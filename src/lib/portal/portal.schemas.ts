@@ -19,9 +19,11 @@ export const ETIQUETA_OBJETO: Record<ObjetoCitable, string> = {
 };
 
 /** RF-01.6: quiénes consultan la auditoría — el admin del cliente (dueño de los datos)
- * y el lead de la boutique (operador del engagement). La UI deriva de aquí; la autoridad
- * es la política RLS de evento_dominio, que para los demás roles devuelve cero filas. */
-export const ROLES_AUDITORIA = ['admin-cliente', 'lead-boutique'] as const;
+ * y la boutique, que son sus DOS roles: el lead que opera el engagement y el diseñador
+ * que ejecuta. El sponsor y el stakeholder generan eventos pero no los leen. La UI deriva
+ * de aquí; la autoridad es la política RLS de evento_dominio, que para los demás roles
+ * devuelve cero filas. */
+export const ROLES_AUDITORIA = ['admin-cliente', 'lead-boutique', 'disenador'] as const;
 
 /** Mismo bound que el CHECK de la tabla: el schema recorta y la base protege el SQL directo. */
 export const CUERPO_MAX = 5000;

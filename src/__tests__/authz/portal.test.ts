@@ -344,6 +344,10 @@ describeAuthz('portal: hilos de comentarios y auditoría', () => {
 
     const delAdmin = await listarAuditoria(adminCliId, ws, {});
     expect(delAdmin.eventos.length).toBe(delLead.eventos.length);
+    // «La boutique» de RF-01.6 son sus DOS roles: el diseñador también rinde cuentas de
+    // lo que ejecuta, así que también lo consulta.
+    const delDisenador = await listarAuditoria(disenadorId, ws, {});
+    expect(delDisenador.eventos.length).toBe(delLead.eventos.length);
 
     // El stakeholder GENERÓ varios de esos eventos y aun así la auditoría no existe para
     // él: ni por el servicio (motivo explícito) ni por SQL directo (cero filas por RLS).
@@ -354,6 +358,13 @@ describeAuthz('portal: hilos de comentarios y auditoría', () => {
     expect(crudo[0]!.n).toBe(0);
     // Pero sigue GENERANDO auditoría con sus actos: leer y escribir son cosas distintas.
     await comentar(stakeId, { workspaceId: ws, hiloId, cuerpo: 'sigo participando' });
+    // Y un cuerpo de puro espacio en blanco no pasa ni por la puerta del SQL directo:
+    // btrim() con un argumento solo quita espacios, no tabuladores ni saltos.
+    await expect(
+      conUsuario(stakeId, (tx) => tx`insert into comentario
+        (workspace_id, hilo_id, cuerpo, autor_id, autor_rol)
+        values (${ws}, ${hiloId}, ${'\n\t  \n'}, ${stakeId}, 'stakeholder')`),
+    ).rejects.toThrow(/violates check constraint/);
     const despues = await listarAuditoria(leadId, ws, {});
     expect(despues.eventos.length).toBeGreaterThan(delLead.eventos.length);
   });

@@ -69,7 +69,11 @@ create table comentario (
   hilo_id uuid not null,
   -- Contenido acotado y con sustancia: whitespace no es un comentario (SPEC-09: bounds
   -- antes de cualquier procesamiento).
-  cuerpo text not null check (btrim(cuerpo) <> '' and length(cuerpo) <= 5000),
+  -- No basta btrim(): con un solo argumento quita espacios, no tabuladores ni saltos,
+  -- así que un cuerpo de puros \n pasaba por la puerta del SQL directo y producía un
+  -- comentario visualmente vacío con su evento de auditoría detrás. El regex exige al
+  -- menos un carácter que no sea espacio en blanco, sea cual sea.
+  cuerpo text not null check (cuerpo ~ '[^[:space:]]' and length(cuerpo) <= 5000),
   autor_id uuid not null references usuario(id),
   -- El rol CONGELADO con el que se habló: la membresía cambia (un stakeholder asciende a
   -- admin-cliente) y el acta del portal debe seguir diciendo bajo qué rol se dijo cada
@@ -138,14 +142,16 @@ create policy hilo_update_resolucion on hilo_comentario
 
 -- ── La auditoría se consulta, y no por cualquiera (RF-01.6) ──
 -- evento_dominio nació legible para todo miembro; la spec dice quién rinde cuentas: el
--- admin del cliente (dueño de los datos, RF-01.4) y el lead de la boutique (operador).
--- Para los demás roles la auditoría NO EXISTE — cero filas por RLS, no una pantalla
--- escondida por conveniencia de UI. La política de INSERT queda intacta: todo miembro
--- sigue generando eventos con sus acciones, aunque no pueda leerlos.
+-- admin del cliente (dueño de los datos, RF-01.4) y LA BOUTIQUE (operador) — que son sus
+-- dos roles, lead y diseñador, no solo el lead. Para sponsor y stakeholder la auditoría
+-- NO EXISTE: cero filas por RLS, no una pantalla escondida por conveniencia de UI. La
+-- política de INSERT queda intacta: todo miembro sigue generando eventos con sus
+-- acciones, aunque no pueda leerlos.
 drop policy evento_select on evento_dominio;
 create policy evento_select on evento_dominio
   for select using (
-    workspace_role(app_user_id(), workspace_id) in ('admin-cliente', 'lead-boutique')
+    workspace_role(app_user_id(), workspace_id)
+      in ('admin-cliente', 'lead-boutique', 'disenador')
   );
 
 -- La auditoría se LEE en orden, y con el default now() todos los eventos de una misma

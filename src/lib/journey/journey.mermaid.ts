@@ -86,7 +86,14 @@ export function mermaidDeJourney(journey: JourneyCompleto): string {
 
   for (const fase of fases) {
     lineas.push(`  subgraph ${idMermaid(fase.id)}["${texto(fase.etiqueta)}"]`);
-    const dentro = (porFase.get(fase.id) ?? []).sort((a, b) => a.orden - b.orden);
+    // Mismo orden TOTAL que `porSecuencia`: ordenar solo por `orden` deja el desempate
+    // al azar del motor, así que un empate entre hermanos podía dibujarse en un orden y
+    // validarse en otro — las tres vistas dejarían de hablar del mismo journey por la
+    // única puerta que queda abierta. El servicio ya impide crear el empate; esto es que
+    // aunque lo hubiera, el diagrama y el informe coincidirían.
+    const dentro = [...(porFase.get(fase.id) ?? [])].sort(
+      (a, b) => a.orden - b.orden || a.id.localeCompare(b.id),
+    );
     if (dentro.length === 0) {
       // Un subgrafo vacío rompe el layout: se marca explícitamente para que la fase
       // sin pasos se VEA (y la validación ya la reporta aparte).

@@ -163,6 +163,40 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
           and n.catalogo_id is not null
           and otros.catalogo_id = n.catalogo_id and otros.workspace_id = n.workspace_id
           and otros.id <> n.id`;
+      // Mover un nodo a una posición ocupada dejaría a dos hermanos EMPATADOS en `orden`,
+      // y ahí las tres vistas dejan de hablar del mismo journey: `porSecuencia` desempata
+      // por id y el render de la fase ordena solo por `orden`, así que el diagrama y el
+      // blueprint pueden colocar el movimiento en posiciones distintas. El alta ya
+      // serializa `max(orden) + 1` justo para no tener empates; editar tenía que hacer lo
+      // propio.
+      //
+      // Se abre hueco: los hermanos del mismo tipo desde la posición pedida corren uno.
+      // El candado es el mismo que el del alta —por (journey, tipo)— y va antes de leer,
+      // porque desplazar es un `max`/`shift` sobre un conjunto que otro curador puede
+      // estar tocando; sin él, dos movimientos concurrentes vuelven a empatar.
+      const [ubicacion] = await tx`
+        select journey_id, tipo, orden from journey_nodo
+        where id = ${entrada.nodoId} and workspace_id = ${entrada.workspaceId}`;
+      if (!ubicacion) throw new ErrorJourney('El nodo no existe o no puedes editarlo');
+      if ((ubicacion.orden as number) !== entrada.orden) {
+        await tx`select pg_advisory_xact_lock(hashtextextended('designio:journey-orden:'
+          || ${ubicacion.journey_id as string} || ':' || ${ubicacion.tipo as string}, 42))`;
+        // Solo si de verdad hay colisión: sin esto, cualquier edición renumeraría el grupo
+        // entero y llenaría la auditoría de movimientos que nadie pidió.
+        await tx`
+          update journey_nodo otros
+          set orden = otros.orden + 1
+          where otros.journey_id = ${ubicacion.journey_id as string}
+            and otros.workspace_id = ${entrada.workspaceId}
+            and otros.tipo = ${ubicacion.tipo as string}
+            and otros.id <> ${entrada.nodoId}
+            and otros.orden >= ${entrada.orden}
+            and exists (
+              select 1 from journey_nodo x
+              where x.journey_id = otros.journey_id and x.workspace_id = otros.workspace_id
+                and x.tipo = otros.tipo and x.id <> ${entrada.nodoId}
+                and x.orden = ${entrada.orden})`;
+      }
       filas = await tx`
         update journey_nodo
         set etiqueta = ${entrada.etiqueta}, detalle = ${entrada.detalle},

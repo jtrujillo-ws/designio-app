@@ -175,6 +175,51 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     expect(pasos.find((p) => p.id === segundo.nodoId)!.orden).toBe(1);
   });
 
+  it('mover un nodo a una posición ocupada abre hueco en vez de empatar', async () => {
+    // Un empate en `orden` rompe la tesis del slice: `porSecuencia` desempata por id y el
+    // render de la fase ordenaba solo por `orden`, así que el diagrama y el blueprint
+    // podían colocar el movimiento en posiciones distintas. El alta ya serializa
+    // `max(orden) + 1` para no empatar; editar tenía que hacer lo propio.
+    const tercero = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'paso',
+      etiqueta: 'Firma el contrato',
+      arquetipoId: null,
+      detalle: '',
+      faseId,
+      responsable: '',
+    });
+    const antes = await journeyCompleto(leadId, ws, journeyId);
+    const pasosAntes = antes!.nodos.filter((n) => n.tipo === 'paso');
+    expect(pasosAntes.map((p) => p.orden)).toEqual([0, 1, 2]);
+
+    // El tercero se mueve al puesto 0, que ya ocupa el primero.
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: tercero.nodoId,
+      etiqueta: 'Firma el contrato',
+      detalle: '',
+      faseId,
+      responsable: '',
+      orden: 0,
+    });
+
+    const despues = await journeyCompleto(leadId, ws, journeyId);
+    const pasos = despues!.nodos.filter((n) => n.tipo === 'paso');
+    // Ni un empate: los órdenes son todos distintos…
+    const ordenes = pasos.map((p) => p.orden);
+    expect(new Set(ordenes).size).toBe(ordenes.length);
+    // …y el movido está de verdad primero, que es lo que el curador pidió.
+    const porOrden = [...pasos].sort((a, b) => a.orden - b.orden);
+    expect(porOrden[0]!.id).toBe(tercero.nodoId);
+    expect(porOrden.map((p) => p.etiqueta)).toEqual([
+      'Firma el contrato',
+      'Abre la app',
+      'Sube el documento',
+    ]);
+  });
+
   it('el guard impide que una arista o una fase crucen de journey', async () => {
     const ajeno = await agregarNodo(leadId, {
       workspaceId: ws,

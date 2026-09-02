@@ -304,10 +304,9 @@ function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
       <div style={{ ...item, font: '700 13px var(--font-sans)', color: 'var(--ink)', background: 'var(--surface-sunken)' }}>
         <span>Loop del método (J1–J7)</span>
       </div>
-      <div style={item}>
+      <Link to="/importacion" style={{ ...item, textDecoration: 'none' }}>
         <span>Bandeja de importación</span>
-        <span style={{ font: '600 11px var(--font-mono)', color: 'var(--accent)' }}>2</span>
-      </div>
+      </Link>
       <div style={item}>
         <span>Aprobaciones pendientes</span>
         <span style={{ font: '600 11px var(--font-mono)', color: 'var(--warn)' }}>1</span>

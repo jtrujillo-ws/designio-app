@@ -2,10 +2,29 @@ import { z } from 'zod';
 
 /** CTX-02 Evidencia y Conocimiento — cinco dimensiones (ADR-0010) y citas verificables. */
 
+/** Fecha CALENDÁRICA pura (AAAA-MM-DD, sin huso): codificarla como instante corre el
+ * día en husos extremos (p. ej. mediodía UTC ya es mañana en UTC+13/14) — se persiste
+ * y viaja como texto y solo se interpreta como día. */
+export const FechaCalendarioSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Fecha en formato AAAA-MM-DD')
+  .refine(
+    (f) => {
+      // Comparación por componentes: el parser ISO de V8 RUEDA los desbordes
+      // (2026-02-30 → 2 de marzo) en vez de rechazarlos.
+      const [a, m, d] = f.split('-').map(Number);
+      const fecha = new Date(Date.UTC(a!, m! - 1, d!));
+      return (
+        fecha.getUTCFullYear() === a && fecha.getUTCMonth() === m! - 1 && fecha.getUTCDate() === d
+      );
+    },
+    { message: 'Fecha inválida' },
+  );
+
 export const DimensionesEvidenciaSchema = z.object({
   proveniencia: z.object({
     tipoFuente: z.string().min(1),
-    fecha: z.coerce.date(),
+    fecha: FechaCalendarioSchema,
     localizacion: z.string().default(''),
   }),
   metodo: z.object({
@@ -46,3 +65,101 @@ export const InsightSchema = z.object({
   estado: z.enum(['propuesto', 'validado', 'descartado']),
 });
 export type Insight = z.infer<typeof InsightSchema>;
+
+// ── Bandeja de importación (SPEC-03, MVP manual: texto pegado o referencia) ──
+
+/** Quiénes deciden la curaduría (RF-03.4): compartido entre el re-check del servicio
+ * y la UI, que solo muestra los controles de decisión a estos roles. */
+export const ROLES_CURADORES = ['lead-boutique', 'disenador'] as const;
+
+export const TIPOS_FUENTE = [
+  'documento',
+  'entrevista',
+  'observacion',
+  'dataset',
+  'enlace',
+  'nota',
+] as const;
+export type TipoFuente = (typeof TIPOS_FUENTE)[number];
+
+export const ETIQUETA_TIPO_FUENTE: Record<TipoFuente, string> = {
+  documento: 'Documento',
+  entrevista: 'Entrevista',
+  observacion: 'Observación',
+  dataset: 'Dataset',
+  enlace: 'Enlace',
+  nota: 'Nota',
+};
+
+/** RF-03.1/03.2: el contenido es texto NO confiable — acotado aquí y en el esquema SQL.
+ * Se importa texto pegado, una referencia al original, o ambos: al menos uno. */
+export const CrearItemImportacionSchema = z
+  .object({
+    workspaceId: z.string().uuid(),
+    titulo: z.string().trim().min(1, 'El título es obligatorio').max(300),
+    contenido: z.string().max(100_000, 'Máximo 100k caracteres').default(''),
+    tipoFuente: z.enum(TIPOS_FUENTE),
+    referencia: z.string().trim().max(2000).default(''),
+  })
+  .refine((d) => d.contenido.trim().length > 0 || d.referencia.length > 0, {
+    message: 'Pega el contenido o indica al menos la referencia del original',
+    path: ['contenido'],
+  });
+export type CrearItemImportacion = z.infer<typeof CrearItemImportacionSchema>;
+
+/**
+ * Lo que el CURADOR completa al aprobar (RF-03.4/03.5): el servicio compone con esto
+ * las cinco dimensiones completas (proveniencia sale del propio item; lineage es null
+ * porque la importación manual no pasó por ninguna transformación AI).
+ */
+export const DimensionesCuraduriaSchema = z.object({
+  fecha: FechaCalendarioSchema,
+  recoleccion: z.string().trim().min(1, 'Describe cómo se recolectó').max(300),
+  derivada: z.boolean().default(false),
+  confianza: z.enum(['alta', 'media', 'baja']),
+  consentimiento: z.boolean().default(false),
+  confidencialidad: z.enum(['interna', 'cliente', 'restringida']),
+  segmentoIds: z.array(z.string().uuid()).default([]),
+});
+export type DimensionesCuraduria = z.infer<typeof DimensionesCuraduriaSchema>;
+
+export const AprobarItemSchema = z.object({
+  workspaceId: z.string().uuid(),
+  itemId: z.string().uuid(),
+  esEstadoActual: z.boolean().default(false),
+  resumen: z.string().trim().max(2000).default(''),
+  dimensiones: DimensionesCuraduriaSchema,
+});
+export type AprobarItem = z.infer<typeof AprobarItemSchema>;
+
+export const RechazarItemSchema = z.object({
+  workspaceId: z.string().uuid(),
+  itemId: z.string().uuid(),
+});
+export type RechazarItem = z.infer<typeof RechazarItemSchema>;
+
+export const BandejaInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  /** Cursor: id del último pendiente devuelto — el server resuelve su (creado_en, id)
+   * con precisión exacta y pide los más antiguos (keyset estable ante inserciones). */
+  antesDe: z.string().uuid().optional(),
+});
+
+export const ItemInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  itemId: z.string().uuid(),
+});
+
+/** Fila de la bandeja tal como la ve la UI (el contenido viaja como extracto acotado). */
+export type ItemBandeja = {
+  id: string;
+  titulo: string;
+  tipoFuente: TipoFuente;
+  referencia: string;
+  estado: 'pendiente' | 'aprobado' | 'rechazado';
+  extracto: string;
+  /** true si el contenido completo es más largo que el extracto (la UI muestra la elipsis). */
+  truncado: boolean;
+  creadoEn: string;
+  decididoEn: string | null;
+};

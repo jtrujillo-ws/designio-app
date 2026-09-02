@@ -247,6 +247,28 @@ alter table gate_instancia add column aprobado_sin_registry boolean not null def
 update gate_instancia set aprobado_sin_registry = true
   where numero = 6 and estado = 'aprobado';
 
+-- ── Y los retos que YA estaban midiendo sin contrato de medición ──
+-- El mismo problema un paso más allá, y peor: el ciclo anterior (20260902070000) admitía
+-- `activo → en-medicion` sin registry porque la medición no existía todavía. Esos retos
+-- están midiendo FUERA del sistema, y este slice les quita la única salida que tenían:
+-- `en-medicion → cerrado` ahora exige un veredicto que solo escribe el guard del outcome
+-- review, el review exige un registry firmado, el registry no se podía ni abrir sobre un
+-- reto que no está 'activo' — y `en-medicion` no vuelve a 'activo' ni se archiva. Quedaban
+-- encerrados: ni miden aquí, ni cierran, ni se archivan.
+--
+-- La salida NO es dejarlos cerrar sin veredicto (sería el loop abierto que SYS-24 cierra,
+-- y el CHECK nuevo lo rechaza igual) ni archivarlos por decreto (es trabajo vivo, no
+-- basura). Es dejarles ABRIR su contrato ahora: firman el registry —su G6 ya está marcado
+-- por el bloque de arriba—, declaran la ventana que llevan corriendo, y desde ahí el
+-- camino es el normal: snapshots, review y cierre con veredicto de verdad.
+--
+-- Misma disciplina que la marca del gate: se escribe UNA vez, aquí; no entra en el grant
+-- del rol de aplicación (`reto` solo concede update de `estado`) y ningún guard la toca.
+-- Y el estado que habilita —«reto en medición sin registry»— es inalcanzable para todo
+-- reto posterior, porque abrir la medición exige el registry FIRMADO.
+alter table reto add column medicion_sin_registry boolean not null default false;
+update reto set medicion_sin_registry = true where estado = 'en-medicion';
+
 -- ── «La ventana sigue abierta», en UN solo sitio ──
 -- Tres predicados de la base (apertura del review, guard de completación, estado de
 -- cadencia de la proyección) y su espejo del cliente deciden exactamente lo mismo. Escrito
@@ -312,10 +334,14 @@ create policy registry_insert on metric_registry
     and firmado_por is null
     and firmado_en is null
     -- El contrato de medición se redacta con el reto VIVO: ni sobre un candidato sin
-    -- método ni sobre uno ya cerrado (SYS-08).
+    -- método ni sobre uno ya cerrado (SYS-08). Y también sobre uno que YA estaba midiendo
+    -- cuando este esquema no existía (ver arriba): es la única forma de que llegue a tener
+    -- contrato, y sin ella no puede ni medir aquí ni cerrar. Esa marca la escribió la
+    -- migración y nadie puede volver a escribirla.
     and exists (select 1 from reto r
       where r.id = metric_registry.reto_id and r.workspace_id = metric_registry.workspace_id
-        and r.estado = 'activo')
+        and (r.estado = 'activo'
+             or (r.estado = 'en-medicion' and r.medicion_sin_registry)))
   );
 
 -- La firma es la transición decisora del registry (SYS-22). El rol se lee del PROPIO
@@ -839,6 +865,18 @@ begin
       where r.reto_id = p.reto_id and r.workspace_id = new.workspace_id
         and r.estado = 'firmado') then
       raise exception 'no se puede aprobar G6: el Metric Registry no está firmado (SYS-22)';
+    end if;
+    -- …y aprobado G6, el proyecto ENTRA en implementación (§7: «activo → en implementación
+    -- → en medición → cerrado»). Este slice abrió las transiciones del proyecto y dejó ese
+    -- estado inalcanzable: nada lo escribía, así que G7 saltaba de `activo` directo a
+    -- `en-medicion` y el tablero decía «activo» durante toda la etapa 7 —la fase en la que
+    -- de verdad se está implementando—. El efecto va DENTRO del guard que decide, como el
+    -- resto: así también lo produce el SQL directo, y el evento de la transición lo emite
+    -- su propio guard. Solo desde 'activo': un proyecto pausado no se arrastra en silencio
+    -- (y su par pausado→en-implementacion es ilegal, así que la aprobación fallaría).
+    if new.numero = 6 then
+      update proyecto set estado = 'en-implementacion'
+        where id = new.proyecto_id and workspace_id = new.workspace_id and estado = 'activo';
     end if;
     update etapa_instancia set estado = 'completada'
       where proyecto_id = new.proyecto_id and workspace_id = new.workspace_id

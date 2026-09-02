@@ -343,7 +343,8 @@ async function diagnosticoDeFirma(
  * guards de transición de la base exigen el registry FIRMADO (SYS-22) y el G7 APROBADO
  * (§5.2), y la política, el rol que opera el método. Los dos movimientos van en la misma
  * transacción: un reto midiendo con el proyecto todavía «activo» sería un tablero que
- * miente.
+ * miente — y en una base con historia ese tablero YA existe, así que la operación también
+ * sabe terminar el movimiento a medias que dejó el ciclo anterior.
  */
 export async function abrirMedicion(
   actorId: string,
@@ -357,7 +358,7 @@ export async function abrirMedicion(
     // no hay fila y hablan los guards y la política, que es lo correcto: el diagnóstico no
     // debe contarle el estado del reto a quien no puede leerlo.
     const [listo] = await tx`
-      select
+      select r.estado, r.medicion_sin_registry,
         exists (select 1 from metric_registry mr
           where mr.reto_id = r.id and mr.workspace_id = r.workspace_id
             and mr.estado = 'firmado') as firmado,
@@ -367,7 +368,7 @@ export async function abrirMedicion(
             and g.numero = 7 and g.estado = 'aprobado') as g7
       from reto r
       where r.id = ${entrada.retoId} and r.workspace_id = ${entrada.workspaceId}
-        and r.estado = 'activo'`;
+        and r.estado in ('activo', 'en-medicion')`;
     if (listo && !listo.firmado) {
       throw new ErrorMedicion('Abrir la medición exige el Metric Registry firmado en G6 (SYS-22)');
     }
@@ -380,18 +381,29 @@ export async function abrirMedicion(
         'Abrir la medición exige el G7 aprobado: releases conciliados y effective state constatado',
       );
     }
-    let abierto;
-    try {
-      abierto = await tx`
-        update reto set estado = 'en-medicion'
-        where id = ${entrada.retoId} and workspace_id = ${entrada.workspaceId}
-          and estado = 'activo'
-        returning id`;
-    } catch (e) {
-      comoErrorDeDominio(e);
+    // Un reto que YA venía midiendo de antes de este esquema no tiene que moverse —ya está
+    // donde toca—: lo que le falta es su proyecto, que bajo el ciclo anterior no tenía
+    // siquiera grant para cambiar de estado y por eso se quedó en 'activo'. Esta operación
+    // le termina el movimiento en vez de negarse, que es lo que dejaba el tablero mintiendo
+    // (reto midiendo, proyecto activo) sin ninguna forma de arreglarlo.
+    const yaMedia = listo?.estado === 'en-medicion';
+    if (yaMedia && !listo!.medicion_sin_registry) {
+      throw new ErrorMedicion('La medición de este reto ya está abierta');
     }
-    if (abierto!.length === 0) {
-      throw new ErrorMedicion('El reto no existe, no está activo o no puedes abrir su medición');
+    if (!yaMedia) {
+      let abierto;
+      try {
+        abierto = await tx`
+          update reto set estado = 'en-medicion'
+          where id = ${entrada.retoId} and workspace_id = ${entrada.workspaceId}
+            and estado = 'activo'
+          returning id`;
+      } catch (e) {
+        comoErrorDeDominio(e);
+      }
+      if (abierto!.length === 0) {
+        throw new ErrorMedicion('El reto no existe, no está activo o no puedes abrir su medición');
+      }
     }
     let movidos;
     try {
@@ -812,9 +824,15 @@ export async function seguimientoDeImpacto(
                 -- La ventana entera pasó sin un solo dato: vencido, y ya sin remedio.
                 when ult.fecha is null then 'vencido'
                 -- Recurrente que dejó de aportar ANTES del cierre: la cadencia se
-                -- incumplió dentro de la ventana y eso no lo borra el calendario.
+                -- incumplió dentro de la ventana y eso no lo borra el calendario. Que aquí
+                -- el corte sea «menor o igual» y abajo «menor» no es una asimetría: es la
+                -- misma regla —una entrega vence cuando su día YA PASÓ— leída sobre días
+                -- distintos. El último día de la ventana ya pasó (esta rama exige que
+                -- cerrara ayer o antes), mientras que abajo se compara contra hoy, y hoy
+                -- todavía no ha terminado. Con el corte estricto se daba por cumplida la
+                -- entrega que tocaba justo el último día y nunca llegó.
                 when cad.dias is not null
-                     and ult.fecha + cad.dias < e.ventana_inicio + c.ventana_dias
+                     and ult.fecha + cad.dias <= e.ventana_inicio + c.ventana_dias
                   then 'vencido'
                 -- Llegó lo comprometido hasta el final: la medición terminó.
                 else 'cerrado' end

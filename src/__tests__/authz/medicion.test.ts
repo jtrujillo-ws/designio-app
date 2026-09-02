@@ -610,6 +610,16 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g6.id })).rejects.toThrow(
       /Metric Registry no está firmado/,
     );
+    // Y la regla es del GUARD, no del servicio: por SQL directo el rechazo es el mismo.
+    // Esta comprobación es deliberadamente redundante con la de arriba porque
+    // `gate_aprobar_suficiencia_guard` lo reescribe entero cada `create or replace`: si
+    // alguien lo reemplaza y se deja esta regla por el camino, es la línea que cae — y cae
+    // aunque el servicio siguiera comprobándolo por su cuenta.
+    await expect(
+      conUsuario(sponsorId, (tx) => tx`update gate_instancia
+        set estado = 'aprobado', aprobado_por = ${sponsorId}, aprobado_en = now()
+        where id = ${g6.id}`),
+    ).rejects.toThrow(/Metric Registry no está firmado/);
 
     const firma = await firmarRegistry(sponsorId, { workspaceId: ws, registryId });
     expect(firma.entradas).toBe(2);
@@ -676,6 +686,20 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(revertido.count).toBe(0);
 
     await aprobarGateNumero(6);
+    // Aprobado el plan, el proyecto ENTRA en implementación (§7: activo → en
+    // implementación → en medición → cerrado). Sin este efecto ese estado no lo escribía
+    // nadie: G7 saltaba de 'activo' directo a 'en-medicion' y el tablero decía «activo»
+    // durante toda la etapa 7, que es cuando de verdad se está implementando.
+    const [tras] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where id = ${proyectoId}`);
+    expect(tras!.estado).toBe('en-implementacion');
+    const [transicion] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'ProyectoTransicionado'
+      order by creado_en desc limit 1`;
+    expect((transicion!.payload as { de: string; a: string })).toMatchObject({
+      de: 'activo',
+      a: 'en-implementacion',
+    });
   });
 
   it('firmado el registry, los criterios ya no se mueven ni reabriendo la etapa 0', async () => {
@@ -1043,6 +1067,19 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const aMedias = await seguido();
     expect(aMedias.diasRestantes).toBeLessThanOrEqual(0);
     expect(aMedias.estadoSnapshot).toBe('vencido');
+
+    // El caso del borde, que es el que distingue una regla de una aproximación: con el
+    // último dato en -47 y cadencia semanal, la siguiente entrega vencía el -40 — el
+    // ÚLTIMO día de la ventana, que es un día medido y que ya pasó. No llegó, así que la
+    // cadencia se incumplió: «cerrado» diría que se cumplió lo comprometido y sería falso.
+    await registrarSnapshot(leadId, {
+      workspaceId: ws,
+      entradaId: entradaReintentosId,
+      valor: '2.0',
+      fecha: fecha(-47),
+      nota: '',
+    });
+    expect((await seguido()).estadoSnapshot).toBe('vencido');
 
     // Y ahora un dato pegado al cierre de la ventana: se aportó lo comprometido hasta el
     // final. El estado es TERMINAL, no «vencido»: comparar la próxima fecha prevista
@@ -1455,6 +1492,110 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await aprobarGateNumero(7, proyectoHeredadoId);
     const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: retoHeredadoId });
     expect(abierto.proyectos).toBe(1);
+  });
+
+  it('un reto que YA estaba midiendo sin contrato deja de estar encerrado', async () => {
+    // El ciclo anterior admitía `activo → en-medicion` sin registry, porque la medición no
+    // existía. Este slice les quitaba la única salida: cerrar exige veredicto, el veredicto
+    // exige review, el review exige registry firmado, y el registry no se podía ni abrir
+    // sobre un reto que no está 'activo' — que además no vuelve a 'activo' ni se archiva.
+    const admin = sqlAdmin();
+    const viejo = await crearReto(leadId, {
+      workspaceId: ws,
+      servicioAnclaId: svcId,
+      codigo: 'R-74',
+      titulo: 'Reto que ya venía midiendo fuera del sistema',
+      descripcion: '',
+      origen: 'peticion-cliente',
+      metricaObjetivo: '30→20',
+      serviciosAfectados: [],
+    });
+    const actVieja = await activarReto(leadId, {
+      workspaceId: ws,
+      retoId: viejo.retoId,
+      perfil: 'rapido',
+      proyectoCodigo: 'P-74',
+      proyectoTitulo: 'Rediseño ya implantado',
+    });
+    const criterioViejo = await agregarCriterio(leadId, {
+      workspaceId: ws,
+      retoId: viejo.retoId,
+      kpi: 'Llamadas por solicitud',
+      definicion: 'Contactos hasta resolver',
+      lineaBaseValor: '30',
+      lineaBaseFecha: fecha(-200),
+      lineaBasePlan: '',
+      objetivo: '20',
+      ventanaDias: 30,
+      fechaPostMortem: null,
+    });
+    // El guard de transición del reto es `before update`, así que se apaga para escribir el
+    // pasado que la base ya no permite: pasar a medición sin registry firmado.
+    await admin`alter table reto disable trigger reto_estado_transicion`;
+    try {
+      await admin`update reto set estado = 'en-medicion' where id = ${viejo.retoId}`;
+    } finally {
+      await admin`alter table reto enable trigger reto_estado_transicion`;
+    }
+
+    // Control: SIN la marca de la migración, el reto sigue encerrado — un reto que llegue
+    // a medición por el camino normal ya trae registry, así que esta rama no le sirve.
+    await expect(abrirRegistry(leadId, { workspaceId: ws, retoId: viejo.retoId })).rejects.toThrow(
+      ErrorMedicion,
+    );
+    await admin`update reto set medicion_sin_registry = true where id = ${viejo.retoId}`;
+
+    // Con ella, el contrato se abre y el camino vuelve a ser el normal.
+    const reg = await abrirRegistry(leadId, { workspaceId: ws, retoId: viejo.retoId });
+    await expect(
+      abrirMedicion(leadId, { workspaceId: ws, retoId: viejo.retoId }),
+    ).rejects.toThrow(/Metric Registry firmado en G6/);
+    await agregarEntrada(leadId, {
+      workspaceId: ws,
+      registryId: reg.registryId,
+      criterioId: criterioViejo.criterioId,
+      nombre: 'Llamadas medias',
+      definicion: 'Contactos hasta resolver, por solicitud',
+      fuente: 'Central telefónica',
+      dimensiones: '',
+      propietarioMiembroId: sponsorMiembroId,
+      frecuencia: 'mensual',
+      dashboardUrl: '',
+      lineaBaseValor: '30',
+      lineaBaseFecha: fecha(-200),
+      // La ventana que llevaba corriendo, declarada ahora: ya cerró.
+      ventanaInicio: fecha(-40),
+      fechaPostMortem: fecha(5),
+    });
+    for (const n of [0, 1, 2, 3, 4, 5]) {
+      await aprobarGateNumero(n, actVieja.proyectoId);
+    }
+    const firma = await firmarRegistry(sponsorId, {
+      workspaceId: ws,
+      registryId: reg.registryId,
+    });
+    expect(firma.entradas).toBe(1);
+    await aprobarGateNumero(6, actVieja.proyectoId);
+    await aprobarGateNumero(7, actVieja.proyectoId);
+
+    // El reto ya está donde toca; lo que faltaba era su PROYECTO, que bajo el ciclo
+    // anterior ni siquiera tenía grant para moverse. La operación lo termina en vez de
+    // negarse, que es lo que dejaba el tablero mintiendo sin forma de arreglarlo.
+    const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: viejo.retoId });
+    expect(abierto.proyectos).toBe(1);
+    const seg = await seguimientoDeImpacto(leadId, ws, actVieja.proyectoId);
+    expect(seg!.retoEstado).toBe('en-medicion');
+    expect(seg!.proyectoEstado).toBe('en-medicion');
+    // Y ya no está encerrado: con la ventana cerrada, el post mortem se abre y podrá
+    // dictar un veredicto de verdad en vez de quedarse sin salida.
+    const review = await abrirOutcomeReview(leadId, { workspaceId: ws, retoId: viejo.retoId });
+    expect(review.reviewId).toBeTruthy();
+    // Y sin la marca —un reto que llegó a medición por el camino normal, con su registry
+    // firmado antes— la operación dice que ya está abierta en vez de mover nada.
+    await admin`update reto set medicion_sin_registry = false where id = ${viejo.retoId}`;
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: viejo.retoId })).rejects.toThrow(
+      /ya está abierta/,
+    );
   });
 
   it('el ciclo del proyecto es de sentido único y ningún estado inventado entra', async () => {

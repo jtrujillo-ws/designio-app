@@ -414,8 +414,9 @@ function FormularioCuraduria({
           esEstadoActual,
           resumen,
           dimensiones: {
-            // Mediodía UTC: la fecha es calendárica y así no se corre de día en ningún huso.
-            fecha: new Date(`${fecha}T12:00:00Z`),
+            // Calendárica pura (AAAA-MM-DD): viaja como texto — cualquier instante se
+            // correría de día en algún huso al formatearla.
+            fecha,
             recoleccion,
             derivada,
             confianza,

@@ -29,7 +29,7 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
   let evidenciaId = '';
 
   const dimensionesDemo = {
-    fecha: new Date('2026-08-01T00:00:00Z'),
+    fecha: '2026-08-01',
     recoleccion: 'Estudio CX del proveedor',
     derivada: true,
     confianza: 'alta' as const,
@@ -182,6 +182,7 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
 
     const dims = DimensionesEvidenciaSchema.parse(ev!.dimensiones);
     expect(dims.proveniencia.tipoFuente).toBe('dataset');
+    expect(dims.proveniencia.fecha).toBe('2026-08-01'); // calendárica pura, sin huso
     expect(dims.proveniencia.localizacion).toBe('hoja compartida');
     expect(dims.calidad.confianza).toBe('alta');
     expect(dims.lineage).toBeNull();

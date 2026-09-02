@@ -2,10 +2,18 @@ import { z } from 'zod';
 
 /** CTX-02 Evidencia y Conocimiento — cinco dimensiones (ADR-0010) y citas verificables. */
 
+/** Fecha CALENDÁRICA pura (AAAA-MM-DD, sin huso): codificarla como instante corre el
+ * día en husos extremos (p. ej. mediodía UTC ya es mañana en UTC+13/14) — se persiste
+ * y viaja como texto y solo se interpreta como día. */
+export const FechaCalendarioSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Fecha en formato AAAA-MM-DD')
+  .refine((f) => !Number.isNaN(Date.parse(`${f}T00:00:00Z`)), { message: 'Fecha inválida' });
+
 export const DimensionesEvidenciaSchema = z.object({
   proveniencia: z.object({
     tipoFuente: z.string().min(1),
-    fecha: z.coerce.date(),
+    fecha: FechaCalendarioSchema,
     localizacion: z.string().default(''),
   }),
   metodo: z.object({
@@ -90,7 +98,7 @@ export type CrearItemImportacion = z.infer<typeof CrearItemImportacionSchema>;
  * porque la importación manual no pasó por ninguna transformación AI).
  */
 export const DimensionesCuraduriaSchema = z.object({
-  fecha: z.coerce.date(),
+  fecha: FechaCalendarioSchema,
   recoleccion: z.string().trim().min(1, 'Describe cómo se recolectó').max(300),
   derivada: z.boolean().default(false),
   confianza: z.enum(['alta', 'media', 'baja']),

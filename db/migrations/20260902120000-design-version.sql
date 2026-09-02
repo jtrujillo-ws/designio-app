@@ -851,6 +851,32 @@ begin
       where ec.design_version_id = new.id and ec.workspace_id = new.workspace_id) then
       raise exception 'no se puede aprobar una design version sin elementos de cambio';
     end if;
+    -- Y que el snapshot se haya tomado EN ESTA transición, no antes. RF-06.3 no promete
+    -- «hay un snapshot de este journey», promete que aprobar CONGELA el to-be — el de
+    -- ahora—, y esas dos cosas se separan en cuanto existe un snapshot anterior del mismo
+    -- grafo (lo deja cualquier aprobación previa de ese journey).
+    --
+    -- Ojo, porque aquí es fácil equivocarse: el CHECK «borrador ⇒ los tres sellos nulos»
+    -- NO cubre esto. Un CHECK se evalúa sobre la fila RESULTANTE, y la de una aprobación
+    -- ya tiene `estado = 'aprobada'`, así que ese CHECK ni se mira: solo restringe a las
+    -- filas que SIGUEN siendo borrador, es decir, sembrar el sello en dos sentencias. En
+    -- UNA sola —aprobar y apuntar de paso a un snapshot viejo del mismo journey— pasaba el
+    -- CHECK y pasaba la política, cuyo `with check` solo exige que el snapshot sea del
+    -- mismo journey y nada sobre cuándo se tomó. La versión quedaba inmutable certificando
+    -- un grafo que no era el to-be vigente.
+    --
+    -- El predicado es «la fila del snapshot nació en esta transacción»: `xmin` es el xid
+    -- que la insertó y `pg_current_xact_id()` el de esta transacción. Es lo más fuerte que
+    -- se puede pedir —más que «no lo usa nadie más» o «es el más reciente», que admiten
+    -- ambos un snapshot tomado antes de la última edición del grafo— y es exactamente lo
+    -- que hace el servicio: insertar el snapshot y aprobar en la misma transacción.
+    if new.snapshot_id is not null and not exists (
+      select 1 from journey_snapshot s
+      where s.id = new.snapshot_id and s.workspace_id = new.workspace_id
+        and s.xmin = pg_current_xact_id()::xid
+    ) then
+      raise exception 'aprobar congela el to-be de AHORA: el snapshot debe tomarse en la misma transición (RF-06.3)';
+    end if;
     -- Y que el snapshot que se congela pueda RESPONDER por cada nodo enlazado. Sin FK en
     -- `elemento_cambio.nodo_id`, entre que un borrador enlaza un nodo y alguien aprueba,
     -- ese nodo puede haberse borrado del grafo de trabajo. Que el borrador se apoye en la
@@ -959,6 +985,57 @@ create trigger release_elemento_misma_dv
   before insert on release_elemento
   for each row execute function release_elemento_misma_dv_guard();
 revoke execute on function release_elemento_misma_dv_guard() from public;
+
+-- Lo que G6 certificó sigue siendo cierto: si el gate aprobó un plan donde CADA elemento
+-- de la design version vigente tiene release, quitarle el release a uno de ellos deja el
+-- gate diciendo algo falso. La aprobación de un gate es inmutable y la reapertura de etapa
+-- NO la deshace (SPEC-04 lo dice explícitamente: «la aprobación del gate no se deshace»),
+-- así que no hay ningún camino por el que ese `aprobado` vuelva a evaluarse: la mentira se
+-- queda. G7 acabaría atrapando el hueco —un elemento sin release es «desconocido»—, pero
+-- eso es descubrirlo al final del ciclo, y entre medias el tablero certifica un plan que
+-- no existe.
+--
+-- El predicado es EL MISMO que el de G6, y a propósito: dos formas de decir «todo elemento
+-- de la versión vigente está cubierto» serían dos verdades y bastaría olvidar una.
+--
+-- DIFERIDO, y aquí está el motivo de fondo: mover un elemento de un release a otro es
+-- borrar y volver a insertar, así que entre las dos sentencias el elemento está descubierto
+-- sin que nadie haya roto nada. Comprobar al COMMIT es lo que distingue «lo he movido» de
+-- «lo he dejado huérfano», que es la diferencia que importa. Un trigger normal habría
+-- prohibido reordenar el plan después de G6 — y como el gate no se puede desaprobar, eso
+-- habría sido cerrar la puerta para siempre.
+--
+-- Solo mira design versions APROBADAS, que es lo que mira G6. Las SUPERADAS quedan fuera y
+-- eso mantiene abierta la salida de G7: quitarle el alcance a un release planificado de una
+-- versión superada es como se cierra lo que ya no va a salir.
+create function release_elemento_cobertura_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), old.workspace_id) then
+    return old;
+  end if;
+  -- Se volvió a asignar en esta misma transacción: era un movimiento, no un descubierto.
+  if exists (select 1 from release_elemento re
+    where re.elemento_id = old.elemento_id and re.workspace_id = old.workspace_id) then
+    return old;
+  end if;
+  if exists (
+    select 1 from elemento_cambio ec
+    join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+    join gate_instancia g on g.proyecto_id = dv.proyecto_id and g.workspace_id = dv.workspace_id
+    where ec.id = old.elemento_id and ec.workspace_id = old.workspace_id
+      and dv.estado = 'aprobada'
+      and g.numero = 6 and g.estado = 'aprobado'
+  ) then
+    raise exception 'G6 aprobó un plan que cubre este elemento: muévelo a otro release, no lo dejes sin ninguno (RF-06.4)';
+  end if;
+  return old;
+end $$;
+create constraint trigger release_elemento_cobertura
+  after delete on release_elemento
+  deferrable initially deferred
+  for each row execute function release_elemento_cobertura_guard();
+revoke execute on function release_elemento_cobertura_guard() from public;
 
 -- Transiciones del release (§3.3) con sus exigencias y sus eventos dentro del guard.
 create function release_transicion_guard() returns trigger
@@ -1159,6 +1236,18 @@ begin
           and c.elemento_id = re.elemento_id)
   ) then
     raise exception 'un effective state se registra con la constatación de CADA elemento de su release (RF-06.6)';
+  end if;
+  -- Y el tercer paso: el release queda VERIFICADO. Con el juego completo de constataciones
+  -- pero el release todavía `desplegado`, el callejón es el mismo —`unique (release_id)`
+  -- rechaza el reintento y no hay forma de retomar—, así que la invariante tiene que
+  -- nombrar la operación entera y no solo su parte más visible. La constatación completa
+  -- sin verificar no es media conciliación: es una que nadie puede cerrar.
+  if not exists (
+    select 1 from release r
+    where r.id = new.release_id and r.workspace_id = new.workspace_id
+      and r.estado = 'verificado'
+  ) then
+    raise exception 'constatar termina verificando el release: un effective state no se queda a medias (RF-06.6)';
   end if;
   return new;
 end $$;

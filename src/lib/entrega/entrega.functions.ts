@@ -31,6 +31,7 @@ import {
   designVersionCompleta,
   designVersionsDelWorkspace,
   desasignarElemento,
+  moverElemento,
   desplegarRelease,
   editarElemento,
   enlazarJourney,
@@ -250,6 +251,23 @@ export const asignarElementoARelease = createServerFn({ method: 'POST' })
     if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
     try {
       await asignarElemento(actorId, data);
+      return { ok: true as const };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+/** Mover, y no «quitar y volver a asignar»: con G6 aprobado, dejar el elemento sin release
+ *  aunque sea entre dos peticiones es lo que el constraint de cobertura rechaza. */
+export const moverElementoDeRelease = createServerFn({ method: 'POST' })
+  .inputValidator(AsignarElementoSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await moverElemento(actorId, data);
       return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);

@@ -15,6 +15,7 @@ import {
   desplegarRelease,
   editarElemento,
   enlazarJourney,
+  moverElemento,
   ErrorEntrega,
   PAGINA_DESIGN_VERSIONS,
   planificarRelease,
@@ -1549,6 +1550,54 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [g6] = await admin`select estado from gate_instancia
       where proyecto_id = ${proyG6} and workspace_id = ${ws} and numero = 6`;
     expect(g6!.estado).toBe('aprobado');
+
+    // ── Y lo que G6 certificó sigue siendo cierto ────────────────────────────────────
+    // La aprobación de un gate es inmutable y la reapertura de etapa NO la deshace, así
+    // que si se le quita el release a un elemento cubierto, el gate se queda diciendo algo
+    // falso y no hay ningún camino por el que vuelva a evaluarse.
+    await expect(
+      desasignarElemento(leadId, ws, dos.elementoId),
+    ).rejects.toThrow(/muévelo a otro release/);
+    const trasIntento = await designVersionCompleta(leadId, ws, dvPlan.designVersionId);
+    expect(
+      trasIntento!.releases.find((r) => r.id === plan.releaseId)!.elementos,
+    ).toHaveLength(2);
+
+    // Pero REORDENAR el plan sigue siendo posible, que es lo que impide que el arreglo se
+    // convierta en una puerta cerrada para siempre: mover es borrar y volver a insertar en
+    // la MISMA transacción, y la invariante se comprueba al commit, no entre sentencias.
+    const segundo = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvPlan.designVersionId,
+      titulo: 'Segunda tanda del plan',
+      responsable: 'Equipo del plan',
+      fechaObjetivo: HOY,
+      elementos: [],
+    });
+    // `moverElemento` y no `asignarElemento`: asignar sigue significando «no tenía
+    // release», y que un segundo asignar se rechace es como se expresa el «exactamente
+    // uno» de SYS-06 (hay test). Mover es una operación propia.
+    await expect(
+      asignarElemento(leadId, {
+        workspaceId: ws,
+        releaseId: segundo.releaseId,
+        elementoId: dos.elementoId,
+        razon: '',
+      }),
+    ).rejects.toThrow(/exactamente uno/);
+    await moverElemento(leadId, {
+      workspaceId: ws,
+      releaseId: segundo.releaseId,
+      elementoId: dos.elementoId,
+      razon: 'se mueve a la segunda tanda',
+    });
+    const trasMover = await designVersionCompleta(leadId, ws, dvPlan.designVersionId);
+    expect(
+      trasMover!.releases.find((r) => r.id === plan.releaseId)!.elementos.map((e) => e.elementoId),
+    ).toEqual([uno.elementoId]);
+    expect(
+      trasMover!.releases.find((r) => r.id === segundo.releaseId)!.elementos.map((e) => e.elementoId),
+    ).toEqual([dos.elementoId]);
   });
 
   it('la sucesión declarada se corrige: perder la carrera no deja un borrador muerto', async () => {
@@ -2059,11 +2108,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // snapshot sea de su journey —no que se acabe de tomar—, así que la versión se
     // congelaría sobre un to-be viejo, certificando un diseño distinto del que aprobó.
     //
-    // No hace falta regla nueva en el guard: lo para el CHECK de la tabla, que exige los
-    // tres sellos nulos mientras el estado es borrador. Se fija aquí porque es la pieza
-    // que sostiene ese hueco, y quien la quite tiene que ver caer este test — un CHECK no
-    // se empareja entre políticas ni se cuela con una transición legal, así que es el
-    // sitio más fuerte donde podía estar.
+    // Esta variante —sembrar el sello en una sentencia y aprobar en otra— la para el
+    // CHECK de la tabla, que exige los tres sellos nulos mientras el estado es borrador.
+    // OJO: eso es TODO lo que para. Un CHECK se evalúa sobre la fila resultante, así que
+    // sobre una aprobación (estado ya 'aprobada') no dice nada; el ataque en UNA sentencia
+    // lo cubre `design_version_transicion_guard` exigiendo que el snapshot se tome en la
+    // propia transición, y tiene su test aparte. Los dos hacen falta y prueban cosas
+    // distintas: confundirlos me costó borrar una vez la regla del guard.
     const dvB = await crearConElemento('DV congelada B', dvA);
     await expect(
       conUsuario(leadId, (tx) => tx`update design_version set snapshot_id = ${snapshotA}
@@ -2401,6 +2452,25 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       }),
     ).rejects.toThrow(/CADA elemento de su release/);
 
+    // Y el caso que parecía a salvo: TODAS las constataciones puestas, pero el release
+    // sin verificar. El callejón es idéntico —la unique rechaza el reintento y no hay
+    // forma de retomar—, así que la invariante tiene que nombrar la operación entera y no
+    // solo su parte más visible. Que las constataciones estén completas no es el final de
+    // constatar: verificar el release lo es.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [es] = await tx`insert into effective_state
+          (workspace_id, servicio_id, release_id, codigo, resumen, constatado_por, constatado_en)
+          values (${ws}, ${svcId}, ${plan.releaseId}, 'ES-9003', '', ${leadId}, ${HOY}::date)
+          returning id`;
+        for (const elementoId of elementos) {
+          await tx`insert into constatacion
+            (workspace_id, effective_state_id, elemento_id, resultado, creado_por)
+            values (${ws}, ${es!.id as string}, ${elementoId}, 'como-aprobado', ${leadId})`;
+        }
+      }),
+    ).rejects.toThrow(/termina verificando el release/);
+
     // Lo que importa del arreglo tanto como el rechazo: la salida sigue abierta. Los dos
     // intentos revirtieron enteros, así que `unique (release_id)` está libre y el camino
     // normal termina el trabajo. Cerrar la puerta no deja al release sin forma de cerrarse
@@ -2419,6 +2489,82 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     });
     const completa = await designVersionCompleta(leadId, ws, dv.designVersionId);
     expect(completa!.releases.find((r) => r.id === plan.releaseId)!.estado).toBe('verificado');
+  });
+
+  it('aprobar congela el to-be de AHORA: un snapshot de antes no vale (RF-06.3)', async () => {
+    // El CHECK «borrador ⇒ los tres sellos nulos» NO cubre esto, y creerlo fue un error
+    // propio que este test existe para no repetir: un CHECK se evalúa sobre la fila
+    // RESULTANTE, y la de una aprobación ya tiene `estado = 'aprobada'`, así que ese CHECK
+    // ni se mira. Solo restringe a las filas que SIGUEN siendo borrador — o sea, sembrar
+    // el sello en DOS sentencias. El ataque de verdad va en UNA: aprobar y apuntar de paso
+    // a un snapshot viejo del mismo journey. Ahí el CHECK pasa, la política pasa (su
+    // `with check` solo exige que el snapshot sea de ese journey, nada sobre cuándo se
+    // tomó) y la versión queda inmutable certificando un grafo que no es el to-be vigente.
+    const admin = sqlAdmin();
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio del snapshot rancio', ${leadId}) returning id`;
+    const svcId = svc!.id as string;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', 'To-be que sigue cambiando', ${leadId}) returning id`;
+    const journeyId = j!.id as string;
+    // Un snapshot ANTERIOR del mismo journey. En producción lo deja cualquier congelación
+    // previa de ese grafo; aquí se pone a mano porque lo que se prueba es qué acepta la
+    // transición, no cómo llegó a existir.
+    const [viejo] = await admin`insert into journey_snapshot
+      (workspace_id, journey_id, motivo, grafo, congelado_por)
+      values (${ws}, ${journeyId}, 'de un ciclo anterior',
+              ${admin.json({ nodos: [], aristas: [] })}, ${leadId}) returning id`;
+    const snapshotViejo = viejo!.id as string;
+
+    // Primera del servicio, así que `supera_a` es null y la cadena de SYS-05 no interfiere:
+    // lo único que puede rechazar el UPDATE de abajo es la frescura del snapshot.
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que intenta congelar un grafo viejo',
+      resumen: '',
+      superaA: null,
+    });
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      tipo: 'canal',
+      operacion: 'agrega',
+      titulo: 'Elemento sin nodo',
+      detalle: '',
+      nodoId: null,
+      decisionIds: [],
+      insightIds: [],
+    });
+
+    // EL ATAQUE, en una sola sentencia. Separarlo en dos lo pararía el CHECK y el test
+    // mentiría: hay que dejarlo así.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update design_version
+        set estado = 'aprobada', aprobada_por = ${leadId}, snapshot_id = ${snapshotViejo}
+        where id = ${dv.designVersionId} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/snapshot debe tomarse en la misma transición/);
+    const sigue = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(sigue!.estado).toBe('borrador');
+    expect(sigue!.snapshotId).toBeNull();
+
+    // Y el camino normal aprueba, congelando un snapshot NUEVO: el viejo sigue donde
+    // estaba, sin que nadie lo haya reutilizado.
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const aprobada = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(aprobada!.estado).toBe('aprobada');
+    expect(aprobada!.snapshotId).not.toBeNull();
+    expect(aprobada!.snapshotId).not.toBe(snapshotViejo);
   });
 
   it('nada de esto cruza el workspace', async () => {

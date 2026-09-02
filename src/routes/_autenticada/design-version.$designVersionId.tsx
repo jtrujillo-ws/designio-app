@@ -18,6 +18,7 @@ import {
   agregarElementoDeCambio,
   aprobarYCongelarDesignVersion,
   asignarElementoARelease,
+  moverElementoDeRelease,
   borrarElementoDeCambio,
   cadenaDelRelease,
   conciliacionDeDesignVersion,
@@ -987,12 +988,17 @@ function AsignarAExistente({
   workspaceId,
   elementoId,
   releases,
+  verbo = 'Asignar',
   onError,
   onHecho,
 }: {
   workspaceId: string;
   elementoId: string;
   releases: ReleaseDeDesignVersion[];
+  /** «Asignar» cuando el elemento está pendiente; «Mover» cuando ya tiene release. Es la
+   *  misma operación —el servicio la resuelve como un movimiento atómico— y decirlo así
+   *  evita que el lead crea que tiene que quitarlo primero. */
+  verbo?: 'Asignar' | 'Mover';
   onError: (e: string | null) => void;
   onHecho: () => Promise<void>;
 }) {
@@ -1001,7 +1007,7 @@ function AsignarAExistente({
   return (
     <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
       <Select value={releaseId} onChange={(e) => setReleaseId(e.target.value)} style={{ width: 160 }}>
-        <option value="">Asignar a…</option>
+        <option value="">{verbo} a…</option>
         {releases.map((r) => (
           <option key={r.id} value={r.id}>
             {r.codigo}
@@ -1020,14 +1026,14 @@ function AsignarAExistente({
         disabled={releaseId === ''}
         onClick={async () => {
           onError(null);
-          const r = await asignarElementoARelease({
+          const r = await (verbo === 'Mover' ? moverElementoDeRelease : asignarElementoARelease)({
             data: { workspaceId, releaseId, elementoId, razon },
           });
           if (r.ok) await onHecho();
           else onError(r.error);
         }}
       >
-        Asignar
+        {verbo}
       </Button>
     </div>
   );
@@ -1073,20 +1079,39 @@ function TarjetaRelease({
             <span style={cuerpo}>{titulos.get(e.elementoId) ?? e.elementoId}</span>
             {e.razon !== '' && <span style={apunte}>— {e.razon}</span>}
             {puedeCompletar && release.estado === 'planificado' && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={async () => {
-                  onError(null);
-                  const r = await quitarElementoDeRelease({
-                    data: { workspaceId, elementoId: e.elementoId },
-                  });
-                  if (r.ok) await onHecho();
-                  else onError(r.error);
-                }}
-              >
-                Quitar
-              </Button>
+              <>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={async () => {
+                    onError(null);
+                    const r = await quitarElementoDeRelease({
+                      data: { workspaceId, elementoId: e.elementoId },
+                    });
+                    if (r.ok) await onHecho();
+                    else onError(r.error);
+                  }}
+                >
+                  Quitar
+                </Button>
+                {/* Mover, y no «quitar y volver a asignar»: con G6 aprobado, dejar el
+                    elemento sin release aunque sea un instante es lo que el constraint de
+                    cobertura rechaza —y como la aprobación de un gate no se deshace, no
+                    habría vuelta atrás—. El servicio lo resuelve en una transacción. */}
+                {dv.releases.filter((o) => o.estado === 'planificado' && o.id !== release.id)
+                  .length > 0 && (
+                  <AsignarAExistente
+                    workspaceId={workspaceId}
+                    elementoId={e.elementoId}
+                    releases={dv.releases.filter(
+                      (o) => o.estado === 'planificado' && o.id !== release.id,
+                    )}
+                    verbo="Mover"
+                    onError={onError}
+                    onHecho={onHecho}
+                  />
+                )}
+              </>
             )}
           </div>
         ))}

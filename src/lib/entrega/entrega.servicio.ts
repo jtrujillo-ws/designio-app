@@ -162,6 +162,11 @@ async function bloquearRelease(tx: TransactionSql, releaseId: string): Promise<v
  *
  *   dv-elemento  →  design-version(servicio)  →  codigo-rl  →  release  →  codigo-es
  *
+ * `release` puede ser DOS en `moverElemento` (origen y destino): se toman en orden
+ * ascendente de uuid, que es el único orden total que dos transacciones que no se conocen
+ * pueden acordar sin hablarse. Ninguna otra ruta toma más de uno, así que cualquier orden
+ * total sobre los releases es compatible con todas.
+ *
  * y `codigo-dv` suelto, que no se toma junto a ningún otro. Cada ruta es una subsecuencia:
  *
  *   aprobarDesignVersion ....... dv-elemento → servicio
@@ -169,6 +174,7 @@ async function bloquearRelease(tx: TransactionSql, releaseId: string): Promise<v
  *   crearDesignVersion ......... codigo-dv
  *   planificarRelease .......... servicio → codigo-rl → release
  *   asignarElemento ............ servicio → release
+ *   moverElemento .............. servicio → release(origen) y release(destino), por uuid
  *   desasignarElemento ......... release
  *   desplegarRelease ........... release
  *   constatarEffectiveState .... release → codigo-es
@@ -630,6 +636,64 @@ async function asignarElementosAlRelease(
 export async function asignarElemento(actorId: string, entrada: AsignarElemento): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    await asignarElementosAlRelease(tx, actorId, entrada.workspaceId, entrada.releaseId, [
+      { elementoId: entrada.elementoId, razon: entrada.razon },
+    ]);
+  });
+}
+
+/**
+ * MOVER un elemento de un release a otro. Es una operación propia y no un `asignar` que
+ * se apaña: asignar sigue significando «este elemento no tenía release», y que un segundo
+ * asignar se RECHACE es como se expresa el «exactamente uno» de SYS-06. Convertirlo en un
+ * movimiento silencioso habría borrado esa expresión y, de paso, dejado que un clic en
+ * «Asignar» sacara un elemento de donde estaba sin decirlo.
+ *
+ * Las dos mitades van en la MISMA transacción, y ese es el punto. Con G6 aprobado, el
+ * constraint de cobertura exige que al commit todo elemento de la design version vigente
+ * siga teniendo release; como la aprobación de un gate no se deshace nunca —la reapertura
+ * reabre la etapa, no el gate—, hacerlo en dos pasos dejaría el primero rechazado y el
+ * plan congelado para siempre. Mover entero es lo que distingue reordenar de dejar
+ * huérfano, y es la razón por la que el constraint es DIFERIDO.
+ *
+ * Hace falta además el candado del release de ORIGEN, no solo el del destino: vaciar RL-1
+ * compite con desplegarlo, que es la carrera para la que ese candado existe. Se toman los
+ * dos en orden ascendente de uuid — el único orden total que dos transacciones que no se
+ * conocen pueden acordar sin hablarse.
+ */
+export async function moverElemento(actorId: string, entrada: AsignarElemento): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [previa] = await tx`select release_id from release_elemento
+      where elemento_id = ${entrada.elementoId} and workspace_id = ${entrada.workspaceId}`;
+    if (!previa) {
+      throw new ErrorEntrega('Ese elemento no está asignado a ningún release: asígnalo');
+    }
+    const origen = previa.release_id as string;
+    if (origen === entrada.releaseId) {
+      throw new ErrorEntrega('Ese elemento ya está en ese release');
+    }
+    const [destino] = await tx`select dv.servicio_id from release r
+      join design_version dv on dv.id = r.design_version_id and dv.workspace_id = r.workspace_id
+      where r.id = ${entrada.releaseId} and r.workspace_id = ${entrada.workspaceId}`;
+    if (!destino) {
+      throw new ErrorEntrega('Ese release no existe en este workspace');
+    }
+    await bloquearServicio(tx, destino.servicio_id as string);
+    for (const rel of [origen, entrada.releaseId].sort()) {
+      await bloquearRelease(tx, rel);
+    }
+    // Se repite el release de origen en el DELETE: si otra transacción lo movió mientras
+    // esperábamos el candado, no borramos bajo el candado equivocado — no borramos nada y
+    // lo decimos, igual que en `desasignarElemento`.
+    const fuera = await tx`delete from release_elemento
+      where elemento_id = ${entrada.elementoId} and workspace_id = ${entrada.workspaceId}
+        and release_id = ${origen}`;
+    if (fuera.count === 0) {
+      throw new ErrorEntrega(
+        'Ese elemento ya no está donde estaba, o su release ya salió (alcance fijo)',
+      );
+    }
     await asignarElementosAlRelease(tx, actorId, entrada.workspaceId, entrada.releaseId, [
       { elementoId: entrada.elementoId, razon: entrada.razon },
     ]);

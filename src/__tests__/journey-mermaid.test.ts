@@ -212,6 +212,22 @@ describe('validarJourney', () => {
     expect(senales).toEqual([]);
   });
 
+  it('un journey que empieza bifurcando desde una decisión recorre las dos ramas', () => {
+    const ev = [{ id: id(), titulo: 'E' }];
+    const fase = nodo({ tipo: 'fase', etiqueta: 'F', orden: 0 });
+    // La decisión es la entrada: `transicion` admite decisión→paso, así que un journey
+    // puede empezar bifurcando. Anclar el recorrido en «el primer paso» dejaría la otra
+    // rama marcada como inalcanzable y no miraría siquiera la decisión de entrada.
+    const d = nodo({ tipo: 'decision', etiqueta: '¿Tiene certificado?', orden: 0, faseId: fase.id });
+    const a = nodo({ tipo: 'paso', etiqueta: 'Vía digital', orden: 0, faseId: fase.id, evidencias: ev });
+    const b = nodo({ tipo: 'paso', etiqueta: 'Vía presencial', orden: 1, faseId: fase.id, evidencias: ev });
+    const senales = validarJourney(
+      journey([fase, d, a, b], [arista(d, a, 'transicion', 'sí'), arista(d, b, 'transicion', 'no')]),
+    );
+
+    expect(senales).toEqual([]);
+  });
+
   it('la acción frontstage sin soporte backstage es señal alta', () => {
     const accion = nodo({
       tipo: 'accion-frontstage',

@@ -16,6 +16,7 @@ import {
   agregarAristaAlJourney,
   agregarNodoAlJourney,
   borrarAristaDelJourney,
+  editarAristaDelJourney,
   borrarNodoDelJourney,
   congelarSnapshotDelJourney,
   desenlazarEvidenciaDelNodo,
@@ -30,6 +31,7 @@ import {
   EXTREMOS_ARISTA,
   TIPOS_ARISTA,
   TIPOS_NODO,
+  type AristaDeJourney,
   type JourneyCompleto,
   type NodoDeJourney,
   type SenalValidacion,
@@ -359,37 +361,16 @@ function BloqueModelo({
           </span>
         )}
         {journey.aristas.map((a) => (
-          <div
+          <FilaArista
             key={a.id}
-            style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}
-          >
-            <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-body)' }}>
-              {porId.get(a.origenId)?.etiqueta ?? '—'}
-            </span>
-            <span style={{ font: '500 11px var(--font-mono)', color: 'var(--accent)' }}>
-              —{ETIQUETA_TIPO_ARISTA[a.tipo]}
-              {a.condicion ? ` (${a.condicion})` : ''}→
-            </span>
-            <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-body)' }}>
-              {porId.get(a.destinoId)?.etiqueta ?? '—'}
-            </span>
-            {editable && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={async () => {
-                  onError(null);
-                  const r = await borrarAristaDelJourney({
-                    data: { workspaceId, aristaId: a.id },
-                  });
-                  if (r.ok) await onCambio();
-                  else onError(r.error);
-                }}
-              >
-                Quitar
-              </Button>
-            )}
-          </div>
+            workspaceId={workspaceId}
+            arista={a}
+            origen={porId.get(a.origenId) ?? null}
+            destino={porId.get(a.destinoId) ?? null}
+            editable={editable}
+            onCambio={onCambio}
+            onError={onError}
+          />
         ))}
       </Card>
     </div>
@@ -759,6 +740,121 @@ function FilaNodo({
             Cancelar
           </Button>
         </div>
+      )}
+    </div>
+  );
+}
+
+/** Una relación con su edición en sitio. Solo el tipo y la condición: cambiar los
+ * extremos es OTRA relación —para eso está el borrado—, y así la identidad de una
+ * arista significa siempre lo mismo. */
+function FilaArista({
+  workspaceId,
+  arista,
+  origen,
+  destino,
+  editable,
+  onCambio,
+  onError,
+}: {
+  workspaceId: string;
+  arista: AristaDeJourney;
+  origen: NodoDeJourney | null;
+  destino: NodoDeJourney | null;
+  editable: boolean;
+  onCambio: () => Promise<void>;
+  onError: (e: string | null) => void;
+}) {
+  const [editando, setEditando] = useState(false);
+  const [tipo, setTipo] = useState<TipoArista>(arista.tipo);
+  const [condicion, setCondicion] = useState(arista.condicion);
+  const [ocupado, setOcupado] = useState(false);
+
+  async function guardar() {
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await editarAristaDelJourney({
+        data: { workspaceId, aristaId: arista.id, tipo, condicion },
+      });
+      if (r.ok) {
+        setEditando(false);
+        await onCambio();
+      } else onError(r.error);
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-body)' }}>
+        {origen?.etiqueta ?? '—'}
+      </span>
+      {!editando && (
+        <span style={{ font: '500 11px var(--font-mono)', color: 'var(--accent)' }}>
+          —{ETIQUETA_TIPO_ARISTA[arista.tipo]}
+          {arista.condicion ? ` (${arista.condicion})` : ''}→
+        </span>
+      )}
+      {editando && (
+        <>
+          <Select
+            value={tipo}
+            onChange={(e) => setTipo(e.target.value as TipoArista)}
+            style={{ minWidth: 150 }}
+          >
+            {TIPOS_ARISTA.map((t) => (
+              <option key={t} value={t}>
+                {ETIQUETA_TIPO_ARISTA[t]}
+              </option>
+            ))}
+          </Select>
+          <Input
+            placeholder="Condición"
+            value={condicion}
+            onChange={(e) => setCondicion(e.target.value)}
+            style={{ minWidth: 180 }}
+          />
+        </>
+      )}
+      <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-body)' }}>
+        {destino?.etiqueta ?? '—'}
+      </span>
+      {editable && !editando && (
+        <>
+          <Button size="sm" variant="ghost" onClick={() => setEditando(true)}>
+            Editar
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={ocupado}
+            onClick={async () => {
+              onError(null);
+              setOcupado(true);
+              try {
+                const r = await borrarAristaDelJourney({ data: { workspaceId, aristaId: arista.id } });
+                if (r.ok) await onCambio();
+                else onError(r.error);
+              } finally {
+                setOcupado(false);
+              }
+            }}
+          >
+            Quitar
+          </Button>
+        </>
+      )}
+      {editando && (
+        <>
+          <Button size="sm" disabled={ocupado} onClick={() => void guardar()}>
+            Guardar
+          </Button>
+          <Button size="sm" variant="ghost" disabled={ocupado} onClick={() => setEditando(false)}>
+            Cancelar
+          </Button>
+        </>
       )}
     </div>
   );

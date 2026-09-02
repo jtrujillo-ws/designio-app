@@ -5,6 +5,7 @@ import {
   AgregarAristaSchema,
   AgregarNodoSchema,
   BorrarAristaSchema,
+  EditarAristaSchema,
   BorrarNodoSchema,
   CongelarJourneySchema,
   CrearJourneySchema,
@@ -20,6 +21,7 @@ import {
   borrarNodo,
   congelarSnapshot,
   crearJourney,
+  editarArista,
   editarNodo,
   desenlazarEvidenciaDeNodo,
   enlazarEvidenciaANodo,
@@ -135,6 +137,21 @@ export const agregarAristaAlJourney = createServerFn({ method: 'POST' })
     try {
       const r = await agregarArista(actorId, data);
       return { ok: true as const, aristaId: r.aristaId };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+export const editarAristaDelJourney = createServerFn({ method: 'POST' })
+  .inputValidator(EditarAristaSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await editarArista(actorId, data);
+      return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

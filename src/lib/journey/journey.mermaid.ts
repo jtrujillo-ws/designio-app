@@ -146,6 +146,23 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
   const primeroId = secuencia[0]?.id ?? null;
   const ultimoId = secuencia[secuencia.length - 1]?.id ?? null;
 
+  // La ENTRADA del recorrido no es «el primer paso» a secas: una transición también
+  // puede salir de una decisión, así que un journey puede empezar bifurcando y anclar en
+  // el primer paso dejaría la otra rama marcada como inalcanzable.
+  //
+  // Pero la entrada es UNA: un journey tiene un principio. Se toma el primero de la
+  // secuencia entre los nodos transitables sin transición de entrada — así una decisión
+  // que abre el journey es la entrada, y un paso sin entrada que aparece más adelante
+  // sigue siendo lo que es: una costura rota, no un segundo comienzo.
+  //
+  // Si no hay ninguno (todo el grafo es un ciclo), se ancla en el primer paso.
+  const transitables = journey.nodos.filter((n) => n.tipo === 'paso' || n.tipo === 'decision');
+  const candidatas = porSecuencia(
+    journey,
+    transitables.filter((n) => conSalida.has(n.id) && !conEntrada.has(n.id)),
+  );
+  const entrada = candidatas[0]?.id ?? primeroId;
+
   // Alcanzable = se LLEGA desde el inicio siguiendo transiciones, no «alguien me apunta».
   // Un ciclo suelto C→D→C se apunta a sí mismo y quedaría exculpado con lo segundo,
   // que es precisamente el grafo roto que hay que ver.
@@ -159,8 +176,8 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
   // le falta salida. Sin esto, un `A → B` y `A → C` con dos finales reporta uno de los
   // dos como roto, que es un journey perfectamente normal.
   const trasBifurcacion = new Set<string>();
-  const pendientes: { id: string; bifurcado: boolean }[] = primeroId
-    ? [{ id: primeroId, bifurcado: false }]
+  const pendientes: { id: string; bifurcado: boolean }[] = entrada
+    ? [{ id: entrada, bifurcado: false }]
     : [];
   while (pendientes.length > 0) {
     const { id: actual, bifurcado } = pendientes.pop()!;

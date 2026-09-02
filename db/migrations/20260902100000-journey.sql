@@ -212,6 +212,14 @@ create policy journey_arista_insert on journey_arista
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and creado_por = app_user_id()
   );
+-- Corregir el tipo o la condición de una relación es edición estructurada (RF-05.2),
+-- no una operación destructiva: borrar y rehacer cambiaría su identidad y dejaría un
+-- par borrado/alta en la auditoría para lo que fue una corrección de una palabra.
+-- Los EXTREMOS no se editan: cambiarlos es otra relación, y para eso está el borrado.
+create policy journey_arista_update on journey_arista
+  for update
+  using (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'))
+  with check (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'));
 create policy journey_arista_delete on journey_arista
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
@@ -348,7 +356,7 @@ begin
   return new;
 end $$;
 create trigger journey_arista_extremos
-  before insert on journey_arista
+  before insert or update on journey_arista
   for each row execute function journey_arista_extremos_guard();
 revoke execute on function journey_arista_extremos_guard() from public;
 
@@ -391,6 +399,7 @@ begin
       'aristaId', fila->'id', 'tipo', fila->'tipo',
       'origenId', fila->'origen_id', 'destinoId', fila->'destino_id');
     evento := case tg_op when 'INSERT' then 'JourneyAristaAgregada'
+                         when 'UPDATE' then 'JourneyAristaEditada'
                          else 'JourneyAristaBorrada' end;
   end if;
 
@@ -403,7 +412,7 @@ create trigger journey_nodo_auditoria
   after insert or update or delete on journey_nodo
   for each row execute function journey_grafo_auditoria();
 create trigger journey_arista_auditoria
-  after insert or delete on journey_arista
+  after insert or update or delete on journey_arista
   for each row execute function journey_grafo_auditoria();
 create trigger journey_nodo_evidencia_auditoria
   after insert or delete on journey_nodo_evidencia
@@ -420,4 +429,6 @@ grant select, insert on journey_nodo_evidencia, journey_snapshot to designio_app
 grant update (etiqueta, detalle, fase_id, orden, responsable) on journey_nodo to designio_app;
 -- journey sin UPDATE: no tiene estado que mover y su contenido es su identidad.
 -- El grafo se corrige borrando y rehaciendo; el snapshot conserva lo que hubo.
+-- Solo el tipo y la condición: los extremos y el journey son la identidad de la arista.
+grant update (tipo, condicion) on journey_arista to designio_app;
 grant delete on journey_nodo, journey_arista, journey_nodo_evidencia to designio_app;

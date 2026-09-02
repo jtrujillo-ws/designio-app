@@ -133,6 +133,14 @@ export const AgregarAristaSchema = z.object({
 });
 export type AgregarArista = z.infer<typeof AgregarAristaSchema>;
 
+export const EditarAristaSchema = z.object({
+  workspaceId: z.string().uuid(),
+  aristaId: z.string().uuid(),
+  tipo: z.enum(TIPOS_ARISTA),
+  condicion: z.string().trim().max(200).default(''),
+});
+export type EditarArista = z.infer<typeof EditarAristaSchema>;
+
 export const BorrarAristaSchema = z.object({
   workspaceId: z.string().uuid(),
   aristaId: z.string().uuid(),

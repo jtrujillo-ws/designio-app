@@ -6,6 +6,7 @@ import type {
   AgregarArista,
   AgregarNodo,
   CrearJourney,
+  EditarArista,
   EditarNodo,
   JourneyCompleto,
   ResumenJourney,
@@ -206,6 +207,27 @@ export async function agregarArista(
     }
     if (!fila) throw new ErrorJourney('El journey no existe o no puedes editarlo');
     return { aristaId: fila.id as string };
+  });
+}
+
+/** Corregir el tipo o la condición de una relación (RF-05.2). Los extremos no se
+ * editan: cambiarlos es otra relación, y para eso está el borrado — así la identidad
+ * de una arista significa siempre lo mismo. */
+export async function editarArista(actorId: string, entrada: EditarArista): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    let filas;
+    try {
+      filas = await tx`
+        update journey_arista
+        set tipo = ${entrada.tipo}, condicion = ${entrada.condicion}
+        where id = ${entrada.aristaId} and workspace_id = ${entrada.workspaceId}`;
+    } catch (e) {
+      comoErrorDeDominio(e);
+    }
+    if (filas!.count === 0) {
+      throw new ErrorJourney('La relación no existe o no puedes editarla');
+    }
   });
 }
 

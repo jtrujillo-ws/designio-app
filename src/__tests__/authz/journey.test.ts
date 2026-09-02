@@ -8,6 +8,7 @@ import {
   congelarSnapshot,
   crearJourney,
   desenlazarEvidenciaDeNodo,
+  editarArista,
   editarNodo,
   enlazarEvidenciaANodo,
   ErrorJourney,
@@ -420,6 +421,53 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
 
     // Un paso NO lleva catálogo: existe dentro de su journey y no se comparte.
     expect(j1!.nodos.find((n) => n.tipo === 'paso')!.catalogoId).toBeNull();
+  });
+
+  it('el tipo y la condición de una relación se corrigen sin borrarla', async () => {
+    const sistema = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'sistema',
+      etiqueta: 'Motor de reglas',
+      detalle: '',
+      faseId: null,
+      responsable: 'Riesgo',
+    });
+    const a = await agregarArista(leadId, {
+      workspaceId: ws,
+      journeyId,
+      origenId: sistema.nodoId,
+      destinoId: pasoId,
+      tipo: 'soporta',
+      condicion: '',
+    });
+
+    await editarArista(leadId, {
+      workspaceId: ws,
+      aristaId: a.aristaId,
+      tipo: 'dependencia',
+      condicion: 'solo si el documento es extranjero',
+    });
+    const j = await journeyCompleto(leadId, ws, journeyId);
+    const editada = j!.aristas.find((x) => x.id === a.aristaId)!;
+    expect(editada.tipo).toBe('dependencia');
+    expect(editada.condicion).toBe('solo si el documento es extranjero');
+
+    // El guard de extremos corre TAMBIÉN al editar: un tipo cuyos extremos no encajan
+    // se rechaza igual que en el alta.
+    await expect(
+      editarArista(leadId, {
+        workspaceId: ws,
+        aristaId: a.aristaId,
+        tipo: 'transicion',
+        condicion: '',
+      }),
+    ).rejects.toThrow(/transición va entre pasos o decisiones/);
+
+    // Y la edición deja su propio rastro, distinto del par borrado/alta.
+    const [ev] = await sqlAdmin()`select tipo from evento_dominio
+      where workspace_id = ${ws} and tipo = 'JourneyAristaEditada' limit 1`;
+    expect(ev).toBeDefined();
   });
 
   it('quitar un enlace de evidencia no obliga a borrar el nodo entero', async () => {

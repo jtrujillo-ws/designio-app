@@ -266,6 +266,10 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
       if (code === '23503') {
         throw new ErrorMetodo('El objeto enlazado no existe en este workspace');
       }
+      // Guard de la base (P0001): la decisión citada es de otro proyecto.
+      if (code === 'P0001' && (e as { message?: string }).message) {
+        throw new ErrorMetodo((e as { message: string }).message);
+      }
       throw e;
     }
     if (filas.count === 0) {

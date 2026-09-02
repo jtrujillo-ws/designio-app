@@ -14,6 +14,7 @@ import {
   agregarCita,
   crearInsight,
   ErrorInsight,
+  insightsCitables,
   insightsDelWorkspace,
   registrarContradiccion,
   validarInsight,
@@ -37,9 +38,23 @@ export const insightsDelEspacio = createServerFn({ method: 'GET' })
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
     try {
-      return await insightsDelWorkspace(usuarioId, data.workspaceId);
+      return await insightsDelWorkspace(usuarioId, data.workspaceId, data.cursor);
     } catch (e) {
-      if (e instanceof ErrorAutorizacion) return null;
+      if (e instanceof ErrorAutorizacion) return { insights: [], siguiente: null };
+      throw e;
+    }
+  });
+
+/** Proyección mínima para pickers: sin ella la pantalla del proyecto arrastraría toda
+ * la ficha de cada insight solo para pintar un `<option>`. */
+export const insightsParaCitar = createServerFn({ method: 'GET' })
+  .inputValidator(InsightsInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await insightsCitables(usuarioId, data.workspaceId);
+    } catch (e) {
+      if (e instanceof ErrorAutorizacion) return { insights: [], hayMas: false };
       throw e;
     }
   });

@@ -11,6 +11,7 @@ import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { cerrarSesion } from '@/lib/auth/auth.functions';
 import type { ArbolWorkspace } from '@/lib/arbol/arbol.schemas';
 import { LOOP_BANCO_ANDINO, type JourneyLoop } from '@/lib/loop/loop-data';
+import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 
 /** Pantalla Loop J1–J7 — recreación de la referencia hifi del design system (ui_kits/designio). */
 
@@ -53,7 +54,7 @@ export function LoopScreen({
     <div>
       <Topbar usuario={usuario} membresiaActiva={membresiaActiva} />
       <div style={{ display: 'flex', minHeight: 780 }}>
-        <Sidebar arbol={arbol} />
+        <Sidebar arbol={arbol} rol={membresiaActiva?.rol ?? ''} />
         <main style={{ flex: 1, padding: '28px 32px', minWidth: 0 }}>
           <div style={{ ...micro, color: 'var(--text-muted)' }}>
             {arbol?.workspaceNombre ?? '—'} / Servicios /{' '}
@@ -272,7 +273,7 @@ const filaArbol: CSSProperties = {
 
 const truncado: CSSProperties = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 
-function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
+function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) {
   const item: CSSProperties = {
     font: '500 13px var(--font-sans)',
     color: 'var(--text-body)',
@@ -380,6 +381,13 @@ function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
       <Link to="/personas" style={{ ...item, textDecoration: 'none' }}>
         <span>Personas y permisos</span>
       </Link>
+      {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para
+          los demás roles y, si lo teclean, la RLS de evento_dominio no les da filas. */}
+      {(ROLES_AUDITORIA as readonly string[]).includes(rol) && (
+        <Link to="/auditoria" style={{ ...item, textDecoration: 'none' }}>
+          <span>Auditoría</span>
+        </Link>
+      )}
       <div style={{ marginTop: 'auto', font: '400 11.5px/1.5 var(--font-sans)', color: 'var(--text-faint)', padding: 10 }}>
         La organización cliente es propietaria del workspace; la boutique opera como autorizada.
       </div>

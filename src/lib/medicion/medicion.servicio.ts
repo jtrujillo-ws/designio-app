@@ -211,10 +211,11 @@ export async function firmarRegistry(
     await bloquearRegistry(tx, entrada.registryId);
     let firmado;
     try {
-      // El sello temporal lo pone el guard (la base), no el caller: aquí solo se pide.
+      // El sello temporal lo pone el guard (la base), no el caller: `firmado_en` ni
+      // siquiera está en el grant del rol de app, así que aquí solo se pide la firma.
       firmado = await tx`
         update metric_registry
-        set estado = 'firmado', firmado_por = ${actorId}, firmado_en = now()
+        set estado = 'firmado', firmado_por = ${actorId}
         where id = ${entrada.registryId} and workspace_id = ${entrada.workspaceId}
         returning id`;
     } catch (e) {

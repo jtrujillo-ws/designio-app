@@ -38,7 +38,10 @@ export const Route = createFileRoute('/_autenticada/insights')({
     ]);
     return {
       workspaceId,
-      insights: insights ?? [],
+      insights: insights.insights,
+      // Cursor keyset de la primera página: «cargar más» sigue desde aquí sin saltar
+      // ni repetir. Sin esto, un insight viejo quedaba fuera de alcance para siempre.
+      siguiente: insights.siguiente,
       evidencias: evidencias?.evidencias ?? [],
       hayMasEvidencias: evidencias?.hayMas ?? false,
     };
@@ -65,6 +68,30 @@ function PantallaInsights() {
   const [titulo, setTitulo] = useState('');
   const [resumen, setResumen] = useState('');
   const [ocupado, setOcupado] = useState(false);
+  // Páginas cargadas DESPUÉS de la del loader. Se guardan aquí y no en la URL porque
+  // son acumulativas: volver atrás no debería reconstruir seis páginas.
+  const [masPaginas, setMasPaginas] = useState<InsightCompleto[]>([]);
+  const [cursor, setCursor] = useState<{ creadoEn: string; id: string } | null>(null);
+  const [cargando, setCargando] = useState(false);
+  const cursorVivo = cursor ?? datos?.siguiente ?? null;
+  const listados = [...(datos?.insights ?? []), ...masPaginas];
+
+  async function cargarMas() {
+    if (!datos || !cursorVivo) return;
+    setCargando(true);
+    setError(null);
+    try {
+      const r = await insightsDelEspacio({
+        data: { workspaceId: datos.workspaceId, cursor: cursorVivo },
+      });
+      setMasPaginas((previas) => [...previas, ...r.insights]);
+      setCursor(r.siguiente);
+    } catch {
+      setError('No se pudieron cargar más insights; intenta de nuevo');
+    } finally {
+      setCargando(false);
+    }
+  }
 
   const rol = membresiaActiva?.rol ?? '';
   const puedeCurar = (ROLES_CURADORES as readonly string[]).includes(rol);
@@ -175,14 +202,14 @@ function PantallaInsights() {
               )}
             </Card>
 
-            {datos.insights.length === 0 && (
+            {listados.length === 0 && (
               <Card style={{ padding: 24 }}>
                 <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
                   Todavía no hay insights. La investigación de la etapa 1 aterriza aquí.
                 </span>
               </Card>
             )}
-            {datos.insights.map((insight) => (
+            {listados.map((insight) => (
               <FichaInsight
                 key={insight.id}
                 workspaceId={datos.workspaceId}
@@ -194,6 +221,13 @@ function PantallaInsights() {
                 onError={setError}
               />
             ))}
+            {cursorVivo && (
+              <div>
+                <Button size="sm" variant="secondary" disabled={cargando} onClick={() => void cargarMas()}>
+                  {cargando ? 'Cargando…' : 'Cargar más insights'}
+                </Button>
+              </div>
+            )}
           </>
         )}
       </main>
@@ -307,7 +341,7 @@ function FichaInsight({
             {a.citas.map((c) => (
               <span key={c.id} style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
                 «{c.fragmento}» — {c.evidenciaTitulo}
-                {c.localizacion ? ` · ${c.localizacion}` : ''}
+                {` · ${c.localizacion}`}
               </span>
             ))}
             {editable && puedeCurar && citandoDe !== a.id && (
@@ -337,15 +371,23 @@ function FichaInsight({
                   value={fragmento}
                   onChange={(e) => setFragmento(e.target.value)}
                 />
+                {/* Obligatoria: la cita tiene que devolver al PUNTO. Sin esto vuelve a
+                    ser una referencia al documento, que es lo que no sirve al auditar. */}
                 <Input
-                  placeholder="Dónde está (página, párrafo o marca de tiempo)"
+                  placeholder="Dónde está (página, párrafo o marca de tiempo) — obligatorio"
                   value={localizacion}
                   onChange={(e) => setLocalizacion(e.target.value)}
+                  required
                 />
                 <div style={{ display: 'flex', gap: 8 }}>
                   <Button
                     size="sm"
-                    disabled={ocupado || evidenciaId === '' || fragmento.trim() === ''}
+                    disabled={
+                      ocupado ||
+                      evidenciaId === '' ||
+                      fragmento.trim() === '' ||
+                      localizacion.trim() === ''
+                    }
                     onClick={() =>
                       void ejecutar(
                         () =>

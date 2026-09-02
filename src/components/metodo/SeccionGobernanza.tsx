@@ -14,6 +14,7 @@ import {
   veredictoDeArquetipo,
 } from '@/lib/metodo/gobernanza.functions';
 import {
+  ETIQUETA_ALCANCE,
   ETIQUETA_TIPO_DECISION,
   TIPOS_DECISION,
   type GobernanzaDeProyecto,
@@ -50,7 +51,9 @@ export function SeccionGobernanza({
   proyecto,
   gobernanza,
   insightsValidados,
+  hayMasInsights,
   evidencias,
+  hayMasEvidencias,
   rol,
   onCambio,
   onError,
@@ -59,7 +62,9 @@ export function SeccionGobernanza({
   proyecto: ProyectoMetodo;
   gobernanza: GobernanzaDeProyecto;
   insightsValidados: { id: string; titulo: string }[];
+  hayMasInsights: boolean;
   evidencias: { id: string; titulo: string }[];
+  hayMasEvidencias: boolean;
   rol: string;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -74,6 +79,7 @@ export function SeccionGobernanza({
         proyecto={proyecto}
         decisiones={gobernanza.decisiones}
         insightsValidados={insightsValidados}
+        hayMasInsights={hayMasInsights}
         esLead={esLead}
         onCambio={onCambio}
         onError={onError}
@@ -84,6 +90,7 @@ export function SeccionGobernanza({
         arquetipos={gobernanza.arquetipos}
         segmentos={gobernanza.segmentosDisponibles}
         evidencias={evidencias}
+        hayMasEvidencias={hayMasEvidencias}
         esCurador={esCurador}
         onCambio={onCambio}
         onError={onError}
@@ -92,6 +99,8 @@ export function SeccionGobernanza({
         workspaceId={workspaceId}
         proyecto={proyecto}
         reaperturas={gobernanza.reaperturas}
+        insightsValidados={insightsValidados}
+        hayMasInsights={hayMasInsights}
         esLead={esLead}
         onCambio={onCambio}
         onError={onError}
@@ -105,6 +114,7 @@ function BloqueDecisiones({
   proyecto,
   decisiones,
   insightsValidados,
+  hayMasInsights,
   esLead,
   onCambio,
   onError,
@@ -113,6 +123,7 @@ function BloqueDecisiones({
   proyecto: ProyectoMetodo;
   decisiones: GobernanzaDeProyecto['decisiones'];
   insightsValidados: { id: string; titulo: string }[];
+  hayMasInsights: boolean;
   esLead: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -260,6 +271,12 @@ function BloqueDecisiones({
           />
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             <span style={micro}>Insights que la sostienen (al menos uno)</span>
+            {hayMasInsights && (
+              <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
+                Solo se listan los 200 validados más recientes: si el que sostiene esta
+                decisión no aparece, búscalo en Insights y valídalo o vuelve a citarlo.
+              </span>
+            )}
             {insightsValidados.map((i) => (
               <label
                 key={i.id}
@@ -302,6 +319,7 @@ function BloqueArquetipos({
   arquetipos,
   segmentos,
   evidencias,
+  hayMasEvidencias,
   esCurador,
   onCambio,
   onError,
@@ -311,6 +329,7 @@ function BloqueArquetipos({
   arquetipos: GobernanzaDeProyecto['arquetipos'];
   segmentos: { id: string; nombre: string }[];
   evidencias: { id: string; titulo: string }[];
+  hayMasEvidencias: boolean;
   esCurador: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -450,6 +469,14 @@ function BloqueArquetipos({
                     {e.titulo}
                   </option>
                 ))}
+                {/* Confirmar un arquetipo EXIGE evidencia enlazada: si la lista viene
+                    recortada y la que hace falta no está, el usuario tiene que saber
+                    que le faltan opciones y no que le falta evidencia. */}
+                {hayMasEvidencias && (
+                  <option value="" disabled>
+                    … hay más evidencias (solo se listan las 200 más recientes)
+                  </option>
+                )}
               </Select>
               <Button size="sm" disabled={ocupado || evidenciaId === ''} onClick={() => void apoyar(a.id)}>
                 Enlazar
@@ -543,6 +570,8 @@ function BloqueReaperturas({
   workspaceId,
   proyecto,
   reaperturas,
+  insightsValidados,
+  hayMasInsights,
   esLead,
   onCambio,
   onError,
@@ -550,6 +579,8 @@ function BloqueReaperturas({
   workspaceId: string;
   proyecto: ProyectoMetodo;
   reaperturas: GobernanzaDeProyecto['reaperturas'];
+  insightsValidados: { id: string; titulo: string }[];
+  hayMasInsights: boolean;
   esLead: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -557,6 +588,7 @@ function BloqueReaperturas({
   const [abierto, setAbierto] = useState(false);
   const [etapaNumero, setEtapaNumero] = useState(0);
   const [motivo, setMotivo] = useState('');
+  const [declarados, setDeclarados] = useState<string[]>([]);
   const [ocupado, setOcupado] = useState(false);
 
   async function reabrir() {
@@ -564,11 +596,18 @@ function BloqueReaperturas({
     onError(null);
     try {
       const r = await reabrirEtapaDelProyecto({
-        data: { workspaceId, proyectoId: proyecto.id, etapaNumero, motivo },
+        data: {
+          workspaceId,
+          proyectoId: proyecto.id,
+          etapaNumero,
+          motivo,
+          insightIds: declarados,
+        },
       });
       if (r.ok) {
         setAbierto(false);
         setMotivo('');
+        setDeclarados([]);
         await onCambio();
       } else onError(r.error);
     } catch {
@@ -585,7 +624,9 @@ function BloqueReaperturas({
       </span>
       <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
         Reabrir no borra la aprobación del gate — es historia con firma y fecha. Marca para
-        revisión las decisiones tomadas de esa etapa en adelante (RF-04.9, SYS-10).
+        revisión las decisiones AFECTADAS (RF-04.9, SYS-10): si declaras qué insights
+        cambiaron, solo se marcan las que se apoyan en ellos; si no declaras ninguno, se
+        marca la etapa entera hacia adelante y así queda registrado.
       </span>
 
       {reaperturas.length === 0 && (
@@ -597,10 +638,17 @@ function BloqueReaperturas({
         <div key={r.id} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
           <span style={{ font: '600 12.5px var(--font-sans)', color: 'var(--ink)' }}>
             Etapa {r.etapaNumero} · {r.reabiertoEn} · {r.decisionesMarcadas} decisiones marcadas
+            {' · '}
+            {ETIQUETA_ALCANCE[r.alcance]}
           </span>
           <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-body)' }}>
             {r.motivo}
           </span>
+          {r.insights.length > 0 && (
+            <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+              Cambió: {r.insights.map((i) => i.titulo).join(', ')}
+            </span>
+          )}
         </div>
       ))}
 
@@ -625,6 +673,44 @@ function BloqueReaperturas({
             value={motivo}
             onChange={(e) => setMotivo(e.target.value)}
           />
+          {insightsValidados.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
+                Qué insights cambiaron (opcional; acota qué decisiones entran en revisión)
+              </span>
+              {hayMasInsights && (
+                <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
+                  Solo se listan los 200 validados más recientes: si el que cambió no está
+                  aquí, la reapertura marcará la etapa completa en vez de acotarla.
+                </span>
+              )}
+              {insightsValidados.map((i) => (
+                <label
+                  key={i.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    font: '400 12.5px var(--font-sans)',
+                    color: 'var(--text-body)',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={declarados.includes(i.id)}
+                    onChange={(e) =>
+                      setDeclarados((previos) =>
+                        e.target.checked
+                          ? [...previos, i.id]
+                          : previos.filter((id) => id !== i.id),
+                      )
+                    }
+                  />
+                  {i.titulo}
+                </label>
+              ))}
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 8 }}>
             <Button size="sm" disabled={ocupado || motivo.trim() === ''} onClick={() => void reabrir()}>
               Reabrir

@@ -6,6 +6,7 @@ import {
   agregarCita,
   crearInsight,
   ErrorInsight,
+  insightsCitables,
   insightsDelWorkspace,
   registrarContradiccion,
   validarInsight,
@@ -125,7 +126,8 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
     });
 
     await validarInsight(leadId, ws, insightId);
-    const [insight] = await insightsDelWorkspace(leadId, ws);
+    const { insights: pagina } = await insightsDelWorkspace(leadId, ws);
+    const insight = pagina[0];
     expect(insight!.estado).toBe('validado');
     expect(insight!.afirmaciones).toHaveLength(2);
     expect(insight!.afirmaciones[0]!.citas[0]!.localizacion).toBe('p. 14');
@@ -146,7 +148,8 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
       evidenciaId,
       descripcion: 'En sucursal el abandono es del 20%, no del 62%',
     });
-    const [insight] = await insightsDelWorkspace(stakeId, ws);
+    const { insights: paginaStake } = await insightsDelWorkspace(stakeId, ws);
+    const insight = paginaStake[0];
     expect(insight!.contradicciones).toHaveLength(1);
 
     // La misma evidencia no se registra dos veces sobre el mismo insight.
@@ -174,9 +177,19 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
         afirmacionId: af.afirmacionId,
         evidenciaId: evidenciaAjenaId,
         fragmento: 'Robado',
-        localizacion: '',
+        localizacion: 'p. 1',
       }),
     ).rejects.toThrow(/no existe en este workspace/);
+  });
+
+  it('el picker solo ofrece insights validados y no arrastra la ficha completa', async () => {
+    // El test anterior dejó un insight propuesto sin validar: si apareciera aquí, el
+    // checklist podría citar razonamiento que nadie sostuvo todavía.
+    const { insights, hayMas } = await insightsCitables(stakeId, ws);
+    expect(insights.map((i) => i.id)).toEqual([insightId]);
+    expect(hayMas).toBe(false);
+    // La proyección es id + título y nada más: es lo que la hace barata.
+    expect(Object.keys(insights[0]!).sort()).toEqual(['id', 'titulo']);
   });
 
   it('sin contexto de usuario los insights son invisibles; la cuenta desactivada tampoco lee', async () => {

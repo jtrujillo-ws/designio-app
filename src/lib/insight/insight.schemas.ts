@@ -29,8 +29,13 @@ export const AgregarCitaSchema = z.object({
   afirmacionId: z.string().uuid(),
   evidenciaId: z.string().uuid(),
   fragmento: z.string().trim().min(1, 'El fragmento citado es obligatorio').max(2000),
-  /** Página, párrafo o marca de tiempo: la cita debe llevar al PUNTO, no al documento. */
-  localizacion: z.string().trim().max(200).default(''),
+  /** Página, párrafo o marca de tiempo. OBLIGATORIA: una cita sin localización lleva al
+   * documento, no al punto — y entonces no es una cita, es una referencia. */
+  localizacion: z
+    .string()
+    .trim()
+    .min(1, 'La localización es obligatoria: página, párrafo o marca de tiempo')
+    .max(200),
 });
 export type AgregarCita = z.infer<typeof AgregarCitaSchema>;
 
@@ -47,7 +52,14 @@ export const ValidarInsightSchema = z.object({
   insightId: z.string().uuid(),
 });
 
-export const InsightsInputSchema = z.object({ workspaceId: z.string().uuid() });
+export const InsightsInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  /** Keyset: el par (creado_en, id) de la última fila mostrada. Sin él, primera página. */
+  cursor: z
+    .object({ creadoEn: z.string(), id: z.string().uuid() })
+    .nullable()
+    .default(null),
+});
 
 /** Proyecciones de lectura. */
 export type CitaDeAfirmacion = {

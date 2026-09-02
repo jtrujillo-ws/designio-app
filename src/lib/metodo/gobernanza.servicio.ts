@@ -59,6 +59,10 @@ export async function registrarDecision(
         from nueva
         join insight i on i.workspace_id = ${entrada.workspaceId}
           and i.id = any(${insightIds}::uuid[])
+          -- Solo VALIDADOS: el picker ya los filtra, pero el endpoint acepta uuids
+          -- arbitrarios y una decisión apoyada en un insight propuesto sería una
+          -- decisión sin cadena. Los que no cuadren hacen fallar el conteo de abajo.
+          and i.estado = 'validado'
         returning insight_id
       ),
       evento as (
@@ -74,7 +78,9 @@ export async function registrarDecision(
       throw new ErrorGobernanza('El gate no existe en este workspace o no puedes decidir en él');
     }
     if ((fila.enlazados as number) !== insightIds.length) {
-      throw new ErrorGobernanza('Algún insight enlazado no existe en este workspace');
+      throw new ErrorGobernanza(
+        'Algún insight enlazado no existe en este workspace o todavía no está validado',
+      );
     }
     return { decisionId: fila.id as string };
   });
@@ -117,6 +123,12 @@ export async function crearArquetipo(
 ): Promise<{ arquetipoId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // MISMO candado por reto que toma aprobarGate. Sin él, dar de alta una hipótesis y
+    // aprobar G2 se cruzan: cada una ve el estado commiteado por la otra, tocan filas
+    // distintas y ambas confirman — volviendo a dejar un G2 aprobado con un arquetipo
+    // sin resolver, que es justo lo que la política nueva intenta impedir.
+    await tx`select pg_advisory_xact_lock(
+      hashtextextended('designio:reto:' || ${entrada.retoId}, 42))`;
     const segmentoIds = [...new Set(entrada.segmentoIds)];
     let fila;
     try {
@@ -156,6 +168,14 @@ export async function crearArquetipo(
       }
       if (code === '23503') {
         throw new ErrorGobernanza('El reto no existe en este workspace');
+      }
+      // WITH CHECK (42501): o no curas, o el G2 del reto ya se aprobó y agregar una
+      // hipótesis ahora la dejaría sin resolver para siempre.
+      if (code === '42501') {
+        throw new ErrorGobernanza(
+          'No puedes definir arquetipos: o no eres curador, o el G2 del reto ya está ' +
+            'aprobado (reabre la etapa 2 para agregar uno nuevo)',
+        );
       }
       throw e;
     }
@@ -226,8 +246,14 @@ export async function darVeredictoArquetipo(
 
 /**
  * Reabrir una etapa (RF-04.9, SYS-10): registra el motivo, devuelve la etapa a curso y
- * marca EN REVISIÓN las decisiones tomadas de ese gate en adelante — las que pudieron
- * apoyarse en lo que ahora cambia.
+ * marca EN REVISIÓN las decisiones AFECTADAS.
+ *
+ * «Afectadas» se computa, no se supone. Si la reapertura declara qué insights
+ * cambiaron, solo entran en revisión las decisiones de ese gate en adelante que se
+ * apoyan en alguno de ellos — que es lo que pide la spec y lo único que hace la marca
+ * creíble. Si no declara ninguno, se marcan todas las de esa etapa hacia adelante: la
+ * reapertura está diciendo que se movió el suelo entero, no que no se sabe. El alcance
+ * elegido queda grabado en la fila, así que el tablero no confunde una cosa con la otra.
  *
  * Lo que NO hace, deliberadamente: desaprobar el gate. Una aprobación es un hecho
  * histórico con fecha y firma; la reapertura no lo borra, lo cuestiona. El tablero
@@ -244,9 +270,17 @@ export async function reabrirEtapa(
 ): Promise<{ decisionesMarcadas: number }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    const insightIds = [...new Set(entrada.insightIds)];
     const [fila] = await tx`
       with quien as (
         select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
+      ),
+      declarados as (
+        -- Los insights que existen DE VERDAD en el workspace: si el conteo no cuadra
+        -- con lo pedido, la declaración era falsa y abajo se revierte todo.
+        select i.id from insight i
+        where i.workspace_id = ${entrada.workspaceId}
+          and i.id = any(${insightIds}::uuid[])
       ),
       marcadas as (
         update decision d set estado = 'en-revision'
@@ -256,6 +290,12 @@ export async function reabrirEtapa(
           and d.workspace_id = ${entrada.workspaceId}
           and g.numero >= ${entrada.etapaNumero}
           and d.estado = 'vigente'
+          and (
+            cardinality(${insightIds}::uuid[]) = 0
+            or exists (select 1 from decision_insight di
+              where di.decision_id = d.id and di.workspace_id = d.workspace_id
+                and di.insight_id = any(${insightIds}::uuid[]))
+          )
         returning d.id
       ),
       etapa as (
@@ -266,11 +306,20 @@ export async function reabrirEtapa(
       ),
       registro as (
         insert into reapertura_etapa (workspace_id, proyecto_id, etapa_numero, motivo,
-                                      decisiones_marcadas, reabierto_por)
+                                      alcance, decisiones_marcadas, reabierto_por)
         select ${entrada.workspaceId}, ${entrada.proyectoId}, ${entrada.etapaNumero},
-               ${entrada.motivo}, (select count(*)::int from marcadas), ${actorId}
+               ${entrada.motivo},
+               case when cardinality(${insightIds}::uuid[]) = 0
+                    then 'etapa-completa' else 'declarado' end,
+               (select count(*)::int from marcadas), ${actorId}
         from etapa
         returning id
+      ),
+      cambios as (
+        insert into reapertura_insight (reapertura_id, insight_id, workspace_id)
+        select registro.id, declarados.id, ${entrada.workspaceId}
+        from registro, declarados
+        returning insight_id
       ),
       evento as (
         insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
@@ -278,13 +327,21 @@ export async function reabrirEtapa(
           jsonb_build_object('proyectoId', ${entrada.proyectoId}::uuid,
                              'etapa', ${entrada.etapaNumero}::int,
                              'motivo', ${entrada.motivo}::text,
+                             'alcance', case when cardinality(${insightIds}::uuid[]) = 0
+                                             then 'etapa-completa' else 'declarado' end,
+                             'insightsDeclarados', (select count(*)::int from cambios),
                              'decisionesMarcadas', (select count(*)::int from marcadas)),
           ${actorId}, quien.rol
         from registro, quien
       )
-      select registro.id, (select count(*)::int from marcadas) as marcadas from registro`;
+      select registro.id, (select count(*)::int from marcadas) as marcadas,
+        (select count(*)::int from cambios) as declarados
+      from registro`;
     if (!fila) {
       throw new ErrorGobernanza('El proyecto o la etapa no existen, o no puedes reabrirla');
+    }
+    if ((fila.declarados as number) !== insightIds.length) {
+      throw new ErrorGobernanza('Algún insight declarado no existe en este workspace');
     }
     return { decisionesMarcadas: fila.marcadas as number };
   });
@@ -342,7 +399,15 @@ export async function gobernanzaDeProyecto(
         coalesce((
           select jsonb_agg(jsonb_build_object(
             'id', r.id, 'etapaNumero', r.etapa_numero, 'motivo', r.motivo,
+            'alcance', r.alcance,
             'decisionesMarcadas', r.decisiones_marcadas,
+            'insights', coalesce((
+              select jsonb_agg(jsonb_build_object('id', i2.id, 'titulo', i2.titulo)
+                order by i2.titulo)
+              from reapertura_insight ri
+              join insight i2 on i2.id = ri.insight_id and i2.workspace_id = ri.workspace_id
+              where ri.reapertura_id = r.id and ri.workspace_id = r.workspace_id
+            ), '[]'::jsonb),
             'reabiertoEn', to_char(r.reabierto_en, 'YYYY-MM-DD'))
             order by r.reabierto_en desc)
           from reapertura_etapa r

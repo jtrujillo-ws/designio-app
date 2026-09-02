@@ -233,7 +233,6 @@ create policy registry_firmar on metric_registry
   with check (
     estado = 'firmado'
     and firmado_por = app_user_id()
-    and firmado_en is not null
   );
 
 create policy entrada_insert on entrada_kpi
@@ -589,6 +588,15 @@ begin
       where ci.gate_id = new.id and ci.workspace_id = new.workspace_id) then
       raise exception 'no se puede aprobar: el gate no tiene checklist instanciado';
     end if;
+    -- Se conserva de la migración anterior: un ítem YA cumplido cuya decisión pasó a
+    -- 'en-revision' por una reapertura no cuenta como suficiencia (RF-04.9). Este
+    -- `create or replace` reescribe la función entera, así que omitirlo la desharía.
+    if exists (select 1 from checklist_item ci
+      join decision d on d.id = ci.decision_id and d.workspace_id = ci.workspace_id
+      where ci.gate_id = new.id and ci.workspace_id = new.workspace_id
+        and ci.estado = 'cumplido' and d.estado <> 'vigente') then
+      raise exception 'no se puede aprobar: hay ítems cumplidos con decisiones en revisión';
+    end if;
     if exists (select 1 from gate_instancia g2
       where g2.proyecto_id = new.proyecto_id and g2.workspace_id = new.workspace_id
         and g2.numero < new.numero and g2.estado <> 'aprobado') then
@@ -640,7 +648,12 @@ end $$;
 grant select, insert on metric_registry, entrada_kpi, snapshot to designio_app;
 grant select, insert on outcome_review, resultado_criterio to designio_app;
 -- Solo la FIRMA del registry (jamás su reto ni su autoría).
-grant update (estado, firmado_por, firmado_en) on metric_registry to designio_app;
+-- Sin `firmado_en` en el grant: el sello temporal lo pone el guard y NADIE más. Que la
+-- columna estuviera aquí dejaba al rol de app proponer una fecha —que el guard pisaba,
+-- pero el contrato decía otra cosa— y obligaba a repetirla en el servicio. Sin permiso
+-- de escritura, la promesa «un update directo no retro ni post-data la firma» es
+-- estructural en vez de depender de que el trigger siga ahí.
+grant update (estado, firmado_por) on metric_registry to designio_app;
 -- La entrada se corrige entera mientras el registry es borrador, salvo su pertenencia
 -- (registry y criterio son la identidad del compromiso, no un campo editable).
 grant update (nombre, definicion, fuente, dimensiones, propietario_miembro_id, frecuencia,

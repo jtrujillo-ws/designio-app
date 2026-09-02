@@ -12,6 +12,22 @@ import { membresiaActivaDe, wsDeBusqueda } from '@/lib/auth/workspace-activo';
  * del contexto en lugar de asumir la primera membresía.
  */
 
+export const Route = createFileRoute('/_autenticada')({
+  validateSearch: (search: Record<string, unknown>): { ws?: string } => {
+    const ws = wsDeBusqueda(search.ws);
+    // Propiedad AUSENTE (no undefined): así `search` es opcional para quien navega
+    // sin workspace explícito (login → /app, links del árbol, etc.).
+    return ws ? { ws } : {};
+  },
+  search: { middlewares: [retainSearchParams(['ws'])] },
+  beforeLoad: async ({ search }) => {
+    const usuario = await usuarioActual();
+    if (!usuario) throw redirect({ to: '/login' });
+    return { usuario, membresiaActiva: membresiaActivaDe(usuario.membresias, search.ws) };
+  },
+  component: LayoutPorWorkspace,
+});
+
 /**
  * Cambiar de workspace REMONTA todo lo que cuelga de aquí, y esa es la única razón de que
  * este componente exista en vez de usar `Outlet` a secas.
@@ -40,19 +56,3 @@ function LayoutPorWorkspace() {
   const { membresiaActiva } = Route.useRouteContext();
   return <Outlet key={membresiaActiva?.workspaceId ?? 'sin-workspace'} />;
 }
-
-export const Route = createFileRoute('/_autenticada')({
-  validateSearch: (search: Record<string, unknown>): { ws?: string } => {
-    const ws = wsDeBusqueda(search.ws);
-    // Propiedad AUSENTE (no undefined): así `search` es opcional para quien navega
-    // sin workspace explícito (login → /app, links del árbol, etc.).
-    return ws ? { ws } : {};
-  },
-  search: { middlewares: [retainSearchParams(['ws'])] },
-  beforeLoad: async ({ search }) => {
-    const usuario = await usuarioActual();
-    if (!usuario) throw redirect({ to: '/login' });
-    return { usuario, membresiaActiva: membresiaActivaDe(usuario.membresias, search.ws) };
-  },
-  component: LayoutPorWorkspace,
-});

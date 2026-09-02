@@ -158,6 +158,20 @@ $$
   returning u.id, u.email, u.nombre
 $$;
 
+-- Estado de cuenta de los miembros del workspace (pantalla Personas, RF-01.4): la RLS
+-- de usuario solo muestra la fila PROPIA (correcto: ahí viven hashes y tokens), así que
+-- esta función expone SOLO el estado, y únicamente a miembros del workspace consultado.
+create or replace function estados_de_miembros(p_workspace uuid)
+returns table (usuario_id uuid, estado text)
+language sql stable security definer set search_path = public as
+$$
+  select u.id, u.estado
+  from miembro m
+  join usuario u on u.id = m.usuario_id
+  where m.workspace_id = p_workspace
+    and is_workspace_member(app_user_id(), p_workspace)
+$$;
+
 -- ── Membresía: la gestionan lead-boutique y admin-cliente desde la app (RF-01.2/01.4) ──
 -- agente-ai queda fuera del alta por invitación: es un actor de plataforma, no invitable.
 
@@ -175,11 +189,13 @@ grant insert on miembro to designio_app;
 revoke execute on function
   usuario_para_login(text),
   preparar_invitacion(text, text, text, timestamptz, uuid),
-  activar_usuario_con_token(text, text)
+  activar_usuario_con_token(text, text),
+  estados_de_miembros(uuid)
 from public;
 
 grant execute on function
   usuario_para_login(text),
   preparar_invitacion(text, text, text, timestamptz, uuid),
-  activar_usuario_con_token(text, text)
+  activar_usuario_con_token(text, text),
+  estados_de_miembros(uuid)
 to designio_app;

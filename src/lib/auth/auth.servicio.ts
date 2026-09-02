@@ -84,6 +84,31 @@ export type ResultadoInvitacion = {
 };
 
 /**
+ * Miembros del workspace con el estado de su cuenta global (pantalla Personas, RF-01.4).
+ * El estado sale de estados_de_miembros (SECURITY DEFINER): la RLS de usuario solo
+ * muestra la fila propia — un join directo dejaría la lista en un solo miembro.
+ */
+export async function listarMiembros(
+  actorId: string,
+  workspaceId: string,
+): Promise<import('./auth.schemas').MiembroDeLista[]> {
+  return conUsuario(actorId, async (tx) => {
+    const filas = await tx`
+      select m.nombre, m.email, m.rol, e.estado
+      from miembro m
+      join estados_de_miembros(${workspaceId}) e on e.usuario_id = m.usuario_id
+      where m.workspace_id = ${workspaceId}
+      order by m.nombre`;
+    return filas.map((f) => ({
+      nombre: f.nombre as string,
+      email: f.email as string,
+      rol: f.rol as string,
+      estado: f.estado as string,
+    }));
+  });
+}
+
+/**
  * Invitación (RF-01.2/01.4) en una transacción, con doble capa: re-check explícito del rol
  * del actor (capa 2) + política RLS de INSERT de miembro y autorización interna de
  * preparar_invitacion (capa 1). El token solo lo recibe el workspace que lo ORIGINÓ:

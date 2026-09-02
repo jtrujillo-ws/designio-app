@@ -55,6 +55,16 @@ export const InvitarMiembroSchema = z.object({
   rol: z.enum(ROLES_INVITABLES),
 });
 
+export const MiembrosInputSchema = z.object({ workspaceId: z.string().uuid() });
+
+/** Fila de la pantalla Personas y permisos (RF-01.4). */
+export type MiembroDeLista = {
+  nombre: string;
+  email: string;
+  rol: string;
+  estado: string;
+};
+
 export type Login = z.infer<typeof LoginSchema>;
 export type EstablecerPassword = z.infer<typeof EstablecerPasswordSchema>;
 export type InvitarMiembro = z.infer<typeof InvitarMiembroSchema>;

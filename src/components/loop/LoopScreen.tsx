@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import { useNavigate } from '@tanstack/react-router';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
@@ -242,9 +242,9 @@ function Sidebar() {
       <div style={item}>
         <span>Segmentos</span>
       </div>
-      <div style={item}>
+      <Link to="/personas" style={{ ...item, textDecoration: 'none' }}>
         <span>Personas y permisos</span>
-      </div>
+      </Link>
       <div style={{ marginTop: 'auto', font: '400 11.5px/1.5 var(--font-sans)', color: 'var(--text-faint)', padding: 10 }}>
         La organización cliente es propietaria del workspace; la boutique opera como autorizada.
       </div>

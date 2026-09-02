@@ -1,13 +1,19 @@
 import { createServerFn } from '@tanstack/react-start';
 import { deleteCookie, getRequestIP, setCookie } from '@tanstack/react-start/server';
 import { usuarioIdDeRequest } from './guardia.server';
-import { EstablecerPasswordSchema, InvitarMiembroSchema, LoginSchema } from './auth.schemas';
+import {
+  EstablecerPasswordSchema,
+  InvitarMiembroSchema,
+  LoginSchema,
+  MiembrosInputSchema,
+} from './auth.schemas';
 import {
   activarConToken,
   autenticar,
   crearInvitacion,
   ErrorAutorizacion,
   ErrorInvitacion,
+  listarMiembros,
   usuarioConMembresias,
 } from './auth.servicio';
 import { descontarIntento, permitirIntento, registrarExito } from './limitador.server';
@@ -86,6 +92,15 @@ export const establecerPassword = createServerFn({ method: 'POST' })
     descontarIntento(clavePorIp);
     await fijarCookieSesion(usuario.id);
     return { ok: true as const, usuario };
+  });
+
+/** Miembros del workspace para la pantalla Personas (el loader pasa el workspace del guard). */
+export const miembrosDelWorkspace = createServerFn({ method: 'GET' })
+  .inputValidator(MiembrosInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await usuarioIdDeRequest();
+    if (!usuarioId) return null;
+    return listarMiembros(usuarioId, data.workspaceId);
   });
 
 export const invitarMiembro = createServerFn({ method: 'POST' })

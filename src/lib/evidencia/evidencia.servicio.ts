@@ -31,20 +31,31 @@ export async function crearItem(
 ): Promise<{ itemId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const [item] = await tx`insert into item_importacion
-      (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
-      values (${entrada.workspaceId}, ${entrada.titulo}, ${entrada.contenido},
-              ${entrada.tipoFuente}, ${entrada.referencia}, ${actorId})
-      returning id`;
-    // La auditoría lleva actor Y su rol DE ESE MOMENTO (la membresía es mutable y el
-    // evento es append-only), y el itemId correlaciona la importación con su decisión
-    // aunque dos items compartan título y tipo de fuente.
-    const [quien] = await tx`select workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
-    await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-      values (${entrada.workspaceId}, 'ItemImportado',
-        ${tx.json({ itemId: item!.id as string, titulo: entrada.titulo, tipoFuente: entrada.tipoFuente })},
-        ${actorId}, ${(quien?.rol ?? null) as string | null})`;
-    return { itemId: item!.id as string };
+    // UNA sentencia = UN snapshot: el rol que registra la auditoría es exactamente el
+    // que autorizó la escritura. En sentencias separadas bajo READ COMMITTED, un cambio
+    // de membresía entre ambas auditaría un rol distinto al vigente en el insert. El
+    // itemId del payload correlaciona la importación con su decisión posterior.
+    const [fila] = await tx`
+      with quien as (
+        select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
+      ),
+      nuevo as (
+        insert into item_importacion
+          (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+        values (${entrada.workspaceId}, ${entrada.titulo}, ${entrada.contenido},
+                ${entrada.tipoFuente}, ${entrada.referencia}, ${actorId})
+        returning id
+      ),
+      evento as (
+        insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        select ${entrada.workspaceId}, 'ItemImportado',
+               jsonb_build_object('itemId', nuevo.id, 'titulo', ${entrada.titulo}::text,
+                                  'tipoFuente', ${entrada.tipoFuente}::text),
+               ${actorId}, quien.rol
+        from nuevo, quien
+      )
+      select id from nuevo`;
+    return { itemId: fila!.id as string };
   });
 }
 

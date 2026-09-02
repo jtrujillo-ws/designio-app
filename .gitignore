@@ -8,4 +8,3 @@ dist/
 .env.local
 .env.*.local
 coverage/
-src/routeTree.gen.ts

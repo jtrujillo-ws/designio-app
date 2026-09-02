@@ -9,12 +9,15 @@ import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
+import { DescargaArchivo } from '@/components/evidencia/DescargaArchivo';
 import {
+  adjuntarArchivoAItem,
   aprobarItemImportacion,
   bandejaDeImportacion,
   contenidoDeItemImportacion,
   crearItemImportacion,
   rechazarItemImportacion,
+  retirarArchivoDeItem,
 } from '@/lib/evidencia/evidencia.functions';
 import {
   ETIQUETA_TIPO_FUENTE,
@@ -23,6 +26,15 @@ import {
   type ItemBandeja,
   type TipoFuente,
 } from '@/lib/evidencia/evidencia.schemas';
+import {
+  bytesABase64,
+  EXTENSIONES_PERMITIDAS,
+  MAX_ARCHIVO_BYTES,
+  MAX_ARCHIVOS_POR_ITEM,
+  tipoDeclaradoDeArchivo,
+  validarTextoImportado,
+  verificarArchivo,
+} from '@/lib/evidencia/sanitizacion';
 
 /**
  * Bandeja de importación (SPEC-03, J1 «arranque en frío», versión manual):
@@ -213,6 +225,17 @@ function FormularioNuevoItem({
       onError('Pega el contenido o indica al menos la referencia del original');
       return;
     }
+    // Contenido no confiable (RF-03.2): el texto entra CRUDO —los offsets de las citas
+    // dependen de que no lo toquemos— pero los controles y overrides bidi se rechazan.
+    // El schema del server y un CHECK de la base repiten esta validación; aquí solo se
+    // adelanta el mensaje.
+    for (const campo of [titulo, referencia, contenido]) {
+      const v = validarTextoImportado(campo);
+      if (!v.ok) {
+        onError(v.motivo);
+        return;
+      }
+    }
     setEnviando(true);
     onError(null);
     try {
@@ -372,6 +395,40 @@ function TarjetaItem({
           Ref: {item.referencia}
         </span>
       )}
+      {item.archivos.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <span style={etiqueta}>Originales adjuntos ({item.archivos.length})</span>
+          {item.archivos.map((a) => (
+            <DescargaArchivo
+              key={a.id}
+              archivo={a}
+              workspaceId={workspaceId}
+              onError={onError}
+              // Un adjunto solo se retira mientras el material siga pendiente: lo curado
+              // ya es evidencia y su original no se toca (la política RLS lo impone).
+              onRetirar={
+                item.estado === 'pendiente'
+                  ? async () => {
+                      const r = await retirarArchivoDeItem({
+                        data: { workspaceId, archivoId: a.id },
+                      });
+                      if (r.ok) await onCambio();
+                      else onError(r.error);
+                    }
+                  : undefined
+              }
+            />
+          ))}
+        </div>
+      )}
+      {item.estado === 'pendiente' && item.archivos.length < MAX_ARCHIVOS_POR_ITEM && (
+        <SubirAdjunto
+          workspaceId={workspaceId}
+          itemId={item.id}
+          onSubido={onCambio}
+          onError={onError}
+        />
+      )}
       {item.estado === 'pendiente' && !puedeCurar && (
         <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
           La curaduría la decide la boutique (lead o diseñador).
@@ -410,6 +467,88 @@ function TarjetaItem({
         />
       )}
     </Card>
+  );
+}
+
+/**
+ * Alta de un adjunto (RF-03.1). Tres capas de validación de formato, deliberadamente
+ * repetidas: aquí (mensaje inmediato), en el servicio (allowlist + firma mágica sobre los
+ * bytes reales) y en el esquema (CHECK de tipo, tamaño y nombre). El `accept` del input
+ * es comodidad, nunca seguridad: se puede desactivar en el diálogo del sistema.
+ */
+function SubirAdjunto({
+  workspaceId,
+  itemId,
+  onSubido,
+  onError,
+}: {
+  workspaceId: string;
+  itemId: string;
+  onSubido: () => Promise<void>;
+  onError: (e: string | null) => void;
+}) {
+  const [subiendo, setSubiendo] = useState(false);
+
+  async function elegido(archivo: File | undefined) {
+    if (!archivo) return;
+    setSubiendo(true);
+    onError(null);
+    try {
+      const tipoMime = tipoDeclaradoDeArchivo(archivo.name, archivo.type);
+      if (!tipoMime) {
+        onError(`Formato no permitido: ${archivo.name}`);
+        return;
+      }
+      if (archivo.size > MAX_ARCHIVO_BYTES) {
+        onError(`El archivo supera los ${MAX_ARCHIVO_BYTES / 1024 / 1024} MB permitidos`);
+        return;
+      }
+      const bytes = new Uint8Array(await archivo.arrayBuffer());
+      const veredicto = verificarArchivo(bytes, tipoMime);
+      if (!veredicto.ok) {
+        onError(veredicto.motivo);
+        return;
+      }
+      const r = await adjuntarArchivoAItem({
+        data: {
+          workspaceId,
+          itemId,
+          nombre: archivo.name,
+          tipoMime,
+          contenidoBase64: bytesABase64(bytes),
+        },
+      });
+      if (r.ok) await onSubido();
+      else onError(r.error);
+    } catch {
+      onError('No se pudo adjuntar el archivo; intenta de nuevo');
+    } finally {
+      setSubiendo(false);
+    }
+  }
+
+  return (
+    <label
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        font: '400 12px var(--font-sans)',
+        color: 'var(--text-muted)',
+      }}
+    >
+      <input
+        type="file"
+        accept={EXTENSIONES_PERMITIDAS}
+        disabled={subiendo}
+        onChange={(e) => {
+          void elegido(e.target.files?.[0]);
+          e.target.value = '';
+        }}
+        style={{ font: '400 12px var(--font-sans)' }}
+      />
+      {subiendo ? 'Subiendo…' : `Adjuntar el original (máx. ${MAX_ARCHIVO_BYTES / 1024 / 1024} MB)`}
+    </label>
   );
 }
 

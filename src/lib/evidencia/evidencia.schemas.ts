@@ -1,4 +1,10 @@
 import { z } from 'zod';
+import {
+  bytesDeBase64,
+  FORMATOS_PERMITIDOS,
+  MAX_ARCHIVO_BYTES,
+  validarTextoImportado,
+} from './sanitizacion';
 
 /** CTX-02 Evidencia y Conocimiento — cinco dimensiones (ADR-0010) y citas verificables. */
 
@@ -91,15 +97,23 @@ export const ETIQUETA_TIPO_FUENTE: Record<TipoFuente, string> = {
   nota: 'Nota',
 };
 
+/** Texto de terceros: se acepta CRUDO (sin normalizar ni recortar — la fidelidad de las
+ * citas depende de que los offsets no cambien) pero se RECHAZA si trae controles o
+ * overrides bidi. Mismo predicado que el CHECK `texto_importado_limpio` de la base. */
+const TextoImportado = z.string().superRefine((valor, ctx) => {
+  const v = validarTextoImportado(valor);
+  if (!v.ok) ctx.addIssue({ code: z.ZodIssueCode.custom, message: v.motivo });
+});
+
 /** RF-03.1/03.2: el contenido es texto NO confiable — acotado aquí y en el esquema SQL.
  * Se importa texto pegado, una referencia al original, o ambos: al menos uno. */
 export const CrearItemImportacionSchema = z
   .object({
     workspaceId: z.string().uuid(),
-    titulo: z.string().trim().min(1, 'El título es obligatorio').max(300),
-    contenido: z.string().max(100_000, 'Máximo 100k caracteres').default(''),
+    titulo: TextoImportado.pipe(z.string().trim().min(1, 'El título es obligatorio').max(300)),
+    contenido: TextoImportado.pipe(z.string().max(100_000, 'Máximo 100k caracteres')).default(''),
     tipoFuente: z.enum(TIPOS_FUENTE),
-    referencia: z.string().trim().max(2000).default(''),
+    referencia: TextoImportado.pipe(z.string().trim().max(2000)).default(''),
   })
   .refine((d) => d.contenido.trim().length > 0 || d.referencia.length > 0, {
     message: 'Pega el contenido o indica al menos la referencia del original',
@@ -162,4 +176,121 @@ export type ItemBandeja = {
   truncado: boolean;
   creadoEn: string;
   decididoEn: string | null;
+  /** Adjuntos del material (RF-03.1): metadatos; los bytes se piden uno a uno. */
+  archivos: ArchivoAdjunto[];
+};
+
+// ── Archivos adjuntos del material importado (RF-03.1, RF-09.8) ──
+
+/** Metadatos del adjunto. Los bytes NUNCA viajan en un listado: se piden por id. */
+export type ArchivoAdjunto = {
+  id: string;
+  nombre: string;
+  tipoMime: string;
+  bytes: number;
+  /** Hash del original, calculado por la base (columna generada): identidad verificable
+   * del archivo, y lo que publica el manifiesto de exportación (RF-01.8). */
+  sha256: string;
+  creadoEn: string;
+};
+
+/** El adjunto viaja base64 dentro del payload JSON: el tope se comprueba ANTES de
+ * decodificar (un payload gigante se corta en el borde, no tras reservar la memoria). */
+export const AdjuntarArchivoSchema = z.object({
+  workspaceId: z.string().uuid(),
+  itemId: z.string().uuid(),
+  nombre: z.string().min(1).max(200),
+  tipoMime: z.string().refine((t) => t in FORMATOS_PERMITIDOS, 'Formato de archivo no permitido'),
+  contenidoBase64: z
+    .string()
+    .min(1, 'El archivo está vacío')
+    .refine(
+      (b) => bytesDeBase64(b) <= MAX_ARCHIVO_BYTES,
+      `El archivo supera ${MAX_ARCHIVO_BYTES / 1024 / 1024} MB`,
+    ),
+});
+export type AdjuntarArchivo = z.infer<typeof AdjuntarArchivoSchema>;
+
+export const ArchivoInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  archivoId: z.string().uuid(),
+});
+
+// ── Derechos de uso (RF-03.10, SYS-14) ──
+
+/** Orden total: interno ⊂ cliente ⊂ publico. Citar en un gate (portal, con el cliente
+ * delante) exige `cliente`; un entregable exportado, también. */
+export const AMBITOS_USO = ['interno', 'cliente', 'publico'] as const;
+export type AmbitoUso = (typeof AMBITOS_USO)[number];
+
+export const ETIQUETA_AMBITO: Record<AmbitoUso, string> = {
+  interno: 'Solo interno (boutique)',
+  cliente: 'Cliente (portal y entregables)',
+  publico: 'Público (difusión)',
+};
+
+export const ESTADOS_DERECHOS = ['pendiente', 'concedido', 'denegado'] as const;
+export type EstadoDerechos = (typeof ESTADOS_DERECHOS)[number];
+
+/** Quiénes deciden derechos: quien opera el engagement y sostiene los consentimientos
+ * (lead-boutique) y quien administra los datos del cliente (admin-cliente, RF-01.4).
+ * Un diseñador cura evidencia pero NO concede derechos: es un acto contractual. */
+export const ROLES_DERECHOS = ['lead-boutique', 'admin-cliente'] as const;
+
+/**
+ * Decisión de derechos. `base` es obligatoria en ambos sentidos: una concesión sin
+ * respaldo documental no es un derecho, y una denegación sin motivo no se puede explicar
+ * (SYS-14 exige que el bloqueo diga qué falta). Denegar no tiene ámbito ni vigencia.
+ */
+export const DecidirDerechosSchema = z
+  .object({
+    workspaceId: z.string().uuid(),
+    evidenciaId: z.string().uuid(),
+    decision: z.enum(['concedido', 'denegado']),
+    ambito: z.enum(AMBITOS_USO).default('interno'),
+    base: z
+      .string()
+      .trim()
+      .min(1, 'Indica qué respalda la decisión (consentimiento, cláusula o motivo)')
+      .max(500),
+    /** Caducidad del permiso; fecha calendárica pura o sin vencimiento. */
+    venceEn: FechaCalendarioSchema.nullable().default(null),
+  })
+  .refine((d) => d.decision === 'concedido' || (d.ambito === 'interno' && d.venceEn === null), {
+    message: 'Una denegación no lleva ámbito ni vigencia',
+    path: ['ambito'],
+  });
+export type DecidirDerechos = z.infer<typeof DecidirDerechosSchema>;
+
+/** Fila del picker de citas (checklists del método, RF-04.6): además del título trae si
+ * puede citarse y, si no, por qué — la UI deshabilita lo bloqueado con su explicación en
+ * vez de dejar que el usuario descubra el error al guardar. El bloqueo REAL lo impone la
+ * base (guard `checklist_item_derechos`); esto solo lo hace legible. */
+export type EvidenciaCitable = {
+  id: string;
+  titulo: string;
+  citable: boolean;
+  motivoBloqueo: string | null;
+};
+
+/** Evidencia con su estado de derechos VIVO (no el snapshot congelado del jsonb) y sus
+ * adjuntos: es la fila de la pantalla de derechos y del picker de citas. */
+export type EvidenciaConDerechos = {
+  id: string;
+  titulo: string;
+  resumen: string;
+  esEstadoActual: boolean;
+  creadoEn: string;
+  derechos: {
+    estado: EstadoDerechos;
+    ambito: AmbitoUso;
+    base: string;
+    venceEn: string | null;
+    decididoEn: string | null;
+  };
+  /** true si puede citarse en el portal (ámbito cliente, vigente). */
+  citable: boolean;
+  /** Por qué NO, con la dimensión que falta; null cuando sí se puede. */
+  motivoBloqueo: string | null;
+  archivos: ArchivoAdjunto[];
 };

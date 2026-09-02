@@ -2,19 +2,27 @@ import { createServerFn } from '@tanstack/react-start';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { requerirUsuarioId, usuarioIdDeRequest } from '@/lib/auth/guardia.server';
 import {
+  AdjuntarArchivoSchema,
   AprobarItemSchema,
+  ArchivoInputSchema,
   BandejaInputSchema,
   CrearItemImportacionSchema,
+  DecidirDerechosSchema,
   ItemInputSchema,
   RechazarItemSchema,
 } from './evidencia.schemas';
 import {
+  adjuntarArchivo,
   aprobarItem,
+  archivoParaDescarga,
   contenidoDeItem,
   crearItem,
+  decidirDerechos,
+  eliminarArchivo,
   ErrorCuraduria,
   listarBandeja,
   listarEvidencias,
+  listarEvidenciaConDerechos,
   rechazarItem,
 } from './evidencia.servicio';
 
@@ -27,7 +35,19 @@ function mensajeDe(e: unknown): string | null {
   if (e instanceof ErrorAutorizacion) return e.message;
   const code = (e as { code?: string }).code;
   if (code === '42501') return 'Sin permiso para esta acción en el workspace';
-  if (code === '23514') return 'El contenido supera los límites permitidos';
+  // CHECK del esquema: es la última barrera y por eso su mensaje distingue de qué se
+  // trata — el nombre del constraint dice si falló el bound del texto, el formato del
+  // adjunto, su tamaño o su nombre.
+  if (code === '23514') {
+    const constraint = (e as { constraint_name?: string }).constraint_name ?? '';
+    if (constraint.startsWith('item_') && constraint.includes('limpi')) {
+      return 'El material contiene caracteres de control o de dirección que no se aceptan';
+    }
+    if (constraint === 'archivo_tipo_permitido') return 'Formato de archivo no permitido';
+    if (constraint === 'archivo_tamano') return 'El archivo está vacío o supera el tamaño máximo';
+    if (constraint === 'archivo_nombre_seguro') return 'El nombre del archivo no es válido';
+    return 'El contenido supera los límites permitidos';
+  }
   return null;
 }
 
@@ -110,6 +130,81 @@ export const rechazarItemImportacion = createServerFn({ method: 'POST' })
     if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
     try {
       await rechazarItem(actorId, data);
+      return { ok: true as const };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+// ── Evidencia con derechos y adjuntos (RF-03.10, RF-03.1) ──
+
+/** Evidencia del workspace con sus derechos VIVOS, su motivo de bloqueo y sus adjuntos. */
+export const evidenciaConDerechos = createServerFn({ method: 'GET' })
+  .inputValidator(BandejaInputSchema.pick({ workspaceId: true }))
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      const datos = await listarEvidenciaConDerechos(usuarioId, data.workspaceId);
+      return { workspaceId: data.workspaceId, ...datos };
+    } catch (e) {
+      if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
+  });
+
+export const adjuntarArchivoAItem = createServerFn({ method: 'POST' })
+  .inputValidator(AdjuntarArchivoSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      return { ok: true as const, ...(await adjuntarArchivo(actorId, data)) };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+export const retirarArchivoDeItem = createServerFn({ method: 'POST' })
+  .inputValidator(ArchivoInputSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await eliminarArchivo(actorId, data.workspaceId, data.archivoId);
+      return { ok: true as const };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+/** Bytes del adjunto en base64: el cliente los convierte en Blob para descargar o
+ * previsualizar. No se expone una ruta HTTP de binarios — el acceso pasa por el mismo
+ * camino (sesión → RLS) que el resto de los datos. */
+export const contenidoDeArchivo = createServerFn({ method: 'GET' })
+  .inputValidator(ArchivoInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await archivoParaDescarga(usuarioId, data.workspaceId, data.archivoId);
+    } catch (e) {
+      if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
+  });
+
+export const decidirDerechosDeEvidencia = createServerFn({ method: 'POST' })
+  .inputValidator(DecidirDerechosSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await decidirDerechos(actorId, data);
       return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);

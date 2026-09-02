@@ -249,6 +249,13 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
         where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
     } catch (e) {
       const code = (e as { code?: string }).code;
+      // DR001: el guard de derechos de SPEC-03 cortó la CITA — la evidencia no tiene
+      // derechos vigentes para el ámbito «cliente» (RF-03.10, SYS-14). El mensaje ya
+      // viene con la dimensión que falta; se propaga tal cual porque es exactamente lo
+      // que el criterio de aceptación pide mostrar.
+      if (code === 'DR001') {
+        throw new ErrorMetodo((e as { message?: string }).message ?? 'Derechos insuficientes');
+      }
       // WITH CHECK violado (42501): rol insuficiente para la transición pedida.
       if (code === '42501' && a.tipo === 'na') {
         throw new ErrorMetodo('Solo el rol aprobador del gate marca N/A');

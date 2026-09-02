@@ -8,7 +8,7 @@ import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { ROLES_CURADORES, type EvidenciaCitable } from '@/lib/evidencia/evidencia.schemas';
 import {
   aprobarGateDeProyecto,
   marcarItemDeChecklist,
@@ -225,7 +225,7 @@ function EtapaConGate({
   nombreEtapa: string;
   estadoEtapa: string;
   gate: GateDeProyecto | undefined;
-  evidencias: { id: string; titulo: string }[];
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   rol: string;
   /** SYS-22 en la etiqueta: G0 no está «listo» sin criterios completos. */
@@ -328,7 +328,7 @@ function ItemChecklist({
 }: {
   workspaceId: string;
   item: ItemDeGate;
-  evidencias: { id: string; titulo: string }[];
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   editable: boolean;
   /** Cumplido/pendiente: curadores (lead/diseñador). N/A —y revertirlo— : el rol aprobador del gate. */
@@ -407,9 +407,12 @@ function ItemChecklist({
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <Select value={evidenciaId} onChange={(e) => setEvidenciaId(e.target.value)} style={{ minWidth: 260 }}>
             <option value="">Elige una evidencia curada…</option>
+            {/* Los derechos restringen el uso aguas abajo (RF-03.10, SYS-14): lo que no
+                puede citarse se muestra deshabilitado y CON el motivo, nunca oculto —
+                que falte una dimensión es información de curaduría, no ruido. */}
             {evidencias.map((ev) => (
-              <option key={ev.id} value={ev.id}>
-                {ev.titulo}
+              <option key={ev.id} value={ev.id} disabled={!ev.citable}>
+                {ev.citable ? ev.titulo : `${ev.titulo} — sin derechos: ${ev.motivoBloqueo ?? ''}`}
               </option>
             ))}
             {hayMasEvidencias && (

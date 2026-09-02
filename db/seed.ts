@@ -94,6 +94,148 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
     (${wsId}, 'RetoActivado', ${tx.json({ codigo: 'R-01', proyecto: 'P-01', perfil: 'estandar' })}, ${luciaId}, 'lead-boutique')`;
 }
 
+/**
+ * Evidencia profunda del ejemplo §19.1 (SPEC-03): el estudio CX y el funnel del banco,
+ * curados, con su original adjunto y sus DERECHOS resueltos — y una entrevista sin
+ * consentimiento, que es el caso que la spec pide poder demostrar: existe, se ve, y no
+ * se puede citar ni exportar como entregable hasta que alguien conceda los derechos.
+ *
+ * El seed corre como owner (sin contexto RLS) y por eso escribe la evidencia directamente
+ * en vez de pasar por la curaduría; los items quedan marcados como aprobados igual que
+ * lo haría la app, para que la bandeja cuente la misma historia.
+ * Idempotente por la presencia de derechos en el workspace.
+ */
+const ARCHIVO_DEMO = `Estudio CX — apertura de cuenta nomina (extracto)
+
+Hallazgo 1: el 62% abandona en el paso de verificacion de identidad.
+Hallazgo 2: el tiempo medio hasta cuenta operativa es de 5 dias.
+Fuente: panel de 240 solicitudes, julio 2026.
+`;
+
+async function sembrarEvidenciaProfunda(
+  tx: TransactionSql,
+  wsId: string,
+  luciaId: string,
+): Promise<boolean> {
+  const yaHay = await tx`select 1 from derecho_uso where workspace_id = ${wsId} limit 1`;
+  if (yaHay.length > 0) return false;
+
+  const material = [
+    {
+      titulo: 'Estudio CX apertura de cuenta (PDF del proveedor)',
+      tipo: 'documento',
+      referencia: 'carpeta compartida / CX-2026-Q3',
+      contenido: ARCHIVO_DEMO,
+      resumen: 'Línea base del abandono: 62% en verificación de identidad',
+      esEstadoActual: true,
+      recoleccion: 'Estudio CX encargado al proveedor externo',
+      derivada: true,
+      confianza: 'alta',
+      consentimiento: true,
+      confidencialidad: 'cliente',
+      // Derechos ACORDADOS (§19.1): citable y exportable.
+      derechos: {
+        estado: 'concedido',
+        ambito: 'cliente',
+        base: 'Cláusula 7 del contrato de servicios: uso interno y en entregables del workspace',
+      },
+      conArchivo: true,
+    },
+    {
+      titulo: 'Funnel de apertura Q2 (hoja de cálculo)',
+      tipo: 'dataset',
+      referencia: 'analítica / funnel-apertura-q2',
+      contenido: 'Paso 1: 100% → Paso 2: 91% → Paso 3: 74% → Paso 4: 38%',
+      resumen: 'Confirma el punto de fuga en el paso 4',
+      esEstadoActual: true,
+      recoleccion: 'Extracción de la analítica del canal digital',
+      derivada: true,
+      confianza: 'alta',
+      consentimiento: true,
+      confidencialidad: 'cliente',
+      derechos: {
+        estado: 'concedido',
+        ambito: 'cliente',
+        base: 'Dato propio del cliente, sin datos personales identificables',
+      },
+      conArchivo: false,
+    },
+    {
+      titulo: 'Entrevista con solicitante que abandonó (grabación)',
+      tipo: 'entrevista',
+      referencia: 'grabaciones / E-014',
+      contenido:
+        'Dice que se detuvo al pedirle una foto del documento por ambas caras y no entendió si podía retomar después.',
+      resumen: 'Explica el abandono desde la vivencia del solicitante',
+      esEstadoActual: false,
+      recoleccion: 'Entrevista 1:1 remota de 25 minutos',
+      derivada: false,
+      confianza: 'media',
+      consentimiento: false,
+      confidencialidad: 'restringida',
+      // Sin consentimiento registrado: derechos PENDIENTES. Es el criterio de
+      // aceptación 3 de SPEC-03, sembrado para poder verlo en la demo.
+      derechos: null,
+      conArchivo: false,
+    },
+  ] as const;
+
+  for (const m of material) {
+    const [item] = await tx`insert into item_importacion
+      (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+      values (${wsId}, ${m.titulo}, ${m.contenido}, ${m.tipo}, ${m.referencia}, ${luciaId})
+      returning id`;
+    const itemId = item!.id as string;
+
+    if (m.conArchivo) {
+      await tx`insert into archivo_importado
+        (workspace_id, item_id, nombre, tipo_mime, contenido, creado_por)
+        values (${wsId}, ${itemId}, 'estudio-cx-extracto.txt', 'text/plain',
+                ${Buffer.from(ARCHIVO_DEMO, 'utf-8')}, ${luciaId})`;
+    }
+
+    const [fuente] = await tx`insert into fuente (workspace_id, tipo, titulo, referencia, creado_por)
+      values (${wsId}, ${m.tipo}, ${m.titulo}, ${m.referencia}, ${luciaId}) returning id`;
+
+    const dimensiones = {
+      proveniencia: { tipoFuente: m.tipo, fecha: '2026-07-15', localizacion: m.referencia },
+      metodo: { recoleccion: m.recoleccion, derivada: m.derivada, segmentoIds: [] },
+      calidad: { confianza: m.confianza, corroboraIds: [], contradiceIds: [] },
+      derechos: { consentimiento: m.consentimiento, confidencialidad: m.confidencialidad },
+      lineage: null,
+    };
+
+    const [evidencia] = await tx`insert into evidencia
+      (workspace_id, fuente_id, titulo, resumen, dimensiones, es_estado_actual, creado_por)
+      values (${wsId}, ${fuente!.id as string}, ${m.titulo}, ${m.resumen},
+              ${tx.json(dimensiones)}, ${m.esEstadoActual}, ${luciaId})
+      returning id`;
+    const evidenciaId = evidencia!.id as string;
+
+    // Toda evidencia nace con su registro de derechos, aunque sea pendiente.
+    if (m.derechos) {
+      await tx`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsId}, ${evidenciaId}, ${m.derechos.estado}, ${m.derechos.ambito},
+                ${m.derechos.base}, ${luciaId}, now(), ${luciaId})`;
+    } else {
+      await tx`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+        values (${wsId}, ${evidenciaId}, ${luciaId})`;
+    }
+
+    await tx`update item_importacion
+      set estado = 'aprobado', decidido_por = ${luciaId}, decidido_en = now(),
+          evidencia_id = ${evidenciaId}
+      where id = ${itemId}`;
+
+    await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
+      (${wsId}, 'EvidenciaCurada',
+       ${tx.json({ itemId, evidenciaId, esEstadoActual: m.esEstadoActual })},
+       ${luciaId}, 'lead-boutique')`;
+  }
+  return true;
+}
+
 /** Segundo workspace de Lucía (demo del selector multi-membresía): mínimo pero real —
  * un servicio, sin retos aún. Idempotente por MEMBRESÍA de Lucía + nombre: el nombre
  * de workspace no es único y uno homónimo ajeno no debe saltarse el seed. Devuelve si
@@ -150,11 +292,20 @@ async function main() {
     if (lucia) {
       segundoSembrado = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
     }
+    // Upgrade de bases sembradas antes de los derechos de uso (SPEC-03 profunda): la
+    // función se auto-guarda por la presencia de derechos en el workspace.
+    let evidenciaSembrada = false;
+    if (lucia) {
+      evidenciaSembrada = await sql.begin((tx) =>
+        sembrarEvidenciaProfunda(tx, wsId, lucia.id as string),
+      );
+    }
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
         (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
         (metodoSembrado ? '; método de P-01 sembrado' : '') +
-        (segundoSembrado ? '; Clínica del Valle sembrada' : ''),
+        (segundoSembrado ? '; Clínica del Valle sembrada' : '') +
+        (evidenciaSembrada ? '; evidencia §19.1 con derechos de uso sembrada' : ''),
     );
     return;
   }
@@ -183,10 +334,11 @@ async function main() {
 
     await sembrarArbol(tx, wsId, luciaId);
     await sembrarMetodo(tx, wsId, luciaId);
+    await sembrarEvidenciaProfunda(tx, wsId, luciaId);
     await sembrarSegundoWorkspace(tx, luciaId);
   });
   console.log(
-    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
+    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );
 }
 

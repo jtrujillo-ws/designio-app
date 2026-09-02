@@ -364,6 +364,9 @@ function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
       <Link to="/importacion" style={{ ...item, textDecoration: 'none' }}>
         <span>Bandeja de importación</span>
       </Link>
+      <Link to="/evidencia" style={{ ...item, textDecoration: 'none' }}>
+        <span>Evidencia y derechos de uso</span>
+      </Link>
       <div style={item}>
         <span>Aprobaciones pendientes</span>
         <span style={{ font: '600 11px var(--font-mono)', color: 'var(--warn)' }}>1</span>
@@ -376,6 +379,9 @@ function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
       </div>
       <Link to="/personas" style={{ ...item, textDecoration: 'none' }}>
         <span>Personas y permisos</span>
+      </Link>
+      <Link to="/exportacion" style={{ ...item, textDecoration: 'none' }}>
+        <span>Exportación del workspace</span>
       </Link>
       <div style={{ marginTop: 'auto', font: '400 11.5px/1.5 var(--font-sans)', color: 'var(--text-faint)', padding: 10 }}>
         La organización cliente es propietaria del workspace; la boutique opera como autorizada.

@@ -567,7 +567,9 @@ function ItemChecklist({
                       disabled={o.citable === false}
                     >
                       {o.citable === false
-                        ? `${o.titulo} — sin derechos: ${o.motivoBloqueo ?? ''}`
+                        ? `${o.titulo} — sin derechos: ${
+                            o.motivoBloqueo ?? 'faltan derechos de uso para el ámbito cliente'
+                          }`
                         : o.titulo}
                     </option>
                   ))}

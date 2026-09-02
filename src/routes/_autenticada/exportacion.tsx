@@ -44,7 +44,11 @@ function PantallaExportacion() {
   const [ambito, setAmbito] = useState<AmbitoExport>('archivo');
   const [error, setError] = useState<string | null>(null);
   const [manifiesto, setManifiesto] = useState<Manifiesto | null>(null);
-  const [bloqueadas, setBloqueadas] = useState<{ titulo: string; motivo: string }[]>([]);
+  // Se conserva el evidenciaId que ya manda el backend: dos evidencias pueden llamarse
+  // igual, y una clave compuesta por título y motivo colisionaría justo en ese caso.
+  const [bloqueadas, setBloqueadas] = useState<
+    { evidenciaId: string; titulo: string; motivo: string }[]
+  >([]);
   const [exportando, setExportando] = useState(false);
 
   const workspaceId = membresiaActiva?.workspaceId;
@@ -62,7 +66,11 @@ function PantallaExportacion() {
       }
       setManifiesto(r.exportacion.manifiesto);
       setBloqueadas(
-        r.exportacion.bloqueadas.map((b) => ({ titulo: b.titulo, motivo: b.motivo })),
+        r.exportacion.bloqueadas.map((b) => ({
+          evidenciaId: b.evidenciaId,
+          titulo: b.titulo,
+          motivo: b.motivo,
+        })),
       );
       const blob = new Blob([JSON.stringify(r.exportacion, null, 2)], {
         type: 'application/json',
@@ -72,7 +80,9 @@ function PantallaExportacion() {
       a.href = url;
       a.download = nombreDeArchivoExport(r.exportacion.manifiesto.workspaceNombre, ambito);
       a.click();
-      URL.revokeObjectURL(url);
+      // El revoke va al siguiente tick: revocar justo después del click cancela o trunca
+      // la descarga en navegadores que aún no han empezado a leer el blob (Safari).
+      setTimeout(() => URL.revokeObjectURL(url), 0);
     } catch {
       setError('No se pudo generar la exportación; intenta de nuevo');
     } finally {
@@ -204,7 +214,7 @@ function PantallaExportacion() {
                 </span>
                 {bloqueadas.map((b) => (
                   <span
-                    key={b.titulo + b.motivo}
+                    key={b.evidenciaId}
                     style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-body)' }}
                   >
                     <strong>{b.titulo}</strong> — {b.motivo}

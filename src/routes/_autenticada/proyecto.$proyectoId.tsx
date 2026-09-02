@@ -350,7 +350,7 @@ function ItemChecklist({
           )}
         </div>
       )}
-      {editable && item.estado !== 'pendiente' && (item.estado === 'na' ? puedeNa : puedeCurar || puedeNa) && (
+      {editable && item.estado !== 'pendiente' && (item.estado === 'na' ? puedeNa : puedeCurar) && (
         <div>
           <Button size="sm" variant="ghost" disabled={ocupado} onClick={() => void marcar({ tipo: 'pendiente' })}>
             Volver a pendiente

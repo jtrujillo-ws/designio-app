@@ -243,6 +243,14 @@ create policy checklist_insert on checklist_item
   for insert with check (
     workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
     and estado = 'pendiente'
+    -- Gate aprobado ⇒ checklist congelado también para ALTAS: sin esto se podría colar
+    -- un pendiente nuevo en un gate ya decidido (ineditable además, por la política de
+    -- update). activarReto inserta el checklist en una sentencia POSTERIOR a los gates
+    -- dentro de la misma transacción, así que este subquery sí los ve.
+    and exists (select 1 from gate_instancia g
+      where g.id = checklist_item.gate_id
+        and g.workspace_id = checklist_item.workspace_id
+        and g.estado = 'pendiente')
   );
 -- Cumplido/pendiente los marcan los curadores (producen artefactos, §13.2); N/A lo
 -- marca SOLO quien tiene el rol aprobador del gate (que en G0/G3/G5/G6 es el sponsor,
@@ -259,10 +267,13 @@ create policy checklist_update on checklist_item
       -- deshace — solo ese rol puede tocarlo (p.ej. revertirlo a pendiente).
       (checklist_item.estado <> 'na'
         and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'))
-      or exists (select 1 from gate_instancia g2
-        where g2.id = checklist_item.gate_id
-          and g2.workspace_id = checklist_item.workspace_id
-          and workspace_role(app_user_id(), workspace_id) = g2.rol_aprobador)
+      -- Y el aprobador solo alcanza pendiente/na: un cumplido de los curadores no se
+      -- deshace desde el rol del gate (su palanca es no aprobar, no borrar trabajo).
+      or (checklist_item.estado <> 'cumplido'
+        and exists (select 1 from gate_instancia g2
+          where g2.id = checklist_item.gate_id
+            and g2.workspace_id = checklist_item.workspace_id
+            and workspace_role(app_user_id(), workspace_id) = g2.rol_aprobador))
     )
   )
   with check (

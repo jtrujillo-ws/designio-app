@@ -211,6 +211,15 @@ describeAuthz('método: etapas, gates y checklists', () => {
 
     const admin = sqlAdmin();
     await admin`update criterio_exito set ventana_dias = 90 where workspace_id = ${ws} and reto_id = ${retoId}`;
+
+    // Valor sin fecha NO es línea base registrada: sin el punto de partida temporal la
+    // ventana de medición no ancla — y aquí tampoco hay plan que lo supla.
+    await admin`update criterio_exito set linea_base_fecha = null where workspace_id = ${ws} and reto_id = ${retoId}`;
+    await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id })).rejects.toThrow(
+      /línea base completa/,
+    );
+    await admin`update criterio_exito set linea_base_fecha = '2026-07-15' where workspace_id = ${ws} and reto_id = ${retoId}`;
+
     const ok = await aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id });
     expect(ok.numero).toBe(0);
   });
@@ -308,6 +317,26 @@ describeAuthz('método: etapas, gates y checklists', () => {
     const trasRevertir = await proyectoMetodo(leadId, ws, proyectoId);
     expect(trasRevertir!.gates[3]!.items[0]!.estado).toBe('pendiente');
 
+    // Y la simetría: el aprobador tampoco deshace un cumplido de los curadores — su
+    // palanca es no aprobar el gate, no borrar trabajo (USING lo deja fuera).
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: g3.items[0]!.id,
+      accion: { tipo: 'cumplido', evidenciaId },
+    });
+    await expect(
+      marcarItem(sponsorId, {
+        workspaceId: ws,
+        itemId: g3.items[0]!.id,
+        accion: { tipo: 'pendiente' },
+      }),
+    ).rejects.toThrow(/no puedes marcarlo/);
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: g3.items[0]!.id,
+      accion: { tipo: 'pendiente' },
+    });
+
     // El stakeholder no marca nada (política de curadores).
     await expect(
       marcarItem(stakeId, {
@@ -316,6 +345,28 @@ describeAuthz('método: etapas, gates y checklists', () => {
         accion: { tipo: 'cumplido', evidenciaId },
       }),
     ).rejects.toThrow(ErrorMetodo);
+  });
+
+  it('un gate aprobado no admite altas de checklist y cada marca deja evento con lo previo', async () => {
+    const p = await proyectoMetodo(leadId, ws, proyectoId);
+    const g1 = p!.gates[1]!; // aprobado en el test del rol del gate
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into checklist_item (workspace_id, gate_id, orden, texto)
+        values (${ws}, ${g1.id}, 99, 'colado tras la aprobación')`),
+    ).rejects.toThrow(/row-level security/);
+
+    // El rastro del N/A revertido vive en el evento: quién lo había aprobado y por qué.
+    const admin = sqlAdmin();
+    const eventos = await admin`
+      select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'ItemMarcado'
+        and payload->>'accion' = 'pendiente'
+        and payload->'previo'->>'estado' = 'na'
+      order by creado_en desc limit 1`;
+    expect(eventos.length).toBe(1);
+    const previo = (eventos[0]!.payload as { previo: Record<string, string> }).previo;
+    expect(previo.naAprobadoPor).toBe(sponsorId);
+    expect(previo.naJustificacion).toBe('Decidido por el sponsor');
   });
 
   it('las escrituras directas del método respetan RLS: un stakeholder no aprueba gates', async () => {

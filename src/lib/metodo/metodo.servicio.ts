@@ -167,31 +167,74 @@ export async function activarReto(
   });
 }
 
+/** Candado consultivo transaccional por gate: marcar checklist y aprobar el gate deben
+ * serializarse entre sí — bajo READ COMMITTED cada sentencia decisora lee un snapshot
+ * que no ve el write concurrente de la otra y ninguna bloquea a la otra por filas, así
+ * que sin el candado podrían commitear un gate aprobado con un ítem devuelto a
+ * pendiente. Tomado ANTES de la sentencia decisora en ambos lados, la que llega segunda
+ * arranca su snapshot con el resultado de la primera ya confirmado. */
+async function bloquearGate(tx: TransactionSql, gateId: string): Promise<void> {
+  await tx`select pg_advisory_xact_lock(hashtextextended('designio:gate:' || ${gateId}, 42))`;
+}
+
 /** Marca un ítem del checklist (RF-04.6): cumplido con evidencia real, pendiente, o N/A
  * (la política exige que quien lo marca TENGA el rol aprobador del gate y quede como su
  * aprobador). Un ítem ya en N/A solo lo revierte ese mismo rol — un curador no deshace la
- * decisión. Un gate aprobado congela su checklist (la política de UPDATE no lo alcanza). */
+ * decisión — y al revertirlo el evento conserva quién lo había aprobado y con qué
+ * justificación. Un gate aprobado congela su checklist (la política de UPDATE no lo
+ * alcanza). */
 export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     const a = entrada.accion;
-    let filas;
+
+    const [dueno] = await tx`select gate_id from checklist_item
+      where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
+    if (!dueno) {
+      throw new ErrorMetodo('El ítem no existe, su gate ya fue aprobado o no puedes marcarlo');
+    }
+    await bloquearGate(tx, dueno.gate_id as string);
+
+    const detalle =
+      a.tipo === 'cumplido'
+        ? { evidenciaId: a.evidenciaId }
+        : a.tipo === 'na'
+          ? { justificacion: a.justificacion }
+          : {};
+    let fila;
     try {
-      filas =
-        a.tipo === 'cumplido'
-          ? await tx`update checklist_item
-              set estado = 'cumplido', evidencia_id = ${a.evidenciaId},
-                  na_justificacion = '', na_aprobado_por = null
-              where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`
-          : a.tipo === 'na'
-            ? await tx`update checklist_item
-                set estado = 'na', na_justificacion = ${a.justificacion},
-                    na_aprobado_por = ${actorId}, evidencia_id = null
-                where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`
-            : await tx`update checklist_item
-                set estado = 'pendiente', evidencia_id = null,
-                    na_justificacion = '', na_aprobado_por = null
-                where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
+      // UNA sentencia: el estado previo (para el rastro del N/A revertido), la marca y
+      // el evento comparten snapshot, y el rol auditado es el que autorizó el update.
+      [fila] = await tx`
+        with antes as (
+          select estado, na_aprobado_por, na_justificacion from checklist_item
+          where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}
+        ),
+        quien as (
+          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
+        ),
+        upd as (
+          update checklist_item
+          set estado = ${a.tipo},
+              evidencia_id = ${a.tipo === 'cumplido' ? a.evidenciaId : null},
+              na_justificacion = ${a.tipo === 'na' ? a.justificacion : ''},
+              na_aprobado_por = ${a.tipo === 'na' ? actorId : null}
+          where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}
+          returning id, gate_id
+        ),
+        evento as (
+          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+          select ${entrada.workspaceId}, 'ItemMarcado',
+            jsonb_build_object('itemId', upd.id, 'gateId', upd.gate_id,
+                               'accion', ${a.tipo}::text)
+              || ${tx.json(detalle)}::jsonb
+              || jsonb_build_object('previo', jsonb_build_object(
+                   'estado', antes.estado, 'naAprobadoPor', antes.na_aprobado_por,
+                   'naJustificacion', antes.na_justificacion)),
+            ${actorId}, quien.rol
+          from upd, quien, antes
+        )
+        select count(*)::int as n from upd`;
     } catch (e) {
       const code = (e as { code?: string }).code;
       // WITH CHECK violado (42501): rol insuficiente para la transición pedida.
@@ -207,7 +250,7 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
       }
       throw e;
     }
-    if (filas.count === 0) {
+    if ((fila!.n as number) === 0) {
       throw new ErrorMetodo('El ítem no existe, su gate ya fue aprobado o no puedes marcarlo');
     }
   });
@@ -215,8 +258,9 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
 
 /**
  * Aprobar un gate (RF-04.7): la MISMA sentencia exige rol aprobador (política), checklist
- * sin pendientes y — para G0 — criterios presentes y completos (ventana + línea base o
- * plan, SYS-22). 0 filas = bloqueado; el diagnóstico posterior lista qué faltó.
+ * sin pendientes y — para G0 — criterios presentes y completos (ventana + línea base con
+ * valor y fecha, o plan — SYS-22). 0 filas = bloqueado; el diagnóstico posterior lista
+ * qué faltó. El candado del gate serializa esta decisión contra marcarItem.
  */
 export async function aprobarGate(
   actorId: string,
@@ -224,6 +268,7 @@ export async function aprobarGate(
 ): Promise<{ numero: number }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    await bloquearGate(tx, entrada.gateId);
 
     const aprobado = await tx`
       update gate_instancia g
@@ -242,7 +287,8 @@ export async function aprobarGate(
           join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
           where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
             and (c.ventana_dias is null
-                 or (nullif(c.linea_base_valor, '') is null and c.linea_base_plan = ''))))
+                 or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
+                     and c.linea_base_plan = ''))))
       returning g.numero, g.proyecto_id, workspace_role(${actorId}, g.workspace_id) as rol`;
 
     if (aprobado.length === 0) {
@@ -295,18 +341,23 @@ async function diagnosticoDeGate(
   }
 
   if ((gate.numero as number) === 0) {
+    // Línea base REGISTRADA = valor + fecha (sin fecha no hay punto de partida temporal
+    // para la ventana de medición); si falta cualquiera de los dos, cuenta solo el plan.
     const incompletos = await tx`
       select c.kpi, (c.ventana_dias is null) as sin_ventana,
-             (nullif(c.linea_base_valor, '') is null and c.linea_base_plan = '') as sin_base
+             ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
+              and c.linea_base_plan = '') as sin_base
       from criterio_exito c
       join proyecto p on p.id = ${gate.proyecto_id as string} and p.workspace_id = ${workspaceId}
       where c.reto_id = p.reto_id and c.workspace_id = ${workspaceId}
-        and (c.ventana_dias is null or (nullif(c.linea_base_valor, '') is null and c.linea_base_plan = ''))`;
+        and (c.ventana_dias is null
+             or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
+                 and c.linea_base_plan = ''))`;
     if (incompletos.length > 0) {
       const lista = incompletos
         .map(
           (c) =>
-            `«${c.kpi as string}» (${[c.sin_ventana ? 'sin ventana' : null, c.sin_base ? 'sin línea base ni plan' : null].filter(Boolean).join(' y ')})`,
+            `«${c.kpi as string}» (${[c.sin_ventana ? 'sin ventana' : null, c.sin_base ? 'sin línea base completa (valor y fecha) ni plan' : null].filter(Boolean).join(' y ')})`,
         )
         .join(', ');
       return `G0 exige criterios completos (SYS-22): ${lista}`;

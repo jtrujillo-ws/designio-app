@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
-import { construirArbol } from '@/lib/arbol/arbol.queries';
+import { arbolParaUsuario, construirArbol } from '@/lib/arbol/arbol.queries';
+import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { describeAuthz } from './helpers';
 
 /**
@@ -92,6 +93,19 @@ describeAuthz('árbol de navegación (proyección + aislamiento)', () => {
 
     // La arista redundante que duplica el ancla NO aparece como «afecta» en Servicio 1.
     expect(s1.retosQueAfectan).toHaveLength(0);
+  });
+
+  it('arbolParaUsuario aplica la capa 2: cuenta activa lee, desactivada con sesión viva no', async () => {
+    const arbol = await arbolParaUsuario(userA, wsA);
+    expect(arbol?.servicios.length).toBeGreaterThan(0);
+
+    const admin = sqlAdmin();
+    await admin`update usuario set estado = 'inactivo' where id = ${userA}`;
+    try {
+      await expect(arbolParaUsuario(userA, wsA)).rejects.toThrow(ErrorAutorizacion);
+    } finally {
+      await admin`update usuario set estado = 'activo' where id = ${userA}`;
+    }
   });
 
   it('sin contexto de usuario, el árbol es invisible (cero filas)', async () => {

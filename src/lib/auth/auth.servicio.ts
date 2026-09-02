@@ -25,11 +25,12 @@ export class ErrorAutorizacion extends Error {}
 export class ErrorInvitacion extends Error {}
 
 /**
- * Capa 2 de TODA operación protegida: el JWT vive 7 días, así que el estado ACTUAL de la
- * cuenta se re-verifica contra la base (la fila propia es visible bajo RLS) — una cuenta
- * desactivada a mitad de sesión no sigue leyendo ni mutando datos de gestión.
+ * Capa 2 de TODA operación protegida (compartida entre módulos): el JWT vive 7 días,
+ * así que el estado ACTUAL de la cuenta se re-verifica contra la base (la fila propia
+ * es visible bajo RLS) — una cuenta desactivada a mitad de sesión no sigue leyendo ni
+ * mutando datos aunque su cookie siga siendo válida.
  */
-async function exigirCuentaActiva(tx: TransactionSql, actorId: string): Promise<void> {
+export async function exigirCuentaActiva(tx: TransactionSql, actorId: string): Promise<void> {
   const [cuenta] = await tx`select estado from usuario where id = ${actorId}`;
   if ((cuenta?.estado as string | undefined) !== 'activo') {
     throw new ErrorAutorizacion('Tu cuenta no está activa');

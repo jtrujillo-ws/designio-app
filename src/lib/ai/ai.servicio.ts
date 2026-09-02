@@ -153,7 +153,10 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
           referencia: (f.item_referencia as string | null) ?? '',
           contenido: (f.item_contenido as string | null) ?? '',
         }).texto;
-  const citas = 'citas' in contenido ? contenido.citas : [];
+  // Las citas se leen del ORIGINAL: son el testimonio del modelo sobre lo que leyó, no del
+  // humano que corrige. Hoy son siempre las mismas —corregirlas está prohibido en el
+  // servicio y en el guard— y leerlas de aquí lo deja dicho en la proyección también.
+  const citas = 'citas' in original ? original.citas : [];
   return {
     id: f.id as string,
     capacidad: f.capacidad as PropuestaEnPanel['capacidad'],
@@ -898,6 +901,9 @@ type PropuestaEnRevision = {
   itemId: string | null;
   retoId: string | null;
   contenido: ContenidoPropuesta;
+  /** Lo que dijo el modelo, intacto (SYS-17). Es contra esto —y no contra el contenido
+   * vigente— contra lo que se comprueba que una corrección no toque las citas. */
+  contenidoOriginal: ContenidoPropuesta;
   modelo: string;
   promptVersion: string;
 };
@@ -907,8 +913,8 @@ async function leerParaRevisar(
   workspaceId: string,
   propuestaId: string,
 ): Promise<PropuestaEnRevision> {
-  const [p] = await tx`select capacidad, destino, item_id, reto_id, contenido, modelo,
-      prompt_version, estado
+  const [p] = await tx`select capacidad, destino, item_id, reto_id, contenido,
+      contenido_original, modelo, prompt_version, estado
     from propuesta_ai where id = ${propuestaId} and workspace_id = ${workspaceId}`;
   if (!p) throw new ErrorAI('La propuesta no existe en este workspace');
   if ((p.estado as string) !== 'propuesta') {
@@ -920,6 +926,7 @@ async function leerParaRevisar(
     itemId: p.item_id as string | null,
     retoId: p.reto_id as string | null,
     contenido: p.contenido as ContenidoPropuesta,
+    contenidoOriginal: p.contenido_original as ContenidoPropuesta,
     modelo: p.modelo as string,
     promptVersion: p.prompt_version as string,
   };
@@ -949,6 +956,25 @@ export async function aceptarPropuesta(
         contenido = parsearContenido(p.capacidad, entrada.correccion);
       } catch {
         throw new ErrorAI('La corrección no cumple el formato de la capacidad');
+      }
+      // Las citas NO se corrigen. Son el testimonio del modelo sobre lo que dijo haber
+      // leído y la entrada de la medida de grounding: reescribir una cita inventada por
+      // otra literal deja una propuesta con aspecto impecable y borra justo la señal que
+      // hay que ver. Corregir el resto —título, resumen, fechas, dimensiones— es la razón
+      // de ser de la corrección; esto no.
+      //
+      // El formulario del panel ya reenvía las originales, pero eso era una convención de
+      // una pantalla: cualquier cliente que hable con la server function podía mandar otras.
+      // Se compara contra el ORIGINAL y no contra el contenido vigente, que es lo mismo
+      // mientras la propuesta esté pendiente pero dice mejor de dónde sale la verdad.
+      if (
+        p.destino === 'evidencia' &&
+        JSON.stringify((contenido as ContenidoExtraccion).citas) !==
+          JSON.stringify((p.contenidoOriginal as ContenidoExtraccion).citas)
+      ) {
+        throw new ErrorAI(
+          'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',
+        );
       }
     }
     // El destino y la forma del contenido van atados por el CHECK de la tabla y por el

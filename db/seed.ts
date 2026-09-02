@@ -12,6 +12,8 @@ import {
   ETAPAS_CANONICAS,
   rolAprobadorDeGate,
 } from '../src/lib/metodo/metodo.plantillas';
+import { MODELO_PRIMARIO } from '../src/lib/ai/ai.degradacion';
+import { PROMPT_VERSION } from '../src/lib/ai/ai.prompts';
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error('Falta DATABASE_URL (conexión admin; ver .env.local.example)');
@@ -1016,6 +1018,110 @@ async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string):
   }
 }
 
+const TITULO_ITEM_AI = 'Notas del análisis de funnel de apertura (julio 2026)';
+
+/** Material de bandeja del que cuelga la propuesta AI de demo. Es texto NO confiable:
+ * entra al prompt delimitado como dato y las citas se verifican contra él. */
+const MATERIAL_ITEM_AI = [
+  'Notas de la sesión de análisis del funnel de apertura (julio 2026).',
+  '',
+  'De cada 100 personas que inician la apertura, 62 no la completan. El 71% de los abandonos ocurre en la pantalla de carga del documento de identidad.',
+  '',
+  'Cita del equipo de Riesgo: "cuando el buró no responde en 30 segundos, la solicitud queda en espera y el cliente no recibe ningún aviso".',
+  '',
+  'El rechazo del documento no explica el motivo: el usuario reintenta con la misma foto una media de 2,4 veces antes de abandonar.',
+].join('\n');
+
+/**
+ * Propuesta AI pendiente de revisión (SPEC-08): un item de bandeja con su candidato a
+ * evidencia esperando que una persona acepte, corrija o rechace. Nada del dominio existe
+ * todavía — es exactamente lo que la demo tiene que enseñar (I4).
+ *
+ * Igual que el journey de demo, la propuesta viene con una IMPERFECCIÓN deliberada: de
+ * sus tres citas, una no aparece literal en el material. Una propuesta impecable de
+ * ejemplo enseñaría a aceptar sin mirar; esta enseña dónde está la señal de alarma.
+ *
+ * Idempotente por presencia de propuestas en el workspace (y el item, por título).
+ * Devuelve si la creó en esta corrida.
+ */
+async function sembrarPropuestaAI(
+  tx: TransactionSql,
+  wsId: string,
+  luciaId: string,
+): Promise<boolean> {
+  const existe = await tx`select 1 from propuesta_ai where workspace_id = ${wsId}`;
+  if (existe.length > 0) return false;
+
+  const [yaItem] = await tx`select id from item_importacion
+    where workspace_id = ${wsId} and titulo = ${TITULO_ITEM_AI}`;
+  let itemId = yaItem?.id as string | undefined;
+  if (!itemId) {
+    const [item] = await tx`insert into item_importacion
+      (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+      values (${wsId}, ${TITULO_ITEM_AI}, ${MATERIAL_ITEM_AI}, 'nota',
+              'carpeta compartida / analítica Q3', ${luciaId})
+      returning id`;
+    itemId = item!.id as string;
+    await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
+      (${wsId}, 'ItemImportado', ${tx.json({ titulo: TITULO_ITEM_AI, origen: 'seed' })},
+       ${luciaId}, 'lead-boutique')`;
+  }
+
+  const contenido = {
+    titulo: 'Abandono en la verificación de identidad',
+    resumen:
+      'El grueso del abandono se concentra en la carga del documento y en la espera del buró, sin aviso al cliente.',
+    recoleccion: 'Sesión de análisis del funnel con el equipo de datos y Riesgo',
+    fecha: '2026-07-20',
+    derivada: true,
+    confianza: 'media',
+    confidencialidad: 'cliente',
+    esEstadoActual: true,
+    citas: [
+      {
+        fragmento:
+          'El 71% de los abandonos ocurre en la pantalla de carga del documento de identidad.',
+        localizacion: 'párrafo 2',
+      },
+      {
+        fragmento:
+          'cuando el buró no responde en 30 segundos, la solicitud queda en espera y el cliente no recibe ningún aviso',
+        localizacion: 'párrafo 3',
+      },
+      {
+        // Deliberadamente NO literal: la pantalla debe marcarla en rojo.
+        fragmento: 'el 71% de los usuarios abandona por falta de confianza en la marca',
+        localizacion: 'párrafo 2',
+      },
+    ],
+  };
+
+  const [propuesta] = await tx`insert into propuesta_ai
+    (workspace_id, capacidad, destino, item_id, contenido, contenido_original, confianza,
+     modelo, prompt_version, alcance_resumen, latencia_ms, origen_key, creado_por)
+    values (${wsId}, 'CI', 'evidencia', ${itemId}, ${tx.json(contenido)}, ${tx.json(contenido)},
+            0.55, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+            ${`item de bandeja «${TITULO_ITEM_AI}» · ${MATERIAL_ITEM_AI.length} de ${MATERIAL_ITEM_AI.length} caracteres`},
+            1840, 'entorno', ${luciaId})
+    returning id`;
+
+  // El guard de la tabla emite este evento para las escrituras CON contexto de usuario; el
+  // seed corre como owner sin contexto y su pre-chequeo lo salta, así que se deja aquí.
+  await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
+    (${wsId}, 'PropuestaAIGenerada',
+     ${tx.json({
+       propuestaId: propuesta!.id as string,
+       capacidad: 'CI',
+       destino: 'evidencia',
+       modelo: MODELO_PRIMARIO,
+       promptVersion: PROMPT_VERSION,
+       origenKey: 'entorno',
+       origen: 'seed',
+     })},
+     ${luciaId}, 'lead-boutique')`;
+  return true;
+}
+
 /** Segundo workspace de Lucía (demo del selector multi-membresía): mínimo pero real —
  * un servicio, sin retos aún. Idempotente por MEMBRESÍA de Lucía + nombre: el nombre
  * de workspace no es único y uno homónimo ajeno no debe saltarse el seed. Devuelve si
@@ -1089,13 +1195,17 @@ async function main() {
     if (lucia) {
       segundoSembrado = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
     }
-    // Upgrade de bases sembradas antes de los derechos de uso (SPEC-03 profunda): la
-    // función se auto-guarda por la presencia de derechos en el workspace.
+    // Upgrade de bases sembradas antes de los derechos de uso (SPEC-03 profunda) y del
+    // pipeline AI (SPEC-08): cada función se auto-guarda por la presencia de su propio
+    // rastro en el workspace —derechos y propuestas—, así que las dos son idempotentes por
+    // separado y el orden entre ellas no las ata.
     let evidenciaSembrada = false;
+    let propuestaSembrada = false;
     if (lucia) {
       evidenciaSembrada = await sql.begin((tx) =>
         sembrarEvidenciaProfunda(tx, wsId, lucia.id as string),
       );
+      propuestaSembrada = await sql.begin((tx) => sembrarPropuestaAI(tx, wsId, lucia.id as string));
     }
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
@@ -1104,7 +1214,8 @@ async function main() {
         (journeySembrado ? '; journey as-is sembrado' : '') +
         (entregaSembrada ? '; DV-1 con RL-1/RL-2 y ES-1 sembrada' : '') +
         (segundoSembrado ? '; Clínica del Valle sembrada' : '') +
-        (evidenciaSembrada ? '; evidencia §19.1 con derechos de uso sembrada' : ''),
+        (evidenciaSembrada ? '; evidencia §19.1 con derechos de uso sembrada' : '') +
+        (propuestaSembrada ? '; propuesta AI pendiente sembrada' : ''),
     );
     return;
   }
@@ -1137,6 +1248,7 @@ async function main() {
     await sembrarCadena(tx, wsId, luciaId);
     await sembrarJourney(tx, wsId, luciaId);
     await sembrarSegundoWorkspace(tx, luciaId);
+    await sembrarPropuestaAI(tx, wsId, luciaId);
     return { wsId, luciaId };
   });
 
@@ -1146,7 +1258,7 @@ async function main() {
   // producto no puede producir y que el guard diferido rechaza.
   await sembrarEntrega(sql, creado.wsId, creado.luciaId);
   console.log(
-    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
+    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1, item de bandeja con propuesta AI pendiente) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );
 }
 

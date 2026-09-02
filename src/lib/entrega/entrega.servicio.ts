@@ -79,7 +79,48 @@ async function bloquearServicio(tx: TransactionSql, servicioId: string): Promise
     hashtextextended('designio:design-version:' || ${servicioId}, 42))`;
 }
 
-/** Candado por release: desplegar y constatar leen y reescriben el mismo estado. */
+/**
+ * Candado por DESIGN VERSION: serializa aprobar contra TODA mutación de sus elementos.
+ *
+ * El recurso en disputa es la VERSIÓN, no el elemento, y por eso la clave es su id: dos
+ * elementos distintos de la misma versión también compiten entre sí (comparten el
+ * `max(orden) + 1`) y, sobre todo, compiten contra la aprobación que los congela.
+ * Nombrarlo por el elemento no serializaría ninguna de las dos cosas.
+ *
+ * Por qué hace falta en los dos lados: aprobar y editar un elemento escriben filas
+ * DISTINTAS —design_version y elemento_cambio—, así que el candado de fila que Postgres
+ * pone solo protege a quien toca la misma. `enlazarJourney`, por ejemplo, no necesita
+ * nada de esto: escribe la propia fila de la design version y el candado de fila lo
+ * serializa contra la aprobación por construcción. El elemento no. Y la política del
+ * elemento («su design version está en borrador») es un predicado sobre un snapshot: bajo
+ * READ COMMITTED la aprobación aún sin commitear no se ve, las dos transacciones pasan sus
+ * chequeos y la versión aprobada acaba con un cambio posterior a su congelación.
+ *
+ * Tampoco vale `select … for update` sobre la design version desde el lado del elemento:
+ * bajo RLS ese bloqueo exige además pasar el USING de alguna política de UPDATE de
+ * design_version, que no es una condición que el editor de elementos deba cumplir — la
+ * autorización para editar un elemento no puede depender de si puedes escribir su padre.
+ *
+ * Orden de adquisición: design version → servicio (en `aprobarDesignVersion`), y nunca
+ * junto al candado de release, que vive en el otro extremo de la cadena. Sin pares
+ * cruzados no hay ciclo posible.
+ */
+async function bloquearDesignVersion(tx: TransactionSql, designVersionId: string): Promise<void> {
+  await tx`select pg_advisory_xact_lock(
+    hashtextextended('designio:dv-elemento:' || ${designVersionId}, 42))`;
+}
+
+/**
+ * Candado por RELEASE. Lo toman los cuatro caminos que deciden sobre el mismo estado: el
+ * despliegue, la constatación y las dos escrituras del ALCANCE (asignar y desasignar).
+ *
+ * El alcance y el despliegue se invalidan mutuamente aunque escriban tablas distintas
+ * —release_elemento y release—, así que el candado de fila no los toca: sin esto, dos
+ * transacciones ven el release 'planificado' a la vez y commitean las dos. El resultado
+ * es un elemento que entra DESPUÉS del despliegue (y queda constatable sin haber salido),
+ * o el último elemento saliendo justo cuando el guard acaba de comprobar que el alcance no
+ * estaba vacío: un release desplegado que no declara nada, contra SYS-06.
+ */
 async function bloquearRelease(tx: TransactionSql, releaseId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(hashtextextended('designio:release:' || ${releaseId}, 42))`;
 }
@@ -158,10 +199,10 @@ export async function agregarElemento(
 ): Promise<{ elementoId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    // El orden es un max()+1: dos altas concurrentes leerían el mismo máximo y nacerían
-    // empatadas. Mismo espacio de nombres que los del journey y los del método.
-    await tx`select pg_advisory_xact_lock(
-      hashtextextended('designio:dv-elemento:' || ${entrada.designVersionId}, 42))`;
+    // El candado hace dos trabajos: el orden es un max()+1 (dos altas concurrentes leerían
+    // el mismo máximo y nacerían empatadas) y, sobre todo, serializa contra la aprobación
+    // que congela esta design version.
+    await bloquearDesignVersion(tx, entrada.designVersionId);
     let fila;
     try {
       [fila] = await tx`
@@ -227,9 +268,27 @@ async function enlazarMotivos(
   }
 }
 
+/**
+ * Resuelve la design version de un elemento y toma su candado. El id resuelto es ESTABLE
+ * sin necesidad de re-comprobarlo después: `design_version_id` está fuera del grant de
+ * columna de elemento_cambio, así que un elemento no puede mudarse de versión entre la
+ * lectura y el candado — el grant mínimo cierra la ventana que si no habría que vigilar.
+ */
+async function bloquearVersionDelElemento(
+  tx: TransactionSql,
+  workspaceId: string,
+  elementoId: string,
+): Promise<void> {
+  const [fila] = await tx`select design_version_id from elemento_cambio
+    where id = ${elementoId} and workspace_id = ${workspaceId}`;
+  if (!fila) throw new ErrorEntrega('Ese elemento de cambio no existe en este workspace');
+  await bloquearDesignVersion(tx, fila.design_version_id as string);
+}
+
 export async function editarElemento(actorId: string, entrada: EditarElemento): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    await bloquearVersionDelElemento(tx, entrada.workspaceId, entrada.elementoId);
     let filas;
     try {
       filas = await tx`
@@ -257,6 +316,7 @@ export async function borrarElemento(
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    await bloquearVersionDelElemento(tx, workspaceId, elementoId);
     // Los motivos se van con el elemento: dejarlos sería dejar enlaces al vacío. Las FKs
     // no tienen cascade a propósito (borrar en cadena por accidente es peor que fallar).
     await tx`delete from elemento_decision
@@ -290,6 +350,11 @@ export async function aprobarDesignVersion(
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // El candado va ANTES de leer, y no después como el del servicio: lo que se lee aquí
+    // —el estado, el journey que se va a congelar— es lo que las mutaciones de elementos
+    // pueden estar cambiando ahora mismo. Leer primero y bloquear después dejaría decidir
+    // sobre una foto vieja, que es justo lo que este candado viene a impedir.
+    await bloquearDesignVersion(tx, entrada.designVersionId);
     const [dv] = await tx`
       select id, servicio_id, journey_id, supera_a, estado, codigo
       from design_version
@@ -326,15 +391,21 @@ export async function aprobarDesignVersion(
         select ${entrada.workspaceId}, j.id,
           coalesce(nullif(${entrada.motivo}, ''), 'Aprobación de ' || ${dv.codigo as string}),
           jsonb_build_object(
-            'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.orden)
+            -- MISMO orden total que congelarSnapshot (SPEC-05): el orden se reinicia por
+            -- tipo y por fase, así que ordenar solo por él deja empates y el array sale
+            -- distinto en cada congelación. Aquí importa el doble, porque son dos caminos
+            -- que producen el MISMO registro: si discreparan, dos snapshots del mismo
+            -- grafo se compararían como si el grafo hubiera cambiado.
+            'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.tipo, n.orden, n.id)
               from journey_nodo n
               where n.journey_id = j.id and n.workspace_id = j.workspace_id), '[]'::jsonb),
-            'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en)
+            'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en, a.id)
               from journey_arista a
               where a.journey_id = j.id and a.workspace_id = j.workspace_id), '[]'::jsonb),
             'evidencias', coalesce((select jsonb_agg(jsonb_build_object(
                 'nodoId', ne.nodo_id, 'evidenciaId', ne.evidencia_id,
-                'evidenciaTitulo', e.titulo) order by ne.creado_en)
+                'evidenciaTitulo', e.titulo)
+                order by ne.creado_en, ne.nodo_id, ne.evidencia_id)
               from journey_nodo_evidencia ne
               join journey_nodo n2 on n2.id = ne.nodo_id and n2.workspace_id = ne.workspace_id
               join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
@@ -411,6 +482,11 @@ async function asignarElementosAlRelease(
   releaseId: string,
   elementos: { elementoId: string; razon: string }[],
 ): Promise<void> {
+  // Declarar el alcance compite con desplegar: los dos deciden sobre el mismo release
+  // escribiendo tablas distintas. En `planificarRelease` el candado no tiene contendiente
+  // —el release acaba de nacer y su id no es visible para nadie más—, pero tomarlo aquí
+  // y no en cada llamador es lo que garantiza que ningún camino al alcance se lo salte.
+  await bloquearRelease(tx, releaseId);
   try {
     const filas = await tx`
       insert into release_elemento (elemento_id, release_id, workspace_id, razon, creado_por)
@@ -446,8 +522,21 @@ export async function desasignarElemento(
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const filas = await tx`delete from release_elemento
+    // El release al que sacar el elemento hay que resolverlo para poder bloquearlo, y a
+    // diferencia del `design_version_id` de un elemento este SÍ puede cambiar: reasignar
+    // es borrar y volver a insertar. Por eso el DELETE repite el release resuelto — si
+    // otra transacción lo movió mientras esperábamos, no borramos bajo el candado
+    // equivocado: no borramos nada y lo decimos.
+    const [asignacion] = await tx`select release_id from release_elemento
       where elemento_id = ${elementoId} and workspace_id = ${workspaceId}`;
+    if (!asignacion) {
+      throw new ErrorEntrega('Ese elemento no está asignado a ningún release');
+    }
+    const releaseId = asignacion.release_id as string;
+    await bloquearRelease(tx, releaseId);
+    const filas = await tx`delete from release_elemento
+      where elemento_id = ${elementoId} and workspace_id = ${workspaceId}
+        and release_id = ${releaseId}`;
     if (filas.count === 0) {
       throw new ErrorEntrega('Ese elemento no está asignado, o su release ya salió (alcance fijo)');
     }

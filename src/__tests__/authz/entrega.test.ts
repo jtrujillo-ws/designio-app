@@ -62,6 +62,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
   let elCore = '';
   let rl1 = '';
   let rl2 = '';
+  // Fixtures de las carreras: servicio propio para que ningún otro test compita por el
+  // índice único de «una design version aprobada por servicio».
+  let dvCarrera = '';
+  let elCarreraA = '';
+  let elCarreraB = '';
+  let rlCarrera = '';
 
   beforeAll(async () => {
     const admin = sqlAdmin();
@@ -919,6 +925,160 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       conUsuario(leadId, (tx) => tx`update design_version set titulo = 'Colado'
         where id = ${otroBorrador.designVersionId} and workspace_id = ${ws}`),
     ).rejects.toThrow(/permission denied/);
+  });
+
+  it('aprobar espera a las mutaciones de elementos en vuelo: nada entra tras la congelación', async () => {
+    const admin = sqlAdmin();
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio de la carrera', ${leadId}) returning id`;
+    const [jt] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svc!.id as string}, 'to-be', 'Objetivo de la carrera', ${leadId})
+      returning id`;
+    const creada = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: svc!.id as string,
+      journeyId: jt!.id as string,
+      titulo: 'La que se aprueba mientras la editan',
+      resumen: '',
+      superaA: null,
+    });
+    dvCarrera = creada.designVersionId;
+    elCarreraA = (
+      await agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dvCarrera,
+        tipo: 'canal',
+        operacion: 'agrega',
+        titulo: 'Elemento declarado antes de aprobar',
+        detalle: '',
+        nodoId: null,
+        decisionIds: [],
+        insightIds: [],
+      })
+    ).elementoId;
+
+    // Transacción A (SQL directo): toma el candado de la DESIGN VERSION —el mismo que
+    // toma agregarElemento— , inserta un elemento y QUEDA ABIERTA. La aprobación
+    // concurrente escribe otra fila, así que ningún candado de fila la detiene: si no
+    // pidiera este candado, congelaría y aprobaría mientras A sigue en vuelo, y el
+    // elemento de A acabaría dentro de una versión ya inmutable.
+    // El intercalado se fija a mano: A avisa cuando YA tiene el candado, y solo entonces
+    // arranca la aprobación. Sin ese aviso el test podría pasar por el intercalado
+    // contrario (la aprobación llegando primero al candado), que no prueba nada.
+    let listo!: () => void;
+    const tomado = new Promise<void>((r) => (listo = r));
+    let liberar!: () => void;
+    const espera = new Promise<void>((r) => (liberar = r));
+    const enVuelo = conUsuario(leadId, async (tx) => {
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:dv-elemento:' || ${dvCarrera}, 42))`;
+      const [fila] = await tx`insert into elemento_cambio
+        (workspace_id, design_version_id, tipo, operacion, titulo, orden, creado_por)
+        values (${ws}, ${dvCarrera}, 'politica', 'agrega', 'Colado en plena aprobación', 1,
+                ${leadId})
+        returning id`;
+      elCarreraB = fila!.id as string;
+      listo();
+      await espera;
+    });
+    await tomado;
+    const aprobacion = aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dvCarrera,
+      motivo: '',
+    });
+    try {
+      const carrera = await Promise.race([
+        aprobacion.then(() => 'aprobada' as const),
+        new Promise<'bloqueada'>((r) => setTimeout(() => r('bloqueada'), 250)),
+      ]);
+      expect(carrera).toBe('bloqueada');
+    } finally {
+      liberar();
+    }
+    await enVuelo;
+    await aprobacion;
+
+    const dv = await designVersionCompleta(leadId, ws, dvCarrera);
+    expect(dv!.estado).toBe('aprobada');
+    // El elemento en vuelo quedó DENTRO de lo aprobado, que es el único desenlace honesto:
+    // o entra antes de congelar, o lo rechaza la política por versión ya aprobada.
+    expect(dv!.elementos.map((e) => e.titulo)).toContain('Colado en plena aprobación');
+    expect(dv!.elementos).toHaveLength(2);
+  });
+
+  it('el alcance del release no se mueve mientras el release se despliega (SYS-06)', async () => {
+    const plan = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvCarrera,
+      titulo: 'Release de la carrera',
+      responsable: 'Equipo de la carrera',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elCarreraA, razon: '' }],
+    });
+    rlCarrera = plan.releaseId;
+
+    // Transacción A: candado del release y despliegue por SQL directo, abierta. Avisa al
+    // tener el candado para que el intercalado no dependa del planificador.
+    let listo!: () => void;
+    const tomado = new Promise<void>((r) => (listo = r));
+    let liberar!: () => void;
+    const espera = new Promise<void>((r) => (liberar = r));
+    const despliegue = conUsuario(leadId, async (tx) => {
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:release:' || ${rlCarrera}, 42))`;
+      await tx`update release set estado = 'desplegado', desplegado_en = ${AYER}::date
+        where id = ${rlCarrera} and workspace_id = ${ws}`;
+      listo();
+      await espera;
+    });
+    await tomado;
+    // Asignar mira el estado del release desde su propia política: sin candado leería
+    // 'planificado' —el despliegue de A aún no está commiteado— y el elemento entraría en
+    // un release ya desplegado.
+    const asignacion = asignarElemento(leadId, {
+      workspaceId: ws,
+      releaseId: rlCarrera,
+      elementoId: elCarreraB,
+      razon: 'llega tarde',
+    });
+    try {
+      const carrera = await Promise.race([
+        asignacion.then(() => 'asignado' as const).catch(() => 'asignado' as const),
+        new Promise<'bloqueada'>((r) => setTimeout(() => r('bloqueada'), 250)),
+      ]);
+      expect(carrera).toBe('bloqueada');
+    } finally {
+      liberar();
+    }
+    await despliegue;
+    await expect(asignacion).rejects.toThrow(ErrorEntrega);
+
+    const dv = await designVersionCompleta(leadId, ws, dvCarrera);
+    const release = dv!.releases.find((r) => r.id === rlCarrera)!;
+    expect(release.estado).toBe('desplegado');
+    expect(release.elementos.map((e) => e.elementoId)).toEqual([elCarreraA]);
+  });
+
+  it('la fecha real de un release desplegado no se reescribe por un UPDATE sin transición', async () => {
+    // El `using` de release_verificar selecciona la fila y el `with check` de
+    // release_desplegar la deja pasar: entre las dos políticas, un UPDATE que no cambia el
+    // estado llegaba a la fila con `desplegado_en` dentro del grant de columna.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update release set desplegado_en = ${dia(-30)}::date
+        where id = ${rlCarrera} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/no se reescribe/);
+    const admin = sqlAdmin();
+    const [r] = await admin`select to_char(desplegado_en, 'YYYY-MM-DD') as f from release
+      where id = ${rlCarrera} and workspace_id = ${ws}`;
+    expect(r!.f).toBe(AYER);
+    // Y el UPDATE no-op tampoco fabrica auditoría: el guard aborta antes de emitir nada.
+    const eventos = await admin`select count(*)::int as n from evento_dominio
+      where workspace_id = ${ws} and tipo = 'ReleaseDesplegado'
+        and payload->>'releaseId' = ${rlCarrera}`;
+    expect(eventos[0]!.n as number).toBe(1);
   });
 
   it('nada de esto cruza el workspace', async () => {

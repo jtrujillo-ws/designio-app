@@ -761,6 +761,27 @@ create function release_transicion_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
   if new.estado = old.estado then
+    -- El mismo hueco que en design_version, aquí sobre la fecha REAL del despliegue. Los
+    -- predicados de RLS se OR-ean entre políticas: sobre un release ya desplegado, el
+    -- `using` de release_verificar (desplegado + lead) selecciona la fila y el
+    -- `with check` de release_desplegar (sigue desplegado, con fecha no nula) la deja
+    -- pasar. Como `desplegado_en` está en el grant de columna, un UPDATE que no cambia de
+    -- estado reescribía la fecha de lo que ya pasó, y el early-return de este guard se
+    -- saltaba tanto las comprobaciones de transición como la auditoría: la corrección no
+    -- dejaba ni rastro.
+    --
+    -- Un release 'planificado' no necesita la regla —ningún with check acepta que siga
+    -- planificado, así que la RLS ya rechaza ese UPDATE— y dejarlo fuera mantiene la
+    -- excepción diciendo exactamente lo que pasa: lo que salió no se reescribe.
+    --
+    -- Se levanta excepción en vez de emitir un evento: un UPDATE no-op también dispara
+    -- los triggers, y auditar «se desplegó» cada vez que alguien escribe la fila sin
+    -- cambiarla llenaría el acta de despliegues que nunca ocurrieron. Si algún día hay
+    -- que corregir una fecha mal tecleada, será una operación explícita con su política y
+    -- su evento propio, no el efecto lateral de un update que no dice nada.
+    if old.estado <> 'planificado' then
+      raise exception 'un release ya desplegado no se reescribe: su fecha real es el registro de lo que pasó (RF-06.5)';
+    end if;
     return new;
   end if;
   if (old.estado, new.estado) not in (

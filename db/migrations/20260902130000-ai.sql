@@ -541,6 +541,25 @@ begin
       raise exception 'ese item no tiene material que citar (solo referencia): no se pueden generar propuestas de extracción sobre él';
     end if;
 
+    -- La llamada referenciada tiene que ser LA QUE PRODUJO esta propuesta, no una
+    -- cualquiera del workspace. La FK sola comprobaba existencia y tenant, así que por SQL
+    -- crudo se podía colgar una extracción de una llamada C0, de otra ancla, de otro modelo
+    -- o —lo peor para el libro— de un intento que terminó en negativa o sin respuesta: el
+    -- panel atribuiría entonces un coste y una latencia que no son los suyos, y el gasto
+    -- por capacidad dejaría de cuadrar. Se exige la coincidencia completa.
+    if not exists (
+      select 1 from llamada_ai l
+      where l.id = new.llamada_id and l.workspace_id = new.workspace_id
+        and l.capacidad = new.capacidad
+        and l.item_id is not distinct from new.item_id
+        and l.reto_id is not distinct from new.reto_id
+        and l.modelo = new.modelo
+        and l.origen_key = new.origen_key
+        and l.resultado = 'salida-valida'
+    ) then
+      raise exception 'la propuesta debe colgar de la llamada que la produjo: misma capacidad, misma ancla, mismo modelo, misma credencial y con salida válida';
+    end if;
+
     -- RF-09.9: de qué workspace salió qué material, a qué modelo y con qué credencial.
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (new.workspace_id, 'PropuestaAIGenerada',
@@ -580,6 +599,15 @@ begin
   end if;
   if new.estado = 'corregida' and new.contenido is not distinct from old.contenido then
     raise exception 'una corrección debe cambiar el contenido propuesto';
+  end if;
+  -- Las CITAS no se corrigen (SYS-17/RF-08.7). Son el testimonio del modelo sobre lo que
+  -- dijo haber leído y la entrada de la medida de grounding: cambiar una cita inventada por
+  -- otra literal deja una propuesta de aspecto impecable y borra la señal que hay que ver.
+  -- El servicio lo rechaza con su mensaje; esto es el suelo, porque una promesa que solo
+  -- vive en un formulario la rompe cualquier cliente que hable con la server function.
+  if new.destino = 'evidencia'
+     and new.contenido -> 'citas' is distinct from new.contenido_original -> 'citas' then
+    raise exception 'las citas de una propuesta AI no se corrigen: son el rastro de lo que el modelo dijo haber leído';
   end if;
 
   -- RF-09.4/09.5 en la ACEPTACIÓN, que es la otra mitad del permiso. Generar ya exigía

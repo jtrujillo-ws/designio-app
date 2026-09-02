@@ -400,7 +400,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
          prompt_version, origen_key, llamada_id, creado_por, estado, revisada_por)
         values (${ws}, 'CI', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":1}'::jsonb,
-                'm', 'v', 'entorno', ${llamadaId}, ${leadId}, 'aceptada', ${leadId})`),
+                ${MODELO_PRIMARIO}, 'v', 'entorno', ${llamadaId}, ${leadId}, 'aceptada',
+                ${leadId})`),
     ).rejects.toThrow(/row-level security|check constraint/);
     // Y el «original» tiene que ser de verdad el original (SYS-17).
     await expect(
@@ -408,25 +409,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
          prompt_version, origen_key, llamada_id, creado_por)
         values (${ws}, 'CI', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":2}'::jsonb,
-                'm', 'v', 'entorno', ${llamadaId}, ${leadId})`),
+                ${MODELO_PRIMARIO}, 'v', 'entorno', ${llamadaId}, ${leadId})`),
     ).rejects.toThrow(/row-level security/);
     // SYS-20: una simulación de revisor AI jamás se materializa como evidencia.
     await expect(
       conUsuario(leadId, (tx) => tx`insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
          prompt_version, origen_key, llamada_id, creado_por, es_simulacion)
-        values (${ws}, 'C4', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":1}'::jsonb,
-                'm', 'v', 'entorno', ${llamadaId}, ${leadId}, true)`),
+        values (${ws}, 'CI', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":1}'::jsonb,
+                ${MODELO_PRIMARIO}, 'v', 'entorno', ${llamadaId}, ${leadId}, true)`),
     ).rejects.toThrow(/check constraint/);
     // Y ninguna propuesta puede existir sin la llamada que la pagó: sin esa línea en el
-    // libro de costos no hay fila (RF-09.14).
+    // libro de costos no hay fila (RF-09.14). Habla primero el guard —que exige además que
+    // sea LA llamada que la produjo— y detrás quedaría el NOT NULL de la columna.
     await expect(
       conUsuario(leadId, (tx) => tx`insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
          prompt_version, origen_key, creado_por)
         values (${ws}, 'CI', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":1}'::jsonb,
-                'm', 'v', 'entorno', ${leadId})`),
-    ).rejects.toThrow(/null value in column "llamada_id"|not-null/);
+                ${MODELO_PRIMARIO}, 'v', 'entorno', ${leadId})`),
+    ).rejects.toThrow(/la llamada que la produjo|null value in column "llamada_id"/);
   });
 
   it('aceptar materializa la evidencia firmada por el humano y sella el item (SYS-16/SYS-19)', async () => {
@@ -529,6 +531,105 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       correccion: { ...CONTENIDO_CI },
     });
     expect(r2.estado).toBe('aceptada');
+  });
+
+  it('corregir no reescribe las citas: el testimonio del modelo no se maquilla', async () => {
+    const itemId = await nuevoItem('Item con citas que alguien quiere arreglar');
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+    });
+
+    // La cita inventada de CONTENIDO_CI cambiada por una literal del material: la propuesta
+    // quedaría impecable y la métrica de grounding, limpia. El formulario del panel reenvía
+    // las originales, pero eso era una convención de una pantalla — cualquier cliente que
+    // hable con la server function podía mandar otras.
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: {
+          ...CONTENIDO_CI,
+          citas: [
+            { fragmento: 'El 71% de los abandonos', localizacion: 'párrafo 1' },
+            { fragmento: 'la carga del documento de identidad', localizacion: 'párrafo 1' },
+          ],
+        },
+      }),
+    ).rejects.toThrow(/citas/i);
+
+    // Quitar una cita incómoda tampoco es corregir: la señal desaparecería igual.
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...CONTENIDO_CI, citas: [CONTENIDO_CI.citas[0]!] },
+      }),
+    ).rejects.toThrow(/citas/i);
+
+    // El suelo es el guard: por SQL crudo tampoco.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update propuesta_ai
+        set estado = 'corregida', revisada_por = ${leadId},
+            contenido = jsonb_set(contenido, '{citas}', ${tx.json([
+              { fragmento: 'El 71% de los abandonos', localizacion: 'párrafo 1' },
+            ])}::jsonb)
+        where id = ${propuestaId}`),
+    ).rejects.toThrow(/citas/i);
+
+    // Y corregir lo que SÍ se corrige sigue funcionando, con sus citas intactas.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: { ...CONTENIDO_CI, titulo: 'Título corregido, citas intactas' },
+    });
+    expect(r.estado).toBe('corregida');
+    const panel = await panelPropuestas(leadId, ws);
+    const decidida = panel.decididas.find((x) => x.id === propuestaId)!;
+    expect(decidida.citas.map((c) => c.fragmento)).toEqual(
+      CONTENIDO_CI.citas.map((c) => c.fragmento),
+    );
+    // La cita inventada sigue marcada como no fiel: la señal sobrevive a la corrección.
+    expect(decidida.citas.map((c) => c.fiel)).toEqual([true, false]);
+  });
+
+  it('una propuesta cuelga de la llamada que la produjo, no de cualquiera', async () => {
+    const itemId = await nuevoItem('Item con llamadas cruzadas');
+    // Una llamada de OTRA capacidad y otra ancla: la FK la aceptaba (existe y es del
+    // workspace) y el panel le habría atribuido su coste y su latencia a esta propuesta.
+    const llamadaC0 = await nuevaLlamada({ capacidad: 'C0', retoId });
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into propuesta_ai
+        (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, llamada_id, creado_por)
+        values (${ws}, 'CI', 'evidencia', ${itemId}, ${tx.json(CONTENIDO_CI)},
+                ${tx.json(CONTENIDO_CI)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+                ${llamadaC0}, ${leadId})`),
+    ).rejects.toThrow(/la llamada que la produjo/i);
+
+    // Y una llamada que no produjo contenido utilizable tampoco vale como origen: colgar
+    // una propuesta de una negativa del proveedor sería contabilidad falsa en las dos
+    // direcciones (esa llamada no dio nada, y esta propuesta salió de otra parte).
+    const [rechazo] = await conUsuario(leadId, (tx) => tx`insert into llamada_ai
+      (workspace_id, capacidad, item_id, modelo, origen_key, resultado, motivo, creado_por)
+      values (${ws}, 'CI', ${itemId}, ${MODELO_PRIMARIO}, 'entorno', 'rechazo-proveedor',
+              'el proveedor se negó', ${leadId})
+      returning id`);
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into propuesta_ai
+        (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, llamada_id, creado_por)
+        values (${ws}, 'CI', 'evidencia', ${itemId}, ${tx.json(CONTENIDO_CI)},
+                ${tx.json(CONTENIDO_CI)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+                ${rechazo!.id as string}, ${leadId})`),
+    ).rejects.toThrow(/la llamada que la produjo/i);
+
+    // Con la llamada correcta —misma capacidad, misma ancla, mismo modelo, misma
+    // credencial y con salida válida— la propuesta nace sin problema.
+    await expect(
+      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+    ).resolves.toBeTruthy();
   });
 
   it('rechazar no toca el dominio: el item sigue pendiente de curaduría manual (SYS-21)', async () => {

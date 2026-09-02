@@ -40,18 +40,17 @@ export type ObjetoCitable = {
   clase: ClaseObjetoCitable;
   id: string;
   titulo: string;
-  /** `citable: false` deshabilita la opción con su motivo a la vista; el bloqueo real lo
-   * impone el guard de la base.
+  /** `citable: false` deshabilita la opción con su motivo a la vista. El bloqueo REAL lo
+   * impone la base; esto reproduce su predicado para que la app y el guard no digan cosas
+   * distintas sobre la misma regla — cuando discrepan, el usuario elige algo que la base
+   * rechaza después y nadie le ha dicho por qué.
    *
-   * HOY solo se calcula para la clase `evidencia`, que es la única que lleva derechos de
-   * uso propios (SPEC-03). Las otras dos NO están cubiertas al mismo nivel y conviene no
-   * fingir que sí:
-   *  · `decision` — el loader ya solo ofrece las `vigente`, que es exactamente lo que el
-   *    guard de aprobación exige, así que la regla se respeta (ocultando en vez de
-   *    explicando, que es la parte mejorable).
-   *  · `insight` — el loader ofrece todos los validados, pero un insight cuyo respaldo
-   *    perdió los derechos ya NO permite aprobar el gate (guard de suficiencia). El
-   *    bloqueo existe y es correcto, pero aparece al aprobar en vez de aquí. */
+   * Se calcula para las TRES clases, cada una con lo que de verdad la bloquea al aprobar
+   * el gate:
+   *  · `evidencia` — derechos de uso propios (SPEC-03): pendientes, denegados o vencidos.
+   *  · `insight` — es inmutable, pero su respaldo no: si una afirmación no-hipótesis se
+   *    queda sin ninguna cita con derechos vigentes, el guard de suficiencia lo rechaza.
+   *  · `decision` — en revisión tras una reapertura aguas arriba (SYS-10). */
   citable?: boolean;
   motivoBloqueo?: string | null;
 };
@@ -105,10 +104,24 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
         clase: 'insight' as const,
         id: i.id,
         titulo: i.titulo,
+        citable: i.citable,
+        motivoBloqueo: i.motivoBloqueo,
       })),
-      ...(gobernanza?.decisiones ?? [])
-        .filter((d) => d.estado === 'vigente')
-        .map((d) => ({ clase: 'decision' as const, id: d.id, titulo: d.titulo })),
+      // Las decisiones en revisión se OFRECEN deshabilitadas, no se esconden. Filtrarlas
+      // dejaba al usuario buscando en el desplegable una decisión que su propia pantalla
+      // de gobernanza le está mostrando: el mismo silencio que este repositorio rechaza
+      // en todas partes («marcado, no escondido»). El guard de suficiencia las bloquea al
+      // aprobar el gate; aquí se dice por qué antes de elegir.
+      ...(gobernanza?.decisiones ?? []).map((d) => ({
+        clase: 'decision' as const,
+        id: d.id,
+        titulo: d.titulo,
+        citable: d.estado === 'vigente',
+        motivoBloqueo:
+          d.estado === 'vigente'
+            ? null
+            : 'está en revisión tras una reapertura aguas arriba (SYS-10): revalídala antes de citarla',
+      })),
     ];
     return {
       workspaceId,

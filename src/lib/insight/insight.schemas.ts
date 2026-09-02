@@ -94,3 +94,21 @@ export type InsightCompleto = {
   afirmaciones: AfirmacionDeInsight[];
   contradicciones: ContradiccionDeInsight[];
 };
+
+/**
+ * Fila del picker de objetos citables (checklist de un gate, RF-04.5). Un insight validado
+ * es inmutable, pero su respaldo NO: los derechos de la evidencia que lo sostiene se
+ * revocan y caducan, y entonces el gate deja de poder aprobarse citándolo.
+ *
+ * `citable` reproduce ese predicado —el mismo que evalúa el guard de suficiencia al
+ * aprobar— para que la app y la base no digan cosas distintas sobre la misma regla. El
+ * bloqueo REAL sigue viviendo en la base; esto solo lo hace legible antes de elegir, en
+ * vez de después de que el gate lo rechace.
+ */
+export type InsightCitable = {
+  id: string;
+  titulo: string;
+  citable: boolean;
+  /** Por qué NO, nombrando la afirmación que se quedó sin respaldo; null cuando sí. */
+  motivoBloqueo: string | null;
+};

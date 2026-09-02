@@ -18,6 +18,8 @@ import {
   agregarCita,
   crearInsight,
   ErrorInsight,
+  insightsCitables,
+  validarInsight,
 } from '@/lib/insight/insight.servicio';
 import { aprobarGate, marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
 import { bytesABase64, MAX_ARCHIVOS_POR_ITEM } from '@/lib/evidencia/sanitizacion';
@@ -495,6 +497,108 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         where workspace_id = ${ws} and evidencia_id = ${evSinDerechos}`,
     );
     expect(registradas).toHaveLength(1);
+  });
+
+  it('el picker dice lo mismo que el guard: un insight sin respaldo vigente sale bloqueado', async () => {
+    // La app y la base tienen que sostener UNA sola verdad sobre si algo se puede citar.
+    // El guard de suficiencia rechaza aprobar un gate cuyo ítem cita un insight cuya
+    // afirmación se quedó sin cita con derechos vigentes; si el desplegable lo ofrece
+    // como válido, el usuario elige y se come el rechazo después, sin explicación. Aquí
+    // se comprueba que el picker reproduce ese mismo predicado.
+    const admin = sqlAdmin();
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'nota', 'Fuente del respaldo', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, 'Respaldo revocable', '{}'::jsonb, ${leadId})
+      returning id`;
+    const evRespaldo = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evRespaldo}, 'concedido', 'cliente', 'Consentimiento vigente',
+              ${leadId}, now(), ${leadId})`;
+
+    const ins = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'La verificación pierde a los independientes',
+      resumen: '',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: ins.insightId,
+      texto: 'El 62% se detiene al cargar el documento',
+      esHipotesis: false,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId: evRespaldo,
+      fragmento: '62 de cada 100 se detienen',
+      localizacion: 'p. 14',
+    });
+    await validarInsight(leadId, ws, ins.insightId);
+
+    // Con el respaldo vigente, el insight se ofrece sin reservas.
+    const antes = (await insightsCitables(leadId, ws)).insights.find(
+      (i) => i.id === ins.insightId,
+    );
+    expect(antes?.citable).toBe(true);
+    expect(antes?.motivoBloqueo).toBeNull();
+
+    // Se retira el consentimiento del material que lo sostiene. El insight sigue
+    // validado —es inmutable— pero ya no puede sostener la aprobación de un gate.
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evRespaldo,
+      decision: 'denegado',
+      ambito: 'interno',
+      base: 'El titular retiró el consentimiento',
+      venceEn: null,
+    });
+    const despues = (await insightsCitables(leadId, ws)).insights.find(
+      (i) => i.id === ins.insightId,
+    );
+    expect(despues?.citable).toBe(false);
+    // El motivo NOMBRA la afirmación que se quedó sin respaldo: un genérico no dice qué
+    // reparar, y reparar aquí es reconceder los derechos o citar otra evidencia.
+    expect(despues?.motivoBloqueo).toContain('El 62% se detiene al cargar el documento');
+    expect(despues?.motivoBloqueo).toContain('derechos vigentes');
+
+    // Y el picker no se inventa el bloqueo: es exactamente lo que hace el guard. Se cita
+    // el insight en un ítem —marcar sigue permitido— y el gate lo rechaza al aprobar.
+    const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-92', 'Proyecto insight sin respaldo', ${leadId}) returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 1, 'Investigación')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 1, 'lead-boutique') returning id`;
+    const [ci] = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gate!.id as string}, 0, 'Interpretación sostenida') returning id`;
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: ci!.id as string,
+      accion: { tipo: 'cumplido', objetoClase: 'insight', objetoId: ins.insightId },
+    });
+    await expect(
+      aprobarGate(leadId, { workspaceId: ws, gateId: gate!.id as string }),
+    ).rejects.toThrow(/ninguna cita con derechos vigentes/);
+
+    // Reconceder desbloquea las dos caras a la vez, que es la prueba de que son una sola.
+    await decidirDerechos(leadId, {
+      workspaceId: ws,
+      evidenciaId: evRespaldo,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Nuevo consentimiento firmado',
+      venceEn: null,
+    });
+    expect(
+      (await insightsCitables(leadId, ws)).insights.find((i) => i.id === ins.insightId)?.citable,
+    ).toBe(true);
+    const r = await aprobarGate(leadId, { workspaceId: ws, gateId: gate!.id as string });
+    expect(r.numero).toBe(1);
   });
 
   // ── La revocación alcanza a lo que YA estaba cumplido ──

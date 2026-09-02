@@ -100,6 +100,21 @@ revoke execute on function evidencia_citable_guard() from public;
 -- Se parte de la versión VIVA del guard (la de 20260902080000, que ya sumó las decisiones
 -- en revisión sobre la de 20260902070000) y se AÑADE: reescribirlo de memoria perdería en
 -- silencio cualquiera de los chequeos anteriores.
+--
+-- CUIDADO AL COMPONER RAMAS. Este `create or replace` sustituye el guard ENTERO, así que
+-- en una base limpia gana la migración de número más alto y las reglas que otras ramas
+-- hubieran añadido a este mismo guard desaparecen sin decir nada. «La versión viva» es la
+-- de la base contra la que se escribió esta migración, no la de `agents` de mañana: si al
+-- integrar aparece otra rama que también reemplaza este guard, hay que volver a copiar la
+-- definición vigente —la de la migración más reciente que lo defina— y volver a añadir
+-- encima los dos chequeos de derechos de aquí, comprobando además que las tablas que esas
+-- reglas consultan ya existan (plpgsql no resuelve los nombres al crear la función: si
+-- falta una tabla, la función se crea igual y revienta al aprobar un gate).
+--
+-- La raíz es que cada migración copia el guard completo. Un guard que delegara en una
+-- función por regla —cada rama definiendo la suya sin tocar el tronco— haría imposible
+-- este fallo; queda anotado como refactor posterior, no se hace aquí porque tocaría a
+-- todas las ramas en vuelo.
 create or replace function gate_aprobar_suficiencia_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare

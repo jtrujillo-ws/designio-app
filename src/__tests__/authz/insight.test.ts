@@ -198,8 +198,20 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
     const { insights, hayMas } = await insightsCitables(stakeId, ws);
     expect(insights.map((i) => i.id)).toEqual([insightId]);
     expect(hayMas).toBe(false);
-    // La proyección es id + título y nada más: es lo que la hace barata.
-    expect(Object.keys(insights[0]!).sort()).toEqual(['id', 'titulo']);
+    // La proyección sigue siendo BARATA: id, título y dos escalares que salen de la misma
+    // sentencia. Lo que este test impide es que el picker acabe arrastrando la ficha
+    // completa —afirmaciones, citas, contradicciones— para pintar un `<option>`; el
+    // `citable`/`motivoBloqueo` no es la ficha, es el predicado que el guard de
+    // suficiencia va a evaluar de todas formas al aprobar el gate.
+    expect(Object.keys(insights[0]!).sort()).toEqual([
+      'citable',
+      'id',
+      'motivoBloqueo',
+      'titulo',
+    ]);
+    // Y con su respaldo vigente, un insight validado se ofrece sin reservas.
+    expect(insights[0]!.citable).toBe(true);
+    expect(insights[0]!.motivoBloqueo).toBeNull();
   });
 
   it('sin contexto de usuario los insights son invisibles; la cuenta desactivada tampoco lee', async () => {

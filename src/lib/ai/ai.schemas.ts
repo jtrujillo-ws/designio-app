@@ -287,6 +287,8 @@ export type PanelPropuestas = {
    * siquiera se listaba, así que la revocación no tenía puerta en el producto.
    */
   materialDePersonas: ConsentimientoDeItem[];
+  /** El corte de esa lista también se dice. */
+  hayMasMaterial: boolean;
   /** El filtro con el que se resolvieron las listas: la pantalla lo devuelve al buscador
    * para que se vea qué se está mirando. */
   busqueda: string;
@@ -295,6 +297,10 @@ export type PanelPropuestas = {
 export type ConsentimientoDeItem = {
   id: string;
   titulo: string;
+  /** El item ya fue decidido en la bandeja. Se lista igual: una revocación posterior a la
+   * curaduría tiene MÁS consecuencias, no menos —la evidencia ya existe—, y la puerta para
+   * registrarla no puede cerrarse justo entonces. */
+  curado: boolean;
   /** Si el registro vigente cubre el procesamiento por un proveedor externo. */
   autorizaExterno: boolean;
   /** Versión del registro vigente; null si nunca se registró ninguno. */

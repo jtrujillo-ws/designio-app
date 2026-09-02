@@ -1385,6 +1385,115 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  it('la excepción del consentimiento no vale para retirar reservas de material que no lo exige', async () => {
+    const nota = await nuevoItem('Nota con generación en vuelo de otra persona');
+    // Una generación en vuelo del LEAD sobre un item que no es material de personas.
+    await conUsuario(leadId, (tx) => tx`insert into reserva_ai
+      (workspace_id, capacidad, item_id, unidades, creado_por)
+      values (${ws}, 'CI', ${nota}, 2, ${leadId})`);
+    try {
+      // Otro curador no puede retirarla: para una nota «no hay consentimiento externo
+      // vigente» es cierto SIEMPRE —nunca hubo nada que registrar—, así que sin el tipo de
+      // fuente en el predicado la excepción se volvía general y cualquiera podía tumbar la
+      // reserva de otro con la llamada en vuelo, pagando dos veces por lo mismo.
+      const borradas = await conUsuario(disenadorId, (tx) => tx`delete from reserva_ai
+        where workspace_id = ${ws} and item_id = ${nota}`);
+      expect(borradas.count).toBe(0);
+      const siguen = await conUsuario(leadId, (tx) => tx`select 1 as x from reserva_ai
+        where workspace_id = ${ws} and item_id = ${nota}`);
+      expect(siguen.length).toBe(1);
+
+      // Y el endpoint deja de ser palanca: sobre una nota no hay consentimiento que
+      // registrar, así que no se acepta el registro que abriría esa puerta.
+      await expect(
+        registrarConsentimiento(disenadorId, {
+          workspaceId: ws,
+          itemId: nota,
+          alcance: 'intento de registrar sobre material que no es de personas',
+          procesamientoExterno: false,
+        }),
+      ).rejects.toThrow(/no es material de personas/i);
+
+      // La dueña de la reserva sí la retira (ese caso nunca dependió de la excepción).
+      const propias = await conUsuario(leadId, (tx) => tx`delete from reserva_ai
+        where workspace_id = ${ws} and item_id = ${nota}`);
+      expect(propias.count).toBe(1);
+    } finally {
+      await sqlAdmin()`delete from reserva_ai where workspace_id = ${ws} and item_id = ${nota}`;
+    }
+  });
+
+  it('la bandera de capacidad no promete lo que la admisión va a negar', async () => {
+    // Un hueco libre y una generación que puede gastar dos: la pantalla decía «AI
+    // disponible», la persona pulsaba y se llevaba el rechazo.
+    await llenarPresupuesto(1);
+    try {
+      // Con credencial resuelta: lo que se mide aquí es el presupuesto, no la capacidad.
+      await conProveedor(RESPUESTA_CI, async () => {
+        const panel = await panelPropuestas(leadId, ws);
+        expect(panel.ai.disponible).toBe(false);
+        expect(panel.ai.motivo).toMatch(/no alcanza para esta generación/i);
+        // Y el número que se MUESTRA sigue siendo lo realmente atendido: son dos números
+        // con dos propósitos y fusionarlos para que cuadren sería el error.
+        expect(panel.ai.llamadasHoy).toBe(LIMITE_LLAMADAS_DIA - 1);
+      });
+    } finally {
+      await vaciarRelleno();
+    }
+
+    // Con sitio para dos, pero ese sitio ya apartado por una generación en vuelo: la
+    // decisión cuenta la reserva, el número mostrado no.
+    const otro = await nuevoItem('Item de la reserva que llena el hueco');
+    await llenarPresupuesto(2);
+    await conUsuario(leadId, (tx) => tx`insert into reserva_ai
+      (workspace_id, capacidad, item_id, unidades, creado_por)
+      values (${ws}, 'CI', ${otro}, 2, ${leadId})`);
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        const panel = await panelPropuestas(leadId, ws);
+        expect(panel.ai.disponible).toBe(false);
+        expect(panel.ai.llamadasHoy).toBe(LIMITE_LLAMADAS_DIA - 2);
+      });
+    } finally {
+      await sqlAdmin()`delete from reserva_ai where workspace_id = ${ws} and item_id = ${otro}`;
+      await vaciarRelleno();
+    }
+  });
+
+  it('la bitácora alcanza el material de personas también después de curarlo', async () => {
+    const itemId = await nuevoItem('Entrevista que se cura y luego se revoca', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+    const [p] = await conUsuario(leadId, (tx) => tx`select id from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId} and estado = 'propuesta'`);
+    await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId: p!.id as string });
+
+    // El item queda curado y su evidencia existe. La puerta de la revocación no puede
+    // cerrarse justo ahora: es cuando una retirada tiene MÁS consecuencias, no menos.
+    const panel = await panelPropuestas(leadId, ws);
+    const enBitacora = panel.materialDePersonas.find((m) => m.id === itemId);
+    expect(enBitacora).toBeDefined();
+    expect(enBitacora!.curado).toBe(true);
+    expect(enBitacora!.autorizaExterno).toBe(true);
+
+    const revocacion = await registrarConsentimiento(disenadorId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'La persona retira el permiso después de la curaduría',
+      procesamientoExterno: false,
+    });
+    expect(revocacion.version).toBe(2);
+    const tras = await panelPropuestas(leadId, ws);
+    expect(tras.materialDePersonas.find((m) => m.id === itemId)!.autorizaExterno).toBe(false);
+  });
+
   it('un item importado solo con la referencia no llega al proveedor: no hay nada que citar', async () => {
     const soloRef = await nuevoItem('Informe que vive en otra parte', 'documento', '');
     await conProveedor(RESPUESTA_CI, async () => {

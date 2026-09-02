@@ -192,6 +192,7 @@ function PantallaPropuestas() {
               <BitacoraConsentimientos
                 workspaceId={datos.workspaceId}
                 items={datos.materialDePersonas}
+                hayMas={datos.hayMasMaterial}
                 onRegistrado={async (r) => {
                   setError(null);
                   setAviso(
@@ -539,11 +540,13 @@ function FormularioGeneracion({
 function BitacoraConsentimientos({
   workspaceId,
   items,
+  hayMas,
   onRegistrado,
   onError,
 }: {
   workspaceId: string;
   items: ConsentimientoDeItem[];
+  hayMas: boolean;
   onRegistrado: (r: { version: number; autorizaExterno: boolean }) => Promise<void>;
   onError: (e: string | null) => void;
 }) {
@@ -558,8 +561,16 @@ function BitacoraConsentimientos({
       <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
         Entrevistas y observaciones de la bandeja, con lo que autoriza su registro VIGENTE. Cada
         registro nuevo manda sobre los anteriores y ninguno se edita ni se borra (RF-09.4/09.5):
-        así se recoge una autorización posterior y así se recoge una revocación.
+        así se recoge una autorización posterior y así se recoge una revocación. Los items ya
+        curados se listan igual — cuando la evidencia existe, una revocación tiene más
+        consecuencias, no menos.
       </span>
+      {hayMas && (
+        <Aviso>
+          Hay más material de personas del que cabe aquí: se listan los {items.length} más
+          antiguos. Busca por título para llegar a uno concreto.
+        </Aviso>
+      )}
       {items.map((i) => (
         <div
           key={i.id}
@@ -574,6 +585,11 @@ function BitacoraConsentimientos({
         >
           <span style={{ font: '500 13px var(--font-sans)', color: 'var(--text-body)', flex: 1, minWidth: 200 }}>
             {i.titulo}
+            {i.curado && (
+              <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--text-faint)' }}>
+                {' '}· ya curado
+              </span>
+            )}
           </span>
           <span
             style={{

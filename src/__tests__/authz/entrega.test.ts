@@ -19,6 +19,7 @@ import {
 } from '@/lib/entrega/entrega.servicio';
 import { calcularDiff, conciliacionCompleta } from '@/lib/entrega/entrega.diff';
 import { abrirHilo, hilosDeObjetos } from '@/lib/portal/portal.servicio';
+import { borrarNodo } from '@/lib/journey/journey.servicio';
 import { describeAuthz } from './helpers';
 
 /**
@@ -85,6 +86,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
   let elCarreraA = '';
   let elCarreraB = '';
   let rlCarrera = '';
+  let dvSucesora = '';
+  let elSucesora = '';
 
   beforeAll(async () => {
     const admin = sqlAdmin();
@@ -1125,17 +1128,20 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       resumen: '',
       superaA: dvCarrera,
     });
-    await agregarElemento(leadId, {
-      workspaceId: ws,
-      designVersionId: sucesora.designVersionId,
-      tipo: 'canal',
-      operacion: 'agrega',
-      titulo: 'Cambio del ciclo siguiente',
-      detalle: '',
-      nodoId: null,
-      decisionIds: [],
-      insightIds: [],
-    });
+    dvSucesora = sucesora.designVersionId;
+    elSucesora = (
+      await agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dvSucesora,
+        tipo: 'canal',
+        operacion: 'agrega',
+        titulo: 'Cambio del ciclo siguiente',
+        detalle: '',
+        nodoId: null,
+        decisionIds: [],
+        insightIds: [],
+      })
+    ).elementoId;
     await aprobarDesignVersion(leadId, {
       workspaceId: ws,
       designVersionId: sucesora.designVersionId,
@@ -1239,6 +1245,78 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         superaA: dv1,
       }),
     ).rejects.toThrow(/MISMO servicio/);
+  });
+
+  it('el grafo vivo se sigue editando tras congelarlo, y la referencia histórica la sostiene el snapshot', async () => {
+    // RF-05.8: aprobar congela un SNAPSHOT; el journey de trabajo continúa editable para
+    // el ciclo siguiente. Con una FK restrictiva desde el elemento inmutable, enlazar un
+    // nodo lo volvía imborrable para siempre — el objeto congelado prohibiéndole cambiar
+    // al vivo.
+    const cadenaAntes = await cadenaDeRelease(leadId, ws, rl1);
+    expect(cadenaAntes!.pasos.map((p) => p.etiqueta).sort()).toEqual([
+      'Recibe el motivo del rechazo',
+      'Video-verificación',
+    ]);
+
+    // El nodo que DV-1 enlazó se borra del grafo vivo: es un ciclo nuevo y el paso ya no
+    // está. Antes esto fallaba con violación de FK y no había forma de deshacerlo (la
+    // design version aprobada es inmutable).
+    await borrarNodo(leadId, ws, nodoToBe2);
+    const [quedan] = await sqlAdmin()`select count(*)::int as n from journey_nodo
+      where id = ${nodoToBe2} and workspace_id = ${ws}`;
+    expect(quedan!.n as number).toBe(0);
+
+    // Y la cadena sigue respondiendo lo mismo: el paso salió del snapshot, no de la fila.
+    const cadenaDespues = await cadenaDeRelease(leadId, ws, rl1);
+    expect(cadenaDespues!.pasos.map((p) => p.etiqueta).sort()).toEqual([
+      'Recibe el motivo del rechazo',
+      'Video-verificación',
+    ]);
+    const dv = await designVersionCompleta(leadId, ws, dv1);
+    expect(dv!.elementos.find((e) => e.id === elPolitica)!.nodoEtiqueta).toBe(
+      'Recibe el motivo del rechazo',
+    );
+  });
+
+  it('la constatación no puede ser anterior al despliegue que describe', async () => {
+    const plan = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvSucesora,
+      titulo: 'Release con fechas',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elSucesora, razon: '' }],
+    });
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: plan.releaseId,
+      desplegadoEn: AYER,
+    });
+    // Una foto de lo que quedó funcionando no puede ser anterior al día en que salió: no
+    // describiría este release. Y como el pliegue del estado vigente ORDENA por
+    // constatado_en, la fecha inválida además reordenaría la historia del servicio.
+    await expect(
+      constatarEffectiveState(leadId, {
+        workspaceId: ws,
+        releaseId: plan.releaseId,
+        constatadoEn: dia(-10),
+        resumen: '',
+        constataciones: [
+          { elementoId: elSucesora, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+        ],
+      }),
+    ).rejects.toThrow(/anterior al despliegue/);
+    // El mismo día sí: constatar lo que acaba de salir es legítimo.
+    const r = await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: plan.releaseId,
+      constatadoEn: AYER,
+      resumen: '',
+      constataciones: [
+        { elementoId: elSucesora, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+      ],
+    });
+    expect(r.effectiveStateId).toBeTruthy();
   });
 
   it('nada de esto cruza el workspace', async () => {

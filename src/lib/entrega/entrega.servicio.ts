@@ -658,13 +658,23 @@ export async function designVersionCompleta(
           select jsonb_agg(jsonb_build_object(
             'id', ec.id, 'tipo', ec.tipo, 'operacion', ec.operacion, 'titulo', ec.titulo,
             'detalle', ec.detalle, 'nodoId', ec.nodo_id, 'orden', ec.orden,
-            'nodoEtiqueta', (select n.etiqueta from journey_nodo n
-              where n.id = ec.nodo_id and n.workspace_id = ec.workspace_id),
+            -- El nodo se resuelve contra el SNAPSHOT que esta design version congeló, y
+            -- solo se cae a la fila viva mientras sigue en borrador (aún no hay snapshot).
+            -- Leer la fila viva de una versión aprobada es leer otra cosa: el journey se
+            -- sigue editando, el nodo puede haberse borrado, y renombrar una entrada de
+            -- catálogo reescribe la etiqueta de todos sus nodos (SPEC-05.1). Lo que esta
+            -- versión aprobó no cambia porque el grafo de trabajo siga su camino.
+            'nodoEtiqueta', coalesce(
+              nodo_congelado(dv.snapshot_id, dv.workspace_id, ec.nodo_id)->>'etiqueta',
+              (select n.etiqueta from journey_nodo n
+                where n.id = ec.nodo_id and n.workspace_id = ec.workspace_id)),
             -- La identidad ESTABLE del elemento (SPEC-05): el catálogo del servicio es lo
             -- único que sobrevive a un journey nuevo y a un renombre. El diff empareja
             -- por aquí antes que por nodo o por título.
-            'catalogoId', (select n.catalogo_id from journey_nodo n
-              where n.id = ec.nodo_id and n.workspace_id = ec.workspace_id),
+            'catalogoId', coalesce(
+              nodo_congelado(dv.snapshot_id, dv.workspace_id, ec.nodo_id)->>'catalogo_id',
+              (select n.catalogo_id::text from journey_nodo n
+                where n.id = ec.nodo_id and n.workspace_id = ec.workspace_id)),
             'decisiones', coalesce((
               select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo) order by d.titulo)
               from elemento_decision ed
@@ -762,7 +772,12 @@ export async function designVersionCompleta(
                 'operacion', u.operacion, 'resultado', u.resultado)
                 order by u.constatado_en, u.es_creado_en, u.orden, u.elemento_creado_en)
               from (
-                select c.elemento_id, ec2.titulo, ec2.nodo_id, n2.catalogo_id,
+                select c.elemento_id, ec2.titulo, ec2.nodo_id,
+                  -- La identidad del elemento histórico sale del snapshot de SU design
+                  -- version, no del grafo vivo: es lo que la hace estable entre ciclos.
+                  coalesce(
+                    nodo_congelado(dv2.snapshot_id, dv2.workspace_id, ec2.nodo_id)->>'catalogo_id',
+                    n2.catalogo_id::text) as catalogo_id,
                   ec2.operacion, c.resultado, es2.constatado_en,
                   es2.creado_en as es_creado_en, ec2.orden,
                   ec2.creado_en as elemento_creado_en
@@ -770,6 +785,8 @@ export async function designVersionCompleta(
                 join effective_state es2 on es2.id = c.effective_state_id
                   and es2.workspace_id = c.workspace_id
                 join release r2 on r2.id = es2.release_id and r2.workspace_id = es2.workspace_id
+                join design_version dv2 on dv2.id = r2.design_version_id
+                  and dv2.workspace_id = r2.workspace_id
                 join elemento_cambio ec2 on ec2.id = c.elemento_id
                   and ec2.workspace_id = c.workspace_id
                 left join journey_nodo n2 on n2.id = ec2.nodo_id
@@ -951,14 +968,27 @@ export async function cadenaDeRelease(
     await exigirCuentaActiva(tx, actorId);
     const [fila] = await tx`
       select r.id, r.codigo,
+        -- Los pasos salen del SNAPSHOT de la design version del release, no del grafo
+        -- vivo. Un release solo existe sobre una design version aprobada, así que aquí
+        -- la pregunta es SIEMPRE histórica: «qué pasos afectó RL-1» tiene que responder
+        -- con el grafo que RL-1 cambió, no con el que el equipo esté dibujando ahora —
+        -- que puede haber renombrado esos nodos o borrado alguno.
         coalesce((
           select jsonb_agg(distinct jsonb_build_object(
-            'nodoId', n.id, 'tipo', n.tipo, 'etiqueta', n.etiqueta,
-            'elementoTitulo', ec.titulo))
+            'nodoId', x.nodo->>'id', 'tipo', x.nodo->>'tipo',
+            'etiqueta', x.nodo->>'etiqueta', 'elementoTitulo', ec.titulo))
           from release_elemento re
           join elemento_cambio ec on ec.id = re.elemento_id and ec.workspace_id = re.workspace_id
-          join journey_nodo n on n.id = ec.nodo_id and n.workspace_id = ec.workspace_id
+          join design_version dv on dv.id = ec.design_version_id
+            and dv.workspace_id = ec.workspace_id
+          cross join lateral (
+            select coalesce(
+              nodo_congelado(dv.snapshot_id, dv.workspace_id, ec.nodo_id),
+              (select to_jsonb(n) from journey_nodo n
+                where n.id = ec.nodo_id and n.workspace_id = ec.workspace_id)) as nodo
+          ) x
           where re.release_id = r.id and re.workspace_id = r.workspace_id
+            and x.nodo is not null
         ), '[]'::jsonb) as pasos,
         coalesce((
           select jsonb_agg(distinct jsonb_build_object(

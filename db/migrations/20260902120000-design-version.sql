@@ -91,13 +91,33 @@ create table elemento_cambio (
   detalle text not null default '',
   -- El nodo del grafo (SPEC-05) que materializa el cambio: es lo que permite responder
   -- «qué pasos del journey afectó RL-1» (§19.7, criterio de aceptación 5).
+  --
+  -- SIN FK, a propósito, y es la única columna de este esquema que renuncia a una. Una FK
+  -- restrictiva desde aquí invierte la relación que RF-05.8 establece: el grafo de trabajo
+  -- NO se cierra al congelar —lo inmutable es el snapshot—, y un elemento de una design
+  -- version aprobada es inmutable (sus políticas solo alcanzan borradores). Con la FK, en
+  -- cuanto una versión aprobada enlazaba un nodo, ese nodo ya no se podía borrar nunca:
+  -- ni desenlazándolo (la versión es inmutable) ni de ninguna otra forma. El objeto
+  -- congelado le prohibía cambiar al vivo, que es exactamente el cierre que la spec
+  -- rechaza.
+  --
+  -- Lo que se conserva es el ID, y con él la referencia histórica — que se resuelve contra
+  -- el SNAPSHOT de la versión que lo aprobó (nodo_congelado, más abajo), no contra la fila
+  -- viva. Leer la fila viva ya era leer otra cosa: el journey sigue editándose, y desde
+  -- SPEC-05.1 renombrar una entrada de catálogo reescribe la etiqueta de todos sus nodos,
+  -- así que el «paso» que una design version aprobada dice haber cambiado podía cambiar de
+  -- nombre por debajo sin que nadie tocara la design version.
+  --
+  -- La integridad que la FK daba de verdad —que el nodo sea de este workspace y del
+  -- journey de esta design version— no se pierde: nunca la dio la FK (que solo garantizaba
+  -- el workspace), la da elemento_cambio_nodo_guard en cada escritura. Lo único que se
+  -- suelta es «la fila sigue existiendo», que es justo lo que no debe ser un invariante.
   nodo_id uuid,
   orden integer not null default 0,
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
-  foreign key (design_version_id, workspace_id) references design_version (id, workspace_id),
-  foreign key (nodo_id, workspace_id) references journey_nodo (id, workspace_id)
+  foreign key (design_version_id, workspace_id) references design_version (id, workspace_id)
 );
 create index elemento_cambio_dv_idx on elemento_cambio (workspace_id, design_version_id, orden);
 create index elemento_cambio_nodo_idx on elemento_cambio (workspace_id, nodo_id);
@@ -553,6 +573,26 @@ create trigger elemento_insight_citable
   for each row execute function elemento_motivo_citable_guard();
 revoke execute on function elemento_motivo_citable_guard() from public;
 
+-- El nodo TAL COMO ERA cuando la design version lo congeló. La aprobación guarda el grafo
+-- entero en journey_snapshot.grafo (nodos serializados con to_jsonb, o sea con todas sus
+-- columnas), así que la respuesta histórica no depende de que la fila viva siga existiendo
+-- ni de que siga diciendo lo mismo.
+--
+-- Devuelve null cuando la design version aún no tiene snapshot —está en borrador—, y ahí
+-- el llamador cae a la fila viva, que es la correcta: un borrador se edita CONTRA el grafo
+-- de trabajo, no contra una foto que todavía no existe.
+create function nodo_congelado(p_snapshot uuid, p_workspace uuid, p_nodo uuid)
+returns jsonb language sql stable as $$
+  select nodo
+  from journey_snapshot s,
+       lateral jsonb_array_elements(s.grafo->'nodos') as nodo
+  where s.id = p_snapshot and s.workspace_id = p_workspace
+    and nodo->>'id' = p_nodo::text
+  limit 1
+$$;
+revoke execute on function nodo_congelado(uuid, uuid, uuid) from public;
+grant execute on function nodo_congelado(uuid, uuid, uuid) to designio_app;
+
 -- ¿Este reto APLICA a este servicio? Anclado en él, o declarado como que lo afecta.
 -- Es el MISMO criterio que journey_anclaje_guard (SPEC-05) lleva inline: «aplica» es una
 -- definición del dominio, y dos versiones divergentes de ella serían dos verdades sobre el
@@ -910,6 +950,8 @@ revoke execute on function release_transicion_guard() from public;
 -- queje. La fecha de constatación tampoco es futura.
 create function effective_state_alta_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_desplegado_en date;
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
@@ -917,12 +959,22 @@ begin
   if new.constatado_en > current_date then
     raise exception 'la fecha de constatación no puede ser futura';
   end if;
-  if not exists (
-    select 1 from release r
-    join design_version dv on dv.id = r.design_version_id and dv.workspace_id = r.workspace_id
-    where r.id = new.release_id and r.workspace_id = new.workspace_id
-      and dv.servicio_id = new.servicio_id) then
+  select r.desplegado_en into v_desplegado_en
+  from release r
+  join design_version dv on dv.id = r.design_version_id and dv.workspace_id = r.workspace_id
+  where r.id = new.release_id and r.workspace_id = new.workspace_id
+    and dv.servicio_id = new.servicio_id;
+  if not found then
     raise exception 'el effective state es del servicio de la design version del release';
+  end if;
+  -- Una foto de lo que quedó funcionando no puede ser anterior al día en que salió: no
+  -- describiría este release, describiría al servicio antes de él. Y el daño no se queda
+  -- en esa fila — el estado efectivo vigente se pliega ORDENANDO por `constatado_en`
+  -- (RF-06.10), así que una fecha inválida reordena la historia del servicio y hace ganar
+  -- a un cambio viejo sobre uno nuevo. La política ya exige el release desplegado, así que
+  -- aquí `desplegado_en` nunca es nulo (lo impone el CHECK de la tabla).
+  if new.constatado_en < v_desplegado_en then
+    raise exception 'la constatación no puede ser anterior al despliegue del release (%)', to_char(v_desplegado_en, 'YYYY-MM-DD');
   end if;
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (new.workspace_id, 'EffectiveStateConstatado',

@@ -155,7 +155,13 @@ function FormularioInvitar({
     try {
       const r = await invitarMiembro({ data: { workspaceId, email, nombre, rol } });
       if (r.ok) {
-        setResultado({ detalle: r.detalle, enlace: r.enlace });
+        // URL absoluta desde ya: este campo es el único mecanismo de entrega del MVP
+        // y también se copia a mano cuando el portapapeles no está disponible — un
+        // path relativo pegado en un correo no lleva a ninguna parte.
+        setResultado({
+          detalle: r.detalle,
+          enlace: r.enlace ? `${window.location.origin}${r.enlace}` : null,
+        });
         setEmail('');
         setNombre('');
         await onCambio();
@@ -171,7 +177,7 @@ function FormularioInvitar({
 
   async function copiarEnlace(enlace: string) {
     try {
-      await navigator.clipboard.writeText(`${window.location.origin}${enlace}`);
+      await navigator.clipboard.writeText(enlace);
       setCopiado(true);
     } catch {
       onError('No se pudo copiar; selecciona el enlace manualmente');

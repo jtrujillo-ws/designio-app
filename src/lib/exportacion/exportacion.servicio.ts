@@ -271,10 +271,15 @@ async function archivosDelExport(
   workspaceId: string,
   filtro: FiltroEntregable | null,
 ): Promise<ArchivoExportado[]> {
+  // `evidencia_id` viaja con cada adjunto porque la correspondencia item → evidencia solo
+  // vive en `item_importacion`, que el entregable NO lleva (sus filas cargan el texto
+  // crudo del material). Sin esto, un paquete con varias evidencias entrega los originales
+  // sin decir cuál respalda a cuál.
   const metadatos = await tx`
     select a.id, a.item_id, a.nombre, a.tipo_mime, a.sha256,
-           octet_length(a.contenido) as bytes
+           octet_length(a.contenido) as bytes, i.evidencia_id
     from archivo_importado a
+    join item_importacion i on i.id = a.item_id and i.workspace_id = a.workspace_id
     where a.workspace_id = ${workspaceId}
     order by a.creado_en, a.id`;
 
@@ -293,6 +298,7 @@ async function archivosDelExport(
     salida.push({
       id: f.id as string,
       itemId: f.item_id as string,
+      evidenciaId: (f.evidencia_id ?? null) as string | null,
       nombre: f.nombre as string,
       tipoMime: f.tipo_mime as string,
       bytes,

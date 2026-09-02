@@ -115,6 +115,9 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       await admin`delete from cita where workspace_id in ${admin(wss)}`;
       await admin`delete from contradiccion where workspace_id in ${admin(wss)}`;
       await admin`delete from afirmacion where workspace_id in ${admin(wss)}`;
+      // decision_insight y decision cuelgan del insight: se borran antes que él.
+      await admin`delete from decision_insight where workspace_id in ${admin(wss)}`;
+      await admin`delete from decision where workspace_id in ${admin(wss)}`;
       await admin`delete from insight where workspace_id in ${admin(wss)}`;
       await admin`delete from gate_instancia where workspace_id in ${admin(wss)}`;
       await admin`delete from etapa_instancia where workspace_id in ${admin(wss)}`;
@@ -601,6 +604,103 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(r.numero).toBe(1);
   });
 
+  it('citar una DECISIÓN no esquiva el re-chequeo: la cadena se sigue hasta sus insights', async () => {
+    // El eslabón que faltaba. Un ítem que cita una decisión solo se comprobaba contra
+    // `decision.estado`, y ese estado habla de REAPERTURAS (SYS-10), no de derechos: una
+    // decisión perfectamente vigente puede apoyarse en insights cuyo respaldo se revocó,
+    // así que el mismo razonamiento entraba por la puerta de al lado.
+    const admin = sqlAdmin();
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'nota', 'Fuente de la decisión', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, 'Respaldo de la decisión', '{}'::jsonb, ${leadId})
+      returning id`;
+    const evDecision = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evDecision}, 'concedido', 'cliente', 'Consentimiento vigente',
+              ${leadId}, now(), ${leadId})`;
+
+    const ins = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'El canal digital concentra el abandono',
+      resumen: '',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: ins.insightId,
+      texto: 'El abandono se concentra en el canal digital',
+      esHipotesis: false,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId: evDecision,
+      fragmento: 'El 62% abandona en digital',
+      localizacion: 'p. 4',
+    });
+    await validarInsight(leadId, ws, ins.insightId);
+
+    const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-93', 'Proyecto decisión', ${leadId}) returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 1, 'Investigación')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 1, 'lead-boutique') returning id`;
+    const gateId = gate!.id as string;
+    const [ci] = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gateId}, 0, 'Decisión tomada con respaldo') returning id`;
+    const [dec] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, decidido_por)
+      values (${ws}, ${proyectoId}, ${gateId}, 'diseno', 'Atacar la verificación digital',
+              'El insight lo concentra ahí', ${leadId}) returning id`;
+    await admin`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${dec!.id as string}, ${ins.insightId}, ${ws})`;
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: ci!.id as string,
+      accion: { tipo: 'cumplido', objetoClase: 'decision', objetoId: dec!.id as string },
+    });
+
+    // Con el respaldo vigente el gate aprueba... pero primero se revoca, para probar que
+    // es el DERECHO lo que lo detiene y no otra cosa.
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evDecision,
+      decision: 'denegado',
+      ambito: 'interno',
+      base: 'El titular retiró el consentimiento',
+      venceEn: null,
+    });
+    // La decisión sigue VIGENTE: la comprobación que ya existía no ve nada raro.
+    const [estado] = await conUsuario(leadId, (tx) => tx`select estado from decision
+      where id = ${dec!.id as string}`);
+    expect(estado!.estado).toBe('vigente');
+    await expect(aprobarGate(leadId, { workspaceId: ws, gateId })).rejects.toThrow(
+      /cita una decisión cuyo insight de respaldo/,
+    );
+    await expect(
+      conUsuario(leadId, (tx) => tx`update gate_instancia
+        set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
+        where id = ${gateId}`),
+    ).rejects.toMatchObject({ code: 'DR001' });
+
+    // Reconceder desbloquea: el bloqueo era el derecho, y vuelve cuando el derecho vuelve.
+    await decidirDerechos(leadId, {
+      workspaceId: ws,
+      evidenciaId: evDecision,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Nuevo consentimiento firmado',
+      venceEn: null,
+    });
+    const r = await aprobarGate(leadId, { workspaceId: ws, gateId });
+    expect(r.numero).toBe(1);
+  });
+
   // ── La revocación alcanza a lo que YA estaba cumplido ──
 
   it('revocar derechos después de cumplir el ítem impide aprobar el gate', async () => {
@@ -968,6 +1068,166 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       evAjena!.id as string,
     );
     expect(conCursorAjeno.evidencias).toHaveLength(0);
+  });
+
+  // ── Los predicados de derechos no responden a quien no es miembro ──
+
+  it('evidencia_usable y motivo_bloqueo no son un oráculo cross-tenant', async () => {
+    // Son SECURITY DEFINER y están concedidas a designio_app: leen `derecho_uso` saltándose
+    // la RLS, que es justo lo que necesitan para decidir igual para todos los roles. Sin
+    // pre-chequeo de membresía, una sesión legítima podía preguntar por la evidencia de
+    // OTRO tenant. La de `motivo` es la grave: devuelve `base`, prosa libre escrita por el
+    // cliente (cláusulas, motivos de retirada del consentimiento).
+    const admin = sqlAdmin();
+    const [fuenteB] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${wsB}, 'nota', 'Fuente ajena', ${leadId}) returning id`;
+    const [evB] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${wsB}, ${fuenteB!.id as string}, 'Evidencia ajena', '{}'::jsonb, ${leadId})
+      returning id`;
+    const SECRETO = 'el titular retiró el consentimiento tras la denuncia interna';
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${wsB}, ${evB!.id as string}, 'denegado', 'interno', ${SECRETO},
+              ${leadId}, now(), ${leadId})`;
+
+    // leadId NO es miembro de wsB. Preguntar por esa evidencia no revela ni su estado ni,
+    // sobre todo, el texto de la denegación.
+    const [sonda] = await conUsuario(
+      leadId,
+      (tx) => tx`select evidencia_usable(${evB!.id as string}, ${wsB}, 'cliente') as usable,
+                        evidencia_motivo_bloqueo(${evB!.id as string}, ${wsB}, 'cliente') as motivo`,
+    );
+    expect(sonda!.usable).toBe(false);
+    expect(sonda!.motivo).toBeNull();
+
+    // Y no se distingue «no puedes verlo» de «no existe»: un uuid inventado en el mismo
+    // workspace ajeno responde exactamente igual. Esa indistinguibilidad ES la propiedad.
+    const [inventada] = await conUsuario(
+      leadId,
+      (tx) => tx`select evidencia_usable(${crypto.randomUUID()}, ${wsB}, 'cliente') as usable,
+                        evidencia_motivo_bloqueo(${crypto.randomUUID()}, ${wsB}, 'cliente') as motivo`,
+    );
+    expect(inventada!.usable).toBe(sonda!.usable);
+    expect(inventada!.motivo).toBe(sonda!.motivo);
+
+    // En el workspace propio siguen funcionando igual que siempre: endurecerlas no las
+    // vuelve inútiles, solo las hace responder a quien tiene derecho a preguntar.
+    const [propia] = await conUsuario(
+      leadId,
+      (tx) => tx`select evidencia_usable(${evSinDerechos}, ${ws}, 'cliente') as usable,
+                        evidencia_motivo_bloqueo(${evSinDerechos}, ${ws}, 'cliente') as motivo`,
+    );
+    expect(propia!.usable).toBe(false);
+    expect(propia!.motivo).toContain('derechos pendientes');
+  });
+
+  it('el adjunto original no se descarga por el mero hecho de ser miembro', async () => {
+    // `interno` es «solo la boutique» y `cliente` es «portal y entregables». La política de
+    // lectura era solo de membresía, así que el ámbito no significaba nada en la única
+    // superficie que entrega el documento ENTERO: un stakeholder podía bajarse los bytes
+    // originales de material sin derechos para uso con el cliente.
+    const item = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Material con original reservado',
+      contenido: 'x',
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    const adj = await adjuntarArchivo(leadId, {
+      workspaceId: ws,
+      itemId: item.itemId,
+      nombre: 'reservado.pdf',
+      tipoMime: 'application/pdf',
+      contenidoBase64: bytesABase64(PDF),
+    });
+
+    // El stakeholder es miembro y no lo subió: ya no lo recibe.
+    expect(await archivoParaDescarga(stakeId, ws, adj.archivoId)).toBeNull();
+    // La boutique sí: curar el material es su trabajo, y es lo que «interno» autoriza.
+    expect(await archivoParaDescarga(disenadorId, ws, adj.archivoId)).not.toBeNull();
+    // Y admin-cliente también: administra los datos del cliente y es quien ejerce el
+    // derecho a exportar el archivo COMPLETO — excluirlo rompería SYS-04.
+    expect(await archivoParaDescarga(adminClienteId, ws, adj.archivoId)).not.toBeNull();
+
+    // Quien aporta material lo sigue viendo aunque no sea curador: sin esto, contribuir
+    // desde el portal sería escribir en un buzón sin tapa.
+    const suyo = await crearItem(stakeId, {
+      workspaceId: ws,
+      titulo: 'Aporte del stakeholder',
+      contenido: 'x',
+      tipoFuente: 'nota',
+      referencia: '',
+    });
+    const propio = await adjuntarArchivo(stakeId, {
+      workspaceId: ws,
+      itemId: suyo.itemId,
+      nombre: 'aporte.pdf',
+      tipoMime: 'application/pdf',
+      contenidoBase64: bytesABase64(PDF),
+    });
+    expect(await archivoParaDescarga(stakeId, ws, propio.archivoId)).not.toBeNull();
+
+    // Y en cuanto la evidencia resultante tiene derechos vigentes para «cliente», el
+    // original deja de estar reservado: el material ya está autorizado para ese uso.
+    const bandeja = await listarBandeja(leadId, ws);
+    expect(bandeja.pendientes.some((i) => i.id === item.itemId)).toBe(true);
+    const curada = await aprobarItem(leadId, {
+      workspaceId: ws,
+      itemId: item.itemId,
+      esEstadoActual: false,
+      resumen: 'Material autorizado',
+      dimensiones,
+    });
+    expect(await archivoParaDescarga(stakeId, ws, adj.archivoId)).toBeNull();
+    await decidirDerechos(leadId, {
+      workspaceId: ws,
+      evidenciaId: curada.evidenciaId,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Cláusula 7 del contrato',
+      venceEn: null,
+    });
+    expect(await archivoParaDescarga(stakeId, ws, adj.archivoId)).not.toBeNull();
+  });
+
+  it('reafirmar los mismos derechos con otra firma deja evento: la atribución es decisión', async () => {
+    // La condición del guard miraba estado, ámbito, vigencia y base — no quién firma. Un
+    // segundo responsable reenviando la MISMA decisión se quedaba como autor de la fila
+    // viva sin aparecer en la historia: la auditoría nombraba a la primera persona.
+    const admin = sqlAdmin();
+    const [antes] = await admin`select count(*)::int as n from evento_dominio
+      where workspace_id = ${ws} and payload->>'evidenciaId' = ${evConDerechos}
+        and tipo in ('DerechosConcedidos', 'DerechosDenegados')`;
+    const [previo] = await conUsuario(leadId, (tx) => tx`select decidido_por from derecho_uso
+      where evidencia_id = ${evConDerechos}`);
+
+    // Mismo estado, mismo ámbito, misma base, misma vigencia — pero otra persona.
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evConDerechos,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Nuevo consentimiento firmado',
+      venceEn: null,
+    });
+
+    const [ahora] = await conUsuario(leadId, (tx) => tx`select decidido_por from derecho_uso
+      where evidencia_id = ${evConDerechos}`);
+    expect(ahora!.decidido_por).toBe(adminClienteId);
+    expect(ahora!.decidido_por).not.toBe(previo!.decidido_por);
+    // La fila viva cambió de firmante, así que la historia tiene que decirlo.
+    const [despues] = await admin`select count(*)::int as n from evento_dominio
+      where workspace_id = ${ws} and payload->>'evidenciaId' = ${evConDerechos}
+        and tipo in ('DerechosConcedidos', 'DerechosDenegados')`;
+    expect(despues!.n as number).toBe((antes!.n as number) + 1);
+    const [evento] = await admin`select payload, actor_id from evento_dominio
+      where workspace_id = ${ws} and payload->>'evidenciaId' = ${evConDerechos}
+      order by creado_en desc limit 1`;
+    expect(evento!.actor_id).toBe(adminClienteId);
+    expect(
+      (evento!.payload as { previo: { decididoPor: string } }).previo.decididoPor,
+    ).toBe(previo!.decidido_por);
   });
 
   // ── Higiene de la migración y del seed ──

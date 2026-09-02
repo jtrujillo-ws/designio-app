@@ -326,6 +326,11 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     expect(paquete.datos.fuente).toHaveLength(1);
     expect(paquete.archivos).toHaveLength(1);
     expect(paquete.archivos[0]!.id).toBe(archivoId);
+    // El receptor tiene que poder decir a QUÉ evidencia respalda cada original. La
+    // correspondencia vivía solo en `item_importacion`, que el entregable no lleva —y no
+    // puede llevar: sus filas cargan el texto crudo del material. Se publica el enlace.
+    expect(paquete.archivos[0]!.evidenciaId).toBe(evConDerechos);
+    expect(paquete.datos.item_importacion).toBeUndefined();
     expect(paquete.datos.derecho_uso).toHaveLength(1);
 
     // El entregable no es el archivo del workspace: no arrastra método ni auditoría.

@@ -172,6 +172,17 @@ export const PRESUPUESTO_ADJUNTOS_BYTES = 25 * 1024 * 1024;
 export type ArchivoExportado = {
   id: string;
   itemId: string;
+  /**
+   * A qué EVIDENCIA pertenece el original, o null si su material sigue en la bandeja sin
+   * curar. El adjunto cuelga del item y el único sitio donde vivía la correspondencia
+   * item → evidencia era `item_importacion`, que el entregable no lleva: el receptor de un
+   * paquete con varias evidencias se quedaba con un montón de ficheros y sin saber cuál
+   * respalda a cuál. La alternativa —exportar las filas de la bandeja— habría metido en el
+   * paquete la columna `contenido`, es decir el texto crudo del material de terceros, que
+   * es precisamente lo que el ámbito del entregable protege. Se publica el enlace, no la
+   * fuente.
+   */
+  evidenciaId: string | null;
   nombre: string;
   tipoMime: string;
   bytes: number;

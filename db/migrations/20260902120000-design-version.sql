@@ -870,6 +870,18 @@ begin
     -- se puede pedir —más que «no lo usa nadie más» o «es el más reciente», que admiten
     -- ambos un snapshot tomado antes de la última edición del grafo— y es exactamente lo
     -- que hace el servicio: insertar el snapshot y aprobar en la misma transacción.
+    --
+    -- PRECONDICIÓN DEL REPOSITORIO, y no solo de este guard: `xmin` es el xid que insertó
+    -- la fila, así que con una SUBTRANSACCIÓN de por medio sería el subxid y no
+    -- coincidiría con el `pg_current_xact_id()` de nivel superior. Hoy se cumple —
+    -- `conUsuario` abre una sola transacción con `begin()` y no hay un solo savepoint en
+    -- el repositorio, comprobado— y hay otro guard que se apoya en lo mismo, así que quien
+    -- meta un savepoint mañana rompe los dos.
+    --
+    -- El modo de fallo es contraintuitivo y por eso se escribe: NO se abre el agujero, se
+    -- cierra de más. Con un subxid la comparación falla y se rechaza una aprobación
+    -- LEGÍTIMA. Es la dirección segura, pero desde producción se ve como «aprobar dejó de
+    -- funcionar» y nadie miraría hacia aquí sin este párrafo.
     if new.snapshot_id is not null and not exists (
       select 1 from journey_snapshot s
       where s.id = new.snapshot_id and s.workspace_id = new.workspace_id

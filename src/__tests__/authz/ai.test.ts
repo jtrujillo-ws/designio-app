@@ -1239,6 +1239,152 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(retirado.version).toBe(2);
   });
 
+  it('lo que cambia durante la llamada no deja nacer una propuesta obsoleta', async () => {
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item que otro curador decide a media llamada');
+    // Entre `prepararAlcance` y la persistencia hay una llamada entera: cualquier
+    // precondición puede dejar de ser cierta. Aquí otro curador cura el item a mano.
+    proveedor.duranteLlamada = async () => {
+      await admin`update item_importacion
+        set estado = 'rechazado', decidido_por = ${disenadorId}, decidido_en = now()
+        where id = ${itemId}`;
+    };
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        ).rejects.toThrow(/ya fue decidido|ya fue curado/i);
+      });
+    } finally {
+      proveedor.duranteLlamada = null;
+    }
+    // No nace una propuesta que solo se podría tirar…
+    const ninguna = await conUsuario(leadId, (tx) => tx`select 1 as x from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(ninguna.length).toBe(0);
+    // …pero la llamada, que se pagó, sí queda anotada: el gasto no depende de que su
+    // resultado llegue a usarse.
+    const llamadas = await conUsuario(leadId, (tx) => tx`select 1 as x from llamada_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(llamadas.length).toBe(1);
+    // Y el suelo es el guard: ni por SQL crudo nace una propuesta sobre un item decidido.
+    await expect(
+      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+    ).rejects.toThrow(/ya fue decidido/i);
+  });
+
+  it('un reto que se congela durante la llamada tampoco deja nacer la propuesta', async () => {
+    await enWorkspaceLimpio('congela-en-vuelo', async ({ ws: wsF, curadorId, retoId: retoF }) => {
+      const admin = sqlAdmin();
+      proveedor.duranteLlamada = async () => {
+        const [proyecto] = await admin`insert into proyecto
+          (workspace_id, reto_id, codigo, titulo, creado_por)
+          values (${wsF}, ${retoF}, 'P-01', 'Proyecto', ${curadorId}) returning id`;
+        await admin`insert into etapa_instancia
+          (workspace_id, proyecto_id, numero, nombre, estado)
+          values (${wsF}, ${proyecto!.id as string}, 0, 'Definición del objeto y del reto',
+                  'completada')`;
+        await admin`insert into gate_instancia
+          (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+          values (${wsF}, ${proyecto!.id as string}, 0, 'sponsor', 'aprobado', ${curadorId},
+                  now())`;
+      };
+      try {
+        await conProveedor(
+          { ok: true, datos: { criterios: [CONTENIDO_C0] }, intentos: [intento({ uso: null })] },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, { workspaceId: wsF, capacidad: 'C0', anclaId: retoF }),
+            ).rejects.toThrow(/no admite criterios|congelados/i);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+      const ninguna = await conUsuario(curadorId, (tx) => tx`select 1 as x from propuesta_ai
+        where workspace_id = ${wsF} and reto_id = ${retoF}`);
+      expect(ninguna.length).toBe(0);
+      const llamadas = await conUsuario(curadorId, (tx) => tx`select 1 as x from llamada_ai
+        where workspace_id = ${wsF} and reto_id = ${retoF}`);
+      expect(llamadas.length).toBe(1);
+    });
+  });
+
+  it('la llamada se anota aunque la cuenta se desactive con el material en vuelo', async () => {
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item con la cuenta desactivada a media llamada');
+    proveedor.duranteLlamada = async () => {
+      await admin`update usuario set estado = 'inactivo' where id = ${disenadorId}`;
+    };
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        // Persistir propuestas SÍ es actuar, así que se corta…
+        await expect(
+          generarPropuestas(disenadorId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        ).rejects.toThrow(ErrorAutorizacion);
+      });
+      // …pero la llamada ya ocurrió y quizá ya se facturó: dejar caer su anotación borraría
+      // gasto real del libro y del tope. El hecho consumado se registra igual.
+      const [llamada] = await conUsuario(leadId, (tx) => tx`select resultado, costo_usd,
+          creado_por from llamada_ai where workspace_id = ${ws} and item_id = ${itemId}`);
+      expect(llamada).toBeDefined();
+      expect(llamada!.resultado).toBe('salida-valida');
+      expect(Number(llamada!.costo_usd)).toBeGreaterThan(0);
+      expect(llamada!.creado_por).toBe(disenadorId);
+      // Y la reserva se suelta: soltarla tampoco es actuar, y dejarla colgada bloquearía el
+      // ancla y abultaría el presupuesto en vuelo hasta que caducara.
+      const reservas = await conUsuario(leadId, (tx) => tx`select 1 as x from reserva_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`);
+      expect(reservas.length).toBe(0);
+      // Lo que no pasa: la cuenta desactivada no crea propuestas.
+      const ninguna = await conUsuario(leadId, (tx) => tx`select 1 as x from propuesta_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`);
+      expect(ninguna.length).toBe(0);
+    } finally {
+      proveedor.duranteLlamada = null;
+      await admin`update usuario set estado = 'activo' where id = ${disenadorId}`;
+    }
+  });
+
+  it('«decididas recientes» se ordena por la fecha de la DECISIÓN, no la de la propuesta', async () => {
+    await enWorkspaceLimpio('decididas', async ({ ws: wsD, curadorId, retoId: retoD }) => {
+      const admin = sqlAdmin();
+      const [llamada] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsD}, 'C0', ${retoD}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      // Una propuesta ANTIGUA y otras cincuenta más nuevas, todas del mismo reto.
+      const [vieja] = await admin`insert into propuesta_ai
+        (workspace_id, capacidad, destino, reto_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, llamada_id, creado_por, creado_en)
+        values (${wsD}, 'C0', 'criterio-exito', ${retoD}, ${admin.json(CONTENIDO_C0)},
+                ${admin.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+                ${llamada!.id as string}, ${curadorId}, now() - interval '30 days')
+        returning id`;
+      const nuevas = await admin`insert into propuesta_ai
+        (workspace_id, capacidad, destino, reto_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, llamada_id, creado_por, creado_en)
+        select ${wsD}, 'C0', 'criterio-exito', ${retoD}, ${admin.json(CONTENIDO_C0)},
+               ${admin.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+               ${llamada!.id as string}, ${curadorId}, now() - interval '1 day'
+        from generate_series(1, 50)
+        returning id`;
+      // Las nuevas se decidieron ayer; la antigua, ahora mismo.
+      await admin`update propuesta_ai set estado = 'rechazada', revisada_por = ${curadorId},
+          revisada_en = now() - interval '1 day'
+        where id in ${admin(nuevas.map((n) => n.id as string))}`;
+      await admin`update propuesta_ai set estado = 'rechazada', revisada_por = ${curadorId},
+          revisada_en = now()
+        where id = ${vieja!.id as string}`;
+
+      const panel = await panelPropuestas(curadorId, wsD);
+      // Con el orden por `creado_en`, la decisión recién tomada quedaba detrás de las
+      // cincuenta de propuestas más nuevas: el revisor no veía lo que acababa de hacer.
+      expect(panel.decididas[0]!.id).toBe(vieja!.id as string);
+      expect(panel.hayMasDecididas).toBe(true);
+    });
+  });
+
   it('un item importado solo con la referencia no llega al proveedor: no hay nada que citar', async () => {
     const soloRef = await nuevoItem('Informe que vive en otra parte', 'documento', '');
     await conProveedor(RESPUESTA_CI, async () => {

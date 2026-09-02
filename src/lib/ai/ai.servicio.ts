@@ -256,9 +256,14 @@ export async function panelPropuestas(
       where p.workspace_id = ${workspaceId} and p.estado = 'propuesta'
       order by p.creado_en asc, p.id asc
       limit ${PAGINA_PENDIENTES + 1}`;
+    // Por `revisada_en`, que es lo que la lista promete: recencia de la DECISIÓN. Con el
+    // orden por `creado_en`, decidir una propuesta antigua no la hacía aparecer —quedaba
+    // detrás de cincuenta decisiones de propuestas más nuevas— y el revisor no veía lo que
+    // acababa de hacer. El sello lo pone el guard, así que es dato de la base y no del
+    // caller.
     const decididas = await tx`select ${columnas} ${origen}
       where p.workspace_id = ${workspaceId} and p.estado <> 'propuesta'
-      order by p.creado_en desc, p.id desc
+      order by p.revisada_en desc, p.id desc
       limit ${DECIDIDAS_RECIENTES + 1}`;
 
     // Anclas ofrecibles a la generación. Un ancla que ya tiene propuesta pendiente no se
@@ -561,13 +566,44 @@ async function liberarReserva(
   reservaId: string,
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
-    await exigirCuentaActiva(tx, actorId);
+    // Tampoco exige cuenta activa, por lo mismo: soltar el hueco de una generación que ya
+    // terminó no es actuar, y dejarlo colgado hasta que caduque bloquearía el ancla y
+    // abultaría el presupuesto en vuelo por una desactivación a destiempo. La política de
+    // DELETE sigue exigiendo rol curador y que la reserva sea suya.
     await bloquearPresupuesto(tx, workspaceId);
     await tx`delete from reserva_ai where id = ${reservaId} and workspace_id = ${workspaceId}`;
   });
 }
 
 /**
+ * INVENTARIO DE PRECONDICIONES. `prepararAlcance` comprueba y commitea; la llamada al
+ * proveedor ocurre después y fuera de transacción (a propósito: un tercero lento no puede
+ * retener una conexión). Por tanto TODO lo que comprueba queda obsoleto en cuanto commitea,
+ * y cada precondición necesita decir dónde se vuelve a exigir. Hay tres momentos y no son
+ * intercambiables: antes de llamar evita el gasto; al persistir evita que nazca el objeto;
+ * el guard es el suelo, para que el SQL directo tampoco pueda.
+ *
+ *  | Precondición                     | Antes de llamar | Al persistir      | Suelo (base)        |
+ *  |----------------------------------|-----------------|-------------------|---------------------|
+ *  | Cuenta activa                    | sí              | sí                | — (es capa 2)       |
+ *  | Rol curador                      | —¹              | —¹                | política de INSERT  |
+ *  | Credencial del proveedor         | resuelta ya²    | n/a               | n/a                 |
+ *  | CI · item aún pendiente          | sí              | guard             | guard de INSERT     |
+ *  | CI · consentimiento vigente      | sí (con candado)| guard             | guard de INSERT     |
+ *  | CI · material extraíble          | inmutable³      | guard             | guard de INSERT     |
+ *  | C0 · reto admite criterios       | sí              | guard             | guard de INSERT     |
+ *  | C0 · criterios no congelados     | sí              | guard             | guard de INSERT     |
+ *  | Ancla sin generación en vuelo    | sí (reserva)    | consume la reserva| índice único parcial|
+ *  | Ancla sin propuesta pendiente    | —⁴              | CI: índice único  | CI: índice único    |
+ *  | Presupuesto                      | sí (reserva)    | no⁵               | —                   |
+ *
+ *  ¹ La política de INSERT de `propuesta_ai` lo exige en cada escritura: no hay ventana.
+ *  ² La key viaja en el alcance; revocarla en el entorno solo afecta a generaciones futuras.
+ *  ³ `contenido` no está en el grant de UPDATE de la bandeja: no puede cambiar bajo los pies.
+ *  ⁴ Lo cubre la reserva, que es exclusiva por ancla y viva durante toda la llamada.
+ *  ⁵ Deliberado: al persistir la llamada ya está pagada y negarse a guardar su salida solo
+ *    tiraría lo comprado. El tope frena en la admisión y en el despacho.
+ *
  * Última comprobación antes de que el material salga hacia el proveedor (RF-09.5).
  *
  * `prepararAlcance` commitea y solo DESPUÉS se despacha la llamada; en ese hueco cabe una
@@ -599,6 +635,7 @@ async function confirmarDespacho(
     if (entrada.capacidad === 'CI') {
       await bloquearConsentimiento(tx, entrada.anclaId);
       const [item] = await tx`select
+          estado <> 'pendiente' as ya_decidido,
           tipo_fuente_exige_consentimiento(tipo_fuente)
             and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento
         from item_importacion
@@ -606,6 +643,25 @@ async function confirmarDespacho(
       if (item?.falta_consentimiento) {
         throw new ErrorAI(
           'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
+        );
+      }
+      // Otro curador pudo decidir el item a mano mientras tanto: su material ya no espera
+      // nada de la AI y la propuesta nacería obsoleta. Gastar la llamada para eso es tirar
+      // dinero, y es el mismo caso que el consentimiento — algo que `prepararAlcance` vio
+      // cierto y dejó de serlo al commitear.
+      if (!item || item.ya_decidido) {
+        throw new ErrorAI(
+          'Ese item de la bandeja ya fue curado mientras se preparaba la llamada: no se llamó al proveedor',
+        );
+      }
+    } else {
+      const [reto] = await tx`select
+          estado in ('candidato', 'activo') as admite,
+          reto_criterios_congelados(id, workspace_id) as congelado
+        from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+      if (!reto || !reto.admite || reto.congelado) {
+        throw new ErrorAI(
+          'Ese reto dejó de admitir criterios mientras se preparaba la llamada (G0 aprobado o reto cerrado): no se llamó al proveedor',
         );
       }
     }
@@ -657,7 +713,16 @@ async function registrarLlamadas(
 ): Promise<{ ids: string[]; idSalidaValida: string | null }> {
   if (intentos.length === 0) return { ids: [], idSalidaValida: null };
   return conUsuario(actorId, async (tx) => {
-    await exigirCuentaActiva(tx, actorId);
+    // SIN `exigirCuentaActiva`, y es la única función del módulo que se lo salta a
+    // propósito. Anotar lo que pasó y autorizar lo que viene son dos preguntas distintas:
+    // la cuenta activa responde a la segunda —«¿puede esta persona actuar ahora?»— y aquí
+    // no se actúa, se registra un hecho consumado. Si la cuenta se desactiva con la llamada
+    // en vuelo, el proveedor ya respondió y quizá ya facturó; dejar caer la anotación
+    // borraría gasto real del libro y del tope, que es la misma doctrina que ya rige para
+    // `sin-respuesta` («no se sabe» no es «salió gratis») aplicada a un caso donde sí se
+    // sabe. La autorización de verdad no desaparece: la RLS sigue exigiendo que quien
+    // firma sea miembro con rol curador del workspace, y persistir propuestas —que sí es
+    // actuar— conserva su chequeo.
     const ids: string[] = [];
     let idSalidaValida: string | null = null;
     for (const intento of intentos) {

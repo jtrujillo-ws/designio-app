@@ -76,10 +76,14 @@ export async function agregarNodo(
 ): Promise<{ nodoId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // El orden es un max()+1: dos altas concurrentes del mismo tipo leerían el mismo
+    // máximo y nacerían empatadas. El candado por (journey, tipo) las serializa —
+    // mismo espacio de nombres que los del método. Es de transacción: se suelta al
+    // commit y no bloquea altas de otro journey ni de otro tipo.
+    await tx`select pg_advisory_xact_lock(
+      hashtextextended('designio:journey-orden:' || ${entrada.journeyId} || ':' || ${entrada.tipo}, 42))`;
     let fila;
     try {
-      // El orden se calcula dentro de la misma sentencia: dos altas concurrentes no se
-      // pisan (el orden es presentacional y reordenar es una operación aparte).
       [fila] = await tx`
         insert into journey_nodo (workspace_id, journey_id, tipo, etiqueta, detalle,
                                   fase_id, orden, responsable, creado_por)

@@ -117,10 +117,26 @@ export function mermaidDeJourney(journey: JourneyCompleto): string {
  */
 export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
   const senales: SenalValidacion[] = [];
-  const pasos = journey.nodos.filter((n) => n.tipo === 'paso');
   const transiciones = journey.aristas.filter((a) => a.tipo === 'transicion');
   const conEntrada = new Set(transiciones.map((a) => a.destinoId));
   const conSalida = new Set(transiciones.map((a) => a.origenId));
+
+  // La secuencia real del journey: las fases se suceden en su orden y los pasos dentro
+  // de cada una en el suyo. Solo el PRIMER paso de esa secuencia global puede no tener
+  // entrada, y solo el último puede no tener salida — el primer paso de la fase 2 sí
+  // necesita que algo de la fase 1 lleve hasta él, que es la costura que más se rompe.
+  // Los pasos sin fase van al final: ya se reportan aparte como huérfanos.
+  const ordenDeFase = new Map(
+    journey.nodos.filter((n) => n.tipo === 'fase').map((f) => [f.id, f.orden]),
+  );
+  const pasos = journey.nodos.filter((n) => n.tipo === 'paso');
+  const secuencia = [...pasos].sort((a, b) => {
+    const fa = a.faseId === null ? Number.MAX_SAFE_INTEGER : (ordenDeFase.get(a.faseId) ?? Number.MAX_SAFE_INTEGER);
+    const fb = b.faseId === null ? Number.MAX_SAFE_INTEGER : (ordenDeFase.get(b.faseId) ?? Number.MAX_SAFE_INTEGER);
+    return fa !== fb ? fa - fb : a.orden !== b.orden ? a.orden - b.orden : a.id.localeCompare(b.id);
+  });
+  const primeroId = secuencia[0]?.id ?? null;
+  const ultimoId = secuencia[secuencia.length - 1]?.id ?? null;
 
   for (const paso of pasos) {
     if (paso.evidencias.length === 0) {
@@ -132,10 +148,7 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
         mensaje: 'El paso no tiene evidencia enlazada que lo sostenga',
       });
     }
-    // El primer paso del journey no necesita entrada; el resto sí. «Primero» se define
-    // por orden dentro de su fase (y por orden global si no tiene fase).
-    const esPrimero = pasos.every((otro) => otro.id === paso.id || otro.orden >= paso.orden);
-    if (!conEntrada.has(paso.id) && !esPrimero) {
+    if (!conEntrada.has(paso.id) && paso.id !== primeroId) {
       senales.push({
         codigo: 'paso-inalcanzable',
         severidad: 'alta',
@@ -145,8 +158,7 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
       });
     }
     // El último tampoco necesita salida: el journey termina en algún lado.
-    const esUltimo = pasos.every((otro) => otro.id === paso.id || otro.orden <= paso.orden);
-    if (!conSalida.has(paso.id) && !esUltimo) {
+    if (!conSalida.has(paso.id) && paso.id !== ultimoId) {
       senales.push({
         codigo: 'paso-sin-salida',
         severidad: 'media',

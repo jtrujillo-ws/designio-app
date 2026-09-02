@@ -134,6 +134,38 @@ describe('validarJourney', () => {
     expect(senales).toEqual([]);
   });
 
+  it('primero y último se calculan sobre la secuencia de fases, no por orden global', () => {
+    const ev = [{ id: id(), titulo: 'E' }];
+    const f1 = nodo({ tipo: 'fase', etiqueta: 'Solicitud', orden: 0 });
+    const f2 = nodo({ tipo: 'fase', etiqueta: 'Verificación', orden: 1 });
+    // Los `orden` de paso se reinician por fase, que es lo natural al editarlas por
+    // separado: sin mirar la fase, «Sube documento» (orden 0) parecería el primero.
+    const abre = nodo({ tipo: 'paso', etiqueta: 'Abre', orden: 0, faseId: f1.id, evidencias: ev });
+    const datos = nodo({ tipo: 'paso', etiqueta: 'Datos', orden: 1, faseId: f1.id, evidencias: ev });
+    const sube = nodo({ tipo: 'paso', etiqueta: 'Sube documento', orden: 0, faseId: f2.id, evidencias: ev });
+    const firma = nodo({ tipo: 'paso', etiqueta: 'Firma', orden: 1, faseId: f2.id, evidencias: ev });
+
+    // Se conecta TODO menos la costura entre fases: datos → sube.
+    const senales = validarJourney(
+      journey(
+        [f1, f2, abre, datos, sube, firma],
+        [arista(abre, datos, 'transicion'), arista(sube, firma, 'transicion')],
+      ),
+    );
+
+    // «Sube documento» es primero de su fase pero NO del journey: le falta la entrada.
+    expect(senales.filter((s) => s.codigo === 'paso-inalcanzable').map((s) => s.nodoId)).toEqual([
+      sube.id,
+    ]);
+    // Y «Datos» es último de la suya pero no del journey: le falta la salida.
+    expect(senales.filter((s) => s.codigo === 'paso-sin-salida').map((s) => s.nodoId)).toEqual([
+      datos.id,
+    ]);
+    // Los extremos reales del journey no se reportan.
+    expect(senales.some((s) => s.nodoId === abre.id)).toBe(false);
+    expect(senales.some((s) => s.nodoId === firma.id)).toBe(false);
+  });
+
   it('la acción frontstage sin soporte backstage es señal alta', () => {
     const accion = nodo({
       tipo: 'accion-frontstage',

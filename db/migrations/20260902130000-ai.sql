@@ -541,6 +541,27 @@ begin
       raise exception 'ese item no tiene material que citar (solo referencia): no se pueden generar propuestas de extracción sobre él';
     end if;
 
+    -- El ANCLA tiene que seguir admitiendo la propuesta en el momento de escribirla. Todo
+    -- lo que el servicio comprobó antes de llamar al proveedor lleva ya una transacción
+    -- commiteada de retraso: entre medias otro curador pudo curar el item a mano o aprobar
+    -- el G0 del reto. Sin esto nacía una propuesta obsoleta — pendiente en el panel y
+    -- rechazada por la materialización— que solo se podía tirar.
+    if new.item_id is not null and not exists (
+      select 1 from item_importacion i
+      where i.id = new.item_id and i.workspace_id = new.workspace_id
+        and i.estado = 'pendiente'
+    ) then
+      raise exception 'ese item de la bandeja ya fue decidido: no admite propuestas nuevas';
+    end if;
+    if new.reto_id is not null and (
+      reto_criterios_congelados(new.reto_id, new.workspace_id)
+      or not exists (select 1 from reto r
+        where r.id = new.reto_id and r.workspace_id = new.workspace_id
+          and r.estado in ('candidato', 'activo'))
+    ) then
+      raise exception 'ese reto ya no admite criterios nuevos (G0 aprobado o reto cerrado)';
+    end if;
+
     -- La llamada referenciada tiene que ser LA QUE PRODUJO esta propuesta, no una
     -- cualquiera del workspace. La FK sola comprobaba existencia y tenant, así que por SQL
     -- crudo se podía colgar una extracción de una llamada C0, de otra ancla, de otro modelo

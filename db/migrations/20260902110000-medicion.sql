@@ -922,6 +922,32 @@ create trigger registry_firmar_trg
   for each row execute function registry_firmar_guard();
 revoke execute on function registry_firmar_guard() from public;
 
+-- ── El CONTENIDO del post mortem, escrito una sola vez ──
+-- Dos rutas escriben este contenido —la edición del borrador y la completación— y las dos
+-- lo tienen que decir con las MISMAS claves: si no, el «antes» que deja una no se puede
+-- comparar con el «después» que deja la otra y el rastro queda partido en dos vocabularios.
+-- Sobre jsonb y no sobre la fila porque un lado trabaja con `old`/`new` de una tabla
+-- concreta y el otro es un guard compartido entre tablas de columnas distintas.
+--
+-- Devuelve el objeto PLANO a propósito: se funde en la raíz del payload para el «después»
+-- y se anida bajo `antes` para el estado previo, que es la misma forma que ya tienen
+-- `EntradaKpiEditada` y `ResultadoCriterioEditado`.
+--
+-- Sin `execute` para nadie: solo lo llaman guards SECURITY DEFINER, que corren como el
+-- dueño; el rol de aplicación no necesita —ni debe— poder invocarlo.
+create function outcome_review_narrativa(fila jsonb) returns jsonb
+language sql immutable parallel safe as $$
+  select jsonb_build_object(
+    'veredicto', fila->'veredicto',
+    'contribucion', fila->'contribucion',
+    'factoresExternos', fila->'factores_externos',
+    'hipotesisAbiertas', fila->'hipotesis_abiertas',
+    'aprendizajes', fila->'aprendizajes',
+    'disenoExperimentalSuficiente', fila->'diseno_experimental_suficiente',
+    'disenoExperimentalJustificacion', fila->'diseno_experimental_justificacion')
+$$;
+revoke execute on function outcome_review_narrativa(jsonb) from public;
+
 -- ── Guard del cierre del outcome review (RF-07.8/07.10, SYS-24) ──
 -- Completar el review es la transición que CIERRA el loop, y sus efectos son
 -- inseparables de ella: reto cerrado con veredicto y proyecto cerrado inmutable.
@@ -988,9 +1014,14 @@ begin
     end if;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'OutcomeReviewCompletado',
-        jsonb_build_object('reviewId', new.id, 'retoId', new.reto_id,
-          'veredicto', new.veredicto,
-          'disenoExperimental', new.diseno_experimental_suficiente),
+        -- El veredicto NO es todo lo que esta escritura congela: la misma sentencia fija
+        -- la contribución, los factores externos, las hipótesis y los aprendizajes. Sin
+        -- ellos aquí, el rastro decía QUÉ se dictaminó y perdía el RAZONAMIENTO con el
+        -- que se dictaminó — que es la mitad que un post mortem existe para dejar. Y con
+        -- el `antes`, porque completar también REESCRIBE lo que hubiera en el borrador.
+        jsonb_build_object('reviewId', new.id, 'retoId', new.reto_id)
+          || outcome_review_narrativa(to_jsonb(new))
+          || jsonb_build_object('antes', outcome_review_narrativa(to_jsonb(old))),
         app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   end if;
   return new;
@@ -1271,7 +1302,10 @@ end $$;
 --   entrada_kpi     UPDATE      · EntradaKpiEditada + `antes`  · trigger (no existía)
 --   snapshot        INSERT      · SnapshotRegistrado           · trigger (era servicio)
 --   outcome_review  INSERT      · OutcomeReviewAbierto         · trigger (no existía)
---   outcome_review  UPDATE      · OutcomeReviewCompletado      · guard del cierre
+--   outcome_review  UPDATE en sitio · OutcomeReviewEditado + `antes` · trigger (no existía)
+--   outcome_review  UPDATE transición · OutcomeReviewCompletado + narrativa y `antes`
+--       · guard del cierre (el trigger de arriba se aparta en esa escritura para no
+--       emitir dos eventos por una sola)
 --   resultado_criterio INSERT   · ResultadoCriterioRegistrado  · trigger (no existía)
 --   resultado_criterio UPDATE   · ResultadoCriterioEditado + `antes` · trigger (no existía;
 --       el upsert por criterio entra por aquí, que es como Postgres resuelve el
@@ -1301,6 +1335,26 @@ end $$;
 --    que ningún trigger puede verlas. Convive con el `SnapshotRegistrado` por fila: son dos
 --    hechos distintos —«alguien pegó una tanda con N buenas y M malas» y «esta medición
 --    concreta entró»— y solo el segundo es reconstruible desde los datos.
+-- DOS FORMAS DE UPDATE, y el inventario tiene que contemplar las dos. Una fila que solo
+-- describe la TRANSICIÓN (pendiente→aprobado, borrador→firmado) se olvida de la EDICIÓN
+-- DENTRO del mismo estado, que es otra escritura legal y otro rastro. El `outcome_review`
+-- era el caso: su política admite explícitamente dejar `estado = 'borrador'`. Barrido del
+-- resto de tablas del inventario, para que la pregunta quede cerrada y no haya que
+-- rehacerla:
+--  · `metric_registry`: no hay edición en sitio POSIBLE. El grant es `(estado,
+--    firmado_por)` —ninguna columna de contenido— y `registry_firmar` exige `estado =
+--    'borrador'` en el USING y `'firmado'` en el WITH CHECK: el par hace que todo UPDATE
+--    legal SEA la transición. El contenido del contrato vive en `entrada_kpi`, no aquí.
+--  · `entrada_kpi` y `resultado_criterio`: ya cubiertos, y precisamente por lo contrario
+--    —no tienen transición, solo edición en sitio—. Sus triggers son `insert or update` y
+--    su evento lleva `antes` desde el barrido anterior.
+--  · `gate_instancia`: transición pura por política (`pendiente` en el USING, `aprobado`
+--    en el WITH CHECK), igual que el registry.
+--  · `reto` y `proyecto`: el único grant de escritura es `(estado)`, así que la única
+--    escritura del rol de aplicación es la transición y su guard la audita. `veredicto`
+--    no tiene grant: lo escribe el guard del cierre y nadie más.
+--  · `snapshot`: append-only sin política ni grant de UPDATE (SYS-23) — no hay edición
+--    que auditar, ni en sitio ni de ninguna otra forma.
 create function medicion_auditoria() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
@@ -1336,8 +1390,23 @@ begin
     cuerpo := jsonb_build_object('snapshotId', fila->'id', 'entradaId', fila->'entrada_kpi_id',
       'valor', fila->'valor', 'fecha', fila->'fecha', 'origen', fila->'origen');
   elsif tg_table_name = 'outcome_review' then
-    evento := 'OutcomeReviewAbierto';
-    cuerpo := jsonb_build_object('reviewId', fila->'id', 'retoId', fila->'reto_id');
+    -- La TRANSICIÓN —completar— ya tiene su evento en el guard del cierre, con el veredicto,
+    -- la narrativa que congela y su `antes`; emitir otro aquí sería dos eventos para una
+    -- sola escritura. Lo que faltaba es el UPDATE que NO es transición: el borrador que se
+    -- redacta y se vuelve a redactar, que la política `review_completar` admite en su WITH
+    -- CHECK (`estado = 'borrador'`) y el grant por columna permite. Sin este rastro, el post
+    -- mortem —la pieza de la que sale el veredicto de un reto— era lo único del slice que
+    -- se podía reescribir sin que nadie pudiera decir quién lo cambió ni qué reemplazó.
+    if tg_op = 'UPDATE' and fila->>'estado' <> 'borrador' then
+      return new;
+    end if;
+    evento := case tg_op when 'INSERT' then 'OutcomeReviewAbierto'
+                         else 'OutcomeReviewEditado' end;
+    cuerpo := jsonb_build_object('reviewId', fila->'id', 'retoId', fila->'reto_id')
+      || outcome_review_narrativa(fila);
+    if previa is not null then
+      cuerpo := cuerpo || jsonb_build_object('antes', outcome_review_narrativa(previa));
+    end if;
   else
     evento := case tg_op when 'INSERT' then 'ResultadoCriterioRegistrado'
                          else 'ResultadoCriterioEditado' end;
@@ -1368,7 +1437,7 @@ create trigger entrada_auditoria
 create trigger snapshot_auditoria
   after insert on snapshot for each row execute function medicion_auditoria();
 create trigger review_auditoria
-  after insert on outcome_review for each row execute function medicion_auditoria();
+  after insert or update on outcome_review for each row execute function medicion_auditoria();
 create trigger resultado_auditoria
   after insert or update on resultado_criterio for each row execute function medicion_auditoria();
 revoke execute on function medicion_auditoria() from public;

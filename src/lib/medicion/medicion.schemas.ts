@@ -291,6 +291,11 @@ export type SeguimientoDeImpacto = {
   retoEstado: string;
   retoVeredicto: VeredictoSlug | null;
   proyectoEstado: string;
+  /** El reto YA venía midiendo cuando corrió la migración de este slice, sin contrato que
+   * lo respaldara. Lo escribió la migración una sola vez y nadie más puede escribirlo; es
+   * lo que abre las dos puertas del perdón histórico —redactar el registry sobre un reto
+   * que no está 'activo' y terminar el movimiento del proyecto que se quedó atrás—. */
+  medicionSinRegistry: boolean;
   registry: { id: string; estado: 'borrador' | 'firmado'; firmadoEn: string | null } | null;
   entradas: EntradaDeRegistry[];
   /** Criterios del reto sin KPI que los responda: la firma los exige (SYS-22). */
@@ -312,6 +317,43 @@ export type SeguimientoDeImpacto = {
  */
 export function ventanaAbierta(entrada: { diasRestantes: number | null }): boolean {
   return entrada.diasRestantes === null || entrada.diasRestantes >= 0;
+}
+
+/**
+ * Espejo cliente EXACTO de lo que `abrirMedicion` acepta: informa la pantalla, no autoriza
+ * nada. Son DOS caminos, no uno.
+ *
+ * El normal —reto 'activo'— y el HEREDADO: un reto que ya estaba en medición cuando corrió
+ * la migración, cuyo proyecto se quedó en 'activo' o 'en-implementacion' porque el ciclo
+ * anterior ni siquiera le daba grant para moverse. Ese reto no tiene que moverse (ya está
+ * donde toca): lo que falta es terminarle el movimiento al proyecto, y esta es la ÚNICA
+ * puerta del producto a esa reparación. Escrito solo como `retoEstado === 'activo'`, la
+ * salida existía en el servicio y era inalcanzable desde la pantalla: el proyecto se
+ * quedaba fuera de medición y su outcome review no podía completarse, porque el guard del
+ * cierre exige que el proyecto esté midiendo. Media salida no es una salida.
+ *
+ * La condición sobre el PROYECTO es la otra mitad del espejo, y no es cosmética: la marca
+ * `medicionSinRegistry` no se borra al reparar —la migración la escribió y nadie la vuelve
+ * a escribir—, así que sin ella el botón seguiría dibujándose después del arreglo para
+ * fallar con «ningún proyecto puede pasar a medición». Lo que decide es el proyecto: solo
+ * hay algo que abrir mientras siga en 'activo' o 'en-implementacion', que son exactamente
+ * los dos estados que la operación mueve.
+ */
+export function medicionPorAbrir(seguimiento: {
+  retoEstado: string;
+  proyectoEstado: string;
+  medicionSinRegistry: boolean;
+}): boolean {
+  if (
+    seguimiento.proyectoEstado !== 'activo' &&
+    seguimiento.proyectoEstado !== 'en-implementacion'
+  ) {
+    return false;
+  }
+  return (
+    seguimiento.retoEstado === 'activo' ||
+    (seguimiento.retoEstado === 'en-medicion' && seguimiento.medicionSinRegistry)
+  );
 }
 
 /** El outcome review se habilita al cerrar la ventana del ÚLTIMO criterio (RF-07.7). */

@@ -25,6 +25,7 @@ import {
   ETIQUETA_VEREDICTO,
   etiquetaVentana,
   FRECUENCIAS,
+  medicionPorAbrir,
   VEREDICTOS,
   ventanaAbierta,
   ventanasCerradas,
@@ -151,6 +152,9 @@ function BloqueRegistry({
   const [creando, setCreando] = useState(false);
   const registry = seguimiento.registry;
   const firmado = registry?.estado === 'firmado';
+  // Quién decide esto es la base; aquí solo se ofrece lo que allí se acepta —los dos
+  // caminos, el normal y el del reto heredado—, en el mismo sitio que las demás mirillas.
+  const porAbrir = medicionPorAbrir(seguimiento);
 
   async function accion(fn: () => Promise<{ ok: boolean; error?: string }>, fallo: string) {
     setOcupado(true);
@@ -294,7 +298,7 @@ function BloqueRegistry({
         </span>
       )}
 
-      {firmado && seguimiento.retoEstado === 'activo' && esLead && g7Aprobado && (
+      {firmado && porAbrir && esLead && g7Aprobado && (
         <div>
           <Button
             size="sm"
@@ -306,11 +310,16 @@ function BloqueRegistry({
               )
             }
           >
-            Abrir la medición
+            {/* El reto heredado ya mide: lo que este botón abre es su PROYECTO, que se
+                quedó atrás. Decirle «abrir la medición» a quien ve el reto midiendo desde
+                hace meses sería ofrecerle algo que no reconoce como su problema. */}
+            {seguimiento.retoEstado === 'en-medicion'
+              ? 'Terminar de abrir la medición'
+              : 'Abrir la medición'}
           </Button>
         </div>
       )}
-      {firmado && seguimiento.retoEstado === 'activo' && esLead && !g7Aprobado && (
+      {firmado && porAbrir && esLead && !g7Aprobado && (
         <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
           La medición se abre al aprobarse el G7: primero se concilian los releases contra
           la design version y se constata el effective state.

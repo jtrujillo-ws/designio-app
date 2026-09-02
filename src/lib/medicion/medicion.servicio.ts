@@ -769,6 +769,10 @@ export async function seguimientoDeImpacto(
     const [fila] = await tx`
       select r.id as reto_id, r.codigo as reto_codigo, r.estado as reto_estado,
         r.veredicto as reto_veredicto, p.estado as proyecto_estado,
+        -- El perdón histórico también se PROYECTA: sin él la pantalla no puede distinguir
+        -- un reto que mide con su contrato de uno que mide desde antes de que el contrato
+        -- existiera, y esa distinción es la que decide si queda reparación por ofrecer.
+        r.medicion_sin_registry,
         case when mr.id is null then null else jsonb_build_object(
           'id', mr.id, 'estado', mr.estado, 'firmadoEn', mr.firmado_en::text) end as registry,
         coalesce((
@@ -894,6 +898,7 @@ export async function seguimientoDeImpacto(
       retoEstado: fila.reto_estado as string,
       retoVeredicto: fila.reto_veredicto as SeguimientoDeImpacto['retoVeredicto'],
       proyectoEstado: fila.proyecto_estado as string,
+      medicionSinRegistry: fila.medicion_sin_registry as boolean,
       registry: fila.registry as SeguimientoDeImpacto['registry'],
       entradas: fila.entradas as SeguimientoDeImpacto['entradas'],
       criteriosSinEntrada: fila.criterios_sin_entrada as SeguimientoDeImpacto['criteriosSinEntrada'],

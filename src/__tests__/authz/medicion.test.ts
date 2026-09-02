@@ -24,7 +24,11 @@ import {
   registrarSnapshot,
   seguimientoDeImpacto,
 } from '@/lib/medicion/medicion.servicio';
-import { ResultadoCriterioSchema, ventanasCerradas } from '@/lib/medicion/medicion.schemas';
+import {
+  medicionPorAbrir,
+  ResultadoCriterioSchema,
+  ventanasCerradas,
+} from '@/lib/medicion/medicion.schemas';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
 import { describeAuthz } from './helpers';
 
@@ -1396,6 +1400,38 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await conUsuario(leadId, (tx) => tx`update resultado_criterio
       set lectura = ${previo!.lectura as string}
       where id = ${previo!.id as string} and workspace_id = ${ws}`);
+
+    // Y el post mortem se REDACTA en sitio, que es un UPDATE legal que NO es la transición:
+    // `review_completar` lo admite explícitamente en su WITH CHECK (`estado = 'borrador'`) y
+    // el grant da las columnas del contenido. Auditar solo el INSERT dejaba invisible quién
+    // cambió la contribución, los factores, las hipótesis o los aprendizajes del borrador
+    // —y el evento de completación tampoco los conservaba—: el rastro del post mortem, que
+    // es de donde sale el veredicto de un reto, era el único del slice que se podía
+    // reescribir sin dejar huella.
+    const [borradorPrevio] = await admin`select contribucion, aprendizajes
+      from outcome_review where id = ${reviewId}`;
+    const redactado = 'contribución reescrita por SQL directo, sin pasar por el servicio';
+    await conUsuario(leadId, (tx) => tx`update outcome_review set contribucion = ${redactado}
+      where id = ${reviewId} and workspace_id = ${ws}`);
+    const edicion = (await de('OutcomeReviewEditado')).at(-1)!;
+    const cuerpoEdicion = edicion.payload as Record<string, unknown>;
+    expect(cuerpoEdicion.reviewId).toBe(reviewId);
+    expect(cuerpoEdicion.contribucion).toBe(redactado);
+    const antesEdicion = cuerpoEdicion.antes as Record<string, unknown>;
+    expect(antesEdicion.contribucion).toBe(borradorPrevio!.contribucion);
+    // El «antes» es la narrativa ENTERA, no solo la columna que se movió: comparar dos
+    // eventos consecutivos es lo que dice qué cambió, y para eso los dos tienen que hablar
+    // del mismo conjunto de campos.
+    expect(antesEdicion.aprendizajes).toBe(borradorPrevio!.aprendizajes);
+    expect(edicion.actor_id).toBe(leadId);
+    expect(edicion.actor_rol).toBe('lead-boutique');
+    // Redactar el borrador NO es completarlo: el evento del cierre no se emite aquí.
+    expect((await de('OutcomeReviewCompletado')).length).toBe(0);
+
+    // Se deja como estaba, igual que el resultado: lo que se probaba era el rastro.
+    await conUsuario(leadId, (tx) => tx`update outcome_review
+      set contribucion = ${borradorPrevio!.contribucion as string}
+      where id = ${reviewId} and workspace_id = ${ws}`);
   });
 
   it('el veredicto es del catálogo cerrado, honesto con los datos y exige justificar la causalidad', async () => {
@@ -1471,6 +1507,12 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       conUsuario(leadId, (tx) => tx`update reto set estado = 'cerrado' where id = ${retoId}`),
     ).rejects.toThrow(/exige el veredicto del outcome review/);
 
+    const admin = sqlAdmin();
+    const edicionesDelReview = () => admin`select 1 from evento_dominio
+      where workspace_id = ${ws} and tipo = 'OutcomeReviewEditado'
+        and payload->>'reviewId' = ${reviewId}`;
+    const edicionesAntesDelCierre = await edicionesDelReview();
+
     const r = await completarOutcomeReview(leadId, {
       workspaceId: ws,
       reviewId,
@@ -1492,11 +1534,26 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(seg!.review!.estado).toBe('completado');
     expect(seg!.review!.disenoExperimentalSuficiente).toBe(false);
 
-    const admin = sqlAdmin();
+    const edicionesTrasCierre = await edicionesDelReview();
     const [evento] = await admin`select actor_id, payload from evento_dominio
       where workspace_id = ${ws} and tipo = 'OutcomeReviewCompletado' order by creado_en desc limit 1`;
     expect(evento!.actor_id).toBe(leadId);
-    expect((evento!.payload as { veredicto: string }).veredicto).toBe('parcialmente-logrado');
+    const cuerpoCierre = evento!.payload as Record<string, unknown>;
+    expect(cuerpoCierre.veredicto).toBe('parcialmente-logrado');
+    // La completación congela el RAZONAMIENTO además del veredicto: la misma sentencia
+    // escribe contribución, factores, hipótesis y aprendizajes. Sin ellos en el evento, el
+    // rastro decía QUÉ se dictaminó y perdía CON QUÉ se dictaminó, que es la mitad que un
+    // post mortem existe para dejar. Y con su «antes», porque completar también reescribe
+    // lo que hubiera en el borrador.
+    expect(cuerpoCierre.aprendizajes).toBe('El dueño del dato debe tener acceso directo al panel');
+    expect(cuerpoCierre.factoresExternos).toBe(
+      'Campaña de nómina del cliente en el mismo trimestre',
+    );
+    expect(cuerpoCierre.disenoExperimentalSuficiente).toBe(false);
+    expect((cuerpoCierre.antes as Record<string, unknown>).veredicto).toBeNull();
+    // Un solo evento por escritura: la transición NO emite además el de la edición en
+    // sitio, aunque toque las mismas columnas y el trigger de auditoría corra en los dos.
+    expect(edicionesTrasCierre.length).toBe(edicionesAntesDelCierre.length);
 
     // Cerrado = inmutable (SYS-08): ni snapshots nuevos, ni proyecto reabierto, ni
     // review reescrito.
@@ -1737,6 +1794,11 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
 
     // Y deja de estar varado: con el contrato firmado, su G7 se aprueba y la medición abre.
     await aprobarGateNumero(7, proyectoHeredadoId);
+    // El camino NORMAL —reto activo— sigue ofreciéndose en la pantalla: el espejo del
+    // cliente ensancha el predicado, no lo cambia de sitio.
+    const segNormal = await seguimientoDeImpacto(leadId, ws, proyectoHeredadoId);
+    expect(segNormal!.retoEstado).toBe('activo');
+    expect(medicionPorAbrir(segNormal!)).toBe(true);
     const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: retoHeredadoId });
     expect(abierto.proyectos).toBe(1);
   });
@@ -1859,6 +1921,18 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
 
     await aprobarGateNumero(7, actVieja.proyectoId);
 
+    // La reparación tiene que estar OFRECIDA, no solo existir. La pantalla decide con el
+    // espejo del cliente, y escrito como «el reto está activo» a secas no se dibujaba
+    // nunca para el ÚNICO caso que necesita esta operación: el reto heredado ya mide, así
+    // que jamás está activo. La salida existía en el servicio y era inalcanzable desde el
+    // producto —y sin ella el proyecto se queda fuera de medición y su outcome review no
+    // puede completarse, porque el guard del cierre exige que el proyecto esté midiendo.
+    const segAntes = await seguimientoDeImpacto(leadId, ws, actVieja.proyectoId);
+    expect(segAntes!.medicionSinRegistry).toBe(true);
+    expect(segAntes!.retoEstado).toBe('en-medicion');
+    expect(segAntes!.proyectoEstado).toBe('en-implementacion');
+    expect(medicionPorAbrir(segAntes!)).toBe(true);
+
     // El reto ya está donde toca; lo que faltaba era su PROYECTO, que bajo el ciclo
     // anterior ni siquiera tenía grant para moverse. La operación lo termina en vez de
     // negarse, que es lo que dejaba el tablero mintiendo sin forma de arreglarlo.
@@ -1867,6 +1941,11 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const seg = await seguimientoDeImpacto(leadId, ws, actVieja.proyectoId);
     expect(seg!.retoEstado).toBe('en-medicion');
     expect(seg!.proyectoEstado).toBe('en-medicion');
+    // Y deja de ofrecerse en cuanto no queda nada que abrir. La marca del perdón histórico
+    // no se borra al reparar —la escribió la migración y nadie la vuelve a escribir—, así
+    // que un espejo que mirara solo la marca seguiría dibujando el botón para que fallara.
+    // Lo que decide es el PROYECTO, que es lo que la operación mueve.
+    expect(medicionPorAbrir(seg!)).toBe(false);
     // Y ya no está encerrado: con la ventana cerrada, el post mortem se abre y podrá
     // dictar un veredicto de verdad en vez de quedarse sin salida.
     const review = await abrirOutcomeReview(leadId, { workspaceId: ws, retoId: viejo.retoId });

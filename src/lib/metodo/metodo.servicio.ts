@@ -240,10 +240,16 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
     try {
       // El evento ItemMarcado (con lo previo) lo emite el guard de la transición
       // DENTRO de este UPDATE — también para SQL directo, mismo snapshot y rol.
+      // Cumplir cita EXACTAMENTE un objeto real (RF-04.5): la clase decide en cuál de
+      // las tres columnas aterriza el enlace; las otras dos quedan nulas (el CHECK de
+      // la tabla exige num_nonnulls = 1, así que un bug aquí revienta, no se cuela).
+      const cumplido = a.tipo === 'cumplido' ? a : null;
       filas = await tx`
         update checklist_item
         set estado = ${a.tipo},
-            evidencia_id = ${a.tipo === 'cumplido' ? a.evidenciaId : null},
+            evidencia_id = ${cumplido?.objetoClase === 'evidencia' ? cumplido.objetoId : null},
+            insight_id = ${cumplido?.objetoClase === 'insight' ? cumplido.objetoId : null},
+            decision_id = ${cumplido?.objetoClase === 'decision' ? cumplido.objetoId : null},
             na_justificacion = ${a.tipo === 'na' ? a.justificacion : ''},
             na_aprobado_por = ${a.tipo === 'na' ? actorId : null}
         where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
@@ -256,9 +262,13 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
       if (code === '42501') {
         throw new ErrorMetodo('Solo lead o diseñador marcan cumplido/pendiente');
       }
-      // FK compuesta (23503): la evidencia enlazada no existe en este workspace.
+      // FK compuesta (23503): el objeto citado no existe en este workspace.
       if (code === '23503') {
-        throw new ErrorMetodo('La evidencia enlazada no existe en este workspace');
+        throw new ErrorMetodo('El objeto enlazado no existe en este workspace');
+      }
+      // Guard de la base (P0001): la decisión citada es de otro proyecto.
+      if (code === 'P0001' && (e as { message?: string }).message) {
+        throw new ErrorMetodo((e as { message: string }).message);
       }
       throw e;
     }
@@ -445,12 +455,23 @@ export async function proyectoMetodo(
             'estado', g.estado, 'aprobadoEn', g.aprobado_en::text,
             'items', coalesce((select jsonb_agg(jsonb_build_object(
                 'id', ci.id, 'orden', ci.orden, 'texto', ci.texto, 'estado', ci.estado,
-                'evidenciaId', ci.evidencia_id, 'evidenciaTitulo', ev.titulo,
+                -- Un ítem cumplido cita exactamente un objeto (CHECK de la tabla): la
+                -- clase y el título salen del que esté enlazado, sin ambigüedad.
+                'objetoClase', case
+                  when ci.evidencia_id is not null then 'evidencia'
+                  when ci.insight_id is not null then 'insight'
+                  when ci.decision_id is not null then 'decision' end,
+                'objetoId', coalesce(ci.evidencia_id, ci.insight_id, ci.decision_id),
+                'objetoTitulo', coalesce(ev.titulo, ins.titulo, dec.titulo),
                 'naJustificacion', ci.na_justificacion)
                 order by ci.orden)
               from checklist_item ci
               left join evidencia ev
                 on ev.id = ci.evidencia_id and ev.workspace_id = ci.workspace_id
+              left join insight ins
+                on ins.id = ci.insight_id and ins.workspace_id = ci.workspace_id
+              left join decision dec
+                on dec.id = ci.decision_id and dec.workspace_id = ci.workspace_id
               where ci.gate_id = g.id and ci.workspace_id = g.workspace_id), '[]'::jsonb))
             order by g.numero)
           from gate_instancia g

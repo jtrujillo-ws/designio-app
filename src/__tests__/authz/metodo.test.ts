@@ -265,7 +265,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
       await marcarItem(leadId, {
         workspaceId: ws,
         itemId: item.id,
-        accion: { tipo: 'cumplido', evidenciaId },
+        accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evidenciaId },
       });
     }
     // El sponsor no es el rol de G1 (lead) — bloqueado aunque el checklist esté limpio.
@@ -294,7 +294,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
       await marcarItem(leadId, {
         workspaceId: ws,
         itemId: item.id,
-        accion: { tipo: 'cumplido', evidenciaId },
+        accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evidenciaId },
       });
     }
     await expect(aprobarGate(leadId, { workspaceId: ws, gateId: g4.id })).rejects.toThrow(
@@ -320,7 +320,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
       marcarItem(leadId, {
         workspaceId: ws,
         itemId: item.id,
-        accion: { tipo: 'cumplido', evidenciaId: crypto.randomUUID() },
+        accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: crypto.randomUUID() },
       }),
     ).rejects.toThrow(ErrorMetodo);
 
@@ -371,7 +371,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
     await marcarItem(leadId, {
       workspaceId: ws,
       itemId: g3.items[0]!.id,
-      accion: { tipo: 'cumplido', evidenciaId },
+      accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evidenciaId },
     });
     await expect(
       marcarItem(sponsorId, {
@@ -391,7 +391,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
       marcarItem(stakeId, {
         workspaceId: ws,
         itemId: item.id,
-        accion: { tipo: 'cumplido', evidenciaId },
+        accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evidenciaId },
       }),
     ).rejects.toThrow(ErrorMetodo);
   });
@@ -463,7 +463,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
       await marcarItem(leadId, {
         workspaceId: ws,
         itemId: item.id,
-        accion: { tipo: 'cumplido', evidenciaId },
+        accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evidenciaId },
       });
     }
 

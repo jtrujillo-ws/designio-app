@@ -1,6 +1,6 @@
 import { createServerFn } from '@tanstack/react-start';
 import { deleteCookie, getRequestIP, setCookie } from '@tanstack/react-start/server';
-import { requerirUsuarioId, usuarioIdDeRequest } from './guardia.server';
+import { usuarioIdDeRequest } from './guardia.server';
 import { EstablecerPasswordSchema, InvitarMiembroSchema, LoginSchema } from './auth.schemas';
 import {
   activarConToken,
@@ -88,7 +88,12 @@ export const establecerPassword = createServerFn({ method: 'POST' })
 export const invitarMiembro = createServerFn({ method: 'POST' })
   .inputValidator(InvitarMiembroSchema)
   .handler(async ({ data }) => {
-    const actorId = await requerirUsuarioId();
+    // Contrato uniforme de las MUTACIONES: siempre {ok, ...} — sin sesión incluido
+    // (en loaders/guards de ruta sí se lanza: ahí el throw alimenta el redirect).
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) {
+      return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    }
     try {
       const r = await crearInvitacion(actorId, data);
       // MVP sin correo saliente: cuando esta llamada emite un enlace, se le entrega a quien

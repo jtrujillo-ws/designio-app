@@ -14,6 +14,7 @@ import {
   veredictoDeArquetipo,
 } from '@/lib/metodo/gobernanza.functions';
 import {
+  ETIQUETA_ALCANCE,
   ETIQUETA_TIPO_DECISION,
   TIPOS_DECISION,
   type GobernanzaDeProyecto,
@@ -95,6 +96,7 @@ export function SeccionGobernanza({
         workspaceId={workspaceId}
         proyecto={proyecto}
         reaperturas={gobernanza.reaperturas}
+        insightsValidados={insightsValidados}
         esLead={esLead}
         onCambio={onCambio}
         onError={onError}
@@ -556,6 +558,7 @@ function BloqueReaperturas({
   workspaceId,
   proyecto,
   reaperturas,
+  insightsValidados,
   esLead,
   onCambio,
   onError,
@@ -563,6 +566,7 @@ function BloqueReaperturas({
   workspaceId: string;
   proyecto: ProyectoMetodo;
   reaperturas: GobernanzaDeProyecto['reaperturas'];
+  insightsValidados: { id: string; titulo: string }[];
   esLead: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -570,6 +574,7 @@ function BloqueReaperturas({
   const [abierto, setAbierto] = useState(false);
   const [etapaNumero, setEtapaNumero] = useState(0);
   const [motivo, setMotivo] = useState('');
+  const [declarados, setDeclarados] = useState<string[]>([]);
   const [ocupado, setOcupado] = useState(false);
 
   async function reabrir() {
@@ -577,11 +582,18 @@ function BloqueReaperturas({
     onError(null);
     try {
       const r = await reabrirEtapaDelProyecto({
-        data: { workspaceId, proyectoId: proyecto.id, etapaNumero, motivo },
+        data: {
+          workspaceId,
+          proyectoId: proyecto.id,
+          etapaNumero,
+          motivo,
+          insightIds: declarados,
+        },
       });
       if (r.ok) {
         setAbierto(false);
         setMotivo('');
+        setDeclarados([]);
         await onCambio();
       } else onError(r.error);
     } catch {
@@ -598,7 +610,9 @@ function BloqueReaperturas({
       </span>
       <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
         Reabrir no borra la aprobación del gate — es historia con firma y fecha. Marca para
-        revisión las decisiones tomadas de esa etapa en adelante (RF-04.9, SYS-10).
+        revisión las decisiones AFECTADAS (RF-04.9, SYS-10): si declaras qué insights
+        cambiaron, solo se marcan las que se apoyan en ellos; si no declaras ninguno, se
+        marca la etapa entera hacia adelante y así queda registrado.
       </span>
 
       {reaperturas.length === 0 && (
@@ -610,10 +624,17 @@ function BloqueReaperturas({
         <div key={r.id} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
           <span style={{ font: '600 12.5px var(--font-sans)', color: 'var(--ink)' }}>
             Etapa {r.etapaNumero} · {r.reabiertoEn} · {r.decisionesMarcadas} decisiones marcadas
+            {' · '}
+            {ETIQUETA_ALCANCE[r.alcance]}
           </span>
           <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-body)' }}>
             {r.motivo}
           </span>
+          {r.insights.length > 0 && (
+            <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+              Cambió: {r.insights.map((i) => i.titulo).join(', ')}
+            </span>
+          )}
         </div>
       ))}
 
@@ -638,6 +659,38 @@ function BloqueReaperturas({
             value={motivo}
             onChange={(e) => setMotivo(e.target.value)}
           />
+          {insightsValidados.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
+                Qué insights cambiaron (opcional; acota qué decisiones entran en revisión)
+              </span>
+              {insightsValidados.map((i) => (
+                <label
+                  key={i.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    font: '400 12.5px var(--font-sans)',
+                    color: 'var(--text-body)',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={declarados.includes(i.id)}
+                    onChange={(e) =>
+                      setDeclarados((previos) =>
+                        e.target.checked
+                          ? [...previos, i.id]
+                          : previos.filter((id) => id !== i.id),
+                      )
+                    }
+                  />
+                  {i.titulo}
+                </label>
+              ))}
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 8 }}>
             <Button size="sm" disabled={ocupado || motivo.trim() === ''} onClick={() => void reabrir()}>
               Reabrir

@@ -175,7 +175,7 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
         afirmacionId: af.afirmacionId,
         evidenciaId: evidenciaAjenaId,
         fragmento: 'Robado',
-        localizacion: '',
+        localizacion: 'p. 1',
       }),
     ).rejects.toThrow(/no existe en este workspace/);
   });

@@ -121,6 +121,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     const admin = sqlAdmin();
     if (ws) {
       await admin`delete from evento_dominio where workspace_id = ${ws}`;
+      await admin`delete from reapertura_insight where workspace_id = ${ws}`;
       await admin`delete from reapertura_etapa where workspace_id = ${ws}`;
       // El checklist cita insights y decisiones: se borra ANTES que ellos.
       await admin`delete from checklist_item where workspace_id = ${ws}`;
@@ -202,14 +203,36 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     expect(item.objetoClase).toBe('insight');
     expect(item.objetoTitulo).toBe('Fricción documental');
 
-    // Un objeto de otro tipo pero inexistente lo para la FK compuesta.
+    // Una decisión inexistente no cumple nada.
     await expect(
       marcarItem(leadId, {
         workspaceId: ws,
         itemId: g1.items[1]!.id,
         accion: { tipo: 'cumplido', objetoClase: 'decision', objetoId: crypto.randomUUID() },
       }),
-    ).rejects.toThrow(/no existe en este workspace/);
+    ).rejects.toThrow(/no existe en este proyecto/);
+
+    // Y una decisión REAL de OTRO proyecto del mismo workspace tampoco: la FK compuesta
+    // solo garantiza el workspace, así que sin el guard esta petición fabricada cumpliría
+    // un gate del proyecto A con la cadena del proyecto B.
+    const admin = sqlAdmin();
+    const [p2] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, ${'P-AJENO-' + marca}, 'Proyecto vecino', ${leadId}) returning id`;
+    const [gAjeno] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${p2!.id as string}, 1, 'lead-boutique') returning id`;
+    const [dAjena] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, decidido_por)
+      values (${ws}, ${p2!.id as string}, ${gAjeno!.id as string}, 'otra',
+              'Decisión del vecino', ${leadId}) returning id`;
+
+    await expect(
+      marcarItem(leadId, {
+        workspaceId: ws,
+        itemId: g1.items[1]!.id,
+        accion: { tipo: 'cumplido', objetoClase: 'decision', objetoId: dAjena!.id as string },
+      }),
+    ).rejects.toThrow(/no existe en este proyecto/);
   });
 
   it('confirmar un arquetipo exige evidencia; G2 no aprueba con hipótesis colgando', async () => {
@@ -302,11 +325,13 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
       insightIds: [insightId],
     });
 
+    // Sin declarar insights: la reapertura dice que se movió el suelo entero.
     const r = await reabrirEtapa(leadId, {
       workspaceId: ws,
       proyectoId,
       etapaNumero: 1,
       motivo: 'Llegaron entrevistas nuevas que cambian el diagnóstico',
+      insightIds: [],
     });
     expect(r.decisionesMarcadas).toBe(2);
 
@@ -314,6 +339,8 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     expect(g!.decisiones.every((d) => d.estado === 'en-revision')).toBe(true);
     expect(g!.reaperturas).toHaveLength(1);
     expect(g!.reaperturas[0]!.decisionesMarcadas).toBe(2);
+    expect(g!.reaperturas[0]!.alcance).toBe('etapa-completa');
+    expect(g!.reaperturas[0]!.insights).toEqual([]);
 
     // La etapa vuelve a curso; la historia del gate permanece intacta.
     const p = await proyectoMetodo(leadId, ws, proyectoId);
@@ -332,8 +359,76 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
         proyectoId,
         etapaNumero: 2,
         motivo: 'Intruso',
+        insightIds: [],
       }),
     ).rejects.toThrow(ErrorGobernanza);
+  });
+
+  it('declarar qué insight cambió acota la marca a las decisiones que se apoyan en él', async () => {
+    // Un segundo insight validado, y una decisión en G3 que se apoya SOLO en él.
+    const otro = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'Los independientes no tienen el documento a mano',
+      resumen: '',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: otro.insightId,
+      texto: 'El 40% intenta la apertura fuera de su casa',
+      esHipotesis: false,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId,
+      fragmento: 'Ocho de veinte lo intentaron desde el trabajo',
+      localizacion: 'p. 3',
+    });
+    await validarInsight(leadId, ws, otro.insightId);
+
+    const dependiente = await registrarDecision(leadId, {
+      workspaceId: ws,
+      gateId: gateG3,
+      tipo: 'diseno',
+      titulo: 'Permitir subir el documento después',
+      fundamento: '',
+      insightIds: [otro.insightId],
+    });
+
+    // Antes de reabrir, todas vigentes (el test anterior revalidó la única marcada
+    // que quedaba en revisión; se revalidan las demás para partir de un estado limpio).
+    const previa = await gobernanzaDeProyecto(leadId, ws, proyectoId);
+    for (const d of previa!.decisiones.filter((x) => x.estado === 'en-revision')) {
+      await revalidarDecision(leadId, ws, d.id);
+    }
+
+    const r = await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      etapaNumero: 1,
+      motivo: 'Una entrevista contradice el segundo insight',
+      insightIds: [otro.insightId],
+    });
+    // Solo la decisión que se apoya en el insight declarado, no la etapa entera.
+    expect(r.decisionesMarcadas).toBe(1);
+
+    const g = await gobernanzaDeProyecto(leadId, ws, proyectoId);
+    expect(g!.decisiones.find((d) => d.id === dependiente.decisionId)!.estado).toBe('en-revision');
+    expect(g!.decisiones.filter((d) => d.estado === 'en-revision')).toHaveLength(1);
+    const ultima = g!.reaperturas[0]!;
+    expect(ultima.alcance).toBe('declarado');
+    expect(ultima.insights.map((i) => i.id)).toEqual([otro.insightId]);
+
+    // Declarar un insight que no existe revierte la reapertura entera.
+    await expect(
+      reabrirEtapa(leadId, {
+        workspaceId: ws,
+        proyectoId,
+        etapaNumero: 1,
+        motivo: 'Declaración falsa',
+        insightIds: [crypto.randomUUID()],
+      }),
+    ).rejects.toThrow(/no existe en este workspace/);
   });
 
   it('las escrituras directas de gobernanza respetan RLS', async () => {
@@ -352,4 +447,113 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
         values (${ws}, ${proyectoId}, ${gateG1}, 'otra', 'Firmada por otro', ${sponsorId})`),
     ).rejects.toThrow(/row-level security/);
   });
+
+  it('una decisión no se apoya en un insight que nadie validó', async () => {
+    const propuesto = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'Sospecha sin sostener',
+      resumen: '',
+    });
+    // El picker solo ofrece validados, pero el endpoint acepta cualquier uuid: sin el
+    // filtro, una decisión aprobada podría apoyarse entera en algo que nadie sostuvo.
+    await expect(
+      registrarDecision(leadId, {
+        workspaceId: ws,
+        gateId: gateG1,
+        tipo: 'otra',
+        titulo: 'Decisión sin cadena',
+        fundamento: '',
+        insightIds: [propuesto.insightId],
+      }),
+    ).rejects.toThrow(/todavía no está validado/);
+  });
+
+  it('con G2 aprobado no se cuelan arquetipos nuevos; la reapertura abre la puerta', async () => {
+    // Se resuelve la hipótesis pendiente y se aprueba G2 de verdad.
+    const g = await gobernanzaDeProyecto(leadId, ws, proyectoId);
+    const pendiente = g!.arquetipos.find((a) => a.estado === 'hipotesis')!;
+    await darVeredictoArquetipo(disenadorId, {
+      workspaceId: ws,
+      arquetipoId: pendiente.id,
+      estado: 'refutado',
+      razon: 'No apareció en ninguna de las veinte entrevistas',
+    });
+    const p = await proyectoMetodo(leadId, ws, proyectoId);
+    await aprobarGate(leadId, { workspaceId: ws, gateId: p!.gates[2]!.id });
+
+    // Un arquetipo nuevo ahora quedaría sin resolver para siempre: G2 es inmutable y su
+    // guard solo corre al aprobar, así que nadie volvería a mirarlo.
+    await expect(
+      crearArquetipo(disenadorId, {
+        workspaceId: ws,
+        retoId,
+        nombre: 'Colado después de G2',
+        definicion: '',
+        segmentoIds: [],
+      }),
+    ).rejects.toThrow(ErrorGobernanza);
+
+    // La vía existe y queda trazada: reabrir la etapa 2.
+    await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      etapaNumero: 2,
+      motivo: 'Apareció un perfil que no habíamos visto',
+      insightIds: [],
+    });
+    const nuevo = await crearArquetipo(disenadorId, {
+      workspaceId: ws,
+      retoId,
+      nombre: 'Perfil tardío',
+      definicion: '',
+      segmentoIds: [],
+    });
+    expect(nuevo.arquetipoId).toBeTruthy();
+  });
+
+  it('reabrir la etapa 0 SÍ deja cambiar los criterios que motivaron la reapertura', async () => {
+    // G0 está aprobado desde el test de G2: sin reapertura, los criterios están cerrados.
+    await expect(
+      agregarCriterio(leadId, {
+        workspaceId: ws,
+        retoId,
+        kpi: 'A destiempo',
+        definicion: 'x',
+        lineaBaseValor: '1',
+        lineaBaseFecha: '2026-07-15',
+        lineaBasePlan: '',
+        objetivo: '2',
+        ventanaDias: 30,
+        fechaPostMortem: null,
+      }),
+    ).rejects.toThrow();
+
+    await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      etapaNumero: 0,
+      motivo: 'El sponsor corrigió la línea base',
+      insightIds: [],
+    });
+
+    // Y ahora sí: es exactamente el cambio para el que existe la reapertura. La
+    // aprobación de G0 sigue en pie — reabrir cuestiona, no borra.
+    const c = await agregarCriterio(leadId, {
+      workspaceId: ws,
+      retoId,
+      kpi: 'Abandono corregido',
+      definicion: 'Porcentaje real medido en sucursal',
+      lineaBaseValor: '58%',
+      lineaBaseFecha: '2026-08-01',
+      lineaBasePlan: '',
+      objetivo: '40%',
+      ventanaDias: 90,
+      fechaPostMortem: null,
+    });
+    expect(c.criterioId).toBeTruthy();
+    const p = await proyectoMetodo(leadId, ws, proyectoId);
+    expect(p!.gates[0]!.estado).toBe('aprobado');
+    expect(p!.etapas[0]!.estado).toBe('en-curso');
+  });
+
 });

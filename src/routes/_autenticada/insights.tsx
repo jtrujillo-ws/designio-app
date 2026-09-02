@@ -307,7 +307,7 @@ function FichaInsight({
             {a.citas.map((c) => (
               <span key={c.id} style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
                 «{c.fragmento}» — {c.evidenciaTitulo}
-                {c.localizacion ? ` · ${c.localizacion}` : ''}
+                {` · ${c.localizacion}`}
               </span>
             ))}
             {editable && puedeCurar && citandoDe !== a.id && (
@@ -337,15 +337,23 @@ function FichaInsight({
                   value={fragmento}
                   onChange={(e) => setFragmento(e.target.value)}
                 />
+                {/* Obligatoria: la cita tiene que devolver al PUNTO. Sin esto vuelve a
+                    ser una referencia al documento, que es lo que no sirve al auditar. */}
                 <Input
-                  placeholder="Dónde está (página, párrafo o marca de tiempo)"
+                  placeholder="Dónde está (página, párrafo o marca de tiempo) — obligatorio"
                   value={localizacion}
                   onChange={(e) => setLocalizacion(e.target.value)}
+                  required
                 />
                 <div style={{ display: 'flex', gap: 8 }}>
                   <Button
                     size="sm"
-                    disabled={ocupado || evidenciaId === '' || fragmento.trim() === ''}
+                    disabled={
+                      ocupado ||
+                      evidenciaId === '' ||
+                      fragmento.trim() === '' ||
+                      localizacion.trim() === ''
+                    }
                     onClick={() =>
                       void ejecutar(
                         () =>

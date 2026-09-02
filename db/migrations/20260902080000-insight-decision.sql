@@ -54,7 +54,9 @@ create table cita (
   afirmacion_id uuid not null,
   evidencia_id uuid not null,
   fragmento text not null check (btrim(fragmento) <> ''),
-  localizacion text not null default '',
+  -- Sin localización la cita apunta al documento y no al punto: deja de cumplir su
+  -- promesa (volver al fragmento exacto) justo cuando alguien la audita.
+  localizacion text not null check (btrim(localizacion) <> ''),
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
@@ -160,6 +162,11 @@ create table reapertura_etapa (
   proyecto_id uuid not null,
   etapa_numero integer not null check (etapa_numero between 0 and 7),
   motivo text not null check (btrim(motivo) <> ''),
+  -- 'declarado': la reapertura nombró los insights que cambiaron y solo se marcaron
+  -- las decisiones que se apoyan en ellos. 'etapa-completa': no se nombró ninguno y se
+  -- marcó todo de esa etapa en adelante. El tablero muestra cuál fue, porque el alcance
+  -- de una reapertura es parte de lo que se está diciendo.
+  alcance text not null check (alcance in ('declarado', 'etapa-completa')),
   decisiones_marcadas integer not null default 0,
   reabierto_por uuid not null references usuario(id),
   reabierto_en timestamptz not null default now(),
@@ -167,6 +174,89 @@ create table reapertura_etapa (
   foreign key (proyecto_id, workspace_id) references proyecto (id, workspace_id)
 );
 create index reapertura_proyecto_idx on reapertura_etapa (workspace_id, proyecto_id);
+
+-- Los insights que la reapertura declara cambiados (RF-04.9: «registra motivo y
+-- cambios»). Sin esto «decisiones aguas abajo AFECTADAS» no se puede computar y solo
+-- queda barrer la etapa entera, que marca de más y enseña a ignorar la marca.
+create table reapertura_insight (
+  reapertura_id uuid not null,
+  insight_id uuid not null,
+  workspace_id uuid not null references workspace(id),
+  primary key (reapertura_id, insight_id),
+  foreign key (reapertura_id, workspace_id) references reapertura_etapa (id, workspace_id),
+  foreign key (insight_id, workspace_id) references insight (id, workspace_id)
+);
+create index reapertura_insight_ins_idx on reapertura_insight (workspace_id, insight_id);
+
+-- ── La reapertura de la etapa 0 tiene que poder cambiar los criterios ──
+-- Tal como estaban, `criterio_insert`/`criterio_update` rechazaban toda escritura en
+-- cuanto existía un G0 aprobado. Reabrir la etapa 0 devolvía la etapa a 'en-curso'
+-- y NADA más: el cambio de criterios para el que existe la reapertura seguía sin poder
+-- hacerse. Se reemplazan para admitir exactamente ese caso — G0 aprobado PERO la etapa
+-- 0 reabierta — sin desaprobar el gate (una aprobación es un hecho histórico, SYS-10).
+drop policy criterio_insert on criterio_exito;
+drop policy criterio_update on criterio_exito;
+
+-- El guard que congela los criterios tiene la misma ceguera que las políticas: mira
+-- «¿G0 aprobado?» y no «¿la etapa 0 está reabierta?». Se reemplaza conservando todo lo
+-- demás (candado por G0 en orden estable, evento de la transición).
+create or replace function criterio_g0_pendiente_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  perform 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id and g.numero = 0
+    order by g.id for update of g;
+  if exists (select 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+      and e.numero = 0
+    where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id
+      and g.numero = 0 and g.estado = 'aprobado'
+      -- La etapa 0 REABIERTA es la excepción: es el cambio para el que existe la
+      -- reapertura. La aprobación del gate sigue en pie (SYS-10: se cuestiona, no se
+      -- borra), y el evento de abajo deja el rastro de qué se tocó después.
+      and e.estado <> 'en-curso') then
+    raise exception 'el G0 del reto está aprobado: criterios congelados';
+  end if;
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id,
+      case tg_op when 'INSERT' then 'CriterioDefinido' else 'CriterioEditado' end,
+      jsonb_build_object('criterioId', new.id, 'retoId', new.reto_id, 'kpi', new.kpi),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  return new;
+end $$;
+
+create policy criterio_insert on criterio_exito
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and creado_por = app_user_id()
+    and not exists (select 1 from gate_instancia g
+      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+      join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+        and e.numero = 0
+      where p.reto_id = criterio_exito.reto_id
+        and p.workspace_id = criterio_exito.workspace_id
+        and g.numero = 0 and g.estado = 'aprobado'
+        and e.estado <> 'en-curso')
+  );
+create policy criterio_update on criterio_exito
+  for update
+  using (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and not exists (select 1 from gate_instancia g
+      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+      join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+        and e.numero = 0
+      where p.reto_id = criterio_exito.reto_id
+        and p.workspace_id = criterio_exito.workspace_id
+        and g.numero = 0 and g.estado = 'aprobado'
+        and e.estado <> 'en-curso')
+  )
+  with check (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'));
 
 -- ── El checklist enlaza los TRES objetos citables que exige RF-04.5 ──
 alter table checklist_item add column insight_id uuid;
@@ -214,6 +304,7 @@ alter table arquetipo enable row level security;
 alter table arquetipo_segmento enable row level security;
 alter table arquetipo_evidencia enable row level security;
 alter table reapertura_etapa enable row level security;
+alter table reapertura_insight enable row level security;
 
 create policy insight_select on insight
   for select using (is_workspace_member(app_user_id(), workspace_id));
@@ -234,6 +325,8 @@ create policy arquetipo_segmento_select on arquetipo_segmento
 create policy arquetipo_evidencia_select on arquetipo_evidencia
   for select using (is_workspace_member(app_user_id(), workspace_id));
 create policy reapertura_select on reapertura_etapa
+  for select using (is_workspace_member(app_user_id(), workspace_id));
+create policy reapertura_insight_select on reapertura_insight
   for select using (is_workspace_member(app_user_id(), workspace_id));
 
 -- Insight: nace PROPUESTO (nadie se auto-valida en el insert) y atribuido.
@@ -302,11 +395,26 @@ create policy decision_insight_insert on decision_insight
 
 -- Arquetipos: curadores los definen y les dan veredicto; el enlace a evidencia y
 -- segmentos es aditivo (quitar apoyo a un arquetipo confirmado sería reescribir).
+-- Un arquetipo nace hipótesis, y solo mientras G2 esté por decidirse. Si G2 ya se
+-- aprobó, agregar una hipótesis dejaría al proyecto con un arquetipo sin resolver para
+-- siempre: G2 es inmutable y su guard solo corre al aprobar, así que nadie volvería a
+-- mirarlo. La vía para hacerlo es la que ya existe y queda trazada — reabrir la etapa 2,
+-- que la devuelve a 'en-curso'.
 create policy arquetipo_insert on arquetipo
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and creado_por = app_user_id()
     and estado = 'hipotesis'
+    and not exists (
+      select 1 from gate_instancia g
+      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+      join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+        and e.numero = 2
+      where p.reto_id = arquetipo.reto_id
+        and p.workspace_id = arquetipo.workspace_id
+        and g.numero = 2 and g.estado = 'aprobado'
+        and e.estado <> 'en-curso'
+    )
   );
 create policy arquetipo_veredicto on arquetipo
   for update
@@ -329,6 +437,15 @@ create policy reapertura_insert on reapertura_etapa
   for insert with check (
     workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
     and reabierto_por = app_user_id()
+  );
+-- Los insights declarados solo los cuelga un lead; sin update ni delete, la declaración
+-- es lo que se dijo. La autoría NO se comprueba aquí a propósito: la fila hermana de
+-- reapertura_etapa se inserta en la MISMA sentencia y las sub-consultas de un WITH
+-- comparten snapshot, así que el exists nunca la vería. La comprueba el constraint
+-- trigger diferido de abajo, que corre al commit y ya la ve.
+create policy reapertura_insight_insert on reapertura_insight
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
   );
 
 -- ── Guard: confirmar un arquetipo exige evidencia enlazada ──
@@ -482,11 +599,59 @@ begin
   return new;
 end $$;
 
+-- ── La declaración de cambios es de la propia reapertura ──
+-- Diferido al commit porque es exactamente el caso que la política no puede ver: la
+-- reapertura y sus insights nacen en una sola sentencia.
+create function reapertura_insight_autor_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if not exists (select 1 from reapertura_etapa r
+    where r.id = new.reapertura_id and r.workspace_id = new.workspace_id
+      and r.reabierto_por = app_user_id()) then
+    raise exception 'solo se declaran cambios en la propia reapertura';
+  end if;
+  return new;
+end $$;
+create constraint trigger reapertura_insight_autor
+  after insert on reapertura_insight
+  deferrable initially deferred
+  for each row execute function reapertura_insight_autor_guard();
+revoke execute on function reapertura_insight_autor_guard() from public;
+
+-- ── La decisión citada tiene que ser DE ESTE proyecto ──
+-- La FK compuesta garantiza el workspace, no el proyecto: con ella sola, una petición
+-- fabricada cumple un gate del proyecto A citando una decisión del proyecto B. Va en la
+-- base y no en el servicio porque el SQL directo tampoco debe poder hacerlo.
+create function checklist_decision_mismo_proyecto_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if new.decision_id is not null and not exists (
+    select 1 from decision d
+    join gate_instancia g on g.id = new.gate_id and g.workspace_id = new.workspace_id
+    where d.id = new.decision_id and d.workspace_id = new.workspace_id
+      and d.proyecto_id = g.proyecto_id) then
+    -- Un solo mensaje para los dos casos porque los dos son lo mismo desde aquí: la
+    -- decisión no está donde el ítem la busca (no existe, o es de otro proyecto).
+    raise exception 'la decisión citada no existe en este proyecto';
+  end if;
+  return new;
+end $$;
+create trigger checklist_decision_mismo_proyecto
+  before insert or update on checklist_item
+  for each row execute function checklist_decision_mismo_proyecto_guard();
+revoke execute on function checklist_decision_mismo_proyecto_guard() from public;
+
 -- ── Grants mínimos ──
 grant select, insert on insight, afirmacion, cita, contradiccion to designio_app;
 grant select, insert on decision, decision_insight to designio_app;
 grant select, insert on arquetipo, arquetipo_segmento, arquetipo_evidencia to designio_app;
-grant select, insert on reapertura_etapa to designio_app;
+grant select, insert on reapertura_etapa, reapertura_insight to designio_app;
 -- Solo la transición de validación (nunca el contenido de un insight).
 grant update (estado, validado_por, validado_en) on insight to designio_app;
 -- Solo el veredicto del arquetipo (nunca renombrarlo ni redefinirlo).

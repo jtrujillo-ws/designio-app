@@ -60,6 +60,13 @@ export const ReabrirEtapaSchema = z.object({
   proyectoId: z.string().uuid(),
   etapaNumero: z.number().int().min(0).max(7),
   motivo: z.string().trim().min(1, 'El motivo de la reapertura es obligatorio').max(2000),
+  /**
+   * Los insights que la reapertura declara cambiados (RF-04.9: «registra motivo y
+   * cambios»). Si se declaran, solo entran en revisión las decisiones que se apoyan en
+   * ellos; si se deja vacío, se marca la etapa entera hacia adelante y así queda
+   * registrado. Declarar es lo preciso; barrer es lo honesto cuando no se puede acotar.
+   */
+  insightIds: z.array(z.string().uuid()).max(50).default([]),
 });
 export type ReabrirEtapa = z.infer<typeof ReabrirEtapaSchema>;
 
@@ -85,11 +92,20 @@ export type ArquetipoDeReto = {
   evidencias: { id: string; titulo: string }[];
 };
 
+export type AlcanceReapertura = 'declarado' | 'etapa-completa';
+
+export const ETIQUETA_ALCANCE: Record<AlcanceReapertura, string> = {
+  declarado: 'insights declarados',
+  'etapa-completa': 'etapa completa',
+};
+
 export type ReaperturaDeProyecto = {
   id: string;
   etapaNumero: number;
   motivo: string;
+  alcance: AlcanceReapertura;
   decisionesMarcadas: number;
+  insights: { id: string; titulo: string }[];
   reabiertoEn: string;
 };
 

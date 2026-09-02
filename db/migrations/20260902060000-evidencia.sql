@@ -52,10 +52,12 @@ create table item_importacion (
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
   foreign key (evidencia_id, workspace_id) references evidencia (id, workspace_id),
-  -- Consistencia del sellado: un item decidido siempre sabe quién y cuándo, y un
-  -- aprobado siempre enlaza su evidencia (decidido = inmutable, no habría reparación).
+  -- Consistencia del sellado: un item decidido siempre sabe quién y cuándo, un
+  -- aprobado siempre enlaza su evidencia y un rechazado jamás la tiene
+  -- (decidido = inmutable, no habría reparación).
   check (estado = 'pendiente' or (decidido_por is not null and decidido_en is not null)),
-  check (estado <> 'aprobado' or evidencia_id is not null)
+  check (estado <> 'aprobado' or evidencia_id is not null),
+  check (estado <> 'rechazado' or evidencia_id is null)
 );
 create index item_importacion_ws_idx on item_importacion (workspace_id, estado, creado_en);
 
@@ -100,6 +102,10 @@ create policy item_insert on item_importacion
     and creado_por = app_user_id()
   );
 
+-- La decisión es una TRANSICIÓN: el WITH CHECK exige que el update deje el item
+-- DECIDIDO y completo — sin él, un curador podía poblar o reescribir los campos de
+-- decisión dejando la fila 'pendiente' (los CHECKs de tabla aceptan cualquier
+-- pendiente), y el sellado dejaba de ser invariante a nivel RLS.
 create policy item_update_curaduria on item_importacion
   for update
   using (
@@ -109,6 +115,10 @@ create policy item_update_curaduria on item_importacion
   with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and decidido_por = app_user_id()
+    and estado in ('aprobado', 'rechazado')
+    and decidido_en is not null
+    and (estado <> 'aprobado' or evidencia_id is not null)
+    and (estado <> 'rechazado' or evidencia_id is null)
   );
 
 grant select, insert on fuente, evidencia to designio_app;

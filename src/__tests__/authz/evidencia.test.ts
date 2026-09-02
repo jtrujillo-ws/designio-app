@@ -241,6 +241,25 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     ).toBe(false);
   });
 
+  it('el sellado es una transición: ni un curador garabatea campos de decisión en una fila pendiente', async () => {
+    const r = await crearItem(stakeId, {
+      workspaceId: ws,
+      titulo: 'Garabato',
+      contenido: 'x',
+      tipoFuente: 'nota',
+      referencia: '',
+    });
+    // Poblar decidido_por/decidido_en dejando estado='pendiente': el WITH CHECK lo corta.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update item_importacion
+        set decidido_por = ${leadId}, decidido_en = now()
+        where id = ${r.itemId}`),
+    ).rejects.toThrow(/row-level security/);
+    const bandeja = await listarBandeja(leadId, ws);
+    const item = bandeja.pendientes.find((i) => i.id === r.itemId);
+    expect(item?.estado).toBe('pendiente');
+  });
+
   it('una fecha calendárica imposible (desborde) se rechaza, no se normaliza', () => {
     expect(FechaCalendarioSchema.safeParse('2026-02-30').success).toBe(false);
     expect(FechaCalendarioSchema.safeParse('2026-04-31').success).toBe(false);

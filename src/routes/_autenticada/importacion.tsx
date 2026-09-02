@@ -294,6 +294,8 @@ function TarjetaItem({
 }) {
   const [curando, setCurando] = useState(false);
   const [ocupado, setOcupado] = useState(false);
+  // Rechazar sella el item de forma INMUTABLE: nunca a un solo clic.
+  const [confirmandoRechazo, setConfirmandoRechazo] = useState(false);
   const [contenidoCompleto, setContenidoCompleto] = useState<string | null>(null);
   const [expandido, setExpandido] = useState(false);
   const [cargandoContenido, setCargandoContenido] = useState(false);
@@ -333,6 +335,7 @@ function TarjetaItem({
       onError('No se pudo rechazar; intenta de nuevo');
     } finally {
       setOcupado(false);
+      setConfirmandoRechazo(false);
     }
   }
 
@@ -373,13 +376,26 @@ function TarjetaItem({
           La curaduría la decide la boutique (lead o diseñador).
         </span>
       )}
-      {item.estado === 'pendiente' && puedeCurar && !curando && (
+      {item.estado === 'pendiente' && puedeCurar && !curando && !confirmandoRechazo && (
         <div style={{ display: 'flex', gap: 10 }}>
           <Button size="sm" onClick={() => setCurando(true)}>
             Curar y aprobar
           </Button>
-          <Button size="sm" variant="ghost" disabled={ocupado} onClick={rechazar}>
+          <Button size="sm" variant="ghost" onClick={() => setConfirmandoRechazo(true)}>
             Rechazar
+          </Button>
+        </div>
+      )}
+      {item.estado === 'pendiente' && puedeCurar && !curando && confirmandoRechazo && (
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span style={{ font: '500 12.5px var(--font-sans)', color: 'var(--danger)' }}>
+            El rechazo es definitivo: el item queda sellado y no podrá aprobarse.
+          </span>
+          <Button size="sm" disabled={ocupado} onClick={rechazar}>
+            {ocupado ? 'Rechazando…' : 'Confirmar rechazo'}
+          </Button>
+          <Button size="sm" variant="ghost" disabled={ocupado} onClick={() => setConfirmandoRechazo(false)}>
+            Cancelar
           </Button>
         </div>
       )}

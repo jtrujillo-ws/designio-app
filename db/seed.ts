@@ -103,7 +103,13 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
  * El seed corre como owner (sin contexto RLS) y por eso escribe la evidencia directamente
  * en vez de pasar por la curaduría; los items quedan marcados como aprobados igual que
  * lo haría la app, para que la bandeja cuente la misma historia.
- * Idempotente por la presencia de derechos en el workspace.
+ * Idempotente por la presencia de MATERIAL EN LA BANDEJA (`item_importacion`), que es lo
+ * único que siembra en exclusiva esta función. La señal era antes «hay algún derecho_uso
+ * en el workspace», y eso la ataba a un dato que otras funciones también producen: en
+ * cuanto sembrarCadena empezó a crear los derechos de sus dos evidencias —y en el camino
+ * de upgrade corre ANTES que esta—, la señal se activaba sola y el material de la bandeja
+ * no llegaba a sembrarse nunca. Una guarda de idempotencia tiene que mirar lo que la
+ * propia función escribe, no un efecto que comparte con otras.
  */
 const ARCHIVO_DEMO = `Estudio CX — apertura de cuenta nomina (extracto)
 
@@ -117,7 +123,7 @@ async function sembrarEvidenciaProfunda(
   wsId: string,
   luciaId: string,
 ): Promise<boolean> {
-  const yaHay = await tx`select 1 from derecho_uso where workspace_id = ${wsId} limit 1`;
+  const yaHay = await tx`select 1 from item_importacion where workspace_id = ${wsId} limit 1`;
   if (yaHay.length > 0) return false;
 
   const material = [
@@ -273,6 +279,28 @@ async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string):
     returning id`;
   const evDigital = ev1!.id as string;
   const evSucursal = ev2!.id as string;
+
+  // TODA evidencia nace con su registro de derechos. El seed corre como propietario, así
+  // que `evidencia_con_derechos_guard` se lo salta a propósito (su pre-chequeo anti-oráculo
+  // sale antes) y estas dos filas quedaban SIN derechos: bloqueadas por «no tiene registro
+  // de derechos», y sin reparación posible desde el producto — `decidirDerechos` solo hace
+  // UPDATE, y no había fila que actualizar. El guard salta la comprobación, no la regla.
+  //
+  // Se conceden para el ámbito CLIENTE, no pendientes, porque estas dos evidencias son
+  // justamente las que sostienen la cadena de demo: una está citada en el insight validado
+  // que respalda la decisión de G1 —y citar exige derechos vigentes— y la otra apoya el
+  // arquetipo confirmado. Sembrarlas pendientes dejaría el demo contradiciéndose: una cita
+  // que el propio producto no habría dejado crear. El caso «bloqueada a propósito» ya está
+  // sembrado, y es de sembrarEvidenciaProfunda: allí vive la evidencia sin consentimiento.
+  for (const [evidenciaId, base] of [
+    [evDigital, 'Cláusula 7 del contrato de servicios: analítica agregada, sin datos personales'],
+    [evSucursal, 'Consentimiento informado firmado por los seis asesores entrevistados'],
+  ] as const) {
+    await tx`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${wsId}, ${evidenciaId}, 'concedido', 'cliente', ${base},
+              ${luciaId}, now(), ${luciaId})`;
+  }
 
   const [ins] = await tx`insert into insight (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
     values (${wsId}, 'La verificación de identidad digital concentra el abandono',

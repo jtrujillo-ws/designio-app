@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import { cerrarPools, sqlAdmin } from '@/lib/db';
+import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import {
   adjuntarArchivo,
   aprobarItem,
@@ -363,6 +363,50 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     const serializado = JSON.stringify(paquete);
     expect(serializado).not.toContain(wsB);
     expect(serializado).not.toContain(marca + ' ajeno');
+  });
+
+  it('el paquete se arma sobre UNA sola foto: repeatable read cierra la ventana', async () => {
+    // La exportación son treinta y pico consultas. Bajo READ COMMITTED cada una abre su
+    // propio snapshot, así que un commit ajeno a media exportación —una revocación de
+    // derechos, típicamente— dejaba la evidencia dentro del paquete (el filtro ya se
+    // había materializado) y a la vez en `bloqueadas`, con sus citas y sus ficheros.
+    // Aquí se comprueba el mecanismo que lo cierra, con una escritura intercalada REAL
+    // desde otra conexión mientras la transacción de lectura sigue abierta.
+    const admin = sqlAdmin();
+    const aislada = await conUsuario(
+      leadId,
+      async (tx) => {
+        const [nivel] = await tx`show transaction_isolation`;
+        const [antes] = await tx`select count(*)::int as n from segmento
+          where workspace_id = ${ws}`;
+        await admin`insert into segmento (workspace_id, nombre)
+          values (${ws}, ${marca + ' intercalado'})`;
+        const [despues] = await tx`select count(*)::int as n from segmento
+          where workspace_id = ${ws}`;
+        return {
+          nivel: nivel!.transaction_isolation as string,
+          antes: antes!.n as number,
+          despues: despues!.n as number,
+        };
+      },
+      { aislamiento: 'repeatable read' },
+    );
+    expect(aislada.nivel).toBe('repeatable read');
+    expect(aislada.despues).toBe(aislada.antes);
+
+    // Control, para que la aserción anterior signifique algo: la MISMA secuencia sin el
+    // aislamiento sí ve la fila intercalada. Esa es exactamente la ventana por la que se
+    // colaba la revocación, y la razón de que el nivel se fije en el propio BEGIN.
+    const porDefecto = await conUsuario(leadId, async (tx) => {
+      const [antes] = await tx`select count(*)::int as n from segmento
+        where workspace_id = ${ws}`;
+      await admin`insert into segmento (workspace_id, nombre)
+        values (${ws}, ${marca + ' intercalado 2'})`;
+      const [despues] = await tx`select count(*)::int as n from segmento
+        where workspace_id = ${ws}`;
+      return { antes: antes!.n as number, despues: despues!.n as number };
+    });
+    expect(porDefecto.despues).toBe(porDefecto.antes + 1);
   });
 
   it('una cuenta desactivada con sesión viva no exporta (re-check de estado)', async () => {

@@ -39,10 +39,60 @@ $$ select t !~ '[\x01-\x08\x0b\x0c\x0e-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\
 comment on function texto_importado_limpio(text) is
   'RF-03.2: el material importado se guarda crudo; lo que se rechaza son controles C0/C1 y overrides bidi (vector de spoofing), nunca se "limpian" en silencio porque eso correría los offsets de las citas.';
 
+-- NOT VALID: la restricción rige desde YA para toda escritura nueva (insert y update),
+-- pero no valida el material que entró antes. No es indulgencia: el esquema anterior y el
+-- validador de la app ACEPTABAN esos caracteres, así que las filas heredadas son datos
+-- válidos de antes del upgrade y tumbar la migración entera por ellas convertiría una
+-- mejora de seguridad en una caída de despliegue. Lo que NO se hace es «repararlas»
+-- reescribiéndolas: la cita verificable localiza un fragmento por su posición en el
+-- original (RF-03.7) y normalizar correría esos offsets — la remediación de un material
+-- sucio es humana (cuarentena o reimportación), no automática.
 alter table item_importacion
-  add constraint item_contenido_limpio check (texto_importado_limpio(contenido)),
-  add constraint item_titulo_limpio check (texto_importado_limpio(titulo)),
-  add constraint item_referencia_limpia check (texto_importado_limpio(referencia));
+  add constraint item_contenido_limpio check (texto_importado_limpio(contenido)) not valid,
+  add constraint item_titulo_limpio check (texto_importado_limpio(titulo)) not valid,
+  add constraint item_referencia_limpia check (texto_importado_limpio(referencia)) not valid;
+
+-- Y acto seguido se VALIDA lo que se pueda, por restricción y no en bloque: una base
+-- limpia —toda instalación nueva, y la mayoría de las viejas— acaba con las tres
+-- `convalidated = t`, que es el estado fuerte; y una con deuda en una sola columna valida
+-- las otras dos en vez de quedarse las tres a medias. Lo que no valida no se calla: deja
+-- `notice` para el operador y un evento por item afectado, con el punto de código exacto.
+do $$
+declare
+  r record;
+  v_sucias bigint;
+begin
+  for r in select * from (values
+      ('item_contenido_limpio', 'contenido'),
+      ('item_titulo_limpio', 'titulo'),
+      ('item_referencia_limpia', 'referencia')) as t(restriccion, columna)
+  loop
+    execute format(
+      'select count(*) from item_importacion where not texto_importado_limpio(%I)', r.columna)
+      into v_sucias;
+    if v_sucias = 0 then
+      execute format('alter table item_importacion validate constraint %I', r.restriccion);
+    else
+      raise notice
+        'RF-03.2: % item(s) heredados incumplen %; la restricción rige para escrituras nuevas y queda NOT VALID. Revisa los eventos MaterialImportadoSucioDetectado y limpia el ORIGINAL (no se normaliza aquí: correría los offsets de las citas).',
+        v_sucias, r.restriccion;
+    end if;
+  end loop;
+end $$;
+
+insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+select i.workspace_id, 'MaterialImportadoSucioDetectado',
+       jsonb_build_object('itemId', i.id, 'estado', i.estado,
+                          'campos', (select jsonb_agg(campo) from unnest(array[
+                            case when not texto_importado_limpio(i.contenido) then 'contenido' end,
+                            case when not texto_importado_limpio(i.titulo) then 'titulo' end,
+                            case when not texto_importado_limpio(i.referencia) then 'referencia' end
+                          ]) as campo where campo is not null)),
+       null, null
+from item_importacion i
+where not (texto_importado_limpio(i.contenido)
+           and texto_importado_limpio(i.titulo)
+           and texto_importado_limpio(i.referencia));
 
 -- ── 2. Archivos adjuntos del material importado (RF-03.1) ──
 -- Cuelgan del ITEM, no de la evidencia: el archivo es el material tal como llegó, y

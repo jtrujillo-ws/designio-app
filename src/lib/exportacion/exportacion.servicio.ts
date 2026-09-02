@@ -27,6 +27,17 @@ import {
  * En ámbito `entregable` la evidencia se lee de la vista `evidencia_entregable`, que
  * aplica el predicado de derechos en la BASE. Lo excluido no se calla: sale listado en
  * `bloqueadas` con la dimensión que falta (SYS-14).
+ *
+ * REPEATABLE READ, y es una decisión de corrección, no de rendimiento. La exportación son
+ * treinta y pico consultas: el permiso y su evento de auditoría, la vista de derechos, la
+ * lista de bloqueadas, un volcado por tabla del catálogo y dos pasadas de adjuntos. Bajo
+ * READ COMMITTED cada una abre su propio snapshot, así que una revocación commiteada a
+ * media exportación deja la evidencia dentro del paquete (el filtro ya se había
+ * materializado) y a la vez en `bloqueadas` — con sus citas y sus ficheros. El manifiesto
+ * es un RECIBO (SYS-04): un recibo cosido de treinta instantes distintos no acredita nada,
+ * y `generadoEn` solo significa algo si hay un «en» que nombrar. Con un único snapshot, el
+ * `registrar_exportacion` que autoriza y audita comparte foto con TODO lo que se emite —
+ * la misma disciplina que ya se exige dentro de una sentencia, extendida a la operación.
  */
 
 export class ErrorExportacion extends Error {}
@@ -126,7 +137,7 @@ export async function exportarWorkspace(
       archivos,
       bloqueadas,
     };
-  });
+  }, { aislamiento: 'repeatable read' });
 }
 
 /** Alcance del paquete entregable, derivado ENTERAMENTE de la vista de la base. */
@@ -236,10 +247,12 @@ function normalizarFila(fila: Record<string, unknown>): FilaExportada {
  * paquete resultante no pasara de 25 MiB. Ahora el pico es O(presupuesto), un tope explícito
  * que ya está declarado en el manifiesto.
  *
- * Las dos consultas comparten transacción pero no snapshot (READ COMMITTED): un adjunto
- * puede retirarse entre ambas. `archivo_importado` no admite UPDATE (su sha256 es su
- * identidad), así que el único desenlace posible es que falten los bytes — y entonces la
- * fila sigue en el inventario con su motivo, nunca desaparece.
+ * Las dos consultas comparten transacción Y snapshot: la exportación corre en REPEATABLE
+ * READ, así que la segunda ve exactamente los adjuntos que la primera midió — sin esto,
+ * partir en dos pasadas habría abierto una ventana para que el presupuesto se calculara
+ * sobre un inventario y los bytes salieran de otro. El fallback de «bytes que faltan» se
+ * conserva como red: si alguna vez esta transacción volviera a READ COMMITTED, la fila
+ * seguiría en el inventario con su motivo en vez de desaparecer del manifiesto (SYS-04).
  */
 async function archivosDelExport(
   tx: TransactionSql,

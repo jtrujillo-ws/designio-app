@@ -491,12 +491,21 @@ export async function journeyCompleto(
   });
 }
 
+/** Página de la lista de journeys. El corte duro dejaba fuera para siempre a los más
+ * antiguos, y esta pantalla es la ÚNICA puerta al grafo: quedar fuera del corte
+ * equivalía a desaparecer del producto. Keyset por `(creado_en, id)`, el mismo patrón que
+ * la bandeja: el cursor viaja como id y su par lo resuelve la base, porque serializar el
+ * timestamp pierde microsegundos y salta o repite filas. */
+export const PAGINA_JOURNEYS = 50;
+
 export async function journeysDelWorkspace(
   actorId: string,
   workspaceId: string,
-): Promise<ResumenJourney[]> {
+  cursor: string | null = null,
+): Promise<{ journeys: ResumenJourney[]; siguiente: string | null }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // Se pide una fila de más para saber si hubo recorte sin contar la tabla entera.
     const filas = await tx`
       select j.id, j.nombre, j.tipo, s.nombre as servicio_nombre,
         (select count(*)::int from journey_nodo n
@@ -506,15 +515,23 @@ export async function journeysDelWorkspace(
       from journey j
       join servicio s on s.id = j.servicio_id and s.workspace_id = j.workspace_id
       where j.workspace_id = ${workspaceId}
-      order by j.creado_en desc
-      limit 200`;
-    return filas.map((f) => ({
-      id: f.id as string,
-      nombre: f.nombre as string,
-      tipo: f.tipo as ResumenJourney['tipo'],
-      servicioNombre: f.servicio_nombre as string,
-      nodos: f.nodos as number,
-      snapshots: f.snapshots as number,
-    }));
+        and (${cursor}::uuid is null or (j.creado_en, j.id) < (
+          select c.creado_en, c.id from journey c
+          where c.id = ${cursor}::uuid and c.workspace_id = ${workspaceId}))
+      order by j.creado_en desc, j.id desc
+      limit ${PAGINA_JOURNEYS + 1}`;
+    const pagina = filas.slice(0, PAGINA_JOURNEYS);
+    return {
+      journeys: pagina.map((f) => ({
+        id: f.id as string,
+        nombre: f.nombre as string,
+        tipo: f.tipo as ResumenJourney['tipo'],
+        servicioNombre: f.servicio_nombre as string,
+        nodos: f.nodos as number,
+        snapshots: f.snapshots as number,
+      })),
+      // Si la fila de más existe, el cursor es la última que SÍ se devuelve.
+      siguiente: filas.length > PAGINA_JOURNEYS ? (pagina[pagina.length - 1]!.id as string) : null,
+    };
   });
 }

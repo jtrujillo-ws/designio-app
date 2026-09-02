@@ -11,7 +11,7 @@ import { Wordmark } from '@/components/ui/Wordmark';
 import { arbolDelWorkspace } from '@/lib/arbol/arbol.functions';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { crearJourneyDeServicio, listaDeJourneys } from '@/lib/journey/journey.functions';
-import { TIPOS_JOURNEY, type TipoJourney } from '@/lib/journey/journey.schemas';
+import { TIPOS_JOURNEY, type ResumenJourney, type TipoJourney } from '@/lib/journey/journey.schemas';
 
 /**
  * Journeys del workspace (SPEC-05): el as-is y el to-be de cada servicio como grafo
@@ -38,7 +38,8 @@ export const Route = createFileRoute('/_autenticada/journeys')({
     );
     return {
       workspaceId,
-      journeys,
+      journeys: journeys.journeys,
+      siguienteJourney: journeys.siguiente,
       servicios: (arbol?.servicios ?? []).map((s) => {
         // Un reto anclado en el servicio A que AFECTA al B es el que empuja el journey del
         // B: si el selector solo ofreciera los anclados, ese journey no podría asociarse al
@@ -163,42 +164,103 @@ function PantallaJourneys() {
               />
             )}
 
-            {datos.journeys.length === 0 && (
-              <Card style={{ padding: 24 }}>
-                <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
-                  Todavía no hay journeys en este workspace.
-                </span>
-              </Card>
-            )}
-
-            {datos.journeys.map((j) => (
-              <Card key={j.id} style={{ padding: 18 }}>
-                <Link
-                  to="/journey/$journeyId"
-                  params={{ journeyId: j.id }}
-                  style={{ textDecoration: 'none', display: 'flex', flexDirection: 'column', gap: 6 }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                    <span style={{ font: '600 14px var(--font-sans)', color: 'var(--ink)' }}>
-                      {j.nombre}
-                    </span>
-                    <Tag>{j.tipo}</Tag>
-                    {j.snapshots > 0 && (
-                      <Tag mono={false}>
-                        {j.snapshots} {j.snapshots === 1 ? 'snapshot' : 'snapshots'}
-                      </Tag>
-                    )}
-                  </div>
-                  <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
-                    {j.servicioNombre} · {j.nodos} {j.nodos === 1 ? 'elemento' : 'elementos'}
-                  </span>
-                </Link>
-              </Card>
-            ))}
+            {/* Remontada por el borde de la primera página: crear un journey invalida la
+                ruta y el loader devuelve otra, así que el cursor acumulado apuntaría más
+                allá del que se desplazó. Misma forma que la lista de insights. */}
+            <ListaDeJourneys
+              key={datos.siguienteJourney ?? ''}
+              workspaceId={datos.workspaceId}
+              primeraPagina={datos.journeys}
+              cursorInicial={datos.siguienteJourney}
+              onError={setError}
+            />
           </>
         )}
       </main>
     </div>
+  );
+}
+
+/**
+ * La lista paginada. El corte duro dejaba fuera para siempre a los journeys más
+ * antiguos, y esta pantalla es la ÚNICA puerta al grafo: quedar fuera del corte
+ * equivalía a desaparecer del producto.
+ */
+function ListaDeJourneys({
+  workspaceId,
+  primeraPagina,
+  cursorInicial,
+  onError,
+}: {
+  workspaceId: string;
+  primeraPagina: ResumenJourney[];
+  cursorInicial: string | null;
+  onError: (e: string | null) => void;
+}) {
+  const [masPaginas, setMasPaginas] = useState<ResumenJourney[]>([]);
+  const [cursor, setCursor] = useState<string | null>(cursorInicial);
+  const [cargando, setCargando] = useState(false);
+  const listados = [...primeraPagina, ...masPaginas];
+
+  async function cargarMas() {
+    if (!cursor) return;
+    setCargando(true);
+    onError(null);
+    try {
+      const r = await listaDeJourneys({ data: { workspaceId, cursor } });
+      setMasPaginas((previas) => [...previas, ...r.journeys]);
+      setCursor(r.siguiente);
+    } catch {
+      onError('No se pudieron cargar más journeys; intenta de nuevo');
+    } finally {
+      setCargando(false);
+    }
+  }
+
+  if (listados.length === 0) {
+    return (
+      <Card style={{ padding: 24 }}>
+        <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+          Todavía no hay journeys en este workspace.
+        </span>
+      </Card>
+    );
+  }
+
+  return (
+    <>
+      {listados.map((j) => (
+        <Card key={j.id} style={{ padding: 18 }}>
+          <Link
+            to="/journey/$journeyId"
+            params={{ journeyId: j.id }}
+            style={{ textDecoration: 'none', display: 'flex', flexDirection: 'column', gap: 6 }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ font: '600 14px var(--font-sans)', color: 'var(--ink)' }}>
+                {j.nombre}
+              </span>
+              <Tag>{j.tipo}</Tag>
+              {j.snapshots > 0 && (
+                <Tag mono={false}>
+                  {j.snapshots} {j.snapshots === 1 ? 'snapshot' : 'snapshots'}
+                </Tag>
+              )}
+            </div>
+            <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+              {j.servicioNombre} · {j.nodos} {j.nodos === 1 ? 'elemento' : 'elementos'}
+            </span>
+          </Link>
+        </Card>
+      ))}
+      {cursor && (
+        <div>
+          <Button size="sm" variant="secondary" disabled={cargando} onClick={() => void cargarMas()}>
+            {cargando ? 'Cargando…' : 'Cargar más journeys'}
+          </Button>
+        </div>
+      )}
+    </>
   );
 }
 

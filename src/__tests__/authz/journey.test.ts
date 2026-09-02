@@ -14,6 +14,7 @@ import {
   ErrorJourney,
   journeyCompleto,
   journeysDelWorkspace,
+  PAGINA_JOURNEYS,
 } from '@/lib/journey/journey.servicio';
 import { describeAuthz } from './helpers';
 
@@ -128,9 +129,42 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     ).rejects.toThrow(ErrorJourney);
 
     // Leer sí: el journey es lo que se conversa con el cliente.
-    expect((await journeysDelWorkspace(stakeId, ws)).map((j) => j.id).sort()).toEqual(
-      [journeyId, otroJourneyId].sort(),
-    );
+    const lista = await journeysDelWorkspace(stakeId, ws);
+    expect(lista.journeys.map((j) => j.id).sort()).toEqual([journeyId, otroJourneyId].sort());
+    // Dos journeys caben de sobra en la página: no hay recorte que anunciar.
+    expect(lista.siguiente).toBeNull();
+  });
+
+  it('la lista de journeys se pagina: ninguno queda fuera de alcance', async () => {
+    // Esta pantalla es la ÚNICA puerta al grafo, así que caer fuera del corte equivalía a
+    // desaparecer del producto. El keyset recorre todo sin repetir ni saltar.
+    const admin = sqlAdmin();
+    const paginables = `${marca}-pag`;
+    for (let i = 0; i < PAGINA_JOURNEYS + 3; i += 1) {
+      await admin`insert into journey (workspace_id, servicio_id, tipo, nombre, creado_por)
+        values (${ws}, ${servicioId}, 'as-is', ${`${paginables}-${String(i).padStart(3, '0')}`},
+                ${leadId})`;
+    }
+
+    const vistos: string[] = [];
+    let cursor: string | null = null;
+    let vueltas = 0;
+    do {
+      const pagina: Awaited<ReturnType<typeof journeysDelWorkspace>> =
+        await journeysDelWorkspace(leadId, ws, cursor);
+      expect(pagina.journeys.length).toBeLessThanOrEqual(PAGINA_JOURNEYS);
+      vistos.push(...pagina.journeys.map((j) => j.id));
+      cursor = pagina.siguiente;
+      vueltas += 1;
+      // La primera página tiene que anunciar el recorte: si no, el resto es inalcanzable.
+      if (vueltas === 1) expect(cursor).not.toBeNull();
+    } while (cursor !== null && vueltas < 10);
+
+    // Ni repetidos ni saltados: el conjunto visitado es exactamente el del workspace.
+    expect(new Set(vistos).size).toBe(vistos.length);
+    const [total] = await admin`select count(*)::int as n from journey
+      where workspace_id = ${ws}`;
+    expect(vistos.length).toBe(total!.n as number);
   });
 
   it('el orden se calcula por tipo dentro del journey', async () => {
@@ -860,7 +894,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
 
     // Sin membresía no hay nada que leer: ni el journey, ni sus nodos.
     expect(await journeyCompleto(fueraId, ws, journeyId)).toBeNull();
-    expect(await journeysDelWorkspace(fueraId, ws)).toEqual([]);
+    expect((await journeysDelWorkspace(fueraId, ws)).journeys).toEqual([]);
     const nodos = await conUsuario(fueraId, (tx) => tx`
       select id from journey_nodo where workspace_id = ${ws}`);
     expect(nodos.length).toBe(0);

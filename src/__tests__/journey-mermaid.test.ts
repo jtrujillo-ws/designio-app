@@ -295,6 +295,42 @@ describe('validarJourney', () => {
     expect(validarJourney(journey([fase, a, b], [arista(a, b, 'transicion')]))).toEqual([]);
   });
 
+  it('un journey que no puede acabar se reporta, y un reintento con salida no', () => {
+    // `A → B → C → B`: A es una entrada válida, todo es alcanzable y todo tiene salida,
+    // así que ninguna señal POR NODO dice nada — y el recorrido no termina nunca. La
+    // pregunta es de grafo: ¿queda algún alcanzable sin salida? Ese es el final.
+    const ev = [{ id: id(), titulo: 'E' }];
+    const fase = nodo({ tipo: 'fase', etiqueta: 'Verificación', orden: 0 });
+    const a = nodo({ tipo: 'paso', etiqueta: 'Entra', orden: 0, faseId: fase.id, evidencias: ev });
+    const b = nodo({ tipo: 'paso', etiqueta: 'Revisa', orden: 1, faseId: fase.id, evidencias: ev });
+    const c = nodo({ tipo: 'paso', etiqueta: 'Corrige', orden: 2, faseId: fase.id, evidencias: ev });
+    const bucle = validarJourney(
+      journey(
+        [fase, a, b, c],
+        [arista(a, b, 'transicion'), arista(b, c, 'transicion'), arista(c, b, 'transicion')],
+      ),
+    );
+    const sinFinal = bucle.filter((s) => s.codigo === 'sin-final');
+    expect(sinFinal).toHaveLength(1);
+    expect(sinFinal[0]!.severidad).toBe('alta');
+
+    // El mismo bucle de reintento CON salida es legítimo y no produce señal: `C` decide
+    // volver a `B` o seguir a `D`, y `D` es un final alcanzable.
+    const d = nodo({ tipo: 'paso', etiqueta: 'Termina', orden: 3, faseId: fase.id, evidencias: ev });
+    const conSalida = validarJourney(
+      journey(
+        [fase, a, b, c, d],
+        [
+          arista(a, b, 'transicion'),
+          arista(b, c, 'transicion'),
+          arista(c, b, 'transicion', 'sigue mal'),
+          arista(c, d, 'transicion', 'quedó bien'),
+        ],
+      ),
+    );
+    expect(conSalida.filter((s) => s.codigo === 'sin-final')).toEqual([]);
+  });
+
   it('un ciclo de solo decisiones también se reporta: no hace falta un paso para no tener principio', () => {
     // `primeroId` se deriva de los pasos, así que una fase de solo decisiones se saltaba
     // la señal: sin paso no había anclaje, y las comprobaciones de alcanzabilidad y de

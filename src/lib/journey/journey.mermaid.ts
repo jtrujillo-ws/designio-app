@@ -293,6 +293,26 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
     }
   }
 
+  // Un journey tiene que poder ACABAR, y eso no lo cubre `paso-sin-salida`: en un bucle
+  // como `A → B → C → B` todos los pasos tienen salida y todos son alcanzables, así que
+  // ninguna señal por nodo dice nada — y el recorrido no termina nunca.
+  //
+  // La pregunta es de grafo, no de nodo: ¿queda algún nodo alcanzable SIN transición de
+  // salida? Ese es el final. Si no hay ninguno, todo camino vuelve sobre sí mismo. Un
+  // ciclo de reintento con salida sigue siendo legítimo: su salida lleva a un final que
+  // también es alcanzable, así que la señal no se emite.
+  const finales = transitables.filter((n) => alcanzables.has(n.id) && !conSalida.has(n.id));
+  if (finales.length === 0 && transiciones.length > 0 && anclaje !== null) {
+    senales.push({
+      codigo: 'sin-final',
+      severidad: 'alta',
+      nodoId: anclaje.id,
+      etiqueta: anclaje.etiqueta,
+      mensaje:
+        'Ningún paso o decisión alcanzable termina el recorrido: todo camino vuelve sobre sí mismo y el journey no puede acabar',
+    });
+  }
+
   // Un arquetipo puede refutarse DESPUÉS de entrar al grafo: el guard impide añadir uno
   // refutado, pero no puede impedir que el veredicto llegue más tarde. Borrar el nodo por
   // detrás sería reescribir el journey sin que nadie lo decida, así que se reporta: el

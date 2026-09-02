@@ -62,9 +62,9 @@ export const listaDeJourneys = createServerFn({ method: 'GET' })
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
     try {
-      return await journeysDelWorkspace(usuarioId, data.workspaceId);
+      return await journeysDelWorkspace(usuarioId, data.workspaceId, data.cursor);
     } catch (e) {
-      if (e instanceof ErrorAutorizacion) return [];
+      if (e instanceof ErrorAutorizacion) return { journeys: [], siguiente: null };
       throw e;
     }
   });

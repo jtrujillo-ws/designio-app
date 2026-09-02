@@ -168,7 +168,11 @@ export const JourneyInputSchema = z.object({
   journeyId: z.string().uuid(),
 });
 
-export const JourneysInputSchema = z.object({ workspaceId: z.string().uuid() });
+export const JourneysInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  /** Id del último journey ya visto: el keyset resuelve su `(creado_en, id)` en la base. */
+  cursor: z.string().uuid().nullable().default(null),
+});
 
 // ── Proyecciones de lectura ──
 
@@ -248,7 +252,8 @@ export type SenalValidacion = {
     | 'sin-responsable'
     | 'huerfano-de-fase'
     | 'arquetipo-refutado'
-    | 'sin-entrada';
+    | 'sin-entrada'
+    | 'sin-final';
   severidad: SeveridadSenal;
   nodoId: string;
   etiqueta: string;

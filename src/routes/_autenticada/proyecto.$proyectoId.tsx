@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { CSSProperties } from 'react';
 import { createFileRoute, useNavigate, useRouter } from '@tanstack/react-router';
+import { PanelDeHilos } from '@/components/portal/PanelDeHilos';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Select } from '@/components/ui/Select';
@@ -21,6 +22,8 @@ import type {
   ItemDeGate,
   ProyectoMetodo,
 } from '@/lib/metodo/metodo.schemas';
+import { hilosDelPortal } from '@/lib/portal/portal.functions';
+import type { HiloDeObjeto, ObjetoCitable } from '@/lib/portal/portal.schemas';
 
 /**
  * Pantalla del método (SPEC-04): las 8 etapas canónicas con su gate, checklist de
@@ -39,14 +42,27 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
       proyectoDelMetodo({ data: { workspaceId, proyectoId: params.proyectoId } }),
       evidenciasDelWorkspace({ data: { workspaceId } }),
     ]);
-    return proyecto
-      ? {
-          workspaceId,
-          proyecto,
-          evidencias: lista?.evidencias ?? [],
-          hayMasEvidencias: lista?.hayMas ?? false,
-        }
-      : null;
+    if (!proyecto) return null;
+    // Los hilos del portal cuelgan del proyecto y de sus gates, y los ids de los gates
+    // solo se conocen tras cargar el método: es una segunda ida deliberada, no una
+    // carrera — y una sola para los nueve objetos de la pantalla.
+    const portal = await hilosDelPortal({
+      data: {
+        workspaceId,
+        objetos: [
+          { tipo: 'proyecto', id: proyecto.id },
+          ...proyecto.gates.map((g) => ({ tipo: 'gate_instancia' as const, id: g.id })),
+        ],
+      },
+    });
+    return {
+      workspaceId,
+      proyecto,
+      evidencias: lista?.evidencias ?? [],
+      hayMasEvidencias: lista?.hayMas ?? false,
+      hilos: portal?.hilos ?? [],
+      hayMasHilos: portal?.hayMas ?? false,
+    };
   },
   component: PantallaProyecto,
 });
@@ -65,6 +81,12 @@ const COLOR_ITEM: Record<ItemDeGate['estado'], string> = {
   cumplido: 'var(--accent)',
   na: 'var(--text-faint)',
 };
+
+/** Los hilos llegan en UNA consulta para toda la pantalla; cada tarjeta se queda con los
+ * suyos (RF-01.5: el hilo pertenece al objeto, no a la pantalla). */
+function hilosDe(hilos: HiloDeObjeto[], tipo: ObjetoCitable, id: string): HiloDeObjeto[] {
+  return hilos.filter((h) => h.objetoTipo === tipo && h.objetoId === id);
+}
 
 /** Espejo cliente del predicado SYS-22 de aprobarGate — solo informa la etiqueta de
  * G0; la exigencia real vive en el servidor y en la política. */
@@ -124,10 +146,24 @@ function PantallaProyecto() {
         )}
         {datos && (
           <>
-            <EncabezadoProyecto proyecto={datos.proyecto} />
+            <EncabezadoProyecto
+              proyecto={datos.proyecto}
+              workspaceId={datos.workspaceId}
+              hilos={hilosDe(datos.hilos, 'proyecto', datos.proyecto.id)}
+              rol={rol}
+              onCambio={() => router.invalidate()}
+            />
             {error && (
               <span role="alert" style={{ font: '500 13px var(--font-sans)', color: 'var(--danger)' }}>
                 {error}
+              </span>
+            )}
+            {/* La consulta del portal está acotada: decirlo es preferible a mostrar una
+                conversación incompleta como si fuera toda. */}
+            {datos.hayMasHilos && (
+              <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-faint)' }}>
+                Esta vista muestra los hilos más recientes del proyecto y sus gates; hay más
+                en el portal.
               </span>
             )}
             {datos.proyecto.etapas.map((etapa) => {
@@ -136,6 +172,7 @@ function PantallaProyecto() {
                 <EtapaConGate
                   key={etapa.id}
                   workspaceId={datos.workspaceId}
+                  hilos={gate ? hilosDe(datos.hilos, 'gate_instancia', gate.id) : []}
                   nombreEtapa={`${etapa.numero} · ${etapa.nombre}`}
                   estadoEtapa={etapa.estado}
                   gate={gate}
@@ -158,7 +195,19 @@ function PantallaProyecto() {
   );
 }
 
-function EncabezadoProyecto({ proyecto }: { proyecto: ProyectoMetodo }) {
+function EncabezadoProyecto({
+  proyecto,
+  workspaceId,
+  hilos,
+  rol,
+  onCambio,
+}: {
+  proyecto: ProyectoMetodo;
+  workspaceId: string;
+  hilos: HiloDeObjeto[];
+  rol: string;
+  onCambio: () => Promise<void>;
+}) {
   const gatesAprobados = proyecto.gates.filter((g) => g.estado === 'aprobado').length;
   return (
     <Card style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -204,12 +253,20 @@ function EncabezadoProyecto({ proyecto }: { proyecto: ProyectoMetodo }) {
           </div>
         ))}
       </div>
+      <PanelDeHilos
+        workspaceId={workspaceId}
+        objeto={{ tipo: 'proyecto', id: proyecto.id }}
+        hilos={hilos}
+        rol={rol}
+        onCambio={onCambio}
+      />
     </Card>
   );
 }
 
 function EtapaConGate({
   workspaceId,
+  hilos,
   nombreEtapa,
   estadoEtapa,
   gate,
@@ -222,6 +279,8 @@ function EtapaConGate({
   onError,
 }: {
   workspaceId: string;
+  /** Hilos del portal sobre ESTE gate: el momento de co-creación de RF-01.5. */
+  hilos: HiloDeObjeto[];
   nombreEtapa: string;
   estadoEtapa: string;
   gate: GateDeProyecto | undefined;
@@ -311,6 +370,17 @@ function EtapaConGate({
           Aprueba {ETIQUETA_ROL[gate.rolAprobador] ?? gate.rolAprobador} en el portal.
         </span>
       )}
+
+      {/* El gate es EL momento de co-creación (SPEC-01): el cliente discute aquí, no por
+          correo — y un gate aprobado conserva su conversación (los hilos no se congelan
+          con él: la decisión es inmutable, la conversación sobre ella sigue viva). */}
+      <PanelDeHilos
+        workspaceId={workspaceId}
+        objeto={{ tipo: 'gate_instancia', id: gate.id }}
+        hilos={hilos}
+        rol={rol}
+        onCambio={onCambio}
+      />
     </Card>
   );
 }

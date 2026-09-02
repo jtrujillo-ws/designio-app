@@ -13,6 +13,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as AutenticadaRouteImport } from './routes/_autenticada'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AutenticadaAppRouteImport } from './routes/_autenticada/app'
+import { Route as AutenticadaAuditoriaRouteImport } from './routes/_autenticada/auditoria'
 import { Route as AutenticadaImportacionRouteImport } from './routes/_autenticada/importacion'
 import { Route as AutenticadaPersonasRouteImport } from './routes/_autenticada/personas'
 import { Route as InvitacionTokenRouteImport } from './routes/invitacion.$token'
@@ -35,6 +36,11 @@ const LoginRoute = LoginRouteImport.update({
 const AutenticadaAppRoute = AutenticadaAppRouteImport.update({
   id: '/app',
   path: '/app',
+  getParentRoute: () => AutenticadaRoute,
+} as any)
+const AutenticadaAuditoriaRoute = AutenticadaAuditoriaRouteImport.update({
+  id: '/auditoria',
+  path: '/auditoria',
   getParentRoute: () => AutenticadaRoute,
 } as any)
 const AutenticadaImportacionRoute = AutenticadaImportacionRouteImport.update({
@@ -63,6 +69,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/app': typeof AutenticadaAppRoute
+  '/auditoria': typeof AutenticadaAuditoriaRoute
   '/importacion': typeof AutenticadaImportacionRoute
   '/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
@@ -72,6 +79,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/app': typeof AutenticadaAppRoute
+  '/auditoria': typeof AutenticadaAuditoriaRoute
   '/importacion': typeof AutenticadaImportacionRoute
   '/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
@@ -83,6 +91,7 @@ export interface FileRoutesById {
   '/_autenticada': typeof AutenticadaRouteWithChildren
   '/login': typeof LoginRoute
   '/_autenticada/app': typeof AutenticadaAppRoute
+  '/_autenticada/auditoria': typeof AutenticadaAuditoriaRoute
   '/_autenticada/importacion': typeof AutenticadaImportacionRoute
   '/_autenticada/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
@@ -94,6 +103,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/app'
+    | '/auditoria'
     | '/importacion'
     | '/personas'
     | '/invitacion/$token'
@@ -103,6 +113,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/app'
+    | '/auditoria'
     | '/importacion'
     | '/personas'
     | '/invitacion/$token'
@@ -113,6 +124,7 @@ export interface FileRouteTypes {
     | '/_autenticada'
     | '/login'
     | '/_autenticada/app'
+    | '/_autenticada/auditoria'
     | '/_autenticada/importacion'
     | '/_autenticada/personas'
     | '/invitacion/$token'
@@ -156,6 +168,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AutenticadaAppRouteImport
       parentRoute: typeof AutenticadaRoute
     }
+    '/_autenticada/auditoria': {
+      id: '/_autenticada/auditoria'
+      path: '/auditoria'
+      fullPath: '/auditoria'
+      preLoaderRoute: typeof AutenticadaAuditoriaRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
     '/_autenticada/importacion': {
       id: '/_autenticada/importacion'
       path: '/importacion'
@@ -189,6 +208,7 @@ declare module '@tanstack/react-router' {
 
 interface AutenticadaRouteChildren {
   AutenticadaAppRoute: typeof AutenticadaAppRoute
+  AutenticadaAuditoriaRoute: typeof AutenticadaAuditoriaRoute
   AutenticadaImportacionRoute: typeof AutenticadaImportacionRoute
   AutenticadaPersonasRoute: typeof AutenticadaPersonasRoute
   AutenticadaProyectoProyectoIdRoute: typeof AutenticadaProyectoProyectoIdRoute
@@ -196,6 +216,7 @@ interface AutenticadaRouteChildren {
 
 const AutenticadaRouteChildren: AutenticadaRouteChildren = {
   AutenticadaAppRoute: AutenticadaAppRoute,
+  AutenticadaAuditoriaRoute: AutenticadaAuditoriaRoute,
   AutenticadaImportacionRoute: AutenticadaImportacionRoute,
   AutenticadaPersonasRoute: AutenticadaPersonasRoute,
   AutenticadaProyectoProyectoIdRoute: AutenticadaProyectoProyectoIdRoute,

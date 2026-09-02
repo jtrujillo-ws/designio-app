@@ -231,10 +231,23 @@ export async function panelPropuestas(
     //
     // `ancla_estado` dice si la propuesta se puede materializar y, si no, POR QUÉ. Se
     // deriva de lo que bloquea a cada destino: el item deja de estar pendiente (lo curó
-    // alguien a mano), su consentimiento deja de autorizar el procesamiento externo, o el
-    // G0 del reto congela sus criterios (SYS-22). Un booleano no basta porque las tres
-    // salidas del revisor son distintas, y un `coalesce` que caía en «disponible» era el
-    // fallo original — dejaba habilitados dos botones que la base rechaza siempre.
+    // alguien a mano), su consentimiento deja de autorizar el procesamiento externo, el G0
+    // del reto congela sus criterios (SYS-22) o el reto avanza en su ciclo de vida y deja de
+    // admitirlos (RF-04.12). Un booleano no basta porque las cuatro salidas del revisor son
+    // distintas, y un `coalesce` que caía en «disponible» era el fallo original — dejaba
+    // habilitados dos botones que la base rechaza siempre.
+    //
+    // Cada motivo pregunta por la MISMA función que lo impone al aceptar: el día que el
+    // predicado cambie, el panel no se queda con la versión vieja (que es exactamente cómo
+    // nació `reto_criterios_congelados`).
+    //
+    // El ORDEN de los dos motivos de C0 importa cuando se cumplen los dos a la vez, que es
+    // lo normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó). Se reporta primero
+    // el del ciclo de vida porque es el que NO tiene vuelta: «criterios congelados» le
+    // sugiere al lead una salida real —reabrir la etapa 0 (RF-04.9) descongela—, y ofrecerle
+    // esa salida sobre un reto archivado sería mandarlo a hacer un trámite que no va a
+    // desbloquear nada, porque al volver seguiría sin admitir criterios. Entre dos motivos
+    // ciertos gana el que describe la puerta que ya no se abre.
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, p.item_id, p.reto_id,
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
@@ -249,6 +262,8 @@ export async function panelPropuestas(
                      then 'consentimiento-revocado'
                    else 'disponible'
                  end
+               when not reto_admite_criterios(p.reto_id, p.workspace_id)
+                 then 'reto-no-admite'
                when reto_criterios_congelados(p.reto_id, p.workspace_id)
                  then 'criterios-congelados'
                else 'disponible'
@@ -327,11 +342,16 @@ export async function panelPropuestas(
         and (${patron}::text is null or i.titulo ilike ${patron})
       order by i.creado_en asc, i.id asc
       limit ${PAGINA_ANCLAS + 1}`;
-    // Retos con criterios aún abiertos: con un G0 aprobado están congelados (SYS-22) y
-    // proponer criterios para ellos sería ofrecer una acción que la base va a rechazar.
+    // Retos con criterios aún abiertos, que son DOS condiciones y no una: que el ciclo de
+    // vida del reto siga admitiéndolos (RF-04.12) y que ningún G0 los haya congelado
+    // (SYS-22). Las dos las impone el guard del INSERT de propuestas, así que ofrecer un
+    // reto al que le falte cualquiera de ellas sería ofrecer una acción que la base va a
+    // rechazar — y las dos se preguntan por la MISMA función que la impone, para que no
+    // vuelvan a divergir.
     const retos = await tx`
       select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
-      where r.workspace_id = ${workspaceId} and r.estado in ('candidato', 'activo')
+      where r.workspace_id = ${workspaceId}
+        and reto_admite_criterios(r.id, r.workspace_id)
         and not reto_criterios_congelados(r.id, r.workspace_id)
         and not exists (select 1 from propuesta_ai p
           where p.reto_id = r.id and p.workspace_id = r.workspace_id and p.estado = 'propuesta')
@@ -599,6 +619,14 @@ async function liberarReserva(
  * intercambiables: antes de llamar evita el gasto; al persistir evita que nazca el objeto;
  * el guard es el suelo, para que el SQL directo tampoco pueda.
  *
+ * Y una propuesta tiene DOS recorridos, no uno; por eso hay DOS tablas. El primero
+ * —generar, despachar, persistir— termina en una fila pendiente y es el de aquí abajo. El
+ * segundo —revisar, aceptar, materializar— empieza cuando un humano la mira, puede tardar
+ * días y en ese hueco, mucho más ancho que el del despacho, las mismas precondiciones
+ * vuelven a caducar: tiene su propia tabla al final, porque no basta con repetirla. Cambian
+ * los momentos (ya no hay gasto que evitar, y en su lugar está el PANEL) y cambia lo que
+ * está en juego: lo que nace ya no es una propuesta, es evidencia o son criterios.
+ *
  * Y una cuarta columna que responde otra pregunta sobre la misma fila: **quién más escribe
  * ese dato y si comparte mecanismo de serialización**. Exigir un predicado en tres momentos
  * no lo vuelve un cerrojo — sigue siendo una foto—, así que hay que mirar las dos cosas.
@@ -637,6 +665,78 @@ async function liberarReserva(
  *    ser de otro tipo («ninguna propuesta pendiente sobrevive al congelado»), el mecanismo
  *    ya está identificado: `for update` sobre los G0 en el mismo orden estable que usa
  *    `criterio_g0_pendiente_guard`, y el candado de reto que ese módulo documenta.
+ *
+ * SEGUNDO RECORRIDO (revisar → aceptar → materializar). Las mismas precondiciones con otro
+ * reloj. El momento «antes de llamar» no existe aquí —no hay gasto que evitar— y lo ocupa
+ * el PANEL, que es donde se decide si la acción llega a ofrecerse; «al materializar» es el
+ * servicio, y el suelo sigue siendo la base:
+ *
+ *  | Precondición                  | En el panel (`anclaEstado`)  | Al materializar             | Suelo (base)                 |
+ *  |-------------------------------|------------------------------|-----------------------------|------------------------------|
+ *  | Cuenta activa                 | sin ella no hay panel        | sí                          | — (es capa 2)                |
+ *  | Rol curador                   | sí, por `puedeRevisar`       | sí (`rolCurador`)           | política de UPDATE           |
+ *  | Propuesta aún pendiente       | la separa de las decididas   | sí⁸                         | USING + guard de revisión    |
+ *  | CI · item aún pendiente       | `item-curado`                | sí⁹                         | guard de materialización¹⁰   |
+ *  | CI · consentimiento vigente   | `consentimiento-revocado`    | sí                          | guard de revisión            |
+ *  | CI · citas intactas           | no aplica: es la corrección  | sí, contra el original      | guard de revisión            |
+ *  | C0 · criterios no congelados  | `criterios-congelados`       | sí, al insertar¹¹           | política de `criterio_exito` |
+ *  | C0 · reto admite criterios    | `reto-no-admite`             | sí (`materializarCriterio`) | guard de materialización¹⁰   |
+ *
+ * La columna del panel no es cosmética y tampoco es un cuarto sitio donde repetir lo mismo:
+ * los cuatro valores de `anclaEstado` distintos de `disponible` SON exactamente las cuatro
+ * filas que pueden caducar sin que el revisor haga nada. Por eso es un enum y no un
+ * booleano —un botón apagado sin decir por qué es la mitad del arreglo—, y por eso añadir
+ * una precondición de este bloque obliga a añadirle su motivo: si la base la rechaza y el
+ * panel la sigue ofreciendo, el revisor descubre el problema con el error.
+ *
+ * La ASIMETRÍA que sostiene la tabla entera: **rechazar sigue abierto siempre**. Ninguna de
+ * estas filas alcanza al rechazo — ni en el servicio, que no materializa nada, ni en los
+ * guards, que salen temprano cuando el estado nuevo no es `aceptada`/`corregida`. Rechazar
+ * ES la salida de una propuesta obsoleta: si el bloqueo la alcanzara, la fila quedaría
+ * muerta —ni materializable ni cerrable— y encima reteniendo su ancla, que no se vuelve a
+ * ofrecer mientras tenga una propuesta pendiente. El ancla quedaría inutilizable para
+ * siempre por una precondición que solo pretendía proteger lo que nace.
+ *
+ * Las CINCO filas del primer recorrido que NO reaparecen en esta tabla, una por una y con
+ * su razón — un inventario que pierde filas al cambiar de tabla deja de servir para
+ * comprobar nada, y «no la puse» y «no aplica» se leen igual desde fuera:
+ *
+ *  · **Presupuesto** y **credencial del proveedor**: aceptar no gasta nada en el proveedor
+ *    —el dinero se fue en el primer recorrido—, así que atarlo al tope cobraría dos veces
+ *    la misma llamada y dejaría propuestas ya pagadas sin poder materializarse por una
+ *    cuota que su generación ya respetó.
+ *  · **CI · material extraíble**: no puede caducar. `contenido` no está en el grant de
+ *    UPDATE de la bandeja (nota ³), así que el material que el modelo leyó sigue ahí
+ *    palabra por palabra — y es justo contra él contra lo que se miden las citas al
+ *    aceptar, así que re-exigirlo sería preguntar dos veces lo mismo.
+ *  · **Ancla sin generación en vuelo**: la reserva es el token que autoriza DESPACHAR, y
+ *    aquí no se despacha nada. Tampoco puede haber una viva: un ancla con propuesta
+ *    pendiente no se vuelve a ofrecer para generar, así que ninguna reserva nueva nace
+ *    sobre ella mientras esta propuesta espera revisión.
+ *  · **Ancla sin propuesta pendiente**: no es precondición de aceptar, es su CONSECUENCIA
+ *    —la propuesta deja de estar pendiente en cuanto se decide— y es lo que devuelve el
+ *    ancla a la circulación. De ahí que bloquear el rechazo saliera tan caro: es la única
+ *    salida que queda cuando aceptar ya no puede, y sin ella el ancla no vuelve nunca.
+ *
+ * Y las dos filas que solo existen aquí —**propuesta aún pendiente** y **citas intactas**—
+ * no tienen contrapartida arriba por la razón simétrica: en el primer recorrido la
+ * propuesta todavía no existe y las citas se están escribiendo, no comprobando.
+ *
+ *  ⁸ Dos veces y a propósito: `leerParaRevisar` para dar un error con nombre, y el
+ *    `where estado = 'propuesta'` del UPDATE que sella, que es el que decide de verdad
+ *    cuando dos revisores llegan a la vez.
+ *  ⁹ Igual que arriba: la lectura da el mensaje y el `where estado = 'pendiente'` del
+ *    update que sella el item es el que arbitra; si otro lo curó a mano, 0 filas y la
+ *    transacción entera se revierte, evidencia incluida.
+ * ¹⁰ Constraint trigger DIFERIDO al commit, no inmediato: el servicio materializa y sella
+ *    en sentencias posteriores de la misma transacción, así que un guard inmediato vería un
+ *    estado a medias. Que corra al commit es además lo que lo vuelve suelo real para este
+ *    recorrido: comprueba el estado del ancla en el ÚLTIMO instante posible.
+ * ¹¹ No se lee antes de insertar, y es deliberado: la política y `criterio_g0_pendiente_guard`
+ *    ya lo dicen en la propia sentencia, sin ventana. El servicio solo traduce el 42501 y el
+ *    P0001 a un mensaje que el revisor entiende. El estado del reto, en cambio, SÍ se lee
+ *    antes: ninguna política de `criterio_exito` lo mira, así que sin esa lectura no habría
+ *    quien lo dijera.
  *
  * Última comprobación antes de que el material salga hacia el proveedor (RF-09.5).
  *
@@ -1220,6 +1320,23 @@ async function materializarCriterio(
   // Mismo candado que agregarCriterio: mutar criterios y decidir un G0 no pueden
   // entrecruzarse (contrato documentado en metodo.servicio.ts).
   await bloquearReto(tx, p.retoId!);
+  // El reto tiene que SEGUIR admitiendo criterios, y eso no lo cubre el congelado por G0:
+  // son dos predicados distintos. La generación exigió los dos y el guard del INSERT
+  // también, pero entre generar y aceptar hay una segunda vida entera y el ciclo de vida del
+  // reto avanza solo (`candidato → archivado` es una transición legal, igual que
+  // `activo → en-medicion → cerrado`). Aceptar después colgaría un criterio de un reto que
+  // ya no lo admite — un contrato de medición para algo que nadie va a medir— y ninguna
+  // política de `criterio_exito` lo mira, así que sin esta lectura nadie lo diría. Mismo
+  // razonamiento que el consentimiento retirado antes de aceptar, con más consecuencias:
+  // aquí lo que nace no es una propuesta, es el criterio. Se lee DENTRO de `bloquearReto`,
+  // el mismo candado que toma la aprobación del G0.
+  const [reto] = await tx`select
+    reto_admite_criterios(${p.retoId}::uuid, ${workspaceId}::uuid) as admite`;
+  if (!reto?.admite) {
+    throw new ErrorAI(
+      'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo. Esta propuesta quedó obsoleta y solo puede rechazarse',
+    );
+  }
   try {
     const [criterio] = await tx`insert into criterio_exito
       (workspace_id, reto_id, kpi, definicion, linea_base_valor, linea_base_fecha,

@@ -87,6 +87,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'El consentimiento de ese material ya no autoriza el procesamiento externo: esta propuesta quedó obsoleta y solo puede rechazarse. El item sigue pudiendo curarse a mano en la bandeja.',
   'criterios-congelados':
     'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'reto-no-admite':
+    'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 
@@ -868,9 +870,11 @@ function TarjetaPropuesta({
         </span>
       )}
       {/* El ancla dejó de admitir la materialización, y cada motivo tiene su salida: el
-          item se curó a mano, la persona retiró el consentimiento (RF-09.4/09.5) o el G0 del
-          reto congeló los criterios (SYS-22). En los tres casos la propuesta quedó obsoleta
-          y aceptarla solo produciría un rechazo de la base. */}
+          item se curó a mano, la persona retiró el consentimiento (RF-09.4/09.5), el G0 del
+          reto congeló los criterios (SYS-22) o el reto avanzó en su ciclo de vida y ya no
+          admite criterios nuevos (RF-04.12). En los cuatro casos la propuesta quedó obsoleta
+          y aceptarla solo produciría un rechazo de la base — pero RECHAZAR sigue habilitado
+          abajo, porque es justamente la salida que cierra la fila. */}
       {propuesta.estado === 'propuesta' && puedeRevisar && !anclaDisponible && (
         <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
           {MOTIVO_ANCLA[propuesta.anclaEstado]}

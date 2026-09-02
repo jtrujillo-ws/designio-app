@@ -208,9 +208,46 @@ returns boolean language sql stable as $$
       and e.estado <> 'en-curso')
 $$;
 
+-- Y su HERMANO, que responde otra pregunta sobre el mismo reto: si su ciclo de vida sigue
+-- en un punto donde caben criterios nuevos. No se fusiona con el de arriba y conviene decir
+-- por qué: «congelado» es una decisión del método (un G0 certificó ESTOS criterios, SYS-22)
+-- y se revierte reabriendo la etapa 0 (RF-04.9); «ya no admite» es el ciclo de vida del reto
+-- (RF-04.12), que es de sentido único y no se revierte nunca. Se explican distinto al
+-- revisor y caducan por caminos distintos, así que fundirlos daría un único mensaje que
+-- mentiría en la mitad de los casos.
+--
+-- Vive en una función por lo mismo que el otro: el predicado ya estaba escrito a mano en el
+-- guard del INSERT de propuestas, y en cuanto la aceptación pasó a exigirlo también habría
+-- pasado a estar en dos sitios — y las lecturas del panel, en un tercero. Quienes lo IMPONEN
+-- (los dos guards) y quien lo ANTICIPA (el panel y el servicio) llaman todos aquí.
+create function reto_admite_criterios(p_reto_id uuid, p_workspace_id uuid)
+returns boolean language sql stable as $$
+  select exists (
+    select 1 from reto r
+    where r.id = p_reto_id and r.workspace_id = p_workspace_id
+      and r.estado in ('candidato', 'activo'))
+$$;
+
 -- Y quienes lo imponen pasan a llamarla, para que no queden dos definiciones que puedan
 -- volver a separarse. El resto del guard no cambia: el candado por G0 en orden estable
 -- (dos guards concurrentes no se cruzan) y el evento de la transición siguen igual.
+--
+-- ⚠ CUIDADO AL INTEGRAR: lo que sigue REEMPLAZA un cuerpo vivo definido en una migración
+-- anterior, y lo mismo hacen los dos `drop policy` de más abajo. En base limpia gana la
+-- migración de número más alto, así que si otra rama añade una regla a este guard o a esas
+-- políticas en una migración ANTERIOR a `130000`, esta la borra en silencio — no habrá
+-- conflicto de merge que avise, porque los ficheros son distintos.
+--
+-- La regla al integrar es una y va en este orden: coge el cuerpo VIVO entero de la
+-- migración más reciente que lo defina y vuelve a aplicarle encima este refactor (la
+-- llamada a `reto_criterios_congelados`). Nunca al revés — no partas de esta versión
+-- añadiéndole de memoria la regla que recuerdes, porque para entonces puede haber más de
+-- una. Y si la regla nueva es otra condición de congelado, va DENTRO de
+-- `reto_criterios_congelados`: la llaman también las dos políticas de `criterio_exito`, los
+-- dos guards de `propuesta_ai` y las lecturas del panel, así que meterla solo aquí volvería
+-- a partir el predicado en dos (que es el fallo que este refactor vino a cerrar). Si en
+-- cambio es sobre el ESTADO del reto, su sitio es `reto_admite_criterios`, que es función
+-- nueva de esta migración: no la reemplaza nadie, así que ahí no hay nada que rescatar.
 create or replace function criterio_g0_pendiente_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -232,6 +269,9 @@ begin
   return new;
 end $$;
 
+-- ⚠ Mismo cuidado que con el guard: esto REEMPLAZA las dos políticas vivas. Al integrar
+-- una rama que también las toque, parte de las suyas y vuelve a aplicar la llamada al
+-- helper; no de estas. Un `drop policy` + `create policy` no deja rastro de lo que borró.
 drop policy criterio_insert on criterio_exito;
 create policy criterio_insert on criterio_exito
   for insert with check (
@@ -555,11 +595,9 @@ begin
     end if;
     if new.reto_id is not null and (
       reto_criterios_congelados(new.reto_id, new.workspace_id)
-      or not exists (select 1 from reto r
-        where r.id = new.reto_id and r.workspace_id = new.workspace_id
-          and r.estado in ('candidato', 'activo'))
+      or not reto_admite_criterios(new.reto_id, new.workspace_id)
     ) then
-      raise exception 'ese reto ya no admite criterios nuevos (G0 aprobado o reto cerrado)';
+      raise exception 'ese reto ya no admite criterios nuevos: o su G0 los congeló, o el reto avanzó más allá de candidato/activo';
     end if;
 
     -- La llamada referenciada tiene que ser LA QUE PRODUJO esta propuesta, no una
@@ -695,6 +733,23 @@ begin
       and c.reto_id = new.reto_id
       and c.creado_por = new.revisada_por) then
     raise exception 'el criterio materializado cuelga del reto de la propuesta y lo firma quien aceptó (SYS-19)';
+  end if;
+  -- Y el reto tiene que SEGUIR admitiendo criterios al aceptar, que no es lo mismo que el
+  -- congelado por G0 y no lo cubre ninguna política de `criterio_exito`. El ciclo de vida
+  -- del reto avanza solo: `candidato → archivado` es una transición legal, igual que
+  -- `activo → en-medicion → cerrado`. El guard del INSERT exige este mismo predicado al
+  -- nacer la propuesta, pero entre nacer y aceptarse caben días — sin esto, aceptar colgaba
+  -- un criterio de un reto que ya no lo admite: un contrato de medición para algo que nadie
+  -- va a medir.
+  --
+  -- Que sea DIFERIDO es lo que lo vuelve suelo de verdad para ese hueco: corre en el commit,
+  -- o sea en el último instante posible, y ve la transición ajena ya commiteada. Y rechazar
+  -- sigue abierto —el `return null` de arriba deja pasar todo lo que no es aceptación—:
+  -- una propuesta obsoleta se cierra rechazándola, y bloquear también esa salida dejaría la
+  -- fila muerta y su ancla retenida para siempre.
+  if new.destino = 'criterio-exito'
+     and not reto_admite_criterios(new.reto_id, new.workspace_id) then
+    raise exception 'ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo';
   end if;
   return null;
 end $$;

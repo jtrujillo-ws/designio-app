@@ -844,19 +844,41 @@ begin
     -- explicado, que es lo que el gate exige (honestidad, no perfección).
     -- Solo las design versions APROBADAS: los elementos de una superada son historia de
     -- un ciclo anterior, y exigirles conciliación ataría G7 a decisiones ya reemplazadas.
-    if new.numero = 7 and exists (
-      select 1 from elemento_cambio ec
-      join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
-      where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
-        and dv.estado = 'aprobada'
-        and not exists (
-          select 1 from constatacion c
-          join effective_state es on es.id = c.effective_state_id and es.workspace_id = c.workspace_id
-          join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
-          where c.elemento_id = ec.id and c.workspace_id = ec.workspace_id
-            and r.estado = 'verificado')
-    ) then
-      raise exception 'no se puede aprobar G7: hay elementos de la design version en estado desconocido (RF-06.7)';
+    if new.numero = 7 then
+      -- Primero, que HAYA tablero. El «no exists elemento en estado desconocido» de
+      -- abajo es vacuamente cierto cuando no hay ningún elemento que mirar: un proyecto
+      -- sin design version aprobada aprobaba G7 en cuanto su checklist y la escalera de
+      -- gates estaban en orden, certificando una implementación que nadie declaró, ni
+      -- repartió en releases, ni constató. Es el mismo agujero que tapa exigir ≥1 ítem
+      -- de checklist («sin ítems no hay pendientes»), y la misma regla que la app ya
+      -- aplica en `conciliacionCompleta([])`: un tablero vacío no está completo, está
+      -- vacío. Se exige la design version APROBADA y CON elementos porque es la única
+      -- que produce filas de conciliación: una aprobada sin elementos —que la transición
+      -- ya no deja nacer, pero que un backfill podría dejar— volvería a vaciar el
+      -- predicado sin que se note.
+      if not exists (
+        select 1 from design_version dv
+        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
+          and dv.estado = 'aprobada'
+          and exists (select 1 from elemento_cambio ec
+            where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id)
+      ) then
+        raise exception 'no se puede aprobar G7: el proyecto no tiene ninguna design version aprobada con elementos que conciliar (RF-06.7)';
+      end if;
+      if exists (
+        select 1 from elemento_cambio ec
+        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
+          and dv.estado = 'aprobada'
+          and not exists (
+            select 1 from constatacion c
+            join effective_state es on es.id = c.effective_state_id and es.workspace_id = c.workspace_id
+            join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
+            where c.elemento_id = ec.id and c.workspace_id = ec.workspace_id
+              and r.estado = 'verificado')
+      ) then
+        raise exception 'no se puede aprobar G7: hay elementos de la design version en estado desconocido (RF-06.7)';
+      end if;
     end if;
     -- Efectos INSEPARABLES de la transición, también para el UPDATE directo: la etapa
     -- homóloga se completa y el evento inmutable queda con el actor y su rol del

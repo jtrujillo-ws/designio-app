@@ -696,6 +696,36 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // con DV-1 aprobada.
   });
 
+  it('G7 no se aprueba sobre la nada: sin design version aprobada no hay tablero que cerrar', async () => {
+    const admin = sqlAdmin();
+    const [p] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-92', 'Proyecto sin design version', ${leadId}) returning id`;
+    const sinDv = p!.id as string;
+    for (let n = 0; n <= 7; n++) {
+      const [g] = await admin`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador)
+        values (${ws}, ${sinDv}, ${n}, ${[0, 3, 5, 6].includes(n) ? 'sponsor' : 'lead-boutique'})
+        returning id`;
+      await admin`insert into checklist_item
+        (workspace_id, gate_id, orden, texto, estado, na_justificacion, na_aprobado_por)
+        values (${ws}, ${g!.id as string}, 0, 'Ítem del test', 'na', 'fuera de alcance del test',
+                ${leadId})`;
+    }
+    for (let n = 0; n <= 6; n++) {
+      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${sinDv} and workspace_id = ${ws} and numero = ${n}`;
+    }
+    // El checklist está en orden y la escalera de gates también; lo que falta es el
+    // objeto que G7 certifica. Antes pasaba: el «no hay elementos en estado desconocido»
+    // era vacuamente cierto porque no había ningún elemento.
+    await expect(
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${sinDv} and workspace_id = ${ws} and numero = 7`,
+    ).rejects.toThrow(/ninguna design version aprobada con elementos/);
+    // Es la misma regla que la app ya aplicaba del lado puro.
+    expect(conciliacionCompleta([])).toBe(false);
+  });
+
   it('nada de esto cruza el workspace', async () => {
     const admin = sqlAdmin();
     const [otro] = await admin`insert into workspace (nombre) values (${marca + '-ajeno'})

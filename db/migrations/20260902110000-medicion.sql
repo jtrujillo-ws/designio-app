@@ -857,6 +857,43 @@ begin
     if faltan is not null then
       raise exception 'no se puede firmar: el propietario del dato tiene que ser una persona del cliente (RF-07.1): %', faltan;
     end if;
+    -- ── Completo no es lo mismo que COHERENTE ──
+    -- Los bloques de arriba comprueban que los campos ESTÉN. Estos dos comprueban que
+    -- digan algo posible entre sí: un contrato con todos los huecos rellenos puede seguir
+    -- siendo imposible de cumplir, y firmarlo lo congela sin reparación.
+    --
+    -- 1) La línea base es el ANTES de lo que se mide, así que no puede estar fechada
+    -- después de que la medición empiece. Con la ventana firmada, los snapshots quedan
+    -- acotados a ella mientras la proyección y el post-mortem los comparan contra una
+    -- «línea base» cronológicamente posterior: una historia base→resultado al revés.
+    select string_agg(e.nombre, ', ' order by e.nombre) into faltan
+    from entrada_kpi e
+    where e.registry_id = new.id and e.workspace_id = new.workspace_id
+      and e.linea_base_fecha > e.ventana_inicio;
+    if faltan is not null then
+      raise exception 'no se puede firmar: la línea base es posterior al inicio de la ventana: %', faltan;
+    end if;
+    -- 2) Y la cadencia comprometida tiene que CABER en la ventana al menos una vez. Un KPI
+    -- trimestral con ventana de 30 días promete una entrega que vence después del cierre:
+    -- nunca llega ninguna, y el post-mortem lo lee como «vencido» por construcción — un
+    -- «no concluyente» pactado de antemano, que es justo lo que la firma existe para
+    -- impedir.
+    --
+    -- Se compara contra el largo MÍNIMO del intervalo (28 días un mes, 89 un trimestre) y
+    -- no contra el intervalo aplicado a `ventana_inicio`, que es lo que escribí primero: eso
+    -- habría hecho que firmar un KPI mensual con ventana de 30 días pasara o fallara según
+    -- el mes en que cayera el inicio — exactamente el defecto que este mismo commit corrige
+    -- en la cadencia. Una regla que dice «esto es imposible de cumplir» solo puede rechazar
+    -- lo que es imposible en TODOS los meses; en la duda, firma.
+    select string_agg(e.nombre, ', ' order by e.nombre) into faltan
+    from entrada_kpi e
+    join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
+    where e.registry_id = new.id and e.workspace_id = new.workspace_id
+      and c.ventana_dias < case e.frecuencia
+        when 'semanal' then 7 when 'mensual' then 28 when 'trimestral' then 89 else 0 end;
+    if faltan is not null then
+      raise exception 'no se puede firmar: la cadencia comprometida no cabe en la ventana del criterio: %', faltan;
+    end if;
     -- El post-mortem se prevé DESPUÉS del cierre de la ventana: fecharlo antes sería
     -- comprometerse a un veredicto sobre datos que aún no existen. «Después» es ESTRICTO,
     -- por la misma razón que el review no se abre el último día: ese día todavía se mide,
@@ -1214,6 +1251,127 @@ begin
       app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   return new;
 end $$;
+
+-- ══ AUDITORÍA: toda mutación de la medición deja rastro, y lo deja la BASE ═════════════
+-- Doctrina del repositorio y del grafo del journey (`journey_grafo_auditoria`): el evento
+-- lo emite un trigger, no el servicio, para que el SQL directo también lo produzca. Este
+-- slice había emitido tres desde el servicio —con la excusa de que la CTE comparte snapshot
+-- con la escritura— y eso los deja fuera de cualquier ruta futura y de cualquier `update`
+-- a mano. Aquí se completa el inventario y se mudan.
+--
+-- INVENTARIO de escrituras del slice y su rastro. La columna «dónde» es la parte que
+-- importa: un evento en el servicio es una promesa, uno en el trigger es una propiedad.
+--
+--   TABLA · ESCRITURA        EVENTO                        DÓNDE SE EMITE
+--   metric_registry INSERT      · MetricRegistryAbierto        · trigger (era servicio)
+--   metric_registry UPDATE      · MetricRegistryFirmado        · guard de la firma (la
+--       única actualización legal: el grant es `estado`/`firmado_por` y la política solo
+--       admite borrador→firmado, así que no hay UPDATE sin evento que auditar)
+--   entrada_kpi     INSERT      · EntradaKpiAgregada           · trigger (no existía)
+--   entrada_kpi     UPDATE      · EntradaKpiEditada + `antes`  · trigger (no existía)
+--   snapshot        INSERT      · SnapshotRegistrado           · trigger (era servicio)
+--   outcome_review  INSERT      · OutcomeReviewAbierto         · trigger (no existía)
+--   outcome_review  UPDATE      · OutcomeReviewCompletado      · guard del cierre
+--   resultado_criterio INSERT   · ResultadoCriterioRegistrado  · trigger (no existía)
+--   resultado_criterio UPDATE   · ResultadoCriterioEditado + `antes` · trigger (no existía;
+--       el upsert por criterio entra por aquí, que es como Postgres resuelve el
+--       `on conflict do update`: la corrección del borrador es un UPDATE y se audita)
+--   criterio_exito  INSERT/UPDATE · CriterioDefinido/Editado   · guard del G0 (este slice
+--       le añade la política de escritura y la congelación por registry firmado; el
+--       evento ya lo emitía y sigue donde estaba)
+--   reto UPDATE estado/veredicto· RetoTransicionado            · guard de transición
+--   proyecto UPDATE estado      · ProyectoTransicionado        · guard de transición, y
+--       eso incluye los dos movimientos que dispara otro trigger —a implementación tras
+--       G6 y a cerrado tras el post-mortem—: el guard es `before update of estado` y no
+--       distingue quién escribe, así que el efecto encadenado también deja su rastro
+--   gate_instancia UPDATE       · GateAprobado                 · guard de suficiencia
+--
+-- FUERA del rastro, que es la otra mitad del inventario y la que hay que justificar:
+--  · `etapa_instancia set estado = 'completada'` al aprobarse un gate. Es el único efecto
+--    encadenado del slice SIN evento propio, y a propósito: no tiene guard de transición
+--    donde emitirlo y no añadiría nada a `GateAprobado` —mismo actor, mismo instante,
+--    misma etapa deducible del número del gate—. Es un espejo del gate, no una decisión.
+--  · Las dos columnas de perdón histórico las escribe la MIGRACIÓN, sin actor: un evento
+--    con `actor_id` nulo afirmaría que alguien lo hizo.
+--  · `reapertura_etapa` no es escritura de este slice —solo le añade la puerta «proyecto
+--    no cerrado»—; su `EtapaReabierta` vive en el servicio de gobernanza, que es de quien
+--    es la tabla. Mudarlo desde aquí sería reescribir el rastro de otro slice de paso.
+--  · `SnapshotsCargados` (la tanda de CSV) SIGUE en el servicio, y es la única excepción
+--    honesta: cuenta las filas RECHAZADAS, que no llegan a ser filas de ninguna tabla, así
+--    que ningún trigger puede verlas. Convive con el `SnapshotRegistrado` por fila: son dos
+--    hechos distintos —«alguien pegó una tanda con N buenas y M malas» y «esta medición
+--    concreta entró»— y solo el segundo es reconstruible desde los datos.
+create function medicion_auditoria() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  fila jsonb := to_jsonb(new);
+  previa jsonb := case when tg_op = 'UPDATE' then to_jsonb(old) end;
+  cuerpo jsonb;
+  evento text;
+begin
+  -- Guard compartido entre tablas con columnas distintas: se trabaja sobre jsonb porque
+  -- plpgsql resuelve TODAS las referencias de campo aunque su rama no se ejecute.
+  if tg_table_name = 'metric_registry' then
+    evento := 'MetricRegistryAbierto';
+    cuerpo := jsonb_build_object('registryId', fila->'id', 'retoId', fila->'reto_id');
+  elsif tg_table_name = 'entrada_kpi' then
+    evento := case tg_op when 'INSERT' then 'EntradaKpiAgregada' else 'EntradaKpiEditada' end;
+    cuerpo := jsonb_build_object('entradaId', fila->'id', 'registryId', fila->'registry_id',
+      'criterioId', fila->'criterio_id', 'nombre', fila->'nombre',
+      'propietarioMiembroId', fila->'propietario_miembro_id', 'frecuencia', fila->'frecuencia',
+      'lineaBaseValor', fila->'linea_base_valor', 'lineaBaseFecha', fila->'linea_base_fecha',
+      'ventanaInicio', fila->'ventana_inicio', 'fechaPostMortem', fila->'fecha_post_mortem');
+    -- El «antes» es lo que hace auditable una EDICIÓN: sin él, el rastro dice que alguien
+    -- tocó la entrada pero no qué movió — y aquí lo que se mueve es el contrato.
+    if previa is not null then
+      cuerpo := cuerpo || jsonb_build_object('antes', jsonb_build_object(
+        'criterioId', previa->'criterio_id', 'nombre', previa->'nombre',
+        'propietarioMiembroId', previa->'propietario_miembro_id',
+        'frecuencia', previa->'frecuencia', 'lineaBaseValor', previa->'linea_base_valor',
+        'lineaBaseFecha', previa->'linea_base_fecha', 'ventanaInicio', previa->'ventana_inicio',
+        'fechaPostMortem', previa->'fecha_post_mortem'));
+    end if;
+  elsif tg_table_name = 'snapshot' then
+    evento := 'SnapshotRegistrado';
+    cuerpo := jsonb_build_object('snapshotId', fila->'id', 'entradaId', fila->'entrada_kpi_id',
+      'valor', fila->'valor', 'fecha', fila->'fecha', 'origen', fila->'origen');
+  elsif tg_table_name = 'outcome_review' then
+    evento := 'OutcomeReviewAbierto';
+    cuerpo := jsonb_build_object('reviewId', fila->'id', 'retoId', fila->'reto_id');
+  else
+    evento := case tg_op when 'INSERT' then 'ResultadoCriterioRegistrado'
+                         else 'ResultadoCriterioEditado' end;
+    cuerpo := jsonb_build_object('resultadoId', fila->'id', 'reviewId', fila->'review_id',
+      'criterioId', fila->'criterio_id', 'snapshotFinalId', fila->'snapshot_final_id',
+      'lectura', fila->'lectura', 'sinDatosMotivo', fila->'sin_datos_motivo');
+    if previa is not null then
+      cuerpo := cuerpo || jsonb_build_object('antes', jsonb_build_object(
+        'snapshotFinalId', previa->'snapshot_final_id',
+        'sinDatosMotivo', previa->'sin_datos_motivo', 'lectura', previa->'lectura'));
+    end if;
+  end if;
+  -- Sin `jsonb_strip_nulls`: aquí un nulo es información, no un hueco. `resultado_criterio`
+  -- lleva por CHECK exactamente uno de los dos —snapshot final o motivo de la falta—, así
+  -- que quitar la clave nula borraría de qué tipo de resultado se trataba; y en `antes`
+  -- convertiría «este campo estaba vacío y ahora tiene valor» en «este campo no se
+  -- audita». El rastro dice lo que había, incluido que no había nada.
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id, evento, cuerpo,
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  return new;
+end $$;
+-- AFTER: el rastro se emite cuando la escritura ya es un hecho, no cuando se propone.
+create trigger registry_auditoria
+  after insert on metric_registry for each row execute function medicion_auditoria();
+create trigger entrada_auditoria
+  after insert or update on entrada_kpi for each row execute function medicion_auditoria();
+create trigger snapshot_auditoria
+  after insert on snapshot for each row execute function medicion_auditoria();
+create trigger review_auditoria
+  after insert on outcome_review for each row execute function medicion_auditoria();
+create trigger resultado_auditoria
+  after insert or update on resultado_criterio for each row execute function medicion_auditoria();
+revoke execute on function medicion_auditoria() from public;
 
 -- ── Grants mínimos ──
 grant select, insert on metric_registry, entrada_kpi, snapshot to designio_app;

@@ -129,25 +129,13 @@ export async function abrirRegistry(
     await exigirCuentaActiva(tx, actorId);
     let fila;
     try {
-      // UNA sentencia: registry y evento comparten snapshot y el rol auditado es el que
-      // autorizó el insert (misma disciplina que el resto de los módulos).
+      // El evento `MetricRegistryAbierto` NO se emite aquí: lo emite el trigger de
+      // auditoría de la base, para que también lo produzca el SQL directo. Un evento en el
+      // servicio es una promesa; uno en el trigger es una propiedad.
       [fila] = await tx`
-        with quien as (
-          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-        ),
-        nuevo as (
-          insert into metric_registry (workspace_id, reto_id, creado_por)
-          values (${entrada.workspaceId}, ${entrada.retoId}, ${actorId})
-          returning id
-        ),
-        evento as (
-          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-          select ${entrada.workspaceId}, 'MetricRegistryAbierto',
-            jsonb_build_object('registryId', nuevo.id, 'retoId', ${entrada.retoId}::uuid),
-            ${actorId}, quien.rol
-          from nuevo, quien
-        )
-        select id from nuevo`;
+        insert into metric_registry (workspace_id, reto_id, creado_por)
+        values (${entrada.workspaceId}, ${entrada.retoId}, ${actorId})
+        returning id`;
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code === '23505') throw new ErrorMedicion('Este reto ya tiene su Metric Registry');
@@ -447,27 +435,14 @@ export async function registrarSnapshot(
     }
     let fila;
     try {
-      // UNA sentencia: snapshot y evento comparten snapshot de transacción y el rol
-      // auditado es el que autorizó el insert.
+      // `SnapshotRegistrado` lo emite el trigger de auditoría, igual que el resto: la
+      // serie es el dato del que sale el veredicto y su rastro no puede depender de que
+      // se entre por aquí.
       [fila] = await tx`
-        with quien as (
-          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-        ),
-        nuevo as (
-          insert into snapshot (workspace_id, entrada_kpi_id, valor, fecha, origen, nota, creado_por)
-          values (${entrada.workspaceId}, ${entrada.entradaId}, ${entrada.valor}::numeric,
-                  ${entrada.fecha}::date, 'formulario', ${entrada.nota}, ${actorId})
-          returning id
-        ),
-        evento as (
-          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-          select ${entrada.workspaceId}, 'SnapshotRegistrado',
-            jsonb_build_object('snapshotId', nuevo.id, 'entradaId', ${entrada.entradaId}::uuid,
-                               'fecha', ${entrada.fecha}::text, 'origen', 'formulario'),
-            ${actorId}, quien.rol
-          from nuevo, quien
-        )
-        select id from nuevo`;
+        insert into snapshot (workspace_id, entrada_kpi_id, valor, fecha, origen, nota, creado_por)
+        values (${entrada.workspaceId}, ${entrada.entradaId}, ${entrada.valor}::numeric,
+                ${entrada.fecha}::date, 'formulario', ${entrada.nota}, ${actorId})
+        returning id`;
     } catch (e) {
       if (esRechazoDePolitica(e)) throw new ErrorMedicion(RECHAZO_SNAPSHOT);
       // El guard del punto de cita habla con su propio motivo (P0001) cuando el reto dejó
@@ -529,8 +504,9 @@ export async function cargarSnapshotsCsv(
       comoErrorDeDominio(e);
     }
     const [quien] = await tx`select workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
-    // Un evento por CARGA, no por fila: la decisión auditable es «alguien cargó esta
-    // tanda por CSV»; cada snapshot ya es una fila inmutable con su autor y su fecha.
+    // Un evento por CARGA, ADEMÁS del que el trigger emite por fila. Es la única
+    // excepción honesta a «el rastro lo emite la base»: cuenta las filas RECHAZADAS, que
+    // no llegan a ser filas de ninguna tabla, así que ningún trigger puede verlas.
     await tx`
       insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (${entrada.workspaceId}, 'SnapshotsCargados',
@@ -835,17 +811,17 @@ export async function seguimientoDeImpacto(
                 -- cerrara ayer o antes), mientras que abajo se compara contra hoy, y hoy
                 -- todavía no ha terminado. Con el corte estricto se daba por cumplida la
                 -- entrega que tocaba justo el último día y nunca llegó.
-                when cad.dias is not null
-                     and ult.fecha + cad.dias <= e.ventana_inicio + c.ventana_dias
+                when cad.paso is not null
+                     and (ult.fecha + cad.paso)::date <= e.ventana_inicio + c.ventana_dias
                   then 'vencido'
                 -- Llegó lo comprometido hasta el final: la medición terminó.
                 else 'cerrado' end
-              when cad.dias is null then
+              when cad.paso is null then
                 case when ult.fecha is not null then 'recibido' else 'esperado' end
               when ult.fecha is null then
-                case when e.ventana_inicio + cad.dias < current_date then 'vencido'
+                case when (e.ventana_inicio + cad.paso)::date < current_date then 'vencido'
                      else 'esperado' end
-              when ult.fecha + cad.dias < current_date then 'vencido'
+              when (ult.fecha + cad.paso)::date < current_date then 'vencido'
               else 'recibido' end,
             'snapshots', coalesce((
               select jsonb_agg(jsonb_build_object(
@@ -861,8 +837,15 @@ export async function seguimientoDeImpacto(
           left join miembro m on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
           left join lateral (select max(s.fecha) as fecha from snapshot s
             where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id) ult on true
+          -- La cadencia es un compromiso de CALENDARIO, no de aritmética: «mensual» es el
+          -- mes siguiente, no treinta días. Con 30 fijos la fecha prometida dependía de la
+          -- longitud del mes — un dato del 1 de agosto vencía el 31 y entraba en mora el 1
+          -- de septiembre, antes de que tocara el de septiembre; y uno del 31 de enero no
+          -- vencía hasta el 2 de marzo. Sumar un mes de calendario respeta el fin de mes.
           cross join lateral (select case e.frecuencia
-            when 'semanal' then 7 when 'mensual' then 30 when 'trimestral' then 90 end as dias) cad
+            when 'semanal' then interval '7 days'
+            when 'mensual' then interval '1 month'
+            when 'trimestral' then interval '3 months' end as paso) cad
           where e.registry_id = mr.id and e.workspace_id = mr.workspace_id), '[]'::jsonb) as entradas,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', c.id, 'kpi', c.kpi) order by c.creado_en, c.id)

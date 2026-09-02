@@ -59,6 +59,10 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
   let proyectoHeredadoId = '';
   let criterioHeredadoId = '';
   let registryHeredadoId = '';
+  // Reto que YA venía midiendo fuera del sistema: su entrada es la única MENSUAL sin serie
+  // propia, así que es donde se fija la aritmética de calendario de la cadencia.
+  let proyectoViejoId = '';
+  let entradaViejaId = '';
 
   /**
    * Corre `accion` mientras OTRA sesión retiene algo durante 300 ms, y responde si tuvo
@@ -441,6 +445,58 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       ventanaInicio: fecha(-5),
       fechaPostMortem: fecha(90),
     });
+  });
+
+  it('completo no es lo mismo que COHERENTE: la firma rechaza el contrato imposible', async () => {
+    // El test anterior comprueba que los campos ESTÉN. Estos dos comprueban que digan algo
+    // posible ENTRE SÍ: un contrato con todos los huecos rellenos puede seguir siendo
+    // imposible de cumplir, y firmarlo lo congela sin reparación posible.
+    const reintentos = {
+      workspaceId: ws,
+      entradaId: entradaReintentosId,
+      criterioId: criterioReintentosId,
+      nombre: 'Reintentos medios',
+      definicion: 'Media de intentos por solicitud completada',
+      fuente: 'Log de verificación',
+      dimensiones: '',
+      propietarioMiembroId: sponsorMiembroId,
+      frecuencia: 'semanal' as const,
+      dashboardUrl: '',
+      lineaBaseValor: '2.4',
+      lineaBaseFecha: fecha(-120),
+      ventanaInicio: fecha(-5),
+      fechaPostMortem: fecha(90),
+    };
+
+    // 1. La línea base es el ANTES de lo que se mide, así que no puede estar fechada
+    // después de que la medición empiece. Firmado el contrato, los snapshots quedan
+    // acotados a la ventana mientras la proyección y el post-mortem los comparan contra una
+    // «línea base» cronológicamente posterior: la historia base→resultado, al revés.
+    await editarEntrada(leadId, { ...reintentos, lineaBaseFecha: fecha(-1) });
+    await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
+      /la línea base es posterior al inicio de la ventana/,
+    );
+
+    // 2. Y la cadencia comprometida tiene que CABER en la ventana al menos una vez: una
+    // entrada trimestral sobre una ventana de 60 días promete una entrega que vence
+    // después del cierre, así que no llega ninguna y el post-mortem la lee «vencida» por
+    // construcción — un «no concluyente» pactado de antemano, que es justo lo que la firma
+    // existe para impedir.
+    //
+    // Va con la línea base EN el día que abre la ventana, y eso prueba de paso el borde de
+    // la regla anterior: ese día todavía es el «antes» de la primera medición, así que si
+    // el corte fuera estricto el rechazo hablaría de la línea base y no de la cadencia.
+    await editarEntrada(leadId, {
+      ...reintentos,
+      lineaBaseFecha: fecha(-5),
+      frecuencia: 'trimestral',
+    });
+    await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
+      /la cadencia comprometida no cabe en la ventana del criterio/,
+    );
+
+    // Y se deja el contrato como estaba, que es el que firman los tests siguientes.
+    await editarEntrada(leadId, reintentos);
   });
 
   it('el dueño del dato es una PERSONA DEL CLIENTE: al escribir la entrada y al firmar', async () => {
@@ -1265,6 +1321,83 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     });
   });
 
+  it('toda escritura de la medición deja su evento, y lo deja la BASE', async () => {
+    // Doctrina del repositorio (y del grafo del journey): el evento lo emite un TRIGGER y
+    // no el servicio, para que el SQL directo y cualquier ruta futura también lo produzcan.
+    // El inventario completo —qué escritura emite qué, y qué queda fuera a propósito— vive
+    // en la migración, junto a la función que lo cumple; aquí se recorre entero.
+    const admin = sqlAdmin();
+    const de = async (tipo: string) =>
+      admin`select payload, actor_id, actor_rol from evento_dominio
+        where workspace_id = ${ws} and tipo = ${tipo} order by creado_en`;
+    const cuerpos = async (tipo: string) =>
+      (await de(tipo)).map((e) => e.payload as Record<string, unknown>);
+
+    // El contrato: apertura del registry, alta de entrada y corrección del borrador.
+    expect((await cuerpos('MetricRegistryAbierto')).some((p) => p.registryId === registryId))
+      .toBe(true);
+    expect(
+      (await cuerpos('EntradaKpiAgregada')).some(
+        (p) => p.entradaId === entradaAbandonoId && p.nombre === 'Abandono %',
+      ),
+    ).toBe(true);
+    // La edición trae el ANTES: sin él el rastro diría que alguien tocó el contrato pero no
+    // qué movió, y lo que se mueve aquí es el compromiso.
+    const editadas = await cuerpos('EntradaKpiEditada');
+    expect(
+      editadas.some((p) => {
+        const antes = p.antes as Record<string, unknown> | undefined;
+        return p.entradaId === entradaReintentosId && antes !== undefined
+          && antes.fechaPostMortem !== p.fechaPostMortem;
+      }),
+    ).toBe(true);
+    // Y las correcciones a mano del fixture —rol admin, sin sesión de aplicación— también
+    // dejaron el suyo. Ese es el punto entero de que el rastro sea de la base: no depende
+    // de que se entre por el servicio, y un `update` directo tampoco es invisible.
+    expect((await de('EntradaKpiEditada')).some((e) => e.actor_id === null)).toBe(true);
+
+    // La serie: un evento por FILA, del formulario y del CSV…
+    const snaps = await cuerpos('SnapshotRegistrado');
+    expect(snaps.filter((p) => p.origen === 'csv').length).toBe(2);
+    expect(snaps.filter((p) => p.origen === 'formulario').length).toBeGreaterThan(0);
+    // …y ADEMÁS el de la tanda, que es la única excepción honesta al «lo emite la base»:
+    // cuenta las filas RECHAZADAS, que no llegan a ser filas de ninguna tabla y por tanto
+    // ningún trigger puede verlas.
+    const tandas = await cuerpos('SnapshotsCargados');
+    expect(tandas.length).toBe(1);
+    expect(tandas[0]!.rechazadas).toBe(5);
+
+    // El post-mortem: apertura del review y resultado por criterio.
+    expect((await cuerpos('OutcomeReviewAbierto')).some((p) => p.reviewId === reviewId)).toBe(true);
+    const registrados = await cuerpos('ResultadoCriterioRegistrado');
+    expect(registrados.some((p) => p.criterioId === criterioAbandonoId)).toBe(true);
+    // Un nulo es INFORMACIÓN y se conserva: la fila lleva por CHECK exactamente uno de los
+    // dos —snapshot final o motivo de la falta—, así que quitar la clave nula del payload
+    // borraría de qué tipo de resultado se trataba.
+    const sinDato = registrados.find((p) => p.criterioId === criterioReintentosId)!;
+    expect('snapshotFinalId' in sinDato).toBe(true);
+    expect(sinDato.snapshotFinalId).toBeNull();
+
+    // Y la prueba de que el rastro es de la BASE: una corrección por SQL DIRECTO, sin pasar
+    // por ninguna función del servicio, también lo deja — con su antes y con su autor.
+    const [previo] = await admin`select id, lectura from resultado_criterio
+      where review_id = ${reviewId} and criterio_id = ${criterioAbandonoId}`;
+    const corregida = 'corregido por SQL directo, sin pasar por el servicio';
+    await conUsuario(leadId, (tx) => tx`update resultado_criterio set lectura = ${corregida}
+      where id = ${previo!.id as string} and workspace_id = ${ws}`);
+    const ultima = (await de('ResultadoCriterioEditado')).at(-1)!;
+    const cuerpo = ultima.payload as Record<string, unknown>;
+    expect(cuerpo.lectura).toBe(corregida);
+    expect((cuerpo.antes as Record<string, unknown>).lectura).toBe(previo!.lectura);
+    expect(ultima.actor_id).toBe(leadId);
+    expect(ultima.actor_rol).toBe('lead-boutique');
+
+    // Se deja el borrador del review como estaba: lo que se probaba era el rastro.
+    await conUsuario(leadId, (tx) => tx`update resultado_criterio
+      set lectura = ${previo!.lectura as string}
+      where id = ${previo!.id as string} and workspace_id = ${ws}`);
+  });
+
   it('el veredicto es del catálogo cerrado, honesto con los datos y exige justificar la causalidad', async () => {
     const admin = sqlAdmin();
     // Catálogo CERRADO en la base (SYS-24): un quinto valor no existe ni por SQL directo.
@@ -1664,7 +1797,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(
       abrirMedicion(leadId, { workspaceId: ws, retoId: viejo.retoId }),
     ).rejects.toThrow(/Metric Registry firmado en G6/);
-    await agregarEntrada(leadId, {
+    const entradaVieja = await agregarEntrada(leadId, {
       workspaceId: ws,
       registryId: reg.registryId,
       criterioId: criterioViejo.criterioId,
@@ -1681,6 +1814,8 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       ventanaInicio: fecha(-40),
       fechaPostMortem: fecha(5),
     });
+    entradaViejaId = entradaVieja.entradaId;
+    proyectoViejoId = actVieja.proyectoId;
     for (const n of [0, 1, 2, 3, 4, 5]) {
       await aprobarGateNumero(n, actVieja.proyectoId);
     }
@@ -1742,6 +1877,62 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: viejo.retoId })).rejects.toThrow(
       /ya está abierta/,
     );
+  });
+
+  it('la cadencia es un compromiso de CALENDARIO: «mensual» es el mes siguiente, no 30 días', async () => {
+    // Convertir «mensual»/«trimestral» a 30/90 días fijos hace que la fecha prometida
+    // dependa de la longitud del mes: un dato del 1 de agosto vencía el 31 y entraba en
+    // mora el 1 de septiembre —antes de que tocara el de septiembre—, y uno del 31 de enero
+    // no vencía hasta el 2 de marzo en vez del 28 de febrero. La cadencia es un compromiso
+    // de calendario, no aritmética: `+ interval '1 month'` respeta el fin de mes y `+ 30`
+    // no.
+    //
+    // El caso se fija con fechas ABSOLUTAS y sobre la ventana ya CERRADA, que es la única
+    // rama donde los dos extremos de la comparación son datos del CONTRATO («la próxima
+    // entrega vencía dentro de la ventana») y no `current_date`. Con fechas relativas a hoy
+    // la diferencia entre 30 días y un mes solo se manifiesta si el mes recién pasado tiene
+    // 31, así que el test pasaría o fallaría según el día en que se ejecutase — que es
+    // exactamente el defecto que se está corrigiendo. La aritmética es la MISMA expresión
+    // (`cad.paso`) en las cuatro ramas del estado, así que fijarla aquí la fija entera.
+    //
+    // Ventana [2026-03-01, 2026-03-31]: un mes de calendario y 30 días de aritmética, que es
+    // donde las dos reglas se separan. Con el dato el día que abre, la cadencia mensual
+    // promete el siguiente el 1 de abril, o sea DESPUÉS del cierre: no se debe ninguno más y
+    // la medición terminó cumplida. Con 30 días fijos habría una entrega vencida el 31 de
+    // marzo —el último día de la ventana— que el contrato nunca prometió.
+    const admin = sqlAdmin();
+    const [previa] = await admin`select ventana_inicio::text as v from entrada_kpi
+      where id = ${entradaViejaId}`;
+    await admin`update entrada_kpi set ventana_inicio = '2026-03-01'
+      where id = ${entradaViejaId}`;
+    const leer = async () =>
+      (await seguimientoDeImpacto(leadId, ws, proyectoViejoId))!.entradas.find(
+        (e) => e.id === entradaViejaId,
+      )!;
+    try {
+      // Control: la ventana cerrada sin un solo dato es 'vencido' pase lo que pase, así que
+      // el estado que distingue las dos reglas necesita la serie cumplida.
+      expect((await leer()).estadoSnapshot).toBe('vencido');
+
+      // El dato entra por el camino normal: cae dentro de la ventana firmada y lo carga el
+      // propietario del dato, aunque la ventana ya sea historia.
+      await registrarSnapshot(sponsorId, {
+        workspaceId: ws,
+        entradaId: entradaViejaId,
+        valor: '24',
+        fecha: '2026-03-01',
+        nota: 'primer corte del mes',
+      });
+      const llamadas = await leer();
+      expect(llamadas.ultimaFecha).toBe('2026-03-01');
+      expect(llamadas.estadoSnapshot).toBe('cerrado');
+    } finally {
+      // Fixture: la ventana vuelve a donde estaba y el snapshot que solo existía para fijar
+      // el corte se va con ella. Solo el rol admin puede borrarlo (SYS-23).
+      await admin`delete from snapshot where entrada_kpi_id = ${entradaViejaId}`;
+      await admin`update entrada_kpi set ventana_inicio = ${previa!.v as string}
+        where id = ${entradaViejaId}`;
+    }
   });
 
   it('el ciclo del proyecto es de sentido único y ningún estado inventado entra', async () => {

@@ -56,15 +56,12 @@ export const ETIQUETA_FRECUENCIA: Record<Frecuencia, string> = {
   unica: 'Única',
 };
 
-/** Cadencia comprometida en días: de ella sale el estado de recepción del KPI (RF-07.4).
- * Espejo EXACTO del CASE de la proyección — la única fuente de verdad del estado es el
- * servidor; esto documenta y etiqueta. `unica` no tiene cadencia. */
-export const CADENCIA_DIAS: Record<Frecuencia, number | null> = {
-  semanal: 7,
-  mensual: 30,
-  trimestral: 90,
-  unica: null,
-};
+/* Aquí vivía `CADENCIA_DIAS`, el espejo en días del CASE de la proyección (7/30/90). Se
+ * borra en vez de corregirse: la cadencia es un INTERVALO DE CALENDARIO —«mensual» es el
+ * mes siguiente, no treinta días— y eso no se puede escribir como número de días sin
+ * volver a mentir. Nadie lo leía; el único que juzga la cadencia es el servidor, con
+ * `interval`. Un espejo que nadie usa y que además es falso solo sirve para que el
+ * siguiente lo copie. Lo que la UI necesita nombrar ya está en ETIQUETA_FRECUENCIA. */
 
 /**
  * Estado de recepción del KPI (RF-07.4). Los tres primeros describen una medición VIVA:

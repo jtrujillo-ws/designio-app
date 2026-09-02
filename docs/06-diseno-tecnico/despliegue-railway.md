@@ -45,6 +45,7 @@ El patrón de datos usa **dos conexiones** (diseño técnico · Multi-tenancy): 
 ## 3. Healthcheck y despliegue
 
 - `railway.json` fija `healthcheckPath: /healthz` (timeout 120 s): el rollout solo promociona si el contenedor responde — y como el entrypoint corre las migraciones antes de arrancar el server, **un fallo de migración bloquea el deploy** en vez de dejar la app a medias.
+- `/healthz` además **verifica la conexión de APLICACIÓN** (`DATABASE_URL_APP`, rol no privilegiado) antes de reportar sano: una referencia sin resolver o una password del rol incorrecta bloquean el rollout con 503 en vez de promocionar un contenedor que fallaría en cada request con datos. Una vez verificada queda verde (readiness de rollout, no liveness). `APP_DB_PASSWORD`, por su parte, es obligatoria en producción **en cada arranque** (las migraciones abortan sin ella, exista o no ya el rol).
 - Restart policy: `ON_FAILURE` con 3 reintentos.
 - Deploy = push a la rama del environment (flujo `agents → dev → stg → main`: el squash-merge a `agents` no despliega; promocionar es avanzar `dev`/`stg`/`main` a ese commit).
 

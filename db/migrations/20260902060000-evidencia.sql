@@ -100,6 +100,13 @@ create policy item_insert on item_importacion
   for insert with check (
     coalesce(workspace_role(app_user_id(), workspace_id), '') not in ('', 'agente-ai')
     and creado_por = app_user_id()
+    -- Todo item NACE pendiente y sin decisión: sin esto, cualquier miembro podía
+    -- insertar directo un 'rechazado'/'aprobado' con metadata de decisión forjada,
+    -- saltándose la política de curaduría (que solo cubre UPDATE).
+    and estado = 'pendiente'
+    and decidido_por is null
+    and decidido_en is null
+    and evidencia_id is null
   );
 
 -- La decisión es una TRANSICIÓN: el WITH CHECK exige que el update deje el item

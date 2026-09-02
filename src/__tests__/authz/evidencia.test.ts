@@ -241,6 +241,19 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     ).toBe(false);
   });
 
+  it('un item no puede NACER decidido: el INSERT directo con decisión forjada se rechaza', async () => {
+    await expect(
+      conUsuario(stakeId, (tx) => tx`insert into item_importacion
+        (workspace_id, titulo, contenido, tipo_fuente, creado_por, estado, decidido_por, decidido_en)
+        values (${ws}, 'Nacido decidido', 'x', 'nota', ${stakeId}, 'rechazado', ${stakeId}, now())`),
+    ).rejects.toThrow(/row-level security/);
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into item_importacion
+        (workspace_id, titulo, contenido, tipo_fuente, creado_por, estado, decidido_por, decidido_en, evidencia_id)
+        values (${ws}, 'Nacido aprobado', 'x', 'nota', ${leadId}, 'aprobado', ${leadId}, now(), ${evidenciaId})`),
+    ).rejects.toThrow(/row-level security/);
+  });
+
   it('el sellado es una transición: ni un curador garabatea campos de decisión en una fila pendiente', async () => {
     const r = await crearItem(stakeId, {
       workspaceId: ws,

@@ -237,7 +237,20 @@ export const ReleaseInputSchema = z.object({
   releaseId: z.string().uuid(),
 });
 
-export const WorkspaceInputSchema = z.object({ workspaceId: z.string().uuid() });
+export const DesignVersionsInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  /** Id de la última design version ya vista: el keyset resuelve su `(creado_en, id)` en
+   * la base. */
+  cursor: z.string().uuid().nullable().default(null),
+});
+
+/** El servicio cuya versión aprobada vigente se busca. Va por servicio y no por página
+ * porque el candidato a suceder (SYS-05) tiene que estar SIEMPRE disponible, viva su fila
+ * donde viva en la lista. */
+export const VersionAprobadaInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  servicioId: z.string().uuid(),
+});
 
 // ── Proyecciones de lectura ──
 

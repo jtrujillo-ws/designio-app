@@ -897,12 +897,27 @@ export async function designVersionCompleta(
   });
 }
 
+/**
+ * Página de la lista de design versions. El corte duro de 200 no solo escondía las más
+ * antiguas de la lista: el formulario de alta armaba con ESTA respuesta los candidatos a
+ * suceder, y como un servicio tiene como mucho UNA versión aprobada (SYS-05), la del
+ * servicio elegido podía quedar detrás del corte. Entonces el selector se quedaba sin
+ * opciones, el formulario mandaba `superaA = null` y `design_version_anclaje_guard` lo
+ * rechazaba —porque sí existe una aprobada—: crear la versión siguiente de ese servicio
+ * se volvía IMPOSIBLE. Keyset por `(creado_en, id)`, el mismo patrón que la lista de
+ * journeys: el cursor viaja como id y su par lo resuelve la base, porque serializar el
+ * timestamp pierde microsegundos y salta o repite filas.
+ */
+export const PAGINA_DESIGN_VERSIONS = 50;
+
 export async function designVersionsDelWorkspace(
   actorId: string,
   workspaceId: string,
-): Promise<ResumenDesignVersion[]> {
+  cursor: string | null = null,
+): Promise<{ versiones: ResumenDesignVersion[]; siguiente: string | null }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // Se pide una fila de más para saber si hubo recorte sin contar la tabla entera.
     const filas = await tx`
       select dv.id, dv.codigo, dv.titulo, dv.estado,
         dv.servicio_id, s.nombre as servicio_nombre,
@@ -916,20 +931,58 @@ export async function designVersionsDelWorkspace(
       join servicio s on s.id = dv.servicio_id and s.workspace_id = dv.workspace_id
       join proyecto p on p.id = dv.proyecto_id and p.workspace_id = dv.workspace_id
       where dv.workspace_id = ${workspaceId}
-      order by dv.creado_en desc
-      limit 200`;
-    return filas.map((f) => ({
-      id: f.id as string,
-      codigo: f.codigo as string,
-      titulo: f.titulo as string,
-      estado: f.estado as ResumenDesignVersion['estado'],
-      servicioId: f.servicio_id as string,
-      servicioNombre: f.servicio_nombre as string,
-      proyectoCodigo: f.proyecto_codigo as string,
-      elementos: f.elementos as number,
-      releases: f.releases as number,
-      aprobadaEn: (f.aprobada_en as string | null) ?? null,
-    }));
+        and (${cursor}::uuid is null or (dv.creado_en, dv.id) < (
+          select c.creado_en, c.id from design_version c
+          where c.id = ${cursor}::uuid and c.workspace_id = ${workspaceId}))
+      order by dv.creado_en desc, dv.id desc
+      limit ${PAGINA_DESIGN_VERSIONS + 1}`;
+    const pagina = filas.slice(0, PAGINA_DESIGN_VERSIONS);
+    return {
+      versiones: pagina.map((f) => ({
+        id: f.id as string,
+        codigo: f.codigo as string,
+        titulo: f.titulo as string,
+        estado: f.estado as ResumenDesignVersion['estado'],
+        servicioId: f.servicio_id as string,
+        servicioNombre: f.servicio_nombre as string,
+        proyectoCodigo: f.proyecto_codigo as string,
+        elementos: f.elementos as number,
+        releases: f.releases as number,
+        aprobadaEn: (f.aprobada_en as string | null) ?? null,
+      })),
+      // Si la fila de más existe, el cursor es la última que SÍ se devuelve.
+      siguiente:
+        filas.length > PAGINA_DESIGN_VERSIONS ? (pagina[pagina.length - 1]!.id as string) : null,
+    };
+  });
+}
+
+/**
+ * La versión aprobada VIGENTE de un servicio, pedida por servicio y bajo demanda. Es la
+ * misma forma que ya usa el selector del to-be: paginar la lista no basta para el
+ * formulario de alta —el candidato a suceder puede vivir en cualquier página, y pedirlas
+ * todas para encontrarlo es la carga que la paginación vino a quitar—, así que se
+ * pregunta por el servicio elegido. SYS-05 garantiza que la respuesta es cero o una fila,
+ * y el índice único parcial `design_version_vigente_uniq` la sirve directa.
+ */
+export async function versionAprobadaDelServicio(
+  actorId: string,
+  workspaceId: string,
+  servicioId: string,
+): Promise<{ id: string; codigo: string; titulo: string } | null> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [fila] = await tx`
+      select dv.id, dv.codigo, dv.titulo
+      from design_version dv
+      where dv.workspace_id = ${workspaceId} and dv.servicio_id = ${servicioId}
+        and dv.estado = 'aprobada'`;
+    if (!fila) return null;
+    return {
+      id: fila.id as string,
+      codigo: fila.codigo as string,
+      titulo: fila.titulo as string,
+    };
   });
 }
 

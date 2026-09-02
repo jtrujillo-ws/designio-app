@@ -112,6 +112,13 @@ create table elemento_cambio (
   -- journey de esta design version— no se pierde: nunca la dio la FK (que solo garantizaba
   -- el workspace), la da elemento_cambio_nodo_guard en cada escritura. Lo único que se
   -- suelta es «la fila sigue existiendo», que es justo lo que no debe ser un invariante.
+  --
+  -- Mientras la versión sigue en BORRADOR, «la fila sigue existiendo» tampoco es un
+  -- invariante que haga falta: el borrador se edita contra el grafo vivo, y si el nodo se
+  -- borra el enlace queda colgando y se corrige —`nodo_id` está en el grant de columna—.
+  -- Lo que sí es un invariante es que al APROBAR el snapshot pueda responder por cada
+  -- nodo enlazado, y eso lo exige design_version_transicion_guard en la transición, que
+  -- es cuando la versión se vuelve inmutable y deja de poder corregirse.
   nodo_id uuid,
   orden integer not null default 0,
   creado_por uuid not null references usuario(id),
@@ -820,6 +827,32 @@ begin
       where ec.design_version_id = new.id and ec.workspace_id = new.workspace_id) then
       raise exception 'no se puede aprobar una design version sin elementos de cambio';
     end if;
+    -- Y que el snapshot que se congela pueda RESPONDER por cada nodo enlazado. Sin FK en
+    -- `elemento_cambio.nodo_id`, entre que un borrador enlaza un nodo y alguien aprueba,
+    -- ese nodo puede haberse borrado del grafo de trabajo. Que el borrador se apoye en la
+    -- fila viva es lo CORRECTO —se edita contra el grafo vivo, y RF-05.8 dice que ese
+    -- grafo sigue editable—, así que la respuesta no es volver a hacer imborrable el nodo:
+    -- eso reintroduce por otra puerta el cierre que quitar la FK vino a deshacer, y encima
+    -- desde el objeto más provisional que hay. Lo que no puede pasar es que la versión se
+    -- CONGELE prometiendo una identidad de nodo que su propio snapshot no contiene: «qué
+    -- pasos del journey afectó RL-1» (§19.7) saldría vacío para siempre, y la versión ya
+    -- es inmutable. Aprobar es el instante en que el borrador deja de serlo y en que todo
+    -- lo demás se revalida (el journey, el anclaje, los elementos); esto es una condición
+    -- más de esa lista.
+    --
+    -- Se comprueba contra el SNAPSHOT y no contra journey_nodo a propósito. El snapshot se
+    -- insertó en una sentencia anterior de esta misma transacción y es lo que la pregunta
+    -- histórica va a leer, así que la comprobación ES la promesa, palabra por palabra.
+    -- Contra la fila viva habría además una carrera —borrar el nodo después de congelar y
+    -- antes del update— que rechazaría una aprobación cuyo snapshot sí tiene el nodo.
+    if new.snapshot_id is not null and exists (
+      select 1 from elemento_cambio ec
+      where ec.design_version_id = new.id and ec.workspace_id = new.workspace_id
+        and ec.nodo_id is not null
+        and nodo_congelado(new.snapshot_id, new.workspace_id, ec.nodo_id) is null
+    ) then
+      raise exception 'hay elementos enlazados a nodos que ya no están en el journey: desenlázalos antes de aprobar (RF-05.8)';
+    end if;
     if new.supera_a is not null and not exists (select 1 from design_version dv
       where dv.id = new.supera_a and dv.workspace_id = new.workspace_id
         and dv.servicio_id = new.servicio_id and dv.estado = 'superada') then
@@ -1163,8 +1196,9 @@ begin
     -- constatación: sin release asignado, en un release aún planificado, o desplegado
     -- sin constatar. Un elemento constatado como 'no-implementado' NO bloquea — está
     -- explicado, que es lo que el gate exige (honestidad, no perfección).
-    -- Solo las design versions APROBADAS: los elementos de una superada son historia de
-    -- un ciclo anterior, y exigirles conciliación ataría G7 a decisiones ya reemplazadas.
+    -- De las design versions SUPERADAS entra solo lo que dejaron EN VUELO: sus elementos
+    -- sin planificar son historia de un ciclo anterior, pero un release suyo sin resolver
+    -- sigue siendo trabajo abierto de ESTE proyecto (ver abajo).
     if new.numero = 7 then
       -- Primero, que HAYA tablero. El «no exists elemento en estado desconocido» de
       -- abajo es vacuamente cierto cuando no hay ningún elemento que mirar: un proyecto
@@ -1199,6 +1233,34 @@ begin
               and r.estado = 'verificado')
       ) then
         raise exception 'no se puede aprobar G7: hay elementos de la design version en estado desconocido (RF-06.7)';
+      end if;
+      -- Y lo que la versión SUPERADA dejó en vuelo. Excluir entera a la superada dejaba
+      -- este agujero: aprobar DV-2 marca DV-1 'superada' y con ella desaparecían del gate
+      -- sus releases sin resolver, así que G7 podía certificar «implementación conciliada»
+      -- con un release de DV-1 desplegado y sin constatar. Es el mismo argumento que
+      -- separó `puedePlanificar` de `puedeCompletar` en la pantalla, y aquí obliga en el
+      -- sentido contrario: el effective state del servicio se arma con las constataciones
+      -- de TODOS sus releases verificados (RF-06.10), así que un despliegue sin observar
+      -- es exactamente un trozo del estado certificado que nadie miró.
+      --
+      -- Lo que entra es el ELEMENTO en un release sin verificar, no la versión entera: un
+      -- elemento de DV-1 que nadie llegó a planificar es una decisión ya reemplazada y
+      -- exigirle conciliación ataría G7 a un ciclo cerrado. Y decidir «esto ya no sale»
+      -- tiene forma en el modelo sin inventar un estado: se le quita el alcance al release
+      -- planificado (la política lo permite mientras siga planificado) y entonces no puede
+      -- desplegarse nunca —`release_transicion_guard` no despliega un release vacío—, con
+      -- lo que deja de haber nada que observar. Un release VERIFICADO no hace falta
+      -- mirarlo: verificarlo ya exigió constatar todos sus elementos.
+      if exists (
+        select 1 from elemento_cambio ec
+        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+        join release_elemento re on re.elemento_id = ec.id and re.workspace_id = ec.workspace_id
+        join release r on r.id = re.release_id and r.workspace_id = re.workspace_id
+        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
+          and dv.estado = 'superada'
+          and r.estado <> 'verificado'
+      ) then
+        raise exception 'no se puede aprobar G7: una design version superada dejó releases sin resolver (RF-06.7)';
       end if;
     end if;
     -- Efectos INSEPARABLES de la transición, también para el UPDATE directo: la etapa

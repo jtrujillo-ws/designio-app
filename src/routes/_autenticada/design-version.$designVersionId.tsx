@@ -24,6 +24,7 @@ import {
   constatarReleaseDesplegado,
   declararSuperaADeDesignVersion,
   designVersionDelWorkspace,
+  editarElementoDeCambio,
   enlazarJourneyDeDesignVersion,
   planificarReleaseDeDesignVersion,
   quitarElementoDeRelease,
@@ -598,6 +599,16 @@ function VistaElementos({
           {el.detalle !== '' && <span style={cuerpo}>{el.detalle}</span>}
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', ...apunte }}>
             {el.nodoEtiqueta && <span>Nodo del to-be: {el.nodoEtiqueta}</span>}
+            {/* El grafo de trabajo se sigue editando mientras la versión es borrador
+                (RF-05.8), así que el nodo enlazado puede haberse borrado por debajo.
+                Aprobar con el enlace roto congelaría una promesa que el snapshot no
+                puede cumplir, y el guard lo rechaza: aquí se ve antes, y se arregla. */}
+            {el.nodoId && !el.nodoEtiqueta && (
+              <span style={{ color: 'var(--danger)' }}>
+                El nodo enlazado ya no está en el journey: desenlázalo o vuelve a
+                enlazarlo antes de aprobar.
+              </span>
+            )}
             {el.decisiones.map((d) => (
               <span key={d.id}>decisión: {d.titulo}</span>
             ))}
@@ -609,7 +620,7 @@ function VistaElementos({
             )}
           </div>
           {puedeEditar && (
-            <div>
+            <div style={{ display: 'flex', gap: 8 }}>
               <Button
                 size="sm"
                 variant="ghost"
@@ -624,6 +635,30 @@ function VistaElementos({
               >
                 Quitar
               </Button>
+              {el.nodoId && !el.nodoEtiqueta && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={async () => {
+                    onError(null);
+                    const r = await editarElementoDeCambio({
+                      data: {
+                        workspaceId,
+                        elementoId: el.id,
+                        tipo: el.tipo,
+                        operacion: el.operacion,
+                        titulo: el.titulo,
+                        detalle: el.detalle,
+                        nodoId: null,
+                      },
+                    });
+                    if (r.ok) await onHecho();
+                    else onError(r.error);
+                  }}
+                >
+                  Desenlazar el nodo
+                </Button>
+              )}
             </div>
           )}
         </Card>
@@ -827,17 +862,24 @@ function VistaDiff({
 /**
  * Dos permisos y no uno, porque son dos cosas distintas (RF-06.4/06.5/06.6):
  *
- *  · `puedePlanificar` — abrir un release nuevo y mover su alcance. Se apaga cuando la
- *    design version queda SUPERADA: planificar trabajo bajo un diseño que ya fue
- *    reemplazado es empezar algo que la versión vigente no respalda.
- *  · `puedeCompletar` — desplegar lo ya planificado y constatar lo desplegado. NO se
- *    apaga al superarse. Un release de DV-1 que ya salió cambió el servicio de verdad, y
- *    su constatación es la única forma de que eso entre en el effective state: el estado
- *    vigente de un servicio se arma con las constataciones de TODOS sus releases
- *    verificados, sea cual sea la design version de la que colgaban (RF-06.10). Apagar
- *    la sección entera al superarse dejaba ese release desplegado sin camino en la UI
- *    —la base y el servicio sí lo permiten— y el diff de cada versión futura quedaba
+ *  · `puedePlanificar` — abrir un release nuevo y METER trabajo en uno planificado. Se
+ *    apaga cuando la design version queda SUPERADA: planificar trabajo bajo un diseño que
+ *    ya fue reemplazado es empezar algo que la versión vigente no respalda.
+ *  · `puedeCompletar` — cerrar lo que quedó abierto: desplegar lo ya planificado,
+ *    constatar lo desplegado y RETIRAR de un release planificado lo que ya no va a salir.
+ *    NO se apaga al superarse. Un release de DV-1 que ya salió cambió el servicio de
+ *    verdad, y su constatación es la única forma de que eso entre en el effective state:
+ *    el estado vigente de un servicio se arma con las constataciones de TODOS sus
+ *    releases verificados, sea cual sea la design version de la que colgaban (RF-06.10).
+ *    Apagar la sección entera al superarse dejaba ese release desplegado sin camino en la
+ *    UI —la base y el servicio sí lo permiten— y el diff de cada versión futura quedaba
  *    ciego a lo que ese release cambió.
+ *
+ * Quitar alcance cayó del lado de COMPLETAR y no del de planificar, que es donde estaba:
+ * es lo que cierra un release planificado de una versión superada que ya no va a salir, y
+ * G7 espera por él (el guard cuenta los releases sin resolver de las superadas). Sin este
+ * camino, el gate quedaba bloqueado sin nada que el lead pudiera hacer desde la pantalla
+ * salvo registrar un despliegue que no ocurrió.
  */
 function VistaReleases({
   workspaceId,
@@ -873,11 +915,12 @@ function VistaReleases({
       {dv.estado === 'superada' && (
         <Card style={{ padding: 16 }}>
           <span style={apunte}>
-            Esta design version fue superada: no se planifican releases nuevos bajo ella.
-            Lo que ya está planificado o desplegado sí se cierra desde aquí — un release
-            que salió cambió el servicio, y su constatación es lo que mete ese cambio en
-            el estado efectivo contra el que se calcula el diff de las versiones
-            siguientes (RF-06.10).
+            Esta design version fue superada: no se planifican releases nuevos bajo ella,
+            ni se le mete trabajo a los que había. Lo que quedó abierto sí se cierra desde
+            aquí, y G7 lo espera: un release que salió cambió el servicio y su constatación
+            es lo que mete ese cambio en el estado efectivo contra el que se calcula el
+            diff de las versiones siguientes (RF-06.10); uno que ya no va a salir se cierra
+            quitándole los elementos, y entonces deja de haber nada que constatar.
           </span>
         </Card>
       )}
@@ -931,7 +974,6 @@ function VistaReleases({
           workspaceId={workspaceId}
           dv={dv}
           release={r}
-          puedePlanificar={puedePlanificar}
           puedeCompletar={puedeCompletar}
           onError={onError}
           onHecho={onHecho}
@@ -995,7 +1037,6 @@ function TarjetaRelease({
   workspaceId,
   dv,
   release,
-  puedePlanificar,
   puedeCompletar,
   onError,
   onHecho,
@@ -1003,7 +1044,6 @@ function TarjetaRelease({
   workspaceId: string;
   dv: DesignVersionCompleta;
   release: ReleaseDeDesignVersion;
-  puedePlanificar: boolean;
   puedeCompletar: boolean;
   onError: (e: string | null) => void;
   onHecho: () => Promise<void>;
@@ -1032,7 +1072,7 @@ function TarjetaRelease({
           <div key={e.elementoId} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <span style={cuerpo}>{titulos.get(e.elementoId) ?? e.elementoId}</span>
             {e.razon !== '' && <span style={apunte}>— {e.razon}</span>}
-            {puedePlanificar && release.estado === 'planificado' && (
+            {puedeCompletar && release.estado === 'planificado' && (
               <Button
                 size="sm"
                 variant="ghost"

@@ -10,13 +10,14 @@ import {
   CrearDesignVersionSchema,
   DesasignarElementoSchema,
   DesignVersionInputSchema,
+  DesignVersionsInputSchema,
   DeclararSuperaASchema,
   DesplegarReleaseSchema,
   EditarElementoSchema,
   EnlazarJourneySchema,
   PlanificarReleaseSchema,
   ReleaseInputSchema,
-  WorkspaceInputSchema,
+  VersionAprobadaInputSchema,
 } from './entrega.schemas';
 import {
   agregarElemento,
@@ -36,6 +37,7 @@ import {
   ErrorEntrega,
   planificarRelease,
   tableroDeConciliacion,
+  versionAprobadaDelServicio,
 } from './entrega.servicio';
 
 /** Server functions de la cadena de resultado. Mutaciones con contrato uniforme
@@ -66,13 +68,28 @@ export const designVersionDelWorkspace = createServerFn({ method: 'GET' })
   });
 
 export const listaDeDesignVersions = createServerFn({ method: 'GET' })
-  .inputValidator(WorkspaceInputSchema)
+  .inputValidator(DesignVersionsInputSchema)
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
     try {
-      return await designVersionsDelWorkspace(usuarioId, data.workspaceId);
+      return await designVersionsDelWorkspace(usuarioId, data.workspaceId, data.cursor);
     } catch (e) {
-      if (e instanceof ErrorAutorizacion) return [];
+      if (e instanceof ErrorAutorizacion) return { versiones: [], siguiente: null };
+      throw e;
+    }
+  });
+
+/** La versión aprobada vigente de UN servicio (SYS-05), para el selector de «supera a».
+ * Pedirla aparte es lo que impide que el candidato obligatorio dependa de si su fila cayó
+ * en la primera página de la lista. */
+export const versionAprobadaDeServicio = createServerFn({ method: 'GET' })
+  .inputValidator(VersionAprobadaInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await versionAprobadaDelServicio(usuarioId, data.workspaceId, data.servicioId);
+    } catch (e) {
+      if (e instanceof ErrorAutorizacion) return null;
       throw e;
     }
   });

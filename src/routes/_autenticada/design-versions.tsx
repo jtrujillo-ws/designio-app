@@ -13,7 +13,9 @@ import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
   crearDesignVersionDelProyecto,
   listaDeDesignVersions,
+  versionAprobadaDeServicio,
 } from '@/lib/entrega/entrega.functions';
+import type { ResumenDesignVersion } from '@/lib/entrega/entrega.schemas';
 import { listaDeJourneys } from '@/lib/journey/journey.functions';
 
 /**
@@ -25,8 +27,8 @@ export const Route = createFileRoute('/_autenticada/design-versions')({
   loader: async ({ context }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
     if (!workspaceId) return null;
-    const [versiones, arbol] = await Promise.all([
-      listaDeDesignVersions({ data: { workspaceId } }),
+    const [pagina, arbol] = await Promise.all([
+      listaDeDesignVersions({ data: { workspaceId, cursor: null } }),
       arbolDelWorkspace({ data: { workspaceId } }),
     ]);
     // Los proyectos cuelgan del RETO, y un reto que afecta a este servicio está anclado en
@@ -42,7 +44,8 @@ export const Route = createFileRoute('/_autenticada/design-versions')({
     );
     return {
       workspaceId,
-      versiones,
+      versiones: pagina.versiones,
+      siguiente: pagina.siguiente,
       // Una design version cuelga de un proyecto y cambia UN servicio. Los proyectos
       // ofrecidos salen de los retos ANCLADOS en el servicio y de los que lo declaran
       // AFECTADO: un reto anclado en A que afecta a B es exactamente el que empuja el
@@ -58,7 +61,6 @@ export const Route = createFileRoute('/_autenticada/design-versions')({
             .flatMap((r) => proyectosPorReto.get(r.id) ?? []),
         };
       }),
-      versionesAprobadas: versiones.filter((v) => v.estado === 'aprobada'),
     };
   },
   component: PantallaDesignVersions,
@@ -80,8 +82,15 @@ function PantallaDesignVersions() {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [abierto, setAbierto] = useState(false);
+  // Las páginas siguientes se acumulan en el cliente: el loader trae la primera y «Ver
+  // más» pide la siguiente por el cursor. El corte duro que había antes no era solo una
+  // lista truncada — el formulario de alta leía de aquí los candidatos a suceder.
+  const [masVersiones, setMasVersiones] = useState<ResumenDesignVersion[]>([]);
+  const [cursor, setCursor] = useState<string | null>(datos?.siguiente ?? null);
+  const [cargandoMas, setCargandoMas] = useState(false);
   const rol = membresiaActiva?.rol ?? '';
   const puedeCrear = (ROLES_CURADORES as readonly string[]).includes(rol);
+  const versiones = [...(datos?.versiones ?? []), ...masVersiones];
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
@@ -156,7 +165,6 @@ function PantallaDesignVersions() {
               <FormularioDesignVersion
                 workspaceId={datos.workspaceId}
                 servicios={datos.servicios}
-                aprobadas={datos.versionesAprobadas}
                 onCerrar={() => setAbierto(false)}
                 onError={setError}
                 onCreada={async (designVersionId) => {
@@ -167,7 +175,7 @@ function PantallaDesignVersions() {
               />
             )}
 
-            {datos.versiones.length === 0 && (
+            {versiones.length === 0 && (
               <Card style={{ padding: 24 }}>
                 <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
                   Todavía no hay design versions en este workspace.
@@ -175,7 +183,7 @@ function PantallaDesignVersions() {
               </Card>
             )}
 
-            {datos.versiones.map((v) => (
+            {versiones.map((v) => (
               <Card key={v.id} style={{ padding: 18 }}>
                 <Link
                   to="/design-version/$designVersionId"
@@ -198,6 +206,31 @@ function PantallaDesignVersions() {
                 </Link>
               </Card>
             ))}
+
+            {cursor !== null && (
+              <div>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={cargandoMas}
+                  onClick={async () => {
+                    setCargandoMas(true);
+                    setError(null);
+                    try {
+                      const pagina = await listaDeDesignVersions({
+                        data: { workspaceId: datos.workspaceId, cursor },
+                      });
+                      setMasVersiones((previas) => [...previas, ...pagina.versiones]);
+                      setCursor(pagina.siguiente);
+                    } finally {
+                      setCargandoMas(false);
+                    }
+                  }}
+                >
+                  {cargandoMas ? 'Cargando…' : 'Ver más design versions'}
+                </Button>
+              </div>
+            )}
           </>
         )}
       </main>
@@ -208,14 +241,12 @@ function PantallaDesignVersions() {
 function FormularioDesignVersion({
   workspaceId,
   servicios,
-  aprobadas,
   onCerrar,
   onError,
   onCreada,
 }: {
   workspaceId: string;
   servicios: { id: string; nombre: string; proyectos: { id: string; etiqueta: string }[] }[];
-  aprobadas: { id: string; codigo: string; titulo: string; servicioId: string }[];
   onCerrar: () => void;
   onError: (e: string | null) => void;
   onCreada: (designVersionId: string) => Promise<void>;
@@ -237,10 +268,18 @@ function FormularioDesignVersion({
   const [hayMasJourneys, setHayMasJourneys] = useState(false);
   const [cargandoJourneys, setCargandoJourneys] = useState(false);
   const proyectos = servicios.find((s) => s.id === servicioId)?.proyectos ?? [];
-  // Solo se supera a una versión del MISMO servicio (SYS-05, y ahora también el guard de
-  // alta): ofrecer las de otros creaba un borrador que no se puede aprobar, ni corregir
-  // —`supera_a` no está en el grant— ni borrar.
-  const superables = aprobadas.filter((v) => v.servicioId === servicioId);
+  // La versión aprobada VIGENTE del servicio elegido, pedida al servidor igual que los
+  // to-be y por el mismo motivo. Antes salía de filtrar la lista de design versions del
+  // workspace, que va paginada: si la aprobada de este servicio caía detrás del corte, el
+  // selector se quedaba vacío, el formulario mandaba `superaA = null` y el guard de
+  // anclaje lo rechazaba —porque sí existe una aprobada—, con lo que crear la versión
+  // siguiente de ese servicio era literalmente imposible. Solo se supera a una versión del
+  // MISMO servicio (SYS-05), y SYS-05 garantiza que hay como mucho una: la respuesta es
+  // cero o un candidato, no una lista que haya que buscar.
+  const [vigente, setVigente] = useState<{ id: string; codigo: string; titulo: string } | null>(
+    null,
+  );
+  const [cargandoVigente, setCargandoVigente] = useState(false);
 
   async function elegirServicio(nuevo: string) {
     setServicioId(nuevo);
@@ -251,16 +290,21 @@ function FormularioDesignVersion({
     setSuperaA('');
     setJourneys([]);
     setHayMasJourneys(false);
+    setVigente(null);
     if (nuevo === '') return;
     setCargandoJourneys(true);
+    setCargandoVigente(true);
     try {
-      const pagina = await listaDeJourneys({
-        data: { workspaceId, servicioId: nuevo, tipo: 'to-be' },
-      });
+      const [pagina, aprobada] = await Promise.all([
+        listaDeJourneys({ data: { workspaceId, servicioId: nuevo, tipo: 'to-be' } }),
+        versionAprobadaDeServicio({ data: { workspaceId, servicioId: nuevo } }),
+      ]);
       setJourneys(pagina.journeys.map((j) => ({ id: j.id, nombre: j.nombre })));
       setHayMasJourneys(pagina.siguiente !== null);
+      setVigente(aprobada);
     } finally {
       setCargandoJourneys(false);
+      setCargandoVigente(false);
     }
   }
 
@@ -341,23 +385,25 @@ function FormularioDesignVersion({
         <Select
           value={superaA}
           onChange={(e) => setSuperaA(e.target.value)}
-          disabled={servicioId === ''}
-          required={superables.length > 0}
+          disabled={servicioId === '' || cargandoVigente}
+          required={vigente !== null}
         >
           {/* Si el servicio ya tiene una versión aprobada, «no supera a ninguna» no es una
               opción: SYS-05 admite como mucho una aprobada, así que la nueva TIENE que
               declarar a cuál reemplaza. Ofrecerlo creaba un borrador que solo se descubría
               inaprobable al intentar aprobarlo. */}
-          {superables.length === 0 ? (
+          {cargandoVigente ? (
+            <option value="">Buscando la versión vigente del servicio…</option>
+          ) : vigente === null ? (
             <option value="">No supera a ninguna (primera del servicio)</option>
           ) : (
-            <option value="">Supera a… (obligatorio: el servicio ya tiene una aprobada)</option>
+            <>
+              <option value="">Supera a… (obligatorio: el servicio ya tiene una aprobada)</option>
+              <option value={vigente.id}>
+                Supera a {vigente.codigo} · {vigente.titulo}
+              </option>
+            </>
           )}
-          {superables.map((v) => (
-            <option key={v.id} value={v.id}>
-              Supera a {v.codigo} · {v.titulo}
-            </option>
-          ))}
         </Select>
         <Input
           placeholder="Título de la design version"
@@ -386,7 +432,8 @@ function FormularioDesignVersion({
               servicioId === '' ||
               proyectoId === '' ||
               titulo.trim() === '' ||
-              (superables.length > 0 && superaA === '')
+              cargandoVigente ||
+              (vigente !== null && superaA === '')
             }
           >
             Crear borrador

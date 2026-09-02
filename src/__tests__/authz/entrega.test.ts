@@ -9,14 +9,17 @@ import {
   constatarEffectiveState,
   crearDesignVersion,
   declararSuperaA,
+  desasignarElemento,
   designVersionCompleta,
   designVersionsDelWorkspace,
   desplegarRelease,
   editarElemento,
   enlazarJourney,
   ErrorEntrega,
+  PAGINA_DESIGN_VERSIONS,
   planificarRelease,
   tableroDeConciliacion,
+  versionAprobadaDelServicio,
 } from '@/lib/entrega/entrega.servicio';
 import { calcularDiff, conciliacionCompleta } from '@/lib/entrega/entrega.diff';
 import { abrirHilo, hilosDeObjetos } from '@/lib/portal/portal.servicio';
@@ -289,7 +292,9 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const dv = await designVersionCompleta(stakeId, ws, dv1);
     expect(dv!.codigo).toMatch(/^DV-\d+$/);
     expect(dv!.estado).toBe('borrador');
-    expect((await designVersionsDelWorkspace(stakeId, ws)).map((v) => v.id)).toEqual([dv1]);
+    const pagina = await designVersionsDelWorkspace(stakeId, ws);
+    expect(pagina.versiones.map((v) => v.id)).toEqual([dv1]);
+    expect(pagina.siguiente).toBeNull();
   });
 
   it('los elementos de cambio se ordenan solos y citan lo que los motiva', async () => {
@@ -1612,6 +1617,390 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await expect(
       declararSuperaA(leadId, { workspaceId: ws, designVersionId: perdedora, superaA: null }),
     ).rejects.toThrow(/inmutable/);
+  });
+
+  it('aprobar revalida los nodos del borrador: no se congela una promesa que el snapshot no puede cumplir', async () => {
+    // `elemento_cambio.nodo_id` no tiene FK a propósito: el registro histórico se resuelve
+    // contra el snapshot, no contra la fila viva, y una FK volvía imborrable para siempre
+    // todo nodo que una versión aprobada enlazara. Pero un BORRADOR sí se apoya en la fila
+    // viva —se edita contra el grafo de trabajo, que RF-05.8 mantiene editable—, así que
+    // entre enlazar y aprobar el nodo puede desaparecer. La salida NO es volver a hacerlo
+    // imborrable (sería reintroducir el cierre por otra puerta, y encima por culpa del
+    // objeto más provisional que hay): es revalidar al APROBAR, que es el instante en que
+    // el borrador deja de poder corregirse.
+    const admin = sqlAdmin();
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio del nodo que se va', ${leadId}) returning id`;
+    const svcId = svc!.id as string;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', 'Objetivo con nodo efímero', ${leadId}) returning id`;
+    const journeyId = j!.id as string;
+    const [n] = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, creado_por)
+      values (${ws}, ${journeyId}, 'paso', 'Paso que se va a borrar', ${leadId}) returning id`;
+    const nodoId = n!.id as string;
+    const [n2] = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, creado_por)
+      values (${ws}, ${journeyId}, 'paso', 'Paso que se queda', ${leadId}) returning id`;
+
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que enlaza un nodo efímero',
+      resumen: '',
+      superaA: null,
+    });
+    const colgante = await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      tipo: 'paso',
+      operacion: 'modifica',
+      titulo: 'Elemento del paso efímero',
+      detalle: '',
+      nodoId,
+      decisionIds: [],
+      insightIds: [],
+    });
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      tipo: 'paso',
+      operacion: 'modifica',
+      titulo: 'Elemento del paso que se queda',
+      detalle: '',
+      nodoId: n2!.id as string,
+      decisionIds: [],
+      insightIds: [],
+    });
+
+    // El grafo de trabajo sigue su camino: el nodo se borra y el enlace del borrador queda
+    // colgando. Nadie vuelve a escribir el elemento, así que elemento_cambio_nodo_guard
+    // —que es BEFORE INSERT/UPDATE del elemento— no corre otra vez.
+    await borrarNodo(leadId, ws, nodoId);
+    const suelto = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    const roto = suelto!.elementos.find((e) => e.id === colgante.elementoId)!;
+    expect(roto.nodoId).toBe(nodoId);
+    // La pantalla lo ve: hay nodo enlazado y no hay etiqueta que resolver.
+    expect(roto.nodoEtiqueta).toBeNull();
+
+    // Y aprobar se rechaza: el snapshot que congelaría esta versión no contiene el nodo,
+    // así que «qué pasos del journey afectó RL-1» (§19.7) saldría vacío para siempre sobre
+    // una versión que ya no se puede corregir.
+    await expect(
+      aprobarDesignVersion(leadId, { workspaceId: ws, designVersionId: dv.designVersionId, motivo: '' }),
+    ).rejects.toThrow(/nodos que ya no están en el journey/);
+    const sigue = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(sigue!.estado).toBe('borrador');
+    expect(sigue!.snapshotId).toBeNull();
+
+    // El borrador SÍ se corrige —esa es la diferencia con una versión aprobada—: se
+    // desenlaza el nodo y la aprobación pasa. El elemento sigue existiendo: no se limpia
+    // solo, porque borrar el trabajo de otro en silencio es peor que pedir que lo revise.
+    await editarElemento(leadId, {
+      workspaceId: ws,
+      elementoId: colgante.elementoId,
+      tipo: 'paso',
+      operacion: 'modifica',
+      titulo: 'Elemento del paso efímero',
+      detalle: '',
+      nodoId: null,
+    });
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const aprobada = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(aprobada!.estado).toBe('aprobada');
+    // El otro elemento conserva su nodo, y ahora lo resuelve el snapshot congelado.
+    expect(
+      aprobada!.elementos.find((e) => e.titulo === 'Elemento del paso que se queda')!.nodoEtiqueta,
+    ).toBe('Paso que se queda');
+  });
+
+  it('G7 espera a los releases que la versión superada dejó en vuelo (RF-06.7)', async () => {
+    // El otro lado del argumento que separó `puedePlanificar` de `puedeCompletar`: si un
+    // release de DV-1 se puede constatar tras la supersión —porque el effective state del
+    // servicio se arma con TODOS sus releases verificados (RF-06.10)—, entonces excluir de
+    // G7 a las versiones superadas dejaba certificar «implementación conciliada» con un
+    // despliegue de DV-1 sin observar.
+    const admin = sqlAdmin();
+    const [p] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-96', 'Proyecto con vuelo pendiente', ${leadId}) returning id`;
+    const proy = p!.id as string;
+    for (let n = 0; n <= 7; n++) {
+      const [g] = await admin`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador)
+        values (${ws}, ${proy}, ${n}, ${[0, 3, 5, 6].includes(n) ? 'sponsor' : 'lead-boutique'})
+        returning id`;
+      await admin`insert into checklist_item
+        (workspace_id, gate_id, orden, texto, estado, na_justificacion, na_aprobado_por)
+        values (${ws}, ${g!.id as string}, 0, 'Ítem del test', 'na', 'fuera de alcance del test',
+                ${leadId})`;
+    }
+    const aprobarGateCrudo = (n: number) =>
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
+
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio con releases en vuelo', ${leadId}) returning id`;
+    const svcId = svc!.id as string;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', 'Objetivo del vuelo', ${leadId}) returning id`;
+    const journeyId = j!.id as string;
+
+    const nuevoElemento = async (designVersionId: string, titulo: string) =>
+      (
+        await agregarElemento(leadId, {
+          workspaceId: ws,
+          designVersionId,
+          tipo: 'canal',
+          operacion: 'agrega',
+          titulo,
+          detalle: '',
+          nodoId: null,
+          decisionIds: [],
+          insightIds: [],
+        })
+      ).elementoId;
+
+    // DV-1 con dos elementos, cada uno en su release: uno se queda planificado y el otro
+    // sale sin constatar. G6 firma el plan con los dos asignados.
+    const primera = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La primera del servicio',
+      resumen: '',
+      superaA: null,
+    });
+    const elPlanificado = await nuevoElemento(primera.designVersionId, 'Lo que se quedó en el plan');
+    const elDesplegado = await nuevoElemento(primera.designVersionId, 'Lo que salió sin constatar');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      motivo: '',
+    });
+    const rlPlanificado = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      titulo: 'El que no llegó a salir',
+      responsable: 'Equipo de core',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elPlanificado, razon: 'dependencia externa' }],
+    });
+    const rlDesplegado = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      titulo: 'El que salió',
+      responsable: 'Equipo de canales',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elDesplegado, razon: '' }],
+    });
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: rlDesplegado.releaseId,
+      desplegadoEn: AYER,
+    });
+    for (let n = 0; n <= 6; n++) await aprobarGateCrudo(n);
+
+    // El ciclo siguiente supera a la primera y se concilia entero.
+    const segunda = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La segunda del servicio',
+      resumen: '',
+      superaA: primera.designVersionId,
+    });
+    const elSegunda = await nuevoElemento(segunda.designVersionId, 'Lo de la segunda versión');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: segunda.designVersionId,
+      motivo: '',
+    });
+    const rlSegunda = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: segunda.designVersionId,
+      titulo: 'El de la segunda',
+      responsable: 'Equipo de canales',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elSegunda, razon: '' }],
+    });
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: rlSegunda.releaseId,
+      desplegadoEn: HOY,
+    });
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlSegunda.releaseId,
+      constatadoEn: HOY,
+      resumen: '',
+      constataciones: [
+        { elementoId: elSegunda, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+      ],
+    });
+    const [estadoPrimera] = await admin`select estado from design_version
+      where id = ${primera.designVersionId} and workspace_id = ${ws}`;
+    expect(estadoPrimera!.estado).toBe('superada');
+
+    // La versión VIGENTE está conciliada y su tablero no tiene huecos… y aun así G7 no
+    // pasa: la superada dejó un despliegue sin observar y un plan sin cerrar.
+    const tableroVigente = await tableroDeConciliacion(leadId, ws, segunda.designVersionId);
+    expect(conciliacionCompleta(tableroVigente!.filas)).toBe(true);
+    await expect(aprobarGateCrudo(7)).rejects.toThrow(/superada dejó releases sin resolver/);
+
+    // Salida 1, la del despliegue: ya cambió el servicio, así que se constata. Es lo que
+    // mete ese cambio en el effective state contra el que se calcula el diff siguiente.
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlDesplegado.releaseId,
+      constatadoEn: AYER,
+      resumen: '',
+      constataciones: [
+        {
+          elementoId: elDesplegado,
+          resultado: 'desviado',
+          queQuedoDistinto: 'Salió sin el aviso al cliente',
+          razon: 'El proveedor no expuso el webhook a tiempo',
+        },
+      ],
+    });
+    // Sigue bloqueado por el release que nunca salió: no basta con cerrar lo desplegado.
+    await expect(aprobarGateCrudo(7)).rejects.toThrow(/superada dejó releases sin resolver/);
+
+    // Salida 2, la del plan: «esto ya no va a salir» tiene forma en el modelo sin inventar
+    // un estado de release — se le quita el alcance, y entonces la base no lo deja
+    // desplegar nunca (un release sin elementos no sale, SYS-06).
+    await desasignarElemento(leadId, ws, elPlanificado);
+    await expect(
+      desplegarRelease(leadId, {
+        workspaceId: ws,
+        releaseId: rlPlanificado.releaseId,
+        desplegadoEn: HOY,
+      }),
+    ).rejects.toThrow(/sin elementos declarados no se despliega/);
+
+    await aprobarGateCrudo(7);
+    const [g7] = await admin`select estado from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
+    expect(g7!.estado).toBe('aprobado');
+  });
+
+  it('la lista de design versions se pagina y el candidato a suceder se pide por servicio', async () => {
+    // Un corte duro esconde justo lo que hace falta: con más versiones de las que cabían
+    // en la respuesta, la aprobada VIGENTE de un servicio podía quedar fuera, el selector
+    // de «supera a» se quedaba sin opciones y el alta mandaba `superaA = null` — que
+    // design_version_anclaje_guard rechaza porque sí existe una aprobada. Crear la versión
+    // siguiente de ese servicio se volvía imposible.
+    const admin = sqlAdmin();
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio del fondo de la lista', ${leadId}) returning id`;
+    const svcId = svc!.id as string;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', 'Objetivo del fondo', ${leadId}) returning id`;
+    const journeyId = j!.id as string;
+
+    const vieja = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La aprobada que se hunde en la lista',
+      resumen: '',
+      superaA: null,
+    });
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: vieja.designVersionId,
+      tipo: 'canal',
+      operacion: 'agrega',
+      titulo: 'Elemento de la que se hunde',
+      detalle: '',
+      nodoId: null,
+      decisionIds: [],
+      insightIds: [],
+    });
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: vieja.designVersionId,
+      motivo: '',
+    });
+
+    // Una página entera de versiones POSTERIORES la empuja fuera del primer tramo. Van
+    // por SQL crudo: lo que se prueba es la lectura, y pasar por el alta real sería
+    // cincuenta transacciones para el mismo fixture.
+    const [ultima] = await admin`select max(substring(codigo from 4)::int) as n
+      from design_version where workspace_id = ${ws}`;
+    let siguienteCodigo = (ultima!.n as number) + 1;
+    for (let i = 0; i < PAGINA_DESIGN_VERSIONS + 1; i++) {
+      await admin`insert into design_version
+        (workspace_id, proyecto_id, servicio_id, journey_id, codigo, titulo, creado_por)
+        values (${ws}, ${proyectoId}, ${servicioId}, ${toBeId},
+                ${'DV-' + siguienteCodigo}, ${'Relleno ' + i}, ${leadId})`;
+      siguienteCodigo += 1;
+    }
+
+    const primera = await designVersionsDelWorkspace(leadId, ws);
+    expect(primera.versiones).toHaveLength(PAGINA_DESIGN_VERSIONS);
+    expect(primera.siguiente).not.toBeNull();
+    // La aprobada del servicio NO está en la primera página: es exactamente el caso que
+    // dejaba el formulario sin candidato.
+    expect(primera.versiones.map((v) => v.id)).not.toContain(vieja.designVersionId);
+
+    // El cursor la alcanza: paginar no la esconde, la pone detrás.
+    const vistas: string[] = primera.versiones.map((v) => v.id);
+    let cursor = primera.siguiente;
+    let vueltas = 0;
+    while (cursor !== null && vueltas < 20) {
+      const pagina = await designVersionsDelWorkspace(leadId, ws, cursor);
+      vistas.push(...pagina.versiones.map((v) => v.id));
+      cursor = pagina.siguiente;
+      vueltas += 1;
+    }
+    expect(vistas).toContain(vieja.designVersionId);
+    // Keyset limpio: ninguna fila repetida entre páginas.
+    expect(new Set(vistas).size).toBe(vistas.length);
+
+    // Y el selector no depende de nada de eso: pregunta por el servicio y SYS-05 garantiza
+    // que la respuesta es cero o una.
+    const vigente = await versionAprobadaDelServicio(leadId, ws, svcId);
+    expect(vigente).toMatchObject({ id: vieja.designVersionId });
+    // Y un servicio sin versiones responde «ninguna», que es lo que hace que el selector
+    // ofrezca «no supera a ninguna (primera del servicio)» sin adivinarlo.
+    const [virgen] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio sin design versions', ${leadId}) returning id`;
+    expect(await versionAprobadaDelServicio(leadId, ws, virgen!.id as string)).toBeNull();
+
+    // Con el candidato en la mano, la versión siguiente del servicio se crea: el guard de
+    // anclaje la acepta porque declara a cuál supera.
+    const sucesora = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La siguiente del servicio del fondo',
+      resumen: '',
+      superaA: vigente!.id,
+    });
+    expect(sucesora.designVersionId).toBeTruthy();
   });
 
   it('nada de esto cruza el workspace', async () => {

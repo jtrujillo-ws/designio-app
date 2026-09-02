@@ -15,9 +15,10 @@ import { LOOP_BANCO_ANDINO, type JourneyLoop } from '@/lib/loop/loop-data';
 /** Pantalla Loop J1–J7 — recreación de la referencia hifi del design system (ui_kits/designio). */
 
 /** Lo que la pantalla necesita del usuario autenticado (lo publica el guard de /_autenticada). */
+export type MembresiaLoop = { workspaceId: string; workspaceNombre: string; rol: string };
 export type UsuarioLoop = {
   nombre: string;
-  membresias: { workspaceNombre: string; rol: string }[];
+  membresias: MembresiaLoop[];
 };
 
 const TABS = [
@@ -40,15 +41,17 @@ const micro: CSSProperties = {
 
 export function LoopScreen({
   usuario,
+  membresiaActiva,
   arbol,
 }: {
   usuario: UsuarioLoop;
+  membresiaActiva: MembresiaLoop | undefined;
   arbol: ArbolWorkspace | null;
 }) {
   const servicio = arbol?.servicios[0] ?? null;
   return (
     <div>
-      <Topbar usuario={usuario} />
+      <Topbar usuario={usuario} membresiaActiva={membresiaActiva} />
       <div style={{ display: 'flex', minHeight: 780 }}>
         <Sidebar arbol={arbol} />
         <main style={{ flex: 1, padding: '28px 32px', minWidth: 0 }}>
@@ -149,13 +152,25 @@ function inicialesDe(nombre: string): string {
   );
 }
 
-function Topbar({ usuario }: { usuario: UsuarioLoop }) {
+function Topbar({
+  usuario,
+  membresiaActiva,
+}: {
+  usuario: UsuarioLoop;
+  membresiaActiva: MembresiaLoop | undefined;
+}) {
   const navigate = useNavigate();
-  const membresia = usuario.membresias[0];
+  const membresia = membresiaActiva ?? usuario.membresias[0];
 
   async function salir() {
     await cerrarSesion();
     await navigate({ to: '/login' });
+  }
+
+  function cambiarWorkspace(ws: string) {
+    // `ws` viaja pegado a la navegación (retainSearchParams): basta con fijarlo aquí
+    // y los loaders de la pantalla actual reaccionan (loaderDeps sobre ws).
+    void navigate({ to: '.', search: (prev) => ({ ...prev, ws }) });
   }
 
   return (
@@ -171,16 +186,53 @@ function Topbar({ usuario }: { usuario: UsuarioLoop }) {
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
         <Wordmark />
-        <span
-          style={{
-            font: '600 13px var(--font-sans)',
-            border: '1px solid var(--border-strong)',
-            borderRadius: 'var(--r-pill)',
-            padding: '5px 14px',
-          }}
-        >
-          ● {membresia?.workspaceNombre ?? 'Sin workspace'} ▾
-        </span>
+        {usuario.membresias.length > 1 ? (
+          <label
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              font: '600 13px var(--font-sans)',
+              border: '1px solid var(--border-strong)',
+              borderRadius: 'var(--r-pill)',
+              padding: '5px 14px',
+            }}
+          >
+            <span aria-hidden>●</span>
+            <span style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>
+              Workspace activo
+            </span>
+            <select
+              value={membresia?.workspaceId ?? ''}
+              onChange={(e) => cambiarWorkspace(e.target.value)}
+              style={{
+                font: 'inherit',
+                border: 'none',
+                background: 'transparent',
+                color: 'inherit',
+                cursor: 'pointer',
+                outlineOffset: 4,
+              }}
+            >
+              {usuario.membresias.map((m) => (
+                <option key={m.workspaceId} value={m.workspaceId}>
+                  {m.workspaceNombre}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <span
+            style={{
+              font: '600 13px var(--font-sans)',
+              border: '1px solid var(--border-strong)',
+              borderRadius: 'var(--r-pill)',
+              padding: '5px 14px',
+            }}
+          >
+            ● {membresia?.workspaceNombre ?? 'Sin workspace'}
+          </span>
+        )}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
         <Input placeholder="Buscar en el workspace…  /" style={{ background: 'var(--bg-app)', border: '1px solid var(--border)', width: 280 }} />

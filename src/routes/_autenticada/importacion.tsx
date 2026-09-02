@@ -30,8 +30,9 @@ import {
  * o rechazar. Nada entra como evidencia sin acción humana explícita (SYS-16).
  */
 export const Route = createFileRoute('/_autenticada/importacion')({
+  loaderDeps: ({ search }) => ({ ws: search.ws }),
   loader: ({ context }) => {
-    const workspaceId = context.usuario.membresias[0]?.workspaceId;
+    const workspaceId = context.membresiaActiva?.workspaceId;
     return workspaceId ? bandejaDeImportacion({ data: { workspaceId } }) : null;
   },
   component: PantallaImportacion,
@@ -60,12 +61,12 @@ const TEXTO_ESTADO: Record<ItemBandeja['estado'], string> = {
 
 function PantallaImportacion() {
   const datos = Route.useLoaderData();
-  const { usuario } = Route.useRouteContext();
+  const { membresiaActiva } = Route.useRouteContext();
   const navigate = useNavigate();
   const router = useRouter();
   // Solo la boutique decide (RF-03.4): a los demás roles la tarjeta no les ofrece
   // controles que el server rechazaría de todos modos (capa 2 + RLS).
-  const rol = usuario.membresias[0]?.rol ?? '';
+  const rol = membresiaActiva?.rol ?? '';
   const puedeCurar = (ROLES_CURADORES as readonly string[]).includes(rol);
   const [error, setError] = useState<string | null>(null);
   // Páginas siguientes de pendientes cargadas bajo demanda (el loader trae la primera).

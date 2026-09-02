@@ -29,8 +29,9 @@ import type {
 const ES_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
+  loaderDeps: ({ search }) => ({ ws: search.ws }),
   loader: async ({ context, params }) => {
-    const workspaceId = context.usuario.membresias[0]?.workspaceId;
+    const workspaceId = context.membresiaActiva?.workspaceId;
     // Un id no-uuid en la URL (enlace editado/truncado) es "no existe", no un crash
     // del validador de la server function contra el error boundary por defecto.
     if (!workspaceId || !ES_UUID.test(params.proyectoId)) return null;
@@ -84,11 +85,11 @@ function criteriosCompletos(criterios: CriterioDeReto[]): boolean {
 
 function PantallaProyecto() {
   const datos = Route.useLoaderData();
-  const { usuario } = Route.useRouteContext();
+  const { membresiaActiva } = Route.useRouteContext();
   const navigate = useNavigate();
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
-  const rol = usuario.membresias[0]?.rol ?? '';
+  const rol = membresiaActiva?.rol ?? '';
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>

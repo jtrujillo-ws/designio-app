@@ -151,30 +151,31 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
     let filas;
     try {
       // Renombrar una entidad la renombra EN TODAS PARTES: es lo que se gana al darle
-      // identidad. Se actualizan el catálogo Y todos los nodos que lo comparten, en la
-      // misma transacción — si solo se tocara el nodo editado, el otro journey seguiría
-      // rindiendo y congelando el nombre viejo, y volver a teclearlo allí crearía una
-      // segunda entrada de catálogo, deshaciendo la identidad que esto viene a dar.
+      // identidad. Aquí solo se toca el CATÁLOGO — la propagación a los nodos que lo
+      // comparten la hace el trigger `catalogo_renombrado`, no esta función.
+      //
+      // Antes se hacía con una segunda sentencia justo aquí, y funcionaba mientras esta
+      // fuera la única puerta. No lo es: `grant update (nombre) on catalogo_journey` deja
+      // renombrar la entrada por SQL directo, y por ahí la promesa se rompía en silencio
+      // —catálogo con el nombre nuevo, nodos con el viejo—. Una regla que solo vale
+      // cuando se entra por la puerta buena no es una regla del modelo, así que bajó a la
+      // tabla; y con ella baja la cautela sobre las ETIQUETAS, que ahora es el
+      // `is distinct from` del trigger.
+      //
+      // Pero aquí hace falta la suya propia, sobre el NOMBRE, y no por el evento —de eso
+      // ya se ocupa el `when` del trigger— sino por el candado: escribir la fila la bloquea
+      // hasta el commit, y esta entrada es COMPARTIDA. Sin el `is distinct from`, editar el
+      // detalle de un nodo con catálogo serializa contra cualquier otra edición de
+      // cualquier nodo que comparta esa entidad, en cualquier journey del servicio.
+      // Justamente lo que se gana al darle identidad se convertiría en un punto de
+      // contención, por una escritura que en el caso normal no cambia nada.
       await tx`
         update catalogo_journey c
         set nombre = ${entrada.etiqueta}
         from journey_nodo n
         where n.id = ${entrada.nodoId} and n.workspace_id = ${entrada.workspaceId}
-          and c.id = n.catalogo_id and c.workspace_id = n.workspace_id`;
-      // Solo cuando la etiqueta CAMBIA de verdad. Sin el `<>`, editar únicamente el
-      // detalle o el responsable de un nodo con catálogo reescribía a todos sus hermanos
-      // con el mismo valor, y Postgres dispara el trigger de auditoría igual en un update
-      // que no cambia nada: `JourneyNodoEditado` falsos en todos los journeys donde la
-      // entidad aparece, por una edición que no los tocó.
-      await tx`
-        update journey_nodo otros
-        set etiqueta = ${entrada.etiqueta}
-        from journey_nodo n
-        where n.id = ${entrada.nodoId} and n.workspace_id = ${entrada.workspaceId}
-          and n.catalogo_id is not null
-          and otros.catalogo_id = n.catalogo_id and otros.workspace_id = n.workspace_id
-          and otros.id <> n.id
-          and otros.etiqueta <> ${entrada.etiqueta}`;
+          and c.id = n.catalogo_id and c.workspace_id = n.workspace_id
+          and c.nombre is distinct from ${entrada.etiqueta}`;
       // Mover un nodo a una posición ocupada dejaría a dos hermanos EMPATADOS en `orden`,
       // y ahí las tres vistas dejan de hablar del mismo journey: `porSecuencia` desempata
       // por id y el render de la fase ordena solo por `orden`, así que el diagrama y el
@@ -221,6 +222,18 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
               and otros.orden >= ${entrada.orden} and otros.orden < ${ordenViejo}`;
         }
       }
+      // `etiqueta` sigue en el SET por los nodos SIN catálogo, que es donde el usuario la
+      // escribe de verdad; en los que sí lo tienen ya llega puesta —el trigger acaba de
+      // propagarla y el guard la deriva igual—, así que aquí no decide nada.
+      //
+      // Renombrar un nodo con catálogo deja por tanto dos eventos sobre él: el de la
+      // propagación, que cuenta que la ENTIDAD cambió de nombre en todos los journeys, y
+      // este, que cuenta qué cambió en ESTE nodo. Son dos hechos distintos y antes iban
+      // confundidos en uno.
+      //
+      // Este UPDATE es además la comprobación de autorización: un stakeholder pasa la
+      // política de lectura y no la de escritura, así que la fila existe para él pero no
+      // se deja tocar, y eso se lee en `count`.
       filas = await tx`
         update journey_nodo
         set etiqueta = ${entrada.etiqueta}, detalle = ${entrada.detalle},

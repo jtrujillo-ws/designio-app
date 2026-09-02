@@ -612,6 +612,176 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     );
   });
 
+  it('guardar sin cambiar nada no es una edición y no deja evento', async () => {
+    // Postgres dispara los triggers también cuando el UPDATE reescribe la fila con los
+    // mismos valores. `editarNodo` reescribe SIEMPRE la fila del nodo —le hace falta el
+    // `count` para saber si la política de escritura le dejó—, así que abrir el formulario
+    // y guardarlo tal cual emitía un `JourneyNodoEditado` de algo que no pasó. Un
+    // historial que registra ediciones que nadie hizo no es más completo, es menos fiable.
+    const admin = sqlAdmin();
+    const nodo = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'paso',
+      etiqueta: 'Firma el contrato',
+      arquetipoId: null,
+      detalle: 'En la app',
+      faseId: null,
+      responsable: 'Cliente',
+    });
+    const [antes] = await admin`select count(*)::int as n from evento_dominio
+      where workspace_id = ${ws} and tipo = 'JourneyNodoEditado'`;
+
+    const igual = {
+      workspaceId: ws,
+      nodoId: nodo.nodoId,
+      etiqueta: 'Firma el contrato',
+      detalle: 'En la app',
+      faseId: null,
+      responsable: 'Cliente',
+      orden: (await journeyCompleto(leadId, ws, journeyId))!.nodos.find(
+        (n) => n.id === nodo.nodoId,
+      )!.orden,
+    };
+    await editarNodo(leadId, igual);
+    const [sinCambio] = await admin`select count(*)::int as n from evento_dominio
+      where workspace_id = ${ws} and tipo = 'JourneyNodoEditado'`;
+    expect(sinCambio!.n as number).toBe(antes!.n as number);
+
+    // Y cambiar UNA cosa sí deja su evento, con el antes y el después: la guarda filtra el
+    // ruido, no las ediciones.
+    await editarNodo(leadId, { ...igual, detalle: 'En la app, con OTP' });
+    const [evento] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'JourneyNodoEditado'
+        and payload->>'nodoId' = ${nodo.nodoId}`;
+    expect(evento!.payload).toMatchObject({
+      detalle: 'En la app, con OTP',
+      antes: { detalle: 'En la app' },
+    });
+  });
+
+  it('renombrar la entrada de catálogo DIRECTAMENTE también renombra en todas partes, y deja rastro', async () => {
+    // El caso que el servicio no cubría. `editarNodo` renombraba el catálogo y después,
+    // con una sentencia propia, los nodos hermanos — pero el rol de la app tiene
+    // `grant update (nombre) on catalogo_journey`, así que renombrar por SQL directo
+    // dejaba la entrada con el nombre nuevo y TODOS los nodos con el viejo. El catálogo y
+    // el grafo decían cosas distintas sobre la misma entidad, que es exactamente la
+    // identidad partida que el catálogo existe para eliminar.
+    const uno = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'canal',
+      etiqueta: 'App móvil',
+      arquetipoId: null,
+      detalle: '',
+      faseId: null,
+      responsable: 'Canales',
+    });
+    const otro = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId: otroJourneyId,
+      tipo: 'canal',
+      etiqueta: 'App móvil',
+      arquetipoId: null,
+      detalle: '',
+      faseId: null,
+      responsable: 'Canales',
+    });
+    const antes = await journeyCompleto(leadId, ws, journeyId);
+    const catId = antes!.nodos.find((n) => n.id === uno.nodoId)!.catalogoId as string;
+
+    // Otra entrada del mismo servicio: la propagación tiene que alcanzar a los nodos de
+    // ESTA entrada y a ninguno más.
+    const ajeno = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'canal',
+      etiqueta: 'Sucursal',
+      arquetipoId: null,
+      detalle: '',
+      faseId: null,
+      responsable: 'Canales',
+    });
+
+    await conUsuario(leadId, (tx) => tx`
+      update catalogo_journey set nombre = 'App móvil (iOS y Android)'
+      where id = ${catId} and workspace_id = ${ws}`);
+
+    const j1 = await journeyCompleto(leadId, ws, journeyId);
+    const j2 = await journeyCompleto(leadId, ws, otroJourneyId);
+    expect(j1!.nodos.find((n) => n.id === uno.nodoId)!.etiqueta).toBe('App móvil (iOS y Android)');
+    expect(j2!.nodos.find((n) => n.id === otro.nodoId)!.etiqueta).toBe('App móvil (iOS y Android)');
+    expect(j1!.nodos.find((n) => n.id === ajeno.nodoId)!.etiqueta).toBe('Sucursal');
+
+    // El acto queda auditado, y no solo su efecto: los `JourneyNodoEditado` de cada nodo
+    // cuentan que una etiqueta cambió, pero no quién renombró la entidad ni cómo se
+    // llamaba antes — que es lo que se pregunta quien lee un journey viejo.
+    const admin = sqlAdmin();
+    const eventos = await admin`
+      select payload, actor_id, actor_rol from evento_dominio
+      where workspace_id = ${ws} and tipo = 'CatalogoJourneyRenombrado'
+        and payload->>'catalogoId' = ${catId}`;
+    expect(eventos).toHaveLength(1);
+    expect(eventos[0]!.payload).toMatchObject({
+      catalogoId: catId,
+      tipo: 'canal',
+      nombre: 'App móvil (iOS y Android)',
+      nodosActualizados: 2,
+      antes: { nombre: 'App móvil' },
+    });
+    expect(eventos[0]!.actor_id).toBe(leadId);
+    expect(eventos[0]!.actor_rol).toBe('lead-boutique');
+
+    // Reescribir la fila con el MISMO nombre no es un renombrado. Postgres dispara los
+    // triggers igual en un update que no cambia nada, así que sin el `when` del trigger
+    // esto dejaría un renombrado que nadie hizo, y sin el `is distinct from` de la
+    // propagación, un `JourneyNodoEditado` por cada aparición de la entidad.
+    const [nodosAntes] = await admin`
+      select count(*) as n from evento_dominio
+      where workspace_id = ${ws} and tipo = 'JourneyNodoEditado'`;
+    await conUsuario(leadId, (tx) => tx`
+      update catalogo_journey set nombre = 'App móvil (iOS y Android)'
+      where id = ${catId} and workspace_id = ${ws}`);
+    const [renombrados] = await admin`
+      select count(*) as n from evento_dominio
+      where workspace_id = ${ws} and tipo = 'CatalogoJourneyRenombrado'
+        and payload->>'catalogoId' = ${catId}`;
+    const [nodosDespues] = await admin`
+      select count(*) as n from evento_dominio
+      where workspace_id = ${ws} and tipo = 'JourneyNodoEditado'`;
+    expect(Number(renombrados!.n)).toBe(1);
+    expect(Number(nodosDespues!.n)).toBe(Number(nodosAntes!.n));
+
+    // Editar un nodo SIN renombrarlo no puede escribir la entrada de catálogo. No es una
+    // cuestión de eventos —de eso ya se ocupa el `when` del trigger— sino de candados: la
+    // entrada es compartida, y escribirla la bloquea hasta el commit, así que cambiar el
+    // detalle de un nodo serializaría contra cualquier edición de cualquier nodo que
+    // comparta esa entidad. Se comprueba por `xmin`, que cambia si y solo si la fila se
+    // reescribió: es el hecho exacto, no una aproximación por evento.
+    const [antesDeEditar] = await admin`select xmin::text as v from catalogo_journey
+      where id = ${catId}`;
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: uno.nodoId,
+      etiqueta: 'App móvil (iOS y Android)',
+      detalle: 'Con biometría',
+      faseId: null,
+      responsable: 'Canales',
+      orden: j1!.nodos.find((n) => n.id === uno.nodoId)!.orden,
+    });
+    const [despuesDeEditar] = await admin`select xmin::text as v from catalogo_journey
+      where id = ${catId}`;
+    expect(despuesDeEditar!.v).toBe(antesDeEditar!.v);
+
+    // Y el stakeholder no renombra: la política de escritura del catálogo es de curadores,
+    // así que su update no alcanza ninguna fila y la entidad no se mueve.
+    await conUsuario(stakeId, (tx) => tx`
+      update catalogo_journey set nombre = 'Renombrado por quien no debe'
+      where id = ${catId} and workspace_id = ${ws}`);
+    const [cat] = await admin`select nombre from catalogo_journey where id = ${catId}`;
+    expect(cat!.nombre).toBe('App móvil (iOS y Android)');
+  });
+
   it('el proyecto del journey tiene que ser del reto del journey', async () => {
     // Las FKs compuestas garantizan el workspace y nada más. Un journey anclado al reto R
     // y al proyecto de S diría una cosa por cada lado, y la conciliación de la design

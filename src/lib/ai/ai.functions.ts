@@ -85,8 +85,11 @@ export const registrarConsentimientoAI = createServerFn({ method: 'POST' })
     const actorId = await usuarioIdDeRequest();
     if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
     try {
-      await registrarConsentimiento(actorId, data);
-      return { ok: true as const };
+      // La versión y si autoriza el procesamiento externo vuelven a la pantalla: un
+      // registro que NO lo cubre es válido y queda anotado, pero no desbloquea la
+      // generación — decirlo evita que alguien crea que ya puede pedir la propuesta.
+      const r = await registrarConsentimiento(actorId, data);
+      return { ok: true as const, version: r.version, autorizaExterno: r.autorizaExterno };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

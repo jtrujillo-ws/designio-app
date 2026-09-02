@@ -5,6 +5,7 @@ import {
   MODELO_FALLBACK,
   MODELO_PRIMARIO,
   MOTIVO_ESQUEMA,
+  MOTIVO_RECHAZO,
   motivoDeFalloProveedor,
   TIMEOUT_PROVEEDOR_MS,
   type UsoTokens,
@@ -32,9 +33,29 @@ import type { CapacidadActiva } from './ai.schemas';
  * para siempre (RF-09.14)—, así que sube con el resultado hasta la propuesta. */
 export type UsoLlamada = UsoTokens & { costoUsd: number | null };
 
+/** Por qué no hay contenido utilizable. Distingue las llamadas que el proveedor SÍ atendió
+ * —y por tanto cobró— de las que ni siquiera llegaron a respuesta: son gastos distintos y
+ * problemas distintos (una negativa se revisa, un timeout se reintenta). */
+export type MotivoSinSalida = 'rechazo-proveedor' | 'fuera-de-contrato' | 'sin-respuesta';
+
+/**
+ * Resultado de una operación de generación. La rama de fallo lleva TAMBIÉN el uso, el
+ * modelo y la latencia: una negativa del proveedor (`stop_reason = 'refusal'`) o una salida
+ * que no se puede parsear son respuestas completas, facturadas, con su `usage` dentro. Sin
+ * subirlo, esas llamadas desaparecían de la observabilidad de costos justo cuando más
+ * interesa mirarlas — el gasto ocurrió y no había ni propuesta ni rastro que lo dijera.
+ */
 export type ResultadoProveedor =
   | { ok: true; datos: unknown; modelo: string; latenciaMs: number; uso: UsoLlamada | null }
-  | { ok: false; motivo: string };
+  | {
+      ok: false;
+      motivo: string;
+      causa: MotivoSinSalida;
+      /** El modelo al que se llamó por última vez (puede ser el de respaldo). */
+      modelo: string;
+      latenciaMs: number;
+      uso: UsoLlamada | null;
+    };
 
 /** Techo de salida: los contenidos de este slice son fichas pequeñas y estructuradas;
  * un techo alto solo compraría latencia y coste. */
@@ -113,18 +134,44 @@ async function unaLlamada(
       format: { type: 'json_schema', schema: ESQUEMA_SALIDA[capacidad] },
     },
   });
+  // El uso se lee lo PRIMERO, antes de cualquier rama que pueda salir por excepción: la
+  // llamada ya está hecha y facturada aunque el contenido no sirva, y este es el único
+  // instante en que el dato existe. Leerlo después de decidir si hay propuesta era
+  // perderlo exactamente en los casos que hay que auditar.
+  const uso = usoDeRespuesta(modelo, respuesta.usage);
   // Una negativa del proveedor es una respuesta válida a nivel HTTP: se trata como
-  // «sin propuesta», jamás como un objeto vacío que alguien pudiera aceptar.
+  // «sin propuesta», jamás como un objeto vacío que alguien pudiera aceptar. Viaja con su
+  // uso a cuestas para que el libro de llamadas la anote igual.
   if (respuesta.stop_reason === 'refusal') {
-    throw Object.assign(new Error('refusal'), { status: 422 });
+    throw Object.assign(new Error('refusal'), { status: 422, uso, causa: 'rechazo-proveedor' });
   }
   const texto = respuesta.content
     .map((b) => (b.type === 'text' ? b.text : ''))
     .join('')
     .trim();
-  // El uso viaja CON los datos: quedarse solo con el texto era tirar el único dato de
-  // coste que el proveedor da, y ningún cálculo posterior podía reconstruirlo.
-  return { datos: JSON.parse(texto), uso: usoDeRespuesta(modelo, respuesta.usage) };
+  try {
+    // El uso viaja CON los datos: quedarse solo con el texto era tirar el único dato de
+    // coste que el proveedor da, y ningún cálculo posterior podía reconstruirlo.
+    return { datos: JSON.parse(texto), uso };
+  } catch (e) {
+    // Un JSON ilegible también se pagó: el error se re-lanza con el uso pegado en vez de
+    // dejar que la excepción se lleve por delante la única medida del gasto.
+    throw Object.assign(e as SyntaxError, { uso });
+  }
+}
+
+/** Rescata el uso que una excepción trae pegado (negativa del proveedor, JSON ilegible).
+ * Un fallo sin respuesta —timeout, 5xx, red— no trae ninguno: ahí el gasto es desconocido
+ * y se anota como tal, que no es lo mismo que cero. */
+function usoDelError(e: unknown): UsoLlamada | null {
+  const uso = (e as { uso?: unknown }).uso;
+  return uso && typeof uso === 'object' ? (uso as UsoLlamada) : null;
+}
+
+function causaDelError(e: unknown): MotivoSinSalida {
+  if (e instanceof SyntaxError) return 'fuera-de-contrato';
+  const causa = (e as { causa?: unknown }).causa;
+  return causa === 'rechazo-proveedor' ? 'rechazo-proveedor' : 'sin-respuesta';
 }
 
 export async function generarConProveedor(entrada: {
@@ -134,7 +181,9 @@ export async function generarConProveedor(entrada: {
   usuario: string;
 }): Promise<ResultadoProveedor> {
   const inicio = Date.now();
+  let ultimoModelo = MODELO_PRIMARIO;
   for (const [indice, modelo] of [MODELO_PRIMARIO, MODELO_FALLBACK].entries()) {
+    ultimoModelo = modelo;
     try {
       const { datos, uso } = await unaLlamada(
         entrada.key,
@@ -146,12 +195,40 @@ export async function generarConProveedor(entrada: {
       return { ok: true, datos, modelo, latenciaMs: Date.now() - inicio, uso };
     } catch (e) {
       // JSON ilegible: el modelo respondió pero fuera de contrato. No se reintenta con
-      // otro modelo (no es indisponibilidad) y la propuesta se descarta entera.
-      if (e instanceof SyntaxError) return { ok: false, motivo: MOTIVO_ESQUEMA };
+      // otro modelo (no es indisponibilidad) y la propuesta se descarta entera —— pero la
+      // llamada existió y su uso sube igual.
+      if (e instanceof SyntaxError) {
+        return {
+          ok: false,
+          motivo: MOTIVO_ESQUEMA,
+          causa: 'fuera-de-contrato',
+          modelo,
+          latenciaMs: Date.now() - inicio,
+          uso: usoDelError(e),
+        };
+      }
       if (indice === 0 && degradaModelo(e)) continue;
-      return { ok: false, motivo: motivoDeFalloProveedor(e) };
+      const causa = causaDelError(e);
+      return {
+        ok: false,
+        // Una negativa se cuenta como lo que es. `motivoDeFalloProveedor` la traduciría por
+        // su status HTTP («rechazó la petición (422)»), que suena a error nuestro y a algo
+        // que se arregla reintentando.
+        motivo: causa === 'rechazo-proveedor' ? MOTIVO_RECHAZO : motivoDeFalloProveedor(e),
+        causa,
+        modelo,
+        latenciaMs: Date.now() - inicio,
+        uso: usoDelError(e),
+      };
     }
   }
   // Inalcanzable (el bucle siempre retorna), pero el contrato se mantiene sin excepción.
-  return { ok: false, motivo: motivoDeFalloProveedor(null) };
+  return {
+    ok: false,
+    motivo: motivoDeFalloProveedor(null),
+    causa: 'sin-respuesta',
+    modelo: ultimoModelo,
+    latenciaMs: Date.now() - inicio,
+    uso: null,
+  };
 }

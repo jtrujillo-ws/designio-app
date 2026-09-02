@@ -12,9 +12,12 @@ create table journey (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references workspace(id),
   servicio_id uuid not null,
-  -- Opcional: un as-is puede existir antes de que haya reto (SPEC-02), y un to-be
-  -- siempre nace dentro de uno.
+  -- Opcionales: un as-is puede existir antes de que haya reto (SPEC-02), y un to-be
+  -- siempre nace dentro de uno. El proyecto también se guarda (RF-05.1 lo permite): sin
+  -- él, con dos proyectos bajo el mismo reto no se sabría de cuál cuelga el grafo, y el
+  -- gate y la design version lo van a necesitar.
   reto_id uuid,
+  proyecto_id uuid,
   tipo text not null check (tipo in ('as-is', 'to-be')),
   nombre text not null check (btrim(nombre) <> ''),
   descripcion text not null default '',
@@ -27,9 +30,11 @@ create table journey (
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
   foreign key (servicio_id, workspace_id) references servicio (id, workspace_id),
-  foreign key (reto_id, workspace_id) references reto (id, workspace_id)
+  foreign key (reto_id, workspace_id) references reto (id, workspace_id),
+  foreign key (proyecto_id, workspace_id) references proyecto (id, workspace_id)
 );
 create index journey_servicio_idx on journey (workspace_id, servicio_id);
+create index journey_proyecto_idx on journey (workspace_id, proyecto_id);
 
 -- ── Catálogo del workspace: identidad estable de lo que se repite entre journeys ──
 -- Un actor, un canal, un touchpoint o un sistema son LOS MISMOS en el as-is y en el
@@ -40,16 +45,30 @@ create index journey_servicio_idx on journey (workspace_id, servicio_id);
 -- Solo para los tipos que SON entidades del workspace. Un paso o una fricción existen
 -- dentro de su journey y no se comparten: darles catálogo sería inventar identidad
 -- donde no la hay.
+-- El catálogo es DEL SERVICIO, no del workspace: dos servicios del mismo cliente pueden
+-- tener un «Core» que no es el mismo Core, y una clave por workspace los fundiría —
+-- arrastrando dependencias y renombres a través de una frontera que el modelo separa.
+--
+-- Sin 'arquetipo': el arquetipo YA es un objeto curado del reto, con su estado, su
+-- evidencia y sus segmentos. Darle una identidad de catálogo paralela permitiría que el
+-- grafo mostrara un arquetipo que el modelo curado refutó. El nodo apunta al de verdad.
 create table catalogo_journey (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references workspace(id),
-  tipo text not null check (tipo in ('touchpoint', 'canal', 'actor', 'arquetipo', 'sistema')),
+  servicio_id uuid not null,
+  tipo text not null check (tipo in ('touchpoint', 'canal', 'actor', 'sistema')),
   nombre text not null check (btrim(nombre) <> ''),
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
-  -- Un nombre por tipo: es lo que hace que dos journeys hablen del mismo sistema.
-  unique (workspace_id, tipo, nombre)
+  -- Clave que ARRASTRA el tipo, para que la FK del nodo lo verifique estructuralmente y
+  -- no dependa solo del guard: un nodo 'sistema' no puede apuntar a un catálogo 'actor'
+  -- ni con SQL crudo.
+  unique (id, workspace_id, tipo),
+  foreign key (servicio_id, workspace_id) references servicio (id, workspace_id),
+  -- Un nombre por tipo DENTRO del servicio: es lo que hace que el as-is y el to-be del
+  -- mismo servicio hablen del mismo sistema.
+  unique (workspace_id, servicio_id, tipo, nombre)
 );
 
 -- ── Nodos: la taxonomía mínima de §10 ──
@@ -72,6 +91,10 @@ create table journey_nodo (
   responsable text not null default '',
   -- Identidad compartida entre journeys, obligatoria justo en los tipos que la tienen.
   catalogo_id uuid,
+  -- El nodo de tipo 'arquetipo' apunta al arquetipo CURADO del reto (SPEC-04.11), no a
+  -- una copia: su estado, su evidencia y sus segmentos se alcanzan desde el grafo, y un
+  -- arquetipo refutado no puede seguir vivo en el journey como si nada.
+  arquetipo_id uuid,
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
@@ -79,14 +102,21 @@ create table journey_nodo (
   foreign key (fase_id, workspace_id) references journey_nodo (id, workspace_id),
   -- Una fase no cuelga de otra fase: el grafo tiene dos niveles, no un árbol libre.
   check (tipo <> 'fase' or fase_id is null),
-  foreign key (catalogo_id, workspace_id) references catalogo_journey (id, workspace_id),
-  -- Los cinco tipos de entidad EXIGEN catálogo; el resto no lo admite. Sin el «solo
+  -- La FK lleva el TIPO dentro: es lo que impide que un nodo 'sistema' cuelgue de una
+  -- entrada de catálogo 'actor'. Con `catalogo_id` nulo la FK no se evalúa (MATCH SIMPLE),
+  -- así que los tipos sin catálogo pasan sin ruido.
+  foreign key (catalogo_id, workspace_id, tipo) references catalogo_journey (id, workspace_id, tipo),
+  foreign key (arquetipo_id, workspace_id) references arquetipo (id, workspace_id),
+  -- Los cuatro tipos de entidad EXIGEN catálogo; el resto no lo admite. Sin el «solo
   -- estos», nada impediría colgar un paso de una entrada de catálogo y volver a tener
   -- dos identidades para la misma cosa.
   check (
-    (tipo in ('touchpoint', 'canal', 'actor', 'arquetipo', 'sistema')) = (catalogo_id is not null)
-  )
+    (tipo in ('touchpoint', 'canal', 'actor', 'sistema')) = (catalogo_id is not null)
+  ),
+  -- Y el arquetipo, exactamente igual pero contra su propia tabla.
+  check ((tipo = 'arquetipo') = (arquetipo_id is not null))
 );
+create index journey_nodo_arquetipo_idx on journey_nodo (workspace_id, arquetipo_id);
 create index journey_nodo_catalogo_idx on journey_nodo (workspace_id, catalogo_id);
 create index journey_nodo_journey_idx on journey_nodo (workspace_id, journey_id, orden);
 
@@ -284,6 +314,42 @@ create trigger journey_nodo_fase
   before insert or update on journey_nodo
   for each row execute function journey_nodo_fase_guard();
 revoke execute on function journey_nodo_fase_guard() from public;
+
+-- ── La identidad que cuelga de un nodo tiene que ser la de SU journey ──
+-- Las FKs compuestas ya garantizan el workspace y el tipo del catálogo; lo que no pueden
+-- expresar es el SERVICIO ni el RETO, porque cuelgan del journey y no del nodo. Sin esto,
+-- un nodo del journey del servicio A podría apuntar al catálogo del servicio B —fundiendo
+-- dos entidades distintas— o a un arquetipo de otro reto.
+--
+-- La comprobación de tipo se queda además aquí, duplicada a propósito: el guard corre
+-- antes que la FK y da el mensaje bueno, y la FK sostiene la promesa aunque alguien
+-- reescriba el guard.
+create function journey_nodo_identidad_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if new.catalogo_id is not null and not exists (
+    select 1 from catalogo_journey c
+    join journey j on j.id = new.journey_id and j.workspace_id = new.workspace_id
+    where c.id = new.catalogo_id and c.workspace_id = new.workspace_id
+      and c.servicio_id = j.servicio_id and c.tipo = new.tipo) then
+    raise exception 'la entrada de catálogo es de otro servicio o de otro tipo';
+  end if;
+  if new.arquetipo_id is not null and not exists (
+    select 1 from arquetipo a
+    join journey j on j.id = new.journey_id and j.workspace_id = new.workspace_id
+    where a.id = new.arquetipo_id and a.workspace_id = new.workspace_id
+      and a.reto_id = j.reto_id) then
+    raise exception 'el arquetipo es de otro reto, o el journey no tiene reto al que anclarlo';
+  end if;
+  return new;
+end $$;
+create trigger journey_nodo_identidad
+  before insert or update on journey_nodo
+  for each row execute function journey_nodo_identidad_guard();
+revoke execute on function journey_nodo_identidad_guard() from public;
 
 -- ── Los extremos de una arista tienen que encajar con su tipo ──
 -- El CHECK del tipo solo valida la cadena. Sin esto se puede guardar una 'transicion'

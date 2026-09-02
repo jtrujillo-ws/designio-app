@@ -23,6 +23,7 @@ function nodo(parcial: Partial<NodoDeJourney> & Pick<NodoDeJourney, 'tipo' | 'et
     id: id(),
     detalle: '',
     catalogoId: null,
+    arquetipoId: null,
     faseId: null,
     orden: 0,
     responsable: '',
@@ -46,6 +47,7 @@ function journey(nodos: NodoDeJourney[], aristas: AristaDeJourney[]): JourneyCom
     servicioId: id(),
     servicioNombre: 'Apertura de cuenta',
     retoId: null,
+    proyectoId: null,
     tipo: 'as-is',
     nombre: 'Alta digital',
     descripcion: '',
@@ -286,6 +288,59 @@ describe('carrilesDeJourney', () => {
     expect(porNombre['Evidencia física']!.map((n) => n.etiqueta)).toEqual(['App móvil']);
     expect(porNombre['Fricción y emoción']!.map((n) => n.etiqueta)).toEqual(['Rechazo sin motivo']);
     expect(porNombre['Backstage']).toEqual([]);
+  });
+
+  it('llega a lo que cuelga de las acciones del paso, no solo a sus vecinos directos', () => {
+    // El modelo canónico cuelga el actor de la acción en la que participa y el sistema de
+    // la acción que soporta, no del paso. Con adyacencia de un salto, la columna mostraría
+    // la acción y a nadie haciéndola.
+    const paso = nodo({ tipo: 'paso', etiqueta: 'Verifica identidad', orden: 0 });
+    const frontstage = nodo({ tipo: 'accion-frontstage', etiqueta: 'Toma la selfie', orden: 0 });
+    const backstage = nodo({ tipo: 'accion-backstage', etiqueta: 'Compara biometría', orden: 0 });
+    const actor = nodo({ tipo: 'actor', etiqueta: 'Analista de riesgo', orden: 0 });
+    const sistema = nodo({ tipo: 'sistema', etiqueta: 'Motor biométrico', orden: 0 });
+    const blueprint = carrilesDeJourney(
+      journey(
+        [paso, frontstage, backstage, actor, sistema],
+        [
+          arista(frontstage, paso, 'ocurre-en'),
+          arista(backstage, frontstage, 'soporta'),
+          arista(actor, frontstage, 'participa'),
+          arista(sistema, backstage, 'soporta'),
+        ],
+      ),
+    );
+
+    const porNombre = Object.fromEntries(blueprint.carriles.map((c) => [c.nombre, c.porPaso[paso.id]!]));
+    expect(porNombre['Frontstage']!.map((n) => n.etiqueta).sort()).toEqual([
+      'Analista de riesgo',
+      'Toma la selfie',
+    ]);
+    expect(porNombre['Backstage']!.map((n) => n.etiqueta)).toEqual(['Compara biometría']);
+    // El sistema cuelga de la acción BACKSTAGE, que a su vez cuelga de la frontstage: son
+    // tres saltos desde el paso y el salto se detiene en el segundo. Que no aparezca es la
+    // decisión, no un olvido: colgar el sistema del paso o de su acción frontstage lo trae.
+    expect(porNombre['Sistemas']).toEqual([]);
+  });
+
+  it('el segundo salto no arrastra la columna vecina', () => {
+    // Dos pasos encadenados por una acción compartida: sin el tope en pasos y fases, el
+    // canal del segundo paso aparecería también en la columna del primero y el blueprint
+    // dejaría de distinguirlos.
+    const p1 = nodo({ tipo: 'paso', etiqueta: 'Solicita', orden: 0 });
+    const p2 = nodo({ tipo: 'paso', etiqueta: 'Confirma', orden: 1 });
+    const accion = nodo({ tipo: 'accion-frontstage', etiqueta: 'Firma el contrato', orden: 0 });
+    const canal = nodo({ tipo: 'canal', etiqueta: 'Sucursal', orden: 0 });
+    const blueprint = carrilesDeJourney(
+      journey(
+        [p1, p2, accion, canal],
+        [arista(accion, p1, 'ocurre-en'), arista(accion, p2, 'ocurre-en'), arista(p2, canal, 'ocurre-en')],
+      ),
+    );
+
+    const evidencia = blueprint.carriles.find((c) => c.nombre === 'Evidencia física')!;
+    expect(evidencia.porPaso[p1.id]).toEqual([]);
+    expect(evidencia.porPaso[p2.id]!.map((n) => n.etiqueta)).toEqual(['Sucursal']);
   });
 
   it('sin pasos no hay columnas: el blueprint se ordena por pasos', () => {

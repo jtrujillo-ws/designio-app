@@ -51,10 +51,11 @@ export async function crearJourney(
           select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
         ),
         nuevo as (
-          insert into journey (workspace_id, servicio_id, reto_id, tipo, nombre,
-                               descripcion, creado_por)
+          insert into journey (workspace_id, servicio_id, reto_id, proyecto_id, tipo,
+                               nombre, descripcion, creado_por)
           values (${entrada.workspaceId}, ${entrada.servicioId}, ${entrada.retoId},
-                  ${entrada.tipo}, ${entrada.nombre}, ${entrada.descripcion}, ${actorId})
+                  ${entrada.proyectoId}, ${entrada.tipo}, ${entrada.nombre},
+                  ${entrada.descripcion}, ${actorId})
           returning id
         ),
         evento as (
@@ -86,27 +87,30 @@ export async function agregarNodo(
     // commit y no bloquea altas de otro journey ni de otro tipo.
     await tx`select pg_advisory_xact_lock(
       hashtextextended('designio:journey-orden:' || ${entrada.journeyId} || ':' || ${entrada.tipo}, 42))`;
-    // Los tipos que son entidades del workspace se cuelgan del catálogo: si ya existe
-    // uno con ese nombre se REUSA, y así el mismo sistema en el as-is y en el to-be es
-    // el mismo objeto. El upsert va en su propia sentencia porque la del nodo necesita
-    // ver la fila (las sub-consultas de un WITH comparten snapshot y no la verían).
+    // Los tipos que son entidades DEL SERVICIO se cuelgan del catálogo: si ya existe uno
+    // con ese nombre se REUSA, y así el mismo sistema en el as-is y en el to-be del
+    // servicio es el mismo objeto.
+    //
+    // El upsert es `on conflict … do update` y no un «mira si existe, si no inserta»:
+    // el candado de orden es por journey, así que dos curadores que añaden la misma
+    // etiqueta en journeys distintos no se serializan — con el patrón anterior uno de
+    // los dos perdía contra el índice único y recibía «ese elemento ya existe» en vez de
+    // reusar la entrada del otro. El `do update` es un no-op que fuerza el `returning`.
     let catalogoId: string | null = null;
     if (TIPOS_CON_CATALOGO.includes(entrada.tipo)) {
       try {
         const [cat] = await tx`
-          with existente as (
-            select id from catalogo_journey
-            where workspace_id = ${entrada.workspaceId} and tipo = ${entrada.tipo}
-              and nombre = ${entrada.etiqueta}
-          ),
-          nueva as (
-            insert into catalogo_journey (workspace_id, tipo, nombre, creado_por)
-            select ${entrada.workspaceId}, ${entrada.tipo}, ${entrada.etiqueta}, ${actorId}
-            where not exists (select 1 from existente)
-            returning id
-          )
-          select id from existente union all select id from nueva`;
-        if (!cat) throw new ErrorJourney('No puedes crear elementos de catálogo en este workspace');
+          insert into catalogo_journey (workspace_id, servicio_id, tipo, nombre, creado_por)
+          select ${entrada.workspaceId}, j.servicio_id, ${entrada.tipo}, ${entrada.etiqueta},
+                 ${actorId}
+          from journey j
+          where j.id = ${entrada.journeyId} and j.workspace_id = ${entrada.workspaceId}
+          on conflict (workspace_id, servicio_id, tipo, nombre)
+            do update set nombre = excluded.nombre
+          returning id`;
+        if (!cat) {
+          throw new ErrorJourney('El journey no existe o no puedes crear elementos de catálogo');
+        }
         catalogoId = cat.id as string;
       } catch (e) {
         if (e instanceof ErrorJourney) throw e;
@@ -117,14 +121,15 @@ export async function agregarNodo(
     try {
       [fila] = await tx`
         insert into journey_nodo (workspace_id, journey_id, tipo, etiqueta, detalle,
-                                  fase_id, orden, responsable, catalogo_id, creado_por)
+                                  fase_id, orden, responsable, catalogo_id, arquetipo_id,
+                                  creado_por)
         select ${entrada.workspaceId}, ${entrada.journeyId}, ${entrada.tipo},
           ${entrada.etiqueta}, ${entrada.detalle}, ${entrada.faseId},
           coalesce((select max(orden) + 1 from journey_nodo n
             where n.journey_id = ${entrada.journeyId}
               and n.workspace_id = ${entrada.workspaceId}
               and n.tipo = ${entrada.tipo}), 0),
-          ${entrada.responsable}, ${catalogoId}, ${actorId}
+          ${entrada.responsable}, ${catalogoId}, ${entrada.arquetipoId}, ${actorId}
         returning id`;
     } catch (e) {
       comoErrorDeDominio(e);
@@ -140,13 +145,24 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
     let filas;
     try {
       // Renombrar una entidad la renombra EN TODAS PARTES: es lo que se gana al darle
-      // identidad. El catálogo se actualiza en la misma transacción que el nodo.
+      // identidad. Se actualizan el catálogo Y todos los nodos que lo comparten, en la
+      // misma transacción — si solo se tocara el nodo editado, el otro journey seguiría
+      // rindiendo y congelando el nombre viejo, y volver a teclearlo allí crearía una
+      // segunda entrada de catálogo, deshaciendo la identidad que esto viene a dar.
       await tx`
         update catalogo_journey c
         set nombre = ${entrada.etiqueta}
         from journey_nodo n
         where n.id = ${entrada.nodoId} and n.workspace_id = ${entrada.workspaceId}
           and c.id = n.catalogo_id and c.workspace_id = n.workspace_id`;
+      await tx`
+        update journey_nodo otros
+        set etiqueta = ${entrada.etiqueta}
+        from journey_nodo n
+        where n.id = ${entrada.nodoId} and n.workspace_id = ${entrada.workspaceId}
+          and n.catalogo_id is not null
+          and otros.catalogo_id = n.catalogo_id and otros.workspace_id = n.workspace_id
+          and otros.id <> n.id`;
       filas = await tx`
         update journey_nodo
         set etiqueta = ${entrada.etiqueta}, detalle = ${entrada.detalle},
@@ -367,13 +383,13 @@ export async function journeyCompleto(
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     const [fila] = await tx`
-      select j.id, j.servicio_id, s.nombre as servicio_nombre, j.reto_id, j.tipo,
-        j.nombre, j.descripcion,
+      select j.id, j.servicio_id, s.nombre as servicio_nombre, j.reto_id, j.proyecto_id,
+        j.tipo, j.nombre, j.descripcion,
         coalesce((
           select jsonb_agg(jsonb_build_object(
             'id', n.id, 'tipo', n.tipo, 'etiqueta', n.etiqueta, 'detalle', n.detalle,
             'faseId', n.fase_id, 'orden', n.orden, 'responsable', n.responsable,
-            'catalogoId', n.catalogo_id,
+            'catalogoId', n.catalogo_id, 'arquetipoId', n.arquetipo_id,
             'evidencias', coalesce((
               select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo)
                 order by e.titulo)
@@ -410,6 +426,7 @@ export async function journeyCompleto(
       servicioId: fila.servicio_id as string,
       servicioNombre: fila.servicio_nombre as string,
       retoId: (fila.reto_id as string | null) ?? null,
+      proyectoId: (fila.proyecto_id as string | null) ?? null,
       tipo: fila.tipo as JourneyCompleto['tipo'],
       nombre: fila.nombre as string,
       descripcion: fila.descripcion as string,

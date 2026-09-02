@@ -11,6 +11,7 @@ import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { DiagramaMermaid } from '@/components/journey/DiagramaMermaid';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
+import { gobernanzaDelProyecto } from '@/lib/metodo/gobernanza.functions';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
   agregarAristaAlJourney,
@@ -56,9 +57,15 @@ export const Route = createFileRoute('/_autenticada/journey/$journeyId')({
       evidenciasDelWorkspace({ data: { workspaceId } }),
     ]);
     if (!journey) return null;
+    // Un nodo de tipo arquetipo REFERENCIA al arquetipo curado del reto (SPEC-04.11),
+    // no lo copia: el formulario solo puede ofrecer los que existen de verdad.
+    const gobernanza = journey.proyectoId
+      ? await gobernanzaDelProyecto({ data: { workspaceId, proyectoId: journey.proyectoId } })
+      : null;
     return {
       workspaceId,
       journey,
+      arquetipos: (gobernanza?.arquetipos ?? []).map((a) => ({ id: a.id, nombre: a.nombre })),
       evidencias: evidencias?.evidencias ?? [],
       hayMasEvidencias: evidencias?.hayMas ?? false,
     };
@@ -168,6 +175,7 @@ function PantallaJourney() {
               <BloqueModelo
                 workspaceId={datos.workspaceId}
                 journey={journey}
+                arquetipos={datos.arquetipos}
                 evidencias={datos.evidencias}
                 hayMasEvidencias={datos.hayMasEvidencias}
                 editable={editable}
@@ -293,6 +301,7 @@ function Encabezado({
 function BloqueModelo({
   workspaceId,
   journey,
+  arquetipos,
   evidencias,
   hayMasEvidencias,
   editable,
@@ -301,6 +310,7 @@ function BloqueModelo({
 }: {
   workspaceId: string;
   journey: JourneyCompleto;
+  arquetipos: { id: string; nombre: string }[];
   evidencias: { id: string; titulo: string }[];
   hayMasEvidencias: boolean;
   editable: boolean;
@@ -317,6 +327,7 @@ function BloqueModelo({
           workspaceId={workspaceId}
           journeyId={journey.id}
           fases={fases}
+          arquetipos={arquetipos}
           onCambio={onCambio}
           onError={onError}
         />
@@ -381,12 +392,14 @@ function FormularioNodo({
   workspaceId,
   journeyId,
   fases,
+  arquetipos,
   onCambio,
   onError,
 }: {
   workspaceId: string;
   journeyId: string;
   fases: NodoDeJourney[];
+  arquetipos: { id: string; nombre: string }[];
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
 }) {
@@ -395,19 +408,25 @@ function FormularioNodo({
   const [detalle, setDetalle] = useState('');
   const [faseId, setFaseId] = useState('');
   const [responsable, setResponsable] = useState('');
+  const [arquetipoId, setArquetipoId] = useState('');
   const [ocupado, setOcupado] = useState(false);
+  const esArquetipo = tipo === 'arquetipo';
 
   async function enviar(e: FormEvent) {
     e.preventDefault();
     setOcupado(true);
     onError(null);
     try {
+      const elegido = arquetipos.find((a) => a.id === arquetipoId);
       const r = await agregarNodoAlJourney({
         data: {
           workspaceId,
           journeyId,
           tipo,
-          etiqueta,
+          // El nodo de arquetipo toma el NOMBRE del arquetipo curado: la etiqueta no es
+          // suya, es de él, y así el grafo no puede llamarlo de otra manera.
+          etiqueta: esArquetipo ? (elegido?.nombre ?? '') : etiqueta,
+          arquetipoId: esArquetipo ? arquetipoId : null,
           detalle,
           // Una fase no cuelga de otra fase (el CHECK de la base lo impone).
           faseId: tipo === 'fase' || faseId === '' ? null : faseId,
@@ -451,12 +470,34 @@ function FormularioNodo({
             ))}
           </Select>
         </div>
-        <Input
-          placeholder="Etiqueta (lo que se lee en el diagrama)"
-          value={etiqueta}
-          onChange={(e) => setEtiqueta(e.target.value)}
-          required
-        />
+        {esArquetipo ? (
+          <>
+            {/* Un arquetipo del grafo REFERENCIA al arquetipo curado del reto: no se
+                teclea. Si se pudiera escribir a mano, el journey podría mostrar un
+                perfil que el modelo curado refutó. */}
+            <Select value={arquetipoId} onChange={(e) => setArquetipoId(e.target.value)} required>
+              <option value="">Arquetipo del reto…</option>
+              {arquetipos.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.nombre}
+                </option>
+              ))}
+            </Select>
+            {arquetipos.length === 0 && (
+              <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+                Este journey no tiene arquetipos que referenciar: defínelos primero en la
+                pantalla del proyecto (o asocia el journey a un proyecto).
+              </span>
+            )}
+          </>
+        ) : (
+          <Input
+            placeholder="Etiqueta (lo que se lee en el diagrama)"
+            value={etiqueta}
+            onChange={(e) => setEtiqueta(e.target.value)}
+            required
+          />
+        )}
         <Input
           placeholder="Responsable (quién lo ejecuta; obligatorio en acciones y sistemas para la validación)"
           value={responsable}
@@ -469,7 +510,11 @@ function FormularioNodo({
           rows={2}
         />
         <div>
-          <Button size="sm" type="submit" disabled={ocupado || etiqueta.trim() === ''}>
+          <Button
+            size="sm"
+            type="submit"
+            disabled={ocupado || (esArquetipo ? arquetipoId === '' : etiqueta.trim() === '')}
+          >
             Agregar
           </Button>
         </div>

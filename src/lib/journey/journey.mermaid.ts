@@ -287,16 +287,50 @@ export function carrilesDeJourney(journey: JourneyCompleto): CarrilesBlueprint {
   const pasos = porSecuencia(journey, journey.nodos.filter((n) => n.tipo === 'paso'));
   const porId = new Map(journey.nodos.map((n) => [n.id, n]));
 
-  /** Nodos de un tipo relacionados con un paso por cualquier arista, en cualquier
-   * dirección: en el blueprint importa la adyacencia, no quién apuntó a quién. */
+  // Adyacencia no dirigida: en el blueprint importa que dos cosas se toquen, no quién
+  // apuntó a quién (`actor -participa-> acción` y `acción -ocurre-en-> paso` describen la
+  // misma columna aunque las flechas vayan en sentidos distintos).
+  const vecindad = new Map<string, string[]>();
+  function unir(a: string, b: string) {
+    vecindad.set(a, [...(vecindad.get(a) ?? []), b]);
+  }
+  for (const a of journey.aristas) {
+    unir(a.origenId, a.destinoId);
+    unir(a.destinoId, a.origenId);
+  }
+
+  const ACCIONES: TipoNodo[] = ['accion-frontstage', 'accion-backstage'];
+
+  /**
+   * Nodos de un tipo que le corresponden a un paso: los adyacentes al paso Y los
+   * adyacentes a sus acciones.
+   *
+   * El segundo salto no es un adorno: el modelo canónico cuelga los actores de la acción
+   * en la que participan y los sistemas de la acción que soportan, no del paso. Con
+   * adyacencia de un salto, un actor que `participa` en una acción frontstage del paso no
+   * caería en ningún carril y el blueprint mostraría acciones sin nadie que las haga.
+   *
+   * El salto se detiene en las acciones y nunca aterriza en otro paso o fase: sin ese
+   * tope, un `paso → acción → paso` arrastraría la columna vecina entera y los carriles
+   * dejarían de distinguir un paso de otro.
+   */
   function relacionados(pasoId: string, tipos: TipoNodo[]): NodoDeJourney[] {
     const vecinos: NodoDeJourney[] = [];
-    for (const a of journey.aristas) {
-      const otroId = a.origenId === pasoId ? a.destinoId : a.destinoId === pasoId ? a.origenId : null;
-      if (!otroId) continue;
-      const nodo = porId.get(otroId);
+    const agregar = (id: string) => {
+      const nodo = porId.get(id);
       if (nodo && tipos.includes(nodo.tipo) && !vecinos.some((v) => v.id === nodo.id)) {
         vecinos.push(nodo);
+      }
+    };
+    const directos = vecindad.get(pasoId) ?? [];
+    for (const id of directos) agregar(id);
+    for (const id of directos) {
+      const intermedio = porId.get(id);
+      if (!intermedio || !ACCIONES.includes(intermedio.tipo)) continue;
+      for (const lejano of vecindad.get(id) ?? []) {
+        const nodo = porId.get(lejano);
+        if (!nodo || nodo.tipo === 'paso' || nodo.tipo === 'fase') continue;
+        agregar(lejano);
       }
     }
     return vecinos;

@@ -111,15 +111,17 @@ async function sembrarJourney(tx: TransactionSql, wsId: string, luciaId: string)
   const svcId = svc.id as string;
 
   const [r01] = await tx`select id from reto where workspace_id = ${wsId} and codigo = 'R-01'`;
+  const [p01] = await tx`select id from proyecto where workspace_id = ${wsId} and codigo = 'P-01'`;
   const [j] = await tx`insert into journey
-    (workspace_id, servicio_id, reto_id, tipo, nombre, descripcion, creado_por) values
-    (${wsId}, ${svcId}, ${(r01?.id as string) ?? null}, 'as-is', 'Apertura hoy',
+    (workspace_id, servicio_id, reto_id, proyecto_id, tipo, nombre, descripcion, creado_por) values
+    (${wsId}, ${svcId}, ${(r01?.id as string) ?? null}, ${(p01?.id as string) ?? null},
+     'as-is', 'Apertura hoy',
      'Desde que el empleado recibe el enlace del convenio hasta su primer movimiento',
      ${luciaId}) returning id`;
   const jId = j!.id as string;
 
-  /** Los tipos que son entidades del workspace llevan identidad de catálogo. */
-  const CON_CATALOGO = ['touchpoint', 'canal', 'actor', 'arquetipo', 'sistema'];
+  /** Los tipos que son entidades DEL SERVICIO llevan identidad de catálogo. */
+  const CON_CATALOGO = ['touchpoint', 'canal', 'actor', 'sistema'];
 
   /** Alta de un nodo devolviendo su id: el orden se pasa explícito porque aquí el
    * grafo se escribe entero de una vez y su secuencia es parte del ejemplo. */
@@ -132,9 +134,11 @@ async function sembrarJourney(tx: TransactionSql, wsId: string, luciaId: string)
   ): Promise<string> {
     let catalogoId: string | null = null;
     if (CON_CATALOGO.includes(tipo)) {
-      const [c] = await tx`insert into catalogo_journey (workspace_id, tipo, nombre, creado_por)
-        values (${wsId}, ${tipo}, ${etiqueta}, ${luciaId})
-        on conflict (workspace_id, tipo, nombre) do update set nombre = excluded.nombre
+      const [c] = await tx`insert into catalogo_journey
+        (workspace_id, servicio_id, tipo, nombre, creado_por)
+        values (${wsId}, ${svcId}, ${tipo}, ${etiqueta}, ${luciaId})
+        on conflict (workspace_id, servicio_id, tipo, nombre)
+          do update set nombre = excluded.nombre
         returning id`;
       catalogoId = c!.id as string;
     }

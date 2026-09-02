@@ -80,6 +80,8 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     await admin`delete from catalogo_journey where workspace_id = ${ws}`;
     await admin`delete from evidencia where workspace_id = ${ws}`;
     await admin`delete from fuente where workspace_id = ${ws}`;
+    await admin`delete from arquetipo where workspace_id = ${ws}`;
+    await admin`delete from reto where workspace_id = ${ws}`;
     await admin`delete from servicio where workspace_id = ${ws}`;
     await admin`delete from evento_dominio where workspace_id = ${ws}`;
     await admin`delete from miembro where workspace_id = ${ws}`;
@@ -93,6 +95,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       workspaceId: ws,
       servicioId,
       retoId: null,
+      proyectoId: null,
       tipo: 'as-is',
       nombre: 'Alta digital hoy',
       descripcion: 'Desde el interés hasta la primera transacción',
@@ -103,6 +106,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       workspaceId: ws,
       servicioId,
       retoId: null,
+      proyectoId: null,
       tipo: 'to-be',
       nombre: 'Alta digital objetivo',
       descripcion: '',
@@ -114,6 +118,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
         workspaceId: ws,
         servicioId,
         retoId: null,
+        proyectoId: null,
         tipo: 'as-is',
         nombre: 'Intruso',
         descripcion: '',
@@ -132,6 +137,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'fase',
       etiqueta: 'Descubrimiento',
+      arquetipoId: null,
       detalle: '',
       faseId: null,
       responsable: '',
@@ -142,6 +148,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'paso',
       etiqueta: 'Abre la app',
+      arquetipoId: null,
       detalle: '',
       faseId,
       responsable: '',
@@ -152,6 +159,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'paso',
       etiqueta: 'Sube el documento',
+      arquetipoId: null,
       detalle: '',
       faseId,
       responsable: '',
@@ -171,6 +179,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId: otroJourneyId,
       tipo: 'paso',
       etiqueta: 'Paso del otro journey',
+      arquetipoId: null,
       detalle: '',
       faseId: null,
       responsable: '',
@@ -194,6 +203,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
         journeyId: otroJourneyId,
         tipo: 'paso',
         etiqueta: 'Colgado de una fase ajena',
+        arquetipoId: null,
         detalle: '',
         faseId,
         responsable: '',
@@ -207,6 +217,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'paso',
       etiqueta: 'Paso efímero',
+      arquetipoId: null,
       detalle: '',
       faseId,
       responsable: '',
@@ -233,6 +244,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'sistema',
       etiqueta: 'Core bancario',
+      arquetipoId: null,
       detalle: '',
       faseId: null,
       responsable: 'Tecnología',
@@ -293,6 +305,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'touchpoint',
       etiqueta: 'SMS de confirmación',
+      arquetipoId: null,
       detalle: '',
       faseId: null,
       responsable: '',
@@ -353,6 +366,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'paso',
       etiqueta: 'Paso del ciclo siguiente',
+      arquetipoId: null,
       detalle: '',
       faseId,
       responsable: '',
@@ -384,6 +398,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'sistema',
       etiqueta: 'Core bancario',
+      arquetipoId: null,
       detalle: '',
       faseId: null,
       responsable: 'Tecnología',
@@ -393,6 +408,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId: otroJourneyId,
       tipo: 'sistema',
       etiqueta: 'Core bancario',
+      arquetipoId: null,
       detalle: '',
       faseId: null,
       responsable: 'Tecnología',
@@ -423,12 +439,147 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     expect(j1!.nodos.find((n) => n.tipo === 'paso')!.catalogoId).toBeNull();
   });
 
+  it('la identidad de catálogo llega hasta el servicio: otro servicio, otra entidad', async () => {
+    // El «Core bancario» de Apertura de cuenta y el de Reclamaciones se llaman igual y no
+    // son lo mismo. Compartir identidad entre servicios haría que renombrar en uno
+    // renombrara en el otro, y que «qué pasos dependen del Core» devolviera pasos de un
+    // servicio que nadie preguntó.
+    const admin = sqlAdmin();
+    const [otroServicio] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Reclamaciones', ${leadId}) returning id`;
+    const ajeno = await crearJourney(leadId, {
+      workspaceId: ws,
+      servicioId: otroServicio!.id as string,
+      retoId: null,
+      proyectoId: null,
+      tipo: 'as-is',
+      nombre: 'Reclamar hoy',
+      descripcion: '',
+    });
+    const nodo = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId: ajeno.journeyId,
+      tipo: 'sistema',
+      etiqueta: 'Core bancario (T24)',
+      arquetipoId: null,
+      detalle: '',
+      faseId: null,
+      responsable: 'Tecnología',
+    });
+    const suyo = await journeyCompleto(leadId, ws, ajeno.journeyId);
+    const catAjeno = suyo!.nodos.find((n) => n.id === nodo.nodoId)!.catalogoId;
+    expect(catAjeno).toBeTruthy();
+
+    const original = await journeyCompleto(leadId, ws, journeyId);
+    const catPropio = original!.nodos.find((n) => n.tipo === 'sistema')!.catalogoId;
+    expect(catAjeno).not.toBe(catPropio);
+
+    // Repuntar el nodo al catálogo del otro servicio no es que esté prohibido por una
+    // política: el rol de la app NO TIENE el grant sobre `catalogo_id`. La identidad la
+    // resuelve el servicio al crear el nodo y nadie más la toca, ni con SQL crudo.
+    await expect(
+      conUsuario(leadId, (tx) => tx`
+        update journey_nodo set catalogo_id = ${catPropio} where id = ${nodo.nodoId}`),
+    ).rejects.toThrow(/permission denied/);
+
+    // Y el tipo va DENTRO de la clave foránea, así que tampoco cuadra por debajo del rol
+    // de la app: un nodo 'sistema' no puede colgar de una entrada de catálogo 'actor'.
+    const actor = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId: ajeno.journeyId,
+      tipo: 'actor',
+      etiqueta: 'Gestor de reclamaciones',
+      arquetipoId: null,
+      detalle: '',
+      faseId: null,
+      responsable: '',
+    });
+    const conActor = await journeyCompleto(leadId, ws, ajeno.journeyId);
+    const catActor = conActor!.nodos.find((n) => n.id === actor.nodoId)!.catalogoId;
+    await expect(
+      admin`update journey_nodo set catalogo_id = ${catActor} where id = ${nodo.nodoId}`,
+    ).rejects.toThrow(/foreign key|violates/i);
+  });
+
+  it('el nodo arquetipo apunta al arquetipo curado del reto, no a una copia', async () => {
+    // RF-05: el arquetipo del journey es EL arquetipo (SPEC-04.11). Si fuera una entrada
+    // de catálogo más, un arquetipo refutado seguiría vivo en el diagrama como si nada.
+    const admin = sqlAdmin();
+    const [reto] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
+      values (${ws}, ${servicioId}, ${`${marca}-R1`}, 'Abandono en el alta', ${leadId})
+      returning id`;
+    const [otroReto] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
+      values (${ws}, ${servicioId}, ${`${marca}-R2`}, 'Otro reto', ${leadId})
+      returning id`;
+    const [arq] = await admin`insert into arquetipo (workspace_id, reto_id, nombre, creado_por)
+      values (${ws}, ${reto!.id as string}, 'Migrante bancarizado', ${leadId}) returning id`;
+    const [arqAjeno] = await admin`insert into arquetipo (workspace_id, reto_id, nombre, creado_por)
+      values (${ws}, ${otroReto!.id as string}, 'De otro reto', ${leadId}) returning id`;
+
+    const anclado = await crearJourney(leadId, {
+      workspaceId: ws,
+      servicioId,
+      retoId: reto!.id as string,
+      proyectoId: null,
+      tipo: 'as-is',
+      nombre: 'Alta con arquetipo',
+      descripcion: '',
+    });
+
+    const nodo = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId: anclado.journeyId,
+      tipo: 'arquetipo',
+      etiqueta: 'Migrante bancarizado',
+      arquetipoId: arq!.id as string,
+      detalle: '',
+      faseId: null,
+      responsable: '',
+    });
+    const completo = await journeyCompleto(leadId, ws, anclado.journeyId);
+    const puesto = completo!.nodos.find((n) => n.id === nodo.nodoId)!;
+    expect(puesto.arquetipoId).toBe(arq!.id as string);
+    // Y no duplica identidad en el catálogo: el arquetipo ya tiene la suya.
+    expect(puesto.catalogoId).toBeNull();
+
+    // Un arquetipo de OTRO reto no entra, aunque sea del mismo workspace.
+    await expect(
+      agregarNodo(leadId, {
+        workspaceId: ws,
+        journeyId: anclado.journeyId,
+        tipo: 'arquetipo',
+        etiqueta: 'De otro reto',
+        arquetipoId: arqAjeno!.id as string,
+        detalle: '',
+        faseId: null,
+        responsable: '',
+      }),
+    ).rejects.toThrow(/otro reto/);
+
+    // Y en un journey sin reto no hay arquetipo al que anclarse.
+    await expect(
+      agregarNodo(leadId, {
+        workspaceId: ws,
+        journeyId,
+        tipo: 'arquetipo',
+        etiqueta: 'Migrante bancarizado',
+        arquetipoId: arq!.id as string,
+        detalle: '',
+        faseId: null,
+        responsable: '',
+      }),
+    ).rejects.toThrow(/otro reto|anclarlo/);
+  });
+
   it('el tipo y la condición de una relación se corrigen sin borrarla', async () => {
     const sistema = await agregarNodo(leadId, {
       workspaceId: ws,
       journeyId,
       tipo: 'sistema',
       etiqueta: 'Motor de reglas',
+      arquetipoId: null,
       detalle: '',
       faseId: null,
       responsable: 'Riesgo',
@@ -476,6 +627,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       journeyId,
       tipo: 'paso',
       etiqueta: 'Paso con evidencia mal enlazada',
+      arquetipoId: null,
       detalle: '',
       faseId,
       responsable: '',

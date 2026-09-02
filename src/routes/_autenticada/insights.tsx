@@ -78,6 +78,20 @@ function PantallaInsights() {
   const [cursor, setCursor] = useState<{ creadoEn: string; id: string } | null>(
     datos?.siguiente ?? null,
   );
+  // Cursor con el que se montó la paginación actual. Proponer un insight invalida la ruta
+  // y el loader devuelve otra primera página: el insight que estaba al final se desplaza a
+  // la segunda, y el cursor guardado —que apunta más allá de él— lo saltaría para siempre.
+  // Reiniciar la acumulación cuando cambia el borde de la primera página también devuelve
+  // el botón a la vida cuando un `null` terminal deja de serlo.
+  const [borde, setBorde] = useState(datos?.siguiente ?? null);
+  const bordeActual = datos?.siguiente ?? null;
+  if (borde?.id !== bordeActual?.id || borde?.creadoEn !== bordeActual?.creadoEn) {
+    // Ajuste durante el render, no en un efecto: así no se llega a pintar una lista con
+    // insights repetidos o ausentes.
+    setBorde(bordeActual);
+    setMasPaginas([]);
+    setCursor(bordeActual);
+  }
   const [cargando, setCargando] = useState(false);
   const listados = [...(datos?.insights ?? []), ...masPaginas];
 

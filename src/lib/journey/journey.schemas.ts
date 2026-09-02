@@ -90,6 +90,7 @@ export const CrearJourneySchema = z.object({
   workspaceId: z.string().uuid(),
   servicioId: z.string().uuid(),
   retoId: z.string().uuid().nullable().default(null),
+  proyectoId: z.string().uuid().nullable().default(null),
   tipo: z.enum(TIPOS_JOURNEY),
   nombre: z.string().trim().min(1, 'El nombre es obligatorio').max(200),
   descripcion: z.string().trim().max(2000).default(''),
@@ -101,6 +102,9 @@ export const AgregarNodoSchema = z.object({
   journeyId: z.string().uuid(),
   tipo: z.enum(TIPOS_NODO),
   etiqueta: z.string().trim().min(1, 'La etiqueta es obligatoria').max(200),
+  /** Obligatorio y solo para tipo 'arquetipo': el nodo referencia al arquetipo curado
+   * del reto, nunca una copia con su propio nombre. */
+  arquetipoId: z.string().uuid().nullable().default(null),
   detalle: z.string().trim().max(2000).default(''),
   faseId: z.string().uuid().nullable().default(null),
   responsable: z.string().trim().max(200).default(''),
@@ -167,16 +171,12 @@ export const JourneysInputSchema = z.object({ workspaceId: z.string().uuid() });
 
 // ── Proyecciones de lectura ──
 
-/** Los tipos que SON entidades del workspace y por tanto llevan identidad de catálogo:
- * el mismo sistema aparece en el as-is y en el to-be, y renombrarlo debe renombrarlo en
- * los dos. Un paso o una fricción viven dentro de su journey y no se comparten. */
-export const TIPOS_CON_CATALOGO: TipoNodo[] = [
-  'touchpoint',
-  'canal',
-  'actor',
-  'arquetipo',
-  'sistema',
-];
+/** Los tipos que son entidades DEL SERVICIO y por tanto llevan identidad de catálogo:
+ * el mismo sistema aparece en el as-is y en el to-be del servicio, y renombrarlo debe
+ * renombrarlo en los dos. Un paso o una fricción viven dentro de su journey y no se
+ * comparten. El arquetipo va aparte: ya es un objeto curado del reto (SPEC-04.11) y el
+ * nodo apunta a ÉL, no a una copia. */
+export const TIPOS_CON_CATALOGO: TipoNodo[] = ['touchpoint', 'canal', 'actor', 'sistema'];
 
 export type NodoDeJourney = {
   id: string;
@@ -185,6 +185,8 @@ export type NodoDeJourney = {
   /** Id de catálogo cuando el tipo lo lleva: es lo que permite preguntar «qué pasos de
    * qué journeys dependen de este sistema» sin comparar cadenas. */
   catalogoId: string | null;
+  /** Solo en los nodos de tipo arquetipo: el id del arquetipo CURADO del reto. */
+  arquetipoId: string | null;
   detalle: string;
   faseId: string | null;
   orden: number;
@@ -205,6 +207,7 @@ export type JourneyCompleto = {
   servicioId: string;
   servicioNombre: string;
   retoId: string | null;
+  proyectoId: string | null;
   tipo: TipoJourney;
   nombre: string;
   descripcion: string;

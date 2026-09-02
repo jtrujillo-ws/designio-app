@@ -81,6 +81,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     await admin`delete from evidencia where workspace_id = ${ws}`;
     await admin`delete from fuente where workspace_id = ${ws}`;
     await admin`delete from arquetipo where workspace_id = ${ws}`;
+    await admin`delete from proyecto where workspace_id = ${ws}`;
     await admin`delete from reto where workspace_id = ${ws}`;
     await admin`delete from servicio where workspace_id = ${ws}`;
     await admin`delete from evento_dominio where workspace_id = ${ws}`;
@@ -437,6 +438,61 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
 
     // Un paso NO lleva catálogo: existe dentro de su journey y no se comparte.
     expect(j1!.nodos.find((n) => n.tipo === 'paso')!.catalogoId).toBeNull();
+  });
+
+  it('el proyecto del journey tiene que ser del reto del journey', async () => {
+    // Las FKs compuestas garantizan el workspace y nada más. Un journey anclado al reto R
+    // y al proyecto de S diría una cosa por cada lado, y la conciliación de la design
+    // version (SPEC-06) elegiría mal.
+    const admin = sqlAdmin();
+    const [r1] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
+      values (${ws}, ${servicioId}, ${`${marca}-RA`}, 'Reto A', ${leadId}) returning id`;
+    const [r2] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
+      values (${ws}, ${servicioId}, ${`${marca}-RB`}, 'Reto B', ${leadId}) returning id`;
+    const [p2] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${r2!.id as string}, ${`${marca}-PB`}, 'Proyecto de B', ${leadId}) returning id`;
+
+    await expect(
+      crearJourney(leadId, {
+        workspaceId: ws,
+        servicioId,
+        retoId: r1!.id as string,
+        proyectoId: p2!.id as string,
+        tipo: 'to-be',
+        nombre: 'Cruzado',
+        descripcion: '',
+      }),
+    ).rejects.toThrow(/otro reto/);
+
+    // Y un proyecto sin reto deja el anclaje a medias: el reto se deriva del proyecto,
+    // así que omitirlo sería guardar dos verdades incompletas.
+    await expect(
+      crearJourney(leadId, {
+        workspaceId: ws,
+        servicioId,
+        retoId: null,
+        proyectoId: p2!.id as string,
+        tipo: 'to-be',
+        nombre: 'Huérfano',
+        descripcion: '',
+      }),
+    ).rejects.toThrow(/anclado también a su reto/);
+
+    // El par coherente sí entra.
+    const ok = await crearJourney(leadId, {
+      workspaceId: ws,
+      servicioId,
+      retoId: r2!.id as string,
+      proyectoId: p2!.id as string,
+      tipo: 'to-be',
+      nombre: 'Alta objetivo de B',
+      descripcion: '',
+    });
+    const leido = await journeyCompleto(leadId, ws, ok.journeyId);
+    expect(leido!.proyectoId).toBe(p2!.id as string);
   });
 
   it('la identidad de catálogo llega hasta el servicio: otro servicio, otra entidad', async () => {

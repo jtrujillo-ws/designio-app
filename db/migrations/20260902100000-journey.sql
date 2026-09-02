@@ -295,6 +295,32 @@ create trigger journey_arista_mismo_journey
   for each row execute function journey_arista_mismo_journey_guard();
 revoke execute on function journey_arista_mismo_journey_guard() from public;
 
+-- ── El anclaje del journey tiene que ser coherente hacia arriba ──
+-- Las FKs compuestas garantizan que el reto y el proyecto son del workspace, pero no que
+-- el proyecto sea DEL reto: un journey anclado al reto R y al proyecto de S diría una cosa
+-- por cada lado, y la conciliación de la design version (SPEC-06) elegiría mal.
+create function journey_anclaje_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if new.proyecto_id is not null and new.reto_id is null then
+    raise exception 'un journey con proyecto tiene que estar anclado también a su reto';
+  end if;
+  if new.proyecto_id is not null and not exists (
+    select 1 from proyecto p
+    where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+      and p.reto_id = new.reto_id) then
+    raise exception 'el proyecto pertenece a otro reto';
+  end if;
+  return new;
+end $$;
+create trigger journey_anclaje
+  before insert or update on journey
+  for each row execute function journey_anclaje_guard();
+revoke execute on function journey_anclaje_guard() from public;
+
 -- Lo mismo para la fase de un nodo: agrupar bajo una fase de OTRO journey rompería
 -- todas las vistas sin que ninguna FK se queje.
 create function journey_nodo_fase_guard() returns trigger

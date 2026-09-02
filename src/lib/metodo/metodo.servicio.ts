@@ -302,7 +302,9 @@ export async function aprobarGate(
     await bloquearReto(tx, pertenece.reto_id as string);
     await bloquearGate(tx, entrada.gateId);
 
-    const aprobado = await tx`
+    let aprobado;
+    try {
+      aprobado = await tx`
       update gate_instancia g
       set estado = 'aprobado', aprobado_por = ${actorId}, aprobado_en = now()
       where g.id = ${entrada.gateId} and g.workspace_id = ${entrada.workspaceId}
@@ -327,14 +329,35 @@ export async function aprobarGate(
                  or btrim(c.kpi) = '' or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
                  or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
                      and btrim(c.linea_base_plan) = ''))))
+        -- G6 no se aprueba sin el Metric Registry FIRMADO (SYS-22). El guard de la base ya
+        -- lo exige y es el suelo; aquí la condición vuelve a escribirse por una razón de
+        -- CONTRATO: si el update sale de la base con un raise del guard, la excepción cruza
+        -- el servicio y la pantalla enseña su mensaje genérico de reintento. Con la
+        -- condición en el WHERE, el update no encuentra fila y el rechazo entra por el
+        -- mismo sitio que todos los demás — el diagnóstico, que dice cómo salir.
+        and (g.numero <> 6 or exists (select 1
+          from metric_registry r
+          join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+          where r.reto_id = p.reto_id and r.workspace_id = g.workspace_id
+            and r.estado = 'firmado'))
       returning g.numero`;
+    } catch (e) {
+      // El guard de suficiencia habla ANTES que el WITH CHECK y lo hace con `raise`
+      // (P0001). Sin traducirlo, la server function lo relanza y la pantalla enseña su
+      // mensaje genérico de reintento en vez del motivo — y el motivo es lo único que
+      // dice qué hacer. Vale para las condiciones que la consulta de arriba espeja y
+      // también para las que no: el traductor cubre la que se añada mañana.
+      const err = e as { code?: string; message?: string };
+      if (err.code === 'P0001' && err.message) throw new ErrorMetodo(err.message);
+      throw e;
+    }
 
-    if (aprobado.length === 0) {
+    if (aprobado!.length === 0) {
       throw new ErrorMetodo(await diagnosticoDeGate(tx, entrada.workspaceId, entrada.gateId));
     }
     // La etapa completada (RF-04.4) y el evento GateAprobado los aplica el guard de la
     // transición DENTRO del propio UPDATE — inseparables también para SQL directo.
-    return { numero: aprobado[0]!.numero as number };
+    return { numero: aprobado![0]!.numero as number };
   });
 }
 
@@ -418,6 +441,21 @@ async function diagnosticoDeGate(
       join proyecto p on p.id = ${gate.proyecto_id as string} and p.workspace_id = ${workspaceId}
       where c.reto_id = p.reto_id and c.workspace_id = ${workspaceId} limit 1`;
     if (!alguno) return 'G0 exige al menos un criterio de éxito definido (SYS-22)';
+  }
+
+  // G6 es donde el contrato de medición se acuerda y se FIRMA (SYS-22). El diagnóstico
+  // tiene que decir CÓMO salir —quién firma y dónde—, no solo que no se puede: el sponsor
+  // que pulsa «Aprobar G6» con el checklist entero en verde no tiene forma de adivinar que
+  // lo que falta está en otra sección de la misma pantalla.
+  if ((gate.numero as number) === 6) {
+    const [firmado] = await tx`
+      select 1 as hay from metric_registry r
+      join proyecto p on p.id = ${gate.proyecto_id as string} and p.workspace_id = ${workspaceId}
+      where r.reto_id = p.reto_id and r.workspace_id = ${workspaceId} and r.estado = 'firmado'
+      limit 1`;
+    if (!firmado) {
+      return 'G6 exige el Metric Registry firmado (SYS-22): fírmalo en el seguimiento de impacto antes de aprobar el gate';
+    }
   }
 
   return `Solo el rol ${gate.rol_aprobador as string} puede aprobar este gate`;

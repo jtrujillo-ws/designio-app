@@ -1061,6 +1061,65 @@ function EditorResultados({
   onError: (e: string | null) => void;
 }) {
   const [criterioId, setCriterioId] = useState(seguimiento.entradas[0]?.criterioId ?? '');
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        border: '1px solid var(--border-strong)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <span style={micro}>Registrar el resultado de un criterio</span>
+      <Select value={criterioId} onChange={(e) => setCriterioId(e.target.value)}>
+        {seguimiento.entradas.map((e) => (
+          <option key={e.criterioId} value={e.criterioId}>
+            {e.criterioKpi}
+          </option>
+        ))}
+      </Select>
+      {/* El `key` es el arreglo, y es estructural a propósito: TODO el borrador pertenece
+          al criterio elegido, así que cambiar de criterio REMONTA el bloque y el estado no
+          puede sobrevivir a la identidad de la que era. Limpiar campo por campo en el
+          `onChange` funcionaba hasta que alguien añadiera el siguiente y se olvidara: la
+          versión anterior limpiaba `snapshotId` y dejaba vivos `motivo` y `lectura`, con
+          lo que el motivo viejo mantenía habilitado el botón y un clic grababa la
+          explicación del criterio A como RESULTADO AUDITADO del criterio B — la fila que
+          el post mortem existe para poder leer después. Una promesa que hay que acordarse
+          de mantener no es una promesa; esta no hay que mantenerla. */}
+      <CamposDelResultado
+        key={criterioId}
+        workspaceId={workspaceId}
+        seguimiento={seguimiento}
+        reviewId={reviewId}
+        criterioId={criterioId}
+        onCambio={onCambio}
+        onError={onError}
+      />
+    </div>
+  );
+}
+
+/** Los campos que pertenecen a UN criterio. Se remonta con él (ver el `key` de arriba),
+ * así que nada de lo que hay aquí sobrevive a un cambio de criterio. */
+function CamposDelResultado({
+  workspaceId,
+  seguimiento,
+  reviewId,
+  criterioId,
+  onCambio,
+  onError,
+}: {
+  workspaceId: string;
+  seguimiento: SeguimientoDeImpacto;
+  reviewId: string;
+  criterioId: string;
+  onCambio: () => Promise<void>;
+  onError: (e: string | null) => void;
+}) {
   const [snapshotId, setSnapshotId] = useState('');
   const [lectura, setLectura] = useState('');
   const [motivo, setMotivo] = useState('');
@@ -1098,30 +1157,7 @@ function EditorResultados({
   }
 
   return (
-    <div
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
-        padding: 12,
-        border: '1px solid var(--border-strong)',
-        borderRadius: 'var(--r-sm)',
-      }}
-    >
-      <span style={micro}>Registrar el resultado de un criterio</span>
-      <Select
-        value={criterioId}
-        onChange={(e) => {
-          setCriterioId(e.target.value);
-          setSnapshotId('');
-        }}
-      >
-        {seguimiento.entradas.map((e) => (
-          <option key={e.criterioId} value={e.criterioId}>
-            {e.criterioKpi}
-          </option>
-        ))}
-      </Select>
+    <>
       {/* Elegir un snapshot BORRA el motivo escrito antes: si no, el campo se ocultaba
           pero seguía viajando, y el resultado llegaba con valor final y con la explicación
           de que no hay dato. Ahora eso lo rechazan el schema y el CHECK de la tabla, así
@@ -1163,6 +1199,6 @@ function EditorResultados({
           Guardar resultado
         </Button>
       </div>
-    </div>
+    </>
   );
 }

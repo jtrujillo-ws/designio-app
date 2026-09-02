@@ -7,6 +7,7 @@ import {
   agregarCriterio,
   aprobarGate,
   crearReto,
+  ErrorMetodo,
   marcarItem,
   proyectoMetodo,
 } from '@/lib/metodo/metodo.servicio';
@@ -54,6 +55,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
   let registryId = '';
   let criterioAbandonoId = '';
   let criterioReintentosId = '';
+  let objetivoReintentosPrevio = '';
   let criterioAjenoId = '';
   let entradaAbandonoId = '';
   let entradaReintentosId = '';
@@ -218,6 +220,12 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       fechaPostMortem: null,
     });
     criterioReintentosId = c2.criterioId;
+    // Con el G0 todavía pendiente y sin registry, el criterio se corrige. Esta corrección
+    // la comprueba después el recorrido del rastro: `objetivo` es la promesa contra la que
+    // se dicta el veredicto y el evento la perdía, igual que perdía `ventana_dias`.
+    objetivoReintentosPrevio = '1.5';
+    await conUsuario(leadId, (tx) => tx`update criterio_exito set objetivo = '1.2'
+      where id = ${criterioReintentosId} and workspace_id = ${ws}`);
     await aprobarGateNumero(0);
   });
 
@@ -667,8 +675,15 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evidenciaId },
       });
     }
+    // El rechazo del SERVICIO tiene que ser del contrato del módulo y decir CÓMO salir. Si
+    // sale de la base como `raise` (P0001) sin traducir, la server function lo relanza y la
+    // pantalla enseña su mensaje genérico de reintento: el sponsor ve el checklist entero
+    // en verde y no tiene forma de adivinar que lo que falta está en otra sección.
     await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g6.id })).rejects.toThrow(
-      /Metric Registry no está firmado/,
+      ErrorMetodo,
+    );
+    await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g6.id })).rejects.toThrow(
+      /fírmalo en el seguimiento de impacto/,
     );
     // Y la regla es del GUARD, no del servicio: por SQL directo el rechazo es el mismo.
     // Esta comprobación es deliberadamente redundante con la de arriba porque
@@ -689,7 +704,15 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       where workspace_id = ${ws} and tipo = 'MetricRegistryFirmado' order by creado_en desc limit 1`;
     expect(evento!.actor_id).toBe(sponsorId);
     expect(evento!.actor_rol).toBe('sponsor');
-    expect((evento!.payload as { entradas: number }).entradas).toBe(2);
+    const cuerpoFirma = evento!.payload as Record<string, unknown>;
+    expect(cuerpoFirma.entradas).toBe(2);
+    // Toda columna con grant entra en el payload: `estado` y `firmado_por` lo tienen, y el
+    // sello lo pone el guard. Que la política ate `firmado_por` a `app_user_id()` los hace
+    // deducibles del `actor_id` SOLO mientras la política se evalúe; el rastro dice lo que
+    // quedó en la fila, no lo que otra capa promete que dice.
+    expect(cuerpoFirma.estado).toBe('firmado');
+    expect(cuerpoFirma.firmadoPor).toBe(sponsorId);
+    expect(cuerpoFirma.firmadoEn).not.toBeNull();
 
     // Firmado = congelado: ni el curador agrega ni edita entradas (es el contrato que
     // el cliente firmó, no un documento vivo).
@@ -753,6 +776,17 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const [tras] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
       where id = ${proyectoId}`);
     expect(tras!.estado).toBe('en-implementacion');
+    // `aprobado_en` está en el grant y el WITH CHECK solo le exige no ser nulo: la fecha de
+    // aprobación la propone la aplicación y nada la ata al instante real, así que es
+    // exactamente la clase de dato que el rastro tiene que conservar tal cual quedó.
+    const [gateEvt] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'GateAprobado' order by creado_en desc limit 1`;
+    const cuerpoGate = gateEvt!.payload as Record<string, unknown>;
+    expect(cuerpoGate.numero).toBe(6);
+    expect(cuerpoGate.estado).toBe('aprobado');
+    expect(cuerpoGate.aprobadoPor).not.toBeNull();
+    expect(cuerpoGate.aprobadoEn).not.toBeNull();
+
     const [transicion] = await admin`select payload from evento_dominio
       where workspace_id = ${ws} and tipo = 'ProyectoTransicionado'
       order by creado_en desc limit 1`;
@@ -857,6 +891,35 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
         where id = ${proyectoId}`),
     ).rejects.toThrow(/pasa a medición con su reto/);
+
+    // Y el RETO tampoco se mueve solo, que es la mitad simétrica y la que faltaba. Con el
+    // G7 aprobado este update pasaba el guard de transición —que solo mira registry y
+    // gate— y dejaba el reto midiendo con el proyecto todavía en implementación; desde ese
+    // instante `snapshot_insert` («registry firmado + reto en medición») acepta datos. El
+    // par lo sostenía únicamente `abrirMedicion`, y una promesa que solo cumple el
+    // servicio dura hasta el próximo camino que escriba la tabla. Lo rechaza un constraint
+    // trigger DIFERIDO: tiene que correr al COMMIT porque los dos movimientos legítimos
+    // son dos sentencias y el reto va primero por obligación —el guard del proyecto exige
+    // que su reto ya mida—, así que una comprobación inmediata rechazaría al propio
+    // `abrirMedicion` en su primera sentencia.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update reto set estado = 'en-medicion'
+        where id = ${retoId}`),
+    ).rejects.toThrow(/mueve los dos a la vez/);
+
+    // La otra mitad del invariante: un reto midiendo sin NINGÚN proyecto que mida es la
+    // misma mentira por el otro lado. Con el proyecto pausado, ningún proyecto queda en
+    // 'activo' ni en 'en-implementacion' —la primera comprobación pasa— y es la segunda la
+    // que habla. `abrirMedicion` ya lo rechazaba contando los movidos; ahora también el
+    // SQL directo.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
+      where id = ${proyectoId}`);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update reto set estado = 'en-medicion'
+        where id = ${retoId}`),
+    ).rejects.toThrow(/sin ningún proyecto en medición/);
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+      where id = ${proyectoId}`);
 
     // El stakeholder no mueve el método.
     await expect(abrirMedicion(stakeId, { workspaceId: ws, retoId })).rejects.toThrow(
@@ -1355,6 +1418,43 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
           && antes.fechaPostMortem !== p.fechaPostMortem;
       }),
     ).toBe(true);
+    // Toda columna con `grant update` entra en el payload, y no una selección de las que
+    // parecen importantes: `definicion`, `fuente`, `dimensiones` y `dashboard_url` son
+    // texto libre que la edición PISA, así que corregir SOLO una de ellas emitía un evento
+    // con el antes y el después idénticos — el rastro decía que alguien tocó el contrato y
+    // era incapaz de decir qué, y el texto anterior ya no estaba en la fila ni en ninguna
+    // otra parte. Se prueba con la columna sola, que es el caso que se perdía.
+    const [defPrevia] = await admin`select definicion from entrada_kpi
+      where id = ${entradaAbandonoId}`;
+    const definicionNueva = 'Redefinido a mano: % que abandona tras el segundo intento';
+    await admin`update entrada_kpi set definicion = ${definicionNueva}
+      where id = ${entradaAbandonoId}`;
+    const soloDefinicion = (await de('EntradaKpiEditada')).at(-1)!;
+    const cuerpoDefinicion = soloDefinicion.payload as Record<string, unknown>;
+    expect(cuerpoDefinicion.definicion).toBe(definicionNueva);
+    expect((cuerpoDefinicion.antes as Record<string, unknown>).definicion).toBe(
+      defPrevia!.definicion,
+    );
+    // Y las cuatro claves existen en los dos lados aunque no se hayan movido: comparar dos
+    // eventos consecutivos es lo que dice qué cambió, y para eso los dos tienen que hablar
+    // del mismo conjunto de campos.
+    for (const clave of ['definicion', 'fuente', 'dimensiones', 'dashboardUrl']) {
+      expect(clave in cuerpoDefinicion).toBe(true);
+      expect(clave in (cuerpoDefinicion.antes as Record<string, unknown>)).toBe(true);
+    }
+
+    // El criterio tiene el mismo eje y era el más grave: el evento llevaba SOLO el `kpi` de
+    // sus ocho columnas editables y ningún `antes`. `objetivo` es la promesa contra la que
+    // se dicta el veredicto y `ventana_dias` es la ventana que decide qué snapshots entran
+    // —el registry no la copia a propósito, así que la ÚNICA copia es esa fila—: moverlas
+    // era indistinguible de renombrar el KPI. La corrección la hizo el fixture, con el G0
+    // todavía pendiente, que es cuando el criterio se puede corregir.
+    const criterios = await cuerpos('CriterioEditado');
+    const editado = criterios.find((c) => c.criterioId === criterioReintentosId)!;
+    expect(editado.objetivo).toBe('1.2');
+    expect((editado.antes as Record<string, unknown>).objetivo).toBe(objetivoReintentosPrevio);
+    expect(editado.ventanaDias).toBe(60);
+
     // Y las correcciones a mano del fixture —rol admin, sin sesión de aplicación— también
     // dejaron el suyo. Ese es el punto entero de que el rastro sea de la base: no depende
     // de que se entre por el servicio, y un `update` directo tampoco es invisible.
@@ -1550,7 +1650,16 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       'Campaña de nómina del cliente en el mismo trimestre',
     );
     expect(cuerpoCierre.disenoExperimentalSuficiente).toBe(false);
-    expect((cuerpoCierre.antes as Record<string, unknown>).veredicto).toBeNull();
+    const antesCierre = cuerpoCierre.antes as Record<string, unknown>;
+    expect(antesCierre.veredicto).toBeNull();
+    // Las tres columnas del grant que faltaban en la narrativa: el estado —que la
+    // transición mueve— y la FIRMA del post mortem. El WITH CHECK solo ata
+    // `completado_por`/`completado_en` en la rama de la completación, así que en un
+    // borrador se pueden escribir sueltas y sin ellas aquí no dejarían rastro.
+    expect(antesCierre.estado).toBe('borrador');
+    expect(cuerpoCierre.estado).toBe('completado');
+    expect(cuerpoCierre.completadoPor).toBe(leadId);
+    expect(cuerpoCierre.completadoEn).not.toBeNull();
     // Un solo evento por escritura: la transición NO emite además el de la edición en
     // sitio, aunque toque las mismas columnas y el trigger de auditoría corra en los dos.
     expect(edicionesTrasCierre.length).toBe(edicionesAntesDelCierre.length);
@@ -1838,13 +1947,17 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       ventanaDias: 30,
       fechaPostMortem: null,
     });
-    // El guard de transición del reto es `before update`, así que se apaga para escribir el
-    // pasado que la base ya no permite: pasar a medición sin registry firmado.
+    // Se apagan los DOS triggers de la transición para escribir el pasado que la base ya
+    // no permite: pasar a medición sin registry firmado (guard de transición) y dejando el
+    // proyecto atrás (par indivisible, que es justo el estado que estas filas tienen y por
+    // el que hay que repararlas).
     await admin`alter table reto disable trigger reto_estado_transicion`;
+    await admin`alter table reto disable trigger reto_medicion_par_indivisible`;
     try {
       await admin`update reto set estado = 'en-medicion' where id = ${viejo.retoId}`;
     } finally {
       await admin`alter table reto enable trigger reto_estado_transicion`;
+      await admin`alter table reto enable trigger reto_medicion_par_indivisible`;
     }
 
     // Control: SIN la marca de la migración, el reto sigue encerrado — un reto que llegue

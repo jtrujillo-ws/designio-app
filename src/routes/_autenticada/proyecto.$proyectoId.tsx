@@ -230,6 +230,7 @@ function PantallaProyecto() {
                   hayMasInsights={datos.hayMasInsights}
                   rol={rol}
                   criteriosListosG0={criteriosCompletos(datos.proyecto.reto.criterios)}
+                  registryFirmadoG6={datos.seguimiento?.registry?.estado === 'firmado'}
                   anterioresAprobados={datos.proyecto.gates
                     .filter((g2) => g2.numero < etapa.numero)
                     .every((g2) => g2.estado === 'aprobado')}
@@ -347,6 +348,7 @@ function EtapaConGate({
   hayMasInsights,
   rol,
   criteriosListosG0,
+  registryFirmadoG6,
   anterioresAprobados,
   onCambio,
   onError,
@@ -363,6 +365,10 @@ function EtapaConGate({
   rol: string;
   /** SYS-22 en la etiqueta: G0 no está «listo» sin criterios completos. */
   criteriosListosG0: boolean;
+  /** Espejo de la precondición que G6 gana con la medición: sin registry firmado el gate
+   * no se aprueba (SYS-22). Lo mismo que `criteriosListosG0` hace por G0 — decirlo en la
+   * cabecera del gate, donde el sponsor mira, y no solo cuando el botón ya falló. */
+  registryFirmadoG6: boolean;
   /** Los gates ordenan el método: el N no está «listo» con anteriores pendientes. */
   anterioresAprobados: boolean;
   onCambio: () => Promise<void>;
@@ -410,7 +416,9 @@ function EtapaConGate({
                 ? 'Esperando los gates anteriores'
                 : gate.numero === 0 && !criteriosListosG0
                   ? 'Faltan criterios completos (SYS-22)'
-                  : 'Listo para aprobar'}
+                  : gate.numero === 6 && !registryFirmadoG6
+                    ? 'Falta firmar el Metric Registry (SYS-22)'
+                    : 'Listo para aprobar'}
           </span>
         )}
       </div>

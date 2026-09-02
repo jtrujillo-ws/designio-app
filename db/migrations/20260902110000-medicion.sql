@@ -773,6 +773,57 @@ begin
   return new;
 end $$;
 
+-- ── El par «reto midiendo ⇔ proyecto midiendo» es INDIVISIBLE, y lo dice la TABLA ──
+-- §5.2 mueve los dos objetos a la vez —«el proyecto y el reto pasan a en medición»— y el
+-- guard del proyecto ya exigía su mitad: no entra en medición si su reto no está midiendo.
+-- La mitad simétrica faltaba, y con ella el par entero: `grant update (estado) on reto` es
+-- una superficie abierta, así que con cualquier G7 aprobado un `update reto set estado =
+-- 'en-medicion'` a secas pasaba el guard de transición —que solo miraba el registry y el
+-- gate— y desde ese instante `snapshot_insert` («registry firmado + reto en medición»)
+-- aceptaba datos con el proyecto todavía en implementación. El tablero mentía y la serie
+-- se llenaba, y lo único que sostenía la promesa era que `abrirMedicion` hiciera los dos
+-- movimientos juntos. Una promesa que solo cumple el servicio dura hasta el próximo
+-- camino que escriba la tabla; la regla baja al dato, que es de donde no se sale.
+--
+-- DIFERIDO, y no es un detalle de estilo. Los dos movimientos son dos sentencias de la
+-- misma transacción, y en ESE orden por obligación: el guard del proyecto exige que el
+-- reto ya mida, así que el reto va primero. Una comprobación inmediata rechazaría al
+-- propio `abrirMedicion` en su primera sentencia, antes de que el proyecto haya podido
+-- moverse. Un `constraint trigger ... deferrable initially deferred` corre al COMMIT,
+-- cuando el movimiento del proyecto ya está escrito y esta comprobación puede verlo.
+--
+-- Las DOS mitades del invariante, porque una sola no dice lo mismo: ningún proyecto del
+-- reto se queda en 'activo' ni en 'en-implementacion' (si quedara, ese es exactamente el
+-- tablero que miente), y al menos uno está midiendo (si no, el reto mide sin que nadie
+-- mida: `abrirMedicion` ya lo rechaza contando los movidos, y por SQL directo también).
+-- Un proyecto 'pausado' o 'cerrado' sí puede quedarse atrás: la operación no los toca a
+-- propósito y parar es del cliente.
+--
+-- Sin SECURITY DEFINER, como su hermano el guard de transición: consulta los proyectos
+-- del MISMO reto que el actor acaba de escribir, todos visibles para cualquier miembro
+-- del workspace, así que no puede volverse oráculo de nada que no se pudiera leer ya.
+create function reto_medicion_par_indivisible_guard() returns trigger
+language plpgsql as $$
+begin
+  if exists (select 1 from proyecto p
+    where p.reto_id = new.id and p.workspace_id = new.workspace_id
+      and p.estado in ('activo', 'en-implementacion')) then
+    raise exception 'el reto no puede medir con su proyecto sin abrir: la medición mueve los dos a la vez (§5.2)';
+  end if;
+  if not exists (select 1 from proyecto p
+    where p.reto_id = new.id and p.workspace_id = new.workspace_id
+      and p.estado = 'en-medicion') then
+    raise exception 'el reto no puede medir sin ningún proyecto en medición (§5.2)';
+  end if;
+  return null;
+end $$;
+create constraint trigger reto_medicion_par_indivisible
+  after update of estado on reto
+  deferrable initially deferred
+  for each row when (new.estado = 'en-medicion' and old.estado is distinct from 'en-medicion')
+  execute function reto_medicion_par_indivisible_guard();
+revoke execute on function reto_medicion_par_indivisible_guard() from public;
+
 -- ── Guard de la firma del registry (SYS-22) ──
 -- La completitud del contrato vive en el DATO: ni el propio sponsor firma por SQL
 -- directo un registry sin dueño del dato, sin línea base o con criterios sin KPI.
@@ -910,7 +961,14 @@ begin
     end if;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'MetricRegistryFirmado',
+        -- Las dos columnas del grant (`estado`, `firmado_por`) y el sello que pone este
+        -- guard. Que la política ate `firmado_por` a `app_user_id()` —y por tanto al
+        -- `actor_id` del propio evento— hace la clave redundante SOLO mientras la política
+        -- se evalúe: una escritura que no pase por RLS la deja libre. El rastro dice lo que
+        -- quedó escrito en la fila, no lo que una regla de otra capa promete que dice.
         jsonb_build_object('registryId', new.id, 'retoId', new.reto_id,
+          'estado', new.estado, 'firmadoPor', new.firmado_por,
+          'firmadoEn', new.firmado_en,
           'entradas', (select count(*) from entrada_kpi e
             where e.registry_id = new.id and e.workspace_id = new.workspace_id)),
         app_user_id(), workspace_role(app_user_id(), new.workspace_id));
@@ -938,15 +996,50 @@ revoke execute on function registry_firmar_guard() from public;
 create function outcome_review_narrativa(fila jsonb) returns jsonb
 language sql immutable parallel safe as $$
   select jsonb_build_object(
+    'estado', fila->'estado',
     'veredicto', fila->'veredicto',
     'contribucion', fila->'contribucion',
     'factoresExternos', fila->'factores_externos',
     'hipotesisAbiertas', fila->'hipotesis_abiertas',
     'aprendizajes', fila->'aprendizajes',
     'disenoExperimentalSuficiente', fila->'diseno_experimental_suficiente',
-    'disenoExperimentalJustificacion', fila->'diseno_experimental_justificacion')
+    'disenoExperimentalJustificacion', fila->'diseno_experimental_justificacion',
+    -- La FIRMA del post mortem. `completado_en` lo pisa el guard con `now()` al completar,
+    -- pero las dos columnas están en el grant y el WITH CHECK solo las ata en la rama de
+    -- la completación: en un borrador se pueden escribir sueltas, así que sin ellas aquí
+    -- una firma puesta a mano sobre un borrador no dejaría rastro.
+    'completadoPor', fila->'completado_por',
+    'completadoEn', fila->'completado_en')
 $$;
 revoke execute on function outcome_review_narrativa(jsonb) from public;
+
+-- ── El CONTENIDO de una entrada del registry, por el mismo motivo ──
+-- Y aquí la regla que lo gobierna, que es la que faltaba: **toda columna con `grant
+-- update` aparece en el payload, en el valor nuevo y en el `antes`**. El payload llevaba
+-- ocho de las doce columnas editables de `entrada_kpi`; las cuatro que faltaban
+-- —`definicion`, `fuente`, `dimensiones`, `dashboard_url`— son texto libre que la edición
+-- PISA, así que corregir solo una de ellas emitía un evento cuyo antes y después eran
+-- idénticos: el rastro decía que alguien tocó el contrato en el instante T y era incapaz
+-- de decir qué, y el texto anterior no se podía recuperar de ninguna parte porque la fila
+-- ya no lo tiene. Elegir a mano qué columnas «importan» es exactamente el criterio que
+-- deja huecos; la lista del grant es la única que no se olvida de nada.
+create function entrada_kpi_contenido(fila jsonb) returns jsonb
+language sql immutable parallel safe as $$
+  select jsonb_build_object(
+    'criterioId', fila->'criterio_id',
+    'nombre', fila->'nombre',
+    'definicion', fila->'definicion',
+    'fuente', fila->'fuente',
+    'dimensiones', fila->'dimensiones',
+    'propietarioMiembroId', fila->'propietario_miembro_id',
+    'frecuencia', fila->'frecuencia',
+    'dashboardUrl', fila->'dashboard_url',
+    'lineaBaseValor', fila->'linea_base_valor',
+    'lineaBaseFecha', fila->'linea_base_fecha',
+    'ventanaInicio', fila->'ventana_inicio',
+    'fechaPostMortem', fila->'fecha_post_mortem')
+$$;
+revoke execute on function entrada_kpi_contenido(jsonb) from public;
 
 -- ── Guard del cierre del outcome review (RF-07.8/07.10, SYS-24) ──
 -- Completar el review es la transición que CIERRA el loop, y sus efectos son
@@ -1099,8 +1192,12 @@ begin
         and numero = new.numero;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'GateAprobado',
+        -- `aprobado_en` está en el grant y el WITH CHECK solo le exige NO SER NULO: la
+        -- fecha de aprobación la propone la aplicación y nada la ata al instante real,
+        -- así que es la clase de dato que el rastro tiene que conservar tal cual quedó.
         jsonb_build_object('gateId', new.id, 'proyectoId', new.proyecto_id,
-                           'numero', new.numero),
+                           'numero', new.numero, 'estado', new.estado,
+                           'aprobadoPor', new.aprobado_por, 'aprobadoEn', new.aprobado_en),
         app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   end if;
   return new;
@@ -1248,6 +1345,22 @@ create policy criterio_update on criterio_exito
   )
   with check (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'));
 
+-- El CONTENIDO del criterio, con la misma regla que las otras dos tablas: entra la lista
+-- del `grant update`, no una selección a mano de lo que parece importante.
+create function criterio_exito_contenido(fila jsonb) returns jsonb
+language sql immutable parallel safe as $$
+  select jsonb_build_object(
+    'kpi', fila->'kpi',
+    'definicion', fila->'definicion',
+    'objetivo', fila->'objetivo',
+    'ventanaDias', fila->'ventana_dias',
+    'lineaBaseValor', fila->'linea_base_valor',
+    'lineaBaseFecha', fila->'linea_base_fecha',
+    'lineaBasePlan', fila->'linea_base_plan',
+    'fechaPostMortem', fila->'fecha_post_mortem')
+$$;
+revoke execute on function criterio_exito_contenido(jsonb) from public;
+
 -- El guard tiene la misma ceguera y hay que reponerle la condición nueva: habla ANTES
 -- que el WITH CHECK, así que sin esto el mensaje sería el de siempre y la firma no
 -- aparecería como motivo.
@@ -1275,10 +1388,21 @@ begin
       and e.estado <> 'en-curso') then
     raise exception 'el G0 del reto está aprobado: criterios congelados';
   end if;
+  -- El criterio se edita ENTERO mientras el G0 sigue pendiente y el registry sin firmar, y
+  -- el evento llevaba solo el `kpi` de sus OCHO columnas editables. Dos de las que faltaban
+  -- son las que gobiernan toda la medición de este slice: `objetivo` es la promesa contra
+  -- la que se dicta el veredicto y `ventana_dias` es la ventana que decide qué snapshots se
+  -- aceptan —el registry no la copia a propósito, así que la ÚNICA copia es esta fila—.
+  -- Cambiarlas dejaba un `CriterioEditado` indistinguible de renombrar el KPI, y sin
+  -- `antes` no había forma de saber contra qué se había prometido medir antes del cambio.
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (new.workspace_id,
       case tg_op when 'INSERT' then 'CriterioDefinido' else 'CriterioEditado' end,
-      jsonb_build_object('criterioId', new.id, 'retoId', new.reto_id, 'kpi', new.kpi),
+      jsonb_build_object('criterioId', new.id, 'retoId', new.reto_id)
+        || criterio_exito_contenido(to_jsonb(new))
+        || case when tg_op = 'UPDATE'
+             then jsonb_build_object('antes', criterio_exito_contenido(to_jsonb(old)))
+             else '{}'::jsonb end,
       app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   return new;
 end $$;
@@ -1355,6 +1479,39 @@ end $$;
 --    no tiene grant: lo escribe el guard del cierre y nadie más.
 --  · `snapshot`: append-only sin política ni grant de UPDATE (SYS-23) — no hay edición
 --    que auditar, ni en sitio ni de ninguna otra forma.
+--
+-- Y EL SEGUNDO EJE, que es el que el primero no ve. El de arriba recorre QUÉ TABLAS
+-- auditan la edición; dentro de cada una queda la pregunta de QUÉ COLUMNAS entran en el
+-- payload. «Cubierta» a nivel de tabla y falsa a nivel de columna es exactamente lo que
+-- pasaba con `entrada_kpi`: auditaba sus ediciones desde el barrido anterior y el evento
+-- llevaba 8 de sus 12 columnas editables, así que corregir solo la definición, la fuente,
+-- los cortes o el dashboard emitía un evento con el antes y el después IDÉNTICOS. La fila
+-- se pisa: si el texto anterior no está en el evento, no está en ninguna parte.
+--
+-- La regla, para no volver a decidirlo caso por caso: **la lista de columnas del payload
+-- es la lista del `grant update`**. No una selección de las que parecen importantes —ese
+-- criterio es justo el que dejó fuera `ventana_dias`, que gobierna qué snapshots se
+-- aceptan— sino la lista entera, en el valor nuevo y en el `antes`. Si una columna se
+-- puede escribir, se puede auditar. Por eso el contenido de cada tabla vive en su propia
+-- función (`entrada_kpi_contenido`, `outcome_review_narrativa`, `criterio_exito_contenido`):
+-- el «antes» y el «después» salen del mismo sitio y no pueden divergir.
+--
+-- Barrido del eje, tabla por tabla, con lo que faltaba:
+--  · `entrada_kpi` (12 columnas): faltaban `definicion`, `fuente`, `dimensiones` y
+--    `dashboard_url`.
+--  · `criterio_exito` (8): el evento llevaba SOLO `kpi` y ningún `antes` — faltaban
+--    `objetivo` y `ventana_dias` incluidos, que son la promesa y la ventana de todo el
+--    slice.
+--  · `outcome_review` (10): faltaban `estado` y la firma (`completado_por`,
+--    `completado_en`), que el WITH CHECK solo ata en la rama de la completación.
+--  · `gate_instancia` (3): faltaban `estado`, `aprobado_por` y `aprobado_en` — y la fecha
+--    la propone la aplicación con el único requisito de no ser nula.
+--  · `metric_registry` (2 + el sello del guard): faltaban `estado`, `firmado_por` y
+--    `firmado_en`.
+--  · `resultado_criterio` (3): ya estaban las tres. Es la única que ya cumplía la regla.
+--  · `reto` (`estado`, + `veredicto` que escribe el guard) y `proyecto` (`estado`): sus
+--    eventos llevan `de`/`a` —el antes y el después de la única columna que se mueve— y el
+--    del reto también el veredicto.
 create function medicion_auditoria() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
@@ -1370,20 +1527,12 @@ begin
     cuerpo := jsonb_build_object('registryId', fila->'id', 'retoId', fila->'reto_id');
   elsif tg_table_name = 'entrada_kpi' then
     evento := case tg_op when 'INSERT' then 'EntradaKpiAgregada' else 'EntradaKpiEditada' end;
-    cuerpo := jsonb_build_object('entradaId', fila->'id', 'registryId', fila->'registry_id',
-      'criterioId', fila->'criterio_id', 'nombre', fila->'nombre',
-      'propietarioMiembroId', fila->'propietario_miembro_id', 'frecuencia', fila->'frecuencia',
-      'lineaBaseValor', fila->'linea_base_valor', 'lineaBaseFecha', fila->'linea_base_fecha',
-      'ventanaInicio', fila->'ventana_inicio', 'fechaPostMortem', fila->'fecha_post_mortem');
+    cuerpo := jsonb_build_object('entradaId', fila->'id', 'registryId', fila->'registry_id')
+      || entrada_kpi_contenido(fila);
     -- El «antes» es lo que hace auditable una EDICIÓN: sin él, el rastro dice que alguien
     -- tocó la entrada pero no qué movió — y aquí lo que se mueve es el contrato.
     if previa is not null then
-      cuerpo := cuerpo || jsonb_build_object('antes', jsonb_build_object(
-        'criterioId', previa->'criterio_id', 'nombre', previa->'nombre',
-        'propietarioMiembroId', previa->'propietario_miembro_id',
-        'frecuencia', previa->'frecuencia', 'lineaBaseValor', previa->'linea_base_valor',
-        'lineaBaseFecha', previa->'linea_base_fecha', 'ventanaInicio', previa->'ventana_inicio',
-        'fechaPostMortem', previa->'fecha_post_mortem'));
+      cuerpo := cuerpo || jsonb_build_object('antes', entrada_kpi_contenido(previa));
     end if;
   elsif tg_table_name = 'snapshot' then
     evento := 'SnapshotRegistrado';

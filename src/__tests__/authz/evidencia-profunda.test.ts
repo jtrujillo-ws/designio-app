@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
+import type { TransactionSql } from 'postgres';
 import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
 import {
   adjuntarArchivo,
@@ -23,6 +24,7 @@ import {
   validarInsight,
 } from '@/lib/insight/insight.servicio';
 import { aprobarGate, marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
+import { rechazarItem } from '@/lib/evidencia/evidencia.servicio';
 import { gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
 import { bytesABase64, MAX_ARCHIVOS_POR_ITEM } from '@/lib/evidencia/sanitizacion';
 import { describeAuthz } from './helpers';
@@ -33,6 +35,52 @@ import { describeAuthz } from './helpers';
  * se impone en la BASE: se verifica por el servicio y también por SQL crudo del rol de
  * aplicación, que es donde una regla escrita solo en la app se caería.
  */
+/**
+ * Deja una transacción ADMIN abierta después de ejecutar `fn`, y devuelve cómo cerrarla.
+ * Es la única forma de comprobar un candado de verdad: hay que tener el conflicto EN
+ * VUELO —commiteado ni bloquea ni prueba nada— mientras el otro camino intenta decidir.
+ */
+async function enVuelo(
+  fn: (tx: TransactionSql) => Promise<void>,
+): Promise<{ cerrar: () => Promise<void> }> {
+  let listo!: () => void;
+  const tomado = new Promise<void>((r) => {
+    listo = r;
+  });
+  let liberar!: () => void;
+  const puedeCerrar = new Promise<void>((r) => {
+    liberar = r;
+  });
+  const terminada = sqlAdmin().begin(async (tx) => {
+    await fn(tx);
+    listo();
+    await puedeCerrar;
+  });
+  await tomado;
+  return {
+    cerrar: async () => {
+      liberar();
+      await terminada;
+    },
+  };
+}
+
+/**
+ * ¿La promesa sigue SIN resolverse pasado `ms`? Es cómo se comprueba que algo espera por
+ * un candado: sin candado compartido, la operación resuelve en milisegundos porque su
+ * lectura no choca con nada. Se enganchan los dos manejadores antes de esperar para que
+ * un rechazo no quede sin capturar.
+ */
+async function sigueEsperando(p: Promise<unknown>, ms = 400): Promise<boolean> {
+  let resuelta = false;
+  const marcar = () => {
+    resuelta = true;
+  };
+  p.then(marcar, marcar);
+  await new Promise((r) => setTimeout(r, ms));
+  return !resuelta;
+}
+
 describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitización', () => {
   const marca = `prof-${crypto.randomUUID().slice(0, 8)}`;
   let ws = '';
@@ -960,6 +1008,148 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         contenidoBase64: bytesABase64(PDF),
       }),
     ).rejects.toThrow(ErrorCuraduria);
+  });
+
+  it('aprobar el gate COMPARTE candado con quien revoca: la revocación no se cuela en medio', async () => {
+    // Re-comprobar los derechos al aprobar cerró el eje TIEMPO, pero una comprobación SIN
+    // candado sobre estado que otro camino muta no cierra la ventana: la estrecha. Bajo
+    // READ COMMITTED el guard leía `derecho_uso` sin bloquear nada, así que la revocación
+    // podía commitear entre esa lectura y el commit del gate. Es el axioma de esta base
+    // —una política es un predicado sobre una instantánea, no un cerrojo— aplicado a un
+    // guard en vez de a una política.
+    const admin = sqlAdmin();
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'nota', 'Fuente del candado', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, 'Respaldo con candado', '{}'::jsonb, ${leadId})
+      returning id`;
+    const evGate = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evGate}, 'concedido', 'cliente', 'Consentimiento vigente',
+              ${leadId}, now(), ${leadId})`;
+
+    const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-96', 'Proyecto candado', ${leadId}) returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 1, 'Investigación')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 1, 'lead-boutique') returning id`;
+    const gateId = gate!.id as string;
+    const [ci] = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gateId}, 1, 'Evidencia de respaldo') returning id`;
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: ci!.id as string,
+      accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evGate },
+    });
+
+    // La revocación EN VUELO: su UPDATE ya tomó el candado de fila de `derecho_uso` y no
+    // ha commiteado. Es exactamente la carrera que el hallazgo describe.
+    const revocacion = await enVuelo(async (tx) => {
+      await tx`update derecho_uso set estado = 'denegado', ambito = 'interno',
+          base = 'El titular retiró el consentimiento'
+        where workspace_id = ${ws} and evidencia_id = ${evGate}`;
+    });
+
+    const aprobacion = aprobarGate(leadId, { workspaceId: ws, gateId });
+    // Sin el `for share` del guard esto resolvía en milisegundos con el gate APROBADO
+    // sobre un respaldo que estaba siendo revocado. Con él, espera.
+    expect(await sigueEsperando(aprobacion)).toBe(true);
+
+    await revocacion.cerrar();
+    // Y al soltarse, Postgres re-evalúa la fila con la versión nueva (EvalPlanQual), así
+    // que la comprobación de abajo ve la revocación ya commiteada y RECHAZA. El candado no
+    // sirve solo para esperar: sirve para decidir sobre lo que quedó.
+    await expect(aprobacion).rejects.toThrow(/derechos/);
+    const [estado] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(estado!.estado).toBe('pendiente');
+  });
+
+  it('el tope de adjuntos se cuenta SIN el filtro de quien mira (un conteo bajo RLS no es un conteo)', async () => {
+    // `archivo_select` solo enseña a quien no cura los adjuntos que él mismo subió
+    // (20260902210000). Contar el tope en la app bajo esa política era contar «lo que este
+    // usuario ve», que es justo lo que un tope no puede significar: el tope es una
+    // propiedad del OBJETO. Diez del curador más diez suyos y el material acaba con veinte.
+    const item = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Material que llena su cupo',
+      contenido: 'x',
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    for (let i = 0; i < MAX_ARCHIVOS_POR_ITEM; i += 1) {
+      await adjuntarArchivo(leadId, {
+        workspaceId: ws,
+        itemId: item.itemId,
+        nombre: `parte-${i}.pdf`,
+        tipoMime: 'application/pdf',
+        contenidoBase64: bytesABase64(PDF),
+      });
+    }
+    // El stakeholder no ve NINGUNO de los diez: ésa es la premisa del hallazgo, no un
+    // detalle. Si algún día los viera, este test dejaría de probar lo que dice probar.
+    const [vistos] = await conUsuario(
+      stakeId,
+      (tx) => tx`select count(*)::int as n from archivo_importado
+        where item_id = ${item.itemId} and workspace_id = ${ws}`,
+    );
+    expect(vistos!.n as number).toBe(0);
+
+    await expect(
+      adjuntarArchivo(stakeId, {
+        workspaceId: ws,
+        itemId: item.itemId,
+        nombre: 'la-que-sobra.pdf',
+        tipoMime: 'application/pdf',
+        contenidoBase64: bytesABase64(PDF),
+      }),
+    ).rejects.toThrow(ErrorCuraduria);
+
+    // Y el SQL crudo del rol de aplicación choca igual: el tope vive ahora en la base, no
+    // en el servicio. Antes no había NINGÚN respaldo — los CHECK de la tabla cubren tipo,
+    // tamaño y nombre, y contar filas hermanas no cabe en un CHECK de fila.
+    await expect(
+      conUsuario(
+        stakeId,
+        (tx) => tx`insert into archivo_importado
+          (workspace_id, item_id, nombre, tipo_mime, contenido, creado_por)
+          values (${ws}, ${item.itemId}, 'por-sql.pdf', 'application/pdf',
+                  ${Buffer.from(PDF)}, ${stakeId})`,
+      ),
+    ).rejects.toMatchObject({ code: 'AD001' });
+  });
+
+  it('sellar el item toma el MISMO candado que adjuntar: lo decidido no se mueve por detrás', async () => {
+    // «Lo decidido es inmutable» (SYS-17) lo dice la política del adjunto exigiendo que el
+    // item siga pendiente — un predicado sobre una instantánea. Sin candado compartido, una
+    // subida podía comprobarlo, el curador sellar, y la subida commitear después: las dos
+    // transacciones con razón en su propio snapshot y equivocadas juntas.
+    const item = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Material que se sella con una subida en vuelo',
+      contenido: 'x',
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    // Una subida en vuelo: lo que sostiene es EL CANDADO DEL ITEM, el mismo que toma el
+    // trigger `archivo_item_candado` en cuanto empieza a insertar.
+    const subida = await enVuelo(async (tx) => {
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:item:' || ${item.itemId}, 42))`;
+    });
+
+    const sello = rechazarItem(leadId, { workspaceId: ws, itemId: item.itemId });
+    expect(await sigueEsperando(sello)).toBe(true);
+
+    await subida.cerrar();
+    await sello;
+    const [estado] = await sqlAdmin()`select estado from item_importacion
+      where id = ${item.itemId}`;
+    expect(estado!.estado).toBe('rechazado');
   });
 
   it('la extensión guardada la fija el FORMATO verificado, no quien llama', async () => {

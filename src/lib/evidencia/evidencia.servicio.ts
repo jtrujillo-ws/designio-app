@@ -333,6 +333,14 @@ export async function aprobarItem(
     // Gate temprano (mensaje claro antes de trabajar); el rol que se AUDITA no sale de
     // aquí sino del RETURNING del update decisor — mismo snapshot que su política RLS.
     await rolCurador(tx, actorId, entrada.workspaceId);
+    // Sellar el item y adjuntarle material se serializan: la política del adjunto exige que
+    // el item siga `pendiente`, pero eso es un predicado sobre una instantánea — una subida
+    // podía comprobarlo, este sello commitear, y la subida entrar después, con las dos
+    // transacciones en lo cierto en su propio snapshot y equivocadas juntas. El mismo
+    // candado lo toma el trigger `item_sellado_candado` para los caminos que no pasan por
+    // aquí; se toma también ANTES de trabajar para no construir la evidencia entera y
+    // descubrir al final que había que esperar.
+    await bloquearItem(tx, entrada.itemId);
 
     const [item] = await tx`
       select id, titulo, contenido, tipo_fuente, referencia
@@ -424,6 +432,10 @@ export async function rechazarItem(actorId: string, entrada: RechazarItem): Prom
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await rolCurador(tx, actorId, entrada.workspaceId); // gate temprano (mensaje claro)
+    // Mismo candado que en aprobar, y por lo mismo: rechazar también SELLA el item, y un
+    // item rechazado conserva sus archivos (SYS-17). Una subida en vuelo no puede colarse
+    // detrás del sello.
+    await bloquearItem(tx, entrada.itemId);
     // Igual que en aprobar: el rol auditado sale del snapshot del update decisor.
     const selladas = await tx`update item_importacion
       set estado = 'rechazado', decidido_por = ${actorId}, decidido_en = now()
@@ -467,22 +479,24 @@ export async function adjuntarArchivo(
 
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // El candado se toma aquí y OTRA VEZ dentro del trigger (es reentrante): aquí para no
+    // hacer el trabajo de la inserción sabiendo que habrá que esperar, y allí para que lo
+    // tomen también los caminos que no pasan por este servicio.
     await bloquearItem(tx, entrada.itemId);
-
-    const [cuenta] = await tx`select count(*)::int as n from archivo_importado
-      where item_id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
-    if ((cuenta!.n as number) >= MAX_ARCHIVOS_POR_ITEM) {
-      throw new ErrorCuraduria(
-        `Este material ya tiene ${MAX_ARCHIVOS_POR_ITEM} adjuntos: la bandeja es curaduría, no un repositorio`,
-      );
-    }
 
     // UNA sentencia = UN snapshot: el rol auditado es el que autorizó la escritura.
     // El insert del evento NO lleva `returning`: con RLS, un INSERT ... RETURNING exige
     // además pasar la política de SELECT, y la auditoría solo la leen los roles que
     // rinden cuentas (RF-01.6) — un stakeholder que adjunta un archivo GENERA el evento
     // pero no puede leerlo, así que pedir la fila de vuelta rompería la escritura.
-    const [fila] = await tx`
+    // El TOPE ya no se cuenta aquí. Contarlo en la app era contar «lo que este usuario
+    // ve»: desde 20260902210000 `archivo_select` solo enseña a quien no cura los adjuntos
+    // que él mismo subió, así que un stakeholder veía cero por muchos que hubiera y subía
+    // por encima del tope. Un tope es una propiedad del OBJETO, no de quien mira. Vive en
+    // `archivo_item_candado_guard`, que cuenta sin RLS y además serializa.
+    let fila;
+    try {
+      [fila] = await tx`
       with quien as (
         select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
       ),
@@ -503,6 +517,18 @@ export async function adjuntarArchivo(
         from nuevo, quien
       )
       select id, sha256 from nuevo`;
+    } catch (e) {
+      // AD001: el tope por item. El mensaje viene de la base y ya está redactado para no
+      // decir de quién son los adjuntos ni cuántos tiene cada cual (SYS-14: se explica el
+      // bloqueo sin filtrar lo que quien pregunta no podía ver).
+      if ((e as { code?: string }).code === 'AD001') {
+        throw new ErrorCuraduria(
+          (e as { message?: string }).message ??
+            `Este material ya alcanzó el máximo de ${MAX_ARCHIVOS_POR_ITEM} adjuntos`,
+        );
+      }
+      throw e;
+    }
     return { archivoId: fila!.id as string, sha256: fila!.sha256 as string };
   });
 }
@@ -516,6 +542,14 @@ export async function eliminarArchivo(
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // El candado es por ITEM, así que primero hay que saber de qué item cuelga. Esta
+    // lectura NO decide nada —si el adjunto no se ve, el DELETE de abajo afecta 0 filas y
+    // el mensaje es el mismo— y por eso puede correr antes del candado: lo que no puede
+    // correr antes es la sentencia decisora. Sin él, un borrado podía quitar un original
+    // justo después de que el curador lo revisara y sellara el material.
+    const [dueno] = await tx`select item_id from archivo_importado
+      where id = ${archivoId} and workspace_id = ${workspaceId}`;
+    if (dueno) await bloquearItem(tx, dueno.item_id as string);
     const borradas = await tx`
       with quien as (
         select workspace_role(${actorId}, ${workspaceId}) as rol

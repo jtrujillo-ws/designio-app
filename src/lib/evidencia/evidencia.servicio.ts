@@ -148,6 +148,30 @@ export async function contenidoDeItem(
   });
 }
 
+const EVIDENCIAS_PICKER = 200;
+
+/** Evidencias del workspace (id y título) para enlazar desde checklists u otros
+ * módulos citantes: lectura mínima bajo RLS + capa 2. hayMas avisa que el picker está
+ * recortado a las más recientes (búsqueda/paginación llegan con la biblioteca CTX-07). */
+export async function listarEvidencias(
+  actorId: string,
+  workspaceId: string,
+): Promise<{ evidencias: { id: string; titulo: string }[]; hayMas: boolean }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`select id, titulo from evidencia
+      where workspace_id = ${workspaceId}
+      order by creado_en desc, id desc
+      limit ${EVIDENCIAS_PICKER + 1}`;
+    return {
+      evidencias: filas
+        .slice(0, EVIDENCIAS_PICKER)
+        .map((f) => ({ id: f.id as string, titulo: f.titulo as string })),
+      hayMas: filas.length > EVIDENCIAS_PICKER,
+    };
+  });
+}
+
 /**
  * Aprobar = curar (RF-03.4/03.5): compone las CINCO dimensiones (proveniencia desde el
  * propio item; lineage null — la importación manual no pasó por AI), crea fuente y

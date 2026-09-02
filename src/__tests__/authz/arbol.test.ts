@@ -6,8 +6,10 @@ import { describeAuthz } from './helpers';
 
 /**
  * SPEC-02 — la proyección del árbol respeta RLS (SYS-01/02), el servicio ancla no se
- * duplica con la relación «afecta», la app no puede escribir el árbol todavía, y las
- * FKs compuestas impiden colgar nodos de otro workspace incluso desde código admin.
+ * duplica con la relación «afecta», las superficies de escritura sin función siguen
+ * cerradas (servicio, contenido por columnas, deletes — reto/proyecto ganaron sus
+ * políticas con SPEC-04), y las FKs compuestas impiden colgar nodos de otro workspace
+ * incluso desde código admin.
  */
 describeAuthz('árbol de navegación (proyección + aislamiento)', () => {
   const marca = `arbol-${crypto.randomUUID().slice(0, 8)}`;
@@ -120,28 +122,25 @@ describeAuthz('árbol de navegación (proyección + aislamiento)', () => {
     expect(retosB.length).toBe(0);
   });
 
-  it('el rol de aplicación no puede escribir NINGUNA tabla del árbol (sin grant hasta que lleguen sus funciones)', async () => {
+  it('las escrituras del árbol sin función siguen cerradas: servicio sin grant, contenido inmutable, sin deletes', async () => {
+    // servicio: sus funciones no llegaron aún — sin grant no hay superficie (userA es lead).
     await expect(
       conUsuario(userA, (tx) => tx`insert into servicio (workspace_id, nombre, creado_por)
         values (${wsA}, 'intruso', ${userA})`),
     ).rejects.toThrow(/permission denied|permiso/i);
-    await expect(
-      conUsuario(userA, (tx) => tx`insert into reto (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
-        values (${wsA}, ${svcA1}, 'R-XX', 'intruso', ${userA})`),
-    ).rejects.toThrow(/permission denied|permiso/i);
-    await expect(
-      conUsuario(userA, (tx) => tx`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
-        values (${wsA}, ${retoA}, 'P-XX', 'intruso', ${userA})`),
-    ).rejects.toThrow(/permission denied|permiso/i);
-    await expect(
-      conUsuario(userA, (tx) => tx`insert into reto_servicio_afectado (reto_id, servicio_id, workspace_id, creado_por)
-        values (${retoA}, ${svcA2}, ${wsA}, ${userA})`),
-    ).rejects.toThrow(/permission denied|permiso/i);
+    // reto/proyecto ganaron INSERT y UPDATE(estado) con SPEC-04, pero el CONTENIDO es
+    // inmutable por grant de columnas y no existe delete para nadie del rol de app.
     await expect(
       conUsuario(userA, (tx) => tx`update reto set titulo = 'alterado' where id = ${retoA}`),
     ).rejects.toThrow(/permission denied|permiso/i);
     await expect(
+      conUsuario(userA, (tx) => tx`update proyecto set titulo = 'alterado' where reto_id = ${retoA}`),
+    ).rejects.toThrow(/permission denied|permiso/i);
+    await expect(
       conUsuario(userA, (tx) => tx`delete from servicio where id = ${svcA1}`),
+    ).rejects.toThrow(/permission denied|permiso/i);
+    await expect(
+      conUsuario(userA, (tx) => tx`delete from reto where id = ${retoA}`),
     ).rejects.toThrow(/permission denied|permiso/i);
   });
 

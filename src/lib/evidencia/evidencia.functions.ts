@@ -14,6 +14,7 @@ import {
   crearItem,
   ErrorCuraduria,
   listarBandeja,
+  listarEvidencias,
   rechazarItem,
 } from './evidencia.servicio';
 
@@ -53,6 +54,19 @@ export const contenidoDeItemImportacion = createServerFn({ method: 'GET' })
     const usuarioId = await requerirUsuarioId();
     try {
       return { contenido: await contenidoDeItem(usuarioId, data.workspaceId, data.itemId) };
+    } catch (e) {
+      if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
+  });
+
+/** Evidencias del workspace para pickers de módulos citantes (checklists del método). */
+export const evidenciasDelWorkspace = createServerFn({ method: 'GET' })
+  .inputValidator(BandejaInputSchema.pick({ workspaceId: true }))
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await listarEvidencias(usuarioId, data.workspaceId);
     } catch (e) {
       if (e instanceof ErrorAutorizacion) return null;
       throw e;

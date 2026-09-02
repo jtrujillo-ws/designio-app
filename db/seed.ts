@@ -7,6 +7,11 @@
  */
 import postgres, { type TransactionSql } from 'postgres';
 import bcrypt from 'bcryptjs';
+import {
+  checklistParaPerfil,
+  ETAPAS_CANONICAS,
+  rolAprobadorDeGate,
+} from '../src/lib/metodo/metodo.plantillas';
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error('Falta DATABASE_URL (conexión admin; ver .env.local.example)');
@@ -47,6 +52,48 @@ async function sembrarArbol(tx: TransactionSql, wsId: string, luciaId: string): 
     (${wsId}, 'ProyectoCreado', ${tx.json({ codigo: 'P-01', reto: 'R-01' })}, ${luciaId}, 'lead-boutique')`;
 }
 
+/** Método de P-01 (SPEC-04): criterios de R-01 con ventana y línea base (§19), etapas
+ * 0-7 canónicas, gates G0-G7 y checklist del perfil estándar. Idempotente por pieza:
+ * en una base migrada, el backfill de la migración ya creó etapas/gates/checklist de
+ * P-01 (y se respetan); los criterios son datos de demo y solo los pone el seed. */
+async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string): Promise<void> {
+  const [p01] = await tx`select p.id, p.reto_id from proyecto p
+    where p.workspace_id = ${wsId} and p.codigo = 'P-01'`;
+  if (!p01) return;
+  const proyectoId = p01.id as string;
+  const retoId = p01.reto_id as string;
+
+  await tx`insert into criterio_exito
+    (workspace_id, reto_id, kpi, definicion, linea_base_valor, linea_base_fecha,
+     objetivo, ventana_dias, creado_por) values
+    (${wsId}, ${retoId}, 'Abandono en verificación',
+     'Porcentaje que inicia la apertura y no la completa', '62%', '2026-07-15',
+     '40%', 90, ${luciaId}),
+    (${wsId}, ${retoId}, 'Tiempo a cuenta activa',
+     'Días desde el inicio hasta cuenta operativa', '5 días', '2026-07-15',
+     '1 día', 90, ${luciaId})`;
+
+  const [yaInstanciado] = await tx`select count(*)::int as n from etapa_instancia
+    where workspace_id = ${wsId} and proyecto_id = ${proyectoId}`;
+  if ((yaInstanciado!.n as number) === 0) {
+    for (const [numero, nombre] of ETAPAS_CANONICAS.entries()) {
+      await tx`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+        values (${wsId}, ${proyectoId}, ${numero}, ${nombre}, ${numero <= 1 ? 'en-curso' : 'pendiente'})`;
+      const [gate] = await tx`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador)
+        values (${wsId}, ${proyectoId}, ${numero}, ${rolAprobadorDeGate(numero)}) returning id`;
+      const textos = checklistParaPerfil(numero, 'estandar');
+      for (const [orden, texto] of textos.entries()) {
+        await tx`insert into checklist_item (workspace_id, gate_id, orden, texto)
+          values (${wsId}, ${gate!.id as string}, ${orden}, ${texto})`;
+      }
+    }
+  }
+
+  await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
+    (${wsId}, 'RetoActivado', ${tx.json({ codigo: 'R-01', proyecto: 'P-01', perfil: 'estandar' })}, ${luciaId}, 'lead-boutique')`;
+}
+
 async function main() {
   const hash = await bcrypt.hash(PASSWORD_DEMO, 10);
 
@@ -62,16 +109,25 @@ async function main() {
     // Upgrade de bases sembradas antes del árbol (SPEC-02): sembrarlo si no existe.
     const [conServicios] = await sql`select count(*)::int as n from servicio where workspace_id = ${wsId}`;
     let arbolSembrado = false;
-    if ((conServicios!.n as number) === 0) {
-      const [lucia] = await sql`select id from usuario where lower(email) = 'lucia@whitespace.demo'`;
-      if (lucia) {
-        await sql.begin((tx) => sembrarArbol(tx, wsId, lucia.id as string));
-        arbolSembrado = true;
-      }
+    const [lucia] = await sql`select id from usuario where lower(email) = 'lucia@whitespace.demo'`;
+    if ((conServicios!.n as number) === 0 && lucia) {
+      await sql.begin((tx) => sembrarArbol(tx, wsId, lucia.id as string));
+      arbolSembrado = true;
+    }
+
+    // Upgrade de bases sembradas antes del método (SPEC-04): los CRITERIOS son la
+    // señal (la migración backfillea etapas/gates/checklist, pero los criterios de
+    // demo solo los pone el seed).
+    const [conCriterios] = await sql`select count(*)::int as n from criterio_exito where workspace_id = ${wsId}`;
+    let metodoSembrado = false;
+    if ((conCriterios!.n as number) === 0 && lucia) {
+      await sql.begin((tx) => sembrarMetodo(tx, wsId, lucia.id as string));
+      metodoSembrado = true;
     }
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
-        (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : ''),
+        (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
+        (metodoSembrado ? '; método de P-01 sembrado' : ''),
     );
     return;
   }
@@ -99,9 +155,10 @@ async function main() {
       (${wsId}, 'WorkspaceCreado', ${tx.json({ nombre: 'Banco Andino', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
 
     await sembrarArbol(tx, wsId, luciaId);
+    await sembrarMetodo(tx, wsId, luciaId);
   });
   console.log(
-    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01) — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
+    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7) — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );
 }
 

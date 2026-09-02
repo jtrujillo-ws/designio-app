@@ -8,7 +8,7 @@ status: active
 language: es
 audience: engineering
 tags: [railway, despliegue, runbook, postgres, environments]
-summary: "Guía operativa para desplegar Designio en Railway: servicio Docker + PostgreSQL gestionado, un environment por rama (dev/stg/main), variables y secrets (incluido el patrón de dos conexiones con RLS), healthcheck, seed y verificación post-deploy."
+summary: "Guía operativa para desplegar Designio en Railway: servicio Docker + PostgreSQL gestionado, environments dev/stg/production sobre las ramas dev/stg/main, variables y secrets (incluido el patrón de dos conexiones con RLS), healthcheck, seed y verificación post-deploy."
 ---
 
 # Runbook — Despliegue de Designio en Railway

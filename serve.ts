@@ -13,7 +13,10 @@ const SERVER_ENTRY = join(import.meta.dir, 'dist', 'server', 'server.js');
 type FetchHandler = { fetch(request: Request): Response | Promise<Response> };
 const { default: ssr } = (await import(SERVER_ENTRY)) as { default: FetchHandler };
 
-const port = Number(process.env.PORT ?? 8080);
+// PORT validado con fallback explícito: un valor vacío o no numérico jamás debe
+// producir NaN ni el puerto 0 (que bindearía uno aleatorio).
+const portEnv = Number.parseInt(process.env.PORT ?? '', 10);
+const port = Number.isInteger(portEnv) && portEnv > 0 && portEnv < 65536 ? portEnv : 8080;
 
 Bun.serve({
   port,

@@ -289,6 +289,70 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     }
   });
 
+  it('dos re-invitaciones simultáneas no se pisan el enlace: solo una emite', async () => {
+    const emailDoble = `${marca}-doble@test.demo`;
+    const admin = sqlAdmin();
+    const primera = await crearInvitacion(leadId, {
+      workspaceId: ws,
+      email: emailDoble,
+      nombre: 'Doble Test',
+      rol: 'stakeholder',
+    });
+    expect(primera.token).toBeTruthy();
+    try {
+      // Lock externo sobre la fila: garantiza que AMBAS re-invitaciones arrancan su
+      // transacción antes de que cualquiera emita (la carrera existe de verdad).
+      let liberar!: () => void;
+      const compuerta = new Promise<void>((res) => (liberar = res));
+      let lockTomado!: () => void;
+      const conLock = new Promise<void>((res) => (lockTomado = res));
+      const bloqueo = admin.begin(async (tx) => {
+        await tx`select id from usuario where lower(email) = ${emailDoble} for update`;
+        lockTomado();
+        await compuerta;
+      });
+      await conLock;
+
+      const reinvitar = () =>
+        crearInvitacion(leadId, {
+          workspaceId: ws,
+          email: emailDoble,
+          nombre: 'Doble Test',
+          rol: 'stakeholder',
+        }).then(
+          (r) => r as unknown,
+          (e: unknown) => e,
+        );
+      const enVuelo = [reinvitar(), reinvitar()];
+      await new Promise((res) => setTimeout(res, 250));
+      liberar();
+      await bloqueo;
+      const resultados = await Promise.all(enVuelo);
+
+      // Determinista sin importar el orden: el primero en tomar el lock re-emite,
+      // el rezagado ve un enlace más nuevo que su propio inicio y NO lo pisa.
+      const conEnlace = resultados.filter(
+        (r) => !(r instanceof Error) && (r as { token: string | null }).token != null,
+      );
+      const simultaneas = resultados.filter(
+        (r) => r instanceof ErrorInvitacion && /simultánea/.test(r.message),
+      );
+      expect(conEnlace.length).toBe(1);
+      expect(simultaneas.length).toBe(1);
+
+      // El enlace del ganador es consumible (el rezagado no lo invalidó). La clave
+      // vive en su propia línea: junto al nombre del campo del enlace, el escaneo
+      // de secretos del CI la confunde con una credencial real (entropía al borde).
+      const claveDelGanador = 'ClaveDoble1234';
+      const ganador = conEnlace[0] as { token: string };
+      const activada = await activarConToken(ganador.token, claveDelGanador);
+      expect(activada?.id).toBe(primera.usuarioId);
+    } finally {
+      await admin`delete from miembro where email = ${emailDoble}`;
+      await admin`delete from usuario where email = ${emailDoble}`;
+    }
+  });
+
   it('no se invita un correo cuya cuenta global está desactivada', async () => {
     const emailInactiva = `${marca}-inactiva@test.demo`;
     const admin = sqlAdmin();

@@ -58,8 +58,9 @@ La migración `00-init.sql` intenta `create extension vector` de forma **toleran
 # 1. Salud
 curl -s https://<dominio>/healthz            # → ok
 
-# 2. La pantalla Loop server-renderizada
-curl -s https://<dominio>/ | grep -c "El loop del método"   # → 1
+# 2. La raíz manda al guard de sesión: sin cookie termina en el login server-renderizado
+#    (la pantalla Loop vive tras /app y requiere sesión desde el PR de auth)
+curl -sL https://<dominio>/ | grep -c "Entra a tu workspace"   # → 1
 
 # 3. Logs del deploy: migraciones aplicadas y (solo dev) seed
 #    "migraciones al día (N en total, ...)" · "designio escuchando en :PORT"

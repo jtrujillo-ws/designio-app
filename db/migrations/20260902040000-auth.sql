@@ -112,49 +112,69 @@ $$;
 -- que activar_usuario_con_token jamás consume), y dos adopciones simultáneas de un
 -- origen NULL podían emitir dos enlaces pisándose entre sí. Con el lock, la condición
 -- de cada rama se evalúa sobre el estado definitivo de la fila.
+-- Aun serializadas, dos re-emisiones del MISMO workspace reportarían éxito ambas
+-- mientras la segunda invalida el enlace de la primera; por eso las emisiones
+-- estampan clock_timestamp() y un request solo re-emite si el enlace vigente es
+-- anterior a su propio inicio de transacción — el que llega tarde recibe
+-- emision_reciente y no pisa nada (también cubre el doble clic del mismo admin).
 -- Devuelve además el estado de la cuenta: el servicio corta la invitación si está
 -- desactivada (autenticar la rechazaría y no existe flujo de reactivación).
 -- Autoriza por sí misma (actor con rol que invita en p_workspace) además de la política
 -- de INSERT de miembro que aplica en la misma transacción.
 create or replace function preparar_invitacion(
   p_email text, p_nombre text, p_token_hash text, p_expira timestamptz, p_workspace uuid
-) returns table (usuario_id uuid, requiere_activacion boolean, token_emitido boolean, estado text)
+) returns table (
+  usuario_id uuid, requiere_activacion boolean, token_emitido boolean,
+  estado text, emision_reciente boolean
+)
 language plpgsql security definer set search_path = public as
 $$
 declare
   v_id uuid;
   v_estado text;
   v_origen uuid;
+  v_actualizado timestamptz;
   v_emitido boolean := false;
+  v_reciente boolean := false;
 begin
   if coalesce(workspace_role(app_user_id(), p_workspace), '') not in ('lead-boutique', 'admin-cliente') then
     raise exception 'sin permiso para invitar en este workspace'
       using errcode = 'insufficient_privilege';
   end if;
 
-  select u.id, u.estado, u.invitacion_origen_ws
-    into v_id, v_estado, v_origen
+  select u.id, u.estado, u.invitacion_origen_ws, u.actualizado_en
+    into v_id, v_estado, v_origen, v_actualizado
   from usuario u where lower(u.email) = lower(p_email)
   for update;
 
   if v_id is null then
-    insert into usuario (email, nombre, estado, invitacion_token_hash, invitacion_expira, invitacion_origen_ws)
-    values (p_email, p_nombre, 'invitado', p_token_hash, p_expira, p_workspace)
+    -- clock_timestamp (no now()): now() es el inicio de transacción y dejaría la
+    -- estampa ANTES de requests que ya estaban en vuelo, rompiendo el CAS de abajo.
+    insert into usuario (email, nombre, estado, invitacion_token_hash, invitacion_expira,
+                         invitacion_origen_ws, actualizado_en)
+    values (p_email, p_nombre, 'invitado', p_token_hash, p_expira, p_workspace, clock_timestamp())
     returning id into v_id;
     v_estado := 'invitado';
     v_emitido := true;
   elsif v_estado = 'invitado' and (v_origen = p_workspace or v_origen is null) then
-    -- Origen NULL = cuenta creada por el backfill de esta migración (pre-auth), sin
-    -- invitación viva. El primer workspace que la invite ADOPTA el origen — el mismo
-    -- modelo de confianza que una cuenta nueva; a partir de ahí, solo él re-emite.
-    update usuario u
-    set invitacion_token_hash = p_token_hash, invitacion_expira = p_expira,
-        invitacion_origen_ws = p_workspace, actualizado_en = now()
-    where u.id = v_id;
-    v_emitido := true;
+    if v_actualizado > transaction_timestamp() then
+      -- Otro request emitió/renovó el enlace DESPUÉS de que este comenzó (carrera
+      -- serializada por el lock): no pisarlo — ese enlace ya está en manos de quien
+      -- lo emitió y este caller debe enterarse en vez de repartir uno muerto.
+      v_reciente := true;
+    else
+      -- Origen NULL = cuenta creada por el backfill de esta migración (pre-auth), sin
+      -- invitación viva. El primer workspace que la invite ADOPTA el origen — el mismo
+      -- modelo de confianza que una cuenta nueva; a partir de ahí, solo él re-emite.
+      update usuario u
+      set invitacion_token_hash = p_token_hash, invitacion_expira = p_expira,
+          invitacion_origen_ws = p_workspace, actualizado_en = clock_timestamp()
+      where u.id = v_id;
+      v_emitido := true;
+    end if;
   end if;
 
-  return query select v_id, (v_estado = 'invitado'), v_emitido, v_estado;
+  return query select v_id, (v_estado = 'invitado'), v_emitido, v_estado, v_reciente;
 end
 $$;
 

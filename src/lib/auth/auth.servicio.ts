@@ -155,7 +155,7 @@ export async function crearInvitacion(
     }
 
     const [prep] = await tx`
-      select usuario_id, requiere_activacion, token_emitido, estado
+      select usuario_id, requiere_activacion, token_emitido, estado, emision_reciente
       from preparar_invitacion(${entrada.email}, ${entrada.nombre}, ${tokenHash}, ${expira}, ${entrada.workspaceId})`;
     const usuarioId = prep!.usuario_id as string;
     const requiereActivacion = prep!.requiere_activacion as boolean;
@@ -168,6 +168,15 @@ export async function crearInvitacion(
     // el estado leído es el definitivo).
     if ((prep!.estado as string) === 'inactivo') {
       throw new ErrorInvitacion('La cuenta de ese correo está desactivada; no puede recibir invitaciones');
+    }
+
+    // Carrera de re-invitaciones (dos admins, o doble clic): el enlace vigente lo
+    // emitió un request posterior al inicio de este — repartir uno nuevo lo mataría
+    // en silencio, así que este caller no recibe enlace y se le dice por qué.
+    if (prep!.emision_reciente as boolean) {
+      throw new ErrorInvitacion(
+        'Otra invitación simultánea acaba de emitir un enlace para esa persona; usa ese enlace o reintenta en unos segundos',
+      );
     }
 
     const [yaMiembro] = await tx`

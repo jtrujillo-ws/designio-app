@@ -16,7 +16,13 @@ import {
   crearItemImportacion,
   rechazarItemImportacion,
 } from '@/lib/evidencia/evidencia.functions';
-import { ETIQUETA_TIPO_FUENTE, TIPOS_FUENTE, type ItemBandeja, type TipoFuente } from '@/lib/evidencia/evidencia.schemas';
+import {
+  ETIQUETA_TIPO_FUENTE,
+  ROLES_CURADORES,
+  TIPOS_FUENTE,
+  type ItemBandeja,
+  type TipoFuente,
+} from '@/lib/evidencia/evidencia.schemas';
 
 /**
  * Bandeja de importación (SPEC-03, J1 «arranque en frío», versión manual):
@@ -54,8 +60,13 @@ const TEXTO_ESTADO: Record<ItemBandeja['estado'], string> = {
 
 function PantallaImportacion() {
   const datos = Route.useLoaderData();
+  const { usuario } = Route.useRouteContext();
   const navigate = useNavigate();
   const router = useRouter();
+  // Solo la boutique decide (RF-03.4): a los demás roles la tarjeta no les ofrece
+  // controles que el server rechazaría de todos modos (capa 2 + RLS).
+  const rol = usuario.membresias[0]?.rol ?? '';
+  const puedeCurar = (ROLES_CURADORES as readonly string[]).includes(rol);
   const [error, setError] = useState<string | null>(null);
   // Páginas siguientes de pendientes cargadas bajo demanda (el loader trae la primera).
   const [masPendientes, setMasPendientes] = useState<ItemBandeja[]>([]);
@@ -144,6 +155,7 @@ function PantallaImportacion() {
                 key={item.id}
                 item={item}
                 workspaceId={datos.workspaceId}
+                puedeCurar={puedeCurar}
                 onCambio={refrescar}
                 onError={setError}
               />
@@ -163,6 +175,7 @@ function PantallaImportacion() {
                     key={item.id}
                     item={item}
                     workspaceId={datos.workspaceId}
+                    puedeCurar={puedeCurar}
                     onCambio={refrescar}
                     onError={setError}
                   />
@@ -269,11 +282,13 @@ function FormularioNuevoItem({
 function TarjetaItem({
   item,
   workspaceId,
+  puedeCurar,
   onCambio,
   onError,
 }: {
   item: ItemBandeja;
   workspaceId: string;
+  puedeCurar: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
 }) {
@@ -353,7 +368,12 @@ function TarjetaItem({
           Ref: {item.referencia}
         </span>
       )}
-      {item.estado === 'pendiente' && !curando && (
+      {item.estado === 'pendiente' && !puedeCurar && (
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+          La curaduría la decide la boutique (lead o diseñador).
+        </span>
+      )}
+      {item.estado === 'pendiente' && puedeCurar && !curando && (
         <div style={{ display: 'flex', gap: 10 }}>
           <Button size="sm" onClick={() => setCurando(true)}>
             Curar y aprobar
@@ -363,7 +383,7 @@ function TarjetaItem({
           </Button>
         </div>
       )}
-      {item.estado === 'pendiente' && curando && (
+      {item.estado === 'pendiente' && puedeCurar && curando && (
         <FormularioCuraduria
           workspaceId={workspaceId}
           itemId={item.id}

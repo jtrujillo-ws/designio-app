@@ -8,7 +8,18 @@ import { z } from 'zod';
 export const FechaCalendarioSchema = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, 'Fecha en formato AAAA-MM-DD')
-  .refine((f) => !Number.isNaN(Date.parse(`${f}T00:00:00Z`)), { message: 'Fecha inválida' });
+  .refine(
+    (f) => {
+      // Comparación por componentes: el parser ISO de V8 RUEDA los desbordes
+      // (2026-02-30 → 2 de marzo) en vez de rechazarlos.
+      const [a, m, d] = f.split('-').map(Number);
+      const fecha = new Date(Date.UTC(a!, m! - 1, d!));
+      return (
+        fecha.getUTCFullYear() === a && fecha.getUTCMonth() === m! - 1 && fecha.getUTCDate() === d
+      );
+    },
+    { message: 'Fecha inválida' },
+  );
 
 export const DimensionesEvidenciaSchema = z.object({
   proveniencia: z.object({
@@ -56,6 +67,10 @@ export const InsightSchema = z.object({
 export type Insight = z.infer<typeof InsightSchema>;
 
 // ── Bandeja de importación (SPEC-03, MVP manual: texto pegado o referencia) ──
+
+/** Quiénes deciden la curaduría (RF-03.4): compartido entre el re-check del servicio
+ * y la UI, que solo muestra los controles de decisión a estos roles. */
+export const ROLES_CURADORES = ['lead-boutique', 'disenador'] as const;
 
 export const TIPOS_FUENTE = [
   'documento',

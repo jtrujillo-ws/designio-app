@@ -4,6 +4,7 @@ import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import {
   DimensionesEvidenciaSchema,
+  ROLES_CURADORES,
   type AprobarItem,
   type CrearItemImportacion,
   type ItemBandeja,
@@ -22,7 +23,6 @@ import {
 
 export class ErrorCuraduria extends Error {}
 
-const ROLES_CURADORES = ['lead-boutique', 'disenador'];
 const LARGO_EXTRACTO = 400;
 
 export async function crearItem(
@@ -235,7 +235,7 @@ async function rolCurador(
 ): Promise<string> {
   const [fila] = await tx`select workspace_role(${actorId}, ${workspaceId}) as rol`;
   const rol = (fila?.rol ?? null) as string | null;
-  if (!rol || !ROLES_CURADORES.includes(rol)) {
+  if (!rol || !(ROLES_CURADORES as readonly string[]).includes(rol)) {
     throw new ErrorCuraduria('Solo lead-boutique o diseñador pueden curar la bandeja');
   }
   return rol;

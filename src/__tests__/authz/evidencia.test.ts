@@ -1,6 +1,10 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
-import { CrearItemImportacionSchema, DimensionesEvidenciaSchema } from '@/lib/evidencia/evidencia.schemas';
+import {
+  CrearItemImportacionSchema,
+  DimensionesEvidenciaSchema,
+  FechaCalendarioSchema,
+} from '@/lib/evidencia/evidencia.schemas';
 import {
   aprobarItem,
   contenidoDeItem,
@@ -235,6 +239,13 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     expect(
       CrearItemImportacionSchema.safeParse({ ...base, contenido: '   ', referencia: '' }).success,
     ).toBe(false);
+  });
+
+  it('una fecha calendárica imposible (desborde) se rechaza, no se normaliza', () => {
+    expect(FechaCalendarioSchema.safeParse('2026-02-30').success).toBe(false);
+    expect(FechaCalendarioSchema.safeParse('2026-04-31').success).toBe(false);
+    expect(FechaCalendarioSchema.safeParse('2026-02-28').success).toBe(true);
+    expect(FechaCalendarioSchema.safeParse('2028-02-29').success).toBe(true); // bisiesto
   });
 
   it('el contenido completo se inspecciona bajo demanda y respeta el aislamiento', async () => {

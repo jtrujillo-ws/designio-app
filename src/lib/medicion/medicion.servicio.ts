@@ -4,6 +4,7 @@ import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 import {
+  etiquetaVentana,
   motivoFechaDeSnapshot,
   ValorMetricoSchema,
   type CargarCsv,
@@ -196,8 +197,12 @@ export async function agregarEntrada(
   });
 }
 
-/** Corrige una entrada mientras el registry es borrador (después la política la congela:
- * 0 filas). Es el camino de reparación — una entrada incompleta bloquea la firma. */
+/** Corrige una entrada ENTERA mientras el registry es borrador —el criterio al que
+ * responde incluido— y después la política la congela (0 filas). Es el camino de
+ * reparación y el ÚNICO: la tabla no tiene borrado, así que si el criterio no se pudiera
+ * corregir, elegir el equivocado obligaría a firmar el contrato con un KPI que mide una
+ * promesa que nadie hizo. En borrador la entrada no puede tener snapshots (la política del
+ * snapshot exige el registry firmado), así que reapuntarla no mueve ninguna serie. */
 export async function editarEntrada(actorId: string, entrada: EditarEntrada): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
@@ -211,6 +216,7 @@ export async function editarEntrada(actorId: string, entrada: EditarEntrada): Pr
         update entrada_kpi
         set nombre = ${entrada.nombre}, definicion = ${entrada.definicion},
             fuente = ${entrada.fuente}, dimensiones = ${entrada.dimensiones},
+            criterio_id = ${entrada.criterioId},
             propietario_miembro_id = ${entrada.propietarioMiembroId},
             frecuencia = ${entrada.frecuencia}, dashboard_url = ${entrada.dashboardUrl},
             linea_base_valor = ${entrada.lineaBaseValor},
@@ -221,13 +227,17 @@ export async function editarEntrada(actorId: string, entrada: EditarEntrada): Pr
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code === '23505') throw new ErrorMedicion('Ya hay un KPI con ese nombre en el registry');
-      if (code === '23503') throw new ErrorMedicion('El propietario del dato no es miembro de este workspace');
-      // Aquí el WITH CHECK solo puede fallar por UNA razón, y por eso el mensaje puede
-      // permitirse ser exacto: el USING ya validó rol y registry en borrador, y ni el
-      // registry ni el criterio de la entrada se editan (son su identidad).
+      if (code === '23503') {
+        throw new ErrorMedicion('El criterio o el propietario del dato no existen aquí');
+      }
+      // El USING ya validó rol y registry en borrador, así que a estas alturas el WITH
+      // CHECK solo puede fallar por las dos condiciones sobre el CONTENIDO de la fila
+      // nueva. Van juntas en un mensaje, como el del snapshot: son las dos que el
+      // formulario puede haber elegido mal.
       if (code === '42501') {
         throw new ErrorMedicion(
-          'El dueño del dato tiene que ser una persona del cliente (RF-07.1)',
+          'El criterio no es de este reto o el dueño del dato no es una persona del cliente' +
+            ' (RF-07.1)',
         );
       }
       throw e;
@@ -603,21 +613,20 @@ async function diagnosticoDeReview(
   if (reto.estado !== 'en-medicion') {
     return `El outcome review se abre con el reto en medición (ahora: ${reto.estado as string})`;
   }
+  // MISMO predicado que la política y el guard, por la función de la base: un diagnóstico
+  // que no coincidiera con quien autoriza dejaría al lead con un rechazo y un «no falta
+  // nada» — precisamente el día del corte, que es cuando importa.
   const abiertas = await tx`
     select e.nombre, (e.ventana_inicio + c.ventana_dias) - current_date as faltan
     from entrada_kpi e
     join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
     join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
     where r.reto_id = ${retoId} and r.workspace_id = ${workspaceId}
-      and (e.ventana_inicio is null or c.ventana_dias is null
-           or e.ventana_inicio + c.ventana_dias > current_date)
+      and ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias)
     order by e.nombre`;
   if (abiertas.length > 0) {
     const lista = abiertas
-      .map(
-        (a) =>
-          `«${a.nombre as string}»${a.faltan === null ? ' (sin ventana)' : ` (faltan ${a.faltan as number} días)`}`,
-      )
+      .map((a) => `«${a.nombre as string}» (${etiquetaVentana(a.faltan as number | null)})`)
       .join(', ');
     return `El outcome review se habilita al cerrar la ventana del último criterio: ${lista}`;
   }
@@ -775,7 +784,9 @@ export async function seguimientoDeImpacto(
             'estadoSnapshot', case
               -- Sin ventana no hay cadencia que juzgar: la firma es quien la exige.
               when e.ventana_inicio is null or c.ventana_dias is null then 'esperado'
-              when e.ventana_inicio + c.ventana_dias < current_date then case
+              -- «Ya no está abierta», con el MISMO predicado que autoriza el review: el
+              -- último día de la ventana la medición sigue viva y su estado también.
+              when not ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias) then case
                 -- La ventana entera pasó sin un solo dato: vencido, y ya sin remedio.
                 when ult.fecha is null then 'vencido'
                 -- Recurrente que dejó de aportar ANTES del cierre: la cadencia se

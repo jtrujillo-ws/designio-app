@@ -148,10 +148,13 @@ export const CrearEntradaSchema = CamposEntradaSchema.extend({
 });
 export type CrearEntrada = z.infer<typeof CrearEntradaSchema>;
 
-/** Editar la entrada completa mientras el registry es borrador. Registry y criterio no
- * se editan: son la IDENTIDAD del compromiso (mover un KPI de criterio sería otro KPI). */
+/** Editar la entrada COMPLETA mientras el registry es borrador, criterio incluido: elegir
+ * el criterio equivocado al crearla es el error fácil, y el criterio decide la VENTANA del
+ * KPI (`ventana_dias` vive en él). Lo único que no se edita es `registryId`: eso sí es
+ * identidad —la entrada pertenece a ese contrato— y moverla sería otra entrada. */
 export const EditarEntradaSchema = CamposEntradaSchema.extend({
   entradaId: z.string().uuid(),
+  criterioId: z.string().uuid(),
 });
 export type EditarEntrada = z.infer<typeof EditarEntradaSchema>;
 
@@ -251,7 +254,8 @@ export type EntradaDeRegistry = {
   ventanaInicio: string | null;
   ventanaFin: string | null;
   fechaPostMortem: string | null;
-  /** Negativo o cero: la ventana de este criterio ya cerró. */
+  /** Días hasta el cierre de la ventana. CERO significa «cierra hoy», y hoy todavía se
+   * mide: solo un valor NEGATIVO dice que la ventana ya cerró (ver `ventanaAbierta`). */
   diasRestantes: number | null;
   ultimaFecha: string | null;
   estadoSnapshot: EstadoSnapshot;
@@ -300,12 +304,30 @@ export type SeguimientoDeImpacto = {
   review: OutcomeReviewDeReto | null;
 };
 
-/** El outcome review se habilita al cerrar la ventana del ÚLTIMO criterio (RF-07.7).
- * Espejo cliente del predicado de la política: informa la pantalla, no autoriza nada. */
+/**
+ * Espejo cliente EXACTO de `ventana_de_medicion_abierta` de la base: informa la pantalla,
+ * no autoriza nada. El último día de la ventana cuenta como abierto —`diasRestantes === 0`
+ * es «cierra hoy»— porque ese día la política del snapshot todavía acepta el dato de la
+ * jornada; solo un valor negativo cierra. Sin ventana declarada tampoco está cerrada: no
+ * hay nada que dar por terminado.
+ */
+export function ventanaAbierta(entrada: { diasRestantes: number | null }): boolean {
+  return entrada.diasRestantes === null || entrada.diasRestantes >= 0;
+}
+
+/** El outcome review se habilita al cerrar la ventana del ÚLTIMO criterio (RF-07.7). */
 export function ventanasCerradas(entradas: EntradaDeRegistry[]): boolean {
-  return (
-    entradas.length > 0 && entradas.every((e) => e.diasRestantes !== null && e.diasRestantes <= 0)
-  );
+  return entradas.length > 0 && entradas.every((e) => !ventanaAbierta(e));
+}
+
+/** Cómo se dice una ventana en la pantalla, en UN sitio: los tres estados (falta tiempo,
+ * cierra hoy, ya cerró) más la ausencia de ventana. Escrito por su cuenta en cada bloque,
+ * el caso del último día —el único que este corte introduce— se olvidaría en alguno. */
+export function etiquetaVentana(diasRestantes: number | null): string {
+  if (diasRestantes === null) return 'sin ventana';
+  if (diasRestantes > 0) return `faltan ${diasRestantes} días`;
+  if (diasRestantes === 0) return 'cierra hoy';
+  return 'ventana cerrada';
 }
 
 /**

@@ -23,8 +23,10 @@ import {
   ETIQUETA_ESTADO_SNAPSHOT,
   ETIQUETA_FRECUENCIA,
   ETIQUETA_VEREDICTO,
+  etiquetaVentana,
   FRECUENCIAS,
   VEREDICTOS,
+  ventanaAbierta,
   ventanasCerradas,
   type EntradaDeRegistry,
   type EstadoSnapshot,
@@ -371,10 +373,7 @@ function FichaEntrada({
       </span>
       <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
         Ventana: {entrada.ventanaInicio ?? '—'} → {entrada.ventanaFin ?? '—'}
-        {entrada.diasRestantes !== null &&
-          (entrada.diasRestantes > 0
-            ? ` · faltan ${entrada.diasRestantes} días`
-            : ' · ventana cerrada')}
+        {entrada.diasRestantes !== null && ` · ${etiquetaVentana(entrada.diasRestantes)}`}
         {entrada.fechaPostMortem ? ` · post-mortem previsto ${entrada.fechaPostMortem}` : ''}
       </span>
       {entrada.dashboardUrl && (
@@ -462,9 +461,12 @@ function FormularioEntrada({
       }}
     >
       <span style={micro}>{entrada ? 'Editar KPI' : 'Nuevo KPI del registry'}</span>
+      {/* El criterio se corrige mientras el registry sea borrador: es el error fácil al
+          crear el KPI y no hay borrado que lo deshaga. Además decide la VENTANA del KPI
+          (`ventana_dias` vive en el criterio), así que dejarlo bloqueado no congelaba una
+          identidad — condenaba a firmar midiendo una promesa que nadie hizo. */}
       <Select
         value={datos.criterioId}
-        disabled={entrada !== null}
         onChange={(e) => setDatos((d) => ({ ...d, criterioId: e.target.value }))}
       >
         {criterios.map((c) => (
@@ -663,11 +665,7 @@ function BloqueSerie({
         <span style={{ font: '600 11.5px var(--font-sans)', color: COLOR_ESTADO[entrada.estadoSnapshot] }}>
           {ETIQUETA_ESTADO_SNAPSHOT[entrada.estadoSnapshot]}
         </span>
-        <Tag>
-          {entrada.diasRestantes !== null && entrada.diasRestantes > 0
-            ? `${entrada.diasRestantes} días de ventana`
-            : 'ventana cerrada'}
-        </Tag>
+        <Tag>{etiquetaVentana(entrada.diasRestantes)}</Tag>
       </div>
 
       {/* Baseline → serie → objetivo: la lectura del criterio en una línea (RF-07.5). */}
@@ -874,10 +872,11 @@ function BloqueReview({
 
       {!review && !habilitado && (
         <span style={{ font: '400 12.5px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}>
-          Se habilita al cerrar la ventana del último criterio (RF-07.7).{' '}
+          Se habilita al cerrar la ventana del último criterio (RF-07.7) — el último día de
+          la ventana todavía se mide, así que el post-mortem se abre al día siguiente.{' '}
           {seguimiento.entradas
-            .filter((e) => e.diasRestantes !== null && e.diasRestantes > 0)
-            .map((e) => `${e.nombre}: faltan ${e.diasRestantes} días`)
+            .filter(ventanaAbierta)
+            .map((e) => `${e.nombre}: ${etiquetaVentana(e.diasRestantes)}`)
             .join(' · ')}
         </span>
       )}

@@ -219,6 +219,32 @@ create table resultado_criterio (
 );
 create index resultado_criterio_review_idx on resultado_criterio (workspace_id, review_id);
 
+-- ── «La ventana sigue abierta», en UN solo sitio ──
+-- Tres predicados de la base (apertura del review, guard de completación, estado de
+-- cadencia de la proyección) y su espejo del cliente deciden exactamente lo mismo. Escrito
+-- una vez por sitio, basta que una copia use `>` donde otra usa `>=` para que el sistema
+-- se contradiga consigo mismo. Mismo argumento que con `es_rol_cliente` y que con no
+-- copiar `ventana_dias`: dos copias son dos verdades.
+--
+-- Y la verdad es que el ÚLTIMO DÍA de la ventana es un día MEDIDO: `snapshot_insert`
+-- acepta `fecha <= ventana_inicio + ventana_dias`, con los dos extremos inclusivos porque
+-- el día que abre y el que cierra la ventana se miden. Mientras `current_date` sea ese
+-- día, el dato de la jornada todavía puede llegar y la ventana NO está cerrada — de ahí
+-- el `>=`. Con `>` el sistema se contradecía: el post mortem se podía abrir y completar a
+-- primera hora del último día, cerrando el reto de forma irreversible (SYS-08), y los
+-- snapshots legítimos de esa misma tarde se quedaban sin sitio. El contrato firmado los
+-- admitía; el sistema ya no.
+--
+-- Sin ventana declarada tampoco está cerrada: no hay nada que dar por terminado, y esa es
+-- la rama que impide abrir el review sobre un registry al que le falta la ventana.
+--
+-- STABLE y no IMMUTABLE porque depende de `current_date`. No lee ninguna tabla, así que
+-- —como `es_rol_cliente`— no puede volverse oráculo y no necesita el tratamiento
+-- anti-oráculo de los helpers SECURITY DEFINER.
+create function ventana_de_medicion_abierta(p_inicio date, p_dias integer) returns boolean
+language sql stable parallel safe as
+$$ select p_inicio is null or p_dias is null or p_inicio + p_dias >= current_date $$;
+
 -- ── RLS ──
 -- Lectura: TODO miembro (ver el tablero completo es el punto del portal; el stakeholder
 -- lee el impacto aunque no escriba nada). Escrituras:
@@ -383,8 +409,7 @@ create policy review_insert on outcome_review
       join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
       join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
       where r.reto_id = outcome_review.reto_id and r.workspace_id = outcome_review.workspace_id
-        and (e.ventana_inicio is null or c.ventana_dias is null
-             or e.ventana_inicio + c.ventana_dias > current_date))
+        and ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias))
   );
 create policy review_completar on outcome_review
   for update
@@ -604,14 +629,18 @@ begin
       raise exception 'no se puede firmar: el propietario del dato tiene que ser una persona del cliente (RF-07.1): %', faltan;
     end if;
     -- El post-mortem se prevé DESPUÉS del cierre de la ventana: fecharlo antes sería
-    -- comprometerse a un veredicto sobre datos que aún no existen.
+    -- comprometerse a un veredicto sobre datos que aún no existen. «Después» es ESTRICTO,
+    -- por la misma razón que el review no se abre el último día: ese día todavía se mide,
+    -- así que un post-mortem fechado ahí promete para hoy un veredicto que el sistema no
+    -- dejará dictar hasta mañana. El `<=` es el mismo `>=` de la ventana, visto del otro
+    -- lado del corte.
     select string_agg(e.nombre, ', ' order by e.nombre) into faltan
     from entrada_kpi e
     join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
     where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and e.fecha_post_mortem < e.ventana_inicio + c.ventana_dias;
+      and e.fecha_post_mortem <= e.ventana_inicio + c.ventana_dias;
     if faltan is not null then
-      raise exception 'no se puede firmar: post-mortem antes del cierre de la ventana: %', faltan;
+      raise exception 'no se puede firmar: el post-mortem se prevé después del cierre de la ventana: %', faltan;
     end if;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'MetricRegistryFirmado',
@@ -646,8 +675,7 @@ begin
       join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
       join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
       where r.reto_id = new.reto_id and r.workspace_id = new.workspace_id
-        and (e.ventana_inicio is null or c.ventana_dias is null
-             or e.ventana_inicio + c.ventana_dias > current_date)) then
+        and ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias)) then
       raise exception 'el outcome review se habilita al cerrar la ventana del último criterio (RF-07.7)';
     end if;
     -- Resultado por criterio, sin elegir cuáles contar (RF-07.8).
@@ -880,11 +908,26 @@ grant select, insert on outcome_review, resultado_criterio to designio_app;
 -- de escritura, la promesa «un update directo no retro ni post-data la firma» es
 -- estructural en vez de depender de que el trigger siga ahí.
 grant update (estado, firmado_por) on metric_registry to designio_app;
--- La entrada se corrige entera mientras el registry es borrador, salvo su pertenencia
--- (registry y criterio son la identidad del compromiso, no un campo editable).
-grant update (nombre, definicion, fuente, dimensiones, propietario_miembro_id, frecuencia,
-  dashboard_url, linea_base_valor, linea_base_fecha, ventana_inicio, fecha_post_mortem)
-  on entrada_kpi to designio_app;
+-- La entrada se corrige ENTERA mientras el registry es borrador —el criterio al que
+-- responde incluido—; lo único fuera del grant es `registry_id`, que sí es identidad: la
+-- entrada pertenece a ESE contrato de medición y moverla a otro sería otra entrada.
+--
+-- El criterio, en cambio, es un ATRIBUTO del compromiso, como el dueño del dato o la
+-- ventana. Dejarlo fuera del grant lo volvía inmutable de hecho —no hay política ni grant
+-- de DELETE en esta tabla—, así que elegir el criterio equivocado al crear el KPI no tenía
+-- reparación: la única salida era firmar el contrato con un KPI que mide una promesa que
+-- nadie hizo. Y el error es especialmente caro porque el criterio no es una etiqueta: de
+-- él sale `ventana_dias`, o sea la VENTANA que gobierna qué snapshots se aceptan.
+--
+-- Que sea seguro no es una esperanza: el WITH CHECK de `entrada_update` ya revalidaba en
+-- cada escritura que el criterio fuera del MISMO reto del registry —esa comprobación
+-- estaba ahí escrita para un `criterio_id` mutable y era letra muerta sin este grant—, y
+-- mientras el registry es borrador la entrada NO puede tener snapshots (`snapshot_insert`
+-- exige el registry firmado), así que cambiar el criterio no mueve el suelo bajo ninguna
+-- serie. Firmar es lo que congela; hasta entonces el borrador se corrige.
+grant update (nombre, definicion, fuente, dimensiones, criterio_id, propietario_miembro_id,
+  frecuencia, dashboard_url, linea_base_valor, linea_base_fecha, ventana_inicio,
+  fecha_post_mortem) on entrada_kpi to designio_app;
 -- snapshot SIN update ni delete: append-only por ausencia de política Y de grant (SYS-23).
 grant update (estado, veredicto, contribucion, factores_externos, hipotesis_abiertas,
   aprendizajes, diseno_experimental_suficiente, diseno_experimental_justificacion,

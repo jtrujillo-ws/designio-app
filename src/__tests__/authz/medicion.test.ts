@@ -23,6 +23,7 @@ import {
   registrarSnapshot,
   seguimientoDeImpacto,
 } from '@/lib/medicion/medicion.servicio';
+import { ventanasCerradas } from '@/lib/medicion/medicion.schemas';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
 import { describeAuthz } from './helpers';
 
@@ -48,9 +49,18 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
   let registryId = '';
   let criterioAbandonoId = '';
   let criterioReintentosId = '';
+  let criterioAjenoId = '';
   let entradaAbandonoId = '';
   let entradaReintentosId = '';
   let reviewId = '';
+
+  /** Fecha calendárica relativa a la de la BASE. El test del último día de la ventana
+   * compara días EXACTOS (cero restantes), y ahí un desfase de huso entre el proceso y el
+   * servidor movería el corte justo en el caso que se quiere fijar. */
+  async function fechaDeBase(dias: number): Promise<string> {
+    const [f] = await sqlAdmin()`select (current_date + ${dias}::int)::text as f`;
+    return f!.f as string;
+  }
 
   /** Fecha CALENDÁRICA relativa a hoy (AAAA-MM-DD): los márgenes de los tests son de
    * varios días, así que un desfase de huso entre el proceso y la base no los mueve. */
@@ -247,11 +257,12 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       ventanaDias: 30,
       fechaPostMortem: null,
     });
+    criterioAjenoId = criterioAjeno.criterioId;
     await expect(
       agregarEntrada(leadId, {
         workspaceId: ws,
         registryId,
-        criterioId: criterioAjeno.criterioId,
+        criterioId: criterioAjenoId,
         nombre: 'KPI colado',
         definicion: '',
         fuente: '',
@@ -338,6 +349,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await editarEntrada(leadId, {
       workspaceId: ws,
       entradaId: entradaReintentosId,
+      criterioId: criterioReintentosId,
       nombre: 'Reintentos medios',
       definicion: 'Media de intentos por solicitud completada',
       fuente: 'Log de verificación',
@@ -351,11 +363,34 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       fechaPostMortem: fecha(10),
     });
     await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
-      /post-mortem antes del cierre de la ventana/,
+      /el post-mortem se prevé después del cierre de la ventana/,
+    );
+    // Y «después» es ESTRICTO: fecharlo EL DÍA del cierre promete para hoy un veredicto
+    // que el sistema no dejará dictar hasta mañana, porque ese día todavía se mide. La
+    // ventana de este criterio es [-5, +55] (60 días), así que el 55 tampoco vale.
+    await editarEntrada(leadId, {
+      workspaceId: ws,
+      entradaId: entradaReintentosId,
+      criterioId: criterioReintentosId,
+      nombre: 'Reintentos medios',
+      definicion: 'Media de intentos por solicitud completada',
+      fuente: 'Log de verificación',
+      dimensiones: '',
+      propietarioMiembroId: sponsorMiembroId,
+      frecuencia: 'semanal',
+      dashboardUrl: '',
+      lineaBaseValor: '2.4',
+      lineaBaseFecha: fecha(-120),
+      ventanaInicio: fecha(-5),
+      fechaPostMortem: fecha(55),
+    });
+    await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
+      /el post-mortem se prevé después del cierre de la ventana/,
     );
     await editarEntrada(leadId, {
       workspaceId: ws,
       entradaId: entradaReintentosId,
+      criterioId: criterioReintentosId,
       nombre: 'Reintentos medios',
       definicion: 'Media de intentos por solicitud completada',
       fuente: 'Log de verificación',
@@ -407,6 +442,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       editarEntrada(leadId, {
         workspaceId: ws,
         entradaId: entradaReintentosId,
+        criterioId: criterioReintentosId,
         nombre: 'Reintentos medios',
         definicion: 'Media de intentos por solicitud completada',
         fuente: 'Log de verificación',
@@ -437,6 +473,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await editarEntrada(leadId, {
       workspaceId: ws,
       entradaId: entradaReintentosId,
+      criterioId: criterioReintentosId,
       nombre: 'Reintentos medios',
       definicion: 'Media de intentos por solicitud completada',
       fuente: 'Log de verificación',
@@ -461,6 +498,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await editarEntrada(leadId, {
       workspaceId: ws,
       entradaId: entradaReintentosId,
+      criterioId: criterioReintentosId,
       nombre: 'Reintentos medios',
       definicion: 'Media de intentos por solicitud completada',
       fuente: 'Log de verificación',
@@ -473,6 +511,50 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       ventanaInicio: fecha(-5),
       fechaPostMortem: fecha(90),
     });
+  });
+
+  it('en borrador, el criterio del KPI se CORRIGE: es el error fácil y no hay borrado', async () => {
+    // Elegir el criterio equivocado al crear el KPI no tenía reparación: el selector lo
+    // bloqueaba al editar, `criterio_id` estaba fuera del grant de update y `entrada_kpi`
+    // no tiene política ni grant de DELETE. La única salida era firmar el contrato con un
+    // KPI que mide una promesa que nadie hizo — y no es una etiqueta: del criterio sale
+    // `ventana_dias`, o sea la VENTANA que decide qué snapshots se aceptan.
+    const campos = {
+      workspaceId: ws,
+      entradaId: entradaReintentosId,
+      nombre: 'Reintentos medios',
+      definicion: 'Media de intentos por solicitud completada',
+      fuente: 'Log de verificación',
+      dimensiones: '',
+      propietarioMiembroId: sponsorMiembroId,
+      frecuencia: 'semanal' as const,
+      dashboardUrl: '',
+      lineaBaseValor: '2.4',
+      lineaBaseFecha: fecha(-120),
+      ventanaInicio: fecha(-5),
+      fechaPostMortem: fecha(90),
+    };
+    const ventanaDeReintentos = async () =>
+      (await seguimientoDeImpacto(leadId, ws, proyectoId))!.entradas.find(
+        (e) => e.id === entradaReintentosId,
+      )!;
+
+    await editarEntrada(leadId, { ...campos, criterioId: criterioAbandonoId });
+    const reapuntada = await ventanaDeReintentos();
+    expect(reapuntada.criterioId).toBe(criterioAbandonoId);
+    // Y con el criterio se mueve la ventana, que es lo que hacía cara la equivocación.
+    expect(reapuntada.criterioVentanaDias).toBe(30);
+
+    // Lo que el WITH CHECK sigue impidiendo —y que ahora deja de ser letra muerta, porque
+    // por fin hay un `criterio_id` que puede moverse—: apuntar al criterio de OTRO reto.
+    await expect(
+      editarEntrada(leadId, { ...campos, criterioId: criterioAjenoId }),
+    ).rejects.toThrow(/no es de este reto/);
+
+    await editarEntrada(leadId, { ...campos, criterioId: criterioReintentosId });
+    const devuelta = await ventanaDeReintentos();
+    expect(devuelta.criterioId).toBe(criterioReintentosId);
+    expect(devuelta.criterioVentanaDias).toBe(60);
   });
 
   it('G6 no se aprueba sin registry firmado; firmado queda congelado y deja rastro', async () => {
@@ -525,6 +607,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       editarEntrada(leadId, {
         workspaceId: ws,
         entradaId: entradaAbandonoId,
+        criterioId: criterioAbandonoId,
         nombre: 'Abandono % (retocado)',
         definicion: 'otra cosa',
         fuente: 'otra fuente',
@@ -538,6 +621,14 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         fechaPostMortem: fecha(40),
       }),
     ).rejects.toThrow(/firmado/);
+    // El criterio, que en borrador SÍ se corregía, queda congelado con lo demás: el USING
+    // filtra la fila y el UPDATE directo no toca ninguna (la forma silenciosa de decir no).
+    const reapuntada = await conUsuario(leadId, (tx) => tx`update entrada_kpi
+      set criterio_id = ${criterioAbandonoId} where id = ${entradaReintentosId}`);
+    expect(reapuntada.count).toBe(0);
+    const [sigueEnSuCriterio] = await conUsuario(leadId, (tx) => tx`select criterio_id
+      from entrada_kpi where id = ${entradaReintentosId}`);
+    expect(sigueEnSuCriterio!.criterio_id).toBe(criterioReintentosId);
     // Ni siquiera el sponsor que lo firmó lo re-firma o lo devuelve a borrador.
     await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
       /ya está firmado/,
@@ -758,6 +849,73 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect((evento!.payload as { insertados: number }).insertados).toBe(2);
   });
 
+  it('el ÚLTIMO día de la ventana todavía mide: el review no se abre y el snapshot entra', async () => {
+    // Los dos extremos de la ventana son inclusivos —el día que abre y el que cierra son
+    // días medidos— y `snapshot_insert` lo respeta. El predicado del review usaba `>`, así
+    // que daba la ventana por cerrada ESE MISMO día: el lead abría y completaba el post
+    // mortem a primera hora, cerraba el reto de forma irreversible (SYS-08) y el snapshot
+    // legítimo de esa tarde se quedaba sin sitio. El contrato firmado lo admitía y el
+    // sistema ya no. Aquí se fija el corte por los dos lados.
+    const admin = sqlAdmin();
+    const [previas] = await admin`select
+      (select ventana_inicio::text from entrada_kpi where id = ${entradaAbandonoId}) as abandono,
+      (select ventana_inicio::text from entrada_kpi where id = ${entradaReintentosId}) as reintentos`;
+    // Se simula que HOY es el último día de AMBAS ventanas (30 y 60 días de criterio). Las
+    // entradas están congeladas por la firma, así que solo el rol admin las mueve.
+    await admin`update entrada_kpi set ventana_inicio = ${await fechaDeBase(-30)}
+      where id = ${entradaAbandonoId}`;
+    await admin`update entrada_kpi set ventana_inicio = ${await fechaDeBase(-60)}
+      where id = ${entradaReintentosId}`;
+    let tardio = '';
+    try {
+      const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
+      expect(seg!.entradas.map((e) => e.diasRestantes)).toEqual([0, 0]);
+      // El espejo del cliente no da la ventana por cerrada…
+      expect(ventanasCerradas(seg!.entradas)).toBe(false);
+      // …y la base tampoco, que es quien manda.
+      await expect(abrirOutcomeReview(leadId, { workspaceId: ws, retoId })).rejects.toThrow(
+        /se habilita al cerrar la ventana del último criterio/,
+      );
+      // El diagnóstico lo dice con la palabra del corte, en vez de «faltan 0 días».
+      await expect(abrirOutcomeReview(leadId, { workspaceId: ws, retoId })).rejects.toThrow(
+        /cierra hoy/,
+      );
+
+      // La otra mitad: el dato de HOY sí entra — es exactamente el que un review
+      // prematuro habría dejado fuera para siempre.
+      const hoy = await registrarSnapshot(sponsorId, {
+        workspaceId: ws,
+        entradaId: entradaAbandonoId,
+        valor: '47',
+        fecha: await fechaDeBase(0),
+        nota: 'último día de la ventana',
+      });
+      tardio = hoy.snapshotId;
+      // Y un día después la puerta se cierra por los dos lados a la vez.
+      await admin`update entrada_kpi set ventana_inicio = ${await fechaDeBase(-31)}
+        where id = ${entradaAbandonoId}`;
+      await expect(
+        registrarSnapshot(sponsorId, {
+          workspaceId: ws,
+          entradaId: entradaAbandonoId,
+          valor: '46',
+          fecha: await fechaDeBase(0),
+          nota: '',
+        }),
+      ).rejects.toThrow(/posterior a la ventana firmada/);
+    } finally {
+      // Fixture: se deshace el viaje en el tiempo y el snapshot que solo existía para
+      // probar el corte, de modo que la serie que construyeron los tests anteriores siga
+      // siendo la que leen los siguientes. Solo el rol admin puede borrarlo: para el rol
+      // de aplicación los snapshots son append-only (SYS-23), como comprueba su test.
+      if (tardio) await admin`delete from snapshot where id = ${tardio}`;
+      await admin`update entrada_kpi set ventana_inicio = ${previas!.abandono as string}
+        where id = ${entradaAbandonoId}`;
+      await admin`update entrada_kpi set ventana_inicio = ${previas!.reintentos as string}
+        where id = ${entradaReintentosId}`;
+    }
+  });
+
   it('el outcome review NO se habilita antes de cerrar la ventana del último criterio', async () => {
     await expect(abrirOutcomeReview(leadId, { workspaceId: ws, retoId })).rejects.toThrow(
       /se habilita al cerrar la ventana del último criterio/,
@@ -924,11 +1082,19 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // de inmediato en vez de esperar a que se suelte.
     const admin = sqlAdmin();
     let soltado = false;
+    let avisarTomado = () => {};
+    const tomado = new Promise<void>((resolve) => {
+      avisarTomado = resolve;
+    });
     const reteniendo = admin.begin(async (tx) => {
       await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+      avisarTomado();
       await new Promise((resolve) => setTimeout(resolve, 300));
       soltado = true;
     });
+    // Se espera a que el candado esté TOMADO antes de lanzar el contendiente: si no, lo
+    // que se mediría es quién abre antes su conexión, no quién espera a quién.
+    await tomado;
     const esperoAlCandado = registrarResultado(leadId, {
       workspaceId: ws,
       reviewId,

@@ -22,6 +22,7 @@ import {
   cadenaDelRelease,
   conciliacionDeDesignVersion,
   constatarReleaseDesplegado,
+  declararSuperaADeDesignVersion,
   designVersionDelWorkspace,
   enlazarJourneyDeDesignVersion,
   planificarReleaseDeDesignVersion,
@@ -187,6 +188,15 @@ function PantallaDesignVersion() {
 
         {enBorrador && esCurador && (
           <EnlazarJourneyToBe
+            workspaceId={datos.workspaceId}
+            dv={dv}
+            onError={setError}
+            onHecho={refrescar}
+          />
+        )}
+
+        {enBorrador && esCurador && (
+          <DeclararSucesion
             workspaceId={datos.workspaceId}
             dv={dv}
             onError={setError}
@@ -387,6 +397,79 @@ function EnlazarJourneyToBe({
           en la pantalla de journeys.
         </span>
       )}
+    </Card>
+  );
+}
+
+/**
+ * A qué versión aprobada sucede este borrador (SYS-05). Mismo camino que el enlace del
+ * journey y por el mismo motivo: la sucesión se declara al abrirlo, pero el servicio puede
+ * aprobar otra versión mientras tanto —o la declarada puede perder su propia carrera de
+ * sucesión, que el modelo admite expresamente—, y sin poder reapuntarla el borrador queda
+ * inaprobable y, como no hay DELETE, muerto en la lista.
+ */
+function DeclararSucesion({
+  workspaceId,
+  dv,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  dv: DesignVersionCompleta;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [superaA, setSuperaA] = useState(dv.superaA?.id ?? '');
+  const [ocupado, setOcupado] = useState(false);
+  // Sin ninguna aprobada del servicio no hay sucesión que declarar: la primera versión no
+  // supera a nada, y el guard rechaza que diga lo contrario.
+  if (dv.superables.length === 0 && dv.superaA === null) return null;
+
+  return (
+    <Card style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <span style={micro}>A qué versión sucede</span>
+      <span style={apunte}>
+        Un servicio tiene como mucho una design version aprobada (SYS-05): para aprobar
+        esta, tiene que declarar a cuál reemplaza. Se puede corregir mientras siga en
+        borrador.
+      </span>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <Select
+          value={superaA}
+          onChange={(e) => setSuperaA(e.target.value)}
+          style={{ flex: '1 1 280px' }}
+        >
+          <option value="">No supera a ninguna (primera del servicio)</option>
+          {dv.superables.map((v) => (
+            <option key={v.id} value={v.id}>
+              {v.codigo} · {v.titulo}
+            </option>
+          ))}
+        </Select>
+        <Button
+          size="sm"
+          disabled={ocupado || superaA === (dv.superaA?.id ?? '')}
+          onClick={async () => {
+            setOcupado(true);
+            onError(null);
+            try {
+              const r = await declararSuperaADeDesignVersion({
+                data: {
+                  workspaceId,
+                  designVersionId: dv.id,
+                  superaA: superaA === '' ? null : superaA,
+                },
+              });
+              if (r.ok) await onHecho();
+              else onError(r.error);
+            } finally {
+              setOcupado(false);
+            }
+          }}
+        >
+          Declarar
+        </Button>
+      </div>
     </Card>
   );
 }

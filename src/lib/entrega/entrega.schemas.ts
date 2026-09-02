@@ -153,6 +153,16 @@ export const EnlazarJourneySchema = z.object({
 });
 export type EnlazarJourney = z.infer<typeof EnlazarJourneySchema>;
 
+/** Declarar (o corregir) a qué versión aprobada sucede este borrador. Admite null: si el
+ * servicio no tiene ninguna aprobada, «no supera a ninguna» es la respuesta correcta y
+ * tiene que poder volver a serlo tras un error. */
+export const DeclararSuperaASchema = z.object({
+  workspaceId: z.string().uuid(),
+  designVersionId: z.string().uuid(),
+  superaA: z.string().uuid().nullable(),
+});
+export type DeclararSuperaA = z.infer<typeof DeclararSuperaASchema>;
+
 export const AprobarDesignVersionSchema = z.object({
   workspaceId: z.string().uuid(),
   designVersionId: z.string().uuid(),
@@ -338,6 +348,10 @@ export type DesignVersionCompleta = {
   /** Los to-be del servicio que este borrador puede enlazar (mismo predicado que el
    * guard): si nació sin journey, es por aquí por donde se le pone. */
   journeysEnlazables: { id: string; nombre: string }[];
+  /** Las versiones aprobadas del MISMO servicio a las que este borrador puede suceder.
+   * Como mucho hay una (SYS-05), pero la lista deja que la pantalla ofrezca exactamente
+   * lo que el guard acepta en vez de suponerlo. */
+  superables: { id: string; codigo: string; titulo: string }[];
   decisionesDelProyecto: { id: string; titulo: string }[];
   insightsValidados: { id: string; titulo: string }[];
   vigente: EstadoEfectivoVigente;

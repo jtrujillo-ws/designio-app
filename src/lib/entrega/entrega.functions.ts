@@ -10,6 +10,7 @@ import {
   CrearDesignVersionSchema,
   DesasignarElementoSchema,
   DesignVersionInputSchema,
+  DeclararSuperaASchema,
   DesplegarReleaseSchema,
   EditarElementoSchema,
   EnlazarJourneySchema,
@@ -25,6 +26,7 @@ import {
   cadenaDeRelease,
   constatarEffectiveState,
   crearDesignVersion,
+  declararSuperaA,
   designVersionCompleta,
   designVersionsDelWorkspace,
   desasignarElemento,
@@ -169,6 +171,23 @@ export const enlazarJourneyDeDesignVersion = createServerFn({ method: 'POST' })
     if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
     try {
       await enlazarJourney(actorId, data);
+      return { ok: true as const };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+/** La sucesión declarada también se corrige mientras el borrador lo sea: si no, perder la
+ * carrera de sucesión dejaba la versión inaprobable para siempre. */
+export const declararSuperaADeDesignVersion = createServerFn({ method: 'POST' })
+  .inputValidator(DeclararSuperaASchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await declararSuperaA(actorId, data);
       return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);

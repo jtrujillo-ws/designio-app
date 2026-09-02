@@ -8,6 +8,7 @@ import type {
   AsignarElemento,
   Constatar,
   CrearDesignVersion,
+  DeclararSuperaA,
   DesignVersionCompleta,
   DesplegarRelease,
   EditarElemento,
@@ -89,12 +90,18 @@ async function bloquearServicio(tx: TransactionSql, servicioId: string): Promise
  *
  * Por qué hace falta en los dos lados: aprobar y editar un elemento escriben filas
  * DISTINTAS —design_version y elemento_cambio—, así que el candado de fila que Postgres
- * pone solo protege a quien toca la misma. `enlazarJourney`, por ejemplo, no necesita
- * nada de esto: escribe la propia fila de la design version y el candado de fila lo
- * serializa contra la aprobación por construcción. El elemento no. Y la política del
- * elemento («su design version está en borrador») es un predicado sobre un snapshot: bajo
- * READ COMMITTED la aprobación aún sin commitear no se ve, las dos transacciones pasan sus
- * chequeos y la versión aprobada acaba con un cambio posterior a su congelación.
+ * pone solo protege a quien toca la misma. Y la política del elemento («su design version
+ * está en borrador») es un predicado sobre un snapshot: bajo READ COMMITTED la aprobación
+ * aún sin commitear no se ve, las dos transacciones pasan sus chequeos y la versión
+ * aprobada acaba con un cambio posterior a su congelación.
+ *
+ * Lo toman las CINCO escrituras que deciden sobre el contenido de una design version:
+ * aprobar, agregar/editar/borrar elemento, enlazar el journey y declarar la sucesión. Las
+ * tres últimas escriben la propia fila, así que contra la aprobación les bastaría el
+ * candado de fila — pero un candado de fila y uno consultivo sobre el mismo objeto NO se
+ * ven entre sí, y su otro contendiente (las mutaciones de elementos) se serializa por el
+ * consultivo. Basta con que un camino use un candado distinto para que la serialización
+ * no exista: el nombre tiene que ser el mismo en todos los lados.
  *
  * Tampoco vale `select … for update` sobre la design version desde el lado del elemento:
  * bajo RLS ese bloqueo exige además pasar el USING de alguna política de UPDATE de
@@ -175,6 +182,15 @@ export async function crearDesignVersion(
 export async function enlazarJourney(actorId: string, entrada: EnlazarJourney): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // Contra la APROBACIÓN bastaría el candado de fila —las dos escriben esta misma fila—,
+    // pero ese no es el único contendiente: las mutaciones de elementos escriben otra
+    // tabla y se serializan por el candado consultivo de la design version. Un candado de
+    // fila y uno consultivo sobre el mismo objeto no se ven entre sí, así que sin esto
+    // reenlazar y enlazar un nodo podían commitear a la vez: el guard del journey no ve el
+    // elemento aún sin commitear y el guard del elemento sigue viendo el journey anterior,
+    // y la versión queda con un elemento colgando de un nodo fuera de su grafo — que la
+    // aprobación ya no revalida elemento por elemento.
+    await bloquearDesignVersion(tx, entrada.designVersionId);
     let filas;
     try {
       filas = await tx`
@@ -188,6 +204,38 @@ export async function enlazarJourney(actorId: string, entrada: EnlazarJourney): 
     if (filas!.count === 0) {
       throw new ErrorEntrega(
         'La design version no existe en este workspace, o no puedes enlazar su journey',
+      );
+    }
+  });
+}
+
+/**
+ * Declarar a qué versión aprobada sucede un BORRADOR (SYS-05). Mismo mecanismo y mismos
+ * motivos que `enlazarJourney`: la sucesión se declara al abrir el borrador, pero el
+ * servicio puede aprobar otra versión mientras tanto, o la declarada puede perder su
+ * propia carrera —el índice parcial de sucesión admite expresamente que dos borradores
+ * compitan y uno se quede en el camino—. Sin poder reapuntarla, el que pierde queda
+ * inaprobable e imborrable.
+ *
+ * El candado es el de la design version por la misma razón que en el enlace del journey:
+ * la aprobación lee `supera_a` para marcar superada a la anterior, y esa lectura no puede
+ * cambiar bajo sus pies.
+ */
+export async function declararSuperaA(actorId: string, entrada: DeclararSuperaA): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    await bloquearDesignVersion(tx, entrada.designVersionId);
+    let filas;
+    try {
+      filas = await tx`
+        update design_version set supera_a = ${entrada.superaA}
+        where id = ${entrada.designVersionId} and workspace_id = ${entrada.workspaceId}`;
+    } catch (e) {
+      comoErrorDeDominio(e, 'Solo los curadores declaran la sucesión de un borrador');
+    }
+    if (filas!.count === 0) {
+      throw new ErrorEntrega(
+        'La design version no existe en este workspace, o no puedes declarar su sucesión',
       );
     }
   });
@@ -733,6 +781,15 @@ export async function designVersionCompleta(
             and j2.tipo = 'to-be'
             and (j2.proyecto_id is null or j2.proyecto_id = dv.proyecto_id)
         ), '[]'::jsonb) as journeys_enlazables,
+        -- Las versiones a las que este borrador puede suceder: mismo predicado que el
+        -- guard de anclaje (aprobadas, del MISMO servicio, y no ella misma).
+        coalesce((
+          select jsonb_agg(jsonb_build_object('id', a2.id, 'codigo', a2.codigo,
+            'titulo', a2.titulo) order by a2.codigo)
+          from design_version a2
+          where a2.workspace_id = dv.workspace_id and a2.servicio_id = dv.servicio_id
+            and a2.estado = 'aprobada' and a2.id <> dv.id
+        ), '[]'::jsonb) as superables,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo) order by d.decidido_en)
           from decision d
@@ -831,6 +888,7 @@ export async function designVersionCompleta(
       releases: fila.releases as DesignVersionCompleta['releases'],
       nodosDelJourney: fila.nodos_del_journey as DesignVersionCompleta['nodosDelJourney'],
       journeysEnlazables: fila.journeys_enlazables as DesignVersionCompleta['journeysEnlazables'],
+      superables: fila.superables as DesignVersionCompleta['superables'],
       decisionesDelProyecto:
         fila.decisiones_del_proyecto as DesignVersionCompleta['decisionesDelProyecto'],
       insightsValidados: fila.insights_validados as DesignVersionCompleta['insightsValidados'],

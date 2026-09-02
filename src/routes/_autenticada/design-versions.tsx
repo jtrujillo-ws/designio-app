@@ -338,8 +338,21 @@ function FormularioDesignVersion({
             no aparece, enlázalo después desde la design version.
           </span>
         )}
-        <Select value={superaA} onChange={(e) => setSuperaA(e.target.value)} disabled={servicioId === ''}>
-          <option value="">No supera a ninguna (primera del servicio)</option>
+        <Select
+          value={superaA}
+          onChange={(e) => setSuperaA(e.target.value)}
+          disabled={servicioId === ''}
+          required={superables.length > 0}
+        >
+          {/* Si el servicio ya tiene una versión aprobada, «no supera a ninguna» no es una
+              opción: SYS-05 admite como mucho una aprobada, así que la nueva TIENE que
+              declarar a cuál reemplaza. Ofrecerlo creaba un borrador que solo se descubría
+              inaprobable al intentar aprobarlo. */}
+          {superables.length === 0 ? (
+            <option value="">No supera a ninguna (primera del servicio)</option>
+          ) : (
+            <option value="">Supera a… (obligatorio: el servicio ya tiene una aprobada)</option>
+          )}
           {superables.map((v) => (
             <option key={v.id} value={v.id}>
               Supera a {v.codigo} · {v.titulo}
@@ -368,7 +381,13 @@ function FormularioDesignVersion({
           <Button
             size="sm"
             type="submit"
-            disabled={ocupado || servicioId === '' || proyectoId === '' || titulo.trim() === ''}
+            disabled={
+              ocupado ||
+              servicioId === '' ||
+              proyectoId === '' ||
+              titulo.trim() === '' ||
+              (superables.length > 0 && superaA === '')
+            }
           >
             Crear borrador
           </Button>

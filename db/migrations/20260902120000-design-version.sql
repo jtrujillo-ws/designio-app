@@ -636,11 +636,21 @@ begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
-  if not exists (
-    select 1 from proyecto p
-    where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
-      and reto_aplica_a_servicio(p.reto_id, p.workspace_id, new.servicio_id)) then
-    raise exception 'el proyecto de la design version cuelga de un reto que no ancla este servicio ni lo declara afectado';
+  if tg_op = 'UPDATE' then
+    -- Sobre una versión que ya no es borrador manda el guard de transición, que la declara
+    -- inmutable; y si `supera_a` no se mueve no hay nada nuevo que validar.
+    if old.estado <> 'borrador' or new.supera_a is not distinct from old.supera_a then
+      return new;
+    end if;
+  else
+    -- Solo en el alta: ni `proyecto_id` ni `servicio_id` están en el grant de columna, así
+    -- que después de nacer no pueden moverse y revalidarlos sería trabajo muerto.
+    if not exists (
+      select 1 from proyecto p
+      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+        and reto_aplica_a_servicio(p.reto_id, p.workspace_id, new.servicio_id)) then
+      raise exception 'el proyecto de la design version cuelga de un reto que no ancla este servicio ni lo declara afectado';
+    end if;
   end if;
   if new.supera_a is not null and not exists (
     select 1 from design_version dv
@@ -648,10 +658,20 @@ begin
       and dv.servicio_id = new.servicio_id) then
     raise exception 'una design version solo supera a otra del MISMO servicio (SYS-05)';
   end if;
+  -- Y al revés: si el servicio YA tiene una versión aprobada, la nueva tiene que declarar
+  -- a cuál supera. Sin esto el borrador nacía sin `supera_a`, y la aprobación chocaba
+  -- mucho más tarde contra el índice único parcial de SYS-05 — con la versión ya escrita y
+  -- sin forma de corregirla desde la app hasta que `supera_a` entró en el grant.
+  if new.supera_a is null and exists (
+    select 1 from design_version dv
+    where dv.workspace_id = new.workspace_id and dv.servicio_id = new.servicio_id
+      and dv.estado = 'aprobada') then
+    raise exception 'este servicio ya tiene una design version aprobada: la nueva debe declarar a cuál supera (SYS-05)';
+  end if;
   return new;
 end $$;
 create trigger design_version_anclaje
-  before insert on design_version
+  before insert or update on design_version
   for each row execute function design_version_anclaje_guard();
 revoke execute on function design_version_anclaje_guard() from public;
 
@@ -1023,7 +1043,19 @@ revoke execute on function constatacion_alcance_guard() from public;
 -- ══ G7 no pasa con la conciliación incompleta (RF-06.7, criterio de aceptación 4) ══
 -- El guard de suficiencia se REESCRIBE ENTERO (create or replace no fusiona): esta es la
 -- versión vigente —checklist sin pendientes y no vacío, ítems cumplidos con decisiones
--- vigentes, orden de gates, criterios de G0 y arquetipos de G2— más la rama de G7.
+-- vigentes, orden de gates, criterios de G0 y arquetipos de G2— más las ramas de G6 y G7,
+-- que son las dos que SPEC-06 aporta (el plan y la conciliación).
+--
+-- Un mismo número de gate admite reglas de specs distintas conviviendo: G6 tendrá también
+-- la firma del Metric Registry (SPEC-07/SYS-22) además de esta cobertura de releases. Al
+-- integrar no se busca «la regla de G6» en singular —se encuentra una y se pierden las
+-- otras—: se copia el cuerpo VIVO entero y se le añade lo propio encima.
+--
+-- Y lo que NO se copia: los EFECTOS de aprobar un gate que dependen de que el gate ya esté
+-- escrito no viven aquí. Este guard es BEFORE, así que dentro de él la fila del gate aún
+-- no existe y una precondición que la consulte se rechazaría a sí misma; esos efectos van
+-- en triggers AFTER propios sobre gate_instancia. Si aparecen en una versión antigua de
+-- este cuerpo, su sitio ya no es este.
 --
 -- «Vigente» significa vigente EN `agents`, no en la rama propia, y esa es la trampa: las
 -- migraciones se aplican por nombre de fichero, así que otra rama con un número MENOR que
@@ -1094,6 +1126,37 @@ begin
       where a.reto_id = p.reto_id and a.workspace_id = new.workspace_id
         and a.estado = 'hipotesis') then
       raise exception 'no se puede aprobar G2: hay arquetipos sin confirmar ni refutar (RF-04.11)';
+    end if;
+    -- G6 firma el PLAN (RF-06.4): «cada elemento de la design version queda asignado a
+    -- exactamente un release con dueño y fecha». Que el ítem del checklist esté cumplido
+    -- no lo demuestra — un ítem cumplido registra un objeto citado o un N/A razonado, y
+    -- no deriva nada de release_elemento—, así que sin esto G6 certificaba un plan que
+    -- podía no existir. El «exactamente uno» ya lo garantiza la PK de release_elemento; lo
+    -- que faltaba era el «cada». Dueño y fecha no hay que comprobarlos: release.responsable
+    -- y fecha_objetivo son not null con CHECK, así que estar asignado ya los implica.
+    if new.numero = 6 then
+      -- El gemelo vacuo, igual que en G7: sin design version aprobada con elementos no hay
+      -- plan que firmar, y el «no exists elemento sin release» de abajo sería vacuamente
+      -- cierto por no haber ningún elemento que mirar.
+      if not exists (
+        select 1 from design_version dv
+        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
+          and dv.estado = 'aprobada'
+          and exists (select 1 from elemento_cambio ec
+            where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id)
+      ) then
+        raise exception 'no se puede aprobar G6: el proyecto no tiene ninguna design version aprobada con elementos que planificar (RF-06.4)';
+      end if;
+      if exists (
+        select 1 from elemento_cambio ec
+        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
+          and dv.estado = 'aprobada'
+          and not exists (select 1 from release_elemento re
+            where re.elemento_id = ec.id and re.workspace_id = ec.workspace_id)
+      ) then
+        raise exception 'no se puede aprobar G6: hay elementos de la design version sin release asignado (RF-06.4)';
+      end if;
     end if;
     -- G7 cierra la implementación: el tablero de conciliación no puede tener NINGÚN
     -- elemento en estado desconocido (RF-06.7). Desconocido es la ausencia de
@@ -1216,9 +1279,13 @@ grant select, insert on effective_state, constatacion to designio_app;
 -- La aprobación mueve estado, autor y snapshot, y el borrador puede reenlazar su journey
 -- (design_version_enlazar_journey). `aprobada_en` NO está: lo escribe solo el guard, así
 -- que la promesa «el sello lo pone la base» es estructural, no una disciplina del
--- servicio. Tampoco están `titulo`, `resumen`, `servicio_id`, `proyecto_id` ni `supera_a`:
--- lo único editable de un borrador es a qué grafo apunta.
-grant update (estado, aprobada_por, snapshot_id, journey_id) on design_version to designio_app;
+-- servicio. `supera_a` entra por el mismo motivo que `journey_id`: la sucesión se declara
+-- al abrir el borrador, pero el servicio puede aprobar otra versión mientras tanto —o la
+-- declarada puede perder su propia carrera de sucesión, que el índice parcial admite
+-- expresamente— y sin poder reapuntarla el borrador quedaría muerto. Tampoco están
+-- `titulo`, `resumen`, `servicio_id` ni `proyecto_id`: de un borrador solo se corrige a
+-- qué grafo apunta y a qué versión sucede.
+grant update (estado, aprobada_por, snapshot_id, journey_id, supera_a) on design_version to designio_app;
 -- El release mueve estado y la fecha real de despliegue; nunca su código, su dueño ni
 -- su design version (eso sería otro release).
 grant update (estado, desplegado_en) on release to designio_app;

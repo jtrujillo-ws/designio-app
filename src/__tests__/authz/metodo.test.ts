@@ -538,6 +538,18 @@ describeAuthz('método: etapas, gates y checklists', () => {
         (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
         values (${ws}, ${retoId}, 'P-96', 'Huérfano', 'activo', 'rapido', ${leadId})`),
     ).rejects.toThrow(/instanciar su método/);
+    // …y una MUESTRA del método tampoco basta: el guard exige la estructura completa
+    // (8 etapas, 8 gates, cada gate con checklist), no una etapa suelta.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [pr] = await tx`insert into proyecto
+          (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+          values (${ws}, ${retoId}, 'P-96', 'Huérfano', 'activo', 'rapido', ${leadId})
+          returning id`;
+        await tx`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+          values (${ws}, ${pr!.id as string}, 0, 'Definición del objeto y del reto')`;
+      }),
+    ).rejects.toThrow(/instanciar su método/);
     // …así que el gate SIN ítems del siguiente chequeo solo puede fabricarlo el admin
     // (el guard salta para el owner sin contexto): el NOT EXISTS de pendientes sería
     // vacuamente cierto — lo tapa exigir ≥1 ítem.

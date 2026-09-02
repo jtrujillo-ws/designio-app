@@ -400,8 +400,16 @@ begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return null;
   end if;
-  if not exists (select 1 from etapa_instancia e
-    where e.proyecto_id = new.id and e.workspace_id = new.workspace_id) then
+  -- Método COMPLETO, no una muestra: 8 etapas, 8 gates y cada gate con checklist
+  -- (una sola etapa colada dejaría un método a medias sin camino de reparación).
+  if (select count(*) from etapa_instancia e
+        where e.proyecto_id = new.id and e.workspace_id = new.workspace_id) <> 8
+     or (select count(*) from gate_instancia g
+        where g.proyecto_id = new.id and g.workspace_id = new.workspace_id) <> 8
+     or exists (select 1 from gate_instancia g
+        where g.proyecto_id = new.id and g.workspace_id = new.workspace_id
+          and not exists (select 1 from checklist_item ci
+            where ci.gate_id = g.id and ci.workspace_id = g.workspace_id)) then
     raise exception 'crear un proyecto exige instanciar su método: usa la activación de la app';
   end if;
   return null;

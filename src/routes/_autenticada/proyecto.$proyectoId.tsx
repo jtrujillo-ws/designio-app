@@ -142,6 +142,9 @@ function PantallaProyecto() {
                   hayMasEvidencias={datos.hayMasEvidencias}
                   rol={rol}
                   criteriosListosG0={criteriosCompletos(datos.proyecto.reto.criterios)}
+                  anterioresAprobados={datos.proyecto.gates
+                    .filter((g2) => g2.numero < etapa.numero)
+                    .every((g2) => g2.estado === 'aprobado')}
                   onCambio={() => router.invalidate()}
                   onError={setError}
                 />
@@ -206,6 +209,7 @@ function EtapaConGate({
   hayMasEvidencias,
   rol,
   criteriosListosG0,
+  anterioresAprobados,
   onCambio,
   onError,
 }: {
@@ -218,6 +222,8 @@ function EtapaConGate({
   rol: string;
   /** SYS-22 en la etiqueta: G0 no está «listo» sin criterios completos. */
   criteriosListosG0: boolean;
+  /** Los gates ordenan el método: el N no está «listo» con anteriores pendientes. */
+  anterioresAprobados: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
 }) {
@@ -259,9 +265,11 @@ function EtapaConGate({
           <span style={{ font: '600 12px var(--font-sans)', color: 'var(--warn)' }}>
             {pendientes > 0
               ? `${pendientes} pendientes`
-              : gate.numero === 0 && !criteriosListosG0
-                ? 'Faltan criterios completos (SYS-22)'
-                : 'Listo para aprobar'}
+              : !anterioresAprobados
+                ? 'Esperando los gates anteriores'
+                : gate.numero === 0 && !criteriosListosG0
+                  ? 'Faltan criterios completos (SYS-22)'
+                  : 'Listo para aprobar'}
           </span>
         )}
       </div>

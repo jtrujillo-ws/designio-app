@@ -71,18 +71,23 @@ function PantallaInsights() {
   // Páginas cargadas DESPUÉS de la del loader. Se guardan aquí y no en la URL porque
   // son acumulativas: volver atrás no debería reconstruir seis páginas.
   const [masPaginas, setMasPaginas] = useState<InsightCompleto[]>([]);
-  const [cursor, setCursor] = useState<{ creadoEn: string; id: string } | null>(null);
+  // El cursor se inicializa CON el del loader, no cae a él por defecto: si el fallback
+  // fuera `cursor ?? datos.siguiente`, al agotar las páginas `setCursor(null)` volvería
+  // al cursor original y el botón pediría la segunda página para siempre, duplicando
+  // insights y claves de React. Un null terminal tiene que seguir siendo terminal.
+  const [cursor, setCursor] = useState<{ creadoEn: string; id: string } | null>(
+    datos?.siguiente ?? null,
+  );
   const [cargando, setCargando] = useState(false);
-  const cursorVivo = cursor ?? datos?.siguiente ?? null;
   const listados = [...(datos?.insights ?? []), ...masPaginas];
 
   async function cargarMas() {
-    if (!datos || !cursorVivo) return;
+    if (!datos || !cursor) return;
     setCargando(true);
     setError(null);
     try {
       const r = await insightsDelEspacio({
-        data: { workspaceId: datos.workspaceId, cursor: cursorVivo },
+        data: { workspaceId: datos.workspaceId, cursor },
       });
       setMasPaginas((previas) => [...previas, ...r.insights]);
       setCursor(r.siguiente);
@@ -221,7 +226,7 @@ function PantallaInsights() {
                 onError={setError}
               />
             ))}
-            {cursorVivo && (
+            {cursor && (
               <div>
                 <Button size="sm" variant="secondary" disabled={cargando} onClick={() => void cargarMas()}>
                   {cargando ? 'Cargando…' : 'Cargar más insights'}

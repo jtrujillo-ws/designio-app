@@ -793,13 +793,26 @@ create policy reserva_insert on reserva_ai
 -- es quien tiene la generación en vuelo, y sin esto el `delete` afectaría a cero filas y el
 -- material saldría igual. La reserva es el token de despacho; retirar el permiso retira el
 -- token.
+--
+-- La excepción va acotada al material que EXIGE consentimiento, y ahí está el detalle que
+-- casi se cuela: para una nota o un documento «no hay consentimiento externo vigente» es
+-- cierto SIEMPRE —nunca hubo nada que registrar—, así que sin el tipo de fuente en el
+-- predicado la excepción se volvía general y cualquier curador podía retirarle a otro una
+-- reserva viva sobre cualquier item, con la llamada en vuelo y el gasto duplicado detrás.
+-- Una excepción vale lo que vale su predicado.
 create policy reserva_delete on reserva_ai
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and (
       creado_por = app_user_id()
       or creado_en <= now() - reserva_ai_ventana()
-      or (item_id is not null and not consentimiento_externo_vigente(item_id, workspace_id))
+      or (
+        item_id is not null
+        and exists (select 1 from item_importacion i
+          where i.id = reserva_ai.item_id and i.workspace_id = reserva_ai.workspace_id
+            and tipo_fuente_exige_consentimiento(i.tipo_fuente))
+        and not consentimiento_externo_vigente(item_id, workspace_id)
+      )
     )
   );
 

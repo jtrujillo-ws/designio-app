@@ -118,15 +118,29 @@ async function presupuestoDeHoy(
   };
 }
 
+/**
+ * Estado de la capacidad para la BANDERA del panel. Dos números con dos propósitos, y
+ * fusionarlos sería el error:
+ *
+ *  · la DECISIÓN («¿puedo pedir una propuesta ahora?») se toma con lo que costaría la
+ *    próxima generación —hasta `INTENTOS_POR_GENERACION` llamadas— y contando las reservas
+ *    en vuelo, porque si no la pantalla anuncia «AI disponible» con 59/60, la persona pulsa
+ *    y se lleva un rechazo del servicio. Prometer lo que la admisión va a negar es el mismo
+ *    desajuste, una capa más arriba, que el del contador que frena y el que informa;
+ *  · el NÚMERO que se muestra sigue siendo lo realmente atendido hoy, que es lo que suma el
+ *    reporte de costos. Las reservas no son gasto: son gasto probable de otros en curso.
+ */
 async function estadoCapacidad(tx: TransactionSql, workspaceId: string) {
   const { keyWorkspace, keyEntorno } = credencialesAI();
-  const { atendidas } = await presupuestoDeHoy(tx, workspaceId);
-  return evaluarCapacidadAI({
+  const { atendidas, reservadas } = await presupuestoDeHoy(tx, workspaceId);
+  const ai = evaluarCapacidadAI({
     keyWorkspace,
     keyEntorno,
-    llamadasHoy: atendidas,
+    llamadasHoy: atendidas + reservadas,
     limiteDiario: LIMITE_LLAMADAS_DIA,
+    unidades: INTENTOS_POR_GENERACION,
   });
+  return { ...ai, llamadasHoy: atendidas };
 }
 
 /** Candado del presupuesto AI de un workspace. Apartar el hueco y consumirlo ocurren en
@@ -302,17 +316,17 @@ export async function panelPropuestas(
     // el selector — así que la revocación, que el servicio y la bitácora admiten, no tenía
     // por dónde entrar en el producto.
     const personas = await tx`
-      select i.id, i.titulo,
+      select i.id, i.titulo, i.estado,
              consentimiento_externo_vigente(i.id, i.workspace_id) as autoriza_externo,
              (select c.version from consentimiento_item c
                where c.item_id = i.id and c.workspace_id = i.workspace_id
                order by c.version desc limit 1) as version
       from item_importacion i
-      where i.workspace_id = ${workspaceId} and i.estado = 'pendiente'
+      where i.workspace_id = ${workspaceId}
         and tipo_fuente_exige_consentimiento(i.tipo_fuente)
         and (${patron}::text is null or i.titulo ilike ${patron})
       order by i.creado_en asc, i.id asc
-      limit ${PAGINA_ANCLAS}`;
+      limit ${PAGINA_ANCLAS + 1}`;
     // Retos con criterios aún abiertos: con un G0 aprobado están congelados (SYS-22) y
     // proponer criterios para ellos sería ofrecer una acción que la base va a rechazar.
     const retos = await tx`
@@ -349,12 +363,14 @@ export async function panelPropuestas(
         .map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
       hayMasItems: items.length > PAGINA_ANCLAS,
       hayMasRetos: retos.length > PAGINA_ANCLAS,
-      materialDePersonas: personas.map((p) => ({
+      materialDePersonas: personas.slice(0, PAGINA_ANCLAS).map((p) => ({
         id: p.id as string,
         titulo: p.titulo as string,
+        curado: (p.estado as string) !== 'pendiente',
         autorizaExterno: p.autoriza_externo as boolean,
         version: p.version === null ? null : Number(p.version),
       })),
+      hayMasMaterial: personas.length > PAGINA_ANCLAS,
       busqueda,
     };
   });
@@ -583,19 +599,23 @@ async function liberarReserva(
  * intercambiables: antes de llamar evita el gasto; al persistir evita que nazca el objeto;
  * el guard es el suelo, para que el SQL directo tampoco pueda.
  *
- *  | Precondición                     | Antes de llamar | Al persistir      | Suelo (base)        |
- *  |----------------------------------|-----------------|-------------------|---------------------|
- *  | Cuenta activa                    | sí              | sí                | — (es capa 2)       |
- *  | Rol curador                      | —¹              | —¹                | política de INSERT  |
- *  | Credencial del proveedor         | resuelta ya²    | n/a               | n/a                 |
- *  | CI · item aún pendiente          | sí              | guard             | guard de INSERT     |
- *  | CI · consentimiento vigente      | sí (con candado)| guard             | guard de INSERT     |
- *  | CI · material extraíble          | inmutable³      | guard             | guard de INSERT     |
- *  | C0 · reto admite criterios       | sí              | guard             | guard de INSERT     |
- *  | C0 · criterios no congelados     | sí              | guard             | guard de INSERT     |
- *  | Ancla sin generación en vuelo    | sí (reserva)    | consume la reserva| índice único parcial|
- *  | Ancla sin propuesta pendiente    | —⁴              | CI: índice único  | CI: índice único    |
- *  | Presupuesto                      | sí (reserva)    | no⁵               | —                   |
+ * Y una cuarta columna que responde otra pregunta sobre la misma fila: **quién más escribe
+ * ese dato y si comparte mecanismo de serialización**. Exigir un predicado en tres momentos
+ * no lo vuelve un cerrojo — sigue siendo una foto—, así que hay que mirar las dos cosas.
+ *
+ *  | Precondición                  | Antes de llamar | Al persistir      | Suelo (base)        | Quién más lo escribe → cómo se serializa                    |
+ *  |-------------------------------|-----------------|-------------------|---------------------|-------------------------------------------------------------|
+ *  | Cuenta activa                 | sí              | sí                | — (es capa 2)       | auth/gobernanza → no hace falta⁶                             |
+ *  | Rol curador                   | —¹              | —¹                | política de INSERT  | gobernanza → la política se evalúa EN la sentencia: sin ventana |
+ *  | Credencial del proveedor      | resuelta ya²    | n/a               | n/a                 | el entorno → no es dato transaccional                        |
+ *  | CI · item aún pendiente       | sí              | guard             | guard de INSERT     | curaduría manual y materialización → la fila⁷                |
+ *  | CI · consentimiento vigente   | sí (con candado)| guard             | guard de INSERT     | `registrarConsentimiento` → candado por item, en los dos lados |
+ *  | CI · material extraíble       | inmutable³      | guard             | guard de INSERT     | nadie: sin grant de UPDATE, no es carreable                  |
+ *  | C0 · reto admite criterios    | sí              | guard             | guard de INSERT     | activación/cierre del reto → la fila⁷                        |
+ *  | C0 · criterios no congelados  | sí              | guard             | guard de INSERT     | `aprobarGate` → la fila del gate⁷ (y `bloquearReto` en el lado que escribe criterios) |
+ *  | Ancla sin generación en vuelo | sí (reserva)    | consume la reserva| índice único parcial| solo este módulo → candado del presupuesto, en los dos lados |
+ *  | Ancla sin propuesta pendiente | —⁴              | CI: índice único  | CI: índice único    | solo este módulo → candado del presupuesto + índice único    |
+ *  | Presupuesto                   | sí (reserva)    | no⁵               | —                   | solo este módulo → candado del presupuesto                   |
  *
  *  ¹ La política de INSERT de `propuesta_ai` lo exige en cada escritura: no hay ventana.
  *  ² La key viaja en el alcance; revocarla en el entorno solo afecta a generaciones futuras.
@@ -603,6 +623,20 @@ async function liberarReserva(
  *  ⁴ Lo cubre la reserva, que es exclusiva por ancla y viva durante toda la llamada.
  *  ⁵ Deliberado: al persistir la llamada ya está pagada y negarse a guardar su salida solo
  *    tiraría lo comprado. El tope frena en la admisión y en el despacho.
+ *  ⁶ Leer una cuenta recién desactivada solo permite terminar la operación en curso, y la
+ *    doctrina ya está fijada: anotar un hecho consumado no pregunta por el permiso, actuar sí.
+ *  ⁷ Estas tres no necesitan candado propio, y conviene decir por qué en vez de añadir uno:
+ *    quien las escribe lo hace con un `update … where <estado esperado>`, que toma el candado
+ *    de la fila, y en READ COMMITTED cada sentencia del guard ve lo ya commiteado. De ahí que
+ *    solo queden dos desenlaces y los dos sean equivalentes a un orden serial: o la decisión
+ *    ajena commitea antes y el guard la ve y rechaza la propuesta, o commitea después y la
+ *    propuesta nació cuando el ancla todavía la admitía. Lo segundo NO es una violación —es
+ *    «alguien decidió el ancla justo después», que puede pasar un segundo más tarde igual— y
+ *    el panel ya lo reporta como obsoleta y solo rechazable. Un candado no eliminaría ese
+ *    desenlace: solo elegiría cuál de los dos órdenes ocurre. El día que la promesa pase a
+ *    ser de otro tipo («ninguna propuesta pendiente sobrevive al congelado»), el mecanismo
+ *    ya está identificado: `for update` sobre los G0 en el mismo orden estable que usa
+ *    `criterio_g0_pendiente_guard`, y el candado de reto que ese módulo documenta.
  *
  * Última comprobación antes de que el material salga hacia el proveedor (RF-09.5).
  *
@@ -921,9 +955,21 @@ export async function registrarConsentimiento(
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await rolCurador(tx, actorId, entrada.workspaceId);
-    const [item] = await tx`select 1 as hay from item_importacion
+    const [item] = await tx`select
+        tipo_fuente_exige_consentimiento(tipo_fuente) as de_personas
+      from item_importacion
       where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
     if (!item) throw new ErrorAI('El item no existe en este workspace');
+    // Un consentimiento sobre una nota o un documento no significa nada: no hay personas
+    // que autoricen nada, ninguna lectura del pipeline lo consulta y la bitácora del panel
+    // ni siquiera lo ofrece. Aceptarlo era dejar el endpoint como palanca para otra cosa
+    // —de hecho lo fue: hizo general una excepción de la política de `reserva_ai` que solo
+    // debía aplicar al material de personas—.
+    if (!(item.de_personas as boolean)) {
+      throw new ErrorAI(
+        'Ese item no es material de personas: no hay consentimiento que registrar sobre él',
+      );
+    }
     await bloquearConsentimiento(tx, entrada.itemId);
     try {
       // `version` no viaja: la asigna el guard (y no está en el grant de insert), porque

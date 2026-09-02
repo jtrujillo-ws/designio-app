@@ -43,6 +43,11 @@ async function appDbLista(): Promise<boolean> {
       );
       return false;
     }
+    // Los roles son CLUSTER-wide: la identidad no prueba que la URL apunte a la BASE
+    // migrada (misma instancia, base equivocada → el pool luego no encontraría tablas).
+    // Tocar una relación conocida falla con 42P01 en la base errónea; bajo RLS sin
+    // contexto devuelve 0 filas, que aquí es suficiente y correcto.
+    await sql`select count(*) from workspace`;
     appDbVerificada = true;
     return true;
   } catch (e) {

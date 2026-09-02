@@ -68,14 +68,20 @@ export const ETIQUETA_TIPO_FUENTE: Record<TipoFuente, string> = {
   nota: 'Nota',
 };
 
-/** RF-03.1/03.2: el contenido es texto NO confiable — acotado aquí y en el esquema SQL. */
-export const CrearItemImportacionSchema = z.object({
-  workspaceId: z.string().uuid(),
-  titulo: z.string().trim().min(1, 'El título es obligatorio').max(300),
-  contenido: z.string().min(1, 'Pega el contenido a importar').max(100_000, 'Máximo 100k caracteres'),
-  tipoFuente: z.enum(TIPOS_FUENTE),
-  referencia: z.string().trim().max(2000).default(''),
-});
+/** RF-03.1/03.2: el contenido es texto NO confiable — acotado aquí y en el esquema SQL.
+ * Se importa texto pegado, una referencia al original, o ambos: al menos uno. */
+export const CrearItemImportacionSchema = z
+  .object({
+    workspaceId: z.string().uuid(),
+    titulo: z.string().trim().min(1, 'El título es obligatorio').max(300),
+    contenido: z.string().max(100_000, 'Máximo 100k caracteres').default(''),
+    tipoFuente: z.enum(TIPOS_FUENTE),
+    referencia: z.string().trim().max(2000).default(''),
+  })
+  .refine((d) => d.contenido.trim().length > 0 || d.referencia.length > 0, {
+    message: 'Pega el contenido o indica al menos la referencia del original',
+    path: ['contenido'],
+  });
 export type CrearItemImportacion = z.infer<typeof CrearItemImportacionSchema>;
 
 /**
@@ -109,7 +115,17 @@ export const RechazarItemSchema = z.object({
 });
 export type RechazarItem = z.infer<typeof RechazarItemSchema>;
 
-export const BandejaInputSchema = z.object({ workspaceId: z.string().uuid() });
+export const BandejaInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  /** Cursor: id del último pendiente devuelto — el server resuelve su (creado_en, id)
+   * con precisión exacta y pide los más antiguos (keyset estable ante inserciones). */
+  antesDe: z.string().uuid().optional(),
+});
+
+export const ItemInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  itemId: z.string().uuid(),
+});
 
 /** Fila de la bandeja tal como la ve la UI (el contenido viaja como extracto acotado). */
 export type ItemBandeja = {

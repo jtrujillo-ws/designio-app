@@ -1,11 +1,13 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
-import { DimensionesEvidenciaSchema } from '@/lib/evidencia/evidencia.schemas';
+import { CrearItemImportacionSchema, DimensionesEvidenciaSchema } from '@/lib/evidencia/evidencia.schemas';
 import {
   aprobarItem,
+  contenidoDeItem,
   crearItem,
   ErrorCuraduria,
   listarBandeja,
+  PAGINA_PENDIENTES,
   rechazarItem,
 } from '@/lib/evidencia/evidencia.servicio';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
@@ -86,7 +88,7 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     itemAprobado = r.itemId;
 
     const bandeja = await listarBandeja(leadId, ws);
-    const item = bandeja.find((i) => i.id === itemAprobado);
+    const item = bandeja.pendientes.find((i) => i.id === itemAprobado);
     expect(item?.estado).toBe('pendiente');
     expect(item?.extracto).toContain('abandono 62%');
   });
@@ -157,7 +159,7 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
       set estado = 'aprobado' where id = ${itemAprobado}`);
     expect(filas.count).toBe(0);
     const bandeja = await listarBandeja(leadId, ws);
-    expect(bandeja.find((i) => i.id === itemAprobado)?.estado).toBe('pendiente');
+    expect(bandeja.pendientes.find((i) => i.id === itemAprobado)?.estado).toBe('pendiente');
   });
 
   it('aprobar crea fuente + evidencia con las cinco dimensiones y sella el item', async () => {
@@ -209,7 +211,7 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     });
     await rechazarItem(leadId, { workspaceId: ws, itemId: r.itemId });
     const bandeja = await listarBandeja(leadId, ws);
-    expect(bandeja.find((i) => i.id === r.itemId)?.estado).toBe('rechazado');
+    expect(bandeja.decididas.find((i) => i.id === r.itemId)?.estado).toBe('rechazado');
     const evidencias = await conUsuario(leadId, (tx) => tx`
       select id from evidencia where workspace_id = ${ws} and titulo = 'Nota irrelevante'`);
     expect(evidencias.length).toBe(0);
@@ -217,9 +219,70 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
 
   it('aislamiento: la bandeja y la evidencia de otro workspace son invisibles', async () => {
     const bandejaAjena = await listarBandeja(leadId, wsB);
-    expect(bandejaAjena).toHaveLength(0);
+    expect(bandejaAjena.pendientes).toHaveLength(0);
+    expect(bandejaAjena.decididas).toHaveLength(0);
     const sinContexto = await sql()`select id from item_importacion where workspace_id in (${ws}, ${wsB})`;
     expect(sinContexto.length).toBe(0);
+  });
+
+  it('importar solo la referencia es válido; sin contenido NI referencia, no', () => {
+    const base = { workspaceId: ws, titulo: 'Solo enlace', tipoFuente: 'enlace' as const };
+    expect(
+      CrearItemImportacionSchema.safeParse({ ...base, contenido: '', referencia: 'https://ejemplo.test/informe' })
+        .success,
+    ).toBe(true);
+    expect(
+      CrearItemImportacionSchema.safeParse({ ...base, contenido: '   ', referencia: '' }).success,
+    ).toBe(false);
+  });
+
+  it('el contenido completo se inspecciona bajo demanda y respeta el aislamiento', async () => {
+    const largo = 'A'.repeat(1200);
+    const r = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Material largo',
+      contenido: largo,
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    const bandeja = await listarBandeja(leadId, ws);
+    const fila = bandeja.pendientes.find((i) => i.id === r.itemId);
+    expect(fila?.truncado).toBe(true);
+    expect(fila?.extracto.length).toBe(400);
+    // La decisión exige poder leer TODO lo importado, no solo el extracto.
+    expect(await contenidoDeItem(leadId, ws, r.itemId)).toBe(largo);
+    // Cross-tenant: el item ajeno es invisible aunque se conozca su id.
+    const [ajeno] = await sqlAdmin()`select id from item_importacion where workspace_id = ${wsB} limit 1`;
+    expect(await contenidoDeItem(leadId, wsB, ajeno!.id as string)).toBeNull();
+  });
+
+  it('la cola de pendientes pagina por keyset: todos alcanzables, sin tope que la atasque', async () => {
+    const admin = sqlAdmin();
+    const [wp] = await admin`insert into workspace (nombre) values (${marca + '-pag'}) returning id`;
+    const wsPag = wp!.id as string;
+    await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${wsPag}, ${leadId}, 'Lead Evid', ${marca + '-lead@test.demo'}, 'lead-boutique')`;
+    try {
+      await admin`insert into item_importacion (workspace_id, titulo, contenido, tipo_fuente, creado_por)
+        select ${wsPag}, 'Volcado ' || n, 'x', 'nota', ${leadId}
+        from generate_series(1, ${PAGINA_PENDIENTES + 5}) n`;
+
+      const pagina1 = await listarBandeja(leadId, wsPag);
+      expect(pagina1.pendientes).toHaveLength(PAGINA_PENDIENTES);
+      expect(pagina1.hayMasPendientes).toBe(true);
+
+      const ultimo = pagina1.pendientes[pagina1.pendientes.length - 1]!;
+      const pagina2 = await listarBandeja(leadId, wsPag, ultimo.id);
+      expect(pagina2.pendientes).toHaveLength(5);
+      expect(pagina2.hayMasPendientes).toBe(false);
+      // Sin solaparse ni saltarse filas entre páginas.
+      const ids1 = new Set(pagina1.pendientes.map((i) => i.id));
+      expect(pagina2.pendientes.every((i) => !ids1.has(i.id))).toBe(true);
+    } finally {
+      await admin`delete from item_importacion where workspace_id = ${wsPag}`;
+      await admin`delete from miembro where workspace_id = ${wsPag}`;
+      await admin`delete from workspace where id = ${wsPag}`;
+    }
   });
 
   it('una cuenta desactivada con sesión viva no lee la bandeja ni aporta (re-check de estado)', async () => {
@@ -227,6 +290,7 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     await admin`update usuario set estado = 'inactivo' where id = ${leadId}`;
     try {
       await expect(listarBandeja(leadId, ws)).rejects.toThrow(ErrorAutorizacion);
+      await expect(contenidoDeItem(leadId, ws, itemAprobado)).rejects.toThrow(ErrorAutorizacion);
       await expect(
         crearItem(leadId, {
           workspaceId: ws,

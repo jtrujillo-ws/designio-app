@@ -12,6 +12,7 @@ import { Wordmark } from '@/components/ui/Wordmark';
 import {
   aprobarItemImportacion,
   bandejaDeImportacion,
+  contenidoDeItemImportacion,
   crearItemImportacion,
   rechazarItemImportacion,
 } from '@/lib/evidencia/evidencia.functions';
@@ -56,9 +57,38 @@ function PantallaImportacion() {
   const navigate = useNavigate();
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
+  // Páginas siguientes de pendientes cargadas bajo demanda (el loader trae la primera).
+  const [masPendientes, setMasPendientes] = useState<ItemBandeja[]>([]);
+  const [hayMasLocal, setHayMasLocal] = useState<boolean | null>(null);
+  const [cargandoMas, setCargandoMas] = useState(false);
+
+  const pendientes = datos ? [...datos.pendientes, ...masPendientes] : [];
+  const hayMas = hayMasLocal ?? datos?.hayMasPendientes ?? false;
 
   async function refrescar() {
+    setMasPendientes([]);
+    setHayMasLocal(null);
     await router.invalidate();
+  }
+
+  async function cargarMas() {
+    if (!datos || pendientes.length === 0) return;
+    setCargandoMas(true);
+    setError(null);
+    try {
+      const ultimo = pendientes[pendientes.length - 1]!;
+      const r = await bandejaDeImportacion({
+        data: { workspaceId: datos.workspaceId, antesDe: ultimo.id },
+      });
+      if (r) {
+        setMasPendientes((previos) => [...previos, ...r.pendientes]);
+        setHayMasLocal(r.hayMasPendientes);
+      }
+    } catch {
+      setError('No se pudo cargar más pendientes; intenta de nuevo');
+    } finally {
+      setCargandoMas(false);
+    }
   }
 
   return (
@@ -105,9 +135,11 @@ function PantallaImportacion() {
               </span>
             )}
             <div style={{ ...etiqueta, paddingTop: 6 }}>
-              {datos.items.length === 0 ? 'Bandeja vacía' : `${datos.items.length} items`}
+              {pendientes.length === 0
+                ? 'Sin pendientes de curaduría'
+                : `${pendientes.length}${hayMas ? '+' : ''} pendientes de curaduría`}
             </div>
-            {datos.items.map((item) => (
+            {pendientes.map((item) => (
               <TarjetaItem
                 key={item.id}
                 item={item}
@@ -116,6 +148,27 @@ function PantallaImportacion() {
                 onError={setError}
               />
             ))}
+            {hayMas && (
+              <div>
+                <Button size="sm" variant="secondary" disabled={cargandoMas} onClick={() => void cargarMas()}>
+                  {cargandoMas ? 'Cargando…' : 'Cargar pendientes más antiguos'}
+                </Button>
+              </div>
+            )}
+            {datos.decididas.length > 0 && (
+              <>
+                <div style={{ ...etiqueta, paddingTop: 14 }}>Decididas recientes</div>
+                {datos.decididas.map((item) => (
+                  <TarjetaItem
+                    key={item.id}
+                    item={item}
+                    workspaceId={datos.workspaceId}
+                    onCambio={refrescar}
+                    onError={setError}
+                  />
+                ))}
+              </>
+            )}
           </>
         )}
       </main>
@@ -140,6 +193,12 @@ function FormularioNuevoItem({
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
+    // Texto pegado, referencia al original, o ambos — pero al menos uno (mismo
+    // criterio que valida el schema en el server).
+    if (contenido.trim().length === 0 && referencia.trim().length === 0) {
+      onError('Pega el contenido o indica al menos la referencia del original');
+      return;
+    }
     setEnviando(true);
     onError(null);
     try {
@@ -188,9 +247,8 @@ function FormularioNuevoItem({
           <Input maxLength={2000} value={referencia} onChange={(e) => setReferencia(e.target.value)} placeholder="https://… o «carpeta compartida / informe Q2»" />
         </label>
         <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <span style={etiqueta}>Contenido (texto pegado)</span>
+          <span style={etiqueta}>Contenido (texto pegado — opcional si registras la referencia)</span>
           <Textarea
-            required
             rows={5}
             maxLength={100000}
             value={contenido}
@@ -221,6 +279,33 @@ function TarjetaItem({
 }) {
   const [curando, setCurando] = useState(false);
   const [ocupado, setOcupado] = useState(false);
+  const [contenidoCompleto, setContenidoCompleto] = useState<string | null>(null);
+  const [expandido, setExpandido] = useState(false);
+  const [cargandoContenido, setCargandoContenido] = useState(false);
+
+  // El extracto es solo una vista previa: la decisión de curaduría exige poder
+  // inspeccionar TODO lo importado, así que el contenido completo se trae bajo demanda.
+  async function verCompleto() {
+    if (contenidoCompleto !== null) {
+      setExpandido(true);
+      return;
+    }
+    setCargandoContenido(true);
+    onError(null);
+    try {
+      const r = await contenidoDeItemImportacion({ data: { workspaceId, itemId: item.id } });
+      if (r?.contenido != null) {
+        setContenidoCompleto(r.contenido);
+        setExpandido(true);
+      } else {
+        onError('No se pudo cargar el contenido completo');
+      }
+    } catch {
+      onError('No se pudo cargar el contenido completo; intenta de nuevo');
+    } finally {
+      setCargandoContenido(false);
+    }
+  }
 
   async function rechazar() {
     setOcupado(true);
@@ -248,9 +333,21 @@ function TarjetaItem({
         </span>
       </div>
       <p style={{ font: '400 12px/1.5 var(--font-mono)', color: 'var(--text-muted)', margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
-        {item.extracto}
-        {item.truncado ? '…' : ''}
+        {expandido && contenidoCompleto !== null ? contenidoCompleto : item.extracto}
+        {!expandido && item.truncado ? '…' : ''}
       </p>
+      {item.truncado && (
+        <div>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={cargandoContenido}
+            onClick={() => (expandido ? setExpandido(false) : void verCompleto())}
+          >
+            {cargandoContenido ? 'Cargando…' : expandido ? 'Contraer' : 'Ver contenido completo'}
+          </Button>
+        </div>
+      )}
       {item.referencia && (
         <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)', overflowWrap: 'anywhere' }}>
           Ref: {item.referencia}

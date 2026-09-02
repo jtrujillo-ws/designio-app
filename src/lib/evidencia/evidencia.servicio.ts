@@ -43,29 +43,92 @@ export async function crearItem(
   });
 }
 
-export async function listarBandeja(actorId: string, workspaceId: string): Promise<ItemBandeja[]> {
+export const PAGINA_PENDIENTES = 100;
+export const DECIDIDAS_RECIENTES = 50;
+
+export type Bandeja = {
+  /** Cola operativa: TODOS los pendientes son alcanzables paginando por keyset. */
+  pendientes: ItemBandeja[];
+  hayMasPendientes: boolean;
+  /** Solo en la primera página: historial reciente de decisiones (acotado — el
+   * registro completo e inmutable vive en evento_dominio y en la propia evidencia). */
+  decididas: ItemBandeja[];
+};
+
+function filaDeBandeja(f: Record<string, unknown>): ItemBandeja {
+  return {
+    id: f.id as string,
+    titulo: f.titulo as string,
+    tipoFuente: f.tipo_fuente as TipoFuente,
+    referencia: f.referencia as string,
+    estado: f.estado as ItemBandeja['estado'],
+    extracto: f.extracto as string,
+    truncado: f.truncado as boolean,
+    creadoEn: (f.creado_en as Date).toISOString(),
+    decididoEn: f.decidido_en ? (f.decidido_en as Date).toISOString() : null,
+  };
+}
+
+export async function listarBandeja(
+  actorId: string,
+  workspaceId: string,
+  antesDe?: string,
+): Promise<Bandeja> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const filas = await tx`
+    // Keyset (creado_en, id) — estable ante inserciones mientras se pagina, a diferencia
+    // de un offset. El cursor viaja como id y su (creado_en, id) se resuelve aquí con la
+    // precisión de la base (serializar el timestamp perdería los microsegundos y saltaría
+    // o repetiría filas). Se pide una fila extra para saber si hay más.
+    const pendientes = await tx`
       select id, titulo, tipo_fuente, referencia, estado,
              left(contenido, ${LARGO_EXTRACTO}) as extracto,
              length(contenido) > ${LARGO_EXTRACTO} as truncado,
              creado_en, decidido_en
       from item_importacion
-      where workspace_id = ${workspaceId}
-      order by (estado = 'pendiente') desc, creado_en desc
-      limit 200`;
-    return filas.map((f) => ({
-      id: f.id as string,
-      titulo: f.titulo as string,
-      tipoFuente: f.tipo_fuente as TipoFuente,
-      referencia: f.referencia as string,
-      estado: f.estado as ItemBandeja['estado'],
-      extracto: f.extracto as string,
-      truncado: f.truncado as boolean,
-      creadoEn: (f.creado_en as Date).toISOString(),
-      decididoEn: f.decidido_en ? (f.decidido_en as Date).toISOString() : null,
-    }));
+      where workspace_id = ${workspaceId} and estado = 'pendiente'
+        ${antesDe
+          ? tx`and (creado_en, id) < (select i2.creado_en, i2.id from item_importacion i2
+                where i2.id = ${antesDe} and i2.workspace_id = ${workspaceId})`
+          : tx``}
+      order by creado_en desc, id desc
+      limit ${PAGINA_PENDIENTES + 1}`;
+
+    const decididas = antesDe
+      ? []
+      : await tx`
+        select id, titulo, tipo_fuente, referencia, estado,
+               left(contenido, ${LARGO_EXTRACTO}) as extracto,
+               length(contenido) > ${LARGO_EXTRACTO} as truncado,
+               creado_en, decidido_en
+        from item_importacion
+        where workspace_id = ${workspaceId} and estado <> 'pendiente'
+        order by decidido_en desc
+        limit ${DECIDIDAS_RECIENTES}`;
+
+    return {
+      pendientes: pendientes.slice(0, PAGINA_PENDIENTES).map(filaDeBandeja),
+      hayMasPendientes: pendientes.length > PAGINA_PENDIENTES,
+      decididas: decididas.map(filaDeBandeja),
+    };
+  });
+}
+
+/**
+ * Contenido COMPLETO de un item (RF-03.3): quien cura debe poder inspeccionar todo lo
+ * importado antes de decidir — la lista solo lleva un extracto. RLS limita a miembros
+ * del workspace; null si el item no existe o no es visible.
+ */
+export async function contenidoDeItem(
+  actorId: string,
+  workspaceId: string,
+  itemId: string,
+): Promise<string | null> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [fila] = await tx`select contenido from item_importacion
+      where id = ${itemId} and workspace_id = ${workspaceId}`;
+    return fila ? (fila.contenido as string) : null;
   });
 }
 

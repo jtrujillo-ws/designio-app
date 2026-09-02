@@ -5,9 +5,17 @@ import {
   AprobarItemSchema,
   BandejaInputSchema,
   CrearItemImportacionSchema,
+  ItemInputSchema,
   RechazarItemSchema,
 } from './evidencia.schemas';
-import { aprobarItem, crearItem, ErrorCuraduria, listarBandeja, rechazarItem } from './evidencia.servicio';
+import {
+  aprobarItem,
+  contenidoDeItem,
+  crearItem,
+  ErrorCuraduria,
+  listarBandeja,
+  rechazarItem,
+} from './evidencia.servicio';
 
 /** Server functions de la bandeja de importación. Mutaciones con contrato uniforme {ok, …};
  * la lectura (loader) lanza, alimentando el redirect/error boundary del router. */
@@ -29,9 +37,23 @@ export const bandejaDeImportacion = createServerFn({ method: 'GET' })
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
     try {
-      return { workspaceId: data.workspaceId, items: await listarBandeja(usuarioId, data.workspaceId) };
+      const bandeja = await listarBandeja(usuarioId, data.workspaceId, data.antesDe);
+      return { workspaceId: data.workspaceId, ...bandeja };
     } catch (e) {
       // Cuenta desactivada con JWT aún vigente: sin datos, como si no hubiera sesión.
+      if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
+  });
+
+/** Contenido completo de un item para inspección previa a la decisión (RF-03.3). */
+export const contenidoDeItemImportacion = createServerFn({ method: 'GET' })
+  .inputValidator(ItemInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return { contenido: await contenidoDeItem(usuarioId, data.workspaceId, data.itemId) };
+    } catch (e) {
       if (e instanceof ErrorAutorizacion) return null;
       throw e;
     }

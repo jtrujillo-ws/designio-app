@@ -30,9 +30,12 @@ export const LoginSchema = z.object({
   password: z.string().min(1, 'La contraseña es obligatoria'),
 });
 
+/** Política de contraseñas en UN lugar: el schema es la autoridad; la UI deriva de aquí. */
+export const PASSWORD_MIN = 10;
+
 export const PasswordNuevaSchema = z
   .string()
-  .min(10, 'La contraseña necesita al menos 10 caracteres')
+  .min(PASSWORD_MIN, `La contraseña necesita al menos ${PASSWORD_MIN} caracteres`)
   .max(200, 'Demasiado larga');
 
 export const EstablecerPasswordSchema = z.object({

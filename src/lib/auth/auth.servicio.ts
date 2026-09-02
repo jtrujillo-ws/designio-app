@@ -20,6 +20,9 @@ export type MembresiaUsuario = { workspaceId: string; workspaceNombre: string; r
 
 export class ErrorAutorizacion extends Error {}
 
+/** Fallo de dominio en la invitación (p. ej. ya es miembro): mensaje apto para la UI. */
+export class ErrorInvitacion extends Error {}
+
 const ROLES_QUE_INVITAN = ['lead-boutique', 'admin-cliente'];
 
 // Rama "usuario no existe / sin password": comparar contra un hash real de costo idéntico
@@ -69,15 +72,29 @@ export async function usuarioConMembresias(
   });
 }
 
+export type ResultadoInvitacion = {
+  usuarioId: string;
+  /** true mientras la cuenta global siga pendiente de que su dueño la active. */
+  requiereActivacion: boolean;
+  /** Enlace emitido en ESTA llamada; null si el token pendiente pertenece a otro workspace
+   * (que la cuenta esté pendiente no da derecho a reclamarla) o si la cuenta ya está activa. */
+  token: string | null;
+  /** true si la persona ya era miembro y esto fue una re-emisión del enlace. */
+  reemision: boolean;
+};
+
 /**
- * Invitación (RF-01.2/01.4): alta o reutilización del usuario + membresía + auditoría, en una
- * transacción. Capa 2: re-check explícito del rol del actor; capa 1: la política de INSERT de
- * miembro rechaza el mismo intento aunque la capa 2 fallara.
+ * Invitación (RF-01.2/01.4) en una transacción, con doble capa: re-check explícito del rol
+ * del actor (capa 2) + política RLS de INSERT de miembro y autorización interna de
+ * preparar_invitacion (capa 1). El token solo lo recibe el workspace que lo ORIGINÓ:
+ * invitar un email pendiente de otro workspace agrega la membresía sin token (anti-takeover
+ * cross-tenant) y sin pisar el enlace original. Re-invitar a un miembro propio aún pendiente
+ * re-emite el enlace (recupera invitaciones perdidas o vencidas).
  */
 export async function crearInvitacion(
   actorId: string,
   entrada: InvitarMiembro,
-): Promise<{ usuarioId: string; requiereActivacion: boolean; token: string | null }> {
+): Promise<ResultadoInvitacion> {
   const { token, tokenHash } = generarTokenInvitacion();
   const expira = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
@@ -89,10 +106,26 @@ export async function crearInvitacion(
     }
 
     const [prep] = await tx`
-      select usuario_id, requiere_activacion
-      from preparar_invitacion(${entrada.email}, ${entrada.nombre}, ${tokenHash}, ${expira})`;
+      select usuario_id, requiere_activacion, token_emitido
+      from preparar_invitacion(${entrada.email}, ${entrada.nombre}, ${tokenHash}, ${expira}, ${entrada.workspaceId})`;
     const usuarioId = prep!.usuario_id as string;
     const requiereActivacion = prep!.requiere_activacion as boolean;
+    const tokenEmitido = prep!.token_emitido as boolean;
+
+    const [yaMiembro] = await tx`
+      select 1 as existe from miembro
+      where workspace_id = ${entrada.workspaceId} and usuario_id = ${usuarioId}`;
+
+    if (yaMiembro) {
+      if (!tokenEmitido) {
+        throw new ErrorInvitacion('Esa persona ya es miembro del workspace');
+      }
+      // Re-emisión: mismo miembro pendiente, enlace nuevo (el anterior queda invalidado).
+      await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        values (${entrada.workspaceId}, 'InvitacionReemitida',
+          ${tx.json({ email: entrada.email })}, ${actorId}, ${rolActor})`;
+      return { usuarioId, requiereActivacion, tokenEmitido, reemision: true };
+    }
 
     await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
       values (${entrada.workspaceId}, ${usuarioId}, ${entrada.nombre}, ${entrada.email}, ${entrada.rol})`;
@@ -106,10 +139,15 @@ export async function crearInvitacion(
         ${rolActor}
       )`;
 
-    return { usuarioId, requiereActivacion };
+    return { usuarioId, requiereActivacion, tokenEmitido, reemision: false };
   });
 
-  return { ...resultado, token: resultado.requiereActivacion ? token : null };
+  return {
+    usuarioId: resultado.usuarioId,
+    requiereActivacion: resultado.requiereActivacion,
+    token: resultado.tokenEmitido ? token : null,
+    reemision: resultado.reemision,
+  };
 }
 
 /** Consume un token de invitación vigente y deja la cuenta activa con esa password. */

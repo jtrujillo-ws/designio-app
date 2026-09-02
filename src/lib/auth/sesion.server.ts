@@ -10,6 +10,12 @@ import { jwtVerify, SignJWT } from 'jose';
 export const COOKIE_SESION = 'designio_sesion';
 export const DURACION_SESION_S = 60 * 60 * 24 * 7; // 7 días
 
+// El mismo JWT_SECRET firmará después recovery y tokens de capacidad (.env.local.example):
+// emisor + audiencia fijan el PROPÓSITO del token para que un token de otro tipo jamás
+// valide como sesión (confusión de tokens).
+const EMISOR = 'designio';
+const AUDIENCIA_SESION = 'designio:sesion';
+
 let avisoDevDado = false;
 
 function secreto(): Uint8Array {
@@ -34,6 +40,8 @@ export async function firmarSesion(usuarioId: string): Promise<string> {
   return new SignJWT({})
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(usuarioId)
+    .setIssuer(EMISOR)
+    .setAudience(AUDIENCIA_SESION)
     .setIssuedAt()
     .setExpirationTime(Math.floor(Date.now() / 1000) + DURACION_SESION_S)
     .sign(secreto());
@@ -46,7 +54,11 @@ export async function usuarioIdDeSesion(token: string | undefined): Promise<stri
   // ruidosamente, no disfrazarse de "sesión inválida" con un redirect silencioso.
   const clave = secreto();
   try {
-    const { payload } = await jwtVerify(token, clave, { algorithms: ['HS256'] });
+    const { payload } = await jwtVerify(token, clave, {
+      algorithms: ['HS256'],
+      issuer: EMISOR,
+      audience: AUDIENCIA_SESION,
+    });
     return payload.sub ?? null;
   } catch {
     return null;

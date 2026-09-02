@@ -6,6 +6,7 @@ import { Card } from '@/components/ui/Card';
 import { Input } from '@/components/ui/Input';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { establecerPassword } from '@/lib/auth/auth.functions';
+import { PASSWORD_MIN, PasswordNuevaSchema } from '@/lib/auth/auth.schemas';
 
 /** Aterrizaje del enlace de invitación: fija la contraseña y entra directo al workspace. */
 export const Route = createFileRoute('/invitacion/$token')({
@@ -32,8 +33,9 @@ function PantallaInvitacion() {
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
-    if (password.length < 10) {
-      setError('La contraseña necesita al menos 10 caracteres');
+    const politica = PasswordNuevaSchema.safeParse(password);
+    if (!politica.success) {
+      setError(politica.error.issues[0]?.message ?? 'Contraseña inválida');
       return;
     }
     if (password !== confirmar) {
@@ -72,11 +74,11 @@ function PantallaInvitacion() {
               name="password"
               autoComplete="new-password"
               required
-              minLength={10}
+              minLength={PASSWORD_MIN}
               autoFocus
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="mínimo 10 caracteres"
+              placeholder={`mínimo ${PASSWORD_MIN} caracteres`}
             />
           </label>
           <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -86,7 +88,7 @@ function PantallaInvitacion() {
               name="confirmar"
               autoComplete="new-password"
               required
-              minLength={10}
+              minLength={PASSWORD_MIN}
               value={confirmar}
               onChange={(e) => setConfirmar(e.target.value)}
             />

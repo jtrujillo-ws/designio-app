@@ -11,6 +11,10 @@ create table usuario (
   estado text not null default 'invitado' check (estado in ('invitado', 'activo', 'inactivo')),
   invitacion_token_hash text,
   invitacion_expira timestamptz,
+  -- El workspace cuya invitación EMITIÓ el token vigente: solo ese workspace puede
+  -- re-emitirlo. Evita que otro tenant obtenga un enlace que reclama esta cuenta
+  -- (takeover cross-tenant) o pise el enlace pendiente del emisor original.
+  invitacion_origen_ws uuid references workspace(id),
   creado_en timestamptz not null default now(),
   actualizado_en timestamptz not null default now()
 );
@@ -35,6 +39,13 @@ where m.usuario_id is null and lower(u.email) = lower(m.email);
 
 alter table miembro alter column usuario_id set not null;
 alter table miembro add constraint miembro_usuario_unico unique (workspace_id, usuario_id);
+
+-- La identidad de actor en la auditoría también pasa a usuario.id: se remapean los
+-- eventos históricos que registraron miembro.id (bases pre-auth) para que actor_id
+-- tenga una sola semántica. En una base fresca es un no-op.
+update evento_dominio e set actor_id = m.usuario_id
+from miembro m
+where e.actor_id = m.id;
 
 -- ── Recableado de helpers: app.user_id ahora es usuario.id ──
 -- (create or replace conserva dueño y grants de la migración anterior)
@@ -68,31 +79,47 @@ $$
   where lower(u.email) = lower(p_email)
 $$;
 
--- Invitación: crea el usuario si no existe; si existe sin activar, refresca su token.
--- Si ya está activo (o inactivo) devuelve su id sin tocar credenciales. La autorización de
--- QUIÉN invita la aplica la política de INSERT de miembro, en la misma transacción: si el
--- actor no puede agregar la membresía, todo (incluido este alta) se revierte.
+-- Invitación: crea el usuario si no existe (emitiendo token con este workspace como
+-- origen); si existe sin activar, SOLO el workspace de origen puede re-emitir el token
+-- (token_emitido dice si esta llamada emitió uno). Un workspace distinto agrega su
+-- membresía sin recibir ni pisar el token: evita el takeover cross-tenant de cuentas
+-- pendientes y que una segunda invitación invalide el enlace de la primera.
+-- Autoriza por sí misma (actor con rol que invita en p_workspace) además de la política
+-- de INSERT de miembro que aplica en la misma transacción.
 create or replace function preparar_invitacion(
-  p_email text, p_nombre text, p_token_hash text, p_expira timestamptz
-) returns table (usuario_id uuid, requiere_activacion boolean)
+  p_email text, p_nombre text, p_token_hash text, p_expira timestamptz, p_workspace uuid
+) returns table (usuario_id uuid, requiere_activacion boolean, token_emitido boolean)
 language plpgsql security definer set search_path = public as
 $$
 declare
   v_id uuid;
   v_estado text;
+  v_origen uuid;
+  v_emitido boolean := false;
 begin
-  select u.id, u.estado into v_id, v_estado from usuario u where lower(u.email) = lower(p_email);
+  if coalesce(workspace_role(app_user_id(), p_workspace), '') not in ('lead-boutique', 'admin-cliente') then
+    raise exception 'sin permiso para invitar en este workspace'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  select u.id, u.estado, u.invitacion_origen_ws
+    into v_id, v_estado, v_origen
+  from usuario u where lower(u.email) = lower(p_email);
+
   if v_id is null then
-    insert into usuario (email, nombre, estado, invitacion_token_hash, invitacion_expira)
-    values (p_email, p_nombre, 'invitado', p_token_hash, p_expira)
+    insert into usuario (email, nombre, estado, invitacion_token_hash, invitacion_expira, invitacion_origen_ws)
+    values (p_email, p_nombre, 'invitado', p_token_hash, p_expira, p_workspace)
     returning id into v_id;
     v_estado := 'invitado';
-  elsif v_estado = 'invitado' then
+    v_emitido := true;
+  elsif v_estado = 'invitado' and v_origen = p_workspace then
     update usuario u
     set invitacion_token_hash = p_token_hash, invitacion_expira = p_expira, actualizado_en = now()
     where u.id = v_id;
+    v_emitido := true;
   end if;
-  return query select v_id, (v_estado = 'invitado');
+
+  return query select v_id, (v_estado = 'invitado'), v_emitido;
 end
 $$;
 
@@ -106,6 +133,7 @@ $$
       estado = 'activo',
       invitacion_token_hash = null,
       invitacion_expira = null,
+      invitacion_origen_ws = null,
       actualizado_en = now()
   where u.invitacion_token_hash = p_token_hash
     and u.estado = 'invitado'
@@ -130,12 +158,12 @@ grant insert on miembro to designio_app;
 
 revoke execute on function
   usuario_para_login(text),
-  preparar_invitacion(text, text, text, timestamptz),
+  preparar_invitacion(text, text, text, timestamptz, uuid),
   activar_usuario_con_token(text, text)
 from public;
 
 grant execute on function
   usuario_para_login(text),
-  preparar_invitacion(text, text, text, timestamptz),
+  preparar_invitacion(text, text, text, timestamptz, uuid),
   activar_usuario_con_token(text, text)
 to designio_app;

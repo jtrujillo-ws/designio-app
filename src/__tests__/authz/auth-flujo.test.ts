@@ -5,6 +5,7 @@ import {
   autenticar,
   crearInvitacion,
   ErrorAutorizacion,
+  ErrorInvitacion,
   usuarioConMembresias,
 } from '@/lib/auth/auth.servicio';
 import { hashPassword } from '@/lib/auth/password.server';
@@ -18,12 +19,16 @@ import { describeAuthz } from './helpers';
 describeAuthz('auth nativa (login, invitación, activación)', () => {
   const marca = `auth-${crypto.randomUUID().slice(0, 8)}`;
   const emailLead = `${marca}-lead@test.demo`;
+  const emailLeadB = `${marca}-leadb@test.demo`;
   const emailStake = `${marca}-stake@test.demo`;
   const emailInvitada = `${marca}-inv@test.demo`;
+  const emailPendiente = `${marca}-pend@test.demo`;
   const emailColada = `${marca}-colada@test.demo`;
   const PASSWORD_LEAD = 'ClaveDeLead123';
   let ws = '';
+  let wsB = '';
   let leadId = '';
+  let leadBId = '';
   let stakeId = '';
   let coladaId = '';
   let invitadaId = '';
@@ -33,12 +38,21 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     const hash = await hashPassword(PASSWORD_LEAD);
     const [w] = await admin`insert into workspace (nombre) values (${marca}) returning id`;
     ws = w!.id as string;
+    const [wb] = await admin`insert into workspace (nombre) values (${marca + '-B'}) returning id`;
+    wsB = wb!.id as string;
 
     const [lead] = await admin`insert into usuario (email, nombre, password_hash, estado)
       values (${emailLead}, 'Lead Test', ${hash}, 'activo') returning id`;
     leadId = lead!.id as string;
     await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
       values (${ws}, ${leadId}, 'Lead Test', ${emailLead}, 'lead-boutique')`;
+
+    // Lead de OTRO tenant: para verificar que no puede reclamar cuentas pendientes ajenas.
+    const [leadB] = await admin`insert into usuario (email, nombre, password_hash, estado)
+      values (${emailLeadB}, 'Lead B Test', ${hash}, 'activo') returning id`;
+    leadBId = leadB!.id as string;
+    await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${wsB}, ${leadBId}, 'Lead B Test', ${emailLeadB}, 'lead-boutique')`;
 
     const [stake] = await admin`insert into usuario (email, nombre, password_hash, estado)
       values (${emailStake}, 'Stake Test', ${hash}, 'activo') returning id`;
@@ -54,10 +68,11 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
 
   afterAll(async () => {
     const admin = sqlAdmin();
-    await admin`delete from evento_dominio where workspace_id = ${ws}`;
-    await admin`delete from miembro where workspace_id = ${ws}`;
-    await admin`delete from workspace where id = ${ws}`;
-    await admin`delete from usuario where email in (${emailLead}, ${emailStake}, ${emailInvitada}, ${emailColada})`;
+    await admin`delete from evento_dominio where workspace_id in (${ws}, ${wsB})`;
+    await admin`delete from miembro where workspace_id in (${ws}, ${wsB})`;
+    await admin`delete from workspace where id in (${ws}, ${wsB})`;
+    await admin`delete from usuario where email in
+      (${emailLead}, ${emailLeadB}, ${emailStake}, ${emailInvitada}, ${emailPendiente}, ${emailColada})`;
     await cerrarPools();
   });
 
@@ -98,6 +113,7 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     invitadaId = inv.usuarioId;
     expect(inv.requiereActivacion).toBe(true);
     expect(inv.token).toBeTruthy();
+    expect(inv.reemision).toBe(false);
 
     // Sin activar todavía: sin password no hay login.
     expect(await autenticar(emailInvitada, 'ClaveNueva1234')).toBeNull();
@@ -119,6 +135,48 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     expect(await activarConToken('token-inventado', 'ClaveValida123')).toBeNull();
   });
 
+  it('re-emisión, y el token de una cuenta pendiente NUNCA sale hacia otro workspace (anti-takeover)', async () => {
+    // ws origina la invitación de una cuenta que queda pendiente.
+    const primera = await crearInvitacion(leadId, {
+      workspaceId: ws,
+      email: emailPendiente,
+      nombre: 'Pendiente Test',
+      rol: 'stakeholder',
+    });
+    expect(primera.token).toBeTruthy();
+
+    // El workspace de ORIGEN puede re-emitir el enlace (recupera invitaciones perdidas)…
+    const reemitida = await crearInvitacion(leadId, {
+      workspaceId: ws,
+      email: emailPendiente,
+      nombre: 'Pendiente Test',
+      rol: 'stakeholder',
+    });
+    expect(reemitida.reemision).toBe(true);
+    expect(reemitida.token).toBeTruthy();
+    // …y el enlace anterior queda invalidado.
+    expect(await activarConToken(primera.token!, 'ClaveCualquiera1')).toBeNull();
+
+    // Otro tenant invita el mismo email: agrega SU membresía pero no recibe token
+    // ni pisa el enlace del origen — no puede reclamar la cuenta pendiente.
+    const ajena = await crearInvitacion(leadBId, {
+      workspaceId: wsB,
+      email: emailPendiente,
+      nombre: 'Pendiente Test',
+      rol: 'stakeholder',
+    });
+    expect(ajena.usuarioId).toBe(primera.usuarioId);
+    expect(ajena.requiereActivacion).toBe(true);
+    expect(ajena.token).toBeNull();
+
+    // El enlace vigente del origen sigue funcionando y, al activar, la persona
+    // (dueña real de la cuenta) ve las membresías de ambos workspaces.
+    const activada = await activarConToken(reemitida.token!, 'ClaveDePendiente1');
+    expect(activada?.id).toBe(primera.usuarioId);
+    const perfil = await usuarioConMembresias(primera.usuarioId);
+    expect(perfil?.membresias.map((m) => m.workspaceId).sort()).toEqual([ws, wsB].sort());
+  });
+
   it('invitar a una cuenta ya activa agrega la membresía sin token nuevo', async () => {
     const inv = await crearInvitacion(leadId, {
       workspaceId: ws,
@@ -129,9 +187,10 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     expect(inv.usuarioId).toBe(coladaId);
     expect(inv.requiereActivacion).toBe(false);
     expect(inv.token).toBeNull();
+    expect(inv.reemision).toBe(false);
   });
 
-  it('invitar a quien ya es miembro falla por unicidad (la server function lo traduce)', async () => {
+  it('re-invitar a un miembro ya activo es un error de dominio claro', async () => {
     await expect(
       crearInvitacion(leadId, {
         workspaceId: ws,
@@ -139,6 +198,6 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
         nombre: 'Diseñadora Test',
         rol: 'disenador',
       }),
-    ).rejects.toMatchObject({ code: '23505' });
+    ).rejects.toThrow(ErrorInvitacion);
   });
 });

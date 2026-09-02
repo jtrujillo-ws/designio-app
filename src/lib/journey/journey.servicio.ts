@@ -1,0 +1,346 @@
+import '@/lib/server-only';
+import { conUsuario } from '@/lib/db';
+import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import type {
+  AgregarArista,
+  AgregarNodo,
+  CrearJourney,
+  EditarNodo,
+  JourneyCompleto,
+  ResumenJourney,
+} from './journey.schemas';
+
+/**
+ * Journeys como grafo tipado (SPEC-05). Capa 1: RLS — miembros leen (el journey es el
+ * lenguaje común con el cliente), curadores escriben y SOLO mientras el journey esté en
+ * borrador; los guards de la base impiden que una arista o una fase crucen de journey,
+ * cosa que las FKs compuestas no ven (garantizan el workspace, no el journey).
+ * Capa 2: estado de cuenta en toda operación y traducción de guards al contrato.
+ *
+ * El grafo se lee ENTERO en una sentencia: las vistas (Mermaid, tabla, carriles) y la
+ * validación son funciones puras sobre esa proyección, así que todas ven exactamente el
+ * mismo estado — no puede pasar que el diagrama muestre un paso que la validación ya no
+ * ve.
+ */
+
+export class ErrorJourney extends Error {}
+
+function comoErrorDeDominio(e: unknown): never {
+  const err = e as { code?: string; message?: string };
+  if (err.code === 'P0001' && err.message) throw new ErrorJourney(err.message);
+  if (err.code === '23503') throw new ErrorJourney('Alguna referencia no existe en este workspace');
+  if (err.code === '23505') throw new ErrorJourney('Ese elemento ya existe en el journey');
+  if (err.code === '42501') throw new ErrorJourney('El journey está congelado o no puedes editarlo');
+  throw e;
+}
+
+export async function crearJourney(
+  actorId: string,
+  entrada: CrearJourney,
+): Promise<{ journeyId: string }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    let fila;
+    try {
+      [fila] = await tx`
+        with quien as (
+          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
+        ),
+        nuevo as (
+          insert into journey (workspace_id, servicio_id, reto_id, tipo, nombre,
+                               descripcion, creado_por)
+          values (${entrada.workspaceId}, ${entrada.servicioId}, ${entrada.retoId},
+                  ${entrada.tipo}, ${entrada.nombre}, ${entrada.descripcion}, ${actorId})
+          returning id
+        ),
+        evento as (
+          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+          select ${entrada.workspaceId}, 'JourneyCreado',
+            jsonb_build_object('journeyId', nuevo.id, 'tipo', ${entrada.tipo}::text,
+                               'nombre', ${entrada.nombre}::text),
+            ${actorId}, quien.rol
+          from nuevo, quien
+        )
+        select id from nuevo`;
+    } catch (e) {
+      comoErrorDeDominio(e);
+    }
+    if (!fila) throw new ErrorJourney('No puedes crear journeys en este workspace');
+    return { journeyId: fila.id as string };
+  });
+}
+
+export async function agregarNodo(
+  actorId: string,
+  entrada: AgregarNodo,
+): Promise<{ nodoId: string }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    let fila;
+    try {
+      // El orden se calcula dentro de la misma sentencia: dos altas concurrentes no se
+      // pisan (el orden es presentacional y reordenar es una operación aparte).
+      [fila] = await tx`
+        insert into journey_nodo (workspace_id, journey_id, tipo, etiqueta, detalle,
+                                  fase_id, orden, responsable, creado_por)
+        select ${entrada.workspaceId}, ${entrada.journeyId}, ${entrada.tipo},
+          ${entrada.etiqueta}, ${entrada.detalle}, ${entrada.faseId},
+          coalesce((select max(orden) + 1 from journey_nodo n
+            where n.journey_id = ${entrada.journeyId}
+              and n.workspace_id = ${entrada.workspaceId}
+              and n.tipo = ${entrada.tipo}), 0),
+          ${entrada.responsable}, ${actorId}
+        returning id`;
+    } catch (e) {
+      comoErrorDeDominio(e);
+    }
+    if (!fila) throw new ErrorJourney('El journey no existe, está congelado o no puedes editarlo');
+    return { nodoId: fila.id as string };
+  });
+}
+
+export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    let filas;
+    try {
+      filas = await tx`
+        update journey_nodo
+        set etiqueta = ${entrada.etiqueta}, detalle = ${entrada.detalle},
+            fase_id = ${entrada.faseId}, orden = ${entrada.orden},
+            responsable = ${entrada.responsable}
+        where id = ${entrada.nodoId} and workspace_id = ${entrada.workspaceId}`;
+    } catch (e) {
+      comoErrorDeDominio(e);
+    }
+    if (filas!.count === 0) {
+      throw new ErrorJourney('El nodo no existe, su journey está congelado o no puedes editarlo');
+    }
+  });
+}
+
+export async function borrarNodo(
+  actorId: string,
+  workspaceId: string,
+  nodoId: string,
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    // Las aristas y los enlaces de evidencia del nodo se van con él: dejarlos sería
+    // dejar flechas que apuntan al vacío. Se borran explícitamente porque las FKs no
+    // tienen cascade (borrar en cascada por accidente es peor que fallar).
+    await tx`delete from journey_arista
+      where workspace_id = ${workspaceId} and (origen_id = ${nodoId} or destino_id = ${nodoId})`;
+    await tx`delete from journey_nodo_evidencia
+      where workspace_id = ${workspaceId} and nodo_id = ${nodoId}`;
+    // Los nodos que colgaban de esta fase quedan sueltos (la validación los reporta),
+    // que es más honesto que borrarlos en cadena sin que nadie lo pidiera.
+    await tx`update journey_nodo set fase_id = null
+      where workspace_id = ${workspaceId} and fase_id = ${nodoId}`;
+    const filas = await tx`delete from journey_nodo
+      where id = ${nodoId} and workspace_id = ${workspaceId}`;
+    if (filas.count === 0) {
+      throw new ErrorJourney('El nodo no existe, su journey está congelado o no puedes borrarlo');
+    }
+  });
+}
+
+export async function agregarArista(
+  actorId: string,
+  entrada: AgregarArista,
+): Promise<{ aristaId: string }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    let fila;
+    try {
+      [fila] = await tx`
+        insert into journey_arista (workspace_id, journey_id, origen_id, destino_id,
+                                    tipo, condicion, creado_por)
+        values (${entrada.workspaceId}, ${entrada.journeyId}, ${entrada.origenId},
+                ${entrada.destinoId}, ${entrada.tipo}, ${entrada.condicion}, ${actorId})
+        returning id`;
+    } catch (e) {
+      comoErrorDeDominio(e);
+    }
+    if (!fila) throw new ErrorJourney('El journey no existe, está congelado o no puedes editarlo');
+    return { aristaId: fila.id as string };
+  });
+}
+
+export async function borrarArista(
+  actorId: string,
+  workspaceId: string,
+  aristaId: string,
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`delete from journey_arista
+      where id = ${aristaId} and workspace_id = ${workspaceId}`;
+    if (filas.count === 0) {
+      throw new ErrorJourney('La arista no existe, su journey está congelado o no puedes borrarla');
+    }
+  });
+}
+
+export async function enlazarEvidenciaANodo(
+  actorId: string,
+  workspaceId: string,
+  nodoId: string,
+  evidenciaId: string,
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    try {
+      const filas = await tx`
+        insert into journey_nodo_evidencia (nodo_id, evidencia_id, workspace_id, creado_por)
+        values (${nodoId}, ${evidenciaId}, ${workspaceId}, ${actorId})
+        returning nodo_id`;
+      if (filas.length === 0) {
+        throw new ErrorJourney('No puedes enlazar evidencia en este workspace');
+      }
+    } catch (e) {
+      if (e instanceof ErrorJourney) throw e;
+      comoErrorDeDominio(e);
+    }
+  });
+}
+
+/**
+ * Congelar (RF-05.8, SYS-05): serializa el grafo completo y cierra el journey a
+ * edición. El snapshot y la transición van en la MISMA sentencia — un journey marcado
+ * congelado sin su snapshot sería una promesa rota, y al revés un snapshot huérfano.
+ */
+export async function congelarJourney(
+  actorId: string,
+  workspaceId: string,
+  journeyId: string,
+  motivo: string,
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`
+      with quien as (
+        select workspace_role(${actorId}, ${workspaceId}) as rol
+      ),
+      grafo as (
+        select jsonb_build_object(
+          'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.orden)
+            from journey_nodo n
+            where n.journey_id = ${journeyId} and n.workspace_id = ${workspaceId}), '[]'::jsonb),
+          'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en)
+            from journey_arista a
+            where a.journey_id = ${journeyId} and a.workspace_id = ${workspaceId}), '[]'::jsonb)
+        ) as contenido
+      ),
+      cerrado as (
+        update journey set estado = 'congelado'
+        where id = ${journeyId} and workspace_id = ${workspaceId} and estado = 'borrador'
+        returning id
+      ),
+      snap as (
+        insert into journey_snapshot (workspace_id, journey_id, motivo, grafo, congelado_por)
+        select ${workspaceId}, cerrado.id, ${motivo}, grafo.contenido, ${actorId}
+        from cerrado, grafo
+        returning id
+      ),
+      evento as (
+        insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        select ${workspaceId}, 'JourneyCongelado',
+          jsonb_build_object('journeyId', ${journeyId}::uuid, 'snapshotId', snap.id),
+          ${actorId}, quien.rol
+        from snap, quien
+      )
+      select id from snap`;
+    if (filas.length === 0) {
+      throw new ErrorJourney('El journey no existe, ya está congelado o no puedes congelarlo');
+    }
+  });
+}
+
+/** El grafo COMPLETO en una sentencia: todas las vistas derivan del mismo snapshot. */
+export async function journeyCompleto(
+  actorId: string,
+  workspaceId: string,
+  journeyId: string,
+): Promise<JourneyCompleto | null> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [fila] = await tx`
+      select j.id, j.servicio_id, s.nombre as servicio_nombre, j.reto_id, j.tipo,
+        j.nombre, j.descripcion, j.estado,
+        coalesce((
+          select jsonb_agg(jsonb_build_object(
+            'id', n.id, 'tipo', n.tipo, 'etiqueta', n.etiqueta, 'detalle', n.detalle,
+            'faseId', n.fase_id, 'orden', n.orden, 'responsable', n.responsable,
+            'evidencias', coalesce((
+              select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo)
+                order by e.titulo)
+              from journey_nodo_evidencia ne
+              join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
+              where ne.nodo_id = n.id and ne.workspace_id = n.workspace_id
+            ), '[]'::jsonb))
+            order by n.tipo, n.orden)
+          from journey_nodo n
+          where n.journey_id = j.id and n.workspace_id = j.workspace_id
+        ), '[]'::jsonb) as nodos,
+        coalesce((
+          select jsonb_agg(jsonb_build_object(
+            'id', a.id, 'origenId', a.origen_id, 'destinoId', a.destino_id,
+            'tipo', a.tipo, 'condicion', a.condicion)
+            order by a.creado_en)
+          from journey_arista a
+          where a.journey_id = j.id and a.workspace_id = j.workspace_id
+        ), '[]'::jsonb) as aristas,
+        coalesce((
+          select jsonb_agg(jsonb_build_object(
+            'id', sn.id, 'motivo', sn.motivo,
+            'congeladoEn', to_char(sn.congelado_en, 'YYYY-MM-DD'))
+            order by sn.congelado_en desc)
+          from journey_snapshot sn
+          where sn.journey_id = j.id and sn.workspace_id = j.workspace_id
+        ), '[]'::jsonb) as snapshots
+      from journey j
+      join servicio s on s.id = j.servicio_id and s.workspace_id = j.workspace_id
+      where j.id = ${journeyId} and j.workspace_id = ${workspaceId}`;
+    if (!fila) return null;
+    return {
+      id: fila.id as string,
+      servicioId: fila.servicio_id as string,
+      servicioNombre: fila.servicio_nombre as string,
+      retoId: (fila.reto_id as string | null) ?? null,
+      tipo: fila.tipo as JourneyCompleto['tipo'],
+      nombre: fila.nombre as string,
+      descripcion: fila.descripcion as string,
+      estado: fila.estado as JourneyCompleto['estado'],
+      nodos: fila.nodos as JourneyCompleto['nodos'],
+      aristas: fila.aristas as JourneyCompleto['aristas'],
+      snapshots: fila.snapshots as JourneyCompleto['snapshots'],
+    };
+  });
+}
+
+export async function journeysDelWorkspace(
+  actorId: string,
+  workspaceId: string,
+): Promise<ResumenJourney[]> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`
+      select j.id, j.nombre, j.tipo, j.estado, s.nombre as servicio_nombre,
+        (select count(*)::int from journey_nodo n
+          where n.journey_id = j.id and n.workspace_id = j.workspace_id) as nodos
+      from journey j
+      join servicio s on s.id = j.servicio_id and s.workspace_id = j.workspace_id
+      where j.workspace_id = ${workspaceId}
+      order by j.creado_en desc
+      limit 200`;
+    return filas.map((f) => ({
+      id: f.id as string,
+      nombre: f.nombre as string,
+      tipo: f.tipo as ResumenJourney['tipo'],
+      estado: f.estado as ResumenJourney['estado'],
+      servicioNombre: f.servicio_nombre as string,
+      nodos: f.nodos as number,
+    }));
+  });
+}

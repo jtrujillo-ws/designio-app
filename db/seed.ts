@@ -94,6 +94,77 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
     (${wsId}, 'RetoActivado', ${tx.json({ codigo: 'R-01', proyecto: 'P-01', perfil: 'estandar' })}, ${luciaId}, 'lead-boutique')`;
 }
 
+/**
+ * Journey as-is del servicio (SPEC-05): un grafo pequeño pero completo — dos fases con
+ * sus pasos, el canal donde ocurren, el sistema que los sostiene y la fricción que duele.
+ *
+ * Deliberadamente SIN evidencia enlazada: la pantalla de validación tiene que mostrar
+ * señales de verdad en la demo. Un journey de ejemplo que sale impecable enseñaría a
+ * ignorar el informe. Devuelve si lo creó en esta corrida.
+ */
+async function sembrarJourney(tx: TransactionSql, wsId: string, luciaId: string): Promise<boolean> {
+  const [svc] = await tx`select id from servicio
+    where workspace_id = ${wsId} and nombre = 'Apertura de cuenta nómina digital'`;
+  if (!svc) return false;
+  const existe = await tx`select 1 from journey where workspace_id = ${wsId}`;
+  if (existe.length > 0) return false;
+  const svcId = svc.id as string;
+
+  const [r01] = await tx`select id from reto where workspace_id = ${wsId} and codigo = 'R-01'`;
+  const [j] = await tx`insert into journey
+    (workspace_id, servicio_id, reto_id, tipo, nombre, descripcion, creado_por) values
+    (${wsId}, ${svcId}, ${(r01?.id as string) ?? null}, 'as-is', 'Apertura hoy',
+     'Desde que el empleado recibe el enlace del convenio hasta su primer movimiento',
+     ${luciaId}) returning id`;
+  const jId = j!.id as string;
+
+  /** Alta de un nodo devolviendo su id: el orden se pasa explícito porque aquí el
+   * grafo se escribe entero de una vez y su secuencia es parte del ejemplo. */
+  async function nodo(
+    tipo: string,
+    etiqueta: string,
+    orden: number,
+    faseId: string | null,
+    responsable = '',
+  ): Promise<string> {
+    const [n] = await tx`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, fase_id, orden, responsable, creado_por)
+      values (${wsId}, ${jId}, ${tipo}, ${etiqueta}, ${faseId}, ${orden}, ${responsable}, ${luciaId})
+      returning id`;
+    return n!.id as string;
+  }
+
+  const solicitud = await nodo('fase', 'Solicitud', 0, null);
+  const verificacion = await nodo('fase', 'Verificación', 1, null);
+
+  const abre = await nodo('paso', 'Abre el enlace del convenio', 0, solicitud);
+  const datos = await nodo('paso', 'Completa sus datos', 1, solicitud);
+  const documento = await nodo('paso', 'Sube el documento de identidad', 2, verificacion);
+  const espera = await nodo('paso', 'Espera la validación', 3, verificacion);
+  const firma = await nodo('paso', 'Firma el contrato', 4, verificacion);
+
+  const app = await nodo('canal', 'App móvil', 0, null);
+  const core = await nodo('sistema', 'Core bancario', 0, null, 'Tecnología');
+  const buro = await nodo('accion-backstage', 'Valida contra el buró', 0, verificacion, 'Riesgo');
+  const rechazo = await nodo('friccion', 'Rechazo sin motivo explicado', 0, verificacion);
+
+  await tx`insert into journey_arista
+    (workspace_id, journey_id, origen_id, destino_id, tipo, condicion, creado_por) values
+    (${wsId}, ${jId}, ${abre}, ${datos}, 'transicion', '', ${luciaId}),
+    (${wsId}, ${jId}, ${datos}, ${documento}, 'transicion', '', ${luciaId}),
+    (${wsId}, ${jId}, ${documento}, ${espera}, 'transicion', '', ${luciaId}),
+    (${wsId}, ${jId}, ${espera}, ${firma}, 'transicion', 'documento aceptado', ${luciaId}),
+    (${wsId}, ${jId}, ${espera}, ${documento}, 'transicion', 'documento rechazado', ${luciaId}),
+    (${wsId}, ${jId}, ${abre}, ${app}, 'ocurre-en', '', ${luciaId}),
+    (${wsId}, ${jId}, ${core}, ${espera}, 'soporta', '', ${luciaId}),
+    (${wsId}, ${jId}, ${buro}, ${espera}, 'soporta', '', ${luciaId}),
+    (${wsId}, ${jId}, ${rechazo}, ${espera}, 'duele', '', ${luciaId})`;
+
+  await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
+    (${wsId}, 'JourneyCreado', ${tx.json({ nombre: 'Apertura hoy', tipo: 'as-is', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
+  return true;
+}
+
 /** Segundo workspace de Lucía (demo del selector multi-membresía): mínimo pero real —
  * un servicio, sin retos aún. Idempotente por MEMBRESÍA de Lucía + nombre: el nombre
  * de workspace no es único y uno homónimo ajeno no debe saltarse el seed. Devuelve si
@@ -144,6 +215,12 @@ async function main() {
       await sql.begin((tx) => sembrarMetodo(tx, wsId, lucia.id as string));
       metodoSembrado = true;
     }
+    // Upgrade de bases sembradas antes del journey (SPEC-05): la función se auto-guarda
+    // por presencia de journeys en el workspace.
+    let journeySembrado = false;
+    if (lucia) {
+      journeySembrado = await sql.begin((tx) => sembrarJourney(tx, wsId, lucia.id as string));
+    }
     // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía
     // (la función se auto-guarda por membresía+nombre, sin chequeo duplicado aquí).
     let segundoSembrado = false;
@@ -154,6 +231,7 @@ async function main() {
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
         (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
         (metodoSembrado ? '; método de P-01 sembrado' : '') +
+        (journeySembrado ? '; journey as-is sembrado' : '') +
         (segundoSembrado ? '; Clínica del Valle sembrada' : ''),
     );
     return;
@@ -183,10 +261,11 @@ async function main() {
 
     await sembrarArbol(tx, wsId, luciaId);
     await sembrarMetodo(tx, wsId, luciaId);
+    await sembrarJourney(tx, wsId, luciaId);
     await sembrarSegundoWorkspace(tx, luciaId);
   });
   console.log(
-    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
+    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, journey as-is) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );
 }
 

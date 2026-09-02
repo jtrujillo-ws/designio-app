@@ -7,8 +7,8 @@ version: "0.2"
 status: draft
 language: es
 audience: engineering
-tags: [diseno-tecnico, arquitectura, stack, bun, tanstack-start, postgresql, multi-tenant, ai, gcp]
-summary: "Diseño técnico del MVP sobre el stack estándar interno de Whitespace: Bun + TanStack Start SSR con server functions tipadas, PostgreSQL fuertemente multi-tenant con RLS activo desde el día 1 más autorización server-side (dos capas), scheduler in-app sin infraestructura de colas, capa AI sobre el SDK de Anthropic con cuotas fail-safe por workspace, CI de checks gating y despliegue en Google Cloud Run. Design system propio «El arco del loop» con tokens versionados en la app."
+tags: [diseno-tecnico, arquitectura, stack, bun, tanstack-start, postgresql, multi-tenant, ai, railway]
+summary: "Diseño técnico del MVP sobre el stack estándar interno de Whitespace: Bun + TanStack Start SSR con server functions tipadas, PostgreSQL fuertemente multi-tenant con RLS activo desde el día 1 más autorización server-side (dos capas), scheduler in-app sin infraestructura de colas, capa AI sobre el SDK de Anthropic con cuotas fail-safe por workspace, CI de checks gating y despliegue en Railway (servicio Docker + PostgreSQL gestionado, un environment por rama). Design system propio «El arco del loop» con tokens versionados en la app."
 ---
 
 ## Tabla de contenido
@@ -44,7 +44,7 @@ summary: "Diseño técnico del MVP sobre el stack estándar interno de Whitespac
 
 ## Resumen ejecutivo
 
-El MVP se construye como **una sola aplicación full-stack SSR** sobre el stack estándar interno de Whitespace, ya probado en producción: **Bun** como único runtime y gestor de paquetes, **TanStack Start** (React 19 + Vite) con **server functions tipadas** extremo a extremo como única capa de lógica de negocio, **PostgreSQL accedido directamente** (cliente `postgres`, sin ORM) y **fuertemente multi-tenant: RLS activo desde el día 1** (rol de aplicación no privilegiado + contexto de tenant por transacción) **más la autorización de tenant/rol re-aplicada en cada server function** — dos capas independientes verificadas por una suite de tests contra base real —, un **scheduler in-app** sin infraestructura de colas (tabla de jobs + tick + claim latch, con Cloud Tasks/Scheduler como complemento para trabajos pesados), y despliegue en **Google Cloud Run** con Cloud Build, Cloud SQL, Cloud Storage y Secret Manager. La capa AI corre sobre el **SDK de Anthropic** con política de modelos primario/fallback centralizada en constantes, **BYOAI por workspace** (coherente con la propiedad del cliente, ADR-0011) y **cuotas fail-safe** por workspace. La estructura interna del monolito se alinea 1:1 con los ocho bounded contexts del modelo de dominio, y las invariantes SYS-* se convierten en checks gating de CI (incluida la suite de autorización contra Postgres real, la batería "AI off" y un smoke E2E con Playwright contra el build de producción). El **design system es propio — «El arco del loop»** (definido por el fundador, sep-2026): firma cromática de 7 hues oklch que mapean los journeys J1–J7, Figtree + IBM Plex Mono, tokens versionados como fuente de verdad en `src/styles/tokens/` y el handoff completo en `.claude/skills/designio-design/`.
+El MVP se construye como **una sola aplicación full-stack SSR** sobre el stack estándar interno de Whitespace, ya probado en producción: **Bun** como único runtime y gestor de paquetes, **TanStack Start** (React 19 + Vite) con **server functions tipadas** extremo a extremo como única capa de lógica de negocio, **PostgreSQL accedido directamente** (cliente `postgres`, sin ORM) y **fuertemente multi-tenant: RLS activo desde el día 1** (rol de aplicación no privilegiado + contexto de tenant por transacción) **más la autorización de tenant/rol re-aplicada en cada server function** — dos capas independientes verificadas por una suite de tests contra base real —, un **scheduler in-app** sin infraestructura de colas (tabla de jobs + tick + claim latch, con un disparador HTTP externo —un servicio cron de Railway que llama el hook y termina— como respaldo para trabajos pesados), y despliegue en **Railway**: servicio Docker + PostgreSQL gestionado del propio proyecto, con environments `dev`/`stg`/`production` sobre las ramas `dev`/`stg`/`main`. La capa AI corre sobre el **SDK de Anthropic** con política de modelos primario/fallback centralizada en constantes, **BYOAI por workspace** (coherente con la propiedad del cliente, ADR-0011) y **cuotas fail-safe** por workspace. La estructura interna del monolito se alinea 1:1 con los ocho bounded contexts del modelo de dominio, y las invariantes SYS-* se convierten en checks gating de CI (incluida la suite de autorización contra Postgres real, la batería "AI off" y un smoke E2E con Playwright contra el build de producción). El **design system es propio — «El arco del loop»** (definido por el fundador, sep-2026): firma cromática de 7 hues oklch que mapean los journeys J1–J7, Figtree + IBM Plex Mono, tokens versionados como fuente de verdad en `src/styles/tokens/` y el handoff completo en `.claude/skills/designio-design/`.
 
 ## Alcance y relación con el resto del paquete
 
@@ -81,18 +81,18 @@ Stack del MVP, fijado al estándar interno de Whitespace, con el **design system
 | UI | **React 19** + **TanStack Query** (estado asíncrono; near-real-time por **polling**, sin WebSockets) |
 | Estilos / componentes | **Tailwind CSS v4** como base + **design system propio «El arco del loop»** (handoff v1 en `.claude/skills/designio-design/`; tokens como CSS variables en `src/styles/tokens/`, fuente de verdad): Figtree + IBM Plex Mono, arco cromático J1–J7 en oklch, primitivas propias (Button, Chip, JourneyBadge, Card, Tabs, …); Radix UI se incorpora cuando lleguen primitivas complejas (dialogs, menús) |
 | Formularios / validación | react-hook-form + **Zod** (los mismos esquemas se reutilizan server-side; todo input externo se parsea antes de tocar lógica) |
-| Base de datos | **PostgreSQL 15** (Cloud SQL en nube; Docker en local/CI) + extensión **pgvector** (adición de este producto para búsqueda semántica intra-workspace) |
+| Base de datos | **PostgreSQL 15** (Postgres gestionado de Railway en nube; Docker en local/CI) + extensión **pgvector** (adición de este producto para búsqueda semántica intra-workspace) |
 | Acceso a datos | Cliente **`postgres`** (pool único configurado por `DATABASE_URL`, **rol de aplicación no privilegiado**); **RLS activo** con contexto de tenant por transacción; **sin ORM**: SQL etiquetado en módulos `*-queries.ts` por contexto |
 | Migraciones | SQL **forward-only** aplicadas en orden de nombre, exactamente una vez, con ledger (`schema_migrations`); aplicadas en el arranque del contenedor |
 | Autenticación | **Nativa**: bcrypt + **JWT stateless** en cookie `HttpOnly`/`Secure`/`SameSite=Lax`; invitaciones, verificación y recovery por email (JWT de un solo uso); **IAP de Google como defensa en profundidad opcional** (dormida, reactivable por configuración) |
-| Jobs y cadencias | **Scheduler in-app** (tabla `scheduled_jobs` + tick auto-throttleado + claim latch atómico) con hooks HTTP `x-cron-secret` timing-safe; **Cloud Tasks/Scheduler** como disparador de trabajos pesados on-demand y backstop de puntualidad |
-| Almacenamiento de archivos | **Google Cloud Storage** con doble backend (bucket en nube / filesystem local); acceso por **tokens de capacidad JWT por objeto**; la app **proxya los bytes** (sin URLs públicas del bucket) |
+| Jobs y cadencias | **Scheduler in-app** (tabla `scheduled_jobs` + tick auto-throttleado + claim latch atómico) con hooks HTTP `x-cron-secret` timing-safe; disparo inmediato vía hook interno y un **servicio cron de Railway** (comando corto que invoca el hook y termina) como backstop de puntualidad |
+| Almacenamiento de archivos | Object storage **compatible S3** (R2/S3; se contrata cuando llegue la evidencia binaria) con doble backend (bucket en nube / filesystem local); acceso por **tokens de capacidad JWT por objeto**; la app **proxya los bytes** (sin URLs públicas del bucket) |
 | Correo | SMTP con nodemailer; **no-op con logging** si faltan credenciales |
 | LLM | **SDK de Anthropic**; política de modelos **primario/fallback centralizada en constantes** (hoy: `claude-sonnet-5` con fallback `claude-sonnet-4-6`); **BYOAI por workspace** con fallback a la key del entorno |
 | STT / diarización | Servicio gestionado (selección con prueba de diarización en español en el scaffolding) |
 | Testing | **Vitest** en tres estratos (unit puro, componentes, y **suite de autorización contra Postgres real**) + **Playwright** (smoke E2E contra el build de producción) |
-| CI/CD | **GitHub Actions** con checks gating (ver [Estrategia de pruebas y CI](#estrategia-de-pruebas-y-ci)); despliegue por **Cloud Build** desde el repo de IaC |
-| Nube | **Google Cloud**: Cloud Run (puerto 8080), Cloud SQL, Cloud Storage (ADC, sin key files), Secret Manager, Cloud Scheduler/Tasks |
+| CI/CD | **GitHub Actions** con checks gating (ver [Estrategia de pruebas y CI](#estrategia-de-pruebas-y-ci)); despliegue automático de **Railway** al hacer push a la rama de cada environment |
+| Nube | **Railway** (elección operativa del fundador, sep-2026): servicio web por Dockerfile (respeta `PORT`, healthcheck `/healthz` en `railway.json`), PostgreSQL del proyecto, variables/secrets por environment, servicio cron para backstops; runbook en [`despliegue-railway.md`](despliegue-railway.md) |
 
 ## Principios técnicos
 
@@ -118,16 +118,16 @@ flowchart TD
     B["Navegador - portal y app<br/>(boutique y cliente)"]
   end
 
-  subgraph App["Aplicación SSR única (Cloud Run, puerto 8080)"]
+  subgraph App["Aplicación SSR única (Railway, contenedor Docker, puerto PORT)"]
     W["TanStack Start SSR<br/>server functions *.functions.ts"]
     AUTH["Auth nativa JWT<br/>middleware requireAuth"]
     SCH["Scheduler in-app<br/>tabla scheduled_jobs + tick"]
   end
 
-  subgraph Datos["Datos (GCP)"]
-    PG[("PostgreSQL - Cloud SQL<br/>agregados, grafo, eventos,<br/>RLS activo, pgvector")]
-    OS[("Cloud Storage<br/>evidencia binaria - proxy de bytes")]
-    SM[("Secret Manager")]
+  subgraph Datos["Datos (Railway)"]
+    PG[("PostgreSQL gestionado<br/>agregados, grafo, eventos,<br/>RLS activo, pgvector")]
+    OS[("Object storage S3 (futuro)<br/>evidencia binaria - proxy de bytes")]
+    SM[("Variables y secrets<br/>por environment")]
   end
 
   subgraph Ext["Servicios externos"]
@@ -135,7 +135,7 @@ flowchart TD
     STT["STT con diarización"]
     AV["Escaneo de malware"]
     MAIL["SMTP transaccional"]
-    CT["Cloud Tasks / Scheduler<br/>hooks x-cron-secret"]
+    CT["Servicio cron de Railway<br/>llama hooks x-cron-secret y termina"]
   end
 
   B --> W
@@ -155,7 +155,7 @@ flowchart TD
   class LLM,STT,AV,MAIL,CT ext
 ```
 
-Notas: **una sola aplicación desplegable** (P7) que renderiza el frontend, ejecuta las server functions y expone las rutas de API (adjuntos con proxy, hooks de jobs, streaming AI). No hay Redis ni broker de colas: las cadencias las lleva el scheduler in-app y los trabajos pesados on-demand (transcripción, extracción, escaneo) se encolan en la misma tabla de jobs y se disparan por hook HTTP vía Cloud Tasks para no depender del tráfico. El "tiempo real" del portal (comentarios, aprobaciones, snapshots) es polling con TanStack Query; el streaming SSE se reserva para superficies AI conversacionales si el MVP las necesita.
+Notas: **una sola aplicación desplegable** (P7) que renderiza el frontend, ejecuta las server functions y expone las rutas de API (adjuntos con proxy, hooks de jobs, streaming AI). No hay Redis ni broker de colas: las cadencias las lleva el scheduler in-app y los trabajos pesados on-demand (transcripción, extracción, escaneo) se encolan en la misma tabla de jobs y se disparan de inmediato vía el hook interno (con el servicio cron de Railway como barrido de respaldo), para no depender del tráfico. El "tiempo real" del portal (comentarios, aprobaciones, snapshots) es polling con TanStack Query; el streaming SSE se reserva para superficies AI conversacionales si el MVP las necesita.
 
 ### Módulos y bounded contexts
 
@@ -180,7 +180,7 @@ Flujo 1 — importación con curaduría (SPEC-03, P5):
 sequenceDiagram
   actor U as Usuario boutique
   participant W as Server function
-  participant J as Job (tabla + Cloud Tasks)
+  participant J as Job (tabla + hook HTTP)
   participant AV as Escaneo
   participant AI as SDK Anthropic
   participant PG as PostgreSQL
@@ -252,7 +252,7 @@ create table arista (
 
 ### Archivos y evidencia binaria
 
-- **Doble backend heredado**: bucket GCS en nube (Application Default Credentials de la service account — sin key files) / filesystem en local; claves prefijadas por workspace.
+- **Doble backend heredado**: bucket S3-compatible en nube (credenciales por variables de entorno) / filesystem en local; claves prefijadas por workspace.
 - Acceso autorizado con **JWT cortos de capacidad por objeto**; la app **proxya los bytes** por sus rutas de upload/download y nunca expone URLs del bucket.
 - Pipeline de entrada: cuarentena → escaneo/validación (RF-09.8) → almacenamiento definitivo → derivados (preview, OCR, transcripción) como objetos ligados a la fuente con lineage. Metadatos (Postgres) y bytes (store) con durabilidades distintas: huérfanos marcados solo ante ausencia comprobada, nunca por fallo transitorio.
 - La exportación (SYS-04) empaqueta datos (JSON por catálogo de objetos) + archivos + auditoría, verificada contra manifiesto.
@@ -267,9 +267,11 @@ Sin broker de colas: el patrón heredado es una tabla `scheduled_jobs` con caden
 
 | Tipo de trabajo | Ejemplos en este producto | Mecanismo |
 |---|---|---|
-| Cadencias | Recordatorios de snapshots (RF-07.4), cierre de ventanas (`VentanaCerrada`), evals de grounding programadas, purga/retención | Scheduler in-app + hook HTTP de backstop (`x-cron-secret` timing-safe) vía Cloud Scheduler |
-| On-demand pesado | Transcripción/diarización, extracción de importación, escaneo, generación de propuestas largas | Fila en la misma tabla + **disparo inmediato por Cloud Tasks** contra el hook (no depende del tráfico); reintentos con backoff en la fila |
+| Cadencias | Recordatorios de snapshots (RF-07.4), cierre de ventanas (`VentanaCerrada`), evals de grounding programadas, purga/retención | Scheduler in-app + hook HTTP de backstop (`x-cron-secret` timing-safe) vía el servicio cron de Railway |
+| On-demand pesado | Transcripción/diarización, extracción de importación, escaneo, generación de propuestas largas | Fila en la misma tabla + **disparo inmediato**: la server function invoca el hook de jobs tras encolar (fire-and-forget) y el servicio cron de Railway barre pendientes/reintentos con backoff |
 | Síncrono | Validación de grafo, checklists de gate, render Mermaid | En la server function (rápidos y deterministas) |
+
+El backstop externo es un **servicio cron aparte** en el proyecto de Railway, no un schedule sobre el servicio `app`: el cron de Railway ejecuta el start command del servicio programado y **exige que el proceso termine** (no hace llamadas HTTP por sí mismo), así que su comando es un one-shot que invoca el hook `x-cron-secret` (p. ej. `curl -fsS`) y sale.
 
 Limitación honesta heredada: con scale-to-zero, un job de cadencia sin backstop corre en el primer request posterior; por eso los trabajos con puntualidad dura (recordatorios comprometidos en G6) llevan siempre el disparador externo.
 
@@ -321,7 +323,7 @@ Mapeo de §14/SPEC-09 a mecanismos concretos del stack:
 | Rutas públicas | Solo por **tokens de capacidad** de alcance mínimo (compartir en solo-lectura, opt-out), con `noindex`/`no-referrer` y navegación que no muta |
 | No confiable (RF-09.7) | Parsers con validación de formato; prompts con delimitación estricta; sin herramientas de escritura expuestas a contenido externo; bounds en contenido persistido |
 | Malware (RF-09.8) | Cuarentena + escaneo previo a preview/AI |
-| Cifrado y secretos (RF-09.6) | TLS extremo a extremo; cifrado at-rest (Cloud SQL/GCS); **Secret Manager** (sin key files: ADC); secretos de cron comparados timing-safe |
+| Cifrado y secretos (RF-09.6) | TLS extremo a extremo; cifrado at-rest del Postgres gestionado; **variables/secrets de Railway por environment** (sin key files en el repo); secretos de cron comparados timing-safe |
 | Ciclo de vida (RF-09.4/5) | Consentimiento como dato bloqueante en `evidencia`; export por manifiesto; borrado con verificación (incluye derivados y embeddings); retención de contenido AI |
 | Auditoría (RF-09.13) | `evento_dominio` append-only sin permiso de borrado a nivel de rol de base |
 | Supply chain | Audit de dependencias como gate de CI; cuarentena de 24 h para versiones recién publicadas; overrides de transitivas sensibles; escaneo de secretos sobre todo el historial |
@@ -330,7 +332,7 @@ Mapeo de §14/SPEC-09 a mecanismos concretos del stack:
 
 - Logs estructurados (Cloud Logging) con `workspace_id`, actor y módulo — nunca contenido sensible de evidencia.
 - Métricas AI (costo, latencia, error, aceptación por capacidad y por workspace, RF-08.9) como contadores propios en base — los mismos que aplican las cuotas — expuestos en un panel interno; las métricas de producto (§17) se derivan de datos de dominio.
-- Trazas en flujos con proveedor externo (importación, generación, STT) para diagnóstico de latencia; alertas mínimas sobre tasa de error de Cloud Run y fallos de jobs.
+- Trazas en flujos con proveedor externo (importación, generación, STT) para diagnóstico de latencia; alertas mínimas sobre tasa de error del servicio y fallos de jobs.
 
 ## Estrategia de pruebas y CI
 
@@ -351,7 +353,7 @@ Checks gating de CI (GitHub Actions, Bun con versión fijada, mínimo privilegio
 ## Despliegue, entornos y flujo de ramas
 
 - **Local**: modo híbrido recomendado (Postgres en Docker + `bun run dev` con hot reload) o todo-en-contenedores; seed con el workspace demo del ejemplo §19; correos/tokens a logs; bypass de auth solo-desarrollo jamás disponible en nube.
-- **Nube**: imagen Docker (base Bun alpine, `--frozen-lockfile`, build de producción, puerto 8080; el entrypoint aplica migraciones) servida por **Cloud Run**; el despliegue vive en el **repo de IaC**: push a rama de ambiente dispara Cloud Build, que construye y despliega al proyecto GCP del ambiente y notifica el estado.
+- **Nube (Railway)**: imagen Docker (base Bun alpine, `--frozen-lockfile`, build de producción; el entrypoint aplica migraciones y el server respeta `PORT`) desplegada automáticamente al hacer push a la rama de cada environment (ramas `dev`/`stg`/`main` → environments `dev`/`stg`/`production`), con healthcheck `/healthz` gating el rollout — un fallo de migración bloquea el deploy. Configuración en `railway.json`; runbook completo en [`despliegue-railway.md`](despliegue-railway.md).
 - **Flujo de ramas heredado**: promoción lineal **`agents → dev → stg → main`**, sin desarrollo directo en ramas de ambiente; las features nacen en ramas `claude/<topic>-<short-id>` desde `agents` y entran por squash-merge secuencial. (Este repo ya sigue la convención: `agents` es la rama default.)
 - **Entornos**: `dev` y `stg` con datos sintéticos (§19); `prod` solo para el piloto real. Configuración exclusivamente por variables de entorno (plantilla `.env.local.example`); backups automáticos de base y storage con prueba de restauración documentada.
 - Feature flags mínimos: `ai_enabled` (global y por workspace) y capacidades C0–CI conmutables.
@@ -362,7 +364,7 @@ Checks gating de CI (GitHub Actions, Bun con versión fijada, mínimo privilegio
 |---|---|---|
 | Iconografía del design system | Lucide (stroke 1.75, 16/20px) propuesto en el handoff, pendiente de confirmación del fundador | Primera superficie que necesite iconos |
 | Ergonomía del contexto RLS con el pool | `sql.begin` + `SET LOCAL` por request vs. helper de contexto propio; costo de la transacción por lectura | Prueba técnica en el scaffolding (la decisión de RLS activo ya está tomada) |
-| Ejecución de trabajos pesados | Hook en la misma instancia (CPU asignada) vs. servicio Cloud Run worker con la misma imagen | Duración real de transcripciones del piloto |
+| Ejecución de trabajos pesados | Hook en la misma instancia vs. segundo servicio worker en Railway con la misma imagen | Duración real de transcripciones del piloto |
 | Proveedor STT | Según prueba de diarización en español | Scaffolding (SPEC-03) |
 | Motor de reglas de checklists (datos vs. código) | Checklists como datos versionados en `biblioteca` | Definición metodológica de la boutique |
 | Render Mermaid en servidor para exports | Cliente-only vs. render headless para PDF/actas | Necesidad real de exports en el piloto |

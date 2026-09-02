@@ -113,9 +113,14 @@ create table checklist_item (
   unique (gate_id, orden),
   foreign key (gate_id, workspace_id) references gate_instancia (id, workspace_id),
   foreign key (evidencia_id, workspace_id) references evidencia (id, workspace_id),
-  check (estado <> 'cumplido' or evidencia_id is not null),
-  check (estado <> 'na' or (na_justificacion <> '' and na_aprobado_por is not null)),
-  check (estado <> 'pendiente' or (evidencia_id is null and na_aprobado_por is null))
+  -- Cada estado con su payload EXCLUSIVO y significativo: whitespace no es
+  -- justificación, un na no arrastra evidencia ni un cumplido restos de N/A.
+  check (estado <> 'cumplido' or (evidencia_id is not null
+    and btrim(na_justificacion) = '' and na_aprobado_por is null)),
+  check (estado <> 'na' or (btrim(na_justificacion) <> '' and na_aprobado_por is not null
+    and evidencia_id is null)),
+  check (estado <> 'pendiente' or (evidencia_id is null and na_aprobado_por is null
+    and btrim(na_justificacion) = ''))
 );
 create index checklist_item_gate_idx on checklist_item (workspace_id, gate_id);
 
@@ -331,6 +336,31 @@ create policy checklist_update on checklist_item
 -- snapshot fresco, así que quien llega segundo ve lo que el primero commiteó mientras
 -- esperaba. SECURITY DEFINER porque bloquear la fila del gate bajo RLS exigiría pasar
 -- el USING de la política de aprobación, que un curador no cumple.
+-- El ciclo de vida del reto es de sentido único (RF-04.12) y las políticas solo ven la
+-- fila nueva: los pares viejo→nuevo legales los exige este guard. Se admite descartar
+-- un candidato (candidato→archivado); nada vuelve atrás.
+create function reto_estado_transicion_guard() returns trigger
+language plpgsql as $$
+begin
+  if new.estado = old.estado then
+    return new;
+  end if;
+  if (old.estado, new.estado) not in (
+    ('candidato', 'activo'),
+    ('candidato', 'archivado'),
+    ('activo', 'en-medicion'),
+    ('en-medicion', 'cerrado'),
+    ('cerrado', 'archivado')
+  ) then
+    raise exception 'transición de reto ilegal: % → %', old.estado, new.estado;
+  end if;
+  return new;
+end $$;
+create trigger reto_estado_transicion
+  before update of estado on reto
+  for each row execute function reto_estado_transicion_guard();
+revoke execute on function reto_estado_transicion_guard() from public;
+
 create function checklist_gate_pendiente_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin

@@ -482,6 +482,21 @@ describeAuthz('método: etapas, gates y checklists', () => {
         where id = ${g0.id}`),
     ).rejects.toThrow(/criterios incompletos/);
 
+    // El CHECK exige justificación REAL y payload exclusivo para el N/A: espacios no
+    // justifican, ni siquiera desde el propio rol aprobador por SQL directo.
+    const g1 = p!.gates[1]!;
+    await expect(
+      conUsuario(leadId, (tx) => tx`update checklist_item
+        set estado = 'na', na_justificacion = '   ', na_aprobado_por = ${leadId}
+        where id = ${g1.items[0]!.id}`),
+    ).rejects.toThrow(/check constraint/);
+
+    // El ciclo del reto es de sentido único: ni el lead salta estados por SQL directo
+    // (el reto principal está activo; cerrado exige pasar por en-medicion).
+    await expect(
+      conUsuario(leadId, (tx) => tx`update reto set estado = 'cerrado' where id = ${retoId}`),
+    ).rejects.toThrow(/transición de reto ilegal/);
+
     // Y los SECURITY DEFINER no se adjuntan a tablas propias del rol de app (EXECUTE
     // revocado de PUBLIC): sin oráculo ni candados sobre gates de otros workspaces.
     await expect(

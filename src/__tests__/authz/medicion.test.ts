@@ -789,6 +789,15 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
 
     await aprobarGateNumero(7);
 
+    // Con G7 aprobado el proyecto TAMPOCO se mueve solo: §5.2 mueve los dos juntos, así
+    // que el proyecto sigue a su reto y no al revés. Sin esta precondición un lead dejaba
+    // el proyecto midiendo con el reto todavía activo — un tablero que miente y una serie
+    // que la política del snapshot rechazaría igual, porque ella sí mira el reto.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
+        where id = ${proyectoId}`),
+    ).rejects.toThrow(/pasa a medición con su reto/);
+
     // El stakeholder no mueve el método.
     await expect(abrirMedicion(stakeId, { workspaceId: ws, retoId })).rejects.toThrow(
       /no puedes abrir su medición/,
@@ -1680,7 +1689,39 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       registryId: reg.registryId,
     });
     expect(firma.entradas).toBe(1);
+    // ── El ciclo de vida del proyecto, con `pausado` de por medio ──
+    // Con el proyecto PARADO, aprobar el gate que autoriza implementar es una
+    // contradicción: se rechaza la aprobación entera en vez de dejarla pasar sin efecto.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
+      where id = ${actVieja.proyectoId}`);
+    await expect(aprobarGateNumero(6, actVieja.proyectoId)).rejects.toThrow(
+      /con el proyecto parado/,
+    );
+    // Y el gate sigue PENDIENTE: lo que se descarta es el no-op silencioso, que dejaba el
+    // gate aprobado y el proyecto quieto para siempre.
+    const [g6Parado] = await conUsuario(leadId, (tx) => tx`select estado from gate_instancia
+      where proyecto_id = ${actVieja.proyectoId} and numero = 6`);
+    expect(g6Parado!.estado).toBe('pendiente');
+
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'activo'
+      where id = ${actVieja.proyectoId}`);
     await aprobarGateNumero(6, actVieja.proyectoId);
+    const [enImplementacion] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where id = ${actVieja.proyectoId}`);
+    expect(enImplementacion!.estado).toBe('en-implementacion');
+
+    // Implementando también se puede parar — y retomar es DETERMINISTA: con el G6 aprobado
+    // vuelve a implementación, no a 'activo', que sería andar hacia atrás en el método y
+    // dejarlo saltar a medición saltándose la fase que acaba de empezar.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
+      where id = ${actVieja.proyectoId}`);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'activo'
+        where id = ${actVieja.proyectoId}`),
+    ).rejects.toThrow(/vuelve a implementación/);
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+      where id = ${actVieja.proyectoId}`);
+
     await aprobarGateNumero(7, actVieja.proyectoId);
 
     // El reto ya está donde toca; lo que faltaba era su PROYECTO, que bajo el ciclo
@@ -1717,6 +1758,11 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(
       conUsuario(leadId, (tx) => tx`update proyecto set estado = 'terminado' where id = ${otroId}`),
     ).rejects.toThrow(/transición de proyecto ilegal: activo → terminado/);
+    // Y entrar en implementación exige el G6 APROBADO: el estado no se elige, se gana.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+        where id = ${otroId}`),
+    ).rejects.toThrow(/al aprobarse su G6/);
     // Pausar y retomar sí es reversible (el método admite pausas del cliente).
     await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado' where id = ${otroId}`);
     await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'activo' where id = ${otroId}`);

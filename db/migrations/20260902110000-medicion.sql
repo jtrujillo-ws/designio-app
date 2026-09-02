@@ -631,23 +631,58 @@ create policy proyecto_update_estado on proyecto
   )
   with check (workspace_role(app_user_id(), workspace_id) = 'lead-boutique');
 
+-- La máquina de estados del proyecto, ENTERA y en un solo sitio: cada par legal con su
+-- precondición al lado. Este slice hizo escribible `proyecto.estado` y al principio declaró
+-- solo los pares, dejando las precondiciones en quien escribe — que es justo el reparto que
+-- deja a un camino nuevo saltarse lo que el anterior comprobaba. Aquí no hay «quien
+-- escribe»: hay una regla por par, y da igual si llega por el servicio o por SQL directo.
+--
+--   activo            → pausado            · sin precondición (parar es del cliente)
+--   en-implementacion → pausado            · sin precondición (también se para implementando)
+--   pausado           → activo             · G6 NO aprobado: se paró antes del plan
+--   pausado           → en-implementacion  · G6 aprobado: se paró implementando
+--   activo            → en-implementacion  · G6 aprobado (§7)
+--   activo            → en-medicion        · G7 aprobado Y el reto ya midiendo
+--   en-implementacion → en-medicion        · G7 aprobado Y el reto ya midiendo
+--   en-medicion       → cerrado            · el reto con veredicto (RF-07.10)
+--
+-- Retomar es DETERMINISTA gracias a G6: un proyecto pausado antes del plan vuelve a
+-- 'activo' y uno pausado durante la implementación vuelve a 'en-implementacion'. Sin esa
+-- discriminación, «reanudar» habría tenido dos destinos posibles y el que eligiera la
+-- pantalla se habría convertido en la regla — otra vez la precondición en quien escribe.
 create function proyecto_estado_transicion_guard() returns trigger
 language plpgsql as $$
+declare
+  g6_aprobado boolean;
 begin
   if new.estado = old.estado then
     return new;
   end if;
-  -- Ciclo de vida del proyecto (RF-04.12): pausar y retomar es reversible; avanzar en el
-  -- método no. Nada sale de 'cerrado' — el trabajo posterior es un reto nuevo (SYS-08).
+  -- Ciclo de vida del proyecto (RF-04.12, §7): pausar y retomar es reversible; avanzar en
+  -- el método no. Nada sale de 'cerrado' — el trabajo posterior es un reto nuevo (SYS-08).
   if (old.estado, new.estado) not in (
     ('activo', 'pausado'),
+    ('en-implementacion', 'pausado'),
     ('pausado', 'activo'),
+    ('pausado', 'en-implementacion'),
     ('activo', 'en-implementacion'),
     ('activo', 'en-medicion'),
     ('en-implementacion', 'en-medicion'),
     ('en-medicion', 'cerrado')
   ) then
     raise exception 'transición de proyecto ilegal: % → %', old.estado, new.estado;
+  end if;
+  select exists (select 1 from gate_instancia g
+    where g.proyecto_id = new.id and g.workspace_id = new.workspace_id
+      and g.numero = 6 and g.estado = 'aprobado') into g6_aprobado;
+  -- §7: se entra en implementación al aprobarse el PLAN, no por decisión de nadie.
+  if new.estado = 'en-implementacion' and not g6_aprobado then
+    raise exception 'el proyecto entra en implementación al aprobarse su G6 (§7)';
+  end if;
+  -- …y por eso mismo un proyecto que se pausó CON el plan aprobado no puede retomarse a
+  -- 'activo': volvería atrás en el método y su siguiente paso se saltaría implementación.
+  if old.estado = 'pausado' and new.estado = 'activo' and g6_aprobado then
+    raise exception 'este proyecto se pausó con su G6 ya aprobado: al retomarlo vuelve a implementación (§7)';
   end if;
   -- §5.2: el paso a «en medición» es el gate de SEGUIMIENTO (G7), no el del plan (G6).
   -- Antes de G7 no hay releases conciliados contra la design version ni effective state
@@ -656,6 +691,15 @@ begin
     where g.proyecto_id = new.id and g.workspace_id = new.workspace_id
       and g.numero = 7 and g.estado = 'aprobado') then
     raise exception 'el proyecto pasa a medición al aprobarse su G7 (§5.2)';
+  end if;
+  -- Y el proyecto NO mide por su cuenta: sigue a su reto. §5.2 los mueve juntos («el
+  -- proyecto y el reto pasan a en medición»), así que sin esto un lead dejaba el proyecto
+  -- midiendo con su reto todavía activo — un tablero que miente y una serie que la política
+  -- del snapshot rechazaría de todos modos, porque ella sí mira el estado del RETO.
+  if new.estado = 'en-medicion' and not exists (select 1 from reto r
+    where r.id = new.reto_id and r.workspace_id = new.workspace_id
+      and r.estado = 'en-medicion') then
+    raise exception 'el proyecto pasa a medición con su reto, no antes (§5.2)';
   end if;
   -- RF-07.10: el proyecto cierra CON su reto y por una sola mano, la del outcome review.
   -- `reto.veredicto` no tiene grant para el rol de aplicación —solo lo escribe el guard
@@ -980,18 +1024,8 @@ begin
         and r.estado = 'firmado') then
       raise exception 'no se puede aprobar G6: el Metric Registry no está firmado (SYS-22)';
     end if;
-    -- …y aprobado G6, el proyecto ENTRA en implementación (§7: «activo → en implementación
-    -- → en medición → cerrado»). Este slice abrió las transiciones del proyecto y dejó ese
-    -- estado inalcanzable: nada lo escribía, así que G7 saltaba de `activo` directo a
-    -- `en-medicion` y el tablero decía «activo» durante toda la etapa 7 —la fase en la que
-    -- de verdad se está implementando—. El efecto va DENTRO del guard que decide, como el
-    -- resto: así también lo produce el SQL directo, y el evento de la transición lo emite
-    -- su propio guard. Solo desde 'activo': un proyecto pausado no se arrastra en silencio
-    -- (y su par pausado→en-implementacion es ilegal, así que la aprobación fallaría).
-    if new.numero = 6 then
-      update proyecto set estado = 'en-implementacion'
-        where id = new.proyecto_id and workspace_id = new.workspace_id and estado = 'activo';
-    end if;
+    -- (El efecto de G6 sobre el proyecto NO va aquí: vive en su propio trigger AFTER, más
+    -- abajo, porque su precondición lee la fila del gate que este guard aún no ha escrito.)
     update etapa_instancia set estado = 'completada'
       where proyecto_id = new.proyecto_id and workspace_id = new.workspace_id
         and numero = new.numero;
@@ -1003,6 +1037,51 @@ begin
   end if;
   return new;
 end $$;
+
+-- ── Aprobar G6 mete el proyecto en implementación ──
+-- El efecto que resucita el estado del medio de §7. Va en un trigger AFTER y no dentro de
+-- `gate_aprobar_suficiencia_guard` por una razón mecánica que conviene dejar escrita: ese
+-- guard es BEFORE, su fila del gate todavía no está escrita, y la precondición del par
+-- `→ en-implementacion` es precisamente «G6 aprobado» — leída desde el guard del proyecto,
+-- que no vería la aprobación en curso y rechazaría su propio efecto. AFTER es el único
+-- momento en que la causa ya es un hecho consultable.
+--
+-- De regalo, deja de ser rehén del guard compartido: quien reemplace
+-- `gate_aprobar_suficiencia_guard` ya no puede llevárselo por delante sin darse cuenta.
+--
+-- SECURITY DEFINER porque quien aprueba G6 es el SPONSOR, y la política del proyecto solo
+-- deja escribir al lead: el efecto es de la BASE, no del rol que dispara el gate.
+--
+-- Y con el proyecto PAUSADO se rechaza la aprobación entera, que es la tercera cosa que
+-- este bloque decide. Un `where estado = 'activo'` habría dejado la aprobación pasar
+-- afectando cero filas: gate aprobado, proyecto quieto, y al retomar volvería a 'activo'
+-- para saltar de ahí a medición saltándose implementación — el estado muerto resucitado y
+-- vuelto a matar por otra puerta. Entre las tres salidas posibles, rechazar es la única que
+-- trata el gate y el proyecto como UN solo hecho: aprobar el gate que autoriza implementar
+-- mientras el proyecto está parado es una contradicción antes que un problema de mecánica.
+-- Es además lo que este mismo slice ya hace en el otro extremo del método, donde el cierre
+-- del post mortem se niega a arrastrar un proyecto que alguien pausó.
+create function proyecto_a_implementacion_tras_g6_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if new.numero = 6 and new.estado = 'aprobado' and old.estado = 'pendiente' then
+    if not exists (select 1 from proyecto p
+      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+        and p.estado = 'activo') then
+      raise exception 'no se puede aprobar G6 con el proyecto parado: retómalo antes, porque aprobar el plan lo pone en implementación (§7)';
+    end if;
+    update proyecto set estado = 'en-implementacion'
+      where id = new.proyecto_id and workspace_id = new.workspace_id;
+  end if;
+  return new;
+end $$;
+create trigger proyecto_a_implementacion_tras_g6
+  after update on gate_instancia
+  for each row execute function proyecto_a_implementacion_tras_g6_guard();
+revoke execute on function proyecto_a_implementacion_tras_g6_guard() from public;
 
 -- ── Dos puertas que la firma del registry y el cierre del proyecto tienen que cerrar ──
 -- Ambas nacen de la convivencia entre la reapertura de etapa (SPEC-04.9) y lo que este

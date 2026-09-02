@@ -73,7 +73,7 @@ El stack no es una lista de librerías: es un conjunto de **patrones operativos 
 
 | Ámbito | Elección |
 |---|---|
-| Runtime y gestor | **Bun** (versión pineada, línea 1.3.x); lockfile `bun.lock` |
+| Runtime y gestor | **Bun** (versión fijada —pinned—, línea 1.3.x); lockfile `bun.lock` |
 | Lenguaje | **TypeScript estricto** (`strict: true`, `any` prohibido en código nuevo); alias `@/*` → `src/*` |
 | Framework | **TanStack Start** (SSR + server functions + streaming) sobre **TanStack Router** (rutas file-based) y **Vite** |
 | UI | **React 19** + **TanStack Query** (estado asíncrono; near-real-time por **polling**, sin WebSockets) |
@@ -116,7 +116,7 @@ flowchart TD
     B["Navegador - portal y app<br/>(boutique y cliente)"]
   end
 
-  subgraph App["Aplicacion SSR unica (Cloud Run, puerto 8080)"]
+  subgraph App["Aplicación SSR única (Cloud Run, puerto 8080)"]
     W["TanStack Start SSR<br/>server functions *.functions.ts"]
     AUTH["Auth nativa JWT<br/>middleware requireAuth"]
     SCH["Scheduler in-app<br/>tabla scheduled_jobs + tick"]
@@ -130,7 +130,7 @@ flowchart TD
 
   subgraph Ext["Servicios externos"]
     LLM["SDK Anthropic<br/>Claude primario + fallback"]
-    STT["STT con diarizacion"]
+    STT["STT con diarización"]
     AV["Escaneo de malware"]
     MAIL["SMTP transaccional"]
     CT["Cloud Tasks / Scheduler<br/>hooks x-cron-secret"]
@@ -185,13 +185,13 @@ sequenceDiagram
 
   U->>W: Sube archivo a la bandeja (token de capacidad)
   W->>PG: ItemImportacion (estado recibido, cuarentena)
-  W->>J: encola job de importacion
-  J->>AV: escaneo y validacion de formato
+  W->>J: encola job de importación
+  J->>AV: escaneo y validación de formato
   AV-->>J: limpio
-  J->>AI: extraccion (contenido delimitado como datos)
+  J->>AI: extracción (contenido delimitado como datos)
   AI-->>J: candidatos estructurados + confianza
   J->>PG: PropuestaAI por candidato (estado propuesta)
-  U->>W: Curaduria: aprueba / ajusta / rechaza
+  U->>W: Curaduría: aprueba / ajusta / rechaza
   W->>PG: objetos al grafo con dimensiones + lineage
 ```
 
@@ -344,7 +344,7 @@ P6: las invariantes son pruebas. Estratos heredados + baterías propias de este 
 | Evals AI | Grounding con regresión | SYS-17 / RF-09.10 — bloqueante para cambios de prompts |
 | E2E smoke (Playwright) | Build de producción real en navegador real: login, guard, loop feliz del ejemplo §19 | Hidratación y split server/client vivos |
 
-Checks gating de CI (GitHub Actions, Bun pineado, mínimo privilegio), heredando el patrón interno: **Typecheck** (`tsc --noEmit`), **Tests** (Vitest + Postgres de servicio con migraciones, incluye authz y "AI off"), **Lint** (ESLint flat, solo correctness; formato con Prettier local, fuera del gate), **Client bundle** (ningún módulo server-only alcanza el bundle del navegador), **E2E smoke**, **Dependency audit** y **Secret scanning** (historial completo). Un test omitido no es un check verde: las omisiones se declaran.
+Checks gating de CI (GitHub Actions, Bun con versión fijada, mínimo privilegio), heredando el patrón interno: **Typecheck** (`tsc --noEmit`), **Tests** (Vitest + Postgres de servicio con migraciones, incluye authz y "AI off"), **Lint** (ESLint flat, solo correctness; formato con Prettier local, fuera del gate), **Client bundle** (ningún módulo server-only alcanza el bundle del navegador), **E2E smoke**, **Dependency audit** y **Secret scanning** (historial completo). Un test omitido no es un check verde: las omisiones se declaran.
 
 ## Despliegue, entornos y flujo de ramas
 

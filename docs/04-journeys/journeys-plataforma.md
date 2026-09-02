@@ -45,7 +45,7 @@ Roles según §13.2 del prediseño; los journeys los combinan:
 | Sponsor | Cliente | J2, J4 (decisiones), J5, J7 | Aprueba G0, G3, G5 y G6; recibe impacto y post mortem |
 | Stakeholders | Cliente | J3 (validación as-is), J4 (tests, talleres) | Validan as-is (G2); comentan en el portal |
 | Admin del cliente | Cliente | J1, J7 | Gestiona accesos; ejecuta continuidad o exportación |
-| Dueño del dato | Cliente | J5 (compromiso), J6 (snapshots) | Aporta baseline y snapshots del Metric Registry |
+| Dueño del dato | Cliente | J2 (compromiso de baseline), J5 (firma del registry), J6 (snapshots) | Aporta baseline y snapshots del Metric Registry |
 | Lead de la boutique | Boutique | Todos | Presenta gates; responde por el método; opera el workspace |
 | Diseñadores | Boutique | J1, J3, J4, J5 | Producen artefactos con cadena de evidencia |
 | Agentes AI | Plataforma | Todos (asistencia) | Proponen y citan; auto-verifican checklists; nunca aprueban |
@@ -54,18 +54,18 @@ Roles según §13.2 del prediseño; los journeys los combinan:
 
 ```mermaid
 flowchart TD
-  J1["J1 Arranque en frio<br/>importacion y servicio"] --> J2["J2 Formulacion del reto<br/>criterios y ventanas - G0"]
-  J2 --> J3["J3 Investigacion y entendimiento<br/>evidencia, insights, as-is - G1 G2"]
-  J3 --> J4["J4 Conceptualizacion y exploracion<br/>HMW, conceptos, tests - G3 G4"]
+  J1["J1 Arranque en frío<br/>importación y servicio"] --> J2["J2 Formulación del reto<br/>criterios y ventanas - G0"]
+  J2 --> J3["J3 Investigación y entendimiento<br/>evidencia, insights, as-is - G1 G2"]
+  J3 --> J4["J4 Conceptualización y exploración<br/>HMW, conceptos, tests - G3 G4"]
   J4 --> J5["J5 Detalle y plan<br/>design version, Metric Registry - G5 G6"]
-  J5 --> J6["J6 Implementacion y medicion<br/>releases, effective state, snapshots - G7"]
-  J6 --> J7["J7 Post mortem y continuidad<br/>veredicto y decision comercial"]
+  J5 --> J6["J6 Implementación y medición<br/>releases, effective state, snapshots - G7"]
+  J6 --> J7["J7 Post mortem y continuidad<br/>veredicto y decisión comercial"]
   J7 -.->|retos candidatos pre-poblados| J2
 
   classDef boutique fill:#dbe9fb,stroke:#2a78d6,color:#0b0b0b
   classDef cliente fill:#fdeee6,stroke:#eb6834,color:#0b0b0b
-  class J1,J3,J4,J5 boutique
-  class J2,J6,J7 cliente
+  class J1,J3 boutique
+  class J2,J4,J5,J6,J7 cliente
 ```
 
 Guía de lectura: azul = journeys conducidos por la boutique; naranja = journeys donde el cliente tiene el rol decisivo (aprobar, aportar datos, decidir continuidad). La arista punteada J7 → J2 es el pipeline embebido (§2.2): los retos candidatos del post mortem pre-pueblan la etapa 0 del siguiente engagement con memoria intra-cliente (§3.4).
@@ -85,12 +85,12 @@ Flujo:
 
 ```mermaid
 flowchart LR
-  A["Crear workspace<br/>y accesos"] --> B["Cargar material a la<br/>bandeja de importacion"]
+  A["Crear workspace<br/>y accesos"] --> B["Cargar material a la<br/>bandeja de importación"]
   B --> C["AI propone candidatos a objetos<br/>con confianza y citas"]
-  C --> D{"Curaduria humana"}
+  C --> D{"Curaduría humana"}
   D -->|aprueba| E["Objetos al grafo con<br/>dimensiones de evidencia"]
   D -->|rechaza o ajusta| C
-  E --> F["Servicio creado con<br/>estado actual y linea base"]
+  E --> F["Servicio creado con<br/>estado actual y línea base"]
 ```
 
 Ejemplo §19: el banco aporta el estudio CX 2024 (PDF) y el funnel (hoja de cálculo); se crea "Apertura de cuenta nómina digital" con línea base de abandono 62% en verificación de identidad. Fricciones: material heredado caótico (mitigación: la bandeja acepta todo y la curaduría decide qué describe el estado actual y qué queda como histórico, §12.1); prompt injection en archivos (tratamiento como contenido no confiable, §14).
@@ -115,7 +115,7 @@ sequenceDiagram
   L->>P: Crea reto candidato sobre el servicio
   P->>AI: Solicita borrador con memoria del workspace
   AI-->>P: Reencuadre + criterios con ventanas (propuesta citada)
-  L->>P: Ajusta criterios, lineas base y perfil
+  L->>P: Ajusta criterios, líneas base y perfil
   L->>S: Presenta G0 en el portal
   S->>P: Comenta y aprueba G0
   P-->>P: Reto candidato pasa a activo, proyecto abre etapa 0
@@ -135,13 +135,13 @@ Ejemplo §19: R-01 "Reducir el abandono de apertura digital del 62% al 40%"; tas
 
 ```mermaid
 flowchart TD
-  A["Plan de research<br/>segun perfil y segmentos"] --> B["Entrevistas y observaciones<br/>consentimiento registrado"]
+  A["Plan de research<br/>según perfil y segmentos"] --> B["Entrevistas y observaciones<br/>consentimiento registrado"]
   B --> C["AI transcribe, diariza<br/>y codifica con citas"]
   C --> D["Monitor de cobertura<br/>por segmento"]
   D --> E{"G1 - suficiencia<br/>de evidencia"}
   E -->|falta| B
-  E -->|suficiente| F["AI propone insights citados<br/>y senala contradicciones"]
-  F --> G["Disenadores validan insights<br/>y definen arquetipos del reto"]
+  E -->|suficiente| F["AI propone insights citados<br/>y señala contradicciones"]
+  F --> G["Diseñadores validan insights<br/>y definen arquetipos del reto"]
   G --> H["Journey as-is como<br/>grafo tipado"]
   H --> I{"G2 - as-is validado<br/>con stakeholders"}
   I -->|contradicciones| F
@@ -162,15 +162,15 @@ Ejemplo §19: 12 entrevistas, cobertura de tres segmentos verificada en G1; insi
 
 ```mermaid
 flowchart TD
-  A["AI propone HMW<br/>trazables a insights"] --> B["Priorizacion contra<br/>criterios del reto"]
+  A["AI propone HMW<br/>trazables a insights"] --> B["Priorización contra<br/>criterios del reto"]
   B --> C{"G3 - portafolio<br/>aprobado por sponsor"}
-  C --> D["Co-generacion<br/>de conceptos"]
-  D --> E["Revisores AI por arquetipo<br/>etiqueta simulacion"]
+  C --> D["Co-generación<br/>de conceptos"]
+  D --> E["Revisores AI por arquetipo<br/>etiqueta simulación"]
   E --> F["Preguntas y escenarios<br/>para tests reales"]
   F --> G["Prototipos y tests<br/>con personas reales"]
   G --> H{"G4 - umbral de evidencia<br/>por concepto"}
   H -->|pasa| I["Concepto avanza a etapa 5"]
-  H -->|muere| J["Descartado con razon registrada"]
+  H -->|muere| J["Descartado con razón registrada"]
 ```
 
 Ejemplo §19: HMW-02 trazable a I-07; dos conceptos; el revisor del "desconfiado digital" señala riesgo de exclusión (simulación → origina una pregunta del test); test real con 8 usuarios y umbral 6/8: pasa "verificación diferida", muere "pre-carga por convenio" con razón. Fricción central y deliberada: la tentación de usar la simulación AI como validación — bloqueada por diseño (ADR-0009, SYS-20): el checklist de G4 solo cuenta evidencia de test real.
@@ -187,13 +187,13 @@ Ejemplo §19: HMW-02 trazable a I-07; dos conceptos; el revisor del "desconfiado
 
 ```mermaid
 flowchart LR
-  A["Blueprint to-be<br/>como grafo tipado"] --> B["Validacion automatica<br/>del grafo"]
+  A["Blueprint to-be<br/>como grafo tipado"] --> B["Validación automática<br/>del grafo"]
   B --> C["Design version con diff<br/>contra effective state vigente"]
   C --> D{"G5 - sponsor aprueba<br/>en el portal"}
   D --> E["Plan de releases<br/>RACI y riesgos"]
-  E --> F["Metric Registry poblado<br/>duenos, fuentes, ventanas"]
+  E --> F["Metric Registry poblado<br/>dueños, fuentes, ventanas"]
   F --> G{"G6 - sign-off<br/>del cliente"}
-  G --> H["Proyecto pasa a<br/>en implementacion"]
+  G --> H["Proyecto pasa a<br/>en implementación"]
 ```
 
 Ejemplo §19: DV-1 con 4 cambios (3 touchpoints modificados + 1 proceso backstage nuevo), diff explicado contra el estado actual; dos releases planificados; Metric Registry firmado. Fricción: el diff es la conversación difícil ("esto cambia y esto no") — por eso es objeto de primera clase y no una diapositiva (ADR-0004).
@@ -213,17 +213,17 @@ sequenceDiagram
   actor EC as Equipo cliente
   actor L as Lead boutique
   participant P as Plataforma
-  actor DD as Dueno del dato
+  actor DD as Dueño del dato
 
   EC->>L: Despliega cambios del release RL-1
   L->>P: Registra release (elementos incluidos)
-  L->>P: Constata effective state con desviaciones y razon
+  L->>P: Constata effective state con desviaciones y razón
   P->>P: AI detecta desviaciones DV vs ES (propuesta)
-  L->>P: Aprueba conciliacion - G7
-  loop Ventana de medicion (por criterio)
+  L->>P: Aprueba conciliación - G7
+  loop Ventana de medición (por criterio)
     DD->>P: Sube snapshot CSV o formulario
     P-->>L: Lectura contra baseline y objetivo
-    P-->>DD: Recordatorio segun frecuencia comprometida
+    P-->>DD: Recordatorio según frecuencia comprometida
   end
 ```
 
@@ -242,13 +242,13 @@ Ejemplo §19: RL-1 despliega 3 de 4 cambios (backstage aplazado a RL-2 por depen
 ```mermaid
 flowchart TD
   A["Cierre de la ventana<br/>del criterio"] --> B["AI redacta borrador del<br/>outcome review sobre snapshots"]
-  B --> C["Lead completa contribucion,<br/>factores externos y aprendizajes"]
+  B --> C["Lead completa contribución,<br/>factores externos y aprendizajes"]
   C --> D["Sponsor recibe el post mortem<br/>en el portal"]
   D --> E["Reto cerrado con veredicto<br/>proyecto inmutable"]
   E --> F["Retos candidatos al<br/>backlog del servicio"]
-  F --> G{"Decision del cliente"}
-  G -->|suscripcion| H["Workspace activo<br/>memoria y retos futuros"]
-  G -->|no continua| I["Exportacion digna, retencion<br/>temporal y borrado o archivo"]
+  F --> G{"Decisión del cliente"}
+  G -->|suscripción| H["Workspace activo<br/>memoria y retos futuros"]
+  G -->|no continúa| I["Exportación digna, retención<br/>temporal y borrado o archivo"]
 ```
 
 Ejemplo §19: veredicto **parcialmente logrado** (44% vs. objetivo 40%), contribución del rediseño + factor externo (campaña comercial) + hipótesis del elemento aplazado; candidatos R-02 (completar backstage) y R-03 (abandono pymes 55%). Nota comercial: la suscripción es hipótesis por validar (ADR-0002/0014); la exportación digna es requisito para que no contratar no sea traumático (§18).
@@ -259,11 +259,11 @@ Vista de la experiencia emocional del rol que aprueba y paga, para diseñar los 
 
 ```mermaid
 journey
-  title Sponsor a traves del engagement
+  title Sponsor a través del engagement
   section Arranque
     Aprueba criterios y ventanas en G0: 4: Sponsor
     Ve su material previo convertido en memoria: 5: Sponsor
-  section Diseno
+  section Diseño
     Valida as-is con su equipo: 4: Sponsor
     Aprueba portafolio HMW en G3: 4: Sponsor
     Recibe resultados de tests reales: 5: Sponsor

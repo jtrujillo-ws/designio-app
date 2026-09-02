@@ -234,13 +234,13 @@ Cada contexto se describe con: responsabilidad, agregados (raíz en negrita), en
 
 ```mermaid
 flowchart LR
-  %% Nucleo core del dominio
+  %% Núcleo core del dominio
   subgraph CORE["Subdominio core"]
     CTX02["CTX-02 Evidencia y Conocimiento"]
-    CTX03["CTX-03 Metodo y Gobernanza"]
-    CTX04["CTX-04 Diseno del Servicio"]
+    CTX03["CTX-03 Método y Gobernanza"]
+    CTX04["CTX-04 Diseño del Servicio"]
     CTX05["CTX-05 Entrega y Estado Efectivo"]
-    CTX06["CTX-06 Medicion e Impacto"]
+    CTX06["CTX-06 Medición e Impacto"]
   end
 
   subgraph SUP["Soporte"]
@@ -263,9 +263,9 @@ flowchart LR
   CTX01 -->|tenancy roles permisos| CTX02
   CTX01 -->|tenancy roles permisos| CTX03
   CTX01 -->|tenancy roles permisos| CTX04
-  CTX07 -->|plantillas y metodo| CTX03
+  CTX07 -->|plantillas y método| CTX03
 
-  %% AI propone via PropuestaAI
+  %% AI propone vía PropuestaAI
   CTX08 -.->|PropuestaAI con citas| CTX02
   CTX08 -.->|PropuestaAI con citas| CTX03
   CTX08 -.->|PropuestaAI con citas| CTX04
@@ -302,10 +302,10 @@ La cadena (§3.2) es la estructura que más restricciones impone al modelo: defi
 ```mermaid
 flowchart LR
   EV["Evidencia<br/>(5 dimensiones)"] --> IN["Insight<br/>(afirmaciones + citas)"]
-  IN --> DE["Decision aprobada<br/>(gate humano)"]
+  IN --> DE["Decisión aprobada<br/>(gate humano)"]
   DE --> DV["Design version<br/>(inmutable al aprobar)"]
-  DV --> RL["Release<br/>(parcial, multiple)"]
-  RL --> ES["Effective state<br/>(desviaciones con razon)"]
+  DV --> RL["Release<br/>(parcial, múltiple)"]
+  RL --> ES["Effective state<br/>(desviaciones con razón)"]
   ES --> SN["Snapshots<br/>(Metric Registry)"]
   SN --> OR["Outcome review<br/>(veredicto)"]
   OR -.->|retos candidatos| RC["Backlog del servicio"]
@@ -405,8 +405,8 @@ Estados según §3.3 del prediseño. Los nombres de estado son canónicos.
 stateDiagram-v2
   direction LR
   state "candidato" as C
-  state "activo (en diseno)" as A
-  state "en medicion" as M
+  state "activo (en diseño)" as A
+  state "en medición" as M
   state "cerrado con veredicto" as X
   state "archivado" as AR
 
@@ -414,7 +414,7 @@ stateDiagram-v2
   C --> A : RetoActivado (G0)
   A --> M : G7 aprobado
   M --> X : OutcomeReviewCompletado
-  C --> AR : descartado con razon
+  C --> AR : descartado con razón
   X --> [*]
 ```
 
@@ -422,8 +422,8 @@ stateDiagram-v2
 stateDiagram-v2
   direction LR
   state "activo" as PA
-  state "en implementacion" as PI
-  state "en medicion" as PM
+  state "en implementación" as PI
+  state "en medición" as PM
   state "cerrado (inmutable)" as PC
 
   [*] --> PA : G0 aprobado

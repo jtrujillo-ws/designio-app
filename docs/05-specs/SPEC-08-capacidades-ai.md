@@ -8,7 +8,7 @@ status: draft
 language: es
 audience: engineering
 tags: [spec, ai, propuestas, revisores, grounding, degradacion, presupuestos]
-summary: "Especificación de la capa AI del MVP: el pipeline único PropuestaAI, las nueve capacidades mínimas (una por etapa más transversales e importación), los revisores AI por arquetipo, el asistente de gates, las métricas de grounding y la degradación segura."
+summary: "Especificación de la capa AI del MVP: el pipeline único PropuestaAI, las diez capacidades mínimas (C0–C7 por etapa, más el asistente transversal de gates y la extracción de importación), los revisores AI por arquetipo, el asistente de gates, las métricas de grounding y la degradación segura."
 ---
 
 # SPEC-08 — Capacidades AI por etapa

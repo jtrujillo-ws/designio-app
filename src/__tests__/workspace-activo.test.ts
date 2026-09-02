@@ -27,4 +27,23 @@ describe('workspace activo (navegación multi-membresía)', () => {
     expect(membresiaActivaDe([a, b], '33333333-3333-4333-8333-333333333333')).toBe(a);
     expect(membresiaActivaDe([], a.workspaceId)).toBeUndefined();
   });
+  it('la identidad resuelta es lo que la `key` del layout puede usar sin remontar de más', () => {
+    // Es la propiedad de la que depende `LayoutPorWorkspace`: la `key` se saca de la
+    // membresía RESUELTA, no del `ws` crudo. Entrar sin parámetro y después fijarlo
+    // explícitamente al MISMO workspace tiene que dar la misma identidad — si la `key`
+    // fuera el parámetro, ese paso remontaría la pantalla y tiraría lo que el usuario
+    // estuviera escribiendo, sin haber cambiado de workspace.
+    expect(membresiaActivaDe([a, b], undefined)?.workspaceId).toBe(
+      membresiaActivaDe([a, b], a.workspaceId)?.workspaceId,
+    );
+    // Y un `ws` que no corresponde a ninguna membresía tampoco cambia la identidad: cae a
+    // la primera, así que tampoco debe remontar.
+    expect(membresiaActivaDe([a, b], '33333333-3333-4333-8333-333333333333')?.workspaceId).toBe(
+      membresiaActivaDe([a, b], undefined)?.workspaceId,
+    );
+    // Cambiar de verdad de workspace SÍ cambia la identidad: es el caso que debe remontar.
+    expect(membresiaActivaDe([a, b], b.workspaceId)?.workspaceId).not.toBe(
+      membresiaActivaDe([a, b], a.workspaceId)?.workspaceId,
+    );
+  });
 });

@@ -104,6 +104,11 @@ export async function exportarWorkspace(
 
     const datos: Record<string, FilaExportada[]> = {};
     const conteos: Record<string, number> = {};
+    // La otra mitad del recibo: cuántas filas EXISTÍAN y la poda del entregable dejó
+    // fuera. Solo se anota para las tablas que sí viajan y sí podan —una `fuera` no tiene
+    // filas podadas, tiene cero porque no viaja; una `todo` no poda nada—. Distinguir esas
+    // dos ausencias es justamente lo que hace del mapa un recibo y no una insinuación.
+    const podadasPorDerechos: Record<string, number> = {};
 
     for (const { tabla, orden, poda } of CATALOGO_EXPORT) {
       // En el entregable solo viaja lo que cuelga de evidencia con derechos, y CÓMO se
@@ -114,6 +119,17 @@ export async function exportarWorkspace(
       const filas = await filasDeTabla(tx, tabla, orden, entrada.workspaceId, entregable, poda);
       datos[tabla] = filas;
       conteos[tabla] = filas.length;
+      if (entregable && poda.modo !== 'fuera' && poda.modo !== 'todo') {
+        // `count(*)` corre bajo la MISMA RLS y el mismo snapshot `repeatable read` que el
+        // volcado, así que la resta cuenta exactamente lo que descartó el predicado de
+        // poda —ni una fila de otro tenant, ni una diferencia por haberse leído en otro
+        // instante— y no materializa nada de lo descartado.
+        const [total] = (await tx.unsafe(
+          `select count(*)::int as n from ${tabla} where workspace_id = $1`,
+          [entrada.workspaceId],
+        )) as unknown as { n: number }[];
+        podadasPorDerechos[tabla] = total!.n - filas.length;
+      }
     }
 
     const archivos = await archivosDelExport(tx, entrada.workspaceId, entregable);
@@ -137,6 +153,7 @@ export async function exportarWorkspace(
           bytesIncluidos,
           presupuestoBytes: PRESUPUESTO_ADJUNTOS_BYTES,
         },
+        podadasPorDerechos,
         evidenciaBloqueada: bloqueadas.length,
       },
       workspace: {

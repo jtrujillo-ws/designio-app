@@ -23,6 +23,7 @@ import {
   validarInsight,
 } from '@/lib/insight/insight.servicio';
 import { aprobarGate, marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
+import { gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
 import { bytesABase64, MAX_ARCHIVOS_POR_ITEM } from '@/lib/evidencia/sanitizacion';
 import { describeAuthz } from './helpers';
 
@@ -726,6 +727,20 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const [estado] = await conUsuario(leadId, (tx) => tx`select estado from decision
       where id = ${dec!.id as string}`);
     expect(estado!.estado).toBe('vigente');
+    // Y el picker tiene que decir lo MISMO que el guard antes de que nadie elija: la
+    // citabilidad de una decisión sale de su estado Y del respaldo vivo de cada insight
+    // enlazado. Mirando solo `estado` la decisión salía habilitada, marcar el ítem tenía
+    // éxito y el rechazo llegaba al aprobar — el mismo hueco que ya se cerró para los
+    // insights, una capa más arriba.
+    const bloqueada = (await gobernanzaDeProyecto(leadId, ws, proyectoId))!.decisiones.find(
+      (d) => d.id === (dec!.id as string),
+    );
+    expect(bloqueada!.estado).toBe('vigente');
+    // Nombra QUÉ reparar: el insight y la afirmación exactos, no un motivo genérico.
+    expect(bloqueada!.sinRespaldo).toEqual({
+      insight: 'El canal digital concentra el abandono',
+      afirmacion: 'El abandono se concentra en el canal digital',
+    });
     await expect(aprobarGate(leadId, { workspaceId: ws, gateId })).rejects.toThrow(
       /cita una decisión cuyo insight de respaldo/,
     );
@@ -744,6 +759,12 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       base: 'Nuevo consentimiento firmado',
       venceEn: null,
     });
+    // Reconceder desbloquea las dos caras a la vez, que es la prueba de que son una sola.
+    expect(
+      (await gobernanzaDeProyecto(leadId, ws, proyectoId))!.decisiones.find(
+        (d) => d.id === (dec!.id as string),
+      )!.sinRespaldo,
+    ).toBeNull();
     const r = await aprobarGate(leadId, { workspaceId: ws, gateId });
     expect(r.numero).toBe(1);
   });

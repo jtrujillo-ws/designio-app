@@ -195,6 +195,21 @@ function PantallaExportacion() {
                     </span>
                   ))}
                 </div>
+                {/* La otra mitad del recibo: cuántas filas EXISTÍAN y se quedaron fuera
+                    por derechos. Solo aparecen las tablas con algo podado — una tabla que
+                    no viaja por diseño no tiene «filas podadas», y anotarle un cero
+                    insinuaría una restricción que no existe. */}
+                {Object.entries(manifiesto.podadasPorDerechos).some(([, n]) => n > 0) && (
+                  <span
+                    style={{ font: '400 12px var(--font-mono)', color: 'var(--warn)' }}
+                  >
+                    podadas por derechos:{' '}
+                    {Object.entries(manifiesto.podadasPorDerechos)
+                      .filter(([, n]) => n > 0)
+                      .map(([tabla, n]) => `${tabla} ${n}`)
+                      .join(' · ')}
+                  </span>
+                )}
                 <span style={{ font: '400 12px var(--font-mono)', color: 'var(--text-body)' }}>
                   adjuntos: {manifiesto.adjuntos.incluidos}/{manifiesto.adjuntos.total} incluidos
                   ({(manifiesto.adjuntos.bytesIncluidos / 1024).toFixed(0)} KB

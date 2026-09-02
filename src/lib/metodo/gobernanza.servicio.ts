@@ -368,7 +368,28 @@ export async function gobernanzaDeProyecto(
               from decision_insight di
               join insight i on i.id = di.insight_id and i.workspace_id = di.workspace_id
               where di.decision_id = d.id and di.workspace_id = d.workspace_id
-            ), '[]'::jsonb))
+            ), '[]'::jsonb),
+            -- El respaldo VIVO de la decisión, no solo su estado. El estado habla de
+            -- reaperturas (SYS-10); los derechos de la evidencia que sostiene sus insights
+            -- son otra cosa y se revocan por su cuenta. El guard de suficiencia ya sigue
+            -- esa cadena al aprobar el gate (20260902190000), así que ofrecer la decisión
+            -- como citable mirando solo el estado dejaba al usuario cumpliendo un ítem con
+            -- una opción que la base iba a rechazar después. Es el MISMO predicado del
+            -- guard —toda afirmación no marcada como hipótesis de todo insight enlazado
+            -- necesita al menos una cita con derechos vigentes para «cliente»— y se trae
+            -- la primera que falla para poder nombrarla: un motivo genérico no dice qué
+            -- reparar.
+            'sinRespaldo', (
+              select jsonb_build_object('insight', i2.titulo, 'afirmacion', a2.texto)
+              from decision_insight di2
+              join insight i2 on i2.id = di2.insight_id and i2.workspace_id = di2.workspace_id
+              join afirmacion a2 on a2.insight_id = i2.id and a2.workspace_id = i2.workspace_id
+              where di2.decision_id = d.id and di2.workspace_id = d.workspace_id
+                and not a2.es_hipotesis
+                and not exists (select 1 from cita c
+                  where c.afirmacion_id = a2.id and c.workspace_id = a2.workspace_id
+                    and evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente'))
+              order by i2.titulo, a2.orden limit 1))
             order by g.numero, d.decidido_en)
           from decision d
           join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id

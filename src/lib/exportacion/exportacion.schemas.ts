@@ -228,6 +228,35 @@ export type Manifiesto = {
   generadoPorRol: string;
   /** Filas exportadas por tabla del catálogo: es el recibo verificable de SYS-04. */
   conteos: Record<string, number>;
+  /**
+   * Filas que EXISTÍAN en el workspace y la poda del entregable dejó fuera, por tabla. Es
+   * la otra mitad del recibo: un recibo que omite filas sin decir cuántas es un recibo
+   * peor, y es el mismo motivo por el que existe `bloqueadas` en vez de que la evidencia
+   * simplemente no aparezca (SYS-04 + SYS-14: lo excluido no se calla).
+   *
+   * El criterio contado es EXACTAMENTE el predicado de la poda —la fila no cuelga de
+   * evidencia con derechos vigentes para el ámbito cliente—, que es lo que hace la resta
+   * verificable: `count(*)` de la tabla en el workspace menos las filas emitidas, las dos
+   * bajo la misma RLS y el mismo snapshot `repeatable read`.
+   *
+   * NUNCA cuenta la ausencia por diseño, que es una ausencia distinta y no se puede sumar
+   * con ésta. Una tabla que no viaja en el entregable —el método, el razonamiento, la
+   * bandeja, el journey— tiene cero filas porque no viaja, no porque se le haya
+   * restringido nada: anotarle «podadas: 40» inventaría una restricción que no existe y
+   * mentiría en la dirección incómoda, la de insinuar que se ocultó algo. Esas tablas no
+   * aparecen aquí, igual que las de modo `todo` (no podan nada) y que el ámbito `archivo`
+   * entero, donde el mapa va vacío en vez de relleno de ceros.
+   *
+   * No es un oráculo, y es la diferencia entre un recibo y una filtración. Viaja DENTRO de
+   * un paquete que la base ya autorizó (`registrar_exportacion` exige lead-boutique o
+   * admin-cliente) y cuyas consultas corren bajo RLS acotadas a ese workspace, así que el
+   * conteo es de filas que ese actor ya podía ver — de hecho, menos de lo que el propio
+   * manifiesto ya publica, porque `bloqueadas` lista cada evidencia excluida con su título
+   * y su motivo. Contar por tabla para un workspace ajeno, o para un rol que no debería
+   * saber que esas filas existen, sería la fuga que `evidencia_motivo_bloqueo` cerró un
+   * nivel más abajo; por eso el conteo no tiene camino propio y solo existe aquí dentro.
+   */
+  podadasPorDerechos: Record<string, number>;
   adjuntos: {
     total: number;
     incluidos: number;

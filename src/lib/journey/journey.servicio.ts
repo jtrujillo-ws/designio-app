@@ -31,6 +31,12 @@ export class ErrorJourney extends Error {}
 
 function comoErrorDeDominio(e: unknown): never {
   const err = e as { code?: string; message?: string };
+  // DR001: el guard de derechos de SPEC-03 cortó el enlace de evidencia a un nodo o el
+  // congelado del snapshot (RF-03.10, SYS-14). El mensaje ya trae la dimensión que falta
+  // y se propaga TAL CUAL, que es lo que el criterio de aceptación pide mostrar. Sin esta
+  // rama el guard bloqueaba igual, pero el curador veía un error de driver en vez del
+  // motivo: bloquear sin explicar es justo lo que SYS-14 prohíbe.
+  if (err.code === 'DR001' && err.message) throw new ErrorJourney(err.message);
   if (err.code === 'P0001' && err.message) throw new ErrorJourney(err.message);
   if (err.code === '23503') throw new ErrorJourney('Alguna referencia no existe en este workspace');
   if (err.code === '23505') throw new ErrorJourney('Ese elemento ya existe en el journey');

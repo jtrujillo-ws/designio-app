@@ -319,6 +319,9 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     }
     // La auditoría también se exporta (RF-01.8).
     expect(paquete.manifiesto.conteos.evento_dominio!).toBeGreaterThan(0);
+    // En el archivo del propietario no se poda NADA por derechos, así que el mapa va
+    // vacío. Rellenarlo de ceros sugeriría que hubo restricciones que no hubo.
+    expect(paquete.manifiesto.podadasPorDerechos).toEqual({});
 
     // Los archivos van con sus bytes y su hash verificable; el dump de la tabla nunca
     // lleva la columna binaria. Los bytes se traen en una segunda pasada, solo para lo
@@ -408,6 +411,23 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     // NINGUNA parte del paquete, ni siquiera copiado dentro de otra tabla. Su id sí
     // aparece —en `bloqueadas`, con el motivo—: SYS-14 pide bloquear EXPLICANDO, y lo
     // que se protege es el contenido, no la existencia de la evidencia.
+    // El recibo dice CUÁNTAS filas se quedaron fuera por derechos, no solo cuáles
+    // viajaron: una evidencia, su fuente, su registro de derechos y su adjunto original.
+    expect(paquete.manifiesto.podadasPorDerechos).toEqual({
+      fuente: 1,
+      evidencia: 1,
+      evidencia_segmento: 0,
+      derecho_uso: 1,
+      archivo_importado: 1,
+    });
+    // Y NO anota las tablas que no viajan por diseño: su ausencia no es una restricción
+    // de derechos y contarla como tal mentiría en la dirección incómoda.
+    for (const tabla of ['cita', 'contradiccion', 'arquetipo_evidencia', 'evento_dominio']) {
+      expect([tabla, tabla in paquete.manifiesto.podadasPorDerechos]).toEqual([tabla, false]);
+    }
+    // `segmento` viaja entero (taxonomía del propio cliente): tampoco tiene nada podado.
+    expect('segmento' in paquete.manifiesto.podadasPorDerechos).toBe(false);
+
     // Ahora NINGÚN fragmento viaja, ni el permitido: las citas salen enteras del paquete
     // porque su afirmación no viaja. El material copiado deja de estar en el entregable
     // por partida doble — por derechos y por no tener a qué agarrarse.

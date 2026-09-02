@@ -129,18 +129,79 @@ export const EXTENSIONES_PERMITIDAS = Object.values(FORMATOS_PERMITIDOS)
 
 const TEXTUALES = new Set(['text/plain', 'text/csv', 'text/markdown']);
 
-/** ¿Aparecen estos bytes ASCII dentro del buffer? Búsqueda literal, sin decodificar: el
- * archivo es binario y solo interesan las cabeceras del ZIP, que son ASCII. */
-function contieneMarca(bytes: Uint8Array, marca: string): boolean {
-  const aguja = new TextEncoder().encode(marca);
-  if (aguja.length === 0 || bytes.length < aguja.length) return false;
-  outer: for (let i = 0; i <= bytes.length - aguja.length; i += 1) {
-    for (let j = 0; j < aguja.length; j += 1) {
-      if (bytes[i + j] !== aguja[j]) continue outer;
+/** La parte que TODO paquete OOXML lleva en la raíz (OPC, ECMA-376 parte 2): sin ella no
+ * hay paquete, sea Word, Excel o PowerPoint. */
+const PARTE_OPC = '[Content_Types].xml';
+
+/** Firmas del formato ZIP, little-endian: fin del directorio central y entrada de ese
+ * directorio. */
+const ZIP_FIN_DIRECTORIO = 0x06054b50;
+const ZIP_ENTRADA_DIRECTORIO = 0x02014b50;
+
+function leerU16(bytes: Uint8Array, i: number): number {
+  return bytes[i]! | (bytes[i + 1]! << 8);
+}
+
+function leerU32(bytes: Uint8Array, i: number): number {
+  return (
+    (bytes[i]! | (bytes[i + 1]! << 8) | (bytes[i + 2]! << 16) | (bytes[i + 3]! << 24)) >>> 0
+  );
+}
+
+/**
+ * Los nombres de entrada que DECLARA el directorio central del ZIP, o `null` si estos
+ * bytes no son un ZIP legible.
+ *
+ * No es un descompresor ni un parser completo: no se toca ni un byte de contenido, no se
+ * inflan flujos y no se interpreta ningún XML. Se recorre exactamente la estructura que
+ * ya se decía que «viaja en claro» —el registro de fin de directorio y las cabeceras del
+ * directorio central—, que es lo único que hace falta para saber qué entradas dice tener
+ * el paquete. Buscar el nombre de la parte como SUBCADENA en un offset cualquiera, que es
+ * lo que había antes, era más débil de lo que su comentario prometía por los dos lados:
+ * unos bytes que no son un ZIP pasaban con solo llevar `PK` delante y la cadena en
+ * cualquier sitio (dentro de un texto, del contenido comprimido de otra entrada, del
+ * comentario del archivo), y no distinguía «tiene una entrada llamada así» de «en algún
+ * lugar aparecen esos caracteres».
+ *
+ * Zip64 se rechaza a propósito (devuelve `null`): con el tope de 5 MiB por archivo no hay
+ * paquete legítimo que lo necesite, y aceptarlo obligaría a seguir un segundo localizador
+ * para ganar cero.
+ */
+function entradasZip(bytes: Uint8Array): string[] | null {
+  const FIN = 22; // tamaño del registro de fin de directorio sin comentario
+  if (bytes.length < FIN) return null;
+  // El registro final puede llevar hasta 64 KiB de comentario detrás, así que se busca
+  // desde el final hacia atrás y se exige que el largo de comentario declarado cuadre con
+  // lo que queda: eso descarta que unos bytes cualesquiera hagan de firma por casualidad.
+  const tope = Math.max(0, bytes.length - FIN - 0xffff);
+  let fin = -1;
+  for (let i = bytes.length - FIN; i >= tope; i -= 1) {
+    if (leerU32(bytes, i) === ZIP_FIN_DIRECTORIO && leerU16(bytes, i + 20) === bytes.length - i - FIN) {
+      fin = i;
+      break;
     }
-    return true;
   }
-  return false;
+  if (fin < 0) return null;
+  const total = leerU16(bytes, fin + 10);
+  const tamano = leerU32(bytes, fin + 12);
+  const inicio = leerU32(bytes, fin + 16);
+  if (total === 0xffff || tamano === 0xffffffff || inicio === 0xffffffff) return null;
+  // El directorio central tiene que caber ANTES del registro final: si no, esto no es un
+  // ZIP coherente por mucho que lleve la firma.
+  if (inicio + tamano > fin) return null;
+  const nombres: string[] = [];
+  const utf8 = new TextDecoder('utf-8');
+  let p = inicio;
+  for (let n = 0; n < total; n += 1) {
+    if (p + 46 > inicio + tamano) return null;
+    if (leerU32(bytes, p) !== ZIP_ENTRADA_DIRECTORIO) return null;
+    const largoNombre = leerU16(bytes, p + 28);
+    const siguiente = p + 46 + largoNombre + leerU16(bytes, p + 30) + leerU16(bytes, p + 32);
+    if (siguiente > inicio + tamano) return null;
+    nombres.push(utf8.decode(bytes.subarray(p + 46, p + 46 + largoNombre)));
+    p = siguiente;
+  }
+  return nombres;
 }
 
 /**
@@ -232,15 +293,29 @@ export function verificarArchivo(bytes: Uint8Array, tipoMime: string): Veredicto
       };
     }
     // Los tres OOXML son ZIP, así que `PK` no distingue un DOCX de un XLSX ni de un .zip
-    // renombrado: lo que los separa es la parte que llevan dentro. Los nombres de las
-    // entradas viajan en claro en las cabeceras locales del ZIP (solo se comprime el
-    // contenido), así que basta buscar la marca en los bytes — sin descomprimir nada, que
-    // sería abrir un parser de ZIP y sus bypasses para ganar poco.
-    if (formato.parteOoxml && !contieneMarca(bytes, formato.parteOoxml)) {
-      return {
-        ok: false,
-        motivo: `El contenido no corresponde a un ${formato.etiqueta}: es un ZIP, pero no contiene «${formato.parteOoxml}». Los formatos de Office comparten la firma PK, así que un .zip o un documento de otro tipo la pasarían.`,
-      };
+    // renombrado: lo que los separa es qué entradas declara el paquete. Se leen del
+    // directorio central del ZIP —la lista de nombres, en claro— y se exigen dos: la parte
+    // propia del formato y `[Content_Types].xml`, que OPC obliga a llevar a todo paquete.
+    // Lo que esto comprueba, dicho sin adornos: que los bytes SON un ZIP coherente y que
+    // DECLARA esas entradas. No abre ni valida su contenido — un ZIP fabricado a mano con
+    // esos dos nombres pasa, y para descartarlo habría que leer el XML de tipos de
+    // contenido, que ya es interpretar material de terceros. La frontera está ahí a
+    // propósito, y el comentario no promete más que eso.
+    if (formato.parteOoxml) {
+      const entradas = entradasZip(bytes);
+      if (entradas === null) {
+        return {
+          ok: false,
+          motivo: `El contenido no corresponde a un ${formato.etiqueta}: empieza por la firma PK pero no es un ZIP con directorio central legible.`,
+        };
+      }
+      const falta = [PARTE_OPC, formato.parteOoxml].find((parte) => !entradas.includes(parte));
+      if (falta !== undefined) {
+        return {
+          ok: false,
+          motivo: `El contenido no corresponde a un ${formato.etiqueta}: es un ZIP, pero no declara la entrada «${falta}». Los formatos de Office comparten la firma PK, así que un .zip o un documento de otro tipo la pasarían.`,
+        };
+      }
     }
     // WebP es un contenedor RIFF: la firma corta también la comparten WAV y AVI.
     if (tipoMime === 'image/webp') {

@@ -505,6 +505,52 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     expect(j2!.nodos.find((n) => n.id === pasoId)!.etiqueta).toBe('Abre la app (revisado)');
   });
 
+  it('congelar re-comprueba los derechos: el trigger de enlace no vuelve a correr (eje TIEMPO)', async () => {
+    // El enlace se creó con derechos válidos y su trigger ya no vuelve a dispararse nunca.
+    // Congelar es OTRO consumidor del mismo enlace —copia cada evidencia y su título dentro
+    // de `journey_snapshot.grafo`, que es inmutable y lo lee todo miembro—, así que tiene
+    // que re-comprobar por su cuenta igual que hace el gate al aprobar (RF-03.10).
+    const admin = sqlAdmin();
+    await admin`update derecho_uso set estado = 'denegado', ambito = 'interno',
+        base = 'El titular retiró el consentimiento'
+      where workspace_id = ${ws} and evidencia_id = ${evidenciaId}`;
+
+    // El enlace sigue ahí —no se borra: podarlo en silencio diría que el paso nunca tuvo
+    // respaldo, y reescribir el mapa del servicio no es cosa del guard.
+    const [enlace] = await admin`select count(*)::int as n from journey_nodo_evidencia
+      where nodo_id = ${pasoId} and evidencia_id = ${evidenciaId}`;
+    expect(enlace!.n as number).toBe(1);
+
+    await expect(congelarSnapshot(leadId, ws, journeyId, 'con derechos revocados')).rejects.toThrow(
+      /derechos/,
+    );
+
+    // Y el grafo que se congela se mira POR SÍ MISMO, no solo los enlaces: un INSERT a mano
+    // con el título de una evidencia revocada dentro del jsonb choca igual aunque no toque
+    // `journey_nodo_evidencia`.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${ws}, ${journeyId}, 'a mano',
+          ${JSON.stringify({
+            nodos: [],
+            aristas: [],
+            evidencias: [
+              { nodoId: pasoId, evidenciaId, evidenciaTitulo: 'Observación en sucursal' },
+            ],
+          })}::jsonb,
+          ${leadId})`),
+    ).rejects.toMatchObject({ code: 'DR001' });
+
+    // Reconcedidos, congela: el bloqueo es sobre el estado vivo, no una marca permanente.
+    await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente',
+        base = 'Consentimiento renovado'
+      where workspace_id = ${ws} and evidencia_id = ${evidenciaId}`;
+    await congelarSnapshot(leadId, ws, journeyId, 'con derechos repuestos');
+    const j = await journeyCompleto(leadId, ws, journeyId);
+    expect(j!.snapshots.map((sn) => sn.motivo)).toContain('con derechos repuestos');
+  });
+
   it('las entidades comparten identidad de catálogo entre journeys; renombrarlas renombra en todas partes', async () => {
     // El MISMO sistema en dos journeys distintos: la promesa del grafo tipado es poder
     // preguntar «qué pasos dependen del sistema X», y con texto libre eso es comparar

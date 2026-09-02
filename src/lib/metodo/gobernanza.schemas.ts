@@ -80,6 +80,16 @@ export type DecisionDeProyecto = {
   estado: 'vigente' | 'en-revision';
   decididoEn: string;
   insights: { id: string; titulo: string }[];
+  /**
+   * La primera afirmación de un insight enlazado que YA NO tiene ninguna cita con derechos
+   * vigentes para el ámbito cliente, o `null` si toda la cadena se sostiene. Es el estado
+   * VIVO del respaldo, que `estado` no cuenta: `estado` habla de reaperturas (SYS-10) y
+   * una decisión perfectamente `vigente` puede apoyarse en insights cuya evidencia perdió
+   * los derechos. El guard de suficiencia sigue esa cadena al aprobar el gate, así que sin
+   * este campo el picker ofrecía una opción que la base iba a rechazar después — y la
+   * pantalla de gobernanza mostraba la decisión como si nada.
+   */
+  sinRespaldo: { insight: string; afirmacion: string } | null;
 };
 
 /** Los tres estados de gobernanza de un arquetipo (SPEC-04.11). Vive aquí y se importa

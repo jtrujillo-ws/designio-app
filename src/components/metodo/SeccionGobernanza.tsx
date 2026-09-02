@@ -225,6 +225,17 @@ function BloqueDecisiones({
           <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
             Sostenida por: {d.insights.map((i) => i.titulo).join(' · ') || '—'} · {d.decididoEn}
           </span>
+          {/* El respaldo se cae por detrás sin que la decisión cambie de estado: los
+              derechos de la evidencia citada se revocan y caducan por su cuenta. El guard
+              de suficiencia lo comprueba al aprobar el gate, así que aquí se dice antes —y
+              se nombra la afirmación exacta, que es lo que hay que reparar. */}
+          {d.sinRespaldo && (
+            <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+              Sin respaldo vigente: en el insight «{d.sinRespaldo.insight}», la afirmación «
+              {d.sinRespaldo.afirmacion}» ya no tiene ninguna cita con derechos vigentes para
+              el ámbito cliente.
+            </span>
+          )}
           {esLead && d.estado === 'en-revision' && (
             <div>
               <Button size="sm" variant="ghost" disabled={ocupado} onClick={() => void revalidar(d.id)}>

@@ -14,6 +14,59 @@ import {
 } from '@/lib/evidencia/sanitizacion';
 
 /**
+ * Un ZIP de VERDAD, con sus cabeceras locales, su directorio central y su registro final.
+ * Las entradas van sin comprimir (método 0) y con CRC en cero: el validador no descomprime
+ * ni verifica integridad, solo lee los nombres que el directorio central declara, así que
+ * el fixture tiene que ser estructuralmente honesto justo en esa parte. Escribirlo a mano
+ * es lo que permite construir los dos contraejemplos que importan: un ZIP real sin la
+ * parte exigida, y unos bytes con la parte «dentro» que no son un ZIP.
+ */
+function construirZip(entradas: { nombre: string; contenido: string }[]): Uint8Array {
+  const utf8 = new TextEncoder();
+  const locales: Uint8Array[] = [];
+  const centrales: Uint8Array[] = [];
+  let offset = 0;
+  for (const { nombre, contenido } of entradas) {
+    const n = utf8.encode(nombre);
+    const datos = utf8.encode(contenido);
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(8, 0, true); // método 0: almacenado
+    local.setUint32(18, datos.length, true);
+    local.setUint32(22, datos.length, true);
+    local.setUint16(26, n.length, true);
+    const central = new DataView(new ArrayBuffer(46));
+    central.setUint32(0, 0x02014b50, true);
+    central.setUint16(6, 20, true);
+    central.setUint16(10, 0, true);
+    central.setUint32(20, datos.length, true);
+    central.setUint32(24, datos.length, true);
+    central.setUint16(28, n.length, true);
+    central.setUint32(42, offset, true);
+    locales.push(new Uint8Array(local.buffer), n, datos);
+    centrales.push(new Uint8Array(central.buffer), n);
+    offset += 30 + n.length + datos.length;
+  }
+  const tamanoCentral = centrales.reduce((t, b) => t + b.length, 0);
+  const cierre = new DataView(new ArrayBuffer(22));
+  cierre.setUint32(0, 0x06054b50, true);
+  cierre.setUint16(8, entradas.length, true);
+  cierre.setUint16(10, entradas.length, true);
+  cierre.setUint32(12, tamanoCentral, true);
+  cierre.setUint32(16, offset, true);
+  const partes = [...locales, ...centrales, new Uint8Array(cierre.buffer)];
+  const total = partes.reduce((t, b) => t + b.length, 0);
+  const salida = new Uint8Array(total);
+  let i = 0;
+  for (const parte of partes) {
+    salida.set(parte, i);
+    i += parte.length;
+  }
+  return salida;
+}
+
+/**
  * Sanitización del material importado (RF-03.2, RF-09.7/09.8). Estos tests fijan la
  * decisión de diseño, no solo el código: el texto entra CRUDO y lo que se rechaza es
  * vector, no contenido.
@@ -162,9 +215,9 @@ describe('sanitización del material importado', () => {
       ).ok,
     ).toBe(false);
     const ooxml = (parte: string) =>
-      new Uint8Array([
-        0x50, 0x4b, 0x03, 0x04,
-        ...new TextEncoder().encode(`[Content_Types].xml${parte}`),
+      construirZip([
+        { nombre: '[Content_Types].xml', contenido: '<Types/>' },
+        { nombre: parte, contenido: '<xml/>' },
       ]);
     expect(
       verificarArchivo(
@@ -194,6 +247,55 @@ describe('sanitización del material importado', () => {
     expect(verificarArchivo(new Uint8Array([0x3c, 0x73]), 'image/svg+xml').ok).toBe(false);
     expect(verificarArchivo(new Uint8Array([0x3c, 0x73]), 'text/html').ok).toBe(false);
     expect(verificarArchivo(new Uint8Array(), 'text/plain').ok).toBe(false);
+  });
+
+  it('OOXML: la parte se lee del directorio central del ZIP, no como subcadena suelta', () => {
+    const utf8 = new TextEncoder();
+    const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+    // 1. Unos bytes que NO son un ZIP, con la firma PK delante y el nombre de la parte en
+    //    cualquier offset. Buscando la marca como subcadena esto pasaba como DOCX.
+    const falsoZip = new Uint8Array([
+      0x50, 0x4b, 0x03, 0x04,
+      ...utf8.encode('texto cualquiera [Content_Types].xml word/document.xml y más texto'),
+    ]);
+    expect(verificarArchivo(falsoZip, DOCX)).toMatchObject({
+      ok: false,
+      motivo: expect.stringContaining('directorio central'),
+    });
+
+    // 2. Un ZIP DE VERDAD que solo MENCIONA la parte dentro del contenido de una entrada.
+    //    Tener esos caracteres en algún sitio no es declarar la entrada.
+    const zipQueLaMenciona = construirZip([
+      { nombre: '[Content_Types].xml', contenido: '<Types/>' },
+      { nombre: 'leeme.txt', contenido: 'este zip habla de word/document.xml pero no la trae' },
+    ]);
+    expect(verificarArchivo(zipQueLaMenciona, DOCX)).toMatchObject({
+      ok: false,
+      motivo: expect.stringContaining('word/document.xml'),
+    });
+
+    // 3. Y un paquete sin `[Content_Types].xml` tampoco es un paquete: OPC lo exige en la
+    //    raíz de todo OOXML, sea Word, Excel o PowerPoint.
+    const sinOpc = construirZip([{ nombre: 'word/document.xml', contenido: '<w:document/>' }]);
+    expect(verificarArchivo(sinOpc, DOCX)).toMatchObject({
+      ok: false,
+      motivo: expect.stringContaining('[Content_Types].xml'),
+    });
+
+    // Lo que SÍ pasa, dicho sin adornos: un ZIP coherente que declara las dos entradas.
+    // Que su contenido sea o no un documento de Word real ya no lo decide este validador
+    // —eso exigiría interpretar el XML de terceros— y el comentario del código no lo
+    // promete.
+    expect(
+      verificarArchivo(
+        construirZip([
+          { nombre: '[Content_Types].xml', contenido: '<Types/>' },
+          { nombre: 'word/document.xml', contenido: '<w:document/>' },
+        ]),
+        DOCX,
+      ).ok,
+    ).toBe(true);
   });
 
   it('un "texto" con controles no es texto: los adjuntos textuales pasan el mismo filtro', () => {

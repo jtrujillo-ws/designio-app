@@ -112,15 +112,24 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
       // de gobernanza le está mostrando: el mismo silencio que este repositorio rechaza
       // en todas partes («marcado, no escondido»). El guard de suficiencia las bloquea al
       // aprobar el gate; aquí se dice por qué antes de elegir.
+      //
+      // Y una decisión se cita por DOS condiciones, no por una. `estado` solo habla de
+      // reaperturas (SYS-10): una decisión perfectamente vigente puede apoyarse en insights
+      // cuya evidencia perdió los derechos, y el guard de suficiencia sigue esa cadena al
+      // aprobar (20260902190000). Mirar solo el estado era el mismo hueco que ya se cerró
+      // para los insights, una capa más arriba: marcar el ítem tenía éxito y el rechazo
+      // llegaba al aprobar el gate, cuando ya se sabía de antemano que iba a fallar.
       ...(gobernanza?.decisiones ?? []).map((d) => ({
         clase: 'decision' as const,
         id: d.id,
         titulo: d.titulo,
-        citable: d.estado === 'vigente',
+        citable: d.estado === 'vigente' && d.sinRespaldo === null,
         motivoBloqueo:
-          d.estado === 'vigente'
-            ? null
-            : 'está en revisión tras una reapertura aguas arriba (SYS-10): revalídala antes de citarla',
+          d.estado !== 'vigente'
+            ? 'está en revisión tras una reapertura aguas arriba (SYS-10): revalídala antes de citarla'
+            : d.sinRespaldo === null
+              ? null
+              : `su respaldo perdió los derechos: en el insight «${d.sinRespaldo.insight}», la afirmación «${d.sinRespaldo.afirmacion}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente`,
       })),
     ];
     return {

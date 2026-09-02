@@ -21,8 +21,9 @@ import {
  * para compartirlo; re-invitar al mismo email re-emite el enlace (invalida el anterior).
  */
 export const Route = createFileRoute('/_autenticada/personas')({
+  loaderDeps: ({ search }) => ({ ws: search.ws }),
   loader: ({ context }) => {
-    const workspaceId = context.usuario.membresias[0]?.workspaceId;
+    const workspaceId = context.membresiaActiva?.workspaceId;
     return workspaceId
       ? miembrosDelWorkspace({ data: { workspaceId } }).then((miembros) => ({ workspaceId, miembros }))
       : null;

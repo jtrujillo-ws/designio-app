@@ -94,6 +94,21 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
     (${wsId}, 'RetoActivado', ${tx.json({ codigo: 'R-01', proyecto: 'P-01', perfil: 'estandar' })}, ${luciaId}, 'lead-boutique')`;
 }
 
+/** Segundo workspace de Lucía (demo del selector multi-membresía): mínimo pero real —
+ * un servicio, sin retos aún. Idempotente por nombre. */
+async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Promise<void> {
+  const existe = await tx`select 1 from workspace where nombre = 'Clínica del Valle'`;
+  if (existe.length > 0) return;
+  const [ws2] = await tx`insert into workspace (nombre) values ('Clínica del Valle') returning id`;
+  const ws2Id = ws2!.id as string;
+  await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+    values (${ws2Id}, ${luciaId}, 'Lucía Ferreira', 'lucia@whitespace.demo', 'lead-boutique')`;
+  await tx`insert into servicio (workspace_id, nombre, descripcion, creado_por)
+    values (${ws2Id}, 'Agendamiento de citas', 'Reserva y confirmación de citas médicas', ${luciaId})`;
+  await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
+    (${ws2Id}, 'WorkspaceCreado', ${tx.json({ nombre: 'Clínica del Valle', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
+}
+
 async function main() {
   const hash = await bcrypt.hash(PASSWORD_DEMO, 10);
 
@@ -124,10 +139,20 @@ async function main() {
       await sql.begin((tx) => sembrarMetodo(tx, wsId, lucia.id as string));
       metodoSembrado = true;
     }
+    // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía.
+    let segundoSembrado = false;
+    if (lucia) {
+      const [ws2] = await sql`select 1 from workspace where nombre = 'Clínica del Valle'`;
+      if (!ws2) {
+        await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
+        segundoSembrado = true;
+      }
+    }
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
         (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
-        (metodoSembrado ? '; método de P-01 sembrado' : ''),
+        (metodoSembrado ? '; método de P-01 sembrado' : '') +
+        (segundoSembrado ? '; Clínica del Valle sembrada' : ''),
     );
     return;
   }
@@ -156,9 +181,10 @@ async function main() {
 
     await sembrarArbol(tx, wsId, luciaId);
     await sembrarMetodo(tx, wsId, luciaId);
+    await sembrarSegundoWorkspace(tx, luciaId);
   });
   console.log(
-    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7) — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
+    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );
 }
 

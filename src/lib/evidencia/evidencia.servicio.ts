@@ -36,12 +36,14 @@ export async function crearItem(
       values (${entrada.workspaceId}, ${entrada.titulo}, ${entrada.contenido},
               ${entrada.tipoFuente}, ${entrada.referencia}, ${actorId})
       returning id`;
-    // Con el id en el payload, la auditoría correlaciona la importación con su
-    // decisión posterior aunque dos items compartan título y tipo de fuente.
-    await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id)
+    // La auditoría lleva actor Y su rol DE ESE MOMENTO (la membresía es mutable y el
+    // evento es append-only), y el itemId correlaciona la importación con su decisión
+    // aunque dos items compartan título y tipo de fuente.
+    const [quien] = await tx`select workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
+    await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (${entrada.workspaceId}, 'ItemImportado',
         ${tx.json({ itemId: item!.id as string, titulo: entrada.titulo, tipoFuente: entrada.tipoFuente })},
-        ${actorId})`;
+        ${actorId}, ${(quien?.rol ?? null) as string | null})`;
     return { itemId: item!.id as string };
   });
 }

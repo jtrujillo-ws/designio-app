@@ -145,12 +145,12 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
   const conEntrada = new Set(transiciones.map((a) => a.destinoId));
   const conSalida = new Set(transiciones.map((a) => a.origenId));
 
-  // Solo el PRIMER paso de la secuencia puede no tener entrada, y solo el último puede
-  // no tener salida — el primer paso de la fase 2 sí necesita que algo de la fase 1
-  // lleve hasta él, que es la costura que más se rompe.
+  // Solo el ÚLTIMO paso de la secuencia puede no tener salida — el primer paso de la
+  // fase 2 sí necesita que algo de la fase 1 lleve hasta él, que es la costura que más
+  // se rompe. (Quién puede no tener ENTRADA lo decide el anclaje de más abajo, que mira
+  // los transitables y no solo los pasos.)
   const pasos = journey.nodos.filter((n) => n.tipo === 'paso');
   const secuencia = porSecuencia(journey, pasos);
-  const primeroId = secuencia[0]?.id ?? null;
   const ultimoId = secuencia[secuencia.length - 1]?.id ?? null;
 
   // La ENTRADA del recorrido no es «el primer paso» a secas: una transición también
@@ -168,7 +168,11 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
     journey,
     transitables.filter((n) => conSalida.has(n.id) && !conEntrada.has(n.id)),
   );
-  const entrada = candidatas[0]?.id ?? primeroId;
+  // El anclaje de reserva se toma entre los TRANSITABLES, no entre los pasos: una fase de
+  // solo decisiones (`D1 → D2 → D1`) es un ciclo cerrado igual de roto, y anclando en el
+  // primer paso —que no existe— el informe se quedaba mudo sobre él.
+  const anclaje = porSecuencia(journey, transitables)[0] ?? null;
+  const entrada = candidatas[0]?.id ?? anclaje?.id ?? null;
 
   // Que NO haya candidata es en sí mismo el hallazgo, y el más silencioso de todos: si
   // cada nodo transitable tiene entrada, el recorrido es un ciclo cerrado y el journey no
@@ -177,13 +181,12 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
   //
   // Se reporta y ADEMÁS se ancla: sin el anclaje, todos los pasos saldrían inalcanzables
   // y la señal de verdad se perdería entre N falsos positivos que dicen lo mismo peor.
-  if (candidatas.length === 0 && transiciones.length > 0 && primeroId !== null) {
-    const primero = secuencia[0]!;
+  if (candidatas.length === 0 && transiciones.length > 0 && anclaje !== null) {
     senales.push({
       codigo: 'sin-entrada',
       severidad: 'alta',
-      nodoId: primero.id,
-      etiqueta: primero.etiqueta,
+      nodoId: anclaje.id,
+      etiqueta: anclaje.etiqueta,
       mensaje:
         'Todo paso o decisión tiene una transición de entrada: el recorrido es un ciclo cerrado y el journey no empieza en ninguna parte',
     });
@@ -354,6 +357,8 @@ export function carrilesDeJourney(journey: JourneyCompleto): CarrilesBlueprint {
   }
 
   const ACCIONES: TipoNodo[] = ['accion-frontstage', 'accion-backstage'];
+  const PUNTOS_DE_CONTACTO: TipoNodo[] = ['touchpoint', 'canal'];
+  const SE_SIENTEN: TipoNodo[] = ['friccion', 'emocion'];
 
   /**
    * Nodos de un tipo que le corresponden a un paso: los adyacentes al paso Y los
@@ -364,9 +369,18 @@ export function carrilesDeJourney(journey: JourneyCompleto): CarrilesBlueprint {
    * adyacencia de un salto, un actor que `participa` en una acción frontstage del paso no
    * caería en ningún carril y el blueprint mostraría acciones sin nadie que las haga.
    *
-   * El salto se detiene en las acciones y nunca aterriza en otro paso o fase: sin ese
-   * tope, un `paso → acción → paso` arrastraría la columna vecina entera y los carriles
-   * dejarían de distinguir un paso de otro.
+   * Los touchpoints y canales también son intermedios, porque `duele` puede apuntar a
+   * ellos: `paso -ocurre-en-> touchpoint` con `friccion -duele-> touchpoint` es un modelo
+   * válido y su carril de fricción salía vacío. Pero por ahí SOLO pasan fricciones y
+   * emociones — lo que de verdad se engancha a un punto de contacto—: un canal suele
+   * servir a media docena de pasos, y dejar cruzar acciones por él traería la columna
+   * vecina, que es el fallo que este tope existe para evitar.
+   *
+   * (Que una fricción de un canal compartido aparezca en todos los pasos que lo usan es
+   * deliberado: eso es exactamente lo que significa colgarla del canal y no del paso.)
+   *
+   * El salto nunca aterriza en otro paso o fase: sin ese tope, un `paso → acción → paso`
+   * arrastraría la columna vecina entera y los carriles dejarían de distinguir un paso.
    */
   function relacionados(pasoId: string, tipos: TipoNodo[]): NodoDeJourney[] {
     const vecinos: NodoDeJourney[] = [];
@@ -380,10 +394,16 @@ export function carrilesDeJourney(journey: JourneyCompleto): CarrilesBlueprint {
     for (const id of directos) agregar(id);
     for (const id of directos) {
       const intermedio = porId.get(id);
-      if (!intermedio || !ACCIONES.includes(intermedio.tipo)) continue;
+      if (!intermedio) continue;
+      const porAccion = ACCIONES.includes(intermedio.tipo);
+      const porContacto = PUNTOS_DE_CONTACTO.includes(intermedio.tipo);
+      if (!porAccion && !porContacto) continue;
       for (const lejano of vecindad.get(id) ?? []) {
         const nodo = porId.get(lejano);
         if (!nodo || nodo.tipo === 'paso' || nodo.tipo === 'fase') continue;
+        // Por un punto de contacto solo cruzan las fricciones y emociones que se le
+        // enganchan; lo demás traería la columna del paso vecino que lo comparte.
+        if (porContacto && !SE_SIENTEN.includes(nodo.tipo)) continue;
         agregar(lejano);
       }
     }

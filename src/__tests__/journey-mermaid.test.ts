@@ -295,6 +295,23 @@ describe('validarJourney', () => {
     expect(validarJourney(journey([fase, a, b], [arista(a, b, 'transicion')]))).toEqual([]);
   });
 
+  it('un ciclo de solo decisiones también se reporta: no hace falta un paso para no tener principio', () => {
+    // `primeroId` se deriva de los pasos, así que una fase de solo decisiones se saltaba
+    // la señal: sin paso no había anclaje, y las comprobaciones de alcanzabilidad y de
+    // salida también iteran solo sobre pasos. Resultado: cero señales sobre un ciclo.
+    const fase = nodo({ tipo: 'fase', etiqueta: 'Enrutamiento', orden: 0 });
+    const d1 = nodo({ tipo: 'decision', etiqueta: '¿Tiene cuenta?', orden: 0, faseId: fase.id });
+    const d2 = nodo({ tipo: 'decision', etiqueta: '¿Verificado?', orden: 1, faseId: fase.id });
+    const senales = validarJourney(
+      journey([fase, d1, d2], [arista(d1, d2, 'transicion'), arista(d2, d1, 'transicion')]),
+    );
+
+    const sinEntrada = senales.filter((s) => s.codigo === 'sin-entrada');
+    expect(sinEntrada).toHaveLength(1);
+    expect(sinEntrada[0]!.nodoId).toBe(d1.id);
+    expect(sinEntrada[0]!.severidad).toBe('alta');
+  });
+
   it('el huérfano de fase se reporta en todo lo que vive dentro de una fase, no solo en pasos', () => {
     // Borrar una fase pone a null el `fase_id` de sus hijos: una acción con soporte y
     // responsable podía quedarse fuera de toda fase sin producir ni una señal, mientras
@@ -417,6 +434,40 @@ describe('carrilesDeJourney', () => {
     // tres saltos desde el paso y el salto se detiene en el segundo. Que no aparezca es la
     // decisión, no un olvido: colgar el sistema del paso o de su acción frontstage lo trae.
     expect(porNombre['Sistemas']).toEqual([]);
+  });
+
+  it('la fricción que duele en el touchpoint del paso llega a su carril', () => {
+    // `paso -ocurre-en-> touchpoint` con `friccion -duele-> touchpoint` es un modelo que
+    // `EXTREMOS_ARISTA` admite, y con el salto limitado a acciones el carril de fricción
+    // salía estructuralmente vacío.
+    const paso = nodo({ tipo: 'paso', etiqueta: 'Consulta el saldo', orden: 0 });
+    const touchpoint = nodo({ tipo: 'touchpoint', etiqueta: 'Pantalla de saldo', orden: 0 });
+    const dolor = nodo({ tipo: 'friccion', etiqueta: 'El saldo tarda 8 segundos', orden: 0 });
+    const emocion = nodo({ tipo: 'emocion', etiqueta: 'Desconfianza', orden: 0 });
+    // Una acción frontstage del touchpoint que NO es de este paso: no debe cruzar.
+    const ajena = nodo({ tipo: 'accion-frontstage', etiqueta: 'Acción de otro paso', orden: 0 });
+
+    const blueprint = carrilesDeJourney(
+      journey(
+        [paso, touchpoint, dolor, emocion, ajena],
+        [
+          arista(paso, touchpoint, 'ocurre-en'),
+          arista(dolor, touchpoint, 'duele'),
+          arista(emocion, touchpoint, 'duele'),
+          arista(ajena, touchpoint, 'ocurre-en'),
+        ],
+      ),
+    );
+
+    const porNombre = Object.fromEntries(blueprint.carriles.map((c) => [c.nombre, c.porPaso[paso.id]!]));
+    expect(porNombre['Fricción y emoción']!.map((n) => n.etiqueta).sort()).toEqual([
+      'Desconfianza',
+      'El saldo tarda 8 segundos',
+    ]);
+    expect(porNombre['Evidencia física']!.map((n) => n.etiqueta)).toEqual(['Pantalla de saldo']);
+    // Por el punto de contacto solo cruzan fricciones y emociones: la acción de otro paso
+    // se queda donde está, o el carril traería la columna vecina.
+    expect(porNombre['Frontstage']).toEqual([]);
   });
 
   it('el segundo salto no arrastra la columna vecina', () => {

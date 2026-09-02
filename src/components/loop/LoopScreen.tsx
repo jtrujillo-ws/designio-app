@@ -1,12 +1,23 @@
 import type { CSSProperties } from 'react';
+import { useNavigate } from '@tanstack/react-router';
+import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
 import { Input } from '@/components/ui/Input';
 import { JourneyBadge } from '@/components/ui/JourneyBadge';
 import { Tabs } from '@/components/ui/Tabs';
+import { Wordmark } from '@/components/ui/Wordmark';
+import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
+import { cerrarSesion } from '@/lib/auth/auth.functions';
 import { LOOP_BANCO_ANDINO, type JourneyLoop } from '@/lib/loop/loop-data';
 
 /** Pantalla Loop J1–J7 — recreación de la referencia hifi del design system (ui_kits/designio). */
+
+/** Lo que la pantalla necesita del usuario autenticado (lo publica el guard de /_autenticada). */
+export type UsuarioLoop = {
+  nombre: string;
+  membresias: { workspaceNombre: string; rol: string }[];
+};
 
 const TABS = [
   'Loop J1–J7',
@@ -26,10 +37,10 @@ const micro: CSSProperties = {
   textTransform: 'uppercase',
 };
 
-export function LoopScreen() {
+export function LoopScreen({ usuario }: { usuario: UsuarioLoop }) {
   return (
     <div>
-      <Topbar />
+      <Topbar usuario={usuario} />
       <div style={{ display: 'flex', minHeight: 780 }}>
         <Sidebar />
         <main style={{ flex: 1, padding: '28px 32px', minWidth: 0 }}>
@@ -101,7 +112,25 @@ function JourneyCard({ jl }: { jl: JourneyLoop }) {
   );
 }
 
-function Topbar() {
+function inicialesDe(nombre: string): string {
+  const partes = nombre.trim().split(/\s+/);
+  return (
+    partes
+      .slice(0, 2)
+      .map((p) => (p[0] ?? '').toUpperCase())
+      .join('') || '?'
+  );
+}
+
+function Topbar({ usuario }: { usuario: UsuarioLoop }) {
+  const navigate = useNavigate();
+  const membresia = usuario.membresias[0];
+
+  async function salir() {
+    await cerrarSesion();
+    await navigate({ to: '/login' });
+  }
+
   return (
     <div
       style={{
@@ -114,19 +143,7 @@ function Topbar() {
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-        <span style={{ font: '800 21px var(--font-sans)' }}>
-          designio
-          <span
-            style={{
-              background: 'var(--grad-arco)',
-              WebkitBackgroundClip: 'text',
-              backgroundClip: 'text',
-              color: 'transparent',
-            }}
-          >
-            .
-          </span>
-        </span>
+        <Wordmark />
         <span
           style={{
             font: '600 13px var(--font-sans)',
@@ -135,7 +152,7 @@ function Topbar() {
             padding: '5px 14px',
           }}
         >
-          ● Banco Andino ▾
+          ● {membresia?.workspaceNombre ?? 'Sin workspace'} ▾
         </span>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
@@ -151,11 +168,15 @@ function Topbar() {
             textAlign: 'center',
           }}
         >
-          LP
+          {inicialesDe(usuario.nombre)}
         </span>
         <span style={{ font: '500 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
-          Lucía P. · Lead boutique
+          {usuario.nombre}
+          {membresia ? ` · ${ETIQUETA_ROL[membresia.rol] ?? membresia.rol}` : ''}
         </span>
+        <Button variant="ghost" size="sm" onClick={salir}>
+          Salir
+        </Button>
       </div>
     </div>
   );

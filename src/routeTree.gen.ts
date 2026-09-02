@@ -10,33 +10,75 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AutenticadaRouteImport } from './routes/_autenticada'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as AutenticadaAppRouteImport } from './routes/_autenticada/app'
+import { Route as InvitacionTokenRouteImport } from './routes/invitacion.$token'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AutenticadaRoute = AutenticadaRouteImport.update({
+  id: '/_autenticada',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AutenticadaAppRoute = AutenticadaAppRouteImport.update({
+  id: '/app',
+  path: '/app',
+  getParentRoute: () => AutenticadaRoute,
+} as any)
+const InvitacionTokenRoute = InvitacionTokenRouteImport.update({
+  id: '/invitacion/$token',
+  path: '/invitacion/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/login': typeof LoginRoute
+  '/app': typeof AutenticadaAppRoute
+  '/invitacion/$token': typeof InvitacionTokenRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/login': typeof LoginRoute
+  '/app': typeof AutenticadaAppRoute
+  '/invitacion/$token': typeof InvitacionTokenRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/_autenticada': typeof AutenticadaRouteWithChildren
+  '/login': typeof LoginRoute
+  '/_autenticada/app': typeof AutenticadaAppRoute
+  '/invitacion/$token': typeof InvitacionTokenRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths: '/' | '/login' | '/app' | '/invitacion/$token'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to: '/' | '/login' | '/app' | '/invitacion/$token'
+  id:
+    | '__root__'
+    | '/'
+    | '/_autenticada'
+    | '/login'
+    | '/_autenticada/app'
+    | '/invitacion/$token'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AutenticadaRoute: typeof AutenticadaRouteWithChildren
+  LoginRoute: typeof LoginRoute
+  InvitacionTokenRoute: typeof InvitacionTokenRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -48,11 +90,54 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/_autenticada': {
+      id: '/_autenticada'
+      path: ''
+      fullPath: '/'
+      preLoaderRoute: typeof AutenticadaRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/_autenticada/app': {
+      id: '/_autenticada/app'
+      path: '/app'
+      fullPath: '/app'
+      preLoaderRoute: typeof AutenticadaAppRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
+    '/invitacion/$token': {
+      id: '/invitacion/$token'
+      path: '/invitacion/$token'
+      fullPath: '/invitacion/$token'
+      preLoaderRoute: typeof InvitacionTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
+interface AutenticadaRouteChildren {
+  AutenticadaAppRoute: typeof AutenticadaAppRoute
+}
+
+const AutenticadaRouteChildren: AutenticadaRouteChildren = {
+  AutenticadaAppRoute: AutenticadaAppRoute,
+}
+
+const AutenticadaRouteWithChildren = AutenticadaRoute._addFileChildren(
+  AutenticadaRouteChildren,
+)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AutenticadaRoute: AutenticadaRouteWithChildren,
+  LoginRoute: LoginRoute,
+  InvitacionTokenRoute: InvitacionTokenRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

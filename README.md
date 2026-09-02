@@ -20,7 +20,7 @@ cp .env.local.example .env.local            # y genera JWT_SECRET con: openssl r
 docker compose -f docker-compose.db.yml up -d
 bun run db:migrate && bun run db:seed       # crea el rol de app (no privilegiado) + workspace demo
 
-bun run dev                                 # http://localhost:5173
+bun run dev                                 # http://localhost:5173 — login demo: lucia@whitespace.demo / designio.demo
 ```
 
 Validación local (lo mismo que corre el CI): `bun run typecheck && bun run lint && bun run test && bun run build && bun run check:bundle`.

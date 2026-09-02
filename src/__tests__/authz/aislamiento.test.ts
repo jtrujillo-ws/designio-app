@@ -19,9 +19,11 @@ describeAuthz('aislamiento por tenant (RLS activo)', () => {
     const [b] = await admin`insert into workspace (nombre) values (${marca + '-B'}) returning id`;
     wsA = a!.id as string;
     wsB = b!.id as string;
-    const [ua] = await admin`insert into miembro (workspace_id, nombre, email, rol)
-      values (${wsA}, 'Usuario A', ${marca + '@a.test'}, 'lead-boutique') returning id`;
+    const [ua] = await admin`insert into usuario (email, nombre, estado)
+      values (${marca + '@a.test'}, 'Usuario A', 'activo') returning id`;
     userA = ua!.id as string;
+    await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${wsA}, ${userA}, 'Usuario A', ${marca + '@a.test'}, 'lead-boutique')`;
     await admin`insert into segmento (workspace_id, nombre) values (${wsA}, ${marca + '-seg-A'})`;
     await admin`insert into segmento (workspace_id, nombre) values (${wsB}, ${marca + '-seg-B'})`;
     await admin`insert into evento_dominio (workspace_id, tipo) values (${wsA}, 'AuthzTest')`;
@@ -33,6 +35,7 @@ describeAuthz('aislamiento por tenant (RLS activo)', () => {
     await admin`delete from segmento where workspace_id in (${wsA}, ${wsB})`;
     await admin`delete from miembro where workspace_id in (${wsA}, ${wsB})`;
     await admin`delete from workspace where id in (${wsA}, ${wsB})`;
+    await admin`delete from usuario where id = ${userA}`;
     await cerrarPools();
   });
 

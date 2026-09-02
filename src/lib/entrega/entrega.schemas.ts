@@ -143,6 +143,16 @@ export const BorrarElementoSchema = z.object({
   elementoId: z.string().uuid(),
 });
 
+/** Enlazar el to-be prometido por «se puede enlazar después». El journey es OBLIGATORIO:
+ * la operación existe para poner el enlace que falta, y desenlazar solo devolvería el
+ * borrador al estado que esto vino a arreglar. */
+export const EnlazarJourneySchema = z.object({
+  workspaceId: z.string().uuid(),
+  designVersionId: z.string().uuid(),
+  journeyId: z.string().uuid(),
+});
+export type EnlazarJourney = z.infer<typeof EnlazarJourneySchema>;
+
 export const AprobarDesignVersionSchema = z.object({
   workspaceId: z.string().uuid(),
   designVersionId: z.string().uuid(),
@@ -229,6 +239,9 @@ export type ElementoDeCambio = {
   detalle: string;
   nodoId: string | null;
   nodoEtiqueta: string | null;
+  /** La identidad de catálogo del nodo, cuando el nodo la tiene: es por donde el diff
+   * reconoce el mismo elemento lógico entre design versions (ver ConstatacionDelServicio). */
+  catalogoId: string | null;
   orden: number;
   decisiones: { id: string; titulo: string }[];
   insights: { id: string; titulo: string }[];
@@ -257,21 +270,49 @@ export type ReleaseDeDesignVersion = {
   } | null;
 };
 
-/** Lo que el effective state VIGENTE del servicio dice de cada elemento ya constatado
- * (RF-06.10). Es el lado derecho del diff. */
-export type ElementoVigente = {
+/**
+ * Una constatación del servicio, con la IDENTIDAD del elemento sobre el que cayó y la
+ * operación que declaraba (RF-06.6). Las tres claves van juntas porque la identidad
+ * lógica de un elemento de cambio no es su fila: cada design version que vuelve a tocar
+ * la misma cosa crea un `elemento_cambio` nuevo, con id nuevo. Lo estable es, por orden:
+ *
+ *  1. `catalogoId` — el catálogo del servicio (SPEC-05) le da identidad a lo que se
+ *     repite entre journeys: un touchpoint, un canal, un actor o un sistema son LOS
+ *     MISMOS en el as-is, en el to-be de este ciclo y en el del siguiente, y sobreviven
+ *     a un renombre. Es la identidad de verdad, y ya está en el esquema: el elemento la
+ *     alcanza por su nodo. Darle al elemento de cambio una identidad propia y paralela
+ *     sería tener dos identidades para la misma cosa — justo lo que el catálogo vino a
+ *     evitar.
+ *  2. `nodoId` — para los tipos que NO tienen catálogo (un paso, una fricción): existen
+ *     dentro de su journey, y el journey de trabajo sigue vivo entre ciclos (RF-05.8),
+ *     así que el nodo aguanta mientras el grafo sea el mismo.
+ *  3. el título normalizado — para los elementos sin nodo. Es un apaño y se sabe: dos
+ *     elementos distintos pueden compartir título. Se prefiere a no emparejar nada,
+ *     pero es la razón por la que enlazar el nodo importa.
+ */
+export type ConstatacionDelServicio = {
   elementoId: string;
   titulo: string;
   nodoId: string | null;
+  catalogoId: string | null;
+  operacion: Operacion;
   resultado: ResultadoConstatacion;
 };
+
+/** Un elemento del effective state VIGENTE (RF-06.10): el resultado de plegar la historia
+ * de constataciones por identidad lógica. Misma forma que la constatación que lo dejó
+ * así, a propósito — es exactamente esa fila la que describe cómo quedó. */
+export type ElementoVigente = ConstatacionDelServicio;
 
 export type EstadoEfectivoVigente = {
   id: string;
   codigo: string;
   constatadoEn: string;
   designVersionCodigo: string;
-  elementos: ElementoVigente[];
+  /** La HISTORIA del servicio en orden cronológico, no el estado: el estado es su
+   * pliegue (`plegarEstadoVigente` en entrega.diff.ts). Viaja entera porque el pliegue
+   * necesita la identidad lógica, que se define del lado que también empareja el diff. */
+  constataciones: ConstatacionDelServicio[];
 } | null;
 
 export type DesignVersionCompleta = {
@@ -294,6 +335,9 @@ export type DesignVersionCompleta = {
   releases: ReleaseDeDesignVersion[];
   /** Nodos del journey to-be, para enlazar elementos sin salir de la pantalla. */
   nodosDelJourney: { id: string; tipo: string; etiqueta: string }[];
+  /** Los to-be del servicio que este borrador puede enlazar (mismo predicado que el
+   * guard): si nació sin journey, es por aquí por donde se le pone. */
+  journeysEnlazables: { id: string; nombre: string }[];
   decisionesDelProyecto: { id: string; titulo: string }[];
   insightsValidados: { id: string; titulo: string }[];
   vigente: EstadoEfectivoVigente;

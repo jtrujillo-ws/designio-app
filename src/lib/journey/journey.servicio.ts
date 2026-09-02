@@ -525,7 +525,7 @@ export async function journeysDelWorkspace(
     await exigirCuentaActiva(tx, actorId);
     // Se pide una fila de más para saber si hubo recorte sin contar la tabla entera.
     const filas = await tx`
-      select j.id, j.nombre, j.tipo, s.nombre as servicio_nombre,
+      select j.id, j.nombre, j.tipo, j.servicio_id, s.nombre as servicio_nombre,
         (select count(*)::int from journey_nodo n
           where n.journey_id = j.id and n.workspace_id = j.workspace_id) as nodos,
         (select count(*)::int from journey_snapshot sn
@@ -544,6 +544,7 @@ export async function journeysDelWorkspace(
         id: f.id as string,
         nombre: f.nombre as string,
         tipo: f.tipo as ResumenJourney['tipo'],
+        servicioId: f.servicio_id as string,
         servicioNombre: f.servicio_nombre as string,
         nodos: f.nodos as number,
         snapshots: f.snapshots as number,

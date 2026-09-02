@@ -203,7 +203,7 @@ function FormularioDesignVersion({
 }: {
   workspaceId: string;
   servicios: { id: string; nombre: string; proyectos: { id: string; etiqueta: string }[] }[];
-  journeys: { id: string; nombre: string; servicioNombre: string }[];
+  journeys: { id: string; nombre: string; servicioId: string; servicioNombre: string }[];
   aprobadas: { id: string; codigo: string; titulo: string; servicioNombre: string }[];
   onCerrar: () => void;
   onError: (e: string | null) => void;
@@ -217,6 +217,10 @@ function FormularioDesignVersion({
   const [resumen, setResumen] = useState('');
   const [ocupado, setOcupado] = useState(false);
   const proyectos = servicios.find((s) => s.id === servicioId)?.proyectos ?? [];
+  // Una design version cambia UN servicio, y su journey tiene que ser el to-be de ESE
+  // servicio (lo exige `design_version_journey_guard`): ofrecer los demás sería ofrecer
+  // un alta que la base rechaza.
+  const journeysDelServicio = journeys.filter((j) => j.servicioId === servicioId);
 
   async function enviar(e: FormEvent) {
     e.preventDefault();
@@ -250,6 +254,9 @@ function FormularioDesignVersion({
           onChange={(e) => {
             setServicioId(e.target.value);
             setProyectoId('');
+            // El journey elegido era del servicio anterior: dejarlo puesto mandaría al
+            // endpoint un enlace que el guard rechaza.
+            setJourneyId('');
           }}
           required
         >
@@ -273,9 +280,13 @@ function FormularioDesignVersion({
             </option>
           ))}
         </Select>
-        <Select value={journeyId} onChange={(e) => setJourneyId(e.target.value)}>
+        <Select
+          value={journeyId}
+          onChange={(e) => setJourneyId(e.target.value)}
+          disabled={servicioId === ''}
+        >
           <option value="">Journey to-be (se puede enlazar después)</option>
-          {journeys.map((j) => (
+          {journeysDelServicio.map((j) => (
             <option key={j.id} value={j.id}>
               {j.nombre} · {j.servicioNombre}
             </option>
@@ -304,7 +315,8 @@ function FormularioDesignVersion({
         <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
           Nace en borrador. Aprobar exige un journey to-be del servicio y al menos un
           elemento de cambio; si el servicio ya tiene una design version aprobada, esta
-          debe declarar a cuál supera (SYS-05).
+          debe declarar a cuál supera (SYS-05). El journey se puede enlazar o cambiar
+          después desde la propia design version, mientras siga en borrador.
         </span>
         <div style={{ display: 'flex', gap: 8 }}>
           <Button

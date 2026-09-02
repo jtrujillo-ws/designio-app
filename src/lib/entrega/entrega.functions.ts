@@ -12,6 +12,7 @@ import {
   DesignVersionInputSchema,
   DesplegarReleaseSchema,
   EditarElementoSchema,
+  EnlazarJourneySchema,
   PlanificarReleaseSchema,
   ReleaseInputSchema,
   WorkspaceInputSchema,
@@ -29,6 +30,7 @@ import {
   desasignarElemento,
   desplegarRelease,
   editarElemento,
+  enlazarJourney,
   ErrorEntrega,
   planificarRelease,
   tableroDeConciliacion,
@@ -150,6 +152,23 @@ export const borrarElementoDeCambio = createServerFn({ method: 'POST' })
     if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
     try {
       await borrarElemento(actorId, data.workspaceId, data.elementoId);
+      return { ok: true as const };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+/** El «se puede enlazar después» del formulario de alta, cumplido: sin esto, el borrador
+ * sin journey no podía aprobarse ni borrarse. */
+export const enlazarJourneyDeDesignVersion = createServerFn({ method: 'POST' })
+  .inputValidator(EnlazarJourneySchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await enlazarJourney(actorId, data);
       return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);

@@ -233,6 +233,9 @@ export type ResumenJourney = {
   id: string;
   nombre: string;
   tipo: TipoJourney;
+  /** El servicio por ID y no solo por nombre: quien filtra journeys por servicio (la
+   * design version, que cambia UNO) no puede hacerlo comparando cadenas. */
+  servicioId: string;
   servicioNombre: string;
   nodos: number;
   /** Cuántos snapshots congelados lleva: la historia de lo aprobado sobre este grafo. */

@@ -11,6 +11,7 @@ import type {
   DesignVersionCompleta,
   DesplegarRelease,
   EditarElemento,
+  EnlazarJourney,
   PlanificarRelease,
   ResumenDesignVersion,
   TableroConciliacion,
@@ -117,6 +118,37 @@ export async function crearDesignVersion(
     }
     if (!fila) throw new ErrorEntrega('No puedes crear design versions en este workspace');
     return { designVersionId: fila.id as string };
+  });
+}
+
+/**
+ * Enlazar (o reenlazar) el journey to-be de un BORRADOR. El formulario de alta ofrece
+ * «se puede enlazar después» porque el modelo lo permite —la DV puede abrirse antes de
+ * que el to-be exista—, y sin esta operación esa opción dejaba el borrador muerto: no se
+ * puede aprobar sin grafo que congelar, y no hay DELETE sobre design_version.
+ *
+ * Ni el estado ni el rol se validan aquí: la política solo alcanza borradores y solo a
+ * curadores, y el grant por columna hace que este UPDATE no pueda tocar nada más. Lo
+ * único que hace el servicio es traducir «no alcanzó ninguna fila» al motivo real.
+ */
+export async function enlazarJourney(actorId: string, entrada: EnlazarJourney): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    let filas;
+    try {
+      filas = await tx`
+        update design_version set journey_id = ${entrada.journeyId}
+        where id = ${entrada.designVersionId} and workspace_id = ${entrada.workspaceId}`;
+    } catch (e) {
+      comoErrorDeDominio(e, 'Solo los curadores enlazan el journey de un borrador');
+    }
+    // Sobre una DV aprobada no se llega aquí: el guard de transición aborta antes con la
+    // inmutabilidad de SYS-05. Cero filas es «no existe, o no puedes enlazarla».
+    if (filas!.count === 0) {
+      throw new ErrorEntrega(
+        'La design version no existe en este workspace, o no puedes enlazar su journey',
+      );
+    }
   });
 }
 
@@ -539,6 +571,11 @@ export async function designVersionCompleta(
             'detalle', ec.detalle, 'nodoId', ec.nodo_id, 'orden', ec.orden,
             'nodoEtiqueta', (select n.etiqueta from journey_nodo n
               where n.id = ec.nodo_id and n.workspace_id = ec.workspace_id),
+            -- La identidad ESTABLE del elemento (SPEC-05): el catálogo del servicio es lo
+            -- único que sobrevive a un journey nuevo y a un renombre. El diff empareja
+            -- por aquí antes que por nodo o por título.
+            'catalogoId', (select n.catalogo_id from journey_nodo n
+              where n.id = ec.nodo_id and n.workspace_id = ec.workspace_id),
             'decisiones', coalesce((
               select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo) order by d.titulo)
               from elemento_decision ed
@@ -586,6 +623,17 @@ export async function designVersionCompleta(
           from journey_nodo n
           where n.journey_id = dv.journey_id and n.workspace_id = dv.workspace_id
         ), '[]'::jsonb) as nodos_del_journey,
+        -- Los journeys que el borrador PUEDE enlazar: exactamente el predicado que exige
+        -- design_version_journey_guard, para que el selector no ofrezca nada que el
+        -- endpoint vaya a rechazar.
+        coalesce((
+          select jsonb_agg(jsonb_build_object('id', j2.id, 'nombre', j2.nombre)
+            order by j2.creado_en desc)
+          from journey j2
+          where j2.workspace_id = dv.workspace_id and j2.servicio_id = dv.servicio_id
+            and j2.tipo = 'to-be'
+            and (j2.proyecto_id is null or j2.proyecto_id = dv.proyecto_id)
+        ), '[]'::jsonb) as journeys_enlazables,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo) order by d.decidido_en)
           from decision d
@@ -598,28 +646,47 @@ export async function designVersionCompleta(
         ), '[]'::jsonb) as insights_validados,
         -- RF-06.10 + RF-06.2: el estado efectivo vigente del servicio, EXCLUYENDO lo que
         -- esta misma design version produjo (compararla consigo misma no es un diff).
-        -- El ancla es la última constatación verificada; el contenido, la última
-        -- constatación de CADA elemento (un servicio con varios releases tiene su estado
-        -- repartido entre ellos, y quedarse solo con el último ES perdería lo anterior).
+        -- El ancla es la última constatación verificada; el contenido, la HISTORIA de
+        -- constataciones del servicio en orden cronológico (un servicio con varios
+        -- releases tiene su estado repartido entre ellos, y quedarse solo con el último
+        -- ES perdería lo anterior).
+        --
+        -- Lo que viaja es la historia, no el estado: el estado vigente es su PLIEGUE por
+        -- identidad lógica, y ese pliegue vive en entrega.diff.ts —donde está definida
+        -- la identidad (la función «clave»)— para que los dos lados del diff no puedan usar
+        -- criterios distintos. Aquí solo se garantiza el ORDEN, que es lo que el pliegue
+        -- necesita y lo que a este jsonb_agg le faltaba.
+        --
+        -- Sin el «distinct on (c.elemento_id)» de antes: no colapsaba nada. Un elemento va a
+        -- como mucho un release (PK de release_elemento), un release se constata una vez
+        -- (unique de effective_state.release_id) y la constatación es única por
+        -- (effective_state, elemento) — o sea, una fila de elemento_cambio tiene como
+        -- mucho UNA constatación en toda su vida. Deduplicar por su id parecía colapsar
+        -- historia y no colapsaba ninguna.
         (select jsonb_build_object(
             'id', v.id, 'codigo', v.codigo,
             'constatadoEn', to_char(v.constatado_en, 'YYYY-MM-DD'),
             'designVersionCodigo', v.dv_codigo,
-            'elementos', coalesce((
+            'constataciones', coalesce((
               select jsonb_agg(jsonb_build_object('elementoId', u.elemento_id,
-                'titulo', u.titulo, 'nodoId', u.nodo_id, 'resultado', u.resultado))
+                'titulo', u.titulo, 'nodoId', u.nodo_id, 'catalogoId', u.catalogo_id,
+                'operacion', u.operacion, 'resultado', u.resultado)
+                order by u.constatado_en, u.es_creado_en, u.orden, u.elemento_creado_en)
               from (
-                select distinct on (c.elemento_id)
-                  c.elemento_id, ec2.titulo, ec2.nodo_id, c.resultado
+                select c.elemento_id, ec2.titulo, ec2.nodo_id, n2.catalogo_id,
+                  ec2.operacion, c.resultado, es2.constatado_en,
+                  es2.creado_en as es_creado_en, ec2.orden,
+                  ec2.creado_en as elemento_creado_en
                 from constatacion c
                 join effective_state es2 on es2.id = c.effective_state_id
                   and es2.workspace_id = c.workspace_id
                 join release r2 on r2.id = es2.release_id and r2.workspace_id = es2.workspace_id
                 join elemento_cambio ec2 on ec2.id = c.elemento_id
                   and ec2.workspace_id = c.workspace_id
+                left join journey_nodo n2 on n2.id = ec2.nodo_id
+                  and n2.workspace_id = ec2.workspace_id
                 where es2.servicio_id = dv.servicio_id and es2.workspace_id = dv.workspace_id
                   and r2.design_version_id <> dv.id and r2.estado = 'verificado'
-                order by c.elemento_id, es2.constatado_en desc, es2.creado_en desc
               ) u), '[]'::jsonb))
           from (
             select es3.id, es3.codigo, es3.constatado_en, dv3.codigo as dv_codigo
@@ -657,6 +724,7 @@ export async function designVersionCompleta(
       elementos: fila.elementos as DesignVersionCompleta['elementos'],
       releases: fila.releases as DesignVersionCompleta['releases'],
       nodosDelJourney: fila.nodos_del_journey as DesignVersionCompleta['nodosDelJourney'],
+      journeysEnlazables: fila.journeys_enlazables as DesignVersionCompleta['journeysEnlazables'],
       decisionesDelProyecto:
         fila.decisiones_del_proyecto as DesignVersionCompleta['decisionesDelProyecto'],
       insightsValidados: fila.insights_validados as DesignVersionCompleta['insightsValidados'],

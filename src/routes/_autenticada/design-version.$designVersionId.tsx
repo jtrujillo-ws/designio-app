@@ -20,6 +20,7 @@ import {
   conciliacionDeDesignVersion,
   constatarReleaseDesplegado,
   designVersionDelWorkspace,
+  enlazarJourneyDeDesignVersion,
   planificarReleaseDeDesignVersion,
   quitarElementoDeRelease,
   registrarDespliegue,
@@ -159,6 +160,15 @@ function PantallaDesignVersion() {
           </span>
         )}
 
+        {enBorrador && esCurador && (
+          <EnlazarJourneyToBe
+            workspaceId={datos.workspaceId}
+            dv={dv}
+            onError={setError}
+            onHecho={refrescar}
+          />
+        )}
+
         {enBorrador && esLead && (
           <AprobarDesignVersion
             workspaceId={datos.workspaceId}
@@ -248,6 +258,79 @@ function Cabecera({ dv }: { dv: DesignVersionCompleta }) {
   );
 }
 
+/**
+ * El enlace que el formulario de alta promete poder poner «después». Solo sobre
+ * BORRADORES (la política no alcanza otra cosa) y solo con los to-be del servicio que el
+ * guard acepta, que son los que trae la proyección: el selector no ofrece nada que el
+ * endpoint vaya a rechazar.
+ */
+function EnlazarJourneyToBe({
+  workspaceId,
+  dv,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  dv: DesignVersionCompleta;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [journeyId, setJourneyId] = useState(dv.journeyId ?? '');
+  const [ocupado, setOcupado] = useState(false);
+  const sinCandidatos = dv.journeysEnlazables.length === 0;
+
+  return (
+    <Card style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <span style={micro}>Journey to-be</span>
+      <span style={apunte}>
+        {dv.journeyId === null
+          ? 'Este borrador todavía no enlaza el grafo objetivo. Aprobar congela su snapshot (RF-06.3), así que sin journey no hay aprobación posible.'
+          : 'Mientras la design version siga en borrador, el grafo objetivo se puede cambiar. Al aprobarla, su snapshot queda congelado y este enlace deja de moverse.'}
+      </span>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <Select
+          value={journeyId}
+          onChange={(e) => setJourneyId(e.target.value)}
+          disabled={sinCandidatos}
+          style={{ flex: '1 1 280px' }}
+        >
+          <option value="">Journey to-be de {dv.servicioNombre}…</option>
+          {dv.journeysEnlazables.map((j) => (
+            <option key={j.id} value={j.id}>
+              {j.nombre}
+            </option>
+          ))}
+        </Select>
+        <Button
+          size="sm"
+          disabled={ocupado || journeyId === '' || journeyId === dv.journeyId}
+          onClick={async () => {
+            setOcupado(true);
+            onError(null);
+            try {
+              const r = await enlazarJourneyDeDesignVersion({
+                data: { workspaceId, designVersionId: dv.id, journeyId },
+              });
+              if (r.ok) await onHecho();
+              else onError(r.error);
+            } finally {
+              setOcupado(false);
+            }
+          }}
+        >
+          Enlazar
+        </Button>
+      </div>
+      {sinCandidatos && (
+        <span style={apunte}>
+          {dv.servicioNombre} no tiene ningún journey to-be de este proyecto: créalo primero
+          en la pantalla de journeys.
+        </span>
+      )}
+    </Card>
+  );
+}
+
 function AprobarDesignVersion({
   workspaceId,
   dv,
@@ -304,7 +387,8 @@ function AprobarDesignVersion({
       )}
       {dv.journeyId === null && (
         <span style={apunte}>
-          Falta enlazar el journey to-be del servicio: sin grafo no hay snapshot que congelar.
+          Falta enlazar el journey to-be del servicio —arriba, en «Journey to-be»—: sin
+          grafo no hay snapshot que congelar.
         </span>
       )}
     </Card>

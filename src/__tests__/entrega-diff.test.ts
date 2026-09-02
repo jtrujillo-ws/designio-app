@@ -3,8 +3,10 @@ import {
   calcularDiff,
   conciliacionCompleta,
   elementosEnEstadoDesconocido,
+  plegarEstadoVigente,
 } from '@/lib/entrega/entrega.diff';
 import type {
+  ConstatacionDelServicio,
   ElementoDeCambio,
   EstadoEfectivoVigente,
   FilaConciliacion,
@@ -23,6 +25,7 @@ function elemento(p: Partial<ElementoDeCambio> & { id: string; titulo: string })
     detalle: '',
     nodoId: null,
     nodoEtiqueta: null,
+    catalogoId: null,
     orden: 0,
     decisiones: [],
     insights: [],
@@ -30,12 +33,26 @@ function elemento(p: Partial<ElementoDeCambio> & { id: string; titulo: string })
   };
 }
 
-const vigente = (elementos: EstadoEfectivoVigente extends null ? never : NonNullable<EstadoEfectivoVigente>['elementos']): EstadoEfectivoVigente => ({
+/** Una constatación de la historia del servicio. `operacion` por defecto 'agrega': lo
+ * habitual es que un elemento constatado sea algo que se puso, no que se quitó. */
+function constatado(
+  p: Partial<ConstatacionDelServicio> & { elementoId: string; titulo: string },
+): ConstatacionDelServicio {
+  return {
+    nodoId: null,
+    catalogoId: null,
+    operacion: 'agrega',
+    resultado: 'como-aprobado',
+    ...p,
+  };
+}
+
+const vigente = (constataciones: ConstatacionDelServicio[]): EstadoEfectivoVigente => ({
   id: 'es-1',
   codigo: 'ES-1',
   constatadoEn: '2026-08-20',
   designVersionCodigo: 'DV-1',
-  elementos,
+  constataciones,
 });
 
 function fila(p: Partial<FilaConciliacion> & { elementoId: string }): FilaConciliacion {
@@ -66,7 +83,7 @@ describe('diff contra el effective state vigente', () => {
     const d = calcularDiff(
       [elemento({ id: 'a', titulo: 'Verificación en vídeo (v2)', nodoId: 'n1', operacion: 'modifica' })],
       vigente([
-        { elementoId: 'viejo', titulo: 'Verificación en video', nodoId: 'n1', resultado: 'como-aprobado' },
+        constatado({ elementoId: 'viejo', titulo: 'Verificación en video', nodoId: 'n1' }),
       ]),
     );
     expect(d.filas[0]!.veredicto).toBe('modifica');
@@ -74,11 +91,42 @@ describe('diff contra el effective state vigente', () => {
     expect(d.filas[0]!.senal).toBeNull();
   });
 
+  it('empareja por CATÁLOGO aunque el nodo sea otro: el journey del ciclo nuevo no rompe la identidad', () => {
+    // El to-be del ciclo siguiente puede ser otro grafo, con otros nodos. Lo que no
+    // cambia es el touchpoint del catálogo del servicio (SPEC-05): es la identidad.
+    const d = calcularDiff(
+      [
+        elemento({
+          id: 'a',
+          titulo: 'Video-verificación asistida',
+          nodoId: 'n2',
+          catalogoId: 'cat-video',
+          operacion: 'modifica',
+        }),
+      ],
+      vigente([
+        constatado({
+          elementoId: 'viejo',
+          titulo: 'Video-verificación',
+          nodoId: 'n1',
+          catalogoId: 'cat-video',
+        }),
+      ]),
+    );
+    expect(d.filas[0]!.veredicto).toBe('modifica');
+    expect(d.filas[0]!.precedente?.elementoId).toBe('viejo');
+    expect(d.seMantiene).toEqual([]);
+  });
+
   it('sin nodo, empareja por título normalizado (acentos, mayúsculas y espacios)', () => {
     const d = calcularDiff(
       [elemento({ id: 'a', titulo: '  Video-VERIFICACIÓN   asistida ', operacion: 'modifica' })],
       vigente([
-        { elementoId: 'viejo', titulo: 'video-verificacion asistida', nodoId: null, resultado: 'desviado' },
+        constatado({
+          elementoId: 'viejo',
+          titulo: 'video-verificacion asistida',
+          resultado: 'desviado',
+        }),
       ]),
     );
     expect(d.filas[0]!.precedente?.elementoId).toBe('viejo');
@@ -91,9 +139,7 @@ describe('diff contra el effective state vigente', () => {
         elemento({ id: 'b', titulo: 'No existe', operacion: 'modifica' }),
         elemento({ id: 'c', titulo: 'Tampoco existe', operacion: 'retira' }),
       ],
-      vigente([
-        { elementoId: 'viejo', titulo: 'Ya existe', nodoId: null, resultado: 'como-aprobado' },
-      ]),
+      vigente([constatado({ elementoId: 'viejo', titulo: 'Ya existe' })]),
     );
     expect(d.filas[0]!.veredicto).toBe('modifica');
     expect(d.filas[0]!.senal).toMatch(/ya lo tiene constatado/);
@@ -108,12 +154,11 @@ describe('diff contra el effective state vigente', () => {
     const d = calcularDiff(
       [elemento({ id: 'a', titulo: 'Integración en línea', operacion: 'agrega' })],
       vigente([
-        {
+        constatado({
           elementoId: 'viejo',
           titulo: 'Integración en línea',
-          nodoId: null,
           resultado: 'no-implementado',
-        },
+        }),
       ]),
     );
     // Nunca llegó a existir: volver a proponerlo es un alta, no una modificación.
@@ -126,11 +171,104 @@ describe('diff contra el effective state vigente', () => {
     const d = calcularDiff(
       [elemento({ id: 'a', titulo: 'Cambia esto', operacion: 'modifica' })],
       vigente([
-        { elementoId: 'v1', titulo: 'Cambia esto', nodoId: null, resultado: 'como-aprobado' },
-        { elementoId: 'v2', titulo: 'Sigue igual', nodoId: null, resultado: 'desviado' },
+        constatado({ elementoId: 'v1', titulo: 'Cambia esto' }),
+        constatado({ elementoId: 'v2', titulo: 'Sigue igual', resultado: 'desviado' }),
       ]),
     );
     expect(d.seMantiene.map((s) => s.elementoId)).toEqual(['v2']);
+  });
+});
+
+/**
+ * La historia del servicio trae una fila por VERSIÓN del elemento —cada design version
+ * que vuelve a tocar la misma cosa crea un `elemento_cambio` nuevo—, así que el estado
+ * vigente es el pliegue de esa historia por identidad lógica, no la historia.
+ */
+describe('pliegue del estado efectivo vigente por identidad lógica', () => {
+  it('gana la constatación MÁS RECIENTE de la identidad, no una fila histórica cualquiera', () => {
+    const estado = plegarEstadoVigente([
+      constatado({ elementoId: 'v1', titulo: 'Verificación en video', catalogoId: 'cat-video' }),
+      constatado({
+        elementoId: 'v2',
+        titulo: 'Video-verificación asistida',
+        catalogoId: 'cat-video',
+        operacion: 'modifica',
+        resultado: 'desviado',
+      }),
+    ]);
+    expect([...estado.values()]).toEqual([
+      expect.objectContaining({ elementoId: 'v2', resultado: 'desviado' }),
+    ]);
+  });
+
+  it('un retiro constatado como se aprobó SACA el elemento del estado vigente', () => {
+    const estado = plegarEstadoVigente([
+      constatado({ elementoId: 'v1', titulo: 'Revisión manual del 100%', catalogoId: 'cat-rev' }),
+      constatado({
+        elementoId: 'v2',
+        titulo: 'Revisión manual del 100%',
+        catalogoId: 'cat-rev',
+        operacion: 'retira',
+      }),
+    ]);
+    expect([...estado.values()]).toEqual([]);
+  });
+
+  it('un retiro DESVIADO no borra nada: el estado vigente no afirma una ausencia que nadie constató', () => {
+    const estado = plegarEstadoVigente([
+      constatado({ elementoId: 'v1', titulo: 'Revisión manual', catalogoId: 'cat-rev' }),
+      constatado({
+        elementoId: 'v2',
+        titulo: 'Revisión manual',
+        catalogoId: 'cat-rev',
+        operacion: 'retira',
+        resultado: 'desviado',
+      }),
+    ]);
+    expect([...estado.values()]).toEqual([
+      expect.objectContaining({ elementoId: 'v2', resultado: 'desviado' }),
+    ]);
+  });
+
+  it('un cambio NO implementado deja el estado como estaba, no lo vacía', () => {
+    const estado = plegarEstadoVigente([
+      constatado({ elementoId: 'v1', titulo: 'Integración por lote', catalogoId: 'cat-core' }),
+      constatado({
+        elementoId: 'v2',
+        titulo: 'Integración en línea',
+        catalogoId: 'cat-core',
+        operacion: 'modifica',
+        resultado: 'no-implementado',
+      }),
+    ]);
+    expect([...estado.values()]).toEqual([expect.objectContaining({ elementoId: 'v1' })]);
+  });
+
+  it('el elemento retirado no reaparece como vigente ni «se mantiene» se repite por ciclo', () => {
+    // Dos ciclos anteriores tocaron el mismo touchpoint y un tercero lo retiró; otro
+    // elemento lógico siguió vivo todo el rato. El diff de la design version siguiente
+    // ve UN elemento vigente, no cuatro filas históricas.
+    const d = calcularDiff(
+      [elemento({ id: 'nuevo', titulo: 'Algo sin relación', operacion: 'agrega' })],
+      vigente([
+        constatado({ elementoId: 'v1', titulo: 'Video-verificación', catalogoId: 'cat-video' }),
+        constatado({ elementoId: 'v2', titulo: 'Firma en la app', catalogoId: 'cat-firma' }),
+        constatado({
+          elementoId: 'v3',
+          titulo: 'Video-verificación asistida',
+          catalogoId: 'cat-video',
+          operacion: 'modifica',
+        }),
+        constatado({
+          elementoId: 'v4',
+          titulo: 'Video-verificación asistida',
+          catalogoId: 'cat-video',
+          operacion: 'retira',
+        }),
+      ]),
+    );
+    expect(d.seMantiene.map((s) => s.elementoId)).toEqual(['v2']);
+    expect(d.filas[0]!.veredicto).toBe('agrega');
   });
 });
 

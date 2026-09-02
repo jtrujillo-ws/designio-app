@@ -12,11 +12,12 @@ import {
   designVersionsDelWorkspace,
   desplegarRelease,
   editarElemento,
+  enlazarJourney,
   ErrorEntrega,
   planificarRelease,
   tableroDeConciliacion,
 } from '@/lib/entrega/entrega.servicio';
-import { conciliacionCompleta } from '@/lib/entrega/entrega.diff';
+import { calcularDiff, conciliacionCompleta } from '@/lib/entrega/entrega.diff';
 import { describeAuthz } from './helpers';
 
 /**
@@ -53,7 +54,9 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
   let insightPropuestoId = '';
   let decisionId = '';
   let decisionAjenaId = '';
+  let catVideo = '';
   let dv1 = '';
+  let dv2 = '';
   let elVideo = '';
   let elPolitica = '';
   let elCore = '';
@@ -129,9 +132,10 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [cat] = await admin`insert into catalogo_journey
       (workspace_id, servicio_id, tipo, nombre, creado_por)
       values (${ws}, ${servicioId}, 'touchpoint', 'Video-verificación', ${leadId}) returning id`;
+    catVideo = cat!.id as string;
     const [n1] = await admin`insert into journey_nodo
       (workspace_id, journey_id, tipo, etiqueta, catalogo_id, creado_por)
-      values (${ws}, ${toBeId}, 'touchpoint', 'Video-verificación', ${cat!.id as string}, ${leadId})
+      values (${ws}, ${toBeId}, 'touchpoint', 'Video-verificación', ${catVideo}, ${leadId})
       returning id`;
     nodoToBe = n1!.id as string;
     const [n2] = await admin`insert into journey_nodo
@@ -189,8 +193,10 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await admin`delete from elemento_decision where workspace_id = ${ws}`;
     await admin`delete from elemento_insight where workspace_id = ${ws}`;
     await admin`delete from elemento_cambio where workspace_id = ${ws}`;
-    // La cadena de superación es una autorreferencia: se corta antes de borrar.
-    await admin`update design_version set supera_a = null where workspace_id = ${ws}`;
+    // La cadena de superación es una autorreferencia, pero NO se corta antes: una design
+    // version aprobada es inmutable hasta para el owner (lo impone el guard de
+    // transición), y un DELETE que se lleva los dos extremos en la misma sentencia deja
+    // la FK satisfecha al final de ella.
     await admin`delete from design_version where workspace_id = ${ws}`;
     await admin`delete from journey_snapshot where workspace_id = ${ws}`;
     await admin`delete from journey_arista where workspace_id = ${ws}`;
@@ -662,18 +668,33 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       }),
     ).rejects.toThrow(/debe declarar a cuál supera/);
 
-    const dv2 = await crearDesignVersion(leadId, {
+    // El ciclo siguiente trabaja sobre un to-be NUEVO: otros nodos, misma identidad de
+    // catálogo para el touchpoint que ya existe. Es el caso en el que emparejar por id de
+    // fila o por nodo se rompe y solo el catálogo aguanta.
+    const admin = sqlAdmin();
+    const [jt2] = await admin`insert into journey
+      (workspace_id, servicio_id, reto_id, proyecto_id, tipo, nombre, creado_por)
+      values (${ws}, ${servicioId}, ${retoId}, ${proyectoId}, 'to-be', 'Apertura objetivo v2',
+              ${leadId}) returning id`;
+    const toBe2 = jt2!.id as string;
+    const [n4] = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, catalogo_id, creado_por)
+      values (${ws}, ${toBe2}, 'touchpoint', 'Video-verificación', ${catVideo}, ${leadId})
+      returning id`;
+
+    const nueva = await crearDesignVersion(leadId, {
       workspaceId: ws,
       proyectoId,
       servicioId,
-      journeyId: toBeId,
+      journeyId: toBe2,
       titulo: 'Segunda versión',
       resumen: '',
       superaA: dv1,
     });
+    dv2 = nueva.designVersionId;
     await agregarElemento(leadId, {
       workspaceId: ws,
-      designVersionId: dv2.designVersionId,
+      designVersionId: dv2,
       tipo: 'canal',
       operacion: 'agrega',
       titulo: 'Cambio de la segunda versión',
@@ -682,18 +703,58 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       decisionIds: [],
       insightIds: [],
     });
+    // Retirar lo que DV-1 puso: nodo distinto, título distinto, misma cosa.
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: dv2,
+      tipo: 'touchpoint',
+      operacion: 'retira',
+      titulo: 'Video-verificación asistida (se retira)',
+      detalle: '',
+      nodoId: n4!.id as string,
+      decisionIds: [],
+      insightIds: [],
+    });
     await aprobarDesignVersion(leadId, {
       workspaceId: ws,
-      designVersionId: dv2.designVersionId,
+      designVersionId: dv2,
       motivo: '',
     });
 
     const anterior = await designVersionCompleta(leadId, ws, dv1);
     expect(anterior!.estado).toBe('superada');
-    expect(anterior!.superadaPor!.id).toBe(dv2.designVersionId);
+    expect(anterior!.superadaPor!.id).toBe(dv2);
     // Va la ÚLTIMA del hilo a propósito: superar a DV-1 es de ida (la transición
     // 'superada' → 'aprobada' no existe), así que ningún test posterior podría contar
     // con DV-1 aprobada.
+  });
+
+  it('el estado efectivo vigente se pliega por identidad lógica, no por fila de elemento', async () => {
+    const dv = await designVersionCompleta(leadId, ws, dv2);
+    // Lo que viaja es la HISTORIA del servicio, en orden: una constatación por elemento
+    // de DV-1, con su operación y su identidad. Cada elemento_cambio tiene como mucho una
+    // constatación en toda su vida, así que aquí no hay nada que deduplicar por id.
+    expect(dv!.vigente!.constataciones.map((c) => c.elementoId)).toEqual([
+      elVideo,
+      elPolitica,
+      elCore,
+    ]);
+    expect(dv!.vigente!.constataciones[0]).toMatchObject({
+      operacion: 'agrega',
+      resultado: 'como-aprobado',
+      catalogoId: catVideo,
+    });
+
+    const diff = calcularDiff(dv!.elementos, dv!.vigente);
+    // El retiro empareja con lo que DV-1 dejó puesto pese a que el nodo es otro (el to-be
+    // del ciclo nuevo) y el título también: la identidad es la del catálogo del servicio.
+    const retiro = diff.filas.find((f) => f.operacionDeclarada === 'retira')!;
+    expect(retiro.precedente?.elementoId).toBe(elVideo);
+    expect(retiro.senal).toBeNull();
+    // Y «se mantiene» trae UNA fila por elemento lógico no tocado: la política desviada.
+    // El elemento no implementado de RL-2 no está (nunca llegó a existir) y el touchpoint
+    // tampoco (lo toca esta versión).
+    expect(diff.seMantiene.map((s) => s.elementoId)).toEqual([elPolitica]);
   });
 
   it('G7 no se aprueba sobre la nada: sin design version aprobada no hay tablero que cerrar', async () => {
@@ -724,6 +785,140 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     ).rejects.toThrow(/ninguna design version aprobada con elementos/);
     // Es la misma regla que la app ya aplicaba del lado puro.
     expect(conciliacionCompleta([])).toBe(false);
+  });
+
+  it('«se puede enlazar después» es un camino real: el borrador sin journey se enlaza y se aprueba', async () => {
+    const admin = sqlAdmin();
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${otroServicioId}, 'to-be', 'Objetivo del otro servicio', ${leadId})
+      returning id`;
+    const toBeOtro = j!.id as string;
+    const [nOtro] = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, creado_por)
+      values (${ws}, ${toBeOtro}, 'paso', 'Paso del otro objetivo', ${leadId}) returning id`;
+    const [j2] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${otroServicioId}, 'to-be', 'Otro objetivo del otro servicio', ${leadId})
+      returning id`;
+    const toBeOtro2 = j2!.id as string;
+
+    // El guard cierra el atajo de nacer mal enlazado: el to-be es el de SU servicio.
+    await expect(
+      crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId,
+        servicioId,
+        journeyId: toBeOtro,
+        titulo: 'Con el journey de otro servicio',
+        resumen: '',
+        superaA: null,
+      }),
+    ).rejects.toThrow(/to-be de su servicio/);
+
+    const suelta = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: otroServicioId,
+      journeyId: null,
+      titulo: 'Nace sin journey',
+      resumen: '',
+      superaA: null,
+    });
+    const sinJourney = suelta.designVersionId;
+
+    // La pantalla ofrece exactamente lo que el guard acepta: los to-be de SU servicio.
+    const antes = await designVersionCompleta(leadId, ws, sinJourney);
+    expect(antes!.journeyId).toBeNull();
+    expect(antes!.journeysEnlazables.map((x) => x.id).sort()).toEqual(
+      [toBeOtro, toBeOtro2].sort(),
+    );
+
+    // El stakeholder no enlaza: la política solo alcanza a curadores.
+    await expect(
+      enlazarJourney(stakeId, {
+        workspaceId: ws,
+        designVersionId: sinJourney,
+        journeyId: toBeOtro,
+      }),
+    ).rejects.toThrow(ErrorEntrega);
+    // Y el curador tampoco puede enlazar cualquier cosa.
+    await expect(
+      enlazarJourney(disId, { workspaceId: ws, designVersionId: sinJourney, journeyId: toBeId }),
+    ).rejects.toThrow(/to-be de su servicio/);
+
+    await enlazarJourney(disId, {
+      workspaceId: ws,
+      designVersionId: sinJourney,
+      journeyId: toBeOtro,
+    });
+    const despues = await designVersionCompleta(leadId, ws, sinJourney);
+    expect(despues!.journeyId).toBe(toBeOtro);
+
+    // Y con el enlace puesto, el borrador que estaba muerto se puede aprobar.
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: sinJourney,
+      tipo: 'paso',
+      operacion: 'agrega',
+      titulo: 'Algo que cambia en el otro servicio',
+      detalle: '',
+      nodoId: nOtro!.id as string,
+      decisionIds: [],
+      insightIds: [],
+    });
+    // Reenlazar AHORA dejaría ese elemento apuntando a un nodo fuera del grafo que la
+    // design version aprueba: el guard lo para y pide revisar los enlaces primero.
+    await expect(
+      enlazarJourney(disId, {
+        workspaceId: ws,
+        designVersionId: sinJourney,
+        journeyId: toBeOtro2,
+      }),
+    ).rejects.toThrow(/journey anterior/);
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: sinJourney,
+      motivo: '',
+    });
+    const aprobada = await designVersionCompleta(leadId, ws, sinJourney);
+    expect(aprobada!.estado).toBe('aprobada');
+    expect(aprobada!.snapshotId).not.toBeNull();
+
+    // Aprobada, el enlace deja de moverse: la política solo alcanza borradores y, donde
+    // la RLS no llega —el UPDATE que no cambia de estado, que el USING de «superar» y el
+    // WITH CHECK de «aprobar» dejarían pasar entre los dos—, el guard de transición
+    // sostiene la inmutabilidad de SYS-05.
+    await expect(
+      enlazarJourney(leadId, { workspaceId: ws, designVersionId: sinJourney, journeyId: toBeOtro }),
+    ).rejects.toThrow(/inmutable/);
+    // Ni siquiera repuntando snapshot y journey A LA VEZ por SQL directo, que es la
+    // versión peligrosa del mismo hueco: con los dos coherentes entre sí, el WITH CHECK
+    // de «aprobar» no tiene nada que objetar, y la versión aprobada acabaría diciendo que
+    // aprobó otro grafo.
+    const [snapAjeno] = await admin`insert into journey_snapshot
+      (workspace_id, journey_id, motivo, grafo, congelado_por)
+      values (${ws}, ${toBeOtro2}, 'snapshot de otro grafo', '{}'::jsonb, ${leadId})
+      returning id`;
+    await expect(
+      conUsuario(leadId, (tx) => tx`update design_version
+        set journey_id = ${toBeOtro2}, snapshot_id = ${snapAjeno!.id as string}
+        where id = ${sinJourney} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/inmutable/);
+    // Y el grant por columna deja fuera todo lo demás de un borrador.
+    const otroBorrador = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: otroServicioId,
+      journeyId: null,
+      titulo: 'Título original',
+      resumen: '',
+      superaA: null,
+    });
+    await expect(
+      conUsuario(leadId, (tx) => tx`update design_version set titulo = 'Colado'
+        where id = ${otroBorrador.designVersionId} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/permission denied/);
   });
 
   it('nada de esto cruza el workspace', async () => {

@@ -1,5 +1,6 @@
 import {
   ESTADOS_CONOCIDOS,
+  type ConstatacionDelServicio,
   type ElementoDeCambio,
   type ElementoVigente,
   type EstadoEfectivoVigente,
@@ -23,11 +24,22 @@ import {
  * pantalla para explicarlo, sobre la MISMA proyección leída en una sentencia.
  */
 
-/** Emparejar por nodo del grafo cuando los dos lados lo tienen (identidad real), y por
- * título normalizado si no. El título es un apaño honesto: sin nodo no hay identidad, y
- * comparar cadenas es exactamente lo que el catálogo del journey vino a evitar. */
-function clave(titulo: string, nodoId: string | null): string {
-  return nodoId ? `nodo:${nodoId}` : `titulo:${normalizar(titulo)}`;
+/**
+ * La IDENTIDAD LÓGICA de un elemento de cambio, y el único sitio donde está definida:
+ * los dos lados del diff (lo que esta design version declara y lo que el estado efectivo
+ * vigente dice) tienen que emparejarse con el mismo criterio o el contraste compara
+ * cosas distintas.
+ *
+ * Por orden: el catálogo del servicio (SPEC-05) es identidad de verdad y sobrevive a un
+ * journey nuevo y a un renombre; el nodo aguanta para los tipos sin catálogo mientras el
+ * grafo de trabajo sea el mismo; el título normalizado es el apaño honesto de los
+ * elementos sin nodo — comparar cadenas es exactamente lo que el catálogo vino a evitar,
+ * y por eso el elemento sin nodo empareja peor.
+ */
+function clave(e: { titulo: string; nodoId: string | null; catalogoId: string | null }): string {
+  if (e.catalogoId) return `catalogo:${e.catalogoId}`;
+  if (e.nodoId) return `nodo:${e.nodoId}`;
+  return `titulo:${normalizar(e.titulo)}`;
 }
 
 function normalizar(texto: string): string {
@@ -64,20 +76,49 @@ export type Diff = {
   totales: { agrega: number; modifica: number; retira: number; senales: number };
 };
 
+/**
+ * El estado efectivo vigente NO es la lista de constataciones del servicio: es su
+ * PLIEGUE por identidad lógica, y esa diferencia es el bug que esto arregla. Cuando
+ * varias design versions tocan el mismo elemento lógico, cada una crea su propio
+ * `elemento_cambio` con id nuevo, así que la historia trae una fila por VERSIÓN del
+ * elemento, no una por elemento. Quedarse con todas —o con una cualquiera— deja el diff
+ * comparando contra un estado que nunca existió.
+ *
+ * Se pliega en orden cronológico aplicando la operación que cada constatación resolvió:
+ *
+ *  - `no-implementado` es un NO-OP: lo declarado no llegó a pasar, así que el estado se
+ *    queda como estaba. Si un ciclo agregó algo y el siguiente intentó modificarlo sin
+ *    conseguirlo, lo vigente sigue siendo lo primero — no «nada».
+ *  - `retira` saca del estado SOLO cuando se constató como se aprobó. Un retiro desviado
+ *    deja el elemento a la vista con su desviación: el estado vigente no puede afirmar
+ *    una ausencia que nadie constató, y esconderlo haría que la design version siguiente
+ *    leyera «no hay nada que modificar» sobre algo que sigue funcionando.
+ *  - todo lo demás (agrega/modifica constatados) deja el elemento presente, descrito por
+ *    la constatación MÁS RECIENTE, que es la que dice cómo quedó de verdad.
+ */
+export function plegarEstadoVigente(
+  historia: ConstatacionDelServicio[],
+): Map<string, ElementoVigente> {
+  const estado = new Map<string, ElementoVigente>();
+  for (const c of historia) {
+    if (c.resultado === 'no-implementado') continue;
+    const k = clave(c);
+    if (c.operacion === 'retira' && c.resultado === 'como-aprobado') estado.delete(k);
+    else estado.set(k, c);
+  }
+  return estado;
+}
+
 export function calcularDiff(
   elementos: ElementoDeCambio[],
   vigente: EstadoEfectivoVigente,
 ): Diff {
-  // Lo «no implementado» del estado vigente no forma parte de él: constatarlo así fue
-  // decir que no llegó a existir, así que no puede ser el precedente de nada.
-  const previos = (vigente?.elementos ?? []).filter((e) => e.resultado !== 'no-implementado');
-  const porClave = new Map<string, ElementoVigente>();
-  for (const previo of previos) porClave.set(clave(previo.titulo, previo.nodoId), previo);
+  const estadoVigente = plegarEstadoVigente(vigente?.constataciones ?? []);
 
   const tocados = new Set<string>();
   const filas = elementos.map((elemento) => {
-    const k = clave(elemento.titulo, elemento.nodoId);
-    const precedente = porClave.get(k) ?? null;
+    const k = clave(elemento);
+    const precedente = estadoVigente.get(k) ?? null;
     if (precedente) tocados.add(k);
 
     const veredicto: VeredictoDiff =
@@ -111,7 +152,11 @@ export function calcularDiff(
         }
       : null,
     filas,
-    seMantiene: previos.filter((p) => !tocados.has(clave(p.titulo, p.nodoId))),
+    // Uno por identidad lógica, no por fila histórica: antes, un elemento que tres
+    // ciclos habían tocado aparecía tres veces en «se mantiene».
+    seMantiene: [...estadoVigente]
+      .filter(([k]) => !tocados.has(k))
+      .map(([, elemento]) => elemento),
     totales: {
       agrega: filas.filter((f) => f.veredicto === 'agrega').length,
       modifica: filas.filter((f) => f.veredicto === 'modifica').length,

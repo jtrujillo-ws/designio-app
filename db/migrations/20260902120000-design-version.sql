@@ -307,6 +307,35 @@ create policy design_version_superar on design_version
     and workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
   );
 
+-- Enlazar el journey to-be DESPUÉS de abrir el borrador. `journey_id` es opcional en
+-- borrador a propósito (la DV puede abrirse antes de que el to-be exista), pero sin este
+-- camino esa opción era una trampa: el borrador que nacía sin journey no podía aprobarse
+-- —aprobar congela el snapshot, y sin grafo no hay snapshot— ni borrarse —no hay DELETE
+-- sobre design_version, porque los cuatro objetos de resultado son el registro de lo que
+-- pasó—, así que se quedaba muerto en la lista para siempre.
+--
+-- Alcanza SOLO borradores: una design version aprobada es inmutable y su snapshot ya
+-- congeló el grafo que aprobó; reapuntarla a otro journey reescribiría a qué se
+-- comprometió. Y el grant por columna (más abajo) deja fuera todo lo demás, así que
+-- «de una DV en borrador solo se puede reenlazar el journey» es estructural, no una
+-- disciplina del servicio.
+--
+-- El USING que esto abre (borrador + curador) puede emparejarse con el WITH CHECK de
+-- otra política —así funciona la RLS: los predicados se OR-ean entre políticas— pero no
+-- abre ninguna transición nueva: 'borrador' → 'superada' ya era emparejable con el USING
+-- de design_version_aprobar, y lo que la cierra es el CHECK de la tabla (una no-borrador
+-- exige sellos) y `design_version_transicion_guard`, que enumera los pares legales.
+create policy design_version_enlazar_journey on design_version
+  for update
+  using (
+    estado = 'borrador'
+    and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+  )
+  with check (
+    estado = 'borrador'
+    and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+  );
+
 -- Criterio de aceptación 1: sobre una DV aprobada, editar un elemento se RECHAZA. No es
 -- un chequeo del servicio con un mensaje amable — es que las tres políticas del elemento
 -- solo alcanzan design versions en borrador.
@@ -524,6 +553,68 @@ create trigger elemento_insight_citable
   for each row execute function elemento_motivo_citable_guard();
 revoke execute on function elemento_motivo_citable_guard() from public;
 
+-- El journey que una design version declara tiene que ser el to-be de SU servicio, se
+-- declare al abrirla o se enlace después. La FK compuesta solo garantiza el workspace: sin
+-- esto, un borrador podía nacer apuntando al as-is, o al to-be de otro servicio, y la
+-- pantalla anunciaba «to-be: X» hasta que la aprobación —mucho más tarde— lo desmintiera.
+-- Misma doctrina que `elemento_motivo_citable_guard`: el picker filtra, pero el endpoint
+-- acepta cualquier uuid, así que la regla vive en la base.
+--
+-- Las mismas dos comprobaciones que hace `design_version_transicion_guard` al aprobar, y
+-- ahí siguen: esto adelanta el veredicto al momento del enlace (que es cuando el autor
+-- puede corregirlo), no lo sustituye — entre enlazar y aprobar, el journey puede haber
+-- cambiado de proyecto.
+create function design_version_journey_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if new.journey_id is null then
+    return new;
+  end if;
+  -- Aprobar y superar no tocan el journey: sin esto, cada transición pagaría dos
+  -- consultas por una respuesta que ya no puede haber cambiado.
+  if tg_op = 'UPDATE' and new.journey_id is not distinct from old.journey_id then
+    return new;
+  end if;
+  -- Sobre una design version que ya NO estaba en borrador no hay nada que validar aquí:
+  -- es inmutable, y ese —no «el journey no es el de tu servicio»— es el veredicto que su
+  -- autor tiene que leer. Lo dice design_version_transicion_guard, que corre después
+  -- (los triggers de un mismo evento van por orden alfabético de nombre).
+  if tg_op = 'UPDATE' and old.estado <> 'borrador' then
+    return new;
+  end if;
+  if not exists (select 1 from journey j
+    where j.id = new.journey_id and j.workspace_id = new.workspace_id
+      and j.tipo = 'to-be' and j.servicio_id = new.servicio_id) then
+    raise exception 'el journey de la design version debe ser el to-be de su servicio';
+  end if;
+  if exists (select 1 from journey j
+    where j.id = new.journey_id and j.workspace_id = new.workspace_id
+      and j.proyecto_id is not null and j.proyecto_id <> new.proyecto_id) then
+    raise exception 'el journey to-be está anclado a otro proyecto';
+  end if;
+  -- Cambiar el journey de un borrador que ya enlazó elementos a nodos del anterior
+  -- dejaría esos enlaces apuntando fuera del grafo que la design version aprueba: la
+  -- respuesta a «qué pasos del journey afectó RL-1» (§19.7) saldría de un grafo que esta
+  -- versión no congela. El guard del elemento no puede verlo —solo mira la fila que se
+  -- escribe, y aquí no se escribe ninguna—, así que lo mira este. No se limpian solos a
+  -- propósito: borrar el trabajo de otro en silencio es peor que pedir que lo revise.
+  if tg_op = 'UPDATE' and exists (
+    select 1 from elemento_cambio ec
+    join journey_nodo n on n.id = ec.nodo_id and n.workspace_id = ec.workspace_id
+    where ec.design_version_id = new.id and ec.workspace_id = new.workspace_id
+      and n.journey_id <> new.journey_id) then
+    raise exception 'hay elementos enlazados a nodos del journey anterior: quita esos enlaces antes de cambiar el journey';
+  end if;
+  return new;
+end $$;
+create trigger design_version_journey
+  before insert or update on design_version
+  for each row execute function design_version_journey_guard();
+revoke execute on function design_version_journey_guard() from public;
+
 -- Alta de la design version: rastro con actor y rol del MISMO snapshot que la autorizó.
 -- El pre-chequeo deja pasar al owner (seed/backfill) sin fabricar eventos anónimos.
 create function design_version_alta_auditoria() returns trigger
@@ -551,6 +642,19 @@ create function design_version_transicion_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
   if new.estado = old.estado then
+    -- SYS-05 donde no llegan las políticas: una design version que ya no está en borrador
+    -- es INMUTABLE, y un UPDATE que no cambia de estado es justo el que las políticas no
+    -- pueden rechazar. Los predicados de RLS se OR-ean ENTRE políticas: el USING de
+    -- design_version_superar (aprobada + lead) selecciona la fila y el WITH CHECK de
+    -- design_version_aprobar (sigue aprobada, mismo autor, con snapshot del journey) la
+    -- deja pasar, sin que ninguna de las dos haya autorizado nada — la transición que
+    -- cada una describe no está ocurriendo. Por ahí, el lead podía repuntar una versión
+    -- aprobada a otro journey con otro snapshot y reescribir a qué se comprometió.
+    -- Una política es un predicado sobre un snapshot, no un candado ni una máquina de
+    -- estados; la máquina de estados es esto.
+    if old.estado <> 'borrador' then
+      raise exception 'una design version aprobada es inmutable (SYS-05): crea una versión nueva que la supere';
+    end if;
     return new;
   end if;
   if (old.estado, new.estado) not in (('borrador', 'aprobada'), ('aprobada', 'superada')) then
@@ -900,10 +1004,12 @@ grant select, insert on design_version, elemento_cambio to designio_app;
 grant select, insert on elemento_decision, elemento_insight to designio_app;
 grant select, insert on release, release_elemento to designio_app;
 grant select, insert on effective_state, constatacion to designio_app;
--- La aprobación mueve estado, autor y snapshot. `aprobada_en` NO está: lo escribe solo
--- el guard, así que la promesa «el sello lo pone la base» es estructural, no una
--- disciplina del servicio.
-grant update (estado, aprobada_por, snapshot_id) on design_version to designio_app;
+-- La aprobación mueve estado, autor y snapshot, y el borrador puede reenlazar su journey
+-- (design_version_enlazar_journey). `aprobada_en` NO está: lo escribe solo el guard, así
+-- que la promesa «el sello lo pone la base» es estructural, no una disciplina del
+-- servicio. Tampoco están `titulo`, `resumen`, `servicio_id`, `proyecto_id` ni `supera_a`:
+-- lo único editable de un borrador es a qué grafo apunta.
+grant update (estado, aprobada_por, snapshot_id, journey_id) on design_version to designio_app;
 -- El release mueve estado y la fecha real de despliegue; nunca su código, su dueño ni
 -- su design version (eso sería otro release).
 grant update (estado, desplegado_en) on release to designio_app;

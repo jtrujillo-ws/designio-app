@@ -153,14 +153,23 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
       // renombrar la entrada por SQL directo, y por ahí la promesa se rompía en silencio
       // —catálogo con el nombre nuevo, nodos con el viejo—. Una regla que solo vale
       // cuando se entra por la puerta buena no es una regla del modelo, así que bajó a la
-      // tabla; y con ella baja también la cautela del `<>`, que ahora es el
+      // tabla; y con ella baja la cautela sobre las ETIQUETAS, que ahora es el
       // `is distinct from` del trigger.
+      //
+      // Pero aquí hace falta la suya propia, sobre el NOMBRE, y no por el evento —de eso
+      // ya se ocupa el `when` del trigger— sino por el candado: escribir la fila la bloquea
+      // hasta el commit, y esta entrada es COMPARTIDA. Sin el `is distinct from`, editar el
+      // detalle de un nodo con catálogo serializa contra cualquier otra edición de
+      // cualquier nodo que comparta esa entidad, en cualquier journey del servicio.
+      // Justamente lo que se gana al darle identidad se convertiría en un punto de
+      // contención, por una escritura que en el caso normal no cambia nada.
       await tx`
         update catalogo_journey c
         set nombre = ${entrada.etiqueta}
         from journey_nodo n
         where n.id = ${entrada.nodoId} and n.workspace_id = ${entrada.workspaceId}
-          and c.id = n.catalogo_id and c.workspace_id = n.workspace_id`;
+          and c.id = n.catalogo_id and c.workspace_id = n.workspace_id
+          and c.nombre is distinct from ${entrada.etiqueta}`;
       // Mover un nodo a una posición ocupada dejaría a dos hermanos EMPATADOS en `orden`,
       // y ahí las tres vistas dejan de hablar del mismo journey: `porSecuencia` desempata
       // por id y el render de la fase ordena solo por `orden`, así que el diagrama y el

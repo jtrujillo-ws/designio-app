@@ -696,6 +696,27 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     expect(Number(renombrados!.n)).toBe(1);
     expect(Number(nodosDespues!.n)).toBe(Number(nodosAntes!.n));
 
+    // Editar un nodo SIN renombrarlo no puede escribir la entrada de catálogo. No es una
+    // cuestión de eventos —de eso ya se ocupa el `when` del trigger— sino de candados: la
+    // entrada es compartida, y escribirla la bloquea hasta el commit, así que cambiar el
+    // detalle de un nodo serializaría contra cualquier edición de cualquier nodo que
+    // comparta esa entidad. Se comprueba por `xmin`, que cambia si y solo si la fila se
+    // reescribió: es el hecho exacto, no una aproximación por evento.
+    const [antesDeEditar] = await admin`select xmin::text as v from catalogo_journey
+      where id = ${catId}`;
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: uno.nodoId,
+      etiqueta: 'App móvil (iOS y Android)',
+      detalle: 'Con biometría',
+      faseId: null,
+      responsable: 'Canales',
+      orden: j1!.nodos.find((n) => n.id === uno.nodoId)!.orden,
+    });
+    const [despuesDeEditar] = await admin`select xmin::text as v from catalogo_journey
+      where id = ${catId}`;
+    expect(despuesDeEditar!.v).toBe(antesDeEditar!.v);
+
     // Y el stakeholder no renombra: la política de escritura del catálogo es de curadores,
     // así que su update no alcanza ninguna fila y la entidad no se mueve.
     await conUsuario(stakeId, (tx) => tx`

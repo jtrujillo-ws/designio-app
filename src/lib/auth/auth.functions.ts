@@ -35,10 +35,13 @@ export const iniciarSesion = createServerFn({ method: 'POST' })
   .inputValidator(LoginSchema)
   .handler(async ({ data }) => {
     // Fricción anti fuerza bruta (por cuenta y por origen); el email ya viene normalizado.
+    // Sin short-circuit: AMBOS contadores avanzan en cada intento — insistir sobre una
+    // cuenta ya bloqueada también gasta el cupo de la IP.
     const clavePorEmail = `login:email:${data.email}`;
     const clavePorIp = `login:ip:${ipDelRequest()}`;
-    const permitido = permitirIntento(clavePorEmail, 10) && permitirIntento(clavePorIp, 30);
-    if (!permitido) {
+    const permitidoEmail = permitirIntento(clavePorEmail, 10);
+    const permitidoIp = permitirIntento(clavePorIp, 30);
+    if (!permitidoEmail || !permitidoIp) {
       return { ok: false as const, error: ERROR_LIMITE };
     }
     const usuario = await autenticar(data.email, data.password);

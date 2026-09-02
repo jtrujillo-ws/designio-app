@@ -21,6 +21,8 @@ import {
   ETIQUETA_CAPACIDAD,
   type CandidatoAncla,
   type CapacidadActiva,
+  type ConsentimientoDeItem,
+  type EstadoAncla,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoPropuesta,
@@ -72,6 +74,20 @@ const COLOR_ESTADO: Record<PropuestaEnPanel['estado'], string> = {
   aceptada: 'var(--accent)',
   corregida: 'var(--accent)',
   rechazada: 'var(--text-faint)',
+};
+
+/** Por qué una propuesta pendiente dejó de poder aceptarse. Cada motivo dice además cuál
+ * es la salida, que no es la misma: un item curado a mano ya tiene su evidencia, un
+ * consentimiento retirado deja el material fuera de la AI (pero la bandeja sigue abierta) y
+ * unos criterios congelados esperan a la reapertura de su etapa. */
+const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
+  disponible: '',
+  'item-curado': 'El item ya se curó a mano: esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'consentimiento-revocado':
+    'El consentimiento de ese material ya no autoriza el procesamiento externo: esta propuesta quedó obsoleta y solo puede rechazarse. El item sigue pudiendo curarse a mano en la bandeja.',
+  'criterios-congelados':
+    'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 
 const TEXTO_ESTADO: Record<PropuestaEnPanel['estado'], string> = {
@@ -171,7 +187,27 @@ function PantallaPropuestas() {
                   setError(e);
                 }}
               />
-            ) : (
+            ) : null}
+            {puedeRevisar && datos.materialDePersonas.length > 0 && (
+              <BitacoraConsentimientos
+                workspaceId={datos.workspaceId}
+                items={datos.materialDePersonas}
+                onRegistrado={async (r) => {
+                  setError(null);
+                  setAviso(
+                    r.autorizaExterno
+                      ? `Consentimiento registrado (nº ${r.version}): ese material ya puede procesarse con el proveedor AI`
+                      : `Consentimiento registrado (nº ${r.version}): ese material deja de poder procesarse con el proveedor AI. Las propuestas pendientes sobre él solo pueden rechazarse.`,
+                  );
+                  await refrescar();
+                }}
+                onError={(e) => {
+                  setAviso(null);
+                  setError(e);
+                }}
+              />
+            )}
+            {!puedeRevisar && (
               <Card style={{ padding: 20 }}>
                 <span style={{ font: '400 13px var(--font-sans)', color: 'var(--text-muted)' }}>
                   Las propuestas AI las piden y deciden lead-boutique o diseñador. Aquí puedes
@@ -491,10 +527,98 @@ function FormularioGeneracion({
 }
 
 /**
- * Captura del consentimiento ANTES de procesar (RF-09.5). Está aquí, delante del botón de
- * generar, porque ese es el momento en que importa: hasta que no consta qué autorizó la
- * persona, el material no sale hacia ningún proveedor. Ningún registro se edita ni se
- * borra: lo que cambia el permiso es un registro NUEVO, y el vigente es el que manda.
+ * Bitácora de consentimientos del material de personas: qué autoriza HOY cada item y la
+ * puerta para registrar un hecho nuevo — incluida la revocación.
+ *
+ * Existe porque colgar el formulario del selector de generación lo hacía inalcanzable justo
+ * cuando hace falta: un item con permiso vigente no «necesita» nada, así que el formulario
+ * no aparecía, y uno con propuesta pendiente ni siquiera se lista como ancla. El servicio y
+ * la bitácora admiten registros posteriores desde el primer día; sin esta lista, RF-09.4 no
+ * tenía por dónde entrar en el producto.
+ */
+function BitacoraConsentimientos({
+  workspaceId,
+  items,
+  onRegistrado,
+  onError,
+}: {
+  workspaceId: string;
+  items: ConsentimientoDeItem[];
+  onRegistrado: (r: { version: number; autorizaExterno: boolean }) => Promise<void>;
+  onError: (e: string | null) => void;
+}) {
+  const [abierto, setAbierto] = useState<string | null>(null);
+  const elegido = items.find((i) => i.id === abierto);
+
+  return (
+    <Card style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <span style={{ font: '700 15px var(--font-sans)', color: 'var(--ink)' }}>
+        Consentimiento del material de personas
+      </span>
+      <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
+        Entrevistas y observaciones de la bandeja, con lo que autoriza su registro VIGENTE. Cada
+        registro nuevo manda sobre los anteriores y ninguno se edita ni se borra (RF-09.4/09.5):
+        así se recoge una autorización posterior y así se recoge una revocación.
+      </span>
+      {items.map((i) => (
+        <div
+          key={i.id}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            flexWrap: 'wrap',
+            padding: '8px 0',
+            borderTop: '1px solid var(--border)',
+          }}
+        >
+          <span style={{ font: '500 13px var(--font-sans)', color: 'var(--text-body)', flex: 1, minWidth: 200 }}>
+            {i.titulo}
+          </span>
+          <span
+            style={{
+              font: '600 11.5px var(--font-sans)',
+              color: i.autorizaExterno ? 'var(--accent)' : 'var(--warn)',
+            }}
+          >
+            {i.version === null
+              ? 'sin consentimiento registrado'
+              : i.autorizaExterno
+                ? `autoriza el procesamiento externo · registro nº ${i.version}`
+                : `NO autoriza el procesamiento externo · registro nº ${i.version}`}
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setAbierto(abierto === i.id ? null : i.id)}
+          >
+            {abierto === i.id ? 'Cancelar' : 'Registrar consentimiento'}
+          </Button>
+        </div>
+      ))}
+      {elegido && (
+        <FormularioConsentimiento
+          workspaceId={workspaceId}
+          itemId={elegido.id}
+          titulo={elegido.titulo}
+          onRegistrado={async (r) => {
+            setAbierto(null);
+            await onRegistrado(r);
+          }}
+          onError={onError}
+        />
+      )}
+    </Card>
+  );
+}
+
+/**
+ * Captura del consentimiento ANTES de procesar (RF-09.5). Aparece delante del botón de
+ * generar —ese es el momento en que importa: hasta que no consta qué autorizó la persona, el
+ * material no sale hacia ningún proveedor— y también en la bitácora de arriba, que es lo que
+ * permite registrar un hecho posterior sobre un item que ya tiene permiso. Ningún registro se
+ * edita ni se borra: lo que cambia el permiso es un registro NUEVO, y el vigente es el que
+ * manda.
  *
  * Por eso el botón ya no exige marcar la casilla. Anotar «autorizó solo el uso interno» es
  * un hecho legítimo y útil —queda en la bitácora, con su autor y su fecha— y ya no condena
@@ -607,6 +731,7 @@ function TarjetaPropuesta({
   const [corrigiendo, setCorrigiendo] = useState(false);
   const [ocupado, setOcupado] = useState(false);
   const esExtraccion = propuesta.destino === 'evidencia';
+  const anclaDisponible = propuesta.anclaEstado === 'disponible';
   const citasFieles = propuesta.citas.filter((c) => c.fiel).length;
 
   async function decidir(correccion?: ContenidoPropuesta) {
@@ -726,26 +851,24 @@ function TarjetaPropuesta({
           La decisión la toma la boutique (lead o diseñador).
         </span>
       )}
-      {/* El ancla dejó de admitir la materialización, y el porqué depende del destino: un
-          item ya curado a mano, o un reto cuyo G0 se aprobó DESPUÉS de generar la propuesta
-          (SYS-22: ese gate certificó unos criterios y los congeló). En los dos casos la
-          propuesta quedó obsoleta y aceptarla solo produciría un rechazo de la base. */}
-      {propuesta.estado === 'propuesta' && puedeRevisar && !propuesta.anclaDisponible && (
+      {/* El ancla dejó de admitir la materialización, y cada motivo tiene su salida: el
+          item se curó a mano, la persona retiró el consentimiento (RF-09.4/09.5) o el G0 del
+          reto congeló los criterios (SYS-22). En los tres casos la propuesta quedó obsoleta
+          y aceptarla solo produciría un rechazo de la base. */}
+      {propuesta.estado === 'propuesta' && puedeRevisar && !anclaDisponible && (
         <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
-          {esExtraccion
-            ? 'El item ya se curó a mano: esta propuesta quedó obsoleta y solo puede rechazarse.'
-            : 'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse.'}
+          {MOTIVO_ANCLA[propuesta.anclaEstado]}
         </span>
       )}
       {propuesta.estado === 'propuesta' && puedeRevisar && !corrigiendo && (
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          <Button size="sm" disabled={ocupado || !propuesta.anclaDisponible} onClick={() => void decidir()}>
+          <Button size="sm" disabled={ocupado || !anclaDisponible} onClick={() => void decidir()}>
             Aceptar tal cual
           </Button>
           <Button
             size="sm"
             variant="secondary"
-            disabled={ocupado || !propuesta.anclaDisponible}
+            disabled={ocupado || !anclaDisponible}
             onClick={() => setCorrigiendo(true)}
           >
             Corregir y aceptar

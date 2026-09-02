@@ -24,6 +24,7 @@ import {
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoPropuesta,
+  type EstadoAncla,
   type GenerarPropuestas,
   type OrigenKey,
   type PanelPropuestas,
@@ -172,9 +173,8 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
     anclaId: ((f.item_id ?? f.reto_id) as string | null) ?? '',
     // Si no se pudo determinar, se trata como NO disponible: habilitar dos botones que la
-    // base va a rechazar es peor que pedir un refresco (y el `true` por defecto era
-    // exactamente el fallo — dejaba todas las propuestas C0 marcadas como aceptables).
-    anclaDisponible: (f.ancla_disponible as boolean | null) ?? false,
+    // base va a rechazar es peor que pedir un refresco.
+    anclaEstado: (f.ancla_estado as EstadoAncla | null) ?? 'ancla-ausente',
     modelo: f.modelo as string,
     promptVersion: f.prompt_version as string,
     origenKey: f.origen_key as OrigenKey,
@@ -212,20 +212,30 @@ export async function panelPropuestas(
 
     // Fragmentos compartidos: dos consultas con la MISMA proyección no pueden divergir.
     //
-    // `ancla_disponible` se deriva de lo que congela CADA destino, no del item. Con un
-    // coalesce sobre el estado del item que caía en `true`, toda propuesta C0 —cuyo join
-    // con el item es null por construcción— salía disponible: si el G0 del reto se aprobaba
-    // entre generar y revisar, sus criterios quedaban congelados (SYS-22), la
-    // materialización empezaba a rechazar cualquier aceptación y el panel seguía ofreciendo
-    // los dos botones como si nada.
+    // `ancla_estado` dice si la propuesta se puede materializar y, si no, POR QUÉ. Se
+    // deriva de lo que bloquea a cada destino: el item deja de estar pendiente (lo curó
+    // alguien a mano), su consentimiento deja de autorizar el procesamiento externo, o el
+    // G0 del reto congela sus criterios (SYS-22). Un booleano no basta porque las tres
+    // salidas del revisor son distintas, y un `coalesce` que caía en «disponible» era el
+    // fallo original — dejaba habilitados dos botones que la base rechaza siempre.
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, p.item_id, p.reto_id,
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
              coalesce(i.titulo, r.codigo || ' ' || r.titulo) as ancla_titulo,
-             case when p.item_id is not null then i.estado = 'pendiente'
-                  else not reto_criterios_congelados(p.reto_id, p.workspace_id)
-             end as ancla_disponible,
+             case
+               when p.item_id is not null then
+                 case
+                   when i.estado is distinct from 'pendiente' then 'item-curado'
+                   when tipo_fuente_exige_consentimiento(i.tipo_fuente)
+                     and not consentimiento_externo_vigente(i.id, i.workspace_id)
+                     then 'consentimiento-revocado'
+                   else 'disponible'
+                 end
+               when reto_criterios_congelados(p.reto_id, p.workspace_id)
+                 then 'criterios-congelados'
+               else 'disponible'
+             end as ancla_estado,
              i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
              i.referencia as item_referencia,
              left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`;
@@ -276,6 +286,25 @@ export async function panelPropuestas(
         and (${patron}::text is null or i.titulo ilike ${patron})
       order by i.creado_en asc, i.id asc
       limit ${PAGINA_ANCLAS + 1}`;
+    // Material de personas del workspace, con el estado de su consentimiento VIGENTE. Es
+    // una lista aparte de las anclas ofrecibles a propósito: el consentimiento no es un
+    // paso de la generación sino un hecho de la investigación que se registra cuando
+    // ocurre. Colgado del selector de generación, un item con permiso vigente no mostraba
+    // formulario (no le falta nada) y uno con propuesta pendiente ni siquiera aparecía en
+    // el selector — así que la revocación, que el servicio y la bitácora admiten, no tenía
+    // por dónde entrar en el producto.
+    const personas = await tx`
+      select i.id, i.titulo,
+             consentimiento_externo_vigente(i.id, i.workspace_id) as autoriza_externo,
+             (select c.version from consentimiento_item c
+               where c.item_id = i.id and c.workspace_id = i.workspace_id
+               order by c.version desc limit 1) as version
+      from item_importacion i
+      where i.workspace_id = ${workspaceId} and i.estado = 'pendiente'
+        and tipo_fuente_exige_consentimiento(i.tipo_fuente)
+        and (${patron}::text is null or i.titulo ilike ${patron})
+      order by i.creado_en asc, i.id asc
+      limit ${PAGINA_ANCLAS}`;
     // Retos con criterios aún abiertos: con un G0 aprobado están congelados (SYS-22) y
     // proponer criterios para ellos sería ofrecer una acción que la base va a rechazar.
     const retos = await tx`
@@ -312,6 +341,12 @@ export async function panelPropuestas(
         .map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
       hayMasItems: items.length > PAGINA_ANCLAS,
       hayMasRetos: retos.length > PAGINA_ANCLAS,
+      materialDePersonas: personas.map((p) => ({
+        id: p.id as string,
+        titulo: p.titulo as string,
+        autorizaExterno: p.autoriza_externo as boolean,
+        version: p.version === null ? null : Number(p.version),
+      })),
       busqueda,
     };
   });
@@ -385,12 +420,6 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
           'Ese item se importó solo con la referencia al original: no hay material que citar, así que no se puede extraer evidencia de él. Cúralo a mano en la bandeja o vuelve a importarlo con el texto pegado.',
         );
       }
-      const [pendiente] = await tx`select 1 as hay from propuesta_ai
-        where item_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-          and estado = 'propuesta' limit 1`;
-      if (pendiente) {
-        throw new ErrorAI('Ese item ya tiene una propuesta pendiente: revísala antes de pedir otra');
-      }
       sistema = SISTEMA_EXTRACCION;
       prompt = promptExtraccion({
         titulo: item.titulo as string,
@@ -411,18 +440,6 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
         reto_criterios_congelados(${entrada.anclaId}, ${entrada.workspaceId}) as hay`;
       if (congelado?.hay) {
         throw new ErrorAI('El G0 de ese reto ya fue aprobado: sus criterios están congelados');
-      }
-      // Misma regla que en CI, y por la misma razón: pedir otro lote sobre un ancla que ya
-      // espera revisión humana quema presupuesto en algo que nadie ha mirado todavía. En C0
-      // además es lo que DRENA la lista de retos ofrecidos — un reto no cambia de estado por
-      // generar, así que sin esto los mismos de siempre ocupaban la ventana.
-      const [pendiente] = await tx`select 1 as hay from propuesta_ai
-        where reto_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-          and estado = 'propuesta' limit 1`;
-      if (pendiente) {
-        throw new ErrorAI(
-          'Ese reto ya tiene criterios propuestos esperando revisión: decídelos antes de pedir otros',
-        );
       }
       sistema = SISTEMA_CRITERIOS;
       prompt = promptCriterios({
@@ -459,6 +476,31 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
         entrada.capacidad === 'CI'
           ? 'Ese item ya tiene una generación AI en curso: espera a que termine antes de pedir otra'
           : 'Ese reto ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      );
+    }
+
+    // «Este ancla ya tiene trabajo esperando revisión» se pregunta AQUÍ, bajo el mismo
+    // candado, y no antes de tomarlo. Fuera del candado la respuesta caduca al instante: la
+    // generación anterior persiste su lote en otra transacción, así que una segunda podía
+    // leer «no hay nada pendiente», esperar a que la primera terminara —soltando su
+    // reserva— y colar un segundo lote sobre la misma ancla. Dentro del candado las dos
+    // señales se leen juntas: o está la reserva viva de la otra, o están sus propuestas.
+    // Para CI el índice único parcial de `propuesta_ai` es además el suelo; para C0 no puede
+    // haberlo (un lote son varias propuestas pendientes del mismo reto), así que aquí es
+    // donde se decide.
+    const [pendiente] =
+      entrada.capacidad === 'CI'
+        ? await tx`select 1 as hay from propuesta_ai
+            where item_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+              and estado = 'propuesta' limit 1`
+        : await tx`select 1 as hay from propuesta_ai
+            where reto_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+              and estado = 'propuesta' limit 1`;
+    if (pendiente) {
+      throw new ErrorAI(
+        entrada.capacidad === 'CI'
+          ? 'Ese item ya tiene una propuesta pendiente: revísala antes de pedir otra'
+          : 'Ese reto ya tiene criterios propuestos esperando revisión: decídelos antes de pedir otros',
       );
     }
 
@@ -959,9 +1001,22 @@ async function materializarEvidencia(
   p: PropuestaEnRevision,
   c: ContenidoExtraccion,
 ): Promise<string> {
-  const [item] = await tx`select titulo, tipo_fuente, referencia from item_importacion
+  const [item] = await tx`select titulo, tipo_fuente, referencia,
+      tipo_fuente_exige_consentimiento(tipo_fuente)
+        and not consentimiento_externo_vigente(id, workspace_id) as consentimiento_retirado
+    from item_importacion
     where id = ${p.itemId} and workspace_id = ${workspaceId} and estado = 'pendiente'`;
   if (!item) throw new ErrorAI('El item de la bandeja ya fue curado o no existe');
+  // La otra mitad del permiso, y una ventana distinta de la del despacho: la propuesta se
+  // generó con consentimiento vigente y la persona lo retiró DESPUÉS. Aceptar crearía un
+  // objeto de dominio nuevo derivado de material que ya no está autorizado. Rechazarla
+  // sigue disponible, y curar el item a mano en la bandeja también: eso no manda nada a
+  // ningún tercero. El guard de `propuesta_ai` es el suelo; esto lo dice con nombre.
+  if (item.consentimiento_retirado as boolean) {
+    throw new ErrorAI(
+      'El consentimiento de ese material ya no autoriza el procesamiento externo: esta propuesta quedó obsoleta y solo puede rechazarse (RF-09.5)',
+    );
+  }
   // El consentimiento se registró ANTES de procesar (RF-09.5) o no se registró: la
   // evidencia dice cuál de las dos, y no lo decide ni lo propone la AI. Aquí la pregunta es
   // si LLEGÓ A CAPTURARSE el consentimiento de las personas —por eso basta con que exista

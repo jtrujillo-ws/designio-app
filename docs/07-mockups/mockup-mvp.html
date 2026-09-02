@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup MVP — Plataforma de service design</title>
+<style>
+  /* ============ tokens (paleta de referencia; sustituir por el design system propio de la plataforma) ============ */
+  :root{
+    --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --baseline:#c3c2b7; --ring:rgba(11,11,11,.10);
+    --s1:#2a78d6; --s1-soft:#dbe9fb; --s2:#eb6834; --s2-soft:#fdeee6;
+    --good:#0ca30c; --good-text:#006300; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
+    --r:10px; --r-sm:7px;
+    font-size:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:var(--page);color:var(--ink);font:400 14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+  b,strong{font-weight:600}
+
+  /* ============ marco de la app ============ */
+  .note{background:#fff8e6;border-bottom:1px solid #f0e0b0;color:#6b5510;padding:6px 16px;font-size:12.5px;text-align:center}
+  .topbar{display:flex;align-items:center;gap:14px;background:var(--surface);border-bottom:1px solid var(--grid);padding:10px 16px;position:sticky;top:0;z-index:5}
+  .brand{font-weight:700;letter-spacing:.2px}
+  .brand small{color:var(--muted);font-weight:500}
+  .ws{display:flex;align-items:center;gap:8px;border:1px solid var(--grid);border-radius:999px;padding:4px 12px;background:var(--page);font-size:13px}
+  .ws .dot{width:8px;height:8px;border-radius:50%;background:var(--s1)}
+  .spacer{flex:1}
+  .search{border:1px solid var(--grid);border-radius:8px;background:var(--page);color:var(--muted);padding:6px 12px;min-width:260px;font-size:13px}
+  .userchip{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-2)}
+  .avatar{width:26px;height:26px;border-radius:50%;background:var(--s1);color:#fff;display:grid;place-items:center;font-size:11.5px;font-weight:600}
+
+  .shell{display:grid;grid-template-columns:264px 1fr;min-height:calc(100vh - 88px)}
+  @media (max-width:900px){.shell{grid-template-columns:1fr}.sidebar{display:none}}
+
+  /* ============ sidebar: arbol de navegacion ============ */
+  .sidebar{background:var(--surface);border-right:1px solid var(--grid);padding:14px 10px}
+  .side-h{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:10px 8px 6px}
+  .tree{list-style:none;margin:0;padding:0;font-size:13.5px}
+  .tree li{margin:1px 0}
+  .tree button{all:unset;display:flex;align-items:center;gap:7px;width:100%;padding:6px 8px;border-radius:8px;cursor:pointer;color:var(--ink-2)}
+  .tree button:hover{background:var(--page)}
+  .tree button.on{background:var(--s1-soft);color:var(--ink);font-weight:600}
+  .tree .lvl1{padding-left:8px}.tree .lvl2{padding-left:22px}.tree .lvl3{padding-left:36px}.tree .lvl4{padding-left:50px}
+  .twig{color:var(--muted);font-size:10px;width:10px;display:inline-block}
+  .count{margin-left:auto;color:var(--muted);font-size:11.5px}
+  .statebead{width:7px;height:7px;border-radius:50%}
+  .bead-med{background:var(--warning)} .bead-ok{background:var(--good)} .bead-cand{background:var(--baseline)}
+
+  /* ============ contenido ============ */
+  main{padding:16px 20px 40px;min-width:0}
+  .crumbs{color:var(--muted);font-size:12.5px;margin-bottom:8px}
+  .crumbs b{color:var(--ink-2);font-weight:600}
+  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--grid);margin-bottom:16px;flex-wrap:wrap}
+  .tabs button{all:unset;cursor:pointer;padding:8px 14px;border-radius:8px 8px 0 0;color:var(--ink-2);font-size:13.5px}
+  .tabs button:hover{background:var(--surface)}
+  .tabs button.on{background:var(--surface);border:1px solid var(--grid);border-bottom:1px solid var(--surface);margin-bottom:-1px;color:var(--ink);font-weight:600}
+  .screen{display:none}
+  .screen.on{display:block}
+  h1{font-size:19px;margin:0 0 2px}
+  h2{font-size:15px;margin:0 0 10px}
+  .sub{color:var(--ink-2);font-size:13px;margin:0 0 14px}
+
+  .card{background:var(--surface);border:1px solid var(--grid);border-radius:var(--r);padding:14px 16px;margin-bottom:14px}
+  .card h2{display:flex;align-items:center;gap:8px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  @media (max-width:1100px){.grid2,.grid3{grid-template-columns:1fr}}
+
+  .chip{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 10px;font-size:11.5px;font-weight:600;border:1px solid transparent;vertical-align:middle}
+  .chip.med{background:#fdf4dd;color:#6b5510;border-color:#f0e0b0}
+  .chip.ok{background:#e4f4e4;color:var(--good-text);border-color:#c4e4c4}
+  .chip.info{background:var(--s1-soft);color:#1c5cab;border-color:#b7d3f6}
+  .chip.warn{background:#fdeee6;color:#9a3d12;border-color:#f5cdb8}
+  .chip.crit{background:#fbe3e3;color:#8f1f1f;border-color:#f1bcbc}
+  .chip.sim{background:#f0efec;color:#52514e;border-color:#d8d7d0}
+  .chip.neutral{background:var(--page);color:var(--ink-2);border-color:var(--grid)}
+  .chip.jstep{background:#efeaff;color:#3a2d8f;border-color:#cfc6f2}
+
+  /* loop J1-J7 */
+  .loopflow{display:grid;grid-template-columns:repeat(7,1fr);gap:14px;margin:4px 0 2px}
+  @media (max-width:1100px){.loopflow{grid-template-columns:repeat(2,1fr)}}
+  .jcard{position:relative;border:1px solid var(--grid);border-radius:var(--r-sm);background:var(--surface);padding:10px 10px 12px;font-size:12px;display:flex;flex-direction:column}
+  .jcard.done{border-color:#c4e4c4;background:#f6fbf6}
+  .jcard.now{border-color:var(--s1);box-shadow:0 0 0 2px var(--s1-soft)}
+  .jcard .jn{font-weight:800;font-size:12.5px;display:flex;gap:6px;align-items:center}
+  .jcard .jt{font-weight:700;margin:3px 0 4px;line-height:1.25}
+  .jcard small{color:var(--ink-2);display:block;line-height:1.4}
+  .jcard .go{margin-top:auto;padding-top:8px}
+  .jcard .go .btn{padding:4px 10px;font-size:12px;display:inline-block}
+  .jcard:not(:last-child)::after{content:"→";position:absolute;right:-13px;top:44%;color:var(--muted);font-weight:700;z-index:2}
+  @media (max-width:1100px){.jcard:not(:last-child)::after{display:none}}
+  .loopback{display:flex;align-items:center;gap:10px;border:1px dashed var(--baseline);border-radius:var(--r-sm);background:var(--page);padding:9px 12px;color:var(--ink-2);font-size:12.5px;margin-top:12px}
+
+  /* stat tiles */
+  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+  @media (max-width:1100px){.tiles{grid-template-columns:repeat(2,1fr)}}
+  .tile{background:var(--surface);border:1px solid var(--grid);border-radius:var(--r);padding:12px 14px}
+  .tile .k{color:var(--ink-2);font-size:12px}
+  .tile .v{font-size:26px;font-weight:700;line-height:1.15;margin:2px 0}
+  .tile .d{font-size:12px;color:var(--muted)}
+  .up-good{color:var(--good-text);font-weight:600}
+  .flat{color:var(--muted);font-weight:600}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{color:var(--muted);font-weight:600;text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+  th,td{padding:7px 10px;border-bottom:1px solid var(--grid);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  .tblwrap{overflow-x:auto}
+
+  .btn{all:unset;cursor:pointer;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600;text-align:center}
+  .btn.primary{background:var(--s1);color:#fff}
+  .btn.ghost{border:1px solid var(--grid);color:var(--ink-2);background:var(--surface)}
+  .btn.approve{background:var(--good);color:#fff}
+  .btnrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+
+  /* stepper etapas */
+  .stepper{display:grid;grid-template-columns:repeat(9,1fr);gap:6px;margin-bottom:14px}
+  @media (max-width:1100px){.stepper{grid-template-columns:repeat(3,1fr)}}
+  .step{border:1px solid var(--grid);border-radius:var(--r-sm);background:var(--surface);padding:8px 9px;font-size:11.5px;position:relative}
+  .step .g{font-weight:700;font-size:12px;display:flex;align-items:center;gap:6px}
+  .step small{color:var(--muted);display:block;margin-top:2px}
+  .step.done{border-color:#c4e4c4;background:#f2faf2}
+  .step.now{border-color:var(--s1);box-shadow:0 0 0 2px var(--s1-soft)}
+  .step.todo{opacity:.75}
+  .gd{width:8px;height:8px;border-radius:50%}
+  .gd.ok{background:var(--good)} .gd.now{background:var(--s1)} .gd.todo{background:var(--baseline)}
+
+  .check{list-style:none;margin:6px 0 0;padding:0;font-size:13px}
+  .check li{display:flex;gap:8px;padding:5px 0;border-bottom:1px dashed var(--grid);align-items:flex-start}
+  .check li:last-child{border-bottom:none}
+  .ck{width:16px;height:16px;border-radius:5px;flex:none;display:grid;place-items:center;font-size:10.5px;font-weight:800;margin-top:1.5px}
+  .ck.ok{background:var(--good);color:#fff}
+  .ck.no{background:#fbe3e3;color:#8f1f1f;border:1px solid #f1bcbc}
+  .ck.na{background:var(--page);color:var(--muted);border:1px solid var(--grid)}
+
+  .commentbox{border:1px solid var(--grid);border-radius:var(--r-sm);padding:10px 12px;margin-top:8px;background:var(--page)}
+  .commentbox .who{font-size:12px;color:var(--muted);margin-bottom:2px}
+  .commentbox .who b{color:var(--ink-2)}
+
+  .divider{border:0;border-top:1px solid var(--grid);margin:12px 0}
+  .footnote{color:var(--muted);font-size:11.5px;margin-top:8px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--ink-2);font-size:12px;margin-top:8px}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .sw{width:10px;height:10px;border-radius:3px;display:inline-block}
+
+  .svgwrap{overflow-x:auto;border:1px solid var(--grid);border-radius:var(--r-sm);background:var(--surface)}
+  svg text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+
+  .diff li{margin:3px 0}
+  .diff .add{color:var(--good-text);font-weight:700}
+  .diff .mod{color:#1c5cab;font-weight:700}
+  .kbd{background:var(--page);border:1px solid var(--grid);border-radius:5px;padding:0 6px;font-size:12px;color:var(--ink-2)}
+</style>
+</head>
+<body>
+
+<div class="note">Mockup estático del MVP — datos ficticios del ejemplo trabajado (Banco Andino, prediseño §19). Tokens visuales de referencia: se sustituirán por el design system propio de la plataforma en el scaffolding.</div>
+
+<header class="topbar">
+  <div class="brand">designio <small>· mockup MVP</small></div>
+  <div class="ws"><span class="dot"></span> Banco Andino <span style="color:var(--muted)">▾</span></div>
+  <div class="spacer"></div>
+  <div class="search">Buscar en el workspace…  <span class="kbd">/</span></div>
+  <div class="userchip"><span class="avatar">LP</span> Lucía P. · Lead boutique</div>
+</header>
+
+<div class="shell">
+
+  <!-- ================= ARBOL DE NAVEGACION ================= -->
+  <aside class="sidebar">
+    <div class="side-h">Cliente</div>
+    <ul class="tree">
+      <li><button class="lvl1" data-screen="servicio"><span class="twig">▾</span><b>Banco Andino</b></button></li>
+      <li><button class="lvl2" data-screen="servicio" data-primary><span class="twig">▾</span>🛠 Apertura de cuenta nómina digital <span class="count">servicio</span></button></li>
+      <li><button class="lvl3" data-screen="reto" data-primary><span class="twig">▾</span><span class="statebead bead-med"></span> R-01 Reducir abandono 62→40 <span class="count">en medición</span></button></li>
+      <li><button class="lvl4" data-screen="proyecto" data-primary><span class="twig">·</span><span class="statebead bead-med"></span> P-01 Rediseño verificación <span class="count">en medición</span></button></li>
+      <li><button class="lvl3" data-screen="servicio"><span class="twig">·</span><span class="statebead bead-cand"></span> R-02 Completar backstage <span class="count">candidato</span></button></li>
+      <li><button class="lvl3" data-screen="servicio"><span class="twig">·</span><span class="statebead bead-cand"></span> R-03 Abandono pymes <span class="count">candidato</span></button></li>
+    </ul>
+    <div class="side-h">Workspace</div>
+    <ul class="tree">
+      <li><button class="lvl1" data-screen="loop" data-primary><span class="twig">·</span>🔁 Loop del método (J1–J7)</button></li>
+      <li><button class="lvl1" data-screen="importacion" data-primary><span class="twig">·</span>📥 Bandeja de importación <span class="count">2</span></button></li>
+      <li><button class="lvl1" data-screen="portal" data-primary><span class="twig">·</span>✅ Aprobaciones pendientes <span class="count">1</span></button></li>
+      <li><button class="lvl1" data-screen="servicio"><span class="twig">·</span>📚 Biblioteca del cliente</button></li>
+      <li><button class="lvl1" data-screen="servicio"><span class="twig">·</span>👥 Segmentos <span class="count">3</span></button></li>
+      <li><button class="lvl1" data-screen="servicio"><span class="twig">·</span>⚙️ Personas y permisos</button></li>
+    </ul>
+    <div class="footnote" style="padding:10px 8px">La organización cliente es propietaria del workspace; la boutique opera como autorizada.</div>
+  </aside>
+
+  <!-- ================= CONTENIDO ================= -->
+  <main>
+    <div class="crumbs">Banco Andino / Servicios / <b>Apertura de cuenta nómina digital</b></div>
+
+    <div class="tabs" id="tabs">
+      <button data-screen="loop" class="on">Loop J1–J7</button>
+      <button data-screen="servicio">Servicio</button>
+      <button data-screen="reto">Reto R-01</button>
+      <button data-screen="proyecto">Proyecto P-01</button>
+      <button data-screen="journey">Journey / Blueprint</button>
+      <button data-screen="portal">Portal · Aprobación G5</button>
+      <button data-screen="importacion">Importación</button>
+    </div>
+
+    <!-- ========== PANTALLA: LOOP J1-J7 ========== -->
+    <section class="screen on" id="screen-loop">
+      <h1>El loop del método · journeys J1–J7 <span class="chip info">vista de recorrido</span></h1>
+      <p class="sub">Los siete recorridos de la plataforma, de la importación al post mortem, con su estado en el ejemplo Banco Andino. Cada tarjeta lleva a la pantalla del mockup donde ese journey ocurre; el resto de pantallas indica su journey con la etiqueta morada <span class="chip jstep">J#</span>.</p>
+
+      <div class="card">
+        <h2>Recorrido del engagement</h2>
+        <div class="loopflow">
+          <div class="jcard done">
+            <div class="jn">J1 <span class="chip ok" style="margin-left:auto">hecho</span></div>
+            <div class="jt">Arranque en frío</div>
+            <small>Importación y curaduría · servicio con estado actual</small>
+            <small><b>Lead + admin cliente</b></small>
+            <div class="go"><button class="btn ghost" data-screen="importacion">Ver pantalla</button></div>
+          </div>
+          <div class="jcard done">
+            <div class="jn">J2 <span class="chip ok" style="margin-left:auto">hecho</span></div>
+            <div class="jt">Formulación del reto</div>
+            <small>Etapa 0 · criterios con ventanas · <b>G0</b></small>
+            <small><b>Sponsor aprueba</b></small>
+            <div class="go"><button class="btn ghost" data-screen="reto">Ver pantalla</button></div>
+          </div>
+          <div class="jcard done">
+            <div class="jn">J3 <span class="chip ok" style="margin-left:auto">hecho</span></div>
+            <div class="jt">Investigación y entendimiento</div>
+            <small>Etapas 1–2 · evidencia, insights, as-is · <b>G1 G2</b></small>
+            <small><b>Diseñadores + stakeholders</b></small>
+            <div class="go"><button class="btn ghost" data-screen="proyecto">Ver pantalla</button></div>
+          </div>
+          <div class="jcard done">
+            <div class="jn">J4 <span class="chip ok" style="margin-left:auto">hecho</span></div>
+            <div class="jt">Conceptualización y exploración</div>
+            <small>Etapas 3–4 · HMW, conceptos, tests reales · <b>G3 G4</b></small>
+            <small><b>Sponsor + equipo</b></small>
+            <div class="go"><button class="btn ghost" data-screen="proyecto">Ver pantalla</button></div>
+          </div>
+          <div class="jcard done">
+            <div class="jn">J5 <span class="chip ok" style="margin-left:auto">hecho</span></div>
+            <div class="jt">Detalle y plan</div>
+            <small>Etapas 5–6 · design version, diff, Metric Registry · <b>G5 G6</b></small>
+            <small><b>Sponsor + dueño del dato</b></small>
+            <div class="go"><button class="btn ghost" data-screen="portal">Ver pantalla</button></div>
+          </div>
+          <div class="jcard now">
+            <div class="jn">J6 <span class="chip med" style="margin-left:auto">en curso</span></div>
+            <div class="jt">Implementación y medición</div>
+            <small>Etapa 7 · releases, effective state, snapshots · <b>G7</b></small>
+            <small><b>Equipo cliente + dueño del dato</b></small>
+            <div class="go"><button class="btn ghost" data-screen="reto">Ver pantalla</button></div>
+          </div>
+          <div class="jcard">
+            <div class="jn">J7 <span class="chip neutral" style="margin-left:auto">próximo</span></div>
+            <div class="jt">Post mortem y continuidad</div>
+            <small>Outcome review · veredicto · suscripción o exportación</small>
+            <small><b>Sponsor decide</b></small>
+            <div class="go"><button class="btn ghost" data-screen="proyecto">Ver pantalla</button></div>
+          </div>
+        </div>
+        <div class="loopback">🔁 <span><b>El loop cierra:</b> los retos candidatos del post mortem (J7) pre-pueblan la etapa 0 del siguiente reto (J2) con la memoria del propio workspace — R-02 y R-03 ya esperan en el backlog del servicio.</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Mapa journey → etapas → pantalla</h2>
+        <div class="tblwrap"><table>
+          <tr><th>Journey</th><th>Etapas / gates</th><th>Rol decisivo</th><th>Estado (ejemplo)</th><th>Pantalla del mockup</th></tr>
+          <tr><td><b>J1</b> Arranque en frío</td><td>Pre-0 · curaduría</td><td>Lead + admin cliente</td><td><span class="chip ok">hecho</span></td><td><button class="btn ghost" data-screen="importacion">Importación</button></td></tr>
+          <tr><td><b>J2</b> Formulación del reto</td><td>0 · G0</td><td>Sponsor</td><td><span class="chip ok">hecho</span></td><td><button class="btn ghost" data-screen="reto">Reto R-01</button></td></tr>
+          <tr><td><b>J3</b> Investigación y entendimiento</td><td>1–2 · G1, G2</td><td>Diseñadores, stakeholders</td><td><span class="chip ok">hecho</span></td><td><button class="btn ghost" data-screen="proyecto">Proyecto P-01</button></td></tr>
+          <tr><td><b>J4</b> Conceptualización y exploración</td><td>3–4 · G3, G4</td><td>Sponsor, equipo</td><td><span class="chip ok">hecho</span></td><td><button class="btn ghost" data-screen="proyecto">Proyecto P-01</button></td></tr>
+          <tr><td><b>J5</b> Detalle y plan</td><td>5–6 · G5, G6</td><td>Sponsor, dueño del dato</td><td><span class="chip ok">hecho</span></td><td><button class="btn ghost" data-screen="portal">Portal · G5</button></td></tr>
+          <tr><td><b>J6</b> Implementación y medición</td><td>7 · G7</td><td>Equipo cliente, dueño del dato</td><td><span class="chip med">en curso</span></td><td><button class="btn ghost" data-screen="reto">Reto R-01 · impacto</button></td></tr>
+          <tr><td><b>J7</b> Post mortem y continuidad</td><td>PM · veredicto</td><td>Sponsor, admin cliente</td><td><span class="chip neutral">próximo</span></td><td><button class="btn ghost" data-screen="proyecto">Proyecto P-01 · PM</button></td></tr>
+        </table></div>
+        <div class="footnote">Definición completa de cada journey en <code>docs/04-journeys/journeys-plataforma.md</code>.</div>
+      </div>
+    </section>
+
+    <!-- ========== PANTALLA: SERVICIO ========== -->
+    <section class="screen" id="screen-servicio">
+      <h1>Apertura de cuenta nómina digital <span class="chip info">effective state vigente: ES-1</span> <span class="chip jstep">J1 · Arranque</span></h1>
+      <p class="sub">Estado vigente del servicio, su historia de diseño y el backlog de retos. El seguimiento de impacto vive dentro de cada reto.</p>
+
+      <div class="tiles">
+        <div class="tile"><div class="k">Abandono en verificación</div><div class="v">44%</div><div class="d"><span class="up-good">▼ 18 pts</span> vs. línea base 62% · objetivo 40%</div></div>
+        <div class="tile"><div class="k">NPS del flujo</div><div class="v">31</div><div class="d"><span class="up-good">▲ 9</span> vs. línea base · ventana 3 m cerrada</div></div>
+        <div class="tile"><div class="k">Retos</div><div class="v">1<span style="font-size:14px;color:var(--muted)"> en medición</span></div><div class="d">2 candidatos en backlog</div></div>
+        <div class="tile"><div class="k">Snapshots recibidos</div><div class="v">4/6</div><div class="d"><span class="flat">2 pendientes</span> de la ventana de 6 m</div></div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <h2>Estado vigente (effective state ES-1) <span class="chip warn">1 desviación</span></h2>
+          <div class="tblwrap"><table>
+            <tr><th>Elemento</th><th>Constatado</th></tr>
+            <tr><td>Verificación diferida de identidad</td><td>Operativa <span class="chip warn">desviación: paso adicional exigido por cumplimiento</span></td></tr>
+            <tr><td>Touchpoint “carga de documentos” simplificado</td><td>Operativo conforme a DV-1</td></tr>
+            <tr><td>Mensajería de estado en la app</td><td>Operativa conforme a DV-1</td></tr>
+            <tr><td>Proceso backstage de orquestación</td><td><span class="chip neutral">aplazado a RL-2</span> dependencia del área de riesgo</td></tr>
+          </table></div>
+          <div class="footnote">Toda desviación queda registrada con razón. Fuente de verdad: constatación del 12-abr-2026.</div>
+        </div>
+
+        <div class="card">
+          <h2>Historia de diseño</h2>
+          <div class="tblwrap"><table>
+            <tr><th>Objeto</th><th>Estado</th><th>Fecha</th></tr>
+            <tr><td><b>DV-1</b> Rediseño de verificación (4 elementos)</td><td><span class="chip ok">aprobada</span> G5/G6 por sponsor</td><td>mar-2026</td></tr>
+            <tr><td><b>RL-1</b> Release 1 · 3 de 4 elementos</td><td><span class="chip ok">verificado</span> con ES-1</td><td>abr-2026</td></tr>
+            <tr><td><b>RL-2</b> Release 2 · backstage pendiente</td><td><span class="chip neutral">planificado</span></td><td>—</td></tr>
+          </table></div>
+          <hr class="divider">
+          <h2>Backlog de retos del servicio</h2>
+          <div class="tblwrap"><table>
+            <tr><th>Reto</th><th>Origen</th><th>Estado</th></tr>
+            <tr><td>R-01 Reducir abandono de apertura 62% → 40%</td><td>Importación + diagnóstico</td><td><span class="chip med">en medición</span></td></tr>
+            <tr><td>R-02 Completar el backstage aplazado (RL-2)</td><td>Post mortem R-01</td><td><span class="chip neutral">candidato</span></td></tr>
+            <tr><td>R-03 Abandono del segmento pymes (55%)</td><td>Hallazgo de medición</td><td><span class="chip neutral">candidato</span></td></tr>
+          </table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== PANTALLA: RETO ========== -->
+    <section class="screen" id="screen-reto">
+      <h1>R-01 · Reducir el abandono de apertura digital del 62% al 40% <span class="chip med">en medición</span> <span class="chip jstep">J2 · Formulación</span> <span class="chip jstep">J6 · Medición</span></h1>
+      <p class="sub">Formulación aprobada en G0 · servicio ancla: Apertura de cuenta nómina digital · post mortem previsto: nov-2026</p>
+
+      <div class="grid2">
+        <div class="card">
+          <h2>Criterios de éxito y ventanas <span class="chip ok">G0 aprobado</span></h2>
+          <div class="tblwrap"><table>
+            <tr><th>Criterio / KPI</th><th class="num">Línea base</th><th class="num">Objetivo</th><th>Ventana</th><th>Dueño del dato</th></tr>
+            <tr><td>Tasa de abandono en verificación</td><td class="num">62% (feb)</td><td class="num">40%</td><td>6 meses · snapshot mensual (CSV)</td><td>G. de Canales</td></tr>
+            <tr><td>NPS del flujo de apertura</td><td class="num">22</td><td class="num">35</td><td>3 meses · encuesta trimestral</td><td>Á. de Experiencia</td></tr>
+          </table></div>
+          <hr class="divider">
+          <h2>Arquetipos del reto</h2>
+          <p style="margin:4px 0 8px">
+            <span class="chip info">El apurado de RR. HH. → segmento empleados</span>&nbsp;
+            <span class="chip info">El desconfiado digital → segmento independientes</span>
+          </p>
+          <div class="footnote">Cada arquetipo cita la evidencia que lo sostiene (requisito de G2). Disponibles como revisores AI <span class="chip sim">simulación</span> — sus salidas no cuentan para gates.</div>
+        </div>
+
+        <div class="card">
+          <h2>Seguimiento de impacto · Metric Registry</h2>
+          <!-- chart: linea de snapshots vs objetivo -->
+          <div class="svgwrap" style="border:none">
+          <svg viewBox="0 0 600 232" width="100%" role="img" aria-label="Serie mensual de tasa de abandono contra objetivo">
+            <!-- grid -->
+            <g stroke="#e1e0d9" stroke-width="1">
+              <line x1="52" y1="24"  x2="580" y2="24"/>
+              <line x1="52" y1="66"  x2="580" y2="66"/>
+              <line x1="52" y1="108" x2="580" y2="108"/>
+              <line x1="52" y1="150" x2="580" y2="150"/>
+            </g>
+            <line x1="52" y1="192" x2="580" y2="192" stroke="#c3c2b7" stroke-width="1"/>
+            <!-- eje y: 70,60,50,40,30 → y = 24 + (70-v)*4.2 -->
+            <g fill="#898781" font-size="11" text-anchor="end">
+              <text x="44" y="28">70</text><text x="44" y="70">60</text><text x="44" y="112">50</text><text x="44" y="154">40</text><text x="44" y="196">30</text>
+            </g>
+            <!-- objetivo 40 -->
+            <line x1="52" y1="150" x2="580" y2="150" stroke="#898781" stroke-width="1.5" stroke-dasharray="5 4"/>
+            <text x="578" y="144" fill="#52514e" font-size="11" text-anchor="end">objetivo 40%</text>
+            <!-- marca release RL-1 (entre feb y may) -->
+            <line x1="245" y1="24" x2="245" y2="192" stroke="#eb6834" stroke-width="1.5" stroke-dasharray="2 3"/>
+            <text x="249" y="34" fill="#9a3d12" font-size="11">RL-1 desplegado</text>
+            <!-- serie: feb 62 (baseline), may 55, jun 49, jul 46, ago 44 ; x: 90,268,364,460,556 -->
+            <polyline points="90,57.6 323,87 401,112.2 478,124.8 556,133.2" fill="none" stroke="#2a78d6" stroke-width="2"/>
+            <g fill="#2a78d6" stroke="#fcfcfb" stroke-width="2">
+              <circle cx="90"  cy="57.6"  r="4.5"><title>feb · línea base 62%</title></circle>
+              <circle cx="323" cy="87"    r="4.5"><title>may · 55%</title></circle>
+              <circle cx="401" cy="112.2" r="4.5"><title>jun · 49%</title></circle>
+              <circle cx="478" cy="124.8" r="4.5"><title>jul · 46%</title></circle>
+              <circle cx="556" cy="133.2" r="4.5"><title>ago · 44%</title></circle>
+            </g>
+            <g fill="#0b0b0b" font-size="11.5" font-weight="600" text-anchor="middle">
+              <text x="90" y="47">62</text><text x="323" y="77">55</text><text x="401" y="102">49</text><text x="478" y="115">46</text><text x="556" y="123">44</text>
+            </g>
+            <g fill="#898781" font-size="11" text-anchor="middle">
+              <text x="90" y="210">feb · base</text><text x="323" y="210">may</text><text x="401" y="210">jun</text><text x="478" y="210">jul</text><text x="556" y="210">ago</text>
+            </g>
+          </svg>
+          </div>
+          <div class="tblwrap"><table>
+            <tr><th>Snapshot</th><th class="num">Valor</th><th>Origen</th><th>Estado</th></tr>
+            <tr><td>ago-2026</td><td class="num">44%</td><td>CSV · analítica</td><td><span class="chip ok">recibido</span></td></tr>
+            <tr><td>sep-2026</td><td class="num">—</td><td>CSV · analítica</td><td><span class="chip warn">esperado · recordatorio enviado</span></td></tr>
+          </table></div>
+          <div class="btnrow"><button class="btn ghost">Subir snapshot (CSV)</button><button class="btn ghost">Ver dashboard externo ↗</button></div>
+          <div class="footnote">Carga manual o CSV; sin telemetría continua. Al cierre de la ventana se habilita el post mortem con veredicto.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== PANTALLA: PROYECTO ========== -->
+    <section class="screen" id="screen-proyecto">
+      <h1>P-01 · Rediseño de la verificación de identidad <span class="chip med">en medición</span> <span class="chip neutral">perfil estándar</span> <span class="chip jstep">J3–J5 · Diseño</span> <span class="chip jstep">J7 · Post mortem</span></h1>
+      <p class="sub">Etapas canónicas 0–7 con gates de suficiencia. Los gates ordenan decisiones; las actividades pueden ir en paralelo.</p>
+
+      <div class="stepper">
+        <div class="step done"><div class="g"><span class="gd ok"></span>0 · G0</div>Definición del reto<small>aprobado · sponsor</small></div>
+        <div class="step done"><div class="g"><span class="gd ok"></span>1 · G1</div>Investigación<small>12 entrevistas · 3 segmentos</small></div>
+        <div class="step done"><div class="g"><span class="gd ok"></span>2 · G2</div>Entendimiento<small>as-is validado</small></div>
+        <div class="step done"><div class="g"><span class="gd ok"></span>3 · G3</div>Conceptualización<small>portafolio HMW</small></div>
+        <div class="step done"><div class="g"><span class="gd ok"></span>4 · G4</div>Exploración<small>test 8 usuarios · 1 pasa</small></div>
+        <div class="step done"><div class="g"><span class="gd ok"></span>5 · G5</div>Detalle<small>DV-1 aprobada</small></div>
+        <div class="step done"><div class="g"><span class="gd ok"></span>6 · G6</div>Plan<small>2 releases · registry firmado</small></div>
+        <div class="step done"><div class="g"><span class="gd ok"></span>7 · G7</div>Seguimiento<small>ES-1 conciliado</small></div>
+        <div class="step now"><div class="g"><span class="gd now"></span>PM</div>Post mortem<small>al cierre de ventana</small></div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <h2>Asistente de gate · ¿Qué falta para el post mortem? <span class="chip sim">asistente AI · no aprueba</span></h2>
+          <ul class="check">
+            <li><span class="ck ok">✓</span><div>Baseline y 4 snapshots de abandono en el Metric Registry <span class="chip neutral">objetos enlazados</span></div></li>
+            <li><span class="ck ok">✓</span><div>Ventana de NPS cerrada con resultado final (31)</div></li>
+            <li><span class="ck no">!</span><div>Faltan los snapshots de sep y oct para cerrar la ventana de abandono · <b>recordatorio enviado al dueño del dato</b></div></li>
+            <li><span class="ck ok">✓</span><div>Desviaciones del effective state explicadas (1/1 con razón)</div></li>
+            <li><span class="ck na">N/A</span><div>Diseño experimental suficiente para lenguaje causal · <b>no aplica</b> — el outcome review usará contribución/asociación (aprobado por lead)</div></li>
+          </ul>
+          <div class="footnote">El checklist evalúa suficiencia contra objetos reales; decide siempre un humano con el rol correcto.</div>
+        </div>
+
+        <div class="card">
+          <h2>Decisiones del proyecto</h2>
+          <div class="tblwrap"><table>
+            <tr><th>Decisión</th><th>Gate</th><th>Sostenida por</th></tr>
+            <tr><td><b>Pasa</b> “verificación diferida”</td><td>G4</td><td>Test real 8 usuarios · umbral 6/8 <span class="chip ok">7/8</span></td></tr>
+            <tr><td><b>Muere</b> “pre-carga por convenio”</td><td>G4</td><td>Razón registrada: dependencia de convenios sin dueño</td></tr>
+            <tr><td>Aprobación DV-1 (4 elementos, diff contra estado actual)</td><td>G5</td><td>Insight I-07 (7 citas) · cobertura journey↔blueprint</td></tr>
+            <tr><td>Plan de 2 releases + Metric Registry</td><td>G6</td><td>Sign-off sponsor · dueños de dato comprometidos</td></tr>
+          </table></div>
+          <div class="footnote">Cada decisión navega hasta su evidencia (cadena completa). Las salidas de revisores AI están etiquetadas <span class="chip sim">simulación</span> y no computan en G4/G5.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== PANTALLA: JOURNEY ========== -->
+    <section class="screen" id="screen-journey">
+      <h1>Journey to-be · Apertura de cuenta nómina digital <span class="chip ok">snapshot DV-1</span> <span class="chip jstep">J3 · as-is → J5 · to-be</span></h1>
+      <p class="sub">Grafo tipado — la fuente de verdad es el modelo estructurado; esta vista se regenera (render tipo Mermaid / blueprint por carriles). Selección: paso “Verifica identidad”.</p>
+
+      <div class="grid2" style="grid-template-columns:1.6fr 1fr">
+        <div class="card">
+          <h2>Blueprint por carriles</h2>
+          <div class="svgwrap">
+          <svg viewBox="0 0 1060 420" width="1060" role="img" aria-label="Blueprint del journey con carriles frontstage, backstage y sistemas">
+            <defs>
+              <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#52514e"/></marker>
+            </defs>
+            <!-- fases -->
+            <g font-size="11.5" font-weight="700" fill="#52514e">
+              <rect x="20"  y="14" width="240" height="26" rx="6" fill="#f0efec"/><text x="140" y="31" text-anchor="middle">FASE · DESCUBRE</text>
+              <rect x="270" y="14" width="240" height="26" rx="6" fill="#f0efec"/><text x="390" y="31" text-anchor="middle">FASE · SOLICITA</text>
+              <rect x="520" y="14" width="260" height="26" rx="6" fill="#dbe9fb"/><text x="650" y="31" text-anchor="middle" fill="#1c5cab">FASE · VERIFICA IDENTIDAD</text>
+              <rect x="790" y="14" width="250" height="26" rx="6" fill="#f0efec"/><text x="915" y="31" text-anchor="middle">FASE · ACTIVA</text>
+            </g>
+            <!-- etiquetas de carril -->
+            <g font-size="10" fill="#898781" font-weight="700">
+              <text x="20" y="78">FRONTSTAGE</text>
+              <text x="20" y="208">BACKSTAGE</text>
+              <text x="20" y="326">SISTEMAS</text>
+            </g>
+            <line x1="20" y1="180" x2="1040" y2="180" stroke="#e1e0d9" stroke-dasharray="4 4"/>
+            <line x1="20" y1="300" x2="1040" y2="300" stroke="#e1e0d9" stroke-dasharray="4 4"/>
+
+            <!-- pasos frontstage -->
+            <g font-size="12">
+              <rect x="40" y="92" width="200" height="54" rx="9" fill="#fcfcfb" stroke="#c3c2b7"/>
+              <text x="140" y="114" text-anchor="middle" font-weight="600">Conoce la cuenta</text>
+              <text x="140" y="132" text-anchor="middle" fill="#52514e" font-size="11">canal: web / campaña</text>
+
+              <rect x="290" y="92" width="200" height="54" rx="9" fill="#fcfcfb" stroke="#c3c2b7"/>
+              <text x="390" y="114" text-anchor="middle" font-weight="600">Completa el formulario</text>
+              <text x="390" y="132" text-anchor="middle" fill="#52514e" font-size="11">touchpoint: app móvil</text>
+
+              <rect x="540" y="88" width="220" height="62" rx="9" fill="#dbe9fb" stroke="#2a78d6" stroke-width="2"/>
+              <text x="650" y="110" text-anchor="middle" font-weight="700">Verifica identidad ◉</text>
+              <text x="650" y="127" text-anchor="middle" fill="#1c5cab" font-size="11">verificación diferida (DV-1)</text>
+              <text x="650" y="142" text-anchor="middle" fill="#8f1f1f" font-size="10.5">fricción: documentos no a mano</text>
+
+              <rect x="810" y="92" width="200" height="54" rx="9" fill="#fcfcfb" stroke="#c3c2b7"/>
+              <text x="910" y="114" text-anchor="middle" font-weight="600">Activa y usa la cuenta</text>
+              <text x="910" y="132" text-anchor="middle" fill="#52514e" font-size="11">primer abono de nómina</text>
+            </g>
+            <!-- transiciones -->
+            <g stroke="#52514e" stroke-width="1.6" marker-end="url(#arr)">
+              <line x1="240" y1="119" x2="286" y2="119"/>
+              <line x1="490" y1="119" x2="536" y2="119"/>
+              <line x1="760" y1="119" x2="806" y2="119"/>
+            </g>
+            <!-- salida de abandono -->
+            <line x1="650" y1="150" x2="650" y2="170" stroke="#d03b3b" stroke-width="1.6" stroke-dasharray="3 3" marker-end="url(#arr)"/>
+            <text x="662" y="168" fill="#8f1f1f" font-size="10.5">abandono 62% → 44% · KPI</text>
+
+            <!-- backstage -->
+            <g font-size="12">
+              <rect x="540" y="212" width="220" height="54" rx="9" fill="#fcfcfb" stroke="#c3c2b7"/>
+              <text x="650" y="234" text-anchor="middle" font-weight="600">Motor de verificación</text>
+              <text x="650" y="251" text-anchor="middle" fill="#52514e" font-size="11">validación en buró + biometría</text>
+
+              <rect x="810" y="212" width="200" height="54" rx="9" fill="#fcfcfb" stroke="#898781" stroke-dasharray="5 4"/>
+              <text x="910" y="234" text-anchor="middle" font-weight="600" fill="#52514e">Orquestación diferida</text>
+              <text x="910" y="251" text-anchor="middle" fill="#9a3d12" font-size="11">aplazado a RL-2</text>
+            </g>
+            <g stroke="#898781" stroke-width="1.4" marker-end="url(#arr)">
+              <line x1="640" y1="150" x2="640" y2="208"/>
+              <line x1="910" y1="146" x2="910" y2="208"/>
+            </g>
+            <text x="628" y="184" fill="#898781" font-size="10" text-anchor="end">soporta</text>
+
+            <!-- sistemas -->
+            <g font-size="12">
+              <rect x="290" y="330" width="200" height="46" rx="9" fill="#f0efec" stroke="#c3c2b7"/>
+              <text x="390" y="357" text-anchor="middle" font-weight="600">App móvil</text>
+              <rect x="540" y="330" width="220" height="46" rx="9" fill="#f0efec" stroke="#c3c2b7"/>
+              <text x="650" y="357" text-anchor="middle" font-weight="600">Proveedor de identidad</text>
+              <rect x="810" y="330" width="200" height="46" rx="9" fill="#f0efec" stroke="#c3c2b7"/>
+              <text x="910" y="357" text-anchor="middle" font-weight="600">Core bancario</text>
+            </g>
+            <g stroke="#898781" stroke-width="1.4" marker-end="url(#arr)">
+              <line x1="390" y1="146" x2="390" y2="326"/>
+              <line x1="650" y1="266" x2="650" y2="326"/>
+              <line x1="910" y1="266" x2="910" y2="326"/>
+            </g>
+          </svg>
+          </div>
+          <div class="legend">
+            <span><span class="sw" style="background:#dbe9fb;border:1.5px solid #2a78d6"></span> seleccionado</span>
+            <span><span class="sw" style="background:#fcfcfb;border:1px dashed #898781"></span> pendiente (RL-2)</span>
+            <span><span class="sw" style="background:#f0efec"></span> sistema / fase</span>
+            <span>— línea punteada roja: punto de fuga medido</span>
+          </div>
+          <div class="footnote">Validación automática del grafo: 0 transiciones rotas · 0 pasos sin evidencia · 1 hueco frontstage↔backstage (orquestación aplazada, justificado en G7).</div>
+        </div>
+
+        <div class="card">
+          <h2>Trazabilidad del paso seleccionado</h2>
+          <p style="margin:0 0 6px"><b>Verifica identidad</b> <span class="chip info">paso · frontstage</span></p>
+          <div class="tblwrap"><table>
+            <tr><th>Relación</th><th>Objeto</th></tr>
+            <tr><td>evidencia-de</td><td><b>I-07</b> “la verificación pide documentos que el usuario no tiene a mano en el móvil” · <span class="chip neutral">7 citas</span></td></tr>
+            <tr><td>siente</td><td>Fricción alta · arquetipo “el desconfiado digital” <span class="chip sim">revisor AI: riesgo de exclusión → pregunta de test</span></td></tr>
+            <tr><td>afecta</td><td>Elemento DV-1 “verificación diferida” · incluido en <b>RL-1</b> <span class="chip ok">desplegado</span></td></tr>
+            <tr><td>desviación</td><td>ES-1: paso adicional exigido por cumplimiento <span class="chip warn">con razón</span></td></tr>
+            <tr><td>mide</td><td>KPI tasa de abandono · 62% → 44% · objetivo 40%</td></tr>
+            <tr><td>soporta</td><td>Motor de verificación → Proveedor de identidad</td></tr>
+          </table></div>
+          <div class="btnrow"><button class="btn ghost">Ver código Mermaid (solo lectura)</button><button class="btn ghost">Exportar vista</button></div>
+          <div class="footnote">Consulta equivalente del grafo: “¿qué pasos afectó RL-1?” — responde 3 pasos vía elementos de DV-1.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== PANTALLA: PORTAL / G5 ========== -->
+    <section class="screen" id="screen-portal">
+      <h1>Portal del cliente · Aprobación de gate <span class="chip info">G5 · Detalle de solución</span> <span class="chip jstep">J5 · Detalle y plan</span></h1>
+      <p class="sub">Vista del sponsor (Banco Andino). La aprobación queda auditada y convierte el gate en un momento de co-creación. <i>Pantalla histórica del ejemplo: G5 se aprobó en mar-2026.</i></p>
+
+      <div class="grid2">
+        <div class="card">
+          <h2>Design version DV-1 · diff contra el estado actual</h2>
+          <p style="margin:2px 0 8px;color:var(--ink-2)">Qué cambia en “Apertura de cuenta nómina digital” si apruebas esta versión:</p>
+          <ul class="diff" style="margin:0;padding-left:18px">
+            <li><span class="mod">MOD</span> Touchpoint “carga de documentos” → se elimina la exigencia de documentos en el momento (verificación diferida)</li>
+            <li><span class="mod">MOD</span> Paso “verifica identidad” → biometría primero, documentos después con plazo de 48 h</li>
+            <li><span class="mod">MOD</span> Mensajería de estado en la app → seguimiento del avance de verificación</li>
+            <li><span class="add">NUEVO</span> Proceso backstage “orquestación de verificación diferida” (área de riesgo + proveedor de identidad)</li>
+          </ul>
+          <hr class="divider">
+          <h2>Suficiencia verificada</h2>
+          <ul class="check">
+            <li><span class="ck ok">✓</span><div>Cobertura journey ↔ blueprint ↔ requisitos: 100% de pasos con soporte o justificación</div></li>
+            <li><span class="ck ok">✓</span><div>Pieza crítica validada: test real de “verificación diferida” 7/8 (umbral 6/8)</div></li>
+            <li><span class="ck ok">✓</span><div>Cadena de evidencia: cada cambio navega a insights y citas (p. ej. I-07)</div></li>
+            <li><span class="ck ok">✓</span><div>Revisión adversarial por arquetipos adjunta <span class="chip sim">simulación AI · no computa</span></div></li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h2>Conversación del gate</h2>
+          <div class="commentbox"><div class="who"><b>María G. · Sponsor</b> · 18 mar</div>¿Por qué el proceso backstage nuevo no entra en el primer release?</div>
+          <div class="commentbox"><div class="who"><b>Lucía P. · Lead boutique</b> · 18 mar</div>Depende del área de riesgo (convenio con el proveedor). Lo planificamos como RL-2 en el G6; el diff lo deja explícito para que la parcialidad no sea invisible.</div>
+          <div class="commentbox"><div class="who"><b>Asistente de gate</b> <span class="chip sim">AI</span> · 19 mar</div>Checklist de suficiencia completo. Nada pendiente para decidir. La decisión es del sponsor.</div>
+          <div class="btnrow">
+            <button class="btn approve">Aprobar G5</button>
+            <button class="btn ghost">Solicitar cambios</button>
+            <button class="btn ghost">Comentar</button>
+          </div>
+          <div class="footnote">Aprobado por María G. (sponsor) el 20-mar-2026 · registro de auditoría #4211 · checklist v3. Los agentes AI no pueden aprobar gates.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== PANTALLA: IMPORTACION ========== -->
+    <section class="screen" id="screen-importacion">
+      <h1>Bandeja de importación <span class="chip neutral">2 ítems</span> <span class="chip jstep">J1 · Arranque en frío</span></h1>
+      <p class="sub">El material externo se trata como contenido no confiable: escaneo, validación y extracción propuesta. Nada entra al grafo sin curaduría humana.</p>
+
+      <div class="grid2">
+        <div class="card">
+          <h2>Ítems en bandeja</h2>
+          <div class="tblwrap"><table>
+            <tr><th>Material</th><th>Origen</th><th>Estado</th></tr>
+            <tr><td>📄 Estudio de CX 2024 (PDF, 68 págs.)</td><td>Banco Andino · dic-2024</td><td><span class="chip ok">escaneado</span> <span class="chip info">extracción lista</span></td></tr>
+            <tr><td>📊 Funnel de apertura (hoja de cálculo)</td><td>Analítica · feb-2026</td><td><span class="chip ok">escaneado</span> <span class="chip info">extracción lista</span></td></tr>
+            <tr><td>🖼 Tablero de taller (enlace Miro)</td><td>Boutique · ene-2026</td><td><span class="chip neutral">evidencia adjunta</span> preview + OCR básico</td></tr>
+          </table></div>
+          <div class="footnote">Miro/Figma entran como evidencia importable básica: original + preview + lectura AI; sin sincronización ni reconstrucción del tablero.</div>
+        </div>
+
+        <div class="card">
+          <h2>Curaduría · candidatos propuestos por AI <span class="chip sim">propuesta · requiere aprobación</span></h2>
+          <div class="tblwrap"><table>
+            <tr><th>Candidato</th><th>Mapeo al grafo</th><th class="num">Confianza</th><th>Acción</th></tr>
+            <tr><td>Servicio “Apertura de cuenta nómina digital”</td><td>Servicio + estado actual</td><td class="num">0.96</td><td><span class="chip ok">aprobado</span></td></tr>
+            <tr><td>Línea base: abandono 62% en verificación</td><td>KPI + baseline (feb)</td><td class="num">0.93</td><td><span class="chip ok">aprobado</span></td></tr>
+            <tr><td>Persona “oficinista joven” (estudio 2024)</td><td>Arquetipo histórico → segmento empleados</td><td class="num">0.81</td><td><button class="btn ghost" style="padding:3px 10px">Aprobar como histórico</button></td></tr>
+            <tr><td>“Los clientes prefieren la sucursal” (pág. 41)</td><td>Insight candidato</td><td class="num">0.34</td><td><button class="btn ghost" style="padding:3px 10px">Rechazar</button> <span class="chip warn">contradice funnel 2026</span></td></tr>
+          </table></div>
+          <div class="footnote">Cada objeto aprobado queda con sus dimensiones: proveniencia (cita al documento), método (derivado), derechos (acuerdo del engagement) y lineage (modelo + versión de extracción). Las contradicciones se señalan, no se ocultan.</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  // Navegación simple entre pantallas del mockup (tabs, árbol lateral y enlaces internos)
+  const screens = document.querySelectorAll('.screen');
+  const tabBtns = document.querySelectorAll('#tabs button');
+  const treeBtns = document.querySelectorAll('.tree button');
+  function show(name){
+    screens.forEach(s => s.classList.toggle('on', s.id === 'screen-' + name));
+    tabBtns.forEach(b => b.classList.toggle('on', b.dataset.screen === name));
+    treeBtns.forEach(b => b.classList.toggle('on', b.hasAttribute('data-primary') && b.dataset.screen === name));
+    window.scrollTo({top: 0});
+  }
+  document.querySelectorAll('[data-screen]').forEach(el => el.addEventListener('click', () => show(el.dataset.screen)));
+</script>
+</body>
+</html>

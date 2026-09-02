@@ -264,6 +264,12 @@ create policy criterio_update on criterio_exito
  * llegó a guardar, para que la fila no pueda mentir; cuántas propuestas nacieron de ella se
  * responde con un join desde `propuesta_ai`.
  *
+ * Una fila por INTENTO, no por operación: cuando el primario cae por indisponibilidad y
+ * responde el respaldo, hubo dos llamadas y las dos se anotan con su modelo, su desenlace y
+ * su propia latencia. Con una sola fila, la tasa de error por modelo decía que el primario
+ * no falla nunca y la latencia del respaldo arrastraba la espera del intento perdido — la
+ * observabilidad por modelo (RF-09.14) medía algo que no había ocurrido.
+ *
  * Y al existir la llamada como fila, el coste deja de repetirse en cada propuesta del lote:
  * el gasto del workspace es `sum(costo_usd)` sobre esta tabla, una fila por llamada, sin
  * sumar por `distinct` ni prorratear un entero de tokens entre 1..4 filas.
@@ -695,10 +701,22 @@ create policy reserva_insert on reserva_ai
 -- Se libera la PROPIA reserva; las ajenas, solo cuando ya caducaron (recolección de
 -- basura de un proceso muerto). Sin esto, un curador podría liberar la reserva viva de
 -- otro y devolver el presupuesto al mismo agujero que esta tabla cierra.
+--
+-- Y un tercer caso, que es el que convierte una revocación de consentimiento en algo con
+-- efecto: la reserva de un item cuyo consentimiento VIGENTE ya no autoriza el procesamiento
+-- externo se puede retirar aunque la haya apartado otra persona. Es coherente con quién
+-- puede registrar la revocación —los mismos curadores— y necesario: quien revoca casi nunca
+-- es quien tiene la generación en vuelo, y sin esto el `delete` afectaría a cero filas y el
+-- material saldría igual. La reserva es el token de despacho; retirar el permiso retira el
+-- token.
 create policy reserva_delete on reserva_ai
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
-    and (creado_por = app_user_id() or creado_en <= now() - reserva_ai_ventana())
+    and (
+      creado_por = app_user_id()
+      or creado_en <= now() - reserva_ai_ventana()
+      or (item_id is not null and not consentimiento_externo_vigente(item_id, workspace_id))
+    )
   );
 
 -- Sin UPDATE: una reserva no se edita, se consume o se libera.

@@ -1,7 +1,12 @@
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
-import { costoDeUso, LIMITE_PROPUESTAS_DIA, MODELO_PRIMARIO } from '@/lib/ai/ai.degradacion';
+import {
+  costoDeUso,
+  LIMITE_PROPUESTAS_DIA,
+  MODELO_FALLBACK,
+  MODELO_PRIMARIO,
+} from '@/lib/ai/ai.degradacion';
 import { PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import type {
   ContenidoCriterio,
@@ -16,16 +21,29 @@ import {
   rechazarPropuesta,
   registrarConsentimiento,
 } from '@/lib/ai/ai.servicio';
-import type { ResultadoProveedor } from '@/lib/ai/proveedor.server';
+import type { IntentoProveedor, ResultadoProveedor } from '@/lib/ai/proveedor.server';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
  * generación entera —incluido el lote de propuestas y su lineage— sin red. La resolución
- * de credenciales y la degradación siguen siendo las reales. */
-const proveedor = vi.hoisted(() => ({ respuesta: null as ResultadoProveedor | null }));
+ * de credenciales y la degradación siguen siendo las reales.
+ *
+ * `duranteLlamada` es el hueco de tiempo en el que el material está EN VUELO: lo que ocurra
+ * ahí (una revocación de consentimiento, por ejemplo) pasa con la llamada ya despachada, que
+ * es justo el caso que ningún candado puede cubrir y que hay que poder probar. */
+const proveedor = vi.hoisted(() => ({
+  respuesta: null as ResultadoProveedor | null,
+  duranteLlamada: null as (() => Promise<void>) | null,
+}));
 vi.mock('@/lib/ai/proveedor.server', async (original) => {
   const real = await original<typeof import('@/lib/ai/proveedor.server')>();
-  return { ...real, generarConProveedor: async () => proveedor.respuesta };
+  return {
+    ...real,
+    generarConProveedor: async () => {
+      if (proveedor.duranteLlamada) await proveedor.duranteLlamada();
+      return proveedor.respuesta;
+    },
+  };
 });
 
 /**
@@ -88,14 +106,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   }
 
   const USO_CI = { entrada: 1200, salida: 300 };
+  const USO_CI_COMPLETO = { ...USO_CI, costoUsd: costoDeUso(MODELO_PRIMARIO, USO_CI) };
+
+  /** Un intento contra el proveedor tal como lo devuelve el adaptador: una llamada real, con
+   * su modelo, su desenlace, su latencia y su uso. */
+  function intento(campos: Partial<IntentoProveedor> = {}): IntentoProveedor {
+    return {
+      modelo: MODELO_PRIMARIO,
+      resultado: 'salida-valida',
+      motivo: '',
+      latenciaMs: 900,
+      uso: USO_CI_COMPLETO,
+      ...campos,
+    };
+  }
 
   /** Respuesta del proveedor con su uso: es el único momento en que ese dato existe. */
   const RESPUESTA_CI: ResultadoProveedor = {
     ok: true,
-    modelo: MODELO_PRIMARIO,
-    latenciaMs: 900,
     datos: CONTENIDO_CI,
-    uso: { ...USO_CI, costoUsd: costoDeUso(MODELO_PRIMARIO, USO_CI) },
+    intentos: [intento()],
   };
 
   /** El proveedor ATENDIÓ la llamada y se negó a producir contenido: hay `usage` y no hay
@@ -103,10 +133,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   const RESPUESTA_RECHAZO: ResultadoProveedor = {
     ok: false,
     motivo: 'El proveedor AI se negó a procesar este material.',
-    causa: 'rechazo-proveedor',
-    modelo: MODELO_PRIMARIO,
-    latenciaMs: 700,
-    uso: { ...USO_CI, costoUsd: costoDeUso(MODELO_PRIMARIO, USO_CI) },
+    intentos: [
+      intento({
+        resultado: 'rechazo-proveedor',
+        motivo: 'El proveedor AI se negó a procesar este material.',
+        latenciaMs: 700,
+      }),
+    ],
   };
 
   /** Fallo sin respuesta: no hay uso que registrar y el coste queda en «no se sabe», que no
@@ -114,10 +147,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   const RESPUESTA_CAIDO: ResultadoProveedor = {
     ok: false,
     motivo: 'El proveedor AI no está disponible.',
-    causa: 'sin-respuesta',
-    modelo: MODELO_PRIMARIO,
-    latenciaMs: 25_000,
-    uso: null,
+    intentos: [
+      intento({
+        resultado: 'sin-respuesta',
+        motivo: 'El proveedor AI no está disponible.',
+        latenciaMs: 25_000,
+        uso: null,
+      }),
+    ],
   };
 
   /** Llamada al proveedor de mentira: ninguna propuesta puede existir sin su línea en el
@@ -616,10 +653,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // C0 devuelve un LOTE: una propuesta por criterio, revisable por elemento.
       proveedor.respuesta = {
         ok: true,
-        modelo: 'modelo-de-prueba',
-        latenciaMs: 1234,
         datos: { criterios: [CONTENIDO_C0, { ...CONTENIDO_C0, kpi: 'Tiempo a cuenta activa' }] },
-        uso: null,
+        intentos: [intento({ modelo: 'modelo-de-prueba', latenciaMs: 1234, uso: null })],
       };
       const lote = await generarPropuestas(leadId, {
         workspaceId: ws,
@@ -650,10 +685,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // Y una salida fuera de contrato se descarta entera, sin media propuesta guardada.
       proveedor.respuesta = {
         ok: true,
-        modelo: 'm',
-        latenciaMs: 1,
         datos: { basura: true },
-        uso: null,
+        intentos: [intento({ modelo: 'm', latenciaMs: 1, uso: null })],
       };
       await expect(
         generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
@@ -880,6 +913,109 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(eventos.map((e) => (e.payload as { version: number }).version)).toEqual([1, 2, 3]);
   });
 
+  it('una revocación retira el token de despacho de la generación en vuelo', async () => {
+    const itemId = await nuevoItem('Entrevista con generación en vuelo', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    // Una generación en vuelo, representada por su reserva (el token de despacho).
+    await conUsuario(leadId, (tx) => tx`insert into reserva_ai
+      (workspace_id, capacidad, item_id, unidades, creado_por)
+      values (${ws}, 'CI', ${itemId}, 1, ${leadId})`);
+
+    // La revocación la registra OTRA persona: quien revoca casi nunca es quien tiene la
+    // llamada en curso, y esa es justo la fila que hay que poder retirar.
+    await registrarConsentimiento(disenadorId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'La persona retira el permiso de procesamiento externo',
+      procesamientoExterno: false,
+    });
+    const reservas = await conUsuario(leadId, (tx) => tx`select 1 as x from reserva_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(reservas.length).toBe(0);
+
+    // Un registro que SÍ autoriza no retira nada: solo la retirada del permiso corta.
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'La persona vuelve a autorizar el procesamiento externo',
+      procesamientoExterno: true,
+    });
+    await conUsuario(leadId, (tx) => tx`insert into reserva_ai
+      (workspace_id, capacidad, item_id, unidades, creado_por)
+      values (${ws}, 'CI', ${itemId}, 1, ${leadId})`);
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Amplía el alcance, sigue autorizando el proveedor externo',
+      procesamientoExterno: true,
+    });
+    const siguen = await conUsuario(leadId, (tx) => tx`select 1 as x from reserva_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(siguen.length).toBe(1);
+    await sqlAdmin()`delete from reserva_ai where workspace_id = ${ws} and item_id = ${itemId}`;
+  });
+
+  it('revocar mientras el material viaja: la llamada ya salió, pero ninguna propuesta nace', async () => {
+    const itemId = await nuevoItem('Entrevista revocada a media llamada', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+
+    // El caso que NINGÚN candado puede cubrir y que conviene decir en voz alta: la
+    // revocación entra con el material ya despachado. Lo que se promete es lo que sí se
+    // cumple — que de ese material no nazca nada— y no que el envío se pueda deshacer.
+    proveedor.duranteLlamada = async () => {
+      await registrarConsentimiento(disenadorId, {
+        workspaceId: ws,
+        itemId,
+        alcance: 'La persona retira el permiso mientras la llamada está en curso',
+        procesamientoExterno: false,
+      });
+    };
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        ).rejects.toThrow(/consentimiento/i);
+      });
+    } finally {
+      proveedor.duranteLlamada = null;
+    }
+
+    // El suelo hizo su trabajo: el guard lee el registro VIGENTE, así que la propuesta no
+    // llega a existir aunque el proveedor ya hubiera respondido.
+    const propuestas = await conUsuario(leadId, (tx) => tx`select 1 as x from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(propuestas.length).toBe(0);
+    // La reserva la retiró la propia revocación, así que el item no queda bloqueado.
+    const reservas = await conUsuario(leadId, (tx) => tx`select 1 as x from reserva_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(reservas.length).toBe(0);
+    // Y la llamada, que se pagó, queda anotada: el gasto no depende de que el resultado
+    // llegue a usarse.
+    const llamadas = await conUsuario(leadId, (tx) => tx`select resultado, costo_usd
+      from llamada_ai where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(llamadas.length).toBe(1);
+    expect(llamadas[0]!.resultado).toBe('salida-valida');
+    expect(Number(llamadas[0]!.costo_usd)).toBeGreaterThan(0);
+
+    // Y pedirla de nuevo se corta antes de construir el prompt: el vigente sigue siendo el
+    // que revoca.
+    await conProveedor(RESPUESTA_CI, async () => {
+      await expect(
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+      ).rejects.toThrow(/consentimiento/i);
+    });
+  });
+
   it('un item importado solo con la referencia no llega al proveedor: no hay nada que citar', async () => {
     const soloRef = await nuevoItem('Informe que vive en otra parte', 'documento', '');
     await conProveedor(RESPUESTA_CI, async () => {
@@ -977,6 +1113,99 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(r.generadas).toBe(1);
   });
 
+  it('una reserva caducada no vale como hueco al consumir: se re-comprueba el presupuesto', async () => {
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item cuya reserva caduca a media llamada');
+    // La reserva caduca mientras el proveedor responde (proveedor lentísimo, proceso
+    // reiniciado). Desde ese momento dejó de contar en el presupuesto, así que otras
+    // generaciones pueden reclamar esa misma capacidad — y aquí la reclaman entera.
+    proveedor.duranteLlamada = async () => {
+      await admin`update reserva_ai set creado_en = now() - interval '10 minutes'
+        where workspace_id = ${ws} and item_id = ${itemId}`;
+      for (let i = 0; i < 8; i += 1) {
+        await admin`insert into reserva_ai (workspace_id, capacidad, unidades, creado_por)
+          values (${ws}, 'C0', 8, ${leadId})`;
+      }
+    };
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        // Con la reserva caducada aceptada como token bueno, `apartadas` salía distinto de
+        // cero y el re-chequeo —que existe justo para este caso— se saltaba: la propuesta
+        // se persistía sobre una capacidad que ya era de otro y el tope se rebasaba.
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        ).rejects.toThrow(/presupuesto/i);
+      });
+    } finally {
+      proveedor.duranteLlamada = null;
+      await admin`delete from reserva_ai where workspace_id = ${ws}`;
+    }
+
+    const propuestas = await conUsuario(leadId, (tx) => tx`select 1 as x from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(propuestas.length).toBe(0);
+    // Y la llamada se anotó igual: se pagó aunque el lote no llegara a nacer.
+    const llamadas = await conUsuario(leadId, (tx) => tx`select 1 as x from llamada_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(llamadas.length).toBe(1);
+  });
+
+  it('una degradación de modelo deja DOS filas en el libro, una por intento', async () => {
+    const itemId = await nuevoItem('Item con degradación de modelo');
+    const usoRespaldo = { entrada: 100, salida: 20 };
+    await conProveedor(
+      {
+        ok: true,
+        datos: CONTENIDO_CI,
+        intentos: [
+          intento({
+            modelo: MODELO_PRIMARIO,
+            resultado: 'sin-respuesta',
+            motivo: 'El proveedor AI no está disponible.',
+            latenciaMs: 25_000,
+            uso: null,
+          }),
+          intento({
+            modelo: MODELO_FALLBACK,
+            latenciaMs: 800,
+            uso: { ...usoRespaldo, costoUsd: costoDeUso(MODELO_FALLBACK, usoRespaldo) },
+          }),
+        ],
+      },
+      () => generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+
+    const llamadas = await conUsuario(leadId, (tx) => tx`select id, modelo, resultado, motivo,
+        latencia_ms, costo_usd from llamada_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    // Dos llamadas al proveedor, dos filas: con el `continue` que descartaba el intento
+    // caído, la tasa de error por modelo decía que el primario no falla nunca.
+    expect(llamadas.length).toBe(2);
+    const primario = llamadas.find((l) => l.modelo === MODELO_PRIMARIO)!;
+    const respaldo = llamadas.find((l) => l.modelo === MODELO_FALLBACK)!;
+    expect(primario.resultado).toBe('sin-respuesta');
+    expect(primario.motivo).toMatch(/no está disponible/);
+    expect(primario.costo_usd).toBeNull();
+    expect(primario.latencia_ms).toBe(25_000);
+    // Y la latencia del respaldo es la SUYA: antes la fila superviviente sumaba los dos
+    // intentos y la latencia por modelo medía algo que no ocurrió.
+    expect(respaldo.resultado).toBe('salida-valida');
+    expect(respaldo.latencia_ms).toBe(800);
+
+    // La propuesta cuelga de la llamada que SÍ produjo contenido, y su lineage nombra al
+    // modelo que respondió de verdad.
+    const [p] = await conUsuario(leadId, (tx) => tx`select llamada_id, modelo from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(p!.llamada_id).toBe(respaldo.id);
+    expect(p!.modelo).toBe(MODELO_FALLBACK);
+
+    // El intento caído deja su evento: una llamada pagada de la que no nació nada.
+    const [evento] = await sqlAdmin()`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'LlamadaAISinPropuesta'
+        and payload->>'llamadaId' = ${primario.id as string}`;
+    expect((evento!.payload as { modelo: string }).modelo).toBe(MODELO_PRIMARIO);
+  });
+
   it('una reserva caducada no bloquea el item para siempre: se recoge y se sigue', async () => {
     const itemId = await nuevoItem('Item con reserva zombi');
     await sqlAdmin()`insert into reserva_ai
@@ -1063,14 +1292,21 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     ).rejects.toThrow(/permission denied/);
 
     // Un lote nacido de UNA llamada cuelga de UNA fila de gasto: el coste del workspace es
-    // la suma del libro, sin `distinct` ni prorrateos.
+    // la suma del libro, sin `distinct` ni prorrateos. (Antes hay que decidir lo que ya
+    // esperaba revisión sobre este reto: un ancla con propuestas pendientes no admite otra
+    // pasada, que es lo que hace avanzar la lista de anclas ofrecidas.)
+    const previas = await conUsuario(leadId, (tx) => tx`select id from propuesta_ai
+      where workspace_id = ${ws} and reto_id = ${retoId} and estado = 'propuesta'`);
+    for (const p of previas) {
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: p.id as string });
+    }
     await conProveedor(
       {
         ok: true,
-        modelo: MODELO_PRIMARIO,
-        latenciaMs: 10,
         datos: { criterios: [CONTENIDO_C0, { ...CONTENIDO_C0, kpi: 'KPI del lote' }] },
-        uso: { entrada: 500, salida: 100, costoUsd: 0.005 },
+        intentos: [
+          intento({ latenciaMs: 10, uso: { entrada: 500, salida: 100, costoUsd: 0.005 } }),
+        ],
       },
       () => generarPropuestas(leadId, { workspaceId: ws, capacidad: 'C0', anclaId: retoId }),
     );
@@ -1120,8 +1356,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // Una salida fuera de contrato es el mismo caso: respondió, se pagó, no sirve.
     const otro = await nuevoItem('Item con salida fuera de contrato');
     await conProveedor(
-      { ok: true, modelo: MODELO_PRIMARIO, latenciaMs: 40, datos: { basura: true },
-        uso: { entrada: 90, salida: 10, costoUsd: 0.001 } },
+      {
+        ok: true,
+        datos: { basura: true },
+        intentos: [
+          intento({ latenciaMs: 40, uso: { entrada: 90, salida: 10, costoUsd: 0.001 } }),
+        ],
+      },
       async () => {
         await expect(
           generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: otro }),
@@ -1264,6 +1505,54 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(despues.itemsPendientes[0]!.titulo).toBe('Item 11');
       expect(despues.itemsPendientes.some((i) => i.titulo === 'Item 60')).toBe(true);
       expect(despues.hayMasItems).toBe(false);
+
+      // Y la promesa incondicional: con más anclas elegibles que sitio en la lista, NINGÚN
+      // orden alcanza —el drenaje ayuda, pero exige trabajar lo que va delante—. Buscar por
+      // nombre llega a cualquiera sin drenar nada y sin gastar presupuesto en el camino.
+      const buscado = await panelPropuestas(curadorId, wsA, 'Item 58');
+      expect(buscado.itemsPendientes.map((i) => i.titulo)).toEqual(['Item 58']);
+      expect(buscado.hayMasItems).toBe(false);
+      const porCodigo = await panelPropuestas(curadorId, wsA, 'R-052');
+      expect(porCodigo.retosAbiertos).toHaveLength(1);
+      expect(porCodigo.busqueda).toBe('R-052');
+      // El texto se busca LITERAL: un comodín de LIKE escrito por la persona es un carácter
+      // más, no un «dámelo todo» que haría creer que la búsqueda no filtra.
+      const comodin = await panelPropuestas(curadorId, wsA, '%');
+      expect(comodin.itemsPendientes).toHaveLength(0);
+    });
+  });
+
+  it('los retos también drenan: un reto con criterios propuestos sale de la lista', async () => {
+    await enWorkspaceLimpio('drenaje', async ({ ws: wsD, curadorId, retoId: retoD }) => {
+      const antes = await panelPropuestas(curadorId, wsD);
+      expect(antes.retosAbiertos.some((r) => r.id === retoD)).toBe(true);
+
+      await conProveedor(
+        { ok: true, datos: { criterios: [CONTENIDO_C0] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsD, capacidad: 'C0', anclaId: retoD }),
+      );
+
+      // Un reto no cambia de estado por generarle criterios, así que sin esta condición se
+      // quedaba en la lista para siempre y con más de 50 retos abiertos los de atrás eran
+      // inalcanzables: el orden FIFO ordenaba, pero no drenaba.
+      const conPendiente = await panelPropuestas(curadorId, wsD);
+      expect(conPendiente.retosAbiertos.some((r) => r.id === retoD)).toBe(false);
+      // Y el servicio dice lo mismo que el panel: pedir otro lote sobre un ancla que ya
+      // espera revisión quemaría presupuesto en algo que nadie ha mirado.
+      await conProveedor(
+        { ok: true, datos: { criterios: [CONTENIDO_C0] }, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsD, capacidad: 'C0', anclaId: retoD }),
+          ).rejects.toThrow(/esperando revisión/i);
+        },
+      );
+
+      const [p] = await conUsuario(curadorId, (tx) => tx`select id from propuesta_ai
+        where workspace_id = ${wsD} and reto_id = ${retoD} and estado = 'propuesta'`);
+      await rechazarPropuesta(curadorId, { workspaceId: wsD, propuestaId: p!.id as string });
+      const drenado = await panelPropuestas(curadorId, wsD);
+      expect(drenado.retosAbiertos.some((r) => r.id === retoD)).toBe(true);
     });
   });
 
@@ -1295,10 +1584,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const generadas = await conProveedor(
         {
           ok: true,
-          modelo: MODELO_PRIMARIO,
-          latenciaMs: 120,
           datos: { criterios: [CONTENIDO_C0, { ...CONTENIDO_C0, kpi: 'Segundo KPI' }] },
-          uso: null,
+          intentos: [intento({ latenciaMs: 120, uso: null })],
         },
         () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C0', anclaId: retoC }),
       );
@@ -1306,7 +1593,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
       const antes = await panelPropuestas(curadorId, wsC);
       expect(antes.pendientes.every((p) => p.anclaDisponible)).toBe(true);
-      expect(antes.retosAbiertos.some((r) => r.id === retoC)).toBe(true);
+      // Con criterios propuestos esperando revisión, el reto deja de ofrecerse como ancla:
+      // es la condición que DRENA la lista (un reto no cambia de estado por generar).
+      expect(antes.retosAbiertos.some((r) => r.id === retoC)).toBe(false);
 
       // Entre generar y revisar, alguien aprueba el G0: ese gate certificó unos criterios
       // y los congeló (SYS-22). El insert directo del gate ya aprobado es el atajo del
@@ -1329,7 +1618,6 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // C0 salía disponible y el panel habilitaba «aceptar» y «corregir y aceptar» sobre
       // algo que la base rechaza siempre.
       expect(despues.pendientes.every((x) => x.anclaDisponible === false)).toBe(true);
-      // Y el reto deja de ofrecerse como ancla de generación, por el mismo predicado.
       expect(despues.retosAbiertos.some((r) => r.id === retoC)).toBe(false);
 
       // Lo que decía la pantalla se confirma contra la base…
@@ -1346,14 +1634,20 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`update etapa_instancia set estado = 'en-curso'
         where workspace_id = ${wsC} and proyecto_id = ${proyecto!.id as string} and numero = 0`;
       const reabierto = await panelPropuestas(curadorId, wsC);
-      expect(reabierto.retosAbiertos.some((r) => r.id === retoC)).toBe(true);
       const viva = reabierto.pendientes[0]!;
       expect(viva.anclaDisponible).toBe(true);
+      // Sigue sin ofrecerse como ancla mientras esa propuesta espera: las dos condiciones
+      // son independientes y ninguna tapa a la otra.
+      expect(reabierto.retosAbiertos.some((r) => r.id === retoC)).toBe(false);
       const aceptada = await aceptarPropuesta(curadorId, {
         workspaceId: wsC,
         propuestaId: viva.id,
       });
       expect(aceptada.estado).toBe('aceptada');
+      // Y decidida la última pendiente, el reto vuelve a la lista: la ventana avanza al
+      // trabajar, que es justo lo que le faltaba a los retos.
+      const drenado = await panelPropuestas(curadorId, wsC);
+      expect(drenado.retosAbiertos.some((r) => r.id === retoC)).toBe(true);
     });
   });
 

@@ -39,7 +39,7 @@ export const propuestasDelWorkspace = createServerFn({ method: 'GET' })
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
     try {
-      return await panelPropuestas(usuarioId, data.workspaceId);
+      return await panelPropuestas(usuarioId, data.workspaceId, data.busqueda);
     } catch (e) {
       // Cuenta desactivada con JWT aún vigente: sin datos, como si no hubiera sesión.
       if (e instanceof ErrorAutorizacion) return null;

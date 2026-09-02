@@ -149,7 +149,13 @@ export const RevisarPropuestaSchema = z.object({
 });
 export type RevisarPropuesta = z.infer<typeof RevisarPropuestaSchema>;
 
-export const PropuestasInputSchema = z.object({ workspaceId: z.string().uuid() });
+export const PropuestasInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  /** Filtro de las anclas ofrecidas a la generación. Con más anclas elegibles que sitio en
+   * el selector, ningún orden alcanza: buscar por nombre es lo que hace que ninguna quede
+   * fuera del alcance del producto. */
+  busqueda: z.string().trim().max(100).default(''),
+});
 
 /**
  * RF-09.5: el consentimiento de las personas se captura ANTES de procesar su material,
@@ -254,4 +260,7 @@ export type PanelPropuestas = {
    * había más anclas que ofrecer. */
   hayMasItems: boolean;
   hayMasRetos: boolean;
+  /** El filtro con el que se resolvieron las dos listas: la pantalla lo devuelve al
+   * buscador para que se vea qué se está mirando. */
+  busqueda: string;
 };

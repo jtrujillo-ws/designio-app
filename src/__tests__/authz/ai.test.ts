@@ -1041,6 +1041,103 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  it('revocar después de generar deja la propuesta obsoleta: no se materializa ni por SQL', async () => {
+    const itemId = await nuevoItem('Entrevista revocada antes de revisar', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    const generadas = await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+    expect(generadas.generadas).toBe(1);
+    const [p] = await conUsuario(leadId, (tx) => tx`select id from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId} and estado = 'propuesta'`);
+    const propuestaId = p!.id as string;
+
+    // La propuesta nació con permiso vigente; la persona lo retira DESPUÉS. Es una ventana
+    // distinta de la del despacho: aquí no hay nada viajando, hay un objeto de dominio a
+    // punto de nacer de un material que ya no está autorizado.
+    await registrarConsentimiento(disenadorId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'La persona retira el permiso de procesamiento externo',
+      procesamientoExterno: false,
+    });
+
+    // El panel deja de ofrecer los botones de aceptación y dice por qué.
+    const panel = await panelPropuestas(leadId, ws);
+    const enPanel = panel.pendientes.find((x) => x.id === propuestaId)!;
+    expect(enPanel.anclaEstado).toBe('consentimiento-revocado');
+
+    // El servicio lo dice con nombre…
+    await expect(
+      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
+    ).rejects.toThrow(/consentimiento/i);
+    // …y el suelo es la base: el guard de la transición lo impide también por SQL crudo,
+    // antes incluso de que hablen los CHECK de la tabla.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update propuesta_ai
+        set estado = 'aceptada', revisada_por = ${leadId} where id = ${propuestaId}`),
+    ).rejects.toThrow(/consentimiento/i);
+
+    // Nada nació en el dominio y el item sigue pendiente: la curaduría a mano no depende
+    // de esto (no manda nada a ningún tercero).
+    const evidencias = await conUsuario(leadId, (tx) => tx`select 1 as x from propuesta_ai
+      where id = ${propuestaId} and evidencia_id is not null`);
+    expect(evidencias.length).toBe(0);
+    // Y rechazar, que es la salida, sigue disponible.
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+  });
+
+  it('la bitácora del panel es la puerta de la revocación, también con propuesta pendiente', async () => {
+    const itemId = await nuevoItem('Entrevista de la bitácora del panel', 'entrevista');
+    const nota = await nuevoItem('Nota que no es material de personas');
+
+    // Sin registro: aparece con su estado, que es lo que hace registrable el primer
+    // consentimiento (y solo el material de personas se lista).
+    const inicial = await panelPropuestas(leadId, ws);
+    const sinRegistro = inicial.materialDePersonas.find((m) => m.id === itemId);
+    expect(sinRegistro).toBeDefined();
+    expect(sinRegistro!.version).toBeNull();
+    expect(sinRegistro!.autorizaExterno).toBe(false);
+    expect(inicial.materialDePersonas.some((m) => m.id === nota)).toBe(false);
+
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+
+    // Con permiso vigente y una propuesta pendiente, el item ya no es un ancla ofrecible…
+    const conPropuesta = await panelPropuestas(leadId, ws);
+    expect(conPropuesta.itemsPendientes.some((i) => i.id === itemId)).toBe(false);
+    // …y ahí estaba el agujero: el formulario colgaba del selector de generación, así que
+    // en este estado —el único en el que una revocación urge— no había forma de registrarla.
+    const vigente = conPropuesta.materialDePersonas.find((m) => m.id === itemId)!;
+    expect(vigente.autorizaExterno).toBe(true);
+    expect(vigente.version).toBe(1);
+
+    // Y la revocación entra por esa puerta, sobre el mismo item.
+    const revocacion = await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'La persona retira el permiso',
+      procesamientoExterno: false,
+    });
+    expect(revocacion.version).toBe(2);
+    const tras = await panelPropuestas(leadId, ws);
+    const retirado = tras.materialDePersonas.find((m) => m.id === itemId)!;
+    expect(retirado.autorizaExterno).toBe(false);
+    expect(retirado.version).toBe(2);
+  });
+
   it('un item importado solo con la referencia no llega al proveedor: no hay nada que citar', async () => {
     const soloRef = await nuevoItem('Informe que vive en otra parte', 'documento', '');
     await conProveedor(RESPUESTA_CI, async () => {
@@ -1709,7 +1806,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(generadas.generadas).toBe(2);
 
       const antes = await panelPropuestas(curadorId, wsC);
-      expect(antes.pendientes.every((p) => p.anclaDisponible)).toBe(true);
+      expect(antes.pendientes.every((p) => p.anclaEstado === 'disponible')).toBe(true);
       // Con criterios propuestos esperando revisión, el reto deja de ofrecerse como ancla:
       // es la condición que DRENA la lista (un reto no cambia de estado por generar).
       expect(antes.retosAbiertos.some((r) => r.id === retoC)).toBe(false);
@@ -1734,7 +1831,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // El fallo estaba aquí: con la disponibilidad derivada solo del item, toda propuesta
       // C0 salía disponible y el panel habilitaba «aceptar» y «corregir y aceptar» sobre
       // algo que la base rechaza siempre.
-      expect(despues.pendientes.every((x) => x.anclaDisponible === false)).toBe(true);
+      expect(despues.pendientes.every((x) => x.anclaEstado === 'criterios-congelados')).toBe(true);
       expect(despues.retosAbiertos.some((r) => r.id === retoC)).toBe(false);
 
       // Lo que decía la pantalla se confirma contra la base…
@@ -1752,7 +1849,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         where workspace_id = ${wsC} and proyecto_id = ${proyecto!.id as string} and numero = 0`;
       const reabierto = await panelPropuestas(curadorId, wsC);
       const viva = reabierto.pendientes[0]!;
-      expect(viva.anclaDisponible).toBe(true);
+      expect(viva.anclaEstado).toBe('disponible');
       // Sigue sin ofrecerse como ancla mientras esa propuesta espera: las dos condiciones
       // son independientes y ninguna tapa a la otra.
       expect(reabierto.retosAbiertos.some((r) => r.id === retoC)).toBe(false);

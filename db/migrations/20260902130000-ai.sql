@@ -582,6 +582,21 @@ begin
     raise exception 'una corrección debe cambiar el contenido propuesto';
   end if;
 
+  -- RF-09.4/09.5 en la ACEPTACIÓN, que es la otra mitad del permiso. Generar ya exigía
+  -- consentimiento vigente, pero entre generar y revisar la persona puede retirarlo: la
+  -- propuesta ya existe legítimamente (nació cuando el permiso valía) y lo que no puede
+  -- ocurrir es que el workspace gane un objeto de dominio NUEVO derivado de un material
+  -- que ya no está autorizado. Rechazarla sigue permitido —es la salida— y la curaduría a
+  -- mano de la bandeja no se toca: eso no manda nada a ningún tercero (SYS-21).
+  if new.estado in ('aceptada', 'corregida') and new.item_id is not null and exists (
+    select 1 from item_importacion i
+    where i.id = new.item_id and i.workspace_id = new.workspace_id
+      and tipo_fuente_exige_consentimiento(i.tipo_fuente)
+      and not consentimiento_externo_vigente(i.id, i.workspace_id)
+  ) then
+    raise exception 'el consentimiento de ese material ya no autoriza el procesamiento externo: la propuesta no puede materializarse (RF-09.5)';
+  end if;
+
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
   values (new.workspace_id,
     case new.estado

@@ -181,6 +181,17 @@ export const TIPOS_FUENTE_CON_PERSONAS = ['entrevista', 'observacion'] as const;
 
 // ── Proyección del panel de revisión ──
 
+/** Estado del ancla de una propuesta pendiente: `disponible` es el único que admite
+ * aceptar o corregir; el resto son motivos de obsolescencia, cada uno con su salida. */
+export const ESTADOS_ANCLA = [
+  'disponible',
+  'item-curado',
+  'consentimiento-revocado',
+  'criterios-congelados',
+  'ancla-ausente',
+] as const;
+export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];
+
 export type CitaVerificada = {
   fragmento: string;
   localizacion: string;
@@ -204,8 +215,14 @@ export type PropuestaEnPanel = {
   /** Título del objeto del que se derivó (item de bandeja o reto), para dar contexto. */
   anclaTitulo: string;
   anclaId: string;
-  /** Solo para CI: si el item ya fue curado a mano, la propuesta quedó obsoleta. */
-  anclaDisponible: boolean;
+  /**
+   * Si el ancla sigue admitiendo la materialización y, cuando no, POR QUÉ: el item se curó
+   * a mano, su consentimiento dejó de autorizar el procesamiento externo (RF-09.4/09.5), o
+   * el G0 del reto congeló sus criterios (SYS-22). Las tres dejan la propuesta obsoleta y
+   * solo rechazable, pero se explican distinto — y con un booleano el panel no podía
+   * decirlo.
+   */
+  anclaEstado: EstadoAncla;
   modelo: string;
   promptVersion: string;
   origenKey: OrigenKey;
@@ -262,7 +279,24 @@ export type PanelPropuestas = {
    * había más anclas que ofrecer. */
   hayMasItems: boolean;
   hayMasRetos: boolean;
-  /** El filtro con el que se resolvieron las dos listas: la pantalla lo devuelve al
-   * buscador para que se vea qué se está mirando. */
+  /**
+   * Items cuyo material es de personas, con su consentimiento VIGENTE. Lista propia y no
+   * derivada del selector de generación: registrar un consentimiento —o revocarlo— es un
+   * hecho de la investigación que ocurre cuando ocurre, no un paso previo a generar. Colgado
+   * del selector, un item ya autorizado no tenía formulario y uno con propuesta pendiente ni
+   * siquiera se listaba, así que la revocación no tenía puerta en el producto.
+   */
+  materialDePersonas: ConsentimientoDeItem[];
+  /** El filtro con el que se resolvieron las listas: la pantalla lo devuelve al buscador
+   * para que se vea qué se está mirando. */
   busqueda: string;
+};
+
+export type ConsentimientoDeItem = {
+  id: string;
+  titulo: string;
+  /** Si el registro vigente cubre el procesamiento por un proveedor externo. */
+  autorizaExterno: boolean;
+  /** Versión del registro vigente; null si nunca se registró ninguno. */
+  version: number | null;
 };

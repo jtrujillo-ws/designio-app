@@ -9,6 +9,7 @@ import { Tabs } from '@/components/ui/Tabs';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { cerrarSesion } from '@/lib/auth/auth.functions';
+import type { ArbolWorkspace } from '@/lib/arbol/arbol.schemas';
 import { LOOP_BANCO_ANDINO, type JourneyLoop } from '@/lib/loop/loop-data';
 
 /** Pantalla Loop J1–J7 — recreación de la referencia hifi del design system (ui_kits/designio). */
@@ -37,15 +38,23 @@ const micro: CSSProperties = {
   textTransform: 'uppercase',
 };
 
-export function LoopScreen({ usuario }: { usuario: UsuarioLoop }) {
+export function LoopScreen({
+  usuario,
+  arbol,
+}: {
+  usuario: UsuarioLoop;
+  arbol: ArbolWorkspace | null;
+}) {
+  const servicio = arbol?.servicios[0] ?? null;
   return (
     <div>
       <Topbar usuario={usuario} />
       <div style={{ display: 'flex', minHeight: 780 }}>
-        <Sidebar />
+        <Sidebar arbol={arbol} />
         <main style={{ flex: 1, padding: '28px 32px', minWidth: 0 }}>
           <div style={{ ...micro, color: 'var(--text-muted)' }}>
-            Banco Andino / Servicios / <span style={{ color: 'var(--ink)' }}>Apertura de cuenta nómina digital</span>
+            {arbol?.workspaceNombre ?? '—'} / Servicios /{' '}
+            <span style={{ color: 'var(--ink)' }}>{servicio?.nombre ?? 'Sin servicios aún'}</span>
           </div>
           <div style={{ margin: '16px 0 24px' }}>
             <Tabs items={TABS} value="Loop J1–J7" label="Vistas del servicio" />
@@ -81,8 +90,26 @@ export function LoopScreen({ usuario }: { usuario: UsuarioLoop }) {
           <Card style={{ padding: '16px 20px', borderRadius: 14 }}>
             <span style={{ font: '400 13.5px/1.55 var(--font-sans)', color: 'var(--text-body)' }}>
               <strong>El loop cierra:</strong> los retos candidatos del post mortem (J7) pre-pueblan la etapa 0
-              del siguiente reto (J2) con la memoria del propio workspace — <a href="#retos">R-02</a> y{' '}
-              <a href="#retos">R-03</a> ya esperan en el backlog del servicio.
+              del siguiente reto (J2) con la memoria del propio workspace
+              {(() => {
+                // La narrativa es J7→J2 sobre el servicio ACTUAL (el del breadcrumb):
+                // solo candidatos de este servicio nacidos del post mortem.
+                const candidatos =
+                  servicio?.retos.filter((r) => r.estado === 'candidato' && r.origen === 'post-mortem') ?? [];
+                if (candidatos.length === 0) return ' — el backlog del servicio espera su primer candidato.';
+                return (
+                  <>
+                    {' — '}
+                    {candidatos.map((r, i) => (
+                      <span key={r.id}>
+                        {i > 0 && (i === candidatos.length - 1 ? ' y ' : ', ')}
+                        <a href="#retos">{r.codigo}</a>
+                      </span>
+                    ))}
+                    {candidatos.length === 1 ? ' ya espera' : ' ya esperan'} en el backlog del servicio.
+                  </>
+                );
+              })()}
             </span>
           </Card>
         </main>
@@ -182,7 +209,18 @@ function Topbar({ usuario }: { usuario: UsuarioLoop }) {
   );
 }
 
-function Sidebar() {
+const filaArbol: CSSProperties = {
+  font: '400 12.5px var(--font-sans)',
+  color: 'var(--text-muted)',
+  padding: '5px 10px 5px 34px',
+  display: 'flex',
+  justifyContent: 'space-between',
+  gap: 8,
+};
+
+const truncado: CSSProperties = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+
+function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
   const item: CSSProperties = {
     font: '500 13px var(--font-sans)',
     color: 'var(--text-body)',
@@ -204,25 +242,63 @@ function Sidebar() {
       }}
     >
       <div style={{ ...micro, fontSize: 10, color: 'var(--text-faint)', padding: '0 10px 6px' }}>Cliente</div>
-      <div style={{ font: '700 13.5px var(--font-sans)', padding: '7px 10px' }}>Banco Andino</div>
-      <div
-        style={{
-          font: '600 13px var(--font-sans)',
-          color: 'var(--text-body)',
-          padding: '6px 10px 6px 22px',
-          background: 'var(--accent-soft)',
-          borderRadius: 'var(--r-sm)',
-        }}
-      >
-        Apertura de cuenta nómina
+      <div style={{ font: '700 13.5px var(--font-sans)', padding: '7px 10px' }}>
+        {arbol?.workspaceNombre ?? '—'}
       </div>
-      <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)', padding: '5px 10px 5px 34px', display: 'flex', justifyContent: 'space-between' }}>
-        <span>R-01 Reducir abandono</span>
-        <span style={{ font: '500 10.5px var(--font-mono)', color: 'var(--accent)' }}>62→40</span>
-      </div>
-      <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)', padding: '5px 10px 5px 46px' }}>P-01 Rediseño verificación</div>
-      <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)', padding: '5px 10px 5px 34px' }}>R-02 Completar backstage</div>
-      <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)', padding: '5px 10px 5px 34px' }}>R-03 Abandono pymes</div>
+      {(arbol?.servicios.length ?? 0) === 0 && (
+        <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-faint)', padding: '5px 10px 5px 22px' }}>
+          Sin servicios aún
+        </div>
+      )}
+      {arbol?.servicios.map((servicio, indice) => (
+        <div key={servicio.id}>
+          <div
+            style={{
+              font: '600 13px var(--font-sans)',
+              color: 'var(--text-body)',
+              padding: '6px 10px 6px 22px',
+              // Resaltado solo el servicio "actual" (el primero, el que muestra el
+              // breadcrumb); el selector de servicio llegará con más de uno.
+              background: indice === 0 ? 'var(--accent-soft)' : undefined,
+              borderRadius: 'var(--r-sm)',
+              ...truncado,
+            }}
+          >
+            {servicio.nombre}
+          </div>
+          {servicio.retos.map((reto) => (
+            <div key={reto.id}>
+              <div style={filaArbol}>
+                <span style={truncado}>
+                  {reto.codigo} {reto.titulo}
+                </span>
+                {reto.metricaObjetivo && (
+                  <span style={{ font: '500 10.5px var(--font-mono)', color: 'var(--accent)', flexShrink: 0 }}>
+                    {reto.metricaObjetivo}
+                  </span>
+                )}
+              </div>
+              {reto.proyectos.map((proyecto) => (
+                <div key={proyecto.id} style={{ ...filaArbol, paddingLeft: 46 }}>
+                  <span style={truncado}>
+                    {proyecto.codigo} {proyecto.titulo}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ))}
+          {servicio.retosQueAfectan.map((reto) => (
+            <div key={reto.id} style={filaArbol}>
+              <span style={truncado}>
+                {reto.codigo} {reto.titulo}
+              </span>
+              <span style={{ font: '500 9.5px var(--font-mono)', color: 'var(--text-faint)', flexShrink: 0 }}>
+                afecta
+              </span>
+            </div>
+          ))}
+        </div>
+      ))}
 
       <div style={{ ...micro, fontSize: 10, color: 'var(--text-faint)', padding: '18px 10px 6px' }}>Workspace</div>
       <div style={{ ...item, font: '700 13px var(--font-sans)', color: 'var(--ink)', background: 'var(--surface-sunken)' }}>

@@ -6,6 +6,7 @@ import {
   agregarCriterio,
   aprobarGate,
   crearReto,
+  editarCriterio,
   ErrorMetodo,
   marcarItem,
   proyectoMetodo,
@@ -199,36 +200,44 @@ describeAuthz('método: etapas, gates y checklists', () => {
       /al menos un criterio/,
     );
 
-    await agregarCriterio(leadId, {
+    const creado = await agregarCriterio(leadId, {
       workspaceId: ws,
       retoId,
       ...criterioBase,
       ventanaDias: null, // sin ventana: G0 debe seguir bloqueado y señalarlo
     });
+    const criterioId = creado.criterioId;
     await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id })).rejects.toThrow(
       /sin ventana/,
     );
 
-    const admin = sqlAdmin();
-    await admin`update criterio_exito set ventana_dias = 90 where workspace_id = ${ws} and reto_id = ${retoId}`;
-
-    // Sin objetivo no hay contra qué medir el éxito: el post-mortem quedaría sin vara.
-    await admin`update criterio_exito set objetivo = '' where workspace_id = ${ws} and reto_id = ${retoId}`;
+    // La reparación de borradores es editarCriterio: sin objetivo no hay vara para el
+    // veredicto del post-mortem…
+    await editarCriterio(leadId, { workspaceId: ws, criterioId, ...criterioBase, objetivo: '' });
     await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id })).rejects.toThrow(
       /sin objetivo/,
     );
-    await admin`update criterio_exito set objetivo = '40%' where workspace_id = ${ws} and reto_id = ${retoId}`;
-
-    // Valor sin fecha NO es línea base registrada: sin el punto de partida temporal la
-    // ventana de medición no ancla — y aquí tampoco hay plan que lo supla.
-    await admin`update criterio_exito set linea_base_fecha = null where workspace_id = ${ws} and reto_id = ${retoId}`;
+    // …valor sin fecha NO es línea base registrada (falta el punto de partida temporal
+    // de la ventana, y aquí tampoco hay plan que lo supla)…
+    await editarCriterio(leadId, {
+      workspaceId: ws,
+      criterioId,
+      ...criterioBase,
+      lineaBaseFecha: null,
+    });
     await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id })).rejects.toThrow(
       /línea base completa/,
     );
-    await admin`update criterio_exito set linea_base_fecha = '2026-07-15' where workspace_id = ${ws} and reto_id = ${retoId}`;
-
+    // …y con el criterio completo, G0 aprueba.
+    await editarCriterio(leadId, { workspaceId: ws, criterioId, ...criterioBase });
     const ok = await aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id });
     expect(ok.numero).toBe(0);
+
+    // Con el G0 aprobado el criterio queda congelado incluso para su curador: es la
+    // base del contrato de medición.
+    await expect(
+      editarCriterio(leadId, { workspaceId: ws, criterioId, ...criterioBase, objetivo: '45%' }),
+    ).rejects.toThrow(/congelado/);
   });
 
   it('el rol del gate gobierna: el lead no aprueba G0 ni el sponsor G1; los pendientes bloquean listándose', async () => {
@@ -376,7 +385,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
     expect(previo.naJustificacion).toBe('Decidido por el sponsor');
   });
 
-  it('las escrituras directas del método respetan RLS: un stakeholder no aprueba gates', async () => {
+  it('las escrituras directas del método respetan RLS: ni el stakeholder aprueba, ni el aprobador salta la suficiencia', async () => {
     const p = await proyectoMetodo(leadId, ws, proyectoId);
     const g4 = p!.gates[4]!;
     const filas = await conUsuario(stakeId, (tx) => tx`
@@ -385,6 +394,15 @@ describeAuthz('método: etapas, gates y checklists', () => {
     expect(filas.count).toBe(0);
     const sigue = await proyectoMetodo(leadId, ws, proyectoId);
     expect(sigue?.gates[4]?.estado).toBe('pendiente');
+
+    // La suficiencia vive en el DATO: el sponsor es el rol de G5 pero su checklist
+    // sigue pendiente — la propia política (WITH CHECK) rechaza el salto por SQL.
+    const g5 = p!.gates[5]!;
+    await expect(
+      conUsuario(sponsorId, (tx) => tx`
+        update gate_instancia set estado = 'aprobado', aprobado_por = ${sponsorId}, aprobado_en = now()
+        where id = ${g5.id}`),
+    ).rejects.toThrow(/row-level security/);
   });
 
   it('una cuenta desactivada con sesión viva no lee el método ni aprueba (re-check de estado)', async () => {

@@ -237,6 +237,26 @@ create policy gate_update_aprobar on gate_instancia
     and aprobado_por = app_user_id()
     and aprobado_en is not null
     and workspace_role(app_user_id(), workspace_id) = rol_aprobador
+    -- La suficiencia vive en el DATO, no solo en el servicio: ni el propio rol
+    -- aprobador aprueba por SQL directo con checklist pendiente ni — en G0 — sin
+    -- criterios completos (mismo predicado que aprobarGate, que además da el motivo).
+    and not exists (select 1 from checklist_item ci
+      where ci.gate_id = gate_instancia.id
+        and ci.workspace_id = gate_instancia.workspace_id
+        and ci.estado = 'pendiente')
+    and (gate_instancia.numero <> 0 or (
+      exists (select 1 from criterio_exito c
+        join proyecto p on p.id = gate_instancia.proyecto_id
+          and p.workspace_id = gate_instancia.workspace_id
+        where c.reto_id = p.reto_id and c.workspace_id = gate_instancia.workspace_id)
+      and not exists (select 1 from criterio_exito c
+        join proyecto p on p.id = gate_instancia.proyecto_id
+          and p.workspace_id = gate_instancia.workspace_id
+        where c.reto_id = p.reto_id and c.workspace_id = gate_instancia.workspace_id
+          and (c.ventana_dias is null
+               or c.definicion = '' or c.objetivo = ''
+               or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
+                   and c.linea_base_plan = '')))))
   );
 
 create policy checklist_insert on checklist_item
@@ -307,3 +327,60 @@ grant update (kpi, definicion, linea_base_valor, linea_base_fecha, linea_base_pl
 grant update (estado) on etapa_instancia to designio_app;
 grant update (estado, aprobado_por, aprobado_en) on gate_instancia to designio_app;
 grant update (estado, evidencia_id, na_justificacion, na_aprobado_por) on checklist_item to designio_app;
+
+-- ── Backfill de proyectos pre-existentes a esta migración ──
+-- Antes de este release, crear proyectos solo era posible vía seed/admin (activarReto
+-- llega con este mismo código), así que toda fila previa está recién activada y su
+-- método real es «todo pendiente». Sin esto, la pantalla del método mostraría 0/8
+-- gates sin camino de reparación (el reto ya no está en candidato). El checklist es un
+-- retrato del perfil estándar A ESTA FECHA: los proyectos nuevos toman el vigente de
+-- metodo.plantillas.ts, y este retrato no se re-sincroniza (es historia, no plantilla).
+insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+select p.workspace_id, p.id, e.numero, e.nombre
+from proyecto p
+cross join (values
+  (0, 'Definición del objeto y del reto'),
+  (1, 'Investigación'),
+  (2, 'Análisis y entendimiento'),
+  (3, 'Conceptualización'),
+  (4, 'Exploración de soluciones'),
+  (5, 'Detalle de solución'),
+  (6, 'Plan de implementación'),
+  (7, 'Seguimiento de implementación')
+) e(numero, nombre)
+where not exists (select 1 from etapa_instancia x where x.proyecto_id = p.id);
+
+insert into gate_instancia (workspace_id, proyecto_id, numero, rol_aprobador)
+select p.workspace_id, p.id, n.numero,
+       case when n.numero in (0, 3, 5, 6) then 'sponsor' else 'lead-boutique' end
+from proyecto p
+cross join generate_series(0, 7) n(numero)
+where not exists (select 1 from gate_instancia x where x.proyecto_id = p.id);
+
+insert into checklist_item (workspace_id, gate_id, orden, texto)
+select g.workspace_id, g.id, i.orden, i.texto
+from gate_instancia g
+join (values
+  (0, 0, 'Formulación del reto validada con el sponsor'),
+  (0, 1, 'Stakeholders del reto identificados y notificados'),
+  (0, 2, 'Plan del proyecto y perfil acordados con el cliente'),
+  (1, 0, 'Evidencia primaria suficiente para decidir en etapa 2'),
+  (1, 1, 'Segmentos priorizados cubiertos por la evidencia'),
+  (2, 0, 'Insights con citas a evidencia enlazada'),
+  (2, 1, 'As-is validado con el cliente'),
+  (2, 2, 'Contradicciones de evidencia resueltas o explícitas'),
+  (3, 0, 'Portafolio de oportunidades trazable a insights'),
+  (3, 1, 'Principios de diseño acordados'),
+  (4, 0, 'Evidencia de test de cada concepto que avanza'),
+  (4, 1, 'Conceptos descartados con razón registrada'),
+  (5, 0, 'Design version completa y consistente'),
+  (5, 1, 'Piezas críticas validadas con el cliente'),
+  (5, 2, 'Cobertura journey ↔ blueprint ↔ requisitos revisada'),
+  (6, 0, 'Cada elemento asignado a un release con dueño y fecha'),
+  (6, 1, 'Metric Registry acordado (KPI, dueño del dato, fuente)'),
+  (6, 2, 'Riesgos y RACI del plan revisados'),
+  (7, 0, 'Releases conciliados contra la design version'),
+  (7, 1, 'Effective state constatado con desviaciones explicadas'),
+  (7, 2, 'Medición operando con baseline y snapshots llegando')
+) i(gate, orden, texto) on i.gate = g.numero
+where not exists (select 1 from checklist_item x where x.gate_id = g.id);

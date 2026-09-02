@@ -8,6 +8,7 @@ import type {
   AprobarGate,
   CrearReto,
   CriterioEntrada,
+  EditarCriterio,
   MarcarItem,
   ProyectoMetodo,
 } from './metodo.schemas';
@@ -100,6 +101,51 @@ export async function agregarCriterio(
       )
       select id from nuevo`;
     return { criterioId: fila!.id as string };
+  });
+}
+
+/** Editar un criterio completo ANTES de que el G0 del reto se apruebe (después la
+ * política lo congela — 0 filas aquí). Es el camino de reparación de borradores: un
+ * criterio incompleto bloquea G0 y agregar otros completos no lo desbloquea. */
+export async function editarCriterio(actorId: string, entrada: EditarCriterio): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [dueno] = await tx`select reto_id from criterio_exito
+      where id = ${entrada.criterioId} and workspace_id = ${entrada.workspaceId}`;
+    if (!dueno) {
+      throw new ErrorMetodo('El criterio no existe en este workspace');
+    }
+    // Mismo candado que agregarCriterio: editar y decidir G0 no pueden entrecruzarse.
+    await bloquearReto(tx, dueno.reto_id as string);
+    const [fila] = await tx`
+      with quien as (
+        select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
+      ),
+      upd as (
+        update criterio_exito
+        set kpi = ${entrada.kpi}, definicion = ${entrada.definicion},
+            linea_base_valor = ${entrada.lineaBaseValor},
+            linea_base_fecha = ${entrada.lineaBaseFecha},
+            linea_base_plan = ${entrada.lineaBasePlan},
+            objetivo = ${entrada.objetivo}, ventana_dias = ${entrada.ventanaDias},
+            fecha_post_mortem = ${entrada.fechaPostMortem}
+        where id = ${entrada.criterioId} and workspace_id = ${entrada.workspaceId}
+        returning id, reto_id
+      ),
+      evento as (
+        insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        select ${entrada.workspaceId}, 'CriterioEditado',
+          jsonb_build_object('criterioId', upd.id, 'retoId', upd.reto_id,
+                             'kpi', ${entrada.kpi}::text),
+          ${actorId}, quien.rol
+        from upd, quien
+      )
+      select count(*)::int as n from upd`;
+    if ((fila!.n as number) === 0) {
+      throw new ErrorMetodo(
+        'El criterio está congelado por un G0 aprobado o no puedes editarlo',
+      );
+    }
   });
 }
 

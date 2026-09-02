@@ -84,6 +84,14 @@ export const CriterioSchema = z.object({
 });
 export type CriterioEntrada = z.infer<typeof CriterioSchema>;
 
+/** Edición completa de un criterio ANTES de aprobar el G0 del reto (después está
+ * congelado): es el camino de reparación de borradores — un criterio incompleto
+ * bloquea G0 y agregar otros completos no lo desbloquea. */
+export const EditarCriterioSchema = CriterioSchema.omit({ retoId: true }).extend({
+  criterioId: z.string().uuid(),
+});
+export type EditarCriterio = z.infer<typeof EditarCriterioSchema>;
+
 export const ActivarRetoSchema = z.object({
   workspaceId: z.string().uuid(),
   retoId: z.string().uuid(),

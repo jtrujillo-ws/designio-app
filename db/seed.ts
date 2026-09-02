@@ -53,7 +53,9 @@ async function sembrarArbol(tx: TransactionSql, wsId: string, luciaId: string): 
 }
 
 /** Método de P-01 (SPEC-04): criterios de R-01 con ventana y línea base (§19), etapas
- * 0-7 canónicas, gates G0-G7 y checklist del perfil estándar. */
+ * 0-7 canónicas, gates G0-G7 y checklist del perfil estándar. Idempotente por pieza:
+ * en una base migrada, el backfill de la migración ya creó etapas/gates/checklist de
+ * P-01 (y se respetan); los criterios son datos de demo y solo los pone el seed. */
 async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string): Promise<void> {
   const [p01] = await tx`select p.id, p.reto_id from proyecto p
     where p.workspace_id = ${wsId} and p.codigo = 'P-01'`;
@@ -71,16 +73,20 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
      'Días desde el inicio hasta cuenta operativa', '5 días', '2026-07-15',
      '1 día', 90, ${luciaId})`;
 
-  for (const [numero, nombre] of ETAPAS_CANONICAS.entries()) {
-    await tx`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
-      values (${wsId}, ${proyectoId}, ${numero}, ${nombre}, ${numero <= 1 ? 'en-curso' : 'pendiente'})`;
-    const [gate] = await tx`insert into gate_instancia
-      (workspace_id, proyecto_id, numero, rol_aprobador)
-      values (${wsId}, ${proyectoId}, ${numero}, ${rolAprobadorDeGate(numero)}) returning id`;
-    const textos = checklistParaPerfil(numero, 'estandar');
-    for (const [orden, texto] of textos.entries()) {
-      await tx`insert into checklist_item (workspace_id, gate_id, orden, texto)
-        values (${wsId}, ${gate!.id as string}, ${orden}, ${texto})`;
+  const [yaInstanciado] = await tx`select count(*)::int as n from etapa_instancia
+    where workspace_id = ${wsId} and proyecto_id = ${proyectoId}`;
+  if ((yaInstanciado!.n as number) === 0) {
+    for (const [numero, nombre] of ETAPAS_CANONICAS.entries()) {
+      await tx`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+        values (${wsId}, ${proyectoId}, ${numero}, ${nombre}, ${numero <= 1 ? 'en-curso' : 'pendiente'})`;
+      const [gate] = await tx`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador)
+        values (${wsId}, ${proyectoId}, ${numero}, ${rolAprobadorDeGate(numero)}) returning id`;
+      const textos = checklistParaPerfil(numero, 'estandar');
+      for (const [orden, texto] of textos.entries()) {
+        await tx`insert into checklist_item (workspace_id, gate_id, orden, texto)
+          values (${wsId}, ${gate!.id as string}, ${orden}, ${texto})`;
+      }
     }
   }
 
@@ -109,10 +115,12 @@ async function main() {
       arbolSembrado = true;
     }
 
-    // Upgrade de bases sembradas antes del método (SPEC-04): sembrarlo si no existe.
-    const [conEtapas] = await sql`select count(*)::int as n from etapa_instancia where workspace_id = ${wsId}`;
+    // Upgrade de bases sembradas antes del método (SPEC-04): los CRITERIOS son la
+    // señal (la migración backfillea etapas/gates/checklist, pero los criterios de
+    // demo solo los pone el seed).
+    const [conCriterios] = await sql`select count(*)::int as n from criterio_exito where workspace_id = ${wsId}`;
     let metodoSembrado = false;
-    if ((conEtapas!.n as number) === 0 && lucia) {
+    if ((conCriterios!.n as number) === 0 && lucia) {
       await sql.begin((tx) => sembrarMetodo(tx, wsId, lucia.id as string));
       metodoSembrado = true;
     }

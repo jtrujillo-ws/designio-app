@@ -6,6 +6,7 @@ import {
   AprobarGateSchema,
   CrearRetoSchema,
   CriterioSchema,
+  EditarCriterioSchema,
   MarcarItemSchema,
   ProyectoInputSchema,
 } from './metodo.schemas';
@@ -14,6 +15,7 @@ import {
   agregarCriterio,
   aprobarGate,
   crearReto,
+  editarCriterio,
   ErrorMetodo,
   marcarItem,
   proyectoMetodo,
@@ -68,6 +70,21 @@ export const definirCriterio = createServerFn({ method: 'POST' })
     try {
       const r = await agregarCriterio(actorId, data);
       return { ok: true as const, criterioId: r.criterioId };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+export const editarCriterioDeReto = createServerFn({ method: 'POST' })
+  .inputValidator(EditarCriterioSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await editarCriterio(actorId, data);
+      return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

@@ -11,9 +11,11 @@ create table usuario (
   estado text not null default 'invitado' check (estado in ('invitado', 'activo', 'inactivo')),
   invitacion_token_hash text,
   invitacion_expira timestamptz,
-  -- El workspace cuya invitación EMITIÓ el token vigente: solo ese workspace puede
-  -- re-emitirlo. Evita que otro tenant obtenga un enlace que reclama esta cuenta
-  -- (takeover cross-tenant) o pise el enlace pendiente del emisor original.
+  -- El workspace dueño del vínculo de invitación: el que creó la cuenta al invitarla
+  -- o, en cuentas migradas, el de su membresía legacy más antigua (lo fija el backfill
+  -- de abajo). SOLO ese workspace emite o re-emite enlaces de activación — otro tenant
+  -- no puede obtener un enlace que reclama esta cuenta (takeover cross-tenant) ni
+  -- pisar el enlace pendiente del emisor original.
   invitacion_origen_ws uuid references workspace(id),
   creado_en timestamptz not null default now(),
   actualizado_en timestamptz not null default now()
@@ -28,10 +30,15 @@ create index usuario_invitacion_idx on usuario (invitacion_token_hash) where inv
 -- sin password: nadie puede iniciar sesión con ellas hasta activarlas.
 alter table miembro add column usuario_id uuid references usuario(id);
 
-insert into usuario (email, nombre, estado)
-select distinct on (lower(email)) email, nombre, 'invitado'
+-- La membresía MÁS ANTIGUA introduce la identidad: su workspace queda como origen de
+-- invitación — el mismo modelo de confianza que una cuenta nueva, aplicado retro-
+-- activamente. Sin esto, el admin de cualquier otro tenant podía "adoptar" la cuenta
+-- migrada, recibir su enlace de activación y quedarse con una identidad que ya tiene
+-- membresías ajenas (takeover cross-tenant vía invitación).
+insert into usuario (email, nombre, estado, invitacion_origen_ws)
+select distinct on (lower(email)) email, nombre, 'invitado', workspace_id
 from miembro
-order by lower(email), creado_en;
+order by lower(email), creado_en, id::text;
 
 update miembro m set usuario_id = u.id
 from usuario u
@@ -108,10 +115,9 @@ $$;
 -- membresía sin recibir ni pisar el token: evita el takeover cross-tenant de cuentas
 -- pendientes y que una segunda invitación invalide el enlace de la primera.
 -- La fila se lee FOR UPDATE: sin el lock, una activación concurrente entre la lectura
--- y el UPDATE dejaba token y origen restaurados sobre una cuenta ya activa (enlace
--- que activar_usuario_con_token jamás consume), y dos adopciones simultáneas de un
--- origen NULL podían emitir dos enlaces pisándose entre sí. Con el lock, la condición
--- de cada rama se evalúa sobre el estado definitivo de la fila.
+-- y el UPDATE dejaba token restaurado sobre una cuenta ya activa (enlace que
+-- activar_usuario_con_token jamás consume). Con el lock, la condición de cada rama
+-- se evalúa sobre el estado definitivo de la fila.
 -- Aun serializadas, dos re-emisiones del MISMO workspace reportarían éxito ambas
 -- mientras la segunda invalida el enlace de la primera; por eso las emisiones
 -- estampan clock_timestamp() y un request solo re-emite si el enlace vigente es
@@ -156,19 +162,20 @@ begin
     returning id into v_id;
     v_estado := 'invitado';
     v_emitido := true;
-  elsif v_estado = 'invitado' and (v_origen = p_workspace or v_origen is null) then
+  elsif v_estado = 'invitado' and v_origen = p_workspace then
+    -- SOLO igualdad exacta de origen emite: toda cuenta invitable tiene origen (lo
+    -- fija la creación por invitación o el backfill de la migración con la membresía
+    -- legacy más antigua). Un origen NULL residual queda fail-closed — nadie recibe
+    -- un enlace que reclama esa cuenta; lo resuelve el operador corrigiendo el dato.
     if v_actualizado > transaction_timestamp() then
       -- Otro request emitió/renovó el enlace DESPUÉS de que este comenzó (carrera
       -- serializada por el lock): no pisarlo — ese enlace ya está en manos de quien
       -- lo emitió y este caller debe enterarse en vez de repartir uno muerto.
       v_reciente := true;
     else
-      -- Origen NULL = cuenta creada por el backfill de esta migración (pre-auth), sin
-      -- invitación viva. El primer workspace que la invite ADOPTA el origen — el mismo
-      -- modelo de confianza que una cuenta nueva; a partir de ahí, solo él re-emite.
       update usuario u
       set invitacion_token_hash = p_token_hash, invitacion_expira = p_expira,
-          invitacion_origen_ws = p_workspace, actualizado_en = clock_timestamp()
+          actualizado_en = clock_timestamp()
       where u.id = v_id;
       v_emitido := true;
     end if;

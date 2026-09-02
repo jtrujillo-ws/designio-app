@@ -200,14 +200,30 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     expect(perfil?.membresias.map((m) => m.workspaceId).sort()).toEqual([ws, wsB].sort());
   });
 
-  it('una cuenta migrada (origen null) la adopta el primer workspace que la invita', async () => {
+  it('una cuenta migrada solo la re-invita su workspace de origen (membresía legacy más antigua)', async () => {
     const emailMigrada = `${marca}-migrada@test.demo`;
     const admin = sqlAdmin();
-    // Simula el backfill pre-auth de la migración: invitado sin origen ni token.
-    const [u] = await admin`insert into usuario (email, nombre, estado)
-      values (${emailMigrada}, 'Migrada Test', 'invitado') returning id`;
+    // Simula el backfill de la migración: cuenta 'invitado' sin token, con su
+    // membresía legacy y ese workspace como origen (lo fija el propio backfill).
+    const [u] = await admin`insert into usuario (email, nombre, estado, invitacion_origen_ws)
+      values (${emailMigrada}, 'Migrada Test', 'invitado', ${ws}) returning id`;
     const migradaId = u!.id as string;
+    await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${ws}, ${migradaId}, 'Migrada Test', ${emailMigrada}, 'stakeholder')`;
     try {
+      // Un tenant ajeno NO puede quedarse con la identidad migrada: agrega su
+      // membresía pero jamás recibe el enlace de activación de la cuenta.
+      const ajena = await crearInvitacion(leadBId, {
+        workspaceId: wsB,
+        email: emailMigrada,
+        nombre: 'Migrada Test',
+        rol: 'stakeholder',
+      });
+      expect(ajena.usuarioId).toBe(migradaId);
+      expect(ajena.token).toBeNull();
+      expect(ajena.requiereActivacion).toBe(true);
+
+      // El origen re-invita (el re-onboarding natural de cuentas migradas) y emite.
       const inv = await crearInvitacion(leadId, {
         workspaceId: ws,
         email: emailMigrada,
@@ -215,16 +231,8 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
         rol: 'stakeholder',
       });
       expect(inv.usuarioId).toBe(migradaId);
-      expect(inv.token).toBeTruthy(); // adoptó el origen y emitió enlace
-
-      // Desde la adopción, otro tenant ya no recibe ni pisa el token.
-      const ajena = await crearInvitacion(leadBId, {
-        workspaceId: wsB,
-        email: emailMigrada,
-        nombre: 'Migrada Test',
-        rol: 'stakeholder',
-      });
-      expect(ajena.token).toBeNull();
+      expect(inv.reemision).toBe(true);
+      expect(inv.token).toBeTruthy();
 
       const activada = await activarConToken(inv.token!, 'ClaveMigrada123');
       expect(activada?.id).toBe(migradaId);

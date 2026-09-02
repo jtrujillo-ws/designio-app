@@ -696,6 +696,33 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         where id = ${g6.id}`),
     ).rejects.toThrow(/Metric Registry no está firmado/);
 
+    // La ventana tiene DOS piezas en tablas distintas —el inicio en la entrada, el largo en
+    // `criterio_exito.ventana_dias`, que el registry no copia a propósito—, y la lista de
+    // completitud solo enumeraba columnas de `entrada_kpi`: comprobaba media ventana. G0
+    // exige el largo, pero G0 corre ANTES, y reabrir la etapa 0 —el camino de reparación de
+    // SPEC-04.9— permite devolverlo a nulo sin que el gate vuelva a pendiente. Firmar así
+    // TAPIA el reto: sin ventana el review no se abre nunca (la ventana está «abierta» para
+    // siempre), el snapshot exige el largo no nulo, el criterio ya no se arregla porque el
+    // registry está firmado, y sin review no hay veredicto, sin veredicto el reto no cierra
+    // y sin cierre el proyecto tampoco. El encierro del preámbulo, para filas nuevas y sin
+    // columna de perdón. Aquí se pone a nulo con el rol admin para fijar la regla del GUARD
+    // sin arrastrar una reapertura por el resto de la suite.
+    const adminVentana = sqlAdmin();
+    await adminVentana`update criterio_exito set ventana_dias = null
+      where id = ${criterioAbandonoId}`;
+    await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
+      /entradas incompletas/,
+    );
+    // Las dos reglas de coherencia que existían justo para esto tampoco saltaban, y por una
+    // razón que es el patrón y no el caso: escritas como «rechaza si la incoherencia es
+    // cierta», un nulo en cualquier lado vuelve el predicado NULL, la fila no agrega y la
+    // regla se evapora en silencio — justo cuando falta un dato, que es cuando más falta
+    // hace. Ahora enuncian el hecho que TIENE que ser cierto y rechazan cuando no se puede
+    // demostrar. Con esta lista de completitud delante ya no les llegan nulos; el
+    // `coalesce` es lo que hace que sigan sin llegarles si alguien toca la lista.
+    await adminVentana`update criterio_exito set ventana_dias = 30
+      where id = ${criterioAbandonoId}`;
+
     const firma = await firmarRegistry(sponsorId, { workspaceId: ws, registryId });
     expect(firma.entradas).toBe(2);
 
@@ -920,6 +947,50 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     ).rejects.toThrow(/sin ningún proyecto en medición/);
     await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
       where id = ${proyectoId}`);
+
+    // Y una máquina de estados que solo vive en el UPDATE no es una máquina de estados: el
+    // guard de transición es `before update of estado`, así que por INSERT no se dispara y
+    // `proyecto_insert` no miraba el estado de la fila que nace. Con el grant de tabla, el
+    // rol de app escribe esa columna: un proyecto podía NACER midiendo —sin G7 y sin
+    // registry, las dos condiciones por las que el guard levanta en el camino UPDATE— o
+    // nacer 'cerrado', o sea inmutable de nacimiento. Todas sus hermanas fijaban ya el
+    // estado inicial; esta era la única que no.
+    //
+    // Se comprueba por el MENSAJE y no solo por el rechazo, y ahí está el matiz: un insert
+    // pelado ya fallaba, pero por otra razón —el constraint trigger diferido que exige
+    // instanciar el método— y solo al COMMIT. Esa puerta la abre cualquiera que además
+    // instancie sus ocho etapas y ocho gates, que es exactamente lo que hace la activación
+    // y está al alcance del rol de app. Lo que tiene que hablar es la política, en la
+    // sentencia, diciendo que el estado inicial no se elige.
+    for (const estadoIlegal of ['en-medicion', 'cerrado', 'en-implementacion', 'pausado']) {
+      await expect(
+        conUsuario(leadId, (tx) => tx`insert into proyecto
+          (workspace_id, reto_id, codigo, titulo, estado, creado_por)
+          values (${ws}, ${retoId}, ${'P-NACE-' + estadoIlegal}, 'Proyecto que nace hecho',
+                  ${estadoIlegal}, ${leadId})`),
+      ).rejects.toThrow(/row-level security/);
+    }
+    // Y nacer 'activo' lo rechaza el método, no la política: la puerta del estado inicial
+    // es lo único que este slice añade.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, estado, creado_por)
+        values (${ws}, ${retoId}, 'P-NACE-activo', 'Proyecto sin método',
+                'activo', ${leadId})`),
+    ).rejects.toThrow(/instanciar su método/);
+
+    // Las dos marcas del perdón histórico se cierran en la PUERTA y no en el grant: los
+    // `grant insert` son de TABLA y un grant de tabla cubre las columnas añadidas después,
+    // así que no había que actualizar nada — bastaba insertar una fila nueva con el perdón
+    // puesto. Se exige que nazcan en false, y con eso el conjunto perdonado vuelve a ser el
+    // que escribió la migración y solo puede encoger.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, origen, creado_por,
+         medicion_sin_registry)
+        values (${ws}, ${svcId}, 'R-PERDON', 'Reto que nace perdonado', 'peticion-cliente',
+                ${leadId}, true)`),
+    ).rejects.toThrow(/row-level security/);
 
     // El stakeholder no mueve el método.
     await expect(abrirMedicion(stakeId, { workspaceId: ws, retoId })).rejects.toThrow(
@@ -2012,6 +2083,39 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const [g6Parado] = await conUsuario(leadId, (tx) => tx`select estado from gate_instancia
       where proyecto_id = ${actVieja.proyectoId} and numero = 6`);
     expect(g6Parado!.estado).toBe('pendiente');
+
+    // Y la mitad que una sola sesión no ve: DECIDIR sobre una instantánea y ESCRIBIR sobre
+    // un candado. El guard leía `proyecto.estado` sin bloquear y actualizaba después sin
+    // pedir estado en el `where`. Con otra sesión pausando el proyecto en medio, la lectura
+    // veía 'activo' y no levantaba, el update esperaba, y al soltarse casaba igual — y
+    // `pausado → en-implementacion` es un par LEGAL cuya única precondición, «G6 aprobado»,
+    // la cumple la propia sentencia en vuelo. La pausa se borraba sin que nadie la
+    // deshiciera. Ahora el estado va en el `where` —así el UPDATE reevalúa DESPUÉS del
+    // candado, que es lo único que ve la pausa ajena— y el post-chequeo de lo afectado
+    // convierte el cero en el rechazo de la aprobación entera.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'activo'
+      where id = ${actVieja.proyectoId}`);
+    let avisarPausado = () => {};
+    const pausado = new Promise<void>((resolve) => {
+      avisarPausado = resolve;
+    });
+    const pausando = sqlAdmin().begin(async (tx) => {
+      await tx`update proyecto set estado = 'pausado' where id = ${actVieja.proyectoId}`;
+      avisarPausado();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    });
+    await pausado;
+    await expect(aprobarGateNumero(6, actVieja.proyectoId)).rejects.toThrow(
+      /con el proyecto parado/,
+    );
+    await pausando;
+    // La pausa sigue puesta y el gate sigue pendiente: nadie deshizo lo que el otro decidió.
+    const [trasCarrera] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where id = ${actVieja.proyectoId}`);
+    expect(trasCarrera!.estado).toBe('pausado');
+    const [g6TrasCarrera] = await conUsuario(leadId, (tx) => tx`select estado
+      from gate_instancia where proyecto_id = ${actVieja.proyectoId} and numero = 6`);
+    expect(g6TrasCarrera!.estado).toBe('pendiente');
 
     await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'activo'
       where id = ${actVieja.proyectoId}`);

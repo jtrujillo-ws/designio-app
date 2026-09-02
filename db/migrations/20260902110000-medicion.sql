@@ -241,9 +241,13 @@ create index resultado_criterio_review_idx on resultado_criterio (workspace_id, 
 -- verdad; lo único que se perdona es el MOMENTO.
 --
 -- Y no es un agujero permanente, por dos razones independientes:
---  1. La columna se escribe UNA vez, aquí. No entra en ningún grant (`gate_instancia` solo
---     concede update de estado/aprobado_por/aprobado_en) y ningún guard la toca, así que
---     el conjunto queda congelado en el instante del despliegue y solo puede encoger.
+--  1. La columna se escribe UNA vez, aquí. Ningún guard la toca y no está en el grant de
+--     UPDATE, que sí es por columna (`gate_instancia` solo concede estado/aprobado_por/
+--     aprobado_en). Pero el `grant insert` es de TABLA y un grant de tabla cubre también
+--     las columnas añadidas después, así que la fila NUEVA sí podía nacer con el perdón
+--     puesto — no había que actualizar nada, bastaba insertar. Lo cierra `gate_insert`, más
+--     abajo, exigiendo `aprobado_sin_registry = false` al nacer; con eso el conjunto sí
+--     queda congelado en el instante del despliegue y solo puede encoger.
 --  2. Aunque se pudiera escribir, el estado que habilita —«G6 aprobado con su registry en
 --     borrador»— es inalcanzable para todo proyecto posterior: aprobar G6 exige un registry
 --     FIRMADO, el registry es 1:1 con el reto y la firma es de ida. Así que la rama solo
@@ -267,8 +271,10 @@ update gate_instancia set aprobado_sin_registry = true
 -- por el bloque de arriba—, declaran la ventana que llevan corriendo, y desde ahí el
 -- camino es el normal: snapshots, review y cierre con veredicto de verdad.
 --
--- Misma disciplina que la marca del gate: se escribe UNA vez, aquí; no entra en el grant
--- del rol de aplicación (`reto` solo concede update de `estado`) y ningún guard la toca.
+-- Misma disciplina que la marca del gate, y la misma advertencia: se escribe UNA vez, aquí;
+-- ningún guard la toca y no está en el grant de UPDATE (`reto` solo concede `estado`), pero
+-- el `grant insert` es de tabla y cubre las columnas nuevas, así que la puerta que hay que
+-- cerrar es la de INSERT — lo hace `reto_insert`, más abajo, exigiendo que nazca en false.
 -- Y el estado que habilita —«reto en medición sin registry»— es inalcanzable para todo
 -- reto posterior, porque abrir la medición exige el registry FIRMADO.
 alter table reto add column medicion_sin_registry boolean not null default false;
@@ -290,8 +296,15 @@ update reto set medicion_sin_registry = true where estado = 'en-medicion';
 -- snapshots legítimos de esa misma tarde se quedaban sin sitio. El contrato firmado los
 -- admitía; el sistema ya no.
 --
--- Sin ventana declarada tampoco está cerrada: no hay nada que dar por terminado, y esa es
--- la rama que impide abrir el review sobre un registry al que le falta la ventana.
+-- Sin ventana declarada tampoco está cerrada: no hay nada que dar por terminado. Esa rama
+-- impide abrir el review sobre un registry al que le falta la ventana, y conviene ser
+-- exacto sobre lo que eso significa, porque «impedir» aquí quiere decir «PARA SIEMPRE»:
+-- devuelve true a perpetuidad, así que un registry FIRMADO sin `ventana_dias` no podría
+-- abrir su post mortem nunca, ni cerrar su reto, ni cerrar su proyecto. Este comentario
+-- daba por hecho que la firma hacía imposible ese estado; no lo hacía —su lista de
+-- completitud enumeraba columnas de `entrada_kpi` y nunca cruzaba al criterio— y ahora sí:
+-- `registry_firmar_guard` exige `c.ventana_dias is not null` antes de sellar. La red de
+-- seguridad de un estado irrecuperable tiene que ser una regla, no un supuesto.
 --
 -- STABLE y no IMMUTABLE porque depende de `current_date`. No lee ninguna tabla, así que
 -- —como `es_rol_cliente`— no puede volverse oráculo y no necesita el tratamiento
@@ -773,6 +786,70 @@ begin
   return new;
 end $$;
 
+-- ── Una máquina de estados que solo vive en el UPDATE no es una máquina de estados ──
+-- El guard de transición de arriba es `before update of estado`, así que en un INSERT no
+-- se dispara. Y `proyecto_insert` comprobaba el rol, la autoría y que el reto estuviera
+-- activo — nunca el `estado` de la fila que nace. Con `grant insert on proyecto` a nivel de
+-- tabla, el rol de aplicación escribe esa columna: un `insert … values (…, 'en-medicion')`
+-- daba un proyecto midiendo sin G7 y sin registry —las dos condiciones por las que el
+-- guard levanta en el camino UPDATE— y uno con 'cerrado' nacía inmutable, saltándose la
+-- máquina entera por la puerta que nadie miraba.
+--
+-- Hasta este slice apenas importaba porque `proyecto` no tenía grant de UPDATE y el estado
+-- no se movía; en cuanto el estado empieza a significar algo, la puerta de entrada tiene
+-- que decir por dónde se entra. Todas sus hermanas ya lo hacían —`reto_insert` fija
+-- 'candidato', `gate_insert` 'pendiente' con su aprobación nula, `registry_insert`
+-- 'borrador' con la firma nula, `review_insert` 'borrador' sin veredicto—: `proyecto_insert`
+-- era la única que no, y una fila que nace en el estado que le apetece hace de la tabla de
+-- pares legales una recomendación.
+drop policy proyecto_insert on proyecto;
+create policy proyecto_insert on proyecto
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
+    and creado_por = app_user_id()
+    -- Se nace ACTIVO y se avanza por transiciones, que es lo que las deja auditables: cada
+    -- par legal deja su `ProyectoTransicionado` y ningún estado se alcanza sin pasar por su
+    -- precondición.
+    and estado = 'activo'
+    -- Solo bajo un reto ACTIVO: ni proyectos que esquivan la activación (candidato)
+    -- ni trabajo nuevo colgado de un reto cerrado/archivado. activarReto pasa porque
+    -- actualiza el reto a activo en una sentencia anterior de la misma transacción.
+    and exists (select 1 from reto r
+      where r.id = proyecto.reto_id and r.workspace_id = proyecto.workspace_id
+        and r.estado = 'activo')
+  );
+
+-- ── Y las dos columnas del perdón histórico se cierran en la PUERTA, no en el grant ──
+-- El preámbulo de esta migración da dos razones independientes para que esas marcas no
+-- sean una puerta trasera permanente, y la primera —«no entran en ningún grant, así que el
+-- conjunto queda congelado en el instante del despliegue y solo puede encoger»— era falsa
+-- en la mitad que importa: los `grant insert` de `reto` y `gate_instancia` son de TABLA, y
+-- un grant de tabla cubre también las columnas añadidas después. Ninguna de las dos se
+-- podía UPDATE-ar —ahí sí el grant es por columna— pero las dos se podían escribir en el
+-- INSERT, o sea fabricar una fila nueva con el perdón puesto.
+--
+-- Se cierra donde estaba el agujero: la política de inserción exige que nazcan en false. El
+-- conjunto perdonado vuelve a ser el que escribió la migración, y ahora de verdad solo
+-- puede encoger. (La segunda razón del preámbulo sigue en pie por su cuenta: los estados
+-- que estas marcas habilitan son inalcanzables para cualquier fila posterior.)
+drop policy reto_insert on reto;
+create policy reto_insert on reto
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and creado_por = app_user_id()
+    and estado = 'candidato'
+    and medicion_sin_registry = false
+  );
+drop policy gate_insert on gate_instancia;
+create policy gate_insert on gate_instancia
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
+    and estado = 'pendiente'
+    and aprobado_por is null
+    and aprobado_en is null
+    and aprobado_sin_registry = false
+  );
+
 -- ── El par «reto midiendo ⇔ proyecto midiendo» es INDIVISIBLE, y lo dice la TABLA ──
 -- §5.2 mueve los dos objetos a la vez —«el proyecto y el reto pasan a en medición»— y el
 -- guard del proyecto ya exigía su mitad: no entra en medición si su reto no está midiendo.
@@ -884,13 +961,33 @@ begin
     -- Entrada completa = lo que RF-07.1 exige y la medición usa: definición, fuente,
     -- dueño del dato, línea base con valor y fecha, y ventana con post-mortem previsto.
     -- btrim en los textos: whitespace no es contenido, tampoco por SQL directo.
+    --
+    -- La lista CRUZA al criterio, y esa es la mitad que faltaba. La ventana tiene dos
+    -- piezas y viven en tablas distintas a propósito —el inicio en la entrada, el largo en
+    -- `criterio_exito.ventana_dias`, que el registry NO copia porque dos copias son dos
+    -- verdades—, así que una lista que solo enumera columnas de `entrada_kpi` comprueba
+    -- media ventana. G0 exige `ventana_dias`, pero G0 corre ANTES: reabrir la etapa 0
+    -- —el camino de reparación que SPEC-04.9 ofrece— permite devolverlo a nulo sin que el
+    -- gate vuelva a pendiente, y desde ahí la firma pasaba y CONGELABA un contrato
+    -- imposible de cumplir.
+    --
+    -- Y lo que quedaba después era el encierro entero, no una molestia: sin ventana,
+    -- `ventana_de_medicion_abierta` devuelve true para siempre, así que el outcome review
+    -- no se abre nunca; `snapshot_insert` exige `ventana_dias is not null`, así que la
+    -- serie tampoco entra; `criterio_update` está cerrado por el registry firmado, así que
+    -- el criterio no se arregla; y sin review no hay veredicto, sin veredicto el reto no
+    -- cierra, y sin cierre el proyecto tampoco. Es exactamente el encierro que el preámbulo
+    -- de esta migración describe para los retos heredados —«ni miden aquí, ni cierran, ni
+    -- se archivan»— reintroducido para filas NUEVAS, y esta vez sin columna de perdón que
+    -- las saque.
     select string_agg(e.nombre, ', ' order by e.nombre) into faltan
     from entrada_kpi e
+    join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
     where e.registry_id = new.id and e.workspace_id = new.workspace_id
       and (btrim(e.nombre) = '' or btrim(e.definicion) = '' or btrim(e.fuente) = ''
            or e.propietario_miembro_id is null or e.linea_base_valor is null
            or e.linea_base_fecha is null or e.ventana_inicio is null
-           or e.fecha_post_mortem is null);
+           or e.fecha_post_mortem is null or c.ventana_dias is null);
     if faltan is not null then
       raise exception 'no se puede firmar: entradas incompletas (SYS-22): %', faltan;
     end if;
@@ -917,10 +1014,19 @@ begin
     -- después de que la medición empiece. Con la ventana firmada, los snapshots quedan
     -- acotados a ella mientras la proyección y el post-mortem los comparan contra una
     -- «línea base» cronológicamente posterior: una historia base→resultado al revés.
+    --
+    -- ESCRITAS EN POSITIVO, y el `coalesce(…, false)` no es defensa de más: es el arreglo
+    -- de un patrón. Escritas como «rechaza si la incoherencia es cierta», un NULL en
+    -- cualquiera de los dos lados vuelve el predicado NULL, la fila no agrega, `faltan`
+    -- queda NULL y la regla NO SALTA — se evapora en silencio justo cuando falta un dato,
+    -- que es cuando más falta hace. Así, cada regla enuncia el hecho que TIENE que ser
+    -- cierto y rechaza cuando no se puede demostrar: en ausencia de prueba, no se firma.
+    -- Con la comprobación de completitud de arriba estos nulos ya no llegan aquí; esto es
+    -- lo que hace que sigan sin llegar si alguien toca aquella lista.
     select string_agg(e.nombre, ', ' order by e.nombre) into faltan
     from entrada_kpi e
     where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and e.linea_base_fecha > e.ventana_inicio;
+      and not coalesce(e.linea_base_fecha <= e.ventana_inicio, false);
     if faltan is not null then
       raise exception 'no se puede firmar: la línea base es posterior al inicio de la ventana: %', faltan;
     end if;
@@ -940,8 +1046,9 @@ begin
     from entrada_kpi e
     join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
     where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and c.ventana_dias < case e.frecuencia
-        when 'semanal' then 7 when 'mensual' then 28 when 'trimestral' then 89 else 0 end;
+      and not coalesce(c.ventana_dias >= case e.frecuencia
+        when 'semanal' then 7 when 'mensual' then 28 when 'trimestral' then 89 else 0 end,
+        false);
     if faltan is not null then
       raise exception 'no se puede firmar: la cadencia comprometida no cabe en la ventana del criterio: %', faltan;
     end if;
@@ -955,7 +1062,7 @@ begin
     from entrada_kpi e
     join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
     where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and e.fecha_post_mortem <= e.ventana_inicio + c.ventana_dias;
+      and not coalesce(e.fecha_post_mortem > e.ventana_inicio + c.ventana_dias, false);
     if faltan is not null then
       raise exception 'no se puede firmar: el post-mortem se prevé después del cierre de la ventana: %', faltan;
     end if;
@@ -1218,14 +1325,28 @@ end $$;
 -- deja escribir al lead: el efecto es de la BASE, no del rol que dispara el gate.
 --
 -- Y con el proyecto PAUSADO se rechaza la aprobación entera, que es la tercera cosa que
--- este bloque decide. Un `where estado = 'activo'` habría dejado la aprobación pasar
--- afectando cero filas: gate aprobado, proyecto quieto, y al retomar volvería a 'activo'
--- para saltar de ahí a medición saltándose implementación — el estado muerto resucitado y
--- vuelto a matar por otra puerta. Entre las tres salidas posibles, rechazar es la única que
--- trata el gate y el proyecto como UN solo hecho: aprobar el gate que autoriza implementar
--- mientras el proyecto está parado es una contradicción antes que un problema de mecánica.
--- Es además lo que este mismo slice ya hace en el otro extremo del método, donde el cierre
--- del post mortem se niega a arrastrar un proyecto que alguien pausó.
+-- este bloque decide. Aprobar el gate que autoriza implementar mientras el proyecto está
+-- parado es una contradicción antes que un problema de mecánica, y es además lo que este
+-- mismo slice ya hace en el otro extremo del método, donde el cierre del post mortem se
+-- niega a arrastrar un proyecto que alguien pausó.
+--
+-- CÓMO se rechaza es lo que importa, y la primera versión lo tenía al revés. Leía el estado
+-- con un `if not exists (… p.estado = 'activo')` y actualizaba después SIN predicado de
+-- estado en el `where`: decidir sobre una instantánea y ejecutar sobre un candado. Con dos
+-- sesiones, quien pausa el proyecto y retiene la fila hace que esta lectura vea el estado
+-- viejo y no levante; el `update` espera, y al soltarse re-lee bajo READ COMMITTED y casa
+-- igual porque no pedía ningún estado. Resultado: `pausado → en-implementacion`, un par que
+-- además es legal y cuya única precondición —G6 aprobado— la cumple la propia sentencia en
+-- vuelo. La pausa se borraba sin que nadie la deshiciera.
+--
+-- El descarte que había escrito aquí —«un `where estado = 'activo'` dejaría la aprobación
+-- pasar afectando cero filas»— era cierto de esa forma A SECAS, y por eso la conclusión
+-- estaba mal: la forma correcta es la que este slice ya usa en `abrirMedicion` y en el
+-- guard del cierre, `where` con el estado MÁS post-chequeo de lo afectado. El `where` hace
+-- que el UPDATE reevalúe el predicado DESPUÉS del candado —que es lo único que ve la pausa
+-- ajena— y el post-chequeo convierte el cero en el rechazo de la aprobación entera. Se
+-- comprueba una sola vez, donde se escribe, en lugar de comprobar en un sitio y escribir en
+-- otro.
 create function proyecto_a_implementacion_tras_g6_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -1233,13 +1354,12 @@ begin
     return new;
   end if;
   if new.numero = 6 and new.estado = 'aprobado' and old.estado = 'pendiente' then
-    if not exists (select 1 from proyecto p
-      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
-        and p.estado = 'activo') then
+    update proyecto set estado = 'en-implementacion'
+      where id = new.proyecto_id and workspace_id = new.workspace_id
+        and estado = 'activo';
+    if not found then
       raise exception 'no se puede aprobar G6 con el proyecto parado: retómalo antes, porque aprobar el plan lo pone en implementación (§7)';
     end if;
-    update proyecto set estado = 'en-implementacion'
-      where id = new.proyecto_id and workspace_id = new.workspace_id;
   end if;
   return new;
 end $$;

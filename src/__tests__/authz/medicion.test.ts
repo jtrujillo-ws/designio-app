@@ -23,6 +23,7 @@ import {
   registrarSnapshot,
   seguimientoDeImpacto,
 } from '@/lib/medicion/medicion.servicio';
+import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
 import { describeAuthz } from './helpers';
 
 /**
@@ -171,6 +172,8 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       await admin`delete from gate_instancia where workspace_id = ${ws}`;
       await admin`delete from etapa_instancia where workspace_id = ${ws}`;
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
+      await admin`delete from reapertura_insight where workspace_id = ${ws}`;
+      await admin`delete from reapertura_etapa where workspace_id = ${ws}`;
       await admin`delete from proyecto where workspace_id = ${ws}`;
       await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
       await admin`delete from reto where workspace_id = ${ws}`;
@@ -433,6 +436,46 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(revertido.count).toBe(0);
 
     await aprobarGateNumero(6);
+  });
+
+  it('firmado el registry, los criterios ya no se mueven ni reabriendo la etapa 0', async () => {
+    // La excepción de la reapertura existe para corregir el compromiso ANTES de acordar
+    // cómo se mide. Con el registry firmado, `objetivo` y `ventana_dias` son el contrato
+    // que el post mortem va a leer — y el registry no copia la ventana a propósito.
+    await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      etapaNumero: 0,
+      motivo: 'Intento de mover el objetivo a toro pasado',
+      insightIds: [],
+    });
+
+    await expect(
+      agregarCriterio(leadId, {
+        workspaceId: ws,
+        retoId,
+        kpi: 'Criterio colado tras la firma',
+        definicion: 'x',
+        lineaBaseValor: '1',
+        lineaBaseFecha: '2026-07-15',
+        lineaBasePlan: '',
+        objetivo: '2',
+        ventanaDias: 30,
+        fechaPostMortem: null,
+      }),
+    ).rejects.toThrow(/registry del reto está firmado/);
+
+    // Ni por SQL directo: la política mira el registry además de la etapa. Un UPDATE
+    // que el USING filtra no lanza — simplemente no toca ninguna fila, que es la forma
+    // silenciosa de decir que no. Se comprueba por el valor, no por la excepción.
+    const [c] = await conUsuario(leadId, (tx) => tx`select id, objetivo from criterio_exito
+      where reto_id = ${retoId} order by creado_en limit 1`);
+    const tocadas = await conUsuario(leadId, (tx) => tx`update criterio_exito
+      set objetivo = '5%' where id = ${c!.id as string}`);
+    expect(tocadas.count).toBe(0);
+    const [tras] = await conUsuario(leadId, (tx) => tx`select objetivo from criterio_exito
+      where id = ${c!.id as string}`);
+    expect(tras!.objetivo).toBe(c!.objetivo);
   });
 
   it('abrir la medición exige registry firmado y G6 aprobado, y mueve reto Y proyecto', async () => {
@@ -761,6 +804,21 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         sinDatosMotivo: 'reescribir la historia',
       }),
     ).rejects.toThrow(ErrorMedicion);
+  });
+
+  it('un proyecto CERRADO no se reabre', async () => {
+    // El proyecto quedó cerrado al completar el outcome review: reabrir una etapa lo
+    // devolvería a 'en-curso' y marcaría en revisión decisiones que ya son historia
+    // (SYS-08). El trabajo posterior es un reto nuevo.
+    await expect(
+      reabrirEtapa(leadId, {
+        workspaceId: ws,
+        proyectoId,
+        etapaNumero: 3,
+        motivo: 'Reabrir lo ya cerrado',
+        insightIds: [],
+      }),
+    ).rejects.toThrow();
   });
 
   it('el ciclo del proyecto es de sentido único y ningún estado inventado entra', async () => {

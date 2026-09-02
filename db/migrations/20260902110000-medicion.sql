@@ -644,6 +644,103 @@ begin
   return new;
 end $$;
 
+-- ── Dos puertas que la firma del registry y el cierre del proyecto tienen que cerrar ──
+-- Ambas nacen de la convivencia entre la reapertura de etapa (SPEC-04.9) y lo que este
+-- slice añade: un contrato de medición firmado y un proyecto que se cierra.
+
+-- 1) Un proyecto CERRADO no se reabre. `reapertura_insert` solo miraba el rol, así que
+-- un lead podía devolver a 'en-curso' una etapa de un proyecto ya cerrado con veredicto
+-- y marcar en revisión decisiones que son historia (SYS-08: cerrado es inmutable, el
+-- trabajo posterior es un reto nuevo).
+drop policy reapertura_insert on reapertura_etapa;
+create policy reapertura_insert on reapertura_etapa
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
+    and reabierto_por = app_user_id()
+    and exists (select 1 from proyecto p
+      where p.id = reapertura_etapa.proyecto_id
+        and p.workspace_id = reapertura_etapa.workspace_id
+        and p.estado <> 'cerrado')
+  );
+
+-- 2) Con el registry FIRMADO, los criterios quedan congelados aunque se reabra la etapa 0.
+-- La excepción de la reapertura existe para corregir el compromiso ANTES de acordar cómo
+-- se mide; una vez firmado, `objetivo` y `ventana_dias` son el contrato que el post
+-- mortem va a leer, y el registry no copia la ventana a propósito. Moverlos después de
+-- firmar cambiaría la promesa sin que nadie lo viera. Si hay que cambiarlos, el camino
+-- es un reto nuevo, no una reapertura.
+drop policy criterio_insert on criterio_exito;
+drop policy criterio_update on criterio_exito;
+
+create policy criterio_insert on criterio_exito
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and creado_por = app_user_id()
+    and not exists (select 1 from metric_registry r
+      where r.reto_id = criterio_exito.reto_id and r.workspace_id = criterio_exito.workspace_id
+        and r.estado = 'firmado')
+    and not exists (select 1 from gate_instancia g
+      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+      join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+        and e.numero = 0
+      where p.reto_id = criterio_exito.reto_id
+        and p.workspace_id = criterio_exito.workspace_id
+        and g.numero = 0 and g.estado = 'aprobado'
+        and e.estado <> 'en-curso')
+  );
+create policy criterio_update on criterio_exito
+  for update
+  using (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and not exists (select 1 from metric_registry r
+      where r.reto_id = criterio_exito.reto_id and r.workspace_id = criterio_exito.workspace_id
+        and r.estado = 'firmado')
+    and not exists (select 1 from gate_instancia g
+      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+      join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+        and e.numero = 0
+      where p.reto_id = criterio_exito.reto_id
+        and p.workspace_id = criterio_exito.workspace_id
+        and g.numero = 0 and g.estado = 'aprobado'
+        and e.estado <> 'en-curso')
+  )
+  with check (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'));
+
+-- El guard tiene la misma ceguera y hay que reponerle la condición nueva: habla ANTES
+-- que el WITH CHECK, así que sin esto el mensaje sería el de siempre y la firma no
+-- aparecería como motivo.
+create or replace function criterio_g0_pendiente_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  perform 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id and g.numero = 0
+    order by g.id for update of g;
+  if exists (select 1 from metric_registry r
+    where r.reto_id = new.reto_id and r.workspace_id = new.workspace_id
+      and r.estado = 'firmado') then
+    raise exception 'el registry del reto está firmado: los criterios de medición son el contrato acordado (SYS-22)';
+  end if;
+  if exists (select 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+      and e.numero = 0
+    where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id
+      and g.numero = 0 and g.estado = 'aprobado'
+      and e.estado <> 'en-curso') then
+    raise exception 'el G0 del reto está aprobado: criterios congelados';
+  end if;
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id,
+      case tg_op when 'INSERT' then 'CriterioDefinido' else 'CriterioEditado' end,
+      jsonb_build_object('criterioId', new.id, 'retoId', new.reto_id, 'kpi', new.kpi),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  return new;
+end $$;
+
 -- ── Grants mínimos ──
 grant select, insert on metric_registry, entrada_kpi, snapshot to designio_app;
 grant select, insert on outcome_review, resultado_criterio to designio_app;

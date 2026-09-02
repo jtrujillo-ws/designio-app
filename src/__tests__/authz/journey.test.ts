@@ -5,7 +5,7 @@ import {
   agregarArista,
   agregarNodo,
   borrarNodo,
-  congelarJourney,
+  congelarSnapshot,
   crearJourney,
   editarNodo,
   enlazarEvidenciaANodo,
@@ -17,11 +17,12 @@ import { describeAuthz } from './helpers';
 
 /**
  * SPEC-05 — el grafo del journey bajo RLS: los miembros lo leen (es el lenguaje común
- * con el cliente), los curadores lo escriben, y SOLO mientras esté en borrador. Los
- * guards cierran lo que las FKs compuestas no ven: que una arista o una fase crucen de
- * journey dentro del mismo workspace.
+ * con el cliente) y los curadores lo escriben, siempre — el grafo de trabajo no se
+ * cierra al congelar (RF-05.8); lo inmutable es el snapshot. Los guards cierran lo que
+ * las FKs compuestas no ven: que una arista o una fase crucen de journey dentro del
+ * mismo workspace, y que los extremos de una arista no encajen con su tipo.
  */
-describeAuthz('journey: grafo tipado, congelado y aislamiento', () => {
+describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
   const marca = `jou-${crypto.randomUUID().slice(0, 8)}`;
   let ws = '';
   let leadId = '';
@@ -66,7 +67,8 @@ describeAuthz('journey: grafo tipado, congelado y aislamiento', () => {
 
   afterAll(async () => {
     const admin = sqlAdmin();
-    await admin`delete from evento_dominio where workspace_id = ${ws}`;
+    // Los eventos van AL FINAL: los triggers de auditoría generan más mientras se
+    // desmonta el grafo, así que borrarlos primero dejaría filas nuevas colgando.
     await admin`delete from journey_nodo_evidencia where workspace_id = ${ws}`;
     await admin`delete from journey_snapshot where workspace_id = ${ws}`;
     await admin`delete from journey_arista where workspace_id = ${ws}`;
@@ -76,6 +78,7 @@ describeAuthz('journey: grafo tipado, congelado y aislamiento', () => {
     await admin`delete from evidencia where workspace_id = ${ws}`;
     await admin`delete from fuente where workspace_id = ${ws}`;
     await admin`delete from servicio where workspace_id = ${ws}`;
+    await admin`delete from evento_dominio where workspace_id = ${ws}`;
     await admin`delete from miembro where workspace_id = ${ws}`;
     await admin`delete from workspace where id = ${ws}`;
     await admin`delete from usuario where email like ${marca + '-%@test.demo'}`;
@@ -221,61 +224,152 @@ describeAuthz('journey: grafo tipado, congelado y aislamiento', () => {
     expect(j!.aristas.some((a) => a.destinoId === suelto.nodoId)).toBe(false);
   });
 
-  it('congelar guarda el grafo entero y cierra la edición para siempre', async () => {
-    await enlazarEvidenciaANodo(leadId, ws, pasoId, evidenciaId);
+  it('el guard rechaza aristas cuyos extremos no encajan con su tipo', async () => {
+    const sistema = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'sistema',
+      etiqueta: 'Core bancario',
+      detalle: '',
+      faseId: null,
+      responsable: 'Tecnología',
+    });
+
+    // Una transición es secuencia: un sistema no «sigue» a un paso.
+    await expect(
+      agregarArista(leadId, {
+        workspaceId: ws,
+        journeyId,
+        origenId: sistema.nodoId,
+        destinoId: pasoId,
+        tipo: 'transicion',
+        condicion: '',
+      }),
+    ).rejects.toThrow(/transición va entre pasos o decisiones/);
+
+    // 'soporta' sí: el sistema sostiene al paso. Y la dirección importa.
     await agregarArista(leadId, {
       workspaceId: ws,
       journeyId,
-      origenId: faseId,
+      origenId: sistema.nodoId,
       destinoId: pasoId,
-      tipo: 'pertenece-a',
+      tipo: 'soporta',
       condicion: '',
     });
+    await expect(
+      agregarArista(leadId, {
+        workspaceId: ws,
+        journeyId,
+        origenId: pasoId,
+        destinoId: sistema.nodoId,
+        tipo: 'soporta',
+        condicion: '',
+      }),
+    ).rejects.toThrow(/soporta va de un sistema/);
 
-    await expect(congelarJourney(stakeId, ws, journeyId, 'sin permiso')).rejects.toThrow(
+    // Y una fase no participa en ninguna arista: agrupa por fase_id.
+    await expect(
+      agregarArista(leadId, {
+        workspaceId: ws,
+        journeyId,
+        origenId: pasoId,
+        destinoId: faseId,
+        tipo: 'dependencia',
+        condicion: '',
+      }),
+    ).rejects.toThrow(/una fase agrupa por fase_id/);
+  });
+
+  it('toda mutación del grafo deja rastro en la auditoría, también por SQL directo', async () => {
+    const admin = sqlAdmin();
+    const antes = await admin`select count(*)::int as n from evento_dominio
+      where workspace_id = ${ws} and tipo like 'Journey%'`;
+
+    const efimero = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'touchpoint',
+      etiqueta: 'SMS de confirmación',
+      detalle: '',
+      faseId: null,
+      responsable: '',
+    });
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: efimero.nodoId,
+      etiqueta: 'SMS de aviso',
+      detalle: '',
+      faseId: null,
+      responsable: '',
+      orden: 0,
+    });
+    await borrarNodo(leadId, ws, efimero.nodoId);
+
+    const tipos = await admin`select tipo from evento_dominio
+      where workspace_id = ${ws} and tipo like 'Journey%'
+      order by creado_en desc limit 3`;
+    expect(tipos.map((t) => t.tipo as string).sort()).toEqual(
+      ['JourneyNodoAgregado', 'JourneyNodoBorrado', 'JourneyNodoEditado'].sort(),
+    );
+    expect(antes[0]!.n as number).toBeLessThan(
+      (await admin`select count(*)::int as n from evento_dominio
+        where workspace_id = ${ws} and tipo like 'Journey%'`)[0]!.n as number,
+    );
+  });
+
+  it('congelar guarda el grafo entero CON su evidencia y deja el journey editable', async () => {
+    await enlazarEvidenciaANodo(leadId, ws, pasoId, evidenciaId);
+
+    await expect(congelarSnapshot(stakeId, ws, journeyId, 'sin permiso')).rejects.toThrow(
       ErrorJourney,
     );
-    await congelarJourney(leadId, ws, journeyId, 'aprobado en G4');
+    await congelarSnapshot(leadId, ws, journeyId, 'aprobado en G4');
 
     const j = await journeyCompleto(leadId, ws, journeyId);
-    expect(j!.estado).toBe('congelado');
     expect(j!.snapshots).toHaveLength(1);
     expect(j!.snapshots[0]!.motivo).toBe('aprobado en G4');
 
-    // El snapshot guarda el grafo, no una promesa de grafo.
+    // El snapshot guarda el grafo, no una promesa de grafo — y con la cadena de
+    // evidencia dentro, que es lo que hace auditable lo aprobado.
     const [snap] = await conUsuario(leadId, (tx) => tx`
       select grafo from journey_snapshot where journey_id = ${journeyId}`);
-    const grafo = snap!.grafo as { nodos: unknown[]; aristas: unknown[] };
+    const grafo = snap!.grafo as {
+      nodos: unknown[];
+      aristas: unknown[];
+      evidencias: { nodoId: string; evidenciaId: string }[];
+    };
     expect(grafo.nodos.length).toBe(j!.nodos.length);
     expect(grafo.aristas.length).toBe(j!.aristas.length);
+    expect(grafo.evidencias).toEqual([
+      expect.objectContaining({ nodoId: pasoId, evidenciaId }),
+    ]);
 
-    // Y a partir de aquí no se toca nada: ni alta, ni edición, ni doble congelado.
-    await expect(
-      agregarNodo(leadId, {
-        workspaceId: ws,
-        journeyId,
-        tipo: 'paso',
-        etiqueta: 'Tardío',
-        detalle: '',
-        faseId: null,
-        responsable: '',
-      }),
-    ).rejects.toThrow(ErrorJourney);
-    await expect(
-      editarNodo(leadId, {
-        workspaceId: ws,
-        nodoId: pasoId,
-        etiqueta: 'Renombrado a destiempo',
-        detalle: '',
-        faseId: null,
-        responsable: '',
-        orden: 0,
-      }),
-    ).rejects.toThrow(ErrorJourney);
-    await expect(congelarJourney(leadId, ws, journeyId, 'otra vez')).rejects.toThrow(ErrorJourney);
-    await expect(enlazarEvidenciaANodo(leadId, ws, pasoId, evidenciaId)).rejects.toThrow(
-      ErrorJourney,
-    );
+    // RF-05.8: el grafo de trabajo SIGUE editable para el ciclo siguiente.
+    const siguiente = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'paso',
+      etiqueta: 'Paso del ciclo siguiente',
+      detalle: '',
+      faseId,
+      responsable: '',
+    });
+    expect(siguiente.nodoId).toBeTruthy();
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: pasoId,
+      etiqueta: 'Abre la app (revisado)',
+      detalle: '',
+      faseId,
+      responsable: '',
+      orden: 0,
+    });
+
+    // Y se puede congelar otra vez: cada snapshot es una foto, no un candado.
+    await congelarSnapshot(leadId, ws, journeyId, 'DV-2');
+    const j2 = await journeyCompleto(leadId, ws, journeyId);
+    expect(j2!.snapshots).toHaveLength(2);
+    expect(j2!.nodos.find((n) => n.id === pasoId)!.etiqueta).toBe('Abre la app (revisado)');
   });
 
   it('quien no es miembro no ve el grafo; la cuenta desactivada tampoco lee', async () => {

@@ -12,10 +12,12 @@ import type {
 
 /**
  * Journeys como grafo tipado (SPEC-05). Capa 1: RLS — miembros leen (el journey es el
- * lenguaje común con el cliente), curadores escriben y SOLO mientras el journey esté en
- * borrador; los guards de la base impiden que una arista o una fase crucen de journey,
- * cosa que las FKs compuestas no ven (garantizan el workspace, no el journey).
+ * lenguaje común con el cliente) y curadores escriben; los guards de la base impiden que
+ * una arista o una fase crucen de journey (las FKs compuestas garantizan el workspace,
+ * no el journey) y que los extremos de una arista no encajen con su tipo.
  * Capa 2: estado de cuenta en toda operación y traducción de guards al contrato.
+ *
+ * El grafo de trabajo NO se cierra al congelar (RF-05.8): lo inmutable es el snapshot.
  *
  * El grafo se lee ENTERO en una sentencia: las vistas (Mermaid, tabla, carriles) y la
  * validación son funciones puras sobre esa proyección, así que todas ven exactamente el
@@ -30,7 +32,7 @@ function comoErrorDeDominio(e: unknown): never {
   if (err.code === 'P0001' && err.message) throw new ErrorJourney(err.message);
   if (err.code === '23503') throw new ErrorJourney('Alguna referencia no existe en este workspace');
   if (err.code === '23505') throw new ErrorJourney('Ese elemento ya existe en el journey');
-  if (err.code === '42501') throw new ErrorJourney('El journey está congelado o no puedes editarlo');
+  if (err.code === '42501') throw new ErrorJourney('No puedes editar el grafo de este workspace');
   throw e;
 }
 
@@ -98,7 +100,7 @@ export async function agregarNodo(
     } catch (e) {
       comoErrorDeDominio(e);
     }
-    if (!fila) throw new ErrorJourney('El journey no existe, está congelado o no puedes editarlo');
+    if (!fila) throw new ErrorJourney('El journey no existe o no puedes editarlo');
     return { nodoId: fila.id as string };
   });
 }
@@ -118,7 +120,7 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
       comoErrorDeDominio(e);
     }
     if (filas!.count === 0) {
-      throw new ErrorJourney('El nodo no existe, su journey está congelado o no puedes editarlo');
+      throw new ErrorJourney('El nodo no existe o no puedes editarlo');
     }
   });
 }
@@ -144,7 +146,7 @@ export async function borrarNodo(
     const filas = await tx`delete from journey_nodo
       where id = ${nodoId} and workspace_id = ${workspaceId}`;
     if (filas.count === 0) {
-      throw new ErrorJourney('El nodo no existe, su journey está congelado o no puedes borrarlo');
+      throw new ErrorJourney('El nodo no existe o no puedes borrarlo');
     }
   });
 }
@@ -166,7 +168,7 @@ export async function agregarArista(
     } catch (e) {
       comoErrorDeDominio(e);
     }
-    if (!fila) throw new ErrorJourney('El journey no existe, está congelado o no puedes editarlo');
+    if (!fila) throw new ErrorJourney('El journey no existe o no puedes editarlo');
     return { aristaId: fila.id as string };
   });
 }
@@ -181,7 +183,7 @@ export async function borrarArista(
     const filas = await tx`delete from journey_arista
       where id = ${aristaId} and workspace_id = ${workspaceId}`;
     if (filas.count === 0) {
-      throw new ErrorJourney('La arista no existe, su journey está congelado o no puedes borrarla');
+      throw new ErrorJourney('La arista no existe o no puedes borrarla');
     }
   });
 }
@@ -210,11 +212,15 @@ export async function enlazarEvidenciaANodo(
 }
 
 /**
- * Congelar (RF-05.8, SYS-05): serializa el grafo completo y cierra el journey a
- * edición. El snapshot y la transición van en la MISMA sentencia — un journey marcado
- * congelado sin su snapshot sería una promesa rota, y al revés un snapshot huérfano.
+ * Congelar un snapshot (RF-05.8, SYS-05): serializa el grafo COMPLETO —nodos, aristas y
+ * los enlaces de evidencia— en un registro inmutable. Sin la evidencia, el snapshot no
+ * podría reconstruir qué sostenía cada paso cuando se aprobó, que es justo lo que se le
+ * pedirá al auditarlo.
+ *
+ * NO cierra el journey. RF-05.8 es explícito: «el grafo de trabajo continúa editable
+ * para el ciclo siguiente». Lo inmutable es el snapshot; el journey es el modelo vivo.
  */
-export async function congelarJourney(
+export async function congelarSnapshot(
   actorId: string,
   workspaceId: string,
   journeyId: string,
@@ -222,7 +228,9 @@ export async function congelarJourney(
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const filas = await tx`
+    let filas;
+    try {
+      filas = await tx`
       with quien as (
         select workspace_role(${actorId}, ${workspaceId}) as rol
       ),
@@ -233,30 +241,41 @@ export async function congelarJourney(
             where n.journey_id = ${journeyId} and n.workspace_id = ${workspaceId}), '[]'::jsonb),
           'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en)
             from journey_arista a
-            where a.journey_id = ${journeyId} and a.workspace_id = ${workspaceId}), '[]'::jsonb)
+            where a.journey_id = ${journeyId} and a.workspace_id = ${workspaceId}), '[]'::jsonb),
+          -- La cadena de evidencia va DENTRO del snapshot: un grafo aprobado que no
+          -- puede decir qué sostenía cada paso no sirve para auditarlo después.
+          'evidencias', coalesce((select jsonb_agg(jsonb_build_object(
+              'nodoId', ne.nodo_id, 'evidenciaId', ne.evidencia_id,
+              'evidenciaTitulo', e.titulo) order by ne.creado_en)
+            from journey_nodo_evidencia ne
+            join journey_nodo n2 on n2.id = ne.nodo_id and n2.workspace_id = ne.workspace_id
+            join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
+            where n2.journey_id = ${journeyId} and ne.workspace_id = ${workspaceId}), '[]'::jsonb)
         ) as contenido
       ),
-      cerrado as (
-        update journey set estado = 'congelado'
-        where id = ${journeyId} and workspace_id = ${workspaceId} and estado = 'borrador'
-        returning id
+      vivo as (
+        select j.id from journey j
+        where j.id = ${journeyId} and j.workspace_id = ${workspaceId}
       ),
       snap as (
         insert into journey_snapshot (workspace_id, journey_id, motivo, grafo, congelado_por)
-        select ${workspaceId}, cerrado.id, ${motivo}, grafo.contenido, ${actorId}
-        from cerrado, grafo
+        select ${workspaceId}, vivo.id, ${motivo}, grafo.contenido, ${actorId}
+        from vivo, grafo
         returning id
       ),
       evento as (
         insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-        select ${workspaceId}, 'JourneyCongelado',
+        select ${workspaceId}, 'JourneySnapshotCongelado',
           jsonb_build_object('journeyId', ${journeyId}::uuid, 'snapshotId', snap.id),
           ${actorId}, quien.rol
         from snap, quien
       )
       select id from snap`;
-    if (filas.length === 0) {
-      throw new ErrorJourney('El journey no existe, ya está congelado o no puedes congelarlo');
+    } catch (e) {
+      comoErrorDeDominio(e);
+    }
+    if (filas!.length === 0) {
+      throw new ErrorJourney('El journey no existe o no puedes congelar su grafo');
     }
   });
 }
@@ -271,7 +290,7 @@ export async function journeyCompleto(
     await exigirCuentaActiva(tx, actorId);
     const [fila] = await tx`
       select j.id, j.servicio_id, s.nombre as servicio_nombre, j.reto_id, j.tipo,
-        j.nombre, j.descripcion, j.estado,
+        j.nombre, j.descripcion,
         coalesce((
           select jsonb_agg(jsonb_build_object(
             'id', n.id, 'tipo', n.tipo, 'etiqueta', n.etiqueta, 'detalle', n.detalle,
@@ -315,7 +334,6 @@ export async function journeyCompleto(
       tipo: fila.tipo as JourneyCompleto['tipo'],
       nombre: fila.nombre as string,
       descripcion: fila.descripcion as string,
-      estado: fila.estado as JourneyCompleto['estado'],
       nodos: fila.nodos as JourneyCompleto['nodos'],
       aristas: fila.aristas as JourneyCompleto['aristas'],
       snapshots: fila.snapshots as JourneyCompleto['snapshots'],
@@ -330,9 +348,11 @@ export async function journeysDelWorkspace(
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     const filas = await tx`
-      select j.id, j.nombre, j.tipo, j.estado, s.nombre as servicio_nombre,
+      select j.id, j.nombre, j.tipo, s.nombre as servicio_nombre,
         (select count(*)::int from journey_nodo n
-          where n.journey_id = j.id and n.workspace_id = j.workspace_id) as nodos
+          where n.journey_id = j.id and n.workspace_id = j.workspace_id) as nodos,
+        (select count(*)::int from journey_snapshot sn
+          where sn.journey_id = j.id and sn.workspace_id = j.workspace_id) as snapshots
       from journey j
       join servicio s on s.id = j.servicio_id and s.workspace_id = j.workspace_id
       where j.workspace_id = ${workspaceId}
@@ -342,9 +362,9 @@ export async function journeysDelWorkspace(
       id: f.id as string,
       nombre: f.nombre as string,
       tipo: f.tipo as ResumenJourney['tipo'],
-      estado: f.estado as ResumenJourney['estado'],
       servicioNombre: f.servicio_nombre as string,
       nodos: f.nodos as number,
+      snapshots: f.snapshots as number,
     }));
   });
 }

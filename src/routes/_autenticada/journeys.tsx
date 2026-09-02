@@ -163,7 +163,11 @@ function PantallaJourneys() {
                       {j.nombre}
                     </span>
                     <Tag>{j.tipo}</Tag>
-                    <Tag mono={false}>{j.estado}</Tag>
+                    {j.snapshots > 0 && (
+                      <Tag mono={false}>
+                        {j.snapshots} {j.snapshots === 1 ? 'snapshot' : 'snapshots'}
+                      </Tag>
+                    )}
                   </div>
                   <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
                     {j.servicioNombre} · {j.nodos} {j.nodos === 1 ? 'elemento' : 'elementos'}

@@ -18,7 +18,11 @@ create table journey (
   tipo text not null check (tipo in ('as-is', 'to-be')),
   nombre text not null check (btrim(nombre) <> ''),
   descripcion text not null default '',
-  estado text not null check (estado in ('borrador', 'congelado')) default 'borrador',
+  -- SIN estado a propósito. RF-05.8 es explícito: al aprobar una design version se
+  -- congela un SNAPSHOT del grafo (inmutable) y «el grafo de trabajo continúa editable
+  -- para el ciclo siguiente». Cerrar el journey al congelar dejaría al equipo sin grafo
+  -- vivo justo cuando empieza el ciclo que el snapshot habilita. Lo inmutable es el
+  -- snapshot; el journey es el modelo que sigue.
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
@@ -64,8 +68,11 @@ create table journey_arista (
   journey_id uuid not null,
   origen_id uuid not null,
   destino_id uuid not null,
+  -- Sin 'pertenece-a': la pertenencia a una fase YA la modela journey_nodo.fase_id, y
+  -- dos representaciones del mismo hecho es la ambigüedad que el grafo tipado existe
+  -- para evitar (¿cuál manda si discrepan?). 'dependencia' sí falta y el modelo la pide.
   tipo text not null check (tipo in (
-    'transicion', 'pertenece-a', 'ocurre-en', 'participa', 'soporta', 'duele')),
+    'transicion', 'dependencia', 'ocurre-en', 'participa', 'soporta', 'duele')),
   -- Condición de la bifurcación (RF-05.3): el render la muestra sobre la flecha.
   condicion text not null default '',
   creado_por uuid not null references usuario(id),
@@ -114,7 +121,7 @@ create index journey_snapshot_journey_idx on journey_snapshot (workspace_id, jou
 
 -- ── RLS ──
 -- Lectura: todo miembro (el journey es el lenguaje común con el cliente).
--- Escritura: curadores (lead/diseñador) y SOLO mientras el journey esté en borrador.
+-- Escritura: curadores (lead/diseñador). El grafo de trabajo no se cierra (RF-05.8).
 alter table journey enable row level security;
 alter table journey_nodo enable row level security;
 alter table journey_arista enable row level security;
@@ -136,84 +143,46 @@ create policy journey_insert on journey
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and creado_por = app_user_id()
-    and estado = 'borrador'
   );
--- Congelar es la única transición: borrador → congelado, y no vuelve.
-create policy journey_congelar on journey
-  for update
-  using (
-    estado = 'borrador'
-    and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
-  )
-  with check (estado = 'congelado');
 
--- Nodos y aristas: alta y edición solo con el journey en borrador. Un journey
--- congelado es el registro de lo que se aprobó; editarlo sería reescribir la historia
--- (el ciclo siguiente trabaja sobre el journey de trabajo, no sobre el snapshot).
+-- Nodos, aristas y enlaces de evidencia: los escriben los curadores, siempre. El grafo
+-- de trabajo no se cierra nunca (RF-05.8); lo que queda fijo es cada snapshot.
 create policy journey_nodo_insert on journey_nodo
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and creado_por = app_user_id()
-    and exists (select 1 from journey j
-      where j.id = journey_nodo.journey_id and j.workspace_id = journey_nodo.workspace_id
-        and j.estado = 'borrador')
   );
 create policy journey_nodo_update on journey_nodo
   for update
-  using (
-    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
-    and exists (select 1 from journey j
-      where j.id = journey_nodo.journey_id and j.workspace_id = journey_nodo.workspace_id
-        and j.estado = 'borrador')
-  )
-  with check (
-    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
-  );
+  using (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'))
+  with check (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'));
 create policy journey_nodo_delete on journey_nodo
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
-    and exists (select 1 from journey j
-      where j.id = journey_nodo.journey_id and j.workspace_id = journey_nodo.workspace_id
-        and j.estado = 'borrador')
   );
 
 create policy journey_arista_insert on journey_arista
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and creado_por = app_user_id()
-    and exists (select 1 from journey j
-      where j.id = journey_arista.journey_id and j.workspace_id = journey_arista.workspace_id
-        and j.estado = 'borrador')
   );
 create policy journey_arista_delete on journey_arista
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
-    and exists (select 1 from journey j
-      where j.id = journey_arista.journey_id and j.workspace_id = journey_arista.workspace_id
-        and j.estado = 'borrador')
   );
 
 create policy journey_nodo_evidencia_insert on journey_nodo_evidencia
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and creado_por = app_user_id()
-    and exists (select 1 from journey j
-      join journey_nodo n on n.journey_id = j.id and n.workspace_id = j.workspace_id
-      where n.id = journey_nodo_evidencia.nodo_id
-        and j.workspace_id = journey_nodo_evidencia.workspace_id
-        and j.estado = 'borrador')
   );
 create policy journey_nodo_evidencia_delete on journey_nodo_evidencia
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
-    and exists (select 1 from journey j
-      join journey_nodo n on n.journey_id = j.id and n.workspace_id = j.workspace_id
-      where n.id = journey_nodo_evidencia.nodo_id
-        and j.workspace_id = journey_nodo_evidencia.workspace_id
-        and j.estado = 'borrador')
   );
 
--- El snapshot lo escribe quien congela, y nadie lo toca después (sin update ni delete).
+-- El snapshot lo escribe quien congela, y nadie lo toca después (sin update ni delete):
+-- ESTA es la inmutabilidad de RF-05.8, y vive aquí y no en el journey.
 create policy journey_snapshot_insert on journey_snapshot
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
@@ -262,12 +231,142 @@ create trigger journey_nodo_fase
   for each row execute function journey_nodo_fase_guard();
 revoke execute on function journey_nodo_fase_guard() from public;
 
+-- ── Los extremos de una arista tienen que encajar con su tipo ──
+-- El CHECK del tipo solo valida la cadena. Sin esto se puede guardar una 'transicion'
+-- de un sistema a un actor o un 'soporta' entre dos emociones: relaciones que los
+-- renders y la validación tratan como buenas, o se comen en silencio. El tipo de arista
+-- ES la semántica, así que la semántica se impone.
+create function journey_arista_extremos_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  t_origen text;
+  t_destino text;
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  select tipo into t_origen from journey_nodo
+    where id = new.origen_id and workspace_id = new.workspace_id;
+  select tipo into t_destino from journey_nodo
+    where id = new.destino_id and workspace_id = new.workspace_id;
+  if t_origen is null or t_destino is null then
+    return new;  -- lo dirá la FK compuesta, con su propio error
+  end if;
+
+  -- Una fase no participa en ninguna arista: agrupa por fase_id y nada más.
+  if t_origen = 'fase' or t_destino = 'fase' then
+    raise exception 'una fase agrupa por fase_id, no por aristas';
+  end if;
+
+  case new.tipo
+    -- Secuencia: solo entre lo que ocurre en el tiempo (un paso o una bifurcación).
+    when 'transicion' then
+      if t_origen not in ('paso', 'decision') or t_destino not in ('paso', 'decision') then
+        raise exception 'una transición va entre pasos o decisiones, no de % a %', t_origen, t_destino;
+      end if;
+    -- Algo que otro necesita para poder ocurrir.
+    when 'dependencia' then
+      if t_origen not in ('paso', 'accion-frontstage', 'accion-backstage', 'sistema')
+        or t_destino not in ('paso', 'accion-frontstage', 'accion-backstage', 'sistema') then
+        raise exception 'una dependencia va entre pasos, acciones o sistemas, no de % a %', t_origen, t_destino;
+      end if;
+    -- Dónde ocurre: el canal o el touchpoint es el destino.
+    when 'ocurre-en' then
+      if t_origen not in ('paso', 'accion-frontstage') or t_destino not in ('canal', 'touchpoint') then
+        raise exception 'ocurre-en va de un paso o acción visible a un canal o touchpoint, no de % a %', t_origen, t_destino;
+      end if;
+    -- Quién participa: el actor o arquetipo es el origen.
+    when 'participa' then
+      if t_origen not in ('actor', 'arquetipo')
+        or t_destino not in ('paso', 'accion-frontstage', 'accion-backstage') then
+        raise exception 'participa va de un actor o arquetipo a un paso o acción, no de % a %', t_origen, t_destino;
+      end if;
+    -- Qué lo sostiene por detrás: el soporte es el origen.
+    when 'soporta' then
+      if t_origen not in ('sistema', 'accion-backstage')
+        or t_destino not in ('paso', 'accion-frontstage', 'accion-backstage') then
+        raise exception 'soporta va de un sistema o acción backstage a lo que sostiene, no de % a %', t_origen, t_destino;
+      end if;
+    -- Dónde duele: la fricción o la emoción es el origen.
+    when 'duele' then
+      if t_origen not in ('friccion', 'emocion')
+        or t_destino not in ('paso', 'accion-frontstage', 'touchpoint', 'canal') then
+        raise exception 'duele va de una fricción o emoción a donde se siente, no de % a %', t_origen, t_destino;
+      end if;
+    else
+      null;
+  end case;
+  return new;
+end $$;
+create trigger journey_arista_extremos
+  before insert on journey_arista
+  for each row execute function journey_arista_extremos_guard();
+revoke execute on function journey_arista_extremos_guard() from public;
+
+-- ── Auditoría de TODA mutación del grafo ──
+-- El journey es sistema de registro: si solo se auditaran el alta y el congelado, el
+-- historial no podría decir quién movió un paso o quién le quitó la evidencia que lo
+-- sostenía. Va en triggers y no en el servicio para que el SQL directo también lo emita.
+create function journey_grafo_auditoria() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  fila jsonb;
+  ws uuid;
+  jid uuid;
+  cuerpo jsonb;
+  evento text;
+begin
+  -- Se trabaja sobre jsonb y no sobre el record: las tres tablas tienen columnas
+  -- distintas, y plpgsql resuelve TODAS las referencias de campo de una expresión aunque
+  -- la rama no se ejecute (`fila.origen_id` reventaría al auditar un nodo).
+  fila := to_jsonb(case when tg_op = 'DELETE' then old else new end);
+  ws := (fila->>'workspace_id')::uuid;
+
+  if tg_table_name = 'journey_nodo_evidencia' then
+    select n.journey_id into jid from journey_nodo n
+      where n.id = (fila->>'nodo_id')::uuid and n.workspace_id = ws;
+    cuerpo := jsonb_build_object('nodoId', fila->'nodo_id', 'evidenciaId', fila->'evidencia_id');
+    evento := case tg_op when 'INSERT' then 'JourneyEvidenciaEnlazada'
+                         else 'JourneyEvidenciaDesenlazada' end;
+  elsif tg_table_name = 'journey_nodo' then
+    jid := (fila->>'journey_id')::uuid;
+    cuerpo := jsonb_build_object(
+      'nodoId', fila->'id', 'tipo', fila->'tipo', 'etiqueta', fila->'etiqueta',
+      'faseId', fila->'fase_id', 'orden', fila->'orden');
+    evento := case tg_op when 'INSERT' then 'JourneyNodoAgregado'
+                         when 'UPDATE' then 'JourneyNodoEditado'
+                         else 'JourneyNodoBorrado' end;
+  else
+    jid := (fila->>'journey_id')::uuid;
+    cuerpo := jsonb_build_object(
+      'aristaId', fila->'id', 'tipo', fila->'tipo',
+      'origenId', fila->'origen_id', 'destinoId', fila->'destino_id');
+    evento := case tg_op when 'INSERT' then 'JourneyAristaAgregada'
+                         else 'JourneyAristaBorrada' end;
+  end if;
+
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (ws, evento, cuerpo || jsonb_build_object('journeyId', jid),
+      app_user_id(), workspace_role(app_user_id(), ws));
+  return case when tg_op = 'DELETE' then old else new end;
+end $$;
+create trigger journey_nodo_auditoria
+  after insert or update or delete on journey_nodo
+  for each row execute function journey_grafo_auditoria();
+create trigger journey_arista_auditoria
+  after insert or delete on journey_arista
+  for each row execute function journey_grafo_auditoria();
+create trigger journey_nodo_evidencia_auditoria
+  after insert or delete on journey_nodo_evidencia
+  for each row execute function journey_grafo_auditoria();
+revoke execute on function journey_grafo_auditoria() from public;
+
 -- ── Grants mínimos ──
 grant select, insert on journey, journey_nodo, journey_arista to designio_app;
 grant select, insert on journey_nodo_evidencia, journey_snapshot to designio_app;
 -- Editar un nodo es corregir su contenido y su lugar; jamás cambiarlo de journey ni de
 -- tipo (eso sería otro nodo, y las aristas que lo citan quedarían mintiendo).
 grant update (etiqueta, detalle, fase_id, orden, responsable) on journey_nodo to designio_app;
-grant update (estado) on journey to designio_app;
--- El grafo se corrige borrando y rehaciendo mientras está en borrador.
+-- journey sin UPDATE: no tiene estado que mover y su contenido es su identidad.
+-- El grafo se corrige borrando y rehaciendo; el snapshot conserva lo que hubo.
 grant delete on journey_nodo, journey_arista, journey_nodo_evidencia to designio_app;

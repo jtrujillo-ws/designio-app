@@ -48,7 +48,6 @@ function journey(nodos: NodoDeJourney[], aristas: AristaDeJourney[]): JourneyCom
     tipo: 'as-is',
     nombre: 'Alta digital',
     descripcion: '',
-    estado: 'borrador',
     nodos,
     aristas,
     snapshots: [],
@@ -81,11 +80,15 @@ describe('mermaidDeJourney', () => {
     expect(codigo).toContain('-.->|"soporta"|');
   });
 
-  it('no repite «pertenece-a» como flecha: ya la dibuja el subgrafo', () => {
+  it('la pertenencia a la fase la dibuja el subgrafo, no una flecha', () => {
     const fase = nodo({ tipo: 'fase', etiqueta: 'Onboarding', orden: 0 });
     const paso = nodo({ tipo: 'paso', etiqueta: 'Registro', faseId: fase.id, orden: 0 });
-    const codigo = mermaidDeJourney(journey([fase, paso], [arista(paso, fase, 'pertenece-a')]));
+    // Sin aristas: el agrupamiento sale de fase_id y de nada más (por eso el tipo
+    // «pertenece-a» no existe en la taxonomía: sería el mismo hecho dos veces).
+    const codigo = mermaidDeJourney(journey([fase, paso], []));
 
+    expect(codigo).toContain('subgraph');
+    expect(codigo).toContain('Registro');
     expect(codigo).not.toContain('-.->');
     expect(codigo).not.toContain('-->');
   });
@@ -153,17 +156,41 @@ describe('validarJourney', () => {
       ),
     );
 
-    // «Sube documento» es primero de su fase pero NO del journey: le falta la entrada.
-    expect(senales.filter((s) => s.codigo === 'paso-inalcanzable').map((s) => s.nodoId)).toEqual([
-      sube.id,
-    ]);
-    // Y «Datos» es último de la suya pero no del journey: le falta la salida.
+    // «Sube documento» es primero de su fase pero NO del journey: no se llega hasta él.
+    // Y «Firma», que cuelga de él, tampoco — el recorrido propaga la rotura, que es
+    // exactamente lo que se quiere ver: la fase 2 entera quedó desconectada.
+    expect(
+      senales.filter((s) => s.codigo === 'paso-inalcanzable').map((s) => s.nodoId).sort(),
+    ).toEqual([sube.id, firma.id].sort());
+    // «Datos» es último de su fase pero no del journey: le falta la salida.
     expect(senales.filter((s) => s.codigo === 'paso-sin-salida').map((s) => s.nodoId)).toEqual([
       datos.id,
     ]);
-    // Los extremos reales del journey no se reportan.
+    // El primer paso real del journey no se reporta por ningún lado.
     expect(senales.some((s) => s.nodoId === abre.id)).toBe(false);
-    expect(senales.some((s) => s.nodoId === firma.id)).toBe(false);
+  });
+
+  it('un ciclo suelto no se salva por apuntarse a sí mismo: se recorre desde el inicio', () => {
+    const ev = [{ id: id(), titulo: 'E' }];
+    const fase = nodo({ tipo: 'fase', etiqueta: 'F', orden: 0 });
+    const a = nodo({ tipo: 'paso', etiqueta: 'Inicio', orden: 0, faseId: fase.id, evidencias: ev });
+    const b = nodo({ tipo: 'paso', etiqueta: 'Fin', orden: 1, faseId: fase.id, evidencias: ev });
+    // C y D forman un ciclo desconectado del resto: los dos TIENEN entrada, pero no se
+    // llega a ninguno desde el primer paso del journey.
+    const c = nodo({ tipo: 'paso', etiqueta: 'Isla C', orden: 2, faseId: fase.id, evidencias: ev });
+    const d = nodo({ tipo: 'paso', etiqueta: 'Isla D', orden: 3, faseId: fase.id, evidencias: ev });
+    const senales = validarJourney(
+      journey(
+        [fase, a, b, c, d],
+        [arista(a, b, 'transicion'), arista(c, d, 'transicion'), arista(d, c, 'transicion')],
+      ),
+    );
+
+    const inalcanzables = senales.filter((s) => s.codigo === 'paso-inalcanzable').map((s) => s.nodoId);
+    expect(inalcanzables.sort()).toEqual([c.id, d.id].sort());
+    // Y el mensaje distingue el caso: tienen entrada, pero no camino.
+    expect(senales.find((s) => s.nodoId === c.id && s.codigo === 'paso-inalcanzable')!.mensaje)
+      .toContain('no se llega hasta él desde el inicio');
   });
 
   it('la acción frontstage sin soporte backstage es señal alta', () => {
@@ -190,6 +217,17 @@ describe('validarJourney', () => {
 });
 
 describe('carrilesDeJourney', () => {
+  it('ordena las columnas por fase antes que por orden, igual que la validación', () => {
+    const f1 = nodo({ tipo: 'fase', etiqueta: 'Solicitud', orden: 0 });
+    const f2 = nodo({ tipo: 'fase', etiqueta: 'Verificación', orden: 1 });
+    const p1 = nodo({ tipo: 'paso', etiqueta: 'Abre', orden: 0, faseId: f1.id });
+    const p2 = nodo({ tipo: 'paso', etiqueta: 'Datos', orden: 1, faseId: f1.id });
+    const p3 = nodo({ tipo: 'paso', etiqueta: 'Sube', orden: 0, faseId: f2.id });
+    // Con `orden` reiniciado por fase, ordenar solo por él intercalaría Abre/Sube/Datos.
+    const b = carrilesDeJourney(journey([f1, f2, p1, p2, p3], []));
+    expect(b.pasos.map((p) => p.etiqueta)).toEqual(['Abre', 'Datos', 'Sube']);
+  });
+
   it('alinea cada carril por paso siguiendo la adyacencia en cualquier dirección', () => {
     const paso = nodo({ tipo: 'paso', etiqueta: 'Verifica identidad', orden: 0 });
     const sistema = nodo({ tipo: 'sistema', etiqueta: 'Core bancario', orden: 0 });

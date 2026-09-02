@@ -43,7 +43,7 @@ export const ETIQUETA_TIPO_NODO: Record<TipoNodo, string> = {
 
 export const TIPOS_ARISTA = [
   'transicion',
-  'pertenece-a',
+  'dependencia',
   'ocurre-en',
   'participa',
   'soporta',
@@ -53,11 +53,32 @@ export type TipoArista = (typeof TIPOS_ARISTA)[number];
 
 export const ETIQUETA_TIPO_ARISTA: Record<TipoArista, string> = {
   transicion: 'transición',
-  'pertenece-a': 'pertenece a',
+  dependencia: 'depende de',
   'ocurre-en': 'ocurre en',
   participa: 'participa en',
   soporta: 'soporta',
   duele: 'duele en',
+};
+
+/** Qué extremos admite cada tipo: el mismo contrato que impone el guard de la base,
+ * aquí para que el formulario no ofrezca pares que el servidor va a rechazar. Nunca es
+ * la autoridad — solo evita el viaje. */
+export const EXTREMOS_ARISTA: Record<TipoArista, { origen: TipoNodo[]; destino: TipoNodo[] }> = {
+  transicion: { origen: ['paso', 'decision'], destino: ['paso', 'decision'] },
+  dependencia: {
+    origen: ['paso', 'accion-frontstage', 'accion-backstage', 'sistema'],
+    destino: ['paso', 'accion-frontstage', 'accion-backstage', 'sistema'],
+  },
+  'ocurre-en': { origen: ['paso', 'accion-frontstage'], destino: ['canal', 'touchpoint'] },
+  participa: {
+    origen: ['actor', 'arquetipo'],
+    destino: ['paso', 'accion-frontstage', 'accion-backstage'],
+  },
+  soporta: {
+    origen: ['sistema', 'accion-backstage'],
+    destino: ['paso', 'accion-frontstage', 'accion-backstage'],
+  },
+  duele: { origen: ['friccion', 'emocion'], destino: ['paso', 'accion-frontstage', 'touchpoint', 'canal'] },
 };
 
 export const TIPOS_JOURNEY = ['as-is', 'to-be'] as const;
@@ -165,7 +186,6 @@ export type JourneyCompleto = {
   tipo: TipoJourney;
   nombre: string;
   descripcion: string;
-  estado: 'borrador' | 'congelado';
   nodos: NodoDeJourney[];
   aristas: AristaDeJourney[];
   snapshots: { id: string; motivo: string; congeladoEn: string }[];
@@ -175,9 +195,10 @@ export type ResumenJourney = {
   id: string;
   nombre: string;
   tipo: TipoJourney;
-  estado: 'borrador' | 'congelado';
   servicioNombre: string;
   nodos: number;
+  /** Cuántos snapshots congelados lleva: la historia de lo aprobado sobre este grafo. */
+  snapshots: number;
 };
 
 /** Severidad de una señal de validación: el hueco que impide decidir vs. el que

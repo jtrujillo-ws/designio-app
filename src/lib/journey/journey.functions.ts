@@ -18,7 +18,7 @@ import {
   agregarNodo,
   borrarArista,
   borrarNodo,
-  congelarJourney,
+  congelarSnapshot,
   crearJourney,
   editarNodo,
   enlazarEvidenciaANodo,
@@ -171,13 +171,13 @@ export const enlazarEvidenciaAlNodo = createServerFn({ method: 'POST' })
     }
   });
 
-export const congelarJourneyDelWorkspace = createServerFn({ method: 'POST' })
+export const congelarSnapshotDelJourney = createServerFn({ method: 'POST' })
   .inputValidator(CongelarJourneySchema)
   .handler(async ({ data }) => {
     const actorId = await usuarioIdDeRequest();
     if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
     try {
-      await congelarJourney(actorId, data.workspaceId, data.journeyId, data.motivo);
+      await congelarSnapshot(actorId, data.workspaceId, data.journeyId, data.motivo);
       return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);

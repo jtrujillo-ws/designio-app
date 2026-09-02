@@ -16,7 +16,7 @@ import {
   agregarNodoAlJourney,
   borrarAristaDelJourney,
   borrarNodoDelJourney,
-  congelarJourneyDelWorkspace,
+  congelarSnapshotDelJourney,
   editarNodoDelJourney,
   enlazarEvidenciaAlNodo,
   journeyDelWorkspace,
@@ -25,6 +25,7 @@ import { carrilesDeJourney, mermaidDeJourney, validarJourney } from '@/lib/journ
 import {
   ETIQUETA_TIPO_ARISTA,
   ETIQUETA_TIPO_NODO,
+  EXTREMOS_ARISTA,
   TIPOS_ARISTA,
   TIPOS_NODO,
   type JourneyCompleto,
@@ -96,7 +97,9 @@ function PantallaJourney() {
   const mermaid = useMemo(() => (journey ? mermaidDeJourney(journey) : ''), [journey]);
   const carriles = useMemo(() => (journey ? carrilesDeJourney(journey) : null), [journey]);
 
-  const editable = esCurador && journey?.estado === 'borrador';
+  // El grafo de trabajo no se cierra nunca (RF-05.8): quien cura, edita. Lo inmutable
+  // es cada snapshot congelado, que se lista aparte.
+  const editable = esCurador;
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
@@ -201,7 +204,7 @@ function Encabezado({
     setOcupado(true);
     onError(null);
     try {
-      const r = await congelarJourneyDelWorkspace({
+      const r = await congelarSnapshotDelJourney({
         data: { workspaceId, journeyId: journey.id, motivo },
       });
       if (r.ok) {
@@ -221,7 +224,6 @@ function Encabezado({
           {journey.nombre}
         </span>
         <Tag>{journey.tipo}</Tag>
-        <Tag mono={false}>{journey.estado}</Tag>
       </div>
       <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
         {journey.servicioNombre}
@@ -229,24 +231,30 @@ function Encabezado({
       </span>
 
       {journey.snapshots.length > 0 && (
-        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
-          Congelado {journey.snapshots[0]!.congeladoEn}
-          {journey.snapshots[0]!.motivo ? ` · ${journey.snapshots[0]!.motivo}` : ''}
-        </span>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <span style={micro}>Snapshots congelados ({journey.snapshots.length})</span>
+          {journey.snapshots.map((s) => (
+            <span key={s.id} style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+              {s.congeladoEn}
+              {s.motivo ? ` · ${s.motivo}` : ''}
+            </span>
+          ))}
+        </div>
       )}
 
-      {esCurador && journey.estado === 'borrador' && !congelando && (
+      {esCurador && !congelando && (
         <div>
           <Button size="sm" variant="secondary" onClick={() => setCongelando(true)}>
-            Congelar journey
+            Congelar snapshot
           </Button>
         </div>
       )}
       {congelando && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <span style={{ font: '400 12.5px/1.6 var(--font-sans)', color: 'var(--text-body)' }}>
-            Congelar guarda el grafo entero como el estado que se aprobó y cierra la
-            edición: no se reabre.
+            Congelar guarda el grafo entero —nodos, aristas y su evidencia— como registro
+            inmutable de lo que se aprobó. El grafo de trabajo <strong>sigue editable</strong>:
+            el snapshot es la foto, no un candado.
             {senalesAltas > 0 && (
               <>
                 {' '}
@@ -717,6 +725,13 @@ function FormularioArista({
   const [condicion, setCondicion] = useState('');
   const [ocupado, setOcupado] = useState(false);
 
+  // El tipo de arista decide qué puede ir en cada extremo (lo impone un guard de la
+  // base). Aquí solo se filtra el picker para no ofrecer pares que el servidor va a
+  // rechazar: la autoridad sigue siendo el guard, esto ahorra el viaje.
+  const permitidos = EXTREMOS_ARISTA[tipo];
+  const origenes = nodos.filter((n) => permitidos.origen.includes(n.tipo));
+  const destinos = nodos.filter((n) => permitidos.destino.includes(n.tipo) && n.id !== origenId);
+
   async function enviar(e: FormEvent) {
     e.preventDefault();
     setOcupado(true);
@@ -738,13 +753,23 @@ function FormularioArista({
     <form onSubmit={(e) => void enviar(e)} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
       <Select value={origenId} onChange={(e) => setOrigenId(e.target.value)} required style={{ minWidth: 180 }}>
         <option value="">Origen…</option>
-        {nodos.map((n) => (
+        {origenes.map((n) => (
           <option key={n.id} value={n.id}>
-            {n.etiqueta}
+            {n.etiqueta} · {ETIQUETA_TIPO_NODO[n.tipo]}
           </option>
         ))}
       </Select>
-      <Select value={tipo} onChange={(e) => setTipo(e.target.value as TipoArista)} style={{ minWidth: 150 }}>
+      <Select
+        value={tipo}
+        onChange={(e) => {
+          // Cambiar el tipo puede invalidar lo ya elegido: se limpia en vez de mandar
+          // al servidor un par que su guard va a rechazar.
+          setTipo(e.target.value as TipoArista);
+          setOrigenId('');
+          setDestinoId('');
+        }}
+        style={{ minWidth: 150 }}
+      >
         {TIPOS_ARISTA.map((t) => (
           <option key={t} value={t}>
             {ETIQUETA_TIPO_ARISTA[t]}
@@ -758,13 +783,11 @@ function FormularioArista({
         style={{ minWidth: 180 }}
       >
         <option value="">Destino…</option>
-        {nodos
-          .filter((n) => n.id !== origenId)
-          .map((n) => (
-            <option key={n.id} value={n.id}>
-              {n.etiqueta}
-            </option>
-          ))}
+        {destinos.map((n) => (
+          <option key={n.id} value={n.id}>
+            {n.etiqueta} · {ETIQUETA_TIPO_NODO[n.tipo]}
+          </option>
+        ))}
       </Select>
       <Input
         placeholder="Condición (para bifurcaciones)"

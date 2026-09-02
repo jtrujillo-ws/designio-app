@@ -31,6 +31,26 @@ const FORMA: Record<TipoNodo, [string, string]> = {
   decision: ['{', '}'],
 };
 
+/**
+ * La secuencia real del journey: las fases se suceden en su orden y los pasos dentro de
+ * cada una en el suyo. Los pasos sin fase van al final (la validación ya los reporta).
+ *
+ * La usan la validación Y el blueprint: si cada una ordenara a su manera, las columnas
+ * del blueprint y las señales hablarían de journeys distintos.
+ */
+function porSecuencia(journey: JourneyCompleto, nodos: NodoDeJourney[]): NodoDeJourney[] {
+  const ordenDeFase = new Map(
+    journey.nodos.filter((n) => n.tipo === 'fase').map((f) => [f.id, f.orden]),
+  );
+  const deFase = (n: NodoDeJourney): number =>
+    n.faseId === null ? Number.MAX_SAFE_INTEGER : (ordenDeFase.get(n.faseId) ?? Number.MAX_SAFE_INTEGER);
+  return [...nodos].sort((a, b) => {
+    const fa = deFase(a);
+    const fb = deFase(b);
+    return fa !== fb ? fa - fb : a.orden !== b.orden ? a.orden - b.orden : a.id.localeCompare(b.id);
+  });
+}
+
 /** Identificador estable y seguro para Mermaid a partir del uuid. */
 function idMermaid(id: string): string {
   return `n${id.replace(/-/g, '').slice(0, 12)}`;
@@ -79,15 +99,12 @@ export function mermaidDeJourney(journey: JourneyCompleto): string {
     lineas.push('  end');
   }
 
-  for (const n of sueltos.sort((x, y) => x.orden - y.orden)) {
+  for (const n of porSecuencia(journey, sueltos)) {
     const [a, b] = FORMA[n.tipo];
     lineas.push(`  ${idMermaid(n.id)}${a}"${texto(n.etiqueta)}"${b}`);
   }
 
   for (const arista of journey.aristas) {
-    // «pertenece-a» ya está dibujada por el subgrafo: repetirla como flecha duplicaría
-    // la información y ensuciaría el flujo.
-    if (arista.tipo === 'pertenece-a') continue;
     const origen = idMermaid(arista.origenId);
     const destino = idMermaid(arista.destinoId);
     if (arista.tipo === 'transicion') {
@@ -121,22 +138,29 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
   const conEntrada = new Set(transiciones.map((a) => a.destinoId));
   const conSalida = new Set(transiciones.map((a) => a.origenId));
 
-  // La secuencia real del journey: las fases se suceden en su orden y los pasos dentro
-  // de cada una en el suyo. Solo el PRIMER paso de esa secuencia global puede no tener
-  // entrada, y solo el último puede no tener salida — el primer paso de la fase 2 sí
-  // necesita que algo de la fase 1 lleve hasta él, que es la costura que más se rompe.
-  // Los pasos sin fase van al final: ya se reportan aparte como huérfanos.
-  const ordenDeFase = new Map(
-    journey.nodos.filter((n) => n.tipo === 'fase').map((f) => [f.id, f.orden]),
-  );
+  // Solo el PRIMER paso de la secuencia puede no tener entrada, y solo el último puede
+  // no tener salida — el primer paso de la fase 2 sí necesita que algo de la fase 1
+  // lleve hasta él, que es la costura que más se rompe.
   const pasos = journey.nodos.filter((n) => n.tipo === 'paso');
-  const secuencia = [...pasos].sort((a, b) => {
-    const fa = a.faseId === null ? Number.MAX_SAFE_INTEGER : (ordenDeFase.get(a.faseId) ?? Number.MAX_SAFE_INTEGER);
-    const fb = b.faseId === null ? Number.MAX_SAFE_INTEGER : (ordenDeFase.get(b.faseId) ?? Number.MAX_SAFE_INTEGER);
-    return fa !== fb ? fa - fb : a.orden !== b.orden ? a.orden - b.orden : a.id.localeCompare(b.id);
-  });
+  const secuencia = porSecuencia(journey, pasos);
   const primeroId = secuencia[0]?.id ?? null;
   const ultimoId = secuencia[secuencia.length - 1]?.id ?? null;
+
+  // Alcanzable = se LLEGA desde el inicio siguiendo transiciones, no «alguien me apunta».
+  // Un ciclo suelto C→D→C se apunta a sí mismo y quedaría exculpado con lo segundo,
+  // que es precisamente el grafo roto que hay que ver.
+  const salidas = new Map<string, string[]>();
+  for (const a of transiciones) {
+    salidas.set(a.origenId, [...(salidas.get(a.origenId) ?? []), a.destinoId]);
+  }
+  const alcanzables = new Set<string>();
+  const pendientes = primeroId ? [primeroId] : [];
+  while (pendientes.length > 0) {
+    const actual = pendientes.pop()!;
+    if (alcanzables.has(actual)) continue;
+    alcanzables.add(actual);
+    for (const siguiente of salidas.get(actual) ?? []) pendientes.push(siguiente);
+  }
 
   for (const paso of pasos) {
     if (paso.evidencias.length === 0) {
@@ -148,13 +172,15 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
         mensaje: 'El paso no tiene evidencia enlazada que lo sostenga',
       });
     }
-    if (!conEntrada.has(paso.id) && paso.id !== primeroId) {
+    if (!alcanzables.has(paso.id)) {
       senales.push({
         codigo: 'paso-inalcanzable',
         severidad: 'alta',
         nodoId: paso.id,
         etiqueta: paso.etiqueta,
-        mensaje: 'Ninguna transición llega a este paso: es inalcanzable',
+        mensaje: conEntrada.has(paso.id)
+          ? 'Tiene transiciones de entrada, pero no se llega hasta él desde el inicio'
+          : 'Ninguna transición llega a este paso: es inalcanzable',
       });
     }
     // El último tampoco necesita salida: el journey termina en algún lado.
@@ -223,9 +249,10 @@ export type CarrilesBlueprint = {
 };
 
 export function carrilesDeJourney(journey: JourneyCompleto): CarrilesBlueprint {
-  const pasos = [...journey.nodos.filter((n) => n.tipo === 'paso')].sort(
-    (a, b) => a.orden - b.orden,
-  );
+  // Misma secuencia que usa la validación: si el blueprint ordenara solo por `orden`,
+  // dos fases numeradas desde cero intercalarían sus columnas y las tres vistas
+  // dejarían de hablar del mismo journey.
+  const pasos = porSecuencia(journey, journey.nodos.filter((n) => n.tipo === 'paso'));
   const porId = new Map(journey.nodos.map((n) => [n.id, n]));
 
   /** Nodos de un tipo relacionados con un paso por cualquier arista, en cualquier

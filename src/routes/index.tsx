@@ -1,11 +1,8 @@
-import { createFileRoute } from '@tanstack/react-router';
-import { LoopScreen } from '@/components/loop/LoopScreen';
+import { createFileRoute, redirect } from '@tanstack/react-router';
 
-/**
- * Pantalla principal del workspace: el loop del método J1–J7.
- * Datos estáticos del ejemplo §19 por ahora; el estado real se derivará de los
- * gates del reto activo cuando aterricen los módulos de método (SPEC-04).
- */
+/** La raíz siempre entra al workspace; el guard de /_autenticada manda a /login si no hay sesión. */
 export const Route = createFileRoute('/')({
-  component: LoopScreen,
+  beforeLoad: () => {
+    throw redirect({ to: '/app' });
+  },
 });

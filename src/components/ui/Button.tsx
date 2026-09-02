@@ -14,18 +14,23 @@ export function Button({
   variant = 'primary',
   size = 'md',
   disabled = false,
+  type = 'button',
   onClick,
+  style,
   children,
 }: {
   variant?: ButtonVariant;
   size?: 'sm' | 'md';
   disabled?: boolean;
+  /** `submit` para el botón principal de un formulario (Enter lo dispara). */
+  type?: 'button' | 'submit';
   onClick?: () => void;
+  style?: CSSProperties;
   children: ReactNode;
 }) {
   return (
     <button
-      type="button"
+      type={type}
       disabled={disabled}
       onClick={onClick}
       style={{
@@ -42,6 +47,7 @@ export function Button({
         fontSize: size === 'sm' ? 12.5 : 14,
         transition: 'background 150ms ease-out',
         ...VARIANTES[variant],
+        ...style,
       }}
     >
       {children}

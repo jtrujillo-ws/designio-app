@@ -16,10 +16,12 @@
 -- atribución fijada en la política, transiciones exigidas por WITH CHECK y efectos
 -- (eventos + sellos temporales) emitidos DENTRO del guard que decide.
 --
--- Dos tablas acompañan al pipeline y existen por lo mismo —que las promesas del slice se
--- cumplan aunque haya concurrencia o prisa—: `consentimiento_item` (RF-09.5: el material
--- de personas no se procesa sin permiso registrado ANTES) y `reserva_ai` (RF-09.12: el
--- presupuesto se aparta antes de llamar al proveedor, no después de pagar).
+-- Tres tablas acompañan al pipeline y existen por lo mismo —que las promesas del slice se
+-- cumplan aunque haya concurrencia, prisa o un proveedor que diga que no—:
+-- `consentimiento_item` (RF-09.5: el material de personas no se procesa sin permiso
+-- registrado ANTES), `reserva_ai` (RF-09.12: el presupuesto se aparta antes de llamar al
+-- proveedor, no después de pagar) y `llamada_ai` (RF-09.14: el libro de las llamadas al
+-- proveedor, que se escribe nazca o no una propuesta).
 
 -- ── Consentimiento del material ANTES de procesarlo (RF-09.5) ─────────────────────────
 -- Qué material lo exige. Vive en una función y no repartido por consultas: el día que
@@ -29,6 +31,29 @@
 create function tipo_fuente_exige_consentimiento(tipo text) returns boolean
 language sql immutable parallel safe as $$
   select tipo in ('entrevista', 'observacion')
+$$;
+
+/*
+ * ¿Este item tiene material del que se pueda extraer algo? La bandeja admite importar SOLO
+ * la referencia al original, sin texto pegado (RF-03.1), y de ahí no puede salir una
+ * evidencia fundada: el contrato de CI obliga al modelo a devolver una evidencia FECHADA y
+ * con al menos una cita literal, y no hay herramienta de recuperación que lea la fuente
+ * referenciada. Con el cuerpo vacío, lo único que el modelo tiene delante es la ficha
+ * (título, tipo, referencia), así que la única forma de cumplir el contrato es inventar —
+ * y sale una propuesta con pinta de fundamentada que costó presupuesto.
+ *
+ * El umbral es un SUELO («hay algo que citar»), no una medida de calidad: por debajo de una
+ * frase no hay extracción posible. Vive en la base porque es la base quien lo impone —el
+ * guard de propuesta_ai— y porque el servicio y el panel deben preguntar exactamente lo
+ * mismo que se va a exigir, sin copiar el predicado en cada consulta.
+ *
+ * No hay arreglo posterior por diseño: `contenido` no está en el grant de UPDATE de la
+ * bandeja (el material importado es inmutable, SYS-17), así que un item solo-referencia se
+ * cura a mano o se vuelve a importar con el texto pegado.
+ */
+create function item_tiene_material_extraible(contenido text) returns boolean
+language sql immutable parallel safe as $$
+  select length(btrim(coalesce(contenido, ''))) >= 40
 $$;
 
 /*
@@ -45,11 +70,27 @@ $$;
  *    decidir la curaduría son actos separados, con políticas separadas;
  *  · el registro tiene contenido propio (qué se autorizó y si cubre a un tercero) que no
  *    tiene por qué engordar la tabla caliente de la bandeja.
- * Una revocación futura (RF-09.4) será otra fila/objeto, nunca un UPDATE sobre esta.
+ *
+ * Y es una BITÁCORA VERSIONADA, no un registro único por item. Con una clave primaria
+ * (item_id, workspace_id) el primer registro era también el último: una persona que
+ * autorizaba solo el uso interno (`procesamiento_externo = false`, entrada legítima) dejaba
+ * el item bloqueado PARA SIEMPRE — el append-only impedía corregirlo y la PK impedía añadir
+ * el permiso posterior. El consentimiento no es un estado, es una sucesión de hechos
+ * fechados: cada registro es una fila nueva y lo que manda es el VIGENTE (el de mayor
+ * versión). Así una autorización posterior desbloquea, y una revocación futura (RF-09.4)
+ * vuelve a bloquear siendo también un registro nuevo — nunca un UPDATE sobre el anterior.
  */
 create table consentimiento_item (
+  id uuid primary key default gen_random_uuid(),
   item_id uuid not null,
   workspace_id uuid not null references workspace(id),
+  -- Orden de la bitácora. Lo asigna el guard y NO está en el grant de insert: si el caller
+  -- pudiera escribirlo, podría colar un registro con versión alta y convertir en «vigente»
+  -- un hecho que no es el último — que es exactamente la reescritura que el append-only
+  -- prohíbe, por la puerta de atrás. Un entero y no el timestamp: `now()` es el de la
+  -- transacción, así que dos registros de la misma transacción empatarían y «el más
+  -- reciente» dejaría de estar definido.
+  version integer not null check (version >= 1),
   -- Qué autorizó la persona, en las palabras de quien lo recogió: es el registro del
   -- consentimiento, no el contrato.
   alcance text not null check (length(btrim(alcance)) between 1 and 1000),
@@ -60,7 +101,12 @@ create table consentimiento_item (
   procesamiento_externo boolean not null,
   registrado_por uuid not null references usuario(id),
   registrado_en timestamptz not null default now(),
-  primary key (item_id, workspace_id),
+  unique (id, workspace_id),
+  -- El suelo de la bitácora: dos registros no pueden ocupar la misma posición. Es lo que
+  -- convierte «leí el máximo y sumé uno» en una operación segura aunque dos curadores
+  -- registren a la vez (el candado consultivo del servicio los serializa; esto es lo que
+  -- pasa si alguien llega por otro camino).
+  unique (item_id, workspace_id, version),
   foreign key (item_id, workspace_id) references item_importacion (id, workspace_id)
 );
 
@@ -76,17 +122,26 @@ create policy consentimiento_insert on consentimiento_item
     and registrado_por = app_user_id()
   );
 
--- Auditoría del registro (RF-09.13). Sin `returning` en ningún lado: el evento se emite
--- dentro del trigger, así que quien registra no necesita poder LEER `evento_dominio`.
+-- Posición en la bitácora y auditoría del registro (RF-09.13). El número de versión lo
+-- pone el guard —no el caller— porque es lo que decide cuál es el registro vigente, y con
+-- él el permiso para procesar. Sin `returning` en ningún lado: el evento se emite dentro
+-- del trigger, así que quien registra no necesita poder LEER `evento_dominio`.
 create function consentimiento_item_registro_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
+  -- El sello temporal y la posición los estampa la BASE: ni se antedata un consentimiento
+  -- ni se reordena la bitácora desde la app.
+  new.registrado_en := now();
+  new.version := coalesce(
+    (select max(c.version) + 1 from consentimiento_item c
+      where c.item_id = new.item_id and c.workspace_id = new.workspace_id),
+    1);
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
   values (new.workspace_id, 'ConsentimientoRegistrado',
-    jsonb_build_object('itemId', new.item_id,
+    jsonb_build_object('itemId', new.item_id, 'version', new.version,
                        'procesamientoExterno', new.procesamiento_externo),
     app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   return new;
@@ -98,8 +153,201 @@ create trigger consentimiento_item_registro
 
 revoke execute on function consentimiento_item_registro_guard() from public;
 
--- Sin UPDATE ni DELETE: un consentimiento registrado es un hecho, no un campo editable.
-grant select, insert on consentimiento_item to designio_app;
+-- Sin UPDATE ni DELETE: un consentimiento registrado es un hecho, no un campo editable —
+-- lo que cambia el permiso es un registro NUEVO. Y el insert va por columnas: `version` y
+-- `registrado_en` los escribe solo el guard, así que la app no puede fabricar un vigente
+-- ni fechar hacia atrás. La promesa es estructural, no una convención del servicio.
+grant select on consentimiento_item to designio_app;
+grant insert (item_id, workspace_id, alcance, procesamiento_externo, registrado_por)
+  on consentimiento_item to designio_app;
+
+/*
+ * El registro VIGENTE de un item autoriza (o no) el procesamiento externo. Una función y
+ * no un predicado copiado en cada consulta: el guard de `propuesta_ai`, el servicio antes
+ * de construir el prompt y el marcado del panel tienen que responder EXACTAMENTE lo mismo,
+ * o la pantalla ofrecería lo que la base va a rechazar (o al revés, que es peor: material
+ * de personas viajando porque una consulta miraba una fila vieja).
+ *
+ * Sin registros ⇒ false: el permiso se demuestra, no se presume. Y como solo mira el de
+ * mayor versión, una revocación posterior vuelve a bloquear sin tocar nada más.
+ */
+create function consentimiento_externo_vigente(p_item_id uuid, p_workspace_id uuid)
+returns boolean language sql stable as $$
+  select coalesce(
+    (select c.procesamiento_externo from consentimiento_item c
+      where c.item_id = p_item_id and c.workspace_id = p_workspace_id
+      order by c.version desc limit 1),
+    false)
+$$;
+
+/*
+ * ¿Los criterios de este reto están congelados? Un G0 aprobado certificó exactamente esos
+ * criterios (SYS-22) y los cierra… salvo que la etapa 0 esté REABIERTA, que es el cambio
+ * para el que existe la reapertura (RF-04.9) y que no desaprueba el gate (SYS-10).
+ *
+ * El predicado pasa a vivir en UNA función porque ya se le vio la costura: nació en las
+ * políticas de `criterio_exito` (SPEC-04), la reapertura le añadió la excepción de la etapa
+ * en SPEC-03/04 tocando política y guard… y las lecturas del pipeline AI —qué retos se
+ * ofrecen como ancla, qué propuestas siguen siendo aceptables— se quedaron con la versión
+ * vieja. El resultado eran errores en las dos direcciones: se ofrecía generar sobre retos
+ * ya congelados y se ESCONDÍA la generación en retos legítimamente reabiertos.
+ *
+ * Con la función, la política y el guard siguen siendo quienes lo IMPONEN y las lecturas
+ * anticipan exactamente lo mismo: un panel que ofrece un botón que la base va a rechazar es
+ * tan malo como uno que esconde una acción permitida.
+ */
+create function reto_criterios_congelados(p_reto_id uuid, p_workspace_id uuid)
+returns boolean language sql stable as $$
+  select exists (
+    select 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+      and e.numero = 0
+    where p.reto_id = p_reto_id and p.workspace_id = p_workspace_id
+      and g.numero = 0 and g.estado = 'aprobado'
+      and e.estado <> 'en-curso')
+$$;
+
+-- Y quienes lo imponen pasan a llamarla, para que no queden dos definiciones que puedan
+-- volver a separarse. El resto del guard no cambia: el candado por G0 en orden estable
+-- (dos guards concurrentes no se cruzan) y el evento de la transición siguen igual.
+create or replace function criterio_g0_pendiente_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  perform 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id and g.numero = 0
+    order by g.id for update of g;
+  if reto_criterios_congelados(new.reto_id, new.workspace_id) then
+    raise exception 'el G0 del reto está aprobado: criterios congelados';
+  end if;
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id,
+      case tg_op when 'INSERT' then 'CriterioDefinido' else 'CriterioEditado' end,
+      jsonb_build_object('criterioId', new.id, 'retoId', new.reto_id, 'kpi', new.kpi),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  return new;
+end $$;
+
+drop policy criterio_insert on criterio_exito;
+create policy criterio_insert on criterio_exito
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and creado_por = app_user_id()
+    and not reto_criterios_congelados(criterio_exito.reto_id, criterio_exito.workspace_id)
+  );
+drop policy criterio_update on criterio_exito;
+create policy criterio_update on criterio_exito
+  for update
+  using (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and not reto_criterios_congelados(criterio_exito.reto_id, criterio_exito.workspace_id)
+  )
+  with check (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'));
+
+-- ── Libro de llamadas al proveedor (RF-09.14) ─────────────────────────────────────────
+/*
+ * Una llamada al proveedor ocurrió, costó dinero y devolvió su `usage` UNA sola vez: ese
+ * dato no se puede reconstruir después. Colgarlo de la propuesta hacía que existiera solo
+ * si nacía una propuesta, y hay caminos completamente normales en los que la llamada se
+ * paga y no nace ninguna: el proveedor se niega a responder (`stop_reason = 'refusal'`),
+ * responde algo que no cumple el esquema de la capacidad, o la carrera por el item la gana
+ * otro curador. Todas esas llamadas desaparecían de la observabilidad de costos justo
+ * cuando más interesa mirarlas.
+ *
+ * Por eso el libro se escribe SIEMPRE que el proveedor fue invocado, en su propia
+ * transacción y ANTES de persistir nada: si el guardado de las propuestas falla después, la
+ * llamada sigue anotada. `resultado` describe lo que devolvió el PROVEEDOR, no lo que se
+ * llegó a guardar, para que la fila no pueda mentir; cuántas propuestas nacieron de ella se
+ * responde con un join desde `propuesta_ai`.
+ *
+ * Y al existir la llamada como fila, el coste deja de repetirse en cada propuesta del lote:
+ * el gasto del workspace es `sum(costo_usd)` sobre esta tabla, una fila por llamada, sin
+ * sumar por `distinct` ni prorratear un entero de tokens entre 1..4 filas.
+ */
+create table llamada_ai (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspace(id),
+  capacidad text not null check (capacidad in ('C0', 'CI')),
+  -- El ancla que se procesó: el reporte de costos se lee por capacidad y por objeto, y una
+  -- llamada sin propuestas seguiría sin decir sobre qué se gastó si no viviera aquí.
+  item_id uuid,
+  reto_id uuid,
+  -- El modelo que respondió (puede ser el de respaldo tras una degradación) y la credencial
+  -- que lo pagó: sin esto, el gasto no se puede atribuir en BYOAI (RF-09.9).
+  modelo text not null,
+  origen_key text not null check (origen_key in ('workspace', 'entorno')),
+  -- Qué devolvió el proveedor. 'salida-valida' es «contenido que pasó el esquema de la
+  -- capacidad»; lo demás son llamadas pagadas de las que no puede nacer nada.
+  resultado text not null check (resultado in
+    ('salida-valida', 'rechazo-proveedor', 'fuera-de-contrato', 'sin-respuesta')),
+  motivo text not null default '' check (length(motivo) <= 500),
+  -- Uso medido, no estimado. Los dos contadores viajan juntos o no viaja ninguno: medio
+  -- `usage` no es un uso, es un número que engaña al sumarlo.
+  tokens_entrada integer check (tokens_entrada is null or tokens_entrada >= 0),
+  tokens_salida integer check (tokens_salida is null or tokens_salida >= 0),
+  -- Al precio VIGENTE cuando se llamó: una tarifa nueva no reescribe el histórico. null si
+  -- el modelo no tiene tarifa registrada — «no se sabe» no es «salió gratis».
+  costo_usd numeric(12, 6) check (costo_usd is null or costo_usd >= 0),
+  latencia_ms integer check (latencia_ms is null or latencia_ms >= 0),
+  creado_por uuid not null references usuario(id),
+  creado_en timestamptz not null default now(),
+  unique (id, workspace_id),
+  foreign key (item_id, workspace_id) references item_importacion (id, workspace_id),
+  foreign key (reto_id, workspace_id) references reto (id, workspace_id),
+  check ((capacidad = 'CI') = (item_id is not null)),
+  check ((capacidad = 'C0') = (reto_id is not null)),
+  check ((tokens_entrada is null) = (tokens_salida is null)),
+  -- Una llamada que no dio contenido utilizable DICE por qué: es la mitad del valor de
+  -- anotarla (la otra es cuánto costó).
+  check (resultado = 'salida-valida' or length(btrim(motivo)) > 0)
+);
+create index llamada_ai_ws_idx on llamada_ai (workspace_id, creado_en);
+
+alter table llamada_ai enable row level security;
+
+create policy llamada_select on llamada_ai
+  for select using (is_workspace_member(app_user_id(), workspace_id));
+-- La registra quien pidió la generación, y queda atribuida por la política: el gasto tiene
+-- dueño (los mismos curadores que pueden pedir propuestas).
+create policy llamada_insert on llamada_ai
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and creado_por = app_user_id()
+  );
+
+-- Una llamada que no produjo contenido utilizable deja rastro auditable: es dinero gastado
+-- sin objeto que lo justifique y no debería haber que deducirlo de la ausencia de filas.
+-- Se emite DENTRO del guard para que una escritura cruda lo produzca igual, y sin
+-- `returning` (quien registra no necesita leer `evento_dominio`).
+create function llamada_ai_registro_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if new.resultado <> 'salida-valida' then
+    insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id, 'LlamadaAISinPropuesta',
+      jsonb_build_object('llamadaId', new.id, 'capacidad', new.capacidad,
+                         'modelo', new.modelo, 'resultado', new.resultado,
+                         'motivo', new.motivo, 'costoUsd', new.costo_usd),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  end if;
+  return new;
+end $$;
+
+create trigger llamada_ai_registro
+  before insert on llamada_ai
+  for each row execute function llamada_ai_registro_guard();
+
+revoke execute on function llamada_ai_registro_guard() from public;
+
+-- Sin UPDATE ni DELETE: lo que costó una llamada ya hecha no se reescribe ni se borra.
+grant select, insert on llamada_ai to designio_app;
 
 create table propuesta_ai (
   id uuid primary key default gen_random_uuid(),
@@ -133,26 +381,19 @@ create table propuesta_ai (
   modelo text not null,
   prompt_version text not null,
   alcance_resumen text not null default '',
-  latencia_ms integer check (latencia_ms is null or latencia_ms >= 0),
   -- BYOAI: qué credencial sirvió la llamada. Hoy la app resuelve siempre 'entorno'
   -- (el almacenamiento de la key por workspace espera al secret manager, RF-09.6);
   -- el catálogo ya admite 'workspace' para que ese día no haya migración de datos.
   origen_key text not null check (origen_key in ('workspace', 'entorno')),
 
-  -- Uso y coste de la llamada que la produjo (RF-09.14: observabilidad de costos). El
-  -- proveedor devuelve el `usage` de cada respuesta y aquí se conserva: sin esto el
-  -- `costoUsd` del lineage no se puede calcular NUNCA — el dato solo existe en el
-  -- instante de la llamada y se perdía al quedarnos con el texto.
-  -- `llamada_id` agrupa las propuestas nacidas de UNA misma llamada (C0 devuelve un
-  -- lote): el uso y el coste son de la LLAMADA, así que las filas del lote los repiten
-  -- y el gasto real del workspace se suma por llamada distinta, no por propuesta —
-  -- prorratear el coste entre las filas habría hecho cuadrar la suma a costa de que
-  -- ninguna fila dijera la verdad sobre lo que se pagó.
-  llamada_id uuid not null default gen_random_uuid(),
-  tokens_entrada integer check (tokens_entrada is null or tokens_entrada >= 0),
-  tokens_salida integer check (tokens_salida is null or tokens_salida >= 0),
-  -- Al precio VIGENTE cuando se generó: una tarifa nueva no reescribe el histórico.
-  costo_usd numeric(12, 6) check (costo_usd is null or costo_usd >= 0),
+  -- La llamada de la que salió. NOT NULL y con FK: ninguna propuesta puede existir sin su
+  -- línea en el libro de costos, y una llamada que devolvió un lote (C0 propone varios
+  -- criterios) es UNA fila de gasto con varias propuestas colgando. El uso, el coste y la
+  -- latencia viven allí y no repetidos aquí: son de la llamada, no de cada propuesta, y
+  -- repetirlos obligaba a sumar por `distinct` para no contar cuatro veces lo que se pagó
+  -- una. Lo que sí es de la propuesta —modelo, versión de prompt, credencial, alcance— se
+  -- queda: es su LINEAGE (SYS-19) y la evidencia materializada lo copia.
+  llamada_id uuid not null,
 
   -- ── Revisión humana y materialización ──
   revisada_por uuid references usuario(id),
@@ -168,6 +409,7 @@ create table propuesta_ai (
   unique (id, workspace_id),
   foreign key (item_id, workspace_id) references item_importacion (id, workspace_id),
   foreign key (reto_id, workspace_id) references reto (id, workspace_id),
+  foreign key (llamada_id, workspace_id) references llamada_ai (id, workspace_id),
   foreign key (evidencia_id, workspace_id) references evidencia (id, workspace_id),
   foreign key (criterio_id, workspace_id) references criterio_exito (id, workspace_id),
 
@@ -270,16 +512,27 @@ begin
     -- de material sin consentimiento no puede EXISTIR, venga de donde venga la
     -- escritura. Y exige que el consentimiento cubra el procesamiento externo: haber
     -- autorizado la grabación no es haber autorizado mandarla a un tercero.
+    -- Se mira el registro VIGENTE, no «si existe alguno»: un permiso solo para uso interno
+    -- no desbloquea, uno externo posterior sí, y una revocación futura vuelve a bloquear.
     if new.item_id is not null and exists (
       select 1 from item_importacion i
       where i.id = new.item_id and i.workspace_id = new.workspace_id
         and tipo_fuente_exige_consentimiento(i.tipo_fuente)
-        and not exists (
-          select 1 from consentimiento_item c
-          where c.item_id = i.id and c.workspace_id = i.workspace_id
-            and c.procesamiento_externo)
+        and not consentimiento_externo_vigente(i.id, i.workspace_id)
     ) then
       raise exception 'ese material exige consentimiento registrado para procesamiento externo antes de generar propuestas AI (RF-09.5)';
+    end if;
+
+    -- Y no puede haber extracción de un item sin material que extraer: una evidencia
+    -- fechada y citada derivada solo de la ficha (título y referencia) sería inventada por
+    -- construcción, no por casualidad. El servicio lo corta antes de gastar la llamada;
+    -- esto es el suelo para cualquier otra escritura.
+    if new.item_id is not null and exists (
+      select 1 from item_importacion i
+      where i.id = new.item_id and i.workspace_id = new.workspace_id
+        and not item_tiene_material_extraible(i.contenido)
+    ) then
+      raise exception 'ese item no tiene material que citar (solo referencia): no se pueden generar propuestas de extracción sobre él';
     end if;
 
     -- RF-09.9: de qué workspace salió qué material, a qué modelo y con qué credencial.
@@ -455,9 +708,8 @@ grant select, insert, delete on reserva_ai to designio_app;
 grant select, insert on propuesta_ai to designio_app;
 -- Fuera del grant y por tanto sin superficie: capacidad, destino, item_id, reto_id,
 -- contenido_original, confianza, es_simulacion, modelo, prompt_version, alcance_resumen,
--- latencia_ms, origen_key, llamada_id, tokens_entrada, tokens_salida, costo_usd,
--- creado_por — el lineage y el original son inmutables (SYS-17/19), y el coste de una
--- llamada ya hecha no se reescribe.
+-- origen_key, llamada_id, creado_por — el lineage y el original son inmutables
+-- (SYS-17/19), y una propuesta no puede reapuntar a otra llamada que la pagó.
 -- `revisada_en` tampoco: lo estampa el guard, no el caller.
 grant update (estado, contenido, revisada_por, evidencia_id, criterio_id)
   on propuesta_ai to designio_app;

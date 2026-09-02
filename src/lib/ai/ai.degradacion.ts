@@ -168,3 +168,9 @@ export function motivoDeFalloProveedor(e: unknown): string {
 /** El proveedor devolvió algo que no cumple el esquema de la capacidad: se descarta
  * entera (una propuesta a medias no es revisable) y se dice sin jerga. */
 export const MOTIVO_ESQUEMA = `La respuesta del proveedor AI no cumplió el formato esperado y se descartó. ${COLA_MANUAL}`;
+
+/** El proveedor ATENDIÓ la llamada y se negó a producir contenido (`stop_reason` de
+ * negativa). No es indisponibilidad ni una petición mal formada: es una respuesta, con su
+ * uso facturado, y llamarla por su nombre evita leerla como un fallo transitorio que
+ * conviene reintentar — reintentar una negativa solo gasta el presupuesto otra vez. */
+export const MOTIVO_RECHAZO = `El proveedor AI se negó a procesar este material. ${COLA_MANUAL}`;

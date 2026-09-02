@@ -135,12 +135,18 @@ function PantallaPropuestas() {
                 habilitada={datos.ai.disponible}
                 items={datos.itemsPendientes}
                 retos={datos.retosAbiertos}
+                hayMasItems={datos.hayMasItems}
+                hayMasRetos={datos.hayMasRetos}
                 onGenerado={async (n) => {
                   setAviso(`${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`);
                   await refrescar();
                 }}
-                onConsentimiento={async () => {
-                  setAviso('Consentimiento registrado: ya puedes pedir la propuesta');
+                onConsentimiento={async (r) => {
+                  setAviso(
+                    r.autorizaExterno
+                      ? `Consentimiento registrado (nº ${r.version}): ya puedes pedir la propuesta`
+                      : `Consentimiento registrado (nº ${r.version}). No cubre el procesamiento externo, así que la generación sigue bloqueada; si la persona lo autoriza después, registra un consentimiento nuevo y ese pasará a ser el vigente.`,
+                  );
                   await refrescar();
                 }}
                 onError={(e) => {
@@ -271,6 +277,8 @@ function FormularioGeneracion({
   habilitada,
   items,
   retos,
+  hayMasItems,
+  hayMasRetos,
   onGenerado,
   onConsentimiento,
   onError,
@@ -279,19 +287,26 @@ function FormularioGeneracion({
   habilitada: boolean;
   items: CandidatoAncla[];
   retos: CandidatoAncla[];
+  hayMasItems: boolean;
+  hayMasRetos: boolean;
   onGenerado: (generadas: number) => Promise<void>;
-  onConsentimiento: () => Promise<void>;
+  onConsentimiento: (r: { version: number; autorizaExterno: boolean }) => Promise<void>;
   onError: (e: string | null) => void;
 }) {
   const [capacidad, setCapacidad] = useState<CapacidadActiva>('CI');
   const [anclaId, setAnclaId] = useState('');
   const [enviando, setEnviando] = useState(false);
   const anclas = capacidad === 'CI' ? items : retos;
+  const hayMas = capacidad === 'CI' ? hayMasItems : hayMasRetos;
   const elegida = anclas.find((a) => a.id === anclaId);
-  // RF-09.5: si el material es de personas y nadie ha registrado el consentimiento, el
-  // paso que toca no es generar — es registrarlo. La pantalla lo dice y lo ofrece aquí
-  // mismo en vez de dejar que el intento falle contra el servidor.
+  // RF-09.5: si el material es de personas y el consentimiento vigente no cubre el
+  // procesamiento externo, el paso que toca no es generar — es registrarlo. La pantalla lo
+  // dice y lo ofrece aquí mismo en vez de dejar que el intento falle contra el servidor.
   const faltaConsentimiento = Boolean(elegida?.consentimientoPendiente);
+  // Y un item importado solo con la referencia no tiene material que citar: la extracción
+  // se apaga con su explicación, porque aquí no hay nada que arreglar (el contenido de un
+  // item importado es inmutable) — el camino es la bandeja.
+  const sinMaterial = Boolean(elegida?.sinMaterial);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -349,6 +364,7 @@ function FormularioGeneracion({
                 <option key={a.id} value={a.id}>
                   {a.titulo}
                   {a.consentimientoPendiente ? ' · falta consentimiento' : ''}
+                  {a.sinMaterial ? ' · sin material que citar' : ''}
                 </option>
               ))}
             </Select>
@@ -361,9 +377,28 @@ function FormularioGeneracion({
               : 'No hay retos con criterios abiertos (un G0 aprobado los congela).'}
           </span>
         )}
+        {/* El recorte de la lista se dice: es la ÚNICA puerta a la generación, así que
+            callarlo hacía creer que no había más anclas que ofrecer. */}
+        {hayMas && (
+          <Aviso>
+            {capacidad === 'CI'
+              ? `Hay más items pendientes de los que caben aquí: se listan los ${anclas.length} más antiguos. Decide o cura estos y los siguientes aparecerán.`
+              : `Hay más retos con criterios abiertos de los que caben aquí: se listan los ${anclas.length} primeros por código.`}
+          </Aviso>
+        )}
+        {sinMaterial && (
+          <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+            «{elegida!.titulo}» se importó solo con la referencia al original: no hay texto que
+            citar, y una extracción sobre pura ficha sería inventada. Cúralo a mano en la bandeja
+            de importación, o vuelve a importarlo con el contenido pegado.
+          </span>
+        )}
         {!faltaConsentimiento && (
           <div>
-            <Button type="submit" disabled={enviando || !habilitada || anclas.length === 0}>
+            <Button
+              type="submit"
+              disabled={enviando || !habilitada || anclas.length === 0 || sinMaterial}
+            >
               {enviando ? 'Proponiendo…' : 'Proponer con AI'}
             </Button>
           </div>
@@ -391,7 +426,13 @@ function FormularioGeneracion({
 /**
  * Captura del consentimiento ANTES de procesar (RF-09.5). Está aquí, delante del botón de
  * generar, porque ese es el momento en que importa: hasta que no consta qué autorizó la
- * persona, el material no sale hacia ningún proveedor. Se registra una vez y no se edita.
+ * persona, el material no sale hacia ningún proveedor. Ningún registro se edita ni se
+ * borra: lo que cambia el permiso es un registro NUEVO, y el vigente es el que manda.
+ *
+ * Por eso el botón ya no exige marcar la casilla. Anotar «autorizó solo el uso interno» es
+ * un hecho legítimo y útil —queda en la bitácora, con su autor y su fecha— y ya no condena
+ * al item: cuando la persona autorice el procesamiento externo, ese consentimiento nuevo
+ * pasa a ser el vigente y desbloquea la generación.
  */
 function FormularioConsentimiento({
   workspaceId,
@@ -403,7 +444,7 @@ function FormularioConsentimiento({
   workspaceId: string;
   itemId: string;
   titulo: string;
-  onRegistrado: () => Promise<void>;
+  onRegistrado: (r: { version: number; autorizaExterno: boolean }) => Promise<void>;
   onError: (e: string | null) => void;
 }) {
   const [alcance, setAlcance] = useState('');
@@ -421,7 +462,7 @@ function FormularioConsentimiento({
           const r = await registrarConsentimientoAI({
             data: { workspaceId, itemId, alcance, procesamientoExterno },
           });
-          if (r.ok) await onRegistrado();
+          if (r.ok) await onRegistrado({ version: r.version, autorizaExterno: r.autorizaExterno });
           else onError(r.error);
         } catch {
           onError('No se pudo registrar el consentimiento; intenta de nuevo');
@@ -434,8 +475,9 @@ function FormularioConsentimiento({
         «{titulo}» es material de personas: registra el consentimiento antes de procesarlo
       </span>
       <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
-        Sin este registro el material no sale hacia el proveedor AI (RF-09.5). El item sigue
-        pudiendo curarse a mano en la bandeja, como siempre.
+        Sin un consentimiento vigente que cubra el procesamiento externo, el material no sale
+        hacia el proveedor AI (RF-09.5). El item sigue pudiendo curarse a mano en la bandeja,
+        como siempre.
       </span>
       <label style={campo}>
         <span style={etiqueta}>Qué autorizó la persona</span>
@@ -464,14 +506,16 @@ function FormularioConsentimiento({
         El consentimiento cubre el procesamiento por un proveedor externo
       </label>
       <div>
-        <Button type="submit" size="sm" disabled={enviando || !procesamientoExterno}>
+        <Button type="submit" size="sm" disabled={enviando}>
           {enviando ? 'Registrando…' : 'Registrar consentimiento'}
         </Button>
       </div>
       {!procesamientoExterno && (
-        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-faint)' }}>
           Autorizar la grabación no es autorizar mandarla a un tercero: sin esa casilla, la AI
-          sigue sin poder procesar este material.
+          sigue sin poder procesar este material. El registro se guarda igual —es un hecho de la
+          investigación— y no cierra la puerta: si la persona lo autoriza más adelante, se
+          registra un consentimiento nuevo y ese pasa a ser el vigente.
         </span>
       )}
     </form>
@@ -613,9 +657,15 @@ function TarjetaPropuesta({
           La decisión la toma la boutique (lead o diseñador).
         </span>
       )}
+      {/* El ancla dejó de admitir la materialización, y el porqué depende del destino: un
+          item ya curado a mano, o un reto cuyo G0 se aprobó DESPUÉS de generar la propuesta
+          (SYS-22: ese gate certificó unos criterios y los congeló). En los dos casos la
+          propuesta quedó obsoleta y aceptarla solo produciría un rechazo de la base. */}
       {propuesta.estado === 'propuesta' && puedeRevisar && !propuesta.anclaDisponible && (
-        <span style={{ font: '500 12.5px var(--font-sans)', color: 'var(--warn)' }}>
-          El item ya se curó a mano: esta propuesta quedó obsoleta y solo puede rechazarse.
+        <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+          {esExtraccion
+            ? 'El item ya se curó a mano: esta propuesta quedó obsoleta y solo puede rechazarse.'
+            : 'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse.'}
         </span>
       )}
       {propuesta.estado === 'propuesta' && puedeRevisar && !corrigiendo && (

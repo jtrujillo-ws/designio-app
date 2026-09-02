@@ -216,9 +216,14 @@ export type PropuestaEnPanel = {
 export type CandidatoAncla = {
   id: string;
   titulo: string;
-  /** Solo items: su material es de personas y aún no tiene consentimiento registrado
-   * para procesamiento externo, así que la generación está bloqueada (RF-09.5). */
+  /** Solo items: el consentimiento VIGENTE sobre su material de personas no cubre el
+   * procesamiento externo (nunca se registró, o el último registro no lo autoriza), así que
+   * la generación está bloqueada (RF-09.5). */
   consentimientoPendiente?: boolean;
+  /** Solo items: se importó sin texto pegado (solo la referencia al original), así que no
+   * hay nada que citar y la extracción produciría una evidencia inventada a partir de la
+   * ficha. Se marca en vez de esconderse: el item sigue curándose a mano en la bandeja. */
+  sinMaterial?: boolean;
 };
 
 export type PanelPropuestas = {
@@ -238,7 +243,15 @@ export type PanelPropuestas = {
    * pendiente antigua (y la generación tampoco volvía a ofrecer su item). */
   hayMasPendientes: boolean;
   hayMasDecididas: boolean;
-  /** Anclas ofrecibles a la generación: items de bandeja pendientes y retos abiertos. */
+  /** Anclas ofrecibles a la generación: items de bandeja pendientes y retos abiertos. El
+   * selector del formulario es la ÚNICA puerta a la generación, así que estas listas se
+   * ordenan por antigüedad (FIFO): el recorte cae sobre lo recién llegado —que vuelve a
+   * aparecer en la siguiente pasada— y nunca sobre lo que más lleva esperando, que si no
+   * jamás alcanzaría la ventana. */
   itemsPendientes: CandidatoAncla[];
   retosAbiertos: CandidatoAncla[];
+  /** Y el recorte se DICE, como en las listas de propuestas: callarlo hacía creer que no
+   * había más anclas que ofrecer. */
+  hayMasItems: boolean;
+  hayMasRetos: boolean;
 };

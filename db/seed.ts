@@ -1096,17 +1096,25 @@ async function sembrarPropuestaAI(
     ],
   };
 
-  // Con su uso y su coste: la observabilidad de costos (RF-09.14) tiene que verse en la
-  // demo, no solo existir en el esquema.
+  // La llamada que la produjo, con su uso y su coste: la observabilidad de costos
+  // (RF-09.14) tiene que verse en la demo, no solo existir en el esquema. Vive en su propia
+  // fila porque una llamada es una unidad de gasto —aunque devuelva un lote, y aunque no
+  // llegue a nacer ninguna propuesta de ella—.
+  const [llamada] = await tx`insert into llamada_ai
+    (workspace_id, capacidad, item_id, modelo, origen_key, resultado, tokens_entrada,
+     tokens_salida, costo_usd, latencia_ms, creado_por)
+    values (${wsId}, 'CI', ${itemId}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+            1420, 640, ${costoDeUso(MODELO_PRIMARIO, { entrada: 1420, salida: 640 })},
+            1840, ${luciaId})
+    returning id`;
+
   const [propuesta] = await tx`insert into propuesta_ai
     (workspace_id, capacidad, destino, item_id, contenido, contenido_original, confianza,
-     modelo, prompt_version, alcance_resumen, latencia_ms, origen_key,
-     tokens_entrada, tokens_salida, costo_usd, creado_por)
+     modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
     values (${wsId}, 'CI', 'evidencia', ${itemId}, ${tx.json(contenido)}, ${tx.json(contenido)},
             0.55, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
             ${`item de bandeja «${TITULO_ITEM_AI}» · ${MATERIAL_ITEM_AI.length} de ${MATERIAL_ITEM_AI.length} caracteres`},
-            1840, 'entorno', 1420, 640,
-            ${costoDeUso(MODELO_PRIMARIO, { entrada: 1420, salida: 640 })}, ${luciaId})
+            'entorno', ${llamada!.id as string}, ${luciaId})
     returning id`;
 
   // El guard de la tabla emite este evento para las escrituras CON contexto de usuario; el

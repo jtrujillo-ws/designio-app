@@ -34,7 +34,7 @@ import {
 import {
   credencialesAI,
   generarConProveedor,
-  type ResultadoProveedor,
+  type UsoLlamada,
 } from './proveedor.server';
 
 /**
@@ -55,6 +55,10 @@ export class ErrorAI extends Error {}
 
 const PAGINA_PENDIENTES = 100;
 const DECIDIDAS_RECIENTES = 50;
+/** Cuántas anclas se ofrecen a la vez en el formulario de generación. El corte es
+ * inevitable (un `select` no es una superficie de paginación); lo que no puede pasar es que
+ * deje algo permanentemente inalcanzable, y de eso se encarga el orden FIFO más el aviso. */
+const PAGINA_ANCLAS = 50;
 /** Cuántos criterios se le piden a C0 de una vez: revisión por elemento, lote pequeño. */
 const CRITERIOS_POR_GENERACION = 3;
 
@@ -155,7 +159,10 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
     anclaId: ((f.item_id ?? f.reto_id) as string | null) ?? '',
-    anclaDisponible: (f.ancla_disponible as boolean | null) ?? true,
+    // Si no se pudo determinar, se trata como NO disponible: habilitar dos botones que la
+    // base va a rechazar es peor que pedir un refresco (y el `true` por defecto era
+    // exactamente el fallo — dejaba todas las propuestas C0 marcadas como aceptables).
+    anclaDisponible: (f.ancla_disponible as boolean | null) ?? false,
     modelo: f.modelo as string,
     promptVersion: f.prompt_version as string,
     origenKey: f.origen_key as OrigenKey,
@@ -188,16 +195,28 @@ export async function panelPropuestas(
     const ai = await estadoCapacidad(tx, workspaceId);
 
     // Fragmentos compartidos: dos consultas con la MISMA proyección no pueden divergir.
+    //
+    // `ancla_disponible` se deriva de lo que congela CADA destino, no del item. Con un
+    // coalesce sobre el estado del item que caía en `true`, toda propuesta C0 —cuyo join
+    // con el item es null por construcción— salía disponible: si el G0 del reto se aprobaba
+    // entre generar y revisar, sus criterios quedaban congelados (SYS-22), la
+    // materialización empezaba a rechazar cualquier aceptación y el panel seguía ofreciendo
+    // los dos botones como si nada.
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, p.item_id, p.reto_id,
-             p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen, p.latencia_ms,
-             p.costo_usd, p.creado_en, p.revisada_en,
+             p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
+             l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
              coalesce(i.titulo, r.codigo || ' ' || r.titulo) as ancla_titulo,
-             coalesce(i.estado = 'pendiente', true) as ancla_disponible,
+             case when p.item_id is not null then i.estado = 'pendiente'
+                  else not reto_criterios_congelados(p.reto_id, p.workspace_id)
+             end as ancla_disponible,
              i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
              i.referencia as item_referencia,
              left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`;
+    // La llamada que pagó cada propuesta: el uso, el coste y la latencia viven allí (una
+    // fila por llamada, aunque devuelva un lote), no repetidos en cada propuesta.
     const origen = tx`from propuesta_ai p
+      join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
       left join item_importacion i
         on i.id = p.item_id and i.workspace_id = p.workspace_id
       left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`;
@@ -215,31 +234,35 @@ export async function panelPropuestas(
 
     // Anclas ofrecibles a la generación. Un item con propuesta pendiente no se vuelve a
     // ofrecer: pedir otra quemaría presupuesto sobre algo que ya espera revisión humana.
-    // Los que exigen consentimiento se ofrecen igual, MARCADOS: la pantalla explica qué
-    // falta y deja registrarlo, que es más útil que esconder el item sin decir por qué.
+    // Los que exigen consentimiento o no traen material se ofrecen igual, MARCADOS: la
+    // pantalla explica qué falta, que es más útil que esconder el item sin decir por qué.
+    //
+    // Y van de la MÁS ANTIGUA a la más nueva. Este selector es la única puerta a la
+    // generación, así que con el orden inverso los items más viejos caían fuera del corte y
+    // ninguna acción del producto volvía a acercarlos: seguían pendientes y elegibles, pero
+    // inalcanzables. En FIFO el recorte cae sobre lo recién importado —que reaparece en
+    // cuanto la cabeza de la cola se decide— y la ventana avanza sola.
     const items = await tx`
       select i.id, i.titulo,
              tipo_fuente_exige_consentimiento(i.tipo_fuente)
-               and not exists (select 1 from consentimiento_item c
-                 where c.item_id = i.id and c.workspace_id = i.workspace_id
-                   and c.procesamiento_externo) as consentimiento_pendiente
+               and not consentimiento_externo_vigente(i.id, i.workspace_id)
+               as consentimiento_pendiente,
+             not item_tiene_material_extraible(i.contenido) as sin_material
       from item_importacion i
       where i.workspace_id = ${workspaceId} and i.estado = 'pendiente'
         and not exists (select 1 from propuesta_ai p
           where p.item_id = i.id and p.workspace_id = i.workspace_id and p.estado = 'propuesta')
-      order by i.creado_en desc
-      limit 50`;
+      order by i.creado_en asc, i.id asc
+      limit ${PAGINA_ANCLAS + 1}`;
     // Retos con criterios aún abiertos: con un G0 aprobado están congelados (SYS-22) y
     // proponer criterios para ellos sería ofrecer una acción que la base va a rechazar.
+    // El código de reto es creciente en el tiempo, así que ordenar por él es el mismo FIFO.
     const retos = await tx`
       select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
       where r.workspace_id = ${workspaceId} and r.estado in ('candidato', 'activo')
-        and not exists (select 1 from gate_instancia g
-          join proyecto pr on pr.id = g.proyecto_id and pr.workspace_id = g.workspace_id
-          where pr.reto_id = r.id and pr.workspace_id = r.workspace_id
-            and g.numero = 0 and g.estado = 'aprobado')
-      order by r.codigo
-      limit 50`;
+        and not reto_criterios_congelados(r.id, r.workspace_id)
+      order by r.codigo asc, r.id asc
+      limit ${PAGINA_ANCLAS + 1}`;
 
     return {
       workspaceId,
@@ -254,12 +277,17 @@ export async function panelPropuestas(
       decididas: decididas.slice(0, DECIDIDAS_RECIENTES).map(filaDePanel),
       hayMasPendientes: pendientes.length > PAGINA_PENDIENTES,
       hayMasDecididas: decididas.length > DECIDIDAS_RECIENTES,
-      itemsPendientes: items.map((i) => ({
+      itemsPendientes: items.slice(0, PAGINA_ANCLAS).map((i) => ({
         id: i.id as string,
         titulo: i.titulo as string,
         consentimientoPendiente: i.consentimiento_pendiente as boolean,
+        sinMaterial: i.sin_material as boolean,
       })),
-      retosAbiertos: retos.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
+      retosAbiertos: retos
+        .slice(0, PAGINA_ANCLAS)
+        .map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
+      hayMasItems: items.length > PAGINA_ANCLAS,
+      hayMasRetos: retos.length > PAGINA_ANCLAS,
     };
   });
 }
@@ -300,10 +328,8 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     if (entrada.capacidad === 'CI') {
       const [item] = await tx`select titulo, tipo_fuente, referencia, contenido,
           tipo_fuente_exige_consentimiento(tipo_fuente)
-            and not exists (select 1 from consentimiento_item c
-              where c.item_id = item_importacion.id
-                and c.workspace_id = item_importacion.workspace_id
-                and c.procesamiento_externo) as falta_consentimiento
+            and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
+          item_tiene_material_extraible(contenido) as tiene_material
         from item_importacion
         where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
           and estado = 'pendiente'`;
@@ -314,6 +340,18 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       if (item.falta_consentimiento as boolean) {
         throw new ErrorAI(
           'Ese material es de personas: registra el consentimiento para procesarlo con un proveedor externo antes de pedir una propuesta (RF-09.5)',
+        );
+      }
+      // Un item importado SOLO con la referencia al original no tiene nada que citar, y el
+      // contrato de CI obliga al modelo a devolver una evidencia fechada con al menos una
+      // cita literal. Sin cuerpo, la única salida que cumple el contrato es inventada a
+      // partir de la ficha: una propuesta con apariencia de fundamentada, pagada, que
+      // además contamina la métrica de fidelidad. Y no hay recuperación posible — no hay
+      // herramienta que lea la fuente referenciada — así que la respuesta correcta es no
+      // ofrecer la generación, no intentarla peor.
+      if (!(item.tiene_material as boolean)) {
+        throw new ErrorAI(
+          'Ese item se importó solo con la referencia al original: no hay material que citar, así que no se puede extraer evidencia de él. Cúralo a mano en la bandeja o vuelve a importarlo con el texto pegado.',
         );
       }
       const [pendiente] = await tx`select 1 as hay from propuesta_ai
@@ -335,12 +373,12 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
           and estado in ('candidato', 'activo')`;
       if (!reto) throw new ErrorAI('El reto no existe en este workspace o ya no admite criterios');
       // El congelado de criterios lo impone la política de criterio_exito; anticiparlo aquí
-      // evita quemar presupuesto en una propuesta que nadie podría aceptar.
-      const [congelado] = await tx`select 1 as hay from gate_instancia g
-        join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
-        where p.reto_id = ${entrada.anclaId} and p.workspace_id = ${entrada.workspaceId}
-          and g.numero = 0 and g.estado = 'aprobado' limit 1`;
-      if (congelado) {
+      // evita quemar presupuesto en una propuesta que nadie podría aceptar. Mismo predicado
+      // que usa el panel para decidir qué retos ofrece y qué propuestas siguen vivas: una
+      // sola función, tres lecturas que no pueden discrepar.
+      const [congelado] = await tx`select
+        reto_criterios_congelados(${entrada.anclaId}, ${entrada.workspaceId}) as hay`;
+      if (congelado?.hay) {
         throw new ErrorAI('El G0 de ese reto ya fue aprobado: sus criterios están congelados');
       }
       sistema = SISTEMA_CRITERIOS;
@@ -433,6 +471,52 @@ function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): Contenid
   return ContenidoCriterioSchema.array().min(1).max(4).parse(lote.criterios);
 }
 
+/** Qué devolvió el proveedor. Es lo que se anota en el libro de llamadas: describe la
+ * RESPUESTA, no si se llegó a guardar algo — cuántas propuestas nacieron de una llamada se
+ * responde mirando quién la referencia, y así la fila no puede mentir. */
+type ResultadoLlamada = 'salida-valida' | 'rechazo-proveedor' | 'fuera-de-contrato' | 'sin-respuesta';
+
+/**
+ * Anota la llamada al proveedor en el libro de costos (RF-09.14), haya nacido o no una
+ * propuesta. Es la mitad que faltaba: una negativa del proveedor o una salida fuera de
+ * contrato son llamadas atendidas y FACTURADAS, con su `usage` dentro, y se perdían enteras
+ * porque el uso solo se guardaba colgado de una propuesta que en esos casos no existe.
+ *
+ * Transacción propia y ANTES de persistir el lote: si el guardado falla después (una
+ * carrera por el item, un esquema que no cuadra), la llamada sigue anotada — el dinero se
+ * gastó igual. Su id es lo que las propuestas referencian, así que ninguna puede existir
+ * sin su línea de gasto.
+ */
+async function registrarLlamada(
+  actorId: string,
+  entrada: GenerarPropuestas,
+  alcance: Alcance,
+  llamada: {
+    modelo: string;
+    latenciaMs: number | null;
+    uso: UsoLlamada | null;
+    resultado: ResultadoLlamada;
+    motivo: string;
+  },
+): Promise<string> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [fila] = await tx`insert into llamada_ai
+      (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado, motivo,
+       tokens_entrada, tokens_salida, costo_usd, latencia_ms, creado_por)
+      values (${entrada.workspaceId}, ${entrada.capacidad},
+              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
+              ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
+              ${llamada.modelo}, ${alcance.origenKey}, ${llamada.resultado},
+              ${llamada.motivo.slice(0, 500)},
+              ${llamada.uso?.entrada ?? null}, ${llamada.uso?.salida ?? null},
+              ${llamada.uso?.costoUsd ?? null}, ${llamada.latenciaMs},
+              ${actorId})
+      returning id`;
+    return fila!.id as string;
+  });
+}
+
 /**
  * Genera propuestas para un ancla (RF-08.1). Nada del dominio cambia aquí: solo nacen
  * filas de `propuesta_ai` en estado `propuesta`, con su lineage completo (SYS-19).
@@ -450,17 +534,51 @@ export async function generarPropuestas(
       sistema: alcance.sistema,
       usuario: alcance.usuario,
     });
-    if (!respuesta.ok) throw new ErrorAI(respuesta.motivo);
+
+    // El proveedor no dio contenido utilizable. La llamada se anota igual —con su uso, si
+    // la respuesta llegó a existir— y solo DESPUÉS se corta: registrar el gasto no puede
+    // depender de que el resultado nos guste. Si el propio registro falla, manda el motivo
+    // del proveedor: es lo que la persona necesita leer.
+    if (!respuesta.ok) {
+      await registrarLlamada(actorId, entrada, alcance, {
+        modelo: respuesta.modelo,
+        latenciaMs: respuesta.latenciaMs,
+        uso: respuesta.uso,
+        resultado: respuesta.causa,
+        motivo: respuesta.motivo,
+      }).catch(() => {});
+      throw new ErrorAI(respuesta.motivo);
+    }
 
     let contenidos: ContenidoPropuesta[];
     try {
       contenidos = contenidosValidos(entrada.capacidad, respuesta.datos);
     } catch {
-      throw new ErrorAI(
-        'La respuesta del proveedor AI no cumplió el esquema de la capacidad y se descartó. Todo el flujo sigue disponible a mano.',
-      );
+      // Respondió, se pagó, y no cumple el esquema de la capacidad: el peor caso para la
+      // observabilidad si no se anotara, porque no deja ni propuesta que lo delate.
+      const motivo =
+        'La respuesta del proveedor AI no cumplió el esquema de la capacidad y se descartó. Todo el flujo sigue disponible a mano.';
+      await registrarLlamada(actorId, entrada, alcance, {
+        modelo: respuesta.modelo,
+        latenciaMs: respuesta.latenciaMs,
+        uso: respuesta.uso,
+        resultado: 'fuera-de-contrato',
+        motivo,
+      }).catch(() => {});
+      throw new ErrorAI(motivo);
     }
-    return await persistirPropuestas(actorId, entrada, alcance, respuesta, contenidos);
+
+    const llamadaId = await registrarLlamada(actorId, entrada, alcance, {
+      modelo: respuesta.modelo,
+      latenciaMs: respuesta.latenciaMs,
+      uso: respuesta.uso,
+      resultado: 'salida-valida',
+      motivo: '',
+    });
+    return await persistirPropuestas(actorId, entrada, alcance, contenidos, {
+      id: llamadaId,
+      modelo: respuesta.modelo,
+    });
   } catch (e) {
     // Nada nació: el hueco vuelve al presupuesto en el acto. Si la transacción de arriba
     // ya lo había consumido y luego falló, su rollback lo repuso — y este delete lo
@@ -471,17 +589,15 @@ export async function generarPropuestas(
 }
 
 /** Persiste el lote consumiendo la reserva EN LA MISMA transacción (RF-09.12): el hueco
- * apartado y las filas que lo ocupan nacen o no nacen juntos. */
+ * apartado y las filas que lo ocupan nacen o no nacen juntos. `llamadaId` es la línea del
+ * libro de costos que ya quedó escrita: las propuestas de un lote cuelgan de ella. */
 async function persistirPropuestas(
   actorId: string,
   entrada: GenerarPropuestas,
   alcance: Alcance,
-  respuesta: Extract<ResultadoProveedor, { ok: true }>,
   contenidos: ContenidoPropuesta[],
+  llamada: { id: string; modelo: string },
 ): Promise<{ generadas: number }> {
-  // Agrupa las propuestas de ESTA llamada: su uso y su coste son de la llamada, no de
-  // cada fila, y el reporte de costos suma por llamada distinta (RF-09.14).
-  const llamadaId = crypto.randomUUID();
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await bloquearPresupuesto(tx, entrada.workspaceId);
@@ -514,16 +630,13 @@ async function persistirPropuestas(
       const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
-         modelo, prompt_version, alcance_resumen, latencia_ms, origen_key, llamada_id,
-         tokens_entrada, tokens_salida, costo_usd, creado_por)
+         modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino},
              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
              ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
              c.contenido, c.contenido,
-             ${respuesta.modelo}, ${PROMPT_VERSION}, ${alcance.alcanceResumen},
-             ${respuesta.latenciaMs}, ${alcance.origenKey}, ${llamadaId},
-             ${respuesta.uso?.entrada ?? null}, ${respuesta.uso?.salida ?? null},
-             ${respuesta.uso?.costoUsd ?? null}, ${actorId}
+             ${llamada.modelo}, ${PROMPT_VERSION}, ${alcance.alcanceResumen},
+             ${alcance.origenKey}, ${llamada.id}, ${actorId}
       from jsonb_array_elements(${tx.json(contenidos)}) as c(contenido)
       returning id`;
       return { generadas: filas.length };
@@ -548,33 +661,57 @@ async function persistirPropuestas(
   });
 }
 
+/** Candado del consentimiento de un item: la versión del registro nuevo se calcula
+ * leyendo la máxima actual, y una consulta es un predicado sobre un snapshot — dos
+ * curadores registrando a la vez leerían el mismo máximo. El índice único de la bitácora es
+ * el suelo (uno de los dos fallaría); esto es lo que hace que ninguno tenga que fallar. */
+async function bloquearConsentimiento(tx: TransactionSql, itemId: string): Promise<void> {
+  await tx`select pg_advisory_xact_lock(
+    hashtextextended('designio:consentimiento:' || ${itemId}, 42))`;
+}
+
 /**
  * Registra el consentimiento de las personas sobre el material de un item (RF-09.5),
  * ANTES de procesarlo. No lo propone ni lo infiere la AI: lo declara la persona que
  * condujo la investigación, y queda atribuido por la política.
  *
- * Es append-only: no hay grant de UPDATE ni de DELETE sobre la tabla, así que un
- * consentimiento registrado no se puede reescribir ni borrar desde la app. Una revocación
- * futura (RF-09.4) será su propio objeto, no una edición de este.
+ * Es una BITÁCORA append-only: cada registro es una fila nueva —sin grant de UPDATE ni de
+ * DELETE, así que ninguno se reescribe ni se borra— y el que manda es el VIGENTE. Con un
+ * único registro por item, quien anotaba honestamente «autorizó solo el uso interno»
+ * (`procesamientoExterno: false`) dejaba el item bloqueado para siempre: el append-only
+ * impedía corregirlo y la clave impedía añadir el permiso que la persona diera después. El
+ * consentimiento no es un estado que se fija una vez, es una sucesión de hechos fechados —
+ * y por eso mismo una revocación futura (RF-09.4) encaja aquí sin tocar nada: es otro
+ * registro, y al ser el vigente vuelve a bloquear.
  */
 export async function registrarConsentimiento(
   actorId: string,
   entrada: RegistrarConsentimiento,
-): Promise<void> {
-  await conUsuario(actorId, async (tx) => {
+): Promise<{ version: number; autorizaExterno: boolean }> {
+  return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await rolCurador(tx, actorId, entrada.workspaceId);
     const [item] = await tx`select 1 as hay from item_importacion
       where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
     if (!item) throw new ErrorAI('El item no existe en este workspace');
+    await bloquearConsentimiento(tx, entrada.itemId);
     try {
-      await tx`insert into consentimiento_item
+      // `version` no viaja: la asigna el guard (y no está en el grant de insert), porque
+      // quien pudiera escribirla podría colar un registro «vigente» que no es el último.
+      const [fila] = await tx`insert into consentimiento_item
         (item_id, workspace_id, alcance, procesamiento_externo, registrado_por)
         values (${entrada.itemId}, ${entrada.workspaceId}, ${entrada.alcance},
-                ${entrada.procesamientoExterno}, ${actorId})`;
+                ${entrada.procesamientoExterno}, ${actorId})
+        returning version, procesamiento_externo`;
+      return {
+        version: Number(fila!.version),
+        autorizaExterno: fila!.procesamiento_externo as boolean,
+      };
     } catch (e) {
       if ((e as { code?: string }).code === '23505') {
-        throw new ErrorAI('Ese item ya tiene consentimiento registrado: no se reescribe');
+        throw new ErrorAI(
+          'Otro registro de consentimiento sobre este item se adelantó: vuelve a intentarlo',
+        );
       }
       throw e;
     }
@@ -695,9 +832,13 @@ async function materializarEvidencia(
     where id = ${p.itemId} and workspace_id = ${workspaceId} and estado = 'pendiente'`;
   if (!item) throw new ErrorAI('El item de la bandeja ya fue curado o no existe');
   // El consentimiento se registró ANTES de procesar (RF-09.5) o no se registró: la
-  // evidencia dice cuál de las dos, y no lo decide ni lo propone la AI.
+  // evidencia dice cuál de las dos, y no lo decide ni lo propone la AI. Aquí la pregunta es
+  // si LLEGÓ A CAPTURARSE el consentimiento de las personas —por eso basta con que exista
+  // algún registro en la bitácora—, no si cubre al proveedor externo: esa segunda pregunta
+  // es la que decide si el material puede salir, y se hace sobre el registro vigente donde
+  // toca, antes de construir el prompt y en el guard de la propuesta.
   const [consentimiento] = await tx`select 1 as hay from consentimiento_item
-    where item_id = ${p.itemId} and workspace_id = ${workspaceId}`;
+    where item_id = ${p.itemId} and workspace_id = ${workspaceId} limit 1`;
 
   const dimensiones = DimensionesEvidenciaSchema.parse({
     proveniencia: {

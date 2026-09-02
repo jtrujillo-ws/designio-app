@@ -159,7 +159,9 @@ export async function aprobarItem(
 ): Promise<{ evidenciaId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const rol = await rolCurador(tx, actorId, entrada.workspaceId);
+    // Gate temprano (mensaje claro antes de trabajar); el rol que se AUDITA no sale de
+    // aquí sino del RETURNING del update decisor — mismo snapshot que su política RLS.
+    await rolCurador(tx, actorId, entrada.workspaceId);
 
     const [item] = await tx`
       select id, titulo, contenido, tipo_fuente, referencia
@@ -215,16 +217,20 @@ export async function aprobarItem(
     const evidenciaId = evidencia!.id as string;
 
     // La política de UPDATE solo alcanza pendientes: si otro curador decidió en paralelo,
-    // esto afecta 0 filas y la transacción entera se revierte.
+    // esto afecta 0 filas y la transacción entera se revierte. El RETURNING evalúa
+    // workspace_role en el snapshot de ESTA sentencia: el rol auditado es exactamente
+    // el que autorizó la decisión (en sentencias separadas, un cambio de membresía
+    // entre lead-boutique y diseñador registraría el rol viejo).
     const selladas = await tx`update item_importacion
       set estado = 'aprobado', decidido_por = ${actorId}, decidido_en = now(), evidencia_id = ${evidenciaId}
-      where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId} and estado = 'pendiente'`;
-    if (selladas.count === 0) throw new ErrorCuraduria('El item ya fue decidido por otra persona');
+      where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId} and estado = 'pendiente'
+      returning workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
+    if (selladas.length === 0) throw new ErrorCuraduria('El item ya fue decidido por otra persona');
 
     await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (${entrada.workspaceId}, 'EvidenciaCurada',
         ${tx.json({ itemId: entrada.itemId, evidenciaId, esEstadoActual: entrada.esEstadoActual })},
-        ${actorId}, ${rol})`;
+        ${actorId}, ${selladas[0]!.rol as string})`;
 
     return { evidenciaId };
   });
@@ -233,13 +239,15 @@ export async function aprobarItem(
 export async function rechazarItem(actorId: string, entrada: RechazarItem): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const rol = await rolCurador(tx, actorId, entrada.workspaceId);
+    await rolCurador(tx, actorId, entrada.workspaceId); // gate temprano (mensaje claro)
+    // Igual que en aprobar: el rol auditado sale del snapshot del update decisor.
     const selladas = await tx`update item_importacion
       set estado = 'rechazado', decidido_por = ${actorId}, decidido_en = now()
-      where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId} and estado = 'pendiente'`;
-    if (selladas.count === 0) throw new ErrorCuraduria('El item no existe o ya fue decidido');
+      where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId} and estado = 'pendiente'
+      returning workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
+    if (selladas.length === 0) throw new ErrorCuraduria('El item no existe o ya fue decidido');
     await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-      values (${entrada.workspaceId}, 'ItemRechazado', ${tx.json({ itemId: entrada.itemId })}, ${actorId}, ${rol})`;
+      values (${entrada.workspaceId}, 'ItemRechazado', ${tx.json({ itemId: entrada.itemId })}, ${actorId}, ${selladas[0]!.rol as string})`;
   });
 }
 

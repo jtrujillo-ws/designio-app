@@ -56,8 +56,10 @@ create table proyecto (
 );
 create index proyecto_reto_idx on proyecto (reto_id);
 
--- Arista «afecta» reto→servicio a nivel de agregado. El servicio ANCLA no se duplica
--- aquí (criterio de aceptación 1 de SPEC-02: ninguna relación se duplica).
+-- Arista «afecta» reto→servicio a nivel de agregado. El DDL no prohíbe una arista
+-- redundante con el servicio ANCLA: la garantía de "ninguna relación duplicada"
+-- (criterio de aceptación 1 de SPEC-02) la aplica la PROYECCIÓN, que ignora esas
+-- aristas, y la función de escritura futura las rechazará al crearlas.
 create table reto_servicio_afectado (
   reto_id uuid not null,
   servicio_id uuid not null,

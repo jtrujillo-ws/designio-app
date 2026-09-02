@@ -8,7 +8,8 @@ import { construirArbol } from './arbol.queries';
  * Árbol de navegación del workspace (proyección de lectura, SPEC-02), en UNA
  * transacción: la membresía se resuelve bajo el propio RLS del usuario (la política de
  * workspace solo muestra los suyos — capa 1 y capa 2 a la vez) y el árbol se proyecta
- * en el mismo snapshot. Sin workspaceId explícito usa la primera membresía.
+ * en el mismo snapshot. Sin workspaceId explícito usa el primer workspace del usuario
+ * ORDENADO POR NOMBRE (el mismo criterio que usuarioConMembresias/topbar).
  */
 export const arbolDelWorkspace = createServerFn({ method: 'GET' })
   .inputValidator(ArbolInputSchema)

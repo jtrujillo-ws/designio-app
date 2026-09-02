@@ -9,5 +9,9 @@ dist/
 .env.*.local
 coverage/
 
+<<<<<<< HEAD
 # Worktrees locales de agentes en paralelo: nunca son parte del repo.
+=======
+# Worktrees de agentes en paralelo (locales, nunca versionados)
+>>>>>>> origin/agents
 .claude/worktrees/

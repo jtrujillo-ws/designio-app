@@ -365,6 +365,9 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
       <Link to="/importacion" style={{ ...item, textDecoration: 'none' }}>
         <span>Bandeja de importación</span>
       </Link>
+      <Link to="/insights" style={{ ...item, textDecoration: 'none' }}>
+        <span>Insights y citas</span>
+      </Link>
       <Link to="/journeys" style={{ ...item, textDecoration: 'none' }}>
         <span>Journeys y blueprints</span>
       </Link>

@@ -100,7 +100,13 @@ export const miembrosDelWorkspace = createServerFn({ method: 'GET' })
   .handler(async ({ data }) => {
     const usuarioId = await usuarioIdDeRequest();
     if (!usuarioId) return null;
-    return listarMiembros(usuarioId, data.workspaceId);
+    try {
+      return await listarMiembros(usuarioId, data.workspaceId);
+    } catch (e) {
+      // Cuenta desactivada con JWT aún vigente: sin datos, como si no hubiera sesión.
+      if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
   });
 
 export const invitarMiembro = createServerFn({ method: 'POST' })

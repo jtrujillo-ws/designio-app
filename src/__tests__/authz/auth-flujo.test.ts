@@ -6,6 +6,7 @@ import {
   crearInvitacion,
   ErrorAutorizacion,
   ErrorInvitacion,
+  listarMiembros,
   usuarioConMembresias,
 } from '@/lib/auth/auth.servicio';
 import { hashPassword } from '@/lib/auth/password.server';
@@ -224,7 +225,7 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     expect(inv.reemision).toBe(false);
   });
 
-  it('una cuenta desactivada con sesión viva ya no puede mutar (re-check de estado)', async () => {
+  it('una cuenta desactivada con sesión viva no muta NI lee datos de gestión (re-check de estado)', async () => {
     const admin = sqlAdmin();
     await admin`update usuario set estado = 'inactivo' where id = ${leadId}`;
     try {
@@ -236,6 +237,7 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
           rol: 'disenador',
         }),
       ).rejects.toThrow(ErrorAutorizacion);
+      await expect(listarMiembros(leadId, ws)).rejects.toThrow(ErrorAutorizacion);
     } finally {
       await admin`update usuario set estado = 'activo' where id = ${leadId}`;
     }

@@ -1,4 +1,5 @@
 import '@/lib/server-only';
+import type { TransactionSql } from 'postgres';
 import { conUsuario, sql } from '@/lib/db';
 import type { InvitarMiembro } from './auth.schemas';
 import {
@@ -22,6 +23,18 @@ export class ErrorAutorizacion extends Error {}
 
 /** Fallo de dominio en la invitación (p. ej. ya es miembro): mensaje apto para la UI. */
 export class ErrorInvitacion extends Error {}
+
+/**
+ * Capa 2 de TODA operación protegida: el JWT vive 7 días, así que el estado ACTUAL de la
+ * cuenta se re-verifica contra la base (la fila propia es visible bajo RLS) — una cuenta
+ * desactivada a mitad de sesión no sigue leyendo ni mutando datos de gestión.
+ */
+async function exigirCuentaActiva(tx: TransactionSql, actorId: string): Promise<void> {
+  const [cuenta] = await tx`select estado from usuario where id = ${actorId}`;
+  if ((cuenta?.estado as string | undefined) !== 'activo') {
+    throw new ErrorAutorizacion('Tu cuenta no está activa');
+  }
+}
 
 const ROLES_QUE_INVITAN = ['lead-boutique', 'admin-cliente'];
 
@@ -93,6 +106,7 @@ export async function listarMiembros(
   workspaceId: string,
 ): Promise<import('./auth.schemas').MiembroDeLista[]> {
   return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
     const filas = await tx`
       select m.nombre, m.email, m.rol, e.estado
       from miembro m
@@ -124,13 +138,7 @@ export async function crearInvitacion(
   const expira = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
   const resultado = await conUsuario(actorId, async (tx) => {
-    // El JWT vive 7 días: una cuenta desactivada a mitad de sesión no debe seguir
-    // mutando. Las mutaciones re-verifican el estado ACTUAL contra la base (la fila
-    // propia es visible bajo RLS), no solo el sub del token.
-    const [cuenta] = await tx`select estado from usuario where id = ${actorId}`;
-    if ((cuenta?.estado as string | undefined) !== 'activo') {
-      throw new ErrorAutorizacion('Tu cuenta no está activa');
-    }
+    await exigirCuentaActiva(tx, actorId);
     const [actor] = await tx`select workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
     const rolActor = (actor?.rol ?? null) as string | null;
     if (!rolActor || !ROLES_QUE_INVITAN.includes(rolActor)) {

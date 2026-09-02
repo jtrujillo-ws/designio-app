@@ -48,13 +48,24 @@ where e.actor_id = m.id;
 
 -- El constraint viejo (workspace_id, email) era case-sensitive: 'Alice@' y 'alice@'
 -- podían coexistir como miembros y el backfill los mapea al MISMO usuario global.
--- Se conserva la membresía más antigua por (workspace_id, usuario_id) para que el
--- constraint nuevo no aborte la migración. En una base fresca es un no-op.
+-- Dedupe conservando primero EL ROL MÁS PRIVILEGIADO (lead-boutique > admin-cliente >
+-- resto): quedarse ciegamente con la más antigua podía descartar la única membresía
+-- capaz de invitar y dejar el workspace sin administración. Empate de privilegio →
+-- la más antigua, con desempate estable. En una base fresca es un no-op.
 delete from miembro m
 using miembro m2
 where m.workspace_id = m2.workspace_id
   and m.usuario_id = m2.usuario_id
-  and (m.creado_en > m2.creado_en or (m.creado_en = m2.creado_en and m.id::text > m2.id::text));
+  and m.id <> m2.id
+  and (
+    (case m.rol when 'lead-boutique' then 0 when 'admin-cliente' then 1 else 2 end)
+      > (case m2.rol when 'lead-boutique' then 0 when 'admin-cliente' then 1 else 2 end)
+    or (
+      (case m.rol when 'lead-boutique' then 0 when 'admin-cliente' then 1 else 2 end)
+        = (case m2.rol when 'lead-boutique' then 0 when 'admin-cliente' then 1 else 2 end)
+      and (m.creado_en > m2.creado_en or (m.creado_en = m2.creado_en and m.id::text > m2.id::text))
+    )
+  );
 
 alter table miembro alter column usuario_id set not null;
 alter table miembro add constraint miembro_usuario_unico unique (workspace_id, usuario_id);

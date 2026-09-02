@@ -24,21 +24,30 @@ const ETIQUETA = 'material-no-confiable';
  * cierre para «salirse» del bloque y hablarle al modelo como si fuera el sistema. Se
  * neutraliza cualquier aparición del delimitador (abierto o cerrado) antes de envolver.
  */
+/**
+ * El material EXACTO que ve el modelo: recortado al techo y con el delimitador
+ * neutralizado. Se exporta porque la fidelidad de las citas hay que medirla contra esto
+ * y no contra el texto crudo — si no, un material que contiene el delimitador produce
+ * «no aparece literal» sobre citas que sí son literales de lo que el modelo leyó.
+ */
+export function materialQueVeElModelo(texto: string): string {
+  // Se rompe la secuencia con un carácter visible: el lector humano sigue viendo qué
+  // decía el material y el modelo ya no encuentra un delimitador que cerrar.
+  return texto
+    .slice(0, MAX_MATERIAL)
+    .replace(new RegExp(`</?${ETIQUETA}`, 'gi'), (m) => m.replace('<', '‹'));
+}
+
 export function delimitarMaterialNoConfiable(texto: string): {
   bloque: string;
   truncado: boolean;
   usados: number;
 } {
-  const recortado = texto.slice(0, MAX_MATERIAL);
-  // Se rompe la secuencia con un carácter visible: el lector humano sigue viendo qué
-  // decía el material y el modelo ya no encuentra un delimitador que cerrar.
-  const neutralizado = recortado.replace(new RegExp(`</?${ETIQUETA}`, 'gi'), (m) =>
-    m.replace('<', '‹'),
-  );
+  const neutralizado = materialQueVeElModelo(texto);
   return {
     bloque: `<${ETIQUETA}>\n${neutralizado}\n</${ETIQUETA}>`,
     truncado: texto.length > MAX_MATERIAL,
-    usados: recortado.length,
+    usados: Math.min(texto.length, MAX_MATERIAL),
   };
 }
 

@@ -72,6 +72,8 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     if (wss.length > 0) {
       await admin`delete from evento_dominio where workspace_id in ${admin(wss)}`;
       await admin`delete from item_importacion where workspace_id in ${admin(wss)}`;
+      await admin`delete from evidencia_segmento where workspace_id in ${admin(wss)}`;
+      await admin`delete from segmento where workspace_id in ${admin(wss)}`;
       await admin`delete from evidencia where workspace_id in ${admin(wss)}`;
       await admin`delete from fuente where workspace_id in ${admin(wss)}`;
       await admin`delete from miembro where workspace_id in ${admin(wss)}`;
@@ -239,6 +241,53 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     expect(
       CrearItemImportacionSchema.safeParse({ ...base, contenido: '   ', referencia: '' }).success,
     ).toBe(false);
+  });
+
+  it('los segmentos referenciados quedan anclados: no se pueden borrar, y los inexistentes se rechazan', async () => {
+    const admin = sqlAdmin();
+    const [seg] = await admin`insert into segmento (workspace_id, nombre)
+      values (${ws}, ${marca + ' Segmento'}) returning id`;
+    const segId = seg!.id as string;
+
+    const r = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Con segmento',
+      contenido: 'observación del segmento',
+      tipoFuente: 'observacion',
+      referencia: '',
+    });
+    const aprobado = await aprobarItem(leadId, {
+      workspaceId: ws,
+      itemId: r.itemId,
+      esEstadoActual: false,
+      resumen: '',
+      dimensiones: { ...dimensionesDemo, segmentoIds: [segId] },
+    });
+    // El vínculo relacional existe y la FK impide borrar el segmento referenciado.
+    const enlaces = await conUsuario(leadId, (tx) => tx`
+      select segmento_id from evidencia_segmento where evidencia_id = ${aprobado.evidenciaId}`);
+    expect(enlaces.map((e) => e.segmento_id)).toEqual([segId]);
+    await expect(admin`delete from segmento where id = ${segId}`).rejects.toThrow(/foreign key/);
+
+    // Un segmento inexistente revierte la aprobación completa.
+    const r2 = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Segmento fantasma',
+      contenido: 'x',
+      tipoFuente: 'nota',
+      referencia: '',
+    });
+    await expect(
+      aprobarItem(leadId, {
+        workspaceId: ws,
+        itemId: r2.itemId,
+        esEstadoActual: false,
+        resumen: '',
+        dimensiones: { ...dimensionesDemo, segmentoIds: [crypto.randomUUID()] },
+      }),
+    ).rejects.toThrow(ErrorCuraduria);
+    const bandeja = await listarBandeja(leadId, ws);
+    expect(bandeja.pendientes.find((i) => i.id === r2.itemId)?.estado).toBe('pendiente');
   });
 
   it('un item no puede NACER decidido: el INSERT directo con decisión forjada se rechaza', async () => {

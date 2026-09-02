@@ -169,17 +169,7 @@ export async function aprobarItem(
       where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId} and estado = 'pendiente'`;
     if (!item) throw new ErrorCuraduria('El item no existe o ya fue decidido');
 
-    // Las dimensiones quedan CONGELADAS en la evidencia (sin update posterior): los
-    // segmentos referenciados deben existir en ESTE workspace o la referencia colgante
-    // sería permanente.
     const segmentoIds = [...new Set(entrada.dimensiones.segmentoIds)];
-    if (segmentoIds.length > 0) {
-      const [validos] = await tx`select count(*)::int as n from segmento
-        where workspace_id = ${entrada.workspaceId} and id in ${tx(segmentoIds)}`;
-      if ((validos!.n as number) !== segmentoIds.length) {
-        throw new ErrorCuraduria('Algún segmento referenciado no existe en este workspace');
-      }
-    }
 
     const dimensiones = DimensionesEvidenciaSchema.parse({
       proveniencia: {
@@ -215,6 +205,20 @@ export async function aprobarItem(
               ${entrada.resumen}, ${tx.json(dimensiones)}, ${entrada.esEstadoActual}, ${actorId})
       returning id`;
     const evidenciaId = evidencia!.id as string;
+
+    // Anclaje relacional de segmentos: el vínculo se crea desde la propia tabla segmento
+    // (validación y enlace en UNA sentencia, mismo snapshot) y la FK compuesta impide
+    // borrar un segmento referenciado — el jsonb conserva el snapshot congelado, la
+    // integridad vive aquí. Si falta alguno, el conteo delata y la transacción revierte.
+    if (segmentoIds.length > 0) {
+      const enlazados = await tx`insert into evidencia_segmento (evidencia_id, segmento_id, workspace_id)
+        select ${evidenciaId}, s.id, ${entrada.workspaceId}
+        from segmento s
+        where s.workspace_id = ${entrada.workspaceId} and s.id in ${tx(segmentoIds)}`;
+      if (enlazados.count !== segmentoIds.length) {
+        throw new ErrorCuraduria('Algún segmento referenciado no existe en este workspace');
+      }
+    }
 
     // La política de UPDATE solo alcanza pendientes: si otro curador decidió en paralelo,
     // esto afecta 0 filas y la transacción entera se revierte. El RETURNING evalúa

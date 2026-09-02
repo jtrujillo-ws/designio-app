@@ -134,3 +134,32 @@ grant select, insert on fuente, evidencia to designio_app;
 -- de tenant (SYS-01/02).
 grant select, insert on item_importacion to designio_app;
 grant update (estado, decidido_por, decidido_en, evidencia_id) on item_importacion to designio_app;
+
+-- ── Anclaje relacional de segmentos referenciados por evidencia ──
+-- El jsonb de dimensiones conserva el snapshot CONGELADO (ADR-0010); esta tabla ancla
+-- la integridad: un segmento referenciado por evidencia no puede borrarse (FK compuesta
+-- sin cascada) y la existencia se valida en la MISMA sentencia que crea el vínculo —
+-- sin ella, la validación por conteo solo probaba existencia en su propio snapshot y un
+-- borrado posterior dejaba la referencia colgante para siempre en evidencia inmutable.
+alter table segmento add constraint segmento_id_ws_unico unique (id, workspace_id);
+
+create table evidencia_segmento (
+  evidencia_id uuid not null,
+  segmento_id uuid not null,
+  workspace_id uuid not null references workspace(id),
+  primary key (evidencia_id, segmento_id),
+  foreign key (evidencia_id, workspace_id) references evidencia (id, workspace_id),
+  foreign key (segmento_id, workspace_id) references segmento (id, workspace_id)
+);
+create index evidencia_segmento_seg_idx on evidencia_segmento (workspace_id, segmento_id);
+
+alter table evidencia_segmento enable row level security;
+create policy evidencia_segmento_select on evidencia_segmento
+  for select using (is_workspace_member(app_user_id(), workspace_id));
+-- Solo curadores crean vínculos (misma regla que evidencia); congelado: sin update/delete.
+create policy evidencia_segmento_insert on evidencia_segmento
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+  );
+
+grant select, insert on evidencia_segmento to designio_app;

@@ -17,9 +17,13 @@ const { default: ssr } = (await import(SERVER_ENTRY)) as { default: FetchHandler
 // Readiness de la conexión de APLICACIÓN (rol no privilegiado): las migraciones del
 // entrypoint solo prueban la conexión admin, así que una DATABASE_URL_APP mal compuesta
 // (referencia sin resolver, password del rol incorrecta) pasaría inadvertida y todo
-// request con datos fallaría con el contenedor "sano". /healthz la verifica; una vez
-// verde queda verde: el healthcheck gatea el ROLLOUT — un blip de la base en runtime
-// no debe tumbar un contenedor que ya arrancó bien.
+// request con datos fallaría con el contenedor "sano". Y no basta con que AUTENTIQUE:
+// si por error apunta a la URL admin, el tráfico de la app correría con un rol que
+// BYPASEA RLS — se verifica identidad (designio_app) y ausencia de privilegios de
+// bypass antes de dar el verde. Una vez verificada queda verde: el healthcheck gatea
+// el ROLLOUT — un blip de la base en runtime no debe tumbar un contenedor que ya
+// arrancó bien.
+const ROL_APP = 'designio_app';
 let appDbVerificada = false;
 async function appDbLista(): Promise<boolean> {
   if (appDbVerificada) return true;
@@ -30,7 +34,15 @@ async function appDbLista(): Promise<boolean> {
   }
   const sql = postgres(url, { max: 1, connect_timeout: 5, onnotice: () => {} });
   try {
-    await sql`select 1`;
+    const [quien] = await sql`
+      select current_user as usuario,
+             (select rolsuper or rolbypassrls from pg_roles where rolname = current_user) as bypassa_rls`;
+    if (quien?.usuario !== ROL_APP || quien?.bypassa_rls === true) {
+      console.error(
+        `healthz: DATABASE_URL_APP no usa el rol de aplicación esperado (usuario=${String(quien?.usuario)}, bypassa RLS=${String(quien?.bypassa_rls)}) — ¿quedó apuntando a la URL admin?`,
+      );
+      return false;
+    }
     appDbVerificada = true;
     return true;
   } catch (e) {

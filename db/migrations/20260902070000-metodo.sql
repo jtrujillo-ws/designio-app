@@ -361,6 +361,30 @@ create trigger reto_estado_transicion
   for each row execute function reto_estado_transicion_guard();
 revoke execute on function reto_estado_transicion_guard() from public;
 
+-- Activo ⇒ método instanciado: candidato→activo es INSEPARABLE de crear el proyecto
+-- con sus etapas (RF-04.3). Diferido al commit para que activarReto — que decide el
+-- update del reto ANTES de insertar proyecto/etapas en la misma transacción — pase, y
+-- el UPDATE crudo solitario aborte. Mismo pre-chequeo anti-oráculo que los guards.
+create function reto_activo_con_metodo_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return null;
+  end if;
+  if new.estado = 'activo' and not exists (select 1
+    from proyecto p
+    join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+    where p.reto_id = new.id and p.workspace_id = new.workspace_id) then
+    raise exception 'activar un reto exige instanciar su método: usa la activación de la app';
+  end if;
+  return null;
+end $$;
+create constraint trigger reto_activo_con_metodo
+  after update of estado on reto
+  deferrable initially deferred
+  for each row execute function reto_activo_con_metodo_guard();
+revoke execute on function reto_activo_con_metodo_guard() from public;
+
 create function checklist_gate_pendiente_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin

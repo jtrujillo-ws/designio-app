@@ -530,6 +530,26 @@ describeAuthz('método: etapas, gates y checklists', () => {
         where id = ${huerfano}`),
     ).rejects.toThrow(/checklist instanciado/);
 
+    // Activo ⇒ método instanciado (constraint diferido al commit): el update crudo
+    // solitario aborta y el reto sigue candidato — activarReto, que crea el método en
+    // la MISMA transacción antes del commit, es el único camino que pasa.
+    const r97 = await crearReto(leadId, {
+      workspaceId: ws,
+      servicioAnclaId: svcId,
+      codigo: 'R-97',
+      titulo: 'Reto sin método',
+      descripcion: '',
+      origen: 'post-mortem',
+      metricaObjetivo: '',
+      serviciosAfectados: [],
+    });
+    await expect(
+      conUsuario(leadId, (tx) => tx`update reto set estado = 'activo' where id = ${r97.retoId}`),
+    ).rejects.toThrow(/instanciar su método/);
+    const [sigueCandidato] = await conUsuario(leadId, (tx) => tx`
+      select estado from reto where id = ${r97.retoId}`);
+    expect(sigueCandidato!.estado).toBe('candidato');
+
     // Oráculo: un miembro de OTRO workspace que apunte a nuestro reto (G0 aprobado)
     // recibe el error de política de siempre — el pre-chequeo de membresía del guard
     // evita la consulta privilegiada y sus mensajes/candados delatores.

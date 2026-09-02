@@ -224,6 +224,23 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     expect(inv.reemision).toBe(false);
   });
 
+  it('una cuenta desactivada con sesión viva ya no puede mutar (re-check de estado)', async () => {
+    const admin = sqlAdmin();
+    await admin`update usuario set estado = 'inactivo' where id = ${leadId}`;
+    try {
+      await expect(
+        crearInvitacion(leadId, {
+          workspaceId: ws,
+          email: `${marca}-tarde@test.demo`,
+          nombre: 'Tarde Test',
+          rol: 'disenador',
+        }),
+      ).rejects.toThrow(ErrorAutorizacion);
+    } finally {
+      await admin`update usuario set estado = 'activo' where id = ${leadId}`;
+    }
+  });
+
   it('re-invitar a un miembro ya activo es un error de dominio claro', async () => {
     await expect(
       crearInvitacion(leadId, {

@@ -99,6 +99,13 @@ export async function crearInvitacion(
   const expira = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
   const resultado = await conUsuario(actorId, async (tx) => {
+    // El JWT vive 7 días: una cuenta desactivada a mitad de sesión no debe seguir
+    // mutando. Las mutaciones re-verifican el estado ACTUAL contra la base (la fila
+    // propia es visible bajo RLS), no solo el sub del token.
+    const [cuenta] = await tx`select estado from usuario where id = ${actorId}`;
+    if ((cuenta?.estado as string | undefined) !== 'activo') {
+      throw new ErrorAutorizacion('Tu cuenta no está activa');
+    }
     const [actor] = await tx`select workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
     const rolActor = (actor?.rol ?? null) as string | null;
     if (!rolActor || !ROLES_QUE_INVITAN.includes(rolActor)) {

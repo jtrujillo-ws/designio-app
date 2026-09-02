@@ -37,6 +37,15 @@ update miembro m set usuario_id = u.id
 from usuario u
 where m.usuario_id is null and lower(u.email) = lower(m.email);
 
+-- La identidad de actor en la auditoría también pasa a usuario.id: se remapean los
+-- eventos históricos que registraron miembro.id (bases pre-auth) para que actor_id
+-- tenga una sola semántica. Debe correr ANTES del dedupe de abajo: un evento puede
+-- referenciar justo la membresía duplicada que se descarta, y este es el último
+-- momento en que ese mapeo miembro→usuario existe completo. En una base fresca, no-op.
+update evento_dominio e set actor_id = m.usuario_id
+from miembro m
+where e.actor_id = m.id;
+
 -- El constraint viejo (workspace_id, email) era case-sensitive: 'Alice@' y 'alice@'
 -- podían coexistir como miembros y el backfill los mapea al MISMO usuario global.
 -- Se conserva la membresía más antigua por (workspace_id, usuario_id) para que el
@@ -49,13 +58,6 @@ where m.workspace_id = m2.workspace_id
 
 alter table miembro alter column usuario_id set not null;
 alter table miembro add constraint miembro_usuario_unico unique (workspace_id, usuario_id);
-
--- La identidad de actor en la auditoría también pasa a usuario.id: se remapean los
--- eventos históricos que registraron miembro.id (bases pre-auth) para que actor_id
--- tenga una sola semántica. En una base fresca es un no-op.
-update evento_dominio e set actor_id = m.usuario_id
-from miembro m
-where e.actor_id = m.id;
 
 -- ── Recableado de helpers: app.user_id ahora es usuario.id ──
 -- (create or replace conserva dueño y grants de la migración anterior)

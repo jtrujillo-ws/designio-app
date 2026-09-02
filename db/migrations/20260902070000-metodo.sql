@@ -254,6 +254,11 @@ create policy gate_update_aprobar on gate_instancia
     and exists (select 1 from checklist_item ci
       where ci.gate_id = gate_instancia.id
         and ci.workspace_id = gate_instancia.workspace_id)
+    -- Los gates ordenan el método: el N exige todos los anteriores aprobados.
+    and not exists (select 1 from gate_instancia g2
+      where g2.proyecto_id = gate_instancia.proyecto_id
+        and g2.workspace_id = gate_instancia.workspace_id
+        and g2.numero < gate_instancia.numero and g2.estado <> 'aprobado')
     and (gate_instancia.numero <> 0 or (
       exists (select 1 from criterio_exito c
         join proyecto p on p.id = gate_instancia.proyecto_id
@@ -385,6 +390,28 @@ create constraint trigger reto_activo_con_metodo
   for each row execute function reto_activo_con_metodo_guard();
 revoke execute on function reto_activo_con_metodo_guard() from public;
 
+-- Y el proyecto mismo es inseparable de su método: uno colado a mano bajo un reto ya
+-- activo no toca reto.estado y esquivaría el guard anterior — al commit, todo proyecto
+-- nuevo debe tener sus etapas instanciadas (activarReto las crea en la misma tx; el
+-- seed y el backfill corren como owner sin contexto y el pre-chequeo los salta).
+create function proyecto_con_metodo_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return null;
+  end if;
+  if not exists (select 1 from etapa_instancia e
+    where e.proyecto_id = new.id and e.workspace_id = new.workspace_id) then
+    raise exception 'crear un proyecto exige instanciar su método: usa la activación de la app';
+  end if;
+  return null;
+end $$;
+create constraint trigger proyecto_con_metodo
+  after insert on proyecto
+  deferrable initially deferred
+  for each row execute function proyecto_con_metodo_guard();
+revoke execute on function proyecto_con_metodo_guard() from public;
+
 create function checklist_gate_pendiente_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -449,6 +476,13 @@ begin
       where ci.gate_id = new.id and ci.workspace_id = new.workspace_id) then
       raise exception 'no se puede aprobar: el gate no tiene checklist instanciado';
     end if;
+    -- Los gates ORDENAN el método (§5.2): el N no se decide con algún anterior
+    -- pendiente — las aprobaciones son inmutables y grabarían la historia al revés.
+    if exists (select 1 from gate_instancia g2
+      where g2.proyecto_id = new.proyecto_id and g2.workspace_id = new.workspace_id
+        and g2.numero < new.numero and g2.estado <> 'aprobado') then
+      raise exception 'no se puede aprobar G%: los gates anteriores deben aprobarse primero', new.numero;
+    end if;
     if new.numero = 0 then
       if not exists (select 1 from criterio_exito c
         join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
@@ -465,6 +499,17 @@ begin
         raise exception 'no se puede aprobar G0: criterios incompletos (SYS-22)';
       end if;
     end if;
+    -- Efectos INSEPARABLES de la transición, también para el UPDATE directo: la etapa
+    -- homóloga se completa y el evento inmutable queda con el actor y su rol del
+    -- MISMO snapshot. aprobarGate ya no los duplica: esta es la única fuente.
+    update etapa_instancia set estado = 'completada'
+      where proyecto_id = new.proyecto_id and workspace_id = new.workspace_id
+        and numero = new.numero;
+    insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+      values (new.workspace_id, 'GateAprobado',
+        jsonb_build_object('gateId', new.id, 'proyectoId', new.proyecto_id,
+                           'numero', new.numero),
+        app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   end if;
   return new;
 end $$;

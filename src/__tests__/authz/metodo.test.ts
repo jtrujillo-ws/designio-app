@@ -275,6 +275,28 @@ describeAuthz('método: etapas, gates y checklists', () => {
         accion: { tipo: 'pendiente' },
       }),
     ).rejects.toThrow(ErrorMetodo);
+
+    // Los gates ORDENAN el método: G4 con su checklist limpio no se aprueba con G2/G3
+    // pendientes — el diagnóstico los lista.
+    const g4 = p!.gates[4]!;
+    for (const item of g4.items) {
+      await marcarItem(leadId, {
+        workspaceId: ws,
+        itemId: item.id,
+        accion: { tipo: 'cumplido', evidenciaId },
+      });
+    }
+    await expect(aprobarGate(leadId, { workspaceId: ws, gateId: g4.id })).rejects.toThrow(
+      /anteriores deben aprobarse primero \(pendientes: G2, G3\)/,
+    );
+    // Y volver a pendiente para no ensuciar los tests que siguen.
+    for (const item of g4.items) {
+      await marcarItem(leadId, {
+        workspaceId: ws,
+        itemId: item.id,
+        accion: { tipo: 'pendiente' },
+      });
+    }
   });
 
   it('cumplido exige objeto real y N/A exige el rol aprobador del gate', async () => {
@@ -509,18 +531,25 @@ describeAuthz('método: etapas, gates y checklists', () => {
   });
 
   it('un checklist vacío no es suficiencia y el guard instalado no es oráculo cross-tenant', async () => {
-    // Gate colado a mano SIN ítems (las políticas de insert lo permiten al lead): el
-    // NOT EXISTS de pendientes sería vacuamente cierto — lo tapa exigir ≥1 ítem.
-    const huerfano = await conUsuario(leadId, async (tx) => {
-      const [pr] = await tx`insert into proyecto
+    // Un proyecto colado a mano por el rol de app muere al commit (constraint diferido:
+    // proyecto ⇒ método instanciado)…
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into proyecto
         (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
-        values (${ws}, ${retoId}, 'P-96', 'Huérfano', 'activo', 'rapido', ${leadId})
-        returning id`;
-      const [g] = await tx`insert into gate_instancia
-        (workspace_id, proyecto_id, numero, rol_aprobador)
-        values (${ws}, ${pr!.id as string}, 1, 'lead-boutique') returning id`;
-      return g!.id as string;
-    });
+        values (${ws}, ${retoId}, 'P-96', 'Huérfano', 'activo', 'rapido', ${leadId})`),
+    ).rejects.toThrow(/instanciar su método/);
+    // …así que el gate SIN ítems del siguiente chequeo solo puede fabricarlo el admin
+    // (el guard salta para el owner sin contexto): el NOT EXISTS de pendientes sería
+    // vacuamente cierto — lo tapa exigir ≥1 ítem.
+    const adminSetup = sqlAdmin();
+    const [pr96] = await adminSetup`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${retoId}, 'P-96', 'Huérfano', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const [g96] = await adminSetup`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${pr96!.id as string}, 1, 'lead-boutique') returning id`;
+    const huerfano = g96!.id as string;
     await expect(aprobarGate(leadId, { workspaceId: ws, gateId: huerfano })).rejects.toThrow(
       /checklist instanciado/,
     );

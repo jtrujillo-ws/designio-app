@@ -348,6 +348,9 @@ export async function aprobarGate(
             and ci.estado = 'pendiente')
         and exists (select 1 from checklist_item ci
           where ci.gate_id = g.id and ci.workspace_id = g.workspace_id)
+        and not exists (select 1 from gate_instancia g2
+          where g2.proyecto_id = g.proyecto_id and g2.workspace_id = g.workspace_id
+            and g2.numero < g.numero and g2.estado <> 'aprobado')
         and (g.numero <> 0 or exists (select 1
           from criterio_exito c
           join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
@@ -360,30 +363,14 @@ export async function aprobarGate(
                  or btrim(c.kpi) = '' or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
                  or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
                      and btrim(c.linea_base_plan) = ''))))
-      returning g.numero, g.proyecto_id, workspace_role(${actorId}, g.workspace_id) as rol`;
+      returning g.numero`;
 
     if (aprobado.length === 0) {
       throw new ErrorMetodo(await diagnosticoDeGate(tx, entrada.workspaceId, entrada.gateId));
     }
-    const numero = aprobado[0]!.numero as number;
-    const proyectoId = aprobado[0]!.proyecto_id as string;
-    const rol = aprobado[0]!.rol as string;
-
-    // Estado informativo de la etapa (RF-04.4): el gate gobierna, la etapa acompaña.
-    // La política admite al aprobador del gate homólogo; 0 filas aquí sería una
-    // regresión de esa política — mejor reventar la transacción que desincronizar.
-    const etapa = await tx`update etapa_instancia set estado = 'completada'
-      where proyecto_id = ${proyectoId} and workspace_id = ${entrada.workspaceId}
-        and numero = ${numero}`;
-    if (etapa.count === 0) {
-      throw new ErrorMetodo('La etapa del gate no pudo marcarse como completada');
-    }
-
-    await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-      values (${entrada.workspaceId}, 'GateAprobado',
-        ${tx.json({ gateId: entrada.gateId, proyectoId, numero })}, ${actorId}, ${rol})`;
-
-    return { numero };
+    // La etapa completada (RF-04.4) y el evento GateAprobado los aplica el guard de la
+    // transición DENTRO del propio UPDATE — inseparables también para SQL directo.
+    return { numero: aprobado[0]!.numero as number };
   });
 }
 
@@ -415,6 +402,16 @@ async function diagnosticoDeGate(
     where gate_id = ${gateId} and workspace_id = ${workspaceId}`;
   if ((conItems!.n as number) === 0) {
     return 'El gate no tiene checklist instanciado: un checklist vacío no es suficiencia';
+  }
+
+  const anteriores = await tx`
+    select g2.numero from gate_instancia g2
+    where g2.proyecto_id = ${gate.proyecto_id as string} and g2.workspace_id = ${workspaceId}
+      and g2.numero < ${gate.numero as number} and g2.estado <> 'aprobado'
+    order by g2.numero`;
+  if (anteriores.length > 0) {
+    const lista = anteriores.map((g2) => `G${g2.numero as number}`).join(', ');
+    return `Los gates anteriores deben aprobarse primero (pendientes: ${lista})`;
   }
 
   if ((gate.numero as number) === 0) {

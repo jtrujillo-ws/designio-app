@@ -53,16 +53,17 @@ describe('adaptador del proveedor AI', () => {
     sdk.respuestas = [{ stop_reason: 'refusal', content: [], usage: USO_CRUDO }];
     const r = await llamar();
     expect(r.ok).toBe(false);
-    if (r.ok) return;
+    expect(r.intentos).toHaveLength(1);
+    const intento = r.intentos[0]!;
     // Lo que se perdía: el `usage` de una respuesta que no produce propuesta.
-    expect(r.uso?.entrada).toBe(1000);
-    expect(r.uso?.salida).toBe(40);
-    expect(r.uso?.costoUsd).toBeCloseTo(costoDeUso(MODELO_PRIMARIO, USO_ESPERADO)!, 6);
-    expect(r.modelo).toBe(MODELO_PRIMARIO);
-    expect(r.causa).toBe('rechazo-proveedor');
+    expect(intento.uso?.entrada).toBe(1000);
+    expect(intento.uso?.salida).toBe(40);
+    expect(intento.uso?.costoUsd).toBeCloseTo(costoDeUso(MODELO_PRIMARIO, USO_ESPERADO)!, 6);
+    expect(intento.modelo).toBe(MODELO_PRIMARIO);
+    expect(intento.resultado).toBe('rechazo-proveedor');
     // Y se llama por su nombre: no es «el proveedor rechazó la petición (422)», que suena a
     // error nuestro y a algo que se arregla reintentando (reintentar solo gasta otra vez).
-    expect(r.motivo).toMatch(/se negó a procesar/i);
+    expect(intento.motivo).toMatch(/se negó a procesar/i);
     // Una negativa no es indisponibilidad: no se degrada al modelo de respaldo.
     expect(sdk.modelosLlamados).toEqual([MODELO_PRIMARIO]);
   });
@@ -73,10 +74,10 @@ describe('adaptador del proveedor AI', () => {
     ];
     const r = await llamar();
     expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.causa).toBe('fuera-de-contrato');
-    expect(r.uso?.entrada).toBe(1000);
-    expect(r.motivo).toMatch(/formato esperado/i);
+    expect(r.intentos).toHaveLength(1);
+    expect(r.intentos[0]!.resultado).toBe('fuera-de-contrato');
+    expect(r.intentos[0]!.uso?.entrada).toBe(1000);
+    expect(r.intentos[0]!.motivo).toMatch(/formato esperado/i);
     // Tampoco se reintenta con otro modelo: no es indisponibilidad.
     expect(sdk.modelosLlamados).toEqual([MODELO_PRIMARIO]);
   });
@@ -88,15 +89,14 @@ describe('adaptador del proveedor AI', () => {
     ];
     const r = await llamar();
     expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.uso).toBeNull();
-    expect(r.causa).toBe('sin-respuesta');
-    // Degradación de modelo UNA vez: primario y respaldo, y ahí termina.
+    // Degradación de modelo UNA vez: primario y respaldo, y ahí termina — y los DOS
+    // intentos suben, porque los dos ocurrieron.
     expect(sdk.modelosLlamados).toEqual([MODELO_PRIMARIO, MODELO_FALLBACK]);
-    expect(r.modelo).toBe(MODELO_FALLBACK);
+    expect(r.intentos.map((i) => i.modelo)).toEqual([MODELO_PRIMARIO, MODELO_FALLBACK]);
+    expect(r.intentos.every((i) => i.resultado === 'sin-respuesta' && i.uso === null)).toBe(true);
   });
 
-  it('la salida buena viaja con el uso del modelo que respondió de verdad', async () => {
+  it('el intento fallido del primario no se pierde cuando el respaldo sí responde', async () => {
     sdk.respuestas = [
       Object.assign(new Error('no disponible'), { status: 503 }),
       {
@@ -109,8 +109,21 @@ describe('adaptador del proveedor AI', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.datos).toEqual({ titulo: 'ok' });
-    expect(r.modelo).toBe(MODELO_FALLBACK);
+    // DOS intentos: el del primario que se cayó —que antes desaparecía con el `continue`,
+    // dejando la tasa de error por modelo diciendo que el primario nunca falla— y el del
+    // respaldo que respondió.
+    expect(r.intentos.map((i) => [i.modelo, i.resultado])).toEqual([
+      [MODELO_PRIMARIO, 'sin-respuesta'],
+      [MODELO_FALLBACK, 'salida-valida'],
+    ]);
+    expect(r.intentos[0]!.motivo).toMatch(/no está disponible/i);
     // La tarifa es la del modelo que respondió, no la del que se intentó primero.
-    expect(r.uso?.costoUsd).toBeCloseTo(costoDeUso(MODELO_FALLBACK, USO_ESPERADO)!, 6);
+    expect(r.intentos[1]!.uso?.costoUsd).toBeCloseTo(
+      costoDeUso(MODELO_FALLBACK, USO_ESPERADO)!,
+      6,
+    );
+    // Y cada latencia es la de SU intento: la del respaldo no arrastra la espera del
+    // primario, que era lo que hacía irreal la latencia por modelo.
+    expect(r.intentos.every((i) => i.latenciaMs >= 0)).toBe(true);
   });
 });

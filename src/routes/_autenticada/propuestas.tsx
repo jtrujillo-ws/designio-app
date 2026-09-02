@@ -38,10 +38,20 @@ import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
  * caminos manuales de la bandeja y del método— sigue disponible.
  */
 export const Route = createFileRoute('/_autenticada/propuestas')({
-  loaderDeps: ({ search }) => ({ ws: search.ws }),
-  loader: ({ context }) => {
+  // `q` filtra las anclas que el formulario de generación puede ofrecer. Vive en la URL y
+  // no en un estado local porque es lo que decide QUÉ pide el loader: sin viajar al
+  // servidor, buscar solo filtraría las 50 que ya bajaron, que es justo lo que no sirve
+  // cuando el problema es que hay más anclas elegibles que sitio en la lista.
+  validateSearch: (search: Record<string, unknown>): { q?: string } => {
+    const q = typeof search.q === 'string' ? search.q.trim().slice(0, 100) : '';
+    return q ? { q } : {};
+  },
+  loaderDeps: ({ search }) => ({ ws: search.ws, q: search.q ?? '' }),
+  loader: ({ context, deps }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
-    return workspaceId ? propuestasDelWorkspace({ data: { workspaceId } }) : null;
+    return workspaceId
+      ? propuestasDelWorkspace({ data: { workspaceId, busqueda: deps.q } })
+      : null;
   },
   component: PantallaPropuestas,
 });
@@ -137,6 +147,13 @@ function PantallaPropuestas() {
                 retos={datos.retosAbiertos}
                 hayMasItems={datos.hayMasItems}
                 hayMasRetos={datos.hayMasRetos}
+                busqueda={datos.busqueda}
+                onBuscar={(texto) =>
+                  navigate({
+                    to: '/propuestas',
+                    search: (prev) => ({ ...prev, q: texto || undefined }),
+                  })
+                }
                 onGenerado={async (n) => {
                   setAviso(`${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`);
                   await refrescar();
@@ -279,6 +296,8 @@ function FormularioGeneracion({
   retos,
   hayMasItems,
   hayMasRetos,
+  busqueda,
+  onBuscar,
   onGenerado,
   onConsentimiento,
   onError,
@@ -289,12 +308,15 @@ function FormularioGeneracion({
   retos: CandidatoAncla[];
   hayMasItems: boolean;
   hayMasRetos: boolean;
+  busqueda: string;
+  onBuscar: (texto: string) => void;
   onGenerado: (generadas: number) => Promise<void>;
   onConsentimiento: (r: { version: number; autorizaExterno: boolean }) => Promise<void>;
   onError: (e: string | null) => void;
 }) {
   const [capacidad, setCapacidad] = useState<CapacidadActiva>('CI');
   const [anclaId, setAnclaId] = useState('');
+  const [texto, setTexto] = useState(busqueda);
   const [enviando, setEnviando] = useState(false);
   const anclas = capacidad === 'CI' ? items : retos;
   const hayMas = capacidad === 'CI' ? hayMasItems : hayMasRetos;
@@ -358,6 +380,44 @@ function FormularioGeneracion({
             <span style={etiqueta}>
               {capacidad === 'CI' ? 'Item de la bandeja' : 'Reto con criterios abiertos'}
             </span>
+            {/* Buscar VIAJA al servidor (la búsqueda vive en la URL): filtrar en el cliente
+                solo tocaría las anclas que ya bajaron, que es exactamente el conjunto del
+                que un ancla puede haberse caído. */}
+            <div style={{ display: 'flex', gap: 6 }}>
+              <Input
+                value={texto}
+                maxLength={100}
+                placeholder={capacidad === 'CI' ? 'Buscar por título…' : 'Buscar por código o título…'}
+                onChange={(e) => setTexto(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    onBuscar(texto.trim());
+                  }
+                }}
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                onClick={() => onBuscar(texto.trim())}
+              >
+                Buscar
+              </Button>
+              {busqueda && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setTexto('');
+                    onBuscar('');
+                  }}
+                >
+                  Limpiar
+                </Button>
+              )}
+            </div>
             <Select value={anclaId} onChange={(e) => setAnclaId(e.target.value)}>
               <option value="">Elige el alcance…</option>
               {anclas.map((a) => (
@@ -378,12 +438,19 @@ function FormularioGeneracion({
           </span>
         )}
         {/* El recorte de la lista se dice: es la ÚNICA puerta a la generación, así que
-            callarlo hacía creer que no había más anclas que ofrecer. */}
+            callarlo hacía creer que no había más anclas que ofrecer. Y se dice CON la
+            salida: buscar por nombre alcanza cualquier ancla, caiga donde caiga el corte. */}
         {hayMas && (
           <Aviso>
             {capacidad === 'CI'
-              ? `Hay más items pendientes de los que caben aquí: se listan los ${anclas.length} más antiguos. Decide o cura estos y los siguientes aparecerán.`
-              : `Hay más retos con criterios abiertos de los que caben aquí: se listan los ${anclas.length} primeros por código.`}
+              ? `Hay más items pendientes de los que caben aquí: se listan los ${anclas.length} más antiguos. Decide o cura estos y los siguientes aparecerán; para uno concreto, búscalo por su título.`
+              : `Hay más retos con criterios abiertos de los que caben aquí: se listan los ${anclas.length} primeros por código. Un reto sale de la lista mientras sus criterios propuestos esperan revisión; para uno concreto, búscalo por su código o su título.`}
+          </Aviso>
+        )}
+        {busqueda && anclas.length === 0 && (
+          <Aviso>
+            Ningún {capacidad === 'CI' ? 'item pendiente' : 'reto con criterios abiertos'} coincide
+            con «{busqueda}». Vacía la búsqueda para volver a la cola completa.
           </Aviso>
         )}
         {sinMaterial && (
@@ -477,7 +544,9 @@ function FormularioConsentimiento({
       <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
         Sin un consentimiento vigente que cubra el procesamiento externo, el material no sale
         hacia el proveedor AI (RF-09.5). El item sigue pudiendo curarse a mano en la bandeja,
-        como siempre.
+        como siempre. Un registro posterior manda sobre los anteriores: si retira el permiso,
+        detiene las generaciones que aún no hayan salido y ninguna propuesta podrá nacer de
+        ese material — lo que ya viajó al proveedor no se puede des-enviar.
       </span>
       <label style={campo}>
         <span style={etiqueta}>Qué autorizó la persona</span>

@@ -8,6 +8,7 @@ import {
   MOTIVO_RECHAZO,
   motivoDeFalloProveedor,
   TIMEOUT_PROVEEDOR_MS,
+  type ResultadoIntento,
   type UsoTokens,
 } from './ai.degradacion';
 import { ESQUEMA_SALIDA } from './ai.prompts';
@@ -36,26 +37,37 @@ export type UsoLlamada = UsoTokens & { costoUsd: number | null };
 /** Por qué no hay contenido utilizable. Distingue las llamadas que el proveedor SÍ atendió
  * —y por tanto cobró— de las que ni siquiera llegaron a respuesta: son gastos distintos y
  * problemas distintos (una negativa se revisa, un timeout se reintenta). */
-export type MotivoSinSalida = 'rechazo-proveedor' | 'fuera-de-contrato' | 'sin-respuesta';
+export type MotivoSinSalida = Exclude<ResultadoIntento, 'salida-valida'>;
 
 /**
- * Resultado de una operación de generación. La rama de fallo lleva TAMBIÉN el uso, el
- * modelo y la latencia: una negativa del proveedor (`stop_reason = 'refusal'`) o una salida
- * que no se puede parsear son respuestas completas, facturadas, con su `usage` dentro. Sin
- * subirlo, esas llamadas desaparecían de la observabilidad de costos justo cuando más
- * interesa mirarlas — el gasto ocurrió y no había ni propuesta ni rastro que lo dijera.
+ * UN intento contra el proveedor: un modelo, una petición, un desenlace. Una operación de
+ * generación puede tener dos (primario y, si el primero cae por indisponibilidad, respaldo),
+ * y **cada uno es una llamada real** con su propia latencia y su propio uso.
+ */
+export type IntentoProveedor = {
+  modelo: string;
+  resultado: ResultadoIntento;
+  /** Vacío solo cuando el intento dio salida válida. */
+  motivo: string;
+  /** De ESE intento, no acumulada: si la latencia del respaldo incluyera la espera del
+   * primario, la latencia por modelo mediría otra cosa. */
+  latenciaMs: number;
+  uso: UsoLlamada | null;
+};
+
+/**
+ * Resultado de una operación de generación. `intentos` los lleva SIEMPRE y en orden: una
+ * degradación de modelo son dos llamadas al proveedor, las dos ocurrieron y las dos tienen
+ * que poder anotarse. Quedarse solo con la última borraba del libro el fallo del primario y
+ * dejaba una sola fila cuya latencia sumaba los dos intentos — la tasa de error y la
+ * latencia por modelo (RF-09.14) medían algo que no pasó.
+ *
+ * Cuando `ok`, el último intento es el que dio la salida válida (y su `modelo` es el que
+ * firma el lineage de las propuestas).
  */
 export type ResultadoProveedor =
-  | { ok: true; datos: unknown; modelo: string; latenciaMs: number; uso: UsoLlamada | null }
-  | {
-      ok: false;
-      motivo: string;
-      causa: MotivoSinSalida;
-      /** El modelo al que se llamó por última vez (puede ser el de respaldo). */
-      modelo: string;
-      latenciaMs: number;
-      uso: UsoLlamada | null;
-    };
+  | { ok: true; datos: unknown; intentos: IntentoProveedor[] }
+  | { ok: false; motivo: string; intentos: IntentoProveedor[] };
 
 /** Techo de salida: los contenidos de este slice son fichas pequeñas y estructuradas;
  * un techo alto solo compraría latencia y coste. */
@@ -180,10 +192,12 @@ export async function generarConProveedor(entrada: {
   sistema: string;
   usuario: string;
 }): Promise<ResultadoProveedor> {
-  const inicio = Date.now();
-  let ultimoModelo = MODELO_PRIMARIO;
+  // Cada intento se anota antes de decidir si hay otro: una degradación de modelo son DOS
+  // llamadas al proveedor, y la del primario existió aunque no sirviera. Devolver solo la
+  // última la borraba del libro y dejaba una latencia que sumaba las dos.
+  const intentos: IntentoProveedor[] = [];
   for (const [indice, modelo] of [MODELO_PRIMARIO, MODELO_FALLBACK].entries()) {
-    ultimoModelo = modelo;
+    const inicio = Date.now();
     try {
       const { datos, uso } = await unaLlamada(
         entrada.key,
@@ -192,43 +206,40 @@ export async function generarConProveedor(entrada: {
         entrada.sistema,
         entrada.usuario,
       );
-      return { ok: true, datos, modelo, latenciaMs: Date.now() - inicio, uso };
-    } catch (e) {
-      // JSON ilegible: el modelo respondió pero fuera de contrato. No se reintenta con
-      // otro modelo (no es indisponibilidad) y la propuesta se descarta entera —— pero la
-      // llamada existió y su uso sube igual.
-      if (e instanceof SyntaxError) {
-        return {
-          ok: false,
-          motivo: MOTIVO_ESQUEMA,
-          causa: 'fuera-de-contrato',
-          modelo,
-          latenciaMs: Date.now() - inicio,
-          uso: usoDelError(e),
-        };
-      }
-      if (indice === 0 && degradaModelo(e)) continue;
-      const causa = causaDelError(e);
-      return {
-        ok: false,
-        // Una negativa se cuenta como lo que es. `motivoDeFalloProveedor` la traduciría por
-        // su status HTTP («rechazó la petición (422)»), que suena a error nuestro y a algo
-        // que se arregla reintentando.
-        motivo: causa === 'rechazo-proveedor' ? MOTIVO_RECHAZO : motivoDeFalloProveedor(e),
-        causa,
+      intentos.push({
         modelo,
+        resultado: 'salida-valida',
+        motivo: '',
+        latenciaMs: Date.now() - inicio,
+        uso,
+      });
+      return { ok: true, datos, intentos };
+    } catch (e) {
+      const causa = causaDelError(e);
+      // Una negativa se cuenta como lo que es. `motivoDeFalloProveedor` la traduciría por
+      // su status HTTP («rechazó la petición (422)»), que suena a error nuestro y a algo
+      // que se arregla reintentando.
+      const motivo =
+        causa === 'fuera-de-contrato'
+          ? MOTIVO_ESQUEMA
+          : causa === 'rechazo-proveedor'
+            ? MOTIVO_RECHAZO
+            : motivoDeFalloProveedor(e);
+      intentos.push({
+        modelo,
+        resultado: causa,
+        motivo,
         latenciaMs: Date.now() - inicio,
         uso: usoDelError(e),
-      };
+      });
+      // JSON ilegible: el modelo respondió pero fuera de contrato. No se reintenta con otro
+      // modelo (no es indisponibilidad) y la propuesta se descarta entera.
+      if (causa === 'fuera-de-contrato') return { ok: false, motivo, intentos };
+      if (indice === 0 && degradaModelo(e)) continue;
+      return { ok: false, motivo, intentos };
     }
   }
-  // Inalcanzable (el bucle siempre retorna), pero el contrato se mantiene sin excepción.
-  return {
-    ok: false,
-    motivo: motivoDeFalloProveedor(null),
-    causa: 'sin-respuesta',
-    modelo: ultimoModelo,
-    latenciaMs: Date.now() - inicio,
-    uso: null,
-  };
+  // Inalcanzable (el bucle siempre retorna), pero el contrato se mantiene sin excepción:
+  // los intentos ya anotados viajan igual.
+  return { ok: false, motivo: motivoDeFalloProveedor(null), intentos };
 }

@@ -34,6 +34,23 @@ export const TARIFA_USD_POR_MTOK: Record<string, { entrada: number; salida: numb
   [MODELO_FALLBACK]: { entrada: 2, salida: 10 },
 };
 
+/**
+ * Cómo terminó UN intento contra el proveedor. Es el vocabulario que comparten el
+ * adaptador, el servicio y el CHECK de `llamada_ai`: una sola lista, o el libro de costos
+ * acabaría con valores que nadie sabe leer.
+ *
+ * `salida-valida` es «contenido que pasó el esquema de la capacidad»; los otros tres son
+ * intentos de los que no puede nacer nada, y se distinguen porque son gastos y problemas
+ * distintos: una negativa se revisa, un formato roto se investiga, un timeout se reintenta.
+ */
+export const RESULTADOS_INTENTO = [
+  'salida-valida',
+  'rechazo-proveedor',
+  'fuera-de-contrato',
+  'sin-respuesta',
+] as const;
+export type ResultadoIntento = (typeof RESULTADOS_INTENTO)[number];
+
 /** Uso de UNA llamada tal como lo devuelve el proveedor. */
 export type UsoTokens = {
   entrada: number;

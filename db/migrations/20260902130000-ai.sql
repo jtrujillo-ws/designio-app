@@ -514,6 +514,18 @@ create index propuesta_ai_ws_idx on propuesta_ai (workspace_id, estado, creado_e
 create unique index propuesta_ai_item_pendiente_idx on propuesta_ai (workspace_id, item_id)
   where item_id is not null and estado = 'propuesta';
 
+-- Y un objeto materializado cuelga de UNA sola propuesta. El guard diferido exige que lo
+-- haya creado la aceptación que lo reclama, lo que ya impide adoptar algo preexistente;
+-- esto cierra el caso simétrico, que el guard no puede ver porque mira una fila a la vez:
+-- dos propuestas de la MISMA transacción reclamando el mismo objeto recién creado —las dos
+-- pasarían el `xmin`— y la atribución quedaría repartida entre dos, con una de las dos
+-- mintiendo. Parcial porque `null` es lo normal: una propuesta pendiente o rechazada no
+-- materializa nada.
+create unique index propuesta_ai_evidencia_idx on propuesta_ai (workspace_id, evidencia_id)
+  where evidencia_id is not null;
+create unique index propuesta_ai_criterio_idx on propuesta_ai (workspace_id, criterio_id)
+  where criterio_id is not null;
+
 -- ── RLS ──
 -- Lectura: cualquier miembro (el cliente también ve qué propuso la AI y quién decidió).
 -- Escritura: SOLO curadores de la boutique (lead-boutique/diseñador) — los mismos que
@@ -753,6 +765,60 @@ begin
       and c.reto_id = new.reto_id
       and c.creado_por = new.revisada_por) then
     raise exception 'el criterio materializado cuelga del reto de la propuesta y lo firma quien aceptó (SYS-19)';
+  end if;
+
+  -- ── PROCEDENCIA, que no es lo mismo que PARECIDO ──
+  -- Los dos bloques de arriba son PREDICADOS: dicen que existe un objeto que encaja con la
+  -- forma esperada (el item apunta a esa evidencia, el criterio cuelga de ese reto, los dos
+  -- firmados por quien aceptó). Un predicado lo satisface cualquier objeto que dé la talla,
+  -- incluido uno que ya existía. Con el SQL del rol de aplicación eso bastaba para atribuir
+  -- a la AI algo hecho a mano: aprobar el item por su cuenta y DESPUÉS marcar aceptada la
+  -- propuesta pendiente colgándole esa evidencia preexistente.
+  --
+  -- Lo que hace falta es una PROCEDENCIA: que el objeto haya nacido de ESTA aceptación. Y
+  -- eso sí es comprobable sin guardar nada, porque la transacción es la unidad de trabajo
+  -- de la materialización: `xmin` es la transacción que insertó la fila, y aquí —dentro del
+  -- constraint trigger diferido, o sea todavía dentro de la transacción que acepta—
+  -- `pg_current_xact_id()` es la nuestra. Si no coinciden, ese objeto lo creó otro y la
+  -- propuesta se lo está apropiando.
+  --
+  -- Por qué importa más que una fila rara: lo que queda mal atribuido es que un objeto
+  -- CURADO A MANO conste como materializado por la AI, y de eso viven las dos lecturas del
+  -- método — el rastro de quién produjo qué (SPEC-08) y la tasa de corrección humana, que
+  -- SPEC-09 usa como señal de calidad barata frente al coste de los evals. Una atribución
+  -- falsa no ensucia una fila: mueve una métrica de calidad de la AI, y hacia el lado
+  -- optimista (entra como `aceptada`, que es «la AI acertó a la primera»).
+  if new.destino = 'evidencia' and not exists (
+    select 1 from evidencia e
+    where e.id = new.evidencia_id and e.workspace_id = new.workspace_id
+      and e.xmin = pg_current_xact_id()::xid) then
+    raise exception 'la evidencia materializada tiene que haberla creado esta misma aceptación: una propuesta no puede apropiarse de evidencia que ya existía (SYS-19)';
+  end if;
+  if new.destino = 'criterio-exito' and not exists (
+    select 1 from criterio_exito c
+    where c.id = new.criterio_id and c.workspace_id = new.workspace_id
+      and c.xmin = pg_current_xact_id()::xid) then
+    raise exception 'el criterio materializado tiene que haberlo creado esta misma aceptación: una propuesta no puede apropiarse de un criterio que ya existía (SYS-19)';
+  end if;
+
+  -- ── El consentimiento, en el ÚLTIMO instante ──
+  -- El guard de revisión ya lo exige, pero es un trigger BEFORE UPDATE: su snapshot es el
+  -- de la sentencia que sella, así que una revocación que commitea DESPUÉS de esa sentencia
+  -- y antes de que commitee la aceptación no la ve nadie — y la evidencia entra con la
+  -- revocación ya vigente. Aquí, en el commit, sí se ve: cada sentencia de plpgsql toma su
+  -- propio snapshot en READ COMMITTED. Es el mismo argumento por el que este guard es el
+  -- suelo del ciclo de vida del reto, aplicado al otro eje que también caduca solo.
+  --
+  -- El servicio toma además `designio:consentimiento:<item>`, el mismo candado que toma
+  -- registrar un consentimiento, para que el orden sea determinista y el revisor reciba el
+  -- error con nombre en vez de un rechazo del suelo. Pero el candado NO es lo que cierra la
+  -- ventana —el SQL directo no lo pide—: lo cierra esto.
+  if new.destino = 'evidencia' and exists (
+    select 1 from item_importacion i
+    where i.id = new.item_id and i.workspace_id = new.workspace_id
+      and tipo_fuente_exige_consentimiento(i.tipo_fuente)
+      and not consentimiento_externo_vigente(i.id, i.workspace_id)) then
+    raise exception 'el consentimiento de ese material ya no autoriza el procesamiento externo: la propuesta no puede materializarse (RF-09.5)';
   end if;
   -- Y el reto tiene que SEGUIR admitiendo criterios al aceptar, que no es lo mismo que el
   -- congelado por G0 y no lo cubre ninguna política de `criterio_exito`. El ciclo de vida

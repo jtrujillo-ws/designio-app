@@ -143,10 +143,33 @@ async function estadoCapacidad(tx: TransactionSql, workspaceId: string) {
   return { ...ai, llamadasHoy: atendidas };
 }
 
+/**
+ * ORDEN DE ADQUISICIÓN DE CANDADOS DE ESTE SLICE, en un solo sitio y para todas sus rutas:
+ *
+ *     designio:consentimiento:<item>  →  designio:presupuesto-ai:<workspace>
+ *     designio:reto:<reto>            (ver `bloquearReto`, que documenta reto → gate)
+ *
+ * Las dos primeras coexisten en dos rutas y las dos las toman en ese orden: `prepararAlcance`
+ * (consentimiento del ancla, luego el hueco de presupuesto) y `registrarConsentimiento` (el
+ * item, y el presupuesto solo cuando la revocación retira una reserva). Con una sola regla no
+ * hay ciclo posible.
+ *
+ * El candado de RETO no se cruza con los otros dos, y conviene decir por qué en vez de
+ * ordenarlo por si acaso: lo toma la materialización de C0, que crea un criterio, y el de
+ * consentimiento lo toma la de CI, que crea evidencia. Las dos ramas son excluyentes —las
+ * elige el `destino` de la propuesta—, así que ninguna transacción de este módulo llega a
+ * tener los dos en la mano. Si algún día una ruta necesitara ambos, su sitio en la cadena es
+ * el primero (reto → consentimiento → presupuesto), porque `bloquearReto` ya encabeza su
+ * propia cadena hacia el gate y así las dos reglas siguen siendo una.
+ *
+ * Y el contrato que comparten los tres, que es lo que los hace necesarios: una consulta es un
+ * predicado sobre un snapshot, no un candado. Comprobar algo que otro camino muta, sin
+ * compartir candado con ese camino, no cierra la ventana — la estrecha.
+ */
+
 /** Candado del presupuesto AI de un workspace. Apartar el hueco y consumirlo ocurren en
  * transacciones DISTINTAS (la llamada al proveedor va entre medias, fuera de toda
- * transacción), así que los dos lados lo toman: una consulta es un predicado sobre un
- * snapshot, no un candado — mismo contrato que `bloquearReto`. */
+ * transacción), así que los dos lados lo toman. Orden: ver el bloque de arriba. */
 async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(
     hashtextextended('designio:presupuesto-ai:' || ${workspaceId}, 42))`;
@@ -679,7 +702,7 @@ async function liberarReserva(
  *  | Rol curador                   | sí, por `puedeRevisar`       | sí (`rolCurador`)           | política de UPDATE           |
  *  | Propuesta aún pendiente       | la separa de las decididas   | sí⁸                         | USING + guard de revisión    |
  *  | CI · item aún pendiente       | `item-curado`                | sí⁹                         | guard de materialización¹⁰   |
- *  | CI · consentimiento vigente   | `consentimiento-revocado`    | sí                          | guard de revisión            |
+ *  | CI · consentimiento vigente   | `consentimiento-revocado`    | sí, con candado por item    | los DOS guards¹⁵             |
  *  | CI · citas intactas           | no aplica: es la corrección  | sí, contra el original      | guard de revisión            |
  *  | C0 · criterios no congelados  | `criterios-congelados`       | sí, al insertar¹¹           | política de `criterio_exito` |
  *  | C0 · reto admite criterios    | `reto-no-admite`             | sí (`materializarCriterio`) | guard de materialización¹⁰   |
@@ -734,11 +757,56 @@ async function liberarReserva(
  *    en sentencias posteriores de la misma transacción, así que un guard inmediato vería un
  *    estado a medias. Que corra al commit es además lo que lo vuelve suelo real para este
  *    recorrido: comprueba el estado del ancla en el ÚLTIMO instante posible.
+ * ¹⁵ Hacen falta los dos y no es redundancia. El de revisión es BEFORE UPDATE: su snapshot
+ *    es el de la sentencia que sella, así que no ve una revocación que commitee después de
+ *    ella y antes del commit de la aceptación — la evidencia entraba con la revocación ya
+ *    vigente. El de materialización corre en el COMMIT y sí la ve. Y el servicio toma además
+ *    el mismo candado por item que `registrarConsentimiento`, que no es lo que cierra la
+ *    ventana (el SQL directo no lo pide) sino lo que hace el orden determinista y deja que el
+ *    revisor reciba el error con nombre en vez del rechazo del suelo.
  * ¹¹ No se lee antes de insertar, y es deliberado: la política y `criterio_g0_pendiente_guard`
  *    ya lo dicen en la propia sentencia, sin ventana. El servicio solo traduce el 42501 y el
  *    P0001 a un mensaje que el revisor entiende. El estado del reto, en cambio, SÍ se lee
  *    antes: ninguna política de `criterio_exito` lo mira, así que sin esa lectura no habría
  *    quien lo dijera.
+ *
+ * PROCEDENCIA DE LO QUE NACE AL ACEPTAR. Las dos tablas de arriba responden «¿sigue
+ * valiendo la precondición?». Esta responde otra que no se deduce de aquella: de cada cosa
+ * que la aceptación produce, **qué demuestra que nació de ESTA propuesta** — y no que existe
+ * algo con la forma correcta. La diferencia no es retórica: un PREDICADO lo satisface
+ * cualquier objeto que dé la talla, incluido uno hecho a mano antes; una PROCEDENCIA solo la
+ * satisface el que salió de aquí. Lo que se protege es la atribución, de la que viven el
+ * rastro de quién produjo qué (SPEC-08) y la tasa de corrección humana (SPEC-09):
+ *
+ *  | Lo que nace al aceptar        | Cómo queda atado a la propuesta      | Qué lo DEMUESTRA                          |
+ *  |-------------------------------|--------------------------------------|-------------------------------------------|
+ *  | `evidencia` (CI)              | `evidencia_id`, FK compuesta         | `xmin` = la transacción que acepta¹², único|
+ *  |                               |                                      | por workspace, y el item sellado con ESA   |
+ *  |                               |                                      | evidencia y por quien aceptó (SYS-16)      |
+ *  | `criterio_exito` (C0)         | `criterio_id`, FK compuesta          | lo mismo: `xmin`, único, y cuelga del reto |
+ *  |                               |                                      | de la propuesta firmado por quien aceptó   |
+ *  | sello de `item_importacion`   | `evidencia_id` + `decidido_por`      | el guard los compara con los de la fila    |
+ *  | `fuente` (CI)                 | ninguna, y no hace falta             | cuelga de la evidencia, que sí está atada¹³|
+ *  | evento `PropuestaAIAceptada`  | —                                    | lo emite el GUARD: no se puede aceptar sin |
+ *  | / `Corregida` / `Rechazada`   |                                      | emitirlo ni emitirlo sin aceptar           |
+ *  | evento `CriterioDefinido`     | —                                    | igual, desde `criterio_g0_pendiente_guard` |
+ *  | evento `EvidenciaCurada`      | `payload.origen = 'propuesta-ai'`    | **nada: lo escribe el servicio**¹⁴         |
+ *
+ * ¹² `xmin` es la transacción que insertó la fila, y el guard de materialización corre
+ *    DIFERIDO — todavía dentro de la transacción que acepta—, así que `pg_current_xact_id()`
+ *    es la suya. Coincidir es la prueba; no coincidir significa que ese objeto lo creó otro y
+ *    esta propuesta se lo está apropiando. Vale como prueba porque aquí no hay subtransacciones
+ *    (`conUsuario` abre una sola y nadie usa savepoints): con ellas, `xmin` sería el subxid.
+ * ¹³ Atribuir la fuente sería atribuir dos veces el mismo hecho, y además no hay nada que
+ *    proteger: una fuente no es una afirmación sobre el mundo, es de dónde salió la evidencia
+ *    que sí lo es.
+ * ¹⁴ Hueco conocido y acotado a propósito. `EvidenciaCurada` lo emiten los DOS caminos de
+ *    curaduría —este y el manual de SPEC-06—, así que moverlo a un guard es cirugía en el
+ *    slice de evidencia, no en este. Lo que hoy limita el daño: nadie LEE ese `origen` (es
+ *    rastro de auditoría, no entrada de ningún cálculo), y la tasa de corrección humana no se
+ *    computa de los eventos sino del reparto `aceptada`/`corregida` de `propuesta_ai`, que es
+ *    justo lo que las filas de arriba acaban de atar. Si algún día alguien calcula sobre el
+ *    evento, esta fila pasa a ser un defecto de verdad y hay que emitirlo desde un trigger.
  *
  * Última comprobación antes de que el material salga hacia el proveedor (RF-09.5).
  *
@@ -1240,6 +1308,13 @@ async function materializarEvidencia(
   p: PropuestaEnRevision,
   c: ContenidoExtraccion,
 ): Promise<string> {
+  // El MISMO candado que toma `registrarConsentimiento`, y por el mismo motivo que lo toma
+  // `prepararAlcance` antes de despachar: lo que se va a leer aquí es exactamente lo que ese
+  // camino muta. Sin compartirlo, la lectura de abajo es un predicado sobre un snapshot y una
+  // revocación que commitea justo después entra por la rendija — el guard diferido la para en
+  // el commit, pero con un error del suelo en vez del que dice cómo salir. El candado no es lo
+  // que cierra la ventana: es lo que hace que el orden sea determinista y el mensaje, el bueno.
+  await bloquearConsentimiento(tx, p.itemId!);
   const [item] = await tx`select titulo, tipo_fuente, referencia,
       tipo_fuente_exige_consentimiento(tipo_fuente)
         and not consentimiento_externo_vigente(id, workspace_id) as consentimiento_retirado

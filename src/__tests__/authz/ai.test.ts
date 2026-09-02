@@ -697,7 +697,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         set estado = 'aceptada', revisada_por = ${leadId} where id = ${propuestaId}`),
     ).rejects.toThrow(/check constraint/);
 
-    // Apuntar a la evidencia de OTRO item: el constraint diferido lo revienta al commit.
+    // Apuntar a la evidencia que YA materializó otra propuesta: la reclama el índice único
+    // antes de que hable ningún guard. Un objeto materializado cuelga de una sola propuesta,
+    // porque si colgara de dos una de las dos estaría mintiendo sobre quién lo produjo.
     const otroItem = await nuevoItem('Item ya curado a mano');
     const ajena = await aceptarPropuesta(
       leadId,
@@ -714,6 +716,24 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       conUsuario(leadId, (tx) => tx`update propuesta_ai
         set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${ajena.objetoId}
         where id = ${propuestaId}`),
+    ).rejects.toThrow(/propuesta_ai_evidencia_idx/);
+
+    // Y con una evidencia RECIÉN creada, sin dueño y en esta misma transacción —o sea
+    // pasando el índice único y la procedencia—, lo que queda en pie es el sello del item:
+    // aceptar una extracción sella su item de la bandeja con ESA evidencia (SYS-16).
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [f] = await tx`insert into fuente
+          (workspace_id, tipo, titulo, referencia, creado_por)
+          values (${ws}, 'documento', 'Fuente suelta', 'ref', ${leadId}) returning id`;
+        const [e] = await tx`insert into evidencia
+          (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+          values (${ws}, ${f!.id as string}, 'Evidencia suelta', '', '{}'::jsonb, ${leadId})
+          returning id`;
+        await tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${e!.id as string}
+          where id = ${propuestaId}`;
+      }),
     ).rejects.toThrow(/sella su item de la bandeja/);
 
     // El lineage y el original no tienen superficie de escritura para el rol de la app.
@@ -1576,6 +1596,149 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         where id = ${propuestaId}`);
       expect(decidida!.estado).toBe('rechazada');
     });
+  });
+
+  it('aceptar no puede adoptar un objeto que ya existía: se exige procedencia, no parecido', async () => {
+    const itemId = await nuevoItem('Item curado a mano antes de aceptar');
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+    });
+
+    // El ataque exacto: el curador aprueba el item POR SU CUENTA, con una evidencia hecha a
+    // mano y sin lineage de AI, en su propia transacción. Nada de esto es ilegítimo — es la
+    // curaduría manual de siempre (SYS-16), y el item queda sellado por él.
+    const aMano = await conUsuario(leadId, async (tx) => {
+      const [f] = await tx`insert into fuente
+        (workspace_id, tipo, titulo, referencia, creado_por)
+        values (${ws}, 'nota', 'Fuente a mano', 'ref', ${leadId}) returning id`;
+      const [e] = await tx`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${ws}, ${f!.id as string}, 'Evidencia a mano', 'La escribió una persona',
+                '{}'::jsonb, ${leadId}) returning id`;
+      await tx`update item_importacion
+        set estado = 'aprobado', decidido_por = ${leadId}, decidido_en = now(),
+            evidencia_id = ${e!.id as string}
+        where id = ${itemId}`;
+      return e!.id as string;
+    });
+
+    // Y DESPUÉS marca aceptada la propuesta que seguía pendiente, colgándole esa evidencia.
+    // El guard viejo lo dejaba pasar porque su comprobación era un PREDICADO: el item apunta
+    // a esa evidencia y la decidió el mismo humano — las dos cosas son ciertas. Lo que no es
+    // cierto es que la produjera esta aceptación, y eso es lo que ahora hay que demostrar.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update propuesta_ai
+        set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${aMano}
+        where id = ${propuestaId}`),
+    ).rejects.toThrow(/esta misma aceptación/i);
+
+    // Lo que estaba en juego no es la fila: es que un objeto hecho a mano constara como
+    // materializado por la AI. La propuesta sigue pendiente y su única salida es rechazarla.
+    const [viva] = await conUsuario(leadId, (tx) => tx`select estado, evidencia_id
+      from propuesta_ai where id = ${propuestaId}`);
+    expect(viva!.estado).toBe('propuesta');
+    expect(viva!.evidencia_id).toBeNull();
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+  });
+
+  it('dos propuestas no se reparten el mismo criterio: un objeto cuelga de una sola', async () => {
+    // El caso simétrico del anterior, y el único que la procedencia NO puede ver: las dos
+    // propuestas reclaman un objeto creado en ESTA transacción, así que las dos pasan el
+    // `xmin`. También pasan el resto del guard —el criterio cuelga del reto de ambas y lo
+    // firma quien acepta—, porque un reto admite varios criterios y varias propuestas. Si
+    // colgara de las dos, una de las dos estaría mintiendo sobre quién lo produjo, y la
+    // atribución de SPEC-08 se repartiría entre una propuesta real y una prestada.
+    const p1 = await nuevaPropuesta(leadId, {
+      capacidad: 'C0',
+      destino: 'criterio-exito',
+      retoId,
+    });
+    const p2 = await nuevaPropuesta(leadId, {
+      capacidad: 'C0',
+      destino: 'criterio-exito',
+      retoId,
+    });
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [c] = await tx`insert into criterio_exito
+          (workspace_id, reto_id, kpi, definicion, linea_base_plan, objetivo, ventana_dias,
+           creado_por)
+          values (${ws}, ${retoId}, 'KPI compartido', 'Definición', 'Plan', 'Objetivo', 30,
+                  ${leadId})
+          returning id`;
+        for (const id of [p1, p2]) {
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId}, criterio_id = ${c!.id as string}
+            where id = ${id}`;
+        }
+      }),
+    ).rejects.toThrow(/propuesta_ai_criterio_idx/);
+
+    for (const id of [p1, p2]) {
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: id });
+    }
+  });
+
+  it('una revocación que commitea a media aceptación la para en el commit, no la deja pasar', async () => {
+    const itemId = await nuevoItem('Entrevista revocada a media aceptación', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza la entrevista y su procesamiento externo',
+      procesamientoExterno: true,
+    });
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+    });
+
+    // Se materializa a mano —o sea SIN el candado por item que toma el servicio—, que es
+    // justo el caso que el candado no cubre y el suelo sí tiene que cubrir. En medio, desde
+    // otra conexión, la persona retira el permiso y esa revocación COMMITEA.
+    //
+    // El guard de revisión no puede verla: es BEFORE UPDATE y su snapshot es el de la
+    // sentencia que sella, tomado antes. El diferido corre en el COMMIT, con snapshot nuevo,
+    // y sí la ve. Sin él, la evidencia entraba con la revocación ya vigente.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [f] = await tx`insert into fuente
+          (workspace_id, tipo, titulo, referencia, creado_por)
+          values (${ws}, 'entrevista', 'Fuente', 'ref', ${leadId}) returning id`;
+        const [e] = await tx`insert into evidencia
+          (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+          values (${ws}, ${f!.id as string}, 'Evidencia', '', '{}'::jsonb, ${leadId})
+          returning id`;
+        await tx`update item_importacion
+          set estado = 'aprobado', decidido_por = ${leadId}, decidido_en = now(),
+              evidencia_id = ${e!.id as string}
+          where id = ${itemId}`;
+        await tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${e!.id as string}
+          where id = ${propuestaId}`;
+
+        await registrarConsentimiento(leadId, {
+          workspaceId: ws,
+          itemId,
+          alcance: 'La persona retira el permiso para el procesamiento externo',
+          procesamientoExterno: false,
+        });
+      }),
+    ).rejects.toThrow(/no autoriza el procesamiento externo/i);
+
+    // La transacción entera se revirtió: ni evidencia colada ni item sellado.
+    const [tras] = await conUsuario(leadId, (tx) => tx`select estado, evidencia_id
+      from item_importacion where id = ${itemId}`);
+    expect(tras!.estado).toBe('pendiente');
+    expect(tras!.evidencia_id).toBeNull();
+
+    // Y por el camino del SERVICIO el revisor recibe el error con NOMBRE, no el del suelo:
+    // la lectura va bajo el mismo candado por item que toma registrar un consentimiento.
+    await expect(
+      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
+    ).rejects.toThrow(/solo puede rechazarse/i);
   });
 
   it('un reto que ya no admite criterios no llega ni a pedirlos: se corta antes de gastar', async () => {

@@ -1,11 +1,13 @@
 import '@/lib/server-only';
 import Anthropic from '@anthropic-ai/sdk';
 import {
+  costoDeUso,
   MODELO_FALLBACK,
   MODELO_PRIMARIO,
   MOTIVO_ESQUEMA,
   motivoDeFalloProveedor,
   TIMEOUT_PROVEEDOR_MS,
+  type UsoTokens,
 } from './ai.degradacion';
 import { ESQUEMA_SALIDA } from './ai.prompts';
 import type { CapacidadActiva } from './ai.schemas';
@@ -24,8 +26,14 @@ import type { CapacidadActiva } from './ai.schemas';
  *    política de modelos del diseño técnico.
  */
 
+/** Lo que costó la llamada, medido y no estimado: el `usage` de la respuesta más el
+ * coste derivado con la tarifa del modelo que respondió. Es el ÚNICO momento en que este
+ * dato existe —descartarlo aquí dejaba el `costoUsd` del lineage imposible de poblar
+ * para siempre (RF-09.14)—, así que sube con el resultado hasta la propuesta. */
+export type UsoLlamada = UsoTokens & { costoUsd: number | null };
+
 export type ResultadoProveedor =
-  | { ok: true; datos: unknown; modelo: string; latenciaMs: number }
+  | { ok: true; datos: unknown; modelo: string; latenciaMs: number; uso: UsoLlamada | null }
   | { ok: false; motivo: string };
 
 /** Techo de salida: los contenidos de este slice son fichas pequeñas y estructuradas;
@@ -59,13 +67,35 @@ function degradaModelo(e: unknown): boolean {
   return typeof status === 'number' && (status === 404 || status >= 500);
 }
 
+/** Un contador de tokens del proveedor, saneado: lo que se persiste como uso tiene que
+ * ser un entero no negativo o nada — un campo ausente o raro no se cuela como 0 real. */
+function contador(valor: unknown): number | null {
+  return typeof valor === 'number' && Number.isFinite(valor) && valor >= 0
+    ? Math.round(valor)
+    : null;
+}
+
+function usoDeRespuesta(modelo: string, usage: unknown): UsoLlamada | null {
+  const u = (usage ?? {}) as Record<string, unknown>;
+  const entrada = contador(u.input_tokens);
+  const salida = contador(u.output_tokens);
+  if (entrada === null || salida === null) return null;
+  const uso: UsoTokens = {
+    entrada,
+    salida,
+    cacheEscritura: contador(u.cache_creation_input_tokens) ?? 0,
+    cacheLectura: contador(u.cache_read_input_tokens) ?? 0,
+  };
+  return { ...uso, costoUsd: costoDeUso(modelo, uso) };
+}
+
 async function unaLlamada(
   key: string,
   modelo: string,
   capacidad: CapacidadActiva,
   sistema: string,
   usuario: string,
-): Promise<unknown> {
+): Promise<{ datos: unknown; uso: UsoLlamada | null }> {
   const cliente = new Anthropic({
     apiKey: key,
     timeout: TIMEOUT_PROVEEDOR_MS,
@@ -92,7 +122,9 @@ async function unaLlamada(
     .map((b) => (b.type === 'text' ? b.text : ''))
     .join('')
     .trim();
-  return JSON.parse(texto);
+  // El uso viaja CON los datos: quedarse solo con el texto era tirar el único dato de
+  // coste que el proveedor da, y ningún cálculo posterior podía reconstruirlo.
+  return { datos: JSON.parse(texto), uso: usoDeRespuesta(modelo, respuesta.usage) };
 }
 
 export async function generarConProveedor(entrada: {
@@ -104,14 +136,14 @@ export async function generarConProveedor(entrada: {
   const inicio = Date.now();
   for (const [indice, modelo] of [MODELO_PRIMARIO, MODELO_FALLBACK].entries()) {
     try {
-      const datos = await unaLlamada(
+      const { datos, uso } = await unaLlamada(
         entrada.key,
         modelo,
         entrada.capacidad,
         entrada.sistema,
         entrada.usuario,
       );
-      return { ok: true, datos, modelo, latenciaMs: Date.now() - inicio };
+      return { ok: true, datos, modelo, latenciaMs: Date.now() - inicio, uso };
     } catch (e) {
       // JSON ilegible: el modelo respondió pero fuera de contrato. No se reintenta con
       // otro modelo (no es indisponibilidad) y la propuesta se descarta entera.

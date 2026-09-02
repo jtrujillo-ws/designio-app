@@ -22,6 +22,40 @@ export const MODELO_FALLBACK = 'claude-sonnet-5';
  * desactiva el tope. */
 export const LIMITE_PROPUESTAS_DIA = 60;
 
+/**
+ * Tarifa del proveedor en USD por millón de tokens, por modelo de la política. Vive en
+ * código junto a la política de modelos y no en la base: el coste se calcula con el
+ * precio VIGENTE al generar y se persiste con la propuesta, así que una tarifa nueva no
+ * reescribe el histórico. Un modelo sin tarifa conocida no inventa un coste: devuelve
+ * null y el panel dice «sin tarifa registrada» en vez de un número falso.
+ */
+export const TARIFA_USD_POR_MTOK: Record<string, { entrada: number; salida: number }> = {
+  [MODELO_PRIMARIO]: { entrada: 5, salida: 25 },
+  [MODELO_FALLBACK]: { entrada: 2, salida: 10 },
+};
+
+/** Uso de UNA llamada tal como lo devuelve el proveedor. */
+export type UsoTokens = {
+  entrada: number;
+  salida: number;
+  /** Escritura de caché (~1,25×) y lectura de caché (~0,1×): hoy no se cachea, pero el
+   * coste se calcula con la fórmula completa para que activar el cacheo no exija
+   * reabrir esto ni deje el histórico mal contado. */
+  cacheEscritura?: number;
+  cacheLectura?: number;
+};
+
+/** Coste en USD de una llamada, redondeado al micro-dólar (la precisión que persiste la
+ * columna). Sin tarifa para ese modelo → null. */
+export function costoDeUso(modelo: string, uso: UsoTokens): number | null {
+  const tarifa = TARIFA_USD_POR_MTOK[modelo];
+  if (!tarifa) return null;
+  const entrada =
+    uso.entrada + (uso.cacheEscritura ?? 0) * 1.25 + (uso.cacheLectura ?? 0) * 0.1;
+  const usd = (entrada * tarifa.entrada + uso.salida * tarifa.salida) / 1_000_000;
+  return Math.round(Math.max(0, usd) * 1_000_000) / 1_000_000;
+}
+
 /** El proveedor no puede colgar una pantalla: pasado este techo la llamada se aborta y
  * la capacidad se reporta como no disponible en esta operación. */
 export const TIMEOUT_PROVEEDOR_MS = 25_000;
@@ -53,12 +87,20 @@ export function evaluarCapacidadAI(entrada: {
   keyEntorno?: string | null;
   propuestasHoy?: number;
   limiteDiario?: number;
+  /** Cuántas propuestas puede llegar a persistir la generación que se está admitiendo
+   * (el techo de la capacidad). El panel no pasa ninguna: pregunta por el estado, no
+   * pide hueco. Sin esto, «queda 1 y la generación produce 4» pasaba el chequeo. */
+  unidades?: number;
 }): EstadoCapacidadAI {
   const limite =
     Number.isInteger(entrada.limiteDiario) && (entrada.limiteDiario as number) > 0
       ? (entrada.limiteDiario as number)
       : LIMITE_PROPUESTAS_DIA;
   const usadas = Number.isFinite(entrada.propuestasHoy) ? Math.max(0, entrada.propuestasHoy!) : 0;
+  const piden =
+    Number.isInteger(entrada.unidades) && (entrada.unidades as number) > 0
+      ? (entrada.unidades as number)
+      : 1;
 
   const delWorkspace = (entrada.keyWorkspace ?? '').trim();
   const delEntorno = (entrada.keyEntorno ?? '').trim();
@@ -80,6 +122,14 @@ export function evaluarCapacidadAI(entrada: {
       disponible: false,
       origenKey,
       motivo: `Presupuesto AI del workspace agotado por hoy (${usadas}/${limite} propuestas). Las capacidades AI quedan en pausa hasta mañana. ${COLA_MANUAL}`,
+    };
+  }
+  if (usadas + piden > limite) {
+    return {
+      ...base,
+      disponible: false,
+      origenKey,
+      motivo: `El presupuesto AI de hoy no alcanza para esta generación: quedan ${limite - usadas} de ${limite} propuestas y esta puede producir hasta ${piden}. ${COLA_MANUAL}`,
     };
   }
   return { ...base, disponible: true, origenKey, motivo: '' };

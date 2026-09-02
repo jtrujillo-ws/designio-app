@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
-import { MODELO_PRIMARIO } from '@/lib/ai/ai.degradacion';
+import { costoDeUso, LIMITE_PROPUESTAS_DIA, MODELO_PRIMARIO } from '@/lib/ai/ai.degradacion';
 import { PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import type {
   ContenidoCriterio,
@@ -14,6 +14,7 @@ import {
   generarPropuestas,
   panelPropuestas,
   rechazarPropuesta,
+  registrarConsentimiento,
 } from '@/lib/ai/ai.servicio';
 import type { ResultadoProveedor } from '@/lib/ai/proveedor.server';
 import { describeAuthz } from './helpers';
@@ -70,13 +71,42 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     razonamiento: 'Es la métrica que el reto declara como objetivo',
   };
 
-  /** Item de bandeja pendiente (setup con la conexión admin, como el resto de la suite). */
-  async function nuevoItem(titulo: string): Promise<string> {
+  /** Item de bandeja pendiente (setup con la conexión admin, como el resto de la suite).
+   * `tipoFuente` decide si su material es de personas: 'entrevista' exige consentimiento
+   * registrado antes de cualquier procesamiento AI (RF-09.5). */
+  async function nuevoItem(titulo: string, tipoFuente = 'nota'): Promise<string> {
     const [i] = await sqlAdmin()`insert into item_importacion
       (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
-      values (${ws}, ${titulo}, ${MATERIAL}, 'nota', 'ref', ${leadId})
+      values (${ws}, ${titulo}, ${MATERIAL}, ${tipoFuente}, 'ref', ${leadId})
       returning id`;
     return i!.id as string;
+  }
+
+  /** Respuesta del proveedor con su uso: es el único momento en que ese dato existe. */
+  const RESPUESTA_CI: ResultadoProveedor = {
+    ok: true,
+    modelo: MODELO_PRIMARIO,
+    latenciaMs: 900,
+    datos: CONTENIDO_CI,
+    uso: {
+      entrada: 1200,
+      salida: 300,
+      costoUsd: costoDeUso(MODELO_PRIMARIO, { entrada: 1200, salida: 300 }),
+    },
+  };
+
+  /** Corre `fn` con la capacidad AI encendida y la respuesta del proveedor dada. */
+  async function conProveedor<T>(respuesta: ResultadoProveedor, fn: () => Promise<T>): Promise<T> {
+    const previa = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'sk-de-prueba';
+    proveedor.respuesta = respuesta;
+    try {
+      return await fn();
+    } finally {
+      proveedor.respuesta = null;
+      if (previa === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previa;
+    }
   }
 
   /** Propuesta pendiente creada por el camino real (RLS del rol de aplicación): la
@@ -144,7 +174,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const admin = sqlAdmin();
     if (ws) {
       await admin`delete from evento_dominio where workspace_id = ${ws}`;
+      await admin`delete from reserva_ai where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where workspace_id = ${ws}`;
+      await admin`delete from consentimiento_item where workspace_id = ${ws}`;
       await admin`delete from item_importacion where workspace_id = ${ws}`;
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
@@ -472,6 +504,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         modelo: 'modelo-de-prueba',
         latenciaMs: 1234,
         datos: { criterios: [CONTENIDO_C0, { ...CONTENIDO_C0, kpi: 'Tiempo a cuenta activa' }] },
+        uso: null,
       };
       const lote = await generarPropuestas(leadId, {
         workspaceId: ws,
@@ -498,7 +531,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
       ).rejects.toThrow(/no está disponible/);
       // Y una salida fuera de contrato se descarta entera, sin media propuesta guardada.
-      proveedor.respuesta = { ok: true, modelo: 'm', latenciaMs: 1, datos: { basura: true } };
+      proveedor.respuesta = {
+        ok: true,
+        modelo: 'm',
+        latenciaMs: 1,
+        datos: { basura: true },
+        uso: null,
+      };
       await expect(
         generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
       ).rejects.toThrow(/esquema/);
@@ -548,6 +587,323 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const panel = await panelPropuestas(leadId, ws);
     const p = [...panel.pendientes, ...panel.decididas].find((x) => x.id === propuestaId)!;
     expect(p.citas.map((c) => c.fiel)).toEqual([true, false]);
+  });
+
+  // ── RF-09.5: consentimiento ANTES de que el material salga hacia el proveedor ──
+
+  it('material de personas sin consentimiento: no se genera, y la base tampoco lo admite', async () => {
+    const itemId = await nuevoItem('Entrevista sin consentimiento', 'entrevista');
+    await conProveedor(RESPUESTA_CI, async () => {
+      // El servicio corta ANTES de construir el prompt: el material no llega a viajar.
+      await expect(
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+      ).rejects.toThrow(/consentimiento/i);
+    });
+    // Y el suelo es la base: ni por SQL crudo puede EXISTIR una propuesta de ese material.
+    await expect(
+      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+    ).rejects.toThrow(/consentimiento/i);
+    // Un item que no es de personas no exige nada: la regla no se derrama sobre el resto.
+    const nota = await nuevoItem('Nota sin personas dentro');
+    await conProveedor(RESPUESTA_CI, async () => {
+      const r = await generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: nota });
+      expect(r.generadas).toBe(1);
+    });
+  });
+
+  it('el consentimiento se registra antes, distingue el procesamiento externo y no se reescribe', async () => {
+    const itemId = await nuevoItem('Entrevista con consentimiento', 'entrevista');
+
+    // Un stakeholder no registra consentimientos (misma frontera que curar).
+    await expect(
+      registrarConsentimiento(stakeId, {
+        workspaceId: ws,
+        itemId,
+        alcance: 'Grabación autorizada',
+        procesamientoExterno: true,
+      }),
+    ).rejects.toThrow(/lead-boutique o diseñador/);
+
+    // Autorizar la grabación NO es autorizar mandarla a un tercero: sigue bloqueada.
+    const soloInterno = await nuevoItem('Entrevista solo interna', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId: soloInterno,
+      alcance: 'Grabación y transcripción para uso interno',
+      procesamientoExterno: false,
+    });
+    await conProveedor(RESPUESTA_CI, async () => {
+      await expect(
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: soloInterno }),
+      ).rejects.toThrow(/consentimiento/i);
+    });
+
+    // Con el consentimiento completo, el mismo camino funciona…
+    await registrarConsentimiento(disenadorId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Grabación, transcripción y procesamiento por proveedor AI',
+      procesamientoExterno: true,
+    });
+    const generadas = await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+    expect(generadas.generadas).toBe(1);
+
+    // …y la evidencia materializada HEREDA lo registrado, en vez de nacer siempre en falso.
+    const [propuesta] = await conUsuario(leadId, (tx) => tx`select id from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId} and estado = 'propuesta'`);
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId: propuesta!.id as string,
+    });
+    const [ev] = await conUsuario(leadId, (tx) => tx`select dimensiones from evidencia
+      where id = ${r.objetoId}`);
+    expect((ev!.dimensiones as { derechos: { consentimiento: boolean } }).derechos.consentimiento)
+      .toBe(true);
+
+    // Append-only: ni se reescribe por el servicio ni hay superficie para el rol de app.
+    await expect(
+      registrarConsentimiento(leadId, {
+        workspaceId: ws,
+        itemId,
+        alcance: 'otra cosa',
+        procesamientoExterno: true,
+      }),
+    ).rejects.toThrow(/ya tiene consentimiento/);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update consentimiento_item set procesamiento_externo = false
+        where item_id = ${itemId}`),
+    ).rejects.toThrow(/permission denied/);
+    await expect(
+      conUsuario(leadId, (tx) => tx`delete from consentimiento_item where item_id = ${itemId}`),
+    ).rejects.toThrow(/permission denied/);
+
+    // Y el registro deja rastro auditable de qué se autorizó (RF-09.13).
+    const [evento] = await sqlAdmin()`select actor_id, payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'ConsentimientoRegistrado'
+        and payload->>'itemId' = ${itemId}`;
+    expect(evento!.actor_id).toBe(disenadorId);
+    expect((evento!.payload as { procesamientoExterno: boolean }).procesamientoExterno).toBe(true);
+  });
+
+  it('el panel marca los items que esperan consentimiento en vez de esconderlos', async () => {
+    const itemId = await nuevoItem('Entrevista por marcar', 'entrevista');
+    const notaId = await nuevoItem('Nota que no espera nada');
+    const panel = await panelPropuestas(leadId, ws);
+    expect(panel.itemsPendientes.find((i) => i.id === itemId)?.consentimientoPendiente).toBe(true);
+    // Y no se derrama: un item que no es de personas se ofrece sin marca.
+    expect(panel.itemsPendientes.find((i) => i.id === notaId)?.consentimientoPendiente).toBe(false);
+  });
+
+  // ── RF-09.12: el presupuesto se aparta ANTES de llamar, y una sola propuesta por item ──
+
+  it('la reserva se consume al persistir y se libera si la generación no llega a nacer', async () => {
+    const itemId = await nuevoItem('Item con reserva');
+    await conProveedor({ ok: false, motivo: 'El proveedor AI no está disponible.' }, async () => {
+      await expect(
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+      ).rejects.toThrow(/no está disponible/);
+    });
+    // Una llamada fallida no consume presupuesto NI deja el hueco bloqueado.
+    const tras = await conUsuario(leadId, (tx) => tx`select 1 as x from reserva_ai
+      where workspace_id = ${ws}`);
+    expect(tras.length).toBe(0);
+
+    // Y una que sí nace consume su reserva en la misma transacción que escribe.
+    await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+    const despues = await conUsuario(leadId, (tx) => tx`select 1 as x from reserva_ai
+      where workspace_id = ${ws}`);
+    expect(despues.length).toBe(0);
+  });
+
+  it('las generaciones en curso ocupan presupuesto: N curadores a la vez no lo rebasan', async () => {
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item con el presupuesto lleno');
+    // Ocho generaciones de criterios EN CURSO (8 × 8 = 64 huecos apartados) agotan el
+    // tope de hoy aunque todavía no haya ninguna propuesta persistida: es exactamente el
+    // estado que el chequeo viejo no veía.
+    for (let i = 0; i < 8; i += 1) {
+      await admin`insert into reserva_ai (workspace_id, capacidad, unidades, creado_por)
+        values (${ws}, 'C0', 8, ${leadId})`;
+    }
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        ).rejects.toThrow(/presupuesto/i);
+      });
+      // El panel sigue contando lo REALMENTE gastado hoy, no las reservas en vuelo.
+      const panel = await panelPropuestas(leadId, ws);
+      expect(panel.ai.propuestasHoy).toBeLessThan(LIMITE_PROPUESTAS_DIA);
+    } finally {
+      await admin`delete from reserva_ai where workspace_id = ${ws}`;
+    }
+    // Liberadas las reservas, el mismo item vuelve a poder generarse.
+    const r = await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+    expect(r.generadas).toBe(1);
+  });
+
+  it('una reserva caducada no bloquea el item para siempre: se recoge y se sigue', async () => {
+    const itemId = await nuevoItem('Item con reserva zombi');
+    await sqlAdmin()`insert into reserva_ai
+      (workspace_id, capacidad, item_id, unidades, creado_por, creado_en)
+      values (${ws}, 'CI', ${itemId}, 1, ${leadId}, now() - interval '10 minutes')`;
+    const r = await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+    expect(r.generadas).toBe(1);
+    const quedan = await conUsuario(leadId, (tx) => tx`select 1 as x from reserva_ai
+      where workspace_id = ${ws}`);
+    expect(quedan.length).toBe(0);
+  });
+
+  it('dos curadores a la vez sobre el mismo item dejan UNA sola propuesta pendiente', async () => {
+    const itemId = await nuevoItem('Item disputado');
+    const resultados = await conProveedor(RESPUESTA_CI, () =>
+      Promise.allSettled([
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        generarPropuestas(disenadorId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+      ]),
+    );
+    expect(resultados.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const perdedora = resultados.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    expect(perdedora.reason).toBeInstanceOf(ErrorAI);
+
+    const pendientes = await conUsuario(leadId, (tx) => tx`select 1 as x from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId} and estado = 'propuesta'`);
+    expect(pendientes.length).toBe(1);
+
+    // El suelo es el índice único parcial: ni por SQL crudo caben dos pendientes.
+    await expect(
+      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+    ).rejects.toThrow(/duplicate key|unique/i);
+
+    // Decidida la primera, el hueco se libera: el índice solo cubre las pendientes.
+    const [p] = await conUsuario(leadId, (tx) => tx`select id from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId} and estado = 'propuesta'`);
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: p!.id as string });
+    await expect(
+      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+    ).resolves.toBeTruthy();
+  });
+
+  // ── El uso de la llamada llega hasta el lineage (RF-09.14) ──
+
+  it('el uso y el coste de la llamada se persisten y llegan al panel', async () => {
+    const itemId = await nuevoItem('Item con coste');
+    await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+    const [fila] = await conUsuario(leadId, (tx) => tx`
+      select tokens_entrada, tokens_salida, costo_usd, llamada_id, id from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(fila!.tokens_entrada).toBe(1200);
+    expect(fila!.tokens_salida).toBe(300);
+    expect(Number(fila!.costo_usd)).toBeCloseTo(
+      costoDeUso(MODELO_PRIMARIO, { entrada: 1200, salida: 300 })!,
+      6,
+    );
+    expect(fila!.llamada_id).not.toBeNull();
+
+    const panel = await panelPropuestas(leadId, ws);
+    const enPanel = panel.pendientes.find((p) => p.id === (fila!.id as string));
+    expect(enPanel!.costoUsd).toBeCloseTo(Number(fila!.costo_usd), 6);
+
+    // Y el lineage no tiene superficie de escritura: el coste de una llamada ya hecha
+    // no se reescribe desde la app.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update propuesta_ai set costo_usd = 0
+        where id = ${fila!.id as string}`),
+    ).rejects.toThrow(/permission denied/);
+
+    // Un lote de la MISMA llamada comparte llamada_id: el coste se suma por llamada, no
+    // multiplicado por el tamaño del lote.
+    await conProveedor(
+      {
+        ok: true,
+        modelo: MODELO_PRIMARIO,
+        latenciaMs: 10,
+        datos: { criterios: [CONTENIDO_C0, { ...CONTENIDO_C0, kpi: 'KPI del lote' }] },
+        uso: { entrada: 500, salida: 100, costoUsd: 0.005 },
+      },
+      () => generarPropuestas(leadId, { workspaceId: ws, capacidad: 'C0', anclaId: retoId }),
+    );
+    const lote = await conUsuario(leadId, (tx) => tx`select distinct llamada_id from propuesta_ai
+      where workspace_id = ${ws} and reto_id = ${retoId} and contenido->>'kpi' in
+        (${CONTENIDO_C0.kpi}, 'KPI del lote') and costo_usd = 0.005`);
+    expect(lote.length).toBe(1);
+  });
+
+  // ── El panel pagina pendientes y decididas por separado ──
+
+  it('una propuesta pendiente antigua no queda enterrada bajo las decisiones nuevas', async () => {
+    // En su propio workspace: lo que se prueba es el CORTE de las listas, y para eso hace
+    // falta pasarse de largo sin ensuciar las cuentas de los demás tests.
+    const admin = sqlAdmin();
+    const [w] = await admin`insert into workspace (nombre) values (${marca + '-pag'}) returning id`;
+    const wsP = w!.id as string;
+    const [u] = await admin`insert into usuario (email, nombre, estado)
+      values (${marca + '-pag@test.demo'}, 'Curadora', 'activo') returning id`;
+    const curadorId = u!.id as string;
+    await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${wsP}, ${curadorId}, 'Curadora', ${marca + '-pag@test.demo'}, 'lead-boutique')`;
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${wsP}, 'Servicio', ${curadorId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+      values (${wsP}, ${svc!.id as string}, 'R-01', 'Reto', 'candidato', 'peticion-cliente',
+              ${curadorId}) returning id`;
+    const retoP = r!.id as string;
+
+    /** Propuestas C0 en bloque, con `creado_en` explícito para poder ordenar la historia. */
+    async function sembrar(n: number, desdeMinutos: number): Promise<string[]> {
+      const filas = await admin`insert into propuesta_ai
+        (workspace_id, capacidad, destino, reto_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, creado_por, creado_en)
+        select ${wsP}, 'C0', 'criterio-exito', ${retoP}, ${admin.json(CONTENIDO_C0)},
+               ${admin.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+               ${curadorId}, now() - make_interval(mins => ${desdeMinutos} - g)
+        from generate_series(1, ${n}) as g
+        returning id`;
+      return filas.map((f) => f.id as string);
+    }
+
+    try {
+      // La más ANTIGUA de todas, pendiente, y 100 pendientes más nuevas por encima.
+      const [viejaId] = await sembrar(1, 5000);
+      await sembrar(100, 4000);
+      // Y 51 decisiones, todas más nuevas que la pendiente antigua.
+      const decididas = await sembrar(51, 1000);
+      await admin`update propuesta_ai set estado = 'rechazada', revisada_por = ${curadorId},
+          revisada_en = now()
+        where id in ${admin(decididas)}`;
+
+      const panel = await panelPropuestas(curadorId, wsP);
+      // Con un solo corte de 150 antes de partir por estado, las dos filas más antiguas
+      // —pendientes— se caían de la lista: invisibles y, por el `not exists` de la
+      // generación, sin ninguna otra forma de llegar a ellas.
+      expect(panel.pendientes.length).toBe(100);
+      expect(panel.pendientes.some((p) => p.id === viejaId)).toBe(true);
+      expect(panel.pendientes[0]!.id).toBe(viejaId);
+      expect(panel.hayMasPendientes).toBe(true);
+      // Las decididas tienen su propio corte y su propio aviso, sin robarle sitio a nadie.
+      expect(panel.decididas.length).toBe(50);
+      expect(panel.hayMasDecididas).toBe(true);
+      expect(panel.decididas.every((p) => p.estado !== 'propuesta')).toBe(true);
+    } finally {
+      await admin`delete from evento_dominio where workspace_id = ${wsP}`;
+      await admin`delete from propuesta_ai where workspace_id = ${wsP}`;
+      await admin`delete from reto where workspace_id = ${wsP}`;
+      await admin`delete from servicio where workspace_id = ${wsP}`;
+      await admin`delete from miembro where workspace_id = ${wsP}`;
+      await admin`delete from workspace where id = ${wsP}`;
+      await admin`delete from usuario where id = ${curadorId}`;
+    }
   });
 
   it('aislamiento: otro workspace no ve ni revisa las propuestas de este', async () => {

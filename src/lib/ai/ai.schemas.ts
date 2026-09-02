@@ -151,6 +151,28 @@ export type RevisarPropuesta = z.infer<typeof RevisarPropuestaSchema>;
 
 export const PropuestasInputSchema = z.object({ workspaceId: z.string().uuid() });
 
+/**
+ * RF-09.5: el consentimiento de las personas se captura ANTES de procesar su material,
+ * no se infiere de un texto ni se rellena al aceptar. `procesamientoExterno` es la mitad
+ * que la AI necesita: autorizar la grabación no es autorizar mandarla a un tercero.
+ */
+export const RegistrarConsentimientoSchema = z.object({
+  workspaceId: z.string().uuid(),
+  itemId: z.string().uuid(),
+  alcance: z
+    .string()
+    .trim()
+    .min(1, 'Describe qué autorizó la persona')
+    .max(1000),
+  procesamientoExterno: z.boolean(),
+});
+export type RegistrarConsentimiento = z.infer<typeof RegistrarConsentimientoSchema>;
+
+/** Tipos de fuente cuyo material es de PERSONAS y exige consentimiento registrado antes
+ * de cualquier procesamiento AI. Espejo de `tipo_fuente_exige_consentimiento()` en la
+ * base, que es quien lo impone; aquí sirve a la UI para explicarlo antes de intentarlo. */
+export const TIPOS_FUENTE_CON_PERSONAS = ['entrevista', 'observacion'] as const;
+
 // ── Proyección del panel de revisión ──
 
 export type CitaVerificada = {
@@ -183,11 +205,21 @@ export type PropuestaEnPanel = {
   origenKey: OrigenKey;
   alcanceResumen: string;
   latenciaMs: number | null;
+  /** Coste de la llamada que la produjo, en USD (RF-09.14). null si el modelo no tiene
+   * tarifa registrada o si la propuesta es anterior a que se midiera: preferimos «sin
+   * dato» a un número inventado. */
+  costoUsd: number | null;
   creadoEn: string;
   revisadaEn: string | null;
 };
 
-export type CandidatoAncla = { id: string; titulo: string };
+export type CandidatoAncla = {
+  id: string;
+  titulo: string;
+  /** Solo items: su material es de personas y aún no tiene consentimiento registrado
+   * para procesamiento externo, así que la generación está bloqueada (RF-09.5). */
+  consentimientoPendiente?: boolean;
+};
 
 export type PanelPropuestas = {
   workspaceId: string;
@@ -201,6 +233,11 @@ export type PanelPropuestas = {
   };
   pendientes: PropuestaEnPanel[];
   decididas: PropuestaEnPanel[];
+  /** Cada lista se corta por su cuenta y avisa de su recorte: con un solo corte antes de
+   * partir por estado, 150 decisiones nuevas escondían para siempre una propuesta
+   * pendiente antigua (y la generación tampoco volvía a ofrecer su item). */
+  hayMasPendientes: boolean;
+  hayMasDecididas: boolean;
   /** Anclas ofrecibles a la generación: items de bandeja pendientes y retos abiertos. */
   itemsPendientes: CandidatoAncla[];
   retosAbiertos: CandidatoAncla[];

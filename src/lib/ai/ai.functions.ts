@@ -4,6 +4,7 @@ import { requerirUsuarioId, usuarioIdDeRequest } from '@/lib/auth/guardia.server
 import {
   GenerarPropuestasSchema,
   PropuestasInputSchema,
+  RegistrarConsentimientoSchema,
   RevisarPropuestaSchema,
 } from './ai.schemas';
 import {
@@ -12,6 +13,7 @@ import {
   generarPropuestas,
   panelPropuestas,
   rechazarPropuesta,
+  registrarConsentimiento,
 } from './ai.servicio';
 
 /** Server functions del pipeline PropuestaAI. Mutaciones con contrato uniforme {ok, …};
@@ -68,6 +70,23 @@ export const aceptarPropuestaAI = createServerFn({ method: 'POST' })
     try {
       const r = await aceptarPropuesta(actorId, data);
       return { ok: true as const, estado: r.estado, objetoId: r.objetoId };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+/** RF-09.5: capturar el consentimiento es un paso PREVIO al procesamiento, con su propia
+ * mutación — no un campo que se rellena al aceptar lo que la AI ya produjo. */
+export const registrarConsentimientoAI = createServerFn({ method: 'POST' })
+  .inputValidator(RegistrarConsentimientoSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await registrarConsentimiento(actorId, data);
+      return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

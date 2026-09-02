@@ -1,0 +1,120 @@
+import type { OrigenKey } from './ai.schemas';
+
+/**
+ * Degradación segura (SPEC-09 RF-09.11, SYS-21, I4): la ausencia de AI —sin credencial,
+ * proveedor caído, lento o con el presupuesto agotado— APAGA la capacidad con un mensaje
+ * claro y no rompe nada más. Todo lo demás de la aplicación sigue funcionando y toda
+ * operación de negocio tiene su camino manual equivalente.
+ *
+ * Módulo PURO a propósito (sin imports de servidor ni del SDK): la propiedad más
+ * importante del slice —«no lanza nunca»— se prueba sin base de datos y sin proveedor.
+ * La clasificación de fallos mira la FORMA del error (status/name), no su clase, para no
+ * arrastrar el SDK hasta aquí.
+ */
+
+/** Política de modelos centralizada en CÓDIGO, no en env vars (diseño técnico): primario
+ * y fallback por superficie; la degradación de modelo ocurre una sola vez por operación. */
+export const MODELO_PRIMARIO = 'claude-opus-5';
+export const MODELO_FALLBACK = 'claude-sonnet-5';
+
+/** Presupuesto AI por workspace (RF-08.5): corte SUAVE — al agotarse se pausan las
+ * capacidades AI, jamás un flujo de negocio. Un valor inválido cae al default y nunca
+ * desactiva el tope. */
+export const LIMITE_PROPUESTAS_DIA = 60;
+
+/** El proveedor no puede colgar una pantalla: pasado este techo la llamada se aborta y
+ * la capacidad se reporta como no disponible en esta operación. */
+export const TIMEOUT_PROVEEDOR_MS = 25_000;
+
+export type EstadoCapacidadAI = {
+  disponible: boolean;
+  /** Vacío si está disponible; si no, el porqué en lenguaje de la UI (nunca un stack). */
+  motivo: string;
+  origenKey: OrigenKey | null;
+  modelo: string;
+  propuestasHoy: number;
+  limiteDiario: number;
+};
+
+const COLA_MANUAL = 'Todo el flujo sigue disponible a mano.';
+
+/**
+ * Estado de la capacidad AI para un workspace. Nunca lanza: en el peor de los casos
+ * devuelve «apagada» con su motivo, que es exactamente lo que la UI necesita pintar.
+ *
+ * BYOAI (diseño técnico · Proveedores y BYOAI): la key del workspace gana a la del
+ * entorno y el lineage registra cuál sirvió. Hoy el resolver de servidor solo entrega la
+ * del entorno —guardar la credencial de un cliente en una columna legible bajo RLS
+ * contradiría RF-09.6 (secretos en secret manager)—, pero la precedencia vive aquí para
+ * que enchufar el secret manager no toque ni esta lógica ni el esquema.
+ */
+export function evaluarCapacidadAI(entrada: {
+  keyWorkspace?: string | null;
+  keyEntorno?: string | null;
+  propuestasHoy?: number;
+  limiteDiario?: number;
+}): EstadoCapacidadAI {
+  const limite =
+    Number.isInteger(entrada.limiteDiario) && (entrada.limiteDiario as number) > 0
+      ? (entrada.limiteDiario as number)
+      : LIMITE_PROPUESTAS_DIA;
+  const usadas = Number.isFinite(entrada.propuestasHoy) ? Math.max(0, entrada.propuestasHoy!) : 0;
+
+  const delWorkspace = (entrada.keyWorkspace ?? '').trim();
+  const delEntorno = (entrada.keyEntorno ?? '').trim();
+  const origenKey: OrigenKey | null = delWorkspace ? 'workspace' : delEntorno ? 'entorno' : null;
+
+  const base = { modelo: MODELO_PRIMARIO, propuestasHoy: usadas, limiteDiario: limite };
+
+  if (!origenKey) {
+    return {
+      ...base,
+      disponible: false,
+      origenKey: null,
+      motivo: `Capacidad AI apagada: este despliegue no tiene credencial del proveedor configurada. ${COLA_MANUAL}`,
+    };
+  }
+  if (usadas >= limite) {
+    return {
+      ...base,
+      disponible: false,
+      origenKey,
+      motivo: `Presupuesto AI del workspace agotado por hoy (${usadas}/${limite} propuestas). Las capacidades AI quedan en pausa hasta mañana. ${COLA_MANUAL}`,
+    };
+  }
+  return { ...base, disponible: true, origenKey, motivo: '' };
+}
+
+/**
+ * Traduce un fallo del proveedor a un mensaje accionable. No lanza, no filtra cuerpos de
+ * respuesta ni credenciales, y siempre recuerda que el camino manual sigue abierto.
+ */
+export function motivoDeFalloProveedor(e: unknown): string {
+  const err = (e ?? {}) as { status?: unknown; name?: unknown; message?: unknown };
+  const nombre = typeof err.name === 'string' ? err.name : '';
+  const status = typeof err.status === 'number' ? err.status : null;
+
+  if (/abort|timeout/i.test(nombre) || (typeof err.message === 'string' && /timeout/i.test(err.message))) {
+    return `El proveedor AI no respondió a tiempo (${Math.round(TIMEOUT_PROVEEDOR_MS / 1000)} s). ${COLA_MANUAL}`;
+  }
+  if (status === 401 || status === 403) {
+    return `El proveedor AI rechazó la credencial configurada. ${COLA_MANUAL}`;
+  }
+  if (status === 429) {
+    return `El proveedor AI está limitando las llamadas ahora mismo. ${COLA_MANUAL}`;
+  }
+  if (status !== null && status >= 500) {
+    return `El proveedor AI no está disponible en este momento. ${COLA_MANUAL}`;
+  }
+  if (status !== null && status >= 400) {
+    return `El proveedor AI rechazó la petición (${status}). ${COLA_MANUAL}`;
+  }
+  if (/connection|network|fetch/i.test(nombre)) {
+    return `No se pudo alcanzar al proveedor AI. ${COLA_MANUAL}`;
+  }
+  return `No se pudo generar la propuesta con AI. ${COLA_MANUAL}`;
+}
+
+/** El proveedor devolvió algo que no cumple el esquema de la capacidad: se descarta
+ * entera (una propuesta a medias no es revisable) y se dice sin jerga. */
+export const MOTIVO_ESQUEMA = `La respuesta del proveedor AI no cumplió el formato esperado y se descartó. ${COLA_MANUAL}`;

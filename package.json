@@ -17,6 +17,7 @@
     "check:bundle": "bash scripts/check-client-bundle.sh"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.123.0",
     "@tanstack/react-query": "^5.83.0",
     "@tanstack/react-router": "^1.168.0",
     "@tanstack/react-start": "^1.167.0",

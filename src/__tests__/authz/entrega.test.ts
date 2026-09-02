@@ -18,6 +18,7 @@ import {
   tableroDeConciliacion,
 } from '@/lib/entrega/entrega.servicio';
 import { calcularDiff, conciliacionCompleta } from '@/lib/entrega/entrega.diff';
+import { abrirHilo, hilosDeObjetos } from '@/lib/portal/portal.servicio';
 import { describeAuthz } from './helpers';
 
 /**
@@ -192,6 +193,10 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
   afterAll(async () => {
     const admin = sqlAdmin();
+    // Los hilos del portal cuelgan de la design version desde SPEC-06: se van primero o
+    // la FK compuesta impide borrarla.
+    await admin`delete from comentario where workspace_id = ${ws}`;
+    await admin`delete from hilo_comentario where workspace_id = ${ws}`;
     await admin`delete from constatacion where workspace_id = ${ws}`;
     await admin`delete from effective_state where workspace_id = ${ws}`;
     await admin`delete from release_elemento where workspace_id = ${ws}`;
@@ -1079,6 +1084,90 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       where workspace_id = ${ws} and tipo = 'ReleaseDesplegado'
         and payload->>'releaseId' = ${rlCarrera}`;
     expect(eventos[0]!.n as number).toBe(1);
+  });
+
+  it('un release desplegado se constata aunque su design version quede superada', async () => {
+    // El caso que la pantalla apagaba entero: DV-2 aprueba mientras un release de DV-1 ya
+    // salió y nadie lo ha constatado. La base y el servicio lo permiten —y tienen que
+    // permitirlo—: ese release cambió el servicio de verdad, y su constatación es la
+    // única vía para que eso entre en el effective state contra el que se calcula el diff
+    // de las versiones siguientes (RF-06.10).
+    const sucesora = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: (
+        await sqlAdmin()`select servicio_id from design_version
+          where id = ${dvCarrera} and workspace_id = ${ws}`
+      )[0]!.servicio_id as string,
+      journeyId: (
+        await sqlAdmin()`select journey_id from design_version
+          where id = ${dvCarrera} and workspace_id = ${ws}`
+      )[0]!.journey_id as string,
+      titulo: 'La que supera a la de la carrera',
+      resumen: '',
+      superaA: dvCarrera,
+    });
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: sucesora.designVersionId,
+      tipo: 'canal',
+      operacion: 'agrega',
+      titulo: 'Cambio del ciclo siguiente',
+      detalle: '',
+      nodoId: null,
+      decisionIds: [],
+      insightIds: [],
+    });
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: sucesora.designVersionId,
+      motivo: '',
+    });
+    expect((await designVersionCompleta(leadId, ws, dvCarrera))!.estado).toBe('superada');
+
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlCarrera,
+      constatadoEn: HOY,
+      resumen: 'Salió antes de que el diseño se reemplazara',
+      constataciones: [
+        { elementoId: elCarreraA, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+      ],
+    });
+
+    const superada = await designVersionCompleta(leadId, ws, dvCarrera);
+    expect(superada!.releases.find((r) => r.id === rlCarrera)!.estado).toBe('verificado');
+    // Y lo constatado entra en el estado efectivo del SERVICIO: la sucesora lo ve como
+    // vigente, que es justo lo que se perdía si el release se quedaba sin constatar.
+    const siguiente = await designVersionCompleta(leadId, ws, sucesora.designVersionId);
+    expect(siguiente!.vigente!.constataciones.map((c) => c.elementoId)).toEqual([elCarreraA]);
+  });
+
+  it('la design version entra al arco del portal: el cliente comenta lo que se decidió cambiar', async () => {
+    const admin = sqlAdmin();
+    const abierto = await abrirHilo(stakeId, {
+      workspaceId: ws,
+      objeto: { tipo: 'design_version', id: dv1 },
+      cuerpo: '¿La verificación en video cubre a quien no tiene smartphone?',
+    });
+    const { hilos } = await hilosDeObjetos(leadId, ws, [{ tipo: 'design_version', id: dv1 }]);
+    expect(hilos.map((h) => h.id)).toEqual([abierto.hiloId]);
+    expect(hilos[0]!.objetoTipo).toBe('design_version');
+    // El rol CONGELADO del portal: el stakeholder comenta en el canal que es suyo.
+    expect(hilos[0]!.comentarios[0]!.autorRol).toBe('stakeholder');
+
+    // El arco sigue siendo EXCLUSIVO tras ampliarlo: un hilo no cuelga de dos objetos.
+    await expect(
+      admin`insert into hilo_comentario
+        (workspace_id, proyecto_id, design_version_id, abierto_por)
+        values (${ws}, ${proyectoId}, ${dv1}, ${leadId})`,
+    ).rejects.toThrow(/hilo_comentario_objeto_unico/);
+
+    // Y la columna generada nombra el objeto nuevo, así que la auditoría también.
+    const [ev] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'HiloAbierto'
+        and payload->>'hiloId' = ${abierto.hiloId}`;
+    expect((ev!.payload as { objetoTipo: string }).objetoTipo).toBe('design_version');
   });
 
   it('nada de esto cruza el workspace', async () => {

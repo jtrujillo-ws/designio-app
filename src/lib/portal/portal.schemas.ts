@@ -7,8 +7,16 @@ import { z } from 'zod';
 
 /** Objetos presentables que YA existen en el modelo y admiten hilo (RF-01.5). Los
  * nombres son los de las tablas padre porque el arco de FKs compuestas del hilo no
- * admite otros: design version y post mortem entran cuando lleguen con sus specs. */
-export const OBJETOS_CITABLES = ['reto', 'proyecto', 'gate_instancia', 'evidencia'] as const;
+ * admite otros. `design_version` entra con SPEC-06, que es cuando el objeto existe: es
+ * lo que se decidió cambiar, o sea exactamente aquello sobre lo que el cliente opina.
+ * El post mortem sigue esperando a SPEC-07. */
+export const OBJETOS_CITABLES = [
+  'reto',
+  'proyecto',
+  'gate_instancia',
+  'evidencia',
+  'design_version',
+] as const;
 export type ObjetoCitable = (typeof OBJETOS_CITABLES)[number];
 
 export const ETIQUETA_OBJETO: Record<ObjetoCitable, string> = {
@@ -16,6 +24,7 @@ export const ETIQUETA_OBJETO: Record<ObjetoCitable, string> = {
   proyecto: 'Proyecto',
   gate_instancia: 'Gate',
   evidencia: 'Evidencia',
+  design_version: 'Design version',
 };
 
 /** RF-01.6: quiénes consultan la auditoría — el admin del cliente (dueño de los datos)

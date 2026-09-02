@@ -1020,6 +1020,61 @@ begin
   return new;
 end $$;
 
+-- ══ El portal alcanza la design version (SPEC-01, RF-01.5) ══
+-- La migración del portal dejó el alta pendiente con nombre y apellidos: «design version
+-- y post mortem entran al arco cuando lleguen con sus specs». SPEC-06 la trae, y sin este
+-- bloque el objeto MÁS comentable de la cadena —lo que se decidió cambiar, que es
+-- exactamente sobre lo que el cliente opina— era el único que no admitía hilo.
+--
+-- Se hace aquí y no editando la migración del portal porque aquella ya está aplicada: las
+-- migraciones son forward-only. Y se hace DESPUÉS de crear design_version, que es lo que
+-- permite que la FK compuesta exista de verdad.
+
+-- El arco es EXCLUSIVO y el CHECK cuenta cuántas columnas van llenas, así que hay que
+-- reemplazarlo: con la columna nueva a null y las otras cuatro también, un hilo de design
+-- version daría num_nonnulls = 0 y la fila se rechazaría. Se localiza por su definición y
+-- no por un nombre adivinado — el CHECK del portal es anónimo, y su nombre generado es un
+-- detalle de implementación que nadie escribió.
+do $$
+declare v_check text;
+begin
+  select conname into strict v_check from pg_constraint
+  where conrelid = 'hilo_comentario'::regclass and contype = 'c'
+    and pg_get_constraintdef(oid) like '%num_nonnulls%';
+  execute format('alter table hilo_comentario drop constraint %I', v_check);
+end $$;
+
+alter table hilo_comentario add column design_version_id uuid;
+alter table hilo_comentario
+  add constraint hilo_comentario_objeto_unico
+    check (num_nonnulls(reto_id, proyecto_id, gate_id, evidencia_id, design_version_id) = 1),
+  add foreign key (design_version_id, workspace_id) references design_version (id, workspace_id);
+
+-- Las columnas generadas no admiten cambio de expresión en 16 (SET EXPRESSION llegó en
+-- 17), así que se rehacen. Recalcular no pierde nada: son proyección pura de las columnas
+-- del arco, y siguen sin poder escribirse — que es lo que impide falsear a qué objeto
+-- apunta un hilo. Al dropearlas se va con ellas el índice que las usa; vuelve idéntico.
+alter table hilo_comentario drop column objeto_tipo, drop column objeto_id;
+alter table hilo_comentario
+  add column objeto_tipo text generated always as (
+    case
+      when reto_id is not null then 'reto'
+      when proyecto_id is not null then 'proyecto'
+      when gate_id is not null then 'gate_instancia'
+      when evidencia_id is not null then 'evidencia'
+      when design_version_id is not null then 'design_version'
+    end
+  ) stored,
+  add column objeto_id uuid generated always as (
+    coalesce(reto_id, proyecto_id, gate_id, evidencia_id, design_version_id)
+  ) stored;
+create index hilo_objeto_idx on hilo_comentario (workspace_id, objeto_tipo, objeto_id, creado_en, id);
+
+-- Sin políticas ni grants nuevos a propósito: las del portal no miran QUÉ objeto cuelga
+-- del hilo —quién puede abrirlo y comentarlo es cuestión de rol, no de objeto— y el grant
+-- de INSERT es de tabla, así que la columna nueva entra sin ampliar ningún permiso. La
+-- design version no añade una regla de portal distinta: añade un objeto al arco.
+
 -- ══ Grants mínimos (UPDATE por columnas) ══
 grant select, insert on design_version, elemento_cambio to designio_app;
 grant select, insert on elemento_decision, elemento_insight to designio_app;

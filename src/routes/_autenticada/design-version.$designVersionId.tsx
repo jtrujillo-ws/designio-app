@@ -9,7 +9,10 @@ import { Tabs } from '@/components/ui/Tabs';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
+import { PanelDeHilos } from '@/components/portal/PanelDeHilos';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { hilosDelPortal } from '@/lib/portal/portal.functions';
+import type { HiloDeObjeto } from '@/lib/portal/portal.schemas';
 import { calcularDiff, elementosEnEstadoDesconocido } from '@/lib/entrega/entrega.diff';
 import {
   agregarElementoDeCambio,
@@ -51,14 +54,29 @@ export const Route = createFileRoute('/_autenticada/design-version/$designVersio
   loader: async ({ context, params }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
     if (!workspaceId || !ES_UUID.test(params.designVersionId)) return null;
-    const [dv, tablero] = await Promise.all([
+    const [dv, tablero, portal] = await Promise.all([
       designVersionDelWorkspace({ data: { workspaceId, designVersionId: params.designVersionId } }),
       conciliacionDeDesignVersion({
         data: { workspaceId, designVersionId: params.designVersionId },
       }),
+      // El portal (RF-01.5) sobre la design version: es el objeto que el cliente discute
+      // —qué se decidió cambiar—, y hasta ahora era el único de la cadena sin hilos. Va
+      // en paralelo porque su id ya se conoce: no hace falta esperar a la proyección.
+      hilosDelPortal({
+        data: {
+          workspaceId,
+          objetos: [{ tipo: 'design_version', id: params.designVersionId }],
+        },
+      }),
     ]);
     if (!dv) return null;
-    return { workspaceId, dv, tablero };
+    return {
+      workspaceId,
+      dv,
+      tablero,
+      hilos: portal?.hilos ?? [],
+      hayMasHilos: portal?.hayMas ?? false,
+    };
   },
   component: PantallaDesignVersion,
 });
@@ -152,7 +170,14 @@ function PantallaDesignVersion() {
           gap: 16,
         }}
       >
-        <Cabecera dv={dv} />
+        <Cabecera
+          dv={dv}
+          workspaceId={datos.workspaceId}
+          hilos={datos.hilos}
+          hayMasHilos={datos.hayMasHilos}
+          rol={rol}
+          onCambio={refrescar}
+        />
 
         {error && (
           <span role="alert" style={{ font: '500 13px var(--font-sans)', color: 'var(--danger)' }}>
@@ -196,7 +221,11 @@ function PantallaDesignVersion() {
           <VistaReleases
             workspaceId={datos.workspaceId}
             dv={dv}
-            puedeOperar={esLead && dv.estado === 'aprobada'}
+            // Planificar trabajo nuevo se apaga al superarse la versión: el diseño que lo
+            // justificaba ya fue reemplazado. Completar lo que YA está en marcha, no —
+            // ver el comentario de VistaReleases.
+            puedePlanificar={esLead && dv.estado === 'aprobada'}
+            puedeCompletar={esLead && dv.estado !== 'borrador'}
             onError={setError}
             onHecho={refrescar}
           />
@@ -215,7 +244,21 @@ function PantallaDesignVersion() {
   );
 }
 
-function Cabecera({ dv }: { dv: DesignVersionCompleta }) {
+function Cabecera({
+  dv,
+  workspaceId,
+  hilos,
+  hayMasHilos,
+  rol,
+  onCambio,
+}: {
+  dv: DesignVersionCompleta;
+  workspaceId: string;
+  hilos: HiloDeObjeto[];
+  hayMasHilos: boolean;
+  rol: string;
+  onCambio: () => Promise<void>;
+}) {
   return (
     <Card style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
@@ -252,6 +295,23 @@ function Cabecera({ dv }: { dv: DesignVersionCompleta }) {
         <span style={apunte}>
           Inmutable (SYS-05): cambiar algo aquí exige crear una design version nueva que
           supere a esta.
+        </span>
+      )}
+      {/* El portal es el canal del cliente (RF-01.5) y la design version es lo que discute:
+          qué se decidió cambiar. Los hilos NO se congelan con la aprobación —la
+          conversación sobre lo aprobado sigue siendo legítima, igual que en un gate ya
+          aprobado—, así que el panel se dibuja en cualquier estado. */}
+      <PanelDeHilos
+        workspaceId={workspaceId}
+        objeto={{ tipo: 'design_version', id: dv.id }}
+        hilos={hilos}
+        rol={rol}
+        onCambio={onCambio}
+      />
+      {hayMasHilos && (
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+          Esta vista muestra los hilos más recientes de la design version; hay más en el
+          portal.
         </span>
       )}
     </Card>
@@ -681,16 +741,33 @@ function VistaDiff({
 
 // ── Plan de releases, despliegue y constatación (RF-06.4/06.5/06.6) ──
 
+/**
+ * Dos permisos y no uno, porque son dos cosas distintas (RF-06.4/06.5/06.6):
+ *
+ *  · `puedePlanificar` — abrir un release nuevo y mover su alcance. Se apaga cuando la
+ *    design version queda SUPERADA: planificar trabajo bajo un diseño que ya fue
+ *    reemplazado es empezar algo que la versión vigente no respalda.
+ *  · `puedeCompletar` — desplegar lo ya planificado y constatar lo desplegado. NO se
+ *    apaga al superarse. Un release de DV-1 que ya salió cambió el servicio de verdad, y
+ *    su constatación es la única forma de que eso entre en el effective state: el estado
+ *    vigente de un servicio se arma con las constataciones de TODOS sus releases
+ *    verificados, sea cual sea la design version de la que colgaban (RF-06.10). Apagar
+ *    la sección entera al superarse dejaba ese release desplegado sin camino en la UI
+ *    —la base y el servicio sí lo permiten— y el diff de cada versión futura quedaba
+ *    ciego a lo que ese release cambió.
+ */
 function VistaReleases({
   workspaceId,
   dv,
-  puedeOperar,
+  puedePlanificar,
+  puedeCompletar,
   onError,
   onHecho,
 }: {
   workspaceId: string;
   dv: DesignVersionCompleta;
-  puedeOperar: boolean;
+  puedePlanificar: boolean;
+  puedeCompletar: boolean;
   onError: (e: string | null) => void;
   onHecho: () => Promise<void>;
 }) {
@@ -710,14 +787,25 @@ function VistaReleases({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {puedeOperar && !abierto && (
+      {dv.estado === 'superada' && (
+        <Card style={{ padding: 16 }}>
+          <span style={apunte}>
+            Esta design version fue superada: no se planifican releases nuevos bajo ella.
+            Lo que ya está planificado o desplegado sí se cierra desde aquí — un release
+            que salió cambió el servicio, y su constatación es lo que mete ese cambio en
+            el estado efectivo contra el que se calcula el diff de las versiones
+            siguientes (RF-06.10).
+          </span>
+        </Card>
+      )}
+      {puedePlanificar && !abierto && (
         <div>
           <Button size="sm" onClick={() => setAbierto(true)}>
             Planificar release
           </Button>
         </div>
       )}
-      {puedeOperar && abierto && (
+      {puedePlanificar && abierto && (
         <FormularioRelease
           workspaceId={workspaceId}
           dv={dv}
@@ -741,7 +829,7 @@ function VistaReleases({
         {pendientes.map((el) => (
           <div key={el.id} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
             <span style={cuerpo}>{el.titulo}</span>
-            {puedeOperar && dv.releases.some((r) => r.estado === 'planificado') && (
+            {puedePlanificar && dv.releases.some((r) => r.estado === 'planificado') && (
               <AsignarAExistente
                 workspaceId={workspaceId}
                 elementoId={el.id}
@@ -760,7 +848,8 @@ function VistaReleases({
           workspaceId={workspaceId}
           dv={dv}
           release={r}
-          puedeOperar={puedeOperar}
+          puedePlanificar={puedePlanificar}
+          puedeCompletar={puedeCompletar}
           onError={onError}
           onHecho={onHecho}
         />
@@ -823,14 +912,16 @@ function TarjetaRelease({
   workspaceId,
   dv,
   release,
-  puedeOperar,
+  puedePlanificar,
+  puedeCompletar,
   onError,
   onHecho,
 }: {
   workspaceId: string;
   dv: DesignVersionCompleta;
   release: ReleaseDeDesignVersion;
-  puedeOperar: boolean;
+  puedePlanificar: boolean;
+  puedeCompletar: boolean;
   onError: (e: string | null) => void;
   onHecho: () => Promise<void>;
 }) {
@@ -858,7 +949,7 @@ function TarjetaRelease({
           <div key={e.elementoId} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <span style={cuerpo}>{titulos.get(e.elementoId) ?? e.elementoId}</span>
             {e.razon !== '' && <span style={apunte}>— {e.razon}</span>}
-            {puedeOperar && release.estado === 'planificado' && (
+            {puedePlanificar && release.estado === 'planificado' && (
               <Button
                 size="sm"
                 variant="ghost"
@@ -901,7 +992,7 @@ function TarjetaRelease({
         </div>
       )}
 
-      {puedeOperar && release.estado === 'planificado' && (
+      {puedeCompletar && release.estado === 'planificado' && (
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <Input
             type="date"
@@ -931,14 +1022,14 @@ function TarjetaRelease({
 
       <CadenaDelRelease workspaceId={workspaceId} releaseId={release.id} codigo={release.codigo} />
 
-      {puedeOperar && release.estado === 'desplegado' && !constatando && (
+      {puedeCompletar && release.estado === 'desplegado' && !constatando && (
         <div>
           <Button size="sm" onClick={() => setConstatando(true)}>
             Constatar effective state
           </Button>
         </div>
       )}
-      {puedeOperar && release.estado === 'desplegado' && constatando && (
+      {puedeCompletar && release.estado === 'desplegado' && constatando && (
         <FormularioConstatacion
           workspaceId={workspaceId}
           release={release}

@@ -68,31 +68,6 @@ function PantallaInsights() {
   const [titulo, setTitulo] = useState('');
   const [resumen, setResumen] = useState('');
   const [ocupado, setOcupado] = useState(false);
-  // Páginas cargadas DESPUÉS de la del loader. Se guardan aquí y no en la URL porque
-  // son acumulativas: volver atrás no debería reconstruir seis páginas.
-  const [masPaginas, setMasPaginas] = useState<InsightCompleto[]>([]);
-  const [cursor, setCursor] = useState<{ creadoEn: string; id: string } | null>(null);
-  const [cargando, setCargando] = useState(false);
-  const cursorVivo = cursor ?? datos?.siguiente ?? null;
-  const listados = [...(datos?.insights ?? []), ...masPaginas];
-
-  async function cargarMas() {
-    if (!datos || !cursorVivo) return;
-    setCargando(true);
-    setError(null);
-    try {
-      const r = await insightsDelEspacio({
-        data: { workspaceId: datos.workspaceId, cursor: cursorVivo },
-      });
-      setMasPaginas((previas) => [...previas, ...r.insights]);
-      setCursor(r.siguiente);
-    } catch {
-      setError('No se pudieron cargar más insights; intenta de nuevo');
-    } finally {
-      setCargando(false);
-    }
-  }
-
   const rol = membresiaActiva?.rol ?? '';
   const puedeCurar = (ROLES_CURADORES as readonly string[]).includes(rol);
 
@@ -202,36 +177,104 @@ function PantallaInsights() {
               )}
             </Card>
 
-            {listados.length === 0 && (
-              <Card style={{ padding: 24 }}>
-                <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
-                  Todavía no hay insights. La investigación de la etapa 1 aterriza aquí.
-                </span>
-              </Card>
-            )}
-            {listados.map((insight) => (
-              <FichaInsight
-                key={insight.id}
-                workspaceId={datos.workspaceId}
-                insight={insight}
-                evidencias={datos.evidencias}
-                hayMasEvidencias={datos.hayMasEvidencias}
-                puedeCurar={puedeCurar}
-                onCambio={() => router.invalidate()}
-                onError={setError}
-              />
-            ))}
-            {cursorVivo && (
-              <div>
-                <Button size="sm" variant="secondary" disabled={cargando} onClick={() => void cargarMas()}>
-                  {cargando ? 'Cargando…' : 'Cargar más insights'}
-                </Button>
-              </div>
-            )}
+            {/* La `key` es el BORDE de la primera página del loader. Proponer un insight
+                invalida la ruta y el loader devuelve otra primera página: el insight que
+                estaba al final se desplaza a la segunda, y el cursor acumulado —que apunta
+                más allá de él— lo saltaría para siempre; un `null` terminal, además, se
+                quedaría terminal aunque llegaran páginas nuevas.
+
+                Al cambiar la key, React desmonta y vuelve a montar: la acumulación se
+                reinicia con el cursor nuevo sin efecto que la sincronice (un efecto llega
+                tarde y deja pintar una vez la lista incoherente) y sin ajustar estado
+                durante el render (correcto, pero sutil de leer y de mantener). */}
+            <ListaDeInsights
+              key={`${datos.siguiente?.creadoEn ?? ''}|${datos.siguiente?.id ?? ''}`}
+              datos={datos}
+              puedeCurar={puedeCurar}
+              onCambio={() => router.invalidate()}
+              onError={setError}
+            />
           </>
         )}
       </main>
     </div>
+  );
+}
+
+/**
+ * La lista paginada. Vive aparte del formulario de alta porque su estado —las páginas
+ * acumuladas y el cursor— pertenece a UNA primera página concreta: cuando el loader trae
+ * otra, lo correcto es empezar de cero, y eso se expresa remontando con una `key`.
+ *
+ * El cursor se inicializa CON el del loader y no cae a él por defecto: si el fallback
+ * fuera `cursor ?? datos.siguiente`, al agotar las páginas `setCursor(null)` volvería al
+ * cursor original y el botón pediría la segunda página para siempre, duplicando insights
+ * y claves de React. Un null terminal tiene que seguir siendo terminal.
+ */
+function ListaDeInsights({
+  datos,
+  puedeCurar,
+  onCambio,
+  onError,
+}: {
+  datos: NonNullable<ReturnType<typeof Route.useLoaderData>>;
+  puedeCurar: boolean;
+  onCambio: () => Promise<void>;
+  onError: (e: string | null) => void;
+}) {
+  // Páginas cargadas DESPUÉS de la del loader. Se guardan aquí y no en la URL porque son
+  // acumulativas: volver atrás no debería reconstruir seis páginas.
+  const [masPaginas, setMasPaginas] = useState<InsightCompleto[]>([]);
+  const [cursor, setCursor] = useState<{ creadoEn: string; id: string } | null>(
+    datos.siguiente ?? null,
+  );
+  const [cargando, setCargando] = useState(false);
+  const listados = [...datos.insights, ...masPaginas];
+
+  async function cargarMas() {
+    if (!cursor) return;
+    setCargando(true);
+    onError(null);
+    try {
+      const r = await insightsDelEspacio({ data: { workspaceId: datos.workspaceId, cursor } });
+      setMasPaginas((previas) => [...previas, ...r.insights]);
+      setCursor(r.siguiente);
+    } catch {
+      onError('No se pudieron cargar más insights; intenta de nuevo');
+    } finally {
+      setCargando(false);
+    }
+  }
+
+  return (
+    <>
+      {listados.length === 0 && (
+        <Card style={{ padding: 24 }}>
+          <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+            Todavía no hay insights. La investigación de la etapa 1 aterriza aquí.
+          </span>
+        </Card>
+      )}
+      {listados.map((insight) => (
+        <FichaInsight
+          key={insight.id}
+          workspaceId={datos.workspaceId}
+          insight={insight}
+          evidencias={datos.evidencias}
+          hayMasEvidencias={datos.hayMasEvidencias}
+          puedeCurar={puedeCurar}
+          onCambio={onCambio}
+          onError={onError}
+        />
+      ))}
+      {cursor && (
+        <div>
+          <Button size="sm" variant="secondary" disabled={cargando} onClick={() => void cargarMas()}>
+            {cargando ? 'Cargando…' : 'Cargar más insights'}
+          </Button>
+        </div>
+      )}
+    </>
   );
 }
 

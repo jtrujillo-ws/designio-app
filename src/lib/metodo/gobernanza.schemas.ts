@@ -82,11 +82,16 @@ export type DecisionDeProyecto = {
   insights: { id: string; titulo: string }[];
 };
 
+/** Los tres estados de gobernanza de un arquetipo (SPEC-04.11). Vive aquí y se importa
+ * desde donde haga falta: el journey referencia arquetipos y necesita hablar del mismo
+ * vocabulario, no de una copia que pueda quedarse atrás. */
+export type EstadoArquetipo = 'hipotesis' | 'confirmado' | 'refutado';
+
 export type ArquetipoDeReto = {
   id: string;
   nombre: string;
   definicion: string;
-  estado: 'hipotesis' | 'confirmado' | 'refutado';
+  estado: EstadoArquetipo;
   veredictoRazon: string;
   segmentos: { id: string; nombre: string }[];
   evidencias: { id: string; titulo: string }[];

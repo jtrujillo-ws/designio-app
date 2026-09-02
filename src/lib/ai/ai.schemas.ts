@@ -239,7 +239,9 @@ export type PanelPropuestas = {
     disponible: boolean;
     motivo: string;
     modelo: string;
-    propuestasHoy: number;
+    /** Llamadas al proveedor atendidas hoy: lo que se ha pagado, que es lo que el tope
+     * acota (y lo que suma el reporte de costos). */
+    llamadasHoy: number;
     limiteDiario: number;
   };
   pendientes: PropuestaEnPanel[];

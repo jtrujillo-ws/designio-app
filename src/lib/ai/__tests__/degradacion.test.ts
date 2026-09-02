@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   costoDeUso,
   evaluarCapacidadAI,
-  LIMITE_PROPUESTAS_DIA,
+  LIMITE_LLAMADAS_DIA,
   MODELO_FALLBACK,
   MODELO_PRIMARIO,
   motivoDeFalloProveedor,
@@ -58,7 +58,7 @@ describe('estado de la capacidad AI (SYS-21)', () => {
   it('presupuesto agotado pausa la capacidad (corte suave, RF-08.5) sin tocar nada más', () => {
     const estado = evaluarCapacidadAI({
       keyEntorno: 'sk-test',
-      propuestasHoy: LIMITE_PROPUESTAS_DIA,
+      llamadasHoy: LIMITE_LLAMADAS_DIA,
     });
     expect(estado.disponible).toBe(false);
     expect(estado.motivo).toMatch(/presupuesto/i);
@@ -71,17 +71,17 @@ describe('estado de la capacidad AI (SYS-21)', () => {
     const estado = evaluarCapacidadAI({
       keyEntorno: 'sk-test',
       limiteDiario: 0,
-      propuestasHoy: LIMITE_PROPUESTAS_DIA,
+      llamadasHoy: LIMITE_LLAMADAS_DIA,
     });
-    expect(estado.limiteDiario).toBe(LIMITE_PROPUESTAS_DIA);
+    expect(estado.limiteDiario).toBe(LIMITE_LLAMADAS_DIA);
     expect(estado.disponible).toBe(false);
   });
 
   it('una generación que no CABE en lo que queda se rechaza antes de llamar al proveedor', () => {
-    // Quedan 3 huecos: una extracción (1 propuesta) entra; un lote de criterios (hasta 4)
-    // no. Sin esto, «queda sitio» y «cabe esta generación» eran la misma pregunta, y la
-    // respuesta valía para cualquier tamaño de lote.
-    const base = { keyEntorno: 'sk-test', propuestasHoy: LIMITE_PROPUESTAS_DIA - 3 };
+    // Quedan 3 llamadas: una generación que puede gastar 1 o 3 entra; una que puede gastar
+    // 4 no. Sin esto, «queda sitio» y «cabe esta generación» eran la misma pregunta, y la
+    // respuesta valía para cualquier gasto.
+    const base = { keyEntorno: 'sk-test', llamadasHoy: LIMITE_LLAMADAS_DIA - 3 };
     expect(evaluarCapacidadAI({ ...base, unidades: 1 }).disponible).toBe(true);
     expect(evaluarCapacidadAI({ ...base, unidades: 3 }).disponible).toBe(true);
     const lote = evaluarCapacidadAI({ ...base, unidades: 4 });

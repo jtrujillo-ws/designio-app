@@ -253,7 +253,7 @@ function Aviso({ children }: { children: ReactNode }) {
 function BanderaAI({
   ai,
 }: {
-  ai: { disponible: boolean; motivo: string; modelo: string; propuestasHoy: number; limiteDiario: number };
+  ai: { disponible: boolean; motivo: string; modelo: string; llamadasHoy: number; limiteDiario: number };
 }) {
   return (
     <Card
@@ -271,7 +271,7 @@ function BanderaAI({
         </span>
         <Tag>{ai.modelo}</Tag>
         <span style={{ font: '500 11.5px var(--font-mono)', color: 'var(--text-muted)' }}>
-          {ai.propuestasHoy}/{ai.limiteDiario} propuestas hoy
+          {ai.llamadasHoy}/{ai.limiteDiario} llamadas al proveedor hoy
         </span>
       </div>
       <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>

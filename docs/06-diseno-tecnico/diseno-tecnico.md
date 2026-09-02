@@ -300,7 +300,7 @@ Los **prompts y esquemas son artefactos versionados** en el repo, referenciados 
 
 ### Cuotas, evaluaciones y degradación
 
-- **Presupuestos independientes y fail-safe por workspace** (patrón heredado): cuota diaria de llamadas AI con **reserva contra contador antes de llamar** al proveedor (429 al agotar), techo de tokens por operación y truncado de contexto con reserva de completion. Un valor inválido cae al default, nunca desactiva el tope (RF-08.5).
+- **Presupuestos independientes y fail-safe por workspace** (patrón heredado): cuota diaria de llamadas AI con **reserva contra contador antes de llamar** al proveedor (429 al agotar), techo de tokens por operación y truncado de contexto con reserva de completion. Un valor inválido cae al default, nunca desactiva el tope (RF-08.5). La unidad del tope es la **llamada atendida** —lo que se paga—, contada sobre `llamada_ai`, la misma magnitud que suma el reporte de costos: una negativa del proveedor o una salida fuera de contrato gastan aunque no produzcan propuesta. Un intento sin respuesta no cuenta (no se sabe si se facturó, y una caída del proveedor no debe agotar el día del workspace). La reserva es solo el hueco de las generaciones en vuelo y el token de exclusión por ancla; retirarla no devuelve presupuesto.
 - Evals de grounding en CI + corrida programada (dataset propio creciente): fidelidad de citas, afirmaciones no soportadas, formato válido, comparadas contra línea base (regresión, RF-09.10).
 - Degradación: fallo del proveedor o cuota agotada ⇒ bandera "AI no disponible" y paridad manual de todo flujo (SYS-21); los jobs AI no urgentes reintentan.
 

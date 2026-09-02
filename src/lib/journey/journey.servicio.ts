@@ -178,24 +178,36 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
         select journey_id, tipo, orden from journey_nodo
         where id = ${entrada.nodoId} and workspace_id = ${entrada.workspaceId}`;
       if (!ubicacion) throw new ErrorJourney('El nodo no existe o no puedes editarlo');
-      if ((ubicacion.orden as number) !== entrada.orden) {
+      const ordenViejo = ubicacion.orden as number;
+      if (ordenViejo !== entrada.orden) {
         await tx`select pg_advisory_xact_lock(hashtextextended('designio:journey-orden:'
           || ${ubicacion.journey_id as string} || ':' || ${ubicacion.tipo as string}, 42))`;
-        // Solo si de verdad hay colisión: sin esto, cualquier edición renumeraría el grupo
-        // entero y llenaría la auditoría de movimientos que nadie pidió.
-        await tx`
-          update journey_nodo otros
-          set orden = otros.orden + 1
-          where otros.journey_id = ${ubicacion.journey_id as string}
-            and otros.workspace_id = ${entrada.workspaceId}
-            and otros.tipo = ${ubicacion.tipo as string}
-            and otros.id <> ${entrada.nodoId}
-            and otros.orden >= ${entrada.orden}
-            and exists (
-              select 1 from journey_nodo x
-              where x.journey_id = otros.journey_id and x.workspace_id = otros.workspace_id
-                and x.tipo = otros.tipo and x.id <> ${entrada.nodoId}
-                and x.orden = ${entrada.orden})`;
+        // Desplazamiento ACOTADO al tramo entre la posición vieja y la nueva, y en el
+        // sentido del movimiento. Correr a todos los que están «de la posición pedida en
+        // adelante» solo vale para subir: al bajar deja abierto el hueco que el nodo
+        // libera, y entonces el movimiento se queda corto — mover A#0 a #2 sobre
+        // `A#0 B#1 C#2` daría `B#1 A#2 C#3`, o sea A entre B y C en vez de detrás de C.
+        //
+        // Los que cambian son exactamente los que el movimiento atropella, ni uno más:
+        // solo esos se movieron de verdad, así que su `JourneyNodoEditado` es información
+        // y no ruido.
+        if (entrada.orden > ordenViejo) {
+          await tx`
+            update journey_nodo otros set orden = otros.orden - 1
+            where otros.journey_id = ${ubicacion.journey_id as string}
+              and otros.workspace_id = ${entrada.workspaceId}
+              and otros.tipo = ${ubicacion.tipo as string}
+              and otros.id <> ${entrada.nodoId}
+              and otros.orden > ${ordenViejo} and otros.orden <= ${entrada.orden}`;
+        } else {
+          await tx`
+            update journey_nodo otros set orden = otros.orden + 1
+            where otros.journey_id = ${ubicacion.journey_id as string}
+              and otros.workspace_id = ${entrada.workspaceId}
+              and otros.tipo = ${ubicacion.tipo as string}
+              and otros.id <> ${entrada.nodoId}
+              and otros.orden >= ${entrada.orden} and otros.orden < ${ordenViejo}`;
+        }
       }
       filas = await tx`
         update journey_nodo

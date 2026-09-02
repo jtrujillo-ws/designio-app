@@ -368,16 +368,27 @@ language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   arq_nombre text;
   arq_estado text;
+  cat_nombre text;
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
-  if new.catalogo_id is not null and not exists (
-    select 1 from catalogo_journey c
+  if new.catalogo_id is not null then
+    select c.nombre into cat_nombre
+    from catalogo_journey c
     join journey j on j.id = new.journey_id and j.workspace_id = new.workspace_id
     where c.id = new.catalogo_id and c.workspace_id = new.workspace_id
-      and c.servicio_id = j.servicio_id and c.tipo = new.tipo) then
-    raise exception 'la entrada de catálogo es de otro servicio o de otro tipo';
+      and c.servicio_id = j.servicio_id and c.tipo = new.tipo;
+    if cat_nombre is null then
+      raise exception 'la entrada de catálogo es de otro servicio o de otro tipo';
+    end if;
+    -- La etiqueta la pone el CATÁLOGO, igual que el arquetipo pone la suya. Sin esto, un
+    -- update directo puede dejar el nodo mostrando y congelando un nombre mientras las
+    -- consultas por catálogo lo identifican por otro — que es precisamente la identidad
+    -- partida que el catálogo viene a eliminar. Renombrar sigue siendo renombrar la
+    -- entrada: el servicio actualiza el catálogo primero, así que para cuando el nodo
+    -- pasa por aquí, `cat_nombre` ya es el nombre nuevo.
+    new.etiqueta := cat_nombre;
   end if;
   if new.arquetipo_id is not null then
     select a.nombre, a.estado into arq_nombre, arq_estado
@@ -518,6 +529,7 @@ begin
     jid := (fila->>'journey_id')::uuid;
     cuerpo := jsonb_build_object(
       'nodoId', fila->'id', 'tipo', fila->'tipo', 'etiqueta', fila->'etiqueta',
+      'detalle', fila->'detalle', 'responsable', fila->'responsable',
       'faseId', fila->'fase_id', 'orden', fila->'orden');
     if previa is not null then
       cuerpo := cuerpo || jsonb_build_object('antes', jsonb_build_object(

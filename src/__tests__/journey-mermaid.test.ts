@@ -506,6 +506,32 @@ describe('carrilesDeJourney', () => {
     expect(porNombre['Frontstage']).toEqual([]);
   });
 
+  it('la oportunidad llega al carril a través de la fricción que resuelve', () => {
+    // `oportunidad -dependencia-> friccion -duele-> paso` es lo que la tabla de extremos
+    // ofrece como modelo natural, y el vecino directo del paso es la fricción: sin cruzar
+    // por ella, la oportunidad no aparecía en ningún carril.
+    const paso = nodo({ tipo: 'paso', etiqueta: 'Sube el documento', orden: 0 });
+    const dolor = nodo({ tipo: 'friccion', etiqueta: 'Rechaza el formato', orden: 0 });
+    const idea = nodo({ tipo: 'oportunidad', etiqueta: 'Aceptar foto del móvil', orden: 0 });
+    // Un sistema colgado de la misma fricción NO debe cruzar: por una fricción solo pasa
+    // la oportunidad que la resuelve.
+    const sistema = nodo({ tipo: 'sistema', etiqueta: 'Validador de formato', orden: 0, responsable: 'TI' });
+
+    const blueprint = carrilesDeJourney(
+      journey(
+        [paso, dolor, idea, sistema],
+        [arista(dolor, paso, 'duele'), arista(idea, dolor, 'dependencia'), arista(sistema, dolor, 'dependencia')],
+      ),
+    );
+
+    const porNombre = Object.fromEntries(blueprint.carriles.map((c) => [c.nombre, c.porPaso[paso.id]!]));
+    expect(porNombre['Fricción y emoción']!.map((n) => n.etiqueta).sort()).toEqual([
+      'Aceptar foto del móvil',
+      'Rechaza el formato',
+    ]);
+    expect(porNombre['Sistemas']).toEqual([]);
+  });
+
   it('el segundo salto no arrastra la columna vecina', () => {
     // Dos pasos encadenados por una acción compartida: sin el tope en pasos y fases, el
     // canal del segundo paso aparecería también en la columna del primero y el blueprint

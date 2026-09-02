@@ -239,19 +239,44 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       orden: 0,
     });
 
-    const despues = await journeyCompleto(leadId, ws, journeyId);
-    const pasos = despues!.nodos.filter((n) => n.tipo === 'paso');
-    // Ni un empate: los órdenes son todos distintos…
-    const ordenes = pasos.map((p) => p.orden);
-    expect(new Set(ordenes).size).toBe(ordenes.length);
-    // …y el movido está de verdad primero, que es lo que el curador pidió.
-    const porOrden = [...pasos].sort((a, b) => a.orden - b.orden);
-    expect(porOrden[0]!.id).toBe(tercero.nodoId);
-    expect(porOrden.map((p) => p.etiqueta)).toEqual([
-      'Firma el contrato',
-      'Abre la app',
-      'Sube el documento',
-    ]);
+    const secuencia = async () => {
+      const j = await journeyCompleto(leadId, ws, journeyId);
+      const ps = j!.nodos.filter((n) => n.tipo === 'paso');
+      // Ni un empate en ninguna de las comprobaciones.
+      const ordenes = ps.map((p) => p.orden);
+      expect(new Set(ordenes).size).toBe(ordenes.length);
+      return [...ps].sort((a, b) => a.orden - b.orden).map((p) => p.etiqueta);
+    };
+
+    // Subir: el movido queda de verdad primero, que es lo que el curador pidió.
+    expect(await secuencia()).toEqual(['Firma el contrato', 'Abre la app', 'Sube el documento']);
+
+    // BAJAR es el caso que un desplazamiento «de la posición pedida en adelante» hace mal:
+    // deja abierto el hueco que el nodo libera y el movimiento se queda corto. Devolver el
+    // primero al puesto 2 tiene que dejarlo el ÚLTIMO, no en medio.
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: tercero.nodoId,
+      etiqueta: 'Firma el contrato',
+      detalle: '',
+      faseId,
+      responsable: '',
+      orden: 2,
+    });
+    expect(await secuencia()).toEqual(['Abre la app', 'Sube el documento', 'Firma el contrato']);
+
+    // Y un movimiento de una sola posición hacia abajo sí cambia el orden visible: con el
+    // desplazamiento incondicional no cambiaba nada en absoluto.
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: pasoId,
+      etiqueta: 'Abre la app',
+      detalle: '',
+      faseId,
+      responsable: '',
+      orden: 1,
+    });
+    expect(await secuencia()).toEqual(['Sube el documento', 'Abre la app', 'Firma el contrato']);
   });
 
   it('el guard impide que una arista o una fase crucen de journey', async () => {
@@ -518,6 +543,17 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
 
     // Un paso NO lleva catálogo: existe dentro de su journey y no se comparte.
     expect(j1!.nodos.find((n) => n.tipo === 'paso')!.catalogoId).toBeNull();
+
+    // Y la etiqueta la pone el CATÁLOGO, igual que el arquetipo pone la suya: un update
+    // directo que cambie solo el nodo dejaría el grafo mostrando y congelando un nombre
+    // mientras las consultas por catálogo lo identifican por otro.
+    await conUsuario(leadId, (tx) => tx`
+      update journey_nodo set etiqueta = 'Nombre suelto que no es el del catálogo'
+      where id = ${enOtro.nodoId} and workspace_id = ${ws}`);
+    const trasElIntento = await journeyCompleto(leadId, ws, otroJourneyId);
+    expect(trasElIntento!.nodos.find((n) => n.id === enOtro.nodoId)!.etiqueta).toBe(
+      'Core bancario (T24)',
+    );
   });
 
   it('el proyecto del journey tiene que ser del reto del journey', async () => {

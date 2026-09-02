@@ -417,13 +417,20 @@ export function carrilesDeJourney(journey: JourneyCompleto): CarrilesBlueprint {
       if (!intermedio) continue;
       const porAccion = ACCIONES.includes(intermedio.tipo);
       const porContacto = PUNTOS_DE_CONTACTO.includes(intermedio.tipo);
-      if (!porAccion && !porContacto) continue;
+      // La oportunidad cuelga de la FRICCIÓN que viene a resolver (`dependencia`), no del
+      // paso: sin este salto, el carril nunca la muestra aunque la tabla de extremos lo
+      // ofrezca como el modelo natural.
+      const porDolor = intermedio.tipo === 'friccion' || intermedio.tipo === 'emocion';
+      if (!porAccion && !porContacto && !porDolor) continue;
       for (const lejano of vecindad.get(id) ?? []) {
         const nodo = porId.get(lejano);
         if (!nodo || nodo.tipo === 'paso' || nodo.tipo === 'fase') continue;
         // Por un punto de contacto solo cruzan las fricciones y emociones que se le
         // enganchan; lo demás traería la columna del paso vecino que lo comparte.
         if (porContacto && !SE_SIENTEN.includes(nodo.tipo)) continue;
+        // Y por una fricción, solo la oportunidad que la resuelve: dejar pasar acciones o
+        // sistemas por ahí sería la misma fuga por la puerta de al lado.
+        if (porDolor && nodo.tipo !== 'oportunidad') continue;
         agregar(lejano);
       }
     }

@@ -26,14 +26,34 @@ export const Route = createFileRoute('/_autenticada/journeys')({
       listaDeJourneys({ data: { workspaceId } }),
       arbolDelWorkspace({ data: { workspaceId } }),
     ]);
+    // Los proyectos cuelgan del reto, y un reto que afecta a este servicio está anclado en
+    // OTRO: el mapa se arma sobre el árbol entero para poder resolverlos desde cualquier
+    // servicio sin volver a consultar.
+    const proyectosPorReto = new Map(
+      (arbol?.servicios ?? []).flatMap((s) =>
+        s.retos.map(
+          (r) => [r.id, r.proyectos.map((p) => ({ id: p.id, etiqueta: `${p.codigo} ${p.titulo}` }))] as const,
+        ),
+      ),
+    );
     return {
       workspaceId,
       journeys,
-      servicios: (arbol?.servicios ?? []).map((s) => ({
-        id: s.id,
-        nombre: s.nombre,
-        retos: s.retos.map((r) => ({ id: r.id, etiqueta: `${r.codigo} ${r.titulo}` })),
-      })),
+      servicios: (arbol?.servicios ?? []).map((s) => {
+        // Un reto anclado en el servicio A que AFECTA al B es el que empuja el journey del
+        // B: si el selector solo ofreciera los anclados, ese journey no podría asociarse al
+        // reto que lo motiva. Se unen y se deduplican por id, que es lo que el árbol ya
+        // separa para no repetir la relación.
+        const vistos = new Set<string>();
+        const retos = [...s.retos, ...s.retosQueAfectan]
+          .filter((r) => !vistos.has(r.id) && vistos.add(r.id))
+          .map((r) => ({
+            id: r.id,
+            etiqueta: `${r.codigo} ${r.titulo}`,
+            proyectos: proyectosPorReto.get(r.id) ?? [],
+          }));
+        return { id: s.id, nombre: s.nombre, retos };
+      }),
     };
   },
   component: PantallaJourneys,
@@ -190,18 +210,24 @@ function FormularioJourney({
   onCreado,
 }: {
   workspaceId: string;
-  servicios: { id: string; nombre: string; retos: { id: string; etiqueta: string }[] }[];
+  servicios: {
+    id: string;
+    nombre: string;
+    retos: { id: string; etiqueta: string; proyectos: { id: string; etiqueta: string }[] }[];
+  }[];
   onCerrar: () => void;
   onError: (e: string | null) => void;
   onCreado: (journeyId: string) => Promise<void>;
 }) {
   const [servicioId, setServicioId] = useState('');
   const [retoId, setRetoId] = useState('');
+  const [proyectoId, setProyectoId] = useState('');
   const [tipo, setTipo] = useState<TipoJourney>('as-is');
   const [nombre, setNombre] = useState('');
   const [descripcion, setDescripcion] = useState('');
   const [ocupado, setOcupado] = useState(false);
   const retos = servicios.find((s) => s.id === servicioId)?.retos ?? [];
+  const proyectos = retos.find((r) => r.id === retoId)?.proyectos ?? [];
 
   async function enviar(e: FormEvent) {
     e.preventDefault();
@@ -215,6 +241,9 @@ function FormularioJourney({
           // El as-is puede existir antes de que haya reto; el to-be casi siempre nace
           // dentro de uno, pero no se exige aquí: lo exigiría el gate, no el formulario.
           retoId: retoId === '' ? null : retoId,
+          // El proyecto cuelga del reto: sin reto no hay proyecto que asociar, y el
+          // selector lo refleja deshabilitándose.
+          proyectoId: proyectoId === '' ? null : proyectoId,
           tipo,
           nombre,
           descripcion,
@@ -236,6 +265,7 @@ function FormularioJourney({
           onChange={(e) => {
             setServicioId(e.target.value);
             setRetoId('');
+            setProyectoId('');
           }}
           required
         >
@@ -253,11 +283,30 @@ function FormularioJourney({
             </option>
           ))}
         </Select>
-        <Select value={retoId} onChange={(e) => setRetoId(e.target.value)} disabled={servicioId === ''}>
+        <Select
+          value={retoId}
+          onChange={(e) => {
+            setRetoId(e.target.value);
+            setProyectoId('');
+          }}
+          disabled={servicioId === ''}
+        >
           <option value="">Sin reto asociado (opcional)</option>
           {retos.map((r) => (
             <option key={r.id} value={r.id}>
               {r.etiqueta}
+            </option>
+          ))}
+        </Select>
+        <Select
+          value={proyectoId}
+          onChange={(e) => setProyectoId(e.target.value)}
+          disabled={proyectos.length === 0}
+        >
+          <option value="">Sin proyecto asociado (opcional)</option>
+          {proyectos.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.etiqueta}
             </option>
           ))}
         </Select>

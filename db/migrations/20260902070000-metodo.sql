@@ -254,9 +254,11 @@ create policy gate_update_aprobar on gate_instancia
           and p.workspace_id = gate_instancia.workspace_id
         where c.reto_id = p.reto_id and c.workspace_id = gate_instancia.workspace_id
           and (c.ventana_dias is null
-               or c.definicion = '' or c.objetivo = ''
-               or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
-                   and c.linea_base_plan = '')))))
+               -- btrim: el schema recorta en la app, pero este predicado protege
+               -- también contra SQL directo — whitespace NO es contenido.
+               or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
+               or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
+                   and btrim(c.linea_base_plan) = '')))))
   );
 
 create policy checklist_insert on checklist_item
@@ -381,9 +383,9 @@ begin
         join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
         where c.reto_id = p.reto_id and c.workspace_id = new.workspace_id
           and (c.ventana_dias is null
-               or c.definicion = '' or c.objetivo = ''
-               or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
-                   and c.linea_base_plan = ''))) then
+               or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
+               or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
+                   and btrim(c.linea_base_plan) = ''))) then
         raise exception 'no se puede aprobar G0: criterios incompletos (SYS-22)';
       end if;
     end if;
@@ -393,6 +395,14 @@ end $$;
 create trigger gate_aprobar_suficiencia
   before update on gate_instancia
   for each row execute function gate_aprobar_suficiencia_guard();
+
+-- Sin esto, cualquier sesión del rol de app podría adjuntar estos SECURITY DEFINER a
+-- una tabla temporal propia (EXECUTE es de PUBLIC por defecto) y usarlos como oráculo
+-- de existencia o candado sobre gates de OTROS workspaces. Los triggers ya instalados
+-- no exigen EXECUTE del invocante; crear triggers nuevos con ellas, sí.
+revoke execute on function checklist_gate_pendiente_guard() from public;
+revoke execute on function criterio_g0_pendiente_guard() from public;
+revoke execute on function gate_aprobar_suficiencia_guard() from public;
 
 -- ── Grants mínimos (UPDATE por columnas: nada más que la transición de cada pieza) ──
 grant insert on reto, proyecto, reto_servicio_afectado, criterio_exito,

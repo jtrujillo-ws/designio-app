@@ -72,10 +72,11 @@ function criteriosCompletos(criterios: CriterioDeReto[]): boolean {
     criterios.length > 0 &&
     criterios.every(
       (c) =>
-        c.definicion !== '' &&
-        c.objetivo !== '' &&
+        c.definicion.trim() !== '' &&
+        c.objetivo.trim() !== '' &&
         c.ventanaDias !== null &&
-        (((c.lineaBaseValor ?? '') !== '' && c.lineaBaseFecha !== null) || c.lineaBasePlan !== ''),
+        (((c.lineaBaseValor ?? '').trim() !== '' && c.lineaBaseFecha !== null) ||
+          c.lineaBasePlan.trim() !== ''),
     )
   );
 }

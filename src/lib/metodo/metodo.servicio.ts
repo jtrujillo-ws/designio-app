@@ -355,9 +355,9 @@ export async function aprobarGate(
           join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
           where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
             and (c.ventana_dias is null
-                 or c.definicion = '' or c.objetivo = ''
-                 or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
-                     and c.linea_base_plan = ''))))
+                 or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
+                 or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
+                     and btrim(c.linea_base_plan) = ''))))
       returning g.numero, g.proyecto_id, workspace_role(${actorId}, g.workspace_id) as rol`;
 
     if (aprobado.length === 0) {
@@ -412,19 +412,20 @@ async function diagnosticoDeGate(
   if ((gate.numero as number) === 0) {
     // Criterio completo (SYS-22) = definición + objetivo + ventana + línea base
     // REGISTRADA (valor Y fecha: sin fecha no hay punto de partida temporal) o plan.
+    // btrim en todos los textos: whitespace no es contenido, ni siquiera por SQL directo.
     const incompletos = await tx`
       select c.kpi, (c.ventana_dias is null) as sin_ventana,
-             (c.definicion = '') as sin_definicion,
-             (c.objetivo = '') as sin_objetivo,
-             ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
-              and c.linea_base_plan = '') as sin_base
+             (btrim(c.definicion) = '') as sin_definicion,
+             (btrim(c.objetivo) = '') as sin_objetivo,
+             ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
+              and btrim(c.linea_base_plan) = '') as sin_base
       from criterio_exito c
       join proyecto p on p.id = ${gate.proyecto_id as string} and p.workspace_id = ${workspaceId}
       where c.reto_id = p.reto_id and c.workspace_id = ${workspaceId}
         and (c.ventana_dias is null
-             or c.definicion = '' or c.objetivo = ''
-             or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
-                 and c.linea_base_plan = ''))`;
+             or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
+             or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
+                 and btrim(c.linea_base_plan) = ''))`;
     if (incompletos.length > 0) {
       const lista = incompletos
         .map(

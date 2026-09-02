@@ -439,6 +439,59 @@ describeAuthz('método: etapas, gates y checklists', () => {
     expect(sigue!.gates[2]!.estado).toBe('pendiente');
   });
 
+  it('whitespace no es contenido para G0 y los guards no se prestan a tablas del rol de app', async () => {
+    const r = await crearReto(leadId, {
+      workspaceId: ws,
+      servicioAnclaId: svcId,
+      codigo: 'R-95',
+      titulo: 'Reto whitespace',
+      descripcion: '',
+      origen: 'post-mortem',
+      metricaObjetivo: '',
+      serviciosAfectados: [],
+    });
+    const act = await activarReto(leadId, {
+      workspaceId: ws,
+      retoId: r.retoId,
+      perfil: 'rapido',
+      proyectoCodigo: 'P-95',
+      proyectoTitulo: 'Proyecto whitespace',
+    });
+    const p = await proyectoMetodo(sponsorId, ws, act.proyectoId);
+    const g0 = p!.gates[0]!;
+    for (const item of g0.items) {
+      await marcarItem(sponsorId, {
+        workspaceId: ws,
+        itemId: item.id,
+        accion: { tipo: 'na', justificacion: 'Cubierto' },
+      });
+    }
+    // Solo posible por SQL directo (el schema recorta): espacios en todos los textos.
+    const admin = sqlAdmin();
+    await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, linea_base_plan, ventana_dias, creado_por)
+      values (${ws}, ${r.retoId}, 'KPI espacios', '   ', ' ', '  ', 90, ${leadId})`;
+    await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id })).rejects.toThrow(
+      /sin definición/,
+    );
+    // El guard de fila repite el veredicto para el SQL directo del propio sponsor.
+    await expect(
+      conUsuario(sponsorId, (tx) => tx`
+        update gate_instancia set estado = 'aprobado', aprobado_por = ${sponsorId}, aprobado_en = now()
+        where id = ${g0.id}`),
+    ).rejects.toThrow(/criterios incompletos/);
+
+    // Y los SECURITY DEFINER no se adjuntan a tablas propias del rol de app (EXECUTE
+    // revocado de PUBLIC): sin oráculo ni candados sobre gates de otros workspaces.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        await tx`create temp table sonda (gate_id uuid, workspace_id uuid) on commit drop`;
+        await tx`create trigger sonda_t before insert on sonda
+          for each row execute function checklist_gate_pendiente_guard()`;
+      }),
+    ).rejects.toThrow(/permission denied/);
+  });
+
   it('una cuenta desactivada con sesión viva no lee el método ni aprueba (re-check de estado)', async () => {
     const admin = sqlAdmin();
     await admin`update usuario set estado = 'inactivo' where id = ${leadId}`;

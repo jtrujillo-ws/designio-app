@@ -236,6 +236,98 @@ async function sembrarEvidenciaProfunda(
   return true;
 }
 
+/** Cadena de razonamiento de demo (SPEC-03/04): evidencia curada → insight validado
+ * con citas y una contradicción a la vista → decisión aprobada en G1 y un arquetipo
+ * confirmado. Es lo que hace demostrable el grafo sin pasar por toda la curaduría.
+ * Idempotente: la señal es el insight del workspace. */
+async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string): Promise<void> {
+  const yaHay = await tx`select 1 from insight where workspace_id = ${wsId}`;
+  if (yaHay.length > 0) return;
+
+  const [fuente] = await tx`insert into fuente (workspace_id, tipo, titulo, referencia, creado_por)
+    values (${wsId}, 'documento', 'Estudio CX apertura de cuenta 2026',
+      'Consultora externa · informe interno 2026-06', ${luciaId})
+    returning id`;
+  const fuenteId = fuente!.id as string;
+  const [ev1] = await tx`insert into evidencia
+    (workspace_id, fuente_id, titulo, resumen, dimensiones, es_estado_actual, creado_por)
+    values (${wsId}, ${fuenteId}, 'Funnel de apertura: 62% de abandono en verificación',
+      'Analítica del embudo entre enero y junio',
+      ${tx.json({
+        proveniencia: { tipoFuente: 'documento', fecha: '2026-06-30', localizacion: 'p. 14' },
+        metodo: { recoleccion: 'analitica', derivada: false, segmentoIds: [] },
+        calidad: { confianza: 'alta', corroboraIds: [], contradiceIds: [] },
+        derechos: { consentimiento: true, confidencialidad: 'cliente' },
+      })}, true, ${luciaId})
+    returning id`;
+  const [ev2] = await tx`insert into evidencia
+    (workspace_id, fuente_id, titulo, resumen, dimensiones, es_estado_actual, creado_por)
+    values (${wsId}, ${fuenteId}, 'Entrevistas en sucursal: abandono del 20%',
+      'Seis entrevistas con asesores de sucursal',
+      ${tx.json({
+        proveniencia: { tipoFuente: 'entrevista', fecha: '2026-07-02', localizacion: 'sesión 3' },
+        metodo: { recoleccion: 'entrevista', derivada: false, segmentoIds: [] },
+        calidad: { confianza: 'media', corroboraIds: [], contradiceIds: [] },
+        derechos: { consentimiento: true, confidencialidad: 'cliente' },
+      })}, false, ${luciaId})
+    returning id`;
+  const evDigital = ev1!.id as string;
+  const evSucursal = ev2!.id as string;
+
+  const [ins] = await tx`insert into insight (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+    values (${wsId}, 'La verificación de identidad digital concentra el abandono',
+      'El corte por canal muestra que el problema es del canal digital, no del proceso completo',
+      'validado', ${luciaId}, now(), ${luciaId})
+    returning id`;
+  const insightId = ins!.id as string;
+  const [af1] = await tx`insert into afirmacion (workspace_id, insight_id, orden, texto, es_hipotesis)
+    values (${wsId}, ${insightId}, 0, '62 de cada 100 solicitudes digitales se detienen al cargar el documento', false)
+    returning id`;
+  await tx`insert into afirmacion (workspace_id, insight_id, orden, texto, es_hipotesis)
+    values (${wsId}, ${insightId}, 1, 'El rechazo probablemente crece con documentos vencidos', true)`;
+  await tx`insert into cita (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+    values (${wsId}, ${af1!.id as string}, ${evDigital},
+      'De cada 100 solicitudes iniciadas en canal digital, 62 se detienen en la carga del documento',
+      'p. 14', ${luciaId})`;
+  // La contradicción se siembra a la vista: el mismo dato en sucursal no cuadra.
+  await tx`insert into contradiccion (workspace_id, insight_id, evidencia_id, descripcion, creado_por)
+    values (${wsId}, ${insightId}, ${evSucursal},
+      'En sucursal el abandono es del 20%: el problema puede ser del canal, no del requisito',
+      ${luciaId})`;
+
+  const [p01] = await tx`select p.id, p.reto_id from proyecto p
+    where p.workspace_id = ${wsId} and p.codigo = 'P-01'`;
+  if (p01) {
+    const [g1] = await tx`select id from gate_instancia
+      where proyecto_id = ${p01.id as string} and workspace_id = ${wsId} and numero = 1`;
+    if (g1) {
+      const [dec] = await tx`insert into decision
+        (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, decidido_por)
+        values (${wsId}, ${p01.id as string}, ${g1.id as string}, 'diseno',
+          'Atacar la verificación digital antes que el resto del embudo',
+          'El insight validado concentra el abandono ahí; sucursal queda fuera del alcance',
+          ${luciaId})
+        returning id`;
+      await tx`insert into decision_insight (decision_id, insight_id, workspace_id)
+        values (${dec!.id as string}, ${insightId}, ${wsId})`;
+    }
+    const [arq] = await tx`insert into arquetipo
+      (workspace_id, reto_id, nombre, definicion, estado, veredicto_razon, creado_por)
+      values (${wsId}, ${p01.reto_id as string}, 'Independiente sin firma digital',
+        'Trabaja por cuenta propia, sin certificado digital vigente',
+        'confirmado', 'Tres de las seis entrevistas encajan con el perfil', ${luciaId})
+      returning id`;
+    await tx`insert into arquetipo_evidencia (arquetipo_id, evidencia_id, workspace_id)
+      values (${arq!.id as string}, ${evSucursal}, ${wsId})`;
+    const [seg] = await tx`select id from segmento
+      where workspace_id = ${wsId} and nombre = 'independientes'`;
+    if (seg) {
+      await tx`insert into arquetipo_segmento (arquetipo_id, segmento_id, workspace_id)
+        values (${arq!.id as string}, ${seg.id as string}, ${wsId})`;
+    }
+  }
+}
+
 /** Segundo workspace de Lucía (demo del selector multi-membresía): mínimo pero real —
  * un servicio, sin retos aún. Idempotente por MEMBRESÍA de Lucía + nombre: el nombre
  * de workspace no es único y uno homónimo ajeno no debe saltarse el seed. Devuelve si
@@ -286,6 +378,11 @@ async function main() {
       await sql.begin((tx) => sembrarMetodo(tx, wsId, lucia.id as string));
       metodoSembrado = true;
     }
+    // Upgrade de bases sembradas antes de la cadena de razonamiento.
+    if (lucia) {
+      await sql.begin((tx) => sembrarCadena(tx, wsId, lucia.id as string));
+    }
+
     // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía
     // (la función se auto-guarda por membresía+nombre, sin chequeo duplicado aquí).
     let segundoSembrado = false;
@@ -335,6 +432,7 @@ async function main() {
     await sembrarArbol(tx, wsId, luciaId);
     await sembrarMetodo(tx, wsId, luciaId);
     await sembrarEvidenciaProfunda(tx, wsId, luciaId);
+    await sembrarCadena(tx, wsId, luciaId);
     await sembrarSegundoWorkspace(tx, luciaId);
   });
   console.log(

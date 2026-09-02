@@ -450,6 +450,10 @@ export async function adjuntarArchivo(
     }
 
     // UNA sentencia = UN snapshot: el rol auditado es el que autorizó la escritura.
+    // El insert del evento NO lleva `returning`: con RLS, un INSERT ... RETURNING exige
+    // además pasar la política de SELECT, y la auditoría solo la leen los roles que
+    // rinden cuentas (RF-01.6) — un stakeholder que adjunta un archivo GENERA el evento
+    // pero no puede leerlo, así que pedir la fila de vuelta rompería la escritura.
     const [fila] = await tx`
       with quien as (
         select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
@@ -469,7 +473,6 @@ export async function adjuntarArchivo(
                                   'sha256', nuevo.sha256, 'bytes', ${bytes.length}::int),
                ${actorId}, quien.rol
         from nuevo, quien
-        returning id
       )
       select id, sha256 from nuevo`;
     return { archivoId: fila!.id as string, sha256: fila!.sha256 as string };
@@ -501,7 +504,6 @@ export async function eliminarArchivo(
                                   'nombre', fuera.nombre),
                ${actorId}, quien.rol
         from fuera, quien
-        returning id
       )
       select id from fuera`;
     if (borradas.length === 0) {

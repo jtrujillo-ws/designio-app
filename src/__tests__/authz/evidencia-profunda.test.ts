@@ -155,7 +155,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       marcarItem(leadId, {
         workspaceId: ws,
         itemId: itemChecklist,
-        accion: { tipo: 'cumplido', evidenciaId: evSinDerechos },
+        accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evSinDerechos },
       }),
     ).rejects.toThrow(/No puedes citar esta evidencia.*derechos pendientes/s);
 
@@ -280,7 +280,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     await marcarItem(leadId, {
       workspaceId: ws,
       itemId: itemChecklist,
-      accion: { tipo: 'cumplido', evidenciaId: evConDerechos },
+      accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evConDerechos },
     });
     const [ci] = await conUsuario(leadId, (tx) => tx`select estado, evidencia_id
       from checklist_item where id = ${itemChecklist}`);
@@ -566,7 +566,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       marcarItem(leadId, {
         workspaceId: ws,
         itemId: itemChecklist,
-        accion: { tipo: 'cumplido', evidenciaId: crypto.randomUUID() },
+        accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: crypto.randomUUID() },
       }),
     ).rejects.toThrow(ErrorMetodo);
   });

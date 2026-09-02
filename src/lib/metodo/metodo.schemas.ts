@@ -109,11 +109,25 @@ export const ProyectoInputSchema = z.object({
   proyectoId: z.string().uuid(),
 });
 
+/** Los objetos REALES que un ítem puede citar (RF-04.5): nada de casillas sueltas. */
+export const CLASES_OBJETO_CITABLE = ['evidencia', 'insight', 'decision'] as const;
+export type ClaseObjetoCitable = (typeof CLASES_OBJETO_CITABLE)[number];
+
+export const ETIQUETA_CLASE_OBJETO: Record<ClaseObjetoCitable, string> = {
+  evidencia: 'Evidencia',
+  insight: 'Insight',
+  decision: 'Decisión',
+};
+
 export const MarcarItemSchema = z.object({
   workspaceId: z.string().uuid(),
   itemId: z.string().uuid(),
   accion: z.discriminatedUnion('tipo', [
-    z.object({ tipo: z.literal('cumplido'), evidenciaId: z.string().uuid() }),
+    z.object({
+      tipo: z.literal('cumplido'),
+      objetoClase: z.enum(CLASES_OBJETO_CITABLE),
+      objetoId: z.string().uuid(),
+    }),
     z.object({ tipo: z.literal('pendiente') }),
     z.object({ tipo: z.literal('na'), justificacion: z.string().trim().min(1).max(2000) }),
   ]),
@@ -132,8 +146,10 @@ export type ItemDeGate = {
   orden: number;
   texto: string;
   estado: 'pendiente' | 'cumplido' | 'na';
-  evidenciaId: string | null;
-  evidenciaTitulo: string | null;
+  /** El objeto real que lo cumple: su clase gobierna cómo se lee el enlace. */
+  objetoClase: ClaseObjetoCitable | null;
+  objetoId: string | null;
+  objetoTitulo: string | null;
   naJustificacion: string;
 };
 

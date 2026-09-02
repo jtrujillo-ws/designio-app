@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { CSSProperties } from 'react';
 import { createFileRoute, useNavigate, useRouter } from '@tanstack/react-router';
+import { PanelDeHilos } from '@/components/portal/PanelDeHilos';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Select } from '@/components/ui/Select';
@@ -8,19 +9,43 @@ import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES, type EvidenciaCitable } from '@/lib/evidencia/evidencia.schemas';
+import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
   aprobarGateDeProyecto,
   marcarItemDeChecklist,
   proyectoDelMetodo,
 } from '@/lib/metodo/metodo.functions';
 import { ETIQUETA_PERFIL } from '@/lib/metodo/metodo.plantillas';
+import { CLASES_OBJETO_CITABLE, ETIQUETA_CLASE_OBJETO } from '@/lib/metodo/metodo.schemas';
 import type {
+  ClaseObjetoCitable,
   CriterioDeReto,
   GateDeProyecto,
   ItemDeGate,
   ProyectoMetodo,
 } from '@/lib/metodo/metodo.schemas';
+import { insightsParaCitar } from '@/lib/insight/insight.functions';
+import { gobernanzaDelProyecto } from '@/lib/metodo/gobernanza.functions';
+import { SeccionGobernanza } from '@/components/metodo/SeccionGobernanza';
+import { hilosDelPortal } from '@/lib/portal/portal.functions';
+// El portal ya usa «ObjetoCitable» para OTRA cosa: a qué se ancla un hilo. Aquí se
+// necesita qué puede CUMPLIR un ítem del checklist, que no es la misma lista ni la
+// misma forma, así que se importa con su nombre y el de aquí se llama distinto.
+import type { HiloDeObjeto, ObjetoCitable as AnclaDeHilo } from '@/lib/portal/portal.schemas';
+
+/** Lo que un ítem del checklist puede citar: evidencia curada, insight validado o
+ * decisión vigente (RF-04.5). Un insight propuesto no cuenta — la suficiencia se
+ * apoya en lo que alguien ya sostuvo con citas. */
+export type ObjetoCitable = {
+  clase: ClaseObjetoCitable;
+  id: string;
+  titulo: string;
+  /** Solo la evidencia lleva derechos de uso (SPEC-03): un insight o una decisión son
+   * razonamiento propio del workspace. `citable: false` deshabilita la opción con su
+   * motivo a la vista; el bloqueo real lo impone el guard de la base. */
+  citable?: boolean;
+  motivoBloqueo?: string | null;
+};
 
 /**
  * Pantalla del método (SPEC-04): las 8 etapas canónicas con su gate, checklist de
@@ -35,18 +60,63 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
     // Un id no-uuid en la URL (enlace editado/truncado) es "no existe", no un crash
     // del validador de la server function contra el error boundary por defecto.
     if (!workspaceId || !ES_UUID.test(params.proyectoId)) return null;
-    const [proyecto, lista] = await Promise.all([
+    const [proyecto, lista, gobernanza, insights] = await Promise.all([
       proyectoDelMetodo({ data: { workspaceId, proyectoId: params.proyectoId } }),
       evidenciasDelWorkspace({ data: { workspaceId } }),
+      gobernanzaDelProyecto({ data: { workspaceId, proyectoId: params.proyectoId } }),
+      // Proyección mínima a propósito: esta pantalla solo cita insights, no los muestra.
+      // La ficha completa (afirmaciones, citas, contradicciones) vive en /insights.
+      insightsParaCitar({ data: { workspaceId } }),
     ]);
-    return proyecto
-      ? {
-          workspaceId,
-          proyecto,
-          evidencias: lista?.evidencias ?? [],
-          hayMasEvidencias: lista?.hayMas ?? false,
-        }
-      : null;
+    if (!proyecto) return null;
+    // Los hilos del portal cuelgan del proyecto y de sus gates, y los ids de los gates
+    // solo se conocen tras cargar el método: es una segunda ida deliberada, no una
+    // carrera — y una sola para los nueve objetos de la pantalla.
+    const portal = await hilosDelPortal({
+      data: {
+        workspaceId,
+        objetos: [
+          { tipo: 'proyecto', id: proyecto.id },
+          ...proyecto.gates.map((g) => ({ tipo: 'gate_instancia' as const, id: g.id })),
+        ],
+      },
+    });
+    // La lista de objetos citables se arma aquí, no en la base: cada fuente ya tiene su
+    // propia proyección con RLS aplicada y su propio corte (las evidencias vienen
+    // recortadas a las 200 más recientes, con aviso).
+    const citables: ObjetoCitable[] = [
+      ...(lista?.evidencias ?? []).map((e) => ({
+        clase: 'evidencia' as const,
+        id: e.id,
+        titulo: e.titulo,
+        citable: e.citable,
+        motivoBloqueo: e.motivoBloqueo,
+      })),
+      ...insights.insights.map((i) => ({
+        clase: 'insight' as const,
+        id: i.id,
+        titulo: i.titulo,
+      })),
+      ...(gobernanza?.decisiones ?? [])
+        .filter((d) => d.estado === 'vigente')
+        .map((d) => ({ clase: 'decision' as const, id: d.id, titulo: d.titulo })),
+    ];
+    return {
+      workspaceId,
+      proyecto,
+      citables,
+      hayMasEvidencias: lista?.hayMas ?? false,
+      hayMasInsights: insights.hayMas,
+      gobernanza: gobernanza ?? {
+        decisiones: [],
+        arquetipos: [],
+        reaperturas: [],
+        segmentosDisponibles: [],
+      },
+      insightsValidados: insights.insights,
+      hilos: portal?.hilos ?? [],
+      hayMasHilos: portal?.hayMas ?? false,
+    };
   },
   component: PantallaProyecto,
 });
@@ -65,6 +135,12 @@ const COLOR_ITEM: Record<ItemDeGate['estado'], string> = {
   cumplido: 'var(--accent)',
   na: 'var(--text-faint)',
 };
+
+/** Los hilos llegan en UNA consulta para toda la pantalla; cada tarjeta se queda con los
+ * suyos (RF-01.5: el hilo pertenece al objeto, no a la pantalla). */
+function hilosDe(hilos: HiloDeObjeto[], tipo: AnclaDeHilo, id: string): HiloDeObjeto[] {
+  return hilos.filter((h) => h.objetoTipo === tipo && h.objetoId === id);
+}
 
 /** Espejo cliente del predicado SYS-22 de aprobarGate — solo informa la etiqueta de
  * G0; la exigencia real vive en el servidor y en la política. */
@@ -124,10 +200,24 @@ function PantallaProyecto() {
         )}
         {datos && (
           <>
-            <EncabezadoProyecto proyecto={datos.proyecto} />
+            <EncabezadoProyecto
+              proyecto={datos.proyecto}
+              workspaceId={datos.workspaceId}
+              hilos={hilosDe(datos.hilos, 'proyecto', datos.proyecto.id)}
+              rol={rol}
+              onCambio={() => router.invalidate()}
+            />
             {error && (
               <span role="alert" style={{ font: '500 13px var(--font-sans)', color: 'var(--danger)' }}>
                 {error}
+              </span>
+            )}
+            {/* La consulta del portal está acotada: decirlo es preferible a mostrar una
+                conversación incompleta como si fuera toda. */}
+            {datos.hayMasHilos && (
+              <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-faint)' }}>
+                Esta vista muestra los hilos más recientes del proyecto y sus gates; hay más
+                en el portal.
               </span>
             )}
             {datos.proyecto.etapas.map((etapa) => {
@@ -136,11 +226,13 @@ function PantallaProyecto() {
                 <EtapaConGate
                   key={etapa.id}
                   workspaceId={datos.workspaceId}
+                  hilos={gate ? hilosDe(datos.hilos, 'gate_instancia', gate.id) : []}
                   nombreEtapa={`${etapa.numero} · ${etapa.nombre}`}
                   estadoEtapa={etapa.estado}
                   gate={gate}
-                  evidencias={datos.evidencias}
+                  citables={datos.citables}
                   hayMasEvidencias={datos.hayMasEvidencias}
+                  hayMasInsights={datos.hayMasInsights}
                   rol={rol}
                   criteriosListosG0={criteriosCompletos(datos.proyecto.reto.criterios)}
                   anterioresAprobados={datos.proyecto.gates
@@ -151,6 +243,18 @@ function PantallaProyecto() {
                 />
               );
             })}
+            <SeccionGobernanza
+              workspaceId={datos.workspaceId}
+              proyecto={datos.proyecto}
+              gobernanza={datos.gobernanza}
+              insightsValidados={datos.insightsValidados}
+              hayMasInsights={datos.hayMasInsights}
+              evidencias={datos.citables.filter((o) => o.clase === 'evidencia')}
+              hayMasEvidencias={datos.hayMasEvidencias}
+              rol={rol}
+              onCambio={() => router.invalidate()}
+              onError={setError}
+            />
           </>
         )}
       </main>
@@ -158,7 +262,19 @@ function PantallaProyecto() {
   );
 }
 
-function EncabezadoProyecto({ proyecto }: { proyecto: ProyectoMetodo }) {
+function EncabezadoProyecto({
+  proyecto,
+  workspaceId,
+  hilos,
+  rol,
+  onCambio,
+}: {
+  proyecto: ProyectoMetodo;
+  workspaceId: string;
+  hilos: HiloDeObjeto[];
+  rol: string;
+  onCambio: () => Promise<void>;
+}) {
   const gatesAprobados = proyecto.gates.filter((g) => g.estado === 'aprobado').length;
   return (
     <Card style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -204,17 +320,26 @@ function EncabezadoProyecto({ proyecto }: { proyecto: ProyectoMetodo }) {
           </div>
         ))}
       </div>
+      <PanelDeHilos
+        workspaceId={workspaceId}
+        objeto={{ tipo: 'proyecto', id: proyecto.id }}
+        hilos={hilos}
+        rol={rol}
+        onCambio={onCambio}
+      />
     </Card>
   );
 }
 
 function EtapaConGate({
   workspaceId,
+  hilos,
   nombreEtapa,
   estadoEtapa,
   gate,
-  evidencias,
+  citables,
   hayMasEvidencias,
+  hayMasInsights,
   rol,
   criteriosListosG0,
   anterioresAprobados,
@@ -222,11 +347,14 @@ function EtapaConGate({
   onError,
 }: {
   workspaceId: string;
+  /** Hilos del portal sobre ESTE gate: el momento de co-creación de RF-01.5. */
+  hilos: HiloDeObjeto[];
   nombreEtapa: string;
   estadoEtapa: string;
   gate: GateDeProyecto | undefined;
-  evidencias: EvidenciaCitable[];
+  citables: ObjetoCitable[];
   hayMasEvidencias: boolean;
+  hayMasInsights: boolean;
   rol: string;
   /** SYS-22 en la etiqueta: G0 no está «listo» sin criterios completos. */
   criteriosListosG0: boolean;
@@ -288,8 +416,9 @@ function EtapaConGate({
             key={item.id}
             workspaceId={workspaceId}
             item={item}
-            evidencias={evidencias}
+            citables={citables}
             hayMasEvidencias={hayMasEvidencias}
+            hayMasInsights={hayMasInsights}
             editable={gate.estado === 'pendiente'}
             puedeCurar={(ROLES_CURADORES as readonly string[]).includes(rol)}
             puedeNa={rol === gate.rolAprobador}
@@ -311,6 +440,17 @@ function EtapaConGate({
           Aprueba {ETIQUETA_ROL[gate.rolAprobador] ?? gate.rolAprobador} en el portal.
         </span>
       )}
+
+      {/* El gate es EL momento de co-creación (SPEC-01): el cliente discute aquí, no por
+          correo — y un gate aprobado conserva su conversación (los hilos no se congelan
+          con él: la decisión es inmutable, la conversación sobre ella sigue viva). */}
+      <PanelDeHilos
+        workspaceId={workspaceId}
+        objeto={{ tipo: 'gate_instancia', id: gate.id }}
+        hilos={hilos}
+        rol={rol}
+        onCambio={onCambio}
+      />
     </Card>
   );
 }
@@ -318,8 +458,9 @@ function EtapaConGate({
 function ItemChecklist({
   workspaceId,
   item,
-  evidencias,
+  citables,
   hayMasEvidencias,
+  hayMasInsights,
   editable,
   puedeCurar,
   puedeNa,
@@ -328,8 +469,9 @@ function ItemChecklist({
 }: {
   workspaceId: string;
   item: ItemDeGate;
-  evidencias: EvidenciaCitable[];
+  citables: ObjetoCitable[];
   hayMasEvidencias: boolean;
+  hayMasInsights: boolean;
   editable: boolean;
   /** Cumplido/pendiente: curadores (lead/diseñador). N/A —y revertirlo— : el rol aprobador del gate. */
   puedeCurar: boolean;
@@ -338,7 +480,9 @@ function ItemChecklist({
   onError: (e: string | null) => void;
 }) {
   const [enlazando, setEnlazando] = useState(false);
-  const [evidenciaId, setEvidenciaId] = useState('');
+  // Un solo control para los tres tipos: el value viaja como «clase:id» y se parte al
+  // enviar. Evita un segundo selector de clase que el usuario tendría que sincronizar.
+  const [objetoSel, setObjetoSel] = useState('');
   const [naJustificacion, setNaJustificacion] = useState('');
   const [marcandoNa, setMarcandoNa] = useState(false);
   const [ocupado, setOcupado] = useState(false);
@@ -371,7 +515,7 @@ function ItemChecklist({
         </span>
         <span style={{ font: '600 11.5px var(--font-sans)', color: COLOR_ITEM[item.estado] }}>
           {item.estado === 'cumplido'
-            ? `cumplido · ${item.evidenciaTitulo ?? 'evidencia'}`
+            ? `cumplido · ${item.objetoClase ? ETIQUETA_CLASE_OBJETO[item.objetoClase] : 'objeto'}: ${item.objetoTitulo ?? '—'}`
             : item.estado === 'na'
               ? 'N/A aprobado'
               : 'pendiente'}
@@ -386,7 +530,7 @@ function ItemChecklist({
         <div style={{ display: 'flex', gap: 8 }}>
           {puedeCurar && (
             <Button size="sm" variant="secondary" disabled={ocupado} onClick={() => setEnlazando(true)}>
-              Enlazar evidencia
+              Enlazar objeto
             </Button>
           )}
           {puedeNa && (
@@ -405,26 +549,62 @@ function ItemChecklist({
       )}
       {editable && enlazando && (
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <Select value={evidenciaId} onChange={(e) => setEvidenciaId(e.target.value)} style={{ minWidth: 260 }}>
-            <option value="">Elige una evidencia curada…</option>
-            {/* Los derechos restringen el uso aguas abajo (RF-03.10, SYS-14): lo que no
-                puede citarse se muestra deshabilitado y CON el motivo, nunca oculto —
-                que falte una dimensión es información de curaduría, no ruido. */}
-            {evidencias.map((ev) => (
-              <option key={ev.id} value={ev.id} disabled={!ev.citable}>
-                {ev.citable ? ev.titulo : `${ev.titulo} — sin derechos: ${ev.motivoBloqueo ?? ''}`}
-              </option>
-            ))}
+          <Select value={objetoSel} onChange={(e) => setObjetoSel(e.target.value)} style={{ minWidth: 300 }}>
+            <option value="">Elige el objeto que lo cumple…</option>
+            {CLASES_OBJETO_CITABLE.map((clase) => {
+              const delGrupo = citables.filter((o) => o.clase === clase);
+              if (delGrupo.length === 0) return null;
+              return (
+                <optgroup key={clase} label={ETIQUETA_CLASE_OBJETO[clase]}>
+                  {/* Los derechos restringen el uso aguas abajo (RF-03.10, SYS-14): lo
+                      que no puede citarse se muestra deshabilitado y CON el motivo,
+                      nunca oculto — que falte una dimensión es información de curaduría,
+                      no ruido. El bloqueo REAL lo impone la base; esto lo hace legible. */}
+                  {delGrupo.map((o) => (
+                    <option
+                      key={`${o.clase}:${o.id}`}
+                      value={`${o.clase}:${o.id}`}
+                      disabled={o.citable === false}
+                    >
+                      {o.citable === false
+                        ? `${o.titulo} — sin derechos: ${o.motivoBloqueo ?? ''}`
+                        : o.titulo}
+                    </option>
+                  ))}
+                </optgroup>
+              );
+            })}
             {hayMasEvidencias && (
               <option value="" disabled>
                 … hay más evidencias (solo se listan las 200 más recientes)
               </option>
             )}
+            {hayMasInsights && (
+              <option value="" disabled>
+                … hay más insights validados (solo se listan los 200 más recientes)
+              </option>
+            )}
           </Select>
           <Button
             size="sm"
-            disabled={ocupado || evidenciaId === ''}
-            onClick={() => void marcar({ tipo: 'cumplido', evidenciaId })}
+            disabled={ocupado || objetoSel === ''}
+            onClick={() => {
+              // El valor viene del DOM: se resuelve contra la MISMA lista con la que se
+              // pintó el picker en vez de partirlo y castearlo. Así un valor manipulado
+              // —o rancio, porque la lista se recarga en cada invalidate— da un mensaje
+              // que se entiende y no un error de constraint desde la base.
+              const elegido = citables.find((o) => `${o.clase}:${o.id}` === objetoSel);
+              if (!elegido) {
+                setObjetoSel('');
+                onError('Ese objeto ya no está en la lista: vuelve a elegirlo');
+                return;
+              }
+              void marcar({
+                tipo: 'cumplido',
+                objetoClase: elegido.clase,
+                objetoId: elegido.id,
+              });
+            }}
           >
             Cumplido
           </Button>

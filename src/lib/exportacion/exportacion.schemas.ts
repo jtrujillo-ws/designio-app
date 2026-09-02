@@ -59,6 +59,23 @@ export const CATALOGO_EXPORT = [
   { tabla: 'evidencia', orden: 'creado_en, id' },
   { tabla: 'evidencia_segmento', orden: 'evidencia_id, segmento_id' },
   { tabla: 'derecho_uso', orden: 'creado_en, id' },
+  // Cadena de razonamiento (SPEC-03.9 / SPEC-04.9-11): el insight y lo que lo sostiene,
+  // las decisiones con su enlace a insights, los arquetipos y las reaperturas. Sin
+  // esto, el archivo entregado tendría los gates pero no el porqué de cada decisión.
+  { tabla: 'insight', orden: 'creado_en, id' },
+  { tabla: 'afirmacion', orden: 'insight_id, orden' },
+  { tabla: 'cita', orden: 'creado_en, id' },
+  { tabla: 'contradiccion', orden: 'creado_en, id' },
+  { tabla: 'decision', orden: 'decidido_en, id' },
+  { tabla: 'decision_insight', orden: 'decision_id, insight_id' },
+  { tabla: 'arquetipo', orden: 'creado_en, id' },
+  { tabla: 'arquetipo_segmento', orden: 'arquetipo_id, segmento_id' },
+  { tabla: 'arquetipo_evidencia', orden: 'arquetipo_id, evidencia_id' },
+  { tabla: 'reapertura_etapa', orden: 'reabierto_en, id' },
+  { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id' },
+  // Portal (SPEC-01.5): la conversación con el cliente es parte de lo que se le entrega.
+  { tabla: 'hilo_comentario', orden: 'creado_en, id' },
+  { tabla: 'comentario', orden: 'creado_en, id' },
   { tabla: 'item_importacion', orden: 'creado_en, id' },
   // Los bytes NO salen por esta vía: archivo_importado se exporta aparte, sin la
   // columna `contenido` y con el binario en base64 sujeto al presupuesto de adjuntos.
@@ -74,6 +91,11 @@ export const TABLAS_ENTREGABLE = [
   'evidencia_segmento',
   'derecho_uso',
   'archivo_importado',
+  // Citan evidencia por id: si la evidencia no sale, su cita tampoco — de lo contrario
+  // el entregable llevaría el fragmento citado de un material sin derechos.
+  'cita',
+  'contradiccion',
+  'arquetipo_evidencia',
 ] as const;
 
 /** 25 MiB de binarios por exportación: el paquete se arma en memoria y viaja como una

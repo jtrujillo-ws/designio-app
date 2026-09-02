@@ -24,7 +24,7 @@ import {
   registrarSnapshot,
   seguimientoDeImpacto,
 } from '@/lib/medicion/medicion.servicio';
-import { ventanasCerradas } from '@/lib/medicion/medicion.schemas';
+import { ResultadoCriterioSchema, ventanasCerradas } from '@/lib/medicion/medicion.schemas';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
 import { describeAuthz } from './helpers';
 
@@ -1147,6 +1147,80 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       .toBe('49');
   });
 
+  it('las escrituras de la medición se citan en la FILA DEL RETO, también por SQL directo', async () => {
+    // El barrido de pares deja cinco escrituras cuyo predicado puede invalidar una
+    // transición ajena que commitee en medio. Se citan en la fila del reto —el objeto del
+    // que cuelga todo— y aquí se comprueba reteniendo ESA fila desde otra sesión, sin
+    // tomar ningún candado consultivo: si solo se citaran en el candado del servicio,
+    // ninguna esperaría y el SQL directo seguiría colándose. (La tercera, la entrada KPI
+    // contra la firma, se comprueba donde su registry todavía es borrador.)
+    const filaDelReto = (tx: TransactionSql) =>
+      tx`select 1 from reto where id = ${retoId} and workspace_id = ${ws} for update`;
+
+    // 1) El snapshot contra la completación del review («reto en medición»).
+    expect(
+      await esperaA(filaDelReto, () =>
+        registrarSnapshot(sponsorId, {
+          workspaceId: ws,
+          entradaId: entradaAbandonoId,
+          valor: '48',
+          fecha: fecha(-75),
+          nota: 'cita en la fila del reto',
+        }),
+      ),
+    ).toBe(true);
+
+    // 2) El resultado por criterio contra esa misma completación («review en borrador»).
+    expect(
+      await esperaA(filaDelReto, () =>
+        registrarResultado(leadId, {
+          workspaceId: ws,
+          reviewId,
+          criterioId: criterioAbandonoId,
+          snapshotFinalId: null,
+          lectura: '',
+          sinDatosMotivo: 'cita en la fila del reto',
+        }),
+      ),
+    ).toBe(true);
+
+    // El resultado del criterio se deja como estaba: con su snapshot final de la serie.
+    const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const abandono = seg!.entradas.find((e) => e.id === entradaAbandonoId)!;
+    await registrarResultado(leadId, {
+      workspaceId: ws,
+      reviewId,
+      criterioId: criterioAbandonoId,
+      snapshotFinalId: abandono.snapshots.at(-1)!.id,
+      lectura: 'De 62 a 48: mejora sostenida tras el rediseño de la verificación',
+      sinDatosMotivo: '',
+    });
+  });
+
+  it('un resultado no puede traer valor final Y motivo de falta de dato a la vez', async () => {
+    // «Al menos uno» dejaba pasar una fila que se contradice dentro de un post mortem
+    // auditado: un valor final y, al lado, la explicación de que no hay dato. Es una
+    // propiedad de la FILA, así que la impone el CHECK y no la disciplina del formulario.
+    const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const abandono = seg!.entradas.find((e) => e.id === entradaAbandonoId)!;
+    await expect(
+      conUsuario(leadId, (tx) => tx`update resultado_criterio
+        set sin_datos_motivo = 'y además no hay dato'
+        where review_id = ${reviewId} and criterio_id = ${criterioAbandonoId}`),
+    ).rejects.toThrow(/check constraint/);
+    // Y el contrato del schema dice lo mismo antes de llegar a la base.
+    expect(
+      ResultadoCriterioSchema.safeParse({
+        workspaceId: ws,
+        reviewId,
+        criterioId: criterioAbandonoId,
+        snapshotFinalId: abandono.snapshots.at(-1)!.id,
+        lectura: '',
+        sinDatosMotivo: 'no hay dato',
+      }).success,
+    ).toBe(false);
+  });
+
   it('el resultado por criterio se serializa con la completación: mismo candado del reto', async () => {
     // El upsert del resultado y la completación tocan FILAS DISTINTAS, así que ninguna
     // bloquea a la otra por filas: sin candado, este guardado podía evaluar su «solo
@@ -1292,7 +1366,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         fecha: fecha(0),
         nota: 'tardío',
       }),
-    ).rejects.toThrow(/No puedes cargar snapshots/);
+    ).rejects.toThrow(/el reto ya no está en medición/);
     const reabierto = await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'activo'
       where id = ${proyectoId}`);
     expect(reabierto.count).toBe(0);
@@ -1444,6 +1518,37 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         firmar,
       ),
     ).toBe(true);
+
+    // 3) Y la tercera cita del barrido, que necesita un registry todavía en BORRADOR:
+    //    escribir una entrada KPI contra la firma. Sin ella, la firma valida el contrato
+    //    y una entrada en vuelo lo muta justo después de congelarse.
+    expect(
+      await esperaA(
+        (tx) => tx`select 1 from reto
+          where id = ${retoHeredadoId} and workspace_id = ${ws} for update`,
+        () =>
+          agregarEntrada(leadId, {
+            workspaceId: ws,
+            registryId: registryHeredadoId,
+            criterioId: criterioHeredadoId,
+            nombre: 'KPI que llega mientras se firma',
+            definicion: 'x',
+            fuente: 'x',
+            dimensiones: '',
+            propietarioMiembroId: sponsorMiembroId,
+            frecuencia: 'mensual',
+            dashboardUrl: '',
+            lineaBaseValor: '1',
+            lineaBaseFecha: fecha(-200),
+            ventanaInicio: fecha(-3),
+            fechaPostMortem: fecha(40),
+          }),
+      ),
+    ).toBe(true);
+    // Esa entrada entró de verdad (el registry seguía en borrador), así que se retira para
+    // que el test de la firma heredada siga contando una sola.
+    await sqlAdmin()`delete from entrada_kpi
+      where registry_id = ${registryHeredadoId} and nombre = 'KPI que llega mientras se firma'`;
 
     // El rechazo de esos intentos es el del CONTENIDO: la política dejó pasar la firma
     // (G6 heredado) y habló el guard, que es lo que hace válido el bloqueo de arriba.

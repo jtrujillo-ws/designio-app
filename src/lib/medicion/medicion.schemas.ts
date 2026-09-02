@@ -194,8 +194,10 @@ export const ResultadoCriterioSchema = z
     lectura: z.string().trim().max(4000).default(''),
     sinDatosMotivo: z.string().trim().max(1000).default(''),
   })
-  .refine((d) => d.snapshotFinalId !== null || d.sinDatosMotivo !== '', {
-    message: 'Elige el snapshot final o escribe por qué no hay dato',
+  // Exactamente UNA de las dos, espejo del CHECK de la tabla: un resultado que trae valor
+  // final y a la vez la explicación de que no hay dato se contradice a sí mismo.
+  .refine((d) => (d.snapshotFinalId !== null) !== (d.sinDatosMotivo !== ''), {
+    message: 'Elige el snapshot final o escribe por qué no hay dato, pero no las dos cosas',
     path: ['sinDatosMotivo'],
   });
 export type ResultadoCriterioEntrada = z.infer<typeof ResultadoCriterioSchema>;

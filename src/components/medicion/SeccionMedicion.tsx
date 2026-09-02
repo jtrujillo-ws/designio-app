@@ -1113,7 +1113,17 @@ function EditorResultados({
           </option>
         ))}
       </Select>
-      <Select value={snapshotId} onChange={(e) => setSnapshotId(e.target.value)}>
+      {/* Elegir un snapshot BORRA el motivo escrito antes: si no, el campo se ocultaba
+          pero seguía viajando, y el resultado llegaba con valor final y con la explicación
+          de que no hay dato. Ahora eso lo rechazan el schema y el CHECK de la tabla, así
+          que dejarlo en el estado sería enviar a propósito algo que la base rechaza. */}
+      <Select
+        value={snapshotId}
+        onChange={(e) => {
+          setSnapshotId(e.target.value);
+          if (e.target.value !== '') setMotivo('');
+        }}
+      >
         <option value="">Sin dato final (hay que decir por qué)…</option>
         {disponibles.map((s) => (
           <option key={s.id} value={s.id}>

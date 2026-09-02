@@ -215,7 +215,12 @@ create table resultado_criterio (
   foreign key (review_id, workspace_id) references outcome_review (id, workspace_id),
   foreign key (criterio_id, workspace_id) references criterio_exito (id, workspace_id),
   foreign key (snapshot_final_id, workspace_id) references snapshot (id, workspace_id),
-  check (snapshot_final_id is not null or btrim(sin_datos_motivo) <> '')
+  -- O apunta a un snapshot, O explica por qué no hay dato: EXACTAMENTE uno. Con «al menos
+  -- uno» la fila podía traer las dos cosas —un valor final y, a la vez, la explicación de
+  -- que no hay dato— y eso no es un formulario descuidado, es un resultado que se
+  -- contradice a sí mismo dentro de un post mortem auditado. El XOR lo impide aquí porque
+  -- es una propiedad de la FILA, no una disciplina de pantalla.
+  check ((snapshot_final_id is not null) <> (btrim(sin_datos_motivo) <> ''))
 );
 create index resultado_criterio_review_idx on resultado_criterio (workspace_id, review_id);
 
@@ -515,6 +520,103 @@ create policy resultado_update on resultado_criterio
         and e.criterio_id = resultado_criterio.criterio_id))
   );
 
+-- ══ EL PUNTO DE CITA: la fila del RETO ══════════════════════════════════════════════
+-- Todas las políticas de arriba son predicados sobre un SNAPSHOT. Cuando dos escrituras
+-- deciden sobre lo mismo tocando FILAS DISTINTAS, ninguna bloquea a la otra: cada una
+-- evalúa su condición contra un snapshot que no ve a la vecina y las dos commitean. El
+-- resultado es una escritura sobre un mundo que ya no existe.
+--
+-- El barrido de todos los pares del slice —cada escritura contra cada transición ajena—
+-- deja CINCO que necesitan cita, y los cinco cuelgan del reto (el registry es 1:1 con él,
+-- los criterios son suyos, la serie cuelga de sus entradas, el review es 1:1 con él y el
+-- proyecto se cierra con él). Por eso el punto de cita es UNO: la fila del reto. Un candado
+-- por par sería más superficie de interbloqueo y nadie capaz de razonar el orden.
+--
+--   entrada_kpi ↔ firma del registry        · «registry en borrador»   → este guard
+--   snapshot ↔ completación del review      · «reto en medición»       → este guard
+--   resultado_criterio ↔ completación       · «review en borrador»     → este guard
+--   firma del registry ↔ criterio_exito     · «criterio del reto»      → filas del G0
+--   reapertura de etapa ↔ completación      · «proyecto no cerrado»    → fila del proyecto
+--
+-- Los dos últimos ya se citan en una fila más fina y probada; se conservan tal cual porque
+-- se apoyan en bloqueos que ya existían (el de `criterio_g0_pendiente_guard` es del ciclo
+-- del método, no de este slice) y sobreviven mejor a que alguien reemplace esos guards.
+--
+-- ORDEN DE ADQUISICIÓN, en un solo sitio y para todas las rutas:
+--   fila del RETO  →  metric_registry / outcome_review / proyecto / gate_instancia
+-- La fila que la propia sentencia actualiza queda bloqueada antes por PostgreSQL, y
+-- ninguna ruta bloquea dos filas «propias», así que con esta regla no hay ciclo posible.
+-- El candado consultivo del servicio (`designio:reto:`) es el mismo acuerdo un nivel más
+-- arriba; este vale además para el SQL directo, que es donde el servicio no llega.
+create function bloqueo_por_reto_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  -- Guard COMPARTIDO entre tres tablas con columnas distintas: plpgsql resuelve todas las
+  -- referencias de campo aunque su rama no se ejecute, así que la fila se lee por jsonb.
+  fila jsonb := to_jsonb(new);
+  v_reto uuid;
+begin
+  -- Pre-chequeo anti-oráculo, como el resto: la consulta privilegiada solo corre para
+  -- miembros del workspace declarado; a los demás los rechaza la política.
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  -- Por dónde llega cada escritura hasta su reto. Todas estas pertenencias son
+  -- inmutables (ni `registry_id` ni `entrada_kpi_id` ni `review_id` se editan jamás), así
+  -- que resolverlas antes de bloquear no abre ninguna carrera nueva.
+  if tg_table_name = 'entrada_kpi' then
+    select r.reto_id into v_reto from metric_registry r
+      where r.id = (fila->>'registry_id')::uuid and r.workspace_id = new.workspace_id;
+  elsif tg_table_name = 'snapshot' then
+    select r.reto_id into v_reto
+      from entrada_kpi e
+      join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
+      where e.id = (fila->>'entrada_kpi_id')::uuid and e.workspace_id = new.workspace_id;
+  else
+    select o.reto_id into v_reto from outcome_review o
+      where o.id = (fila->>'review_id')::uuid and o.workspace_id = new.workspace_id;
+  end if;
+  -- Sin reto no hay nada que bloquear: la FK y la política dirán que la referencia no
+  -- existe, y decirlo aquí sería adelantarles un diagnóstico que no nos toca.
+  if v_reto is null then
+    return new;
+  end if;
+  perform 1 from reto where id = v_reto and workspace_id = new.workspace_id for update;
+  -- Y AQUÍ está el punto: releer el predicado DESPUÉS de esperar. Cada sentencia de
+  -- plpgsql toma su propio snapshot, así que esta lectura ya ve lo que commiteó quien
+  -- tenía la fila — que es justo lo que la política, atada al snapshot de la sentencia
+  -- externa, no puede ver.
+  if tg_table_name = 'entrada_kpi' then
+    if exists (select 1 from metric_registry r
+      where r.id = (fila->>'registry_id')::uuid and r.workspace_id = new.workspace_id
+        and r.estado <> 'borrador') then
+      raise exception 'el Metric Registry ya está firmado: el contrato quedó congelado (SYS-22)';
+    end if;
+  elsif tg_table_name = 'snapshot' then
+    if not exists (select 1 from reto r
+      where r.id = v_reto and r.workspace_id = new.workspace_id and r.estado = 'en-medicion') then
+      raise exception 'el reto ya no está en medición: su serie se cerró con el post mortem (SYS-08)';
+    end if;
+  else
+    if exists (select 1 from outcome_review o
+      where o.id = (fila->>'review_id')::uuid and o.workspace_id = new.workspace_id
+        and o.estado <> 'borrador') then
+      raise exception 'el outcome review ya está completado: el post mortem es inmutable (SYS-08)';
+    end if;
+  end if;
+  return new;
+end $$;
+create trigger entrada_bloqueo_por_reto
+  before insert or update on entrada_kpi
+  for each row execute function bloqueo_por_reto_guard();
+create trigger snapshot_bloqueo_por_reto
+  before insert on snapshot
+  for each row execute function bloqueo_por_reto_guard();
+create trigger resultado_bloqueo_por_reto
+  before insert or update on resultado_criterio
+  for each row execute function bloqueo_por_reto_guard();
+revoke execute on function bloqueo_por_reto_guard() from public;
+
 -- ── El proyecto gana su transición de estado (hasta ahora sin grant ni política) ──
 -- La abre este slice porque es el que la necesita: G7 mueve el proyecto a medición y el
 -- post-mortem lo cierra. Con el mismo rigor que el reto: rol que opera el método, pares
@@ -643,6 +745,12 @@ begin
   if new.estado = 'firmado' and old.estado = 'borrador' then
     -- El sello temporal lo pone la BASE: un update directo no retro ni post-data la firma.
     new.firmado_en := now();
+    -- El punto de cita del slice, y ANTES de comprobar nada: lo que esta firma va a
+    -- validar —las entradas y los criterios— lo escriben rutas que bloquean esta misma
+    -- fila. Comprobar primero y bloquear después sería validar un contrato y congelar
+    -- otro. Va antes que el bloqueo del G0 para respetar el orden reto → gate.
+    perform 1 from reto where id = new.reto_id and workspace_id = new.workspace_id
+      for update;
     -- Punto de cita con `criterio_g0_pendiente_guard`: LAS MISMAS filas (los G0 del reto),
     -- en el mismo orden. Firmar congela los criterios, pero firmar y editar un criterio
     -- tocan tablas distintas, así que sin este bloqueo la firma valida el criterio VIEJO,
@@ -746,6 +854,12 @@ begin
   end if;
   if new.estado = 'completado' and old.estado = 'borrador' then
     new.completado_en := now();
+    -- El punto de cita, y lo PRIMERO de todo: este guard decide sobre snapshots y
+    -- resultados que otras rutas escriben bloqueando esta misma fila. Si se tomara al
+    -- final —al cerrar el reto— las comprobaciones de abajo ya habrían corrido contra un
+    -- snapshot viejo y el veredicto se dictaría sobre datos que cambiaron mientras tanto.
+    perform 1 from reto where id = new.reto_id and workspace_id = new.workspace_id
+      for update;
     -- RF-07.7 de nuevo aquí (la política ya lo exigió al abrir el review): entre la
     -- apertura y el cierre nadie amplió una ventana, pero el dato manda, no el orden.
     if exists (select 1 from entrada_kpi e

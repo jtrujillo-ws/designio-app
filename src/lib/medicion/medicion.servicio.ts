@@ -194,7 +194,7 @@ export async function agregarEntrada(
             ' una persona del cliente o no puedes editarlo',
         );
       }
-      throw e;
+      comoErrorDeDominio(e);
     }
     if (!fila) throw new ErrorMedicion('El registry está firmado o no puedes editarlo');
     return { entradaId: fila.id as string };
@@ -244,7 +244,7 @@ export async function editarEntrada(actorId: string, entrada: EditarEntrada): Pr
             ' (RF-07.1)',
         );
       }
-      throw e;
+      comoErrorDeDominio(e);
     }
     if (filas.count === 0) {
       throw new ErrorMedicion('El registry está firmado o no puedes editarlo');
@@ -470,7 +470,9 @@ export async function registrarSnapshot(
         select id from nuevo`;
     } catch (e) {
       if (esRechazoDePolitica(e)) throw new ErrorMedicion(RECHAZO_SNAPSHOT);
-      throw e;
+      // El guard del punto de cita habla con su propio motivo (P0001) cuando el reto dejó
+      // de estar en medición mientras esta inserción esperaba la fila.
+      comoErrorDeDominio(e);
     }
     return { snapshotId: fila!.id as string };
   });
@@ -522,7 +524,9 @@ export async function cargarSnapshotsCsv(
         returning id`;
     } catch (e) {
       if (esRechazoDePolitica(e)) throw new ErrorMedicion(RECHAZO_SNAPSHOT);
-      throw e;
+      // El guard del punto de cita habla con su propio motivo (P0001) cuando el reto dejó
+      // de estar en medición mientras esta inserción esperaba la fila.
+      comoErrorDeDominio(e);
     }
     const [quien] = await tx`select workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
     // Un evento por CARGA, no por fila: la decisión auditable es «alguien cargó esta
@@ -717,7 +721,7 @@ export async function registrarResultado(
       // El snapshot final de OTRO criterio, el review ya completado o el rol equivocado:
       // los tres los rechaza la política con el mismo código.
       if (esRechazoDePolitica(e)) throw new ErrorMedicion(RECHAZO_RESULTADO);
-      throw e;
+      comoErrorDeDominio(e);
     }
     if (filas.length === 0) throw new ErrorMedicion(RECHAZO_RESULTADO);
   });

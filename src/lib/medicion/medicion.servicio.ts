@@ -44,10 +44,12 @@ export const MAX_FILAS_CSV = 500;
  * por la ventana firmada sin perder de vista cuál era. */
 type FilaCsv = { linea: number; contenido: string; fecha: string; valor: string; nota: string };
 
-/** Candado por reto — MISMO espacio de nombres que el método (metodo.servicio): cerrar
- * el reto y aceptar snapshots deben serializarse entre sí. Sin él, bajo READ COMMITTED
- * un snapshot podría pasar su política («reto en medición») y commitear DESPUÉS del
- * cierre, escribiendo sobre un objeto cerrado (SYS-08). */
+/** Candado por reto — MISMO espacio de nombres que el método (metodo.servicio). Serializa
+ * todo lo que el cierre del post mortem vuelve historia: aceptar snapshots, escribir el
+ * resultado por criterio y completar el review. Sin él, bajo READ COMMITTED cualquiera de
+ * las dos escrituras pasa su política («reto en medición», «review en borrador») contra un
+ * snapshot anterior al cierre y commitea DESPUÉS, escribiendo sobre un objeto ya cerrado
+ * (SYS-08). Lo toma TODA operación de ese conjunto, antes de su sentencia decisora. */
 async function bloquearReto(tx: TransactionSql, retoId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
 }
@@ -183,7 +185,8 @@ export async function agregarEntrada(
       }
       if (code === '42501') {
         throw new ErrorMedicion(
-          'El registry está firmado, el criterio no es de este reto o no puedes editarlo',
+          'El registry está firmado, el criterio no es de este reto, el dueño del dato no es' +
+            ' una persona del cliente o no puedes editarlo',
         );
       }
       throw e;
@@ -219,6 +222,14 @@ export async function editarEntrada(actorId: string, entrada: EditarEntrada): Pr
       const code = (e as { code?: string }).code;
       if (code === '23505') throw new ErrorMedicion('Ya hay un KPI con ese nombre en el registry');
       if (code === '23503') throw new ErrorMedicion('El propietario del dato no es miembro de este workspace');
+      // Aquí el WITH CHECK solo puede fallar por UNA razón, y por eso el mensaje puede
+      // permitirse ser exacto: el USING ya validó rol y registry en borrador, y ni el
+      // registry ni el criterio de la entrada se editan (son su identidad).
+      if (code === '42501') {
+        throw new ErrorMedicion(
+          'El dueño del dato tiene que ser una persona del cliente (RF-07.1)',
+        );
+      }
       throw e;
     }
     if (filas.count === 0) {
@@ -624,6 +635,22 @@ export async function registrarResultado(
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // MISMO candado que completarOutcomeReview, y por la razón de siempre: una política es
+    // un predicado sobre un snapshot, no un candado. Este upsert y la completación tocan
+    // FILAS DISTINTAS (resultado_criterio / outcome_review), así que ninguna bloquea a la
+    // otra: bajo READ COMMITTED este upsert puede evaluar su «solo borrador» contra un
+    // snapshot anterior a la completación y commitear DESPUÉS. El post mortem quedaría
+    // cerrado, inmutable y firmado sobre una lectura —o un snapshot final— que su propio
+    // trigger de cierre nunca vio: el caso peor es cambiar un resultado a «sin dato» justo
+    // cuando el guard acaba de comprobar que no hay ninguno para admitir un «logrado».
+    // El candado es del RETO (el review es 1:1 con él y lo que se cierra es el reto), y va
+    // ANTES de la sentencia decisora en los dos lados: quien llegue segundo arranca su
+    // snapshot con el resultado del primero ya confirmado y se rechaza limpiamente.
+    // reto_id es inmutable, así que leerlo antes de tomar el candado no abre carrera.
+    const [dueno] = await tx`select reto_id from outcome_review
+      where id = ${entrada.reviewId} and workspace_id = ${entrada.workspaceId}`;
+    if (!dueno) throw new ErrorMedicion('El outcome review no existe en este workspace');
+    await bloquearReto(tx, dueno.reto_id as string);
     // El upsert lo hace explícito el ON CONFLICT: escribir dos veces el resultado de un
     // criterio es corregir el borrador, no duplicarlo.
     let filas;
@@ -738,13 +765,28 @@ export async function seguimientoDeImpacto(
             'diasRestantes', (e.ventana_inicio + c.ventana_dias) - current_date,
             'ultimaFecha', ult.fecha::text,
             -- RF-07.4 sobre el DATO: el estado sale de la cadencia comprometida y de la
-            -- última recepción, no de una marca que alguien pone a mano.
+            -- última recepción, no de una marca que alguien pone a mano. La cadencia corre
+            -- contra hoy solo MIENTRAS la ventana está abierta: una vez cerrada nadie puede
+            -- aportar nada (la política del snapshot rechaza cualquier fecha posterior) y
+            -- el review completado es inmutable, así que seguir avanzando con current_date
+            -- convertiría en «vencido» —por el mero paso del tiempo, y para siempre— todo
+            -- KPI recurrente que cumplió. Cerrada la ventana el estado es TERMINAL y se
+            -- juzga contra su último día.
             'estadoSnapshot', case
+              -- Sin ventana no hay cadencia que juzgar: la firma es quien la exige.
               when e.ventana_inicio is null or c.ventana_dias is null then 'esperado'
+              when e.ventana_inicio + c.ventana_dias < current_date then case
+                -- La ventana entera pasó sin un solo dato: vencido, y ya sin remedio.
+                when ult.fecha is null then 'vencido'
+                -- Recurrente que dejó de aportar ANTES del cierre: la cadencia se
+                -- incumplió dentro de la ventana y eso no lo borra el calendario.
+                when cad.dias is not null
+                     and ult.fecha + cad.dias < e.ventana_inicio + c.ventana_dias
+                  then 'vencido'
+                -- Llegó lo comprometido hasta el final: la medición terminó.
+                else 'cerrado' end
               when cad.dias is null then
-                case when ult.fecha is not null then 'recibido'
-                     when e.ventana_inicio + c.ventana_dias < current_date then 'vencido'
-                     else 'esperado' end
+                case when ult.fecha is not null then 'recibido' else 'esperado' end
               when ult.fecha is null then
                 case when e.ventana_inicio + cad.dias < current_date then 'vencido'
                      else 'esperado' end
@@ -774,10 +816,16 @@ export async function seguimientoDeImpacto(
             and not exists (select 1 from entrada_kpi e
               where e.criterio_id = c.id and e.workspace_id = c.workspace_id)), '[]'::jsonb)
           as criterios_sin_entrada,
+        -- Candidatos a dueño del dato: SOLO el lado cliente (RF-07.1), con el mismo
+        -- predicado que la política de la entrada y el guard de la firma. Ofrecer a un
+        -- curador aquí sería ofrecer lo que la base rechaza, y ese rechazo llegaría —en el
+        -- peor momento posible— como un «no se puede firmar» en G6, delante del cliente.
         coalesce((
           select jsonb_agg(jsonb_build_object('id', m2.id, 'nombre', m2.nombre, 'rol', m2.rol)
             order by m2.nombre)
-          from miembro m2 where m2.workspace_id = r.workspace_id), '[]'::jsonb) as miembros,
+          from miembro m2
+          where m2.workspace_id = r.workspace_id and es_rol_cliente(m2.rol)), '[]'::jsonb)
+          as propietarios_posibles,
         case when orv.id is null then null else jsonb_build_object(
           'id', orv.id, 'estado', orv.estado, 'veredicto', orv.veredicto,
           'contribucion', orv.contribucion, 'factoresExternos', orv.factores_externos,
@@ -811,7 +859,8 @@ export async function seguimientoDeImpacto(
       registry: fila.registry as SeguimientoDeImpacto['registry'],
       entradas: fila.entradas as SeguimientoDeImpacto['entradas'],
       criteriosSinEntrada: fila.criterios_sin_entrada as SeguimientoDeImpacto['criteriosSinEntrada'],
-      miembros: fila.miembros as SeguimientoDeImpacto['miembros'],
+      propietariosPosibles:
+        fila.propietarios_posibles as SeguimientoDeImpacto['propietariosPosibles'],
       review: fila.review as SeguimientoDeImpacto['review'],
     };
   });

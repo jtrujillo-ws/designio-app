@@ -20,6 +20,7 @@ import {
   guardarResultadoDeCriterio,
 } from '@/lib/medicion/medicion.functions';
 import {
+  ETIQUETA_ESTADO_SNAPSHOT,
   ETIQUETA_FRECUENCIA,
   ETIQUETA_VEREDICTO,
   FRECUENCIAS,
@@ -31,7 +32,9 @@ import {
   type SeguimientoDeImpacto,
   type VeredictoSlug,
 } from '@/lib/medicion/medicion.schemas';
+import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import type { ProyectoMetodo } from '@/lib/metodo/metodo.schemas';
+import { ROLES_CLIENTE } from '@/lib/workspace/workspace.schemas';
 
 /**
  * Seguimiento de impacto del reto (SPEC-07). Vive DENTRO del proyecto, no en un módulo
@@ -54,10 +57,14 @@ const micro: CSSProperties = {
   color: 'var(--text-muted)',
 };
 
+/** `cerrado` es terminal y BUENO —llegó lo comprometido y la ventana se acabó—, pero no
+ * es una recepción de hoy: se pinta con el acento y no con el verde de «recibido», que
+ * está reservado a la cadencia viva. */
 const COLOR_ESTADO: Record<EstadoSnapshot, string> = {
   esperado: 'var(--text-muted)',
   recibido: 'var(--ok)',
   vencido: 'var(--danger)',
+  cerrado: 'var(--accent)',
 };
 
 const COLOR_VEREDICTO: Record<VeredictoSlug, string> = {
@@ -337,7 +344,7 @@ function FichaEntrada({
         </span>
         <Tag>{ETIQUETA_FRECUENCIA[entrada.frecuencia]}</Tag>
         <span style={{ font: '600 11.5px var(--font-sans)', color: COLOR_ESTADO[entrada.estadoSnapshot] }}>
-          {entrada.estadoSnapshot}
+          {ETIQUETA_ESTADO_SNAPSHOT[entrada.estadoSnapshot]}
         </span>
         {editable && (
           <Button size="sm" variant="ghost" onClick={onEditar}>
@@ -491,6 +498,9 @@ function FormularioEntrada({
         maxLength={300}
         onChange={(e) => texto('dimensiones')(e.target.value)}
       />
+      {/* El dueño del dato es una persona del CLIENTE (RF-07.1) y el servidor solo manda
+          esas: ofrecer a un curador sería ofrecer lo que la base rechaza — al escribir la
+          entrada y otra vez al firmar el registry, que es el peor momento para enterarse. */}
       <Select
         value={datos.propietarioMiembroId ?? ''}
         onChange={(e) =>
@@ -498,12 +508,19 @@ function FormularioEntrada({
         }
       >
         <option value="">Dueño del dato (persona del cliente)…</option>
-        {seguimiento.miembros.map((m) => (
+        {seguimiento.propietariosPosibles.map((m) => (
           <option key={m.id} value={m.id}>
-            {m.nombre} · {m.rol}
+            {m.nombre} · {ETIQUETA_ROL[m.rol] ?? m.rol}
           </option>
         ))}
       </Select>
+      {seguimiento.propietariosPosibles.length === 0 && (
+        <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+          Todavía no hay nadie del cliente en el workspace (
+          {ROLES_CLIENTE.map((r) => ETIQUETA_ROL[r] ?? r).join(', ')}): sin dueño del dato,
+          el registry no se puede firmar en G6.
+        </span>
+      )}
       <Select
         value={datos.frecuencia}
         onChange={(e) => setDatos((d) => ({ ...d, frecuencia: e.target.value as Frecuencia }))}
@@ -644,7 +661,7 @@ function BloqueSerie({
           {entrada.nombre} · lectura del criterio «{entrada.criterioKpi}»
         </span>
         <span style={{ font: '600 11.5px var(--font-sans)', color: COLOR_ESTADO[entrada.estadoSnapshot] }}>
-          snapshot {entrada.estadoSnapshot}
+          {ETIQUETA_ESTADO_SNAPSHOT[entrada.estadoSnapshot]}
         </span>
         <Tag>
           {entrada.diasRestantes !== null && entrada.diasRestantes > 0

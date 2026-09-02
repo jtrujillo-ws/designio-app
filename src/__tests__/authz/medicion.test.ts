@@ -39,6 +39,8 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
   let sponsorId = '';
   let stakeId = '';
   let sponsorMiembroId = '';
+  let stakeMiembroId = '';
+  let disMiembroId = '';
   let svcId = '';
   let retoId = '';
   let proyectoId = '';
@@ -81,6 +83,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
 
     const personas = [
       ['lead', 'lead-boutique'],
+      ['dis', 'disenador'],
       ['sponsor', 'sponsor'],
       ['stake', 'stakeholder'],
     ] as const;
@@ -94,7 +97,10 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       const [m] = await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
         values (${ws}, ${id}, ${alias}, ${`${marca}-${alias}@test.demo`}, ${rol}) returning id`;
       // El propietario del DATO es una persona del cliente (RF-07.1): aquí, el sponsor.
+      // El diseñador está para probar justamente que la boutique NO puede serlo.
       if (alias === 'sponsor') sponsorMiembroId = m!.id as string;
+      if (alias === 'stake') stakeMiembroId = m!.id as string;
+      if (alias === 'dis') disMiembroId = m!.id as string;
     }
 
     const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
@@ -347,6 +353,111 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
       /post-mortem antes del cierre de la ventana/,
     );
+    await editarEntrada(leadId, {
+      workspaceId: ws,
+      entradaId: entradaReintentosId,
+      nombre: 'Reintentos medios',
+      definicion: 'Media de intentos por solicitud completada',
+      fuente: 'Log de verificación',
+      dimensiones: '',
+      propietarioMiembroId: sponsorMiembroId,
+      frecuencia: 'semanal',
+      dashboardUrl: '',
+      lineaBaseValor: '2.4',
+      lineaBaseFecha: fecha(-120),
+      ventanaInicio: fecha(-5),
+      fechaPostMortem: fecha(90),
+    });
+  });
+
+  it('el dueño del dato es una PERSONA DEL CLIENTE: al escribir la entrada y al firmar', async () => {
+    // El compromiso del dato es del cliente (RF-07.1, §8.1): con un lead o un diseñador
+    // como dueño, el registry firmado dice que la boutique se compromete consigo misma a
+    // transcribir — exactamente lo que G6 existe para sustituir.
+    const admin = sqlAdmin();
+
+    // 1) El servidor no OFRECE lo que la base rechaza: el selector del seguimiento trae
+    //    solo el lado cliente, así que el error normal ni se puede cometer.
+    const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    expect(seg!.propietariosPosibles.map((m) => m.rol).sort()).toEqual(['sponsor', 'stakeholder']);
+    expect(seg!.propietariosPosibles.some((m) => m.id === disMiembroId)).toBe(false);
+
+    // 2) Y si se pide igualmente, la política de la entrada dice que no — al crear…
+    await expect(
+      agregarEntrada(leadId, {
+        workspaceId: ws,
+        registryId,
+        criterioId: criterioAbandonoId,
+        nombre: 'KPI con dueño de la boutique',
+        definicion: 'x',
+        fuente: 'x',
+        dimensiones: '',
+        propietarioMiembroId: disMiembroId,
+        frecuencia: 'mensual',
+        dashboardUrl: '',
+        lineaBaseValor: '1',
+        lineaBaseFecha: fecha(-120),
+        ventanaInicio: fecha(-10),
+        fechaPostMortem: fecha(40),
+      }),
+    ).rejects.toThrow(/dueño del dato/);
+    // …y al editar (aquí el rechazo solo puede ser este: el USING ya validó rol y
+    // borrador, y el criterio de la entrada no se edita).
+    await expect(
+      editarEntrada(leadId, {
+        workspaceId: ws,
+        entradaId: entradaReintentosId,
+        nombre: 'Reintentos medios',
+        definicion: 'Media de intentos por solicitud completada',
+        fuente: 'Log de verificación',
+        dimensiones: '',
+        propietarioMiembroId: disMiembroId,
+        frecuencia: 'semanal',
+        dashboardUrl: '',
+        lineaBaseValor: '2.4',
+        lineaBaseFecha: fecha(-120),
+        ventanaInicio: fecha(-5),
+        fechaPostMortem: fecha(90),
+      }),
+    ).rejects.toThrow(/persona del cliente/);
+    // Y por SQL directo tampoco: quien manda es el WITH CHECK, no el mensaje.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update entrada_kpi
+        set propietario_miembro_id = ${disMiembroId} where id = ${entradaAbandonoId}`),
+    ).rejects.toThrow(/row-level security/);
+    const [intacto] = await conUsuario(leadId, (tx) => tx`select propietario_miembro_id
+      from entrada_kpi where id = ${entradaAbandonoId}`);
+    expect(intacto!.propietario_miembro_id).toBe(sponsorMiembroId);
+
+    // 3) La firma lo vuelve a exigir, y no por redundancia: la entrada guarda una
+    //    REFERENCIA al miembro, no una copia de su rol, y entre redactar el registry y
+    //    firmarlo en G6 pasan semanas. Aquí se simula que la persona comprometida cambió
+    //    de lado en ese intervalo: lo que el contrato afirma es lo que sea cierto cuando
+    //    se congela, así que el guard lo comprueba en ese momento y no antes.
+    await editarEntrada(leadId, {
+      workspaceId: ws,
+      entradaId: entradaReintentosId,
+      nombre: 'Reintentos medios',
+      definicion: 'Media de intentos por solicitud completada',
+      fuente: 'Log de verificación',
+      dimensiones: '',
+      propietarioMiembroId: stakeMiembroId,
+      frecuencia: 'semanal',
+      dashboardUrl: '',
+      lineaBaseValor: '2.4',
+      lineaBaseFecha: fecha(-120),
+      ventanaInicio: fecha(-5),
+      fechaPostMortem: fecha(90),
+    });
+    await admin`update miembro set rol = 'disenador' where id = ${stakeMiembroId}`;
+    try {
+      await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
+        /persona del cliente \(RF-07\.1\): Reintentos medios/,
+      );
+    } finally {
+      await admin`update miembro set rol = 'stakeholder' where id = ${stakeMiembroId}`;
+    }
+    // Se devuelve el compromiso al sponsor, que es quien lo sostiene en el resto del ciclo.
     await editarEntrada(leadId, {
       workspaceId: ws,
       entradaId: entradaReintentosId,
@@ -715,6 +826,48 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(abandono.snapshots.map((s) => s.valor)).toEqual(['55', '52', '46', '49']);
   });
 
+  it('cerrada la ventana, la cadencia deja de correr: lo que cumplió no vence por calendario', async () => {
+    // La ventana de «Reintentos medios» es [-100, -40] y la frecuencia comprometida es
+    // SEMANAL. Los dos snapshots entran por el camino normal: caen dentro de la ventana
+    // firmada y el reto sigue midiendo.
+    const seguido = async () =>
+      (await seguimientoDeImpacto(leadId, ws, proyectoId))!.entradas.find(
+        (e) => e.id === entradaReintentosId,
+      )!;
+
+    // Un solo dato al principio y nada más: la cadencia se incumplió DENTRO de la ventana
+    // y eso no lo borra el calendario — sigue vencido, y para siempre.
+    await registrarSnapshot(leadId, {
+      workspaceId: ws,
+      entradaId: entradaReintentosId,
+      valor: '2.3',
+      fecha: fecha(-95),
+      nota: '',
+    });
+    const aMedias = await seguido();
+    expect(aMedias.diasRestantes).toBeLessThanOrEqual(0);
+    expect(aMedias.estadoSnapshot).toBe('vencido');
+
+    // Y ahora un dato pegado al cierre de la ventana: se aportó lo comprometido hasta el
+    // final. El estado es TERMINAL, no «vencido»: comparar la próxima fecha prevista
+    // (-42 + 7 = -35) contra HOY la deja atrás por 35 días y marcaría vencido todo KPI
+    // recurrente cumplido, en un proyecto que ya es historia y donde la política rechaza
+    // cualquier snapshot posterior. Se compara contra el FIN de la ventana (-40).
+    await registrarSnapshot(leadId, {
+      workspaceId: ws,
+      entradaId: entradaReintentosId,
+      valor: '1.6',
+      fecha: fecha(-42),
+      nota: 'último corte de la ventana',
+    });
+    const alCierre = await seguido();
+    expect(alCierre.ultimaFecha).toBe(fecha(-42));
+    expect(alCierre.estadoSnapshot).toBe('cerrado');
+    // «Cerrado» dice que la medición TERMINÓ habiendo llegado lo comprometido, no solo que
+    // terminó: este mismo KPI, con la ventana ya cerrada y sin un solo dato, se leyó
+    // «vencido» en el test anterior — y con razón, porque ya no puede llegar ninguno.
+  });
+
   it('el resultado por criterio apunta a un snapshot REAL de SU criterio o dice por qué falta', async () => {
     const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
     const abandono = seg!.entradas.find((e) => e.id === entradaAbandonoId)!;
@@ -751,13 +904,53 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       criterioId: criterioReintentosId,
       snapshotFinalId: null,
       lectura: '',
-      sinDatosMotivo: 'El cliente no aportó el log de verificación durante la ventana',
+      sinDatosMotivo:
+        'La serie del log llegó a medias: ningún corte comparable con la línea base al cierre',
     });
 
     const stake = await seguimientoDeImpacto(stakeId, ws, proyectoId);
     expect(stake!.review!.resultados.length).toBe(2);
     expect(stake!.review!.resultados.find((r) => r.criterioId === criterioAbandonoId)!.valorFinal)
       .toBe('49');
+  });
+
+  it('el resultado por criterio se serializa con la completación: mismo candado del reto', async () => {
+    // El upsert del resultado y la completación tocan FILAS DISTINTAS, así que ninguna
+    // bloquea a la otra por filas: sin candado, este guardado podía evaluar su «solo
+    // borrador» contra un snapshot anterior al cierre y commitear DESPUÉS, dejando el post
+    // mortem firmado sobre una lectura que su propio trigger jamás vio. Se comprueba que
+    // registrarResultado toma de verdad el candado del reto —el mismo que toma
+    // completarOutcomeReview— reteniéndolo desde otra sesión: si no lo tomara, terminaría
+    // de inmediato en vez de esperar a que se suelte.
+    const admin = sqlAdmin();
+    let soltado = false;
+    const reteniendo = admin.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      soltado = true;
+    });
+    const esperoAlCandado = registrarResultado(leadId, {
+      workspaceId: ws,
+      reviewId,
+      criterioId: criterioAbandonoId,
+      snapshotFinalId: null,
+      lectura: 'edición concurrente del borrador',
+      sinDatosMotivo: 'se corrige a continuación',
+    }).then(() => soltado);
+    expect(await esperoAlCandado).toBe(true);
+    await reteniendo;
+
+    // Y se deja el resultado del criterio como estaba: con su snapshot final de la serie.
+    const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const abandono = seg!.entradas.find((e) => e.id === entradaAbandonoId)!;
+    await registrarResultado(leadId, {
+      workspaceId: ws,
+      reviewId,
+      criterioId: criterioAbandonoId,
+      snapshotFinalId: abandono.snapshots.at(-1)!.id,
+      lectura: 'De 62 a 49: mejora sostenida tras el rediseño de la verificación',
+      sinDatosMotivo: '',
+    });
   });
 
   it('el veredicto es del catálogo cerrado, honesto con los datos y exige justificar la causalidad', async () => {

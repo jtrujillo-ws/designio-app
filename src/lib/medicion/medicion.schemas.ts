@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 import { VeredictoSchema } from '@/lib/metodo/metodo.schemas';
+import type { RolCliente } from '@/lib/workspace/workspace.schemas';
 
 /** CTX-06 Medición e Impacto — Metric Registry, snapshots append-only y outcome review (ADR-0007). */
 
@@ -55,9 +56,9 @@ export const ETIQUETA_FRECUENCIA: Record<Frecuencia, string> = {
   unica: 'Única',
 };
 
-/** Cadencia comprometida en días: de ella sale «esperado / recibido / vencido»
- * (RF-07.4). Espejo EXACTO del CASE de la proyección — la única fuente de verdad del
- * estado es el servidor; esto documenta y etiqueta. `unica` no tiene cadencia. */
+/** Cadencia comprometida en días: de ella sale el estado de recepción del KPI (RF-07.4).
+ * Espejo EXACTO del CASE de la proyección — la única fuente de verdad del estado es el
+ * servidor; esto documenta y etiqueta. `unica` no tiene cadencia. */
 export const CADENCIA_DIAS: Record<Frecuencia, number | null> = {
   semanal: 7,
   mensual: 30,
@@ -65,8 +66,23 @@ export const CADENCIA_DIAS: Record<Frecuencia, number | null> = {
   unica: null,
 };
 
-export const ESTADOS_SNAPSHOT = ['esperado', 'recibido', 'vencido'] as const;
+/**
+ * Estado de recepción del KPI (RF-07.4). Los tres primeros describen una medición VIVA:
+ * la cadencia comprometida corre contra hoy. `cerrado` es el estado TERMINAL de un KPI
+ * que cumplió: la ventana firmada se acabó y llegó todo lo que se esperaba. Existe porque
+ * la ventana es acotada (I5) y después de ella la política rechaza cualquier snapshot: sin
+ * un estado propio, cada KPI recurrente cumplido acababa marcado «vencido» por el simple
+ * paso del tiempo sobre un proyecto que ya es historia.
+ */
+export const ESTADOS_SNAPSHOT = ['esperado', 'recibido', 'vencido', 'cerrado'] as const;
 export type EstadoSnapshot = (typeof ESTADOS_SNAPSHOT)[number];
+
+export const ETIQUETA_ESTADO_SNAPSHOT: Record<EstadoSnapshot, string> = {
+  esperado: 'Snapshot esperado',
+  recibido: 'Snapshot recibido',
+  vencido: 'Snapshot vencido',
+  cerrado: 'Medición cerrada',
+};
 
 export const ORIGENES_SNAPSHOT = ['formulario', 'csv'] as const;
 export type OrigenSnapshot = (typeof ORIGENES_SNAPSHOT)[number];
@@ -276,8 +292,11 @@ export type SeguimientoDeImpacto = {
   entradas: EntradaDeRegistry[];
   /** Criterios del reto sin KPI que los responda: la firma los exige (SYS-22). */
   criteriosSinEntrada: { id: string; kpi: string }[];
-  /** Miembros del workspace: entre ellos se elige el propietario del dato. */
-  miembros: { id: string; nombre: string; rol: string }[];
+  /** Candidatos a propietario del dato: SOLO los miembros del lado cliente (RF-07.1). No
+   * es «los miembros del workspace» filtrados por conveniencia de pantalla — es la misma
+   * lista que la política de la entrada y el guard de la firma exigen, así que ofrecer
+   * aquí a un curador sería ofrecer algo que la base rechaza. */
+  propietariosPosibles: { id: string; nombre: string; rol: RolCliente }[];
   review: OutcomeReviewDeReto | null;
 };
 

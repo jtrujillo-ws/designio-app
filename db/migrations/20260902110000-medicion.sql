@@ -17,6 +17,21 @@
 -- compuesta contra miembro, que hasta ahora no tenía la unique que eso exige.
 alter table miembro add constraint miembro_id_ws_unico unique (id, workspace_id);
 
+-- …y «del cliente» es una partición REAL del catálogo de roles (§13.2): sponsor,
+-- stakeholder y admin-cliente son la organización que aporta el dato; lead-boutique y
+-- disenador son quienes la acompañan, y agente-ai no es una persona. La lista vive en UNA
+-- función y no repetida en cada política y guard que la necesita, por el mismo motivo por
+-- el que el registry no copia `ventana_dias`: dos copias serían dos verdades y bastaría
+-- olvidar una para que la promesa se deshiciera en silencio. Se define aquí —y no en la
+-- migración del workspace, que ya está desplegada— porque las migraciones son forward-only.
+--
+-- NO es SECURITY DEFINER ni necesita revoke: es un predicado sobre su propio argumento,
+-- no lee ninguna tabla y por tanto no puede volverse oráculo de nada. Los helpers que sí
+-- consultan por encima de RLS (app_user_id, workspace_role…) son los que se revocan.
+create function es_rol_cliente(p_rol text) returns boolean
+language sql immutable parallel safe as
+$$ select p_rol in ('sponsor', 'stakeholder', 'admin-cliente') $$;
+
 -- ── El veredicto vive en el reto (SYS-24) ──
 -- Catálogo CERRADO en el propio CHECK: ni un bug de la app ni SQL directo inventan un
 -- quinto valor. Los slugs son la codificación de base; el vocabulario canónico
@@ -101,7 +116,9 @@ create table entrada_kpi (
   fuente text not null default '',
   -- Cortes/dimensiones del KPI (RF-07.1): texto libre, no un modelo analítico.
   dimensiones text not null default '',
-  -- Persona del CLIENTE que se compromete a aportar el dato (RF-07.4).
+  -- Persona del CLIENTE que se compromete a aportar el dato (RF-07.1/07.4). Que sea del
+  -- cliente no lo puede exigir un CHECK —el rol vive en otra tabla— y por eso lo exigen
+  -- la política de la entrada al escribir y el guard de la firma al congelar el contrato.
   propietario_miembro_id uuid,
   frecuencia text not null check (frecuencia in ('semanal', 'mensual', 'trimestral', 'unica')),
   dashboard_url text not null default '',
@@ -205,7 +222,8 @@ create index resultado_criterio_review_idx on resultado_criterio (workspace_id, 
 -- ── RLS ──
 -- Lectura: TODO miembro (ver el tablero completo es el punto del portal; el stakeholder
 -- lee el impacto aunque no escriba nada). Escrituras:
---  · registry/entradas — curadores (lead/diseñador) mientras el registry es borrador.
+--  · registry/entradas — curadores (lead/diseñador) mientras el registry es borrador, y
+--    con el dueño del dato del lado CLIENTE (RF-07.1) o todavía sin asignar.
 --  · firma del registry — SOLO el rol aprobador de G6 (sponsor, §13.2) y solo en G6:
 --    con G0-G5 aprobados y G6 aún pendiente. Firmado ⇒ congelado (ninguna política
 --    alcanza sus filas).
@@ -285,6 +303,14 @@ create policy entrada_insert on entrada_kpi
       join criterio_exito c on c.reto_id = r.reto_id and c.workspace_id = r.workspace_id
       where r.id = entrada_kpi.registry_id and r.workspace_id = entrada_kpi.workspace_id
         and c.id = entrada_kpi.criterio_id)
+    -- RF-07.1: el dueño del dato es una persona del CLIENTE. Se acepta ausente —la entrada
+    -- se redacta iterando y la completitud la exige la firma—, pero no de la boutique: un
+    -- registry con un lead como dueño del dato convierte el compromiso del cliente en la
+    -- transcripción que G6 existe justamente para sustituir. Va en la política y no solo
+    -- en el selector porque el selector es una sugerencia y esto es el contrato.
+    and (entrada_kpi.propietario_miembro_id is null or exists (select 1 from miembro m
+      where m.id = entrada_kpi.propietario_miembro_id
+        and m.workspace_id = entrada_kpi.workspace_id and es_rol_cliente(m.rol)))
   );
 create policy entrada_update on entrada_kpi
   for update
@@ -300,11 +326,14 @@ create policy entrada_update on entrada_kpi
       join criterio_exito c on c.reto_id = r.reto_id and c.workspace_id = r.workspace_id
       where r.id = entrada_kpi.registry_id and r.workspace_id = entrada_kpi.workspace_id
         and c.id = entrada_kpi.criterio_id)
+    and (entrada_kpi.propietario_miembro_id is null or exists (select 1 from miembro m
+      where m.id = entrada_kpi.propietario_miembro_id
+        and m.workspace_id = entrada_kpi.workspace_id and es_rol_cliente(m.rol)))
   );
 
--- Snapshots: quien tiene el dato lo aporta. El propietario del dato es normalmente del
--- CLIENTE (sponsor, stakeholder, admin-cliente): sin esta rama, medir dependería de que
--- la boutique transcriba, que es justo el compromiso que G6 formaliza.
+-- Snapshots: quien tiene el dato lo aporta. El propietario del dato es SIEMPRE del cliente
+-- (RF-07.1, exigido al escribir la entrada y al firmar): sin esta rama, medir dependería
+-- de que la boutique transcriba, que es justo el compromiso que G6 formaliza.
 create policy snapshot_insert on snapshot
   for insert with check (
     creado_por = app_user_id()
@@ -559,6 +588,20 @@ begin
            or e.fecha_post_mortem is null);
     if faltan is not null then
       raise exception 'no se puede firmar: entradas incompletas (SYS-22): %', faltan;
+    end if;
+    -- Y ese dueño es una persona del CLIENTE (RF-07.1, §8.1): el bloque anterior exige un
+    -- id no nulo, que no dice de QUIÉN es. La política de la entrada ya lo impide al
+    -- ESCRIBIR; volver a exigirlo aquí no es redundancia sino la regla que corresponde a
+    -- este punto. La entrada guarda una REFERENCIA al miembro, no una copia de su rol, y
+    -- entre redactar el registry y firmarlo en G6 pasan semanas: lo que el contrato afirma
+    -- es lo que sea cierto en el momento en que se congela, y ese momento es este.
+    select string_agg(e.nombre, ', ' order by e.nombre) into faltan
+    from entrada_kpi e
+    join miembro m on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
+    where e.registry_id = new.id and e.workspace_id = new.workspace_id
+      and not es_rol_cliente(m.rol);
+    if faltan is not null then
+      raise exception 'no se puede firmar: el propietario del dato tiene que ser una persona del cliente (RF-07.1): %', faltan;
     end if;
     -- El post-mortem se prevé DESPUÉS del cierre de la ventana: fecharlo antes sería
     -- comprometerse a un veredicto sobre datos que aún no existen.

@@ -17,6 +17,15 @@ const sql = postgres(url, { max: 1, onnotice: () => {} });
 const MIGRATIONS_DIR = join(import.meta.dir, 'migrations');
 
 async function main() {
+  // La credencial del rol de aplicación es obligatoria en producción en CADA arranque,
+  // no solo cuando el rol se crea: sin ella DATABASE_URL_APP no puede componerse y el
+  // deploy debe frenar aquí (el healthcheck además verifica que la conexión autentique).
+  if (!process.env.APP_DB_PASSWORD && process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'Falta APP_DB_PASSWORD: obligatoria en producción en cada arranque (compone DATABASE_URL_APP)',
+    );
+  }
+
   await sql`create table if not exists schema_migrations (
     id text primary key,
     aplicado_en timestamptz not null default now()

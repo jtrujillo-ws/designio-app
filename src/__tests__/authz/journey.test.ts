@@ -7,6 +7,7 @@ import {
   borrarNodo,
   congelarSnapshot,
   crearJourney,
+  desenlazarEvidenciaDeNodo,
   editarNodo,
   enlazarEvidenciaANodo,
   ErrorJourney,
@@ -75,6 +76,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     await admin`update journey_nodo set fase_id = null where workspace_id = ${ws}`;
     await admin`delete from journey_nodo where workspace_id = ${ws}`;
     await admin`delete from journey where workspace_id = ${ws}`;
+    await admin`delete from catalogo_journey where workspace_id = ${ws}`;
     await admin`delete from evidencia where workspace_id = ${ws}`;
     await admin`delete from fuente where workspace_id = ${ws}`;
     await admin`delete from servicio where workspace_id = ${ws}`;
@@ -370,6 +372,79 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     const j2 = await journeyCompleto(leadId, ws, journeyId);
     expect(j2!.snapshots).toHaveLength(2);
     expect(j2!.nodos.find((n) => n.id === pasoId)!.etiqueta).toBe('Abre la app (revisado)');
+  });
+
+  it('las entidades comparten identidad de catálogo entre journeys; renombrarlas renombra en todas partes', async () => {
+    // El MISMO sistema en dos journeys distintos: la promesa del grafo tipado es poder
+    // preguntar «qué pasos dependen del sistema X», y con texto libre eso es comparar
+    // cadenas —y renombrarlo crearía una identidad nueva.
+    const enUno = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'sistema',
+      etiqueta: 'Core bancario',
+      detalle: '',
+      faseId: null,
+      responsable: 'Tecnología',
+    });
+    const enOtro = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId: otroJourneyId,
+      tipo: 'sistema',
+      etiqueta: 'Core bancario',
+      detalle: '',
+      faseId: null,
+      responsable: 'Tecnología',
+    });
+
+    const j1 = await journeyCompleto(leadId, ws, journeyId);
+    const j2 = await journeyCompleto(leadId, ws, otroJourneyId);
+    const cat1 = j1!.nodos.find((n) => n.id === enUno.nodoId)!.catalogoId;
+    const cat2 = j2!.nodos.find((n) => n.id === enOtro.nodoId)!.catalogoId;
+    expect(cat1).toBeTruthy();
+    expect(cat1).toBe(cat2);
+
+    // Renombrar en un journey renombra la entidad, no solo esa aparición.
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: enUno.nodoId,
+      etiqueta: 'Core bancario (T24)',
+      detalle: '',
+      faseId: null,
+      responsable: 'Tecnología',
+      orden: 0,
+    });
+    const [cat] = await conUsuario(leadId, (tx) => tx`
+      select nombre from catalogo_journey where id = ${cat1}`);
+    expect(cat!.nombre).toBe('Core bancario (T24)');
+
+    // Un paso NO lleva catálogo: existe dentro de su journey y no se comparte.
+    expect(j1!.nodos.find((n) => n.tipo === 'paso')!.catalogoId).toBeNull();
+  });
+
+  it('quitar un enlace de evidencia no obliga a borrar el nodo entero', async () => {
+    const conEnlace = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId,
+      tipo: 'paso',
+      etiqueta: 'Paso con evidencia mal enlazada',
+      detalle: '',
+      faseId,
+      responsable: '',
+    });
+    await enlazarEvidenciaANodo(leadId, ws, conEnlace.nodoId, evidenciaId);
+    const antes = await journeyCompleto(leadId, ws, journeyId);
+    expect(antes!.nodos.find((n) => n.id === conEnlace.nodoId)!.evidencias).toHaveLength(1);
+
+    await desenlazarEvidenciaDeNodo(leadId, ws, conEnlace.nodoId, evidenciaId);
+    const despues = await journeyCompleto(leadId, ws, journeyId);
+    expect(despues!.nodos.find((n) => n.id === conEnlace.nodoId)!.evidencias).toEqual([]);
+    // El nodo sigue ahí: corregir un enlace no cuesta el paso ni sus aristas.
+    expect(despues!.nodos.some((n) => n.id === conEnlace.nodoId)).toBe(true);
+
+    await expect(
+      desenlazarEvidenciaDeNodo(leadId, ws, conEnlace.nodoId, evidenciaId),
+    ).rejects.toThrow(ErrorJourney);
   });
 
   it('quien no es miembro no ve el grafo; la cuenta desactivada tampoco lee', async () => {

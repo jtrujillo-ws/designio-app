@@ -154,12 +154,26 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
     salidas.set(a.origenId, [...(salidas.get(a.origenId) ?? []), a.destinoId]);
   }
   const alcanzables = new Set<string>();
-  const pendientes = primeroId ? [primeroId] : [];
+  // Además de si se llega, se recuerda si se llegó PASANDO POR UNA BIFURCACIÓN: un paso
+  // al que solo se llega tras una bifurcación es un desenlace legítimo de esa rama y no
+  // le falta salida. Sin esto, un `A → B` y `A → C` con dos finales reporta uno de los
+  // dos como roto, que es un journey perfectamente normal.
+  const trasBifurcacion = new Set<string>();
+  const pendientes: { id: string; bifurcado: boolean }[] = primeroId
+    ? [{ id: primeroId, bifurcado: false }]
+    : [];
   while (pendientes.length > 0) {
-    const actual = pendientes.pop()!;
-    if (alcanzables.has(actual)) continue;
+    const { id: actual, bifurcado } = pendientes.pop()!;
+    const yaVisto = alcanzables.has(actual);
+    // Se revisita solo si aporta información nueva (llegar tras una bifurcación cuando
+    // antes no se había llegado así): el recorrido termina igual.
+    if (yaVisto && (!bifurcado || trasBifurcacion.has(actual))) continue;
     alcanzables.add(actual);
-    for (const siguiente of salidas.get(actual) ?? []) pendientes.push(siguiente);
+    if (bifurcado) trasBifurcacion.add(actual);
+    const siguientes = salidas.get(actual) ?? [];
+    for (const siguiente of siguientes) {
+      pendientes.push({ id: siguiente, bifurcado: bifurcado || siguientes.length > 1 });
+    }
   }
 
   for (const paso of pasos) {
@@ -183,8 +197,9 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
           : 'Ninguna transición llega a este paso: es inalcanzable',
       });
     }
-    // El último tampoco necesita salida: el journey termina en algún lado.
-    if (!conSalida.has(paso.id) && paso.id !== ultimoId) {
+    // No necesitan salida ni el último de la secuencia ni los desenlaces de una
+    // bifurcación: el journey termina en algún lado, y con ramas termina en varios.
+    if (!conSalida.has(paso.id) && paso.id !== ultimoId && !trasBifurcacion.has(paso.id)) {
       senales.push({
         codigo: 'paso-sin-salida',
         severidad: 'media',

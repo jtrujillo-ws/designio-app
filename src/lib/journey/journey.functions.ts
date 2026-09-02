@@ -21,6 +21,7 @@ import {
   congelarSnapshot,
   crearJourney,
   editarNodo,
+  desenlazarEvidenciaDeNodo,
   enlazarEvidenciaANodo,
   ErrorJourney,
   journeyCompleto,
@@ -163,6 +164,21 @@ export const enlazarEvidenciaAlNodo = createServerFn({ method: 'POST' })
     if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
     try {
       await enlazarEvidenciaANodo(actorId, data.workspaceId, data.nodoId, data.evidenciaId);
+      return { ok: true as const };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+export const desenlazarEvidenciaDelNodo = createServerFn({ method: 'POST' })
+  .inputValidator(EnlazarEvidenciaNodoSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await desenlazarEvidenciaDeNodo(actorId, data.workspaceId, data.nodoId, data.evidenciaId);
       return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);

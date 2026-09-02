@@ -66,8 +66,8 @@ export const ETIQUETA_TIPO_ARISTA: Record<TipoArista, string> = {
 export const EXTREMOS_ARISTA: Record<TipoArista, { origen: TipoNodo[]; destino: TipoNodo[] }> = {
   transicion: { origen: ['paso', 'decision'], destino: ['paso', 'decision'] },
   dependencia: {
-    origen: ['paso', 'accion-frontstage', 'accion-backstage', 'sistema'],
-    destino: ['paso', 'accion-frontstage', 'accion-backstage', 'sistema'],
+    origen: ['paso', 'accion-frontstage', 'accion-backstage', 'sistema', 'oportunidad'],
+    destino: ['paso', 'accion-frontstage', 'accion-backstage', 'sistema', 'friccion'],
   },
   'ocurre-en': { origen: ['paso', 'accion-frontstage'], destino: ['canal', 'touchpoint'] },
   participa: {
@@ -159,10 +159,24 @@ export const JourneysInputSchema = z.object({ workspaceId: z.string().uuid() });
 
 // ── Proyecciones de lectura ──
 
+/** Los tipos que SON entidades del workspace y por tanto llevan identidad de catálogo:
+ * el mismo sistema aparece en el as-is y en el to-be, y renombrarlo debe renombrarlo en
+ * los dos. Un paso o una fricción viven dentro de su journey y no se comparten. */
+export const TIPOS_CON_CATALOGO: TipoNodo[] = [
+  'touchpoint',
+  'canal',
+  'actor',
+  'arquetipo',
+  'sistema',
+];
+
 export type NodoDeJourney = {
   id: string;
   tipo: TipoNodo;
   etiqueta: string;
+  /** Id de catálogo cuando el tipo lo lleva: es lo que permite preguntar «qué pasos de
+   * qué journeys dependen de este sistema» sin comparar cadenas. */
+  catalogoId: string | null;
   detalle: string;
   faseId: string | null;
   orden: number;

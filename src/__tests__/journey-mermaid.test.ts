@@ -22,6 +22,7 @@ function nodo(parcial: Partial<NodoDeJourney> & Pick<NodoDeJourney, 'tipo' | 'et
   return {
     id: id(),
     detalle: '',
+    catalogoId: null,
     faseId: null,
     orden: 0,
     responsable: '',
@@ -191,6 +192,24 @@ describe('validarJourney', () => {
     // Y el mensaje distingue el caso: tienen entrada, pero no camino.
     expect(senales.find((s) => s.nodoId === c.id && s.codigo === 'paso-inalcanzable')!.mensaje)
       .toContain('no se llega hasta él desde el inicio');
+  });
+
+  it('una bifurcación puede terminar en varios desenlaces sin señal falsa', () => {
+    const ev = [{ id: id(), titulo: 'E' }];
+    const fase = nodo({ tipo: 'fase', etiqueta: 'F', orden: 0 });
+    const a = nodo({ tipo: 'paso', etiqueta: 'Verifica', orden: 0, faseId: fase.id, evidencias: ev });
+    const b = nodo({ tipo: 'paso', etiqueta: 'Aprobado', orden: 1, faseId: fase.id, evidencias: ev });
+    const c = nodo({ tipo: 'paso', etiqueta: 'Rechazado', orden: 2, faseId: fase.id, evidencias: ev });
+    // A bifurca: B y C son los dos desenlaces legítimos de la rama. Antes, solo el
+    // último por secuencia quedaba exento y el otro salía como «sin salida».
+    const senales = validarJourney(
+      journey(
+        [fase, a, b, c],
+        [arista(a, b, 'transicion', 'documento válido'), arista(a, c, 'transicion', 'documento inválido')],
+      ),
+    );
+
+    expect(senales).toEqual([]);
   });
 
   it('la acción frontstage sin soporte backstage es señal alta', () => {

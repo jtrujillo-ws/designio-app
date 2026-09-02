@@ -9,6 +9,7 @@ import { Tabs } from '@/components/ui/Tabs';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
+import { DiagramaMermaid } from '@/components/journey/DiagramaMermaid';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
@@ -17,6 +18,7 @@ import {
   borrarAristaDelJourney,
   borrarNodoDelJourney,
   congelarSnapshotDelJourney,
+  desenlazarEvidenciaDelNodo,
   editarNodoDelJourney,
   enlazarEvidenciaAlNodo,
   journeyDelWorkspace,
@@ -550,6 +552,20 @@ function FilaNodo({
     }
   }
 
+  async function quitarEvidencia(evidenciaId: string) {
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await desenlazarEvidenciaDelNodo({
+        data: { workspaceId, nodoId: nodo.id, evidenciaId },
+      });
+      if (r.ok) await onCambio();
+      else onError(r.error);
+    } finally {
+      setOcupado(false);
+    }
+  }
+
   async function enlazar() {
     setOcupado(true);
     onError(null);
@@ -596,12 +612,54 @@ function FilaNodo({
           {nodo.detalle}
         </span>
       )}
-      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
-        Responsable: {nodo.responsable || '—'} · Evidencia:{' '}
-        {nodo.evidencias.length > 0
-          ? nodo.evidencias.map((e) => e.titulo).join(', ')
-          : 'sin enlazar'}
-      </span>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
+          Responsable: {nodo.responsable || '—'} · Evidencia:
+        </span>
+        {nodo.evidencias.length === 0 && (
+          <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
+            sin enlazar
+          </span>
+        )}
+        {nodo.evidencias.map((e) => (
+          <span
+            key={e.id}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              font: '400 12px var(--font-sans)',
+              color: 'var(--text-body)',
+              background: 'var(--surface-sunken)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--r-pill)',
+              padding: '2px 4px 2px 10px',
+            }}
+          >
+            {e.titulo}
+            {editable && (
+              // Enlazar mal es un error corriente: sin esta salida había que borrar el
+              // nodo entero —y sus aristas— para corregir un enlace.
+              <button
+                type="button"
+                aria-label={`Quitar la evidencia ${e.titulo}`}
+                disabled={ocupado}
+                onClick={() => void quitarEvidencia(e.id)}
+                style={{
+                  font: '600 12px var(--font-sans)',
+                  color: 'var(--text-muted)',
+                  background: 'transparent',
+                  border: 'none',
+                  cursor: 'pointer',
+                  padding: '0 6px',
+                }}
+              >
+                ×
+              </button>
+            )}
+          </span>
+        ))}
+      </div>
 
       {editable && !editando && !enlazando && (
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -831,9 +889,10 @@ function BloqueDiagrama({ codigo }: { codigo: string }) {
         </Button>
       </div>
       <span style={{ font: '400 12.5px/1.6 var(--font-sans)', color: 'var(--text-muted)' }}>
-        Este código se genera desde el grafo cada vez que se lee. Editarlo no cambia el
-        journey: lo que gobierna es el modelo, no el dibujo.
+        El diagrama y su código se generan desde el grafo cada vez que se lee. Editar el
+        código no cambia el journey: lo que gobierna es el modelo, no el dibujo.
       </span>
+      <DiagramaMermaid codigo={codigo} />
       <pre
         style={{
           font: '400 12px/1.65 var(--font-mono)',

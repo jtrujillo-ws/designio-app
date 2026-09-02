@@ -118,6 +118,9 @@ async function sembrarJourney(tx: TransactionSql, wsId: string, luciaId: string)
      ${luciaId}) returning id`;
   const jId = j!.id as string;
 
+  /** Los tipos que son entidades del workspace llevan identidad de catálogo. */
+  const CON_CATALOGO = ['touchpoint', 'canal', 'actor', 'arquetipo', 'sistema'];
+
   /** Alta de un nodo devolviendo su id: el orden se pasa explícito porque aquí el
    * grafo se escribe entero de una vez y su secuencia es parte del ejemplo. */
   async function nodo(
@@ -127,9 +130,18 @@ async function sembrarJourney(tx: TransactionSql, wsId: string, luciaId: string)
     faseId: string | null,
     responsable = '',
   ): Promise<string> {
+    let catalogoId: string | null = null;
+    if (CON_CATALOGO.includes(tipo)) {
+      const [c] = await tx`insert into catalogo_journey (workspace_id, tipo, nombre, creado_por)
+        values (${wsId}, ${tipo}, ${etiqueta}, ${luciaId})
+        on conflict (workspace_id, tipo, nombre) do update set nombre = excluded.nombre
+        returning id`;
+      catalogoId = c!.id as string;
+    }
     const [n] = await tx`insert into journey_nodo
-      (workspace_id, journey_id, tipo, etiqueta, fase_id, orden, responsable, creado_por)
-      values (${wsId}, ${jId}, ${tipo}, ${etiqueta}, ${faseId}, ${orden}, ${responsable}, ${luciaId})
+      (workspace_id, journey_id, tipo, etiqueta, fase_id, orden, responsable, catalogo_id, creado_por)
+      values (${wsId}, ${jId}, ${tipo}, ${etiqueta}, ${faseId}, ${orden}, ${responsable},
+              ${catalogoId}, ${luciaId})
       returning id`;
     return n!.id as string;
   }

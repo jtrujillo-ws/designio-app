@@ -31,6 +31,27 @@ create table journey (
 );
 create index journey_servicio_idx on journey (workspace_id, servicio_id);
 
+-- ── Catálogo del workspace: identidad estable de lo que se repite entre journeys ──
+-- Un actor, un canal, un touchpoint o un sistema son LOS MISMOS en el as-is y en el
+-- to-be, y en los journeys de otros servicios. Guardados como texto libre en cada nodo,
+-- «qué pasos dependen del sistema X» se convierte en comparar cadenas, y renombrarlo
+-- crea una identidad nueva. El catálogo les da un id; el nodo lo referencia.
+--
+-- Solo para los tipos que SON entidades del workspace. Un paso o una fricción existen
+-- dentro de su journey y no se comparten: darles catálogo sería inventar identidad
+-- donde no la hay.
+create table catalogo_journey (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspace(id),
+  tipo text not null check (tipo in ('touchpoint', 'canal', 'actor', 'arquetipo', 'sistema')),
+  nombre text not null check (btrim(nombre) <> ''),
+  creado_por uuid not null references usuario(id),
+  creado_en timestamptz not null default now(),
+  unique (id, workspace_id),
+  -- Un nombre por tipo: es lo que hace que dos journeys hablen del mismo sistema.
+  unique (workspace_id, tipo, nombre)
+);
+
 -- ── Nodos: la taxonomía mínima de §10 ──
 -- El CHECK la fija: inventar un tipo nuevo exige migración, que es exactamente la
 -- fricción que mantiene comparables los journeys entre retos y clientes.
@@ -49,14 +70,24 @@ create table journey_nodo (
   orden integer not null default 0,
   -- Responsable del elemento: su ausencia es una señal de la validación (RF-05.6).
   responsable text not null default '',
+  -- Identidad compartida entre journeys, obligatoria justo en los tipos que la tienen.
+  catalogo_id uuid,
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
   foreign key (journey_id, workspace_id) references journey (id, workspace_id),
   foreign key (fase_id, workspace_id) references journey_nodo (id, workspace_id),
   -- Una fase no cuelga de otra fase: el grafo tiene dos niveles, no un árbol libre.
-  check (tipo <> 'fase' or fase_id is null)
+  check (tipo <> 'fase' or fase_id is null),
+  foreign key (catalogo_id, workspace_id) references catalogo_journey (id, workspace_id),
+  -- Los cinco tipos de entidad EXIGEN catálogo; el resto no lo admite. Sin el «solo
+  -- estos», nada impediría colgar un paso de una entrada de catálogo y volver a tener
+  -- dos identidades para la misma cosa.
+  check (
+    (tipo in ('touchpoint', 'canal', 'actor', 'arquetipo', 'sistema')) = (catalogo_id is not null)
+  )
 );
+create index journey_nodo_catalogo_idx on journey_nodo (workspace_id, catalogo_id);
 create index journey_nodo_journey_idx on journey_nodo (workspace_id, journey_id, orden);
 
 -- ── Aristas tipadas ──
@@ -122,12 +153,15 @@ create index journey_snapshot_journey_idx on journey_snapshot (workspace_id, jou
 -- ── RLS ──
 -- Lectura: todo miembro (el journey es el lenguaje común con el cliente).
 -- Escritura: curadores (lead/diseñador). El grafo de trabajo no se cierra (RF-05.8).
+alter table catalogo_journey enable row level security;
 alter table journey enable row level security;
 alter table journey_nodo enable row level security;
 alter table journey_arista enable row level security;
 alter table journey_nodo_evidencia enable row level security;
 alter table journey_snapshot enable row level security;
 
+create policy catalogo_select on catalogo_journey
+  for select using (is_workspace_member(app_user_id(), workspace_id));
 create policy journey_select on journey
   for select using (is_workspace_member(app_user_id(), workspace_id));
 create policy journey_nodo_select on journey_nodo
@@ -138,6 +172,18 @@ create policy journey_nodo_evidencia_select on journey_nodo_evidencia
   for select using (is_workspace_member(app_user_id(), workspace_id));
 create policy journey_snapshot_select on journey_snapshot
   for select using (is_workspace_member(app_user_id(), workspace_id));
+
+-- El catálogo lo pueblan los curadores al nombrar el elemento; renombrarlo cambia su
+-- nombre EN TODAS PARTES, que es justamente el punto de tener identidad.
+create policy catalogo_insert on catalogo_journey
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and creado_por = app_user_id()
+  );
+create policy catalogo_update on catalogo_journey
+  for update
+  using (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'))
+  with check (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'));
 
 create policy journey_insert on journey
   for insert with check (
@@ -264,11 +310,14 @@ begin
       if t_origen not in ('paso', 'decision') or t_destino not in ('paso', 'decision') then
         raise exception 'una transición va entre pasos o decisiones, no de % a %', t_origen, t_destino;
       end if;
-    -- Algo que otro necesita para poder ocurrir.
+    -- Algo que otro necesita para poder ocurrir. Incluye la oportunidad, que depende
+    -- del paso o de la fricción que viene a resolver: sin esta pareja el tipo
+    -- 'oportunidad' no podría conectarse a nada y su carril del blueprint sería
+    -- estructuralmente imposible de llenar.
     when 'dependencia' then
-      if t_origen not in ('paso', 'accion-frontstage', 'accion-backstage', 'sistema')
-        or t_destino not in ('paso', 'accion-frontstage', 'accion-backstage', 'sistema') then
-        raise exception 'una dependencia va entre pasos, acciones o sistemas, no de % a %', t_origen, t_destino;
+      if t_origen not in ('paso', 'accion-frontstage', 'accion-backstage', 'sistema', 'oportunidad')
+        or t_destino not in ('paso', 'accion-frontstage', 'accion-backstage', 'sistema', 'friccion') then
+        raise exception 'una dependencia va entre pasos, acciones, sistemas u oportunidades, no de % a %', t_origen, t_destino;
       end if;
     -- Dónde ocurre: el canal o el touchpoint es el destino.
     when 'ocurre-en' then
@@ -362,6 +411,8 @@ create trigger journey_nodo_evidencia_auditoria
 revoke execute on function journey_grafo_auditoria() from public;
 
 -- ── Grants mínimos ──
+grant select, insert on catalogo_journey to designio_app;
+grant update (nombre) on catalogo_journey to designio_app;
 grant select, insert on journey, journey_nodo, journey_arista to designio_app;
 grant select, insert on journey_nodo_evidencia, journey_snapshot to designio_app;
 -- Editar un nodo es corregir su contenido y su lugar; jamás cambiarlo de journey ni de

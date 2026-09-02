@@ -1,6 +1,7 @@
 import '@/lib/server-only';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { TIPOS_CON_CATALOGO } from './journey.schemas';
 import type {
   AgregarArista,
   AgregarNodo,
@@ -84,18 +85,45 @@ export async function agregarNodo(
     // commit y no bloquea altas de otro journey ni de otro tipo.
     await tx`select pg_advisory_xact_lock(
       hashtextextended('designio:journey-orden:' || ${entrada.journeyId} || ':' || ${entrada.tipo}, 42))`;
+    // Los tipos que son entidades del workspace se cuelgan del catálogo: si ya existe
+    // uno con ese nombre se REUSA, y así el mismo sistema en el as-is y en el to-be es
+    // el mismo objeto. El upsert va en su propia sentencia porque la del nodo necesita
+    // ver la fila (las sub-consultas de un WITH comparten snapshot y no la verían).
+    let catalogoId: string | null = null;
+    if (TIPOS_CON_CATALOGO.includes(entrada.tipo)) {
+      try {
+        const [cat] = await tx`
+          with existente as (
+            select id from catalogo_journey
+            where workspace_id = ${entrada.workspaceId} and tipo = ${entrada.tipo}
+              and nombre = ${entrada.etiqueta}
+          ),
+          nueva as (
+            insert into catalogo_journey (workspace_id, tipo, nombre, creado_por)
+            select ${entrada.workspaceId}, ${entrada.tipo}, ${entrada.etiqueta}, ${actorId}
+            where not exists (select 1 from existente)
+            returning id
+          )
+          select id from existente union all select id from nueva`;
+        if (!cat) throw new ErrorJourney('No puedes crear elementos de catálogo en este workspace');
+        catalogoId = cat.id as string;
+      } catch (e) {
+        if (e instanceof ErrorJourney) throw e;
+        comoErrorDeDominio(e);
+      }
+    }
     let fila;
     try {
       [fila] = await tx`
         insert into journey_nodo (workspace_id, journey_id, tipo, etiqueta, detalle,
-                                  fase_id, orden, responsable, creado_por)
+                                  fase_id, orden, responsable, catalogo_id, creado_por)
         select ${entrada.workspaceId}, ${entrada.journeyId}, ${entrada.tipo},
           ${entrada.etiqueta}, ${entrada.detalle}, ${entrada.faseId},
           coalesce((select max(orden) + 1 from journey_nodo n
             where n.journey_id = ${entrada.journeyId}
               and n.workspace_id = ${entrada.workspaceId}
               and n.tipo = ${entrada.tipo}), 0),
-          ${entrada.responsable}, ${actorId}
+          ${entrada.responsable}, ${catalogoId}, ${actorId}
         returning id`;
     } catch (e) {
       comoErrorDeDominio(e);
@@ -110,6 +138,14 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
     await exigirCuentaActiva(tx, actorId);
     let filas;
     try {
+      // Renombrar una entidad la renombra EN TODAS PARTES: es lo que se gana al darle
+      // identidad. El catálogo se actualiza en la misma transacción que el nodo.
+      await tx`
+        update catalogo_journey c
+        set nombre = ${entrada.etiqueta}
+        from journey_nodo n
+        where n.id = ${entrada.nodoId} and n.workspace_id = ${entrada.workspaceId}
+          and c.id = n.catalogo_id and c.workspace_id = n.workspace_id`;
       filas = await tx`
         update journey_nodo
         set etiqueta = ${entrada.etiqueta}, detalle = ${entrada.detalle},
@@ -211,6 +247,26 @@ export async function enlazarEvidenciaANodo(
   });
 }
 
+/** Quitar un enlace de evidencia (RF-05.9): enlazar mal es un error corriente, y sin
+ * esta operación la única salida era borrar el nodo entero y perder sus aristas. La
+ * migración ya concedía el delete y auditaba el desenlace; faltaba la puerta. */
+export async function desenlazarEvidenciaDeNodo(
+  actorId: string,
+  workspaceId: string,
+  nodoId: string,
+  evidenciaId: string,
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`delete from journey_nodo_evidencia
+      where nodo_id = ${nodoId} and evidencia_id = ${evidenciaId}
+        and workspace_id = ${workspaceId}`;
+    if (filas.count === 0) {
+      throw new ErrorJourney('Ese enlace no existe o no puedes quitarlo');
+    }
+  });
+}
+
 /**
  * Congelar un snapshot (RF-05.8, SYS-05): serializa el grafo COMPLETO —nodos, aristas y
  * los enlaces de evidencia— en un registro inmutable. Sin la evidencia, el snapshot no
@@ -295,6 +351,7 @@ export async function journeyCompleto(
           select jsonb_agg(jsonb_build_object(
             'id', n.id, 'tipo', n.tipo, 'etiqueta', n.etiqueta, 'detalle', n.detalle,
             'faseId', n.fase_id, 'orden', n.orden, 'responsable', n.responsable,
+            'catalogoId', n.catalogo_id,
             'evidencias', coalesce((
               select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo)
                 order by e.titulo)

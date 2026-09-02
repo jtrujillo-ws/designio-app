@@ -123,6 +123,12 @@ export async function crearArquetipo(
 ): Promise<{ arquetipoId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // MISMO candado por reto que toma aprobarGate. Sin él, dar de alta una hipótesis y
+    // aprobar G2 se cruzan: cada una ve el estado commiteado por la otra, tocan filas
+    // distintas y ambas confirman — volviendo a dejar un G2 aprobado con un arquetipo
+    // sin resolver, que es justo lo que la política nueva intenta impedir.
+    await tx`select pg_advisory_xact_lock(
+      hashtextextended('designio:reto:' || ${entrada.retoId}, 42))`;
     const segmentoIds = [...new Set(entrada.segmentoIds)];
     let fila;
     try {

@@ -51,6 +51,7 @@ export function SeccionGobernanza({
   proyecto,
   gobernanza,
   insightsValidados,
+  hayMasInsights,
   evidencias,
   hayMasEvidencias,
   rol,
@@ -61,6 +62,7 @@ export function SeccionGobernanza({
   proyecto: ProyectoMetodo;
   gobernanza: GobernanzaDeProyecto;
   insightsValidados: { id: string; titulo: string }[];
+  hayMasInsights: boolean;
   evidencias: { id: string; titulo: string }[];
   hayMasEvidencias: boolean;
   rol: string;
@@ -77,6 +79,7 @@ export function SeccionGobernanza({
         proyecto={proyecto}
         decisiones={gobernanza.decisiones}
         insightsValidados={insightsValidados}
+        hayMasInsights={hayMasInsights}
         esLead={esLead}
         onCambio={onCambio}
         onError={onError}
@@ -97,6 +100,7 @@ export function SeccionGobernanza({
         proyecto={proyecto}
         reaperturas={gobernanza.reaperturas}
         insightsValidados={insightsValidados}
+        hayMasInsights={hayMasInsights}
         esLead={esLead}
         onCambio={onCambio}
         onError={onError}
@@ -110,6 +114,7 @@ function BloqueDecisiones({
   proyecto,
   decisiones,
   insightsValidados,
+  hayMasInsights,
   esLead,
   onCambio,
   onError,
@@ -118,6 +123,7 @@ function BloqueDecisiones({
   proyecto: ProyectoMetodo;
   decisiones: GobernanzaDeProyecto['decisiones'];
   insightsValidados: { id: string; titulo: string }[];
+  hayMasInsights: boolean;
   esLead: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -265,6 +271,12 @@ function BloqueDecisiones({
           />
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             <span style={micro}>Insights que la sostienen (al menos uno)</span>
+            {hayMasInsights && (
+              <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
+                Solo se listan los 200 validados más recientes: si el que sostiene esta
+                decisión no aparece, búscalo en Insights y valídalo o vuelve a citarlo.
+              </span>
+            )}
             {insightsValidados.map((i) => (
               <label
                 key={i.id}
@@ -559,6 +571,7 @@ function BloqueReaperturas({
   proyecto,
   reaperturas,
   insightsValidados,
+  hayMasInsights,
   esLead,
   onCambio,
   onError,
@@ -567,6 +580,7 @@ function BloqueReaperturas({
   proyecto: ProyectoMetodo;
   reaperturas: GobernanzaDeProyecto['reaperturas'];
   insightsValidados: { id: string; titulo: string }[];
+  hayMasInsights: boolean;
   esLead: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -664,6 +678,12 @@ function BloqueReaperturas({
               <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
                 Qué insights cambiaron (opcional; acota qué decisiones entran en revisión)
               </span>
+              {hayMasInsights && (
+                <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
+                  Solo se listan los 200 validados más recientes: si el que cambió no está
+                  aquí, la reapertura marcará la etapa completa en vez de acotarla.
+                </span>
+              )}
               {insightsValidados.map((i) => (
                 <label
                   key={i.id}

@@ -52,7 +52,14 @@ export const ValidarInsightSchema = z.object({
   insightId: z.string().uuid(),
 });
 
-export const InsightsInputSchema = z.object({ workspaceId: z.string().uuid() });
+export const InsightsInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  /** Keyset: el par (creado_en, id) de la última fila mostrada. Sin él, primera página. */
+  cursor: z
+    .object({ creadoEn: z.string(), id: z.string().uuid() })
+    .nullable()
+    .default(null),
+});
 
 /** Proyecciones de lectura. */
 export type CitaDeAfirmacion = {

@@ -126,7 +126,8 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
     });
 
     await validarInsight(leadId, ws, insightId);
-    const [insight] = await insightsDelWorkspace(leadId, ws);
+    const { insights: pagina } = await insightsDelWorkspace(leadId, ws);
+    const insight = pagina[0];
     expect(insight!.estado).toBe('validado');
     expect(insight!.afirmaciones).toHaveLength(2);
     expect(insight!.afirmaciones[0]!.citas[0]!.localizacion).toBe('p. 14');
@@ -147,7 +148,8 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
       evidenciaId,
       descripcion: 'En sucursal el abandono es del 20%, no del 62%',
     });
-    const [insight] = await insightsDelWorkspace(stakeId, ws);
+    const { insights: paginaStake } = await insightsDelWorkspace(stakeId, ws);
+    const insight = paginaStake[0];
     expect(insight!.contradicciones).toHaveLength(1);
 
     // La misma evidencia no se registra dos veces sobre el mismo insight.

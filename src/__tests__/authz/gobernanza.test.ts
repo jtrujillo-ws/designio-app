@@ -511,6 +511,70 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     expect(nuevo.arquetipoId).toBeTruthy();
   });
 
+  it('un ítem no se cumple con un insight que nadie validó', async () => {
+    const propuesto = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'Sin validar todavía',
+      resumen: '',
+    });
+    const p = await proyectoMetodo(leadId, ws, proyectoId);
+    const item = p!.gates[3]!.items[0]!;
+    // Igual que con las decisiones: el picker filtra, el endpoint acepta cualquier uuid,
+    // y la regla vive en la base para que el SQL directo tampoco la esquive.
+    await expect(
+      marcarItem(leadId, {
+        workspaceId: ws,
+        itemId: item.id,
+        accion: { tipo: 'cumplido', objetoClase: 'insight', objetoId: propuesto.insightId },
+      }),
+    ).rejects.toThrow(/todavía no está validado/);
+  });
+
+  it('un gate no se aprueba con ítems cumplidos sobre decisiones en revisión', async () => {
+    // Se parte de un estado limpio y se cumple un ítem de G3 citando una decisión.
+    const previa = await gobernanzaDeProyecto(leadId, ws, proyectoId);
+    for (const d of previa!.decisiones.filter((x) => x.estado === 'en-revision')) {
+      await revalidarDecision(leadId, ws, d.id);
+    }
+    const vigente = (await gobernanzaDeProyecto(leadId, ws, proyectoId))!.decisiones.find(
+      (d) => d.gateNumero === 3,
+    )!;
+    const p = await proyectoMetodo(leadId, ws, proyectoId);
+    const g3 = p!.gates[3]!;
+    for (const item of g3.items) {
+      if (item.estado === 'cumplido') continue;
+      await marcarItem(leadId, {
+        workspaceId: ws,
+        itemId: item.id,
+        accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evidenciaId },
+      });
+    }
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: g3.items[0]!.id,
+      accion: { tipo: 'cumplido', objetoClase: 'decision', objetoId: vigente.id },
+    });
+
+    // Una reapertura de la etapa 3 pone esa decisión en revisión. El ítem sigue
+    // 'cumplido' —no se tira el trabajo— pero deja de contar como suficiencia.
+    await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      etapaNumero: 3,
+      motivo: 'Llegó una restricción de cumplimiento',
+      insightIds: [],
+    });
+    // G3 lo aprueba el sponsor (rolAprobadorDeGate), pero el guard le para igual.
+    await expect(
+      aprobarGate(sponsorId, { workspaceId: ws, gateId: g3.id }),
+    ).rejects.toThrow(/decisiones en revisión/);
+
+    // Revalidar la decisión desbloquea el gate sin tocar el checklist.
+    await revalidarDecision(leadId, ws, vigente.id);
+    const tras = await proyectoMetodo(leadId, ws, proyectoId);
+    expect(tras!.gates[3]!.items[0]!.estado).toBe('cumplido');
+  });
+
   it('reabrir la etapa 0 SÍ deja cambiar los criterios que motivaron la reapertura', async () => {
     // G0 está aprobado desde el test de G2: sin reapertura, los criterios están cerrados.
     await expect(

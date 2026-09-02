@@ -1,4 +1,5 @@
 import '@/lib/server-only';
+import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import type {
@@ -22,9 +23,12 @@ import type {
 
 export class ErrorInsight extends Error {}
 
-/** Corte de la lista: la pantalla los muestra completos (con citas). Sin corte, un
- * workspace con historia cargaría todo su razonamiento en cada visita. */
-export const INSIGHTS_LISTA = 200;
+/** Página de la lista completa: la pantalla los muestra con citas y contradicciones, así
+ * que traerlos todos de golpe cargaría el razonamiento entero del workspace. Se pagina
+ * por keyset (creado_en, id) para que «cargar más» no salte ni repita filas — y para que
+ * un insight viejo NO quede fuera de alcance para siempre, que es lo que hacía el corte
+ * duro anterior: sin él no se podía ni citarlo, ni validarlo, ni contradecirlo. */
+export const PAGINA_INSIGHTS = 50;
 
 /** El picker del gate se recorta aparte: es otra consulta y otro tamaño. */
 const INSIGHTS_PICKER = 200;
@@ -67,12 +71,22 @@ export async function crearInsight(
   });
 }
 
+/** Candado por insight: serializa escribir su contenido contra validarlo. Sin él, una
+ * afirmación sin cita puede entrar mientras otra transacción valida —ambas ven el estado
+ * 'propuesto' commiteado, tocan filas distintas y las dos pasan— y queda un insight
+ * validado e inmutable con una afirmación que nadie sostuvo. Mismo espacio de nombres
+ * que los candados del método. */
+async function candadoDeInsight(tx: TransactionSql, insightId: string): Promise<void> {
+  await tx`select pg_advisory_xact_lock(hashtextextended('designio:insight:' || ${insightId}, 42))`;
+}
+
 export async function agregarAfirmacion(
   actorId: string,
   entrada: AgregarAfirmacion,
 ): Promise<{ afirmacionId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    await candadoDeInsight(tx, entrada.insightId);
     // El orden se calcula en la MISMA sentencia que inserta: dos afirmaciones
     // concurrentes chocarían contra unique (insight_id, orden) en vez de pisarse, y el
     // reintento del usuario es correcto porque el orden es presentacional.
@@ -115,6 +129,11 @@ export async function agregarCita(
 ): Promise<{ citaId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // Mismo candado que agregarAfirmacion y validarInsight: lo que cuenta el guard de
+    // validación son las afirmaciones SIN cita, así que citar también entra en la cola.
+    const [duena] = await tx`select insight_id from afirmacion
+      where id = ${entrada.afirmacionId} and workspace_id = ${entrada.workspaceId}`;
+    if (duena) await candadoDeInsight(tx, duena.insight_id as string);
     let fila;
     try {
       [fila] = await tx`
@@ -194,6 +213,9 @@ export async function validarInsight(
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // El mismo candado que toma agregarAfirmacion: el guard de validación cuenta las
+    // afirmaciones sin cita, y esa cuenta tiene que ser la definitiva.
+    await candadoDeInsight(tx, insightId);
     let filas;
     try {
       filas = await tx`
@@ -243,7 +265,8 @@ export async function insightsCitables(
 export async function insightsDelWorkspace(
   actorId: string,
   workspaceId: string,
-): Promise<InsightCompleto[]> {
+  cursor?: { creadoEn: string; id: string } | null,
+): Promise<{ insights: InsightCompleto[]; siguiente: { creadoEn: string; id: string } | null }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     const filas = await tx`
@@ -275,18 +298,32 @@ export async function insightsDelWorkspace(
           join evidencia e2 on e2.id = x.evidencia_id and e2.workspace_id = x.workspace_id
           where x.insight_id = i.id and x.workspace_id = i.workspace_id
         ), '[]'::jsonb) as contradicciones
+        , i.creado_en
       from insight i
       where i.workspace_id = ${workspaceId}
-      order by i.creado_en desc
-      limit ${INSIGHTS_LISTA}`;
-    return filas.map((f) => ({
-      id: f.id as string,
-      titulo: f.titulo as string,
-      resumen: f.resumen as string,
-      estado: f.estado as InsightCompleto['estado'],
-      validadoEn: (f.validado_en as string | null) ?? null,
-      afirmaciones: f.afirmaciones as InsightCompleto['afirmaciones'],
-      contradicciones: f.contradicciones as InsightCompleto['contradicciones'],
-    }));
+        and (${cursor?.creadoEn ?? null}::timestamptz is null
+             or (i.creado_en, i.id) < (${cursor?.creadoEn ?? null}::timestamptz,
+                                       ${cursor?.id ?? null}::uuid))
+      order by i.creado_en desc, i.id desc
+      limit ${PAGINA_INSIGHTS + 1}`;
+    const pagina = filas.slice(0, PAGINA_INSIGHTS);
+    const ultima = pagina[pagina.length - 1];
+    return {
+      insights: pagina.map((f) => ({
+        id: f.id as string,
+        titulo: f.titulo as string,
+        resumen: f.resumen as string,
+        estado: f.estado as InsightCompleto['estado'],
+        validadoEn: (f.validado_en as string | null) ?? null,
+        afirmaciones: f.afirmaciones as InsightCompleto['afirmaciones'],
+        contradicciones: f.contradicciones as InsightCompleto['contradicciones'],
+      })),
+      // El cursor es el par completo (creado_en, id): dos insights del mismo instante
+      // no harían saltar ni repetir la página siguiente.
+      siguiente:
+        filas.length > PAGINA_INSIGHTS && ultima
+          ? { creadoEn: (ultima.creado_en as Date).toISOString(), id: ultima.id as string }
+          : null,
+    };
   });
 }

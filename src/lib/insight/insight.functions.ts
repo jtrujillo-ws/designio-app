@@ -38,9 +38,9 @@ export const insightsDelEspacio = createServerFn({ method: 'GET' })
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
     try {
-      return await insightsDelWorkspace(usuarioId, data.workspaceId);
+      return await insightsDelWorkspace(usuarioId, data.workspaceId, data.cursor);
     } catch (e) {
-      if (e instanceof ErrorAutorizacion) return null;
+      if (e instanceof ErrorAutorizacion) return { insights: [], siguiente: null };
       throw e;
     }
   });

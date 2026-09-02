@@ -196,6 +196,7 @@ function PantallaProyecto() {
               proyecto={datos.proyecto}
               gobernanza={datos.gobernanza}
               insightsValidados={datos.insightsValidados}
+              hayMasInsights={datos.hayMasInsights}
               evidencias={datos.citables.filter((o) => o.clase === 'evidencia')}
               hayMasEvidencias={datos.hayMasEvidencias}
               rol={rol}

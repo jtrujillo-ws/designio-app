@@ -527,6 +527,17 @@ begin
       where ci.gate_id = new.id and ci.workspace_id = new.workspace_id) then
       raise exception 'no se puede aprobar: el gate no tiene checklist instanciado';
     end if;
+    -- Un ítem YA cumplido cuya decisión pasó a 'en-revision' por una reapertura seguía
+    -- contando como suficiencia: el gate se aprobaba sobre razonamiento cuestionado. Se
+    -- re-chequea al aprobar en vez de resetear los ítems al reabrir — resetear tiraría
+    -- trabajo que quizá sigue en pie, y revalidar la decisión desbloquea el gate sin
+    -- tocar el checklist.
+    if exists (select 1 from checklist_item ci
+      join decision d on d.id = ci.decision_id and d.workspace_id = ci.workspace_id
+      where ci.gate_id = new.id and ci.workspace_id = new.workspace_id
+        and ci.estado = 'cumplido' and d.estado <> 'vigente') then
+      raise exception 'no se puede aprobar: hay ítems cumplidos con decisiones en revisión';
+    end if;
     if exists (select 1 from gate_instancia g2
       where g2.proyecto_id = new.proyecto_id and g2.workspace_id = new.workspace_id
         and g2.numero < new.numero and g2.estado <> 'aprobado') then
@@ -621,11 +632,13 @@ create constraint trigger reapertura_insight_autor
   for each row execute function reapertura_insight_autor_guard();
 revoke execute on function reapertura_insight_autor_guard() from public;
 
--- ── La decisión citada tiene que ser DE ESTE proyecto ──
--- La FK compuesta garantiza el workspace, no el proyecto: con ella sola, una petición
--- fabricada cumple un gate del proyecto A citando una decisión del proyecto B. Va en la
--- base y no en el servicio porque el SQL directo tampoco debe poder hacerlo.
-create function checklist_decision_mismo_proyecto_guard() returns trigger
+-- ── Lo que cumple un ítem tiene que ser CITABLE de verdad ──
+-- La FK compuesta garantiza el workspace y nada más. Con ella sola, una petición
+-- fabricada cumple un gate del proyecto A citando una decisión del proyecto B, o lo
+-- cumple con un insight que nadie validó todavía — razonamiento que ni siquiera pasó
+-- por el guard de las citas. El picker filtra las dos cosas; el endpoint acepta
+-- cualquier uuid, así que la regla vive aquí, donde el SQL directo tampoco la esquiva.
+create function checklist_objeto_citable_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
@@ -640,12 +653,18 @@ begin
     -- decisión no está donde el ítem la busca (no existe, o es de otro proyecto).
     raise exception 'la decisión citada no existe en este proyecto';
   end if;
+  if new.insight_id is not null and not exists (
+    select 1 from insight i
+    where i.id = new.insight_id and i.workspace_id = new.workspace_id
+      and i.estado = 'validado') then
+    raise exception 'el insight citado no existe o todavía no está validado';
+  end if;
   return new;
 end $$;
-create trigger checklist_decision_mismo_proyecto
+create trigger checklist_objeto_citable
   before insert or update on checklist_item
-  for each row execute function checklist_decision_mismo_proyecto_guard();
-revoke execute on function checklist_decision_mismo_proyecto_guard() from public;
+  for each row execute function checklist_objeto_citable_guard();
+revoke execute on function checklist_objeto_citable_guard() from public;
 
 -- ── Grants mínimos ──
 grant select, insert on insight, afirmacion, cita, contradiccion to designio_app;

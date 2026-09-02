@@ -194,10 +194,21 @@ describe('sanitización del material importado', () => {
     expect([...base64ABytes(b64)]).toEqual([...bytes]);
   });
 
-  it('no existe un solo dangerouslySetInnerHTML en el repo: el contenido se pinta como texto', () => {
-    // La razón por la que NO hay sanitizador de HTML: no hay superficie donde el
-    // material importado se interprete como markup. Este test es el que sostiene esa
-    // afirmación — si alguien abre esa puerta, deja de pasar.
+  it('el material importado no llega a ninguna superficie que interprete markup', () => {
+    // La razón por la que NO hay sanitizador de HTML: el contenido importado se pinta
+    // como texto, nunca como markup. Este test es el que sostiene esa afirmación.
+    //
+    // Hay UNA excepción en el repo y conviene que esté nombrada en vez de que el test se
+    // relaje a `[]` vacío o desaparezca: el visor de diagramas de SPEC-05 inyecta el SVG
+    // que produce mermaid. No toca esta promesa, y la razón es concreta: el diagrama se
+    // arma solo con `etiqueta` y `condicion` del journey —texto que escribe el equipo en
+    // la propia herramienta— y las evidencias entran ahí como CONTEO («este paso no tiene
+    // evidencia»), nunca como texto. Además ese texto pasa por el neutralizador de
+    // `journey.mermaid.ts` (comillas, corchetes y saltos) y mermaid corre con
+    // `securityLevel: 'strict'`. Es decir: por esa puerta no pasa material de terceros.
+    //
+    // La lista es EXACTA a propósito. Si aparece un segundo uso —o si el primero se mueve
+    // de fichero— este test falla y obliga a repetir el razonamiento en vez de heredarlo.
     const raiz = join(import.meta.dirname, '..', '..');
     // Solo el USO real (atributo JSX o propiedad); las menciones en prosa de los
     // comentarios que documentan esta decisión no son una superficie.
@@ -214,6 +225,8 @@ describe('sanitización del material importado', () => {
       }
     };
     recorrer(raiz);
-    expect(sospechosos).toEqual([]);
+    expect(sospechosos.map((r) => r.slice(raiz.length + 1))).toEqual([
+      'components/journey/DiagramaMermaid.tsx',
+    ]);
   });
 });

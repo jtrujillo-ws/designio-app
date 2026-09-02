@@ -40,9 +40,18 @@ export type ObjetoCitable = {
   clase: ClaseObjetoCitable;
   id: string;
   titulo: string;
-  /** Solo la evidencia lleva derechos de uso (SPEC-03): un insight o una decisión son
-   * razonamiento propio del workspace. `citable: false` deshabilita la opción con su
-   * motivo a la vista; el bloqueo real lo impone el guard de la base. */
+  /** `citable: false` deshabilita la opción con su motivo a la vista; el bloqueo real lo
+   * impone el guard de la base.
+   *
+   * HOY solo se calcula para la clase `evidencia`, que es la única que lleva derechos de
+   * uso propios (SPEC-03). Las otras dos NO están cubiertas al mismo nivel y conviene no
+   * fingir que sí:
+   *  · `decision` — el loader ya solo ofrece las `vigente`, que es exactamente lo que el
+   *    guard de aprobación exige, así que la regla se respeta (ocultando en vez de
+   *    explicando, que es la parte mejorable).
+   *  · `insight` — el loader ofrece todos los validados, pero un insight cuyo respaldo
+   *    perdió los derechos ya NO permite aprobar el gate (guard de suficiencia). El
+   *    bloqueo existe y es correcto, pero aparece al aprobar en vez de aquí. */
   citable?: boolean;
   motivoBloqueo?: string | null;
 };

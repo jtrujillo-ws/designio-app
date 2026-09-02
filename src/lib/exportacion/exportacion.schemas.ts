@@ -122,6 +122,24 @@ export const CATALOGO_EXPORT = [
   },
   { tabla: 'reapertura_etapa', orden: 'reabierto_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id', poda: { modo: 'fuera' } },
+  // Journey (SPEC-05): el mapa del servicio, su catálogo de touchpoints/canales/sistemas,
+  // los nodos y aristas del grafo y los snapshots congelados. Es modelo PROPIO del
+  // workspace, no material de terceros, así que el archivo del dueño lo lleva entero y el
+  // entregable no lo arrastra — misma línea que el método y la cadena de razonamiento.
+  { tabla: 'journey', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'catalogo_journey', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'journey_nodo', orden: 'journey_id, orden, id', poda: { modo: 'fuera' } },
+  { tabla: 'journey_arista', orden: 'journey_id, creado_en, id', poda: { modo: 'fuera' } },
+  // Enlaza un nodo con la evidencia que lo respalda: tiene `evidencia_id`, así que el
+  // invariante estructural obliga a declararlo. Queda FUERA —y no podado por evidencia—
+  // porque el journey al que apunta tampoco viaja: un enlace a un nodo ausente no informa
+  // de nada y sí revela qué evidencia sostiene qué paso. Mismo criterio que checklist_item.
+  {
+    tabla: 'journey_nodo_evidencia',
+    orden: 'nodo_id, evidencia_id',
+    poda: { modo: 'fuera' },
+  },
+  { tabla: 'journey_snapshot', orden: 'congelado_en, id', poda: { modo: 'fuera' } },
   // Portal (SPEC-01.5): la conversación con el cliente es parte de lo que se le entrega.
   // Un hilo puede colgar de una evidencia, pero el entregable no lleva la conversación:
   // fuera entera (y por eso `comentario`, que cuelga del hilo, también).

@@ -3,7 +3,7 @@ import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import {
   costoDeUso,
-  LIMITE_PROPUESTAS_DIA,
+  LIMITE_LLAMADAS_DIA,
   MODELO_FALLBACK,
   MODELO_PRIMARIO,
 } from '@/lib/ai/ai.degradacion';
@@ -175,6 +175,31 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               ${costoDeUso(MODELO_PRIMARIO, USO_CI)}, 900, ${leadId})
       returning id`);
     return l!.id as string;
+  }
+
+  /** Llamadas de relleno para dejar el presupuesto del workspace con `huecos` libres. Se
+   * rellena con LLAMADAS ATENDIDAS porque es lo que el tope cuenta desde que acota el gasto
+   * y no la producción; el modelo las marca para poder retirarlas después sin tocar las
+   * llamadas de verdad que dejaron los otros tests. */
+  const MODELO_RELLENO = 'modelo-de-relleno';
+
+  async function llenarPresupuesto(huecos: number): Promise<void> {
+    const admin = sqlAdmin();
+    const [fila] = await admin`select count(*)::int as n from llamada_ai
+      where workspace_id = ${ws} and creado_en >= date_trunc('day', now())
+        and resultado <> 'sin-respuesta'`;
+    const faltan = Math.max(0, LIMITE_LLAMADAS_DIA - (fila!.n as number) - huecos);
+    if (faltan > 0) {
+      await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        select ${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'salida-valida', ${leadId}
+        from generate_series(1, ${faltan})`;
+    }
+  }
+
+  async function vaciarRelleno(): Promise<void> {
+    await sqlAdmin()`delete from llamada_ai
+      where workspace_id = ${ws} and modelo = ${MODELO_RELLENO}`;
   }
 
   /** Corre `fn` con la capacidad AI encendida y la respuesta del proveedor dada. */
@@ -1084,70 +1109,162 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(despues.length).toBe(0);
   });
 
-  it('las generaciones en curso ocupan presupuesto: N curadores a la vez no lo rebasan', async () => {
-    const admin = sqlAdmin();
-    const itemId = await nuevoItem('Item con el presupuesto lleno');
-    // Ocho generaciones de criterios EN CURSO (8 × 8 = 64 huecos apartados) agotan el
-    // tope de hoy aunque todavía no haya ninguna propuesta persistida: es exactamente el
-    // estado que el chequeo viejo no veía.
-    for (let i = 0; i < 8; i += 1) {
-      await admin`insert into reserva_ai (workspace_id, capacidad, unidades, creado_por)
-        values (${ws}, 'C0', 8, ${leadId})`;
-    }
+  it('el tope cuenta LLAMADAS atendidas: lo que se paga sin producir nada también gasta', async () => {
+    const itemId = await nuevoItem('Item con el presupuesto casi lleno');
+    // El tope acota lo que se PAGA. Una negativa del proveedor es una llamada atendida y
+    // facturada de la que no nace ninguna propuesta: contando propuestas persistidas, ese
+    // gasto era invisible y un material que el modelo rechaza siempre se podía reintentar
+    // sin fin. Se deja sitio justo para una generación (que puede gastar hasta dos
+    // llamadas: primario y respaldo).
+    await llenarPresupuesto(2);
     try {
+      const antes = (await panelPropuestas(leadId, ws)).ai.llamadasHoy;
+      await conProveedor(RESPUESTA_RECHAZO, async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        ).rejects.toThrow(/se negó a procesar/);
+      });
+      // El contador se movió sin que naciera ninguna propuesta: eso es lo que el tope
+      // basado en producción no veía.
+      const despues = (await panelPropuestas(leadId, ws)).ai.llamadasHoy;
+      expect(despues).toBe(antes + 1);
+      // Y por eso la siguiente ya no entra: queda una llamada y una generación puede
+      // gastar dos.
       await conProveedor(RESPUESTA_CI, async () => {
         await expect(
           generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
         ).rejects.toThrow(/presupuesto/i);
       });
-      // El panel sigue contando lo REALMENTE gastado hoy, no las reservas en vuelo.
-      const panel = await panelPropuestas(leadId, ws);
-      expect(panel.ai.propuestasHoy).toBeLessThan(LIMITE_PROPUESTAS_DIA);
+      const ninguna = await conUsuario(leadId, (tx) => tx`select 1 as x from propuesta_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`);
+      expect(ninguna.length).toBe(0);
     } finally {
-      await admin`delete from reserva_ai where workspace_id = ${ws}`;
+      await vaciarRelleno();
     }
-    // Liberadas las reservas, el mismo item vuelve a poder generarse.
+    // Sin el relleno, el mismo item vuelve a poder generarse.
     const r = await conProveedor(RESPUESTA_CI, () =>
       generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
     );
     expect(r.generadas).toBe(1);
   });
 
-  it('una reserva caducada no vale como hueco al consumir: se re-comprueba el presupuesto', async () => {
+  it('un fallo sin respuesta no gasta tope: «no se sabe» no es «se pagó»', async () => {
+    const itemId = await nuevoItem('Item con el proveedor caído y el tope al límite');
+    await llenarPresupuesto(2);
+    try {
+      // El proveedor no respondió: la llamada se anota para operabilidad, pero con coste
+      // desconocido — cobrarla convertiría una caída del proveedor en un workspace sin
+      // capacidad AI el resto del día, justo lo contrario de la degradación segura.
+      await conProveedor(RESPUESTA_CAIDO, async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        ).rejects.toThrow(/no está disponible/);
+      });
+      const r = await conProveedor(RESPUESTA_CI, () =>
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+      );
+      expect(r.generadas).toBe(1);
+    } finally {
+      await vaciarRelleno();
+    }
+  });
+
+  it('las generaciones en curso ocupan presupuesto: N curadores a la vez no lo rebasan', async () => {
     const admin = sqlAdmin();
-    const itemId = await nuevoItem('Item cuya reserva caduca a media llamada');
-    // La reserva caduca mientras el proveedor responde (proveedor lentísimo, proceso
-    // reiniciado). Desde ese momento dejó de contar en el presupuesto, así que otras
-    // generaciones pueden reclamar esa misma capacidad — y aquí la reclaman entera.
-    proveedor.duranteLlamada = async () => {
-      await admin`update reserva_ai set creado_en = now() - interval '10 minutes'
-        where workspace_id = ${ws} and item_id = ${itemId}`;
-      for (let i = 0; i < 8; i += 1) {
-        await admin`insert into reserva_ai (workspace_id, capacidad, unidades, creado_por)
-          values (${ws}, 'C0', 8, ${leadId})`;
-      }
-    };
+    const itemId = await nuevoItem('Item con una generación en vuelo delante');
+    const otro = await nuevoItem('Item de la generación en vuelo');
+    // Sitio para dos llamadas y una generación EN CURSO que ya las apartó: el tope no se
+    // rebasa aunque todavía no haya ninguna propuesta ni ninguna llamada anotada — es
+    // exactamente el estado que el chequeo sobre lo persistido no veía.
+    await llenarPresupuesto(2);
+    await admin`insert into reserva_ai (workspace_id, capacidad, item_id, unidades, creado_por)
+      values (${ws}, 'CI', ${otro}, 2, ${leadId})`;
     try {
       await conProveedor(RESPUESTA_CI, async () => {
-        // Con la reserva caducada aceptada como token bueno, `apartadas` salía distinto de
-        // cero y el re-chequeo —que existe justo para este caso— se saltaba: la propuesta
-        // se persistía sobre una capacidad que ya era de otro y el tope se rebasaba.
         await expect(
           generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
         ).rejects.toThrow(/presupuesto/i);
       });
+      // El panel informa de lo REALMENTE gastado hoy, no de las reservas en vuelo.
+      const panel = await panelPropuestas(leadId, ws);
+      expect(panel.ai.llamadasHoy).toBeLessThan(LIMITE_LLAMADAS_DIA);
     } finally {
-      proveedor.duranteLlamada = null;
       await admin`delete from reserva_ai where workspace_id = ${ws}`;
+      await vaciarRelleno();
     }
+    const r = await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+    );
+    expect(r.generadas).toBe(1);
+  });
 
-    const propuestas = await conUsuario(leadId, (tx) => tx`select 1 as x from propuesta_ai
-      where workspace_id = ${ws} and item_id = ${itemId}`);
-    expect(propuestas.length).toBe(0);
-    // Y la llamada se anotó igual: se pagó aunque el lote no llegara a nacer.
-    const llamadas = await conUsuario(leadId, (tx) => tx`select 1 as x from llamada_ai
-      where workspace_id = ${ws} and item_id = ${itemId}`);
-    expect(llamadas.length).toBe(1);
+  it('una reserva caducada no concede capacidad, y lo ya pagado no se tira', async () => {
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item con una reserva zombi de otro');
+    const zombi = await nuevoItem('Item de la reserva zombi');
+    await llenarPresupuesto(2);
+    // Una reserva de OTRA generación que murió a mitad, con ocho huecos apartados: si
+    // contara, no habría sitio para nadie. No cuenta — para admitir se ignora — y por eso
+    // esta generación entra.
+    await admin`insert into reserva_ai
+      (workspace_id, capacidad, item_id, unidades, creado_por, creado_en)
+      values (${ws}, 'CI', ${zombi}, 8, ${leadId}, now() - interval '10 minutes')`;
+    try {
+      const r = await conProveedor(RESPUESTA_CI, () =>
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+      );
+      // Y lo que ya se pagó no se tira: la llamada estaba hecha cuando se fue a persistir,
+      // así que negarse a guardar su salida no des-gastaría nada — solo perdería lo
+      // comprado. El tope frena donde puede frenar el gasto: en la admisión.
+      expect(r.generadas).toBe(1);
+      // Consumido ese hueco, la siguiente generación ya no entra.
+      await conProveedor(RESPUESTA_CI, async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: zombi }),
+        ).rejects.toThrow(/presupuesto/i);
+      });
+    } finally {
+      await admin`delete from reserva_ai where workspace_id = ${ws}`;
+      await vaciarRelleno();
+    }
+  });
+
+  it('dos curadores a la vez sobre el mismo RETO dejan una sola generación en vuelo', async () => {
+    await enWorkspaceLimpio('c0-exclusivo', async ({ ws: wsE, curadorId, retoId: retoE }) => {
+      const resultados = await conProveedor(
+        { ok: true, datos: { criterios: [CONTENIDO_C0] }, intentos: [intento({ uso: null })] },
+        () =>
+          Promise.allSettled([
+            generarPropuestas(curadorId, { workspaceId: wsE, capacidad: 'C0', anclaId: retoE }),
+            generarPropuestas(curadorId, { workspaceId: wsE, capacidad: 'C0', anclaId: retoE }),
+          ]),
+      );
+      // Antes, la reserva C0 no guardaba el reto: no excluía nada, las dos llamaban al
+      // proveedor y quedaban dos lotes pendientes sobre un ancla que la pantalla ofrece una
+      // sola vez. Ahora la segunda se detiene ANTES de llamar.
+      expect(resultados.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const perdedora = resultados.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+      expect(perdedora.reason).toBeInstanceOf(ErrorAI);
+      expect((perdedora.reason as ErrorAI).message).toMatch(/en curso|esperando revisión/i);
+
+      // Una sola llamada pagada y un solo lote pendiente.
+      const llamadas = await conUsuario(curadorId, (tx) => tx`select 1 as x from llamada_ai
+        where workspace_id = ${wsE} and reto_id = ${retoE}`);
+      expect(llamadas.length).toBe(1);
+      const pendientes = await conUsuario(curadorId, (tx) => tx`select 1 as x from propuesta_ai
+        where workspace_id = ${wsE} and reto_id = ${retoE} and estado = 'propuesta'`);
+      expect(pendientes.length).toBe(1);
+
+      // Y el suelo es el índice único parcial por reto: ni por SQL crudo caben dos.
+      await conUsuario(curadorId, (tx) => tx`insert into reserva_ai
+        (workspace_id, capacidad, reto_id, unidades, creado_por)
+        values (${wsE}, 'C0', ${retoE}, 2, ${curadorId})`);
+      await expect(
+        conUsuario(curadorId, (tx) => tx`insert into reserva_ai
+          (workspace_id, capacidad, reto_id, unidades, creado_por)
+          values (${wsE}, 'C0', ${retoE}, 2, ${curadorId})`),
+      ).rejects.toThrow(/duplicate key|unique/i);
+    });
   });
 
   it('una degradación de modelo deja DOS filas en el libro, una por intento', async () => {

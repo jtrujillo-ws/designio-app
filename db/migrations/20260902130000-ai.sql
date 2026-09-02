@@ -655,33 +655,53 @@ revoke execute on function propuesta_ai_materializacion_guard() from public;
  * el gasto en el proveedor ya se había hecho.
  *
  * Una fila de reserva ocupa el hueco durante la llamada: se toma bajo candado consultivo
- * del workspace, se consume (se borra) en la MISMA transacción que persiste las
- * propuestas, y se libera si la generación no llega a nacer — una llamada fallida sigue
- * sin consumir presupuesto. Caduca sola: si el proceso muere, la reserva deja de contar
- * pasada la ventana en vez de bloquear el workspace para siempre.
+ * del workspace, se retira al terminar la generación y caduca sola, así que un proceso
+ * muerto a mitad no bloquea el workspace para siempre.
  *
- * Y para CI hace de token de exclusión por item: dos curadores no pueden tener a la vez
- * una generación en curso sobre el mismo item de bandeja, así que el gasto duplicado en
- * el proveedor se corta ANTES de la llamada (el índice único parcial de propuesta_ai es
- * el suelo, pero llega cuando el dinero ya se gastó).
+ * Lo que la reserva NO es (y sí era en su primera versión) es la contabilidad del gasto.
+ * El tope diario cuenta LLAMADAS ATENDIDAS —las filas de `llamada_ai`—, porque es donde
+ * está el dinero: una negativa del proveedor o una salida fuera de contrato se pagan y no
+ * producen propuesta, y contando propuestas se podía reintentar sin fin sin mover el
+ * contador. Así que retirar la reserva ya no «devuelve» nada: solo dice que esa generación
+ * dejó de estar en vuelo, y lo que se gastó por el camino ya está anotado en el libro.
+ *
+ * Y hace de token de exclusión por ancla —item para CI, reto para C0—: dos curadores no
+ * pueden tener a la vez una generación en curso sobre el mismo objeto, así que el gasto
+ * duplicado se corta ANTES de la llamada (el índice único parcial de propuesta_ai es el
+ * suelo para CI, pero llega cuando el dinero ya se gastó).
  */
 create table reserva_ai (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references workspace(id),
   capacidad text not null check (capacidad in ('C0', 'CI')),
+  -- El ancla que se está procesando. Las DOS columnas, no solo el item: la reserva es
+  -- también el token de exclusión por ancla, y con `item_id` a secas las generaciones C0
+  -- no excluían nada — dos curadores podían despachar sobre el mismo reto a la vez, pagar
+  -- dos veces y dejar dos lotes pendientes sobre un ancla que la pantalla promete ofrecer
+  -- una sola vez. El mismo agujero que ya estaba tapado para CI.
   item_id uuid,
-  -- Cuántas propuestas puede llegar a persistir esta generación (el techo que admite el
-  -- esquema de la capacidad), no cuántas se le piden al modelo.
+  reto_id uuid,
+  -- Cuántas LLAMADAS al proveedor puede llegar a hacer esta generación (primario y, si el
+  -- primero cae por indisponibilidad, respaldo). Es lo que se aparta del presupuesto: el
+  -- tope diario acota lo que se PAGA, y se paga por llamada atendida, no por propuesta.
   unidades smallint not null check (unidades between 1 and 8),
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
   foreign key (item_id, workspace_id) references item_importacion (id, workspace_id),
-  check ((capacidad = 'CI') = (item_id is not null))
+  foreign key (reto_id, workspace_id) references reto (id, workspace_id),
+  check ((capacidad = 'CI') = (item_id is not null)),
+  check ((capacidad = 'C0') = (reto_id is not null))
 );
 create index reserva_ai_ws_idx on reserva_ai (workspace_id, creado_en);
+-- Un índice parcial POR COLUMNA y no uno sobre un `coalesce` de las dos: cada uno dice su
+-- promesa por separado —«un item, una generación en vuelo» y «un reto, una generación en
+-- vuelo»— y así un reto puede tener en curso su C0 mientras un item cualquiera tiene el
+-- suyo, sin estorbarse por compartir una clave sintética.
 create unique index reserva_ai_item_idx on reserva_ai (workspace_id, item_id)
   where item_id is not null;
+create unique index reserva_ai_reto_idx on reserva_ai (workspace_id, reto_id)
+  where reto_id is not null;
 
 -- Ventana de vida de una reserva: cuatro veces el timeout duro del proveedor. Se define
 -- una sola vez y AQUÍ para que el conteo del servicio y la limpieza no puedan divergir;

@@ -17,10 +17,19 @@ import type { OrigenKey } from './ai.schemas';
 export const MODELO_PRIMARIO = 'claude-opus-5';
 export const MODELO_FALLBACK = 'claude-sonnet-5';
 
-/** Presupuesto AI por workspace (RF-08.5): corte SUAVE — al agotarse se pausan las
- * capacidades AI, jamás un flujo de negocio. Un valor inválido cae al default y nunca
- * desactiva el tope. */
-export const LIMITE_PROPUESTAS_DIA = 60;
+/**
+ * Presupuesto AI por workspace (RF-08.5, diseño técnico · «cuota diaria de llamadas AI»):
+ * corte SUAVE — al agotarse se pausan las capacidades AI, jamás un flujo de negocio. Un
+ * valor inválido cae al default y nunca desactiva el tope.
+ *
+ * La unidad es la LLAMADA ATENDIDA por el proveedor, no la propuesta persistida, porque el
+ * tope acota lo que se PAGA y no lo que se produce. Contando propuestas, una negativa del
+ * proveedor o una salida fuera de contrato —dos llamadas facturadas de las que no nace
+ * nada— dejaban el contador intacto: con un material que el modelo rechaza siempre, se
+ * podía reintentar sin fin gastando sin tope. Y es la misma magnitud que suma el reporte de
+ * costos sobre `llamada_ai`: el número que frena y el número que informa son uno.
+ */
+export const LIMITE_LLAMADAS_DIA = 60;
 
 /**
  * Tarifa del proveedor en USD por millón de tokens, por modelo de la política. Vive en
@@ -83,7 +92,9 @@ export type EstadoCapacidadAI = {
   motivo: string;
   origenKey: OrigenKey | null;
   modelo: string;
-  propuestasHoy: number;
+  /** Llamadas al proveedor ATENDIDAS hoy por este workspace: lo que se ha pagado, que es
+   * lo que el tope acota. */
+  llamadasHoy: number;
   limiteDiario: number;
 };
 
@@ -102,18 +113,18 @@ const COLA_MANUAL = 'Todo el flujo sigue disponible a mano.';
 export function evaluarCapacidadAI(entrada: {
   keyWorkspace?: string | null;
   keyEntorno?: string | null;
-  propuestasHoy?: number;
+  llamadasHoy?: number;
   limiteDiario?: number;
-  /** Cuántas propuestas puede llegar a persistir la generación que se está admitiendo
-   * (el techo de la capacidad). El panel no pasa ninguna: pregunta por el estado, no
-   * pide hueco. Sin esto, «queda 1 y la generación produce 4» pasaba el chequeo. */
+  /** Cuántas llamadas puede llegar a hacer la generación que se está admitiendo (primario
+   * y, si cae, respaldo). El panel no pasa ninguna: pregunta por el estado, no pide hueco.
+   * Sin esto, «queda 1 y la generación puede gastar 2» pasaba el chequeo. */
   unidades?: number;
 }): EstadoCapacidadAI {
   const limite =
     Number.isInteger(entrada.limiteDiario) && (entrada.limiteDiario as number) > 0
       ? (entrada.limiteDiario as number)
-      : LIMITE_PROPUESTAS_DIA;
-  const usadas = Number.isFinite(entrada.propuestasHoy) ? Math.max(0, entrada.propuestasHoy!) : 0;
+      : LIMITE_LLAMADAS_DIA;
+  const usadas = Number.isFinite(entrada.llamadasHoy) ? Math.max(0, entrada.llamadasHoy!) : 0;
   const piden =
     Number.isInteger(entrada.unidades) && (entrada.unidades as number) > 0
       ? (entrada.unidades as number)
@@ -123,7 +134,7 @@ export function evaluarCapacidadAI(entrada: {
   const delEntorno = (entrada.keyEntorno ?? '').trim();
   const origenKey: OrigenKey | null = delWorkspace ? 'workspace' : delEntorno ? 'entorno' : null;
 
-  const base = { modelo: MODELO_PRIMARIO, propuestasHoy: usadas, limiteDiario: limite };
+  const base = { modelo: MODELO_PRIMARIO, llamadasHoy: usadas, limiteDiario: limite };
 
   if (!origenKey) {
     return {
@@ -138,7 +149,7 @@ export function evaluarCapacidadAI(entrada: {
       ...base,
       disponible: false,
       origenKey,
-      motivo: `Presupuesto AI del workspace agotado por hoy (${usadas}/${limite} propuestas). Las capacidades AI quedan en pausa hasta mañana. ${COLA_MANUAL}`,
+      motivo: `Presupuesto AI del workspace agotado por hoy (${usadas}/${limite} llamadas al proveedor). Las capacidades AI quedan en pausa hasta mañana. ${COLA_MANUAL}`,
     };
   }
   if (usadas + piden > limite) {
@@ -146,7 +157,7 @@ export function evaluarCapacidadAI(entrada: {
       ...base,
       disponible: false,
       origenKey,
-      motivo: `El presupuesto AI de hoy no alcanza para esta generación: quedan ${limite - usadas} de ${limite} propuestas y esta puede producir hasta ${piden}. ${COLA_MANUAL}`,
+      motivo: `El presupuesto AI de hoy no alcanza para esta generación: quedan ${limite - usadas} llamadas de ${limite} y esta puede gastar hasta ${piden}. ${COLA_MANUAL}`,
     };
   }
   return { ...base, disponible: true, origenKey, motivo: '' };

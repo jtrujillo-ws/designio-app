@@ -4,7 +4,7 @@ import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { DimensionesEvidenciaSchema, ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { bloquearReto } from '@/lib/metodo/metodo.servicio';
-import { evaluarCapacidadAI, LIMITE_PROPUESTAS_DIA } from './ai.degradacion';
+import { evaluarCapacidadAI, LIMITE_LLAMADAS_DIA } from './ai.degradacion';
 import {
   fidelidadDeCitas,
   materialDeItem,
@@ -62,10 +62,11 @@ const PAGINA_ANCLAS = 50;
 /** Cuántos criterios se le piden a C0 de una vez: revisión por elemento, lote pequeño. */
 const CRITERIOS_POR_GENERACION = 3;
 
-/** Cuántas propuestas puede llegar a PERSISTIR una generación de cada capacidad: el techo
- * que admite su esquema (no el que se le pide al modelo, que puede devolver de más). Es
- * lo que se aparta del presupuesto antes de llamar al proveedor. */
-const UNIDADES_POR_CAPACIDAD: Record<CapacidadActiva, number> = { CI: 1, C0: 4 };
+/** Cuántas LLAMADAS al proveedor puede llegar a hacer una generación: la del modelo
+ * primario y, si cae por indisponibilidad, la del respaldo. Es lo que se aparta del
+ * presupuesto antes de llamar, porque el tope cuenta llamadas atendidas y no propuestas —
+ * el techo de propuestas de cada capacidad ya no dice nada sobre lo que se paga. */
+const INTENTOS_POR_GENERACION = 2;
 
 /** Capa 2: re-check explícito del rol curador (la política RLS es la capa 1). Los mismos
  * que curan la bandeja (RF-03.4) piden y revisan propuestas; `agente-ai` no aparece por
@@ -79,40 +80,51 @@ async function rolCurador(tx: TransactionSql, actorId: string, workspaceId: stri
 }
 
 /**
- * Presupuesto AI del workspace (RF-08.5): propuestas generadas hoy. Es un corte SUAVE y
- * por eso se cuenta lo PERSISTIDO —una llamada fallida no consume presupuesto— con el día
- * del servidor, que es también el que usa el reporte de costos.
+ * Presupuesto AI del workspace (RF-08.5): llamadas al proveedor ATENDIDAS hoy. Es un corte
+ * SUAVE, con el día del servidor, y se cuenta sobre `llamada_ai` —el mismo libro que suma
+ * el reporte de costos— porque el tope acota lo que se PAGA, no lo que se produce.
  *
- * `reservadas` son las generaciones EN CURSO (huecos apartados antes de llamar al
- * proveedor): cuentan para admitir una generación nueva, porque si no, N curadores
- * simultáneos leen todos el mismo «quedan sitios» y todos escriben. No cuentan para el
- * número que pinta el panel, que informa de lo realmente gastado hoy.
+ * Contando propuestas persistidas, el gasto que no producía objeto era invisible para el
+ * tope: una negativa del proveedor o una salida fuera de contrato se facturan, liberan la
+ * reserva y no dejan propuesta, así que un material que el modelo rechaza siempre se podía
+ * reintentar sin fin. El número que frena y el número que informa tienen que ser el mismo.
+ *
+ * `sin-respuesta` NO cuenta: ahí no hubo respuesta y no sabemos si el proveedor llegó a
+ * cobrar — «no se sabe» no es «se pagó», la misma distinción que hace `costo_usd = null`.
+ * Y cobrar por una caída convertiría un incidente del proveedor en un workspace sin
+ * capacidad AI por el resto del día, justo lo contrario de la degradación segura (SYS-21).
+ *
+ * `reservadas` son las generaciones EN CURSO (huecos apartados antes de llamar): cuentan
+ * para admitir una nueva, porque si no, N curadores simultáneos leen todos el mismo «quedan
+ * sitios» y todos llaman. Mientras una generación anota sus llamadas y aún no ha soltado su
+ * reserva se cuenta dos veces; el error es conservador —nunca deja pasar de más— y dura lo
+ * que tarda en terminar.
  */
 async function presupuestoDeHoy(
   tx: TransactionSql,
   workspaceId: string,
-): Promise<{ persistidas: number; reservadas: number }> {
+): Promise<{ atendidas: number; reservadas: number }> {
   const [fila] = await tx`select
-      (select count(*) from propuesta_ai
-        where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now()))::int
-        as persistidas,
+      (select count(*) from llamada_ai
+        where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now())
+          and resultado <> 'sin-respuesta')::int as atendidas,
       (select coalesce(sum(unidades), 0) from reserva_ai
         where workspace_id = ${workspaceId} and creado_en > now() - reserva_ai_ventana())::int
         as reservadas`;
   return {
-    persistidas: (fila?.persistidas ?? 0) as number,
+    atendidas: (fila?.atendidas ?? 0) as number,
     reservadas: (fila?.reservadas ?? 0) as number,
   };
 }
 
 async function estadoCapacidad(tx: TransactionSql, workspaceId: string) {
   const { keyWorkspace, keyEntorno } = credencialesAI();
-  const { persistidas } = await presupuestoDeHoy(tx, workspaceId);
+  const { atendidas } = await presupuestoDeHoy(tx, workspaceId);
   return evaluarCapacidadAI({
     keyWorkspace,
     keyEntorno,
-    propuestasHoy: persistidas,
-    limiteDiario: LIMITE_PROPUESTAS_DIA,
+    llamadasHoy: atendidas,
+    limiteDiario: LIMITE_LLAMADAS_DIA,
   });
 }
 
@@ -282,7 +294,7 @@ export async function panelPropuestas(
         disponible: ai.disponible,
         motivo: ai.motivo,
         modelo: ai.modelo,
-        propuestasHoy: ai.propuestasHoy,
+        llamadasHoy: ai.llamadasHoy,
         limiteDiario: ai.limiteDiario,
       },
       pendientes: pendientes.slice(0, PAGINA_PENDIENTES).map(filaDePanel),
@@ -329,7 +341,7 @@ type Alcance = {
  * a la vez ven el mismo hueco libre.
  */
 async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Promise<Alcance> {
-  const unidades = UNIDADES_POR_CAPACIDAD[entrada.capacidad];
+  const unidades = INTENTOS_POR_GENERACION;
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await rolCurador(tx, actorId, entrada.workspaceId);
@@ -430,22 +442,32 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       where workspace_id = ${entrada.workspaceId}
         and creado_en <= now() - reserva_ai_ventana()`;
 
-    if (entrada.capacidad === 'CI') {
-      const [enCurso] = await tx`select 1 as hay from reserva_ai
-        where workspace_id = ${entrada.workspaceId} and item_id = ${entrada.anclaId}`;
-      if (enCurso) {
-        throw new ErrorAI(
-          'Ese item ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
-        );
-      }
+    // Exclusión por ANCLA, no solo por item: dos curadores no pueden tener a la vez una
+    // generación en vuelo sobre el mismo objeto. Para C0 esto faltaba —la reserva no
+    // guardaba el reto, así que no excluía nada— y dos lotes podían despacharse a la vez
+    // sobre el mismo reto: se pagaba dos veces y quedaban dos lotes pendientes sobre un
+    // ancla que la pantalla ofrece una sola vez. Los dos caminos toman el MISMO candado
+    // (el del presupuesto del workspace) antes de mirar, que es lo que hace que mirar sirva.
+    const [enCurso] =
+      entrada.capacidad === 'CI'
+        ? await tx`select 1 as hay from reserva_ai
+            where workspace_id = ${entrada.workspaceId} and item_id = ${entrada.anclaId}`
+        : await tx`select 1 as hay from reserva_ai
+            where workspace_id = ${entrada.workspaceId} and reto_id = ${entrada.anclaId}`;
+    if (enCurso) {
+      throw new ErrorAI(
+        entrada.capacidad === 'CI'
+          ? 'Ese item ya tiene una generación AI en curso: espera a que termine antes de pedir otra'
+          : 'Ese reto ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      );
     }
 
-    const { persistidas, reservadas } = await presupuestoDeHoy(tx, entrada.workspaceId);
+    const { atendidas, reservadas } = await presupuestoDeHoy(tx, entrada.workspaceId);
     const ai = evaluarCapacidadAI({
       keyWorkspace,
       keyEntorno,
-      propuestasHoy: persistidas + reservadas,
-      limiteDiario: LIMITE_PROPUESTAS_DIA,
+      llamadasHoy: atendidas + reservadas,
+      limiteDiario: LIMITE_LLAMADAS_DIA,
       unidades,
     });
     if (!ai.disponible || !ai.origenKey) throw new ErrorAI(ai.motivo);
@@ -454,15 +476,20 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     let reserva;
     try {
       [reserva] = await tx`insert into reserva_ai
-        (workspace_id, capacidad, item_id, unidades, creado_por)
+        (workspace_id, capacidad, item_id, reto_id, unidades, creado_por)
         values (${entrada.workspaceId}, ${entrada.capacidad},
-                ${entrada.capacidad === 'CI' ? entrada.anclaId : null}, ${unidades}, ${actorId})
+                ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
+                ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
+                ${unidades}, ${actorId})
         returning id`;
     } catch (e) {
-      // El índice único de la reserva por item: el candado ya serializa a los curadores,
-      // así que aquí solo se llega por un camino que no pasara por él.
+      // Los índices únicos parciales de la reserva (uno por item, otro por reto): el candado
+      // ya serializa a los curadores, así que aquí solo se llega por un camino que no pasara
+      // por él. Son el suelo de la exclusión, no su mecanismo.
       if ((e as { code?: string }).code === '23505') {
-        throw new ErrorAI('Ese item ya tiene una generación AI en curso: espera a que termine');
+        throw new ErrorAI(
+          'Ese ancla ya tiene una generación AI en curso: espera a que termine',
+        );
       }
       throw e;
     }
@@ -479,9 +506,10 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
   });
 }
 
-/** Devuelve el hueco al presupuesto cuando la generación no llegó a persistir: una
- * llamada fallida no consume presupuesto (y no hay que esperar a que la reserva caduque
- * para volver a intentarlo sobre el mismo item). Idempotente. */
+/** Retira la reserva cuando la generación no llegó a persistir. Ojo con lo que esto ES y
+ * lo que ya NO es: no devuelve presupuesto —lo que se llegó a pagar quedó anotado en
+ * `llamada_ai` y cuenta para todos—, solo declara que esa ancla ya no tiene una generación
+ * en vuelo, para no obligar a esperar a que caduque antes de reintentar. Idempotente. */
 async function liberarReserva(
   actorId: string,
   workspaceId: string,
@@ -702,32 +730,17 @@ async function persistirPropuestas(
     await exigirCuentaActiva(tx, actorId);
     await bloquearPresupuesto(tx, entrada.workspaceId);
 
-    // La fila se retira siempre —no dejamos basura— pero solo vale como hueco si sigue
-    // VIGENTE. Una reserva caducada dejó de contar en `presupuestoDeHoy` hace rato, así que
-    // otra generación ya pudo reclamar esa misma capacidad; aceptarla aquí como token bueno
-    // saltaba justo el re-chequeo que existe para ese caso, y las dos persistían. La
-    // asimetría era el fallo: para admitir se ignoraba y para consumir se aceptaba.
-    const consumida = await tx`delete from reserva_ai
-      where id = ${alcance.reservaId} and workspace_id = ${entrada.workspaceId}
-      returning unidades, creado_en > now() - reserva_ai_ventana() as vigente`;
-    const apartadas =
-      consumida.length > 0 && consumida[0]!.vigente ? Number(consumida[0]!.unidades) : 0;
-    // Sin hueco válido (la reserva caducó o ya no está: proveedor lentísimo, proceso
-    // reiniciado, revocación que la retiró) este insert volvería a ser el chequeo obsoleto
-    // que dejaba pasar a todos, así que se re-comprueba el presupuesto con el estado de
-    // AHORA antes de escribir nada.
-    if (contenidos.length > apartadas) {
-      const { keyWorkspace, keyEntorno } = credencialesAI();
-      const { persistidas, reservadas } = await presupuestoDeHoy(tx, entrada.workspaceId);
-      const ai = evaluarCapacidadAI({
-        keyWorkspace,
-        keyEntorno,
-        propuestasHoy: persistidas + reservadas,
-        limiteDiario: LIMITE_PROPUESTAS_DIA,
-        unidades: contenidos.length,
-      });
-      if (!ai.disponible) throw new ErrorAI(ai.motivo);
-    }
+    // Retirar la reserva ya no «devuelve» presupuesto: desde que el tope cuenta llamadas
+    // atendidas, lo que esta generación gastó está anotado en `llamada_ai` y contado para
+    // todo el mundo desde antes de llegar aquí. La reserva solo decía «hay una generación
+    // en vuelo sobre esta ancla», y eso deja de ser cierto ahora.
+    //
+    // Por eso tampoco se re-comprueba el presupuesto antes de escribir: la llamada ya se
+    // pagó, y negarse a guardar su salida no des-gasta nada — solo tira lo comprado. El
+    // tope frena donde puede frenar el gasto, que es la admisión (y el despacho, que exige
+    // la reserva viva). Una reserva caducada no concede capacidad en ninguno de los dos.
+    await tx`delete from reserva_ai
+      where id = ${alcance.reservaId} and workspace_id = ${entrada.workspaceId}`;
 
     const destino = DESTINO_DE_CAPACIDAD[entrada.capacidad];
     // UNA sentencia para el lote entero: el evento PropuestaAIGenerada de cada fila lo

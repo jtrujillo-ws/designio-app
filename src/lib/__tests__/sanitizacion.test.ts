@@ -49,6 +49,33 @@ describe('sanitización del material importado', () => {
     expect(validarTextoImportado('linea1\nlinea2\r\n\tsangrada').ok).toBe(true);
   });
 
+  it('el bloque C1 ENTERO se rechaza: la promesa decía C0/C1 y la clase se paraba en DEL', () => {
+    // El comentario del módulo prometía «controles C0/C1» desde el primer día, pero la
+    // clase iba de U+0000 a U+007F: todo U+0080-U+009F entraba como texto legítimo.
+    // U+0085 (NEL) lo tratan como salto de línea varios editores y U+009B (CSI) es la
+    // forma de un solo byte del introductor de secuencias ANSI: los dos hacen que el
+    // curador LEA algo distinto de lo que quedó guardado, que es el acto humano sobre el
+    // que se apoya SYS-16. Se recorre el bloque completo para que nadie lo estreche.
+    for (let punto = 0x80; punto <= 0x9f; punto += 1) {
+      const v = validarTextoImportado(`hola${String.fromCodePoint(punto)}mundo`);
+      expect([punto, v.ok]).toEqual([punto, false]);
+    }
+    // Y el mensaje sigue localizando el carácter exacto, no un «texto inválido».
+    const v = validarTextoImportado('inicio\u0085fin');
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.motivo).toContain('U+0085');
+    // El vecindario inmediato NO se rechaza: U+00A0 y siguientes son texto real.
+    expect(validarTextoImportado('espacio duro y ¡hola!').ok).toBe(true);
+  });
+
+  it('el nombre de archivo tampoco conserva controles C1 (el CHECK usa [[:cntrl:]])', () => {
+    // `archivo_nombre_seguro` rechaza `[[:cntrl:]]`, que en UTF-8 SÍ incluye C1. Con el
+    // rango corto la app generaba nombres que el esquema rechazaba: el curador veía un
+    // 23514 opaco en vez de un nombre ya limpio. El backstop confirma lo que la app hace.
+    expect(normalizarNombreArchivo('informe\u0085raro.pdf')).toBe('informeraro.pdf');
+    expect(normalizarNombreArchivo('a\u009Bb.csv')).toBe('ab.csv');
+  });
+
   it('el rechazo dice qué carácter y dónde (el curador limpia el original, no el sistema)', () => {
     const v = validarTextoImportado('inicio\u0007fin');
     expect(v.ok).toBe(false);

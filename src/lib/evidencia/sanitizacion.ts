@@ -30,10 +30,21 @@
  *    salvo los tres formatos ráster, que no ejecutan nada.
  */
 
-/** Controles C0/C1 (sin tab/LF/CR) y overrides bidi. Mismo predicado que el CHECK
- * `texto_importado_limpio` de la base: la app explica, el esquema garantiza. */
+/**
+ * Controles C0/C1 (sin tab/LF/CR) y overrides bidi. Mismo predicado que el CHECK
+ * `texto_importado_limpio` de la base: la app explica, el esquema garantiza — y por eso
+ * las dos clases tienen que ser idénticas rango a rango, no «parecidas».
+ *
+ * El tramo que va de DEL al final del bloque C1 es el que faltaba. El comentario de este
+ * módulo prometía «C0/C1» desde el primer día pero la clase se paraba en U+007F, así que
+ * U+0085 (NEL, que varios editores tratan como salto de línea) y U+009B (CSI, la forma de
+ * un solo byte del introductor de secuencias ANSI) entraban como texto legítimo — y son
+ * exactamente el tipo de carácter que hace que el curador LEA algo distinto de lo que
+ * quedó guardado, el acto humano en el que se apoya SYS-16. Que la promesa estuviera
+ * escrita no la convertía en predicado.
+ */
 // eslint-disable-next-line no-control-regex
-const PROHIBIDOS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+const PROHIBIDOS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 
 export type Veredicto = { ok: true } | { ok: false; motivo: string };
 
@@ -112,12 +123,18 @@ const TEXTUALES = new Set(['text/plain', 'text/csv', 'text/markdown']);
  * no es material citable —no lleva offsets— y se usa como identificador al descargar,
  * donde una ruta o un control sí serían un problema real. Espejo del CHECK
  * `archivo_nombre_seguro`.
+ *
+ * El rango de controles llega hasta el final de C1 por la misma razón que el de la
+ * ingesta, y además por una concreta: el CHECK usa `[[:cntrl:]]`, que en UTF-8 SÍ incluye
+ * el bloque C1. Con el rango corto, la app producía nombres que el esquema rechazaba y el
+ * curador veía un 23514 opaco en vez de un nombre ya limpio. El backstop debe confirmar lo
+ * que la app hace, no contradecirlo.
  */
 export function normalizarNombreArchivo(nombre: string): string {
   const soloBase = nombre.split(/[/\\]/).pop() ?? '';
   const limpio = soloBase
     // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u001F\u007F"]/g, '')
+    .replace(/[\u0000-\u001F\u007F-\u009F"]/g, '')
     .replace(/\s+/g, ' ')
     .replace(/^\.+/, '')
     .trim()

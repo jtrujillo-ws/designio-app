@@ -290,11 +290,25 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     expect(paquete.datos.arquetipo_evidencia).toHaveLength(2);
 
     // La ejecución queda registrada en el propio workspace (RF-01.6/01.8).
-    const [evento] = await admin`select payload, actor_id, actor_rol from evento_dominio
+    const [evento] = await admin`select payload, actor_id, actor_rol, creado_en from evento_dominio
       where workspace_id = ${ws} and tipo = 'WorkspaceExportado'
       order by creado_en desc limit 1`;
     expect(evento!.actor_id).toBe(adminClienteId);
     expect((evento!.payload as { ambito: string }).ambito).toBe('archivo');
+
+    // El manifiesto lleva el instante de la TRANSACCIÓN (`now()`), que es del que deriva
+    // el `current_date` con el que `evidencia_usable` decide qué derechos siguen vigentes.
+    // La auditoría usa otro reloj a propósito —`clock_timestamp()`, para que varios eventos
+    // de una misma transacción conserven su orden real (20260902090000)— y por eso lo que
+    // se comprueba es la DESIGUALDAD: el inicio de la transacción no puede ser posterior al
+    // instante en que esa misma transacción insertó su evento. Es exactamente la aserción
+    // que el código anterior fallaba: `new Date()` se evaluaba tras las treinta y pico
+    // consultas del volcado, siempre DESPUÉS del evento.
+    const instanteManifiesto = Date.parse(paquete.manifiesto.generadoEn);
+    const instanteEvento = (evento!.creado_en as Date).getTime();
+    expect(instanteManifiesto).toBeLessThanOrEqual(instanteEvento);
+    // Y no es un valor cualquiera de otro momento: pertenece a esta misma exportación.
+    expect(instanteEvento - instanteManifiesto).toBeLessThan(1000);
   });
 
   it('el entregable excluye la evidencia sin derechos y DICE por qué (SYS-14/SYS-17)', async () => {

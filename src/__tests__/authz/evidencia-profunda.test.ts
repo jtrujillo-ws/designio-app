@@ -889,6 +889,41 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     // SQL crudo, que sigue chocando con 23514.)
   });
 
+  it('el CHECK de la base rechaza el bloque C1 entero, igual que el validador de la app', async () => {
+    // Los dos predicados son espejo: si divergen, el respaldo del esquema deja de serlo.
+    // Se recorre TODO U+0080-U+009F contra la función de la base, que es lo que ejecuta el
+    // CHECK, y se comprueba de paso que el vecindario (U+00A0 en adelante) sigue siendo
+    // texto legítimo — un predicado demasiado ancho rompería material real.
+    const admin = sqlAdmin();
+    const [veredicto] = await admin`select
+      bool_and(not texto_importado_limpio('hola' || chr(g) || 'mundo')) as c1_rechazado,
+      texto_importado_limpio('espacio ' || chr(160) || 'duro y acentos áéí') as vecino_ok
+      from generate_series(128, 159) g`;
+    expect(veredicto!.c1_rechazado).toBe(true);
+    expect(veredicto!.vecino_ok).toBe(true);
+
+    // Y por SQL CRUDO del rol de aplicación: NEL en el contenido y CSI en el título
+    // chocan con el CHECK, que es donde la promesa deja de depender de la app.
+    const item = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Base para el check C1',
+      contenido: 'limpio',
+      tipoFuente: 'nota',
+      referencia: '',
+    });
+    expect(item.itemId).toBeTruthy();
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into item_importacion
+        (workspace_id, titulo, contenido, tipo_fuente, creado_por)
+        values (${ws}, 'con NEL', 'hola' || chr(133) || 'mundo', 'nota', ${leadId})`),
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into item_importacion
+        (workspace_id, titulo, contenido, tipo_fuente, creado_por)
+        values (${ws}, 'con CSI ' || chr(155), 'texto', 'nota', ${leadId})`),
+    ).rejects.toMatchObject({ code: '23514' });
+  });
+
   it('el seed no deja evidencia sin registro de derechos (el guard se lo salta, la regla no)', async () => {
     // El seed corre como PROPIETARIO, así que el pre-chequeo anti-oráculo de
     // `evidencia_con_derechos_guard` sale antes y no verifica nada. Eso es correcto —el

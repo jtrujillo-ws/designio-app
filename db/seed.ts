@@ -242,13 +242,86 @@ async function sembrarEvidenciaProfunda(
   return true;
 }
 
+/**
+ * Las dos evidencias de la cadena, por TÍTULO: es lo que identifica a la evidencia que
+ * esta función siembra, tanto si acaba de crearla como si ya estaba de una corrida
+ * anterior. Cada una con la base documental que justifica su concesión.
+ */
+const DERECHOS_CADENA = [
+  {
+    titulo: 'Funnel de apertura: 62% de abandono en verificación',
+    base: 'Cláusula 7 del contrato de servicios: analítica agregada, sin datos personales',
+  },
+  {
+    titulo: 'Entrevistas en sucursal: abandono del 20%',
+    base: 'Consentimiento informado firmado por los seis asesores entrevistados',
+  },
+] as const;
+
+/**
+ * Derechos CONCEDIDOS (ámbito cliente) para la evidencia de la cadena de demo, tanto si la
+ * fila de derechos falta como si existe todavía en 'pendiente'.
+ *
+ * Por qué concedidos y no pendientes: estas dos evidencias son justamente las que sostienen
+ * la cadena —una está citada en el insight validado que respalda la decisión de G1, y citar
+ * exige derechos vigentes; la otra apoya el arquetipo confirmado—. Dejarlas pendientes deja
+ * el demo contradiciéndose: una cita que hoy el propio producto no dejaría crear. El caso
+ * «bloqueada a propósito» ya está sembrado y vive donde le toca, en la evidencia sin
+ * consentimiento de sembrarEvidenciaProfunda.
+ *
+ * Por qué hace falta ponerlos a mano: el seed corre como PROPIETARIO, así que el
+ * pre-chequeo anti-oráculo de `evidencia_con_derechos_guard` sale antes y no comprueba
+ * nada. El guard se salta la comprobación, no la regla.
+ *
+ * Dos propiedades que sostienen la idempotencia:
+ *  · Solo toca lo que está en 'pendiente'. Si un operador denegó estos derechos a mano
+ *    —o los concedió con otro ámbito— el seed NO le pisa la decisión: repara el estado
+ *    fail-closed que dejó el backfill, no cualquier estado.
+ *  · Identifica la evidencia por el título que ESTA función siembra, dentro de su
+ *    workspace: mira lo que ella misma produce, que es la lección de la guarda anterior.
+ */
+async function asegurarDerechosDeCadena(
+  tx: TransactionSql,
+  wsId: string,
+  luciaId: string,
+): Promise<void> {
+  for (const { titulo, base } of DERECHOS_CADENA) {
+    // Falta la fila entera (base sembrada por una versión sin derechos y nunca migrada).
+    await tx`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      select ${wsId}, e.id, 'concedido', 'cliente', ${base}, ${luciaId}, now(), ${luciaId}
+      from evidencia e
+      where e.workspace_id = ${wsId} and e.titulo = ${titulo}
+        and not exists (select 1 from derecho_uso d where d.evidencia_id = e.id)`;
+    // O existe en 'pendiente' porque la puso el backfill de la migración.
+    await tx`update derecho_uso d
+      set estado = 'concedido', ambito = 'cliente', base = ${base},
+          decidido_por = ${luciaId}, decidido_en = now()
+      from evidencia e
+      where e.id = d.evidencia_id and e.workspace_id = ${wsId}
+        and d.workspace_id = ${wsId} and e.titulo = ${titulo}
+        and d.estado = 'pendiente'`;
+  }
+}
+
 /** Cadena de razonamiento de demo (SPEC-03/04): evidencia curada → insight validado
  * con citas y una contradicción a la vista → decisión aprobada en G1 y un arquetipo
  * confirmado. Es lo que hace demostrable el grafo sin pasar por toda la curaduría.
- * Idempotente: la señal es el insight del workspace. */
+ * Idempotente: la señal es el insight del workspace — pero los DERECHOS de la cadena se
+ * aseguran en las dos ramas, porque una base sembrada por una versión anterior ya tiene
+ * el insight y aun así necesita repararlos. */
 async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string): Promise<void> {
   const yaHay = await tx`select 1 from insight where workspace_id = ${wsId}`;
-  if (yaHay.length > 0) return;
+  if (yaHay.length > 0) {
+    // La cadena ya está sembrada, pero puede venir de ANTES de que esta función creara los
+    // derechos de sus dos evidencias. En esa base el backfill de la migración 140000 les
+    // puso una fila 'pendiente' (fail-closed, correcto en general) y el resultado tras el
+    // upgrade es un demo que se contradice: un insight validado cuya cita apunta a
+    // evidencia bloqueada, y una cita que hoy el propio producto no dejaría crear. Los
+    // derechos de la cadena CONOCIDA se ponen igual, sin volver a sembrar nada.
+    await asegurarDerechosDeCadena(tx, wsId, luciaId);
+    return;
+  }
 
   const [fuente] = await tx`insert into fuente (workspace_id, tipo, titulo, referencia, creado_por)
     values (${wsId}, 'documento', 'Estudio CX apertura de cuenta 2026',
@@ -279,28 +352,7 @@ async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string):
     returning id`;
   const evDigital = ev1!.id as string;
   const evSucursal = ev2!.id as string;
-
-  // TODA evidencia nace con su registro de derechos. El seed corre como propietario, así
-  // que `evidencia_con_derechos_guard` se lo salta a propósito (su pre-chequeo anti-oráculo
-  // sale antes) y estas dos filas quedaban SIN derechos: bloqueadas por «no tiene registro
-  // de derechos», y sin reparación posible desde el producto — `decidirDerechos` solo hace
-  // UPDATE, y no había fila que actualizar. El guard salta la comprobación, no la regla.
-  //
-  // Se conceden para el ámbito CLIENTE, no pendientes, porque estas dos evidencias son
-  // justamente las que sostienen la cadena de demo: una está citada en el insight validado
-  // que respalda la decisión de G1 —y citar exige derechos vigentes— y la otra apoya el
-  // arquetipo confirmado. Sembrarlas pendientes dejaría el demo contradiciéndose: una cita
-  // que el propio producto no habría dejado crear. El caso «bloqueada a propósito» ya está
-  // sembrado, y es de sembrarEvidenciaProfunda: allí vive la evidencia sin consentimiento.
-  for (const [evidenciaId, base] of [
-    [evDigital, 'Cláusula 7 del contrato de servicios: analítica agregada, sin datos personales'],
-    [evSucursal, 'Consentimiento informado firmado por los seis asesores entrevistados'],
-  ] as const) {
-    await tx`insert into derecho_uso
-      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
-      values (${wsId}, ${evidenciaId}, 'concedido', 'cliente', ${base},
-              ${luciaId}, now(), ${luciaId})`;
-  }
+  await asegurarDerechosDeCadena(tx, wsId, luciaId);
 
   const [ins] = await tx`insert into insight (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
     values (${wsId}, 'La verificación de identidad digital concentra el abandono',

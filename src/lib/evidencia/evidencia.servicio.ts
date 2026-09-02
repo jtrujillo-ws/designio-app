@@ -518,10 +518,12 @@ export async function adjuntarArchivo(
       )
       select id, sha256 from nuevo`;
     } catch (e) {
-      // AD001: el tope por item. El mensaje viene de la base y ya está redactado para no
-      // decir de quién son los adjuntos ni cuántos tiene cada cual (SYS-14: se explica el
-      // bloqueo sin filtrar lo que quien pregunta no podía ver).
-      if ((e as { code?: string }).code === 'AD001') {
+      // AD001 (tope por item) y AD002 (el material ya fue decidido mientras esperábamos
+      // el candado). Los dos mensajes vienen de la base y ya están redactados para no
+      // filtrar: ni de quién son los adjuntos, ni quién selló el material ni cuándo
+      // (SYS-14: se explica el bloqueo sin decir lo que quien pregunta no podía ver).
+      const code = (e as { code?: string }).code;
+      if (code === 'AD001' || code === 'AD002') {
         throw new ErrorCuraduria(
           (e as { message?: string }).message ??
             `Este material ya alcanzó el máximo de ${MAX_ARCHIVOS_POR_ITEM} adjuntos`,
@@ -550,7 +552,12 @@ export async function eliminarArchivo(
     const [dueno] = await tx`select item_id from archivo_importado
       where id = ${archivoId} and workspace_id = ${workspaceId}`;
     if (dueno) await bloquearItem(tx, dueno.item_id as string);
-    const borradas = await tx`
+    // El DELETE puede chocar con AD002: su política eligió el adjunto con el item todavía
+    // pendiente, y para cuando el trigger soltó el candado el curador ya había sellado.
+    // Sin traducirlo, el curador vería un error de driver en vez del motivo.
+    let borradas;
+    try {
+      borradas = await tx`
       with quien as (
         select workspace_role(${actorId}, ${workspaceId}) as rol
       ),
@@ -568,6 +575,14 @@ export async function eliminarArchivo(
         from fuera, quien
       )
       select id from fuera`;
+    } catch (e) {
+      if ((e as { code?: string }).code === 'AD002') {
+        throw new ErrorCuraduria(
+          (e as { message?: string }).message ?? 'El material ya fue decidido',
+        );
+      }
+      throw e;
+    }
     if (borradas.length === 0) {
       throw new ErrorCuraduria(
         'El adjunto no existe, su material ya fue curado o no puedes retirarlo',

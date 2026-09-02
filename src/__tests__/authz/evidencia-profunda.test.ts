@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import type { TransactionSql } from 'postgres';
 import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
 import {
   adjuntarArchivo,
@@ -27,7 +26,7 @@ import { aprobarGate, marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servic
 import { rechazarItem } from '@/lib/evidencia/evidencia.servicio';
 import { gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
 import { bytesABase64, MAX_ARCHIVOS_POR_ITEM } from '@/lib/evidencia/sanitizacion';
-import { describeAuthz } from './helpers';
+import { describeAuthz, enVuelo, sigueEsperando } from './helpers';
 
 /**
  * SPEC-03 (resto) — derechos de uso BLOQUEANTES (RF-03.10, SYS-14), archivos adjuntos
@@ -35,52 +34,6 @@ import { describeAuthz } from './helpers';
  * se impone en la BASE: se verifica por el servicio y también por SQL crudo del rol de
  * aplicación, que es donde una regla escrita solo en la app se caería.
  */
-/**
- * Deja una transacción ADMIN abierta después de ejecutar `fn`, y devuelve cómo cerrarla.
- * Es la única forma de comprobar un candado de verdad: hay que tener el conflicto EN
- * VUELO —commiteado ni bloquea ni prueba nada— mientras el otro camino intenta decidir.
- */
-async function enVuelo(
-  fn: (tx: TransactionSql) => Promise<void>,
-): Promise<{ cerrar: () => Promise<void> }> {
-  let listo!: () => void;
-  const tomado = new Promise<void>((r) => {
-    listo = r;
-  });
-  let liberar!: () => void;
-  const puedeCerrar = new Promise<void>((r) => {
-    liberar = r;
-  });
-  const terminada = sqlAdmin().begin(async (tx) => {
-    await fn(tx);
-    listo();
-    await puedeCerrar;
-  });
-  await tomado;
-  return {
-    cerrar: async () => {
-      liberar();
-      await terminada;
-    },
-  };
-}
-
-/**
- * ¿La promesa sigue SIN resolverse pasado `ms`? Es cómo se comprueba que algo espera por
- * un candado: sin candado compartido, la operación resuelve en milisegundos porque su
- * lectura no choca con nada. Se enganchan los dos manejadores antes de esperar para que
- * un rechazo no quede sin capturar.
- */
-async function sigueEsperando(p: Promise<unknown>, ms = 400): Promise<boolean> {
-  let resuelta = false;
-  const marcar = () => {
-    resuelta = true;
-  };
-  p.then(marcar, marcar);
-  await new Promise((r) => setTimeout(r, ms));
-  return !resuelta;
-}
-
 describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitización', () => {
   const marca = `prof-${crypto.randomUUID().slice(0, 8)}`;
   let ws = '';
@@ -951,6 +904,13 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
 
   it('el adjunto solo entra mientras el material esté PENDIENTE: lo curado es inmutable', async () => {
     // itemSinDerechos ya fue aprobado en el primer test.
+    //
+    // La REGLA es la misma de siempre; lo que cambió es quién la dice primero. Antes el
+    // rechazo lo daba el `WITH CHECK` de `archivo_insert` («row-level security»); ahora
+    // llega antes la re-lectura de `archivo_item_candado`, que existe para el caso de
+    // carrera y de paso responde a éste. Se gana el mensaje: «row-level security» no le
+    // dice al curador QUÉ pasó, y SYS-14 pide explicar el bloqueo. La política sigue
+    // debajo por si el trigger algún día no estuviera.
     await expect(
       adjuntarArchivo(leadId, {
         workspaceId: ws,
@@ -959,7 +919,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         tipoMime: 'application/pdf',
         contenidoBase64: bytesABase64(PDF),
       }),
-    ).rejects.toThrow(/row-level security/);
+    ).rejects.toThrow(/ya fue decidido/);
   });
 
   it('retirar un adjunto: quien lo subió o un curador, y solo antes de curar', async () => {
@@ -1150,6 +1110,60 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const [estado] = await sqlAdmin()`select estado from item_importacion
       where id = ${item.itemId}`;
     expect(estado!.estado).toBe('rechazado');
+  });
+
+  it('el candado RELEE: un DELETE crudo elegido con el item pendiente no sobrevive al sello', async () => {
+    // El escalón siguiente del mismo axioma, y el más fácil de no ver. Tomar el candado
+    // ORDENA la espera, pero no arregla retroactivamente la instantánea que la sentencia ya
+    // usó para elegir filas: la política `archivo_delete` exige que el item siga
+    // `pendiente` y ese `exists` se evaluó ANTES de dormirse en el candado. Sin re-lectura,
+    // el borrado despertaba con el sello ya commiteado y quitaba igual el original de un
+    // material decidido. Esperar sin releer es esperar para nada.
+    const admin = sqlAdmin();
+    const item = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Material cuyo adjunto se intenta borrar bajo el sello',
+      contenido: 'x',
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    const a = await adjuntarArchivo(leadId, {
+      workspaceId: ws,
+      itemId: item.itemId,
+      nombre: 'original.pdf',
+      tipoMime: 'application/pdf',
+      contenidoBase64: bytesABase64(PDF),
+    });
+
+    // El SELLO en vuelo: su UPDATE ya disparó `item_sellado_candado` y tiene el candado
+    // del item, pero NO ha commiteado — así que para quien mire ahora sigue `pendiente`.
+    const sello = await enVuelo(async (tx) => {
+      await tx`update item_importacion
+        set estado = 'rechazado', decidido_por = ${leadId}, decidido_en = now()
+        where id = ${item.itemId} and workspace_id = ${ws}`;
+    });
+
+    // El borrado se lanza AHORA, con el item todavía pendiente en su snapshot: es lo que
+    // hace que el test pruebe lo que dice. Lanzado después del commit del sello, la
+    // política lo pararía sola y pasaría igual sin el arreglo.
+    //
+    // Va por SQL CRUDO a propósito: `eliminarArchivo` toma el candado en una sentencia
+    // ANTERIOR, así que su DELETE arranca con el candado en la mano y su snapshot ya es
+    // posterior al sello. El agujero era del SQL directo, que es el que este repositorio
+    // se compromete a que choque igual.
+    const borrado = conUsuario(
+      leadId,
+      (tx) => tx`delete from archivo_importado
+        where id = ${a.archivoId} and workspace_id = ${ws}`,
+    );
+    expect(await sigueEsperando(borrado)).toBe(true);
+
+    await sello.cerrar();
+    // Y al soltarse RECHAZA, en vez de despertar y borrar sobre un mundo que ya no existe.
+    await expect(borrado).rejects.toMatchObject({ code: 'AD002' });
+    const [quedan] = await admin`select count(*)::int as n from archivo_importado
+      where id = ${a.archivoId}`;
+    expect(quedan!.n as number).toBe(1);
   });
 
   it('la extensión guardada la fija el FORMATO verificado, no quien llama', async () => {

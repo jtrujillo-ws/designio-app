@@ -1,6 +1,7 @@
 -- RF-03.10 / RF-03.1 / SYS-17 — CANDADOS COMPARTIDOS: una comprobación sin candado sobre
--- estado que otro camino muta no cierra la ventana, la estrecha. Y un conteo bajo RLS no
--- es un conteo.
+-- estado que otro camino muta no cierra la ventana, la estrecha. Un conteo bajo RLS no es
+-- un conteo. Y un candado sin re-lectura ordena la espera sin cambiar lo que ya se
+-- decidió: esperar sin releer es esperar para nada.
 --
 -- Las tres cosas que cierra esta migración son la MISMA falta desde tres sitios, y es
 -- literalmente el axioma que ya rige esta base —«una política es un predicado sobre una
@@ -79,6 +80,39 @@
 --    que quien ya tiene derecho a leer su workspace lea las mismas filas con un `select`:
 --    la auditoría registra el acto de EMPAQUETAR, no el de mirar. La coherencia del
 --    paquete no la da el registro sino el `repeatable read`.
+--
+-- ═══ COLUMNA 4 — de cada candado que se introduce aquí: ¿qué se leyó ANTES de tomarlo,
+--     y quién lo relee DESPUÉS? ═══
+-- Un candado ORDENA; no arregla retroactivamente la instantánea que la sentencia ya usó
+-- para elegir filas. Esperar sin releer es esperar para nada, y la columna 1 no basta por
+-- sí sola: hay que mirar qué decidió el predicado ANTES de dormirse.
+--
+--   candado                        | decidido antes de esperar        | quién lo revalida
+--   -------------------------------|----------------------------------|------------------
+--   `for share` derecho_uso (gate) | la fila de `gate_instancia` que   | las comprobaciones
+--                                  | eligió el UPDATE externo — pero   | de derechos, TODAS
+--                                  | `decidirDerechos` no toca esa     | debajo del candado
+--                                  | tabla, y marcar↔aprobar ya        | y con snapshot
+--                                  | comparten `designio:gate:`        | nuevo ✔
+--   `for share` derecho_uso        | nada: el guard corre en el INSERT | ídem, todo el
+--   (congelar)                     | del snapshot y no hay predicado   | recorrido va
+--                                  | previo sobre derechos             | debajo ✔
+--   `designio:item:` en el sello   | `estado = 'pendiente'` del USING  | EvalPlanQual: el
+--   (`item_sellado_candado`)       | de `item_update_decision`, sobre  | UPDATE bloquea SU
+--                                  | la fila que el UPDATE actualiza   | propia fila y
+--                                  |                                   | re-evalúa el qual
+--                                  |                                   | con la versión
+--                                  |                                   | nueva ⇒ 0 filas ✔
+--   `designio:item:` en el adjunto | `estado = 'pendiente'` del EXISTS | NADIE ← el agujero
+--   (`archivo_item_candado`)       | de `archivo_insert`/`archivo_     | que se cierra abajo
+--                                  | delete`, evaluado sobre OTRA      | con una re-lectura
+--                                  | tabla y con el snapshot de la     | explícita
+--                                  | sentencia DML                     |
+--
+-- La diferencia entre las dos últimas filas es exactamente por qué el caso del adjunto se
+-- escapaba: cuando el predicado mira la MISMA fila que la sentencia va a escribir, EPQ la
+-- revalida sola; cuando mira OTRA tabla (el item, desde el adjunto), no hay nada que
+-- revalidar y el snapshot viejo sobrevive al candado.
 
 -- ── El gate re-comprueba derechos Y comparte candado con quien los revoca ──
 -- Copia ÍNTEGRA de la versión viva (20260902220000) más el candado. Ver la advertencia
@@ -327,6 +361,7 @@ declare
   v_item uuid := coalesce(new.item_id, old.item_id);
   v_ws uuid := coalesce(new.workspace_id, old.workspace_id);
   v_n int;
+  v_estado text;
 begin
   -- El candado va PRIMERO y sin condición: es el mismo espacio de nombres que toma la
   -- app (`designio:item:` + el uuid en texto canónico, semilla 42), de modo que subir,
@@ -334,13 +369,53 @@ begin
   -- nada a nadie —esperar no es una respuesta— así que no hay motivo para condicionarlo,
   -- y ponerlo antes del pre-chequeo es lo que hace que también participe el SQL crudo.
   perform pg_advisory_xact_lock(hashtextextended('designio:item:' || v_item::text, 42));
-  -- Anti-oráculo, y solo para lo que SÍ informa: el tope. Un no-miembro no puede
-  -- enterarse por el mensaje de error de que ese material existe y está lleno — su
-  -- escritura la rechaza la política de todas formas, pero el `WITH CHECK` se evalúa
+  -- Anti-oráculo. Un no-miembro no puede enterarse por el mensaje de error de que ese
+  -- material existe, ni de si está lleno o ya decidido — su escritura la rechaza la
+  -- política de todas formas, pero el `WITH CHECK` (y el `USING` del DELETE) se evalúan
   -- DESPUÉS de este trigger, así que sin el pre-chequeo el error llegaría antes que el
   -- rechazo. Mismo motivo por el que el guard de derechos lo lleva.
-  if tg_op = 'DELETE' or not is_workspace_member(app_user_id(), v_ws) then
+  if not is_workspace_member(app_user_id(), v_ws) then
     return coalesce(new, old);
+  end if;
+
+  -- ═══ RE-LECTURA DESPUÉS DEL CANDADO (esperar sin releer es esperar para nada) ═══
+  -- El candado ORDENA, pero no arregla retroactivamente la instantánea que la sentencia
+  -- ya usó para elegir filas. Las dos políticas del adjunto —`archivo_insert` y
+  -- `archivo_delete`— exigen que el item siga `pendiente`, y ese `exists` se evalúa con
+  -- el snapshot de la sentencia DML, que se tomó ANTES de que este trigger empezara a
+  -- esperar. Así que un `delete … where id = X` crudo podía elegir el adjunto con el item
+  -- todavía pendiente, dormirse aquí en el candado del curador, despertar con el sello ya
+  -- commiteado y BORRAR IGUAL el original de un material ya decidido. Es el mismo error
+  -- que el `for share` sobre `derecho_uso` no comete: allí hay comprobaciones DEBAJO del
+  -- candado que releen; aquí no había nada debajo, el trigger esperaba y dejaba pasar.
+  --
+  -- Por el camino del servicio no se daba, y eso es justo lo que lo hacía fácil de no ver:
+  -- `bloquearItem` toma el candado en una sentencia ANTERIOR, así que el DML arranca con
+  -- el candado ya en la mano y su snapshot es posterior al sello. El agujero era del SQL
+  -- directo, que es el que este repositorio se compromete a que choque igual.
+  --
+  -- La re-lectura es un `select` llano, no un `for share`: el candado consultivo YA es el
+  -- candado elegido para este objeto y lo toman los dos lados dentro de la base (aquí y
+  -- en `item_sellado_candado`), así que añadir un candado de fila sobre `item_importacion`
+  -- no protegería de nada nuevo y sí metería un segundo mecanismo sobre el mismo objeto
+  -- —justo lo que esta migración evita— con su orden de adquisición que cuadrar.
+  --
+  -- Y funciona porque este camino corre en READ COMMITTED: un `select` posterior al
+  -- candado toma snapshot nuevo y ve lo que se commiteó mientras esperaba (comprobado).
+  -- OJO al futuro: bajo `repeatable read` —que la exportación sí usa a propósito— esta
+  -- re-lectura vería el snapshot viejo y volvería a ser decorativa. Si algún día un
+  -- camino de adjuntos necesita ese nivel, esta comprobación hay que rehacerla.
+  select i.estado into v_estado from item_importacion i
+    where i.id = v_item and i.workspace_id = v_ws;
+  if v_estado is distinct from 'pendiente' then
+    -- Dice QUE fue decidido y nada más: ni quién lo selló ni cuándo. Que un material haya
+    -- pasado a decidido lo puede saber cualquiera que pudiera verlo pendiente.
+    raise exception 'No puedes cambiar los adjuntos de este material: ya fue decidido, y lo decidido es inmutable (SYS-17)'
+      using errcode = 'AD002';
+  end if;
+
+  if tg_op = 'DELETE' then
+    return old;
   end if;
   select count(*) into v_n from archivo_importado
     where item_id = v_item and workspace_id = v_ws;

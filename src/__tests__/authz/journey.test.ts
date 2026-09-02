@@ -16,7 +16,7 @@ import {
   journeysDelWorkspace,
   PAGINA_JOURNEYS,
 } from '@/lib/journey/journey.servicio';
-import { describeAuthz } from './helpers';
+import { describeAuthz, enVuelo, sigueEsperando } from './helpers';
 
 /**
  * SPEC-05 — el grafo del journey bajo RLS: los miembros lo leen (es el lenguaje común
@@ -549,6 +549,34 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     await congelarSnapshot(leadId, ws, journeyId, 'con derechos repuestos');
     const j = await journeyCompleto(leadId, ws, journeyId);
     expect(j!.snapshots.map((sn) => sn.motivo)).toContain('con derechos repuestos');
+  });
+
+  it('congelar COMPARTE candado con quien revoca, y decide sobre lo que quedó', async () => {
+    // El guard al congelar tiene la misma forma que el del gate, así que se comprueba —no
+    // se asume— que tiene también su misma garantía: el `for share` sobre `derecho_uso` va
+    // ANTES de las comprobaciones, y todo el recorrido que decide va DEBAJO del candado,
+    // con snapshot nuevo. Por eso al soltarse rechaza en vez de despertar y congelar sobre
+    // un mundo que ya no existe.
+    const admin = sqlAdmin();
+    const revocacion = await enVuelo(async (tx) => {
+      await tx`update derecho_uso set estado = 'denegado', ambito = 'interno',
+          base = 'El titular retiró el consentimiento'
+        where workspace_id = ${ws} and evidencia_id = ${evidenciaId}`;
+    });
+
+    const congelacion = congelarSnapshot(leadId, ws, journeyId, 'con revocación en vuelo');
+    expect(await sigueEsperando(congelacion)).toBe(true);
+
+    await revocacion.cerrar();
+    await expect(congelacion).rejects.toThrow(/derechos/);
+    const [cuantos] = await admin`select count(*)::int as n from journey_snapshot
+      where journey_id = ${journeyId} and motivo = 'con revocación en vuelo'`;
+    expect(cuantos!.n as number).toBe(0);
+
+    // Se reponen para no dejar el fixture en denegado.
+    await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente',
+        base = 'Consentimiento renovado'
+      where workspace_id = ${ws} and evidencia_id = ${evidenciaId}`;
   });
 
   it('las entidades comparten identidad de catálogo entre journeys; renombrarlas renombra en todas partes', async () => {

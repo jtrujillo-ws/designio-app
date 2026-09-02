@@ -22,10 +22,12 @@ import type {
 
 export class ErrorInsight extends Error {}
 
-/** Corte de la lista: la pantalla los muestra completos (con citas) y el picker del
- * gate solo necesita los recientes. Sin corte, un workspace con historia cargaría todo
- * su razonamiento en cada visita a la pantalla del proyecto. */
+/** Corte de la lista: la pantalla los muestra completos (con citas). Sin corte, un
+ * workspace con historia cargaría todo su razonamiento en cada visita. */
 export const INSIGHTS_LISTA = 200;
+
+/** El picker del gate se recorta aparte: es otra consulta y otro tamaño. */
+const INSIGHTS_PICKER = 200;
 
 /** Traduce el raise del guard (P0001) al contrato del módulo; deja pasar lo demás. */
 function comoErrorDeDominio(e: unknown): never {
@@ -204,6 +206,34 @@ export async function validarInsight(
     if (filas!.count === 0) {
       throw new ErrorInsight('El insight no existe, ya está validado o no puedes validarlo');
     }
+  });
+}
+
+/**
+ * Insights validados (id y título) para enlazar desde checklists y decisiones: lectura
+ * mínima bajo RLS + capa 2. Deliberadamente NO reusa la proyección completa — quien
+ * puebla un picker no necesita afirmaciones ni citas, y traerlas convertiría cada
+ * visita al proyecto en una descarga del razonamiento entero del workspace.
+ *
+ * hayMas avisa que la lista está recortada a los más recientes, igual que el picker de
+ * evidencias: un picker que oculta opciones sin decirlo bloquea al usuario sin pistas.
+ */
+export async function insightsCitables(
+  actorId: string,
+  workspaceId: string,
+): Promise<{ insights: { id: string; titulo: string }[]; hayMas: boolean }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`select id, titulo from insight
+      where workspace_id = ${workspaceId} and estado = 'validado'
+      order by validado_en desc nulls last, creado_en desc, id desc
+      limit ${INSIGHTS_PICKER + 1}`;
+    return {
+      insights: filas
+        .slice(0, INSIGHTS_PICKER)
+        .map((f) => ({ id: f.id as string, titulo: f.titulo as string })),
+      hayMas: filas.length > INSIGHTS_PICKER,
+    };
   });
 }
 

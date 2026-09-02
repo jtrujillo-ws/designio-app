@@ -23,7 +23,7 @@ import type {
   ItemDeGate,
   ProyectoMetodo,
 } from '@/lib/metodo/metodo.schemas';
-import { insightsDelEspacio } from '@/lib/insight/insight.functions';
+import { insightsParaCitar } from '@/lib/insight/insight.functions';
 import { gobernanzaDelProyecto } from '@/lib/metodo/gobernanza.functions';
 import { SeccionGobernanza } from '@/components/metodo/SeccionGobernanza';
 
@@ -49,7 +49,9 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
       proyectoDelMetodo({ data: { workspaceId, proyectoId: params.proyectoId } }),
       evidenciasDelWorkspace({ data: { workspaceId } }),
       gobernanzaDelProyecto({ data: { workspaceId, proyectoId: params.proyectoId } }),
-      insightsDelEspacio({ data: { workspaceId } }),
+      // Proyección mínima a propósito: esta pantalla solo cita insights, no los muestra.
+      // La ficha completa (afirmaciones, citas, contradicciones) vive en /insights.
+      insightsParaCitar({ data: { workspaceId } }),
     ]);
     if (!proyecto) return null;
     // La lista de objetos citables se arma aquí, no en la base: cada fuente ya tiene su
@@ -61,9 +63,11 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
         id: e.id,
         titulo: e.titulo,
       })),
-      ...(insights ?? [])
-        .filter((i) => i.estado === 'validado')
-        .map((i) => ({ clase: 'insight' as const, id: i.id, titulo: i.titulo })),
+      ...insights.insights.map((i) => ({
+        clase: 'insight' as const,
+        id: i.id,
+        titulo: i.titulo,
+      })),
       ...(gobernanza?.decisiones ?? [])
         .filter((d) => d.estado === 'vigente')
         .map((d) => ({ clase: 'decision' as const, id: d.id, titulo: d.titulo })),
@@ -73,15 +77,14 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
       proyecto,
       citables,
       hayMasEvidencias: lista?.hayMas ?? false,
+      hayMasInsights: insights.hayMas,
       gobernanza: gobernanza ?? {
         decisiones: [],
         arquetipos: [],
         reaperturas: [],
         segmentosDisponibles: [],
       },
-      insightsValidados: (insights ?? [])
-        .filter((i) => i.estado === 'validado')
-        .map((i) => ({ id: i.id, titulo: i.titulo })),
+      insightsValidados: insights.insights,
     };
   },
   component: PantallaProyecto,
@@ -177,6 +180,7 @@ function PantallaProyecto() {
                   gate={gate}
                   citables={datos.citables}
                   hayMasEvidencias={datos.hayMasEvidencias}
+                  hayMasInsights={datos.hayMasInsights}
                   rol={rol}
                   criteriosListosG0={criteriosCompletos(datos.proyecto.reto.criterios)}
                   anterioresAprobados={datos.proyecto.gates
@@ -193,6 +197,7 @@ function PantallaProyecto() {
               gobernanza={datos.gobernanza}
               insightsValidados={datos.insightsValidados}
               evidencias={datos.citables.filter((o) => o.clase === 'evidencia')}
+              hayMasEvidencias={datos.hayMasEvidencias}
               rol={rol}
               onCambio={() => router.invalidate()}
               onError={setError}
@@ -261,6 +266,7 @@ function EtapaConGate({
   gate,
   citables,
   hayMasEvidencias,
+  hayMasInsights,
   rol,
   criteriosListosG0,
   anterioresAprobados,
@@ -273,6 +279,7 @@ function EtapaConGate({
   gate: GateDeProyecto | undefined;
   citables: ObjetoCitable[];
   hayMasEvidencias: boolean;
+  hayMasInsights: boolean;
   rol: string;
   /** SYS-22 en la etiqueta: G0 no está «listo» sin criterios completos. */
   criteriosListosG0: boolean;
@@ -336,6 +343,7 @@ function EtapaConGate({
             item={item}
             citables={citables}
             hayMasEvidencias={hayMasEvidencias}
+            hayMasInsights={hayMasInsights}
             editable={gate.estado === 'pendiente'}
             puedeCurar={(ROLES_CURADORES as readonly string[]).includes(rol)}
             puedeNa={rol === gate.rolAprobador}
@@ -366,6 +374,7 @@ function ItemChecklist({
   item,
   citables,
   hayMasEvidencias,
+  hayMasInsights,
   editable,
   puedeCurar,
   puedeNa,
@@ -376,6 +385,7 @@ function ItemChecklist({
   item: ItemDeGate;
   citables: ObjetoCitable[];
   hayMasEvidencias: boolean;
+  hayMasInsights: boolean;
   editable: boolean;
   /** Cumplido/pendiente: curadores (lead/diseñador). N/A —y revertirlo— : el rol aprobador del gate. */
   puedeCurar: boolean;
@@ -473,16 +483,30 @@ function ItemChecklist({
                 … hay más evidencias (solo se listan las 200 más recientes)
               </option>
             )}
+            {hayMasInsights && (
+              <option value="" disabled>
+                … hay más insights validados (solo se listan los 200 más recientes)
+              </option>
+            )}
           </Select>
           <Button
             size="sm"
             disabled={ocupado || objetoSel === ''}
             onClick={() => {
-              const [clase, id] = objetoSel.split(':');
+              // El valor viene del DOM: se resuelve contra la MISMA lista con la que se
+              // pintó el picker en vez de partirlo y castearlo. Así un valor manipulado
+              // —o rancio, porque la lista se recarga en cada invalidate— da un mensaje
+              // que se entiende y no un error de constraint desde la base.
+              const elegido = citables.find((o) => `${o.clase}:${o.id}` === objetoSel);
+              if (!elegido) {
+                setObjetoSel('');
+                onError('Ese objeto ya no está en la lista: vuelve a elegirlo');
+                return;
+              }
               void marcar({
                 tipo: 'cumplido',
-                objetoClase: clase as ClaseObjetoCitable,
-                objetoId: id ?? '',
+                objetoClase: elegido.clase,
+                objetoId: elegido.id,
               });
             }}
           >

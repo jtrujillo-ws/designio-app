@@ -6,6 +6,7 @@ import {
   agregarCita,
   crearInsight,
   ErrorInsight,
+  insightsCitables,
   insightsDelWorkspace,
   registrarContradiccion,
   validarInsight,
@@ -177,6 +178,16 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
         localizacion: '',
       }),
     ).rejects.toThrow(/no existe en este workspace/);
+  });
+
+  it('el picker solo ofrece insights validados y no arrastra la ficha completa', async () => {
+    // El test anterior dejó un insight propuesto sin validar: si apareciera aquí, el
+    // checklist podría citar razonamiento que nadie sostuvo todavía.
+    const { insights, hayMas } = await insightsCitables(stakeId, ws);
+    expect(insights.map((i) => i.id)).toEqual([insightId]);
+    expect(hayMas).toBe(false);
+    // La proyección es id + título y nada más: es lo que la hace barata.
+    expect(Object.keys(insights[0]!).sort()).toEqual(['id', 'titulo']);
   });
 
   it('sin contexto de usuario los insights son invisibles; la cuenta desactivada tampoco lee', async () => {

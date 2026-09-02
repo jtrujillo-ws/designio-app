@@ -51,6 +51,7 @@ export function SeccionGobernanza({
   gobernanza,
   insightsValidados,
   evidencias,
+  hayMasEvidencias,
   rol,
   onCambio,
   onError,
@@ -60,6 +61,7 @@ export function SeccionGobernanza({
   gobernanza: GobernanzaDeProyecto;
   insightsValidados: { id: string; titulo: string }[];
   evidencias: { id: string; titulo: string }[];
+  hayMasEvidencias: boolean;
   rol: string;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -84,6 +86,7 @@ export function SeccionGobernanza({
         arquetipos={gobernanza.arquetipos}
         segmentos={gobernanza.segmentosDisponibles}
         evidencias={evidencias}
+        hayMasEvidencias={hayMasEvidencias}
         esCurador={esCurador}
         onCambio={onCambio}
         onError={onError}
@@ -302,6 +305,7 @@ function BloqueArquetipos({
   arquetipos,
   segmentos,
   evidencias,
+  hayMasEvidencias,
   esCurador,
   onCambio,
   onError,
@@ -311,6 +315,7 @@ function BloqueArquetipos({
   arquetipos: GobernanzaDeProyecto['arquetipos'];
   segmentos: { id: string; nombre: string }[];
   evidencias: { id: string; titulo: string }[];
+  hayMasEvidencias: boolean;
   esCurador: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -450,6 +455,14 @@ function BloqueArquetipos({
                     {e.titulo}
                   </option>
                 ))}
+                {/* Confirmar un arquetipo EXIGE evidencia enlazada: si la lista viene
+                    recortada y la que hace falta no está, el usuario tiene que saber
+                    que le faltan opciones y no que le falta evidencia. */}
+                {hayMasEvidencias && (
+                  <option value="" disabled>
+                    … hay más evidencias (solo se listan las 200 más recientes)
+                  </option>
+                )}
               </Select>
               <Button size="sm" disabled={ocupado || evidenciaId === ''} onClick={() => void apoyar(a.id)}>
                 Enlazar

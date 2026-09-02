@@ -8,6 +8,7 @@ import {
   listarBandeja,
   rechazarItem,
 } from '@/lib/evidencia/evidencia.servicio';
+import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { describeAuthz } from './helpers';
 
 /**
@@ -219,6 +220,25 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     expect(bandejaAjena).toHaveLength(0);
     const sinContexto = await sql()`select id from item_importacion where workspace_id in (${ws}, ${wsB})`;
     expect(sinContexto.length).toBe(0);
+  });
+
+  it('una cuenta desactivada con sesión viva no lee la bandeja ni aporta (re-check de estado)', async () => {
+    const admin = sqlAdmin();
+    await admin`update usuario set estado = 'inactivo' where id = ${leadId}`;
+    try {
+      await expect(listarBandeja(leadId, ws)).rejects.toThrow(ErrorAutorizacion);
+      await expect(
+        crearItem(leadId, {
+          workspaceId: ws,
+          titulo: 'Tarde',
+          contenido: 'contenido',
+          tipoFuente: 'nota',
+          referencia: 'ref',
+        }),
+      ).rejects.toThrow(ErrorAutorizacion);
+    } finally {
+      await admin`update usuario set estado = 'activo' where id = ${leadId}`;
+    }
   });
 
   it('el bound del contenido también vive en el esquema (100k, contenido no confiable)', async () => {

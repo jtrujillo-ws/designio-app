@@ -1,6 +1,7 @@
 import '@/lib/server-only';
 import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
+import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import {
   DimensionesEvidenciaSchema,
   type AprobarItem,
@@ -14,7 +15,9 @@ import {
  * Bandeja de importación y curaduría (SPEC-03, SYS-16): nada entra como evidencia sin
  * acción humana explícita. Capa 1: políticas RLS (miembros leen; humanos aportan; solo
  * curadores de la boutique deciden y SOLO sobre pendientes — decidido = inmutable).
- * Capa 2: los re-checks de este módulo.
+ * Capa 2: los re-checks de este módulo — estado ACTUAL de la cuenta en toda operación
+ * (el JWT vive 7 días y las server functions son invocables directo) y rol curador en
+ * las decisiones.
  */
 
 export class ErrorCuraduria extends Error {}
@@ -27,6 +30,7 @@ export async function crearItem(
   entrada: CrearItemImportacion,
 ): Promise<{ itemId: string }> {
   return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
     const [item] = await tx`insert into item_importacion
       (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
       values (${entrada.workspaceId}, ${entrada.titulo}, ${entrada.contenido},
@@ -41,6 +45,7 @@ export async function crearItem(
 
 export async function listarBandeja(actorId: string, workspaceId: string): Promise<ItemBandeja[]> {
   return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
     const filas = await tx`
       select id, titulo, tipo_fuente, referencia, estado,
              left(contenido, ${LARGO_EXTRACTO}) as extracto,
@@ -74,6 +79,7 @@ export async function aprobarItem(
   entrada: AprobarItem,
 ): Promise<{ evidenciaId: string }> {
   return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
     const rol = await rolCurador(tx, actorId, entrada.workspaceId);
 
     const [item] = await tx`
@@ -147,6 +153,7 @@ export async function aprobarItem(
 
 export async function rechazarItem(actorId: string, entrada: RechazarItem): Promise<void> {
   await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
     const rol = await rolCurador(tx, actorId, entrada.workspaceId);
     const selladas = await tx`update item_importacion
       set estado = 'rechazado', decidido_por = ${actorId}, decidido_en = now()

@@ -1,4 +1,5 @@
 import { createServerFn } from '@tanstack/react-start';
+import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { requerirUsuarioId, usuarioIdDeRequest } from '@/lib/auth/guardia.server';
 import {
   AprobarItemSchema,
@@ -13,6 +14,8 @@ import { aprobarItem, crearItem, ErrorCuraduria, listarBandeja, rechazarItem } f
 
 function mensajeDe(e: unknown): string | null {
   if (e instanceof ErrorCuraduria) return e.message;
+  // Cuenta desactivada con JWT aún vigente (capa 2 del servicio).
+  if (e instanceof ErrorAutorizacion) return e.message;
   const code = (e as { code?: string }).code;
   if (code === '42501') return 'Sin permiso para esta acción en el workspace';
   if (code === '23514') return 'El contenido supera los límites permitidos';
@@ -25,7 +28,13 @@ export const bandejaDeImportacion = createServerFn({ method: 'GET' })
   .inputValidator(BandejaInputSchema)
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
-    return { workspaceId: data.workspaceId, items: await listarBandeja(usuarioId, data.workspaceId) };
+    try {
+      return { workspaceId: data.workspaceId, items: await listarBandeja(usuarioId, data.workspaceId) };
+    } catch (e) {
+      // Cuenta desactivada con JWT aún vigente: sin datos, como si no hubiera sesión.
+      if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
   });
 
 export const crearItemImportacion = createServerFn({ method: 'POST' })

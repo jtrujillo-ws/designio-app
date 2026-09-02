@@ -28,7 +28,10 @@ export const Route = createFileRoute('/_autenticada/design-versions')({
     const [versiones, arbol, journeys] = await Promise.all([
       listaDeDesignVersions({ data: { workspaceId } }),
       arbolDelWorkspace({ data: { workspaceId } }),
-      listaDeJourneys({ data: { workspaceId } }),
+      // Solo los to-be, filtrados EN EL SERVIDOR: aprobar congela el snapshot del grafo
+      // objetivo (RF-06.3), y quedarse con los de la primera página dejaría fuera de
+      // alcance el to-be de un servicio con muchos journeys por delante.
+      listaDeJourneys({ data: { workspaceId, tipo: 'to-be' } }),
     ]);
     return {
       workspaceId,
@@ -42,8 +45,8 @@ export const Route = createFileRoute('/_autenticada/design-versions')({
           r.proyectos.map((p) => ({ id: p.id, etiqueta: `${p.codigo} ${p.titulo}` })),
         ),
       })),
-      // Solo los to-be: aprobar congela el snapshot del grafo objetivo (RF-06.3).
-      journeys: journeys.filter((j) => j.tipo === 'to-be'),
+      journeys: journeys.journeys,
+      hayMasJourneys: journeys.siguiente !== null,
       versionesAprobadas: versiones.filter((v) => v.estado === 'aprobada'),
     };
   },

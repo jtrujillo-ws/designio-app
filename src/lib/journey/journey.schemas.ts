@@ -172,6 +172,12 @@ export const JourneysInputSchema = z.object({
   workspaceId: z.string().uuid(),
   /** Id del último journey ya visto: el keyset resuelve su `(creado_en, id)` en la base. */
   cursor: z.string().uuid().nullable().default(null),
+  /** Filtros para los selectores que no quieren la lista entera sino un subconjunto
+   * acotado — el de la design version pide los to-be de UN servicio. Filtrar en el
+   * servidor y no sobre la primera página es lo que evita que un journey quede fuera de
+   * alcance por el corte. */
+  servicioId: z.string().uuid().nullable().default(null),
+  tipo: z.enum(TIPOS_JOURNEY).nullable().default(null),
 });
 
 // ── Proyecciones de lectura ──

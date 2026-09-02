@@ -1,0 +1,1311 @@
+import { useMemo, useState } from 'react';
+import type { CSSProperties, FormEvent } from 'react';
+import { createFileRoute, Link, useNavigate, useRouter } from '@tanstack/react-router';
+import { Button } from '@/components/ui/Button';
+import { Card } from '@/components/ui/Card';
+import { Input } from '@/components/ui/Input';
+import { Select } from '@/components/ui/Select';
+import { Tabs } from '@/components/ui/Tabs';
+import { Tag } from '@/components/ui/Tag';
+import { Textarea } from '@/components/ui/Textarea';
+import { Wordmark } from '@/components/ui/Wordmark';
+import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { calcularDiff, elementosEnEstadoDesconocido } from '@/lib/entrega/entrega.diff';
+import {
+  agregarElementoDeCambio,
+  aprobarYCongelarDesignVersion,
+  asignarElementoARelease,
+  borrarElementoDeCambio,
+  cadenaDelRelease,
+  conciliacionDeDesignVersion,
+  constatarReleaseDesplegado,
+  designVersionDelWorkspace,
+  planificarReleaseDeDesignVersion,
+  quitarElementoDeRelease,
+  registrarDespliegue,
+} from '@/lib/entrega/entrega.functions';
+import {
+  ETIQUETA_CONCILIACION,
+  ETIQUETA_RESULTADO,
+  ETIQUETA_TIPO_ELEMENTO,
+  OPERACIONES,
+  RESULTADOS_CONSTATACION,
+  TIPOS_ELEMENTO,
+  type DesignVersionCompleta,
+  type Operacion,
+  type ReleaseDeDesignVersion,
+  type ResultadoConstatacion,
+  type TipoElemento,
+} from '@/lib/entrega/entrega.schemas';
+
+/**
+ * La design version por dentro (SPEC-06): los elementos SON el modelo; el diff, el plan
+ * de releases y el tablero de conciliación son tres lecturas de la MISMA proyección
+ * —leída en una sentencia—, así que no pueden discrepar entre ellas.
+ */
+const ES_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const Route = createFileRoute('/_autenticada/design-version/$designVersionId')({
+  loaderDeps: ({ search }) => ({ ws: search.ws }),
+  loader: async ({ context, params }) => {
+    const workspaceId = context.membresiaActiva?.workspaceId;
+    if (!workspaceId || !ES_UUID.test(params.designVersionId)) return null;
+    const [dv, tablero] = await Promise.all([
+      designVersionDelWorkspace({ data: { workspaceId, designVersionId: params.designVersionId } }),
+      conciliacionDeDesignVersion({
+        data: { workspaceId, designVersionId: params.designVersionId },
+      }),
+    ]);
+    if (!dv) return null;
+    return { workspaceId, dv, tablero };
+  },
+  component: PantallaDesignVersion,
+});
+
+const micro: CSSProperties = {
+  fontFamily: 'var(--font-mono)',
+  fontWeight: 500,
+  fontSize: 11,
+  letterSpacing: '.08em',
+  textTransform: 'uppercase',
+  color: 'var(--text-muted)',
+};
+
+const cuerpo: CSSProperties = { font: '400 13px/1.6 var(--font-sans)', color: 'var(--text-body)' };
+const apunte: CSSProperties = { font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-muted)' };
+
+const VISTAS = ['Elementos', 'Diff', 'Releases', 'Conciliación'];
+
+const HOY = () => new Date().toISOString().slice(0, 10);
+
+function PantallaDesignVersion() {
+  const datos = Route.useLoaderData();
+  const { membresiaActiva } = Route.useRouteContext();
+  const navigate = useNavigate();
+  const router = useRouter();
+  const [vista, setVista] = useState(VISTAS[0]!);
+  const [error, setError] = useState<string | null>(null);
+  const rol = membresiaActiva?.rol ?? '';
+  const esCurador = (ROLES_CURADORES as readonly string[]).includes(rol);
+  const esLead = rol === 'lead-boutique';
+
+  // El diff se CALCULA aquí (RF-06.2) sobre la misma proyección que alimenta el resto:
+  // no hay tabla de diff, y no puede haber dos versiones del mismo contraste.
+  const diff = useMemo(
+    () => (datos ? calcularDiff(datos.dv.elementos, datos.dv.vigente) : null),
+    [datos],
+  );
+  const desconocidos = useMemo(
+    () => (datos?.tablero ? elementosEnEstadoDesconocido(datos.tablero.filas) : []),
+    [datos],
+  );
+
+  async function refrescar() {
+    setError(null);
+    await router.invalidate();
+  }
+
+  if (!datos) {
+    return (
+      <div style={{ minHeight: '100vh', background: 'var(--bg-app)', padding: 40 }}>
+        <Card style={{ padding: 24, maxWidth: 600, margin: '0 auto' }}>
+          <span style={cuerpo}>Esta design version no existe o ya no puedes verla.</span>
+        </Card>
+      </div>
+    );
+  }
+
+  const { dv } = datos;
+  const enBorrador = dv.estado === 'borrador';
+
+  return (
+    <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '14px 28px',
+          background: 'var(--surface)',
+          borderBottom: '1px solid var(--border)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <Wordmark />
+          <span style={{ font: '600 13px var(--font-sans)', color: 'var(--text-body)' }}>
+            {dv.codigo} · {dv.titulo}
+          </span>
+        </div>
+        <Button variant="ghost" size="sm" onClick={() => navigate({ to: '/design-versions' })}>
+          ← Design versions
+        </Button>
+      </div>
+
+      <main
+        style={{
+          maxWidth: 980,
+          margin: '0 auto',
+          padding: '24px 24px 60px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 16,
+        }}
+      >
+        <Cabecera dv={dv} />
+
+        {error && (
+          <span role="alert" style={{ font: '500 13px var(--font-sans)', color: 'var(--danger)' }}>
+            {error}
+          </span>
+        )}
+
+        {enBorrador && esLead && (
+          <AprobarDesignVersion
+            workspaceId={datos.workspaceId}
+            dv={dv}
+            onError={setError}
+            onHecho={refrescar}
+          />
+        )}
+
+        <Tabs items={VISTAS} value={vista} onChange={setVista} />
+
+        {vista === 'Elementos' && (
+          <VistaElementos
+            workspaceId={datos.workspaceId}
+            dv={dv}
+            puedeEditar={esCurador && enBorrador}
+            onError={setError}
+            onHecho={refrescar}
+          />
+        )}
+
+        {vista === 'Diff' && diff && <VistaDiff diff={diff} dv={dv} />}
+
+        {vista === 'Releases' && (
+          <VistaReleases
+            workspaceId={datos.workspaceId}
+            dv={dv}
+            puedeOperar={esLead && dv.estado === 'aprobada'}
+            onError={setError}
+            onHecho={refrescar}
+          />
+        )}
+
+        {vista === 'Conciliación' && (
+          <VistaConciliacion
+            tablero={datos.tablero}
+            desconocidos={desconocidos}
+            proyectoId={dv.proyectoId}
+            estado={dv.estado}
+          />
+        )}
+      </main>
+    </div>
+  );
+}
+
+function Cabecera({ dv }: { dv: DesignVersionCompleta }) {
+  return (
+    <Card style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <Tag>{dv.codigo}</Tag>
+        <Tag mono={false}>{dv.estado}</Tag>
+        <span style={apunte}>
+          {dv.servicioNombre} · {dv.proyectoCodigo}
+          {dv.journeyNombre ? ` · to-be: ${dv.journeyNombre}` : ' · sin journey to-be enlazado'}
+        </span>
+      </div>
+      {dv.resumen !== '' && <span style={cuerpo}>{dv.resumen}</span>}
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', ...apunte }}>
+        {dv.aprobadaEn && <span>Aprobada el {dv.aprobadaEn}, con snapshot del grafo congelado</span>}
+        {dv.superaA && (
+          <Link
+            to="/design-version/$designVersionId"
+            params={{ designVersionId: dv.superaA.id }}
+            style={{ color: 'var(--accent)' }}
+          >
+            supera a {dv.superaA.codigo}
+          </Link>
+        )}
+        {dv.superadaPor && (
+          <Link
+            to="/design-version/$designVersionId"
+            params={{ designVersionId: dv.superadaPor.id }}
+            style={{ color: 'var(--accent)' }}
+          >
+            superada por {dv.superadaPor.codigo}
+          </Link>
+        )}
+      </div>
+      {dv.estado === 'aprobada' && (
+        <span style={apunte}>
+          Inmutable (SYS-05): cambiar algo aquí exige crear una design version nueva que
+          supere a esta.
+        </span>
+      )}
+    </Card>
+  );
+}
+
+function AprobarDesignVersion({
+  workspaceId,
+  dv,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  dv: DesignVersionCompleta;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [motivo, setMotivo] = useState('');
+  const [ocupado, setOcupado] = useState(false);
+
+  async function aprobar() {
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await aprobarYCongelarDesignVersion({
+        data: { workspaceId, designVersionId: dv.id, motivo },
+      });
+      if (r.ok) await onHecho();
+      else onError(r.error);
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  return (
+    <Card style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <span style={micro}>Aprobar y congelar</span>
+      <span style={apunte}>
+        Aprobar vuelve inmutable la design version y congela un snapshot del grafo to-be en
+        la misma transacción (RF-06.3). Si el servicio ya tenía una versión aprobada, esta
+        la marca como superada.
+      </span>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <Input
+          placeholder="Motivo del snapshot (opcional)"
+          value={motivo}
+          onChange={(e) => setMotivo(e.target.value)}
+          style={{ flex: '1 1 280px' }}
+        />
+        <Button
+          size="sm"
+          disabled={ocupado || dv.elementos.length === 0 || dv.journeyId === null}
+          onClick={() => void aprobar()}
+        >
+          Aprobar (congela)
+        </Button>
+      </div>
+      {dv.elementos.length === 0 && (
+        <span style={apunte}>Falta al menos un elemento de cambio.</span>
+      )}
+      {dv.journeyId === null && (
+        <span style={apunte}>
+          Falta enlazar el journey to-be del servicio: sin grafo no hay snapshot que congelar.
+        </span>
+      )}
+    </Card>
+  );
+}
+
+// ── Elementos de cambio (RF-06.1) ──
+
+function VistaElementos({
+  workspaceId,
+  dv,
+  puedeEditar,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  dv: DesignVersionCompleta;
+  puedeEditar: boolean;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [abierto, setAbierto] = useState(false);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {puedeEditar && !abierto && (
+        <div>
+          <Button size="sm" onClick={() => setAbierto(true)}>
+            Añadir elemento de cambio
+          </Button>
+        </div>
+      )}
+      {puedeEditar && abierto && (
+        <FormularioElemento
+          workspaceId={workspaceId}
+          dv={dv}
+          onCerrar={() => setAbierto(false)}
+          onError={onError}
+          onHecho={async () => {
+            setAbierto(false);
+            await onHecho();
+          }}
+        />
+      )}
+
+      {dv.elementos.length === 0 && (
+        <Card style={{ padding: 20 }}>
+          <span style={apunte}>
+            Todavía no hay elementos de cambio. Sin ellos no hay diff, ni plan de releases,
+            ni nada que conciliar en G7.
+          </span>
+        </Card>
+      )}
+
+      {dv.elementos.map((el) => (
+        <Card key={el.id} style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <Tag mono={false}>{ETIQUETA_TIPO_ELEMENTO[el.tipo]}</Tag>
+            <Tag mono={false}>{el.operacion}</Tag>
+            <span style={{ font: '600 13.5px var(--font-sans)', color: 'var(--ink)' }}>
+              {el.titulo}
+            </span>
+          </div>
+          {el.detalle !== '' && <span style={cuerpo}>{el.detalle}</span>}
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', ...apunte }}>
+            {el.nodoEtiqueta && <span>Nodo del to-be: {el.nodoEtiqueta}</span>}
+            {el.decisiones.map((d) => (
+              <span key={d.id}>decisión: {d.titulo}</span>
+            ))}
+            {el.insights.map((i) => (
+              <span key={i.id}>insight: {i.titulo}</span>
+            ))}
+            {el.decisiones.length === 0 && el.insights.length === 0 && (
+              <span>Sin decisión ni insight que lo motive: la cadena se corta aquí.</span>
+            )}
+          </div>
+          {puedeEditar && (
+            <div>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={async () => {
+                  onError(null);
+                  const r = await borrarElementoDeCambio({
+                    data: { workspaceId, elementoId: el.id },
+                  });
+                  if (r.ok) await onHecho();
+                  else onError(r.error);
+                }}
+              >
+                Quitar
+              </Button>
+            </div>
+          )}
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+function FormularioElemento({
+  workspaceId,
+  dv,
+  onCerrar,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  dv: DesignVersionCompleta;
+  onCerrar: () => void;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [tipo, setTipo] = useState<TipoElemento>('touchpoint');
+  const [operacion, setOperacion] = useState<Operacion>('agrega');
+  const [titulo, setTitulo] = useState('');
+  const [detalle, setDetalle] = useState('');
+  const [nodoId, setNodoId] = useState('');
+  const [decisionId, setDecisionId] = useState('');
+  const [insightId, setInsightId] = useState('');
+  const [ocupado, setOcupado] = useState(false);
+
+  async function enviar(e: FormEvent) {
+    e.preventDefault();
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await agregarElementoDeCambio({
+        data: {
+          workspaceId,
+          designVersionId: dv.id,
+          tipo,
+          operacion,
+          titulo,
+          detalle,
+          nodoId: nodoId === '' ? null : nodoId,
+          decisionIds: decisionId === '' ? [] : [decisionId],
+          insightIds: insightId === '' ? [] : [insightId],
+        },
+      });
+      if (r.ok) await onHecho();
+      else onError(r.error);
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  return (
+    <Card style={{ padding: 18 }}>
+      <form onSubmit={(e) => void enviar(e)} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <span style={micro}>Nuevo elemento de cambio</span>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <Select
+            value={tipo}
+            onChange={(e) => setTipo(e.target.value as TipoElemento)}
+            style={{ flex: '1 1 180px' }}
+          >
+            {TIPOS_ELEMENTO.map((t) => (
+              <option key={t} value={t}>
+                {ETIQUETA_TIPO_ELEMENTO[t]}
+              </option>
+            ))}
+          </Select>
+          <Select
+            value={operacion}
+            onChange={(e) => setOperacion(e.target.value as Operacion)}
+            style={{ flex: '1 1 180px' }}
+          >
+            {OPERACIONES.map((o) => (
+              <option key={o} value={o}>
+                {o}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <Input
+          placeholder="Qué cambia (una frase)"
+          value={titulo}
+          onChange={(e) => setTitulo(e.target.value)}
+          required
+        />
+        <Textarea
+          placeholder="Detalle (opcional)"
+          value={detalle}
+          onChange={(e) => setDetalle(e.target.value)}
+          rows={2}
+        />
+        <Select value={nodoId} onChange={(e) => setNodoId(e.target.value)}>
+          <option value="">Nodo del journey to-be (opcional)</option>
+          {dv.nodosDelJourney.map((n) => (
+            <option key={n.id} value={n.id}>
+              {n.tipo} · {n.etiqueta}
+            </option>
+          ))}
+        </Select>
+        <Select value={decisionId} onChange={(e) => setDecisionId(e.target.value)}>
+          <option value="">Decisión que lo motiva (opcional)</option>
+          {dv.decisionesDelProyecto.map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.titulo}
+            </option>
+          ))}
+        </Select>
+        <Select value={insightId} onChange={(e) => setInsightId(e.target.value)}>
+          <option value="">Insight que lo motiva (opcional)</option>
+          {dv.insightsValidados.map((i) => (
+            <option key={i.id} value={i.id}>
+              {i.titulo}
+            </option>
+          ))}
+        </Select>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button size="sm" type="submit" disabled={ocupado || titulo.trim() === ''}>
+            Añadir
+          </Button>
+          <Button size="sm" variant="ghost" type="button" disabled={ocupado} onClick={onCerrar}>
+            Cancelar
+          </Button>
+        </div>
+      </form>
+    </Card>
+  );
+}
+
+// ── Diff derivado (RF-06.2) ──
+
+function VistaDiff({
+  diff,
+  dv,
+}: {
+  diff: ReturnType<typeof calcularDiff>;
+  dv: DesignVersionCompleta;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <Card style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <span style={micro}>Diff contra el estado efectivo vigente</span>
+        <span style={apunte}>
+          {diff.contra
+            ? `Calculado contra ${diff.contra.codigo} (${diff.contra.designVersionCodigo}, constatado el ${diff.contra.constatadoEn}) del servicio ${dv.servicioNombre}.`
+            : `${dv.servicioNombre} todavía no tiene estado efectivo constatado: contra la nada, todo es alta.`}
+        </span>
+        <span style={apunte}>
+          {diff.totales.agrega} agrega · {diff.totales.modifica} modifica ·{' '}
+          {diff.totales.retira} retira
+          {diff.totales.senales > 0 ? ` · ${diff.totales.senales} con señal` : ''}
+        </span>
+        <span style={apunte}>
+          El diff no se escribe a mano: se deriva de estos dos lados cada vez que se mira.
+        </span>
+      </Card>
+
+      {diff.filas.map((f) => (
+        <Card key={f.elementoId} style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <Tag mono={false}>{f.veredicto}</Tag>
+            <span style={{ font: '600 13.5px var(--font-sans)', color: 'var(--ink)' }}>
+              {f.titulo}
+            </span>
+            {f.operacionDeclarada !== f.veredicto && (
+              <span style={apunte}>declarado como «{f.operacionDeclarada}»</span>
+            )}
+          </div>
+          {f.precedente && (
+            <span style={apunte}>
+              En el estado vigente: {f.precedente.titulo} ({ETIQUETA_RESULTADO[f.precedente.resultado]})
+            </span>
+          )}
+          {f.senal && (
+            <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+              {f.senal}
+            </span>
+          )}
+        </Card>
+      ))}
+
+      {diff.seMantiene.length > 0 && (
+        <Card style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <span style={micro}>Se mantiene</span>
+          {diff.seMantiene.map((p) => (
+            <span key={p.elementoId} style={apunte}>
+              {p.titulo}
+            </span>
+          ))}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ── Plan de releases, despliegue y constatación (RF-06.4/06.5/06.6) ──
+
+function VistaReleases({
+  workspaceId,
+  dv,
+  puedeOperar,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  dv: DesignVersionCompleta;
+  puedeOperar: boolean;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [abierto, setAbierto] = useState(false);
+  const asignados = new Set(dv.releases.flatMap((r) => r.elementos.map((e) => e.elementoId)));
+  const pendientes = dv.elementos.filter((e) => !asignados.has(e.id));
+
+  if (dv.estado === 'borrador') {
+    return (
+      <Card style={{ padding: 20 }}>
+        <span style={apunte}>
+          Los releases cuelgan de una design version APROBADA (SYS-06). Apruébala primero.
+        </span>
+      </Card>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {puedeOperar && !abierto && (
+        <div>
+          <Button size="sm" onClick={() => setAbierto(true)}>
+            Planificar release
+          </Button>
+        </div>
+      )}
+      {puedeOperar && abierto && (
+        <FormularioRelease
+          workspaceId={workspaceId}
+          dv={dv}
+          pendientes={pendientes}
+          onCerrar={() => setAbierto(false)}
+          onError={onError}
+          onHecho={async () => {
+            setAbierto(false);
+            await onHecho();
+          }}
+        />
+      )}
+
+      {/* Criterio de aceptación 2: los elementos no incluidos siguen VISIBLES como
+          pendientes; no desaparecen porque el primer release no los cogió. */}
+      <Card style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <span style={micro}>Elementos sin release ({pendientes.length})</span>
+        {pendientes.length === 0 && (
+          <span style={apunte}>Cada elemento de esta design version está en un release.</span>
+        )}
+        {pendientes.map((el) => (
+          <div key={el.id} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={cuerpo}>{el.titulo}</span>
+            {puedeOperar && dv.releases.some((r) => r.estado === 'planificado') && (
+              <AsignarAExistente
+                workspaceId={workspaceId}
+                elementoId={el.id}
+                releases={dv.releases.filter((r) => r.estado === 'planificado')}
+                onError={onError}
+                onHecho={onHecho}
+              />
+            )}
+          </div>
+        ))}
+      </Card>
+
+      {dv.releases.map((r) => (
+        <TarjetaRelease
+          key={r.id}
+          workspaceId={workspaceId}
+          dv={dv}
+          release={r}
+          puedeOperar={puedeOperar}
+          onError={onError}
+          onHecho={onHecho}
+        />
+      ))}
+    </div>
+  );
+}
+
+function AsignarAExistente({
+  workspaceId,
+  elementoId,
+  releases,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  elementoId: string;
+  releases: ReleaseDeDesignVersion[];
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [releaseId, setReleaseId] = useState('');
+  const [razon, setRazon] = useState('');
+  return (
+    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+      <Select value={releaseId} onChange={(e) => setReleaseId(e.target.value)} style={{ width: 160 }}>
+        <option value="">Asignar a…</option>
+        {releases.map((r) => (
+          <option key={r.id} value={r.id}>
+            {r.codigo}
+          </option>
+        ))}
+      </Select>
+      <Input
+        placeholder="Razón de que caiga ahí"
+        value={razon}
+        onChange={(e) => setRazon(e.target.value)}
+        style={{ width: 220 }}
+      />
+      <Button
+        size="sm"
+        variant="ghost"
+        disabled={releaseId === ''}
+        onClick={async () => {
+          onError(null);
+          const r = await asignarElementoARelease({
+            data: { workspaceId, releaseId, elementoId, razon },
+          });
+          if (r.ok) await onHecho();
+          else onError(r.error);
+        }}
+      >
+        Asignar
+      </Button>
+    </div>
+  );
+}
+
+function TarjetaRelease({
+  workspaceId,
+  dv,
+  release,
+  puedeOperar,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  dv: DesignVersionCompleta;
+  release: ReleaseDeDesignVersion;
+  puedeOperar: boolean;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [fecha, setFecha] = useState(HOY());
+  const [constatando, setConstatando] = useState(false);
+  const titulos = new Map(dv.elementos.map((e) => [e.id, e.titulo]));
+
+  return (
+    <Card style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <Tag>{release.codigo}</Tag>
+        <span style={{ font: '600 13.5px var(--font-sans)', color: 'var(--ink)' }}>
+          {release.titulo}
+        </span>
+        <Tag mono={false}>{release.estado}</Tag>
+      </div>
+      <span style={apunte}>
+        Dueño: {release.responsable} · objetivo {release.fechaObjetivo}
+        {release.desplegadoEn ? ` · desplegado el ${release.desplegadoEn}` : ''}
+      </span>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <span style={micro}>Incluye ({release.elementos.length})</span>
+        {release.elementos.map((e) => (
+          <div key={e.elementoId} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <span style={cuerpo}>{titulos.get(e.elementoId) ?? e.elementoId}</span>
+            {e.razon !== '' && <span style={apunte}>— {e.razon}</span>}
+            {puedeOperar && release.estado === 'planificado' && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={async () => {
+                  onError(null);
+                  const r = await quitarElementoDeRelease({
+                    data: { workspaceId, elementoId: e.elementoId },
+                  });
+                  if (r.ok) await onHecho();
+                  else onError(r.error);
+                }}
+              >
+                Quitar
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {release.effectiveState && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <span style={micro}>
+            {release.effectiveState.codigo} · constatado el {release.effectiveState.constatadoEn}
+          </span>
+          {release.effectiveState.resumen !== '' && (
+            <span style={cuerpo}>{release.effectiveState.resumen}</span>
+          )}
+          {release.effectiveState.constataciones.map((c) => (
+            <div key={c.elementoId} style={{ display: 'flex', flexDirection: 'column' }}>
+              <span style={cuerpo}>
+                {titulos.get(c.elementoId) ?? c.elementoId} — {ETIQUETA_RESULTADO[c.resultado]}
+              </span>
+              {c.resultado !== 'como-aprobado' && (
+                <span style={apunte}>
+                  {c.queQuedoDistinto} · razón: {c.razon}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {puedeOperar && release.estado === 'planificado' && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <Input
+            type="date"
+            value={fecha}
+            onChange={(e) => setFecha(e.target.value)}
+            style={{ width: 170 }}
+          />
+          <Button
+            size="sm"
+            disabled={release.elementos.length === 0}
+            onClick={async () => {
+              onError(null);
+              const r = await registrarDespliegue({
+                data: { workspaceId, releaseId: release.id, desplegadoEn: fecha },
+              });
+              if (r.ok) await onHecho();
+              else onError(r.error);
+            }}
+          >
+            Registrar despliegue
+          </Button>
+          {release.elementos.length === 0 && (
+            <span style={apunte}>Un release sin elementos declarados no sale (SYS-06).</span>
+          )}
+        </div>
+      )}
+
+      <CadenaDelRelease workspaceId={workspaceId} releaseId={release.id} codigo={release.codigo} />
+
+      {puedeOperar && release.estado === 'desplegado' && !constatando && (
+        <div>
+          <Button size="sm" onClick={() => setConstatando(true)}>
+            Constatar effective state
+          </Button>
+        </div>
+      )}
+      {puedeOperar && release.estado === 'desplegado' && constatando && (
+        <FormularioConstatacion
+          workspaceId={workspaceId}
+          release={release}
+          titulos={titulos}
+          onCerrar={() => setConstatando(false)}
+          onError={onError}
+          onHecho={async () => {
+            setConstatando(false);
+            await onHecho();
+          }}
+        />
+      )}
+    </Card>
+  );
+}
+
+/**
+ * RF-06.9 / criterio de aceptación 5: «qué pasos del journey afectó RL-1» y, del otro
+ * lado, hasta qué citas llega la cadena hacia atrás. Se pide bajo demanda: es la
+ * pregunta que se hace al auditar, no en cada render de la pantalla.
+ */
+function CadenaDelRelease({
+  workspaceId,
+  releaseId,
+  codigo,
+}: {
+  workspaceId: string;
+  releaseId: string;
+  codigo: string;
+}) {
+  const [cadena, setCadena] = useState<Awaited<ReturnType<typeof cadenaDelRelease>> | null>(null);
+  const [ocupado, setOcupado] = useState(false);
+
+  if (!cadena) {
+    return (
+      <div>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={ocupado}
+          onClick={async () => {
+            setOcupado(true);
+            try {
+              setCadena(await cadenaDelRelease({ data: { workspaceId, releaseId } }));
+            } finally {
+              setOcupado(false);
+            }
+          }}
+        >
+          Ver la cadena de {codigo}
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <span style={micro}>Qué pasos del journey afectó {codigo}</span>
+      {cadena.pasos.length === 0 && (
+        <span style={apunte}>Ningún elemento de este release enlaza un nodo del grafo.</span>
+      )}
+      {cadena.pasos.map((p) => (
+        <span key={`${p.nodoId}-${p.elementoTitulo}`} style={cuerpo}>
+          {p.tipo} · {p.etiqueta} <span style={apunte}>— por «{p.elementoTitulo}»</span>
+        </span>
+      ))}
+      <span style={{ ...micro, paddingTop: 6 }}>Hacia atrás, hasta las citas</span>
+      {cadena.citas.length === 0 && (
+        <span style={apunte}>
+          Sus elementos no citan insights ni decisiones: la cadena se corta antes de la evidencia.
+        </span>
+      )}
+      {cadena.citas.map((c) => (
+        <span key={`${c.evidenciaId}-${c.localizacion}-${c.fragmento}`} style={apunte}>
+          {c.insightTitulo} → {c.evidenciaTitulo} ({c.localizacion}): «{c.fragmento}»
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function FormularioRelease({
+  workspaceId,
+  dv,
+  pendientes,
+  onCerrar,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  dv: DesignVersionCompleta;
+  pendientes: DesignVersionCompleta['elementos'];
+  onCerrar: () => void;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [titulo, setTitulo] = useState('');
+  const [responsable, setResponsable] = useState('');
+  const [fechaObjetivo, setFechaObjetivo] = useState(HOY());
+  const [seleccion, setSeleccion] = useState<Record<string, string | undefined>>({});
+  const [ocupado, setOcupado] = useState(false);
+
+  async function enviar(e: FormEvent) {
+    e.preventDefault();
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await planificarReleaseDeDesignVersion({
+        data: {
+          workspaceId,
+          designVersionId: dv.id,
+          titulo,
+          responsable,
+          fechaObjetivo,
+          elementos: Object.entries(seleccion)
+            .filter(([, razon]) => razon !== undefined)
+            .map(([elementoId, razon]) => ({ elementoId, razon: razon ?? '' })),
+        },
+      });
+      if (r.ok) await onHecho();
+      else onError(r.error);
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  return (
+    <Card style={{ padding: 18 }}>
+      <form onSubmit={(e) => void enviar(e)} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <span style={micro}>Nuevo release</span>
+        <Input
+          placeholder="Título del release"
+          value={titulo}
+          onChange={(e) => setTitulo(e.target.value)}
+          required
+        />
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <Input
+            placeholder="Dueño del release"
+            value={responsable}
+            onChange={(e) => setResponsable(e.target.value)}
+            required
+            style={{ flex: '1 1 220px' }}
+          />
+          <Input
+            type="date"
+            value={fechaObjetivo}
+            onChange={(e) => setFechaObjetivo(e.target.value)}
+            required
+            style={{ width: 170 }}
+          />
+        </div>
+        <span style={micro}>Qué incluye (parcialidad explícita)</span>
+        {pendientes.length === 0 && (
+          <span style={apunte}>No queda ningún elemento sin release.</span>
+        )}
+        {pendientes.map((el) => {
+          const marcado = seleccion[el.id] !== undefined;
+          return (
+            <div key={el.id} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <label style={{ display: 'flex', gap: 6, alignItems: 'center', ...cuerpo }}>
+                <input
+                  type="checkbox"
+                  checked={marcado}
+                  onChange={(e) =>
+                    setSeleccion((s) => ({ ...s, [el.id]: e.target.checked ? '' : undefined }))
+                  }
+                />
+                {el.titulo}
+              </label>
+              {marcado && (
+                <Input
+                  placeholder="Razón de que caiga en este release"
+                  value={seleccion[el.id] ?? ''}
+                  onChange={(e) => setSeleccion((s) => ({ ...s, [el.id]: e.target.value }))}
+                  style={{ flex: '1 1 240px' }}
+                />
+              )}
+            </div>
+          );
+        })}
+        <span style={apunte}>
+          Lo que no marques sigue visible como pendiente: la parcialidad se declara, no se
+          esconde (SYS-06).
+        </span>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button
+            size="sm"
+            type="submit"
+            disabled={ocupado || titulo.trim() === '' || responsable.trim() === ''}
+          >
+            Planificar
+          </Button>
+          <Button size="sm" variant="ghost" type="button" disabled={ocupado} onClick={onCerrar}>
+            Cancelar
+          </Button>
+        </div>
+      </form>
+    </Card>
+  );
+}
+
+function FormularioConstatacion({
+  workspaceId,
+  release,
+  titulos,
+  onCerrar,
+  onError,
+  onHecho,
+}: {
+  workspaceId: string;
+  release: ReleaseDeDesignVersion;
+  titulos: Map<string, string>;
+  onCerrar: () => void;
+  onError: (e: string | null) => void;
+  onHecho: () => Promise<void>;
+}) {
+  const [constatadoEn, setConstatadoEn] = useState(HOY());
+  const [resumen, setResumen] = useState('');
+  const [filas, setFilas] = useState<
+    Record<string, { resultado: ResultadoConstatacion; queQuedoDistinto: string; razon: string }>
+  >(() =>
+    Object.fromEntries(
+      release.elementos.map((e) => [
+        e.elementoId,
+        { resultado: 'como-aprobado' as ResultadoConstatacion, queQuedoDistinto: '', razon: '' },
+      ]),
+    ),
+  );
+  const [ocupado, setOcupado] = useState(false);
+
+  async function enviar(e: FormEvent) {
+    e.preventDefault();
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await constatarReleaseDesplegado({
+        data: {
+          workspaceId,
+          releaseId: release.id,
+          constatadoEn,
+          resumen,
+          constataciones: release.elementos.map((el) => ({
+            elementoId: el.elementoId,
+            ...filas[el.elementoId]!,
+          })),
+        },
+      });
+      if (r.ok) await onHecho();
+      else onError(r.error);
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  return (
+    <Card style={{ padding: 18 }}>
+      <form onSubmit={(e) => void enviar(e)} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <span style={micro}>Constatar cómo quedó</span>
+        <span style={apunte}>
+          Toda diferencia respecto de lo aprobado se registra como desviación con razón
+          obligatoria (SYS-07): sin razón, la base rechaza el registro.
+        </span>
+        <Input type="date" value={constatadoEn} onChange={(e) => setConstatadoEn(e.target.value)} />
+        <Textarea
+          placeholder="Resumen de la constatación (opcional)"
+          value={resumen}
+          onChange={(e) => setResumen(e.target.value)}
+          rows={2}
+        />
+        {release.elementos.map((el) => {
+          const fila = filas[el.elementoId]!;
+          return (
+            <div
+              key={el.elementoId}
+              style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 6 }}
+            >
+              <span style={cuerpo}>{titulos.get(el.elementoId) ?? el.elementoId}</span>
+              <Select
+                value={fila.resultado}
+                onChange={(e) =>
+                  setFilas((f) => ({
+                    ...f,
+                    [el.elementoId]: { ...fila, resultado: e.target.value as ResultadoConstatacion },
+                  }))
+                }
+              >
+                {RESULTADOS_CONSTATACION.map((r) => (
+                  <option key={r} value={r}>
+                    {ETIQUETA_RESULTADO[r]}
+                  </option>
+                ))}
+              </Select>
+              {fila.resultado !== 'como-aprobado' && (
+                <>
+                  <Input
+                    placeholder="Qué quedó distinto"
+                    value={fila.queQuedoDistinto}
+                    onChange={(e) =>
+                      setFilas((f) => ({
+                        ...f,
+                        [el.elementoId]: { ...fila, queQuedoDistinto: e.target.value },
+                      }))
+                    }
+                    required
+                  />
+                  <Input
+                    placeholder="Razón (obligatoria)"
+                    value={fila.razon}
+                    onChange={(e) =>
+                      setFilas((f) => ({ ...f, [el.elementoId]: { ...fila, razon: e.target.value } }))
+                    }
+                    required
+                  />
+                </>
+              )}
+            </div>
+          );
+        })}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button size="sm" type="submit" disabled={ocupado}>
+            Constatar y verificar
+          </Button>
+          <Button size="sm" variant="ghost" type="button" disabled={ocupado} onClick={onCerrar}>
+            Cancelar
+          </Button>
+        </div>
+      </form>
+    </Card>
+  );
+}
+
+// ── Tablero de conciliación (RF-06.7) ──
+
+function VistaConciliacion({
+  tablero,
+  desconocidos,
+  proyectoId,
+  estado,
+}: {
+  tablero: Awaited<ReturnType<typeof conciliacionDeDesignVersion>>;
+  desconocidos: { elementoId: string; elementoTitulo: string }[];
+  proyectoId: string;
+  estado: DesignVersionCompleta['estado'];
+}) {
+  if (!tablero || tablero.filas.length === 0) {
+    return (
+      <Card style={{ padding: 20 }}>
+        <span style={apunte}>
+          Sin elementos de cambio no hay nada que conciliar. G7 exige que esta design
+          version aprobada tenga su tablero completo.
+        </span>
+      </Card>
+    );
+  }
+
+  const bloquea = estado === 'aprobada' && desconocidos.length > 0;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <Card
+        style={{
+          padding: 18,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+          borderColor: bloquea ? 'var(--warn)' : undefined,
+        }}
+      >
+        <span style={micro}>Conciliación de la etapa 7</span>
+        {bloquea ? (
+          <span style={{ font: '600 13px/1.6 var(--font-sans)', color: 'var(--warn)' }}>
+            G7 está bloqueado: {desconocidos.length}{' '}
+            {desconocidos.length === 1 ? 'elemento' : 'elementos'} en estado desconocido.
+            Nadie ha constatado cómo quedaron, y aprobar el gate con huecos sería firmar
+            que se implementó algo que no se sabe si existe (RF-06.7).
+          </span>
+        ) : (
+          <span style={cuerpo}>
+            {estado === 'aprobada'
+              ? 'Todos los elementos tienen estado conocido: G7 no encuentra huecos por este lado.'
+              : 'La conciliación se exige sobre design versions aprobadas.'}
+          </span>
+        )}
+        <Link
+          to="/proyecto/$proyectoId"
+          params={{ proyectoId }}
+          style={{ ...apunte, color: 'var(--accent)' }}
+        >
+          Ir a los gates del proyecto →
+        </Link>
+      </Card>
+
+      <Card style={{ padding: 0, overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 640 }}>
+          <thead>
+            <tr>
+              {['Elemento', 'Estado', 'Release', 'Razón / desviación'].map((h) => (
+                <th
+                  key={h}
+                  style={{
+                    ...micro,
+                    textAlign: 'left',
+                    padding: '10px 14px',
+                    borderBottom: '1px solid var(--border)',
+                  }}
+                >
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {tablero.filas.map((f) => {
+              const desconocido = desconocidos.some((d) => d.elementoId === f.elementoId);
+              return (
+                <tr key={f.elementoId}>
+                  <td style={{ ...cuerpo, padding: '10px 14px', borderBottom: '1px solid var(--border)' }}>
+                    {f.elementoTitulo}
+                    <div style={apunte}>
+                      {ETIQUETA_TIPO_ELEMENTO[f.tipo]} · {f.operacion}
+                    </div>
+                  </td>
+                  <td
+                    style={{
+                      padding: '10px 14px',
+                      borderBottom: '1px solid var(--border)',
+                      font: '600 12.5px var(--font-sans)',
+                      color: desconocido ? 'var(--warn)' : 'var(--ok)',
+                    }}
+                  >
+                    {ETIQUETA_CONCILIACION[f.estado]}
+                  </td>
+                  <td style={{ ...apunte, padding: '10px 14px', borderBottom: '1px solid var(--border)' }}>
+                    {f.releaseCodigo
+                      ? `${f.releaseCodigo} · ${f.releaseResponsable} · ${f.releaseFecha}`
+                      : '—'}
+                  </td>
+                  <td style={{ ...apunte, padding: '10px 14px', borderBottom: '1px solid var(--border)' }}>
+                    {f.razonDesviacion !== ''
+                      ? `${f.queQuedoDistinto} · ${f.razonDesviacion}`
+                      : f.razonAsignacion !== ''
+                        ? f.razonAsignacion
+                        : '—'}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}

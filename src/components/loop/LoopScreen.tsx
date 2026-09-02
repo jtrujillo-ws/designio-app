@@ -371,6 +371,9 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
       <Link to="/journeys" style={{ ...item, textDecoration: 'none' }}>
         <span>Journeys y blueprints</span>
       </Link>
+      <Link to="/design-versions" style={{ ...item, textDecoration: 'none' }}>
+        <span>Design versions y releases</span>
+      </Link>
       <div style={item}>
         <span>Aprobaciones pendientes</span>
         <span style={{ font: '600 11px var(--font-mono)', color: 'var(--warn)' }}>1</span>

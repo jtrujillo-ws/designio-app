@@ -309,7 +309,12 @@ export async function aprobarGate(
     await bloquearReto(tx, pertenece.reto_id as string);
     await bloquearGate(tx, entrada.gateId);
 
-    const aprobado = await tx`
+    // El guard de la transición vuelve a evaluar los DERECHOS de lo ya citado: un ítem
+    // cumplido no se entera de que le revocaron el consentimiento, porque nada lo
+    // actualiza. Su DR001 trae la dimensión que falta y se propaga tal cual (SYS-14).
+    let aprobado;
+    try {
+      aprobado = await tx`
       update gate_instancia g
       set estado = 'aprobado', aprobado_por = ${actorId}, aprobado_en = now()
       where g.id = ${entrada.gateId} and g.workspace_id = ${entrada.workspaceId}
@@ -335,6 +340,12 @@ export async function aprobarGate(
                  or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
                      and btrim(c.linea_base_plan) = ''))))
       returning g.numero`;
+    } catch (e) {
+      if ((e as { code?: string }).code === 'DR001') {
+        throw new ErrorMetodo((e as { message?: string }).message ?? 'Derechos insuficientes');
+      }
+      throw e;
+    }
 
     if (aprobado.length === 0) {
       throw new ErrorMetodo(await diagnosticoDeGate(tx, entrada.workspaceId, entrada.gateId));

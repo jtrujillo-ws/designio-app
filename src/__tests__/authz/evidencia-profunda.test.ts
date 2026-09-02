@@ -13,7 +13,13 @@ import {
   listarEvidenciaConDerechos,
   PAGINA_DERECHOS,
 } from '@/lib/evidencia/evidencia.servicio';
-import { marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
+import {
+  agregarAfirmacion,
+  agregarCita,
+  crearInsight,
+  ErrorInsight,
+} from '@/lib/insight/insight.servicio';
+import { aprobarGate, marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
 import { bytesABase64, MAX_ARCHIVOS_POR_ITEM } from '@/lib/evidencia/sanitizacion';
 import { describeAuthz } from './helpers';
 
@@ -38,6 +44,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
   let itemSinDerechos = '';
   /** Un ítem de checklist real donde se prueba la CITA. */
   let itemChecklist = '';
+  let retoId = '';
 
   const dimensiones = {
     fecha: '2026-08-01',
@@ -83,6 +90,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
       values (${ws}, ${svc!.id as string}, 'R-90', 'Reto derechos', 'activo', 'peticion-cliente', ${leadId})
       returning id`;
+    retoId = reto!.id as string;
     const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
       values (${ws}, ${reto!.id as string}, 'P-90', 'Proyecto derechos', ${leadId}) returning id`;
     const proyectoId = proy!.id as string;
@@ -102,6 +110,10 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     if (wss.length > 0) {
       await admin`delete from evento_dominio where workspace_id in ${admin(wss)}`;
       await admin`delete from checklist_item where workspace_id in ${admin(wss)}`;
+      await admin`delete from cita where workspace_id in ${admin(wss)}`;
+      await admin`delete from contradiccion where workspace_id in ${admin(wss)}`;
+      await admin`delete from afirmacion where workspace_id in ${admin(wss)}`;
+      await admin`delete from insight where workspace_id in ${admin(wss)}`;
       await admin`delete from gate_instancia where workspace_id in ${admin(wss)}`;
       await admin`delete from etapa_instancia where workspace_id in ${admin(wss)}`;
       await admin`delete from archivo_importado where workspace_id in ${admin(wss)}`;
@@ -383,6 +395,189 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(sinContexto.length).toBe(0);
     const ajena = await listarEvidenciaConDerechos(leadId, wsB);
     expect(ajena.evidencias).toHaveLength(0);
+  });
+
+  // ── La MISMA regla en la otra superficie de cita: el insight ──
+
+  it('citar evidencia bloqueada desde un insight se bloquea igual que en un gate', async () => {
+    // El guard colgaba solo de `checklist_item`, pero la superficie de cita son DOS. La
+    // política de `cita` mira rol, autoría e insight-propuesto — nunca derechos — así que
+    // por /insights se persistía el `fragmento` COPIADO de material sin derechos, y esa
+    // misma cita satisfacía el requisito que valida el insight (que luego es inmutable).
+    const ins = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'La verificación expulsa solicitantes',
+      resumen: '',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: ins.insightId,
+      texto: 'El abandono se concentra al subir el documento',
+      esHipotesis: false,
+    });
+
+    await expect(
+      agregarCita(leadId, {
+        workspaceId: ws,
+        afirmacionId: af.afirmacionId,
+        evidenciaId: evSinDerechos,
+        fragmento: 'Testimonio literal del solicitante',
+        localizacion: 'min 12:04',
+      }),
+    ).rejects.toThrow(/No puedes citar esta evidencia.*derechos pendientes/s);
+    await expect(
+      agregarCita(leadId, {
+        workspaceId: ws,
+        afirmacionId: af.afirmacionId,
+        evidenciaId: evSinDerechos,
+        fragmento: 'Testimonio literal del solicitante',
+        localizacion: 'min 12:04',
+      }),
+    ).rejects.toThrow(ErrorInsight);
+
+    // Por SQL CRUDO del rol de aplicación también: el bloqueo vive en el guard, no en el
+    // servicio. Sin esto la regla sería una convención de la app en la otra puerta.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into cita
+        (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+        values (${ws}, ${af.afirmacionId}, ${evSinDerechos}, 'robado', 'p. 1', ${leadId})`),
+    ).rejects.toMatchObject({ code: 'DR001' });
+    const nada = await conUsuario(leadId, (tx) => tx`select id from cita
+      where afirmacion_id = ${af.afirmacionId}`);
+    expect(nada).toHaveLength(0);
+
+    // Y con derechos vigentes la cita entra con normalidad: el guard bloquea material sin
+    // derechos, no la superficie.
+    const cita = await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId: evConDerechos,
+      fragmento: 'Abandono del 62% en verificación',
+      localizacion: 'p. 14',
+    });
+    expect(cita.citaId).toBeTruthy();
+  });
+
+  it('las superficies con guard de derechos son exactamente checklist_item y cita', async () => {
+    // Un solo guard compartido y un trigger por tabla: mientras la regla estuvo escrita
+    // en una función con nombre de tabla, «añadir la siguiente superficie» significó
+    // reescribirla — y por eso faltó. Este test fija el conjunto: quitar un trigger o
+    // añadir una superficie tiene que ser un acto deliberado, no un descuido.
+    const admin = sqlAdmin();
+    const tablas = (
+      await admin`select c.relname as tabla
+        from pg_trigger t
+        join pg_class c on c.oid = t.tgrelid
+        join pg_proc p on p.oid = t.tgfoid
+        where p.proname = 'evidencia_citable_guard' and not t.tgisinternal
+        order by 1`
+    ).map((f) => f.tabla as string);
+    expect(tablas).toEqual(['checklist_item', 'cita']);
+
+    // `contradiccion` queda FUERA a propósito (RF-03.9: se registra y se muestra
+    // siempre, jamás bloquea ni se oculta — que un stakeholder señale que algo no cuadra
+    // es el punto del portal). Se comprueba que sigue siendo posible con evidencia
+    // bloqueada: si alguien le colgara el guard, esto lo detiene.
+    const [ins] = await conUsuario(
+      leadId,
+      (tx) => tx`select id from insight where workspace_id = ${ws} limit 1`,
+    );
+    await conUsuario(
+      stakeId,
+      (tx) => tx`insert into contradiccion
+        (workspace_id, insight_id, evidencia_id, descripcion, creado_por)
+        values (${ws}, ${ins!.id as string}, ${evSinDerechos},
+                'El testimonio apunta a lo contrario', ${stakeId})`,
+    );
+    const registradas = await conUsuario(
+      leadId,
+      (tx) => tx`select id from contradiccion
+        where workspace_id = ${ws} and evidencia_id = ${evSinDerechos}`,
+    );
+    expect(registradas).toHaveLength(1);
+  });
+
+  // ── La revocación alcanza a lo que YA estaba cumplido ──
+
+  it('revocar derechos después de cumplir el ítem impide aprobar el gate', async () => {
+    // El caso que se colaba: el ítem se marca cuando la evidencia SÍ tiene derechos, y
+    // después se revocan. Nada actualiza la fila del checklist, así que su guard no vuelve
+    // a correr; y el guard de aprobación miraba pendientes, orden, criterios, arquetipos
+    // y decisiones — pero no derechos. El gate se aprobaba, delante del cliente, sobre una
+    // cita ya bloqueada. Proyecto propio para no tocar el checklist compartido.
+    const admin = sqlAdmin();
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'nota', 'Fuente revocable', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, 'Evidencia revocable', '{}'::jsonb, ${leadId})
+      returning id`;
+    const evRevocable = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evRevocable}, 'concedido', 'cliente', 'Consentimiento firmado',
+              ${leadId}, now(), ${leadId})`;
+
+    const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-91', 'Proyecto revocación', ${leadId}) returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 1, 'Investigación')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 1, 'lead-boutique') returning id`;
+    const gateId = gate!.id as string;
+    const [ci] = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gateId}, 0, 'Evidencia primaria suficiente') returning id`;
+
+    // Con derechos vigentes, cumplir el ítem es legítimo.
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: ci!.id as string,
+      accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evRevocable },
+    });
+
+    // Se retira el consentimiento. El ítem sigue cumplido: nada lo toca, y esa es
+    // justamente la decisión (resetearlo tiraría juicio humano por algo reversible).
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evRevocable,
+      decision: 'denegado',
+      ambito: 'interno',
+      base: 'El titular retiró el consentimiento',
+      venceEn: null,
+    });
+    const [sigueCumplido] = await conUsuario(leadId, (tx) => tx`select estado from checklist_item
+      where id = ${ci!.id as string}`);
+    expect(sigueCumplido?.estado).toBe('cumplido');
+
+    // Pero aprobar el gate —el acto que pone la cita delante del cliente— ya no pasa, y
+    // lo dice nombrando la dimensión que falta (SYS-14).
+    await expect(aprobarGate(leadId, { workspaceId: ws, gateId })).rejects.toThrow(
+      /derechos vigentes.*retiró el consentimiento/s,
+    );
+    // Y por SQL CRUDO: el re-chequeo vive en el guard de la transición.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update gate_instancia
+        set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
+        where id = ${gateId}`),
+    ).rejects.toMatchObject({ code: 'DR001' });
+    const [sigueP] = await conUsuario(leadId, (tx) => tx`select estado from gate_instancia
+      where id = ${gateId}`);
+    expect(sigueP?.estado).toBe('pendiente');
+
+    // El camino de reparación es reconceder (los derechos van y vuelven por diseño), y no
+    // exige rehacer el checklist: el ítem cumplido sigue ahí y el gate aprueba.
+    await decidirDerechos(leadId, {
+      workspaceId: ws,
+      evidenciaId: evRevocable,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Nuevo consentimiento firmado',
+      venceEn: null,
+    });
+    const r = await aprobarGate(leadId, { workspaceId: ws, gateId });
+    expect(r.numero).toBe(1);
   });
 
   // ── Archivos adjuntos ──
@@ -669,6 +864,50 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       evAjena!.id as string,
     );
     expect(conCursorAjeno.evidencias).toHaveLength(0);
+  });
+
+  // ── Higiene de la migración y del seed ──
+
+  it('los CHECK de sanitización rigen desde ya y quedan VALIDADOS en una base limpia', async () => {
+    // Se añaden NOT VALID —el esquema anterior y el validador de la app aceptaban esos
+    // caracteres, así que una instalación con material heredado sucio no puede caerse al
+    // desplegar— y se validan acto seguido si no hay deuda. Las dos mitades importan: que
+    // una base limpia acabe en el estado FUERTE (convalidated = t, la restricción cubre
+    // también el pasado) y que, validada o no, rija para toda escritura nueva.
+    const admin = sqlAdmin();
+    const filas = await admin`select conname, convalidated from pg_constraint
+      where conrelid = 'item_importacion'::regclass
+        and conname in ('item_contenido_limpio', 'item_titulo_limpio', 'item_referencia_limpia')
+      order by conname`;
+    expect(filas.map((f) => f.conname as string)).toEqual([
+      'item_contenido_limpio',
+      'item_referencia_limpia',
+      'item_titulo_limpio',
+    ]);
+    expect(filas.map((f) => f.convalidated as boolean)).toEqual([true, true, true]);
+    // (La mitad «rige para escrituras nuevas» la cubre el test de controles y bidi por
+    // SQL crudo, que sigue chocando con 23514.)
+  });
+
+  it('el seed no deja evidencia sin registro de derechos (el guard se lo salta, la regla no)', async () => {
+    // El seed corre como PROPIETARIO, así que el pre-chequeo anti-oráculo de
+    // `evidencia_con_derechos_guard` sale antes y no verifica nada. Eso es correcto —el
+    // guard no puede ser un oráculo— pero significa que la disciplina la tiene que poner
+    // el seed: una evidencia sembrada sin fila de derechos sale bloqueada por «no tiene
+    // registro» y NO se puede reparar desde el producto, porque decidirDerechos solo hace
+    // UPDATE y no hay fila que actualizar.
+    const admin = sqlAdmin();
+    const [total] = await admin`select count(*)::int as n from evidencia e
+      join workspace w on w.id = e.workspace_id
+      where w.nombre in ('Banco Andino', 'Clínica del Valle')`;
+    // No vacuo: si esto es 0 la base no está sembrada y la aserción siguiente no probaría
+    // nada (CI siembra antes de correr la suite, igual que el flujo de validación local).
+    expect(total!.n as number).toBeGreaterThan(0);
+    const huerfanas = await admin`select e.id, e.titulo from evidencia e
+      join workspace w on w.id = e.workspace_id
+      where w.nombre in ('Banco Andino', 'Clínica del Valle')
+        and not exists (select 1 from derecho_uso d where d.evidencia_id = e.id)`;
+    expect(huerfanas.map((f) => f.titulo as string)).toEqual([]);
   });
 
   it('marcar cumplido sin evidencia sigue siendo imposible (el guard no lo relaja)', async () => {

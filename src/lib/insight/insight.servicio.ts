@@ -144,6 +144,14 @@ export async function agregarCita(
         returning id`;
     } catch (e) {
       const code = (e as { code?: string }).code;
+      // DR001: el guard de derechos cortó la CITA — la evidencia no tiene derechos
+      // vigentes para el ámbito «cliente» (RF-03.10, SYS-14). Citar aquí es tan
+      // definitivo como citar en un gate: la cita COPIA el fragmento del original y es
+      // lo que después valida el insight, que es inmutable. El mensaje ya trae la
+      // dimensión que falta y se propaga tal cual, que es lo que la spec pide mostrar.
+      if (code === 'DR001') {
+        throw new ErrorInsight((e as { message?: string }).message ?? 'Derechos insuficientes');
+      }
       // FK compuesta: la evidencia citada no es de este workspace (o no existe).
       if (code === '23503') {
         throw new ErrorInsight('La evidencia citada no existe en este workspace');

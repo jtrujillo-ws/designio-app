@@ -55,6 +55,15 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
       values (${ws}, ${fuente!.id as string}, 'Entrevistas de apertura', '{}'::jsonb, ${leadId})
       returning id`;
     evidenciaId = ev!.id as string;
+    // Citar exige DERECHOS vigentes para el ámbito cliente (RF-03.10): la cita copia el
+    // fragmento del original, así que crearla es publicar el material. La evidencia de
+    // este workspace de prueba los tiene concedidos; el caso contrario lo cubre la suite
+    // de evidencia profunda. (El insert directo como admin se salta el constraint trigger
+    // que lo exigiría desde la app: por eso hay que ponerlo a mano.)
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaId}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${leadId}, now(), ${leadId})`;
 
     const [fuenteB] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
       values (${wsAjeno}, 'nota', 'Fuente ajena', ${leadId}) returning id`;
@@ -73,6 +82,7 @@ describeAuthz('insights: afirmaciones, citas y contradicciones', () => {
       await admin`delete from contradiccion where workspace_id = ${w}`;
       await admin`delete from afirmacion where workspace_id = ${w}`;
       await admin`delete from insight where workspace_id = ${w}`;
+      await admin`delete from derecho_uso where workspace_id = ${w}`;
       await admin`delete from evidencia where workspace_id = ${w}`;
       await admin`delete from fuente where workspace_id = ${w}`;
       await admin`delete from miembro where workspace_id = ${w}`;

@@ -8,7 +8,7 @@ import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { ROLES_CURADORES, type EvidenciaCitable } from '@/lib/evidencia/evidencia.schemas';
 import {
   afirmarEnInsight,
   anotarContradiccion,
@@ -245,8 +245,11 @@ function FichaInsight({
   onError,
 }: {
   workspaceId: string;
+  /** Con su `citable` y su motivo: citar exige derechos vigentes para el ámbito cliente
+   * (RF-03.10) y la opción bloqueada se muestra deshabilitada CON la razón, nunca
+   * oculta — el bloqueo real lo impone el guard de la base; esto lo hace legible. */
   insight: InsightCompleto;
-  evidencias: { id: string; titulo: string }[];
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   puedeCurar: boolean;
   onCambio: () => Promise<void>;
@@ -355,9 +358,16 @@ function FichaInsight({
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <Select value={evidenciaId} onChange={(e) => setEvidenciaId(e.target.value)}>
                   <option value="">Evidencia citada…</option>
+                  {/* La cita COPIA el fragmento del original y es lo que después valida
+                      el insight: sin derechos vigentes para el ámbito cliente no se
+                      crea. Deshabilitada CON su motivo, nunca oculta (SYS-14). */}
                   {evidencias.map((e) => (
-                    <option key={e.id} value={e.id}>
-                      {e.titulo}
+                    <option key={e.id} value={e.id} disabled={!e.citable}>
+                      {e.citable
+                        ? e.titulo
+                        : `${e.titulo} — sin derechos: ${
+                            e.motivoBloqueo ?? 'faltan derechos de uso para el ámbito cliente'
+                          }`}
                     </option>
                   ))}
                   {hayMasEvidencias && (
@@ -485,6 +495,12 @@ function FichaInsight({
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             <Select value={contraEvidenciaId} onChange={(e) => setContraEvidenciaId(e.target.value)}>
               <option value="">Evidencia que lo contradice…</option>
+              {/* SIN filtro de derechos, y es deliberado: RF-03.9 dice que la
+                  contradicción se registra y se muestra SIEMPRE, jamás bloquea ni se
+                  oculta, y la puede levantar cualquier miembro. Impedir señalar que una
+                  evidencia contradice un insight porque le faltan derechos de PUBLICACIÓN
+                  suprimiría justo el descubrimiento incómodo que la spec protege. Lo que
+                  no puede es salir en el entregable: de eso se encarga la poda. */}
               {evidencias.map((e) => (
                 <option key={e.id} value={e.id}>
                   {e.titulo}

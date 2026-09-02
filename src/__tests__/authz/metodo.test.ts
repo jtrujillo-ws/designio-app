@@ -466,13 +466,14 @@ describeAuthz('método: etapas, gates y checklists', () => {
         accion: { tipo: 'na', justificacion: 'Cubierto' },
       });
     }
-    // Solo posible por SQL directo (el schema recorta): espacios en todos los textos.
+    // Solo posible por SQL directo (el schema recorta): espacios en todos los textos,
+    // el KPI incluido.
     const admin = sqlAdmin();
     await admin`insert into criterio_exito
       (workspace_id, reto_id, kpi, definicion, objetivo, linea_base_plan, ventana_dias, creado_por)
-      values (${ws}, ${r.retoId}, 'KPI espacios', '   ', ' ', '  ', 90, ${leadId})`;
+      values (${ws}, ${r.retoId}, '   ', '   ', ' ', '  ', 90, ${leadId})`;
     await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id })).rejects.toThrow(
-      /sin definición/,
+      /sin KPI/,
     );
     // El guard de fila repite el veredicto para el SQL directo del propio sponsor.
     await expect(
@@ -490,6 +491,49 @@ describeAuthz('método: etapas, gates y checklists', () => {
           for each row execute function checklist_gate_pendiente_guard()`;
       }),
     ).rejects.toThrow(/permission denied/);
+  });
+
+  it('un checklist vacío no es suficiencia y el guard instalado no es oráculo cross-tenant', async () => {
+    // Gate colado a mano SIN ítems (las políticas de insert lo permiten al lead): el
+    // NOT EXISTS de pendientes sería vacuamente cierto — lo tapa exigir ≥1 ítem.
+    const huerfano = await conUsuario(leadId, async (tx) => {
+      const [pr] = await tx`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+        values (${ws}, ${retoId}, 'P-96', 'Huérfano', 'activo', 'rapido', ${leadId})
+        returning id`;
+      const [g] = await tx`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador)
+        values (${ws}, ${pr!.id as string}, 1, 'lead-boutique') returning id`;
+      return g!.id as string;
+    });
+    await expect(aprobarGate(leadId, { workspaceId: ws, gateId: huerfano })).rejects.toThrow(
+      /checklist instanciado/,
+    );
+    await expect(
+      conUsuario(leadId, (tx) => tx`
+        update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
+        where id = ${huerfano}`),
+    ).rejects.toThrow(/checklist instanciado/);
+
+    // Oráculo: un miembro de OTRO workspace que apunte a nuestro reto (G0 aprobado)
+    // recibe el error de política de siempre — el pre-chequeo de membresía del guard
+    // evita la consulta privilegiada y sus mensajes/candados delatores.
+    const admin = sqlAdmin();
+    const [wsX] = await admin`insert into workspace (nombre) values (${marca + '-X'}) returning id`;
+    const [ux] = await admin`insert into usuario (email, nombre, estado)
+      values (${marca + '-x@test.demo'}, 'Fisgón', 'activo') returning id`;
+    await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${wsX!.id as string}, ${ux!.id as string}, 'Fisgón', ${marca + '-x@test.demo'}, 'lead-boutique')`;
+    try {
+      await expect(
+        conUsuario(ux!.id as string, (tx) => tx`insert into criterio_exito
+          (workspace_id, reto_id, kpi, creado_por)
+          values (${ws}, ${retoId}, 'Sonda', ${ux!.id as string})`),
+      ).rejects.toThrow(/row-level security/);
+    } finally {
+      await admin`delete from miembro where workspace_id = ${wsX!.id as string}`;
+      await admin`delete from workspace where id = ${wsX!.id as string}`;
+    }
   });
 
   it('una cuenta desactivada con sesión viva no lee el método ni aprueba (re-check de estado)', async () => {

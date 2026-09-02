@@ -244,6 +244,11 @@ create policy gate_update_aprobar on gate_instancia
       where ci.gate_id = gate_instancia.id
         and ci.workspace_id = gate_instancia.workspace_id
         and ci.estado = 'pendiente')
+    -- Un checklist VACÍO no es suficiencia: sin esto, el NOT EXISTS de pendientes
+    -- sería vacuamente cierto para un gate colado a mano sin ítems.
+    and exists (select 1 from checklist_item ci
+      where ci.gate_id = gate_instancia.id
+        and ci.workspace_id = gate_instancia.workspace_id)
     and (gate_instancia.numero <> 0 or (
       exists (select 1 from criterio_exito c
         join proyecto p on p.id = gate_instancia.proyecto_id
@@ -256,7 +261,7 @@ create policy gate_update_aprobar on gate_instancia
           and (c.ventana_dias is null
                -- btrim: el schema recorta en la app, pero este predicado protege
                -- también contra SQL directo — whitespace NO es contenido.
-               or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
+               or btrim(c.kpi) = '' or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
                or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
                    and btrim(c.linea_base_plan) = '')))))
   );
@@ -329,11 +334,19 @@ create policy checklist_update on checklist_item
 create function checklist_gate_pendiente_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
+  -- El guard corre como definer ANTES del WITH CHECK: sin este pre-chequeo sería un
+  -- oráculo cross-tenant (mensaje distinto según el estado del gate ajeno) y tomaría
+  -- candados sobre filas de otros workspaces. Para quien no es miembro del workspace
+  -- declarado no hay nada que serializar: la política rechaza el write como siempre.
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
   perform 1 from gate_instancia g
     where g.id = new.gate_id and g.workspace_id = new.workspace_id for update;
-  if not exists (select 1 from gate_instancia g
+  -- Solo si el gate existe y está aprobado; si no existe, que hable la FK compuesta.
+  if exists (select 1 from gate_instancia g
     where g.id = new.gate_id and g.workspace_id = new.workspace_id
-      and g.estado = 'pendiente') then
+      and g.estado = 'aprobado') then
     raise exception 'el gate ya está aprobado: checklist congelado';
   end if;
   return new;
@@ -345,6 +358,11 @@ create trigger checklist_gate_pendiente
 create function criterio_g0_pendiente_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
+  -- Mismo pre-chequeo anti-oráculo que el guard del checklist: la consulta
+  -- privilegiada solo corre para miembros del workspace declarado.
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
   -- Todos los G0 del reto, en orden estable (dos guards concurrentes no se cruzan).
   perform 1 from gate_instancia g
     join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
@@ -373,6 +391,10 @@ begin
         and ci.estado = 'pendiente') then
       raise exception 'no se puede aprobar: checklist con pendientes';
     end if;
+    if not exists (select 1 from checklist_item ci
+      where ci.gate_id = new.id and ci.workspace_id = new.workspace_id) then
+      raise exception 'no se puede aprobar: el gate no tiene checklist instanciado';
+    end if;
     if new.numero = 0 then
       if not exists (select 1 from criterio_exito c
         join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
@@ -383,7 +405,7 @@ begin
         join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
         where c.reto_id = p.reto_id and c.workspace_id = new.workspace_id
           and (c.ventana_dias is null
-               or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
+               or btrim(c.kpi) = '' or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
                or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
                    and btrim(c.linea_base_plan) = ''))) then
         raise exception 'no se puede aprobar G0: criterios incompletos (SYS-22)';

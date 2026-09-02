@@ -346,6 +346,8 @@ export async function aprobarGate(
         and not exists (select 1 from checklist_item ci
           where ci.gate_id = g.id and ci.workspace_id = g.workspace_id
             and ci.estado = 'pendiente')
+        and exists (select 1 from checklist_item ci
+          where ci.gate_id = g.id and ci.workspace_id = g.workspace_id)
         and (g.numero <> 0 or exists (select 1
           from criterio_exito c
           join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
@@ -355,7 +357,7 @@ export async function aprobarGate(
           join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
           where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
             and (c.ventana_dias is null
-                 or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
+                 or btrim(c.kpi) = '' or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
                  or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
                      and btrim(c.linea_base_plan) = ''))))
       returning g.numero, g.proyecto_id, workspace_role(${actorId}, g.workspace_id) as rol`;
@@ -408,6 +410,12 @@ async function diagnosticoDeGate(
     const lista = pendientes.map((p) => `«${p.texto as string}»`).join(', ');
     return `Checklist con pendientes: ${lista}`;
   }
+  const [conItems] = await tx`
+    select count(*)::int as n from checklist_item
+    where gate_id = ${gateId} and workspace_id = ${workspaceId}`;
+  if ((conItems!.n as number) === 0) {
+    return 'El gate no tiene checklist instanciado: un checklist vacío no es suficiencia';
+  }
 
   if ((gate.numero as number) === 0) {
     // Criterio completo (SYS-22) = definición + objetivo + ventana + línea base
@@ -415,6 +423,7 @@ async function diagnosticoDeGate(
     // btrim en todos los textos: whitespace no es contenido, ni siquiera por SQL directo.
     const incompletos = await tx`
       select c.kpi, (c.ventana_dias is null) as sin_ventana,
+             (btrim(c.kpi) = '') as sin_kpi,
              (btrim(c.definicion) = '') as sin_definicion,
              (btrim(c.objetivo) = '') as sin_objetivo,
              ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
@@ -423,7 +432,7 @@ async function diagnosticoDeGate(
       join proyecto p on p.id = ${gate.proyecto_id as string} and p.workspace_id = ${workspaceId}
       where c.reto_id = p.reto_id and c.workspace_id = ${workspaceId}
         and (c.ventana_dias is null
-             or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
+             or btrim(c.kpi) = '' or btrim(c.definicion) = '' or btrim(c.objetivo) = ''
              or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
                  and btrim(c.linea_base_plan) = ''))`;
     if (incompletos.length > 0) {
@@ -431,6 +440,7 @@ async function diagnosticoDeGate(
         .map(
           (c) =>
             `«${c.kpi as string}» (${[
+              c.sin_kpi ? 'sin KPI' : null,
               c.sin_definicion ? 'sin definición' : null,
               c.sin_objetivo ? 'sin objetivo' : null,
               c.sin_ventana ? 'sin ventana' : null,

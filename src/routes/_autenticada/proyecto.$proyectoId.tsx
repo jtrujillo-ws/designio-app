@@ -72,6 +72,7 @@ function criteriosCompletos(criterios: CriterioDeReto[]): boolean {
     criterios.length > 0 &&
     criterios.every(
       (c) =>
+        c.kpi.trim() !== '' &&
         c.definicion.trim() !== '' &&
         c.objetivo.trim() !== '' &&
         c.ventanaDias !== null &&

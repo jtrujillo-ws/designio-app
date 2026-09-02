@@ -366,10 +366,11 @@ describeAuthz('método: etapas, gates y checklists', () => {
   it('un gate aprobado no admite altas de checklist y cada marca deja evento con lo previo', async () => {
     const p = await proyectoMetodo(leadId, ws, proyectoId);
     const g1 = p!.gates[1]!; // aprobado en el test del rol del gate
+    // El guard de fila salta antes que el WITH CHECK: mismo veredicto, mensaje propio.
     await expect(
       conUsuario(leadId, (tx) => tx`insert into checklist_item (workspace_id, gate_id, orden, texto)
         values (${ws}, ${g1.id}, 99, 'colado tras la aprobación')`),
-    ).rejects.toThrow(/row-level security/);
+    ).rejects.toThrow(/checklist congelado/);
 
     // El rastro del N/A revertido vive en el evento: quién lo había aprobado y por qué.
     const admin = sqlAdmin();
@@ -396,13 +397,46 @@ describeAuthz('método: etapas, gates y checklists', () => {
     expect(sigue?.gates[4]?.estado).toBe('pendiente');
 
     // La suficiencia vive en el DATO: el sponsor es el rol de G5 pero su checklist
-    // sigue pendiente — la propia política (WITH CHECK) rechaza el salto por SQL.
+    // sigue pendiente — el guard del gate (y la política, como respaldo por snapshot)
+    // rechaza el salto por SQL directo.
     const g5 = p!.gates[5]!;
     await expect(
       conUsuario(sponsorId, (tx) => tx`
         update gate_instancia set estado = 'aprobado', aprobado_por = ${sponsorId}, aprobado_en = now()
         where id = ${g5.id}`),
-    ).rejects.toThrow(/row-level security/);
+    ).rejects.toThrow(/checklist con pendientes/);
+  });
+
+  it('la carrera insertar↔aprobar por SQL directo la serializa el guard de fila', async () => {
+    const p = await proyectoMetodo(leadId, ws, proyectoId);
+    const g2 = p!.gates[2]!;
+    for (const item of g2.items) {
+      await marcarItem(leadId, {
+        workspaceId: ws,
+        itemId: item.id,
+        accion: { tipo: 'cumplido', evidenciaId },
+      });
+    }
+
+    // Transacción A (SQL directo, sin candados del servicio): inserta un pendiente y
+    // QUEDA ABIERTA con el FOR UPDATE del guard sobre la fila del gate. La aprobación
+    // concurrente bloquea en esa fila y, al retomar, su guard re-verifica con snapshot
+    // fresco y ve el ítem colado. El rechazo es determinista en cualquier intercalado:
+    // si A commitea antes de que B llegue al lock, B lo ve igual.
+    let liberar!: () => void;
+    const espera = new Promise<void>((r) => (liberar = r));
+    const insercion = conUsuario(leadId, async (tx) => {
+      await tx`insert into checklist_item (workspace_id, gate_id, orden, texto)
+        values (${ws}, ${g2.id}, 99, 'colado en plena aprobación')`;
+      await espera;
+    });
+    const aprobacion = aprobarGate(leadId, { workspaceId: ws, gateId: g2.id });
+    await new Promise((r) => setTimeout(r, 150));
+    liberar();
+    await insercion;
+    await expect(aprobacion).rejects.toThrow(/checklist con pendientes/);
+    const sigue = await proyectoMetodo(leadId, ws, proyectoId);
+    expect(sigue!.gates[2]!.estado).toBe('pendiente');
   });
 
   it('una cuenta desactivada con sesión viva no lee el método ni aprueba (re-check de estado)', async () => {

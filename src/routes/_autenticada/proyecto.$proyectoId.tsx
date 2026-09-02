@@ -15,7 +15,12 @@ import {
   proyectoDelMetodo,
 } from '@/lib/metodo/metodo.functions';
 import { ETIQUETA_PERFIL } from '@/lib/metodo/metodo.plantillas';
-import type { GateDeProyecto, ItemDeGate, ProyectoMetodo } from '@/lib/metodo/metodo.schemas';
+import type {
+  CriterioDeReto,
+  GateDeProyecto,
+  ItemDeGate,
+  ProyectoMetodo,
+} from '@/lib/metodo/metodo.schemas';
 
 /**
  * Pantalla del método (SPEC-04): las 8 etapas canónicas con su gate, checklist de
@@ -59,6 +64,21 @@ const COLOR_ITEM: Record<ItemDeGate['estado'], string> = {
   cumplido: 'var(--accent)',
   na: 'var(--text-faint)',
 };
+
+/** Espejo cliente del predicado SYS-22 de aprobarGate — solo informa la etiqueta de
+ * G0; la exigencia real vive en el servidor y en la política. */
+function criteriosCompletos(criterios: CriterioDeReto[]): boolean {
+  return (
+    criterios.length > 0 &&
+    criterios.every(
+      (c) =>
+        c.definicion !== '' &&
+        c.objetivo !== '' &&
+        c.ventanaDias !== null &&
+        (((c.lineaBaseValor ?? '') !== '' && c.lineaBaseFecha !== null) || c.lineaBasePlan !== ''),
+    )
+  );
+}
 
 function PantallaProyecto() {
   const datos = Route.useLoaderData();
@@ -119,6 +139,7 @@ function PantallaProyecto() {
                   evidencias={datos.evidencias}
                   hayMasEvidencias={datos.hayMasEvidencias}
                   rol={rol}
+                  criteriosListosG0={criteriosCompletos(datos.proyecto.reto.criterios)}
                   onCambio={() => router.invalidate()}
                   onError={setError}
                 />
@@ -182,6 +203,7 @@ function EtapaConGate({
   evidencias,
   hayMasEvidencias,
   rol,
+  criteriosListosG0,
   onCambio,
   onError,
 }: {
@@ -192,6 +214,8 @@ function EtapaConGate({
   evidencias: { id: string; titulo: string }[];
   hayMasEvidencias: boolean;
   rol: string;
+  /** SYS-22 en la etiqueta: G0 no está «listo» sin criterios completos. */
+  criteriosListosG0: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
 }) {
@@ -231,7 +255,11 @@ function EtapaConGate({
           </span>
         ) : (
           <span style={{ font: '600 12px var(--font-sans)', color: 'var(--warn)' }}>
-            {pendientes === 0 ? 'Listo para aprobar' : `${pendientes} pendientes`}
+            {pendientes > 0
+              ? `${pendientes} pendientes`
+              : gate.numero === 0 && !criteriosListosG0
+                ? 'Faltan criterios completos (SYS-22)'
+                : 'Listo para aprobar'}
           </span>
         )}
       </div>

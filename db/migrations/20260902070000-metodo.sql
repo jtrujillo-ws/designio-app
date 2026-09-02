@@ -315,6 +315,85 @@ create policy checklist_update on checklist_item
           and workspace_role(app_user_id(), workspace_id) = g.rol_aprobador))
   );
 
+-- ── Serialización a nivel de base de la carrera escribir↔aprobar ──
+-- Las políticas son chequeos por snapshot: dos transacciones por SQL directo (donde
+-- los candados consultivos del servicio no aplican) podrían commitear un gate aprobado
+-- con un pendiente colado. Cada guard de escritura toma el candado de FILA del gate
+-- (FOR UPDATE conflictúa con el NO KEY UPDATE de la aprobación y con otros guards) y
+-- re-verifica en una sentencia nueva: en READ COMMITTED cada sentencia de plpgsql toma
+-- snapshot fresco, así que quien llega segundo ve lo que el primero commiteó mientras
+-- esperaba. SECURITY DEFINER porque bloquear la fila del gate bajo RLS exigiría pasar
+-- el USING de la política de aprobación, que un curador no cumple.
+create function checklist_gate_pendiente_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  perform 1 from gate_instancia g
+    where g.id = new.gate_id and g.workspace_id = new.workspace_id for update;
+  if not exists (select 1 from gate_instancia g
+    where g.id = new.gate_id and g.workspace_id = new.workspace_id
+      and g.estado = 'pendiente') then
+    raise exception 'el gate ya está aprobado: checklist congelado';
+  end if;
+  return new;
+end $$;
+create trigger checklist_gate_pendiente
+  before insert or update on checklist_item
+  for each row execute function checklist_gate_pendiente_guard();
+
+create function criterio_g0_pendiente_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  -- Todos los G0 del reto, en orden estable (dos guards concurrentes no se cruzan).
+  perform 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id and g.numero = 0
+    order by g.id for update of g;
+  if exists (select 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id
+      and g.numero = 0 and g.estado = 'aprobado') then
+    raise exception 'el G0 del reto está aprobado: criterios congelados';
+  end if;
+  return new;
+end $$;
+create trigger criterio_g0_pendiente
+  before insert or update on criterio_exito
+  for each row execute function criterio_g0_pendiente_guard();
+
+create function gate_aprobar_suficiencia_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if new.estado = 'aprobado' and old.estado = 'pendiente' then
+    -- La fila del gate ya quedó bloqueada por el propio UPDATE: los guards de
+    -- escritura esperan en su FOR UPDATE y estas sentencias ven lo ya commiteado.
+    if exists (select 1 from checklist_item ci
+      where ci.gate_id = new.id and ci.workspace_id = new.workspace_id
+        and ci.estado = 'pendiente') then
+      raise exception 'no se puede aprobar: checklist con pendientes';
+    end if;
+    if new.numero = 0 then
+      if not exists (select 1 from criterio_exito c
+        join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+        where c.reto_id = p.reto_id and c.workspace_id = new.workspace_id) then
+        raise exception 'no se puede aprobar G0: sin criterios de éxito (SYS-22)';
+      end if;
+      if exists (select 1 from criterio_exito c
+        join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+        where c.reto_id = p.reto_id and c.workspace_id = new.workspace_id
+          and (c.ventana_dias is null
+               or c.definicion = '' or c.objetivo = ''
+               or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
+                   and c.linea_base_plan = ''))) then
+        raise exception 'no se puede aprobar G0: criterios incompletos (SYS-22)';
+      end if;
+    end if;
+  end if;
+  return new;
+end $$;
+create trigger gate_aprobar_suficiencia
+  before update on gate_instancia
+  for each row execute function gate_aprobar_suficiencia_guard();
+
 -- ── Grants mínimos (UPDATE por columnas: nada más que la transición de cada pieza) ──
 grant insert on reto, proyecto, reto_servicio_afectado, criterio_exito,
   etapa_instancia, gate_instancia, checklist_item to designio_app;

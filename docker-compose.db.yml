@@ -1,0 +1,14 @@
+services:
+  db:
+    # Override para entornos donde Docker Hub no es alcanzable:
+    #   DESIGNIO_DB_IMAGE=public.ecr.aws/docker/library/postgres:15-alpine
+    image: ${DESIGNIO_DB_IMAGE:-pgvector/pgvector:pg15}
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - '54322:5432'
+    volumes:
+      - designio-db:/var/lib/postgresql/data
+
+volumes:
+  designio-db: {}

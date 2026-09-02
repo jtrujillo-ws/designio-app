@@ -1,0 +1,10 @@
+:root {
+  --font-sans: 'Figtree', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --fs-display: 30px;  /* 800, lh 1.12 */
+  --fs-h2: 22px;       /* 700, lh 1.2 */
+  --fs-h3: 16.5px;     /* 700, lh 1.3 */
+  --fs-body: 14px;     /* 400, lh 1.5 */
+  --fs-small: 12.5px;  /* 400-600, lh 1.45 */
+  --fs-micro: 11px;    /* mono 500, uppercase, tracking .08em */
+}

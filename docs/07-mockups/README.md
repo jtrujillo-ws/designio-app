@@ -16,5 +16,5 @@ Notas de intención:
 
 - El árbol lateral reproduce la navegación canónica Cliente → Servicio → Retos → Proyectos (ADR-0003); el seguimiento de impacto vive dentro del reto, no como módulo aparte (ADR-0007).
 - Toda salida AI visible lleva etiqueta (asistente / simulación / propuesta) y ningún control de aprobación es AI (ADR-0009, ADR-0012).
-- Los tokens visuales (colores, tipografía del sistema) son **placeholder de referencia**: el scaffolding los sustituirá por el design system propio de la plataforma, por definir, orientado a una herramienta de diseño (ver `docs/06-diseno-tecnico/`).
+- Los tokens visuales del mockup son **placeholder de referencia**, anteriores al design system definitivo: la app usa el sistema propio «El arco del loop» (`.claude/skills/designio-design/`, tokens en `src/styles/tokens/`). Este mockup se conserva como registro histórico del alcance funcional.
 - Es un mockup de comunicación, no un prototipo funcional: la única interacción es el cambio de pantalla.

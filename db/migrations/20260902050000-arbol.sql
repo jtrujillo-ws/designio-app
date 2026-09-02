@@ -69,6 +69,8 @@ create table reto_servicio_afectado (
   foreign key (reto_id, workspace_id) references reto (id, workspace_id),
   foreign key (servicio_id, workspace_id) references servicio (id, workspace_id)
 );
+-- La proyección lee por servicio (¿qué retos afectan a este servicio?): el PK no lo cubre.
+create index reto_servicio_afectado_servicio_idx on reto_servicio_afectado (workspace_id, servicio_id);
 
 -- ── RLS: por ahora SOLO LECTURA para el rol de aplicación ──
 -- Las escrituras del árbol llegan con sus server functions (backlog de retos, gates)

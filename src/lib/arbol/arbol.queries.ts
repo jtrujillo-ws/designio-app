@@ -44,7 +44,7 @@ export async function construirArbol(
             'id', r2.id, 'codigo', r2.codigo, 'titulo', r2.titulo
           ) order by r2.codigo, r2.id)
           from reto_servicio_afectado ra
-          join reto r2 on r2.id = ra.reto_id
+          join reto r2 on r2.id = ra.reto_id and r2.workspace_id = ra.workspace_id
           where ra.servicio_id = s.id
             and ra.workspace_id = ${workspaceId}
             -- Si una arista «afecta» duplicara el ancla, la proyección NO la duplica

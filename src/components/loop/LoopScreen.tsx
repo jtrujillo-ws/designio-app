@@ -92,8 +92,10 @@ export function LoopScreen({
               <strong>El loop cierra:</strong> los retos candidatos del post mortem (J7) pre-pueblan la etapa 0
               del siguiente reto (J2) con la memoria del propio workspace
               {(() => {
+                // La narrativa es J7→J2 sobre el servicio ACTUAL (el del breadcrumb):
+                // solo candidatos de este servicio nacidos del post mortem.
                 const candidatos =
-                  arbol?.servicios.flatMap((s) => s.retos).filter((r) => r.estado === 'candidato') ?? [];
+                  servicio?.retos.filter((r) => r.estado === 'candidato' && r.origen === 'post-mortem') ?? [];
                 if (candidatos.length === 0) return ' — el backlog del servicio espera su primer candidato.';
                 return (
                   <>

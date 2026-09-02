@@ -73,6 +73,6 @@ psql "$DATABASE_URL_APP" -tAc "select count(*) from workspace"   # → 0
 | Tema | Plan |
 |---|---|
 | Object storage para evidencia binaria | Bucket S3-compatible (R2/S3) cuando llegue SPEC-03; en local, filesystem |
-| Cron/backstop de jobs | Railway cron invocando los hooks `x-cron-secret` cuando llegue el scheduler (SPEC-07) |
+| Cron/backstop de jobs | Un **servicio cron aparte** cuyo start command invoca el hook `x-cron-secret` (p. ej. `curl -fsS`) y termina — el cron de Railway ejecuta el comando del servicio programado y requiere que el proceso finalice; no hace llamadas HTTP por sí mismo. Llega con el scheduler (SPEC-07) |
 | Dominios | Asignar dominio propio por environment cuando el piloto lo pida (mientras, el subdominio `*.up.railway.app`) |
 | Backups | Verificar la política de backups del plugin Postgres del plan contratado y documentar la prueba de restauración (DoD §14) |

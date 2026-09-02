@@ -15,12 +15,22 @@ import {
   proyectoDelMetodo,
 } from '@/lib/metodo/metodo.functions';
 import { ETIQUETA_PERFIL } from '@/lib/metodo/metodo.plantillas';
+import { CLASES_OBJETO_CITABLE, ETIQUETA_CLASE_OBJETO } from '@/lib/metodo/metodo.schemas';
 import type {
+  ClaseObjetoCitable,
   CriterioDeReto,
   GateDeProyecto,
   ItemDeGate,
   ProyectoMetodo,
 } from '@/lib/metodo/metodo.schemas';
+import { insightsDelEspacio } from '@/lib/insight/insight.functions';
+import { gobernanzaDelProyecto } from '@/lib/metodo/gobernanza.functions';
+import { SeccionGobernanza } from '@/components/metodo/SeccionGobernanza';
+
+/** Lo que un ítem del checklist puede citar: evidencia curada, insight validado o
+ * decisión vigente (RF-04.5). Un insight propuesto no cuenta — la suficiencia se
+ * apoya en lo que alguien ya sostuvo con citas. */
+export type ObjetoCitable = { clase: ClaseObjetoCitable; id: string; titulo: string };
 
 /**
  * Pantalla del método (SPEC-04): las 8 etapas canónicas con su gate, checklist de
@@ -35,18 +45,44 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
     // Un id no-uuid en la URL (enlace editado/truncado) es "no existe", no un crash
     // del validador de la server function contra el error boundary por defecto.
     if (!workspaceId || !ES_UUID.test(params.proyectoId)) return null;
-    const [proyecto, lista] = await Promise.all([
+    const [proyecto, lista, gobernanza, insights] = await Promise.all([
       proyectoDelMetodo({ data: { workspaceId, proyectoId: params.proyectoId } }),
       evidenciasDelWorkspace({ data: { workspaceId } }),
+      gobernanzaDelProyecto({ data: { workspaceId, proyectoId: params.proyectoId } }),
+      insightsDelEspacio({ data: { workspaceId } }),
     ]);
-    return proyecto
-      ? {
-          workspaceId,
-          proyecto,
-          evidencias: lista?.evidencias ?? [],
-          hayMasEvidencias: lista?.hayMas ?? false,
-        }
-      : null;
+    if (!proyecto) return null;
+    // La lista de objetos citables se arma aquí, no en la base: cada fuente ya tiene su
+    // propia proyección con RLS aplicada y su propio corte (las evidencias vienen
+    // recortadas a las 200 más recientes, con aviso).
+    const citables: ObjetoCitable[] = [
+      ...(lista?.evidencias ?? []).map((e) => ({
+        clase: 'evidencia' as const,
+        id: e.id,
+        titulo: e.titulo,
+      })),
+      ...(insights ?? [])
+        .filter((i) => i.estado === 'validado')
+        .map((i) => ({ clase: 'insight' as const, id: i.id, titulo: i.titulo })),
+      ...(gobernanza?.decisiones ?? [])
+        .filter((d) => d.estado === 'vigente')
+        .map((d) => ({ clase: 'decision' as const, id: d.id, titulo: d.titulo })),
+    ];
+    return {
+      workspaceId,
+      proyecto,
+      citables,
+      hayMasEvidencias: lista?.hayMas ?? false,
+      gobernanza: gobernanza ?? {
+        decisiones: [],
+        arquetipos: [],
+        reaperturas: [],
+        segmentosDisponibles: [],
+      },
+      insightsValidados: (insights ?? [])
+        .filter((i) => i.estado === 'validado')
+        .map((i) => ({ id: i.id, titulo: i.titulo })),
+    };
   },
   component: PantallaProyecto,
 });
@@ -139,7 +175,7 @@ function PantallaProyecto() {
                   nombreEtapa={`${etapa.numero} · ${etapa.nombre}`}
                   estadoEtapa={etapa.estado}
                   gate={gate}
-                  evidencias={datos.evidencias}
+                  citables={datos.citables}
                   hayMasEvidencias={datos.hayMasEvidencias}
                   rol={rol}
                   criteriosListosG0={criteriosCompletos(datos.proyecto.reto.criterios)}
@@ -151,6 +187,16 @@ function PantallaProyecto() {
                 />
               );
             })}
+            <SeccionGobernanza
+              workspaceId={datos.workspaceId}
+              proyecto={datos.proyecto}
+              gobernanza={datos.gobernanza}
+              insightsValidados={datos.insightsValidados}
+              evidencias={datos.citables.filter((o) => o.clase === 'evidencia')}
+              rol={rol}
+              onCambio={() => router.invalidate()}
+              onError={setError}
+            />
           </>
         )}
       </main>
@@ -213,7 +259,7 @@ function EtapaConGate({
   nombreEtapa,
   estadoEtapa,
   gate,
-  evidencias,
+  citables,
   hayMasEvidencias,
   rol,
   criteriosListosG0,
@@ -225,7 +271,7 @@ function EtapaConGate({
   nombreEtapa: string;
   estadoEtapa: string;
   gate: GateDeProyecto | undefined;
-  evidencias: { id: string; titulo: string }[];
+  citables: ObjetoCitable[];
   hayMasEvidencias: boolean;
   rol: string;
   /** SYS-22 en la etiqueta: G0 no está «listo» sin criterios completos. */
@@ -288,7 +334,7 @@ function EtapaConGate({
             key={item.id}
             workspaceId={workspaceId}
             item={item}
-            evidencias={evidencias}
+            citables={citables}
             hayMasEvidencias={hayMasEvidencias}
             editable={gate.estado === 'pendiente'}
             puedeCurar={(ROLES_CURADORES as readonly string[]).includes(rol)}
@@ -318,7 +364,7 @@ function EtapaConGate({
 function ItemChecklist({
   workspaceId,
   item,
-  evidencias,
+  citables,
   hayMasEvidencias,
   editable,
   puedeCurar,
@@ -328,7 +374,7 @@ function ItemChecklist({
 }: {
   workspaceId: string;
   item: ItemDeGate;
-  evidencias: { id: string; titulo: string }[];
+  citables: ObjetoCitable[];
   hayMasEvidencias: boolean;
   editable: boolean;
   /** Cumplido/pendiente: curadores (lead/diseñador). N/A —y revertirlo— : el rol aprobador del gate. */
@@ -338,7 +384,9 @@ function ItemChecklist({
   onError: (e: string | null) => void;
 }) {
   const [enlazando, setEnlazando] = useState(false);
-  const [evidenciaId, setEvidenciaId] = useState('');
+  // Un solo control para los tres tipos: el value viaja como «clase:id» y se parte al
+  // enviar. Evita un segundo selector de clase que el usuario tendría que sincronizar.
+  const [objetoSel, setObjetoSel] = useState('');
   const [naJustificacion, setNaJustificacion] = useState('');
   const [marcandoNa, setMarcandoNa] = useState(false);
   const [ocupado, setOcupado] = useState(false);
@@ -371,7 +419,7 @@ function ItemChecklist({
         </span>
         <span style={{ font: '600 11.5px var(--font-sans)', color: COLOR_ITEM[item.estado] }}>
           {item.estado === 'cumplido'
-            ? `cumplido · ${item.evidenciaTitulo ?? 'evidencia'}`
+            ? `cumplido · ${item.objetoClase ? ETIQUETA_CLASE_OBJETO[item.objetoClase] : 'objeto'}: ${item.objetoTitulo ?? '—'}`
             : item.estado === 'na'
               ? 'N/A aprobado'
               : 'pendiente'}
@@ -386,7 +434,7 @@ function ItemChecklist({
         <div style={{ display: 'flex', gap: 8 }}>
           {puedeCurar && (
             <Button size="sm" variant="secondary" disabled={ocupado} onClick={() => setEnlazando(true)}>
-              Enlazar evidencia
+              Enlazar objeto
             </Button>
           )}
           {puedeNa && (
@@ -405,13 +453,21 @@ function ItemChecklist({
       )}
       {editable && enlazando && (
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <Select value={evidenciaId} onChange={(e) => setEvidenciaId(e.target.value)} style={{ minWidth: 260 }}>
-            <option value="">Elige una evidencia curada…</option>
-            {evidencias.map((ev) => (
-              <option key={ev.id} value={ev.id}>
-                {ev.titulo}
-              </option>
-            ))}
+          <Select value={objetoSel} onChange={(e) => setObjetoSel(e.target.value)} style={{ minWidth: 300 }}>
+            <option value="">Elige el objeto que lo cumple…</option>
+            {CLASES_OBJETO_CITABLE.map((clase) => {
+              const delGrupo = citables.filter((o) => o.clase === clase);
+              if (delGrupo.length === 0) return null;
+              return (
+                <optgroup key={clase} label={ETIQUETA_CLASE_OBJETO[clase]}>
+                  {delGrupo.map((o) => (
+                    <option key={`${o.clase}:${o.id}`} value={`${o.clase}:${o.id}`}>
+                      {o.titulo}
+                    </option>
+                  ))}
+                </optgroup>
+              );
+            })}
             {hayMasEvidencias && (
               <option value="" disabled>
                 … hay más evidencias (solo se listan las 200 más recientes)
@@ -420,8 +476,15 @@ function ItemChecklist({
           </Select>
           <Button
             size="sm"
-            disabled={ocupado || evidenciaId === ''}
-            onClick={() => void marcar({ tipo: 'cumplido', evidenciaId })}
+            disabled={ocupado || objetoSel === ''}
+            onClick={() => {
+              const [clase, id] = objetoSel.split(':');
+              void marcar({
+                tipo: 'cumplido',
+                objetoClase: clase as ClaseObjetoCitable,
+                objetoId: id ?? '',
+              });
+            }}
           >
             Cumplido
           </Button>

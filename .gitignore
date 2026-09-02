@@ -8,3 +8,6 @@ dist/
 .env.local
 .env.*.local
 coverage/
+
+# Worktrees de agentes en paralelo (locales, nunca versionados)
+.claude/worktrees/

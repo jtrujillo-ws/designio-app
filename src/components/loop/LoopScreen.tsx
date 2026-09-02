@@ -364,6 +364,9 @@ function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
       <Link to="/importacion" style={{ ...item, textDecoration: 'none' }}>
         <span>Bandeja de importación</span>
       </Link>
+      <Link to="/insights" style={{ ...item, textDecoration: 'none' }}>
+        <span>Insights y citas</span>
+      </Link>
       <div style={item}>
         <span>Aprobaciones pendientes</span>
         <span style={{ font: '600 11px var(--font-mono)', color: 'var(--warn)' }}>1</span>

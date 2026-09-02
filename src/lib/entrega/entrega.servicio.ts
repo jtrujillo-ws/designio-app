@@ -89,9 +89,9 @@ function comoErrorDeDominio(e: unknown, sinPermiso?: string): never {
  * que ya no es un estado legal e inocuo sino trabajo que nadie pidió y que hay que ir a
  * cerrar a mano.
  *
- * Orden de adquisición: design version → SERVICIO (en `aprobarDesignVersion`) y
- * SERVICIO → serie → release (en los caminos del alcance). Ninguna ruta toma el servicio
- * antes que su design version ni el release antes que el servicio, así que no hay ciclo.
+ * Orden de adquisición: ninguna ruta toma el servicio antes que su design version, ni un
+ * release antes que el servicio. El orden canónico del módulo, entero, está en
+ * `bloquearSerie` — un solo sitio, para que no haya dos versiones de la regla.
  */
 async function bloquearServicio(tx: TransactionSql, servicioId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(
@@ -150,8 +150,35 @@ async function bloquearRelease(tx: TransactionSql, releaseId: string): Promise<v
   await tx`select pg_advisory_xact_lock(hashtextextended('designio:release:' || ${releaseId}, 42))`;
 }
 
-/** Los códigos DV-n / RL-n / ES-n son max+1 por workspace: dos altas concurrentes leerían
- * el mismo máximo y chocarían contra la unique. Un candado por serie los serializa. */
+/**
+ * Los códigos DV-n / RL-n / ES-n son max+1 por workspace: dos altas concurrentes leerían
+ * el mismo máximo y chocarían contra la unique. Un candado por serie los serializa.
+ *
+ * «Por SERIE» es lo importante y no es un detalle de nombrado: `codigo-dv`, `codigo-rl` y
+ * `codigo-es` son candados DISTINTOS, y de ahí sale que uno de ellos pueda estar antes del
+ * candado de release y otro después sin que aparezca ningún ciclo.
+ *
+ * ── ORDEN DE ADQUISICIÓN CANÓNICO DEL MÓDULO (el único sitio donde está escrito) ────────
+ *
+ *   dv-elemento  →  design-version(servicio)  →  codigo-rl  →  release  →  codigo-es
+ *
+ * y `codigo-dv` suelto, que no se toma junto a ningún otro. Cada ruta es una subsecuencia:
+ *
+ *   aprobarDesignVersion ....... dv-elemento → servicio
+ *   agregar/editar/borrar elemento, enlazar journey, declarar sucesión ..... dv-elemento
+ *   crearDesignVersion ......... codigo-dv
+ *   planificarRelease .......... servicio → codigo-rl → release
+ *   asignarElemento ............ servicio → release
+ *   desasignarElemento ......... release
+ *   desplegarRelease ........... release
+ *   constatarEffectiveState .... release → codigo-es
+ *
+ * Ojo con la lectura fácil: NO es cierto que «la serie va siempre antes que el release».
+ * `planificarRelease` toma `codigo-rl` antes y `constatarEffectiveState` toma `codigo-es`
+ * después, y las dos están bien porque son series distintas. Quien añada una función que
+ * tome `codigo-es` y LUEGO el candado de un release cerraría el ciclo contra
+ * `constatarEffectiveState` — que es justo el error que se comete creyendo seguir la regla.
+ */
 async function bloquearSerie(tx: TransactionSql, serie: string, workspaceId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(
     hashtextextended('designio:codigo-' || ${serie} || ':' || ${workspaceId}, 42))`;
@@ -570,8 +597,9 @@ async function asignarElementosAlRelease(
   // toma `aprobarDesignVersion`, así que al pasar él ya committeó y la política —que toma
   // su propio snapshot, por ser una sentencia posterior— lee el estado real.
   //
-  // Orden de adquisición, igual en los dos caminos del alcance: SERVICIO → serie → release.
-  // Ninguna ruta lo toma al revés, así que no hay ciclo.
+  // Orden de adquisición: servicio antes que release, como en el resto del módulo. El
+  // orden canónico completo —y por qué las series no se cruzan entre sí— está escrito una
+  // sola vez, en `bloquearSerie`.
   const [dvDelRelease] = await tx`select dv.servicio_id from release r
     join design_version dv on dv.id = r.design_version_id and dv.workspace_id = r.workspace_id
     where r.id = ${releaseId} and r.workspace_id = ${workspaceId}`;

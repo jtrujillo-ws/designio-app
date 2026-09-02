@@ -1,0 +1,232 @@
+import type { CSSProperties } from 'react';
+import { Card } from '@/components/ui/Card';
+import { Chip } from '@/components/ui/Chip';
+import { Input } from '@/components/ui/Input';
+import { JourneyBadge } from '@/components/ui/JourneyBadge';
+import { Tabs } from '@/components/ui/Tabs';
+import { LOOP_BANCO_ANDINO, type JourneyLoop } from '@/lib/loop/loop-data';
+
+/** Pantalla Loop J1–J7 — recreación de la referencia hifi del design system (ui_kits/designio). */
+
+const TABS = [
+  'Loop J1–J7',
+  'Servicio',
+  'Reto R-01',
+  'Proyecto P-01',
+  'Journey / Blueprint',
+  'Portal · Aprobación G5',
+  'Importación',
+];
+
+const micro: CSSProperties = {
+  fontFamily: 'var(--font-mono)',
+  fontWeight: 500,
+  fontSize: 11,
+  letterSpacing: '.08em',
+  textTransform: 'uppercase',
+};
+
+export function LoopScreen() {
+  return (
+    <div>
+      <Topbar />
+      <div style={{ display: 'flex', minHeight: 780 }}>
+        <Sidebar />
+        <main style={{ flex: 1, padding: '28px 32px', minWidth: 0 }}>
+          <div style={{ ...micro, color: 'var(--text-muted)' }}>
+            Banco Andino / Servicios / <span style={{ color: 'var(--ink)' }}>Apertura de cuenta nómina digital</span>
+          </div>
+          <div style={{ margin: '16px 0 24px' }}>
+            <Tabs items={TABS} value="Loop J1–J7" label="Vistas del servicio" />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 6 }}>
+            <h1 style={{ font: '800 30px/1.12 var(--font-sans)', margin: 0 }}>
+              El loop del método · journeys J1–J7
+            </h1>
+            <span
+              style={{
+                font: '700 11px var(--font-sans)',
+                color: 'var(--accent)',
+                background: 'var(--accent-soft)',
+                borderRadius: 'var(--r-pill)',
+                padding: '4px 12px',
+              }}
+            >
+              vista de recorrido
+            </span>
+          </div>
+          <p style={{ font: '400 14px/1.5 var(--font-sans)', color: 'var(--text-muted)', maxWidth: 760, margin: '0 0 24px' }}>
+            Los siete recorridos de la plataforma, de la importación al post mortem, con su estado en el
+            ejemplo Banco Andino. El arco de color marca la posición de cada journey en el método.
+          </p>
+          <div style={{ height: 6, borderRadius: 'var(--r-pill)', background: 'var(--grad-arco)', marginBottom: 16 }} />
+          <div style={{ overflowX: 'auto', marginBottom: 24 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(158px, 1fr))', gap: 12, minWidth: 1178 }}>
+              {LOOP_BANCO_ANDINO.map((jl) => (
+                <JourneyCard key={jl.j} jl={jl} />
+              ))}
+            </div>
+          </div>
+          <Card style={{ padding: '16px 20px', borderRadius: 14 }}>
+            <span style={{ font: '400 13.5px/1.55 var(--font-sans)', color: 'var(--text-body)' }}>
+              <strong>El loop cierra:</strong> los retos candidatos del post mortem (J7) pre-pueblan la etapa 0
+              del siguiente reto (J2) con la memoria del propio workspace — <a href="#retos">R-02</a> y{' '}
+              <a href="#retos">R-03</a> ya esperan en el backlog del servicio.
+            </span>
+          </Card>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function JourneyCard({ jl }: { jl: JourneyLoop }) {
+  const active = jl.estado === 'en curso';
+  const pending = jl.estado === 'próximo';
+  return (
+    <Card
+      j={jl.j}
+      active={active}
+      pending={pending}
+      style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 8, padding: active ? 15 : '16px 16px 13px' }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <JourneyBadge j={jl.j} />
+        <Chip estado={jl.estado} />
+      </div>
+      <div style={{ font: '700 14.5px/1.25 var(--font-sans)', color: 'var(--ink)' }}>{jl.titulo}</div>
+      <div style={{ font: '400 11.5px/1.5 var(--font-mono)', color: 'var(--text-muted)' }}>{jl.meta}</div>
+      <div style={{ font: '600 12px var(--font-sans)', color: 'var(--text-body)', marginTop: 'auto' }}>{jl.rol}</div>
+    </Card>
+  );
+}
+
+function Topbar() {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '14px 28px',
+        background: 'var(--surface)',
+        borderBottom: '1px solid var(--border)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+        <span style={{ font: '800 21px var(--font-sans)' }}>
+          designio
+          <span
+            style={{
+              background: 'var(--grad-arco)',
+              WebkitBackgroundClip: 'text',
+              backgroundClip: 'text',
+              color: 'transparent',
+            }}
+          >
+            .
+          </span>
+        </span>
+        <span
+          style={{
+            font: '600 13px var(--font-sans)',
+            border: '1px solid var(--border-strong)',
+            borderRadius: 'var(--r-pill)',
+            padding: '5px 14px',
+          }}
+        >
+          ● Banco Andino ▾
+        </span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        <Input placeholder="Buscar en el workspace…  /" style={{ background: 'var(--bg-app)', border: '1px solid var(--border)', width: 280 }} />
+        <span
+          style={{
+            width: 32,
+            height: 32,
+            borderRadius: '50%',
+            background: 'var(--grad-arco)',
+            color: '#fff',
+            font: '700 12px/32px var(--font-sans)',
+            textAlign: 'center',
+          }}
+        >
+          LP
+        </span>
+        <span style={{ font: '500 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+          Lucía P. · Lead boutique
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar() {
+  const item: CSSProperties = {
+    font: '500 13px var(--font-sans)',
+    color: 'var(--text-body)',
+    padding: '7px 10px',
+    borderRadius: 'var(--r-sm)',
+    display: 'flex',
+    justifyContent: 'space-between',
+  };
+  return (
+    <aside
+      style={{
+        width: 250,
+        background: 'var(--surface)',
+        borderRight: '1px solid var(--border)',
+        padding: '20px 16px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+      }}
+    >
+      <div style={{ ...micro, fontSize: 10, color: 'var(--text-faint)', padding: '0 10px 6px' }}>Cliente</div>
+      <div style={{ font: '700 13.5px var(--font-sans)', padding: '7px 10px' }}>Banco Andino</div>
+      <div
+        style={{
+          font: '600 13px var(--font-sans)',
+          color: 'var(--text-body)',
+          padding: '6px 10px 6px 22px',
+          background: 'var(--accent-soft)',
+          borderRadius: 'var(--r-sm)',
+        }}
+      >
+        Apertura de cuenta nómina
+      </div>
+      <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)', padding: '5px 10px 5px 34px', display: 'flex', justifyContent: 'space-between' }}>
+        <span>R-01 Reducir abandono</span>
+        <span style={{ font: '500 10.5px var(--font-mono)', color: 'var(--accent)' }}>62→40</span>
+      </div>
+      <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)', padding: '5px 10px 5px 46px' }}>P-01 Rediseño verificación</div>
+      <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)', padding: '5px 10px 5px 34px' }}>R-02 Completar backstage</div>
+      <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)', padding: '5px 10px 5px 34px' }}>R-03 Abandono pymes</div>
+
+      <div style={{ ...micro, fontSize: 10, color: 'var(--text-faint)', padding: '18px 10px 6px' }}>Workspace</div>
+      <div style={{ ...item, font: '700 13px var(--font-sans)', color: 'var(--ink)', background: 'var(--surface-sunken)' }}>
+        <span>Loop del método (J1–J7)</span>
+      </div>
+      <div style={item}>
+        <span>Bandeja de importación</span>
+        <span style={{ font: '600 11px var(--font-mono)', color: 'var(--accent)' }}>2</span>
+      </div>
+      <div style={item}>
+        <span>Aprobaciones pendientes</span>
+        <span style={{ font: '600 11px var(--font-mono)', color: 'var(--warn)' }}>1</span>
+      </div>
+      <div style={item}>
+        <span>Biblioteca del cliente</span>
+      </div>
+      <div style={item}>
+        <span>Segmentos</span>
+      </div>
+      <div style={item}>
+        <span>Personas y permisos</span>
+      </div>
+      <div style={{ marginTop: 'auto', font: '400 11.5px/1.5 var(--font-sans)', color: 'var(--text-faint)', padding: 10 }}>
+        La organización cliente es propietaria del workspace; la boutique opera como autorizada.
+      </div>
+    </aside>
+  );
+}

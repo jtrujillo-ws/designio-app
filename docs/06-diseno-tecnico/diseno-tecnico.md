@@ -8,7 +8,7 @@ status: draft
 language: es
 audience: engineering
 tags: [diseno-tecnico, arquitectura, stack, bun, tanstack-start, postgresql, multi-tenant, ai, gcp]
-summary: "Diseño técnico del MVP sobre el stack estándar interno de Whitespace: Bun + TanStack Start SSR con server functions tipadas, PostgreSQL fuertemente multi-tenant con RLS activo desde el día 1 más autorización server-side (dos capas), scheduler in-app sin infraestructura de colas, capa AI sobre el SDK de Anthropic con cuotas fail-safe por workspace, CI de checks gating y despliegue en Google Cloud Run. El design system será propio, orientado a una herramienta de diseño."
+summary: "Diseño técnico del MVP sobre el stack estándar interno de Whitespace: Bun + TanStack Start SSR con server functions tipadas, PostgreSQL fuertemente multi-tenant con RLS activo desde el día 1 más autorización server-side (dos capas), scheduler in-app sin infraestructura de colas, capa AI sobre el SDK de Anthropic con cuotas fail-safe por workspace, CI de checks gating y despliegue en Google Cloud Run. Design system propio «El arco del loop» con tokens versionados en la app."
 ---
 
 ## Tabla de contenido
@@ -44,7 +44,7 @@ summary: "Diseño técnico del MVP sobre el stack estándar interno de Whitespac
 
 ## Resumen ejecutivo
 
-El MVP se construye como **una sola aplicación full-stack SSR** sobre el stack estándar interno de Whitespace, ya probado en producción: **Bun** como único runtime y gestor de paquetes, **TanStack Start** (React 19 + Vite) con **server functions tipadas** extremo a extremo como única capa de lógica de negocio, **PostgreSQL accedido directamente** (cliente `postgres`, sin ORM) y **fuertemente multi-tenant: RLS activo desde el día 1** (rol de aplicación no privilegiado + contexto de tenant por transacción) **más la autorización de tenant/rol re-aplicada en cada server function** — dos capas independientes verificadas por una suite de tests contra base real —, un **scheduler in-app** sin infraestructura de colas (tabla de jobs + tick + claim latch, con Cloud Tasks/Scheduler como complemento para trabajos pesados), y despliegue en **Google Cloud Run** con Cloud Build, Cloud SQL, Cloud Storage y Secret Manager. La capa AI corre sobre el **SDK de Anthropic** con política de modelos primario/fallback centralizada en constantes, **BYOAI por workspace** (coherente con la propiedad del cliente, ADR-0011) y **cuotas fail-safe** por workspace. La estructura interna del monolito se alinea 1:1 con los ocho bounded contexts del modelo de dominio, y las invariantes SYS-* se convierten en checks gating de CI (incluida la suite de autorización contra Postgres real, la batería "AI off" y un smoke E2E con Playwright contra el build de producción). El **design system es la única pieza abierta por decisión del fundador**: será propio, orientado a una herramienta de diseño, sobre primitivas accesibles Radix/shadcn.
+El MVP se construye como **una sola aplicación full-stack SSR** sobre el stack estándar interno de Whitespace, ya probado en producción: **Bun** como único runtime y gestor de paquetes, **TanStack Start** (React 19 + Vite) con **server functions tipadas** extremo a extremo como única capa de lógica de negocio, **PostgreSQL accedido directamente** (cliente `postgres`, sin ORM) y **fuertemente multi-tenant: RLS activo desde el día 1** (rol de aplicación no privilegiado + contexto de tenant por transacción) **más la autorización de tenant/rol re-aplicada en cada server function** — dos capas independientes verificadas por una suite de tests contra base real —, un **scheduler in-app** sin infraestructura de colas (tabla de jobs + tick + claim latch, con Cloud Tasks/Scheduler como complemento para trabajos pesados), y despliegue en **Google Cloud Run** con Cloud Build, Cloud SQL, Cloud Storage y Secret Manager. La capa AI corre sobre el **SDK de Anthropic** con política de modelos primario/fallback centralizada en constantes, **BYOAI por workspace** (coherente con la propiedad del cliente, ADR-0011) y **cuotas fail-safe** por workspace. La estructura interna del monolito se alinea 1:1 con los ocho bounded contexts del modelo de dominio, y las invariantes SYS-* se convierten en checks gating de CI (incluida la suite de autorización contra Postgres real, la batería "AI off" y un smoke E2E con Playwright contra el build de producción). El **design system es propio — «El arco del loop»** (definido por el fundador, sep-2026): firma cromática de 7 hues oklch que mapean los journeys J1–J7, Figtree + IBM Plex Mono, tokens versionados como fuente de verdad en `src/styles/tokens/` y el handoff completo en `.claude/skills/designio-design/`.
 
 ## Alcance y relación con el resto del paquete
 
@@ -52,7 +52,7 @@ El MVP se construye como **una sola aplicación full-stack SSR** sobre el stack 
 |---|---|
 | Topología, stack fijado, persistencia, pipeline AI, seguridad técnica, pruebas, despliegue | Modelo de dominio (`01-ddd`), reglas de negocio (`03-invariantes`), comportamiento funcional (`05-specs`) |
 | Cómo se hace cumplir técnicamente cada SYS-* | El contenido de los checklists de gates (biblioteca metodológica) |
-| Stack fijado y principios técnicos heredados | El design system definitivo (propio, por definir antes del scaffolding de UI) |
+| Stack fijado, principios heredados y design system («El arco del loop») | El contenido metodológico de los checklists (biblioteca de la boutique) |
 
 ## Stack técnico
 
@@ -71,13 +71,15 @@ El stack no es una lista de librerías: es un conjunto de **patrones operativos 
 
 ### Stack fijado
 
+Stack del MVP, fijado al estándar interno de Whitespace, con el **design system propio «El arco del loop»** ya definido e integrado (handoff v1 versionado en `.claude/skills/designio-design/`).
+
 | Ámbito | Elección |
 |---|---|
 | Runtime y gestor | **Bun** (versión fijada —pinned—, línea 1.3.x); lockfile `bun.lock` |
 | Lenguaje | **TypeScript estricto** (`strict: true`, `any` prohibido en código nuevo); alias `@/*` → `src/*` |
 | Framework | **TanStack Start** (SSR + server functions + streaming) sobre **TanStack Router** (rutas file-based) y **Vite** |
 | UI | **React 19** + **TanStack Query** (estado asíncrono; near-real-time por **polling**, sin WebSockets) |
-| Estilos / componentes | **Tailwind CSS v4** (tokens como CSS variables) + primitivas **Radix UI** compuestas al estilo shadcn/ui; **design system propio por definir** (tokens, tipografía y lenguaje visual de la plataforma) |
+| Estilos / componentes | **Tailwind CSS v4** como base + **design system propio «El arco del loop»** (handoff v1 en `.claude/skills/designio-design/`; tokens como CSS variables en `src/styles/tokens/`, fuente de verdad): Figtree + IBM Plex Mono, arco cromático J1–J7 en oklch, primitivas propias (Button, Chip, JourneyBadge, Card, Tabs, …); Radix UI se incorpora cuando lleguen primitivas complejas (dialogs, menús) |
 | Formularios / validación | react-hook-form + **Zod** (los mismos esquemas se reutilizan server-side; todo input externo se parsea antes de tocar lógica) |
 | Base de datos | **PostgreSQL 15** (Cloud SQL en nube; Docker en local/CI) + extensión **pgvector** (adición de este producto para búsqueda semántica intra-workspace) |
 | Acceso a datos | Cliente **`postgres`** (pool único configurado por `DATABASE_URL`, **rol de aplicación no privilegiado**); **RLS activo** con contexto de tenant por transacción; **sin ORM**: SQL etiquetado en módulos `*-queries.ts` por contexto |
@@ -358,7 +360,7 @@ Checks gating de CI (GitHub Actions, Bun con versión fijada, mínimo privilegio
 
 | Decisión | Opciones | Criterio de cierre |
 |---|---|---|
-| Design system propio (tokens, tipografía, componentes) | Definición del fundador, orientada a una herramienta de diseño, sobre primitivas Radix/shadcn | Antes del scaffolding de UI |
+| Iconografía del design system | Lucide (stroke 1.75, 16/20px) propuesto en el handoff, pendiente de confirmación del fundador | Primera superficie que necesite iconos |
 | Ergonomía del contexto RLS con el pool | `sql.begin` + `SET LOCAL` por request vs. helper de contexto propio; costo de la transacción por lectura | Prueba técnica en el scaffolding (la decisión de RLS activo ya está tomada) |
 | Ejecución de trabajos pesados | Hook en la misma instancia (CPU asignada) vs. servicio Cloud Run worker con la misma imagen | Duración real de transcripciones del piloto |
 | Proveedor STT | Según prueba de diarización en español | Scaffolding (SPEC-03) |
@@ -367,7 +369,7 @@ Checks gating de CI (GitHub Actions, Bun con versión fijada, mínimo privilegio
 
 ## Próximos pasos
 
-1. Definir el design system propio (tokens, tipografía y componentes base, orientados a una herramienta de diseño) — dueño: fundador + diseño.
+1. ~~Definir el design system propio~~ — **hecho**: «El arco del loop» (handoff v1 en `.claude/skills/designio-design/`, tokens en `src/styles/tokens/`); queda confirmar la iconografía (Lucide propuesto).
 2. Emitir el ADR "Stack del MVP" formalizando la tabla de [Stack fijado](#stack-fijado) — dueño: ingeniería.
 3. Scaffolding de la app única con los ocho módulos, migración `00-init` con **RLS activo y rol de aplicación no privilegiado desde el primer esquema**, `evento_dominio`, la suite de autorización y el CI con los checks gating desde el día 1 — dueño: ingeniería (tras aprobar este paquete).
 4. Prueba técnica de las consultas (a)–(f) de SPEC-02 sobre el esquema nodo/arista con datos del ejemplo §19, y de la ergonomía/costo del contexto RLS por transacción — dueño: ingeniería.

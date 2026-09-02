@@ -10,8 +10,9 @@ Documentación de diseño derivada del prediseño de producto v0.2. Orden de lec
 | 3 | [`03-invariantes/`](03-invariantes/invariantes.md) | Invariantes de producto I1–I6 y 24 invariantes de sistema verificables (SYS-*) | borrador |
 | 4 | [`04-journeys/`](04-journeys/journeys-plataforma.md) | Journeys de la plataforma J1–J7 por rol, sobre el ejemplo Banco Andino | borrador |
 | 5 | [`05-specs/`](05-specs/README.md) | 9 especificaciones funcionales del MVP con requisitos y criterios de aceptación | borrador |
-| 6 | [`06-diseno-tecnico/`](06-diseno-tecnico/diseno-tecnico.md) | Diseño técnico (arquitectura, stack fijado, datos, AI, seguridad, pruebas, despliegue) | borrador — design system propio por definir |
+| 6 | [`06-diseno-tecnico/`](06-diseno-tecnico/diseno-tecnico.md) | Diseño técnico (arquitectura, stack fijado, datos, AI, seguridad, pruebas, despliegue) | borrador — stack y design system definidos |
 | 7 | [`07-mockups/`](07-mockups/README.md) | Mockup HTML autocontenido: loop del método J1–J7 + 6 superficies del MVP | borrador |
+| 8 | [`../.claude/skills/designio-design/`](../.claude/skills/designio-design/README.md) | Design system «El arco del loop» (handoff v1: tokens, primitivas, guidelines, pantalla Loop hifi); tokens integrados en `src/styles/tokens/` | v1 |
 
 Reglas de coherencia del paquete:
 

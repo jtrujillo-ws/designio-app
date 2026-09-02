@@ -1,0 +1,30 @@
+/* Designio — entrada global de estilos.
+   Fuente de verdad de tokens: src/styles/tokens/ (design system "El arco del loop").
+   Tailwind v4 se usa como base utilitaria; los tokens del sistema son CSS variables. */
+@import './tokens/fonts.css';
+@import 'tailwindcss';
+@import './tokens/colors.css';
+@import './tokens/typography.css';
+@import './tokens/spacing.css';
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: 1.5;
+  background: var(--bg-app);
+  color: var(--ink);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  opacity: 0.8;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

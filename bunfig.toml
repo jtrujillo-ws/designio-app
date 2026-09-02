@@ -1,0 +1,3 @@
+# Guarda de supply chain: ninguna versión publicada hace menos de 24 h se instala.
+[install.security]
+minimumReleaseAge = 86400

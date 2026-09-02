@@ -34,6 +34,6 @@ Provienen de §20 del prediseño. Se convertirán en ADRs numerados cuando se de
 | Cliente y reto piloto del MVP | Criterio sugerido: KPI medible y dueño del dato claro |
 | Experimento de validación de la hipótesis de suscripción | Precio, contenido, momento de oferta |
 | ADR "Stack del MVP" | **Resuelto en dirección (fundador, sep-2026): el scaffolding hereda los principios y parámetros del stack interno de Whitespace, fijados en `docs/06-diseno-tecnico/` (Stack fijado).** El ADR formal se emite al iniciar el scaffolding |
-| Design system propio | Orientado a una herramienta de diseño; lo define el fundador antes del scaffolding de UI (los tokens del mockup son placeholder) |
+| Design system propio | **Definido (fundador, sep-2026): «El arco del loop»** — handoff v1 versionado en `.claude/skills/designio-design/`, tokens integrados como fuente de verdad en `src/styles/tokens/`. Pendiente menor: confirmar iconografía (Lucide propuesto) |
 | Pricing (cifras de fee y suscripción) | El modelo de momentos (§15) está definido; las cifras no |
 | Persistencia del grafo y topología de despliegue | Derivada del diseño técnico (`docs/06-diseno-tecnico/`) |

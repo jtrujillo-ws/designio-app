@@ -1,0 +1,41 @@
+<!-- @dsCard group="Components" viewport="700x400" subtitle="Botones, chips, badges, controles y tarjetas" name="Core" -->
+<!doctype html><html><head><link rel="stylesheet" href="../../styles.css"><style>
+body{margin:0;font-family:var(--font-sans);background:var(--surface);padding:20px;color:var(--ink);display:flex;flex-direction:column;gap:16px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.lbl{font:500 10px var(--font-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--text-faint);width:100%}
+button{font-family:var(--font-sans);font-weight:700;font-size:14px;border:1px solid transparent;border-radius:var(--r-sm);padding:9px 16px;cursor:pointer}
+</style></head><body>
+<div class="row"><span class="lbl">Button</span>
+<button style="background:var(--ink);color:var(--text-inverse)">Primary</button>
+<button style="background:var(--grad-arco);color:#fff">Arco · avanza el loop</button>
+<button style="background:var(--surface);color:var(--ink);border-color:var(--border-strong)">Secondary</button>
+<button style="background:transparent;color:var(--text-body)">Ghost</button>
+<button style="background:var(--ink);color:var(--text-inverse);opacity:.45;cursor:default">Disabled</button>
+</div>
+<div class="row"><span class="lbl">Chip · estados canónicos</span>
+<span style="font:700 11px var(--font-sans);color:var(--ok);background:var(--ok-soft);border-radius:var(--r-pill);padding:4px 10px">Hecho</span>
+<span style="font:700 11px var(--font-sans);color:#fff;background:var(--grad-arco);border-radius:var(--r-pill);padding:4px 10px">En curso</span>
+<span style="font:700 11px var(--font-sans);color:var(--text-muted);background:var(--surface-sunken);border-radius:var(--r-pill);padding:4px 10px">Próximo</span>
+<span style="font:700 11px var(--font-sans);color:var(--warn);background:var(--warn-soft);border-radius:var(--r-pill);padding:4px 10px">Candidato</span>
+<span style="font:700 11px var(--font-sans);color:var(--accent);background:var(--accent-soft);border-radius:var(--r-pill);padding:4px 10px">En medición</span>
+</div>
+<div class="row"><span class="lbl">JourneyBadge · Tag</span>
+<span style="font:600 12px var(--font-mono);color:#fff;background:var(--j1);border-radius:6px;padding:3px 8px">J1</span>
+<span style="font:600 12px var(--font-mono);color:#fff;background:var(--j4);border-radius:6px;padding:3px 8px">J4</span>
+<span style="font:600 12px var(--font-mono);color:#fff;background:var(--j6);border-radius:6px;padding:3px 8px">J6</span>
+<span style="font:600 12px var(--font-mono);color:var(--j7);background:var(--j7-soft);border-radius:6px;padding:3px 8px">J7</span>
+<span style="font:500 11.5px var(--font-mono);color:var(--text-muted);background:var(--surface-sunken);border:1px solid var(--border);border-radius:6px;padding:3px 8px">G5 G6</span>
+<span style="font:500 11.5px var(--font-mono);color:var(--text-muted);background:var(--surface-sunken);border:1px solid var(--border);border-radius:6px;padding:3px 8px">R-01</span>
+</div>
+<div class="row"><span class="lbl">Input · Select · Switch · Checkbox</span>
+<input placeholder="Buscar en el workspace…" style="font:400 14px var(--font-sans);color:var(--ink);border:1px solid var(--border-strong);border-radius:var(--r-sm);padding:8px 12px">
+<select style="font:400 14px var(--font-sans);color:var(--ink);border:1px solid var(--border-strong);border-radius:var(--r-sm);padding:8px 12px"><option>Banco Andino</option></select>
+<span style="width:36px;height:20px;border-radius:var(--r-pill);background:var(--grad-arco);position:relative;display:inline-block"><span style="position:absolute;top:2px;left:18px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:var(--shadow-sm)"></span></span>
+<label style="font:400 14px var(--font-sans);color:var(--text-body);display:inline-flex;gap:8px;align-items:center"><input type="checkbox" checked style="width:16px;height:16px;accent-color:var(--accent)">Incluir candidatos</label>
+</div>
+<div class="row"><span class="lbl">Card · journey / activa / pendiente</span>
+<div style="width:180px;background:var(--surface);border:1px solid var(--border);border-top:4px solid var(--j3);border-radius:14px;padding:12px;box-shadow:var(--shadow-sm);font:700 13px var(--font-sans)">Journey (j=3)</div>
+<div style="width:180px;border:2px solid transparent;border-radius:14px;padding:12px;background:linear-gradient(var(--surface),var(--surface)) padding-box,var(--grad-arco) border-box;box-shadow:var(--shadow-arco);font:700 13px var(--font-sans)">Activa (en curso)</div>
+<div style="width:180px;background:var(--bg-app);border:1px dashed var(--border-strong);border-radius:14px;padding:12px;color:var(--text-faint);font:700 13px var(--font-sans)">Pendiente</div>
+</div>
+</body></html>

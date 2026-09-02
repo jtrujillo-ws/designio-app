@@ -1,0 +1,48 @@
+:root {
+  /* Neutros — base fría, saturación mínima */
+  --bg-app: #f6f6f4;
+  --surface: #ffffff;
+  --surface-sunken: #efefec;
+  --border: #e5e5e1;
+  --border-strong: #d2d2cc;
+  --ink: #1d1e24;
+  --text-body: #3a3b44;
+  --text-muted: #6b6d7a;
+  --text-faint: #a2a4b1;
+  --text-inverse: #f7f7f9;
+
+  /* El arco del loop — 7 hues petróleo→frambuesa, chroma contenido (nunca candy) */
+  --j1: oklch(0.58 0.11 190);
+  --j2: oklch(0.58 0.11 215);
+  --j3: oklch(0.58 0.11 240);
+  --j4: oklch(0.58 0.12 265);
+  --j5: oklch(0.58 0.12 290);
+  --j6: oklch(0.58 0.13 315);
+  --j7: oklch(0.58 0.14 340);
+  --j1-soft: oklch(0.95 0.025 190);
+  --j2-soft: oklch(0.95 0.025 215);
+  --j3-soft: oklch(0.95 0.025 240);
+  --j4-soft: oklch(0.95 0.03 265);
+  --j5-soft: oklch(0.95 0.03 290);
+  --j6-soft: oklch(0.95 0.035 315);
+  --j7-soft: oklch(0.95 0.04 340);
+  --j1-deep: oklch(0.4 0.08 190);
+  --j4-deep: oklch(0.4 0.09 265);
+  --j7-deep: oklch(0.4 0.1 340);
+
+  /* Firma: el gradiente ES el loop (J1→J7) */
+  --grad-arco: linear-gradient(120deg, oklch(0.58 0.11 190), oklch(0.58 0.14 340));
+  --grad-arco-deep: linear-gradient(120deg, oklch(0.4 0.08 190), oklch(0.4 0.1 340));
+
+  /* Acento por defecto (centro del arco): links, focus, selección */
+  --accent: oklch(0.5 0.12 265);
+  --accent-soft: oklch(0.95 0.03 265);
+
+  /* Semánticos — fuera del arco */
+  --ok: oklch(0.55 0.11 150);
+  --ok-soft: oklch(0.94 0.045 150);
+  --warn: oklch(0.6 0.12 70);
+  --warn-soft: oklch(0.95 0.05 85);
+  --danger: oklch(0.55 0.17 25);
+  --danger-soft: oklch(0.95 0.03 25);
+}

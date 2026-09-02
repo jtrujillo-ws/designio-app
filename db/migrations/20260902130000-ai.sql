@@ -15,6 +15,91 @@
 -- Mismo patrón multi-tenant de la casa: FKs compuestas (id, workspace_id), RLS día 1,
 -- atribución fijada en la política, transiciones exigidas por WITH CHECK y efectos
 -- (eventos + sellos temporales) emitidos DENTRO del guard que decide.
+--
+-- Dos tablas acompañan al pipeline y existen por lo mismo —que las promesas del slice se
+-- cumplan aunque haya concurrencia o prisa—: `consentimiento_item` (RF-09.5: el material
+-- de personas no se procesa sin permiso registrado ANTES) y `reserva_ai` (RF-09.12: el
+-- presupuesto se aparta antes de llamar al proveedor, no después de pagar).
+
+-- ── Consentimiento del material ANTES de procesarlo (RF-09.5) ─────────────────────────
+-- Qué material lo exige. Vive en una función y no repartido por consultas: el día que
+-- entren audio/vídeo transcritos, la lista se amplía en UN sitio y el bloqueo de la base,
+-- el del servicio y el aviso de la UI se mueven juntos. No es SECURITY DEFINER ni lee
+-- nada: es un mapa constante sobre su argumento, así que no hay oráculo que revocar.
+create function tipo_fuente_exige_consentimiento(tipo text) returns boolean
+language sql immutable parallel safe as $$
+  select tipo in ('entrevista', 'observacion')
+$$;
+
+/*
+ * El consentimiento de las personas se captura ANTES de procesar (RF-09.5), no se infiere
+ * de un texto ni se rellena al final: hasta ahora nacía en `false` al aceptar la propuesta,
+ * o sea DESPUÉS de que el material ya hubiera viajado al proveedor.
+ *
+ * Vive en su propia tabla y no en una columna de `item_importacion` por tres razones:
+ *  · append-only por construcción — sin grant de UPDATE/DELETE no hay superficie con la
+ *    que reescribir un consentimiento ya registrado, sin necesidad de un guard que lo
+ *    defienda ni de ampliar el grant por columna de la bandeja (que hoy solo sella la
+ *    decisión de curaduría);
+ *  · no mezcla dos transiciones distintas sobre la misma fila: registrar consentimiento y
+ *    decidir la curaduría son actos separados, con políticas separadas;
+ *  · el registro tiene contenido propio (qué se autorizó y si cubre a un tercero) que no
+ *    tiene por qué engordar la tabla caliente de la bandeja.
+ * Una revocación futura (RF-09.4) será otra fila/objeto, nunca un UPDATE sobre esta.
+ */
+create table consentimiento_item (
+  item_id uuid not null,
+  workspace_id uuid not null references workspace(id),
+  -- Qué autorizó la persona, en las palabras de quien lo recogió: es el registro del
+  -- consentimiento, no el contrato.
+  alcance text not null check (length(btrim(alcance)) between 1 and 1000),
+  -- Y si ese consentimiento cubre EXPLÍCITAMENTE el procesamiento por un tercero: un
+  -- permiso para grabar y transcribir en interno no autoriza mandar el material a un
+  -- proveedor externo (RF-09.5 + condiciones de uso del proveedor, RF-09.9). Registrar
+  -- consentimiento no es marcar una casilla: distingue qué se autorizó.
+  procesamiento_externo boolean not null,
+  registrado_por uuid not null references usuario(id),
+  registrado_en timestamptz not null default now(),
+  primary key (item_id, workspace_id),
+  foreign key (item_id, workspace_id) references item_importacion (id, workspace_id)
+);
+
+alter table consentimiento_item enable row level security;
+
+create policy consentimiento_select on consentimiento_item
+  for select using (is_workspace_member(app_user_id(), workspace_id));
+-- Lo registra quien conduce la investigación (los mismos curadores que deciden la
+-- bandeja) y queda atribuido por la política, no por el caller.
+create policy consentimiento_insert on consentimiento_item
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and registrado_por = app_user_id()
+  );
+
+-- Auditoría del registro (RF-09.13). Sin `returning` en ningún lado: el evento se emite
+-- dentro del trigger, así que quien registra no necesita poder LEER `evento_dominio`.
+create function consentimiento_item_registro_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+  values (new.workspace_id, 'ConsentimientoRegistrado',
+    jsonb_build_object('itemId', new.item_id,
+                       'procesamientoExterno', new.procesamiento_externo),
+    app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  return new;
+end $$;
+
+create trigger consentimiento_item_registro
+  before insert on consentimiento_item
+  for each row execute function consentimiento_item_registro_guard();
+
+revoke execute on function consentimiento_item_registro_guard() from public;
+
+-- Sin UPDATE ni DELETE: un consentimiento registrado es un hecho, no un campo editable.
+grant select, insert on consentimiento_item to designio_app;
 
 create table propuesta_ai (
   id uuid primary key default gen_random_uuid(),
@@ -53,6 +138,21 @@ create table propuesta_ai (
   -- (el almacenamiento de la key por workspace espera al secret manager, RF-09.6);
   -- el catálogo ya admite 'workspace' para que ese día no haya migración de datos.
   origen_key text not null check (origen_key in ('workspace', 'entorno')),
+
+  -- Uso y coste de la llamada que la produjo (RF-09.14: observabilidad de costos). El
+  -- proveedor devuelve el `usage` de cada respuesta y aquí se conserva: sin esto el
+  -- `costoUsd` del lineage no se puede calcular NUNCA — el dato solo existe en el
+  -- instante de la llamada y se perdía al quedarnos con el texto.
+  -- `llamada_id` agrupa las propuestas nacidas de UNA misma llamada (C0 devuelve un
+  -- lote): el uso y el coste son de la LLAMADA, así que las filas del lote los repiten
+  -- y el gasto real del workspace se suma por llamada distinta, no por propuesta —
+  -- prorratear el coste entre las filas habría hecho cuadrar la suma a costa de que
+  -- ninguna fila dijera la verdad sobre lo que se pagó.
+  llamada_id uuid not null default gen_random_uuid(),
+  tokens_entrada integer check (tokens_entrada is null or tokens_entrada >= 0),
+  tokens_salida integer check (tokens_salida is null or tokens_salida >= 0),
+  -- Al precio VIGENTE cuando se generó: una tarifa nueva no reescribe el histórico.
+  costo_usd numeric(12, 6) check (costo_usd is null or costo_usd >= 0),
 
   -- ── Revisión humana y materialización ──
   revisada_por uuid references usuario(id),
@@ -95,9 +195,16 @@ create table propuesta_ai (
 );
 
 create index propuesta_ai_ws_idx on propuesta_ai (workspace_id, estado, creado_en);
--- La bandeja pinta «este item ya tiene propuesta pendiente» sin recorrer el workspace.
-create index propuesta_ai_item_idx on propuesta_ai (workspace_id, item_id)
-  where item_id is not null;
+-- Un item tiene COMO MUCHO una propuesta pendiente, y el índice lo impone además de
+-- servir la consulta («este item ya tiene propuesta pendiente» sin recorrer el
+-- workspace). Que sea único y parcial es el punto: dos curadores concurrentes veían
+-- cada uno un snapshot sin propuesta pendiente y ambos insertaban — un predicado sobre
+-- un snapshot no es un candado, un índice único sí. La segunda escritura falla aunque
+-- ninguna de las dos haya visto a la otra; el gasto duplicado en el proveedor lo corta
+-- antes la reserva de más abajo. Decidir la propuesta libera el hueco: el índice solo
+-- cubre `estado = 'propuesta'`, así que un item rechazado admite otra pasada.
+create unique index propuesta_ai_item_pendiente_idx on propuesta_ai (workspace_id, item_id)
+  where item_id is not null and estado = 'propuesta';
 
 -- ── RLS ──
 -- Lectura: cualquier miembro (el cliente también ve qué propuso la AI y quién decidió).
@@ -157,6 +264,24 @@ begin
   end if;
 
   if tg_op = 'INSERT' then
+    -- RF-09.5: el material de personas no se procesa sin consentimiento registrado
+    -- ANTES. El servicio lo comprueba antes de construir el prompt —ahí es donde se
+    -- evita de verdad la fuga al proveedor— y esto es el suelo: una propuesta derivada
+    -- de material sin consentimiento no puede EXISTIR, venga de donde venga la
+    -- escritura. Y exige que el consentimiento cubra el procesamiento externo: haber
+    -- autorizado la grabación no es haber autorizado mandarla a un tercero.
+    if new.item_id is not null and exists (
+      select 1 from item_importacion i
+      where i.id = new.item_id and i.workspace_id = new.workspace_id
+        and tipo_fuente_exige_consentimiento(i.tipo_fuente)
+        and not exists (
+          select 1 from consentimiento_item c
+          where c.item_id = i.id and c.workspace_id = i.workspace_id
+            and c.procesamiento_externo)
+    ) then
+      raise exception 'ese material exige consentimiento registrado para procesamiento externo antes de generar propuestas AI (RF-09.5)';
+    end if;
+
     -- RF-09.9: de qué workspace salió qué material, a qué modelo y con qué credencial.
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (new.workspace_id, 'PropuestaAIGenerada',
@@ -262,11 +387,77 @@ create constraint trigger propuesta_ai_materializacion
 revoke execute on function propuesta_ai_revision_guard() from public;
 revoke execute on function propuesta_ai_materializacion_guard() from public;
 
+-- ── Reserva del presupuesto AI: se aparta ANTES de llamar al proveedor ────────────────
+/*
+ * El presupuesto por workspace (RF-09.12) se contaba sobre lo PERSISTIDO y se comprobaba
+ * en una transacción que commiteaba antes de la llamada, y el insert posterior no volvía
+ * a mirar nada: N curadores concurrentes pasaban todos el mismo chequeo con 59/60 y cada
+ * uno persistía su lote. El tope prometido se rebasaba por un margen arbitrario y, peor,
+ * el gasto en el proveedor ya se había hecho.
+ *
+ * Una fila de reserva ocupa el hueco durante la llamada: se toma bajo candado consultivo
+ * del workspace, se consume (se borra) en la MISMA transacción que persiste las
+ * propuestas, y se libera si la generación no llega a nacer — una llamada fallida sigue
+ * sin consumir presupuesto. Caduca sola: si el proceso muere, la reserva deja de contar
+ * pasada la ventana en vez de bloquear el workspace para siempre.
+ *
+ * Y para CI hace de token de exclusión por item: dos curadores no pueden tener a la vez
+ * una generación en curso sobre el mismo item de bandeja, así que el gasto duplicado en
+ * el proveedor se corta ANTES de la llamada (el índice único parcial de propuesta_ai es
+ * el suelo, pero llega cuando el dinero ya se gastó).
+ */
+create table reserva_ai (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspace(id),
+  capacidad text not null check (capacidad in ('C0', 'CI')),
+  item_id uuid,
+  -- Cuántas propuestas puede llegar a persistir esta generación (el techo que admite el
+  -- esquema de la capacidad), no cuántas se le piden al modelo.
+  unidades smallint not null check (unidades between 1 and 8),
+  creado_por uuid not null references usuario(id),
+  creado_en timestamptz not null default now(),
+  unique (id, workspace_id),
+  foreign key (item_id, workspace_id) references item_importacion (id, workspace_id),
+  check ((capacidad = 'CI') = (item_id is not null))
+);
+create index reserva_ai_ws_idx on reserva_ai (workspace_id, creado_en);
+create unique index reserva_ai_item_idx on reserva_ai (workspace_id, item_id)
+  where item_id is not null;
+
+-- Ventana de vida de una reserva: cuatro veces el timeout duro del proveedor. Se define
+-- una sola vez y AQUÍ para que el conteo del servicio y la limpieza no puedan divergir;
+-- ninguna llamada puede sobrevivirla (el SDK aborta a los 25 s).
+create function reserva_ai_ventana() returns interval
+language sql immutable parallel safe as $$ select interval '100 seconds' $$;
+
+alter table reserva_ai enable row level security;
+
+create policy reserva_select on reserva_ai
+  for select using (is_workspace_member(app_user_id(), workspace_id));
+create policy reserva_insert on reserva_ai
+  for insert with check (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and creado_por = app_user_id()
+  );
+-- Se libera la PROPIA reserva; las ajenas, solo cuando ya caducaron (recolección de
+-- basura de un proceso muerto). Sin esto, un curador podría liberar la reserva viva de
+-- otro y devolver el presupuesto al mismo agujero que esta tabla cierra.
+create policy reserva_delete on reserva_ai
+  for delete using (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and (creado_por = app_user_id() or creado_en <= now() - reserva_ai_ventana())
+  );
+
+-- Sin UPDATE: una reserva no se edita, se consume o se libera.
+grant select, insert, delete on reserva_ai to designio_app;
+
 -- ── Grants mínimos (UPDATE por columna: solo la transición y su materialización) ──
 grant select, insert on propuesta_ai to designio_app;
 -- Fuera del grant y por tanto sin superficie: capacidad, destino, item_id, reto_id,
 -- contenido_original, confianza, es_simulacion, modelo, prompt_version, alcance_resumen,
--- latencia_ms, origen_key, creado_por — el lineage y el original son inmutables (SYS-17/19).
+-- latencia_ms, origen_key, llamada_id, tokens_entrada, tokens_salida, costo_usd,
+-- creado_por — el lineage y el original son inmutables (SYS-17/19), y el coste de una
+-- llamada ya hecha no se reescribe.
 -- `revisada_en` tampoco: lo estampa el guard, no el caller.
 grant update (estado, contenido, revisada_por, evidencia_id, criterio_id)
   on propuesta_ai to designio_app;

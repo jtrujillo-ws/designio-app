@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { CSSProperties, FormEvent } from 'react';
+import type { CSSProperties, FormEvent, ReactNode } from 'react';
 import { createFileRoute, useNavigate, useRouter } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -14,10 +14,12 @@ import {
   generarPropuestasAI,
   propuestasDelWorkspace,
   rechazarPropuestaAI,
+  registrarConsentimientoAI,
 } from '@/lib/ai/ai.functions';
 import {
   CAPACIDADES_ACTIVAS,
   ETIQUETA_CAPACIDAD,
+  type CandidatoAncla,
   type CapacidadActiva,
   type ContenidoCriterio,
   type ContenidoExtraccion,
@@ -137,6 +139,10 @@ function PantallaPropuestas() {
                   setAviso(`${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`);
                   await refrescar();
                 }}
+                onConsentimiento={async () => {
+                  setAviso('Consentimiento registrado: ya puedes pedir la propuesta');
+                  await refrescar();
+                }}
                 onError={(e) => {
                   setAviso(null);
                   setError(e);
@@ -162,8 +168,14 @@ function PantallaPropuestas() {
             <div style={{ ...etiqueta, paddingTop: 6 }}>
               {datos.pendientes.length === 0
                 ? 'Sin propuestas pendientes de revisión'
-                : `${datos.pendientes.length} pendientes de revisión humana`}
+                : `${datos.pendientes.length} pendientes de revisión humana, de la más antigua a la más reciente`}
             </div>
+            {datos.hayMasPendientes && (
+              <Aviso>
+                Hay más pendientes de las que caben aquí: se muestran las {datos.pendientes.length}{' '}
+                más antiguas. Decide estas y las siguientes aparecerán.
+              </Aviso>
+            )}
             {datos.pendientes.map((p) => (
               <TarjetaPropuesta
                 key={p.id}
@@ -178,6 +190,12 @@ function PantallaPropuestas() {
             {datos.decididas.length > 0 && (
               <>
                 <div style={{ ...etiqueta, paddingTop: 14 }}>Decididas recientes</div>
+                {datos.hayMasDecididas && (
+                  <Aviso>
+                    Solo las {datos.decididas.length} decisiones más recientes; el historial
+                    completo vive en la auditoría del workspace.
+                  </Aviso>
+                )}
                 {datos.decididas.map((p) => (
                   <TarjetaPropuesta
                     key={p.id}
@@ -194,6 +212,16 @@ function PantallaPropuestas() {
         )}
       </main>
     </div>
+  );
+}
+
+/** Un recorte de lista se DICE. Callarlo es lo que dejaba creer que no quedaba trabajo
+ * pendiente cuando sí quedaba. */
+function Aviso({ children }: { children: ReactNode }) {
+  return (
+    <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
+      {children}
+    </span>
   );
 }
 
@@ -244,19 +272,26 @@ function FormularioGeneracion({
   items,
   retos,
   onGenerado,
+  onConsentimiento,
   onError,
 }: {
   workspaceId: string;
   habilitada: boolean;
-  items: { id: string; titulo: string }[];
-  retos: { id: string; titulo: string }[];
+  items: CandidatoAncla[];
+  retos: CandidatoAncla[];
   onGenerado: (generadas: number) => Promise<void>;
+  onConsentimiento: () => Promise<void>;
   onError: (e: string | null) => void;
 }) {
   const [capacidad, setCapacidad] = useState<CapacidadActiva>('CI');
   const [anclaId, setAnclaId] = useState('');
   const [enviando, setEnviando] = useState(false);
   const anclas = capacidad === 'CI' ? items : retos;
+  const elegida = anclas.find((a) => a.id === anclaId);
+  // RF-09.5: si el material es de personas y nadie ha registrado el consentimiento, el
+  // paso que toca no es generar — es registrarlo. La pantalla lo dice y lo ofrece aquí
+  // mismo en vez de dejar que el intento falle contra el servidor.
+  const faltaConsentimiento = Boolean(elegida?.consentimientoPendiente);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -313,6 +348,7 @@ function FormularioGeneracion({
               {anclas.map((a) => (
                 <option key={a.id} value={a.id}>
                   {a.titulo}
+                  {a.consentimientoPendiente ? ' · falta consentimiento' : ''}
                 </option>
               ))}
             </Select>
@@ -325,11 +361,13 @@ function FormularioGeneracion({
               : 'No hay retos con criterios abiertos (un G0 aprobado los congela).'}
           </span>
         )}
-        <div>
-          <Button type="submit" disabled={enviando || !habilitada || anclas.length === 0}>
-            {enviando ? 'Proponiendo…' : 'Proponer con AI'}
-          </Button>
-        </div>
+        {!faltaConsentimiento && (
+          <div>
+            <Button type="submit" disabled={enviando || !habilitada || anclas.length === 0}>
+              {enviando ? 'Proponiendo…' : 'Proponer con AI'}
+            </Button>
+          </div>
+        )}
         {!habilitada && (
           <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-faint)' }}>
             Generar está desactivado mientras la capacidad AI esté apagada; revisar y aceptar lo
@@ -337,7 +375,106 @@ function FormularioGeneracion({
           </span>
         )}
       </form>
+      {faltaConsentimiento && (
+        <FormularioConsentimiento
+          workspaceId={workspaceId}
+          itemId={anclaId}
+          titulo={elegida!.titulo}
+          onRegistrado={onConsentimiento}
+          onError={onError}
+        />
+      )}
     </Card>
+  );
+}
+
+/**
+ * Captura del consentimiento ANTES de procesar (RF-09.5). Está aquí, delante del botón de
+ * generar, porque ese es el momento en que importa: hasta que no consta qué autorizó la
+ * persona, el material no sale hacia ningún proveedor. Se registra una vez y no se edita.
+ */
+function FormularioConsentimiento({
+  workspaceId,
+  itemId,
+  titulo,
+  onRegistrado,
+  onError,
+}: {
+  workspaceId: string;
+  itemId: string;
+  titulo: string;
+  onRegistrado: () => Promise<void>;
+  onError: (e: string | null) => void;
+}) {
+  const [alcance, setAlcance] = useState('');
+  const [procesamientoExterno, setProcesamientoExterno] = useState(false);
+  const [enviando, setEnviando] = useState(false);
+
+  return (
+    <form
+      style={{ ...CAJA_CORRECCION, marginTop: 14 }}
+      onSubmit={async (e) => {
+        e.preventDefault();
+        setEnviando(true);
+        onError(null);
+        try {
+          const r = await registrarConsentimientoAI({
+            data: { workspaceId, itemId, alcance, procesamientoExterno },
+          });
+          if (r.ok) await onRegistrado();
+          else onError(r.error);
+        } catch {
+          onError('No se pudo registrar el consentimiento; intenta de nuevo');
+        } finally {
+          setEnviando(false);
+        }
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        «{titulo}» es material de personas: registra el consentimiento antes de procesarlo
+      </span>
+      <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
+        Sin este registro el material no sale hacia el proveedor AI (RF-09.5). El item sigue
+        pudiendo curarse a mano en la bandeja, como siempre.
+      </span>
+      <label style={campo}>
+        <span style={etiqueta}>Qué autorizó la persona</span>
+        <Textarea
+          required
+          rows={2}
+          maxLength={1000}
+          value={alcance}
+          onChange={(e) => setAlcance(e.target.value)}
+          placeholder="Grabación y transcripción de la entrevista del 12/06, autorizadas por escrito"
+        />
+      </label>
+      <label
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          font: '400 12.5px var(--font-sans)',
+          color: 'var(--text-body)',
+        }}
+      >
+        <Checkbox
+          checked={procesamientoExterno}
+          onChange={(e) => setProcesamientoExterno(e.target.checked)}
+        />
+        El consentimiento cubre el procesamiento por un proveedor externo
+      </label>
+      <div>
+        <Button type="submit" size="sm" disabled={enviando || !procesamientoExterno}>
+          {enviando ? 'Registrando…' : 'Registrar consentimiento'}
+        </Button>
+      </div>
+      {!procesamientoExterno && (
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+          Autorizar la grabación no es autorizar mandarla a un tercero: sin esa casilla, la AI
+          sigue sin poder procesar este material.
+        </span>
+      )}
+    </form>
   );
 }
 
@@ -462,8 +599,13 @@ function TarjetaPropuesta({
 
       <span style={{ font: '400 11px var(--font-mono)', color: 'var(--text-faint)' }}>
         lineage: {propuesta.modelo} · prompt {propuesta.promptVersion} · key {propuesta.origenKey}
-        {propuesta.latenciaMs !== null ? ` · ${propuesta.latenciaMs} ms` : ''} ·{' '}
-        {propuesta.alcanceResumen}
+        {propuesta.latenciaMs !== null ? ` · ${propuesta.latenciaMs} ms` : ''}
+        {/* Coste MEDIDO de la llamada que la produjo, no estimado. Sin dato se dice, no
+            se rellena con un cero que parecería gratis. */}
+        {propuesta.costoUsd !== null
+          ? ` · $${propuesta.costoUsd.toFixed(4)}`
+          : ' · coste sin registrar'}{' '}
+        · {propuesta.alcanceResumen}
       </span>
 
       {propuesta.estado === 'propuesta' && !puedeRevisar && (
@@ -545,7 +687,7 @@ function FichaExtraccion({ contenido }: { contenido: ContenidoExtraccion }) {
       />
       <Dato
         rotulo="Consentimiento"
-        valor="no registrado — lo captura una persona antes de procesar (RF-09.5)"
+        valor="el que se registró sobre el item ANTES de procesarlo (RF-09.5); la AI no lo propone ni lo infiere"
       />
     </div>
   );

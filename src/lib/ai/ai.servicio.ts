@@ -7,7 +7,7 @@ import { bloquearReto } from '@/lib/metodo/metodo.servicio';
 import { evaluarCapacidadAI, LIMITE_PROPUESTAS_DIA } from './ai.degradacion';
 import {
   fidelidadDeCitas,
-  materialQueVeElModelo,
+  materialDeItem,
   MAX_MATERIAL,
   PROMPT_VERSION,
   promptCriterios,
@@ -28,9 +28,14 @@ import {
   type OrigenKey,
   type PanelPropuestas,
   type PropuestaEnPanel,
+  type RegistrarConsentimiento,
   type RevisarPropuesta,
 } from './ai.schemas';
-import { credencialesAI, generarConProveedor } from './proveedor.server';
+import {
+  credencialesAI,
+  generarConProveedor,
+  type ResultadoProveedor,
+} from './proveedor.server';
 
 /**
  * Pipeline único PropuestaAI (SPEC-08, ADR-0012/I4). La AI **propone**; el objeto real
@@ -53,6 +58,11 @@ const DECIDIDAS_RECIENTES = 50;
 /** Cuántos criterios se le piden a C0 de una vez: revisión por elemento, lote pequeño. */
 const CRITERIOS_POR_GENERACION = 3;
 
+/** Cuántas propuestas puede llegar a PERSISTIR una generación de cada capacidad: el techo
+ * que admite su esquema (no el que se le pide al modelo, que puede devolver de más). Es
+ * lo que se aparta del presupuesto antes de llamar al proveedor. */
+const UNIDADES_POR_CAPACIDAD: Record<CapacidadActiva, number> = { CI: 1, C0: 4 };
+
 /** Capa 2: re-check explícito del rol curador (la política RLS es la capa 1). Los mismos
  * que curan la bandeja (RF-03.4) piden y revisan propuestas; `agente-ai` no aparece por
  * ningún lado — no es un actor que cure ni apruebe (SYS-18). */
@@ -64,31 +74,68 @@ async function rolCurador(tx: TransactionSql, actorId: string, workspaceId: stri
   }
 }
 
-/** Presupuesto AI del workspace (RF-08.5): propuestas generadas hoy. Es un corte SUAVE
- * y por eso se cuenta lo PERSISTIDO —una llamada fallida no consume presupuesto— con el
- * día del servidor, que es también el que usa el reporte de costos. */
-async function propuestasDeHoy(tx: TransactionSql, workspaceId: string): Promise<number> {
-  const [fila] = await tx`select count(*)::int as n from propuesta_ai
-    where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now())`;
-  return (fila?.n ?? 0) as number;
+/**
+ * Presupuesto AI del workspace (RF-08.5): propuestas generadas hoy. Es un corte SUAVE y
+ * por eso se cuenta lo PERSISTIDO —una llamada fallida no consume presupuesto— con el día
+ * del servidor, que es también el que usa el reporte de costos.
+ *
+ * `reservadas` son las generaciones EN CURSO (huecos apartados antes de llamar al
+ * proveedor): cuentan para admitir una generación nueva, porque si no, N curadores
+ * simultáneos leen todos el mismo «quedan sitios» y todos escriben. No cuentan para el
+ * número que pinta el panel, que informa de lo realmente gastado hoy.
+ */
+async function presupuestoDeHoy(
+  tx: TransactionSql,
+  workspaceId: string,
+): Promise<{ persistidas: number; reservadas: number }> {
+  const [fila] = await tx`select
+      (select count(*) from propuesta_ai
+        where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now()))::int
+        as persistidas,
+      (select coalesce(sum(unidades), 0) from reserva_ai
+        where workspace_id = ${workspaceId} and creado_en > now() - reserva_ai_ventana())::int
+        as reservadas`;
+  return {
+    persistidas: (fila?.persistidas ?? 0) as number,
+    reservadas: (fila?.reservadas ?? 0) as number,
+  };
 }
 
 async function estadoCapacidad(tx: TransactionSql, workspaceId: string) {
   const { keyWorkspace, keyEntorno } = credencialesAI();
+  const { persistidas } = await presupuestoDeHoy(tx, workspaceId);
   return evaluarCapacidadAI({
     keyWorkspace,
     keyEntorno,
-    propuestasHoy: await propuestasDeHoy(tx, workspaceId),
+    propuestasHoy: persistidas,
     limiteDiario: LIMITE_PROPUESTAS_DIA,
   });
+}
+
+/** Candado del presupuesto AI de un workspace. Apartar el hueco y consumirlo ocurren en
+ * transacciones DISTINTAS (la llamada al proveedor va entre medias, fuera de toda
+ * transacción), así que los dos lados lo toman: una consulta es un predicado sobre un
+ * snapshot, no un candado — mismo contrato que `bloquearReto`. */
+async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Promise<void> {
+  await tx`select pg_advisory_xact_lock(
+    hashtextextended('designio:presupuesto-ai:' || ${workspaceId}, 42))`;
 }
 
 function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   const contenido = f.contenido as ContenidoPropuesta;
   const original = f.contenido_original as ContenidoPropuesta;
-  // El material se neutraliza IGUAL que al construir el prompt: la fidelidad se mide
-  // contra lo que el modelo leyó, no contra el texto crudo de la base.
-  const material = materialQueVeElModelo((f.material as string | null) ?? '');
+  // El material se compone IGUAL que al construir el prompt —ficha incluida y con el
+  // delimitador neutralizado—: la fidelidad se mide contra lo que el modelo leyó, no
+  // contra el texto crudo de la base. Una sola definición, dos usos.
+  const material =
+    f.item_id === null
+      ? ''
+      : materialDeItem({
+          titulo: (f.item_titulo as string | null) ?? '',
+          tipoFuente: (f.item_tipo_fuente as string | null) ?? '',
+          referencia: (f.item_referencia as string | null) ?? '',
+          contenido: (f.item_contenido as string | null) ?? '',
+        }).texto;
   const citas = 'citas' in contenido ? contenido.citas : [];
   return {
     id: f.id as string,
@@ -114,6 +161,7 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     origenKey: f.origen_key as OrigenKey,
     alcanceResumen: f.alcance_resumen as string,
     latenciaMs: f.latencia_ms === null ? null : Number(f.latencia_ms),
+    costoUsd: f.costo_usd === null || f.costo_usd === undefined ? null : Number(f.costo_usd),
     creadoEn: (f.creado_en as Date).toISOString(),
     revisadaEn: f.revisada_en ? (f.revisada_en as Date).toISOString() : null,
   };
@@ -123,6 +171,13 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
  * Proyección del panel de revisión. El `material` que viaja para medir la fidelidad de
  * las citas está acotado EXACTAMENTE al que entró al prompt (MAX_MATERIAL): medir contra
  * más texto del que el modelo vio daría un grounding falsamente bueno.
+ *
+ * Pendientes y decididas se consultan por SEPARADO, cada una con su corte. Con un único
+ * límite antes de partir por estado, 150 decisiones nuevas dejaban fuera una propuesta
+ * pendiente antigua: invisible en el panel y, como la generación excluye su item por el
+ * `not exists`, imposible de revisar o rechazar por ningún camino. Y las pendientes van
+ * de la MÁS ANTIGUA a la más nueva: una cola de revisión se drena por el frente, así que
+ * el recorte cae siempre sobre lo recién llegado, que se ve en la siguiente pasada.
  */
 export async function panelPropuestas(
   actorId: string,
@@ -132,28 +187,43 @@ export async function panelPropuestas(
     await exigirCuentaActiva(tx, actorId);
     const ai = await estadoCapacidad(tx, workspaceId);
 
-    const filas = await tx`
-      select p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
+    // Fragmentos compartidos: dos consultas con la MISMA proyección no pueden divergir.
+    const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, p.item_id, p.reto_id,
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen, p.latencia_ms,
-             p.creado_en, p.revisada_en,
+             p.costo_usd, p.creado_en, p.revisada_en,
              coalesce(i.titulo, r.codigo || ' ' || r.titulo) as ancla_titulo,
              coalesce(i.estado = 'pendiente', true) as ancla_disponible,
-             left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as material
-      from propuesta_ai p
+             i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
+             i.referencia as item_referencia,
+             left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`;
+    const origen = tx`from propuesta_ai p
       left join item_importacion i
         on i.id = p.item_id and i.workspace_id = p.workspace_id
-      left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id
-      where p.workspace_id = ${workspaceId}
-      order by p.creado_en desc, p.id desc
-      limit ${PAGINA_PENDIENTES + DECIDIDAS_RECIENTES}`;
+      left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`;
 
-    const todas = filas.map(filaDePanel);
+    // Se pide una fila de más para saber si el corte dejó algo fuera (mismo truco que la
+    // bandeja): el panel lo dice en vez de fingir que eso es todo.
+    const pendientes = await tx`select ${columnas} ${origen}
+      where p.workspace_id = ${workspaceId} and p.estado = 'propuesta'
+      order by p.creado_en asc, p.id asc
+      limit ${PAGINA_PENDIENTES + 1}`;
+    const decididas = await tx`select ${columnas} ${origen}
+      where p.workspace_id = ${workspaceId} and p.estado <> 'propuesta'
+      order by p.creado_en desc, p.id desc
+      limit ${DECIDIDAS_RECIENTES + 1}`;
 
     // Anclas ofrecibles a la generación. Un item con propuesta pendiente no se vuelve a
     // ofrecer: pedir otra quemaría presupuesto sobre algo que ya espera revisión humana.
+    // Los que exigen consentimiento se ofrecen igual, MARCADOS: la pantalla explica qué
+    // falta y deja registrarlo, que es más útil que esconder el item sin decir por qué.
     const items = await tx`
-      select i.id, i.titulo from item_importacion i
+      select i.id, i.titulo,
+             tipo_fuente_exige_consentimiento(i.tipo_fuente)
+               and not exists (select 1 from consentimiento_item c
+                 where c.item_id = i.id and c.workspace_id = i.workspace_id
+                   and c.procesamiento_externo) as consentimiento_pendiente
+      from item_importacion i
       where i.workspace_id = ${workspaceId} and i.estado = 'pendiente'
         and not exists (select 1 from propuesta_ai p
           where p.item_id = i.id and p.workspace_id = i.workspace_id and p.estado = 'propuesta')
@@ -180,9 +250,15 @@ export async function panelPropuestas(
         propuestasHoy: ai.propuestasHoy,
         limiteDiario: ai.limiteDiario,
       },
-      pendientes: todas.filter((p) => p.estado === 'propuesta').slice(0, PAGINA_PENDIENTES),
-      decididas: todas.filter((p) => p.estado !== 'propuesta').slice(0, DECIDIDAS_RECIENTES),
-      itemsPendientes: items.map((i) => ({ id: i.id as string, titulo: i.titulo as string })),
+      pendientes: pendientes.slice(0, PAGINA_PENDIENTES).map(filaDePanel),
+      decididas: decididas.slice(0, DECIDIDAS_RECIENTES).map(filaDePanel),
+      hayMasPendientes: pendientes.length > PAGINA_PENDIENTES,
+      hayMasDecididas: decididas.length > DECIDIDAS_RECIENTES,
+      itemsPendientes: items.map((i) => ({
+        id: i.id as string,
+        titulo: i.titulo as string,
+        consentimientoPendiente: i.consentimiento_pendiente as boolean,
+      })),
       retosAbiertos: retos.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
     };
   });
@@ -194,78 +270,158 @@ type Alcance = {
   alcanceResumen: string;
   origenKey: OrigenKey;
   key: string;
+  /** Hueco del presupuesto apartado para esta generación: se consume al persistir y se
+   * libera si la generación no llega a nacer. */
+  reservaId: string;
+  unidades: number;
 };
 
-/** Lee el alcance delimitado del ancla y comprueba que la capacidad esté encendida.
+/**
+ * Lee el alcance delimitado del ancla, comprueba que se PUEDA procesar (capacidad
+ * encendida, consentimiento registrado si el material es de personas) y aparta el hueco
+ * del presupuesto.
+ *
  * Deliberadamente en su propia transacción, corta: la llamada al proveedor ocurre FUERA
- * de cualquier transacción — un tercero lento no puede retener una conexión de la base. */
-async function prepararAlcance(
-  actorId: string,
-  entrada: GenerarPropuestas,
-): Promise<Alcance> {
+ * de cualquier transacción — un tercero lento no puede retener una conexión de la base.
+ * Justo por eso el chequeo del presupuesto no bastaba: entre este commit y el insert
+ * final pasa la llamada entera, y sin dejar nada apartado todos los curadores que miran
+ * a la vez ven el mismo hueco libre.
+ */
+async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Promise<Alcance> {
+  const unidades = UNIDADES_POR_CAPACIDAD[entrada.capacidad];
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await rolCurador(tx, actorId, entrada.workspaceId);
 
-    const ai = await estadoCapacidad(tx, entrada.workspaceId);
     const { keyWorkspace, keyEntorno } = credencialesAI();
-    if (!ai.disponible || !ai.origenKey) throw new ErrorAI(ai.motivo);
-    const key = (ai.origenKey === 'workspace' ? keyWorkspace : keyEntorno)!;
+    let sistema: string;
+    let prompt: { usuario: string; alcanceResumen: string };
 
     if (entrada.capacidad === 'CI') {
-      const [item] = await tx`select titulo, tipo_fuente, referencia, contenido
+      const [item] = await tx`select titulo, tipo_fuente, referencia, contenido,
+          tipo_fuente_exige_consentimiento(tipo_fuente)
+            and not exists (select 1 from consentimiento_item c
+              where c.item_id = item_importacion.id
+                and c.workspace_id = item_importacion.workspace_id
+                and c.procesamiento_externo) as falta_consentimiento
         from item_importacion
         where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
           and estado = 'pendiente'`;
       if (!item) throw new ErrorAI('El item no existe en este workspace o ya fue curado');
+      // RF-09.5: ANTES de construir el prompt, no al aceptar la propuesta. Aquí es donde
+      // se evita de verdad que el material de una persona salga hacia el proveedor; el
+      // guard de `propuesta_ai` es el suelo que impide que exista una propuesta así.
+      if (item.falta_consentimiento as boolean) {
+        throw new ErrorAI(
+          'Ese material es de personas: registra el consentimiento para procesarlo con un proveedor externo antes de pedir una propuesta (RF-09.5)',
+        );
+      }
       const [pendiente] = await tx`select 1 as hay from propuesta_ai
         where item_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
           and estado = 'propuesta' limit 1`;
       if (pendiente) {
         throw new ErrorAI('Ese item ya tiene una propuesta pendiente: revísala antes de pedir otra');
       }
-      const p = promptExtraccion({
+      sistema = SISTEMA_EXTRACCION;
+      prompt = promptExtraccion({
         titulo: item.titulo as string,
         tipoFuente: item.tipo_fuente as string,
         referencia: item.referencia as string,
         contenido: item.contenido as string,
       });
-      return {
-        sistema: SISTEMA_EXTRACCION,
-        usuario: p.usuario,
-        alcanceResumen: p.alcanceResumen,
-        origenKey: ai.origenKey,
-        key,
-      };
+    } else {
+      const [reto] = await tx`select codigo, titulo, descripcion, metrica_objetivo
+        from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+          and estado in ('candidato', 'activo')`;
+      if (!reto) throw new ErrorAI('El reto no existe en este workspace o ya no admite criterios');
+      // El congelado de criterios lo impone la política de criterio_exito; anticiparlo aquí
+      // evita quemar presupuesto en una propuesta que nadie podría aceptar.
+      const [congelado] = await tx`select 1 as hay from gate_instancia g
+        join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+        where p.reto_id = ${entrada.anclaId} and p.workspace_id = ${entrada.workspaceId}
+          and g.numero = 0 and g.estado = 'aprobado' limit 1`;
+      if (congelado) {
+        throw new ErrorAI('El G0 de ese reto ya fue aprobado: sus criterios están congelados');
+      }
+      sistema = SISTEMA_CRITERIOS;
+      prompt = promptCriterios({
+        codigo: reto.codigo as string,
+        titulo: reto.titulo as string,
+        descripcion: reto.descripcion as string,
+        metricaObjetivo: reto.metrica_objetivo as string,
+        cuantos: CRITERIOS_POR_GENERACION,
+      });
     }
 
-    const [reto] = await tx`select codigo, titulo, descripcion, metrica_objetivo
-      from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-        and estado in ('candidato', 'activo')`;
-    if (!reto) throw new ErrorAI('El reto no existe en este workspace o ya no admite criterios');
-    // El congelado de criterios lo impone la política de criterio_exito; anticiparlo aquí
-    // evita quemar presupuesto en una propuesta que nadie podría aceptar.
-    const [congelado] = await tx`select 1 as hay from gate_instancia g
-      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
-      where p.reto_id = ${entrada.anclaId} and p.workspace_id = ${entrada.workspaceId}
-        and g.numero = 0 and g.estado = 'aprobado' limit 1`;
-    if (congelado) {
-      throw new ErrorAI('El G0 de ese reto ya fue aprobado: sus criterios están congelados');
+    // ── Reserva del hueco, bajo candado del workspace ──
+    await bloquearPresupuesto(tx, entrada.workspaceId);
+    // Recolección de basura de reservas caducadas (proceso muerto a mitad de llamada):
+    // bajo el mismo candado, así que limpiar y apartar son atómicos entre sí.
+    await tx`delete from reserva_ai
+      where workspace_id = ${entrada.workspaceId}
+        and creado_en <= now() - reserva_ai_ventana()`;
+
+    if (entrada.capacidad === 'CI') {
+      const [enCurso] = await tx`select 1 as hay from reserva_ai
+        where workspace_id = ${entrada.workspaceId} and item_id = ${entrada.anclaId}`;
+      if (enCurso) {
+        throw new ErrorAI(
+          'Ese item ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+        );
+      }
     }
-    const p = promptCriterios({
-      codigo: reto.codigo as string,
-      titulo: reto.titulo as string,
-      descripcion: reto.descripcion as string,
-      metricaObjetivo: reto.metrica_objetivo as string,
-      cuantos: CRITERIOS_POR_GENERACION,
+
+    const { persistidas, reservadas } = await presupuestoDeHoy(tx, entrada.workspaceId);
+    const ai = evaluarCapacidadAI({
+      keyWorkspace,
+      keyEntorno,
+      propuestasHoy: persistidas + reservadas,
+      limiteDiario: LIMITE_PROPUESTAS_DIA,
+      unidades,
     });
+    if (!ai.disponible || !ai.origenKey) throw new ErrorAI(ai.motivo);
+    const key = (ai.origenKey === 'workspace' ? keyWorkspace : keyEntorno)!;
+
+    let reserva;
+    try {
+      [reserva] = await tx`insert into reserva_ai
+        (workspace_id, capacidad, item_id, unidades, creado_por)
+        values (${entrada.workspaceId}, ${entrada.capacidad},
+                ${entrada.capacidad === 'CI' ? entrada.anclaId : null}, ${unidades}, ${actorId})
+        returning id`;
+    } catch (e) {
+      // El índice único de la reserva por item: el candado ya serializa a los curadores,
+      // así que aquí solo se llega por un camino que no pasara por él.
+      if ((e as { code?: string }).code === '23505') {
+        throw new ErrorAI('Ese item ya tiene una generación AI en curso: espera a que termine');
+      }
+      throw e;
+    }
+
     return {
-      sistema: SISTEMA_CRITERIOS,
-      usuario: p.usuario,
-      alcanceResumen: p.alcanceResumen,
+      sistema,
+      usuario: prompt.usuario,
+      alcanceResumen: prompt.alcanceResumen,
       origenKey: ai.origenKey,
       key,
+      reservaId: reserva!.id as string,
+      unidades,
     };
+  });
+}
+
+/** Devuelve el hueco al presupuesto cuando la generación no llegó a persistir: una
+ * llamada fallida no consume presupuesto (y no hay que esperar a que la reserva caduque
+ * para volver a intentarlo sobre el mismo item). Idempotente. */
+async function liberarReserva(
+  actorId: string,
+  workspaceId: string,
+  reservaId: string,
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    await bloquearPresupuesto(tx, workspaceId);
+    await tx`delete from reserva_ai where id = ${reservaId} and workspace_id = ${workspaceId}`;
   });
 }
 
@@ -287,43 +443,141 @@ export async function generarPropuestas(
   entrada: GenerarPropuestas,
 ): Promise<{ generadas: number }> {
   const alcance = await prepararAlcance(actorId, entrada);
-
-  const respuesta = await generarConProveedor({
-    key: alcance.key,
-    capacidad: entrada.capacidad,
-    sistema: alcance.sistema,
-    usuario: alcance.usuario,
-  });
-  if (!respuesta.ok) throw new ErrorAI(respuesta.motivo);
-
-  let contenidos: ContenidoPropuesta[];
   try {
-    contenidos = contenidosValidos(entrada.capacidad, respuesta.datos);
-  } catch {
-    throw new ErrorAI(
-      'La respuesta del proveedor AI no cumplió el esquema de la capacidad y se descartó. Todo el flujo sigue disponible a mano.',
-    );
-  }
+    const respuesta = await generarConProveedor({
+      key: alcance.key,
+      capacidad: entrada.capacidad,
+      sistema: alcance.sistema,
+      usuario: alcance.usuario,
+    });
+    if (!respuesta.ok) throw new ErrorAI(respuesta.motivo);
 
+    let contenidos: ContenidoPropuesta[];
+    try {
+      contenidos = contenidosValidos(entrada.capacidad, respuesta.datos);
+    } catch {
+      throw new ErrorAI(
+        'La respuesta del proveedor AI no cumplió el esquema de la capacidad y se descartó. Todo el flujo sigue disponible a mano.',
+      );
+    }
+    return await persistirPropuestas(actorId, entrada, alcance, respuesta, contenidos);
+  } catch (e) {
+    // Nada nació: el hueco vuelve al presupuesto en el acto. Si la transacción de arriba
+    // ya lo había consumido y luego falló, su rollback lo repuso — y este delete lo
+    // vuelve a quitar, que es lo correcto: sigue sin haber propuestas.
+    await liberarReserva(actorId, entrada.workspaceId, alcance.reservaId).catch(() => {});
+    throw e;
+  }
+}
+
+/** Persiste el lote consumiendo la reserva EN LA MISMA transacción (RF-09.12): el hueco
+ * apartado y las filas que lo ocupan nacen o no nacen juntos. */
+async function persistirPropuestas(
+  actorId: string,
+  entrada: GenerarPropuestas,
+  alcance: Alcance,
+  respuesta: Extract<ResultadoProveedor, { ok: true }>,
+  contenidos: ContenidoPropuesta[],
+): Promise<{ generadas: number }> {
+  // Agrupa las propuestas de ESTA llamada: su uso y su coste son de la llamada, no de
+  // cada fila, y el reporte de costos suma por llamada distinta (RF-09.14).
+  const llamadaId = crypto.randomUUID();
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    await bloquearPresupuesto(tx, entrada.workspaceId);
+
+    const consumida = await tx`delete from reserva_ai
+      where id = ${alcance.reservaId} and workspace_id = ${entrada.workspaceId}
+      returning unidades`;
+    const apartadas = consumida.length > 0 ? Number(consumida[0]!.unidades) : 0;
+    // La reserva caducó (proveedor lentísimo, proceso reiniciado): sin ella este insert
+    // volvería a ser el chequeo obsoleto que dejaba pasar a todos, así que se re-comprueba
+    // el presupuesto con el estado de AHORA antes de escribir nada.
+    if (contenidos.length > apartadas) {
+      const { keyWorkspace, keyEntorno } = credencialesAI();
+      const { persistidas, reservadas } = await presupuestoDeHoy(tx, entrada.workspaceId);
+      const ai = evaluarCapacidadAI({
+        keyWorkspace,
+        keyEntorno,
+        propuestasHoy: persistidas + reservadas,
+        limiteDiario: LIMITE_PROPUESTAS_DIA,
+        unidades: contenidos.length,
+      });
+      if (!ai.disponible) throw new ErrorAI(ai.motivo);
+    }
+
     const destino = DESTINO_DE_CAPACIDAD[entrada.capacidad];
     // UNA sentencia para el lote entero: el evento PropuestaAIGenerada de cada fila lo
     // emite el guard DENTRO de este insert, así que el rol auditado es exactamente el que
     // autorizó la escritura (mismo snapshot).
-    const filas = await tx`
+    try {
+      const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
-         modelo, prompt_version, alcance_resumen, latencia_ms, origen_key, creado_por)
+         modelo, prompt_version, alcance_resumen, latencia_ms, origen_key, llamada_id,
+         tokens_entrada, tokens_salida, costo_usd, creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino},
              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
              ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
              c.contenido, c.contenido,
              ${respuesta.modelo}, ${PROMPT_VERSION}, ${alcance.alcanceResumen},
-             ${respuesta.latenciaMs}, ${alcance.origenKey}, ${actorId}
+             ${respuesta.latenciaMs}, ${alcance.origenKey}, ${llamadaId},
+             ${respuesta.uso?.entrada ?? null}, ${respuesta.uso?.salida ?? null},
+             ${respuesta.uso?.costoUsd ?? null}, ${actorId}
       from jsonb_array_elements(${tx.json(contenidos)}) as c(contenido)
       returning id`;
-    return { generadas: filas.length };
+      return { generadas: filas.length };
+    } catch (e) {
+      const err = e as { code?: string; message?: string };
+      // El índice único parcial: otra generación se adelantó con este item. Es el suelo
+      // que garantiza UNA sola propuesta pendiente aunque nadie viera a nadie.
+      if (err.code === '23505') {
+        throw new ErrorAI(
+          'Ese item ya tiene una propuesta pendiente: otra generación se adelantó y esta se descarta',
+        );
+      }
+      // El guard del consentimiento (RF-09.5): el servicio ya lo comprobó antes de
+      // construir el prompt, así que aquí solo llega por carrera o por SQL crudo.
+      if (err.code === 'P0001' && err.message?.includes('consentimiento')) {
+        throw new ErrorAI(
+          'Ese material exige consentimiento registrado para procesamiento externo (RF-09.5)',
+        );
+      }
+      throw e;
+    }
+  });
+}
+
+/**
+ * Registra el consentimiento de las personas sobre el material de un item (RF-09.5),
+ * ANTES de procesarlo. No lo propone ni lo infiere la AI: lo declara la persona que
+ * condujo la investigación, y queda atribuido por la política.
+ *
+ * Es append-only: no hay grant de UPDATE ni de DELETE sobre la tabla, así que un
+ * consentimiento registrado no se puede reescribir ni borrar desde la app. Una revocación
+ * futura (RF-09.4) será su propio objeto, no una edición de este.
+ */
+export async function registrarConsentimiento(
+  actorId: string,
+  entrada: RegistrarConsentimiento,
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    await rolCurador(tx, actorId, entrada.workspaceId);
+    const [item] = await tx`select 1 as hay from item_importacion
+      where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
+    if (!item) throw new ErrorAI('El item no existe en este workspace');
+    try {
+      await tx`insert into consentimiento_item
+        (item_id, workspace_id, alcance, procesamiento_externo, registrado_por)
+        values (${entrada.itemId}, ${entrada.workspaceId}, ${entrada.alcance},
+                ${entrada.procesamientoExterno}, ${actorId})`;
+    } catch (e) {
+      if ((e as { code?: string }).code === '23505') {
+        throw new ErrorAI('Ese item ya tiene consentimiento registrado: no se reescribe');
+      }
+      throw e;
+    }
   });
 }
 
@@ -440,6 +694,10 @@ async function materializarEvidencia(
   const [item] = await tx`select titulo, tipo_fuente, referencia from item_importacion
     where id = ${p.itemId} and workspace_id = ${workspaceId} and estado = 'pendiente'`;
   if (!item) throw new ErrorAI('El item de la bandeja ya fue curado o no existe');
+  // El consentimiento se registró ANTES de procesar (RF-09.5) o no se registró: la
+  // evidencia dice cuál de las dos, y no lo decide ni lo propone la AI.
+  const [consentimiento] = await tx`select 1 as hay from consentimiento_item
+    where item_id = ${p.itemId} and workspace_id = ${workspaceId}`;
 
   const dimensiones = DimensionesEvidenciaSchema.parse({
     proveniencia: {
@@ -449,10 +707,14 @@ async function materializarEvidencia(
     },
     metodo: { recoleccion: c.recoleccion, derivada: c.derivada, segmentoIds: [] },
     calidad: { confianza: c.confianza, corroboraIds: [], contradiceIds: [] },
-    // Los DERECHOS no los propone la AI: el consentimiento de las personas se captura
-    // antes de procesar (RF-09.5) y jamás se infiere de un texto. Nace en falso; para
-    // una evidencia con consentimiento registrado está el camino manual de la bandeja.
-    derechos: { consentimiento: false, confidencialidad: c.confidencialidad },
+    // Los DERECHOS no los propone la AI: el consentimiento se captura antes de procesar
+    // (RF-09.5) y jamás se infiere de un texto. Aquí solo se COPIA lo que quedó
+    // registrado sobre el item — antes nacía siempre en falso, lo que obligaba a
+    // reparar a mano una evidencia cuyo consentimiento sí constaba.
+    derechos: {
+      consentimiento: Boolean(consentimiento),
+      confidencialidad: c.confidencialidad,
+    },
     // SYS-19: esta evidencia SÍ pasó por una transformación AI y lo dice para siempre.
     // Las citas literales viven en la propuesta aceptada, que queda enlazada a esta fila.
     lineage: { modelo: p.modelo, promptVersion: p.promptVersion },

@@ -12,7 +12,7 @@ import {
   ETAPAS_CANONICAS,
   rolAprobadorDeGate,
 } from '../src/lib/metodo/metodo.plantillas';
-import { MODELO_PRIMARIO } from '../src/lib/ai/ai.degradacion';
+import { costoDeUso, MODELO_PRIMARIO } from '../src/lib/ai/ai.degradacion';
 import { PROMPT_VERSION } from '../src/lib/ai/ai.prompts';
 
 const url = process.env.DATABASE_URL;
@@ -1096,13 +1096,17 @@ async function sembrarPropuestaAI(
     ],
   };
 
+  // Con su uso y su coste: la observabilidad de costos (RF-09.14) tiene que verse en la
+  // demo, no solo existir en el esquema.
   const [propuesta] = await tx`insert into propuesta_ai
     (workspace_id, capacidad, destino, item_id, contenido, contenido_original, confianza,
-     modelo, prompt_version, alcance_resumen, latencia_ms, origen_key, creado_por)
+     modelo, prompt_version, alcance_resumen, latencia_ms, origen_key,
+     tokens_entrada, tokens_salida, costo_usd, creado_por)
     values (${wsId}, 'CI', 'evidencia', ${itemId}, ${tx.json(contenido)}, ${tx.json(contenido)},
             0.55, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
             ${`item de bandeja «${TITULO_ITEM_AI}» · ${MATERIAL_ITEM_AI.length} de ${MATERIAL_ITEM_AI.length} caracteres`},
-            1840, 'entorno', ${luciaId})
+            1840, 'entorno', 1420, 640,
+            ${costoDeUso(MODELO_PRIMARIO, { entrada: 1420, salida: 640 })}, ${luciaId})
     returning id`;
 
   // El guard de la tabla emite este evento para las escrituras CON contexto de usuario; el

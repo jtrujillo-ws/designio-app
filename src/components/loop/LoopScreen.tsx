@@ -92,7 +92,8 @@ export function LoopScreen({
               <strong>El loop cierra:</strong> los retos candidatos del post mortem (J7) pre-pueblan la etapa 0
               del siguiente reto (J2) con la memoria del propio workspace
               {(() => {
-                const candidatos = servicio?.retos.filter((r) => r.estado === 'candidato') ?? [];
+                const candidatos =
+                  arbol?.servicios.flatMap((s) => s.retos).filter((r) => r.estado === 'candidato') ?? [];
                 if (candidatos.length === 0) return ' — el backlog del servicio espera su primer candidato.';
                 return (
                   <>
@@ -247,14 +248,16 @@ function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
           Sin servicios aún
         </div>
       )}
-      {arbol?.servicios.map((servicio) => (
+      {arbol?.servicios.map((servicio, indice) => (
         <div key={servicio.id}>
           <div
             style={{
               font: '600 13px var(--font-sans)',
               color: 'var(--text-body)',
               padding: '6px 10px 6px 22px',
-              background: 'var(--accent-soft)',
+              // Resaltado solo el servicio "actual" (el primero, el que muestra el
+              // breadcrumb); el selector de servicio llegará con más de uno.
+              background: indice === 0 ? 'var(--accent-soft)' : undefined,
               borderRadius: 'var(--r-sm)',
               ...truncado,
             }}

@@ -1,83 +1,65 @@
 import '@/lib/server-only';
 import type { TransactionSql } from 'postgres';
-import type { ArbolWorkspace, ProyectoArbol, RetoArbol, ServicioArbol } from './arbol.schemas';
+import type { ArbolWorkspace, ServicioArbol } from './arbol.schemas';
 
 /**
- * Construye la proyección del árbol (RF-02.1/02.2) con lecturas planas + ensamblado en
- * memoria: volumen de piloto, proyección síncrona (nota técnica de SPEC-02). Corre DENTRO
- * de una transacción con contexto RLS — las políticas ya acotan al workspace del usuario;
- * el filtro explícito por workspace_id es la capa 2.
+ * Construye la proyección del árbol (RF-02.1/02.2) en UNA sola sentencia (json_agg
+ * anidado): un único snapshot — sin carreras entre lecturas bajo READ COMMITTED — y
+ * orden estable con desempate por id. Corre DENTRO de una transacción con contexto
+ * RLS; el filtro explícito por workspace_id es la capa 2.
  */
 export async function construirArbol(
   tx: TransactionSql,
   workspaceId: string,
   workspaceNombre: string,
 ): Promise<ArbolWorkspace> {
-  const servicios = await tx`
-    select id, nombre, estado from servicio
-    where workspace_id = ${workspaceId}
-    order by creado_en`;
-  const retos = await tx`
-    select id, servicio_ancla_id, codigo, titulo, estado, origen, metrica_objetivo from reto
-    where workspace_id = ${workspaceId}
-    order by codigo`;
-  const proyectos = await tx`
-    select id, reto_id, codigo, titulo, estado from proyecto
-    where workspace_id = ${workspaceId}
-    order by codigo`;
-  const afectados = await tx`
-    select ra.servicio_id, r.id, r.codigo, r.titulo
-    from reto_servicio_afectado ra
-    join reto r on r.id = ra.reto_id
-    where ra.workspace_id = ${workspaceId}
-    order by r.codigo`;
-
-  const proyectosPorReto = new Map<string, ProyectoArbol[]>();
-  for (const p of proyectos) {
-    const retoId = p.reto_id as string;
-    const lista = proyectosPorReto.get(retoId) ?? [];
-    lista.push({
-      id: p.id as string,
-      codigo: p.codigo as string,
-      titulo: p.titulo as string,
-      estado: p.estado as string,
-    });
-    proyectosPorReto.set(retoId, lista);
-  }
-
-  const retosPorServicio = new Map<string, RetoArbol[]>();
-  for (const r of retos) {
-    const anclaId = r.servicio_ancla_id as string;
-    const lista = retosPorServicio.get(anclaId) ?? [];
-    lista.push({
-      id: r.id as string,
-      codigo: r.codigo as string,
-      titulo: r.titulo as string,
-      estado: r.estado as string,
-      origen: (r.origen ?? null) as string | null,
-      metricaObjetivo: r.metrica_objetivo as string,
-      proyectos: proyectosPorReto.get(r.id as string) ?? [],
-    });
-    retosPorServicio.set(anclaId, lista);
-  }
-
-  const afectanPorServicio = new Map<string, ServicioArbol['retosQueAfectan']>();
-  for (const a of afectados) {
-    const servicioId = a.servicio_id as string;
-    const lista = afectanPorServicio.get(servicioId) ?? [];
-    lista.push({ id: a.id as string, codigo: a.codigo as string, titulo: a.titulo as string });
-    afectanPorServicio.set(servicioId, lista);
-  }
+  const [fila] = await tx`
+    select coalesce(json_agg(servicio_json order by creado_en, id), '[]'::json) as servicios
+    from (
+      select s.creado_en, s.id, json_build_object(
+        'id', s.id,
+        'nombre', s.nombre,
+        'estado', s.estado,
+        'retos', coalesce((
+          select json_agg(json_build_object(
+            'id', r.id,
+            'codigo', r.codigo,
+            'titulo', r.titulo,
+            'estado', r.estado,
+            'origen', r.origen,
+            'metricaObjetivo', r.metrica_objetivo,
+            'proyectos', coalesce((
+              select json_agg(json_build_object(
+                'id', p.id, 'codigo', p.codigo, 'titulo', p.titulo, 'estado', p.estado
+              ) order by p.codigo, p.id)
+              from proyecto p
+              where p.reto_id = r.id and p.workspace_id = ${workspaceId}
+            ), '[]'::json)
+          ) order by r.codigo, r.id)
+          from reto r
+          where r.servicio_ancla_id = s.id and r.workspace_id = ${workspaceId}
+        ), '[]'::json),
+        'retosQueAfectan', coalesce((
+          select json_agg(json_build_object(
+            'id', r2.id, 'codigo', r2.codigo, 'titulo', r2.titulo
+          ) order by r2.codigo, r2.id)
+          from reto_servicio_afectado ra
+          join reto r2 on r2.id = ra.reto_id
+          where ra.servicio_id = s.id
+            and ra.workspace_id = ${workspaceId}
+            -- Si una arista «afecta» duplicara el ancla, la proyección NO la duplica
+            -- (criterio de aceptación 1 de SPEC-02); la función de escritura futura
+            -- rechazará crearla.
+            and ra.servicio_id <> r2.servicio_ancla_id
+        ), '[]'::json)
+      ) as servicio_json
+      from servicio s
+      where s.workspace_id = ${workspaceId}
+    ) sub`;
 
   return {
     workspaceId,
     workspaceNombre,
-    servicios: servicios.map((s) => ({
-      id: s.id as string,
-      nombre: s.nombre as string,
-      estado: s.estado as string,
-      retos: retosPorServicio.get(s.id as string) ?? [],
-      retosQueAfectan: afectanPorServicio.get(s.id as string) ?? [],
-    })),
+    servicios: (fila?.servicios ?? []) as ServicioArbol[],
   };
 }

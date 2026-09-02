@@ -438,6 +438,21 @@ begin
       and g.estado = 'aprobado') then
     raise exception 'el gate ya está aprobado: checklist congelado';
   end if;
+  -- El rastro va CON la transición, también por SQL directo: cada marca deja evento
+  -- con lo previo (revertir un N/A conserva quién lo había aprobado y por qué). Las
+  -- altas (activación/backfill) no son decisiones: sin evento por ítem.
+  if tg_op = 'UPDATE' then
+    insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id, 'ItemMarcado',
+      jsonb_strip_nulls(jsonb_build_object(
+        'itemId', new.id, 'gateId', new.gate_id, 'accion', new.estado,
+        'evidenciaId', new.evidencia_id,
+        'justificacion', nullif(new.na_justificacion, '')))
+        || jsonb_build_object('previo', jsonb_build_object(
+             'estado', old.estado, 'naAprobadoPor', old.na_aprobado_por,
+             'naJustificacion', old.na_justificacion)),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  end if;
   return new;
 end $$;
 create trigger checklist_gate_pendiente
@@ -473,6 +488,9 @@ create function gate_aprobar_suficiencia_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
   if new.estado = 'aprobado' and old.estado = 'pendiente' then
+    -- El sello temporal lo pone la BASE, no el caller: un update directo no puede
+    -- retro ni post-datar el registro inmutable.
+    new.aprobado_en := now();
     -- La fila del gate ya quedó bloqueada por el propio UPDATE: los guards de
     -- escritura esperan en su FOR UPDATE y estas sentencias ven lo ya commiteado.
     if exists (select 1 from checklist_item ci

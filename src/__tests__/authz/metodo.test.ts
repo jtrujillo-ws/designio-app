@@ -406,6 +406,22 @@ describeAuthz('método: etapas, gates y checklists', () => {
     const previo = (eventos[0]!.payload as { previo: Record<string, string> }).previo;
     expect(previo.naAprobadoPor).toBe(sponsorId);
     expect(previo.naJustificacion).toBe('Decidido por el sponsor');
+
+    // Y el rastro cubre también el SQL directo: la marca cruda deja su evento (lo
+    // emite el guard de la transición, no solo marcarItem).
+    const p2 = await proyectoMetodo(leadId, ws, proyectoId);
+    const item2 = p2!.gates[3]!.items[1]!;
+    await conUsuario(leadId, (tx) => tx`update checklist_item
+      set estado = 'cumplido', evidencia_id = ${evidenciaId}
+      where id = ${item2.id}`);
+    const [directo] = await admin`
+      select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'ItemMarcado'
+        and payload->>'itemId' = ${item2.id}
+      order by creado_en desc limit 1`;
+    expect((directo!.payload as { accion: string }).accion).toBe('cumplido');
+    await conUsuario(leadId, (tx) => tx`update checklist_item
+      set estado = 'pendiente', evidencia_id = null where id = ${item2.id}`);
   });
 
   it('las escrituras directas del método respetan RLS: ni el stakeholder aprueba, ni el aprobador salta la suficiencia', async () => {

@@ -253,46 +253,17 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
     }
     await bloquearGate(tx, dueno.gate_id as string);
 
-    const detalle =
-      a.tipo === 'cumplido'
-        ? { evidenciaId: a.evidenciaId }
-        : a.tipo === 'na'
-          ? { justificacion: a.justificacion }
-          : {};
-    let fila;
+    let filas;
     try {
-      // UNA sentencia: el estado previo (para el rastro del N/A revertido), la marca y
-      // el evento comparten snapshot, y el rol auditado es el que autorizó el update.
-      [fila] = await tx`
-        with antes as (
-          select estado, na_aprobado_por, na_justificacion from checklist_item
-          where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}
-        ),
-        quien as (
-          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-        ),
-        upd as (
-          update checklist_item
-          set estado = ${a.tipo},
-              evidencia_id = ${a.tipo === 'cumplido' ? a.evidenciaId : null},
-              na_justificacion = ${a.tipo === 'na' ? a.justificacion : ''},
-              na_aprobado_por = ${a.tipo === 'na' ? actorId : null}
-          where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}
-          returning id, gate_id
-        ),
-        evento as (
-          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-          select ${entrada.workspaceId}, 'ItemMarcado',
-            jsonb_build_object('itemId', upd.id, 'gateId', upd.gate_id,
-                               'accion', ${a.tipo}::text)
-              || ${tx.json(detalle)}::jsonb
-              || jsonb_build_object('previo', jsonb_build_object(
-                   'estado', antes.estado, 'naAprobadoPor', antes.na_aprobado_por,
-                   'naJustificacion', antes.na_justificacion)),
-            ${actorId}, quien.rol
-          from upd, quien, antes
-        )
-        select count(*)::int as n from upd`;
+      // El evento ItemMarcado (con lo previo) lo emite el guard de la transición
+      // DENTRO de este UPDATE — también para SQL directo, mismo snapshot y rol.
+      filas = await tx`
+        update checklist_item
+        set estado = ${a.tipo},
+            evidencia_id = ${a.tipo === 'cumplido' ? a.evidenciaId : null},
+            na_justificacion = ${a.tipo === 'na' ? a.justificacion : ''},
+            na_aprobado_por = ${a.tipo === 'na' ? actorId : null}
+        where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
     } catch (e) {
       const code = (e as { code?: string }).code;
       // WITH CHECK violado (42501): rol insuficiente para la transición pedida.
@@ -308,7 +279,7 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
       }
       throw e;
     }
-    if ((fila!.n as number) === 0) {
+    if (filas.count === 0) {
       throw new ErrorMetodo('El ítem no existe, su gate ya fue aprobado o no puedes marcarlo');
     }
   });

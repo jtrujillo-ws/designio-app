@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { EstadoArquetipo } from '@/lib/metodo/gobernanza.schemas';
 
 /**
  * CTX-04 — Journey y blueprint como grafo tipado (ADR-0006, §10). La taxonomía es
@@ -187,6 +188,10 @@ export type NodoDeJourney = {
   catalogoId: string | null;
   /** Solo en los nodos de tipo arquetipo: el id del arquetipo CURADO del reto. */
   arquetipoId: string | null;
+  /** Y su estado de gobernanza en este momento. Referenciar en vez de copiar sirve
+   * justamente para esto: un arquetipo refutado después de entrar al grafo se ve desde
+   * el grafo, y la validación lo reporta. */
+  arquetipoEstado: EstadoArquetipo | null;
   detalle: string;
   faseId: string | null;
   orden: number;
@@ -214,6 +219,10 @@ export type JourneyCompleto = {
   nodos: NodoDeJourney[];
   aristas: AristaDeJourney[];
   snapshots: { id: string; motivo: string; congeladoEn: string }[];
+  /** Los arquetipos del reto del journey: lo que un nodo de ese tipo puede referenciar.
+   * Vienen con su estado porque un refutado no se puede añadir pero sí puede estar ya
+   * puesto, y la pantalla tiene que poder decirlo. */
+  arquetipos: { id: string; nombre: string; estado: EstadoArquetipo }[];
 };
 
 export type ResumenJourney = {
@@ -237,7 +246,8 @@ export type SenalValidacion = {
     | 'paso-sin-salida'
     | 'frontstage-sin-soporte'
     | 'sin-responsable'
-    | 'huerfano-de-fase';
+    | 'huerfano-de-fase'
+    | 'arquetipo-refutado';
   severidad: SeveridadSenal;
   nodoId: string;
   etiqueta: string;

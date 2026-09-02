@@ -11,7 +11,6 @@ import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { DiagramaMermaid } from '@/components/journey/DiagramaMermaid';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { gobernanzaDelProyecto } from '@/lib/metodo/gobernanza.functions';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
   agregarAristaAlJourney,
@@ -57,15 +56,9 @@ export const Route = createFileRoute('/_autenticada/journey/$journeyId')({
       evidenciasDelWorkspace({ data: { workspaceId } }),
     ]);
     if (!journey) return null;
-    // Un nodo de tipo arquetipo REFERENCIA al arquetipo curado del reto (SPEC-04.11),
-    // no lo copia: el formulario solo puede ofrecer los que existen de verdad.
-    const gobernanza = journey.proyectoId
-      ? await gobernanzaDelProyecto({ data: { workspaceId, proyectoId: journey.proyectoId } })
-      : null;
     return {
       workspaceId,
       journey,
-      arquetipos: (gobernanza?.arquetipos ?? []).map((a) => ({ id: a.id, nombre: a.nombre })),
       evidencias: evidencias?.evidencias ?? [],
       hayMasEvidencias: evidencias?.hayMas ?? false,
     };
@@ -175,7 +168,7 @@ function PantallaJourney() {
               <BloqueModelo
                 workspaceId={datos.workspaceId}
                 journey={journey}
-                arquetipos={datos.arquetipos}
+                arquetipos={datos.journey.arquetipos}
                 evidencias={datos.evidencias}
                 hayMasEvidencias={datos.hayMasEvidencias}
                 editable={editable}
@@ -310,7 +303,7 @@ function BloqueModelo({
 }: {
   workspaceId: string;
   journey: JourneyCompleto;
-  arquetipos: { id: string; nombre: string }[];
+  arquetipos: JourneyCompleto['arquetipos'];
   evidencias: { id: string; titulo: string }[];
   hayMasEvidencias: boolean;
   editable: boolean;
@@ -399,7 +392,7 @@ function FormularioNodo({
   workspaceId: string;
   journeyId: string;
   fases: NodoDeJourney[];
-  arquetipos: { id: string; nombre: string }[];
+  arquetipos: JourneyCompleto['arquetipos'];
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
 }) {
@@ -411,6 +404,9 @@ function FormularioNodo({
   const [arquetipoId, setArquetipoId] = useState('');
   const [ocupado, setOcupado] = useState(false);
   const esArquetipo = tipo === 'arquetipo';
+  // Un arquetipo REFUTADO no entra al grafo: el veredicto dice que ese perfil no describe
+  // a nadie, y dibujarlo lo resucitaría. El guard lo rechaza igual; esto ahorra el viaje.
+  const disponibles = arquetipos.filter((a) => a.estado !== 'refutado');
 
   async function enviar(e: FormEvent) {
     e.preventDefault();
@@ -477,16 +473,18 @@ function FormularioNodo({
                 perfil que el modelo curado refutó. */}
             <Select value={arquetipoId} onChange={(e) => setArquetipoId(e.target.value)} required>
               <option value="">Arquetipo del reto…</option>
-              {arquetipos.map((a) => (
+              {disponibles.map((a) => (
                 <option key={a.id} value={a.id}>
                   {a.nombre}
+                  {a.estado === 'hipotesis' ? ' (hipótesis)' : ''}
                 </option>
               ))}
             </Select>
-            {arquetipos.length === 0 && (
+            {disponibles.length === 0 && (
               <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
-                Este journey no tiene arquetipos que referenciar: defínelos primero en la
-                pantalla del proyecto (o asocia el journey a un proyecto).
+                {arquetipos.length === 0
+                  ? 'Este journey no tiene arquetipos que referenciar: defínelos primero en el reto (o asocia el journey a uno).'
+                  : 'Los arquetipos de este reto están todos refutados: un perfil descartado no entra al journey.'}
               </span>
             )}
           </>
@@ -718,7 +716,19 @@ function FilaNodo({
 
       {editando && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <Input value={etiqueta} onChange={(e) => setEtiqueta(e.target.value)} />
+          {/* La etiqueta de un nodo arquetipo NO se teclea: es el nombre del arquetipo
+              curado. Poder reescribirla haría que el diagrama, el blueprint y los
+              snapshots congelados mostraran un nombre inventado para un arquetipo real —
+              justo la identidad que referenciarlo viene a garantizar. El guard la deriva
+              de todas formas; aquí se muestra para que se entienda por qué no se edita. */}
+          {nodo.tipo === 'arquetipo' ? (
+            <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+              La etiqueta la pone el arquetipo curado del reto ({nodo.etiqueta}) y no se
+              edita aquí: se cambia renombrando el arquetipo.
+            </span>
+          ) : (
+            <Input value={etiqueta} onChange={(e) => setEtiqueta(e.target.value)} />
+          )}
           <Input
             placeholder="Responsable"
             value={responsable}
@@ -749,7 +759,11 @@ function FilaNodo({
               onChange={(e) => setOrden(e.target.value)}
               style={{ width: 100 }}
             />
-            <Button size="sm" disabled={ocupado || etiqueta.trim() === ''} onClick={() => void guardar()}>
+            <Button
+              size="sm"
+              disabled={ocupado || (nodo.tipo !== 'arquetipo' && etiqueta.trim() === '')}
+              onClick={() => void guardar()}
+            >
               Guardar
             </Button>
             <Button size="sm" variant="ghost" disabled={ocupado} onClick={() => setEditando(false)}>

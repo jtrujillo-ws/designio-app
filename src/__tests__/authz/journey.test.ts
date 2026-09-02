@@ -627,6 +627,66 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
         responsable: '',
       }),
     ).rejects.toThrow(/otro reto|anclarlo/);
+
+    // La etiqueta se DERIVA del arquetipo, no se teclea: si se pudiera escribir, el
+    // diagrama y los snapshots mostrarían un nombre inventado para un arquetipo real.
+    const conNombreFalso = await agregarNodo(leadId, {
+      workspaceId: ws,
+      journeyId: anclado.journeyId,
+      tipo: 'arquetipo',
+      etiqueta: 'Nombre inventado que no es el suyo',
+      arquetipoId: arq!.id as string,
+      detalle: '',
+      faseId: null,
+      responsable: '',
+    });
+    const tras = await journeyCompleto(leadId, ws, anclado.journeyId);
+    expect(tras!.nodos.find((n) => n.id === conNombreFalso.nodoId)!.etiqueta).toBe(
+      'Migrante bancarizado',
+    );
+    // Y editarla tampoco la mueve.
+    await editarNodo(leadId, {
+      workspaceId: ws,
+      nodoId: conNombreFalso.nodoId,
+      etiqueta: 'Otro nombre inventado',
+      detalle: '',
+      faseId: null,
+      responsable: '',
+      orden: 1,
+    });
+    const trasEditar = await journeyCompleto(leadId, ws, anclado.journeyId);
+    expect(trasEditar!.nodos.find((n) => n.id === conNombreFalso.nodoId)!.etiqueta).toBe(
+      'Migrante bancarizado',
+    );
+
+    // Un arquetipo REFUTADO no entra: el veredicto dice que ese perfil no describe a
+    // nadie, y dibujarlo en el journey lo resucitaría.
+    const [refutado] = await admin`insert into arquetipo
+      (workspace_id, reto_id, nombre, estado, veredicto_razon, creado_por)
+      values (${ws}, ${reto!.id as string}, 'Perfil descartado', 'refutado',
+        'La evidencia lo contradice', ${leadId}) returning id`;
+    await expect(
+      agregarNodo(leadId, {
+        workspaceId: ws,
+        journeyId: anclado.journeyId,
+        tipo: 'arquetipo',
+        etiqueta: 'Perfil descartado',
+        arquetipoId: refutado!.id as string,
+        detalle: '',
+        faseId: null,
+        responsable: '',
+      }),
+    ).rejects.toThrow(/refutado/);
+
+    // Lo que YA estaba puesto se queda cuando el veredicto llega después —el grafo es
+    // historia y borrarlo por detrás sería reescribirla— y la proyección lo delata para
+    // que la validación pueda reportarlo.
+    await admin`update arquetipo set estado = 'refutado',
+      veredicto_razon = 'Refutado más tarde' where id = ${arq!.id as string}`;
+    const conDeriva = await journeyCompleto(leadId, ws, anclado.journeyId);
+    expect(conDeriva!.nodos.find((n) => n.id === nodo.nodoId)!.arquetipoEstado).toBe('refutado');
+    // Y el selector deja de ofrecerlo, porque la proyección trae el estado.
+    expect(conDeriva!.arquetipos.filter((a) => a.estado !== 'refutado')).toEqual([]);
   });
 
   it('el tipo y la condición de una relación se corrigen sin borrarla', async () => {

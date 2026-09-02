@@ -24,6 +24,7 @@ function nodo(parcial: Partial<NodoDeJourney> & Pick<NodoDeJourney, 'tipo' | 'et
     detalle: '',
     catalogoId: null,
     arquetipoId: null,
+    arquetipoEstado: null,
     faseId: null,
     orden: 0,
     responsable: '',
@@ -54,6 +55,7 @@ function journey(nodos: NodoDeJourney[], aristas: AristaDeJourney[]): JourneyCom
     nodos,
     aristas,
     snapshots: [],
+    arquetipos: [],
   };
 }
 
@@ -252,6 +254,31 @@ describe('validarJourney', () => {
     expect(senales[0]!.codigo).toBe('sin-responsable');
   });
 });
+
+  it('reporta el arquetipo que la gobernanza refutó después de entrar al grafo', () => {
+    // El guard impide AÑADIR uno refutado, pero el veredicto puede llegar más tarde.
+    // Borrar el nodo por detrás sería reescribir el journey sin que nadie lo decida.
+    const perfil = nodo({
+      tipo: 'arquetipo',
+      etiqueta: 'Migrante bancarizado',
+      orden: 0,
+      arquetipoId: id(),
+      arquetipoEstado: 'refutado',
+    });
+    const vivo = nodo({
+      tipo: 'arquetipo',
+      etiqueta: 'Joven primer empleo',
+      orden: 1,
+      arquetipoId: id(),
+      arquetipoEstado: 'confirmado',
+    });
+    const senales = validarJourney(journey([perfil, vivo], []));
+
+    expect(senales.filter((s) => s.codigo === 'arquetipo-refutado').map((s) => s.nodoId)).toEqual([
+      perfil.id,
+    ]);
+    expect(senales.find((s) => s.codigo === 'arquetipo-refutado')!.severidad).toBe('alta');
+  });
 
 describe('carrilesDeJourney', () => {
   it('ordena las columnas por fase antes que por orden, igual que la validación', () => {

@@ -252,6 +252,22 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
     }
   }
 
+  // Un arquetipo puede refutarse DESPUÉS de entrar al grafo: el guard impide añadir uno
+  // refutado, pero no puede impedir que el veredicto llegue más tarde. Borrar el nodo por
+  // detrás sería reescribir el journey sin que nadie lo decida, así que se reporta: el
+  // grafo sigue describiendo a alguien que la gobernanza ya dijo que no existe.
+  for (const nodo of journey.nodos) {
+    if (nodo.tipo === 'arquetipo' && nodo.arquetipoEstado === 'refutado') {
+      senales.push({
+        codigo: 'arquetipo-refutado',
+        severidad: 'alta',
+        nodoId: nodo.id,
+        etiqueta: nodo.etiqueta,
+        mensaje: 'El arquetipo fue refutado: el journey describe a un perfil que la gobernanza descartó',
+      });
+    }
+  }
+
   // Responsable: se exige donde alguien tiene que hacer algo, no en emociones ni
   // fricciones (que se sienten, no se ejecutan).
   const EXIGEN_RESPONSABLE: TipoNodo[] = ['accion-frontstage', 'accion-backstage', 'sistema'];

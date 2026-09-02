@@ -390,6 +390,11 @@ export async function journeyCompleto(
             'id', n.id, 'tipo', n.tipo, 'etiqueta', n.etiqueta, 'detalle', n.detalle,
             'faseId', n.fase_id, 'orden', n.orden, 'responsable', n.responsable,
             'catalogoId', n.catalogo_id, 'arquetipoId', n.arquetipo_id,
+            -- El estado del arquetipo VIAJA con el nodo: un arquetipo refutado después de
+            -- entrar al grafo tiene que poder verse desde el grafo, que es la promesa de
+            -- referenciarlo en vez de copiarlo. La validación lo reporta.
+            'arquetipoEstado', (select a.estado from arquetipo a
+              where a.id = n.arquetipo_id and a.workspace_id = n.workspace_id),
             'evidencias', coalesce((
               select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo)
                 order by e.titulo)
@@ -416,7 +421,17 @@ export async function journeyCompleto(
             order by sn.congelado_en desc)
           from journey_snapshot sn
           where sn.journey_id = j.id and sn.workspace_id = j.workspace_id
-        ), '[]'::jsonb) as snapshots
+        ), '[]'::jsonb) as snapshots,
+        -- Los arquetipos que este journey puede referenciar salen de SU reto, no de un
+        -- proyecto: un as-is nace antes de que exista proyecto y aun así puede tener
+        -- arquetipos. Los refutados quedan fuera —el guard los rechaza— pero se leen igual
+        -- para que un nodo ya puesto siga mostrando de qué habla.
+        coalesce((
+          select jsonb_agg(jsonb_build_object('id', a.id, 'nombre', a.nombre, 'estado', a.estado)
+            order by a.nombre)
+          from arquetipo a
+          where a.reto_id = j.reto_id and a.workspace_id = j.workspace_id
+        ), '[]'::jsonb) as arquetipos
       from journey j
       join servicio s on s.id = j.servicio_id and s.workspace_id = j.workspace_id
       where j.id = ${journeyId} and j.workspace_id = ${workspaceId}`;
@@ -433,6 +448,7 @@ export async function journeyCompleto(
       nodos: fila.nodos as JourneyCompleto['nodos'],
       aristas: fila.aristas as JourneyCompleto['aristas'],
       snapshots: fila.snapshots as JourneyCompleto['snapshots'],
+      arquetipos: fila.arquetipos as JourneyCompleto['arquetipos'],
     };
   });
 }

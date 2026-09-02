@@ -352,6 +352,9 @@ revoke execute on function journey_nodo_fase_guard() from public;
 -- reescriba el guard.
 create function journey_nodo_identidad_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  arq_nombre text;
+  arq_estado text;
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
@@ -363,12 +366,27 @@ begin
       and c.servicio_id = j.servicio_id and c.tipo = new.tipo) then
     raise exception 'la entrada de catálogo es de otro servicio o de otro tipo';
   end if;
-  if new.arquetipo_id is not null and not exists (
-    select 1 from arquetipo a
+  if new.arquetipo_id is not null then
+    select a.nombre, a.estado into arq_nombre, arq_estado
+    from arquetipo a
     join journey j on j.id = new.journey_id and j.workspace_id = new.workspace_id
     where a.id = new.arquetipo_id and a.workspace_id = new.workspace_id
-      and a.reto_id = j.reto_id) then
-    raise exception 'el arquetipo es de otro reto, o el journey no tiene reto al que anclarlo';
+      and a.reto_id = j.reto_id;
+    if arq_nombre is null then
+      raise exception 'el arquetipo es de otro reto, o el journey no tiene reto al que anclarlo';
+    end if;
+    -- Un arquetipo REFUTADO no entra al grafo. El veredicto de SPEC-04.11 dice que ese
+    -- perfil no describe a nadie: dibujarlo en el journey lo resucitaría como si el
+    -- veredicto no se hubiera dado. Lo que ya estaba puesto se queda —el grafo es
+    -- historia y borrarlo sería reescribirla— y la validación lo reporta.
+    if arq_estado = 'refutado' and (tg_op = 'INSERT' or old.arquetipo_id is distinct from new.arquetipo_id) then
+      raise exception 'el arquetipo está refutado: no puede entrar al journey';
+    end if;
+    -- La etiqueta se DERIVA del arquetipo, no se teclea. Si el curador pudiera escribirla
+    -- libremente, el diagrama, el blueprint y los snapshots congelados mostrarían un
+    -- nombre inventado para un arquetipo curado distinto — que es exactamente la
+    -- identidad que referenciarlo en vez de copiarlo viene a garantizar.
+    new.etiqueta := arq_nombre;
   end if;
   return new;
 end $$;

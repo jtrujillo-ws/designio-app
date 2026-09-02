@@ -23,7 +23,7 @@ import {
   base64ABytes,
   bytesABase64,
   MAX_ARCHIVOS_POR_ITEM,
-  normalizarNombreArchivo,
+  nombreSeguroParaFormato,
   verificarArchivo,
 } from './sanitizacion';
 
@@ -239,31 +239,53 @@ export async function listarEvidencias(
   });
 }
 
+/** Página de la pantalla de derechos. Cada fila es una tarjeta con formulario y adjuntos,
+ * así que la página es más corta que la de la bandeja; lo que importa es que TODA la
+ * evidencia sea alcanzable paginando, no cuántas caben de una vez. */
+export const PAGINA_DERECHOS = 50;
+
 /**
  * Evidencia del workspace con sus DERECHOS vivos y sus adjuntos (pantalla de derechos,
  * RF-03.10). El jsonb de dimensiones guarda lo que el curador declaró al aprobar
  * (snapshot congelado, ADR-0010); lo que bloquea aguas abajo es esta fila, que se
  * concede y se revoca.
+ *
+ * Paginación keyset `(creado_en, id)`, el mismo patrón que `listarBandeja`. No es una
+ * mejora de rendimiento: con un tope duro y sin cursor, la evidencia más antigua de un
+ * workspace con historia quedaba PERMANENTEMENTE fuera de la única pantalla desde la que
+ * se conceden y revocan derechos — y como los derechos nacen `pendiente` (fail-closed),
+ * esa evidencia quedaba también permanentemente incitable e inexportable, sin camino de
+ * reparación en el producto. El cursor viaja como id y su `(creado_en, id)` se resuelve
+ * en la base: serializar el timestamp perdería microsegundos y saltaría o repetiría filas.
  */
 export async function listarEvidenciaConDerechos(
   actorId: string,
   workspaceId: string,
+  antesDe?: string,
 ): Promise<{ evidencias: EvidenciaConDerechos[]; hayMas: boolean }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // El item se trae con subconsulta escalar y no con un join: `item_importacion.evidencia_id`
+    // no es único, y un join que multiplicara filas haría que `limit` contase duplicados y
+    // dejara evidencia real fuera de la página — el mismo daño que el tope duro.
     const filas = await tx`select e.id, e.titulo, e.resumen, e.es_estado_actual, e.creado_en,
         d.estado, d.ambito, d.base, d.vence_en::text as vence_en, d.decidido_en,
-        i.id as item_id,
+        (select i.id from item_importacion i
+          where i.evidencia_id = e.id and i.workspace_id = e.workspace_id
+          order by i.creado_en, i.id limit 1) as item_id,
         evidencia_usable(e.id, e.workspace_id, 'cliente') as citable,
         evidencia_motivo_bloqueo(e.id, e.workspace_id, 'cliente') as motivo
       from evidencia e
       left join derecho_uso d on d.evidencia_id = e.id and d.workspace_id = e.workspace_id
-      left join item_importacion i on i.evidencia_id = e.id and i.workspace_id = e.workspace_id
       where e.workspace_id = ${workspaceId}
+        ${antesDe
+          ? tx`and (e.creado_en, e.id) < (select e2.creado_en, e2.id from evidencia e2
+                where e2.id = ${antesDe} and e2.workspace_id = ${workspaceId})`
+          : tx``}
       order by e.creado_en desc, e.id desc
-      limit ${EVIDENCIAS_PICKER + 1}`;
+      limit ${PAGINA_DERECHOS + 1}`;
 
-    const pagina = filas.slice(0, EVIDENCIAS_PICKER);
+    const pagina = filas.slice(0, PAGINA_DERECHOS);
     const adjuntos = await archivosPorItem(
       tx,
       workspaceId,
@@ -292,7 +314,7 @@ export async function listarEvidenciaConDerechos(
         motivoBloqueo: (f.motivo ?? null) as string | null,
         archivos: f.item_id ? (adjuntos.get(f.item_id as string) ?? []) : [],
       })),
-      hayMas: filas.length > EVIDENCIAS_PICKER,
+      hayMas: filas.length > PAGINA_DERECHOS,
     };
   });
 }
@@ -427,6 +449,12 @@ async function bloquearItem(tx: TransactionSql, itemId: string): Promise<void> {
  * de que exista curaduría) y solo mientras siga PENDIENTE: lo decidido es inmutable
  * (SYS-17). Validación de formato ANTES de tocar la base (RF-09.8): allowlist cerrada +
  * firma mágica — no se confía ni en la extensión ni en el `type` del navegador.
+ *
+ * El nombre se ata además al formato ya verificado: validar bytes y nombre por separado
+ * dejaba pasar un `payload.html` declarado `text/plain` con HTML dentro, que se guardaba
+ * con esa extensión y se descargaba como un fichero ejecutable en el disco de quien lo
+ * abriera. `nombreSeguroParaFormato` garantiza que la extensión FINAL corresponda al
+ * formato que sí se comprobó por bytes.
  */
 export async function adjuntarArchivo(
   actorId: string,
@@ -435,7 +463,7 @@ export async function adjuntarArchivo(
   const bytes = base64ABytes(entrada.contenidoBase64);
   const veredicto = verificarArchivo(bytes, entrada.tipoMime);
   if (!veredicto.ok) throw new ErrorCuraduria(veredicto.motivo);
-  const nombre = normalizarNombreArchivo(entrada.nombre);
+  const nombre = nombreSeguroParaFormato(entrada.nombre, entrada.tipoMime);
 
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);

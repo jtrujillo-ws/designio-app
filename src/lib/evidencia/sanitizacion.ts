@@ -125,6 +125,45 @@ export function normalizarNombreArchivo(nombre: string): string {
   return limpio.length > 0 ? limpio : 'adjunto';
 }
 
+/** Extensión efectiva de un nombre ya normalizado: la ÚLTIMA, que es la que el sistema
+ * operativo mira para decidir con qué se abre el archivo. En `informe.txt.html` es
+ * `.html`, no `.txt`. */
+function extensionFinal(nombre: string): string {
+  const punto = nombre.lastIndexOf('.');
+  return punto > 0 ? nombre.slice(punto).toLowerCase() : '';
+}
+
+/**
+ * Nombre seguro Y COHERENTE con el formato validado (RF-09.8). El nombre y los bytes se
+ * validan por caminos separados —`verificarArchivo` mira los bytes, `normalizarNombreArchivo`
+ * mira el nombre— y esa separación dejaba una rendija: un `.html` declarado `text/plain`
+ * con HTML en UTF-8 pasa AMBAS pruebas (el HTML es texto legítimo: ni controles ni bidi),
+ * y el adjunto quedaba guardado con un nombre EJECUTABLE. El `download` del navegador lo
+ * escribe en disco con ese nombre, y abrirlo desde ahí —origen `file://`, ya fuera del
+ * `application/octet-stream` que protege la descarga— interpreta exactamente el formato que
+ * la allowlist excluye a propósito.
+ *
+ * Se APENDA la extensión canónica del formato, en vez de sustituirla o de rechazar:
+ *  · rechazar no daría seguridad —quien manda bytes HTML solo tendría que llamarlos
+ *    `.txt`— y sí rompería subidas legítimas (`notas.text`, `informe.v2`);
+ *  · sustituir destruiría el nombre que puso quien aportó el material, que es trazabilidad;
+ *  · apendar conserva el nombre íntegro y garantiza que la extensión FINAL —la única que el
+ *    sistema operativo mira— esté en la allowlist del formato que sí se verificó por bytes.
+ * `payload.html` declarado `text/plain` queda `payload.html.txt`: inerte al abrirlo y con el
+ * nombre original a la vista del curador. Es idempotente: aplicarlo dos veces no cambia nada.
+ *
+ * La base repite la regla en un CHECK: la app explica, el esquema garantiza.
+ */
+export function nombreSeguroParaFormato(nombre: string, tipoMime: string): string {
+  const base = normalizarNombreArchivo(nombre);
+  const formato = FORMATOS_PERMITIDOS[tipoMime];
+  // MIME fuera de la allowlist: `verificarArchivo` ya lo rechaza antes de llegar aquí.
+  if (!formato) return base;
+  if (formato.extensiones.includes(extensionFinal(base))) return base;
+  const canonica = formato.extensiones[0]!;
+  return `${base.slice(0, 200 - canonica.length)}${canonica}`;
+}
+
 /**
  * Validación de FORMATO (RF-09.8): el tipo declarado tiene que coincidir con los bytes.
  * Un .pdf que empieza por `PK` no es un PDF; un "texto" con controles no es texto.

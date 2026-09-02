@@ -6,6 +6,7 @@ import {
   bytesABase64,
   base64ABytes,
   bytesDeBase64,
+  nombreSeguroParaFormato,
   normalizarNombreArchivo,
   tipoDeclaradoDeArchivo,
   validarTextoImportado,
@@ -89,6 +90,33 @@ describe('sanitización del material importado', () => {
     expect(normalizarNombreArchivo('   ')).toBe('adjunto');
     expect(normalizarNombreArchivo('informe año.pdf')).toBe('informe año.pdf');
     expect(normalizarNombreArchivo('a'.repeat(400)).length).toBe(200);
+  });
+
+  it('la extensión guardada corresponde al formato verificado, no a la que pidió el cliente', () => {
+    // El agujero: bytes y nombre se validan por caminos separados. HTML en UTF-8 es
+    // texto legítimo —ni controles ni bidi—, así que declarado `text/plain` pasa
+    // `verificarArchivo`, y el sufijo `.html` sobrevivía a la normalización del nombre.
+    // El adjunto quedaba guardado con un nombre EJECUTABLE: la descarga fuerza
+    // octet-stream, pero el fichero acaba en el disco con ese nombre y abrirlo desde ahí
+    // (origen file://) lo interpreta como HTML. La allowlist excluye HTML a propósito.
+    expect(nombreSeguroParaFormato('payload.html', 'text/plain')).toBe('payload.html.txt');
+    expect(nombreSeguroParaFormato('grafico.svg', 'text/plain')).toBe('grafico.svg.txt');
+    // Se apenda, nunca se sustituye: el nombre que puso quien aportó el material es
+    // trazabilidad, y lo que decide cómo se abre el fichero es la extensión FINAL.
+    expect(nombreSeguroParaFormato('informe.v2', 'application/pdf')).toBe('informe.v2.pdf');
+    expect(nombreSeguroParaFormato('sin-extension', 'text/csv')).toBe('sin-extension.csv');
+    expect(nombreSeguroParaFormato('   ', 'application/pdf')).toBe('adjunto.pdf');
+    // Un nombre ya coherente no se toca, y la comparación no distingue mayúsculas ni
+    // se cierra a la única extensión canónica del formato.
+    expect(nombreSeguroParaFormato('informe.pdf', 'application/pdf')).toBe('informe.pdf');
+    expect(nombreSeguroParaFormato('foto.JPEG', 'image/jpeg')).toBe('foto.JPEG');
+    expect(nombreSeguroParaFormato('../../etc/passwd', 'text/plain')).toBe('passwd.txt');
+    // Idempotente: pasarlo dos veces no encadena extensiones.
+    const una = nombreSeguroParaFormato('payload.html', 'text/plain');
+    expect(nombreSeguroParaFormato(una, 'text/plain')).toBe(una);
+    // El CHECK del esquema exige 200 caracteres como máximo, extensión incluida.
+    expect(nombreSeguroParaFormato('a'.repeat(400), 'application/pdf').length).toBe(200);
+    expect(nombreSeguroParaFormato('a'.repeat(400), 'application/pdf').endsWith('.pdf')).toBe(true);
   });
 
   it('la validación de formato mira los BYTES, no la extensión ni el type del navegador', () => {

@@ -61,6 +61,57 @@ function PantallaEvidencia() {
   // RLS es la capa 1: aquí solo se evita ofrecer un control que sería rechazado.
   const puedeDecidir = (ROLES_DERECHOS as readonly string[]).includes(rol);
   const [error, setError] = useState<string | null>(null);
+  // Páginas siguientes cargadas bajo demanda (el loader trae la primera).
+  const [masEvidencias, setMasEvidencias] = useState<EvidenciaConDerechos[]>([]);
+  const [hayMasLocal, setHayMasLocal] = useState<boolean | null>(null);
+
+  // El cursor con el que se pidieron las páginas siguientes es la ÚLTIMA fila de la
+  // primera página. Si el loader se revalida y ese borde cambia —conceder un derecho
+  // invalida la ruta, y también la cambia un workspace distinto o una evidencia nueva—,
+  // lo acumulado colgaba de un cursor que ya no existe y al concatenarlo saltaría o
+  // repetiría filas. Se descarta AQUÍ, durante el render: hacerlo en un efecto pintaría
+  // primero un fotograma con la lista mal empalmada.
+  const borde = datos?.evidencias.at(-1)?.id ?? null;
+  const [bordeVisto, setBordeVisto] = useState(borde);
+  if (bordeVisto !== borde) {
+    setBordeVisto(borde);
+    setMasEvidencias([]);
+    setHayMasLocal(null);
+  }
+
+  const evidencias = datos ? [...datos.evidencias, ...masEvidencias] : [];
+  const hayMas = hayMasLocal ?? datos?.hayMas ?? false;
+  const [cargandoMas, setCargandoMas] = useState(false);
+
+  // Tras una decisión, la acumulación se descarta explícitamente: las páginas ya
+  // cargadas son copias con el estado de derechos VIEJO y el loader solo refresca la
+  // primera. Volver a la página uno es honesto; mostrar «pendiente» sobre un derecho
+  // recién concedido, no.
+  async function refrescar() {
+    setMasEvidencias([]);
+    setHayMasLocal(null);
+    await router.invalidate();
+  }
+
+  async function cargarMas() {
+    if (!datos || evidencias.length === 0) return;
+    setCargandoMas(true);
+    setError(null);
+    try {
+      const ultima = evidencias[evidencias.length - 1]!;
+      const r = await evidenciaConDerechos({
+        data: { workspaceId: datos.workspaceId, antesDe: ultima.id },
+      });
+      if (r) {
+        setMasEvidencias((previas) => [...previas, ...r.evidencias]);
+        setHayMasLocal(r.hayMas);
+      }
+    } catch {
+      setError('No se pudo cargar más evidencia; intenta de nuevo');
+    } finally {
+      setCargandoMas(false);
+    }
+  }
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
@@ -125,21 +176,36 @@ function PantallaEvidencia() {
             )}
 
             <div style={etiqueta}>
-              {datos.evidencias.length === 0
+              {evidencias.length === 0
                 ? 'Todavía no hay evidencia curada'
-                : `${datos.evidencias.length}${datos.hayMas ? '+' : ''} evidencias · ${datos.evidencias.filter((e) => e.citable).length} citables`}
+                : `${evidencias.length}${hayMas ? '+' : ''} evidencias · ${evidencias.filter((e) => e.citable).length} citables`}
             </div>
 
-            {datos.evidencias.map((ev) => (
+            {evidencias.map((ev) => (
               <TarjetaEvidencia
                 key={ev.id}
                 evidencia={ev}
                 workspaceId={datos.workspaceId}
                 puedeDecidir={puedeDecidir}
-                onCambio={() => router.invalidate()}
+                onCambio={refrescar}
                 onError={setError}
               />
             ))}
+
+            {/* Sin esto la evidencia más antigua no tiene camino: sus derechos no se
+                pueden conceder, revocar ni siquiera consultar desde el producto. */}
+            {hayMas && (
+              <div>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={cargandoMas}
+                  onClick={() => void cargarMas()}
+                >
+                  {cargandoMas ? 'Cargando…' : 'Cargar evidencia más antigua'}
+                </Button>
+              </div>
+            )}
           </>
         )}
       </main>

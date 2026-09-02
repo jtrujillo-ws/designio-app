@@ -140,13 +140,15 @@ export const rechazarItemImportacion = createServerFn({ method: 'POST' })
 
 // ── Evidencia con derechos y adjuntos (RF-03.10, RF-03.1) ──
 
-/** Evidencia del workspace con sus derechos VIVOS, su motivo de bloqueo y sus adjuntos. */
+/** Evidencia del workspace con sus derechos VIVOS, su motivo de bloqueo y sus adjuntos.
+ * `antesDe` es el cursor keyset (id de la última fila devuelta): toda la evidencia del
+ * workspace tiene que ser alcanzable desde la pantalla que concede y revoca derechos. */
 export const evidenciaConDerechos = createServerFn({ method: 'GET' })
-  .inputValidator(BandejaInputSchema.pick({ workspaceId: true }))
+  .inputValidator(BandejaInputSchema)
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
     try {
-      const datos = await listarEvidenciaConDerechos(usuarioId, data.workspaceId);
+      const datos = await listarEvidenciaConDerechos(usuarioId, data.workspaceId, data.antesDe);
       return { workspaceId: data.workspaceId, ...datos };
     } catch (e) {
       if (e instanceof ErrorAutorizacion) return null;

@@ -10,7 +10,7 @@ import {
   ErrorInvitacion,
   usuarioConMembresias,
 } from './auth.servicio';
-import { permitirIntento, registrarExito } from './limitador.server';
+import { descontarIntento, permitirIntento, registrarExito } from './limitador.server';
 import { COOKIE_SESION, DURACION_SESION_S, firmarSesion } from './sesion.server';
 
 /** Server functions de auth. Convención dura: este módulo solo exporta server functions. */
@@ -36,8 +36,8 @@ export const iniciarSesion = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     // Fricción anti fuerza bruta (por cuenta y por origen); el email ya viene normalizado.
     const clavePorEmail = `login:email:${data.email}`;
-    const permitido =
-      permitirIntento(clavePorEmail, 10) && permitirIntento(`login:ip:${ipDelRequest()}`, 30);
+    const clavePorIp = `login:ip:${ipDelRequest()}`;
+    const permitido = permitirIntento(clavePorEmail, 10) && permitirIntento(clavePorIp, 30);
     if (!permitido) {
       return { ok: false as const, error: ERROR_LIMITE };
     }
@@ -46,7 +46,11 @@ export const iniciarSesion = createServerFn({ method: 'POST' })
       // Fallo de dominio, no de transporte: mismo mensaje exista o no la cuenta.
       return { ok: false as const, error: 'Correo o contraseña incorrectos' };
     }
+    // El éxito limpia la ventana de la cuenta y se descuenta del cupo de la IP:
+    // una oficina tras un NAT con muchos logins válidos jamás se bloquea, pero un
+    // atacante no puede lavar sus fallos acumulados con un login propio.
     registrarExito(clavePorEmail);
+    descontarIntento(clavePorIp);
     await fijarCookieSesion(usuario.id);
     return { ok: true as const, usuario };
   });
@@ -67,13 +71,16 @@ export const establecerPassword = createServerFn({ method: 'POST' })
   .inputValidator(EstablecerPasswordSchema)
   .handler(async ({ data }) => {
     // El token es aleatorio de 256 bits; el límite aquí evita gasto de CPU (bcrypt) al azar.
-    if (!permitirIntento(`activar:ip:${ipDelRequest()}`, 30)) {
+    const clavePorIp = `activar:ip:${ipDelRequest()}`;
+    if (!permitirIntento(clavePorIp, 30)) {
       return { ok: false as const, error: ERROR_LIMITE };
     }
     const usuario = await activarConToken(data.token, data.password);
     if (!usuario) {
       return { ok: false as const, error: 'La invitación no es válida o ya expiró' };
     }
+    // Las activaciones válidas no consumen cupo (misma lógica que el login).
+    descontarIntento(clavePorIp);
     await fijarCookieSesion(usuario.id);
     return { ok: true as const, usuario };
   });

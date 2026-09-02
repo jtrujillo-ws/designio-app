@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { permitirIntento, registrarExito, reiniciarLimitador } from '@/lib/auth/limitador.server';
+import {
+  descontarIntento,
+  permitirIntento,
+  registrarExito,
+  reiniciarLimitador,
+  tamanoLimitador,
+} from '@/lib/auth/limitador.server';
 
 describe('limitador de intentos (ventana fija en memoria)', () => {
   beforeEach(() => {
@@ -33,5 +39,26 @@ describe('limitador de intentos (ventana fija en memoria)', () => {
     for (let i = 0; i < 3; i++) permitirIntento('k', 3);
     registrarExito('k');
     expect(permitirIntento('k', 3)).toBe(true);
+  });
+
+  it('descontar un intento legítimo no consume cupo, pero no lava los fallos acumulados', () => {
+    // Muchos éxitos seguidos desde una misma IP: nunca se bloquea.
+    for (let i = 0; i < 50; i++) {
+      expect(permitirIntento('ip', 30)).toBe(true);
+      descontarIntento('ip');
+    }
+    // Fallos acumulados + un éxito: el éxito descuenta UNO, no borra la ventana.
+    for (let i = 0; i < 29; i++) permitirIntento('ip2', 30);
+    permitirIntento('ip2', 30); // intento 30 (el "éxito")
+    descontarIntento('ip2'); // queda en 29
+    expect(permitirIntento('ip2', 30)).toBe(true); // 30
+    expect(permitirIntento('ip2', 30)).toBe(false); // 31: bloqueado
+  });
+
+  it('la cota de memoria es dura: el spam de claves únicas expulsa las más viejas', () => {
+    for (let i = 0; i < 10_050; i++) permitirIntento(`clave-${i}`, 3);
+    expect(tamanoLimitador()).toBeLessThanOrEqual(10_000);
+    // Las claves recientes siguen contando normalmente.
+    expect(permitirIntento('clave-10049', 3)).toBe(true);
   });
 });

@@ -6,10 +6,10 @@ import { bytesABase64 } from '@/lib/evidencia/sanitizacion';
 import {
   CATALOGO_EXPORT,
   PRESUPUESTO_ADJUNTOS_BYTES,
-  TABLAS_ENTREGABLE,
   type ArchivoExportado,
   type EvidenciaBloqueada,
   type FilaExportada,
+  type PodaEntregable,
   type ValorJson,
   type Exportacion,
   type Exportar,
@@ -83,12 +83,13 @@ export async function exportarWorkspace(
     const datos: Record<string, FilaExportada[]> = {};
     const conteos: Record<string, number> = {};
 
-    for (const { tabla, orden } of CATALOGO_EXPORT) {
-      // En el entregable solo viaja lo que cuelga de evidencia con derechos.
-      const dependeDeEvidencia = (TABLAS_ENTREGABLE as readonly string[]).includes(tabla);
-      if (entrada.ambito === 'entregable' && !dependeDeEvidencia) continue;
+    for (const { tabla, orden, poda } of CATALOGO_EXPORT) {
+      // En el entregable solo viaja lo que cuelga de evidencia con derechos, y CÓMO se
+      // poda cada tabla lo declara su propia entrada del catálogo (no un switch aparte
+      // que pueda quedarse corto).
+      if (entrada.ambito === 'entregable' && poda.modo === 'fuera') continue;
 
-      const filas = await filasDeTabla(tx, tabla, orden, entrada.workspaceId, filtro);
+      const filas = await filasDeTabla(tx, tabla, orden, entrada.workspaceId, filtro, poda);
       datos[tabla] = filas;
       conteos[tabla] = filas.length;
     }
@@ -166,6 +167,7 @@ async function filasDeTabla(
   orden: string,
   workspaceId: string,
   filtro: FiltroEntregable | null,
+  poda: PodaEntregable,
 ): Promise<FilaExportada[]> {
   const columnas = tabla === 'archivo_importado' ? COLUMNAS_ARCHIVO : '*';
   const filas = (await tx.unsafe(
@@ -173,35 +175,41 @@ async function filasDeTabla(
     [workspaceId],
   )) as unknown as Record<string, unknown>[];
   if (!filtro) return filas.map(normalizarFila);
-  return filas.filter((f) => enElEntregable(tabla, f, filtro)).map(normalizarFila);
+  return filas.filter((f) => enElEntregable(poda, f, filtro)).map(normalizarFila);
 }
 
 const COLUMNAS_ARCHIVO =
   'id, workspace_id, item_id, nombre, tipo_mime, sha256, creado_por, creado_en';
 
 /**
- * Poda del séquito de la evidencia. La evidencia misma ya la filtró la vista; aquí se
- * quitan su fuente, sus vínculos de segmento, sus derechos y sus adjuntos cuando ella no
- * viaja — un entregable que llevara el documento original de algo que no puede citarse
- * sería el mismo agujero por otra puerta.
+ * Poda del séquito de la evidencia, según lo que DECLARA el catálogo. La evidencia misma
+ * ya la filtró la vista; aquí se quitan su fuente, sus vínculos de segmento, sus derechos,
+ * sus adjuntos y todo lo que la cita cuando ella no viaja — un entregable que llevara el
+ * documento original (o el fragmento citado) de algo que no puede citarse sería el mismo
+ * agujero por otra puerta.
+ *
+ * Sin `default`: el `switch` es exhaustivo sobre la unión discriminada, así que añadir un
+ * modo de poda sin darle rama aquí no compila. Antes había un `default: true` y era él
+ * quien dejaba pasar enteras `cita`, `contradiccion` y `arquetipo_evidencia`.
  */
 function enElEntregable(
-  tabla: string,
+  poda: PodaEntregable,
   fila: Record<string, unknown>,
   filtro: FiltroEntregable,
 ): boolean {
-  switch (tabla) {
-    case 'evidencia':
-      return filtro.evidencias.has(fila.id as string);
-    case 'evidencia_segmento':
-    case 'derecho_uso':
-      return filtro.evidencias.has(fila.evidencia_id as string);
-    case 'fuente':
-      return filtro.fuentes.has(fila.id as string);
-    case 'archivo_importado':
-      return filtro.items.has(fila.item_id as string);
-    default:
-      return true;
+  switch (poda.modo) {
+    case 'fuera':
+      return false;
+    case 'porEvidencia':
+      return filtro.evidencias.has(fila[poda.columna] as string);
+    case 'porFuente':
+      return filtro.fuentes.has(fila[poda.columna] as string);
+    case 'porItem':
+      return filtro.items.has(fila[poda.columna] as string);
+    default: {
+      const nunca: never = poda;
+      return nunca;
+    }
   }
 }
 
@@ -219,27 +227,44 @@ function normalizarFila(fila: Record<string, unknown>): FilaExportada {
  * Adjuntos con sus bytes (RF-01.8 «evidencia con sus archivos»). Se incluyen en orden
  * hasta agotar el presupuesto; el resto viaja en el inventario con su sha256 y el motivo
  * de omisión — desaparecer del manifiesto sería justo lo que SYS-04 prohíbe.
+ *
+ * DOS pasadas, y el orden importa: primero los METADATOS (con `octet_length`, que la base
+ * calcula sin materializar el bytea) para decidir qué cabe, y solo después los bytes de lo
+ * seleccionado. Traerlo todo de una vez y recortar en el bucle hacía que el pico de memoria
+ * fuese el tamaño del almacén entero —items ilimitados × 10 adjuntos × 5 MiB— en vez del
+ * presupuesto: una exportación perfectamente autorizada podía tumbar el proceso aunque el
+ * paquete resultante no pasara de 25 MiB. Ahora el pico es O(presupuesto), un tope explícito
+ * que ya está declarado en el manifiesto.
+ *
+ * Las dos consultas comparten transacción pero no snapshot (READ COMMITTED): un adjunto
+ * puede retirarse entre ambas. `archivo_importado` no admite UPDATE (su sha256 es su
+ * identidad), así que el único desenlace posible es que falten los bytes — y entonces la
+ * fila sigue en el inventario con su motivo, nunca desaparece.
  */
 async function archivosDelExport(
   tx: TransactionSql,
   workspaceId: string,
   filtro: FiltroEntregable | null,
 ): Promise<ArchivoExportado[]> {
-  const filas = await tx`
-    select a.id, a.item_id, a.nombre, a.tipo_mime, a.sha256, a.contenido,
+  const metadatos = await tx`
+    select a.id, a.item_id, a.nombre, a.tipo_mime, a.sha256,
            octet_length(a.contenido) as bytes
     from archivo_importado a
     where a.workspace_id = ${workspaceId}
     order by a.creado_en, a.id`;
 
   const salida: ArchivoExportado[] = [];
+  const seleccionados: string[] = [];
   let presupuesto = PRESUPUESTO_ADJUNTOS_BYTES;
-  for (const f of filas) {
+  for (const f of metadatos) {
     if (filtro && !filtro.items.has(f.item_id as string)) continue;
 
     const bytes = f.bytes as number;
     const cabe = bytes <= presupuesto;
-    if (cabe) presupuesto -= bytes;
+    if (cabe) {
+      presupuesto -= bytes;
+      seleccionados.push(f.id as string);
+    }
     salida.push({
       id: f.id as string,
       itemId: f.item_id as string,
@@ -247,11 +272,31 @@ async function archivosDelExport(
       tipoMime: f.tipo_mime as string,
       bytes,
       sha256: f.sha256 as string,
-      contenidoBase64: cabe ? bytesABase64(new Uint8Array(f.contenido as Uint8Array)) : null,
+      contenidoBase64: null,
       omitido: cabe
         ? null
         : `Omitido por presupuesto de adjuntos (${PRESUPUESTO_ADJUNTOS_BYTES / 1024 / 1024} MB por exportación): descárgalo desde la bandeja; su sha256 permite verificarlo`,
     });
+  }
+
+  if (seleccionados.length > 0) {
+    const contenidos = await tx`select id, contenido from archivo_importado
+      where workspace_id = ${workspaceId} and id in ${tx(seleccionados)}`;
+    const porId = new Map(
+      contenidos.map((f) => [
+        f.id as string,
+        bytesABase64(new Uint8Array(f.contenido as Uint8Array)),
+      ]),
+    );
+    for (const archivo of salida) {
+      if (archivo.omitido !== null) continue;
+      const base64 = porId.get(archivo.id);
+      archivo.contenidoBase64 = base64 ?? null;
+      if (base64 === undefined) {
+        archivo.omitido =
+          'El adjunto se retiró de la bandeja mientras se armaba la exportación; su sha256 queda en el inventario';
+      }
+    }
   }
   return salida;
 }

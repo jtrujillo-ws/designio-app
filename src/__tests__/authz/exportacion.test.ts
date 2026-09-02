@@ -30,6 +30,10 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
   let archivoId = '';
 
   const PDF = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37]);
+  /** El fragmento COPIADO en la cita de la evidencia sin derechos: es el texto del
+   * material de terceros, y jamás puede aparecer en un paquete entregable. */
+  const FRAGMENTO_BLOQUEADO = 'me negué a darles la foto de mi cédula';
+  const FRAGMENTO_CITABLE = 'abandono del 62% en el paso de verificación';
   const dimensiones = {
     fecha: '2026-07-15',
     recoleccion: 'Estudio del proveedor',
@@ -122,6 +126,40 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
         dimensiones: { ...dimensiones, consentimiento: false, confianza: 'media' },
       })
     ).evidenciaId;
+
+    // Cadena de razonamiento sobre AMBAS evidencias: es el séquito que el entregable
+    // tiene que podar por derechos. La cita es el caso grave (copia el fragmento del
+    // original), pero contradicción y arquetipo_evidencia delatan la misma evidencia.
+    const [ins] = await admin`insert into insight (workspace_id, titulo, resumen, creado_por)
+      values (${ws}, 'Fricción en verificación', 'Interpretación', ${leadId}) returning id`;
+    const insightId = ins!.id as string;
+    const [afi] = await admin`insert into afirmacion (workspace_id, insight_id, orden, texto)
+      values (${ws}, ${insightId}, 0, 'La verificación expulsa solicitantes') returning id`;
+    for (const [evidenciaId, fragmento] of [
+      [evConDerechos, FRAGMENTO_CITABLE],
+      [evSinDerechos, FRAGMENTO_BLOQUEADO],
+    ] as const) {
+      await admin`insert into cita
+        (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+        values (${ws}, ${afi!.id as string}, ${evidenciaId}, ${fragmento},
+                'p. 4 §2', ${leadId})`;
+      await admin`insert into contradiccion
+        (workspace_id, insight_id, evidencia_id, descripcion, creado_por)
+        values (${ws}, ${insightId}, ${evidenciaId}, 'Matiza el hallazgo', ${leadId})`;
+    }
+
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, ${marca + ' Onboarding'}, ${leadId}) returning id`;
+    const [reto] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+      values (${ws}, ${svc!.id as string}, 'R-70', 'Reto export', 'candidato', 'peticion-cliente', ${leadId})
+      returning id`;
+    const [arq] = await admin`insert into arquetipo (workspace_id, reto_id, nombre, creado_por)
+      values (${ws}, ${reto!.id as string}, 'Solicitante primerizo', ${leadId}) returning id`;
+    for (const evidenciaId of [evConDerechos, evSinDerechos]) {
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${ws}, ${arq!.id as string}, ${evidenciaId})`;
+    }
   });
 
   afterAll(async () => {
@@ -129,11 +167,19 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     const wss = [ws, wsB].filter((id) => id !== '');
     if (wss.length > 0) {
       await admin`delete from evento_dominio where workspace_id in ${admin(wss)}`;
+      await admin`delete from arquetipo_evidencia where workspace_id in ${admin(wss)}`;
+      await admin`delete from arquetipo where workspace_id in ${admin(wss)}`;
+      await admin`delete from cita where workspace_id in ${admin(wss)}`;
+      await admin`delete from contradiccion where workspace_id in ${admin(wss)}`;
+      await admin`delete from afirmacion where workspace_id in ${admin(wss)}`;
+      await admin`delete from insight where workspace_id in ${admin(wss)}`;
       await admin`delete from archivo_importado where workspace_id in ${admin(wss)}`;
       await admin`delete from item_importacion where workspace_id in ${admin(wss)}`;
       await admin`delete from derecho_uso where workspace_id in ${admin(wss)}`;
       await admin`delete from evidencia where workspace_id in ${admin(wss)}`;
       await admin`delete from fuente where workspace_id in ${admin(wss)}`;
+      await admin`delete from reto where workspace_id in ${admin(wss)}`;
+      await admin`delete from servicio where workspace_id in ${admin(wss)}`;
       await admin`delete from segmento where workspace_id in ${admin(wss)}`;
       await admin`delete from miembro where workspace_id in ${admin(wss)}`;
       await admin`delete from workspace where id in ${admin(wss)}`;
@@ -160,6 +206,47 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     expect(catalogo).toEqual(tablas.sort());
   });
 
+  it('toda tabla que apunte a evidencia declara cómo se poda en el entregable', async () => {
+    // La otra mitad del invariante de SYS-04, y la que faltaba: no basta con exportar
+    // toda tabla, hay que saber podarla. Mientras la poda tuvo un `default: true`, una
+    // tabla nueva con `evidencia_id` viajaba ENTERA sin que nada avisara. Aquí se
+    // contrasta la declaración del catálogo con las columnas reales de la base:
+    //  · la columna por la que dice podar tiene que existir (podar por una columna
+    //    inexistente compara contra `undefined` y descarta o deja pasar todo en silencio);
+    //  · y toda tabla con `evidencia_id` o queda FUERA del entregable, o se poda
+    //    exactamente por esa columna. No hay tercera opción.
+    const admin = sqlAdmin();
+    const filas = await admin`select c.table_name, c.column_name
+      from information_schema.columns c
+      join information_schema.tables t
+        on t.table_name = c.table_name and t.table_schema = c.table_schema
+      where c.table_schema = 'public' and t.table_type = 'BASE TABLE'`;
+    const columnasDe = new Map<string, Set<string>>();
+    for (const f of filas) {
+      const tabla = f.table_name as string;
+      const set = columnasDe.get(tabla) ?? new Set<string>();
+      set.add(f.column_name as string);
+      columnasDe.set(tabla, set);
+    }
+
+    const columnaInexistente: string[] = [];
+    const apuntaAEvidenciaSinPodar: string[] = [];
+    for (const { tabla, poda } of CATALOGO_EXPORT) {
+      const columnas = columnasDe.get(tabla) ?? new Set<string>();
+      if (poda.modo !== 'fuera' && !columnas.has(poda.columna)) {
+        columnaInexistente.push(`${tabla}.${poda.columna}`);
+      }
+      if (
+        columnas.has('evidencia_id') &&
+        !(poda.modo === 'fuera' || (poda.modo === 'porEvidencia' && poda.columna === 'evidencia_id'))
+      ) {
+        apuntaAEvidenciaSinPodar.push(tabla);
+      }
+    }
+    expect(columnaInexistente).toEqual([]);
+    expect(apuntaAEvidenciaSinPodar).toEqual([]);
+  });
+
   it('el archivo del propietario lo lleva TODO, incluida la evidencia sin derechos', async () => {
     const admin = sqlAdmin();
     const paquete = await exportarWorkspace(adminClienteId, { workspaceId: ws, ambito: 'archivo' });
@@ -183,12 +270,24 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     expect(paquete.manifiesto.conteos.evento_dominio!).toBeGreaterThan(0);
 
     // Los archivos van con sus bytes y su hash verificable; el dump de la tabla nunca
-    // lleva la columna binaria.
+    // lleva la columna binaria. Los bytes se traen en una segunda pasada, solo para lo
+    // que el presupuesto seleccionó: el tamaño anunciado y el contenido devuelto tienen
+    // que seguir siendo el mismo archivo.
     expect(paquete.archivos).toHaveLength(2);
     const adjunto = paquete.archivos.find((a) => a.id === archivoId)!;
     expect(adjunto.contenidoBase64).toBe(bytesABase64(PDF));
+    expect(adjunto.bytes).toBe(PDF.length);
     expect(adjunto.omitido).toBeNull();
+    expect(paquete.manifiesto.adjuntos.incluidos).toBe(2);
+    expect(paquete.manifiesto.adjuntos.omitidos).toBe(0);
+    expect(paquete.manifiesto.adjuntos.bytesIncluidos).toBe(PDF.length * 2);
     expect(Object.keys(paquete.datos.archivo_importado![0]!)).not.toContain('contenido');
+
+    // El archivo del propietario NO poda por derechos: la cadena de razonamiento entera
+    // viaja, incluida la que cita la evidencia bloqueada.
+    expect(paquete.datos.cita).toHaveLength(2);
+    expect(paquete.datos.contradiccion).toHaveLength(2);
+    expect(paquete.datos.arquetipo_evidencia).toHaveLength(2);
 
     // La ejecución queda registrada en el propio workspace (RF-01.6/01.8).
     const [evento] = await admin`select payload, actor_id, actor_rol from evento_dominio
@@ -218,6 +317,30 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     // El entregable no es el archivo del workspace: no arrastra método ni auditoría.
     expect(paquete.datos.evento_dominio).toBeUndefined();
     expect(paquete.datos.miembro).toBeUndefined();
+  });
+
+  it('lo que CITA la evidencia bloqueada tampoco viaja: ni el fragmento ni el vínculo', async () => {
+    // Quitar la evidencia y dejar su cita es publicar el material por otra puerta: la
+    // cita COPIA el fragmento y su localización exacta para ser legible sin abrir la
+    // evidencia, así que una cita superviviente entrega justo lo que RF-03.10 protege.
+    // Lo mismo, en menor grado, con contradicción y arquetipo_evidencia: revelan que esa
+    // evidencia existe y qué dice de ella el razonamiento.
+    const paquete = await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'entregable' });
+
+    expect(paquete.datos.cita!.map((c) => c.evidencia_id)).toEqual([evConDerechos]);
+    expect(paquete.datos.contradiccion!.map((c) => c.evidencia_id)).toEqual([evConDerechos]);
+    expect(paquete.datos.arquetipo_evidencia!.map((a) => a.evidencia_id)).toEqual([
+      evConDerechos,
+    ]);
+    expect(paquete.manifiesto.conteos.cita).toBe(1);
+
+    // La prueba que de verdad importa: el texto del material sin derechos no está en
+    // NINGUNA parte del paquete, ni siquiera copiado dentro de otra tabla. Su id sí
+    // aparece —en `bloqueadas`, con el motivo—: SYS-14 pide bloquear EXPLICANDO, y lo
+    // que se protege es el contenido, no la existencia de la evidencia.
+    const serializado = JSON.stringify(paquete);
+    expect(serializado).not.toContain(FRAGMENTO_BLOQUEADO);
+    expect(serializado).toContain(FRAGMENTO_CITABLE);
   });
 
   it('la exportación la ejecuta quien administra u opera el workspace, no cualquiera', async () => {

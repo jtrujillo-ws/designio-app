@@ -35,68 +35,115 @@ export const ExportarSchema = z.object({
 export type Exportar = z.infer<typeof ExportarSchema>;
 
 /**
+ * Cómo se poda cada tabla al armar un paquete `entregable`. Es un campo OBLIGATORIO de
+ * cada entrada del catálogo, y esa obligación es la corrección de fondo: mientras la
+ * poda vivía en un `switch` con `default: true`, toda tabla no contemplada viajaba
+ * ENTERA — el estado por omisión era «se exporta todo», que es justo el que no debe
+ * alcanzarse por descuido. Ahora omitir la declaración no compila y el estado por
+ * omisión no existe.
+ *
+ *  · `fuera`        — no viaja en el entregable (el archivo del propietario sí la lleva).
+ *  · `porEvidencia` — la fila cuelga de una evidencia por esa columna (`id` en la propia
+ *    tabla `evidencia`): sale solo si esa evidencia tiene derechos vigentes.
+ *  · `porFuente` / `porItem` — séquito indirecto: la fuente de la que nace la evidencia
+ *    y el material importado cuyos adjuntos son su original.
+ */
+export type PodaEntregable =
+  | { modo: 'fuera' }
+  | { modo: 'porEvidencia'; columna: string }
+  | { modo: 'porFuente'; columna: string }
+  | { modo: 'porItem'; columna: string };
+
+export type EntradaCatalogo = { tabla: string; orden: string; poda: PodaEntregable };
+
+/**
  * Catálogo de objetos del workspace: la lista contra la que se verifica que la
  * exportación es COMPLETA (SYS-04 «checklist de export contra el catálogo de objetos»).
  * Un test estructural compara este catálogo con las tablas que realmente tienen
  * `workspace_id` en la base: si alguien añade una tabla de dominio y no la exporta, el
- * test lo detiene — que es exactamente cómo un invariante deja de ser un deseo.
+ * test lo detiene — que es exactamente cómo un invariante deja de ser un deseo. El mismo
+ * test comprueba la otra mitad: toda tabla real con `evidencia_id` o queda `fuera` del
+ * entregable o se poda EXACTAMENTE por esa columna.
  *
  * `workspace` no aparece aquí porque se filtra por `id`, no por `workspace_id`; se
  * exporta aparte, siempre.
  */
 export const CATALOGO_EXPORT = [
-  { tabla: 'miembro', orden: 'creado_en, id' },
-  { tabla: 'segmento', orden: 'creado_en, id' },
-  { tabla: 'servicio', orden: 'creado_en, id' },
-  { tabla: 'reto', orden: 'creado_en, id' },
-  { tabla: 'reto_servicio_afectado', orden: 'reto_id, servicio_id' },
-  { tabla: 'proyecto', orden: 'creado_en, id' },
-  { tabla: 'criterio_exito', orden: 'creado_en, id' },
-  { tabla: 'etapa_instancia', orden: 'proyecto_id, numero' },
-  { tabla: 'gate_instancia', orden: 'proyecto_id, numero' },
-  { tabla: 'checklist_item', orden: 'gate_id, orden' },
-  { tabla: 'fuente', orden: 'creado_en, id' },
-  { tabla: 'evidencia', orden: 'creado_en, id' },
-  { tabla: 'evidencia_segmento', orden: 'evidencia_id, segmento_id' },
-  { tabla: 'derecho_uso', orden: 'creado_en, id' },
+  { tabla: 'miembro', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'segmento', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'servicio', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'reto', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'reto_servicio_afectado', orden: 'reto_id, servicio_id', poda: { modo: 'fuera' } },
+  { tabla: 'proyecto', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'criterio_exito', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'etapa_instancia', orden: 'proyecto_id, numero', poda: { modo: 'fuera' } },
+  { tabla: 'gate_instancia', orden: 'proyecto_id, numero', poda: { modo: 'fuera' } },
+  // Cita evidencia (`evidencia_id`), pero el entregable no lleva el método: fuera entera.
+  { tabla: 'checklist_item', orden: 'gate_id, orden', poda: { modo: 'fuera' } },
+  { tabla: 'fuente', orden: 'creado_en, id', poda: { modo: 'porFuente', columna: 'id' } },
+  { tabla: 'evidencia', orden: 'creado_en, id', poda: { modo: 'porEvidencia', columna: 'id' } },
+  {
+    tabla: 'evidencia_segmento',
+    orden: 'evidencia_id, segmento_id',
+    poda: { modo: 'porEvidencia', columna: 'evidencia_id' },
+  },
+  {
+    tabla: 'derecho_uso',
+    orden: 'creado_en, id',
+    poda: { modo: 'porEvidencia', columna: 'evidencia_id' },
+  },
   // Cadena de razonamiento (SPEC-03.9 / SPEC-04.9-11): el insight y lo que lo sostiene,
   // las decisiones con su enlace a insights, los arquetipos y las reaperturas. Sin
   // esto, el archivo entregado tendría los gates pero no el porqué de cada decisión.
-  { tabla: 'insight', orden: 'creado_en, id' },
-  { tabla: 'afirmacion', orden: 'insight_id, orden' },
-  { tabla: 'cita', orden: 'creado_en, id' },
-  { tabla: 'contradiccion', orden: 'creado_en, id' },
-  { tabla: 'decision', orden: 'decidido_en, id' },
-  { tabla: 'decision_insight', orden: 'decision_id, insight_id' },
-  { tabla: 'arquetipo', orden: 'creado_en, id' },
-  { tabla: 'arquetipo_segmento', orden: 'arquetipo_id, segmento_id' },
-  { tabla: 'arquetipo_evidencia', orden: 'arquetipo_id, evidencia_id' },
-  { tabla: 'reapertura_etapa', orden: 'reabierto_en, id' },
-  { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id' },
+  { tabla: 'insight', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'afirmacion', orden: 'insight_id, orden', poda: { modo: 'fuera' } },
+  // `cita` copia el `fragmento` y la `localizacion` del original para que la lista sea
+  // legible sin abrir cada evidencia: es la tabla del catálogo que MÁS material de
+  // terceros lleva dentro. Si su evidencia no viaja, la cita tampoco — de lo contrario
+  // el entregable publicaría el fragmento de un material sin derechos vigentes.
+  {
+    tabla: 'cita',
+    orden: 'creado_en, id',
+    poda: { modo: 'porEvidencia', columna: 'evidencia_id' },
+  },
+  {
+    tabla: 'contradiccion',
+    orden: 'creado_en, id',
+    poda: { modo: 'porEvidencia', columna: 'evidencia_id' },
+  },
+  { tabla: 'decision', orden: 'decidido_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'decision_insight', orden: 'decision_id, insight_id', poda: { modo: 'fuera' } },
+  { tabla: 'arquetipo', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'arquetipo_segmento', orden: 'arquetipo_id, segmento_id', poda: { modo: 'fuera' } },
+  {
+    tabla: 'arquetipo_evidencia',
+    orden: 'arquetipo_id, evidencia_id',
+    poda: { modo: 'porEvidencia', columna: 'evidencia_id' },
+  },
+  { tabla: 'reapertura_etapa', orden: 'reabierto_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id', poda: { modo: 'fuera' } },
   // Portal (SPEC-01.5): la conversación con el cliente es parte de lo que se le entrega.
-  { tabla: 'hilo_comentario', orden: 'creado_en, id' },
-  { tabla: 'comentario', orden: 'creado_en, id' },
-  { tabla: 'item_importacion', orden: 'creado_en, id' },
+  // Un hilo puede colgar de una evidencia, pero el entregable no lleva la conversación:
+  // fuera entera (y por eso `comentario`, que cuelga del hilo, también).
+  { tabla: 'hilo_comentario', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'comentario', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'item_importacion', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   // Los bytes NO salen por esta vía: archivo_importado se exporta aparte, sin la
   // columna `contenido` y con el binario en base64 sujeto al presupuesto de adjuntos.
-  { tabla: 'archivo_importado', orden: 'creado_en, id' },
-  { tabla: 'evento_dominio', orden: 'creado_en, id' },
-] as const;
+  {
+    tabla: 'archivo_importado',
+    orden: 'creado_en, id',
+    poda: { modo: 'porItem', columna: 'item_id' },
+  },
+  { tabla: 'evento_dominio', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+] as const satisfies readonly EntradaCatalogo[];
 
-/** Tablas del catálogo cuyo contenido depende de una evidencia concreta: en el ámbito
- * `entregable` solo salen las filas de la evidencia con derechos vigentes. */
-export const TABLAS_ENTREGABLE = [
-  'fuente',
-  'evidencia',
-  'evidencia_segmento',
-  'derecho_uso',
-  'archivo_importado',
-  // Citan evidencia por id: si la evidencia no sale, su cita tampoco — de lo contrario
-  // el entregable llevaría el fragmento citado de un material sin derechos.
-  'cita',
-  'contradiccion',
-  'arquetipo_evidencia',
-] as const;
+/** Tablas que viajan en un paquete `entregable`. DERIVADA del catálogo, no una lista
+ * paralela: cuando eran dos listas independientes podían discrepar — y discrepaban
+ * (`cita` figuraba aquí sin que la poda supiera podarla, así que salía entera). */
+export const TABLAS_ENTREGABLE: readonly string[] = CATALOGO_EXPORT.filter(
+  (c) => c.poda.modo !== 'fuera',
+).map((c) => c.tabla);
 
 /** 25 MiB de binarios por exportación: el paquete se arma en memoria y viaja como una
  * sola respuesta JSON. Pasado el tope, el archivo sale en el manifiesto con su sha256 y

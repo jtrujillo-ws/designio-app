@@ -95,10 +95,14 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
 }
 
 /** Segundo workspace de Lucía (demo del selector multi-membresía): mínimo pero real —
- * un servicio, sin retos aún. Idempotente por nombre. */
-async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Promise<void> {
-  const existe = await tx`select 1 from workspace where nombre = 'Clínica del Valle'`;
-  if (existe.length > 0) return;
+ * un servicio, sin retos aún. Idempotente por MEMBRESÍA de Lucía + nombre: el nombre
+ * de workspace no es único y uno homónimo ajeno no debe saltarse el seed. Devuelve si
+ * lo creó en esta corrida. */
+async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Promise<boolean> {
+  const existe = await tx`select 1 from workspace w
+    join miembro m on m.workspace_id = w.id
+    where w.nombre = 'Clínica del Valle' and m.usuario_id = ${luciaId}`;
+  if (existe.length > 0) return false;
   const [ws2] = await tx`insert into workspace (nombre) values ('Clínica del Valle') returning id`;
   const ws2Id = ws2!.id as string;
   await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
@@ -107,6 +111,7 @@ async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Pro
     values (${ws2Id}, 'Agendamiento de citas', 'Reserva y confirmación de citas médicas', ${luciaId})`;
   await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
     (${ws2Id}, 'WorkspaceCreado', ${tx.json({ nombre: 'Clínica del Valle', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
+  return true;
 }
 
 async function main() {
@@ -139,14 +144,11 @@ async function main() {
       await sql.begin((tx) => sembrarMetodo(tx, wsId, lucia.id as string));
       metodoSembrado = true;
     }
-    // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía.
+    // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía
+    // (la función se auto-guarda por membresía+nombre, sin chequeo duplicado aquí).
     let segundoSembrado = false;
     if (lucia) {
-      const [ws2] = await sql`select 1 from workspace where nombre = 'Clínica del Valle'`;
-      if (!ws2) {
-        await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
-        segundoSembrado = true;
-      }
+      segundoSembrado = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
     }
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +

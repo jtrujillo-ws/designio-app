@@ -2,7 +2,8 @@
  * Workspace activo de la navegación (multi-membresía): el parámetro de búsqueda `ws`
  * elige entre las membresías del usuario, viaja pegado a toda la navegación interna
  * (retainSearchParams en el layout autenticado) y es deep-linkeable; si falta o no
- * corresponde a una membresía del usuario, se cae a la primera (orden por nombre).
+ * corresponde a una membresía del usuario, se cae a la PRIMERA del arreglo recibido
+ * (esta función no ordena: usuarioConMembresias las entrega ordenadas por nombre).
  *
  * Solo informa NAVEGACIÓN: cada server function re-valida el workspaceId recibido
  * contra la membresía real vía RLS — un `ws` forjado solo produce pantallas vacías.

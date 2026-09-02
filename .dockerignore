@@ -1,0 +1,14 @@
+.git
+node_modules
+dist
+.output
+.vite
+.tanstack
+coverage
+*.log
+.env
+.env.local
+.env.*.local
+docs
+.claude
+.github

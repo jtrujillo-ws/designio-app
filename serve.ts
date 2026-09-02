@@ -1,7 +1,8 @@
 /**
- * Servidor de producción (Bun.serve, puerto 8080 — contrato de Cloud Run):
- * 1) estáticos desde dist/client (assets con caché inmutable);
- * 2) todo lo demás va al worker SSR exportado por dist/server/server.js.
+ * Servidor de producción (Bun.serve; respeta el PORT que inyecta la plataforma — Railway):
+ * 1) /healthz para el healthcheck de despliegue;
+ * 2) estáticos desde dist/client (assets con caché inmutable);
+ * 3) todo lo demás va al worker SSR exportado por dist/server/server.js.
  * Las migraciones se aplican en el entrypoint del contenedor, antes de arrancar esto.
  */
 import { join, sep } from 'node:path';
@@ -18,6 +19,9 @@ Bun.serve({
   port,
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === '/healthz') {
+      return new Response('ok', { headers: { 'content-type': 'text/plain' } });
+    }
     if (url.pathname.startsWith('/assets/') || url.pathname === '/favicon.ico') {
       // join() normaliza `..`: se verifica que la ruta resuelta siga DENTRO de dist/client
       // (anti path-traversal); cualquier escape cae al SSR como una ruta más.

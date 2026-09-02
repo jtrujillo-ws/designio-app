@@ -8,7 +8,7 @@ Plataforma B2B AI-native de service design para el contexto de una boutique: sis
 
 ## Stack
 
-Bun · TypeScript estricto · TanStack Start (SSR + server functions) · React 19 · Tailwind v4 + tokens propios · Zod · PostgreSQL con **RLS activo desde el día 1** (cliente `postgres`, sin ORM) · despliegue en Google Cloud Run. Detalle completo en [`docs/06-diseno-tecnico/`](docs/06-diseno-tecnico/diseno-tecnico.md).
+Bun · TypeScript estricto · TanStack Start (SSR + server functions) · React 19 · Tailwind v4 + tokens propios · Zod · PostgreSQL con **RLS activo desde el día 1** (cliente `postgres`, sin ORM) · despliegue en Railway. Detalle completo en [`docs/06-diseno-tecnico/`](docs/06-diseno-tecnico/diseno-tecnico.md).
 
 ## Desarrollo local
 
@@ -29,4 +29,4 @@ La suite de autorización (`src/__tests__/authz/`) corre contra el Postgres real
 
 ## Flujo de ramas
 
-Promoción lineal `agents → dev → stg → main`; las features nacen en ramas `claude/<topic>-<short-id>` desde `agents` y entran por squash-merge. Cada push a rama de ambiente despliega ese ambiente (Cloud Build, repo de IaC).
+Promoción lineal `agents → dev → stg → main`; las features nacen en ramas `claude/<topic>-<short-id>` desde `agents` y entran por squash-merge. Cada push a rama de ambiente despliega ese ambiente (Railway: un environment por rama; runbook en `docs/06-diseno-tecnico/despliegue-railway.md`).

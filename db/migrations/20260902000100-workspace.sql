@@ -85,4 +85,9 @@ grant usage on schema public to designio_app;
 grant select on workspace, miembro to designio_app;
 grant select, insert, update, delete on segmento to designio_app;
 grant select, insert on evento_dominio to designio_app;
+
+-- Postgres otorga EXECUTE a PUBLIC por defecto sobre funciones nuevas: se revoca
+-- explícitamente para que ningún otro rol de la instancia invoque helpers que
+-- consultan por encima de RLS; solo el rol de aplicación los ejecuta.
+revoke execute on function app_user_id(), is_workspace_member(uuid, uuid), workspace_role(uuid, uuid) from public;
 grant execute on function app_user_id(), is_workspace_member(uuid, uuid), workspace_role(uuid, uuid) to designio_app;

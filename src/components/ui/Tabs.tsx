@@ -2,19 +2,29 @@ export function Tabs({
   items,
   value,
   onChange,
+  label,
 }: {
   items: string[];
   value: string;
   onChange?: (item: string) => void;
+  /** Nombre accesible del tablist. */
+  label?: string;
 }) {
   return (
-    <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border)' }}>
+    <div
+      role="tablist"
+      aria-label={label}
+      style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border)' }}
+    >
       {items.map((it) => {
         const act = it === value;
         return (
           <button
             key={it}
             type="button"
+            role="tab"
+            aria-selected={act}
+            tabIndex={act ? 0 : -1}
             onClick={() => onChange?.(it)}
             style={{
               fontFamily: 'var(--font-sans)',

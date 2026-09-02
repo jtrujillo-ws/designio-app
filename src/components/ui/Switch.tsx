@@ -5,7 +5,8 @@ export function Switch({
 }: {
   on?: boolean;
   onChange?: (on: boolean) => void;
-  label?: string;
+  /** Nombre accesible obligatorio: el switch no renderiza texto visible propio. */
+  label: string;
 }) {
   return (
     <button

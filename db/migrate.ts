@@ -12,7 +12,6 @@ import postgres from 'postgres';
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error('Falta DATABASE_URL (conexión admin; ver .env.local.example)');
 
-const appPassword = process.env.APP_DB_PASSWORD ?? 'designio_app_dev';
 const sql = postgres(url, { max: 1, onnotice: () => {} });
 
 const MIGRATIONS_DIR = join(import.meta.dir, 'migrations');
@@ -24,8 +23,20 @@ async function main() {
   )`;
 
   // Bootstrap del rol de aplicación (no privilegiado): las migraciones le otorgan permisos.
+  // El default de desarrollo JAMÁS aplica en producción: sin APP_DB_PASSWORD ahí, se aborta
+  // (el Dockerfile fija NODE_ENV=production; en nube el secret viene de Secret Manager).
   const [rol] = await sql`select 1 from pg_roles where rolname = 'designio_app'`;
   if (!rol) {
+    let appPassword = process.env.APP_DB_PASSWORD;
+    if (!appPassword) {
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error(
+          'Falta APP_DB_PASSWORD: en producción el rol designio_app no puede crearse con la credencial de desarrollo',
+        );
+      }
+      console.warn('APP_DB_PASSWORD no definido: usando la credencial de DESARROLLO para designio_app');
+      appPassword = 'designio_app_dev';
+    }
     await sql.unsafe(`create role designio_app login password '${appPassword.replaceAll("'", "''")}'`);
     console.log('rol designio_app creado (no privilegiado)');
   }

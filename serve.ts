@@ -4,7 +4,7 @@
  * 2) todo lo demás va al worker SSR exportado por dist/server/server.js.
  * Las migraciones se aplican en el entrypoint del contenedor, antes de arrancar esto.
  */
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 
 const CLIENT_DIR = join(import.meta.dir, 'dist', 'client');
 const SERVER_ENTRY = join(import.meta.dir, 'dist', 'server', 'server.js');
@@ -19,7 +19,13 @@ Bun.serve({
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/assets/') || url.pathname === '/favicon.ico') {
-      const file = Bun.file(join(CLIENT_DIR, url.pathname));
+      // join() normaliza `..`: se verifica que la ruta resuelta siga DENTRO de dist/client
+      // (anti path-traversal); cualquier escape cae al SSR como una ruta más.
+      const rutaEstatica = join(CLIENT_DIR, url.pathname);
+      if (!rutaEstatica.startsWith(CLIENT_DIR + sep)) {
+        return ssr.fetch(request);
+      }
+      const file = Bun.file(rutaEstatica);
       if (await file.exists()) {
         const headers = url.pathname.startsWith('/assets/')
           ? { 'cache-control': 'public, max-age=31536000, immutable' }

@@ -1,3 +1,4 @@
+import type { CSSProperties } from 'react';
 import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
 import { Input } from '@/components/ui/Input';
@@ -17,7 +18,7 @@ const TABS = [
   'Importación',
 ];
 
-const micro: React.CSSProperties = {
+const micro: CSSProperties = {
   fontFamily: 'var(--font-mono)',
   fontWeight: 500,
   fontSize: 11,
@@ -36,7 +37,7 @@ export function LoopScreen() {
             Banco Andino / Servicios / <span style={{ color: 'var(--ink)' }}>Apertura de cuenta nómina digital</span>
           </div>
           <div style={{ margin: '16px 0 24px' }}>
-            <Tabs items={TABS} value="Loop J1–J7" />
+            <Tabs items={TABS} value="Loop J1–J7" label="Vistas del servicio" />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 6 }}>
             <h1 style={{ font: '800 30px/1.12 var(--font-sans)', margin: 0 }}>
@@ -161,7 +162,7 @@ function Topbar() {
 }
 
 function Sidebar() {
-  const item: React.CSSProperties = {
+  const item: CSSProperties = {
     font: '500 13px var(--font-sans)',
     color: 'var(--text-body)',
     padding: '7px 10px',

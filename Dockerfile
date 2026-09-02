@@ -1,5 +1,6 @@
 FROM oven/bun:1.3.11-alpine
 
+ENV NODE_ENV=production
 WORKDIR /app
 
 COPY package.json bun.lock bunfig.toml ./

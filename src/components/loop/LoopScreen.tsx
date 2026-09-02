@@ -279,11 +279,16 @@ function Sidebar({ arbol }: { arbol: ArbolWorkspace | null }) {
                 )}
               </div>
               {reto.proyectos.map((proyecto) => (
-                <div key={proyecto.id} style={{ ...filaArbol, paddingLeft: 46 }}>
+                <Link
+                  key={proyecto.id}
+                  to="/proyecto/$proyectoId"
+                  params={{ proyectoId: proyecto.id }}
+                  style={{ ...filaArbol, paddingLeft: 46, textDecoration: 'none' }}
+                >
                   <span style={truncado}>
                     {proyecto.codigo} {proyecto.titulo}
                   </span>
-                </div>
+                </Link>
               ))}
             </div>
           ))}

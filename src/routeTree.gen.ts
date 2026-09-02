@@ -16,6 +16,7 @@ import { Route as AutenticadaAppRouteImport } from './routes/_autenticada/app'
 import { Route as AutenticadaImportacionRouteImport } from './routes/_autenticada/importacion'
 import { Route as AutenticadaPersonasRouteImport } from './routes/_autenticada/personas'
 import { Route as InvitacionTokenRouteImport } from './routes/invitacion.$token'
+import { Route as AutenticadaProyectoProyectoIdRouteImport } from './routes/_autenticada/proyecto.$proyectoId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -51,6 +52,12 @@ const InvitacionTokenRoute = InvitacionTokenRouteImport.update({
   path: '/invitacion/$token',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AutenticadaProyectoProyectoIdRoute =
+  AutenticadaProyectoProyectoIdRouteImport.update({
+    id: '/proyecto/$proyectoId',
+    path: '/proyecto/$proyectoId',
+    getParentRoute: () => AutenticadaRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -59,6 +66,7 @@ export interface FileRoutesByFullPath {
   '/importacion': typeof AutenticadaImportacionRoute
   '/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
+  '/proyecto/$proyectoId': typeof AutenticadaProyectoProyectoIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -67,6 +75,7 @@ export interface FileRoutesByTo {
   '/importacion': typeof AutenticadaImportacionRoute
   '/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
+  '/proyecto/$proyectoId': typeof AutenticadaProyectoProyectoIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -77,6 +86,7 @@ export interface FileRoutesById {
   '/_autenticada/importacion': typeof AutenticadaImportacionRoute
   '/_autenticada/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
+  '/_autenticada/proyecto/$proyectoId': typeof AutenticadaProyectoProyectoIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -87,6 +97,7 @@ export interface FileRouteTypes {
     | '/importacion'
     | '/personas'
     | '/invitacion/$token'
+    | '/proyecto/$proyectoId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -95,6 +106,7 @@ export interface FileRouteTypes {
     | '/importacion'
     | '/personas'
     | '/invitacion/$token'
+    | '/proyecto/$proyectoId'
   id:
     | '__root__'
     | '/'
@@ -104,6 +116,7 @@ export interface FileRouteTypes {
     | '/_autenticada/importacion'
     | '/_autenticada/personas'
     | '/invitacion/$token'
+    | '/_autenticada/proyecto/$proyectoId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -164,6 +177,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof InvitacionTokenRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/_autenticada/proyecto/$proyectoId': {
+      id: '/_autenticada/proyecto/$proyectoId'
+      path: '/proyecto/$proyectoId'
+      fullPath: '/proyecto/$proyectoId'
+      preLoaderRoute: typeof AutenticadaProyectoProyectoIdRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
   }
 }
 
@@ -171,12 +191,14 @@ interface AutenticadaRouteChildren {
   AutenticadaAppRoute: typeof AutenticadaAppRoute
   AutenticadaImportacionRoute: typeof AutenticadaImportacionRoute
   AutenticadaPersonasRoute: typeof AutenticadaPersonasRoute
+  AutenticadaProyectoProyectoIdRoute: typeof AutenticadaProyectoProyectoIdRoute
 }
 
 const AutenticadaRouteChildren: AutenticadaRouteChildren = {
   AutenticadaAppRoute: AutenticadaAppRoute,
   AutenticadaImportacionRoute: AutenticadaImportacionRoute,
   AutenticadaPersonasRoute: AutenticadaPersonasRoute,
+  AutenticadaProyectoProyectoIdRoute: AutenticadaProyectoProyectoIdRoute,
 }
 
 const AutenticadaRouteWithChildren = AutenticadaRoute._addFileChildren(

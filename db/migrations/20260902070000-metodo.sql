@@ -255,7 +255,10 @@ create policy checklist_update on checklist_item
         and g.workspace_id = checklist_item.workspace_id
         and g.estado = 'pendiente')
     and (
-      workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+      -- Un ítem ya en N/A es decisión del rol aprobador del gate: un curador no la
+      -- deshace — solo ese rol puede tocarlo (p.ej. revertirlo a pendiente).
+      (checklist_item.estado <> 'na'
+        and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'))
       or exists (select 1 from gate_instancia g2
         where g2.id = checklist_item.gate_id
           and g2.workspace_id = checklist_item.workspace_id
@@ -263,8 +266,16 @@ create policy checklist_update on checklist_item
     )
   )
   with check (
-    (estado in ('pendiente', 'cumplido')
+    (estado = 'cumplido'
       and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador'))
+    -- pendiente lo ponen curadores (revertir un cumplido) o el rol aprobador del gate
+    -- (revertir su propio N/A; sin esta rama un N/A de sponsor sería irreversible).
+    or (estado = 'pendiente'
+      and (workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+        or exists (select 1 from gate_instancia g3
+          where g3.id = checklist_item.gate_id
+            and g3.workspace_id = checklist_item.workspace_id
+            and workspace_role(app_user_id(), workspace_id) = g3.rol_aprobador)))
     or (estado = 'na'
       and na_aprobado_por = app_user_id()
       and exists (select 1 from gate_instancia g

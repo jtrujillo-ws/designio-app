@@ -285,6 +285,29 @@ describeAuthz('método: etapas, gates y checklists', () => {
       }),
     ).rejects.toThrow(/Solo el rol aprobador/);
 
+    // Un N/A decidido por el sponsor queda sellado para curadores: el lead no lo
+    // devuelve a pendiente (USING: un ítem en na solo lo alcanza el rol aprobador)…
+    await marcarItem(sponsorId, {
+      workspaceId: ws,
+      itemId: g3.items[0]!.id,
+      accion: { tipo: 'na', justificacion: 'Decidido por el sponsor' },
+    });
+    await expect(
+      marcarItem(leadId, {
+        workspaceId: ws,
+        itemId: g3.items[0]!.id,
+        accion: { tipo: 'pendiente' },
+      }),
+    ).rejects.toThrow(/no puedes marcarlo/);
+    // …pero el propio aprobador sí puede revertir su decisión.
+    await marcarItem(sponsorId, {
+      workspaceId: ws,
+      itemId: g3.items[0]!.id,
+      accion: { tipo: 'pendiente' },
+    });
+    const trasRevertir = await proyectoMetodo(leadId, ws, proyectoId);
+    expect(trasRevertir!.gates[3]!.items[0]!.estado).toBe('pendiente');
+
     // El stakeholder no marca nada (política de curadores).
     await expect(
       marcarItem(stakeId, {

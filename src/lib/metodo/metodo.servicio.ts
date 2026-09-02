@@ -169,7 +169,8 @@ export async function activarReto(
 
 /** Marca un ítem del checklist (RF-04.6): cumplido con evidencia real, pendiente, o N/A
  * (la política exige que quien lo marca TENGA el rol aprobador del gate y quede como su
- * aprobador). Un gate aprobado congela su checklist (la política de UPDATE no lo alcanza). */
+ * aprobador). Un ítem ya en N/A solo lo revierte ese mismo rol — un curador no deshace la
+ * decisión. Un gate aprobado congela su checklist (la política de UPDATE no lo alcanza). */
 export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);

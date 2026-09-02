@@ -285,7 +285,7 @@ function ItemChecklist({
   evidencias: { id: string; titulo: string }[];
   hayMasEvidencias: boolean;
   editable: boolean;
-  /** Cumplido/pendiente: curadores (lead/diseñador). N/A: el rol aprobador del gate. */
+  /** Cumplido/pendiente: curadores (lead/diseñador). N/A —y revertirlo— : el rol aprobador del gate. */
   puedeCurar: boolean;
   puedeNa: boolean;
   onCambio: () => Promise<void>;
@@ -350,7 +350,7 @@ function ItemChecklist({
           )}
         </div>
       )}
-      {editable && item.estado !== 'pendiente' && puedeCurar && (
+      {editable && item.estado !== 'pendiente' && (item.estado === 'na' ? puedeNa : puedeCurar || puedeNa) && (
         <div>
           <Button size="sm" variant="ghost" disabled={ocupado} onClick={() => void marcar({ tipo: 'pendiente' })}>
             Volver a pendiente

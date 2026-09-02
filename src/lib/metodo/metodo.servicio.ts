@@ -74,6 +74,9 @@ export async function agregarCriterio(
 ): Promise<{ criterioId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // Serializa contra la decisión de G0: sin el candado, este insert y una aprobación
+    // concurrente podrían commitear juntos y congelar un criterio incompleto.
+    await bloquearReto(tx, entrada.retoId);
     const [fila] = await tx`
       with quien as (
         select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
@@ -177,6 +180,15 @@ async function bloquearGate(tx: TransactionSql, gateId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(hashtextextended('designio:gate:' || ${gateId}, 42))`;
 }
 
+/** Candado por reto: los criterios se congelan cuando CUALQUIER G0 del reto se aprueba,
+ * así que mutar criterios y decidir un G0 deben serializarse a nivel de reto (misma
+ * carrera de snapshots que marcar↔aprobar). Toda operación que tome ambos candados los
+ * toma en este orden — reto y DESPUÉS gate — y cualquier servicio futuro que edite
+ * criterios debe tomar este candado antes de su sentencia decisora. */
+async function bloquearReto(tx: TransactionSql, retoId: string): Promise<void> {
+  await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+}
+
 /** Marca un ítem del checklist (RF-04.6): cumplido con evidencia real, pendiente, o N/A
  * (la política exige que quien lo marca TENGA el rol aprobador del gate y quede como su
  * aprobador). Un ítem ya en N/A solo lo revierte ese mismo rol — un curador no deshace la
@@ -258,9 +270,10 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
 
 /**
  * Aprobar un gate (RF-04.7): la MISMA sentencia exige rol aprobador (política), checklist
- * sin pendientes y — para G0 — criterios presentes y completos (ventana + línea base con
- * valor y fecha, o plan — SYS-22). 0 filas = bloqueado; el diagnóstico posterior lista
- * qué faltó. El candado del gate serializa esta decisión contra marcarItem.
+ * sin pendientes y — para G0 — criterios presentes y completos (definición, objetivo,
+ * ventana y línea base con valor y fecha, o plan — SYS-22). 0 filas = bloqueado; el
+ * diagnóstico posterior lista qué faltó. Los candados de reto y gate (en ese orden) serializan esta decisión contra
+ * agregarCriterio y marcarItem.
  */
 export async function aprobarGate(
   actorId: string,
@@ -268,6 +281,15 @@ export async function aprobarGate(
 ): Promise<{ numero: number }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // proyecto_id y reto_id son inmutables: leerlos antes del candado no abre carrera.
+    const [pertenece] = await tx`
+      select p.reto_id from gate_instancia g
+      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+      where g.id = ${entrada.gateId} and g.workspace_id = ${entrada.workspaceId}`;
+    if (!pertenece) {
+      throw new ErrorMetodo(await diagnosticoDeGate(tx, entrada.workspaceId, entrada.gateId));
+    }
+    await bloquearReto(tx, pertenece.reto_id as string);
     await bloquearGate(tx, entrada.gateId);
 
     const aprobado = await tx`
@@ -287,6 +309,7 @@ export async function aprobarGate(
           join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
           where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
             and (c.ventana_dias is null
+                 or c.definicion = '' or c.objetivo = ''
                  or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
                      and c.linea_base_plan = ''))))
       returning g.numero, g.proyecto_id, workspace_role(${actorId}, g.workspace_id) as rol`;
@@ -341,23 +364,33 @@ async function diagnosticoDeGate(
   }
 
   if ((gate.numero as number) === 0) {
-    // Línea base REGISTRADA = valor + fecha (sin fecha no hay punto de partida temporal
-    // para la ventana de medición); si falta cualquiera de los dos, cuenta solo el plan.
+    // Criterio completo (SYS-22) = definición + objetivo + ventana + línea base
+    // REGISTRADA (valor Y fecha: sin fecha no hay punto de partida temporal) o plan.
     const incompletos = await tx`
       select c.kpi, (c.ventana_dias is null) as sin_ventana,
+             (c.definicion = '') as sin_definicion,
+             (c.objetivo = '') as sin_objetivo,
              ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
               and c.linea_base_plan = '') as sin_base
       from criterio_exito c
       join proyecto p on p.id = ${gate.proyecto_id as string} and p.workspace_id = ${workspaceId}
       where c.reto_id = p.reto_id and c.workspace_id = ${workspaceId}
         and (c.ventana_dias is null
+             or c.definicion = '' or c.objetivo = ''
              or ((nullif(c.linea_base_valor, '') is null or c.linea_base_fecha is null)
                  and c.linea_base_plan = ''))`;
     if (incompletos.length > 0) {
       const lista = incompletos
         .map(
           (c) =>
-            `«${c.kpi as string}» (${[c.sin_ventana ? 'sin ventana' : null, c.sin_base ? 'sin línea base completa (valor y fecha) ni plan' : null].filter(Boolean).join(' y ')})`,
+            `«${c.kpi as string}» (${[
+              c.sin_definicion ? 'sin definición' : null,
+              c.sin_objetivo ? 'sin objetivo' : null,
+              c.sin_ventana ? 'sin ventana' : null,
+              c.sin_base ? 'sin línea base completa (valor y fecha) ni plan' : null,
+            ]
+              .filter(Boolean)
+              .join(' y ')})`,
         )
         .join(', ');
       return `G0 exige criterios completos (SYS-22): ${lista}`;

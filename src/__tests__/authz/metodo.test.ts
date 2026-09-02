@@ -31,7 +31,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
 
   const criterioBase = {
     kpi: 'Abandono',
-    definicion: '',
+    definicion: 'Porcentaje que inicia la verificación y no la completa',
     lineaBaseValor: '62%' as string | null,
     lineaBaseFecha: '2026-07-15' as string | null,
     lineaBasePlan: '',
@@ -211,6 +211,13 @@ describeAuthz('método: etapas, gates y checklists', () => {
 
     const admin = sqlAdmin();
     await admin`update criterio_exito set ventana_dias = 90 where workspace_id = ${ws} and reto_id = ${retoId}`;
+
+    // Sin objetivo no hay contra qué medir el éxito: el post-mortem quedaría sin vara.
+    await admin`update criterio_exito set objetivo = '' where workspace_id = ${ws} and reto_id = ${retoId}`;
+    await expect(aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id })).rejects.toThrow(
+      /sin objetivo/,
+    );
+    await admin`update criterio_exito set objetivo = '40%' where workspace_id = ${ws} and reto_id = ${retoId}`;
 
     // Valor sin fecha NO es línea base registrada: sin el punto de partida temporal la
     // ventana de medición no ancla — y aquí tampoco hay plan que lo supla.

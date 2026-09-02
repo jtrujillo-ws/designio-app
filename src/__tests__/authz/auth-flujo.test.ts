@@ -87,6 +87,21 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     expect(await autenticar(`${marca}-nadie@test.demo`, PASSWORD_LEAD)).toBeNull();
   });
 
+  it('el login compara la password en bytes exactos: tras el byte 72 un sufijo no autentica', async () => {
+    const email72 = `${marca}-borde72@test.demo`;
+    const pass72 = 'a'.repeat(72);
+    const admin = sqlAdmin();
+    const [u] = await admin`insert into usuario (email, nombre, password_hash, estado)
+      values (${email72}, 'Borde Test', ${await hashPassword(pass72)}, 'activo') returning id`;
+    try {
+      expect((await autenticar(email72, pass72))?.id).toBe(u!.id as string);
+      // bcrypt truncaría el sufijo y aceptaría; el corte por bytes lo rechaza.
+      expect(await autenticar(email72, `${pass72}x`)).toBeNull();
+    } finally {
+      await admin`delete from usuario where id = ${u!.id as string}`;
+    }
+  });
+
   it('un stakeholder no invita: capa 2 (re-check de rol) y capa 1 (política RLS de miembro)', async () => {
     await expect(
       crearInvitacion(stakeId, {
@@ -124,6 +139,13 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
 
     // El token se consume al usarse.
     expect(await activarConToken(inv.token!, 'OtraClave12345')).toBeNull();
+
+    // RF-01.6: la activación queda en la auditoría del workspace que emitió el enlace
+    // (una sola vez — el intento repetido de arriba no duplica el evento).
+    const eventos = await sqlAdmin()`select actor_rol from evento_dominio
+      where workspace_id = ${ws} and tipo = 'UsuarioActivado' and actor_id = ${invitadaId}`;
+    expect(eventos.length).toBe(1);
+    expect(eventos[0]?.actor_rol).toBe('disenador');
 
     const u = await autenticar(emailInvitada, 'ClaveNueva1234');
     expect(u?.id).toBe(invitadaId);

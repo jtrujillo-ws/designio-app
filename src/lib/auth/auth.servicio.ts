@@ -1,7 +1,7 @@
 import '@/lib/server-only';
 import type { TransactionSql } from 'postgres';
 import { conUsuario, sql } from '@/lib/db';
-import type { InvitarMiembro } from './auth.schemas';
+import { PASSWORD_MAX_BYTES, type InvitarMiembro } from './auth.schemas';
 import {
   generarTokenInvitacion,
   hashPassword,
@@ -48,6 +48,15 @@ async function compararConSenuelo(password: string): Promise<void> {
 
 /** Login: null si el email no existe, no está activo o la password no coincide. */
 export async function autenticar(email: string, password: string): Promise<UsuarioSesion | null> {
+  // bcrypt solo compara los primeros 72 bytes: sin este corte, con una password
+  // almacenada de exactamente 72 bytes cualquier sufijo extra también autenticaría.
+  // Un candidato más largo jamás es la password real (la política de creación los
+  // rechaza), así que responde como cualquier credencial incorrecta — mismo mensaje
+  // y mismo costo (señuelo) para no filtrar la política por timing.
+  if (new TextEncoder().encode(password).length > PASSWORD_MAX_BYTES) {
+    await compararConSenuelo(password);
+    return null;
+  }
   const [u] = await sql()`select * from usuario_para_login(${email})`;
   if (!u || !u.password_hash || u.estado !== 'activo') {
     await compararConSenuelo(password);

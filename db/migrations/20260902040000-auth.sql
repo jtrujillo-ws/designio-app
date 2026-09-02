@@ -159,10 +159,33 @@ end
 $$;
 
 -- Activación: consume un token vigente y fija la password (el hash llega ya calculado).
+-- Lee FOR UPDATE para capturar el workspace de origen ANTES de limpiarlo y deja el
+-- evento de auditoría (RF-01.6: toda escritura genera evento_dominio) en ese workspace
+-- — es el que emitió el enlace y donde la activación tiene contexto de membresía.
 create or replace function activar_usuario_con_token(p_token_hash text, p_password_hash text)
 returns table (id uuid, email text, nombre text)
-language sql security definer set search_path = public as
+language plpgsql security definer set search_path = public as
 $$
+declare
+  v_id uuid;
+  v_email text;
+  v_nombre text;
+  v_origen uuid;
+  v_rol text;
+begin
+  select u.id, u.email, u.nombre, u.invitacion_origen_ws
+    into v_id, v_email, v_nombre, v_origen
+  from usuario u
+  where u.invitacion_token_hash = p_token_hash
+    and u.estado = 'invitado'
+    and u.invitacion_expira is not null
+    and u.invitacion_expira > now()
+  for update;
+
+  if v_id is null then
+    return; -- token desconocido, vencido o ya consumido: sin filas
+  end if;
+
   update usuario u
   set password_hash = p_password_hash,
       estado = 'activo',
@@ -170,11 +193,21 @@ $$
       invitacion_expira = null,
       invitacion_origen_ws = null,
       actualizado_en = now()
-  where u.invitacion_token_hash = p_token_hash
-    and u.estado = 'invitado'
-    and u.invitacion_expira is not null
-    and u.invitacion_expira > now()
-  returning u.id, u.email, u.nombre
+  where u.id = v_id;
+
+  -- Un token vigente siempre tiene origen (se fijan juntos); el guard cubre datos
+  -- degradados sin dejar la activación a medias.
+  if v_origen is not null then
+    select m.rol into v_rol
+    from miembro m
+    where m.workspace_id = v_origen and m.usuario_id = v_id;
+
+    insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (v_origen, 'UsuarioActivado', jsonb_build_object('email', v_email), v_id, v_rol);
+  end if;
+
+  return query select v_id, v_email, v_nombre;
+end
 $$;
 
 -- Estado de cuenta de los miembros del workspace (pantalla Personas, RF-01.4): la RLS

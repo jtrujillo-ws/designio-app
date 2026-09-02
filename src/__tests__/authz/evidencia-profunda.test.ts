@@ -4,6 +4,7 @@ import {
   adjuntarArchivo,
   aprobarItem,
   archivoParaDescarga,
+  contenidoDeItem,
   crearItem,
   decidirDerechos,
   eliminarArchivo,
@@ -202,10 +203,18 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         venceEn: null,
       }),
     ).rejects.toThrow(ErrorCuraduria);
-    // Saltándose la capa 2: la política de UPDATE no le alcanza ninguna fila.
+    // Saltándose la capa 2: escribir `decidido_en` ya ni siquiera está en el grant (lo
+    // sella el guard), así que el intento se corta antes de llegar a la política.
+    await expect(
+      conUsuario(disenadorId, (tx) => tx`update derecho_uso
+        set estado = 'concedido', ambito = 'cliente', base = 'forzado',
+            decidido_por = ${disenadorId}, decidido_en = now()
+        where evidencia_id = ${evSinDerechos}`),
+    ).rejects.toMatchObject({ code: '42501' });
+    // Y sin tocar el sello tampoco: ahí la política de UPDATE no le alcanza ninguna fila.
     const filas = await conUsuario(disenadorId, (tx) => tx`update derecho_uso
       set estado = 'concedido', ambito = 'cliente', base = 'forzado',
-          decidido_por = ${disenadorId}, decidido_en = now()
+          decidido_por = ${disenadorId}
       where evidencia_id = ${evSinDerechos}`);
     expect(filas.count).toBe(0);
   });
@@ -382,15 +391,16 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
   });
 
   it('un derecho decidido nunca vuelve a «pendiente» ni acepta una concesión sin base', async () => {
+    // Sin tocar el sello (que ya no está en el grant): lo detiene la política.
     await expect(
       conUsuario(leadId, (tx) => tx`update derecho_uso
-        set estado = 'pendiente', base = '', decidido_por = null, decidido_en = null
+        set estado = 'pendiente', base = '', decidido_por = null
         where evidencia_id = ${evConDerechos}`),
     ).rejects.toThrow(/row-level security/);
     await expect(
       conUsuario(leadId, (tx) => tx`update derecho_uso
         set estado = 'concedido', ambito = 'publico', base = '  ',
-            decidido_por = ${leadId}, decidido_en = now()
+            decidido_por = ${leadId}
         where evidencia_id = ${evConDerechos}`),
     ).rejects.toThrow(/row-level security|check constraint/);
   });
@@ -477,8 +487,12 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         where p.proname = 'evidencia_citable_guard' and not t.tgisinternal
         order by 1`
     ).map((f) => f.tabla as string);
-    expect(tablas).toEqual(['checklist_item', 'cita']);
+    expect(tablas).toEqual(['arquetipo_evidencia', 'checklist_item', 'cita']);
 
+    // `arquetipo_evidencia` entró en 20260902200000 tras haberla dejado fuera por un
+    // argumento equivocado: se creía apoyo interno que no se publica, y es respaldo
+    // probatorio (confirmar exige enlace, G2 no pasa con arquetipos sin confirmar) cuyo
+    // TÍTULO de evidencia se pinta en el tablero de gobernanza que lee todo el workspace.
     // `contradiccion` queda FUERA a propósito (RF-03.9: se registra y se muestra
     // siempre, jamás bloquea ni se oculta — que un stakeholder señale que algo no cuadra
     // es el punto del portal). Se comprueba que sigue siendo posible con evidencia
@@ -1228,6 +1242,110 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(
       (evento!.payload as { previo: { decididoPor: string } }).previo.decididoPor,
     ).toBe(previo!.decidido_por);
+  });
+
+  it('el MATERIAL de una evidencia bloqueada no llega por ninguna de sus tres vías', async () => {
+    // Un solo predicado (`material_evidencia_visible`) gobierna las tres superficies que
+    // entregan material: los bytes del adjunto, el texto pegado del item y el fragmento
+    // copiado en la cita. Antes cada una tenía su propia regla —o ninguna— y por eso se
+    // fueron encontrando de una en una. Aquí se comprueban las tres a la vez sobre la
+    // MISMA evidencia bloqueada, que es lo que hace que sea una regla y no tres parecidas.
+    const item = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: 'Entrevista con transcripción pegada',
+      contenido: 'TRANSCRIPCIÓN LITERAL: me negué a darles la foto de mi cédula.',
+      tipoFuente: 'entrevista',
+      referencia: 'grabaciones/E-020',
+    });
+    await adjuntarArchivo(leadId, {
+      workspaceId: ws,
+      itemId: item.itemId,
+      nombre: 'transcripcion.pdf',
+      tipoMime: 'application/pdf',
+      contenidoBase64: bytesABase64(PDF),
+    });
+    const curada = await aprobarItem(leadId, {
+      workspaceId: ws,
+      itemId: item.itemId,
+      esEstadoActual: false,
+      resumen: 'Vivencia del abandono',
+      dimensiones,
+    });
+
+    // Derechos PENDIENTES: el stakeholder no recibe el material por ninguna vía.
+    expect(await contenidoDeItem(stakeId, ws, item.itemId)).toBeNull();
+    const bandejaStake = await listarBandeja(stakeId, ws);
+    expect(bandejaStake.decididas.some((i) => i.id === item.itemId)).toBe(false);
+    // La boutique sí, que es lo que autoriza el ámbito interno y sin lo cual no se cura.
+    expect(await contenidoDeItem(disenadorId, ws, item.itemId)).toContain('TRANSCRIPCIÓN');
+    // Y admin-cliente también: administra los datos y exporta el archivo completo (SYS-04).
+    expect(await contenidoDeItem(adminClienteId, ws, item.itemId)).toContain('TRANSCRIPCIÓN');
+
+    // El fragmento de una cita es texto copiado del original: mismo predicado.
+    const ins = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'La verificación expulsa',
+      resumen: '',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: ins.insightId,
+      texto: 'El documento es el punto de fuga',
+      esHipotesis: false,
+    });
+    await decidirDerechos(leadId, {
+      workspaceId: ws,
+      evidenciaId: curada.evidenciaId,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Consentimiento firmado',
+      venceEn: null,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId: curada.evidenciaId,
+      fragmento: 'me negué a darles la foto de mi cédula',
+      localizacion: 'min 12:04',
+    });
+    // Con derechos vigentes el stakeholder ve el fragmento: no se le oculta el trabajo,
+    // se le oculta el material que todavía no está autorizado para él.
+    const conDerechos = await conUsuario(stakeId, (tx) => tx`select fragmento from cita
+      where afirmacion_id = ${af.afirmacionId}`);
+    expect(conDerechos).toHaveLength(1);
+
+    // Se revoca. El fragmento ya copiado deja de ser legible para quien no tiene el uso.
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: curada.evidenciaId,
+      decision: 'denegado',
+      ambito: 'interno',
+      base: 'El titular retiró el consentimiento',
+      venceEn: null,
+    });
+    const trasRevocar = await conUsuario(stakeId, (tx) => tx`select fragmento from cita
+      where afirmacion_id = ${af.afirmacionId}`);
+    expect(trasRevocar).toHaveLength(0);
+    // La boutique sigue viéndolo: es su material de trabajo.
+    const paraCurador = await conUsuario(disenadorId, (tx) => tx`select fragmento from cita
+      where afirmacion_id = ${af.afirmacionId}`);
+    expect(paraCurador).toHaveLength(1);
+
+    // Y la IDENTIDAD de la evidencia sigue siendo visible para el stakeholder: sin eso no
+    // se puede explicar el bloqueo, que es lo que SYS-14 exige.
+    const visible = await conUsuario(stakeId, (tx) => tx`select titulo from evidencia
+      where id = ${curada.evidenciaId}`);
+    expect(visible).toHaveLength(1);
+  });
+
+  it('el sello de la decisión de derechos no lo puede escribir el caller', async () => {
+    // `decidido_en` salió del grant de UPDATE: lo fija el guard de la transición. Sin eso,
+    // un UPDATE directo podía retro o post-datar cuándo se concedieron unos derechos.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update derecho_uso
+        set decidido_en = now() - interval '30 days'
+        where evidencia_id = ${evConDerechos} and workspace_id = ${ws}`),
+    ).rejects.toMatchObject({ code: '42501' });
   });
 
   // ── Higiene de la migración y del seed ──

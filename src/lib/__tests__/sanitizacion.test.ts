@@ -152,10 +152,37 @@ describe('sanitización del material importado', () => {
     // Un zip disfrazado de PDF: la firma no coincide.
     const zip = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x00]);
     expect(verificarArchivo(zip, 'application/pdf').ok).toBe(false);
+    // Un ZIP pelado ya NO pasa por XLSX: los tres OOXML comparten la firma `PK`, así que
+    // sin mirar dentro un .zip cualquiera —o un DOCX declarado como hoja de cálculo—
+    // entraba como si fuera lo que dice ser.
     expect(
       verificarArchivo(
         zip,
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      ).ok,
+    ).toBe(false);
+    const ooxml = (parte: string) =>
+      new Uint8Array([
+        0x50, 0x4b, 0x03, 0x04,
+        ...new TextEncoder().encode(`[Content_Types].xml${parte}`),
+      ]);
+    expect(
+      verificarArchivo(
+        ooxml('xl/workbook.xml'),
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      ).ok,
+    ).toBe(true);
+    // Y cada formato exige SU parte: un DOCX no cuela como XLSX ni al revés.
+    expect(
+      verificarArchivo(
+        ooxml('word/document.xml'),
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      ).ok,
+    ).toBe(false);
+    expect(
+      verificarArchivo(
+        ooxml('word/document.xml'),
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       ).ok,
     ).toBe(true);
     // RIFF que no es WebP (un WAV, por ejemplo).

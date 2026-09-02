@@ -5,6 +5,7 @@ import { Card } from '@/components/ui/Card';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
+import type { EvidenciaCitable } from '@/lib/evidencia/evidencia.schemas';
 import {
   aprobarDecision,
   definirArquetipo,
@@ -63,7 +64,11 @@ export function SeccionGobernanza({
   gobernanza: GobernanzaDeProyecto;
   insightsValidados: { id: string; titulo: string }[];
   hayMasInsights: boolean;
-  evidencias: { id: string; titulo: string }[];
+  /** Con su `citable` y su motivo: enlazar evidencia a un arquetipo es respaldo
+   * probatorio —confirmar exige enlace, y G2 no pasa con arquetipos sin confirmar— y
+   * además su título se publica en el tablero de gobernanza, que lee todo el workspace.
+   * El prop no puede estrechar el tipo o el bloqueo se pierde por el camino. */
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   rol: string;
   onCambio: () => Promise<void>;
@@ -328,7 +333,11 @@ function BloqueArquetipos({
   retoId: string;
   arquetipos: GobernanzaDeProyecto['arquetipos'];
   segmentos: { id: string; nombre: string }[];
-  evidencias: { id: string; titulo: string }[];
+  /** Con su `citable` y su motivo: enlazar evidencia a un arquetipo es respaldo
+   * probatorio —confirmar exige enlace, y G2 no pasa con arquetipos sin confirmar— y
+   * además su título se publica en el tablero de gobernanza, que lee todo el workspace.
+   * El prop no puede estrechar el tipo o el bloqueo se pierde por el camino. */
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   esCurador: boolean;
   onCambio: () => Promise<void>;
@@ -464,9 +473,15 @@ function BloqueArquetipos({
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
               <Select value={evidenciaId} onChange={(e) => setEvidenciaId(e.target.value)} style={{ minWidth: 240 }}>
                 <option value="">Evidencia que lo sostiene…</option>
+                {/* Sin derechos vigentes para «cliente» no se enlaza: el guard de la base
+                    lo impide, y aquí se dice por qué antes de elegir (SYS-14). */}
                 {evidencias.map((e) => (
-                  <option key={e.id} value={e.id}>
-                    {e.titulo}
+                  <option key={e.id} value={e.id} disabled={!e.citable}>
+                    {e.citable
+                      ? e.titulo
+                      : `${e.titulo} — sin derechos: ${
+                          e.motivoBloqueo ?? 'faltan derechos de uso para el ámbito cliente'
+                        }`}
                   </option>
                 ))}
                 {/* Confirmar un arquetipo EXIGE evidencia enlazada: si la lista viene

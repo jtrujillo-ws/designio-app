@@ -271,7 +271,18 @@ function PantallaProyecto() {
               gobernanza={datos.gobernanza}
               insightsValidados={datos.insightsValidados}
               hayMasInsights={datos.hayMasInsights}
-              evidencias={datos.citables.filter((o) => o.clase === 'evidencia')}
+              // El bloque de arquetipos exige el tipo COMPLETO, con `citable` obligatorio:
+              // enlazar evidencia a un arquetipo es respaldo probatorio y su título se
+              // publica en el tablero, así que el prop no puede admitir la forma
+              // «opcional» que sí vale para la lista mezclada del checklist.
+              evidencias={datos.citables
+                .filter((o) => o.clase === 'evidencia')
+                .map((o) => ({
+                  id: o.id,
+                  titulo: o.titulo,
+                  citable: o.citable ?? false,
+                  motivoBloqueo: o.motivoBloqueo ?? null,
+                }))}
               hayMasEvidencias={datos.hayMasEvidencias}
               rol={rol}
               onCambio={() => router.invalidate()}

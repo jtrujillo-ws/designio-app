@@ -75,7 +75,15 @@ export const MAX_ARCHIVO_BYTES = 5 * 1024 * 1024;
 /** Tope de adjuntos por item: la bandeja es curaduría humana, no un repositorio. */
 export const MAX_ARCHIVOS_POR_ITEM = 10;
 
-type Formato = { etiqueta: string; extensiones: readonly string[]; firma?: readonly number[] };
+type Formato = {
+  etiqueta: string;
+  extensiones: readonly string[];
+  firma?: readonly number[];
+  /** Marca interna obligatoria además de la firma. Los tres formatos OOXML son ZIP, así
+   * que `PK` no distingue un DOCX de un XLSX ni de un .zip cualquiera renombrado: lo que
+   * los distingue es la carpeta de partes que llevan dentro. */
+  parteOoxml?: string;
+};
 
 /** Allowlist CERRADA (RF-09.8), espejo del CHECK `archivo_tipo_permitido`.
  * Fuera a propósito: SVG y HTML (ejecutan script en un navegador) y todo formato con
@@ -96,16 +104,19 @@ export const FORMATOS_PERMITIDOS: Record<string, Formato> = {
     etiqueta: 'Word (docx)',
     extensiones: ['.docx'],
     firma: [0x50, 0x4b],
+    parteOoxml: 'word/document.xml',
   },
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': {
     etiqueta: 'Excel (xlsx)',
     extensiones: ['.xlsx'],
     firma: [0x50, 0x4b],
+    parteOoxml: 'xl/workbook.xml',
   },
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
     etiqueta: 'PowerPoint (pptx)',
     extensiones: ['.pptx'],
     firma: [0x50, 0x4b],
+    parteOoxml: 'ppt/presentation.xml',
   },
 };
 
@@ -117,6 +128,20 @@ export const EXTENSIONES_PERMITIDAS = Object.values(FORMATOS_PERMITIDOS)
   .join(',');
 
 const TEXTUALES = new Set(['text/plain', 'text/csv', 'text/markdown']);
+
+/** ¿Aparecen estos bytes ASCII dentro del buffer? Búsqueda literal, sin decodificar: el
+ * archivo es binario y solo interesan las cabeceras del ZIP, que son ASCII. */
+function contieneMarca(bytes: Uint8Array, marca: string): boolean {
+  const aguja = new TextEncoder().encode(marca);
+  if (aguja.length === 0 || bytes.length < aguja.length) return false;
+  outer: for (let i = 0; i <= bytes.length - aguja.length; i += 1) {
+    for (let j = 0; j < aguja.length; j += 1) {
+      if (bytes[i + j] !== aguja[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
 
 /**
  * Nombre de archivo seguro. Aquí SÍ se normaliza (a diferencia del contenido): el nombre
@@ -204,6 +229,17 @@ export function verificarArchivo(bytes: Uint8Array, tipoMime: string): Veredicto
       return {
         ok: false,
         motivo: `El contenido no corresponde a un ${formato.etiqueta}: la firma del archivo no coincide con el tipo declarado`,
+      };
+    }
+    // Los tres OOXML son ZIP, así que `PK` no distingue un DOCX de un XLSX ni de un .zip
+    // renombrado: lo que los separa es la parte que llevan dentro. Los nombres de las
+    // entradas viajan en claro en las cabeceras locales del ZIP (solo se comprime el
+    // contenido), así que basta buscar la marca en los bytes — sin descomprimir nada, que
+    // sería abrir un parser de ZIP y sus bypasses para ganar poco.
+    if (formato.parteOoxml && !contieneMarca(bytes, formato.parteOoxml)) {
+      return {
+        ok: false,
+        motivo: `El contenido no corresponde a un ${formato.etiqueta}: es un ZIP, pero no contiene «${formato.parteOoxml}». Los formatos de Office comparten la firma PK, así que un .zip o un documento de otro tipo la pasarían.`,
       };
     }
     // WebP es un contenedor RIFF: la firma corta también la comparten WAV y AVI.

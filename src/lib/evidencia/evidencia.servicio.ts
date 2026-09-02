@@ -590,8 +590,10 @@ export async function decidirDerechos(actorId: string, entrada: DecidirDerechos)
           ambito = ${entrada.decision === 'concedido' ? entrada.ambito : 'interno'},
           base = ${entrada.base},
           vence_en = ${entrada.decision === 'concedido' ? entrada.venceEn : null}::date,
-          decidido_por = ${actorId},
-          decidido_en = now()
+          decidido_por = ${actorId}
+      -- decidido_en NO se escribe aquí: lo sella el guard de la transición y la columna
+      -- ni siquiera está en el grant de UPDATE. Si el caller pudiera ponerlo, un UPDATE
+      -- directo retro o post-dataría cuándo se concedieron unos derechos.
       where evidencia_id = ${entrada.evidenciaId} and workspace_id = ${entrada.workspaceId}
       returning id`;
     if (decididas.length === 0) {

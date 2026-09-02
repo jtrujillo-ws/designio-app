@@ -248,6 +248,26 @@ $$;
 -- a partir el predicado en dos (que es el fallo que este refactor vino a cerrar). Si en
 -- cambio es sobre el ESTADO del reto, su sitio es `reto_admite_criterios`, que es función
 -- nueva de esta migración: no la reemplaza nadie, así que ahí no hay nada que rescatar.
+--
+-- Y meterla en el helper NO exime de dejar su comprobación propia aquí, DELANTE de la
+-- genérica: el helper solo sabe responder «sí, congelados», así que el
+-- `raise exception 'el G0 del reto está aprobado'` de abajo sería FALSO cuando la causa es
+-- otra (el G0 puede estar sin aprobar y los criterios congelados igualmente). Causas
+-- distintas, mensajes distintos; el genérico se queda para su propia causa. La
+-- comprobación va SIEMPRE después del `perform … for update of g`: ese candado es lo que
+-- serializa la decisión ajena contra la edición de criterios, y decidir antes de bloquear
+-- deja exactamente el hueco que el candado existe para cerrar.
+--
+-- ⚠ Y la consecuencia que se escapa fácil, porque cae FUERA de este fichero: al ampliar el
+-- helper, cuatro mensajes de cara al usuario que hoy nombran el G0 pasan a mentir en la
+-- causa nueva. Son el `raise` del guard de INSERT de `propuesta_ai` (abajo), los dos
+-- `ErrorAI` de `ai.servicio.ts` (admisión y última lectura antes de despachar) y el copy de
+-- `MOTIVO_ANCLA['criterios-congelados']` en `propuestas.tsx`. Ese último es además un
+-- `anclaEstado`, y la doctrina del panel es un motivo por causa CON SU SALIDA: reabrir la
+-- etapa 0 (RF-04.9) descongela el caso del G0 y no descongelaría el otro, así que lo que
+-- corresponde es un valor NUEVO en `ESTADOS_ANCLA`, no reescribir el copy del que ya hay
+-- para que valga para dos cosas. Mismo razonamiento por el que `reto-no-admite` no se fundió
+-- con `criterios-congelados`.
 create or replace function criterio_g0_pendiente_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin

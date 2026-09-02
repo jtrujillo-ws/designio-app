@@ -474,12 +474,14 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     } else {
       const [reto] = await tx`select codigo, titulo, descripcion, metrica_objetivo
         from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-          and estado in ('candidato', 'activo')`;
+          and reto_admite_criterios(id, workspace_id)`;
       if (!reto) throw new ErrorAI('El reto no existe en este workspace o ya no admite criterios');
       // El congelado de criterios lo impone la política de criterio_exito; anticiparlo aquí
-      // evita quemar presupuesto en una propuesta que nadie podría aceptar. Mismo predicado
-      // que usa el panel para decidir qué retos ofrece y qué propuestas siguen vivas: una
-      // sola función, tres lecturas que no pueden discrepar.
+      // evita quemar presupuesto en una propuesta que nadie podría aceptar. Los DOS
+      // predicados del reto —admite criterios, y no están congelados— se preguntan por la
+      // función que los impone, nunca copiados a mano: es lo que hace que ampliar uno llegue
+      // de golpe a las políticas, a los guards, al panel y a estas lecturas, en vez de
+      // dejar la versión vieja escondida en la que nadie tocó.
       const [congelado] = await tx`select
         reto_criterios_congelados(${entrada.anclaId}, ${entrada.workspaceId}) as hay`;
       if (congelado?.hay) {
@@ -790,7 +792,7 @@ async function confirmarDespacho(
       }
     } else {
       const [reto] = await tx`select
-          estado in ('candidato', 'activo') as admite,
+          reto_admite_criterios(id, workspace_id) as admite,
           reto_criterios_congelados(id, workspace_id) as congelado
         from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
       if (!reto || !reto.admite || reto.congelado) {

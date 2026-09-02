@@ -1121,6 +1121,53 @@ create trigger constatacion_alcance
   for each row execute function constatacion_alcance_guard();
 revoke execute on function constatacion_alcance_guard() from public;
 
+-- Y el par completo: un effective state SIN la constatación de cada elemento de su
+-- release no es «media escritura», es una fila que NADIE puede terminar. `unique
+-- (release_id)` deja un solo effective state por release, así que el reintento por el
+-- camino normal choca contra la unique y el release se queda `desplegado` para siempre,
+-- con su conciliación en estado desconocido y G7 bloqueado sin nada que el lead pueda
+-- hacer desde la pantalla.
+--
+-- La atomicidad de «effective state + constataciones + verificar» vivía SOLO en
+-- `constatarEffectiveState`, y una promesa que solo cumple el servicio no es una promesa:
+-- el grant es una superficie, no un camino. La política de `effective_state` autoriza el
+-- primer paso a solas —lead, release desplegado— y nadie exigía los otros dos.
+--
+-- Va como CONSTRAINT TRIGGER DIFERIDO, no como uno normal, porque en el instante del
+-- insert las constataciones todavía no existen: se insertan en la sentencia siguiente de
+-- la misma transacción. Comprobarlo al COMMIT es lo que permite exigir el conjunto entero
+-- sin obligar a un orden de sentencias concreto, y es la misma forma que el resto del
+-- sistema ya usa para las reglas que solo son ciertas al final de la transacción.
+--
+-- No hace falta mirar el borrado de constataciones ni el cambio de alcance: no hay
+-- políticas de UPDATE/DELETE sobre `constatacion` (es historia, RF-06.6) y el alcance solo
+-- se mueve mientras el release está `planificado`, así que una vez que esto se cumple no
+-- puede dejar de cumplirse. Y un release desplegado siempre tiene al menos un elemento
+-- (`release_transicion_guard`), así que la comprobación nunca es vacuamente cierta.
+create function effective_state_completo_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if exists (
+    select 1 from release_elemento re
+    where re.release_id = new.release_id and re.workspace_id = new.workspace_id
+      and not exists (
+        select 1 from constatacion c
+        where c.effective_state_id = new.id and c.workspace_id = new.workspace_id
+          and c.elemento_id = re.elemento_id)
+  ) then
+    raise exception 'un effective state se registra con la constatación de CADA elemento de su release (RF-06.6)';
+  end if;
+  return new;
+end $$;
+create constraint trigger effective_state_completo
+  after insert on effective_state
+  deferrable initially deferred
+  for each row execute function effective_state_completo_guard();
+revoke execute on function effective_state_completo_guard() from public;
+
 -- ══ G7 no pasa con la conciliación incompleta (RF-06.7, criterio de aceptación 4) ══
 -- El guard de suficiencia se REESCRIBE ENTERO (create or replace no fusiona): esta es la
 -- versión vigente —checklist sin pendientes y no vacío, ítems cumplidos con decisiones

@@ -2309,6 +2309,118 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(trasVaciar!.releases[0]!.elementos).toHaveLength(0);
   });
 
+  it('un effective state no se registra a medias: nadie podría terminarlo después', async () => {
+    // La atomicidad de «effective state + constataciones + verificar» vivía SOLO en
+    // `constatarEffectiveState`, y el grant es una superficie, no un camino: la política
+    // de effective_state autoriza el primer paso a solas —lead, release desplegado— y
+    // nadie exigía los otros dos. El agravante es `unique (release_id)`: la fila a medias
+    // no es media escritura, es una que NADIE puede terminar ni sustituir, porque el
+    // reintento por el camino normal choca contra la unique y el release se queda
+    // desplegado para siempre, con G7 bloqueado y sin salida desde la pantalla.
+    const admin = sqlAdmin();
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio del effective state a medias', ${leadId}) returning id`;
+    const svcId = svc!.id as string;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', 'To-be del effective state a medias', ${leadId})
+      returning id`;
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: svcId,
+      journeyId: j!.id as string,
+      titulo: 'La que se constata entera o nada',
+      resumen: '',
+      superaA: null,
+    });
+    const elementos: string[] = [];
+    for (const titulo of ['Primer elemento del release', 'Segundo elemento del release']) {
+      elementos.push(
+        (
+          await agregarElemento(leadId, {
+            workspaceId: ws,
+            designVersionId: dv.designVersionId,
+            tipo: 'canal',
+            operacion: 'agrega',
+            titulo,
+            detalle: '',
+            nodoId: null,
+            decisionIds: [],
+            insightIds: [],
+          })
+        ).elementoId,
+      );
+    }
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const plan = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'Release que se constata entero',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: elementos.map((elementoId) => ({ elementoId, razon: '' })),
+    });
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: plan.releaseId,
+      desplegadoEn: AYER,
+    });
+
+    // El insert suelto que la política autoriza. Falla en el COMMIT, no en la sentencia:
+    // es un constraint trigger diferido, porque en el instante del insert las
+    // constataciones aún no existen ni pueden existir.
+    const insertarES = (codigo: string) =>
+      conUsuario(leadId, async (tx) => {
+        const [es] = await tx`insert into effective_state
+          (workspace_id, servicio_id, release_id, codigo, resumen, constatado_por, constatado_en)
+          values (${ws}, ${svcId}, ${plan.releaseId}, ${codigo}, '', ${leadId}, ${HOY}::date)
+          returning id`;
+        return es!.id as string;
+      });
+    await expect(insertarES('ES-9001')).rejects.toThrow(/CADA elemento de su release/);
+
+    // Y a medias tampoco: una constatación de dos no es una conciliación, es la mitad que
+    // conviene. Aquí el primer elemento sí entra, así que lo que se prueba es el conjunto.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [es] = await tx`insert into effective_state
+          (workspace_id, servicio_id, release_id, codigo, resumen, constatado_por, constatado_en)
+          values (${ws}, ${svcId}, ${plan.releaseId}, 'ES-9002', '', ${leadId}, ${HOY}::date)
+          returning id`;
+        await tx`insert into constatacion
+          (workspace_id, effective_state_id, elemento_id, resultado, creado_por)
+          values (${ws}, ${es!.id as string}, ${elementos[0]!}, 'como-aprobado', ${leadId})`;
+      }),
+    ).rejects.toThrow(/CADA elemento de su release/);
+
+    // Lo que importa del arreglo tanto como el rechazo: la salida sigue abierta. Los dos
+    // intentos revirtieron enteros, así que `unique (release_id)` está libre y el camino
+    // normal termina el trabajo. Cerrar la puerta no deja al release sin forma de cerrarse
+    // — que es justo lo que habría pasado si la fila a medias hubiera llegado a existir.
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: plan.releaseId,
+      constatadoEn: HOY,
+      resumen: 'Los dos salieron como se aprobaron',
+      constataciones: elementos.map((elementoId) => ({
+        elementoId,
+        resultado: 'como-aprobado' as const,
+        queQuedoDistinto: '',
+        razon: '',
+      })),
+    });
+    const completa = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(completa!.releases.find((r) => r.id === plan.releaseId)!.estado).toBe('verificado');
+  });
+
   it('nada de esto cruza el workspace', async () => {
     const admin = sqlAdmin();
     const [otro] = await admin`insert into workspace (nombre) values (${marca + '-ajeno'})

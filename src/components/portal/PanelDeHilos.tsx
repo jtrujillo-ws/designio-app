@@ -274,11 +274,15 @@ function FormularioCuerpo({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {/* El placeholder no nombra el control: desaparece al escribir y varios lectores
+          de pantalla no lo anuncian. El nombre accesible va aparte, con el mismo texto
+          que ya explica qué se espera aquí. */}
       <Textarea
         rows={3}
         maxLength={CUERPO_MAX}
         value={cuerpo}
         placeholder={placeholder}
+        aria-label={placeholder}
         onChange={(e) => setCuerpo(e.target.value)}
       />
       <div style={{ display: 'flex', gap: 8 }}>

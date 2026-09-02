@@ -25,8 +25,44 @@ alter table reto add column veredicto text
   check (veredicto is null or veredicto in
     ('logrado', 'parcialmente-logrado', 'no-logrado', 'no-concluyente'));
 -- Cerrar un reto SIN veredicto sería exactamente el loop abierto que este slice cierra…
+-- …pero el ciclo ANTERIOR ya admitía `en-medicion → cerrado` (20260902070000) cuando la
+-- columna ni existía: en una base con historia hay retos cerrados LEGALMENTE bajo aquel
+-- esquema. Validar el CHECK contra ellos abortaría la migración entera —y el arranque del
+-- contenedor con ella, porque cada archivo corre en UNA transacción.
+--
+-- Política de esas filas: NO se les inventa un veredicto.
+--  · Un quinto slug («sin-outcome-review») rompería el catálogo CERRADO que SYS-24 exige
+--    y obligaría a la UI, al vocabulario canónico y a la métrica de loop cerrado (§17) a
+--    tratar como veredicto algo que no lo es.
+--  · «No concluyente» sería una FABRICACIÓN peor: afirma que hubo post mortem y que no
+--    pudo concluir, y contamina justo la métrica que cuenta cuántos retos cierran con
+--    resultado. «No concluyente» es un veredicto caro y ganado; no un relleno.
+-- El veredicto que nunca se dictó se codifica como lo que es: ausencia (null). Y la forma
+-- que PostgreSQL tiene de decir «esto se exige a todo lo que se escriba desde ahora y no
+-- afirmo nada sobre lo ya escrito» es exactamente NOT VALID — que sigue rechazando todo
+-- INSERT y todo UPDATE de esas mismas filas.
 alter table reto add constraint reto_cerrado_con_veredicto
-  check (estado <> 'cerrado' or veredicto is not null);
+  check (estado <> 'cerrado' or veredicto is not null) not valid;
+-- Y se valida EN EL ACTO si no hay nada que arrastrar (toda base nueva, el CI y el dev
+-- local): así el constraint queda plenamente confiable donde puede estarlo, en vez de
+-- quedar NOT VALID para siempre «por si acaso». Con deuda histórica el deploy no aborta:
+-- la nombra en un notice y el constraint sigue exigiéndose a cada escritura nueva. Saldarla
+-- es decisión de PRODUCTO, no de esta migración: archivar esas filas (`cerrado → archivado`
+-- sigue admitiendo veredicto nulo) o dictarles el veredicto por vía administrativa —el
+-- outcome review ya no se abre sobre un reto cerrado—. Después basta VALIDATE CONSTRAINT.
+do $$
+declare
+  heredados int;
+begin
+  select count(*) into heredados from reto where estado = 'cerrado' and veredicto is null;
+  if heredados = 0 then
+    alter table reto validate constraint reto_cerrado_con_veredicto;
+  else
+    raise notice
+      '% reto(s) cerrados antes de SPEC-07 se quedan sin veredicto: reto_cerrado_con_veredicto queda NOT VALID (exigido en toda escritura nueva); valídalo cuando cierres esa deuda',
+      heredados;
+  end if;
+end $$;
 -- …y un veredicto en un reto que sigue vivo sería un resultado sin medición terminada.
 alter table reto add constraint reto_veredicto_solo_cerrado
   check (veredicto is null or estado in ('cerrado', 'archivado'));
@@ -174,7 +210,8 @@ create index resultado_criterio_review_idx on resultado_criterio (workspace_id, 
 --    con G0-G5 aprobados y G6 aún pendiente. Firmado ⇒ congelado (ninguna política
 --    alcanza sus filas).
 --  · snapshots — curadores o el PROPIETARIO DEL DATO de esa entrada, solo con el
---    registry firmado y el reto en medición; jamás update ni delete (SYS-23).
+--    registry firmado y el reto en medición, y solo con FECHA dentro de la ventana
+--    firmada y no futura (I5); jamás update ni delete (SYS-23).
 --  · outcome review — el lead (opera el método), y solo cuando la ventana del último
 --    criterio ya cerró (RF-07.7).
 
@@ -271,13 +308,27 @@ create policy entrada_update on entrada_kpi
 create policy snapshot_insert on snapshot
   for insert with check (
     creado_por = app_user_id()
+    -- La fecha del DATO no puede ser del futuro. Sin esto, el propietario del dato mete
+    -- un valor fechado por delante: la proyección lo toma como la última recepción (y la
+    -- cadencia pasa a «recibido» sin que nadie haya aportado nada), y el selector del
+    -- outcome review lo ofrece como resultado final del criterio.
+    and snapshot.fecha <= current_date
     and exists (select 1 from entrada_kpi e
       join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
       join reto rt on rt.id = r.reto_id and rt.workspace_id = r.workspace_id
+      join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
       where e.id = snapshot.entrada_kpi_id and e.workspace_id = snapshot.workspace_id
         -- Solo se mide lo FIRMADO (SYS-22) y solo mientras el reto está en medición:
         -- después del cierre el resultado es historia (SYS-08).
         and r.estado = 'firmado' and rt.estado = 'en-medicion'
+        -- Y solo DENTRO de la ventana firmada: I5 dice que la medición es temporal y
+        -- ACOTADA, así que un valor de antes del inicio o de después del cierre no mide
+        -- lo que se acordó medir. La ventana es la del contrato —inicio de la entrada,
+        -- largo del criterio congelado en G0— y ninguna de las dos se copia aquí: se
+        -- leen donde viven, que es lo que evita la segunda verdad.
+        and e.ventana_inicio is not null and c.ventana_dias is not null
+        and snapshot.fecha >= e.ventana_inicio
+        and snapshot.fecha <= e.ventana_inicio + c.ventana_dias
         and (workspace_role(app_user_id(), snapshot.workspace_id) in ('lead-boutique', 'disenador')
           or exists (select 1 from miembro m
             where m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
@@ -354,9 +405,11 @@ create policy resultado_update on resultado_criterio
   );
 
 -- ── El proyecto gana su transición de estado (hasta ahora sin grant ni política) ──
--- La abre este slice porque es el que la necesita: medir mueve el proyecto a medición y
--- el post-mortem lo cierra. Con el mismo rigor que el reto: rol que opera el método,
--- pares legales en un guard y CERRADO INMUTABLE (SYS-08) ya en el USING.
+-- La abre este slice porque es el que la necesita: G7 mueve el proyecto a medición y el
+-- post-mortem lo cierra. Con el mismo rigor que el reto: rol que opera el método, pares
+-- legales en un guard y CERRADO INMUTABLE (SYS-08) ya en el USING. Qué gate habilita cada
+-- par y quién puede cerrar viven en el guard y no aquí: una política solo ve la fila
+-- NUEVA, y estas dos reglas son sobre el par viejo→nuevo y sobre otra tabla.
 create policy proyecto_update_estado on proyecto
   for update
   using (
@@ -382,6 +435,24 @@ begin
     ('en-medicion', 'cerrado')
   ) then
     raise exception 'transición de proyecto ilegal: % → %', old.estado, new.estado;
+  end if;
+  -- §5.2: el paso a «en medición» es el gate de SEGUIMIENTO (G7), no el del plan (G6).
+  -- Antes de G7 no hay releases conciliados contra la design version ni effective state
+  -- constatado: medir ahí sería medir una implementación que nadie verificó.
+  if new.estado = 'en-medicion' and not exists (select 1 from gate_instancia g
+    where g.proyecto_id = new.id and g.workspace_id = new.workspace_id
+      and g.numero = 7 and g.estado = 'aprobado') then
+    raise exception 'el proyecto pasa a medición al aprobarse su G7 (§5.2)';
+  end if;
+  -- RF-07.10: el proyecto cierra CON su reto y por una sola mano, la del outcome review.
+  -- `reto.veredicto` no tiene grant para el rol de aplicación —solo lo escribe el guard
+  -- del review—, así que exigirlo aquí ata el cierre del proyecto a la completación del
+  -- post mortem también por SQL directo. Sin esto, cualquier lead cerraba el proyecto
+  -- (inmutable, SYS-08) y dejaba su reto midiendo y aceptando snapshots.
+  if new.estado = 'cerrado' and not exists (select 1 from reto r
+    where r.id = new.reto_id and r.workspace_id = new.workspace_id
+      and r.veredicto is not null) then
+    raise exception 'el proyecto cierra al completarse el outcome review de su reto (RF-07.10)';
   end if;
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (new.workspace_id, 'ProyectoTransicionado',
@@ -419,6 +490,17 @@ begin
   if new.estado = 'en-medicion' and not exists (select 1 from metric_registry r
     where r.reto_id = new.id and r.workspace_id = new.workspace_id and r.estado = 'firmado') then
     raise exception 'abrir la medición exige el Metric Registry firmado en G6 (SYS-22)';
+  end if;
+  -- §5.2: y exige el G7 APROBADO, que es el gate al que el ciclo canónico le asigna este
+  -- paso («releases conciliados contra la design version; effective state constatado;
+  -- medición operando. El proyecto y el reto pasan a en medición»). G6 solo acuerda el
+  -- plan y firma el contrato de medición: abrir ahí admitiría snapshots de una
+  -- implementación aún sin conciliar y se saltaría el último gate del método.
+  if new.estado = 'en-medicion' and not exists (select 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = new.id and p.workspace_id = new.workspace_id
+      and g.numero = 7 and g.estado = 'aprobado') then
+    raise exception 'abrir la medición exige el G7 aprobado: releases conciliados y effective state constatado (§5.2)';
   end if;
   -- SYS-24: el reto cierra CON veredicto. La columna no tiene grant para el rol de app:
   -- la única mano que la escribe es el guard del outcome review, así que exigirla aquí
@@ -543,6 +625,14 @@ begin
         and rc.snapshot_final_id is null) then
       raise exception 'veredicto «logrado» con criterios sin dato final: usa parcialmente logrado o no concluyente (SYS-24)';
     end if;
+    -- El reto cierra con SU veredicto (el guard de transición vuelve a exigirlo y deja su
+    -- propio rastro). Esta es la ÚNICA escritura de reto.veredicto del sistema, y va
+    -- PRIMERO a propósito: el guard del proyecto exige ese veredicto para dejarlo cerrar,
+    -- que es lo que ata el cierre del proyecto a esta completación y a ninguna otra mano.
+    -- Tienen que ser dos sentencias, no una CTE: las sub-sentencias de un WITH comparten
+    -- snapshot y el guard del proyecto no vería el veredicto recién escrito.
+    update reto set estado = 'cerrado', veredicto = new.veredicto
+      where id = new.reto_id and workspace_id = new.workspace_id;
     -- El proyecto cierra CON el reto (RF-07.10) y queda inmutable. Se exige que esté en
     -- medición: si alguien lo pausó, el cierre no lo arrastra en silencio.
     update proyecto set estado = 'cerrado'
@@ -553,10 +643,6 @@ begin
         and p.estado <> 'cerrado') then
       raise exception 'el proyecto del reto no está en medición: no puede cerrarse con el outcome review';
     end if;
-    -- Y el reto cierra con SU veredicto (el guard de transición vuelve a exigirlo y deja
-    -- su propio rastro). Esta es la ÚNICA escritura de reto.veredicto del sistema.
-    update reto set estado = 'cerrado', veredicto = new.veredicto
-      where id = new.reto_id and workspace_id = new.workspace_id;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'OutcomeReviewCompletado',
         jsonb_build_object('reviewId', new.id, 'retoId', new.reto_id,

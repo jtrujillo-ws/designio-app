@@ -288,3 +288,31 @@ export function ventanasCerradas(entradas: EntradaDeRegistry[]): boolean {
     entradas.length > 0 && entradas.every((e) => e.diasRestantes !== null && e.diasRestantes <= 0)
   );
 }
+
+/**
+ * Por qué una fecha no puede entrar en la serie, o null si puede. La ventana firmada
+ * acota QUÉ mide el dato (I5: la medición es temporal y acotada) y el futuro no se ha
+ * medido todavía. Ambos extremos son INCLUSIVOS: el día que abre y el que cierra la
+ * ventana son días medidos.
+ *
+ * Espejo del predicado de la política del snapshot, igual que `ventanasCerradas`: quien
+ * autoriza es la base; esto da el motivo ACCIONABLE (RF-07.3, criterio 1), que en el CSV
+ * va por fila. Puro y comparando textos porque son fechas calendáricas AAAA-MM-DD —
+ * comparar textos es comparar días, sin husos de por medio, que es justo por lo que la
+ * columna es `date` y no timestamp.
+ */
+export function motivoFechaDeSnapshot(
+  fecha: string,
+  ventana: { ventanaInicio: string | null; ventanaFin: string | null; hoy: string },
+): string | null {
+  if (fecha > ventana.hoy) {
+    return `Fecha en el futuro: «${fecha}» (hoy es ${ventana.hoy})`;
+  }
+  if (ventana.ventanaInicio !== null && fecha < ventana.ventanaInicio) {
+    return `Fecha anterior a la ventana firmada: «${fecha}» (abre el ${ventana.ventanaInicio})`;
+  }
+  if (ventana.ventanaFin !== null && fecha > ventana.ventanaFin) {
+    return `Fecha posterior a la ventana firmada: «${fecha}» (cerró el ${ventana.ventanaFin})`;
+  }
+  return null;
+}

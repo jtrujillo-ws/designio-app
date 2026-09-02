@@ -4,6 +4,7 @@ import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 import {
+  motivoFechaDeSnapshot,
   ValorMetricoSchema,
   type CargarCsv,
   type CompletarReview,
@@ -39,6 +40,10 @@ export const SNAPSHOTS_POR_ENTRADA = 500;
 /** Tope de filas por carga CSV: la ingesta es manual y acotada (ADR-0007, decisión 4). */
 export const MAX_FILAS_CSV = 500;
 
+/** Fila de CSV que pasó el formato: sigue llevando su línea para poder rechazarla luego
+ * por la ventana firmada sin perder de vista cuál era. */
+type FilaCsv = { linea: number; contenido: string; fecha: string; valor: string; nota: string };
+
 /** Candado por reto — MISMO espacio de nombres que el método (metodo.servicio): cerrar
  * el reto y aceptar snapshots deben serializarse entre sí. Sin él, bajo READ COMMITTED
  * un snapshot podría pasar su política («reto en medición») y commitear DESPUÉS del
@@ -67,18 +72,44 @@ function esRechazoDePolitica(e: unknown): boolean {
   return (e as { code?: string }).code === '42501';
 }
 
-/** El reto dueño de una entrada KPI (inmutable: leerlo antes del candado no abre carrera). */
-async function retoDeEntrada(
+/** Lo que hay que saber de una entrada KPI para aceptar un dato: de qué reto es, si está
+ * midiendo y cuál es su ventana FIRMADA. La ventana no se puede mover una vez firmado el
+ * registry (ni la entrada ni el criterio tienen política de update entonces), así que
+ * leerla antes del candado no abre carrera; y `hoy` sale de la misma transacción que
+ * evaluará la política, así que ambos ven el mismo `current_date`. */
+type ContextoEntrada = {
+  retoId: string;
+  /** Registry firmado y reto en medición: las condiciones que hacen del dato un dato. */
+  midiendo: boolean;
+  ventanaInicio: string | null;
+  ventanaFin: string | null;
+  hoy: string;
+};
+
+async function contextoDeEntrada(
   tx: TransactionSql,
   workspaceId: string,
   entradaId: string,
-): Promise<string> {
+): Promise<ContextoEntrada> {
   const [fila] = await tx`
-    select r.reto_id from entrada_kpi e
+    select r.reto_id,
+      (r.estado = 'firmado' and rt.estado = 'en-medicion') as midiendo,
+      e.ventana_inicio::text as ventana_inicio,
+      (e.ventana_inicio + c.ventana_dias)::text as ventana_fin,
+      current_date::text as hoy
+    from entrada_kpi e
     join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
+    join reto rt on rt.id = r.reto_id and rt.workspace_id = r.workspace_id
+    join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
     where e.id = ${entradaId} and e.workspace_id = ${workspaceId}`;
   if (!fila) throw new ErrorMedicion('La entrada KPI no existe en este workspace');
-  return fila.reto_id as string;
+  return {
+    retoId: fila.reto_id as string,
+    midiendo: fila.midiendo as boolean,
+    ventanaInicio: fila.ventana_inicio as string | null,
+    ventanaFin: fila.ventana_fin as string | null,
+    hoy: fila.hoy as string,
+  };
 }
 
 /** Abre el contrato de medición del reto (RF-07.1). 1:1 por unique: dos aperturas
@@ -265,10 +296,11 @@ async function diagnosticoDeFirma(
 }
 
 /**
- * Abrir la medición (RF-07.6): el reto pasa a «en medición» y su proyecto también. El
- * guard de transición del reto exige el registry FIRMADO (SYS-22) y la política, el rol
- * que opera el método. Los dos movimientos van en la misma transacción: un reto midiendo
- * con el proyecto todavía «activo» sería un tablero que miente.
+ * Abrir la medición (RF-07.6): el reto pasa a «en medición» y su proyecto también. Los
+ * guards de transición de la base exigen el registry FIRMADO (SYS-22) y el G7 APROBADO
+ * (§5.2), y la política, el rol que opera el método. Los dos movimientos van en la misma
+ * transacción: un reto midiendo con el proyecto todavía «activo» sería un tablero que
+ * miente.
  */
 export async function abrirMedicion(
   actorId: string,
@@ -277,6 +309,34 @@ export async function abrirMedicion(
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await bloquearReto(tx, entrada.retoId);
+    // Las dos condiciones del método, leídas ANTES de mover nada para que el mensaje sea
+    // el del método y no el del rechazo. Si el reto no existe, no está activo o no se ve,
+    // no hay fila y hablan los guards y la política, que es lo correcto: el diagnóstico no
+    // debe contarle el estado del reto a quien no puede leerlo.
+    const [listo] = await tx`
+      select
+        exists (select 1 from metric_registry mr
+          where mr.reto_id = r.id and mr.workspace_id = r.workspace_id
+            and mr.estado = 'firmado') as firmado,
+        exists (select 1 from gate_instancia g
+          join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+          where p.reto_id = r.id and p.workspace_id = r.workspace_id
+            and g.numero = 7 and g.estado = 'aprobado') as g7
+      from reto r
+      where r.id = ${entrada.retoId} and r.workspace_id = ${entrada.workspaceId}
+        and r.estado = 'activo'`;
+    if (listo && !listo.firmado) {
+      throw new ErrorMedicion('Abrir la medición exige el Metric Registry firmado en G6 (SYS-22)');
+    }
+    // El ciclo canónico (§5.2) asigna este paso a G7, no a G6: «releases conciliados
+    // contra la design version; effective state constatado; medición operando. El proyecto
+    // y el reto pasan a en medición». G6 acuerda el plan y firma el contrato; abrir ahí
+    // admitiría snapshots de una implementación que nadie ha conciliado todavía.
+    if (listo && !listo.g7) {
+      throw new ErrorMedicion(
+        'Abrir la medición exige el G7 aprobado: releases conciliados y effective state constatado',
+      );
+    }
     let abierto;
     try {
       abierto = await tx`
@@ -289,17 +349,6 @@ export async function abrirMedicion(
     }
     if (abierto!.length === 0) {
       throw new ErrorMedicion('El reto no existe, no está activo o no puedes abrir su medición');
-    }
-    // El G6 aprobado es la señal de que el plan de implementación está acordado: medir
-    // antes sería medir un plan que aún puede cambiar.
-    const [g6] = await tx`
-      select count(*) filter (where g.estado = 'aprobado')::int as aprobados
-      from gate_instancia g
-      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
-      where p.reto_id = ${entrada.retoId} and p.workspace_id = ${entrada.workspaceId}
-        and g.numero = 6`;
-    if ((g6!.aprobados as number) === 0) {
-      throw new ErrorMedicion('Abrir la medición exige el G6 aprobado (plan de implementación)');
     }
     let movidos;
     try {
@@ -333,8 +382,14 @@ export async function registrarSnapshot(
 ): Promise<{ snapshotId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const retoId = await retoDeEntrada(tx, entrada.workspaceId, entrada.entradaId);
-    await bloquearReto(tx, retoId);
+    const ctx = await contextoDeEntrada(tx, entrada.workspaceId, entrada.entradaId);
+    await bloquearReto(tx, ctx.retoId);
+    // Solo se diagnostica la FECHA cuando lo demás está en su sitio: si el reto no está
+    // midiendo, el motivo real es ese y lo dice la política, no la ventana.
+    if (ctx.midiendo) {
+      const motivo = motivoFechaDeSnapshot(entrada.fecha, ctx);
+      if (motivo) throw new ErrorMedicion(motivo);
+    }
     let fila;
     try {
       // UNA sentencia: snapshot y evento comparten snapshot de transacción y el rol
@@ -380,9 +435,22 @@ export async function cargarSnapshotsCsv(
   const { validas, rechazadas } = parsearCsv(entrada.csv);
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const retoId = await retoDeEntrada(tx, entrada.workspaceId, entrada.entradaId);
-    await bloquearReto(tx, retoId);
-    if (validas.length === 0) {
+    const ctx = await contextoDeEntrada(tx, entrada.workspaceId, entrada.entradaId);
+    await bloquearReto(tx, ctx.retoId);
+    // La ventana firmada se aplica FILA A FILA, como el formato: una fecha fuera de
+    // ventana no debe tumbar la tanda entera (RF-07.3, criterio 1) — la política sí lo
+    // haría, porque un solo rechazo aborta el INSERT completo. Solo cuando el reto está
+    // midiendo: si no, el motivo real es otro y lo dice la política.
+    const enVentana = ctx.midiendo
+      ? validas.filter((f) => {
+          const motivo = motivoFechaDeSnapshot(f.fecha, ctx);
+          if (motivo === null) return true;
+          rechazadas.push({ linea: f.linea, contenido: f.contenido, motivo });
+          return false;
+        })
+      : validas;
+    rechazadas.sort((a, b) => a.linea - b.linea);
+    if (enVentana.length === 0) {
       // Sin filas válidas no hay escritura, pero el diagnóstico sí importa: la pantalla
       // muestra por qué se rechazó cada línea.
       return { insertados: 0, rechazadas };
@@ -395,7 +463,7 @@ export async function cargarSnapshotsCsv(
         insert into snapshot (workspace_id, entrada_kpi_id, valor, fecha, origen, nota, creado_por)
         select ${entrada.workspaceId}, ${entrada.entradaId}, f.valor::numeric, f.fecha::date,
                'csv', f.nota, ${actorId}
-        from jsonb_to_recordset(${tx.json(validas)}) as f(fecha text, valor text, nota text)
+        from jsonb_to_recordset(${tx.json(enVentana)}) as f(fecha text, valor text, nota text)
         returning id`;
     } catch (e) {
       if (esRechazoDePolitica(e)) throw new ErrorMedicion(RECHAZO_SNAPSHOT);
@@ -418,12 +486,14 @@ export async function cargarSnapshotsCsv(
   });
 }
 
-/** Parseo puro del CSV pegado (sin base): separa filas válidas de rechazadas con motivo. */
+/** Parseo puro del CSV pegado (sin base): separa filas válidas de rechazadas con motivo.
+ * Las válidas conservan su línea y su contenido porque la ventana firmada todavía puede
+ * rechazarlas, y ese rechazo también tiene que decir QUÉ línea fue. */
 export function parsearCsv(csv: string): {
-  validas: { fecha: string; valor: string; nota: string }[];
+  validas: FilaCsv[];
   rechazadas: FilaRechazada[];
 } {
-  const validas: { fecha: string; valor: string; nota: string }[] = [];
+  const validas: FilaCsv[] = [];
   const rechazadas: FilaRechazada[] = [];
   const lineas = csv.split(/\r?\n/);
   for (let i = 0; i < lineas.length; i++) {
@@ -463,7 +533,13 @@ export function parsearCsv(csv: string): {
       });
       continue;
     }
-    validas.push({ fecha: fechaOk.data, valor: valorOk.data, nota });
+    validas.push({
+      linea: i + 1,
+      contenido: linea.slice(0, 120),
+      fecha: fechaOk.data,
+      valor: valorOk.data,
+      nota,
+    });
   }
   return { validas, rechazadas };
 }

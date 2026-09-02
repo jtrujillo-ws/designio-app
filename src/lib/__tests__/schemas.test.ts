@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DesviacionSchema } from '@/lib/entrega/entrega.schemas';
 import { EstadoRetoSchema, VeredictoSchema } from '@/lib/metodo/metodo.schemas';
-import { OutcomeReviewSchema } from '@/lib/medicion/medicion.schemas';
+import { motivoFechaDeSnapshot, OutcomeReviewSchema } from '@/lib/medicion/medicion.schemas';
 import { InsightSchema } from '@/lib/evidencia/evidencia.schemas';
 
 /** Invariantes codificadas en los esquemas (docs/03-invariantes). */
@@ -9,6 +9,20 @@ describe('esquemas del dominio', () => {
   it('el veredicto es un catálogo cerrado (SYS-24)', () => {
     expect(VeredictoSchema.safeParse('parcialmente logrado').success).toBe(true);
     expect(VeredictoSchema.safeParse('éxito rotundo').success).toBe(false);
+  });
+
+  it('el snapshot cae dentro de la ventana firmada, extremos incluidos (I5)', () => {
+    const ventana = { ventanaInicio: '2026-03-01', ventanaFin: '2026-05-30', hoy: '2026-09-02' };
+    // Los dos extremos son días MEDIDOS: la ventana es cerrada, no semiabierta.
+    expect(motivoFechaDeSnapshot('2026-03-01', ventana)).toBeNull();
+    expect(motivoFechaDeSnapshot('2026-05-30', ventana)).toBeNull();
+    expect(motivoFechaDeSnapshot('2026-02-28', ventana)).toMatch(/anterior a la ventana/);
+    expect(motivoFechaDeSnapshot('2026-05-31', ventana)).toMatch(/posterior a la ventana/);
+    // Hoy sí; mañana no: un valor fechado por delante sería la «última recepción» de la
+    // proyección y el candidato a resultado final del review sin haber medido nada.
+    const abierta = { ...ventana, ventanaFin: '2026-12-31' };
+    expect(motivoFechaDeSnapshot('2026-09-02', abierta)).toBeNull();
+    expect(motivoFechaDeSnapshot('2026-09-03', abierta)).toMatch(/en el futuro/);
   });
 
   it('los estados del reto son canónicos (I1)', () => {

@@ -478,7 +478,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(tras!.objetivo).toBe(c!.objetivo);
   });
 
-  it('abrir la medición exige registry firmado y G6 aprobado, y mueve reto Y proyecto', async () => {
+  it('abrir la medición exige registry firmado y G7 aprobado, y mueve reto Y proyecto', async () => {
     // Otro reto activo con método pero sin registry: el guard de la base lo frena
     // también por SQL directo (SYS-22).
     const otro = await crearReto(leadId, {
@@ -505,6 +505,25 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       conUsuario(leadId, (tx) => tx`update reto set estado = 'en-medicion'
         where id = ${otro.retoId}`),
     ).rejects.toThrow(/Metric Registry firmado en G6/);
+
+    // Y con el registry firmado y el G6 aprobado TAMPOCO se abre: el ciclo canónico
+    // (§5.2) da este paso a G7, después de conciliar los releases contra la design
+    // version y constatar el effective state. Abrir en G6 admitiría snapshots de una
+    // implementación que nadie ha verificado y se saltaría el último gate del método.
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId })).rejects.toThrow(
+      /G7 aprobado/,
+    );
+    // El guard de la base lo repite para el SQL directo, en las DOS piezas que se mueven.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update reto set estado = 'en-medicion'
+        where id = ${retoId}`),
+    ).rejects.toThrow(/G7 aprobado/);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
+        where id = ${proyectoId}`),
+    ).rejects.toThrow(/al aprobarse su G7/);
+
+    await aprobarGateNumero(7);
 
     // El stakeholder no mueve el método.
     await expect(abrirMedicion(stakeId, { workspaceId: ws, retoId })).rejects.toThrow(
@@ -597,6 +616,11 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       `2026-02-30,44`, // fecha inexistente (el parser ISO de V8 la rodaría a marzo)
       `${fecha(-4)},cuarenta`, // valor no numérico
       `${fecha(-2)},46`,
+      // La ventana firmada («Abandono %») abre hace 10 días y dura 30: estas dos son
+      // formalmente correctas y aun así no miden lo acordado. Se rechazan POR FILA, no
+      // tumbando la tanda — que es lo que haría la política si llegaran hasta ella.
+      `${fecha(-30)},60`, // anterior a la apertura de la ventana
+      `${fecha(3)},20`, // fechada en el futuro
     ].join('\n');
     const r = await cargarSnapshotsCsv(sponsorId, {
       workspaceId: ws,
@@ -604,10 +628,12 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       csv,
     });
     expect(r.insertados).toBe(2);
-    expect(r.rechazadas.map((f) => f.linea)).toEqual([3, 4, 5]);
+    expect(r.rechazadas.map((f) => f.linea)).toEqual([3, 4, 5, 7, 8]);
     expect(r.rechazadas[0]!.motivo).toMatch(/Falta la fecha/);
     expect(r.rechazadas[1]!.motivo).toMatch(/Fecha inválida/);
     expect(r.rechazadas[2]!.motivo).toMatch(/no numérico/);
+    expect(r.rechazadas[3]!.motivo).toMatch(/anterior a la ventana firmada/);
+    expect(r.rechazadas[4]!.motivo).toMatch(/Fecha en el futuro/);
 
     const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
     const abandono = seg!.entradas.find((e) => e.id === entradaAbandonoId)!;
@@ -649,6 +675,44 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     );
     const abierto = await abrirOutcomeReview(leadId, { workspaceId: ws, retoId });
     reviewId = abierto.reviewId;
+  });
+
+  it('el snapshot cae DENTRO de la ventana firmada y nunca en el futuro', async () => {
+    // Las ventanas ya se movieron a [-100, -70] y [-100, -40] (test anterior) y el reto
+    // sigue midiendo: las tres puertas son alcanzables. Un valor fuera de la ventana no
+    // mide lo que se acordó medir (I5: la medición es temporal y ACOTADA), y uno fechado
+    // por delante se cuela como «última recepción» de la proyección —dejando la cadencia
+    // en «recibido» sin que nadie haya aportado nada— y como candidato a resultado final
+    // del criterio en el outcome review.
+    const base = { workspaceId: ws, entradaId: entradaAbandonoId, valor: '5', nota: '' };
+    await expect(registrarSnapshot(sponsorId, { ...base, fecha: fecha(1) })).rejects.toThrow(
+      /Fecha en el futuro/,
+    );
+    await expect(registrarSnapshot(sponsorId, { ...base, fecha: fecha(-150) })).rejects.toThrow(
+      /anterior a la ventana firmada/,
+    );
+    await expect(registrarSnapshot(leadId, { ...base, fecha: fecha(-60) })).rejects.toThrow(
+      /posterior a la ventana firmada/,
+    );
+
+    // Y la puerta es de la BASE, no del mensaje: por SQL directo la política los rechaza
+    // igual, tanto al propietario del dato como al curador.
+    for (const [quien, dia] of [
+      [sponsorId, 1],
+      [sponsorId, -150],
+      [leadId, -60],
+    ] as const) {
+      await expect(
+        conUsuario(quien, (tx) => tx`insert into snapshot
+          (workspace_id, entrada_kpi_id, valor, fecha, origen, creado_por)
+          values (${ws}, ${entradaAbandonoId}, 5, ${fecha(dia)}::date, 'formulario', ${quien})`),
+      ).rejects.toThrow(/row-level security/);
+    }
+
+    // Nada entró: la serie sigue siendo la de siempre (SYS-23 no admite «casi»).
+    const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const abandono = seg!.entradas.find((e) => e.id === entradaAbandonoId)!;
+    expect(abandono.snapshots.map((s) => s.valor)).toEqual(['55', '52', '46', '49']);
   });
 
   it('el resultado por criterio apunta a un snapshot REAL de SU criterio o dice por qué falta', async () => {
@@ -741,6 +805,25 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     ).rejects.toThrow(ErrorMedicion);
     const [sigueBorrador] = await admin`select estado from outcome_review where id = ${reviewId}`;
     expect(sigueBorrador!.estado).toBe('borrador');
+  });
+
+  it('el proyecto no cierra por su cuenta: lo cierra el outcome review completado', async () => {
+    // Con el proyecto en medición, cualquier lead con el rol de app podía pasarlo a
+    // 'cerrado' sin post mortem: quedaba un proyecto INMUTABLE (SYS-08) mientras su reto
+    // seguía midiendo y aceptando snapshots, saltándose la operación que cierra ambos
+    // objetos con veredicto (RF-07.10). El guard lo ata a la única mano que escribe
+    // `reto.veredicto` —la completación del review—, así que no hay atajo por SQL directo.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'cerrado'
+        where id = ${proyectoId}`),
+    ).rejects.toThrow(/outcome review de su reto/);
+    const [sigue] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where id = ${proyectoId}`);
+    expect(sigue!.estado).toBe('en-medicion');
+    // El reto tampoco: cerrarlo exige el veredicto, que no tiene grant para el rol de app.
+    const [reto] = await conUsuario(leadId, (tx) => tx`select estado from reto
+      where id = ${retoId}`);
+    expect(reto!.estado).toBe('en-medicion');
   });
 
   it('completar el review cierra el reto CON veredicto y el proyecto, ambos inmutables', async () => {
@@ -842,6 +925,85 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const filas = await conUsuario(stakeId, (tx) => tx`update proyecto set estado = 'pausado'
       where id = ${otroId}`);
     expect(filas.count).toBe(0);
+  });
+
+  it('el veredicto obligatorio no aborta el deploy sobre un reto cerrado heredado', async () => {
+    const admin = sqlAdmin();
+    const donde = { conname: 'reto_cerrado_con_veredicto' };
+    // En una base LIMPIA no hay nada que arrastrar y la migración lo valida en el acto:
+    // el constraint queda plenamente confiable donde puede estarlo.
+    const [antes] = await admin`select convalidated from pg_constraint
+      where conname = ${donde.conname} and conrelid = 'reto'::regclass`;
+    expect(antes!.convalidated).toBe(true);
+
+    // Y se reproduce el deploy sobre una base CON historia: el ciclo anterior admitía
+    // `en-medicion → cerrado` cuando la columna `veredicto` ni existía, así que esas filas
+    // son legales y validar el CHECK contra ellas abortaría la migración entera —y con
+    // ella el arranque, porque cada archivo corre en UNA transacción. El DDL de PostgreSQL
+    // es transaccional: la simulación completa se revierte y el esquema queda intacto.
+    const centinela = 'revertir la simulación del deploy';
+    await expect(
+      admin.begin(async (tx) => {
+        await tx`set local lock_timeout = '30s'`;
+        await tx`alter table reto drop constraint reto_cerrado_con_veredicto`;
+        const [heredado] = await tx`insert into reto
+          (workspace_id, servicio_ancla_id, codigo, titulo, estado, creado_por)
+          values (${ws}, ${svcId}, 'R-HEREDADO', 'Cerrado antes de que hubiera post mortem',
+                  'cerrado', ${leadId})
+          returning id`;
+        const heredadoId = heredado!.id as string;
+
+        // 1) El deploy NO aborta: el constraint entra NOT VALID, que es la forma que
+        //    PostgreSQL tiene de decir «esto se exige a todo lo nuevo y no afirmo nada
+        //    sobre lo ya escrito».
+        await tx`alter table reto add constraint reto_cerrado_con_veredicto
+          check (estado <> 'cerrado' or veredicto is not null) not valid`;
+        const [recien] = await tx`select convalidated from pg_constraint
+          where conname = ${donde.conname} and conrelid = 'reto'::regclass`;
+        expect(recien!.convalidated).toBe(false);
+
+        // 2) A la fila histórica no se le inventa un veredicto: el catálogo de SYS-24
+        //    tiene cuatro valores y ninguno significa «se cerró antes de que existiera el
+        //    post mortem». «No concluyente» afirmaría que lo hubo y no concluyó, y
+        //    contaminaría la métrica de loop cerrado (§17). Ausencia se codifica null.
+        const [fila] = await tx`select veredicto from reto where id = ${heredadoId}`;
+        expect(fila!.veredicto).toBeNull();
+
+        // 3) NOT VALID no es «apagado»: toda escritura NUEVA sí se exige.
+        await expect(
+          tx.savepoint((sp) => sp`insert into reto
+            (workspace_id, servicio_ancla_id, codigo, titulo, estado, creado_por)
+            values (${ws}, ${svcId}, 'R-NUEVO', 'Cierre sin veredicto', 'cerrado', ${leadId})`),
+        ).rejects.toThrow(/reto_cerrado_con_veredicto/);
+
+        // 4) Validar sigue fallando mientras quede deuda: por eso la migración cuenta esas
+        //    filas ANTES y solo valida cuando no hay ninguna (si las hay, lo dice en un
+        //    notice y sigue adelante en vez de tumbar el despliegue).
+        await expect(
+          tx.savepoint(
+            (sp) => sp`alter table reto validate constraint reto_cerrado_con_veredicto`,
+          ),
+        ).rejects.toThrow(/reto_cerrado_con_veredicto/);
+
+        // 5) Y saldada la deuda —aquí, con el veredicto que su post mortem tardío dictó—
+        //    el VALIDATE pasa sin más DDL: la salida documentada existe y funciona.
+        await tx`update reto set veredicto = 'no-concluyente' where id = ${heredadoId}`;
+        await tx`alter table reto validate constraint reto_cerrado_con_veredicto`;
+        const [saldado] = await tx`select convalidated from pg_constraint
+          where conname = ${donde.conname} and conrelid = 'reto'::regclass`;
+        expect(saldado!.convalidated).toBe(true);
+
+        throw new Error(centinela);
+      }),
+    ).rejects.toThrow(centinela);
+
+    // El esquema quedó como estaba: la simulación se revirtió entera.
+    const [despues] = await admin`select convalidated from pg_constraint
+      where conname = ${donde.conname} and conrelid = 'reto'::regclass`;
+    expect(despues!.convalidated).toBe(true);
+    const [heredados] = await admin`select count(*)::int as n from reto
+      where workspace_id = ${ws} and codigo = 'R-HEREDADO'`;
+    expect(heredados!.n).toBe(0);
   });
 
   it('aislamiento cross-tenant: otro workspace no ve ni escribe esta medición', async () => {

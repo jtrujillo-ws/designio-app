@@ -94,6 +94,9 @@ export function SeccionMedicion({
   // El registry se firma en G6 y lo firma SU rol aprobador: se lee del gate, no de una
   // constante duplicada aquí.
   const firmaG6 = proyecto.gates.find((g) => g.numero === 6)?.rolAprobador;
+  // Y la medición se ABRE en G7 (§5.2): el gate de seguimiento, con los releases
+  // conciliados y el effective state constatado. Firmar el contrato no basta.
+  const g7Aprobado = proyecto.gates.find((g) => g.numero === 7)?.estado === 'aprobado';
   const comunes = { workspaceId, seguimiento, onCambio, onError };
 
   return (
@@ -104,6 +107,7 @@ export function SeccionMedicion({
         esCurador={esCurador}
         esLead={esLead}
         puedeFirmar={rol === firmaG6}
+        g7Aprobado={g7Aprobado}
       />
       {seguimiento.registry?.estado === 'firmado' &&
         seguimiento.entradas.map((entrada) => (
@@ -123,6 +127,7 @@ function BloqueRegistry({
   esCurador,
   esLead,
   puedeFirmar,
+  g7Aprobado,
   onCambio,
   onError,
 }: Comunes & {
@@ -130,6 +135,7 @@ function BloqueRegistry({
   esCurador: boolean;
   esLead: boolean;
   puedeFirmar: boolean;
+  g7Aprobado: boolean;
 }) {
   const [ocupado, setOcupado] = useState(false);
   const [editando, setEditando] = useState<string | null>(null);
@@ -279,7 +285,7 @@ function BloqueRegistry({
         </span>
       )}
 
-      {firmado && seguimiento.retoEstado === 'activo' && esLead && (
+      {firmado && seguimiento.retoEstado === 'activo' && esLead && g7Aprobado && (
         <div>
           <Button
             size="sm"
@@ -294,6 +300,12 @@ function BloqueRegistry({
             Abrir la medición
           </Button>
         </div>
+      )}
+      {firmado && seguimiento.retoEstado === 'activo' && esLead && !g7Aprobado && (
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+          La medición se abre al aprobarse el G7: primero se concilian los releases contra
+          la design version y se constata el effective state.
+        </span>
       )}
     </Card>
   );
@@ -558,6 +570,13 @@ function FormularioEntrada({
   );
 }
 
+/** Último día que la base aceptaría para un snapshot: el cierre de la ventana firmada o
+ * hoy, lo que llegue antes. */
+function maxFechaDeSnapshot(entrada: EntradaDeRegistry): string {
+  const hoy = new Date().toISOString().slice(0, 10);
+  return entrada.ventanaFin !== null && entrada.ventanaFin < hoy ? entrada.ventanaFin : hoy;
+}
+
 function BloqueSerie({
   workspaceId,
   seguimiento,
@@ -667,7 +686,15 @@ function BloqueSerie({
             onChange={(e) => setValor(e.target.value)}
             style={{ width: 110 }}
           />
-          <Input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} />
+          {/* La ventana firmada acota qué mide el dato (I5) y el futuro no se ha medido:
+              el calendario ofrece solo lo que la base aceptaría. */}
+          <Input
+            type="date"
+            value={fecha}
+            min={entrada.ventanaInicio ?? undefined}
+            max={maxFechaDeSnapshot(entrada)}
+            onChange={(e) => setFecha(e.target.value)}
+          />
           <Input
             value={nota}
             placeholder="Nota (una corrección es un snapshot nuevo)"

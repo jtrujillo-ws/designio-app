@@ -177,6 +177,40 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     expect(perfil?.membresias.map((m) => m.workspaceId).sort()).toEqual([ws, wsB].sort());
   });
 
+  it('una cuenta migrada (origen null) la adopta el primer workspace que la invita', async () => {
+    const emailMigrada = `${marca}-migrada@test.demo`;
+    const admin = sqlAdmin();
+    // Simula el backfill pre-auth de la migración: invitado sin origen ni token.
+    const [u] = await admin`insert into usuario (email, nombre, estado)
+      values (${emailMigrada}, 'Migrada Test', 'invitado') returning id`;
+    const migradaId = u!.id as string;
+    try {
+      const inv = await crearInvitacion(leadId, {
+        workspaceId: ws,
+        email: emailMigrada,
+        nombre: 'Migrada Test',
+        rol: 'stakeholder',
+      });
+      expect(inv.usuarioId).toBe(migradaId);
+      expect(inv.token).toBeTruthy(); // adoptó el origen y emitió enlace
+
+      // Desde la adopción, otro tenant ya no recibe ni pisa el token.
+      const ajena = await crearInvitacion(leadBId, {
+        workspaceId: wsB,
+        email: emailMigrada,
+        nombre: 'Migrada Test',
+        rol: 'stakeholder',
+      });
+      expect(ajena.token).toBeNull();
+
+      const activada = await activarConToken(inv.token!, 'ClaveMigrada123');
+      expect(activada?.id).toBe(migradaId);
+    } finally {
+      await admin`delete from miembro where usuario_id = ${migradaId}`;
+      await admin`delete from usuario where id = ${migradaId}`;
+    }
+  });
+
   it('invitar a una cuenta ya activa agrega la membresía sin token nuevo', async () => {
     const inv = await crearInvitacion(leadId, {
       workspaceId: ws,

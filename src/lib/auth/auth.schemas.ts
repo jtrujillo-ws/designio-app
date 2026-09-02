@@ -32,11 +32,16 @@ export const LoginSchema = z.object({
 
 /** Política de contraseñas en UN lugar: el schema es la autoridad; la UI deriva de aquí. */
 export const PASSWORD_MIN = 10;
+/** bcrypt solo usa los primeros 72 BYTES: aceptar más truncaría en silencio y dos
+ * contraseñas distintas con el mismo prefijo autenticarían igual. */
+export const PASSWORD_MAX_BYTES = 72;
 
 export const PasswordNuevaSchema = z
   .string()
   .min(PASSWORD_MIN, `La contraseña necesita al menos ${PASSWORD_MIN} caracteres`)
-  .max(200, 'Demasiado larga');
+  .refine((p) => new TextEncoder().encode(p).length <= PASSWORD_MAX_BYTES, {
+    message: `Máximo ${PASSWORD_MAX_BYTES} bytes (límite de bcrypt): usa una contraseña más corta`,
+  });
 
 export const EstablecerPasswordSchema = z.object({
   token: z.string().min(1),

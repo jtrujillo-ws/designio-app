@@ -37,6 +37,16 @@ update miembro m set usuario_id = u.id
 from usuario u
 where m.usuario_id is null and lower(u.email) = lower(m.email);
 
+-- El constraint viejo (workspace_id, email) era case-sensitive: 'Alice@' y 'alice@'
+-- podían coexistir como miembros y el backfill los mapea al MISMO usuario global.
+-- Se conserva la membresía más antigua por (workspace_id, usuario_id) para que el
+-- constraint nuevo no aborte la migración. En una base fresca es un no-op.
+delete from miembro m
+using miembro m2
+where m.workspace_id = m2.workspace_id
+  and m.usuario_id = m2.usuario_id
+  and (m.creado_en > m2.creado_en or (m.creado_en = m2.creado_en and m.id::text > m2.id::text));
+
 alter table miembro alter column usuario_id set not null;
 alter table miembro add constraint miembro_usuario_unico unique (workspace_id, usuario_id);
 
@@ -112,9 +122,13 @@ begin
     returning id into v_id;
     v_estado := 'invitado';
     v_emitido := true;
-  elsif v_estado = 'invitado' and v_origen = p_workspace then
+  elsif v_estado = 'invitado' and (v_origen = p_workspace or v_origen is null) then
+    -- Origen NULL = cuenta creada por el backfill de esta migración (pre-auth), sin
+    -- invitación viva. El primer workspace que la invite ADOPTA el origen — el mismo
+    -- modelo de confianza que una cuenta nueva; a partir de ahí, solo él re-emite.
     update usuario u
-    set invitacion_token_hash = p_token_hash, invitacion_expira = p_expira, actualizado_en = now()
+    set invitacion_token_hash = p_token_hash, invitacion_expira = p_expira,
+        invitacion_origen_ws = p_workspace, actualizado_en = now()
     where u.id = v_id;
     v_emitido := true;
   end if;

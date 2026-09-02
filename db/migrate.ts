@@ -37,7 +37,15 @@ async function main() {
       console.warn('APP_DB_PASSWORD no definido: usando la credencial de DESARROLLO para designio_app');
       appPassword = 'designio_app_dev';
     }
-    await sql.unsafe(`create role designio_app login password '${appPassword.replaceAll("'", "''")}'`);
+    // CREATE ROLE es DDL y no admite parámetros bind del driver; para no interpolar el
+    // secreto a mano, viaja como parámetro real hasta set_config (transaction-local) y el
+    // servidor lo quotea con format('%L') dentro del DO block.
+    await sql.begin(async (tx) => {
+      await tx`select set_config('app.bootstrap_password', ${appPassword}, true)`;
+      await tx.unsafe(
+        `do $$ begin execute format('create role designio_app login password %L', current_setting('app.bootstrap_password', true)); end $$`,
+      );
+    });
     console.log('rol designio_app creado (no privilegiado)');
   }
 

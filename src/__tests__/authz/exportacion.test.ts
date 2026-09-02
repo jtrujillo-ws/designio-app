@@ -8,7 +8,10 @@ import {
 } from '@/lib/evidencia/evidencia.servicio';
 import { bytesABase64 } from '@/lib/evidencia/sanitizacion';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
-import { CATALOGO_EXPORT } from '@/lib/exportacion/exportacion.schemas';
+import {
+  CATALOGO_EXPORT,
+  type EntradaCatalogo,
+} from '@/lib/exportacion/exportacion.schemas';
 import { ErrorExportacion, exportarWorkspace } from '@/lib/exportacion/exportacion.servicio';
 import { describeAuthz } from './helpers';
 
@@ -233,18 +236,66 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     const apuntaAEvidenciaSinPodar: string[] = [];
     for (const { tabla, poda } of CATALOGO_EXPORT) {
       const columnas = columnasDe.get(tabla) ?? new Set<string>();
-      if (poda.modo !== 'fuera' && !columnas.has(poda.columna)) {
+      // `fuera` y `todo` no nombran columna: no hay nada que comprobar.
+      if (poda.modo !== 'fuera' && poda.modo !== 'todo' && !columnas.has(poda.columna)) {
         columnaInexistente.push(`${tabla}.${poda.columna}`);
       }
       if (
         columnas.has('evidencia_id') &&
-        !(poda.modo === 'fuera' || (poda.modo === 'porEvidencia' && poda.columna === 'evidencia_id'))
+        !(
+          poda.modo === 'fuera' ||
+          (poda.modo === 'porEvidencia' && poda.columna === 'evidencia_id')
+        )
       ) {
         apuntaAEvidenciaSinPodar.push(tabla);
       }
     }
     expect(columnaInexistente).toEqual([]);
     expect(apuntaAEvidenciaSinPodar).toEqual([]);
+  });
+
+  it('el entregable no exporta hijos cuyos padres se quedaron fuera', async () => {
+    // La regla: una fila viaja solo si viaja aquello a lo que apunta. Sin ella, el paquete
+    // sale con `afirmacion_id` o `arquetipo_id` colgando —fragmentos permitidos que el
+    // receptor no puede asociar a nada— y encima con material copiado que no aporta.
+    // Las FKs REALES de la base son la fuente de verdad: así la regla también alcanza a
+    // las tablas que otras ramas añadan, sin que nadie tenga que acordarse.
+    const admin = sqlAdmin();
+    const fks = await admin`select
+        c.conrelid::regclass::text as hija,
+        c.confrelid::regclass::text as padre
+      from pg_constraint c
+      where c.contype = 'f' and c.connamespace = 'public'::regnamespace
+        and c.conrelid <> c.confrelid`;
+    const catalogo: readonly EntradaCatalogo[] = CATALOGO_EXPORT;
+    const dentro = new Map(
+      catalogo.filter((e) => e.poda.modo !== 'fuera').map((e) => [e.tabla, e]),
+    );
+    const colgando: string[] = [];
+    for (const fk of fks) {
+      const hija = fk.hija as string;
+      const padre = fk.padre as string;
+      const entrada = dentro.get(hija);
+      if (!entrada) continue; // la hija no viaja: no puede dejar nada colgando
+      if (dentro.has(padre)) continue; // el padre viaja con ella
+      // `workspace` y `usuario` no son objetos del catálogo (no llevan workspace_id): el
+      // paquete los referencia por id a propósito, igual que cualquier export.
+      if (padre === 'workspace' || padre === 'usuario') continue;
+      const declarado = entrada.padresAusentes?.some((p) => p.tabla === padre) ?? false;
+      if (!declarado) colgando.push(`${hija} → ${padre}`);
+    }
+    expect(colgando).toEqual([]);
+
+    // Y la excepción declarada tiene que ser real: si alguien la escribe para una FK que
+    // no existe, el test también lo dice.
+    const declaradasInexistentes: string[] = [];
+    for (const entrada of catalogo) {
+      for (const p of entrada.padresAusentes ?? []) {
+        const existe = fks.some((fk) => fk.hija === entrada.tabla && fk.padre === p.tabla);
+        if (!existe) declaradasInexistentes.push(`${entrada.tabla} → ${p.tabla}`);
+      }
+    }
+    expect(declaradasInexistentes).toEqual([]);
   });
 
   it('el archivo del propietario lo lleva TODO, incluida la evidencia sin derechos', async () => {
@@ -346,20 +397,23 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     // evidencia existe y qué dice de ella el razonamiento.
     const paquete = await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'entregable' });
 
-    expect(paquete.datos.cita!.map((c) => c.evidencia_id)).toEqual([evConDerechos]);
-    expect(paquete.datos.contradiccion!.map((c) => c.evidencia_id)).toEqual([evConDerechos]);
-    expect(paquete.datos.arquetipo_evidencia!.map((a) => a.evidencia_id)).toEqual([
-      evConDerechos,
-    ]);
-    expect(paquete.manifiesto.conteos.cita).toBe(1);
+    // Las anotaciones sobre razonamiento salen ENTERAS del entregable: sus padres
+    // (afirmación, insight, arquetipo) no viajan, así que podarlas por derechos dejaba
+    // ids colgando. Con ellas se va también el `fragmento` copiado del original.
+    expect(paquete.datos.cita).toBeUndefined();
+    expect(paquete.datos.contradiccion).toBeUndefined();
+    expect(paquete.datos.arquetipo_evidencia).toBeUndefined();
 
     // La prueba que de verdad importa: el texto del material sin derechos no está en
     // NINGUNA parte del paquete, ni siquiera copiado dentro de otra tabla. Su id sí
     // aparece —en `bloqueadas`, con el motivo—: SYS-14 pide bloquear EXPLICANDO, y lo
     // que se protege es el contenido, no la existencia de la evidencia.
+    // Ahora NINGÚN fragmento viaja, ni el permitido: las citas salen enteras del paquete
+    // porque su afirmación no viaja. El material copiado deja de estar en el entregable
+    // por partida doble — por derechos y por no tener a qué agarrarse.
     const serializado = JSON.stringify(paquete);
     expect(serializado).not.toContain(FRAGMENTO_BLOQUEADO);
-    expect(serializado).toContain(FRAGMENTO_CITABLE);
+    expect(serializado).not.toContain(FRAGMENTO_CITABLE);
   });
 
   it('la exportación la ejecuta quien administra u opera el workspace, no cualquiera', async () => {

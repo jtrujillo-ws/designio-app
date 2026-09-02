@@ -113,6 +113,8 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     if (wss.length > 0) {
       await admin`delete from evento_dominio where workspace_id in ${admin(wss)}`;
       await admin`delete from checklist_item where workspace_id in ${admin(wss)}`;
+      await admin`delete from arquetipo_evidencia where workspace_id in ${admin(wss)}`;
+      await admin`delete from arquetipo where workspace_id in ${admin(wss)}`;
       await admin`delete from cita where workspace_id in ${admin(wss)}`;
       await admin`delete from contradiccion where workspace_id in ${admin(wss)}`;
       await admin`delete from afirmacion where workspace_id in ${admin(wss)}`;
@@ -473,7 +475,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(cita.citaId).toBeTruthy();
   });
 
-  it('las superficies con guard de derechos son exactamente checklist_item y cita', async () => {
+  it('el inventario de superficies de ENLACE está completo: guard o motivo, sin terceras vías', async () => {
     // Un solo guard compartido y un trigger por tabla: mientras la regla estuvo escrita
     // en una función con nombre de tabla, «añadir la siguiente superficie» significó
     // reescribirla — y por eso faltó. Este test fija el conjunto: quitar un trigger o
@@ -487,7 +489,38 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         where p.proname = 'evidencia_citable_guard' and not t.tgisinternal
         order by 1`
     ).map((f) => f.tabla as string);
-    expect(tablas).toEqual(['arquetipo_evidencia', 'checklist_item', 'cita']);
+    expect(tablas).toEqual([
+      'arquetipo_evidencia',
+      'checklist_item',
+      'cita',
+      'journey_nodo_evidencia',
+    ]);
+
+    // La otra mitad del inventario: de las NUEVE tablas con `evidencia_id`, las cuatro de
+    // arriba llevan guard y las cinco restantes quedan fuera con motivo. Se comprueba
+    // contra las columnas REALES para que una tabla nueva con `evidencia_id` obligue a
+    // decidir en vez de heredar el silencio.
+    const conEvidenciaId = (
+      await admin`select c.table_name from information_schema.columns c
+        join information_schema.tables t
+          on t.table_name = c.table_name and t.table_schema = c.table_schema
+        where c.column_name = 'evidencia_id' and c.table_schema = 'public'
+          and t.table_type = 'BASE TABLE'
+        order by 1`
+    ).map((f) => f.table_name as string);
+    const fueraConMotivo = [
+      // Se registra y se muestra SIEMPRE (RF-03.9); la levanta cualquier miembro.
+      'contradiccion',
+      // ES el registro de derechos: guardarlo contra sí mismo no significa nada.
+      'derecho_uso',
+      // Parte de la DEFINICIÓN de la evidencia, escrita al curarla (derechos aún pendientes).
+      'evidencia_segmento',
+      // Conversación SOBRE la evidencia: es donde se discute el bloqueo, no un uso de él.
+      'hilo_comentario',
+      // El sello de la curaduría por el otro extremo: el alta, no un uso aguas abajo.
+      'item_importacion',
+    ];
+    expect([...tablas, ...fueraConMotivo].sort()).toEqual(conEvidenciaId);
 
     // `arquetipo_evidencia` entró en 20260902200000 tras haberla dejado fuera por un
     // argumento equivocado: se creía apoyo interno que no se publica, y es respaldo
@@ -1346,6 +1379,80 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         set decidido_en = now() - interval '30 days'
         where evidencia_id = ${evConDerechos} and workspace_id = ${ws}`),
     ).rejects.toMatchObject({ code: '42501' });
+  });
+
+  it('G2 no se aprueba con un arquetipo cuyo respaldo perdió los derechos (eje TIEMPO)', async () => {
+    // Un trigger de ENLACE comprueba al escribir y no vuelve a correr. Confirmar un
+    // arquetipo exige evidencia enlazada, pero eso se comprobó al confirmarlo: entre aquel
+    // momento y la aprobación de G2 —que ocurre con el cliente delante— pueden revocarse
+    // los derechos, y el perfil deja de sostenerse sin que nada lo mire. Es el mismo
+    // agujero temporal que ya se cerró para los ítems de checklist, en el último sitio
+    // donde un gate consume respaldo sin re-comprobarlo.
+    const admin = sqlAdmin();
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'nota', 'Fuente del arquetipo', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, 'Perfil observado', '{}'::jsonb, ${leadId})
+      returning id`;
+    const evPerfil = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evPerfil}, 'concedido', 'cliente', 'Consentimiento vigente',
+              ${leadId}, now(), ${leadId})`;
+
+    const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-94', 'Proyecto arquetipo', ${leadId}) returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 2, 'Análisis y entendimiento')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 2, 'lead-boutique') returning id`;
+    const gateId = gate!.id as string;
+    const [ci] = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gateId}, 0, 'Arquetipos resueltos') returning id`;
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: ci!.id as string,
+      accion: { tipo: 'cumplido', objetoClase: 'evidencia', objetoId: evConDerechos },
+    });
+    // Arquetipo CONFIRMADO con su evidencia: el veredicto se emitió cuando los derechos
+    // estaban vigentes, que es justo la premisa del agujero.
+    const [arq] = await admin`insert into arquetipo
+      (workspace_id, reto_id, nombre, estado, veredicto_razon, creado_por)
+      values (${ws}, ${retoId}, ${'Perfil ' + marca}, 'confirmado', 'Encaja con lo observado', ${leadId})
+      returning id`;
+    await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+      values (${ws}, ${arq!.id as string}, ${evPerfil})`;
+
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evPerfil,
+      decision: 'denegado',
+      ambito: 'interno',
+      base: 'El titular retiró el consentimiento',
+      venceEn: null,
+    });
+    // El arquetipo sigue CONFIRMADO y sin hipótesis pendientes: la regla que ya existía
+    // («no quedan arquetipos por resolver») no ve nada raro. Lo que falla es el respaldo.
+    const [estado] = await conUsuario(leadId, (tx) => tx`select estado from arquetipo
+      where id = ${arq!.id as string}`);
+    expect(estado!.estado).toBe('confirmado');
+    await expect(aprobarGate(leadId, { workspaceId: ws, gateId })).rejects.toThrow(
+      /arquetipo confirmado ya no tiene ninguna evidencia con derechos vigentes/,
+    );
+
+    await decidirDerechos(leadId, {
+      workspaceId: ws,
+      evidenciaId: evPerfil,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Nuevo consentimiento firmado',
+      venceEn: null,
+    });
+    const r = await aprobarGate(leadId, { workspaceId: ws, gateId });
+    expect(r.numero).toBe(2);
   });
 
   // ── Higiene de la migración y del seed ──

@@ -66,6 +66,15 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       values (${ws}, ${fuente!.id as string}, 'Observación en sucursal', '{}'::jsonb, ${leadId})
       returning id`;
     evidenciaId = ev!.id as string;
+    // Enlazar evidencia a un nodo es respaldo: satisface la validación «paso sin
+    // evidencia» y se congela en un snapshot que va al cliente, así que exige derechos
+    // vigentes para el ámbito cliente (RF-03.10). El caso contrario lo cubre la suite de
+    // evidencia profunda. El insert directo como admin se salta el constraint trigger que
+    // lo exigiría desde la app, por eso hay que ponerlo a mano.
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaId}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${leadId}, now(), ${leadId})`;
   });
 
   afterAll(async () => {
@@ -79,6 +88,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     await admin`delete from journey_nodo where workspace_id = ${ws}`;
     await admin`delete from journey where workspace_id = ${ws}`;
     await admin`delete from catalogo_journey where workspace_id = ${ws}`;
+    await admin`delete from derecho_uso where workspace_id = ${ws}`;
     await admin`delete from evidencia where workspace_id = ${ws}`;
     await admin`delete from fuente where workspace_id = ${ws}`;
     await admin`delete from arquetipo where workspace_id = ${ws}`;

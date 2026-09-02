@@ -47,14 +47,31 @@ export type Exportar = z.infer<typeof ExportarSchema>;
  *    tabla `evidencia`): sale solo si esa evidencia tiene derechos vigentes.
  *  · `porFuente` / `porItem` — séquito indirecto: la fuente de la que nace la evidencia
  *    y el material importado cuyos adjuntos son su original.
+ *  · `todo`         — viaja completa. Reservado para el modelo PROPIO del cliente que no
+ *    cuelga de ninguna evidencia y que hace legible lo que sí cuelga: hoy solo `segmento`,
+ *    sin el cual los vínculos de segmento de la evidencia serían uuids colgando. No es el
+ *    `default: true` de antes disfrazado: hay que escribirlo tabla por tabla y justificarlo.
  */
 export type PodaEntregable =
   | { modo: 'fuera' }
+  | { modo: 'todo' }
   | { modo: 'porEvidencia'; columna: string }
   | { modo: 'porFuente'; columna: string }
   | { modo: 'porItem'; columna: string };
 
-export type EntradaCatalogo = { tabla: string; orden: string; poda: PodaEntregable };
+export type EntradaCatalogo = {
+  tabla: string;
+  orden: string;
+  poda: PodaEntregable;
+  /**
+   * Tablas a las que esta apunta por FK y que a propósito NO viajan en el entregable, con
+   * el motivo. La regla general es que **una fila viaja solo si viaja aquello a lo que
+   * apunta**: exportar hijos cuyos padres se podaron deja al receptor con ids colgando y
+   * fragmentos que no puede asociar a nada. Un test estructural contrasta esta declaración
+   * con las FKs REALES de la base, así que una excepción nueva no pasa sin escribirse aquí.
+   */
+  padresAusentes?: readonly { tabla: string; motivo: string }[];
+};
 
 /**
  * Catálogo de objetos del workspace: la lista contra la que se verifica que la
@@ -70,7 +87,9 @@ export type EntradaCatalogo = { tabla: string; orden: string; poda: PodaEntregab
  */
 export const CATALOGO_EXPORT = [
   { tabla: 'miembro', orden: 'creado_en, id', poda: { modo: 'fuera' } },
-  { tabla: 'segmento', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  // Los segmentos son la taxonomía del PROPIO cliente, no material de terceros, y sin
+  // ellos `evidencia_segmento` viajaría apuntando a uuids que no están en el paquete.
+  { tabla: 'segmento', orden: 'creado_en, id', poda: { modo: 'todo' } },
   { tabla: 'servicio', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reto', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reto_servicio_afectado', orden: 'reto_id, servicio_id', poda: { modo: 'fuera' } },
@@ -97,29 +116,21 @@ export const CATALOGO_EXPORT = [
   // esto, el archivo entregado tendría los gates pero no el porqué de cada decisión.
   { tabla: 'insight', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'afirmacion', orden: 'insight_id, orden', poda: { modo: 'fuera' } },
-  // `cita` copia el `fragmento` y la `localizacion` del original para que la lista sea
-  // legible sin abrir cada evidencia: es la tabla del catálogo que MÁS material de
-  // terceros lleva dentro. Si su evidencia no viaja, la cita tampoco — de lo contrario
-  // el entregable publicaría el fragmento de un material sin derechos vigentes.
-  {
-    tabla: 'cita',
-    orden: 'creado_en, id',
-    poda: { modo: 'porEvidencia', columna: 'evidencia_id' },
-  },
-  {
-    tabla: 'contradiccion',
-    orden: 'creado_en, id',
-    poda: { modo: 'porEvidencia', columna: 'evidencia_id' },
-  },
+  // `cita`, `contradiccion` y `arquetipo_evidencia` son ANOTACIONES sobre razonamiento que
+  // el entregable no lleva (insight, afirmación, arquetipo). Podarlas por derechos —como
+  // estaban— dejaba filas con `afirmacion_id` e `insight_id` colgando: fragmentos
+  // permitidos que el receptor no puede asociar a la afirmación que sostienen. Se aplica
+  // la regla general (una fila viaja solo si viaja aquello a lo que apunta) y salen
+  // enteras; de paso, el `fragmento` copiado del original deja de estar en el paquete.
+  // Si algún día el entregable lleva la cadena de razonamiento, vuelven CON sus padres y
+  // el test estructural lo exigirá.
+  { tabla: 'cita', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'contradiccion', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'decision', orden: 'decidido_en, id', poda: { modo: 'fuera' } },
   { tabla: 'decision_insight', orden: 'decision_id, insight_id', poda: { modo: 'fuera' } },
   { tabla: 'arquetipo', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'arquetipo_segmento', orden: 'arquetipo_id, segmento_id', poda: { modo: 'fuera' } },
-  {
-    tabla: 'arquetipo_evidencia',
-    orden: 'arquetipo_id, evidencia_id',
-    poda: { modo: 'porEvidencia', columna: 'evidencia_id' },
-  },
+  { tabla: 'arquetipo_evidencia', orden: 'arquetipo_id, evidencia_id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_etapa', orden: 'reabierto_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id', poda: { modo: 'fuera' } },
   // Journey (SPEC-05): el mapa del servicio, su catálogo de touchpoints/canales/sistemas,
@@ -152,6 +163,16 @@ export const CATALOGO_EXPORT = [
     tabla: 'archivo_importado',
     orden: 'creado_en, id',
     poda: { modo: 'porItem', columna: 'item_id' },
+    // Su padre NO viaja, y es deliberado: las filas de la bandeja llevan `contenido`, el
+    // texto crudo del material de terceros. En vez del padre se publica el enlace útil
+    // (`evidenciaId` en cada adjunto), que es lo que el receptor necesita.
+    padresAusentes: [
+      {
+        tabla: 'item_importacion',
+        motivo:
+          'sus filas llevan el texto crudo del material; el adjunto publica en su lugar el evidenciaId',
+      },
+    ],
   },
   { tabla: 'evento_dominio', orden: 'creado_en, id', poda: { modo: 'fuera' } },
 ] as const satisfies readonly EntradaCatalogo[];

@@ -81,11 +81,10 @@ export async function exportarWorkspace(
     // RLS: un workspace ajeno simplemente no existe para esta sesión.
     if (!ws) throw new ErrorExportacion('El workspace no existe o no eres miembro');
 
-    // Qué puede viajar en un entregable: lo decide la VISTA de la base, no un where de
-    // la app. De ahí se derivan también las fuentes y los items cuyo séquito acompaña a
-    // esa evidencia, para que el paquete sea internamente consistente.
-    const filtro =
-      entrada.ambito === 'entregable' ? await filtroEntregable(tx, entrada.workspaceId) : null;
+    // Qué puede viajar en un entregable lo decide la VISTA de la base, no un where de la
+    // app, y el predicado se aplica dentro de cada consulta: nada del séquito de una
+    // evidencia bloqueada llega a materializarse.
+    const entregable = entrada.ambito === 'entregable';
 
     const bloqueadas: EvidenciaBloqueada[] =
       entrada.ambito === 'entregable'
@@ -110,14 +109,14 @@ export async function exportarWorkspace(
       // En el entregable solo viaja lo que cuelga de evidencia con derechos, y CÓMO se
       // poda cada tabla lo declara su propia entrada del catálogo (no un switch aparte
       // que pueda quedarse corto).
-      if (entrada.ambito === 'entregable' && poda.modo === 'fuera') continue;
+      if (entregable && poda.modo === 'fuera') continue;
 
-      const filas = await filasDeTabla(tx, tabla, orden, entrada.workspaceId, filtro, poda);
+      const filas = await filasDeTabla(tx, tabla, orden, entrada.workspaceId, entregable, poda);
       datos[tabla] = filas;
       conteos[tabla] = filas.length;
     }
 
-    const archivos = await archivosDelExport(tx, entrada.workspaceId, filtro);
+    const archivos = await archivosDelExport(tx, entrada.workspaceId, entregable);
     const bytesIncluidos = archivos
       .filter((a) => a.contenidoBase64 !== null)
       .reduce((suma, a) => suma + a.bytes, 0);
@@ -152,89 +151,70 @@ export async function exportarWorkspace(
   }, { aislamiento: 'repeatable read' });
 }
 
-/** Alcance del paquete entregable, derivado ENTERAMENTE de la vista de la base. */
-type FiltroEntregable = {
-  evidencias: Set<string>;
-  fuentes: Set<string>;
-  /** Items de la bandeja cuya curaduría produjo evidencia con derechos: sus adjuntos
-   * son los originales que el entregable sí puede llevar. */
-  items: Set<string>;
-};
-
-async function filtroEntregable(
-  tx: TransactionSql,
-  workspaceId: string,
-): Promise<FiltroEntregable> {
-  const evidencias = await tx`select id, fuente_id from evidencia_entregable
-    where workspace_id = ${workspaceId}`;
-  const ids = new Set(evidencias.map((f) => f.id as string));
-  const items = await tx`select id from item_importacion
-    where workspace_id = ${workspaceId} and evidencia_id is not null
-      and evidencia_id in (select id from evidencia_entregable where workspace_id = ${workspaceId})`;
-  return {
-    evidencias: ids,
-    fuentes: new Set(evidencias.map((f) => f.fuente_id as string)),
-    items: new Set(items.map((f) => f.id as string)),
-  };
-}
-
 /**
- * Vuelca una tabla del catálogo. El nombre de tabla y el orden vienen de `CATALOGO_EXPORT`,
- * una constante del código: no hay interpolación de entrada del usuario. El workspace sí
- * viaja como parámetro. `archivo_importado` excluye la columna `contenido` (los bytes
- * salen aparte, en base64 y con presupuesto).
+ * Vuelca una tabla del catálogo aplicando su poda EN SQL.
+ *
+ * El nombre de tabla, el orden y la columna de poda vienen de `CATALOGO_EXPORT`, una
+ * constante del código: no hay interpolación de entrada del usuario. El workspace viaja
+ * como parámetro. `archivo_importado` excluye la columna `contenido` (los bytes salen
+ * aparte, en base64 y con presupuesto).
+ *
+ * La poda se aplica en la consulta y no sobre el resultado. Antes se traía la tabla
+ * ENTERA —con todas sus columnas de texto— y se filtraba en memoria con un `Set`, que es
+ * la misma forma de fallo que el presupuesto de adjuntos ya había corregido: un workspace
+ * con mucha historia revocada materializaba justo lo que el paquete no iba a llevar. Y
+ * como el predicado se evalúa contra `evidencia_entregable` dentro de la misma
+ * transacción REPEATABLE READ, sigue siendo la misma foto — de hecho una más estrecha,
+ * porque ahora se resuelve dentro de la propia sentencia.
  */
 async function filasDeTabla(
   tx: TransactionSql,
   tabla: string,
   orden: string,
   workspaceId: string,
-  filtro: FiltroEntregable | null,
+  entregable: boolean,
   poda: PodaEntregable,
 ): Promise<FilaExportada[]> {
   const columnas = tabla === 'archivo_importado' ? COLUMNAS_ARCHIVO : '*';
+  const filtro = entregable ? predicadoDePoda(poda) : '';
   const filas = (await tx.unsafe(
-    `select ${columnas} from ${tabla} where workspace_id = $1 order by ${orden}`,
+    `select ${columnas} from ${tabla} where workspace_id = $1${filtro} order by ${orden}`,
     [workspaceId],
   )) as unknown as Record<string, unknown>[];
-  if (!filtro) return filas.map(normalizarFila);
-  return filas.filter((f) => enElEntregable(poda, f, filtro)).map(normalizarFila);
+  return filas.map(normalizarFila);
 }
 
-const COLUMNAS_ARCHIVO =
-  'id, workspace_id, item_id, nombre, tipo_mime, sha256, creado_por, creado_en';
+/** Evidencia con derechos vigentes para el cliente: lo decide la VISTA de la base, y todo
+ * lo demás del entregable se poda contra ella. */
+const EVIDENCIA_PERMITIDA = 'select id from evidencia_entregable where workspace_id = $1';
 
 /**
- * Poda del séquito de la evidencia, según lo que DECLARA el catálogo. La evidencia misma
- * ya la filtró la vista; aquí se quitan su fuente, sus vínculos de segmento, sus derechos,
- * sus adjuntos y todo lo que la cita cuando ella no viaja — un entregable que llevara el
- * documento original (o el fragmento citado) de algo que no puede citarse sería el mismo
- * agujero por otra puerta.
- *
- * Sin `default`: el `switch` es exhaustivo sobre la unión discriminada, así que añadir un
- * modo de poda sin darle rama aquí no compila. Antes había un `default: true` y era él
- * quien dejaba pasar enteras `cita`, `contradiccion` y `arquetipo_evidencia`.
+ * La poda del catálogo, traducida a SQL. Sin `default`: el `switch` es exhaustivo sobre la
+ * unión discriminada, así que un modo nuevo sin rama no compila. `fuera` no aparece porque
+ * esas tablas ni se consultan en el ámbito entregable.
  */
-function enElEntregable(
-  poda: PodaEntregable,
-  fila: Record<string, unknown>,
-  filtro: FiltroEntregable,
-): boolean {
+function predicadoDePoda(poda: PodaEntregable): string {
   switch (poda.modo) {
     case 'fuera':
-      return false;
+      return ' and false';
+    case 'todo':
+      return '';
     case 'porEvidencia':
-      return filtro.evidencias.has(fila[poda.columna] as string);
+      return ` and ${poda.columna} in (${EVIDENCIA_PERMITIDA})`;
     case 'porFuente':
-      return filtro.fuentes.has(fila[poda.columna] as string);
+      return ` and ${poda.columna} in (select fuente_id from evidencia_entregable where workspace_id = $1)`;
     case 'porItem':
-      return filtro.items.has(fila[poda.columna] as string);
+      return ` and ${poda.columna} in (select id from item_importacion
+        where workspace_id = $1 and evidencia_id in (${EVIDENCIA_PERMITIDA}))`;
     default: {
       const nunca: never = poda;
       return nunca;
     }
   }
 }
+
+const COLUMNAS_ARCHIVO =
+  'id, workspace_id, item_id, nombre, tipo_mime, sha256, creado_por, creado_en';
 
 /** Los timestamptz salen como texto ISO (el driver los entrega como Date, que no cruza
  * la frontera de serialización); el resto ya es JSON puro — uuid/text/int/jsonb. */
@@ -269,7 +249,7 @@ function normalizarFila(fila: Record<string, unknown>): FilaExportada {
 async function archivosDelExport(
   tx: TransactionSql,
   workspaceId: string,
-  filtro: FiltroEntregable | null,
+  entregable: boolean,
 ): Promise<ArchivoExportado[]> {
   // `evidencia_id` viaja con cada adjunto porque la correspondencia item → evidencia solo
   // vive en `item_importacion`, que el entregable NO lleva (sus filas cargan el texto
@@ -281,14 +261,16 @@ async function archivosDelExport(
     from archivo_importado a
     join item_importacion i on i.id = a.item_id and i.workspace_id = a.workspace_id
     where a.workspace_id = ${workspaceId}
+      ${entregable
+        ? tx`and i.evidencia_id in (select id from evidencia_entregable
+              where workspace_id = ${workspaceId})`
+        : tx``}
     order by a.creado_en, a.id`;
 
   const salida: ArchivoExportado[] = [];
   const seleccionados: string[] = [];
   let presupuesto = PRESUPUESTO_ADJUNTOS_BYTES;
   for (const f of metadatos) {
-    if (filtro && !filtro.items.has(f.item_id as string)) continue;
-
     const bytes = f.bytes as number;
     const cabe = bytes <= presupuesto;
     if (cabe) {

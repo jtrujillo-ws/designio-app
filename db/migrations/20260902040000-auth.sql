@@ -107,11 +107,18 @@ $$;
 -- (token_emitido dice si esta llamada emitió uno). Un workspace distinto agrega su
 -- membresía sin recibir ni pisar el token: evita el takeover cross-tenant de cuentas
 -- pendientes y que una segunda invitación invalide el enlace de la primera.
+-- La fila se lee FOR UPDATE: sin el lock, una activación concurrente entre la lectura
+-- y el UPDATE dejaba token y origen restaurados sobre una cuenta ya activa (enlace
+-- que activar_usuario_con_token jamás consume), y dos adopciones simultáneas de un
+-- origen NULL podían emitir dos enlaces pisándose entre sí. Con el lock, la condición
+-- de cada rama se evalúa sobre el estado definitivo de la fila.
+-- Devuelve además el estado de la cuenta: el servicio corta la invitación si está
+-- desactivada (autenticar la rechazaría y no existe flujo de reactivación).
 -- Autoriza por sí misma (actor con rol que invita en p_workspace) además de la política
 -- de INSERT de miembro que aplica en la misma transacción.
 create or replace function preparar_invitacion(
   p_email text, p_nombre text, p_token_hash text, p_expira timestamptz, p_workspace uuid
-) returns table (usuario_id uuid, requiere_activacion boolean, token_emitido boolean)
+) returns table (usuario_id uuid, requiere_activacion boolean, token_emitido boolean, estado text)
 language plpgsql security definer set search_path = public as
 $$
 declare
@@ -127,7 +134,8 @@ begin
 
   select u.id, u.estado, u.invitacion_origen_ws
     into v_id, v_estado, v_origen
-  from usuario u where lower(u.email) = lower(p_email);
+  from usuario u where lower(u.email) = lower(p_email)
+  for update;
 
   if v_id is null then
     insert into usuario (email, nombre, estado, invitacion_token_hash, invitacion_expira, invitacion_origen_ws)
@@ -146,7 +154,7 @@ begin
     v_emitido := true;
   end if;
 
-  return query select v_id, (v_estado = 'invitado'), v_emitido;
+  return query select v_id, (v_estado = 'invitado'), v_emitido, v_estado;
 end
 $$;
 

@@ -146,11 +146,20 @@ export async function crearInvitacion(
     }
 
     const [prep] = await tx`
-      select usuario_id, requiere_activacion, token_emitido
+      select usuario_id, requiere_activacion, token_emitido, estado
       from preparar_invitacion(${entrada.email}, ${entrada.nombre}, ${tokenHash}, ${expira}, ${entrada.workspaceId})`;
     const usuarioId = prep!.usuario_id as string;
     const requiereActivacion = prep!.requiere_activacion as boolean;
     const tokenEmitido = prep!.token_emitido as boolean;
+
+    // Una cuenta global desactivada no es invitable: autenticar la rechaza y no hay
+    // flujo de reactivación — sin este corte, quien invita vería "acceso inmediato"
+    // para alguien que jamás podría entrar. El throw aborta la transacción antes de
+    // insertar la membresía (la fila quedó bloqueada por preparar_invitacion, así que
+    // el estado leído es el definitivo).
+    if ((prep!.estado as string) === 'inactivo') {
+      throw new ErrorInvitacion('La cuenta de ese correo está desactivada; no puede recibir invitaciones');
+    }
 
     const [yaMiembro] = await tx`
       select 1 as existe from miembro

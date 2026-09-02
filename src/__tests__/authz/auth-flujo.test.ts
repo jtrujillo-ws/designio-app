@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
+import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
 import {
   activarConToken,
   autenticar,
@@ -9,7 +9,7 @@ import {
   listarMiembros,
   usuarioConMembresias,
 } from '@/lib/auth/auth.servicio';
-import { hashPassword } from '@/lib/auth/password.server';
+import { hashPassword, hashTokenInvitacion } from '@/lib/auth/password.server';
 import { describeAuthz } from './helpers';
 
 /**
@@ -209,6 +209,84 @@ describeAuthz('auth nativa (login, invitación, activación)', () => {
     } finally {
       await admin`delete from miembro where usuario_id = ${migradaId}`;
       await admin`delete from usuario where id = ${migradaId}`;
+    }
+  });
+
+  it('la re-emisión se serializa contra la activación: quien llega tarde ve el estado definitivo', async () => {
+    const emailRace = `${marca}-race@test.demo`;
+    const admin = sqlAdmin();
+    const inv = await crearInvitacion(leadId, {
+      workspaceId: ws,
+      email: emailRace,
+      nombre: 'Race Test',
+      rol: 'stakeholder',
+    });
+    expect(inv.token).toBeTruthy();
+    const hashRace = await hashPassword('ClaveDeRace123');
+    try {
+      // Activación en una transacción que retiene el lock de la fila sin commitear…
+      let liberar!: () => void;
+      const compuerta = new Promise<void>((res) => (liberar = res));
+      let lockTomado!: () => void;
+      const conLock = new Promise<void>((res) => (lockTomado = res));
+      const activacion = sql().begin(async (tx) => {
+        const filas = await tx`
+          select id from activar_usuario_con_token(${hashTokenInvitacion(inv.token!)}, ${hashRace})`;
+        lockTomado();
+        await compuerta;
+        return filas;
+      });
+      await conLock;
+
+      // …mientras la re-invitación del origen espera en el FOR UPDATE de preparar_invitacion.
+      // Sin el lock leería 'invitado' desfasado y restauraría un token inconsumible
+      // sobre la cuenta ya activa; con él, ve el estado definitivo tras el commit.
+      const reinvitacion = crearInvitacion(leadId, {
+        workspaceId: ws,
+        email: emailRace,
+        nombre: 'Race Test',
+        rol: 'stakeholder',
+      }).then(
+        () => 'resuelta' as const,
+        (e: unknown) => e,
+      );
+      await new Promise((res) => setTimeout(res, 250));
+      liberar();
+
+      const activada = (await activacion) as { id?: string }[];
+      expect(activada[0]?.id).toBe(inv.usuarioId);
+      expect(await reinvitacion).toBeInstanceOf(ErrorInvitacion);
+
+      const [fila] = await admin`
+        select estado, invitacion_token_hash from usuario where id = ${inv.usuarioId}`;
+      expect(fila?.estado).toBe('activo');
+      expect(fila?.invitacion_token_hash).toBeNull();
+    } finally {
+      await admin`delete from miembro where email = ${emailRace}`;
+      await admin`delete from usuario where email = ${emailRace}`;
+    }
+  });
+
+  it('no se invita un correo cuya cuenta global está desactivada', async () => {
+    const emailInactiva = `${marca}-inactiva@test.demo`;
+    const admin = sqlAdmin();
+    const [u] = await admin`insert into usuario (email, nombre, password_hash, estado)
+      values (${emailInactiva}, 'Inactiva Test', ${await hashPassword('ClaveInactiva1')}, 'inactivo') returning id`;
+    const inactivaId = u!.id as string;
+    try {
+      await expect(
+        crearInvitacion(leadBId, {
+          workspaceId: wsB,
+          email: emailInactiva,
+          nombre: 'Inactiva Test',
+          rol: 'stakeholder',
+        }),
+      ).rejects.toThrow(/desactivada/);
+      // El corte aborta la transacción completa: la membresía no llegó a insertarse.
+      const filas = await admin`select 1 as existe from miembro where usuario_id = ${inactivaId}`;
+      expect(filas.length).toBe(0);
+    } finally {
+      await admin`delete from usuario where id = ${inactivaId}`;
     }
   });
 

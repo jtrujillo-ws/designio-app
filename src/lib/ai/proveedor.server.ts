@@ -45,7 +45,11 @@ export function credencialesAI(): {
   keyWorkspace: string | null;
   keyEntorno: string | null;
 } {
-  return { keyWorkspace: null, keyEntorno: process.env.ANTHROPIC_API_KEY ?? null };
+  // El trim va AQUÍ y no en cada uso: si evaluarCapacidadAI recortara y el llamador no,
+  // una key con un salto de línea al final se reportaría disponible y el proveedor la
+  // rechazaría con 401. Una sola lectura, una sola forma.
+  const entorno = process.env.ANTHROPIC_API_KEY?.trim();
+  return { keyWorkspace: null, keyEntorno: entorno ? entorno : null };
 }
 
 /** ¿Conviene reintentar con el modelo de respaldo? Solo cuando el fallo es del modelo o

@@ -7,6 +7,7 @@ import { bloquearReto } from '@/lib/metodo/metodo.servicio';
 import { evaluarCapacidadAI, LIMITE_PROPUESTAS_DIA } from './ai.degradacion';
 import {
   fidelidadDeCitas,
+  materialQueVeElModelo,
   MAX_MATERIAL,
   PROMPT_VERSION,
   promptCriterios,
@@ -85,7 +86,9 @@ async function estadoCapacidad(tx: TransactionSql, workspaceId: string) {
 function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   const contenido = f.contenido as ContenidoPropuesta;
   const original = f.contenido_original as ContenidoPropuesta;
-  const material = (f.material as string | null) ?? '';
+  // El material se neutraliza IGUAL que al construir el prompt: la fidelidad se mide
+  // contra lo que el modelo leyó, no contra el texto crudo de la base.
+  const material = materialQueVeElModelo((f.material as string | null) ?? '');
   const citas = 'citas' in contenido ? contenido.citas : [];
   return {
     id: f.id as string,

@@ -900,6 +900,14 @@ revoke execute on function constatacion_alcance_guard() from public;
 -- versión vigente —checklist sin pendientes y no vacío, ítems cumplidos con decisiones
 -- vigentes, orden de gates, criterios de G0 y arquetipos de G2— más la rama de G7.
 --
+-- «Vigente» significa vigente EN `agents`, no en la rama propia, y esa es la trampa: las
+-- migraciones se aplican por nombre de fichero, así que otra rama con un número MENOR que
+-- se mergee después que esta seguirá corriendo antes, y este create or replace borrará su
+-- regla sin decir nada. Antes de mergear hay que volver a copiar el cuerpo vivo de la
+-- migración más reciente que defina esta función en `agents` y añadirle esta rama —nunca
+-- reconstruirlo de memoria—, y el test de la regla ajena es la red que lo detecta: si al
+-- integrar se pone rojo, no se toca, es que falta portarla.
+--
 -- La regla NO se duplica en el WITH CHECK de gate_update_aprobar, igual que la de G2: el
 -- predicado de la política se quedó con lo que se comprueba mirando el gate y su
 -- checklist. El motivo es que la política no puede DECIR por qué falla, y aquí el porqué

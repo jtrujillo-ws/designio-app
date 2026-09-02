@@ -35,6 +35,22 @@ const dia = (delta: number) =>
 const HOY = dia(0);
 const AYER = dia(-1);
 
+/**
+ * ¿La operación sigue esperando el candado? Los dos manejadores se enganchan a la
+ * promesa EN EL ACTO —y no como una rama de un Promise.race— para que su eventual
+ * rechazo nunca quede sin observar: una promesa rechazada que nadie mira tumba la corrida
+ * entera aunque el test que la creó haya pasado.
+ */
+async function siguePendiente(operacion: Promise<unknown>): Promise<boolean> {
+  let termino = false;
+  const marcar = () => {
+    termino = true;
+  };
+  operacion.then(marcar, marcar);
+  await new Promise((r) => setTimeout(r, 250));
+  return !termino;
+}
+
 describeAuthz('entrega: design version, releases parciales, effective state y G7', () => {
   const marca = `ent-${crypto.randomUUID().slice(0, 8)}`;
   let ws = '';
@@ -995,11 +1011,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       motivo: '',
     });
     try {
-      const carrera = await Promise.race([
-        aprobacion.then(() => 'aprobada' as const),
-        new Promise<'bloqueada'>((r) => setTimeout(() => r('bloqueada'), 250)),
-      ]);
-      expect(carrera).toBe('bloqueada');
+      expect(await siguePendiente(aprobacion)).toBe(true);
     } finally {
       liberar();
     }
@@ -1050,11 +1062,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       razon: 'llega tarde',
     });
     try {
-      const carrera = await Promise.race([
-        asignacion.then(() => 'asignado' as const).catch(() => 'asignado' as const),
-        new Promise<'bloqueada'>((r) => setTimeout(() => r('bloqueada'), 250)),
-      ]);
-      expect(carrera).toBe('bloqueada');
+      expect(await siguePendiente(asignacion)).toBe(true);
     } finally {
       liberar();
     }

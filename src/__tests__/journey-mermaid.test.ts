@@ -233,25 +233,66 @@ describe('validarJourney', () => {
   });
 
   it('la acción frontstage sin soporte backstage es señal alta', () => {
+    const fase = nodo({ tipo: 'fase', etiqueta: 'Consulta', orden: 0 });
     const accion = nodo({
       tipo: 'accion-frontstage',
       etiqueta: 'Muestra el saldo',
       orden: 0,
+      faseId: fase.id,
       responsable: 'App',
     });
-    const senales = validarJourney(journey([accion], []));
+    const senales = validarJourney(journey([fase, accion], []));
 
     expect(senales.map((s) => s.codigo)).toEqual(['frontstage-sin-soporte']);
     expect(senales[0]!.severidad).toBe('alta');
   });
 
   it('exige responsable donde alguien ejecuta, no en lo que se siente', () => {
-    const backstage = nodo({ tipo: 'accion-backstage', etiqueta: 'Valida contra buró', orden: 0 });
-    const friccion = nodo({ tipo: 'friccion', etiqueta: 'Espera de 3 días', orden: 0 });
-    const senales = validarJourney(journey([backstage, friccion], []));
+    const fase = nodo({ tipo: 'fase', etiqueta: 'Verificación', orden: 0 });
+    const backstage = nodo({
+      tipo: 'accion-backstage',
+      etiqueta: 'Valida contra buró',
+      orden: 0,
+      faseId: fase.id,
+    });
+    const friccion = nodo({
+      tipo: 'friccion',
+      etiqueta: 'Espera de 3 días',
+      orden: 0,
+      faseId: fase.id,
+    });
+    const senales = validarJourney(journey([fase, backstage, friccion], []));
 
     expect(senales.map((s) => s.nodoId)).toEqual([backstage.id]);
     expect(senales[0]!.codigo).toBe('sin-responsable');
+  });
+
+  it('el huérfano de fase se reporta en todo lo que vive dentro de una fase, no solo en pasos', () => {
+    // Borrar una fase pone a null el `fase_id` de sus hijos: una acción con soporte y
+    // responsable podía quedarse fuera de toda fase sin producir ni una señal, mientras
+    // el diagrama la dibujaba suelta y el informe decía que el grafo estaba limpio.
+    const backstage = nodo({ tipo: 'accion-backstage', etiqueta: 'Compara biometría', orden: 0 });
+    const accion = nodo({
+      tipo: 'accion-frontstage',
+      etiqueta: 'Toma la selfie',
+      orden: 0,
+      responsable: 'App',
+    });
+    const dolor = nodo({ tipo: 'friccion', etiqueta: 'Reintento sin motivo', orden: 0 });
+    const bifurcacion = nodo({ tipo: 'decision', etiqueta: '¿Coincide?', orden: 0 });
+    // Las entidades del catálogo NO son huérfanas: viven en el servicio, no en el
+    // recorrido, y exigirles fase sería inventar una pertenencia que el modelo no tiene.
+    const sistema = nodo({ tipo: 'sistema', etiqueta: 'Motor biométrico', orden: 0, responsable: 'TI' });
+    const canal = nodo({ tipo: 'canal', etiqueta: 'App móvil', orden: 0 });
+
+    const senales = validarJourney(
+      journey([backstage, accion, dolor, bifurcacion, sistema, canal], [arista(backstage, accion, 'soporta')]),
+    );
+    const huerfanos = senales.filter((s) => s.codigo === 'huerfano-de-fase').map((s) => s.nodoId);
+
+    expect(huerfanos.sort()).toEqual([backstage.id, accion.id, dolor.id, bifurcacion.id].sort());
+    expect(huerfanos).not.toContain(sistema.id);
+    expect(huerfanos).not.toContain(canal.id);
   });
 });
 

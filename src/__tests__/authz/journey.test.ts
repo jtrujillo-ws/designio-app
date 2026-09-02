@@ -82,6 +82,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     await admin`delete from fuente where workspace_id = ${ws}`;
     await admin`delete from arquetipo where workspace_id = ${ws}`;
     await admin`delete from proyecto where workspace_id = ${ws}`;
+    await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
     await admin`delete from reto where workspace_id = ${ws}`;
     await admin`delete from servicio where workspace_id = ${ws}`;
     await admin`delete from evento_dominio where workspace_id = ${ws}`;
@@ -466,6 +467,39 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
         descripcion: '',
       }),
     ).rejects.toThrow(/otro reto/);
+
+    // Y el reto tiene que APLICAR al servicio del journey: anclado en él o declarado
+    // como que lo afecta. Sin esto, un journey del servicio B colgado del reto de A
+    // expondría bajo B los proyectos y arquetipos de A.
+    const [otroServ] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio ajeno al reto', ${leadId}) returning id`;
+    await expect(
+      crearJourney(leadId, {
+        workspaceId: ws,
+        servicioId: otroServ!.id as string,
+        retoId: r2!.id as string,
+        proyectoId: null,
+        tipo: 'to-be',
+        nombre: 'Reto de otro servicio',
+        descripcion: '',
+      }),
+    ).rejects.toThrow(/no está anclado a este servicio/);
+
+    // Declararlo como afectado lo habilita: es la relación que el árbol ya modela para
+    // el caso multiservicio, y el selector la ofrece por eso mismo.
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${r2!.id as string}, ${otroServ!.id as string}, ${ws}, ${leadId})`;
+    const afectado = await crearJourney(leadId, {
+      workspaceId: ws,
+      servicioId: otroServ!.id as string,
+      retoId: r2!.id as string,
+      proyectoId: null,
+      tipo: 'to-be',
+      nombre: 'Reto que afecta a este servicio',
+      descripcion: '',
+    });
+    expect(afectado.journeyId).toBeTruthy();
 
     // Y un proyecto sin reto deja el anclaje a medias: el reto se deriva del proyecto,
     // así que omitirlo sería guardar dos verdades incompletas.

@@ -330,17 +330,21 @@ export async function congelarSnapshot(
       ),
       grafo as (
         select jsonb_build_object(
-          'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.orden)
+          -- Orden TOTAL, y el mismo que usa la proyección de lectura: el orden se
+          -- reinicia por tipo y por fase, así que ordenar solo por él deja empates entre
+          -- tipos y el array del snapshot sale distinto en cada congelación. Un registro
+          -- de auditoría que cambia de forma sin que cambie el grafo no es un registro.
+          'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.tipo, n.orden, n.id)
             from journey_nodo n
             where n.journey_id = ${journeyId} and n.workspace_id = ${workspaceId}), '[]'::jsonb),
-          'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en)
+          'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en, a.id)
             from journey_arista a
             where a.journey_id = ${journeyId} and a.workspace_id = ${workspaceId}), '[]'::jsonb),
           -- La cadena de evidencia va DENTRO del snapshot: un grafo aprobado que no
           -- puede decir qué sostenía cada paso no sirve para auditarlo después.
           'evidencias', coalesce((select jsonb_agg(jsonb_build_object(
               'nodoId', ne.nodo_id, 'evidenciaId', ne.evidencia_id,
-              'evidenciaTitulo', e.titulo) order by ne.creado_en)
+              'evidenciaTitulo', e.titulo) order by ne.creado_en, ne.nodo_id, ne.evidencia_id)
             from journey_nodo_evidencia ne
             join journey_nodo n2 on n2.id = ne.nodo_id and n2.workspace_id = ne.workspace_id
             join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id

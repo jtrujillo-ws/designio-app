@@ -225,15 +225,27 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
         mensaje: 'El paso no tiene transición de salida y no es el final',
       });
     }
-    if (paso.faseId === null) {
-      senales.push({
-        codigo: 'huerfano-de-fase',
-        severidad: 'media',
-        nodoId: paso.id,
-        etiqueta: paso.etiqueta,
-        mensaje: 'El paso no pertenece a ninguna fase',
-      });
-    }
+  }
+
+  // Huérfano de fase: para TODO lo que vive dentro de una fase, no solo los pasos.
+  // Borrar una fase pone a `null` el `fase_id` de todos sus hijos, así que una acción
+  // frontstage con soporte y responsable podía quedarse fuera de toda fase sin producir
+  // ni una señal — y el diagrama la dibujaba suelta mientras el informe decía que el
+  // grafo estaba limpio. Se excluyen la fase misma (no se anida) y los tipos de entidad,
+  // que son del catálogo del servicio y viven fuera del recorrido por definición.
+  const FUERA_DE_FASE: TipoNodo[] = ['fase', 'touchpoint', 'canal', 'actor', 'arquetipo', 'sistema'];
+  for (const nodo of journey.nodos) {
+    if (FUERA_DE_FASE.includes(nodo.tipo) || nodo.faseId !== null) continue;
+    senales.push({
+      codigo: 'huerfano-de-fase',
+      severidad: 'media',
+      nodoId: nodo.id,
+      etiqueta: nodo.etiqueta,
+      mensaje:
+        nodo.tipo === 'paso'
+          ? 'El paso no pertenece a ninguna fase'
+          : `El elemento (${nodo.tipo}) no pertenece a ninguna fase`,
+    });
   }
 
   // Hueco frontstage↔backstage: lo que el usuario ve sin nada que lo sostenga detrás.

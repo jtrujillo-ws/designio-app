@@ -52,26 +52,43 @@ export function DiagramaMermaid({ codigo }: { codigo: string }) {
   }
 
   /** PNG desde el SVG ya renderizado: se pinta en un canvas al doble de tamaño para que
-   * la imagen sirva en una presentación y no solo en pantalla. */
+   * la imagen sirva en una presentación y no solo en pantalla.
+   *
+   * El SVG llega a la imagen por un Blob URL y no por un `data:` en base64: `btoa` solo
+   * acepta latin-1, así que el camino clásico necesita `unescape(encodeURIComponent(…))`
+   * —deprecado— y aun así revienta con etiquetas fuera del BMP (un emoji en el nombre de
+   * un paso) o con un diagrama grande, porque base64 crece un tercio y la cadena tiene
+   * techo. El Blob va en bytes y no tiene ninguno de los dos problemas. */
   function descargarPng() {
     const nodo = contenedor.current?.querySelector('svg');
     if (!svg || !nodo) return;
     const caja = nodo.getBoundingClientRect();
     const escala = 2;
+    const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }));
     const imagen = new Image();
     imagen.onload = () => {
-      const lienzo = document.createElement('canvas');
-      lienzo.width = Math.max(1, Math.round(caja.width * escala));
-      lienzo.height = Math.max(1, Math.round(caja.height * escala));
-      const ctx = lienzo.getContext('2d');
-      if (!ctx) return;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, lienzo.width, lienzo.height);
-      ctx.drawImage(imagen, 0, 0, lienzo.width, lienzo.height);
-      lienzo.toBlob((b) => b && descargar(b, 'journey.png'), 'image/png');
+      try {
+        const lienzo = document.createElement('canvas');
+        lienzo.width = Math.max(1, Math.round(caja.width * escala));
+        lienzo.height = Math.max(1, Math.round(caja.height * escala));
+        const ctx = lienzo.getContext('2d');
+        if (!ctx) return;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, lienzo.width, lienzo.height);
+        ctx.drawImage(imagen, 0, 0, lienzo.width, lienzo.height);
+        lienzo.toBlob((b) => b && descargar(b, 'journey.png'), 'image/png');
+      } finally {
+        // Aquí sí se revoca en el acto: el consumidor es esta imagen, ya terminó de
+        // leerla, y nada más va a pedir el URL (a diferencia de la descarga, donde el
+        // que lee es el navegador y todavía no ha empezado).
+        URL.revokeObjectURL(url);
+      }
     };
-    imagen.onerror = () => setError('No se pudo convertir el diagrama a PNG');
-    imagen.src = `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`;
+    imagen.onerror = () => {
+      URL.revokeObjectURL(url);
+      setError('No se pudo convertir el diagrama a PNG');
+    };
+    imagen.src = url;
   }
 
   return (

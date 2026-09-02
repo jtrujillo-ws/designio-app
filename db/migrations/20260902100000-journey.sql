@@ -305,6 +305,19 @@ begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
+  -- El reto tiene que APLICAR a este servicio: anclado en él, o declarado como afectado.
+  -- Sin esto, un journey del servicio B podía colgar del reto del servicio A y exponer
+  -- bajo B los proyectos y arquetipos de A. El selector ya ofrece solo esos dos conjuntos,
+  -- pero un filtro de cliente no es una garantía.
+  if new.reto_id is not null and not exists (
+    select 1 from reto r
+    where r.id = new.reto_id and r.workspace_id = new.workspace_id
+      and (r.servicio_ancla_id = new.servicio_id
+           or exists (select 1 from reto_servicio_afectado rsa
+             where rsa.reto_id = r.id and rsa.workspace_id = r.workspace_id
+               and rsa.servicio_id = new.servicio_id))) then
+    raise exception 'el reto no está anclado a este servicio ni declarado como que lo afecta';
+  end if;
   if new.proyecto_id is not null and new.reto_id is null then
     raise exception 'un journey con proyecto tiene que estar anclado también a su reto';
   end if;

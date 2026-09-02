@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
+import type { TransactionSql } from 'postgres';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import {
@@ -53,6 +54,43 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
   let entradaAbandonoId = '';
   let entradaReintentosId = '';
   let reviewId = '';
+  // Proyecto que simula haber pasado G6 ANTES de que este esquema existiera.
+  let retoHeredadoId = '';
+  let proyectoHeredadoId = '';
+  let criterioHeredadoId = '';
+  let registryHeredadoId = '';
+
+  /**
+   * Corre `accion` mientras OTRA sesión retiene algo durante 300 ms, y responde si tuvo
+   * que esperar a que lo soltara. Es la forma de probar un candado sin simular la carrera
+   * —eso sería no determinista—: se espera a que la retención esté TOMADA antes de lanzar
+   * al contendiente, así que lo que se mide es quién espera a quién y no quién abrió
+   * antes su conexión. El resultado de `accion` da igual: puede fallar por su motivo de
+   * dominio y aun así haber esperado.
+   */
+  async function esperaA(
+    retener: (tx: TransactionSql) => Promise<unknown>,
+    accion: () => Promise<unknown>,
+  ): Promise<boolean> {
+    let soltado = false;
+    let avisarTomado = () => {};
+    const tomado = new Promise<void>((resolve) => {
+      avisarTomado = resolve;
+    });
+    const reteniendo = sqlAdmin().begin(async (tx) => {
+      await retener(tx);
+      avisarTomado();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      soltado = true;
+    });
+    await tomado;
+    const espero = await accion().then(
+      () => soltado,
+      () => soltado,
+    );
+    await reteniendo;
+    return espero;
+  }
 
   /** Fecha calendárica relativa a la de la BASE. El test del último día de la ventana
    * compara días EXACTOS (cero restantes), y ahí un desfase de huso entre el proceso y el
@@ -71,8 +109,8 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
   }
 
   /** Deja el checklist de un gate limpio y lo aprueba con SU rol aprobador. */
-  async function aprobarGateNumero(numero: number): Promise<void> {
-    const p = await proyectoMetodo(leadId, ws, proyectoId);
+  async function aprobarGateNumero(numero: number, deProyecto = ''): Promise<void> {
+    const p = await proyectoMetodo(leadId, ws, deProyecto === '' ? proyectoId : deProyecto);
     const gate = p!.gates[numero]!;
     for (const item of gate.items) {
       if (item.estado === 'cumplido') continue;
@@ -1080,31 +1118,19 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // registrarResultado toma de verdad el candado del reto —el mismo que toma
     // completarOutcomeReview— reteniéndolo desde otra sesión: si no lo tomara, terminaría
     // de inmediato en vez de esperar a que se suelte.
-    const admin = sqlAdmin();
-    let soltado = false;
-    let avisarTomado = () => {};
-    const tomado = new Promise<void>((resolve) => {
-      avisarTomado = resolve;
-    });
-    const reteniendo = admin.begin(async (tx) => {
-      await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
-      avisarTomado();
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      soltado = true;
-    });
-    // Se espera a que el candado esté TOMADO antes de lanzar el contendiente: si no, lo
-    // que se mediría es quién abre antes su conexión, no quién espera a quién.
-    await tomado;
-    const esperoAlCandado = registrarResultado(leadId, {
-      workspaceId: ws,
-      reviewId,
-      criterioId: criterioAbandonoId,
-      snapshotFinalId: null,
-      lectura: 'edición concurrente del borrador',
-      sinDatosMotivo: 'se corrige a continuación',
-    }).then(() => soltado);
-    expect(await esperoAlCandado).toBe(true);
-    await reteniendo;
+    const espero = await esperaA(
+      (tx) => tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`,
+      () =>
+        registrarResultado(leadId, {
+          workspaceId: ws,
+          reviewId,
+          criterioId: criterioAbandonoId,
+          snapshotFinalId: null,
+          lectura: 'edición concurrente del borrador',
+          sinDatosMotivo: 'se corrige a continuación',
+        }),
+    );
+    expect(espero).toBe(true);
 
     // Y se deja el resultado del criterio como estaba: con su snapshot final de la serie.
     const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
@@ -1261,6 +1287,174 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         insightIds: [],
       }),
     ).rejects.toThrow();
+  });
+
+  it('reabrir una etapa se serializa con el cierre del post mortem: candado y fila', async () => {
+    // El proyecto principal cerró al completarse el outcome review. La política nueva
+    // («el proyecto no está cerrado») es un predicado sobre un SNAPSHOT, no un candado:
+    // reabrir toca `etapa_instancia`/`decision` y completar toca `outcome_review`/`reto`/
+    // `proyecto`, así que nada obliga a los dos caminos a verse. La completación cierra el
+    // proyecto y commitea; la reapertura, que evaluó su predicado antes, commitea después
+    // una etapa `en-curso` y decisiones `en-revision` sobre historia inmutable (SYS-08).
+    const reapertura = () =>
+      reabrirEtapa(leadId, {
+        workspaceId: ws,
+        proyectoId,
+        etapaNumero: 3,
+        motivo: 'Reabrir mientras el post mortem cierra',
+        insightIds: [],
+      });
+
+    // 1) El candado del servicio: el MISMO del reto que toma completarOutcomeReview.
+    expect(
+      await esperaA(
+        (tx) => tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`,
+        reapertura,
+      ),
+    ).toBe(true);
+
+    // 2) Y la FILA del proyecto, que es lo que las dos operaciones se disputan: el guard
+    //    la bloquea, así que el SQL directo tampoco se cuela por el hueco.
+    expect(
+      await esperaA((tx) => tx`select 1 from proyecto where id = ${proyectoId} for update`, reapertura),
+    ).toBe(true);
+
+    // 3) Y el motivo lo dicta la base, no un 0-filas silencioso.
+    await expect(reapertura()).rejects.toThrow(/el proyecto está cerrado/);
+  });
+
+  it('firmar el registry se serializa con la edición de criterios: candado y fila del G0', async () => {
+    // Se fabrica un proyecto con la HISTORIA que este esquema no contempla: G0-G6
+    // aprobados cuando la regla «G6 exige registry firmado» todavía no existía. Es la
+    // única forma de tener una firma de verdad que probar aquí, porque el registry
+    // principal ya está firmado y la firma es de ida.
+    const admin = sqlAdmin();
+    const heredado = await crearReto(leadId, {
+      workspaceId: ws,
+      servicioAnclaId: svcId,
+      codigo: 'R-73',
+      titulo: 'Proyecto que pasó G6 antes de este esquema',
+      descripcion: '',
+      origen: 'peticion-cliente',
+      metricaObjetivo: '8→4',
+      serviciosAfectados: [],
+    });
+    retoHeredadoId = heredado.retoId;
+    const act = await activarReto(leadId, {
+      workspaceId: ws,
+      retoId: retoHeredadoId,
+      perfil: 'rapido',
+      proyectoCodigo: 'P-73',
+      proyectoTitulo: 'Implementación ya planificada',
+    });
+    proyectoHeredadoId = act.proyectoId;
+    const c = await agregarCriterio(leadId, {
+      workspaceId: ws,
+      retoId: retoHeredadoId,
+      kpi: 'Tiempo de respuesta',
+      definicion: 'Minutos medios hasta la primera respuesta',
+      lineaBaseValor: '8',
+      lineaBaseFecha: fecha(-200),
+      lineaBasePlan: '',
+      objetivo: '4',
+      ventanaDias: 30,
+      fechaPostMortem: null,
+    });
+    criterioHeredadoId = c.criterioId;
+    // El guard que hoy exige el registry en G6 es `before update`, así que se apaga solo
+    // para ESCRIBIR ese pasado: es lo único que la base no deja inventar de otra forma.
+    await admin`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
+    try {
+      await admin`update gate_instancia
+        set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
+        where proyecto_id = ${proyectoHeredadoId} and numero <= 6`;
+    } finally {
+      await admin`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
+    }
+    await admin`update etapa_instancia set estado = 'completada'
+      where proyecto_id = ${proyectoHeredadoId} and numero <= 6`;
+    // …y lo que la MIGRACIÓN habría marcado al desplegarse sobre esa historia.
+    await admin`update gate_instancia set aprobado_sin_registry = true
+      where proyecto_id = ${proyectoHeredadoId} and numero = 6`;
+
+    const reg = await abrirRegistry(leadId, { workspaceId: ws, retoId: retoHeredadoId });
+    registryHeredadoId = reg.registryId;
+    const firmar = () =>
+      firmarRegistry(sponsorId, { workspaceId: ws, registryId: registryHeredadoId });
+
+    // Firmar CONGELA los criterios, así que tiene que excluirse con quien los muta. Los
+    // dos caminos tomaban candados distintos (reto contra registry) y tocan tablas
+    // distintas: la firma validaba el criterio viejo y commiteaba, y la edición en vuelo
+    // commiteaba después su `objetivo` o su `ventana_dias` nuevos — el contrato cambiaba
+    // justo después de firmarse, que es lo único que la firma existe para impedir.
+    // 1) El candado del servicio: el MISMO del reto que toman agregar/editarCriterio.
+    expect(
+      await esperaA(
+        (tx) =>
+          tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoHeredadoId}, 42))`,
+        firmar,
+      ),
+    ).toBe(true);
+
+    // 2) Y la cita en la BASE, para el SQL directo: la misma fila del G0 que bloquea
+    //    `criterio_g0_pendiente_guard`. Se elige el gate y no los criterios porque un
+    //    criterio NUEVO no existe todavía como fila que bloquear, y su INSERT pasa por
+    //    ese mismo guard.
+    expect(
+      await esperaA(
+        (tx) => tx`select 1 from gate_instancia
+          where proyecto_id = ${proyectoHeredadoId} and numero = 0 for update`,
+        firmar,
+      ),
+    ).toBe(true);
+
+    // El rechazo de esos intentos es el del CONTENIDO: la política dejó pasar la firma
+    // (G6 heredado) y habló el guard, que es lo que hace válido el bloqueo de arriba.
+    await expect(firmar()).rejects.toThrow(/no tiene entradas KPI/);
+  });
+
+  it('un proyecto que pasó G6 antes de este esquema firma su registry; sin la marca, no', async () => {
+    // Sin una salida, este slice dejaba varado a todo proyecto activo con G6 ya aprobado:
+    // su registry nace borrador, la firma exige G6 pendiente, un gate aprobado es
+    // inmutable y la reapertura no lo devuelve a pendiente — y sin registry firmado no
+    // hay medición. La marca de la migración es esa salida, y solo para esas filas.
+    const admin = sqlAdmin();
+    await admin`update gate_instancia set aprobado_sin_registry = false
+      where proyecto_id = ${proyectoHeredadoId} and numero = 6`;
+    await expect(
+      firmarRegistry(sponsorId, { workspaceId: ws, registryId: registryHeredadoId }),
+    ).rejects.toThrow(/El G6 ya fue aprobado/);
+    await admin`update gate_instancia set aprobado_sin_registry = true
+      where proyecto_id = ${proyectoHeredadoId} and numero = 6`;
+
+    // Lo que se perdona es el MOMENTO, no el contenido: el contrato se redacta y se firma
+    // de verdad, con su guard de completitud intacto.
+    await agregarEntrada(leadId, {
+      workspaceId: ws,
+      registryId: registryHeredadoId,
+      criterioId: criterioHeredadoId,
+      nombre: 'Minutos hasta primera respuesta',
+      definicion: 'Media por solicitud atendida',
+      fuente: 'Cola de soporte',
+      dimensiones: '',
+      propietarioMiembroId: sponsorMiembroId,
+      frecuencia: 'semanal',
+      dashboardUrl: '',
+      lineaBaseValor: '8',
+      lineaBaseFecha: fecha(-200),
+      ventanaInicio: fecha(-3),
+      fechaPostMortem: fecha(40),
+    });
+    const firma = await firmarRegistry(sponsorId, {
+      workspaceId: ws,
+      registryId: registryHeredadoId,
+    });
+    expect(firma.entradas).toBe(1);
+
+    // Y deja de estar varado: con el contrato firmado, su G7 se aprueba y la medición abre.
+    await aprobarGateNumero(7, proyectoHeredadoId);
+    const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: retoHeredadoId });
+    expect(abierto.proyectos).toBe(1);
   });
 
   it('el ciclo del proyecto es de sentido único y ningún estado inventado entra', async () => {

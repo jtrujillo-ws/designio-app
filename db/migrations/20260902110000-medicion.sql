@@ -219,6 +219,34 @@ create table resultado_criterio (
 );
 create index resultado_criterio_review_idx on resultado_criterio (workspace_id, review_id);
 
+-- ── Los proyectos que YA pasaron G6 antes de que existiera el Metric Registry ──
+-- Este slice ata dos reglas nuevas: G6 no se aprueba sin registry firmado, y el registry
+-- se firma con G6 PENDIENTE. Juntas dejan varado a todo proyecto activo que, en una base
+-- con historia, ya tuviera su G6 aprobado: su registry nace borrador y no hay forma de
+-- firmarlo —un gate aprobado es inmutable y la reapertura de etapa no lo devuelve a
+-- pendiente a propósito—, así que `abrirMedicion` y el guard de transición lo frenan para
+-- siempre antes de medir. Igual que con el veredicto de los retos ya cerrados, la
+-- migración tiene que traer una historia para lo que ya existe.
+--
+-- La historia es esta columna: marca los G6 que se aprobaron CUANDO LA REGLA NO EXISTÍA,
+-- y solo esos pueden firmar su registry a posteriori. Se descartó la alternativa —crear
+-- por backfill un registry ya `firmado`— porque sería un contrato vacío: no hay KPIs que
+-- inventar, y firmarlo saltándose el guard de completitud diría que el cliente se
+-- comprometió con algo que nadie escribió. Aquí el contrato se redacta y se firma de
+-- verdad; lo único que se perdona es el MOMENTO.
+--
+-- Y no es un agujero permanente, por dos razones independientes:
+--  1. La columna se escribe UNA vez, aquí. No entra en ningún grant (`gate_instancia` solo
+--     concede update de estado/aprobado_por/aprobado_en) y ningún guard la toca, así que
+--     el conjunto queda congelado en el instante del despliegue y solo puede encoger.
+--  2. Aunque se pudiera escribir, el estado que habilita —«G6 aprobado con su registry en
+--     borrador»— es inalcanzable para todo proyecto posterior: aprobar G6 exige un registry
+--     FIRMADO, el registry es 1:1 con el reto y la firma es de ida. Así que la rama solo
+--     puede aplicar a filas que ya existían.
+alter table gate_instancia add column aprobado_sin_registry boolean not null default false;
+update gate_instancia set aprobado_sin_registry = true
+  where numero = 6 and estado = 'aprobado';
+
 -- ── «La ventana sigue abierta», en UN solo sitio ──
 -- Tres predicados de la base (apertura del review, guard de completación, estado de
 -- cadencia de la proyección) y su espejo del cliente deciden exactamente lo mismo. Escrito
@@ -301,7 +329,10 @@ create policy registry_firmar on metric_registry
       join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
       where p.reto_id = metric_registry.reto_id
         and p.workspace_id = metric_registry.workspace_id
-        and g.numero = 6 and g.estado = 'pendiente'
+        and g.numero = 6
+        -- G6 pendiente… o G6 aprobado ANTES de que este esquema existiera (ver arriba):
+        -- esa marca la escribió la migración y nadie puede volver a escribirla.
+        and (g.estado = 'pendiente' or g.aprobado_sin_registry)
         and workspace_role(app_user_id(), metric_registry.workspace_id) = g.rol_aprobador)
     -- «Se firma EN G6»: no antes. Los gates ordenan el método y el registry se acuerda
     -- con el plan de implementación delante, no en el kickoff.
@@ -586,6 +617,26 @@ begin
   if new.estado = 'firmado' and old.estado = 'borrador' then
     -- El sello temporal lo pone la BASE: un update directo no retro ni post-data la firma.
     new.firmado_en := now();
+    -- Punto de cita con `criterio_g0_pendiente_guard`: LAS MISMAS filas (los G0 del reto),
+    -- en el mismo orden. Firmar congela los criterios, pero firmar y editar un criterio
+    -- tocan tablas distintas, así que sin este bloqueo la firma valida el criterio VIEJO,
+    -- commitea, y la edición que ya estaba en vuelo commitea después su `objetivo` o su
+    -- `ventana_dias` nuevos: el contrato firmado cambia justo después de firmarse, que es
+    -- lo único que la firma existe para impedir. Con el bloqueo, quien llegue segundo lee
+    -- lo que el primero dejó — la firma valida el criterio nuevo, o la edición se
+    -- encuentra el registry ya firmado y su propio guard la rechaza.
+    --
+    -- Se bloquea el GATE y no las filas de `criterio_exito` a propósito: un criterio NUEVO
+    -- no existe todavía como fila que bloquear, y su INSERT pasa por el mismo guard y por
+    -- el mismo gate. Bloquear los criterios existentes dejaría colarse justo ese caso —un
+    -- criterio huérfano de KPI dentro de un contrato ya firmado—.
+    --
+    -- El candado del servicio (`designio:reto:`) hace lo mismo un nivel más arriba; este
+    -- vale además para el SQL directo, que es donde el servicio no llega.
+    perform 1 from gate_instancia g
+      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+      where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id and g.numero = 0
+      order by g.id for update of g;
     if not exists (select 1 from entrada_kpi e
       where e.registry_id = new.id and e.workspace_id = new.workspace_id) then
       raise exception 'no se puede firmar: el registry no tiene entradas KPI (SYS-22)';
@@ -819,6 +870,41 @@ create policy reapertura_insert on reapertura_etapa
         and p.workspace_id = reapertura_etapa.workspace_id
         and p.estado <> 'cerrado')
   );
+
+-- …pero una política es un predicado sobre un SNAPSHOT, no un candado, y aquí eso no es
+-- teórico: la reapertura y la completación del outcome review tocan filas distintas
+-- (`etapa_instancia`/`decision` contra `outcome_review`/`reto`/`proyecto`), así que nada
+-- las obliga a verse. La completación cierra el proyecto y commitea; la reapertura, que
+-- evaluó su predicado contra el snapshot anterior, commitea después una etapa `en-curso`
+-- y decisiones `en-revision` sobre un proyecto ya cerrado e inmutable (SYS-08) — el estado
+-- que la política de arriba existe para impedir, alcanzado por el camino de al lado.
+--
+-- El bloqueo va sobre la FILA del proyecto, que es lo que las dos operaciones se disputan
+-- y lo que la completación actualiza. Quien llegue segundo espera y vuelve a leer: si el
+-- proyecto ya cerró, este guard lo dice —y lo dice también para el SQL directo, que es
+-- donde el candado consultivo del servicio no llega—.
+create function reapertura_proyecto_abierto_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  actual text;
+begin
+  -- Pre-chequeo anti-oráculo: la consulta privilegiada solo corre para miembros del
+  -- workspace declarado; a los demás los rechaza la política, como siempre.
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  select p.estado into actual from proyecto p
+    where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+    for update;
+  if actual = 'cerrado' then
+    raise exception 'el proyecto está cerrado: reabrir una etapa no revive lo que ya es historia (SYS-08)';
+  end if;
+  return new;
+end $$;
+create trigger reapertura_proyecto_abierto
+  before insert on reapertura_etapa
+  for each row execute function reapertura_proyecto_abierto_guard();
+revoke execute on function reapertura_proyecto_abierto_guard() from public;
 
 -- 2) Con el registry FIRMADO, los criterios quedan congelados aunque se reabra la etapa 0.
 -- La excepción de la reapertura existe para corregir el compromiso ANTES de acordar cómo

@@ -56,7 +56,11 @@ async function bloquearReto(tx: TransactionSql, retoId: string): Promise<void> {
 }
 
 /** Candado por registry: editar entradas y FIRMAR se excluyen igual que marcar checklist
- * y aprobar el gate — la firma congela exactamente lo que estaba escrito. */
+ * y aprobar el gate — la firma congela exactamente lo que estaba escrito.
+ *
+ * ORDEN DE ADQUISICIÓN, para que ningún par de operaciones se abrace: primero el del RETO
+ * y después el del registry (igual que el método toma reto y después gate). Ninguna ruta
+ * toma este candado antes que el del reto, así que no hay ciclo posible entre los tres. */
 async function bloquearRegistry(tx: TransactionSql, registryId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(hashtextextended('designio:registry:' || ${registryId}, 42))`;
 }
@@ -260,6 +264,19 @@ export async function firmarRegistry(
 ): Promise<{ entradas: number }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // Firmar CONGELA los criterios del reto, así que tiene que serializarse con quien los
+    // muta: `agregarCriterio` y `editarCriterio` toman el candado del RETO y este tomaba
+    // solo el del registry, de modo que los dos caminos no se veían. Bajo READ COMMITTED
+    // la firma validaba el criterio viejo y commiteaba, y la edición en vuelo commiteaba
+    // después su `objetivo` o su `ventana_dias` nuevos: el contrato cambiaba justo después
+    // de firmarse. Se toma el MISMO candado, y primero (orden reto → registry: ninguna
+    // ruta los pide al revés, así que no hay abrazo posible). El guard de la base repite
+    // la cita bloqueando la fila del G0, que es lo que cubre además el SQL directo.
+    // `reto_id` es inmutable: leerlo antes de tomar el candado no abre carrera.
+    const [dueno] = await tx`select reto_id from metric_registry
+      where id = ${entrada.registryId} and workspace_id = ${entrada.workspaceId}`;
+    if (!dueno) throw new ErrorMedicion('El registry no existe en este workspace');
+    await bloquearReto(tx, dueno.reto_id as string);
     await bloquearRegistry(tx, entrada.registryId);
     let firmado;
     try {
@@ -296,12 +313,17 @@ async function diagnosticoDeFirma(
   if (registry.estado === 'firmado') return 'El Metric Registry ya está firmado';
 
   const [g6] = await tx`
-    select g.estado, g.rol_aprobador from gate_instancia g
+    select g.estado, g.rol_aprobador, g.aprobado_sin_registry from gate_instancia g
     join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
     where p.reto_id = ${registry.reto_id as string} and p.workspace_id = ${workspaceId}
       and g.numero = 6`;
   if (!g6) return 'El reto no tiene proyecto con método instanciado: no hay G6 que firmar';
-  if (g6.estado === 'aprobado') return 'El G6 ya fue aprobado: el registry debió firmarse antes';
+  // Un G6 aprobado ANTES de que el Metric Registry existiera sí puede firmar (esa marca la
+  // puso la migración), así que el motivo no puede ser este para él: si su firma falló, fue
+  // por rol o por contenido, y de eso hablan el guard y la última línea.
+  if (g6.estado === 'aprobado' && !g6.aprobado_sin_registry) {
+    return 'El G6 ya fue aprobado: el registry debió firmarse antes';
+  }
 
   const anteriores = await tx`
     select g.numero from gate_instancia g

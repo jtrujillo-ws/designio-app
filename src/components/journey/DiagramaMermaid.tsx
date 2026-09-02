@@ -130,5 +130,7 @@ function descargar(blob: Blob, nombre: string) {
   a.href = url;
   a.download = nombre;
   a.click();
-  URL.revokeObjectURL(url);
+  // El revoke va al siguiente tick: revocar justo después del click cancela o trunca la
+  // descarga en navegadores que aún no han empezado a leer el blob (Safari).
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }

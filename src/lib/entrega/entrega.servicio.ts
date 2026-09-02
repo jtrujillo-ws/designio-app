@@ -829,7 +829,8 @@ export async function designVersionsDelWorkspace(
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     const filas = await tx`
-      select dv.id, dv.codigo, dv.titulo, dv.estado, s.nombre as servicio_nombre,
+      select dv.id, dv.codigo, dv.titulo, dv.estado,
+        dv.servicio_id, s.nombre as servicio_nombre,
         p.codigo as proyecto_codigo,
         to_char(dv.aprobada_en, 'YYYY-MM-DD') as aprobada_en,
         (select count(*)::int from elemento_cambio ec
@@ -847,6 +848,7 @@ export async function designVersionsDelWorkspace(
       codigo: f.codigo as string,
       titulo: f.titulo as string,
       estado: f.estado as ResumenDesignVersion['estado'],
+      servicioId: f.servicio_id as string,
       servicioNombre: f.servicio_nombre as string,
       proyectoCodigo: f.proyecto_codigo as string,
       elementos: f.elementos as number,

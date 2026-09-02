@@ -553,6 +553,68 @@ create trigger elemento_insight_citable
   for each row execute function elemento_motivo_citable_guard();
 revoke execute on function elemento_motivo_citable_guard() from public;
 
+-- ¿Este reto APLICA a este servicio? Anclado en él, o declarado como que lo afecta.
+-- Es el MISMO criterio que journey_anclaje_guard (SPEC-05) lleva inline: «aplica» es una
+-- definición del dominio, y dos versiones divergentes de ella serían dos verdades sobre el
+-- mismo hecho. Aquí se le pone nombre para no volver a escribirla en los dos sitios que la
+-- necesitan; cuando el guard del journey se reescriba, debería adoptar esta.
+create function reto_aplica_a_servicio(p_reto uuid, p_workspace uuid, p_servicio uuid)
+returns boolean language sql stable as $$
+  select exists (
+    select 1 from reto r
+    where r.id = p_reto and r.workspace_id = p_workspace
+      and (r.servicio_ancla_id = p_servicio
+           or exists (select 1 from reto_servicio_afectado rsa
+             where rsa.reto_id = r.id and rsa.workspace_id = r.workspace_id
+               and rsa.servicio_id = p_servicio)))
+$$;
+revoke execute on function reto_aplica_a_servicio(uuid, uuid, uuid) from public;
+
+-- El proyecto que produce la design version y el servicio que cambia tienen que
+-- pertenecer al mismo reto. Ninguna FK lo dice: design_version referencia proyecto y
+-- servicio por separado, y los dos existen en el workspace.
+--
+-- Sin esto, una design version del servicio B podía colgar de un proyecto A cuyo reto ni
+-- ancla ni declara a B. Y no es cosmético: gate_aprobar_suficiencia_guard acota G7 por
+-- `dv.proyecto_id`, así que el proyecto A se certificaría con trabajo hecho para un
+-- servicio que su reto no toca — el gate diría «la implementación de A está conciliada»
+-- mirando elementos que no son de A.
+--
+-- La comprobación NO puede delegarse en el journey: un to-be sin proyecto es legítimo
+-- (SPEC-05 lo permite y esta migración lo usa), así que el chequeo de anclaje del journey
+-- se salta entero cuando `j.proyecto_id is null`. La relación hay que derivarla por el
+-- RETO del proyecto, que es donde vive de verdad.
+--
+-- Aquí también el `supera_a`: la transición exige que la superada sea del MISMO servicio,
+-- pero eso se descubría al aprobar, cuando ya es tarde — `supera_a` no está en el grant de
+-- columna y no hay DELETE sobre design_version, así que un borrador que apunta a la
+-- versión de otro servicio no se puede corregir ni borrar. Igual que el journey sin
+-- enlazar: la comprobación se adelanta al nacimiento, que es cuando aún hay salida.
+create function design_version_anclaje_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if not exists (
+    select 1 from proyecto p
+    where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+      and reto_aplica_a_servicio(p.reto_id, p.workspace_id, new.servicio_id)) then
+    raise exception 'el proyecto de la design version cuelga de un reto que no ancla este servicio ni lo declara afectado';
+  end if;
+  if new.supera_a is not null and not exists (
+    select 1 from design_version dv
+    where dv.id = new.supera_a and dv.workspace_id = new.workspace_id
+      and dv.servicio_id = new.servicio_id) then
+    raise exception 'una design version solo supera a otra del MISMO servicio (SYS-05)';
+  end if;
+  return new;
+end $$;
+create trigger design_version_anclaje
+  before insert on design_version
+  for each row execute function design_version_anclaje_guard();
+revoke execute on function design_version_anclaje_guard() from public;
+
 -- El journey que una design version declara tiene que ser el to-be de SU servicio, se
 -- declare al abrirla o se enlace después. La FK compuesta solo garantiza el workspace: sin
 -- esto, un borrador podía nacer apuntando al as-is, o al to-be de otro servicio, y la
@@ -672,6 +734,17 @@ begin
       where j.id = new.journey_id and j.workspace_id = new.workspace_id
         and j.tipo = 'to-be' and j.servicio_id = new.servicio_id) then
       raise exception 'el journey de la design version debe ser el to-be de su servicio';
+    end if;
+    -- El anclaje proyecto↔servicio se comprueba OTRA VEZ al aprobar, y no por
+    -- desconfianza del guard de alta: los servicios afectados por un reto se declaran y se
+    -- retiran (reto_servicio_afectado no es inmutable), así que una design version que
+    -- nació coherente puede dejar de serlo. Aprobar es el momento en que pasa a ser
+    -- certificable por G7, y es ahí donde la relación tiene que seguir siendo cierta.
+    if not exists (
+      select 1 from proyecto p
+      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+        and reto_aplica_a_servicio(p.reto_id, p.workspace_id, new.servicio_id)) then
+      raise exception 'el proyecto de la design version ya no cuelga de un reto que afecte a este servicio';
     end if;
     -- El journey guarda su proyecto desde SPEC-05 (es opcional). Si lo declara, tiene
     -- que ser el mismo: dos proyectos del mismo reto tocando el mismo servicio podrían

@@ -25,28 +25,39 @@ export const Route = createFileRoute('/_autenticada/design-versions')({
   loader: async ({ context }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
     if (!workspaceId) return null;
-    const [versiones, arbol, journeys] = await Promise.all([
+    const [versiones, arbol] = await Promise.all([
       listaDeDesignVersions({ data: { workspaceId } }),
       arbolDelWorkspace({ data: { workspaceId } }),
-      // Solo los to-be, filtrados EN EL SERVIDOR: aprobar congela el snapshot del grafo
-      // objetivo (RF-06.3), y quedarse con los de la primera página dejaría fuera de
-      // alcance el to-be de un servicio con muchos journeys por delante.
-      listaDeJourneys({ data: { workspaceId, tipo: 'to-be' } }),
     ]);
+    // Los proyectos cuelgan del RETO, y un reto que afecta a este servicio está anclado en
+    // otro: el mapa se arma sobre el árbol entero para poder resolverlos desde cualquier
+    // servicio. Mismo apaño que la pantalla de journeys, por el mismo motivo.
+    const proyectosPorReto = new Map(
+      (arbol?.servicios ?? []).flatMap((s) =>
+        s.retos.map(
+          (r) =>
+            [r.id, r.proyectos.map((p) => ({ id: p.id, etiqueta: `${p.codigo} ${p.titulo}` }))] as const,
+        ),
+      ),
+    );
     return {
       workspaceId,
       versiones,
-      // Una design version cuelga de un proyecto y cambia UN servicio: el formulario
-      // ofrece exactamente los pares que existen en el árbol.
-      servicios: (arbol?.servicios ?? []).map((s) => ({
-        id: s.id,
-        nombre: s.nombre,
-        proyectos: s.retos.flatMap((r) =>
-          r.proyectos.map((p) => ({ id: p.id, etiqueta: `${p.codigo} ${p.titulo}` })),
-        ),
-      })),
-      journeys: journeys.journeys,
-      hayMasJourneys: journeys.siguiente !== null,
+      // Una design version cuelga de un proyecto y cambia UN servicio. Los proyectos
+      // ofrecidos salen de los retos ANCLADOS en el servicio y de los que lo declaran
+      // AFECTADO: un reto anclado en A que afecta a B es exactamente el que empuja el
+      // rediseño de B, y ofrecer solo los anclados dejaba a B sin forma de crear la
+      // design version que lo cambia.
+      servicios: (arbol?.servicios ?? []).map((s) => {
+        const vistos = new Set<string>();
+        return {
+          id: s.id,
+          nombre: s.nombre,
+          proyectos: [...s.retos, ...s.retosQueAfectan]
+            .filter((r) => !vistos.has(r.id) && vistos.add(r.id))
+            .flatMap((r) => proyectosPorReto.get(r.id) ?? []),
+        };
+      }),
       versionesAprobadas: versiones.filter((v) => v.estado === 'aprobada'),
     };
   },
@@ -145,7 +156,6 @@ function PantallaDesignVersions() {
               <FormularioDesignVersion
                 workspaceId={datos.workspaceId}
                 servicios={datos.servicios}
-                journeys={datos.journeys}
                 aprobadas={datos.versionesAprobadas}
                 onCerrar={() => setAbierto(false)}
                 onError={setError}
@@ -198,7 +208,6 @@ function PantallaDesignVersions() {
 function FormularioDesignVersion({
   workspaceId,
   servicios,
-  journeys,
   aprobadas,
   onCerrar,
   onError,
@@ -206,8 +215,7 @@ function FormularioDesignVersion({
 }: {
   workspaceId: string;
   servicios: { id: string; nombre: string; proyectos: { id: string; etiqueta: string }[] }[];
-  journeys: { id: string; nombre: string; servicioId: string; servicioNombre: string }[];
-  aprobadas: { id: string; codigo: string; titulo: string; servicioNombre: string }[];
+  aprobadas: { id: string; codigo: string; titulo: string; servicioId: string }[];
   onCerrar: () => void;
   onError: (e: string | null) => void;
   onCreada: (designVersionId: string) => Promise<void>;
@@ -219,11 +227,42 @@ function FormularioDesignVersion({
   const [titulo, setTitulo] = useState('');
   const [resumen, setResumen] = useState('');
   const [ocupado, setOcupado] = useState(false);
+  // Los to-be del servicio elegido se piden BAJO DEMANDA, no en el loader. La lista de
+  // journeys se pagina por keyset, así que traer «la primera página de los to-be del
+  // workspace» y filtrar por servicio en el cliente deja fuera de alcance los de un
+  // servicio que quede detrás del corte — el mismo agujero que la paginación vino a
+  // cerrar, reintroducido en el selector. Filtrando por servicio en el servidor, lo que
+  // se pide es siempre un conjunto pequeño y completo.
+  const [journeys, setJourneys] = useState<{ id: string; nombre: string }[]>([]);
+  const [hayMasJourneys, setHayMasJourneys] = useState(false);
+  const [cargandoJourneys, setCargandoJourneys] = useState(false);
   const proyectos = servicios.find((s) => s.id === servicioId)?.proyectos ?? [];
-  // Una design version cambia UN servicio, y su journey tiene que ser el to-be de ESE
-  // servicio (lo exige `design_version_journey_guard`): ofrecer los demás sería ofrecer
-  // un alta que la base rechaza.
-  const journeysDelServicio = journeys.filter((j) => j.servicioId === servicioId);
+  // Solo se supera a una versión del MISMO servicio (SYS-05, y ahora también el guard de
+  // alta): ofrecer las de otros creaba un borrador que no se puede aprobar, ni corregir
+  // —`supera_a` no está en el grant— ni borrar.
+  const superables = aprobadas.filter((v) => v.servicioId === servicioId);
+
+  async function elegirServicio(nuevo: string) {
+    setServicioId(nuevo);
+    // Proyecto, journey y «supera a» eran del servicio anterior: dejarlos puestos mandaría
+    // al endpoint combinaciones que los guards rechazan.
+    setProyectoId('');
+    setJourneyId('');
+    setSuperaA('');
+    setJourneys([]);
+    setHayMasJourneys(false);
+    if (nuevo === '') return;
+    setCargandoJourneys(true);
+    try {
+      const pagina = await listaDeJourneys({
+        data: { workspaceId, servicioId: nuevo, tipo: 'to-be' },
+      });
+      setJourneys(pagina.journeys.map((j) => ({ id: j.id, nombre: j.nombre })));
+      setHayMasJourneys(pagina.siguiente !== null);
+    } finally {
+      setCargandoJourneys(false);
+    }
+  }
 
   async function enviar(e: FormEvent) {
     e.preventDefault();
@@ -254,13 +293,7 @@ function FormularioDesignVersion({
         <span style={micro}>Nueva design version</span>
         <Select
           value={servicioId}
-          onChange={(e) => {
-            setServicioId(e.target.value);
-            setProyectoId('');
-            // El journey elegido era del servicio anterior: dejarlo puesto mandaría al
-            // endpoint un enlace que el guard rechaza.
-            setJourneyId('');
-          }}
+          onChange={(e) => void elegirServicio(e.target.value)}
           required
         >
           <option value="">Servicio que cambia…</option>
@@ -286,18 +319,28 @@ function FormularioDesignVersion({
         <Select
           value={journeyId}
           onChange={(e) => setJourneyId(e.target.value)}
-          disabled={servicioId === ''}
+          disabled={servicioId === '' || cargandoJourneys}
         >
-          <option value="">Journey to-be (se puede enlazar después)</option>
-          {journeysDelServicio.map((j) => (
+          <option value="">
+            {cargandoJourneys
+              ? 'Buscando los to-be del servicio…'
+              : 'Journey to-be (se puede enlazar después)'}
+          </option>
+          {journeys.map((j) => (
             <option key={j.id} value={j.id}>
-              {j.nombre} · {j.servicioNombre}
+              {j.nombre}
             </option>
           ))}
         </Select>
-        <Select value={superaA} onChange={(e) => setSuperaA(e.target.value)}>
+        {hayMasJourneys && (
+          <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+            Este servicio tiene más journeys to-be de los que caben aquí; si el que buscas
+            no aparece, enlázalo después desde la design version.
+          </span>
+        )}
+        <Select value={superaA} onChange={(e) => setSuperaA(e.target.value)} disabled={servicioId === ''}>
           <option value="">No supera a ninguna (primera del servicio)</option>
-          {aprobadas.map((v) => (
+          {superables.map((v) => (
             <option key={v.id} value={v.id}>
               Supera a {v.codigo} · {v.titulo}
             </option>

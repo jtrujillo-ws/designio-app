@@ -117,6 +117,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       (workspace_id, servicio_ancla_id, codigo, titulo, estado, creado_por)
       values (${ws}, ${servicioId}, 'R-90', 'Reducir el abandono', 'activo', ${leadId}) returning id`;
     retoId = r!.id as string;
+    // R-90 ancla en `servicioId` y declara AFECTADO a `otroServicioId`: es la relación que
+    // hace legítimo que un proyecto de este reto produzca design versions de los dos
+    // servicios, y la que el guard de anclaje comprueba.
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${otroServicioId}, ${ws}, ${leadId})`;
     const [p] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
       values (${ws}, ${retoId}, 'P-90', 'Rediseño', ${leadId}) returning id`;
     proyectoId = p!.id as string;
@@ -242,6 +248,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await admin`delete from etapa_instancia where workspace_id = ${ws}`;
     await admin`delete from criterio_exito where workspace_id = ${ws}`;
     await admin`delete from proyecto where workspace_id = ${ws}`;
+    await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
     await admin`delete from reto where workspace_id = ${ws}`;
     await admin`delete from servicio where workspace_id = ${ws}`;
     await admin`delete from evento_dominio where workspace_id = ${ws}`;
@@ -952,6 +959,9 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const admin = sqlAdmin();
     const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
       values (${ws}, 'Servicio de la carrera', ${leadId}) returning id`;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svc!.id as string}, ${ws}, ${leadId})`;
     const [jt] = await admin`insert into journey
       (workspace_id, servicio_id, tipo, nombre, creado_por)
       values (${ws}, ${svc!.id as string}, 'to-be', 'Objetivo de la carrera', ${leadId})
@@ -1176,6 +1186,59 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       where workspace_id = ${ws} and tipo = 'HiloAbierto'
         and payload->>'hiloId' = ${abierto.hiloId}`;
     expect((ev!.payload as { objetoTipo: string }).objetoTipo).toBe('design_version');
+  });
+
+  it('el proyecto y el servicio de una design version cuelgan del MISMO reto', async () => {
+    const admin = sqlAdmin();
+    // Un servicio del workspace que R-90 ni ancla ni declara afectado.
+    const [ajeno] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio ajeno al reto', ${leadId}) returning id`;
+    const servicioAjeno = ajeno!.id as string;
+
+    // Las dos FKs están contentas —proyecto y servicio existen en el workspace— y el
+    // journey no puede decir nada: un to-be sin proyecto es legítimo, así que el chequeo
+    // de anclaje del journey se salta entero. La relación la impone el reto del proyecto.
+    await expect(
+      crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId,
+        servicioId: servicioAjeno,
+        journeyId: null,
+        titulo: 'Cambia un servicio que este reto no toca',
+        resumen: '',
+        superaA: null,
+      }),
+    ).rejects.toThrow(/no ancla este servicio ni lo declara afectado/);
+
+    // Declararlo afectado lo vuelve legítimo: la regla es la relación, no una lista fija.
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${servicioAjeno}, ${ws}, ${leadId})`;
+    const valida = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: servicioAjeno,
+      journeyId: null,
+      titulo: 'Ahora el reto sí lo declara afectado',
+      resumen: '',
+      superaA: null,
+    });
+    expect(valida.designVersionId).toBeTruthy();
+
+    // Y superar solo alcanza a versiones del MISMO servicio. Se comprueba al nacer y no
+    // solo al aprobar porque `supera_a` no está en el grant de columna y no hay DELETE:
+    // el borrador mal apuntado sería una fila muerta para siempre.
+    await expect(
+      crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId,
+        servicioId: servicioAjeno,
+        journeyId: null,
+        titulo: 'Supera a la de otro servicio',
+        resumen: '',
+        superaA: dv1,
+      }),
+    ).rejects.toThrow(/MISMO servicio/);
   });
 
   it('nada de esto cruza el workspace', async () => {

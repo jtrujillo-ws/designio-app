@@ -348,6 +348,10 @@ export type ResumenDesignVersion = {
   codigo: string;
   titulo: string;
   estado: EstadoDesignVersion;
+  /** Por ID y no solo por nombre: quien filtra por servicio —el selector de «supera a»,
+   * que solo puede ofrecer versiones del MISMO servicio— no puede hacerlo comparando
+   * cadenas. */
+  servicioId: string;
   servicioNombre: string;
   proyectoCodigo: string;
   elementos: number;

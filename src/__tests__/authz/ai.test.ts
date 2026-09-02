@@ -1494,6 +1494,90 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(tras.materialDePersonas.find((m) => m.id === itemId)!.autorizaExterno).toBe(false);
   });
 
+  it('archivar el reto tras generar deja la propuesta obsoleta, y rechazarla sigue abierto', async () => {
+    await enWorkspaceLimpio('reto-archivado', async ({ ws: wsA, curadorId, retoId: retoA }) => {
+      const admin = sqlAdmin();
+      await conProveedor(
+        { ok: true, datos: { criterios: [CONTENIDO_C0] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsA, capacidad: 'C0', anclaId: retoA }),
+      );
+      const [p] = await conUsuario(curadorId, (tx) => tx`select id from propuesta_ai
+        where workspace_id = ${wsA} and reto_id = ${retoA} and estado = 'propuesta'`);
+      const propuestaId = p!.id as string;
+
+      // `candidato → archivado` es una transición LEGAL: entre generar y revisar el reto
+      // puede dejar de admitir criterios sin que nadie haga nada raro.
+      await admin`update reto set estado = 'archivado' where id = ${retoA}`;
+
+      // El panel lo dice con su propio motivo —es el cuarto— en vez de apagar un botón sin
+      // explicación.
+      const panel = await panelPropuestas(curadorId, wsA);
+      const enPanel = panel.pendientes.find((x) => x.id === propuestaId)!;
+      expect(enPanel.anclaEstado).toBe('reto-no-admite');
+
+      // Aceptar crearía un criterio bajo un reto archivado: un contrato de medición para
+      // algo que nadie va a medir, y algo que la generación no habría admitido. Se exige el
+      // mensaje del SERVICIO —el que dice cómo salir— y no solo que reviente: el suelo de la
+      // base también revienta, pero varias sentencias más tarde y sin decir qué hacer.
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsA, propuestaId }),
+      ).rejects.toThrow(/solo puede rechazarse/i);
+      const criterios = await conUsuario(curadorId, (tx) => tx`select 1 as x from criterio_exito
+        where workspace_id = ${wsA} and reto_id = ${retoA}`);
+      expect(criterios.length).toBe(0);
+
+      // El SUELO, sin pasar por el servicio: crear el criterio a mano y sellar la propuesta
+      // por SQL. Ninguna política de `criterio_exito` mira el estado del reto, así que el
+      // insert pasa; quien lo para es el constraint diferido de materialización, y lo hace
+      // en el COMMIT — el último instante posible, que es justo lo que lo vuelve suelo para
+      // una ventana que dura días.
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [c] = await tx`insert into criterio_exito
+            (workspace_id, reto_id, kpi, definicion, linea_base_plan, objetivo, ventana_dias,
+             creado_por)
+            values (${wsA}, ${retoA}, 'KPI a mano', 'Definición', 'Plan', 'Objetivo', 30,
+                    ${curadorId})
+            returning id`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${curadorId}, criterio_id = ${c!.id as string}
+            where id = ${propuestaId}`;
+        }),
+      ).rejects.toThrow(/no admite criterios nuevos/i);
+
+      // Y cuando se cumplen LOS DOS motivos de C0 —lo normal en un reto que avanzó: cambió
+      // de estado y su G0 se aprobó— el panel reporta el del ciclo de vida, que es el que no
+      // tiene vuelta. «Criterios congelados» insinuaría una salida real (reabrir la etapa 0
+      // descongela, RF-04.9) que aquí no desbloquea nada: al volver, el reto seguiría
+      // archivado. Entre dos motivos ciertos gana el que describe la puerta que ya no se
+      // abre.
+      const [proyecto] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsA}, ${retoA}, 'P-01', 'Proyecto', ${curadorId}) returning id`;
+      await admin`insert into etapa_instancia
+        (workspace_id, proyecto_id, numero, nombre, estado)
+        values (${wsA}, ${proyecto!.id as string}, 0, 'Definición del objeto y del reto',
+                'completada')`;
+      await admin`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+        values (${wsA}, ${proyecto!.id as string}, 0, 'sponsor', 'aprobado', ${curadorId},
+                now())`;
+      const conAmbos = await panelPropuestas(curadorId, wsA);
+      expect(conAmbos.pendientes.find((x) => x.id === propuestaId)!.anclaEstado).toBe(
+        'reto-no-admite',
+      );
+
+      // Y la asimetría que sostiene todo esto: RECHAZAR sigue abierto. Es la salida de una
+      // propuesta obsoleta; bloquearla también dejaría la fila muerta para siempre. No lo
+      // alcanza ni el servicio (no materializa nada) ni el guard (sale temprano si el estado
+      // nuevo no es una aceptación). Con los DOS motivos encima, que es el caso de arriba.
+      await rechazarPropuesta(curadorId, { workspaceId: wsA, propuestaId });
+      const [decidida] = await conUsuario(curadorId, (tx) => tx`select estado from propuesta_ai
+        where id = ${propuestaId}`);
+      expect(decidida!.estado).toBe('rechazada');
+    });
+  });
+
   it('un item importado solo con la referencia no llega al proveedor: no hay nada que citar', async () => {
     const soloRef = await nuevoItem('Informe que vive en otra parte', 'documento', '');
     await conProveedor(RESPUESTA_CI, async () => {

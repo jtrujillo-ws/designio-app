@@ -182,12 +182,15 @@ export const TIPOS_FUENTE_CON_PERSONAS = ['entrevista', 'observacion'] as const;
 // ── Proyección del panel de revisión ──
 
 /** Estado del ancla de una propuesta pendiente: `disponible` es el único que admite
- * aceptar o corregir; el resto son motivos de obsolescencia, cada uno con su salida. */
+ * aceptar o corregir; el resto son motivos de obsolescencia, cada uno con su salida.
+ * RECHAZAR se admite en todos ellos, incluido el ancla ausente: es la salida de una
+ * propuesta obsoleta, y bloquearla dejaría la fila muerta y su ancla retenida. */
 export const ESTADOS_ANCLA = [
   'disponible',
   'item-curado',
   'consentimiento-revocado',
   'criterios-congelados',
+  'reto-no-admite',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];
@@ -217,10 +220,15 @@ export type PropuestaEnPanel = {
   anclaId: string;
   /**
    * Si el ancla sigue admitiendo la materialización y, cuando no, POR QUÉ: el item se curó
-   * a mano, su consentimiento dejó de autorizar el procesamiento externo (RF-09.4/09.5), o
-   * el G0 del reto congeló sus criterios (SYS-22). Las tres dejan la propuesta obsoleta y
-   * solo rechazable, pero se explican distinto — y con un booleano el panel no podía
-   * decirlo.
+   * a mano, su consentimiento dejó de autorizar el procesamiento externo (RF-09.4/09.5), el
+   * G0 del reto congeló sus criterios (SYS-22), o el reto avanzó en su ciclo de vida y ya no
+   * admite criterios nuevos (RF-04.12). Las cuatro dejan la propuesta obsoleta y solo
+   * rechazable, pero se explican distinto —y tienen salidas distintas—, así que con un
+   * booleano el panel no podía decirlo.
+   *
+   * Son cuatro y no tres porque la propuesta vive DOS recorridos: entre que se genera y que
+   * alguien la revisa pueden pasar días, y en ese hueco cada precondición caduca por su
+   * cuenta. El inventario de `ai.servicio.ts` las lista una a una.
    */
   anclaEstado: EstadoAncla;
   modelo: string;

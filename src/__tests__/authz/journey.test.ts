@@ -765,10 +765,20 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       }),
     ).rejects.toThrow(/transición va entre pasos o decisiones/);
 
-    // Y la edición deja su propio rastro, distinto del par borrado/alta.
-    const [ev] = await sqlAdmin()`select tipo from evento_dominio
-      where workspace_id = ${ws} and tipo = 'JourneyAristaEditada' limit 1`;
+    // Y la edición deja su propio rastro, distinto del par borrado/alta — con el estado
+    // ANTERIOR dentro. El update pisa la fila, así que un historial append-only que solo
+    // guardara el estado posterior no podría decir QUÉ cambió: auditar una corrección sin
+    // poder leerla es no auditarla.
+    const [ev] = await sqlAdmin()`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'JourneyAristaEditada'
+        and payload->>'aristaId' = ${a.aristaId}`;
     expect(ev).toBeDefined();
+    const payload = ev!.payload as Record<string, unknown>;
+    expect(payload.tipo).toBe('dependencia');
+    expect(payload.condicion).toBe('solo si el documento es extranjero');
+    const previo = payload.antes as Record<string, unknown>;
+    expect(previo.tipo).toBe('soporta');
+    expect(previo.condicion).toBe('');
   });
 
   it('quitar un enlace de evidencia no obliga a borrar el nodo entero', async () => {

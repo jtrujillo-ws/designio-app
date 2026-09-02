@@ -247,7 +247,8 @@ export type SenalValidacion = {
     | 'frontstage-sin-soporte'
     | 'sin-responsable'
     | 'huerfano-de-fase'
-    | 'arquetipo-refutado';
+    | 'arquetipo-refutado'
+    | 'sin-entrada';
   severidad: SeveridadSenal;
   nodoId: string;
   etiqueta: string;

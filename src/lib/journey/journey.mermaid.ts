@@ -163,6 +163,25 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
   );
   const entrada = candidatas[0]?.id ?? primeroId;
 
+  // Que NO haya candidata es en sí mismo el hallazgo, y el más silencioso de todos: si
+  // cada nodo transitable tiene entrada, el recorrido es un ciclo cerrado y el journey no
+  // empieza en ninguna parte. Anclando en el primer paso, un `A → B → A` sale entero
+  // alcanzable y con salida — cero señales sobre un grafo que no describe un recorrido.
+  //
+  // Se reporta y ADEMÁS se ancla: sin el anclaje, todos los pasos saldrían inalcanzables
+  // y la señal de verdad se perdería entre N falsos positivos que dicen lo mismo peor.
+  if (candidatas.length === 0 && transiciones.length > 0 && primeroId !== null) {
+    const primero = secuencia[0]!;
+    senales.push({
+      codigo: 'sin-entrada',
+      severidad: 'alta',
+      nodoId: primero.id,
+      etiqueta: primero.etiqueta,
+      mensaje:
+        'Todo paso o decisión tiene una transición de entrada: el recorrido es un ciclo cerrado y el journey no empieza en ninguna parte',
+    });
+  }
+
   // Alcanzable = se LLEGA desde el inicio siguiendo transiciones, no «alguien me apunta».
   // Un ciclo suelto C→D→C se apunta a sí mismo y quedaría exculpado con lo segundo,
   // que es precisamente el grafo roto que hay que ver.

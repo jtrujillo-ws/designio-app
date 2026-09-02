@@ -491,6 +491,7 @@ create function journey_grafo_auditoria() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   fila jsonb;
+  previa jsonb;
   ws uuid;
   jid uuid;
   cuerpo jsonb;
@@ -500,6 +501,11 @@ begin
   -- distintas, y plpgsql resuelve TODAS las referencias de campo de una expresión aunque
   -- la rama no se ejecute (`fila.origen_id` reventaría al auditar un nodo).
   fila := to_jsonb(case when tg_op = 'DELETE' then old else new end);
+  -- En un UPDATE, la fila vieja también: el evento tiene que decir QUÉ cambió, no solo
+  -- que algo cambió. Como el update pisa la fila, un historial append-only que solo
+  -- guarde el estado posterior no puede reconstruir la corrección — y auditar una
+  -- corrección sin poder leerla es no auditarla.
+  previa := case when tg_op = 'UPDATE' then to_jsonb(old) else null end;
   ws := (fila->>'workspace_id')::uuid;
 
   if tg_table_name = 'journey_nodo_evidencia' then
@@ -513,14 +519,24 @@ begin
     cuerpo := jsonb_build_object(
       'nodoId', fila->'id', 'tipo', fila->'tipo', 'etiqueta', fila->'etiqueta',
       'faseId', fila->'fase_id', 'orden', fila->'orden');
+    if previa is not null then
+      cuerpo := cuerpo || jsonb_build_object('antes', jsonb_build_object(
+        'etiqueta', previa->'etiqueta', 'detalle', previa->'detalle',
+        'faseId', previa->'fase_id', 'orden', previa->'orden',
+        'responsable', previa->'responsable'));
+    end if;
     evento := case tg_op when 'INSERT' then 'JourneyNodoAgregado'
                          when 'UPDATE' then 'JourneyNodoEditado'
                          else 'JourneyNodoBorrado' end;
   else
     jid := (fila->>'journey_id')::uuid;
     cuerpo := jsonb_build_object(
-      'aristaId', fila->'id', 'tipo', fila->'tipo',
+      'aristaId', fila->'id', 'tipo', fila->'tipo', 'condicion', fila->'condicion',
       'origenId', fila->'origen_id', 'destinoId', fila->'destino_id');
+    if previa is not null then
+      cuerpo := cuerpo || jsonb_build_object('antes', jsonb_build_object(
+        'tipo', previa->'tipo', 'condicion', previa->'condicion'));
+    end if;
     evento := case tg_op when 'INSERT' then 'JourneyAristaAgregada'
                          when 'UPDATE' then 'JourneyAristaEditada'
                          else 'JourneyAristaBorrada' end;

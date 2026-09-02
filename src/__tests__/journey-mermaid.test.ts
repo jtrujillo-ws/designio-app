@@ -267,6 +267,34 @@ describe('validarJourney', () => {
     expect(senales[0]!.codigo).toBe('sin-responsable');
   });
 
+  it('un ciclo cerrado sin principio se reporta: un journey empieza en algún sitio', () => {
+    // El caso más silencioso del grafo roto: si TODO nodo transitable tiene entrada, no
+    // hay candidata a inicio y anclar en el primer paso hace que `A → B → A` salga entero
+    // alcanzable y con salida — cero señales sobre algo que no describe un recorrido.
+    const ev = [{ id: id(), titulo: 'E' }];
+    const fase = nodo({ tipo: 'fase', etiqueta: 'Bucle', orden: 0 });
+    const a = nodo({ tipo: 'paso', etiqueta: 'A', orden: 0, faseId: fase.id, evidencias: ev });
+    const b = nodo({ tipo: 'paso', etiqueta: 'B', orden: 1, faseId: fase.id, evidencias: ev });
+    const senales = validarJourney(
+      journey([fase, a, b], [arista(a, b, 'transicion'), arista(b, a, 'transicion')]),
+    );
+
+    const sinEntrada = senales.filter((s) => s.codigo === 'sin-entrada');
+    expect(sinEntrada).toHaveLength(1);
+    expect(sinEntrada[0]!.severidad).toBe('alta');
+    // Se ancla igualmente: sin el anclaje los dos pasos saldrían inalcanzables y la
+    // señal de verdad quedaría enterrada bajo falsos positivos que dicen lo mismo peor.
+    expect(senales.some((s) => s.codigo === 'paso-inalcanzable')).toBe(false);
+  });
+
+  it('un journey lineal normal no produce la señal de ciclo cerrado', () => {
+    const ev = [{ id: id(), titulo: 'E' }];
+    const fase = nodo({ tipo: 'fase', etiqueta: 'Alta', orden: 0 });
+    const a = nodo({ tipo: 'paso', etiqueta: 'Inicio', orden: 0, faseId: fase.id, evidencias: ev });
+    const b = nodo({ tipo: 'paso', etiqueta: 'Fin', orden: 1, faseId: fase.id, evidencias: ev });
+    expect(validarJourney(journey([fase, a, b], [arista(a, b, 'transicion')]))).toEqual([]);
+  });
+
   it('el huérfano de fase se reporta en todo lo que vive dentro de una fase, no solo en pasos', () => {
     // Borrar una fase pone a null el `fase_id` de sus hijos: una acción con soporte y
     // responsable podía quedarse fuera de toda fase sin producir ni una señal, mientras

@@ -302,15 +302,54 @@ export function validarJourney(journey: JourneyCompleto): SenalValidacion[] {
   // ciclo de reintento con salida sigue siendo legítimo: su salida lleva a un final que
   // también es alcanzable, así que la señal no se emite.
   const finales = transitables.filter((n) => alcanzables.has(n.id) && !conSalida.has(n.id));
-  if (finales.length === 0 && transiciones.length > 0 && anclaje !== null) {
-    senales.push({
-      codigo: 'sin-final',
-      severidad: 'alta',
-      nodoId: anclaje.id,
-      etiqueta: anclaje.etiqueta,
-      mensaje:
-        'Ningún paso o decisión alcanzable termina el recorrido: todo camino vuelve sobre sí mismo y el journey no puede acabar',
-    });
+  if (transiciones.length > 0 && alcanzables.size > 0) {
+    if (finales.length === 0 && anclaje !== null) {
+      // NINGÚN final: todo el recorrido es un bucle. Se reporta una vez y sobre la
+      // entrada, porque señalar los N nodos diría lo mismo N veces.
+      senales.push({
+        codigo: 'sin-final',
+        severidad: 'alta',
+        nodoId: anclaje.id,
+        etiqueta: anclaje.etiqueta,
+        mensaje:
+          'Ningún paso o decisión alcanzable termina el recorrido: todo camino vuelve sobre sí mismo y el journey no puede acabar',
+      });
+    } else if (finales.length > 0) {
+      // Hay final, pero eso no basta: una bifurcación puede dejar una rama atrapada
+      // mientras la otra sí termina (`A → B` junto a `A → C → D → C`). B salva el grafo
+      // de la comprobación anterior y C/D no acaban nunca.
+      //
+      // La pregunta correcta es «¿desde aquí SE PUEDE llegar a un final?», que es
+      // alcanzabilidad hacia atrás: se parte de los finales y se sube por las
+      // transiciones. Lo que quede fuera está atrapado, y aquí sí se nombra uno por uno
+      // porque cada rama atrapada es un desenlace distinto que alguien tiene que cerrar.
+      const entradasDe = new Map<string, string[]>();
+      for (const a of transiciones) {
+        entradasDe.set(a.destinoId, [...(entradasDe.get(a.destinoId) ?? []), a.origenId]);
+      }
+      const puedenTerminar = new Set<string>(finales.map((n) => n.id));
+      const cola = [...puedenTerminar];
+      while (cola.length > 0) {
+        for (const previo of entradasDe.get(cola.pop()!) ?? []) {
+          if (!puedenTerminar.has(previo)) {
+            puedenTerminar.add(previo);
+            cola.push(previo);
+          }
+        }
+      }
+      for (const nodo of porSecuencia(
+        journey,
+        transitables.filter((n) => alcanzables.has(n.id) && !puedenTerminar.has(n.id)),
+      )) {
+        senales.push({
+          codigo: 'sin-final',
+          severidad: 'alta',
+          nodoId: nodo.id,
+          etiqueta: nodo.etiqueta,
+          mensaje: 'Desde aquí no se llega a ningún final: esta rama del recorrido no puede terminar',
+        });
+      }
+    }
   }
 
   // Un arquetipo puede refutarse DESPUÉS de entrar al grafo: el guard impide añadir uno

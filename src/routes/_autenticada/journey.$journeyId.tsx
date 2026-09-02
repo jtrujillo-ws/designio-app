@@ -551,6 +551,21 @@ function FilaNodo({
   const [ocupado, setOcupado] = useState(false);
   const fase = fases.find((f) => f.id === nodo.faseId);
 
+  /**
+   * Los campos se cargan al ABRIR la edición, no al montar. Reordenar un nodo desplaza el
+   * `orden` de sus hermanos, y aunque el loader se revalide, la fila del hermano sigue
+   * montada con el valor que tenía: si más tarde se edita solo su detalle, se enviaría el
+   * orden viejo y el nodo se movería otra vez sin que nadie lo pidiera.
+   */
+  function abrirEdicion() {
+    setEtiqueta(nodo.etiqueta);
+    setDetalle(nodo.detalle);
+    setResponsable(nodo.responsable);
+    setFaseId(nodo.faseId ?? '');
+    setOrden(String(nodo.orden));
+    setEditando(true);
+  }
+
   async function guardar() {
     setOcupado(true);
     onError(null);
@@ -687,7 +702,7 @@ function FilaNodo({
 
       {editable && !editando && !enlazando && (
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <Button size="sm" variant="ghost" onClick={() => setEditando(true)}>
+          <Button size="sm" variant="ghost" onClick={abrirEdicion}>
             Editar
           </Button>
           <Button size="sm" variant="ghost" onClick={() => setEnlazando(true)}>

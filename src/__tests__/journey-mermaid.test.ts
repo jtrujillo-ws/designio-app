@@ -331,6 +331,39 @@ describe('validarJourney', () => {
     expect(conSalida.filter((s) => s.codigo === 'sin-final')).toEqual([]);
   });
 
+  it('una rama atrapada se reporta aunque otra rama sí termine', () => {
+    // `A → B` (final) junto a `A → C → D → C`: la existencia de UN final salva el grafo de
+    // la comprobación global, pero la rama C/D no acaba nunca. La pregunta correcta no es
+    // «¿hay algún final?» sino «¿desde aquí se puede llegar a uno?».
+    const ev = [{ id: id(), titulo: 'E' }];
+    const fase = nodo({ tipo: 'fase', etiqueta: 'Alta', orden: 0 });
+    const a = nodo({ tipo: 'decision', etiqueta: '¿Documento válido?', orden: 0, faseId: fase.id });
+    const b = nodo({ tipo: 'paso', etiqueta: 'Aprueba', orden: 0, faseId: fase.id, evidencias: ev });
+    const c = nodo({ tipo: 'paso', etiqueta: 'Pide corrección', orden: 1, faseId: fase.id, evidencias: ev });
+    const d = nodo({ tipo: 'paso', etiqueta: 'Revisa de nuevo', orden: 2, faseId: fase.id, evidencias: ev });
+
+    const senales = validarJourney(
+      journey(
+        [fase, a, b, c, d],
+        [
+          arista(a, b, 'transicion', 'sí'),
+          arista(a, c, 'transicion', 'no'),
+          arista(c, d, 'transicion'),
+          arista(d, c, 'transicion'),
+        ],
+      ),
+    );
+
+    // Se nombran los dos nodos atrapados, uno por uno: cada rama es un desenlace que
+    // alguien tiene que cerrar.
+    expect(
+      senales.filter((s) => s.codigo === 'sin-final').map((s) => s.nodoId).sort(),
+    ).toEqual([c.id, d.id].sort());
+    // El que sí termina no se reporta, ni la decisión que lleva a los dos.
+    expect(senales.some((s) => s.codigo === 'sin-final' && s.nodoId === b.id)).toBe(false);
+    expect(senales.some((s) => s.codigo === 'sin-final' && s.nodoId === a.id)).toBe(false);
+  });
+
   it('un ciclo de solo decisiones también se reporta: no hace falta un paso para no tener principio', () => {
     // `primeroId` se deriva de los pasos, así que una fase de solo decisiones se saltaba
     // la señal: sin paso no había anclaje, y las comprobaciones de alcanzabilidad y de

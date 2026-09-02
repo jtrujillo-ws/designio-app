@@ -155,6 +155,11 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
         from journey_nodo n
         where n.id = ${entrada.nodoId} and n.workspace_id = ${entrada.workspaceId}
           and c.id = n.catalogo_id and c.workspace_id = n.workspace_id`;
+      // Solo cuando la etiqueta CAMBIA de verdad. Sin el `<>`, editar únicamente el
+      // detalle o el responsable de un nodo con catálogo reescribía a todos sus hermanos
+      // con el mismo valor, y Postgres dispara el trigger de auditoría igual en un update
+      // que no cambia nada: `JourneyNodoEditado` falsos en todos los journeys donde la
+      // entidad aparece, por una edición que no los tocó.
       await tx`
         update journey_nodo otros
         set etiqueta = ${entrada.etiqueta}
@@ -162,7 +167,8 @@ export async function editarNodo(actorId: string, entrada: EditarNodo): Promise<
         where n.id = ${entrada.nodoId} and n.workspace_id = ${entrada.workspaceId}
           and n.catalogo_id is not null
           and otros.catalogo_id = n.catalogo_id and otros.workspace_id = n.workspace_id
-          and otros.id <> n.id`;
+          and otros.id <> n.id
+          and otros.etiqueta <> ${entrada.etiqueta}`;
       // Mover un nodo a una posición ocupada dejaría a dos hermanos EMPATADOS en `orden`,
       // y ahí las tres vistas dejan de hablar del mismo journey: `porSecuencia` desempata
       // por id y el render de la fase ordena solo por `orden`, así que el diagrama y el

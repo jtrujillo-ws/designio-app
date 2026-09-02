@@ -69,11 +69,29 @@ function comoErrorDeDominio(e: unknown, sinPermiso?: string): never {
 }
 
 /**
- * Candado por SERVICIO para las aprobaciones de design version. Dos aprobaciones
- * concurrentes tocan filas distintas (cada una la suya y la que supera), así que ninguna
- * política ve a la otra: una política es un predicado sobre un snapshot, no un candado.
- * El índice único parcial las atraparía, pero con un error de constraint en vez de un
- * mensaje; el candado las serializa y la segunda ve el estado real.
+ * Candado por SERVICIO: el punto de cita de todo lo que decide sobre CUÁL es la design
+ * version vigente de un servicio, y de todo lo que cuelga trabajo nuevo de ella.
+ *
+ * Lo toman las aprobaciones —dos concurrentes tocan filas distintas (cada una la suya y la
+ * que supera), así que ninguna política ve a la otra; el índice único parcial las
+ * atraparía, pero con un error de constraint en vez de un mensaje— y también los dos
+ * caminos que AÑADEN trabajo a una versión: planificar un release y declarar alcance.
+ *
+ * Esos dos hacían falta por el mismo motivo, en el otro sentido. Sus políticas exigen que
+ * la design version esté `aprobada`, pero eso es un predicado sobre un snapshot: mientras
+ * la aprobación de la sucesora —que marca `superada` a la actual— sigue sin commitear, la
+ * versión vieja todavía parece aprobada. Y la verificación de la FK NO los serializa:
+ * insertar el release toma `FOR KEY SHARE` sobre la fila de la design version y la
+ * supersión solo cambia una columna no-clave, o sea `FOR NO KEY UPDATE`, y esos dos modos
+ * NO entran en conflicto. Las dos transacciones commitean y queda un release colgado para
+ * siempre de un diseño superado. Que eso importe es reciente: desde el arreglo de G7, un
+ * release sin resolver de una versión superada BLOQUEA la certificación del proyecto, así
+ * que ya no es un estado legal e inocuo sino trabajo que nadie pidió y que hay que ir a
+ * cerrar a mano.
+ *
+ * Orden de adquisición: design version → SERVICIO (en `aprobarDesignVersion`) y
+ * SERVICIO → serie → release (en los caminos del alcance). Ninguna ruta toma el servicio
+ * antes que su design version ni el release antes que el servicio, así que no hay ciclo.
  */
 async function bloquearServicio(tx: TransactionSql, servicioId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(
@@ -489,6 +507,16 @@ export async function planificarRelease(
 ): Promise<{ releaseId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // `servicio_id` no está en el grant de columna, así que es inmutable y leerlo ANTES
+    // del candado no puede quedar obsoleto: es solo el nombre del candado que hay que
+    // pedir. Lo que sí puede haber cambiado cuando volvamos —que la design version haya
+    // sido superada— lo relee la política del insert, ya bajo el candado.
+    const [dvServicio] = await tx`select servicio_id from design_version
+      where id = ${entrada.designVersionId} and workspace_id = ${entrada.workspaceId}`;
+    if (!dvServicio) {
+      throw new ErrorEntrega('Esa design version no existe en este workspace');
+    }
+    await bloquearServicio(tx, dvServicio.servicio_id as string);
     await bloquearSerie(tx, 'rl', entrada.workspaceId);
     let fila;
     try {
@@ -534,6 +562,23 @@ async function asignarElementosAlRelease(
   // escribiendo tablas distintas. En `planificarRelease` el candado no tiene contendiente
   // —el release acaba de nacer y su id no es visible para nadie más—, pero tomarlo aquí
   // y no en cada llamador es lo que garantiza que ningún camino al alcance se lo salte.
+  //
+  // Y compite TAMBIÉN con la supersión de su design version, que escribe una tercera
+  // tabla: la política nueva exige que la versión siga aprobada para añadir alcance, pero
+  // una política es un predicado sobre un snapshot y bajo READ COMMITTED no ve la
+  // aprobación de la sucesora aún sin commitear. El candado del servicio es el mismo que
+  // toma `aprobarDesignVersion`, así que al pasar él ya committeó y la política —que toma
+  // su propio snapshot, por ser una sentencia posterior— lee el estado real.
+  //
+  // Orden de adquisición, igual en los dos caminos del alcance: SERVICIO → serie → release.
+  // Ninguna ruta lo toma al revés, así que no hay ciclo.
+  const [dvDelRelease] = await tx`select dv.servicio_id from release r
+    join design_version dv on dv.id = r.design_version_id and dv.workspace_id = r.workspace_id
+    where r.id = ${releaseId} and r.workspace_id = ${workspaceId}`;
+  if (!dvDelRelease) {
+    throw new ErrorEntrega('Ese release no existe en este workspace');
+  }
+  await bloquearServicio(tx, dvDelRelease.servicio_id as string);
   await bloquearRelease(tx, releaseId);
   try {
     const filas = await tx`

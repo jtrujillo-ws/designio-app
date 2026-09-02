@@ -2003,6 +2003,312 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(sucesora.designVersionId).toBeTruthy();
   });
 
+  it('una transición legal no es un salvoconducto: cada una congela lo que no le toca', async () => {
+    // La clase entera, no tres casos sueltos. Toda transición de este slice es un UPDATE
+    // sobre una fila con columnas en el grant, y su política solo mira el PAR DE ESTADOS.
+    // Como la transición es LEGAL, el rechazo de «mismo estado» ni siquiera llega, y la
+    // sentencia entra con toda la carga extra que quiera: el que decide qué queda
+    // congelado tiene que ser el guard, que es la máquina de estados.
+    const admin = sqlAdmin();
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio de las columnas congeladas', ${leadId}) returning id`;
+    const svcId = svc!.id as string;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', 'To-be de las columnas congeladas', ${leadId})
+      returning id`;
+    const journeyId = j!.id as string;
+
+    const crearConElemento = async (titulo: string, superaA: string | null) => {
+      const dv = await crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId,
+        servicioId: svcId,
+        journeyId,
+        titulo,
+        resumen: '',
+        superaA,
+      });
+      await agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        tipo: 'canal',
+        operacion: 'agrega',
+        titulo: `Elemento de ${titulo}`,
+        detalle: '',
+        nodoId: null,
+        decisionIds: [],
+        insightIds: [],
+      });
+      return dv.designVersionId;
+    };
+
+    const dvA = await crearConElemento('DV congelada A', null);
+    await aprobarDesignVersion(leadId, { workspaceId: ws, designVersionId: dvA, motivo: '' });
+    const snapshotA = (await designVersionCompleta(leadId, ws, dvA))!.snapshotId!;
+    expect(snapshotA).toBeTruthy();
+
+    // ── 1. BORRADOR: los sellos no se ponen a mano ────────────────────────────────────
+    // `snapshot_id` y `aprobada_por` están en el grant porque los escribe la aprobación, y
+    // sobre un borrador hay UPDATEs legítimos (enlazar journey, declarar sucesión) que
+    // ninguna política acota columna a columna. El ataque sería sembrar el snapshot de una
+    // aprobación ANTERIOR del mismo grafo: al aprobar, la política solo exige que el
+    // snapshot sea de su journey —no que se acabe de tomar—, así que la versión se
+    // congelaría sobre un to-be viejo, certificando un diseño distinto del que aprobó.
+    //
+    // No hace falta regla nueva en el guard: lo para el CHECK de la tabla, que exige los
+    // tres sellos nulos mientras el estado es borrador. Se fija aquí porque es la pieza
+    // que sostiene ese hueco, y quien la quite tiene que ver caer este test — un CHECK no
+    // se empareja entre políticas ni se cuela con una transición legal, así que es el
+    // sitio más fuerte donde podía estar.
+    const dvB = await crearConElemento('DV congelada B', dvA);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update design_version set snapshot_id = ${snapshotA}
+        where id = ${dvB} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/violates check constraint/);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update design_version set aprobada_por = ${leadId}
+        where id = ${dvB} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/violates check constraint/);
+    // Y lo que SÍ se corrige en borrador sigue corrigiéndose: el guard no cierra la puerta
+    // que la rama abrió, solo la de los sellos.
+    await enlazarJourney(leadId, { workspaceId: ws, designVersionId: dvB, journeyId });
+    expect((await designVersionCompleta(leadId, ws, dvB))!.snapshotId).toBeNull();
+
+    // ── 2. aprobada → superada: solo cambia el estado ─────────────────────────────────
+    // La transición es legal, así que ni el rechazo de «mismo estado» ni los otros dos
+    // guards (que se apartan cuando la fila ya no es borrador) miran nada. Sin esto, la
+    // misma sentencia que supera reescribía el snapshot que contesta «qué pasos afectó
+    // RL-1» (§19.7) y la cadena de SYS-05.
+    // Los valores de la carga son VÁLIDOS uno a uno: otro snapshot real, otro journey
+    // real, otro usuario, otra versión. Anularlos habría caído en el CHECK de sellos («no
+    // borrador ⇒ los tres no nulos») sin llegar nunca al guard, y el test habría pasado
+    // sin probarlo. Repuntar es además el ataque de verdad: dejar la fila coherente pero
+    // diciendo que aprobó otra cosa.
+    const [otroSvc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio del snapshot ajeno', ${leadId}) returning id`;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${otroSvc!.id as string}, ${ws}, ${leadId})`;
+    const [otroJ] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${otroSvc!.id as string}, 'to-be', 'To-be ajeno', ${leadId}) returning id`;
+    const otroJourney = otroJ!.id as string;
+    const dvAjena = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: otroSvc!.id as string,
+      journeyId: otroJourney,
+      titulo: 'DV del snapshot ajeno',
+      resumen: '',
+      superaA: null,
+    });
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: dvAjena.designVersionId,
+      tipo: 'canal',
+      operacion: 'agrega',
+      titulo: 'Elemento ajeno',
+      detalle: '',
+      nodoId: null,
+      decisionIds: [],
+      insightIds: [],
+    });
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dvAjena.designVersionId,
+      motivo: '',
+    });
+    const snapshotAjeno = (await designVersionCompleta(leadId, ws, dvAjena.designVersionId))!
+      .snapshotId!;
+
+    // Una a una y como LEAD autenticado, que es quien tiene la política de supersión: lo
+    // que se prueba es que el guard las para, no que la RLS no llegue.
+    const superarCon = (columna: string, valor: string) =>
+      conUsuario(leadId, (tx) => tx`update design_version
+        set estado = 'superada', ${tx.unsafe(columna)} = ${valor}
+        where id = ${dvA} and workspace_id = ${ws}`);
+    for (const [columna, valor] of [
+      ['snapshot_id', snapshotAjeno],
+      ['journey_id', otroJourney],
+      ['aprobada_por', disId],
+      ['supera_a', dvB],
+    ] as [string, string][]) {
+      await expect(superarCon(columna, valor)).rejects.toThrow(/solo cambia su estado/);
+    }
+    // Y la supersión de verdad —la que hace la aprobación de la sucesora, en la misma
+    // transacción— sigue pasando y deja intacto lo que aquella versión aprobó.
+    await aprobarDesignVersion(leadId, { workspaceId: ws, designVersionId: dvB, motivo: '' });
+    const superada = await designVersionCompleta(leadId, ws, dvA);
+    expect(superada!.estado).toBe('superada');
+    expect(superada!.snapshotId).toBe(snapshotA);
+
+    // ── 3. desplegado → verificado: la fecha real de lo que pasó no se reescribe ───────
+    const elB = (await designVersionCompleta(leadId, ws, dvB))!.elementos[0]!.id;
+    const plan = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvB,
+      titulo: 'Release de la fecha congelada',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elB, razon: '' }],
+    });
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: plan.releaseId,
+      desplegadoEn: AYER,
+    });
+    // La comprobación va ANTES que la de «constatar todos los elementos» a propósito: si
+    // fuera después, sobre un release ya constatado por completo la fecha se colaría. Y
+    // por aquí entraba incluso una fecha FUTURA, porque el «no futura» vive en la rama de
+    // desplegado y esta transición no pasa por ella.
+    for (const fecha of [HOY, dia(30)]) {
+      await expect(
+        conUsuario(leadId, (tx) => tx`update release
+          set estado = 'verificado', desplegado_en = ${fecha}::date
+          where id = ${plan.releaseId} and workspace_id = ${ws}`),
+      ).rejects.toThrow(/no reescribe la fecha real del despliegue/);
+    }
+    const trasIntentos = await designVersionCompleta(leadId, ws, dvB);
+    const rel = trasIntentos!.releases.find((r) => r.id === plan.releaseId)!;
+    expect(rel.estado).toBe('desplegado');
+    expect(rel.desplegadoEn).toBe(AYER);
+  });
+
+  it('planificar y ampliar el alcance esperan a la supersión; quitarlo no', async () => {
+    // La política del release y la del alcance exigen la design version APROBADA, pero una
+    // política es un predicado sobre un snapshot: mientras la aprobación de la sucesora
+    // —que marca `superada` a la actual— sigue sin commitear, la vieja todavía parece
+    // aprobada. Y la FK NO serializa: insertar el release toma FOR KEY SHARE sobre la fila
+    // de la design version y la supersión solo cambia una columna no-clave (FOR NO KEY
+    // UPDATE), y esos dos modos no entran en conflicto. Las dos commitean y queda trabajo
+    // nuevo colgado de un diseño superado — que desde el arreglo de G7 BLOQUEA el gate.
+    const admin = sqlAdmin();
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, 'Servicio de la supersión en vuelo', ${leadId}) returning id`;
+    const svcId = svc!.id as string;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', 'To-be de la supersión en vuelo', ${leadId})
+      returning id`;
+    const journeyId = j!.id as string;
+
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que va a ser superada en vuelo',
+      resumen: '',
+      superaA: null,
+    });
+    const elUno = (
+      await agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        tipo: 'canal',
+        operacion: 'agrega',
+        titulo: 'Elemento que ya está en el release',
+        detalle: '',
+        nodoId: null,
+        decisionIds: [],
+        insightIds: [],
+      })
+    ).elementoId;
+    const elDos = (
+      await agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        tipo: 'canal',
+        operacion: 'agrega',
+        titulo: 'Elemento que llega tarde',
+        detalle: '',
+        nodoId: null,
+        decisionIds: [],
+        insightIds: [],
+      })
+    ).elementoId;
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const yaPlanificado = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'Release que ya existía',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elUno, razon: '' }],
+    });
+
+    // Transacción A: toma el candado del SERVICIO —el mismo que toman aprobar y los dos
+    // caminos del alcance— y supera la versión, y queda abierta. Avisa al TENER el
+    // candado: sin ese aviso el test podría pasar por el intercalado contrario, en el que
+    // los contendientes llegan primero, y eso no prueba nada.
+    let listo!: () => void;
+    const tomado = new Promise<void>((r) => (listo = r));
+    let liberar!: () => void;
+    const espera = new Promise<void>((r) => (liberar = r));
+    const supersion = conUsuario(leadId, async (tx) => {
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:design-version:' || ${svcId}, 42))`;
+      await tx`update design_version set estado = 'superada'
+        where id = ${dv.designVersionId} and workspace_id = ${ws}`;
+      listo();
+      await espera;
+    });
+    await tomado;
+
+    // Los dos caminos que AÑADEN trabajo esperan: planificar un release nuevo y meter un
+    // elemento en el que ya estaba planificado.
+    const planNuevo = planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'Release colado en plena supersión',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elDos, razon: '' }],
+    });
+    const alcanceTardio = asignarElemento(leadId, {
+      workspaceId: ws,
+      releaseId: yaPlanificado.releaseId,
+      elementoId: elDos,
+      razon: 'llega tarde',
+    });
+    try {
+      expect(await siguePendiente(planNuevo)).toBe(true);
+      expect(await siguePendiente(alcanceTardio)).toBe(true);
+    } finally {
+      liberar();
+    }
+    await supersion;
+    // Al soltar, los dos releen el estado real y los dos se niegan.
+    await expect(planNuevo).rejects.toThrow(ErrorEntrega);
+    await expect(alcanceTardio).rejects.toThrow(ErrorEntrega);
+
+    const trasCarrera = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(trasCarrera!.estado).toBe('superada');
+    expect(trasCarrera!.releases).toHaveLength(1);
+    expect(
+      trasCarrera!.releases[0]!.elementos.map((e) => e.elementoId),
+    ).toEqual([elUno]);
+
+    // Y la asimetría que sostiene a G7: QUITAR alcance sigue permitido sobre una versión
+    // superada. Es la salida que el gate le deja al lead para cerrar lo que quedó en vuelo
+    // («esto ya no va a salir»); exigir aquí la versión aprobada dejaría ese release sin
+    // forma de cerrarse y G7 bloqueado para siempre.
+    await desasignarElemento(leadId, ws, elUno);
+    const trasVaciar = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(trasVaciar!.releases[0]!.elementos).toHaveLength(0);
+  });
+
   it('nada de esto cruza el workspace', async () => {
     const admin = sqlAdmin();
     const [otro] = await admin`insert into workspace (nombre) values (${marca + '-ajeno'})

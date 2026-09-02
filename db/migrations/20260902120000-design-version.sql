@@ -471,14 +471,29 @@ create policy release_verificar on release
 
 -- El alcance de un release se declara mientras está PLANIFICADO. Una vez desplegado,
 -- mover elementos dentro o fuera reescribiría qué se implementó.
+--
+-- AÑADIR alcance exige además que la design version padre siga APROBADA. Sin eso, una
+-- pantalla cargada antes de la supersión seguía pudiendo meter trabajo nuevo en una
+-- versión ya reemplazada: la política solo miraba el release, y el release no cambia de
+-- estado cuando su versión es superada. Desde el arreglo de G7 eso no es inocuo — un
+-- release sin resolver de una versión superada BLOQUEA la certificación del proyecto—,
+-- así que la puerta se cierra donde se abre.
+--
+-- QUITAR alcance no lo exige, y la asimetría es deliberada: es exactamente la salida que
+-- G7 deja al lead para cerrar lo que la versión superada dejó en vuelo («esto ya no va a
+-- salir» = se le quita el alcance al release planificado, y entonces no puede desplegarse
+-- nunca). Exigir aquí la versión aprobada dejaría ese trabajo sin forma de cerrarse y el
+-- gate bloqueado para siempre. Añadir es abrir trabajo nuevo; quitar es cerrar lo abierto.
 create policy release_elemento_insert on release_elemento
   for insert with check (
     workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
     and creado_por = app_user_id()
     and exists (select 1 from release r
+      join design_version dv on dv.id = r.design_version_id and dv.workspace_id = r.workspace_id
       where r.id = release_elemento.release_id
         and r.workspace_id = release_elemento.workspace_id
-        and r.estado = 'planificado')
+        and r.estado = 'planificado'
+        and dv.estado = 'aprobada')
   );
 create policy release_elemento_delete on release_elemento
   for delete using (
@@ -784,6 +799,15 @@ begin
     if old.estado <> 'borrador' then
       raise exception 'una design version aprobada es inmutable (SYS-05): crea una versión nueva que la supere';
     end if;
+    -- Sobre un BORRADOR sí hay UPDATEs legítimos —enlazar el journey, declarar a quién
+    -- supera—, y cada uno tiene su guard. Los dos SELLOS que la aprobación escribe
+    -- (`snapshot_id`, `aprobada_por`) están además en el grant de columna, así que se
+    -- miró si hacía falta congelarlos aquí: NO hace falta, y por eso no hay regla. El
+    -- CHECK de la tabla («estado <> borrador o los tres sellos son null») ya impide
+    -- sembrarlos de antemano, que era el ataque —aprobar congelando el snapshot de una
+    -- aprobación ANTERIOR del mismo grafo, y certificar así un to-be viejo—. Un CHECK no
+    -- se puede emparejar entre políticas ni saltar con una transición legal: es el sitio
+    -- más fuerte donde podía estar. Hay test que lo fija.
     return new;
   end if;
   if (old.estado, new.estado) not in (('borrador', 'aprobada'), ('aprobada', 'superada')) then
@@ -865,6 +889,20 @@ begin
                            'superaA', new.supera_a),
         app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   else
+    -- Superar cambia UNA cosa: el estado. Todo lo demás es el registro de lo que esta
+    -- versión aprobó, y sigue teniendo que responder por ello mucho después — el snapshot
+    -- es lo que contesta «qué pasos afectó RL-1» (§19.7), y `supera_a` es la cadena de
+    -- SYS-05. La transición es LEGAL, así que el rechazo de «mismo estado» de arriba no
+    -- dispara y las políticas solo miran el par de estados; el `using` de
+    -- design_version_superar y su `with check` dejan pasar la sentencia entera, carga
+    -- incluida. Los otros dos guards se apartan a propósito cuando la fila ya no es
+    -- borrador, así que aquí no queda nadie más: la lista va explícita.
+    if new.journey_id is distinct from old.journey_id
+      or new.snapshot_id is distinct from old.snapshot_id
+      or new.aprobada_por is distinct from old.aprobada_por
+      or new.supera_a is distinct from old.supera_a then
+      raise exception 'superar una design version solo cambia su estado: lo que aprobó es inmutable (SYS-05)';
+    end if;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'DesignVersionSuperada',
         jsonb_build_object('designVersionId', new.id, 'codigo', new.codigo,
@@ -973,6 +1011,16 @@ begin
                            'desplegadoEn', to_char(new.desplegado_en, 'YYYY-MM-DD')),
         app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   else
+    -- Verificar cambia UNA cosa: el estado. `desplegado_en` es la fecha REAL de lo que
+    -- pasó y ya está registrada; aquí no se toca. El rechazo de «mismo estado» de arriba
+    -- no cubre esto —la transición es legal, así que ni siquiera llega—, y la política de
+    -- verificación solo pide el estado nuevo mientras el grant de columna sigue dejando
+    -- escribir la fecha. Peor aún: la comprobación de fecha no futura vive en la rama de
+    -- `desplegado`, así que por aquí entraba incluso una fecha del futuro. Congelar la
+    -- columna cierra las dos cosas de una vez.
+    if new.desplegado_en is distinct from old.desplegado_en then
+      raise exception 'verificar no reescribe la fecha real del despliegue (RF-06.5)';
+    end if;
     -- RF-06.6: «por cada elemento desplegado, constatación de cómo quedó». La
     -- constatación se inserta en sentencias anteriores de la misma transacción, así que
     -- este predicado ya las ve; por SQL crudo, verificar sin constatar aborta.

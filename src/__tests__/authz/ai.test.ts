@@ -1578,6 +1578,34 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  it('un reto que ya no admite criterios no llega ni a pedirlos: se corta antes de gastar', async () => {
+    await enWorkspaceLimpio('admision-archivado', async ({ ws: wsB, curadorId, retoId: retoB }) => {
+      const admin = sqlAdmin();
+      await admin`update reto set estado = 'archivado' where id = ${retoB}`;
+
+      // La contrapartida del test de arriba en el PRIMER recorrido: allí el reto se cerraba
+      // entre generar y aceptar; aquí ya estaba cerrado antes de empezar. El mismo predicado
+      // y la misma función, en el momento en el que todavía se puede evitar el gasto — que
+      // es la razón de que la columna «antes de llamar» exista.
+      await expect(
+        conProveedor(
+          { ok: true, datos: { criterios: [CONTENIDO_C0] }, intentos: [intento({ uso: null })] },
+          () => generarPropuestas(curadorId, { workspaceId: wsB, capacidad: 'C0', anclaId: retoB }),
+        ),
+      ).rejects.toThrow(/no admite criterios/i);
+
+      // Y «se corta antes de gastar» se comprueba, no se supone: sin llamada anotada no hubo
+      // nada que pagar, y sin reserva viva el ancla no queda retenida por un intento que no
+      // llegó a ninguna parte.
+      const llamadas = await conUsuario(curadorId, (tx) => tx`select 1 as x from llamada_ai
+        where workspace_id = ${wsB} and reto_id = ${retoB}`);
+      expect(llamadas.length).toBe(0);
+      const reservas = await conUsuario(curadorId, (tx) => tx`select 1 as x from reserva_ai
+        where workspace_id = ${wsB} and reto_id = ${retoB}`);
+      expect(reservas.length).toBe(0);
+    });
+  });
+
   it('un item importado solo con la referencia no llega al proveedor: no hay nada que citar', async () => {
     const soloRef = await nuevoItem('Informe que vive en otra parte', 'documento', '');
     await conProveedor(RESPUESTA_CI, async () => {

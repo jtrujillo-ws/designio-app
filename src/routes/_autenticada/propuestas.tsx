@@ -106,11 +106,26 @@ function PantallaPropuestas() {
   const router = useRouter();
   const rol = membresiaActiva?.rol ?? '';
   const puedeRevisar = (ROLES_CURADORES as readonly string[]).includes(rol);
-  const [error, setError] = useState<string | null>(null);
-  const [aviso, setAviso] = useState<string | null>(null);
+  // Los mensajes PERTENECEN al workspace en el que se produjeron, así que se guardan con su
+  // dueño y se descartan al pintar si ya no coincide. Esta ruta no se desmonta al cambiar de
+  // workspace —el selector solo cambia sus `loaderDeps`, y el componente se reutiliza—, de
+  // modo que un aviso guardado a secas sobrevivía al workspace del que hablaba: «3 propuestas
+  // en espera de revisión humana» leído sobre el cliente de al lado. Misma forma que el ancla
+  // del formulario de generación y por la misma razón: la validez se DERIVA de la identidad
+  // que hay delante, no se recuerda y se invalida a mano.
+  const wsActual = datos?.workspaceId ?? '';
+  type Mensaje = { ws: string; texto: string } | null;
+  const [errorGuardado, setErrorGuardado] = useState<Mensaje>(null);
+  const [avisoGuardado, setAvisoGuardado] = useState<Mensaje>(null);
+  const error = errorGuardado?.ws === wsActual ? errorGuardado.texto : null;
+  const aviso = avisoGuardado?.ws === wsActual ? avisoGuardado.texto : null;
+  const errar = (texto: string | null) =>
+    setErrorGuardado(texto === null ? null : { ws: wsActual, texto });
+  const avisar = (texto: string | null) =>
+    setAvisoGuardado(texto === null ? null : { ws: wsActual, texto });
 
   async function refrescar() {
-    setError(null);
+    errar(null);
     await router.invalidate();
   }
 
@@ -173,11 +188,11 @@ function PantallaPropuestas() {
                   })
                 }
                 onGenerado={async (n) => {
-                  setAviso(`${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`);
+                  avisar(`${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`);
                   await refrescar();
                 }}
                 onConsentimiento={async (r) => {
-                  setAviso(
+                  avisar(
                     r.autorizaExterno
                       ? `Consentimiento registrado (nº ${r.version}): ya puedes pedir la propuesta`
                       : `Consentimiento registrado (nº ${r.version}). No cubre el procesamiento externo, así que la generación sigue bloqueada; si la persona lo autoriza después, registra un consentimiento nuevo y ese pasará a ser el vigente.`,
@@ -185,8 +200,8 @@ function PantallaPropuestas() {
                   await refrescar();
                 }}
                 onError={(e) => {
-                  setAviso(null);
-                  setError(e);
+                  avisar(null);
+                  errar(e);
                 }}
               />
             ) : null}
@@ -196,8 +211,8 @@ function PantallaPropuestas() {
                 items={datos.materialDePersonas}
                 hayMas={datos.hayMasMaterial}
                 onRegistrado={async (r) => {
-                  setError(null);
-                  setAviso(
+                  errar(null);
+                  avisar(
                     r.autorizaExterno
                       ? `Consentimiento registrado (nº ${r.version}): ese material ya puede procesarse con el proveedor AI`
                       : `Consentimiento registrado (nº ${r.version}): ese material deja de poder procesarse con el proveedor AI. Las propuestas pendientes sobre él solo pueden rechazarse.`,
@@ -205,8 +220,8 @@ function PantallaPropuestas() {
                   await refrescar();
                 }}
                 onError={(e) => {
-                  setAviso(null);
-                  setError(e);
+                  avisar(null);
+                  errar(e);
                 }}
               />
             )}
@@ -245,7 +260,7 @@ function PantallaPropuestas() {
                 workspaceId={datos.workspaceId}
                 puedeRevisar={puedeRevisar}
                 onCambio={refrescar}
-                onError={setError}
+                onError={errar}
               />
             ))}
 
@@ -265,7 +280,7 @@ function PantallaPropuestas() {
                     workspaceId={datos.workspaceId}
                     puedeRevisar={false}
                     onCambio={refrescar}
-                    onError={setError}
+                    onError={errar}
                   />
                 ))}
               </>
@@ -369,16 +384,27 @@ function FormularioGeneracion({
   // item importado es inmutable) — el camino es la bandeja.
   const sinMaterial = Boolean(elegida?.sinMaterial);
 
+  // El ancla elegida dejó de estar entre las opciones: pasa al buscar algo que la excluye
+  // (la búsqueda viaja al servidor y devuelve otra lista) y también al cambiar de workspace,
+  // porque la ruta no se desmonta — solo cambian sus `loaderDeps`. El id guardado sobrevive
+  // a la lista a la que pertenecía y el `select` se ve en blanco.
+  const anclaPerdida = anclaId !== '' && !elegida;
+
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!anclaId) {
+    // Se comprueba `elegida`, no `anclaId`: un id que ya no está entre las opciones es tan
+    // inválido como no haber elegido nada, y aceptarlo mandaba al proveedor una petición por
+    // un ancla que el curador no tiene delante —gastando su cuota— sin que nada en la
+    // pantalla lo hubiera propuesto. Derivar la validez de la lista a la vista, en vez de
+    // guardarla, es lo que hace que no haya que acordarse de invalidar el id.
+    if (!elegida) {
       onError('Elige el objeto del que quieres una propuesta');
       return;
     }
     setEnviando(true);
     onError(null);
     try {
-      const r = await generarPropuestasAI({ data: { workspaceId, capacidad, anclaId } });
+      const r = await generarPropuestasAI({ data: { workspaceId, capacidad, anclaId: elegida.id } });
       if (r.ok) {
         setAnclaId('');
         await onGenerado(r.generadas);
@@ -492,6 +518,13 @@ function FormularioGeneracion({
             con «{busqueda}». Vacía la búsqueda para volver a la cola completa.
           </Aviso>
         )}
+        {anclaPerdida && (
+          <Aviso>
+            El objeto que habías elegido no está entre estas opciones
+            {busqueda ? ` (la búsqueda «${busqueda}» lo deja fuera)` : ''}: vuelve a elegir uno
+            de la lista antes de pedir la propuesta.
+          </Aviso>
+        )}
         {sinMaterial && (
           <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
             «{elegida!.titulo}» se importó solo con la referencia al original: no hay texto que
@@ -503,7 +536,9 @@ function FormularioGeneracion({
           <div>
             <Button
               type="submit"
-              disabled={enviando || !habilitada || anclas.length === 0 || sinMaterial}
+              disabled={
+                enviando || !habilitada || anclas.length === 0 || sinMaterial || anclaPerdida
+              }
             >
               {enviando ? 'Proponiendo…' : 'Proponer con AI'}
             </Button>
@@ -518,6 +553,15 @@ function FormularioGeneracion({
       </form>
       {faltaConsentimiento && (
         <FormularioConsentimiento
+          // `key` por el item, y no un reset: lo que se redacta aquí es una AUTORIZACIÓN
+          // (RF-09.5), así que el estado no puede sobrevivir al item al que pertenece. Sin
+          // esto, React reutiliza el componente al cambiar de ancla y el «qué autorizó la
+          // persona» y la casilla de procesamiento externo del item ANTERIOR se graban
+          // contra el nuevo: un permiso que nadie dio, y que además puede dejar salir su
+          // material personal hacia el proveedor. Con `key` no hay nada que acordarse de
+          // resetear —el campo que se añada mañana ya nace protegido—, que es justo lo que
+          // un `useEffect` de reset no garantiza.
+          key={anclaId}
           workspaceId={workspaceId}
           itemId={anclaId}
           titulo={elegida!.titulo}
@@ -616,6 +660,10 @@ function BitacoraConsentimientos({
       ))}
       {elegido && (
         <FormularioConsentimiento
+          // Mismo motivo que en el selector de generación: aquí se salta de un item a otro
+          // sin desmontar (el botón solo cambia `abierto`), así que sin `key` el borrador
+          // del anterior se graba contra el siguiente.
+          key={elegido.id}
           workspaceId={workspaceId}
           itemId={elegido.id}
           titulo={elegido.titulo}

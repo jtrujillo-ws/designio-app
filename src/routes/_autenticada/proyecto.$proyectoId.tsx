@@ -193,6 +193,13 @@ function EncabezadoProyecto({ proyecto }: { proyecto: ProyectoMetodo }) {
                 : 'sin línea base'}
             {' · '}
             {c.ventanaDias ? `ventana ${c.ventanaDias} días` : 'SIN VENTANA'}
+            {/* La definición ES lo que el sponsor certifica en G0: sin ella a la
+                vista, aprobaría un KPI cuyo cálculo nunca leyó. */}
+            {c.definicion && (
+              <div style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
+                {c.definicion}
+              </div>
+            )}
           </div>
         ))}
       </div>

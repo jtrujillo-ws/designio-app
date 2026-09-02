@@ -544,6 +544,18 @@ describeAuthz('método: etapas, gates y checklists', () => {
           for each row execute function checklist_gate_pendiente_guard()`;
       }),
     ).rejects.toThrow(/permission denied/);
+
+    // Las transiciones LEGALES por SQL directo también dejan rastro: el guard emite
+    // RetoTransicionado con el par y el actor.
+    await conUsuario(leadId, (tx) => tx`update reto set estado = 'en-medicion'
+      where id = ${r.retoId}`);
+    const [trans] = await admin`select payload, actor_id from evento_dominio
+      where workspace_id = ${ws} and tipo = 'RetoTransicionado'
+        and payload->>'retoId' = ${r.retoId}
+      order by creado_en desc limit 1`;
+    expect((trans!.payload as { de: string; a: string }).de).toBe('activo');
+    expect((trans!.payload as { de: string; a: string }).a).toBe('en-medicion');
+    expect(trans!.actor_id).toBe(leadId);
   });
 
   it('un checklist vacío no es suficiencia y el guard instalado no es oráculo cross-tenant', async () => {

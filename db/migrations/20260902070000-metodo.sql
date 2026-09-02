@@ -359,6 +359,13 @@ begin
   ) then
     raise exception 'transición de reto ilegal: % → %', old.estado, new.estado;
   end if;
+  -- Rastro de BASE de toda transición aceptada (quién, cuándo, qué par) — también por
+  -- SQL directo. Los eventos de servicio (RetoActivado hoy, los de medición mañana)
+  -- son adicionales de dominio, con payload rico que este guard no conoce.
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id, 'RetoTransicionado',
+      jsonb_build_object('retoId', new.id, 'de', old.estado, 'a', new.estado),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   return new;
 end $$;
 create trigger reto_estado_transicion

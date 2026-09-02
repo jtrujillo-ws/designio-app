@@ -174,6 +174,12 @@ create policy proyecto_insert on proyecto
   for insert with check (
     workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
     and creado_por = app_user_id()
+    -- Solo bajo un reto ACTIVO: ni proyectos que esquivan la activación (candidato)
+    -- ni trabajo nuevo colgado de un reto cerrado/archivado. activarReto pasa porque
+    -- actualiza el reto a activo en una sentencia anterior de la misma transacción.
+    and exists (select 1 from reto r
+      where r.id = proyecto.reto_id and r.workspace_id = proyecto.workspace_id
+        and r.estado = 'activo')
   );
 -- Los criterios se CONGELAN cuando algún G0 del reto queda aprobado: el gate certificó
 -- exactamente esos criterios (SYS-22) — ni agregar ni mutar después sin reapertura
@@ -485,6 +491,13 @@ begin
       and g.numero = 0 and g.estado = 'aprobado') then
     raise exception 'el G0 del reto está aprobado: criterios congelados';
   end if;
+  -- El compromiso medible deja rastro en su propia transición — también por SQL
+  -- directo. El servicio ya no emite estos eventos: esta es la única fuente.
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id,
+      case tg_op when 'INSERT' then 'CriterioDefinido' else 'CriterioEditado' end,
+      jsonb_build_object('criterioId', new.id, 'retoId', new.reto_id, 'kpi', new.kpi),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   return new;
 end $$;
 create trigger criterio_g0_pendiente

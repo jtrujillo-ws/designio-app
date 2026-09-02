@@ -76,30 +76,27 @@ export async function agregarCriterio(
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     // Serializa contra la decisión de G0: sin el candado, este insert y una aprobación
-    // concurrente podrían commitear juntos y congelar un criterio incompleto.
+    // concurrente podrían commitear juntos y congelar un criterio incompleto. El
+    // evento CriterioDefinido lo emite el guard de la transición.
     await bloquearReto(tx, entrada.retoId);
-    const [fila] = await tx`
-      with quien as (
-        select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-      ),
-      nuevo as (
+    let fila;
+    try {
+      [fila] = await tx`
         insert into criterio_exito (workspace_id, reto_id, kpi, definicion, linea_base_valor,
                                     linea_base_fecha, linea_base_plan, objetivo, ventana_dias,
                                     fecha_post_mortem, creado_por)
         values (${entrada.workspaceId}, ${entrada.retoId}, ${entrada.kpi}, ${entrada.definicion},
                 ${entrada.lineaBaseValor}, ${entrada.lineaBaseFecha}, ${entrada.lineaBasePlan},
                 ${entrada.objetivo}, ${entrada.ventanaDias}, ${entrada.fechaPostMortem}, ${actorId})
-        returning id
-      ),
-      evento as (
-        insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-        select ${entrada.workspaceId}, 'CriterioDefinido',
-               jsonb_build_object('criterioId', nuevo.id, 'retoId', ${entrada.retoId}::uuid,
-                                  'kpi', ${entrada.kpi}::text),
-               ${actorId}, quien.rol
-        from nuevo, quien
-      )
-      select id from nuevo`;
+        returning id`;
+    } catch (e) {
+      const err = e as { code?: string; message?: string };
+      // El guard habla ANTES que el WITH CHECK (P0001): traducirlo al contrato.
+      if (err.code === 'P0001' && err.message?.includes('congelados')) {
+        throw new ErrorMetodo('Los criterios están congelados: el G0 del reto ya fue aprobado');
+      }
+      throw e;
+    }
     return { criterioId: fila!.id as string };
   });
 }
@@ -116,32 +113,18 @@ export async function editarCriterio(actorId: string, entrada: EditarCriterio): 
       throw new ErrorMetodo('El criterio no existe en este workspace');
     }
     // Mismo candado que agregarCriterio: editar y decidir G0 no pueden entrecruzarse.
+    // El evento CriterioEditado lo emite el guard de la transición.
     await bloquearReto(tx, dueno.reto_id as string);
-    const [fila] = await tx`
-      with quien as (
-        select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-      ),
-      upd as (
-        update criterio_exito
-        set kpi = ${entrada.kpi}, definicion = ${entrada.definicion},
-            linea_base_valor = ${entrada.lineaBaseValor},
-            linea_base_fecha = ${entrada.lineaBaseFecha},
-            linea_base_plan = ${entrada.lineaBasePlan},
-            objetivo = ${entrada.objetivo}, ventana_dias = ${entrada.ventanaDias},
-            fecha_post_mortem = ${entrada.fechaPostMortem}
-        where id = ${entrada.criterioId} and workspace_id = ${entrada.workspaceId}
-        returning id, reto_id
-      ),
-      evento as (
-        insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-        select ${entrada.workspaceId}, 'CriterioEditado',
-          jsonb_build_object('criterioId', upd.id, 'retoId', upd.reto_id,
-                             'kpi', ${entrada.kpi}::text),
-          ${actorId}, quien.rol
-        from upd, quien
-      )
-      select count(*)::int as n from upd`;
-    if ((fila!.n as number) === 0) {
+    const filas = await tx`
+      update criterio_exito
+      set kpi = ${entrada.kpi}, definicion = ${entrada.definicion},
+          linea_base_valor = ${entrada.lineaBaseValor},
+          linea_base_fecha = ${entrada.lineaBaseFecha},
+          linea_base_plan = ${entrada.lineaBasePlan},
+          objetivo = ${entrada.objetivo}, ventana_dias = ${entrada.ventanaDias},
+          fecha_post_mortem = ${entrada.fechaPostMortem}
+      where id = ${entrada.criterioId} and workspace_id = ${entrada.workspaceId}`;
+    if (filas.count === 0) {
       throw new ErrorMetodo(
         'El criterio está congelado por un G0 aprobado o no puedes editarlo',
       );

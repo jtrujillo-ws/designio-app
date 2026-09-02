@@ -233,11 +233,22 @@ describeAuthz('método: etapas, gates y checklists', () => {
     const ok = await aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id });
     expect(ok.numero).toBe(0);
 
+    // La edición dejó rastro (lo emite el guard de la transición, con el actor real).
+    const admin = sqlAdmin();
+    const [edicion] = await admin`select actor_id from evento_dominio
+      where workspace_id = ${ws} and tipo = 'CriterioEditado'
+      order by creado_en desc limit 1`;
+    expect(edicion!.actor_id).toBe(leadId);
+
     // Con el G0 aprobado el criterio queda congelado incluso para su curador: es la
-    // base del contrato de medición.
+    // base del contrato de medición — ni editar ni AGREGAR (el guard lo dice con el
+    // contrato del módulo, no con un error crudo).
     await expect(
       editarCriterio(leadId, { workspaceId: ws, criterioId, ...criterioBase, objetivo: '45%' }),
     ).rejects.toThrow(/congelado/);
+    await expect(
+      agregarCriterio(leadId, { workspaceId: ws, retoId, ...criterioBase }),
+    ).rejects.toThrow(/congelados/);
   });
 
   it('el rol del gate gobierna: el lead no aprueba G0 ni el sponsor G1; los pendientes bloquean listándose', async () => {
@@ -618,6 +629,14 @@ describeAuthz('método: etapas, gates y checklists', () => {
     const [sigueCandidato] = await conUsuario(leadId, (tx) => tx`
       select estado from reto where id = ${r97.retoId}`);
     expect(sigueCandidato!.estado).toBe('candidato');
+
+    // Y bajo un reto que NO está activo no se cuelga proyecto alguno: la política
+    // exige reto activo (solo activarReto, que activa antes en la misma tx, pasa).
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+        values (${ws}, ${r97.retoId}, 'P-97', 'Bajo candidato', 'activo', 'rapido', ${leadId})`),
+    ).rejects.toThrow(/row-level security/);
 
     // Oráculo: un miembro de OTRO workspace que apunte a nuestro reto (G0 aprobado)
     // recibe el error de política de siempre — el pre-chequeo de membresía del guard

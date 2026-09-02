@@ -26,6 +26,8 @@ import type {
 import { insightsDelEspacio } from '@/lib/insight/insight.functions';
 import { gobernanzaDelProyecto } from '@/lib/metodo/gobernanza.functions';
 import { SeccionGobernanza } from '@/components/metodo/SeccionGobernanza';
+import { seguimientoDelProyecto } from '@/lib/medicion/medicion.functions';
+import { SeccionMedicion } from '@/components/medicion/SeccionMedicion';
 
 /** Lo que un ítem del checklist puede citar: evidencia curada, insight validado o
  * decisión vigente (RF-04.5). Un insight propuesto no cuenta — la suficiencia se
@@ -45,11 +47,14 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
     // Un id no-uuid en la URL (enlace editado/truncado) es "no existe", no un crash
     // del validador de la server function contra el error boundary por defecto.
     if (!workspaceId || !ES_UUID.test(params.proyectoId)) return null;
-    const [proyecto, lista, gobernanza, insights] = await Promise.all([
+    const [proyecto, lista, gobernanza, insights, seguimiento] = await Promise.all([
       proyectoDelMetodo({ data: { workspaceId, proyectoId: params.proyectoId } }),
       evidenciasDelWorkspace({ data: { workspaceId } }),
       gobernanzaDelProyecto({ data: { workspaceId, proyectoId: params.proyectoId } }),
       insightsDelEspacio({ data: { workspaceId } }),
+      // El seguimiento de impacto vive DENTRO del proyecto (RF-07.6): no hay módulo de
+      // «operación» aparte al que navegar.
+      seguimientoDelProyecto({ data: { workspaceId, proyectoId: params.proyectoId } }),
     ]);
     if (!proyecto) return null;
     // La lista de objetos citables se arma aquí, no en la base: cada fuente ya tiene su
@@ -82,6 +87,7 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
       insightsValidados: (insights ?? [])
         .filter((i) => i.estado === 'validado')
         .map((i) => ({ id: i.id, titulo: i.titulo })),
+      seguimiento,
     };
   },
   component: PantallaProyecto,
@@ -197,6 +203,16 @@ function PantallaProyecto() {
               onCambio={() => router.invalidate()}
               onError={setError}
             />
+            {datos.seguimiento && (
+              <SeccionMedicion
+                workspaceId={datos.workspaceId}
+                proyecto={datos.proyecto}
+                seguimiento={datos.seguimiento}
+                rol={rol}
+                onCambio={() => router.invalidate()}
+                onError={setError}
+              />
+            )}
           </>
         )}
       </main>

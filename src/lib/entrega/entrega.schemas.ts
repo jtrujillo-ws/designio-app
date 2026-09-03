@@ -373,6 +373,10 @@ export type DesignVersionCompleta = {
    * usa para decidir si admite plan y alcance, y no es lo mismo que estar aprobada — una
    * versión superada desde OTRO proyecto sigue a cargo del suyo. */
   aCargoDelProyecto: boolean;
+  /** Por qué G7 está bloqueado en el proyecto de esta design version, o null si no lo está.
+   * Lo dice la misma función que lo rechaza (`g7_motivo_de_bloqueo`): el tablero no vuelve
+   * a redactar el predicado, que es como se le acabó quedando una rama corta. */
+  bloqueoDeG7: string | null;
   decisionesDelProyecto: { id: string; titulo: string }[];
   insightsValidados: { id: string; titulo: string }[];
   vigente: EstadoEfectivoVigente;

@@ -322,6 +322,70 @@ returns setof uuid language sql stable as $$
 $$;
 revoke execute on function design_versions_superadas_del_ambito(uuid, uuid) from public;
 
+-- POR QUÉ está bloqueado G7 en este proyecto, o null si no lo está. Una sola redacción del
+-- predicado para los dos que lo necesitan: el guard, que la levanta como excepción al
+-- intentar aprobar, y la pantalla de conciliación, que la enseña antes de que el lead se
+-- estrelle contra el gate.
+--
+-- Escribirla dos veces era el fallo de siempre y ya se cobró su ronda: la regla creció a
+-- cuatro ramas y el espejo de la pantalla se quedó copiando una, así que una versión
+-- auto-superada con un release en vuelo se pintaba como «no bloquea» mientras la base la
+-- rechazaba. Mientras haya dos redacciones, la siguiente que falte es cuestión de tiempo.
+--
+-- El orden del CASE es el orden en que conviene leerlas: primero si hay tablero, luego lo
+-- propio, y al final lo que arrastra la cadena del servicio.
+create function g7_motivo_de_bloqueo(p_proyecto uuid, p_workspace uuid)
+returns text language sql stable as $$
+  select case
+    when not exists (
+      select 1 from design_version dv
+      where dv.id in (select design_versions_a_cargo_del_proyecto(p_proyecto, p_workspace))
+        and exists (select 1 from elemento_cambio ec
+          where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id))
+      then 'el proyecto no tiene ninguna design version con elementos que conciliar (RF-06.7)'
+    when exists (
+      select 1 from elemento_cambio ec
+      where ec.workspace_id = p_workspace
+        and ec.design_version_id in (
+          select design_versions_a_cargo_del_proyecto(p_proyecto, p_workspace))
+        and not exists (
+          select 1 from constatacion c
+          join effective_state es on es.id = c.effective_state_id and es.workspace_id = c.workspace_id
+          join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
+          where c.elemento_id = ec.id and c.workspace_id = ec.workspace_id
+            and r.estado = 'verificado'))
+      then 'hay elementos de la design version en estado desconocido (RF-06.7)'
+    when exists (
+      select 1 from elemento_cambio ec
+      join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+      where dv.id in (select design_versions_superadas_del_ambito(p_proyecto, p_workspace))
+        and dv.id in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
+        and not exists (
+          select 1 from constatacion c
+          join effective_state es on es.id = c.effective_state_id and es.workspace_id = c.workspace_id
+          join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
+          where c.elemento_id = ec.id and c.workspace_id = ec.workspace_id
+            and r.estado = 'verificado'))
+      then 'una design version superada del servicio sigue siendo responsabilidad de su proyecto y tiene elementos sin resolver (RF-06.7)'
+    when exists (
+      select 1 from elemento_cambio ec
+      join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+      join release_elemento re on re.elemento_id = ec.id and re.workspace_id = ec.workspace_id
+      join release r on r.id = re.release_id and r.workspace_id = re.workspace_id
+      where dv.id in (select design_versions_superadas_del_ambito(p_proyecto, p_workspace))
+        and dv.id not in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
+        and r.estado <> 'verificado')
+      then 'una design version superada dejó releases sin resolver (RF-06.7)'
+  end
+$$;
+revoke execute on function g7_motivo_de_bloqueo(uuid, uuid) from public;
+-- La pantalla de conciliación la llama para decir lo mismo que dirá el gate. No es SECURITY
+-- DEFINER: lee bajo las políticas del rol de la app, las mismas con las que ya dibuja el
+-- tablero.
+grant execute on function g7_motivo_de_bloqueo(uuid, uuid) to designio_app;
+grant execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) to designio_app;
+grant execute on function design_versions_superadas_del_ambito(uuid, uuid) to designio_app;
+
 -- ══ RLS ══
 -- Lectura: todo miembro. La cadena evidencia→resultado es lo que el cliente audita; un
 -- effective state que el sponsor no puede leer no demuestra nada.
@@ -725,6 +789,40 @@ returns boolean language sql stable as $$
 $$;
 revoke execute on function reto_aplica_a_servicio(uuid, uuid, uuid) from public;
 
+-- ── Perdón histórico: los gates que se firmaron ANTES de que esto existiera ──
+-- `design_version` nace en esta migración, así que ningún proyecto tenía una cuando aprobó
+-- su G6 o su G7. Sin perdón, todo proyecto que ya los hubiera firmado —perfectamente legal
+-- entonces— quedaba encerrado: el guard de alta le prohíbe crear una design version «porque
+-- ya certificó», y G7 le exige una con elementos para poder aprobarse. Y la salida que el
+-- mensaje ofrece no le sirve: le dice que abra el ciclo siguiente en otro proyecto, pero el
+-- G7 que necesita es el SUYO.
+--
+-- Se perdona EL MOMENTO, no el contenido: la marca dice «esta aprobación es anterior a las
+-- reglas de design version», que es un hecho, no una dispensa. El proyecto perdonado redacta
+-- su versión ahora y llega a G7 por el camino normal, con todos los guards intactos — G7 le
+-- exigirá el tablero completo igual que a cualquiera.
+--
+-- No es una puerta trasera, y la forma es lo que lo garantiza:
+--  · la columna se escribe UNA sola vez, aquí, en el instante del despliegue;
+--  · no entra en ningún grant —el de gate_instancia es por columnas y no la incluye—, así
+--    que el rol de la app no puede ponerla ni quitarla;
+--  · ningún guard la toca, así que el conjunto solo puede encoger (por borrado), nunca
+--    crecer: una fila creada después nace en false y el estado que habilitaría es
+--    inalcanzable para ella.
+--
+-- Y no se inventan datos: NO se le fabrica al proyecto una design version con elementos.
+-- Sería un contrato vacío afirmando un compromiso que nadie redactó — el mismo motivo por el
+-- que el slice de medición descartó rellenar un registry ya firmado.
+--
+-- DEUDA PARA PRODUCTO: un proyecto perdonado tiene su G6 aprobado sin que nadie haya firmado
+-- su plan de releases con las reglas nuevas. Nada lo obliga a redactar la design version que
+-- describe lo que ya construyó; solo lo necesitará cuando quiera cerrar G7. Si el método
+-- quiere exigir esa reconstrucción, es una decisión de producto, no de esta migración.
+alter table gate_instancia add column previo_a_design_version boolean not null default false;
+-- perdon-historico:inicio
+update gate_instancia set previo_a_design_version = true where estado = 'aprobado';
+-- perdon-historico:fin
+
 -- ¿Este proyecto ya CERTIFICÓ un resultado que depende de sus design versions aprobadas?
 -- Devuelve el número del gate más bajo que lo hizo, o null.
 --
@@ -742,6 +840,7 @@ returns int language sql stable as $$
   select min(g.numero) from gate_instancia g
   where g.proyecto_id = p_proyecto and g.workspace_id = p_workspace
     and g.numero in (6, 7) and g.estado = 'aprobado'
+    and not g.previo_a_design_version
 $$;
 revoke execute on function gate_certificado_del_proyecto(uuid, uuid) from public;
 -- La pantalla de alta la llama para no ofrecer proyectos que el guard va a rechazar. Se le
@@ -1592,6 +1691,8 @@ revoke execute on function effective_state_completo_guard() from public;
 -- (el trigger es de la tabla, no del rol).
 create or replace function gate_aprobar_suficiencia_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_motivo text;
 begin
   if new.estado = 'aprobado' and old.estado = 'pendiente' then
     -- El sello temporal lo pone la BASE, no el caller: un update directo no puede
@@ -1681,132 +1782,18 @@ begin
         raise exception 'no se puede aprobar G6: hay elementos de la design version sin release asignado (RF-06.4)';
       end if;
     end if;
-    -- G7 cierra la implementación: el tablero de conciliación no puede tener NINGÚN
-    -- elemento en estado desconocido (RF-06.7). Desconocido es la ausencia de
-    -- constatación: sin release asignado, en un release aún planificado, o desplegado
-    -- sin constatar. Un elemento constatado como 'no-implementado' NO bloquea — está
-    -- explicado, que es lo que el gate exige (honestidad, no perfección).
-    -- De las design versions SUPERADAS entra solo lo que dejaron EN VUELO: sus elementos
-    -- sin planificar son historia de un ciclo anterior, pero un release suyo sin resolver
-    -- sigue siendo trabajo abierto sobre el SERVICIO que este proyecto certifica — venga
-    -- de este proyecto o del que le pasó la cadena (ver abajo).
+    -- G7 cierra la implementación (RF-06.7). Las cuatro ramas del predicado —hay tablero,
+    -- lo propio está constatado, lo que la cadena del servicio dejó a medias, y lo que una
+    -- versión auto-superada dejó en vuelo— viven en `g7_motivo_de_bloqueo`, con el porqué
+    -- de cada una escrito allí. Aquí solo se levanta el motivo que devuelva.
+    --
+    -- Está fuera del guard a propósito y no por gusto: la pantalla de conciliación tiene
+    -- que decir exactamente lo que el gate va a rechazar, y mientras eso se escribía dos
+    -- veces siempre le faltaba una rama a la copia. Una sola redacción, dos lectores.
     if new.numero = 7 then
-      -- Primero, que HAYA tablero. El «no exists elemento en estado desconocido» de
-      -- abajo es vacuamente cierto cuando no hay ningún elemento que mirar: un proyecto
-      -- sin design version aprobada aprobaba G7 en cuanto su checklist y la escalera de
-      -- gates estaban en orden, certificando una implementación que nadie declaró, ni
-      -- repartió en releases, ni constató. Es el mismo agujero que tapa exigir ≥1 ítem
-      -- de checklist («sin ítems no hay pendientes»), y la misma regla que la app ya
-      -- aplica en `conciliacionCompleta([])`: un tablero vacío no está completo, está
-      -- vacío. Se exige CON elementos porque son los que producen filas de conciliación:
-      -- una versión sin elementos —que la transición ya no deja nacer, pero que un
-      -- backfill podría dejar— volvería a vaciar el predicado sin que se note. Y se
-      -- pregunta por las versiones DE ESTE PROYECTO, no por la vigente del servicio: ver
-      -- design_versions_a_cargo_del_proyecto.
-      if not exists (
-        select 1 from design_version dv
-        where dv.id in (select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
-          and exists (select 1 from elemento_cambio ec
-            where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id)
-      ) then
-        raise exception 'no se puede aprobar G7: el proyecto no tiene ninguna design version con elementos que conciliar (RF-06.7)';
-      end if;
-      if exists (
-        select 1 from elemento_cambio ec
-        where ec.workspace_id = new.workspace_id
-          and ec.design_version_id in (
-            select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
-          and not exists (
-            select 1 from constatacion c
-            join effective_state es on es.id = c.effective_state_id and es.workspace_id = c.workspace_id
-            join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
-            where c.elemento_id = ec.id and c.workspace_id = ec.workspace_id
-              and r.estado = 'verificado')
-      ) then
-        raise exception 'no se puede aprobar G7: hay elementos de la design version en estado desconocido (RF-06.7)';
-      end if;
-      -- Y lo que la versión SUPERADA dejó en vuelo. Excluir entera a la superada dejaba
-      -- este agujero: aprobar DV-2 marca DV-1 'superada' y con ella desaparecían del gate
-      -- sus releases sin resolver, así que G7 podía certificar «implementación conciliada»
-      -- con un release de DV-1 desplegado y sin constatar. Es el mismo argumento que
-      -- separó `puedePlanificar` de `puedeCompletar` en la pantalla, y aquí obliga en el
-      -- sentido contrario: el effective state del servicio se arma con las constataciones
-      -- de TODOS sus releases verificados (RF-06.10), así que un despliegue sin observar
-      -- es exactamente un trozo del estado certificado que nadie miró.
-      --
-      -- Lo que entra es el ELEMENTO en un release sin verificar, no la versión entera: un
-      -- elemento de DV-1 que nadie llegó a planificar es una decisión ya reemplazada y
-      -- exigirle conciliación ataría G7 a un ciclo cerrado. Y decidir «esto ya no sale»
-      -- tiene forma en el modelo sin inventar un estado: se le quita el alcance al release
-      -- planificado (la política lo permite mientras siga planificado) y entonces no puede
-      -- desplegarse nunca —`release_transicion_guard` no despliega un release vacío—, con
-      -- lo que deja de haber nada que observar. Un release VERIFICADO no hace falta
-      -- mirarlo: verificarlo ya exigió constatar todos sus elementos.
-      --
-      -- Y la superada NO se busca por proyecto, sino por SERVICIO. `supera_a` está
-      -- restringido por servicio y no por proyecto —design_version_anclaje_guard lo exige
-      -- así—, o sea que la cadena de versiones de un servicio atraviesa proyectos: DV-B del
-      -- proyecto B puede suceder a DV-A del proyecto A. Con el filtro por proyecto, B
-      -- certificaba G7 sin ver los releases planificados o desplegados-sin-constatar de
-      -- DV-A, que pueden salir o constatarse DESPUÉS y mover el estado compartido del
-      -- servicio — el mismo estado que la conciliación de B dice haber cerrado. El filtro
-      -- estaba mirando quién hizo el trabajo, cuando lo que decide es sobre qué.
-      --
-      -- Se recorre por servicio y no siguiendo `supera_a` a saltos porque el servicio ES el
-      -- cierre de esa cadena (todo eslabón comparte servicio) y además atrapa lo que un
-      -- eslabón roto dejaría fuera: una versión marcada 'superada' sin sucesora que la
-      -- declare —la política admite ese UPDATE— desaparecería de un recorrido por enlaces y
-      -- se llevaría con ella sus releases en vuelo.
-      --
-      -- La rama por PROYECTO se queda, y no es redundante: si la única versión del proyecto
-      -- para ese servicio fue superada desde otro proyecto, el proyecto ya no tiene ninguna
-      -- APROBADA de ese servicio y el recorrido por servicio no llegaría a ella. Sigue
-      -- siendo trabajo abierto suyo.
-      -- Y la regla tiene DOS mitades, según quién superó a la versión — la misma distinción
-      -- que separa «cuál manda en el servicio» de «de qué responde el proyecto»:
-      --
-      -- (a) La que superó OTRO proyecto sigue siendo responsabilidad del suyo: sus elementos
-      --     no son decisiones cerradas, son trabajo que ese proyecto todavía tiene que
-      --     planificar (por eso las políticas del release y del alcance se lo permiten). Así
-      --     que aquí no basta con mirar lo que ya está en vuelo: mientras le queden elementos
-      --     sin resolver, la conciliación de ESTE proyecto no puede darse por cerrada — el
-      --     otro puede planificarlos y desplegarlos DESPUÉS y mover el estado compartido del
-      --     servicio que este gate acaba de certificar. Un G7 inmutable no admite eso.
-      --
-      --     Y esto es además lo que CONGELA el alcance de la predecesora sin necesidad de
-      --     una regla nueva: cuando todos sus elementos están constatados vía releases
-      --     verificados, no queda ninguno que asignar (la PK de release_elemento da uno por
-      --     elemento) ni release planificado donde meterlo, así que no hay forma de volver a
-      --     abrir trabajo. La salida es la honesta: desplegar y constatar, aunque sea como
-      --     'no-implementado' con su razón.
-      if exists (
-        select 1 from elemento_cambio ec
-        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
-        where dv.id in (select design_versions_superadas_del_ambito(new.proyecto_id, new.workspace_id))
-          and dv.id in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
-          and not exists (
-            select 1 from constatacion c
-            join effective_state es on es.id = c.effective_state_id and es.workspace_id = c.workspace_id
-            join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
-            where c.elemento_id = ec.id and c.workspace_id = ec.workspace_id
-              and r.estado = 'verificado')
-      ) then
-        raise exception 'no se puede aprobar G7: una design version superada del servicio sigue siendo responsabilidad de su proyecto y tiene elementos sin resolver (RF-06.7)';
-      end if;
-      -- (b) La que superó su PROPIO proyecto es un ciclo cerrado a conciencia: sus elementos
-      --     sin planificar son decisiones reemplazadas y nadie puede volver a abrirlos —las
-      --     políticas del release y del alcance no la alcanzan—. De ella entra solo lo que
-      --     dejó EN VUELO, que es lo único que todavía puede salir.
-      if exists (
-        select 1 from elemento_cambio ec
-        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
-        join release_elemento re on re.elemento_id = ec.id and re.workspace_id = ec.workspace_id
-        join release r on r.id = re.release_id and r.workspace_id = re.workspace_id
-        where dv.id in (select design_versions_superadas_del_ambito(new.proyecto_id, new.workspace_id))
-          and dv.id not in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
-          and r.estado <> 'verificado'
-      ) then
-        raise exception 'no se puede aprobar G7: una design version superada dejó releases sin resolver (RF-06.7)';
+      v_motivo := g7_motivo_de_bloqueo(new.proyecto_id, new.workspace_id);
+      if v_motivo is not null then
+        raise exception 'no se puede aprobar G7: %', v_motivo;
       end if;
     end if;
     -- Efectos INSEPARABLES de la transición, también para el UPDATE directo: la etapa

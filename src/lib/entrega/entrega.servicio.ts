@@ -1006,6 +1006,12 @@ export async function designVersionCompleta(
         -- exactamente lo que la base permite, ni más ni menos.
         dv.id in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
           as a_cargo_del_proyecto,
+        -- Por qué está bloqueado el G7 de ESTE proyecto, dicho por la MISMA función que lo
+        -- rechaza. El tablero explicaba antes el bloqueo con un predicado propio, y cuando
+        -- la regla creció a cuatro ramas la copia se quedó con una: una versión que el
+        -- proyecto se auto-superó, con un release en vuelo, salía como que no bloqueaba
+        -- mientras el gate la rechazaba. El espejo se lee de la fuente o miente.
+        g7_motivo_de_bloqueo(dv.proyecto_id, dv.workspace_id) as bloqueo_de_g7,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', j2.id, 'nombre', j2.nombre)
             order by j2.creado_en desc)
@@ -1118,6 +1124,7 @@ export async function designVersionCompleta(
       proyectoId: fila.proyecto_id as string,
       proyectoCodigo: fila.proyecto_codigo as string,
       aCargoDelProyecto: fila.a_cargo_del_proyecto as boolean,
+      bloqueoDeG7: (fila.bloqueo_de_g7 as string | null) ?? null,
       journeyId: (fila.journey_id as string | null) ?? null,
       journeyNombre: (fila.journey_nombre as string | null) ?? null,
       snapshotId: (fila.snapshot_id as string | null) ?? null,

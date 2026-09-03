@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import {
@@ -2020,6 +2021,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const tableroVigente = await tableroDeConciliacion(leadId, ws, segunda.designVersionId);
     expect(conciliacionCompleta(tableroVigente!.filas)).toBe(true);
     await expect(aprobarGateCrudo(7)).rejects.toThrow(/superada dejó releases sin resolver/);
+    // Y la pantalla dice LO MISMO que el gate, no lo que deduzca del tablero de esta
+    // versión: su tablero está completo y aun así el proyecto está bloqueado, por la que se
+    // superó a sí mismo. Cuando el espejo se escribía a mano, este caso salía como «no
+    // bloquea» y mandaba al lead a mirar donde no era.
+    const vistaBloqueada = await designVersionCompleta(leadId, ws, segunda.designVersionId);
+    expect(vistaBloqueada!.bloqueoDeG7).toMatch(/superada dejó releases sin resolver/);
 
     // Salida 1, la del despliegue: ya cambió el servicio, así que se constata. Es lo que
     // mete ese cambio en el effective state contra el que se calcula el diff siguiente.
@@ -2052,6 +2059,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       }),
     ).rejects.toThrow(/sin elementos declarados no se despliega/);
 
+    const vistaLibre = await designVersionCompleta(leadId, ws, segunda.designVersionId);
+    expect(vistaLibre!.bloqueoDeG7).toBeNull();
     await aprobarGateCrudo(7);
     const [g7] = await admin`select estado from gate_instancia
       where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
@@ -3798,6 +3807,104 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [g7] = await admin`select estado from gate_instancia
       where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
     expect(g7!.estado).toBe('aprobado');
+  });
+
+  it('el proyecto que firmó su G6 antes de esta migración no se queda encerrado', async () => {
+    // `design_version` NACE en esta migración, así que ningún proyecto tenía una cuando
+    // aprobó su G6 — cosa perfectamente legal entonces. Sin perdón, el guard de alta le
+    // prohíbe crear la primera («ya certificó») y G7 le exige una con elementos: encerrado
+    // para siempre, y la salida del mensaje no le sirve porque el G7 que necesita es el
+    // suyo. Este test va el ÚLTIMO de los que tocan gates a propósito: ejecuta el update de
+    // la migración tal cual, y ese alcanza a todas las aprobaciones que ya existan.
+    const admin = sqlAdmin();
+    const [p] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-112', 'Proyecto anterior al esquema', ${leadId}) returning id`;
+    const proy = p!.id as string;
+    // La forma HEREDADA, fabricada: los gates nacen ya aprobados, que es como se veían las
+    // filas de antes. Se insertan en ese estado y no se actualizan porque un UPDATE pasaría
+    // por el guard de suficiencia — y ese, con las reglas nuevas, es justo el que no las
+    // habría dejado aprobarse.
+    for (let n = 0; n <= 7; n++) {
+      const [g] = await admin`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+        values (${ws}, ${proy}, ${n}, ${[0, 3, 5, 6].includes(n) ? 'sponsor' : 'lead-boutique'},
+                ${n <= 6 ? 'aprobado' : 'pendiente'},
+                ${n <= 6 ? leadId : null}, ${n <= 6 ? new Date() : null})
+        returning id`;
+      await admin`insert into checklist_item
+        (workspace_id, gate_id, orden, texto, estado, na_justificacion, na_aprobado_por)
+        values (${ws}, ${g!.id as string}, 0, 'Ítem del test', 'na', 'fuera de alcance del test',
+                ${leadId})`;
+    }
+
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del proyecto heredado');
+    const alta = () =>
+      crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proy,
+        servicioId: svcId,
+        journeyId,
+        titulo: 'La primera del proyecto heredado',
+        resumen: '',
+        superaA: null,
+      });
+
+    // Antes del perdón, encerrado: es el estado en el que quedaría al desplegar.
+    await expect(alta()).rejects.toThrow(/ya certificó G6/);
+
+    // El perdón es el UPDATE de la migración, leído del propio archivo y ejecutado tal cual:
+    // si lo reescribiera aquí, el test aprobaría una regla que no es la que se despliega.
+    const migracion = readFileSync('db/migrations/20260902120000-design-version.sql', 'utf8');
+    const bloque = migracion
+      .split('-- perdon-historico:inicio')[1]!
+      .split('-- perdon-historico:fin')[0]!
+      .trim();
+    expect(bloque).toMatch(/^update gate_instancia set previo_a_design_version = true/);
+    await admin.unsafe(bloque);
+
+    // Y ahora el proyecto redacta su versión y llega a G7 por el camino normal, con todos
+    // los guards en pie: el perdón es del MOMENTO, no del contenido.
+    const dv = await alta();
+    const el = await elementoSuelto(dv.designVersionId, 'Lo que el proyecto heredado declara');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const rl = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'El plan del proyecto heredado',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: el, razon: '' }],
+    });
+    const aprobarG7 = () =>
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
+    // G7 no se regala: sigue exigiendo el tablero completo.
+    await expect(aprobarG7()).rejects.toThrow(/en estado desconocido/);
+    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rl.releaseId, desplegadoEn: HOY });
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rl.releaseId,
+      constatadoEn: HOY,
+      resumen: '',
+      constataciones: [
+        { elementoId: el, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+      ],
+    });
+    await aprobarG7();
+    const [g7] = await admin`select estado from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
+    expect(g7!.estado).toBe('aprobado');
+
+    // Y no es puerta trasera: la marca no la puede poner el rol de la app. La columna está
+    // fuera del grant, que en gate_instancia es por columnas.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update gate_instancia set previo_a_design_version = true
+        where proyecto_id = ${proy} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/permission denied/);
   });
 
   it('nada de esto cruza el workspace', async () => {

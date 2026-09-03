@@ -251,6 +251,7 @@ function PantallaDesignVersion() {
             desconocidos={desconocidos}
             proyectoId={dv.proyectoId}
             aCargo={dv.aCargoDelProyecto}
+            bloqueo={dv.bloqueoDeG7}
           />
         )}
       </main>
@@ -443,7 +444,20 @@ function DeclararSucesion({
           onChange={(e) => setSuperaA(e.target.value)}
           style={{ flex: '1 1 280px' }}
         >
-          <option value="">No supera a ninguna (primera del servicio)</option>
+          {/* «No supera a ninguna» solo cuando de verdad no hay a cuál: con una aprobada
+              del servicio, `design_version_anclaje_guard` rechaza necesariamente el null
+              (SYS-05 admite una sola aprobada). Ofrecerlo era ofrecer un error, el mismo
+              que ya se quitó del formulario de alta. */}
+          {dv.superables.length === 0 ? (
+            <option value="">No supera a ninguna (primera del servicio)</option>
+          ) : (
+            // Con opciones reales el vacío sigue existiendo como estado inicial, pero se
+            // ofrece deshabilitado: si no, el navegador pintaría la primera versión como
+            // elegida mientras el estado sigue vacío y el botón no dejaría enviarla.
+            <option value="" disabled>
+              Elige a cuál supera…
+            </option>
+          )}
           {dv.superables.map((v) => (
             <option key={v.id} value={v.id}>
               {v.codigo} · {v.titulo}
@@ -1536,6 +1550,7 @@ function VistaConciliacion({
   desconocidos,
   proyectoId,
   aCargo,
+  bloqueo,
 }: {
   tablero: Awaited<ReturnType<typeof conciliacionDeDesignVersion>>;
   desconocidos: { elementoId: string; elementoTitulo: string }[];
@@ -1544,6 +1559,11 @@ function VistaConciliacion({
    * «está aprobada»: los huecos de una versión que superó otro proyecto también cuentan
    * para G7, y los de la que el propio proyecto reemplazó ya no. */
   aCargo: boolean;
+  /** Por qué está bloqueado el G7 del proyecto, dicho por la misma función que lo rechaza.
+   * No se recalcula aquí: el predicado tiene cuatro ramas y el tablero solo veía la de
+   * esta design version, así que lo que arrastraba la cadena del servicio salía como que
+   * no bloqueaba. */
+  bloqueo: string | null;
 }) {
   if (!tablero || tablero.filas.length === 0) {
     return (
@@ -1556,9 +1576,10 @@ function VistaConciliacion({
     );
   }
 
-  // Bloquea mientras el proyecto siga respondiendo por esta versión, esté aprobada o la
-  // haya superado otro proyecto: en los dos casos sus huecos son los que G7 cuenta.
-  const bloquea = aCargo && desconocidos.length > 0;
+  // Lo que decide es lo que dice la base. Los huecos de ESTA versión solo se destacan
+  // cuando el proyecto responde por ella; el aviso, en cambio, es el del gate entero,
+  // porque lo que atranca G7 puede estar en otra versión del servicio.
+  const huecosPropios = aCargo && desconocidos.length > 0;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -1568,21 +1589,23 @@ function VistaConciliacion({
           display: 'flex',
           flexDirection: 'column',
           gap: 8,
-          borderColor: bloquea ? 'var(--warn)' : undefined,
+          borderColor: bloqueo !== null ? 'var(--warn)' : undefined,
         }}
       >
         <span style={micro}>Conciliación de la etapa 7</span>
-        {bloquea ? (
+        {bloqueo !== null ? (
           <span style={{ font: '600 13px/1.6 var(--font-sans)', color: 'var(--warn)' }}>
-            G7 está bloqueado: {desconocidos.length}{' '}
-            {desconocidos.length === 1 ? 'elemento' : 'elementos'} en estado desconocido.
-            Nadie ha constatado cómo quedaron, y aprobar el gate con huecos sería firmar
-            que se implementó algo que no se sabe si existe (RF-06.7).
+            G7 está bloqueado: {bloqueo}
+            {huecosPropios
+              ? ` En esta design version hay ${desconocidos.length} ${
+                  desconocidos.length === 1 ? 'elemento' : 'elementos'
+                } sin constatar; abajo, cuáles.`
+              : ' El hueco no está en esta design version: mira las demás del servicio desde los gates del proyecto.'}
           </span>
         ) : (
           <span style={cuerpo}>
             {aCargo
-              ? 'Todos los elementos tienen estado conocido: G7 no encuentra huecos por este lado.'
+              ? 'Todos los elementos tienen estado conocido y el gate no encuentra huecos: G7 puede aprobarse.'
               : 'Este proyecto ya reemplazó esta versión: su conciliación la cierra la que la sucede.'}
           </span>
         )}

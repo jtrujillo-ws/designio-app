@@ -203,7 +203,11 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       lineaBaseFecha: fecha(-120),
       lineaBasePlan: '',
       objetivo: '40',
-      ventanaDias: 30,
+      // 31 y no 30 porque su entrada se compromete a una cadencia MENSUAL y la firma exige
+      // que quepa un mes de CALENDARIO desde el inicio de la ventana: con 30 días el
+      // contrato pasaría o fallaría según el mes en que corriese la suite, que es
+      // exactamente la aritmética que este slice dejó de usar.
+      ventanaDias: 31,
       fechaPostMortem: null,
     });
     criterioAbandonoId = c1.criterioId;
@@ -507,7 +511,44 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       /la cadencia comprometida no cabe en la ventana del criterio/,
     );
 
+    // 3. Y «caber» se mide con la MISMA aritmética con la que después se juzga la cadencia:
+    // CALENDARIO, no un largo mínimo en días. Un mínimo fijo (28 días un mes) es una
+    // segunda verdad sobre el mismo compromiso, y basta que discrepe una vez para que la
+    // firma bendiga lo que la lectura llamará vacío. Con fechas ABSOLUTAS, porque el caso
+    // vive justo en el día de diferencia: mensual desde el 1 de agosto con ventana de 29
+    // días cierra el 30 de agosto y su primera entrega vence el 1 de septiembre — dos días
+    // después. El mínimo lo aceptaba (29 ≥ 28) y lo congelaba.
+    const adminCadencia = sqlAdmin();
+    await adminCadencia`update criterio_exito set ventana_dias = 29
+      where id = ${criterioReintentosId}`;
+    const agosto = {
+      ...reintentos,
+      frecuencia: 'mensual' as const,
+      lineaBaseFecha: '2026-06-01',
+      ventanaInicio: '2026-08-01',
+      fechaPostMortem: '2026-09-15',
+    };
+    await editarEntrada(leadId, agosto);
+    await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
+      /la cadencia comprometida no cabe en la ventana del criterio/,
+    );
+
+    // Y el borde por el otro lado, que es lo que separa la regla de una prohibición: con un
+    // día más la ventana cierra el 1 de septiembre —el día en que vence la primera entrega,
+    // y el último día de la ventana todavía mide—, así que el compromiso SÍ se puede
+    // cumplir. Se comprueba por el MOTIVO y sin firmar, que aquí congelaría el contrato que
+    // los tests siguientes necesitan en borrador: con el post-mortem fechado DENTRO de la
+    // ventana, el rechazo que llega es el suyo — señal de que la cadencia ya pasó.
+    await adminCadencia`update criterio_exito set ventana_dias = 31
+      where id = ${criterioReintentosId}`;
+    await editarEntrada(leadId, { ...agosto, fechaPostMortem: '2026-08-20' });
+    await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
+      /el post-mortem se prevé después del cierre de la ventana/,
+    );
+
     // Y se deja el contrato como estaba, que es el que firman los tests siguientes.
+    await adminCadencia`update criterio_exito set ventana_dias = 60
+      where id = ${criterioReintentosId}`;
     await editarEntrada(leadId, reintentos);
   });
 
@@ -649,7 +690,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const reapuntada = await ventanaDeReintentos();
     expect(reapuntada.criterioId).toBe(criterioAbandonoId);
     // Y con el criterio se mueve la ventana, que es lo que hacía cara la equivocación.
-    expect(reapuntada.criterioVentanaDias).toBe(30);
+    expect(reapuntada.criterioVentanaDias).toBe(31);
 
     // Lo que el WITH CHECK sigue impidiendo —y que ahora deja de ser letra muerta, porque
     // por fin hay un `criterio_id` que puede moverse—: apuntar al criterio de OTRO reto.
@@ -720,7 +761,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // hace. Ahora enuncian el hecho que TIENE que ser cierto y rechazan cuando no se puede
     // demostrar. Con esta lista de completitud delante ya no les llegan nulos; el
     // `coalesce` es lo que hace que sigan sin llegarles si alguien toca la lista.
-    await adminVentana`update criterio_exito set ventana_dias = 30
+    await adminVentana`update criterio_exito set ventana_dias = 31
       where id = ${criterioAbandonoId}`;
 
     const firma = await firmarRegistry(sponsorId, { workspaceId: ws, registryId });
@@ -1125,9 +1166,9 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const [previas] = await admin`select
       (select ventana_inicio::text from entrada_kpi where id = ${entradaAbandonoId}) as abandono,
       (select ventana_inicio::text from entrada_kpi where id = ${entradaReintentosId}) as reintentos`;
-    // Se simula que HOY es el último día de AMBAS ventanas (30 y 60 días de criterio). Las
+    // Se simula que HOY es el último día de AMBAS ventanas (31 y 60 días de criterio). Las
     // entradas están congeladas por la firma, así que solo el rol admin las mueve.
-    await admin`update entrada_kpi set ventana_inicio = ${await fechaDeBase(-30)}
+    await admin`update entrada_kpi set ventana_inicio = ${await fechaDeBase(-31)}
       where id = ${entradaAbandonoId}`;
     await admin`update entrada_kpi set ventana_inicio = ${await fechaDeBase(-60)}
       where id = ${entradaReintentosId}`;
@@ -1157,7 +1198,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       });
       tardio = hoy.snapshotId;
       // Y un día después la puerta se cierra por los dos lados a la vez.
-      await admin`update entrada_kpi set ventana_inicio = ${await fechaDeBase(-31)}
+      await admin`update entrada_kpi set ventana_inicio = ${await fechaDeBase(-32)}
         where id = ${entradaAbandonoId}`;
       await expect(
         registrarSnapshot(sponsorId, {
@@ -2038,7 +2079,11 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       lineaBaseFecha: fecha(-200),
       lineaBasePlan: '',
       objetivo: '20',
-      ventanaDias: 30,
+      // Igual que el criterio de abandono: su entrada es MENSUAL, así que la ventana tiene
+      // que contener un mes de calendario cuente el mes que cuente. El test de la cadencia
+      // la fija después en 30 con fechas absolutas, que es donde ese día de diferencia es
+      // justo lo que se quiere medir.
+      ventanaDias: 31,
       fechaPostMortem: null,
     });
     // Se apagan los DOS triggers de la transición para escribir el pasado que la base ya
@@ -2220,10 +2265,17 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // la medición terminó cumplida. Con 30 días fijos habría una entrega vencida el 31 de
     // marzo —el último día de la ventana— que el contrato nunca prometió.
     const admin = sqlAdmin();
-    const [previa] = await admin`select ventana_inicio::text as v from entrada_kpi
-      where id = ${entradaViejaId}`;
+    const [previa] = await admin`select
+      (select ventana_inicio::text from entrada_kpi where id = ${entradaViejaId}) as inicio,
+      (select c.ventana_dias from criterio_exito c
+        join entrada_kpi e on e.criterio_id = c.id where e.id = ${entradaViejaId}) as dias`;
+    // La ventana se fija ENTERA aquí —inicio y largo— en vez de heredar el largo del
+    // fixture: los 30 días son la mitad del caso (marzo tiene 31), y un test que depende de
+    // un número escrito trescientas líneas más arriba deja de decir lo que prueba.
     await admin`update entrada_kpi set ventana_inicio = '2026-03-01'
       where id = ${entradaViejaId}`;
+    await admin`update criterio_exito set ventana_dias = 30
+      where id = (select criterio_id from entrada_kpi where id = ${entradaViejaId})`;
     const leer = async () =>
       (await seguimientoDeImpacto(leadId, ws, proyectoViejoId))!.entradas.find(
         (e) => e.id === entradaViejaId,
@@ -2249,8 +2301,10 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       // Fixture: la ventana vuelve a donde estaba y el snapshot que solo existía para fijar
       // el corte se va con ella. Solo el rol admin puede borrarlo (SYS-23).
       await admin`delete from snapshot where entrada_kpi_id = ${entradaViejaId}`;
-      await admin`update entrada_kpi set ventana_inicio = ${previa!.v as string}
+      await admin`update entrada_kpi set ventana_inicio = ${previa!.inicio as string}
         where id = ${entradaViejaId}`;
+      await admin`update criterio_exito set ventana_dias = ${previa!.dias as number}
+        where id = (select criterio_id from entrada_kpi where id = ${entradaViejaId})`;
     }
   });
 
@@ -2514,9 +2568,45 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       });
     await expect(completar()).rejects.toThrow(/no está en medición/);
 
-    // La reanudación tiene UN destino y es la fase en la que está el reto.
-    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
-      where id = ${bId}`);
+    // Y la OTRA puerta del par, la de las filas que NACEN: `proyecto_insert` comprueba «el
+    // reto está activo» y eso es un predicado sobre una instantánea, no un candado. Con
+    // `abrirMedicion` en vuelo, el insert veía el 'activo' viejo y commiteaba un proyecto
+    // 'activo' bajo un reto que ya mide — el par roto sin que ninguna regla de transición
+    // pudiera verlo, porque no hubo transición. Ahora el insert toma la fila del RETO y la
+    // relee después del candado: primero se comprueba que ESPERA a quien la tiene…
+    expect(
+      await esperaA(
+        (tx) => tx`select 1 from reto
+          where id = ${r.retoId} and workspace_id = ${ws} for update`,
+        () =>
+          conUsuario(leadId, (tx) => tx`insert into proyecto
+            (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+            values (${ws}, ${r.retoId}, 'P-75C', 'Frente que llega tarde', 'activo',
+                    'rapido', ${leadId})`),
+      ),
+    ).toBe(true);
+    // …y después, que al releer bajo el candado el motivo es el estado del reto.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+        values (${ws}, ${r.retoId}, 'P-75C', 'Frente que llega tarde', 'activo',
+                'rapido', ${leadId})`),
+    ).rejects.toThrow(/el reto no está activo/);
+
+    // La reanudación tiene UN destino y es la fase en la que está el reto — y toma el MISMO
+    // candado antes de leer dónde está: sin él, esta transición decidiría sobre una
+    // instantánea y commitearía por detrás de un reto que acaba de empezar a medir. Es el
+    // mismo agujero que el de arriba, en la puerta de al lado, así que se prueba igual: la
+    // reanudación de verdad se hace esperando a quien tiene la fila del reto.
+    expect(
+      await esperaA(
+        (tx) => tx`select 1 from reto
+          where id = ${r.retoId} and workspace_id = ${ws} for update`,
+        () =>
+          conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
+            where id = ${bId}`),
+      ),
+    ).toBe(true);
     const [tras] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
       where id = ${bId}`);
     expect(tras!.estado).toBe('en-medicion');

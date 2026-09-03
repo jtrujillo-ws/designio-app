@@ -727,6 +727,17 @@ begin
   if new.estado = old.estado then
     return new;
   end if;
+  -- El punto de cita, y ANTES de leer nada del reto. Tres de las reglas de abajo consultan
+  -- `reto` —retomar sigue al reto, medir con el reto, cerrar con su veredicto— y las tres
+  -- serían predicados sobre una instantánea sin bloquear primero: con `abrirMedicion` o la
+  -- completación del post mortem en vuelo, esta transición leería el estado VIEJO del reto
+  -- y commitearía por detrás — un proyecto retomado detrás de un reto que ya mide, o
+  -- midiendo bajo uno que acaba de cerrar. Mismo candado y mismo ORDEN (`reto → proyecto`)
+  -- que ya toman `abrirMedicion`, el guard del cierre y el bloqueo compartido de las
+  -- escrituras de medición, así que no añade ciclo posible; y las dos rutas que mueven el
+  -- par no pagan nada por repetirlo, porque ya lo tienen.
+  perform 1 from reto where id = new.reto_id and workspace_id = new.workspace_id
+    for update;
   -- Ciclo de vida del proyecto (RF-04.12, §7): pausar y retomar es reversible; avanzar en
   -- el método no. Nada sale de 'cerrado' — el trabajo posterior es un reto nuevo (SYS-08).
   if (old.estado, new.estado) not in (
@@ -894,10 +905,62 @@ create policy proyecto_insert on proyecto
     -- Solo bajo un reto ACTIVO: ni proyectos que esquivan la activación (candidato)
     -- ni trabajo nuevo colgado de un reto cerrado/archivado. activarReto pasa porque
     -- actualiza el reto a activo en una sentencia anterior de la misma transacción.
+    -- (Y esa comprobación NO se basta sola: ver el guard de aquí debajo.)
     and exists (select 1 from reto r
       where r.id = proyecto.reto_id and r.workspace_id = proyecto.workspace_id
         and r.estado = 'activo')
   );
+
+-- ── …y ese `exists` es un predicado sobre una INSTANTÁNEA, no un candado ──
+-- La regla de arriba está bien enunciada y mal sostenida, por el axioma que este slice
+-- repite en todas partes menos aquí: una política comprueba lo que veía cuando miró, y
+-- nada impide que el reto cambie mientras tanto. Con `abrirMedicion` corriendo en otra
+-- sesión, el insert evalúa su `exists` contra el 'activo' VIEJO y commitea después; la
+-- comprobación diferida del par indivisible ya corrió en la otra transacción y no pudo ver
+-- esta fila, que aún no existía. Resultado: un proyecto 'activo' colgando de un reto que ya
+-- mide — el par roto por la puerta de las filas que NACEN, que ninguna regla sobre
+-- transiciones puede vigilar, y con ella el cierre del outcome review bloqueado.
+--
+-- Es exactamente el error que este mismo slice ya corrigió en el efecto de G6 —decidir
+-- sobre una instantánea y escribir sobre un candado—, cometido en el sitio donde se había
+-- dado por cerrado «porque la política ya lo comprueba». Ninguna política cierra una
+-- carrera.
+--
+-- La forma correcta es la del resto del archivo: bloquear la FILA DEL RETO y volver a
+-- leerla DESPUÉS del candado —cada sentencia de plpgsql toma su propio snapshot, así que
+-- ve lo que commiteó quien la tenía—. El WITH CHECK no serviría ni con el candado puesto:
+-- su subconsulta se evalúa contra el snapshot de la SENTENCIA, que no se renueva. Con esto
+-- los dos órdenes quedan bien: si el insert llega primero, `abrirMedicion` espera y su
+-- comprobación diferida sí ve el proyecto nuevo y rechaza la apertura; si llega segundo,
+-- este guard lee 'en-medicion' y el rechazado es el insert.
+--
+-- Mismo punto de cita y mismo ORDEN que las demás rutas (`reto → proyecto`), así que no
+-- añade ciclo posible. `activarReto` no paga nada: ya tiene la fila del reto bloqueada por
+-- su propio `update` de la sentencia anterior y lee su 'activo' sin commitear.
+--
+-- SECURITY DEFINER con el pre-chequeo anti-oráculo de siempre: a quien no es miembro lo
+-- rechaza la política, como debe ser, y el seed y los rellenos —que corren como owner sin
+-- contexto— lo saltan, igual que en `proyecto_con_metodo_guard`.
+create function proyecto_reto_activo_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  actual text;
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  select r.estado into actual from reto r
+    where r.id = new.reto_id and r.workspace_id = new.workspace_id
+    for update;
+  if actual is distinct from 'activo' then
+    raise exception 'el reto no está activo: un proyecto nuevo no nace bajo un reto que ya mide, que cerró o que sigue en candidato';
+  end if;
+  return new;
+end $$;
+create trigger proyecto_reto_activo
+  before insert on proyecto
+  for each row execute function proyecto_reto_activo_guard();
+revoke execute on function proyecto_reto_activo_guard() from public;
 
 -- ── Y las dos columnas del perdón histórico se cierran en la PUERTA, no en el grant ──
 -- El preámbulo de esta migración da dos razones independientes para que esas marcas no
@@ -1132,25 +1195,43 @@ begin
     if faltan is not null then
       raise exception 'no se puede firmar: la línea base es posterior al inicio de la ventana: %', faltan;
     end if;
-    -- 2) Y la cadencia comprometida tiene que CABER en la ventana al menos una vez. Un KPI
-    -- trimestral con ventana de 30 días promete una entrega que vence después del cierre:
-    -- nunca llega ninguna, y el post-mortem lo lee como «vencido» por construcción — un
-    -- «no concluyente» pactado de antemano, que es justo lo que la firma existe para
-    -- impedir.
+    -- 2) Y la cadencia comprometida tiene que CABER en la ventana al menos una vez: la
+    -- PRIMERA entrega prometida tiene que vencer DENTRO de la ventana. Un KPI trimestral
+    -- con ventana de 30 días promete una entrega que vence después del cierre: la cadencia
+    -- no llega a correr ni una sola vez dentro de la medición, y el compromiso de
+    -- frecuencia que G6 formaliza queda vacío.
     --
-    -- Se compara contra el largo MÍNIMO del intervalo (28 días un mes, 89 un trimestre) y
-    -- no contra el intervalo aplicado a `ventana_inicio`, que es lo que escribí primero: eso
-    -- habría hecho que firmar un KPI mensual con ventana de 30 días pasara o fallara según
-    -- el mes en que cayera el inicio — exactamente el defecto que este mismo commit corrige
-    -- en la cadencia. Una regla que dice «esto es imposible de cumplir» solo puede rechazar
-    -- lo que es imposible en TODOS los meses; en la duda, firma.
+    -- Y se juzga con la MISMA aritmética con la que se juzgará de verdad: calendario
+    -- (`+ interval '1 month'` sobre `ventana_inicio`), no un largo mínimo en días. Escribí
+    -- primero el mínimo fijo (28 un mes, 89 un trimestre) razonando que una regla solo debe
+    -- rechazar lo imposible en TODOS los meses; el razonamiento estaba mal por donde este
+    -- archivo se corrige siempre: la proyección de la cadencia suma meses de CALENDARIO,
+    -- así que un mínimo en días es una SEGUNDA verdad sobre el mismo compromiso, y basta
+    -- que discrepen para que la firma bendiga lo que la lectura va a llamar vacío. Un
+    -- mensual que abre el 1 de agosto con ventana de 28 días pasaba el mínimo (28 ≥ 28) y
+    -- su primera entrega vencía el 1 de septiembre, tres días después del cierre. Que el
+    -- mismo `ventana_dias` pase en febrero y falle en agosto no es indeterminación: es que
+    -- un compromiso MENSUAL mide distinto según cuándo empieza, y el inicio ya está escrito
+    -- cuando se firma.
+    --
+    -- El borde es inclusivo, como toda la ventana: si la primera entrega vence EL último
+    -- día, ese día todavía mide y el compromiso se puede cumplir.
+    --
+    -- 'unica' se queda fuera porque no tiene cadencia que quepa, y se excluye por el `paso`
+    -- nulo en vez de por un `else 0`: así la regla habla solo de lo que promete repetirse.
+    -- El `coalesce(…, false)` sigue haciendo su trabajo con los otros dos nulos posibles
+    -- —ventana sin inicio o sin largo—: en ausencia de prueba, no se firma.
     select string_agg(e.nombre, ', ' order by e.nombre) into faltan
     from entrada_kpi e
     join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
+    cross join lateral (select case e.frecuencia
+      when 'semanal' then interval '7 days'
+      when 'mensual' then interval '1 month'
+      when 'trimestral' then interval '3 months' end as paso) cad
     where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and not coalesce(c.ventana_dias >= case e.frecuencia
-        when 'semanal' then 7 when 'mensual' then 28 when 'trimestral' then 89 else 0 end,
-        false);
+      and cad.paso is not null
+      and not coalesce((e.ventana_inicio + cad.paso)::date
+                       <= e.ventana_inicio + c.ventana_dias, false);
     if faltan is not null then
       raise exception 'no se puede firmar: la cadencia comprometida no cabe en la ventana del criterio: %', faltan;
     end if;

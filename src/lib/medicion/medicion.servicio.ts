@@ -762,8 +762,25 @@ export async function completarOutcomeReview(
 /**
  * Seguimiento de impacto del proyecto (RF-07.5/07.6): registry con sus entradas, serie de
  * snapshots contra la línea base y el objetivo, días restantes de ventana y estado
- * «esperado / recibido / vencido» derivado de la frecuencia comprometida (RF-07.4). Una
- * sola sentencia: un snapshot, orden estable, sin lecturas incoherentes entre bloques.
+ * «esperado / recibido / vencido» derivado de la frecuencia comprometida. Una sola
+ * sentencia: un snapshot, orden estable, sin lecturas incoherentes entre bloques.
+ *
+ * ALCANCE de RF-07.4, dicho aquí y no solo en la descripción del PR, porque es aquí donde
+ * alguien va a creer que está cubierto: RF-07.4 pide DOS cosas —«recordatorios al
+ * propietario del dato según la frecuencia comprometida» y «el estado esperado / recibido
+ * / vencido visible en el seguimiento»— y este slice entrega la SEGUNDA. El estado que se
+ * calcula abajo es una señal de LECTURA: aparece cuando alguien abre el proyecto y no le
+ * llega a nadie. No hay envío, y no por descuido: este repositorio no tiene todavía ni
+ * canal de correo ni planificador (el diseño técnico los sitúa en SMTP + scheduler in-app
+ * con hook de cron, §Cadencias), así que el recordatorio EFECTIVO depende de una
+ * infraestructura que llega con otro slice.
+ *
+ * La condición que convierte esto en un defecto real, para que se reconozca cuando pase:
+ * el día que exista ese canal, un `vencido` que se quede solo en la pantalla ya no es una
+ * limitación declarada sino una promesa incumplida — la spec nombra los recordatorios como
+ * LA mitigación del riesgo «el cliente no aporta snapshots» (§Riesgos), y sin envío la
+ * mitigación depende de que alguien entre a mirar. Hasta entonces, lo honesto es que el
+ * código lo diga: la señal existe, el aviso no.
  */
 export async function seguimientoDeImpacto(
   actorId: string,

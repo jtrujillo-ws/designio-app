@@ -3217,9 +3217,9 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const aprobarG7 = () =>
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
-    await expect(aprobarG7()).rejects.toThrow(/superada dejó releases sin resolver/);
+    await expect(aprobarG7()).rejects.toThrow(/responsabilidad de su proyecto/);
 
-    // Las dos salidas, las mismas que dentro de un proyecto: lo desplegado se constata…
+    // Lo desplegado se constata…
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rlSale.releaseId,
@@ -3234,19 +3234,56 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         },
       ],
     });
-    await expect(aprobarG7()).rejects.toThrow(/superada dejó releases sin resolver/);
-    // …y lo que ya no va a salir se cierra quitándole el alcance. El proyecto A no firmó
-    // G6, así que el constraint de cobertura no lo impide: la salida sigue abierta.
+    await expect(aprobarG7()).rejects.toThrow(/responsabilidad de su proyecto/);
+
+    // …y lo que no salió NO se cierra quitándole el alcance, que es la diferencia con la
+    // superada dentro del mismo proyecto. Aquella es un ciclo cerrado a conciencia y sus
+    // elementos sin planificar son decisiones reemplazadas; ésta sigue siendo trabajo de A,
+    // que puede planificarlo y desplegarlo DESPUÉS y mover el estado del servicio que este
+    // gate acaba de certificar. Vaciar el release no lo resuelve: lo deja sin resolver.
     await desasignarElemento(leadId, ws, elNoSale);
-    await expect(
-      desplegarRelease(leadId, {
-        workspaceId: ws,
-        releaseId: rlQuieto.releaseId,
-        desplegadoEn: HOY,
-      }),
-    ).rejects.toThrow(/sin elementos declarados no se despliega/);
+    await expect(aprobarG7()).rejects.toThrow(/responsabilidad de su proyecto/);
+
+    // La salida es la honesta, y es la que además CONGELA el alcance sin regla nueva:
+    // constatado el elemento vía un release verificado, no queda ninguno que asignar (uno
+    // por elemento) ni release planificado donde meterlo.
+    await asignarElemento(leadId, {
+      workspaceId: ws,
+      releaseId: rlQuieto.releaseId,
+      elementoId: elNoSale,
+      razon: 'se cierra explicándolo',
+    });
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: rlQuieto.releaseId,
+      desplegadoEn: HOY,
+    });
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlQuieto.releaseId,
+      constatadoEn: HOY,
+      resumen: '',
+      constataciones: [
+        {
+          elementoId: elNoSale,
+          resultado: 'no-implementado',
+          queQuedoDistinto: 'No llegó a construirse',
+          razon: 'El ciclo pasó al proyecto siguiente antes de empezarlo',
+        },
+      ],
+    });
 
     await aprobarG7();
+    // Y el alcance de A queda cerrado por construcción: su release está verificado, así que
+    // ninguna reasignación puede reabrir trabajo que B ya certificó como conciliado.
+    await expect(
+      asignarElemento(leadId, {
+        workspaceId: ws,
+        releaseId: rlQuieto.releaseId,
+        elementoId: elSale,
+        razon: 'intento de reabrir',
+      }),
+    ).rejects.toThrow(ErrorEntrega);
     const [g7] = await admin`select estado from gate_instancia
       where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
     expect(g7!.estado).toBe('aprobado');

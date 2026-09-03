@@ -296,6 +296,24 @@ revoke execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) from
 -- política de siempre, la misma que esas políticas ya atravesaban con su propio `exists`.
 grant execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) to designio_app;
 
+-- Las design versions SUPERADAS por cuyo vuelo responde la conciliación de este proyecto:
+-- las suyas propias, y las del servicio que este proyecto certifica —porque la cadena de
+-- versiones de un servicio atraviesa proyectos y el effective state es del servicio, no del
+-- proyecto—. Se escribe una vez porque la usan las DOS mitades de la regla de G7, que
+-- distinguen según quién las superó.
+create function design_versions_superadas_del_ambito(p_proyecto uuid, p_workspace uuid)
+returns setof uuid language sql stable as $$
+  select dv.id
+  from design_version dv
+  where dv.workspace_id = p_workspace and dv.estado = 'superada'
+    and (dv.proyecto_id = p_proyecto
+         or dv.servicio_id in (
+           select vig.servicio_id from design_version vig
+           where vig.proyecto_id = p_proyecto and vig.workspace_id = p_workspace
+             and vig.estado = 'aprobada'))
+$$;
+revoke execute on function design_versions_superadas_del_ambito(uuid, uuid) from public;
+
 -- ══ RLS ══
 -- Lectura: todo miembro. La cadena evidencia→resultado es lo que el cliente audita; un
 -- effective state que el sponsor no puede leer no demuestra nada.
@@ -1736,22 +1754,49 @@ begin
       -- para ese servicio fue superada desde otro proyecto, el proyecto ya no tiene ninguna
       -- APROBADA de ese servicio y el recorrido por servicio no llegaría a ella. Sigue
       -- siendo trabajo abierto suyo.
+      -- Y la regla tiene DOS mitades, según quién superó a la versión — la misma distinción
+      -- que separa «cuál manda en el servicio» de «de qué responde el proyecto»:
+      --
+      -- (a) La que superó OTRO proyecto sigue siendo responsabilidad del suyo: sus elementos
+      --     no son decisiones cerradas, son trabajo que ese proyecto todavía tiene que
+      --     planificar (por eso las políticas del release y del alcance se lo permiten). Así
+      --     que aquí no basta con mirar lo que ya está en vuelo: mientras le queden elementos
+      --     sin resolver, la conciliación de ESTE proyecto no puede darse por cerrada — el
+      --     otro puede planificarlos y desplegarlos DESPUÉS y mover el estado compartido del
+      --     servicio que este gate acaba de certificar. Un G7 inmutable no admite eso.
+      --
+      --     Y esto es además lo que CONGELA el alcance de la predecesora sin necesidad de
+      --     una regla nueva: cuando todos sus elementos están constatados vía releases
+      --     verificados, no queda ninguno que asignar (la PK de release_elemento da uno por
+      --     elemento) ni release planificado donde meterlo, así que no hay forma de volver a
+      --     abrir trabajo. La salida es la honesta: desplegar y constatar, aunque sea como
+      --     'no-implementado' con su razón.
+      if exists (
+        select 1 from elemento_cambio ec
+        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+        where dv.id in (select design_versions_superadas_del_ambito(new.proyecto_id, new.workspace_id))
+          and dv.id in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
+          and not exists (
+            select 1 from constatacion c
+            join effective_state es on es.id = c.effective_state_id and es.workspace_id = c.workspace_id
+            join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
+            where c.elemento_id = ec.id and c.workspace_id = ec.workspace_id
+              and r.estado = 'verificado')
+      ) then
+        raise exception 'no se puede aprobar G7: una design version superada del servicio sigue siendo responsabilidad de su proyecto y tiene elementos sin resolver (RF-06.7)';
+      end if;
+      -- (b) La que superó su PROPIO proyecto es un ciclo cerrado a conciencia: sus elementos
+      --     sin planificar son decisiones reemplazadas y nadie puede volver a abrirlos —las
+      --     políticas del release y del alcance no la alcanzan—. De ella entra solo lo que
+      --     dejó EN VUELO, que es lo único que todavía puede salir.
       if exists (
         select 1 from elemento_cambio ec
         join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
         join release_elemento re on re.elemento_id = ec.id and re.workspace_id = ec.workspace_id
         join release r on r.id = re.release_id and r.workspace_id = re.workspace_id
-        where dv.workspace_id = new.workspace_id
-          and dv.estado = 'superada'
+        where dv.id in (select design_versions_superadas_del_ambito(new.proyecto_id, new.workspace_id))
+          and dv.id not in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
           and r.estado <> 'verificado'
-          and (
-            dv.proyecto_id = new.proyecto_id
-            or dv.servicio_id in (
-              select vigente.servicio_id from design_version vigente
-              where vigente.proyecto_id = new.proyecto_id
-                and vigente.workspace_id = new.workspace_id
-                and vigente.estado = 'aprobada')
-          )
       ) then
         raise exception 'no se puede aprobar G7: una design version superada dejó releases sin resolver (RF-06.7)';
       end if;

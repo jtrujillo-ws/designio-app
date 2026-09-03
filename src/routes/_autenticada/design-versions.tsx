@@ -277,10 +277,33 @@ function FormularioDesignVersion({
   // servicio que quede detrás del corte — el mismo agujero que la paginación vino a
   // cerrar, reintroducido en el selector. Filtrando por servicio en el servidor, lo que
   // se pide es siempre un conjunto pequeño y completo.
-  const [journeys, setJourneys] = useState<{ id: string; nombre: string }[]>([]);
+  const [journeys, setJourneys] = useState<
+    { id: string; nombre: string; proyectoId: string | null }[]
+  >([]);
   const [hayMasJourneys, setHayMasJourneys] = useState(false);
   const [cargandoJourneys, setCargandoJourneys] = useState(false);
   const proyectos = servicios.find((s) => s.id === servicioId)?.proyectos ?? [];
+  /**
+   * Los to-be que este PROYECTO puede congelar. Un journey declara su proyecto de forma
+   * opcional (SPEC-05), y `design_version_journey_guard` rechaza el que esté anclado a
+   * otro: sin este filtro, un servicio con to-be de dos proyectos elegibles ofrecía el de
+   * A con B seleccionado y el alta se estrellaba contra el guard. Los que no declaran
+   * proyecto valen para cualquiera — que es lo que dice el guard, no una interpretación.
+   *
+   * Se filtra en el cliente y no se vuelve a pedir al servidor porque la respuesta ya es
+   * del servicio elegido y por tanto pequeña; el aviso de «hay más de los que caben»
+   * sigue cubriendo el corte, que es el mismo con o sin este filtro.
+   */
+  const journeysElegibles = journeys.filter(
+    (j) => j.proyectoId === null || j.proyectoId === proyectoId,
+  );
+
+  function elegirProyecto(nuevo: string) {
+    setProyectoId(nuevo);
+    // El to-be elegido podía ser del proyecto anterior: dejarlo puesto mandaría al endpoint
+    // justo la combinación que el guard rechaza. Mismo cuidado que al cambiar de servicio.
+    setJourneyId('');
+  }
   // La versión aprobada VIGENTE del servicio elegido, pedida al servidor igual que los
   // to-be y por el mismo motivo. Antes salía de filtrar la lista de design versions del
   // workspace, que va paginada: si la aprobada de este servicio caía detrás del corte, el
@@ -331,7 +354,9 @@ function FormularioDesignVersion({
         versionAprobadaDeServicio({ data: { workspaceId, servicioId: nuevo } }),
       ]);
       if (peticion.current !== mia) return;
-      setJourneys(pagina.journeys.map((j) => ({ id: j.id, nombre: j.nombre })));
+      setJourneys(
+        pagina.journeys.map((j) => ({ id: j.id, nombre: j.nombre, proyectoId: j.proyectoId })),
+      );
       setHayMasJourneys(pagina.siguiente !== null);
       setVigente(aprobada);
     } finally {
@@ -385,7 +410,7 @@ function FormularioDesignVersion({
         </Select>
         <Select
           value={proyectoId}
-          onChange={(e) => setProyectoId(e.target.value)}
+          onChange={(e) => elegirProyecto(e.target.value)}
           disabled={servicioId === ''}
           required
         >
@@ -399,19 +424,27 @@ function FormularioDesignVersion({
         <Select
           value={journeyId}
           onChange={(e) => setJourneyId(e.target.value)}
-          disabled={servicioId === '' || cargandoJourneys}
+          disabled={servicioId === '' || proyectoId === '' || cargandoJourneys}
         >
           <option value="">
             {cargandoJourneys
               ? 'Buscando los to-be del servicio…'
-              : 'Journey to-be (se puede enlazar después)'}
+              : proyectoId === ''
+                ? 'Elige el proyecto para ver sus to-be'
+                : 'Journey to-be (se puede enlazar después)'}
           </option>
-          {journeys.map((j) => (
+          {journeysElegibles.map((j) => (
             <option key={j.id} value={j.id}>
               {j.nombre}
             </option>
           ))}
         </Select>
+        {proyectoId !== '' && journeys.length > journeysElegibles.length && (
+          <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+            Hay to-be de este servicio anclados a otro proyecto; no se ofrecen porque una
+            design version solo congela el grafo de SU proyecto.
+          </span>
+        )}
         {hayMasJourneys && (
           <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
             Este servicio tiene más journeys to-be de los que caben aquí; si el que buscas

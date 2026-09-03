@@ -27,7 +27,7 @@ import { calcularDiff, conciliacionCompleta } from '@/lib/entrega/entrega.diff';
 import { aprobarGate } from '@/lib/metodo/metodo.servicio';
 import { revalidarDecision } from '@/lib/metodo/gobernanza.servicio';
 import { abrirHilo, hilosDeObjetos } from '@/lib/portal/portal.servicio';
-import { borrarNodo } from '@/lib/journey/journey.servicio';
+import { borrarNodo, journeysDelWorkspace } from '@/lib/journey/journey.servicio';
 import { describeAuthz } from './helpers';
 
 /**
@@ -3360,6 +3360,43 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // Y sigue asignado: el rechazo del constraint diferido revierte la transacción entera.
     const cubierto = await designVersionCompleta(leadId, ws, dvA.designVersionId);
     expect(cubierto!.releases[0]!.elementos.map((e) => e.elementoId)).toEqual([elA]);
+  });
+
+  it('un to-be anclado a otro proyecto no lo congela esta design version', async () => {
+    // El selector del alta ofrece los to-be DEL SERVICIO, y un servicio puede tener uno por
+    // cada proyecto que lo toca: sin filtrar por el proyecto elegido, la pantalla ofrecía el
+    // de A con B seleccionado y el alta se estrellaba contra el guard. Aquí se fija lo que
+    // la pantalla tiene que respetar (la regla) y el dato con el que puede respetarlo (el
+    // proyecto del journey en la lista) — sin ese dato, filtrar no era posible.
+    const admin = sqlAdmin();
+    const { servicioId: svcId } = await servicioConToBe('Servicio con to-be de dos proyectos');
+    const [jAjeno] = await admin`insert into journey
+      (workspace_id, servicio_id, reto_id, proyecto_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, ${retoId}, ${otroProyectoId}, 'to-be', 'To-be del proyecto vecino',
+              ${leadId}) returning id`;
+    const journeyAjeno = jAjeno!.id as string;
+
+    await expect(
+      crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proyectoAbierto,
+        servicioId: svcId,
+        journeyId: journeyAjeno,
+        titulo: 'La que quiere congelar el grafo de otro',
+        resumen: '',
+        superaA: null,
+      }),
+    ).rejects.toThrow(/anclado a otro proyecto/);
+
+    // Y la lista trae el anclaje, que es lo único que le permite al selector no ofrecerlo.
+    // Los to-be SIN proyecto valen para cualquiera, y así los reporta.
+    const pagina = await journeysDelWorkspace(leadId, ws, null, {
+      servicioId: svcId,
+      tipo: 'to-be',
+    });
+    const anclados = new Map(pagina.journeys.map((j) => [j.id, j.proyectoId]));
+    expect(anclados.get(journeyAjeno)).toBe(otroProyectoId);
+    expect([...anclados.values()]).toContain(null);
   });
 
   it('nada de esto cruza el workspace', async () => {

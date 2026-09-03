@@ -243,6 +243,11 @@ export type ResumenJourney = {
    * design version, que cambia UNO) no puede hacerlo comparando cadenas. */
   servicioId: string;
   servicioNombre: string;
+  /** El proyecto al que el grafo está anclado, si lo declara (SPEC-05 lo hace opcional).
+   * Va en el resumen porque quien elige un to-be para una design version tiene que
+   * descartar los anclados a OTRO proyecto: `design_version_journey_guard` los rechaza, y
+   * un selector que los ofrece ofrece un error. */
+  proyectoId: string | null;
   nodos: number;
   /** Cuántos snapshots congelados lleva: la historia de lo aprobado sobre este grafo. */
   snapshots: number;

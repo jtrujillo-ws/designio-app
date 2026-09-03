@@ -277,8 +277,22 @@ $$;
 -- columnas editables del criterio más su `antes`. Al reordenar esta migración por detrás de
 -- aquella, se cogió el cuerpo VIVO ENTERO de `…110000` y se le volvió a aplicar encima este
 -- refactor. Nunca al revés — no partas de esta versión añadiéndole de memoria la regla que
--- recuerdes, porque para entonces puede haber más de una; verifica con un bucle sobre TODOS
--- los ficheros de `db/migrations/` cuáles definen el guard, no mirando el que esperas.
+-- recuerdes, porque para entonces puede haber más de una.
+--
+-- Y la comprobación NO es «mira el guard que te han nombrado». Es, para CADA migración que
+-- se mueva de sitio: lista todos los objetos que redefine —funciones, políticas y
+-- triggers— y mira quién más los define, porque la lista siempre es más larga de lo que uno
+-- recuerda. Este fichero redefine CUATRO cosas que otros también definen (este guard, las
+-- dos políticas de `criterio_exito` de más abajo, y el trigger `criterio_g0_pendiente`), y
+-- se descubrieron con el bucle, no de memoria. Sirve tal cual:
+--
+--   grep -hoiE "create (or replace )?(function|policy|trigger) [a-z0-9_]+" db/migrations/*.sql \
+--     | awk '{print tolower($NF)}' | sort | uniq -d
+--
+-- y después, por cada nombre repetido, `grep -l` para ver en qué ficheros está y quién gana
+-- (el de número más alto). Sobre la base ya migrada, `select prosrc from pg_proc` dice cuál
+-- es el cuerpo VIVO, que es el único que cuenta: leer un fichero no compone los
+-- `create or replace` posteriores.
 --
 -- Y si la regla nueva es otra condición de congelado, va DENTRO de las funciones de arriba:
 -- las llaman también las dos políticas de `criterio_exito`, los dos guards de `propuesta_ai`

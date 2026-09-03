@@ -6,6 +6,10 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import {
+  etiquetaObjetoBloqueado,
+  type EvidenciaCitable,
+} from '@/lib/evidencia/evidencia.schemas';
+import {
   aprobarDecision,
   definirArquetipo,
   enlazarEvidenciaArquetipo,
@@ -63,7 +67,11 @@ export function SeccionGobernanza({
   gobernanza: GobernanzaDeProyecto;
   insightsValidados: { id: string; titulo: string }[];
   hayMasInsights: boolean;
-  evidencias: { id: string; titulo: string }[];
+  /** Con su `citable` y su motivo: enlazar evidencia a un arquetipo es respaldo
+   * probatorio —confirmar exige enlace, y G2 no pasa con arquetipos sin confirmar— y
+   * además su título se publica en el tablero de gobernanza, que lee todo el workspace.
+   * El prop no puede estrechar el tipo o el bloqueo se pierde por el camino. */
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   rol: string;
   onCambio: () => Promise<void>;
@@ -220,6 +228,23 @@ function BloqueDecisiones({
           <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
             Sostenida por: {d.insights.map((i) => i.titulo).join(' · ') || '—'} · {d.decididoEn}
           </span>
+          {/* El respaldo se cae por detrás sin que la decisión cambie de estado: los
+              derechos de la evidencia citada se revocan y caducan por su cuenta. El guard
+              de suficiencia lo comprueba al aprobar el gate, así que aquí se dice antes —y
+              se nombra la afirmación exacta, que es lo que hay que reparar. */}
+          {d.insightSinValidar && (
+            <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+              Sin validar: el insight «{d.insightSinValidar}» que traza esta decisión no
+              pasó la validación, así que el gate que la cite no se podrá aprobar.
+            </span>
+          )}
+          {d.sinRespaldo && (
+            <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+              Sin respaldo vigente: en el insight «{d.sinRespaldo.insight}», la afirmación «
+              {d.sinRespaldo.afirmacion}» ya no tiene ninguna cita con derechos vigentes para
+              el ámbito cliente.
+            </span>
+          )}
           {esLead && d.estado === 'en-revision' && (
             <div>
               <Button size="sm" variant="ghost" disabled={ocupado} onClick={() => void revalidar(d.id)}>
@@ -328,7 +353,11 @@ function BloqueArquetipos({
   retoId: string;
   arquetipos: GobernanzaDeProyecto['arquetipos'];
   segmentos: { id: string; nombre: string }[];
-  evidencias: { id: string; titulo: string }[];
+  /** Con su `citable` y su motivo: enlazar evidencia a un arquetipo es respaldo
+   * probatorio —confirmar exige enlace, y G2 no pasa con arquetipos sin confirmar— y
+   * además su título se publica en el tablero de gobernanza, que lee todo el workspace.
+   * El prop no puede estrechar el tipo o el bloqueo se pierde por el camino. */
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   esCurador: boolean;
   onCambio: () => Promise<void>;
@@ -464,9 +493,11 @@ function BloqueArquetipos({
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
               <Select value={evidenciaId} onChange={(e) => setEvidenciaId(e.target.value)} style={{ minWidth: 240 }}>
                 <option value="">Evidencia que lo sostiene…</option>
+                {/* Sin derechos vigentes para «cliente» no se enlaza: el guard de la base
+                    lo impide, y aquí se dice por qué antes de elegir (SYS-14). */}
                 {evidencias.map((e) => (
-                  <option key={e.id} value={e.id}>
-                    {e.titulo}
+                  <option key={e.id} value={e.id} disabled={!e.citable}>
+                    {e.citable ? e.titulo : etiquetaObjetoBloqueado(e.titulo, e.motivoBloqueo)}
                   </option>
                 ))}
                 {/* Confirmar un arquetipo EXIGE evidencia enlazada: si la lista viene

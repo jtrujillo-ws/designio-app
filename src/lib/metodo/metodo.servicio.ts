@@ -264,6 +264,13 @@ export async function marcarItem(actorId: string, entrada: MarcarItem): Promise<
         where id = ${entrada.itemId} and workspace_id = ${entrada.workspaceId}`;
     } catch (e) {
       const code = (e as { code?: string }).code;
+      // DR001: el guard de derechos de SPEC-03 cortó la CITA — la evidencia no tiene
+      // derechos vigentes para el ámbito «cliente» (RF-03.10, SYS-14). El mensaje ya
+      // viene con la dimensión que falta; se propaga tal cual porque es exactamente lo
+      // que el criterio de aceptación pide mostrar.
+      if (code === 'DR001') {
+        throw new ErrorMetodo((e as { message?: string }).message ?? 'Derechos insuficientes');
+      }
       // WITH CHECK violado (42501): rol insuficiente para la transición pedida.
       if (code === '42501' && a.tipo === 'na') {
         throw new ErrorMetodo('Solo el rol aprobador del gate marca N/A');
@@ -311,6 +318,9 @@ export async function aprobarGate(
     await bloquearReto(tx, pertenece.reto_id as string);
     await bloquearGate(tx, entrada.gateId);
 
+    // El guard de la transición vuelve a evaluar los DERECHOS de lo ya citado: un ítem
+    // cumplido no se entera de que le revocaron el consentimiento, porque nada lo
+    // actualiza. Su DR001 trae la dimensión que falta y se propaga tal cual (SYS-14).
     let aprobado;
     try {
       aprobado = await tx`
@@ -351,17 +361,21 @@ export async function aprobarGate(
             and r.estado = 'firmado'))
       returning g.numero`;
     } catch (e) {
-      // El guard de suficiencia habla ANTES que el WITH CHECK y lo hace con `raise`
-      // (P0001). Sin traducirlo, la server function lo relanza y la pantalla enseña su
-      // mensaje genérico de reintento en vez del motivo — y el motivo es lo único que
-      // dice qué hacer. Vale para las condiciones que la consulta de arriba espeja y
-      // también para las que no: el traductor cubre la que se añada mañana.
+      // El guard de suficiencia habla ANTES que el WITH CHECK y lo hace con `raise`.
+      // Sin traducirlo, la server function lo relanza y la pantalla enseña su mensaje
+      // genérico de reintento en vez del motivo — y el motivo es lo único que dice qué
+      // hacer. Vale para las condiciones que la consulta de arriba espeja y también para
+      // las que no: el traductor cubre la que se añada mañana.
       //
-      // De SPEC-06 llegan por aquí los motivos más concretos —«hay elementos de la design
-      // version sin release asignado», «el proyecto no tiene ninguna design version
-      // aprobada con elementos que certificar»—, y el diagnóstico por cero filas sigue
-      // detrás para lo que la política rechaza sin decir nada.
+      // Dos códigos, una razón: `DR001` es el de derechos (lo distingue de «rol
+      // insuficiente» para que el motivo con la dimensión que falta llegue entero —
+      // SYS-14) y `P0001` el genérico de `raise`. De SPEC-06 llegan por el segundo los
+      // motivos más concretos —«hay elementos de la design version sin release asignado»,
+      // «el proyecto no tiene ninguna design version aprobada con elementos que
+      // certificar»—, y el diagnóstico por cero filas sigue detrás para lo que la política
+      // rechaza sin decir nada.
       const err = e as { code?: string; message?: string };
+      if (err.code === 'DR001') throw new ErrorMetodo(err.message ?? 'Derechos insuficientes');
       if (err.code === 'P0001' && err.message) throw new ErrorMetodo(err.message);
       throw e;
     }

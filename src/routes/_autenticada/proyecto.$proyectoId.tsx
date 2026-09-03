@@ -9,7 +9,7 @@ import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { etiquetaObjetoBloqueado, ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
   aprobarGateDeProyecto,
   marcarItemDeChecklist,
@@ -42,7 +42,24 @@ import type { HiloDeObjeto, ObjetoCitable as AnclaDeHilo } from '@/lib/portal/po
 /** Lo que un ítem del checklist puede citar: evidencia curada, insight validado o
  * decisión vigente (RF-04.5). Un insight propuesto no cuenta — la suficiencia se
  * apoya en lo que alguien ya sostuvo con citas. */
-export type ObjetoCitable = { clase: ClaseObjetoCitable; id: string; titulo: string };
+export type ObjetoCitable = {
+  clase: ClaseObjetoCitable;
+  id: string;
+  titulo: string;
+  /** `citable: false` deshabilita la opción con su motivo a la vista. El bloqueo REAL lo
+   * impone la base; esto reproduce su predicado para que la app y el guard no digan cosas
+   * distintas sobre la misma regla — cuando discrepan, el usuario elige algo que la base
+   * rechaza después y nadie le ha dicho por qué.
+   *
+   * Se calcula para las TRES clases, cada una con lo que de verdad la bloquea al aprobar
+   * el gate:
+   *  · `evidencia` — derechos de uso propios (SPEC-03): pendientes, denegados o vencidos.
+   *  · `insight` — es inmutable, pero su respaldo no: si una afirmación no-hipótesis se
+   *    queda sin ninguna cita con derechos vigentes, el guard de suficiencia lo rechaza.
+   *  · `decision` — en revisión tras una reapertura aguas arriba (SYS-10). */
+  citable?: boolean;
+  motivoBloqueo?: string | null;
+};
 
 /**
  * Pantalla del método (SPEC-04): las 8 etapas canónicas con su gate, checklist de
@@ -89,15 +106,48 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
         clase: 'evidencia' as const,
         id: e.id,
         titulo: e.titulo,
+        citable: e.citable,
+        motivoBloqueo: e.motivoBloqueo,
       })),
       ...insights.insights.map((i) => ({
         clase: 'insight' as const,
         id: i.id,
         titulo: i.titulo,
+        citable: i.citable,
+        motivoBloqueo: i.motivoBloqueo,
       })),
-      ...(gobernanza?.decisiones ?? [])
-        .filter((d) => d.estado === 'vigente')
-        .map((d) => ({ clase: 'decision' as const, id: d.id, titulo: d.titulo })),
+      // Las decisiones en revisión se OFRECEN deshabilitadas, no se esconden. Filtrarlas
+      // dejaba al usuario buscando en el desplegable una decisión que su propia pantalla
+      // de gobernanza le está mostrando: el mismo silencio que este repositorio rechaza
+      // en todas partes («marcado, no escondido»). El guard de suficiencia las bloquea al
+      // aprobar el gate; aquí se dice por qué antes de elegir.
+      //
+      // Y una decisión se cita por DOS condiciones, no por una. `estado` solo habla de
+      // reaperturas (SYS-10): una decisión perfectamente vigente puede apoyarse en insights
+      // cuya evidencia perdió los derechos, y el guard de suficiencia sigue esa cadena al
+      // aprobar (20260902190000). Mirar solo el estado era el mismo hueco que ya se cerró
+      // para los insights, una capa más arriba: marcar el ítem tenía éxito y el rechazo
+      // llegaba al aprobar el gate, cuando ya se sabía de antemano que iba a fallar.
+      ...(gobernanza?.decisiones ?? []).map((d) => ({
+        clase: 'decision' as const,
+        id: d.id,
+        titulo: d.titulo,
+        citable:
+          d.estado === 'vigente' && d.insightSinValidar === null && d.sinRespaldo === null,
+        // Tres superficies de rechazo, tres motivos distintos, en el orden en que hay que
+        // repararlos: el estado de la decisión, después que sus insights estén validados
+        // (objeción ANTERIOR al respaldo — un insight sin validar nunca pasó la barra de
+        // suficiencia) y después el respaldo vivo. Cada uno nombra SU dimensión: rotularlos
+        // todos como «sin derechos» manda a reparar donde no hay nada roto.
+        motivoBloqueo:
+          d.estado !== 'vigente'
+            ? 'está en revisión tras una reapertura aguas arriba (SYS-10): revalídala antes de citarla'
+            : d.insightSinValidar !== null
+              ? `su insight de respaldo «${d.insightSinValidar}» no está validado: valídalo o rehaz la decisión`
+              : d.sinRespaldo === null
+                ? null
+                : `su respaldo perdió los derechos: en el insight «${d.sinRespaldo.insight}», la afirmación «${d.sinRespaldo.afirmacion}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente`,
+      })),
     ];
     return {
       workspaceId,
@@ -253,7 +303,18 @@ function PantallaProyecto() {
               gobernanza={datos.gobernanza}
               insightsValidados={datos.insightsValidados}
               hayMasInsights={datos.hayMasInsights}
-              evidencias={datos.citables.filter((o) => o.clase === 'evidencia')}
+              // El bloque de arquetipos exige el tipo COMPLETO, con `citable` obligatorio:
+              // enlazar evidencia a un arquetipo es respaldo probatorio y su título se
+              // publica en el tablero, así que el prop no puede admitir la forma
+              // «opcional» que sí vale para la lista mezclada del checklist.
+              evidencias={datos.citables
+                .filter((o) => o.clase === 'evidencia')
+                .map((o) => ({
+                  id: o.id,
+                  titulo: o.titulo,
+                  citable: o.citable ?? false,
+                  motivoBloqueo: o.motivoBloqueo ?? null,
+                }))}
               hayMasEvidencias={datos.hayMasEvidencias}
               rol={rol}
               onCambio={() => router.invalidate()}
@@ -599,9 +660,19 @@ function ItemChecklist({
               if (delGrupo.length === 0) return null;
               return (
                 <optgroup key={clase} label={ETIQUETA_CLASE_OBJETO[clase]}>
+                  {/* Los derechos restringen el uso aguas abajo (RF-03.10, SYS-14): lo
+                      que no puede citarse se muestra deshabilitado y CON el motivo,
+                      nunca oculto — que falte una dimensión es información de curaduría,
+                      no ruido. El bloqueo REAL lo impone la base; esto lo hace legible. */}
                   {delGrupo.map((o) => (
-                    <option key={`${o.clase}:${o.id}`} value={`${o.clase}:${o.id}`}>
-                      {o.titulo}
+                    <option
+                      key={`${o.clase}:${o.id}`}
+                      value={`${o.clase}:${o.id}`}
+                      disabled={o.citable === false}
+                    >
+                      {o.citable === false
+                        ? etiquetaObjetoBloqueado(o.titulo, o.motivoBloqueo)
+                        : o.titulo}
                     </option>
                   ))}
                 </optgroup>

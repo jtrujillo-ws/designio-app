@@ -284,6 +284,15 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       values (${ws}, ${fuente!.id as string}, 'Evidencia medición', '{}'::jsonb, ${leadId})
       returning id`;
     evidenciaId = ev!.id as string;
+    // Marcar un ítem de checklist como `cumplido` citando evidencia exige DERECHOS
+    // vigentes para el ámbito cliente (SPEC-03, RF-03.10): un gate se aprueba con el
+    // cliente delante. La evidencia de este workspace de prueba los tiene concedidos,
+    // que es lo que deja aprobar los gates de este fixture; el caso contrario —citar sin
+    // derechos, y la revocación posterior— lo cubre la suite de evidencia profunda.
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaId}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${leadId}, now(), ${leadId})`;
 
     // Reto activo con su método y DOS criterios de éxito con ventana propia (SYS-22).
     const r = await crearReto(leadId, {
@@ -377,6 +386,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       await admin`delete from proyecto where workspace_id = ${ws}`;
       await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
       await admin`delete from reto where workspace_id = ${ws}`;
+      await admin`delete from derecho_uso where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
       await admin`delete from servicio where workspace_id = ${ws}`;
@@ -2593,14 +2603,20 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await disenoAprobado(proyectoHeredadoId);
     // El guard que hoy exige el registry en G6 es `before update`, así que se apaga solo
     // para ESCRIBIR ese pasado: es lo único que la base no deja inventar de otra forma.
-    await admin`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
-    try {
-      await admin`update gate_instancia
+    // La ventana de apagado va DENTRO de una transacción a propósito. `alter table … disable
+    // trigger` cambia el esquema para TODAS las sesiones, y suelto suelta su ACCESS
+    // EXCLUSIVE al terminar su propia sentencia: mientras dura, cualquier suite en paralelo
+    // aprueba gates sin el guard y se queda sin el sello de `aprobado_en` —choque con
+    // `gate_instancia_check1`, intermitente y dependiente del entrelazado—. Dentro de una
+    // transacción el candado se retiene hasta el commit, así que las demás esperan y nunca
+    // ven el guard apagado. No cambia lo que este test hace; cambia a quién se lo hace.
+    await admin.begin(async (tx) => {
+      await tx`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
+      await tx`update gate_instancia
         set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
         where proyecto_id = ${proyectoHeredadoId} and numero <= 6`;
-    } finally {
-      await admin`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
-    }
+      await tx`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
+    });
     await admin`update etapa_instancia set estado = 'completada'
       where proyecto_id = ${proyectoHeredadoId} and numero <= 6`;
     // …y lo que la MIGRACIÓN habría marcado al desplegarse sobre esa historia.
@@ -3447,13 +3463,19 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // que usa el guard, así que no puede faltar en un lado y estar en el otro.
     await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
       where id = ${bId}`);
-    await admin`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
-    try {
-      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+    // La ventana de apagado va DENTRO de una transacción a propósito. `alter table … disable
+    // trigger` cambia el esquema para TODAS las sesiones, y suelto suelta su ACCESS
+    // EXCLUSIVE al terminar su propia sentencia: mientras dura, cualquier suite en paralelo
+    // aprueba gates sin el guard y se queda sin el sello de `aprobado_en` —choque con
+    // `gate_instancia_check1`, intermitente y dependiente del entrelazado—. Dentro de una
+    // transacción el candado se retiene hasta el commit, así que las demás esperan y nunca
+    // ven el guard apagado. No cambia lo que este test hace; cambia a quién se lo hace.
+    await admin.begin(async (tx) => {
+      await tx`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
+      await tx`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
         aprobado_en = now() where proyecto_id = ${bId} and numero = 7`;
-    } finally {
-      await admin`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
-    }
+      await tx`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
+    });
     await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
       where id = ${bId}`);
     await admin`alter table proyecto disable trigger proyecto_estado_transicion`;
@@ -3502,13 +3524,19 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // quedarse atrás, porque ahora sí podrá volver. (Aquí con el guard de suficiencia
     // apagado, porque este segundo proyecto se fabricó con sus gates y sin checklist; el
     // camino real es aprobarlo por el servicio como hace su hermano.)
-    await admin`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
-    try {
-      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+    // La ventana de apagado va DENTRO de una transacción a propósito. `alter table … disable
+    // trigger` cambia el esquema para TODAS las sesiones, y suelto suelta su ACCESS
+    // EXCLUSIVE al terminar su propia sentencia: mientras dura, cualquier suite en paralelo
+    // aprueba gates sin el guard y se queda sin el sello de `aprobado_en` —choque con
+    // `gate_instancia_check1`, intermitente y dependiente del entrelazado—. Dentro de una
+    // transacción el candado se retiene hasta el commit, así que las demás esperan y nunca
+    // ven el guard apagado. No cambia lo que este test hace; cambia a quién se lo hace.
+    await admin.begin(async (tx) => {
+      await tx`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
+      await tx`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
         aprobado_en = now() where proyecto_id = ${bId} and numero = 7`;
-    } finally {
-      await admin`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
-    }
+      await tx`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
+    });
 
     // ── El candado compartido, por lo que un candado hace: ESPERAR ──
     // Los dos guards del par son diferidos, y «diferido» no es «excluyente»: corren en la

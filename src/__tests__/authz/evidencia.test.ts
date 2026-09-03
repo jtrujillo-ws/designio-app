@@ -71,8 +71,10 @@ describeAuthz('bandeja de importación y evidencia (curaduría + aislamiento)', 
     const wss = [ws, wsB].filter((id) => id !== '');
     if (wss.length > 0) {
       await admin`delete from evento_dominio where workspace_id in ${admin(wss)}`;
+      await admin`delete from archivo_importado where workspace_id in ${admin(wss)}`;
       await admin`delete from item_importacion where workspace_id in ${admin(wss)}`;
       await admin`delete from evidencia_segmento where workspace_id in ${admin(wss)}`;
+      await admin`delete from derecho_uso where workspace_id in ${admin(wss)}`;
       await admin`delete from segmento where workspace_id in ${admin(wss)}`;
       await admin`delete from evidencia where workspace_id in ${admin(wss)}`;
       await admin`delete from fuente where workspace_id in ${admin(wss)}`;

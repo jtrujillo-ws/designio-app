@@ -6,6 +6,7 @@ import type {
   AgregarAfirmacion,
   AgregarCita,
   CrearInsight,
+  InsightCitable,
   InsightCompleto,
   RegistrarContradiccion,
 } from './insight.schemas';
@@ -37,6 +38,15 @@ const INSIGHTS_PICKER = 200;
 function comoErrorDeDominio(e: unknown): never {
   const err = e as { code?: string; message?: string };
   if (err.code === 'P0001' && err.message) {
+    throw new ErrorInsight(err.message);
+  }
+  // DR001 es el errcode propio de los derechos, y desde 20260902310000 también lo levanta
+  // el guard de VALIDACIÓN: validar es irreversible, así que se comprueba ahí que las
+  // citas siguen sirviendo y no solo que existen. Sin esta rama el mensaje —que ya trae la
+  // afirmación exacta y la dimensión que falta— salía como error de servidor sin traducir,
+  // que es justo lo que SYS-14 prohíbe. El traductor es un consumidor de pleno derecho de
+  // cada restricción nueva.
+  if (err.code === 'DR001' && err.message) {
     throw new ErrorInsight(err.message);
   }
   throw e;
@@ -144,6 +154,14 @@ export async function agregarCita(
         returning id`;
     } catch (e) {
       const code = (e as { code?: string }).code;
+      // DR001: el guard de derechos cortó la CITA — la evidencia no tiene derechos
+      // vigentes para el ámbito «cliente» (RF-03.10, SYS-14). Citar aquí es tan
+      // definitivo como citar en un gate: la cita COPIA el fragmento del original y es
+      // lo que después valida el insight, que es inmutable. El mensaje ya trae la
+      // dimensión que falta y se propaga tal cual, que es lo que la spec pide mostrar.
+      if (code === 'DR001') {
+        throw new ErrorInsight((e as { message?: string }).message ?? 'Derechos insuficientes');
+      }
       // FK compuesta: la evidencia citada no es de este workspace (o no existe).
       if (code === '23503') {
         throw new ErrorInsight('La evidencia citada no existe en este workspace');
@@ -243,17 +261,41 @@ export async function validarInsight(
 export async function insightsCitables(
   actorId: string,
   workspaceId: string,
-): Promise<{ insights: { id: string; titulo: string }[]; hayMas: boolean }> {
+): Promise<{ insights: InsightCitable[]; hayMas: boolean }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const filas = await tx`select id, titulo from insight
-      where workspace_id = ${workspaceId} and estado = 'validado'
-      order by validado_en desc nulls last, creado_en desc, id desc
+    // Un insight validado es inmutable, pero su RESPALDO no: los derechos de la evidencia
+    // citada se revocan y caducan. El guard de suficiencia lo comprueba al aprobar el
+    // gate, así que ofrecerlo aquí como si nada dejaba al usuario eligiendo una opción
+    // que la base iba a rechazar después, sin decirle por qué. El predicado es el MISMO
+    // que evalúa ese guard —toda afirmación no marcada como hipótesis necesita al menos
+    // una cita con derechos vigentes para el ámbito cliente— y se trae la primera que
+    // falle para poder nombrarla: un motivo genérico no dice qué reparar.
+    const filas = await tx`select i.id, i.titulo,
+        (select a.texto from afirmacion a
+          where a.insight_id = i.id and a.workspace_id = i.workspace_id
+            and not a.es_hipotesis
+            and not exists (select 1 from cita c
+              where c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
+                and evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente'))
+          order by a.orden limit 1) as sin_respaldo
+      from insight i
+      where i.workspace_id = ${workspaceId} and i.estado = 'validado'
+      order by i.validado_en desc nulls last, i.creado_en desc, i.id desc
       limit ${INSIGHTS_PICKER + 1}`;
     return {
-      insights: filas
-        .slice(0, INSIGHTS_PICKER)
-        .map((f) => ({ id: f.id as string, titulo: f.titulo as string })),
+      insights: filas.slice(0, INSIGHTS_PICKER).map((f) => {
+        const sinRespaldo = f.sin_respaldo as string | null;
+        return {
+          id: f.id as string,
+          titulo: f.titulo as string,
+          citable: sinRespaldo === null,
+          motivoBloqueo:
+            sinRespaldo === null
+              ? null
+              : `su respaldo perdió los derechos: la afirmación «${sinRespaldo}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente`,
+        };
+      }),
       hayMas: filas.length > INSIGHTS_PICKER,
     };
   });
@@ -280,7 +322,15 @@ export async function insightsDelWorkspace(
                 select jsonb_agg(jsonb_build_object(
                   'id', c.id, 'evidenciaId', c.evidencia_id,
                   'evidenciaTitulo', e.titulo, 'fragmento', c.fragmento,
-                  'localizacion', c.localizacion) order by c.creado_en)
+                  'localizacion', c.localizacion,
+                  -- Se INVOCA el predicado de la base, no se reproduce: es el mismo que el
+                  -- guard de validación (desde 20260902310000) y el de suficiencia del
+                  -- gate. Una cita nace con derechos vigentes pero los derechos se revocan
+                  -- y caducan, así que «tiene cita» dejó de ser «tiene respaldo».
+                  'usable', evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente'),
+                  'motivoBloqueo',
+                    evidencia_motivo_bloqueo(c.evidencia_id, c.workspace_id, 'cliente'))
+                  order by c.creado_en)
                 from cita c
                 join evidencia e on e.id = c.evidencia_id and e.workspace_id = c.workspace_id
                 where c.afirmacion_id = a.id and c.workspace_id = a.workspace_id

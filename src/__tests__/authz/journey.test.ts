@@ -16,7 +16,7 @@ import {
   journeysDelWorkspace,
   PAGINA_JOURNEYS,
 } from '@/lib/journey/journey.servicio';
-import { describeAuthz } from './helpers';
+import { describeAuthz, enVuelo, sigueEsperando } from './helpers';
 
 /**
  * SPEC-05 — el grafo del journey bajo RLS: los miembros lo leen (es el lenguaje común
@@ -66,6 +66,15 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
       values (${ws}, ${fuente!.id as string}, 'Observación en sucursal', '{}'::jsonb, ${leadId})
       returning id`;
     evidenciaId = ev!.id as string;
+    // Enlazar evidencia a un nodo es respaldo: satisface la validación «paso sin
+    // evidencia» y se congela en un snapshot que va al cliente, así que exige derechos
+    // vigentes para el ámbito cliente (RF-03.10). El caso contrario lo cubre la suite de
+    // evidencia profunda. El insert directo como admin se salta el constraint trigger que
+    // lo exigiría desde la app, por eso hay que ponerlo a mano.
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaId}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${leadId}, now(), ${leadId})`;
   });
 
   afterAll(async () => {
@@ -79,6 +88,7 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     await admin`delete from journey_nodo where workspace_id = ${ws}`;
     await admin`delete from journey where workspace_id = ${ws}`;
     await admin`delete from catalogo_journey where workspace_id = ${ws}`;
+    await admin`delete from derecho_uso where workspace_id = ${ws}`;
     await admin`delete from evidencia where workspace_id = ${ws}`;
     await admin`delete from fuente where workspace_id = ${ws}`;
     await admin`delete from arquetipo where workspace_id = ${ws}`;
@@ -493,6 +503,80 @@ describeAuthz('journey: grafo tipado, snapshots y aislamiento', () => {
     const j2 = await journeyCompleto(leadId, ws, journeyId);
     expect(j2!.snapshots).toHaveLength(2);
     expect(j2!.nodos.find((n) => n.id === pasoId)!.etiqueta).toBe('Abre la app (revisado)');
+  });
+
+  it('congelar re-comprueba los derechos: el trigger de enlace no vuelve a correr (eje TIEMPO)', async () => {
+    // El enlace se creó con derechos válidos y su trigger ya no vuelve a dispararse nunca.
+    // Congelar es OTRO consumidor del mismo enlace —copia cada evidencia y su título dentro
+    // de `journey_snapshot.grafo`, que es inmutable y lo lee todo miembro—, así que tiene
+    // que re-comprobar por su cuenta igual que hace el gate al aprobar (RF-03.10).
+    const admin = sqlAdmin();
+    await admin`update derecho_uso set estado = 'denegado', ambito = 'interno',
+        base = 'El titular retiró el consentimiento'
+      where workspace_id = ${ws} and evidencia_id = ${evidenciaId}`;
+
+    // El enlace sigue ahí —no se borra: podarlo en silencio diría que el paso nunca tuvo
+    // respaldo, y reescribir el mapa del servicio no es cosa del guard.
+    const [enlace] = await admin`select count(*)::int as n from journey_nodo_evidencia
+      where nodo_id = ${pasoId} and evidencia_id = ${evidenciaId}`;
+    expect(enlace!.n as number).toBe(1);
+
+    await expect(congelarSnapshot(leadId, ws, journeyId, 'con derechos revocados')).rejects.toThrow(
+      /derechos/,
+    );
+
+    // Y el grafo que se congela se mira POR SÍ MISMO, no solo los enlaces: un INSERT a mano
+    // con el título de una evidencia revocada dentro del jsonb choca igual aunque no toque
+    // `journey_nodo_evidencia`.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${ws}, ${journeyId}, 'a mano',
+          ${JSON.stringify({
+            nodos: [],
+            aristas: [],
+            evidencias: [
+              { nodoId: pasoId, evidenciaId, evidenciaTitulo: 'Observación en sucursal' },
+            ],
+          })}::jsonb,
+          ${leadId})`),
+    ).rejects.toMatchObject({ code: 'DR001' });
+
+    // Reconcedidos, congela: el bloqueo es sobre el estado vivo, no una marca permanente.
+    await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente',
+        base = 'Consentimiento renovado'
+      where workspace_id = ${ws} and evidencia_id = ${evidenciaId}`;
+    await congelarSnapshot(leadId, ws, journeyId, 'con derechos repuestos');
+    const j = await journeyCompleto(leadId, ws, journeyId);
+    expect(j!.snapshots.map((sn) => sn.motivo)).toContain('con derechos repuestos');
+  });
+
+  it('congelar COMPARTE candado con quien revoca, y decide sobre lo que quedó', async () => {
+    // El guard al congelar tiene la misma forma que el del gate, así que se comprueba —no
+    // se asume— que tiene también su misma garantía: el `for share` sobre `derecho_uso` va
+    // ANTES de las comprobaciones, y todo el recorrido que decide va DEBAJO del candado,
+    // con snapshot nuevo. Por eso al soltarse rechaza en vez de despertar y congelar sobre
+    // un mundo que ya no existe.
+    const admin = sqlAdmin();
+    const revocacion = await enVuelo(async (tx) => {
+      await tx`update derecho_uso set estado = 'denegado', ambito = 'interno',
+          base = 'El titular retiró el consentimiento'
+        where workspace_id = ${ws} and evidencia_id = ${evidenciaId}`;
+    });
+
+    const congelacion = congelarSnapshot(leadId, ws, journeyId, 'con revocación en vuelo');
+    expect(await sigueEsperando(congelacion)).toBe(true);
+
+    await revocacion.cerrar();
+    await expect(congelacion).rejects.toThrow(/derechos/);
+    const [cuantos] = await admin`select count(*)::int as n from journey_snapshot
+      where journey_id = ${journeyId} and motivo = 'con revocación en vuelo'`;
+    expect(cuantos!.n as number).toBe(0);
+
+    // Se reponen para no dejar el fixture en denegado.
+    await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente',
+        base = 'Consentimiento renovado'
+      where workspace_id = ${ws} and evidencia_id = ${evidenciaId}`;
   });
 
   it('las entidades comparten identidad de catálogo entre journeys; renombrarlas renombra en todas partes', async () => {

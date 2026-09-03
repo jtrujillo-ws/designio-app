@@ -478,8 +478,15 @@ export type DesignVersionCompleta = {
   /** El gate del proyecto que ya certificó y por tanto impide aprobar design versions
    * nuevas aquí (6 o 7), o null. El ciclo siguiente de ese servicio va en otro proyecto. */
   proyectoCertificadoPor: number | null;
-  decisionesDelProyecto: { id: string; titulo: string }[];
-  insightsValidados: { id: string; titulo: string }[];
+  /**
+   * Motivos que un elemento puede citar, con su estado de DERECHOS. `sinRespaldo` trae la
+   * primera afirmación no-hipótesis que se quedó sin ninguna cita con derechos vigentes, o
+   * `null` si el razonamiento sigue usable. Desde `20260902320000` G5 no certifica un
+   * diseño motivado por razonamiento bloqueado, así que ofrecerlo sin marcar sería la
+   * pantalla ofreciendo lo que la base rechaza.
+   */
+  decisionesDelProyecto: { id: string; titulo: string; sinRespaldo: string | null }[];
+  insightsValidados: { id: string; titulo: string; sinRespaldo: string | null }[];
   vigente: EstadoEfectivoVigente;
   /** El tablero de conciliación (RF-06.7), en la MISMA lectura que los releases. Fue una
    * segunda consulta y por eso podía contradecirlos: entre las dos, otro lead verificaba

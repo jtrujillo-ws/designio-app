@@ -1212,14 +1212,41 @@ export async function designVersionCompleta(
         -- rechaza elemento_motivo_citable_guard— y ofrecerla era ofrecer un error. El
         -- picker filtra; quien decide es el guard, y al aprobar se vuelve a mirar porque
         -- entre citar y aprobar la decisión puede haberse ido a revisión.
+        -- Los motivos llevan su estado de DERECHOS, y el predicado se INVOCA (no se copia):
+        -- es el mismo que desde 20260902320000 exige G5 para certificar. Un elemento
+        -- motivado por razonamiento cuyo respaldo perdió los derechos deja la design
+        -- version sin poder certificarse, y ofrecerlo aquí como si nada sería la pantalla
+        -- ofreciendo lo que la base rechaza — el defecto que este PR lleva toda la revisión
+        -- cerrando en los otros pickers. Se trae la primera afirmación que falla para
+        -- poder nombrarla: un motivo genérico no dice qué reparar.
         coalesce((
-          select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo) order by d.decidido_en)
+          select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo,
+                   'sinRespaldo', (
+                     select a.texto from decision_insight di
+                       join afirmacion a on a.insight_id = di.insight_id
+                         and a.workspace_id = di.workspace_id
+                       where di.decision_id = d.id and di.workspace_id = d.workspace_id
+                         and not a.es_hipotesis
+                         and not exists (select 1 from cita c
+                           where c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
+                             and evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente'))
+                       order by a.orden limit 1))
+                 order by d.decidido_en)
           from decision d
           where d.proyecto_id = dv.proyecto_id and d.workspace_id = dv.workspace_id
             and d.estado = 'vigente'
         ), '[]'::jsonb) as decisiones_del_proyecto,
         coalesce((
-          select jsonb_agg(jsonb_build_object('id', i.id, 'titulo', i.titulo) order by i.titulo)
+          select jsonb_agg(jsonb_build_object('id', i.id, 'titulo', i.titulo,
+                   'sinRespaldo', (
+                     select a.texto from afirmacion a
+                       where a.insight_id = i.id and a.workspace_id = i.workspace_id
+                         and not a.es_hipotesis
+                         and not exists (select 1 from cita c
+                           where c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
+                             and evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente'))
+                       order by a.orden limit 1))
+                 order by i.titulo)
           from insight i
           where i.workspace_id = dv.workspace_id and i.estado = 'validado'
         ), '[]'::jsonb) as insights_validados,

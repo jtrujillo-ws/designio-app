@@ -80,6 +80,27 @@ export type DecisionDeProyecto = {
   estado: 'vigente' | 'en-revision';
   decididoEn: string;
   insights: { id: string; titulo: string }[];
+  /**
+   * La primera afirmación de un insight enlazado que YA NO tiene ninguna cita con derechos
+   * vigentes para el ámbito cliente, o `null` si toda la cadena se sostiene. Es el estado
+   * VIVO del respaldo, que `estado` no cuenta: `estado` habla de reaperturas (SYS-10) y
+   * una decisión perfectamente `vigente` puede apoyarse en insights cuya evidencia perdió
+   * los derechos. El guard de suficiencia sigue esa cadena al aprobar el gate, así que sin
+   * este campo el picker ofrecía una opción que la base iba a rechazar después — y la
+   * pantalla de gobernanza mostraba la decisión como si nada.
+   */
+  sinRespaldo: { insight: string; afirmacion: string } | null;
+  /**
+   * El título del primer insight enlazado que NO está `validado`, o `null` si todos lo
+   * están. Es una objeción ANTERIOR a la del respaldo: un insight sin validar nunca pasó
+   * por `insight_validar_guard`, así que nadie comprobó que sus afirmaciones no-hipótesis
+   * tuvieran cita, y el guard de aprobación lo rechaza desde `20260902270000`.
+   *
+   * El predicado pregunta lo que el guard EXIGE —`estado = 'validado'`— y no enumera los
+   * estados que hoy fallan: hoy `insight.estado` solo admite `propuesto` y `validado`,
+   * pero un estado nuevo mañana debe deshabilitar por defecto, no colarse.
+   */
+  insightSinValidar: string | null;
 };
 
 /** Los tres estados de gobernanza de un arquetipo (SPEC-04.11). Vive aquí y se importa

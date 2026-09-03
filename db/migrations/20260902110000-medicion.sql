@@ -788,6 +788,9 @@ create policy proyecto_update_estado on proyecto
 --   en-implementacion → en-medicion        · G7 aprobado Y el reto ya midiendo
 --   en-medicion       → cerrado            · el reto con veredicto (RF-07.10)
 --
+-- Y una precondición que vale para TODOS los pares menos el último: el reto no puede haber
+-- terminado. Un reto cerrado o archivado congela a sus proyectos donde estén.
+--
 -- Retomar es DETERMINISTA y tiene UN destino, que sale de dos preguntas en este orden:
 -- dónde está el RETO y, si el reto todavía no mide, si el plan ya estaba aprobado. Un
 -- proyecto pausado antes del plan vuelve a 'activo', uno pausado durante la implementación
@@ -830,6 +833,26 @@ begin
     ('en-medicion', 'cerrado')
   ) then
     raise exception 'transición de proyecto ilegal: % → %', old.estado, new.estado;
+  end if;
+  -- El reto que ya TERMINÓ congela a sus proyectos. El relleno del preámbulo deja a
+  -- propósito quietos los proyectos 'activo' de un reto cerrado —no les inventa una fase
+  -- que nadie vivió—, pero dejarlos quietos solo es una decisión si además QUEDAN quietos:
+  -- mientras el par `activo → en-implementacion` siguiera abierto para ellos, cualquier
+  -- lead podía empujar esa fila a un estado sin salida. Desde 'en-implementacion' solo se
+  -- va a 'pausado' o a 'en-medicion', y medir exige un reto MIDIENDO, cosa que un reto
+  -- cerrado no puede volver a ser porque su ciclo es de sentido único. El proyecto quedaba
+  -- varado para siempre y encima con la historia falsificada: implementándose bajo un reto
+  -- que terminó. Es SYS-08 aplicado al hijo — lo posterior al cierre es un reto NUEVO.
+  --
+  -- La excepción es una sola y es la del propio cierre: `outcome_review_completar_guard`
+  -- escribe el veredicto del reto ANTES de mover el proyecto —tiene que ser en ese orden,
+  -- porque cerrar el proyecto exige ese veredicto—, así que el único paso legítimo que
+  -- llega aquí con el reto ya cerrado es 'en-medicion' → 'cerrado'.
+  if not (old.estado = 'en-medicion' and new.estado = 'cerrado')
+    and exists (select 1 from reto r
+      where r.id = new.reto_id and r.workspace_id = new.workspace_id
+        and r.estado in ('cerrado', 'archivado')) then
+    raise exception 'el reto ya terminó: su proyecto se queda como está y lo posterior es un reto nuevo (SYS-08)';
   end if;
   select exists (select 1 from gate_instancia g
     where g.proyecto_id = new.id and g.workspace_id = new.workspace_id

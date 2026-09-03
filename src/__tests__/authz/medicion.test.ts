@@ -28,13 +28,18 @@ import {
 } from '@/lib/medicion/medicion.servicio';
 import {
   arranqueDelResultado,
+  CamposEntradaSchema,
+  CargarCsvSchema,
   faltaParaCompletar,
   medicionPorAbrir,
   narrativaDelBorrador,
   postMortemPorAbrir,
+  RegistrarSnapshotSchema,
   registryPorAbrir,
+  reparosDelEsquema,
   ResultadoCriterioSchema,
   ventanasCerradas,
+  type CompletarReview,
 } from '@/lib/medicion/medicion.schemas';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
 import { describeAuthz } from './helpers';
@@ -1233,10 +1238,45 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(euro.csvRestante).toContain('1.234,5');
     expect(euro.csvRestante).not.toContain('corte con coma decimal');
 
+    // ── Una nota con salto de línea NO se parte en media fila ──
+    // La hoja de cálculo entrecomilla la celda que contiene un salto, y al exportar el
+    // fichero ese salto viaja DENTRO del campo. Partir por líneas físicas convertía ese
+    // registro en dos: el primer trozo pasaba todas las validaciones —fecha buena, número
+    // bueno— y entraba con la nota cortada a la mitad, y el segundo se rechazaba como fecha
+    // inválida. O sea: un snapshot append-only, imborrable, cuya nota miente sobre por qué
+    // se corrigió el dato, y un mensaje de error que señala una línea que el cliente no
+    // escribió. Este parser no interpreta comillas, así que la salida honesta es la otra:
+    // detectar la comilla sin cerrar y rechazar el REGISTRO ENTERO diciendo qué arreglar.
+    const csvConSalto = [
+      'fecha;valor;nota',
+      `${fecha(-9)};58;"la extracción venía mal`,
+      'y por eso corregimos"',
+      `${fecha(-7)};51;corte normal`,
+    ].join('\n');
+    const multi = await cargarSnapshotsCsv(sponsorId, {
+      workspaceId: ws,
+      entradaId: entradaAbandonoId,
+      csv: csvConSalto,
+    });
+    // El registro roto cuenta UNA vez y por su línea de COMIENZO, que es la que hay que
+    // tocar; el resto del fichero se sigue leyendo con normalidad.
+    expect(multi.rechazadas.map((f) => f.linea)).toEqual([2]);
+    expect(multi.rechazadas[0]!.motivo).toMatch(/salto de línea o una comilla sin cerrar/);
+    expect(multi.insertados).toBe(1);
+    const segMulti = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const serieMulti = segMulti!.entradas.find((e) => e.id === entradaAbandonoId)!.snapshots;
+    // Lo que de verdad se está fijando: NADA del registro roto llegó a la serie.
+    expect(serieMulti.some((s) => s.nota.includes('la extracción venía mal'))).toBe(false);
+    expect(serieMulti.some((s) => s.fecha === fecha(-9))).toBe(false);
+    // Y el reintento se devuelve con el registro ENTERO, salto incluido: reconstruirlo
+    // desde las líneas sueltas volvería a partirlo y el segundo intento fallaría igual.
+    expect(multi.csvRestante).toContain('venía mal\ny por eso corregimos"');
     // Fixture: la serie que leen los tests siguientes es la de arriba, así que estos cortes
     // —que solo existían para fijar el valor y la corrección— se retiran. Solo el admin
     // puede (SYS-23).
-    await admin`delete from snapshot where id in (${conComa.id}, ${correccion.snapshotId})`;
+    const buenoDelSalto = serieMulti.find((s) => s.nota === 'corte normal')!;
+    await admin`delete from snapshot
+      where id in (${conComa.id}, ${correccion.snapshotId}, ${buenoDelSalto.id})`;
   });
 
   it('el ÚLTIMO día de la ventana todavía mide: el review no se abre y el snapshot entra', async () => {
@@ -1481,7 +1521,21 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // pantalla lo dice ANTES en vez de ofrecer el botón y dejar que el lead lo descubra por
     // un error de base — y dice cuál falta.
     const aMedias = await seguimientoDeImpacto(leadId, ws, proyectoId);
-    expect(faltaParaCompletar(aMedias!, 'parcialmente-logrado')).toEqual([
+    // El borrador ENTERO, que es lo que la pantalla envía: preguntar con media entrada solo
+    // deja mirar media superficie de rechazo (ver más abajo).
+    const borradorDe = (cambios: Partial<CompletarReview> = {}): CompletarReview => ({
+      workspaceId: ws,
+      reviewId,
+      veredicto: 'parcialmente-logrado',
+      contribucion: 'El rediseño explica la mejora del abandono; el resto no se le atribuye',
+      factoresExternos: '',
+      hipotesisAbiertas: '',
+      aprendizajes: '',
+      disenoExperimentalSuficiente: false,
+      disenoExperimentalJustificacion: '',
+      ...cambios,
+    });
+    expect(faltaParaCompletar(aMedias!, borradorDe())).toEqual([
       'Reintentos por solicitud: falta registrar su resultado',
     ]);
 
@@ -1509,10 +1563,43 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // guard rechaza con un criterio sin dato final: es la mitigación de la «presión por
     // demostrar éxito» (SYS-24), y la pantalla dice POR QUÉ en vez de dejar que llegue como
     // rechazo después de pulsar.
-    expect(faltaParaCompletar(stake!, 'parcialmente-logrado')).toEqual([]);
-    expect(faltaParaCompletar(stake!, 'logrado')).toEqual([
+    expect(faltaParaCompletar(stake!, borradorDe())).toEqual([]);
+    expect(faltaParaCompletar(stake!, borradorDe({ veredicto: 'logrado' }))).toEqual([
       'Reintentos por solicitud: sin dato final, así que el veredicto no puede ser «logrado»',
     ]);
+
+    // ── Y el espejo cubre las DOS superficies que rechazan la escritura, no solo el guard ──
+    // Marcar «diseño experimental suficiente» sin justificarlo lo rechazan el esquema Zod y
+    // el CHECK de la tabla, pero ninguno de los dos es el guard, así que un espejo que solo
+    // mirase el guard dejaba el botón encendido: el lead dictaba el veredicto, pulsaba y
+    // recibía un error del servidor en la única escritura del sistema que es irreversible
+    // —completar cierra el reto y el proyecto (SYS-08)—. Y no es una condición cualquiera:
+    // es la que separa contribución de causalidad (RF-07.9). Por eso el predicado lee el
+    // ESQUEMA ENTERO en vez de copiarle una condición: lo que el esquema añada mañana
+    // aparece en el botón sin tocar el botón.
+    expect(faltaParaCompletar(stake!, borradorDe({ disenoExperimentalSuficiente: true }))).toEqual([
+      'Declarar diseño experimental suficiente exige justificarlo (SYS-24)',
+    ]);
+    expect(
+      faltaParaCompletar(
+        stake!,
+        borradorDe({
+          disenoExperimentalSuficiente: true,
+          disenoExperimentalJustificacion: 'Corte temporal con grupo de control por cohorte',
+        }),
+      ),
+    ).toEqual([]);
+    // La contribución en blanco también sale del esquema, y también apagaba el botón sin
+    // decir por qué: ahora lo dice con el mensaje del propio esquema.
+    expect(faltaParaCompletar(stake!, borradorDe({ contribucion: '   ' }))).toEqual([
+      'Escribe la contribución del rediseño y lo que no puede atribuírsele',
+    ]);
+    // Y que lo de arriba es un espejo y no una regla nueva: la BASE lo rechaza igual, con su
+    // propio CHECK, aunque se entre por SQL directo.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update outcome_review
+        set diseno_experimental_suficiente = true where id = ${reviewId}`),
+    ).rejects.toThrow(/check constraint/);
 
     // Y el editor del resultado arranca del resultado GUARDADO, no en vacío: guardar es un
     // upsert de las tres columnas, así que un formulario en blanco convertía «cambio el
@@ -1719,20 +1806,24 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // de que se entre por el servicio, y un `update` directo tampoco es invisible.
     expect((await de('EntradaKpiEditada')).some((e) => e.actor_id === null)).toBe(true);
 
-    // La serie: un evento por FILA, del formulario y del CSV. Son TRES del CSV: dos de la
-    // primera tanda y la del fichero europeo, cuya fila retiró el fixture después de fijar
-    // su valor — el rastro no se va con ella, que es el punto de que lo emita la base.
+    // La serie: un evento por FILA, del formulario y del CSV. Son CUATRO del CSV: dos de la
+    // primera tanda, la del fichero europeo y la fila buena del fichero con salto de línea.
+    // Las dos últimas las retiró el fixture después de fijar lo suyo — el rastro no se va
+    // con ellas, que es el punto de que lo emita la base.
     const snaps = await cuerpos('SnapshotRegistrado');
-    expect(snaps.filter((p) => p.origen === 'csv').length).toBe(3);
+    expect(snaps.filter((p) => p.origen === 'csv').length).toBe(4);
     expect(snaps.filter((p) => p.origen === 'formulario').length).toBeGreaterThan(0);
     // …y ADEMÁS el de la tanda, que es la única excepción honesta al «lo emite la base»:
     // cuenta las filas RECHAZADAS, que no llegan a ser filas de ninguna tabla y por tanto
-    // ningún trigger puede verlas. Dos tandas: la primera con sus cinco rechazos y la del
-    // fichero europeo con el suyo, el número agrupado que no se adivina.
+    // ningún trigger puede verlas. Tres tandas —la que no escribió nada no deja rastro de
+    // escritura porque no la hubo—: la primera con sus cinco rechazos, la del fichero
+    // europeo con dos, y la del salto de línea con uno, el registro roto que cuenta UNA vez
+    // aunque ocupara dos renglones.
     const tandas = await cuerpos('SnapshotsCargados');
-    expect(tandas.length).toBe(2);
+    expect(tandas.length).toBe(3);
     expect(tandas[0]!.rechazadas).toBe(5);
     expect(tandas[1]!.rechazadas).toBe(2);
+    expect(tandas[2]!.rechazadas).toBe(1);
 
     // El post-mortem: apertura del review y resultado por criterio.
     expect((await cuerpos('OutcomeReviewAbierto')).some((p) => p.reviewId === reviewId)).toBe(true);
@@ -3006,18 +3097,31 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       .catch((e: unknown) => {
         if (!String(e).includes('deshacer el relleno de prueba')) throw e;
       });
-    // Y por qué importa, recorrido hasta el final: movido a implementación por la migración,
-    // ese proyecto quedaría con la historia falsificada —trabajo implementándose bajo un
-    // reto que terminó— y VARADO para siempre, porque desde ahí no hay salida ninguna.
-    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+    // Y por qué importa, recorrido hasta el final: movido a implementación, ese proyecto
+    // quedaría con la historia falsificada —trabajo implementándose bajo un reto que
+    // terminó— y VARADO para siempre, porque desde 'en-implementacion' solo se sale a
+    // 'pausado' o a 'en-medicion', y medir exige un reto MIDIENDO, cosa que un reto cerrado
+    // no vuelve a ser. Por eso no basta con que el relleno no lo mueva: dejarlo quieto solo
+    // es una decisión si además QUEDA quieto, y quien lo sostiene es la base. El reto que
+    // terminó congela a sus proyectos donde estén.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+        where id = ${dId}`),
+    ).rejects.toThrow(/el reto ya terminó/);
+    // Y no es que se cierre esa puerta y queden las otras: NINGÚN par sale de ahí. El
+    // proyecto se queda exactamente como la migración lo encontró.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado' where id = ${dId}`),
+    ).rejects.toThrow(/el reto ya terminó/);
+    const [quieto] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
       where id = ${dId}`);
-    await expect(
-      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'cerrado' where id = ${dId}`),
-    ).rejects.toThrow(/transición de proyecto ilegal: en-implementacion → cerrado/);
-    await expect(
-      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion' where id = ${dId}`),
-    ).rejects.toThrow(/pasa a medición con su reto/);
-
+    expect(quieto!.estado).toBe('activo');
+    // La única excepción es el cierre que hace el propio outcome review, y ya se ejerció
+    // arriba: los dos frentes de este reto cerraron con él —el guard escribe el veredicto
+    // ANTES de mover el proyecto, así que ese paso llega siempre con el reto ya cerrado—.
+    // Si la excepción no existiera, ese cierre habría fallado y `cerrados` no sería
+    // ['cerrado', 'cerrado'].
+    expect(cerrados.map((p) => p.estado as string)).toEqual(['cerrado', 'cerrado']);
   });
 
   it('una cuenta desactivada con sesión viva no lee el seguimiento ni carga snapshots', async () => {
@@ -3046,5 +3150,76 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     } finally {
       await admin`update usuario set estado = 'activo' where id = ${sponsorId}`;
     }
+  });
+  it('el botón lee el ESQUEMA del payload que va a enviar, no una lista copiada a mano', () => {
+    // El barrido de la ronda anterior fue por COMPORTAMIENTO pero solo de una superficie:
+    // la base. Una escritura tiene dos, y la otra es el esquema Zod que valida el payload
+    // antes de salir. Cuatro de los controles de esta pantalla tenían condiciones de
+    // esquema que su botón no miraba, y todas producen el mismo defecto: se ofrece, se
+    // pulsa, y lo que llega es un error del servidor donde debía haber un aviso.
+    //
+    // El arreglo NO es añadir cuatro condiciones a mano —eso es exactamente lo que se queda
+    // atrás la próxima vez que el esquema cambie— sino leer el esquema con el MISMO objeto
+    // que se envía. Estos casos son esos cuatro payloads, con la forma exacta que la
+    // pantalla construye, y lo que fijan es que el reparo salga ANTES de escribir.
+    const uuid = '00000000-0000-4000-8000-000000000001';
+
+    // 1) KPI del registry: el enlace tiene que ser una URL y la línea base un número. El
+    //    botón solo miraba nombre y criterio.
+    const kpi = {
+      workspaceId: ws,
+      nombre: 'Abandono %',
+      definicion: '',
+      fuente: '',
+      dimensiones: '',
+      propietarioMiembroId: null,
+      frecuencia: 'semanal' as const,
+      dashboardUrl: '',
+      lineaBaseValor: null,
+      lineaBaseFecha: null,
+      ventanaInicio: null,
+      fechaPostMortem: null,
+    };
+    expect(reparosDelEsquema(CamposEntradaSchema, kpi)).toEqual([]);
+    expect(reparosDelEsquema(CamposEntradaSchema, { ...kpi, dashboardUrl: 'panel interno' }))
+      .toEqual(['Enlace de dashboard inválido']);
+    expect(reparosDelEsquema(CamposEntradaSchema, { ...kpi, lineaBaseValor: '62%' }))
+      .toEqual(['Valor numérico (usa punto decimal)']);
+    expect(reparosDelEsquema(CamposEntradaSchema, { ...kpi, nombre: '  ' }))
+      .toEqual(['El nombre del KPI es obligatorio']);
+
+    // 2) Snapshot del formulario: el valor tiene FORMA, y «cuarenta» pasaba el
+    //    `!== ''` del botón para que lo rechazara la columna numérica.
+    const snap = { workspaceId: ws, entradaId: uuid, valor: '49', fecha: '2026-08-01', nota: '' };
+    expect(reparosDelEsquema(RegistrarSnapshotSchema, snap)).toEqual([]);
+    expect(reparosDelEsquema(RegistrarSnapshotSchema, { ...snap, valor: 'cuarenta' }))
+      .toEqual(['Valor numérico (usa punto decimal)']);
+    expect(reparosDelEsquema(RegistrarSnapshotSchema, { ...snap, valor: '55,2' }))
+      .toEqual(['Valor numérico (usa punto decimal)']);
+    expect(reparosDelEsquema(RegistrarSnapshotSchema, { ...snap, nota: 'x'.repeat(501) }).length)
+      .toBe(1);
+
+    // 3) Pegado de CSV: hay un máximo, y pegar una hoja entera se dejaba pulsar.
+    const pegado = { workspaceId: ws, entradaId: uuid, csv: 'fecha,valor\n2026-08-01,55' };
+    expect(reparosDelEsquema(CargarCsvSchema, pegado)).toEqual([]);
+    expect(reparosDelEsquema(CargarCsvSchema, { ...pegado, csv: 'x'.repeat(100_001) }))
+      .toEqual(['Máximo 100k caracteres']);
+
+    // 4) Resultado del criterio: EXACTAMENTE una de las dos. El botón miraba la mitad
+    //    «ninguna» y dejaba pasar la mitad «las dos», que es la que se contradice.
+    const res = {
+      workspaceId: ws,
+      reviewId: uuid,
+      criterioId: uuid,
+      snapshotFinalId: uuid,
+      lectura: 'de 62 a 49',
+      sinDatosMotivo: '',
+    };
+    expect(reparosDelEsquema(ResultadoCriterioSchema, res)).toEqual([]);
+    expect(reparosDelEsquema(ResultadoCriterioSchema, { ...res, sinDatosMotivo: 'sin serie' }))
+      .toEqual(['Elige el snapshot final o escribe por qué no hay dato, pero no las dos cosas']);
+    expect(
+      reparosDelEsquema(ResultadoCriterioSchema, { ...res, snapshotFinalId: null, lectura: '' }),
+    ).toEqual(['Elige el snapshot final o escribe por qué no hay dato, pero no las dos cosas']);
   });
 });

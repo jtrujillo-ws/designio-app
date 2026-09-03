@@ -20,16 +20,21 @@ import {
   guardarResultadoDeCriterio,
 } from '@/lib/medicion/medicion.functions';
 import {
+  CamposEntradaSchema,
+  CargarCsvSchema,
   ETIQUETA_ESTADO_SNAPSHOT,
   ETIQUETA_FRECUENCIA,
   ETIQUETA_VEREDICTO,
   etiquetaVentana,
   FRECUENCIAS,
+  RegistrarSnapshotSchema,
+  ResultadoCriterioSchema,
   arranqueDelResultado,
   faltaParaCompletar,
   medicionPorAbrir,
   narrativaDelBorrador,
   registryPorAbrir,
+  reparosDelEsquema,
   VEREDICTOS,
   ventanaAbierta,
   postMortemPorAbrir,
@@ -471,6 +476,10 @@ function FormularioEntrada({
     (k: 'lineaBaseValor' | 'lineaBaseFecha' | 'ventanaInicio' | 'fechaPostMortem') =>
     (v: string) =>
       setDatos((d) => ({ ...d, [k]: v === '' ? null : v }));
+  // El botón lo decide el ESQUEMA sobre lo que se va a enviar, no una lista de condiciones
+  // copiada a mano: el enlace del dashboard tiene que ser una URL y la línea base un
+  // número, y las dos se dejaban pulsar para que el rechazo llegara del servidor.
+  const reparos = reparosDelEsquema(CamposEntradaSchema, datos);
 
   return (
     <div
@@ -596,10 +605,15 @@ function FormularioEntrada({
         maxLength={2000}
         onChange={(e) => texto('dashboardUrl')(e.target.value)}
       />
+      {reparos.length > 0 && (
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+          {reparos.join(' · ')}
+        </span>
+      )}
       <div style={{ display: 'flex', gap: 8 }}>
         <Button
           size="sm"
-          disabled={ocupado || datos.nombre.trim() === '' || datos.criterioId === ''}
+          disabled={ocupado || reparos.length > 0 || datos.criterioId === ''}
           onClick={() => void onEnviar(datos)}
         >
           Guardar
@@ -637,14 +651,20 @@ function BloqueSerie({
   // La política acepta al curador o al PROPIETARIO del dato, y solo mientras el reto mide.
   const puedeCargar =
     (esCurador || entrada.soyPropietario) && seguimiento.retoEstado === 'en-medicion';
+  // Un payload por escritura, armado una vez y leído por los dos: el espejo que decide si
+  // el botón se ofrece y el envío. El valor métrico tiene FORMA —el schema y la columna
+  // exigen un decimal con punto— y el botón solo miraba que no estuviera vacío: «cuarenta»
+  // se dejaba pulsar para que el rechazo llegara del servidor.
+  const snapshot = { workspaceId, entradaId: entrada.id, valor, fecha, nota };
+  const reparosSnapshot = reparosDelEsquema(RegistrarSnapshotSchema, snapshot);
+  const pegado = { workspaceId, entradaId: entrada.id, csv };
+  const reparosCsv = reparosDelEsquema(CargarCsvSchema, pegado);
 
   async function enviarFormulario() {
     setOcupado(true);
     onError(null);
     try {
-      const r = await cargarSnapshotDeFormulario({
-        data: { workspaceId, entradaId: entrada.id, valor, fecha, nota },
-      });
+      const r = await cargarSnapshotDeFormulario({ data: snapshot });
       if (r.ok) {
         setValor('');
         setFecha('');
@@ -663,7 +683,7 @@ function BloqueSerie({
     onError(null);
     setRechazadas([]);
     try {
-      const r = await cargarSnapshotsPegados({ data: { workspaceId, entradaId: entrada.id, csv } });
+      const r = await cargarSnapshotsPegados({ data: pegado });
       if (r.ok) {
         setRechazadas(r.rechazadas);
         // En el textarea queda SOLO lo que hay que reintentar (cabecera incluida, para que
@@ -745,7 +765,7 @@ function BloqueSerie({
           />
           <Button
             size="sm"
-            disabled={ocupado || valor.trim() === '' || fecha === ''}
+            disabled={ocupado || reparosSnapshot.length > 0}
             onClick={() => void enviarFormulario()}
           >
             Registrar
@@ -754,6 +774,15 @@ function BloqueSerie({
             {pegando ? 'Cerrar CSV' : 'Pegar CSV'}
           </Button>
         </div>
+      )}
+      {/* Y se dice POR QUÉ no se puede registrar, en cuanto hay algo escrito: con el botón
+          apagado y sin motivo, «no puedo guardar» es tan opaco como el error del servidor
+          que esto evita. En blanco no se dice nada — un formulario que riñe antes de que
+          nadie escriba es ruido. */}
+      {puedeCargar && reparosSnapshot.length > 0 && (valor !== '' || fecha !== '' || nota !== '') && (
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+          {reparosSnapshot.join(' · ')}
+        </span>
       )}
       {puedeCargar && pegando && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -764,7 +793,11 @@ function BloqueSerie({
             onChange={(e) => setCsv(e.target.value)}
           />
           <div>
-            <Button size="sm" disabled={ocupado || csv.trim() === ''} onClick={() => void enviarCsv()}>
+            <Button
+              size="sm"
+              disabled={ocupado || csv.trim() === '' || reparosCsv.length > 0}
+              onClick={() => void enviarCsv()}
+            >
               Cargar filas válidas
             </Button>
           </div>
@@ -843,10 +876,26 @@ function BloqueReview({
   const [aprendizajes, setAprendizajes] = useState('');
   const [experimental, setExperimental] = useState(false);
   const [justificacion, setJustificacion] = useState('');
-  // Qué le falta al post mortem para poder completarse, con el veredicto elegido delante:
-  // el guard del cierre lo rechaza mientras algún criterio no tenga resultado, y también un
-  // «logrado» con criterios sin dato final.
-  const falta = faltaParaCompletar(seguimiento, veredicto);
+  // El BORRADOR se arma UNA vez y lo leen los dos: el espejo que decide si el botón se
+  // ofrece y el envío que lo manda. Con dos objetos distintos —uno para preguntar y otro
+  // para escribir— la pregunta se responde sobre algo que no es lo que se envía, que es
+  // como el «diseño experimental suficiente» sin justificar llegaba a pulsarse.
+  const borrador = {
+    workspaceId,
+    reviewId: review?.id ?? '',
+    veredicto,
+    contribucion,
+    factoresExternos: factores,
+    hipotesisAbiertas: hipotesis,
+    aprendizajes,
+    disenoExperimentalSuficiente: experimental,
+    disenoExperimentalJustificacion: justificacion,
+  };
+  // Qué le falta al post mortem para poder completarse: lo que le reprocha el ESQUEMA
+  // —contribución escrita, justificación si se declara diseño experimental— y lo que le
+  // reprocharía el guard del cierre —todo criterio con su resultado, y un «logrado» sin
+  // criterios sin dato final—. Las dos superficies que pueden rechazar la escritura.
+  const falta = faltaParaCompletar(seguimiento, borrador);
 
   // El formulario se HIDRATA del borrador guardado, y no es comodidad: completar escribe
   // las cinco columnas de la narrativa a la vez, así que arrancando en vacío bastaba abrir
@@ -889,19 +938,7 @@ function BloqueReview({
     setOcupado(true);
     onError(null);
     try {
-      const r = await completarReviewDelReto({
-        data: {
-          workspaceId,
-          reviewId: review.id,
-          veredicto,
-          contribucion,
-          factoresExternos: factores,
-          hipotesisAbiertas: hipotesis,
-          aprendizajes,
-          disenoExperimentalSuficiente: experimental,
-          disenoExperimentalJustificacion: justificacion,
-        },
-      });
+      const r = await completarReviewDelReto({ data: borrador });
       if (r.ok) await onCambio();
       else onError(r.error);
     } catch {
@@ -1070,11 +1107,12 @@ function BloqueReview({
                     </option>
                   ))}
                 </Select>
-                {/* El guard del cierre rechaza la completación mientras falte el resultado
-                    de algún criterio, y también un veredicto «logrado» con criterios sin
-                    dato final. Ofrecer el botón y dejar que lo diga la base es hacer que el
-                    lead descubra lo que falta por un error; el predicado es el mismo y vive
-                    con sus hermanos en `medicion.schemas`. */}
+                {/* Lo que falta se DICE, no se deja descubrir por un error: el resultado
+                    de algún criterio, un «logrado» con criterios sin dato final, la
+                    contribución en blanco o el diseño experimental declarado sin
+                    justificar. Las dos superficies que rechazan la escritura —el esquema y
+                    el guard del cierre— salen de un solo predicado, que vive con sus
+                    hermanos en `medicion.schemas` porque es donde los tests lo alcanzan. */}
                 {falta.length > 0 && (
                   <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
                     Falta para poder completarlo: {falta.join(' · ')}
@@ -1083,7 +1121,7 @@ function BloqueReview({
                 <div>
                   <Button
                     size="sm"
-                    disabled={ocupado || contribucion.trim() === '' || falta.length > 0}
+                    disabled={ocupado || falta.length > 0}
                     onClick={() => void completar()}
                   >
                     Completar y cerrar el reto
@@ -1203,20 +1241,24 @@ function CamposDelResultado({
     .filter((e) => e.criterioId === criterioId)
     .flatMap((e) => e.snapshots.map((s) => ({ ...s, kpi: e.nombre })));
 
+  // Mismo objeto para preguntar y para escribir. El esquema exige EXACTAMENTE una de las
+  // dos —snapshot final o motivo de la falta de datos—, y el botón solo miraba la mitad
+  // «ninguna de las dos»: con las dos puestas se dejaba pulsar.
+  const resultado = {
+    workspaceId,
+    reviewId,
+    criterioId,
+    snapshotFinalId: snapshotId === '' ? null : snapshotId,
+    lectura,
+    sinDatosMotivo: motivo,
+  };
+  const reparos = reparosDelEsquema(ResultadoCriterioSchema, resultado);
+
   async function guardar() {
     setOcupado(true);
     onError(null);
     try {
-      const r = await guardarResultadoDeCriterio({
-        data: {
-          workspaceId,
-          reviewId,
-          criterioId,
-          snapshotFinalId: snapshotId === '' ? null : snapshotId,
-          lectura,
-          sinDatosMotivo: motivo,
-        },
-      });
+      const r = await guardarResultadoDeCriterio({ data: resultado });
       if (r.ok) {
         // Y NO se vacían los campos al guardar: la fila existe ahora con esos valores, así
         // que dejarlos en blanco haría que el siguiente guardado del mismo criterio —el
@@ -1264,10 +1306,15 @@ function CamposDelResultado({
         placeholder="Lectura del criterio: base vs. final y qué se puede sostener con la serie"
         onChange={(e) => setLectura(e.target.value)}
       />
+      {reparos.length > 0 && (
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+          {reparos.join(' · ')}
+        </span>
+      )}
       <div>
         <Button
           size="sm"
-          disabled={ocupado || criterioId === '' || (snapshotId === '' && motivo.trim() === '')}
+          disabled={ocupado || criterioId === '' || reparos.length > 0}
           onClick={() => void guardar()}
         >
           Guardar resultado

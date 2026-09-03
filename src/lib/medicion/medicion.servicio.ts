@@ -497,7 +497,7 @@ export async function cargarSnapshotsCsv(
   actorId: string,
   entrada: CargarCsv,
 ): Promise<{ insertados: number; rechazadas: FilaRechazada[]; csvRestante: string }> {
-  const { validas, rechazadas, cabecera } = parsearCsv(entrada.csv);
+  const { validas, rechazadas, cabecera, textoDeRegistro } = parsearCsv(entrada.csv);
   /** El texto que queda por reintentar: la cabecera —si la había— y las filas rechazadas,
    * en su orden original. Se construye AQUÍ y no en la pantalla porque las reglas del
    * parseo viven aquí: el delimitador sale del primer renglón con contenido y la cabecera
@@ -505,12 +505,11 @@ export async function cargarSnapshotsCsv(
    * reintento — otra corrupción distinta en lugar de la que se está evitando. */
   const restante = (rechazadas: FilaRechazada[]): string => {
     if (rechazadas.length === 0) return '';
-    const lineas = entrada.csv.split(/\r?\n/);
     const quedan = new Set(rechazadas.map((f) => f.linea));
     if (cabecera !== null) quedan.add(cabecera);
     return [...quedan]
       .sort((a, b) => a - b)
-      .map((n) => lineas[n - 1] ?? '')
+      .map((n) => textoDeRegistro.get(n) ?? '')
       .join('\n');
   };
   return conUsuario(actorId, async (tx) => {
@@ -639,6 +638,45 @@ function delimitadorCsv(primera: string): string {
   return DELIMITADORES_CSV.find((d) => primera.includes(d)) ?? ',';
 }
 
+/**
+ * Un REGISTRO del pegado: una fila lógica, que no siempre es una línea física. Un campo
+ * entrecomillado puede llevar saltos de línea dentro —una hoja de cálculo los exporta así
+ * cuando la celda tiene varias líneas—, y partir a ciegas por `\n` rompía ese registro por
+ * la mitad: la primera mitad entraba como snapshot con media nota y la segunda volvía como
+ * fila inválida. Media fila insertada es la misma mentira silenciosa que el decimal y la
+ * nota recortada, y aquí la peor de todas: la nota original ya no está entera en ningún
+ * sitio y la serie es append-only, así que el fragmento no se puede sacar.
+ *
+ * Se agrupan las líneas físicas por BALANCE de comillas: mientras haya una comilla sin
+ * cerrar, la línea siguiente pertenece al mismo registro. `linea` es la del COMIENZO, que
+ * es la que hay que decirle a quien tiene que arreglarlo.
+ */
+function registrosCsv(lineas: string[]): { linea: number; texto: string }[] {
+  const registros: { linea: number; texto: string }[] = [];
+  let abierto: { linea: number; partes: string[] } | null = null;
+  // El balance es ACUMULADO, no de la línea suelta: la que cierra la comilla también tiene
+  // una cantidad impar, así que mirar solo su paridad dejaba el registro abierto y se
+  // tragaba la fila siguiente —buena— dentro del rechazo.
+  let dentroDeComillas = false;
+  for (let i = 0; i < lineas.length; i++) {
+    const fisica = lineas[i] ?? '';
+    if (abierto === null) {
+      abierto = { linea: i + 1, partes: [fisica] };
+    } else {
+      abierto.partes.push(fisica);
+    }
+    // `""` es una comilla escapada y cuenta dos: el estado solo cambia con una impar.
+    if ((fisica.match(/"/g) ?? []).length % 2 === 1) dentroDeComillas = !dentroDeComillas;
+    if (dentroDeComillas) continue;
+    registros.push({ linea: abierto.linea, texto: abierto.partes.join('\n') });
+    abierto = null;
+  }
+  if (abierto !== null) {
+    registros.push({ linea: abierto.linea, texto: abierto.partes.join('\n') });
+  }
+  return registros;
+}
+
 /** Parseo puro del CSV pegado (sin base): separa filas válidas de rechazadas con motivo.
  * Las válidas conservan su línea y su contenido porque la ventana firmada todavía puede
  * rechazarlas, y ese rechazo también tiene que decir QUÉ línea fue. */
@@ -649,12 +687,18 @@ export function parsearCsv(csv: string): {
    * el texto que queda por reintentar: sin ella, el recorte se comería el renglón que
    * decide el delimitador y el reintento se parsearía de otra forma. */
   cabecera: number | null;
+  /** Texto ORIGINAL de cada registro, por su línea de comienzo. Un registro puede ocupar
+   * varias líneas físicas, así que reconstruir el reintento a partir de las líneas sueltas
+   * volvería a partirlo. */
+  textoDeRegistro: Map<number, string>;
 } {
   const validas: FilaCsv[] = [];
   const rechazadas: FilaRechazada[] = [];
   let cabecera: number | null = null;
   const lineas = csv.split(/\r?\n/);
   const delim = delimitadorCsv(lineas.find((l) => l.trim() !== '')?.trim() ?? '');
+  const registros = registrosCsv(lineas);
+  const textoDeRegistro = new Map(registros.map((r) => [r.linea, r.texto]));
   // Con el delimitador fijado, la coma solo puede ser una cosa. Si NO es el delimitador es
   // el decimal, y se normaliza a punto antes de validar: el objetivo del producto es que el
   // cliente pueda subir lo que su hoja de cálculo produce, y aceptar el `;` sin aceptar la
@@ -664,10 +708,24 @@ export function parsearCsv(csv: string): {
   // La cabecera se salta en la primera línea CON CONTENIDO, no en el índice 0: un fichero
   // que empieza con una línea en blanco tenía su cabecera rechazada como fecha inválida.
   let cabeceraPosible = true;
-  for (let i = 0; i < lineas.length; i++) {
-    const cruda = lineas[i] ?? '';
-    const linea = cruda.trim();
+  for (const registro of registros) {
+    const i = registro.linea - 1;
+    const linea = registro.texto.trim();
     if (linea === '') continue;
+    // Un registro de VARIAS líneas físicas viene de un campo entrecomillado con saltos
+    // dentro (o de una comilla sin pareja, que es lo mismo visto desde el error). Este
+    // parser no interpreta comillas —y meterle medio intérprete es exactamente como
+    // nacieron los tres defectos anteriores de este parseo—, así que se rechaza ENTERO y
+    // no entra ningún fragmento. El motivo dice qué hacer.
+    if (registro.texto.includes('\n') || (registro.texto.match(/"/g) ?? []).length % 2 === 1) {
+      rechazadas.push({
+        linea: registro.linea,
+        contenido: linea.slice(0, 120),
+        motivo:
+          'La nota tiene un salto de línea o una comilla sin cerrar: quítalos y deja cada dato en una sola línea',
+      });
+      continue;
+    }
     const partes = linea.split(delim);
     const fecha = (partes[0] ?? '').trim();
     // Cabecera de hoja de cálculo: se salta sin contarla como rechazo.
@@ -746,7 +804,7 @@ export function parsearCsv(csv: string): {
       nota,
     });
   }
-  return { validas, rechazadas, cabecera };
+  return { validas, rechazadas, cabecera, textoDeRegistro };
 }
 
 /** Abrir el outcome review (RF-07.7): la política solo lo permite con la ventana del

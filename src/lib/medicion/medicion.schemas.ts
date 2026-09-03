@@ -122,7 +122,7 @@ export const SeguimientoInputSchema = z.object({
 
 /** Campos de la entrada KPI (RF-07.1). Se aceptan INCOMPLETOS mientras el registry es
  * borrador: la completitud la exige la firma (SYS-22), igual que G0 con los criterios. */
-const CamposEntradaSchema = z.object({
+export const CamposEntradaSchema = z.object({
   workspaceId: z.string().uuid(),
   nombre: z.string().trim().min(1, 'El nombre del KPI es obligatorio').max(200),
   definicion: z.string().trim().max(2000).default(''),
@@ -367,42 +367,56 @@ export function ventanasCerradas(entradas: EntradaDeRegistry[]): boolean {
 }
 
 /**
- * Espejo cliente EXACTO de lo que `review_insert` acepta: informa la pantalla, no autoriza
- * nada. Son DOS condiciones y no una —el reto MIDIENDO y las ventanas del contrato ya
- * cerradas— y vive aquí, junto a su hermano `medicionPorAbrir`, por el mismo motivo: un
- * predicado de pantalla escrito a mano dentro del componente es el que se queda a medias.
- * Escrito solo como «las ventanas vencieron», el botón se dibujaba para un reto que aún no
- * ha abierto su medición y la política lo rechazaba en cada clic. Media condición es un
- * botón que miente, igual que media salida no es una salida.
+ * Lo que el ESQUEMA le reprocha a lo que hay escrito ahora mismo, con sus propios mensajes.
+ *
+ * Una escritura se puede rechazar por dos sitios y hasta aquí los espejos de pantalla solo
+ * miraban uno: el guard de la base. El otro es el esquema Zod que valida el payload antes
+ * de llegar a la base, y sus condiciones —el enlace que tiene que ser una URL, la línea
+ * base que tiene que ser un número, la justificación que exige el diseño experimental
+ * declarado, el «una cosa o la otra, no las dos» del resultado— no estaban en ningún botón.
+ * Cada una es la misma avería de siempre: el botón se ofrece, el lead pulsa y descubre por
+ * un error lo que la pantalla ya sabía.
+ *
+ * Y no se arregla escribiendo a mano un espejo por condición —eso es exactamente lo que se
+ * queda atrás en cuanto el esquema cambia—, sino LEYENDO EL ESQUEMA: se le da el mismo
+ * payload que se va a enviar y se pregunta qué le falla. Una fuente, dos lectores. Lo que
+ * el esquema añada mañana aparece en el botón sin tocar el botón.
  */
-/**
- * Con qué valores arranca el formulario de completar el post mortem: los del BORRADOR
- * guardado, no vacíos. No es comodidad — completar escribe las cinco columnas de la
- * narrativa a la vez, así que un formulario que arranca en blanco convierte «abro la
- * pantalla y elijo veredicto» en «borro la contribución, los factores, las hipótesis y los
- * aprendizajes que alguien ya había redactado», y el review completado es INMUTABLE: lo que
- * se pierde ahí no vuelve. Vive aquí y no dentro del componente por el mismo motivo que sus
- * hermanos `medicionPorAbrir` y `postMortemPorAbrir`: lo que la pantalla decide a mano es
- * lo que ningún test alcanza.
- */
+export function reparosDelEsquema(esquema: z.ZodTypeAny, valores: unknown): string[] {
+  const r = esquema.safeParse(valores);
+  if (r.success) return [];
+  // Sin duplicados y en orden: varias reglas del mismo campo pueden decir lo mismo.
+  return [...new Set(r.error.issues.map((i) => i.message))];
+}
+
 /**
  * Qué le falta al post mortem para poder completarse, con el criterio nombrado. Espejo de
- * `outcome_review_completar_guard`, que rechaza la completación mientras algún criterio del
- * reto no tenga su `resultado_criterio` y cuando el veredicto es «logrado» habiendo
- * resultados sin dato final. Sin esto, el botón se ofrecía en cuanto había contribución
- * escrita y el lead descubría lo que faltaba por un error de base.
+ * las DOS superficies que pueden rechazar la completación:
+ *
+ *  · el esquema `CompletarReviewSchema` —contribución escrita, y justificación si se
+ *    declara el diseño experimental suficiente (RF-07.9)—, que se lee entero en vez de
+ *    copiarse condición a condición;
+ *  · `outcome_review_completar_guard`, que rechaza mientras algún criterio del reto no
+ *    tenga su `resultado_criterio` y cuando el veredicto es «logrado» habiendo resultados
+ *    sin dato final.
+ *
+ * Se le pasa el BORRADOR ENTERO y no solo el veredicto justamente por eso: con media
+ * entrada solo se puede mirar media superficie, y el hueco que dejaba —marcar «diseño
+ * experimental suficiente» sin justificarlo— dejaba el botón encendido para que el rechazo
+ * llegara del servidor.
  *
  * Los criterios salen de las entradas del registry: firmar exige que TODO criterio del reto
  * tenga al menos un KPI que lo responda, así que a esta altura son el mismo conjunto.
  */
 export function faltaParaCompletar(
   seguimiento: { entradas: EntradaDeRegistry[]; review: OutcomeReviewDeReto | null },
-  veredicto: VeredictoSlug,
+  borrador: CompletarReview,
 ): string[] {
   const review = seguimiento.review;
   if (review === null) return [];
+  const veredicto = borrador.veredicto;
   const conResultado = new Set(review.resultados.map((r) => r.criterioId));
-  const faltan: string[] = [];
+  const faltan: string[] = reparosDelEsquema(CompletarReviewSchema, borrador);
   const vistos = new Set<string>();
   for (const e of seguimiento.entradas) {
     if (vistos.has(e.criterioId)) continue;
@@ -462,6 +476,16 @@ export function registryPorAbrir(seguimiento: {
   );
 }
 
+/**
+ * Con qué valores arranca el formulario de completar el post mortem: los del BORRADOR
+ * guardado, no vacíos. No es comodidad — completar escribe las cinco columnas de la
+ * narrativa a la vez, así que un formulario que arranca en blanco convierte «abro la
+ * pantalla y elijo veredicto» en «borro la contribución, los factores, las hipótesis y los
+ * aprendizajes que alguien ya había redactado», y el review completado es INMUTABLE: lo que
+ * se pierde ahí no vuelve. Vive aquí y no dentro del componente por el mismo motivo que sus
+ * hermanos `medicionPorAbrir` y `postMortemPorAbrir`: lo que la pantalla decide a mano es
+ * lo que ningún test alcanza.
+ */
 export function narrativaDelBorrador(review: OutcomeReviewDeReto | null): {
   veredicto: VeredictoSlug | null;
   contribucion: string;
@@ -482,6 +506,15 @@ export function narrativaDelBorrador(review: OutcomeReviewDeReto | null): {
   };
 }
 
+/**
+ * Espejo cliente EXACTO de lo que `review_insert` acepta: informa la pantalla, no autoriza
+ * nada. Son DOS condiciones y no una —el reto MIDIENDO y las ventanas del contrato ya
+ * cerradas— y vive aquí, junto a su hermano `medicionPorAbrir`, por el mismo motivo: un
+ * predicado de pantalla escrito a mano dentro del componente es el que se queda a medias.
+ * Escrito solo como «las ventanas vencieron», el botón se dibujaba para un reto que aún no
+ * ha abierto su medición y la política lo rechazaba en cada clic. Media condición es un
+ * botón que miente, igual que media salida no es una salida.
+ */
 export function postMortemPorAbrir(seguimiento: {
   retoEstado: string;
   entradas: EntradaDeRegistry[];

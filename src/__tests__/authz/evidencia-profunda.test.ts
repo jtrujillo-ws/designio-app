@@ -2034,7 +2034,8 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     // Lucía — que nunca los concedió. En un producto cuya tesis es que conceder el uso es
     // un acto propio, con su base documental y su responsable, un seed que firma
     // consentimiento en nombre de alguien es la contradicción más grande posible.
-    // Ahora la procedencia se acredita por RELACIONES desde `proyecto.codigo = 'P-01'`.
+    // Ahora la procedencia no se deduce de la base: se lee del registro que el propio
+    // seed dejó al crear la cadena, y solo se concede a los ids que ese registro nombra.
     const admin = sqlAdmin();
     const [wsDemo] = await admin`select id from workspace where nombre = 'Banco Andino'`;
     // No vacuo: sin base sembrada este test no probaría nada.
@@ -2093,6 +2094,157 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       await admin`delete from derecho_uso where evidencia_id in (${idSinFila}, ${idPendiente})`;
       await admin`delete from evidencia where id in (${idSinFila}, ${idPendiente})`;
       await admin`delete from fuente where id = ${fu!.id as string}`;
+    }
+  });
+
+  it('el seed no adopta lo que no sembró: sin registro de procedencia declina y lo deja dicho', async () => {
+    // Acreditar la procedencia por RELACIONES arreglaba el emparejamiento por título, pero
+    // seguía siendo una inferencia sobre la FORMA de la base. El caso que la rompe: la
+    // idempotencia de `sembrarCadena` es «¿hay algún insight en el workspace?», y un
+    // insight lo crea también un usuario. En esa base la cadena de demo NO existe, el
+    // camino desde P-01 llega a la evidencia del usuario, devuelve exactamente una — y el
+    // seed le firmaba derechos de ámbito CLIENTE en nombre de Lucía. La salida correcta no
+    // es afinar la inferencia: es no adoptar nada que no conste que sembró él.
+    //
+    // Aquí se reproduce quitando el registro de procedencia y devolviendo los derechos de
+    // la cadena a 'pendiente', que es justo el estado que la reparación tocaría. Con el
+    // código anterior el camino devuelve una evidencia por rama y las concede; con este,
+    // no concede ninguna aunque acertaría, porque acertar por casualidad no es acreditar.
+    const admin = sqlAdmin();
+    const [wsDemo] = await admin`select id from workspace where nombre = 'Banco Andino'`;
+    // No vacuo: sin base sembrada este test no probaría nada.
+    expect(wsDemo).toBeTruthy();
+    const wsDemoId = wsDemo!.id as string;
+    const [lucia] = await admin`select id from usuario where email = 'lucia@whitespace.demo'`;
+    const luciaId = lucia!.id as string;
+
+    // El estado real de los derechos de la cadena, para restaurarlo intacto al final.
+    const previos = await admin`select d.id, d.evidencia_id, d.estado, d.ambito, d.base,
+        d.decidido_por, d.decidido_en, d.vence_en
+      from derecho_uso d
+      join evidencia e on e.id = d.evidencia_id
+      join fuente f on f.id = e.fuente_id
+      where e.workspace_id = ${wsDemoId} and f.titulo = 'Estudio CX apertura de cuenta 2026'
+      order by d.evidencia_id`;
+    expect(previos.length).toBe(2);
+    const marcas = await admin`select id, payload, actor_id, actor_rol, creado_en
+      from evento_dominio
+      where workspace_id = ${wsDemoId} and tipo = 'CadenaDemoSembrada'`;
+    // El registro tiene que EXISTIR en una base recién sembrada: si no, el resto del test
+    // pasaría por la razón equivocada (declinar por una base que nunca lo tuvo).
+    expect(marcas.length).toBeGreaterThan(0);
+
+    // Y una evidencia que NO es de la cadena, colgada del arquetipo de demo: es lo que el
+    // recorrido alcanza y lo que el aviso tiene que nombrar sin concederle nada.
+    const [fu] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${wsDemoId}, 'documento', ${marca + ' material propio del usuario'}, ${luciaId})
+      returning id`;
+    const [ajena] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${wsDemoId}, ${fu!.id as string}, ${marca + ' evidencia del usuario'},
+        '{}'::jsonb, ${luciaId})
+      returning id`;
+    const ajenaId = ajena!.id as string;
+    await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+      values (${wsDemoId}, ${ajenaId}, ${luciaId})`;
+    // Restaurar el registro es idempotente: borra los que haya y repone los capturados,
+    // así da igual en qué punto se llame.
+    const restaurarMarcas = async (): Promise<void> => {
+      await admin`delete from evento_dominio
+        where workspace_id = ${wsDemoId} and tipo = 'CadenaDemoSembrada'`;
+      for (const m of marcas) {
+        await admin`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+          values (${wsDemoId}, 'CadenaDemoSembrada',
+            ${admin.json(m.payload as Record<string, string>)},
+            ${m.actor_id as string | null}, ${m.actor_rol as string | null})`;
+      }
+    };
+    const [arq] = await admin`select id from arquetipo
+      where workspace_id = ${wsDemoId} and nombre = 'Independiente sin firma digital'`;
+    await admin`insert into arquetipo_evidencia (arquetipo_id, evidencia_id, workspace_id)
+      values (${arq!.id as string}, ${ajenaId}, ${wsDemoId})`;
+
+    try {
+      await admin`delete from evento_dominio
+        where workspace_id = ${wsDemoId}
+          and tipo in ('CadenaDemoSembrada', 'DerechosDeCadenaSinRepararPorProcedencia')`;
+      await admin`update derecho_uso set estado = 'pendiente', ambito = 'interno', base = '',
+          decidido_por = null, decidido_en = null, vence_en = null
+        where id = any(${previos.map((f) => f.id as string)}::uuid[])`;
+
+      // El seed COMPLETO, como se re-ejecuta en un despliegue.
+      const r = spawnSync('bun', ['db/seed.ts'], { encoding: 'utf8', env: process.env });
+      expect(r.status).toBe(0);
+
+      // Nada concedido: ni la evidencia del usuario ni —y esto es lo que separa este
+      // arreglo del anterior— la propia cadena, que el recorrido acertaría a nombrar.
+      const despues = await admin`select d.evidencia_id, d.estado, d.ambito, d.base,
+          d.decidido_por
+        from derecho_uso d
+        where d.evidencia_id = any(${[...previos.map((f) => f.evidencia_id as string), ajenaId]}::uuid[])`;
+      expect(despues.length).toBe(3);
+      expect(despues.every((f) => f.estado === 'pendiente')).toBe(true);
+      expect(despues.every((f) => f.ambito === 'interno')).toBe(true);
+      expect(despues.every((f) => f.decidido_por === null && f.base === '')).toBe(true);
+
+      // Y no en silencio: un aviso que nombra lo que habría tocado y el papel de cada uno,
+      // para que un operador lo conceda a mano si procede. Sin base documental sugerida:
+      // la base la escribe quien concede, no el seed.
+      const avisos = await admin`select payload from evento_dominio
+        where workspace_id = ${wsDemoId} and tipo = 'DerechosDeCadenaSinRepararPorProcedencia'`;
+      expect(avisos.length).toBe(1);
+      const nombradas = (avisos[0]!.payload as { evidencias: { evidenciaId: string; papel: string }[] })
+        .evidencias;
+      expect(new Set(nombradas.map((e) => e.evidenciaId))).toEqual(
+        new Set([...previos.map((f) => f.evidencia_id as string), ajenaId]),
+      );
+      expect(nombradas.some((e) => e.papel === 'citada')).toBe(true);
+      expect(nombradas.some((e) => e.papel === 'arquetipo')).toBe(true);
+      expect(JSON.stringify(avisos[0]!.payload)).not.toContain('Cláusula 7');
+
+      // Re-sembrar no llena la auditoría: el aviso es idempotente por contenido.
+      const r2 = spawnSync('bun', ['db/seed.ts'], { encoding: 'utf8', env: process.env });
+      expect(r2.status).toBe(0);
+      const [repetidos] = await admin`select count(*)::int as n from evento_dominio
+        where workspace_id = ${wsDemoId} and tipo = 'DerechosDeCadenaSinRepararPorProcedencia'`;
+      expect(repetidos!.n as number).toBe(1);
+
+      // Y con el registro de vuelta, la reparación SÍ concede — exactamente las dos de la
+      // cadena, por id, y sin tocar la del usuario. El test no pasa por haber roto el seed.
+      await restaurarMarcas();
+      const r3 = spawnSync('bun', ['db/seed.ts'], { encoding: 'utf8', env: process.env });
+      expect(r3.status).toBe(0);
+      const final = await admin`select d.evidencia_id, d.estado, d.ambito, d.decidido_por
+        from derecho_uso d
+        where d.evidencia_id = any(${[...previos.map((f) => f.evidencia_id as string), ajenaId]}::uuid[])`;
+      const porEvidencia = new Map(final.map((f) => [f.evidencia_id as string, f]));
+      for (const f of previos) {
+        const fila = porEvidencia.get(f.evidencia_id as string)!;
+        expect(fila.estado).toBe('concedido');
+        expect(fila.ambito).toBe('cliente');
+        expect(fila.decidido_por).toBe(luciaId);
+      }
+      expect(porEvidencia.get(ajenaId)!.estado).toBe('pendiente');
+      expect(porEvidencia.get(ajenaId)!.decidido_por).toBe(null);
+    } finally {
+      // El registro se restaura AQUÍ y no en el camino feliz: si una aserción se cae antes
+      // de tiempo, la base no puede quedarse sin él — sería este test dejándole el suelo
+      // quitado a la siguiente corrida del seed, que es justo el defecto que otra parte de
+      // este PR arregló en otra suite.
+      await restaurarMarcas();
+      await admin`delete from arquetipo_evidencia where evidencia_id = ${ajenaId}`;
+      await admin`delete from derecho_uso where evidencia_id = ${ajenaId}`;
+      await admin`delete from evidencia where id = ${ajenaId}`;
+      await admin`delete from fuente where id = ${fu!.id as string}`;
+      await admin`delete from evento_dominio where workspace_id = ${wsDemoId}
+        and tipo = 'DerechosDeCadenaSinRepararPorProcedencia'`;
+      for (const f of previos) {
+        await admin`update derecho_uso set estado = ${f.estado as string},
+            ambito = ${f.ambito as string}, base = ${f.base as string},
+            decidido_por = ${f.decidido_por as string | null},
+            decidido_en = ${f.decidido_en as Date | null}, vence_en = ${f.vence_en as Date | null}
+          where id = ${f.id as string}`;
+      }
     }
   });
 

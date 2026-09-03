@@ -316,6 +316,7 @@ async function concederDerechosDeCadena(
  */
 const MARCA_CADENA_SEMBRADA = 'CadenaDemoSembrada';
 const AVISO_CADENA_SIN_PROCEDENCIA = 'DerechosDeCadenaSinRepararPorProcedencia';
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Deja constancia de la reparación que NO se hizo, nombrando lo que habría tocado.
@@ -428,10 +429,16 @@ async function repararDerechosDeCadena(
     evidenciaCitadaId?: unknown;
     evidenciaArquetipoId?: unknown;
   };
+  // La forma de uuid se comprueba ANTES de consultar: el payload es texto que escribe quien
+  // puede escribir eventos, y un `id in ('no-soy-uuid')` no devuelve cero filas, revienta la
+  // sentencia y con ella el seed entero. Fallar cerrado aquí significa declinar, no caerse.
   const declarados = [
     { evidenciaId: registro.evidenciaCitadaId, base: BASE_DERECHO_CITADA },
     { evidenciaId: registro.evidenciaArquetipoId, base: BASE_DERECHO_ARQUETIPO },
-  ].filter((f): f is { evidenciaId: string; base: string } => typeof f.evidenciaId === 'string');
+  ].filter(
+    (f): f is { evidenciaId: string; base: string } =>
+      typeof f.evidenciaId === 'string' && UUID.test(f.evidenciaId),
+  );
   if (declarados.length === 0) {
     await declinarReparacionDeCadena(tx, wsId);
     return;

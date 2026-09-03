@@ -255,6 +255,47 @@ create table constatacion (
 create index constatacion_es_idx on constatacion (workspace_id, effective_state_id);
 create index constatacion_elemento_idx on constatacion (workspace_id, elemento_id);
 
+-- ¿De qué design versions responde ESTE proyecto ante sus gates? La pregunta del gate y la
+-- pregunta de la supersión son distintas, y durante un tiempo las contestó el mismo filtro:
+--
+--   · el GATE pregunta por el trabajo DEL PROYECTO — qué declaró cambiar y qué hizo con
+--     ello. Es lo que G6 firma (plan) y lo que G7 concilia.
+--   · `estado = 'aprobada'` contesta otra cosa: cuál es la versión que gobierna EL SERVICIO
+--     ahora mismo (SYS-05, y por eso el índice único parcial es por servicio).
+--
+-- Confundirlas dejaba al proyecto A INCERTIFICABLE en cuanto otro proyecto B superaba su
+-- versión —flujo soportado, porque `supera_a` está restringido por servicio y no por
+-- proyecto—: DV-A salía de los chequeos de A, G6 decía que A no tiene plan y G7 que no
+-- tiene tablero, aunque el trabajo de A estuviera entero. Y abrir una tercera versión no
+-- arreglaba nada: solo trasladaba el bloqueo al proyecto siguiente. Que alguien supere
+-- DV-A no deshace el plan de A ni sus constataciones; solo deja de ser la que manda.
+--
+-- Lo que SÍ saca a una versión del conjunto es que EL PROPIO PROYECTO la haya reemplazado:
+-- si A aprobó DV-1 y después DV-2, los elementos de DV-1 que nadie planificó son decisiones
+-- que A mismo sustituyó, y exigirles release o constatación ataría sus gates a un ciclo que
+-- el proyecto cerró a conciencia. Esa es la distinción que faltaba: no «superada», sino
+-- «superada POR MÍ».
+--
+-- Lo que dejó EN VUELO una versión superada —por quien sea— es harina de otro costal y lo
+-- sigue mirando G7 aparte: un release desplegado sin constatar cambia el estado del
+-- servicio aunque la decisión que lo motivó ya esté reemplazada.
+create function design_versions_a_cargo_del_proyecto(p_proyecto uuid, p_workspace uuid)
+returns setof uuid language sql stable as $$
+  select dv.id
+  from design_version dv
+  where dv.proyecto_id = p_proyecto and dv.workspace_id = p_workspace
+    and dv.estado <> 'borrador'
+    and not exists (
+      select 1 from design_version suc
+      where suc.supera_a = dv.id and suc.workspace_id = dv.workspace_id
+        and suc.proyecto_id = p_proyecto and suc.estado <> 'borrador')
+$$;
+revoke execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) from public;
+-- Las políticas de `release` y `release_elemento` la evalúan como el rol de la app, así que
+-- necesita el grant. No es SECURITY DEFINER: leer design_version desde ella pasa por la
+-- política de siempre, la misma que esas políticas ya atravesaban con su propio `exists`.
+grant execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) to designio_app;
+
 -- ══ RLS ══
 -- Lectura: todo miembro. La cadena evidencia→resultado es lo que el cliente audita; un
 -- effective state que el sponsor no puede leer no demuestra nada.
@@ -440,8 +481,20 @@ create policy elemento_insight_delete on elemento_insight
         and dv.estado = 'borrador')
   );
 
--- SYS-06 en la política de alta: un release solo cuelga de una design version APROBADA.
--- Nace planificado y sin fecha real (las filas nacen en su estado inicial).
+-- SYS-06 en la política de alta: un release solo cuelga de una design version que su
+-- proyecto todavía tiene que cerrar. Nace planificado y sin fecha real (las filas nacen en
+-- su estado inicial).
+--
+-- «Que su proyecto todavía tiene que cerrar» y no «aprobada» a secas, y la diferencia no es
+-- un matiz: si el proyecto B supera la versión de A antes de que A firme su G6, la versión
+-- de A sigue en la responsabilidad de A —lo dice design_versions_a_cargo_del_proyecto, y de
+-- eso depende que A pueda certificar— pero pasa a 'superada'. Con el filtro anterior, A no
+-- podía planificar el release del elemento que le faltaba ni asignarlo, así que su G6 se
+-- volvía inalcanzable: la regla que le devolvía el trabajo le quitaba la forma de cerrarlo.
+--
+-- Lo que se sigue prohibiendo es lo que la regla vino a prohibir: colgar trabajo nuevo de
+-- una versión que EL PROPIO PROYECTO reemplazó. Eso sí es un ciclo cerrado a conciencia, y
+-- ahí un release sin resolver bloquearía G7 sin que nadie lo hubiera pedido.
 create policy release_insert on release
   for insert with check (
     workspace_role(app_user_id(), workspace_id) = 'lead-boutique'
@@ -451,7 +504,8 @@ create policy release_insert on release
     and exists (select 1 from design_version dv
       where dv.id = release.design_version_id
         and dv.workspace_id = release.workspace_id
-        and dv.estado = 'aprobada')
+        and dv.id in (
+          select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id)))
   );
 create policy release_desplegar on release
   for update
@@ -472,12 +526,17 @@ create policy release_verificar on release
 -- El alcance de un release se declara mientras está PLANIFICADO. Una vez desplegado,
 -- mover elementos dentro o fuera reescribiría qué se implementó.
 --
--- AÑADIR alcance exige además que la design version padre siga APROBADA. Sin eso, una
--- pantalla cargada antes de la supersión seguía pudiendo meter trabajo nuevo en una
--- versión ya reemplazada: la política solo miraba el release, y el release no cambia de
--- estado cuando su versión es superada. Desde el arreglo de G7 eso no es inocuo — un
--- release sin resolver de una versión superada BLOQUEA la certificación del proyecto—,
--- así que la puerta se cierra donde se abre.
+-- AÑADIR alcance exige además que la design version padre siga siendo de las que su
+-- proyecto tiene que cerrar. Sin eso, una pantalla cargada antes de la supersión seguía
+-- pudiendo meter trabajo nuevo en una versión ya reemplazada: la política solo miraba el
+-- release, y el release no cambia de estado cuando su versión es superada. Desde el arreglo
+-- de G7 eso no es inocuo — un release sin resolver de una versión superada BLOQUEA la
+-- certificación del proyecto—, así que la puerta se cierra donde se abre.
+--
+-- «Reemplazada» significa aquí reemplazada POR SU PROPIO PROYECTO (mismo conjunto que usan
+-- G6, G7 y el guard de cobertura). Si la superó otro proyecto, la versión sigue contando
+-- para los gates de éste y por tanto tiene que poder terminar su plan: negarle el alcance
+-- dejaba su G6 inalcanzable, que es cerrar la puerta y quedarse la llave.
 --
 -- QUITAR alcance no lo exige, y la asimetría es deliberada: es exactamente la salida que
 -- G7 deja al lead para cerrar lo que la versión superada dejó en vuelo («esto ya no va a
@@ -493,7 +552,8 @@ create policy release_elemento_insert on release_elemento
       where r.id = release_elemento.release_id
         and r.workspace_id = release_elemento.workspace_id
         and r.estado = 'planificado'
-        and dv.estado = 'aprobada')
+        and dv.id in (
+          select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id)))
   );
 create policy release_elemento_delete on release_elemento
   for delete using (
@@ -664,43 +724,6 @@ revoke execute on function gate_certificado_del_proyecto(uuid, uuid) from public
 -- costó una ronda con el vigilante de la cobertura. No es SECURITY DEFINER, así que leer
 -- gate_instancia desde el rol de la app pasa por su política de siempre.
 grant execute on function gate_certificado_del_proyecto(uuid, uuid) to designio_app;
-
--- ¿De qué design versions responde ESTE proyecto ante sus gates? La pregunta del gate y la
--- pregunta de la supersión son distintas, y durante un tiempo las contestó el mismo filtro:
---
---   · el GATE pregunta por el trabajo DEL PROYECTO — qué declaró cambiar y qué hizo con
---     ello. Es lo que G6 firma (plan) y lo que G7 concilia.
---   · `estado = 'aprobada'` contesta otra cosa: cuál es la versión que gobierna EL SERVICIO
---     ahora mismo (SYS-05, y por eso el índice único parcial es por servicio).
---
--- Confundirlas dejaba al proyecto A INCERTIFICABLE en cuanto otro proyecto B superaba su
--- versión —flujo soportado, porque `supera_a` está restringido por servicio y no por
--- proyecto—: DV-A salía de los chequeos de A, G6 decía que A no tiene plan y G7 que no
--- tiene tablero, aunque el trabajo de A estuviera entero. Y abrir una tercera versión no
--- arreglaba nada: solo trasladaba el bloqueo al proyecto siguiente. Que alguien supere
--- DV-A no deshace el plan de A ni sus constataciones; solo deja de ser la que manda.
---
--- Lo que SÍ saca a una versión del conjunto es que EL PROPIO PROYECTO la haya reemplazado:
--- si A aprobó DV-1 y después DV-2, los elementos de DV-1 que nadie planificó son decisiones
--- que A mismo sustituyó, y exigirles release o constatación ataría sus gates a un ciclo que
--- el proyecto cerró a conciencia. Esa es la distinción que faltaba: no «superada», sino
--- «superada POR MÍ».
---
--- Lo que dejó EN VUELO una versión superada —por quien sea— es harina de otro costal y lo
--- sigue mirando G7 aparte: un release desplegado sin constatar cambia el estado del
--- servicio aunque la decisión que lo motivó ya esté reemplazada.
-create function design_versions_a_cargo_del_proyecto(p_proyecto uuid, p_workspace uuid)
-returns setof uuid language sql stable as $$
-  select dv.id
-  from design_version dv
-  where dv.proyecto_id = p_proyecto and dv.workspace_id = p_workspace
-    and dv.estado <> 'borrador'
-    and not exists (
-      select 1 from design_version suc
-      where suc.supera_a = dv.id and suc.workspace_id = dv.workspace_id
-        and suc.proyecto_id = p_proyecto and suc.estado <> 'borrador')
-$$;
-revoke execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) from public;
 
 -- El proyecto que produce la design version y el servicio que cambia tienen que
 -- pertenecer al mismo reto. Ninguna FK lo dice: design_version referencia proyecto y
@@ -1025,6 +1048,46 @@ begin
         and s.xmin = pg_current_xact_id()::xid
     ) then
       raise exception 'aprobar congela el to-be de AHORA: el snapshot debe tomarse en la misma transición (RF-06.3)';
+    end if;
+    -- Y el CONTENIDO del snapshot lo escribe la BASE, no el llamante. `xmin` contesta
+    -- «¿es de ahora?»; esto contesta «¿es de verdad?», y son dos preguntas distintas: la
+    -- política de `journey_snapshot` solo comprueba rol y autor, así que por SQL directo un
+    -- lead podía insertar en esta misma transacción un grafo INVENTADO —etiquetas
+    -- cambiadas, aristas o evidencias omitidas— y pasaba la frescura sin problema. Bastaba
+    -- con incluir los ids de los nodos enlazados para pasar también la comprobación de
+    -- abajo. La versión quedaba inmutable certificando un grafo que nunca existió, que es
+    -- exactamente lo que RF-06.3 promete que no pasa.
+    --
+    -- Comparar el payload con el grafo vivo sería la respuesta débil: cara, y ella misma
+    -- una lectura sobre algo que puede cambiar. Construirlo aquí lo vuelve inatacable por
+    -- construcción — no hay payload que fabricar si el llamante no lo aporta—, y es el
+    -- idiom de la casa: el efecto lo produce el guard que decide, para que el SQL crudo lo
+    -- produzca igual. Del llamante solo llega la FILA (journey, motivo, autor).
+    --
+    -- MISMO orden total que `congelarSnapshot` (SPEC-05): el orden de los nodos se reinicia
+    -- por tipo y por fase, así que ordenar solo por él deja empates y el array sale distinto
+    -- en cada congelación. Importa el doble porque son dos caminos que producen el MISMO
+    -- registro: si discreparan, dos snapshots del mismo grafo se compararían como si el
+    -- grafo hubiera cambiado.
+    update journey_snapshot s
+    set grafo = jsonb_build_object(
+      'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.tipo, n.orden, n.id)
+        from journey_nodo n
+        where n.journey_id = new.journey_id and n.workspace_id = new.workspace_id), '[]'::jsonb),
+      'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en, a.id)
+        from journey_arista a
+        where a.journey_id = new.journey_id and a.workspace_id = new.workspace_id), '[]'::jsonb),
+      'evidencias', coalesce((select jsonb_agg(jsonb_build_object(
+          'nodoId', ne.nodo_id, 'evidenciaId', ne.evidencia_id, 'evidenciaTitulo', e.titulo)
+          order by ne.creado_en, ne.nodo_id, ne.evidencia_id)
+        from journey_nodo_evidencia ne
+        join journey_nodo n2 on n2.id = ne.nodo_id and n2.workspace_id = ne.workspace_id
+        join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
+        where n2.journey_id = new.journey_id and ne.workspace_id = new.workspace_id), '[]'::jsonb))
+    where s.id = new.snapshot_id and s.workspace_id = new.workspace_id
+      and s.journey_id = new.journey_id;
+    if not found then
+      raise exception 'el snapshot que se congela no es del journey de esta design version';
     end if;
     -- Y que el snapshot que se congela pueda RESPONDER por cada nodo enlazado. Sin FK en
     -- `elemento_cambio.nodo_id`, entre que un borrador enlaza un nodo y alguien aprueba,

@@ -584,35 +584,17 @@ export async function aprobarDesignVersion(
         }
       }
 
-      // Snapshot del grafo to-be: nodos, aristas y la evidencia enlazada. Sin la
-      // evidencia, el snapshot no podría decir qué sostenía cada paso cuando se aprobó,
-      // que es justo lo que se le pedirá al auditarlo (RF-05.8).
+      // La FILA del snapshot: journey, motivo y autor. El CONTENIDO —el grafo— lo escribe
+      // `design_version_transicion_guard` al aprobar, y no es un reparto arbitrario: la
+      // política de `journey_snapshot` solo comprueba rol y autor, así que un payload que
+      // viniera del llamante podía estar inventado y la frescura por `xmin` no lo notaba.
+      // Construirlo en la base lo vuelve inatacable por construcción y deja una sola
+      // definición de qué es «el grafo congelado» — aquí no se puede quedar vieja.
       const [snap] = await tx`
         insert into journey_snapshot (workspace_id, journey_id, motivo, grafo, congelado_por)
         select ${entrada.workspaceId}, j.id,
           coalesce(nullif(${entrada.motivo}, ''), 'Aprobación de ' || ${dv.codigo as string}),
-          jsonb_build_object(
-            -- MISMO orden total que congelarSnapshot (SPEC-05): el orden se reinicia por
-            -- tipo y por fase, así que ordenar solo por él deja empates y el array sale
-            -- distinto en cada congelación. Aquí importa el doble, porque son dos caminos
-            -- que producen el MISMO registro: si discreparan, dos snapshots del mismo
-            -- grafo se compararían como si el grafo hubiera cambiado.
-            'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.tipo, n.orden, n.id)
-              from journey_nodo n
-              where n.journey_id = j.id and n.workspace_id = j.workspace_id), '[]'::jsonb),
-            'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en, a.id)
-              from journey_arista a
-              where a.journey_id = j.id and a.workspace_id = j.workspace_id), '[]'::jsonb),
-            'evidencias', coalesce((select jsonb_agg(jsonb_build_object(
-                'nodoId', ne.nodo_id, 'evidenciaId', ne.evidencia_id,
-                'evidenciaTitulo', e.titulo)
-                order by ne.creado_en, ne.nodo_id, ne.evidencia_id)
-              from journey_nodo_evidencia ne
-              join journey_nodo n2 on n2.id = ne.nodo_id and n2.workspace_id = ne.workspace_id
-              join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
-              where n2.journey_id = j.id and ne.workspace_id = j.workspace_id), '[]'::jsonb)
-          ),
-          ${actorId}
+          '{}'::jsonb, ${actorId}
         from journey j
         where j.id = ${dv.journey_id as string} and j.workspace_id = ${entrada.workspaceId}
         returning id`;

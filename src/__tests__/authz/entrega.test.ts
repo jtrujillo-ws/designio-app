@@ -3496,6 +3496,168 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(superada!.superadaPor!.id).toBe(siguienteCiclo.designVersionId);
   });
 
+  it('el proyecto puede terminar el plan de la versión que sigue siendo suya', async () => {
+    // El conjunto de responsabilidad y el permiso de actuar tienen que coincidir. Si otro
+    // proyecto supera la versión de A ANTES de que A firme su G6, esa versión sigue dentro
+    // del conjunto que responde A —a propósito, o A no podría certificar nunca— pero pasa a
+    // 'superada'; con el filtro de «aprobada» en las políticas del release y del alcance, A
+    // quedaba obligado a cubrir un elemento que tenía prohibido planificar. Callejón.
+    const admin = sqlAdmin();
+    const proyA = await proyectoConGates('P-107', 'Proyecto al que le quitan el ciclo a medias');
+    const [pb] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-108', 'Proyecto que adelanta el ciclo', ${leadId}) returning id`;
+    const proyB = pb!.id as string;
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del plan a medio hacer');
+
+    const dvA = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyA,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La de A, con el plan a medias',
+      resumen: '',
+      superaA: null,
+    });
+    const elPlanificado = await elementoSuelto(dvA.designVersionId, 'Lo que A ya había planificado');
+    const elSinPlan = await elementoSuelto(dvA.designVersionId, 'Lo que A no llegó a planificar');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.designVersionId,
+      motivo: '',
+    });
+    const rlPrimero = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.designVersionId,
+      titulo: 'Lo que A alcanzó a planificar',
+      responsable: 'Equipo de A',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elPlanificado, razon: '' }],
+    });
+
+    // B se adelanta y supera la versión de A antes de que A firme nada.
+    const dvB = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyB,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La de B',
+      resumen: '',
+      superaA: dvA.designVersionId,
+    });
+    await elementoSuelto(dvB.designVersionId, 'Lo que B trae');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dvB.designVersionId,
+      motivo: '',
+    });
+
+    // A sigue pudiendo cerrar SU plan: asignar al release que ya tenía y planificar uno
+    // nuevo. Las dos cosas estaban prohibidas y las dos son las que su G6 le exige.
+    await asignarElemento(leadId, {
+      workspaceId: ws,
+      releaseId: rlPrimero.releaseId,
+      elementoId: elSinPlan,
+      razon: 'se cierra con el primero',
+    });
+    const rlSegundo = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.designVersionId,
+      titulo: 'El que A abre para cerrar',
+      responsable: 'Equipo de A',
+      fechaObjetivo: HOY,
+      elementos: [],
+    });
+    expect(rlSegundo.releaseId).toBeTruthy();
+
+    // Y con el plan completo, G6 firma. Antes era inalcanzable.
+    await aprobarGatesHasta(proyA, 6);
+    const [g6] = await admin`select estado from gate_instancia
+      where proyecto_id = ${proyA} and workspace_id = ${ws} and numero = 6`;
+    expect(g6!.estado).toBe('aprobado');
+
+    // El contraste que mantiene la regla original en pie: sobre una versión que el PROPIO
+    // proyecto reemplazó, añadir alcance sigue prohibido — eso sí es un ciclo cerrado a
+    // conciencia. Lo fija el test de «planificar y ampliar el alcance esperan a la
+    // supersión», que supera dentro del mismo proyecto.
+  });
+
+  it('el contenido del snapshot lo escribe la base: un grafo inventado no se congela', async () => {
+    // `xmin` contesta «¿es de ahora?»; esto contesta «¿es de verdad?». La política de
+    // journey_snapshot solo comprueba rol y autor, así que por SQL directo un lead podía
+    // insertar en la misma transacción un grafo INVENTADO y aprobarlo: la frescura la
+    // pasaba, y con incluir el id del nodo enlazado pasaba también la revalidación de
+    // nodos, mientras omitía aristas y falseaba etiquetas. La versión quedaba inmutable
+    // certificando un grafo que nunca existió.
+    const admin = sqlAdmin();
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del grafo inventado');
+    const [n1] = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, creado_por)
+      values (${ws}, ${journeyId}, 'paso', 'La etiqueta de verdad', ${leadId}) returning id`;
+    const [n2] = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, creado_por)
+      values (${ws}, ${journeyId}, 'paso', 'El segundo paso', ${leadId}) returning id`;
+    await admin`insert into journey_arista
+      (workspace_id, journey_id, origen_id, destino_id, tipo, creado_por)
+      values (${ws}, ${journeyId}, ${n1!.id as string}, ${n2!.id as string}, 'transicion',
+              ${leadId})`;
+
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoAbierto,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que se aprueba con SQL crudo',
+      resumen: '',
+      superaA: null,
+    });
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      tipo: 'paso',
+      operacion: 'modifica',
+      titulo: 'Toca el primer paso',
+      detalle: '',
+      nodoId: n1!.id as string,
+      decisionIds: [],
+      insightIds: [],
+    });
+
+    // EL ATAQUE, entero y en una sola transacción: snapshot fabricado —el id del nodo
+    // enlazado está, para pasar la revalidación, pero la etiqueta es otra, el segundo nodo
+    // no está y la arista tampoco— y aprobación apuntando a él.
+    const inventado = {
+      nodos: [{ id: n1!.id as string, etiqueta: 'La etiqueta que nunca existió' }],
+      aristas: [],
+      evidencias: [],
+    };
+    await conUsuario(leadId, async (tx) => {
+      const [snap] = await tx`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${ws}, ${journeyId}, 'con el grafo inventado', ${tx.json(inventado)}, ${leadId})
+        returning id`;
+      await tx`update design_version
+        set estado = 'aprobada', aprobada_por = ${leadId}, snapshot_id = ${snap!.id as string}
+        where id = ${dv.designVersionId} and workspace_id = ${ws}`;
+    });
+
+    // La aprobación vale —el grafo es real y la transición es legítima—, pero lo congelado
+    // es lo que había, no lo que el llamante trajo.
+    const completa = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(completa!.estado).toBe('aprobada');
+    const [snapshot] = await admin`select grafo from journey_snapshot
+      where id = ${completa!.snapshotId!} and workspace_id = ${ws}`;
+    const grafo = snapshot!.grafo as {
+      nodos: { id: string; etiqueta: string }[];
+      aristas: unknown[];
+      evidencias: unknown[];
+    };
+    expect(grafo.nodos.map((n) => n.etiqueta).sort()).toEqual([
+      'El segundo paso',
+      'La etiqueta de verdad',
+    ]);
+    expect(grafo.aristas).toHaveLength(1);
+  });
+
   it('nada de esto cruza el workspace', async () => {
     const admin = sqlAdmin();
     const [otro] = await admin`insert into workspace (nombre) values (${marca + '-ajeno'})

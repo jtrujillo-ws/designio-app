@@ -2458,6 +2458,45 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
 
     await aprobarGateNumero(7, actVieja.proyectoId);
 
+    // ── El perdón histórico CADUCA con el motivo que lo justificaba ──
+    // Hasta esta línea el proyecto heredado podía retomarse a 'en-implementacion' aunque su
+    // reto ya midiera, y eso era correcto: le faltaba recorrer el método, así que exigirle
+    // entrar en medición al retomarlo habría cerrado la única salida que tenía. Con su G7
+    // aprobado y el registry firmado esa razón ya no existe —'pausado' → 'en-medicion' es
+    // un par legal y disponible— y la exención deja de perdonar nada: solo abriría la vía
+    // de dejarlo VARADO detrás de un reto que mide, que es justo lo que el perdón existía
+    // para evitar. Y como la marca no se borra nunca, atada solo a ella habría valido para
+    // siempre. La transacción entera se revierte con el rechazo, así que el proyecto se
+    // queda donde estaba.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        await tx`update proyecto set estado = 'pausado' where id = ${actVieja.proyectoId}`;
+        await tx`update proyecto set estado = 'en-implementacion'
+          where id = ${actVieja.proyectoId}`;
+      }),
+    ).rejects.toThrow(/no por detrás/);
+    const [siguePuesto] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where id = ${actVieja.proyectoId}`);
+    expect(siguePuesto!.estado).toBe('en-implementacion');
+
+    // Y la mitad SIMÉTRICA del invariante, que es la que hacía falta cerrar a la vez: el
+    // constraint diferido aplicaba la MISMA exención, así que cerrarla solo en el guard de
+    // transición habría dejado a las dos mitades diciendo cosas distintas — la puerta de la
+    // reanudación cerrada y la del alta abierta para la misma fila. Con el guard de
+    // transición apagado a propósito, el rechazo tiene que seguir llegando al COMMIT.
+    await admin`alter table proyecto disable trigger proyecto_estado_transicion`;
+    try {
+      await expect(
+        conUsuario(leadId, async (tx) => {
+          await tx`update proyecto set estado = 'pausado' where id = ${actVieja.proyectoId}`;
+          await tx`update proyecto set estado = 'en-implementacion'
+            where id = ${actVieja.proyectoId}`;
+        }),
+      ).rejects.toThrow(/no puede quedarse sin abrir/);
+    } finally {
+      await admin`alter table proyecto enable trigger proyecto_estado_transicion`;
+    }
+
     // La reparación tiene que estar OFRECIDA, no solo existir. La pantalla decide con el
     // espejo del cliente, y escrito como «el reto está activo» a secas no se dibujaba
     // nunca para el ÚNICO caso que necesita esta operación: el reto heredado ya mide, así
@@ -2487,6 +2526,15 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // dictar un veredicto de verdad en vez de quedarse sin salida.
     const review = await abrirOutcomeReview(leadId, { workspaceId: ws, retoId: viejo.retoId });
     expect(review.reviewId).toBeTruthy();
+    // Y la marca deja de excusar la operación en cuanto no queda nada que reparar, TODAVÍA
+    // CON ella puesta: sin esta condición la rama del perdón seguía abierta para siempre
+    // —nadie borra la marca— y la segunda llamada no encontraba proyecto que mover, así que
+    // terminaba diciendo «ningún proyecto del reto puede pasar a medición». Ese mensaje
+    // manda a buscar una avería que no existe; la verdad es que ya está abierta.
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: viejo.retoId })).rejects.toThrow(
+      /ya está abierta/,
+    );
+
     // Y sin la marca —un reto que llegó a medición por el camino normal, con su registry
     // firmado antes— la operación dice que ya está abierta en vez de mover nada.
     await admin`update reto set medicion_sin_registry = false where id = ${viejo.retoId}`;

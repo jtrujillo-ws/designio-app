@@ -347,6 +347,12 @@ export async function abrirMedicion(
     // debe contarle el estado del reto a quien no puede leerlo.
     const [listo] = await tx`
       select r.estado, r.medicion_sin_registry,
+        -- ¿Queda algún proyecto DETRÁS del reto? Es lo que acota el perdón histórico de
+        -- abajo: 'en-medicion' está con su reto y 'cerrado' ya terminó; cualquier otro
+        -- estado es una fila que este movimiento todavía tiene que rematar.
+        exists (select 1 from proyecto p2
+          where p2.reto_id = r.id and p2.workspace_id = r.workspace_id
+            and p2.estado not in ('en-medicion', 'cerrado')) as alguno_detras,
         exists (select 1 from metric_registry mr
           where mr.reto_id = r.id and mr.workspace_id = r.workspace_id
             and mr.estado = 'firmado') as firmado,
@@ -374,8 +380,16 @@ export async function abrirMedicion(
     // siquiera grant para cambiar de estado y por eso se quedó atrás. Esta operación le
     // termina el movimiento en vez de negarse, que es lo que dejaba el tablero mintiendo
     // (reto midiendo, proyecto sin medir) sin ninguna forma de arreglarlo.
+    //
+    // Y ese perdón dura lo que dura su MOTIVO, igual que en los dos guards del par: vale
+    // mientras quede algún proyecto detrás. La marca no se borra al reparar —la escribió la
+    // migración y nadie la vuelve a escribir—, así que atada solo a ella esta rama seguía
+    // abierta para siempre: con la reparación ya hecha, la operación no tenía nada que
+    // mover y terminaba diciendo «ningún proyecto del reto puede pasar a medición», que
+    // manda a buscar una avería inexistente en lugar de decir la verdad — que ya está
+    // abierta.
     const yaMedia = listo?.estado === 'en-medicion';
-    if (yaMedia && !listo!.medicion_sin_registry) {
+    if (yaMedia && !(listo!.medicion_sin_registry && listo!.alguno_detras)) {
       throw new ErrorMedicion('La medición de este reto ya está abierta');
     }
     // Qué proyectos del reto NO van a estar midiendo después de esto, y por qué. Sale de

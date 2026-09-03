@@ -252,6 +252,13 @@ create index resultado_criterio_review_idx on resultado_criterio (workspace_id, 
 --     borrador»— es inalcanzable para todo proyecto posterior: aprobar G6 exige un registry
 --     FIRMADO, el registry es 1:1 con el reto y la firma es de ida. Así que la rama solo
 --     puede aplicar a filas que ya existían.
+-- Y CUÁNDO DEJA DE APLICAR, que es la parte que se olvida y por la que un perdón acaba
+-- valiendo más de lo que debía: la marca no se borra —nadie tiene grant para escribirla—,
+-- así que quien la acota es su ÚNICO lector, `registry_firmar`. Esa política es un UPDATE
+-- con `using (estado = 'borrador' …)`, de modo que la exención se consume con la firma: un
+-- registry firmado ya no es borrador y no vuelve a serlo, y `metric_registry` es 1:1 con el
+-- reto (`unique (reto_id)`), así que tampoco hay un segundo contrato al que aplicársela.
+-- El perdón vale exactamente una firma, que es el acto que lo hizo falta.
 alter table gate_instancia add column aprobado_sin_registry boolean not null default false;
 update gate_instancia set aprobado_sin_registry = true
   where numero = 6 and estado = 'aprobado';
@@ -364,6 +371,19 @@ end $$;
 -- cerrar es la de INSERT — lo hace `reto_insert`, más abajo, exigiendo que nazca en false.
 -- Y el estado que habilita —«reto en medición sin registry»— es inalcanzable para todo
 -- reto posterior, porque abrir la medición exige el registry FIRMADO.
+-- Y CUÁNDO DEJA DE APLICAR. Esta marca tampoco se borra, pero a diferencia de la del gate
+-- tiene VARIOS lectores, así que la caducidad hay que escribirla en cada uno o la exención
+-- se queda abierta para siempre en el que se olvide:
+--  · `registry_insert` — la acota el `unique (reto_id)` de `metric_registry`: abre el
+--    contrato que falta, y en cuanto existe no hay un segundo que abrir.
+--  · los dos guards del par (transición del proyecto y constraint diferido) — los acota
+--    `proyecto_puede_seguir_al_reto`: la exención vale mientras al proyecto le falten su G7
+--    o el registry firmado, que es justamente mientras NO pueda seguir a su reto.
+--  · `abrirMedicion` — lo acota que quede algún proyecto DETRÁS: terminada la reparación no
+--    hay movimiento que rematar y la operación vuelve a decir que la medición ya está
+--    abierta, que es la verdad.
+-- La regla común, que es la que conviene recordar en la próxima marca: un perdón vale
+-- exactamente mientras dure la condición que lo hizo necesario, ni un caso más ni uno menos.
 alter table reto add column medicion_sin_registry boolean not null default false;
 update reto set medicion_sin_registry = true where estado = 'en-medicion';
 
@@ -773,6 +793,48 @@ create policy proyecto_update_estado on proyecto
   )
   with check (workspace_role(app_user_id(), workspace_id) = 'lead-boutique');
 
+-- ── «¿Este proyecto YA puede entrar en medición con su reto?», en UN solo sitio ──
+-- Un perdón histórico vale exactamente mientras dure la condición que lo hizo necesario, ni
+-- un caso más ni uno menos. `medicion_sin_registry` exime al proyecto de un reto HEREDADO
+-- de la regla «si tu reto mide, tú mides», y la razón de esa exención es concreta: ese
+-- proyecto TODAVÍA NO PUEDE seguir a su reto —le falta recorrer G6, firmar el contrato y
+-- aprobar G7—, así que exigírselo cerraría la única salida que esas filas tienen.
+--
+-- Esa razón caduca. En el instante en que el proyecto tiene su G7 aprobado y el registry de
+-- su reto firmado, seguir al reto es un movimiento legal y disponible (`pausado` y
+-- `en-implementacion` entran los dos en medición por su propio par), y a partir de ahí la
+-- exención ya no perdona nada: solo abre una vía para dejar el proyecto por DETRÁS de un
+-- reto que ya mide, que es exactamente lo que el perdón existía para evitar. Y como la
+-- marca no se borra nunca —la escribió la migración y nadie la vuelve a escribir—, atarla a
+-- la marca sola es dejarla abierta para siempre.
+--
+-- Son las DOS condiciones y no una, porque para el proyecto heredado son independientes: su
+-- G6 está aprobado CON la marca `aprobado_sin_registry`, o sea aprobado sin contrato, y la
+-- regla que exige el registry firmado para aprobar G6 solo corre en el `pendiente →
+-- aprobado` que ese proyecto ya no va a hacer. Así que puede llegar a tener G7 aprobado con
+-- el registry todavía sin firmar — y ahí sigue sin poder medir de verdad, porque la
+-- política del snapshot exige contrato firmado. Con «G7 aprobado» a secas la exención se
+-- cerraría un paso antes de tiempo.
+--
+-- Se escribe UNA vez y la llaman los dos guards del par, por el mismo motivo que
+-- `proyectos_frenan_medicion`: dos redacciones del mismo predicado son dos verdades, y a
+-- una de las dos siempre se le queda una condición corta.
+--
+-- Sin SECURITY DEFINER, como sus dos llamadores: lee gates y registry del MISMO workspace
+-- que el actor acaba de escribir, visibles para cualquier miembro, así que corre bajo el
+-- RLS de quien llama y no puede volverse oráculo.
+create function proyecto_puede_seguir_al_reto(p_proyecto uuid, p_reto uuid, p_ws uuid)
+returns boolean
+language sql stable as $$
+  select exists (select 1 from gate_instancia g
+      where g.proyecto_id = p_proyecto and g.workspace_id = p_ws
+        and g.numero = 7 and g.estado = 'aprobado')
+    and exists (select 1 from metric_registry r
+      where r.reto_id = p_reto and r.workspace_id = p_ws and r.estado = 'firmado')
+$$;
+revoke execute on function proyecto_puede_seguir_al_reto(uuid, uuid, uuid) from public;
+grant execute on function proyecto_puede_seguir_al_reto(uuid, uuid, uuid) to designio_app;
+
 -- La máquina de estados del proyecto, ENTERA y en un solo sitio: cada par legal con su
 -- precondición al lado. Este slice hizo escribible `proyecto.estado` y al principio declaró
 -- solo los pares, dejando las precondiciones en quien escribe — que es justo el reparto que
@@ -869,16 +931,23 @@ begin
   -- La mitad que le falta al constraint diferido se comprueba aquí, en la transición del
   -- PROYECTO, que es la que llega tarde.
   --
-  -- Con la excepción EXACTA del reto heredado (`medicion_sin_registry`), que es el único
-  -- que mide teniendo por definición su proyecto detrás: ahí «estar detrás» no es la
-  -- avería sino el estado que la migración encontró, y el camino de reparación consiste
-  -- justamente en recorrer G6 y G7 antes de que `abrirMedicion` termine el movimiento.
-  -- Prohibir ahí la reanudación cerraría la única salida que ese reto tiene. La marca la
-  -- escribió la migración y ningún grant la vuelve a escribir, así que la excepción es un
-  -- conjunto cerrado que solo puede encoger.
+  -- Con la excepción del reto heredado (`medicion_sin_registry`), que es el único que mide
+  -- teniendo por definición su proyecto detrás: ahí «estar detrás» no es la avería sino el
+  -- estado que la migración encontró, y el camino de reparación consiste justamente en
+  -- recorrer G6 y G7 antes de que `abrirMedicion` termine el movimiento. Prohibir ahí la
+  -- reanudación cerraría la única salida que ese reto tiene.
+  --
+  -- Y la excepción dura lo que dura SU MOTIVO, que es `proyecto_puede_seguir_al_reto`: en
+  -- cuanto este proyecto tiene su G7 y el registry firmado, retomarlo a 'en-medicion' es un
+  -- par legal y disponible, así que dejarlo volver a 'activo' o a 'en-implementacion' ya no
+  -- le abre ninguna salida — le abre la vía de quedarse varado detrás de un reto que mide,
+  -- que es lo que el perdón existía para evitar. Atada solo a la marca, que no se borra
+  -- nunca, la exención habría valido para siempre.
   if old.estado = 'pausado' and new.estado <> 'en-medicion' and exists (select 1 from reto r
     where r.id = new.reto_id and r.workspace_id = new.workspace_id
-      and r.estado = 'en-medicion' and not r.medicion_sin_registry) then
+      and r.estado = 'en-medicion'
+      and (not r.medicion_sin_registry
+           or proyecto_puede_seguir_al_reto(new.id, new.reto_id, new.workspace_id))) then
     raise exception 'el reto ya está midiendo: al retomarlo el proyecto entra en medición con él, no por detrás (§5.2)';
   end if;
   -- §7: se entra en implementación al aprobarse el PLAN, no por decisión de nadie.
@@ -1247,16 +1316,21 @@ revoke execute on function reto_medicion_par_indivisible_guard() from public;
 -- siempre en el caso secuencial —la política para el insert, el guard de transición para la
 -- pausa retomada—: esto es la red de la carrera, no el diagnóstico.
 --
--- Con la excepción EXACTA del reto heredado, igual que el guard de transición: es el único
--- que mide teniendo su proyecto detrás por definición, y ese «detrás» es el estado que
--- encontró la migración, no una avería.
+-- Con la excepción del reto heredado, igual que el guard de transición y con el MISMO
+-- alcance: es el único que mide teniendo su proyecto detrás por definición, y ese «detrás»
+-- es el estado que encontró la migración, no una avería. Y también aquí la exención dura lo
+-- que dura su motivo — `proyecto_puede_seguir_al_reto` —, porque si no las dos mitades del
+-- invariante dejarían de decir lo mismo: el guard de transición cerraría la puerta de la
+-- reanudación mientras esta seguiría admitiendo la misma fila por la puerta del alta.
 create function proyecto_par_medicion_guard() returns trigger
 language plpgsql as $$
 begin
   perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || new.reto_id, 42));
   if exists (select 1 from reto r
     where r.id = new.reto_id and r.workspace_id = new.workspace_id
-      and r.estado = 'en-medicion' and not r.medicion_sin_registry) then
+      and r.estado = 'en-medicion'
+      and (not r.medicion_sin_registry
+           or proyecto_puede_seguir_al_reto(new.id, new.reto_id, new.workspace_id))) then
     raise exception 'el reto ya está midiendo: su proyecto no puede quedarse sin abrir (§5.2)';
   end if;
   return null;

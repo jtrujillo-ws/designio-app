@@ -711,11 +711,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     // La escalera de gates: G7 no se decide con anteriores pendientes.
     for (let n = 0; n <= 6; n++) {
-      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = ${n}`;
     }
     await expect(
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = 7`,
     ).rejects.toThrow(/estado desconocido/);
 
@@ -745,7 +747,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const cerrado = await designVersionCompleta(leadId, ws, dv1);
     // 'no-implementado' es una respuesta CONOCIDA: el gate exige honestidad, no éxito.
     expect(conciliacionCompleta(cerrado!.conciliacion)).toBe(true);
-    await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+    await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
       where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = 7`;
     const [g7] = await admin`select estado from gate_instancia
       where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = 7`;
@@ -937,7 +940,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       elementos: [{ elementoId: suyo.elementoId, razon: '' }],
     });
     for (let n = 0; n <= 6; n++) {
-      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
     }
 
@@ -972,7 +976,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // planificado, o sea en estado desconocido. Antes lo rechazaba diciendo que no había
     // tablero —y no había forma de que lo hubiera nunca—.
     const aprobarG7 = () =>
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
     await expect(aprobarG7()).rejects.toThrow(/en estado desconocido/);
 
@@ -1052,7 +1057,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
               ${snap!.id as string}, ${leadId}, now(), ${leadId})`;
 
     await expect(
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`,
     ).rejects.toThrow(/ninguna design version con elementos que conciliar/);
     // Es la misma regla que la app ya aplicaba del lado puro.
@@ -1643,7 +1649,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
                 ${leadId})`;
     }
     const aprobarGateCrudo = (n: number) =>
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proyG6} and workspace_id = ${ws} and numero = ${n}`;
     for (let n = 0; n <= 4; n++) await aprobarGateCrudo(n);
 
@@ -1990,7 +1997,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
                 ${leadId})`;
     }
     const aprobarGateCrudo = (n: number) =>
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
 
     const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
@@ -2906,11 +2914,20 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         set estado = 'firmado', firmado_por = ${leadId}, firmado_en = now()`;
   };
 
+  // `aprobado_en` se escribe SIEMPRE, aquí y en las demás aprobaciones crudas de este
+  // fichero. El guard `gate_aprobar_suficiencia` lo estampa —y ese es su trabajo—, pero un
+  // fixture que dependa de ese estampado para cumplir `gate_instancia_check1` deja de ser
+  // determinista en cuanto otra suite apaga el trigger: `alter table … disable trigger` es
+  // global y lo ven todas las sesiones. La forma correcta ya estaba decidida en este mismo
+  // fichero (las aprobaciones que van por `conUsuario` sí la escriben); esta mitad se quedó
+  // fuera. Escribir la columna no toca ningún predicado ni ninguna aserción: arregla el
+  // andamiaje, no la regla.
   const aprobarGatesHasta = async (proy: string, hasta: number): Promise<void> => {
     const admin = sqlAdmin();
     if (hasta >= 6) await registryFirmado(proy);
     for (let n = 0; n <= hasta; n++) {
-      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
     }
   };
@@ -3579,7 +3596,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const tablero = await designVersionCompleta(leadId, ws, dvB.designVersionId);
     expect(conciliacionCompleta(tablero!.conciliacion)).toBe(true);
     const aprobarG7 = () =>
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
     await expect(aprobarG7()).rejects.toThrow(/responsabilidad de su proyecto/);
 
@@ -4141,7 +4159,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(vistaA!.aCargoDelProyecto).toBe(true);
 
     const aprobarG7B = () =>
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
     await expect(aprobarG7B()).rejects.toThrow(/responsabilidad de su proyecto/);
 
@@ -4254,7 +4273,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await aprobarGatesHasta(proyB, 6);
 
     const aprobarG7B = () =>
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
     // La MISMA redacción que levanta el guard, preguntada directamente: si el ámbito se
     // pasa de ancho, aquí sale el motivo antes de que el update lo confirme.
@@ -4279,7 +4299,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // se coloca donde toca.
     await aprobarGatesHasta(proyC, 6);
     await expect(
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proyC} and workspace_id = ${ws} and numero = 7`,
     ).rejects.toThrow(/estado desconocido/);
   });
@@ -5763,7 +5784,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     });
 
     const aprobarG7 = () =>
-      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now()
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
     // G7 no se regala: sigue exigiendo el tablero completo.
     await expect(aprobarG7()).rejects.toThrow(/en estado desconocido/);

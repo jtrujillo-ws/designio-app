@@ -1243,6 +1243,14 @@ export async function seguimientoDeImpacto(
         -- un reto que mide con su contrato de uno que mide desde antes de que el contrato
         -- existiera, y esa distinción es la que decide si queda reparación por ofrecer.
         r.medicion_sin_registry,
+        -- El día de calendario de la BASE, que es quien juzga. snapshot_insert acota la
+        -- fecha con current_date y contextoDeEntrada diagnostica con el mismo, así que
+        -- el máximo del selector tiene que salir de aquí y no de un new Date() del
+        -- navegador: no hay huso por petición, de modo que un hoy calculado en el cliente
+        -- discrepa del que decide — al este de UTC ofrecía un día que el servicio rechaza
+        -- por futuro, y en el borde inverso escondía uno que la base sí acepta. El espejo
+        -- LEE la regla; no la reproduce.
+        current_date::text as hoy,
         -- El G7 del proyecto que se mira: lo necesita el espejo del botón de RETOMAR, cuya
         -- precondición en el guard es exactamente esa (a medición se entra por G7). Sin él
         -- el botón se ofrecería para que la base lo negara.
@@ -1439,6 +1447,7 @@ export async function seguimientoDeImpacto(
     return {
       retoId: fila.reto_id as string,
       retoCodigo: fila.reto_codigo as string,
+      hoy: fila.hoy as string,
       retoEstado: fila.reto_estado as string,
       retoVeredicto: fila.reto_veredicto as SeguimientoDeImpacto['retoVeredicto'],
       proyectoEstado: fila.proyecto_estado as string,

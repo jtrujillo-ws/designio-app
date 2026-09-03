@@ -42,7 +42,10 @@ import {
   registryPorAbrir,
   CompletarReviewSchema,
   narrativaDelBorrador,
+  BorradorReviewSchema,
   reparosDelEsquema,
+  TOPE_JUSTIFICACION,
+  TOPE_NARRATIVA,
   ResultadoCriterioSchema,
   ventanasCerradas,
   type BorradorReview,
@@ -54,7 +57,6 @@ import {
   proyectoPorRetomar,
 } from '@/lib/medicion/medicion.schemas';
 import { faltaParaAprobarGate } from '@/lib/metodo/metodo.schemas';
-import { hoyCalendario } from '@/lib/fecha-calendario';
 import { describeAuthz } from './helpers';
 
 /**
@@ -1778,6 +1780,40 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       disenoExperimentalJustificacion: '',
     });
 
+    // Y el botón de GUARDAR espeja su propio esquema, que es el control que se quedó sin
+    // espejo al crearlo: sin esto, un campo pasado de tope lo rechaza el validador de la
+    // server function antes del handler, sale el mensaje genérico de reintento y se pierde el
+    // borrador entero — la ironía exacta, porque guardar existe para no perder texto.
+    const largo = 'x'.repeat(TOPE_NARRATIVA + 1);
+    expect(
+      reparosDelEsquema(BorradorReviewSchema, {
+        workspaceId: ws,
+        reviewId,
+        veredicto: null,
+        contribucion: largo,
+        factoresExternos: '',
+        hipotesisAbiertas: '',
+        aprendizajes: '',
+        disenoExperimentalSuficiente: false,
+        disenoExperimentalJustificacion: '',
+      }),
+    ).not.toEqual([]);
+    // Y con todo dentro de tope no reprocha nada: apagar de más es tan avería como ofrecer
+    // de más, y aquí apagar de más sería no dejar guardar nunca.
+    expect(
+      reparosDelEsquema(BorradorReviewSchema, {
+        workspaceId: ws,
+        reviewId,
+        veredicto: null,
+        contribucion: 'x'.repeat(TOPE_NARRATIVA),
+        factoresExternos: '',
+        hipotesisAbiertas: '',
+        aprendizajes: '',
+        disenoExperimentalSuficiente: true,
+        disenoExperimentalJustificacion: 'y'.repeat(TOPE_JUSTIFICACION),
+      }),
+    ).toEqual([]);
+
     const guardado = await seguimientoDeImpacto(leadId, ws, proyectoId);
     // Sigue en BORRADOR: guardar no es firmar. El reto no se ha cerrado ni tiene veredicto.
     expect(guardado!.review!.estado).toBe('borrador');
@@ -2921,32 +2957,20 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     );
   });
 
-  it('el «hoy» de la pantalla es el día LOCAL, no el de UTC', () => {
-    // Una fecha de calendario no es un instante, y `toISOString()` sí lo es: convierte a UTC
-    // y recorta. El máximo del selector de snapshots salía de ahí, así que al oeste de UTC
-    // por la tarde dejaba elegir MAÑANA —que `snapshot_insert` rechaza por `fecha <=
-    // current_date`— y al este, cerca de medianoche, escondía el día local en curso y el dato
-    // de la jornada se quedaba sin poder cargarse. El formulario de importación ya lo hacía
-    // bien por este mismo motivo: eran dos redacciones de «qué día es hoy» y mandaba la que
-    // no sabía. Ahora hay una y la comprueban los dos extremos del huso.
-    //
-    // El huso se fija en el test porque la suite corre en UTC, que es justo el único sitio
-    // donde el defecto no se ve: con TZ=UTC las dos redacciones coinciden y un test escrito
-    // sin esto pasaría con la implementación rota.
-    const previo = process.env.TZ;
-    try {
-      process.env.TZ = 'America/Bogota';
-      const tardeAlOeste = new Date('2026-08-01T23:30:00-05:00'); // 04:30Z del día 2
-      expect(tardeAlOeste.toISOString().slice(0, 10)).toBe('2026-08-02');
-      expect(hoyCalendario(tardeAlOeste)).toBe('2026-08-01');
-
-      process.env.TZ = 'Asia/Tokyo';
-      const madrugadaAlEste = new Date('2026-08-02T00:30:00+09:00'); // 15:30Z del día 1
-      expect(madrugadaAlEste.toISOString().slice(0, 10)).toBe('2026-08-01');
-      expect(hoyCalendario(madrugadaAlEste)).toBe('2026-08-02');
-    } finally {
-      process.env.TZ = previo;
-    }
+  it('el «hoy» del selector es el de la BASE, que es quien juzga la fecha', async () => {
+    // Una fecha de calendario no es un instante, pero el arreglo no es calcularla mejor en el
+    // cliente: es no calcularla ahí. Quien decide si un snapshot vale es `snapshot_insert`
+    // con el `current_date` de PostgreSQL, y no hay huso por petición que concilie los dos
+    // calendarios — un «hoy» del navegador, en UTC o en el huso local, es un SEGUNDO
+    // calendario que discrepa del que manda: al este de UTC la pantalla ofrecía un día que el
+    // servicio rechaza por futuro, y al oeste escondía uno que la base sí acepta. Así que la
+    // proyección trae el día de la base y el espejo lo lee.
+    const seg = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const [dia] = await sqlAdmin()`select current_date::text as hoy`;
+    expect(seg!.hoy).toBe(dia!.hoy);
+    // Que ese mismo día es el que ACOTA lo fija el test de la ventana, que rechaza la fecha
+    // del futuro contra `current_date`: aquí lo que se prueba es que la pantalla lea ESE y
+    // no uno propio.
   });
 
   it('la cadencia es un compromiso de CALENDARIO: «mensual» es el mes siguiente, no 30 días', async () => {

@@ -1,17 +1,17 @@
 /**
- * El día de CALENDARIO de quien mira, en UN solo sitio.
+ * El día de CALENDARIO de quien mira, para los DEFAULTS de formulario.
  *
  * Una fecha de calendario no es un instante, y `toISOString()` sí lo es: convierte a UTC y
- * después recorta. Al oeste de UTC, por la tarde, eso ya es el día siguiente —el selector
- * dejaba elegir MAÑANA, que `snapshot_insert` rechaza por `fecha <= current_date`—; al este,
- * cerca de medianoche, esconde el día local en curso y el dato de la jornada se queda sin
- * poder cargarse. Los snapshots, la línea base y las ventanas de este producto son días
- * comparados como texto, sin husos de por medio, y por eso sus columnas son `date`.
+ * después recorta. Al oeste de UTC, por la tarde, eso ya es el día siguiente; al este, cerca
+ * de medianoche, esconde el día local en curso. Para proponer «hoy» en un campo que la
+ * persona va a revisar y puede cambiar, el día que quiere ver es el SUYO.
  *
- * Vive aquí y no dentro de una pantalla porque ya estaba escrito dos veces —el formulario de
- * importación lo hacía bien y el de snapshots no—, y dos redacciones de «qué día es hoy» son
- * dos verdades: basta que una use el huso equivocado para que el sistema se contradiga
- * consigo mismo. Mismo argumento que `ventana_de_medicion_abierta` y `paso_de_cadencia`.
+ * Lo que NO se hace con esto es acotar lo que la base va a aceptar. Ahí el calendario que
+ * manda es el de PostgreSQL —`snapshot_insert` juzga con `current_date` y no hay huso por
+ * petición—, así que un «hoy» calculado aquí sería un segundo calendario que discrepa del que
+ * decide: la pantalla ofrecería un día que el servicio rechaza por futuro, o escondería uno
+ * que sí acepta. Esos límites se PROYECTAN desde el servidor (`seguimiento.hoy`) y el espejo
+ * los lee. La regla de siempre: el espejo lee la regla, no la reproduce.
  */
 export function hoyCalendario(ahora: Date = new Date()): string {
   const mes = String(ahora.getMonth() + 1).padStart(2, '0');

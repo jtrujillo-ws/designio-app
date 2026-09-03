@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Button } from '@/components/ui/Button';
-import { hoyCalendario } from '@/lib/fecha-calendario';
 import { Card } from '@/components/ui/Card';
 import { Checkbox } from '@/components/ui/Checkbox';
 import { Input } from '@/components/ui/Input';
@@ -36,7 +35,10 @@ import {
   ResultadoCriterioSchema,
   arranqueDelResultado,
   faltaParaCompletar,
+  BorradorReviewSchema,
   medicionPorAbrir,
+  TOPE_JUSTIFICACION,
+  TOPE_NARRATIVA,
   destinoAlRetomar,
   proyectoPorPausar,
   proyectoPorRetomar,
@@ -727,12 +729,12 @@ function FormularioEntrada({
 
 /** Último día que la base aceptaría para un snapshot: el cierre de la ventana firmada o
  * hoy, lo que llegue antes. */
-function maxFechaDeSnapshot(entrada: EntradaDeRegistry): string {
-  // El hoy LOCAL, no el de UTC: `toISOString()` convierte a instante y recorta, así que al
-  // oeste de UTC por la tarde dejaba elegir mañana —que la política rechaza— y al este, cerca
-  // de medianoche, escondía el día en curso. Sale de `hoyCalendario`, la misma función que
-  // usa el formulario de importación: dos redacciones de «qué día es hoy» son dos verdades.
-  const hoy = hoyCalendario();
+function maxFechaDeSnapshot(entrada: EntradaDeRegistry, hoy: string): string {
+  // El «hoy» viene de la BASE, que es quien juzga: `snapshot_insert` acota la fecha con
+  // `current_date`. Calcularlo en el navegador —da igual si en UTC o en el huso local— crea
+  // un SEGUNDO calendario y no hay huso por petición que los concilie: al este de UTC la
+  // pantalla ofrecía un día que el servicio rechaza por futuro, y al oeste escondía uno que
+  // la base sí acepta. El espejo lee la regla; no la reproduce.
   return entrada.ventanaFin !== null && entrada.ventanaFin < hoy ? entrada.ventanaFin : hoy;
 }
 
@@ -873,7 +875,7 @@ function BloqueSerie({
             type="date"
             value={fecha}
             min={entrada.ventanaInicio ?? undefined}
-            max={maxFechaDeSnapshot(entrada)}
+            max={maxFechaDeSnapshot(entrada, seguimiento.hoy)}
             onChange={(e) => setFecha(e.target.value)}
           />
           <Input
@@ -1023,6 +1025,13 @@ function BloqueReview({
   // reprocharía el guard del cierre —todo criterio con su resultado, y un «logrado» sin
   // criterios sin dato final—. Las dos superficies que pueden rechazar la escritura.
   const falta = faltaParaCompletar(seguimiento, borrador);
+  // Y lo que le reprocha el esquema del BORRADOR, que es otra escritura y otro botón. Guardar
+  // existe justamente para no perder texto, así que un guardado que el validador rechaza
+  // —por pasarse de los topes— pierde el borrador entero: la ironía exacta que el botón vino
+  // a evitar. Mismo `reparosDelEsquema` que el resto de los controles del slice, aplicado al
+  // control nuevo; los `maxLength` de los textareas impiden llegar ahí, y esto lo dice si se
+  // llega por pegado.
+  const reparosBorrador = reparosDelEsquema(BorradorReviewSchema, borrador);
 
   // El formulario se HIDRATA del borrador guardado, y no es comodidad: completar escribe
   // las cinco columnas de la narrativa a la vez, así que arrancando en vacío bastaba abrir
@@ -1198,24 +1207,28 @@ function BloqueReview({
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <Textarea
                   value={contribucion}
+                  maxLength={TOPE_NARRATIVA}
                   rows={3}
                   placeholder="Contribución del rediseño: qué cambió, con qué evidencia de la serie (lenguaje de contribución, no causal)"
                   onChange={(e) => setContribucion(e.target.value)}
                 />
                 <Textarea
                   value={factores}
+                  maxLength={TOPE_NARRATIVA}
                   rows={2}
                   placeholder="Factores externos conocidos que pudieron mover el KPI"
                   onChange={(e) => setFactores(e.target.value)}
                 />
                 <Textarea
                   value={hipotesis}
+                  maxLength={TOPE_NARRATIVA}
                   rows={2}
                   placeholder="Hipótesis abiertas que quedan para el próximo reto"
                   onChange={(e) => setHipotesis(e.target.value)}
                 />
                 <Textarea
                   value={aprendizajes}
+                  maxLength={TOPE_NARRATIVA}
                   rows={2}
                   placeholder="Aprendizajes del ciclo"
                   onChange={(e) => setAprendizajes(e.target.value)}
@@ -1238,6 +1251,7 @@ function BloqueReview({
                 {experimental && (
                   <Textarea
                     value={justificacion}
+                    maxLength={TOPE_JUSTIFICACION}
                     rows={2}
                     placeholder="Justificación del diseño experimental (grupo de control, aleatorización, corte temporal…)"
                     onChange={(e) => setJustificacion(e.target.value)}
@@ -1264,6 +1278,11 @@ function BloqueReview({
                     justificar. Las dos superficies que rechazan la escritura —el esquema y
                     el guard del cierre— salen de un solo predicado, que vive con sus
                     hermanos en `medicion.schemas` porque es donde los tests lo alcanzan. */}
+                {reparosBorrador.length > 0 && (
+                  <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+                    No se puede guardar todavía: {reparosBorrador.join(' · ')}
+                  </span>
+                )}
                 {falta.length > 0 && (
                   <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
                     Falta para poder completarlo: {falta.join(' · ')}
@@ -1279,7 +1298,7 @@ function BloqueReview({
                   <Button
                     size="sm"
                     variant="secondary"
-                    disabled={ocupado}
+                    disabled={ocupado || reparosBorrador.length > 0}
                     onClick={() => void guardarBorrador()}
                   >
                     Guardar borrador

@@ -241,6 +241,12 @@ export type CompletarReview = z.infer<typeof CompletarReviewSchema>;
  * tenerlo ya elegido; lo que NO hace guardar es firmarlo — eso es `completado_por` y solo lo
  * escribe el cierre.
  */
+/** Topes de la narrativa del post mortem, en UN sitio: los usan el esquema —que rechaza— y
+ * los `maxLength` de la pantalla —que impiden llegar—. Escritos dos veces, basta que uno
+ * cambie para que el botón deje pasar lo que el validador tira. */
+export const TOPE_NARRATIVA = 8000;
+export const TOPE_JUSTIFICACION = 4000;
+
 export const BorradorReviewSchema = z.object({
   workspaceId: z.string().uuid(),
   reviewId: z.string().uuid(),
@@ -249,12 +255,12 @@ export const BorradorReviewSchema = z.object({
    * Exigirlo aquí obligaría a elegir un dictamen para poder guardar media redacción, que es
    * justo la presión por concluir que SYS-24 nombra como riesgo. */
   veredicto: z.enum(VEREDICTOS).nullable(),
-  contribucion: z.string().trim().max(8000),
-  factoresExternos: z.string().trim().max(8000).default(''),
-  hipotesisAbiertas: z.string().trim().max(8000).default(''),
-  aprendizajes: z.string().trim().max(8000).default(''),
+  contribucion: z.string().trim().max(TOPE_NARRATIVA),
+  factoresExternos: z.string().trim().max(TOPE_NARRATIVA).default(''),
+  hipotesisAbiertas: z.string().trim().max(TOPE_NARRATIVA).default(''),
+  aprendizajes: z.string().trim().max(TOPE_NARRATIVA).default(''),
   disenoExperimentalSuficiente: z.boolean().default(false),
-  disenoExperimentalJustificacion: z.string().trim().max(4000).default(''),
+  disenoExperimentalJustificacion: z.string().trim().max(TOPE_JUSTIFICACION).default(''),
 });
 export type BorradorReview = z.infer<typeof BorradorReviewSchema>;
 
@@ -330,6 +336,11 @@ export type OutcomeReviewDeReto = {
 export type SeguimientoDeImpacto = {
   retoId: string;
   retoCodigo: string;
+  /** El día de calendario de la BASE, que es quien juzga si un snapshot es válido
+   * (`snapshot_insert` lo acota con `current_date`). La pantalla lo espeja en vez de
+   * calcularlo: no hay huso por petición, así que un «hoy» del navegador es un segundo
+   * calendario y discrepa del que decide. */
+  hoy: string;
   retoEstado: string;
   retoVeredicto: VeredictoSlug | null;
   proyectoEstado: string;

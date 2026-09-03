@@ -28,6 +28,7 @@ import {
 } from '@/lib/medicion/medicion.servicio';
 import {
   medicionPorAbrir,
+  narrativaDelBorrador,
   postMortemPorAbrir,
   ResultadoCriterioSchema,
   ventanasCerradas,
@@ -1412,11 +1413,25 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     });
     expect((await seguido()).estadoSnapshot).toBe('vencido');
 
-    // Y ahora un dato pegado al cierre de la ventana: se aportó lo comprometido hasta el
-    // final. El estado es TERMINAL, no «vencido»: comparar la próxima fecha prevista
-    // (-42 + 7 = -35) contra HOY la deja atrás por 35 días y marcaría vencido todo KPI
-    // recurrente cumplido, en un proyecto que ya es historia y donde la política rechaza
-    // cualquier snapshot posterior. Se compara contra el FIN de la ventana (-40).
+    // Y ahora la serie COMPLETA. «Cerrado» dice que llegó lo comprometido, y eso no lo
+    // decide la última fecha: con un solo corte al principio y otro al final quedaban seis
+    // entregas semanales sin llegar en medio, y mirar solo `max(fecha)` las daba por
+    // cumplidas. Se rellenan los huecos para que la serie diga de verdad lo que «cerrado»
+    // promete — el caso contrario, un único dato en una ventana larga, se fija con fechas
+    // absolutas en el test de la cadencia de calendario.
+    for (const dia of [-88, -81, -74, -67, -60, -53]) {
+      await registrarSnapshot(leadId, {
+        workspaceId: ws,
+        entradaId: entradaReintentosId,
+        valor: '2.1',
+        fecha: fecha(dia),
+        nota: 'corte semanal',
+      });
+    }
+    // Y el dato pegado al cierre. El estado es TERMINAL, no «vencido»: comparar la próxima
+    // fecha prevista (-42 + 7 = -35) contra HOY la deja atrás por 35 días y marcaría
+    // vencido todo KPI recurrente cumplido, en un proyecto que ya es historia y donde la
+    // política rechaza cualquier snapshot posterior. Se compara contra el FIN (-40).
     await registrarSnapshot(leadId, {
       workspaceId: ws,
       entradaId: entradaReintentosId,
@@ -1730,6 +1745,16 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(edicion.actor_rol).toBe('lead-boutique');
     // Redactar el borrador NO es completarlo: el evento del cierre no se emite aquí.
     expect((await de('OutcomeReviewCompletado')).length).toBe(0);
+
+    // Y el formulario de completar arranca DE ESE BORRADOR, no en vacío. Completar escribe
+    // las cinco columnas de la narrativa a la vez, así que abrir la pantalla y elegir
+    // veredicto habría borrado lo redactado — y el review completado es INMUTABLE, o sea
+    // que lo que se pierde ahí no vuelve. Se comprueba sobre la proyección real, que es lo
+    // que la pantalla recibe.
+    const segBorrador = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const arranque = narrativaDelBorrador(segBorrador!.review);
+    expect(arranque.contribucion).toBe(redactado);
+    expect(arranque.aprendizajes).toBe(borradorPrevio!.aprendizajes);
 
     // Se deja como estaba, igual que el resultado: lo que se probaba era el rastro.
     await conUsuario(leadId, (tx) => tx`update outcome_review
@@ -2388,6 +2413,27 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       const llamadas = await leer();
       expect(llamadas.ultimaFecha).toBe('2026-03-01');
       expect(llamadas.estadoSnapshot).toBe('cerrado');
+
+      // Y la mitad simétrica, que es donde «cerrado» mentía. Con la ventana estirada a tres
+      // meses —[2026-03-01, 2026-06-01]— y un corte el primer día y otro el ÚLTIMO, la
+      // última fecha más un mes cae fuera del cierre, así que la comprobación de «dejó de
+      // aportar antes del final» no salta… y entre medias quedaron DOS entregas mensuales
+      // sin llegar (1 de abril y 1 de mayo). Mirando solo la última fecha la entrada se leía
+      // «cerrado», o sea CUMPLIDA, y eso es exactamente lo que alimenta el outcome review:
+      // un KPI que incumplió dos de tres presentándose como cumplido justo donde este slice
+      // existe para impedirlo. El hueco es lo que lo distingue.
+      await admin`update criterio_exito set ventana_dias = 92
+        where id = (select criterio_id from entrada_kpi where id = ${entradaViejaId})`;
+      await registrarSnapshot(sponsorId, {
+        workspaceId: ws,
+        entradaId: entradaViejaId,
+        valor: '21',
+        fecha: '2026-06-01',
+        nota: 'último día de la ventana larga, con dos meses sin aportar en medio',
+      });
+      expect((await leer()).estadoSnapshot).toBe('vencido');
+      await admin`update criterio_exito set ventana_dias = 30
+        where id = (select criterio_id from entrada_kpi where id = ${entradaViejaId})`;
     } finally {
       // Fixture: la ventana vuelve a donde estaba y el snapshot que solo existía para fijar
       // el corte se va con ella. Solo el rol admin puede borrarlo (SYS-23).
@@ -2625,10 +2671,43 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await admin`update gate_instancia set estado = 'pendiente', aprobado_por = null,
       aprobado_en = null where proyecto_id = ${bId} and numero = 7`;
     const segSinG7 = await seguimientoDeImpacto(leadId, ws, a.proyectoId);
-    expect(segSinG7!.proyectosSinG7).toEqual(['P-75B']);
+    expect(segSinG7!.proyectosFrenan.map((p) => p.codigo)).toEqual(['P-75B']);
+    expect(segSinG7!.proyectosFrenan[0]!.motivo).toMatch(/sin su G7 aprobado/);
     await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId })).rejects.toThrow(
-      /Falta el G7 en \(P-75B\)/,
+      /P-75B \(sin su G7 aprobado\)/,
     );
+    // Y el mismo conjunto para el estado de al lado: un hermano en 'activo' —sin pasar por
+    // implementación— tampoco lo mueve la apertura, así que también frena. Era el estado
+    // que faltaba cuando esta lista se escribía a mano, y ahora sale de la misma función
+    // que usa el guard, así que no puede faltar en un lado y estar en el otro.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
+      where id = ${bId}`);
+    await admin`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
+    try {
+      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+        aprobado_en = now() where proyecto_id = ${bId} and numero = 7`;
+    } finally {
+      await admin`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
+    }
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+      where id = ${bId}`);
+    await admin`alter table proyecto disable trigger proyecto_estado_transicion`;
+    try {
+      await admin`update proyecto set estado = 'activo' where id = ${bId}`;
+    } finally {
+      await admin`alter table proyecto enable trigger proyecto_estado_transicion`;
+    }
+    const segActivo = await seguimientoDeImpacto(leadId, ws, a.proyectoId);
+    expect(segActivo!.proyectosFrenan.map((p) => p.codigo)).toEqual(['P-75B']);
+    expect(segActivo!.proyectosFrenan[0]!.motivo).toMatch(/le falta aprobar su G6/);
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId })).rejects.toThrow(
+      /P-75B \(no ha pasado por implementación/,
+    );
+    // Se devuelve a implementación sin su G7, que es donde lo quiere el resto del guion.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+      where id = ${bId}`);
+    await admin`update gate_instancia set estado = 'pendiente', aprobado_por = null,
+      aprobado_en = null where proyecto_id = ${bId} and numero = 7`;
 
     // Se para ANTES de abrir la medición. Que un pausado se quede atrás es deliberado
     // —parar es del cliente— pero solo vale si TODAVÍA PUEDE SEGUIR al reto: sin su G7 el
@@ -2643,7 +2722,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       /P-75B/,
     );
     await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId })).rejects.toThrow(
-      /Retómalos y cierra sus gates antes de abrir la medición/,
+      /pausado y sin su G7/,
     );
     // Y la regla es de la BASE, no del diagnóstico: por SQL directo, moviendo el par entero
     // a mano —que es lo único que llega hasta la tercera comprobación, porque las dos
@@ -2653,7 +2732,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         await tx`update reto set estado = 'en-medicion' where id = ${r.retoId}`;
         await tx`update proyecto set estado = 'en-medicion' where id = ${a.proyectoId}`;
       }),
-    ).rejects.toThrow(/no podría seguir al reto ni dejarlo cerrar/);
+    ).rejects.toThrow(/pausado y sin su G7: no podría seguir al reto ni dejarlo cerrar/);
     // Y la salida existe y es la normal: se le cierra el gate que le faltaba y ya puede
     // quedarse atrás, porque ahora sí podrá volver. (Aquí con el guard de suficiencia
     // apagado, porque este segundo proyecto se fabricó con sus gates y sin checklist; el

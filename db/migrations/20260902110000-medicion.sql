@@ -1021,6 +1021,53 @@ create policy gate_insert on gate_instancia
     and aprobado_sin_registry = false
   );
 
+-- ── «Qué proyectos del reto frenan la medición», en UN solo sitio ──
+-- Este predicado se ha escrito ya tres veces en este slice —el guard que rechaza, el
+-- diagnóstico del servicio y el espejo de la pantalla— y las tres veces se ha quedado un
+-- estado corto: primero media condición, luego una fila en lugar del conjunto, luego un
+-- estado de menos dentro del conjunto. No es descuido tres veces: es que mantener
+-- sincronizadas a mano tres enumeraciones del mismo conjunto no se puede, y la siguiente
+-- ronda encuentra la cuarta. Así que se escribe UNA vez y los tres la llaman.
+--
+-- Qué es «frenar»: un proyecto que, tras `abrirMedicion`, NO va a estar midiendo. La
+-- operación mueve exactamente los que están en 'en-implementacion', así que:
+--  · 'activo'                     — no lo mueve nadie: se quedaría sin abrir bajo un reto
+--                                   que mide, que es el par roto. Le falta su G6.
+--  · 'pausado' SIN su G7          — no puede seguir al reto después (retomar con el reto
+--                                   midiendo exige entrar en medición, y eso exige su G7),
+--                                   y atrapado él el outcome review no cierra el reto.
+--  · 'en-implementacion' SIN G7   — su propio movimiento lo rechaza el guard de transición.
+-- Y NO frenan: 'pausado' CON su G7 (puede volver cuando quiera), 'cerrado' y 'en-medicion'.
+--
+-- `solo_al_entrar` distingue las dos primeras —que solo estorban cuando el reto ENTRA en
+-- medición— de la tercera, que impide el movimiento del propio proyecto siempre. Es lo que
+-- deja al reto HEREDADO reparar su medición: allí el reto ya mide y sus proyectos están
+-- detrás por definición, así que las razones «al entrar» no aplican.
+--
+-- No es SECURITY DEFINER: lee proyectos y gates del workspace del reto, que cualquier
+-- miembro ya puede leer, así que corre bajo el RLS de quien llama y no puede volverse
+-- oráculo. La ejecuta el rol de aplicación (el diagnóstico y la proyección la llaman).
+create function proyectos_frenan_medicion(p_reto uuid, p_ws uuid)
+returns table (codigo text, motivo text, solo_al_entrar boolean)
+language sql stable as $$
+  select p.codigo,
+    case p.estado
+      when 'activo' then 'no ha pasado por implementación: le falta aprobar su G6'
+      when 'pausado' then 'pausado y sin su G7: no podría seguir al reto ni dejarlo cerrar'
+      else 'sin su G7 aprobado' end,
+    p.estado <> 'en-implementacion'
+  from proyecto p
+  where p.reto_id = p_reto and p.workspace_id = p_ws
+    and (p.estado = 'activo'
+         or (p.estado in ('pausado', 'en-implementacion')
+             and not exists (select 1 from gate_instancia g
+               where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+                 and g.numero = 7 and g.estado = 'aprobado')))
+  order by p.codigo
+$$;
+revoke execute on function proyectos_frenan_medicion(uuid, uuid) from public;
+grant execute on function proyectos_frenan_medicion(uuid, uuid) to designio_app;
+
 -- ── El par «reto midiendo ⇔ proyecto midiendo» es INDIVISIBLE, y lo dice la TABLA ──
 -- §5.2 mueve los dos objetos a la vez —«el proyecto y el reto pasan a en medición»— y el
 -- guard del proyecto ya exigía su mitad: no entra en medición si su reto no está midiendo.
@@ -1095,15 +1142,18 @@ begin
   -- 'activo' la salida existe y es normal —retomar el proyecto, que vuelve a 'activo' o a
   -- implementación según su G6, y cerrar sus gates hasta G7—; en cuanto el reto se mueve,
   -- esa salida desaparece. Descubrirlo después es descubrirlo cuando ya no hay ninguna.
-  select string_agg(p.codigo, ', ' order by p.codigo) into atrapados
-  from proyecto p
-  where p.reto_id = new.id and p.workspace_id = new.workspace_id
-    and p.estado = 'pausado'
-    and not exists (select 1 from gate_instancia g
-      where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
-        and g.numero = 7 and g.estado = 'aprobado');
+  --
+  -- Y sale de `proyectos_frenan_medicion`, la MISMA fuente que usan el diagnóstico previo
+  -- del servicio y el espejo de la pantalla: mientras hubo tres redacciones del mismo
+  -- conjunto, cada ronda encontró un estado que a alguna le faltaba. Aquí, después del
+  -- movimiento, lo que la función añade a las dos comprobaciones de arriba es justo el
+  -- pausado sin G7 —los otros dos motivos ya los ha rechazado la primera—, pero se
+  -- pregunta entero para que añadir un estado mañana no vuelva a olvidarse de este lado.
+  select string_agg(f.codigo || ' (' || f.motivo || ')', ', ' order by f.codigo)
+    into atrapados
+  from proyectos_frenan_medicion(new.id, new.workspace_id) f;
   if atrapados is not null then
-    raise exception 'un proyecto pausado sin su G7 no podría seguir al reto ni dejarlo cerrar: retómalo y cierra sus gates antes de abrir la medición (§5.2): %', atrapados;
+    raise exception 'estos proyectos no pueden seguir al reto a medición: retómalos y cierra sus gates antes de abrirla (§5.2): %', atrapados;
   end if;
   return null;
 end $$;

@@ -378,52 +378,29 @@ export async function abrirMedicion(
     if (yaMedia && !listo!.medicion_sin_registry) {
       throw new ErrorMedicion('La medición de este reto ya está abierta');
     }
-    // El G7 es del CONJUNTO, no del proyecto que se esté mirando: esta operación mueve
-    // TODOS los que están en implementación y el guard de transición rechaza al que no
-    // tenga el suyo, así que basta un hermano sin G7 para que la apertura entera falle. Se
-    // dice antes de mover nada y con nombres, porque «falta un G7» sin decir cuál manda a
-    // buscarlo a mano. La pantalla mira exactamente esto (`proyectosSinG7`).
-    if (listo) {
-      const sinG7 = await tx`
-        select p.codigo from proyecto p
-        where p.reto_id = ${entrada.retoId} and p.workspace_id = ${entrada.workspaceId}
-          and p.estado = 'en-implementacion'
-          and not exists (select 1 from gate_instancia g
-            where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
-              and g.numero = 7 and g.estado = 'aprobado')
-        order by p.codigo`;
-      if (sinG7.length > 0) {
-        const lista = sinG7.map((p) => p.codigo as string).join(', ');
-        throw new ErrorMedicion(
-          `Falta el G7 en (${lista}): la apertura mueve a todos los proyectos del reto a la vez, así que hasta que lo tengan la medición no abre`,
-        );
-      }
-    }
-    // Un proyecto PAUSADO puede quedarse atrás —parar es del cliente y esta operación no
-    // lo toca— pero solo si todavía puede seguir al reto después. Sin su G7 aprobado no
-    // puede, y por tres reglas que se cierran entre sí: con el reto ya midiendo, retomarlo
-    // exige entrar directamente en medición, medir exige su G7, G7 exige G6 antes y
-    // aprobar G6 con el proyecto parado se rechaza. Atrapado él, el outcome review tampoco
-    // cierra el reto —exige que no quede ningún proyecto sin cerrar—, así que lo que se
-    // pierde no es un proyecto sino el final del reto.
+    // Qué proyectos del reto NO van a estar midiendo después de esto, y por qué. Sale de
+    // `proyectos_frenan_medicion`, la MISMA función que usan el guard del par y la
+    // proyección de la pantalla: este predicado se había escrito tres veces a mano y las
+    // tres se quedó un estado corto, así que ahora hay una sola redacción y tres lectores.
     //
-    // Se dice ANTES de mover nada, que es lo único que deja al operador una salida: con el
-    // reto todavía activo, retomar el proyecto y cerrar sus gates es el camino normal; en
-    // cuanto el reto se mueve, ese camino desaparece. El guard diferido lo vuelve a exigir
-    // para el SQL directo, pero allí el diagnóstico llega al COMMIT y sin nombres a mano.
-    if (listo && !yaMedia) {
-      const atrapados = await tx`
-        select p.codigo from proyecto p
-        where p.reto_id = ${entrada.retoId} and p.workspace_id = ${entrada.workspaceId}
-          and p.estado = 'pausado'
-          and not exists (select 1 from gate_instancia g
-            where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
-              and g.numero = 7 and g.estado = 'aprobado')
-        order by p.codigo`;
-      if (atrapados.length > 0) {
-        const lista = atrapados.map((p) => p.codigo as string).join(', ');
+    // Se dice ANTES de mover nada, que es lo único que deja salida: con el reto todavía
+    // activo, retomar un proyecto y cerrar sus gates es el camino normal del método; en
+    // cuanto el reto se mueve, esa salida desaparece.
+    //
+    // Con el reto HEREDADO solo cuentan los motivos que no son «al entrar»: allí el reto ya
+    // mide y sus proyectos están detrás por definición —esa es la avería que se está
+    // reparando—, así que exigirlos cerraría la única salida que esas filas tienen.
+    if (listo) {
+      const frenan = await tx`
+        select codigo, motivo from proyectos_frenan_medicion(${entrada.retoId}::uuid,
+                                                             ${entrada.workspaceId}::uuid)
+        where not solo_al_entrar or not ${yaMedia}`;
+      if (frenan.length > 0) {
+        const lista = frenan
+          .map((p) => `${p.codigo as string} (${p.motivo as string})`)
+          .join(', ');
         throw new ErrorMedicion(
-          `Retómalos y cierra sus gates antes de abrir la medición (${lista}): un proyecto pausado sin su G7 no podría seguir al reto ni dejarlo cerrar`,
+          `Estos proyectos del reto no pueden entrar en medición: ${lista}. La apertura los mueve a todos a la vez, así que resuélvelo antes`,
         );
       }
     }
@@ -1025,8 +1002,28 @@ export async function seguimientoDeImpacto(
                 -- cerrara ayer o antes), mientras que abajo se compara contra hoy, y hoy
                 -- todavía no ha terminado. Con el corte estricto se daba por cumplida la
                 -- entrega que tocaba justo el último día y nunca llegó.
+                --
+                -- Y el HUECO, que es la otra mitad y faltaba. Mirar solo la ÚLTIMA fecha
+                -- responde «¿siguió aportando hasta el final?» y no «¿aportó lo
+                -- comprometido?»: en una ventana mensual de tres meses, un único dato el
+                -- último día dejaba la entrada en 'cerrado' —«llegó lo comprometido»— con
+                -- dos entregas de tres sin llegar. Y 'cerrado' es lo que lee el outcome
+                -- review, así que un KPI que incumplió se presentaba como cumplido en el
+                -- sitio exacto donde este slice dice existir para impedirlo (la mitigación
+                -- del riesgo «presión por demostrar éxito»). La última fecha sola no puede
+                -- decidirlo porque no sabe cuántas entregas se prometieron; hay que
+                -- recorrer la ventana. Se recorre por HUECOS —entre el inicio y la primera
+                -- lectura, y entre cada dos consecutivas— porque un hueco mayor que el
+                -- paso ES una entrega prevista que no llegó, y contar huecos no exige
+                -- inventar el calendario de vencimientos.
+                --
+                -- El estado del que incumplió y ya no puede remediarlo sigue siendo
+                -- 'vencido': «se esperaba y no llegó» era cierto el último día y lo sigue
+                -- siendo después. 'cerrado' queda para quien cumplió hasta el final, que
+                -- es lo único que esa palabra promete.
                 when cad.paso is not null
-                     and (ult.fecha + cad.paso)::date <= e.ventana_inicio + c.ventana_dias
+                     and ((ult.fecha + cad.paso)::date <= e.ventana_inicio + c.ventana_dias
+                          or coalesce(hue.hubo_hueco, false))
                   then 'vencido'
                 -- Llegó lo comprometido hasta el final: la medición terminó.
                 else 'cerrado' end
@@ -1060,6 +1057,20 @@ export async function seguimientoDeImpacto(
             when 'semanal' then interval '7 days'
             when 'mensual' then interval '1 month'
             when 'trimestral' then interval '3 months' end as paso) cad
+          -- ¿Se quedó sin llegar alguna entrega DENTRO de la ventana? Un hueco mayor que el
+          -- paso entre dos lecturas consecutivas —o entre el inicio de la ventana y la
+          -- primera— es exactamente eso. El lag con valor por defecto ventana_inicio
+          -- hace que la primera lectura se mida contra el inicio sin un caso aparte.
+          left join lateral (
+            -- Estricto: la entrega vence el día previa+paso y ese día todavía cuenta,
+            -- así que solo hay hueco si la siguiente lectura llega DESPUÉS. Es el mismo
+            -- corte inclusivo que usa toda la ventana de este slice.
+            select bool_or((g.previa + cad.paso)::date < g.fecha) as hubo_hueco
+            from (select s.fecha,
+                    lag(s.fecha, 1, e.ventana_inicio) over (order by s.fecha) as previa
+                  from snapshot s
+                  where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id) g
+          ) hue on true
           where e.registry_id = mr.id and e.workspace_id = mr.workspace_id), '[]'::jsonb) as entradas,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', c.id, 'kpi', c.kpi) order by c.creado_en, c.id)
@@ -1068,21 +1079,18 @@ export async function seguimientoDeImpacto(
             and not exists (select 1 from entrada_kpi e
               where e.criterio_id = c.id and e.workspace_id = c.workspace_id)), '[]'::jsonb)
           as criterios_sin_entrada,
-        -- Qué proyectos del RETO impedirían abrir la medición por faltarles su G7. La
+        -- Qué proyectos del RETO frenan la apertura de la medición, y por qué. La
         -- disponibilidad de esa operación es propiedad del CONJUNTO y no del proyecto que
-        -- se está mirando: abrirMedicion mueve todos los que están en implementación y el
-        -- guard rechaza al hermano sin G7, así que una pantalla que solo mire su gate
-        -- anuncia lista una acción que la base va a negar. Van los CÓDIGOS porque el motivo
-        -- tiene que decir cuál falta, no solo que falta alguno.
+        -- se está mirando, y el conjunto lo define UNA función que comparten el guard del
+        -- par y el diagnóstico del servicio: escribirlo aquí a mano es lo que ya se quedó
+        -- corto tres veces. Van con motivo porque decir «falta algo» sin decir qué manda a
+        -- buscarlo a mano por los proyectos del reto.
         coalesce((
-          select jsonb_agg(p2.codigo order by p2.codigo)
-          from proyecto p2
-          where p2.reto_id = r.id and p2.workspace_id = r.workspace_id
-            and p2.estado = 'en-implementacion'
-            and not exists (select 1 from gate_instancia g
-              where g.proyecto_id = p2.id and g.workspace_id = p2.workspace_id
-                and g.numero = 7 and g.estado = 'aprobado')), '[]'::jsonb)
-          as proyectos_sin_g7,
+          select jsonb_agg(jsonb_build_object('codigo', f.codigo, 'motivo', f.motivo)
+                           order by f.codigo)
+          from proyectos_frenan_medicion(r.id, r.workspace_id) f
+          where not f.solo_al_entrar or r.estado <> 'en-medicion'), '[]'::jsonb)
+          as proyectos_frenan,
         -- Candidatos a dueño del dato: SOLO el lado cliente (RF-07.1), con el mismo
         -- predicado que la política de la entrada y el guard de la firma. Ofrecer a un
         -- curador aquí sería ofrecer lo que la base rechaza, y ese rechazo llegaría —en el
@@ -1127,7 +1135,7 @@ export async function seguimientoDeImpacto(
       registry: fila.registry as SeguimientoDeImpacto['registry'],
       entradas: fila.entradas as SeguimientoDeImpacto['entradas'],
       criteriosSinEntrada: fila.criterios_sin_entrada as SeguimientoDeImpacto['criteriosSinEntrada'],
-      proyectosSinG7: fila.proyectos_sin_g7 as string[],
+      proyectosFrenan: fila.proyectos_frenan as SeguimientoDeImpacto['proyectosFrenan'],
       propietariosPosibles:
         fila.propietarios_posibles as SeguimientoDeImpacto['propietariosPosibles'],
       review: fila.review as SeguimientoDeImpacto['review'],

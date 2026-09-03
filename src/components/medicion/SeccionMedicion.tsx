@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -26,6 +26,7 @@ import {
   etiquetaVentana,
   FRECUENCIAS,
   medicionPorAbrir,
+  narrativaDelBorrador,
   VEREDICTOS,
   ventanaAbierta,
   postMortemPorAbrir,
@@ -109,11 +110,11 @@ export function SeccionMedicion({
   // conciliados y el effective state constatado. Firmar el contrato no basta.
   //
   // Y es propiedad del CONJUNTO, no del proyecto que se está mirando: `abrirMedicion` mueve
-  // todos los proyectos del reto que están en implementación, y el guard de transición
-  // rechaza al hermano sin G7 — así que mirar solo este gate anunciaba lista una acción que
-  // la base iba a negar. La proyección trae los que faltan, con su código, porque el motivo
-  // tiene que decir CUÁL falta.
-  const faltanG7 = seguimiento.proyectosSinG7;
+  // todos los proyectos del reto y el guard rechaza al hermano que no pueda seguirlo, así
+  // que mirar solo este gate anunciaba lista una acción que la base iba a negar. La lista
+  // la define la MISMA función de base que usan el guard y el diagnóstico del servicio, con
+  // su motivo, porque decir «falta algo» sin decir qué manda a buscarlo a mano.
+  const frenan = seguimiento.proyectosFrenan;
   const comunes = { workspaceId, seguimiento, onCambio, onError };
 
   return (
@@ -124,7 +125,7 @@ export function SeccionMedicion({
         esCurador={esCurador}
         esLead={esLead}
         puedeFirmar={rol === firmaG6}
-        faltanG7={faltanG7}
+        frenan={frenan}
       />
       {seguimiento.registry?.estado === 'firmado' &&
         seguimiento.entradas.map((entrada) => (
@@ -144,7 +145,7 @@ function BloqueRegistry({
   esCurador,
   esLead,
   puedeFirmar,
-  faltanG7,
+  frenan,
   onCambio,
   onError,
 }: Comunes & {
@@ -152,7 +153,7 @@ function BloqueRegistry({
   esCurador: boolean;
   esLead: boolean;
   puedeFirmar: boolean;
-  faltanG7: string[];
+  frenan: { codigo: string; motivo: string }[];
 }) {
   const [ocupado, setOcupado] = useState(false);
   const [editando, setEditando] = useState<string | null>(null);
@@ -305,7 +306,7 @@ function BloqueRegistry({
         </span>
       )}
 
-      {firmado && porAbrir && esLead && faltanG7.length === 0 && (
+      {firmado && porAbrir && esLead && frenan.length === 0 && (
         <div>
           <Button
             size="sm"
@@ -326,10 +327,10 @@ function BloqueRegistry({
           </Button>
         </div>
       )}
-      {firmado && porAbrir && esLead && faltanG7.length > 0 && (
+      {firmado && porAbrir && esLead && frenan.length > 0 && (
         <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
-          La medición se abre al aprobarse el G7: primero se concilian los releases contra
-          la design version y se constata el effective state. Falta en {faltanG7.join(', ')}.
+          La medición mueve a todos los proyectos del reto a la vez, y estos no pueden
+          entrar todavía: {frenan.map((p) => `${p.codigo} — ${p.motivo}`).join(' · ')}.
         </span>
       )}
     </Card>
@@ -836,6 +837,28 @@ function BloqueReview({
   const [aprendizajes, setAprendizajes] = useState('');
   const [experimental, setExperimental] = useState(false);
   const [justificacion, setJustificacion] = useState('');
+
+  // El formulario se HIDRATA del borrador guardado, y no es comodidad: completar escribe
+  // las cinco columnas de la narrativa a la vez, así que arrancando en vacío bastaba abrir
+  // la pantalla y elegir veredicto para BORRAR la contribución, los factores, las hipótesis
+  // y los aprendizajes que ya se habían redactado — y el review completado es inmutable,
+  // así que lo que se pierde ahí no vuelve. Se sincroniza por `id` para recoger también el
+  // review recién abierto sin pisar lo que se esté escribiendo entre tanto.
+  const reviewId = review?.id ?? null;
+  useEffect(() => {
+    if (!review) return;
+    const borrador = narrativaDelBorrador(review);
+    if (borrador.veredicto !== null) setVeredicto(borrador.veredicto);
+    setContribucion(borrador.contribucion);
+    setFactores(borrador.factoresExternos);
+    setHipotesis(borrador.hipotesisAbiertas);
+    setAprendizajes(borrador.aprendizajes);
+    setExperimental(borrador.disenoExperimentalSuficiente);
+    setJustificacion(borrador.disenoExperimentalJustificacion);
+    // Deliberadamente por `id` y no por el contenido: recargar la proyección tras cada
+    // escritura no debe reescribir el campo que el lead tiene a medias delante.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewId]);
 
   async function abrir() {
     setOcupado(true);

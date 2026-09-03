@@ -300,9 +300,11 @@ export type SeguimientoDeImpacto = {
   entradas: EntradaDeRegistry[];
   /** Criterios del reto sin KPI que los responda: la firma los exige (SYS-22). */
   criteriosSinEntrada: { id: string; kpi: string }[];
-  /** Códigos de los proyectos del reto que están en implementación SIN su G7 aprobado:
-   * los que harían fallar la apertura de la medición, que mueve a todos a la vez. */
-  proyectosSinG7: string[];
+  /** Los proyectos del reto que NO acabarían midiendo tras abrir la medición, con su
+   * motivo. Lo define una sola función de base (`proyectos_frenan_medicion`) que comparten
+   * el guard del par, el diagnóstico del servicio y este espejo: mientras hubo tres
+   * redacciones del mismo conjunto, a alguna siempre le faltaba un estado. */
+  proyectosFrenan: { codigo: string; motivo: string }[];
   /** Candidatos a propietario del dato: SOLO los miembros del lado cliente (RF-07.1). No
    * es «los miembros del workspace» filtrados por conveniencia de pantalla — es la misma
    * lista que la política de la entrada y el guard de la firma exigen, así que ofrecer
@@ -373,6 +375,36 @@ export function ventanasCerradas(entradas: EntradaDeRegistry[]): boolean {
  * ha abierto su medición y la política lo rechazaba en cada clic. Media condición es un
  * botón que miente, igual que media salida no es una salida.
  */
+/**
+ * Con qué valores arranca el formulario de completar el post mortem: los del BORRADOR
+ * guardado, no vacíos. No es comodidad — completar escribe las cinco columnas de la
+ * narrativa a la vez, así que un formulario que arranca en blanco convierte «abro la
+ * pantalla y elijo veredicto» en «borro la contribución, los factores, las hipótesis y los
+ * aprendizajes que alguien ya había redactado», y el review completado es INMUTABLE: lo que
+ * se pierde ahí no vuelve. Vive aquí y no dentro del componente por el mismo motivo que sus
+ * hermanos `medicionPorAbrir` y `postMortemPorAbrir`: lo que la pantalla decide a mano es
+ * lo que ningún test alcanza.
+ */
+export function narrativaDelBorrador(review: OutcomeReviewDeReto | null): {
+  veredicto: VeredictoSlug | null;
+  contribucion: string;
+  factoresExternos: string;
+  hipotesisAbiertas: string;
+  aprendizajes: string;
+  disenoExperimentalSuficiente: boolean;
+  disenoExperimentalJustificacion: string;
+} {
+  return {
+    veredicto: review?.veredicto ?? null,
+    contribucion: review?.contribucion ?? '',
+    factoresExternos: review?.factoresExternos ?? '',
+    hipotesisAbiertas: review?.hipotesisAbiertas ?? '',
+    aprendizajes: review?.aprendizajes ?? '',
+    disenoExperimentalSuficiente: review?.disenoExperimentalSuficiente ?? false,
+    disenoExperimentalJustificacion: review?.disenoExperimentalJustificacion ?? '',
+  };
+}
+
 export function postMortemPorAbrir(seguimiento: {
   retoEstado: string;
   entradas: EntradaDeRegistry[];

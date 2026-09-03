@@ -309,7 +309,14 @@ export async function aprobarGate(
     await bloquearReto(tx, pertenece.reto_id as string);
     await bloquearGate(tx, entrada.gateId);
 
-    const aprobado = await tx`
+    // El guard de suficiencia levanta P0001 con el motivo EXACTO —«hay elementos de la
+    // design version sin release asignado», «los gates anteriores deben aprobarse
+    // primero»—, y ese porqué es el producto: sin traducirlo, la pantalla enseñaba un
+    // fallo genérico y el lead se quedaba sin saber qué le falta. El diagnóstico por
+    // cero filas sigue detrás, para lo que la política rechaza sin decir nada.
+    let aprobado;
+    try {
+      aprobado = await tx`
       update gate_instancia g
       set estado = 'aprobado', aprobado_por = ${actorId}, aprobado_en = now()
       where g.id = ${entrada.gateId} and g.workspace_id = ${entrada.workspaceId}
@@ -335,6 +342,11 @@ export async function aprobarGate(
                  or ((nullif(btrim(c.linea_base_valor), '') is null or c.linea_base_fecha is null)
                      and btrim(c.linea_base_plan) = ''))))
       returning g.numero`;
+    } catch (e) {
+      const err = e as { code?: string; message?: string };
+      if (err.code === 'P0001' && err.message) throw new ErrorMetodo(err.message);
+      throw e;
+    }
 
     if (aprobado.length === 0) {
       throw new ErrorMetodo(await diagnosticoDeGate(tx, entrada.workspaceId, entrada.gateId));

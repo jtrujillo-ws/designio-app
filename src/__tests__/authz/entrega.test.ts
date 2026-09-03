@@ -25,7 +25,7 @@ import {
   versionAprobadaDelServicio,
 } from '@/lib/entrega/entrega.servicio';
 import { calcularDiff, conciliacionCompleta } from '@/lib/entrega/entrega.diff';
-import { aprobarGate } from '@/lib/metodo/metodo.servicio';
+import { aprobarGate, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
 import { revalidarDecision } from '@/lib/metodo/gobernanza.servicio';
 import { abrirHilo, hilosDeObjetos } from '@/lib/portal/portal.servicio';
 import { borrarNodo, journeysDelWorkspace } from '@/lib/journey/journey.servicio';
@@ -1582,6 +1582,19 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await expect(aprobarGateCrudo(6)).rejects.toThrow(
       /ninguna design version con elementos que planificar/,
     );
+    // Y por el camino de la app llega el MISMO motivo, no un fallo genérico: el porqué es
+    // el producto de este guard, y sin traducir el P0001 la pantalla no lo enseñaba.
+    const [g6Crudo] = await admin`select id from gate_instancia
+      where proyecto_id = ${proyG6} and workspace_id = ${ws} and numero = 6`;
+    const fallo = await aprobarGate(sponsorId, {
+      workspaceId: ws,
+      gateId: g6Crudo!.id as string,
+    }).catch((e: unknown) => e);
+    // Del TIPO depende que la pantalla lo enseñe: el mapeador de las server functions
+    // devuelve el mensaje de un ErrorMetodo y deja escapar cualquier otro como fallo
+    // genérico. Que el texto coincida no basta si llega como error de Postgres.
+    expect(fallo).toBeInstanceOf(ErrorMetodo);
+    expect((fallo as Error).message).toMatch(/ninguna design version con elementos que planificar/);
 
     const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
       values (${ws}, 'Servicio del plan', ${leadId}) returning id`;

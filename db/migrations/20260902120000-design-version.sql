@@ -382,8 +382,10 @@ revoke execute on function g7_motivo_de_bloqueo(uuid, uuid) from public;
 -- La pantalla de conciliación la llama para decir lo mismo que dirá el gate. No es SECURITY
 -- DEFINER: lee bajo las políticas del rol de la app, las mismas con las que ya dibuja el
 -- tablero.
+-- `g7_motivo_de_bloqueo` no es SECURITY DEFINER, así que las dos que llama por dentro se
+-- ejecutan también como el rol de la app: necesitan su grant. El de
+-- `design_versions_a_cargo_del_proyecto` ya está más arriba, dado para las políticas.
 grant execute on function g7_motivo_de_bloqueo(uuid, uuid) to designio_app;
-grant execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) to designio_app;
 grant execute on function design_versions_superadas_del_ambito(uuid, uuid) to designio_app;
 
 -- ══ RLS ══

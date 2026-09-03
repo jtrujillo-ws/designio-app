@@ -748,6 +748,97 @@ grant execute on function filas_de_conciliacion(uuid, uuid) to designio_app;
 -- curadores (lead/diseñador: producen el artefacto); el plan de releases, el despliegue
 -- y la constatación son del lead. El sponsor aprueba GATES (G5/G6/G7), no objetos: su
 -- palanca sobre una design version es no aprobar el gate que la certifica.
+--
+-- ── CENSO C · POLÍTICAS CUYO `exists` LEE UNA TABLA QUE ESTE SLICE TAMBIÉN ESCRIBE ──────
+--
+-- Un `using`/`with check` con un `exists` sobre otra tabla es la MISMA clase de lectura
+-- cruzada que la del censo B, y con un agravante: se evalúa con la instantánea de la
+-- sentencia, así que una escritura ajena sin commitear no está en ella. Esta clase ya se
+-- cobró dos hallazgos en este slice —el alta de elementos contra la aprobación, y el alta
+-- de releases contra la supersión—, así que las políticas van censadas una a una.
+--
+-- Solo se enumeran las 26 que añade esta migración; no modifica ninguna anterior. De ellas,
+-- 8 son de SELECT (solo `is_workspace_member`, sin lectura cruzada) y 4 de escritura miran
+-- únicamente columnas de su propia fila y el rol —design_version_insert,
+-- design_version_superar, design_version_enlazar_journey, release_desplegar y
+-- release_verificar—: correctas por construcción, no hay predicado que envejecer.
+--
+-- Las que sí leen fuera, con qué escritura las puede volver falsas y qué lo impide:
+--
+--   design_version_aprobar → journey_snapshot
+--     afirma ...... el snapshot al que apunta existe y es del journey de la versión
+--     lo rompería . mover el journey del borrador (enlazarJourney)
+--     veredicto ... SERIALIZADO por `dv-elemento`, que toman las dos rutas; y la fuente es
+--                   append-only (journey_snapshot no tiene grant de update ni delete).
+--                   Además design_version_transicion_guard relee la frescura del snapshot
+--                   (xmin) bajo los dos candados.
+--
+--   elemento_cambio_insert / _update / _delete → design_version
+--     afirma ...... la design version del elemento sigue en 'borrador'
+--     lo rompería . aprobarla
+--     veredicto ... CERRADO por elemento_cambio_version_editable_guard, diferido, que
+--                   relee el estado bajo `dv-elemento`. Es el hallazgo que estrenó la clase.
+--
+--   elemento_decision_insert / _delete, elemento_insight_insert / _delete
+--     → elemento_cambio y design_version
+--     afirma ...... el elemento existe y su versión sigue en 'borrador'
+--     lo rompería . aprobar la versión; borrar el elemento
+--     veredicto ... CERRADO dos veces: el mismo diferido sirve a las tres tablas, y el
+--                   borrado del elemento lo cierra la FK compuesta.
+--
+--   release_insert → design_version (vía design_versions_a_cargo_del_proyecto)
+--     afirma ...... la versión sigue respondiendo por sus gates (no la ha superado otra)
+--     lo rompería . aprobar la sucesora
+--     veredicto ... SERIALIZADO por `design-version(servicio)`: lo toma planificarRelease y
+--                   también lo toma el trigger de serie al insertar un release, así que
+--                   vale igual para el SQL directo. Fue un P1 y así se cerró.
+--
+--   release_elemento_delete → release
+--     afirma ...... el release sigue 'planificado'
+--     lo rompería . desplegarlo
+--     veredicto ... CERRADO por release_alcance_fijo_guard, diferido, que relee el estado
+--                   bajo `release`.
+--
+--   release_elemento_insert → release y design_version
+--     afirma ...... (1) el release sigue 'planificado' y (2) su versión sigue a cargo
+--     lo rompería . (1) desplegarlo; (2) aprobar la sucesora
+--     veredicto ... (1) CERRADO por release_alcance_fijo_guard, igual que el delete.
+--                   (2) SERIALIZADO por `design-version(servicio)` en la ruta del servicio
+--                   (asignarElementosAlRelease lo toma), pero NO para el SQL directo: un
+--                   `insert into release_elemento` a pelo no toma ningún candado hasta su
+--                   fase de commit, y el diferido que corre entonces solo relee (1).
+--                   Es la única casilla de este censo que no está cerrada, y se deja así a
+--                   propósito, con el razonamiento a la vista:
+--                     · el estado que produce —alcance nuevo en un release de una versión
+--                       ya superada— es alcanzable SECUENCIALMENTE y de forma legítima:
+--                       basta planificar el release antes de aprobar la sucesora;
+--                     · no es un estado invisible: G7 no certifica un proyecto cuya versión
+--                       superada dejó releases sin resolver, así que el sistema lo detecta
+--                       y lo obliga a cerrarse, con la salida documentada de vaciar o
+--                       desplegar el release;
+--                     · y los dos sitios donde cabría el candado —el guard inmediato del
+--                       alcance, o su diferido— lo tomarían en un orden que, para una
+--                       transacción de SQL directo que borre alcance y lo vuelva a insertar,
+--                       queda del lado equivocado de `reto`: se cambiaría un estado acotado
+--                       y detectado por un interbloqueo nuevo.
+--                   Si algún día el alcance se escribe desde otra ruta del producto, esto
+--                   deja de ser aceptable y el candado va en asignarElementosAlRelease.
+--
+--   effective_state_insert → release
+--     afirma ...... el release está 'desplegado'
+--     lo rompería . verificarlo
+--     veredicto ... SERIALIZADO por `release`, que esta transacción ya sostiene desde su
+--                   propio trigger de serie (codigo_de_effective_state) y que también toma
+--                   release_transicion_guard.
+--
+--   constatacion_insert → effective_state y release
+--     afirma ...... el effective state cuelga de un release 'desplegado'
+--     lo rompería . verificar el release
+--     veredicto ... CERRADO sin candado propio, y por dos vías: verificar exige que TODOS
+--                   los elementos del alcance estén constatados, así que una verificación
+--                   concurrente no ve esta constatación y se rechaza a sí misma; y si el
+--                   elemento ya estuviera constatado, el único (effective_state, elemento)
+--                   rechaza la segunda.
 
 alter table design_version enable row level security;
 alter table elemento_cambio enable row level security;
@@ -1153,12 +1244,11 @@ create policy constatacion_insert on constatacion
 --                                   → el candado `release`, que la transacción sostiene
 --                                     desde el alta del effective state
 --
--- ── LO QUE ESTOS DOS CENSOS NO CUBREN ───────────────────────────────────────────────────
+-- ── LO QUE ESTOS CENSOS NO CUBREN ───────────────────────────────────────────────────────
 --
---  · Las POLÍTICAS RLS. Un `using`/`with check` con un exists sobre otra tabla es la misma
---    clase de lectura cruzada y aquí no se enumeran. Dos de los hallazgos de este slice
---    fueron exactamente eso, y se cerraron con guards diferidos; no hay garantía de que
---    queden censadas todas.
+--  · Las POLÍTICAS RLS son la misma clase de lectura cruzada y tienen su propio censo, el C,
+--    junto a los `create policy` de más abajo. Ahí queda dicha la única casilla que no está
+--    cerrada y por qué se acepta.
 --  · El orden en que se encolan los candados de VARIOS diferidos de una misma transacción,
 --    que sigue el orden de las sentencias. Ninguna ruta del servicio mezcla escrituras de
 --    elemento con bajas de alcance, pero una transacción de SQL directo que lo hiciera

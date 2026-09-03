@@ -361,6 +361,22 @@ export function ventanasCerradas(entradas: EntradaDeRegistry[]): boolean {
   return entradas.length > 0 && entradas.every((e) => !ventanaAbierta(e));
 }
 
+/**
+ * Espejo cliente EXACTO de lo que `review_insert` acepta: informa la pantalla, no autoriza
+ * nada. Son DOS condiciones y no una —el reto MIDIENDO y las ventanas del contrato ya
+ * cerradas— y vive aquí, junto a su hermano `medicionPorAbrir`, por el mismo motivo: un
+ * predicado de pantalla escrito a mano dentro del componente es el que se queda a medias.
+ * Escrito solo como «las ventanas vencieron», el botón se dibujaba para un reto que aún no
+ * ha abierto su medición y la política lo rechazaba en cada clic. Media condición es un
+ * botón que miente, igual que media salida no es una salida.
+ */
+export function postMortemPorAbrir(seguimiento: {
+  retoEstado: string;
+  entradas: EntradaDeRegistry[];
+}): boolean {
+  return seguimiento.retoEstado === 'en-medicion' && ventanasCerradas(seguimiento.entradas);
+}
+
 /** Cómo se dice una ventana en la pantalla, en UN sitio: los tres estados (falta tiempo,
  * cierra hoy, ya cerró) más la ausencia de ventana. Escrito por su cuenta en cada bloque,
  * el caso del último día —el único que este corte introduce— se olvidaría en alguno. */

@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import type { TransactionSql } from 'postgres';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
@@ -27,6 +28,7 @@ import {
 } from '@/lib/medicion/medicion.servicio';
 import {
   medicionPorAbrir,
+  postMortemPorAbrir,
   ResultadoCriterioSchema,
   ventanasCerradas,
 } from '@/lib/medicion/medicion.schemas';
@@ -1169,6 +1171,11 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       // Y lo que no se adivina se rechaza diciéndolo: un número agrupado tiene DOS
       // separadores y no hay forma de saber cuál es cuál.
       `${fecha(-3)};1.234,5;miles agrupados`,
+      // La nota que no cabe se RECHAZA, no se recorta: recortarla reportaba la fila como
+      // insertada y guardaba un texto distinto del que el fichero decía, sin nada en
+      // `rechazadas`. Y no es un campo cualquiera —la nota explica una CORRECCIÓN, que en
+      // una serie append-only es el único sitio donde consta por qué un número cambió—.
+      `${fecha(-4)};44;${'x'.repeat(501)}`,
     ].join('\n');
     const euro = await cargarSnapshotsCsv(sponsorId, {
       workspaceId: ws,
@@ -1176,8 +1183,9 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       csv: csvEuropeo,
     });
     expect(euro.insertados).toBe(1);
-    expect(euro.rechazadas.map((f) => f.linea)).toEqual([3]);
+    expect(euro.rechazadas.map((f) => f.linea)).toEqual([3, 4]);
     expect(euro.rechazadas[0]!.motivo).toMatch(/más de un separador decimal/);
+    expect(euro.rechazadas[1]!.motivo).toMatch(/Nota de 501 caracteres/);
     const segEuro = await seguimientoDeImpacto(leadId, ws, proyectoId);
     const conComa = segEuro!.entradas
       .find((e) => e.id === entradaAbandonoId)!
@@ -1276,6 +1284,13 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const reintentos = seg!.entradas.find((e) => e.id === entradaReintentosId)!;
     expect(reintentos.estadoSnapshot).toBe('vencido');
     expect(reintentos.diasRestantes).toBeLessThanOrEqual(0);
+
+    // El espejo de la pantalla son DOS condiciones y no una: con las ventanas ya vencidas
+    // pero el reto todavía sin abrir su medición, `review_insert` rechaza cada clic — así
+    // que el botón no se ofrece. Media condición es un botón que miente.
+    expect(postMortemPorAbrir({ retoEstado: 'en-medicion', entradas: seg!.entradas })).toBe(true);
+    expect(postMortemPorAbrir({ retoEstado: 'activo', entradas: seg!.entradas })).toBe(false);
+    expect(ventanasCerradas(seg!.entradas)).toBe(true);
 
     // El stakeholder no abre el post-mortem aunque la ventana esté cerrada.
     await expect(abrirOutcomeReview(stakeId, { workspaceId: ws, retoId })).rejects.toThrow(
@@ -1618,7 +1633,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const tandas = await cuerpos('SnapshotsCargados');
     expect(tandas.length).toBe(2);
     expect(tandas[0]!.rechazadas).toBe(5);
-    expect(tandas[1]!.rechazadas).toBe(1);
+    expect(tandas[1]!.rechazadas).toBe(2);
 
     // El post-mortem: apertura del review y resultado por criterio.
     expect((await cuerpos('OutcomeReviewAbierto')).some((p) => p.reviewId === reviewId)).toBe(true);
@@ -2767,6 +2782,66 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const cerrados = await conUsuario(leadId, (tx) => tx`select estado from proyecto
       where reto_id = ${r.retoId} order by codigo`);
     expect(cerrados.map((p) => p.estado as string)).toEqual(['cerrado', 'cerrado']);
+
+    // ── Y el relleno de la migración NO toca a los proyectos de un reto que ya terminó ──
+    // El ciclo anterior cerraba el reto sin poder mover el estado del proyecto —no tenía
+    // grant para esa columna—, así que en una base con historia hay retos CERRADOS con su
+    // G6 aprobado y su proyecto todavía en 'activo'. Ese es el reto de este test una vez
+    // cerrado, así que la forma se puede fabricar sobre él.
+    const [d] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${r.retoId}, 'P-75D', 'Frente de un reto que ya terminó', ${leadId})
+      returning id`;
+    const dId = d!.id as string;
+    // Con su G6 y su G7 aprobados, para que el callejón se vea entero y no se quede en el
+    // primer rechazo: ni siquiera teniendo el gate que abre la medición hay salida.
+    await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+      values (${ws}, ${dId}, 6, 'sponsor', 'aprobado', ${leadId}, now()),
+             (${ws}, ${dId}, 7, 'lead-boutique', 'aprobado', ${leadId}, now())`;
+    // El predicado EXACTO del relleno no lo alcanza: pide además que su reto siga VIVO.
+    const alcanzados = await admin`select p.codigo from proyecto p
+      where p.estado = 'activo'
+        and exists (select 1 from reto r
+          where r.id = p.reto_id and r.workspace_id = p.workspace_id
+            and r.estado in ('activo', 'en-medicion'))
+        and exists (select 1 from gate_instancia g
+          where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+            and g.numero = 6 and g.estado = 'aprobado')`;
+    expect(alcanzados.some((p) => (p.codigo as string) === 'P-75D')).toBe(false);
+    // Y no solo el predicado copiado aquí: se ejecuta el relleno TAL CUAL está escrito en la
+    // migración, dentro de una transacción que se revierte, y este proyecto se queda donde
+    // está. Sin la condición del reto, esa misma sentencia lo movería. (Se revierte porque
+    // la sentencia es global por diseño —una migración no filtra por workspace— y las
+    // suites corren en paralelo; el `lock_timeout` hace que una contención se vea en vez de
+    // esperar callando.)
+    const fuente = await readFile('db/migrations/20260902110000-medicion.sql', 'utf8');
+    const desde = fuente.indexOf('do $$', fuente.indexOf('-- …y la marca sola no basta'));
+    const relleno = fuente.slice(desde, fuente.indexOf('end $$;', desde) + 'end $$;'.length);
+    expect(relleno).toContain('ProyectoTransicionado');
+    await admin
+      .begin(async (tx) => {
+        await tx`set local lock_timeout = '5s'`;
+        await tx.unsafe(relleno);
+        const [trasRelleno] = await tx`select estado from proyecto where id = ${dId}`;
+        expect(trasRelleno!.estado).toBe('activo');
+        throw new Error('deshacer el relleno de prueba');
+      })
+      .catch((e: unknown) => {
+        if (!String(e).includes('deshacer el relleno de prueba')) throw e;
+      });
+    // Y por qué importa, recorrido hasta el final: movido a implementación por la migración,
+    // ese proyecto quedaría con la historia falsificada —trabajo implementándose bajo un
+    // reto que terminó— y VARADO para siempre, porque desde ahí no hay salida ninguna.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+      where id = ${dId}`);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'cerrado' where id = ${dId}`),
+    ).rejects.toThrow(/transición de proyecto ilegal: en-implementacion → cerrado/);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion' where id = ${dId}`),
+    ).rejects.toThrow(/pasa a medición con su reto/);
+
   });
 
   it('una cuenta desactivada con sesión viva no lee el seguimiento ni carga snapshots', async () => {

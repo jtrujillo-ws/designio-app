@@ -268,7 +268,35 @@ update gate_instancia set aprobado_sin_registry = true
 --
 -- Elegibles son los ACTIVOS y solo ellos: un proyecto pausado se retoma a implementación
 -- por su propio par legal —parar es del cliente y una migración no deshace una pausa— y
--- los que ya miden o están cerrados están más adelante, no más atrás.
+-- los que ya miden o están cerrados están más adelante, no más atrás. (En la práctica
+-- TODO proyecto anterior a este slice está en 'activo', porque el ciclo anterior no tenía
+-- grant de UPDATE sobre esa columna; el predicado lo dice igual, para no adivinar sobre
+-- una fila que llegara de otra forma.)
+--
+-- Y elegibles son también, y sobre todo, los de un reto VIVO. Esta condición faltaba y era
+-- la peor clase de omisión: la que produce un estado irrecuperable sobre datos que YA
+-- existen. El ciclo anterior admitía `en-medicion → cerrado` sin tocar el estado del
+-- proyecto —no tenía grant para hacerlo—, así que en una base con historia hay retos
+-- CERRADOS con su G6 aprobado y su proyecto todavía en 'activo'. Moverlo a
+-- 'en-implementacion' diría que hay trabajo implementándose bajo un reto que terminó, y lo
+-- diría PARA SIEMPRE: desde implementación los únicos destinos son 'pausado' y
+-- 'en-medicion', y a medición no se llega porque exige que el reto esté midiendo — y un
+-- reto cerrado no vuelve. Historia falsificada y fila varada, hechas por la migración.
+--
+-- Qué se hace con esos proyectos: NADA, y es una decisión, no un olvido. Se quedan en el
+-- único estado que el esquema viejo podía dejarles. Se descartó cerrarlos —que es lo que
+-- «reflejar una historia terminada» pediría— porque `cerrado` es INMUTABLE (SYS-08) y
+-- escribirlo por decreto es una afirmación irreversible que esta migración no tiene
+-- mandato para hacer: exactamente el mismo argumento por el que no le inventa un veredicto
+-- al reto cerrado que no lo tuvo. Un estado heredado y raro es una deuda declarada; un
+-- estado heredado, raro y congelado es una deuda que ya nadie puede saldar. Se nombra en
+-- un notice, como aquella, y saldarla es decisión de PRODUCTO.
+--
+-- Y excluirlos no reabre el atajo por el que se retiró el par `activo → en-medicion`: un
+-- proyecto de un reto cerrado no puede llegar a medición por definición —el guard de
+-- transición exige que su reto esté midiendo—, así que la post-condición que sostiene esa
+-- retirada es la que de verdad hace falta: ningún proyecto de un reto VIVO se queda en
+-- 'activo' con su G6 aprobado.
 --
 -- Y la política de auditoría es EXPLÍCITA, que es la otra mitad de traer una historia. El
 -- rastro lo escribe esta sentencia y no el guard de transición —que en este punto del
@@ -283,6 +311,9 @@ begin
   with movidos as (
     update proyecto p set estado = 'en-implementacion'
       where p.estado = 'activo'
+        and exists (select 1 from reto r
+          where r.id = p.reto_id and r.workspace_id = p.workspace_id
+            and r.estado in ('activo', 'en-medicion'))
         and exists (select 1 from gate_instancia g
           where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
             and g.numero = 6 and g.estado = 'aprobado')
@@ -297,6 +328,17 @@ begin
   if heredados > 0 then
     raise notice
       '% proyecto(s) con G6 aprobado antes de SPEC-07 pasan a en-implementacion: es la fase que su aprobación ya significaba (§7)',
+      heredados;
+  end if;
+  -- Y la deuda que se deja declarada en vez de saldada por decreto.
+  select count(*) into heredados from proyecto p
+    where p.estado = 'activo'
+      and exists (select 1 from reto r
+        where r.id = p.reto_id and r.workspace_id = p.workspace_id
+          and r.estado in ('cerrado', 'archivado'));
+  if heredados > 0 then
+    raise notice
+      '% proyecto(s) siguen en activo bajo un reto ya terminado: el ciclo anterior cerraba el reto sin poder mover el proyecto. NO se les inventa un estado (cerrado es inmutable); saldarlo es decisión de producto',
       heredados;
   end if;
 end $$;
@@ -715,7 +757,9 @@ create policy proyecto_update_estado on proyecto
 -- Y `activo → en-medicion` NO está: no es una restricción nueva sino el par que sobraba.
 -- Medir exige G7, G7 exige G6 y aprobar G6 mete el proyecto en implementación, así que un
 -- proyecto en 'activo' con su G7 aprobado solo podía existir como HISTORIA —G6 aprobado
--- antes de que ese efecto existiera—, y a esa historia la mueve el relleno del preámbulo.
+-- antes de que ese efecto existiera—, y a esa historia la mueve el relleno del preámbulo
+-- allí donde el par podría usarse: bajo un reto VIVO. Bajo uno cerrado el relleno no toca
+-- nada a propósito, y tampoco hace falta: a medición no se llega sin un reto que mida.
 -- Mientras el par siguió declarado, ese proyecto heredado saltaba de 'activo' a medición
 -- sin pasar por la fase que su propio G6 significaba; declarar solo los pares alcanzables
 -- es lo que hace que la tabla describa el método en vez de dejarle un atajo.

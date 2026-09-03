@@ -28,6 +28,7 @@ import {
   medicionPorAbrir,
   VEREDICTOS,
   ventanaAbierta,
+  postMortemPorAbrir,
   ventanasCerradas,
   type EntradaDeRegistry,
   type EstadoSnapshot,
@@ -810,7 +811,14 @@ function BloqueReview({
   onError,
 }: Comunes & { esLead: boolean }) {
   const review = seguimiento.review;
-  const habilitado = ventanasCerradas(seguimiento.entradas);
+  // Espejo EXACTO de lo que `review_insert` acepta, y son DOS condiciones y no una: las
+  // ventanas del contrato cerradas Y el reto MIDIENDO. Con solo la primera, un reto cuyas
+  // ventanas ya vencieron pero que todavía no abrió su medición —el caso del reto heredado
+  // mientras se repara, y el de cualquiera que firme con ventanas ya pasadas— dibujaba el
+  // botón y la política lo rechazaba en cada clic. Media condición es un botón que miente.
+  const midiendo = seguimiento.retoEstado === 'en-medicion';
+  const ventanasListas = ventanasCerradas(seguimiento.entradas);
+  const habilitado = postMortemPorAbrir(seguimiento);
   const [ocupado, setOcupado] = useState(false);
   const [veredicto, setVeredicto] = useState<VeredictoSlug>('no-concluyente');
   const [contribucion, setContribucion] = useState('');
@@ -879,7 +887,15 @@ function BloqueReview({
         )}
       </div>
 
-      {!review && !habilitado && (
+      {/* Y el motivo que se enseña es el que toca: decirle «faltan 0 días de ventana» a
+          quien todavía no ha abierto la medición es mandarlo a mirar donde no está. */}
+      {!review && !midiendo && (
+        <span style={{ font: '400 12.5px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}>
+          El post-mortem se abre sobre un reto que ya mide: este todavía no ha abierto su
+          medición.
+        </span>
+      )}
+      {!review && midiendo && !ventanasListas && (
         <span style={{ font: '400 12.5px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}>
           Se habilita al cerrar la ventana del último criterio (RF-07.7) — el último día de
           la ventana todavía se mide, así que el post-mortem se abre al día siguiente.{' '}

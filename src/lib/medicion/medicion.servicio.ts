@@ -426,7 +426,8 @@ export async function abrirMedicion(
       // Solo desde IMPLEMENTACIÓN: al método se entra en medición por G7 y a G7 se llega
       // por G6, que es el que mete el proyecto en implementación (§7). Un proyecto en
       // 'activo' con su G7 aprobado solo existía como historia previa a este esquema, y a
-      // esa la mueve el relleno de la migración; mover también los 'activo' aquí era el
+      // esa la mueve el relleno de la migración (donde el reto sigue vivo, que es donde el
+      // proyecto puede avanzar); mover también los 'activo' aquí era el
       // atajo por el que un proyecto heredado se saltaba la fase entera.
       movidos = await tx`
         update proyecto set estado = 'en-medicion'
@@ -555,6 +556,10 @@ export async function cargarSnapshotsCsv(
   });
 }
 
+/** Mismo límite que el formulario (`RegistrarSnapshotSchema.nota`): la vía por la que
+ * entra un dato no puede cambiar lo que cabe en él. */
+const MAX_NOTA_CSV = 500;
+
 /** Delimitadores admitidos, en el ORDEN en que se prueban. Ver `delimitadorCsv`. */
 const DELIMITADORES_CSV = [';', '\t', ','] as const;
 
@@ -633,7 +638,7 @@ export function parsearCsv(csv: string): {
     // contenga se conserva tal cual en vez de volver alterada, que es la misma clase de
     // mentira silenciosa aunque no toque el número. (Sin comillas: este parser no las
     // interpreta, y un campo entrecomillado con delimitadores dentro sigue partiéndose.)
-    const nota = partes.slice(2).join(delim).trim().slice(0, 500);
+    const nota = partes.slice(2).join(delim).trim();
     if (validas.length >= MAX_FILAS_CSV) {
       rechazadas.push({
         linea: i + 1,
@@ -648,6 +653,21 @@ export function parsearCsv(csv: string): {
         linea: i + 1,
         contenido: linea.slice(0, 120),
         motivo: fecha === '' ? 'Falta la fecha (AAAA-MM-DD)' : `Fecha inválida: «${fecha}»`,
+      });
+      continue;
+    }
+    // La nota se RECHAZA si no cabe, no se recorta. Recortarla era la misma mentira
+    // silenciosa que el decimal, un tamaño más pequeña: la fila se reportaba como
+    // insertada, el texto guardado no era el del fichero y `rechazadas` no decía nada. Y no
+    // es un campo cualquiera: la nota explica una CORRECCIÓN (los snapshots son
+    // append-only, así que corregir un número es una fila nueva con su porqué), o sea que
+    // es justo el texto que alguien va a leer para entender por qué el dato cambió. El
+    // formulario ya la rechaza con el mismo límite; aquí también, y con la línea a mano.
+    if (nota.length > MAX_NOTA_CSV) {
+      rechazadas.push({
+        linea: i + 1,
+        contenido: linea.slice(0, 120),
+        motivo: `Nota de ${nota.length} caracteres: el máximo son ${MAX_NOTA_CSV} (recórtala antes de cargar)`,
       });
       continue;
     }

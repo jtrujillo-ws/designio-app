@@ -1795,25 +1795,134 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
 
   // ── Higiene de la migración y del seed ──
 
-  it('los CHECK de sanitización rigen desde ya y quedan VALIDADOS en una base limpia', async () => {
-    // Se añaden NOT VALID —el esquema anterior y el validador de la app aceptaban esos
-    // caracteres, así que una instalación con material heredado sucio no puede caerse al
-    // desplegar— y se validan acto seguido si no hay deuda. Las dos mitades importan: que
-    // una base limpia acabe en el estado FUERTE (convalidated = t, la restricción cubre
-    // también el pasado) y que, validada o no, rija para toda escritura nueva.
+  it('un enlace HEREDADO a un insight sin validar no aprueba el gate: la política no alcanza al pasado', async () => {
+    // `decision_insight_insert` cierra la puerta de ENTRADA, pero una política gobierna
+    // las escrituras nuevas del rol de aplicación y nada más. Los enlaces que ya existían
+    // —los que la propia migración enumera en `DecisionConInsightSinValidarDetectada`—
+    // siguen ahí, y el guard de aprobación nunca miraba `insight.estado`: uno de ellos
+    // hacia un insight `propuesto` con citas de derechos vigentes cumplía el ítem y
+    // aprobaba el gate igual que antes del arreglo. Se rechaza en el CONSUMO, que es el
+    // mismo patrón que este slice usa para los derechos, y no invalidando hacia atrás
+    // filas que registran una decisión humana.
     const admin = sqlAdmin();
-    const filas = await admin`select conname, convalidated from pg_constraint
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'nota', 'Fuente del enlace heredado', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, 'Respaldo del heredado', '{}'::jsonb, ${leadId})
+      returning id`;
+    const evId = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evId}, 'concedido', 'cliente', 'Consentimiento vigente',
+              ${leadId}, now(), ${leadId})`;
+
+    // Insight PROPUESTO con su afirmación citada y derechos VIVOS: pasa el re-chequeo de
+    // derechos entero, que es lo que lo hacía peligroso.
+    const ins = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'Insight heredado sin validar',
+      resumen: '',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: ins.insightId,
+      texto: 'Afirmación con respaldo vivo',
+      esHipotesis: false,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId: evId,
+      fragmento: 'fragmento',
+      localizacion: 'p. 1',
+    });
+
+    const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-95', 'Proyecto heredado', ${leadId}) returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 1, 'Investigación')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 1, 'lead-boutique') returning id`;
+    const gateId = gate!.id as string;
+    const [ci] = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gateId}, 0, 'Decisión trazada') returning id`;
+    const [dec] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, decidido_por)
+      values (${ws}, ${proyectoId}, ${gateId}, 'diseno', 'Decisión con enlace heredado',
+              'x', ${leadId}) returning id`;
+    const decisionId = dec!.id as string;
+    // EL ENLACE HEREDADO: lo escribe el PROPIETARIO, que no pasa por políticas. Es la
+    // forma exacta en que estas filas existen en una base que ya venía funcionando.
+    await admin`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${decisionId}, ${ins.insightId}, ${ws})`;
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: ci!.id as string,
+      accion: { tipo: 'cumplido', objetoClase: 'decision', objetoId: decisionId },
+    });
+
+    // La decisión sigue VIGENTE y los derechos VIVOS: las dos comprobaciones que ya
+    // existían no ven nada raro. Lo que falla es la barra de suficiencia del insight.
+    await expect(aprobarGate(leadId, { workspaceId: ws, gateId })).rejects.toThrow(
+      /no está validado/,
+    );
+    const [estado] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(estado!.estado).toBe('pendiente');
+
+    // Y validarlo lo desbloquea: la regla es «validado», no «este enlace está maldito».
+    await validarInsight(leadId, ws, ins.insightId);
+    const r = await aprobarGate(leadId, { workspaceId: ws, gateId });
+    expect(r.numero).toBe(1);
+  });
+
+  it('el material sucio se rechaza al ENTRAR o CAMBIAR, y lo heredado tiene salida', async () => {
+    // Los tres `CHECK NOT VALID` de 20260902170000 se cambiaron por un trigger en
+    // 20260902280000, y el motivo es que `NOT VALID` no es un perdón: solo salta el
+    // escaneo al crear la restricción, pero Postgres sigue comprobando el CHECK en cada
+    // UPDATE posterior, sobre la fila RESULTANTE. Aprobar o rechazar un item heredado
+    // sucio toca solo los campos de decisión —el texto ni se menciona— y aun así fallaba
+    // con 23514. Y no había otra salida: el grant de UPDATE del rol de aplicación son
+    // cuatro columnas y el texto original no es una de ellas, así que el item quedaba
+    // clavado en la bandeja para siempre.
+    const admin = sqlAdmin();
+    // El mecanismo, comprobado en la base: el trigger existe y los CHECK ya no.
+    const trg = await admin`select tgname from pg_trigger
+      where tgrelid = 'item_importacion'::regclass and tgname = 'item_texto_importado'`;
+    expect(trg.map((f) => f.tgname as string)).toEqual(['item_texto_importado']);
+    const checks = await admin`select conname from pg_constraint
       where conrelid = 'item_importacion'::regclass
-        and conname in ('item_contenido_limpio', 'item_titulo_limpio', 'item_referencia_limpia')
-      order by conname`;
-    expect(filas.map((f) => f.conname as string)).toEqual([
-      'item_contenido_limpio',
-      'item_referencia_limpia',
-      'item_titulo_limpio',
-    ]);
-    expect(filas.map((f) => f.convalidated as boolean)).toEqual([true, true, true]);
-    // (La mitad «rige para escrituras nuevas» la cubre el test de controles y bidi por
-    // SQL crudo, que sigue chocando con 23514.)
+        and conname in ('item_contenido_limpio', 'item_titulo_limpio', 'item_referencia_limpia')`;
+    expect(checks).toEqual([]);
+
+    // Una instalación HEREDADA: material sucio que el esquema anterior aceptaba. Se siembra
+    // desactivando el trigger, que es lo único que reproduce «ya estaba ahí».
+    const sucio = `heredado ${marca} con control ${String.fromCharCode(7)} dentro`;
+    await admin`alter table item_importacion disable trigger item_texto_importado`;
+    const [item] = await admin`insert into item_importacion
+      (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+      values (${ws}, ${marca + ' heredado sucio'}, ${sucio}, 'nota', '', ${leadId})
+      returning id`;
+    await admin`alter table item_importacion enable trigger item_texto_importado`;
+    const itemId = item!.id as string;
+
+    // AHORA sí se puede despachar: decidir no cambia el texto, y el curador que lo mira es
+    // exactamente quien tiene que poder rechazarlo. Por el servicio, no por SQL.
+    await rechazarItem(leadId, { workspaceId: ws, itemId });
+    const [tras] = await admin`select estado, contenido from item_importacion where id = ${itemId}`;
+    expect(tras!.estado).toBe('rechazado');
+    // Y el original NO se reescribió: normalizar correría los offsets de las citas.
+    expect(tras!.contenido).toBe(sucio);
+
+    // La otra mitad, que es la que no se puede aflojar: material sucio NUEVO sigue
+    // rebotando, y también un UPDATE que meta texto sucio donde no lo había.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into item_importacion
+        (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+        values (${ws}, 'nuevo sucio', ${sucio}, 'nota', '', ${leadId})`),
+    ).rejects.toMatchObject({ code: '23514', constraint_name: 'item_contenido_limpio' });
   });
 
   it('el CHECK de la base rechaza el bloque C1 entero, igual que el validador de la app', async () => {

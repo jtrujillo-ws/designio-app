@@ -300,30 +300,27 @@ async function diagnosticoDeFirma(
   if (!registry) return 'El registry no existe en este workspace';
   if (registry.estado === 'firmado') return 'El Metric Registry ya está firmado';
 
+  // La posición en el método la dice `reparos_de_posicion_de_firma`, la MISMA función que
+  // lee la proyección para apagar el botón ANTES de que nadie pulse. Mientras estos tres
+  // mensajes se compusieron aquí a mano, la pantalla no tenía de dónde sacarlos y el botón
+  // se ofrecía encendido para que la política filtrara la fila — y una fila filtrada por
+  // política no levanta excepción: son cero filas, y sin este diagnóstico el acto más
+  // solemne de la pantalla habría fallado en silencio.
+  const [posicion] = await tx`
+    select reparo from reparos_de_posicion_de_firma(${registryId}::uuid,
+      ${registry.reto_id as string}::uuid, ${workspaceId}::uuid)
+    order by orden limit 1`;
+  if (posicion) return posicion.reparo as string;
+
+  // Y si la posición está bien, lo que queda es el ROL: es lo único de esta lista que
+  // depende de QUIÉN mira, así que no vive en la proyección compartida —la pantalla lo
+  // espeja con `puedeFirmar`— y se resuelve aquí, con el rol aprobador del propio G6.
   const [g6] = await tx`
-    select g.estado, g.rol_aprobador, g.aprobado_sin_registry from gate_instancia g
+    select g.rol_aprobador from gate_instancia g
     join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
     where p.reto_id = ${registry.reto_id as string} and p.workspace_id = ${workspaceId}
       and g.numero = 6`;
-  if (!g6) return 'El reto no tiene proyecto con método instanciado: no hay G6 que firmar';
-  // Un G6 aprobado ANTES de que el Metric Registry existiera sí puede firmar (esa marca la
-  // puso la migración), así que el motivo no puede ser este para él: si su firma falló, fue
-  // por rol o por contenido, y de eso hablan el guard y la última línea.
-  if (g6.estado === 'aprobado' && !g6.aprobado_sin_registry) {
-    return 'El G6 ya fue aprobado: el registry debió firmarse antes';
-  }
-
-  const anteriores = await tx`
-    select g.numero from gate_instancia g
-    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
-    where p.reto_id = ${registry.reto_id as string} and p.workspace_id = ${workspaceId}
-      and g.numero < 6 and g.estado <> 'aprobado'
-    order by g.numero`;
-  if (anteriores.length > 0) {
-    const lista = anteriores.map((g) => `G${g.numero as number}`).join(', ');
-    return `El registry se firma EN G6: faltan los gates anteriores (${lista})`;
-  }
-  return `Solo el rol ${g6.rol_aprobador as string} firma el Metric Registry en G6`;
+  return `Solo el rol ${g6!.rol_aprobador as string} firma el Metric Registry en G6`;
 }
 
 /**
@@ -1127,9 +1124,19 @@ export async function seguimientoDeImpacto(
         --
         -- Solo mientras el registry sigue en BORRADOR: firmado no hay nada que reparar, y
         -- las reglas hablan de un contrato que todavía se puede corregir.
-        case when mr.estado = 'borrador' then coalesce((
-          select jsonb_agg(rf.reparo order by rf.orden)
-          from reparos_de_firma(mr.id, r.id, r.workspace_id) rf), '[]'::jsonb)
+        -- Las DOS superficies que pueden negar la firma, en el orden en que importan: la
+        -- POSICIÓN en el método primero —si el proyecto no ha llegado a G6 no se firma
+        -- todavía, diga lo que diga el contenido— y después el CONTENIDO del contrato. Son
+        -- dos funciones y no una a propósito: la primera es de la política y la segunda del
+        -- guard, y juntarlas bajo un nombre pondría dos cosas distintas en la misma lista.
+        -- Quien mira la pantalla no distingue las superficies —pulsa y falla—, así que el
+        -- botón mira las dos; el rol es lo único que no está aquí, porque depende de QUIÉN
+        -- mira y una proyección compartida no puede afirmar «tú no puedes».
+        case when mr.estado = 'borrador' then
+          coalesce((select jsonb_agg(rp.reparo order by rp.orden)
+            from reparos_de_posicion_de_firma(mr.id, r.id, r.workspace_id) rp), '[]'::jsonb)
+          || coalesce((select jsonb_agg(rf.reparo order by rf.orden)
+            from reparos_de_firma(mr.id, r.id, r.workspace_id) rf), '[]'::jsonb)
           else '[]'::jsonb end as reparos_firma,
         -- Qué proyectos del RETO frenan la apertura de la medición, y por qué. La
         -- disponibilidad de esa operación es propiedad del CONJUNTO y no del proyecto que

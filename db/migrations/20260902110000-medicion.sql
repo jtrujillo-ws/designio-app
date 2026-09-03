@@ -1552,6 +1552,55 @@ $$;
 revoke execute on function reparos_de_firma(uuid, uuid, uuid) from public;
 grant execute on function reparos_de_firma(uuid, uuid, uuid) to designio_app;
 
+-- ── …y qué le falta por POSICIÓN EN EL MÉTODO, que es la otra superficie ──
+-- Una firma se puede negar por dos sitios y son dos cosas distintas: el GUARD habla del
+-- CONTENIDO del contrato (arriba) y la POLÍTICA `registry_firmar`, de dónde está el proyecto
+-- en el método — se firma EN G6, así que con los gates anteriores pendientes la fila ni
+-- siquiera llega al trigger. Van en funciones separadas a propósito: meter la regla de la
+-- política dentro de `reparos_de_firma` pondría dos cosas distintas bajo un mismo nombre, y
+-- la lista del guard dejaría de ser la lista del guard.
+--
+-- Pero para QUIEN MIRA LA PANTALLA la distinción no existe: pulsa y falla. Así que el botón
+-- mira las dos, y las dos se escriben una sola vez. Esta la leen el diagnóstico posterior al
+-- rechazo (`diagnosticoDeFirma`, que es quien componía estos mensajes a mano) y la
+-- proyección, que los enseña ANTES de ofrecer el botón.
+--
+-- Y era el desenlace peor de los dos: un UPDATE que la política filtra afecta a cero filas y
+-- no levanta ninguna excepción que traducir. Lo salva que `firmarRegistry` comprueba el
+-- recuento y convierte el cero en este diagnóstico — sin esa comprobación, el acto más
+-- solemne de la pantalla habría fallado en silencio.
+--
+-- El rol NO está aquí: es propiedad de quien mira y no del contrato, la pantalla ya lo
+-- espeja con `puedeFirmar`, y una proyección compartida no puede afirmar «tú no puedes».
+create function reparos_de_posicion_de_firma(p_registry uuid, p_reto uuid, p_ws uuid)
+returns table (orden integer, reparo text)
+language sql stable as $$
+  select 1, 'El reto no tiene proyecto con método instanciado: no hay G6 que firmar'
+  where not exists (select 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = p_reto and p.workspace_id = p_ws and g.numero = 6)
+  union all
+  -- Un G6 aprobado ANTES de que el Metric Registry existiera SÍ puede firmar (esa marca la
+  -- puso la migración y nadie la vuelve a escribir), así que para él este reparo no aplica.
+  select 2, 'El G6 ya fue aprobado: el registry debió firmarse antes'
+  where exists (select 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = p_reto and p.workspace_id = p_ws and g.numero = 6
+      and g.estado = 'aprobado' and not g.aprobado_sin_registry)
+  union all
+  -- «Se firma EN G6»: no antes. Los gates ordenan el método y el registry se acuerda con el
+  -- plan de implementación delante, no en el kickoff. Es la misma condición que la política
+  -- `registry_firmar` aplica al filtrar la fila; aquí se NOMBRA para poder decirla.
+  select 3, 'El registry se firma EN G6: faltan los gates anteriores (' || l || ')' from (
+    select string_agg('G' || g.numero, ', ' order by g.numero) as l
+    from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = p_reto and p.workspace_id = p_ws
+      and g.numero < 6 and g.estado <> 'aprobado') x where l is not null
+$$;
+revoke execute on function reparos_de_posicion_de_firma(uuid, uuid, uuid) from public;
+grant execute on function reparos_de_posicion_de_firma(uuid, uuid, uuid) to designio_app;
+
 -- ── Guard de la firma del registry (SYS-22) ──
 -- La completitud del contrato vive en el DATO: ni el propio sponsor firma por SQL
 -- directo un registry sin dueño del dato, sin línea base o con criterios sin KPI.

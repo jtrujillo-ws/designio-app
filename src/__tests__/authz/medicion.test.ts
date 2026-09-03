@@ -375,6 +375,17 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
       /faltan los gates anteriores \(G1, G2, G3, G4, G5\)/,
     );
+    // Y la PANTALLA lo sabe antes de ofrecer el botón, que es lo que faltaba: este rechazo
+    // no viene del guard sino de la POLÍTICA, y una fila que la política filtra no levanta
+    // ninguna excepción —son cero filas—. Lo único que separaba al sponsor de pulsar el
+    // botón que congela el contrato y no ver nada era el recuento de `firmarRegistry`.
+    // Además es el curso NORMAL de un proyecto a mitad de camino: el registry se acuerda
+    // pronto porque es el contrato del cliente, y G6 llega tarde. Con el contrato completo
+    // y los gates por delante, la lista tiene que decirlo aunque el guard no tenga nada que
+    // objetar — son dos superficies distintas y quien mira no las distingue.
+    expect(
+      (await seguimientoDeImpacto(leadId, ws, proyectoId))!.reparosFirma,
+    ).toContain('El registry se firma EN G6: faltan los gates anteriores (G1, G2, G3, G4, G5)');
     for (const numero of [1, 2, 3, 4, 5]) {
       await aprobarGateNumero(numero);
     }
@@ -383,6 +394,21 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(firmarRegistry(leadId, { workspaceId: ws, registryId })).rejects.toThrow(
       /Solo el rol sponsor firma/,
     );
+    // Aprobados los anteriores, el reparo de posición se va: apagar de más es tan avería
+    // como ofrecer de más. Lo que quede en la lista ya es del guard, no de la política.
+    expect(
+      (await seguimientoDeImpacto(leadId, ws, proyectoId))!.reparosFirma.filter((r) =>
+        r.startsWith('El registry se firma EN G6'),
+      ),
+    ).toEqual([]);
+    // El ROL no entra en la lista: depende de QUIÉN mira y la proyección es compartida —la
+    // pantalla lo espeja aparte con `puedeFirmar`—. Afirmarlo aquí sería decirle «tú no
+    // puedes» a todo el que la lea.
+    expect(
+      (await seguimientoDeImpacto(leadId, ws, proyectoId))!.reparosFirma.filter((r) =>
+        r.includes('Solo el rol'),
+      ),
+    ).toEqual([]);
   });
 
   it('firmar exige contrato COMPLETO: criterio sin KPI, entrada incompleta o post-mortem prematuro', async () => {

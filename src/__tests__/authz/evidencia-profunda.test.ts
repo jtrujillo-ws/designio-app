@@ -1939,8 +1939,23 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     );
     const itemId = (item as unknown as { id: string }).id;
 
-    // AHORA sí se puede despachar: decidir no cambia el texto, y el curador que lo mira es
-    // exactamente quien tiene que poder rechazarlo. Por el servicio, no por SQL.
+    // APROBARLO, en cambio, sigue prohibido: `aprobarItem` COPIA el título del item a
+    // `fuente.titulo` y a `evidencia.titulo`, y ahí no hay guard equivalente. Dar salida al
+    // heredado sucio no puede ser la puerta que lo blanquea convirtiéndolo en evidencia.
+    await expect(
+      aprobarItem(leadId, {
+        workspaceId: ws,
+        itemId,
+        resumen: 'no debería entrar',
+        esEstadoActual: false,
+        dimensiones,
+      }),
+    ).rejects.toThrow(/no se puede aprobar este material/);
+    const [sigue] = await admin`select estado from item_importacion where id = ${itemId}`;
+    expect(sigue!.estado).toBe('pendiente');
+
+    // Y RECHAZARLO sí: decidir no cambia el texto, y el curador que lo mira es exactamente
+    // quien tiene que poder despacharlo. Por el servicio, no por SQL.
     await rechazarItem(leadId, { workspaceId: ws, itemId });
     const [tras] = await admin`select estado, contenido from item_importacion where id = ${itemId}`;
     expect(tras!.estado).toBe('rechazado');

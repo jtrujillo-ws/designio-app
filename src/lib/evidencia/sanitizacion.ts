@@ -48,8 +48,22 @@
  * quedó guardado, el acto humano en el que se apoya SYS-16. Que la promesa estuviera
  * escrita no la convertía en predicado.
  */
+/**
+ * Los overrides bidi, en UN solo sitio de este módulo. Estaban dentro de `PROHIBIDOS` y
+ * en ninguna otra parte, así que el saneador del NOMBRE de archivo —que quita controles y
+ * comillas— los dejaba pasar enteros. Y en un nombre el bidi es PEOR que en el cuerpo del
+ * texto: el nombre es justo lo que el curador lee para decidir y lo que el sistema
+ * operativo enseña tras la descarga, así que un `.txt` que se muestra como otra cosa es el
+ * mismo ataque que aquí se rechaza para el material, en la superficie donde más engaña.
+ * El razonamiento que lo dejó fuera pensaba en rutas y en controles: el predicado ya
+ * existía y no se aplicó.
+ */
+const BIDI = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+
 // eslint-disable-next-line no-control-regex
-const PROHIBIDOS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+const CONTROLES = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/;
+
+const PROHIBIDOS = new RegExp(`${CONTROLES.source}|${BIDI.source}`);
 
 export type Veredicto = { ok: true } | { ok: false; motivo: string };
 
@@ -212,8 +226,13 @@ function entradasZip(bytes: Uint8Array): string[] | null {
 /**
  * Nombre de archivo seguro. Aquí SÍ se normaliza (a diferencia del contenido): el nombre
  * no es material citable —no lleva offsets— y se usa como identificador al descargar,
- * donde una ruta o un control sí serían un problema real. Espejo del CHECK
+ * donde una ruta, un control o un override BIDI son un problema real. Espejo del CHECK
  * `archivo_nombre_seguro`.
+ *
+ * El bidi llegó tarde y por un error de razonamiento que conviene dejar escrito: esta
+ * misma nota decía «una ruta o un control», y de ahí salió una clase que quitaba
+ * exactamente eso. El predicado bidi ya existía en este módulo para el material importado;
+ * no se aplicó aquí por no haberlo pensado, no por haberlo descartado.
  *
  * El rango de controles llega hasta el final de C1 por la misma razón que el de la
  * ingesta, y además por una concreta: el CHECK usa `[[:cntrl:]]`, que en UTF-8 SÍ incluye
@@ -226,6 +245,9 @@ export function normalizarNombreArchivo(nombre: string): string {
   const limpio = soloBase
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001F\u007F-\u009F"]/g, '')
+    // Y los overrides bidi, con la MISMA clase que rechaza el material importado: no se
+    // reescriben dos veces los mismos rangos, se usa el que ya existe.
+    .replace(new RegExp(BIDI.source, 'g'), '')
     .replace(/\s+/g, ' ')
     .replace(/^\.+/, '')
     .trim()

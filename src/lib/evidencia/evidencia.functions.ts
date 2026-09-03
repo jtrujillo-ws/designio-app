@@ -35,9 +35,19 @@ function mensajeDe(e: unknown): string | null {
   if (e instanceof ErrorAutorizacion) return e.message;
   const code = (e as { code?: string }).code;
   if (code === '42501') return 'Sin permiso para esta acción en el workspace';
+  // AD003: aprobar un material heredado con texto sucio copiaría ese metadato al título de
+  // la fuente y de la evidencia, donde no hay guard. El mensaje viene de la base y dice qué
+  // hacer (rechazarlo y reimportar), así que se propaga tal cual.
+  if (code === 'AD003') return (e as { message?: string }).message ?? null;
   // CHECK del esquema: es la última barrera y por eso su mensaje distingue de qué se
   // trata — el nombre del constraint dice si falló el bound del texto, el formato del
-  // adjunto, su tamaño o su nombre.
+  // adjunto, su tamaño, su nombre o la coherencia entre extensión y formato.
+  //
+  // Este traductor es un CONSUMIDOR de cada restricción que se añade: un CHECK nuevo sin su
+  // rama aquí cae en el genérico, y el genérico MIENTE — decía «supera los límites» cuando
+  // lo que fallaba era que la extensión no casaba con el formato verificado. La base
+  // rechaza bien y el producto explica mal, que es la versión suave del mismo defecto que
+  // este slice persigue. Al añadir una restricción hay que pasar por aquí.
   if (code === '23514') {
     const constraint = (e as { constraint_name?: string }).constraint_name ?? '';
     if (constraint.startsWith('item_') && constraint.includes('limpi')) {
@@ -46,6 +56,9 @@ function mensajeDe(e: unknown): string | null {
     if (constraint === 'archivo_tipo_permitido') return 'Formato de archivo no permitido';
     if (constraint === 'archivo_tamano') return 'El archivo está vacío o supera el tamaño máximo';
     if (constraint === 'archivo_nombre_seguro') return 'El nombre del archivo no es válido';
+    if (constraint === 'archivo_extension_del_formato') {
+      return 'La extensión del archivo no corresponde al formato verificado por sus bytes';
+    }
     return 'El contenido supera los límites permitidos';
   }
   return null;

@@ -319,6 +319,25 @@ describe('sanitización del material importado', () => {
     expect(tipoDeclaradoDeArchivo('sin-extension', '')).toBeNull();
   });
 
+  it('el nombre de archivo también pierde los overrides bidi, no solo los controles', () => {
+    // El predicado bidi existía desde el primer día para el material importado y no se
+    // aplicaba al NOMBRE: el saneador quitaba controles y comillas, y el CHECK miraba
+    // `[[:cntrl:]]`. En un nombre el bidi es PEOR que en el cuerpo del texto, porque el
+    // nombre es lo que el curador lee para decidir y lo que el sistema operativo enseña
+    // tras la descarga: un `.txt` que se muestra como otra cosa es el mismo ataque en la
+    // superficie donde más engaña.
+    const rlo = String.fromCharCode(0x202e);
+    const pdi = String.fromCharCode(0x2069);
+    const lrm = String.fromCharCode(0x200e);
+    expect(normalizarNombreArchivo(`informe${rlo}fdp.txt`)).toBe('informefdp.txt');
+    expect(normalizarNombreArchivo(`a${lrm}b${pdi}c.pdf`)).toBe('abc.pdf');
+    // Y no se lleva por delante lo legítimo: acentos, espacios y puntos internos siguen.
+    expect(normalizarNombreArchivo('informe final v2.tar.gz')).toBe('informe final v2.tar.gz');
+    expect(normalizarNombreArchivo('análisis ñandú.pdf')).toBe('análisis ñandú.pdf');
+    // Un nombre que era SOLO bidi no puede quedar vacío: cae al de reserva.
+    expect(normalizarNombreArchivo(`${rlo}${pdi}`)).toBe('adjunto');
+  });
+
   it('el esquema rechaza un base64 con forma inválida, no lo deja reventar en atob', () => {
     // Validar solo la longitud estimada dejaba pasar basura: el esquema la aceptaba, `atob`
     // reventaba dentro del servicio y el endpoint devolvía un fallo de servidor inesperado

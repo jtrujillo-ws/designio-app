@@ -5,7 +5,7 @@
 -- Octava reescritura de `gate_aprobar_suficiencia_guard` en esta rama. `create or replace`
 -- reemplaza la función entera: el cuerpo se copió del ÁRBOL YA MIGRADO
 -- (`pg_get_functiondef`), no de memoria, y lo único que cambia respecto de él es que los
--- candados y las tres comprobaciones de razonamiento salen a la función compartida.
+-- candados y las cuatro comprobaciones de razonamiento salen a la función compartida.
 
 -- RF-03.10 / RF-04.5 / RF-06.3 / SYS-14 — DOS RUTAS QUE CONSUMEN RAZONAMIENTO, UNA SOLA
 -- REDACCIÓN DEL PROTOCOLO.
@@ -45,6 +45,7 @@ declare
   v_bloqueo text;
   v_afirmacion text;
   v_evidencia uuid;
+  v_decision text;
 begin
   -- ═══ 1. CANDADO SOBRE LAS DECISIONES ═══
   -- Va PRIMERO porque de estas filas se DERIVA el conjunto de derechos de abajo: bloquear
@@ -94,7 +95,26 @@ begin
       p_contexto, coalesce(v_bloqueo, 'derechos insuficientes') using errcode = 'DR001';
   end if;
 
-  -- ═══ 4. TODA DECISIÓN SE TRAZA A INSIGHTS VALIDADOS ═══
+  -- ═══ 4. NINGUNA DECISIÓN DEL RAZONAMIENTO ESTÁ EN REVISIÓN ═══
+  -- `elemento_motivo_citable_guard` ya exige `estado = 'vigente'` al ENLAZAR, y eso no
+  -- basta: `reabrirEtapa` puede pasarla a 'en-revision' DESPUÉS, con el diseño ya aprobado
+  -- e inmutable. Se re-chequea al consumir en vez de resetear los ítems al reabrir —
+  -- resetear tiraría trabajo que quizá sigue en pie, y revalidar la decisión desbloquea el
+  -- gate sin tocar el checklist. Estaba a mano en la rama del checklist y por eso G5 no la
+  -- tenía: es la CUARTA comprobación del protocolo, y compartir sólo tres reproducía un
+  -- piso más abajo el defecto que esta función vino a cerrar. Va después del candado sobre
+  -- `decision`, que es de donde lee.
+  select d.titulo into v_decision
+    from decision d
+    where d.workspace_id = p_ws and d.id = any(p_decisiones) and d.estado <> 'vigente'
+    order by d.decidido_en, d.id
+    limit 1;
+  if v_decision is not null then
+    raise exception 'no se puede aprobar: % se apoya en la decisión «%», que una reapertura dejó en revisión (SYS-10) — revalídala o rehaz el razonamiento',
+      p_contexto, v_decision;
+  end if;
+
+  -- ═══ 5. TODA DECISIÓN SE TRAZA A INSIGHTS VALIDADOS ═══
   -- La política `decision_insight_insert` cierra la entrada desde 20260902260000, pero una
   -- política gobierna lo que se escribe A PARTIR DE AHORA: los enlaces heredados solo los
   -- alcanza la comprobación en el CONSUMO, y ésta es.
@@ -108,7 +128,7 @@ begin
       p_contexto;
   end if;
 
-  -- ═══ 5. TODA AFIRMACIÓN NO-HIPÓTESIS TIENE AL MENOS UNA CITA USABLE ═══
+  -- ═══ 6. TODA AFIRMACIÓN NO-HIPÓTESIS TIENE AL MENOS UNA CITA USABLE ═══
   -- Sobre el razonamiento alcanzado por las dos vías, directa y a través de decisiones. Se
   -- trae la primera que falla para poder NOMBRARLA (SYS-14): un motivo genérico no dice qué
   -- reparar. «Al menos una usable» y no «ninguna bloqueada»: una afirmación con dos citas
@@ -145,7 +165,7 @@ begin
   end if;
 end $$;
 comment on function razonamiento_usable_guard(uuid, uuid[], uuid[], uuid[], text) is
-'El protocolo COMPLETO para consumir razonamiento: candado sobre las decisiones, candado sobre los derechos que se van a leer, y las tres comprobaciones (evidencia citada usable, decisiones trazadas a insights validados, afirmaciones no-hipótesis con al menos una cita usable). Lo llaman el consumo por checklist y la certificación de G5; el recorrido hasta los ids lo pone cada ruta.';
+'El protocolo COMPLETO para consumir razonamiento: candado sobre las decisiones, candado sobre los derechos que se van a leer, y las cuatro comprobaciones (evidencia citada usable, ninguna decisión en revisión, decisiones trazadas a insights validados, afirmaciones no-hipótesis con al menos una cita usable). Lo llaman el consumo por checklist y la certificación de G5; el recorrido hasta los ids lo pone cada ruta.';
 
 revoke execute on function razonamiento_usable_guard(uuid, uuid[], uuid[], uuid[], text) from public;
 
@@ -189,7 +209,7 @@ begin
       raise exception 'no se puede aprobar: el gate no tiene checklist instanciado';
     end if;
     -- ═══ EL PROTOCOLO DE RAZONAMIENTO, COMPARTIDO CON G5 ═══
-    -- Candados (decisiones y derechos, en ese orden) y las tres comprobaciones viven en
+    -- Candados (decisiones y derechos, en ese orden) y las cuatro comprobaciones viven en
     -- `razonamiento_usable_guard`. Aquí solo va el RECORRIDO: qué insights, decisiones y
     -- evidencia consume este gate por su checklist. Estuvo escrito dos veces —aquí y en la
     -- rama de G5— y las dos redacciones ya habían divergido: la de G5 nació sin el estado
@@ -224,17 +244,13 @@ begin
       order by du.evidencia_id
       for share;
 
-    -- Un ítem YA cumplido cuya decisión pasó a 'en-revision' por una reapertura seguía
-    -- contando como suficiencia: el gate se aprobaba sobre razonamiento cuestionado. Se
-    -- re-chequea al aprobar en vez de resetear los ítems al reabrir — resetear tiraría
-    -- trabajo que quizá sigue en pie, y revalidar la decisión desbloquea el gate sin
-    -- tocar el checklist.
-    if exists (select 1 from checklist_item ci
-      join decision d on d.id = ci.decision_id and d.workspace_id = ci.workspace_id
-      where ci.gate_id = new.id and ci.workspace_id = new.workspace_id
-        and ci.estado = 'cumplido' and d.estado <> 'vigente') then
-      raise exception 'no se puede aprobar: hay ítems cumplidos con decisiones en revisión';
-    end if;
+    -- La comprobación de «ítems cumplidos con decisiones en revisión» YA NO ESTÁ AQUÍ: es
+    -- la cuarta del protocolo y vive dentro de `razonamiento_usable_guard`, que se llama
+    -- justo arriba con las decisiones de los ítems cumplidos — el mismo conjunto que
+    -- recorría esta versión a mano. Se deja dicho porque el hueco que dejó fue real: al
+    -- estar escrita aquí y no en la función compartida, la ruta de G5 no la heredó y podía
+    -- certificar un diseño inmutable y de cara al cliente sobre una decisión que una
+    -- reapertura había puesto en cuestión.
     if exists (select 1 from gate_instancia g2
       where g2.proyecto_id = new.proyecto_id and g2.workspace_id = new.workspace_id
         and g2.numero < new.numero and g2.estado <> 'aprobado') then
@@ -426,8 +442,9 @@ begin
 end $$;
 
 -- El orden dentro del guard cambia en una cosa, y conviene decirla: las comprobaciones
--- estructurales del checklist (pendientes, instanciado) pasan a ir ANTES de los candados,
--- y la de «decisiones en revisión» va después —porque lee `decision.estado` y necesita el
--- `for share` que la función compartida toma—. Antes los candados iban primero de todo:
--- moverlos detrás de dos comprobaciones que no leen estado compartido no abre ninguna
--- ventana y evita bloquear filas para acabar rechazando por un checklist vacío.
+-- estructurales del checklist (pendientes, instanciado) pasan a ir ANTES de los candados.
+-- Antes los candados iban primero de todo: moverlos detrás de dos comprobaciones que no
+-- leen estado compartido no abre ninguna ventana y evita bloquear filas para acabar
+-- rechazando por un checklist vacío. La de «decisiones en revisión» ya no está suelta en
+-- ninguna parte: entró en la función compartida, que la ejecuta después de su propio
+-- `for share` sobre `decision` — que es de donde lee.

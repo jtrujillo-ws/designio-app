@@ -2664,6 +2664,33 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const [final] = await admin`select estado from gate_instancia where id = ${gateId}`;
     expect(final!.estado).toBe('aprobado');
 
+    // Y la CUARTA comprobación del protocolo, que era la que faltaba: una reapertura pone
+    // la decisión en 'en-revision' DESPUÉS de aprobar el diseño. `elemento_motivo_citable_guard`
+    // exige 'vigente' al ENLAZAR, y nadie lo re-miraba al certificar, así que G5 firmaba
+    // de cara al cliente un diseño inmutable cuya decisión estaba explícitamente en
+    // cuestión. La ruta del checklist sí lo comprobaba —a mano, y por eso G5 no lo heredó—.
+    await admin`update gate_instancia set estado = 'pendiente', aprobado_por = null,
+      aprobado_en = null where id = ${gateId}`;
+    await admin`update decision set estado = 'en-revision' where id = ${dec!.id as string}`;
+    await expect(aprobarG5()).rejects.toThrow(/dejó en revisión \(SYS-10\)/);
+    // El motivo NOMBRA la decisión, que es lo que hay que reparar (SYS-14).
+    await expect(aprobarG5()).rejects.toThrow(/Decisión del diseño/);
+
+    // Y el PICKER dice lo mismo, por el mismo predicado: la pantalla no ofrece un motivo
+    // con el que después no se puede certificar.
+    const enRevision = await designVersionCompleta(leadId, ws, dv!.id as string);
+    expect(
+      enRevision!.decisionesDelProyecto.find((d) => d.id === (dec!.id as string)),
+    ).toBeUndefined();
+    const gob = await gobernanzaDeProyecto(leadId, ws, proyectoId);
+    expect(gob!.decisiones.find((d) => d.id === (dec!.id as string))!.sinRespaldo).toContain(
+      'dejó en revisión',
+    );
+
+    // Revalidarla desbloquea la certificación sin tocar el diseño.
+    await admin`update decision set estado = 'vigente' where id = ${dec!.id as string}`;
+    await aprobarG5();
+
     // Se deshacen los enlaces que dejarían FKs colgando sobre el insight y el proyecto
     // cuando la suite limpie: un test no le quita el suelo al siguiente. Hace falta apagar
     // los triggers porque la design version está aprobada y SYS-05 prohíbe tocar sus

@@ -26,6 +26,7 @@ declare
   v_bloqueo text;
   v_afirmacion text;
   v_evidencia uuid;
+  v_decision text;
 begin
   -- 1. La evidencia citada directamente sigue siendo usable.
   select evidencia_motivo_bloqueo(e.id, e.workspace_id, 'cliente')
@@ -39,7 +40,30 @@ begin
            || coalesce(v_bloqueo, 'derechos insuficientes');
   end if;
 
-  -- 2. Toda decisión se traza a insights VALIDADOS. La política `decision_insight_insert`
+  -- 2. NINGUNA decisión del razonamiento está EN REVISIÓN.
+  --
+  -- `elemento_motivo_citable_guard` ya exige `estado = 'vigente'` al ENLAZAR, y eso no
+  -- basta: `reabrirEtapa` puede pasar la decisión a 'en-revision' DESPUÉS, cuando el
+  -- diseño ya está aprobado y es inmutable. Una política gobierna el enlace; el consumo
+  -- necesita su propia comprobación, y ésta es — el mismo argumento que la de abajo.
+  --
+  -- Se re-chequea al consumir en vez de resetear los ítems al reabrir: resetear tiraría
+  -- trabajo que quizá sigue en pie, y revalidar la decisión desbloquea el gate sin tocar
+  -- el checklist. Vivió a mano en la rama del checklist de `gate_aprobar_suficiencia_guard`
+  -- y ahí solo cubría una de las dos rutas: G5 certificaba un diseño de cara al cliente
+  -- sobre una decisión explícitamente puesta en cuestión. Compartir tres de las cuatro
+  -- comprobaciones reproducía un piso más abajo el defecto que la función vino a cerrar.
+  select d.titulo into v_decision
+    from decision d
+    where d.workspace_id = p_ws and d.id = any(p_decisiones) and d.estado <> 'vigente'
+    order by d.decidido_en, d.id
+    limit 1;
+  if v_decision is not null then
+    return 'se apoya en la decisión «' || v_decision
+           || '», que una reapertura dejó en revisión (SYS-10) — revalídala o rehaz el razonamiento';
+  end if;
+
+  -- 3. Toda decisión se traza a insights VALIDADOS. La política `decision_insight_insert`
   -- cierra la entrada desde 20260902260000, pero una política gobierna lo que se escribe a
   -- partir de ahora: los enlaces heredados solo los alcanza el consumo.
   if exists (
@@ -51,7 +75,7 @@ begin
     return 'se traza a una decisión con un insight que no está validado — valídalo o rehaz la decisión';
   end if;
 
-  -- 3. Toda afirmación no-hipótesis tiene al menos una cita usable, por las dos vías. Se
+  -- 4. Toda afirmación no-hipótesis tiene al menos una cita usable, por las dos vías. Se
   -- trae la primera que falla para NOMBRARLA (SYS-14). «Al menos una usable» y no «ninguna
   -- bloqueada»: una afirmación con dos citas sigue sostenida si a una le quedan derechos.
   with alcanzado as (

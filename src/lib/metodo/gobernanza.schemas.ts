@@ -83,9 +83,9 @@ export type DecisionDeProyecto = {
   /**
    * Por qué NO se puede citar esta decisión, ya redactado, o `null` si se puede. Sale de
    * `razonamiento_sin_respaldo`, **la misma función que consulta el guard de suficiencia
-   * antes de levantar**: cubre las tres comprobaciones —evidencia citada usable, insights
-   * enlazados `validado`, y toda afirmación no-hipótesis con al menos una cita usable— sin
-   * que esta proyección tenga que enunciar ninguna.
+   * antes de levantar**: cubre las cuatro comprobaciones —evidencia citada usable, ninguna
+   * decisión en revisión, insights enlazados `validado`, y toda afirmación no-hipótesis con
+   * al menos una cita usable— sin que esta proyección tenga que enunciar ninguna.
    *
    * Estuvo escrito a mano, con las comprobaciones repartidas en dos campos, y así fue como
    * el selector de la design version —copiado de éste— se quedó con una sola. El estado

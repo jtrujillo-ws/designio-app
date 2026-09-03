@@ -575,7 +575,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     // G3 lo aprueba el sponsor (rolAprobadorDeGate), pero el guard le para igual.
     await expect(
       aprobarGate(sponsorId, { workspaceId: ws, gateId: g3.id }),
-    ).rejects.toThrow(/decisiones en revisión/);
+    ).rejects.toThrow(/dejó en revisión \(SYS-10\)/);
 
     // Revalidar la decisión desbloquea el gate sin tocar el checklist.
     await revalidarDecision(leadId, ws, vigente.id);

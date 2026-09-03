@@ -707,6 +707,25 @@ create index propuesta_ai_ws_idx on propuesta_ai (workspace_id, estado, creado_e
 create unique index propuesta_ai_item_pendiente_idx on propuesta_ai (workspace_id, item_id)
   where item_id is not null and estado = 'propuesta';
 
+-- Una llamada de CI respalda COMO MUCHO UNA propuesta. `llamada_id` afirma «la llamada que
+-- ME produjo», y con N propuestas colgadas de la misma llamada de extracción esa frase solo
+-- puede ser cierta en una de ellas: las demás heredan un coste, una latencia y un `usage`
+-- que no son suyos. El daño no es solo de lectura — el coste por propuesta se divide entre
+-- filas que nadie pagó y el recuento de propuestas generadas crece sin gasto detrás, que es
+-- justo la dirección que esconde el problema.
+--
+-- El índice parcial es el que lo impone porque el guard no puede: comprueba la fila que
+-- entra, y «cuántas hay ya» es una pregunta sobre el conjunto, que bajo READ COMMITTED dos
+-- transacciones responden a la vez sobre snapshots distintos. `propuesta_ai_item_pendiente_idx`
+-- tampoco lo cubre: solo alcanza a las PENDIENTES, así que decidir la primera dejaba el
+-- hueco libre para colgar una segunda de la misma llamada ya pagada.
+--
+-- Solo CI, y la asimetría es la misma que la de `reserva_ai`: C0 persiste un LOTE —de uno a
+-- cuatro criterios de una sola llamada— y sus filas hermanas violarían el índice. Ahí el
+-- invariante no es una fila que Postgres pueda rechazar.
+create unique index propuesta_ai_llamada_ci_idx on propuesta_ai (workspace_id, llamada_id)
+  where capacidad = 'CI';
+
 -- Y un objeto materializado cuelga de UNA sola propuesta. El guard diferido exige que lo
 -- haya creado la aceptación que lo reclama, lo que ya impide adoptar algo preexistente;
 -- esto cierra el caso simétrico, que el guard no puede ver porque mira una fila a la vez:
@@ -831,6 +850,25 @@ begin
     -- o —lo peor para el libro— de un intento que terminó en negativa o sin respuesta: el
     -- panel atribuiría entonces un coste y una latencia que no son los suyos, y el gasto
     -- por capacidad dejaría de cuadrar. Se exige la coincidencia completa.
+    --
+    -- Y dicho para que nadie lo lea de más: esto empareja METADATOS, no contenido. Que el
+    -- `contenido` sea lo que un modelo devolvió NO es comprobable desde aquí, y no por
+    -- falta de ganas: la base no es parte de la llamada HTTP, así que no tiene ningún hecho
+    -- propio sobre la respuesta. Guardar un digest de la respuesta en `llamada_ai` no lo
+    -- arreglaría — lo escribiría el MISMO rol, en el MISMO acto, con el MISMO grant que
+    -- escribe el contenido, así que un escritor que fabrica el contenido fabrica también su
+    -- huella y las dos afirmaciones se sostienen entre sí sin que ninguna se apoye en nada.
+    -- La diferencia con el linaje de materialización es exacta y vale la pena tenerla clara:
+    -- allí el hecho que ata (`evidencia.propuesta_ai_id`) lo produce el GUARD, que es parte
+    -- de confianza y está fuera de todo grant; aquí el hecho tendría que producirlo el
+    -- proveedor, que no escribe en esta base. Un digest añadiría ceremonia, no garantía.
+    --
+    -- Así que `contenido` pertenece al mismo conjunto declarado que `modelo`,
+    -- `prompt_version`, `tokens_*`, `costo_usd` y `latencia_ms`: lineage y medidas que solo
+    -- existen porque la aplicación las anota. Lo que SÍ se ata queda atado —la llamada
+    -- (arriba), su unicidad para CI (índice parcial), el consentimiento bajo el que salió
+    -- (FK compuesta con la constante dentro) y el objeto materializado (relación + xmin +
+    -- proyección)—, y lo que no se puede atar se dice, en vez de blindarse en falso.
     if not exists (
       select 1 from llamada_ai l
       where l.id = new.llamada_id and l.workspace_id = new.workspace_id

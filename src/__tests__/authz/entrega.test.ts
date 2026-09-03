@@ -287,12 +287,18 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     });
     await admin`delete from elemento_decision where workspace_id = ${ws}`;
     await admin`delete from elemento_insight where workspace_id = ${ws}`;
-    await admin`delete from elemento_cambio where workspace_id = ${ws}`;
     // La cadena de superación es una autorreferencia, pero NO se corta antes: una design
     // version aprobada es inmutable hasta para el owner (lo impone el guard de
     // transición), y un DELETE que se lleva los dos extremos en la misma sentencia deja
     // la FK satisfecha al final de ella.
-    await admin`delete from design_version where workspace_id = ${ws}`;
+    // Elementos y versiones se van JUNTOS, igual que el alcance y sus releases: el guard
+    // diferido exige que un elemento solo viva en un borrador, y en sentencias sueltas el
+    // borrado de los elementos commitea con las versiones aún aprobadas y lo levanta, con
+    // razón. En una sola transacción, al commit no queda versión a la que pertenecer.
+    await admin.begin(async (tx) => {
+      await tx`delete from elemento_cambio where workspace_id = ${ws}`;
+      await tx`delete from design_version where workspace_id = ${ws}`;
+    });
     await admin`delete from journey_snapshot where workspace_id = ${ws}`;
     await admin`delete from journey_arista where workspace_id = ${ws}`;
     await admin`delete from journey_nodo where workspace_id = ${ws}`;
@@ -991,40 +997,46 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
   it('un tablero sin filas no está completo: está vacío (RF-06.7)', async () => {
     // La defensa del gemelo vacuo sigue en pie, y ahora solo la alcanza lo que su comentario
-    // nombra: un backfill que deje una design version sin elementos. Por el camino normal ya
-    // no se llega —la transición no aprueba una versión sin elementos y G6 exige el mismo
-    // conjunto que G7—, y por eso se monta con SQL de administrador: sin este test, quitar
-    // la comprobación no rompería nada.
+    // nombra: un BACKFILL que deje una design version aprobada sin elementos. Por el camino
+    // normal ya no se llega por ningún lado —la transición no aprueba una versión sin
+    // elementos, G5 y G6 exigen el mismo conjunto, y desde el guard diferido de edición
+    // tampoco se le pueden quitar los elementos a una versión ya aprobada—, así que se
+    // fabrica entero con SQL de administrador. Sin este test, quitar la comprobación de G7 no
+    // rompería nada.
     const admin = sqlAdmin();
-    const proy = await proyectoConGates('P-104', 'Proyecto al que le vacían el tablero');
+    const [p] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-104', 'Proyecto al que le vacían el tablero', ${leadId})
+      returning id`;
+    const proy = p!.id as string;
+    // Los gates NACEN aprobados, que es la forma que tiene un backfill: pasar por el guard de
+    // suficiencia es justo lo que este estado no podría hacer.
+    for (let n = 0; n <= 7; n++) {
+      const [g] = await admin`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+        values (${ws}, ${proy}, ${n}, ${[0, 3, 5, 6].includes(n) ? 'sponsor' : 'lead-boutique'},
+                ${n <= 6 ? 'aprobado' : 'pendiente'},
+                ${n <= 6 ? leadId : null}, ${n <= 6 ? new Date() : null})
+        returning id`;
+      await admin`insert into checklist_item
+        (workspace_id, gate_id, orden, texto, estado, na_justificacion, na_aprobado_por)
+        values (${ws}, ${g!.id as string}, 0, 'Ítem del test', 'na', 'fuera de alcance del test',
+                ${leadId})`;
+    }
     const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del tablero vacío');
-    const dv = await crearDesignVersion(leadId, {
-      workspaceId: ws,
-      proyectoId: proy,
-      servicioId: svcId,
-      journeyId,
-      titulo: 'La que se queda sin elementos',
-      resumen: '',
-      superaA: null,
-    });
-    const el = await elementoSuelto(dv.designVersionId, 'Elemento que después no estará');
-    await aprobarDesignVersion(leadId, {
-      workspaceId: ws,
-      designVersionId: dv.designVersionId,
-      motivo: '',
-    });
-    await planificarRelease(leadId, {
-      workspaceId: ws,
-      designVersionId: dv.designVersionId,
-      titulo: 'Plan que se firma',
-      responsable: 'Equipo',
-      fechaObjetivo: HOY,
-      elementos: [{ elementoId: el, razon: '' }],
-    });
-    await aprobarGatesHasta(proy, 6);
+    // Y la versión aprobada SIN elementos, insertada tal cual: el guard de transición mira
+    // UPDATEs, así que un alta directa en ese estado es exactamente el agujero que un
+    // backfill abriría.
+    const [snap] = await admin`insert into journey_snapshot
+      (workspace_id, journey_id, motivo, grafo, congelado_por)
+      values (${ws}, ${journeyId}, 'Backfill del test',
+        jsonb_build_object('nodos', '[]'::jsonb, 'aristas', '[]'::jsonb, 'evidencias', '[]'::jsonb),
+        ${leadId}) returning id`;
+    await admin`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, journey_id, titulo, estado,
+       snapshot_id, aprobada_por, aprobada_en, creado_por)
+      values (${ws}, ${proy}, ${svcId}, ${journeyId}, 'La que nació sin elementos', 'aprobada',
+              ${snap!.id as string}, ${leadId}, now(), ${leadId})`;
 
-    await admin`delete from release_elemento where elemento_id = ${el} and workspace_id = ${ws}`;
-    await admin`delete from elemento_cambio where id = ${el} and workspace_id = ${ws}`;
     await expect(
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`,
@@ -4216,6 +4228,163 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [dvSig] = await admin`select codigo from design_version
       where id = ${siguiente.designVersionId}`;
     expect(numeroDe(dvSig!.codigo as string)).toBeGreaterThan(numeroDe(creada!.codigo as string));
+  });
+
+  it('aprobar la versión y meterle un elemento NO pueden commitear los dos (SYS-05)', async () => {
+    // Escriben tablas DISTINTAS —design_version y elemento_cambio—, así que no hay candado de
+    // fila que las cruce, y el de clave foránea tampoco: no entra en conflicto con un update
+    // de columnas no-clave de la design version. La aprobación cuenta y valida los elementos
+    // que ve, la inserción ve 'borrador', y las dos commitean.
+    //
+    // Lo que queda es peor que una versión con un nodo fuera de su snapshot: desde que G5
+    // exige una design version aprobada, la FIRMA DEL CLIENTE cubre algo que el cliente no
+    // vio. Y no se arregla nunca, porque la versión ya es inmutable.
+    //
+    // Y el candado solo no bastaba: la política del elemento se evalúa con la instantánea del
+    // INICIO de su sentencia, así que esperar el candado no le haría ver la aprobación recién
+    // commiteada. Hace falta una sentencia nueva después, que es lo que es el diferido.
+    const proy = await proyectoConGates('P-134', 'Proyecto de la carrera del congelado');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del congelado');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que se congela a medias',
+      resumen: '',
+      superaA: null,
+    });
+    await elementoSuelto(dv.designVersionId, 'El que sí estaba cuando se firmó');
+
+    // Las dos escriben lo suyo y esperan a que la otra haya escrito: nadie ha commiteado, así
+    // que ninguna puede ver a la otra. Solo entonces se sueltan a la vez.
+    let listaA!: () => void;
+    let listaB!: () => void;
+    const ambasEscritas = Promise.all([
+      new Promise<void>((r) => (listaA = r)),
+      new Promise<void>((r) => (listaB = r)),
+    ]);
+    let soltar!: () => void;
+    const salida = new Promise<void>((r) => (soltar = r));
+
+    const aprobando = conUsuario(leadId, async (tx) => {
+      const [snap] = await tx`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        select ${ws}, ${journeyId}, 'Aprobación en carrera',
+          jsonb_build_object(
+            'nodos', coalesce((select jsonb_agg(to_jsonb(n)) from journey_nodo n
+              where n.journey_id = ${journeyId} and n.workspace_id = ${ws}), '[]'::jsonb),
+            'aristas', coalesce((select jsonb_agg(to_jsonb(a)) from journey_arista a
+              where a.journey_id = ${journeyId} and a.workspace_id = ${ws}), '[]'::jsonb),
+            'evidencias', '[]'::jsonb),
+          ${leadId} returning id`;
+      const filas = await tx`update design_version
+        set estado = 'aprobada', snapshot_id = ${snap!.id as string}, aprobada_por = ${leadId}
+        where id = ${dv.designVersionId} and workspace_id = ${ws} and estado = 'borrador'`;
+      if (filas.count !== 1) throw new Error('la aprobación directa no alcanzó su fila');
+      listaA();
+      await salida;
+    });
+    const insertando = conUsuario(leadId, async (tx) => {
+      const filas = await tx`insert into elemento_cambio
+        (workspace_id, design_version_id, tipo, operacion, titulo, nodo_id, orden, creado_por)
+        values (${ws}, ${dv.designVersionId}, 'canal', 'agrega',
+                'El que se cuela después de la firma', null, 99, ${leadId})`;
+      if (filas.count !== 1) throw new Error('la inserción directa no alcanzó su fila');
+      listaB();
+      await salida;
+    });
+
+    await ambasEscritas;
+    soltar();
+    const desenlaces = await Promise.allSettled([aprobando, insertando]);
+    expect(desenlaces.filter((d) => d.status === 'fulfilled')).toHaveLength(1);
+    expect(desenlaces.filter((d) => d.status === 'rejected')).toHaveLength(1);
+
+    // Y el invariante queda ENTERO gane quien gane: o la versión sigue en borrador con sus
+    // dos elementos, o se congeló con exactamente lo que la aprobación validó.
+    const admin = sqlAdmin();
+    const [estado] = await admin`select dv.estado,
+        (select count(*)::int from elemento_cambio ec
+          where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id) as elementos
+      from design_version dv where dv.id = ${dv.designVersionId} and dv.workspace_id = ${ws}`;
+    const congeladaConIntruso =
+      estado!.estado !== 'borrador' && (estado!.elementos as number) !== 1;
+    expect(congeladaConIntruso).toBe(false);
+  });
+
+  it('meter alcance en un release que ya salió NO puede commitear con el despliegue (SYS-06)', async () => {
+    // El tercer lado del alcance, y una invariante DISTINTA de la de arriba: aquella dice que
+    // un release desplegado no se queda vacío; esta, que no CRECE. Sin ella, un release sale y
+    // después gana un elemento que no formó parte del despliegue — y la constatación o lo da
+    // por bueno sin haber salido, o se queda sin forma de resolverlo.
+    const proy = await proyectoConGates('P-135', 'Proyecto del alcance que crece');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del alcance que crece');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del alcance que crece',
+      resumen: '',
+      superaA: null,
+    });
+    const dentro = await elementoSuelto(dv.designVersionId, 'El que sí sale');
+    const fuera = await elementoSuelto(dv.designVersionId, 'El que se cuela después');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const rl = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'El que sale con lo que declaró',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: dentro, razon: '' }],
+    });
+
+    let listaA!: () => void;
+    let listaB!: () => void;
+    const ambasEscritas = Promise.all([
+      new Promise<void>((r) => (listaA = r)),
+      new Promise<void>((r) => (listaB = r)),
+    ]);
+    let soltar!: () => void;
+    const salida = new Promise<void>((r) => (soltar = r));
+
+    const metiendo = conUsuario(leadId, async (tx) => {
+      const filas = await tx`insert into release_elemento
+        (elemento_id, release_id, workspace_id, razon, creado_por)
+        values (${fuera}, ${rl.releaseId}, ${ws}, 'llega tarde', ${leadId})`;
+      if (filas.count !== 1) throw new Error('el alta directa no alcanzó su fila');
+      listaA();
+      await salida;
+    });
+    const desplegando = conUsuario(leadId, async (tx) => {
+      const filas = await tx`update release set estado = 'desplegado', desplegado_en = ${HOY}::date
+        where id = ${rl.releaseId} and workspace_id = ${ws} and estado = 'planificado'`;
+      if (filas.count !== 1) throw new Error('el despliegue directo no alcanzó su fila');
+      listaB();
+      await salida;
+    });
+
+    await ambasEscritas;
+    soltar();
+    const desenlaces = await Promise.allSettled([metiendo, desplegando]);
+    expect(desenlaces.filter((d) => d.status === 'fulfilled')).toHaveLength(1);
+    expect(desenlaces.filter((d) => d.status === 'rejected')).toHaveLength(1);
+
+    // Gane quien gane: o el release sigue planificado con sus dos elementos, o salió con
+    // exactamente el alcance que declaró. Lo que no existe es un desplegado que creció.
+    const admin = sqlAdmin();
+    const [estado] = await admin`select r.estado,
+        (select count(*)::int from release_elemento re
+          where re.release_id = r.id and re.workspace_id = r.workspace_id) as alcance
+      from release r where r.id = ${rl.releaseId} and r.workspace_id = ${ws}`;
+    const salioYCrecio = estado!.estado !== 'planificado' && (estado!.alcance as number) !== 1;
+    expect(salioYCrecio).toBe(false);
   });
 
   it('quitar el último elemento y desplegar NO pueden commitear los dos (SYS-06)', async () => {

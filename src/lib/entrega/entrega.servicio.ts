@@ -285,7 +285,10 @@ async function bloquearRetoDelElemento(
  *
  * `reto` es el candado del MÉTODO (`bloquearReto`, en metodo.servicio) y aparece aquí
  * porque aprobar una design version y quitarle el release a un elemento tienen que
- * serializarse contra `aprobarGate`. Va el primero de todos porque en el método ya va antes
+ * serializarse contra `aprobarGate`. Lo toman TAMBIÉN, al commit, los guards diferidos que
+ * cierran ese par en la base (`release_elemento_cobertura` y el de suficiencia del gate), y
+ * por eso lo pide toda ruta que BORRE un release_elemento —mover incluido—: un candado que
+ * toma un trigger sigue contando para el orden, y pedirlo tarde invierte la secuencia. Va el primero de todos porque en el método ya va antes
  * que el gate, y ninguna ruta de este módulo lo toma después de nada: quien lo tome, lo
  * toma antes de todo lo demás.
  *
@@ -301,7 +304,7 @@ async function bloquearRetoDelElemento(
  *   crearDesignVersion ......... reto → codigo-dv
  *   planificarRelease .......... servicio → codigo-rl → release
  *   asignarElemento ............ servicio → release
- *   moverElemento .............. servicio → release(origen) y release(destino), por uuid
+ *   moverElemento .............. reto → servicio → release(origen) y release(destino), por uuid
  *   desasignarElemento ......... reto → release
  *   desplegarRelease ........... release
  *   constatarEffectiveState .... release → codigo-es
@@ -797,6 +800,15 @@ export async function moverElemento(actorId: string, entrada: AsignarElemento): 
     if (!destino) {
       throw new ErrorEntrega('Ese release no existe en este workspace');
     }
+    // El RETO primero, antes que nada. Mover BORRA un release_elemento, y el borrado dispara
+    // al commit el diferido de cobertura, que desde que la cita de G6 vive en la base toma el
+    // candado del reto. Sin tomarlo aquí, esta ruta lo adquiriría el ÚLTIMO —después del
+    // servicio y de los releases— y eso invierte el orden canónico del módulo: contra
+    // `aprobarDesignVersion` (reto → dv-elemento → servicio) se cierra el ciclo.
+    //
+    // Que el candado lo tome un trigger no lo saca del orden: un candado diferido es un
+    // candado, y la ruta que lo va a necesitar tiene que pedirlo en su sitio.
+    await bloquearRetoDelElemento(tx, entrada.workspaceId, entrada.elementoId);
     await bloquearServicio(tx, destino.servicio_id as string);
     for (const rel of [origen, entrada.releaseId].sort()) {
       await bloquearRelease(tx, rel);

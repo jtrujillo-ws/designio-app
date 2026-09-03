@@ -970,6 +970,65 @@ create trigger elemento_cambio_nodo
   for each row execute function elemento_cambio_nodo_guard();
 revoke execute on function elemento_cambio_nodo_guard() from public;
 
+-- ══ UN ELEMENTO SOLO ENTRA EN UN BORRADOR (SYS-05) ══
+-- La política del elemento ya exige que su design version esté en borrador, pero una política
+-- es un predicado sobre una INSTANTÁNEA, y la de una sentencia se toma cuando la sentencia
+-- empieza. Aprobar y añadir un elemento escriben tablas DISTINTAS —design_version y
+-- elemento_cambio—, así que ningún candado de fila las cruza: la aprobación cuenta los
+-- elementos que ve y los valida, la inserción ve 'borrador', y las dos commitean. Queda un
+-- elemento DENTRO de una versión ya congelada sin haber pasado por ninguna de las
+-- comprobaciones de la aprobación.
+--
+-- Lo que eso rompe, desde que G5 exige una design version aprobada para firmarse: **la firma
+-- del cliente pasa a cubrir algo que el cliente no vio**. No es solo una versión inmutable
+-- con un nodo fuera de su snapshot —que también, y esa no se puede arreglar nunca porque la
+-- versión ya no se edita—: es una certificación humana cuyo contenido cambió por detrás.
+--
+-- Y el candado SOLO no basta, que es lo que obliga a que esto sea diferido. Si el candado se
+-- tomara en el trigger BEFORE del elemento, la inserción esperaría a la aprobación… y después
+-- seguiría evaluando su política con la instantánea que tomó al EMPEZAR la sentencia, o sea
+-- viendo 'borrador' igual. Hace falta una sentencia NUEVA después de que la otra commitee, y
+-- eso es exactamente lo que es un constraint trigger diferido.
+--
+-- El candado va PRIMERO por lo mismo que en los otros dos pares: dos diferidos que se miran
+-- sin verse pasan los dos. La clave es la del servicio ('designio:dv-elemento:' || id), que ya
+-- serializa aprobar contra toda mutación de elementos — solo que hasta ahora únicamente para
+-- quien entraba por el servicio.
+--
+-- Es el ÚNICO constraint trigger de elemento_cambio, así que aquí no hay orden alfabético que
+-- respetar; si algún día entra otro que tome un candado distinto, hay que colocarlo según el
+-- orden canónico del módulo (reto → dv-elemento → …), como ya pasa en release_elemento.
+--
+-- Si la versión ya no existe no hay nada que proteger: el desmontaje que se lleva versión y
+-- elementos en la misma transacción es legítimo.
+create function elemento_cambio_version_editable_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_dv uuid;
+  v_ws uuid;
+  v_estado text;
+begin
+  if tg_op = 'DELETE' then
+    v_dv := old.design_version_id;
+    v_ws := old.workspace_id;
+  else
+    v_dv := new.design_version_id;
+    v_ws := new.workspace_id;
+  end if;
+  perform pg_advisory_xact_lock(hashtextextended('designio:dv-elemento:' || v_dv, 42));
+  select dv.estado into v_estado from design_version dv
+    where dv.id = v_dv and dv.workspace_id = v_ws;
+  if v_estado is not null and v_estado <> 'borrador' then
+    raise exception 'la design version se aprobó mientras se editaban sus elementos: lo que se congeló no incluye este cambio (SYS-05)';
+  end if;
+  return null;
+end $$;
+create constraint trigger elemento_cambio_version_editable
+  after insert or update or delete on elemento_cambio
+  deferrable initially deferred
+  for each row execute function elemento_cambio_version_editable_guard();
+revoke execute on function elemento_cambio_version_editable_guard() from public;
+
 -- Lo que MOTIVA un elemento tiene que ser citable de verdad: misma doctrina que
 -- checklist_objeto_citable_guard (la decisión, del proyecto de la DV y VIGENTE; el
 -- insight, validado). El picker filtra las dos cosas; el endpoint acepta cualquier uuid.
@@ -1326,6 +1385,12 @@ begin
   end if;
 
   if new.estado = 'aprobada' then
+    -- El candado de la VERSIÓN, y antes de mirar nada: es el otro lado del par que cierra
+    -- `elemento_cambio_version_editable_guard`. Sin él, esta aprobación y una inserción de
+    -- elemento concurrente se miran sin verse y congelan una versión con contenido que estas
+    -- comprobaciones nunca vieron. El servicio ya lo tomaba; aquí vale también para el SQL
+    -- directo, que es lo que este esquema promete cubrir.
+    perform pg_advisory_xact_lock(hashtextextended('designio:dv-elemento:' || new.id, 42));
     -- El sello lo pone la BASE: un update directo no puede retro ni post-datar lo que
     -- desde este instante es inmutable.
     new.aprobada_en := now();
@@ -1838,6 +1903,46 @@ create constraint trigger release_sin_alcance
   deferrable initially deferred
   for each row execute function release_alcance_no_vacio_guard();
 revoke execute on function release_alcance_no_vacio_guard() from public;
+
+-- ══ Y EL ALCANCE DE LO QUE YA SALIÓ NO CAMBIA (SYS-06) ══
+-- Otra invariante, no otro lado de la anterior, y por eso guard aparte: aquella dice que un
+-- release desplegado no se queda VACÍO; esta dice que su alcance no CRECE. La política del
+-- alta ya exige 'planificado', pero es un predicado sobre la instantánea de la sentencia, y
+-- ahí vuelve el mismo agujero: meter un elemento mientras se despliega el release escribe
+-- otra tabla, así que la política ve 'planificado', el guard de transición ve solo el alcance
+-- viejo, y las dos commitean. El release sale y DESPUÉS gana un elemento que no formó parte
+-- del despliegue — y luego la constatación o lo da por bueno sin haber salido, o se queda
+-- bloqueada porque el elemento no tiene forma de resolverse.
+--
+-- Basta con vigilar el ALTA. Si el alta commitea primero, el elemento entró cuando el release
+-- todavía estaba planificado y el despliegue lo incluye con razón; si commitea primero el
+-- despliegue, esta comprobación —sentencia nueva, instantánea fresca— ya lo ve desplegado y
+-- rechaza. El UPDATE no hace falta mirarlo: release_elemento no tiene grant de update.
+--
+-- El NOMBRE mantiene el orden canónico, otra vez. En release_elemento los diferidos disparan
+-- por orden alfabético, y `alcance_fijo` va antes que `cobertura` y que `sin_alcance` — pero
+-- solo se cruzan en una transacción que BORRA e INSERTA (mover un elemento), y ahí los
+-- eventos del borrado se encolan antes, así que el candado del reto (cobertura) se toma antes
+-- que el del release. Si algún día esto pasa a mirar también el borrado, hay que renombrarlo
+-- para que caiga DESPUÉS de `cobertura`, o se invierte la secuencia.
+create function release_alcance_fijo_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_estado text;
+begin
+  perform pg_advisory_xact_lock(hashtextextended('designio:release:' || new.release_id, 42));
+  select r.estado into v_estado from release r
+    where r.id = new.release_id and r.workspace_id = new.workspace_id;
+  if v_estado is not null and v_estado <> 'planificado' then
+    raise exception 'ese release ya salió: su alcance es fijo y este elemento no formó parte del despliegue (SYS-06)';
+  end if;
+  return null;
+end $$;
+create constraint trigger release_elemento_alcance_fijo
+  after insert on release_elemento
+  deferrable initially deferred
+  for each row execute function release_alcance_fijo_guard();
+revoke execute on function release_alcance_fijo_guard() from public;
 
 -- ══ EL CALENDARIO QUE MANDA ES EL DE QUIEN ESCRIBE (RF-06.5, RF-06.6) ══
 -- «La fecha no puede ser futura» no dice nada hasta que se responde «futura ¿en qué

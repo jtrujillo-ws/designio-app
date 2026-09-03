@@ -191,180 +191,245 @@ async function sembrarJourney(tx: TransactionSql, wsId: string, luciaId: string)
  * Un demo con la conciliación cuadrada enseñaría a ignorar el tablero. Idempotente: la
  * señal es la presencia de design versions en el workspace. Devuelve si la creó ahora.
  */
-async function sembrarEntrega(tx: TransactionSql, wsId: string, luciaId: string): Promise<boolean> {
-  const yaHay = await tx`select 1 from design_version where workspace_id = ${wsId}`;
+/**
+ * La cadena de entrega del ejemplo trabajado, sembrada COMO NACE DE VERDAD y no como queda.
+ *
+ * Son tres transacciones y no una a propósito. Una design version nace en BORRADOR, recibe
+ * sus elementos, y se aprueba DESPUÉS —congelando el snapshot en esa misma transición—. El
+ * seed insertaba la fila ya 'aprobada' y le colgaba los elementos detrás, que es un estado
+ * que el producto no puede producir: se saltaba el guard de transición entero y era, de
+ * hecho, un segundo escritor con reglas propias. Desde que un constraint trigger diferido
+ * exige que un elemento solo entre en un borrador, ese atajo ya no cuela — y menos mal,
+ * porque el fixture estaba mintiendo sobre cómo se crea el dato.
+ *
+ * Ahora el seed pasa por los MISMOS guards que la aplicación, así que cada `db:seed` es
+ * también una prueba de que el camino de aprobación funciona de punta a punta.
+ */
+async function sembrarEntrega(
+  conexion: typeof sql,
+  wsId: string,
+  luciaId: string,
+): Promise<boolean> {
+  const yaHay = await conexion`select 1 from design_version where workspace_id = ${wsId}`;
   if (yaHay.length > 0) return false;
-  const [svc] = await tx`select id from servicio
-    where workspace_id = ${wsId} and nombre = 'Apertura de cuenta nómina digital'`;
-  const [p01] = await tx`select id from proyecto where workspace_id = ${wsId} and codigo = 'P-01'`;
-  if (!svc || !p01) return false;
-  const svcId = svc.id as string;
-  const proyectoId = p01.id as string;
+  const ids = await conexion.begin(async (tx) => {
+    const [svc] = await tx`select id from servicio
+      where workspace_id = ${wsId} and nombre = 'Apertura de cuenta nómina digital'`;
+    const [p01] = await tx`select id from proyecto where workspace_id = ${wsId} and codigo = 'P-01'`;
+    if (!svc || !p01) return null;
+    const svcId = svc.id as string;
+    const proyectoId = p01.id as string;
 
-  // ── El to-be: el mismo grafo tipado, con lo que la design version viene a cambiar ──
-  const [r01] = await tx`select id from reto where workspace_id = ${wsId} and codigo = 'R-01'`;
-  const [j] = await tx`insert into journey
-    (workspace_id, servicio_id, reto_id, proyecto_id, tipo, nombre, descripcion, creado_por) values
-    (${wsId}, ${svcId}, ${(r01?.id as string) ?? null}, ${proyectoId},
-     'to-be', 'Apertura con verificación asistida',
-     'El mismo recorrido con la verificación resuelta en la app y el rechazo explicado',
-     ${luciaId}) returning id`;
-  const jId = j!.id as string;
+    // ── El to-be: el mismo grafo tipado, con lo que la design version viene a cambiar ──
+    const [r01] = await tx`select id from reto where workspace_id = ${wsId} and codigo = 'R-01'`;
+    const [j] = await tx`insert into journey
+      (workspace_id, servicio_id, reto_id, proyecto_id, tipo, nombre, descripcion, creado_por) values
+      (${wsId}, ${svcId}, ${(r01?.id as string) ?? null}, ${proyectoId},
+       'to-be', 'Apertura con verificación asistida',
+       'El mismo recorrido con la verificación resuelta en la app y el rechazo explicado',
+       ${luciaId}) returning id`;
+    const jId = j!.id as string;
 
-  /** Los tipos que son entidades DEL SERVICIO llevan identidad de catálogo. */
-  const CON_CATALOGO = ['touchpoint', 'canal', 'actor', 'sistema'];
-  async function nodo(
-    tipo: string,
-    etiqueta: string,
-    orden: number,
-    faseId: string | null,
-    responsable = '',
-  ): Promise<string> {
-    let catalogoId: string | null = null;
-    if (CON_CATALOGO.includes(tipo)) {
-      // El catálogo da identidad COMPARTIDA dentro del servicio: el core bancario del
-      // as-is y el del to-be son el mismo objeto, y por eso el upsert reusa.
-      const [c] = await tx`insert into catalogo_journey
-        (workspace_id, servicio_id, tipo, nombre, creado_por)
-        values (${wsId}, ${svcId}, ${tipo}, ${etiqueta}, ${luciaId})
-        on conflict (workspace_id, servicio_id, tipo, nombre)
-          do update set nombre = excluded.nombre
+    /** Los tipos que son entidades DEL SERVICIO llevan identidad de catálogo. */
+    const CON_CATALOGO = ['touchpoint', 'canal', 'actor', 'sistema'];
+    async function nodo(
+      tipo: string,
+      etiqueta: string,
+      orden: number,
+      faseId: string | null,
+      responsable = '',
+    ): Promise<string> {
+      let catalogoId: string | null = null;
+      if (CON_CATALOGO.includes(tipo)) {
+        // El catálogo da identidad COMPARTIDA dentro del servicio: el core bancario del
+        // as-is y el del to-be son el mismo objeto, y por eso el upsert reusa.
+        const [c] = await tx`insert into catalogo_journey
+          (workspace_id, servicio_id, tipo, nombre, creado_por)
+          values (${wsId}, ${svcId}, ${tipo}, ${etiqueta}, ${luciaId})
+          on conflict (workspace_id, servicio_id, tipo, nombre)
+            do update set nombre = excluded.nombre
+          returning id`;
+        catalogoId = c!.id as string;
+      }
+      const [n] = await tx`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, fase_id, orden, responsable, catalogo_id, creado_por)
+        values (${wsId}, ${jId}, ${tipo}, ${etiqueta}, ${faseId}, ${orden}, ${responsable},
+                ${catalogoId}, ${luciaId})
         returning id`;
-      catalogoId = c!.id as string;
+      return n!.id as string;
     }
-    const [n] = await tx`insert into journey_nodo
-      (workspace_id, journey_id, tipo, etiqueta, fase_id, orden, responsable, catalogo_id, creado_por)
-      values (${wsId}, ${jId}, ${tipo}, ${etiqueta}, ${faseId}, ${orden}, ${responsable},
-              ${catalogoId}, ${luciaId})
-      returning id`;
-    return n!.id as string;
-  }
 
-  const solicitud = await nodo('fase', 'Solicitud', 0, null);
-  const verificacion = await nodo('fase', 'Verificación', 1, null);
-  const abre = await nodo('paso', 'Abre el enlace del convenio', 0, solicitud);
-  const datos = await nodo('paso', 'Completa sus datos', 1, solicitud);
-  const video = await nodo('touchpoint', 'Video-verificación asistida', 0, null);
-  const verifica = await nodo('paso', 'Se verifica en video con un asesor', 2, verificacion);
-  const motivo = await nodo('paso', 'Recibe el motivo del rechazo explicado', 3, verificacion);
-  const firma = await nodo('paso', 'Firma el contrato', 4, verificacion);
-  const app = await nodo('canal', 'App móvil', 0, null);
-  const core = await nodo('sistema', 'Core bancario', 0, null, 'Tecnología');
-  const excepciones = await nodo('accion-backstage', 'Revisión manual solo de excepciones', 0, verificacion, 'Riesgo');
+    const solicitud = await nodo('fase', 'Solicitud', 0, null);
+    const verificacion = await nodo('fase', 'Verificación', 1, null);
+    const abre = await nodo('paso', 'Abre el enlace del convenio', 0, solicitud);
+    const datos = await nodo('paso', 'Completa sus datos', 1, solicitud);
+    const video = await nodo('touchpoint', 'Video-verificación asistida', 0, null);
+    const verifica = await nodo('paso', 'Se verifica en video con un asesor', 2, verificacion);
+    const motivo = await nodo('paso', 'Recibe el motivo del rechazo explicado', 3, verificacion);
+    const firma = await nodo('paso', 'Firma el contrato', 4, verificacion);
+    const app = await nodo('canal', 'App móvil', 0, null);
+    const core = await nodo('sistema', 'Core bancario', 0, null, 'Tecnología');
+    const excepciones = await nodo('accion-backstage', 'Revisión manual solo de excepciones', 0, verificacion, 'Riesgo');
 
-  await tx`insert into journey_arista
-    (workspace_id, journey_id, origen_id, destino_id, tipo, condicion, creado_por) values
-    (${wsId}, ${jId}, ${abre}, ${datos}, 'transicion', '', ${luciaId}),
-    (${wsId}, ${jId}, ${datos}, ${verifica}, 'transicion', '', ${luciaId}),
-    (${wsId}, ${jId}, ${verifica}, ${firma}, 'transicion', 'identidad confirmada', ${luciaId}),
-    (${wsId}, ${jId}, ${verifica}, ${motivo}, 'transicion', 'identidad rechazada', ${luciaId}),
-    (${wsId}, ${jId}, ${abre}, ${app}, 'ocurre-en', '', ${luciaId}),
-    (${wsId}, ${jId}, ${verifica}, ${video}, 'ocurre-en', '', ${luciaId}),
-    (${wsId}, ${jId}, ${core}, ${verifica}, 'soporta', '', ${luciaId}),
-    (${wsId}, ${jId}, ${excepciones}, ${verifica}, 'soporta', '', ${luciaId})`;
+    await tx`insert into journey_arista
+      (workspace_id, journey_id, origen_id, destino_id, tipo, condicion, creado_por) values
+      (${wsId}, ${jId}, ${abre}, ${datos}, 'transicion', '', ${luciaId}),
+      (${wsId}, ${jId}, ${datos}, ${verifica}, 'transicion', '', ${luciaId}),
+      (${wsId}, ${jId}, ${verifica}, ${firma}, 'transicion', 'identidad confirmada', ${luciaId}),
+      (${wsId}, ${jId}, ${verifica}, ${motivo}, 'transicion', 'identidad rechazada', ${luciaId}),
+      (${wsId}, ${jId}, ${abre}, ${app}, 'ocurre-en', '', ${luciaId}),
+      (${wsId}, ${jId}, ${verifica}, ${video}, 'ocurre-en', '', ${luciaId}),
+      (${wsId}, ${jId}, ${core}, ${verifica}, 'soporta', '', ${luciaId}),
+      (${wsId}, ${jId}, ${excepciones}, ${verifica}, 'soporta', '', ${luciaId})`;
 
-  // ── DV-1 aprobada: el snapshot del grafo congelado es parte de la aprobación ──
-  const [snap] = await tx`insert into journey_snapshot
-    (workspace_id, journey_id, motivo, grafo, congelado_por) values
-    (${wsId}, ${jId}, 'Aprobación de DV-1',
-     jsonb_build_object(
-       'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.orden) from journey_nodo n
-         where n.journey_id = ${jId} and n.workspace_id = ${wsId}), '[]'::jsonb),
-       'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en) from journey_arista a
-         where a.journey_id = ${jId} and a.workspace_id = ${wsId}), '[]'::jsonb),
-       'evidencias', '[]'::jsonb),
-     ${luciaId}) returning id`;
 
-  const [dv] = await tx`insert into design_version
-    (workspace_id, proyecto_id, servicio_id, journey_id, codigo, titulo, resumen, estado,
-     snapshot_id, aprobada_por, aprobada_en, creado_por) values
-    (${wsId}, ${proyectoId}, ${svcId}, ${jId}, 'DV-1',
-     'Verificación asistida y rechazo explicado',
-     'Resuelve la verificación dentro de la app y devuelve el motivo del rechazo al cliente',
-     'aprobada', ${snap!.id as string}, ${luciaId}, now(), ${luciaId}) returning id`;
-  const dvId = dv!.id as string;
+    // La design version NACE EN BORRADOR y recibe sus elementos aquí. Aprobarla es otra
+    // transición y va en su propia transacción, abajo: un elemento solo entra en un borrador
+    // (lo impone elemento_cambio_version_editable_guard, que es diferido y mira al COMMIT).
+    const [dv] = await tx`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, journey_id, titulo, resumen, creado_por) values
+      (${wsId}, ${proyectoId}, ${svcId}, ${jId},
+       'Verificación asistida y rechazo explicado',
+       'Resuelve la verificación dentro de la app y devuelve el motivo del rechazo al cliente',
+       ${luciaId}) returning id`;
+    const dvId = dv!.id as string;
 
-  async function elemento(
-    tipo: string,
-    operacion: string,
-    titulo: string,
-    detalle: string,
-    nodoId: string,
-    orden: number,
-  ): Promise<string> {
-    const [e] = await tx`insert into elemento_cambio
-      (workspace_id, design_version_id, tipo, operacion, titulo, detalle, nodo_id, orden, creado_por)
-      values (${wsId}, ${dvId}, ${tipo}, ${operacion}, ${titulo}, ${detalle}, ${nodoId}, ${orden},
-              ${luciaId}) returning id`;
-    return e!.id as string;
-  }
+    async function elemento(
+      tipo: string,
+      operacion: string,
+      titulo: string,
+      detalle: string,
+      nodoId: string,
+      orden: number,
+    ): Promise<string> {
+      const [e] = await tx`insert into elemento_cambio
+        (workspace_id, design_version_id, tipo, operacion, titulo, detalle, nodo_id, orden, creado_por)
+        values (${wsId}, ${dvId}, ${tipo}, ${operacion}, ${titulo}, ${detalle}, ${nodoId}, ${orden},
+                ${luciaId}) returning id`;
+      return e!.id as string;
+    }
 
-  const elVideo = await elemento('touchpoint', 'agrega', 'Video-verificación asistida en la app',
-    'Un asesor confirma la identidad en video sin salir del flujo', video, 0);
-  const elExcepciones = await elemento('proceso-backstage', 'modifica', 'Revisión manual solo de excepciones',
-    'Riesgo deja de revisar el 100% y pasa a revisar lo que el motor marca', excepciones, 1);
-  const elMotivo = await elemento('politica', 'modifica', 'El motivo del rechazo se explica al cliente',
-    'La política de no revelar criterios se sustituye por un motivo accionable', motivo, 2);
-  const elCore = await elemento('sistema', 'modifica', 'Integración del core con el proveedor de identidad',
-    'El core consulta al proveedor en línea en vez de por lote nocturno', core, 3);
+    const elVideo = await elemento('touchpoint', 'agrega', 'Video-verificación asistida en la app',
+      'Un asesor confirma la identidad en video sin salir del flujo', video, 0);
+    const elExcepciones = await elemento('proceso-backstage', 'modifica', 'Revisión manual solo de excepciones',
+      'Riesgo deja de revisar el 100% y pasa a revisar lo que el motor marca', excepciones, 1);
+    const elMotivo = await elemento('politica', 'modifica', 'El motivo del rechazo se explica al cliente',
+      'La política de no revelar criterios se sustituye por un motivo accionable', motivo, 2);
+    const elCore = await elemento('sistema', 'modifica', 'Integración del core con el proveedor de identidad',
+      'El core consulta al proveedor en línea en vez de por lote nocturno', core, 3);
 
-  // La cadena hacia atrás: los elementos citan el insight validado y la decisión de G1.
-  const [ins] = await tx`select id from insight where workspace_id = ${wsId} and estado = 'validado' limit 1`;
-  const [dec] = await tx`select id from decision where workspace_id = ${wsId} limit 1`;
-  if (ins) {
-    await tx`insert into elemento_insight (elemento_id, insight_id, workspace_id, creado_por) values
-      (${elVideo}, ${ins.id as string}, ${wsId}, ${luciaId}),
-      (${elMotivo}, ${ins.id as string}, ${wsId}, ${luciaId})`;
-  }
-  if (dec) {
-    await tx`insert into elemento_decision (elemento_id, decision_id, workspace_id, creado_por) values
-      (${elVideo}, ${dec.id as string}, ${wsId}, ${luciaId}),
-      (${elExcepciones}, ${dec.id as string}, ${wsId}, ${luciaId})`;
-  }
+    // La cadena hacia atrás: los elementos citan el insight validado y la decisión de G1.
+    const [ins] = await tx`select id from insight where workspace_id = ${wsId} and estado = 'validado' limit 1`;
+    const [dec] = await tx`select id from decision where workspace_id = ${wsId} limit 1`;
+    if (ins) {
+      await tx`insert into elemento_insight (elemento_id, insight_id, workspace_id, creado_por) values
+        (${elVideo}, ${ins.id as string}, ${wsId}, ${luciaId}),
+        (${elMotivo}, ${ins.id as string}, ${wsId}, ${luciaId})`;
+    }
+    if (dec) {
+      await tx`insert into elemento_decision (elemento_id, decision_id, workspace_id, creado_por) values
+        (${elVideo}, ${dec.id as string}, ${wsId}, ${luciaId}),
+        (${elExcepciones}, ${dec.id as string}, ${wsId}, ${luciaId})`;
+    }
 
-  // ── RL-1: tres de los cuatro elementos, desplegado y constatado ──
-  const [rl1] = await tx`insert into release
-    (workspace_id, design_version_id, codigo, titulo, responsable, fecha_objetivo, estado,
-     desplegado_en, creado_por) values
-    (${wsId}, ${dvId}, 'RL-1', 'Verificación en la app', 'Equipo de canales digitales',
-     '2026-08-10', 'verificado', '2026-08-10', ${luciaId}) returning id`;
-  const rl1Id = rl1!.id as string;
-  await tx`insert into release_elemento (elemento_id, release_id, workspace_id, razon, creado_por) values
-    (${elVideo}, ${rl1Id}, ${wsId}, '', ${luciaId}),
-    (${elExcepciones}, ${rl1Id}, ${wsId}, '', ${luciaId}),
-    (${elMotivo}, ${rl1Id}, ${wsId}, '', ${luciaId})`;
+    return { jId, dvId, svcId, elVideo, elExcepciones, elMotivo, elCore };
+  });
+  if (!ids) return false;
+  const { jId, dvId, svcId, elVideo, elExcepciones, elMotivo, elCore } = ids;
 
-  // ── RL-2: el cuarto elemento, con la razón de su parcialidad (§19.5) ──
-  const [rl2] = await tx`insert into release
-    (workspace_id, design_version_id, codigo, titulo, responsable, fecha_objetivo, estado, creado_por)
-    values (${wsId}, ${dvId}, 'RL-2', 'Integración en línea con identidad',
-     'Equipo de core bancario', '2026-10-15', 'planificado', ${luciaId}) returning id`;
-  await tx`insert into release_elemento (elemento_id, release_id, workspace_id, razon, creado_por)
-    values (${elCore}, ${rl2!.id as string}, ${wsId}, 'dependencia del área de riesgo', ${luciaId})`;
+  // La APROBACIÓN, en su propia transacción y por el camino real: el guard exige que el
+  // snapshot se tome en esta misma transición (xmin), así que congelar y aprobar van
+  // juntos — igual que en `aprobarDesignVersion`. Se declara quién actúa porque los
+  // guards levantan eventos de dominio con el actor y su rol.
+  await conexion.begin(async (tx) => {
+    await tx`select set_config('app.user_id', ${luciaId}, true)`;
+    // ── DV-1 aprobada: el snapshot del grafo congelado es parte de la aprobación ──
+    const [snap] = await tx`insert into journey_snapshot
+      (workspace_id, journey_id, motivo, grafo, congelado_por) values
+      (${wsId}, ${jId}, 'Aprobación de DV-1',
+       jsonb_build_object(
+         'nodos', coalesce((select jsonb_agg(to_jsonb(n) order by n.orden) from journey_nodo n
+           where n.journey_id = ${jId} and n.workspace_id = ${wsId}), '[]'::jsonb),
+         'aristas', coalesce((select jsonb_agg(to_jsonb(a) order by a.creado_en) from journey_arista a
+           where a.journey_id = ${jId} and a.workspace_id = ${wsId}), '[]'::jsonb),
+         'evidencias', '[]'::jsonb),
+       ${luciaId}) returning id`;
 
-  // ── ES-1: cómo quedó de verdad, con la desviación y su razón (SYS-07) ──
-  const [es] = await tx`insert into effective_state
-    (workspace_id, servicio_id, release_id, codigo, resumen, constatado_por, constatado_en) values
-    (${wsId}, ${svcId}, ${rl1Id}, 'ES-1',
-     'La verificación en video opera desde el 10 de agosto; el motivo del rechazo salió distinto',
-     ${luciaId}, '2026-08-20') returning id`;
-  await tx`insert into constatacion
-    (workspace_id, effective_state_id, elemento_id, resultado, que_quedo_distinto, razon, creado_por) values
-    (${wsId}, ${es!.id as string}, ${elVideo}, 'como-aprobado', '', '', ${luciaId}),
-    (${wsId}, ${es!.id as string}, ${elExcepciones}, 'como-aprobado', '', '', ${luciaId}),
-    (${wsId}, ${es!.id as string}, ${elMotivo}, 'desviado',
-     'El motivo llega por correo horas después, no en pantalla: la verificación quedó diferida',
-     'Cumplimiento exigió un paso adicional de revisión antes de mostrar el motivo',
-     ${luciaId})`;
+    await tx`update design_version
+      set estado = 'aprobada', snapshot_id = ${snap!.id as string}, aprobada_por = ${luciaId}
+      where id = ${dvId} and workspace_id = ${wsId}`;
+  });
 
-  await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
-    (${wsId}, 'JourneyCreado', ${tx.json({ nombre: 'Apertura con verificación asistida', tipo: 'to-be', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-    (${wsId}, 'DesignVersionAprobada', ${tx.json({ codigo: 'DV-1', servicio: 'Apertura de cuenta nómina digital', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-    (${wsId}, 'ReleaseDesplegado', ${tx.json({ codigo: 'RL-1', desplegadoEn: '2026-08-10', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-    (${wsId}, 'ReleaseVerificado', ${tx.json({ codigo: 'RL-1', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-    (${wsId}, 'ReleasePlanificado', ${tx.json({ codigo: 'RL-2', razon: 'dependencia del área de riesgo', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-    (${wsId}, 'EffectiveStateConstatado', ${tx.json({ codigo: 'ES-1', constatadoEn: '2026-08-20', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-    (${wsId}, 'DesviacionRegistrada', ${tx.json({ elemento: 'El motivo del rechazo se explica al cliente', razon: 'Cumplimiento exigió un paso adicional de revisión antes de mostrar el motivo', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
+  const releaseDesplegado = await conexion.begin(async (tx) => {
+    // ── RL-1: tres de los cuatro elementos, desplegado y constatado ──
+    // Nace PLANIFICADO y recorre sus transiciones, no se fabrica ya verificado. El alcance de
+    // un release que ya salió es FIJO (lo impone release_alcance_fijo_guard, diferido), así
+    // que declararlo antes de desplegar no es un detalle de orden: es la única forma en que
+    // este dato puede existir. Verificar va al final, cuando ya están sus constataciones.
+    const [rl1] = await tx`insert into release
+      (workspace_id, design_version_id, titulo, responsable, fecha_objetivo, creado_por) values
+      (${wsId}, ${dvId}, 'Verificación en la app', 'Equipo de canales digitales',
+       '2026-08-10', ${luciaId}) returning id`;
+    const rl1Id = rl1!.id as string;
+    await tx`insert into release_elemento (elemento_id, release_id, workspace_id, razon, creado_por) values
+      (${elVideo}, ${rl1Id}, ${wsId}, '', ${luciaId}),
+      (${elExcepciones}, ${rl1Id}, ${wsId}, '', ${luciaId}),
+      (${elMotivo}, ${rl1Id}, ${wsId}, '', ${luciaId})`;
+
+
+    // ── RL-2: el cuarto elemento, con la razón de su parcialidad (§19.5) ──
+    const [rl2] = await tx`insert into release
+      (workspace_id, design_version_id, titulo, responsable, fecha_objetivo, creado_por)
+      values (${wsId}, ${dvId}, 'Integración en línea con identidad',
+       'Equipo de core bancario', '2026-10-15', ${luciaId}) returning id`;
+    await tx`insert into release_elemento (elemento_id, release_id, workspace_id, razon, creado_por)
+      values (${elCore}, ${rl2!.id as string}, ${wsId}, 'dependencia del área de riesgo', ${luciaId})`;
+    return rl1Id;
+  });
+
+  // El DESPLIEGUE, en su propia transacción. Las comprobaciones diferidas miran al COMMIT, no
+  // a mitad de la transacción, así que declarar el alcance y salir tienen que ser dos commits
+  // — que es además lo que son en la vida real: planificar y desplegar son dos actos.
+  await conexion.begin(async (tx) => {
+    await tx`update release set estado = 'desplegado', desplegado_en = '2026-08-10'
+      where id = ${releaseDesplegado} and workspace_id = ${wsId}`;
+  });
+
+  // Y la CONSTATACIÓN, que es el tercer acto: el effective state con la constatación de cada
+  // elemento y el release a verificado, inseparables y en la misma transacción.
+  await conexion.begin(async (tx) => {
+    const rl1Id = releaseDesplegado;
+    // ── ES-1: cómo quedó de verdad, con la desviación y su razón (SYS-07) ──
+    const [es] = await tx`insert into effective_state
+      (workspace_id, servicio_id, release_id, resumen, constatado_por, constatado_en) values
+      (${wsId}, ${svcId}, ${rl1Id},
+       'La verificación en video opera desde el 10 de agosto; el motivo del rechazo salió distinto',
+       ${luciaId}, '2026-08-20') returning id`;
+    await tx`insert into constatacion
+      (workspace_id, effective_state_id, elemento_id, resultado, que_quedo_distinto, razon, creado_por) values
+      (${wsId}, ${es!.id as string}, ${elVideo}, 'como-aprobado', '', '', ${luciaId}),
+      (${wsId}, ${es!.id as string}, ${elExcepciones}, 'como-aprobado', '', '', ${luciaId}),
+      (${wsId}, ${es!.id as string}, ${elMotivo}, 'desviado',
+       'El motivo llega por correo horas después, no en pantalla: la verificación quedó diferida',
+       'Cumplimiento exigió un paso adicional de revisión antes de mostrar el motivo',
+       ${luciaId})`;
+    // Y solo AHORA se verifica: el guard exige la constatación de cada elemento del release,
+    // y el diferido de effective_state exige que el release acabe verificado. Las dos mitades
+    // de la operación son inseparables, y el seed las hace en el mismo orden que el servicio.
+    await tx`update release set estado = 'verificado'
+      where id = ${rl1Id} and workspace_id = ${wsId}`;
+
+    // `DesignVersionAprobada` ya NO se inserta a mano: lo levanta el guard de transición al
+    // aprobar de verdad, arriba. Los demás sí, porque sus triggers de auditoría se saltan
+    // para quien no es miembro y esta transacción corre como administrador.
+    await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
+      (${wsId}, 'JourneyCreado', ${tx.json({ nombre: 'Apertura con verificación asistida', tipo: 'to-be', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
+      (${wsId}, 'ReleaseDesplegado', ${tx.json({ codigo: 'RL-1', desplegadoEn: '2026-08-10', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
+      (${wsId}, 'ReleaseVerificado', ${tx.json({ codigo: 'RL-1', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
+      (${wsId}, 'ReleasePlanificado', ${tx.json({ codigo: 'RL-2', razon: 'dependencia del área de riesgo', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
+      (${wsId}, 'EffectiveStateConstatado', ${tx.json({ codigo: 'ES-1', constatadoEn: '2026-08-20', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
+      (${wsId}, 'DesviacionRegistrada', ${tx.json({ elemento: 'El motivo del rechazo se explica al cliente', razon: 'Cumplimiento exigió un paso adicional de revisión antes de mostrar el motivo', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
+  });
   return true;
 }
 
@@ -524,7 +589,7 @@ async function main() {
     // se auto-guarda por presencia de design versions en el workspace.
     let entregaSembrada = false;
     if (lucia) {
-      entregaSembrada = await sql.begin((tx) => sembrarEntrega(tx, wsId, lucia.id as string));
+      entregaSembrada = await sembrarEntrega(sql, wsId, lucia.id as string);
     }
 
     // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía
@@ -544,7 +609,7 @@ async function main() {
     return;
   }
 
-  await sql.begin(async (tx) => {
+  const creado = await sql.begin(async (tx) => {
     const [ws] = await tx`insert into workspace (nombre) values ('Banco Andino') returning id`;
     const wsId = ws!.id as string;
 
@@ -570,9 +635,15 @@ async function main() {
     await sembrarMetodo(tx, wsId, luciaId);
     await sembrarCadena(tx, wsId, luciaId);
     await sembrarJourney(tx, wsId, luciaId);
-    await sembrarEntrega(tx, wsId, luciaId);
     await sembrarSegundoWorkspace(tx, luciaId);
+    return { wsId, luciaId };
   });
+
+  // La entrega va FUERA de esa transacción porque necesita varias: la design version nace en
+  // borrador, recibe sus elementos, y se aprueba después. Meterla dentro obligaría a que el
+  // borrador y su aprobación cayeran en el mismo commit, que es justo el estado que el
+  // producto no puede producir y que el guard diferido rechaza.
+  await sembrarEntrega(sql, creado.wsId, creado.luciaId);
   console.log(
     `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );

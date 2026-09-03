@@ -14,6 +14,7 @@ import { Route as AutenticadaRouteImport } from './routes/_autenticada'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AutenticadaAppRouteImport } from './routes/_autenticada/app'
 import { Route as AutenticadaAuditoriaRouteImport } from './routes/_autenticada/auditoria'
+import { Route as AutenticadaDesignVersionsRouteImport } from './routes/_autenticada/design-versions'
 import { Route as AutenticadaEvidenciaRouteImport } from './routes/_autenticada/evidencia'
 import { Route as AutenticadaExportacionRouteImport } from './routes/_autenticada/exportacion'
 import { Route as AutenticadaImportacionRouteImport } from './routes/_autenticada/importacion'
@@ -21,6 +22,7 @@ import { Route as AutenticadaInsightsRouteImport } from './routes/_autenticada/i
 import { Route as AutenticadaJourneysRouteImport } from './routes/_autenticada/journeys'
 import { Route as AutenticadaPersonasRouteImport } from './routes/_autenticada/personas'
 import { Route as InvitacionTokenRouteImport } from './routes/invitacion.$token'
+import { Route as AutenticadaDesignVersionDesignVersionIdRouteImport } from './routes/_autenticada/design-version.$designVersionId'
 import { Route as AutenticadaJourneyJourneyIdRouteImport } from './routes/_autenticada/journey.$journeyId'
 import { Route as AutenticadaProyectoProyectoIdRouteImport } from './routes/_autenticada/proyecto.$proyectoId'
 
@@ -48,6 +50,12 @@ const AutenticadaAuditoriaRoute = AutenticadaAuditoriaRouteImport.update({
   path: '/auditoria',
   getParentRoute: () => AutenticadaRoute,
 } as any)
+const AutenticadaDesignVersionsRoute =
+  AutenticadaDesignVersionsRouteImport.update({
+    id: '/design-versions',
+    path: '/design-versions',
+    getParentRoute: () => AutenticadaRoute,
+  } as any)
 const AutenticadaEvidenciaRoute = AutenticadaEvidenciaRouteImport.update({
   id: '/evidencia',
   path: '/evidencia',
@@ -83,6 +91,12 @@ const InvitacionTokenRoute = InvitacionTokenRouteImport.update({
   path: '/invitacion/$token',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AutenticadaDesignVersionDesignVersionIdRoute =
+  AutenticadaDesignVersionDesignVersionIdRouteImport.update({
+    id: '/design-version/$designVersionId',
+    path: '/design-version/$designVersionId',
+    getParentRoute: () => AutenticadaRoute,
+  } as any)
 const AutenticadaJourneyJourneyIdRoute =
   AutenticadaJourneyJourneyIdRouteImport.update({
     id: '/journey/$journeyId',
@@ -101,6 +115,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/app': typeof AutenticadaAppRoute
   '/auditoria': typeof AutenticadaAuditoriaRoute
+  '/design-versions': typeof AutenticadaDesignVersionsRoute
   '/evidencia': typeof AutenticadaEvidenciaRoute
   '/exportacion': typeof AutenticadaExportacionRoute
   '/importacion': typeof AutenticadaImportacionRoute
@@ -108,6 +123,7 @@ export interface FileRoutesByFullPath {
   '/journeys': typeof AutenticadaJourneysRoute
   '/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
+  '/design-version/$designVersionId': typeof AutenticadaDesignVersionDesignVersionIdRoute
   '/journey/$journeyId': typeof AutenticadaJourneyJourneyIdRoute
   '/proyecto/$proyectoId': typeof AutenticadaProyectoProyectoIdRoute
 }
@@ -116,6 +132,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/app': typeof AutenticadaAppRoute
   '/auditoria': typeof AutenticadaAuditoriaRoute
+  '/design-versions': typeof AutenticadaDesignVersionsRoute
   '/evidencia': typeof AutenticadaEvidenciaRoute
   '/exportacion': typeof AutenticadaExportacionRoute
   '/importacion': typeof AutenticadaImportacionRoute
@@ -123,6 +140,7 @@ export interface FileRoutesByTo {
   '/journeys': typeof AutenticadaJourneysRoute
   '/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
+  '/design-version/$designVersionId': typeof AutenticadaDesignVersionDesignVersionIdRoute
   '/journey/$journeyId': typeof AutenticadaJourneyJourneyIdRoute
   '/proyecto/$proyectoId': typeof AutenticadaProyectoProyectoIdRoute
 }
@@ -133,6 +151,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/_autenticada/app': typeof AutenticadaAppRoute
   '/_autenticada/auditoria': typeof AutenticadaAuditoriaRoute
+  '/_autenticada/design-versions': typeof AutenticadaDesignVersionsRoute
   '/_autenticada/evidencia': typeof AutenticadaEvidenciaRoute
   '/_autenticada/exportacion': typeof AutenticadaExportacionRoute
   '/_autenticada/importacion': typeof AutenticadaImportacionRoute
@@ -140,6 +159,7 @@ export interface FileRoutesById {
   '/_autenticada/journeys': typeof AutenticadaJourneysRoute
   '/_autenticada/personas': typeof AutenticadaPersonasRoute
   '/invitacion/$token': typeof InvitacionTokenRoute
+  '/_autenticada/design-version/$designVersionId': typeof AutenticadaDesignVersionDesignVersionIdRoute
   '/_autenticada/journey/$journeyId': typeof AutenticadaJourneyJourneyIdRoute
   '/_autenticada/proyecto/$proyectoId': typeof AutenticadaProyectoProyectoIdRoute
 }
@@ -150,6 +170,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/app'
     | '/auditoria'
+    | '/design-versions'
     | '/evidencia'
     | '/exportacion'
     | '/importacion'
@@ -157,6 +178,7 @@ export interface FileRouteTypes {
     | '/journeys'
     | '/personas'
     | '/invitacion/$token'
+    | '/design-version/$designVersionId'
     | '/journey/$journeyId'
     | '/proyecto/$proyectoId'
   fileRoutesByTo: FileRoutesByTo
@@ -165,6 +187,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/app'
     | '/auditoria'
+    | '/design-versions'
     | '/evidencia'
     | '/exportacion'
     | '/importacion'
@@ -172,6 +195,7 @@ export interface FileRouteTypes {
     | '/journeys'
     | '/personas'
     | '/invitacion/$token'
+    | '/design-version/$designVersionId'
     | '/journey/$journeyId'
     | '/proyecto/$proyectoId'
   id:
@@ -181,6 +205,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/_autenticada/app'
     | '/_autenticada/auditoria'
+    | '/_autenticada/design-versions'
     | '/_autenticada/evidencia'
     | '/_autenticada/exportacion'
     | '/_autenticada/importacion'
@@ -188,6 +213,7 @@ export interface FileRouteTypes {
     | '/_autenticada/journeys'
     | '/_autenticada/personas'
     | '/invitacion/$token'
+    | '/_autenticada/design-version/$designVersionId'
     | '/_autenticada/journey/$journeyId'
     | '/_autenticada/proyecto/$proyectoId'
   fileRoutesById: FileRoutesById
@@ -234,6 +260,13 @@ declare module '@tanstack/react-router' {
       path: '/auditoria'
       fullPath: '/auditoria'
       preLoaderRoute: typeof AutenticadaAuditoriaRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
+    '/_autenticada/design-versions': {
+      id: '/_autenticada/design-versions'
+      path: '/design-versions'
+      fullPath: '/design-versions'
+      preLoaderRoute: typeof AutenticadaDesignVersionsRouteImport
       parentRoute: typeof AutenticadaRoute
     }
     '/_autenticada/evidencia': {
@@ -285,6 +318,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof InvitacionTokenRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/_autenticada/design-version/$designVersionId': {
+      id: '/_autenticada/design-version/$designVersionId'
+      path: '/design-version/$designVersionId'
+      fullPath: '/design-version/$designVersionId'
+      preLoaderRoute: typeof AutenticadaDesignVersionDesignVersionIdRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
     '/_autenticada/journey/$journeyId': {
       id: '/_autenticada/journey/$journeyId'
       path: '/journey/$journeyId'
@@ -305,12 +345,14 @@ declare module '@tanstack/react-router' {
 interface AutenticadaRouteChildren {
   AutenticadaAppRoute: typeof AutenticadaAppRoute
   AutenticadaAuditoriaRoute: typeof AutenticadaAuditoriaRoute
+  AutenticadaDesignVersionsRoute: typeof AutenticadaDesignVersionsRoute
   AutenticadaEvidenciaRoute: typeof AutenticadaEvidenciaRoute
   AutenticadaExportacionRoute: typeof AutenticadaExportacionRoute
   AutenticadaImportacionRoute: typeof AutenticadaImportacionRoute
   AutenticadaInsightsRoute: typeof AutenticadaInsightsRoute
   AutenticadaJourneysRoute: typeof AutenticadaJourneysRoute
   AutenticadaPersonasRoute: typeof AutenticadaPersonasRoute
+  AutenticadaDesignVersionDesignVersionIdRoute: typeof AutenticadaDesignVersionDesignVersionIdRoute
   AutenticadaJourneyJourneyIdRoute: typeof AutenticadaJourneyJourneyIdRoute
   AutenticadaProyectoProyectoIdRoute: typeof AutenticadaProyectoProyectoIdRoute
 }
@@ -318,12 +360,15 @@ interface AutenticadaRouteChildren {
 const AutenticadaRouteChildren: AutenticadaRouteChildren = {
   AutenticadaAppRoute: AutenticadaAppRoute,
   AutenticadaAuditoriaRoute: AutenticadaAuditoriaRoute,
+  AutenticadaDesignVersionsRoute: AutenticadaDesignVersionsRoute,
   AutenticadaEvidenciaRoute: AutenticadaEvidenciaRoute,
   AutenticadaExportacionRoute: AutenticadaExportacionRoute,
   AutenticadaImportacionRoute: AutenticadaImportacionRoute,
   AutenticadaInsightsRoute: AutenticadaInsightsRoute,
   AutenticadaJourneysRoute: AutenticadaJourneysRoute,
   AutenticadaPersonasRoute: AutenticadaPersonasRoute,
+  AutenticadaDesignVersionDesignVersionIdRoute:
+    AutenticadaDesignVersionDesignVersionIdRoute,
   AutenticadaJourneyJourneyIdRoute: AutenticadaJourneyJourneyIdRoute,
   AutenticadaProyectoProyectoIdRoute: AutenticadaProyectoProyectoIdRoute,
 }

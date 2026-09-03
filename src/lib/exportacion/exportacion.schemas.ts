@@ -189,6 +189,33 @@ export const CATALOGO_EXPORT = [
     poda: { modo: 'fuera' },
   },
   { tabla: 'journey_snapshot', orden: 'congelado_en, id', poda: { modo: 'fuera' } },
+  // Entrega y estado efectivo (SPEC-06): la design version que se congela al aprobarse,
+  // sus elementos de cambio con la traza al insight y a la decisión que los justifican, los
+  // releases que los llevan a producción y la constatación de lo que de verdad quedó. Las
+  // ocho al catálogo, porque SYS-04 exige que el ARCHIVO del propietario lo lleve todo.
+  //
+  // Las ocho quedan `fuera` del ENTREGABLE, y por el mismo motivo estructural que la
+  // medición: ninguna tiene `evidencia_id`, así que el eje de poda de este ámbito no las
+  // alcanza, y sus padres —`proyecto`, `servicio`, `journey`, `journey_snapshot`,
+  // `decision`, `insight` y ellas entre sí— tampoco viajan. Un elemento de cambio sin el
+  // journey que modifica, sin la decisión que lo ordena y sin el insight que lo justifica
+  // es un título y un id colgando; y `constatacion` sin su `elemento_cambio` es un
+  // veredicto sobre algo que no está en el paquete.
+  //
+  // Y como con el post mortem, la incomodidad hay que decirla en vez de esconderla: la
+  // design version aprobada es probablemente lo MÁS entregable de todo el método —es
+  // literalmente el diseño que se entrega—. Pero entonces se entrega como tal, con su
+  // journey y su cadena de razonamiento, no colada dentro de un paquete cuyo contrato es
+  // «material de terceros con derechos vigentes». Ensanchar este ámbito en silencio sería
+  // cambiar lo que significa; queda como pregunta de producto.
+  { tabla: 'design_version', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'elemento_cambio', orden: 'design_version_id, orden, id', poda: { modo: 'fuera' } },
+  { tabla: 'elemento_decision', orden: 'elemento_id, decision_id', poda: { modo: 'fuera' } },
+  { tabla: 'elemento_insight', orden: 'elemento_id, insight_id', poda: { modo: 'fuera' } },
+  { tabla: 'release', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'release_elemento', orden: 'release_id, elemento_id', poda: { modo: 'fuera' } },
+  { tabla: 'effective_state', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'constatacion', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   // Portal (SPEC-01.5): la conversación con el cliente es parte de lo que se le entrega.
   // Un hilo puede colgar de una evidencia, pero el entregable no lleva la conversación:
   // fuera entera (y por eso `comentario`, que cuelga del hilo, también).

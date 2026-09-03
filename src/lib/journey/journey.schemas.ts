@@ -172,6 +172,12 @@ export const JourneysInputSchema = z.object({
   workspaceId: z.string().uuid(),
   /** Id del último journey ya visto: el keyset resuelve su `(creado_en, id)` en la base. */
   cursor: z.string().uuid().nullable().default(null),
+  /** Filtros para los selectores que no quieren la lista entera sino un subconjunto
+   * acotado — el de la design version pide los to-be de UN servicio. Filtrar en el
+   * servidor y no sobre la primera página es lo que evita que un journey quede fuera de
+   * alcance por el corte. */
+  servicioId: z.string().uuid().nullable().default(null),
+  tipo: z.enum(TIPOS_JOURNEY).nullable().default(null),
 });
 
 // ── Proyecciones de lectura ──
@@ -233,7 +239,15 @@ export type ResumenJourney = {
   id: string;
   nombre: string;
   tipo: TipoJourney;
+  /** El servicio por ID y no solo por nombre: quien filtra journeys por servicio (la
+   * design version, que cambia UNO) no puede hacerlo comparando cadenas. */
+  servicioId: string;
   servicioNombre: string;
+  /** El proyecto al que el grafo está anclado, si lo declara (SPEC-05 lo hace opcional).
+   * Va en el resumen porque quien elige un to-be para una design version tiene que
+   * descartar los anclados a OTRO proyecto: `design_version_journey_guard` los rechaza, y
+   * un selector que los ofrece ofrece un error. */
+  proyectoId: string | null;
   nodos: number;
   /** Cuántos snapshots congelados lleva: la historia de lo aprobado sobre este grafo. */
   snapshots: number;

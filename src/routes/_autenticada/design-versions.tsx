@@ -1,0 +1,523 @@
+import { useRef, useState } from 'react';
+import type { CSSProperties, FormEvent } from 'react';
+import { createFileRoute, Link, useNavigate, useRouter } from '@tanstack/react-router';
+import { Button } from '@/components/ui/Button';
+import { Card } from '@/components/ui/Card';
+import { Input } from '@/components/ui/Input';
+import { Select } from '@/components/ui/Select';
+import { Tag } from '@/components/ui/Tag';
+import { Textarea } from '@/components/ui/Textarea';
+import { Wordmark } from '@/components/ui/Wordmark';
+import { arbolDelWorkspace } from '@/lib/arbol/arbol.functions';
+import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import {
+  crearDesignVersionDelProyecto,
+  listaDeDesignVersions,
+  proyectosYaCertificados,
+  versionAprobadaDeServicio,
+} from '@/lib/entrega/entrega.functions';
+import { LARGO_MAXIMO, type ResumenDesignVersion } from '@/lib/entrega/entrega.schemas';
+import { listaDeJourneys } from '@/lib/journey/journey.functions';
+
+/**
+ * Design versions del workspace (SPEC-06). Esta pantalla lista y abre; la cadena entera
+ * —elementos, diff, releases, effective state y conciliación— vive dentro de cada una.
+ */
+export const Route = createFileRoute('/_autenticada/design-versions')({
+  loaderDeps: ({ search }) => ({ ws: search.ws }),
+  loader: async ({ context }) => {
+    const workspaceId = context.membresiaActiva?.workspaceId;
+    if (!workspaceId) return null;
+    const [pagina, arbol, certificados] = await Promise.all([
+      listaDeDesignVersions({ data: { workspaceId, cursor: null } }),
+      arbolDelWorkspace({ data: { workspaceId } }),
+      proyectosYaCertificados({ data: { workspaceId } }),
+    ]);
+    // Un proyecto que ya firmó G6 o G7 no aprueba design versions nuevas: su gate afirma
+    // algo sobre el conjunto de sus versiones aprobadas y esa afirmación no se reevalúa
+    // (SPEC-04). El guard lo rechaza en el alta; ofrecerlo aquí sería invitar a escribir
+    // el formulario entero para nada. El ciclo siguiente va en otro proyecto, y el
+    // selector solo enseña los que todavía pueden producir una design version.
+    const certificado = new Set(certificados);
+    // Los proyectos cuelgan del RETO, y un reto que afecta a este servicio está anclado en
+    // otro: el mapa se arma sobre el árbol entero para poder resolverlos desde cualquier
+    // servicio. Mismo apaño que la pantalla de journeys, por el mismo motivo.
+    const proyectosPorReto = new Map(
+      (arbol?.servicios ?? []).flatMap((s) =>
+        s.retos.map(
+          (r) =>
+            [
+              r.id,
+              r.proyectos
+                .filter((p) => !certificado.has(p.id))
+                .map((p) => ({ id: p.id, etiqueta: `${p.codigo} ${p.titulo}` })),
+            ] as const,
+        ),
+      ),
+    );
+    return {
+      workspaceId,
+      versiones: pagina.versiones,
+      siguiente: pagina.siguiente,
+      // Una design version cuelga de un proyecto y cambia UN servicio. Los proyectos
+      // ofrecidos salen de los retos ANCLADOS en el servicio y de los que lo declaran
+      // AFECTADO: un reto anclado en A que afecta a B es exactamente el que empuja el
+      // rediseño de B, y ofrecer solo los anclados dejaba a B sin forma de crear la
+      // design version que lo cambia.
+      servicios: (arbol?.servicios ?? []).map((s) => {
+        const vistos = new Set<string>();
+        return {
+          id: s.id,
+          nombre: s.nombre,
+          proyectos: [...s.retos, ...s.retosQueAfectan]
+            .filter((r) => !vistos.has(r.id) && vistos.add(r.id))
+            .flatMap((r) => proyectosPorReto.get(r.id) ?? []),
+        };
+      }),
+    };
+  },
+  component: PantallaDesignVersions,
+});
+
+const micro: CSSProperties = {
+  fontFamily: 'var(--font-mono)',
+  fontWeight: 500,
+  fontSize: 11,
+  letterSpacing: '.08em',
+  textTransform: 'uppercase',
+  color: 'var(--text-muted)',
+};
+
+function PantallaDesignVersions() {
+  const datos = Route.useLoaderData();
+  const { membresiaActiva } = Route.useRouteContext();
+  const navigate = useNavigate();
+  const router = useRouter();
+  const [error, setError] = useState<string | null>(null);
+  const [abierto, setAbierto] = useState(false);
+  // Las páginas siguientes se acumulan en el cliente: el loader trae la primera y «Ver
+  // más» pide la siguiente por el cursor. El corte duro que había antes no era solo una
+  // lista truncada — el formulario de alta leía de aquí los candidatos a suceder.
+  const [masVersiones, setMasVersiones] = useState<ResumenDesignVersion[]>([]);
+  const [cursor, setCursor] = useState<string | null>(datos?.siguiente ?? null);
+  const [cargandoMas, setCargandoMas] = useState(false);
+  const rol = membresiaActiva?.rol ?? '';
+  const puedeCrear = (ROLES_CURADORES as readonly string[]).includes(rol);
+  const versiones = [...(datos?.versiones ?? []), ...masVersiones];
+
+  return (
+    <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '14px 28px',
+          background: 'var(--surface)',
+          borderBottom: '1px solid var(--border)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <Wordmark />
+          <span style={{ font: '600 13px var(--font-sans)', color: 'var(--text-body)' }}>
+            Design versions y releases
+          </span>
+        </div>
+        <Button variant="ghost" size="sm" onClick={() => navigate({ to: '/app' })}>
+          ← Volver al loop
+        </Button>
+      </div>
+
+      <main
+        style={{
+          maxWidth: 900,
+          margin: '0 auto',
+          padding: '28px 24px 60px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 18,
+        }}
+      >
+        {!datos && (
+          <Card style={{ padding: 24 }}>
+            <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+              No hay workspace activo.
+            </span>
+          </Card>
+        )}
+        {datos && (
+          <>
+            <Card style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <span style={micro}>Qué es esto</span>
+              <span style={{ font: '400 13.5px/1.65 var(--font-sans)', color: 'var(--text-body)' }}>
+                La <strong>design version</strong> es qué se decidió cambiar, elemento por
+                elemento. Aprobarla la vuelve <strong>inmutable</strong> y congela el
+                snapshot del grafo to-be: a partir de ahí, cambiar algo es crear una
+                versión nueva que supere a esta. Sus elementos se reparten en{' '}
+                <strong>releases parciales</strong> —cada elemento en exactamente uno— y lo
+                que quedó funcionando se constata en el <strong>effective state</strong>,
+                con las desviaciones y su razón. El diff no se escribe: se calcula contra
+                el estado efectivo vigente del servicio.
+              </span>
+            </Card>
+
+            {error && (
+              <span role="alert" style={{ font: '500 13px var(--font-sans)', color: 'var(--danger)' }}>
+                {error}
+              </span>
+            )}
+
+            {puedeCrear && !abierto && (
+              <div>
+                <Button size="sm" onClick={() => setAbierto(true)}>
+                  Nueva design version
+                </Button>
+              </div>
+            )}
+            {puedeCrear && abierto && (
+              <FormularioDesignVersion
+                workspaceId={datos.workspaceId}
+                servicios={datos.servicios}
+                onCerrar={() => setAbierto(false)}
+                onError={setError}
+                onCreada={async (designVersionId) => {
+                  setAbierto(false);
+                  await router.invalidate();
+                  await navigate({ to: '/design-version/$designVersionId', params: { designVersionId } });
+                }}
+              />
+            )}
+
+            {versiones.length === 0 && (
+              <Card style={{ padding: 24 }}>
+                <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+                  Todavía no hay design versions en este workspace.
+                </span>
+              </Card>
+            )}
+
+            {versiones.map((v) => (
+              <Card key={v.id} style={{ padding: 18 }}>
+                <Link
+                  to="/design-version/$designVersionId"
+                  params={{ designVersionId: v.id }}
+                  style={{ textDecoration: 'none', display: 'flex', flexDirection: 'column', gap: 6 }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                    <Tag>{v.codigo}</Tag>
+                    <span style={{ font: '600 14px var(--font-sans)', color: 'var(--ink)' }}>
+                      {v.titulo}
+                    </span>
+                    <Tag mono={false}>{v.estado}</Tag>
+                  </div>
+                  <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+                    {v.servicioNombre} · {v.proyectoCodigo} · {v.elementos}{' '}
+                    {v.elementos === 1 ? 'elemento' : 'elementos'} · {v.releases}{' '}
+                    {v.releases === 1 ? 'release' : 'releases'}
+                    {v.aprobadaEn ? ` · aprobada el ${v.aprobadaEn}` : ''}
+                  </span>
+                </Link>
+              </Card>
+            ))}
+
+            {cursor !== null && (
+              <div>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={cargandoMas}
+                  onClick={async () => {
+                    setCargandoMas(true);
+                    setError(null);
+                    try {
+                      const pagina = await listaDeDesignVersions({
+                        data: { workspaceId: datos.workspaceId, cursor },
+                      });
+                      setMasVersiones((previas) => [...previas, ...pagina.versiones]);
+                      setCursor(pagina.siguiente);
+                    } finally {
+                      setCargandoMas(false);
+                    }
+                  }}
+                >
+                  {cargandoMas ? 'Cargando…' : 'Ver más design versions'}
+                </Button>
+              </div>
+            )}
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function FormularioDesignVersion({
+  workspaceId,
+  servicios,
+  onCerrar,
+  onError,
+  onCreada,
+}: {
+  workspaceId: string;
+  servicios: { id: string; nombre: string; proyectos: { id: string; etiqueta: string }[] }[];
+  onCerrar: () => void;
+  onError: (e: string | null) => void;
+  onCreada: (designVersionId: string) => Promise<void>;
+}) {
+  const [servicioId, setServicioId] = useState('');
+  const [proyectoId, setProyectoId] = useState('');
+  const [journeyId, setJourneyId] = useState('');
+  const [superaA, setSuperaA] = useState('');
+  const [titulo, setTitulo] = useState('');
+  const [resumen, setResumen] = useState('');
+  const [ocupado, setOcupado] = useState(false);
+  // Los to-be del servicio elegido se piden BAJO DEMANDA, no en el loader. La lista de
+  // journeys se pagina por keyset, así que traer «la primera página de los to-be del
+  // workspace» y filtrar por servicio en el cliente deja fuera de alcance los de un
+  // servicio que quede detrás del corte — el mismo agujero que la paginación vino a
+  // cerrar, reintroducido en el selector. Filtrando por servicio en el servidor, lo que
+  // se pide es siempre un conjunto pequeño y completo.
+  const [journeys, setJourneys] = useState<
+    { id: string; nombre: string; proyectoId: string | null }[]
+  >([]);
+  const [hayMasJourneys, setHayMasJourneys] = useState(false);
+  const [cargandoJourneys, setCargandoJourneys] = useState(false);
+  const proyectos = servicios.find((s) => s.id === servicioId)?.proyectos ?? [];
+  /**
+   * Los to-be que este PROYECTO puede congelar. Un journey declara su proyecto de forma
+   * opcional (SPEC-05), y `design_version_journey_guard` rechaza el que esté anclado a
+   * otro: sin este filtro, un servicio con to-be de dos proyectos elegibles ofrecía el de
+   * A con B seleccionado y el alta se estrellaba contra el guard. Los que no declaran
+   * proyecto valen para cualquiera — que es lo que dice el guard, no una interpretación.
+   *
+   * Se filtra en el cliente y no se vuelve a pedir al servidor porque la respuesta ya es
+   * del servicio elegido y por tanto pequeña; el aviso de «hay más de los que caben»
+   * sigue cubriendo el corte, que es el mismo con o sin este filtro.
+   */
+  const journeysElegibles = journeys.filter(
+    (j) => j.proyectoId === null || j.proyectoId === proyectoId,
+  );
+
+  function elegirProyecto(nuevo: string) {
+    setProyectoId(nuevo);
+    // El to-be elegido podía ser del proyecto anterior: dejarlo puesto mandaría al endpoint
+    // justo la combinación que el guard rechaza. Mismo cuidado que al cambiar de servicio.
+    setJourneyId('');
+  }
+  // La versión aprobada VIGENTE del servicio elegido, pedida al servidor igual que los
+  // to-be y por el mismo motivo. Antes salía de filtrar la lista de design versions del
+  // workspace, que va paginada: si la aprobada de este servicio caía detrás del corte, el
+  // selector se quedaba vacío, el formulario mandaba `superaA = null` y el guard de
+  // anclaje lo rechazaba —porque sí existe una aprobada—, con lo que crear la versión
+  // siguiente de ese servicio era literalmente imposible. Solo se supera a una versión del
+  // MISMO servicio (SYS-05), y SYS-05 garantiza que hay como mucho una: la respuesta es
+  // cero o un candidato, no una lista que haya que buscar.
+  const [vigente, setVigente] = useState<{ id: string; codigo: string; titulo: string } | null>(
+    null,
+  );
+  const [cargandoVigente, setCargandoVigente] = useState(false);
+  /**
+   * Cuál es la selección que MANDA. Elegir un servicio dispara dos viajes al servidor, y
+   * dos selecciones seguidas pueden volver DESORDENADAS: la respuesta de A instalaba sus
+   * to-be y su versión aprobada con B ya elegido, y entonces el formulario ofrecía
+   * journeys que el guard rechaza («el to-be es el de SU servicio») o mandaba
+   * `superaA = null` sobre un servicio que sí tiene aprobada — sin más salida que volver a
+   * cambiar la selección.
+   *
+   * Es un contador y no el id del servicio a propósito: con el id, la secuencia A → B → A
+   * aceptaría la respuesta vieja de A por parecerse a la nueva.
+   *
+   * Va en una `ref` y no en estado porque hay que leerla DESPUÉS del await, y lo que ve la
+   * clausura de un `useState` es el valor de SU render. Es el mismo tipo de estado rancio
+   * que #18 cerró en el layout, pero no el mismo caso: allí sobrevivía estado a un cambio
+   * de workspace; aquí llega tarde una respuesta que ya no interesa.
+   */
+  const peticion = useRef(0);
+
+  async function elegirServicio(nuevo: string) {
+    const mia = ++peticion.current;
+    setServicioId(nuevo);
+    // Proyecto, journey y «supera a» eran del servicio anterior: dejarlos puestos mandaría
+    // al endpoint combinaciones que los guards rechazan.
+    setProyectoId('');
+    setJourneyId('');
+    setSuperaA('');
+    setJourneys([]);
+    setHayMasJourneys(false);
+    setVigente(null);
+    if (nuevo === '') return;
+    setCargandoJourneys(true);
+    setCargandoVigente(true);
+    try {
+      const [pagina, aprobada] = await Promise.all([
+        listaDeJourneys({ data: { workspaceId, servicioId: nuevo, tipo: 'to-be' } }),
+        versionAprobadaDeServicio({ data: { workspaceId, servicioId: nuevo } }),
+      ]);
+      if (peticion.current !== mia) return;
+      setJourneys(
+        pagina.journeys.map((j) => ({ id: j.id, nombre: j.nombre, proyectoId: j.proyectoId })),
+      );
+      setHayMasJourneys(pagina.siguiente !== null);
+      setVigente(aprobada);
+    } finally {
+      // También el «cargando»: si la respuesta tardía lo apagara, la selección nueva se
+      // quedaría pintada como si ya hubiera terminado de cargar.
+      if (peticion.current === mia) {
+        setCargandoJourneys(false);
+        setCargandoVigente(false);
+      }
+    }
+  }
+
+  async function enviar(e: FormEvent) {
+    e.preventDefault();
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await crearDesignVersionDelProyecto({
+        data: {
+          workspaceId,
+          servicioId,
+          proyectoId,
+          journeyId: journeyId === '' ? null : journeyId,
+          superaA: superaA === '' ? null : superaA,
+          titulo,
+          resumen,
+        },
+      });
+      if (r.ok) await onCreada(r.designVersionId);
+      else onError(r.error);
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  return (
+    <Card style={{ padding: 20 }}>
+      <form onSubmit={(e) => void enviar(e)} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <span style={micro}>Nueva design version</span>
+        <Select
+          value={servicioId}
+          onChange={(e) => void elegirServicio(e.target.value)}
+          required
+        >
+          <option value="">Servicio que cambia…</option>
+          {servicios.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.nombre}
+            </option>
+          ))}
+        </Select>
+        <Select
+          value={proyectoId}
+          onChange={(e) => elegirProyecto(e.target.value)}
+          disabled={servicioId === ''}
+          required
+        >
+          <option value="">Proyecto que la produce…</option>
+          {proyectos.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.etiqueta}
+            </option>
+          ))}
+        </Select>
+        <Select
+          value={journeyId}
+          onChange={(e) => setJourneyId(e.target.value)}
+          disabled={servicioId === '' || proyectoId === '' || cargandoJourneys}
+        >
+          <option value="">
+            {cargandoJourneys
+              ? 'Buscando los to-be del servicio…'
+              : proyectoId === ''
+                ? 'Elige el proyecto para ver sus to-be'
+                : 'Journey to-be (se puede enlazar después)'}
+          </option>
+          {journeysElegibles.map((j) => (
+            <option key={j.id} value={j.id}>
+              {j.nombre}
+            </option>
+          ))}
+        </Select>
+        {proyectoId !== '' && journeys.length > journeysElegibles.length && (
+          <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+            Hay to-be de este servicio anclados a otro proyecto; no se ofrecen porque una
+            design version solo congela el grafo de SU proyecto.
+          </span>
+        )}
+        {hayMasJourneys && (
+          <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+            Este servicio tiene más journeys to-be de los que caben aquí; si el que buscas
+            no aparece, enlázalo después desde la design version.
+          </span>
+        )}
+        <Select
+          value={superaA}
+          onChange={(e) => setSuperaA(e.target.value)}
+          disabled={servicioId === '' || cargandoVigente}
+          required={vigente !== null}
+        >
+          {/* Si el servicio ya tiene una versión aprobada, «no supera a ninguna» no es una
+              opción: SYS-05 admite como mucho una aprobada, así que la nueva TIENE que
+              declarar a cuál reemplaza. Ofrecerlo creaba un borrador que solo se descubría
+              inaprobable al intentar aprobarlo. */}
+          {cargandoVigente ? (
+            <option value="">Buscando la versión vigente del servicio…</option>
+          ) : vigente === null ? (
+            <option value="">No supera a ninguna (primera del servicio)</option>
+          ) : (
+            <>
+              <option value="">Supera a… (obligatorio: el servicio ya tiene una aprobada)</option>
+              <option value={vigente.id}>
+                Supera a {vigente.codigo} · {vigente.titulo}
+              </option>
+            </>
+          )}
+        </Select>
+        {/* `maxLength` desde `LARGO_MAXIMO`, que es el mismo número que usa el esquema:
+            un texto más largo lo rechaza `CrearDesignVersionSchema` ANTES del handler, así
+            que no vuelve como `{ ok: false, error }` sino como fallo genérico. Aquí el
+            control directamente no deja escribirlo. */}
+        <Input
+          placeholder="Título de la design version"
+          value={titulo}
+          onChange={(e) => setTitulo(e.target.value)}
+          maxLength={LARGO_MAXIMO.titulo}
+          required
+        />
+        <Textarea
+          placeholder="Qué propone, en una frase (opcional)"
+          value={resumen}
+          onChange={(e) => setResumen(e.target.value)}
+          maxLength={LARGO_MAXIMO.resumen}
+          rows={2}
+        />
+        <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
+          Nace en borrador. Aprobar exige un journey to-be del servicio y al menos un
+          elemento de cambio; si el servicio ya tiene una design version aprobada, esta
+          debe declarar a cuál supera (SYS-05). El journey se puede enlazar o cambiar
+          después desde la propia design version, mientras siga en borrador.
+        </span>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button
+            size="sm"
+            type="submit"
+            disabled={
+              ocupado ||
+              servicioId === '' ||
+              proyectoId === '' ||
+              titulo.trim() === '' ||
+              cargandoVigente ||
+              (vigente !== null && superaA === '')
+            }
+          >
+            Crear borrador
+          </Button>
+          <Button size="sm" variant="ghost" type="button" disabled={ocupado} onClick={onCerrar}>
+            Cancelar
+          </Button>
+        </div>
+      </form>
+    </Card>
+  );
+}

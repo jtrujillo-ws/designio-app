@@ -119,8 +119,25 @@ create or replace function gate_aprobar_suficiencia_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_bloqueo text;
+  v_motivo text;
+  v_reto uuid;
 begin
   if new.estado = 'aprobado' and old.estado = 'pendiente' then
+    -- El candado del RETO antes de mirar nada. Este guard decide sobre filas de OTRAS tablas
+    -- —el checklist, los releases, las constataciones—, así que sin candado compartido en la
+    -- base una aprobación y una escritura concurrente sobre lo que afirma se miran sin verse
+    -- y commitean las dos: G6 firmando un plan al que otra transacción le acaba de quitar la
+    -- cobertura. El servicio ya lo tomaba (`aprobarGate` lo toma primero de todo), pero eso
+    -- vale solo para quien entra por ahí.
+    --
+    -- Es la misma clave y el mismo primer lugar que en `release_elemento_cobertura_guard`,
+    -- que es el otro lado del par. Y va aquí dentro, en la rama de la aprobación, para no
+    -- serializar por el reto transiciones que no afirman nada sobre otras tablas.
+    select p.reto_id into v_reto from proyecto p
+      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id;
+    if v_reto is not null then
+      perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+    end if;
     -- El sello temporal lo pone la BASE, no el caller: un update directo no puede
     -- retro ni post-datar el registro inmutable.
     new.aprobado_en := now();
@@ -144,10 +161,6 @@ begin
         and ci.estado = 'cumplido' and d.estado <> 'vigente') then
       raise exception 'no se puede aprobar: hay ítems cumplidos con decisiones en revisión';
     end if;
-    -- Mismo razonamiento, aplicado a los DERECHOS: se conceden y se revocan, y un ítem
-    -- cumplido no se entera porque nada lo actualiza. Aprobar es el acto que pone la cita
-    -- delante del cliente, así que es aquí donde el predicado tiene que volver a ser
-    -- cierto. El mensaje nombra la dimensión que falta (SYS-14 exige explicar el bloqueo).
     select evidencia_motivo_bloqueo(ci.evidencia_id, ci.workspace_id, 'cliente')
       into v_bloqueo
       from checklist_item ci
@@ -159,13 +172,6 @@ begin
       raise exception 'no se puede aprobar: un ítem cumplido cita evidencia sin derechos vigentes — %',
         coalesce(v_bloqueo, 'derechos insuficientes') using errcode = 'DR001';
     end if;
-    -- Y por la vía indirecta: un ítem cumplido con un INSIGHT cuyo respaldo perdió los
-    -- derechos. El predicado es EXACTAMENTE el de `insight_validar_guard` —toda afirmación
-    -- no marcada como hipótesis necesita al menos una cita— re-evaluado con derechos vivos.
-    -- No basta con «alguna cita sin derechos»: una afirmación con dos citas sigue sostenida
-    -- si a una le quedan derechos, y exigir más sería más estricto que la propia validación.
-    -- No se sigue la cadena hasta las decisiones: ese eslabón ya tiene su propio re-chequeo
-    -- (estado 'en-revision') y su propia maquinaria de reapertura.
     if exists (select 1 from checklist_item ci
       join afirmacion a on a.insight_id = ci.insight_id and a.workspace_id = ci.workspace_id
       where ci.gate_id = new.id and ci.workspace_id = new.workspace_id
@@ -206,31 +212,113 @@ begin
         and a.estado = 'hipotesis') then
       raise exception 'no se puede aprobar G2: hay arquetipos sin confirmar ni refutar (RF-04.11)';
     end if;
-    -- ── ABSORBIDO de 20260902110000-medicion.sql, no reescrito ──
+    -- G5 firma el DISEÑO. La etapa 5 («Detalle de solución») entrega precisamente la design
+    -- version, y el criterio del gate es «design version completa y consistente, piezas
+    -- críticas validadas, APROBADA POR EL CLIENTE». Así que el gate no puede aprobarse sin
+    -- que exista lo que dice certificar.
+    --
+    -- Es el mismo argumento que la rama de G6, palabra por palabra: que el ítem del checklist
+    -- esté cumplido no lo demuestra —un ítem registra un objeto citado o un N/A razonado, y
+    -- no deriva nada de design_version—, así que sin esto G5 certificaba un diseño que podía
+    -- no existir. Y con G5 firmado sobre la nada, `gate_certificado_del_proyecto` tampoco lo
+    -- ve, con lo que después se puede aprobar cualquier versión: la aprobación del cliente
+    -- acababa desligada de todo diseño concreto.
+    --
+    -- Se exige APROBADA (o superada: aprobada estuvo) y no un borrador, porque lo que el
+    -- cliente firma tiene que estar CONGELADO. Un borrador sigue editándose después de la
+    -- firma, que es exactamente la certificación-que-cambia-de-contenido que este esquema
+    -- existe para impedir. `design_versions_a_cargo_del_proyecto` ya devuelve solo no
+    -- borradores, así que basta con reusarla — la misma que usan G6 y G7.
+    --
+    -- Lo que esto NO hace es fijar G5 a UNA versión concreta, y es deliberado: ver el porqué
+    -- en `gate_certificado_del_proyecto`, donde se explica por qué G5 no entra en ese
+    -- conjunto. Aquí se exige que el diseño exista y esté congelado, no que sea para siempre
+    -- el único.
+    if new.numero = 5 and not exists (
+      select 1 from design_version dv
+      where dv.id in (select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
+        and exists (select 1 from elemento_cambio ec
+          where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id)
+    ) then
+      raise exception 'no se puede aprobar G5: el proyecto no tiene ninguna design version aprobada con elementos que certificar (RF-06.3)';
+    end if;
     -- G6 es donde el Metric Registry se acuerda y se FIRMA (SYS-22): aprobar el plan de
     -- implementación sin contrato de medición firmado deja el loop abierto por diseño.
-    -- Este `create or replace` reescribe la función ENTERA, así que omitirlo la desharía;
-    -- es la misma advertencia que ya lleva la rama de decisiones en revisión, con el
-    -- mismo motivo. Lo que NO se copia aquí es el efecto de G6 sobre el proyecto
-    -- (`en-implementacion`): vive en su propio trigger AFTER
-    -- (`proyecto_a_implementacion_tras_g6`) precisamente porque su precondición lee la
-    -- fila del gate que este guard, siendo BEFORE, todavía no ha escrito. Traérselo aquí
-    -- lo duplicaría y encima en el único momento en que no puede funcionar.
     if new.numero = 6 and not exists (select 1 from metric_registry r
       join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
       where r.reto_id = p.reto_id and r.workspace_id = new.workspace_id
         and r.estado = 'firmado') then
       raise exception 'no se puede aprobar G6: el Metric Registry no está firmado (SYS-22)';
     end if;
+    -- ↑ Copiada TAL CUAL del cuerpo vivo de `20260902110000-medicion.sql`, que corre antes
+    -- que esta migración. Este `create or replace` reemplaza la función ENTERA, así que sin
+    -- traerla se perdería la puerta de G6 que SPEC-07 acaba de poner — y en silencio, porque
+    -- nada falla al borrar una regla. Lo que NO se trae es el efecto de G6 sobre el proyecto:
+    -- vive en su propio trigger AFTER (`proyecto_a_implementacion_tras_g6`), y aquí, en un
+    -- BEFORE, la fila del gate todavía no existe.
+    -- G6 firma el PLAN (RF-06.4): «cada elemento de la design version queda asignado a
+    -- exactamente un release con dueño y fecha». Que el ítem del checklist esté cumplido
+    -- no lo demuestra — un ítem cumplido registra un objeto citado o un N/A razonado, y
+    -- no deriva nada de release_elemento—, así que sin esto G6 certificaba un plan que
+    -- podía no existir. El «exactamente uno» ya lo garantiza la PK de release_elemento; lo
+    -- que faltaba era el «cada». Dueño y fecha no hay que comprobarlos: release.responsable
+    -- y fecha_objetivo son not null con CHECK, así que estar asignado ya los implica.
+    if new.numero = 6 then
+      -- El conjunto es «de qué responde este proyecto» (design_versions_a_cargo_del_proyecto)
+      -- y no «cuál manda en el servicio»: que otro proyecto haya superado la versión de este
+      -- no deshace su plan, solo deja de ser la vigente. Lo que sí la saca es que este mismo
+      -- proyecto la haya reemplazado.
+      --
+      -- El gemelo vacuo, igual que en G7: sin design version con elementos no hay plan que
+      -- firmar, y el «no exists elemento sin release» de abajo sería vacuamente cierto por
+      -- no haber ningún elemento que mirar.
+      if not exists (
+        select 1 from design_version dv
+        where dv.id in (select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
+          and exists (select 1 from elemento_cambio ec
+            where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id)
+      ) then
+        raise exception 'no se puede aprobar G6: el proyecto no tiene ninguna design version con elementos que planificar (RF-06.4)';
+      end if;
+      if exists (
+        select 1 from elemento_cambio ec
+        where ec.workspace_id = new.workspace_id
+          and ec.design_version_id in (
+            select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
+          and not exists (select 1 from release_elemento re
+            where re.elemento_id = ec.id and re.workspace_id = ec.workspace_id)
+      ) then
+        raise exception 'no se puede aprobar G6: hay elementos de la design version sin release asignado (RF-06.4)';
+      end if;
+    end if;
+    -- G7 cierra la implementación (RF-06.7). Las cuatro ramas del predicado —hay tablero,
+    -- lo propio está constatado, lo que la cadena del servicio dejó a medias, y lo que una
+    -- versión auto-superada dejó en vuelo— viven en `g7_motivo_de_bloqueo`, con el porqué
+    -- de cada una escrito allí. Aquí solo se levanta el motivo que devuelva.
+    --
+    -- Está fuera del guard a propósito y no por gusto: la pantalla de conciliación tiene
+    -- que decir exactamente lo que el gate va a rechazar, y mientras eso se escribía dos
+    -- veces siempre le faltaba una rama a la copia. Una sola redacción, dos lectores.
+    if new.numero = 7 then
+      v_motivo := g7_motivo_de_bloqueo(new.proyecto_id, new.workspace_id);
+      if v_motivo is not null then
+        raise exception 'no se puede aprobar G7: %', v_motivo;
+      end if;
+    end if;
+    -- Efectos INSEPARABLES de la transición, también para el UPDATE directo: la etapa
+    -- homóloga se completa y el evento inmutable queda con el actor y su rol del
+    -- MISMO snapshot. aprobarGate ya no los duplica: esta es la única fuente.
     update etapa_instancia set estado = 'completada'
       where proyecto_id = new.proyecto_id and workspace_id = new.workspace_id
         and numero = new.numero;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'GateAprobado',
-        -- Payload también absorbido de 110000: `aprobado_en` está en el grant y el WITH
-        -- CHECK solo le exige no ser nulo, así que la fecha la propone la aplicación y
-        -- nada la ata al instante real — es la clase de dato que el rastro conserva tal
-        -- cual quedó.
+        -- El cuerpo del evento viene ENTERO de la migración de medición. Este
+        -- `create or replace` reescribe la función completa, así que lo que no se copie
+        -- desaparece sin que nada falle al aplicar: el rastro pierde columnas y solo lo
+        -- nota quien lo lea. `aprobado_en` está en el grant y el WITH CHECK solo le exige
+        -- NO SER NULO —la fecha la propone la aplicación y nada la ata al instante real—,
+        -- así que es la clase de dato que el evento tiene que conservar tal cual quedó.
         jsonb_build_object('gateId', new.id, 'proyectoId', new.proyecto_id,
                            'numero', new.numero, 'estado', new.estado,
                            'aprobadoPor', new.aprobado_por, 'aprobadoEn', new.aprobado_en),

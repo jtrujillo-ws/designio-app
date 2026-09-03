@@ -50,6 +50,26 @@ export async function construirArbol(
         'id', s.id,
         'nombre', s.nombre,
         'estado', s.estado,
+        -- El estado OPERATIVO del servicio (RF-06.10): la última constatación que dejaron sus
+        -- releases verificados. Es lo que el servicio hace hoy, y es distinto de s.estado,
+        -- que es su estado de gestión. Sin esto, el dato que SPEC-06 produce solo existía en
+        -- el detalle de una design version: para verlo había que saber ya cuál mirar.
+        --
+        -- CUÁL es el vigente lo decide la misma función que usa ese detalle, no una consulta
+        -- parecida: dos lecturas del estado de un servicio que se eligen por separado acaban
+        -- enseñando estados distintos del mismo servicio. Aquí no se excluye ninguna design
+        -- version —el árbol mira el servicio entero—, así que el tercer argumento va nulo.
+        'estadoEfectivo', (
+          select json_build_object(
+            'codigo', es.codigo,
+            'constatadoEn', to_char(es.constatado_en, 'YYYY-MM-DD'),
+            'designVersionCodigo', dv.codigo,
+            'resumen', es.resumen)
+          from effective_state es
+          join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
+          join design_version dv on dv.id = r.design_version_id and dv.workspace_id = r.workspace_id
+          where es.id = effective_state_vigente_del_servicio(s.id, ${workspaceId})
+        ),
         'retos', coalesce((
           select json_agg(json_build_object(
             'id', r.id,

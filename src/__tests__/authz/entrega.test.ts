@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import type { TransactionSql } from 'postgres';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import {
@@ -3017,6 +3018,114 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // conciliación completa y release por constatar son, ahora, mutuamente excluyentes.
     expect(conciliacionCompleta(antes!.conciliacion)).toBe(false);
     expect(conciliacionCompleta(despues!.conciliacion)).toBe(true);
+  });
+
+  it('editar un borrador no se interbloquea con aprobarlo: los candados van en el mismo orden', async () => {
+    // ABBA de manual, y de los que el usuario ve como un error sin traducir. Las dos rutas
+    // que editan un BORRADOR —enlazar su journey, declarar a quién sucede— toman en el
+    // servicio el candado de la versión (`dv-elemento`) y después ejecutan un update sobre
+    // `design_version`; `aprobarDesignVersion` toma los dos al revés, `reto` → `dv-elemento`,
+    // que es el orden canónico. Mientras `design_version_anclaje_guard` pedía `reto` en su
+    // PRIMERA sentencia —o sea también en el update, donde no lee ningún gate—, las dos
+    // rutas acababan sosteniendo dv-elemento → reto y cerraban el ciclo: Postgres detecta el
+    // interbloqueo y aborta a una de las dos con un 40P01 que ninguna capa traduce.
+    //
+    // El arreglo es mover el candado a la rama del ALTA, que es la única que lee un gate. Y
+    // que el UPDATE no lo necesita no es una impresión: `design_versions_a_cargo_del_proyecto`
+    // —la base de los predicados de G6 y G7— excluye los borradores, así que mover el
+    // `supera_a` de uno no puede volver falso nada que un gate haya certificado.
+    //
+    // Las DOS rutas se prueban a propósito. Recortar solo la rama que retorna pronto arregla
+    // el enlace del journey y deja `declararSuperaA` exactamente igual de roto: ese update sí
+    // cambia `supera_a`, así que pasa de largo del early return. Un arreglo que solo mira el
+    // camino corto parece cerrar el hallazgo y no lo cierra.
+    const proy = await proyectoConGates('P-141', 'Proyecto del orden de candados');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del orden de candados');
+    const admin = sqlAdmin();
+    const [j2] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', 'Otro to-be del mismo servicio', ${leadId}) returning id`;
+    const otroJourney = j2!.id as string;
+
+    // La PRIMERA nace y se aprueba; la SEGUNDA nace ANTES de esa aprobación, que es la única
+    // forma de tener un borrador con `supera_a` nulo sobre un servicio que ya tiene aprobada
+    // — o sea, el caso real que `declararSuperaA` existe para reparar.
+    const primera = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que se aprueba',
+      resumen: '',
+      superaA: null,
+    });
+    await elementoSuelto(primera.designVersionId, 'Lo que la primera cambia');
+    const segunda = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que se queda en borrador',
+      resumen: '',
+      superaA: null,
+    });
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      motivo: '',
+    });
+    const borrador = segunda.designVersionId;
+
+    /**
+     * El cruce: una transacción con el candado de la VERSIÓN tomado ejecuta el update del
+     * borrador, y otra con el del RETO tomado pide el de la versión — que es exactamente lo
+     * que hace `aprobarDesignVersion` después de tomar el reto. Las dos esperan a que la
+     * otra tenga su primer candado antes de seguir, así que si el update pidiera `reto` el
+     * ciclo estaría cerrado y una de las dos moriría con 40P01.
+     */
+    const cruce = async (editar: (tx: TransactionSql) => Promise<unknown>): Promise<void> => {
+      let listoEditor!: () => void;
+      let listoAprobador!: () => void;
+      const conEditor = new Promise<void>((r) => (listoEditor = r));
+      const conAprobador = new Promise<void>((r) => (listoAprobador = r));
+      const ambos = Promise.all([conEditor, conAprobador]);
+      const editor = conUsuario(leadId, async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:dv-elemento:' || ${borrador}, 42))`;
+        listoEditor();
+        await ambos;
+        await editar(tx);
+      });
+      const aprobador = conUsuario(leadId, async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+        listoAprobador();
+        await ambos;
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:dv-elemento:' || ${borrador}, 42))`;
+      });
+      // Sin `allSettled` una de las dos quedaría sin esperar cuando la otra revienta, y el
+      // test terminaría con una transacción viva: el fallo aparecería en el desmontaje.
+      const finales = await Promise.allSettled([editor, aprobador]);
+      const caida = finales.find((f) => f.status === 'rejected');
+      if (caida && caida.status === 'rejected') throw caida.reason;
+    };
+
+    // 1) El enlace del journey: el update que NO cambia `supera_a`.
+    await cruce(
+      (tx) => tx`update design_version set journey_id = ${otroJourney}
+        where id = ${borrador} and workspace_id = ${ws}`,
+    );
+    // 2) Y la declaración de sucesión: el update que SÍ lo cambia y por tanto atraviesa el
+    //    guard entero. Es la mitad que un arreglo del camino corto habría dejado rota.
+    await cruce(
+      (tx) => tx`update design_version set supera_a = ${primera.designVersionId}
+        where id = ${borrador} and workspace_id = ${ws}`,
+    );
+    // Y las dos escrituras llegaron de verdad: el test no pasa por no haber hecho nada.
+    const [comoQuedo] = await conUsuario(leadId, (tx) => tx`select journey_id, supera_a
+      from design_version where id = ${borrador} and workspace_id = ${ws}`);
+    expect(comoQuedo!.journey_id).toBe(otroJourney);
+    expect(comoQuedo!.supera_a).toBe(primera.designVersionId);
   });
 
   it('firmar G6 y quitarle el release a un elemento no pueden cruzarse (RF-06.4)', async () => {

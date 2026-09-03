@@ -296,17 +296,49 @@ async function bloquearRetoDelElemento(
  * pueden acordar sin hablarse. Ninguna otra ruta toma más de uno, así que cualquier orden
  * total sobre los releases es compatible con todas.
  *
- * y `codigo-dv`, que solo se toma junto al del reto. Cada ruta es una subsecuencia:
+ * y `codigo-dv`, que solo se toma junto al del reto.
  *
- *   aprobarDesignVersion ....... reto → dv-elemento → servicio
- *   agregar/editar/borrar elemento, enlazar journey, declarar sucesión ..... dv-elemento
- *   crearDesignVersion ......... reto → codigo-dv
- *   planificarRelease .......... servicio → codigo-rl → release
- *   asignarElemento ............ servicio → release
- *   moverElemento .............. reto → servicio → release(origen) y release(destino), por uuid
- *   desasignarElemento ......... reto → release
- *   desplegarRelease ........... release
- *   constatarEffectiveState .... release → codigo-es
+ * ── CENSO DE RUTAS: la secuencia COMPLETA que cada una acaba sosteniendo ─────────────────
+ *
+ * La frontera de este censo es la que importa y no es obvia: **no basta con los candados
+ * que la función pide**. Una ruta acaba sosteniendo también los que toman los TRIGGERS de
+ * las sentencias que ejecuta —los inmediatos, en mitad de la sentencia; los diferidos, en
+ * el commit y por tanto los ÚLTIMOS de la transacción—. Un candado que toma un trigger
+ * cuenta para el orden exactamente igual que uno del servicio, y pedirlo tarde invierte la
+ * secuencia aunque la función no lo mencione. Las tres inversiones que se han encontrado
+ * en este módulo eran de esa forma, así que la columna que decide es la última:
+ *
+ *   ruta                       secuencia completa (servicio + triggers)          veredicto
+ *   ─────────────────────────  ───────────────────────────────────────────────   ─────────
+ *   crearDesignVersion ....... reto → codigo-dv                                  ✔
+ *     (el trigger de la serie repite reto y codigo-dv: no-ops)
+ *   enlazarJourney ........... dv-elemento                                       ✔
+ *   declararSuperaA .......... dv-elemento                                       ✔
+ *     (las dos, desde que el anclaje pide `reto` solo en el ALTA; antes pedían
+ *      dv-elemento → reto y cerraban ABBA contra aprobarDesignVersion)
+ *   agregarElemento .......... dv-elemento                                       ✔
+ *   editarElemento ........... dv-elemento                                       ✔
+ *   borrarElemento ........... dv-elemento                                       ✔
+ *     (las tres: los diferidos de identidad y de borrador repiten dv-elemento)
+ *   aprobarDesignVersion ..... reto → dv-elemento → servicio                     ✔
+ *     (el guard de transición repite reto → dv-elemento, en ese orden)
+ *   planificarRelease ........ servicio → codigo-rl → release                    ✔
+ *     (el trigger de la serie repite servicio y codigo-rl; el diferido del
+ *      alcance fijo repite release)
+ *   asignarElemento .......... servicio → release                                ✔
+ *   moverElemento ............ reto → servicio → release(×2, por uuid)           ✔
+ *     (el `reto` lo pide la ruta SOLO porque el diferido de cobertura lo tomaría
+ *      al commit, o sea el último de todos: es el caso que enseña la regla)
+ *   desasignarElemento ....... reto → release                                    ✔ (ídem)
+ *   desplegarRelease ......... release                                           ✔
+ *   constatarEffectiveState .. release → codigo-es                               ✔
+ *     (el trigger de la serie repite release y codigo-es)
+ *   designVersionCompleta, designVersionsDelWorkspace, versionAprobadaDelServicio,
+ *   proyectosCertificados, cadenaDeRelease ..... ninguno                         ✔ (lecturas)
+ *
+ * Y la vecina de fuera del módulo, porque es el otro extremo de casi todos los pares:
+ *   aprobarGate (metodo.servicio) ..... reto → gate                              ✔
+ *     (su guard de suficiencia repite `reto`; `gate` no lo toma ninguna ruta de aquí)
  *
  * Ojo con la lectura fácil: NO es cierto que «la serie va siempre antes que el release».
  * `planificarRelease` toma `codigo-rl` antes y `constatarEffectiveState` toma `codigo-es`
@@ -314,18 +346,17 @@ async function bloquearRetoDelElemento(
  * tome `codigo-es` y LUEGO el candado de un release cerraría el ciclo contra
  * `constatarEffectiveState` — que es justo el error que se comete creyendo seguir la regla.
  *
- * ── CENSO DE TRIGGERS QUE TOMAN CANDADO ─────────────────────────────────────────────────
+ * ── QUÉ TRIGGER TOMA QUÉ, Y POR QUÉ SU NOMBRE IMPORTA ───────────────────────────────────
  *
- * Un candado que toma un trigger cuenta para el orden igual que uno del servicio, así que
- * el censo va aquí y no en la migración: es la misma regla, y tenerla en dos sitios es
- * tenerla mal. Por candado, con la tabla de cada trigger y si es DIFERIDO (o sea, si corre
- * en la fase de commit y con su propia foto):
+ * Por candado, con la tabla de cada trigger y si es DIFERIDO (o sea, si corre en la fase de
+ * commit y con su propia foto):
  *
  *   reto ......... codigo_de_design_version (design_version, before insert · el prefijo
  *                    canónico, antes de codigo-dv)
- *                  design_version_anclaje (design_version, before insert/update)
- *                  design_version_transicion (design_version, before update · y luego
- *                    dv-elemento: es el único trigger que toma dos)
+ *                  design_version_anclaje (design_version, before insert · SOLO en el alta,
+ *                    que es la única rama que lee un gate)
+ *                  design_version_transicion (design_version, before update · solo en la
+ *                    rama de aprobación, y luego dv-elemento: el único que toma dos)
  *                  release_elemento_cobertura (release_elemento, DIFERIDO en delete)
  *                  gate_aprobar_suficiencia (gate_instancia, before update · es del método
  *                    y esta migración lo reemplaza, así que también responde por él)
@@ -342,11 +373,10 @@ async function bloquearRetoDelElemento(
  *                  release_elemento_sin_alcance (release_elemento, DIFERIDO en delete)
  *                  release_elemento_fijo (release_elemento, DIFERIDO en insert/delete)
  *
- * Y la parte que no se ve mirando cada trigger por separado: cuando DOS de ellos cuelgan de
- * la MISMA tabla y en el mismo momento, quien fija su orden entre sí es el ALFABETO de sus
- * nombres — Postgres dispara por nombre, y lo hace igual con los inmediatos que con los
- * diferidos. O sea que el nombre de un trigger es parte del orden de candados. Las
- * adyacencias que existen hoy, y por qué están bien:
+ * Cuando DOS de ellos cuelgan de la misma tabla y del mismo momento, quien fija su orden
+ * entre sí es el ALFABETO de sus nombres — Postgres dispara por nombre, y lo hace igual con
+ * los inmediatos que con los diferidos. O sea que el nombre de un trigger es parte del
+ * orden de candados. Las adyacencias que existen hoy, y por qué están bien:
  *
  *   release_elemento (diferidos, en delete) ... release_elemento_cobertura <
  *     release_elemento_fijo < release_elemento_sin_alcance: primero `reto` y después
@@ -354,17 +384,17 @@ async function bloquearRetoDelElemento(
  *     del alcance fijo se llamaba de forma que caía ANTES que el de cobertura y tomaba
  *     `release` antes que `reto`. Renombrarlo no fue cosmética: fue el arreglo.
  *   design_version (inmediatos) ... codigo_de_design_version < design_version_anclaje <
- *     design_version_transicion. Los tres empiezan por `reto`; el primero solo corre en el
- *     insert y el último solo en el update, así que nunca coinciden, y el único que añade
- *     un segundo candado lo añade DESPUÉS. El alfabeto coincide con el orden canónico.
+ *     design_version_transicion. En el INSERT corren los dos primeros y los dos empiezan
+ *     por `reto`; en el UPDATE, solo el tercero toma algo. El alfabeto coincide con el
+ *     orden canónico.
  *   elemento_cambio (diferidos) ... elemento_cambio_identidad <
  *     elemento_cambio_version_editable: los dos piden el MISMO candado, así que su orden
  *     entre sí da igual — lo que importa es que ninguno pide otro después.
  *   effective_state (inmediatos) ... codigo_de_effective_state < effective_state_alta, y
  *     el segundo no toma candado: no hay orden que romper.
- *   release (inmediatos y diferido) ... codigo_de_release (solo insert), release_transicion
- *     (solo update) y release_sin_alcance (diferido) piden todos `release`; el primero
- *     añade `codigo-rl` después, que es su sitio.
+ *   release ... codigo_de_release (solo insert), release_transicion (solo update) y
+ *     release_sin_alcance (diferido) piden todos `release`; el primero añade `codigo-rl`
+ *     después, que es su sitio.
  *
  * Los que no tienen vecino en su tabla (gate_instancia, elemento_decision,
  * elemento_insight) o no toman más de un candado —los diferidos de medición sobre `reto` y

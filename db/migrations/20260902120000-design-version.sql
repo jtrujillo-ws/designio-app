@@ -1402,17 +1402,6 @@ declare
   v_gate int;
   v_reto uuid;
 begin
-  -- El candado del RETO, antes de nada: más abajo este guard pregunta si el proyecto ya
-  -- CERTIFICÓ un gate, y eso es una lectura de gate_instancia que otra transacción puede
-  -- invalidar aprobando G6 a la vez. Sin candado compartido, el borrador nace en un proyecto
-  -- que acaba certificado — y entonces no se puede aprobar (lo rechaza la transición), ni
-  -- borrar, ni mudar de proyecto: el callejón exacto que este guard existe para evitar.
-  -- `crearDesignVersion` ya lo tomaba; aquí vale también para el SQL directo.
-  select p.reto_id into v_reto from proyecto p
-    where p.id = new.proyecto_id and p.workspace_id = new.workspace_id;
-  if v_reto is not null then
-    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
-  end if;
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
@@ -1423,6 +1412,34 @@ begin
       return new;
     end if;
   else
+    -- ── El candado del RETO, y SOLO en el alta ──
+    -- Las dos comprobaciones de abajo leen cosas que el método mueve: si el reto sigue
+    -- tocando este servicio, y si el proyecto ya CERTIFICÓ un gate. Las dos son lecturas de
+    -- instantánea que una aprobación de G6 concurrente invalida, así que se toman bajo el
+    -- candado del reto — el mismo que toma `aprobarGate`.
+    --
+    -- Va DENTRO de esta rama, y ahí está el arreglo. Estaba en la primera sentencia del
+    -- guard, o sea también en el UPDATE — donde no se lee ningún gate — y eso invertía el
+    -- orden canónico para las dos rutas que editan un borrador: `enlazarJourney` y
+    -- `declararSuperaA` toman `dv-elemento` en el servicio y llegaban aquí a pedir `reto`,
+    -- mientras `aprobarDesignVersion` los toma al revés (`reto` → `dv-elemento`). ABBA de
+    -- manual: Postgres detecta el interbloqueo y aborta a uno de los dos con un 40P01 que
+    -- ninguna capa traduce. Un candado que toma un trigger cuenta para el orden igual que
+    -- uno del servicio; pedirlo donde no se necesita no es contención de más, es un ciclo.
+    --
+    -- Que el UPDATE no lo necesite no es una impresión: `design_versions_a_cargo_del_proyecto`
+    -- —la base de los predicados de G6 y G7— excluye los BORRADORES, y esta rama solo corre
+    -- sobre borradores. Mover el `supera_a` de un borrador no puede volver falso nada que un
+    -- gate haya certificado.
+    --
+    -- Si algún día una comprobación de la rama UPDATE lee un gate, el candado vuelve — y
+    -- entonces `enlazarJourney` y `declararSuperaA` tienen que tomar `reto` ANTES que
+    -- `dv-elemento`, o el interbloqueo vuelve con él.
+    select p.reto_id into v_reto from proyecto p
+      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id;
+    if v_reto is not null then
+      perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+    end if;
     -- Solo en el alta: ni `proyecto_id` ni `servicio_id` están en el grant de columna, así
     -- que después de nacer no pueden moverse y revalidarlos sería trabajo muerto.
     if not exists (

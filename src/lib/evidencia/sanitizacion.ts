@@ -20,8 +20,13 @@
  * Lo que NO se hace, y por qué:
  *  · No hay sanitizador de HTML. El contenido importado jamás se interpreta como markup:
  *    se pinta como texto (React escapa por defecto y el bloque usa `white-space:
- *    pre-wrap`), no existe `dangerouslySetInnerHTML` en el repo y hay un test que lo
- *    verifica. Escribir un sanitizador de HTML a mano añadiría un parser propio —y sus
+ *    pre-wrap`). Un test enumera de forma EXACTA los usos de `dangerouslySetInnerHTML` del
+ *    repo; hoy hay UNO —el visor de diagramas de SPEC-05— y por esa puerta no pasa
+ *    material de terceros: el diagrama se arma con `etiqueta` y `condicion` del journey,
+ *    que escribe el equipo, las evidencias entran como conteo y nunca como texto, y encima
+ *    pasa por el neutralizador de `journey.mermaid.ts` con mermaid en `securityLevel:
+ *    'strict'`. Si aparece un segundo uso el test falla y obliga a repetir el
+ *    razonamiento. Escribir un sanitizador de HTML a mano añadiría un parser propio —y sus
  *    bypasses— para un riesgo que el renderizado ya no tiene.
  *  · No se normaliza a NFC ni se recorta: ver arriba (offsets de citas).
  *  · No hay escaneo de malware (no hay motor en el MVP). Se compensa con allowlist

@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
 import {
@@ -10,6 +11,7 @@ import {
   eliminarArchivo,
   ErrorCuraduria,
   listarBandeja,
+  DECIDIDAS_RECIENTES,
   listarEvidencias,
   listarEvidenciaConDerechos,
   PAGINA_DERECHOS,
@@ -1868,6 +1870,197 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       where w.nombre in ('Banco Andino', 'Clínica del Valle')
         and not exists (select 1 from derecho_uso d where d.evidencia_id = e.id)`;
     expect(huerfanas.map((f) => f.titulo as string)).toEqual([]);
+  });
+
+  it('el seed no fabrica consentimiento: una evidencia AJENA con el mismo título no recibe derechos', async () => {
+    // La reparación de la cadena de demo emparejaba la evidencia por su TÍTULO. El título
+    // es texto que cualquiera escribe, así que material confidencial de otro cliente
+    // bautizado igual recibía, al re-sembrar, derechos de ámbito CLIENTE firmados por
+    // Lucía — que nunca los concedió. En un producto cuya tesis es que conceder el uso es
+    // un acto propio, con su base documental y su responsable, un seed que firma
+    // consentimiento en nombre de alguien es la contradicción más grande posible.
+    // Ahora la procedencia se acredita por RELACIONES desde `proyecto.codigo = 'P-01'`.
+    const admin = sqlAdmin();
+    const [wsDemo] = await admin`select id from workspace where nombre = 'Banco Andino'`;
+    // No vacuo: sin base sembrada este test no probaría nada.
+    expect(wsDemo).toBeTruthy();
+    const wsDemoId = wsDemo!.id as string;
+    const [lucia] = await admin`select id from usuario where email = 'lucia@whitespace.demo'`;
+    const luciaId = lucia!.id as string;
+
+    const [fu] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${wsDemoId}, 'documento', ${marca + ' material de otro cliente'}, ${luciaId})
+      returning id`;
+    // Los dos títulos exactos de la cadena de demo, y las dos ramas del asegurador: una
+    // sin fila de derechos (rama insert) y otra con la fila 'pendiente' que deja el
+    // backfill (rama update).
+    const [ajenaSinFila] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${wsDemoId}, ${fu!.id as string},
+        'Funnel de apertura: 62% de abandono en verificación', '{}'::jsonb, ${luciaId})
+      returning id`;
+    const [ajenaPendiente] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${wsDemoId}, ${fu!.id as string},
+        'Entrevistas en sucursal: abandono del 20%', '{}'::jsonb, ${luciaId})
+      returning id`;
+    const idSinFila = ajenaSinFila!.id as string;
+    const idPendiente = ajenaPendiente!.id as string;
+    await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+      values (${wsDemoId}, ${idPendiente}, ${luciaId})`;
+
+    try {
+      // El seed COMPLETO, como se re-ejecuta en un despliegue: es el camino que hay que
+      // probar, no una reimplementación de su lógica en el test.
+      const r = spawnSync('bun', ['db/seed.ts'], { encoding: 'utf8', env: process.env });
+      expect(r.status).toBe(0);
+
+      const ajenas = await admin`select e.id, d.estado, d.ambito, d.decidido_por
+        from evidencia e left join derecho_uso d on d.evidencia_id = e.id
+        where e.id in (${idSinFila}, ${idPendiente})`;
+      const porId = new Map(ajenas.map((f) => [f.id as string, f]));
+      // Ni se le inventa una fila a la que no la tiene (rama insert)...
+      expect(porId.get(idSinFila)!.estado).toBe(null);
+      // ...ni se le concede a la que el backfill dejó pendiente (rama update). Y sobre
+      // todo: nadie ha firmado nada en su nombre.
+      expect(porId.get(idPendiente)!.estado).toBe('pendiente');
+      expect(porId.get(idPendiente)!.ambito).toBe('interno');
+      expect(ajenas.every((f) => f.decidido_por === null)).toBe(true);
+
+      // Y la cadena de VERDAD sí queda reparada: el test no pasa por haber roto el seed.
+      const cadena = await admin`select d.estado, d.ambito from derecho_uso d
+        join evidencia e on e.id = d.evidencia_id
+        join fuente f on f.id = e.fuente_id
+        where e.workspace_id = ${wsDemoId} and f.titulo = 'Estudio CX apertura de cuenta 2026'`;
+      expect(cadena.length).toBe(2);
+      expect(cadena.every((f) => f.estado === 'concedido' && f.ambito === 'cliente')).toBe(true);
+    } finally {
+      await admin`delete from derecho_uso where evidencia_id in (${idSinFila}, ${idPendiente})`;
+      await admin`delete from evidencia where id in (${idSinFila}, ${idPendiente})`;
+      await admin`delete from fuente where id = ${fu!.id as string}`;
+    }
+  });
+
+  it('un item RECHAZADO conserva sus archivos Y tiene camino: el historial se pagina entero', async () => {
+    // «Un item rechazado conserva sus archivos (SYS-17)» era una promesa sin ruta. El
+    // historial de decididas venía acotado a las más recientes y un rechazado no tiene
+    // `evidencia_id`, así que no aparece en la pantalla de evidencias: pasadas esas
+    // decisiones, los originales seguían ahí, RLS los dejaba leer y el producto no daba
+    // ningún camino para llegar. Es la regla «lo que la base permite, la pantalla lo
+    // ofrece» leída del revés.
+    const admin = sqlAdmin();
+    const viejo = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: marca + ' rechazado con original',
+      contenido: 'material que se rechaza pero se conserva',
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    await adjuntarArchivo(leadId, {
+      workspaceId: ws,
+      itemId: viejo.itemId,
+      nombre: 'original.pdf',
+      tipoMime: 'application/pdf',
+      contenidoBase64: bytesABase64(PDF),
+    });
+    await rechazarItem(leadId, { workspaceId: ws, itemId: viejo.itemId });
+    // Y se le entierra bajo una página entera de decisiones POSTERIORES.
+    await admin`insert into item_importacion
+      (workspace_id, titulo, contenido, tipo_fuente, referencia, estado,
+       decidido_por, decidido_en, creado_por)
+      select ${ws}, ${marca} || ' relleno ' || g, 'x', 'nota', '', 'rechazado',
+             ${leadId}, now() + (g || ' seconds')::interval, ${leadId}
+      from generate_series(1, ${DECIDIDAS_RECIENTES + 1}) as g`;
+
+    const primera = await listarBandeja(leadId, ws);
+    // La primera página NO lo alcanza: sin paginación el original quedaba inalcanzable.
+    expect(primera.decididas.some((i) => i.id === viejo.itemId)).toBe(false);
+    expect(primera.hayMasDecididas).toBe(true);
+
+    // Paginando por keyset se llega, y llega CON su adjunto: la promesa tiene ruta.
+    let cursor = primera.decididas[primera.decididas.length - 1]!.id;
+    let encontrado = primera.decididas.find((i) => i.id === viejo.itemId);
+    for (let vuelta = 0; vuelta < 5 && !encontrado; vuelta += 1) {
+      const pagina = await listarBandeja(leadId, ws, undefined, cursor);
+      expect(pagina.pendientes).toEqual([]);
+      if (pagina.decididas.length === 0) break;
+      encontrado = pagina.decididas.find((i) => i.id === viejo.itemId);
+      cursor = pagina.decididas[pagina.decididas.length - 1]!.id;
+    }
+    expect(encontrado).toBeTruthy();
+    expect(encontrado!.estado).toBe('rechazado');
+    expect(encontrado!.archivos.map((a) => a.nombre)).toEqual(['original.pdf']);
+  });
+
+  it('la cadena de una decisión se hace de insights VALIDADOS, y lo dice la base', async () => {
+    // `cita_insert` exige `insight.estado = 'propuesto'` para crear una cita, así que
+    // `propuesto` no es el estado en el que no hay citas: es el estado en el que se crean.
+    // Un insight propuesto, bien citado y con derechos vigentes, atravesaba entero el
+    // re-chequeo de derechos del gate —que pide «alguna cita con derechos vigentes» por
+    // afirmación, y la hay— y el gate se aprobaba sobre un insight que nunca pasó la barra
+    // de suficiencia de `insight_validar_guard`. El filtro `estado = 'validado'` vivía solo
+    // en el CTE de `registrarDecision`, y un espejo en el servicio no es una regla.
+    const admin = sqlAdmin();
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'nota', 'Fuente del insight sin validar', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, 'Respaldo con derechos vivos', '{}'::jsonb, ${leadId})
+      returning id`;
+    const evId = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evId}, 'concedido', 'cliente', 'Consentimiento vigente',
+              ${leadId}, now(), ${leadId})`;
+
+    // Insight PROPUESTO con su afirmación citada: derechos vigentes, barra sin pasar.
+    const ins = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'Insight que nunca pasó la barra',
+      resumen: '',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: ins.insightId,
+      texto: 'Afirmación sostenida por evidencia con derechos',
+      esHipotesis: false,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId: evId,
+      fragmento: 'fragmento',
+      localizacion: 'p. 1',
+    });
+    const [estadoIns] = await admin`select estado from insight where id = ${ins.insightId}`;
+    expect(estadoIns!.estado).toBe('propuesto');
+
+    const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-98', 'Proyecto sin validar', ${leadId}) returning id`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proy!.id as string}, 1, 'lead-boutique') returning id`;
+    const [dec] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, decidido_por)
+      values (${ws}, ${proy!.id as string}, ${gate!.id as string}, 'diseno',
+        'Decisión sobre un insight sin validar', 'x', ${leadId}) returning id`;
+
+    // Por SQL crudo del rol de aplicación, que es el escritor que hay que frenar.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into decision_insight (decision_id, insight_id, workspace_id)
+        values (${dec!.id as string}, ${ins.insightId}, ${ws})`),
+    ).rejects.toThrow(/row-level security|violates/i);
+    const enlaces = await admin`select 1 from decision_insight
+      where decision_id = ${dec!.id as string}`;
+    expect(enlaces.length).toBe(0);
+
+    // Y validado sí entra: la regla es «validado», no «ninguno».
+    await validarInsight(leadId, ws, ins.insightId);
+    await conUsuario(leadId, (tx) => tx`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${dec!.id as string}, ${ins.insightId}, ${ws})`);
+    const despues = await admin`select 1 from decision_insight
+      where decision_id = ${dec!.id as string}`;
+    expect(despues.length).toBe(1);
   });
 
   it('marcar cumplido sin evidencia sigue siendo imposible (el guard no lo relaja)', async () => {

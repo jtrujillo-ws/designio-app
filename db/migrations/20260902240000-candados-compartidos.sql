@@ -146,7 +146,14 @@ begin
     -- ventana. Y si la revocación ya estaba en vuelo, este `for share` espera a que
     -- commitee y Postgres re-evalúa la fila con la versión nueva (EvalPlanQual), así que
     -- las comprobaciones de abajo leen el estado posterior a la revocación y rechazan.
-    -- Se bloquea el MISMO conjunto que las comprobaciones recorren, ni una fila más.
+    -- Se bloquea el mismo conjunto de FILAS que las comprobaciones recorren, ni una más.
+    -- OJO, y esto de aquí decía «el MISMO conjunto» a secas, que era decir de más: bloquear
+    -- las filas correctas no basta si CUÁLES son esas filas se deriva de un `select` que
+    -- también corre sobre una instantánea. `decision_insight` es una de las tablas de las
+    -- que se deriva y nada la serializaba, así que un enlace nuevo entraba como fantasma —
+    -- una fila que habría cambiado el conjunto y que ningún candado de fila puede tomar
+    -- porque todavía no existe. Lo cierra 20260902250000 poniendo el candado sobre la
+    -- DECISIÓN, que es el objeto común de las dos operaciones.
     perform du.evidencia_id
       from derecho_uso du
       where du.workspace_id = new.workspace_id

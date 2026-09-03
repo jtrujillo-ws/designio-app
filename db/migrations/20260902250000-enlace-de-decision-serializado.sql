@@ -62,16 +62,25 @@
 -- «arregle» este guard añadiéndole comprobaciones que no le tocan.
 --
 -- ═══ LO QUE NO SE TOCA ═══
---  · `afirmacion` y `cita`, los otros dos eslabones de la cadena, NO necesitan candado:
---    una afirmación solo se escribe con el insight en borrador y el insight validado es
---    inmutable, y una `cita` nueva solo puede AÑADIR una con derechos vigentes (su propio
---    guard lo exige), de modo que nunca puede volver falso un `not exists`. El único
---    eslabón que puede empeorar el conjunto es el enlace decisión→insight.
---  · Enlazar un insight NO VALIDADO por SQL crudo sigue sin rechazarse aquí (la política
---    solo mira el rol; el filtro `estado = 'validado'` vive en el servicio). No se arregla
---    en esta migración porque es de otro dominio y porque, frente a este guard, falla
---    cerrado: un insight sin validar no tiene citas con derechos, así que el gate no se
---    aprueba. Queda anotado, no disimulado.
+--  · `afirmacion` y `cita`, los otros dos eslabones de la cadena, NO necesitan candado, y
+--    esto está comprobado contra el esquema vivo, no razonado de memoria:
+--      · `afirmacion_insert` exige `insight.estado = 'propuesto'`, y el rol de aplicación
+--        no tiene UPDATE ni DELETE sobre `afirmacion`. Una vez validado el insight, sus
+--        afirmaciones no cambian.
+--      · `insight_validar` es `using (estado = 'propuesto') with check (estado =
+--        'validado')` y el UPDATE está concedido solo sobre `estado`, `validado_por` y
+--        `validado_en`: un insight validado es inmutable para la aplicación.
+--      · sobre `cita` el rol de aplicación tiene INSERT y SELECT, nada más. Una cita nueva
+--        solo puede AÑADIR una con derechos vigentes (`evidencia_citable` lo exige), y
+--        ninguna se puede borrar, así que un `not exists` nunca puede pasar a verdadero.
+--    El único eslabón que puede empeorar el conjunto es el enlace decisión→insight.
+--  · Enlazar un insight NO VALIDADO por SQL crudo sigue sin rechazarse aquí: la política
+--    `decision_insight_insert` solo mira el rol. NO falla cerrado —lo comprobé después de
+--    escribir esto y lo di por bueno sin verificarlo, que es el error que hay que no
+--    repetir—: `cita_insert` exige `insight.estado = 'propuesto'` para crear una cita, así
+--    que `propuesto` es justamente el estado en el que las citas EXISTEN, y un insight
+--    propuesto bien citado atraviesa entero el re-chequeo de derechos de abajo. Lo cierra
+--    la migración siguiente, 20260902260000, en la política.
 
 -- ── El guard del gate bloquea también las DECISIONES de las que deriva el conjunto ──
 -- Copia ÍNTEGRA de la versión viva (20260902240000) más el candado. Ver la advertencia
@@ -122,7 +131,9 @@ begin
     -- ventana. Y si la revocación ya estaba en vuelo, este `for share` espera a que
     -- commitee y Postgres re-evalúa la fila con la versión nueva (EvalPlanQual), así que
     -- las comprobaciones de abajo leen el estado posterior a la revocación y rechazan.
-    -- Se bloquea el MISMO conjunto que las comprobaciones recorren, ni una fila más.
+    -- Se bloquea el mismo conjunto de FILAS que las comprobaciones recorren, ni una más —
+    -- y ahora también es el conjunto correcto, porque el `for share` sobre `decision` de
+    -- arriba impide que otro camino le añada miembros mientras se decide.
     perform du.evidencia_id
       from derecho_uso du
       where du.workspace_id = new.workspace_id

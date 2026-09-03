@@ -555,6 +555,47 @@ export async function cargarSnapshotsCsv(
   });
 }
 
+/** Delimitadores admitidos, en el ORDEN en que se prueban. Ver `delimitadorCsv`. */
+const DELIMITADORES_CSV = [';', '\t', ','] as const;
+
+/**
+ * El delimitador es UNO por fichero y se decide UNA sola vez, aquí.
+ *
+ * Partir cada fila por «cualquiera de los admitidos» —que es lo que hacía antes— no es un
+ * atajo sino un error de raíz: hace IMPOSIBLE distinguir un separador de un decimal,
+ * porque la misma cadena es válida en las dos lecturas y la que gana la elige el orden del
+ * código. `2026-08-01;55,2;nota` se partía en cuatro campos y guardaba 55 con la nota
+ * «2 nota»: sin error, sin fila rechazada y sin nada en el rastro que permitiera notarlo
+ * después. Un número plausible y distinto del que el fichero decía, alimentando el
+ * resultado del criterio y, por ahí, el veredicto del outcome review — que es justo lo que
+ * este slice existe para poder defender.
+ *
+ * Y no es un borde: `;` como delimitador y `,` como decimal son EL MISMO formato. Excel en
+ * configuración regional española (y europea en general) exporta así precisamente porque la
+ * coma está ocupada por el decimal, así que es lo que va a traer un cliente hispanohablante
+ * que pegue sus métricas desde una hoja de cálculo — el caso de uso central de la pantalla.
+ *
+ * Cómo se decide: el primero de `;`, tab y `,` que aparezca en la primera línea con
+ * contenido y deje una PRIMERA COLUMNA reconocible —una fecha, o la palabra «fecha» de la
+ * cabecera—. El orden importa: `;` y el tabulador no aparecen nunca dentro de una fecha ni
+ * de un número, así que su presencia es decisiva; la coma es el último recurso y, cuando le
+ * toca serlo, ya no puede ser además decimal. Mirar la primera columna es lo que salva el
+ * caso simétrico —un fichero de comas con un `;` dentro de una nota—: ahí `;` deja una
+ * primera columna que no es fecha y se pasa al siguiente candidato.
+ */
+function delimitadorCsv(primera: string): string {
+  for (const d of DELIMITADORES_CSV) {
+    if (!primera.includes(d)) continue;
+    const cabeza = (primera.split(d)[0] ?? '').trim();
+    if (cabeza.toLowerCase() === 'fecha' || FechaCalendarioSchema.safeParse(cabeza).success) {
+      return d;
+    }
+  }
+  // Ninguno deja una primera columna reconocible: se elige por precedencia para que la
+  // fila se rechace con su motivo en vez de partirse de una tercera forma.
+  return DELIMITADORES_CSV.find((d) => primera.includes(d)) ?? ',';
+}
+
 /** Parseo puro del CSV pegado (sin base): separa filas válidas de rechazadas con motivo.
  * Las válidas conservan su línea y su contenido porque la ventana firmada todavía puede
  * rechazarlas, y ese rechazo también tiene que decir QUÉ línea fue. */
@@ -565,16 +606,34 @@ export function parsearCsv(csv: string): {
   const validas: FilaCsv[] = [];
   const rechazadas: FilaRechazada[] = [];
   const lineas = csv.split(/\r?\n/);
+  const delim = delimitadorCsv(lineas.find((l) => l.trim() !== '')?.trim() ?? '');
+  // Con el delimitador fijado, la coma solo puede ser una cosa. Si NO es el delimitador es
+  // el decimal, y se normaliza a punto antes de validar: el objetivo del producto es que el
+  // cliente pueda subir lo que su hoja de cálculo produce, y aceptar el `;` sin aceptar la
+  // coma decimal sería aceptar medio formato. Si SÍ es el delimitador, entonces `55,2` son
+  // dos campos y eso tampoco es una interpretación: es lo que el fichero declara.
+  const comaDecimal = delim !== ',';
+  // La cabecera se salta en la primera línea CON CONTENIDO, no en el índice 0: un fichero
+  // que empieza con una línea en blanco tenía su cabecera rechazada como fecha inválida.
+  let cabeceraPosible = true;
   for (let i = 0; i < lineas.length; i++) {
     const cruda = lineas[i] ?? '';
     const linea = cruda.trim();
     if (linea === '') continue;
-    const partes = linea.split(/[;,\t]/);
+    const partes = linea.split(delim);
     const fecha = (partes[0] ?? '').trim();
     // Cabecera de hoja de cálculo: se salta sin contarla como rechazo.
-    if (i === 0 && fecha.toLowerCase() === 'fecha') continue;
-    const valor = (partes[1] ?? '').trim();
-    const nota = partes.slice(2).join(' ').trim().slice(0, 500);
+    if (cabeceraPosible && fecha.toLowerCase() === 'fecha') {
+      cabeceraPosible = false;
+      continue;
+    }
+    cabeceraPosible = false;
+    const crudo = (partes[1] ?? '').trim();
+    // La nota se vuelve a unir con SU delimitador y no con un espacio: una nota que lo
+    // contenga se conserva tal cual en vez de volver alterada, que es la misma clase de
+    // mentira silenciosa aunque no toque el número. (Sin comillas: este parser no las
+    // interpreta, y un campo entrecomillado con delimitadores dentro sigue partiéndose.)
+    const nota = partes.slice(2).join(delim).trim().slice(0, 500);
     if (validas.length >= MAX_FILAS_CSV) {
       rechazadas.push({
         linea: i + 1,
@@ -592,13 +651,26 @@ export function parsearCsv(csv: string): {
       });
       continue;
     }
-    const valorOk = ValorMetricoSchema.safeParse(valor);
+    // Más de un separador es un número AGRUPADO (`1.234,56`, `1,234.56`, `12,345,678`) y
+    // eso no se adivina: se rechaza diciéndolo. Con uno solo, ese uno es el decimal — no se
+    // admite separador de miles, que es además lo que exporta una hoja de cálculo.
+    if ((crudo.match(/[.,]/g) ?? []).length > 1) {
+      rechazadas.push({
+        linea: i + 1,
+        contenido: linea.slice(0, 120),
+        motivo: `Valor con más de un separador decimal: «${crudo}» (no se admite separador de miles)`,
+      });
+      continue;
+    }
+    const valorOk = ValorMetricoSchema.safeParse(comaDecimal ? crudo.replace(',', '.') : crudo);
     if (!valorOk.success) {
       rechazadas.push({
         linea: i + 1,
         contenido: linea.slice(0, 120),
         motivo:
-          valor === '' ? 'Falta el valor' : `Valor no numérico: «${valor}» (usa punto decimal)`,
+          crudo === ''
+            ? 'Falta el valor'
+            : `Valor no numérico: «${crudo}» (usa ${comaDecimal ? 'punto o coma decimal' : 'punto decimal'})`,
       });
       continue;
     }

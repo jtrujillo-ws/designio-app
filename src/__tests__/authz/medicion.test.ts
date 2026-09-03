@@ -1153,6 +1153,39 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const [evento] = await admin`select payload from evento_dominio
       where workspace_id = ${ws} and tipo = 'SnapshotsCargados' order by creado_en desc limit 1`;
     expect((evento!.payload as { insertados: number }).insertados).toBe(2);
+
+    // ── El fichero que va a llegar de verdad: `;` de delimitador y coma decimal ──
+    // No son dos rarezas independientes, son EL MISMO formato: una hoja de cálculo en
+    // configuración regional española exporta con `;` precisamente porque la coma está
+    // ocupada por el decimal. Partir cada fila por «cualquiera de los separadores
+    // admitidos» hacía de `55,2` dos campos y guardaba 55 con la nota «2 …»: sin error, sin
+    // fila rechazada y sin nada en el rastro. Un número plausible y distinto del que el
+    // fichero decía, alimentando el resultado del criterio y el veredicto — que es lo que
+    // este slice existe para poder defender. Por eso lo que se fija aquí no es que la fila
+    // entre, sino QUÉ VALOR queda escrito.
+    const csvEuropeo = [
+      'fecha;valor;nota',
+      `${fecha(-5)};55,2;corte con coma decimal`,
+      // Y lo que no se adivina se rechaza diciéndolo: un número agrupado tiene DOS
+      // separadores y no hay forma de saber cuál es cuál.
+      `${fecha(-3)};1.234,5;miles agrupados`,
+    ].join('\n');
+    const euro = await cargarSnapshotsCsv(sponsorId, {
+      workspaceId: ws,
+      entradaId: entradaAbandonoId,
+      csv: csvEuropeo,
+    });
+    expect(euro.insertados).toBe(1);
+    expect(euro.rechazadas.map((f) => f.linea)).toEqual([3]);
+    expect(euro.rechazadas[0]!.motivo).toMatch(/más de un separador decimal/);
+    const segEuro = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const conComa = segEuro!.entradas
+      .find((e) => e.id === entradaAbandonoId)!
+      .snapshots.find((sn) => sn.nota === 'corte con coma decimal')!;
+    expect(conComa.valor).toBe('55.2');
+    // Fixture: la serie que leen los tests siguientes es la de arriba, así que este corte
+    // —que solo existía para fijar el valor— se retira. Solo el rol admin puede (SYS-23).
+    await admin`delete from snapshot where id = ${conComa.id}`;
   });
 
   it('el ÚLTIMO día de la ventana todavía mide: el review no se abre y el snapshot entra', async () => {
@@ -1572,16 +1605,20 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // de que se entre por el servicio, y un `update` directo tampoco es invisible.
     expect((await de('EntradaKpiEditada')).some((e) => e.actor_id === null)).toBe(true);
 
-    // La serie: un evento por FILA, del formulario y del CSV…
+    // La serie: un evento por FILA, del formulario y del CSV. Son TRES del CSV: dos de la
+    // primera tanda y la del fichero europeo, cuya fila retiró el fixture después de fijar
+    // su valor — el rastro no se va con ella, que es el punto de que lo emita la base.
     const snaps = await cuerpos('SnapshotRegistrado');
-    expect(snaps.filter((p) => p.origen === 'csv').length).toBe(2);
+    expect(snaps.filter((p) => p.origen === 'csv').length).toBe(3);
     expect(snaps.filter((p) => p.origen === 'formulario').length).toBeGreaterThan(0);
     // …y ADEMÁS el de la tanda, que es la única excepción honesta al «lo emite la base»:
     // cuenta las filas RECHAZADAS, que no llegan a ser filas de ninguna tabla y por tanto
-    // ningún trigger puede verlas.
+    // ningún trigger puede verlas. Dos tandas: la primera con sus cinco rechazos y la del
+    // fichero europeo con el suyo, el número agrupado que no se adivina.
     const tandas = await cuerpos('SnapshotsCargados');
-    expect(tandas.length).toBe(1);
+    expect(tandas.length).toBe(2);
     expect(tandas[0]!.rechazadas).toBe(5);
+    expect(tandas[1]!.rechazadas).toBe(1);
 
     // El post-mortem: apertura del review y resultado por criterio.
     expect((await cuerpos('OutcomeReviewAbierto')).some((p) => p.reviewId === reviewId)).toBe(true);

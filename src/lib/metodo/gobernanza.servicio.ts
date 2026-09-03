@@ -263,6 +263,10 @@ export async function darVeredictoArquetipo(
  * mientras se reabre, su decisión se registra DESPUÉS con el contexto nuevo — no queda
  * marcada, y es correcto que no lo esté. La reapertura cuestiona lo decidido ANTES,
  * no lo que se decide sabiendo que la etapa se reabrió.
+ *
+ * Sí lo toma, en cambio, contra el CIERRE del proyecto: ahí no hay lectura razonable del
+ * entrecruce — un proyecto cerrado es historia inmutable (SYS-08) y reabrirle una etapa
+ * después no cuestiona nada, corrompe.
  */
 export async function reabrirEtapa(
   actorId: string,
@@ -270,73 +274,93 @@ export async function reabrirEtapa(
 ): Promise<{ decisionesMarcadas: number }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // MISMO candado por reto que toma la completación del outcome review, que es quien
+    // cierra el proyecto. Sin él los dos caminos tocan filas distintas y no se ven: la
+    // completación cierra el proyecto y commitea, y esta reapertura —que ya evaluó su
+    // predicado «el proyecto no está cerrado» contra el snapshot anterior— commitea
+    // después una etapa `en-curso` y decisiones `en-revision` sobre lo que ya es
+    // historia. `proyecto.reto_id` es inmutable: leerlo antes del candado no abre carrera.
+    const [dueno] = await tx`select reto_id from proyecto
+      where id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}`;
+    if (!dueno) throw new ErrorGobernanza('El proyecto no existe en este workspace');
+    await tx`select pg_advisory_xact_lock(
+      hashtextextended('designio:reto:' || ${dueno.reto_id as string}, 42))`;
     const insightIds = [...new Set(entrada.insightIds)];
-    const [fila] = await tx`
-      with quien as (
-        select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-      ),
-      declarados as (
-        -- Los insights que existen DE VERDAD en el workspace: si el conteo no cuadra
-        -- con lo pedido, la declaración era falsa y abajo se revierte todo.
-        select i.id from insight i
-        where i.workspace_id = ${entrada.workspaceId}
-          and i.id = any(${insightIds}::uuid[])
-      ),
-      marcadas as (
-        update decision d set estado = 'en-revision'
-        from gate_instancia g
-        where d.gate_id = g.id and d.workspace_id = g.workspace_id
-          and d.proyecto_id = ${entrada.proyectoId}
-          and d.workspace_id = ${entrada.workspaceId}
-          and g.numero >= ${entrada.etapaNumero}
-          and d.estado = 'vigente'
-          and (
-            cardinality(${insightIds}::uuid[]) = 0
-            or exists (select 1 from decision_insight di
-              where di.decision_id = d.id and di.workspace_id = d.workspace_id
-                and di.insight_id = any(${insightIds}::uuid[]))
-          )
-        returning d.id
-      ),
-      etapa as (
-        update etapa_instancia set estado = 'en-curso'
-        where proyecto_id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}
-          and numero = ${entrada.etapaNumero}
-        returning id
-      ),
-      registro as (
-        insert into reapertura_etapa (workspace_id, proyecto_id, etapa_numero, motivo,
-                                      alcance, decisiones_marcadas, reabierto_por)
-        select ${entrada.workspaceId}, ${entrada.proyectoId}, ${entrada.etapaNumero},
-               ${entrada.motivo},
-               case when cardinality(${insightIds}::uuid[]) = 0
-                    then 'etapa-completa' else 'declarado' end,
-               (select count(*)::int from marcadas), ${actorId}
-        from etapa
-        returning id
-      ),
-      cambios as (
-        insert into reapertura_insight (reapertura_id, insight_id, workspace_id)
-        select registro.id, declarados.id, ${entrada.workspaceId}
-        from registro, declarados
-        returning insight_id
-      ),
-      evento as (
-        insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-        select ${entrada.workspaceId}, 'EtapaReabierta',
-          jsonb_build_object('proyectoId', ${entrada.proyectoId}::uuid,
-                             'etapa', ${entrada.etapaNumero}::int,
-                             'motivo', ${entrada.motivo}::text,
-                             'alcance', case when cardinality(${insightIds}::uuid[]) = 0
-                                             then 'etapa-completa' else 'declarado' end,
-                             'insightsDeclarados', (select count(*)::int from cambios),
-                             'decisionesMarcadas', (select count(*)::int from marcadas)),
-          ${actorId}, quien.rol
-        from registro, quien
-      )
-      select registro.id, (select count(*)::int from marcadas) as marcadas,
-        (select count(*)::int from cambios) as declarados
-      from registro`;
+    let fila;
+    try {
+      [fila] = await tx`
+        with quien as (
+          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
+        ),
+        declarados as (
+          -- Los insights que existen DE VERDAD en el workspace: si el conteo no cuadra
+          -- con lo pedido, la declaración era falsa y abajo se revierte todo.
+          select i.id from insight i
+          where i.workspace_id = ${entrada.workspaceId}
+            and i.id = any(${insightIds}::uuid[])
+        ),
+        marcadas as (
+          update decision d set estado = 'en-revision'
+          from gate_instancia g
+          where d.gate_id = g.id and d.workspace_id = g.workspace_id
+            and d.proyecto_id = ${entrada.proyectoId}
+            and d.workspace_id = ${entrada.workspaceId}
+            and g.numero >= ${entrada.etapaNumero}
+            and d.estado = 'vigente'
+            and (
+              cardinality(${insightIds}::uuid[]) = 0
+              or exists (select 1 from decision_insight di
+                where di.decision_id = d.id and di.workspace_id = d.workspace_id
+                  and di.insight_id = any(${insightIds}::uuid[]))
+            )
+          returning d.id
+        ),
+        etapa as (
+          update etapa_instancia set estado = 'en-curso'
+          where proyecto_id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}
+            and numero = ${entrada.etapaNumero}
+          returning id
+        ),
+        registro as (
+          insert into reapertura_etapa (workspace_id, proyecto_id, etapa_numero, motivo,
+                                        alcance, decisiones_marcadas, reabierto_por)
+          select ${entrada.workspaceId}, ${entrada.proyectoId}, ${entrada.etapaNumero},
+                 ${entrada.motivo},
+                 case when cardinality(${insightIds}::uuid[]) = 0
+                      then 'etapa-completa' else 'declarado' end,
+                 (select count(*)::int from marcadas), ${actorId}
+          from etapa
+          returning id
+        ),
+        cambios as (
+          insert into reapertura_insight (reapertura_id, insight_id, workspace_id)
+          select registro.id, declarados.id, ${entrada.workspaceId}
+          from registro, declarados
+          returning insight_id
+        ),
+        evento as (
+          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+          select ${entrada.workspaceId}, 'EtapaReabierta',
+            jsonb_build_object('proyectoId', ${entrada.proyectoId}::uuid,
+                               'etapa', ${entrada.etapaNumero}::int,
+                               'motivo', ${entrada.motivo}::text,
+                               'alcance', case when cardinality(${insightIds}::uuid[]) = 0
+                                               then 'etapa-completa' else 'declarado' end,
+                               'insightsDeclarados', (select count(*)::int from cambios),
+                               'decisionesMarcadas', (select count(*)::int from marcadas)),
+            ${actorId}, quien.rol
+          from registro, quien
+        )
+        select registro.id, (select count(*)::int from marcadas) as marcadas,
+          (select count(*)::int from cambios) as declarados
+        from registro`;
+    } catch (e) {
+      // El guard de la base habla ANTES que el WITH CHECK y con el motivo concreto (el
+      // proyecto cerró mientras esto esperaba el candado): se traduce al contrato.
+      const err = e as { code?: string; message?: string };
+      if (err.code === 'P0001' && err.message) throw new ErrorGobernanza(err.message);
+      throw e;
+    }
     if (!fila) {
       throw new ErrorGobernanza('El proyecto o la etapa no existen, o no puedes reabrirla');
     }

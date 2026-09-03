@@ -167,6 +167,14 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       (workspace_id, servicio_ancla_id, codigo, titulo, estado, creado_por)
       values (${ws}, ${servicioId}, 'R-90', 'Reducir el abandono', 'activo', ${leadId}) returning id`;
     retoId = r!.id as string;
+    // Desde SPEC-07, G6 no se aprueba sin el Metric Registry del reto FIRMADO. Casi todos los
+    // proyectos de este fichero cuelgan de R-90, así que se firma UNA vez aquí: el registry es
+    // 1:1 con el reto, y lo que estos tests ejercitan es SPEC-06, no la firma del contrato de
+    // medición —que tiene su propia suite—. Los fixtures que crean su propio reto lo firman
+    // por `aprobarGatesHasta`.
+    await admin`insert into metric_registry
+      (workspace_id, reto_id, estado, firmado_por, firmado_en, creado_por)
+      values (${ws}, ${retoId}, 'firmado', ${leadId}, now(), ${leadId})`;
     // R-90 ancla en `servicioId` y declara AFECTADO a `otroServicioId`: es la relación que
     // hace legítimo que un proyecto de este reto produzca design versions de los dos
     // servicios, y la que el guard de anclaje comprueba.
@@ -319,6 +327,9 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await admin`delete from criterio_exito where workspace_id = ${ws}`;
     await admin`delete from proyecto where workspace_id = ${ws}`;
     await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
+    // El contrato de medición cuelga del reto desde SPEC-07, y estos fixtures lo firman para
+    // poder llegar a G6: se va antes que su reto o la FK lo impide.
+    await admin`delete from metric_registry where workspace_id = ${ws}`;
     await admin`delete from reto where workspace_id = ${ws}`;
     await admin`delete from servicio where workspace_id = ${ws}`;
     await admin`delete from evento_dominio where workspace_id = ${ws}`;
@@ -2876,8 +2887,27 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       })
     ).elementoId;
 
+  /**
+   * Deja firmado el Metric Registry del reto de este proyecto.
+   *
+   * Desde SPEC-07, G6 no se aprueba sin él (lo exige el guard de suficiencia, y esta
+   * migración lo conserva al reemplazar la función). Los fixtures de aquí llegan a G6 por
+   * muchos caminos, así que en vez de sembrarlo en cada uno se asegura aquí — y es un upsert
+   * porque varios proyectos de estos comparten reto y el registry es 1:1 con el reto.
+   */
+  const registryFirmado = async (proy: string): Promise<void> => {
+    const admin = sqlAdmin();
+    await admin`insert into metric_registry
+      (workspace_id, reto_id, estado, firmado_por, firmado_en, creado_por)
+      select ${ws}, p.reto_id, 'firmado', ${leadId}, now(), ${leadId}
+      from proyecto p where p.id = ${proy} and p.workspace_id = ${ws}
+      on conflict (reto_id) do update
+        set estado = 'firmado', firmado_por = ${leadId}, firmado_en = now()`;
+  };
+
   const aprobarGatesHasta = async (proy: string, hasta: number): Promise<void> => {
     const admin = sqlAdmin();
+    if (hasta >= 6) await registryFirmado(proy);
     for (let n = 0; n <= hasta; n++) {
       await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;

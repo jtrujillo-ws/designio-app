@@ -2546,6 +2546,20 @@ begin
     ) then
       raise exception 'no se puede aprobar G5: el proyecto no tiene ninguna design version aprobada con elementos que certificar (RF-06.3)';
     end if;
+    -- G6 es donde el Metric Registry se acuerda y se FIRMA (SYS-22): aprobar el plan de
+    -- implementación sin contrato de medición firmado deja el loop abierto por diseño.
+    if new.numero = 6 and not exists (select 1 from metric_registry r
+      join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+      where r.reto_id = p.reto_id and r.workspace_id = new.workspace_id
+        and r.estado = 'firmado') then
+      raise exception 'no se puede aprobar G6: el Metric Registry no está firmado (SYS-22)';
+    end if;
+    -- ↑ Copiada TAL CUAL del cuerpo vivo de `20260902110000-medicion.sql`, que corre antes
+    -- que esta migración. Este `create or replace` reemplaza la función ENTERA, así que sin
+    -- traerla se perdería la puerta de G6 que SPEC-07 acaba de poner — y en silencio, porque
+    -- nada falla al borrar una regla. Lo que NO se trae es el efecto de G6 sobre el proyecto:
+    -- vive en su propio trigger AFTER (`proyecto_a_implementacion_tras_g6`), y aquí, en un
+    -- BEFORE, la fila del gate todavía no existe.
     -- G6 firma el PLAN (RF-06.4): «cada elemento de la design version queda asignado a
     -- exactamente un release con dueño y fecha». Que el ítem del checklist esté cumplido
     -- no lo demuestra — un ítem cumplido registra un objeto citado o un N/A razonado, y
@@ -2603,8 +2617,15 @@ begin
         and numero = new.numero;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'GateAprobado',
+        -- El cuerpo del evento viene ENTERO de la migración de medición. Este
+        -- `create or replace` reescribe la función completa, así que lo que no se copie
+        -- desaparece sin que nada falle al aplicar: el rastro pierde columnas y solo lo
+        -- nota quien lo lea. `aprobado_en` está en el grant y el WITH CHECK solo le exige
+        -- NO SER NULO —la fecha la propone la aplicación y nada la ata al instante real—,
+        -- así que es la clase de dato que el evento tiene que conservar tal cual quedó.
         jsonb_build_object('gateId', new.id, 'proyectoId', new.proyecto_id,
-                           'numero', new.numero),
+                           'numero', new.numero, 'estado', new.estado,
+                           'aprobadoPor', new.aprobado_por, 'aprobadoEn', new.aprobado_en),
         app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   end if;
   return new;

@@ -290,6 +290,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       });
     } finally {
       await admin`delete from evento_dominio where workspace_id = ${wsL}`;
+      // El linaje va de la fila materializada HACIA la propuesta, así que hay que soltarlo
+      // antes de borrarla. Es la contrapartida de que la columna sea inescribible por la
+      // aplicación: solo una conexión de administración puede deshacer el vínculo.
+      await admin`update evidencia set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      await admin`update criterio_exito set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -352,6 +357,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     if (ws) {
       await admin`delete from evento_dominio where workspace_id = ${ws}`;
       await admin`delete from reserva_ai where workspace_id = ${ws}`;
+      await admin`update evidencia set propuesta_ai_id = null where workspace_id = ${ws}`;
+      await admin`update criterio_exito set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where workspace_id = ${ws}`;
       await admin`delete from llamada_ai where workspace_id = ${ws}`;
       await admin`delete from consentimiento_item where workspace_id = ${ws}`;
@@ -2703,6 +2710,110 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(leida!.consentimiento_autoriza_externo).toBe(true);
     await admin`delete from llamada_ai where id in
       (${buena!.id as string}, ${sinPersonas!.id as string})`;
+  });
+
+  it('la procedencia es una relación, no una coincidencia de transacción', async () => {
+    // `xmin` demuestra «nació en esta transacción», y el linaje AFIRMA «la produjo esta
+    // propuesta». En el hueco cabía todo esto: crear a mano una evidencia que no tiene nada
+    // que ver, sellar con ella el item que cuadra y marcar la propuesta como aceptada —
+    // todo en un commit, así que todos los predicados de `xmin` pasaban. Y el daño no es
+    // solo de auditoría: contenido escrito a mano quedaba contado como aceptado tal cual
+    // del modelo, que es la métrica con la que se decide si esta capacidad sirve.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item de la procedencia');
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+      contenido: CONTENIDO_CI,
+    });
+
+    // El ataque, con la misma forma exacta que usa el servicio y en una sola transacción.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [f] = await tx`insert into fuente (workspace_id, tipo, titulo, referencia,
+            creado_por)
+          values (${ws}, 'nota', 'Fuente a mano', 'ref', ${leadId}) returning id`;
+        const [e] = await tx`insert into evidencia
+          (workspace_id, fuente_id, titulo, resumen, dimensiones, es_estado_actual, creado_por)
+          values (${ws}, ${f!.id as string}, 'Título que me he inventado',
+                  'Resumen que no propuso nadie',
+                  ${tx.json({
+                    proveniencia: { tipoFuente: 'nota', fecha: '2026-07-20', localizacion: 'ref' },
+                    metodo: { recoleccion: 'a mano', derivada: false, segmentoIds: [] },
+                    calidad: { confianza: 'alta', corroboraIds: [], contradiceIds: [] },
+                    derechos: { consentimiento: false, confidencialidad: 'interna' },
+                  })},
+                  true, ${leadId}) returning id`;
+        const evidenciaId = e!.id as string;
+        await tx`update item_importacion
+          set estado = 'aprobado', decidido_por = ${leadId}, decidido_en = now(),
+              evidencia_id = ${evidenciaId}
+          where id = ${itemId} and workspace_id = ${ws}`;
+        await tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${evidenciaId}
+          where id = ${propuestaId} and workspace_id = ${ws}`;
+      }),
+    ).rejects.toThrow(/no dice lo que dice la propuesta/i);
+
+    // Y por el camino bueno, el vínculo queda ESCRITO en la fila materializada — no en la
+    // propuesta, que es la que afirma— y lo escribe el guard: la aplicación no tiene grant
+    // sobre esa columna ni para ponerla ni para quitarla.
+    const r = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    expect(r.estado).toBe('aceptada');
+    const [ev] = await conUsuario(leadId, (tx) => tx`select titulo, propuesta_ai_id
+      from evidencia where id = ${r.objetoId}`);
+    expect(ev!.propuesta_ai_id).toBe(propuestaId);
+    // El título es el de la propuesta, que es lo que la proyección exige.
+    expect(ev!.titulo).toBe(CONTENIDO_CI.titulo);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update evidencia set propuesta_ai_id = null
+        where id = ${r.objetoId}`),
+    ).rejects.toThrow(/permission denied/i);
+
+    // Y el objeto no puede pasar a colgar de OTRA propuesta: el índice único lo impide para
+    // siempre, no solo dentro de la transacción que lo creó.
+    const otroItem = await nuevoItem('Otro item de la procedencia');
+    const otraPropuesta = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId: otroItem,
+      contenido: CONTENIDO_CI,
+    });
+    await expect(
+      conUsuario(leadId, (tx) => tx`update propuesta_ai
+        set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${r.objetoId}
+        where id = ${otraPropuesta} and workspace_id = ${ws}`),
+    ).rejects.toThrow();
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: otraPropuesta });
+    await admin`update evidencia set propuesta_ai_id = null where workspace_id = ${ws}`;
+  });
+
+  it('corregir antes de aceptar sigue siendo legítimo: la proyección mira lo corregido', async () => {
+    // La contrapartida imprescindible de la comprobación anterior. «Aprobar incluye
+    // enmendar» (I4), así que un guard que exigiera el contenido ORIGINAL convertiría cada
+    // corrección en un fallo. Se compara contra `contenido`, que la corrección reescribe en
+    // la misma sentencia que dispara el guard — de ahí que el objeto materializado sea el
+    // corregido y la propuesta salga `corregida`, que es justo el dato que hay que medir.
+    const itemId = await nuevoItem('Item que se corrige antes de aceptar');
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+      contenido: CONTENIDO_CI,
+    });
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      // Las citas se reenvían intactas: son lo único que la corrección no puede tocar.
+      correccion: { ...CONTENIDO_CI, titulo: 'Título corregido por la curadora' },
+    });
+    expect(r.estado).toBe('corregida');
+    const [ev] = await conUsuario(leadId, (tx) => tx`select titulo, propuesta_ai_id
+      from evidencia where id = ${r.objetoId}`);
+    expect(ev!.titulo).toBe('Título corregido por la curadora');
+    expect(ev!.propuesta_ai_id).toBe(propuestaId);
+    await sqlAdmin()`update evidencia set propuesta_ai_id = null where id = ${r.objetoId}`;
   });
 
   it('los relojes del slice no los escribe quien se mide con ellos', async () => {

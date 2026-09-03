@@ -1319,6 +1319,41 @@ export async function aceptarPropuesta(
   actorId: string,
   entrada: RevisarPropuesta,
 ): Promise<{ estado: 'aceptada' | 'corregida'; objetoId: string }> {
+  // El guard de materialización es un constraint trigger DIFERIDO: habla en el COMMIT, o sea
+  // FUERA del callback de la transacción, así que ningún `try` de dentro lo alcanza. Sin
+  // esta traducción su rechazo sale como PostgresError crudo, y `mensajeDe` devuelve null
+  // para P0001 — la server function relanza y el revisor se encuentra el error boundary del
+  // router en vez de un motivo. Es el mismo fallo que el `catch` de `materializarCriterio`
+  // tenía con el registry firmado, un nivel más arriba.
+  //
+  // Casi todas sus reglas son inalcanzables desde el servicio (él sella el item, firma el
+  // criterio y crea el objeto en esta misma transacción), pero una no lo es: entre que
+  // `materializarCriterio` lee `reto_admite_criterios` y que su INSERT toma la fila del
+  // reto cabe un `update reto` crudo, y entonces el guard lo ve en el commit. Se traduce el
+  // conjunto y no solo esa: son mensajes escritos para una persona, y dejar caer los otros
+  // por «no deberían pasar» es exactamente cómo se descubren con una pantalla rota.
+  //
+  // El mensaje se pasa TAL CUAL, sin añadirle una salida. La tentación era rematarlo con
+  // «esta propuesta quedó obsoleta y solo puede rechazarse», pero por aquí pasan también
+  // los `raise` del guard de revisión —«una corrección debe cambiar el contenido propuesto»,
+  // «las citas no se corrigen»—, donde esa coletilla sería falsa: la propuesta está
+  // perfectamente viva y lo que hay que arreglar es el envío. Cada guard ya dice lo suyo;
+  // esto solo lo convierte en un error de dominio en vez de en una pantalla rota.
+  try {
+    return await aceptarPropuestaEnTransaccion(actorId, entrada);
+  } catch (e) {
+    const err = e as { code?: string; message?: string };
+    if (err.code === 'P0001' && typeof err.message === 'string' && err.message.length > 0) {
+      throw new ErrorAI(`${err.message.charAt(0).toUpperCase()}${err.message.slice(1)}`);
+    }
+    throw e;
+  }
+}
+
+async function aceptarPropuestaEnTransaccion(
+  actorId: string,
+  entrada: RevisarPropuesta,
+): Promise<{ estado: 'aceptada' | 'corregida'; objetoId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await rolCurador(tx, actorId, entrada.workspaceId);

@@ -6,6 +6,7 @@ import {
   evaluarCapacidadAI,
   LIMITE_LLAMADAS_DIA,
   MODELO_FALLBACK,
+  VENTANA_SALUD_PROVEEDOR_MS,
   MODELO_PRIMARIO,
   motivoDeFalloProveedor,
   TARIFA_USD_POR_MTOK,
@@ -54,6 +55,54 @@ describe('estado de la capacidad AI (SYS-21)', () => {
     expect(estado.origenKey).toBe('entorno');
     expect(estado.modelo).toBe(MODELO_PRIMARIO);
     expect(estado.motivo).toBe('');
+  });
+
+  it('la salud del proveedor es un dato APARTE de la capacidad, y no la apaga', () => {
+    // El defecto: ante timeout o 5xx, el estado se derivaba solo de credencial, cupo y
+    // reservas, así que la pantalla decía «disponible» justo después de una operación que
+    // había reportado caída. Prometía sobre un TERCERO algo que este proceso no puede
+    // establecer.
+    const caido = evaluarCapacidadAI({ keyEntorno: 'sk-test', ultimaCaidaHaceMs: 1_000 });
+    expect(caido.proveedorResponde).toBe(false);
+    expect(caido.advertencia).toMatch(/no respondió al último intento/i);
+    expect(caido.advertencia).toMatch(/a mano/i);
+
+    // Y sin embargo la capacidad SIGUE disponible, que es la mitad que importa: hay
+    // credencial y hay presupuesto, que es lo único que este proceso sabe. Apagarla dejaría
+    // al workspace sin forma de averiguar que el proveedor volvió —lo único que lo averigua
+    // es llamarlo—, y ése es el interruptor pegado en «caído» que no puede existir.
+    expect(caido.disponible).toBe(true);
+    expect(caido.motivo).toBe('');
+  });
+
+  it('la caída CADUCA por tiempo, y una respuesta posterior la borra sin purga', () => {
+    const key = { keyEntorno: 'sk-test' };
+    // Justo dentro de la ventana: cuenta. Justo fuera: ya no dice nada del presente, porque
+    // nadie puede saber que un tercero SIGUE caído sin volver a llamarlo.
+    expect(
+      evaluarCapacidadAI({ ...key, ultimaCaidaHaceMs: VENTANA_SALUD_PROVEEDOR_MS })
+        .proveedorResponde,
+    ).toBe(false);
+    expect(
+      evaluarCapacidadAI({ ...key, ultimaCaidaHaceMs: VENTANA_SALUD_PROVEEDOR_MS + 1 })
+        .proveedorResponde,
+    ).toBe(true);
+
+    // `null` es «el último intento SÍ obtuvo respuesta» (o no hay intentos): una llamada
+    // buena posterior borra la caída al instante y sin que nadie limpie nada.
+    const sano = evaluarCapacidadAI({ ...key, ultimaCaidaHaceMs: null });
+    expect(sano.proveedorResponde).toBe(true);
+    expect(sano.advertencia).toBe('');
+    expect(evaluarCapacidadAI(key).proveedorResponde).toBe(true);
+  });
+
+  it('un dato de salud imposible se lee como «responde», nunca como caída', () => {
+    // La dirección conservadora es la CONTRARIA a la del presupuesto: un falso «responde»
+    // cuesta un reintento fallido; un falso «caído» apagaría la capacidad de todos sin que
+    // nadie lo hubiera decidido. Ante la duda, no se pinta rojo.
+    for (const raro of [NaN, Infinity, -Infinity, -1]) {
+      expect(evaluarCapacidadAI({ keyEntorno: 'sk-test', ultimaCaidaHaceMs: raro }).proveedorResponde).toBe(true);
+    }
   });
 
   it('BYOAI: la key del workspace gana a la del entorno', () => {

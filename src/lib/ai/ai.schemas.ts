@@ -349,6 +349,11 @@ export type PanelPropuestas = {
      * acota (y lo que suma el reporte de costos). */
     llamadasHoy: number;
     limiteDiario: number;
+    /** Si el ÚLTIMO intento de este workspace se quedó sin respuesta dentro de la ventana
+     * de salud. No apaga la capacidad: la pantalla avisa y deja reintentar, porque lo único
+     * que averigua si el proveedor volvió es volver a llamarlo. */
+    proveedorResponde: boolean;
+    advertencia: string;
   };
   pendientes: PropuestaEnPanel[];
   decididas: PropuestaEnPanel[];

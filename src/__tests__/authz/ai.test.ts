@@ -6,6 +6,7 @@ import {
   LIMITE_LLAMADAS_DIA,
   MODELO_FALLBACK,
   MODELO_PRIMARIO,
+  VENTANA_SALUD_PROVEEDOR_MS,
 } from '@/lib/ai/ai.degradacion';
 import { PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import {
@@ -1673,6 +1674,129 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     } finally {
       await admin`update workspace set limite_llamadas_ai_dia = null where id = ${ws}`;
       await vaciarRelleno();
+    }
+  });
+
+  it('una caída del proveedor se ve en el panel, sale del libro y la borra la siguiente respuesta', async () => {
+    // Workspace PROPIO: la señal es «el intento más reciente de este workspace», así que
+    // probarla sobre el libro compartido del fichero la ataría al orden en que corren los
+    // demás tests —cualquier llamada suya sería más reciente que una caída antedatada—.
+    // Con un libro entero bajo control, cada aserción dice lo que parece decir.
+    const admin = sqlAdmin();
+    const [w] = await admin`insert into workspace (nombre) values (${marca + ' salud'})
+      returning id`;
+    const wsS = w!.id as string;
+    try {
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsS}, ${leadId}, 'lead', ${`${marca}-salud@test.demo`}, 'lead-boutique')`;
+      const [svcS] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+        values (${wsS}, 'Servicio de salud', ${leadId}) returning id`;
+      const [retoS] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+        values (${wsS}, ${svcS!.id as string}, 'R-S1', 'Reto de salud', 'candidato',
+                'peticion-cliente', ${leadId})
+        returning id`;
+      const retoS_id = retoS!.id as string;
+
+      // Una llamada que no dio contenido utilizable DICE por qué: lo exige el CHECK de
+      // `llamada_ai`, así que el fixture lo respeta en vez de esquivarlo.
+      const anotar = (resultado: string, haceSegundos: number) => admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo, creado_por,
+         creado_en)
+        values (${wsS}, 'C0', ${retoS_id}, ${MODELO_RELLENO}, 'entorno', ${resultado},
+                ${resultado === 'salida-valida' ? '' : 'anotado por la prueba de salud'},
+                ${leadId}, now() - make_interval(secs => ${haceSegundos}))`;
+      const salud = () =>
+        conProveedor(RESPUESTA_CI, async () => {
+          const panel = await panelPropuestas(leadId, wsS);
+          return panel.ai;
+        });
+
+      // Sin ningún intento todavía no hay nada que reportar: «no se sabe» es «responde».
+      expect((await salud()).proveedorResponde).toBe(true);
+
+      // El defecto: el panel decía «disponible» justo después de una operación que reportó
+      // caída, porque el estado se derivaba solo de credencial, cupo y reservas.
+      await anotar('sin-respuesta', 5);
+      const caido = await salud();
+      expect(caido.proveedorResponde).toBe(false);
+      expect(caido.advertencia).toMatch(/no respondió al último intento/i);
+      // Y la capacidad NO se apaga: hay credencial y hay presupuesto, que es lo único que
+      // este proceso puede establecer. Si se apagara, nadie podría averiguar que el
+      // proveedor volvió —lo único que lo averigua es llamarlo—.
+      expect(caido.disponible).toBe(true);
+
+      // Una respuesta POSTERIOR la borra al instante: no hay purga que recordar y el
+      // interruptor no se queda pegado. La observación más reciente es la única que habla
+      // del presente.
+      await anotar('salida-valida', 1);
+      const repuesto = await salud();
+      expect(repuesto.proveedorResponde).toBe(true);
+      expect(repuesto.advertencia).toBe('');
+
+      // Un rechazo del proveedor o una salida fuera de contrato NO son caídas: el tercero
+      // contestó, y de hecho cobró. Pintarlo de rojo por un material que el modelo se niega
+      // a procesar confundiría un problema del material con uno de disponibilidad.
+      await admin`delete from llamada_ai where workspace_id = ${wsS}`;
+      await anotar('rechazo-proveedor', 2);
+      expect((await salud()).proveedorResponde).toBe(true);
+      await admin`delete from llamada_ai where workspace_id = ${wsS}`;
+      await anotar('fuera-de-contrato', 2);
+      expect((await salud()).proveedorResponde).toBe(true);
+
+      // Y CADUCA por tiempo: pasada la ventana, una caída vieja deja de decir nada del
+      // presente —nadie sabe que un tercero SIGUE caído sin volver a llamarlo— y no hace
+      // falta que nadie la limpie.
+      await admin`delete from llamada_ai where workspace_id = ${wsS}`;
+      await anotar('sin-respuesta', Math.round(VENTANA_SALUD_PROVEEDOR_MS / 1000) + 60);
+      expect((await salud()).proveedorResponde).toBe(true);
+      // Justo dentro de la ventana sí cuenta: el corte está donde dice la constante.
+      await admin`delete from llamada_ai where workspace_id = ${wsS}`;
+      await anotar('sin-respuesta', Math.round(VENTANA_SALUD_PROVEEDOR_MS / 1000) - 30);
+      expect((await salud()).proveedorResponde).toBe(false);
+    } finally {
+      await admin`delete from llamada_ai where workspace_id = ${wsS}`;
+      await admin`delete from reto where workspace_id = ${wsS}`;
+      await admin`delete from servicio where workspace_id = ${wsS}`;
+      await admin`delete from miembro where workspace_id = ${wsS}`;
+      await admin`delete from workspace where id = ${wsS}`;
+    }
+  });
+
+  it('la caída de un workspace no apaga el panel del otro', async () => {
+    // El aislamiento no hay que construirlo: `llamada_ai` lleva `workspace_id`, así que la
+    // señal nace por inquilino. Es la razón de derivarla del libro en vez de cachearla en el
+    // proceso, donde este aislamiento habría que decidirlo, escribirlo y probarlo a mano —y
+    // donde un interruptor pegado apagaría la capacidad de todos a la vez.
+    const admin = sqlAdmin();
+    const [otroWs] = await admin`insert into workspace (nombre) values ('Vecino con AI caída')
+      returning id`;
+    const vecino = otroWs!.id as string;
+    try {
+      // El lead de este test NO es miembro del vecino, que es justo el caso: su panel no
+      // puede enterarse de una caída ajena ni siquiera indirectamente.
+      const [svcV] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+        values (${vecino}, 'Servicio del vecino', ${leadId}) returning id`;
+      const [retoV] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+        values (${vecino}, ${svcV!.id as string}, 'R-V1', 'Reto del vecino', 'candidato',
+                'peticion-cliente', ${leadId})
+        returning id`;
+      await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo, creado_por)
+        values (${vecino}, 'C0', ${retoV!.id as string}, ${MODELO_RELLENO}, 'entorno',
+                'sin-respuesta', 'caída del vecino', ${leadId})`;
+
+      await conProveedor(RESPUESTA_CI, async () => {
+        const mio = await panelPropuestas(leadId, ws);
+        expect(mio.ai.proveedorResponde).toBe(true);
+        expect(mio.ai.advertencia).toBe('');
+      });
+    } finally {
+      await admin`delete from llamada_ai where workspace_id = ${vecino}`;
+      await admin`delete from reto where workspace_id = ${vecino}`;
+      await admin`delete from servicio where workspace_id = ${vecino}`;
+      await admin`delete from workspace where id = ${vecino}`;
     }
   });
 

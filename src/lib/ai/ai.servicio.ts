@@ -106,7 +106,12 @@ async function rolCurador(tx: TransactionSql, actorId: string, workspaceId: stri
 async function presupuestoDeHoy(
   tx: TransactionSql,
   workspaceId: string,
-): Promise<{ atendidas: number; reservadas: number; limiteDiario: number }> {
+): Promise<{
+  atendidas: number;
+  reservadas: number;
+  limiteDiario: number;
+  ultimaCaidaHaceMs: number | null;
+}> {
   // El cupo viaja en la MISMA consulta que el gasto, y no en una aparte, porque los dos
   // números deciden juntos: leerlos en dos sentencias es leerlos en dos snapshots, y en el
   // hueco cabe un cupo que cambia entre el «cuánto llevas» y el «cuánto puedes».
@@ -124,7 +129,28 @@ async function presupuestoDeHoy(
         where workspace_id = ${workspaceId} and creado_en > now() - reserva_ai_ventana())::int
         as reservadas,
       (select w.limite_llamadas_ai_dia from workspace w where w.id = ${workspaceId})::int
-        as limite_pactado`;
+        as limite_pactado,
+      -- La salud del proveedor NO se cachea en el proceso: se lee del libro que la propia
+      -- base escribe. La tabla llamada_ai ya anota cada intento con su resultado, su
+      -- workspace y su reloj, así que el aislamiento por inquilino y la caducidad vienen
+      -- dados y no hay interruptor que se pueda quedar pegado en caido.
+      --
+      -- Se mira el intento MAS RECIENTE, no "hubo alguna caida": una llamada buena posterior
+      -- tiene que borrar la caida al instante, porque la ultima observacion es la unica que
+      -- habla del presente. El order by baja por creado_en y desempata por id para que el
+      -- orden sea TOTAL: dos intentos de la misma generacion comparten el reloj de la
+      -- transaccion, y con orden parcial el "ultimo" lo elegiria el planificador.
+      --
+      -- Solo sin-respuesta: un rechazo del proveedor o una salida fuera de contrato son
+      -- llamadas ATENDIDAS, el tercero contesto y de hecho cobro. Contarlas como caida
+      -- pintaria el proveedor de rojo por un material que el modelo se niega a procesar,
+      -- que es un problema del material y no de la disponibilidad.
+      (select case when u.resultado = 'sin-respuesta'
+                then (extract(epoch from (now() - u.creado_en)) * 1000)::bigint end
+         from llamada_ai u
+        where u.workspace_id = ${workspaceId}
+        order by u.creado_en desc, u.id desc
+        limit 1) as caida_hace_ms`;
   // El cupo pactado del workspace manda; la constante del código es el RESPALDO para
   // «no hay cupo pactado» (NULL) y para cualquier valor que no sea un entero positivo, no
   // el valor por defecto de todos. `evaluarCapacidadAI` vuelve a filtrarlo —es función pura
@@ -132,6 +158,11 @@ async function presupuestoDeHoy(
   // correcto; se resuelve aquí para que el número que se decide y el que se muestra en el
   // panel sean el mismo, leído una sola vez.
   const pactado = (fila?.limite_pactado ?? null) as number | null;
+  // `bigint` llega como texto por el driver: se normaliza aquí, y lo que no sea un número
+  // finito viaja como `null` —«no se sabe»— en vez de como un cero, que la ventana leería
+  // como una caída ocurrida hace un instante.
+  const caidaCruda = fila?.caida_hace_ms ?? null;
+  const caida = caidaCruda === null ? null : Number(caidaCruda);
   return {
     atendidas: (fila?.atendidas ?? 0) as number,
     reservadas: (fila?.reservadas ?? 0) as number,
@@ -139,6 +170,7 @@ async function presupuestoDeHoy(
       Number.isInteger(pactado) && (pactado as number) > 0
         ? (pactado as number)
         : LIMITE_LLAMADAS_DIA,
+    ultimaCaidaHaceMs: caida !== null && Number.isFinite(caida) ? caida : null,
   };
 }
 
@@ -156,13 +188,17 @@ async function presupuestoDeHoy(
  */
 async function estadoCapacidad(tx: TransactionSql, workspaceId: string) {
   const { keyWorkspace, keyEntorno } = credencialesAI();
-  const { atendidas, reservadas, limiteDiario } = await presupuestoDeHoy(tx, workspaceId);
+  const { atendidas, reservadas, limiteDiario, ultimaCaidaHaceMs } = await presupuestoDeHoy(
+    tx,
+    workspaceId,
+  );
   const ai = evaluarCapacidadAI({
     keyWorkspace,
     keyEntorno,
     llamadasHoy: atendidas + reservadas,
     limiteDiario,
     unidades: INTENTOS_POR_GENERACION,
+    ultimaCaidaHaceMs,
   });
   return { ...ai, llamadasHoy: atendidas };
 }
@@ -452,6 +488,8 @@ export async function panelPropuestas(
         modelo: ai.modelo,
         llamadasHoy: ai.llamadasHoy,
         limiteDiario: ai.limiteDiario,
+        proveedorResponde: ai.proveedorResponde,
+        advertencia: ai.advertencia,
       },
       pendientes: pendientes.slice(0, PAGINA_PENDIENTES).map(filaDePanel),
       decididas: decididas.slice(0, DECIDIDAS_RECIENTES).map(filaDePanel),
@@ -642,14 +680,23 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       );
     }
 
-    const { atendidas, reservadas, limiteDiario } = await presupuestoDeHoy(tx, entrada.workspaceId);
+    const { atendidas, reservadas, limiteDiario, ultimaCaidaHaceMs } = await presupuestoDeHoy(
+      tx,
+      entrada.workspaceId,
+    );
     const ai = evaluarCapacidadAI({
       keyWorkspace,
       keyEntorno,
       llamadasHoy: atendidas + reservadas,
       limiteDiario,
       unidades,
+      ultimaCaidaHaceMs,
     });
+    // La admisión mira `disponible` —credencial y presupuesto—, y NO `proveedorResponde`, a
+    // propósito y no por descuido. Una caída observada es pasado: lo único que averigua si
+    // el tercero volvió es llamarlo otra vez, así que cerrar la puerta aquí dejaría al
+    // workspace sin forma de comprobarlo hasta que venciera la ventana —el interruptor
+    // pegado, otra vez, con otra cara—. El panel avisa; quien insiste, prueba.
     if (!ai.disponible || !ai.origenKey) throw new ErrorAI(ai.motivo);
     const key = (ai.origenKey === 'workspace' ? keyWorkspace : keyEntorno)!;
 

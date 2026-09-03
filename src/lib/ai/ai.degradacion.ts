@@ -136,7 +136,31 @@ export function formatearCosteUsd(usd: number): string {
  * la capacidad se reporta como no disponible en esta operación. */
 export const TIMEOUT_PROVEEDOR_MS = 25_000;
 
+/**
+ * Cuánto vale lo último que se supo del proveedor (RF-09.11). Pasada esta ventana, una
+ * caída observada deja de decir nada del presente: nadie puede saber que un tercero SIGUE
+ * caído sin volver a llamarlo, así que la señal CADUCA por tiempo y no porque alguien se
+ * acuerde de limpiarla.
+ *
+ * Y de ahí sale la decisión que más importa de este arreglo: la señal NO se cachea en el
+ * proceso. Un estado de salud en memoria es estado compartido entre peticiones —hay varios
+ * workspaces en el mismo proceso y varios procesos sirviendo el mismo workspace—, así que
+ * habría que decidir su ventana, su aislamiento por inquilino y su purga, y un interruptor
+ * pegado en «caído» apagaría la capacidad de todos sin que nadie lo hubiera decidido: peor
+ * que el defecto que arregla. Aquí se DERIVA de `llamada_ai`, que es un hecho que produce la
+ * propia base, lleva `workspace_id` y lleva su reloj — el aislamiento y la caducidad no hay
+ * que construirlos, ya están.
+ */
+export const VENTANA_SALUD_PROVEEDOR_MS = 5 * 60_000;
+
 export type EstadoCapacidadAI = {
+  /**
+   * Hay CREDENCIAL y hay PRESUPUESTO, que es todo lo que este proceso puede establecer por
+   * sí mismo. No dice que el proveedor esté vivo: lo único que lo demuestra es llamarlo, y
+   * prometerlo aquí sería una afirmación que nada ata. La salud observada viaja aparte, en
+   * `proveedorResponde`, justamente para no meter en un mismo booleano un hecho local y una
+   * conjetura sobre un tercero.
+   */
   disponible: boolean;
   /** Vacío si está disponible; si no, el porqué en lenguaje de la UI (nunca un stack). */
   motivo: string;
@@ -146,9 +170,23 @@ export type EstadoCapacidadAI = {
    * lo que el tope acota. */
   llamadasHoy: number;
   limiteDiario: number;
+  /**
+   * Lo último que se supo del proveedor dentro de `VENTANA_SALUD_PROVEEDOR_MS`: `false`
+   * cuando el intento más reciente de este workspace se quedó SIN RESPUESTA (timeout o
+   * 5xx). No apaga la capacidad a propósito —ver `advertencia`—.
+   */
+  proveedorResponde: boolean;
+  /** Vacío si el proveedor responde; si no, qué se observó y qué puede hacerse ahora. */
+  advertencia: string;
 };
 
 const COLA_MANUAL = 'Todo el flujo sigue disponible a mano.';
+
+/** «hace 40 s» / «hace 3 min»: una antigüedad que se lee, no un número de ms en pantalla. */
+function minutosLegibles(ms: number): string {
+  const seg = Math.round(ms / 1000);
+  return seg < 60 ? `${seg} s` : `${Math.round(seg / 60)} min`;
+}
 
 /**
  * Estado de la capacidad AI para un workspace. Nunca lanza: en el peor de los casos
@@ -169,6 +207,13 @@ export function evaluarCapacidadAI(entrada: {
    * y, si cae, respaldo). El panel no pasa ninguna: pregunta por el estado, no pide hueco.
    * Sin esto, «queda 1 y la generación puede gastar 2» pasaba el chequeo. */
   unidades?: number;
+  /**
+   * Hace cuántos ms se observó la última caída del proveedor en este workspace, y solo si
+   * ese fue además el intento MÁS RECIENTE. `null` cuando el último intento sí obtuvo
+   * respuesta —una llamada buena posterior borra la caída al instante, sin purga— o cuando
+   * no hay intentos que mirar.
+   */
+  ultimaCaidaHaceMs?: number | null;
 }): EstadoCapacidadAI {
   const limite =
     Number.isInteger(entrada.limiteDiario) && (entrada.limiteDiario as number) > 0
@@ -184,7 +229,30 @@ export function evaluarCapacidadAI(entrada: {
   const delEntorno = (entrada.keyEntorno ?? '').trim();
   const origenKey: OrigenKey | null = delWorkspace ? 'workspace' : delEntorno ? 'entorno' : null;
 
-  const base = { modelo: MODELO_PRIMARIO, llamadasHoy: usadas, limiteDiario: limite };
+  // La caída solo cuenta si es RECIENTE y si el dato es utilizable: un número negativo,
+  // NaN o infinito no describe ninguna observación, y ante la duda se dice que el proveedor
+  // responde. La dirección conservadora aquí es la contraria a la del presupuesto —un falso
+  // «responde» cuesta un reintento fallido, un falso «caído» apaga la capacidad sin que
+  // nadie lo haya decidido—, y ése es justo el interruptor pegado que no puede existir.
+  const caidaMs = entrada.ultimaCaidaHaceMs;
+  const proveedorResponde = !(
+    typeof caidaMs === 'number' &&
+    Number.isFinite(caidaMs) &&
+    caidaMs >= 0 &&
+    caidaMs <= VENTANA_SALUD_PROVEEDOR_MS
+  );
+  const advertencia = proveedorResponde
+    ? ''
+    : `El proveedor AI no respondió al último intento (hace ${minutosLegibles(caidaMs as number)}). ` +
+      `Puedes reintentar —quizá ya se haya recuperado— o seguir a mano: ${COLA_MANUAL}`;
+
+  const base = {
+    modelo: MODELO_PRIMARIO,
+    llamadasHoy: usadas,
+    limiteDiario: limite,
+    proveedorResponde,
+    advertencia,
+  };
 
   if (!origenKey) {
     return {

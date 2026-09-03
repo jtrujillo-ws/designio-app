@@ -330,7 +330,15 @@ function Aviso({ children }: { children: ReactNode }) {
 function BanderaAI({
   ai,
 }: {
-  ai: { disponible: boolean; motivo: string; modelo: string; llamadasHoy: number; limiteDiario: number };
+  ai: {
+    disponible: boolean;
+    motivo: string;
+    modelo: string;
+    llamadasHoy: number;
+    limiteDiario: number;
+    proveedorResponde: boolean;
+    advertencia: string;
+  };
 }) {
   return (
     <Card
@@ -339,12 +347,16 @@ function BanderaAI({
         display: 'flex',
         flexDirection: 'column',
         gap: 6,
-        borderLeft: `3px solid ${ai.disponible ? 'var(--accent)' : 'var(--warn)'}`,
+        borderLeft: `3px solid ${ai.disponible && ai.proveedorResponde ? 'var(--accent)' : 'var(--warn)'}`,
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
         <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
-          {ai.disponible ? 'Capacidad AI disponible' : 'Capacidad AI apagada'}
+          {!ai.disponible
+            ? 'Capacidad AI apagada'
+            : ai.proveedorResponde
+              ? 'Capacidad AI disponible'
+              : 'Capacidad AI disponible · el proveedor no respondió'}
         </span>
         <Tag>{ai.modelo}</Tag>
         <span style={{ font: '500 11.5px var(--font-mono)', color: 'var(--text-muted)' }}>
@@ -356,6 +368,11 @@ function BanderaAI({
           ? 'La AI propone y cita; el objeto real del dominio solo nace cuando una persona acepta.'
           : ai.motivo}
       </span>
+      {ai.disponible && !ai.proveedorResponde && (
+        <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+          {ai.advertencia}
+        </span>
+      )}
       {!ai.disponible && (
         <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-body)' }}>
           Caminos manuales equivalentes: curar la bandeja de importación a mano y definir los

@@ -1212,14 +1212,27 @@ export async function designVersionCompleta(
         -- rechaza elemento_motivo_citable_guard— y ofrecerla era ofrecer un error. El
         -- picker filtra; quien decide es el guard, y al aprobar se vuelve a mirar porque
         -- entre citar y aprobar la decisión puede haberse ido a revisión.
+        -- Los motivos llevan el MOTIVO por el que no se pueden usar, y no se calcula aquí:
+        -- se INVOCA razonamiento_sin_respaldo, la misma función que usa el guard que
+        -- certifica G5. La primera versión de esta proyección reprodujo del guard la
+        -- comprobación de derechos y se dejó la del estado del insight, así que un enlace
+        -- heredado a un insight propuesto con derechos vivos salía habilitado y el
+        -- rechazo llegaba al certificar. Espejar media regla es peor que no espejarla: la
+        -- pantalla prometía algo que la base no cumple. Ahora no espeja, invoca.
         coalesce((
-          select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo) order by d.decidido_en)
+          select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo,
+                   'sinRespaldo', razonamiento_sin_respaldo_visible(
+                     dv.workspace_id, array[]::uuid[], array[d.id], array[]::uuid[]))
+                 order by d.decidido_en)
           from decision d
           where d.proyecto_id = dv.proyecto_id and d.workspace_id = dv.workspace_id
             and d.estado = 'vigente'
         ), '[]'::jsonb) as decisiones_del_proyecto,
         coalesce((
-          select jsonb_agg(jsonb_build_object('id', i.id, 'titulo', i.titulo) order by i.titulo)
+          select jsonb_agg(jsonb_build_object('id', i.id, 'titulo', i.titulo,
+                   'sinRespaldo', razonamiento_sin_respaldo_visible(
+                     dv.workspace_id, array[i.id], array[]::uuid[], array[]::uuid[]))
+                 order by i.titulo)
           from insight i
           where i.workspace_id = dv.workspace_id and i.estado = 'validado'
         ), '[]'::jsonb) as insights_validados,

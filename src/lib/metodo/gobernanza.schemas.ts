@@ -80,6 +80,20 @@ export type DecisionDeProyecto = {
   estado: 'vigente' | 'en-revision';
   decididoEn: string;
   insights: { id: string; titulo: string }[];
+  /**
+   * Por qué NO se puede citar esta decisión, ya redactado, o `null` si se puede. Sale de
+   * `razonamiento_sin_respaldo`, **la misma función que consulta el guard de suficiencia
+   * antes de levantar**: cubre las cuatro comprobaciones —evidencia citada usable, ninguna
+   * decisión en revisión, insights enlazados `validado`, y toda afirmación no-hipótesis con
+   * al menos una cita usable— sin que esta proyección tenga que enunciar ninguna.
+   *
+   * Estuvo escrito a mano, con las comprobaciones repartidas en dos campos, y así fue como
+   * el selector de la design version —copiado de éste— se quedó con una sola. El estado
+   * VIVO del respaldo es algo que `estado` no cuenta: `estado` habla de reaperturas
+   * (SYS-10) y una decisión perfectamente `vigente` puede trazarse a un insight sin validar
+   * o apoyarse en evidencia cuyos derechos se revocaron.
+   */
+  sinRespaldo: string | null;
 };
 
 /** Los tres estados de gobernanza de un arquetipo (SPEC-04.11). Vive aquí y se importa

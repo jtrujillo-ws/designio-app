@@ -9,7 +9,7 @@ import {
   ventanasCerradas,
   type EntradaDeRegistry,
 } from '@/lib/medicion/medicion.schemas';
-import { InsightSchema } from '@/lib/evidencia/evidencia.schemas';
+import { etiquetaObjetoBloqueado, InsightSchema } from '@/lib/evidencia/evidencia.schemas';
 
 /** Invariantes codificadas en los esquemas (docs/03-invariantes). */
 describe('esquemas del dominio', () => {
@@ -87,6 +87,35 @@ describe('esquemas del dominio', () => {
         citas: [{ evidenciaId: crypto.randomUUID(), fragmento: '…', localizacion: 'p. 41' }],
       }).success,
     ).toBe(true);
+  });
+
+  it('el rótulo de un objeto bloqueado nombra SU dimensión, no siempre los derechos', () => {
+    // SYS-14 obliga a bloquear *explicando* y el criterio de aceptación 3 pide nombrar la
+    // dimensión que FALTA. El picker del checklist ofrece tres clases y no todas se
+    // bloquean por lo mismo: una decisión `en-revision` tras una reapertura (SYS-10) no
+    // tiene nada que ver con los derechos de uso. Con el prefijo fijo salía «sin derechos:
+    // está en revisión…», que manda a reparar donde no hay nada roto.
+    const enRevision =
+      'está en revisión tras una reapertura aguas arriba (SYS-10): revalídala antes de citarla';
+    expect(etiquetaObjetoBloqueado('Atacar la verificación', enRevision)).toBe(
+      `Atacar la verificación — ${enRevision}`,
+    );
+    expect(etiquetaObjetoBloqueado('Atacar la verificación', enRevision)).not.toContain(
+      'sin derechos',
+    );
+
+    // El motivo de la base viaja tal cual: ya es una frase que se lee sola.
+    const pendientes =
+      'derechos pendientes: nadie ha registrado la base (consentimiento o cláusula) que autoriza este uso';
+    expect(etiquetaObjetoBloqueado('Entrevistas', pendientes)).toBe(
+      `Entrevistas — ${pendientes}`,
+    );
+
+    // Y solo cuando NO hay motivo se nombran los derechos: ese null es el pre-chequeo
+    // anti-oráculo de `evidencia_motivo_bloqueo`, que solo se alcanza por esa vía.
+    expect(etiquetaObjetoBloqueado('Entrevistas', null)).toBe(
+      'Entrevistas — sin derechos: faltan derechos de uso para el ámbito cliente',
+    );
   });
 
   it('el outcome review no habilita causalidad por defecto (SYS-24)', () => {

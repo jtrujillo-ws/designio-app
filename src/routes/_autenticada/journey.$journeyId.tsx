@@ -11,7 +11,11 @@ import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { DiagramaMermaid } from '@/components/journey/DiagramaMermaid';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import {
+  etiquetaObjetoBloqueado,
+  ROLES_CURADORES,
+  type EvidenciaCitable,
+} from '@/lib/evidencia/evidencia.schemas';
 import {
   agregarAristaAlJourney,
   agregarNodoAlJourney,
@@ -304,7 +308,12 @@ function BloqueModelo({
   workspaceId: string;
   journey: JourneyCompleto;
   arquetipos: JourneyCompleto['arquetipos'];
-  evidencias: { id: string; titulo: string }[];
+  /** Con su `citable` y su motivo, NO estrechado a {id, titulo}: enlazar evidencia a un
+   * nodo es respaldo —satisface la validación «paso sin evidencia» y se congela en un
+   * snapshot que lee todo el workspace—, así que el guard de la base lo bloquea sin
+   * derechos vigentes para «cliente». Estrechar el tipo aquí perdía el bloqueo por el
+   * camino y el curador se enteraba al fallar la operación. */
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   editable: boolean;
   onCambio: () => Promise<void>;
@@ -534,7 +543,12 @@ function FilaNodo({
   workspaceId: string;
   nodo: NodoDeJourney;
   fases: NodoDeJourney[];
-  evidencias: { id: string; titulo: string }[];
+  /** Con su `citable` y su motivo, NO estrechado a {id, titulo}: enlazar evidencia a un
+   * nodo es respaldo —satisface la validación «paso sin evidencia» y se congela en un
+   * snapshot que lee todo el workspace—, así que el guard de la base lo bloquea sin
+   * derechos vigentes para «cliente». Estrechar el tipo aquí perdía el bloqueo por el
+   * camino y el curador se enteraba al fallar la operación. */
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   editable: boolean;
   onCambio: () => Promise<void>;
@@ -796,9 +810,12 @@ function FilaNodo({
             style={{ minWidth: 260 }}
           >
             <option value="">Evidencia que lo sostiene…</option>
+            {/* Sin derechos vigentes para «cliente» no se enlaza: el guard de la base lo
+                impide, y aquí se dice por qué antes de elegir (SYS-14). Mismo texto que el
+                picker de arquetipos: es la misma regla, no dos parecidas. */}
             {evidencias.map((e) => (
-              <option key={e.id} value={e.id}>
-                {e.titulo}
+              <option key={e.id} value={e.id} disabled={!e.citable}>
+                {e.citable ? e.titulo : etiquetaObjetoBloqueado(e.titulo, e.motivoBloqueo)}
               </option>
             ))}
             {hayMasEvidencias && (

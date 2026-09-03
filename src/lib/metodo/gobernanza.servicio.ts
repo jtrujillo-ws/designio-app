@@ -392,7 +392,18 @@ export async function gobernanzaDeProyecto(
               from decision_insight di
               join insight i on i.id = di.insight_id and i.workspace_id = di.workspace_id
               where di.decision_id = d.id and di.workspace_id = d.workspace_id
-            ), '[]'::jsonb))
+            ), '[]'::jsonb),
+            -- Por qué NO se puede citar esta decisión, o null. NO se reproduce aquí: se
+            -- INVOCA razonamiento_sin_respaldo, la misma función que consulta el guard de
+            -- suficiencia antes de levantar. Este espejo estuvo escrito a mano y con las
+            -- tres comprobaciones repartidas en dos campos, y así fue como el selector de
+            -- la design version —copiado de éste— se quedó con una sola: mientras el
+            -- predicado viva dentro de un guard que lanza excepciones, quien quiera
+            -- mirarlo antes no tiene más remedio que reescribirlo. El motivo viene ya
+            -- redactado y nombra el objeto exacto, que es lo que hay que reparar.
+            'sinRespaldo', razonamiento_sin_respaldo_visible(
+              d.workspace_id, array[]::uuid[], array[d.id], array[]::uuid[]))
+
             order by g.numero, d.decidido_en)
           from decision d
           join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id

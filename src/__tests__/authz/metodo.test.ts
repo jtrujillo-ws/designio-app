@@ -74,6 +74,13 @@ describeAuthz('método: etapas, gates y checklists', () => {
       values (${ws}, ${fuente!.id as string}, 'Evidencia método', '{}'::jsonb, ${leadId})
       returning id`;
     evidenciaId = ev!.id as string;
+    // Citar exige DERECHOS vigentes para el ámbito cliente (SPEC-03, RF-03.10): la
+    // evidencia de este workspace de prueba los tiene concedidos, así que el checklist
+    // puede enlazarla. El caso contrario lo cubre la suite de evidencia profunda.
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaId}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${leadId}, now(), ${leadId})`;
   });
 
   afterAll(async () => {
@@ -85,6 +92,7 @@ describeAuthz('método: etapas, gates y checklists', () => {
       await admin`delete from etapa_instancia where workspace_id = ${ws}`;
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
       await admin`delete from evidencia_segmento where workspace_id = ${ws}`;
+      await admin`delete from derecho_uso where workspace_id = ${ws}`;
       await admin`delete from proyecto where workspace_id = ${ws}`;
       await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
       await admin`delete from reto where workspace_id = ${ws}`;

@@ -68,6 +68,16 @@ export type CitaDeAfirmacion = {
   evidenciaTitulo: string;
   fragmento: string;
   localizacion: string;
+  /**
+   * Si la evidencia citada SIGUE teniendo derechos vigentes para el ámbito cliente. Una
+   * cita nace con ellos —`evidencia_citable_guard` lo exige— pero los derechos se revocan
+   * y caducan, y validar es irreversible: desde `20260902310000` el guard de validación
+   * comprueba vigencia y no existencia, así que la pantalla tiene que mirar lo mismo o
+   * estaría ofreciendo un botón que la base rechaza.
+   */
+  usable: boolean;
+  /** Qué dimensión falta, para nombrarla en vez de decir «bloqueada» (SYS-14). */
+  motivoBloqueo: string | null;
 };
 
 export type AfirmacionDeInsight = {
@@ -93,4 +103,22 @@ export type InsightCompleto = {
   validadoEn: string | null;
   afirmaciones: AfirmacionDeInsight[];
   contradicciones: ContradiccionDeInsight[];
+};
+
+/**
+ * Fila del picker de objetos citables (checklist de un gate, RF-04.5). Un insight validado
+ * es inmutable, pero su respaldo NO: los derechos de la evidencia que lo sostiene se
+ * revocan y caducan, y entonces el gate deja de poder aprobarse citándolo.
+ *
+ * `citable` reproduce ese predicado —el mismo que evalúa el guard de suficiencia al
+ * aprobar— para que la app y la base no digan cosas distintas sobre la misma regla. El
+ * bloqueo REAL sigue viviendo en la base; esto solo lo hace legible antes de elegir, en
+ * vez de después de que el gate lo rechace.
+ */
+export type InsightCitable = {
+  id: string;
+  titulo: string;
+  citable: boolean;
+  /** Por qué NO, nombrando la afirmación que se quedó sin respaldo; null cuando sí. */
+  motivoBloqueo: string | null;
 };

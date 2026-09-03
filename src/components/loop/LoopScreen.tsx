@@ -391,6 +391,9 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
       <Link to="/importacion" style={{ ...item, textDecoration: 'none' }}>
         <span>Bandeja de importación</span>
       </Link>
+      <Link to="/evidencia" style={{ ...item, textDecoration: 'none' }}>
+        <span>Evidencia y derechos de uso</span>
+      </Link>
       <Link to="/insights" style={{ ...item, textDecoration: 'none' }}>
         <span>Insights y citas</span>
       </Link>
@@ -412,6 +415,9 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
       </div>
       <Link to="/personas" style={{ ...item, textDecoration: 'none' }}>
         <span>Personas y permisos</span>
+      </Link>
+      <Link to="/exportacion" style={{ ...item, textDecoration: 'none' }}>
+        <span>Exportación del workspace</span>
       </Link>
       {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para
           los demás roles y, si lo teclean, la RLS de evento_dominio no les da filas. */}

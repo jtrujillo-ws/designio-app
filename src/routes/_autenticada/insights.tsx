@@ -8,7 +8,11 @@ import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import {
+  etiquetaObjetoBloqueado,
+  ROLES_CURADORES,
+  type EvidenciaCitable,
+} from '@/lib/evidencia/evidencia.schemas';
 import {
   afirmarEnInsight,
   anotarContradiccion,
@@ -288,8 +292,11 @@ function FichaInsight({
   onError,
 }: {
   workspaceId: string;
+  /** Con su `citable` y su motivo: citar exige derechos vigentes para el ámbito cliente
+   * (RF-03.10) y la opción bloqueada se muestra deshabilitada CON la razón, nunca
+   * oculta — el bloqueo real lo impone el guard de la base; esto lo hace legible. */
   insight: InsightCompleto;
-  evidencias: { id: string; titulo: string }[];
+  evidencias: EvidenciaCitable[];
   hayMasEvidencias: boolean;
   puedeCurar: boolean;
   onCambio: () => Promise<void>;
@@ -307,10 +314,16 @@ function FichaInsight({
   const [descripcion, setDescripcion] = useState('');
 
   const editable = insight.estado === 'propuesto';
-  // Espejo del guard: solo informa el botón; la exigencia real vive en la base.
-  const listoParaValidar =
-    insight.afirmaciones.length > 0 &&
-    insight.afirmaciones.every((a) => a.esHipotesis || a.citas.length > 0);
+  // Espejo del guard: solo informa el botón; la exigencia real vive en la base. Y desde
+  // 20260902310000 el guard pide que la cita SIRVA, no solo que exista: una cita nace con
+  // derechos vigentes y los derechos se revocan, así que «tiene citas» dejó de ser
+  // condición suficiente. El predicado lo evalúa la base y llega en `usable`: reproducirlo
+  // aquí sería la segunda redacción de la regla.
+  const sinRespaldo = insight.afirmaciones.find(
+    (a) => !a.esHipotesis && !a.citas.some((c) => c.usable),
+  );
+  const listoParaValidar = insight.afirmaciones.length > 0 && sinRespaldo === undefined;
+  const motivoSinRespaldo = sinRespaldo?.citas.find((c) => !c.usable)?.motivoBloqueo ?? null;
 
   async function ejecutar(accion: () => Promise<{ ok: boolean; error?: string }>, fallo: string) {
     setOcupado(true);
@@ -398,9 +411,12 @@ function FichaInsight({
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <Select value={evidenciaId} onChange={(e) => setEvidenciaId(e.target.value)}>
                   <option value="">Evidencia citada…</option>
+                  {/* La cita COPIA el fragmento del original y es lo que después valida
+                      el insight: sin derechos vigentes para el ámbito cliente no se
+                      crea. Deshabilitada CON su motivo, nunca oculta (SYS-14). */}
                   {evidencias.map((e) => (
-                    <option key={e.id} value={e.id}>
-                      {e.titulo}
+                    <option key={e.id} value={e.id} disabled={!e.citable}>
+                      {e.citable ? e.titulo : etiquetaObjetoBloqueado(e.titulo, e.motivoBloqueo)}
                     </option>
                   ))}
                   {hayMasEvidencias && (
@@ -528,6 +544,12 @@ function FichaInsight({
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             <Select value={contraEvidenciaId} onChange={(e) => setContraEvidenciaId(e.target.value)}>
               <option value="">Evidencia que lo contradice…</option>
+              {/* SIN filtro de derechos, y es deliberado: RF-03.9 dice que la
+                  contradicción se registra y se muestra SIEMPRE, jamás bloquea ni se
+                  oculta, y la puede levantar cualquier miembro. Impedir señalar que una
+                  evidencia contradice un insight porque le faltan derechos de PUBLICACIÓN
+                  suprimiría justo el descubrimiento incómodo que la spec protege. Lo que
+                  no puede es salir en el entregable: de eso se encarga la poda. */}
               {evidencias.map((e) => (
                 <option key={e.id} value={e.id}>
                   {e.titulo}
@@ -590,7 +612,11 @@ function FichaInsight({
           </Button>
           {!listoParaValidar && (
             <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
-              Falta al menos una cita en las afirmaciones que no son hipótesis.
+              {sinRespaldo && sinRespaldo.citas.length > 0
+                ? `La afirmación «${sinRespaldo.texto}» se apoya en evidencia sin derechos vigentes${
+                    motivoSinRespaldo ? `: ${motivoSinRespaldo}` : ''
+                  }. Validar es irreversible y un insight validado no admite citas nuevas.`
+                : 'Falta al menos una cita en las afirmaciones que no son hipótesis.'}
             </span>
           )}
         </div>

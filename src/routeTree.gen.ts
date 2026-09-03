@@ -15,6 +15,8 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as AutenticadaAppRouteImport } from './routes/_autenticada/app'
 import { Route as AutenticadaAuditoriaRouteImport } from './routes/_autenticada/auditoria'
 import { Route as AutenticadaDesignVersionsRouteImport } from './routes/_autenticada/design-versions'
+import { Route as AutenticadaEvidenciaRouteImport } from './routes/_autenticada/evidencia'
+import { Route as AutenticadaExportacionRouteImport } from './routes/_autenticada/exportacion'
 import { Route as AutenticadaImportacionRouteImport } from './routes/_autenticada/importacion'
 import { Route as AutenticadaInsightsRouteImport } from './routes/_autenticada/insights'
 import { Route as AutenticadaJourneysRouteImport } from './routes/_autenticada/journeys'
@@ -54,6 +56,16 @@ const AutenticadaDesignVersionsRoute =
     path: '/design-versions',
     getParentRoute: () => AutenticadaRoute,
   } as any)
+const AutenticadaEvidenciaRoute = AutenticadaEvidenciaRouteImport.update({
+  id: '/evidencia',
+  path: '/evidencia',
+  getParentRoute: () => AutenticadaRoute,
+} as any)
+const AutenticadaExportacionRoute = AutenticadaExportacionRouteImport.update({
+  id: '/exportacion',
+  path: '/exportacion',
+  getParentRoute: () => AutenticadaRoute,
+} as any)
 const AutenticadaImportacionRoute = AutenticadaImportacionRouteImport.update({
   id: '/importacion',
   path: '/importacion',
@@ -104,6 +116,8 @@ export interface FileRoutesByFullPath {
   '/app': typeof AutenticadaAppRoute
   '/auditoria': typeof AutenticadaAuditoriaRoute
   '/design-versions': typeof AutenticadaDesignVersionsRoute
+  '/evidencia': typeof AutenticadaEvidenciaRoute
+  '/exportacion': typeof AutenticadaExportacionRoute
   '/importacion': typeof AutenticadaImportacionRoute
   '/insights': typeof AutenticadaInsightsRoute
   '/journeys': typeof AutenticadaJourneysRoute
@@ -119,6 +133,8 @@ export interface FileRoutesByTo {
   '/app': typeof AutenticadaAppRoute
   '/auditoria': typeof AutenticadaAuditoriaRoute
   '/design-versions': typeof AutenticadaDesignVersionsRoute
+  '/evidencia': typeof AutenticadaEvidenciaRoute
+  '/exportacion': typeof AutenticadaExportacionRoute
   '/importacion': typeof AutenticadaImportacionRoute
   '/insights': typeof AutenticadaInsightsRoute
   '/journeys': typeof AutenticadaJourneysRoute
@@ -136,6 +152,8 @@ export interface FileRoutesById {
   '/_autenticada/app': typeof AutenticadaAppRoute
   '/_autenticada/auditoria': typeof AutenticadaAuditoriaRoute
   '/_autenticada/design-versions': typeof AutenticadaDesignVersionsRoute
+  '/_autenticada/evidencia': typeof AutenticadaEvidenciaRoute
+  '/_autenticada/exportacion': typeof AutenticadaExportacionRoute
   '/_autenticada/importacion': typeof AutenticadaImportacionRoute
   '/_autenticada/insights': typeof AutenticadaInsightsRoute
   '/_autenticada/journeys': typeof AutenticadaJourneysRoute
@@ -153,6 +171,8 @@ export interface FileRouteTypes {
     | '/app'
     | '/auditoria'
     | '/design-versions'
+    | '/evidencia'
+    | '/exportacion'
     | '/importacion'
     | '/insights'
     | '/journeys'
@@ -168,6 +188,8 @@ export interface FileRouteTypes {
     | '/app'
     | '/auditoria'
     | '/design-versions'
+    | '/evidencia'
+    | '/exportacion'
     | '/importacion'
     | '/insights'
     | '/journeys'
@@ -184,6 +206,8 @@ export interface FileRouteTypes {
     | '/_autenticada/app'
     | '/_autenticada/auditoria'
     | '/_autenticada/design-versions'
+    | '/_autenticada/evidencia'
+    | '/_autenticada/exportacion'
     | '/_autenticada/importacion'
     | '/_autenticada/insights'
     | '/_autenticada/journeys'
@@ -243,6 +267,20 @@ declare module '@tanstack/react-router' {
       path: '/design-versions'
       fullPath: '/design-versions'
       preLoaderRoute: typeof AutenticadaDesignVersionsRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
+    '/_autenticada/evidencia': {
+      id: '/_autenticada/evidencia'
+      path: '/evidencia'
+      fullPath: '/evidencia'
+      preLoaderRoute: typeof AutenticadaEvidenciaRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
+    '/_autenticada/exportacion': {
+      id: '/_autenticada/exportacion'
+      path: '/exportacion'
+      fullPath: '/exportacion'
+      preLoaderRoute: typeof AutenticadaExportacionRouteImport
       parentRoute: typeof AutenticadaRoute
     }
     '/_autenticada/importacion': {
@@ -308,6 +346,8 @@ interface AutenticadaRouteChildren {
   AutenticadaAppRoute: typeof AutenticadaAppRoute
   AutenticadaAuditoriaRoute: typeof AutenticadaAuditoriaRoute
   AutenticadaDesignVersionsRoute: typeof AutenticadaDesignVersionsRoute
+  AutenticadaEvidenciaRoute: typeof AutenticadaEvidenciaRoute
+  AutenticadaExportacionRoute: typeof AutenticadaExportacionRoute
   AutenticadaImportacionRoute: typeof AutenticadaImportacionRoute
   AutenticadaInsightsRoute: typeof AutenticadaInsightsRoute
   AutenticadaJourneysRoute: typeof AutenticadaJourneysRoute
@@ -321,6 +361,8 @@ const AutenticadaRouteChildren: AutenticadaRouteChildren = {
   AutenticadaAppRoute: AutenticadaAppRoute,
   AutenticadaAuditoriaRoute: AutenticadaAuditoriaRoute,
   AutenticadaDesignVersionsRoute: AutenticadaDesignVersionsRoute,
+  AutenticadaEvidenciaRoute: AutenticadaEvidenciaRoute,
+  AutenticadaExportacionRoute: AutenticadaExportacionRoute,
   AutenticadaImportacionRoute: AutenticadaImportacionRoute,
   AutenticadaInsightsRoute: AutenticadaInsightsRoute,
   AutenticadaJourneysRoute: AutenticadaJourneysRoute,

@@ -111,6 +111,411 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
 }
 
 /**
+ * Evidencia profunda del ejemplo §19.1 (SPEC-03): el estudio CX y el funnel del banco,
+ * curados, con su original adjunto y sus DERECHOS resueltos — y una entrevista sin
+ * consentimiento, que es el caso que la spec pide poder demostrar: existe, se ve, y no
+ * se puede citar ni exportar como entregable hasta que alguien conceda los derechos.
+ *
+ * El seed corre como owner (sin contexto RLS) y por eso escribe la evidencia directamente
+ * en vez de pasar por la curaduría; los items quedan marcados como aprobados igual que
+ * lo haría la app, para que la bandeja cuente la misma historia.
+ * Idempotente por su MARCADOR EN `sembrado_registro`, no por lo que encuentre en las
+ * tablas de producto. La señal ha fallado ya dos veces por el mismo motivo, y las dos
+ * enseñan la misma frase con distinta letra:
+ *
+ *  1. Fue «hay algún `derecho_uso` en el workspace», y eso la ataba a un dato que otras
+ *     funciones también producen: en cuanto `sembrarCadena` empezó a crear los derechos
+ *     de sus dos evidencias —y en el camino de upgrade corre ANTES que ésta—, la señal se
+ *     activaba sola y el material de la bandeja no se sembraba nunca.
+ *  2. Fue «hay algún `item_importacion` en el workspace», que es más estrecho pero sigue
+ *     siendo una tabla DE PRODUCTO: cualquiera puede dar de alta material en la bandeja
+ *     de un Banco Andino ya existente, y desde ese momento esta función concluye que sus
+ *     tres registros ya están y los salta PARA SIEMPRE. Nadie ha borrado nada; el demo
+ *     simplemente nunca llega, y no hay forma de distinguirlo de que sí llegó.
+ *
+ * El arreglo es el mismo que el de `sembrarCadena`, y por eso lo comparte en vez de
+ * copiarlo: la procedencia del sembrado no la deduce el seed de la forma de la base, la
+ * ESCRIBE donde el rol de aplicación no llega. `sembrado_registro` no tiene política ni
+ * grant de escritura para `designio_app`, así que «existe el marcador» solo puede haberlo
+ * puesto una corrida del seed.
+ *
+ * Con una salvedad que conviene decir en vez de dejar implícita, porque esta función corre
+ * también en el camino de UPGRADE sobre un Banco Andino ya existente: las bases sembradas
+ * por la versión anterior tienen el material y no tienen marcador, y sembrar otra vez ahí
+ * lo DUPLICA. Así que la guarda son dos preguntas —el marcador primero, y sólo si falta,
+ * la presencia de los registros propios de esta función por su título exacto— y no una.
+ * La segunda es la concesión al pasado y se apaga sola; el detalle de por qué emparejar
+ * por título es admisible aquí y no en `repararDerechosDeCadena` está junto a ella.
+ */
+const ARCHIVO_DEMO = `Estudio CX — apertura de cuenta nomina (extracto)
+
+Hallazgo 1: el 62% abandona en el paso de verificacion de identidad.
+Hallazgo 2: el tiempo medio hasta cuenta operativa es de 5 dias.
+Fuente: panel de 240 solicitudes, julio 2026.
+`;
+
+async function sembrarEvidenciaProfunda(
+  tx: TransactionSql,
+  wsId: string,
+  luciaId: string,
+): Promise<boolean> {
+  const sembrados: { itemId: string; evidenciaId: string }[] = [];
+  const material = [
+    {
+      titulo: 'Estudio CX apertura de cuenta (PDF del proveedor)',
+      tipo: 'documento',
+      referencia: 'carpeta compartida / CX-2026-Q3',
+      contenido: ARCHIVO_DEMO,
+      resumen: 'Línea base del abandono: 62% en verificación de identidad',
+      esEstadoActual: true,
+      recoleccion: 'Estudio CX encargado al proveedor externo',
+      derivada: true,
+      confianza: 'alta',
+      consentimiento: true,
+      confidencialidad: 'cliente',
+      // Derechos ACORDADOS (§19.1): citable y exportable.
+      derechos: {
+        estado: 'concedido',
+        ambito: 'cliente',
+        base: 'Cláusula 7 del contrato de servicios: uso interno y en entregables del workspace',
+      },
+      conArchivo: true,
+    },
+    {
+      titulo: 'Funnel de apertura Q2 (hoja de cálculo)',
+      tipo: 'dataset',
+      referencia: 'analítica / funnel-apertura-q2',
+      contenido: 'Paso 1: 100% → Paso 2: 91% → Paso 3: 74% → Paso 4: 38%',
+      resumen: 'Confirma el punto de fuga en el paso 4',
+      esEstadoActual: true,
+      recoleccion: 'Extracción de la analítica del canal digital',
+      derivada: true,
+      confianza: 'alta',
+      consentimiento: true,
+      confidencialidad: 'cliente',
+      derechos: {
+        estado: 'concedido',
+        ambito: 'cliente',
+        base: 'Dato propio del cliente, sin datos personales identificables',
+      },
+      conArchivo: false,
+    },
+    {
+      titulo: 'Entrevista con solicitante que abandonó (grabación)',
+      tipo: 'entrevista',
+      referencia: 'grabaciones / E-014',
+      contenido:
+        'Dice que se detuvo al pedirle una foto del documento por ambas caras y no entendió si podía retomar después.',
+      resumen: 'Explica el abandono desde la vivencia del solicitante',
+      esEstadoActual: false,
+      recoleccion: 'Entrevista 1:1 remota de 25 minutos',
+      derivada: false,
+      confianza: 'media',
+      consentimiento: false,
+      confidencialidad: 'restringida',
+      // Sin consentimiento registrado: derechos PENDIENTES. Es el criterio de
+      // aceptación 3 de SPEC-03, sembrado para poder verlo en la demo.
+      derechos: null,
+      conArchivo: false,
+    },
+  ] as const;
+
+  // ── ¿Ya está sembrado? Dos preguntas, y ninguna es «¿hay algo en la bandeja?» ──
+  const [marca] = await tx`select 1 from sembrado_registro
+    where workspace_id = ${wsId} and clave = ${CLAVE_EVIDENCIA_PROFUNDA}`;
+  if (marca) return false;
+
+  // Sin marcador quedan las bases sembradas por una versión anterior, que sí tienen este
+  // material y no tienen cómo acreditarlo. Para ésas la pregunta se hace sobre LOS
+  // REGISTROS DE ESTA FUNCIÓN —sus títulos exactos, derivados del mismo array que los
+  // crea y no de una lista paralela que se desincronice—, no sobre la tabla entera.
+  //
+  // Emparejar por título está proscrito en `repararDerechosDeCadena` y aquí no lo está, y
+  // la diferencia importa: allí decide a quién se le CONCEDEN derechos, así que un acierto
+  // falso regala permisos sobre material ajeno. Aquí solo decide si se ESCRIBE material de
+  // demo, y el peor acierto falso es no añadirlo. La dirección conservadora es la contraria
+  // en cada caso, y por eso la respuesta también.
+  //
+  // Esta rama se apaga sola: en cuanto una corrida siembra deja marcador, y desde ahí la
+  // pregunta vuelve a ser exacta. NO se le escribe marcador a las bases viejas a propósito
+  // —sellar en nombre de una corrida que no consta es justo lo que este registro existe
+  // para impedir—, así que sigue costando una consulta y diciendo la verdad.
+  const heredado = await tx`select 1 from item_importacion
+    where workspace_id = ${wsId} and titulo = any(${material.map((m) => m.titulo)})
+    limit 1`;
+  if (heredado.length > 0) return false;
+
+  for (const m of material) {
+    const [item] = await tx`insert into item_importacion
+      (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+      values (${wsId}, ${m.titulo}, ${m.contenido}, ${m.tipo}, ${m.referencia}, ${luciaId})
+      returning id`;
+    const itemId = item!.id as string;
+
+    if (m.conArchivo) {
+      await tx`insert into archivo_importado
+        (workspace_id, item_id, nombre, tipo_mime, contenido, creado_por)
+        values (${wsId}, ${itemId}, 'estudio-cx-extracto.txt', 'text/plain',
+                ${Buffer.from(ARCHIVO_DEMO, 'utf-8')}, ${luciaId})`;
+    }
+
+    const [fuente] = await tx`insert into fuente (workspace_id, tipo, titulo, referencia, creado_por)
+      values (${wsId}, ${m.tipo}, ${m.titulo}, ${m.referencia}, ${luciaId}) returning id`;
+
+    const dimensiones = {
+      proveniencia: { tipoFuente: m.tipo, fecha: '2026-07-15', localizacion: m.referencia },
+      metodo: { recoleccion: m.recoleccion, derivada: m.derivada, segmentoIds: [] },
+      calidad: { confianza: m.confianza, corroboraIds: [], contradiceIds: [] },
+      derechos: { consentimiento: m.consentimiento, confidencialidad: m.confidencialidad },
+      lineage: null,
+    };
+
+    const [evidencia] = await tx`insert into evidencia
+      (workspace_id, fuente_id, titulo, resumen, dimensiones, es_estado_actual, creado_por)
+      values (${wsId}, ${fuente!.id as string}, ${m.titulo}, ${m.resumen},
+              ${tx.json(dimensiones)}, ${m.esEstadoActual}, ${luciaId})
+      returning id`;
+    const evidenciaId = evidencia!.id as string;
+
+    // Toda evidencia nace con su registro de derechos, aunque sea pendiente.
+    if (m.derechos) {
+      await tx`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsId}, ${evidenciaId}, ${m.derechos.estado}, ${m.derechos.ambito},
+                ${m.derechos.base}, ${luciaId}, now(), ${luciaId})`;
+    } else {
+      await tx`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+        values (${wsId}, ${evidenciaId}, ${luciaId})`;
+    }
+
+    await tx`update item_importacion
+      set estado = 'aprobado', decidido_por = ${luciaId}, decidido_en = now(),
+          evidencia_id = ${evidenciaId}
+      where id = ${itemId}`;
+
+    await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
+      (${wsId}, 'EvidenciaCurada',
+       ${tx.json({ itemId, evidenciaId, esEstadoActual: m.esEstadoActual })},
+       ${luciaId}, 'lead-boutique')`;
+    sembrados.push({ itemId, evidenciaId });
+  }
+  // La constancia de ESTA corrida, donde la aplicación no escribe. Lleva los ids además de
+  // la clave: hoy la guarda solo pregunta si la fila existe, pero un marcador que no dice
+  // QUÉ creó obliga a la siguiente reparación a adivinarlo, que es exactamente el defecto
+  // que `repararDerechosDeCadena` existe para no repetir.
+  await tx`insert into sembrado_registro (workspace_id, clave, payload)
+    values (${wsId}, ${CLAVE_EVIDENCIA_PROFUNDA}, ${tx.json({ sembrados })})
+    on conflict (workspace_id, clave) do nothing`;
+  return true;
+}
+
+/**
+ * La BASE documental de cada derecho, atada al PAPEL que esa evidencia cumple en la
+ * cadena de demo (la que se cita y la que sostiene el arquetipo), no a su título. El
+ * título es texto que cualquiera puede repetir; el papel sale de las relaciones.
+ */
+const BASE_DERECHO_CITADA =
+  'Cláusula 7 del contrato de servicios: analítica agregada, sin datos personales';
+const BASE_DERECHO_ARQUETIPO =
+  'Consentimiento informado firmado por los seis asesores entrevistados';
+
+/**
+ * Concede los derechos (ámbito cliente) de la evidencia de la cadena de demo, IDENTIFICADA
+ * POR ID. Quien llama tiene que haber acreditado antes que esos ids son de la cadena.
+ *
+ * Por qué concedidos y no pendientes: estas dos evidencias son justamente las que sostienen
+ * la cadena —una está citada en el insight validado que respalda la decisión de G1, y citar
+ * exige derechos vigentes; la otra apoya el arquetipo confirmado—. Dejarlas pendientes deja
+ * el demo contradiciéndose: una cita que hoy el propio producto no dejaría crear. El caso
+ * «bloqueada a propósito» ya está sembrado y vive donde le toca, en la evidencia sin
+ * consentimiento de sembrarEvidenciaProfunda.
+ *
+ * Por qué hace falta ponerlos a mano: el seed corre como PROPIETARIO, así que el
+ * pre-chequeo anti-oráculo de `evidencia_con_derechos_guard` sale antes y no comprueba
+ * nada. El guard se salta la comprobación, no la regla.
+ *
+ * Solo toca lo que está en 'pendiente'. Si un operador denegó estos derechos a mano —o los
+ * concedió con otro ámbito— el seed NO le pisa la decisión: repara el estado fail-closed que
+ * dejó el backfill, no cualquier estado. Y `pendiente` significa exactamente «nadie ha
+ * decidido todavía»: la transición nunca vuelve a ese estado, solo se nace en él.
+ */
+async function concederDerechosDeCadena(
+  tx: TransactionSql,
+  wsId: string,
+  luciaId: string,
+  filas: readonly { evidenciaId: string; base: string }[],
+): Promise<void> {
+  for (const { evidenciaId, base } of filas) {
+    // Falta la fila entera (base sembrada por una versión sin derechos y nunca migrada).
+    await tx`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      select ${wsId}, ${evidenciaId}, 'concedido', 'cliente', ${base}, ${luciaId}, now(), ${luciaId}
+      where not exists (select 1 from derecho_uso d where d.evidencia_id = ${evidenciaId})`;
+    // O existe en 'pendiente' porque la puso el backfill de la migración.
+    await tx`update derecho_uso d
+      set estado = 'concedido', ambito = 'cliente', base = ${base},
+          decidido_por = ${luciaId}, decidido_en = now()
+      where d.evidencia_id = ${evidenciaId} and d.workspace_id = ${wsId}
+        and d.estado = 'pendiente'`;
+  }
+}
+
+/**
+ * La clave con la que el seed registra la cadena de demo en `sembrado_registro`, y el tipo
+ * de evento del aviso que emite cuando decide no tocar nada. Viven aquí, y no sueltos
+ * donde se usan, porque la reparación los LEE: son el contrato entre dos corridas
+ * distintas del seed.
+ */
+const CLAVE_CADENA_SEMBRADA = 'cadena-demo';
+/** La clave con la que el seed registra el material de bandeja de §19.1. */
+const CLAVE_EVIDENCIA_PROFUNDA = 'evidencia-profunda-demo';
+const AVISO_CADENA_SIN_PROCEDENCIA = 'DerechosDeCadenaSinRepararPorProcedencia';
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Deja constancia de la reparación que NO se hizo, nombrando lo que habría tocado.
+ *
+ * «No concedo» a secas sería un silencio, y quien se encuentre el demo con la evidencia
+ * bloqueada necesita saber por qué y sobre qué. El evento nombra la evidencia y el PAPEL
+ * que cumple en el grafo —dato que sale de las relaciones, no de un título— y a propósito
+ * NO sugiere una base documental: la base es lo que justifica el permiso, y la escribe
+ * quien lo concede. Un seed que redactara la justificación estaría haciendo otra vez, por
+ * la puerta de al lado, lo que este arreglo existe para impedir.
+ *
+ * Solo nombra lo que la reparación habría podido tocar: evidencia sin fila de derechos o
+ * con la fila en 'pendiente'. Lo ya decidido —concedido o denegado— no entra: nadie iba a
+ * pisarlo, así que nombrarlo sería ruido.
+ *
+ * Idempotente POR CONTENIDO: se reemite solo si cambia el conjunto afectado, para que
+ * re-sembrar diez veces no llene la auditoría con el mismo aviso y para que un cambio real
+ * sí quede fechado. El orden del array es TOTAL (`order by e.id, u.papel`, no solo por id)
+ * porque la igualdad de jsonb sí distingue el orden dentro de un array, y una misma
+ * evidencia puede salir en las dos ramas: ordenar solo por id dejaría ese par empatado y el
+ * aviso se reemitiría al azar.
+ */
+async function declinarReparacionDeCadena(tx: TransactionSql, wsId: string): Promise<void> {
+  const alcanzables = await tx`
+    with citada as (
+      select distinct c.evidencia_id as ev, 'citada'::text as papel
+      from proyecto p
+      join gate_instancia g on g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+        and g.numero = 1
+      join decision d on d.gate_id = g.id and d.workspace_id = g.workspace_id
+      join decision_insight di on di.decision_id = d.id and di.workspace_id = d.workspace_id
+      join afirmacion a on a.insight_id = di.insight_id and a.workspace_id = di.workspace_id
+      join cita c on c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
+      where p.workspace_id = ${wsId} and p.codigo = 'P-01'
+    ), del_arquetipo as (
+      select distinct ae.evidencia_id as ev, 'arquetipo'::text as papel
+      from proyecto p
+      join arquetipo arq on arq.reto_id = p.reto_id and arq.workspace_id = p.workspace_id
+      join arquetipo_evidencia ae on ae.arquetipo_id = arq.id
+        and ae.workspace_id = arq.workspace_id
+      where p.workspace_id = ${wsId} and p.codigo = 'P-01'
+    )
+    select e.id, e.titulo, u.papel
+    from (select * from citada union all select * from del_arquetipo) u
+    join evidencia e on e.id = u.ev and e.workspace_id = ${wsId}
+    left join derecho_uso d on d.evidencia_id = e.id and d.workspace_id = ${wsId}
+    where d.id is null or d.estado = 'pendiente'
+    order by e.id, u.papel`;
+  if (alcanzables.length === 0) return;
+
+  const payload = {
+    motivo:
+      'la cadena de demo de este workspace no la sembró este seed (no hay registro de procedencia), así que no se concede nada: la evidencia alcanzable puede ser material de un usuario y firmarle derechos en nombre de Lucía sería inventar un consentimiento',
+    remedio:
+      'si estos derechos proceden de verdad, concédelos a mano desde la pantalla de evidencia, con su base documental y su responsable',
+    evidencias: alcanzables.map((f) => ({
+      evidenciaId: f.id as string,
+      titulo: f.titulo as string,
+      papel: f.papel as string,
+    })),
+  };
+  await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    select ${wsId}, ${AVISO_CADENA_SIN_PROCEDENCIA}, ${tx.json(payload)}, null, null
+    where not exists (select 1 from evento_dominio e
+      where e.workspace_id = ${wsId} and e.tipo = ${AVISO_CADENA_SIN_PROCEDENCIA}
+        and e.payload = ${tx.json(payload)})`;
+}
+
+/**
+ * Repara los derechos de una base sembrada por una versión ANTERIOR, donde la cadena ya
+ * existe pero el backfill de 20260902140000 dejó sus derechos en 'pendiente'.
+ *
+ * Solo repara LO QUE ESTE SEED REGISTRÓ HABER CREADO. La versión anterior acreditaba la
+ * procedencia recorriendo relaciones desde `proyecto.codigo = 'P-01'` y concedía si el
+ * camino devolvía exactamente una evidencia. Emparejar por relaciones es mejor que por
+ * título, pero seguía siendo una INFERENCIA sobre la FORMA de la base, y hay un caso que
+ * la rompe entera: si la cadena de demo nunca se sembró —porque el workspace ya tenía un
+ * insight propio y `sembrarCadena` se saltó— pero alguien construyó su decisión sobre el
+ * G1 de P-01 citando SU evidencia, el camino devuelve exactamente una: la suya. Y el seed
+ * le firmaba derechos de ámbito CLIENTE en nombre de Lucía, que nunca los concedió. La
+ * forma de la base no dice quién escribió sus filas.
+ *
+ * Así que la procedencia ya no se deduce: se LEE. `sembrarCadena` deja constancia de lo
+ * que crea —una fila de `sembrado_registro` con los ids de sus dos evidencias— y la
+ * reparación concede solo a esos ids. Sin ese registro no hay nada que acreditar y NO SE
+ * CONCEDE NADA: fallar cerrado, no adoptar. En su lugar queda un evento que nombra lo que
+ * habría tocado, para que un operador lo conceda a mano si de verdad procede — que es como
+ * debe entrar un consentimiento en un producto cuya tesis es que conceder el uso es un
+ * acto propio, con su base documental y su responsable.
+ *
+ * Y el registro SÍ es un sello, que es lo que le faltaba a la versión anterior. Vivió un
+ * rato en `evento_dominio`, y ahí no lo era: la política `evento_insert` autoriza a
+ * CUALQUIER miembro a escribir eventos, mientras que conceder derechos está reservado a
+ * lead-boutique y admin-cliente. Un stakeholder podía escribir su propio registro de
+ * procedencia y esperar a la siguiente corrida del seed para cobrar derechos de ámbito
+ * cliente a nombre de Lucía: una escalada de privilegio con dos pasos y una espera. Ahora
+ * vive en `sembrado_registro`, que el rol de aplicación puede leer y NO puede escribir —
+ * sin política ni grant de insert/update/delete—, así que la ausencia de otra mano es
+ * estructural y no hay que razonar sobre quién mentiría.
+ *
+ * La concesión sigue acotada además por lo de siempre: solo evidencia DE ESTE workspace y
+ * solo mientras su derecho siga en 'pendiente' (lo decidido a mano nunca se pisa).
+ */
+async function repararDerechosDeCadena(
+  tx: TransactionSql,
+  wsId: string,
+  luciaId: string,
+): Promise<void> {
+  const [marca] = await tx`select payload from sembrado_registro
+    where workspace_id = ${wsId} and clave = ${CLAVE_CADENA_SEMBRADA}`;
+  const registro = (marca?.payload ?? {}) as {
+    evidenciaCitadaId?: unknown;
+    evidenciaArquetipoId?: unknown;
+  };
+  // La forma de uuid se comprueba ANTES de consultar: el payload es jsonb libre y un
+  // `id in ('no-soy-uuid')` no devuelve cero filas, revienta la sentencia y con ella el
+  // seed entero. Fallar cerrado aquí significa declinar, no caerse.
+  const declarados = [
+    { evidenciaId: registro.evidenciaCitadaId, base: BASE_DERECHO_CITADA },
+    { evidenciaId: registro.evidenciaArquetipoId, base: BASE_DERECHO_ARQUETIPO },
+  ].filter(
+    (f): f is { evidenciaId: string; base: string } =>
+      typeof f.evidenciaId === 'string' && UUID.test(f.evidenciaId),
+  );
+  if (declarados.length === 0) {
+    await declinarReparacionDeCadena(tx, wsId);
+    return;
+  }
+
+  // El registro nombra ids, y que esos ids sean de ESTE workspace no se da por supuesto.
+  // No porque quepa una falsificación —ya no cabe— sino porque un payload es dato libre y
+  // una pieza futura del seed podría escribir ahí un id equivocado; el filtro cuesta una
+  // consulta y evita que un registro torcido alcance material de otro tenant.
+  const propias = await tx`select id from evidencia
+    where workspace_id = ${wsId} and id in ${tx(declarados.map((f) => f.evidenciaId))}`;
+  const enElWorkspace = new Set(propias.map((f) => f.id as string));
+  const acreditados = declarados.filter((f) => enElWorkspace.has(f.evidenciaId));
+  if (acreditados.length === 0) {
+    await declinarReparacionDeCadena(tx, wsId);
+    return;
+  }
+  await concederDerechosDeCadena(tx, wsId, luciaId, acreditados);
+}
+
+/**
  * Journey as-is del servicio (SPEC-05): un grafo pequeño pero completo — dos fases con
  * sus pasos, el canal donde ocurren, el sistema que los sostiene y la fricción que duele.
  *
@@ -489,10 +894,26 @@ async function sembrarEntrega(
 /** Cadena de razonamiento de demo (SPEC-03/04): evidencia curada → insight validado
  * con citas y una contradicción a la vista → decisión aprobada en G1 y un arquetipo
  * confirmado. Es lo que hace demostrable el grafo sin pasar por toda la curaduría.
- * Idempotente: la señal es el insight del workspace. */
+ * Idempotente: la señal es el insight del workspace — pero los DERECHOS de la cadena se
+ * atienden en las dos ramas, porque una base sembrada por una versión anterior ya tiene
+ * el insight y aun así necesita repararlos. Al crearla, deja constancia de qué evidencia
+ * es suya: sin esa constancia la reparación no tiene forma honesta de saberlo. */
 async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string): Promise<void> {
   const yaHay = await tx`select 1 from insight where workspace_id = ${wsId}`;
-  if (yaHay.length > 0) return;
+  if (yaHay.length > 0) {
+    // Aquí NO se sabe que la cadena esté sembrada: se sabe que el workspace tiene algún
+    // insight, que es la señal de idempotencia — y un insight lo crea también un usuario.
+    // La distinción importa, porque el caso interesante es el otro: una base sembrada por
+    // una versión ANTERIOR a que esta función creara los derechos de sus dos evidencias.
+    // Ahí el backfill de la migración 140000 les puso una fila 'pendiente' (fail-closed,
+    // correcto en general) y tras el upgrade el demo se contradice: un insight validado
+    // cuya cita apunta a evidencia bloqueada, una cita que hoy el propio producto no
+    // dejaría crear. Reparar eso es legítimo; adivinar CUÁL evidencia reparar, no. Por eso
+    // la reparación lee el registro de procedencia en vez de deducirlo de la forma de la
+    // base, y sin registro no concede nada.
+    await repararDerechosDeCadena(tx, wsId, luciaId);
+    return;
+  }
 
   const [fuente] = await tx`insert into fuente (workspace_id, tipo, titulo, referencia, creado_por)
     values (${wsId}, 'documento', 'Estudio CX apertura de cuenta 2026',
@@ -523,6 +944,23 @@ async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string):
     returning id`;
   const evDigital = ev1!.id as string;
   const evSucursal = ev2!.id as string;
+  // Alta: los ids acaban de salir del INSERT, así que la procedencia es certeza y no hay
+  // nada que emparejar. Emparejar por título aquí era, además de peligroso, innecesario.
+  await concederDerechosDeCadena(tx, wsId, luciaId, [
+    { evidenciaId: evDigital, base: BASE_DERECHO_CITADA },
+    { evidenciaId: evSucursal, base: BASE_DERECHO_ARQUETIPO },
+  ]);
+  // Y queda CONSTANCIA de qué evidencia creó ESTA corrida, en `sembrado_registro`, que el
+  // rol de aplicación puede leer y NO puede escribir. No es decoración: es lo único que una
+  // corrida futura puede leer para reparar sin adivinar. Deducir la procedencia de la FORMA
+  // de la base —«el único camino desde P-01 llega aquí»— adopta lo que encuentre, y lo que
+  // encuentre puede ser material de un usuario. Ver `repararDerechosDeCadena`, que lo lee.
+  await tx`insert into sembrado_registro (workspace_id, clave, payload)
+    values (${wsId}, ${CLAVE_CADENA_SEMBRADA}, ${tx.json({
+      evidenciaCitadaId: evDigital,
+      evidenciaArquetipoId: evSucursal,
+    })})
+    on conflict (workspace_id, clave) do nothing`;
 
   const [ins] = await tx`insert into insight (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
     values (${wsId}, 'La verificación de identidad digital concentra el abandono',
@@ -651,13 +1089,22 @@ async function main() {
     if (lucia) {
       segundoSembrado = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
     }
+    // Upgrade de bases sembradas antes de los derechos de uso (SPEC-03 profunda): la
+    // función se auto-guarda por la presencia de derechos en el workspace.
+    let evidenciaSembrada = false;
+    if (lucia) {
+      evidenciaSembrada = await sql.begin((tx) =>
+        sembrarEvidenciaProfunda(tx, wsId, lucia.id as string),
+      );
+    }
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
         (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
         (metodoSembrado ? '; método de P-01 sembrado' : '') +
         (journeySembrado ? '; journey as-is sembrado' : '') +
         (entregaSembrada ? '; DV-1 con RL-1/RL-2 y ES-1 sembrada' : '') +
-        (segundoSembrado ? '; Clínica del Valle sembrada' : ''),
+        (segundoSembrado ? '; Clínica del Valle sembrada' : '') +
+        (evidenciaSembrada ? '; evidencia §19.1 con derechos de uso sembrada' : ''),
     );
     return;
   }
@@ -686,6 +1133,7 @@ async function main() {
 
     await sembrarArbol(tx, wsId, luciaId);
     await sembrarMetodo(tx, wsId, luciaId);
+    await sembrarEvidenciaProfunda(tx, wsId, luciaId);
     await sembrarCadena(tx, wsId, luciaId);
     await sembrarJourney(tx, wsId, luciaId);
     await sembrarSegundoWorkspace(tx, luciaId);
@@ -698,7 +1146,7 @@ async function main() {
   // producto no puede producir y que el guard diferido rechaza.
   await sembrarEntrega(sql, creado.wsId, creado.luciaId);
   console.log(
-    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
+    `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );
 }
 

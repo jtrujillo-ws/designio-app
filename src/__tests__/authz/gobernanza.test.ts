@@ -74,6 +74,13 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
       values (${ws}, ${fuente!.id as string}, 'Diario de campo', '{}'::jsonb, ${leadId})
       returning id`;
     evidenciaId = ev!.id as string;
+    // Citar exige DERECHOS vigentes para el ámbito cliente (SPEC-03, RF-03.10): la
+    // evidencia de este workspace de prueba los tiene concedidos. El caso contrario lo
+    // cubre la suite de evidencia profunda.
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaId}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${leadId}, now(), ${leadId})`;
 
     // Un insight VALIDADO: sin él no hay decisión trazable.
     const ins = await crearInsight(leadId, { workspaceId: ws, titulo: 'Fricción documental', resumen: '' });
@@ -140,6 +147,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
       await admin`delete from proyecto where workspace_id = ${ws}`;
       await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
       await admin`delete from reto where workspace_id = ${ws}`;
+      await admin`delete from derecho_uso where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
       await admin`delete from servicio where workspace_id = ${ws}`;
@@ -567,7 +575,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     // G3 lo aprueba el sponsor (rolAprobadorDeGate), pero el guard le para igual.
     await expect(
       aprobarGate(sponsorId, { workspaceId: ws, gateId: g3.id }),
-    ).rejects.toThrow(/decisiones en revisión/);
+    ).rejects.toThrow(/dejó en revisión \(SYS-10\)/);
 
     // Revalidar la decisión desbloquea el gate sin tocar el checklist.
     await revalidarDecision(leadId, ws, vigente.id);

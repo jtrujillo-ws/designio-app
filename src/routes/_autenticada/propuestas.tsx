@@ -275,6 +275,21 @@ function PantallaPropuestas() {
             {datos.decididas.length > 0 && (
               <>
                 <div style={{ ...etiqueta, paddingTop: 14 }}>Decididas recientes</div>
+                {/* El reparto aceptada/corregida que se lee AQUÍ es el insumo de la tasa de
+                    corrección humana (SYS-17), así que aquí es donde toca decir hasta dónde
+                    llega. Si el límite vive solo en el comentario de la migración, quien lea
+                    la tasa dentro de seis meses la leerá como si fuera medida, y no lo es del
+                    todo: la base garantiza que el reparto no se maquilla —lo decide ella
+                    comparando contenido con original— y que cada propuesta cuelga de la
+                    llamada que la pagó, pero no puede verificar que el contenido lo
+                    devolviera un modelo, porque no participa en esa llamada. */}
+                <Aviso>
+                  El reparto entre «aceptada» y «corregida» es el insumo de la tasa de
+                  corrección humana. La base impide maquillarlo —compara el contenido con el
+                  original— y ata cada propuesta a la llamada que la pagó; lo que no puede
+                  verificar es que ese contenido lo devolviera un modelo, porque no participa
+                  en la llamada al proveedor: eso lo atestigua la aplicación.
+                </Aviso>
                 {datos.hayMasDecididas && (
                   <Aviso>
                     Solo las {datos.decididas.length} decisiones más recientes; el historial

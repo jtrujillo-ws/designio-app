@@ -10,7 +10,21 @@ import type { CapacidadActiva } from './ai.schemas';
  * de fidelidad de citas se prueban como funciones, no como integración.
  */
 
-export const PROMPT_VERSION = 'ai-2026-09-02.2';
+/**
+ * Sube con CADA cambio del contrato de este fichero: los dos sistemas, los dos prompts, los
+ * dos esquemas de salida y los techos que los recortan. `ai-2026-09-02.2` se quedó atrás
+ * cuando CI pasó a admitir fechas ausentes y C0 pasó a exigir citas y confianza declarada:
+ * propuestas con contratos distintos llevaban el mismo lineage, así que una regresión de
+ * grounding no podía separar las dos poblaciones — que es para lo único que existe esta
+ * constante.
+ *
+ * Que no vuelva a depender de que alguien se acuerde: la suite calcula la huella del
+ * contrato vivo y la compara con la anotada junto a esta versión. Cambiar el contrato sin
+ * subir la versión rompe el test, y subir la versión sin anotar la huella también. No
+ * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
+ * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
+ */
+export const PROMPT_VERSION = 'ai-2026-09-03.1';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   costoDeUso,
@@ -12,13 +13,17 @@ import {
 import {
   delimitarMaterialNoConfiable,
   esCitaFiel,
+  ESQUEMA_SALIDA,
   fidelidadDeCitas,
   materialDeItem,
   materialDeReto,
   MAX_CAMPO_FICHA,
   MAX_MATERIAL,
+  PROMPT_VERSION,
   promptCriterios,
   promptExtraccion,
+  SISTEMA_CRITERIOS,
+  SISTEMA_EXTRACCION,
 } from '../ai.prompts';
 
 /**
@@ -289,5 +294,58 @@ describe('fidelidad de citas (SYS-17: el grounding se mide, no se presume)', () 
       { fragmento: 'inician la apertura' },
     ]);
     expect(r).toEqual({ fieles: 2, total: 3 });
+  });
+});
+
+/**
+ * El lineage promete que dos propuestas con el MISMO `prompt_version` salieron del mismo
+ * contrato. Esa promesa dependía de que alguien se acordara de subir la constante al tocar
+ * el fichero, y ya falló una vez: CI pasó a admitir fechas ausentes y C0 pasó a exigir citas
+ * y confianza declarada sin que la versión se moviera, así que dos poblaciones incomparables
+ * quedaron etiquetadas igual — y una regresión de grounding no las puede separar.
+ *
+ * Aquí se ata: la huella del contrato vivo tiene que ser la anotada para la versión que
+ * declara `PROMPT_VERSION`. Cambiar el contrato sin subir la versión falla; subir la versión
+ * sin anotar la huella nueva también. Lo que NO hace —y conviene no leerlo de más— es
+ * decidir por nadie: quien mueva las dos cosas a la vez sigue pudiendo etiquetar mal. Lo que
+ * elimina es el olvido silencioso, que es el modo real de fallo.
+ */
+describe('el contrato del prompt y su versión se mueven juntos', () => {
+  /** Versión y huella anotadas: una sola fila, la del contrato de hoy. Un histórico de
+   * huellas viejas no se puede volver a comprobar, y una afirmación que nadie puede
+   * verificar es justo lo que este slice no escribe. */
+  const VERSION_ANOTADA = 'ai-2026-09-03.1';
+  const HUELLA_ANOTADA = '1a2b4521360d7ce7b82fe4d7a59cb9d503c910472777f2f49db8555989eb3c40';
+
+  /** Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige
+   * y los techos que recortan lo que ve. Los prompts se renderizan con una entrada FIJA,
+   * así que la huella cubre su esqueleto y no el material de un caso concreto. */
+  function huellaDelContratoVivo(): string {
+    const fijo = {
+      sistemaExtraccion: SISTEMA_EXTRACCION,
+      sistemaCriterios: SISTEMA_CRITERIOS,
+      esquemaSalida: ESQUEMA_SALIDA,
+      maxMaterial: MAX_MATERIAL,
+      maxCampoFicha: MAX_CAMPO_FICHA,
+      promptExtraccion: promptExtraccion({
+        titulo: 'T',
+        tipoFuente: 'nota',
+        referencia: 'R',
+        contenido: 'C',
+      }),
+      promptCriterios: promptCriterios({
+        codigo: 'R-01',
+        titulo: 'T',
+        descripcion: 'D',
+        metricaObjetivo: 'M',
+        cuantos: 3,
+      }),
+    };
+    return createHash('sha256').update(JSON.stringify(fijo)).digest('hex');
+  }
+
+  it('la huella del contrato vivo es la anotada para esta versión', () => {
+    expect(PROMPT_VERSION).toBe(VERSION_ANOTADA);
+    expect(huellaDelContratoVivo()).toBe(HUELLA_ANOTADA);
   });
 });

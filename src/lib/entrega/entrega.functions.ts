@@ -125,7 +125,8 @@ export const conciliacionDeDesignVersion = createServerFn({ method: 'GET' })
     }
   });
 
-/** RF-06.9: la cadena en los dos sentidos desde un release. */
+/** La cadena en los dos sentidos DESDE UN RELEASE (criterio de aceptación 5). La mitad de
+ * RF-06.9 que se ancla en la evidencia se declara fuera — ver `cadenaDeRelease`. */
 export const cadenaDelRelease = createServerFn({ method: 'GET' })
   .inputValidator(ReleaseInputSchema)
   .handler(async ({ data }) => {

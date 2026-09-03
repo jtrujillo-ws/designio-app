@@ -1243,7 +1243,20 @@ function TarjetaRelease({
         </div>
       )}
 
-      <CadenaDelRelease workspaceId={workspaceId} releaseId={release.id} codigo={release.codigo} />
+      {/* La `key` incluye el ALCANCE, no solo el id: la cadena expandida vive en estado
+          local y sobrevive a la recarga del loader porque el release sigue siendo el mismo,
+          así que tras asignar, mover o quitar un elemento seguía enseñando los pasos y las
+          citas de antes — una vista de auditoría diciendo algo que ya no es cierto, y sin
+          control para recargarla. Es la misma clase que el remonte al cambiar de workspace
+          (#18): la pregunta no es «¿cambió el id?» sino «¿sigue siendo verdad lo que este
+          estado afirma?». Cuando el alcance cambia, el componente se remonta y la cadena
+          vuelve a pedirse cuando el lead la abra. */}
+      <CadenaDelRelease
+        key={`${release.id}:${release.elementos.map((e) => e.elementoId).join(',')}`}
+        workspaceId={workspaceId}
+        releaseId={release.id}
+        codigo={release.codigo}
+      />
 
       {puedeCompletar && release.estado === 'desplegado' && !constatando && (
         <div>

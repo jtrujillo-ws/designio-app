@@ -70,6 +70,34 @@ function comoErrorDeDominio(e: unknown, sinPermiso?: string): never {
 }
 
 /**
+ * Igual que `conUsuario`, pero traduciendo también lo que revienta en el COMMIT.
+ *
+ * Los constraint triggers DIFERIDOS de este esquema —cobertura de G6 al quitar alcance,
+ * effective state completo, y la sucesora aprobada al superar— levantan su P0001 al cerrar
+ * la transacción, o sea FUERA del callback: ningún `try` de dentro los ve, y por eso
+ * `comoErrorDeDominio`, que envuelve sentencias sueltas, no los alcanza. Sin esto, el
+ * mensaje del guard —que es el producto de la regla: «muévelo a otro release, no lo dejes
+ * sin ninguno»— llegaba crudo al handler, que no reconoce P0001 y lanza en vez de devolver
+ * `{ ok: false, error }`: la pantalla enseñaba un fallo de servidor en lugar de qué hacer.
+ *
+ * Solo traduce P0001, que es lo que levantan los guards; cualquier otro error sigue su
+ * camino sin tocarse. Lo usan las cuatro operaciones cuya transacción puede terminar en uno
+ * de esos tres triggers; quien añada otro guard diferido tiene que traer su escritura aquí.
+ */
+async function conUsuarioTraduciendoElCommit<T>(
+  actorId: string,
+  fn: (tx: TransactionSql) => Promise<T>,
+): Promise<T> {
+  try {
+    return await conUsuario(actorId, fn);
+  } catch (e) {
+    const err = e as { code?: string; message?: string };
+    if (err.code === 'P0001' && err.message) throw new ErrorEntrega(err.message);
+    throw e;
+  }
+}
+
+/**
  * Candado por SERVICIO: el punto de cita de todo lo que decide sobre CUÁL es la design
  * version vigente de un servicio, y de todo lo que cuelga trabajo nuevo de ella.
  *
@@ -543,7 +571,7 @@ export async function aprobarDesignVersion(
   actorId: string,
   entrada: AprobarDesignVersion,
 ): Promise<void> {
-  await conUsuario(actorId, async (tx) => {
+  await conUsuarioTraduciendoElCommit(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     // El reto va primero: aprobar mueve el conjunto de versiones aprobadas del proyecto,
     // que es sobre lo que afirman G6 y G7, así que esto y `aprobarGate` no pueden decidir
@@ -746,7 +774,7 @@ export async function asignarElemento(actorId: string, entrada: AsignarElemento)
  * conocen pueden acordar sin hablarse.
  */
 export async function moverElemento(actorId: string, entrada: AsignarElemento): Promise<void> {
-  await conUsuario(actorId, async (tx) => {
+  await conUsuarioTraduciendoElCommit(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     const [previa] = await tx`select release_id from release_elemento
       where elemento_id = ${entrada.elementoId} and workspace_id = ${entrada.workspaceId}`;
@@ -789,7 +817,7 @@ export async function desasignarElemento(
   workspaceId: string,
   elementoId: string,
 ): Promise<void> {
-  await conUsuario(actorId, async (tx) => {
+  await conUsuarioTraduciendoElCommit(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     // El release al que sacar el elemento hay que resolverlo para poder bloquearlo, y a
     // diferencia del `design_version_id` de un elemento este SÍ puede cambiar: reasignar
@@ -851,7 +879,7 @@ export async function constatarEffectiveState(
   actorId: string,
   entrada: Constatar,
 ): Promise<{ effectiveStateId: string }> {
-  return conUsuario(actorId, async (tx) => {
+  return conUsuarioTraduciendoElCommit(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     await bloquearRelease(tx, entrada.releaseId);
     await bloquearSerie(tx, 'es', entrada.workspaceId);
@@ -1350,10 +1378,18 @@ export type CadenaDeRelease = {
 };
 
 /**
- * Navegación bidireccional de la cadena (RF-06.9) anclada en el release: hacia adelante,
- * qué nodos del grafo tocó; hacia atrás, hasta las citas que sostienen las decisiones e
- * insights que motivaron sus elementos. Una sola sentencia porque las dos direcciones
- * son la misma pregunta desde extremos opuestos y tienen que cuadrar.
+ * La cadena en los dos sentidos ANCLADA EN EL RELEASE: hacia adelante, qué nodos del grafo
+ * tocó; hacia atrás, hasta las citas que sostienen las decisiones e insights que motivaron
+ * sus elementos. Una sola sentencia porque las dos direcciones son la misma pregunta desde
+ * extremos opuestos y tienen que cuadrar.
+ *
+ * Es el criterio de aceptación 5 de SPEC-06 («qué pasos del journey afectó RL-1», §19.7) y
+ * la mitad de RF-06.9 que este slice entrega. La OTRA mitad —anclar en una evidencia y
+ * listar los releases que la usaron, vía insight → decisión → design version → release— NO
+ * está aquí y se declara fuera a propósito: son los mismos joins al revés, pero la pregunta
+ * nace en la pantalla de evidencia, que es de SPEC-03, y su respuesta se lee ahí. Las dos
+ * tablas que la harían posible (`elemento_decision` y `elemento_insight`) existen ya con sus
+ * índices hacia atrás, así que lo que falta es la consulta y su ruta, no el modelo.
  */
 export async function cadenaDeRelease(
   actorId: string,

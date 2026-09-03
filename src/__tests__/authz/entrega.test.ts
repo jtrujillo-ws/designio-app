@@ -2880,7 +2880,14 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // eso el borrado ya no puede vaciarlo. La salida sigue existiendo —mover el elemento a
     // otro release es borrar e insertar en la MISMA transacción— y es la que el mensaje
     // ofrece.
-    await expect(quitar).rejects.toThrow(/G6 aprobó un plan que cubre este elemento/);
+    // Y llega como error de DOMINIO, no como fallo de Postgres. Importa el tipo: este
+    // guard es DIFERIDO, así que revienta en el COMMIT —fuera del callback, donde ningún
+    // `try` de la transacción lo ve— y sin traducirlo ahí el handler no lo reconoce y lanza
+    // en vez de devolver `{ ok: false, error }`: la pantalla enseñaba un fallo de servidor
+    // en lugar de la salida que el mensaje ofrece.
+    const fallo = await quitar.catch((e: unknown) => e);
+    expect(fallo).toBeInstanceOf(ErrorEntrega);
+    expect((fallo as Error).message).toMatch(/G6 aprobó un plan que cubre este elemento/);
     const [gate] = await admin`select estado from gate_instancia
       where id = ${g6Id} and workspace_id = ${ws}`;
     expect(gate!.estado).toBe('aprobado');

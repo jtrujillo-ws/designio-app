@@ -4176,24 +4176,41 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(otroTipo.elementoId).toBeTruthy();
   });
 
-  it('la normalización de la BASE y la de TypeScript dicen lo mismo', async () => {
+  it('la normalización de la BASE y la de TypeScript dicen lo mismo, TAMBIÉN en los bordes', async () => {
     // Son los dos lados de la misma regla —el índice que la impone y el pliegue que la
     // aplica— y no pueden compartir código, porque una corre también en el navegador. Este
-    // test es lo único que las mantiene juntas: si alguien toca una, aquí se ve.
+    // test es lo único que las mantiene juntas.
+    //
+    // Y ya falló una vez por no probar los BORDES: `btrim` sin argumento recorta solo el
+    // espacio ASCII, `.trim()` de JavaScript se lleva también tabuladores y NBSP, así que con
+    // el recorte antes del colapso las dos divergían en cuanto el título empezaba o terminaba
+    // con un espacio exótico. Un test de paridad que solo mira el medio da una seguridad que
+    // no existe, y aquí era la única red. Ahora los casos llevan el espacio raro DELANTE,
+    // DETRÁS y en medio, y las cadenas que son solo espacios.
     const admin = sqlAdmin();
+    const RAROS = ['\u0009', '\u000a', '\u000b', '\u000c', '\u000d', '\u00a0', '\u1680',
+      '\u2000', '\u200a', '\u2028', '\u2029', '\u202f', '\u205f', '\u3000', '\ufeff'];
     const casos = [
       'Atención telefónica',
       '  ATENCION   telefonica ',
       'Ñandú Ünico',
-      'Canal\u00a0\u00a0con espacios raros',
       'MAYÚSCULAS y minúsculas',
-      'con\ttabulador\ny salto',
-      'sin nada especial',
       'ácido básico cañón',
+      'sin nada especial',
+      '',
+      ' ',
+      // Cada espacio exótico, en los tres sitios donde puede aparecer.
+      ...RAROS.flatMap((c) => [
+        `${c}Atención${c}`,
+        `${c}${c}Canal con bordes`,
+        `Canal con bordes${c}${c}`,
+        `Canal${c}con${c}medio`,
+        `${c}${c}`,
+      ]),
     ];
     for (const caso of casos) {
       const [f] = await admin`select titulo_normalizado(${caso}) as n`;
-      expect(f!.n as string).toBe(normalizarTitulo(caso));
+      expect({ caso, sql: f!.n as string }).toEqual({ caso, sql: normalizarTitulo(caso) });
     }
   });
 
@@ -4230,6 +4247,93 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [dvSig] = await admin`select codigo from design_version
       where id = ${siguiente.designVersionId}`;
     expect(numeroDe(dvSig!.codigo as string)).toBeGreaterThan(numeroDe(creada!.codigo as string));
+  });
+
+  it('un release de una versión auto-superada se cierra vaciándolo, y no bloquea G7 para siempre', async () => {
+    // Este test existe por un hallazgo que decidí NO arreglar, y guarda el argumento.
+    //
+    // La afirmación era: meter alcance mientras se aprueba la sucesora deja trabajo
+    // planificado sobre una versión ya reemplazada, que G7 lee como release sin resolver y
+    // BLOQUEA — sin salida. Las dos mitades de esa frase son falsas, y esto lo fija:
+    //
+    //  1. Ese estado es LEGÍTIMAMENTE alcanzable en secuencia: se planifica un release con su
+    //     alcance y DESPUÉS se decide reemplazar la design version. Nada lo prohíbe, y no
+    //     debería: la decisión de superar llega cuando llega.
+    //  2. Y tiene salida, que es justo la que la pantalla ya ofrece para las auto-superadas:
+    //     «lo que ya no va a salir se cierra quitándole los elementos». Vaciado el release,
+    //     G7 deja de verlo.
+    //
+    // Si la carrera produce el mismo estado que la secuencia legítima, no hay invariante que
+    // proteger: prohibirla habría sido rechazar por concurrente algo que se acepta en orden.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-139', 'Proyecto de la superada con release');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la superada');
+    const nueva = async (titulo: string, supera: string | null) => {
+      const dv = await crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proy,
+        servicioId: svcId,
+        journeyId,
+        titulo,
+        resumen: '',
+        superaA: supera,
+      });
+      const el = await elementoSuelto(dv.designVersionId, `Elemento de ${titulo}`);
+      await aprobarDesignVersion(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        motivo: '',
+      });
+      return { id: dv.designVersionId, elementoId: el };
+    };
+
+    const dv1 = await nueva('La que se queda atrás', null);
+    // (1) Alcance planificado ANTES de reemplazarla: el camino secuencial y legítimo.
+    const rl = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv1.id,
+      titulo: 'El que se queda a medias',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: dv1.elementoId, razon: '' }],
+    });
+    const dv2 = await nueva('La que la reemplaza', dv1.id);
+    const [tras] = await admin`select estado from design_version
+      where id = ${dv1.id} and workspace_id = ${ws}`;
+    expect(tras!.estado).toBe('superada');
+
+    // Y ya no se le puede meter trabajo NUEVO: eso sí lo cierra la política, en secuencia.
+    await expect(
+      asignarElemento(leadId, {
+        workspaceId: ws,
+        releaseId: rl.releaseId,
+        elementoId: dv2.elementoId,
+        razon: 'no debería entrar',
+      }),
+    ).rejects.toThrow();
+
+    // (2) La salida: vaciarlo. Sigue disponible porque el release está planificado.
+    //
+    // Se comprueba el PREDICADO exacto de la cuarta rama de G7 —«una superada dejó releases
+    // sin resolver»— y no el mensaje, porque en un proyecto real la rama de los elementos sin
+    // constatar salta antes y taparía justo lo que aquí se quiere observar.
+    const dejaReleasesSinResolver = async (): Promise<boolean> => {
+      const [f] = await admin`select exists (
+        select 1 from elemento_cambio ec
+        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+        join release_elemento re on re.elemento_id = ec.id and re.workspace_id = ec.workspace_id
+        join release r on r.id = re.release_id and r.workspace_id = re.workspace_id
+        where dv.id in (select design_versions_superadas_del_ambito(${proy}, ${ws}))
+          and dv.id not in (
+            select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
+          and r.estado <> 'verificado') as bloquea`;
+      return f!.bloquea as boolean;
+    };
+
+    expect(await dejaReleasesSinResolver()).toBe(true);
+    await desasignarElemento(leadId, ws, dv1.elementoId);
+    // Vacío el release, la rama deja de verlo: cuenta releases CON alcance sin resolver.
+    expect(await dejaReleasesSinResolver()).toBe(false);
   });
 
   it('varias altas simultáneas no se pelean por el mismo número de serie', async () => {

@@ -79,12 +79,15 @@ function clave(e: {
  * que pasa las mismas cadenas por las dos y exige el mismo resultado.
  */
 export function normalizarTitulo(texto: string): string {
+  // El orden importa y coincide con el de `titulo_normalizado` a propósito: colapsar las
+  // rachas de espacios ANTES de recortar. Aquí `.trim()` se lleva los espacios exóticos y
+  // en SQL `btrim` no, así que recortar primero era justo donde las dos se separaban.
   return texto
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .trim()
     .toLowerCase()
-    .replace(/\s+/g, ' ');
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export type VeredictoDiff = 'agrega' | 'modifica' | 'retira';

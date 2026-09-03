@@ -188,12 +188,22 @@ create unique index elemento_cambio_nodo_unico
 -- marcas combinantes (así «Atención» y «atencion» son la misma), bajar a minúsculas, recortar
 -- los extremos y colapsar cualquier racha de espacios —incluidos los exóticos que `\s`
 -- reconoce en JavaScript— a uno solo.
+-- El ORDEN de los pasos es parte de la regla, no una preferencia de escritura. `btrim` sin
+-- argumento recorta SOLO el espacio ASCII, mientras que `.trim()` de JavaScript se lleva
+-- también tabuladores, NBSP y compañía. Recortando ANTES de colapsar, «\tAtención\t» conservaba
+-- los tabuladores, el colapso los volvía espacios normales y quedaba « atencion » con espacios
+-- en los bordes — mientras TypeScript devolvía «atencion». Dos claves distintas para el mismo
+-- título: exactamente los duplicados lógicos que el índice tenía que impedir.
+--
+-- Colapsando primero y recortando después, el recorte solo tiene que vérselas con espacios
+-- ASCII y las dos redacciones coinciden en los bordes igual que en el medio.
 create function titulo_normalizado(p_titulo text) returns text
 language sql immutable strict as $$
-  select regexp_replace(
-           btrim(lower(regexp_replace(normalize(p_titulo, nfd), '[\u0300-\u036f]', '', 'g'))),
-           '[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+',
-           ' ', 'g')
+  select btrim(
+           regexp_replace(
+             lower(regexp_replace(normalize(p_titulo, nfd), '[\u0300-\u036f]', '', 'g')),
+             '[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+',
+             ' ', 'g'))
 $$;
 revoke execute on function titulo_normalizado(text) from public;
 -- La evalúa el índice, que corre con los privilegios de quien escribe.
@@ -370,8 +380,41 @@ create function asignar_codigo_de_serie() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_siguiente int;
+  v_previo uuid;
 begin
-  -- El candado de la SERIE, primero. `max()+1` sobre la propia tabla es una lectura que otra
+  -- ── PRIMERO el candado que va ANTES en el orden canónico, y por eso no depende del nombre ──
+  -- Este trigger no es el único BEFORE que toma candados en su tabla: en `design_version`
+  -- convive con el de anclaje, que toma el del RETO. Los BEFORE disparan en orden alfabético,
+  -- así que confiar en el nombre para que salgan en el orden canónico es frágil — y de hecho
+  -- se rompió: `codigo_de_design_version` iba antes que `design_version_anclaje`, o sea
+  -- codigo-dv antes que reto, al revés que `crearDesignVersion`. Interbloqueo.
+  --
+  -- En vez de renombrar —que solo mueve la fragilidad de sitio y ya dependía del nombre en
+  -- tres puntos—, cada tomador de candado adquiere aquí el PREFIJO canónico que le
+  -- corresponde. Así el orden sale igual dispare quien dispare primero, y renombrar un
+  -- trigger deja de poder invertirlo:
+  --
+  --   design_version  → reto      (crearDesignVersion:      reto → codigo-dv)
+  --   release         → servicio  (planificarRelease:       servicio → codigo-rl → release)
+  --   effective_state → release   (constatarEffectiveState: release → codigo-es)
+  --
+  -- Para quien entra por el servicio son no-ops: ya los tiene tomados.
+  if tg_table_name = 'design_version' then
+    select p.reto_id into v_previo from proyecto p
+      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id;
+    if v_previo is not null then
+      perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_previo, 42));
+    end if;
+  elsif tg_table_name = 'release' then
+    select dv.servicio_id into v_previo from design_version dv
+      where dv.id = new.design_version_id and dv.workspace_id = new.workspace_id;
+    if v_previo is not null then
+      perform pg_advisory_xact_lock(hashtextextended('designio:design-version:' || v_previo, 42));
+    end if;
+  else
+    perform pg_advisory_xact_lock(hashtextextended('designio:release:' || new.release_id, 42));
+  end if;
+  -- Y ahora sí, el candado de la SERIE. `max()+1` sobre la propia tabla es una lectura que otra
   -- transacción invalida escribiendo: sin candado, dos altas por SQL directo calculan el
   -- mismo número y una cae contra el único. Es un fallo y no una corrupción —la misma
   -- distinción que justifica el SECURITY DEFINER de abajo—, pero es evitable y la causa es la
@@ -2034,21 +2077,57 @@ revoke execute on function release_alcance_no_vacio_guard() from public;
 create function release_alcance_fijo_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
+  v_release uuid;
+  v_ws uuid;
   v_estado text;
 begin
-  perform pg_advisory_xact_lock(hashtextextended('designio:release:' || new.release_id, 42));
+  if tg_op = 'DELETE' then
+    v_release := old.release_id;
+    v_ws := old.workspace_id;
+  else
+    v_release := new.release_id;
+    v_ws := new.workspace_id;
+  end if;
+  perform pg_advisory_xact_lock(hashtextextended('designio:release:' || v_release, 42));
   select r.estado into v_estado from release r
-    where r.id = new.release_id and r.workspace_id = new.workspace_id;
+    where r.id = v_release and r.workspace_id = v_ws;
   if v_estado is not null and v_estado <> 'planificado' then
-    raise exception 'ese release ya salió: su alcance es fijo y este elemento no formó parte del despliegue (SYS-06)';
+    raise exception 'ese release ya salió: su alcance es fijo y no puede cambiar después del despliegue (SYS-06)';
   end if;
   return null;
 end $$;
-create constraint trigger release_elemento_alcance_fijo
-  after insert on release_elemento
+-- Cubre el ALTA y la BAJA, que es lo que «fijo» quiere decir de verdad. Faltaba la baja: la
+-- política del borrado exige 'planificado' con un exists sobre otra tabla, así que quitar un
+-- elemento mientras se despliega el release también commitea — y el release sale declarando
+-- un alcance y acaba con otro más pequeño. El guard de «no vacío» no lo veía porque solo mira
+-- si queda vacío, no si encogió.
+--
+-- El nombre cae entre `cobertura` y `sin_alcance` a propósito: en la baja disparan los tres y
+-- el orden alfabético tiene que dar el canónico —cobertura toma el RETO y estos dos el
+-- RELEASE—. Con `alcance_fijo` iba el primero y salía release antes que reto.
+create constraint trigger release_elemento_fijo
+  after insert or delete on release_elemento
   deferrable initially deferred
   for each row execute function release_alcance_fijo_guard();
 revoke execute on function release_alcance_fijo_guard() from public;
+
+-- ── Y lo que NO se vigila aquí, con su motivo ──
+-- Meter alcance mientras se aprueba la sucesora deja trabajo planificado sobre una versión
+-- que el propio proyecto acaba de reemplazar. Parece la misma familia que lo de arriba, y no
+-- lo es: ese estado es LEGÍTIMAMENTE alcanzable en secuencia —se planifica el release con su
+-- alcance y DESPUÉS se decide reemplazar la design version, que es cuando llega la decisión—,
+-- así que no hay invariante que la concurrencia rompa. Rechazarla por concurrente sería
+-- rechazar algo que se acepta en orden.
+--
+-- Y tampoco encierra a nadie: el release sigue 'planificado', así que se cierra vaciándolo,
+-- que es exactamente la salida que la pantalla ofrece para las auto-superadas. Vacío, la rama
+-- de G7 que cuenta «releases de una superada sin resolver» deja de verlo, porque cuenta
+-- releases CON alcance. Está fijado en `entrega.test.ts` («un release de una versión
+-- auto-superada se cierra vaciándolo»), que es donde vive el argumento por si alguien vuelve
+-- a plantearlo.
+--
+-- Lo que sí se cierra en secuencia, y basta: la política del alta no deja meter trabajo NUEVO
+-- en una versión que el proyecto ya reemplazó.
 
 -- ══ EL CALENDARIO QUE MANDA ES EL DE QUIEN ESCRIBE (RF-06.5, RF-06.6) ══
 -- «La fecha no puede ser futura» no dice nada hasta que se responde «futura ¿en qué

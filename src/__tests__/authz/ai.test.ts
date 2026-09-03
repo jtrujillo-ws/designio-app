@@ -1233,10 +1233,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const enPanel = panel.pendientes.find((x) => x.id === propuestaId)!;
     expect(enPanel.anclaEstado).toBe('consentimiento-revocado');
 
-    // El servicio lo dice con nombre…
-    await expect(
-      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
-    ).rejects.toThrow(/consentimiento/i);
+    // El servicio lo dice con nombre, y con un error de DOMINIO: quien rechaza aquí es un
+    // guard de la base, así que sin traducción el revisor se llevaría un PostgresError
+    // crudo a la pantalla (`mensajeDe` devuelve null para P0001 y la server function
+    // relanza al error boundary). Se comprueba la CLASE además del texto, porque el texto
+    // es el mismo en los dos casos y no distingue el error traducido del que se escapa.
+    const alAceptar = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+    }).catch((e: unknown) => e);
+    expect(alAceptar).toBeInstanceOf(ErrorAI);
+    expect((alAceptar as ErrorAI).message).toMatch(/consentimiento/i);
     // …y el suelo es la base: el guard de la transición lo impide también por SQL crudo,
     // antes incluso de que hablen los CHECK de la tabla.
     await expect(

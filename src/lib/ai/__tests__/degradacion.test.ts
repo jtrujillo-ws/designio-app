@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   costoDeUso,
+  formatearCosteUsd,
   evaluarCapacidadAI,
   LIMITE_LLAMADAS_DIA,
   MODELO_FALLBACK,
@@ -119,6 +120,32 @@ describe('coste de la llamada (RF-09.14: se mide, no se estima)', () => {
 
   it('un modelo sin tarifa registrada NO inventa un coste', () => {
     expect(costoDeUso('modelo-que-no-existe', { entrada: 10, salida: 10 })).toBeNull();
+  });
+
+  it('y al escribirlo NUNCA se colapsa a cero un coste que no es cero', () => {
+    // El fallo que esto cierra: la pantalla usaba `toFixed(4)` sobre una columna de SEIS
+    // decimales, así que un coste real de 40 micro-dólares se leía «$0.0000». Un
+    // presupuesto por workspace (RF-09.12) existe para ver venir justo lo que se acumula
+    // en llamadas pequeñas, y la pantalla lo hacía invisible — mintiendo, además, en la
+    // dirección que esconde el problema.
+    expect(formatearCosteUsd(0.00004)).toBe('$0.00004');
+    expect(formatearCosteUsd(0.000001)).toBe('$0.000001');
+    // Un coste normal se sigue leyendo de un vistazo, con sus dos decimales de siempre.
+    expect(formatearCosteUsd(1.5)).toBe('$1.50');
+    expect(formatearCosteUsd(12.345678)).toBe('$12.345678');
+    // Cero es cero, y solo cero se escribe como cero.
+    expect(formatearCosteUsd(0)).toBe('$0.00');
+    expect(formatearCosteUsd(4e-7)).toBe('< $0.000001');
+
+    // Y la propiedad de verdad, sobre el rango que la base puede guardar: ningún valor
+    // positivo se presenta como una cantidad nula.
+    for (const usd of [1e-6, 4e-5, 9.9e-5, 0.001, 0.5, 3.25]) {
+      const escrito = formatearCosteUsd(usd);
+      expect(Number(escrito.replace(/[^0-9.]/g, ''))).toBeGreaterThan(0);
+    }
+    // Incluido el coste de una llamada minúscula, que es el que se perdía.
+    const minimo = costoDeUso(MODELO_PRIMARIO, { entrada: 100, salida: 20 })!;
+    expect(formatearCosteUsd(minimo)).not.toBe('$0.00');
   });
 });
 

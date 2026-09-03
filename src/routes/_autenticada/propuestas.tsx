@@ -9,6 +9,7 @@ import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
+import { formatearCosteUsd } from '@/lib/ai/ai.degradacion';
 import {
   aceptarPropuestaAI,
   generarPropuestasAI,
@@ -377,6 +378,22 @@ function FormularioGeneracion({
   const [anclaId, setAnclaId] = useState('');
   const [texto, setTexto] = useState(busqueda);
   const [enviando, setEnviando] = useState(false);
+  // La búsqueda vive en la URL (`?q=`), así que el back/forward del navegador la cambia sin
+  // que nadie toque el input: sin esto, la caja seguía enseñando lo que se tecleó la última
+  // vez mientras la lista ya era de otra búsqueda — dos verdades a la vez en la misma
+  // pantalla.
+  //
+  // El ajuste va DURANTE el render y no en un efecto, que es lo que React prescribe para
+  // «derivar estado cuando cambia una prop»: al ver el `setState` de su propio componente
+  // durante el render, React descarta la salida y lo reejecuta ANTES de commitear y antes
+  // de pintar los hijos. Con un efecto, el commit ocurre primero y el usuario ve un
+  // fotograma con el input viejo sobre los resultados nuevos — exactamente el síntoma que
+  // se quiere quitar, solo que más corto.
+  const [busquedaVista, setBusquedaVista] = useState(busqueda);
+  if (busquedaVista !== busqueda) {
+    setBusquedaVista(busqueda);
+    setTexto(busqueda);
+  }
   const anclas = capacidad === 'CI' ? items : retos;
   const hayMas = capacidad === 'CI' ? hayMasItems : hayMasRetos;
   const elegida = anclas.find((a) => a.id === anclaId);
@@ -912,7 +929,7 @@ function TarjetaPropuesta({
         {/* Coste MEDIDO de la llamada que la produjo, no estimado. Sin dato se dice, no
             se rellena con un cero que parecería gratis. */}
         {propuesta.costoUsd !== null
-          ? ` · $${propuesta.costoUsd.toFixed(4)}`
+          ? ` · ${formatearCosteUsd(propuesta.costoUsd)}`
           : ' · coste sin registrar'}{' '}
         · {propuesta.alcanceResumen}
       </span>

@@ -67,10 +67,18 @@ function clave(e: {
 }): string {
   if (e.catalogoId) return `catalogo:${e.catalogoId}`;
   if (e.nodoId) return `nodo:${e.nodoId}`;
-  return `titulo:${e.tipo}:${normalizar(e.titulo)}`;
+  return `titulo:${e.tipo}:${normalizarTitulo(e.titulo)}`;
 }
 
-function normalizar(texto: string): string {
+/**
+ * La forma normalizada de un título, y el ÚNICO sitio donde se define de este lado.
+ *
+ * Se exporta porque tiene gemela en SQL —`titulo_normalizado` en la migración—, que es la que
+ * impone la unicidad del tercer escalón con un índice. Las dos son la misma regla y no pueden
+ * compartir código: esta corre también en el navegador. Lo que las mantiene juntas es un test
+ * que pasa las mismas cadenas por las dos y exige el mismo resultado.
+ */
+export function normalizarTitulo(texto: string): string {
   return texto
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')

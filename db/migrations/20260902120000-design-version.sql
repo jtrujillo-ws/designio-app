@@ -166,6 +166,43 @@ create unique index elemento_cambio_nodo_unico
   on elemento_cambio (workspace_id, design_version_id, nodo_id)
   where nodo_id is not null;
 
+-- ── Y el TERCER escalón de la identidad, que es el que no tiene referencia ──
+-- El índice de arriba cubre a los elementos CON nodo. Los que no lo tienen se emparejan por
+-- «tipo + título normalizado» —el tercer escalón de «clave»—, y ahí hacía falta el índice
+-- complementario, no la ausencia de uno: lo que no se puede indexar es un único sobre
+-- `nodo_id` nulo (en Postgres los nulos ni colisionan entre sí), pero `(tipo, título
+-- normalizado)` se indexa perfectamente. Entre los dos, cada escalón de la clave tiene su
+-- unicidad y el modelo deja de contradecirla.
+--
+-- Sin esto quedaba abierto EXACTAMENTE el mismo fallo, en el escalón que el otro índice no
+-- alcanza: dos elementos sin nodo, mismo tipo y mismo título, aprobados y desplegados; el
+-- pliegue los cuenta como uno y G7 como dos.
+--
+-- La normalización TIENE que decir lo mismo que `normalizar` en entrega.diff.ts, porque son
+-- los dos lados de la misma regla —el que la impone y el que la aplica al plegar—. No pueden
+-- compartir código (uno es SQL y el otro corre también en el navegador), así que lo que las
+-- mantiene juntas es un test que pasa las mismas cadenas por las dos y exige el mismo
+-- resultado. Si alguien toca una, ese test se pone rojo.
+--
+-- Paso a paso, y en el mismo orden que la de TypeScript: descomponer a NFD, quitar las
+-- marcas combinantes (así «Atención» y «atencion» son la misma), bajar a minúsculas, recortar
+-- los extremos y colapsar cualquier racha de espacios —incluidos los exóticos que `\s`
+-- reconoce en JavaScript— a uno solo.
+create function titulo_normalizado(p_titulo text) returns text
+language sql immutable strict as $$
+  select regexp_replace(
+           btrim(lower(regexp_replace(normalize(p_titulo, nfd), '[\u0300-\u036f]', '', 'g'))),
+           '[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+',
+           ' ', 'g')
+$$;
+revoke execute on function titulo_normalizado(text) from public;
+-- La evalúa el índice, que corre con los privilegios de quien escribe.
+grant execute on function titulo_normalizado(text) to designio_app;
+
+create unique index elemento_cambio_titulo_unico
+  on elemento_cambio (workspace_id, design_version_id, tipo, titulo_normalizado(titulo))
+  where nodo_id is null;
+
 -- Qué MOTIVA el elemento (RF-06.1). Dos tablas y no una columna polimórfica: cada
 -- enlace tiene su FK compuesta real, y la navegación hacia atrás (RF-06.9) es un join,
 -- no un case.
@@ -306,6 +343,52 @@ language sql immutable strict as $$ select substring(p_codigo from '[0-9]+$')::i
 revoke execute on function numero_de_serie(text) from public;
 -- Las dos lecturas corren como el rol de la app, así que necesita el grant.
 grant execute on function numero_de_serie(text) to designio_app;
+
+-- ── El CÓDIGO DE SERIE lo pone la BASE, nunca el que inserta ──
+-- El siguiente código sale de un max() sobre la propia tabla. Mientras el valor lo escribía
+-- el llamante, ese max() dependía de un dato que el llamante controla — y con el tope
+-- canónico de nueve dígitos eso se vuelve un cierre PERMANENTE: basta una fila con
+-- 'DV-999999999', que es perfectamente válida, para que toda creación posterior calcule diez
+-- dígitos y el CHECK la rechace. Las design versions no se borran y `codigo` no está en el
+-- grant de UPDATE, así que el workspace se queda sin poder crear versiones para siempre, sin
+-- intervención del dueño.
+--
+-- Acotar más el tope no arregla eso: mueva donde mueva el límite, quien escribe el dato
+-- decide si el resto puede seguir trabajando. Lo que lo cierra por construcción es que el
+-- valor deje de venir de fuera. Es la misma doctrina que `aprobado_en` —«el sello lo pone la
+-- BASE, no el caller»— y que `previo_a_design_version`: lo que solo debe escribir la base no
+-- se le pide al que inserta, se le impone.
+--
+-- Se SOBRESCRIBE en vez de exigir que venga nulo: así da igual lo que mande el insert —el
+-- servicio, un script, una consola—, y no hay ninguna forma de colar un código elegido.
+--
+-- El nombre importa y por eso son `codigo_de_*`: los triggers BEFORE de una tabla disparan en
+-- orden alfabético, y `effective_state_alta` es BEFORE y arma su evento de dominio con
+-- `new.codigo`. Con la 'c' por delante de la 'e' este corre primero y aquel ve el código
+-- definitivo. Los de design version y release son AFTER, así que ahí el orden ya daba igual.
+create function asignar_codigo_de_serie() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_siguiente int;
+begin
+  -- SECURITY DEFINER a propósito: el máximo tiene que verse ENTERO. Si una política ocultara
+  -- filas, la serie repetiría un número que el índice único rechazaría — un fallo en vez de
+  -- una corrupción, pero un fallo evitable.
+  execute format(
+      'select coalesce(max(numero_de_serie(codigo)), 0) + 1 from %I where workspace_id = $1',
+      tg_table_name)
+    into v_siguiente
+    using new.workspace_id;
+  new.codigo := tg_argv[0] || '-' || v_siguiente;
+  return new;
+end $$;
+revoke execute on function asignar_codigo_de_serie() from public;
+create trigger codigo_de_design_version before insert on design_version
+  for each row execute function asignar_codigo_de_serie('DV');
+create trigger codigo_de_release before insert on release
+  for each row execute function asignar_codigo_de_serie('RL');
+create trigger codigo_de_effective_state before insert on effective_state
+  for each row execute function asignar_codigo_de_serie('ES');
 
 -- ── El EFFECTIVE STATE VIGENTE de un servicio (RF-06.10) ──
 -- La constatación más reciente de todas las que dejaron sus releases VERIFICADOS, cuelguen

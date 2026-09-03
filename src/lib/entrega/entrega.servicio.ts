@@ -55,6 +55,11 @@ function comoErrorDeDominio(e: unknown, sinPermiso?: string): never {
   if (err.code === '23505' && err.constraint_name === 'design_version_sucesion_uniq') {
     throw new ErrorEntrega('Esa design version ya fue superada por otra');
   }
+  if (err.code === '23505' && err.constraint_name === 'elemento_cambio_titulo_unico') {
+    throw new ErrorEntrega(
+      'Otro elemento de esta design version ya cambia eso mismo: descríbelo en UN elemento, o enlaza cada uno a su nodo del to-be',
+    );
+  }
   if (err.code === '23505' && err.constraint_name === 'elemento_cambio_nodo_unico') {
     throw new ErrorEntrega(
       'Otro elemento de esta design version ya cambia ese nodo: descríbelo en UN elemento (el estado efectivo no sabe plegar dos)',
@@ -334,11 +339,9 @@ export async function crearDesignVersion(
       // el trigger de alta con el rol del MISMO snapshot que autorizó el insert.
       [fila] = await tx`
         insert into design_version (workspace_id, proyecto_id, servicio_id, journey_id,
-                                    codigo, titulo, resumen, supera_a, creado_por)
+                                    titulo, resumen, supera_a, creado_por)
         select ${entrada.workspaceId}, ${entrada.proyectoId}, ${entrada.servicioId},
           ${entrada.journeyId},
-          'DV-' || (coalesce((select max(substring(dv.codigo from 4)::int)
-            from design_version dv where dv.workspace_id = ${entrada.workspaceId}), 0) + 1),
           ${entrada.titulo}, ${entrada.resumen}, ${entrada.superaA}, ${actorId}
         returning id`;
     } catch (e) {
@@ -672,11 +675,9 @@ export async function planificarRelease(
     try {
       fila = (
         await tx`
-        insert into release (workspace_id, design_version_id, codigo, titulo, responsable,
+        insert into release (workspace_id, design_version_id, titulo, responsable,
                              fecha_objetivo, creado_por)
         select ${entrada.workspaceId}, ${entrada.designVersionId},
-          'RL-' || (coalesce((select max(substring(r.codigo from 4)::int)
-            from release r where r.workspace_id = ${entrada.workspaceId}), 0) + 1),
           ${entrada.titulo}, ${entrada.responsable}, ${entrada.fechaObjetivo}::date, ${actorId}
         returning id`
       )[0];
@@ -911,11 +912,9 @@ export async function constatarEffectiveState(
     let es;
     try {
       [es] = await tx`
-        insert into effective_state (workspace_id, servicio_id, release_id, codigo, resumen,
+        insert into effective_state (workspace_id, servicio_id, release_id, resumen,
                                      constatado_por, constatado_en)
         select ${entrada.workspaceId}, dv.servicio_id, r.id,
-          'ES-' || (coalesce((select max(substring(x.codigo from 4)::int)
-            from effective_state x where x.workspace_id = ${entrada.workspaceId}), 0) + 1),
           ${entrada.resumen}, ${actorId}, ${entrada.constatadoEn}::date
         from release r
         join design_version dv on dv.id = r.design_version_id and dv.workspace_id = r.workspace_id
@@ -1046,7 +1045,11 @@ export async function designVersionCompleta(
                   where c.effective_state_id = es.id and c.workspace_id = es.workspace_id), '[]'::jsonb))
               from effective_state es
               where es.release_id = r.id and es.workspace_id = r.workspace_id))
-            order by r.codigo)
+            -- Por el NÚMERO, no por el texto: 'RL-10' va antes que 'RL-2' en orden
+            -- lexicográfico, y los números de release son del workspace entero, así que una
+            -- sola design version cruza ese borde enseguida. Que la columna SEA la serie no
+            -- basta; hay que leerla como serie.
+            order by numero_de_serie(r.codigo))
           from release r
           where r.design_version_id = dv.id and r.workspace_id = dv.workspace_id
         ), '[]'::jsonb) as releases,
@@ -1090,7 +1093,8 @@ export async function designVersionCompleta(
         -- guard de anclaje (aprobadas, del MISMO servicio, y no ella misma).
         coalesce((
           select jsonb_agg(jsonb_build_object('id', a2.id, 'codigo', a2.codigo,
-            'titulo', a2.titulo) order by a2.codigo)
+            -- Mismo motivo que los releases: el código ordena como número, no como texto.
+            'titulo', a2.titulo) order by numero_de_serie(a2.codigo))
           from design_version a2
           where a2.workspace_id = dv.workspace_id and a2.servicio_id = dv.servicio_id
             and a2.estado = 'aprobada' and a2.id <> dv.id

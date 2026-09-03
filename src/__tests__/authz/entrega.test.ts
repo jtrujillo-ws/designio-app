@@ -24,7 +24,12 @@ import {
   tableroDeConciliacion,
   versionAprobadaDelServicio,
 } from '@/lib/entrega/entrega.servicio';
-import { calcularDiff, conciliacionCompleta, plegarEstadoVigente } from '@/lib/entrega/entrega.diff';
+import {
+  calcularDiff,
+  conciliacionCompleta,
+  normalizarTitulo,
+  plegarEstadoVigente,
+} from '@/lib/entrega/entrega.diff';
 import {
   AgregarElementoSchema,
   ConstatarSchema,
@@ -64,6 +69,11 @@ const AYER = dia(-1);
  * rechazo nunca quede sin observar: una promesa rechazada que nadie mira tumba la corrida
  * entera aunque el test que la creó haya pasado.
  */
+/** El número de un código de serie ('DV-7' → 7), como lo lee `numero_de_serie` en la base. */
+function numeroDe(codigo: string): number {
+  return Number(/[0-9]+$/.exec(codigo)![0]);
+}
+
 async function siguePendiente(operacion: Promise<unknown>): Promise<boolean> {
   let termino = false;
   const marcar = () => {
@@ -4092,33 +4102,178 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     });
   });
 
+  it('sin nodo, el mismo tipo y el mismo título tampoco son dos elementos', async () => {
+    // El escalón que el índice del nodo no alcanza. «clave» empareja los elementos sin nodo
+    // por tipo + título normalizado, así que dos así son la MISMA identidad y el pliegue los
+    // cuenta como uno mientras G7 los cuenta como dos — el mismo fallo, en el único escalón
+    // que quedaba sin unicidad.
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del tercer escalón');
+    const proy = await proyectoConGates('P-129', 'Proyecto del tercer escalón');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del tercer escalón',
+      resumen: '',
+      superaA: null,
+    });
+    const suelto = (titulo: string, tipo: 'canal' | 'rol') =>
+      agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        tipo,
+        operacion: 'agrega',
+        titulo,
+        detalle: '',
+        nodoId: null,
+        decisionIds: [],
+        insightIds: [],
+      });
+
+    await suelto('Atención telefónica', 'canal');
+    // El mismo título, y además escrito distinto: acentos, mayúsculas y espacios de sobra son
+    // el MISMO título para la clave, así que también tienen que serlo para el índice.
+    await expect(suelto('  ATENCION   telefonica ', 'canal')).rejects.toThrow(/UN elemento/);
+    // Y lo que NO se prohíbe: otro TIPO es otra identidad — es justo lo que la clave
+    // distingue en este escalón, y prohibirlo aquí desharía aquel arreglo.
+    const otroTipo = await suelto('Atención telefónica', 'rol');
+    expect(otroTipo.elementoId).toBeTruthy();
+  });
+
+  it('la normalización de la BASE y la de TypeScript dicen lo mismo', async () => {
+    // Son los dos lados de la misma regla —el índice que la impone y el pliegue que la
+    // aplica— y no pueden compartir código, porque una corre también en el navegador. Este
+    // test es lo único que las mantiene juntas: si alguien toca una, aquí se ve.
+    const admin = sqlAdmin();
+    const casos = [
+      'Atención telefónica',
+      '  ATENCION   telefonica ',
+      'Ñandú Ünico',
+      'Canal\u00a0\u00a0con espacios raros',
+      'MAYÚSCULAS y minúsculas',
+      'con\ttabulador\ny salto',
+      'sin nada especial',
+      'ácido básico cañón',
+    ];
+    for (const caso of casos) {
+      const [f] = await admin`select titulo_normalizado(${caso}) as n`;
+      expect(f!.n as string).toBe(normalizarTitulo(caso));
+    }
+  });
+
+  it('el código de serie lo pone la BASE: nadie puede envenenar la serie', async () => {
+    // El siguiente código sale de un max() sobre la tabla. Mientras el valor lo escribía el
+    // llamante, una sola fila con el tope —'DV-999999999', perfectamente válida— dejaba al
+    // workspace sin poder crear versiones NUNCA MÁS: toda creación posterior calcularía diez
+    // dígitos y el CHECK las rechazaría, y ni se borran design versions ni el rol de la app
+    // puede actualizar el código. Ahora el valor no viene de fuera: la base lo sobrescribe.
+    const admin = sqlAdmin();
+    const [dvRef] = await admin`select proyecto_id, servicio_id from design_version
+      where workspace_id = ${ws} limit 1`;
+    const [creada] = await admin`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, codigo, titulo, creado_por)
+      values (${ws}, ${dvRef!.proyecto_id as string}, ${dvRef!.servicio_id as string},
+              'DV-999999999', 'La que intentaba envenenar la serie', ${leadId})
+      returning codigo`;
+    // El código elegido se IGNORA, no se rechaza: da igual lo que mande quien inserta.
+    expect(creada!.codigo).not.toBe('DV-999999999');
+    expect(creada!.codigo as string).toMatch(/^DV-[1-9][0-9]{0,8}$/);
+
+    // Y la serie sigue viva: la creación normal siguiente numera detrás de la anterior.
+    const siguiente = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: (
+        await proyectoConGates('P-130', 'Proyecto de la serie sana')
+      ) as unknown as string,
+      servicioId: (await servicioConToBe('Servicio de la serie sana')).servicioId,
+      journeyId: null,
+      titulo: 'La de después',
+      resumen: '',
+      superaA: null,
+    });
+    const [dvSig] = await admin`select codigo from design_version
+      where id = ${siguiente.designVersionId}`;
+    expect(numeroDe(dvSig!.codigo as string)).toBeGreaterThan(numeroDe(creada!.codigo as string));
+  });
+
+  it('los releases se ordenan por NÚMERO de serie, no como texto', async () => {
+    // Que la columna SEA la serie no basta: ordenada como TEXTO, 'RL-10' va antes que 'RL-2'.
+    // Y los números de release son del workspace entero, así que una sola design version
+    // cruza ese borde enseguida y la pantalla enseña la serie desordenada.
+    //
+    // Es la lección del barrido anterior: pregunté «¿ordena por secuencia en vez de por
+    // sello?» —y la respuesta era sí— pero no «¿este orden ordena de verdad?».
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-132', 'Proyecto del orden de releases');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del orden');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La de los muchos releases',
+      resumen: '',
+      superaA: null,
+    });
+    const el1 = await elementoSuelto(dv.designVersionId, 'Lo primero del orden');
+    const el2 = await elementoSuelto(dv.designVersionId, 'Lo segundo del orden');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const plan = async (titulo: string, elementoId: string) =>
+      (
+        await planificarRelease(leadId, {
+          workspaceId: ws,
+          designVersionId: dv.designVersionId,
+          titulo,
+          responsable: 'Equipo',
+          fechaObjetivo: HOY,
+          elementos: [{ elementoId, razon: '' }],
+        })
+      ).releaseId;
+    const rl1 = await plan('El que va primero', el1);
+    const rl2 = await plan('El que va después', el2);
+
+    // Se renumeran a dos códigos CANÓNICOS que cruzan el borde: 'RL-1000' es menor que
+    // 'RL-800' como texto y mayor como número. Números altos para no chocar con la serie
+    // que los demás tests van gastando.
+    await admin`update release set codigo = 'RL-800' where id = ${rl1}`;
+    await admin`update release set codigo = 'RL-1000' where id = ${rl2}`;
+
+    const vista = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(vista!.releases.map((r) => r.codigo)).toEqual(['RL-800', 'RL-1000']);
+  });
+
   it('los códigos de serie son CANÓNICOS: el orden depende de leerlos como número', async () => {
     // Desde que el orden lo da el número interpretado y no el sello, un código no canónico
     // es carga estructural: 'DV-01' y 'DV-1' pasan la unicidad de TEXTO pero valen lo mismo
     // como número, y entonces el keyset de la lista pierde el orden total que asume —puede
     // saltarse filas en el borde de una página— y la elección del ES vigente del mismo día
-    // vuelve a ser no determinista. Se cierra donde nace, en el CHECK.
+    // vuelve a ser no determinista.
+    //
+    // Por el camino del INSERT ya no se llega: el código lo pone la base y sobrescribe lo que
+    // mande quien inserta (ver el test de arriba). El CHECK sigue puesto porque es la
+    // afirmación estructural de qué puede contener la columna, y se comprueba por el único
+    // camino que lo alcanza: un UPDATE de administrador, que ningún trigger toca.
     const admin = sqlAdmin();
-    const [dvOk] = await admin`select id, codigo, proyecto_id, servicio_id, workspace_id
-      from design_version where workspace_id = ${ws} limit 1`;
-    const proyectoDe = dvOk!.proyecto_id as string;
-    const servicioDe = dvOk!.servicio_id as string;
-
-    const conCodigo = (codigo: string) =>
-      admin`insert into design_version
-        (workspace_id, proyecto_id, servicio_id, codigo, titulo, creado_por)
-        values (${ws}, ${proyectoDe}, ${servicioDe}, ${codigo}, 'La del código raro', ${leadId})`;
+    const [dvOk] = await admin`select id, codigo from design_version
+      where workspace_id = ${ws} order by numero_de_serie(codigo) limit 1`;
+    const recodificar = (codigo: string) =>
+      admin`update design_version set codigo = ${codigo} where id = ${dvOk!.id as string}`;
 
     // Cero a la izquierda: el gemelo silencioso de otro código.
-    await expect(conCodigo('DV-01')).rejects.toThrow();
-    // Sin número, o con un cero que ninguna serie emite.
-    await expect(conCodigo('DV-0')).rejects.toThrow();
-    // Y una tirada que desbordaría el int al interpretarla.
-    await expect(conCodigo('DV-1234567890')).rejects.toThrow();
+    await expect(recodificar('DV-01')).rejects.toThrow();
+    // El cero que ninguna serie emite.
+    await expect(recodificar('DV-0')).rejects.toThrow();
+    // Y la tirada que desbordaría el int al interpretarla.
+    await expect(recodificar('DV-1234567890')).rejects.toThrow();
 
-    // Lo que la serie sí emite de verdad pasa, y se lee como su número.
+    // Lo que la serie sí emite pasa, y se lee como su número.
     const [n] = await admin`select numero_de_serie(${dvOk!.codigo as string}) as n`;
-    expect(n!.n).toBeGreaterThan(0);
+    expect(n!.n).toBe(numeroDe(dvOk!.codigo as string));
   });
 
   it('un elemento cita VARIOS motivos, y la lectura los devuelve todos', async () => {
@@ -4328,43 +4483,60 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // DESPUÉS. Los dos relojes se contradicen en cuanto hay espera: una transacción que
     // empezó ANTES y se quedó esperando obtiene un número MAYOR con un sello MENOR.
     //
-    // Y donde el orden decide el estado eso no es cosmético: el effective state vigente es
-    // el PLIEGUE cronológico de las constataciones del servicio (RF-06.10), así que si dos
-    // caen en la misma fecha de calendario y se desempatan por el sello, el pliegue aplica
-    // ES-2 primero y deja que ES-1 lo pise. Estado vigente equivocado y diff equivocado
-    // detrás, sin ninguna excepción que lo delate.
+    // Donde el orden decide el estado eso no es cosmético: el effective state vigente es el
+    // PLIEGUE cronológico de las constataciones del SERVICIO, así que dos que caen en la
+    // misma fecha se desempataban por el sello y el pliegue aplicaba ES-2 primero, dejando
+    // que ES-1 lo pisara. Estado vigente equivocado y diff equivocado detrás.
     //
-    // La inversión se monta de verdad, y sale determinista porque `bloquearRelease` se toma
-    // ANTES que `bloquearSerie`: se retiene el candado del release A, se lanza la
-    // constatación de A —que se queda esperando ahí, con su `now()` ya fijado— y mientras
-    // tanto la de B entra entera y se lleva ES-1. Al soltar, A numera ES-2 con un sello
-    // anterior al de B.
+    // Las dos constataciones tienen que compartir IDENTIDAD LÓGICA para que el orden decida
+    // un ganador, y por eso viven en design versions distintas de la misma cadena: dentro de
+    // UNA versión, dos elementos con la misma identidad ya no pueden convivir. Es además el
+    // caso real —la historia de un servicio se reparte entre sus versiones sucesivas—.
+    //
+    // La inversión se monta de verdad y sale determinista porque `bloquearRelease` se toma
+    // ANTES que `bloquearSerie`: se retiene el candado del release A, su constatación se
+    // queda esperando ahí con el `now()` ya fijado, la de B entra entera y numera primero, y
+    // al soltar A numera después con un sello anterior.
     const admin = sqlAdmin();
-    const proy = await proyectoConGates('P-125', 'Proyecto del desempate');
+    const proy = await proyectoConGates('P-131', 'Proyecto del desempate');
     const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del desempate');
-    const dv1 = await crearDesignVersion(leadId, {
-      workspaceId: ws,
-      proyectoId: proy,
-      servicioId: svcId,
-      journeyId,
-      titulo: 'La que deja la historia',
-      resumen: '',
-      superaA: null,
-    });
-    // Mismo tipo y mismo título: sin catálogo ni nodo, comparten IDENTIDAD LÓGICA, que es
-    // lo que hace que el pliegue tenga que elegir uno y el orden decida cuál.
-    const elA = await elementoSuelto(dv1.designVersionId, 'Atención telefónica');
-    const elB = await elementoSuelto(dv1.designVersionId, 'Atención telefónica');
-    await aprobarDesignVersion(leadId, {
-      workspaceId: ws,
-      designVersionId: dv1.designVersionId,
-      motivo: '',
-    });
 
-    const releaseCon = async (titulo: string, elementoId: string): Promise<string> => {
+    const versionCon = async (titulo: string, supera: string | null) => {
+      const dv = await crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proy,
+        servicioId: svcId,
+        journeyId,
+        titulo,
+        resumen: '',
+        superaA: supera,
+      });
+      // Mismo tipo y mismo título en las dos: sin nodo, eso ES la misma identidad lógica.
+      const el = await agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        tipo: 'canal',
+        operacion: 'agrega',
+        titulo: 'Atención telefónica',
+        detalle: '',
+        nodoId: null,
+        decisionIds: [],
+        insightIds: [],
+      });
+      await aprobarDesignVersion(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        motivo: '',
+      });
+      return { id: dv.designVersionId, elementoId: el.elementoId };
+    };
+
+    // El release de cada versión se planifica y despliega ANTES de que la siguiente la
+    // supere: una versión que el propio proyecto reemplazó ya no admite trabajo nuevo.
+    const desplegarDe = async (dvId: string, elementoId: string, titulo: string) => {
       const rl = await planificarRelease(leadId, {
         workspaceId: ws,
-        designVersionId: dv1.designVersionId,
+        designVersionId: dvId,
         titulo,
         responsable: 'Equipo',
         fechaObjetivo: HOY,
@@ -4378,10 +4550,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       });
       return rl.releaseId;
     };
-    const rlA = await releaseCon('El que espera el candado', elA);
-    const rlB = await releaseCon('El que se cuela', elB);
 
-    // Se retiene el candado del release A hasta que la constatación de A esté esperándolo.
+    const dvA = await versionCon('La primera de la cadena', null);
+    const rlA = await desplegarDe(dvA.id, dvA.elementoId, 'El que espera el candado');
+    const dvB = await versionCon('La segunda de la cadena', dvA.id);
+    const rlB = await desplegarDe(dvB.id, dvB.elementoId, 'El que se cuela');
+
+    // Se retiene el candado del release A hasta que su constatación esté esperándolo.
     let listo!: () => void;
     const tomado = new Promise<void>((r) => (listo = r));
     let liberar!: () => void;
@@ -4400,13 +4575,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       desfaseUtcMinutos: 0,
       resumen: 'La que empezó antes',
       constataciones: [
-        { elementoId: elA, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+        { elementoId: dvA.elementoId, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
       ],
     });
     try {
       // Con su `now()` ya fijado y sin número todavía.
       expect(await siguePendiente(constatarA)).toBe(true);
-      // B entra entera mientras A espera: se lleva ES-1 con un sello POSTERIOR.
+      // B entra entera mientras A espera: se lleva el número menor con un sello POSTERIOR.
       await constatarEffectiveState(leadId, {
         workspaceId: ws,
         releaseId: rlB,
@@ -4415,7 +4590,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         resumen: 'La que empezó después',
         constataciones: [
           {
-            elementoId: elB,
+            elementoId: dvB.elementoId,
             resultado: 'desviado',
             queQuedoDistinto: 'Quedó distinto',
             razon: 'Lo dice la que numeró primero',
@@ -4433,7 +4608,6 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // se comprueba la RELACIÓN, que es lo que el desempate mira.
     const [inversion] = await admin`
       select (select codigo from effective_state where release_id = ${rlA}) as codigo_a,
-             (select codigo from effective_state where release_id = ${rlB}) as codigo_b,
              (select numero_de_serie(codigo) from effective_state where release_id = ${rlA})
                > (select numero_de_serie(codigo) from effective_state where release_id = ${rlB})
                  as numero_posterior,
@@ -4442,28 +4616,32 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(inversion!.numero_posterior).toBe(true);
     expect(inversion!.sello_anterior).toBe(true);
 
-    // Y ahora lo que importa: el pliegue tiene que aplicar ES-1 y luego ES-2, así que gana
-    // la constatación de A. Ordenando por el sello ganaba la de B.
-    const dv2 = await crearDesignVersion(leadId, {
+    // Y lo que importa: el pliegue aplica primero la que numeró antes, así que gana la de A.
+    // Ordenando por el sello ganaba la de B.
+    const dvC = await crearDesignVersion(leadId, {
       workspaceId: ws,
       proyectoId: proy,
       servicioId: svcId,
       journeyId,
       titulo: 'La que lee la historia',
       resumen: '',
-      superaA: dv1.designVersionId,
+      superaA: dvB.id,
     });
-    const vista = await designVersionCompleta(leadId, ws, dv2.designVersionId);
+    const vista = await designVersionCompleta(leadId, ws, dvC.designVersionId);
     // El ES vigente es el ÚLTIMO de la serie, no el del sello más nuevo.
     expect(vista!.vigente!.codigo).toBe(inversion!.codigo_a as string);
     // La historia llega en orden de serie…
-    expect(vista!.vigente!.constataciones.map((c) => c.elementoId)).toEqual([elB, elA]);
+    expect(vista!.vigente!.constataciones.map((c) => c.elementoId)).toEqual([
+      dvB.elementoId,
+      dvA.elementoId,
+    ]);
     // …y por tanto el pliegue deja vigente lo que dijo la ÚLTIMA de la serie.
     const plegado = [...plegarEstadoVigente(vista!.vigente!.constataciones).values()];
     expect(plegado).toHaveLength(1);
-    expect(plegado[0]!.elementoId).toBe(elA);
+    expect(plegado[0]!.elementoId).toBe(dvA.elementoId);
     expect(plegado[0]!.resultado).toBe('como-aprobado');
   });
+
 
   it('la fecha se juzga en el calendario de QUIEN ESCRIBE, no en el de la base (RF-06.5, RF-06.6)', async () => {
     // «No puede ser futura» no significa nada sin decir «futura ¿en qué calendario?», y las

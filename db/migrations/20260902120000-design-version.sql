@@ -659,6 +659,43 @@ returns int language sql stable as $$
 $$;
 revoke execute on function gate_certificado_del_proyecto(uuid, uuid) from public;
 
+-- ¿De qué design versions responde ESTE proyecto ante sus gates? La pregunta del gate y la
+-- pregunta de la supersión son distintas, y durante un tiempo las contestó el mismo filtro:
+--
+--   · el GATE pregunta por el trabajo DEL PROYECTO — qué declaró cambiar y qué hizo con
+--     ello. Es lo que G6 firma (plan) y lo que G7 concilia.
+--   · `estado = 'aprobada'` contesta otra cosa: cuál es la versión que gobierna EL SERVICIO
+--     ahora mismo (SYS-05, y por eso el índice único parcial es por servicio).
+--
+-- Confundirlas dejaba al proyecto A INCERTIFICABLE en cuanto otro proyecto B superaba su
+-- versión —flujo soportado, porque `supera_a` está restringido por servicio y no por
+-- proyecto—: DV-A salía de los chequeos de A, G6 decía que A no tiene plan y G7 que no
+-- tiene tablero, aunque el trabajo de A estuviera entero. Y abrir una tercera versión no
+-- arreglaba nada: solo trasladaba el bloqueo al proyecto siguiente. Que alguien supere
+-- DV-A no deshace el plan de A ni sus constataciones; solo deja de ser la que manda.
+--
+-- Lo que SÍ saca a una versión del conjunto es que EL PROPIO PROYECTO la haya reemplazado:
+-- si A aprobó DV-1 y después DV-2, los elementos de DV-1 que nadie planificó son decisiones
+-- que A mismo sustituyó, y exigirles release o constatación ataría sus gates a un ciclo que
+-- el proyecto cerró a conciencia. Esa es la distinción que faltaba: no «superada», sino
+-- «superada POR MÍ».
+--
+-- Lo que dejó EN VUELO una versión superada —por quien sea— es harina de otro costal y lo
+-- sigue mirando G7 aparte: un release desplegado sin constatar cambia el estado del
+-- servicio aunque la decisión que lo motivó ya esté reemplazada.
+create function design_versions_a_cargo_del_proyecto(p_proyecto uuid, p_workspace uuid)
+returns setof uuid language sql stable as $$
+  select dv.id
+  from design_version dv
+  where dv.proyecto_id = p_proyecto and dv.workspace_id = p_workspace
+    and dv.estado <> 'borrador'
+    and not exists (
+      select 1 from design_version suc
+      where suc.supera_a = dv.id and suc.workspace_id = dv.workspace_id
+        and suc.proyecto_id = p_proyecto and suc.estado <> 'borrador')
+$$;
+revoke execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) from public;
+
 -- El proyecto que produce la design version y el servicio que cambia tienen que
 -- pertenecer al mismo reto. Ninguna FK lo dice: design_version referencia proyecto y
 -- servicio por separado, y los dos existen en el workspace.
@@ -1458,23 +1495,27 @@ begin
     -- que faltaba era el «cada». Dueño y fecha no hay que comprobarlos: release.responsable
     -- y fecha_objetivo son not null con CHECK, así que estar asignado ya los implica.
     if new.numero = 6 then
-      -- El gemelo vacuo, igual que en G7: sin design version aprobada con elementos no hay
-      -- plan que firmar, y el «no exists elemento sin release» de abajo sería vacuamente
-      -- cierto por no haber ningún elemento que mirar.
+      -- El conjunto es «de qué responde este proyecto» (design_versions_a_cargo_del_proyecto)
+      -- y no «cuál manda en el servicio»: que otro proyecto haya superado la versión de este
+      -- no deshace su plan, solo deja de ser la vigente. Lo que sí la saca es que este mismo
+      -- proyecto la haya reemplazado.
+      --
+      -- El gemelo vacuo, igual que en G7: sin design version con elementos no hay plan que
+      -- firmar, y el «no exists elemento sin release» de abajo sería vacuamente cierto por
+      -- no haber ningún elemento que mirar.
       if not exists (
         select 1 from design_version dv
-        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
-          and dv.estado = 'aprobada'
+        where dv.id in (select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
           and exists (select 1 from elemento_cambio ec
             where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id)
       ) then
-        raise exception 'no se puede aprobar G6: el proyecto no tiene ninguna design version aprobada con elementos que planificar (RF-06.4)';
+        raise exception 'no se puede aprobar G6: el proyecto no tiene ninguna design version con elementos que planificar (RF-06.4)';
       end if;
       if exists (
         select 1 from elemento_cambio ec
-        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
-        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
-          and dv.estado = 'aprobada'
+        where ec.workspace_id = new.workspace_id
+          and ec.design_version_id in (
+            select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
           and not exists (select 1 from release_elemento re
             where re.elemento_id = ec.id and re.workspace_id = ec.workspace_id)
       ) then
@@ -1498,24 +1539,24 @@ begin
       -- repartió en releases, ni constató. Es el mismo agujero que tapa exigir ≥1 ítem
       -- de checklist («sin ítems no hay pendientes»), y la misma regla que la app ya
       -- aplica en `conciliacionCompleta([])`: un tablero vacío no está completo, está
-      -- vacío. Se exige la design version APROBADA y CON elementos porque es la única
-      -- que produce filas de conciliación: una aprobada sin elementos —que la transición
-      -- ya no deja nacer, pero que un backfill podría dejar— volvería a vaciar el
-      -- predicado sin que se note.
+      -- vacío. Se exige CON elementos porque son los que producen filas de conciliación:
+      -- una versión sin elementos —que la transición ya no deja nacer, pero que un
+      -- backfill podría dejar— volvería a vaciar el predicado sin que se note. Y se
+      -- pregunta por las versiones DE ESTE PROYECTO, no por la vigente del servicio: ver
+      -- design_versions_a_cargo_del_proyecto.
       if not exists (
         select 1 from design_version dv
-        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
-          and dv.estado = 'aprobada'
+        where dv.id in (select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
           and exists (select 1 from elemento_cambio ec
             where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id)
       ) then
-        raise exception 'no se puede aprobar G7: el proyecto no tiene ninguna design version aprobada con elementos que conciliar (RF-06.7)';
+        raise exception 'no se puede aprobar G7: el proyecto no tiene ninguna design version con elementos que conciliar (RF-06.7)';
       end if;
       if exists (
         select 1 from elemento_cambio ec
-        join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
-        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
-          and dv.estado = 'aprobada'
+        where ec.workspace_id = new.workspace_id
+          and ec.design_version_id in (
+            select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
           and not exists (
             select 1 from constatacion c
             join effective_state es on es.id = c.effective_state_id and es.workspace_id = c.workspace_id

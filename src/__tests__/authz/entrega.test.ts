@@ -809,12 +809,15 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(diff.seMantiene.map((s) => s.elementoId)).toEqual([elPolitica]);
   });
 
-  it('G7 no se aprueba sobre la nada: sin design version vigente no hay tablero que cerrar', async () => {
-    // El caso llega por el camino real: el proyecto SÍ tuvo su design version, firmó G6
-    // con el plan completo, y para cuando pide G7 otro proyecto ya la ha superado. Su
-    // tablero se queda sin filas —los elementos de una superada son historia de un ciclo
-    // anterior y el guard los excluye a propósito—, y sin filas el «no hay elementos en
-    // estado desconocido» sería vacuamente cierto.
+  it('que otro proyecto le supere la versión no deja al proyecto sin poder certificar', async () => {
+    // El gate pregunta por el trabajo DEL PROYECTO; la supersión dice cuál es la versión
+    // vigente PARA EL SERVICIO. Son dos preguntas distintas y durante un tiempo las
+    // contestaba el mismo filtro (`estado = 'aprobada'`): en cuanto otro proyecto superaba
+    // la versión de este —flujo soportado, y la salida que la regla del proyecto
+    // certificado ofrece—, sus propios gates dejaban de ver su único trabajo y el proyecto
+    // se volvía INCERTIFICABLE, sin que abrir otra versión arreglara nada (solo trasladaba
+    // el bloqueo). Ahora el conjunto es «de qué responde este proyecto», del que solo sale
+    // lo que el propio proyecto reemplazó.
     const admin = sqlAdmin();
     const [p] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
       values (${ws}, ${retoId}, 'P-92', 'Proyecto superado por otro', ${leadId}) returning id`;
@@ -905,10 +908,85 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       motivo: '',
     });
 
+    // Y G7 lo rechaza, pero por el motivo BUENO: su elemento sigue en un release
+    // planificado, o sea en estado desconocido. Antes lo rechazaba diciendo que no había
+    // tablero —y no había forma de que lo hubiera nunca—.
+    const aprobarG7 = () =>
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
+    await expect(aprobarG7()).rejects.toThrow(/en estado desconocido/);
+
+    // La salida es la del método, no una excepción: se cierra el trabajo propio con
+    // honestidad. 'no-implementado' es una respuesta CONOCIDA (el gate exige honestidad, no
+    // perfección), y con ella el proyecto certifica lo suyo aunque el servicio haya seguido
+    // sin él.
+    const [rl] = await admin`select id from release
+      where design_version_id = ${propia.designVersionId} and workspace_id = ${ws}`;
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: rl!.id as string,
+      desplegadoEn: HOY,
+    });
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rl!.id as string,
+      constatadoEn: HOY,
+      resumen: '',
+      constataciones: [
+        {
+          elementoId: suyo.elementoId,
+          resultado: 'no-implementado',
+          queQuedoDistinto: 'El ciclo pasó a otro proyecto antes de salir',
+          razon: 'La versión se superó desde el proyecto siguiente',
+        },
+      ],
+    });
+    await aprobarG7();
+    const [g7] = await admin`select estado from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
+    expect(g7!.estado).toBe('aprobado');
+  });
+
+  it('un tablero sin filas no está completo: está vacío (RF-06.7)', async () => {
+    // La defensa del gemelo vacuo sigue en pie, y ahora solo la alcanza lo que su comentario
+    // nombra: un backfill que deje una design version sin elementos. Por el camino normal ya
+    // no se llega —la transición no aprueba una versión sin elementos y G6 exige el mismo
+    // conjunto que G7—, y por eso se monta con SQL de administrador: sin este test, quitar
+    // la comprobación no rompería nada.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-104', 'Proyecto al que le vacían el tablero');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del tablero vacío');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que se queda sin elementos',
+      resumen: '',
+      superaA: null,
+    });
+    const el = await elementoSuelto(dv.designVersionId, 'Elemento que después no estará');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'Plan que se firma',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: el, razon: '' }],
+    });
+    await aprobarGatesHasta(proy, 6);
+
+    await admin`delete from release_elemento where elemento_id = ${el} and workspace_id = ${ws}`;
+    await admin`delete from elemento_cambio where id = ${el} and workspace_id = ${ws}`;
     await expect(
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`,
-    ).rejects.toThrow(/ninguna design version aprobada con elementos/);
+    ).rejects.toThrow(/ninguna design version con elementos que conciliar/);
     // Es la misma regla que la app ya aplicaba del lado puro.
     expect(conciliacionCompleta([])).toBe(false);
   });
@@ -1501,7 +1579,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // igual que en G7. El ítem del checklist está cumplido y no demuestra nada — registra
     // un objeto citado o un N/A, no deriva cobertura de release_elemento.
     await expect(aprobarGateCrudo(6)).rejects.toThrow(
-      /ninguna design version aprobada con elementos que planificar/,
+      /ninguna design version con elementos que planificar/,
     );
 
     const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { CSSProperties, FormEvent } from 'react';
 import { createFileRoute, Link, useNavigate, useRouter } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
@@ -293,8 +293,26 @@ function FormularioDesignVersion({
     null,
   );
   const [cargandoVigente, setCargandoVigente] = useState(false);
+  /**
+   * Cuál es la selección que MANDA. Elegir un servicio dispara dos viajes al servidor, y
+   * dos selecciones seguidas pueden volver DESORDENADAS: la respuesta de A instalaba sus
+   * to-be y su versión aprobada con B ya elegido, y entonces el formulario ofrecía
+   * journeys que el guard rechaza («el to-be es el de SU servicio») o mandaba
+   * `superaA = null` sobre un servicio que sí tiene aprobada — sin más salida que volver a
+   * cambiar la selección.
+   *
+   * Es un contador y no el id del servicio a propósito: con el id, la secuencia A → B → A
+   * aceptaría la respuesta vieja de A por parecerse a la nueva.
+   *
+   * Va en una `ref` y no en estado porque hay que leerla DESPUÉS del await, y lo que ve la
+   * clausura de un `useState` es el valor de SU render. Es el mismo tipo de estado rancio
+   * que #18 cerró en el layout, pero no el mismo caso: allí sobrevivía estado a un cambio
+   * de workspace; aquí llega tarde una respuesta que ya no interesa.
+   */
+  const peticion = useRef(0);
 
   async function elegirServicio(nuevo: string) {
+    const mia = ++peticion.current;
     setServicioId(nuevo);
     // Proyecto, journey y «supera a» eran del servicio anterior: dejarlos puestos mandaría
     // al endpoint combinaciones que los guards rechazan.
@@ -312,12 +330,17 @@ function FormularioDesignVersion({
         listaDeJourneys({ data: { workspaceId, servicioId: nuevo, tipo: 'to-be' } }),
         versionAprobadaDeServicio({ data: { workspaceId, servicioId: nuevo } }),
       ]);
+      if (peticion.current !== mia) return;
       setJourneys(pagina.journeys.map((j) => ({ id: j.id, nombre: j.nombre })));
       setHayMasJourneys(pagina.siguiente !== null);
       setVigente(aprobada);
     } finally {
-      setCargandoJourneys(false);
-      setCargandoVigente(false);
+      // También el «cargando»: si la respuesta tardía lo apagara, la selección nueva se
+      // quedaría pintada como si ya hubiera terminado de cargar.
+      if (peticion.current === mia) {
+        setCargandoJourneys(false);
+        setCargandoVigente(false);
+      }
     }
   }
 

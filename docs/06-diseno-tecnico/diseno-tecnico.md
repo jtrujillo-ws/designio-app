@@ -285,7 +285,7 @@ Implementación del pipeline único (SPEC-08) en `src/lib/ai`:
 |---|---|
 | Scoping | Resolver `AlcanceDeContexto` con las consultas de SPEC-02 (subgrafo por reto + permisos del solicitante); serialización compacta con IDs estables |
 | Generación | SDK de Anthropic con **salida estructurada validada por Zod** (esquema por capacidad C0–CI); material externo delimitado como datos (P5); ejecución en server function (rápidas) o job (largas), con timeouts y reintentos |
-| Persistencia | `propuesta_ai` (tipo, contenido, citas, confianza, lineage: modelo + versión de prompt/config + alcance usado + costo/latencia) |
+| Persistencia | `propuesta_ai` (tipo, contenido, citas, confianza, lineage: modelo + versión de prompt/config + alcance usado) y `llamada_ai`, el libro de llamadas al proveedor: **una fila por intento** (una degradación de modelo son dos), con su uso, costo y latencia propios. Se separan porque el costo es de la LLAMADA, no de cada propuesta: una devuelve un lote, y una negativa del proveedor, una salida fuera de contrato o el intento que falló antes de degradar son llamadas pagadas de las que no nace ninguna propuesta. Cada propuesta apunta a la llamada que la produjo (FK), así que no hay gasto sin registrar ni propuesta sin gasto |
 | Revisión | UI de revisión por capacidad (aceptar/corregir/rechazar por elemento); la corrección conserva el original (SYS-17) |
 | Materialización | Handlers por tipo que crean objetos de dominio firmados por el humano aceptante |
 | Medición | Métricas por propuesta (aceptación, edición, costo) + evals muestrales de grounding |
@@ -300,7 +300,7 @@ Los **prompts y esquemas son artefactos versionados** en el repo, referenciados 
 
 ### Cuotas, evaluaciones y degradación
 
-- **Presupuestos independientes y fail-safe por workspace** (patrón heredado): cuota diaria de llamadas AI con **reserva contra contador antes de llamar** al proveedor (429 al agotar), techo de tokens por operación y truncado de contexto con reserva de completion. Un valor inválido cae al default, nunca desactiva el tope (RF-08.5).
+- **Presupuestos independientes y fail-safe por workspace** (patrón heredado): cuota diaria de llamadas AI con **reserva contra contador antes de llamar** al proveedor (429 al agotar), techo de tokens por operación y truncado de contexto con reserva de completion. Un valor inválido cae al default, nunca desactiva el tope (RF-08.5). La unidad del tope es la **llamada atendida** —lo que se paga—, contada sobre `llamada_ai`, la misma magnitud que suma el reporte de costos: una negativa del proveedor o una salida fuera de contrato gastan aunque no produzcan propuesta. Un intento sin respuesta no cuenta (no se sabe si se facturó, y una caída del proveedor no debe agotar el día del workspace). La reserva es solo el hueco de las generaciones en vuelo y el token de exclusión por ancla; retirarla no devuelve presupuesto.
 - Evals de grounding en CI + corrida programada (dataset propio creciente): fidelidad de citas, afirmaciones no soportadas, formato válido, comparadas contra línea base (regresión, RF-09.10).
 - Degradación: fallo del proveedor o cuota agotada ⇒ bandera "AI no disponible" y paridad manual de todo flujo (SYS-21); los jobs AI no urgentes reintentan.
 

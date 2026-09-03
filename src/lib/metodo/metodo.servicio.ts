@@ -217,8 +217,10 @@ async function bloquearGate(tx: TransactionSql, gateId: string): Promise<void> {
  *
  * Se EXPORTA porque ya no es solo del método: desde SPEC-06, quitarle el release a un
  * elemento tiene que serializarse contra la aprobación de G6 (lo que el gate certificó
- * sigue siendo cierto), y `entrega.servicio` lo toma para eso. El nombre del candado tiene
- * que ser el mismo en los dos lados o no hay serialización ninguna, así que se comparte la
+ * sigue siendo cierto), y `entrega.servicio` lo toma para eso; desde SPEC-08 lo toma
+ * también la materialización de una propuesta AI que crea un criterio, que es otra
+ * escritura de criterios que no pasa por este módulo. El nombre del candado tiene que ser
+ * el mismo en todos los lados o no hay serialización ninguna, así que se comparte la
  * función en vez de repetir la cadena — es el primero de los dos que toma `aprobarGate`,
  * de modo que quien lo tome no puede adelantarse a una aprobación en curso. */
 export async function bloquearReto(tx: TransactionSql, retoId: string): Promise<void> {

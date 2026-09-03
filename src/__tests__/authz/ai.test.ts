@@ -3071,6 +3071,48 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  it('la cola se ordena por la confianza declarada, con la antigüedad de desempate', async () => {
+    // Persistir `confianza` argumentando que «ordena la revisión humana» y después no ordenar
+    // por ella no entrega esa conducta: con FIFO puro, una propuesta nueva y sólida se
+    // quedaba detrás de las viejas y flojas, y el dato no servía para nada.
+    await enWorkspaceLimpio('orden', async ({ ws: wsO, curadorId }) => {
+      const admin = sqlAdmin();
+      const niveles = ['baja', 'alta', 'media'] as const;
+      for (const nivel of niveles) {
+        const [i] = await admin`insert into item_importacion
+          (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+          values (${wsO}, ${`Item ${nivel}`}, ${MATERIAL}, 'nota', 'ref', ${curadorId})
+          returning id`;
+        await conProveedor(
+          {
+            ok: true,
+            datos: { ...CONTENIDO_CI, confianzaPropuesta: nivel },
+            intentos: [intento({ latenciaMs: 50, uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsO,
+              capacidad: 'CI',
+              anclaId: i!.id as string,
+            }),
+        );
+      }
+
+      const panel = await panelPropuestas(curadorId, wsO);
+      // Se generaron en orden baja → alta → media; la cola las devuelve por confianza.
+      expect(panel.pendientes.map((p) => p.confianza)).toEqual([
+        CONFIANZA_PROPUESTA_NUMERICA.alta,
+        CONFIANZA_PROPUESTA_NUMERICA.media,
+        CONFIANZA_PROPUESTA_NUMERICA.baja,
+      ]);
+      // Y el total es el total, no lo que cabe: con el corte por confianza, lo que queda
+      // detrás son las MENOS fiables, así que decir el número es lo que distingue «esto es
+      // todo» de «esto es lo que cabe».
+      expect(panel.totalPendientes).toBe(3);
+      expect(panel.hayMasPendientes).toBe(false);
+    });
+  });
+
   it('los relojes del slice no los escribe quien se mide con ellos', async () => {
     // Tres relojes que gobiernan decisiones y que la aplicación NO puede escribir, porque
     // `creado_en` está fuera de los tres grants de INSERT: el tope diario del workspace se

@@ -251,12 +251,14 @@ function PantallaPropuestas() {
             <div style={{ ...etiqueta, paddingTop: 6 }}>
               {datos.pendientes.length === 0
                 ? 'Sin propuestas pendientes de revisión'
-                : `${datos.pendientes.length} pendientes de revisión humana, de la más antigua a la más reciente`}
+                : `${datos.totalPendientes} pendientes de revisión humana, de mayor a menor confianza declarada`}
             </div>
             {datos.hayMasPendientes && (
               <Aviso>
-                Hay más pendientes de las que caben aquí: se muestran las {datos.pendientes.length}{' '}
-                más antiguas. Decide estas y las siguientes aparecerán.
+                Se muestran {datos.pendientes.length} de {datos.totalPendientes} pendientes, las de
+                mayor confianza declarada primero. Las {datos.totalPendientes - datos.pendientes.length}{' '}
+                que quedan detrás son las que el modelo dio por menos fiables: decide estas y
+                aparecerán.
               </Aviso>
             )}
             {datos.pendientes.map((p) => (

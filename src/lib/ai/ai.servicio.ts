@@ -327,10 +327,25 @@ export async function panelPropuestas(
 
     // Se pide una fila de más para saber si el corte dejó algo fuera (mismo truco que la
     // bandeja): el panel lo dice en vez de fingir que eso es todo.
+    //
+    // Y el orden es por CONFIANZA, no por antigüedad. Persistir `confianza` argumentando que
+    // «ordena la revisión humana» y después no ordenar por ella no entrega esa conducta: con
+    // FIFO puro, una propuesta nueva y sólida se quedaba detrás de cien viejas y flojas, y el
+    // dato no servía para nada. La antigüedad sigue siendo el desempate, así que entre iguales
+    // manda la cola de siempre y el drenaje no se rompe.
+    //
+    // `nulls last` porque «sin confianza declarada» no es «confianza cero»: son las sembradas
+    // o las escritas por SQL crudo, y van al final sin fingir un valor que nadie dijo.
     const pendientes = await tx`select ${columnas} ${origen}
       where p.workspace_id = ${workspaceId} and p.estado = 'propuesta'
-      order by p.creado_en asc, p.id asc
+      order by p.confianza desc nulls last, p.creado_en asc, p.id asc
       limit ${PAGINA_PENDIENTES + 1}`;
+    // Cuántas hay en total, para que el recorte diga un número y no «hay más». Con el orden
+    // por confianza, lo que queda detrás del corte son las MENOS fiables: saber cuántas son
+    // es lo que convierte el corte en algo que se puede drenar en vez de en un final falso.
+    const [conteo] = await tx`select count(*)::int as n from propuesta_ai
+      where workspace_id = ${workspaceId} and estado = 'propuesta'`;
+
     // Por `revisada_en`, que es lo que la lista promete: recencia de la DECISIÓN. Con el
     // orden por `creado_en`, decidir una propuesta antigua no la hacía aparecer —quedaba
     // detrás de cincuenta decisiones de propuestas más nuevas— y el revisor no veía lo que
@@ -419,6 +434,7 @@ export async function panelPropuestas(
       pendientes: pendientes.slice(0, PAGINA_PENDIENTES).map(filaDePanel),
       decididas: decididas.slice(0, DECIDIDAS_RECIENTES).map(filaDePanel),
       hayMasPendientes: pendientes.length > PAGINA_PENDIENTES,
+      totalPendientes: Number(conteo!.n),
       hayMasDecididas: decididas.length > DECIDIDAS_RECIENTES,
       itemsPendientes: items.slice(0, PAGINA_ANCLAS).map((i) => ({
         id: i.id as string,

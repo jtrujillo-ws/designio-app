@@ -356,6 +356,10 @@ export type PanelPropuestas = {
    * partir por estado, 150 decisiones nuevas escondían para siempre una propuesta
    * pendiente antigua (y la generación tampoco volvía a ofrecer su item). */
   hayMasPendientes: boolean;
+  /** Cuántas pendientes hay en total, no cuántas caben. Con la cola ordenada por confianza,
+   * lo que el corte deja fuera son las menos fiables, así que decir el número es lo que
+   * distingue «esto es todo» de «esto es lo que cabe». */
+  totalPendientes: number;
   hayMasDecididas: boolean;
   /** Anclas ofrecibles a la generación: items de bandeja pendientes y retos abiertos. El
    * selector del formulario es la ÚNICA puerta a la generación, así que estas listas se

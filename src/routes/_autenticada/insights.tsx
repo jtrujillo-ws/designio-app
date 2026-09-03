@@ -314,10 +314,16 @@ function FichaInsight({
   const [descripcion, setDescripcion] = useState('');
 
   const editable = insight.estado === 'propuesto';
-  // Espejo del guard: solo informa el botón; la exigencia real vive en la base.
-  const listoParaValidar =
-    insight.afirmaciones.length > 0 &&
-    insight.afirmaciones.every((a) => a.esHipotesis || a.citas.length > 0);
+  // Espejo del guard: solo informa el botón; la exigencia real vive en la base. Y desde
+  // 20260902310000 el guard pide que la cita SIRVA, no solo que exista: una cita nace con
+  // derechos vigentes y los derechos se revocan, así que «tiene citas» dejó de ser
+  // condición suficiente. El predicado lo evalúa la base y llega en `usable`: reproducirlo
+  // aquí sería la segunda redacción de la regla.
+  const sinRespaldo = insight.afirmaciones.find(
+    (a) => !a.esHipotesis && !a.citas.some((c) => c.usable),
+  );
+  const listoParaValidar = insight.afirmaciones.length > 0 && sinRespaldo === undefined;
+  const motivoSinRespaldo = sinRespaldo?.citas.find((c) => !c.usable)?.motivoBloqueo ?? null;
 
   async function ejecutar(accion: () => Promise<{ ok: boolean; error?: string }>, fallo: string) {
     setOcupado(true);
@@ -606,7 +612,11 @@ function FichaInsight({
           </Button>
           {!listoParaValidar && (
             <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
-              Falta al menos una cita en las afirmaciones que no son hipótesis.
+              {sinRespaldo && sinRespaldo.citas.length > 0
+                ? `La afirmación «${sinRespaldo.texto}» se apoya en evidencia sin derechos vigentes${
+                    motivoSinRespaldo ? `: ${motivoSinRespaldo}` : ''
+                  }. Validar es irreversible y un insight validado no admite citas nuevas.`
+                : 'Falta al menos una cita en las afirmaciones que no son hipótesis.'}
             </span>
           )}
         </div>

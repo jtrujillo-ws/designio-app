@@ -22,6 +22,7 @@ import {
   crearInsight,
   ErrorInsight,
   insightsCitables,
+  insightsDelWorkspace,
   validarInsight,
 } from '@/lib/insight/insight.servicio';
 import { aprobarGate, marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
@@ -2249,6 +2250,109 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
           where id = ${f.id as string}`;
       }
     }
+  });
+
+  it('validar un insight mira derechos VIVOS, no que la cita exista: el objeto inmutable no nace roto', async () => {
+    // La misma familia que el resto de la rama —comprobar existencia en vez de vigencia—
+    // pero sobre el peor objeto posible: uno INMUTABLE. Se cita evidencia con derechos
+    // vigentes (el guard de cita lo exige), se revocan después mientras el insight sigue
+    // `propuesto` —nada actualiza la cita, así que su trigger no vuelve a correr— y el
+    // guard de validación solo miraba que EXISTIERA una cita. El insight quedaba validado
+    // sin respaldo usable, y ahí empieza la parte fea: aguas abajo todo lo rechaza y
+    // `cita_insert` exige `insight.estado = 'propuesto'`, así que tampoco admite citas de
+    // repuesto. Inservible y sin salida dentro del producto.
+    //
+    // La salida que SÍ existe es que los derechos vuelven —son lo único de este dominio
+    // que va y viene—, así que el arreglo no inventa una transición nueva: para el acto
+    // definitivo antes de que ocurra.
+    const admin = sqlAdmin();
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'documento', ${marca + ' respaldo que se revoca'}, ${leadId})
+      returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, ${marca + ' respaldo revocable'},
+        '{}'::jsonb, ${leadId})
+      returning id`;
+    const evId = ev!.id as string;
+    await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+      values (${ws}, ${evId}, ${leadId})`;
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evId,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Cláusula 7 del contrato',
+      venceEn: null,
+    });
+
+    const ins = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: marca + ' insight que no debe nacer roto',
+      resumen: 'su respaldo pierde los derechos antes de validarlo',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: ins.insightId,
+      texto: 'La verificación concentra el abandono',
+      esHipotesis: false,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId: evId,
+      fragmento: 'el 62% se detiene',
+      localizacion: 'p. 14',
+    });
+
+    // Se retira el consentimiento con el insight todavía propuesto.
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evId,
+      decision: 'denegado',
+      ambito: 'interno',
+      base: 'El titular retiró el consentimiento',
+      venceEn: null,
+    });
+
+    // Por el servicio: rechazo traducido, con la afirmación exacta y la dimensión que
+    // falta. Un DR001 sin rama en el traductor saldría como error de servidor.
+    await expect(validarInsight(leadId, ws, ins.insightId)).rejects.toThrow(ErrorInsight);
+    await expect(validarInsight(leadId, ws, ins.insightId)).rejects.toThrow(
+      /La verificación concentra el abandono/,
+    );
+    // Y por SQL crudo del rol de aplicación, que es donde una regla escrita solo en el
+    // servicio se caería.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update insight set estado = 'validado',
+        validado_por = ${leadId}, validado_en = now()
+        where id = ${ins.insightId} and workspace_id = ${ws}`),
+    ).rejects.toMatchObject({ code: 'DR001' });
+    const [sigue] = await admin`select estado from insight where id = ${ins.insightId}`;
+    expect(sigue!.estado).toBe('propuesto');
+
+    // La pantalla mira lo mismo que la base: el botón de validar no se ofrece, y el aviso
+    // nombra la afirmación y la dimensión en vez de decir «faltan citas», que sería falso.
+    const proyectada = (await insightsDelWorkspace(leadId, ws)).insights.find(
+      (i) => i.id === ins.insightId,
+    );
+    const citaProyectada = proyectada!.afirmaciones[0]!.citas[0]!;
+    expect(citaProyectada.usable).toBe(false);
+    expect(citaProyectada.motivoBloqueo).toContain('deneg');
+
+    // Y la salida existe y es la de siempre: reconceder revive el insight entero. No hacía
+    // falta inventar una transición nueva sobre un objeto inmutable.
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evId,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'El titular volvió a firmar',
+      venceEn: null,
+    });
+    await validarInsight(leadId, ws, ins.insightId);
+    const [validado] = await admin`select estado from insight where id = ${ins.insightId}`;
+    expect(validado!.estado).toBe('validado');
   });
 
   it('el candado del adjunto no depende del aislamiento del llamante: en REPEATABLE READ tampoco pasa', async () => {

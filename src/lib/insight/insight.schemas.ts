@@ -68,6 +68,16 @@ export type CitaDeAfirmacion = {
   evidenciaTitulo: string;
   fragmento: string;
   localizacion: string;
+  /**
+   * Si la evidencia citada SIGUE teniendo derechos vigentes para el ámbito cliente. Una
+   * cita nace con ellos —`evidencia_citable_guard` lo exige— pero los derechos se revocan
+   * y caducan, y validar es irreversible: desde `20260902310000` el guard de validación
+   * comprueba vigencia y no existencia, así que la pantalla tiene que mirar lo mismo o
+   * estaría ofreciendo un botón que la base rechaza.
+   */
+  usable: boolean;
+  /** Qué dimensión falta, para nombrarla en vez de decir «bloqueada» (SYS-14). */
+  motivoBloqueo: string | null;
 };
 
 export type AfirmacionDeInsight = {

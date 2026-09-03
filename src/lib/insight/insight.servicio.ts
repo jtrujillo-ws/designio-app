@@ -40,6 +40,15 @@ function comoErrorDeDominio(e: unknown): never {
   if (err.code === 'P0001' && err.message) {
     throw new ErrorInsight(err.message);
   }
+  // DR001 es el errcode propio de los derechos, y desde 20260902310000 también lo levanta
+  // el guard de VALIDACIÓN: validar es irreversible, así que se comprueba ahí que las
+  // citas siguen sirviendo y no solo que existen. Sin esta rama el mensaje —que ya trae la
+  // afirmación exacta y la dimensión que falta— salía como error de servidor sin traducir,
+  // que es justo lo que SYS-14 prohíbe. El traductor es un consumidor de pleno derecho de
+  // cada restricción nueva.
+  if (err.code === 'DR001' && err.message) {
+    throw new ErrorInsight(err.message);
+  }
   throw e;
 }
 
@@ -313,7 +322,15 @@ export async function insightsDelWorkspace(
                 select jsonb_agg(jsonb_build_object(
                   'id', c.id, 'evidenciaId', c.evidencia_id,
                   'evidenciaTitulo', e.titulo, 'fragmento', c.fragmento,
-                  'localizacion', c.localizacion) order by c.creado_en)
+                  'localizacion', c.localizacion,
+                  -- Se INVOCA el predicado de la base, no se reproduce: es el mismo que el
+                  -- guard de validación (desde 20260902310000) y el de suficiencia del
+                  -- gate. Una cita nace con derechos vigentes pero los derechos se revocan
+                  -- y caducan, así que «tiene cita» dejó de ser «tiene respaldo».
+                  'usable', evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente'),
+                  'motivoBloqueo',
+                    evidencia_motivo_bloqueo(c.evidencia_id, c.workspace_id, 'cliente'))
+                  order by c.creado_en)
                 from cita c
                 join evidencia e on e.id = c.evidencia_id and e.workspace_id = c.workspace_id
                 where c.afirmacion_id = a.id and c.workspace_id = a.workspace_id

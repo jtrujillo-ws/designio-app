@@ -107,6 +107,13 @@ create table consentimiento_item (
   -- registren a la vez (el candado consultivo del servicio los serializa; esto es lo que
   -- pasa si alguien llega por otro camino).
   unique (item_id, workspace_id, version),
+  -- Redundante como clave (el `procesamiento_externo` depende funcionalmente de las tres
+  -- de arriba) y aun así necesaria: es lo que hace EXPRESABLE la FK de `llamada_ai`, que
+  -- no cita una versión cualquiera sino una que autorizara la salida. Una FK solo puede
+  -- apuntar a un índice único NO parcial, así que la condición viaja como columna dentro
+  -- de la clave en vez de como `where`. Sin esto, «autorizó» tendría que comprobarlo un
+  -- guard, y un guard es una comprobación que hay que acordarse de escribir.
+  unique (item_id, workspace_id, version, procesamiento_externo),
   foreign key (item_id, workspace_id) references item_importacion (id, workspace_id)
 );
 
@@ -434,18 +441,38 @@ create table llamada_ai (
   -- FUERA de toda transacción a propósito, así que una revocación que commitee mientras los
   -- bytes viajan no puede detenerla — eso no lo cierra ningún candado. Lo que sí se puede es
   -- que el sistema SEPA qué salió y bajo qué permiso, que es lo que RF-09.4 necesita para
-  -- remediar: con esto, «esto salió amparado por el registro nº N» es un hecho consultable, y
-  -- una revocación posterior (nº N+1) se cruza contra el libro para saber exactamente qué
-  -- material hay que ir a buscar. null cuando el material no es de personas y no había
-  -- consentimiento que citar.
+  -- remediar: una revocación posterior se cruza contra el libro para saber exactamente qué
+  -- material hay que ir a buscar.
+  --
+  -- Y para que eso sea un HECHO y no una afirmación, el número está atado. Un entero suelto
+  -- con `> 0` admitía citar una versión inexistente, la de OTRO item, o la de un registro
+  -- que DENEGÓ el procesamiento externo — y `llamada_ai` la escribe la aplicación, así que
+  -- el libro podía afirmar en falso bajo qué permiso salió material de personas. Un número
+  -- que nadie comprueba es peor que no tener número: invita a fiarse de él justo en la
+  -- remediación, que es cuando más caro sale equivocarse.
   consentimiento_version integer check (consentimiento_version is null or consentimiento_version > 0),
+  -- La mitad «y ese registro AUTORIZABA» de la ligadura, como columna generada para que
+  -- viaje dentro de la FK sin que nadie tenga que escribirla (ni pueda mentir en ella): la
+  -- app no la menciona y la base la deriva. `true` cuando se cita una versión, `null`
+  -- cuando no — y con `null` la FK compuesta no comprueba nada (MATCH SIMPLE), que es
+  -- justo la semántica del «no aplicaba».
+  consentimiento_autoriza_externo boolean
+    generated always as (case when consentimiento_version is null then null else true end) stored,
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
   foreign key (item_id, workspace_id) references item_importacion (id, workspace_id),
   foreign key (reto_id, workspace_id) references reto (id, workspace_id),
+  -- Ligadura completa: la versión citada es de ESTE item, de ESTE workspace, existe, y su
+  -- registro autorizaba el procesamiento externo. Las cuatro columnas en una sola FK.
+  foreign key (item_id, workspace_id, consentimiento_version, consentimiento_autoriza_externo)
+    references consentimiento_item (item_id, workspace_id, version, procesamiento_externo),
   check ((capacidad = 'CI') = (item_id is not null)),
   check ((capacidad = 'C0') = (reto_id is not null)),
+  -- Una generación C0 no tiene item, así que no hay consentimiento que citar. Sin esto, la
+  -- FK se la saltaría entera (item_id null ⇒ MATCH SIMPLE no comprueba) y una llamada C0
+  -- podría llevar un número inventado sin que nada lo mirara.
+  check (item_id is not null or consentimiento_version is null),
   check ((tokens_entrada is null) = (tokens_salida is null)),
   -- Una llamada que no dio contenido utilizable DICE por qué: es la mitad del valor de
   -- anotarla (la otra es cuánto costó).
@@ -472,6 +499,28 @@ create policy llamada_insert on llamada_ai
 create function llamada_ai_registro_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
+  -- La OTRA mitad de la ligadura del consentimiento, la que ninguna FK puede expresar
+  -- porque depende del `tipo_fuente` del item: citar una versión es obligatorio cuando el
+  -- material es de personas, y está prohibido cuando no lo es. Sin las dos direcciones, un
+  -- `null` sería ambiguo entre «no aplicaba» y «no lo escribí», y la remediación de RF-09.4
+  -- no puede distinguir esas dos cosas leyendo el libro — que es para lo único que sirve.
+  --
+  -- Va ANTES del pre-chequeo anti-oráculo de abajo, y a propósito: esto no revela nada (el
+  -- caller ya trae el item y la versión, y sin ser miembro la política no le deja insertar
+  -- de todos modos), y ponerlo después dejaría la regla sin aplicar justo en la escritura
+  -- privilegiada, que es donde más falta hace un suelo.
+  if new.item_id is not null then
+    if exists (select 1 from item_importacion i
+      where i.id = new.item_id and i.workspace_id = new.workspace_id
+        and tipo_fuente_exige_consentimiento(i.tipo_fuente))
+    then
+      if new.consentimiento_version is null then
+        raise exception 'una llamada sobre material de personas anota bajo qué consentimiento salió: falta consentimiento_version (RF-09.4/09.5)';
+      end if;
+    elsif new.consentimiento_version is not null then
+      raise exception 'ese material no exige consentimiento: la llamada no puede citar uno, porque la ausencia es lo que significa «no aplicaba»';
+    end if;
+  end if;
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
@@ -493,7 +542,16 @@ create trigger llamada_ai_registro
 revoke execute on function llamada_ai_registro_guard() from public;
 
 -- Sin UPDATE ni DELETE: lo que costó una llamada ya hecha no se reescribe ni se borra.
-grant select, insert on llamada_ai to designio_app;
+-- Y por COLUMNA, para dejar `creado_en` fuera: es el reloj con el que se cuenta el tope
+-- diario del workspace (`creado_en >= date_trunc('day', now())`), así que con el grant
+-- puesto una llamada podía nacer fechada ayer y no contar para hoy — el presupuesto de
+-- RF-09.12 medido con una regla que el medido escribe. Lo estampa el DEFAULT, que es la
+-- única mano que no tiene motivos. Mismo criterio que `consentimiento_item.version`.
+grant select on llamada_ai to designio_app;
+grant insert (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado,
+              motivo, tokens_entrada, tokens_salida, costo_usd, latencia_ms,
+              consentimiento_version, creado_por)
+  on llamada_ai to designio_app;
 
 create table propuesta_ai (
   id uuid primary key default gen_random_uuid(),
@@ -1059,11 +1117,24 @@ create policy reserva_delete on reserva_ai
     )
   );
 
--- Sin UPDATE: una reserva no se edita, se consume o se libera.
-grant select, insert, delete on reserva_ai to designio_app;
+-- Sin UPDATE: una reserva no se edita, se consume o se libera. Y `creado_en` fuera del
+-- insert por el mismo motivo, aquí todavía más directo: ES el arrendamiento. La caducidad
+-- se mide sobre él —la admisión, el despacho y el fencing de la persistencia—, así que
+-- poder escribirlo era poder acuñarse una reserva inmortal que bloquea su ancla para
+-- siempre, o una nacida caducada que no excluye a nadie.
+grant select, delete on reserva_ai to designio_app;
+grant insert (workspace_id, capacidad, item_id, reto_id, unidades, creado_por)
+  on reserva_ai to designio_app;
 
 -- ── Grants mínimos (UPDATE por columna: solo la transición y su materialización) ──
-grant select, insert on propuesta_ai to designio_app;
+grant select on propuesta_ai to designio_app;
+-- `creado_en` fuera también aquí: es el orden de la cola FIFO que la pantalla drena por el
+-- frente, y una propuesta fechada al principio del tiempo se queda delante de todas para
+-- siempre. Y `revisada_en` fuera porque lo estampa el guard al decidir, no el caller.
+grant insert (workspace_id, capacidad, destino, item_id, reto_id, contenido,
+              contenido_original, confianza, es_simulacion, modelo, prompt_version,
+              alcance_resumen, origen_key, llamada_id, creado_por)
+  on propuesta_ai to designio_app;
 -- Fuera del grant y por tanto sin superficie: capacidad, destino, item_id, reto_id,
 -- contenido_original, confianza, es_simulacion, modelo, prompt_version, alcance_resumen,
 -- origen_key, llamada_id, creado_por — el lineage y el original son inmutables

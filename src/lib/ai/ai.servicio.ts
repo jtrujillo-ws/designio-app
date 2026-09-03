@@ -863,9 +863,12 @@ async function confirmarDespacho(
           estado <> 'pendiente' as ya_decidido,
           tipo_fuente_exige_consentimiento(tipo_fuente)
             and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
-          (select c.version from consentimiento_item c
-            where c.item_id = item_importacion.id and c.workspace_id = item_importacion.workspace_id
-            order by c.version desc limit 1) as version_vigente
+          case when tipo_fuente_exige_consentimiento(tipo_fuente) then
+            (select c.version from consentimiento_item c
+              where c.item_id = item_importacion.id
+                and c.workspace_id = item_importacion.workspace_id
+              order by c.version desc limit 1)
+          end as version_vigente
         from item_importacion
         where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
       if (item?.falta_consentimiento) {
@@ -885,8 +888,16 @@ async function confirmarDespacho(
       // La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción
       // que la aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un
       // hecho consultable y no una reconstrucción por fechas.
+      //
+      // `null` EXACTAMENTE cuando el tipo de fuente no exige consentimiento, que es lo que
+      // la base impone en los dos sentidos: con material de personas es obligatorio citar
+      // uno, sin él está prohibido. Si se leyera «la última versión que haya», un item de
+      // tipo `nota` con un consentimiento registrado por si acaso citaría uno y el guard lo
+      // rechazaría — y con razón, porque ese `null` es el que significa «no aplicaba».
       versionConsentimiento =
-        item.version_vigente === null ? null : Number(item.version_vigente);
+        item.version_vigente === null || item.version_vigente === undefined
+          ? null
+          : Number(item.version_vigente);
     } else {
       const [reto] = await tx`select
           reto_admite_criterios(id, workspace_id) as admite,
@@ -1463,12 +1474,30 @@ async function materializarCriterio(
   } catch (e) {
     const err = e as { code?: string; message?: string };
     // El guard de criterio_exito habla antes que el WITH CHECK (P0001); la política
-    // responde 42501. En ambos casos el motivo es el mismo para quien revisa.
-    if (
-      (err.code === 'P0001' && err.message?.includes('congelados')) ||
-      err.code === '42501'
-    ) {
+    // responde 42501, que no trae motivo. Traducir es obligatorio: sin esto sale el error
+    // crudo del driver a una pantalla de revisión.
+    //
+    // Y hay que traducir CADA causa de congelado por separado, porque cada una tiene su
+    // salida: reabrir la etapa 0 (RF-04.9) descongela el G0 y no descongela una firma. La
+    // primera versión de esto miraba solo la palabra «congelados», que es la del mensaje del
+    // G0; cuando SPEC-07 añadió el registry —cuyo `raise` no la lleva— este `catch` dejó de
+    // reconocerlo y el error crudo pasaba de largo. No se puede volver a preguntar a la base
+    // cuál fue: la transacción ya está abortada. Se decide por el mensaje, que es lo único
+    // que queda en la mano.
+    if (err.code === 'P0001' && err.message?.includes('registry del reto está firmado')) {
+      throw new ErrorAI(
+        'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y no admiten cambios (SYS-22). Esta propuesta quedó obsoleta y solo puede rechazarse',
+      );
+    }
+    if (err.code === 'P0001' && err.message?.includes('congelados')) {
       throw new ErrorAI('El G0 del reto ya fue aprobado: los criterios están congelados');
+    }
+    // 42501 es la política, que rechaza sin decir por qué. Nombrar una sola causa sería
+    // inventarse cuál: el mensaje enumera las que hay y deja al revisor mirar el reto.
+    if (err.code === '42501') {
+      throw new ErrorAI(
+        'La base no admite criterios nuevos en ese reto: o su G0 los congeló, o su registry de medición está firmado. Esta propuesta quedó obsoleta y solo puede rechazarse',
+      );
     }
     throw e;
   }

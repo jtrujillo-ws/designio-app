@@ -222,12 +222,17 @@ export type PropuestaEnPanel = {
   /**
    * Si el ancla sigue admitiendo la materialización y, cuando no, POR QUÉ: el item se curó
    * a mano, su consentimiento dejó de autorizar el procesamiento externo (RF-09.4/09.5), el
-   * G0 del reto congeló sus criterios (SYS-22), o el reto avanzó en su ciclo de vida y ya no
-   * admite criterios nuevos (RF-04.12). Las cuatro dejan la propuesta obsoleta y solo
+   * G0 del reto congeló sus criterios (SYS-22), el registry de medición del reto se firmó
+   * (SYS-22 también, pero es otra puerta), o el reto avanzó en su ciclo de vida y ya no
+   * admite criterios nuevos (RF-04.12). Las cinco dejan la propuesta obsoleta y solo
    * rechazable, pero se explican distinto —y tienen salidas distintas—, así que con un
    * booleano el panel no podía decirlo.
    *
-   * Son cuatro y no tres porque la propuesta vive DOS recorridos: entre que se genera y que
+   * El congelado son DOS valores y no uno porque las salidas no coinciden: reabrir la etapa
+   * 0 (RF-04.9) descongela el del G0 y no descongela el de la firma, que es de ida. Un solo
+   * valor le habría ofrecido al lead un trámite que no desbloquea nada.
+   *
+   * Son cinco y no tres porque la propuesta vive DOS recorridos: entre que se genera y que
    * alguien la revisa pueden pasar días, y en ese hueco cada precondición caduca por su
    * cuenta. El inventario de `ai.servicio.ts` las lista una a una.
    */

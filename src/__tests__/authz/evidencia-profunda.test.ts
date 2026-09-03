@@ -327,7 +327,14 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
   });
 
   it('los derechos caducan: una concesión vencida deja de habilitar la cita', async () => {
-    const ayer = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    // La fecha sale de la BASE, no del reloj del proceso. Quien decide la caducidad es
+    // `current_date` dentro de `evidencia_usable`, y un desfase de huso —o cruzar la
+    // medianoche entre el cálculo y la consulta— haría que el «ayer» del proceso siga
+    // siendo hoy para Postgres y el test fallara sin que nada estuviera roto. Es la misma
+    // regla que este PR aplica al manifiesto: la fecha que decide y la que se compara
+    // tienen que venir del mismo reloj.
+    const [f] = await sqlAdmin()`select (current_date - 1)::text as dia`;
+    const ayer = f!.dia as string;
     await decidirDerechos(leadId, {
       workspaceId: ws,
       evidenciaId: evConDerechos,
@@ -1914,15 +1921,23 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(checks).toEqual([]);
 
     // Una instalación HEREDADA: material sucio que el esquema anterior aceptaba. Se siembra
-    // desactivando el trigger, que es lo único que reproduce «ya estaba ahí».
+    // saltándose el trigger, que es lo único que reproduce «ya estaba ahí».
     const sucio = `heredado ${marca} con control ${String.fromCharCode(7)} dentro`;
-    await admin`alter table item_importacion disable trigger item_texto_importado`;
-    const [item] = await admin`insert into item_importacion
-      (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
-      values (${ws}, ${marca + ' heredado sucio'}, ${sucio}, 'nota', '', ${leadId})
-      returning id`;
-    await admin`alter table item_importacion enable trigger item_texto_importado`;
-    const itemId = item!.id as string;
+    // Con `set local session_replication_role`, NO con `alter table … disable trigger`: lo
+    // segundo cambia el esquema para TODAS las sesiones, así que mientras la ventana está
+    // abierta cualquier otra suite en paralelo escribe sin ese guard. `set local` vive en
+    // esta transacción y muere con ella, que es la única forma de que una suite no le quite
+    // el suelo a otra.
+    const [item] = await admin.begin(
+      (tx) =>
+        tx`set local session_replication_role = 'replica'`.then(
+          () => tx`insert into item_importacion
+            (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+            values (${ws}, ${marca + ' heredado sucio'}, ${sucio}, 'nota', '', ${leadId})
+            returning id`,
+        ) as unknown as Promise<{ id: string }[]>,
+    );
+    const itemId = (item as unknown as { id: string }).id;
 
     // AHORA sí se puede despachar: decidir no cambia el texto, y el curador que lo mira es
     // exactamente quien tiene que poder rechazarlo. Por el servicio, no por SQL.

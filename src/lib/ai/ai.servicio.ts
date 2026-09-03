@@ -141,9 +141,15 @@ async function presupuestoDeHoy(
       --
       -- Se mira el intento MAS RECIENTE, no "hubo alguna caida": una llamada buena posterior
       -- tiene que borrar la caida al instante, porque la ultima observacion es la unica que
-      -- habla del presente. El order by baja por creado_en y desempata por id para que el
-      -- orden sea TOTAL: dos intentos de la misma generacion comparten el reloj de la
-      -- transaccion, y con orden parcial el "ultimo" lo elegiria el planificador.
+      -- habla del presente.
+      --
+      -- El desempate es el PUESTO del intento, no su id. Dos intentos de una generacion
+      -- degradada comparten creado_en exacto —now() es la hora de inicio de la transaccion—
+      -- y el id es un uuid v4, o sea aleatorio: desempatar por el daba un orden total pero
+      -- NO cronologico, y tras una degradacion con exito el primario fallido salia elegido
+      -- como "ultimo intento" la mitad de las veces. El panel avisaba de una caida justo
+      -- despues de una generacion correcta. El id se queda al final solo para que el orden
+      -- siga siendo total entre filas anteriores a la columna, que empatan todas en 0.
       --
       -- Solo sin-respuesta: un rechazo del proveedor o una salida fuera de contrato son
       -- llamadas ATENDIDAS, el tercero contesto y de hecho cobro. Contarlas como caida
@@ -153,7 +159,7 @@ async function presupuestoDeHoy(
                 then (extract(epoch from (now() - u.creado_en)) * 1000)::bigint end
          from llamada_ai u
         where u.workspace_id = ${workspaceId}
-        order by u.creado_en desc, u.id desc
+        order by u.creado_en desc, u.intento desc, u.id desc
         limit 1) as caida_hace_ms`;
   // El cupo pactado del workspace manda; la constante del código es el RESPALDO para
   // «no hay cupo pactado» (NULL) y para cualquier valor que no sea un entero positivo, no
@@ -1133,11 +1139,15 @@ async function registrarLlamadas(
     // actuar— conserva su chequeo.
     const ids: string[] = [];
     let idSalidaValida: string | null = null;
-    for (const intento of intentos) {
+    // El índice del bucle ES el puesto del intento (0 primario, 1 respaldo): el adaptador
+    // devuelve `intentos` EN ORDEN y hasta ahora esa información se tiraba al persistir.
+    // Sin ella, dos filas de la misma transacción comparten `creado_en` y no hay forma
+    // cronológica de saber cuál fue la última.
+    for (const [puesto, intento] of intentos.entries()) {
       const [fila] = await tx`insert into llamada_ai
         (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado, motivo,
          tokens_entrada, tokens_salida, costo_usd, latencia_ms, consentimiento_version,
-         creado_por)
+         intento, creado_por)
         values (${entrada.workspaceId}, ${entrada.capacidad},
                 ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
                 ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
@@ -1145,7 +1155,7 @@ async function registrarLlamadas(
                 ${intento.motivo.slice(0, 500)},
                 ${intento.uso?.entrada ?? null}, ${intento.uso?.salida ?? null},
                 ${intento.uso?.costoUsd ?? null}, ${intento.latenciaMs},
-                ${intento.consentimientoVersion},
+                ${intento.consentimientoVersion}, ${puesto},
                 ${actorId})
         returning id`;
       const id = fila!.id as string;

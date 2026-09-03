@@ -1887,6 +1887,84 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
+  it('una degradación que acaba bien NO avisa de caída, aunque los dos intentos compartan reloj', async () => {
+    // El primario cae y el respaldo responde: la generación fue CORRECTA y el panel no puede
+    // decir que el proveedor no responde. Las dos filas se escriben en la misma transacción,
+    // así que su `creado_en` es idéntico —`now()` es la hora de inicio— y el desempate
+    // decide. Cuando era `id desc` (uuid v4, aleatorio) el primario fallido salía elegido
+    // como «último intento» aproximadamente la mitad de las veces: un orden total, pero no
+    // cronológico. Se repite varias veces justamente porque el fallo era probabilístico —una
+    // sola pasada lo habría visto en verde uno de cada dos intentos—.
+    const admin = sqlAdmin();
+    const [w] = await admin`insert into workspace (nombre) values (${marca + ' degradada'})
+      returning id`;
+    const wsD = w!.id as string;
+    try {
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsD}, ${leadId}, 'lead', ${`${marca}-degr@test.demo`}, 'lead-boutique')`;
+      const [svcD] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+        values (${wsD}, 'Servicio degradado', ${leadId}) returning id`;
+      const [retoD] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+        values (${wsD}, ${svcD!.id as string}, 'R-D1', 'Reto degradado', 'candidato',
+                'peticion-cliente', ${leadId})
+        returning id`;
+
+      for (let vuelta = 0; vuelta < 8; vuelta++) {
+        await admin`delete from llamada_ai where workspace_id = ${wsD}`;
+        // Los dos intentos de UNA generación, en una sola transacción y en orden.
+        await admin.begin(async (tx) => {
+          for (const [puesto, i] of [
+            { modelo: MODELO_PRIMARIO, resultado: 'sin-respuesta', motivo: 'el primario no respondió' },
+            { modelo: MODELO_FALLBACK, resultado: 'salida-valida', motivo: '' },
+          ].entries()) {
+            await tx`insert into llamada_ai
+              (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo,
+               intento, creado_por)
+              values (${wsD}, 'C0', ${retoD!.id as string}, ${i.modelo}, 'entorno',
+                      ${i.resultado}, ${i.motivo}, ${puesto}, ${leadId})`;
+          }
+        });
+        // Las dos filas comparten reloj exacto: si no lo hicieran, este test no probaría nada.
+        const relojes = await admin`select distinct creado_en from llamada_ai
+          where workspace_id = ${wsD}`;
+        expect(relojes.length).toBe(1);
+
+        await conProveedor(RESPUESTA_CI, async () => {
+          const panel = await panelPropuestas(leadId, wsD);
+          expect(panel.ai.proveedorResponde).toBe(true);
+          expect(panel.ai.advertencia).toBe('');
+        });
+      }
+
+      // Y al revés: si el ÚLTIMO puesto es el que cayó, sí avisa. El desempate no está
+      // ignorando la caída, está eligiendo bien cuál fue la última.
+      await admin`delete from llamada_ai where workspace_id = ${wsD}`;
+      await admin.begin(async (tx) => {
+        for (const [puesto, i] of [
+          { modelo: MODELO_PRIMARIO, resultado: 'salida-valida', motivo: '' },
+          { modelo: MODELO_FALLBACK, resultado: 'sin-respuesta', motivo: 'el respaldo tampoco' },
+        ].entries()) {
+          await tx`insert into llamada_ai
+            (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo,
+             intento, creado_por)
+            values (${wsD}, 'C0', ${retoD!.id as string}, ${i.modelo}, 'entorno',
+                    ${i.resultado}, ${i.motivo}, ${puesto}, ${leadId})`;
+        }
+      });
+      await conProveedor(RESPUESTA_CI, async () => {
+        const panel = await panelPropuestas(leadId, wsD);
+        expect(panel.ai.proveedorResponde).toBe(false);
+      });
+    } finally {
+      await admin`delete from llamada_ai where workspace_id = ${wsD}`;
+      await admin`delete from reto where workspace_id = ${wsD}`;
+      await admin`delete from servicio where workspace_id = ${wsD}`;
+      await admin`delete from miembro where workspace_id = ${wsD}`;
+      await admin`delete from workspace where id = ${wsD}`;
+    }
+  });
+
   it('la caída de un workspace no apaga el panel del otro', async () => {
     // El aislamiento no hay que construirlo: `llamada_ai` lleva `workspace_id`, así que la
     // señal nace por inquilino. Es la razón de derivarla del libro en vez de cachearla en el

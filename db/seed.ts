@@ -14,6 +14,7 @@ import {
 } from '../src/lib/metodo/metodo.plantillas';
 import { costoDeUso, MODELO_PRIMARIO } from '../src/lib/ai/ai.degradacion';
 import { PROMPT_VERSION } from '../src/lib/ai/ai.prompts';
+import { CONFIANZA_PROPUESTA_NUMERICA, type ContenidoExtraccion } from '../src/lib/ai/ai.schemas';
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error('Falta DATABASE_URL (conexión admin; ver .env.local.example)');
@@ -629,7 +630,7 @@ async function sembrarPropuestaAI(
        ${luciaId}, 'lead-boutique')`;
   }
 
-  const contenido = {
+  const contenido: ContenidoExtraccion = {
     titulo: 'Abandono en la verificación de identidad',
     resumen:
       'El grueso del abandono se concentra en la carga del documento y en la espera del buró, sin aviso al cliente.',
@@ -680,7 +681,12 @@ async function sembrarPropuestaAI(
     (workspace_id, capacidad, destino, item_id, contenido, contenido_original, confianza,
      modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
     values (${wsId}, 'CI', 'evidencia', ${itemId}, ${tx.json(contenido)}, ${tx.json(contenido)},
-            0.55, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+            -- De la MISMA tabla que usa la generación viva, no un número a mano: el seed
+            -- decía 'alta' en el contenido y guardaba 0.55 en la columna, así que la tarjeta
+            -- y la métrica hablaban de la misma propuesta con dos cifras distintas. Dos
+            -- redacciones del mismo dato dentro de una sola fila.
+            ${CONFIANZA_PROPUESTA_NUMERICA[contenido.confianzaPropuesta]},
+            ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
             ${`item de bandeja «${TITULO_ITEM_AI}» · ${MATERIAL_ITEM_AI.length} de ${MATERIAL_ITEM_AI.length} caracteres`},
             'entorno', ${llamada!.id as string}, ${luciaId})
     returning id`;

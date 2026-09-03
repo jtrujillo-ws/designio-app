@@ -27,9 +27,12 @@ import {
   seguimientoDeImpacto,
 } from '@/lib/medicion/medicion.servicio';
 import {
+  arranqueDelResultado,
+  faltaParaCompletar,
   medicionPorAbrir,
   narrativaDelBorrador,
   postMortemPorAbrir,
+  registryPorAbrir,
   ResultadoCriterioSchema,
   ventanasCerradas,
 } from '@/lib/medicion/medicion.schemas';
@@ -1472,6 +1475,16 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       lectura: 'De 62 a 49: mejora sostenida tras el rediseño de la verificación',
       sinDatosMotivo: '',
     });
+
+    // Con UN criterio resuelto y el otro no, el post mortem todavía no se puede completar:
+    // el guard del cierre lo rechaza mientras falte el resultado de cualquier criterio. La
+    // pantalla lo dice ANTES en vez de ofrecer el botón y dejar que el lead lo descubra por
+    // un error de base — y dice cuál falta.
+    const aMedias = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    expect(faltaParaCompletar(aMedias!, 'parcialmente-logrado')).toEqual([
+      'Reintentos por solicitud: falta registrar su resultado',
+    ]);
+
     // Sin snapshot final, el motivo es OBLIGATORIO (criterio de aceptación 3).
     await expect(
       conUsuario(leadId, (tx) => tx`insert into resultado_criterio
@@ -1491,6 +1504,38 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(stake!.review!.resultados.length).toBe(2);
     expect(stake!.review!.resultados.find((r) => r.criterioId === criterioAbandonoId)!.valorFinal)
       .toBe('49');
+
+    // Con los dos resueltos ya no falta nada… salvo que el veredicto sea «logrado», que el
+    // guard rechaza con un criterio sin dato final: es la mitigación de la «presión por
+    // demostrar éxito» (SYS-24), y la pantalla dice POR QUÉ en vez de dejar que llegue como
+    // rechazo después de pulsar.
+    expect(faltaParaCompletar(stake!, 'parcialmente-logrado')).toEqual([]);
+    expect(faltaParaCompletar(stake!, 'logrado')).toEqual([
+      'Reintentos por solicitud: sin dato final, así que el veredicto no puede ser «logrado»',
+    ]);
+
+    // Y el editor del resultado arranca del resultado GUARDADO, no en vacío: guardar es un
+    // upsert de las tres columnas, así que un formulario en blanco convertía «cambio el
+    // snapshot final» en «borro la lectura» y obligaba a reteclear el motivo del criterio
+    // sin dato. Es el mismo defecto que el del formulario de completar, un editor más abajo.
+    const conDato = arranqueDelResultado(stake!.review, criterioAbandonoId);
+    expect(conDato.snapshotFinalId).toBe(ultimo.id);
+    expect(conDato.lectura).toBe('De 62 a 49: mejora sostenida tras el rediseño de la verificación');
+    const sinDato = arranqueDelResultado(stake!.review, criterioReintentosId);
+    expect(sinDato.snapshotFinalId).toBe('');
+    expect(sinDato.sinDatosMotivo).toMatch(/ningún corte comparable/);
+
+    // Y el espejo del ALTA del contrato: `registry_insert` exige además del rol un reto
+    // VIVO, y un reto cerrado bajo el esquema anterior puede no tener contrato — el botón
+    // se ofrecía para que la política lo rechazara.
+    expect(registryPorAbrir({ retoEstado: 'activo', medicionSinRegistry: false, registry: null }))
+      .toBe(true);
+    expect(registryPorAbrir({ retoEstado: 'cerrado', medicionSinRegistry: false, registry: null }))
+      .toBe(false);
+    expect(
+      registryPorAbrir({ retoEstado: 'en-medicion', medicionSinRegistry: true, registry: null }),
+    ).toBe(true);
+    expect(registryPorAbrir(stake!)).toBe(false);
   });
 
   it('las escrituras de la medición se citan en la FILA DEL RETO, también por SQL directo', async () => {

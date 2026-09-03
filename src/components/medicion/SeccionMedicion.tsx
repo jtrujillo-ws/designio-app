@@ -25,8 +25,11 @@ import {
   ETIQUETA_VEREDICTO,
   etiquetaVentana,
   FRECUENCIAS,
+  arranqueDelResultado,
+  faltaParaCompletar,
   medicionPorAbrir,
   narrativaDelBorrador,
+  registryPorAbrir,
   VEREDICTOS,
   ventanaAbierta,
   postMortemPorAbrir,
@@ -201,7 +204,10 @@ function BloqueRegistry({
         snapshots, y son append-only (SYS-23).
       </span>
 
-      {!registry && esCurador && (
+      {/* Espejo de `registry_insert`, que además del rol exige un reto VIVO: un reto
+          cerrado bajo el esquema anterior puede no tener contrato, y el botón se ofrecía
+          para que la política lo rechazara. */}
+      {registryPorAbrir(seguimiento) && esCurador && (
         <div>
           <Button
             size="sm"
@@ -837,6 +843,10 @@ function BloqueReview({
   const [aprendizajes, setAprendizajes] = useState('');
   const [experimental, setExperimental] = useState(false);
   const [justificacion, setJustificacion] = useState('');
+  // Qué le falta al post mortem para poder completarse, con el veredicto elegido delante:
+  // el guard del cierre lo rechaza mientras algún criterio no tenga resultado, y también un
+  // «logrado» con criterios sin dato final.
+  const falta = faltaParaCompletar(seguimiento, veredicto);
 
   // El formulario se HIDRATA del borrador guardado, y no es comodidad: completar escribe
   // las cinco columnas de la narrativa a la vez, así que arrancando en vacío bastaba abrir
@@ -1060,10 +1070,20 @@ function BloqueReview({
                     </option>
                   ))}
                 </Select>
+                {/* El guard del cierre rechaza la completación mientras falte el resultado
+                    de algún criterio, y también un veredicto «logrado» con criterios sin
+                    dato final. Ofrecer el botón y dejar que lo diga la base es hacer que el
+                    lead descubra lo que falta por un error; el predicado es el mismo y vive
+                    con sus hermanos en `medicion.schemas`. */}
+                {falta.length > 0 && (
+                  <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+                    Falta para poder completarlo: {falta.join(' · ')}
+                  </span>
+                )}
                 <div>
                   <Button
                     size="sm"
-                    disabled={ocupado || contribucion.trim() === ''}
+                    disabled={ocupado || contribucion.trim() === '' || falta.length > 0}
                     onClick={() => void completar()}
                   >
                     Completar y cerrar el reto
@@ -1168,9 +1188,15 @@ function CamposDelResultado({
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
 }) {
-  const [snapshotId, setSnapshotId] = useState('');
-  const [lectura, setLectura] = useState('');
-  const [motivo, setMotivo] = useState('');
+  // Arranca del resultado YA GUARDADO, no en vacío: guardar es un UPSERT de las tres
+  // columnas, así que un formulario en blanco convertía «cambio el snapshot final» en
+  // «borro la lectura» y obligaba a reteclear el motivo al editar un resultado sin dato.
+  // No hace falta efecto: este bloque se REMONTA con el criterio (ver el `key` de arriba),
+  // así que el inicializador corre una vez por cada criterio elegido.
+  const previo = arranqueDelResultado(seguimiento.review, criterioId);
+  const [snapshotId, setSnapshotId] = useState(previo.snapshotFinalId);
+  const [lectura, setLectura] = useState(previo.lectura);
+  const [motivo, setMotivo] = useState(previo.sinDatosMotivo);
   const [ocupado, setOcupado] = useState(false);
   // Solo snapshots del criterio elegido: la política rechaza cualquier otro.
   const disponibles = seguimiento.entradas
@@ -1192,9 +1218,9 @@ function CamposDelResultado({
         },
       });
       if (r.ok) {
-        setSnapshotId('');
-        setLectura('');
-        setMotivo('');
+        // Y NO se vacían los campos al guardar: la fila existe ahora con esos valores, así
+        // que dejarlos en blanco haría que el siguiente guardado del mismo criterio —el
+        // bloque no se remonta porque el criterio no cambió— los borrara.
         await onCambio();
       } else onError(r.error);
     } catch {

@@ -385,6 +385,83 @@ export function ventanasCerradas(entradas: EntradaDeRegistry[]): boolean {
  * hermanos `medicionPorAbrir` y `postMortemPorAbrir`: lo que la pantalla decide a mano es
  * lo que ningún test alcanza.
  */
+/**
+ * Qué le falta al post mortem para poder completarse, con el criterio nombrado. Espejo de
+ * `outcome_review_completar_guard`, que rechaza la completación mientras algún criterio del
+ * reto no tenga su `resultado_criterio` y cuando el veredicto es «logrado» habiendo
+ * resultados sin dato final. Sin esto, el botón se ofrecía en cuanto había contribución
+ * escrita y el lead descubría lo que faltaba por un error de base.
+ *
+ * Los criterios salen de las entradas del registry: firmar exige que TODO criterio del reto
+ * tenga al menos un KPI que lo responda, así que a esta altura son el mismo conjunto.
+ */
+export function faltaParaCompletar(
+  seguimiento: { entradas: EntradaDeRegistry[]; review: OutcomeReviewDeReto | null },
+  veredicto: VeredictoSlug,
+): string[] {
+  const review = seguimiento.review;
+  if (review === null) return [];
+  const conResultado = new Set(review.resultados.map((r) => r.criterioId));
+  const faltan: string[] = [];
+  const vistos = new Set<string>();
+  for (const e of seguimiento.entradas) {
+    if (vistos.has(e.criterioId)) continue;
+    vistos.add(e.criterioId);
+    if (!conResultado.has(e.criterioId)) {
+      faltan.push(`${e.criterioKpi}: falta registrar su resultado`);
+    }
+  }
+  // «Logrado» con un criterio sin dato final es la presión por demostrar éxito que SYS-24
+  // nombra como riesgo, y el guard la rechaza. Decirlo aquí es decir POR QUÉ, en vez de
+  // dejar que el rechazo llegue después de pulsar.
+  if (veredicto === 'logrado') {
+    for (const r of review.resultados) {
+      if (r.snapshotFinalId === null) {
+        faltan.push(`${r.criterioKpi}: sin dato final, así que el veredicto no puede ser «logrado»`);
+      }
+    }
+  }
+  return faltan;
+}
+
+/**
+ * Con qué valores arranca el editor del resultado de UN criterio: los del resultado ya
+ * guardado. Su escritura es un UPSERT de las TRES columnas del resultado, así que arrancar
+ * en vacío convertía «cambio el snapshot final» en «borro la lectura» y obligaba a reteclear
+ * el motivo al editar un resultado sin dato — y el resultado por criterio es la fila que el
+ * post mortem existe para poder leer después. Misma lección que `narrativaDelBorrador`, un
+ * editor más abajo.
+ */
+export function arranqueDelResultado(
+  review: OutcomeReviewDeReto | null,
+  criterioId: string,
+): { snapshotFinalId: string; lectura: string; sinDatosMotivo: string } {
+  const previo = review?.resultados.find((r) => r.criterioId === criterioId) ?? null;
+  return {
+    snapshotFinalId: previo?.snapshotFinalId ?? '',
+    lectura: previo?.lectura ?? '',
+    sinDatosMotivo: previo?.sinDatosMotivo ?? '',
+  };
+}
+
+/**
+ * ¿Se puede ABRIR el contrato de medición? Espejo de `registry_insert`: curador —eso lo
+ * sabe la pantalla— y un reto VIVO, que es lo que aquí faltaba. Un reto cerrado bajo el
+ * esquema anterior puede no tener registry, y el botón se ofrecía para que la política lo
+ * rechazara.
+ */
+export function registryPorAbrir(seguimiento: {
+  retoEstado: string;
+  medicionSinRegistry: boolean;
+  registry: unknown | null;
+}): boolean {
+  if (seguimiento.registry !== null) return false;
+  return (
+    seguimiento.retoEstado === 'activo' ||
+    (seguimiento.retoEstado === 'en-medicion' && seguimiento.medicionSinRegistry)
+  );
+}
+
 export function narrativaDelBorrador(review: OutcomeReviewDeReto | null): {
   veredicto: VeredictoSlug | null;
   contribucion: string;

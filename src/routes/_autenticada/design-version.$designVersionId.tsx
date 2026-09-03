@@ -810,7 +810,7 @@ function SelectorDeMotivos({
             />
             {o.sinRespaldo === null
               ? o.titulo
-              : `${o.titulo} — sin derechos: la afirmación «${o.sinRespaldo}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente, y G5 no certificaría el diseño`}
+              : `${o.titulo} — G5 no certificaría el diseño: ${o.sinRespaldo}`}
           </label>
         );
       })}

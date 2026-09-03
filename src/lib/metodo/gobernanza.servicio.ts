@@ -393,42 +393,17 @@ export async function gobernanzaDeProyecto(
               join insight i on i.id = di.insight_id and i.workspace_id = di.workspace_id
               where di.decision_id = d.id and di.workspace_id = d.workspace_id
             ), '[]'::jsonb),
-            -- El respaldo VIVO de la decisión, no solo su estado. El estado habla de
-            -- reaperturas (SYS-10); los derechos de la evidencia que sostiene sus insights
-            -- son otra cosa y se revocan por su cuenta. El guard de suficiencia ya sigue
-            -- esa cadena al aprobar el gate (20260902190000), así que ofrecer la decisión
-            -- como citable mirando solo el estado dejaba al usuario cumpliendo un ítem con
-            -- una opción que la base iba a rechazar después. Es el MISMO predicado del
-            -- guard —toda afirmación no marcada como hipótesis de todo insight enlazado
-            -- necesita al menos una cita con derechos vigentes para «cliente»— y se trae
-            -- la primera que falla para poder nombrarla: un motivo genérico no dice qué
-            -- reparar.
-            'sinRespaldo', (
-              select jsonb_build_object('insight', i2.titulo, 'afirmacion', a2.texto)
-              from decision_insight di2
-              join insight i2 on i2.id = di2.insight_id and i2.workspace_id = di2.workspace_id
-              join afirmacion a2 on a2.insight_id = i2.id and a2.workspace_id = i2.workspace_id
-              where di2.decision_id = d.id and di2.workspace_id = d.workspace_id
-                and not a2.es_hipotesis
-                and not exists (select 1 from cita c
-                  where c.afirmacion_id = a2.id and c.workspace_id = a2.workspace_id
-                    and evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente'))
-              order by i2.titulo, a2.orden limit 1),
-            -- La OTRA superficie que puede rechazar la escritura, y que este PR añadió
-            -- después de escribir el espejo de arriba: desde 20260902270000 el guard de
-            -- aprobación exige que todo insight enlazado esté validado. Sin esto la
-            -- pantalla seguía ofreciendo la decisión como citable y el rechazo llegaba al
-            -- aprobar — «lo que la base rechaza, la pantalla no lo ofrece», roto por el
-            -- mismo arreglo que reforzó la base. Se pregunta por lo que el guard EXIGE
-            -- (estado = validado), no por los estados que hoy fallan: uno nuevo mañana
-            -- tiene que deshabilitar por defecto, no colarse.
-            'insightSinValidar', (
-              select i3.titulo
-              from decision_insight di3
-              join insight i3 on i3.id = di3.insight_id and i3.workspace_id = di3.workspace_id
-              where di3.decision_id = d.id and di3.workspace_id = d.workspace_id
-                and i3.estado <> 'validado'
-              order by i3.titulo limit 1))
+            -- Por qué NO se puede citar esta decisión, o null. NO se reproduce aquí: se
+            -- INVOCA razonamiento_sin_respaldo, la misma función que consulta el guard de
+            -- suficiencia antes de levantar. Este espejo estuvo escrito a mano y con las
+            -- tres comprobaciones repartidas en dos campos, y así fue como el selector de
+            -- la design version —copiado de éste— se quedó con una sola: mientras el
+            -- predicado viva dentro de un guard que lanza excepciones, quien quiera
+            -- mirarlo antes no tiene más remedio que reescribirlo. El motivo viene ya
+            -- redactado y nombra el objeto exacto, que es lo que hay que reparar.
+            'sinRespaldo', razonamiento_sin_respaldo(
+              d.workspace_id, array[]::uuid[], array[d.id], array[]::uuid[]))
+
             order by g.numero, d.decidido_en)
           from decision d
           join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id

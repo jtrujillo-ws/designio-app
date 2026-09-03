@@ -132,21 +132,20 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
         clase: 'decision' as const,
         id: d.id,
         titulo: d.titulo,
-        citable:
-          d.estado === 'vigente' && d.insightSinValidar === null && d.sinRespaldo === null,
-        // Tres superficies de rechazo, tres motivos distintos, en el orden en que hay que
-        // repararlos: el estado de la decisión, después que sus insights estén validados
-        // (objeción ANTERIOR al respaldo — un insight sin validar nunca pasó la barra de
-        // suficiencia) y después el respaldo vivo. Cada uno nombra SU dimensión: rotularlos
-        // todos como «sin derechos» manda a reparar donde no hay nada roto.
+        citable: d.estado === 'vigente' && d.sinRespaldo === null,
+        // Dos superficies de rechazo, y cada una nombra SU dimensión: rotularlas todas como
+        // «sin derechos» manda a reparar donde no hay nada roto. El estado de la decisión
+        // se mira aquí porque es de la decisión; todo lo que tiene que ver con el
+        // RAZONAMIENTO que la sostiene —insights validados, respaldo vivo— llega ya
+        // redactado en `sinRespaldo`, que sale de la misma función que consulta el guard.
+        // Enunciarlo aquí sería la segunda redacción de un predicado de tres partes, que es
+        // exactamente cómo el selector de la design version acabó reflejando solo una.
         motivoBloqueo:
           d.estado !== 'vigente'
             ? 'está en revisión tras una reapertura aguas arriba (SYS-10): revalídala antes de citarla'
-            : d.insightSinValidar !== null
-              ? `su insight de respaldo «${d.insightSinValidar}» no está validado: valídalo o rehaz la decisión`
-              : d.sinRespaldo === null
-                ? null
-                : `su respaldo perdió los derechos: en el insight «${d.sinRespaldo.insight}», la afirmación «${d.sinRespaldo.afirmacion}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente`,
+            : d.sinRespaldo === null
+              ? null
+              : d.sinRespaldo,
       })),
     ];
     return {

@@ -268,32 +268,28 @@ export async function insightsCitables(
     // citada se revocan y caducan. El guard de suficiencia lo comprueba al aprobar el
     // gate, así que ofrecerlo aquí como si nada dejaba al usuario eligiendo una opción
     // que la base iba a rechazar después, sin decirle por qué. El predicado es el MISMO
-    // que evalúa ese guard —toda afirmación no marcada como hipótesis necesita al menos
-    // una cita con derechos vigentes para el ámbito cliente— y se trae la primera que
-    // falle para poder nombrarla: un motivo genérico no dice qué reparar.
+    // que evalúa ese guard, y desde 20260902350000 no se reproduce: se INVOCA
+    // `razonamiento_sin_respaldo`, que es la función que el propio guard consulta antes de
+    // levantar. El motivo viene ya redactado y nombra la afirmación concreta — un motivo
+    // genérico no dice qué reparar.
     const filas = await tx`select i.id, i.titulo,
-        (select a.texto from afirmacion a
-          where a.insight_id = i.id and a.workspace_id = i.workspace_id
-            and not a.es_hipotesis
-            and not exists (select 1 from cita c
-              where c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
-                and evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente'))
-          order by a.orden limit 1) as sin_respaldo
+        razonamiento_sin_respaldo(i.workspace_id, array[i.id], array[]::uuid[],
+                                  array[]::uuid[]) as sin_respaldo
       from insight i
       where i.workspace_id = ${workspaceId} and i.estado = 'validado'
       order by i.validado_en desc nulls last, i.creado_en desc, i.id desc
       limit ${INSIGHTS_PICKER + 1}`;
     return {
       insights: filas.slice(0, INSIGHTS_PICKER).map((f) => {
+        // El motivo lo compone la BASE, con la misma redacción con la que el guard
+        // levanta: recomponerlo aquí volvería a dejar dos textos para la misma regla, y ya
+        // se ha visto lo que pasa cuando divergen.
         const sinRespaldo = f.sin_respaldo as string | null;
         return {
           id: f.id as string,
           titulo: f.titulo as string,
           citable: sinRespaldo === null,
-          motivoBloqueo:
-            sinRespaldo === null
-              ? null
-              : `su respaldo perdió los derechos: la afirmación «${sinRespaldo}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente`,
+          motivoBloqueo: sinRespaldo === null ? null : `su respaldo ${sinRespaldo}`,
         };
       }),
       hayMas: filas.length > INSIGHTS_PICKER,

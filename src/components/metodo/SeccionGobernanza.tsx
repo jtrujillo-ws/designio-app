@@ -232,17 +232,9 @@ function BloqueDecisiones({
               derechos de la evidencia citada se revocan y caducan por su cuenta. El guard
               de suficiencia lo comprueba al aprobar el gate, así que aquí se dice antes —y
               se nombra la afirmación exacta, que es lo que hay que reparar. */}
-          {d.insightSinValidar && (
-            <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
-              Sin validar: el insight «{d.insightSinValidar}» que traza esta decisión no
-              pasó la validación, así que el gate que la cite no se podrá aprobar.
-            </span>
-          )}
           {d.sinRespaldo && (
             <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
-              Sin respaldo vigente: en el insight «{d.sinRespaldo.insight}», la afirmación «
-              {d.sinRespaldo.afirmacion}» ya no tiene ninguna cita con derechos vigentes para
-              el ámbito cliente.
+              No se puede citar: {d.sinRespaldo}
             </span>
           )}
           {esLead && d.estado === 'en-revision' && (

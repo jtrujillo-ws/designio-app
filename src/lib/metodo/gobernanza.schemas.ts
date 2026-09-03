@@ -81,26 +81,19 @@ export type DecisionDeProyecto = {
   decididoEn: string;
   insights: { id: string; titulo: string }[];
   /**
-   * La primera afirmación de un insight enlazado que YA NO tiene ninguna cita con derechos
-   * vigentes para el ámbito cliente, o `null` si toda la cadena se sostiene. Es el estado
-   * VIVO del respaldo, que `estado` no cuenta: `estado` habla de reaperturas (SYS-10) y
-   * una decisión perfectamente `vigente` puede apoyarse en insights cuya evidencia perdió
-   * los derechos. El guard de suficiencia sigue esa cadena al aprobar el gate, así que sin
-   * este campo el picker ofrecía una opción que la base iba a rechazar después — y la
-   * pantalla de gobernanza mostraba la decisión como si nada.
-   */
-  sinRespaldo: { insight: string; afirmacion: string } | null;
-  /**
-   * El título del primer insight enlazado que NO está `validado`, o `null` si todos lo
-   * están. Es una objeción ANTERIOR a la del respaldo: un insight sin validar nunca pasó
-   * por `insight_validar_guard`, así que nadie comprobó que sus afirmaciones no-hipótesis
-   * tuvieran cita, y el guard de aprobación lo rechaza desde `20260902270000`.
+   * Por qué NO se puede citar esta decisión, ya redactado, o `null` si se puede. Sale de
+   * `razonamiento_sin_respaldo`, **la misma función que consulta el guard de suficiencia
+   * antes de levantar**: cubre las tres comprobaciones —evidencia citada usable, insights
+   * enlazados `validado`, y toda afirmación no-hipótesis con al menos una cita usable— sin
+   * que esta proyección tenga que enunciar ninguna.
    *
-   * El predicado pregunta lo que el guard EXIGE —`estado = 'validado'`— y no enumera los
-   * estados que hoy fallan: hoy `insight.estado` solo admite `propuesto` y `validado`,
-   * pero un estado nuevo mañana debe deshabilitar por defecto, no colarse.
+   * Estuvo escrito a mano, con las comprobaciones repartidas en dos campos, y así fue como
+   * el selector de la design version —copiado de éste— se quedó con una sola. El estado
+   * VIVO del respaldo es algo que `estado` no cuenta: `estado` habla de reaperturas
+   * (SYS-10) y una decisión perfectamente `vigente` puede trazarse a un insight sin validar
+   * o apoyarse en evidencia cuyos derechos se revocaron.
    */
-  insightSinValidar: string | null;
+  sinRespaldo: string | null;
 };
 
 /** Los tres estados de gobernanza de un arquetipo (SPEC-04.11). Vive aquí y se importa

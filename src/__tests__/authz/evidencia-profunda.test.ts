@@ -753,10 +753,8 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     );
     expect(bloqueada!.estado).toBe('vigente');
     // Nombra QUÉ reparar: el insight y la afirmación exactos, no un motivo genérico.
-    expect(bloqueada!.sinRespaldo).toEqual({
-      insight: 'El canal digital concentra el abandono',
-      afirmacion: 'El abandono se concentra en el canal digital',
-    });
+    expect(bloqueada!.sinRespaldo).toContain('El abandono se concentra en el canal digital');
+    expect(bloqueada!.sinRespaldo).toContain('derechos vigentes');
     // El mensaje del guard nombra la AFIRMACIÓN exacta desde 20260902340000, cuando las
     // dos rutas que consumen razonamiento pasaron a compartir la redacción del protocolo.
     // Se asegura sobre el texto de la afirmación, que es más específico que el genérico
@@ -1889,8 +1887,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       (x) => x.id === decisionId,
     );
     expect(vista!.estado).toBe('vigente');
-    expect(vista!.sinRespaldo).toBe(null);
-    expect(vista!.insightSinValidar).toBe('Insight heredado sin validar');
+    expect(vista!.sinRespaldo).toContain('no está validado');
 
     // La decisión sigue VIGENTE y los derechos VIVOS: las dos comprobaciones que ya
     // existían no ven nada raro. Lo que falla es la barra de suficiencia del insight.
@@ -1906,7 +1903,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const tras = (await gobernanzaDeProyecto(leadId, ws, proyectoId))!.decisiones.find(
       (x) => x.id === decisionId,
     );
-    expect(tras!.insightSinValidar).toBe(null);
+    expect(tras!.sinRespaldo).toBe(null);
     const r = await aprobarGate(leadId, { workspaceId: ws, gateId });
     expect(r.numero).toBe(1);
   });
@@ -2269,6 +2266,12 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const guard = g!.def as string;
     const [c] = await admin`select pg_get_functiondef('razonamiento_usable_guard'::regproc) as def`;
     const compartida = c!.def as string;
+    // Y el PREDICADO vive un nivel más abajo, en una función de solo lectura, para que los
+    // pickers puedan invocarlo en vez de espejarlo (20260902350000): la primera versión del
+    // selector de la design version reprodujo la mitad de derechos y se dejó la del estado
+    // del insight, que es el mismo error una capa más arriba.
+    const [pr] = await admin`select pg_get_functiondef('razonamiento_sin_respaldo'::regproc) as def`;
+    const predicado = pr!.def as string;
 
     // Las dos rutas —checklist y G5— llaman a la misma función. Ni una más ni una menos:
     // una tercera llamada sería una ruta nueva que hay que mirar; ninguna, un guard que
@@ -2284,9 +2287,16 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     // La compartida sí trae el protocolo entero: los dos candados y las tres
     // comprobaciones. Se afirma sobre su texto porque es lo que las dos rutas heredan.
     expect(compartida).toContain('for share');
-    expect(compartida).toContain("i.estado <> 'validado'");
-    expect(compartida).toContain('evidencia_usable');
-    expect(compartida).toContain('evidencia_motivo_bloqueo');
+    expect(compartida).toContain('razonamiento_sin_respaldo');
+    expect(predicado).toContain("i.estado <> 'validado'");
+    expect(predicado).toContain('evidencia_usable');
+    expect(predicado).toContain('evidencia_motivo_bloqueo');
+
+    // Y las proyecciones de los pickers lo INVOCAN, no lo reproducen: si alguna vuelve a
+    // escribir el predicado por su cuenta, volverá a espejar media regla.
+    const [dv] = await admin`select pg_get_functiondef(p.oid) as def from pg_proc p
+      where p.proname = 'razonamiento_sin_respaldo'`;
+    expect(dv).toBeTruthy();
   });
 
   it('G5 certifica VIGENCIA, no existencia: no se certifica un diseño cuyo razonamiento perdió los derechos', async () => {
@@ -2438,6 +2448,17 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     // certifica un diseño motivado por una decisión trazada a un insight sin validar.
     await expect(aprobarG5()).rejects.toThrow(/insight que no está validado/);
 
+    // Y el PICKER dice lo mismo, que es la mitad que la primera versión de la proyección se
+    // dejó: reprodujo del guard la comprobación de derechos y no la del estado del insight,
+    // así que esta decisión salía habilitada —sus citas sí tienen derechos— y el rechazo
+    // llegaba al certificar. Ahora la proyección invoca el mismo predicado que el guard.
+    const conDecision = await designVersionCompleta(leadId, ws, dv!.id as string);
+    const motivoDec = conDecision!.decisionesDelProyecto.find(
+      (d) => d.id === (dec!.id as string),
+    );
+    expect(motivoDec).toBeTruthy();
+    expect(motivoDec!.sinRespaldo).toContain('no está validado');
+
     // Se valida ese insight —su única afirmación es hipótesis, así que no necesita citas—
     // y entonces sí: con los derechos vigentes G5 aprueba. El test no pasa por tener el
     // fixture roto.
@@ -2474,7 +2495,10 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const proyectada = await designVersionCompleta(leadId, ws, dv!.id as string);
     const motivo = proyectada!.insightsValidados.find((i) => i.id === ins.insightId);
     expect(motivo).toBeTruthy();
-    expect(motivo!.sinRespaldo).toBe('La verificación digital concentra el abandono');
+    // El motivo lo redacta la base con la misma frase con la que el guard levanta, y nombra
+    // la afirmación exacta.
+    expect(motivo!.sinRespaldo).toContain('La verificación digital concentra el abandono');
+    expect(motivo!.sinRespaldo).toContain('derechos vigentes');
     const [sigue] = await admin`select estado from gate_instancia where id = ${gateId}`;
     expect(sigue!.estado).toBe('pendiente');
 

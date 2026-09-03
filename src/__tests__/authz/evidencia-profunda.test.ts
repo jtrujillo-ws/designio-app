@@ -2252,6 +2252,184 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     }
   });
 
+  it('G5 certifica VIGENCIA, no existencia: no se certifica un diseño cuyo razonamiento perdió los derechos', async () => {
+    // Tercera aparición de «existencia en vez de vigencia», y la peor: el artefacto que
+    // queda es INMUTABLE y de cara al cliente. Este mismo guard rechaza un ítem de
+    // checklist que cita un insight cuyo respaldo perdió los derechos; G5 entraba por la
+    // puerta de al lado, mirando solo que existiera una design version aprobada con
+    // elementos. Dos puertas al mismo sitio, una con cerradura.
+    const admin = sqlAdmin();
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'documento', ${marca + ' respaldo del diseno'}, ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, ${marca + ' respaldo del diseno'},
+        '{}'::jsonb, ${leadId}) returning id`;
+    const evId = ev!.id as string;
+    await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+      values (${ws}, ${evId}, ${leadId})`;
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evId,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Cláusula 7 del contrato',
+      venceEn: null,
+    });
+
+    const ins = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: marca + ' insight que sostiene el diseno',
+      resumen: 'el razonamiento que la design version certifica',
+    });
+    const af = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: ins.insightId,
+      texto: 'La verificación digital concentra el abandono',
+      esHipotesis: false,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: af.afirmacionId,
+      evidenciaId: evId,
+      fragmento: 'el 62% se detiene',
+      localizacion: 'p. 14',
+    });
+    await validarInsight(leadId, ws, ins.insightId);
+
+    // Proyecto con su G5 y una design version aprobada cuyo elemento cuelga del insight.
+    // Se arma por SQL de propietario a propósito: lo que se prueba es el GUARD, no el
+    // camino de servicio de SPEC-06, que tiene su propia suite.
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, ${marca + ' servicio del diseno'}, ${leadId}) returning id`;
+    // El guard de aprobación exige que el reto del proyecto afecte a ese servicio.
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svc!.id as string}, ${ws}, ${leadId})
+      on conflict do nothing`;
+    const [proy] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, ${'P-' + marca.slice(-4)}, 'Proyecto que certifica', ${leadId})
+      returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 5, 'Detalle de solución')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 5, 'sponsor') returning id`;
+    const gateId = gate!.id as string;
+    // El guard exige checklist instanciado y sin pendientes. Un ítem `na` razonado basta y
+    // no mete evidencia por la puerta de al lado: lo que este test prueba es la vía del
+    // DISEÑO, no la del ítem, que ya está cubierta desde 20260902160000.
+    await admin`insert into checklist_item
+      (workspace_id, gate_id, orden, texto, estado, na_justificacion, na_aprobado_por)
+      values (${ws}, ${gateId}, 0, 'Criterio del gate', 'na',
+        'No aplica a este proyecto de prueba', ${leadId})`;
+    // Sin `proyecto_id`: el journey cuelga del servicio, para no dejarle una FK al
+    // proyecto que la limpieza de la suite tendría que deshacer en orden.
+    const [jr] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svc!.id as string}, 'to-be', 'To-be certificable', ${leadId})
+      returning id`;
+    // La versión nace BORRADOR, se le cuelgan los elementos y después se aprueba: al revés
+    // el guard de SYS-05 lo para, y con razón — lo que se congela no se edita.
+    const [dv] = await admin`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, journey_id, codigo, titulo, estado, creado_por)
+      values (${ws}, ${proyectoId}, ${svc!.id as string}, ${jr!.id as string},
+        ${'DV-' + (Math.floor(Math.random() * 900000) + 100000)},
+        'Diseño certificable', 'borrador', ${leadId})
+      returning id`;
+    const [elem] = await admin`insert into elemento_cambio
+      (workspace_id, design_version_id, tipo, operacion, titulo, creado_por)
+      values (${ws}, ${dv!.id as string}, 'paso', 'agrega', 'Verificación en dos pasos',
+        ${leadId})
+      returning id`;
+    await admin`insert into elemento_insight (elemento_id, insight_id, workspace_id, creado_por)
+      values (${elem!.id as string}, ${ins.insightId}, ${ws}, ${leadId})`;
+    // El snapshot se toma EN LA MISMA transición que la aprobación: el guard de #16 lo
+    // exige comparando `xmin` con la transacción actual («aprobar congela el to-be de
+    // AHORA»), y tiene razón.
+    const snapId = await admin.begin(async (tx) => {
+      const [snap] = await tx`insert into journey_snapshot
+        (workspace_id, journey_id, grafo, congelado_por)
+        values (${ws}, ${jr!.id as string}, '{}'::jsonb, ${leadId}) returning id`;
+      await tx`update design_version set estado = 'aprobada', aprobada_por = ${leadId},
+          aprobada_en = now(), snapshot_id = ${snap!.id as string}
+        where id = ${dv!.id as string}`;
+      return snap!.id as string;
+    });
+
+    // Aprobar declarando el actor: el guard consulta `evidencia_usable`, que lleva delante
+    // la puerta anti-oráculo (`is_workspace_member(app_user_id(), …)`), y la conexión de
+    // propietario no tiene `app.user_id`. Sin declararlo, la puerta sale falsa y el guard
+    // rechazaría SIEMPRE — el test pasaría por la razón equivocada. Es la misma disciplina
+    // que el seed aplica con `declararActor`.
+    const aprobarG5 = () =>
+      admin.begin(async (tx) => {
+        await tx`select set_config('app.user_id', ${leadId}, true)`;
+        await tx`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now() where id = ${gateId}`;
+      });
+
+    // Con los derechos vigentes, G5 aprueba: el test no pasa por tener el fixture roto.
+    await aprobarG5();
+    const [aprobado] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(aprobado!.estado).toBe('aprobado');
+
+    // Se retira el consentimiento y se reintenta sobre un G5 equivalente: ahora certificar
+    // sería enseñarle al cliente un diseño que se apoya en material que no se puede usar.
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evId,
+      decision: 'denegado',
+      ambito: 'interno',
+      base: 'El titular retiró el consentimiento',
+      venceEn: null,
+    });
+    await admin`update gate_instancia set estado = 'pendiente', aprobado_por = null,
+      aprobado_en = null where id = ${gateId}`;
+    await expect(aprobarG5()).rejects.toMatchObject({ code: 'DR001' });
+    // Y el mensaje nombra la afirmación exacta y la dimensión que falta (SYS-14).
+    await expect(aprobarG5()).rejects.toThrow(/La verificación digital concentra el abandono/);
+    const [sigue] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(sigue!.estado).toBe('pendiente');
+
+    // La salida es la de siempre y no hay que inventarla: reconceder revive el diseño.
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evId,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'El titular volvió a firmar',
+      venceEn: null,
+    });
+    await aprobarG5();
+    const [final] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(final!.estado).toBe('aprobado');
+
+    // Se deshacen los enlaces que dejarían FKs colgando sobre el insight y el proyecto
+    // cuando la suite limpie: un test no le quita el suelo al siguiente. Hace falta apagar
+    // los triggers porque la design version está aprobada y SYS-05 prohíbe tocar sus
+    // elementos —correctamente—, y aquí no se está editando un diseño: se está desmontando
+    // un fixture. Con `set local session_replication_role`, que es de la TRANSACCIÓN y no
+    // se ve desde otras sesiones; `alter table … disable trigger` es global y le quitaría
+    // el suelo a las suites que corren en paralelo.
+    await admin.begin(async (tx) => {
+      await tx`set local session_replication_role = 'replica'`;
+      await tx`delete from elemento_insight where elemento_id = ${elem!.id as string}`;
+      await tx`delete from elemento_cambio where id = ${elem!.id as string}`;
+      await tx`delete from design_version where id = ${dv!.id as string}`;
+      await tx`delete from journey_snapshot where id = ${snapId}`;
+      await tx`delete from journey where id = ${jr!.id as string}`;
+      await tx`delete from checklist_item where gate_id = ${gateId}`;
+      await tx`delete from gate_instancia where id = ${gateId}`;
+      await tx`delete from etapa_instancia where proyecto_id = ${proyectoId}`;
+      await tx`delete from proyecto where id = ${proyectoId}`;
+      await tx`delete from reto_servicio_afectado where servicio_id = ${svc!.id as string}`;
+      await tx`delete from servicio where id = ${svc!.id as string}`;
+    });
+  });
+
   it('validar un insight mira derechos VIVOS, no que la cita exista: el objeto inmutable no nace roto', async () => {
     // La misma familia que el resto de la rama —comprobar existencia en vez de vigencia—
     // pero sobre el peor objeto posible: uno INMUTABLE. Se cita evidencia con derechos

@@ -254,6 +254,16 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await admin`insert into cita
       (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
       values (${ws}, ${af!.id as string}, ${ev!.id as string}, '62 de cada 100', 'p. 14', ${leadId})`;
+    // Con derechos CONCEDIDOS: desde 20260902320000, G5 no certifica un diseño cuyo
+    // razonamiento se apoya en evidencia sin derechos vigentes, y este insight cuelga de un
+    // elemento de la design version. La evidencia se crea como propietario, así que el
+    // constraint trigger que exige registro de derechos no llega a mirarla: ponerlos aquí
+    // es la misma disciplina que el seed. Sin esto el fixture pedía certificar un diseño
+    // que el producto no dejaría enseñar.
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${ev!.id as string}, 'concedido', 'cliente',
+        'Cláusula 7 del contrato de servicios', ${leadId}, now(), ${leadId})`;
     const [ip] = await admin`insert into insight (workspace_id, titulo, creado_por)
       values (${ws}, 'Insight sin validar', ${leadId}) returning id`;
     insightPropuestoId = ip!.id as string;
@@ -320,6 +330,9 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await admin`delete from cita where workspace_id = ${ws}`;
     await admin`delete from afirmacion where workspace_id = ${ws}`;
     await admin`delete from insight where workspace_id = ${ws}`;
+    // Los derechos cuelgan de la evidencia y hay que quitarlos antes: el fixture concede
+    // los del insight que la design version certifica (ver más abajo).
+    await admin`delete from derecho_uso where workspace_id = ${ws}`;
     await admin`delete from evidencia where workspace_id = ${ws}`;
     await admin`delete from fuente where workspace_id = ${ws}`;
     await admin`delete from checklist_item where workspace_id = ${ws}`;
@@ -711,9 +724,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     // La escalera de gates: G7 no se decide con anteriores pendientes.
     for (let n = 0; n <= 6; n++) {
-      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
-          aprobado_en = now()
-        where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = ${n}`;
+      // Con el actor declarado, por lo mismo que en `aprobarGatesHasta`.
+      await admin.begin(async (tx) => {
+        await tx`select set_config('app.user_id', ${leadId}, true)`;
+        await tx`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+            aprobado_en = now()
+          where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = ${n}`;
+      });
     }
     await expect(
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
@@ -940,9 +957,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       elementos: [{ elementoId: suyo.elementoId, razon: '' }],
     });
     for (let n = 0; n <= 6; n++) {
-      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
-          aprobado_en = now()
-        where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
+      // Con el actor declarado, por lo mismo que en `aprobarGatesHasta`.
+      await admin.begin(async (tx) => {
+        await tx`select set_config('app.user_id', ${leadId}, true)`;
+        await tx`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+            aprobado_en = now()
+          where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
+      });
     }
 
     // Otro proyecto se lleva el servicio al ciclo siguiente y supera la versión.
@@ -2926,9 +2947,18 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const admin = sqlAdmin();
     if (hasta >= 6) await registryFirmado(proy);
     for (let n = 0; n <= hasta; n++) {
-      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
-          aprobado_en = now()
-        where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
+      // Se DECLARA el actor: el guard consulta `evidencia_usable`, que lleva delante la
+      // puerta anti-oráculo `is_workspace_member(app_user_id(), …)`, y la conexión de
+      // propietario no tiene `app.user_id`. Sin declararlo la puerta sale falsa y el guard
+      // rechaza toda aprobación cuyo razonamiento cite evidencia — no por falta de
+      // derechos, sino por falta de contexto. Misma disciplina que `declararActor` en el
+      // seed. `set_config(..., true)` es de la transacción, así que no se filtra al pool.
+      await admin.begin(async (tx) => {
+        await tx`select set_config('app.user_id', ${leadId}, true)`;
+        await tx`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+            aprobado_en = now()
+          where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
+      });
     }
   };
 

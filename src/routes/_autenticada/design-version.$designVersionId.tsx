@@ -233,10 +233,12 @@ function PantallaDesignVersion() {
           <VistaReleases
             workspaceId={datos.workspaceId}
             dv={dv}
-            // Planificar trabajo nuevo se apaga al superarse la versión: el diseño que lo
-            // justificaba ya fue reemplazado. Completar lo que YA está en marcha, no —
-            // ver el comentario de VistaReleases.
-            puedePlanificar={esLead && dv.estado === 'aprobada'}
+            // Planificar sale de la RESPONSABILIDAD, no del estado: una versión que superó
+            // OTRO proyecto sigue a cargo del suyo —y desde el arreglo de G7 el gate del que
+            // la superó depende de que la termine—, así que la pantalla tiene que dejarle
+            // completar el plan. Lo que se apaga es la que el propio proyecto reemplazó.
+            // Completar lo que YA está en marcha no se apaga nunca — ver VistaReleases.
+            puedePlanificar={esLead && dv.aCargoDelProyecto}
             puedeCompletar={esLead && dv.estado !== 'borrador'}
             onError={setError}
             onHecho={refrescar}
@@ -248,7 +250,7 @@ function PantallaDesignVersion() {
             tablero={datos.tablero}
             desconocidos={desconocidos}
             proyectoId={dv.proyectoId}
-            estado={dv.estado}
+            aCargo={dv.aCargoDelProyecto}
           />
         )}
       </main>
@@ -864,8 +866,12 @@ function VistaDiff({
  * Dos permisos y no uno, porque son dos cosas distintas (RF-06.4/06.5/06.6):
  *
  *  · `puedePlanificar` — abrir un release nuevo y METER trabajo en uno planificado. Se
- *    apaga cuando la design version queda SUPERADA: planificar trabajo bajo un diseño que
- *    ya fue reemplazado es empezar algo que la versión vigente no respalda.
+ *    apaga cuando la design version deja de estar A CARGO de su proyecto, o sea cuando el
+ *    PROPIO proyecto la reemplazó: planificar bajo un diseño que uno mismo sustituyó es
+ *    empezar algo que ya decidió no hacer. Si la superó otro proyecto sigue encendido, y
+ *    tiene que estarlo: esa versión sigue contando para el G6 y el G7 de su proyecto —y
+ *    para el G7 del que la superó—, así que negarle el plan la dejaría obligada a cubrir
+ *    lo que no puede planificar.
  *  · `puedeCompletar` — cerrar lo que quedó abierto: desplegar lo ya planificado,
  *    constatar lo desplegado y RETIRAR de un release planificado lo que ya no va a salir.
  *    NO se apaga al superarse. Un release de DV-1 que ya salió cambió el servicio de
@@ -913,15 +919,28 @@ function VistaReleases({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {dv.estado === 'superada' && (
+      {dv.estado === 'superada' && !puedePlanificar && (
         <Card style={{ padding: 16 }}>
           <span style={apunte}>
-            Esta design version fue superada: no se planifican releases nuevos bajo ella,
-            ni se le mete trabajo a los que había. Lo que quedó abierto sí se cierra desde
-            aquí, y G7 lo espera: un release que salió cambió el servicio y su constatación
-            es lo que mete ese cambio en el estado efectivo contra el que se calcula el
-            diff de las versiones siguientes (RF-06.10); uno que ya no va a salir se cierra
-            quitándole los elementos, y entonces deja de haber nada que constatar.
+            Este proyecto reemplazó esta design version: no se planifican releases nuevos
+            bajo ella, ni se le mete trabajo a los que había. Lo que quedó abierto sí se
+            cierra desde aquí, y G7 lo espera: un release que salió cambió el servicio y su
+            constatación es lo que mete ese cambio en el estado efectivo contra el que se
+            calcula el diff de las versiones siguientes (RF-06.10); uno que ya no va a salir
+            se cierra quitándole los elementos, y entonces deja de haber nada que constatar.
+          </span>
+        </Card>
+      )}
+      {dv.estado === 'superada' && puedePlanificar && (
+        <Card style={{ padding: 16 }}>
+          <span style={apunte}>
+            Otro proyecto se llevó el servicio al ciclo siguiente, pero esta design version
+            sigue siendo trabajo de ESTE: su G6 exige que cada elemento tenga release y su
+            G7 que cada uno quede constatado, así que aquí se termina de planificar y de
+            cerrar. Y no es solo asunto suyo: el G7 del proyecto que la superó también lo
+            espera, porque lo que salga de aquí cambia el mismo servicio que aquel certifica.
+            Lo que ya no vaya a construirse se cierra constatándolo como no implementado, con
+            su razón — quitarle el alcance lo deja sin resolver, no lo resuelve.
           </span>
         </Card>
       )}
@@ -1516,12 +1535,15 @@ function VistaConciliacion({
   tablero,
   desconocidos,
   proyectoId,
-  estado,
+  aCargo,
 }: {
   tablero: Awaited<ReturnType<typeof conciliacionDeDesignVersion>>;
   desconocidos: { elementoId: string; elementoTitulo: string }[];
   proyectoId: string;
-  estado: DesignVersionCompleta['estado'];
+  /** Si el proyecto sigue respondiendo por esta versión ante sus gates. Sustituye a
+   * «está aprobada»: los huecos de una versión que superó otro proyecto también cuentan
+   * para G7, y los de la que el propio proyecto reemplazó ya no. */
+  aCargo: boolean;
 }) {
   if (!tablero || tablero.filas.length === 0) {
     return (
@@ -1534,7 +1556,9 @@ function VistaConciliacion({
     );
   }
 
-  const bloquea = estado === 'aprobada' && desconocidos.length > 0;
+  // Bloquea mientras el proyecto siga respondiendo por esta versión, esté aprobada o la
+  // haya superado otro proyecto: en los dos casos sus huecos son los que G7 cuenta.
+  const bloquea = aCargo && desconocidos.length > 0;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -1557,9 +1581,9 @@ function VistaConciliacion({
           </span>
         ) : (
           <span style={cuerpo}>
-            {estado === 'aprobada'
+            {aCargo
               ? 'Todos los elementos tienen estado conocido: G7 no encuentra huecos por este lado.'
-              : 'La conciliación se exige sobre design versions aprobadas.'}
+              : 'Este proyecto ya reemplazó esta versión: su conciliación la cierra la que la sucede.'}
           </span>
         )}
         <Link

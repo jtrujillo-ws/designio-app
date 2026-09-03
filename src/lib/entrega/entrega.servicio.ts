@@ -998,6 +998,14 @@ export async function designVersionCompleta(
         -- Los journeys que el borrador PUEDE enlazar: exactamente el predicado que exige
         -- design_version_journey_guard, para que el selector no ofrezca nada que el
         -- endpoint vaya a rechazar.
+        -- ¿Sigue el proyecto respondiendo por esta versión ante sus gates? Es lo que decide
+        -- si se le puede planificar y meter alcance —lo dicen las políticas con esta misma
+        -- función—, y no coincide con «está aprobada»: una versión que superó OTRO proyecto
+        -- sigue siendo trabajo del suyo, y desde el arreglo de G7 el gate del proyecto que
+        -- la superó DEPENDE de que su proyecto la termine. La pantalla tiene que ofrecer
+        -- exactamente lo que la base permite, ni más ni menos.
+        dv.id in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
+          as a_cargo_del_proyecto,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', j2.id, 'nombre', j2.nombre)
             order by j2.creado_en desc)
@@ -1109,6 +1117,7 @@ export async function designVersionCompleta(
       servicioNombre: fila.servicio_nombre as string,
       proyectoId: fila.proyecto_id as string,
       proyectoCodigo: fila.proyecto_codigo as string,
+      aCargoDelProyecto: fila.a_cargo_del_proyecto as boolean,
       journeyId: (fila.journey_id as string | null) ?? null,
       journeyNombre: (fila.journey_nombre as string | null) ?? null,
       snapshotId: (fila.snapshot_id as string | null) ?? null,

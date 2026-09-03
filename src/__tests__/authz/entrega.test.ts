@@ -3695,6 +3695,111 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(grafo.aristas).toHaveLength(1);
   });
 
+  it('en una cadena de tres, el del medio sigue respondiendo por lo que dejó el primero', async () => {
+    // El ámbito de la superada se derivaba de «los servicios de los que este proyecto tiene
+    // la APROBADA vigente», y eso se rompe un eslabón más arriba: en A → B → C, cuando C
+    // supera a la de B, B deja de tener aprobada de ese servicio, el brazo por servicio se
+    // queda vacío y la de A se cae del ámbito de B — que entonces certificaba G7 sin
+    // responder por el trabajo abierto de A. La aprobada vigente es solo un caso particular
+    // de la responsabilidad.
+    const admin = sqlAdmin();
+    const [pa] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-109', 'Primero de la cadena', ${leadId}) returning id`;
+    const proyA = pa!.id as string;
+    const proyB = await proyectoConGates('P-110', 'Segundo de la cadena');
+    const [pc] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-111', 'Tercero de la cadena', ${leadId}) returning id`;
+    const proyC = pc!.id as string;
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la cadena de tres');
+
+    const nueva = async (proy: string, titulo: string, superaA: string | null) => {
+      const dv = await crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proy,
+        servicioId: svcId,
+        journeyId,
+        titulo,
+        resumen: '',
+        superaA,
+      });
+      const el = await elementoSuelto(dv.designVersionId, `Elemento de ${titulo}`);
+      await aprobarDesignVersion(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        motivo: '',
+      });
+      return { id: dv.designVersionId, elementoId: el };
+    };
+
+    const dvA = await nueva(proyA, 'la de A', null);
+    // A deja su elemento en un release planificado: trabajo abierto que todavía puede salir.
+    const rlA = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.id,
+      titulo: 'El que A no llegó a desplegar',
+      responsable: 'Equipo de A',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: dvA.elementoId, razon: '' }],
+    });
+
+    const dvB = await nueva(proyB, 'la de B', dvA.id);
+    const rlB = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvB.id,
+      titulo: 'El de B',
+      responsable: 'Equipo de B',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: dvB.elementoId, razon: '' }],
+    });
+    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlB.releaseId, desplegadoEn: HOY });
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlB.releaseId,
+      constatadoEn: HOY,
+      resumen: '',
+      constataciones: [
+        { elementoId: dvB.elementoId, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+      ],
+    });
+
+    // C se lleva el servicio: la de B pasa a superada y B se queda sin aprobada de S.
+    await nueva(proyC, 'la de C', dvB.id);
+    await aprobarGatesHasta(proyB, 6);
+
+    // La versión de A la superó OTRO proyecto, así que sigue a cargo del suyo — y eso es
+    // exactamente lo que la pantalla necesita saber para dejarle planificar y cerrar.
+    const vistaA = await designVersionCompleta(leadId, ws, dvA.id);
+    expect(vistaA!.estado).toBe('superada');
+    expect(vistaA!.aCargoDelProyecto).toBe(true);
+
+    const aprobarG7B = () =>
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
+    await expect(aprobarG7B()).rejects.toThrow(/responsabilidad de su proyecto/);
+
+    // Se cierra el trabajo de A —lo hace quien puede, que aquí es el mismo lead— y entonces
+    // B certifica: nada del servicio puede moverse ya sin que alguien lo constate.
+    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlA.releaseId, desplegadoEn: HOY });
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlA.releaseId,
+      constatadoEn: HOY,
+      resumen: '',
+      constataciones: [
+        {
+          elementoId: dvA.elementoId,
+          resultado: 'no-implementado',
+          queQuedoDistinto: 'Se quedó sin construir',
+          razon: 'El ciclo pasó a los proyectos siguientes',
+        },
+      ],
+    });
+    await aprobarG7B();
+    const [g7] = await admin`select estado from gate_instancia
+      where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
+    expect(g7!.estado).toBe('aprobado');
+  });
+
   it('nada de esto cruza el workspace', async () => {
     const admin = sqlAdmin();
     const [otro] = await admin`insert into workspace (nombre) values (${marca + '-ajeno'})

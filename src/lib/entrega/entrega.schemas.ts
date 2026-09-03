@@ -369,6 +369,10 @@ export type DesignVersionCompleta = {
    * Como mucho hay una (SYS-05), pero la lista deja que la pantalla ofrezca exactamente
    * lo que el guard acepta en vez de suponerlo. */
   superables: { id: string; codigo: string; titulo: string }[];
+  /** Si el proyecto sigue respondiendo por esta versión ante sus gates: es lo que la base
+   * usa para decidir si admite plan y alcance, y no es lo mismo que estar aprobada — una
+   * versión superada desde OTRO proyecto sigue a cargo del suyo. */
+  aCargoDelProyecto: boolean;
   decisionesDelProyecto: { id: string; titulo: string }[];
   insightsValidados: { id: string; titulo: string }[];
   vigente: EstadoEfectivoVigente;

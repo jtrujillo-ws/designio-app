@@ -297,10 +297,18 @@ revoke execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) from
 grant execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) to designio_app;
 
 -- Las design versions SUPERADAS por cuyo vuelo responde la conciliación de este proyecto:
--- las suyas propias, y las del servicio que este proyecto certifica —porque la cadena de
--- versiones de un servicio atraviesa proyectos y el effective state es del servicio, no del
--- proyecto—. Se escribe una vez porque la usan las DOS mitades de la regla de G7, que
--- distinguen según quién las superó.
+-- las suyas propias, y las de los servicios DE LOS QUE ESTE PROYECTO RESPONDE —porque la
+-- cadena de versiones de un servicio atraviesa proyectos y el effective state es del
+-- servicio, no del proyecto—. Se escribe una vez porque la usan las DOS mitades de la regla
+-- de G7, que distinguen según quién las superó.
+--
+-- «De los que responde» y no «de los que tiene la aprobada vigente», que es lo que decía
+-- antes y se rompía en la cadena de tres: en A → B → C, cuando C supera a la de B, la de B
+-- pasa a 'superada' y B deja de tener ninguna aprobada de ese servicio — el brazo por
+-- servicio se quedaba vacío y la de A se caía del ámbito de B, que entonces certificaba G7
+-- sin responder por el trabajo abierto de A. La aprobada vigente es solo un caso particular
+-- de la responsabilidad: `design_versions_a_cargo_del_proyecto` sí conserva la de B (nadie
+-- DENTRO de B la reemplazó), así que la pieza ya estaba escrita y solo había que usarla.
 create function design_versions_superadas_del_ambito(p_proyecto uuid, p_workspace uuid)
 returns setof uuid language sql stable as $$
   select dv.id
@@ -308,9 +316,9 @@ returns setof uuid language sql stable as $$
   where dv.workspace_id = p_workspace and dv.estado = 'superada'
     and (dv.proyecto_id = p_proyecto
          or dv.servicio_id in (
-           select vig.servicio_id from design_version vig
-           where vig.proyecto_id = p_proyecto and vig.workspace_id = p_workspace
-             and vig.estado = 'aprobada'))
+           select resp.servicio_id from design_version resp
+           where resp.workspace_id = p_workspace
+             and resp.id in (select design_versions_a_cargo_del_proyecto(p_proyecto, p_workspace))))
 $$;
 revoke execute on function design_versions_superadas_del_ambito(uuid, uuid) from public;
 

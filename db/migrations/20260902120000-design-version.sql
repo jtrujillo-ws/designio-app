@@ -1139,7 +1139,11 @@ revoke execute on function release_elemento_misma_dv_guard() from public;
 -- no existe.
 --
 -- El predicado es EL MISMO que el de G6, y a propósito: dos formas de decir «todo elemento
--- de la versión vigente está cubierto» serían dos verdades y bastaría olvidar una.
+-- del que responde el proyecto está cubierto» serían dos verdades y bastaría olvidar una.
+-- Por eso comparte con él `design_versions_a_cargo_del_proyecto` en vez de repetir un
+-- filtro: cuando ese conjunto cambió —al separar «cuál manda en el servicio» de «de qué
+-- responde el proyecto»—, tenía que cambiar aquí con él o el gate y su vigilante habrían
+-- pasado a hablar de cosas distintas.
 --
 -- DIFERIDO, y aquí está el motivo de fondo: mover un elemento de un release a otro es
 -- borrar y volver a insertar, así que entre las dos sentencias el elemento está descubierto
@@ -1148,9 +1152,19 @@ revoke execute on function release_elemento_misma_dv_guard() from public;
 -- prohibido reordenar el plan después de G6 — y como el gate no se puede desaprobar, eso
 -- habría sido cerrar la puerta para siempre.
 --
--- Solo mira design versions APROBADAS, que es lo que mira G6. Las SUPERADAS quedan fuera y
--- eso mantiene abierta la salida de G7: quitarle el alcance a un release planificado de una
--- versión superada es como se cierra lo que ya no va a salir.
+-- Fuera del conjunto quedan las versiones que EL PROPIO proyecto reemplazó, y eso mantiene
+-- abierta la salida de G7: quitarle el alcance a un release planificado de una versión que
+-- el proyecto ya sustituyó es como se cierra lo que ya no va a salir.
+--
+-- Para las que siguen en el conjunto —incluidas las que superó OTRO proyecto— esa salida no
+-- hace falta y además no serviría: sus elementos siguen contando para el G7 de este
+-- proyecto, así que dejarlos sin release los deja «en estado desconocido» en vez de
+-- cerrarlos. La salida de esos es la buena: desplegar y constatar, aunque sea como
+-- 'no-implementado' con su razón — una respuesta conocida, que es lo que el gate pide.
+--
+-- Y el conjunto no se mueve bajo el gate: desde que G6 está aprobado, el proyecto no puede
+-- aprobar design versions nuevas (design_version_transicion_guard), así que ni entra ni
+-- sale nada de él.
 create function release_elemento_cobertura_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -1167,7 +1181,7 @@ begin
     join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
     join gate_instancia g on g.proyecto_id = dv.proyecto_id and g.workspace_id = dv.workspace_id
     where ec.id = old.elemento_id and ec.workspace_id = old.workspace_id
-      and dv.estado = 'aprobada'
+      and dv.id in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
       and g.numero = 6 and g.estado = 'aprobado'
   ) then
     raise exception 'G6 aprobó un plan que cubre este elemento: muévelo a otro release, no lo dejes sin ninguno (RF-06.4)';

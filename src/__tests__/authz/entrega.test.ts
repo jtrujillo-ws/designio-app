@@ -3299,6 +3299,69 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(aprobada!.estado).toBe('aprobada');
   });
 
+  it('lo que G6 firmó sigue cubierto aunque otro proyecto supere la versión', async () => {
+    // El vigilante de la cobertura y el propio G6 tienen que hablar del MISMO conjunto: si
+    // el gate pasó a preguntar «de qué responde este proyecto» y el guard diferido se
+    // quedaba en «cuál manda en el servicio», bastaba con que otro proyecto superara la
+    // versión para poder vaciar el plan que G6 acababa de firmar — sin que nada avisara.
+    const admin = sqlAdmin();
+    const proyA = await proyectoConGates('P-105', 'Proyecto que firmó su plan');
+    const [pb] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-106', 'Proyecto que se lleva el servicio', ${leadId})
+      returning id`;
+    const proyB = pb!.id as string;
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del plan heredado');
+
+    const dvA = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyA,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que A planificó',
+      resumen: '',
+      superaA: null,
+    });
+    const elA = await elementoSuelto(dvA.designVersionId, 'Lo que A dejó cubierto');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.designVersionId,
+      motivo: '',
+    });
+    await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.designVersionId,
+      titulo: 'El plan de A',
+      responsable: 'Equipo de A',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elA, razon: '' }],
+    });
+    await aprobarGatesHasta(proyA, 6);
+
+    // B se lleva el servicio al ciclo siguiente. El plan de A no se deshace por eso.
+    const dvB = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyB,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que B se lleva',
+      resumen: '',
+      superaA: dvA.designVersionId,
+    });
+    await elementoSuelto(dvB.designVersionId, 'Lo que B trae');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dvB.designVersionId,
+      motivo: '',
+    });
+
+    await expect(desasignarElemento(leadId, ws, elA)).rejects.toThrow(
+      /G6 aprobó un plan que cubre este elemento/,
+    );
+    // Y sigue asignado: el rechazo del constraint diferido revierte la transacción entera.
+    const cubierto = await designVersionCompleta(leadId, ws, dvA.designVersionId);
+    expect(cubierto!.releases[0]!.elementos.map((e) => e.elementoId)).toEqual([elA]);
+  });
+
   it('nada de esto cruza el workspace', async () => {
     const admin = sqlAdmin();
     const [otro] = await admin`insert into workspace (nombre) values (${marca + '-ajeno'})

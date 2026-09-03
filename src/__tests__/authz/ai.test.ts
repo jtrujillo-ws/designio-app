@@ -3210,6 +3210,83 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  it('una llamada de CI respalda como mucho UNA propuesta', async () => {
+    // `llamada_id` afirma «la llamada que ME produjo». Con dos propuestas de extracción
+    // colgadas de la misma llamada esa frase solo puede ser cierta en una: la otra hereda un
+    // coste, una latencia y un uso que no son suyos, el coste por propuesta se divide entre
+    // filas que nadie pagó y el recuento de propuestas generadas crece sin gasto detrás.
+    //
+    // El índice de «una pendiente por item» NO lo cubría: solo alcanza a las pendientes, así
+    // que decidir la primera dejaba libre el hueco para colgar una segunda de la llamada ya
+    // pagada. Este test recorre exactamente ese camino.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item de una sola llamada');
+    const llamadaId = await nuevaLlamada({ capacidad: 'CI', itemId });
+    const insertar = () =>
+      conUsuario(leadId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, item_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+        values (${ws}, 'CI', 'evidencia', ${itemId}, ${tx.json(CONTENIDO_CI)},
+                ${tx.json(CONTENIDO_CI)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance de prueba', 'entorno', ${llamadaId}, ${leadId})
+        returning id`);
+
+    const [primera] = await insertar();
+    const propuestaId = primera!.id as string;
+    try {
+      // Se decide la primera, que es lo que liberaba el hueco del índice de pendientes.
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+      await expect(insertar()).rejects.toThrow(/propuesta_ai_llamada_ci_idx|duplicate key|llave duplicada/i);
+
+      // Control: con SU PROPIA llamada, la segunda propuesta entra. Lo que la rechazaba era
+      // compartir la llamada, no nada del item ni del estado.
+      const otraLlamada = await nuevaLlamada({ capacidad: 'CI', itemId });
+      const [segunda] = await conUsuario(leadId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, item_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+        values (${ws}, 'CI', 'evidencia', ${itemId}, ${tx.json(CONTENIDO_CI)},
+                ${tx.json(CONTENIDO_CI)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance de prueba', 'entorno', ${otraLlamada}, ${leadId})
+        returning id`);
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: segunda!.id as string });
+    } finally {
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
+  it('C0 sí reparte una llamada entre el lote que produjo', async () => {
+    // La asimetría es deliberada y es la misma que la de la reserva: C0 persiste un LOTE de
+    // una sola llamada, así que sus filas hermanas comparten `llamada_id` legítimamente y el
+    // índice tiene que dejarlas pasar. Sin este control, «una llamada, una propuesta» se
+    // habría podido escribir sin capacidad y habría roto C0 en producción.
+    const admin = sqlAdmin();
+    const llamadaId = await nuevaLlamada({ capacidad: 'C0', retoId });
+    const insertar = () =>
+      conUsuario(leadId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+        values (${ws}, 'C0', 'criterio-exito', ${retoId}, ${tx.json(CONTENIDO_C0)},
+                ${tx.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance de prueba', 'entorno', ${llamadaId}, ${leadId})
+        returning id`);
+    const ids: string[] = [];
+    try {
+      for (let n = 0; n < 3; n++) {
+        const [f] = await insertar();
+        ids.push(f!.id as string);
+      }
+      expect(ids.length).toBe(3);
+    } finally {
+      for (const id of ids) await admin`delete from propuesta_ai where id = ${id}`;
+      await admin`delete from llamada_ai where id = ${llamadaId}`;
+    }
+  });
+
   it('el asiento reservado del árbol ya no puede apuntar al vacío ni a otro workspace', async () => {
     // `reto_servicio_afectado.propuesta_ai_id` llevaba desde SPEC-02 siendo una columna
     // suelta: anulable, sin FK y con grant de INSERT sin lista de columnas, o sea escribible

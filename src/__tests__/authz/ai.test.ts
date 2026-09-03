@@ -41,9 +41,13 @@ vi.mock('@/lib/ai/proveedor.server', async (original) => {
   const real = await original<typeof import('@/lib/ai/proveedor.server')>();
   return {
     ...real,
-    generarConProveedor: async () => {
+    generarConProveedor: async (entrada: { consentimientoVersion: number | null }) => {
       if (proveedor.duranteLlamada) await proveedor.duranteLlamada();
-      return proveedor.respuesta;
+      const r = proveedor.respuesta!;
+      // El adaptador real SELLA cada intento con la autorización bajo la que salió, y el
+      // libro se escribe a partir de ahí. El doble tiene que hacer lo mismo o las pruebas
+      // dejarían de ver justo eso: con qué permiso se despachó cada llamada.
+      return { ...r, intentos: r.intentos.map((i) => ({ ...i, consentimientoVersion: entrada.consentimientoVersion })) };
     },
   };
 });
@@ -126,6 +130,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       motivo: '',
       latenciaMs: 900,
       uso: USO_CI_COMPLETO,
+      consentimientoVersion: null,
       ...campos,
     };
   }

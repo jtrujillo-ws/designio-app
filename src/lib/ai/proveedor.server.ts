@@ -53,6 +53,12 @@ export type IntentoProveedor = {
    * primario, la latencia por modelo mediría otra cosa. */
   latenciaMs: number;
   uso: UsoLlamada | null;
+  /** Bajo qué versión del consentimiento salió ESTE intento. Por intento y no por
+   * operación: el respaldo es un despacho NUEVO, con su propia autorización leída en su
+   * propio momento, y anotar los dos contra la versión que autorizó al primario haría que
+   * el libro afirmara en falso bajo qué permiso salió el material. `null` cuando el
+   * material no es de personas. */
+  consentimientoVersion: number | null;
 };
 
 /**
@@ -186,16 +192,42 @@ function causaDelError(e: unknown): MotivoSinSalida {
   return causa === 'rechazo-proveedor' ? 'rechazo-proveedor' : 'sin-respuesta';
 }
 
+/**
+ * Lo que el adaptador tiene que poder preguntar antes de despachar OTRA vez. No sabe de
+ * base de datos —ese es el punto de este módulo— así que el permiso se lo pasa quien sí
+ * sabe, y con la MISMA comprobación que autorizó el despacho primario.
+ */
+export type Revalidacion =
+  | { ok: true; consentimientoVersion: number | null }
+  | { ok: false; motivo: string };
+
 export async function generarConProveedor(entrada: {
   key: string;
   capacidad: CapacidadActiva;
   sistema: string;
   usuario: string;
+  /** La versión que autorizó el despacho PRIMARIO, ya leída bajo candado por quien llama. */
+  consentimientoVersion: number | null;
+  /**
+   * Se llama ANTES de degradar de modelo, y su respuesta decide si hay segundo despacho.
+   *
+   * La degradación no es «la misma llamada otra vez»: es una petición NUEVA que sale cuando
+   * la primera ya terminó — o sea, con el control de vuelta aquí, la base a mano y ni un
+   * byte en el aire todavía. El argumento de que ningún candado alcanza a una llamada en
+   * vuelo, que es cierto para el material ya enviado, no dice nada de este caso: aquí no hay
+   * límite físico, hay una comprobación que hacer. Si entre medias se revocó el
+   * consentimiento, la revocación ya retiró la reserva —el token sin el cual no se
+   * despacha— y el respaldo saldría sin él.
+   */
+  revalidar?: () => Promise<Revalidacion>;
 }): Promise<ResultadoProveedor> {
   // Cada intento se anota antes de decidir si hay otro: una degradación de modelo son DOS
   // llamadas al proveedor, y la del primario existió aunque no sirviera. Devolver solo la
   // última la borraba del libro y dejaba una latencia que sumaba las dos.
   const intentos: IntentoProveedor[] = [];
+  // La autorización con la que sale CADA intento. El primario trae la que leyó quien llama;
+  // el respaldo, la que devuelva la revalidación justo antes de salir.
+  let consentimientoVersion = entrada.consentimientoVersion;
   for (const [indice, modelo] of [MODELO_PRIMARIO, MODELO_FALLBACK].entries()) {
     const inicio = Date.now();
     try {
@@ -212,6 +244,7 @@ export async function generarConProveedor(entrada: {
         motivo: '',
         latenciaMs: Date.now() - inicio,
         uso,
+        consentimientoVersion,
       });
       return { ok: true, datos, intentos };
     } catch (e) {
@@ -231,11 +264,23 @@ export async function generarConProveedor(entrada: {
         motivo,
         latenciaMs: Date.now() - inicio,
         uso: usoDelError(e),
+        consentimientoVersion,
       });
       // JSON ilegible: el modelo respondió pero fuera de contrato. No se reintenta con otro
       // modelo (no es indisponibilidad) y la propuesta se descarta entera.
       if (causa === 'fuera-de-contrato') return { ok: false, motivo, intentos };
-      if (indice === 0 && degradaModelo(e)) continue;
+      if (indice === 0 && degradaModelo(e)) {
+        // El segundo despacho se autoriza otra vez, o no sale. Sin esto, una revocación que
+        // commiteó mientras el primario estaba en vuelo dejaba salir el material de todos
+        // modos —sin reserva, porque la revocación ya la retiró— y la llamada se anotaba
+        // contra una versión de consentimiento que había dejado de ser la vigente.
+        if (entrada.revalidar) {
+          const permiso = await entrada.revalidar();
+          if (!permiso.ok) return { ok: false, motivo: permiso.motivo, intentos };
+          consentimientoVersion = permiso.consentimientoVersion;
+        }
+        continue;
+      }
       return { ok: false, motivo, intentos };
     }
   }

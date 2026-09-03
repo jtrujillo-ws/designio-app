@@ -30,16 +30,19 @@ vi.mock('@anthropic-ai/sdk', () => ({
 }));
 
 const { generarConProveedor } = await import('../proveedor.server');
+import type { Revalidacion } from '../proveedor.server';
 
 const USO_CRUDO = { input_tokens: 1000, output_tokens: 40 };
 const USO_ESPERADO = { entrada: 1000, salida: 40 };
 
-function llamar() {
+function llamar(revalidar?: () => Promise<Revalidacion>) {
   return generarConProveedor({
     key: 'sk-de-prueba',
     capacidad: 'CI',
     sistema: 'sistema',
     usuario: 'material',
+    consentimientoVersion: 1,
+    revalidar,
   });
 }
 
@@ -94,6 +97,46 @@ describe('adaptador del proveedor AI', () => {
     expect(sdk.modelosLlamados).toEqual([MODELO_PRIMARIO, MODELO_FALLBACK]);
     expect(r.intentos.map((i) => i.modelo)).toEqual([MODELO_PRIMARIO, MODELO_FALLBACK]);
     expect(r.intentos.every((i) => i.resultado === 'sin-respuesta' && i.uso === null)).toBe(true);
+  });
+
+  it('el respaldo pide permiso otra vez: si lo revocaron, no sale un segundo despacho', async () => {
+    // Degradar de modelo NO es la misma llamada otra vez: es una petición NUEVA, que sale
+    // con la primera ya terminada, el control de vuelta aquí y ni un byte en el aire. El
+    // argumento de que ningún candado alcanza a una llamada EN VUELO —cierto para el
+    // material ya enviado— no dice nada de este caso: aquí no hay límite físico, hay una
+    // comprobación que hacer. Y si el consentimiento se revocó mientras el primario viajaba,
+    // la revocación ya retiró la reserva, así que el respaldo saldría sin el token que
+    // debía impedirlo.
+    sdk.respuestas = [
+      Object.assign(new Error('no disponible'), { status: 503 }),
+      { stop_reason: 'end_turn', content: [{ type: 'text', text: '{"titulo":"ok"}' }], usage: USO_CRUDO },
+    ];
+    const r = await llamar(async () => ({
+      ok: false,
+      motivo: 'El consentimiento de ese material dejó de autorizar el procesamiento externo',
+    }));
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.motivo).toMatch(/consentimiento/i);
+    // Solo UN intento: el segundo no llegó a salir. Y el del primario queda anotado con su
+    // coste, que se pagó igual.
+    expect(r.intentos).toHaveLength(1);
+    expect(r.intentos[0]!.modelo).toBe(MODELO_PRIMARIO);
+    expect(sdk.modelosLlamados).toEqual([MODELO_PRIMARIO]);
+  });
+
+  it('y si el permiso sigue vigente, el respaldo sale anotado con la versión de ESE momento', async () => {
+    // La otra mitad: revalidar no es bloquear. Y la versión que ampara al respaldo es la
+    // que se lee al degradar, no la que autorizó al primario — anotar las dos contra la
+    // primera haría que el libro afirmara en falso bajo qué permiso salió el material.
+    sdk.respuestas = [
+      Object.assign(new Error('no disponible'), { status: 503 }),
+      { stop_reason: 'end_turn', content: [{ type: 'text', text: '{"titulo":"ok"}' }], usage: USO_CRUDO },
+    ];
+    const r = await llamar(async () => ({ ok: true, consentimientoVersion: 7 }));
+    expect(r.ok).toBe(true);
+    expect(r.intentos.map((i) => i.consentimientoVersion)).toEqual([1, 7]);
+    expect(sdk.modelosLlamados).toEqual([MODELO_PRIMARIO, MODELO_FALLBACK]);
   });
 
   it('el intento fallido del primario no se pierde cuando el respaldo sí responde', async () => {

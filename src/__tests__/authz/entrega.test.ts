@@ -24,7 +24,7 @@ import {
   tableroDeConciliacion,
   versionAprobadaDelServicio,
 } from '@/lib/entrega/entrega.servicio';
-import { calcularDiff, conciliacionCompleta } from '@/lib/entrega/entrega.diff';
+import { calcularDiff, conciliacionCompleta, plegarEstadoVigente } from '@/lib/entrega/entrega.diff';
 import { aprobarGate, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
 import { revalidarDecision } from '@/lib/metodo/gobernanza.servicio';
 import { abrirHilo, hilosDeObjetos } from '@/lib/portal/portal.servicio';
@@ -3985,6 +3985,149 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proyC} and workspace_id = ${ws} and numero = 7`,
     ).rejects.toThrow(/estado desconocido/);
+  });
+
+  it('el orden del pliegue es la SERIE, no el sello: la que empieza antes puede numerar después', async () => {
+    // `creado_en` cae por defecto en `now()`, que en Postgres es el instante de INICIO de la
+    // transacción; el código de ES se asigna bajo `bloquearSerie`, un candado que se toma
+    // DESPUÉS. Los dos relojes se contradicen en cuanto hay espera: una transacción que
+    // empezó ANTES y se quedó esperando obtiene un número MAYOR con un sello MENOR.
+    //
+    // Y donde el orden decide el estado eso no es cosmético: el effective state vigente es
+    // el PLIEGUE cronológico de las constataciones del servicio (RF-06.10), así que si dos
+    // caen en la misma fecha de calendario y se desempatan por el sello, el pliegue aplica
+    // ES-2 primero y deja que ES-1 lo pise. Estado vigente equivocado y diff equivocado
+    // detrás, sin ninguna excepción que lo delate.
+    //
+    // La inversión se monta de verdad, y sale determinista porque `bloquearRelease` se toma
+    // ANTES que `bloquearSerie`: se retiene el candado del release A, se lanza la
+    // constatación de A —que se queda esperando ahí, con su `now()` ya fijado— y mientras
+    // tanto la de B entra entera y se lleva ES-1. Al soltar, A numera ES-2 con un sello
+    // anterior al de B.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-125', 'Proyecto del desempate');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del desempate');
+    const dv1 = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que deja la historia',
+      resumen: '',
+      superaA: null,
+    });
+    // Mismo tipo y mismo título: sin catálogo ni nodo, comparten IDENTIDAD LÓGICA, que es
+    // lo que hace que el pliegue tenga que elegir uno y el orden decida cuál.
+    const elA = await elementoSuelto(dv1.designVersionId, 'Atención telefónica');
+    const elB = await elementoSuelto(dv1.designVersionId, 'Atención telefónica');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv1.designVersionId,
+      motivo: '',
+    });
+
+    const releaseCon = async (titulo: string, elementoId: string): Promise<string> => {
+      const rl = await planificarRelease(leadId, {
+        workspaceId: ws,
+        designVersionId: dv1.designVersionId,
+        titulo,
+        responsable: 'Equipo',
+        fechaObjetivo: HOY,
+        elementos: [{ elementoId, razon: '' }],
+      });
+      await desplegarRelease(leadId, {
+        workspaceId: ws,
+        releaseId: rl.releaseId,
+        desplegadoEn: HOY,
+        desfaseUtcMinutos: 0,
+      });
+      return rl.releaseId;
+    };
+    const rlA = await releaseCon('El que espera el candado', elA);
+    const rlB = await releaseCon('El que se cuela', elB);
+
+    // Se retiene el candado del release A hasta que la constatación de A esté esperándolo.
+    let listo!: () => void;
+    const tomado = new Promise<void>((r) => (listo = r));
+    let liberar!: () => void;
+    const espera = new Promise<void>((r) => (liberar = r));
+    const reteniendo = conUsuario(leadId, async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended('designio:release:' || ${rlA}, 42))`;
+      listo();
+      await espera;
+    });
+    await tomado;
+
+    const constatarA = constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlA,
+      constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
+      resumen: 'La que empezó antes',
+      constataciones: [
+        { elementoId: elA, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+      ],
+    });
+    try {
+      // Con su `now()` ya fijado y sin número todavía.
+      expect(await siguePendiente(constatarA)).toBe(true);
+      // B entra entera mientras A espera: se lleva ES-1 con un sello POSTERIOR.
+      await constatarEffectiveState(leadId, {
+        workspaceId: ws,
+        releaseId: rlB,
+        constatadoEn: HOY,
+        desfaseUtcMinutos: 0,
+        resumen: 'La que empezó después',
+        constataciones: [
+          {
+            elementoId: elB,
+            resultado: 'desviado',
+            queQuedoDistinto: 'Quedó distinto',
+            razon: 'Lo dice la que numeró primero',
+          },
+        ],
+      });
+    } finally {
+      liberar();
+    }
+    await reteniendo;
+    await constatarA;
+
+    // La inversión existe de verdad: A numeró DESPUÉS y su sello es ANTERIOR. Los números
+    // concretos no se fijan —la serie es del workspace y otros tests ya gastaron códigos—,
+    // se comprueba la RELACIÓN, que es lo que el desempate mira.
+    const [inversion] = await admin`
+      select (select codigo from effective_state where release_id = ${rlA}) as codigo_a,
+             (select codigo from effective_state where release_id = ${rlB}) as codigo_b,
+             (select numero_de_serie(codigo) from effective_state where release_id = ${rlA})
+               > (select numero_de_serie(codigo) from effective_state where release_id = ${rlB})
+                 as numero_posterior,
+             (select creado_en from effective_state where release_id = ${rlA})
+               < (select creado_en from effective_state where release_id = ${rlB}) as sello_anterior`;
+    expect(inversion!.numero_posterior).toBe(true);
+    expect(inversion!.sello_anterior).toBe(true);
+
+    // Y ahora lo que importa: el pliegue tiene que aplicar ES-1 y luego ES-2, así que gana
+    // la constatación de A. Ordenando por el sello ganaba la de B.
+    const dv2 = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que lee la historia',
+      resumen: '',
+      superaA: dv1.designVersionId,
+    });
+    const vista = await designVersionCompleta(leadId, ws, dv2.designVersionId);
+    // El ES vigente es el ÚLTIMO de la serie, no el del sello más nuevo.
+    expect(vista!.vigente!.codigo).toBe(inversion!.codigo_a as string);
+    // La historia llega en orden de serie…
+    expect(vista!.vigente!.constataciones.map((c) => c.elementoId)).toEqual([elB, elA]);
+    // …y por tanto el pliegue deja vigente lo que dijo la ÚLTIMA de la serie.
+    const plegado = [...plegarEstadoVigente(vista!.vigente!.constataciones).values()];
+    expect(plegado).toHaveLength(1);
+    expect(plegado[0]!.elementoId).toBe(elA);
+    expect(plegado[0]!.resultado).toBe('como-aprobado');
   });
 
   it('la fecha se juzga en el calendario de QUIEN ESCRIBE, no en el de la base (RF-06.5, RF-06.6)', async () => {

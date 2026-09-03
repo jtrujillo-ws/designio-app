@@ -1017,10 +1017,16 @@ export async function designVersionCompleta(
             'fechaObjetivo', to_char(r.fecha_objetivo, 'YYYY-MM-DD'),
             'estado', r.estado,
             'desplegadoEn', to_char(r.desplegado_en, 'YYYY-MM-DD'),
+            -- Por la POSICIÓN del elemento en su design version, que es como se listan en
+            -- todas partes. El sello re.creado_en no ordenaba nada: el alcance se inserta de una
+            -- vez, así que todas las filas comparten el now() de la transacción y el orden
+            -- lo acababa eligiendo el planificador, distinto entre recargas.
             'elementos', coalesce((
               select jsonb_agg(jsonb_build_object('elementoId', re.elemento_id, 'razon', re.razon)
-                order by re.creado_en)
+                order by ec3.orden, ec3.creado_en)
               from release_elemento re
+              join elemento_cambio ec3 on ec3.id = re.elemento_id
+                and ec3.workspace_id = re.workspace_id
               where re.release_id = r.id and re.workspace_id = r.workspace_id), '[]'::jsonb),
             'effectiveState', (
               select jsonb_build_object('id', es.id, 'codigo', es.codigo, 'resumen', es.resumen,
@@ -1028,8 +1034,10 @@ export async function designVersionCompleta(
                 'constataciones', coalesce((
                   select jsonb_agg(jsonb_build_object('elementoId', c.elemento_id,
                     'resultado', c.resultado, 'queQuedoDistinto', c.que_quedo_distinto,
-                    'razon', c.razon) order by c.creado_en)
+                    'razon', c.razon) order by ec4.orden, ec4.creado_en)
                   from constatacion c
+                  join elemento_cambio ec4 on ec4.id = c.elemento_id
+                    and ec4.workspace_id = c.workspace_id
                   where c.effective_state_id = es.id and c.workspace_id = es.workspace_id), '[]'::jsonb))
               from effective_state es
               where es.release_id = r.id and es.workspace_id = r.workspace_id))
@@ -1126,7 +1134,10 @@ export async function designVersionCompleta(
                 'titulo', u.titulo, 'tipo', u.tipo,
                 'nodoId', u.nodo_id, 'catalogoId', u.catalogo_id,
                 'operacion', u.operacion, 'resultado', u.resultado)
-                order by u.constatado_en, u.es_creado_en, u.orden, u.elemento_creado_en)
+                -- Desempate por NÚMERO DE SERIE y no por el sello: son dos relojes y se
+                -- contradicen (ver numero_de_serie en la migración). El pliegue es
+                -- cronológico, así que ordenarlo mal deja vigente lo que ya no lo es.
+                order by u.constatado_en, u.es_numero, u.orden, u.elemento_creado_en)
               from (
                 -- El tipo es parte de la identidad de respaldo (ver «clave» en
                 -- entrega.diff.ts) y sale de ec2, la fila HISTÓRICA que se constató. No se
@@ -1140,7 +1151,7 @@ export async function designVersionCompleta(
                     nodo_congelado(dv2.snapshot_id, dv2.workspace_id, ec2.nodo_id)->>'catalogo_id',
                     n2.catalogo_id::text) as catalogo_id,
                   ec2.operacion, c.resultado, es2.constatado_en,
-                  es2.creado_en as es_creado_en, ec2.orden,
+                  numero_de_serie(es2.codigo) as es_numero, ec2.orden,
                   ec2.creado_en as elemento_creado_en
                 from constatacion c
                 join effective_state es2 on es2.id = c.effective_state_id
@@ -1163,7 +1174,9 @@ export async function designVersionCompleta(
               and dv3.workspace_id = r3.workspace_id
             where es3.servicio_id = dv.servicio_id and es3.workspace_id = dv.workspace_id
               and r3.design_version_id <> dv.id and r3.estado = 'verificado'
-            order by es3.constatado_en desc, es3.creado_en desc
+            -- Mismo desempate y por el mismo motivo que la historia de arriba: el ES
+            -- vigente es el ÚLTIMO de la serie, no el del sello más nuevo.
+            order by es3.constatado_en desc, numero_de_serie(es3.codigo) desc
             limit 1
           ) v) as vigente
       from design_version dv
@@ -1211,9 +1224,16 @@ export async function designVersionCompleta(
  * servicio elegido podía quedar detrás del corte. Entonces el selector se quedaba sin
  * opciones, el formulario mandaba `superaA = null` y `design_version_anclaje_guard` lo
  * rechazaba —porque sí existe una aprobada—: crear la versión siguiente de ese servicio
- * se volvía IMPOSIBLE. Keyset por `(creado_en, id)`, el mismo patrón que la lista de
- * journeys: el cursor viaja como id y su par lo resuelve la base, porque serializar el
- * timestamp pierde microsegundos y salta o repite filas.
+ * se volvía IMPOSIBLE. Keyset por el NÚMERO DE SERIE del código: el cursor sigue viajando
+ * como id —igual que en la lista de journeys— y la base resuelve su número, que es un entero
+ * y no pierde precisión al viajar, a diferencia del timestamp.
+ *
+ * Antes el keyset era `(creado_en, id)`, y el par hacía falta porque el sello puede repetirse.
+ * El código no: es UNIQUE por workspace y ordena total él solo. Y sobre todo es el orden en
+ * que las versiones se numeraron de verdad —lo serializa `bloquearSerie`—, mientras que el
+ * sello es el INICIO de la transacción y puede contradecirlo (ver `numero_de_serie` en la
+ * migración). Ahí solo desordenaba la lista, pero enseñar DV-6 encima de DV-7 es enseñar la
+ * serie al revés de como se escribió.
  */
 export const PAGINA_DESIGN_VERSIONS = 50;
 
@@ -1238,10 +1258,17 @@ export async function designVersionsDelWorkspace(
       join servicio s on s.id = dv.servicio_id and s.workspace_id = dv.workspace_id
       join proyecto p on p.id = dv.proyecto_id and p.workspace_id = dv.workspace_id
       where dv.workspace_id = ${workspaceId}
-        and (${cursor}::uuid is null or (dv.creado_en, dv.id) < (
-          select c.creado_en, c.id from design_version c
+        -- Keyset por NÚMERO DE SERIE y no por creado_en: el orden real de creación lo fija
+        -- bloquearSerie, que se toma después de que la transacción empiece, así que el
+        -- sello puede contradecir al código (ver numero_de_serie en la migración). Aquí solo
+        -- desordenaba una lista —no decide estado, como sí lo hace el pliegue—, pero enseñar
+        -- DV-6 por encima de DV-7 es enseñar la serie al revés de como se numeró.
+        -- Y el código es UNIQUE por workspace, así que ordena total él solo: el desempate por
+        -- id que necesitaba el sello sobra.
+        and (${cursor}::uuid is null or numero_de_serie(dv.codigo) < (
+          select numero_de_serie(c.codigo) from design_version c
           where c.id = ${cursor}::uuid and c.workspace_id = ${workspaceId}))
-      order by dv.creado_en desc, dv.id desc
+      order by numero_de_serie(dv.codigo) desc
       limit ${PAGINA_DESIGN_VERSIONS + 1}`;
     const pagina = filas.slice(0, PAGINA_DESIGN_VERSIONS);
     return {

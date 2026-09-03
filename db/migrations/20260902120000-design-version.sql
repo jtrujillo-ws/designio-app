@@ -226,6 +226,32 @@ create table effective_state (
 create index effective_state_servicio_idx
   on effective_state (workspace_id, servicio_id, constatado_en desc);
 
+-- ══ EL ORDEN DE UNA SERIE ES SU NÚMERO, NUNCA SU SELLO TEMPORAL ══
+-- Los códigos de serie (ES-1, RL-2, DV-3) se asignan bajo `bloquearSerie`, un candado que la
+-- transacción toma DESPUÉS de haber empezado. Y `creado_en` cae por defecto en `now()`, que
+-- en Postgres es el instante de INICIO de la transacción. Son DOS RELOJES DISTINTOS, y se
+-- contradicen en cuanto hay espera: una transacción que empezó ANTES y se quedó esperando el
+-- candado obtiene un número MAYOR con un `creado_en` MENOR. `now()` no sabe nada de un
+-- candado que se tomó después.
+--
+-- Donde el orden solo decora, da igual. Donde DECIDE EL ESTADO, no: el effective state
+-- vigente de un servicio es el PLIEGUE cronológico de sus constataciones (RF-06.10), así que
+-- dos que caen en la misma fecha de calendario se desempatan aquí — y con el sello el pliegue
+-- aplicaba ES-2 primero y dejaba que ES-1 lo pisara. Estado vigente equivocado, y el diff que
+-- se calcula contra él, también. Sin excepción ninguna que lo delate.
+--
+-- El número SÍ es el orden que impuso el candado: es literalmente lo que el candado
+-- serializa, así que no puede discrepar de sí mismo. Se ordena por él.
+--
+-- Y se escribe UNA vez porque lo necesitan dos lecturas —la historia que se pliega y la
+-- elección del ES vigente—: dos redacciones del mismo desempate acaban divergiendo, que es
+-- la lección que ya dejaron `gate_certificado_del_proyecto` y `g7_motivo_de_bloqueo`.
+create function numero_de_serie(p_codigo text) returns int
+language sql immutable strict as $$ select substring(p_codigo from '[0-9]+$')::int $$;
+revoke execute on function numero_de_serie(text) from public;
+-- Las dos lecturas corren como el rol de la app, así que necesita el grant.
+grant execute on function numero_de_serie(text) to designio_app;
+
 -- ── Constatación por elemento, con la desviación dentro (RF-06.6, SYS-07) ──
 -- La «Desviación» del modelo NO es otra tabla: es una constatación cuyo resultado no es
 -- 'como-aprobado'. Separarlas permitiría constatar un elemento como desviado sin

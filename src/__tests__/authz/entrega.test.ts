@@ -285,17 +285,19 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       await tx`delete from release_elemento where workspace_id = ${ws}`;
       await tx`delete from release where workspace_id = ${ws}`;
     });
-    await admin`delete from elemento_decision where workspace_id = ${ws}`;
-    await admin`delete from elemento_insight where workspace_id = ${ws}`;
+
     // La cadena de superación es una autorreferencia, pero NO se corta antes: una design
     // version aprobada es inmutable hasta para el owner (lo impone el guard de
     // transición), y un DELETE que se lleva los dos extremos en la misma sentencia deja
     // la FK satisfecha al final de ella.
-    // Elementos y versiones se van JUNTOS, igual que el alcance y sus releases: el guard
-    // diferido exige que un elemento solo viva en un borrador, y en sentencias sueltas el
-    // borrado de los elementos commitea con las versiones aún aprobadas y lo levanta, con
-    // razón. En una sola transacción, al commit no queda versión a la que pertenecer.
+    // Elementos, sus motivos y las versiones se van JUNTOS, igual que el alcance y sus
+    // releases: el guard diferido exige que un elemento —y sus enlaces de motivación— solo
+    // vivan en un borrador, y en sentencias sueltas el borrado commitea con las versiones aún
+    // aprobadas y lo levanta, con razón. En una sola transacción, al commit no queda versión
+    // a la que pertenecer.
     await admin.begin(async (tx) => {
+      await tx`delete from elemento_decision where workspace_id = ${ws}`;
+      await tx`delete from elemento_insight where workspace_id = ${ws}`;
       await tx`delete from elemento_cambio where workspace_id = ${ws}`;
       await tx`delete from design_version where workspace_id = ${ws}`;
     });
@@ -4228,6 +4230,194 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [dvSig] = await admin`select codigo from design_version
       where id = ${siguiente.designVersionId}`;
     expect(numeroDe(dvSig!.codigo as string)).toBeGreaterThan(numeroDe(creada!.codigo as string));
+  });
+
+  it('varias altas simultáneas no se pelean por el mismo número de serie', async () => {
+    // El trigger que asigna el código lee `max()+1`, y eso es una lectura que otra transacción
+    // invalida escribiendo. Sin candado EN EL TRIGGER, varias altas por SQL directo calculan
+    // el mismo número y todas menos una caen contra el único.
+    //
+    // Es el más leve de la familia —un fallo, no una corrupción, la misma distinción que
+    // justifica el SECURITY DEFINER del trigger—, pero la causa es idéntica: la cita vivía
+    // solo en el envoltorio del servicio, y el SQL directo está concedido.
+    //
+    // La forma del test es distinta de la de los otros pares, y tiene que serlo: aquí el
+    // candado no RECHAZA a nadie, ORDENA. Así que no se pueden sostener las transacciones
+    // hasta que todas hayan escrito —con el candado puesto, la segunda no puede escribir
+    // hasta que la primera commitee, que es justo lo que se quiere—; se lanzan a la vez y se
+    // exige que sobrevivan todas con códigos distintos. Sin candado el rojo es probabilístico
+    // y no seguro, y por eso van SEIS: seis lecturas simultáneas del mismo máximo no se
+    // salvan por temporización.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-138', 'Proyecto de la serie en carrera');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la serie');
+
+    const crear = (n: number) =>
+      conUsuario(leadId, async (tx) => {
+        const [f] = await tx`insert into design_version
+          (workspace_id, proyecto_id, servicio_id, journey_id, titulo, creado_por)
+          values (${ws}, ${proy}, ${svcId}, ${journeyId}, ${'La ' + n + ' de la carrera'},
+                  ${leadId})
+          returning codigo`;
+        return f!.codigo as string;
+      });
+
+    const desenlaces = await Promise.allSettled([1, 2, 3, 4, 5, 6].map(crear));
+    expect(desenlaces.filter((d) => d.status === 'rejected')).toHaveLength(0);
+    const codigos = desenlaces
+      .filter((d): d is PromiseFulfilledResult<string> => d.status === 'fulfilled')
+      .map((d) => d.value);
+    // Seis códigos, todos distintos y todos canónicos.
+    expect(new Set(codigos).size).toBe(6);
+    for (const c of codigos) expect(c).toMatch(/^DV-[1-9][0-9]{0,8}$/);
+    const [cuenta] = await admin`select count(*)::int as n from design_version
+      where proyecto_id = ${proy} and workspace_id = ${ws}`;
+    expect(cuenta!.n).toBe(6);
+  });
+
+  it('dos elementos para la misma entrada de catálogo NO pueden commitear los dos (SYS-05)', async () => {
+    // El escalón del NODO lo cierra un índice único, y un índice único SÍ es atómico. El del
+    // CATÁLOGO no puede tener índice —el catálogo es columna del nodo, no del elemento—, así
+    // que solo lo sostenía un guard inmediato: dos altas para NODOS DISTINTOS que apuntan a la
+    // MISMA entrada no se ven y commitean las dos. Quedan dos elementos con la misma identidad
+    // lógica, que el pliegue cuenta como uno y G7 como dos.
+    //
+    // Que no haya índice de red es lo que hace que este sea el que MÁS necesita el candado.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-136', 'Proyecto de la identidad en carrera');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la identidad en carrera');
+    const [cat] = await admin`insert into catalogo_journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'touchpoint', 'Mostrador compartido', ${leadId}) returning id`;
+    const nodoDe = async (etiqueta: string) => {
+      const [n] = await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, catalogo_id, creado_por)
+        values (${ws}, ${journeyId}, 'touchpoint', ${etiqueta}, ${cat!.id as string}, ${leadId})
+        returning id`;
+      return n!.id as string;
+    };
+    const nodoA = await nodoDe('Mostrador al entrar');
+    const nodoB = await nodoDe('Mostrador al salir');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La de la identidad en carrera',
+      resumen: '',
+      superaA: null,
+    });
+
+    let listaA!: () => void;
+    let listaB!: () => void;
+    const ambasEscritas = Promise.all([
+      new Promise<void>((r) => (listaA = r)),
+      new Promise<void>((r) => (listaB = r)),
+    ]);
+    let soltar!: () => void;
+    const salida = new Promise<void>((r) => (soltar = r));
+    const insertandoEn = (nodoId: string, titulo: string, lista: () => void) =>
+      conUsuario(leadId, async (tx) => {
+        const filas = await tx`insert into elemento_cambio
+          (workspace_id, design_version_id, tipo, operacion, titulo, nodo_id, orden, creado_por)
+          values (${ws}, ${dv.designVersionId}, 'touchpoint', 'agrega', ${titulo}, ${nodoId}, 0,
+                  ${leadId})`;
+        if (filas.count !== 1) throw new Error('el alta directa no alcanzó su fila');
+        lista();
+        await salida;
+      });
+
+    const unA = insertandoEn(nodoA, 'El del mostrador de entrada', listaA);
+    const unB = insertandoEn(nodoB, 'El del mostrador de salida', listaB);
+    await ambasEscritas;
+    soltar();
+    const desenlaces = await Promise.allSettled([unA, unB]);
+    expect(desenlaces.filter((d) => d.status === 'fulfilled')).toHaveLength(1);
+    expect(desenlaces.filter((d) => d.status === 'rejected')).toHaveLength(1);
+
+    // Una sola identidad lógica en la versión, gane quien gane.
+    const [cuenta] = await admin`select count(*)::int as n from elemento_cambio ec
+      join journey_nodo n on n.id = ec.nodo_id and n.workspace_id = ec.workspace_id
+      where ec.design_version_id = ${dv.designVersionId} and n.catalogo_id = ${cat!.id as string}`;
+    expect(cuenta!.n).toBe(1);
+  });
+
+  it('los MOTIVOS de un elemento tampoco cambian después de congelar (RF-06.9)', async () => {
+    // Los enlaces de motivación tenían el mismo agujero que el elemento y por la misma razón:
+    // su política mira `dv.estado = 'borrador'` con un exists sobre otra tabla, o sea con la
+    // instantánea del inicio de la sentencia. Así el RASTRO de una versión ya inmutable podía
+    // cambiar después de congelarse — y el rastro es el producto, no un adorno: RF-06.9 lo
+    // recorre en los dos sentidos.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-137', 'Proyecto del rastro en carrera');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del rastro');
+    const [g1] = await admin`select id from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 1`;
+    const [dec] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, decidido_por)
+      values (${ws}, ${proy}, ${g1!.id as string}, 'diseno', 'La razón que llega tarde', ${leadId})
+      returning id`;
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del rastro',
+      resumen: '',
+      superaA: null,
+    });
+    const el = await elementoSuelto(dv.designVersionId, 'El que ya estaba');
+
+    let listaA!: () => void;
+    let listaB!: () => void;
+    const ambasEscritas = Promise.all([
+      new Promise<void>((r) => (listaA = r)),
+      new Promise<void>((r) => (listaB = r)),
+    ]);
+    let soltar!: () => void;
+    const salida = new Promise<void>((r) => (soltar = r));
+
+    const aprobando = conUsuario(leadId, async (tx) => {
+      const [snap] = await tx`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        select ${ws}, ${journeyId}, 'Aprobación en carrera',
+          jsonb_build_object(
+            'nodos', coalesce((select jsonb_agg(to_jsonb(n)) from journey_nodo n
+              where n.journey_id = ${journeyId} and n.workspace_id = ${ws}), '[]'::jsonb),
+            'aristas', coalesce((select jsonb_agg(to_jsonb(a)) from journey_arista a
+              where a.journey_id = ${journeyId} and a.workspace_id = ${ws}), '[]'::jsonb),
+            'evidencias', '[]'::jsonb),
+          ${leadId} returning id`;
+      const filas = await tx`update design_version
+        set estado = 'aprobada', snapshot_id = ${snap!.id as string}, aprobada_por = ${leadId}
+        where id = ${dv.designVersionId} and workspace_id = ${ws} and estado = 'borrador'`;
+      if (filas.count !== 1) throw new Error('la aprobación directa no alcanzó su fila');
+      listaA();
+      await salida;
+    });
+    const citando = conUsuario(leadId, async (tx) => {
+      const filas = await tx`insert into elemento_decision
+        (elemento_id, decision_id, workspace_id, creado_por)
+        values (${el}, ${dec!.id as string}, ${ws}, ${leadId})`;
+      if (filas.count !== 1) throw new Error('la cita directa no alcanzó su fila');
+      listaB();
+      await salida;
+    });
+
+    await ambasEscritas;
+    soltar();
+    const desenlaces = await Promise.allSettled([aprobando, citando]);
+    expect(desenlaces.filter((d) => d.status === 'fulfilled')).toHaveLength(1);
+    expect(desenlaces.filter((d) => d.status === 'rejected')).toHaveLength(1);
+
+    // O sigue en borrador con su cita, o se congeló sin ella. Lo que no existe es una versión
+    // inmutable cuyo rastro creció después.
+    const [estado] = await admin`select dv.estado,
+        (select count(*)::int from elemento_decision ed where ed.elemento_id = ${el}) as citas
+      from design_version dv where dv.id = ${dv.designVersionId} and dv.workspace_id = ${ws}`;
+    const congeladaConCitaNueva =
+      estado!.estado !== 'borrador' && (estado!.citas as number) !== 0;
+    expect(congeladaConCitaNueva).toBe(false);
   });
 
   it('aprobar la versión y meterle un elemento NO pueden commitear los dos (SYS-05)', async () => {

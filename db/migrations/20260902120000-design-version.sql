@@ -371,6 +371,16 @@ language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_siguiente int;
 begin
+  -- El candado de la SERIE, primero. `max()+1` sobre la propia tabla es una lectura que otra
+  -- transacción invalida escribiendo: sin candado, dos altas por SQL directo calculan el
+  -- mismo número y una cae contra el único. Es un fallo y no una corrupción —la misma
+  -- distinción que justifica el SECURITY DEFINER de abajo—, pero es evitable y la causa es la
+  -- de siempre: la cita vivía solo en el servicio, y el SQL directo está concedido.
+  --
+  -- Es la MISMA clave que `bloquearSerie` y va en el mismo sitio del orden canónico, así que
+  -- para quien entra por el servicio esto es un no-op: ya lo tiene tomado.
+  perform pg_advisory_xact_lock(
+    hashtextextended('designio:codigo-' || lower(tg_argv[0]) || ':' || new.workspace_id, 42));
   -- SECURITY DEFINER a propósito: el máximo tiene que verse ENTERO. Si una política ocultara
   -- filas, la serie repetiría un número que el índice único rechazaría — un fallo en vez de
   -- una corrupción, pero un fallo evitable.
@@ -1006,14 +1016,35 @@ language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_dv uuid;
   v_ws uuid;
+  v_elemento uuid;
   v_estado text;
 begin
-  if tg_op = 'DELETE' then
-    v_dv := old.design_version_id;
-    v_ws := old.workspace_id;
+  -- Sirve a TRES tablas: el elemento y sus dos enlaces de motivación. Los enlaces tenían el
+  -- mismo agujero y por la misma razón —su política mira `dv.estado = 'borrador'` con un
+  -- exists sobre otra tabla, o sea con la instantánea del inicio de la sentencia—, así que
+  -- el rastro de una versión ya inmutable podía cambiar después de congelarse. Y el rastro
+  -- ES el producto: RF-06.9 lo recorre en los dos sentidos.
+  if tg_table_name = 'elemento_cambio' then
+    if tg_op = 'DELETE' then
+      v_dv := old.design_version_id;
+      v_ws := old.workspace_id;
+    else
+      v_dv := new.design_version_id;
+      v_ws := new.workspace_id;
+    end if;
   else
-    v_dv := new.design_version_id;
-    v_ws := new.workspace_id;
+    if tg_op = 'DELETE' then
+      v_elemento := old.elemento_id;
+      v_ws := old.workspace_id;
+    else
+      v_elemento := new.elemento_id;
+      v_ws := new.workspace_id;
+    end if;
+    select ec.design_version_id into v_dv from elemento_cambio ec
+      where ec.id = v_elemento and ec.workspace_id = v_ws;
+    if v_dv is null then
+      return null;
+    end if;
   end if;
   perform pg_advisory_xact_lock(hashtextextended('designio:dv-elemento:' || v_dv, 42));
   select dv.estado into v_estado from design_version dv
@@ -1027,7 +1058,59 @@ create constraint trigger elemento_cambio_version_editable
   after insert or update or delete on elemento_cambio
   deferrable initially deferred
   for each row execute function elemento_cambio_version_editable_guard();
+create constraint trigger elemento_decision_version_editable
+  after insert or delete on elemento_decision
+  deferrable initially deferred
+  for each row execute function elemento_cambio_version_editable_guard();
+create constraint trigger elemento_insight_version_editable
+  after insert or delete on elemento_insight
+  deferrable initially deferred
+  for each row execute function elemento_cambio_version_editable_guard();
 revoke execute on function elemento_cambio_version_editable_guard() from public;
+
+-- ══ Y LA IDENTIDAD DE CATÁLOGO, REVALIDADA AL COMMIT ══
+-- El escalón del NODO lo cierra un índice único, y un índice único sí es atómico: dos altas
+-- concurrentes contra el mismo nodo chocan de verdad. El del CATÁLOGO no puede tener índice
+-- —el catálogo no es columna de `elemento_cambio`, es del nodo—, así que lo único que lo
+-- sostenía era el guard inmediato de arriba. Y un guard inmediato es ciego a lo que otra
+-- transacción tiene a medias: dos curadores insertan elementos para NODOS DISTINTOS que
+-- apuntan a la MISMA entrada, ninguno ve al otro, y commitean los dos.
+--
+-- Queda entonces lo que la unicidad existe para impedir: dos elementos con la misma identidad
+-- lógica en una versión, que el pliegue cuenta como uno y G7 como dos.
+--
+-- Que no haya índice de red es justo lo que hace que ESTE sea el que más necesita el candado,
+-- no el que menos. Se revalida al commit, con el mismo candado de la versión que ya toma el
+-- guard del borrador — así que para una transacción que toque las dos cosas es un no-op.
+create function elemento_cambio_identidad_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_catalogo uuid;
+begin
+  if new.nodo_id is null then
+    return null;
+  end if;
+  perform pg_advisory_xact_lock(
+    hashtextextended('designio:dv-elemento:' || new.design_version_id, 42));
+  select n.catalogo_id into v_catalogo from journey_nodo n
+    where n.id = new.nodo_id and n.workspace_id = new.workspace_id;
+  if v_catalogo is not null and exists (
+    select 1 from elemento_cambio ec
+    join journey_nodo n2 on n2.id = ec.nodo_id and n2.workspace_id = ec.workspace_id
+    where ec.design_version_id = new.design_version_id
+      and ec.workspace_id = new.workspace_id
+      and ec.id <> new.id
+      and n2.catalogo_id = v_catalogo
+  ) then
+    raise exception 'otro elemento de esta design version ya cambia esa entrada de catálogo: descríbelo en UN elemento (el estado efectivo no sabe plegar dos)';
+  end if;
+  return null;
+end $$;
+create constraint trigger elemento_cambio_identidad
+  after insert or update on elemento_cambio
+  deferrable initially deferred
+  for each row execute function elemento_cambio_identidad_guard();
+revoke execute on function elemento_cambio_identidad_guard() from public;
 
 -- Lo que MOTIVA un elemento tiene que ser citable de verdad: misma doctrina que
 -- checklist_objeto_citable_guard (la decisión, del proyecto de la DV y VIGENTE; el
@@ -1210,7 +1293,19 @@ create function design_version_anclaje_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_gate int;
+  v_reto uuid;
 begin
+  -- El candado del RETO, antes de nada: más abajo este guard pregunta si el proyecto ya
+  -- CERTIFICÓ un gate, y eso es una lectura de gate_instancia que otra transacción puede
+  -- invalidar aprobando G6 a la vez. Sin candado compartido, el borrador nace en un proyecto
+  -- que acaba certificado — y entonces no se puede aprobar (lo rechaza la transición), ni
+  -- borrar, ni mudar de proyecto: el callejón exacto que este guard existe para evitar.
+  -- `crearDesignVersion` ya lo tomaba; aquí vale también para el SQL directo.
+  select p.reto_id into v_reto from proyecto p
+    where p.id = new.proyecto_id and p.workspace_id = new.workspace_id;
+  if v_reto is not null then
+    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+  end if;
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
@@ -1354,6 +1449,7 @@ create function design_version_transicion_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_gate int;
+  v_reto uuid;
 begin
   if new.estado = old.estado then
     -- SYS-05 donde no llegan las políticas: una design version que ya no está en borrador
@@ -1385,11 +1481,21 @@ begin
   end if;
 
   if new.estado = 'aprobada' then
-    -- El candado de la VERSIÓN, y antes de mirar nada: es el otro lado del par que cierra
-    -- `elemento_cambio_version_editable_guard`. Sin él, esta aprobación y una inserción de
-    -- elemento concurrente se miran sin verse y congelan una versión con contenido que estas
-    -- comprobaciones nunca vieron. El servicio ya lo tomaba; aquí vale también para el SQL
-    -- directo, que es lo que este esquema promete cubrir.
+    -- Dos candados, y EN ESTE ORDEN, que es el canónico del módulo (reto → dv-elemento):
+    --
+    --  · el del RETO, porque esta rama pregunta si el proyecto ya certificó un gate, y eso
+    --    es una lectura de gate_instancia que una aprobación de G6 concurrente invalida;
+    --  · el de la VERSIÓN, porque es el otro lado del par que cierra
+    --    `elemento_cambio_version_editable_guard`: sin él, esta aprobación y una inserción de
+    --    elemento se miran sin verse y congelan contenido que estas comprobaciones no vieron.
+    --
+    -- `aprobarDesignVersion` los toma los dos y en este orden; aquí valen además para el SQL
+    -- directo. Invertirlos cerraría un ciclo contra esa misma ruta.
+    select p.reto_id into v_reto from proyecto p
+      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id;
+    if v_reto is not null then
+      perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+    end if;
     perform pg_advisory_xact_lock(hashtextextended('designio:dv-elemento:' || new.id, 42));
     -- El sello lo pone la BASE: un update directo no puede retro ni post-datar lo que
     -- desde este instante es inmutable.
@@ -2032,6 +2138,12 @@ begin
   ) then
     raise exception 'transición de release ilegal: % → %', old.estado, new.estado;
   end if;
+  -- El candado del RELEASE antes de las comprobaciones que leen OTRAS tablas: el alcance al
+  -- desplegar y las constataciones al verificar. Los diferidos del alcance ya cierran el par
+  -- por su lado; esto pone a este guard en la misma cita en vez de dejarlo confiando en que
+  -- el servicio la tomó. Es el único candado que toma esta ruta, así que no hay orden que
+  -- romper.
+  perform pg_advisory_xact_lock(hashtextextended('designio:release:' || new.id, 42));
 
   if new.estado = 'desplegado' then
     -- En el calendario de QUIEN ESCRIBE, no en el de la base (ver hoy_del_cliente).

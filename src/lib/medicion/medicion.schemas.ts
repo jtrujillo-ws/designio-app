@@ -539,7 +539,11 @@ export function faltaParaCompletar(
     review: OutcomeReviewDeReto | null;
     proyectosFrenanCierre: { codigo: string; motivo: string }[];
   },
-  borrador: CompletarReview,
+  // Recibe el BORRADOR y no el payload del cierre: el espejo corre sobre lo que hay escrito
+  // ahora mismo, que por definición puede estar a medias — sin veredicto elegido, incluso. Es
+  // justo el estado en el que el botón tiene que estar apagado, así que exigir aquí la forma
+  // final habría hecho imposible preguntar en el único momento en que hace falta.
+  borrador: BorradorReview,
 ): string[] {
   const review = seguimiento.review;
   if (review === null) return [];

@@ -989,7 +989,14 @@ function BloqueReview({
   const ventanasListas = ventanasCerradas(seguimiento.entradas);
   const habilitado = postMortemPorAbrir(seguimiento);
   const [ocupado, setOcupado] = useState(false);
-  const [veredicto, setVeredicto] = useState<VeredictoSlug>('no-concluyente');
+  // NULL de arranque, y no es un detalle de formulario: el veredicto es un DICTAMEN. Con el
+  // selector prerrelleno, «Guardar borrador» persistía un veredicto que el lead nunca eligió
+  // —y desde que el borrador se guarda de verdad, eso convierte en silencio una redacción a
+  // medias en un dictamen auditado—. La columna se hizo nullable precisamente para que un
+  // borrador no tenga que elegir; que la pantalla elija por él deshace ese contrato. Elegir
+  // es del CIERRE: sin veredicto, `CompletarReviewSchema` no valida y el botón de completar
+  // no se ofrece — lo dice ya el espejo, sin condición nueva.
+  const [veredicto, setVeredicto] = useState<VeredictoSlug | null>(null);
   const [contribucion, setContribucion] = useState('');
   const [factores, setFactores] = useState('');
   const [hipotesis, setHipotesis] = useState('');
@@ -1027,7 +1034,7 @@ function BloqueReview({
   useEffect(() => {
     if (!review) return;
     const borrador = narrativaDelBorrador(review);
-    if (borrador.veredicto !== null) setVeredicto(borrador.veredicto);
+    setVeredicto(borrador.veredicto);
     setContribucion(borrador.contribucion);
     setFactores(borrador.factoresExternos);
     setHipotesis(borrador.hipotesisAbiertas);
@@ -1070,11 +1077,14 @@ function BloqueReview({
   }
 
   async function completar() {
-    if (!review) return;
+    // El veredicto se estrecha aquí y no en el tipo del borrador: completar EXIGE dictamen
+    // —lo dice `CompletarReviewSchema` y por eso el botón está apagado sin él— y guardar no.
+    if (!review || borrador.veredicto === null) return;
+    const payload = { ...borrador, veredicto: borrador.veredicto };
     setOcupado(true);
     onError(null);
     try {
-      const r = await completarReviewDelReto({ data: borrador });
+      const r = await completarReviewDelReto({ data: payload });
       if (r.ok) await onCambio();
       else onError(r.error);
     } catch {
@@ -1234,9 +1244,14 @@ function BloqueReview({
                   />
                 )}
                 <Select
-                  value={veredicto}
-                  onChange={(e) => setVeredicto(e.target.value as VeredictoSlug)}
+                  value={veredicto ?? ''}
+                  onChange={(e) =>
+                    setVeredicto(e.target.value === '' ? null : (e.target.value as VeredictoSlug))
+                  }
                 >
+                  {/* La opción vacía existe para poder NO haber elegido: es el estado en el
+                      que nace un post mortem y en el que se guarda mientras se redacta. */}
+                  <option value="">Veredicto: sin elegir todavía</option>
                   {VEREDICTOS.map((v) => (
                     <option key={v} value={v}>
                       Veredicto: {ETIQUETA_VEREDICTO[v]}

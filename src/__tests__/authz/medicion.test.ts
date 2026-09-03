@@ -37,14 +37,15 @@ import {
   CargarCsvSchema,
   faltaParaCompletar,
   medicionPorAbrir,
-  narrativaDelBorrador,
   postMortemPorAbrir,
   RegistrarSnapshotSchema,
   registryPorAbrir,
+  CompletarReviewSchema,
+  narrativaDelBorrador,
   reparosDelEsquema,
   ResultadoCriterioSchema,
   ventanasCerradas,
-  type CompletarReview,
+  type BorradorReview,
 } from '@/lib/medicion/medicion.schemas';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
 import {
@@ -1729,6 +1730,54 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       disenoExperimentalSuficiente: false,
       disenoExperimentalJustificacion: '',
     });
+    // Y el borrador admite el estado INTERMEDIO que el cierre prohíbe: marcar «diseño
+    // experimental suficiente» y todavía no haber escrito la justificación es lo que pasa
+    // mientras se redacta. Con el CHECK incondicional, guardar ahí moría con un 23514 que se
+    // llevaba por delante los OTROS campos ya escritos. SYS-24 gobierna lo que el post
+    // mortem AFIRMA al cerrarse, y un borrador no afirma nada.
+    await guardarBorradorReview(leadId, {
+      workspaceId: ws,
+      reviewId,
+      veredicto: null,
+      contribucion: 'Media redacción que todavía no cierra nada',
+      factoresExternos: 'Cambió el proveedor de verificación a mitad de ventana',
+      hipotesisAbiertas: '',
+      aprendizajes: '',
+      disenoExperimentalSuficiente: true,
+      disenoExperimentalJustificacion: '',
+    });
+    const aMitad = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    expect(aMitad!.review!.disenoExperimentalSuficiente).toBe(true);
+    expect(aMitad!.review!.contribucion).toBe('Media redacción que todavía no cierra nada');
+    // …y el CIERRE lo sigue rechazando, que es de quien era la regla: por esquema antes de
+    // salir, y por CHECK si alguien lo fuerza por SQL directo.
+    expect(
+      reparosDelEsquema(CompletarReviewSchema, {
+        workspaceId: ws,
+        reviewId,
+        veredicto: 'no-concluyente',
+        contribucion: 'algo',
+        factoresExternos: '',
+        hipotesisAbiertas: '',
+        aprendizajes: '',
+        disenoExperimentalSuficiente: true,
+        disenoExperimentalJustificacion: '',
+      }),
+    ).toContain('Declarar diseño experimental suficiente exige justificarlo (SYS-24)');
+    // (Que el CIERRE sí lo rechaza lo fijan los dos tests del CHECK, por SQL directo.)
+    // Se deja el borrador como estaba para el resto del guion.
+    await guardarBorradorReview(leadId, {
+      workspaceId: ws,
+      reviewId,
+      veredicto: null,
+      contribucion: 'Media redacción que todavía no cierra nada',
+      factoresExternos: 'Cambió el proveedor de verificación a mitad de ventana',
+      hipotesisAbiertas: '',
+      aprendizajes: '',
+      disenoExperimentalSuficiente: false,
+      disenoExperimentalJustificacion: '',
+    });
+
     const guardado = await seguimientoDeImpacto(leadId, ws, proyectoId);
     // Sigue en BORRADOR: guardar no es firmar. El reto no se ha cerrado ni tiene veredicto.
     expect(guardado!.review!.estado).toBe('borrador');
@@ -1751,7 +1800,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const aMedias = await seguimientoDeImpacto(leadId, ws, proyectoId);
     // El borrador ENTERO, que es lo que la pantalla envía: preguntar con media entrada solo
     // deja mirar media superficie de rechazo (ver más abajo).
-    const borradorDe = (cambios: Partial<CompletarReview> = {}): CompletarReview => ({
+    const borradorDe = (cambios: Partial<BorradorReview> = {}): BorradorReview => ({
       workspaceId: ws,
       reviewId,
       veredicto: 'parcialmente-logrado',
@@ -1792,6 +1841,15 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // demostrar éxito» (SYS-24), y la pantalla dice POR QUÉ en vez de dejar que llegue como
     // rechazo después de pulsar.
     expect(faltaParaCompletar(stake!, borradorDe())).toEqual([]);
+    // SIN veredicto elegido no se completa, y eso es lo que hace seguro que el selector nazca
+    // vacío: la columna es nullable para que un BORRADOR no tenga que dictaminar, así que si
+    // la pantalla prerrellenara el veredicto, «Guardar borrador» persistiría un dictamen que
+    // nadie eligió — un borrador neutro convertido en veredicto auditado, en silencio. Elegir
+    // es del CIERRE, y quien lo exige es el esquema: sin condición nueva en el botón.
+    // No se fija el texto de Zod, que es suyo y puede cambiar: lo que se fija es que FALTE
+    // algo, o sea que el botón de completar esté apagado sin veredicto elegido.
+    expect(faltaParaCompletar(stake!, borradorDe({ veredicto: null }))).not.toEqual([]);
+    expect(narrativaDelBorrador(null).veredicto).toBeNull();
     expect(faltaParaCompletar(stake!, borradorDe({ veredicto: 'logrado' }))).toEqual([
       'Reintentos por solicitud: sin dato final, así que el veredicto no puede ser «logrado»',
     ]);
@@ -1823,11 +1881,20 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       'Escribe la contribución del rediseño y lo que no puede atribuírsele',
     ]);
     // Y que lo de arriba es un espejo y no una regla nueva: la BASE lo rechaza igual, con su
-    // propio CHECK, aunque se entre por SQL directo.
+    // propio CHECK, aunque se entre por SQL directo. Pero lo rechaza al COMPLETAR, que es de
+    // quien es la regla: SYS-24 gobierna lo que el post mortem AFIRMA al cerrarse, y en
+    // borrador no afirma nada — marcar la casilla y estar escribiendo la justificación es un
+    // estado intermedio normal. Con el CHECK incondicional, guardar ahí moría con un 23514
+    // que se llevaba por delante los otros campos ya redactados.
+    await conUsuario(leadId, (tx) => tx`update outcome_review
+      set diseno_experimental_suficiente = true where id = ${reviewId}`);
     await expect(
-      conUsuario(leadId, (tx) => tx`update outcome_review
-        set diseno_experimental_suficiente = true where id = ${reviewId}`),
+      sqlAdmin()`update outcome_review set estado = 'completado', veredicto = 'no-concluyente',
+        contribucion = 'x', completado_por = ${leadId}, completado_en = now()
+        where id = ${reviewId}`,
     ).rejects.toThrow(/check constraint/);
+    await conUsuario(leadId, (tx) => tx`update outcome_review
+      set diseno_experimental_suficiente = false where id = ${reviewId}`);
 
     // Y el editor del resultado arranca del resultado GUARDADO, no en vacío: guardar es un
     // upsert de las tres columnas, así que un formulario en blanco convertía «cambio el
@@ -2136,11 +2203,18 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       conUsuario(leadId, (tx) => tx`update outcome_review
         set veredicto = 'éxito rotundo' where id = ${reviewId}`),
     ).rejects.toThrow(/check constraint/);
-    // El lenguaje causal no es el default: el flag SIN justificación lo rechaza el CHECK.
+    // El lenguaje causal no es el default: el flag SIN justificación lo rechaza el CHECK al
+    // COMPLETAR. En borrador se admite —es lo que hay mientras se redacta la justificación—,
+    // y esa es la diferencia entre lo que el post mortem afirma y lo que está escribiendo.
+    await conUsuario(leadId, (tx) => tx`update outcome_review
+      set diseno_experimental_suficiente = true where id = ${reviewId}`);
     await expect(
-      conUsuario(leadId, (tx) => tx`update outcome_review
-        set diseno_experimental_suficiente = true where id = ${reviewId}`),
+      sqlAdmin()`update outcome_review set estado = 'completado', veredicto = 'no-concluyente',
+        contribucion = 'x', completado_por = ${leadId}, completado_en = now()
+        where id = ${reviewId}`,
     ).rejects.toThrow(/check constraint/);
+    await conUsuario(leadId, (tx) => tx`update outcome_review
+      set diseno_experimental_suficiente = false where id = ${reviewId}`);
 
     // «Logrado» con un criterio sin dato final es la presión por demostrar éxito que la
     // spec nombra como riesgo: el guard lo frena y ofrece los veredictos honestos.
@@ -2448,10 +2522,27 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
           }),
       ),
     ).toBe(true);
-    // Esa entrada entró de verdad (el registry seguía en borrador), así que se retira para
-    // que el test de la firma heredada siga contando una sola.
-    await sqlAdmin()`delete from entrada_kpi
+    // 4) Y la CUARTA, que es la escritura nueva de este slice: BORRAR una entrada. Quitar un
+    //    KPI invalida exactamente el mismo predicado que añadirlo —«qué KPIs tiene este
+    //    contrato»— y la firma lo valida desde otra tabla, así que sin esta cita un borrado y
+    //    la firma podían commitear a la vez: la firma validaba el conjunto VIEJO mientras la
+    //    política del borrado seguía viendo el registry en borrador, y quedaba un contrato
+    //    FIRMADO al que le falta un KPI — el criterio huérfano que la firma existe para
+    //    impedir. El guard compartido estaba colgado de INSERT y UPDATE, y la escritura nueva
+    //    no entró sola: la frontera de un guard son TODAS las escrituras que invalidan su
+    //    predicado, no las que existían cuando se escribió.
+    //
+    //    Retira además la entrada de arriba, que entró de verdad porque el registry seguía en
+    //    borrador: así el test de la firma heredada sigue contando una sola.
+    const [enVuelo] = await sqlAdmin()`select id from entrada_kpi
       where registry_id = ${registryHeredadoId} and nombre = 'KPI que llega mientras se firma'`;
+    expect(
+      await esperaA(
+        (tx) => tx`select 1 from reto
+          where id = ${retoHeredadoId} and workspace_id = ${ws} for update`,
+        () => borrarEntrada(leadId, { workspaceId: ws, entradaId: enVuelo!.id as string }),
+      ),
+    ).toBe(true);
 
     // El rechazo de esos intentos es el del CONTENIDO: la política dejó pasar la firma
     // (G6 heredado) y habló el guard, que es lo que hace válido el bloqueo de arriba.

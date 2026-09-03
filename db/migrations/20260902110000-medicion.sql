@@ -189,8 +189,17 @@ create table outcome_review (
   unique (reto_id),
   foreign key (reto_id, workspace_id) references reto (id, workspace_id),
   -- SYS-24: afirmar «diseño experimental suficiente» sin decir POR QUÉ es exactamente
-  -- la puerta trasera al lenguaje causal que la invariante cierra.
-  check (not diseno_experimental_suficiente
+  -- la puerta trasera al lenguaje causal que la invariante cierra. Pero eso es una
+  -- propiedad del DICTAMEN, no de la fila: lo que SYS-24 gobierna es lo que el post mortem
+  -- AFIRMA al cerrarse, y mientras es borrador no afirma nada — se está redactando.
+  --
+  -- Incondicional, este CHECK imponía al borrador una exigencia del cierre: marcar la
+  -- casilla y ponerse a escribir la justificación es un estado intermedio perfectamente
+  -- normal, y ahí el guardado moría con un 23514 que se llevaba por delante los OTROS
+  -- campos ya redactados. Mismo argumento que el veredicto nullable: el borrador no tiene
+  -- que estar terminado para poder guardarse; el que tiene que estarlo es el completado, y
+  -- de eso se ocupa la condición. Es además la forma que ya tenía su CHECK hermano.
+  check (estado = 'borrador' or not diseno_experimental_suficiente
          or btrim(diseno_experimental_justificacion) <> ''),
   -- Completado = veredicto del catálogo, contribución escrita y firma con fecha.
   check (estado = 'borrador' or (veredicto is not null and completado_por is not null
@@ -818,61 +827,79 @@ language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   -- Guard COMPARTIDO entre tres tablas con columnas distintas: plpgsql resuelve todas las
   -- referencias de campo aunque su rama no se ejecute, así que la fila se lee por jsonb.
-  fila jsonb := to_jsonb(new);
+  -- En un DELETE la fila que se escribe es `old` y `new` no existe: nombrarlo reventaría el
+  -- trigger. Se asigna en el cuerpo por eso, igual que en la auditoría.
+  fila jsonb;
+  v_ws uuid;
   v_reto uuid;
 begin
+  if tg_op = 'DELETE' then
+    fila := to_jsonb(old);
+  else
+    fila := to_jsonb(new);
+  end if;
+  v_ws := (fila->>'workspace_id')::uuid;
   -- Pre-chequeo anti-oráculo, como el resto: la consulta privilegiada solo corre para
   -- miembros del workspace declarado; a los demás los rechaza la política.
-  if not is_workspace_member(app_user_id(), new.workspace_id) then
-    return new;
+  if not is_workspace_member(app_user_id(), v_ws) then
+    -- En un BEFORE trigger devolver NULL CANCELA la operación, así que cada salida
+    -- «adelante» tiene que devolver la fila que corresponde a su operación.
+    if tg_op = 'DELETE' then return old; else return new; end if;
   end if;
   -- Por dónde llega cada escritura hasta su reto. Todas estas pertenencias son
   -- inmutables (ni `registry_id` ni `entrada_kpi_id` ni `review_id` se editan jamás), así
   -- que resolverlas antes de bloquear no abre ninguna carrera nueva.
   if tg_table_name = 'entrada_kpi' then
     select r.reto_id into v_reto from metric_registry r
-      where r.id = (fila->>'registry_id')::uuid and r.workspace_id = new.workspace_id;
+      where r.id = (fila->>'registry_id')::uuid and r.workspace_id = v_ws;
   elsif tg_table_name = 'snapshot' then
     select r.reto_id into v_reto
       from entrada_kpi e
       join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
-      where e.id = (fila->>'entrada_kpi_id')::uuid and e.workspace_id = new.workspace_id;
+      where e.id = (fila->>'entrada_kpi_id')::uuid and e.workspace_id = v_ws;
   else
     select o.reto_id into v_reto from outcome_review o
-      where o.id = (fila->>'review_id')::uuid and o.workspace_id = new.workspace_id;
+      where o.id = (fila->>'review_id')::uuid and o.workspace_id = v_ws;
   end if;
   -- Sin reto no hay nada que bloquear: la FK y la política dirán que la referencia no
   -- existe, y decirlo aquí sería adelantarles un diagnóstico que no nos toca.
   if v_reto is null then
-    return new;
+    if tg_op = 'DELETE' then return old; else return new; end if;
   end if;
-  perform 1 from reto where id = v_reto and workspace_id = new.workspace_id for update;
+  perform 1 from reto where id = v_reto and workspace_id = v_ws for update;
   -- Y AQUÍ está el punto: releer el predicado DESPUÉS de esperar. Cada sentencia de
   -- plpgsql toma su propio snapshot, así que esta lectura ya ve lo que commiteó quien
   -- tenía la fila — que es justo lo que la política, atada al snapshot de la sentencia
   -- externa, no puede ver.
   if tg_table_name = 'entrada_kpi' then
     if exists (select 1 from metric_registry r
-      where r.id = (fila->>'registry_id')::uuid and r.workspace_id = new.workspace_id
+      where r.id = (fila->>'registry_id')::uuid and r.workspace_id = v_ws
         and r.estado <> 'borrador') then
       raise exception 'el Metric Registry ya está firmado: el contrato quedó congelado (SYS-22)';
     end if;
   elsif tg_table_name = 'snapshot' then
     if not exists (select 1 from reto r
-      where r.id = v_reto and r.workspace_id = new.workspace_id and r.estado = 'en-medicion') then
+      where r.id = v_reto and r.workspace_id = v_ws and r.estado = 'en-medicion') then
       raise exception 'el reto ya no está en medición: su serie se cerró con el post mortem (SYS-08)';
     end if;
   else
     if exists (select 1 from outcome_review o
-      where o.id = (fila->>'review_id')::uuid and o.workspace_id = new.workspace_id
+      where o.id = (fila->>'review_id')::uuid and o.workspace_id = v_ws
         and o.estado <> 'borrador') then
       raise exception 'el outcome review ya está completado: el post mortem es inmutable (SYS-08)';
     end if;
   end if;
-  return new;
+  if tg_op = 'DELETE' then return old; else return new; end if;
 end $$;
+-- El DELETE entra en la cita, y no es simetría de adorno: QUITAR una entrada invalida el
+-- mismo predicado que su alta —«qué KPIs tiene este contrato»— y la firma lo valida desde
+-- otra tabla. Sin esta rama, un borrado por SQL directo y la firma podían commitear a la
+-- vez: el guard de la firma validaba el conjunto VIEJO de entradas mientras la política del
+-- borrado seguía viendo el registry en borrador, y el resultado era un contrato FIRMADO al
+-- que le falta un KPI — el criterio huérfano que la firma existe para impedir. El guard
+-- estaba colgado de las escrituras que había cuando se escribió; la nueva no entró sola.
 create trigger entrada_bloqueo_por_reto
-  before insert or update on entrada_kpi
+  before insert or update or delete on entrada_kpi
   for each row execute function bloqueo_por_reto_guard();
 create trigger snapshot_bloqueo_por_reto
   before insert on snapshot

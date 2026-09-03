@@ -16,10 +16,11 @@ import type { OrigenKey } from './ai.schemas';
  * Política de modelos centralizada en CÓDIGO, no en env vars (diseño técnico): primario y
  * fallback por superficie; la degradación de modelo ocurre una sola vez por operación.
  *
- * El par es el que fija el diseño técnico, en sus dos secciones. Este slice había puesto
- * otro —`claude-opus-5` con fallback `claude-sonnet-5`— sin decirlo en ninguna parte, y un
- * par documentado que nadie usa es peor que cualquiera de los dos: el siguiente que lea el
- * diseño para calcular costes se equivoca, y el fallback declarado no se ejercita jamás.
+ * El par es el que fija el diseño técnico, en sus dos secciones. Este slice había puesto otro
+ * —uno más capaz de primario, y de fallback el que el documento nombra de primario— sin
+ * decirlo en ninguna parte, y un par documentado que nadie usa es peor que cualquiera de los
+ * dos: el siguiente que lea el diseño para calcular costes se equivoca, y el fallback
+ * declarado no se ejercita jamás.
  *
  * Se alinea el CÓDIGO al documento, y no al revés, por lo que dice el propio documento sobre
  * la asignación por capacidad: «codificación/extracción pueden usar el modelo más rápido

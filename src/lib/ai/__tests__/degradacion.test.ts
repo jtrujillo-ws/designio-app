@@ -99,10 +99,15 @@ describe('coste de la llamada (RF-09.14: se mide, no se estima)', () => {
     const tarifa = TARIFA_USD_POR_MTOK[MODELO_PRIMARIO]!;
     const esperado = (1_000_000 * tarifa.entrada + 200_000 * tarifa.salida) / 1_000_000;
     expect(costoDeUso(MODELO_PRIMARIO, { entrada: 1_000_000, salida: 200_000 })).toBe(esperado);
-    // El fallback es más barato: el coste depende del modelo que sirvió, no del pedido.
-    expect(costoDeUso(MODELO_FALLBACK, { entrada: 1_000_000, salida: 0 })).toBeLessThan(
-      costoDeUso(MODELO_PRIMARIO, { entrada: 1_000_000, salida: 0 })!,
-    );
+    // Lo que se prueba es que el coste depende del modelo que SIRVIÓ, no del que se pidió;
+    // no que el fallback salga más barato. El fallback es para `model-unavailable`, así que
+    // lo que compra es disponibilidad y puede costar más por token — asumir lo contrario
+    // ataba esta prueba a un par de modelos concreto en vez de a la propiedad.
+    const fallback = costoDeUso(MODELO_FALLBACK, { entrada: 1_000_000, salida: 0 })!;
+    const primario = costoDeUso(MODELO_PRIMARIO, { entrada: 1_000_000, salida: 0 })!;
+    expect(fallback).not.toBe(primario);
+    expect(fallback).toBe(TARIFA_USD_POR_MTOK[MODELO_FALLBACK]!.entrada);
+    expect(primario).toBe(TARIFA_USD_POR_MTOK[MODELO_PRIMARIO]!.entrada);
   });
 
   it('la caché entra con su multiplicador y el redondeo no pierde llamadas pequeñas', () => {

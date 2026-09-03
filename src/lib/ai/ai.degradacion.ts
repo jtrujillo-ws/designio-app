@@ -12,10 +12,27 @@ import type { OrigenKey } from './ai.schemas';
  * arrastrar el SDK hasta aquí.
  */
 
-/** Política de modelos centralizada en CÓDIGO, no en env vars (diseño técnico): primario
- * y fallback por superficie; la degradación de modelo ocurre una sola vez por operación. */
-export const MODELO_PRIMARIO = 'claude-opus-5';
-export const MODELO_FALLBACK = 'claude-sonnet-5';
+/**
+ * Política de modelos centralizada en CÓDIGO, no en env vars (diseño técnico): primario y
+ * fallback por superficie; la degradación de modelo ocurre una sola vez por operación.
+ *
+ * El par es el que fija el diseño técnico, en sus dos secciones. Este slice había puesto
+ * otro —`claude-opus-5` con fallback `claude-sonnet-5`— sin decirlo en ninguna parte, y un
+ * par documentado que nadie usa es peor que cualquiera de los dos: el siguiente que lea el
+ * diseño para calcular costes se equivoca, y el fallback declarado no se ejercita jamás.
+ *
+ * Se alinea el CÓDIGO al documento, y no al revés, por lo que dice el propio documento sobre
+ * la asignación por capacidad: «codificación/extracción pueden usar el modelo más rápido
+ * disponible; síntesis (insights, revisores, post mortem) el más capaz». Las dos capacidades
+ * que este slice implementa —CI (extracción) y C0 (encuadre)— son de la primera familia, así
+ * que el primario les toca por regla escrita, no por criterio de nadie.
+ *
+ * El fallback es para `model-unavailable`, no para ahorrar: se degrada a otro modelo cuando
+ * el primero no está, y que cueste algo más por token es normal — lo que se compra es
+ * disponibilidad.
+ */
+export const MODELO_PRIMARIO = 'claude-sonnet-5';
+export const MODELO_FALLBACK = 'claude-sonnet-4-6';
 
 /**
  * Presupuesto AI por workspace (RF-08.5, diseño técnico · «cuota diaria de llamadas AI»):
@@ -39,8 +56,11 @@ export const LIMITE_LLAMADAS_DIA = 60;
  * null y el panel dice «sin tarifa registrada» en vez de un número falso.
  */
 export const TARIFA_USD_POR_MTOK: Record<string, { entrada: number; salida: number }> = {
-  [MODELO_PRIMARIO]: { entrada: 5, salida: 25 },
-  [MODELO_FALLBACK]: { entrada: 2, salida: 10 },
+  // Tarifas de primera parte vigentes para ESTOS dos modelos. Se mueven con el par: si
+  // alguna vez cambia la política, estas dos filas cambian con ella o el reporte de costos
+  // empieza a mentir en silencio (un modelo sin tarifa devuelve null, que al menos se ve).
+  [MODELO_PRIMARIO]: { entrada: 2, salida: 10 },
+  [MODELO_FALLBACK]: { entrada: 3, salida: 15 },
 };
 
 /**

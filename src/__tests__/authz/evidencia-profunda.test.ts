@@ -1029,6 +1029,117 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(estado!.estado).toBe('pendiente');
   });
 
+  it('el CONJUNTO que se bloquea también es mutable: enlazar un insight comparte candado con aprobar', async () => {
+    // El `for share` sobre `derecho_uso` bloquea las FILAS que las comprobaciones
+    // recorren, pero CUÁLES son esas filas se deriva de un `select` que también corre
+    // sobre una instantánea. `decision_insight` es la tabla de la que se deriva y su
+    // política solo mira el rol: un enlace nuevo no toca ninguna fila bloqueada, así que
+    // no espera a nada y aparece como un FANTASMA — una fila que habría cambiado el
+    // conjunto y que ningún candado de fila puede atrapar, porque no existía cuando se
+    // tomó. Objeto común: la DECISIÓN. El guard del gate la toma `for share` antes de
+    // derivar nada; el enlace la toma `for no key update`.
+    const admin = sqlAdmin();
+
+    /** Crea una evidencia con derechos concedidos y devuelve su id. */
+    async function evidenciaConDerecho(titulo: string): Promise<string> {
+      const [f] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+        values (${ws}, 'nota', ${'Fuente ' + titulo}, ${leadId}) returning id`;
+      const [e] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+        values (${ws}, ${f!.id as string}, ${titulo}, '{}'::jsonb, ${leadId}) returning id`;
+      const id = e!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${ws}, ${id}, 'concedido', 'cliente', 'Consentimiento vigente',
+                ${leadId}, now(), ${leadId})`;
+      return id;
+    }
+
+    /** Un insight validado sobre esa evidencia. Validar exige derechos VIVOS al citar. */
+    async function insightValidado(titulo: string, evidenciaId: string): Promise<string> {
+      const ins = await crearInsight(leadId, { workspaceId: ws, titulo, resumen: '' });
+      const af = await agregarAfirmacion(leadId, {
+        workspaceId: ws,
+        insightId: ins.insightId,
+        texto: titulo + ' — afirmación',
+        esHipotesis: false,
+      });
+      await agregarCita(leadId, {
+        workspaceId: ws,
+        afirmacionId: af.afirmacionId,
+        evidenciaId,
+        fragmento: 'Fragmento de respaldo',
+        localizacion: 'p. 1',
+      });
+      await validarInsight(leadId, ws, ins.insightId);
+      return ins.insightId;
+    }
+
+    const evVigente = await evidenciaConDerecho('Respaldo que sigue vigente');
+    const evRevocada = await evidenciaConDerecho('Respaldo que se revocará');
+    const insBueno = await insightValidado('El canal presencial retiene mejor', evVigente);
+    // I2 se valida cuando SÍ tenía derechos y los pierde después: exactamente el estado
+    // que el guard del gate existe para detectar, y que nada impide enlazar más tarde.
+    const insHuerfano = await insightValidado('La cola de espera desanima', evRevocada);
+    await decidirDerechos(adminClienteId, {
+      workspaceId: ws,
+      evidenciaId: evRevocada,
+      decision: 'denegado',
+      ambito: 'interno',
+      base: 'El titular retiró el consentimiento',
+      venceEn: null,
+    });
+
+    const [proy] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-97', 'Proyecto fantasma', ${leadId}) returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 1, 'Investigación')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 1, 'lead-boutique') returning id`;
+    const gateId = gate!.id as string;
+    const [ci] = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gateId}, 0, 'Decisión con su cadena') returning id`;
+    const [dec] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, decidido_por)
+      values (${ws}, ${proyectoId}, ${gateId}, 'diseno', 'Rediseñar la cola',
+              'El insight lo sostiene', ${leadId}) returning id`;
+    const decisionId = dec!.id as string;
+    await admin`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${decisionId}, ${insBueno}, ${ws})`;
+    await marcarItem(leadId, {
+      workspaceId: ws,
+      itemId: ci!.id as string,
+      accion: { tipo: 'cumplido', objetoClase: 'decision', objetoId: decisionId },
+    });
+
+    // El ENLACE en vuelo: su insert ya tomó el candado de la decisión y no ha commiteado.
+    const enlace = await enVuelo(async (tx) => {
+      await tx`insert into decision_insight (decision_id, insight_id, workspace_id)
+        values (${decisionId}, ${insHuerfano}, ${ws})`;
+    });
+
+    const aprobacion = aprobarGate(leadId, { workspaceId: ws, gateId });
+    // Sin el candado sobre la decisión esto resolvía en milisegundos con el gate APROBADO:
+    // el guard derivaba el conjunto de una `decision_insight` en la que el enlace todavía
+    // no estaba, así que no bloqueaba ni miraba las filas de derechos del insight nuevo.
+    expect(await sigueEsperando(aprobacion)).toBe(true);
+
+    await enlace.cerrar();
+    // Y al soltarse, las sentencias siguientes del guard toman instantánea nueva, ven el
+    // enlace, derivan el conjunto AMPLIADO y rechazan. Es la misma lección de siempre: el
+    // candado sirve para decidir sobre lo que quedó, no solo para esperar.
+    await expect(aprobacion).rejects.toThrow(/derechos vigentes/);
+    const [estado] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(estado!.estado).toBe('pendiente');
+    // El enlace SÍ quedó: no se rechaza enlazar, se ordena. Lo que no puede pasar es que
+    // las dos cosas ocurran a la vez y ninguna vea a la otra.
+    const enlaces = await admin`select insight_id from decision_insight
+      where decision_id = ${decisionId} and workspace_id = ${ws}`;
+    expect(enlaces.length).toBe(2);
+  });
+
   it('el tope de adjuntos se cuenta SIN el filtro de quien mira (un conteo bajo RLS no es un conteo)', async () => {
     // `archivo_select` solo enseña a quien no cura los adjuntos que él mismo subió
     // (20260902210000). Contar el tope en la app bajo esa política era contar «lo que este

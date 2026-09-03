@@ -132,13 +132,21 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
         clase: 'decision' as const,
         id: d.id,
         titulo: d.titulo,
-        citable: d.estado === 'vigente' && d.sinRespaldo === null,
+        citable:
+          d.estado === 'vigente' && d.insightSinValidar === null && d.sinRespaldo === null,
+        // Tres superficies de rechazo, tres motivos distintos, en el orden en que hay que
+        // repararlos: el estado de la decisión, después que sus insights estén validados
+        // (objeción ANTERIOR al respaldo — un insight sin validar nunca pasó la barra de
+        // suficiencia) y después el respaldo vivo. Cada uno nombra SU dimensión: rotularlos
+        // todos como «sin derechos» manda a reparar donde no hay nada roto.
         motivoBloqueo:
           d.estado !== 'vigente'
             ? 'está en revisión tras una reapertura aguas arriba (SYS-10): revalídala antes de citarla'
-            : d.sinRespaldo === null
-              ? null
-              : `su respaldo perdió los derechos: en el insight «${d.sinRespaldo.insight}», la afirmación «${d.sinRespaldo.afirmacion}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente`,
+            : d.insightSinValidar !== null
+              ? `su insight de respaldo «${d.insightSinValidar}» no está validado: valídalo o rehaz la decisión`
+              : d.sinRespaldo === null
+                ? null
+                : `su respaldo perdió los derechos: en el insight «${d.sinRespaldo.insight}», la afirmación «${d.sinRespaldo.afirmacion}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente`,
       })),
     ];
     return {

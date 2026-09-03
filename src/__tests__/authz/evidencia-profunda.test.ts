@@ -1864,6 +1864,17 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       accion: { tipo: 'cumplido', objetoClase: 'decision', objetoId: decisionId },
     });
 
+    // Y la PANTALLA no puede ofrecerlo: añadir una superficie de rechazo en la base y
+    // dejar el espejo corto es «lo que la base rechaza, la pantalla no lo ofrece» roto por
+    // el propio arreglo que reforzó la base. El motivo nombra ESTA dimensión, no los
+    // derechos, que aquí están perfectamente vivos.
+    const vista = (await gobernanzaDeProyecto(leadId, ws, proyectoId))!.decisiones.find(
+      (x) => x.id === decisionId,
+    );
+    expect(vista!.estado).toBe('vigente');
+    expect(vista!.sinRespaldo).toBe(null);
+    expect(vista!.insightSinValidar).toBe('Insight heredado sin validar');
+
     // La decisión sigue VIGENTE y los derechos VIVOS: las dos comprobaciones que ya
     // existían no ven nada raro. Lo que falla es la barra de suficiencia del insight.
     await expect(aprobarGate(leadId, { workspaceId: ws, gateId })).rejects.toThrow(
@@ -1872,8 +1883,13 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const [estado] = await admin`select estado from gate_instancia where id = ${gateId}`;
     expect(estado!.estado).toBe('pendiente');
 
-    // Y validarlo lo desbloquea: la regla es «validado», no «este enlace está maldito».
+    // Y validarlo lo desbloquea, en la base y en la pantalla a la vez: la regla es
+    // «validado», no «este enlace está maldito».
     await validarInsight(leadId, ws, ins.insightId);
+    const tras = (await gobernanzaDeProyecto(leadId, ws, proyectoId))!.decisiones.find(
+      (x) => x.id === decisionId,
+    );
+    expect(tras!.insightSinValidar).toBe(null);
     const r = await aprobarGate(leadId, { workspaceId: ws, gateId });
     expect(r.numero).toBe(1);
   });

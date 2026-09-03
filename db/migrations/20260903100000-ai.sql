@@ -900,10 +900,76 @@ create trigger propuesta_ai_revision
 --    MISMO humano que aceptó — la curaduría humana obligatoria (SYS-16) no se esquiva
 --    aceptando una propuesta, y una evidencia AI no puede colarse sin pasar por bandeja.
 --  · C0 ⇒ el criterio cuelga del reto de la propuesta y lo firma quien aceptó (SYS-19).
+-- ── La procedencia, como RELACIÓN y no como coincidencia ───────────────────────────────
+/*
+ * `xmin = pg_current_xact_id()` demuestra «esta fila nació en algún punto de esta
+ * transacción». Lo que el linaje AFIRMA es más fuerte: «esta fila la produjo esta
+ * propuesta». Entre las dos hay hueco, y con los grants de antes se atravesaba entero: un
+ * curador podía, en UNA transacción, crear una evidencia escrita a mano, sellar con ella el
+ * item que le cuadraba y marcar la propuesta como aceptada. Todos los predicados pasaban,
+ * porque todo compartía `xmin`.
+ *
+ * Y el daño no es solo de auditoría: la tasa de corrección humana es la señal con la que se
+ * decide si esta capacidad sirve (§17), y una atribución falsa la corrompe en la dirección
+ * FAVORABLE — contenido escrito a mano contado como aceptado tal cual del modelo. Una
+ * métrica de calidad que el propio operador puede inflar sin querer no mide nada.
+ *
+ * `xmin` es la herramienta correcta para «misma transacción» y la equivocada para «misma
+ * causa» (SPEC-06 lo usa bien: allí la afirmación ES «en esta transacción»). Se queda,
+ * porque «nació aquí» sigue haciendo falta, y se le añaden las dos piezas que faltaban:
+ *
+ *  1. **La relación**, en una columna que el llamante NO puede escribir. Fuera de todo
+ *     grant y estampada solo por el guard que decide, así que «esta fila viene de la
+ *     propuesta P» solo puede haberlo escrito la aceptación de P. Única, además: un objeto
+ *     no puede colgar de dos propuestas ni una propuesta reclamar un objeto ya reclamado, y
+ *     eso deja de valer solo dentro de la transacción para valer siempre.
+ *  2. **La proyección**, más abajo en el guard: los campos que la propuesta DICTA los lleva
+ *     el objeto tal cual. Sin eso, el punto 1 solo registraría la afirmación del llamante
+ *     en un sitio donde no puede reescribirla — que es mejor que nada, pero no es prueba.
+ */
+alter table evidencia add column propuesta_ai_id uuid;
+alter table evidencia add constraint evidencia_propuesta_ai_fkey
+  foreign key (propuesta_ai_id, workspace_id) references propuesta_ai (id, workspace_id);
+create unique index evidencia_propuesta_ai_idx on evidencia (propuesta_ai_id)
+  where propuesta_ai_id is not null;
+
+alter table criterio_exito add column propuesta_ai_id uuid;
+alter table criterio_exito add constraint criterio_exito_propuesta_ai_fkey
+  foreign key (propuesta_ai_id, workspace_id) references propuesta_ai (id, workspace_id);
+create unique index criterio_exito_propuesta_ai_idx on criterio_exito (propuesta_ai_id)
+  where propuesta_ai_id is not null;
+
+-- Y los grants pasan a ser por columna, porque un `grant insert` de tabla cubre también las
+-- columnas FUTURAS: sin esto, añadir la columna se la habría regalado al llamante y el
+-- vínculo no sería vínculo. Un `revoke` por columna no sirve mientras exista el de tabla,
+-- así que se retira el de tabla y se vuelve a conceder la lista exacta de antes.
+revoke insert on evidencia from designio_app;
+grant insert (id, workspace_id, fuente_id, titulo, resumen, dimensiones, es_estado_actual,
+              creado_por, creado_en)
+  on evidencia to designio_app;
+revoke insert on criterio_exito from designio_app;
+grant insert (id, workspace_id, reto_id, kpi, definicion, linea_base_valor, linea_base_fecha,
+              linea_base_plan, objetivo, ventana_dias, fecha_post_mortem, creado_por,
+              creado_en)
+  on criterio_exito to designio_app;
+
+-- El guard de congelado no puede despertarse por el sello del linaje: estampar
+-- `propuesta_ai_id` no es editar un criterio, y dispararlo emitiría un `CriterioEditado`
+-- falso (y podría rechazar la aceptación si el registry se firmó justo entonces). Se acota
+-- por columnas: dispara con el alta y con la edición de lo que de verdad es el criterio.
+drop trigger criterio_g0_pendiente on criterio_exito;
+create trigger criterio_g0_pendiente
+  before insert or update of kpi, definicion, linea_base_valor, linea_base_fecha,
+    linea_base_plan, objetivo, ventana_dias, fecha_post_mortem, reto_id
+  on criterio_exito
+  for each row execute function criterio_g0_pendiente_guard();
+
 -- Diferido al commit porque el servicio materializa y sella en sentencias posteriores de
 -- la misma transacción; una UPDATE cruda solitaria aborta.
 create function propuesta_ai_materializacion_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_filas integer;
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return null;
@@ -961,6 +1027,7 @@ begin
     raise exception 'el criterio materializado tiene que haberlo creado esta misma aceptación: una propuesta no puede apropiarse de un criterio que ya existía (SYS-19)';
   end if;
 
+
   -- ── El consentimiento, en el ÚLTIMO instante ──
   -- El guard de revisión ya lo exige, pero es un trigger BEFORE UPDATE: su snapshot es el
   -- de la sentencia que sella, así que una revocación que commitea DESPUÉS de esa sentencia
@@ -997,6 +1064,61 @@ begin
      and not reto_admite_criterios(new.reto_id, new.workspace_id) then
     raise exception 'ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo';
   end if;
+  -- LA PROYECCIÓN: los campos que la propuesta dicta, el objeto los lleva TAL CUAL. Es lo
+  -- que convierte «nació en esta transacción» en «salió de esta propuesta», y lo que impide
+  -- el caso que el `xmin` solo no veía: una evidencia escrita a mano, sellada en el mismo
+  -- commit, atribuida a una propuesta con la que no tiene nada que ver.
+  --
+  -- Se compara contra `contenido` y NUNCA contra `contenido_original`, y ahí está la razón
+  -- de que esto no rompa la corrección: corregir reescribe `contenido` en la MISMA sentencia
+  -- que dispara este guard, así que el objeto materializado coincide con lo corregido y la
+  -- fila sale `corregida` — que es justo lo que hay que poder medir. Exigir lo original sí
+  -- convertiría cada enmienda en un fallo, y aprobar incluye enmendar (I4).
+  --
+  -- Solo los campos COPIADOS literalmente, no los derivados: `dimensiones` mezcla lo que
+  -- dice la propuesta con lo que dicen el item y la bitácora de consentimiento, así que
+  -- compararla entera ataría este guard al mapeo del servicio y se rompería a la primera
+  -- que alguien añada una dimensión.
+  if new.destino = 'evidencia' and not exists (
+    select 1 from evidencia e
+    where e.id = new.evidencia_id and e.workspace_id = new.workspace_id
+      and e.titulo = new.contenido->>'titulo'
+      and e.resumen = new.contenido->>'resumen'
+      and e.es_estado_actual = (new.contenido->>'esEstadoActual')::boolean) then
+    raise exception 'la evidencia materializada no dice lo que dice la propuesta: el título, el resumen y «es estado actual» se copian tal cual de la propuesta aceptada (SYS-19)';
+  end if;
+  if new.destino = 'criterio-exito' and not exists (
+    select 1 from criterio_exito c
+    where c.id = new.criterio_id and c.workspace_id = new.workspace_id
+      and c.kpi = new.contenido->>'kpi'
+      and c.definicion = new.contenido->>'definicion'
+      and c.objetivo = new.contenido->>'objetivo'
+      and c.ventana_dias = (new.contenido->>'ventanaDias')::integer
+      and c.linea_base_plan = new.contenido->>'lineaBasePlan') then
+    raise exception 'el criterio materializado no dice lo que dice la propuesta: el KPI, la definición, el objetivo, la ventana y el plan de línea base se copian tal cual de la propuesta aceptada (SYS-19)';
+  end if;
+
+  -- Y LA RELACIÓN, estampada aquí porque este es el único sitio que sabe que la
+  -- materialización es legítima: la columna está fuera de todo grant, así que la fila queda
+  -- diciendo de qué propuesta viene y ningún camino de la aplicación puede escribirlo ni
+  -- reescribirlo después. El índice único hace el resto: si el objeto ya cuelga de otra
+  -- propuesta, esto no lo pisa —el `where … is null` no lo alcanza— y el conteo de abajo lo
+  -- rechaza. Es la versión permanente de lo que el `xmin` solo sostenía dentro del commit.
+  if new.destino = 'evidencia' then
+    update evidencia set propuesta_ai_id = new.id
+      where id = new.evidencia_id and workspace_id = new.workspace_id
+        and propuesta_ai_id is null;
+    get diagnostics v_filas = row_count;
+  else
+    update criterio_exito set propuesta_ai_id = new.id
+      where id = new.criterio_id and workspace_id = new.workspace_id
+        and propuesta_ai_id is null;
+    get diagnostics v_filas = row_count;
+  end if;
+  if v_filas <> 1 then
+    raise exception 'ese objeto ya cuelga de otra propuesta AI: un objeto materializado tiene una sola procedencia (SYS-19)';
+  end if;
+
   return null;
 end $$;
 

@@ -50,6 +50,15 @@ export function sqlAdmin(): Sql {
  * primera sentencia — y aquí la primera es el `set_config` del contexto RLS. Bajo
  * READ COMMITTED cada sentencia abre su propio snapshot, así que un cambio commiteado a
  * mitad de una lectura larga deja piezas de dos instantes distintos en la misma respuesta.
+ *
+ * Es para operaciones de SOLO LECTURA, y no es una recomendación: desde
+ * `20260902330000` la base RECHAZA (`IS001`) escribir fuera de READ COMMITTED en toda
+ * tabla cuyos guards serializan con candado y releen — que es la mayoría de las que
+ * gobiernan reglas. La razón es que esos guards dependen de que cada sentencia abra
+ * instantánea nueva, y eso solo es cierto bajo READ COMMITTED; bajo un nivel más fuerte la
+ * relectura ve una foto anterior al cambio que espera ver y la escritura se cuela en
+ * silencio. La exportación encaja porque lo único que escribe es su evento de auditoría, y
+ * `evento_dominio` es append-only y no tiene ningún guard que serialice.
  */
 export async function conUsuario<T>(
   userId: string,

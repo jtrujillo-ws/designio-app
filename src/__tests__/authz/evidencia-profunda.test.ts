@@ -2533,6 +2533,79 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(validado!.estado).toBe('validado');
   });
 
+  it('toda tabla cuyos guards serializan y releen exige READ COMMITTED para escribir', async () => {
+    // La premisa de la que dependen esos guards —cada sentencia abre instantánea nueva—
+    // solo es cierta bajo READ COMMITTED, y el nivel lo elige quien llama. La alternativa
+    // a comprobarla era hacer RR-seguro cada protocolo con una columna de versión: 26
+    // guards de seis slices y, sobre todo, IMPOSIBLE de verificar («¿te acordaste de
+    // incrementar la versión?» no es una pregunta que un test pueda hacer). Esta sí lo es,
+    // y por eso el conjunto de tablas se DERIVA del catálogo en vez de escribirse a mano:
+    // si mañana alguien cuelga un guard con candado de una tabla nueva, esto se pone rojo
+    // aquí y no en producción.
+    const admin = sqlAdmin();
+    const necesitan = (
+      await admin`select distinct t.tgrelid::regclass::text as tabla
+        from pg_trigger t
+        join pg_proc p on p.oid = t.tgfoid
+        where not t.tgisinternal
+          and p.pronamespace = 'public'::regnamespace
+          and pg_get_functiondef(p.oid) ~* '(pg_advisory_xact_lock|for +(share|update|no key update))'
+          and p.proname <> 'exigir_aislamiento_de_escritura'
+        order by 1`
+    ).map((f) => f.tabla as string);
+    const protegidas = (
+      await admin`select distinct t.tgrelid::regclass::text as tabla
+        from pg_trigger t
+        where t.tgname = 'aislamiento_de_escritura'
+        order by 1`
+    ).map((f) => f.tabla as string);
+    // No vacuo: si la derivación devolviera cero tablas, el invariante se cumpliría por no
+    // tener nada que cumplir.
+    expect(necesitan.length).toBeGreaterThan(10);
+    expect(protegidas.sort()).toEqual(necesitan.sort());
+
+    // Y la comprobación hace lo que dice, por el camino real: una escritura en
+    // `repeatable read` sobre una de esas tablas se rechaza con IS001 y el mensaje nombra
+    // el nivel, en vez de colarse en silencio.
+    await expect(
+      conUsuario(
+        leadId,
+        (tx) => tx`insert into item_importacion
+          (workspace_id, titulo, contenido, tipo_fuente, creado_por)
+          values (${ws}, ${marca + ' bajo repeatable read'}, 'texto', 'nota', ${leadId})`,
+        { aislamiento: 'repeatable read' },
+      ),
+    ).rejects.toMatchObject({ code: 'IS001' });
+    await expect(
+      conUsuario(
+        leadId,
+        (tx) => tx`insert into item_importacion
+          (workspace_id, titulo, contenido, tipo_fuente, creado_por)
+          values (${ws}, ${marca + ' bajo repeatable read'}, 'texto', 'nota', ${leadId})`,
+        { aislamiento: 'repeatable read' },
+      ),
+    ).rejects.toThrow(/repeatable read/);
+
+    // Leer en `repeatable read` sigue siendo legítimo —es lo que hace la exportación— y el
+    // evento de auditoría que ESA transacción escribe también, porque `evento_dominio` no
+    // tiene ningún guard que serialice y por tanto queda fuera del conjunto derivado.
+    expect(protegidas).not.toContain('evento_dominio');
+    const leido = await conUsuario(
+      leadId,
+      async (tx) => {
+        const filas = await tx`select count(*)::int as n from item_importacion
+          where workspace_id = ${ws}`;
+        await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+          values (${ws}, 'PruebaDeAislamiento', '{}'::jsonb, ${leadId}, 'lead-boutique')`;
+        return filas[0]!.n as number;
+      },
+      { aislamiento: 'repeatable read' },
+    );
+    expect(leido).toBeGreaterThanOrEqual(0);
+    await admin`delete from evento_dominio where workspace_id = ${ws}
+      and tipo = 'PruebaDeAislamiento'`;
+  });
+
   it('el candado del adjunto no depende del aislamiento del llamante: en REPEATABLE READ tampoco pasa', async () => {
     // «Espera al candado y vuelve a leer» solo funciona bajo READ COMMITTED, donde cada
     // sentencia abre snapshot nuevo. Bajo REPEATABLE READ una sentencia posterior NO lo
@@ -2543,9 +2616,14 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     // transacción nunca ESCRIBE la fila del item: Postgres aborta al escribir una fila
     // cambiada tras la instantánea, no al leerla.
     //
-    // Por eso la re-lectura toma `for share` sobre el item: pedir candado de fila sobre una
-    // fila actualizada después de la instantánea SÍ da 40001 en REPEATABLE READ. El
-    // invariante deja de depender de un nivel de aislamiento que el guard no elige.
+    // Se cierra por DOS sitios, y conviene decir cuál para el que lea esto:
+    //  · la premisa se comprueba (20260902330000): toda tabla cuyos guards serializan con
+    //    candado y releen rechaza escrituras fuera de READ COMMITTED, con `IS001` y un
+    //    mensaje que lo dice. Es lo que salta aquí, porque salta lo primero;
+    //  · y la re-lectura del guard toma además `for share` sobre el item, que es lo que la
+    //    haría correcta POR SÍ SOLA si algún día se abriera la premisa: pedir candado de
+    //    fila sobre una fila actualizada tras la instantánea da 40001 bajo REPEATABLE READ
+    //    (medido). Se queda como defensa en profundidad, no como adorno.
     //
     // Este PR es además el que introduce el parámetro `aislamiento` en `conUsuario`: hoy
     // solo lo usa la exportación, que no muta adjuntos, pero el mecanismo ya está en el
@@ -2589,7 +2667,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         },
         { aislamiento: 'repeatable read' },
       ),
-    ).rejects.toMatchObject({ code: '40001' });
+    ).rejects.toMatchObject({ code: 'IS001' });
 
     // Y el original sigue ahí: la mutación no entró.
     const [tras] = await admin`select count(*)::int as n from archivo_importado
@@ -2636,7 +2714,7 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
         },
         { aislamiento: 'repeatable read' },
       ),
-    ).rejects.toMatchObject({ code: '40001' });
+    ).rejects.toMatchObject({ code: 'IS001' });
     const [conserva] = await admin`select count(*)::int as n from archivo_importado
       where item_id = ${otro.itemId}`;
     expect(conserva!.n as number).toBe(1);

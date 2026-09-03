@@ -652,7 +652,17 @@ function BloqueReaperturas({
         </div>
       ))}
 
-      {esLead && !abierto && (
+      {/* SYS-08: un proyecto CERRADO es inmutable, así que reabrir una etapa suya lo rechazan
+          la política `reapertura_insert` y su guard. Ofrecer el control ahí era prometer una
+          escritura que la base ya negó — la misma clase que el botón de firmar y el de
+          aprobar el gate. Lo que falta se dice, no se deja descubrir por un error. */}
+      {esLead && proyecto.estado === 'cerrado' && (
+        <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+          El proyecto está cerrado: reabrir una etapa no revive lo que ya es historia
+          (SYS-08). Lo posterior al cierre es un reto nuevo.
+        </span>
+      )}
+      {esLead && proyecto.estado !== 'cerrado' && !abierto && (
         <div>
           <Button size="sm" variant="ghost" onClick={() => setAbierto(true)}>
             Reabrir una etapa

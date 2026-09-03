@@ -12,6 +12,17 @@ export const RolSchema = z.enum([
 ]);
 export type Rol = z.infer<typeof RolSchema>;
 
+/**
+ * Los roles del lado CLIENTE (§13.2): la organización que aporta el dato y firma los
+ * gates que le tocan. Los otros dos roles humanos son la boutique que la acompaña, y
+ * `agente-ai` no es una persona. Esta partición no es cosmética: RF-07.1 exige que el
+ * propietario del dato del Metric Registry sea una persona del cliente, y la base lo
+ * impone (política de `entrada_kpi` y guard de la firma) con la misma lista. Aquí vive el
+ * espejo de cliente: informa el selector, no autoriza nada.
+ */
+export const ROLES_CLIENTE = ['sponsor', 'stakeholder', 'admin-cliente'] as const;
+export type RolCliente = (typeof ROLES_CLIENTE)[number];
+
 export const WorkspaceSchema = z.object({
   id: z.string().uuid(),
   nombre: z.string().min(1),

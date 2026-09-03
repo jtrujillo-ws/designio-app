@@ -1102,8 +1102,52 @@ async function persistirPropuestas(
     // pagó, y negarse a guardar su salida no des-gasta nada — solo tira lo comprado. El
     // tope frena donde puede frenar el gasto, que es la admisión (y el despacho, que exige
     // la reserva viva). Una reserva caducada no concede capacidad en ninguno de los dos.
-    await tx`delete from reserva_ai
-      where id = ${alcance.reservaId} and workspace_id = ${entrada.workspaceId}`;
+    //
+    // Y el borrado es el FENCING de este arrendamiento, no una limpieza: solo retira la
+    // reserva si SEGUÍA siendo suya, o sea si no había caducado. Un proceso que se duerme
+    // más de la ventana entre registrar la respuesta y llegar aquí ya no tiene la
+    // exclusividad que creía tener: para entonces otra petición pudo recolectar la reserva
+    // caducada, no ver propuestas pendientes y persistir su propio lote sobre la misma
+    // ancla. Con un borrado incondicional, el dormido insertaba igual y quedaban los dos.
+    //
+    // Se comprueba en vez de estructurarse, y conviene decir por qué, porque en este repo
+    // la estructura gana casi siempre: un índice único parcial de «pendientes por reto»
+    // —el equivalente C0 de `propuesta_ai_item_pendiente_idx`— es IMPOSIBLE, porque C0
+    // persiste un LOTE y sus propias filas hermanas lo violarían. El invariante no es «una
+    // propuesta pendiente por reto» sino «un lote pendiente por reto», y eso no es una fila
+    // que Postgres pueda rechazar. El token de exclusividad es la reserva, así que la
+    // exclusividad se comprueba donde vive el token.
+    const retirada = await tx`delete from reserva_ai
+      where id = ${alcance.reservaId} and workspace_id = ${entrada.workspaceId}
+        and creado_en > now() - reserva_ai_ventana()
+      returning id`;
+    if (retirada.length === 0) {
+      // Cero filas tiene DOS causas y no la misma explicación. La reserva sigue ahí y solo
+      // caducó, o ya no está porque alguien la retiró — y la retirada más frecuente, con
+      // diferencia, es una revocación de consentimiento, que tiene su propio motivo y su
+      // propia salida. Decir «caducó» en ese caso sería FALSO, así que se pregunta antes de
+      // hablar. Se pregunta por las mismas funciones que lo imponen, para no acabar con una
+      // tercera redacción de la regla.
+      const [causa] = await tx`select
+        exists (select 1 from reserva_ai
+          where id = ${alcance.reservaId} and workspace_id = ${entrada.workspaceId}) as sigue,
+        ${entrada.capacidad === 'CI' ? entrada.anclaId : null}::uuid is not null
+          and exists (select 1 from item_importacion i
+            where i.id = ${entrada.capacidad === 'CI' ? entrada.anclaId : null}::uuid
+              and i.workspace_id = ${entrada.workspaceId}
+              and tipo_fuente_exige_consentimiento(i.tipo_fuente)
+              and not consentimiento_externo_vigente(i.id, i.workspace_id)) as sin_consentimiento`;
+      if (causa?.sin_consentimiento) {
+        throw new ErrorAI(
+          'El consentimiento de ese material dejó de autorizar el procesamiento externo mientras la llamada estaba en curso: no se guarda ninguna propuesta (RF-09.5)',
+        );
+      }
+      throw new ErrorAI(
+        causa?.sigue
+          ? 'La reserva de esta generación caducó antes de guardar sus propuestas: otra generación pudo tomar el relevo sobre la misma ancla, así que este lote se descarta. La llamada al proveedor ya está anotada en el libro de costos. Vuelve a pedirla.'
+          : 'La reserva de esta generación se retiró mientras la llamada estaba en curso, así que este lote se descarta. La llamada al proveedor ya está anotada en el libro de costos.',
+      );
+    }
 
     const destino = DESTINO_DE_CAPACIDAD[entrada.capacidad];
     // UNA sentencia para el lote entero: el evento PropuestaAIGenerada de cada fila lo

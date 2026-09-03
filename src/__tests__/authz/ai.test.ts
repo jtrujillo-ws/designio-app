@@ -2740,6 +2740,61 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     await sqlAdmin()`delete from llamada_ai where id = ${llamadaId}`;
   });
 
+  it('una reserva caducada ya no autoriza a guardar el lote: el relevo no queda duplicado', async () => {
+    // Fencing de arrendamiento. El caso: un proceso se duerme más que la ventana entre que
+    // el proveedor responde y que se persisten las propuestas. Para entonces otra petición
+    // pudo recolectar su reserva caducada y despachar sobre la MISMA ancla; con un borrado
+    // incondicional, el dormido insertaba igual y quedaban dos lotes vivos.
+    //
+    // Se prueba con C0 a propósito: es el que no tiene red estructural. `propuesta_ai` sí
+    // impide dos pendientes por ITEM con un índice único parcial, pero el equivalente por
+    // RETO no puede existir — C0 persiste un LOTE y sus propias filas hermanas violarían
+    // ese índice—, así que aquí el token de exclusividad es la reserva y punto.
+    await enWorkspaceLimpio('fencing', async ({ ws: wsF, curadorId, retoId: retoF }) => {
+      const admin = sqlAdmin();
+      // El sueño del proceso, simulado envejeciendo su propia reserva mientras el material
+      // está en vuelo: es el mismo hueco de tiempo, visto desde el reloj.
+      proveedor.duranteLlamada = async () => {
+        await admin`update reserva_ai set creado_en = now() - reserva_ai_ventana() * 2
+          where workspace_id = ${wsF} and reto_id = ${retoF}`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: { criterios: [CONTENIDO_C0] },
+            intentos: [intento({ latenciaMs: 80, uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsF,
+                capacidad: 'C0',
+                anclaId: retoF,
+              }),
+            ).rejects.toThrow(/reserva de esta generación caducó/i);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      // Ninguna propuesta nació…
+      const propuestas = await conUsuario(curadorId, (tx) => tx`select 1 as x
+        from propuesta_ai where workspace_id = ${wsF} and reto_id = ${retoF}`);
+      expect(propuestas.length).toBe(0);
+      // …y la llamada, que se pagó, sigue anotada: el fencing tira el lote, no el libro.
+      const llamadas = await conUsuario(curadorId, (tx) => tx`select resultado
+        from llamada_ai where workspace_id = ${wsF} and reto_id = ${retoF}`);
+      expect(llamadas.length).toBe(1);
+      // Y la reserva caducada no se queda bloqueando el ancla: el `catch` de la generación
+      // la retira igual, así que el reto vuelve a admitir una generación nueva.
+      const reservas = await conUsuario(curadorId, (tx) => tx`select 1 as x
+        from reserva_ai where workspace_id = ${wsF} and reto_id = ${retoF}`);
+      expect(reservas.length).toBe(0);
+    });
+  });
+
   it('el asiento reservado del árbol ya no puede apuntar al vacío ni a otro workspace', async () => {
     // `reto_servicio_afectado.propuesta_ai_id` llevaba desde SPEC-02 siendo una columna
     // suelta: anulable, sin FK y con grant de INSERT sin lista de columnas, o sea escribible

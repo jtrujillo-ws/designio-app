@@ -1118,6 +1118,19 @@ export async function seguimientoDeImpacto(
             and not exists (select 1 from entrada_kpi e
               where e.criterio_id = c.id and e.workspace_id = c.workspace_id)), '[]'::jsonb)
           as criterios_sin_entrada,
+        -- Qué le falta al contrato para poder FIRMARSE, con la fila que hay que arreglar
+        -- nombrada en cada reparo. Sale de reparos_de_firma, la MISMA función que usa el
+        -- guard de la firma: escribir la lista otra vez aquí sería una segunda redacción
+        -- del mismo contrato, y la de la pantalla se quedaría corta a la primera que
+        -- alguien tocara el guard. Sin esto el botón de firmar se ofrecía SIEMPRE y el
+        -- sponsor descubría por un error del servidor lo que ya se podía saber.
+        --
+        -- Solo mientras el registry sigue en BORRADOR: firmado no hay nada que reparar, y
+        -- las reglas hablan de un contrato que todavía se puede corregir.
+        case when mr.estado = 'borrador' then coalesce((
+          select jsonb_agg(rf.reparo order by rf.orden)
+          from reparos_de_firma(mr.id, r.id, r.workspace_id) rf), '[]'::jsonb)
+          else '[]'::jsonb end as reparos_firma,
         -- Qué proyectos del RETO frenan la apertura de la medición, y por qué. La
         -- disponibilidad de esa operación es propiedad del CONJUNTO y no del proyecto que
         -- se está mirando, y el conjunto lo define UNA función que comparten el guard del
@@ -1174,6 +1187,7 @@ export async function seguimientoDeImpacto(
       registry: fila.registry as SeguimientoDeImpacto['registry'],
       entradas: fila.entradas as SeguimientoDeImpacto['entradas'],
       criteriosSinEntrada: fila.criterios_sin_entrada as SeguimientoDeImpacto['criteriosSinEntrada'],
+      reparosFirma: fila.reparos_firma as string[],
       proyectosFrenan: fila.proyectos_frenan as SeguimientoDeImpacto['proyectosFrenan'],
       propietariosPosibles:
         fila.propietarios_posibles as SeguimientoDeImpacto['propietariosPosibles'],

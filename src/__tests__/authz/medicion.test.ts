@@ -390,6 +390,17 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
       /criterios sin entrada KPI \(SYS-22\): Reintentos por solicitud/,
     );
+    // Y la PANTALLA lo sabe antes de ofrecer el botón. El de firmar miraba solo si había una
+    // petición en curso, así que se ofrecía encendido para que la base lo rechazara delante
+    // del cliente — la misma avería que el resto de los botones de este slice, en la
+    // superficie que el espejo del esquema no cubre: aquí quien rechaza es el GUARD. La
+    // lista sale de `reparos_de_firma`, la MISMA función que el guard aplica, y nombra la
+    // fila que hay que arreglar en vez de decir «falta algo».
+    const reparos = async () =>
+      (await seguimientoDeImpacto(leadId, ws, proyectoId))!.reparosFirma;
+    expect(await reparos()).toEqual([
+      'criterios sin entrada KPI (SYS-22): Reintentos por solicitud',
+    ]);
 
     const b = await agregarEntrada(leadId, {
       workspaceId: ws,
@@ -412,6 +423,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
       /entradas incompletas \(SYS-22\): Reintentos medios/,
     );
+    expect(await reparos()).toEqual(['entradas incompletas (SYS-22): Reintentos medios']);
 
     // Post-mortem previsto ANTES del cierre de la ventana: comprometerse a un veredicto
     // sobre datos que aún no existen.
@@ -775,8 +787,18 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await adminVentana`update criterio_exito set ventana_dias = 31
       where id = ${criterioAbandonoId}`;
 
+    // Y la otra mitad del espejo, que es la que lo hace útil: cuando no falta NADA la lista
+    // queda vacía y el botón se enciende. Sin esta comprobación, un espejo que devolviera
+    // siempre algo apagaría el botón para siempre y nadie firmaría — apagar de más es tan
+    // avería como ofrecer de más.
+    const reparosDeFirma = async () =>
+      (await seguimientoDeImpacto(leadId, ws, proyectoId))!.reparosFirma;
+    expect(await reparosDeFirma()).toEqual([]);
+
     const firma = await firmarRegistry(sponsorId, { workspaceId: ws, registryId });
     expect(firma.entradas).toBe(2);
+    // Firmado no hay nada que reparar: las reglas hablan de un contrato todavía corregible.
+    expect(await reparosDeFirma()).toEqual([]);
 
     const admin = sqlAdmin();
     const [evento] = await admin`select actor_id, actor_rol, payload from evento_dominio

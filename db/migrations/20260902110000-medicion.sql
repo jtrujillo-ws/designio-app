@@ -1431,6 +1431,127 @@ create constraint trigger proyecto_par_medicion_transicion
   execute function proyecto_par_medicion_guard();
 revoke execute on function proyecto_par_medicion_guard() from public;
 
+-- ── «Qué le falta a este registry para poder firmarse», en UN solo sitio ──
+-- La completitud del contrato la exige el guard de la firma, y por eso mismo la PANTALLA
+-- tiene que poder preguntarla ANTES de ofrecer el botón. Un botón habilitado es una promesa
+-- de que el envío tiene sentido, y el de firmar se ofrecía siempre: con un criterio sin KPI
+-- que lo responda, con una entrada a medias o con fechas incoherentes, el sponsor pulsaba y
+-- descubría por un error del servidor lo que la pantalla ya podía saber.
+--
+-- Es la misma avería que `reparosDelEsquema` arregló para los botones cuyo rechazo venía de
+-- Zod, en la superficie que aquél no cubre: aquí quien rechaza es el GUARD. Las dos
+-- superficies rechazan la escritura y el espejo tiene que cubrir las dos — es lo que llevó a
+-- unir esquema y guard en `faltaParaCompletar` para el post mortem, y la firma se quedó sin
+-- su equivalente.
+--
+-- Lo que NO se hace es copiar la lista al cliente: serían dos redacciones del mismo contrato
+-- y la de la pantalla se quedaría corta a la primera que alguien tocara el guard, que es
+-- exactamente cómo nacieron las tres redacciones de `proyectos_frenan_medicion` y las dos de
+-- la cadencia. Se escribe UNA vez y la leen los dos: el guard —que raise con la primera, en
+-- el mismo orden y con el mismo texto de siempre— y la proyección, que las enseña todas.
+--
+-- Cada reparo NOMBRA la fila que hay que arreglar (el criterio o la entrada), porque apagar
+-- el botón sin decir qué falta cambia un error confuso por un callejón mudo.
+--
+-- El `orden` es el del guard y no es decorativo: es lo que hace que el mensaje que ve quien
+-- fuerza la firma por SQL directo siga siendo el mismo de antes, test a test.
+--
+-- Sin SECURITY DEFINER: llamada desde el guard —que sí lo es— corre con sus privilegios, y
+-- llamada desde la proyección corre bajo el RLS de quien mira, que ya puede leer estas filas.
+create function reparos_de_firma(p_registry uuid, p_reto uuid, p_ws uuid)
+returns table (orden integer, reparo text)
+language sql stable as $$
+  select 1, 'el registry no tiene entradas KPI (SYS-22)'
+  where not exists (select 1 from entrada_kpi e
+    where e.registry_id = p_registry and e.workspace_id = p_ws)
+  union all
+  -- Cada criterio de éxito del reto necesita al menos un KPI que lo responda: firmar con un
+  -- criterio huérfano garantizaría un «no concluyente» por construcción.
+  select 2, 'criterios sin entrada KPI (SYS-22): ' || l from (
+    select string_agg(c.kpi, ', ' order by c.kpi) as l
+    from criterio_exito c
+    where c.reto_id = p_reto and c.workspace_id = p_ws
+      and not exists (select 1 from entrada_kpi e
+        where e.criterio_id = c.id and e.workspace_id = c.workspace_id
+          and e.registry_id = p_registry)) x where l is not null
+  union all
+  -- Entrada completa = lo que RF-07.1 exige y la medición usa. btrim en los textos:
+  -- whitespace no es contenido, tampoco por SQL directo.
+  select 3, 'entradas incompletas (SYS-22): ' || l from (
+    select string_agg(e.nombre, ', ' order by e.nombre) as l
+    from entrada_kpi e
+    where e.registry_id = p_registry and e.workspace_id = p_ws
+      and (btrim(e.nombre) = '' or btrim(e.definicion) = '' or btrim(e.fuente) = ''
+           or e.propietario_miembro_id is null or e.linea_base_valor is null
+           or e.linea_base_fecha is null or e.ventana_inicio is null
+           or e.fecha_post_mortem is null)) x where l is not null
+  union all
+  -- La otra mitad de la ventana, en su propio reparo: el hueco está en el CRITERIO, así que
+  -- lo que se nombra es el criterio —la fila que hay que arreglar— y no el KPI que lo
+  -- acompaña. Mira TODOS los criterios del reto: a estas alturas son el mismo conjunto que
+  -- los que tienen entrada, y entre dos formas equivalentes se prefiere la que sigue siendo
+  -- correcta si mañana se reordenan.
+  select 4, 'criterios sin ventana declarada (SYS-22): ' || l from (
+    select string_agg(c.kpi, ', ' order by c.kpi) as l
+    from criterio_exito c
+    where c.reto_id = p_reto and c.workspace_id = p_ws and c.ventana_dias is null) x
+    where l is not null
+  union all
+  -- Y ese dueño es una persona del CLIENTE (RF-07.1, §8.1): el reparo anterior exige un id
+  -- no nulo, que no dice de QUIÉN es. La entrada guarda una REFERENCIA al miembro, no una
+  -- copia de su rol, y entre redactar el registry y firmarlo pasan semanas: lo que el
+  -- contrato afirma es lo que sea cierto en el momento en que se congela, y es este.
+  select 5, 'el propietario del dato tiene que ser una persona del cliente (RF-07.1): ' || l
+  from (
+    select string_agg(e.nombre, ', ' order by e.nombre) as l
+    from entrada_kpi e
+    join miembro m on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
+    where e.registry_id = p_registry and e.workspace_id = p_ws
+      and not es_rol_cliente(m.rol)) x where l is not null
+  union all
+  -- ── Completo no es lo mismo que COHERENTE ──
+  -- Los reparos de arriba comprueban que los campos ESTÉN. Estos tres comprueban que digan
+  -- algo posible entre sí: un contrato con todos los huecos rellenos puede seguir siendo
+  -- imposible de cumplir, y firmarlo lo congela sin reparación.
+  --
+  -- ESCRITOS EN POSITIVO, y el `coalesce(…, false)` no es defensa de más: escritos como
+  -- «rechaza si la incoherencia es cierta», un NULL en cualquiera de los dos lados vuelve el
+  -- predicado NULL, la fila no agrega, la lista queda NULL y la regla NO SALTA — se evapora
+  -- en silencio justo cuando falta un dato, que es cuando más falta hace. Así cada regla
+  -- enuncia el hecho que TIENE que ser cierto: en ausencia de prueba, no se firma.
+  select 6, 'la línea base es posterior al inicio de la ventana: ' || l from (
+    select string_agg(e.nombre, ', ' order by e.nombre) as l
+    from entrada_kpi e
+    where e.registry_id = p_registry and e.workspace_id = p_ws
+      and not coalesce(e.linea_base_fecha <= e.ventana_inicio, false)) x where l is not null
+  union all
+  -- La cadencia comprometida tiene que CABER en la ventana al menos una vez, y se pregunta
+  -- con la MISMA función que después juzgará las entregas de verdad: «cabe al menos una vez»
+  -- es «el calendario del compromiso tiene al menos una entrega dentro de la ventana».
+  select 7, 'la cadencia comprometida no cabe en la ventana del criterio: ' || l from (
+    select string_agg(e.nombre, ', ' order by e.nombre) as l
+    from entrada_kpi e
+    join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
+    where e.registry_id = p_registry and e.workspace_id = p_ws
+      and paso_de_cadencia(e.frecuencia) is not null
+      and not exists (select 1 from vencimientos_de_cadencia(
+        e.ventana_inicio, e.frecuencia, (e.ventana_inicio + c.ventana_dias)::date))) x
+    where l is not null
+  union all
+  -- El post-mortem se prevé DESPUÉS del cierre de la ventana: fecharlo antes sería
+  -- comprometerse a un veredicto sobre datos que aún no existen. «Después» es ESTRICTO, por
+  -- la misma razón que el review no se abre el último día.
+  select 8, 'el post-mortem se prevé después del cierre de la ventana: ' || l from (
+    select string_agg(e.nombre, ', ' order by e.nombre) as l
+    from entrada_kpi e
+    join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
+    where e.registry_id = p_registry and e.workspace_id = p_ws
+      and not coalesce(e.fecha_post_mortem > e.ventana_inicio + c.ventana_dias, false)) x
+    where l is not null
+$$;
+revoke execute on function reparos_de_firma(uuid, uuid, uuid) from public;
+grant execute on function reparos_de_firma(uuid, uuid, uuid) to designio_app;
+
 -- ── Guard de la firma del registry (SYS-22) ──
 -- La completitud del contrato vive en el DATO: ni el propio sponsor firma por SQL
 -- directo un registry sin dueño del dato, sin línea base o con criterios sin KPI.
@@ -1473,164 +1594,20 @@ begin
       join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
       where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id and g.numero = 0
       order by g.id for update of g;
-    if not exists (select 1 from entrada_kpi e
-      where e.registry_id = new.id and e.workspace_id = new.workspace_id) then
-      raise exception 'no se puede firmar: el registry no tiene entradas KPI (SYS-22)';
-    end if;
-    -- Cada criterio de éxito del reto necesita al menos un KPI que lo responda: firmar
-    -- con un criterio huérfano garantizaría un «no concluyente» por construcción.
-    select string_agg(c.kpi, ', ' order by c.kpi) into faltan
-    from criterio_exito c
-    where c.reto_id = new.reto_id and c.workspace_id = new.workspace_id
-      and not exists (select 1 from entrada_kpi e
-        where e.criterio_id = c.id and e.workspace_id = c.workspace_id
-          and e.registry_id = new.id);
+    -- La completitud y la coherencia del contrato viven en `reparos_de_firma`, no aquí:
+    -- son las mismas ocho reglas que la PANTALLA necesita para no ofrecer un botón que la
+    -- base va a rechazar. Escritas dos veces —una aquí y otra en el cliente— la del cliente
+    -- se queda corta a la primera que alguien toque esta lista, que es exactamente cómo
+    -- nacieron las tres redacciones de `proyectos_frenan_medicion`.
+    --
+    -- Se raise con la PRIMERA por orden, que es el mismo orden y el mismo texto que cuando
+    -- las ocho comprobaciones estaban escritas aquí en fila: quien fuerza la firma por SQL
+    -- directo lee lo mismo que leía antes.
+    select r.reparo into faltan
+    from reparos_de_firma(new.id, new.reto_id, new.workspace_id) r
+    order by r.orden limit 1;
     if faltan is not null then
-      raise exception 'no se puede firmar: criterios sin entrada KPI (SYS-22): %', faltan;
-    end if;
-    -- Entrada completa = lo que RF-07.1 exige y la medición usa: definición, fuente,
-    -- dueño del dato, línea base con valor y fecha, y ventana con post-mortem previsto.
-    -- btrim en los textos: whitespace no es contenido, tampoco por SQL directo.
-    --
-    -- La ventana se comprueba en DOS bloques, y no por gusto: tiene dos piezas que viven
-    -- en tablas distintas a propósito —el inicio en la entrada, el largo en
-    -- `criterio_exito.ventana_dias`, que el registry NO copia porque dos copias son dos
-    -- verdades—. Una lista que solo enumera columnas de `entrada_kpi` comprueba media
-    -- ventana; una que las junta con un join comprueba las dos pero señala la ENTRADA,
-    -- que es donde no está el hueco, y manda a revisar el KPI a quien tiene que arreglar
-    -- el criterio. Cada mitad se reclama donde vive su dato y con su propio mensaje.
-    --
-    -- G0 exige `ventana_dias`, pero G0 corre ANTES: reabrir la etapa 0 —el camino de
-    -- reparación que SPEC-04.9 ofrece— permite devolverlo a nulo sin que el gate vuelva a
-    -- pendiente, y desde ahí la firma pasaba y CONGELABA un contrato imposible de cumplir.
-    --
-    -- Y lo que quedaba después era el encierro entero, no una molestia: sin ventana,
-    -- `ventana_de_medicion_abierta` devuelve true para siempre, así que el outcome review
-    -- no se abre nunca; `snapshot_insert` exige `ventana_dias is not null`, así que la
-    -- serie tampoco entra; `criterio_update` está cerrado por el registry firmado, así que
-    -- el criterio no se arregla; y sin review no hay veredicto, sin veredicto el reto no
-    -- cierra, y sin cierre el proyecto tampoco. Es exactamente el encierro que el preámbulo
-    -- de esta migración describe para los retos heredados —«ni miden aquí, ni cierran, ni
-    -- se archivan»— reintroducido para filas NUEVAS, y esta vez sin columna de perdón que
-    -- las saque.
-    select string_agg(e.nombre, ', ' order by e.nombre) into faltan
-    from entrada_kpi e
-    where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and (btrim(e.nombre) = '' or btrim(e.definicion) = '' or btrim(e.fuente) = ''
-           or e.propietario_miembro_id is null or e.linea_base_valor is null
-           or e.linea_base_fecha is null or e.ventana_inicio is null
-           or e.fecha_post_mortem is null);
-    if faltan is not null then
-      raise exception 'no se puede firmar: entradas incompletas (SYS-22): %', faltan;
-    end if;
-    -- La otra mitad de la ventana, en su propio bloque: el hueco está en el CRITERIO, así
-    -- que lo que se nombra es el criterio —la fila que hay que arreglar— y no el KPI que
-    -- lo acompaña. Mira TODOS los criterios del reto y no solo los que ya tienen entrada:
-    -- a estas alturas son el mismo conjunto (el bloque de «criterios sin entrada KPI»
-    -- acaba de rechazar la firma si alguno estaba huérfano), y entre dos formas
-    -- equivalentes se prefiere la que sigue siendo correcta si mañana se reordenan.
-    select string_agg(c.kpi, ', ' order by c.kpi) into faltan
-    from criterio_exito c
-    where c.reto_id = new.reto_id and c.workspace_id = new.workspace_id
-      and c.ventana_dias is null;
-    if faltan is not null then
-      raise exception 'no se puede firmar: criterios sin ventana declarada (SYS-22): %', faltan;
-    end if;
-    -- Y ese dueño es una persona del CLIENTE (RF-07.1, §8.1): el bloque anterior exige un
-    -- id no nulo, que no dice de QUIÉN es. La política de la entrada ya lo impide al
-    -- ESCRIBIR; volver a exigirlo aquí no es redundancia sino la regla que corresponde a
-    -- este punto. La entrada guarda una REFERENCIA al miembro, no una copia de su rol, y
-    -- entre redactar el registry y firmarlo en G6 pasan semanas: lo que el contrato afirma
-    -- es lo que sea cierto en el momento en que se congela, y ese momento es este.
-    select string_agg(e.nombre, ', ' order by e.nombre) into faltan
-    from entrada_kpi e
-    join miembro m on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
-    where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and not es_rol_cliente(m.rol);
-    if faltan is not null then
-      raise exception 'no se puede firmar: el propietario del dato tiene que ser una persona del cliente (RF-07.1): %', faltan;
-    end if;
-    -- ── Completo no es lo mismo que COHERENTE ──
-    -- Los bloques de arriba comprueban que los campos ESTÉN. Estos dos comprueban que
-    -- digan algo posible entre sí: un contrato con todos los huecos rellenos puede seguir
-    -- siendo imposible de cumplir, y firmarlo lo congela sin reparación.
-    --
-    -- 1) La línea base es el ANTES de lo que se mide, así que no puede estar fechada
-    -- después de que la medición empiece. Con la ventana firmada, los snapshots quedan
-    -- acotados a ella mientras la proyección y el post-mortem los comparan contra una
-    -- «línea base» cronológicamente posterior: una historia base→resultado al revés.
-    --
-    -- ESCRITAS EN POSITIVO, y el `coalesce(…, false)` no es defensa de más: es el arreglo
-    -- de un patrón. Escritas como «rechaza si la incoherencia es cierta», un NULL en
-    -- cualquiera de los dos lados vuelve el predicado NULL, la fila no agrega, `faltan`
-    -- queda NULL y la regla NO SALTA — se evapora en silencio justo cuando falta un dato,
-    -- que es cuando más falta hace. Así, cada regla enuncia el hecho que TIENE que ser
-    -- cierto y rechaza cuando no se puede demostrar: en ausencia de prueba, no se firma.
-    -- Con la comprobación de completitud de arriba estos nulos ya no llegan aquí; esto es
-    -- lo que hace que sigan sin llegar si alguien toca aquella lista.
-    select string_agg(e.nombre, ', ' order by e.nombre) into faltan
-    from entrada_kpi e
-    where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and not coalesce(e.linea_base_fecha <= e.ventana_inicio, false);
-    if faltan is not null then
-      raise exception 'no se puede firmar: la línea base es posterior al inicio de la ventana: %', faltan;
-    end if;
-    -- 2) Y la cadencia comprometida tiene que CABER en la ventana al menos una vez: la
-    -- PRIMERA entrega prometida tiene que vencer DENTRO de la ventana. Un KPI trimestral
-    -- con ventana de 30 días promete una entrega que vence después del cierre: la cadencia
-    -- no llega a correr ni una sola vez dentro de la medición, y el compromiso de
-    -- frecuencia que G6 formaliza queda vacío.
-    --
-    -- Y se juzga con la MISMA aritmética con la que se juzgará de verdad: calendario
-    -- (`+ interval '1 month'` sobre `ventana_inicio`), no un largo mínimo en días. Escribí
-    -- primero el mínimo fijo (28 un mes, 89 un trimestre) razonando que una regla solo debe
-    -- rechazar lo imposible en TODOS los meses; el razonamiento estaba mal por donde este
-    -- archivo se corrige siempre: la proyección de la cadencia suma meses de CALENDARIO,
-    -- así que un mínimo en días es una SEGUNDA verdad sobre el mismo compromiso, y basta
-    -- que discrepen para que la firma bendiga lo que la lectura va a llamar vacío. Un
-    -- mensual que abre el 1 de agosto con ventana de 28 días pasaba el mínimo (28 ≥ 28) y
-    -- su primera entrega vencía el 1 de septiembre, tres días después del cierre. Que el
-    -- mismo `ventana_dias` pase en febrero y falle en agosto no es indeterminación: es que
-    -- un compromiso MENSUAL mide distinto según cuándo empieza, y el inicio ya está escrito
-    -- cuando se firma.
-    --
-    -- El borde es inclusivo, como toda la ventana: si la primera entrega vence EL último
-    -- día, ese día todavía mide y el compromiso se puede cumplir.
-    --
-    -- 'unica' se queda fuera porque no tiene cadencia que quepa, y se excluye por el `paso`
-    -- nulo en vez de por un `else 0`: así la regla habla solo de lo que promete repetirse.
-    --
-    -- Y se pregunta con la MISMA función que después juzgará las entregas de verdad
-    -- (`vencimientos_de_cadencia`), no con una copia de su aritmética: «cabe al menos una
-    -- vez» es exactamente «el calendario del compromiso tiene al menos una entrega dentro
-    -- de la ventana». Mientras fueron dos redacciones, bastaba que una derivara del ancla y
-    -- la otra encadenara para que la firma bendijera lo que la lectura llamaría incumplido.
-    -- El `not exists` conserva además el «en ausencia de prueba, no se firma» que hacía el
-    -- `coalesce(…, false)`: sin inicio o sin largo de ventana no hay vencimientos que
-    -- generar, así que la entrada queda señalada.
-    select string_agg(e.nombre, ', ' order by e.nombre) into faltan
-    from entrada_kpi e
-    join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
-    where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and paso_de_cadencia(e.frecuencia) is not null
-      and not exists (select 1 from vencimientos_de_cadencia(
-        e.ventana_inicio, e.frecuencia, (e.ventana_inicio + c.ventana_dias)::date));
-    if faltan is not null then
-      raise exception 'no se puede firmar: la cadencia comprometida no cabe en la ventana del criterio: %', faltan;
-    end if;
-    -- El post-mortem se prevé DESPUÉS del cierre de la ventana: fecharlo antes sería
-    -- comprometerse a un veredicto sobre datos que aún no existen. «Después» es ESTRICTO,
-    -- por la misma razón que el review no se abre el último día: ese día todavía se mide,
-    -- así que un post-mortem fechado ahí promete para hoy un veredicto que el sistema no
-    -- dejará dictar hasta mañana. El `<=` es el mismo `>=` de la ventana, visto del otro
-    -- lado del corte.
-    select string_agg(e.nombre, ', ' order by e.nombre) into faltan
-    from entrada_kpi e
-    join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
-    where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and not coalesce(e.fecha_post_mortem > e.ventana_inicio + c.ventana_dias, false);
-    if faltan is not null then
-      raise exception 'no se puede firmar: el post-mortem se prevé después del cierre de la ventana: %', faltan;
+      raise exception 'no se puede firmar: %', faltan;
     end if;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'MetricRegistryFirmado',

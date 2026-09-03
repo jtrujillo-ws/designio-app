@@ -300,6 +300,11 @@ export type SeguimientoDeImpacto = {
   entradas: EntradaDeRegistry[];
   /** Criterios del reto sin KPI que los responda: la firma los exige (SYS-22). */
   criteriosSinEntrada: { id: string; kpi: string }[];
+  /** Qué le falta al contrato para poder FIRMARSE, con la fila a arreglar nombrada en cada
+   * reparo. Lo calcula `reparos_de_firma`, la MISMA función que aplica el guard de la firma:
+   * el botón no puede espejar esta lista a mano sin quedarse corto en cuanto el guard cambie.
+   * Vacío cuando el registry ya está firmado — no hay nada que reparar. */
+  reparosFirma: string[];
   /** Los proyectos del reto que NO acabarían midiendo tras abrir la medición, con su
    * motivo. Lo define una sola función de base (`proyectos_frenan_medicion`) que comparten
    * el guard del par, el diagnóstico del servicio y este espejo: mientras hubo tres

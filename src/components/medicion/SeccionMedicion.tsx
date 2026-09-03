@@ -296,19 +296,32 @@ function BloqueRegistry({
       )}
 
       {registry && !firmado && puedeFirmar && (
-        <div>
-          <Button
-            size="sm"
-            disabled={ocupado}
-            onClick={() =>
-              void accion(
-                () => firmarMetricRegistry({ data: { workspaceId, registryId: registry.id } }),
-                'No se pudo firmar el registry; intenta de nuevo',
-              )
-            }
-          >
-            Firmar el registry (G6)
-          </Button>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {/* Lo que falta se DICE y con la fila nombrada, no se deja descubrir por un error
+              del servidor. Apagar el botón sin decir qué falta cambiaría un error confuso
+              por un callejón mudo, que es peor: la firma es el acto que congela el contrato
+              delante del cliente. La lista la calcula `reparos_de_firma` en la base, la
+              MISMA función que aplica el guard — un espejo copiado a mano aquí se quedaría
+              corto en cuanto alguien tocara el guard. */}
+          {seguimiento.reparosFirma.length > 0 && (
+            <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+              Falta para poder firmarlo: {seguimiento.reparosFirma.join(' · ')}
+            </span>
+          )}
+          <div>
+            <Button
+              size="sm"
+              disabled={ocupado || seguimiento.reparosFirma.length > 0}
+              onClick={() =>
+                void accion(
+                  () => firmarMetricRegistry({ data: { workspaceId, registryId: registry.id } }),
+                  'No se pudo firmar el registry; intenta de nuevo',
+                )
+              }
+            >
+              Firmar el registry (G6)
+            </Button>
+          </div>
         </div>
       )}
       {registry && !firmado && !puedeFirmar && (

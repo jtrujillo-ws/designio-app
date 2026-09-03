@@ -7,7 +7,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * haber salido del mismo prompt y las evals de grounding perderían su línea base.
  *
  * Módulo PURO (sin imports de servidor): la defensa contra prompt injection y la medida
- * de fidelidad de citas se prueban como funciones, no como integración.
+ * de presencia literal de citas se prueban como funciones, no como integración.
  */
 
 /**
@@ -44,7 +44,7 @@ const ETIQUETA = 'material-no-confiable';
  */
 /**
  * El material EXACTO que ve el modelo: recortado al techo y con el delimitador
- * neutralizado. Se exporta porque la fidelidad de las citas hay que medirla contra esto
+ * neutralizado. Se exporta porque la presencia literal de las citas hay que medirla contra esto
  * y no contra el texto crudo — si no, un material que contiene el delimitador produce
  * «no aparece literal» sobre citas que sí son literales de lo que el modelo leyó.
  */
@@ -81,7 +81,7 @@ function campoDeFicha(valor: string): string {
 
 export type MaterialDelimitado = {
   /** Lo que el modelo lee DENTRO del bloque: ficha + cuerpo, ya neutralizados. La
-   * fidelidad de las citas se mide contra esto (una definición, dos usos). */
+   * presencia literal de las citas se mide contra esto (una definición, dos usos). */
   texto: string;
   bloque: string;
   truncado: boolean;
@@ -339,28 +339,47 @@ export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = 
 };
 
 /**
- * Fidelidad de citas (SYS-17 / RF-08.7): qué fragmentos aparecen LITERALES en el material
- * del alcance. Se compara ignorando mayúsculas y colapsando espacios —un salto de línea
- * de más no es una alucinación—, pero nada más: una cita reescrita cuenta como no fiel,
- * que es justo la señal que el revisor humano necesita ver.
+ * PRESENCIA LITERAL de las citas (SYS-17 / RF-08.7): qué fragmentos aparecen, tal cual, en
+ * el material del alcance. Se compara ignorando mayúsculas y colapsando espacios —un salto
+ * de línea de más no es una alucinación—, pero nada más: una cita reescrita no está
+ * presente, que es justo la señal que el revisor humano necesita ver.
+ *
+ * ── Lo que este control establece, y lo que NO ──
+ *
+ * Establece una SUBCADENA: «este texto está en el material». Eso es todo. No establece que
+ * la cita SOSTENGA la afirmación que acompaña, y la diferencia no es de matiz: si el modelo
+ * copia cualquier frase del material mientras alucina la evidencia o el criterio, la cita
+ * está literalmente presente y una métrica llamada «fidelidad» la contaría como verificada.
+ * El nombre haría el trabajo que el código no hace.
+ *
+ * Por eso la función, el campo y la pantalla dicen PRESENCIA LITERAL y no «fiel» ni
+ * «verificada». Una afirmación que nadie ata es peor que no tener número: invita a fiarse
+ * de ella justo en la revisión, que es cuando más caro sale equivocarse.
+ *
+ * Y por eso no hay aquí un evaluador de sostén cita→afirmación, que sería el remedio obvio:
+ * es un juicio de modelo, y usar la AI para verificar el grounding de la AI reintroduce el
+ * problema un piso más arriba —el mismo argumento con el que este slice rechazó el digest
+ * de respuesta—. El único verificador de confianza del pipeline es la persona que
+ * materializa y firma (SYS-19), así que «con respaldo» es propiedad del ACTO HUMANO y se
+ * cuenta en la aceptación, no aquí.
  */
 function normalizar(texto: string): string {
   return texto.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-export function esCitaFiel(material: string, fragmento: string): boolean {
+export function citaApareceLiteral(material: string, fragmento: string): boolean {
   const aguja = normalizar(fragmento);
   return aguja.length > 0 && normalizar(material).includes(aguja);
 }
 
-export function fidelidadDeCitas(
+export function presenciaLiteralDeCitas(
   material: string,
   citas: { fragmento: string }[],
-): { fieles: number; total: number } {
+): { presentes: number; total: number } {
   const pajar = normalizar(material);
-  const fieles = citas.filter((c) => {
+  const presentes = citas.filter((c) => {
     const aguja = normalizar(c.fragmento);
     return aguja.length > 0 && pajar.includes(aguja);
   }).length;
-  return { fieles, total: citas.length };
+  return { presentes, total: citas.length };
 }

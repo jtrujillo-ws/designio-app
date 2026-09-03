@@ -13,9 +13,9 @@ import {
 } from '../ai.degradacion';
 import {
   delimitarMaterialNoConfiable,
-  esCitaFiel,
+  citaApareceLiteral,
   ESQUEMA_SALIDA,
-  fidelidadDeCitas,
+  presenciaLiteralDeCitas,
   materialDeItem,
   materialDeReto,
   MAX_CAMPO_FICHA,
@@ -321,28 +321,47 @@ describe('la ficha del alcance también es material no confiable (RF-09.7)', () 
   });
 });
 
-describe('fidelidad de citas (SYS-17: el grounding se mide, no se presume)', () => {
+describe('presencia literal de citas (SYS-17: se mide lo que se puede medir, y se dice cuál es)', () => {
   const material = 'De cada 100 personas que inician la apertura,\n  62 no la completan.';
 
-  it('una cita literal es fiel aunque cambien espacios o mayúsculas', () => {
-    expect(esCitaFiel(material, '62 no la completan')).toBe(true);
-    expect(esCitaFiel(material, 'DE CADA 100 personas que inician la apertura, 62 no la completan')).toBe(
+  it('una cita literal está presente aunque cambien espacios o mayúsculas', () => {
+    expect(citaApareceLiteral(material, '62 no la completan')).toBe(true);
+    expect(citaApareceLiteral(material, 'DE CADA 100 personas que inician la apertura, 62 no la completan')).toBe(
       true,
     );
   });
 
-  it('una cita reescrita o inventada NO es fiel', () => {
-    expect(esCitaFiel(material, 'el 62% abandona por desconfianza')).toBe(false);
-    expect(esCitaFiel(material, '   ')).toBe(false);
+  it('una cita reescrita o inventada NO está presente', () => {
+    expect(citaApareceLiteral(material, 'el 62% abandona por desconfianza')).toBe(false);
+    expect(citaApareceLiteral(material, '   ')).toBe(false);
   });
 
-  it('cuenta fieles sobre el total, que es lo que la pantalla muestra por propuesta', () => {
-    const r = fidelidadDeCitas(material, [
+  it('cuenta las presentes sobre el total, que es lo que la pantalla muestra por propuesta', () => {
+    const r = presenciaLiteralDeCitas(material, [
       { fragmento: '62 no la completan' },
       { fragmento: 'abandono por desconfianza' },
       { fragmento: 'inician la apertura' },
     ]);
-    expect(r).toEqual({ fieles: 2, total: 3 });
+    expect(r).toEqual({ presentes: 2, total: 3 });
+  });
+
+  it('presencia NO es sostén: una cita copiada al pie puede acompañar a una afirmación falsa', () => {
+    // El límite del control, fijado como test y no solo como comentario: esto es una
+    // SUBCADENA. El fragmento está literalmente en el material y aun así no sostiene nada
+    // de lo que se afirma junto a él. Por eso ni la función ni el campo ni la pantalla
+    // dicen «fiel» ni «verificada» — el nombre haría el trabajo que el código no hace.
+    //
+    // Y por eso el remedio no es un evaluador de sostén cita→afirmación: sería un juicio de
+    // modelo, y usar la AI para verificar el grounding de la AI mueve el problema un piso
+    // más arriba. Quien sostiene es la persona que acepta (SYS-19).
+    expect(citaApareceLiteral(material, 'inician la apertura')).toBe(true);
+    const todasPresentes = presenciaLiteralDeCitas(material, [
+      { fragmento: 'inician la apertura' },
+      { fragmento: '62 no la completan' },
+    ]);
+    expect(todasPresentes).toEqual({ presentes: 2, total: 2 });
+    // 2/2 «presentes» es exactamente lo que devolvería una alucinación bien citada. El
+    // número es cierto; lo que NO es cierto es leerlo como verificación.
   });
 });
 

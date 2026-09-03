@@ -272,6 +272,9 @@ function PantallaPropuestas() {
               />
             ))}
 
+            {datos.respaldo.aceptadas + datos.respaldo.corregidas + datos.respaldo.rechazadas >
+              0 && <RespaldoHumano respaldo={datos.respaldo} />}
+
             {datos.decididas.length > 0 && (
               <>
                 <div style={{ ...etiqueta, paddingTop: 14 }}>Decididas recientes</div>
@@ -379,6 +382,53 @@ function BanderaAI({
           criterios del reto en la pantalla del proyecto. Ningún gate depende de la AI.
         </span>
       )}
+    </Card>
+  );
+}
+
+/**
+ * El grounding que alguien SOSTIENE. Va deliberadamente por encima de las decididas y no
+ * junto a las citas de cada propuesta, porque son dos cosas distintas y confundirlas es el
+ * defecto que esta pantalla arrastraba: la presencia literal de una cita mide una SUBCADENA
+ * —el fragmento está en el material— y no establece que sostenga la afirmación que
+ * acompaña. Un modelo que copia una frase mientras alucina el resto saca 2/2 «presentes».
+ *
+ * Lo que sí es una medida que alguien sostiene es ésta: cuántas propuestas pasó una PERSONA
+ * a objeto real del dominio, poniendo su nombre en la fila (SYS-19). El único verificador de
+ * confianza del pipeline es quien materializa y firma; contar aquí es contar donde hay
+ * alguien que responde por el número.
+ */
+function RespaldoHumano({
+  respaldo,
+}: {
+  respaldo: { aceptadas: number; corregidas: number; rechazadas: number };
+}) {
+  const respaldadas = respaldo.aceptadas + respaldo.corregidas;
+  const decididas = respaldadas + respaldo.rechazadas;
+  return (
+    <Card
+      style={{
+        padding: 16,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+        borderLeft: '3px solid var(--accent)',
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        Con respaldo humano · {respaldadas} de {decididas} decididas
+      </span>
+      <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
+        {respaldo.aceptadas} aceptadas tal cual y {respaldo.corregidas} aceptadas con
+        corrección; {respaldo.rechazadas} rechazadas. Sobre todas las decididas del
+        workspace, no solo las de esta página.
+      </span>
+      <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-body)' }}>
+        Ésta es la medida de grounding que alguien sostiene: cada una la firma la persona que
+        la materializó. La presencia literal de las citas que se ve en cada propuesta es otra
+        cosa —dice que el fragmento está en el material, no que sostenga lo que afirma—, así
+        que no cuenta como verificación por sí sola.
+      </span>
     </Card>
   );
 }
@@ -860,7 +910,7 @@ function TarjetaPropuesta({
   const faltaFecha =
     propuesta.destino === 'evidencia' &&
     (propuesta.contenido as ContenidoExtraccion).fecha === null;
-  const citasFieles = propuesta.citas.filter((c) => c.fiel).length;
+  const citasPresentes = propuesta.citas.filter((c) => c.presenteLiteral).length;
 
   async function decidir(correccion?: ContenidoPropuesta) {
     setOcupado(true);
@@ -925,20 +975,27 @@ function TarjetaPropuesta({
 
       {propuesta.citas.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {/* PRESENCIA LITERAL, no «verificadas»: el control es una subcadena, y una cita
+              puede estar palabra por palabra en el material sin sostener la afirmación que
+              acompaña. El nombre haría aquí el trabajo que el código no hace, y quien lea
+              «verificadas» dejaría de mirar justo lo que hay que mirar. Lo que sí sostiene
+              la propuesta es la persona que la acepta (SYS-19), y eso se cuenta abajo, en
+              las decididas. */}
           <span style={etiqueta}>
-            Citas · {citasFieles}/{propuesta.citas.length} verificadas literales en el material
+            Citas · {citasPresentes}/{propuesta.citas.length} presentes literalmente en el
+            material
           </span>
           {propuesta.citas.map((c, i) => (
             <div
               key={i}
               style={{
                 font: '400 12px/1.5 var(--font-mono)',
-                color: c.fiel ? 'var(--text-body)' : 'var(--danger)',
+                color: c.presenteLiteral ? 'var(--text-body)' : 'var(--danger)',
                 overflowWrap: 'anywhere',
               }}
             >
-              {c.fiel ? '· ' : '⚠ '}«{c.fragmento}» — {c.localizacion}
-              {!c.fiel && ' (no aparece literal en el material)'}
+              {c.presenteLiteral ? '· ' : '⚠ '}«{c.fragmento}» — {c.localizacion}
+              {!c.presenteLiteral && ' (no aparece literal en el material)'}
             </div>
           ))}
         </div>

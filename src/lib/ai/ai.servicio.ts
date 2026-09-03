@@ -6,7 +6,7 @@ import { DimensionesEvidenciaSchema, ROLES_CURADORES } from '@/lib/evidencia/evi
 import { bloquearReto } from '@/lib/metodo/metodo.servicio';
 import { evaluarCapacidadAI, LIMITE_LLAMADAS_DIA } from './ai.degradacion';
 import {
-  fidelidadDeCitas,
+  presenciaLiteralDeCitas,
   materialDeItem,
   materialDeReto,
   MAX_MATERIAL,
@@ -239,11 +239,11 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   const contenido = f.contenido as ContenidoPropuesta;
   const original = f.contenido_original as ContenidoPropuesta;
   // El material se compone IGUAL que al construir el prompt —ficha incluida y con el
-  // delimitador neutralizado—: la fidelidad se mide contra lo que el modelo leyó, no
+  // delimitador neutralizado—: la presencia literal se mide contra lo que el modelo leyó, no
   // contra el texto crudo de la base. Una sola definición, dos usos.
   //
   // Y se compone para las DOS capacidades: C0 cita la formulación del reto igual que CI cita
-  // el material del item, así que la fidelidad se mide con la misma función. Cuando C0 no
+  // el material del item, así que la presencia se mide con la misma función. Cuando C0 no
   // citaba, sus propuestas no salían mal en la medición de grounding (RF-09.10): salían
   // excluidas, que es peor — una capacidad que no puede salir mal es la que más falta hace
   // medir.
@@ -281,7 +281,7 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     citas: citas.map((c) => ({
       fragmento: c.fragmento,
       localizacion: c.localizacion,
-      fiel: fidelidadDeCitas(material, [c]).fieles === 1,
+      presenteLiteral: presenciaLiteralDeCitas(material, [c]).presentes === 1,
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
     anclaId: ((f.item_id ?? f.reto_id) as string | null) ?? '',
@@ -300,7 +300,7 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
 }
 
 /**
- * Proyección del panel de revisión. El `material` que viaja para medir la fidelidad de
+ * Proyección del panel de revisión. El `material` que viaja para medir la presencia literal de
  * las citas está acotado EXACTAMENTE al que entró al prompt (MAX_MATERIAL): medir contra
  * más texto del que el modelo vio daría un grounding falsamente bueno.
  *
@@ -404,6 +404,26 @@ export async function panelPropuestas(
     const [conteo] = await tx`select count(*)::int as n from propuesta_ai
       where workspace_id = ${workspaceId} and estado = 'propuesta'`;
 
+    // ── El grounding que alguien SOSTIENE ──
+    //
+    // La presencia literal de las citas mide una subcadena, y ninguna subcadena verifica que
+    // una cita sostenga su afirmación. El único verificador de confianza del pipeline es la
+    // persona que materializa y firma (SYS-19), así que «con respaldo» es propiedad del ACTO
+    // HUMANO y se cuenta aquí: cuántas propuestas pasó alguien a objeto real del dominio,
+    // poniendo su nombre en `revisada_por`.
+    //
+    // Se cuenta sobre TODO el workspace y no sobre la página de decididas recientes: un
+    // recuento por página no es un recuento, y este número se va a leer como medida.
+    //
+    // Y se cuentan los tres estados por separado en vez de derivar «rechazadas» restando,
+    // porque `propuesta` —lo que aún no ha decidido nadie— no es ninguno de los tres y una
+    // resta lo repartiría en silencio entre ellos.
+    const [respaldo] = await tx`select
+        count(*) filter (where estado = 'aceptada')::int as aceptadas,
+        count(*) filter (where estado = 'corregida')::int as corregidas,
+        count(*) filter (where estado = 'rechazada')::int as rechazadas
+      from propuesta_ai where workspace_id = ${workspaceId} and revisada_por is not null`;
+
     // Por `revisada_en`, que es lo que la lista promete: recencia de la DECISIÓN. Con el
     // orden por `creado_en`, decidir una propuesta antigua no la hacía aparecer —quedaba
     // detrás de cincuenta decisiones de propuestas más nuevas— y el revisor no veía lo que
@@ -495,6 +515,11 @@ export async function panelPropuestas(
       decididas: decididas.slice(0, DECIDIDAS_RECIENTES).map(filaDePanel),
       hayMasPendientes: pendientes.length > PAGINA_PENDIENTES,
       totalPendientes: Number(conteo!.n),
+      respaldo: {
+        aceptadas: (respaldo?.aceptadas ?? 0) as number,
+        corregidas: (respaldo?.corregidas ?? 0) as number,
+        rechazadas: (respaldo?.rechazadas ?? 0) as number,
+      },
       hayMasDecididas: decididas.length > DECIDIDAS_RECIENTES,
       itemsPendientes: items.slice(0, PAGINA_ANCLAS).map((i) => ({
         id: i.id as string,
@@ -580,7 +605,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       // contrato de CI obliga al modelo a devolver una evidencia fechada con al menos una
       // cita literal. Sin cuerpo, la única salida que cumple el contrato es inventada a
       // partir de la ficha: una propuesta con apariencia de fundamentada, pagada, que
-      // además contamina la métrica de fidelidad. Y no hay recuperación posible — no hay
+      // además contamina la métrica de presencia literal. Y no hay recuperación posible — no hay
       // herramienta que lea la fuente referenciada — así que la respuesta correcta es no
       // ofrecer la generación, no intentarla peor.
       if (!(item.tiene_material as boolean)) {

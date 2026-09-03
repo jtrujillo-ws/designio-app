@@ -696,8 +696,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(decidida.citas.map((c) => c.fragmento)).toEqual(
       CONTENIDO_CI.citas.map((c) => c.fragmento),
     );
-    // La cita inventada sigue marcada como no fiel: la señal sobrevive a la corrección.
-    expect(decidida.citas.map((c) => c.fiel)).toEqual([true, false]);
+    // La cita inventada sigue marcada como no presenteLiteral: la señal sobrevive a la corrección.
+    expect(decidida.citas.map((c) => c.presenteLiteral)).toEqual([true, false]);
   });
 
   it('una propuesta cuelga de la llamada que la produjo, no de cualquiera', async () => {
@@ -958,12 +958,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
-  it('la fidelidad de las citas viaja medida contra el material real del alcance', async () => {
+  it('la presencia literal de las citas se mide contra el material real del alcance', async () => {
     const panel = await panelPropuestas(leadId, ws);
     const conCitas = [...panel.pendientes, ...panel.decididas].find((p) => p.citas.length === 2);
     expect(conCitas).toBeDefined();
     // Una cita literal del material y otra inventada: la pantalla las distingue.
-    expect(conCitas!.citas.map((c) => c.fiel)).toEqual([true, false]);
+    expect(conCitas!.citas.map((c) => c.presenteLiteral)).toEqual([true, false]);
     expect(conCitas!.modelo).toBe(MODELO_PRIMARIO);
   });
 
@@ -993,7 +993,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
     const panel = await panelPropuestas(leadId, ws);
     const p = [...panel.pendientes, ...panel.decididas].find((x) => x.id === propuestaId)!;
-    expect(p.citas.map((c) => c.fiel)).toEqual([true, false]);
+    expect(p.citas.map((c) => c.presenteLiteral)).toEqual([true, false]);
   });
 
   // ── RF-09.5: consentimiento ANTES de que el material salga hacia el proveedor ──
@@ -1606,6 +1606,60 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await sqlAdmin()`delete from reserva_ai where workspace_id = ${ws} and item_id = ${otro}`;
       await vaciarRelleno();
     }
+  });
+
+  it('el respaldo lo cuenta el ACTO HUMANO, sobre todo el workspace y no sobre una página', async () => {
+    // La presencia literal de las citas mide una subcadena y no verifica nada por sí sola:
+    // una alucinación bien citada saca 2/2 «presentes». La medida que alguien sostiene es
+    // ésta —cuántas propuestas pasó una PERSONA a objeto real, con su nombre en la fila
+    // (SYS-19)—, así que se comprueba que sale de lo que decidió gente y no de otra cosa.
+    const admin = sqlAdmin();
+    const antes = await conProveedor(RESPUESTA_CI, async () => {
+      const panel = await panelPropuestas(leadId, ws);
+      return panel.respaldo;
+    });
+
+    // Una propuesta SIN decidir no cuenta en ninguno de los tres: `propuesta` no es un
+    // veredicto, y derivar los rechazos restando la habría repartido en silencio.
+    const sinDecidir = await nuevoItem('Item cuya propuesta se queda esperando', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId: sinDecidir,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    await conProveedor(RESPUESTA_CI, () =>
+      generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: sinDecidir }),
+    );
+    const enEspera = await conProveedor(RESPUESTA_CI, async () => {
+      const panel = await panelPropuestas(leadId, ws);
+      return panel.respaldo;
+    });
+    expect(enEspera).toEqual(antes);
+
+    // Aceptarla la mueve a «respaldada», y el que la sostiene es quien firmó.
+    const [p] = await conUsuario(leadId, (tx) => tx`select id from propuesta_ai
+      where workspace_id = ${ws} and item_id = ${sinDecidir} and estado = 'propuesta'`);
+    const propuestaId = p!.id as string;
+    await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const tras = await conProveedor(RESPUESTA_CI, async () => {
+      const panel = await panelPropuestas(leadId, ws);
+      return panel.respaldo;
+    });
+    expect(tras.aceptadas + tras.corregidas).toBe(antes.aceptadas + antes.corregidas + 1);
+    expect(tras.rechazadas).toBe(antes.rechazadas);
+
+    // Y el nombre está en la fila: el respaldo no es anónimo, o no sería de nadie.
+    const [firmada] = await admin`select revisada_por, revisada_en from propuesta_ai
+      where id = ${propuestaId}`;
+    expect(firmada!.revisada_por).toBe(leadId);
+    expect(firmada!.revisada_en).not.toBeNull();
+
+    // El recuento es del WORKSPACE entero, no de la página de decididas recientes: un
+    // recuento por página no es un recuento, y este número se lee como medida.
+    const [total] = await conUsuario(leadId, (tx) => tx`select count(*)::int as n
+      from propuesta_ai where workspace_id = ${ws} and revisada_por is not null`);
+    expect(tras.aceptadas + tras.corregidas + tras.rechazadas).toBe(total!.n as number);
   });
 
   it('el cupo del workspace manda, y la constante del código es solo el respaldo', async () => {
@@ -3298,7 +3352,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     ).not.toThrow();
   });
 
-  it('C0 también cita, y su fidelidad se mide contra la formulación del reto', async () => {
+  it('C0 también cita, y su presencia literal se mide contra la formulación del reto', async () => {
     // Sin citas, C0 no salía MAL en la medición de grounding de RF-09.10: salía EXCLUIDA, en
     // silencio. Y una capacidad que no puede salir mal en la métrica de calidad es la que
     // más falta hace medir. Además I4 lo pide con todas las letras: la AI propone Y CITA.
@@ -3334,8 +3388,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
       const panel = await panelPropuestas(curadorId, wsC);
       const p = panel.pendientes[0]!;
-      // Las citas se pintan y se miden, igual que las de CI: una fiel y una inventada.
-      expect(p.citas.map((c) => c.fiel)).toEqual([true, false]);
+      // Las citas se pintan y se miden, igual que las de CI: una presente y una inventada.
+      expect(p.citas.map((c) => c.presenteLiteral)).toEqual([true, false]);
       // Y la confianza declarada llega a la columna que ordena la revisión, que antes se
       // quedaba en nulo para TODA propuesta no sembrada.
       expect(p.confianza).toBe(CONFIANZA_PROPUESTA_NUMERICA[CONTENIDO_C0.confianzaPropuesta]);

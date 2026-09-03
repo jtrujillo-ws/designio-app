@@ -88,7 +88,7 @@ export const DESTINO_DE_CAPACIDAD: Record<CapacidadActiva, Destino> = {
  * Es la que ordena la revisión humana: sin ella el panel presenta todas las propuestas como
  * si mereciesen la misma atención, que es lo contrario de lo que una capacidad con revisión
  * humana necesita. Y es una AFIRMACIÓN del modelo, no una medida — la medida de verdad es la
- * fidelidad de las citas, que se calcula contra el material.
+ * presencia literal de las citas, que se calcula contra el material.
  */
 export const CONFIANZA_PROPUESTA = ['alta', 'media', 'baja'] as const;
 export const CONFIANZA_PROPUESTA_NUMERICA: Record<(typeof CONFIANZA_PROPUESTA)[number], number> =
@@ -182,7 +182,7 @@ export const ContenidoCriterioSchema = z.object({
    * silencio — y la que no puede salir mal es la que más falta hace medir.
    *
    * El material del alcance de C0 es la formulación del reto (código, título, descripción y
-   * métrica objetivo declarada), delimitado igual que el de CI, así que la fidelidad se mide
+   * métrica objetivo declarada), delimitado igual que el de CI, así que la presencia se mide
    * exactamente con la misma regla y la misma función.
    */
   citas: CitasSchema,
@@ -271,12 +271,20 @@ export const ESTADOS_ANCLA = [
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];
 
-export type CitaVerificada = {
+export type CitaConPresencia = {
   fragmento: string;
   localizacion: string;
-  /** true si el fragmento aparece LITERAL en el material del alcance (grounding medido,
-   * no presumido). La UI lo muestra por cita: una cita no fiel es la señal de alarma. */
-  fiel: boolean;
+  /**
+   * true si el fragmento aparece LITERAL en el material del alcance. Es una subcadena, y el
+   * nombre lo dice porque el control no establece nada más: una cita puede estar presente
+   * palabra por palabra y no sostener la afirmación que acompaña —basta con que el modelo
+   * copie una frase mientras alucina el resto—. Llamarlo «fiel» o «verificada» prometería
+   * un sostén que aquí nadie ata; quien lo ata es la persona que acepta (SYS-19).
+   *
+   * `false` es la señal de alarma y la UI la pinta; `true` no es un visto bueno, es la
+   * ausencia de una alarma concreta.
+   */
+  presenteLiteral: boolean;
 };
 
 export type PropuestaEnPanel = {
@@ -290,7 +298,7 @@ export type PropuestaEnPanel = {
   /** Se envía solo cuando difiere del contenido vigente (una corrección): la propuesta
    * original nunca se pierde de vista. */
   contenidoOriginal: ContenidoPropuesta | null;
-  citas: CitaVerificada[];
+  citas: CitaConPresencia[];
   /** Título del objeto del que se derivó (item de bandeja o reto), para dar contexto. */
   anclaTitulo: string;
   anclaId: string;
@@ -360,6 +368,17 @@ export type PanelPropuestas = {
   /** Cada lista se corta por su cuenta y avisa de su recorte: con un solo corte antes de
    * partir por estado, 150 decisiones nuevas escondían para siempre una propuesta
    * pendiente antigua (y la generación tampoco volvía a ofrecer su item). */
+  /**
+   * El grounding que alguien SOSTIENE, sobre todo el workspace y no sobre una página.
+   * La presencia literal de las citas mide una subcadena y no verifica nada por sí sola; lo
+   * que sí es una medida que alguien sostiene es cuántas propuestas pasó una PERSONA a
+   * objeto real del dominio, con su nombre en `revisada_por` (SYS-19).
+   *
+   * `aceptadas` + `corregidas` son las respaldadas —corregir es aceptar habiendo enmendado,
+   * y el respaldo es igual de suyo—; `rechazadas` está para que el denominador sea el de lo
+   * DECIDIDO y no el de lo generado.
+   */
+  respaldo: { aceptadas: number; corregidas: number; rechazadas: number };
   hayMasPendientes: boolean;
   /** Cuántas pendientes hay en total, no cuántas caben. Con la cola ordenada por confianza,
    * lo que el corte deja fuera son las menos fiables, así que decir el número es lo que

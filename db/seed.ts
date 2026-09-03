@@ -333,8 +333,10 @@ const AVISO_CADENA_SIN_PROCEDENCIA = 'DerechosDeCadenaSinRepararPorProcedencia';
  *
  * Idempotente POR CONTENIDO: se reemite solo si cambia el conjunto afectado, para que
  * re-sembrar diez veces no llene la auditoría con el mismo aviso y para que un cambio real
- * sí quede fechado. El orden del array es estable (`order by e.id`) porque la igualdad de
- * jsonb sí distingue el orden dentro de un array.
+ * sí quede fechado. El orden del array es TOTAL (`order by e.id, u.papel`, no solo por id)
+ * porque la igualdad de jsonb sí distingue el orden dentro de un array, y una misma
+ * evidencia puede salir en las dos ramas: ordenar solo por id dejaría ese par empatado y el
+ * aviso se reemitiría al azar.
  */
 async function declinarReparacionDeCadena(tx: TransactionSql, wsId: string): Promise<void> {
   const alcanzables = await tx`
@@ -361,7 +363,7 @@ async function declinarReparacionDeCadena(tx: TransactionSql, wsId: string): Pro
     join evidencia e on e.id = u.ev and e.workspace_id = ${wsId}
     left join derecho_uso d on d.evidencia_id = e.id and d.workspace_id = ${wsId}
     where d.id is null or d.estado = 'pendiente'
-    order by e.id`;
+    order by e.id, u.papel`;
   if (alcanzables.length === 0) return;
 
   const payload = {

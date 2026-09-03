@@ -3287,6 +3287,40 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
+  it('el asiento del árbol no lo puede escribir la aplicación mientras nada pueda llenarlo', async () => {
+    // La FK impide apuntar al vacío o a otro tenant, pero no que se apunte a una propuesta
+    // cualquiera de ESTE workspace. Como hoy ninguna capacidad materializa un afectado
+    // —`destino` ni siquiera lo contempla—, cualquier valor ahí es una afirmación
+    // necesariamente falsa: la columna sale del grant hasta que exista quien la llene.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item del asiento sin grant');
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+    });
+    try {
+      await expect(
+        conUsuario(leadId, (tx) => tx`
+          insert into reto_servicio_afectado
+            (reto_id, servicio_id, workspace_id, propuesta_ai_id, creado_por)
+          values (${retoId}, ${svcId}, ${ws}, ${propuestaId}, ${leadId})`),
+      ).rejects.toThrow(/permission denied|permiso denegado/i);
+
+      // Control: la MISMA fila sin la columna entra, así que lo que la rechazaba era el
+      // grant de esa columna y no la política ni ninguna de las otras referencias.
+      await conUsuario(leadId, (tx) => tx`
+        insert into reto_servicio_afectado (reto_id, servicio_id, workspace_id, creado_por)
+        values (${retoId}, ${svcId}, ${ws}, ${leadId})`);
+      const [fila] = await admin`select propuesta_ai_id from reto_servicio_afectado
+        where reto_id = ${retoId} and servicio_id = ${svcId}`;
+      expect(fila!.propuesta_ai_id).toBe(null);
+    } finally {
+      await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    }
+  });
+
   it('el asiento reservado del árbol ya no puede apuntar al vacío ni a otro workspace', async () => {
     // `reto_servicio_afectado.propuesta_ai_id` llevaba desde SPEC-02 siendo una columna
     // suelta: anulable, sin FK y con grant de INSERT sin lista de columnas, o sea escribible

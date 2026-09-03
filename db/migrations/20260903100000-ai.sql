@@ -695,6 +695,21 @@ alter table reto_servicio_afectado
   add constraint reto_servicio_afectado_propuesta_ai_fkey
   foreign key (propuesta_ai_id, workspace_id) references propuesta_ai (id, workspace_id);
 
+-- Y el asiento no se puede ESCRIBIR todavía, que es la otra mitad. La FK impide apuntar a
+-- una propuesta inexistente o de otro tenant, pero no que se apunte a una cualquiera de
+-- este: como hoy ninguna capacidad materializa un afectado, cualquier valor ahí es una
+-- afirmación necesariamente falsa. Dejar escribible una columna que solo puede mentir es la
+-- misma clase que este slice viene cerrando en todas partes.
+--
+-- Se retira el grant de tabla de `…070000-metodo.sql` y se vuelve a conceder la lista exacta
+-- que esa migración ya usaba —un `revoke` por columna no sirve mientras exista el de tabla—,
+-- menos `propuesta_ai_id`. `creado_en` se mantiene tal cual estaba: es reloj de otro slice y
+-- no es lo que este cambio discute. El día que exista la capacidad, quien la escriba será su
+-- guard de materialización, como en `evidencia` y `criterio_exito`, y este grant no cambia.
+revoke insert on reto_servicio_afectado from designio_app;
+grant insert (reto_id, servicio_id, workspace_id, creado_por, creado_en)
+  on reto_servicio_afectado to designio_app;
+
 create index propuesta_ai_ws_idx on propuesta_ai (workspace_id, estado, creado_en);
 -- Un item tiene COMO MUCHO una propuesta pendiente, y el índice lo impone además de
 -- servir la consulta («este item ya tiene propuesta pendiente» sin recorrer el

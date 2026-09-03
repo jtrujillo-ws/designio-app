@@ -2254,6 +2254,155 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     }
   });
 
+  it('ninguna función SECURITY DEFINER del esquema deja EXECUTE a PUBLIC', async () => {
+    // En estas tablas `relforcerowsecurity` es `f` y el dueño es el mismo que ejecuta las
+    // funciones `security definer`, así que dentro de una de ellas la RLS NO se aplica.
+    // Dicho de otro modo: toda función `prosecdef` es, por construcción, un agujero
+    // potencial en el aislamiento entre tenants, y lo único que lo cierra es que nadie más
+    // pueda ejecutarla y que la que sí se expone lleve su puerta de membresía.
+    //
+    // `20260902350000` se saltó esa disciplina en una línea —creó la función y le dio grant
+    // sin quitar el EXECUTE que Postgres concede a PUBLIC por defecto— y el resultado fue
+    // una fuga de CONTENIDO entre workspaces. Se arregló, pero arreglar el caso no cierra
+    // la clase: esto sí. El conjunto se deriva del catálogo, así que alcanza también a las
+    // funciones que añadan otras ramas, sin que nadie tenga que acordarse.
+    const admin = sqlAdmin();
+    const conPublic = (
+      await admin`select p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as f
+        from pg_proc p
+        where p.pronamespace = 'public'::regnamespace and p.prosecdef
+          and (p.proacl is null
+               or exists (select 1 from aclexplode(p.proacl) a where a.grantee = 0))
+        order by 1`
+    ).map((r) => r.f as string);
+    // No vacuo: si no hubiera funciones `security definer`, esto se cumpliría por vacío.
+    const [total] = await admin`select count(*)::int as n from pg_proc
+      where pronamespace = 'public'::regnamespace and prosecdef`;
+    expect(total!.n as number).toBeGreaterThan(20);
+    // `proacl is null` cuenta como fallo a propósito: significa «privilegios por defecto»,
+    // y el defecto de Postgres para una función es EXECUTE a PUBLIC.
+    expect(conPublic).toEqual([]);
+  });
+
+  it('el motivo del razonamiento no habla con quien no es miembro: ni por insight, ni por decisión, ni por evidencia', async () => {
+    // La función que sacó el predicado a un solo sitio nació con `grant execute` sobre la
+    // versión CRUDA, y eso la convirtió en un oráculo CON CONTENIDO. Dentro de un
+    // SECURITY DEFINER cuyo dueño es el de las tablas la RLS no se aplica (ninguna lleva
+    // `force row level security`), y la puerta de `evidencia_usable` aquí no protege sino
+    // que EMPEORA: para un workspace ajeno devuelve falso en toda cita, así que la
+    // afirmación se selecciona y su TEXTO literal sale dentro del motivo.
+    //
+    // La RLS tampoco es defensa, y por eso este test pasa los ids como LITERALES: solo
+    // esconde las filas que se leen de una tabla, y quien ataca no las lee, las escribe.
+    //
+    // El arreglo tiene la forma que esta rama ya usó dos veces (`derechos_vigentes` es la
+    // regla y `evidencia_usable` la regla más la puerta): la cruda pierde el grant y la
+    // llama solo el guard —que corre como propietario y necesita ver todo— y encima va un
+    // envoltorio con la puerta, único con grant. La puerta NO puede ir dentro de la cruda:
+    // el guard corre sin `app.user_id` y la dejaría inerte, que es el mismo mecanismo que
+    // hubo que arreglar en los backfills de 20260902310000.
+    const admin = sqlAdmin();
+
+    // Razonamiento AJENO, completo, para que las tres vías tengan de verdad algo que
+    // filtrar. Se crea aquí y lo limpia el afterAll de la suite con el resto de wsB.
+    const [fuenteB] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${wsB}, 'documento', 'Fuente del oráculo', ${leadId}) returning id`;
+    const [evB] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${wsB}, ${fuenteB!.id as string}, 'Evidencia del oráculo', '{}'::jsonb, ${leadId})
+      returning id`;
+    const evAjena = evB!.id as string;
+    await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+      values (${wsB}, ${evAjena}, ${leadId})`;
+    const [insB] = await admin`insert into insight
+      (workspace_id, titulo, estado, validado_por, validado_en, creado_por)
+      values (${wsB}, 'Insight del oráculo', 'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const insAjeno = insB!.id as string;
+    const SECRETO = 'el margen del proveedor ajeno cae 14 puntos en el trimestre';
+    const [afB] = await admin`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${wsB}, ${insAjeno}, 0, ${SECRETO}, false) returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${wsB}, ${afB!.id as string}, ${evAjena}, 'fragmento ajeno', 'p. 1', ${leadId})`;
+    const [svcB] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${wsB}, 'Servicio del oráculo', ${leadId}) returning id`;
+    const [retoB] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+      values (${wsB}, ${svcB!.id as string}, 'R-90', 'Reto del oráculo', 'activo',
+        'peticion-cliente', ${leadId}) returning id`;
+    const [proyB] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${wsB}, ${retoB!.id as string}, 'P-90', 'Proyecto del oráculo', ${leadId})
+      returning id`;
+    const [gateB] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${wsB}, ${proyB!.id as string}, 1, 'lead-boutique') returning id`;
+    const [decB] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, decidido_por)
+      values (${wsB}, ${proyB!.id as string}, ${gateB!.id as string}, 'diseno',
+        'Decisión del oráculo', 'fundamento ajeno', ${leadId}) returning id`;
+    const decAjena = decB!.id as string;
+    await admin`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${decAjena}, ${insAjeno}, ${wsB})`;
+
+    // No vacuo: como PROPIETARIO la función cruda sí devuelve el texto, o sea que hay algo
+    // que filtrar y lo que se prueba abajo no es que no haya nada.
+    const [crudo] = await admin`select razonamiento_sin_respaldo(${wsB}::uuid,
+      array[${insAjeno}]::uuid[], array[]::uuid[], array[]::uuid[]) as motivo`;
+    expect(crudo!.motivo).toContain(SECRETO);
+
+    // Y ahora las tres vías, con el rol de aplicación y una identidad que NO es miembro de
+    // wsB. `null` y no un motivo distinto: indistinguible de «se puede consumir». Un motivo
+    // propio para «no eres miembro» volvería a ser un oráculo, de existencia en vez de
+    // contenido.
+    const vias = [
+      { nombre: 'insight', ins: [insAjeno], dec: [] as string[], ev: [] as string[] },
+      { nombre: 'decisión', ins: [] as string[], dec: [decAjena], ev: [] as string[] },
+      { nombre: 'evidencia', ins: [] as string[], dec: [] as string[], ev: [evAjena] },
+    ];
+    for (const v of vias) {
+      const filas = await conUsuario(
+        leadId,
+        (tx) => tx`select razonamiento_sin_respaldo_visible(${wsB}::uuid, ${v.ins}::uuid[],
+          ${v.dec}::uuid[], ${v.ev}::uuid[]) as motivo`,
+      );
+      expect(filas[0]!.motivo, `vía ${v.nombre}`).toBeNull();
+    }
+
+    // Y la CRUDA no la puede ni ejecutar el rol de aplicación. Sin esto, la puerta del
+    // envoltorio sería decorativa: bastaría con llamar a la de abajo. Se revoca también de
+    // PUBLIC, que es a quien Postgres se la concede por defecto — comprobado: con solo el
+    // `revoke … from designio_app` la función seguía respondiendo.
+    await expect(
+      conUsuario(
+        leadId,
+        (tx) => tx`select razonamiento_sin_respaldo(${wsB}::uuid, array[${insAjeno}]::uuid[],
+          array[]::uuid[], array[]::uuid[])`,
+      ),
+    ).rejects.toMatchObject({ code: '42501' });
+
+    // Control: para un MIEMBRO el envoltorio sí contesta, o todo lo de arriba se cumpliría
+    // por no contestar nunca. La evidencia del control se crea AQUÍ, en el workspace
+    // propio: colgarla de un valor que rellena otro test haría que este dependiera del
+    // orden, y un test que solo pasa acompañado no prueba lo que dice.
+    const [fuenteP] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'documento', 'Fuente del control', ${leadId}) returning id`;
+    const [evP] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuenteP!.id as string}, 'Evidencia del control', '{}'::jsonb, ${leadId})
+      returning id`;
+    await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+      values (${ws}, ${evP!.id as string}, ${leadId})`;
+    const propias = await conUsuario(
+      leadId,
+      (tx) => tx`select razonamiento_sin_respaldo_visible(${ws}::uuid, array[]::uuid[],
+        array[]::uuid[], array[${evP!.id as string}]::uuid[]) as motivo`,
+    );
+    expect(propias[0]!.motivo).toContain('derechos');
+  });
+
   it('el protocolo de razonamiento está escrito UNA vez: las dos rutas comparten la redacción', async () => {
     // La rama de G5 nació copiando del checklist la comprobación que motivó su arreglo y
     // dejándose las que ya estaban: el estado del insight y el candado sobre las decisiones.

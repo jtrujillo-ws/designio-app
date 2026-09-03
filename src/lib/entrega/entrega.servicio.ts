@@ -1221,7 +1221,7 @@ export async function designVersionCompleta(
         -- pantalla prometía algo que la base no cumple. Ahora no espeja, invoca.
         coalesce((
           select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo,
-                   'sinRespaldo', razonamiento_sin_respaldo(
+                   'sinRespaldo', razonamiento_sin_respaldo_visible(
                      dv.workspace_id, array[]::uuid[], array[d.id], array[]::uuid[]))
                  order by d.decidido_en)
           from decision d
@@ -1230,7 +1230,7 @@ export async function designVersionCompleta(
         ), '[]'::jsonb) as decisiones_del_proyecto,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', i.id, 'titulo', i.titulo,
-                   'sinRespaldo', razonamiento_sin_respaldo(
+                   'sinRespaldo', razonamiento_sin_respaldo_visible(
                      dv.workspace_id, array[i.id], array[]::uuid[], array[]::uuid[]))
                  order by i.titulo)
           from insight i

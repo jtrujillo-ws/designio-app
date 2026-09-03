@@ -401,7 +401,7 @@ export async function gobernanzaDeProyecto(
             -- predicado viva dentro de un guard que lanza excepciones, quien quiera
             -- mirarlo antes no tiene más remedio que reescribirlo. El motivo viene ya
             -- redactado y nombra el objeto exacto, que es lo que hay que reparar.
-            'sinRespaldo', razonamiento_sin_respaldo(
+            'sinRespaldo', razonamiento_sin_respaldo_visible(
               d.workspace_id, array[]::uuid[], array[d.id], array[]::uuid[]))
 
             order by g.numero, d.decidido_en)

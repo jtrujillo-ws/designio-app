@@ -273,7 +273,7 @@ export async function insightsCitables(
     // levantar. El motivo viene ya redactado y nombra la afirmación concreta — un motivo
     // genérico no dice qué reparar.
     const filas = await tx`select i.id, i.titulo,
-        razonamiento_sin_respaldo(i.workspace_id, array[i.id], array[]::uuid[],
+        razonamiento_sin_respaldo_visible(i.workspace_id, array[i.id], array[]::uuid[],
                                   array[]::uuid[]) as sin_respaldo
       from insight i
       where i.workspace_id = ${workspaceId} and i.estado = 'validado'

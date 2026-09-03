@@ -208,6 +208,19 @@ export const AdjuntarArchivoSchema = z.object({
   contenidoBase64: z
     .string()
     .min(1, 'El archivo está vacío')
+    // La FORMA antes que el tamaño. Validar solo la longitud estimada dejaba pasar
+    // `'!!!!'`: el esquema lo aceptaba, `atob` reventaba dentro del servicio con
+    // `InvalidCharacterError` y el traductor de errores no lo conocía, así que el endpoint
+    // devolvía un fallo de servidor inesperado en vez de un rechazo de validación. En un
+    // slice cuya tesis es que el rechazo nombre la dimensión que falla —hasta con errcode
+    // propio para que el motivo llegue entero—, un error crudo en la ruta que este mismo
+    // slice estrena es la excepción que sobra. Se valida en el BORDE, donde vive el resto
+    // de la validación y donde la respuesta ya tiene la forma que el cliente sabe pintar.
+    // Alfabeto estándar y relleno canónico, que es lo que produce `bytesABase64`.
+    .refine(
+      (b) => b.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(b),
+      'El contenido del archivo no es base64 válido',
+    )
     .refine(
       (b) => bytesDeBase64(b) <= MAX_ARCHIVO_BYTES,
       `El archivo supera ${MAX_ARCHIVO_BYTES / 1024 / 1024} MB`,

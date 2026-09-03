@@ -1,7 +1,10 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CrearItemImportacionSchema } from '@/lib/evidencia/evidencia.schemas';
+import {
+  AdjuntarArchivoSchema,
+  CrearItemImportacionSchema,
+} from '@/lib/evidencia/evidencia.schemas';
 import {
   bytesABase64,
   base64ABytes,
@@ -314,6 +317,33 @@ describe('sanitización del material importado', () => {
     );
     expect(tipoDeclaradoDeArchivo('script.svg', 'image/svg+xml')).toBeNull();
     expect(tipoDeclaradoDeArchivo('sin-extension', '')).toBeNull();
+  });
+
+  it('el esquema rechaza un base64 con forma inválida, no lo deja reventar en atob', () => {
+    // Validar solo la longitud estimada dejaba pasar basura: el esquema la aceptaba, `atob`
+    // reventaba dentro del servicio y el endpoint devolvía un fallo de servidor inesperado
+    // en vez de un rechazo de validación con su motivo. El criterio de este slice es que el
+    // rechazo NOMBRE la dimensión que falla, y eso solo se puede hacer en el borde.
+    const base = {
+      workspaceId: crypto.randomUUID(),
+      itemId: crypto.randomUUID(),
+      nombre: 'original.pdf',
+      tipoMime: 'application/pdf',
+    };
+    for (const malo of ['!!!!', 'AB=C', 'abc', '====', 'AAAA!']) {
+      const r = AdjuntarArchivoSchema.safeParse({ ...base, contenidoBase64: malo });
+      expect(r.success).toBe(false);
+      if (!r.success) {
+        expect(r.error.issues.map((i) => i.message)).toContain(
+          'El contenido del archivo no es base64 válido',
+        );
+      }
+    }
+    // Y lo que produce el propio transporte pasa: alfabeto estándar y relleno canónico.
+    for (const largo of [1, 2, 3, 8]) {
+      const b64 = bytesABase64(new Uint8Array(Array.from({ length: largo }, (_, i) => i)));
+      expect(AdjuntarArchivoSchema.safeParse({ ...base, contenidoBase64: b64 }).success).toBe(true);
+    }
   });
 
   it('el transporte base64 conserva los bytes exactos', () => {

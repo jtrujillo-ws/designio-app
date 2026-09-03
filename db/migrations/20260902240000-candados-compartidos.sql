@@ -526,19 +526,35 @@ begin
   -- el candado ya en la mano y su snapshot es posterior al sello. El agujero era del SQL
   -- directo, que es el que este repositorio se compromete a que choque igual.
   --
-  -- La re-lectura es un `select` llano, no un `for share`: el candado consultivo YA es el
-  -- candado elegido para este objeto y lo toman los dos lados dentro de la base (aquí y
-  -- en `item_sellado_candado`), así que añadir un candado de fila sobre `item_importacion`
-  -- no protegería de nada nuevo y sí metería un segundo mecanismo sobre el mismo objeto
-  -- —justo lo que esta migración evita— con su orden de adquisición que cuadrar.
+  -- Y la re-lectura toma CANDADO DE FILA sobre el item, no es un `select` llano. Esa
+  -- diferencia es la que hace que el invariante no dependa del nivel de aislamiento que
+  -- elija el llamante, y costó entenderla: «espera al candado y vuelve a leer» solo
+  -- funciona bajo READ COMMITTED, donde cada sentencia abre snapshot nuevo. Bajo
+  -- REPEATABLE READ una sentencia posterior NO toma snapshot nuevo, así que la re-lectura
+  -- seguiría viendo `pendiente` —y el `exists` de la política también— y la mutación
+  -- commitearía después del sellado: material sin revisar añadido, u original ya revisado
+  -- borrado. Y no saltaría ningún error de serialización, porque esa transacción nunca
+  -- ESCRIBE la fila del item: Postgres aborta al escribir una fila cambiada tras la
+  -- instantánea, no al leerla.
   --
-  -- Y funciona porque este camino corre en READ COMMITTED: un `select` posterior al
-  -- candado toma snapshot nuevo y ve lo que se commiteó mientras esperaba (comprobado).
-  -- OJO al futuro: bajo `repeatable read` —que la exportación sí usa a propósito— esta
-  -- re-lectura vería el snapshot viejo y volvería a ser decorativa. Si algún día un
-  -- camino de adjuntos necesita ese nivel, esta comprobación hay que rehacerla.
+  -- `for share` sí aborta: pedir candado de fila sobre una fila actualizada después de la
+  -- instantánea da 40001 bajo REPEATABLE READ, y bajo READ COMMITTED sigue la cadena de
+  -- versiones y devuelve la nueva. Las dos ramas correctas, sin preguntar en qué nivel
+  -- corre quien llama — que es justo lo que un guard no puede permitirse suponer.
+  --
+  -- `for share` y no `for update`: quien sella hace `update item_importacion`, que toma
+  -- FOR NO KEY UPDATE, y FOR SHARE ya entra en conflicto con eso. Dos adjuntos del mismo
+  -- item no tienen por qué esperarse entre sí (y de todos modos ya los serializa el
+  -- consultivo). El orden de adquisición es el mismo en los dos lados —consultivo y
+  -- después fila— así que no hay ciclo: el sellado también toma el consultivo en su
+  -- trigger BEFORE, antes de que el executor bloquee la fila.
+  --
+  -- El consultivo se queda: es lo que serializa la ESPERA entre caminos que tocan objetos
+  -- distintos (el adjunto y el item) y lo que hace que el conteo del tope de abajo se haga
+  -- de uno en uno. El candado de fila es lo que hace que la lectura sea verdad.
   select i.estado into v_estado from item_importacion i
-    where i.id = v_item and i.workspace_id = v_ws;
+    where i.id = v_item and i.workspace_id = v_ws
+    for share;
   if v_estado is distinct from 'pendiente' then
     -- Dice QUE fue decidido y nada más: ni quién lo selló ni cuándo. Que un material haya
     -- pasado a decidido lo puede saber cualquiera que pudiera verlo pendiente.

@@ -2251,6 +2251,115 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     }
   });
 
+  it('el candado del adjunto no depende del aislamiento del llamante: en REPEATABLE READ tampoco pasa', async () => {
+    // «Espera al candado y vuelve a leer» solo funciona bajo READ COMMITTED, donde cada
+    // sentencia abre snapshot nuevo. Bajo REPEATABLE READ una sentencia posterior NO lo
+    // abre: el llamante que abrió su transacción ANTES del sellado seguiría viendo el item
+    // `pendiente` —en la re-lectura del guard y en el `exists` de la política— y su
+    // mutación commitearía DESPUÉS del sello, añadiendo material sin revisar o borrando un
+    // original ya revisado. Y no saltaría ningún error de serialización, porque esa
+    // transacción nunca ESCRIBE la fila del item: Postgres aborta al escribir una fila
+    // cambiada tras la instantánea, no al leerla.
+    //
+    // Por eso la re-lectura toma `for share` sobre el item: pedir candado de fila sobre una
+    // fila actualizada después de la instantánea SÍ da 40001 en REPEATABLE READ. El
+    // invariante deja de depender de un nivel de aislamiento que el guard no elige.
+    //
+    // Este PR es además el que introduce el parámetro `aislamiento` en `conUsuario`: hoy
+    // solo lo usa la exportación, que no muta adjuntos, pero el mecanismo ya está en el
+    // árbol y esto pasa de «SQL crudo de un rol privilegiado» a «una línea de servicio».
+    const admin = sqlAdmin();
+    const item = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: marca + ' material con snapshot viejo',
+      contenido: 'material que se sella mientras otro mira una foto vieja',
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    await adjuntarArchivo(leadId, {
+      workspaceId: ws,
+      itemId: item.itemId,
+      nombre: 'original.pdf',
+      tipoMime: 'application/pdf',
+      contenidoBase64: bytesABase64(PDF),
+    });
+    const [archivo] = await admin`select id from archivo_importado
+      where item_id = ${item.itemId} and workspace_id = ${ws}`;
+    const archivoId = archivo!.id as string;
+
+    // INSERTAR con la instantánea vieja.
+    await expect(
+      conUsuario(
+        leadId,
+        async (tx) => {
+          // Primera sentencia: fija la instantánea de la transacción, con el item todavía
+          // pendiente. Es lo que hace que el resto del test signifique algo.
+          const [antes] = await tx`select estado from item_importacion
+            where id = ${item.itemId}`;
+          expect(antes!.estado).toBe('pendiente');
+          // El curador sella por su camino —otra conexión, READ COMMITTED— y commitea.
+          await rechazarItem(leadId, { workspaceId: ws, itemId: item.itemId });
+          // Y ahora la mutación, que bajo la foto vieja parece perfectamente legal.
+          await tx`insert into archivo_importado
+            (workspace_id, item_id, nombre, tipo_mime, contenido, creado_por)
+            values (${ws}, ${item.itemId}, 'colado.pdf', 'application/pdf',
+                    decode('25504446', 'hex'), ${leadId})`;
+        },
+        { aislamiento: 'repeatable read' },
+      ),
+    ).rejects.toMatchObject({ code: '40001' });
+
+    // Y el original sigue ahí: la mutación no entró.
+    const [tras] = await admin`select count(*)::int as n from archivo_importado
+      where item_id = ${item.itemId}`;
+    expect(tras!.n as number).toBe(1);
+    // Con el item ya sellado y sin instantánea vieja, el borrado normal ni siquiera llega
+    // al guard: la política `archivo_delete` exige el item `pendiente`, así que no alcanza
+    // ninguna fila. Cero filas y sin error es la respuesta correcta de esa capa; lo que el
+    // guard cubre es justo el caso en que la política SÍ deja pasar por mirar una foto
+    // vieja, que es el de arriba y el de abajo.
+    const borradoTardio = await conUsuario(
+      leadId,
+      (tx) => tx`delete from archivo_importado where id = ${archivoId}`,
+    );
+    expect(borradoTardio.count).toBe(0);
+
+    // BORRAR con la instantánea vieja: la otra mitad, y la que se lleva por delante el
+    // original de un material YA revisado (SYS-17).
+    const otro = await crearItem(leadId, {
+      workspaceId: ws,
+      titulo: marca + ' material cuyo original querían borrar',
+      contenido: 'material con original que se conserva',
+      tipoFuente: 'documento',
+      referencia: '',
+    });
+    await adjuntarArchivo(leadId, {
+      workspaceId: ws,
+      itemId: otro.itemId,
+      nombre: 'original-2.pdf',
+      tipoMime: 'application/pdf',
+      contenidoBase64: bytesABase64(PDF),
+    });
+    const [archivo2] = await admin`select id from archivo_importado
+      where item_id = ${otro.itemId} and workspace_id = ${ws}`;
+    await expect(
+      conUsuario(
+        leadId,
+        async (tx) => {
+          const [antes] = await tx`select estado from item_importacion
+            where id = ${otro.itemId}`;
+          expect(antes!.estado).toBe('pendiente');
+          await rechazarItem(leadId, { workspaceId: ws, itemId: otro.itemId });
+          await tx`delete from archivo_importado where id = ${archivo2!.id as string}`;
+        },
+        { aislamiento: 'repeatable read' },
+      ),
+    ).rejects.toMatchObject({ code: '40001' });
+    const [conserva] = await admin`select count(*)::int as n from archivo_importado
+      where item_id = ${otro.itemId}`;
+    expect(conserva!.n as number).toBe(1);
+  });
+
   it('para todo nombre que las restricciones VIEJAS aceptaban, la remediación produce uno que las NUEVAS aceptan', async () => {
     // Esta migración abortó un despliegue DOS veces, con dos entradas distintas, y las dos
     // se arreglaron probando «el ejemplo del hallazgo». Cuando eso pasa dos veces, lo que

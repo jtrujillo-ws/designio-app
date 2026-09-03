@@ -853,7 +853,8 @@ async function confirmarDespacho(
   actorId: string,
   entrada: GenerarPropuestas,
   alcance: Alcance,
-): Promise<void> {
+): Promise<number | null> {
+  let versionConsentimiento: number | null = null;
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     if (entrada.capacidad === 'CI') {
@@ -861,7 +862,10 @@ async function confirmarDespacho(
       const [item] = await tx`select
           estado <> 'pendiente' as ya_decidido,
           tipo_fuente_exige_consentimiento(tipo_fuente)
-            and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento
+            and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
+          (select c.version from consentimiento_item c
+            where c.item_id = item_importacion.id and c.workspace_id = item_importacion.workspace_id
+            order by c.version desc limit 1) as version_vigente
         from item_importacion
         where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
       if (item?.falta_consentimiento) {
@@ -878,6 +882,11 @@ async function confirmarDespacho(
           'Ese item de la bandeja ya fue curado mientras se preparaba la llamada: no se llamó al proveedor',
         );
       }
+      // La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción
+      // que la aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un
+      // hecho consultable y no una reconstrucción por fechas.
+      versionConsentimiento =
+        item.version_vigente === null ? null : Number(item.version_vigente);
     } else {
       const [reto] = await tx`select
           reto_admite_criterios(id, workspace_id) as admite,
@@ -901,6 +910,7 @@ async function confirmarDespacho(
       );
     }
   });
+  return versionConsentimiento;
 }
 
 /** Valida la salida cruda del proveedor contra el esquema de la capacidad. Una salida
@@ -934,6 +944,7 @@ async function registrarLlamadas(
   entrada: GenerarPropuestas,
   alcance: Alcance,
   intentos: IntentoProveedor[],
+  versionConsentimiento: number | null,
 ): Promise<{ ids: string[]; idSalidaValida: string | null }> {
   if (intentos.length === 0) return { ids: [], idSalidaValida: null };
   return conUsuario(actorId, async (tx) => {
@@ -952,7 +963,8 @@ async function registrarLlamadas(
     for (const intento of intentos) {
       const [fila] = await tx`insert into llamada_ai
         (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado, motivo,
-         tokens_entrada, tokens_salida, costo_usd, latencia_ms, creado_por)
+         tokens_entrada, tokens_salida, costo_usd, latencia_ms, consentimiento_version,
+         creado_por)
         values (${entrada.workspaceId}, ${entrada.capacidad},
                 ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
                 ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
@@ -960,6 +972,7 @@ async function registrarLlamadas(
                 ${intento.motivo.slice(0, 500)},
                 ${intento.uso?.entrada ?? null}, ${intento.uso?.salida ?? null},
                 ${intento.uso?.costoUsd ?? null}, ${intento.latenciaMs},
+                ${versionConsentimiento},
                 ${actorId})
         returning id`;
       const id = fila!.id as string;
@@ -987,7 +1000,7 @@ export async function generarPropuestas(
   try {
     // Última parada antes de que el material salga del sistema. Todo lo anterior está
     // commiteado desde hace una transacción entera.
-    await confirmarDespacho(actorId, entrada, alcance);
+    const versionConsentimiento = await confirmarDespacho(actorId, entrada, alcance);
 
     const respuesta = await generarConProveedor({
       key: alcance.key,
@@ -1001,7 +1014,9 @@ export async function generarPropuestas(
     // depender de que el resultado nos guste. Si el propio registro falla, manda el motivo
     // del proveedor: es lo que la persona necesita leer.
     if (!respuesta.ok) {
-      await registrarLlamadas(actorId, entrada, alcance, respuesta.intentos).catch(() => {});
+      await registrarLlamadas(actorId, entrada, alcance, respuesta.intentos, versionConsentimiento).catch(
+        () => {},
+      );
       throw new ErrorAI(respuesta.motivo);
     }
 
@@ -1021,7 +1036,9 @@ export async function generarPropuestas(
           ? { ...i, resultado: 'fuera-de-contrato' as const, motivo }
           : i,
       );
-      await registrarLlamadas(actorId, entrada, alcance, intentos).catch(() => {});
+      await registrarLlamadas(actorId, entrada, alcance, intentos, versionConsentimiento).catch(
+        () => {},
+      );
       throw new ErrorAI(motivo);
     }
 
@@ -1030,6 +1047,7 @@ export async function generarPropuestas(
       entrada,
       alcance,
       respuesta.intentos,
+      versionConsentimiento,
     );
     const exitoso = respuesta.intentos[respuesta.intentos.length - 1]!;
     // Sin línea de gasto no hay propuesta: la FK lo impone y aquí se dice con un mensaje

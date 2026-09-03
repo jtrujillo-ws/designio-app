@@ -768,7 +768,7 @@ function SelectorDeMotivos({
   vacio,
 }: {
   etiqueta: string;
-  opciones: { id: string; titulo: string }[];
+  opciones: { id: string; titulo: string; sinRespaldo: string | null }[];
   seleccion: string[];
   onCambio: (ids: string[]) => void;
   vacio: string;
@@ -780,6 +780,11 @@ function SelectorDeMotivos({
       {opciones.length === 0 && <span style={apunte}>{vacio}</span>}
       {opciones.map((o) => {
         const marcado = seleccion.includes(o.id);
+        // Bloqueado ⇒ no se ofrece, pero SE VE y con su motivo (SYS-14). Ocultarlo dejaría
+        // al lead sin entender por qué falta el insight que buscaba; ofrecerlo lo dejaría
+        // con un diseño que después no se puede certificar. Lo ya marcado no se
+        // deshabilita: quitarlo tiene que seguir siendo posible, que es la reparación.
+        const bloqueado = o.sinRespaldo !== null && !marcado;
         return (
           <label
             key={o.id}
@@ -788,13 +793,13 @@ function SelectorDeMotivos({
               gap: 6,
               alignItems: 'center',
               ...cuerpo,
-              color: !marcado && enElTope ? 'var(--text-faint)' : undefined,
+              color: bloqueado || (!marcado && enElTope) ? 'var(--text-faint)' : undefined,
             }}
           >
             <input
               type="checkbox"
               checked={marcado}
-              disabled={!marcado && enElTope}
+              disabled={bloqueado || (!marcado && enElTope)}
               onChange={(e) =>
                 onCambio(
                   e.target.checked
@@ -803,7 +808,9 @@ function SelectorDeMotivos({
                 )
               }
             />
-            {o.titulo}
+            {o.sinRespaldo === null
+              ? o.titulo
+              : `${o.titulo} — sin derechos: la afirmación «${o.sinRespaldo}» ya no tiene ninguna cita con derechos vigentes para el ámbito cliente, y G5 no certificaría el diseño`}
           </label>
         );
       })}

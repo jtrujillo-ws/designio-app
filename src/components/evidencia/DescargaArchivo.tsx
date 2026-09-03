@@ -36,7 +36,7 @@ export function DescargaArchivo({
         onError('El adjunto ya no está disponible');
         return;
       }
-      const blob = new Blob([base64ABytes(r.contenidoBase64) as unknown as BlobPart], {
+      const blob = new Blob([base64ABytes(r.contenidoBase64)], {
         type: 'application/octet-stream',
       });
       const url = URL.createObjectURL(blob);

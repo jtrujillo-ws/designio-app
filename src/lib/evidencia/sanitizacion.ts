@@ -406,7 +406,16 @@ export function bytesABase64(bytes: Uint8Array): string {
   return btoa(binario);
 }
 
-export function base64ABytes(base64: string): Uint8Array {
+/**
+ * El tipo de retorno es `Uint8Array<ArrayBuffer>` y no `Uint8Array` a secas por una razón
+ * que cuesta descubrir dos veces: desde TypeScript 5.7 `Uint8Array` es genérico sobre su
+ * buffer y su parámetro por defecto es `ArrayBufferLike`, que incluye `SharedArrayBuffer`.
+ * `BlobPart` exige `ArrayBufferView<ArrayBuffer>`, así que el valor por defecto NO encaja y
+ * `new Blob([bytes])` no compila. Este array lo construye esta misma función con
+ * `new Uint8Array(n)`, o sea que su buffer es un `ArrayBuffer` de verdad: decirlo en el
+ * tipo es más honesto que taparlo con un `as unknown as BlobPart` en cada consumidor.
+ */
+export function base64ABytes(base64: string): Uint8Array<ArrayBuffer> {
   const binario = atob(base64);
   const bytes = new Uint8Array(binario.length);
   for (let i = 0; i < binario.length; i += 1) bytes[i] = binario.charCodeAt(i);

@@ -26,6 +26,7 @@ import {
   validarInsight,
 } from '@/lib/insight/insight.servicio';
 import { aprobarGate, marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
+import { designVersionCompleta } from '@/lib/entrega/entrega.servicio';
 import { rechazarItem } from '@/lib/evidencia/evidencia.servicio';
 import { gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
 import {
@@ -756,8 +757,12 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       insight: 'El canal digital concentra el abandono',
       afirmacion: 'El abandono se concentra en el canal digital',
     });
+    // El mensaje del guard nombra la AFIRMACIÓN exacta desde 20260902340000, cuando las
+    // dos rutas que consumen razonamiento pasaron a compartir la redacción del protocolo.
+    // Se asegura sobre el texto de la afirmación, que es más específico que el genérico
+    // anterior, no menos.
     await expect(aprobarGate(leadId, { workspaceId: ws, gateId })).rejects.toThrow(
-      /cita una decisión cuyo insight de respaldo/,
+      /se apoya en la afirmación «El abandono se concentra en el canal digital»/,
     );
     await expect(
       conUsuario(leadId, (tx) => tx`update gate_instancia
@@ -2252,6 +2257,38 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     }
   });
 
+  it('el protocolo de razonamiento está escrito UNA vez: las dos rutas comparten la redacción', async () => {
+    // La rama de G5 nació copiando del checklist la comprobación que motivó su arreglo y
+    // dejándose las que ya estaban: el estado del insight y el candado sobre las decisiones.
+    // Dos redacciones hermanas del mismo protocolo divergen, y ésta ya lo había hecho. La
+    // salida no fue añadir las que faltaban —eso deja las dos copias— sino compartir la
+    // redacción. Este test es esa propiedad, no una promesa sobre ella: si alguien vuelve a
+    // escribir el protocolo dentro del guard, se pone rojo aquí.
+    const admin = sqlAdmin();
+    const [g] = await admin`select pg_get_functiondef('gate_aprobar_suficiencia_guard'::regproc) as def`;
+    const guard = g!.def as string;
+    const [c] = await admin`select pg_get_functiondef('razonamiento_usable_guard'::regproc) as def`;
+    const compartida = c!.def as string;
+
+    // Las dos rutas —checklist y G5— llaman a la misma función. Ni una más ni una menos:
+    // una tercera llamada sería una ruta nueva que hay que mirar; ninguna, un guard que
+    // volvió a decidir por su cuenta.
+    expect((guard.match(/razonamiento_usable_guard\(/g) ?? []).length).toBe(2);
+
+    // Y el guard ya no recorre ni decide sobre razonamiento: ni sigue `decision_insight`
+    // —el eslabón por el que se llega a los insights de una decisión— ni bloquea decisiones
+    // por su cuenta. Todo eso vive en la compartida.
+    expect(guard).not.toContain('decision_insight');
+    expect(guard).not.toContain('for share of d');
+
+    // La compartida sí trae el protocolo entero: los dos candados y las tres
+    // comprobaciones. Se afirma sobre su texto porque es lo que las dos rutas heredan.
+    expect(compartida).toContain('for share');
+    expect(compartida).toContain("i.estado <> 'validado'");
+    expect(compartida).toContain('evidencia_usable');
+    expect(compartida).toContain('evidencia_motivo_bloqueo');
+  });
+
   it('G5 certifica VIGENCIA, no existencia: no se certifica un diseño cuyo razonamiento perdió los derechos', async () => {
     // Tercera aparición de «existencia en vez de vigencia», y la peor: el artefacto que
     // queda es INMUTABLE y de cara al cliente. Este mismo guard rechaza un ítem de
@@ -2346,6 +2383,32 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       returning id`;
     await admin`insert into elemento_insight (elemento_id, insight_id, workspace_id, creado_por)
       values (${elem!.id as string}, ${ins.insightId}, ${ws}, ${leadId})`;
+
+    // Y un motivo por la OTRA vía —una decisión— trazada a un insight que NO está validado.
+    // Es el enlace heredado que 20260902260000 conserva a propósito: la política cierra la
+    // entrada, pero los que ya existían solo los alcanza la comprobación en el consumo. La
+    // primera versión de la rama de G5 no la traía, porque copió del checklist la
+    // comprobación que motivó el arreglo y no las que ya estaban.
+    const insSinValidar = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: marca + ' insight sin validar del diseno',
+      resumen: 'nunca pasó por la validación',
+    });
+    await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: insSinValidar.insightId,
+      texto: 'Probablemente el rechazo crece con documentos vencidos',
+      esHipotesis: true,
+    });
+    const [dec] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, decidido_por)
+      values (${ws}, ${proyectoId}, ${gateId}, 'diseno', 'Decisión del diseño',
+        'la sostiene el razonamiento enlazado', ${leadId})
+      returning id`;
+    await admin`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${dec!.id as string}, ${insSinValidar.insightId}, ${ws})`;
+    await admin`insert into elemento_decision (elemento_id, decision_id, workspace_id, creado_por)
+      values (${elem!.id as string}, ${dec!.id as string}, ${ws}, ${leadId})`;
     // El snapshot se toma EN LA MISMA transición que la aprobación: el guard de #16 lo
     // exige comparando `xmin` con la transacción actual («aprobar congela el to-be de
     // AHORA»), y tiene razón.
@@ -2371,7 +2434,18 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
           aprobado_en = now() where id = ${gateId}`;
       });
 
-    // Con los derechos vigentes, G5 aprueba: el test no pasa por tener el fixture roto.
+    // PRIMERO el hueco que la copia no traía: aunque los derechos estén vigentes, G5 no
+    // certifica un diseño motivado por una decisión trazada a un insight sin validar.
+    await expect(aprobarG5()).rejects.toThrow(/insight que no está validado/);
+
+    // Se valida ese insight —su única afirmación es hipótesis, así que no necesita citas—
+    // y entonces sí: con los derechos vigentes G5 aprueba. El test no pasa por tener el
+    // fixture roto.
+    await admin.begin(async (tx) => {
+      await tx`select set_config('app.user_id', ${leadId}, true)`;
+      await tx`update insight set estado = 'validado', validado_por = ${leadId},
+        validado_en = now() where id = ${insSinValidar.insightId} and workspace_id = ${ws}`;
+    });
     await aprobarG5();
     const [aprobado] = await admin`select estado from gate_instancia where id = ${gateId}`;
     expect(aprobado!.estado).toBe('aprobado');
@@ -2391,6 +2465,16 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     await expect(aprobarG5()).rejects.toMatchObject({ code: 'DR001' });
     // Y el mensaje nombra la afirmación exacta y la dimensión que falta (SYS-14).
     await expect(aprobarG5()).rejects.toThrow(/La verificación digital concentra el abandono/);
+
+    // Y la PANTALLA mira lo mismo: el selector de motivos de la design version deja de
+    // ofrecer ese insight y dice por qué. Sin esto, la regla nueva dejaría un picker
+    // ofreciendo razonamiento con el que después no se puede certificar — «lo que la base
+    // rechaza, la pantalla no lo ofrece», que es la regla que este PR lleva toda la
+    // revisión aplicando.
+    const proyectada = await designVersionCompleta(leadId, ws, dv!.id as string);
+    const motivo = proyectada!.insightsValidados.find((i) => i.id === ins.insightId);
+    expect(motivo).toBeTruthy();
+    expect(motivo!.sinRespaldo).toBe('La verificación digital concentra el abandono');
     const [sigue] = await admin`select estado from gate_instancia where id = ${gateId}`;
     expect(sigue!.estado).toBe('pendiente');
 
@@ -2417,11 +2501,14 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     await admin.begin(async (tx) => {
       await tx`set local session_replication_role = 'replica'`;
       await tx`delete from elemento_insight where elemento_id = ${elem!.id as string}`;
+      await tx`delete from elemento_decision where elemento_id = ${elem!.id as string}`;
+      await tx`delete from decision_insight where decision_id = ${dec!.id as string}`;
       await tx`delete from elemento_cambio where id = ${elem!.id as string}`;
       await tx`delete from design_version where id = ${dv!.id as string}`;
       await tx`delete from journey_snapshot where id = ${snapId}`;
       await tx`delete from journey where id = ${jr!.id as string}`;
       await tx`delete from checklist_item where gate_id = ${gateId}`;
+      await tx`delete from decision where id = ${dec!.id as string}`;
       await tx`delete from gate_instancia where id = ${gateId}`;
       await tx`delete from etapa_instancia where proyecto_id = ${proyectoId}`;
       await tx`delete from proyecto where id = ${proyectoId}`;

@@ -318,6 +318,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // criterios; sin esta línea la limpieza muere en el `delete from reto`.
       await admin`delete from entrada_kpi where workspace_id = ${wsL}`;
       await admin`delete from metric_registry where workspace_id = ${wsL}`;
+      await admin`delete from derecho_uso where workspace_id = ${wsL}`;
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
       await admin`delete from checklist_item where workspace_id = ${wsL}`;
       await admin`delete from gate_instancia where workspace_id = ${wsL}`;
@@ -378,6 +379,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from consentimiento_item where workspace_id = ${ws}`;
       await admin`delete from item_importacion where workspace_id = ${ws}`;
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
+      // El registro de derechos de SPEC-03 cuelga de la evidencia por FK: sin esta línea la
+      // limpieza muere al borrarla. Va aquí y no antes porque toda evidencia que este
+      // fichero crea nace ya con el suyo, que es justo lo que exige el trigger diferido.
+      await admin`delete from derecho_uso where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
       await admin`delete from checklist_item where workspace_id = ${ws}`;
@@ -480,6 +485,55 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         values (${ws}, 'CI', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":1}'::jsonb,
                 ${MODELO_PRIMARIO}, 'v', 'entorno', ${leadId})`),
     ).rejects.toThrow(/la llamada que la produjo|null value in column "llamada_id"/);
+  });
+
+  it('la evidencia aceptada nace con su registro de derechos, y nace PENDIENTE', async () => {
+    // SPEC-03 exige que toda evidencia tenga su fila en `derecho_uso` al commit, y la
+    // materialización de una propuesta la crea en la MISMA transacción. Sin esto, aceptar
+    // una extracción fallaba siempre: la capacidad entera quedaba inservible.
+    //
+    // Y nace PENDIENTE, igual que en la curaduría a mano. Esa paridad es la regla: aceptar
+    // una propuesta ES la escritura humana, con los MISMOS controles, no un atajo alrededor
+    // de uno que la ruta manual sí impone. Conceder el uso es otro acto, con su base
+    // documental y su responsable — y jamás se deriva de lo que dijera el modelo ni de los
+    // metadatos del item, que sería fabricar consentimiento a partir de un texto.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item con derechos por decidir');
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+    });
+    const { objetoId } = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    try {
+      const [derecho] = await admin`select estado, ambito, base, decidido_por, decidido_en,
+                                           creado_por
+        from derecho_uso where evidencia_id = ${objetoId} and workspace_id = ${ws}`;
+      expect(derecho).toBeDefined();
+      expect(derecho!.estado).toBe('pendiente');
+      expect(derecho!.ambito).toBe('interno');
+      expect(derecho!.base).toBe('');
+      expect(derecho!.decidido_por).toBe(null);
+      expect(derecho!.decidido_en).toBe(null);
+      // Lo firma quien aceptó, que es quien acaba de curar.
+      expect(derecho!.creado_por).toBe(leadId);
+      // Y la consecuencia que importa: la evidencia existe pero todavía NO se puede usar
+      // hacia el cliente. Fail-closed, exactamente igual que si la hubiera curado a mano.
+      const [usable] = await admin`select
+        evidencia_usable(${objetoId as string}, ${ws}, 'cliente') as ok`;
+      expect(usable!.ok).toBe(false);
+    } finally {
+      // Este test comparte workspace, y el siguiente comprueba que empieza SIN evidencias:
+      // lo que se materializa aquí se retira aquí.
+      const [ev] = await admin`select fuente_id from evidencia where id = ${objetoId}`;
+      await admin`update evidencia set propuesta_ai_id = null where id = ${objetoId}`;
+      await admin`delete from propuesta_ai where id = ${propuestaId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+      await admin`delete from derecho_uso where evidencia_id = ${objetoId}`;
+      await admin`delete from evidencia where id = ${objetoId}`;
+      await admin`delete from fuente where id = ${ev!.fuente_id as string}`;
+    }
   });
 
   it('aceptar materializa la evidencia firmada por el humano y sella el item (SYS-16/SYS-19)', async () => {
@@ -781,6 +835,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
           values (${ws}, ${f!.id as string}, 'Evidencia suelta', '', '{}'::jsonb, ${leadId})
           returning id`;
+        // Toda evidencia nace con su registro de derechos (SPEC-03, trigger diferido). El
+        // fixture lo pone para que la evidencia sea VÁLIDA y lo que rechace la transacción
+        // sea la regla que este test mide, no la de otro slice.
+        await tx`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+          values (${ws}, ${e!.id as string}, ${leadId})`;
         await tx`update propuesta_ai
           set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${e!.id as string}
           where id = ${propuestaId}`;
@@ -1685,6 +1744,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
         values (${ws}, ${f!.id as string}, 'Evidencia a mano', 'La escribió una persona',
                 '{}'::jsonb, ${leadId}) returning id`;
+      // Toda evidencia nace con su registro de derechos (SPEC-03, trigger diferido). El
+      // fixture lo pone para que la evidencia sea VÁLIDA y lo que rechace la transacción
+      // sea la regla que este test mide, no la de otro slice.
+      await tx`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+        values (${ws}, ${e!.id as string}, ${leadId})`;
       await tx`update item_importacion
         set estado = 'aprobado', decidido_por = ${leadId}, decidido_en = now(),
             evidencia_id = ${e!.id as string}
@@ -1809,6 +1873,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
           values (${ws}, ${f!.id as string}, 'Evidencia', '', '{}'::jsonb, ${leadId})
           returning id`;
+        // Toda evidencia nace con su registro de derechos (SPEC-03, trigger diferido). El
+        // fixture lo pone para que la evidencia sea VÁLIDA y lo que rechace la transacción
+        // sea la regla que este test mide, no la de otro slice.
+        await tx`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+          values (${ws}, ${e!.id as string}, ${leadId})`;
         await tx`update item_importacion
           set estado = 'aprobado', decidido_por = ${leadId}, decidido_en = now(),
               evidencia_id = ${e!.id as string}
@@ -2786,6 +2855,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                   })},
                   true, ${leadId}) returning id`;
         const evidenciaId = e!.id as string;
+        // Toda evidencia nace con su registro de derechos (SPEC-03, trigger diferido). El
+        // fixture lo pone para que la evidencia sea VÁLIDA y lo que rechace la transacción
+        // sea la regla que este test mide, no la de otro slice.
+        await tx`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+          values (${ws}, ${evidenciaId}, ${leadId})`;
         await tx`update item_importacion
           set estado = 'aprobado', decidido_por = ${leadId}, decidido_en = now(),
               evidencia_id = ${evidenciaId}
@@ -2818,6 +2892,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                   })},
                   ${CONTENIDO_CI.esEstadoActual}, ${leadId}) returning id`;
         const evidenciaId = e!.id as string;
+        // Toda evidencia nace con su registro de derechos (SPEC-03, trigger diferido). El
+        // fixture lo pone para que la evidencia sea VÁLIDA y lo que rechace la transacción
+        // sea la regla que este test mide, no la de otro slice.
+        await tx`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+          values (${ws}, ${evidenciaId}, ${leadId})`;
         await tx`update item_importacion
           set estado = 'aprobado', decidido_por = ${leadId}, decidido_en = now(),
               evidencia_id = ${evidenciaId}

@@ -486,10 +486,16 @@ function FormularioGeneracion({
   // item importado es inmutable) — el camino es la bandeja.
   const sinMaterial = Boolean(elegida?.sinMaterial);
 
-  // El ancla elegida dejó de estar entre las opciones: pasa al buscar algo que la excluye
-  // (la búsqueda viaja al servidor y devuelve otra lista) y también al cambiar de workspace,
-  // porque la ruta no se desmonta — solo cambian sus `loaderDeps`. El id guardado sobrevive
-  // a la lista a la que pertenecía y el `select` se ve en blanco.
+  // El ancla elegida dejó de estar entre las opciones: pasa al BUSCAR algo que la excluye —la
+  // búsqueda viaja al servidor y devuelve otra lista—, así que el id guardado sobrevive a la
+  // lista a la que pertenecía y el `select` se ve en blanco.
+  //
+  // NO pasa al cambiar de workspace, aunque este comentario lo dijera: `_autenticada.tsx`
+  // remonta el `Outlet` con `key={membresiaActiva?.workspaceId}` y este `useState` vuelve a
+  // nacer vacío. Era la segunda redacción de la misma afirmación equivocada —la otra vivía
+  // en los mensajes, arriba— y las dos prometían un modelo de router que no es el que hay.
+  // La guarda se queda porque el caso de la búsqueda es real; lo que se va es el motivo
+  // falso, que es lo que habría llevado a alguien a invalidar `anclaId` a mano.
   const anclaPerdida = anclaId !== '' && !elegida;
 
   async function onSubmit(e: FormEvent) {

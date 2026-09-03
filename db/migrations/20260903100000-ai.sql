@@ -429,6 +429,16 @@ create table llamada_ai (
   -- el modelo no tiene tarifa registrada — «no se sabe» no es «salió gratis».
   costo_usd numeric(12, 6) check (costo_usd is null or costo_usd >= 0),
   latencia_ms integer check (latencia_ms is null or latencia_ms >= 0),
+  -- QUÉ AUTORIZACIÓN dejó salir este material, leída bajo el candado por item en la misma
+  -- transacción que aprobó el despacho. No es decoración: la llamada al proveedor ocurre
+  -- FUERA de toda transacción a propósito, así que una revocación que commitee mientras los
+  -- bytes viajan no puede detenerla — eso no lo cierra ningún candado. Lo que sí se puede es
+  -- que el sistema SEPA qué salió y bajo qué permiso, que es lo que RF-09.4 necesita para
+  -- remediar: con esto, «esto salió amparado por el registro nº N» es un hecho consultable, y
+  -- una revocación posterior (nº N+1) se cruza contra el libro para saber exactamente qué
+  -- material hay que ir a buscar. null cuando el material no es de personas y no había
+  -- consentimiento que citar.
+  consentimiento_version integer check (consentimiento_version is null or consentimiento_version > 0),
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),

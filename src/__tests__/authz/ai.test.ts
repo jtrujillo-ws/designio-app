@@ -1151,11 +1151,21 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(reservas.length).toBe(0);
     // Y la llamada, que se pagó, queda anotada: el gasto no depende de que el resultado
     // llegue a usarse.
-    const llamadas = await conUsuario(leadId, (tx) => tx`select resultado, costo_usd
+    const llamadas = await conUsuario(leadId, (tx) => tx`select resultado, costo_usd,
+        consentimiento_version
       from llamada_ai where workspace_id = ${ws} and item_id = ${itemId}`);
     expect(llamadas.length).toBe(1);
     expect(llamadas[0]!.resultado).toBe('salida-valida');
     expect(Number(llamadas[0]!.costo_usd)).toBeGreaterThan(0);
+    // Y anotada CON EL PERMISO que la amparó, que es lo único accionable que queda cuando
+    // el material ya salió: la salida viajó bajo el registro nº1 y la revocación es el nº2,
+    // así que «qué se envió amparado por un permiso que después se retiró» se responde
+    // cruzando el libro con la bitácora (RF-09.4) en vez de reconstruirlo por fechas —que
+    // con dos registros del mismo segundo no distingue nada—.
+    expect(llamadas[0]!.consentimiento_version).toBe(1);
+    const [ultimo] = await conUsuario(leadId, (tx) => tx`select version from consentimiento_item
+      where workspace_id = ${ws} and item_id = ${itemId} order by version desc limit 1`);
+    expect(ultimo!.version).toBe(2);
 
     // Y pedirla de nuevo se corta antes de construir el prompt: el vigente sigue siendo el
     // que revoca.

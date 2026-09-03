@@ -434,8 +434,35 @@ end $$;
 
 -- ── Los diseños que ya certificaron sobre razonamiento muerto quedan NOMBRADOS ──
 -- No se revierte ningún gate: aprobar es un juicio humano y este dominio no lo reescribe.
--- Y no se quedan sin salida — reconceder los derechos revive el razonamiento entero—, pero
+-- Y no se quedan sin salida —reconceder los derechos revive el razonamiento entero— pero
 -- el operador tiene que poder enterarse sin esperar a que algo se rompa.
+--
+-- El censo recorre LAS DOS VÍAS que recorre el guard de arriba. La primera versión de este
+-- bloque unía solo por `elemento_insight`: un G5 heredado cuyo elemento se motiva por
+-- DECISIÓN quedaba sin nombrar, aunque el guard nuevo rechace ese mismo diseño en runtime.
+-- Medido sobre una base con ese caso exacto —un G5 aprobado, su elemento motivado por
+-- decisión, y el insight trazado con las citas sin derechos—: el censo viejo escribía 0
+-- eventos y el nuevo escribe 1. Un nombramiento a medias es peor que ninguno aquí, porque
+-- este bloque corre UNA vez: lo que no se nombre ahora no se reconstruye después.
+--
+-- Lo que el censo comprueba es lo que ESTA migración añade: que toda afirmación
+-- no-hipótesis del razonamiento certificado conserve una cita con derechos vigentes. Las
+-- otras dos comprobaciones del protocolo llegan a la ruta de G5 en 20260902340000, y su
+-- censo le corresponde a esa migración, no a ésta.
+--
+-- Y no llama a `razonamiento_sin_respaldo`, aunque el predicado esté factorizado, por una
+-- razón concreta que conviene dejar escrita en vez de implícita: esa función usa
+-- `evidencia_usable`, que lleva delante la puerta `is_workspace_member(app_user_id(), …)`.
+-- Aquí corre `db/migrate.ts` con la conexión administrativa y sin `app.user_id`, así que la
+-- puerta sería falsa siempre y el censo marcaría TODOS los G5 como rotos — exactamente el
+-- defecto que hubo que arreglar en el backfill de `310000`. Medido sobre un diseño SANO
+-- —derechos concedidos y vigentes de cara al cliente—: llamada como propietario y sin
+-- `app.user_id`, la función responde «se apoya en la afirmación «…», que ya no tiene
+-- ninguna cita con derechos vigentes»; con un miembro declarado responde null. Por eso el
+-- recorrido se escribe aquí y el predicado de derechos se toma de `derechos_vigentes`, que
+-- es la misma regla sin la puerta. El recorrido sí es el del guard, línea por línea.
+
+-- Por las dos vías: `elemento_insight` y `elemento_decision → decision_insight`.
 insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
 select distinct g.workspace_id, 'G5CertificadoSinRespaldoUsable',
        jsonb_build_object('gateId', g.id, 'proyectoId', g.proyecto_id,
@@ -445,12 +472,17 @@ from gate_instancia g
 join elemento_cambio ec on ec.workspace_id = g.workspace_id
   and ec.design_version_id in (
     select design_versions_a_cargo_del_proyecto(g.proyecto_id, g.workspace_id))
-join elemento_insight ei on ei.elemento_id = ec.id and ei.workspace_id = ec.workspace_id
-join afirmacion a on a.insight_id = ei.insight_id and a.workspace_id = ei.workspace_id
+join afirmacion a on a.workspace_id = g.workspace_id
+  and a.insight_id in (
+    select ei.insight_id from elemento_insight ei
+      where ei.elemento_id = ec.id and ei.workspace_id = ec.workspace_id
+    union
+    select di.insight_id from elemento_decision ed
+      join decision_insight di on di.decision_id = ed.decision_id
+        and di.workspace_id = ed.workspace_id
+      where ed.elemento_id = ec.id and ed.workspace_id = ec.workspace_id)
 where g.numero = 5 and g.estado = 'aprobado'
   and not a.es_hipotesis
-  -- Igual que en 310000: esto corre como propietario y `evidencia_usable` lleva delante la
-  -- puerta de membresía, que sin `app.user_id` es siempre falsa.
   and not exists (select 1 from cita c
     where c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
       and derechos_vigentes(c.evidencia_id, c.workspace_id, 'cliente'));

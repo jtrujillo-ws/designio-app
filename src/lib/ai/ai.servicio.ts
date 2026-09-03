@@ -1572,6 +1572,26 @@ async function materializarEvidencia(
     returning id`;
   const evidenciaId = evidencia!.id as string;
 
+  // Toda evidencia nace CON su registro de derechos, en la MISMA transacción: es lo que
+  // exige el constraint trigger diferido de SPEC-03, y sin esta línea aceptar una propuesta
+  // de extracción fallaba SIEMPRE al commit — la capacidad entera quedaba inservible.
+  //
+  // Nacen PENDIENTES, exactamente como en la curaduría a mano, y esa paridad es el punto.
+  // La tentación es la contraria: quien acepta ya está firmando, así que «que declare los
+  // derechos de paso». Pero conceder el uso es OTRO acto, con su propia base documental y su
+  // propio responsable —lo dice el mismo comentario que gobierna `aprobarItem`—, y hacer que
+  // el camino AI lo resuelva de un plumazo convertiría la aceptación de una propuesta en un
+  // atajo alrededor de un control que la ruta manual sí impone. La tesis de este slice es
+  // justo la contraria: aceptar una propuesta ES la escritura humana, con las MISMAS reglas.
+  //
+  // Y menos aún se puede derivar «concedido» de lo que dijera el modelo o de los metadatos
+  // del item: eso sería fabricar consentimiento a partir de un texto, que es la clase de
+  // falsificación que este slice existe para impedir. El `derechos.consentimiento` de las
+  // dimensiones es la FOTO de lo que constaba al curar; el permiso de uso es esta tabla, y
+  // la escribe una persona.
+  await tx`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+    values (${workspaceId}, ${evidenciaId}, ${actorId})`;
+
   const selladas = await tx`update item_importacion
     set estado = 'aprobado', decidido_por = ${actorId}, decidido_en = now(),
         evidencia_id = ${evidenciaId}

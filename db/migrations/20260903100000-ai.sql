@@ -181,22 +181,32 @@ returns boolean language sql stable as $$
 $$;
 
 /*
- * ¿Los criterios de este reto están congelados? Un G0 aprobado certificó exactamente esos
- * criterios (SYS-22) y los cierra… salvo que la etapa 0 esté REABIERTA, que es el cambio
- * para el que existe la reapertura (RF-04.9) y que no desaprueba el gate (SYS-10).
+ * ¿Los criterios de este reto están congelados? A día de hoy por DOS causas distintas, y por
+ * eso son tres funciones y no una: el predicado compuesto es lo que las políticas y las
+ * lecturas necesitan («¿puedo escribir criterios?», una sola respuesta), pero cada causa se
+ * explica distinto, caduca por un camino distinto y merece su propio mensaje. Fundirlas
+ * daría un único `raise` que mentiría en la mitad de los casos, que es justo lo que este
+ * bloque vino a evitar.
  *
- * El predicado pasa a vivir en UNA función porque ya se le vio la costura: nació en las
+ *  · **G0 aprobado** (SPEC-04, SYS-22): el gate certificó EXACTAMENTE esos criterios… salvo
+ *    que la etapa 0 esté REABIERTA, que es el cambio para el que existe la reapertura
+ *    (RF-04.9) y que no desaprueba el gate (SYS-10). Se descongela reabriendo la etapa.
+ *  · **Registry firmado** (SPEC-07, SYS-22): los criterios de medición son el contrato
+ *    acordado y la firma es de ida. No se descongela: no hay reapertura que valga.
+ *
+ * El predicado pasa a vivir en funciones porque ya se le vio la costura: nació en las
  * políticas de `criterio_exito` (SPEC-04), la reapertura le añadió la excepción de la etapa
- * en SPEC-03/04 tocando política y guard… y las lecturas del pipeline AI —qué retos se
- * ofrecen como ancla, qué propuestas siguen siendo aceptables— se quedaron con la versión
- * vieja. El resultado eran errores en las dos direcciones: se ofrecía generar sobre retos
- * ya congelados y se ESCONDÍA la generación en retos legítimamente reabiertos.
+ * en SPEC-03/04 tocando política y guard, SPEC-07 le añadió el registry tocando otra vez
+ * los dos… y las lecturas del pipeline AI —qué retos se ofrecen como ancla, qué propuestas
+ * siguen siendo aceptables— se quedaron con la versión vieja. El resultado eran errores en
+ * las dos direcciones: se ofrecía generar sobre retos ya congelados y se ESCONDÍA la
+ * generación en retos legítimamente reabiertos.
  *
- * Con la función, la política y el guard siguen siendo quienes lo IMPONEN y las lecturas
+ * Con las funciones, la política y el guard siguen siendo quienes lo IMPONEN y las lecturas
  * anticipan exactamente lo mismo: un panel que ofrece un botón que la base va a rechazar es
  * tan malo como uno que esconde una acción permitida.
  */
-create function reto_criterios_congelados(p_reto_id uuid, p_workspace_id uuid)
+create function reto_g0_congela_criterios(p_reto_id uuid, p_workspace_id uuid)
 returns boolean language sql stable as $$
   select exists (
     select 1 from gate_instancia g
@@ -206,6 +216,23 @@ returns boolean language sql stable as $$
     where p.reto_id = p_reto_id and p.workspace_id = p_workspace_id
       and g.numero = 0 and g.estado = 'aprobado'
       and e.estado <> 'en-curso')
+$$;
+
+create function reto_registry_firmado(p_reto_id uuid, p_workspace_id uuid)
+returns boolean language sql stable as $$
+  select exists (
+    select 1 from metric_registry r
+    where r.reto_id = p_reto_id and r.workspace_id = p_workspace_id
+      and r.estado = 'firmado')
+$$;
+
+-- La unión, que es lo que responde «¿se pueden escribir criterios en este reto?». La llaman
+-- las dos políticas de `criterio_exito`, los dos guards de `propuesta_ai` y las lecturas del
+-- panel; quien necesite además saber POR QUÉ no, pregunta por la causa concreta.
+create function reto_criterios_congelados(p_reto_id uuid, p_workspace_id uuid)
+returns boolean language sql stable as $$
+  select reto_g0_congela_criterios(p_reto_id, p_workspace_id)
+      or reto_registry_firmado(p_reto_id, p_workspace_id)
 $$;
 
 -- Y su HERMANO, que responde otra pregunta sobre el mismo reto: si su ciclo de vida sigue
@@ -228,46 +255,47 @@ returns boolean language sql stable as $$
       and r.estado in ('candidato', 'activo'))
 $$;
 
--- Y quienes lo imponen pasan a llamarla, para que no queden dos definiciones que puedan
+-- Y quienes lo imponen pasan a llamarlas, para que no queden dos definiciones que puedan
 -- volver a separarse. El resto del guard no cambia: el candado por G0 en orden estable
 -- (dos guards concurrentes no se cruzan) y el evento de la transición siguen igual.
 --
--- ⚠ CUIDADO AL INTEGRAR: lo que sigue REEMPLAZA un cuerpo vivo definido en una migración
--- anterior, y lo mismo hacen los dos `drop policy` de más abajo. En base limpia gana la
--- migración de número más alto, así que si otra rama añade una regla a este guard o a esas
--- políticas en una migración ANTERIOR a `130000`, esta la borra en silencio — no habrá
--- conflicto de merge que avise, porque los ficheros son distintos.
+-- ⚠ CUIDADO AL INTEGRAR: lo que sigue REEMPLAZA un cuerpo vivo definido en migraciones
+-- anteriores, y lo mismo hacen los dos `drop policy` de más abajo. En base limpia gana la
+-- migración de número más alto —esta—, así que si otra rama añade una regla a este guard o
+-- a esas políticas en una migración ANTERIOR, esta la borra en silencio: no habrá conflicto
+-- de merge que avise, porque los ficheros son distintos.
 --
--- La regla al integrar es una y va en este orden: coge el cuerpo VIVO entero de la
--- migración más reciente que lo defina y vuelve a aplicarle encima este refactor (la
--- llamada a `reto_criterios_congelados`). Nunca al revés — no partas de esta versión
--- añadiéndole de memoria la regla que recuerdes, porque para entonces puede haber más de
--- una. Y si la regla nueva es otra condición de congelado, va DENTRO de
--- `reto_criterios_congelados`: la llaman también las dos políticas de `criterio_exito`, los
--- dos guards de `propuesta_ai` y las lecturas del panel, así que meterla solo aquí volvería
--- a partir el predicado en dos (que es el fallo que este refactor vino a cerrar). Si en
--- cambio es sobre el ESTADO del reto, su sitio es `reto_admite_criterios`, que es función
--- nueva de esta migración: no la reemplaza nadie, así que ahí no hay nada que rescatar.
+-- Ya pasó una vez y así se hizo, que es la receta: SPEC-07 (`…110000-medicion.sql`) le había
+-- añadido al guard la regla del registry firmado y un payload de evento con las ocho
+-- columnas editables del criterio más su `antes`. Al reordenar esta migración por detrás de
+-- aquella, se cogió el cuerpo VIVO ENTERO de `…110000` y se le volvió a aplicar encima este
+-- refactor. Nunca al revés — no partas de esta versión añadiéndole de memoria la regla que
+-- recuerdes, porque para entonces puede haber más de una; verifica con un bucle sobre TODOS
+-- los ficheros de `db/migrations/` cuáles definen el guard, no mirando el que esperas.
 --
--- Y meterla en el helper NO exime de dejar su comprobación propia aquí, DELANTE de la
--- genérica: el helper solo sabe responder «sí, congelados», así que el
--- `raise exception 'el G0 del reto está aprobado'` de abajo sería FALSO cuando la causa es
--- otra (el G0 puede estar sin aprobar y los criterios congelados igualmente). Causas
--- distintas, mensajes distintos; el genérico se queda para su propia causa. La
--- comprobación va SIEMPRE después del `perform … for update of g`: ese candado es lo que
--- serializa la decisión ajena contra la edición de criterios, y decidir antes de bloquear
--- deja exactamente el hueco que el candado existe para cerrar.
+-- Y si la regla nueva es otra condición de congelado, va DENTRO de las funciones de arriba:
+-- las llaman también las dos políticas de `criterio_exito`, los dos guards de `propuesta_ai`
+-- y las lecturas del panel, así que meterla solo aquí volvería a partir el predicado en dos
+-- (que es el fallo que este refactor vino a cerrar). Si en cambio es sobre el ESTADO del
+-- reto, su sitio es `reto_admite_criterios`.
 --
--- ⚠ Y la consecuencia que se escapa fácil, porque cae FUERA de este fichero: al ampliar el
--- helper, cuatro mensajes de cara al usuario que hoy nombran el G0 pasan a mentir en la
--- causa nueva. Son el `raise` del guard de INSERT de `propuesta_ai` (abajo), los dos
--- `ErrorAI` de `ai.servicio.ts` (admisión y última lectura antes de despachar) y el copy de
--- `MOTIVO_ANCLA['criterios-congelados']` en `propuestas.tsx`. Ese último es además un
--- `anclaEstado`, y la doctrina del panel es un motivo por causa CON SU SALIDA: reabrir la
--- etapa 0 (RF-04.9) descongela el caso del G0 y no descongelaría el otro, así que lo que
--- corresponde es un valor NUEVO en `ESTADOS_ANCLA`, no reescribir el copy del que ya hay
--- para que valga para dos cosas. Mismo razonamiento por el que `reto-no-admite` no se fundió
--- con `criterios-congelados`.
+-- Meterla en el compuesto NO exime de darle su propia función-causa y su propio `raise`
+-- aquí: `reto_criterios_congelados` solo sabe responder «sí, congelados», así que un único
+-- mensaje sería FALSO en cuanto las causas son dos. Por eso hay `reto_g0_congela_criterios`
+-- y `reto_registry_firmado` por separado. Causas distintas, mensajes distintos.
+--
+-- ⚠ Y la consecuencia que se escapa fácil, porque cae FUERA de este fichero: al añadir una
+-- causa, los mensajes de cara al usuario que nombran las anteriores pasan a mentir. Cuando
+-- entró la del registry hubo que tocar cinco sitios, y son los mismos que habrá que tocar la
+-- próxima vez: el `raise` del guard de INSERT de `propuesta_ai` (abajo), los dos `ErrorAI`
+-- de `ai.servicio.ts` (admisión y última lectura antes de despachar), el `case` que deriva
+-- `anclaEstado` en el panel y el copy de `MOTIVO_ANCLA` en `propuestas.tsx`. Los dos últimos
+-- son además un `anclaEstado`, y la doctrina del panel es un motivo por causa CON SU SALIDA:
+-- reabrir la etapa 0 (RF-04.9) descongela el caso del G0 y no descongela el del registry
+-- (la firma es de ida), así que lo que corresponde es un valor NUEVO en `ESTADOS_ANCLA`
+-- —`registry-firmado`, que es como se resolvió— y no reescribir el copy del que ya hay para
+-- que valga para dos cosas. Mismo razonamiento por el que `reto-no-admite` no se fundió con
+-- `criterios-congelados`.
 create or replace function criterio_g0_pendiente_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -278,13 +306,33 @@ begin
     join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
     where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id and g.numero = 0
     order by g.id for update of g;
-  if reto_criterios_congelados(new.reto_id, new.workspace_id) then
+  -- CADA causa con su mensaje, y el orden es el que más ayuda a quien lo lee: la firma del
+  -- registry no tiene vuelta atrás, así que se nombra primero. Decirle «reabre la etapa 0»
+  -- a quien tiene el contrato firmado sería mandarlo a un trámite que no desbloquea nada.
+  -- Los dos van SIEMPRE después del `perform … for update`: esos candados son lo que
+  -- serializa la decisión ajena contra la edición de criterios, y decidir antes de bloquear
+  -- deja exactamente el hueco que el candado existe para cerrar.
+  if reto_registry_firmado(new.reto_id, new.workspace_id) then
+    raise exception 'el registry del reto está firmado: los criterios de medición son el contrato acordado (SYS-22)';
+  end if;
+  if reto_g0_congela_criterios(new.reto_id, new.workspace_id) then
     raise exception 'el G0 del reto está aprobado: criterios congelados';
   end if;
+  -- El criterio se edita ENTERO mientras el G0 sigue pendiente y el registry sin firmar, y
+  -- el evento llevaba solo el `kpi` de sus OCHO columnas editables. Dos de las que faltaban
+  -- son las que gobiernan toda la medición de SPEC-07: `objetivo` es la promesa contra
+  -- la que se dicta el veredicto y `ventana_dias` es la ventana que decide qué snapshots se
+  -- aceptan —el registry no la copia a propósito, así que la ÚNICA copia es esta fila—.
+  -- Cambiarlas dejaba un `CriterioEditado` indistinguible de renombrar el KPI, y sin
+  -- `antes` no había forma de saber contra qué se había prometido medir antes del cambio.
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (new.workspace_id,
       case tg_op when 'INSERT' then 'CriterioDefinido' else 'CriterioEditado' end,
-      jsonb_build_object('criterioId', new.id, 'retoId', new.reto_id, 'kpi', new.kpi),
+      jsonb_build_object('criterioId', new.id, 'retoId', new.reto_id)
+        || criterio_exito_contenido(to_jsonb(new))
+        || case when tg_op = 'UPDATE'
+             then jsonb_build_object('antes', criterio_exito_contenido(to_jsonb(old)))
+             else '{}'::jsonb end,
       app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   return new;
 end $$;
@@ -502,6 +550,28 @@ create table propuesta_ai (
   check (estado <> 'aceptada' or contenido = contenido_original)
 );
 
+-- ── El asiento que llevaba reservado desde SPEC-02 ──
+-- `reto_servicio_afectado.propuesta_ai_id` nació en `…050000-arbol.sql` como columna suelta:
+-- anulable, sin FK y sin nada que la validara, esperando a que existiera la tabla. Ese día
+-- es hoy, y sin esta línea se quedaba apuntando al vacío para siempre — y no en teoría: el
+-- grant de INSERT de `…070000-metodo.sql` no lleva lista de columnas, así que la aplicación
+-- YA podía escribir ahí cualquier uuid, incluido el de una propuesta de OTRO workspace.
+--
+-- Compuesta con `workspace_id` como el resto del esquema, que es lo que hace imposible el
+-- cruce de tenants (una FK simple a `id` lo habría dejado abierto). Y con la semántica que
+-- el asiento necesita: MATCH SIMPLE —el default— no comprueba nada mientras la columna
+-- anulable sea NULL, así que «sin propuesta detrás» sigue siendo el caso normal y solo se
+-- valida cuando alguien la rellena.
+--
+-- Lo que esto NO promete, dicho para que nadie lo lea de más: que la propuesta apuntada
+-- esté ACEPTADA. Hoy ninguna capacidad materializa un afectado —el destino ni siquiera
+-- existe en el CHECK de `destino`—, así que no hay ruta que llenar ni guard que escribir; el
+-- día que se implemente, esa regla es suya y va donde van las demás, en el guard diferido de
+-- materialización.
+alter table reto_servicio_afectado
+  add constraint reto_servicio_afectado_propuesta_ai_fkey
+  foreign key (propuesta_ai_id, workspace_id) references propuesta_ai (id, workspace_id);
+
 create index propuesta_ai_ws_idx on propuesta_ai (workspace_id, estado, creado_en);
 -- Un item tiene COMO MUCHO una propuesta pendiente, y el índice lo impone además de
 -- servir la consulta («este item ya tiene propuesta pendiente» sin recorrer el
@@ -629,7 +699,7 @@ begin
       reto_criterios_congelados(new.reto_id, new.workspace_id)
       or not reto_admite_criterios(new.reto_id, new.workspace_id)
     ) then
-      raise exception 'ese reto ya no admite criterios nuevos: o su G0 los congeló, o el reto avanzó más allá de candidato/activo';
+      raise exception 'ese reto ya no admite criterios nuevos: o su G0 los congeló, o su registry de medición está firmado, o el reto avanzó más allá de candidato/activo';
     end if;
 
     -- La llamada referenciada tiene que ser LA QUE PRODUJO esta propuesta, no una

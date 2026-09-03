@@ -252,6 +252,10 @@ export const VersionAprobadaInputSchema = z.object({
   servicioId: z.string().uuid(),
 });
 
+export const ProyectosCertificadosInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+});
+
 // ── Proyecciones de lectura ──
 
 export type ElementoDeCambio = {

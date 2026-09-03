@@ -561,8 +561,15 @@ create trigger elemento_cambio_nodo
 revoke execute on function elemento_cambio_nodo_guard() from public;
 
 -- Lo que MOTIVA un elemento tiene que ser citable de verdad: misma doctrina que
--- checklist_objeto_citable_guard (la decisión, del proyecto de la DV; el insight,
--- validado). El picker filtra las dos cosas; el endpoint acepta cualquier uuid.
+-- checklist_objeto_citable_guard (la decisión, del proyecto de la DV y VIGENTE; el
+-- insight, validado). El picker filtra las dos cosas; el endpoint acepta cualquier uuid.
+--
+-- `vigente` es la mitad barata de la regla y NO es la que cierra el agujero: una decisión
+-- se cita estando vigente y una reapertura aguas arriba la pasa a 'en-revision' DESPUÉS
+-- (RF-04.9), sin que este guard vuelva a mirarla nunca. Lo que sostiene la cadena
+-- «decisión aprobada → design version» es la revalidación al APROBAR, en
+-- design_version_transicion_guard. Aquí solo se impide nacer torcido — que es lo que hace
+-- que el picker y el endpoint digan lo mismo, igual que en la rama del insight.
 create function elemento_motivo_citable_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -575,8 +582,8 @@ begin
       join elemento_cambio ec on ec.id = new.elemento_id and ec.workspace_id = new.workspace_id
       join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
       where d.id = new.decision_id and d.workspace_id = new.workspace_id
-        and d.proyecto_id = dv.proyecto_id) then
-      raise exception 'la decisión citada no existe en el proyecto de esta design version';
+        and d.proyecto_id = dv.proyecto_id and d.estado = 'vigente') then
+      raise exception 'la decisión citada no existe en el proyecto de esta design version, o ya no está vigente';
     end if;
   else
     if not exists (select 1 from insight i
@@ -632,6 +639,26 @@ returns boolean language sql stable as $$
 $$;
 revoke execute on function reto_aplica_a_servicio(uuid, uuid, uuid) from public;
 
+-- ¿Este proyecto ya CERTIFICÓ un resultado que depende de sus design versions aprobadas?
+-- Devuelve el número del gate más bajo que lo hizo, o null.
+--
+-- Solo G6 y G7, y no es una lista arbitraria: son los dos únicos gates cuyo predicado
+-- cuantifica sobre «las design versions APROBADAS de este proyecto» — G6 firma que cada
+-- elemento de ellas tiene release (RF-06.4) y G7 que ninguno queda en estado desconocido
+-- (RF-06.7). G5 aprueba el diseño pero no afirma nada sobre releases ni constataciones,
+-- así que una versión nueva no lo vuelve falso.
+--
+-- Es un CONJUNTO QUE SE MUEVE, y ahí está el problema que esto sirve: aprobar una sucesora
+-- saca de él a la superada y mete a la nueva, con sus elementos sin planificar y sin
+-- constatar. La afirmación del gate se vuelve falsa sin que nadie toque el gate.
+create function gate_certificado_del_proyecto(p_proyecto uuid, p_workspace uuid)
+returns int language sql stable as $$
+  select min(g.numero) from gate_instancia g
+  where g.proyecto_id = p_proyecto and g.workspace_id = p_workspace
+    and g.numero in (6, 7) and g.estado = 'aprobado'
+$$;
+revoke execute on function gate_certificado_del_proyecto(uuid, uuid) from public;
+
 -- El proyecto que produce la design version y el servicio que cambia tienen que
 -- pertenecer al mismo reto. Ninguna FK lo dice: design_version referencia proyecto y
 -- servicio por separado, y los dos existen en el workspace.
@@ -654,6 +681,8 @@ revoke execute on function reto_aplica_a_servicio(uuid, uuid, uuid) from public;
 -- enlazar: la comprobación se adelanta al nacimiento, que es cuando aún hay salida.
 create function design_version_anclaje_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_gate int;
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
@@ -672,6 +701,18 @@ begin
       where p.id = new.proyecto_id and p.workspace_id = new.workspace_id
         and reto_aplica_a_servicio(p.reto_id, p.workspace_id, new.servicio_id)) then
       raise exception 'el proyecto de la design version cuelga de un reto que no ancla este servicio ni lo declara afectado';
+    end if;
+    -- Y que el proyecto no haya certificado ya lo que esta versión volvería falso. La
+    -- regla vive en la APROBACIÓN (ver design_version_transicion_guard, que es donde el
+    -- conjunto del gate se mueve de verdad); esto es la mitad que se adelanta al
+    -- nacimiento, exactamente por el mismo motivo que las dos comprobaciones de arriba:
+    -- descubrirlo al aprobar dejaría un borrador que no se puede aprobar —la regla—, ni
+    -- borrar —no hay DELETE sobre design_version—, ni mudar de proyecto —`proyecto_id` no
+    -- está en el grant de columna—. Aquí todavía hay salida y es barata: elegir el
+    -- proyecto del ciclo siguiente.
+    v_gate := gate_certificado_del_proyecto(new.proyecto_id, new.workspace_id);
+    if v_gate is not null then
+      raise exception 'el proyecto ya certificó G%: la design version siguiente va en el proyecto del ciclo siguiente', v_gate;
     end if;
   end if;
   if new.supera_a is not null and not exists (
@@ -784,6 +825,8 @@ revoke execute on function design_version_alta_auditoria() from public;
 -- crudo los produzca igual: sello temporal, exigencias de aprobación y evento.
 create function design_version_transicion_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_gate int;
 begin
   if new.estado = old.estado then
     -- SYS-05 donde no llegan las políticas: una design version que ya no está en borrador
@@ -845,11 +888,62 @@ begin
         and j.proyecto_id is not null and j.proyecto_id <> new.proyecto_id) then
       raise exception 'el journey to-be está anclado a otro proyecto';
     end if;
+    -- Y que el proyecto no haya CERTIFICADO ya lo que esta aprobación vuelve falso. G6 y
+    -- G7 no afirman algo sobre una design version concreta: afirman algo sobre «las
+    -- aprobadas de este proyecto» —cada elemento con release (RF-06.4), ninguno en estado
+    -- desconocido (RF-06.7)—, y esta transición MUEVE ese conjunto: la cubierta pasa a
+    -- superada y entra la sucesora, con sus elementos sin planificar y sin constatar. El
+    -- gate queda diciendo lo contrario de lo que pasa, sin que nadie lo haya tocado.
+    --
+    -- Rechazar es la única salida que existe, y conviene decir por qué: la aprobación de
+    -- un gate es INMUTABLE y la reapertura de etapa no la deshace —SPEC-04 lo dice con
+    -- todas las letras, y `reabrir_etapa` devuelve la ETAPA a 'en-curso' sin tocar el
+    -- gate—, así que «revalidar el gate afectado» no es un remedio más caro: no existe
+    -- como mecanismo, no hay ningún camino por el que ese 'aprobado' vuelva a evaluarse.
+    -- Es la misma doctrina que release_elemento_cobertura_guard aplica al quitar alcance,
+    -- aplicada al otro acto que puede volver falso lo mismo.
+    --
+    -- Y la puerta NO se cierra sin salida: el ciclo siguiente del servicio se abre en OTRO
+    -- proyecto. Esa salida es de primera clase en el modelo, no un apaño — `supera_a` está
+    -- restringido por SERVICIO y no por proyecto justo para permitirla, y G7 mira la cadena
+    -- por servicio (abajo), así que el proyecto que hereda la cadena responde por lo que el
+    -- anterior dejó en vuelo. El guard de alta rechaza además el NACIMIENTO del borrador en
+    -- un proyecto certificado, que es donde la salida sigue siendo barata.
+    --
+    -- Lo que esto NO toca es el orden normal: RF-06.3 aprueba la design version en la
+    -- ventana G5/G6 y G6 firma DESPUÉS el plan que la cubre. Aprobar diseño nuevo con el
+    -- plan ya firmado no es paralelismo de etapas (RF-04.4) — es rehacer una etapa
+    -- certificada, y eso abre ciclo.
+    v_gate := gate_certificado_del_proyecto(new.proyecto_id, new.workspace_id);
+    if v_gate is not null then
+      raise exception 'el proyecto ya certificó G% y esa aprobación no se deshace: la design version siguiente de este servicio va en el proyecto del ciclo siguiente (SPEC-04)', v_gate;
+    end if;
     -- Una design version sin elementos no es una design version: no hay diff, no hay
     -- plan de releases y G7 se aprobaría vacuamente.
     if not exists (select 1 from elemento_cambio ec
       where ec.design_version_id = new.id and ec.workspace_id = new.workspace_id) then
       raise exception 'no se puede aprobar una design version sin elementos de cambio';
+    end if;
+    -- Y que lo que MOTIVA a esos elementos siga en pie. Una decisión se cita estando
+    -- 'vigente' —lo exige elemento_motivo_citable_guard—, pero reabrir una etapa aguas
+    -- arriba la pasa a 'en-revision' (RF-04.9) y ese enlace no se revalida solo. Sin esto,
+    -- la versión INMUTABLE entraba en la cadena «decisión aprobada → design version» con su
+    -- base explícitamente en revisión, y ya no había forma de corregirlo: aprobar es el
+    -- último instante en que el borrador todavía se puede tocar.
+    --
+    -- Es exactamente la regla que gate_aprobar_suficiencia_guard aplica a los ítems del
+    -- checklist («hay ítems cumplidos con decisiones en revisión»), y con la misma salida y
+    -- el mismo motivo para no resetear nada al reabrir: revalidar la decisión desbloquea la
+    -- aprobación sin tirar trabajo que quizá sigue en pie, y si de verdad ya no la sostiene,
+    -- el elemento se borra y se rehace — en borrador los dos caminos están abiertos.
+    if exists (
+      select 1 from elemento_cambio ec
+      join elemento_decision ed on ed.elemento_id = ec.id and ed.workspace_id = ec.workspace_id
+      join decision d on d.id = ed.decision_id and d.workspace_id = ed.workspace_id
+      where ec.design_version_id = new.id and ec.workspace_id = new.workspace_id
+        and d.estado <> 'vigente'
+    ) then
+      raise exception 'hay elementos que citan decisiones en revisión: revalídalas antes de aprobar (RF-04.9)';
     end if;
     -- Y que el snapshot se haya tomado EN ESTA transición, no antes. RF-06.3 no promete
     -- «hay un snapshot de este journey», promete que aprobar CONGELA el to-be — el de
@@ -1394,7 +1488,8 @@ begin
     -- explicado, que es lo que el gate exige (honestidad, no perfección).
     -- De las design versions SUPERADAS entra solo lo que dejaron EN VUELO: sus elementos
     -- sin planificar son historia de un ciclo anterior, pero un release suyo sin resolver
-    -- sigue siendo trabajo abierto de ESTE proyecto (ver abajo).
+    -- sigue siendo trabajo abierto sobre el SERVICIO que este proyecto certifica — venga
+    -- de este proyecto o del que le pasó la cadena (ver abajo).
     if new.numero = 7 then
       -- Primero, que HAYA tablero. El «no exists elemento en estado desconocido» de
       -- abajo es vacuamente cierto cuando no hay ningún elemento que mirar: un proyecto
@@ -1447,14 +1542,42 @@ begin
       -- desplegarse nunca —`release_transicion_guard` no despliega un release vacío—, con
       -- lo que deja de haber nada que observar. Un release VERIFICADO no hace falta
       -- mirarlo: verificarlo ya exigió constatar todos sus elementos.
+      --
+      -- Y la superada NO se busca por proyecto, sino por SERVICIO. `supera_a` está
+      -- restringido por servicio y no por proyecto —design_version_anclaje_guard lo exige
+      -- así—, o sea que la cadena de versiones de un servicio atraviesa proyectos: DV-B del
+      -- proyecto B puede suceder a DV-A del proyecto A. Con el filtro por proyecto, B
+      -- certificaba G7 sin ver los releases planificados o desplegados-sin-constatar de
+      -- DV-A, que pueden salir o constatarse DESPUÉS y mover el estado compartido del
+      -- servicio — el mismo estado que la conciliación de B dice haber cerrado. El filtro
+      -- estaba mirando quién hizo el trabajo, cuando lo que decide es sobre qué.
+      --
+      -- Se recorre por servicio y no siguiendo `supera_a` a saltos porque el servicio ES el
+      -- cierre de esa cadena (todo eslabón comparte servicio) y además atrapa lo que un
+      -- eslabón roto dejaría fuera: una versión marcada 'superada' sin sucesora que la
+      -- declare —la política admite ese UPDATE— desaparecería de un recorrido por enlaces y
+      -- se llevaría con ella sus releases en vuelo.
+      --
+      -- La rama por PROYECTO se queda, y no es redundante: si la única versión del proyecto
+      -- para ese servicio fue superada desde otro proyecto, el proyecto ya no tiene ninguna
+      -- APROBADA de ese servicio y el recorrido por servicio no llegaría a ella. Sigue
+      -- siendo trabajo abierto suyo.
       if exists (
         select 1 from elemento_cambio ec
         join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
         join release_elemento re on re.elemento_id = ec.id and re.workspace_id = ec.workspace_id
         join release r on r.id = re.release_id and r.workspace_id = re.workspace_id
-        where dv.proyecto_id = new.proyecto_id and dv.workspace_id = new.workspace_id
+        where dv.workspace_id = new.workspace_id
           and dv.estado = 'superada'
           and r.estado <> 'verificado'
+          and (
+            dv.proyecto_id = new.proyecto_id
+            or dv.servicio_id in (
+              select vigente.servicio_id from design_version vigente
+              where vigente.proyecto_id = new.proyecto_id
+                and vigente.workspace_id = new.workspace_id
+                and vigente.estado = 'aprobada')
+          )
       ) then
         raise exception 'no se puede aprobar G7: una design version superada dejó releases sin resolver (RF-06.7)';
       end if;

@@ -19,10 +19,13 @@ import {
   ErrorEntrega,
   PAGINA_DESIGN_VERSIONS,
   planificarRelease,
+  proyectosCertificados,
   tableroDeConciliacion,
   versionAprobadaDelServicio,
 } from '@/lib/entrega/entrega.servicio';
 import { calcularDiff, conciliacionCompleta } from '@/lib/entrega/entrega.diff';
+import { aprobarGate } from '@/lib/metodo/metodo.servicio';
+import { revalidarDecision } from '@/lib/metodo/gobernanza.servicio';
 import { abrirHilo, hilosDeObjetos } from '@/lib/portal/portal.servicio';
 import { borrarNodo } from '@/lib/journey/journey.servicio';
 import { describeAuthz } from './helpers';
@@ -63,11 +66,24 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
   let leadId = '';
   let disId = '';
   let stakeId = '';
+  // G0, G3, G5 y G6 los aprueba el SPONSOR (lo fija un CHECK de gate_instancia, y la
+  // política exige que el rol del que aprueba sea ese). Sin este miembro, las carreras de
+  // G6 tendrían que montarse con SQL de administrador y dejarían de probar el camino real.
+  let sponsorId = '';
   let servicioId = '';
   let otroServicioId = '';
   let retoId = '';
   let proyectoId = '';
   let otroProyectoId = '';
+  /**
+   * P-90 (`proyectoId`) es el proyecto del recorrido completo y acaba CERTIFICADO: el test
+   * de G7 le aprueba la escalera entera. Desde ese momento no vuelve a aprobar design
+   * versions —lo prohíbe `gate_certificado_del_proyecto`, porque G6 y G7 afirman algo sobre
+   * el conjunto de sus versiones aprobadas y ese 'aprobado' no se reevalúa (SPEC-04)—, así
+   * que todo lo que viene después trabaja sobre P-93. No es un apaño del test: es
+   * exactamente la salida que la regla deja, el ciclo siguiente en otro proyecto.
+   */
+  let proyectoAbierto = '';
   let toBeId = '';
   let asIsId = '';
   let nodoToBe = '';
@@ -103,12 +119,14 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       ['lead', 'lead-boutique'],
       ['dis', 'disenador'],
       ['stake', 'stakeholder'],
+      ['sponsor', 'sponsor'],
     ] as const) {
       const [u] = await admin`insert into usuario (email, nombre, estado)
         values (${`${marca}-${alias}@test.demo`}, ${alias}, 'activo') returning id`;
       const id = u!.id as string;
       if (alias === 'lead') leadId = id;
       else if (alias === 'dis') disId = id;
+      else if (alias === 'sponsor') sponsorId = id;
       else stakeId = id;
       await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
         values (${ws}, ${id}, ${alias}, ${`${marca}-${alias}@test.demo`}, ${rol})`;
@@ -137,6 +155,9 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [p2] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
       values (${ws}, ${retoId}, 'P-91', 'Proyecto vecino', ${leadId}) returning id`;
     otroProyectoId = p2!.id as string;
+    const [p3] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-93', 'Ciclo siguiente, sin certificar', ${leadId}) returning id`;
+    proyectoAbierto = p3!.id as string;
 
     // Criterio completo: G0 no se aprueba sin él (SYS-22), y el test de G7 necesita la
     // escalera de gates entera.
@@ -690,7 +711,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await expect(
       crearDesignVersion(leadId, {
         workspaceId: ws,
-        proyectoId,
+        proyectoId: proyectoAbierto,
         servicioId,
         journeyId: toBeId,
         titulo: 'Sin declarar a quién supera',
@@ -705,7 +726,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const admin = sqlAdmin();
     const [jt2] = await admin`insert into journey
       (workspace_id, servicio_id, reto_id, proyecto_id, tipo, nombre, creado_por)
-      values (${ws}, ${servicioId}, ${retoId}, ${proyectoId}, 'to-be', 'Apertura objetivo v2',
+      values (${ws}, ${servicioId}, ${retoId}, ${proyectoAbierto}, 'to-be', 'Apertura objetivo v2',
               ${leadId}) returning id`;
     const toBe2 = jt2!.id as string;
     const [n4] = await admin`insert into journey_nodo
@@ -715,7 +736,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     const nueva = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId,
       journeyId: toBe2,
       titulo: 'Segunda versión',
@@ -860,7 +881,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // Otro proyecto se lleva el servicio al ciclo siguiente y supera la versión.
     const sucesora = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svcId,
       journeyId,
       titulo: 'La del proyecto que sigue',
@@ -914,7 +935,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await expect(
       crearDesignVersion(leadId, {
         workspaceId: ws,
-        proyectoId,
+        proyectoId: proyectoAbierto,
         servicioId: otroServicioId,
         journeyId: toBeId,
         titulo: 'Con el journey de otro servicio',
@@ -925,7 +946,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     const suelta = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: otroServicioId,
       journeyId: null,
       titulo: 'Nace sin journey',
@@ -1016,7 +1037,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // supera porque el servicio ya tiene la recién aprobada: sin eso no nacería.)
     const otroBorrador = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: otroServicioId,
       journeyId: null,
       titulo: 'Título original',
@@ -1042,7 +1063,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       returning id`;
     const creada = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svc!.id as string,
       journeyId: jt!.id as string,
       titulo: 'La que se aprueba mientras la editan',
@@ -1186,7 +1207,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // de las versiones siguientes (RF-06.10).
     const sucesora = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: (
         await sqlAdmin()`select servicio_id from design_version
           where id = ${dvCarrera} and workspace_id = ${ws}`
@@ -1278,7 +1299,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await expect(
       crearDesignVersion(leadId, {
         workspaceId: ws,
-        proyectoId,
+        proyectoId: proyectoAbierto,
         servicioId: servicioAjeno,
         journeyId: null,
         titulo: 'Cambia un servicio que este reto no toca',
@@ -1293,7 +1314,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       values (${retoId}, ${servicioAjeno}, ${ws}, ${leadId})`;
     const valida = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: servicioAjeno,
       journeyId: null,
       titulo: 'Ahora el reto sí lo declara afectado',
@@ -1308,7 +1329,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await expect(
       crearDesignVersion(leadId, {
         workspaceId: ws,
-        proyectoId,
+        proyectoId: proyectoAbierto,
         servicioId: servicioAjeno,
         journeyId: null,
         titulo: 'Supera a la de otro servicio',
@@ -1409,7 +1430,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       values (${ws}, ${ja!.id as string}, 'paso', 'Paso del objetivo A', ${leadId}) returning id`;
     const creada = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svcId,
       journeyId: ja!.id as string,
       titulo: 'La que reenlaza mientras la editan',
@@ -1616,7 +1637,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const nueva = (titulo: string, superaA: string | null) =>
       crearDesignVersion(leadId, {
         workspaceId: ws,
-        proyectoId,
+        proyectoId: proyectoAbierto,
         servicioId: svcId,
         journeyId,
         titulo,
@@ -1698,7 +1719,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     const dv = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svcId,
       journeyId,
       titulo: 'La que enlaza un nodo efímero',
@@ -1862,9 +1883,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       releaseId: rlDesplegado.releaseId,
       desplegadoEn: AYER,
     });
-    for (let n = 0; n <= 6; n++) await aprobarGateCrudo(n);
 
-    // El ciclo siguiente supera a la primera y se concilia entero.
+    // El ciclo siguiente supera a la primera y se concilia entero. Ocurre ANTES de firmar
+    // la escalera de gates y no es un detalle de orden: un proyecto que ya certificó G6 o
+    // G7 no aprueba design versions nuevas —volverían falso lo que el gate afirma sobre el
+    // conjunto de sus versiones aprobadas, y esa aprobación no se deshace (SPEC-04)—. Es
+    // también el orden que describe RF-06.3: la design version se aprueba en la ventana
+    // G5/G6 y G6 firma DESPUÉS el plan que la cubre.
     const segunda = await crearDesignVersion(leadId, {
       workspaceId: ws,
       proyectoId: proy,
@@ -1902,6 +1927,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         { elementoId: elSegunda, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
       ],
     });
+    // Ahora sí la escalera: G6 firma un plan donde cada elemento de la versión VIGENTE
+    // —la segunda— tiene release. Los de la superada son historia de un ciclo anterior y
+    // el gate no los mira; lo que sí sigue abierto son sus releases, y eso es lo que G7
+    // tiene que ver más abajo.
+    for (let n = 0; n <= 6; n++) await aprobarGateCrudo(n);
+
     const [estadoPrimera] = await admin`select estado from design_version
       where id = ${primera.designVersionId} and workspace_id = ${ws}`;
     expect(estadoPrimera!.estado).toBe('superada');
@@ -1969,7 +2000,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     const vieja = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svcId,
       journeyId,
       titulo: 'La aprobada que se hunde en la lista',
@@ -2042,7 +2073,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // anclaje la acepta porque declara a cuál supera.
     const sucesora = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svcId,
       journeyId,
       titulo: 'La siguiente del servicio del fondo',
@@ -2074,7 +2105,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const crearConElemento = async (titulo: string, superaA: string | null) => {
       const dv = await crearDesignVersion(leadId, {
         workspaceId: ws,
-        proyectoId,
+        proyectoId: proyectoAbierto,
         servicioId: svcId,
         journeyId,
         titulo,
@@ -2150,7 +2181,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const otroJourney = otroJ!.id as string;
     const dvAjena = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: otroSvc!.id as string,
       journeyId: otroJourney,
       titulo: 'DV del snapshot ajeno',
@@ -2252,7 +2283,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     const dv = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svcId,
       journeyId,
       titulo: 'La que va a ser superada en vuelo',
@@ -2381,7 +2412,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       returning id`;
     const dv = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svcId,
       journeyId: j!.id as string,
       titulo: 'La que se constata entera o nada',
@@ -2524,7 +2555,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     // lo único que puede rechazar el UPDATE de abajo es la frescura del snapshot.
     const dv = await crearDesignVersion(leadId, {
       workspaceId: ws,
-      proyectoId,
+      proyectoId: proyectoAbierto,
       servicioId: svcId,
       journeyId,
       titulo: 'La que intenta congelar un grafo viejo',
@@ -2565,6 +2596,474 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(aprobada!.estado).toBe('aprobada');
     expect(aprobada!.snapshotId).not.toBeNull();
     expect(aprobada!.snapshotId).not.toBe(snapshotViejo);
+  });
+
+  /**
+   * Un proyecto listo para firmar gates por el camino REAL: las ocho instancias con su
+   * checklist resuelto y el rol aprobador que el CHECK de la tabla impone (sponsor en G0,
+   * G3, G5 y G6; el lead en el resto). El checklist va en 'na' razonado
+   * porque lo que se prueba aquí es la suficiencia de ENTREGA (el plan y la conciliación),
+   * no la del checklist, que tiene sus propios tests en el módulo del método.
+   */
+  const proyectoConGates = async (codigo: string, titulo: string): Promise<string> => {
+    const admin = sqlAdmin();
+    const [p] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, ${codigo}, ${titulo}, ${leadId}) returning id`;
+    const proy = p!.id as string;
+    for (let n = 0; n <= 7; n++) {
+      const [g] = await admin`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador)
+        values (${ws}, ${proy}, ${n}, ${[0, 3, 5, 6].includes(n) ? 'sponsor' : 'lead-boutique'})
+        returning id`;
+      await admin`insert into checklist_item
+        (workspace_id, gate_id, orden, texto, estado, na_justificacion, na_aprobado_por)
+        values (${ws}, ${g!.id as string}, 0, 'Ítem del test', 'na', 'fuera de alcance del test',
+                ${leadId})`;
+    }
+    return proy;
+  };
+
+  /** Un servicio nuevo del reto R-90 con su to-be: el par mínimo que una design version
+   * necesita para nacer y para congelarse. Servicio propio en cada test para que ninguno
+   * compita por «una sola design version aprobada por servicio» (SYS-05). */
+  const servicioConToBe = async (
+    nombre: string,
+  ): Promise<{ servicioId: string; journeyId: string }> => {
+    const admin = sqlAdmin();
+    const [s] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, ${nombre}, ${leadId}) returning id`;
+    const svcId = s!.id as string;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svcId}, 'to-be', ${'To-be de ' + nombre}, ${leadId}) returning id`;
+    return { servicioId: svcId, journeyId: j!.id as string };
+  };
+
+  const elementoSuelto = async (designVersionId: string, titulo: string): Promise<string> =>
+    (
+      await agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId,
+        tipo: 'canal',
+        operacion: 'agrega',
+        titulo,
+        detalle: '',
+        nodoId: null,
+        decisionIds: [],
+        insightIds: [],
+      })
+    ).elementoId;
+
+  const aprobarGatesHasta = async (proy: string, hasta: number): Promise<void> => {
+    const admin = sqlAdmin();
+    for (let n = 0; n <= hasta; n++) {
+      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${proy} and workspace_id = ${ws} and numero = ${n}`;
+    }
+  };
+
+  it('firmar G6 y quitarle el release a un elemento no pueden cruzarse (RF-06.4)', async () => {
+    // La carrera es entre dos caminos que escriben TABLAS distintas —gate_instancia y
+    // release_elemento— y que además deciden en momentos distintos: la aprobación de G6
+    // comprueba la cobertura DENTRO de su update, y el borrado la comprueba en un
+    // constraint trigger DIFERIDO, o sea al COMMIT y con su propio snapshot. Sin candado
+    // compartido, la aprobación ve la asignación todavía visible y el trigger diferido ve
+    // el gate todavía pendiente: las dos pasan y queda un G6 firmando un plan con un
+    // elemento descubierto. El candado de fila no las cruza, y los que ya tenían —reto y
+    // gate de un lado, release del otro— no se ven entre sí.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-97', 'Proyecto del plan en disputa');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del plan en disputa');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del plan en disputa',
+      resumen: '',
+      superaA: null,
+    });
+    const elCubierto = await elementoSuelto(dv.designVersionId, 'Lo que el plan cubre');
+    const elEnDisputa = await elementoSuelto(dv.designVersionId, 'Lo que alguien quiere sacar');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'El plan completo',
+      responsable: 'Equipo del plan',
+      fechaObjetivo: HOY,
+      elementos: [
+        { elementoId: elCubierto, razon: '' },
+        { elementoId: elEnDisputa, razon: '' },
+      ],
+    });
+    await aprobarGatesHasta(proy, 5);
+    const [g6] = await admin`select id from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 6`;
+    const g6Id = g6!.id as string;
+
+    // Transacción A: la aprobación de G6 tal cual la hace `aprobarGate` —candado de reto,
+    // candado de gate y el UPDATE— y QUEDA ABIERTA. El intercalado se fija a mano: A avisa
+    // cuando ya tiene los candados, y solo entonces arranca el borrado. Sin el aviso el
+    // test podría pasar por el intercalado contrario, que no prueba nada.
+    let listo!: () => void;
+    const tomado = new Promise<void>((r) => (listo = r));
+    let liberar!: () => void;
+    const espera = new Promise<void>((r) => (liberar = r));
+    const enVuelo = conUsuario(sponsorId, async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+      await tx`select pg_advisory_xact_lock(hashtextextended('designio:gate:' || ${g6Id}, 42))`;
+      const filas = await tx`update gate_instancia
+        set estado = 'aprobado', aprobado_por = ${sponsorId}, aprobado_en = now()
+        where id = ${g6Id} and workspace_id = ${ws} and estado = 'pendiente'`;
+      if (filas.count !== 1) throw new Error('la aprobación de G6 no alcanzó su gate');
+      listo();
+      await espera;
+    });
+    await tomado;
+
+    const quitar = desasignarElemento(leadId, ws, elEnDisputa);
+    try {
+      expect(await siguePendiente(quitar)).toBe(true);
+    } finally {
+      liberar();
+    }
+    await enVuelo;
+    // Serializadas, el desenlace es el único coherente: G6 firmó un plan completo, y por
+    // eso el borrado ya no puede vaciarlo. La salida sigue existiendo —mover el elemento a
+    // otro release es borrar e insertar en la MISMA transacción— y es la que el mensaje
+    // ofrece.
+    await expect(quitar).rejects.toThrow(/G6 aprobó un plan que cubre este elemento/);
+    const [gate] = await admin`select estado from gate_instancia
+      where id = ${g6Id} and workspace_id = ${ws}`;
+    expect(gate!.estado).toBe('aprobado');
+    const cubierto = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(cubierto!.releases[0]!.elementos.map((e) => e.elementoId).sort()).toEqual(
+      [elCubierto, elEnDisputa].sort(),
+    );
+  });
+
+  it('un proyecto que ya certificó no aprueba diseño nuevo: el ciclo siguiente va en otro proyecto', async () => {
+    // G6 y G7 no afirman algo sobre UNA design version: afirman algo sobre el conjunto de
+    // las aprobadas del proyecto —cada elemento con release (RF-06.4), ninguno en estado
+    // desconocido (RF-06.7)—. Aprobar una sucesora mueve ese conjunto: saca a la cubierta y
+    // mete a la nueva, sin releases y sin constatar. Y el gate no se reevalúa nunca: la
+    // reapertura reabre la ETAPA, no el gate (SPEC-04).
+    const proy = await proyectoConGates('P-98', 'Proyecto que firma su plan');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del ciclo cerrado');
+    const primera = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que el plan cubre',
+      resumen: '',
+      superaA: null,
+    });
+    const elPrimera = await elementoSuelto(primera.designVersionId, 'Lo que se planifica');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      motivo: '',
+    });
+    await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      titulo: 'El plan que se firma',
+      responsable: 'Equipo del ciclo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elPrimera, razon: '' }],
+    });
+
+    // El borrador de la sucesora nace ANTES de firmar: es el caso que la comprobación del
+    // alta no puede atrapar, y por eso la regla vive también en la aprobación.
+    const enVuelo = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La sucesora que se quedó a medias',
+      resumen: '',
+      superaA: primera.designVersionId,
+    });
+    await elementoSuelto(enVuelo.designVersionId, 'Diseño posterior a la firma');
+
+    await aprobarGatesHasta(proy, 5);
+    const admin = sqlAdmin();
+    const [g6] = await admin`select id from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 6`;
+    await aprobarGate(sponsorId, { workspaceId: ws, gateId: g6!.id as string });
+    expect(await proyectosCertificados(leadId, ws)).toContain(proy);
+
+    // Aprobarla dejaría a G6 firmando un plan que ya no cubre nada.
+    await expect(
+      aprobarDesignVersion(leadId, {
+        workspaceId: ws,
+        designVersionId: enVuelo.designVersionId,
+        motivo: '',
+      }),
+    ).rejects.toThrow(/ya certificó G6 y esa aprobación no se deshace/);
+
+    // Y el borrador nuevo ni siquiera nace aquí: enterarse al aprobar dejaría una fila que
+    // no se puede aprobar, ni borrar (no hay DELETE), ni mudar de proyecto (`proyecto_id`
+    // no está en el grant de columna). Adelantarlo al alta es lo que conserva la salida.
+    await expect(
+      crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proy,
+        servicioId: svcId,
+        journeyId,
+        titulo: 'La que no debe nacer aquí',
+        resumen: '',
+        superaA: primera.designVersionId,
+      }),
+    ).rejects.toThrow(/ya certificó G6: la design version siguiente va en el proyecto del ciclo siguiente/);
+
+    // LA SALIDA, y no es un apaño: `supera_a` está restringido por SERVICIO y no por
+    // proyecto justo para esto. El ciclo siguiente se abre en otro proyecto del reto y la
+    // cadena del servicio continúa ahí.
+    const siguiente = await proyectoConGates('P-99', 'Proyecto del ciclo siguiente');
+    const sucesora = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: siguiente,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del ciclo siguiente',
+      resumen: '',
+      superaA: primera.designVersionId,
+    });
+    await elementoSuelto(sucesora.designVersionId, 'Lo que trae el ciclo nuevo');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: sucesora.designVersionId,
+      motivo: '',
+    });
+    const anterior = await designVersionCompleta(leadId, ws, primera.designVersionId);
+    expect(anterior!.estado).toBe('superada');
+    expect(anterior!.superadaPor!.id).toBe(sucesora.designVersionId);
+  });
+
+  it('G7 mira la cadena del SERVICIO: lo que dejó en vuelo el proyecto anterior también cuenta', async () => {
+    // La cadena de versiones de un servicio atraviesa proyectos —`supera_a` está
+    // restringido por servicio, no por proyecto—, así que filtrar los pendientes al
+    // proyecto que pide el gate deja fuera justo lo que la salida del hallazgo anterior
+    // produce: DV-A del proyecto A, superada desde el proyecto B, con releases que todavía
+    // pueden salir o constatarse y mover el estado compartido del servicio.
+    const admin = sqlAdmin();
+    const [pa] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-100', 'Proyecto que deja vuelo', ${leadId}) returning id`;
+    const proyA = pa!.id as string;
+    const proyB = await proyectoConGates('P-101', 'Proyecto que hereda la cadena');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la cadena entre proyectos');
+
+    const dvA = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyA,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del proyecto A',
+      resumen: '',
+      superaA: null,
+    });
+    const elSale = await elementoSuelto(dvA.designVersionId, 'Lo que salió sin constatar');
+    const elNoSale = await elementoSuelto(dvA.designVersionId, 'Lo que se quedó en el plan');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.designVersionId,
+      motivo: '',
+    });
+    const rlSale = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.designVersionId,
+      titulo: 'El de A que salió',
+      responsable: 'Equipo de A',
+      fechaObjetivo: AYER,
+      elementos: [{ elementoId: elSale, razon: '' }],
+    });
+    const rlQuieto = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvA.designVersionId,
+      titulo: 'El de A que no llegó a salir',
+      responsable: 'Equipo de A',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elNoSale, razon: 'dependencia externa' }],
+    });
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: rlSale.releaseId,
+      desplegadoEn: AYER,
+    });
+
+    // El proyecto B se lleva el servicio al ciclo siguiente y lo concilia ENTERO.
+    const dvB = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyB,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del proyecto B',
+      resumen: '',
+      superaA: dvA.designVersionId,
+    });
+    const elB = await elementoSuelto(dvB.designVersionId, 'Lo que trae B');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dvB.designVersionId,
+      motivo: '',
+    });
+    const rlB = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvB.designVersionId,
+      titulo: 'El de B',
+      responsable: 'Equipo de B',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elB, razon: '' }],
+    });
+    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlB.releaseId, desplegadoEn: HOY });
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlB.releaseId,
+      constatadoEn: HOY,
+      resumen: '',
+      constataciones: [
+        { elementoId: elB, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+      ],
+    });
+    await aprobarGatesHasta(proyB, 6);
+
+    // El tablero de B está completo y aun así G7 no pasa: la superada es de OTRO proyecto,
+    // pero del MISMO servicio, y su vuelo sigue abierto.
+    const tablero = await tableroDeConciliacion(leadId, ws, dvB.designVersionId);
+    expect(conciliacionCompleta(tablero!.filas)).toBe(true);
+    const aprobarG7 = () =>
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
+    await expect(aprobarG7()).rejects.toThrow(/superada dejó releases sin resolver/);
+
+    // Las dos salidas, las mismas que dentro de un proyecto: lo desplegado se constata…
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rlSale.releaseId,
+      constatadoEn: HOY,
+      resumen: '',
+      constataciones: [
+        {
+          elementoId: elSale,
+          resultado: 'desviado',
+          queQuedoDistinto: 'Salió sin el aviso',
+          razon: 'El proveedor llegó tarde',
+        },
+      ],
+    });
+    await expect(aprobarG7()).rejects.toThrow(/superada dejó releases sin resolver/);
+    // …y lo que ya no va a salir se cierra quitándole el alcance. El proyecto A no firmó
+    // G6, así que el constraint de cobertura no lo impide: la salida sigue abierta.
+    await desasignarElemento(leadId, ws, elNoSale);
+    await expect(
+      desplegarRelease(leadId, {
+        workspaceId: ws,
+        releaseId: rlQuieto.releaseId,
+        desplegadoEn: HOY,
+      }),
+    ).rejects.toThrow(/sin elementos declarados no se despliega/);
+
+    await aprobarG7();
+    const [g7] = await admin`select estado from gate_instancia
+      where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
+    expect(g7!.estado).toBe('aprobado');
+  });
+
+  it('una design version no se congela sobre decisiones en revisión (RF-04.9)', async () => {
+    const admin = sqlAdmin();
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoAbierto}, 1, 'lead-boutique') returning id`;
+    const [d] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, decidido_por)
+      values (${ws}, ${proyectoAbierto}, ${g!.id as string}, 'diseno',
+              'Mover la verificación al canal digital', ${leadId}) returning id`;
+    const decisionEnRevision = d!.id as string;
+    // Es el estado que deja `reabrirEtapa` (RF-04.9: la reapertura marca las decisiones
+    // aguas abajo). Se escribe directo para no montar las ocho etapas del proyecto solo
+    // para llegar a él; el camino de VUELTA sí es el real (`revalidarDecision`).
+    const enRevision = () => admin`update decision set estado = 'en-revision'
+      where id = ${decisionEnRevision} and workspace_id = ${ws}`;
+    await enRevision();
+
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la decisión revisada');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoAbierto,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que se apoya en una decisión',
+      resumen: '',
+      superaA: null,
+    });
+
+    // El picker no la ofrece, y el guard tampoco la acepta: las dos mitades dicen lo mismo.
+    const antes = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(antes!.decisionesDelProyecto.map((x) => x.id)).not.toContain(decisionEnRevision);
+    await expect(
+      agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        tipo: 'politica',
+        operacion: 'modifica',
+        titulo: 'Citando una decisión en revisión',
+        detalle: '',
+        nodoId: null,
+        decisionIds: [decisionEnRevision],
+        insightIds: [],
+      }),
+    ).rejects.toThrow(/ya no está vigente/);
+
+    // Revalidada, se cita con normalidad.
+    await revalidarDecision(leadId, ws, decisionEnRevision);
+    const conCita = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(conCita!.decisionesDelProyecto.map((x) => x.id)).toContain(decisionEnRevision);
+    await elementoSuelto(dv.designVersionId, 'Elemento sin motivos');
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      tipo: 'politica',
+      operacion: 'modifica',
+      titulo: 'Lo que la decisión motiva',
+      detalle: '',
+      nodoId: null,
+      decisionIds: [decisionEnRevision],
+      insightIds: [],
+    });
+
+    // Y aquí está el agujero que el filtro del picker NO tapa: la decisión se cita estando
+    // vigente y la reapertura llega DESPUÉS. Como la versión aprobada es inmutable, sin
+    // revalidar al aprobar entraría en la cadena «decisión aprobada → design version» con
+    // su base explícitamente en revisión y ya no habría forma de corregirlo.
+    await enRevision();
+    await expect(
+      aprobarDesignVersion(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        motivo: '',
+      }),
+    ).rejects.toThrow(/citan decisiones en revisión/);
+
+    // La salida es la misma que la del gate con ítems cumplidos: revalidar desbloquea sin
+    // tirar el trabajo. No se resetea nada.
+    await revalidarDecision(leadId, ws, decisionEnRevision);
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const aprobada = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(aprobada!.estado).toBe('aprobada');
   });
 
   it('nada de esto cruza el workspace', async () => {

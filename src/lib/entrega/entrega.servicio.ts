@@ -2,6 +2,7 @@ import '@/lib/server-only';
 import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { bloquearReto } from '@/lib/metodo/metodo.servicio';
 import type {
   AgregarElemento,
   AprobarDesignVersion,
@@ -151,6 +152,46 @@ async function bloquearRelease(tx: TransactionSql, releaseId: string): Promise<v
 }
 
 /**
+ * Candado del RETO del proyecto que produjo un elemento. Lo toma el único camino que
+ * puede dejar un elemento SIN release —`desasignarElemento`— para serializarse contra
+ * `aprobarGate`, que es el primero de los dos candados que aquella toma.
+ *
+ * Por qué hace falta: `release_elemento_cobertura_guard` es un constraint trigger
+ * DIFERIDO, así que corre al COMMIT y con su propio snapshot. Sin candado compartido, la
+ * aprobación de G6 lee la asignación TODAVÍA visible (el borrado no ha committeado) y el
+ * trigger diferido del borrado lee el gate TODAVÍA pendiente (la aprobación tampoco ha
+ * committeado): las dos pasan y queda un G6 aprobado con un elemento descubierto. Que las
+ * dos escriban tablas distintas —gate_instancia y release_elemento— es justo por lo que el
+ * candado de fila no las cruza, y los candados que ya tenían (gate/reto de un lado,
+ * release del otro) no se ven entre sí.
+ *
+ * El candado es el del RETO y no el del gate por dos motivos: es el que `aprobarGate` toma
+ * PRIMERO, así que quien lo tenga no puede colarse por delante de una aprobación en curso;
+ * y no depende de que la fila del gate exista, que sería una condición frágil para una
+ * regla que habla de un gate que puede aprobarse en cualquier momento.
+ *
+ * `moverElemento` NO lo toma, y es deliberado: mover borra y vuelve a insertar en la MISMA
+ * transacción, el guard diferido ve el elemento otra vez asignado y se aparta, así que la
+ * cobertura nunca baja y no hay nada que serializar. Lo que se serializa es dejar
+ * descubierto, no reordenar.
+ *
+ * Orden de adquisición: reto → release. Nadie toma un release antes que un reto, así que
+ * no aparece ningún ciclo; el orden canónico completo del módulo está en `bloquearSerie`.
+ */
+async function bloquearRetoDelElemento(
+  tx: TransactionSql,
+  workspaceId: string,
+  elementoId: string,
+): Promise<void> {
+  const [fila] = await tx`select p.reto_id from elemento_cambio ec
+    join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+    join proyecto p on p.id = dv.proyecto_id and p.workspace_id = dv.workspace_id
+    where ec.id = ${elementoId} and ec.workspace_id = ${workspaceId}`;
+  if (!fila) throw new ErrorEntrega('Ese elemento de cambio no existe en este workspace');
+  await bloquearReto(tx, fila.reto_id as string);
+}
+
+/**
  * Los códigos DV-n / RL-n / ES-n son max+1 por workspace: dos altas concurrentes leerían
  * el mismo máximo y chocarían contra la unique. Un candado por serie los serializa.
  *
@@ -160,7 +201,12 @@ async function bloquearRelease(tx: TransactionSql, releaseId: string): Promise<v
  *
  * ── ORDEN DE ADQUISICIÓN CANÓNICO DEL MÓDULO (el único sitio donde está escrito) ────────
  *
- *   dv-elemento  →  design-version(servicio)  →  codigo-rl  →  release  →  codigo-es
+ *   reto  →  dv-elemento  →  design-version(servicio)  →  codigo-rl  →  release  →  codigo-es
+ *
+ * `reto` es el candado del MÉTODO (`bloquearReto`, en metodo.servicio) y aparece aquí
+ * porque `desasignarElemento` tiene que serializarse contra `aprobarGate`. Va el primero
+ * de todos porque en el método ya va antes que el gate, y ninguna ruta de este módulo lo
+ * toma después de nada: quien lo tome, lo toma antes de todo lo demás.
  *
  * `release` puede ser DOS en `moverElemento` (origen y destino): se toman en orden
  * ascendente de uuid, que es el único orden total que dos transacciones que no se conocen
@@ -175,7 +221,7 @@ async function bloquearRelease(tx: TransactionSql, releaseId: string): Promise<v
  *   planificarRelease .......... servicio → codigo-rl → release
  *   asignarElemento ............ servicio → release
  *   moverElemento .............. servicio → release(origen) y release(destino), por uuid
- *   desasignarElemento ......... release
+ *   desasignarElemento ......... reto → release
  *   desplegarRelease ........... release
  *   constatarEffectiveState .... release → codigo-es
  *
@@ -718,6 +764,10 @@ export async function desasignarElemento(
       throw new ErrorEntrega('Ese elemento no está asignado a ningún release');
     }
     const releaseId = asignacion.release_id as string;
+    // Reto ANTES que release (ver `bloquearRetoDelElemento`): este es el único camino que
+    // deja un elemento sin release, y el guard diferido de cobertura decide contra un gate
+    // que otra transacción puede estar aprobando ahora mismo.
+    await bloquearRetoDelElemento(tx, workspaceId, elementoId);
     await bloquearRelease(tx, releaseId);
     const filas = await tx`delete from release_elemento
       where elemento_id = ${elementoId} and workspace_id = ${workspaceId}
@@ -927,10 +977,16 @@ export async function designVersionCompleta(
           where a2.workspace_id = dv.workspace_id and a2.servicio_id = dv.servicio_id
             and a2.estado = 'aprobada' and a2.id <> dv.id
         ), '[]'::jsonb) as superables,
+        -- Solo las VIGENTES, igual que los insights solo llegan validados: una decisión
+        -- que una reapertura dejó 'en-revision' (RF-04.9) no puede motivar un elemento —lo
+        -- rechaza elemento_motivo_citable_guard— y ofrecerla era ofrecer un error. El
+        -- picker filtra; quien decide es el guard, y al aprobar se vuelve a mirar porque
+        -- entre citar y aprobar la decisión puede haberse ido a revisión.
         coalesce((
           select jsonb_agg(jsonb_build_object('id', d.id, 'titulo', d.titulo) order by d.decidido_en)
           from decision d
           where d.proyecto_id = dv.proyecto_id and d.workspace_id = dv.workspace_id
+            and d.estado = 'vigente'
         ), '[]'::jsonb) as decisiones_del_proyecto,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', i.id, 'titulo', i.titulo) order by i.titulo)
@@ -1120,6 +1176,34 @@ export async function versionAprobadaDelServicio(
       codigo: fila.codigo as string,
       titulo: fila.titulo as string,
     };
+  });
+}
+
+/**
+ * Los proyectos del workspace que ya CERTIFICARON G6 o G7, para que el formulario de alta
+ * no los ofrezca. Un proyecto certificado ya no aprueba design versions nuevas —lo rechaza
+ * `design_version_anclaje_guard` en el alta y el guard de transición al aprobar—, porque
+ * G6 y G7 afirman algo sobre el conjunto de sus versiones aprobadas y esa afirmación no
+ * puede reevaluarse: la aprobación de un gate no se deshace (SPEC-04).
+ *
+ * Se pide en una llamada aparte y no dentro del árbol: el árbol es la proyección
+ * compartida de SPEC-02 y no sabe de gates, y meterle el método haría que cada pantalla
+ * que lo pinta pagara por una regla de una sola.
+ *
+ * El picker filtra y el guard decide, como en el resto del módulo. Aquí importa el doble
+ * porque el rechazo del alta llega DESPUÉS de haber escrito el formulario entero.
+ */
+export async function proyectosCertificados(
+  actorId: string,
+  workspaceId: string,
+): Promise<string[]> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`
+      select distinct g.proyecto_id
+      from gate_instancia g
+      where g.workspace_id = ${workspaceId} and g.numero in (6, 7) and g.estado = 'aprobado'`;
+    return filas.map((f) => f.proyecto_id as string);
   });
 }
 

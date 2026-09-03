@@ -16,6 +16,7 @@ import {
   EditarElementoSchema,
   EnlazarJourneySchema,
   PlanificarReleaseSchema,
+  ProyectosCertificadosInputSchema,
   ReleaseInputSchema,
   VersionAprobadaInputSchema,
 } from './entrega.schemas';
@@ -37,6 +38,7 @@ import {
   enlazarJourney,
   ErrorEntrega,
   planificarRelease,
+  proyectosCertificados,
   tableroDeConciliacion,
   versionAprobadaDelServicio,
 } from './entrega.servicio';
@@ -91,6 +93,22 @@ export const versionAprobadaDeServicio = createServerFn({ method: 'GET' })
       return await versionAprobadaDelServicio(usuarioId, data.workspaceId, data.servicioId);
     } catch (e) {
       if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
+  });
+
+/** Los proyectos que ya certificaron G6 o G7, para no ofrecerlos en el alta: una design
+ * version nueva bajo ellos volvería falso lo que el gate afirma, y el gate no se
+ * reevalúa (SPEC-04). El guard lo rechaza igual; esto evita escribir el formulario para
+ * nada. */
+export const proyectosYaCertificados = createServerFn({ method: 'GET' })
+  .inputValidator(ProyectosCertificadosInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await proyectosCertificados(usuarioId, data.workspaceId);
+    } catch (e) {
+      if (e instanceof ErrorAutorizacion) return [];
       throw e;
     }
   });

@@ -13,6 +13,7 @@ import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
   crearDesignVersionDelProyecto,
   listaDeDesignVersions,
+  proyectosYaCertificados,
   versionAprobadaDeServicio,
 } from '@/lib/entrega/entrega.functions';
 import type { ResumenDesignVersion } from '@/lib/entrega/entrega.schemas';
@@ -27,10 +28,17 @@ export const Route = createFileRoute('/_autenticada/design-versions')({
   loader: async ({ context }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
     if (!workspaceId) return null;
-    const [pagina, arbol] = await Promise.all([
+    const [pagina, arbol, certificados] = await Promise.all([
       listaDeDesignVersions({ data: { workspaceId, cursor: null } }),
       arbolDelWorkspace({ data: { workspaceId } }),
+      proyectosYaCertificados({ data: { workspaceId } }),
     ]);
+    // Un proyecto que ya firmó G6 o G7 no aprueba design versions nuevas: su gate afirma
+    // algo sobre el conjunto de sus versiones aprobadas y esa afirmación no se reevalúa
+    // (SPEC-04). El guard lo rechaza en el alta; ofrecerlo aquí sería invitar a escribir
+    // el formulario entero para nada. El ciclo siguiente va en otro proyecto, y el
+    // selector solo enseña los que todavía pueden producir una design version.
+    const certificado = new Set(certificados);
     // Los proyectos cuelgan del RETO, y un reto que afecta a este servicio está anclado en
     // otro: el mapa se arma sobre el árbol entero para poder resolverlos desde cualquier
     // servicio. Mismo apaño que la pantalla de journeys, por el mismo motivo.
@@ -38,7 +46,12 @@ export const Route = createFileRoute('/_autenticada/design-versions')({
       (arbol?.servicios ?? []).flatMap((s) =>
         s.retos.map(
           (r) =>
-            [r.id, r.proyectos.map((p) => ({ id: p.id, etiqueta: `${p.codigo} ${p.titulo}` }))] as const,
+            [
+              r.id,
+              r.proyectos
+                .filter((p) => !certificado.has(p.id))
+                .map((p) => ({ id: p.id, etiqueta: `${p.codigo} ${p.titulo}` })),
+            ] as const,
         ),
       ),
     );

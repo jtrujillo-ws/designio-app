@@ -4690,6 +4690,116 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(cuenta!.n).toBe(1);
   });
 
+  it('enlazar un nodo y reenlazar el journey NO pueden commitear los dos, en cualquier orden', async () => {
+    // La cuarta clase de carrera de este slice, y la única que no era de candados: un guard
+    // BEFORE que hace una lectura CRUZADA —mira filas que su sentencia no escribe— es un
+    // predicado sobre una instantánea, y nadie la renueva.
+    //
+    //   · el alta del elemento comprueba «el nodo pertenece al journey de la versión» leyendo
+    //     `design_version`, y ve el journey VIEJO porque el reenlace sigue sin commitear;
+    //   · el reenlace comprueba «no hay elementos colgados del journey anterior» leyendo
+    //     `elemento_cambio`, y no ve el alta porque sigue sin commitear.
+    //
+    // Los dos pasan y queda un elemento apuntando a un nodo fuera del grafo que la versión va
+    // a congelar — y entonces «qué pasos del journey afectó RL-1» (§19.7) se responde con un
+    // grafo ajeno.
+    //
+    // ── Por qué van los DOS órdenes de commit ──
+    // Porque cada uno lo caza una mitad distinta del arreglo, y con uno solo el test pasa por
+    // suerte. Si commitea primero el REENLACE, quien lo ve es el diferido del elemento, que
+    // relee el journey ya nuevo. Si commitea primero el ALTA, ese diferido relee el journey
+    // todavía VIEJO —un SELECT en READ COMMITTED no espera a una escritura ajena— y pasa: hace
+    // falta que el reenlace tenga TAMBIÉN su diferido y relea `elemento_cambio` bajo el mismo
+    // candado. Diferido no es excluyente; lo que excluye es que los dos lados relean.
+    const admin = sqlAdmin();
+
+    const carrera = async (
+      quienCommiteaPrimero: 'alta' | 'reenlace',
+      marcaDelCaso: string,
+    ): Promise<void> => {
+      const proy = await proyectoConGates(marcaDelCaso, 'Proyecto del grafo en carrera');
+      const { servicioId: svcId, journeyId } = await servicioConToBe(
+        'Servicio del grafo en carrera ' + marcaDelCaso,
+      );
+      const [otro] = await admin`insert into journey
+        (workspace_id, servicio_id, tipo, nombre, creado_por)
+        values (${ws}, ${svcId}, 'to-be', 'El to-be al que se reenlaza', ${leadId}) returning id`;
+      const journeyNuevo = otro!.id as string;
+      const [n] = await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, creado_por)
+        values (${ws}, ${journeyId}, 'paso', 'El paso del grafo viejo', ${leadId}) returning id`;
+      const nodoViejo = n!.id as string;
+      const dv = await crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proy,
+        servicioId: svcId,
+        journeyId,
+        titulo: 'La que cambia de grafo a mitad',
+        resumen: '',
+        superaA: null,
+      });
+
+      let escritaElAlta!: () => void;
+      let escritoElReenlace!: () => void;
+      const ambasEscritas = Promise.all([
+        new Promise<void>((r) => (escritaElAlta = r)),
+        new Promise<void>((r) => (escritoElReenlace = r)),
+      ]);
+      let soltarAlta!: () => void;
+      let soltarReenlace!: () => void;
+      const salidaAlta = new Promise<void>((r) => (soltarAlta = r));
+      const salidaReenlace = new Promise<void>((r) => (soltarReenlace = r));
+
+      // El alta va por SQL directo y sin el candado del servicio: es la superficie que está
+      // concedida, y la que impide que el candado viva solo en el servicio.
+      const alta = conUsuario(leadId, async (tx) => {
+        const filas = await tx`insert into elemento_cambio
+          (workspace_id, design_version_id, tipo, operacion, titulo, nodo_id, orden, creado_por)
+          values (${ws}, ${dv.designVersionId}, 'paso', 'agrega', 'Lo que cuelga del grafo viejo',
+                  ${nodoViejo}, 0, ${leadId})`;
+        if (filas.count !== 1) throw new Error('el alta directa no alcanzó su fila');
+        escritaElAlta();
+        await salidaAlta;
+      });
+      const reenlace = conUsuario(leadId, async (tx) => {
+        const filas = await tx`update design_version set journey_id = ${journeyNuevo}
+          where id = ${dv.designVersionId} and workspace_id = ${ws}`;
+        if (filas.count !== 1) throw new Error('el reenlace no alcanzó su fila');
+        escritoElReenlace();
+        await salidaReenlace;
+      });
+
+      // Las dos han escrito y ninguna ha commiteado: es el instante en que los dos guards
+      // inmediatos ya dijeron que sí, cada uno sobre su foto.
+      await ambasEscritas;
+      const calla = (pr: Promise<unknown>) => pr.catch(() => undefined);
+      if (quienCommiteaPrimero === 'alta') {
+        soltarAlta();
+        await calla(alta);
+        soltarReenlace();
+      } else {
+        soltarReenlace();
+        await calla(reenlace);
+        soltarAlta();
+      }
+      const desenlaces = await Promise.allSettled([alta, reenlace]);
+      expect(desenlaces.filter((d) => d.status === 'fulfilled')).toHaveLength(1);
+      expect(desenlaces.filter((d) => d.status === 'rejected')).toHaveLength(1);
+
+      // Y el estado que sobrevive es coherente gane quien gane: ningún elemento de la versión
+      // cuelga de un nodo que no sea del journey que la versión declara AHORA.
+      const [fuera] = await admin`select count(*)::int as n
+        from elemento_cambio ec
+        join design_version d on d.id = ec.design_version_id and d.workspace_id = ec.workspace_id
+        join journey_nodo nn on nn.id = ec.nodo_id and nn.workspace_id = ec.workspace_id
+        where ec.design_version_id = ${dv.designVersionId} and nn.journey_id <> d.journey_id`;
+      expect(fuera!.n).toBe(0);
+    };
+
+    await carrera('reenlace', 'P-142');
+    await carrera('alta', 'P-143');
+  });
+
   it('los MOTIVOS de un elemento tampoco cambian después de congelar (RF-06.9)', async () => {
     // Los enlaces de motivación tenían el mismo agujero que el elemento y por la misma razón:
     // su política mira `dv.estado = 'borrador'` con un exists sobre otra tabla, o sea con la

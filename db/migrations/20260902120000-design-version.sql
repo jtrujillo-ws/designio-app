@@ -1032,6 +1032,140 @@ create policy constatacion_insert on constatacion
   );
 
 -- ══ Guards ══
+--
+-- ── CENSO A · QUÉ RELEE CADA GUARD DIFERIDO ─────────────────────────────────────────────
+--
+-- Un guard diferido corre en la fase de COMMIT y con una foto nueva, pero solo vuelve a
+-- preguntar lo que su cuerpo pregunta. Todo predicado que un guard INMEDIATO comprobó antes
+-- de la espera y que el diferido no relee es un hueco por defecto: hay que decir por qué es
+-- seguro (el predicado solo puede volverse más cierto, o su fuente es inmutable) o cerrarlo.
+-- Esta tabla existe porque un hueco de esta clase costó una ronda: nodo→journey.
+--
+-- «Fuente inmutable» significa aquí una cosa concreta y comprobable: la columna NO está en
+-- el grant de UPDATE del rol de la app (ver los grants al final del fichero).
+--
+--   elemento_cambio_version_editable (elemento_cambio, elemento_decision, elemento_insight)
+--     relee ....... la design version sigue en 'borrador'
+--     antes ....... elemento_cambio_nodo (journey declarado, nodo del journey, identidad de
+--                   catálogo) y elemento_motivo_citable (decisión del proyecto y vigente;
+--                   insight validado)
+--     huecos ...... nodo→journey e identidad los relee elemento_cambio_identidad, abajo.
+--                   «decisión del proyecto»: fuente inmutable (proyecto_id no tiene grant).
+--                   «vigente»/«validado»: HUECO ACEPTADO — `decision.estado` e
+--                   `insight.estado` sí son mutables, y una reapertura puede pasar la
+--                   decisión a 'en-revision' después de citarla. No se relee aquí a
+--                   propósito: lo que tiene que ser cierto es lo que se CONGELA, y eso lo
+--                   revalida design_version_transicion_guard al aprobar, bajo `reto` +
+--                   `dv-elemento` — los mismos candados que toma reabrir la etapa. Mientras
+--                   la versión siga en borrador el estado es corregible.
+--
+--   elemento_cambio_identidad (elemento_cambio)
+--     relee ....... identidad de catálogo única en la versión, y el nodo sigue siendo del
+--                   journey que la versión declara AHORA
+--     antes ....... elemento_cambio_nodo, los mismos dos predicados
+--     huecos ...... ninguno. Si el nodo se borró, la relectura no lo encuentra y rechaza,
+--                   que es lo mismo que dice el inmediato.
+--
+--   design_version_journey_elementos (design_version, al cambiar de journey)
+--     relee ....... ningún elemento de la versión cuelga de un nodo de otro journey
+--     antes ....... design_version_journey, ese mismo predicado sobre su foto
+--     huecos ...... los otros dos predicados de aquel guard (el journey es el to-be de su
+--                   servicio; no está anclado a otro proyecto) tienen fuente inmutable:
+--                   `journey` no tiene NINGUNA columna en el grant de update.
+--
+--   design_version_superada_con_sucesora (design_version → superada)
+--     relee ....... existe una sucesora aprobada
+--     antes ....... design_version_transicion (transición legal, inmutabilidad, gate no
+--                   certificado, elementos, motivos vigentes, snapshot fresco)
+--     huecos ...... ninguno que importe: este predicado es sobre el INSTANTE de la
+--                   supersión, no una invariante permanente — la cadena X←Y←Z es legítima y
+--                   Y puede superarse después. Y en la ruta real la supersión y la
+--                   aprobación de la sucesora son la MISMA transacción. No toma candado
+--                   porque no lo necesita: la unicidad de la sucesión la cierra
+--                   design_version_sucesion_uniq, que es un constraint de verdad.
+--
+--   effective_state_completo (effective_state)
+--     relee ....... cada elemento del release tiene constatación en ESTE effective state, y
+--                   el release acabó verificado
+--     antes ....... effective_state_alta (fecha no futura, servicio del ES = servicio de la
+--                   DV del release, constatación no anterior al despliegue) y
+--                   constatacion_alcance (el elemento está en el alcance del release)
+--     huecos ...... fechas: fuente inmutable (`desplegado_en` lo congela el guard de
+--                   transición). Servicio: `release.design_version_id` y
+--                   `design_version.servicio_id` no tienen grant. Alcance: serializado por
+--                   el candado del RELEASE, que esta transacción ya sostiene desde
+--                   codigo_de_effective_state — y del otro lado release_alcance_fijo
+--                   rechaza tocar el alcance de un release que ya salió.
+--
+--   release_alcance_no_vacio (release, release_elemento) · toma `release`
+--     relee ....... un release que ya salió tiene alcance declarado
+--     antes ....... release_transicion (transición legal, fecha no futura, alcance no vacío
+--                   al desplegar, todo constatado al verificar)
+--     huecos ...... «todo constatado» lo relee effective_state_completo desde el otro lado y
+--                   bajo el mismo candado; las fechas son fuente inmutable.
+--
+--   release_alcance_fijo (release_elemento) · toma `release`
+--     relee ....... el release sigue 'planificado'
+--     antes ....... release_elemento_misma_dv (el elemento es de la DV del release)
+--     huecos ...... ese predicado no se relee y no hace falta: `design_version_id` no está
+--                   en el grant de update ni en `release` ni en `elemento_cambio`.
+--
+--   release_elemento_cobertura (release_elemento, en delete) · toma `reto`
+--     relee ....... si el proyecto certificó G6/G7, el elemento no se queda sin release
+--     antes ....... ninguno (en DELETE no corre ningún inmediato con predicado)
+--
+-- ── CENSO B · GUARDS BEFORE CON LECTURA CRUZADA, Y QUÉ LA SERIALIZA ─────────────────────
+--
+-- Esta es la pregunta general, y la que habría cazado el hueco de nodo→journey: un guard
+-- BEFORE que lee filas DISTINTAS de la que se escribe está mirando una foto que nadie
+-- renueva — las escrituras ajenas sin commitear no están en ella. O algo serializa esa
+-- lectura, o el predicado es decorativo bajo concurrencia. Van también los que están bien.
+--
+--   asignar_codigo_de_serie ....... lee el max() de su propia tabla
+--                                   → el candado `codigo-*` que él mismo toma
+--   design_version_anclaje (alta) . lee proyecto, reto_servicio_afectado, gate_instancia
+--                                   → el candado `reto` que él mismo toma
+--   design_version_anclaje (update) lee otras design versions del servicio (para supera_a)
+--                                   → NADA. Hueco aceptado: el desenlace es un borrador que
+--                                     no se puede aprobar, pero `supera_a` SÍ está en el
+--                                     grant, así que se corrige; y quien decide de verdad es
+--                                     el índice único parcial, que sí es atómico.
+--   design_version_journey ........ lee journey (inmutable) y elemento_cambio
+--                                   → design_version_journey_elementos, diferido y bajo
+--                                     `dv-elemento`, más la relectura del lado del elemento
+--   design_version_transicion ..... lee journey_snapshot, elemento_cambio, decision,
+--                                   gate_instancia, journey
+--                                   → los candados `reto` + `dv-elemento` que él mismo toma
+--   effective_state_alta .......... lee release y design_version
+--                                   → el candado `release`, tomado por
+--                                     codigo_de_effective_state, que dispara ANTES que él
+--                                     por orden alfabético
+--   elemento_cambio_nodo .......... lee design_version, journey_nodo y elemento_cambio
+--                                   → elemento_cambio_identidad, que relee las dos cosas al
+--                                     commit y bajo `dv-elemento`
+--   elemento_motivo_citable ....... lee decision, insight, elemento_cambio, design_version
+--                                   → hueco aceptado, con el veredicto del censo A
+--   release_transicion ............ lee release_elemento, constatacion, effective_state
+--                                   → el candado `release` que él mismo toma
+--   release_elemento_misma_dv ..... lee release y elemento_cambio
+--                                   → fuentes inmutables (design_version_id sin grant)
+--   constatacion_alcance .......... lee effective_state y release_elemento
+--                                   → el candado `release`, que la transacción sostiene
+--                                     desde el alta del effective state
+--
+-- ── LO QUE ESTOS DOS CENSOS NO CUBREN ───────────────────────────────────────────────────
+--
+--  · Las POLÍTICAS RLS. Un `using`/`with check` con un exists sobre otra tabla es la misma
+--    clase de lectura cruzada y aquí no se enumeran. Dos de los hallazgos de este slice
+--    fueron exactamente eso, y se cerraron con guards diferidos; no hay garantía de que
+--    queden censadas todas.
+--  · El orden en que se encolan los candados de VARIOS diferidos de una misma transacción,
+--    que sigue el orden de las sentencias. Ninguna ruta del servicio mezcla escrituras de
+--    elemento con bajas de alcance, pero una transacción de SQL directo que lo hiciera
+--    podría pedir `dv-elemento` antes que `reto` e invertir el orden canónico.
+--  · Las carreras contra módulos vecinos que no pasan por estas tablas (reapertura de
+--    etapa, renombrado de catálogo): se razonan una a una donde aparecen, no hay censo.
+
 
 -- El nodo que materializa un elemento tiene que ser del grafo que la design version
 -- aprueba. La FK compuesta garantiza el workspace y nada más: sin esto, un elemento de
@@ -1199,6 +1333,35 @@ begin
   end if;
   perform pg_advisory_xact_lock(
     hashtextextended('designio:dv-elemento:' || new.design_version_id, 42));
+  -- ── Y el NODO sigue siendo del journey que la versión declara AHORA ──
+  -- Esto es la relectura de lo que comprobó el guard inmediato, y sin ella el candado no
+  -- servía de nada: esperar no vale si al despertar no vuelves a preguntar lo que
+  -- preguntaste antes de dormirte.
+  --
+  -- El par que se colaba: un curador inserta un elemento para un nodo del journey A
+  -- mientras otro reenlaza el borrador a B. El guard inmediato del elemento lee
+  -- `design_version.journey_id` y ve A —el reenlace sigue sin commitear—; el guard del
+  -- reenlace lee `elemento_cambio` y no ve la fila —el alta sigue sin commitear—; y este
+  -- diferido revalidaba SOLO el borrador y la identidad de catálogo. Los dos commitean y
+  -- queda un elemento colgando de un nodo fuera del grafo que la versión va a congelar,
+  -- que es justo lo que design_version_journey_guard existe para impedir: la respuesta a
+  -- «qué pasos del journey afectó RL-1» (§19.7) saldría de un grafo ajeno.
+  --
+  -- Con la relectura, quien commitee el segundo lo ve: si el reenlace va primero, aquí se
+  -- lee el journey nuevo y el nodo ya no encaja; si va segundo, su propia lectura de
+  -- `elemento_cambio` encuentra la fila ya commiteada. El candado es el mismo que toma el
+  -- guard del borrador, así que para una transacción que toque las dos cosas es un no-op.
+  --
+  -- Lo que la hace suficiente es que el vínculo nodo→journey es INMUTABLE: `journey_id` no
+  -- está en el grant de columna de `journey_nodo`. Lo único que puede romper el par es
+  -- mover la DESIGN VERSION, que es exactamente lo que se relee aquí.
+  if not exists (
+    select 1 from design_version dv
+    join journey_nodo n on n.id = new.nodo_id and n.workspace_id = dv.workspace_id
+    where dv.id = new.design_version_id and dv.workspace_id = new.workspace_id
+      and n.journey_id = dv.journey_id) then
+    raise exception 'el journey de la design version cambió mientras se enlazaba este nodo: vuelve a elegir el nodo en el grafo nuevo';
+  end if;
   select n.catalogo_id into v_catalogo from journey_nodo n
     where n.id = new.nodo_id and n.workspace_id = new.workspace_id;
   if v_catalogo is not null and exists (
@@ -1532,6 +1695,13 @@ begin
   -- versión no congela. El guard del elemento no puede verlo —solo mira la fila que se
   -- escribe, y aquí no se escribe ninguna—, así que lo mira este. No se limpian solos a
   -- propósito: borrar el trabajo de otro en silencio es peor que pedir que lo revise.
+  --
+  -- Esta lectura es CRUZADA —mira filas que esta sentencia no escribe— y por tanto es un
+  -- predicado sobre una instantánea: un alta de elemento sin commitear no está en ella.
+  -- La otra mitad del par vive en elemento_cambio_identidad_guard, que al COMMIT y bajo el
+  -- candado de la versión vuelve a preguntar si el nodo sigue siendo del journey vigente.
+  -- Las dos hacen falta: esta rechaza al reenlace cuando el elemento ya está escrito, y
+  -- aquella al elemento cuando el reenlace se le adelanta.
   if tg_op = 'UPDATE' and exists (
     select 1 from elemento_cambio ec
     join journey_nodo n on n.id = ec.nodo_id and n.workspace_id = ec.workspace_id
@@ -1545,6 +1715,45 @@ create trigger design_version_journey
   before insert or update on design_version
   for each row execute function design_version_journey_guard();
 revoke execute on function design_version_journey_guard() from public;
+
+-- ══ Y LA OTRA MITAD DEL PAR, AL COMMIT ══
+-- El guard de arriba es BEFORE y su lectura de `elemento_cambio` es CRUZADA: mira filas que
+-- esa sentencia no escribe, o sea un predicado sobre una instantánea que no contiene las
+-- altas todavía sin commitear. Revalidar solo en el lado del ELEMENTO no basta, y conviene
+-- dejar escrito por qué, porque es la trampa de este mecanismo:
+--
+--   · el alta del elemento inserta y NO toma candado hasta su fase de commit;
+--   · el reenlace actualiza y su guard BEFORE no ve el alta;
+--   · si el elemento commitea PRIMERO, su diferido toma el candado, relee
+--     `design_version.journey_id` y lee todavía el journey VIEJO —el reenlace sigue sin
+--     commitear, y un SELECT en READ COMMITTED no espera a una escritura ajena—, así que
+--     pasa. Y el reenlace, sin diferido, ya no vuelve a mirar nada.
+--
+-- Los dos commitean. La lección es la misma que costó dos rondas en otro par: DIFERIDO NO
+-- ES EXCLUYENTE. Lo que excluye es que los DOS lados relean bajo el MISMO candado — así el
+-- segundo en llegar encuentra lo que el primero dejó commiteado, gane quien gane la carrera.
+create function design_version_journey_elementos_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  perform pg_advisory_xact_lock(hashtextextended('designio:dv-elemento:' || new.id, 42));
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return null;
+  end if;
+  if exists (
+    select 1 from elemento_cambio ec
+    join journey_nodo n on n.id = ec.nodo_id and n.workspace_id = ec.workspace_id
+    where ec.design_version_id = new.id and ec.workspace_id = new.workspace_id
+      and n.journey_id <> new.journey_id) then
+    raise exception 'hay elementos enlazados a nodos del journey anterior: quita esos enlaces antes de cambiar el journey';
+  end if;
+  return null;
+end $$;
+create constraint trigger design_version_journey_elementos
+  after update on design_version
+  deferrable initially deferred
+  for each row when (new.journey_id is distinct from old.journey_id and new.journey_id is not null)
+  execute function design_version_journey_elementos_guard();
+revoke execute on function design_version_journey_elementos_guard() from public;
 
 -- Alta de la design version: rastro con actor y rol del MISMO snapshot que la autorizó.
 -- El pre-chequeo deja pasar al owner (seed/backfill) sin fabricar eventos anónimos.

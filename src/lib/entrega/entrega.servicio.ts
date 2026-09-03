@@ -844,12 +844,31 @@ export async function desasignarElemento(
   });
 }
 
+/**
+ * Declara, PARA ESTA TRANSACCIÓN, el calendario en el que el cliente escribió su fecha.
+ * Lo lee `hoy_del_cliente()` desde los guards de `release` y `effective_state`, que son los
+ * dos únicos sitios que juzgan una fecha como «no futura».
+ *
+ * Va por variable de sesión y no como columna a propósito: el huso de quien teclea es
+ * contexto de la escritura, no un hecho del despliegue. Y va aquí, en el servicio, y no en
+ * `conUsuario`: solo estas dos operaciones tienen una fecha que juzgar, y meterlo en el
+ * camino común obligaría a todas las demás a arrastrar un dato que no usan.
+ *
+ * `set_config(..., true)` es LOCAL a la transacción: no se queda pegado a la conexión del
+ * pool para la siguiente petición, que con un pool compartido sería justo el fallo divertido
+ * de encontrar.
+ */
+async function declararCalendario(tx: TransactionSql, desfaseUtcMinutos: number): Promise<void> {
+  await tx`select set_config('app.desfase_utc_minutos', ${String(desfaseUtcMinutos)}, true)`;
+}
+
 export async function desplegarRelease(
   actorId: string,
   entrada: DesplegarRelease,
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    await declararCalendario(tx, entrada.desfaseUtcMinutos);
     await bloquearRelease(tx, entrada.releaseId);
     let filas;
     try {
@@ -881,6 +900,7 @@ export async function constatarEffectiveState(
 ): Promise<{ effectiveStateId: string }> {
   return conUsuarioTraduciendoElCommit(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    await declararCalendario(tx, entrada.desfaseUtcMinutos);
     await bloquearRelease(tx, entrada.releaseId);
     await bloquearSerie(tx, 'es', entrada.workspaceId);
     let es;

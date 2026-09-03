@@ -119,6 +119,22 @@ const HOY = () => {
   return `${ahora.getFullYear()}-${dosCifras(ahora.getMonth() + 1)}-${dosCifras(ahora.getDate())}`;
 };
 
+/**
+ * El calendario EN EL QUE se compuso esa fecha, en minutos respecto de UTC y con el signo
+ * natural (Madrid en verano, +120).
+ *
+ * Va pegado a las dos fechas que la base juzga como «no futuras», y sin él las dos mitades
+ * discrepaban: aquí se propone el día LOCAL —a eso se dedica `HOY()`— y el guard lo juzgaba
+ * contra el día de la BASE. Al este de UTC, pasada la medianoche local, la fecha correcta se
+ * rechazaba por futura y el usuario solo podía guardar AYER; sobre escrituras inmutables,
+ * ese día equivocado se queda. Ahora la fecha viaja con su calendario y el guard juzga en
+ * él: quien decide qué es «hoy» es quien escribe.
+ *
+ * `getTimezoneOffset()` va al revés que el uso corriente (devuelve +minutos al OESTE), y por
+ * eso el signo se invierte aquí, una sola vez, en el borde donde el dato sale.
+ */
+const DESFASE_UTC = () => -new Date().getTimezoneOffset();
+
 function PantallaDesignVersion() {
   const datos = Route.useLoaderData();
   const { membresiaActiva } = Route.useRouteContext();
@@ -1243,7 +1259,12 @@ function TarjetaRelease({
             onClick={async () => {
               onError(null);
               const r = await registrarDespliegue({
-                data: { workspaceId, releaseId: release.id, desplegadoEn: fecha },
+                data: {
+                  workspaceId,
+                  releaseId: release.id,
+                  desplegadoEn: fecha,
+                  desfaseUtcMinutos: DESFASE_UTC(),
+                },
               });
               if (r.ok) await onHecho();
               else onError(r.error);
@@ -1530,6 +1551,7 @@ function FormularioConstatacion({
           workspaceId,
           releaseId: release.id,
           constatadoEn,
+          desfaseUtcMinutos: DESFASE_UTC(),
           resumen,
           constataciones: release.elementos.map((el) => ({
             elementoId: el.elementoId,

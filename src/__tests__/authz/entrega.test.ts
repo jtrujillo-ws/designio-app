@@ -40,6 +40,11 @@ import { describeAuthz } from './helpers';
  */
 // Fechas RELATIVAS a la corrida: el guard rechaza despliegues y constataciones futuras,
 // así que fijarlas en el calendario haría que el test caducara.
+//
+// Y se componen en UTC (`toISOString`), así que las escrituras declaran `desfaseUtcMinutos: 0`:
+// el guard juzga «no futura» en el calendario que le declaran (ver hoy_del_cliente en la
+// migración), y un test que compone en UTC tiene que decir que escribe en UTC. El test del
+// calendario, más abajo, es el que ejercita los husos de verdad.
 const dia = (delta: number) =>
   new Date(Date.now() + delta * 86_400_000).toISOString().slice(0, 10);
 const HOY = dia(0);
@@ -558,17 +563,19 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         workspaceId: ws,
         releaseId: vacio.releaseId,
         desplegadoEn: AYER,
+        desfaseUtcMinutos: 0,
       }),
     ).rejects.toThrow(/sin elementos declarados/);
 
     await expect(
-      desplegarRelease(leadId, { workspaceId: ws, releaseId: rl1, desplegadoEn: dia(30) }),
+      desplegarRelease(leadId, { workspaceId: ws, releaseId: rl1, desplegadoEn: dia(30), desfaseUtcMinutos: 0 }),
     ).rejects.toThrow(/no puede ser futura/);
 
     await desplegarRelease(leadId, {
       workspaceId: ws,
       releaseId: rl1,
       desplegadoEn: AYER,
+      desfaseUtcMinutos: 0,
     });
     const dv = await designVersionCompleta(leadId, ws, dv1);
     expect(dv!.releases.find((r) => r.id === rl1)!.estado).toBe('desplegado');
@@ -583,6 +590,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         workspaceId: ws,
         releaseId: rl1,
         constatadoEn: HOY,
+        desfaseUtcMinutos: 0,
         resumen: '',
         constataciones: [
           { elementoId: elVideo, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -602,6 +610,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         workspaceId: ws,
         releaseId: rl1,
         constatadoEn: HOY,
+        desfaseUtcMinutos: 0,
         resumen: '',
         constataciones: [
           { elementoId: elVideo, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -613,6 +622,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rl1,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: 'La verificación en video opera; el motivo salió distinto',
       constataciones: [
         { elementoId: elVideo, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -667,11 +677,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rl2,
       desplegadoEn: HOY,
+      desfaseUtcMinutos: 0,
     });
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rl2,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         {
@@ -927,11 +939,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rl!.id as string,
       desplegadoEn: HOY,
+      desfaseUtcMinutos: 0,
     });
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rl!.id as string,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         {
@@ -1324,6 +1338,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rlCarrera,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: 'Salió antes de que el diseño se reemplazara',
       constataciones: [
         { elementoId: elCarreraA, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -1462,6 +1477,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: plan.releaseId,
       desplegadoEn: AYER,
+      desfaseUtcMinutos: 0,
     });
     // Una foto de lo que quedó funcionando no puede ser anterior al día en que salió: no
     // describiría este release. Y como el pliegue del estado vigente ORDENA por
@@ -1471,6 +1487,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         workspaceId: ws,
         releaseId: plan.releaseId,
         constatadoEn: dia(-10),
+        desfaseUtcMinutos: 0,
         resumen: '',
         constataciones: [
           { elementoId: elSucesora, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -1482,6 +1499,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: plan.releaseId,
       constatadoEn: AYER,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         { elementoId: elSucesora, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -1974,6 +1992,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rlDesplegado.releaseId,
       desplegadoEn: AYER,
+      desfaseUtcMinutos: 0,
     });
 
     // El ciclo siguiente supera a la primera y se concilia entero. Ocurre ANTES de firmar
@@ -2009,11 +2028,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rlSegunda.releaseId,
       desplegadoEn: HOY,
+      desfaseUtcMinutos: 0,
     });
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rlSegunda.releaseId,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         { elementoId: elSegunda, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -2047,6 +2068,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rlDesplegado.releaseId,
       constatadoEn: AYER,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         {
@@ -2069,6 +2091,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         workspaceId: ws,
         releaseId: rlPlanificado.releaseId,
         desplegadoEn: HOY,
+        desfaseUtcMinutos: 0,
       }),
     ).rejects.toThrow(/sin elementos declarados no se despliega/);
 
@@ -2342,6 +2365,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: plan.releaseId,
       desplegadoEn: AYER,
+      desfaseUtcMinutos: 0,
     });
     // La comprobación va ANTES que la de «constatar todos los elementos» a propósito: si
     // fuera después, sobre un release ya constatado por completo la fecha se colaría. Y
@@ -2594,6 +2618,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: plan.releaseId,
       desplegadoEn: AYER,
+      desfaseUtcMinutos: 0,
     });
 
     // El insert suelto que la política autoriza. Falla en el COMMIT, no en la sentencia:
@@ -2650,6 +2675,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: plan.releaseId,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: 'Los dos salieron como se aprobaron',
       constataciones: elementos.map((elementoId) => ({
         elementoId,
@@ -3211,6 +3237,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rlSale.releaseId,
       desplegadoEn: AYER,
+      desfaseUtcMinutos: 0,
     });
 
     // El proyecto B se lleva el servicio al ciclo siguiente y lo concilia ENTERO.
@@ -3237,11 +3264,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       fechaObjetivo: HOY,
       elementos: [{ elementoId: elB, razon: '' }],
     });
-    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlB.releaseId, desplegadoEn: HOY });
+    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlB.releaseId, desplegadoEn: HOY, desfaseUtcMinutos: 0 });
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rlB.releaseId,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         { elementoId: elB, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -3263,6 +3291,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rlSale.releaseId,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         {
@@ -3296,11 +3325,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       workspaceId: ws,
       releaseId: rlQuieto.releaseId,
       desplegadoEn: HOY,
+      desfaseUtcMinutos: 0,
     });
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rlQuieto.releaseId,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         {
@@ -3790,11 +3821,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       fechaObjetivo: HOY,
       elementos: [{ elementoId: dvB.elementoId, razon: '' }],
     });
-    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlB.releaseId, desplegadoEn: HOY });
+    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlB.releaseId, desplegadoEn: HOY, desfaseUtcMinutos: 0 });
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rlB.releaseId,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         { elementoId: dvB.elementoId, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
@@ -3818,11 +3850,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     // Se cierra el trabajo de A —lo hace quien puede, que aquí es el mismo lead— y entonces
     // B certifica: nada del servicio puede moverse ya sin que alguien lo constate.
-    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlA.releaseId, desplegadoEn: HOY });
+    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rlA.releaseId, desplegadoEn: HOY, desfaseUtcMinutos: 0 });
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rlA.releaseId,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         {
@@ -3837,6 +3870,224 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [g7] = await admin`select estado from gate_instancia
       where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
     expect(g7!.estado).toBe('aprobado');
+  });
+
+  it('el trabajo abierto de un ciclo POSTERIOR no bloquea al del medio', async () => {
+    // El reverso del test de arriba, y el borde por el que el ámbito se pasó de ancho:
+    // «todas las superadas del servicio del que respondo» se traga a los DESCENDIENTES.
+    // En A → B → C → D, en cuanto D supera a la de C, la de C —con trabajo sin resolver—
+    // entraba en el ámbito de B. Pero C no es trabajo que B heredara: es POSTERIOR a B.
+    //
+    // La prueba de que estaba mal es que el resultado del gate de B cambiaba por un hecho
+    // sin ninguna relación con B: esa misma versión de C, igual de sin resolver, NO lo
+    // bloqueaba mientras era la vigente; empezaba a bloquearlo en cuanto D la superaba.
+    // Un G7 que se vuelve inaprobable por lo que hagan los ciclos siguientes no certifica
+    // nada. El ámbito es LINAJE —lo que uno reemplazó, hacia atrás—, no «el servicio».
+    const admin = sqlAdmin();
+    const [pa] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-120', 'A de la cadena de cuatro', ${leadId}) returning id`;
+    const proyA = pa!.id as string;
+    const proyB = await proyectoConGates('P-121', 'B de la cadena de cuatro');
+    // C nace CON gates: al final se comprueba que el ámbito no se pierde, sino que aterriza
+    // en el proyecto al que le toca — y para eso su G7 tiene que existir de verdad.
+    const proyC = await proyectoConGates('P-122', 'C de la cadena de cuatro');
+    const [pd] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-123', 'D de la cadena de cuatro', ${leadId}) returning id`;
+    const proyD = pd!.id as string;
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la cadena de cuatro');
+
+    const nueva = async (proy: string, titulo: string, superaA: string | null) => {
+      const dv = await crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proy,
+        servicioId: svcId,
+        journeyId,
+        titulo,
+        resumen: '',
+        superaA,
+      });
+      const el = await elementoSuelto(dv.designVersionId, `Elemento de ${titulo}`);
+      await aprobarDesignVersion(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        motivo: '',
+      });
+      return { id: dv.designVersionId, elementoId: el };
+    };
+
+    // Cierre completo de un elemento: release, despliegue y constatación.
+    const cerrar = async (dvId: string, elementoId: string, titulo: string) => {
+      const rl = await planificarRelease(leadId, {
+        workspaceId: ws,
+        designVersionId: dvId,
+        titulo,
+        responsable: 'Equipo',
+        fechaObjetivo: HOY,
+        elementos: [{ elementoId, razon: '' }],
+      });
+      await desplegarRelease(leadId, { workspaceId: ws, releaseId: rl.releaseId, desplegadoEn: HOY, desfaseUtcMinutos: 0 });
+      await constatarEffectiveState(leadId, {
+        workspaceId: ws,
+        releaseId: rl.releaseId,
+        constatadoEn: HOY,
+        desfaseUtcMinutos: 0,
+        resumen: '',
+        constataciones: [
+          { elementoId, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+        ],
+      });
+    };
+
+    // A y B cierran lo suyo: B no debe nada hacia atrás.
+    const dvA = await nueva(proyA, 'la de A', null);
+    await cerrar(dvA.id, dvA.elementoId, 'El de A');
+    const dvB = await nueva(proyB, 'la de B', dvA.id);
+    await cerrar(dvB.id, dvB.elementoId, 'El de B');
+
+    // C se lleva el servicio y deja su elemento SIN resolver, en un release planificado.
+    const dvC = await nueva(proyC, 'la de C', dvB.id);
+    await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dvC.id,
+      titulo: 'El que C no llegó a desplegar',
+      responsable: 'Equipo de C',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: dvC.elementoId, razon: '' }],
+    });
+    await aprobarGatesHasta(proyB, 6);
+
+    const aprobarG7B = () =>
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
+    // La MISMA redacción que levanta el guard, preguntada directamente: si el ámbito se
+    // pasa de ancho, aquí sale el motivo antes de que el update lo confirme.
+    const bloqueoDeG7 = async (proy: string): Promise<string | null> => {
+      const [f] = await admin`select g7_motivo_de_bloqueo(${proy}, ${ws}) as motivo`;
+      return (f!.motivo as string | null) ?? null;
+    };
+
+    // Mientras la de C es la VIGENTE, su trabajo abierto no bloquea a B. Nadie lo discute.
+    expect(await bloqueoDeG7(proyB)).toBeNull();
+
+    // Y ahora D supera a la de C. Para B no ha cambiado NADA: ni su linaje, ni su trabajo,
+    // ni lo que heredó. Su G7 tiene que seguir aprobándose.
+    await nueva(proyD, 'la de D', dvC.id);
+    expect(await bloqueoDeG7(proyB)).toBeNull();
+    await aprobarG7B();
+    const [g7B] = await admin`select estado from gate_instancia
+      where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;
+    expect(g7B!.estado).toBe('aprobado');
+
+    // Y el que SÍ responde por lo que C dejó abierto es C, no B: el ámbito no se pierde,
+    // se coloca donde toca.
+    await aprobarGatesHasta(proyC, 6);
+    await expect(
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where proyecto_id = ${proyC} and workspace_id = ${ws} and numero = 7`,
+    ).rejects.toThrow(/estado desconocido/);
+  });
+
+  it('la fecha se juzga en el calendario de QUIEN ESCRIBE, no en el de la base (RF-06.5, RF-06.6)', async () => {
+    // «No puede ser futura» no significa nada sin decir «futura ¿en qué calendario?», y las
+    // dos mitades contestaban distinto: la pantalla propone el día LOCAL del usuario y el
+    // guard lo juzgaba contra el de la BASE. Al este de UTC, pasada la medianoche local, la
+    // fecha correcta se rechazaba por futura y al usuario solo le quedaba escribir AYER —
+    // sobre escrituras inmutables, así que el día equivocado se queda y encima reordena el
+    // effective state vigente del servicio (RF-06.10).
+    const admin = sqlAdmin();
+
+    // «Hoy» en un huso dado, compuesto como lo compone la pantalla: la hora UTC desplazada.
+    const hoyEn = (min: number) => new Date(Date.now() + min * 60_000).toISOString().slice(0, 10);
+    const siguiente = (f: string) => {
+      const d = new Date(`${f}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + 1);
+      return d.toISOString().slice(0, 10);
+    };
+    const hoyDeLaBase = (desfase: number): Promise<string> =>
+      admin.begin(async (tx) => {
+        await tx`select set_config('app.desfase_utc_minutos', ${String(desfase)}, true)`;
+        const [f] = await tx`select to_char(hoy_del_cliente(), 'YYYY-MM-DD') as hoy`;
+        return f!.hoy as string;
+      }) as Promise<string>;
+
+    // La propiedad que faltaba: las dos mitades contestan lo MISMO en cada calendario.
+    for (const desfase of [-720, -300, 0, 120, 330, 840]) {
+      expect(await hoyDeLaBase(desfase)).toBe(hoyEn(desfase));
+    }
+    // Un desfase que no es de este mundo no regala días: se acota a los husos reales.
+    expect(await hoyDeLaBase(100_000)).toBe(hoyEn(840));
+    expect(await hoyDeLaBase(-100_000)).toBe(hoyEn(-720));
+    // Y quien no declara calendario se juzga en el de la base, como siempre.
+    const [sinDeclarar] = await admin`select to_char(hoy_del_cliente(), 'YYYY-MM-DD') as hoy`;
+    expect(sinDeclarar!.hoy as string).toBe(hoyEn(0));
+
+    // Y el guard de punta a punta, en el huso más adelantado que existe: su HOY se acepta
+    // —aunque en UTC pueda ser todavía mañana— y su MAÑANA se sigue rechazando, que es la
+    // mitad de la regla que no se puede perder al arreglar la otra.
+    const proy = await proyectoConGates('P-124', 'Proyecto del calendario');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del calendario');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del calendario',
+      resumen: '',
+      superaA: null,
+    });
+    const el = await elementoSuelto(dv.designVersionId, 'Elemento del calendario');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const rl = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'El del calendario',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: el, razon: '' }],
+    });
+
+    const desfase = 840;
+    const hoyDelCliente = hoyEn(desfase);
+
+    await expect(
+      desplegarRelease(leadId, {
+        workspaceId: ws,
+        releaseId: rl.releaseId,
+        desplegadoEn: siguiente(hoyDelCliente),
+        desfaseUtcMinutos: desfase,
+      }),
+    ).rejects.toThrow(/futura/);
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: rl.releaseId,
+      desplegadoEn: hoyDelCliente,
+      desfaseUtcMinutos: desfase,
+    });
+
+    // La constatación es la otra fecha inmutable y va por el mismo camino.
+    const constatacion = { elementoId: el, resultado: 'como-aprobado' as const, queQuedoDistinto: '', razon: '' };
+    await expect(
+      constatarEffectiveState(leadId, {
+        workspaceId: ws,
+        releaseId: rl.releaseId,
+        constatadoEn: siguiente(hoyDelCliente),
+        desfaseUtcMinutos: desfase,
+        resumen: '',
+        constataciones: [constatacion],
+      }),
+    ).rejects.toThrow(/futura/);
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rl.releaseId,
+      constatadoEn: hoyDelCliente,
+      desfaseUtcMinutos: desfase,
+      resumen: '',
+      constataciones: [constatacion],
+    });
   });
 
   it('el proyecto que firmó su G6 antes de esta migración no se queda encerrado', async () => {
@@ -3926,11 +4177,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;
     // G7 no se regala: sigue exigiendo el tablero completo.
     await expect(aprobarG7()).rejects.toThrow(/en estado desconocido/);
-    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rl.releaseId, desplegadoEn: HOY });
+    await desplegarRelease(leadId, { workspaceId: ws, releaseId: rl.releaseId, desplegadoEn: HOY, desfaseUtcMinutos: 0 });
     await constatarEffectiveState(leadId, {
       workspaceId: ws,
       releaseId: rl.releaseId,
       constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
       resumen: '',
       constataciones: [
         { elementoId: el, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },

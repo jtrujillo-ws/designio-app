@@ -120,6 +120,29 @@ const FechaSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Fecha con formato Y
  * volver a tener dos definiciones de lo mismo, y la que se queda vieja es siempre la de la
  * pantalla.
  */
+/**
+ * El desfase del cliente respecto de UTC, EN MINUTOS y con el signo natural (Madrid en
+ * verano es +120), tal como lo da `-new Date().getTimezoneOffset()`.
+ *
+ * Viaja pegado a las dos fechas que la base juzga como «no futuras» porque una fecha sola no
+ * dice en qué calendario es hoy. La pantalla propone el día LOCAL del usuario y el guard lo
+ * juzgaba contra el día de la BASE: al este de UTC, pasada la medianoche local, la fecha
+ * correcta se rechazaba por futura y el usuario solo podía guardar ayer — sobre escrituras
+ * inmutables. Ahora la fecha llega con su calendario y las dos mitades contestan lo mismo.
+ *
+ * El rango es el de los husos que existen, UTC-12 a UTC+14: es lo que impide regalarse días
+ * declarando un desfase inventado. `hoy_del_cliente()` lo vuelve a acotar del lado de la
+ * base, porque el esquema protege a la app y el guard tiene que protegerse solo.
+ *
+ * Con `default(0)` un caller que no lo declare se juzga en UTC, que es la regla de antes.
+ */
+const DesfaseUtcSchema = z
+  .number()
+  .int()
+  .min(-720, 'Desfase horario fuera de los husos reales')
+  .max(840, 'Desfase horario fuera de los husos reales')
+  .default(0);
+
 export const LARGO_MAXIMO = {
   titulo: 200,
   resumen: 2000,
@@ -240,6 +263,7 @@ export const DesplegarReleaseSchema = z.object({
   workspaceId: z.string().uuid(),
   releaseId: z.string().uuid(),
   desplegadoEn: FechaSchema,
+  desfaseUtcMinutos: DesfaseUtcSchema,
 });
 export type DesplegarRelease = z.infer<typeof DesplegarReleaseSchema>;
 
@@ -247,6 +271,7 @@ export const ConstatarSchema = z.object({
   workspaceId: z.string().uuid(),
   releaseId: z.string().uuid(),
   constatadoEn: FechaSchema,
+  desfaseUtcMinutos: DesfaseUtcSchema,
   resumen: z.string().trim().max(LARGO_MAXIMO.resumen).default(''),
   constataciones: z
     .array(

@@ -297,28 +297,65 @@ revoke execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) from
 grant execute on function design_versions_a_cargo_del_proyecto(uuid, uuid) to designio_app;
 
 -- Las design versions SUPERADAS por cuyo vuelo responde la conciliación de este proyecto:
--- las suyas propias, y las de los servicios DE LOS QUE ESTE PROYECTO RESPONDE —porque la
--- cadena de versiones de un servicio atraviesa proyectos y el effective state es del
--- servicio, no del proyecto—. Se escribe una vez porque la usan las DOS mitades de la regla
--- de G7, que distinguen según quién las superó.
+-- las suyas propias, y las que sus versiones REEMPLAZARON —directa o transitivamente—,
+-- porque la cadena de versiones de un servicio atraviesa proyectos y el effective state es
+-- del servicio, no del proyecto. Se escribe una vez porque la usan las DOS mitades de la
+-- regla de G7, que distinguen según quién las superó.
 --
--- «De los que responde» y no «de los que tiene la aprobada vigente», que es lo que decía
--- antes y se rompía en la cadena de tres: en A → B → C, cuando C supera a la de B, la de B
--- pasa a 'superada' y B deja de tener ninguna aprobada de ese servicio — el brazo por
--- servicio se quedaba vacío y la de A se caía del ámbito de B, que entonces certificaba G7
--- sin responder por el trabajo abierto de A. La aprobada vigente es solo un caso particular
--- de la responsabilidad: `design_versions_a_cargo_del_proyecto` sí conserva la de B (nadie
--- DENTRO de B la reemplazó), así que la pieza ya estaba escrita y solo había que usarla.
+-- El ámbito es LINAJE, y llegar aquí costó equivocarse por los DOS lados:
+--
+--  · Demasiado ESTRECHO al principio. Se derivaba de «los servicios de los que el proyecto
+--    tiene la aprobada VIGENTE», y eso se rompe un eslabón más arriba: en A → B → C, cuando
+--    C supera a la de B, B deja de tener aprobada de ese servicio, el brazo se queda vacío
+--    y la de A se cae del ámbito de B — que entonces certificaba G7 sin responder por el
+--    trabajo abierto de A.
+--  · Demasiado ANCHO después. «Todas las superadas del SERVICIO del que respondo» se traga
+--    a los DESCENDIENTES: en A → B → C → D, en cuanto D supera a la de C, la de C entra en
+--    el ámbito de B. Y la de C no es trabajo que B heredara: es POSTERIOR a B.
+--
+-- Lo que delata que lo ancho estaba mal es que el resultado del gate de B cambiaba por un
+-- hecho SIN NINGUNA RELACIÓN CON B: esa misma versión de C, igual de sin resolver, no
+-- bloqueaba a B mientras era la vigente, y empezaba a bloquearlo en cuanto D la superaba.
+-- Un G7 que se vuelve inaprobable por lo que hagan los ciclos siguientes no es una
+-- certificación.
+--
+-- Las dos veces el error fue el mismo: nombrar el ámbito por una propiedad del SERVICIO
+-- cuando lo que se quiere decir es una relación de LINAJE. «De qué responde B» es «lo que B
+-- reemplazó», directa o transitivamente, así que se recorre `supera_a` HACIA ATRÁS desde el
+-- conjunto de responsabilidad de B. Entra la de A y no entra la de C, y el resultado deja
+-- de depender de quién esté aprobado hoy — que es lo que hacía saltar el ámbito de un lado
+-- a otro sin que B tocara nada.
+--
+-- Y el linaje SÍ recoge a un tercero cuando de verdad se hereda: si B vuelve a tomar el
+-- servicio más tarde (A → B1 → C1 → B2), B2 reemplazó a la de C1, así que C1 entra en el
+-- ámbito de B. Lo que decide no es de quién es la versión, sino si la versión de la que
+-- respondo la reemplazó.
+--
+-- No hace falta acotar el recorrido por servicio: `supera_a` solo apunta a versiones del
+-- MISMO servicio (lo exige design_version_anclaje_guard), así que no puede salirse.
+--
+-- El camino acumulado no es decoración. Hoy el grafo no admite ciclos —`supera_a` se fija
+-- al nacer y apunta a una versión que ya existe—, pero un UPDATE directo por SQL podría
+-- cerrar uno, y sin la comprobación el `with recursive` no terminaría: el gate se COLGARÍA
+-- en lugar de rechazar, que es el peor de los dos fallos. Con ella, un ciclo simplemente
+-- corta el recorrido.
 create function design_versions_superadas_del_ambito(p_proyecto uuid, p_workspace uuid)
 returns setof uuid language sql stable as $$
+  with recursive linaje as (
+    select dv.id, dv.supera_a, array[dv.id] as camino
+    from design_version dv
+    where dv.workspace_id = p_workspace
+      and dv.id in (select design_versions_a_cargo_del_proyecto(p_proyecto, p_workspace))
+    union all
+    select ant.id, ant.supera_a, l.camino || ant.id
+    from linaje l
+    join design_version ant on ant.id = l.supera_a and ant.workspace_id = p_workspace
+    where not ant.id = any(l.camino)
+  )
   select dv.id
   from design_version dv
   where dv.workspace_id = p_workspace and dv.estado = 'superada'
-    and (dv.proyecto_id = p_proyecto
-         or dv.servicio_id in (
-           select resp.servicio_id from design_version resp
-           where resp.workspace_id = p_workspace
-             and resp.id in (select design_versions_a_cargo_del_proyecto(p_proyecto, p_workspace))))
+    and (dv.proyecto_id = p_proyecto or dv.id in (select id from linaje))
 $$;
 revoke execute on function design_versions_superadas_del_ambito(uuid, uuid) from public;
 
@@ -1467,6 +1504,60 @@ create constraint trigger release_elemento_cobertura
   for each row execute function release_elemento_cobertura_guard();
 revoke execute on function release_elemento_cobertura_guard() from public;
 
+-- ══ EL CALENDARIO QUE MANDA ES EL DE QUIEN ESCRIBE (RF-06.5, RF-06.6) ══
+-- «La fecha no puede ser futura» no dice nada hasta que se responde «futura ¿en qué
+-- calendario?», y las dos mitades del producto contestaban distinto:
+--
+--  · la pantalla propone el día LOCAL del usuario —HOY() en design-version.$designVersionId.tsx
+--    se compone con los getters locales justamente para no proponer el de UTC—;
+--  · el guard lo juzgaba contra `current_date`, que es el día de la BASE.
+--
+-- Con la base en UTC y un usuario al este pasada su medianoche local, la fecha correcta que
+-- la pantalla propone se rechaza por «futura», y al usuario solo le queda guardar AYER.
+-- Sobre escrituras INMUTABLES —no hay UPDATE que corrija `desplegado_en` ni `constatado_en`,
+-- y encima ordenan el effective state vigente del servicio (RF-06.10)—, así que el día
+-- equivocado se queda para siempre y reordena la historia del servicio.
+--
+-- El arreglo NO es ensanchar el límite un día. Eso admitiría fechas genuinamente futuras y
+-- la regla «no se registra lo que aún no ha ocurrido» dejaría de sostenerse; además elegiría
+-- un calendario arbitrario en vez de nombrar el que manda. Lo que faltaba es que la fecha
+-- viaje CON el calendario en el que significa algo: el cliente declara su desfase respecto
+-- de UTC y el guard juzga en ESE calendario. Los dos lados pasan a contestar lo mismo porque
+-- leen la misma pregunta.
+--
+-- El desfase llega por `app.desfase_utc_minutos`, SET LOCAL por transacción, igual que
+-- `app.user_id` — no como columna: la zona de quien teclea no es un hecho del despliegue ni
+-- de la constatación, es contexto de la escritura, y guardarla en la fila la convertiría en
+-- dato de dominio que alguien acabaría interpretando.
+--
+-- Se acota a los husos que existen de verdad, [-12:00, +14:00], y eso es lo que impide que
+-- un cliente se regale días declarando un desfase absurdo. Dentro de ese rango, lo más que
+-- puede hacer es contar como «hoy» un día que YA es hoy en algún sitio habitado — que es la
+-- ambigüedad que «hoy» tiene de por sí y no un agujero que abra esto.
+--
+-- Y si nadie declara calendario —un UPDATE directo por SQL, un job—, el desfase es 0 y la
+-- regla es la de siempre, la de UTC: quien no dice en qué calendario escribe se juzga en el
+-- de la base. La comprobación del formato es para que un valor con basura no reviente la
+-- escritura con un error de casteo que no explica nada: se ignora y se cae al 0.
+create function hoy_del_cliente() returns date
+language sql stable as $$
+  select ((now() at time zone 'UTC') + make_interval(mins => greatest(-720, least(840, v.minutos))))::date
+  from (
+    select case
+      -- Hasta 9 dígitos: lo que cabe en un int4 sin desbordar. El límite no está para
+      -- acotar el huso —de eso se encarga el greatest/least, que ACOTA en vez de descartar—
+      -- sino para que un valor con basura no reviente la escritura con un error de casteo
+      -- que no explicaría nada. Un número fuera de rango se acota; algo que no es un número
+      -- se ignora y manda UTC.
+      when current_setting('app.desfase_utc_minutos', true) ~ '^-?[0-9]{1,9}$'
+        then current_setting('app.desfase_utc_minutos', true)::int
+      else 0
+    end as minutos
+  ) v
+$$;
+-- Solo la llaman los dos guards, que son SECURITY DEFINER y corren como el dueño.
+revoke execute on function hoy_del_cliente() from public;
+
 -- Transiciones del release (§3.3) con sus exigencias y sus eventos dentro del guard.
 create function release_transicion_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
@@ -1503,7 +1594,8 @@ begin
   end if;
 
   if new.estado = 'desplegado' then
-    if new.desplegado_en > current_date then
+    -- En el calendario de QUIEN ESCRIBE, no en el de la base (ver hoy_del_cliente).
+    if new.desplegado_en > hoy_del_cliente() then
       raise exception 'la fecha real de despliegue no puede ser futura';
     end if;
     -- SYS-06: «declara explícitamente qué elementos incluye». Un release vacío
@@ -1564,7 +1656,8 @@ begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
-  if new.constatado_en > current_date then
+  -- En el calendario de QUIEN ESCRIBE, no en el de la base (ver hoy_del_cliente).
+  if new.constatado_en > hoy_del_cliente() then
     raise exception 'la fecha de constatación no puede ser futura';
   end if;
   select r.desplegado_en into v_desplegado_en

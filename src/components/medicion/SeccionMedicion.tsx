@@ -661,9 +661,15 @@ function BloqueSerie({
   const [pegando, setPegando] = useState(false);
   const [ocupado, setOcupado] = useState(false);
   const [rechazadas, setRechazadas] = useState<{ linea: number; motivo: string }[]>([]);
-  // La política acepta al curador o al PROPIETARIO del dato, y solo mientras el reto mide.
+  // Espejo de `snapshot_insert`, y son TRES condiciones y no dos: quién escribe, el reto
+  // MIDIENDO y el registry FIRMADO (SYS-22). La tercera faltaba y no era inalcanzable: el
+  // reto HEREDADO ya está 'en-medicion' mientras su contrato sigue en borrador, así que
+  // añadidas sus entradas el formulario se ofrecía entero para que la política rechazara
+  // cada carga. Solo se mide lo firmado.
   const puedeCargar =
-    (esCurador || entrada.soyPropietario) && seguimiento.retoEstado === 'en-medicion';
+    (esCurador || entrada.soyPropietario) &&
+    seguimiento.retoEstado === 'en-medicion' &&
+    seguimiento.registry?.estado === 'firmado';
   // Un payload por escritura, armado una vez y leído por los dos: el espejo que decide si
   // el botón se ofrece y el envío. El valor métrico tiene FORMA —el schema y la columna
   // exigen un decimal con punto— y el botón solo miraba que no estuviera vacío: «cuarenta»

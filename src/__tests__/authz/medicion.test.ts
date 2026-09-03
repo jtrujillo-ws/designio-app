@@ -42,6 +42,7 @@ import {
   type CompletarReview,
 } from '@/lib/medicion/medicion.schemas';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
+import { faltaParaAprobarGate } from '@/lib/metodo/metodo.schemas';
 import { describeAuthz } from './helpers';
 
 /**
@@ -2446,6 +2447,42 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(aprobarGateNumero(6, actVieja.proyectoId)).rejects.toThrow(
       /con el proyecto parado/,
     );
+    // Y la PANTALLA lo sabe antes de ofrecer el botón. Este rechazo no lo veía ni la
+    // etiqueta: decía «Listo para aprobar» con el proyecto parado, y el botón —cuyo
+    // `disabled` miraba solo si había una petición en vuelo— se ofrecía encendido. Ahora la
+    // etiqueta y el botón salen del MISMO predicado, así que no pueden discrepar.
+    const gateG6 = {
+      id: 'g6',
+      numero: 6,
+      rolAprobador: 'sponsor' as const,
+      estado: 'pendiente' as const,
+      aprobadoEn: null,
+      items: [
+        {
+          id: 'i1',
+          orden: 1,
+          texto: 'Plan de implementación acordado',
+          estado: 'cumplido' as const,
+          objetoClase: null,
+          objetoId: null,
+          objetoTitulo: null,
+          decisionEnRevision: false,
+          naJustificacion: '',
+        },
+      ],
+    };
+    const contexto = {
+      anterioresAprobados: true,
+      criteriosListosG0: true,
+      registryFirmadoG6: true,
+      arquetiposSinVeredicto: 0,
+    };
+    expect(faltaParaAprobarGate(gateG6, { ...contexto, proyectoEstado: 'pausado' })).toEqual([
+      'El proyecto no está activo: retómalo antes, porque aprobar el plan lo pone en implementación (§7)',
+    ]);
+    // Y la mitad simétrica: con el proyecto activo no falta nada y el botón se enciende.
+    // Apagar de más es tan avería como ofrecer de más.
+    expect(faltaParaAprobarGate(gateG6, { ...contexto, proyectoEstado: 'activo' })).toEqual([]);
     // Y el gate sigue PENDIENTE: lo que se descarta es el no-op silencioso, que dejaba el
     // gate aprobado y el proyecto quieto para siempre.
     const [g6Parado] = await conUsuario(leadId, (tx) => tx`select estado from gate_instancia

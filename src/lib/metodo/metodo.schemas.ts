@@ -150,6 +150,9 @@ export type ItemDeGate = {
   objetoClase: ClaseObjetoCitable | null;
   objetoId: string | null;
   objetoTitulo: string | null;
+  /** Su decisión pasó a «en revisión» por una reapertura: cumplido deja de contar como
+   * suficiencia (RF-04.9) y el guard rechaza la aprobación del gate entero. */
+  decisionEnRevision: boolean;
   naJustificacion: string;
 };
 
@@ -197,3 +200,66 @@ export type ProyectoMetodo = {
   etapas: EtapaDeProyecto[];
   gates: GateDeProyecto[];
 };
+
+/**
+ * Qué le falta a un gate para poder APROBARSE, con el motivo que lo dice.
+ *
+ * Un botón habilitado es una promesa de que el envío tiene sentido, y el de aprobar el gate
+ * la rompía: su `disabled` miraba solo si había una petición en curso. La etiqueta de al lado
+ * SÍ sabía cuatro de las razones —ítems pendientes, gates anteriores, criterios de G0, el
+ * registry de G6— pero era otra expresión, escrita a mano en el JSX; así que la pantalla
+ * decía «Esperando los gates anteriores» con el botón encendido debajo. Dos condiciones
+ * parecidas para la misma pregunta son dos verdades, y la de la etiqueta no apagaba nada.
+ *
+ * Aquí se responde UNA vez y de aquí salen las dos: la etiqueta es el primer motivo y el
+ * botón se apaga si hay alguno. Vive en el módulo y no dentro del componente por el mismo
+ * motivo que sus hermanos de `medicion.schemas`: lo que la pantalla decide a mano es lo que
+ * ningún test alcanza.
+ *
+ * Espeja las DOS superficies que rechazan esta escritura, que es la lección de esta noche:
+ * `gate_aprobar_suficiencia_guard` (checklist, gates anteriores, G0, G2, G6) y
+ * `proyecto_a_implementacion_tras_g6_guard`, que rechaza aprobar G6 con el proyecto parado
+ * porque su efecto —meterlo en implementación— solo alcanza a un proyecto 'activo'. Esa
+ * última no la sabía ni la etiqueta.
+ */
+export function faltaParaAprobarGate(
+  gate: GateDeProyecto,
+  contexto: {
+    anterioresAprobados: boolean;
+    criteriosListosG0: boolean;
+    registryFirmadoG6: boolean;
+    arquetiposSinVeredicto: number;
+    proyectoEstado: string;
+  },
+): string[] {
+  if (gate.estado === 'aprobado') return [];
+  const falta: string[] = [];
+  const pendientes = gate.items.filter((i) => i.estado === 'pendiente').length;
+  if (gate.items.length === 0) {
+    falta.push('el gate no tiene checklist instanciado');
+  } else if (pendientes > 0) {
+    falta.push(`${pendientes} pendientes`);
+  }
+  // Un ítem cumplido cuya decisión volvió a revisión no cuenta como suficiencia (RF-04.9).
+  const enRevision = gate.items.filter((i) => i.estado === 'cumplido' && i.decisionEnRevision);
+  if (enRevision.length > 0) {
+    falta.push(`${enRevision.length} ítems con decisiones en revisión`);
+  }
+  if (!contexto.anterioresAprobados) falta.push('Esperando los gates anteriores');
+  if (gate.numero === 0 && !contexto.criteriosListosG0) {
+    falta.push('Faltan criterios completos (SYS-22)');
+  }
+  if (gate.numero === 2 && contexto.arquetiposSinVeredicto > 0) {
+    falta.push(`${contexto.arquetiposSinVeredicto} arquetipos sin confirmar ni refutar`);
+  }
+  if (gate.numero === 6 && !contexto.registryFirmadoG6) {
+    falta.push('Falta firmar el Metric Registry (SYS-22)');
+  }
+  // §7: aprobar G6 mete el proyecto en implementación, y ese efecto solo alcanza a un
+  // proyecto 'activo'. Con el proyecto parado el guard rechaza la aprobación ENTERA —no la
+  // deja pasar sin efecto—, así que ofrecerla es prometer algo que la base ya negó.
+  if (gate.numero === 6 && contexto.proyectoEstado !== 'activo') {
+    falta.push('El proyecto no está activo: retómalo antes, porque aprobar el plan lo pone en implementación (§7)');
+  }
+  return falta;
+}

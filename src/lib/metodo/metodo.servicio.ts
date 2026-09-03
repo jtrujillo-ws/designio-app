@@ -501,6 +501,12 @@ export async function proyectoMetodo(
                   when ci.decision_id is not null then 'decision' end,
                 'objetoId', coalesce(ci.evidencia_id, ci.insight_id, ci.decision_id),
                 'objetoTitulo', coalesce(ev.titulo, ins.titulo, dec.titulo),
+                -- Un ítem YA cumplido cuya decisión pasó a 'en-revision' por una reapertura
+                -- deja de contar como suficiencia (RF-04.9) y el guard del gate rechaza la
+                -- aprobación entera. Viaja para que el espejo de la pantalla pueda cubrir
+                -- también esa condición: sin este dato el botón se ofrecía encendido y el
+                -- rechazo llegaba del servidor.
+                'decisionEnRevision', (dec.id is not null and dec.estado <> 'vigente'),
                 'naJustificacion', ci.na_justificacion)
                 order by ci.orden)
               from checklist_item ci

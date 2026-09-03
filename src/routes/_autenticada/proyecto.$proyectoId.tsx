@@ -16,7 +16,11 @@ import {
   proyectoDelMetodo,
 } from '@/lib/metodo/metodo.functions';
 import { ETIQUETA_PERFIL } from '@/lib/metodo/metodo.plantillas';
-import { CLASES_OBJETO_CITABLE, ETIQUETA_CLASE_OBJETO } from '@/lib/metodo/metodo.schemas';
+import {
+  CLASES_OBJETO_CITABLE,
+  ETIQUETA_CLASE_OBJETO,
+  faltaParaAprobarGate,
+} from '@/lib/metodo/metodo.schemas';
 import type {
   ClaseObjetoCitable,
   CriterioDeReto,
@@ -231,6 +235,10 @@ function PantallaProyecto() {
                   rol={rol}
                   criteriosListosG0={criteriosCompletos(datos.proyecto.reto.criterios)}
                   registryFirmadoG6={datos.seguimiento?.registry?.estado === 'firmado'}
+                  arquetiposSinVeredicto={
+                    datos.gobernanza.arquetipos.filter((a) => a.estado === 'hipotesis').length
+                  }
+                  proyectoEstado={datos.proyecto.estado}
                   anterioresAprobados={datos.proyecto.gates
                     .filter((g2) => g2.numero < etapa.numero)
                     .every((g2) => g2.estado === 'aprobado')}
@@ -350,6 +358,8 @@ function EtapaConGate({
   criteriosListosG0,
   registryFirmadoG6,
   anterioresAprobados,
+  arquetiposSinVeredicto,
+  proyectoEstado,
   onCambio,
   onError,
 }: {
@@ -371,13 +381,26 @@ function EtapaConGate({
   registryFirmadoG6: boolean;
   /** Los gates ordenan el método: el N no está «listo» con anteriores pendientes. */
   anterioresAprobados: boolean;
+  /** G2 no se aprueba con arquetipos en hipótesis (RF-04.11), y G6 no se aprueba con el
+   * proyecto parado: aprobar el plan lo mete en implementación y ese efecto solo alcanza a
+   * un proyecto 'activo' (§7). Las dos las rechaza la base; el espejo las dice antes. */
+  arquetiposSinVeredicto: number;
+  proyectoEstado: string;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
 }) {
   const [aprobando, setAprobando] = useState(false);
   if (!gate) return null;
   const puedeAprobar = rol === gate.rolAprobador;
-  const pendientes = gate.items.filter((i) => i.estado === 'pendiente').length;
+  // UNA sola respuesta a «¿qué le falta a este gate?», y de ella salen la etiqueta y el
+  // botón. Vive en `metodo.schemas` porque es donde los tests la alcanzan.
+  const falta = faltaParaAprobarGate(gate, {
+    anterioresAprobados,
+    criteriosListosG0,
+    registryFirmadoG6,
+    arquetiposSinVeredicto,
+    proyectoEstado,
+  });
 
   async function aprobar() {
     if (!gate) return;
@@ -410,15 +433,7 @@ function EtapaConGate({
           </span>
         ) : (
           <span style={{ font: '600 12px var(--font-sans)', color: 'var(--warn)' }}>
-            {pendientes > 0
-              ? `${pendientes} pendientes`
-              : !anterioresAprobados
-                ? 'Esperando los gates anteriores'
-                : gate.numero === 0 && !criteriosListosG0
-                  ? 'Faltan criterios completos (SYS-22)'
-                  : gate.numero === 6 && !registryFirmadoG6
-                    ? 'Falta firmar el Metric Registry (SYS-22)'
-                    : 'Listo para aprobar'}
+            {falta[0] ?? 'Listo para aprobar'}
           </span>
         )}
       </div>
@@ -442,10 +457,25 @@ function EtapaConGate({
       </div>
 
       {gate.estado === 'pendiente' && puedeAprobar && (
-        <div>
-          <Button size="sm" disabled={aprobando} onClick={() => void aprobar()}>
-            {aprobando ? 'Aprobando…' : `Aprobar G${gate.numero}`}
-          </Button>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {/* La etiqueta de arriba y este `disabled` salen del MISMO predicado. Escritos como
+              dos expresiones parecidas, la etiqueta decía «Esperando los gates anteriores» con
+              el botón encendido debajo: dos verdades sobre la misma pregunta, y la que apagaba
+              no era ninguna. Lo que falta se enumera entero, no solo el primero. */}
+          {falta.length > 0 && (
+            <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+              Falta para poder aprobarlo: {falta.join(' · ')}
+            </span>
+          )}
+          <div>
+            <Button
+              size="sm"
+              disabled={aprobando || falta.length > 0}
+              onClick={() => void aprobar()}
+            >
+              {aprobando ? 'Aprobando…' : `Aprobar G${gate.numero}`}
+            </Button>
+          </div>
         </div>
       )}
       {gate.estado === 'pendiente' && !puedeAprobar && (

@@ -1439,13 +1439,23 @@ begin
     where re.elemento_id = old.elemento_id and re.workspace_id = old.workspace_id) then
     return old;
   end if;
+  -- «El proyecto certificó» lo contesta `gate_certificado_del_proyecto` y no una consulta
+  -- propia, por el mismo motivo por el que el conjunto de versiones lo contesta una función:
+  -- si dos guards deciden por su cuenta qué cuenta como certificación, uno se queda viejo.
+  -- Y ya pasó: mirar `numero = 6 and estado = 'aprobado'` a pelo ignoraba el perdón
+  -- histórico, así que a un proyecto perdonado —que puede EMPEZAR su plan— se le prohibía
+  -- corregirlo en cuanto asignaba el primer elemento, que es justo la capacidad que el
+  -- perdón existe para devolverle.
+  --
+  -- Sirve `is not null` y no hace falta preguntar por el 6: la escalera de gates impide un
+  -- G7 aprobado sin G6 aprobado, y el perdón solo marca G6 de proyectos SIN G7 aprobado, así
+  -- que «hay algo certificado» y «G6 certificó y no está perdonado» coinciden.
   if exists (
     select 1 from elemento_cambio ec
     join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
-    join gate_instancia g on g.proyecto_id = dv.proyecto_id and g.workspace_id = dv.workspace_id
     where ec.id = old.elemento_id and ec.workspace_id = old.workspace_id
       and dv.id in (select design_versions_a_cargo_del_proyecto(dv.proyecto_id, dv.workspace_id))
-      and g.numero = 6 and g.estado = 'aprobado'
+      and gate_certificado_del_proyecto(dv.proyecto_id, dv.workspace_id) is not null
   ) then
     raise exception 'G6 aprobó un plan que cubre este elemento: muévelo a otro release, no lo dejes sin ninguno (RF-06.4)';
   end if;

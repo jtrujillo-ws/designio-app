@@ -1225,7 +1225,12 @@ function TarjetaRelease({
           />
           <Button
             size="sm"
-            disabled={release.elementos.length === 0}
+            // La fecha también: `DesplegarReleaseSchema` la exige con formato, así que un
+            // envío con el campo vacío lo rechaza el ESQUEMA antes del handler y este
+            // callback sin captura acaba en fallo genérico. El espejo de una pantalla no es
+            // solo el de los guards: la superficie del esquema es una puerta más, y esta se
+            // ofrecía abierta.
+            disabled={release.elementos.length === 0 || fecha === ''}
             onClick={async () => {
               onError(null);
               const r = await registrarDespliegue({
@@ -1239,6 +1244,12 @@ function TarjetaRelease({
           </Button>
           {release.elementos.length === 0 && (
             <span style={apunte}>Un release sin elementos declarados no sale (SYS-06).</span>
+          )}
+          {fecha === '' && release.elementos.length > 0 && (
+            <span style={apunte}>
+              Falta la fecha REAL del despliegue: es la que registra cuándo cambió el
+              servicio (RF-06.5), y no se corrige después.
+            </span>
           )}
         </div>
       )}
@@ -1529,7 +1540,16 @@ function FormularioConstatacion({
           Toda diferencia respecto de lo aprobado se registra como desviación con razón
           obligatoria (SYS-07): sin razón, la base rechaza el registro.
         </span>
-        <Input type="date" value={constatadoEn} onChange={(e) => setConstatadoEn(e.target.value)} />
+        {/* `required` como los demás campos del formulario: `ConstatarSchema` exige la fecha
+            con formato, así que vaciarla y enviar acaba en un rechazo del esquema y un
+            fallo genérico. Aquí basta el atributo —el envío es un `submit`, no un onClick—,
+            que es lo que ya hacen el título del release y los textos de la desviación. */}
+        <Input
+          type="date"
+          value={constatadoEn}
+          onChange={(e) => setConstatadoEn(e.target.value)}
+          required
+        />
         <Textarea
           placeholder="Resumen de la constatación (opcional)"
           value={resumen}
@@ -1546,12 +1566,21 @@ function FormularioConstatacion({
               <span style={cuerpo}>{titulos.get(el.elementoId) ?? el.elementoId}</span>
               <Select
                 value={fila.resultado}
-                onChange={(e) =>
+                onChange={(e) => {
+                  // Volver a «como aprobado» LIMPIA los dos textos. Ocultarlos no basta: el
+                  // estado sobrevivía, se enviaba igual, y el CHECK lo rechaza —«como
+                  // aprobado» con texto de desviación sería una desviación escondida—
+                  // mientras el usuario no tiene ningún campo visible que borrar. Trampa sin
+                  // salida desde la pantalla. La regla, en general: si esto se oculta, deja
+                  // de mandarse.
+                  const resultado = e.target.value as ResultadoConstatacion;
+                  const limpio =
+                    resultado === 'como-aprobado' ? { queQuedoDistinto: '', razon: '' } : {};
                   setFilas((f) => ({
                     ...f,
-                    [el.elementoId]: { ...fila, resultado: e.target.value as ResultadoConstatacion },
-                  }))
-                }
+                    [el.elementoId]: { ...fila, ...limpio, resultado },
+                  }));
+                }}
               >
                 {RESULTADOS_CONSTATACION.map((r) => (
                   <option key={r} value={r}>

@@ -3909,6 +3909,18 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       fechaObjetivo: HOY,
       elementos: [{ elementoId: el, razon: '' }],
     });
+    // Y puede CORREGIR su plan, no solo empezarlo. El guard de cobertura pregunta por la
+    // certificación con la misma función que la define, así que respeta el perdón igual: si
+    // decidiera por su cuenta mirando «G6 aprobado», el proyecto perdonado podría asignar el
+    // elemento y ya no podría sacarlo — justo la capacidad que el perdón viene a devolverle.
+    await desasignarElemento(leadId, ws, el);
+    await asignarElemento(leadId, {
+      workspaceId: ws,
+      releaseId: rl.releaseId,
+      elementoId: el,
+      razon: 'se vuelve a colocar',
+    });
+
     const aprobarG7 = () =>
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 7`;

@@ -2542,12 +2542,21 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     // y por eso el conjunto de tablas se DERIVA del catálogo en vez de escribirse a mano:
     // si mañana alguien cuelga un guard con candado de una tabla nueva, esto se pone rojo
     // aquí y no en producción.
+    //
+    // El `materialized` no es cosmético: sin él el planificador puede evaluar
+    // `pg_get_functiondef` sobre `pg_proc` entero antes del join, y esa función revienta
+    // con los agregados del catálogo. Lo destapó CI (Postgres 15) sobre un local que iba
+    // en 16 — la misma consulta, otro plan.
     const admin = sqlAdmin();
     const necesitan = (
-      await admin`select distinct t.tgrelid::regclass::text as tabla
-        from pg_trigger t
-        join pg_proc p on p.oid = t.tgfoid
-        where not t.tgisinternal
+      await admin`with disparadoras as materialized (
+          select distinct t.tgfoid as oid, t.tgrelid::regclass::text as tabla
+          from pg_trigger t where not t.tgisinternal
+        )
+        select distinct d.tabla
+        from disparadoras d
+        join pg_proc p on p.oid = d.oid
+        where p.prokind = 'f'
           and p.pronamespace = 'public'::regnamespace
           and pg_get_functiondef(p.oid) ~* '(pg_advisory_xact_lock|for +(share|update|no key update))'
           and p.proname <> 'exigir_aislamiento_de_escritura'

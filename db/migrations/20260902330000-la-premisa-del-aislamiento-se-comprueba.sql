@@ -65,10 +65,22 @@ do $$
 declare r record;
 begin
   for r in
-    select distinct t.tgrelid::regclass::text as tabla
-    from pg_trigger t
-    join pg_proc p on p.oid = t.tgfoid
-    where not t.tgisinternal
+    -- El CTE va `materialized` a propósito, y no es cosmética: sin él el planificador
+    -- puede evaluar `pg_get_functiondef` como filtro sobre `pg_proc` ANTES del join, y
+    -- esa función revienta sobre los agregados del catálogo («"avg" is an aggregate
+    -- function», 42809). Pasó en CI —Postgres 15— y no en local —16—, que es exactamente
+    -- la clase de diferencia que un plan distinto produce. Materializar primero el
+    -- conjunto de funciones que SON de trigger deja a `pg_get_functiondef` sin agregados
+    -- que mirar.
+    with disparadoras as materialized (
+      select distinct t.tgfoid as oid, t.tgrelid::regclass::text as tabla
+      from pg_trigger t
+      where not t.tgisinternal
+    )
+    select distinct d.tabla
+    from disparadoras d
+    join pg_proc p on p.oid = d.oid
+    where p.prokind = 'f'
       and p.pronamespace = 'public'::regnamespace
       and pg_get_functiondef(p.oid) ~* '(pg_advisory_xact_lock|for +(share|update|no key update))'
     order by 1

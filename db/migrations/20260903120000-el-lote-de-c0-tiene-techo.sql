@@ -87,8 +87,23 @@ update propuesta_ai p
 -- El UPDATE de arriba encola los eventos del trigger DIFERIDO de esta tabla
 -- (`propuesta_ai_materializacion`), y con esa cola pendiente Postgres rechaza tanto
 -- ALTER TABLE como CREATE INDEX sobre ella («because it has pending trigger events»). Se
--- vacía aquí, dentro de la misma transacción de la migración: los guards se ejecutan de
--- verdad sobre las filas tocadas —no se saltan— y solo después se crea el índice.
+-- vacía aquí, dentro de la misma transacción de la migración, y solo después se crea el
+-- índice.
+--
+-- Qué hace ese guard cuando se vacía la cola, MEDIDO y no supuesto, porque el caso importa:
+-- una propuesta ya ACEPTADA cuyo puesto cambia vuelve a pasar por él, y sus comprobaciones
+-- de procedencia (`xmin` de la transacción que creó el objeto) no las puede satisfacer una
+-- fila materializada hace días. Lo que ocurre es que el guard SALE ANTES: su primera puerta
+-- es `is_workspace_member(app_user_id(), …)`, y una migración corre sin `app.user_id`, así
+-- que `app_user_id()` es null, la pertenencia da falso y devuelve null sin comprobar nada.
+--
+-- Verificado sobre una base con un lote C0 en el que la propuesta aceptada cae en un puesto
+-- distinto del que tenía —o sea, con el UPDATE tocándola de verdad—: la migración pasa. Y
+-- verificado también el contraste, que es lo que lo hace una medición y no una casualidad:
+-- el MISMO update con `app.user_id` de un miembro sí es rechazado, por la comprobación de
+-- procedencia. Nadie corre migraciones así, pero conviene que conste por qué esto funciona,
+-- para que quien mañana escriba un script de mantenimiento con identidad puesta sepa que
+-- mover `orden` en bloque no es una operación inocente.
 set constraints all immediate;
 
 drop index propuesta_ai_llamada_ci_idx;

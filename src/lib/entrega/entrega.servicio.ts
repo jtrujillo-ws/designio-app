@@ -152,32 +152,74 @@ async function bloquearRelease(tx: TransactionSql, releaseId: string): Promise<v
 }
 
 /**
- * Candado del RETO del proyecto que produjo un elemento. Lo toma el único camino que
- * puede dejar un elemento SIN release —`desasignarElemento`— para serializarse contra
- * `aprobarGate`, que es el primero de los dos candados que aquella toma.
+ * Candado del RETO del proyecto — el punto de cita de este módulo con `aprobarGate`.
  *
- * Por qué hace falta: `release_elemento_cobertura_guard` es un constraint trigger
- * DIFERIDO, así que corre al COMMIT y con su propio snapshot. Sin candado compartido, la
- * aprobación de G6 lee la asignación TODAVÍA visible (el borrado no ha committeado) y el
- * trigger diferido del borrado lee el gate TODAVÍA pendiente (la aprobación tampoco ha
- * committeado): las dos pasan y queda un G6 aprobado con un elemento descubierto. Que las
- * dos escriban tablas distintas —gate_instancia y release_elemento— es justo por lo que el
- * candado de fila no las cruza, y los candados que ya tenían (gate/reto de un lado,
- * release del otro) no se ven entre sí.
+ * Lo toman los TRES caminos de este módulo que deciden mirando un gate, o que pueden
+ * volver falso lo que un gate ya certificó: `desasignarElemento` (deja un elemento sin
+ * release, contra lo que firma G6), `aprobarDesignVersion` (mueve el conjunto de versiones
+ * aprobadas del proyecto, sobre el que hablan G6 y G7) y `crearDesignVersion` (comprueba
+ * que el proyecto no esté certificado). Los tres son la MISMA carrera: la comprobación del
+ * gate y la del otro camino se hacen sobre snapshots distintos que no se ven, y las dos
+ * transacciones commitean creyendo cada una que la otra no existe.
+ *
+ * En el caso del borrado es todavía más ancha porque los dos lados ni siquiera deciden a
+ * la vez: `release_elemento_cobertura_guard` es un constraint trigger DIFERIDO, así que
+ * corre al COMMIT. La aprobación de G6 lee la asignación todavía visible y el trigger
+ * diferido lee el gate todavía pendiente. En el caso de la aprobación es simétrica: el
+ * guard del gate no ve la versión sucesora sin commitear y el guard de la versión no ve el
+ * gate sin commitear. Que cada par escriba tablas DISTINTAS —gate_instancia contra
+ * release_elemento o design_version— es justo por lo que el candado de fila no los cruza,
+ * y los candados que ya tenían (reto/gate de un lado; release, dv-elemento o servicio del
+ * otro) no se ven entre sí.
  *
  * El candado es el del RETO y no el del gate por dos motivos: es el que `aprobarGate` toma
  * PRIMERO, así que quien lo tenga no puede colarse por delante de una aprobación en curso;
- * y no depende de que la fila del gate exista, que sería una condición frágil para una
- * regla que habla de un gate que puede aprobarse en cualquier momento.
+ * y no depende de que la fila del gate exista, que sería una precondición frágil para una
+ * regla sobre un gate que puede aprobarse en cualquier momento.
  *
- * `moverElemento` NO lo toma, y es deliberado: mover borra y vuelve a insertar en la MISMA
- * transacción, el guard diferido ve el elemento otra vez asignado y se aparta, así que la
- * cobertura nunca baja y no hay nada que serializar. Lo que se serializa es dejar
- * descubierto, no reordenar.
+ * Que `crearDesignVersion` también lo tome merece una línea, porque el primer razonamiento
+ * fue el contrario y estaba mal: «su comprobación es un aviso temprano, perder la carrera
+ * solo deja un borrador que después no se podrá aprobar». Eso no es un coste menor — es
+ * EXACTAMENTE el callejón que esa comprobación existe para evitar: un borrador que no se
+ * puede aprobar (la regla), ni borrar (no hay DELETE), ni mudar de proyecto (`proyecto_id`
+ * fuera del grant). Una comprobación que solo evita el callejón cuando nadie más escribe a
+ * la vez no lo evita.
  *
- * Orden de adquisición: reto → release. Nadie toma un release antes que un reto, así que
- * no aparece ningún ciclo; el orden canónico completo del módulo está en `bloquearSerie`.
+ * Quién NO lo toma, y es deliberado: `moverElemento`, porque borra y vuelve a insertar en
+ * la MISMA transacción, el guard diferido ve el elemento otra vez asignado y se aparta, así
+ * que la cobertura nunca baja — lo que se serializa es dejar descubierto, no reordenar. Y
+ * `asignarElemento`, porque añadir cobertura no puede volver falso un gate que exige
+ * cobertura completa.
+ *
+ * Orden de adquisición: el reto va SIEMPRE primero. El orden canónico completo del módulo
+ * está en `bloquearSerie`.
  */
+async function bloquearRetoDelProyecto(
+  tx: TransactionSql,
+  workspaceId: string,
+  proyectoId: string,
+): Promise<void> {
+  const [fila] = await tx`select p.reto_id from proyecto p
+    where p.id = ${proyectoId} and p.workspace_id = ${workspaceId}`;
+  if (!fila) throw new ErrorEntrega('Ese proyecto no existe en este workspace');
+  await bloquearReto(tx, fila.reto_id as string);
+}
+
+async function bloquearRetoDeLaVersion(
+  tx: TransactionSql,
+  workspaceId: string,
+  designVersionId: string,
+): Promise<void> {
+  // `proyecto_id` no está en el grant de columna de design_version y `proyecto.reto_id` no
+  // tiene política de UPDATE ninguna: los dos son inmutables, así que leerlos antes del
+  // candado no abre carrera — es solo el nombre del candado que hay que pedir.
+  const [fila] = await tx`select p.reto_id from design_version dv
+    join proyecto p on p.id = dv.proyecto_id and p.workspace_id = dv.workspace_id
+    where dv.id = ${designVersionId} and dv.workspace_id = ${workspaceId}`;
+  if (!fila) throw new ErrorEntrega('La design version no existe en este workspace');
+  await bloquearReto(tx, fila.reto_id as string);
+}
+
 async function bloquearRetoDelElemento(
   tx: TransactionSql,
   workspaceId: string,
@@ -204,20 +246,21 @@ async function bloquearRetoDelElemento(
  *   reto  →  dv-elemento  →  design-version(servicio)  →  codigo-rl  →  release  →  codigo-es
  *
  * `reto` es el candado del MÉTODO (`bloquearReto`, en metodo.servicio) y aparece aquí
- * porque `desasignarElemento` tiene que serializarse contra `aprobarGate`. Va el primero
- * de todos porque en el método ya va antes que el gate, y ninguna ruta de este módulo lo
- * toma después de nada: quien lo tome, lo toma antes de todo lo demás.
+ * porque aprobar una design version y quitarle el release a un elemento tienen que
+ * serializarse contra `aprobarGate`. Va el primero de todos porque en el método ya va antes
+ * que el gate, y ninguna ruta de este módulo lo toma después de nada: quien lo tome, lo
+ * toma antes de todo lo demás.
  *
  * `release` puede ser DOS en `moverElemento` (origen y destino): se toman en orden
  * ascendente de uuid, que es el único orden total que dos transacciones que no se conocen
  * pueden acordar sin hablarse. Ninguna otra ruta toma más de uno, así que cualquier orden
  * total sobre los releases es compatible con todas.
  *
- * y `codigo-dv` suelto, que no se toma junto a ningún otro. Cada ruta es una subsecuencia:
+ * y `codigo-dv`, que solo se toma junto al del reto. Cada ruta es una subsecuencia:
  *
- *   aprobarDesignVersion ....... dv-elemento → servicio
+ *   aprobarDesignVersion ....... reto → dv-elemento → servicio
  *   agregar/editar/borrar elemento, enlazar journey, declarar sucesión ..... dv-elemento
- *   crearDesignVersion ......... codigo-dv
+ *   crearDesignVersion ......... reto → codigo-dv
  *   planificarRelease .......... servicio → codigo-rl → release
  *   asignarElemento ............ servicio → release
  *   moverElemento .............. servicio → release(origen) y release(destino), por uuid
@@ -244,6 +287,13 @@ export async function crearDesignVersion(
 ): Promise<{ designVersionId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // Reto antes que la serie: el guard de alta rechaza nacer en un proyecto que ya
+    // certificó G6 o G7, y esa comprobación es una lectura de instantánea como cualquier
+    // otra. Sin el candado, un borrador creado mientras se firma el gate pasa el chequeo,
+    // commitea, y queda en el callejón que el chequeo existe para evitar (ver
+    // `bloquearRetoDelProyecto`). `reto_id` de un proyecto es inmutable —no hay grant de
+    // UPDATE sobre proyecto—, así que resolverlo antes del candado no abre carrera.
+    await bloquearRetoDelProyecto(tx, entrada.workspaceId, entrada.proyectoId);
     await bloquearSerie(tx, 'dv', entrada.workspaceId);
     let fila;
     try {
@@ -495,6 +545,12 @@ export async function aprobarDesignVersion(
 ): Promise<void> {
   await conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // El reto va primero: aprobar mueve el conjunto de versiones aprobadas del proyecto,
+    // que es sobre lo que afirman G6 y G7, así que esto y `aprobarGate` no pueden decidir
+    // a la vez (ver `bloquearRetoDeLaVersion`). Sin él, el guard del gate no vería la
+    // sucesora sin commitear ni el guard de la sucesora vería el gate sin commitear, y
+    // quedarían las dos: gate certificado y versión nueva sin plan.
+    await bloquearRetoDeLaVersion(tx, entrada.workspaceId, entrada.designVersionId);
     // El candado va ANTES de leer, y no después como el del servicio: lo que se lee aquí
     // —el estado, el journey que se va a congelar— es lo que las mutaciones de elementos
     // pueden estar cambiando ahora mismo. Leer primero y bloquear después dejaría decidir

@@ -897,7 +897,7 @@ begin
     --
     -- Rechazar es la única salida que existe, y conviene decir por qué: la aprobación de
     -- un gate es INMUTABLE y la reapertura de etapa no la deshace —SPEC-04 lo dice con
-    -- todas las letras, y `reabrir_etapa` devuelve la ETAPA a 'en-curso' sin tocar el
+    -- todas las letras, y `reabrirEtapa` devuelve la ETAPA a 'en-curso' sin tocar el
     -- gate—, así que «revalidar el gate afectado» no es un remedio más caro: no existe
     -- como mecanismo, no hay ningún camino por el que ese 'aprobado' vuelva a evaluarse.
     -- Es la misma doctrina que release_elemento_cobertura_guard aplica al quitar alcance,

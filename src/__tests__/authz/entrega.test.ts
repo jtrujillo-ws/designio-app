@@ -2850,6 +2850,161 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(anterior!.superadaPor!.id).toBe(sucesora.designVersionId);
   });
 
+  it('firmar G6 y aprobar la sucesora tampoco pueden cruzarse', async () => {
+    // La otra mitad de la misma carrera, en el sentido contrario: el guard del gate no ve
+    // la sucesora todavía sin commitear y el guard de la sucesora no ve el gate todavía sin
+    // commitear, así que las dos pasan y queda G6 certificando un plan completo sobre un
+    // conjunto de versiones que ya no es el suyo. Aquí el rechazo tampoco puede llegar
+    // después: la aprobación del gate no se deshace.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-102', 'Proyecto que firma mientras sucede');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la firma en carrera');
+    const primera = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que el plan cubre',
+      resumen: '',
+      superaA: null,
+    });
+    const elPrimera = await elementoSuelto(primera.designVersionId, 'Lo que el plan cubre');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      motivo: '',
+    });
+    await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      titulo: 'El plan que se firma',
+      responsable: 'Equipo de la firma',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elPrimera, razon: '' }],
+    });
+    const sucesora = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que llega a la vez que la firma',
+      resumen: '',
+      superaA: primera.designVersionId,
+    });
+    await elementoSuelto(sucesora.designVersionId, 'Lo que la firma no cubriría');
+    await aprobarGatesHasta(proy, 5);
+    const [g6] = await admin`select id from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 6`;
+    const g6Id = g6!.id as string;
+
+    let listo!: () => void;
+    const tomado = new Promise<void>((r) => (listo = r));
+    let liberar!: () => void;
+    const espera = new Promise<void>((r) => (liberar = r));
+    const enVuelo = conUsuario(sponsorId, async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+      await tx`select pg_advisory_xact_lock(hashtextextended('designio:gate:' || ${g6Id}, 42))`;
+      const filas = await tx`update gate_instancia
+        set estado = 'aprobado', aprobado_por = ${sponsorId}, aprobado_en = now()
+        where id = ${g6Id} and workspace_id = ${ws} and estado = 'pendiente'`;
+      if (filas.count !== 1) throw new Error('la aprobación de G6 no alcanzó su gate');
+      listo();
+      await espera;
+    });
+    await tomado;
+
+    const aprobacion = aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: sucesora.designVersionId,
+      motivo: '',
+    });
+    try {
+      expect(await siguePendiente(aprobacion)).toBe(true);
+    } finally {
+      liberar();
+    }
+    await enVuelo;
+    await expect(aprobacion).rejects.toThrow(/ya certificó G6 y esa aprobación no se deshace/);
+    const sigue = await designVersionCompleta(leadId, ws, sucesora.designVersionId);
+    expect(sigue!.estado).toBe('borrador');
+    const anterior = await designVersionCompleta(leadId, ws, primera.designVersionId);
+    expect(anterior!.estado).toBe('aprobada');
+  });
+
+  it('crear el borrador mientras se firma el gate no deja una fila en el callejón', async () => {
+    // La comprobación del alta existe para que nadie se quede con un borrador que no puede
+    // aprobar, ni borrar, ni mudar de proyecto. Si esa comprobación se puede colar mientras
+    // el gate se firma, no evita el callejón: lo aplaza. Por eso el alta toma el mismo
+    // candado, aunque su chequeo no sea la invariante sino el aviso.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-103', 'Proyecto que firma mientras alguien abre');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio del alta en carrera');
+    const primera = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que el plan cubre',
+      resumen: '',
+      superaA: null,
+    });
+    const elPrimera = await elementoSuelto(primera.designVersionId, 'Lo que el plan cubre');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      motivo: '',
+    });
+    await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      titulo: 'El plan que se firma',
+      responsable: 'Equipo del alta',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: elPrimera, razon: '' }],
+    });
+    await aprobarGatesHasta(proy, 5);
+    const [g6] = await admin`select id from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 6`;
+    const g6Id = g6!.id as string;
+
+    let listo!: () => void;
+    const tomado = new Promise<void>((r) => (listo = r));
+    let liberar!: () => void;
+    const espera = new Promise<void>((r) => (liberar = r));
+    const enVuelo = conUsuario(sponsorId, async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+      await tx`select pg_advisory_xact_lock(hashtextextended('designio:gate:' || ${g6Id}, 42))`;
+      const filas = await tx`update gate_instancia
+        set estado = 'aprobado', aprobado_por = ${sponsorId}, aprobado_en = now()
+        where id = ${g6Id} and workspace_id = ${ws} and estado = 'pendiente'`;
+      if (filas.count !== 1) throw new Error('la aprobación de G6 no alcanzó su gate');
+      listo();
+      await espera;
+    });
+    await tomado;
+
+    const alta = crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que no debe llegar a nacer',
+      resumen: '',
+      superaA: primera.designVersionId,
+    });
+    try {
+      expect(await siguePendiente(alta)).toBe(true);
+    } finally {
+      liberar();
+    }
+    await enVuelo;
+    await expect(alta).rejects.toThrow(/ya certificó G6: la design version siguiente va en el proyecto del ciclo siguiente/);
+    // Y no quedó ninguna fila: el aviso llega antes de escribir, que es de lo que se trata.
+    const [cuantas] = await admin`select count(*)::int as n from design_version
+      where proyecto_id = ${proy} and workspace_id = ${ws}`;
+    expect(cuantas!.n).toBe(1);
+  });
+
   it('G7 mira la cadena del SERVICIO: lo que dejó en vuelo el proyecto anterior también cuenta', async () => {
     // La cadena de versiones de un servicio atraviesa proyectos —`supera_a` está
     // restringido por servicio, no por proyecto—, así que filtrar los pendientes al

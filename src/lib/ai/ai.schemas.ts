@@ -190,6 +190,7 @@ export const ESTADOS_ANCLA = [
   'item-curado',
   'consentimiento-revocado',
   'criterios-congelados',
+  'registry-firmado',
   'reto-no-admite',
   'ancla-ausente',
 ] as const;

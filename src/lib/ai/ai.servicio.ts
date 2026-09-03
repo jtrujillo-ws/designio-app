@@ -264,13 +264,17 @@ export async function panelPropuestas(
     // predicado cambie, el panel no se queda con la versión vieja (que es exactamente cómo
     // nació `reto_criterios_congelados`).
     //
-    // El ORDEN de los dos motivos de C0 importa cuando se cumplen los dos a la vez, que es
-    // lo normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó). Se reporta primero
-    // el del ciclo de vida porque es el que NO tiene vuelta: «criterios congelados» le
-    // sugiere al lead una salida real —reabrir la etapa 0 (RF-04.9) descongela—, y ofrecerle
-    // esa salida sobre un reto archivado sería mandarlo a hacer un trámite que no va a
-    // desbloquear nada, porque al volver seguiría sin admitir criterios. Entre dos motivos
-    // ciertos gana el que describe la puerta que ya no se abre.
+    // El ORDEN de los TRES motivos de C0 importa cuando se cumplen varios a la vez, que es
+    // lo normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó Y firmó su registry).
+    // Se ordenan de la puerta más cerrada a la menos: primero el ciclo de vida del reto, que
+    // no se revierte nunca; después el registry firmado, que tampoco (la firma es de ida); y
+    // solo al final el G0, que es el ÚNICO con salida real —reabrir la etapa 0 (RF-04.9)
+    // descongela—. Sugerirle esa salida a quien tiene el reto archivado o el contrato
+    // firmado sería mandarlo a un trámite que no va a desbloquear nada. Entre motivos
+    // ciertos gana siempre el que describe la puerta que ya no se abre.
+    //
+    // Es el mismo orden con el que `criterio_g0_pendiente_guard` elige su `raise`, y por la
+    // misma razón: quien fuerza la escritura por SQL directo lee el motivo que le sirve.
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, p.item_id, p.reto_id,
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
@@ -287,7 +291,9 @@ export async function panelPropuestas(
                  end
                when not reto_admite_criterios(p.reto_id, p.workspace_id)
                  then 'reto-no-admite'
-               when reto_criterios_congelados(p.reto_id, p.workspace_id)
+               when reto_registry_firmado(p.reto_id, p.workspace_id)
+                 then 'registry-firmado'
+               when reto_g0_congela_criterios(p.reto_id, p.workspace_id)
                  then 'criterios-congelados'
                else 'disponible'
              end as ancla_estado,
@@ -366,11 +372,13 @@ export async function panelPropuestas(
       order by i.creado_en asc, i.id asc
       limit ${PAGINA_ANCLAS + 1}`;
     // Retos con criterios aún abiertos, que son DOS condiciones y no una: que el ciclo de
-    // vida del reto siga admitiéndolos (RF-04.12) y que ningún G0 los haya congelado
-    // (SYS-22). Las dos las impone el guard del INSERT de propuestas, así que ofrecer un
-    // reto al que le falte cualquiera de ellas sería ofrecer una acción que la base va a
-    // rechazar — y las dos se preguntan por la MISMA función que la impone, para que no
-    // vuelvan a divergir.
+    // vida del reto siga admitiéndolos (RF-04.12) y que nada los haya congelado (SYS-22:
+    // ni un G0 aprobado ni un registry de medición firmado). Las dos las impone el guard del
+    // INSERT de propuestas, así que ofrecer un reto al que le falte cualquiera de ellas sería
+    // ofrecer una acción que la base va a rechazar — y las dos se preguntan por la MISMA
+    // función que la impone, para que no vuelvan a divergir. Aquí basta el predicado
+    // COMPUESTO porque la lista solo decide si el reto se ofrece; distinguir la causa es
+    // cosa del panel, que sí tiene que explicarla.
     const retos = await tx`
       select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
       where r.workspace_id = ${workspaceId}
@@ -506,8 +514,14 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       // de golpe a las políticas, a los guards, al panel y a estas lecturas, en vez de
       // dejar la versión vieja escondida en la que nadie tocó.
       const [congelado] = await tx`select
-        reto_criterios_congelados(${entrada.anclaId}, ${entrada.workspaceId}) as hay`;
-      if (congelado?.hay) {
+        reto_registry_firmado(${entrada.anclaId}, ${entrada.workspaceId}) as registry,
+        reto_g0_congela_criterios(${entrada.anclaId}, ${entrada.workspaceId}) as g0`;
+      if (congelado?.registry) {
+        throw new ErrorAI(
+          'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y no admiten cambios (SYS-22)',
+        );
+      }
+      if (congelado?.g0) {
         throw new ErrorAI('El G0 de ese reto ya fue aprobado: sus criterios están congelados');
       }
       sistema = SISTEMA_CRITERIOS;
@@ -704,12 +718,18 @@ async function liberarReserva(
  *  | CI · item aún pendiente       | `item-curado`                | sí⁹                         | guard de materialización¹⁰   |
  *  | CI · consentimiento vigente   | `consentimiento-revocado`    | sí, con candado por item    | los DOS guards¹⁵             |
  *  | CI · citas intactas           | no aplica: es la corrección  | sí, contra el original      | guard de revisión            |
- *  | C0 · criterios no congelados  | `criterios-congelados`       | sí, al insertar¹¹           | política de `criterio_exito` |
+ *  | C0 · criterios no congelados  | `criterios-congelados`¹⁶     | sí, al insertar¹¹           | política de `criterio_exito` |
  *  | C0 · reto admite criterios    | `reto-no-admite`             | sí (`materializarCriterio`) | guard de materialización¹⁰   |
  *
+ * ¹⁶ Dos valores, no uno: el congelado tiene dos causas con salidas distintas —el G0, que
+ * la reapertura de la etapa 0 revierte, y el registry firmado, que no se revierte— así que
+ * el panel las nombra por separado (`criterios-congelados` y `registry-firmado`). La fila es
+ * una porque la precondición es una: la política de `criterio_exito` las junta en
+ * `reto_criterios_congelados`.
+ *
  * La columna del panel no es cosmética y tampoco es un cuarto sitio donde repetir lo mismo:
- * los cuatro valores de `anclaEstado` distintos de `disponible` SON exactamente las cuatro
- * filas que pueden caducar sin que el revisor haga nada. Por eso es un enum y no un
+ * los valores de `anclaEstado` distintos de `disponible` SON exactamente las filas de esta
+ * tabla que pueden caducar sin que el revisor haga nada. Por eso es un enum y no un
  * booleano —un botón apagado sin decir por qué es la mitad del arreglo—, y por eso añadir
  * una precondición de este bloque obliga a añadirle su motivo: si la base la rechaza y el
  * panel la sigue ofreciendo, el revisor descubre el problema con el error.
@@ -865,7 +885,7 @@ async function confirmarDespacho(
         from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
       if (!reto || !reto.admite || reto.congelado) {
         throw new ErrorAI(
-          'Ese reto dejó de admitir criterios mientras se preparaba la llamada (G0 aprobado o reto cerrado): no se llamó al proveedor',
+          'Ese reto dejó de admitir criterios mientras se preparaba la llamada (G0 aprobado, registry firmado o reto cerrado): no se llamó al proveedor',
         );
       }
     }

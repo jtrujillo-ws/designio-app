@@ -284,6 +284,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
       await admin`delete from consentimiento_item where workspace_id = ${wsL}`;
       await admin`delete from item_importacion where workspace_id = ${wsL}`;
+      // El registry cuelga del reto y hay pruebas que lo firman para congelar sus
+      // criterios; sin esta línea la limpieza muere en el `delete from reto`.
+      await admin`delete from entrada_kpi where workspace_id = ${wsL}`;
+      await admin`delete from metric_registry where workspace_id = ${wsL}`;
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
       await admin`delete from checklist_item where workspace_id = ${wsL}`;
       await admin`delete from gate_instancia where workspace_id = ${wsL}`;
@@ -2494,6 +2498,135 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const drenado = await panelPropuestas(curadorId, wsC);
       expect(drenado.retosAbiertos.some((r) => r.id === retoC)).toBe(true);
     });
+  });
+
+  it('el registry firmado congela los criterios con su propio motivo, y no con el del G0', async () => {
+    // La SEGUNDA causa de congelado (SPEC-07, SYS-22), que llegó después de la del G0. Se
+    // prueba aparte y no como variante de la anterior porque lo que hay que sostener es
+    // justamente que NO son la misma: se distinguen en el panel, en el mensaje de admisión
+    // y en el `raise` de la base, porque tienen salidas distintas — reabrir la etapa 0
+    // descongela el G0 y no descongela una firma, que es de ida.
+    await enWorkspaceLimpio('registry', async ({ ws: wsR, curadorId, retoId: retoR }) => {
+      const admin = sqlAdmin();
+      const generadas = await conProveedor(
+        {
+          ok: true,
+          datos: { criterios: [CONTENIDO_C0] },
+          intentos: [intento({ latenciaMs: 90, uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsR, capacidad: 'C0', anclaId: retoR }),
+      );
+      expect(generadas.generadas).toBe(1);
+
+      // Entre generar y revisar, el reto firma su contrato de medición. El insert directo
+      // del registry ya firmado es el atajo del test —el camino real pasa por G6—; el
+      // efecto sobre los criterios es el mismo, y es el que se está probando.
+      await admin`insert into metric_registry
+        (workspace_id, reto_id, estado, firmado_por, firmado_en, creado_por)
+        values (${wsR}, ${retoR}, 'firmado', ${curadorId}, now(), ${curadorId})`;
+
+      const panel = await panelPropuestas(curadorId, wsR);
+      // El motivo es el SUYO: con un solo valor para las dos causas, la pantalla le habría
+      // ofrecido al lead reabrir la etapa 0, que aquí no desbloquea nada.
+      expect(panel.pendientes.every((p) => p.anclaEstado === 'registry-firmado')).toBe(true);
+      expect(panel.retosAbiertos.some((r) => r.id === retoR)).toBe(false);
+
+      // Y lo que dice la pantalla se confirma contra la base, por los tres caminos:
+      // aceptar la propuesta…
+      const p = panel.pendientes[0]!;
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsR, propuestaId: p.id }),
+      ).rejects.toThrow(/registry del reto está firmado/i);
+      // …volver a generar sobre ese reto, que se corta en la ADMISIÓN, antes de gastar la
+      // llamada y con el motivo correcto…
+      await expect(
+        generarPropuestas(curadorId, { workspaceId: wsR, capacidad: 'C0', anclaId: retoR }),
+      ).rejects.toThrow(/registry de medición de ese reto ya está firmado/i);
+      // …y el SQL crudo, que es el suelo. Lo rechaza el guard —que corre antes que el
+      // `with check` de la política— y por eso lo que se lee es SU mensaje, el del registry
+      // y no el del G0: es la única señal que le dice a quien fuerza la escritura por qué
+      // no hay reapertura que le sirva. (Que la POLÍTICA también lo mire, para el UPDATE
+      // que el guard no alcanza, lo sostiene la suite de medición.)
+      await expect(
+        conUsuario(curadorId, (tx) => tx`insert into criterio_exito
+          (workspace_id, reto_id, kpi, definicion, linea_base_plan, objetivo, ventana_dias,
+           creado_por)
+          values (${wsR}, ${retoR}, 'Colado', 'Definición', 'Plan', 'Objetivo', 30,
+                  ${curadorId})`),
+      ).rejects.toThrow(/registry del reto está firmado/i);
+
+      // Rechazar, que es la salida de toda propuesta obsoleta, sigue abierta.
+      await rechazarPropuesta(curadorId, { workspaceId: wsR, propuestaId: p.id });
+    });
+  });
+
+  it('el asiento reservado del árbol ya no puede apuntar al vacío ni a otro workspace', async () => {
+    // `reto_servicio_afectado.propuesta_ai_id` llevaba desde SPEC-02 siendo una columna
+    // suelta: anulable, sin FK y con grant de INSERT sin lista de columnas, o sea escribible
+    // por la aplicación con cualquier uuid. Hasta esta migración no había tabla a la que
+    // apuntar; ahora la hay, y la referencia se comprueba.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item del asiento');
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+    });
+    try {
+      // Un uuid inventado ya no entra.
+      await expect(
+        admin`insert into reto_servicio_afectado
+          (reto_id, servicio_id, workspace_id, propuesta_ai_id, creado_por)
+          values (${retoId}, ${svcId}, ${ws},
+                  '00000000-0000-0000-0000-000000000000', ${leadId})`,
+      ).rejects.toThrow(/foreign key|llave foránea/i);
+
+      // Y una propuesta REAL de otro workspace tampoco. La fila de prueba es por lo demás
+      // impecable —su reto y su servicio son los del workspace vecino, así que las otras dos
+      // FK están satisfechas— y lo ÚNICO que la rechaza es que la propuesta sea de aquí: eso
+      // es lo que compra que la FK sea compuesta con `workspace_id`. Con una FK simple a
+      // `id`, esta fila entraba.
+      const [wsY] = await admin`insert into workspace (nombre)
+        values (${marca + '-Y'}) returning id`;
+      const wsYId = wsY!.id as string;
+      try {
+        const [svcY] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+          values (${wsYId}, 'Servicio vecino', ${leadId}) returning id`;
+        const [retoY] = await admin`insert into reto
+          (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+          values (${wsYId}, ${svcY!.id as string}, 'R-81', 'Reto vecino', 'candidato',
+                  'peticion-cliente', ${leadId}) returning id`;
+        await expect(
+          admin`insert into reto_servicio_afectado
+            (reto_id, servicio_id, workspace_id, propuesta_ai_id, creado_por)
+            values (${retoY!.id as string}, ${svcY!.id as string}, ${wsYId}, ${propuestaId},
+                    ${leadId})`,
+        ).rejects.toThrow(/foreign key|llave foránea/i);
+        // Control: la MISMA fila sin la propuesta ajena entra sin problema, así que lo que
+        // la rechazaba no era ninguna de las otras dos referencias.
+        await admin`insert into reto_servicio_afectado
+          (reto_id, servicio_id, workspace_id, creado_por)
+          values (${retoY!.id as string}, ${svcY!.id as string}, ${wsYId}, ${leadId})`;
+        await admin`delete from reto_servicio_afectado where workspace_id = ${wsYId}`;
+        await admin`delete from reto where workspace_id = ${wsYId}`;
+        await admin`delete from servicio where workspace_id = ${wsYId}`;
+      } finally {
+        await admin`delete from workspace where id = ${wsYId}`;
+      }
+
+      // Y el caso normal sigue siendo el asiento VACÍO: MATCH SIMPLE no comprueba nada
+      // mientras la columna anulable sea NULL, así que un afectado escrito a mano —que es
+      // el único que existe hoy— entra igual que antes.
+      await admin`insert into reto_servicio_afectado
+        (reto_id, servicio_id, workspace_id, creado_por)
+        values (${retoId}, ${svcId}, ${ws}, ${leadId})`;
+      const [fila] = await admin`select propuesta_ai_id from reto_servicio_afectado
+        where reto_id = ${retoId} and servicio_id = ${svcId}`;
+      expect(fila!.propuesta_ai_id).toBe(null);
+    } finally {
+      await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    }
   });
 
   it('aislamiento: otro workspace no ve ni revisa las propuestas de este', async () => {

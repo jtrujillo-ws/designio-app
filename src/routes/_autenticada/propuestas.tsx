@@ -79,14 +79,19 @@ const COLOR_ESTADO: Record<PropuestaEnPanel['estado'], string> = {
 /** Por qué una propuesta pendiente dejó de poder aceptarse. Cada motivo dice además cuál
  * es la salida, que no es la misma: un item curado a mano ya tiene su evidencia, un
  * consentimiento retirado deja el material fuera de la AI (pero la bandeja sigue abierta) y
- * unos criterios congelados esperan a la reapertura de su etapa. */
+ * unos criterios congelados por el G0 esperan a la reapertura de su etapa. Congelados por un
+ * registry FIRMADO es otro motivo y no una redacción del mismo: ahí no hay reapertura que
+ * valga, así que ofrecer esa salida sería mandar al lead a un trámite que no desbloquea
+ * nada. */
 const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
   disponible: '',
   'item-curado': 'El item ya se curó a mano: esta propuesta quedó obsoleta y solo puede rechazarse.',
   'consentimiento-revocado':
     'El consentimiento de ese material ya no autoriza el procesamiento externo: esta propuesta quedó obsoleta y solo puede rechazarse. El item sigue pudiendo curarse a mano en la bandeja.',
   'criterios-congelados':
-    'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse.',
+    'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse. Reabrir la etapa 0 los descongela.',
+  'registry-firmado':
+    'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y la firma no se deshace (SYS-22). Esta propuesta quedó obsoleta y solo puede rechazarse.',
   'reto-no-admite':
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',

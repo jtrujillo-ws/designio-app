@@ -1239,6 +1239,39 @@ $$;
 revoke execute on function proyectos_frenan_medicion(uuid, uuid) from public;
 grant execute on function proyectos_frenan_medicion(uuid, uuid) to designio_app;
 
+-- ── «Qué proyectos del reto frenan el CIERRE», en UN solo sitio ──
+-- Hermana de `proyectos_frenan_medicion`, y existe por lo que aquella PERMITE: un proyecto
+-- pausado que ya tiene su G7 no frena la apertura —puede volver cuando quiera, y ahora
+-- además hay ruta para volver—, así que la medición se abre con él parado. Pero el cierre
+-- del post mortem sí lo exige: `outcome_review_completar_guard` arrastra a 'cerrado' solo a
+-- los que están MIDIENDO y después comprueba que no quede ninguno sin cerrar.
+--
+-- O sea que el permiso de un extremo crea un bloqueo en el otro. Eso está bien —parar es del
+-- cliente y el cierre no puede arrastrar en silencio a quien se paró— pero tiene que DECIRSE
+-- en la pantalla del cierre, no descubrirse al pulsar. Y para que el espejo no se quede corto
+-- cuando alguien toque el guard, se escribe UNA vez y la INVOCAN los dos: el guard, que la
+-- raise nombrando las filas, y la proyección, que la enseña antes de ofrecer el botón.
+--
+-- 'cerrado' no frena —ya terminó— y 'en-medicion' tampoco, que es a quien el cierre arrastra.
+--
+-- No es SECURITY DEFINER: lee proyectos del workspace del reto, que cualquier miembro ya
+-- puede leer, así que corre bajo el RLS de quien llama.
+create function proyectos_frenan_cierre(p_reto uuid, p_ws uuid)
+returns table (codigo text, motivo text)
+language sql stable as $$
+  select p.codigo,
+    case p.estado
+      when 'pausado' then 'pausado: retómalo para que entre en medición y pueda cerrar con su reto'
+      when 'activo' then 'no llegó a medición: el cierre solo arrastra a los que miden'
+      else 'todavía en implementación: no puede cerrarse con el reto' end
+  from proyecto p
+  where p.reto_id = p_reto and p.workspace_id = p_ws
+    and p.estado not in ('en-medicion', 'cerrado')
+  order by p.codigo
+$$;
+revoke execute on function proyectos_frenan_cierre(uuid, uuid) from public;
+grant execute on function proyectos_frenan_cierre(uuid, uuid) to designio_app;
+
 -- ── El par «reto midiendo ⇔ proyecto midiendo» es INDIVISIBLE, y lo dice la TABLA ──
 -- §5.2 mueve los dos objetos a la vez —«el proyecto y el reto pasan a en medición»— y el
 -- guard del proyecto ya exigía su mitad: no entra en medición si su reto no está midiendo.
@@ -1796,14 +1829,19 @@ begin
       where id = new.reto_id and workspace_id = new.workspace_id;
     -- El proyecto cierra CON el reto (RF-07.10) y queda inmutable. Se exige que esté en
     -- medición: si alguien lo pausó, el cierre no lo arrastra en silencio.
+    --
+    -- Quién frena sale de `proyectos_frenan_cierre`, la MISMA función que lee la proyección
+    -- para no ofrecer el botón: escrito aquí a mano, el espejo de la pantalla se habría
+    -- quedado corto en cuanto alguien tocara esta comprobación. Y se NOMBRAN las filas,
+    -- porque decir «algún proyecto» manda a buscarlas a mano.
+    select string_agg(f.codigo || ' (' || f.motivo || ')', ', ' order by f.codigo)
+      into faltan from proyectos_frenan_cierre(new.reto_id, new.workspace_id) f;
+    if faltan is not null then
+      raise exception 'el proyecto del reto no está en medición: no puede cerrarse con el outcome review — %', faltan;
+    end if;
     update proyecto set estado = 'cerrado'
       where reto_id = new.reto_id and workspace_id = new.workspace_id
         and estado = 'en-medicion';
-    if exists (select 1 from proyecto p
-      where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id
-        and p.estado <> 'cerrado') then
-      raise exception 'el proyecto del reto no está en medición: no puede cerrarse con el outcome review';
-    end if;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'OutcomeReviewCompletado',
         -- El veredicto NO es todo lo que esta escritura congela: la misma sentencia fija

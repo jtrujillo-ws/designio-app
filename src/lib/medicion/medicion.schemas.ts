@@ -321,6 +321,11 @@ export type SeguimientoDeImpacto = {
    * el guard del par, el diagnóstico del servicio y este espejo: mientras hubo tres
    * redacciones del mismo conjunto, a alguna siempre le faltaba un estado. */
   proyectosFrenan: { codigo: string; motivo: string }[];
+  /** Y los que frenan el CIERRE, que es otra pregunta: la apertura permite al pausado con su
+   * G7 —puede volver— y el cierre exige que TODOS estén midiendo, porque solo arrastra a
+   * esos. El permiso de un extremo crea el bloqueo del otro, y el espejo del cierre tiene que
+   * saberlo. Lo define `proyectos_frenan_cierre`, la misma función que aplica el guard. */
+  proyectosFrenanCierre: { codigo: string; motivo: string }[];
   /** Candidatos a propietario del dato: SOLO los miembros del lado cliente (RF-07.1). No
    * es «los miembros del workspace» filtrados por conveniencia de pantalla — es la misma
    * lista que la política de la entrada y el guard de la firma exigen, así que ofrecer
@@ -493,7 +498,11 @@ export function reparosDelEsquema(esquema: z.ZodTypeAny, valores: unknown): stri
  * tenga al menos un KPI que lo responda, así que a esta altura son el mismo conjunto.
  */
 export function faltaParaCompletar(
-  seguimiento: { entradas: EntradaDeRegistry[]; review: OutcomeReviewDeReto | null },
+  seguimiento: {
+    entradas: EntradaDeRegistry[];
+    review: OutcomeReviewDeReto | null;
+    proyectosFrenanCierre: { codigo: string; motivo: string }[];
+  },
   borrador: CompletarReview,
 ): string[] {
   const review = seguimiento.review;
@@ -518,6 +527,14 @@ export function faltaParaCompletar(
         faltan.push(`${r.criterioKpi}: sin dato final, así que el veredicto no puede ser «logrado»`);
       }
     }
+  }
+  // Y la TERCERA superficie, que es la que abrió la decisión de permitir al pausado en la
+  // apertura: el cierre arrastra a 'cerrado' solo a los proyectos que MIDEN y después exige
+  // que no quede ninguno sin cerrar. Un hermano parado —estado que la apertura permite a
+  // propósito— deja la lista vacía y el botón encendido para que el guard lo niegue. Sale de
+  // `proyectos_frenan_cierre`, la misma función que aplica ese guard.
+  for (const p of seguimiento.proyectosFrenanCierre) {
+    faltan.push(`${p.codigo}: ${p.motivo}`);
   }
   return faltan;
 }
@@ -601,9 +618,18 @@ export function narrativaDelBorrador(review: OutcomeReviewDeReto | null): {
  */
 export function postMortemPorAbrir(seguimiento: {
   retoEstado: string;
+  registry: { estado: 'borrador' | 'firmado' } | null;
   entradas: EntradaDeRegistry[];
 }): boolean {
-  return seguimiento.retoEstado === 'en-medicion' && ventanasCerradas(seguimiento.entradas);
+  return (
+    seguimiento.retoEstado === 'en-medicion' &&
+    // …y con el contrato FIRMADO, que `review_insert` exige y este espejo no miraba. No era
+    // inalcanzable: el reto HEREDADO ya está 'en-medicion' con su registry todavía en
+    // borrador, así que en cuanto sus entradas tienen la ventana cerrada el botón se ofrecía
+    // para que la política lo negara. Solo se dictamina sobre lo que se acordó medir.
+    seguimiento.registry?.estado === 'firmado' &&
+    ventanasCerradas(seguimiento.entradas)
+  );
 }
 
 /** Cómo se dice una ventana en la pantalla, en UN sitio: los tres estados (falta tiempo,

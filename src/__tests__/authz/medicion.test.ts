@@ -1469,11 +1469,28 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     expect(reintentos.estadoSnapshot).toBe('vencido');
     expect(reintentos.diasRestantes).toBeLessThanOrEqual(0);
 
-    // El espejo de la pantalla son DOS condiciones y no una: con las ventanas ya vencidas
-    // pero el reto todavía sin abrir su medición, `review_insert` rechaza cada clic — así
-    // que el botón no se ofrece. Media condición es un botón que miente.
-    expect(postMortemPorAbrir({ retoEstado: 'en-medicion', entradas: seg!.entradas })).toBe(true);
-    expect(postMortemPorAbrir({ retoEstado: 'activo', entradas: seg!.entradas })).toBe(false);
+    // El espejo de la pantalla son TRES condiciones y no una: `review_insert` exige el reto
+    // MIDIENDO, el contrato FIRMADO y las ventanas cerradas. Con cualquiera de las tres a
+    // medias el botón miente, y la del registry no era inalcanzable: el reto HEREDADO ya
+    // está 'en-medicion' con su contrato todavía en borrador.
+    const firmadoOk = { estado: 'firmado' as const };
+    expect(
+      postMortemPorAbrir({
+        retoEstado: 'en-medicion',
+        registry: firmadoOk,
+        entradas: seg!.entradas,
+      }),
+    ).toBe(true);
+    expect(
+      postMortemPorAbrir({ retoEstado: 'activo', registry: firmadoOk, entradas: seg!.entradas }),
+    ).toBe(false);
+    expect(
+      postMortemPorAbrir({
+        retoEstado: 'en-medicion',
+        registry: { estado: 'borrador' as const },
+        entradas: seg!.entradas,
+      }),
+    ).toBe(false);
     expect(ventanasCerradas(seg!.entradas)).toBe(true);
 
     // El stakeholder no abre el post-mortem aunque la ventana esté cerrada.
@@ -3332,6 +3349,28 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // par era una promesa a medias y lo que se perdía era el FINAL del reto. Es la misma
     // lección que el relleno de los retos cerrados, del otro lado: dejarlo quieto solo es
     // una decisión si además puede dejar de estarlo.
+    // Y la PANTALLA del cierre lo sabe antes de ofrecer el botón, que es la consecuencia de
+    // haber permitido al pausado en la APERTURA: `proyectos_frenan_medicion` lo deja quedarse
+    // atrás y el guard del cierre exige que TODOS estén midiendo, porque solo arrastra a
+    // esos. El permiso de un extremo crea el bloqueo del otro, y con los resultados y la
+    // narrativa completos la lista quedaba vacía y el botón encendido para que el guard lo
+    // negara. Sale de `proyectos_frenan_cierre`, la MISMA función que aplica ese guard.
+    const segCierre = await seguimientoDeImpacto(leadId, ws, a.proyectoId);
+    expect(segCierre!.proyectosFrenanCierre.map((f) => f.codigo)).toEqual(['P-75B']);
+    expect(
+      faltaParaCompletar(segCierre!, {
+        workspaceId: ws,
+        reviewId: review.reviewId,
+        veredicto: 'no-concluyente',
+        contribucion: 'Con un frente parado a mitad de ventana no se puede atribuir el cambio',
+        factoresExternos: '',
+        hipotesisAbiertas: '',
+        aprendizajes: '',
+        disenoExperimentalSuficiente: false,
+        disenoExperimentalJustificacion: '',
+      }),
+    ).toContain('P-75B: pausado: retómalo para que entre en medición y pueda cerrar con su reto');
+
     const segPausado = await seguimientoDeImpacto(leadId, ws, bId);
     expect(segPausado!.proyectoEstado).toBe('pausado');
     expect(proyectoPorRetomar(segPausado!)).toBe(true);

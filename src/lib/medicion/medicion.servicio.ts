@@ -1307,6 +1307,14 @@ export async function seguimientoDeImpacto(
           from proyectos_frenan_medicion(r.id, r.workspace_id) f
           where not f.solo_al_entrar or r.estado <> 'en-medicion'), '[]'::jsonb)
           as proyectos_frenan,
+        -- Y quién frena el CIERRE, que es otra pregunta y otra función: la apertura PERMITE
+        -- al pausado con G7 y el cierre no, así que el permiso de un extremo crea el bloqueo
+        -- del otro. Misma función que aplica el guard del cierre, invocada y no recopiada.
+        coalesce((
+          select jsonb_agg(jsonb_build_object('codigo', fc.codigo, 'motivo', fc.motivo)
+                           order by fc.codigo)
+          from proyectos_frenan_cierre(r.id, r.workspace_id) fc), '[]'::jsonb)
+          as proyectos_frenan_cierre,
         -- Candidatos a dueño del dato: SOLO el lado cliente (RF-07.1), con el mismo
         -- predicado que la política de la entrada y el guard de la firma. Ofrecer a un
         -- curador aquí sería ofrecer lo que la base rechaza, y ese rechazo llegaría —en el
@@ -1355,6 +1363,8 @@ export async function seguimientoDeImpacto(
       criteriosSinEntrada: fila.criterios_sin_entrada as SeguimientoDeImpacto['criteriosSinEntrada'],
       reparosFirma: fila.reparos_firma as string[],
       proyectosFrenan: fila.proyectos_frenan as SeguimientoDeImpacto['proyectosFrenan'],
+      proyectosFrenanCierre:
+        fila.proyectos_frenan_cierre as SeguimientoDeImpacto['proyectosFrenanCierre'],
       propietariosPosibles:
         fila.propietarios_posibles as SeguimientoDeImpacto['propietariosPosibles'],
       review: fila.review as SeguimientoDeImpacto['review'],

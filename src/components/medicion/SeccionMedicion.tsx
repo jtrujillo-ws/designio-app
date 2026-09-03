@@ -17,6 +17,7 @@ import {
   completarReviewDelReto,
   editarEntradaKpi,
   firmarMetricRegistry,
+  retomarProyectoDeMedicion,
   guardarResultadoDeCriterio,
 } from '@/lib/medicion/medicion.functions';
 import {
@@ -32,6 +33,7 @@ import {
   arranqueDelResultado,
   faltaParaCompletar,
   medicionPorAbrir,
+  proyectoPorRetomar,
   narrativaDelBorrador,
   registryPorAbrir,
   reparosDelEsquema,
@@ -128,6 +130,7 @@ export function SeccionMedicion({
   return (
     <>
       <BloqueRegistry
+        proyectoId={proyecto.id}
         {...comunes}
         criterios={proyecto.reto.criterios}
         esCurador={esCurador}
@@ -149,6 +152,7 @@ export function SeccionMedicion({
 function BloqueRegistry({
   workspaceId,
   seguimiento,
+  proyectoId,
   criterios,
   esCurador,
   esLead,
@@ -157,6 +161,7 @@ function BloqueRegistry({
   onCambio,
   onError,
 }: Comunes & {
+  proyectoId: string;
   criterios: ProyectoMetodo['reto']['criterios'];
   esCurador: boolean;
   esLead: boolean;
@@ -328,6 +333,35 @@ function BloqueRegistry({
         <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
           Lo firma el sponsor en G6: es el compromiso del cliente con el dato.
         </span>
+      )}
+
+      {/* La SALIDA del proyecto que se quedó pausado mientras su reto abría la medición.
+          `proyectosFrenan` lo deja quedarse atrás cuando ya tiene su G7 —«puede volver
+          cuando quiera»— y esa frase solo es verdad si existe el camino de vuelta: sin él,
+          el guard del outcome review no cierra el reto mientras quede un proyecto sin cerrar
+          y el reto se queda SIN FINAL. El par ya era legal en la tabla; lo que faltaba era
+          que algo lo recorriera. */}
+      {esLead && proyectoPorRetomar(seguimiento) && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
+            Este proyecto se quedó pausado con su reto ya midiendo. Hasta que vuelva a
+            medición, el post mortem no puede cerrar el reto.
+          </span>
+          <div>
+            <Button
+              size="sm"
+              disabled={ocupado}
+              onClick={() =>
+                void accion(
+                  () => retomarProyectoDeMedicion({ data: { workspaceId, proyectoId } }),
+                  'No se pudo retomar el proyecto; intenta de nuevo',
+                )
+              }
+            >
+              Retomar el proyecto a medición
+            </Button>
+          </div>
+        </div>
       )}
 
       {firmado && porAbrir && esLead && frenan.length === 0 && (

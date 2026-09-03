@@ -462,6 +462,59 @@ export async function abrirMedicion(
   });
 }
 
+/**
+ * Retomar a MEDICIÓN el proyecto que se quedó pausado (§5.2, RF-04.12).
+ *
+ * Es la salida que faltaba, y sin ella el esquema estaba sancionando un estado del que el
+ * producto no sabía salir. `proyectos_frenan_medicion` deja pasar al proyecto pausado que YA
+ * tiene su G7 —«puede volver cuando quiera»—, así que la medición se abre dejándolo atrás; y
+ * el par `pausado → en-medicion` es legal en la tabla con su precondición al lado. Pero
+ * NINGUNA ruta lo ejecutaba: `abrirMedicion` solo mueve los que están en 'en-implementacion',
+ * y el reto acababa sin final, porque el guard del outcome review no cierra mientras quede un
+ * proyecto sin cerrar. Un par legal que ningún camino recorre es una promesa a medias, y es
+ * la misma lección que el relleno de los retos cerrados: dejarlo quieto solo es una decisión
+ * si además PUEDE dejar de estarlo.
+ *
+ * No repite ninguna precondición: las tres —par legal, G7 aprobado y reto midiendo— viven en
+ * `proyecto_estado_transicion_guard` y esta operación solo las invoca. Lo que sí hace es
+ * tomar el candado del reto primero, como todas las rutas de este slice, para no decidir
+ * sobre una instantánea; y convertir el cero filas en un motivo, que es lo que separa un
+ * rechazo de un silencio.
+ */
+export async function retomarProyectoAMedicion(
+  actorId: string,
+  entrada: { workspaceId: string; proyectoId: string },
+): Promise<{ proyectoId: string }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [proyecto] = await tx`select reto_id, estado from proyecto
+      where id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}`;
+    if (!proyecto) throw new ErrorMedicion('El proyecto no existe en este workspace');
+    await bloquearReto(tx, proyecto.reto_id as string);
+    let movido;
+    try {
+      // El estado va en el WHERE y no solo en la lectura: el UPDATE lo reevalúa DESPUÉS del
+      // candado, que es lo único que ve una pausa o una reanudación ajena en vuelo.
+      movido = await tx`
+        update proyecto set estado = 'en-medicion'
+        where id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}
+          and estado = 'pausado'
+        returning id`;
+    } catch (e) {
+      comoErrorDeDominio(e);
+    }
+    if (movido!.length === 0) {
+      // Sin fila afectada el motivo es la POSICIÓN, no el contenido: o no estaba pausado, o
+      // quien pide no puede escribir su estado. Decirlo así evita el silencio de un update
+      // que no escribió nada.
+      throw new ErrorMedicion(
+        'Este proyecto no está pausado o no puedes cambiar su estado: solo se retoma a medición un proyecto pausado de un reto que ya mide',
+      );
+    }
+    return { proyectoId: entrada.proyectoId };
+  });
+}
+
 /** Único mensaje de las tres condiciones que la política del snapshot exige a la vez
  * (SYS-22/23): decir cuál falló sería contar el estado del reto a quien no lo lee. */
 const RECHAZO_SNAPSHOT =
@@ -728,17 +781,27 @@ export function parsearCsv(csv: string): {
     const i = registro.linea - 1;
     const linea = registro.texto.trim();
     if (linea === '') continue;
-    // Un registro de VARIAS líneas físicas viene de un campo entrecomillado con saltos
-    // dentro (o de una comilla sin pareja, que es lo mismo visto desde el error). Este
-    // parser no interpreta comillas —y meterle medio intérprete es exactamente como
-    // nacieron los tres defectos anteriores de este parseo—, así que se rechaza ENTERO y
-    // no entra ningún fragmento. El motivo dice qué hacer.
-    if (registro.texto.includes('\n') || (registro.texto.match(/"/g) ?? []).length % 2 === 1) {
+    // Este parser NO interpreta comillas, así que se rechaza TODO registro que las lleve.
+    //
+    // La versión anterior de esta regla rechazaba solo el registro multilínea y el de la
+    // comilla sin pareja, y era el mismo error a medias que ya cometió tres veces este
+    // parseo: aplicar el principio a la mitad de los casos que condena. `2026-08-01,55,"a,
+    // b"` tiene las comillas balanceadas y cabe en un renglón, así que pasaba el filtro; y
+    // como aquí las comillas no significan nada, el `split` por el delimitador la partía en
+    // cuatro campos y la nota entraba con las comillas y los escapes dobles como texto
+    // literal. Se reportaba como INSERTADA, y la serie es append-only: esa nota no se
+    // arregla después. Y no es un borde: la hoja de cálculo entrecomilla precisamente
+    // cuando el campo lleva el delimitador dentro, así que ese es el caso corriente.
+    //
+    // Cubre también el multilínea sin nombrarlo: un registro solo ocupa varias líneas
+    // físicas cuando `registrosCsv` encontró una comilla abierta, así que si lleva saltos,
+    // lleva comillas.
+    if (registro.texto.includes('"')) {
       rechazadas.push({
         linea: registro.linea,
         contenido: linea.slice(0, 120),
         motivo:
-          'La nota tiene un salto de línea o una comilla sin cerrar: quítalos y deja cada dato en una sola línea',
+          'Este renglón lleva comillas y este cargador no las interpreta: quítalas. Si la nota contiene el separador o un salto de línea, exporta con «;» o tabulador, o carga ese dato desde el formulario',
       });
       continue;
     }
@@ -1034,6 +1097,12 @@ export async function seguimientoDeImpacto(
         -- un reto que mide con su contrato de uno que mide desde antes de que el contrato
         -- existiera, y esa distinción es la que decide si queda reparación por ofrecer.
         r.medicion_sin_registry,
+        -- El G7 del proyecto que se mira: lo necesita el espejo del botón de RETOMAR, cuya
+        -- precondición en el guard es exactamente esa (a medición se entra por G7). Sin él
+        -- el botón se ofrecería para que la base lo negara.
+        exists (select 1 from gate_instancia g7
+          where g7.proyecto_id = p.id and g7.workspace_id = p.workspace_id
+            and g7.numero = 7 and g7.estado = 'aprobado') as proyecto_g7,
         case when mr.id is null then null else jsonb_build_object(
           'id', mr.id, 'estado', mr.estado, 'firmadoEn', mr.firmado_en::text) end as registry,
         coalesce((
@@ -1213,6 +1282,7 @@ export async function seguimientoDeImpacto(
       retoVeredicto: fila.reto_veredicto as SeguimientoDeImpacto['retoVeredicto'],
       proyectoEstado: fila.proyecto_estado as string,
       medicionSinRegistry: fila.medicion_sin_registry as boolean,
+      proyectoG7Aprobado: fila.proyecto_g7 as boolean,
       registry: fila.registry as SeguimientoDeImpacto['registry'],
       entradas: fila.entradas as SeguimientoDeImpacto['entradas'],
       criteriosSinEntrada: fila.criterios_sin_entrada as SeguimientoDeImpacto['criteriosSinEntrada'],

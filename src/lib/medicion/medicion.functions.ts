@@ -23,6 +23,7 @@ import {
   ErrorMedicion,
   firmarRegistry,
   registrarResultado,
+  retomarProyectoAMedicion,
   registrarSnapshot,
   seguimientoDeImpacto,
 } from './medicion.servicio';
@@ -122,6 +123,21 @@ export const abrirMedicionDelReto = createServerFn({ method: 'POST' })
     try {
       const r = await abrirMedicion(actorId, data);
       return { ok: true as const, proyectos: r.proyectos };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+export const retomarProyectoDeMedicion = createServerFn({ method: 'POST' })
+  .inputValidator(SeguimientoInputSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await retomarProyectoAMedicion(actorId, data);
+      return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

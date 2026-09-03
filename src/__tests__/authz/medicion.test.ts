@@ -23,6 +23,7 @@ import {
   ErrorMedicion,
   firmarRegistry,
   registrarResultado,
+  retomarProyectoAMedicion,
   SNAPSHOTS_POR_ENTRADA,
   registrarSnapshot,
   seguimientoDeImpacto,
@@ -43,6 +44,7 @@ import {
   type CompletarReview,
 } from '@/lib/medicion/medicion.schemas';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
+import { proyectoPorRetomar } from '@/lib/medicion/medicion.schemas';
 import { faltaParaAprobarGate } from '@/lib/metodo/metodo.schemas';
 import { describeAuthz } from './helpers';
 
@@ -1311,13 +1313,57 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // El registro roto cuenta UNA vez y por su línea de COMIENZO, que es la que hay que
     // tocar; el resto del fichero se sigue leyendo con normalidad.
     expect(multi.rechazadas.map((f) => f.linea)).toEqual([2]);
-    expect(multi.rechazadas[0]!.motivo).toMatch(/salto de línea o una comilla sin cerrar/);
+    expect(multi.rechazadas[0]!.motivo).toMatch(/lleva comillas y este cargador no las interpreta/);
     expect(multi.insertados).toBe(1);
     const segMulti = await seguimientoDeImpacto(leadId, ws, proyectoId);
     const serieMulti = segMulti!.entradas.find((e) => e.id === entradaAbandonoId)!.snapshots;
     // Lo que de verdad se está fijando: NADA del registro roto llegó a la serie.
     expect(serieMulti.some((s) => s.nota.includes('la extracción venía mal'))).toBe(false);
     expect(serieMulti.some((s) => s.fecha === fecha(-9))).toBe(false);
+
+    // ── …y el registro entrecomillado de UNA sola línea tampoco ──
+    // La regla es «este parser no interpreta comillas», y aplicarla solo al multilínea y a
+    // la comilla desbalanceada era aplicarla a la mitad de los casos que ella misma condena.
+    // Una nota entrecomillada que cabe en un renglón tiene las comillas BALANCEADAS, así que
+    // pasaba el filtro; y como aquí las comillas no significan nada, el split por el
+    // delimitador la partía y la nota entraba con las comillas dentro, reportada como
+    // insertada. Append-only: no se arregla después. Y es el caso CORRIENTE, no un borde: la
+    // hoja de cálculo entrecomilla precisamente cuando el campo lleva el delimitador dentro.
+    const csvEntrecomillado = [
+      'fecha,valor,nota',
+      `${fecha(0)},57,"antes, después"`,
+      `${fecha(-10)},52,corte del dia que abre`,
+    ].join('\n');
+    const entre = await cargarSnapshotsCsv(sponsorId, {
+      workspaceId: ws,
+      entradaId: entradaAbandonoId,
+      csv: csvEntrecomillado,
+    });
+    expect(entre.rechazadas.map((f) => f.linea)).toEqual([2]);
+    expect(entre.rechazadas[0]!.motivo).toMatch(/lleva comillas y este cargador no las interpreta/);
+    // El resto del fichero se sigue leyendo con normalidad: el rechazo es del REGISTRO.
+    expect(entre.insertados).toBe(1);
+    // El ECO de la fila rechazada sale ÍNTEGRO, comillas incluidas: es lo que el cliente
+    // tiene que reconocer en su fichero para poder arreglarlo.
+    expect(entre.rechazadas[0]!.contenido).toBe(`${fecha(0)},57,"antes, después"`);
+    // Y el reintento devuelve el registro TAL CUAL, con su cabecera: si el rechazo nuevo
+    // recortara las comillas, el reintento se leería distinto del fichero original — que es
+    // justo la corrupción que `textoDeRegistro` existe para no cometer.
+    expect(entre.csvRestante.split('\n')[0]).toBe('fecha,valor,nota');
+    expect(entre.csvRestante).toContain(`${fecha(0)},57,"antes, después"`);
+    expect(entre.csvRestante).not.toContain('corte normal');
+    const segEntre = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const serieEntre = segEntre!.entradas.find((e) => e.id === entradaAbandonoId)!.snapshots;
+    // Nada del registro entrecomillado llegó a la serie, ni con la nota mutilada: ni su
+    // fecha, ni ninguna nota con comillas dentro —que es exactamente lo que entraba antes,
+    // porque el split guardaba las comillas y los escapes como texto literal—.
+    expect(serieEntre.some((s) => s.fecha === fecha(0))).toBe(false);
+    expect(serieEntre.some((s) => s.nota.includes('"'))).toBe(false);
+    expect(serieEntre.some((s) => s.nota.includes('después'))).toBe(false);
+    // La fila buena se retira para no mover las series que fijan los tests de más abajo:
+    // lo que este bloque prueba es el rechazo del registro, no el contenido de la serie.
+    await sqlAdmin()`delete from snapshot where entrada_kpi_id = ${entradaAbandonoId}
+      and nota = 'corte del dia que abre'`;
     // Y el reintento se devuelve con el registro ENTERO, salto incluido: reconstruirlo
     // desde las líneas sueltas volvería a partirlo y el segundo intento fallaría igual.
     expect(multi.csvRestante).toContain('venía mal\ny por eso corregimos"');
@@ -1891,24 +1937,27 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // de que se entre por el servicio, y un `update` directo tampoco es invisible.
     expect((await de('EntradaKpiEditada')).some((e) => e.actor_id === null)).toBe(true);
 
-    // La serie: un evento por FILA, del formulario y del CSV. Son CUATRO del CSV: dos de la
-    // primera tanda, la del fichero europeo y la fila buena del fichero con salto de línea.
-    // Las dos últimas las retiró el fixture después de fijar lo suyo — el rastro no se va
-    // con ellas, que es el punto de que lo emita la base.
+    // La serie: un evento por FILA, del formulario y del CSV. Son CINCO del CSV: dos de la
+    // primera tanda, la del fichero europeo, la fila buena del fichero con salto de línea y
+    // la del fichero entrecomillado. Las últimas las retiró el fixture después de fijar lo
+    // suyo — el rastro NO se va con ellas, que es justamente el punto de que lo emita la
+    // base: un borrado administrativo no reescribe lo que ya pasó.
     const snaps = await cuerpos('SnapshotRegistrado');
-    expect(snaps.filter((p) => p.origen === 'csv').length).toBe(4);
+    expect(snaps.filter((p) => p.origen === 'csv').length).toBe(5);
     expect(snaps.filter((p) => p.origen === 'formulario').length).toBeGreaterThan(0);
     // …y ADEMÁS el de la tanda, que es la única excepción honesta al «lo emite la base»:
     // cuenta las filas RECHAZADAS, que no llegan a ser filas de ninguna tabla y por tanto
-    // ningún trigger puede verlas. Tres tandas —la que no escribió nada no deja rastro de
+    // ningún trigger puede verlas. Cuatro tandas —la que no escribió nada no deja rastro de
     // escritura porque no la hubo—: la primera con sus cinco rechazos, la del fichero
-    // europeo con dos, y la del salto de línea con uno, el registro roto que cuenta UNA vez
-    // aunque ocupara dos renglones.
+    // europeo con dos, la del salto de línea con uno —el registro roto que cuenta UNA vez
+    // aunque ocupara dos renglones— y la del entrecomillado con otro, que cuenta una vez
+    // aunque ocupe un solo renglón: el rechazo es del REGISTRO, no de la línea.
     const tandas = await cuerpos('SnapshotsCargados');
-    expect(tandas.length).toBe(3);
+    expect(tandas.length).toBe(4);
     expect(tandas[0]!.rechazadas).toBe(5);
     expect(tandas[1]!.rechazadas).toBe(2);
     expect(tandas[2]!.rechazadas).toBe(1);
+    expect(tandas[3]!.rechazadas).toBe(1);
 
     // El post-mortem: apertura del review y resultado por criterio.
     expect((await cuerpos('OutcomeReviewAbierto')).some((p) => p.reviewId === reviewId)).toBe(true);
@@ -3250,12 +3299,24 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       ),
     ).rejects.toThrow(/su proyecto no puede quedarse sin abrir/);
 
-    // La reanudación tiene UN destino y es la fase en la que está el reto.
-    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
-      where id = ${bId}`);
+    // La reanudación tiene UN destino y es la fase en la que está el reto — y ahora existe
+    // como RUTA DEL PRODUCTO y no solo como par legal de la tabla. `proyectosFrenan` deja
+    // pasar al pausado que ya tiene su G7 con el argumento de que «puede volver cuando
+    // quiera», y esa frase solo es verdad si algo lo devuelve: hasta aquí ninguna operación
+    // lo hacía —`abrirMedicion` solo mueve los que están en 'en-implementacion'— así que el
+    // par era una promesa a medias y lo que se perdía era el FINAL del reto. Es la misma
+    // lección que el relleno de los retos cerrados, del otro lado: dejarlo quieto solo es
+    // una decisión si además puede dejar de estarlo.
+    const segPausado = await seguimientoDeImpacto(leadId, ws, bId);
+    expect(segPausado!.proyectoEstado).toBe('pausado');
+    expect(proyectoPorRetomar(segPausado!)).toBe(true);
+    await retomarProyectoAMedicion(leadId, { workspaceId: ws, proyectoId: bId });
     const [tras] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
       where id = ${bId}`);
     expect(tras!.estado).toBe('en-medicion');
+    // Y deja de ofrecerse en cuanto no queda nada que retomar: apagar de más es tan avería
+    // como ofrecer de más.
+    expect(proyectoPorRetomar((await seguimientoDeImpacto(leadId, ws, bId))!)).toBe(false);
     // Y con los dos frentes midiendo el reto SÍ termina: el flujo normal del producto llega
     // hasta el veredicto en vez de quedarse encerrado.
     const veredicto = await completar();

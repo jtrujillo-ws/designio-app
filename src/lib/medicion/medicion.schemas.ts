@@ -302,6 +302,9 @@ export type SeguimientoDeImpacto = {
    * lo que abre las dos puertas del perdón histórico —redactar el registry sobre un reto
    * que no está 'activo' y terminar el movimiento del proyecto que se quedó atrás—. */
   medicionSinRegistry: boolean;
+  /** G7 del proyecto que se mira: a medición se entra por G7, así que es la precondición
+   * del botón de RETOMAR igual que lo es del guard. */
+  proyectoG7Aprobado: boolean;
   registry: { id: string; estado: 'borrador' | 'firmado'; firmadoEn: string | null } | null;
   entradas: EntradaDeRegistry[];
   /** Criterios del reto sin KPI que los responda: la firma los exige (SYS-22). */
@@ -369,6 +372,32 @@ export function medicionPorAbrir(seguimiento: {
   return (
     seguimiento.retoEstado === 'activo' ||
     (seguimiento.retoEstado === 'en-medicion' && seguimiento.medicionSinRegistry)
+  );
+}
+
+/**
+ * ¿Se puede RETOMAR este proyecto a medición? Espejo EXACTO del par `pausado → en-medicion`
+ * y de su precondición: informa la pantalla, no autoriza nada.
+ *
+ * Es la salida del proyecto que se quedó pausado mientras su reto abría la medición.
+ * `proyectosFrenan` lo deja quedarse atrás cuando ya tiene su G7 —«puede volver cuando
+ * quiera»—, y esa frase solo es verdad si existe el camino de vuelta: sin él, el guard del
+ * outcome review no cierra el reto mientras quede un proyecto sin cerrar y el reto se queda
+ * sin final. Un par legal que ningún control recorre es una promesa a medias.
+ *
+ * Las TRES condiciones del guard, no dos: el proyecto pausado, su G7 aprobado —a medición se
+ * entra por G7— y el reto ya midiendo. Ofrecerlo sin la del gate sería el botón que promete
+ * lo que la base niega, que es la avería que este slice ya ha corregido en todos los demás.
+ */
+export function proyectoPorRetomar(seguimiento: {
+  retoEstado: string;
+  proyectoEstado: string;
+  proyectoG7Aprobado: boolean;
+}): boolean {
+  return (
+    seguimiento.proyectoEstado === 'pausado' &&
+    seguimiento.retoEstado === 'en-medicion' &&
+    seguimiento.proyectoG7Aprobado
   );
 }
 

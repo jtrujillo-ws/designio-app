@@ -31,7 +31,8 @@ create table design_version (
   -- antes de que el to-be exista); OBLIGATORIO al aprobar, porque aprobar congela su
   -- snapshot (RF-06.3 / RF-05.8).
   journey_id uuid,
-  codigo text not null check (codigo ~ '^DV-[0-9]+$'),
+  -- CANÓNICO y acotado, no «cualquier cosa que parezca un código»: ver numero_de_serie.
+  codigo text not null check (codigo ~ '^DV-[1-9][0-9]{0,8}$'),
   titulo text not null check (btrim(titulo) <> ''),
   resumen text not null default '',
   estado text not null default 'borrador'
@@ -129,6 +130,42 @@ create table elemento_cambio (
 create index elemento_cambio_dv_idx on elemento_cambio (workspace_id, design_version_id, orden);
 create index elemento_cambio_nodo_idx on elemento_cambio (workspace_id, nodo_id);
 
+-- ══ DENTRO DE UNA DESIGN VERSION, UN NODO ES UN SOLO CAMBIO ══
+-- La identidad lógica de un elemento la define «clave» (entrega.diff.ts), y su primer
+-- escalón es la referencia: catálogo si lo hay, y si no el nodo. Sin esta unicidad, dos
+-- elementos de la MISMA versión podían apuntar al mismo nodo, aprobarse y salir en un
+-- release — y entonces el modelo y la clave se contradicen:
+--
+--  · el pliegue del estado efectivo los trata como UNO, así que una constatación machaca a
+--    la otra, y un 'retira' constatado borra de golpe el estado que representaban las dos;
+--  · mientras el diff y el conteo de G7 siguen viendo DOS filas.
+--
+-- Es la simetría exacta del fallo que cerró la identidad por tipo, con el signo cambiado:
+-- allí eran dos cosas DISTINTAS compartiendo clave, y se arregló distinguiéndolas; aquí son
+-- dos filas que comparten clave CON RAZÓN, y no hay nada en ellas que las separe.
+--
+-- Y por eso la salida no puede ser tocar «clave»: meter el id del elemento la haría única
+-- por fila y destruiría lo único que la clave existe para hacer —reconocer el mismo elemento
+-- lógico ENTRE versiones—, y meter el tipo partiría la identidad en cuanto alguien
+-- reclasifica (el argumento está escrito en «clave», y sigue en pie). Si la clave no puede
+-- distinguirlas, entonces son el mismo cambio, y el modelo tiene que decirlo.
+--
+-- El índice es PARCIAL porque el tercer escalón de la clave —los elementos sin nodo— se
+-- desempata por título normalizado dentro de su tipo: ahí un único sobre null no afirmaría
+-- nada útil (y en Postgres los nulos ni siquiera colisionan entre sí).
+--
+-- La otra mitad de la identidad —dos nodos DISTINTOS que apuntan al mismo catálogo, que un
+-- journey admite de sobra: el mismo touchpoint en dos momentos del recorrido— no cabe en un
+-- índice, porque el catálogo no es una columna de esta tabla sino del nodo. La imponen
+-- elemento_cambio_nodo_guard al escribir y design_version_transicion_guard al aprobar.
+--
+-- Prohibir esto no le quita al usuario ninguna salida que estuviera usando: partir un cambio
+-- en dos elementos era la única forma de colgarle varias razones, y desde que el formulario
+-- manda las listas completas de decisiones e insights esa presión no existe.
+create unique index elemento_cambio_nodo_unico
+  on elemento_cambio (workspace_id, design_version_id, nodo_id)
+  where nodo_id is not null;
+
 -- Qué MOTIVA el elemento (RF-06.1). Dos tablas y no una columna polimórfica: cada
 -- enlace tiene su FK compuesta real, y la navegación hacia atrás (RF-06.9) es un join,
 -- no un case.
@@ -163,7 +200,7 @@ create table release (
   workspace_id uuid not null references workspace(id),
   -- SYS-06: EXACTAMENTE una design version, y aprobada (lo exige la política de insert).
   design_version_id uuid not null,
-  codigo text not null check (codigo ~ '^RL-[0-9]+$'),
+  codigo text not null check (codigo ~ '^RL-[1-9][0-9]{0,8}$'),
   titulo text not null check (btrim(titulo) <> ''),
   -- RF-06.4: dueño y fecha. Sin dueño, «parcialidad explícita» es una lista sin nadie
   -- que responda por ella.
@@ -211,7 +248,7 @@ create table effective_state (
   workspace_id uuid not null references workspace(id),
   servicio_id uuid not null,
   release_id uuid not null,
-  codigo text not null check (codigo ~ '^ES-[0-9]+$'),
+  codigo text not null check (codigo ~ '^ES-[1-9][0-9]{0,8}$'),
   resumen text not null default '',
   constatado_por uuid not null references usuario(id),
   constatado_en date not null,
@@ -246,6 +283,24 @@ create index effective_state_servicio_idx
 -- Y se escribe UNA vez porque lo necesitan dos lecturas —la historia que se pliega y la
 -- elección del ES vigente—: dos redacciones del mismo desempate acaban divergiendo, que es
 -- la lección que ya dejaron `gate_certificado_del_proyecto` y `g7_motivo_de_bloqueo`.
+-- Que el código sea CANÓNICO es ahora carga estructural, y lo es desde que el orden dejó de
+-- salir del sello. Mientras el desempate era temporal, 'DV-01' junto a 'DV-1' solo era feo:
+-- los dos pasaban el patrón antiguo y la unicidad de TEXTO no los ve iguales. Desde que el
+-- orden lo da el número interpretado, los dos valen 1 — y entonces:
+--
+--  · el keyset de la lista pierde el orden TOTAL que asume y puede saltarse filas en el
+--    borde de una página, porque «menor estricto que el del cursor» descarta a su gemelo;
+--  · la elección del effective state vigente del mismo día vuelve a ser no determinista,
+--    que es justo lo que se acababa de arreglar;
+--  · y una tirada larga de dígitos desborda el int en el cast.
+--
+-- Se cierra DONDE NACE, en el CHECK de cada tabla: un dígito inicial no nulo y como mucho
+-- nueve cifras, que es lo que cabe en un int4 con holgura. Así el parseo no tiene casos raros
+-- que cubrir — hacer defensivo a `numero_de_serie` habría sido tratar el síntoma y dejar el
+-- dato torcido en la tabla, donde el siguiente lector se lo vuelve a encontrar.
+--
+-- Los generadores ya producían la forma canónica: `max(...)::int + 1` convertido a texto no
+-- lleva ceros a la izquierda y empieza en 1.
 create function numero_de_serie(p_codigo text) returns int
 language sql immutable strict as $$ select substring(p_codigo from '[0-9]+$')::int $$;
 revoke execute on function numero_de_serie(text) from public;
@@ -786,6 +841,7 @@ create function elemento_cambio_nodo_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_journey uuid;
+  v_catalogo uuid;
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
@@ -802,6 +858,27 @@ begin
     where n.id = new.nodo_id and n.workspace_id = new.workspace_id
       and n.journey_id = v_journey) then
     raise exception 'el nodo enlazado no pertenece al journey de esta design version';
+  end if;
+  -- La mitad de la unicidad de identidad que no cabe en un índice: el CATÁLOGO no es una
+  -- columna de esta tabla, es del nodo. Dos nodos distintos del mismo journey pueden
+  -- apuntar a la misma entrada —el mismo touchpoint en dos momentos del recorrido, que es
+  -- legítimo—, y entonces los dos elementos comparten identidad lógica igual que si
+  -- compartieran nodo (el primer escalón de «clave» es el catálogo, por delante del nodo).
+  --
+  -- Se comprueba aquí y no en un constraint porque no hay constraint que lo exprese; y es
+  -- correcto hacerlo en un guard porque TODA mutación de elementos toma antes el candado de
+  -- su design version, así que dos altas concurrentes no pueden cruzarse.
+  select n.catalogo_id into v_catalogo from journey_nodo n
+    where n.id = new.nodo_id and n.workspace_id = new.workspace_id;
+  if v_catalogo is not null and exists (
+    select 1 from elemento_cambio ec
+    join journey_nodo n2 on n2.id = ec.nodo_id and n2.workspace_id = ec.workspace_id
+    where ec.design_version_id = new.design_version_id
+      and ec.workspace_id = new.workspace_id
+      and ec.id <> new.id
+      and n2.catalogo_id = v_catalogo
+  ) then
+    raise exception 'otro elemento de esta design version ya cambia esa entrada de catálogo: descríbelo en UN elemento (el estado efectivo no sabe plegar dos)';
   end if;
   return new;
 end $$;
@@ -1252,6 +1329,26 @@ begin
         and d.estado <> 'vigente'
     ) then
       raise exception 'hay elementos que citan decisiones en revisión: revalídalas antes de aprobar (RF-04.9)';
+    end if;
+    -- Y que dos elementos no describan el mismo cambio. El caso del NODO compartido lo
+    -- impide un índice único desde el alta; este es el del CATÁLOGO, que además puede
+    -- aparecer DESPUÉS de crear los elementos: basta con que alguien enlace al catálogo, en
+    -- el journey de trabajo, un nodo que no lo estaba, y dos elementos que nacieron con
+    -- identidades distintas pasan a compartirla sin que nadie tocara la design version.
+    --
+    -- Por eso se revalida aquí y no solo al escribir, exactamente igual que las decisiones
+    -- de arriba: aprobar es el último instante en que el borrador todavía se puede corregir,
+    -- y lo que se congela después entra en el pliegue del estado efectivo — donde dos
+    -- elementos con la misma identidad no son dos, son uno que pisa al otro.
+    if exists (
+      select 1 from elemento_cambio ec
+      join journey_nodo n on n.id = ec.nodo_id and n.workspace_id = ec.workspace_id
+      where ec.design_version_id = new.id and ec.workspace_id = new.workspace_id
+        and n.catalogo_id is not null
+      group by n.catalogo_id
+      having count(*) > 1
+    ) then
+      raise exception 'hay dos elementos que cambian la misma entrada de catálogo: descríbelo en UN elemento antes de aprobar (el estado efectivo no sabe plegar dos)';
     end if;
     -- Y que el snapshot se haya tomado EN ESTA transición, no antes. RF-06.3 no promete
     -- «hay un snapshot de este journey», promete que aprobar CONGELA el to-be — el de

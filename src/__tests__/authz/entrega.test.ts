@@ -3995,6 +3995,132 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     ).rejects.toThrow(/estado desconocido/);
   });
 
+  it('dentro de una design version, un nodo —y un catálogo— son UN solo cambio', async () => {
+    // La identidad lógica la define «clave»: catálogo si lo hay, si no el nodo. Sin esta
+    // unicidad dos elementos de la MISMA versión podían apuntar al mismo sitio, aprobarse y
+    // salir en un release, y ahí el modelo y la clave se contradicen: el pliegue los trata
+    // como UNO —una constatación machaca a la otra, y un 'retira' borra el estado que
+    // representaban las dos— mientras el diff y G7 siguen contando DOS filas.
+    //
+    // Es la simetría del fallo que cerró la identidad por tipo, con el signo cambiado: allí
+    // eran dos cosas distintas compartiendo clave y se arreglaron distinguiéndolas; aquí
+    // comparten clave con razón y no hay nada que las separe. Tocar «clave» no es salida:
+    // meter el id la haría única por fila y destruiría el reconocimiento ENTRE versiones,
+    // que es lo único que existe para hacer.
+    const admin = sqlAdmin();
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la identidad');
+    const proy = await proyectoConGates('P-128', 'Proyecto de la identidad');
+    // Un nodo de entidad EXIGE catálogo (lo impone un CHECK del journey), así que las dos
+    // formas de la identidad se montan con entradas de catálogo de verdad.
+    const entrada = async (nombre: string): Promise<string> => {
+      const [c] = await admin`insert into catalogo_journey
+        (workspace_id, servicio_id, tipo, nombre, creado_por)
+        values (${ws}, ${svcId}, 'touchpoint', ${nombre}, ${leadId}) returning id`;
+      return c!.id as string;
+    };
+    const catA = await entrada('Mostrador');
+    const catB = await entrada('Buzón');
+    const nodoDe = async (tipo: string, etiqueta: string, catalogo: string | null) => {
+      const [n] = await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, catalogo_id, creado_por)
+        values (${ws}, ${journeyId}, ${tipo}, ${etiqueta}, ${catalogo}, ${leadId})
+        returning id`;
+      return n!.id as string;
+    };
+    // Dos nodos DISTINTOS contra la MISMA entrada: un journey lo admite de sobra —el mismo
+    // touchpoint en dos momentos del recorrido— y por eso el catálogo necesita su propia
+    // comprobación, que no cabe en el índice.
+    const nodoA1 = await nodoDe('touchpoint', 'Mostrador al entrar', catA);
+    const nodoA2 = await nodoDe('touchpoint', 'Mostrador al salir', catA);
+    const nodoB = await nodoDe('touchpoint', 'Buzón de salida', catB);
+    const nodoPaso = await nodoDe('paso', 'Un paso sin catálogo', null);
+
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La de la identidad',
+      resumen: '',
+      superaA: null,
+    });
+    const conNodo = (titulo: string, nodoId: string) =>
+      agregarElemento(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        tipo: 'touchpoint',
+        operacion: 'agrega',
+        titulo,
+        detalle: '',
+        nodoId,
+        decisionIds: [],
+        insightIds: [],
+      });
+
+    await conNodo('El cambio del mostrador', nodoA1);
+    // Mismo NODO: lo para el índice único, y llega como error de dominio con la salida.
+    await expect(conNodo('Otra cosa del mismo nodo', nodoA1)).rejects.toThrow(/UN elemento/);
+    // Mismo CATÁLOGO por otro nodo: lo para el guard.
+    await expect(conNodo('El mismo mostrador por otro nodo', nodoA2)).rejects.toThrow(
+      /entrada de catálogo/,
+    );
+    // Y lo que NO se prohíbe: otra entrada, y un nodo sin catálogo, son otros elementos.
+    await conNodo('El cambio del buzón', nodoB);
+    await conNodo('El cambio del paso', nodoPaso);
+
+    // La colisión puede APARECER después: fundir dos entradas de catálogo repetidas es una
+    // limpieza normal del journey, y deja a dos elementos que nacieron distintos
+    // compartiendo identidad sin que nadie tocara la design version. Por eso se revalida al
+    // aprobar, que es el último instante en que el borrador todavía se puede corregir.
+    await admin`update journey_nodo set catalogo_id = ${catA}
+      where id = ${nodoB} and workspace_id = ${ws}`;
+    await expect(
+      aprobarDesignVersion(leadId, {
+        workspaceId: ws,
+        designVersionId: dv.designVersionId,
+        motivo: '',
+      }),
+    ).rejects.toThrow(/misma entrada de catálogo/);
+
+    // Deshecha la fusión, la versión aprueba: la regla no deja al borrador sin salida.
+    await admin`update journey_nodo set catalogo_id = ${catB}
+      where id = ${nodoB} and workspace_id = ${ws}`;
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+  });
+
+  it('los códigos de serie son CANÓNICOS: el orden depende de leerlos como número', async () => {
+    // Desde que el orden lo da el número interpretado y no el sello, un código no canónico
+    // es carga estructural: 'DV-01' y 'DV-1' pasan la unicidad de TEXTO pero valen lo mismo
+    // como número, y entonces el keyset de la lista pierde el orden total que asume —puede
+    // saltarse filas en el borde de una página— y la elección del ES vigente del mismo día
+    // vuelve a ser no determinista. Se cierra donde nace, en el CHECK.
+    const admin = sqlAdmin();
+    const [dvOk] = await admin`select id, codigo, proyecto_id, servicio_id, workspace_id
+      from design_version where workspace_id = ${ws} limit 1`;
+    const proyectoDe = dvOk!.proyecto_id as string;
+    const servicioDe = dvOk!.servicio_id as string;
+
+    const conCodigo = (codigo: string) =>
+      admin`insert into design_version
+        (workspace_id, proyecto_id, servicio_id, codigo, titulo, creado_por)
+        values (${ws}, ${proyectoDe}, ${servicioDe}, ${codigo}, 'La del código raro', ${leadId})`;
+
+    // Cero a la izquierda: el gemelo silencioso de otro código.
+    await expect(conCodigo('DV-01')).rejects.toThrow();
+    // Sin número, o con un cero que ninguna serie emite.
+    await expect(conCodigo('DV-0')).rejects.toThrow();
+    // Y una tirada que desbordaría el int al interpretarla.
+    await expect(conCodigo('DV-1234567890')).rejects.toThrow();
+
+    // Lo que la serie sí emite de verdad pasa, y se lee como su número.
+    const [n] = await admin`select numero_de_serie(${dvOk!.codigo as string}) as n`;
+    expect(n!.n).toBeGreaterThan(0);
+  });
+
   it('un elemento cita VARIOS motivos, y la lectura los devuelve todos', async () => {
     // El formulario mandaba un solo id por relación aunque el esquema y la persistencia
     // admiten hasta MAXIMO_MOTIVOS_POR_ELEMENTO, y no había otra pantalla para añadir los

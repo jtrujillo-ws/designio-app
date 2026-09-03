@@ -55,6 +55,11 @@ function comoErrorDeDominio(e: unknown, sinPermiso?: string): never {
   if (err.code === '23505' && err.constraint_name === 'design_version_sucesion_uniq') {
     throw new ErrorEntrega('Esa design version ya fue superada por otra');
   }
+  if (err.code === '23505' && err.constraint_name === 'elemento_cambio_nodo_unico') {
+    throw new ErrorEntrega(
+      'Otro elemento de esta design version ya cambia ese nodo: descríbelo en UN elemento (el estado efectivo no sabe plegar dos)',
+    );
+  }
   if (err.code === '23505' && err.constraint_name === 'release_elemento_pkey') {
     throw new ErrorEntrega('Ese elemento ya está incluido en un release (SYS-06: exactamente uno)');
   }

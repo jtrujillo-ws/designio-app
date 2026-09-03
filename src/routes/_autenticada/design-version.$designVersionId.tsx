@@ -36,6 +36,7 @@ import {
   ETIQUETA_RESULTADO,
   ETIQUETA_TIPO_ELEMENTO,
   LARGO_MAXIMO,
+  MAXIMO_MOTIVOS_POR_ELEMENTO,
   OPERACIONES,
   RESULTADOS_CONSTATACION,
   TIPOS_ELEMENTO,
@@ -737,6 +738,83 @@ function VistaElementos({
   );
 }
 
+/**
+ * Las citas de un elemento de cambio, en plural.
+ *
+ * Antes eran dos `Select` de una sola opción, así que un elemento motivado por tres
+ * insights y una decisión solo podía guardarse de dos maneras, las dos malas: con la
+ * trazabilidad recortada —que en este producto es justo lo que se vende, y como la versión
+ * se CONGELA al aprobarse la omisión queda fija—, o partiendo el cambio en dos elementos
+ * para colgarle la segunda motivación. Lo segundo es peor de lo que parece: deja dos filas
+ * donde hay UN cambio, y de ahí en adelante el pliegue cuenta dos, el diff enseña un alta
+ * que nunca ocurrió y el effective state afirma algo que nadie hizo.
+ *
+ * Casillas y no un `<select multiple>`: es el patrón que ya usa el formulario de release
+ * para elegir el alcance, y un multiselect nativo esconde la selección en cuanto la lista
+ * pasa de unas pocas líneas.
+ *
+ * El tope se espeja apagando lo que queda SIN MARCAR al alcanzarlo —una lista de casillas
+ * no sabe negarse sola, a diferencia de un `maxLength`— y diciendo por qué: apagar sin
+ * explicación es el callejón mudo que este PR ya cerró en otros sitios. Lo ya marcado
+ * sigue activo, porque desmarcar tiene que seguir siendo posible.
+ */
+function SelectorDeMotivos({
+  etiqueta,
+  opciones,
+  seleccion,
+  onCambio,
+  vacio,
+}: {
+  etiqueta: string;
+  opciones: { id: string; titulo: string }[];
+  seleccion: string[];
+  onCambio: (ids: string[]) => void;
+  vacio: string;
+}) {
+  const enElTope = seleccion.length >= MAXIMO_MOTIVOS_POR_ELEMENTO;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <span style={micro}>{etiqueta}</span>
+      {opciones.length === 0 && <span style={apunte}>{vacio}</span>}
+      {opciones.map((o) => {
+        const marcado = seleccion.includes(o.id);
+        return (
+          <label
+            key={o.id}
+            style={{
+              display: 'flex',
+              gap: 6,
+              alignItems: 'center',
+              ...cuerpo,
+              color: !marcado && enElTope ? 'var(--text-faint)' : undefined,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={marcado}
+              disabled={!marcado && enElTope}
+              onChange={(e) =>
+                onCambio(
+                  e.target.checked
+                    ? [...seleccion, o.id]
+                    : seleccion.filter((id) => id !== o.id),
+                )
+              }
+            />
+            {o.titulo}
+          </label>
+        );
+      })}
+      {enElTope && (
+        <span style={apunte}>
+          Máximo {MAXIMO_MOTIVOS_POR_ELEMENTO} por elemento: desmarca alguno para cambiarlo.
+          Si de verdad hacen falta más, el cambio probablemente sean dos.
+        </span>
+      )}
+    </div>
+  );
+}
+
 function FormularioElemento({
   workspaceId,
   dv,
@@ -755,8 +833,11 @@ function FormularioElemento({
   const [titulo, setTitulo] = useState('');
   const [detalle, setDetalle] = useState('');
   const [nodoId, setNodoId] = useState('');
-  const [decisionId, setDecisionId] = useState('');
-  const [insightId, setInsightId] = useState('');
+  // Arrays, no un id suelto: un elemento de cambio puede estar motivado por VARIAS
+  // decisiones y varios insights, y el esquema y la persistencia ya lo admitían. El
+  // formulario mandaba uno, y no había otra pantalla para añadir los que faltasen.
+  const [decisionIds, setDecisionIds] = useState<string[]>([]);
+  const [insightIds, setInsightIds] = useState<string[]>([]);
   const [ocupado, setOcupado] = useState(false);
 
   async function enviar(e: FormEvent) {
@@ -773,8 +854,8 @@ function FormularioElemento({
           titulo,
           detalle,
           nodoId: nodoId === '' ? null : nodoId,
-          decisionIds: decisionId === '' ? [] : [decisionId],
-          insightIds: insightId === '' ? [] : [insightId],
+          decisionIds,
+          insightIds,
         },
       });
       if (r.ok) await onHecho();
@@ -834,22 +915,20 @@ function FormularioElemento({
             </option>
           ))}
         </Select>
-        <Select value={decisionId} onChange={(e) => setDecisionId(e.target.value)}>
-          <option value="">Decisión que lo motiva (opcional)</option>
-          {dv.decisionesDelProyecto.map((d) => (
-            <option key={d.id} value={d.id}>
-              {d.titulo}
-            </option>
-          ))}
-        </Select>
-        <Select value={insightId} onChange={(e) => setInsightId(e.target.value)}>
-          <option value="">Insight que lo motiva (opcional)</option>
-          {dv.insightsValidados.map((i) => (
-            <option key={i.id} value={i.id}>
-              {i.titulo}
-            </option>
-          ))}
-        </Select>
+        <SelectorDeMotivos
+          etiqueta="Decisiones que lo motivan (opcional)"
+          opciones={dv.decisionesDelProyecto}
+          seleccion={decisionIds}
+          onCambio={setDecisionIds}
+          vacio="Este proyecto todavía no tiene decisiones que citar."
+        />
+        <SelectorDeMotivos
+          etiqueta="Insights que lo motivan (opcional)"
+          opciones={dv.insightsValidados}
+          seleccion={insightIds}
+          onCambio={setInsightIds}
+          vacio="Todavía no hay insights validados que citar."
+        />
         <div style={{ display: 'flex', gap: 8 }}>
           <Button size="sm" type="submit" disabled={ocupado || titulo.trim() === ''}>
             Añadir

@@ -26,8 +26,10 @@ import {
 } from '@/lib/entrega/entrega.servicio';
 import { calcularDiff, conciliacionCompleta, plegarEstadoVigente } from '@/lib/entrega/entrega.diff';
 import {
+  AgregarElementoSchema,
   ConstatarSchema,
   DesplegarReleaseSchema,
+  MAXIMO_MOTIVOS_POR_ELEMENTO,
   PlanificarReleaseSchema,
 } from '@/lib/entrega/entrega.schemas';
 import { aprobarGate, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
@@ -3991,6 +3993,91 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proyC} and workspace_id = ${ws} and numero = 7`,
     ).rejects.toThrow(/estado desconocido/);
+  });
+
+  it('un elemento cita VARIOS motivos, y la lectura los devuelve todos', async () => {
+    // El formulario mandaba un solo id por relación aunque el esquema y la persistencia
+    // admiten hasta MAXIMO_MOTIVOS_POR_ELEMENTO, y no había otra pantalla para añadir los
+    // que faltasen. Al usuario le quedaban dos salidas y las dos malas: guardar la
+    // trazabilidad recortada —que es justo lo que este producto vende, y como la versión se
+    // CONGELA al aprobarse la omisión queda fija—, o partir el cambio en dos elementos para
+    // colgarle la segunda motivación. Lo segundo deja dos filas donde hay UN cambio, y de
+    // ahí en adelante el pliegue cuenta dos y el diff enseña un alta que nunca ocurrió.
+    //
+    // El arreglo es de PANTALLA, así que este test no lo prueba: prueba el ida y vuelta del
+    // que la pantalla depende —que varias citas se guardan y VUELVEN todas—, que es lo que
+    // se rompería sin avisar si alguien tocara la proyección.
+    const admin = sqlAdmin();
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la cadena larga');
+    const proy = await proyectoConGates('P-127', 'Proyecto de la cadena larga');
+    const [g1] = await admin`select id from gate_instancia
+      where proyecto_id = ${proy} and workspace_id = ${ws} and numero = 1`;
+    const decisiones: string[] = [];
+    for (const titulo of ['Primera razón', 'Segunda razón', 'Tercera razón']) {
+      const [d] = await admin`insert into decision
+        (workspace_id, proyecto_id, gate_id, tipo, titulo, decidido_por)
+        values (${ws}, ${proy}, ${g1!.id as string}, 'diseno', ${titulo}, ${leadId}) returning id`;
+      decisiones.push(d!.id as string);
+    }
+    const insights: string[] = [];
+    for (const titulo of ['Primer hallazgo', 'Segundo hallazgo']) {
+      const [i] = await admin`insert into insight
+        (workspace_id, titulo, estado, validado_por, validado_en, creado_por)
+        values (${ws}, ${titulo}, 'validado', ${leadId}, now(), ${leadId}) returning id`;
+      insights.push(i!.id as string);
+    }
+
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La de los muchos motivos',
+      resumen: '',
+      superaA: null,
+    });
+    const el = await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      tipo: 'canal',
+      operacion: 'agrega',
+      titulo: 'Un cambio con varias razones',
+      detalle: '',
+      nodoId: null,
+      decisionIds: decisiones,
+      insightIds: insights,
+    });
+
+    const vista = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    const guardado = vista!.elementos.find((e) => e.id === el.elementoId)!;
+    expect(guardado.decisiones.map((d) => d.id).sort()).toEqual([...decisiones].sort());
+    expect(guardado.insights.map((i) => i.id).sort()).toEqual([...insights].sort());
+
+    // Y el tope que la pantalla espeja es EL DEL ESQUEMA, no un número copiado al JSX.
+    const base = {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      tipo: 'canal' as const,
+      operacion: 'agrega' as const,
+      titulo: 'Da igual',
+    };
+    const ids = (n: number) => Array.from({ length: n }, () => crypto.randomUUID());
+    expect(
+      AgregarElementoSchema.safeParse({ ...base, decisionIds: ids(MAXIMO_MOTIVOS_POR_ELEMENTO) })
+        .success,
+    ).toBe(true);
+    expect(
+      AgregarElementoSchema.safeParse({
+        ...base,
+        decisionIds: ids(MAXIMO_MOTIVOS_POR_ELEMENTO + 1),
+      }).success,
+    ).toBe(false);
+    expect(
+      AgregarElementoSchema.safeParse({
+        ...base,
+        insightIds: ids(MAXIMO_MOTIVOS_POR_ELEMENTO + 1),
+      }).success,
+    ).toBe(false);
   });
 
   it('el estado efectivo llega al ÁRBOL, que es donde se busca un servicio (RF-06.10)', async () => {

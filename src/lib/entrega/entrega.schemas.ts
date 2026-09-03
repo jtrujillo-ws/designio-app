@@ -163,6 +163,19 @@ const DesfaseUtcSchema = z
   .max(840, 'Desfase horario fuera de los husos reales')
   .default(0);
 
+/**
+ * Cuántas decisiones —y cuántos insights— puede citar UN elemento de cambio.
+ *
+ * Vive aquí y no como un 20 suelto por el mismo motivo que `LARGO_MAXIMO`: lo leen el
+ * esquema que RECHAZA y el control que impide construir el valor rechazable. Y aquí el
+ * espejo cuesta un poco más que un `maxLength`, porque una lista de casillas no sabe
+ * negarse sola: al llegar al tope hay que apagar las que quedan sin marcar y decir por qué.
+ *
+ * El número no es una restricción de dominio —nada dice que un cambio no pueda tener
+ * veintiuna razones—: es un tope de cordura sobre la entrada, y por eso se elige generoso.
+ */
+export const MAXIMO_MOTIVOS_POR_ELEMENTO = 20;
+
 export const LARGO_MAXIMO = {
   titulo: 200,
   resumen: 2000,
@@ -195,8 +208,8 @@ export const AgregarElementoSchema = z.object({
   titulo: z.string().trim().min(1, 'El título es obligatorio').max(LARGO_MAXIMO.titulo),
   detalle: z.string().trim().max(LARGO_MAXIMO.detalle).default(''),
   nodoId: z.string().uuid().nullable().default(null),
-  decisionIds: z.array(z.string().uuid()).max(20).default([]),
-  insightIds: z.array(z.string().uuid()).max(20).default([]),
+  decisionIds: z.array(z.string().uuid()).max(MAXIMO_MOTIVOS_POR_ELEMENTO).default([]),
+  insightIds: z.array(z.string().uuid()).max(MAXIMO_MOTIVOS_POR_ELEMENTO).default([]),
 });
 export type AgregarElemento = z.infer<typeof AgregarElementoSchema>;
 

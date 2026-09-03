@@ -513,8 +513,8 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       'journey_nodo_evidencia',
     ]);
 
-    // La otra mitad del inventario: de las NUEVE tablas con `evidencia_id`, las cuatro de
-    // arriba llevan guard y las cinco restantes quedan fuera con motivo. Se comprueba
+    // La otra mitad del inventario: de las DIEZ tablas con `evidencia_id`, las cuatro de
+    // arriba llevan guard y las seis restantes quedan fuera con motivo. Se comprueba
     // contra las columnas REALES para que una tabla nueva con `evidencia_id` obligue a
     // decidir en vez de heredar el silencio.
     const conEvidenciaId = (
@@ -536,6 +536,18 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       'hilo_comentario',
       // El sello de la curaduría por el otro extremo: el alta, no un uso aguas abajo.
       'item_importacion',
+      // MISMO caso que `item_importacion`, y conviene decir por qué y no dejarlo parecido a
+      // los cuatro de arriba. `propuesta_ai.evidencia_id` no es una CITA de evidencia ajena:
+      // es el sello de la materialización — la evidencia la crea esa misma aceptación, en la
+      // misma transacción y por la misma persona, y el guard de SPEC-08 exige que la fila
+      // apuntada la haya producido ESA propuesta (relación inversa fuera de todo grant, xmin
+      // y proyección del contenido). Exigirle derechos vigentes al sellar sería pedírselos a
+      // una evidencia nacida una sentencia antes, cuyo `derecho_uso` se está creando en esa
+      // misma transacción y nace PENDIENTE a propósito, igual que en la curaduría a mano:
+      // conceder el uso es otro acto, con su base y su responsable. El bloqueo por derechos
+      // le toca a quien USE esa evidencia aguas abajo —citarla en un gate, colgarla de un
+      // arquetipo, sacarla en un entregable—, y esas superficies sí llevan guard.
+      'propuesta_ai',
     ];
     expect([...tablas, ...fueraConMotivo].sort()).toEqual(conEvidenciaId);
 

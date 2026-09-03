@@ -9,6 +9,7 @@ import {
   presenciaLiteralDeCitas,
   materialDeItem,
   materialDeReto,
+  MAX_CRITERIOS_POR_LOTE,
   MAX_MATERIAL,
   PROMPT_VERSION,
   promptCriterios,
@@ -1056,7 +1057,7 @@ async function confirmarDespacho(
 function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): ContenidoPropuesta[] {
   if (capacidad === 'CI') return [ContenidoExtraccionSchema.parse(datos)];
   const lote = (datos ?? {}) as { criterios?: unknown };
-  return ContenidoCriterioSchema.array().min(1).max(4).parse(lote.criterios);
+  return ContenidoCriterioSchema.array().min(1).max(MAX_CRITERIOS_POR_LOTE).parse(lote.criterios);
 }
 
 /**
@@ -1300,7 +1301,7 @@ async function persistirPropuestas(
       const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
-         confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id,
+         confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, orden,
          creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino},
              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
@@ -1315,8 +1316,16 @@ async function persistirPropuestas(
              -- maquillar sin que se vea.
              (${tx.json(CONFIANZA_PROPUESTA_NUMERICA)}::jsonb ->> (c.contenido ->> 'confianzaPropuesta'))::numeric,
              ${llamada.modelo}, ${PROMPT_VERSION}, ${alcance.alcanceResumen},
-             ${alcance.origenKey}, ${llamada.id}, ${actorId}
-      from jsonb_array_elements(${tx.json(contenidos)}) as c(contenido)
+             ${alcance.origenKey}, ${llamada.id},
+             -- El puesto en el lote sale de la MISMA sentencia que inserta (with
+             -- ordinality, que numera desde 1, de ahi el -1) y no de un contador aparte
+             -- aparte: un contador en la aplicación sería otra redacción de la regla, y
+             -- dos generaciones simultáneas lo empezarían las dos en cero. Aquí el puesto
+             -- es una propiedad de la fila dentro de su propio lote, así que el índice
+             -- único puede imponer el techo sin preguntar cuántas hay ya.
+             (c.puesto - 1)::smallint,
+             ${actorId}
+      from jsonb_array_elements(${tx.json(contenidos)}) with ordinality as c(contenido, puesto)
       returning id`;
       return { generadas: filas.length };
     } catch (e) {

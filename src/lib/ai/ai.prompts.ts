@@ -213,6 +213,19 @@ export function promptCriterios(reto: {
   };
 }
 
+/**
+ * Cuántos criterios como MÁXIMO puede traer un lote de C0. Una sola definición, porque el
+ * número gobierna cuatro cosas que tienen que decir lo mismo: lo que se le pide al modelo,
+ * el esquema de salida que lo acota, el parseo que lo vuelve a comprobar y —desde el techo
+ * del lote— cuántas filas puede respaldar una llamada en la base. Estaba escrito a mano en
+ * dos sitios; dos redacciones de una regla nacen iguales y divergen.
+ *
+ * La base no puede importar esta constante, así que su CHECK lleva el número y hay una
+ * prueba que ata los dos lados insertando exactamente este máximo y uno más. El vínculo es
+ * el test, no la esperanza de que nadie toque uno de los dos.
+ */
+export const MAX_CRITERIOS_POR_LOTE = 4;
+
 /** Esquemas de salida estructurada (`output_config.format`). Espejo del Zod de la
  * capacidad: el modelo responde con esta forma y Zod sigue siendo la última palabra. */
 export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = {
@@ -288,7 +301,7 @@ export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = 
       criterios: {
         type: 'array',
         minItems: 1,
-        maxItems: 4,
+        maxItems: MAX_CRITERIOS_POR_LOTE,
         items: {
           type: 'object',
           additionalProperties: false,

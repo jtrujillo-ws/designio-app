@@ -8,7 +8,7 @@ import {
   MODELO_PRIMARIO,
   VENTANA_SALUD_PROVEEDOR_MS,
 } from '@/lib/ai/ai.degradacion';
-import { PROMPT_VERSION } from '@/lib/ai/ai.prompts';
+import { MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   parsearContenido,
@@ -1497,25 +1497,38 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   it('«decididas recientes» se ordena por la fecha de la DECISIÓN, no la de la propuesta', async () => {
     await enWorkspaceLimpio('decididas', async ({ ws: wsD, curadorId, retoId: retoD }) => {
       const admin = sqlAdmin();
-      const [llamada] = await admin`insert into llamada_ai
+      // Una propuesta ANTIGUA y otras cincuenta más nuevas, todas del mismo reto. CADA UNA
+      // con su propia llamada, que es como nacen de verdad: un lote sale de una llamada y
+      // tiene techo, así que colgar cincuenta y una de la misma —como hacía este fixture—
+      // describía algo que el sistema no puede producir. Un fixture que monta un estado
+      // imposible prueba sobre un mundo que no existe.
+      const [llamadaVieja] = await admin`insert into llamada_ai
         (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
         values (${wsD}, 'C0', ${retoD}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
                 ${curadorId}) returning id`;
-      // Una propuesta ANTIGUA y otras cincuenta más nuevas, todas del mismo reto.
       const [vieja] = await admin`insert into propuesta_ai
         (workspace_id, capacidad, destino, reto_id, contenido, contenido_original, modelo,
          prompt_version, origen_key, llamada_id, creado_por, creado_en)
         values (${wsD}, 'C0', 'criterio-exito', ${retoD}, ${admin.json(CONTENIDO_C0)},
                 ${admin.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
-                ${llamada!.id as string}, ${curadorId}, now() - interval '30 days')
+                ${llamadaVieja!.id as string}, ${curadorId}, now() - interval '30 days')
         returning id`;
-      const nuevas = await admin`insert into propuesta_ai
-        (workspace_id, capacidad, destino, reto_id, contenido, contenido_original, modelo,
-         prompt_version, origen_key, llamada_id, creado_por, creado_en)
+      const nuevas = await admin`
+        with l as (
+          insert into llamada_ai
+            (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+          select ${wsD}, 'C0', ${retoD}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                 ${curadorId}
+          from generate_series(1, 50)
+          returning id
+        )
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original, modelo,
+           prompt_version, origen_key, llamada_id, creado_por, creado_en)
         select ${wsD}, 'C0', 'criterio-exito', ${retoD}, ${admin.json(CONTENIDO_C0)},
                ${admin.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
-               ${llamada!.id as string}, ${curadorId}, now() - interval '1 day'
-        from generate_series(1, 50)
+               l.id, ${curadorId}, now() - interval '1 day'
+        from l
         returning id`;
       // Las nuevas se decidieron ayer; la antigua, ahora mismo.
       await admin`update propuesta_ai set estado = 'rechazada', revisada_por = ${curadorId},
@@ -2692,18 +2705,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
      * Todas cuelgan de una misma llamada: el libro de costos no admite propuestas huérfanas
      * (FK), y aquí lo que se mide es el corte de las listas, no el gasto. */
     async function sembrar(n: number, desdeMinutos: number): Promise<string[]> {
-      const [llamada] = await admin`insert into llamada_ai
-        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
-        values (${wsP}, 'C0', ${retoP}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
-                ${curadorId}) returning id`;
-      const filas = await admin`insert into propuesta_ai
-        (workspace_id, capacidad, destino, reto_id, contenido, contenido_original, modelo,
-         prompt_version, origen_key, llamada_id, creado_por, creado_en)
+      // Una llamada POR propuesta: un lote sale de una sola llamada y tiene techo, así que
+      // colgar n de la misma describía un estado que el sistema no puede producir.
+      const filas = await admin`
+        with l as (
+          insert into llamada_ai
+            (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+          select ${wsP}, 'C0', ${retoP}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                 ${curadorId}
+          from generate_series(1, ${n})
+          returning id
+        ),
+        numeradas as (select id, (row_number() over ())::int as g from l)
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original, modelo,
+           prompt_version, origen_key, llamada_id, creado_por, creado_en)
         select ${wsP}, 'C0', 'criterio-exito', ${retoP}, ${admin.json(CONTENIDO_C0)},
                ${admin.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
-               ${llamada!.id as string}, ${curadorId},
-               now() - make_interval(mins => ${desdeMinutos} - g)
-        from generate_series(1, ${n}) as g
+               n.id, ${curadorId},
+               now() - make_interval(mins => ${desdeMinutos} - n.g)
+        from numeradas n
         returning id`;
       return filas.map((f) => f.id as string);
     }
@@ -3582,7 +3603,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     try {
       // Se decide la primera, que es lo que liberaba el hueco del índice de pendientes.
       await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
-      await expect(insertar()).rejects.toThrow(/propuesta_ai_llamada_ci_idx|duplicate key|llave duplicada/i);
+      await expect(insertar()).rejects.toThrow(/propuesta_ai_llamada_orden_idx|duplicate key|llave duplicada/i);
 
       // Control: con SU PROPIA llamada, la segunda propuesta entra. Lo que la rechazaba era
       // compartir la llamada, no nada del item ni del estado.
@@ -3603,29 +3624,67 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
-  it('C0 sí reparte una llamada entre el lote que produjo', async () => {
-    // La asimetría es deliberada y es la misma que la de la reserva: C0 persiste un LOTE de
-    // una sola llamada, así que sus filas hermanas comparten `llamada_id` legítimamente y el
-    // índice tiene que dejarlas pasar. Sin este control, «una llamada, una propuesta» se
-    // habría podido escribir sin capacidad y habría roto C0 en producción.
+  it('C0 reparte una llamada entre su lote, y el lote tiene techo', async () => {
+    // La asimetría con CI es deliberada y es la misma que la de la reserva: C0 persiste un
+    // LOTE de una sola llamada, así que sus filas hermanas comparten `llamada_id`
+    // legítimamente y el índice tiene que dejarlas pasar.
+    //
+    // Pero «legítimo» no es «sin límite», y ése era el agujero: el índice era PARCIAL de CI,
+    // así que una llamada C0 podía respaldar propuestas sin fin. Cada propuesta afirma «esta
+    // llamada ME produjo», y con más filas que criterios la frase deja de ser cierta en casi
+    // todas: heredan un coste y un uso que no son suyos.
+    //
+    // «Único» y «sin restricción» no eran las dos únicas opciones. Con el PUESTO en el lote,
+    // la cota vuelve a ser una regla de fila que Postgres impone sin preguntar «cuántas hay
+    // ya» —la pregunta sobre el conjunto que dos transacciones responden a la vez sobre
+    // snapshots distintos, y que ningún guard puede cerrar—.
     const admin = sqlAdmin();
     const llamadaId = await nuevaLlamada({ capacidad: 'C0', retoId });
-    const insertar = () =>
+    const insertar = (orden: number) =>
       conUsuario(leadId, (tx) => tx`
         insert into propuesta_ai
           (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-           modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+           modelo, prompt_version, alcance_resumen, origen_key, llamada_id, orden, creado_por)
         values (${ws}, 'C0', 'criterio-exito', ${retoId}, ${tx.json(CONTENIDO_C0)},
                 ${tx.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
-                'alcance de prueba', 'entorno', ${llamadaId}, ${leadId})
+                'alcance de prueba', 'entorno', ${llamadaId}, ${orden}, ${leadId})
         returning id`);
     const ids: string[] = [];
     try {
-      for (let n = 0; n < 3; n++) {
-        const [f] = await insertar();
+      // EXACTAMENTE el máximo entra. El número sale de la constante de TS, no de un literal:
+      // es lo que ata los dos lados, porque la base no puede importarla y su CHECK lleva el
+      // número escrito. Si alguien mueve uno de los dos, este test cae.
+      for (let orden = 0; orden < MAX_CRITERIOS_POR_LOTE; orden++) {
+        const [f] = await insertar(orden);
         ids.push(f!.id as string);
       }
-      expect(ids.length).toBe(3);
+      expect(ids.length).toBe(MAX_CRITERIOS_POR_LOTE);
+
+      // Y UNA MÁS no. Por las dos vías, que son dos reglas distintas y conviene no
+      // confundirlas: un puesto FUERA del rango lo rechaza el CHECK…
+      await expect(insertar(MAX_CRITERIOS_POR_LOTE)).rejects.toThrow(/orden|check/i);
+      // …y un puesto REPETIDO lo rechaza el índice único. Sin la segunda, bastaría con
+      // colgar todas en el puesto 0 para tener un lote infinito dentro del rango.
+      await expect(insertar(0)).rejects.toThrow(
+        /propuesta_ai_llamada_orden_idx|duplicate key|llave duplicada/i,
+      );
+
+      // CI, en cambio, queda fijada al puesto 0 por CHECK: una extracción es un lote de uno,
+      // y por eso el índice GENERAL sustituye al parcial sin perder lo que aquél garantizaba.
+      const itemCI = await nuevoItem('Item que intenta un puesto que no le toca');
+      const llamadaCI = await nuevaLlamada({ capacidad: 'CI', itemId: itemCI });
+      await expect(
+        conUsuario(leadId, (tx) => tx`
+          insert into propuesta_ai
+            (workspace_id, capacidad, destino, item_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, origen_key, llamada_id, orden, creado_por)
+          values (${ws}, 'CI', 'evidencia', ${itemCI}, ${tx.json(CONTENIDO_CI)},
+                  ${tx.json(CONTENIDO_CI)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                  'alcance de prueba', 'entorno', ${llamadaCI}, 1, ${leadId})
+          returning id`),
+      ).rejects.toThrow(/propuesta_ai_ci_puesto_unico|check/i);
+      await admin`delete from llamada_ai where id = ${llamadaCI}`;
+      await admin`delete from item_importacion where id = ${itemCI}`;
     } finally {
       for (const id of ids) await admin`delete from propuesta_ai where id = ${id}`;
       await admin`delete from llamada_ai where id = ${llamadaId}`;

@@ -8,6 +8,7 @@ import { evaluarCapacidadAI, LIMITE_LLAMADAS_DIA } from './ai.degradacion';
 import {
   fidelidadDeCitas,
   materialDeItem,
+  materialDeReto,
   MAX_MATERIAL,
   PROMPT_VERSION,
   promptCriterios,
@@ -16,6 +17,7 @@ import {
   SISTEMA_EXTRACCION,
 } from './ai.prompts';
 import {
+  CONFIANZA_PROPUESTA_NUMERICA,
   ContenidoCriterioSchema,
   ContenidoExtraccionSchema,
   DESTINO_DE_CAPACIDAD,
@@ -181,15 +183,28 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   // El material se compone IGUAL que al construir el prompt —ficha incluida y con el
   // delimitador neutralizado—: la fidelidad se mide contra lo que el modelo leyó, no
   // contra el texto crudo de la base. Una sola definición, dos usos.
+  //
+  // Y se compone para las DOS capacidades: C0 cita la formulación del reto igual que CI cita
+  // el material del item, así que la fidelidad se mide con la misma función. Cuando C0 no
+  // citaba, sus propuestas no salían mal en la medición de grounding (RF-09.10): salían
+  // excluidas, que es peor — una capacidad que no puede salir mal es la que más falta hace
+  // medir.
   const material =
-    f.item_id === null
-      ? ''
-      : materialDeItem({
+    f.item_id !== null
+      ? materialDeItem({
           titulo: (f.item_titulo as string | null) ?? '',
           tipoFuente: (f.item_tipo_fuente as string | null) ?? '',
           referencia: (f.item_referencia as string | null) ?? '',
           contenido: (f.item_contenido as string | null) ?? '',
-        }).texto;
+        }).texto
+      : f.reto_codigo
+        ? materialDeReto({
+            codigo: f.reto_codigo as string,
+            titulo: (f.reto_titulo as string | null) ?? '',
+            descripcion: (f.reto_descripcion as string | null) ?? '',
+            metricaObjetivo: (f.reto_metrica as string | null) ?? '',
+          }).texto
+        : '';
   // Las citas se leen del ORIGINAL: son el testimonio del modelo sobre lo que leyó, no del
   // humano que corrige. Hoy son siempre las mismas —corregirlas está prohibido en el
   // servicio y en el guard— y leerlas de aquí lo deja dicho en la proyección también.
@@ -280,6 +295,8 @@ export async function panelPropuestas(
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
              coalesce(i.titulo, r.codigo || ' ' || r.titulo) as ancla_titulo,
+             r.codigo as reto_codigo, r.titulo as reto_titulo,
+             r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica,
              case
                when p.item_id is not null then
                  case
@@ -1157,11 +1174,20 @@ async function persistirPropuestas(
       const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
-         modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+         confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id,
+         creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino},
              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
              ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
              c.contenido, c.contenido,
+             -- La confianza que el modelo declara sobre CADA propuesta, traducida a la escala
+             -- de la columna por una sola tabla. La columna existía y NADIE la escribía:
+             -- toda propuesta no sembrada nacía en nulo, así que el panel presentaba todas
+             -- como si mereciesen la misma atención — lo contrario de lo que una capacidad
+             -- con revisión humana necesita. Se saca del contenido y no de un campo aparte
+             -- para que viaje también en contenido_original y la corrección no la pueda
+             -- maquillar sin que se vea.
+             (${tx.json(CONFIANZA_PROPUESTA_NUMERICA)}::jsonb ->> (c.contenido ->> 'confianzaPropuesta'))::numeric,
              ${llamada.modelo}, ${PROMPT_VERSION}, ${alcance.alcanceResumen},
              ${alcance.origenKey}, ${llamada.id}, ${actorId}
       from jsonb_array_elements(${tx.json(contenidos)}) as c(contenido)
@@ -1376,10 +1402,12 @@ async function aceptarPropuestaEnTransaccion(
       // una pantalla: cualquier cliente que hable con la server function podía mandar otras.
       // Se compara contra el ORIGINAL y no contra el contenido vigente, que es lo mismo
       // mientras la propuesta esté pendiente pero dice mejor de dónde sale la verdad.
+      // Vale para las DOS capacidades desde que C0 también cita: la regla es de las citas,
+      // no del destino, y atarla a `evidencia` habría dejado las de C0 editables el día que
+      // existieron.
       if (
-        p.destino === 'evidencia' &&
-        JSON.stringify((contenido as ContenidoExtraccion).citas) !==
-          JSON.stringify((p.contenidoOriginal as ContenidoExtraccion).citas)
+        JSON.stringify((contenido as ContenidoPropuesta).citas) !==
+        JSON.stringify((p.contenidoOriginal as ContenidoPropuesta).citas)
       ) {
         throw new ErrorAI(
           'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',
@@ -1468,6 +1496,18 @@ async function materializarEvidencia(
   const [consentimiento] = await tx`select 1 as hay from consentimiento_item
     where item_id = ${p.itemId} and workspace_id = ${workspaceId} limit 1`;
 
+  // Sin fecha no hay proveniencia, y la proveniencia es obligatoria en una evidencia
+  // (`DimensionesEvidenciaSchema` la exige, y con razón: una evidencia sin fecha no se puede
+  // situar en el tiempo). Que el modelo pueda decir «el material no la trae» es lo que evita
+  // que se la invente; ponerla es entonces trabajo del humano, y aprobar incluye enmendar
+  // (I4). Se dice con el motivo que dio el modelo, para que la curadora sepa qué buscar.
+  if (c.fecha === null) {
+    throw new ErrorAI(
+      `Esa propuesta no trae fecha del material${
+        c.fechaSinDatoMotivo ? ` (${c.fechaSinDatoMotivo})` : ''
+      }: una evidencia se sitúa en el tiempo, así que corrígela añadiendo la fecha antes de aceptarla`,
+    );
+  }
   const dimensiones = DimensionesEvidenciaSchema.parse({
     proveniencia: {
       tipoFuente: item.tipo_fuente as string,

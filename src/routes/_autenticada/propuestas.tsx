@@ -1012,7 +1012,21 @@ function FichaExtraccion({ contenido }: { contenido: ContenidoExtraccion }) {
       <Dato rotulo="Título" valor={contenido.titulo} />
       {contenido.resumen && <Dato rotulo="Resumen" valor={contenido.resumen} />}
       <Dato rotulo="Recolección" valor={contenido.recoleccion} />
-      <Dato rotulo="Fecha del material" valor={contenido.fecha} />
+      {/* La fecha o consta con su sitio, o falta con su motivo. Enseñar la ausencia con su
+          razón —en vez de un hueco— es lo que distingue «el material no la trae» de «se
+          olvidó»: la primera pide corregir antes de aceptar, la segunda no existe. */}
+      {contenido.fecha !== null ? (
+        <Dato
+          rotulo="Fecha del material"
+          valor={`${contenido.fecha}${contenido.fechaLocalizacion ? ` · leída en ${contenido.fechaLocalizacion}` : ''}`}
+        />
+      ) : (
+        <Dato
+          rotulo="Fecha del material"
+          valor={`sin fecha en el material${contenido.fechaSinDatoMotivo ? `: ${contenido.fechaSinDatoMotivo}` : ''} — hay que fecharla al corregir para poder aceptarla`}
+        />
+      )}
+      <Dato rotulo="Confianza de la propuesta" valor={contenido.confianzaPropuesta} />
       <Dato
         rotulo="Dimensiones"
         valor={`confianza ${contenido.confianza} · ${contenido.derivada ? 'derivada' : 'primaria'} · confidencialidad ${contenido.confidencialidad}${contenido.esEstadoActual ? ' · describe el estado actual' : ''}`}
@@ -1043,6 +1057,7 @@ function FichaCriterio({ contenido }: { contenido: ContenidoCriterio }) {
       <Dato rotulo="Ventana" valor={`${contenido.ventanaDias} días`} />
       <Dato rotulo="Plan de línea base" valor={contenido.lineaBasePlan} />
       {contenido.razonamiento && <Dato rotulo="Razonamiento" valor={contenido.razonamiento} />}
+      <Dato rotulo="Confianza de la propuesta" valor={contenido.confianzaPropuesta} />
     </div>
   );
 }
@@ -1070,7 +1085,8 @@ function FormularioExtraccion({
   const [titulo, setTitulo] = useState(inicial.titulo);
   const [resumen, setResumen] = useState(inicial.resumen);
   const [recoleccion, setRecoleccion] = useState(inicial.recoleccion);
-  const [fecha, setFecha] = useState(inicial.fecha);
+  const [fecha, setFecha] = useState(inicial.fecha ?? '');
+  const [fechaLocalizacion, setFechaLocalizacion] = useState(inicial.fechaLocalizacion);
   const [confianza, setConfianza] = useState(inicial.confianza);
   const [confidencialidad, setConfidencialidad] = useState(inicial.confidencialidad);
   const [derivada, setDerivada] = useState(inicial.derivada);
@@ -1085,13 +1101,22 @@ function FormularioExtraccion({
           titulo,
           resumen,
           recoleccion,
-          fecha,
+          // La fecha es lo único de aquí que puede NACER vacío, porque el modelo tiene
+          // permitido decir que el material no la trae. Al ponerla, su motivo de ausencia
+          // deja de tener sentido y se va; al quitarla, vuelve el que dio el modelo.
+          fecha: fecha === '' ? null : fecha,
+          fechaLocalizacion: fecha === '' ? '' : fechaLocalizacion,
+          fechaSinDatoMotivo: fecha === '' ? inicial.fechaSinDatoMotivo : '',
           confianza,
           confidencialidad,
           derivada,
           esEstadoActual,
-          // Las citas NO se editan: son el rastro verificable de lo que el modelo dijo
-          // haber leído; corregirlas a mano borraría la señal de grounding.
+          // Ni las citas ni la confianza declarada se editan: las primeras son el rastro
+          // verificable de lo que el modelo dijo haber leído —corregirlas borraría la señal
+          // de grounding— y la segunda es lo que el modelo afirmó sobre su propia propuesta,
+          // que es el dato con el que se ordena la revisión. Reescribir cualquiera de las dos
+          // sería maquillar la medida con la mano que se está midiendo.
+          confianzaPropuesta: inicial.confianzaPropuesta,
           citas: inicial.citas,
         });
       }}
@@ -1119,7 +1144,19 @@ function FormularioExtraccion({
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
         <label style={campo}>
           <span style={etiqueta}>Fecha del material</span>
-          <Input type="date" required value={fecha} onChange={(e) => setFecha(e.target.value)} />
+          <Input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} />
+        </label>
+        <label style={campo}>
+          <span style={etiqueta}>Dónde se lee la fecha</span>
+          {/* Obligatoria SOLO si hay fecha, por lo mismo que las citas llevan localización:
+              una fecha sin sitio en el material es indistinguible de una inventada. */}
+          <Input
+            required={fecha !== ''}
+            maxLength={200}
+            placeholder={fecha === '' ? 'sin fecha que situar' : 'p. ej. cabecera del acta'}
+            value={fechaLocalizacion}
+            onChange={(e) => setFechaLocalizacion(e.target.value)}
+          />
         </label>
         <label style={campo}>
           <span style={etiqueta}>Confianza</span>
@@ -1206,6 +1243,10 @@ function FormularioCriterio({
           ventanaDias: Number(ventanaDias),
           lineaBasePlan,
           razonamiento: inicial.razonamiento,
+          // Mismo criterio que en CI: lo que el modelo afirmó —sus citas y su confianza— no
+          // lo reescribe quien corrige.
+          confianzaPropuesta: inicial.confianzaPropuesta,
+          citas: inicial.citas,
         });
       }}
     >

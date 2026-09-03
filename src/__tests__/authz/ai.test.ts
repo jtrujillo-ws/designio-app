@@ -8,10 +8,12 @@ import {
   MODELO_PRIMARIO,
 } from '@/lib/ai/ai.degradacion';
 import { PROMPT_VERSION } from '@/lib/ai/ai.prompts';
-import type {
-  ContenidoCriterio,
-  ContenidoExtraccion,
-  ContenidoPropuesta,
+import {
+  CONFIANZA_PROPUESTA_NUMERICA,
+  parsearContenido,
+  type ContenidoCriterio,
+  type ContenidoExtraccion,
+  type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import {
   aceptarPropuesta,
@@ -70,10 +72,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     resumen: 'El abandono se concentra en la carga del documento.',
     recoleccion: 'Análisis de funnel',
     fecha: '2026-07-20',
+    fechaLocalizacion: 'párrafo 1',
+    fechaSinDatoMotivo: '',
     derivada: true,
     confianza: 'media',
     confidencialidad: 'cliente',
     esEstadoActual: true,
+    confianzaPropuesta: 'alta',
     citas: [
       { fragmento: 'El 71% de los abandonos', localizacion: 'párrafo 1' },
       { fragmento: 'inventado que no está en el material', localizacion: 'párrafo 1' },
@@ -87,6 +92,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     ventanaDias: 90,
     lineaBasePlan: 'Extraer el funnel de analítica de los últimos 90 días',
     razonamiento: 'Es la métrica que el reto declara como objetivo',
+    confianzaPropuesta: 'media',
+    // C0 cita la formulación del reto igual que CI cita el material del item: el fixture usa
+    // el título, que `materialDeReto` mete en la ficha del bloque, así que es literal.
+    citas: [{ fragmento: 'Reto', localizacion: 'título del reto' }],
   };
 
   /** Item de bandeja pendiente (setup con la conexión admin, como el resto de la suite).
@@ -2911,6 +2920,150 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       where id = ${r.objetoId}`);
     expect(c!.ventana_dias).toBe(3);
     await sqlAdmin()`update criterio_exito set propuesta_ai_id = null where id = ${r.objetoId}`;
+  });
+
+  it('sin fecha en el material la propuesta nace igual, y fecharla es trabajo del humano', async () => {
+    // La contradicción que esto cierra: `item_importacion` no garantiza que el material
+    // traiga una fecha calendárica, el prompt prohíbe inventarlas y el esquema exigía una.
+    // Al modelo solo le quedaban dos salidas — fabricarla, y se persistía como proveniencia
+    // de la evidencia, o devolver algo que se descarta.
+    const itemId = await nuevoItem('Item sin fecha en el material');
+    const sinFecha = {
+      ...CONTENIDO_CI,
+      fecha: null,
+      fechaLocalizacion: '',
+      fechaSinDatoMotivo: 'el material no menciona ninguna fecha',
+    };
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CI',
+      destino: 'evidencia',
+      itemId,
+      contenido: sinFecha,
+    });
+
+    // El panel la ofrece con la ausencia dicha y su motivo: «no consta» no es «no lo escribí».
+    const panel = await panelPropuestas(leadId, ws);
+    const p = panel.pendientes.find((x) => x.id === propuestaId)!;
+    expect((p.contenido as ContenidoExtraccion).fecha).toBeNull();
+    expect((p.contenido as ContenidoExtraccion).fechaSinDatoMotivo).toMatch(/no menciona/i);
+
+    // Aceptarla TAL CUAL no puede ser: una evidencia se sitúa en el tiempo. Y lo dice con el
+    // motivo del modelo, para que la curadora sepa qué buscar.
+    const alAceptar = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+    }).catch((e: unknown) => e);
+    expect(alAceptar).toBeInstanceOf(ErrorAI);
+    expect((alAceptar as ErrorAI).message).toMatch(/no trae fecha del material/i);
+    expect((alAceptar as ErrorAI).message).toMatch(/no menciona/i);
+
+    // Fecharla al corregir sí, que es lo que I4 llama aprobar: aprobar incluye enmendar. Y
+    // queda contada como CORRECCIÓN, que es exactamente lo que hay que poder medir.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: {
+        ...sinFecha,
+        fecha: '2026-07-01',
+        fechaLocalizacion: 'acta de la sesión',
+        fechaSinDatoMotivo: '',
+      },
+    });
+    expect(r.estado).toBe('corregida');
+    const [ev] = await conUsuario(leadId, (tx) => tx`select dimensiones from evidencia
+      where id = ${r.objetoId}`);
+    const dim = ev!.dimensiones as Record<string, Record<string, unknown>>;
+    expect(dim.proveniencia!.fecha).toBe('2026-07-01');
+    await sqlAdmin()`update evidencia set propuesta_ai_id = null where id = ${r.objetoId}`;
+  });
+
+  it('la fecha es un XOR: ni las dos cosas ni ninguna', async () => {
+    // El esquema es la puerta, así que se prueba por el esquema y no por el formulario.
+    const base = { ...CONTENIDO_CI };
+    // Las dos a la vez: un dato que se contradice a sí mismo.
+    expect(() =>
+      parsearContenido('CI', { ...base, fecha: '2026-07-20', fechaSinDatoMotivo: 'no la trae' }),
+    ).toThrow();
+    // Ninguna: la ausencia sin motivo es «no lo escribí», que es justo lo que no vale.
+    expect(() =>
+      parsearContenido('CI', { ...base, fecha: null, fechaLocalizacion: '', fechaSinDatoMotivo: '' }),
+    ).toThrow();
+    // Y una fecha sin sitio en el material es indistinguible de una inventada.
+    expect(() => parsearContenido('CI', { ...base, fechaLocalizacion: '' })).toThrow();
+    // Los dos casos legítimos pasan.
+    expect(() => parsearContenido('CI', base)).not.toThrow();
+    expect(() =>
+      parsearContenido('CI', {
+        ...base,
+        fecha: null,
+        fechaLocalizacion: '',
+        fechaSinDatoMotivo: 'el material no la menciona',
+      }),
+    ).not.toThrow();
+  });
+
+  it('C0 también cita, y su fidelidad se mide contra la formulación del reto', async () => {
+    // Sin citas, C0 no salía MAL en la medición de grounding de RF-09.10: salía EXCLUIDA, en
+    // silencio. Y una capacidad que no puede salir mal en la métrica de calidad es la que
+    // más falta hace medir. Además I4 lo pide con todas las letras: la AI propone Y CITA.
+    await enWorkspaceLimpio('citas-c0', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      await admin`update reto set descripcion = ${'Los clientes abandonan la verificación de identidad antes de terminarla.'},
+          metrica_objetivo = 'Bajar el abandono al 40%'
+        where id = ${retoC}`;
+      const generadas = await conProveedor(
+        {
+          ok: true,
+          datos: {
+            criterios: [
+              {
+                ...CONTENIDO_C0,
+                citas: [
+                  // Literal de la descripción del reto…
+                  {
+                    fragmento: 'abandonan la verificación de identidad',
+                    localizacion: 'descripción del reto',
+                  },
+                  // …y una inventada, para que el panel las distinga.
+                  { fragmento: 'esto no está en el reto', localizacion: 'descripción del reto' },
+                ],
+              },
+            ],
+          },
+          intentos: [intento({ latenciaMs: 70, uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C0', anclaId: retoC }),
+      );
+      expect(generadas.generadas).toBe(1);
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes[0]!;
+      // Las citas se pintan y se miden, igual que las de CI: una fiel y una inventada.
+      expect(p.citas.map((c) => c.fiel)).toEqual([true, false]);
+      // Y la confianza declarada llega a la columna que ordena la revisión, que antes se
+      // quedaba en nulo para TODA propuesta no sembrada.
+      expect(p.confianza).toBe(CONFIANZA_PROPUESTA_NUMERICA[CONTENIDO_C0.confianzaPropuesta]);
+
+      // Corregir un criterio C0 no permite reescribir ni sus citas ni su confianza.
+      const contenido = p.contenido as ContenidoCriterio;
+      await expect(
+        aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId: p.id,
+          correccion: {
+            ...contenido,
+            citas: [{ fragmento: 'inventada a mano', localizacion: 'ninguna' }],
+          },
+        }),
+      ).rejects.toThrow(/no se corrigen/i);
+      await expect(
+        aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId: p.id,
+          correccion: { ...contenido, confianzaPropuesta: 'alta' },
+        }),
+      ).rejects.toThrow(/no se corrigen/i);
+    });
   });
 
   it('los relojes del slice no los escribe quien se mide con ellos', async () => {

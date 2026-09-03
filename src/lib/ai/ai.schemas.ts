@@ -75,25 +75,86 @@ export const DESTINO_DE_CAPACIDAD: Record<CapacidadActiva, Destino> = {
  * la línea base de nada. Las citas son fragmentos que deben aparecer LITERALES en el
  * material: es lo que hace verificable el grounding en lugar de presumirlo (I3).
  */
-export const ContenidoExtraccionSchema = z.object({
-  titulo: z.string().trim().min(1).max(300),
-  resumen: z.string().trim().max(2000).default(''),
-  recoleccion: z.string().trim().min(1).max(300),
-  fecha: FechaCalendarioSchema,
-  derivada: z.boolean(),
-  confianza: z.enum(['alta', 'media', 'baja']),
-  confidencialidad: z.enum(['interna', 'cliente', 'restringida']),
-  esEstadoActual: z.boolean(),
-  citas: z
-    .array(
-      z.object({
-        fragmento: z.string().trim().min(1).max(600),
-        localizacion: z.string().trim().min(1).max(200),
-      }),
-    )
-    .min(1)
-    .max(6),
-});
+/**
+ * Lo que el modelo dice de SU PROPIA propuesta, no del objeto que propone. Se pregunta en
+ * tres niveles y no en un 0-1 porque un decimal auto-reportado finge una calibración que
+ * ningún modelo tiene; tres niveles es lo que de verdad sabe distinguir.
+ *
+ * NO se confunde con `ContenidoExtraccion.confianza`, que viaja a
+ * `dimensiones.calidad.confianza` y es un juicio sobre la EVIDENCIA (cómo de sólida es como
+ * prueba). Una extracción puede ser una propuesta impecable de una evidencia floja, y al
+ * revés. Fundirlas daría un número que no significaría ninguna de las dos cosas.
+ *
+ * Es la que ordena la revisión humana: sin ella el panel presenta todas las propuestas como
+ * si mereciesen la misma atención, que es lo contrario de lo que una capacidad con revisión
+ * humana necesita. Y es una AFIRMACIÓN del modelo, no una medida — la medida de verdad es la
+ * fidelidad de las citas, que se calcula contra el material.
+ */
+export const CONFIANZA_PROPUESTA = ['alta', 'media', 'baja'] as const;
+export const CONFIANZA_PROPUESTA_NUMERICA: Record<(typeof CONFIANZA_PROPUESTA)[number], number> =
+  { alta: 0.9, media: 0.6, baja: 0.3 };
+
+const CitasSchema = z
+  .array(
+    z.object({
+      fragmento: z.string().trim().min(1).max(600),
+      localizacion: z.string().trim().min(1).max(200),
+    }),
+  )
+  .min(1)
+  .max(6);
+
+export const ContenidoExtraccionSchema = z
+  .object({
+    titulo: z.string().trim().min(1).max(300),
+    resumen: z.string().trim().max(2000).default(''),
+    recoleccion: z.string().trim().min(1).max(300),
+    /**
+     * La fecha del material, o la razón de que no la haya — EXACTAMENTE una de las dos.
+     *
+     * Era obligatoria, y eso convertía el contrato en una contradicción: `item_importacion`
+     * guarda título, contenido, tipo de fuente y referencia, y NADA garantiza que ese
+     * material traiga una fecha calendárica. El prompt prohíbe inventar fechas y el esquema
+     * exigía una, así que al modelo solo le quedaban dos salidas: fabricarla —y se
+     * persistía como `proveniencia`, que es de las claves que este slice blinda contra la
+     * falsificación— o devolver algo que se descarta. Blindar el transporte de un dato que
+     * el propio contrato obliga a inventar no protege nada.
+     *
+     * La forma es la que este repo ya usa en `resultado_criterio`: o apunta al dato, o
+     * escribe por qué no lo hay, y el XOR lo impone. Así la ausencia es representable y
+     * significa «no consta», no «no lo escribí» — la misma distinción que sostiene el
+     * `null` de `llamada_ai.consentimiento_version`.
+     *
+     * Con fecha hay que decir DÓNDE se leyó, por lo mismo que las citas llevan localización:
+     * una fecha sin sitio en el material es indistinguible de una inventada.
+     */
+    fecha: FechaCalendarioSchema.nullable(),
+    fechaLocalizacion: z.string().trim().max(200).default(''),
+    fechaSinDatoMotivo: z.string().trim().max(300).default(''),
+    derivada: z.boolean(),
+    confianza: z.enum(['alta', 'media', 'baja']),
+    confidencialidad: z.enum(['interna', 'cliente', 'restringida']),
+    esEstadoActual: z.boolean(),
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+    citas: CitasSchema,
+  })
+  .superRefine((c, ctx) => {
+    if ((c.fecha !== null) === (c.fechaSinDatoMotivo !== '')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['fecha'],
+        message:
+          'La fecha del material o consta con su localización, o falta con su motivo: exactamente una de las dos',
+      });
+    }
+    if (c.fecha !== null && c.fechaLocalizacion === '') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['fechaLocalizacion'],
+        message: 'Una fecha extraída dice dónde se leyó en el material',
+      });
+    }
+  });
 export type ContenidoExtraccion = z.infer<typeof ContenidoExtraccionSchema>;
 
 /**
@@ -112,6 +173,20 @@ export const ContenidoCriterioSchema = z.object({
   ventanaDias: z.number().int().positive().max(3650),
   lineaBasePlan: z.string().trim().min(1).max(1000),
   razonamiento: z.string().trim().max(1000).default(''),
+  /**
+   * Y CITA, como CI. C0 proponía solo con `razonamiento`, y eso la dejaba fuera del marco
+   * por dos sitios: I4 dice «la AI propone Y CITA; el humano aprueba», y un criterio que se
+   * acepta sin ver qué parte del reto lo sostiene es justo lo que G0 tendrá que certificar
+   * después. Peor todavía, RF-09.10 exige una suite de grounding con línea base y
+   * regresión: una capacidad con cero citas no sale MAL en esa medición, sale EXCLUIDA en
+   * silencio — y la que no puede salir mal es la que más falta hace medir.
+   *
+   * El material del alcance de C0 es la formulación del reto (código, título, descripción y
+   * métrica objetivo declarada), delimitado igual que el de CI, así que la fidelidad se mide
+   * exactamente con la misma regla y la misma función.
+   */
+  citas: CitasSchema,
+  confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
 });
 export type ContenidoCriterio = z.infer<typeof ContenidoCriterioSchema>;
 

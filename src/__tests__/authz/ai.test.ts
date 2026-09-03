@@ -1887,6 +1887,31 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
+  it('el puesto del intento está acotado a lo que una generación puede gastar', async () => {
+    // La columna se documenta como «0 primario, 1 respaldo» y el desempate del último intento
+    // se apoya en eso. Con un CHECK de `>= 0` a secas la base aceptaba un 7, así que el
+    // comentario prometía una propiedad que nada establecía — y un puesto fuera de rango
+    // escrito por error sesga el orden sin que nada chille.
+    //
+    // Los dos números salen de INTENTOS_POR_GENERACION, que es lo que ata el CHECK al código
+    // que lo hace necesario: si algún día una generación puede gastar tres llamadas, este
+    // test cae y obliga a mover también la base.
+    const admin = sqlAdmin();
+    const anotar = (puesto: number) => admin`insert into llamada_ai
+      (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo, intento,
+       creado_por)
+      values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'sin-respuesta',
+              'prueba del techo del puesto', ${puesto}, ${leadId})`;
+    try {
+      // El último puesto válido entra…
+      await anotar(INTENTOS_POR_GENERACION - 1);
+      // …y el primero que ya no puede existir, no.
+      await expect(anotar(INTENTOS_POR_GENERACION)).rejects.toThrow(/intento|check/i);
+    } finally {
+      await vaciarRelleno();
+    }
+  });
+
   it('una degradación que acaba bien NO avisa de caída, aunque los dos intentos compartan reloj', async () => {
     // El primario cae y el respaldo responde: la generación fue CORRECTA y el panel no puede
     // decir que el proveedor no responde. Las dos filas se escriben en la misma transacción,

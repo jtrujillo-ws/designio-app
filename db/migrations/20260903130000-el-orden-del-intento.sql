@@ -15,12 +15,23 @@
 --
 -- Se persiste lo que el adaptador ya sabe y estaba tirando: la posición del intento en la
 -- operación (0 = primario, 1 = respaldo).
+-- El techo es 1 porque una generación son como mucho INTENTOS_POR_GENERACION llamadas
+-- —primario y respaldo—, así que los puestos posibles son 0 y 1. Con `intento >= 0` a secas,
+-- el comentario de la columna decía «0 primario, 1 respaldo» y la base aceptaba un 7: otra
+-- afirmación que nadie ataba, y de las que hacen daño en silencio, porque un puesto fuera de
+-- rango escrito por error sesga el orden del «último intento» sin que nada chille.
+--
+-- La base no puede importar la constante, así que el vínculo es el mismo que el del techo del
+-- lote y el del cupo mínimo: una prueba escribe el último puesto válido y el primero
+-- inválido, los dos derivados de INTENTOS_POR_GENERACION.
 alter table llamada_ai
-  add column intento smallint not null default 0 check (intento >= 0);
+  add column intento smallint not null default 0
+    check (intento >= 0 and intento <= 1);
 
 comment on column llamada_ai.intento is
-  'Puesto de este intento dentro de su generación: 0 primario, 1 respaldo. Es el desempate '
-  'CRONOLÓGICO entre filas que comparten creado_en por venir de la misma transacción.';
+  'Puesto de este intento dentro de su generación: 0 primario, 1 respaldo (el CHECK lo acota '
+  'a INTENTOS_POR_GENERACION - 1). Es el desempate CRONOLÓGICO entre filas que comparten '
+  'creado_en por venir de la misma transacción.';
 
 -- Las filas anteriores se quedan todas en 0 y no se pueden desambiguar a posteriori: nada
 -- guardado dice cuál fue primero. No hace falta, y conviene decir por qué en vez de dejar la

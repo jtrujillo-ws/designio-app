@@ -31,7 +31,23 @@ describe('sesión JWT', () => {
     expect(await usuarioIdDeSesion(undefined)).toBeNull();
     expect(await usuarioIdDeSesion('basura.no.jwt')).toBeNull();
     const token = await firmarSesion(USUARIO);
-    expect(await usuarioIdDeSesion(`${token.slice(0, -2)}xx`)).toBeNull();
+    // La manipulación toca el PRIMER carácter de la firma, no el último, y el motivo es
+    // que el último no sirve para esto: una firma HS256 son 32 bytes = 256 bits, y su
+    // base64url son 43 caracteres = 258 bits, así que del carácter final solo cuentan 4
+    // bits y los otros 2 se descartan al decodificar. Medido: para CADA token hay 3
+    // caracteres finales ALTERNATIVOS que decodifican a la misma firma y verifican igual.
+    // Con la versión anterior —sustituir los dos últimos por 'xx'— el token manipulado
+    // seguía siendo válido cuando el penúltimo carácter ya era 'x' y el último caía en su
+    // clase de equivalencia: ~1 de cada 1024 ejecuciones. Se vio en CI.
+    //
+    // En el primer carácter los seis bits son significativos, así que cambiarlo cambia la
+    // firma SIEMPRE. Y se elige un sustituto distinto del original para que la
+    // manipulación no pueda ser la identidad.
+    const [cabecera, cuerpo, firma] = token.split('.');
+    const otro = firma!.startsWith('A') ? 'B' : 'A';
+    expect(
+      await usuarioIdDeSesion(`${cabecera}.${cuerpo}.${otro}${firma!.slice(1)}`),
+    ).toBeNull();
   });
 
   it('token expirado → null', async () => {

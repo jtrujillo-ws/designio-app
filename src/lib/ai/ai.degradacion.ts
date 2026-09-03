@@ -36,9 +36,16 @@ export const MODELO_PRIMARIO = 'claude-sonnet-5';
 export const MODELO_FALLBACK = 'claude-sonnet-4-6';
 
 /**
- * Presupuesto AI por workspace (RF-08.5, diseño técnico · «cuota diaria de llamadas AI»):
- * corte SUAVE — al agotarse se pausan las capacidades AI, jamás un flujo de negocio. Un
- * valor inválido cae al default y nunca desactiva el tope.
+ * RESPALDO del presupuesto AI diario, no el presupuesto de nadie (RF-08.5, diseño técnico ·
+ * «cuota diaria de llamadas AI»): corte SUAVE — al agotarse se pausan las capacidades AI,
+ * jamás un flujo de negocio.
+ *
+ * El cupo que manda es el del WORKSPACE (`workspace.limite_llamadas_ai_dia`), y esta
+ * constante rige solo donde no hay uno pactado o el que hay no es un entero positivo. La
+ * distinción no es cosmética: mientras las dos llamadas vivas le pasaban esta constante a
+ * `evaluarCapacidadAI`, el parámetro `limiteDiario` existía sin que nada lo alimentara y
+ * «presupuesto por workspace» era una afirmación que el código no ataba. Un respaldo que se
+ * usa siempre es un valor por defecto silencioso, que es justo lo que no puede ser.
  *
  * La unidad es la LLAMADA ATENDIDA por el proveedor, no la propuesta persistida, porque el
  * tope acota lo que se PAGA y no lo que se produce. Contando propuestas, una negativa del

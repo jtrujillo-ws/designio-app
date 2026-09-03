@@ -106,17 +106,39 @@ async function rolCurador(tx: TransactionSql, actorId: string, workspaceId: stri
 async function presupuestoDeHoy(
   tx: TransactionSql,
   workspaceId: string,
-): Promise<{ atendidas: number; reservadas: number }> {
+): Promise<{ atendidas: number; reservadas: number; limiteDiario: number }> {
+  // El cupo viaja en la MISMA consulta que el gasto, y no en una aparte, porque los dos
+  // números deciden juntos: leerlos en dos sentencias es leerlos en dos snapshots, y en el
+  // hueco cabe un cupo que cambia entre el «cuánto llevas» y el «cuánto puedes».
+  //
+  // El `left join` es deliberado: bajo RLS el workspace de otro no existe, y un `join` a
+  // secas devolvería CERO filas —que este código leería como «0 atendidas», es decir, como
+  // presupuesto entero disponible—. Con `left join`, si la fila del workspace no se ve, el
+  // gasto se sigue contando y el cupo cae al respaldo; una lectura ciega nunca se convierte
+  // en una autorización.
   const [fila] = await tx`select
       (select count(*) from llamada_ai
         where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now())
           and resultado <> 'sin-respuesta')::int as atendidas,
       (select coalesce(sum(unidades), 0) from reserva_ai
         where workspace_id = ${workspaceId} and creado_en > now() - reserva_ai_ventana())::int
-        as reservadas`;
+        as reservadas,
+      (select w.limite_llamadas_ai_dia from workspace w where w.id = ${workspaceId})::int
+        as limite_pactado`;
+  // El cupo pactado del workspace manda; la constante del código es el RESPALDO para
+  // «no hay cupo pactado» (NULL) y para cualquier valor que no sea un entero positivo, no
+  // el valor por defecto de todos. `evaluarCapacidadAI` vuelve a filtrarlo —es función pura
+  // y no puede fiarse de su llamante—, así que pasar el nulo tal cual también sería
+  // correcto; se resuelve aquí para que el número que se decide y el que se muestra en el
+  // panel sean el mismo, leído una sola vez.
+  const pactado = (fila?.limite_pactado ?? null) as number | null;
   return {
     atendidas: (fila?.atendidas ?? 0) as number,
     reservadas: (fila?.reservadas ?? 0) as number,
+    limiteDiario:
+      Number.isInteger(pactado) && (pactado as number) > 0
+        ? (pactado as number)
+        : LIMITE_LLAMADAS_DIA,
   };
 }
 
@@ -134,12 +156,12 @@ async function presupuestoDeHoy(
  */
 async function estadoCapacidad(tx: TransactionSql, workspaceId: string) {
   const { keyWorkspace, keyEntorno } = credencialesAI();
-  const { atendidas, reservadas } = await presupuestoDeHoy(tx, workspaceId);
+  const { atendidas, reservadas, limiteDiario } = await presupuestoDeHoy(tx, workspaceId);
   const ai = evaluarCapacidadAI({
     keyWorkspace,
     keyEntorno,
     llamadasHoy: atendidas + reservadas,
-    limiteDiario: LIMITE_LLAMADAS_DIA,
+    limiteDiario,
     unidades: INTENTOS_POR_GENERACION,
   });
   return { ...ai, llamadasHoy: atendidas };
@@ -620,12 +642,12 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       );
     }
 
-    const { atendidas, reservadas } = await presupuestoDeHoy(tx, entrada.workspaceId);
+    const { atendidas, reservadas, limiteDiario } = await presupuestoDeHoy(tx, entrada.workspaceId);
     const ai = evaluarCapacidadAI({
       keyWorkspace,
       keyEntorno,
       llamadasHoy: atendidas + reservadas,
-      limiteDiario: LIMITE_LLAMADAS_DIA,
+      limiteDiario,
       unidades,
     });
     if (!ai.disponible || !ai.origenKey) throw new ErrorAI(ai.motivo);

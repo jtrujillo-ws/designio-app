@@ -1607,6 +1607,94 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
+  it('el cupo del workspace manda, y la constante del código es solo el respaldo', async () => {
+    const admin = sqlAdmin();
+    // El gasto de hoy se LEE, no se supone: este workspace lo comparten los tests de este
+    // fichero y fijar un número a mano ataría la prueba al orden en que corren.
+    await admin`insert into llamada_ai
+      (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+      select ${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'salida-valida', ${leadId}
+      from generate_series(1, 3)`;
+    const [gasto] = await admin`select count(*)::int as n from llamada_ai
+      where workspace_id = ${ws} and creado_en >= date_trunc('day', now())
+        and resultado <> 'sin-respuesta'`;
+    const usadas = gasto!.n as number;
+    // Con el respaldo global esto no agotaría nada: si el cupo pactado no se leyera, todo lo
+    // de abajo pasaría en verde y el defecto seguiría vivo. Ése era el estado anterior —el
+    // parámetro `limiteDiario` existía y las dos llamadas vivas le pasaban la constante—,
+    // así que este test falla sin el arreglo.
+    expect(usadas).toBeGreaterThan(0);
+    expect(usadas).toBeLessThan(LIMITE_LLAMADAS_DIA);
+    await admin`update workspace set limite_llamadas_ai_dia = ${usadas} where id = ${ws}`;
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        const panel = await panelPropuestas(leadId, ws);
+        expect(panel.ai.disponible).toBe(false);
+        // El motivo CITA el cupo pactado, no el del despliegue: quien lee «N/N» sabe cuál es
+        // su tope; con «N/60» leería que le sobra presupuesto y que algo se rompió.
+        expect(panel.ai.motivo).toContain(`${usadas}/${usadas} llamadas`);
+        expect(panel.ai.motivo).not.toContain(`/${LIMITE_LLAMADAS_DIA} llamadas`);
+        expect(panel.ai.limiteDiario).toBe(usadas);
+
+        // Y la ADMISIÓN dice lo mismo que la bandera: la pantalla no ofrece lo que el
+        // servicio va a negar, y el servicio no acepta lo que la pantalla apagó.
+        const itemId = await nuevoItem(
+          'Item que pide propuesta con el cupo del workspace agotado',
+          'entrevista',
+        );
+        await registrarConsentimiento(leadId, {
+          workspaceId: ws,
+          itemId,
+          alcance: 'Autoriza el procesamiento por el proveedor AI',
+          procesamientoExterno: true,
+        });
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+        ).rejects.toThrow(ErrorAI);
+      });
+
+      // Un cupo MÁS ALTO que el gasto vuelve a abrir la capacidad, con el mismo gasto: lo
+      // que cambió es el pacto, no lo consumido.
+      await admin`update workspace set limite_llamadas_ai_dia = ${usadas + 10} where id = ${ws}`;
+      await conProveedor(RESPUESTA_CI, async () => {
+        const panel = await panelPropuestas(leadId, ws);
+        expect(panel.ai.disponible).toBe(true);
+        expect(panel.ai.limiteDiario).toBe(usadas + 10);
+        expect(panel.ai.llamadasHoy).toBe(usadas);
+      });
+
+      // NULL no es «sin tope»: es «sin cupo pactado», y entonces rige el respaldo. El corte
+      // suave sigue existiendo — no se apaga dejando el campo vacío.
+      await admin`update workspace set limite_llamadas_ai_dia = null where id = ${ws}`;
+      await conProveedor(RESPUESTA_CI, async () => {
+        const panel = await panelPropuestas(leadId, ws);
+        expect(panel.ai.limiteDiario).toBe(LIMITE_LLAMADAS_DIA);
+      });
+    } finally {
+      await admin`update workspace set limite_llamadas_ai_dia = null where id = ${ws}`;
+      await vaciarRelleno();
+    }
+  });
+
+  it('el inquilino no puede subirse su propio cupo: la promesa es del grant, no del código', async () => {
+    // Un cupo que el propio workspace pudiera escribir no es un cupo. `designio_app` tiene
+    // sobre `workspace` únicamente SELECT, así que no hay ruta de aplicación —ni pantalla,
+    // ni SQL crudo con la identidad del lead— que lo toque. Se comprueba por la vía cruda
+    // justamente porque una pantalla que hoy no existe no prueba nada sobre mañana.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update workspace set limite_llamadas_ai_dia = 9999
+        where id = ${ws}`),
+    ).rejects.toThrow(/permission denied|no autorizado/i);
+
+    // Y la base tampoco admite un cupo imposible por la vía administrativa: el CHECK es el
+    // suelo, así que la validación de TS es la última línea y no la única.
+    await expect(
+      sqlAdmin()`update workspace set limite_llamadas_ai_dia = 0 where id = ${ws}`,
+    ).rejects.toThrow(/limite_llamadas_ai_dia/);
+    const [tras] = await sqlAdmin()`select limite_llamadas_ai_dia from workspace where id = ${ws}`;
+    expect(tras!.limite_llamadas_ai_dia).toBeNull();
+  });
+
   it('la bitácora alcanza el material de personas también después de curarlo', async () => {
     const itemId = await nuevoItem('Entrevista que se cura y luego se revoca', 'entrevista');
     await registrarConsentimiento(leadId, {

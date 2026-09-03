@@ -822,6 +822,12 @@ function TarjetaPropuesta({
   const [ocupado, setOcupado] = useState(false);
   const esExtraccion = propuesta.destino === 'evidencia';
   const anclaDisponible = propuesta.anclaEstado === 'disponible';
+  // La otra precondición que la base impone SIEMPRE y que no es del ancla: una extracción
+  // sin fecha no se materializa. Va aparte de `anclaDisponible` porque no caduca con el
+  // tiempo —nació así— y su salida es distinta: no es rechazar, es corregir.
+  const faltaFecha =
+    propuesta.destino === 'evidencia' &&
+    (propuesta.contenido as ContenidoExtraccion).fecha === null;
   const citasFieles = propuesta.citas.filter((c) => c.fiel).length;
 
   async function decidir(correccion?: ContenidoPropuesta) {
@@ -952,9 +958,28 @@ function TarjetaPropuesta({
           {MOTIVO_ANCLA[propuesta.anclaEstado]}
         </span>
       )}
+      {/* Una extracción SIN fecha no se puede materializar tal cual: `materializarEvidencia`
+          la rechaza siempre, porque una evidencia se sitúa en el tiempo. El modelo tiene
+          permitido decir que el material no la trae —para eso existe el par fecha/motivo— y
+          ponerla es entonces trabajo del humano al corregir. Así que el botón no se ofrece:
+          lo que la base rechaza, la pantalla no lo enseña; y el camino que SÍ existe queda
+          dicho con esas palabras, no deducido de un botón apagado. */}
+      {propuesta.estado === 'propuesta' && puedeRevisar && anclaDisponible && faltaFecha && (
+        <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+          Esta propuesta no trae fecha del material
+          {(propuesta.contenido as ContenidoExtraccion).fechaSinDatoMotivo
+            ? ` (${(propuesta.contenido as ContenidoExtraccion).fechaSinDatoMotivo})`
+            : ''}
+          : féchala en «Corregir y aceptar» para poder materializarla.
+        </span>
+      )}
       {propuesta.estado === 'propuesta' && puedeRevisar && !corrigiendo && (
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          <Button size="sm" disabled={ocupado || !anclaDisponible} onClick={() => void decidir()}>
+          <Button
+            size="sm"
+            disabled={ocupado || !anclaDisponible || faltaFecha}
+            onClick={() => void decidir()}
+          >
             Aceptar tal cual
           </Button>
           <Button
@@ -1146,7 +1171,12 @@ function FormularioExtraccion({
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
         <label style={campo}>
           <span style={etiqueta}>Fecha del material</span>
-          <Input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} />
+          {/* Obligatoria AQUÍ aunque la propuesta pueda nacer sin ella: este formulario es el
+              camino de la ACEPTACIÓN, y aceptar exige fecha siempre. Dejarla opcional
+              permitía enviar una corrección que `materializarEvidencia` rechaza a
+              continuación — el mismo defecto que el botón «Aceptar tal cual» de arriba, un
+              control más allá. */}
+          <Input type="date" required value={fecha} onChange={(e) => setFecha(e.target.value)} />
         </label>
         <label style={campo}>
           <span style={etiqueta}>Dónde se lee la fecha</span>

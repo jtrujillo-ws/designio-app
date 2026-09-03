@@ -1647,6 +1647,36 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
   });
 
+  it('escribir un criterio bloquea la FILA del reto: la transición espera, no se cuela', async () => {
+    await enWorkspaceLimpio('candado-fila', async ({ ws: wsF, curadorId, retoId: retoF }) => {
+      const admin = sqlAdmin();
+      await conUsuario(curadorId, async (tx) => {
+        await tx`insert into criterio_exito
+          (workspace_id, reto_id, kpi, definicion, linea_base_plan, objetivo, ventana_dias,
+           creado_por)
+          values (${wsF}, ${retoF}, 'KPI', 'Definición', 'Plan', 'Objetivo', 30, ${curadorId})`;
+
+        // Desde OTRA conexión, la transición que movería el reto bajo los pies de esta
+        // escritura. Quien la hace no conoce ningún protocolo —hace `update reto` y ya—, así
+        // que lo único que puede detenerla es la fila, no un candado consultivo. Con un
+        // `lock_timeout` corto la prueba es determinista: si la fila estuviera libre, esto
+        // commitearía en milisegundos; bloqueada, agota el plazo esperando.
+        await expect(
+          admin.begin(async (t) => {
+            await t`set local lock_timeout = '300ms'`;
+            await t`update reto set estado = 'archivado' where id = ${retoF}`;
+          }),
+        ).rejects.toThrow(/lock timeout/i);
+      });
+
+      // Y en cuanto la escritura commitea, la transición vuelve a ser posible: el candado
+      // ORDENA las dos operaciones, no prohíbe ninguna.
+      await admin`update reto set estado = 'archivado' where id = ${retoF}`;
+      const [r] = await admin`select estado from reto where id = ${retoF}`;
+      expect(r!.estado).toBe('archivado');
+    });
+  });
+
   it('dos propuestas no se reparten el mismo criterio: un objeto cuelga de una sola', async () => {
     // El caso simétrico del anterior, y el único que la procedencia NO puede ver: las dos
     // propuestas reclaman un objeto creado en ESTA transacción, así que las dos pasan el

@@ -302,6 +302,28 @@ begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
+  -- La FILA del reto, y antes que nada. Quien mueve el ciclo de vida hace `update reto`, que
+  -- bloquea esta misma fila SIN saber nada de ningún protocolo — también desde SQL crudo—,
+  -- mientras que un candado consultivo obligaría a cooperar a todo el que escriba y, peor,
+  -- un consultivo y uno de fila sobre el mismo objeto no se ven entre sí. Por eso aquí es de
+  -- fila: es el único que las dos operaciones comparten sin haberlo pactado.
+  --
+  -- Lo que cierra: el guard diferido de materialización relee el estado del reto en el
+  -- COMMIT, y esa lectura sería otra foto si entre ella y el final del commit cupiera una
+  -- transición. Tomando la fila AQUÍ —al escribir el criterio, o sea antes— el candado se
+  -- retiene hasta el commit y esa transición no puede colarse: o llegó antes y la lectura la
+  -- ve, o espera. Sirve igual a los tres caminos que escriben criterios (materializar una
+  -- propuesta C0, y agregar o editar a mano), que es donde estaba la misma carrera.
+  --
+  -- SECURITY DEFINER es lo que lo hace posible: bajo RLS un `for update` exige pasar la
+  -- política de UPDATE de `reto`, que un curador no cumple. Mismo motivo por el que este
+  -- guard ya bloqueaba los gates desde aquí y no desde el servicio.
+  --
+  -- ORDEN: fila del reto → gates. Es el mismo que documenta `bloquearReto` hacia el gate, y
+  -- el que pide toda ruta que baje del reto a sus objetos; invertirlo aquí abriría un ciclo
+  -- con cualquiera que ya lo respete.
+  perform 1 from reto r
+    where r.id = new.reto_id and r.workspace_id = new.workspace_id for update;
   perform 1 from gate_instancia g
     join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
     where p.reto_id = new.reto_id and p.workspace_id = new.workspace_id and g.numero = 0

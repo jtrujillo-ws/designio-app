@@ -100,7 +100,24 @@ export const CATALOGO_EXPORT = [
   // Cita evidencia (`evidencia_id`), pero el entregable no lleva el método: fuera entera.
   { tabla: 'checklist_item', orden: 'gate_id, orden', poda: { modo: 'fuera' } },
   { tabla: 'fuente', orden: 'creado_en, id', poda: { modo: 'porFuente', columna: 'id' } },
-  { tabla: 'evidencia', orden: 'creado_en, id', poda: { modo: 'porEvidencia', columna: 'id' } },
+  {
+    tabla: 'evidencia',
+    orden: 'creado_en, id',
+    poda: { modo: 'porEvidencia', columna: 'id' },
+    // La evidencia nacida de una propuesta AI guarda su `propuesta_ai_id`, y la propuesta no
+    // viaja (ver el bloque de SPEC-08 más abajo). Es el mismo caso que `archivo_importado` →
+    // `item_importacion`: el padre lleva material que este paquete no debe llevar, así que se
+    // declara la ausencia en vez de arrastrarlo. El id se queda porque es la columna de una
+    // tabla que sí viaja y la poda es por tabla; lo que el receptor necesita —qué se afirma,
+    // con qué método y con qué derechos— está entero en la propia fila.
+    padresAusentes: [
+      {
+        tabla: 'propuesta_ai',
+        motivo:
+          'la propuesta lleva la salida cruda del proveedor y el linaje del modelo; el entregable lleva la evidencia curada, no el artefacto interno que la propuso',
+      },
+    ],
+  },
   {
     tabla: 'evidencia_segmento',
     orden: 'evidencia_id, segmento_id',
@@ -239,6 +256,35 @@ export const CATALOGO_EXPORT = [
       },
     ],
   },
+  // Capacidades AI (SPEC-08 / SPEC-09 · RF-09.4): la propuesta con su contenido original y
+  // corregido, el libro de costos de cada llamada, las reservas de presupuesto y el registro
+  // de consentimiento por item. Las cuatro entran en el catálogo porque SYS-04 exige que el
+  // ARCHIVO del propietario lo lleve TODO —y RF-09.4 lo dice con nombre propio: exportación y
+  // borrado alcanzan los objetos derivados, propuestas AI incluidas—, así que en ese ámbito
+  // viajan enteras con su lineage.
+  //
+  // En el ENTREGABLE las cuatro quedan `fuera`, y no por comodidad:
+  //
+  //  · `propuesta_ai` tiene `evidencia_id`, así que el invariante estructural obliga a
+  //    declararla y podría podarse por ahí. No se hace: lo que guarda es la SALIDA del
+  //    proveedor —`contenido_original` tal cual la devolvió, el resumen del alcance que se le
+  //    mandó, el modelo, la versión del prompt y con qué credencial salió—. Un paquete cuyo
+  //    contrato es «material de terceros con derechos vigentes» no es el sitio del artefacto
+  //    interno con el que la boutique trabajó, ni de la traza de qué herramienta usó. El
+  //    receptor recibe la evidencia curada y firmada por una persona, que es la que tiene
+  //    derechos; la propuesta es el borrador que la precedió.
+  //  · `llamada_ai` es el libro de COSTOS: tokens, dinero y latencia de la boutique. No es
+  //    material del cliente por ningún lado.
+  //  · `reserva_ai` es contabilidad de presupuesto en vuelo, efímera por diseño.
+  //  · `consentimiento_item` cuelga de `item_importacion`, que ya está fuera con su motivo
+  //    (sus filas llevan el texto crudo del material). Sacar el permiso sin el material al
+  //    que se refiere sería un sí o un no sobre algo que no está en el paquete; y los
+  //    derechos que el entregable SÍ respeta viven en `derecho_uso`, que viaja podado por
+  //    evidencia.
+  { tabla: 'propuesta_ai', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'llamada_ai', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'reserva_ai', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'consentimiento_item', orden: 'registrado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'evento_dominio', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   // Bookkeeping del sembrado de desarrollo: registra qué objetos creó el seed, para que
   // reparar una base vieja sea exacto en vez de adivinado. Viaja en el ARCHIVO del

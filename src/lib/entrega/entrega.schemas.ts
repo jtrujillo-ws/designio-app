@@ -377,6 +377,9 @@ export type DesignVersionCompleta = {
    * Lo dice la misma función que lo rechaza (`g7_motivo_de_bloqueo`): el tablero no vuelve
    * a redactar el predicado, que es como se le acabó quedando una rama corta. */
   bloqueoDeG7: string | null;
+  /** El gate del proyecto que ya certificó y por tanto impide aprobar design versions
+   * nuevas aquí (6 o 7), o null. El ciclo siguiente de ese servicio va en otro proyecto. */
+  proyectoCertificadoPor: number | null;
   decisionesDelProyecto: { id: string; titulo: string }[];
   insightsValidados: { id: string; titulo: string }[];
   vigente: EstadoEfectivoVigente;

@@ -1012,6 +1012,11 @@ export async function designVersionCompleta(
         -- proyecto se auto-superó, con un release en vuelo, salía como que no bloqueaba
         -- mientras el gate la rechazaba. El espejo se lee de la fuente o miente.
         g7_motivo_de_bloqueo(dv.proyecto_id, dv.workspace_id) as bloqueo_de_g7,
+        -- Qué gate del proyecto impide aprobar aquí, si es que alguno: la misma función que
+        -- lo rechaza. El botón de aprobar ya se apaga por lo que falta (journey, elementos);
+        -- este es el único blocante que NO se resuelve trabajando en esta versión, así que
+        -- ofrecerlo encendido era ofrecer un callejón con forma de botón.
+        gate_certificado_del_proyecto(dv.proyecto_id, dv.workspace_id) as proyecto_certificado_por,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', j2.id, 'nombre', j2.nombre)
             order by j2.creado_en desc)
@@ -1125,6 +1130,7 @@ export async function designVersionCompleta(
       proyectoCodigo: fila.proyecto_codigo as string,
       aCargoDelProyecto: fila.a_cargo_del_proyecto as boolean,
       bloqueoDeG7: (fila.bloqueo_de_g7 as string | null) ?? null,
+      proyectoCertificadoPor: (fila.proyecto_certificado_por as number | null) ?? null,
       journeyId: (fila.journey_id as string | null) ?? null,
       journeyNombre: (fila.journey_nombre as string | null) ?? null,
       snapshotId: (fila.snapshot_id as string | null) ?? null,

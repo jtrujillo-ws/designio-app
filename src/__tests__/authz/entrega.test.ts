@@ -2942,6 +2942,12 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await aprobarGate(sponsorId, { workspaceId: ws, gateId: g6!.id as string });
     expect(await proyectosCertificados(leadId, ws)).toContain(proy);
 
+    // La pantalla lo sabe ANTES de intentarlo: es el único blocante de la aprobación que no
+    // se resuelve trabajando en esta versión, así que el botón se apaga y lo explica en vez
+    // de ofrecer un callejón con forma de botón.
+    const vistaDelBorrador = await designVersionCompleta(leadId, ws, enVuelo.designVersionId);
+    expect(vistaDelBorrador!.proyectoCertificadoPor).toBe(6);
+
     // Aprobarla dejaría a G6 firmando un plan que ya no cubre nada.
     await expect(
       aprobarDesignVersion(leadId, {
@@ -2988,6 +2994,10 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const anterior = await designVersionCompleta(leadId, ws, primera.designVersionId);
     expect(anterior!.estado).toBe('superada');
     expect(anterior!.superadaPor!.id).toBe(sucesora.designVersionId);
+    // Y en el proyecto del ciclo siguiente el botón está encendido: nada que certificar
+    // todavía.
+    const vistaSucesora = await designVersionCompleta(leadId, ws, sucesora.designVersionId);
+    expect(vistaSucesora!.proyectoCertificadoPor).toBeNull();
   });
 
   it('firmar G6 y aprobar la sucesora tampoco pueden cruzarse', async () => {

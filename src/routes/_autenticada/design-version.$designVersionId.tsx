@@ -98,7 +98,25 @@ const apunte: CSSProperties = { font: '400 12px/1.5 var(--font-sans)', color: 'v
 
 const VISTAS = ['Elementos', 'Diff', 'Releases', 'Conciliación'];
 
-const HOY = () => new Date().toISOString().slice(0, 10);
+/**
+ * El día de hoy en el calendario DEL NAVEGADOR, no en UTC.
+ *
+ * `toISOString().slice(0, 10)` convierte a UTC antes de recortar, así que al este de UTC
+ * poco después de medianoche propone AYER y al oeste a última hora propone MAÑANA. Con
+ * cualquier otro campo sería una molestia; con estos tres no: la fecha real del despliegue
+ * (RF-06.5) y la de la constatación (RF-06.6) son historia INMUTABLE en cuanto se envían
+ * —no hay UPDATE que las corrija— y encima ordenan el effective state vigente del servicio
+ * (RF-06.10), así que un día de más o de menos reordena lo que un ciclo cambió sobre otro.
+ * Y `fecha_objetivo` es el compromiso que G6 firma.
+ *
+ * Se compone con los getters locales en vez de restar el offset: `getTimezoneOffset()`
+ * cambia con el horario de verano y aplicarlo a mano es otra forma de equivocarse.
+ */
+const HOY = () => {
+  const ahora = new Date();
+  const dosCifras = (n: number) => String(n).padStart(2, '0');
+  return `${ahora.getFullYear()}-${dosCifras(ahora.getMonth() + 1)}-${dosCifras(ahora.getDate())}`;
+};
 
 function PantallaDesignVersion() {
   const datos = Route.useLoaderData();
@@ -537,12 +555,25 @@ function AprobarDesignVersion({
         />
         <Button
           size="sm"
-          disabled={ocupado || dv.elementos.length === 0 || dv.journeyId === null}
+          disabled={
+            ocupado ||
+            dv.elementos.length === 0 ||
+            dv.journeyId === null ||
+            dv.proyectoCertificadoPor !== null
+          }
           onClick={() => void aprobar()}
         >
           Aprobar (congela)
         </Button>
       </div>
+      {dv.proyectoCertificadoPor !== null && (
+        <span style={apunte}>
+          Este proyecto ya certificó su G{dv.proyectoCertificadoPor}, y esa aprobación no se
+          deshace (SPEC-04): aprobar aquí dejaría al gate afirmando algo que ya no es cierto.
+          El ciclo siguiente de este servicio se abre en otro proyecto — y la cadena continúa
+          igual, porque la sucesión va por servicio.
+        </span>
+      )}
       {dv.elementos.length === 0 && (
         <span style={apunte}>Falta al menos un elemento de cambio.</span>
       )}

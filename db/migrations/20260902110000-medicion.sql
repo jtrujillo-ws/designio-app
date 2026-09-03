@@ -978,6 +978,10 @@ language plpgsql as $$
 declare
   atrapados text;
 begin
+  -- El punto de cita de las DOS mitades del par, y la primera sentencia de las dos: ver
+  -- `proyecto_par_medicion_guard` para el porqué. Es el MISMO candado que toma
+  -- `abrirMedicion` al empezar, así que esa ruta lo tiene ya y no paga nada por pedirlo.
+  perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || new.id, 42));
   if exists (select 1 from proyecto p
     where p.reto_id = new.id and p.workspace_id = new.workspace_id
       and p.estado in ('activo', 'en-implementacion')) then
@@ -1046,9 +1050,38 @@ revoke execute on function reto_medicion_par_indivisible_guard() from public;
 --
 -- Se cierra donde no hay orden que romper: DIFERIDO, como su hermano de arriba y por la
 -- misma mecánica —al COMMIT cada sentencia toma su propio snapshot, así que ve lo que
--- commiteó el otro—. Los dos órdenes quedan cubiertos sin bloquear nada: si el proyecto
--- commitea primero, es la comprobación del RETO la que ve la fila nueva y rechaza la
--- apertura; si commitea segundo, es esta la que ve el reto midiendo y rechaza el proyecto.
+-- commiteó el otro—. Con eso quedan cubiertos los dos intercalados SECUENCIALES: si el
+-- proyecto commitea primero, es la comprobación del RETO la que ve la fila nueva y rechaza
+-- la apertura; si commitea segundo, es esta la que ve el reto midiendo y rechaza el
+-- proyecto.
+--
+-- Pero «diferido» no es «excluyente», y ahí faltaba la mitad. Un constraint trigger
+-- diferido corre EN la fase de commit, y su `select` se ejecuta antes de que el commit de
+-- su propia transacción sea visible para nadie; entre las dos fases de commit no hay
+-- exclusión ninguna. Si las dos llegan a la vez, cada guard mira y ve el estado VIEJO, las
+-- dos pasan, y queda otra vez un proyecto sin abrir bajo un reto que mide. Lo comprobé en
+-- laboratorio con dos transacciones soltadas a la vez: sin candado, seis de seis veces
+-- ninguna de las dos vio a la otra.
+--
+-- Lo que lo cierra es un candado COMPARTIDO, y el sitio donde cabe sin recrear el ciclo es
+-- el propio guard diferido: aquí no hay ningún tuple lock por delante al que adelantarse
+-- —esto corre en fase de commit, fuera de toda sentencia—, así que no impone ningún orden
+-- contra el `reto → proyecto` de `abrirMedicion`. Los dos guards piden el MISMO candado del
+-- reto como primera sentencia: el que lo consigue comprueba y commitea, y el que espera
+-- vuelve a mirar después —READ COMMITTED, snapshot nuevo por sentencia— y SÍ ve lo que el
+-- otro dejó escrito. La carrera simultánea se convierte así en la secuencial, que es la que
+-- ya estaba cubierta. Mismo laboratorio, con candado: seis de seis, el segundo vio al
+-- primero.
+--
+-- Y no reintroduce ciclo, que es lo que hay que argumentar y no suponer. Piden el candado
+-- exactamente las transacciones que dejan un proyecto ENTRANDO en 'activo' o
+-- 'en-implementacion' (por eso el trigger de UPDATE exige además que el estado CAMBIE: una
+-- reescritura del mismo valor no toca el par y no debe pedir nada). Del otro lado, la única
+-- ruta que sostiene el candado mientras espera una fila de `proyecto` es `abrirMedicion`,
+-- que lo toma al empezar y solo actualiza proyectos 'en-implementacion'; y desde
+-- 'en-implementacion' los únicos destinos legales son 'pausado' y 'en-medicion', que no
+-- disparan estos triggers. Así que nadie que tenga una fila que el otro quiera puede estar
+-- esperando este candado.
 --
 -- Cubre INSERT y transición a la vez, que son las dos puertas por las que un proyecto llega
 -- a 'activo' o 'en-implementacion'. El rechazo inmediato y explicado sigue siendo el de
@@ -1061,6 +1094,7 @@ revoke execute on function reto_medicion_par_indivisible_guard() from public;
 create function proyecto_par_medicion_guard() returns trigger
 language plpgsql as $$
 begin
+  perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || new.reto_id, 42));
   if exists (select 1 from reto r
     where r.id = new.reto_id and r.workspace_id = new.workspace_id
       and r.estado = 'en-medicion' and not r.medicion_sin_registry) then
@@ -1068,10 +1102,20 @@ begin
   end if;
   return null;
 end $$;
-create constraint trigger proyecto_par_medicion
-  after insert or update of estado on proyecto
+-- Dos triggers y una sola función: el `when` del UPDATE exige además que el estado CAMBIE
+-- —una reescritura del mismo valor no mueve el par y pedir el candado por ella es lo único
+-- que podría cerrar un ciclo con `abrirMedicion`— y eso obliga a separarlos, porque en el
+-- `when` de un INSERT no se puede nombrar `old`.
+create constraint trigger proyecto_par_medicion_alta
+  after insert on proyecto
   deferrable initially deferred
   for each row when (new.estado in ('activo', 'en-implementacion'))
+  execute function proyecto_par_medicion_guard();
+create constraint trigger proyecto_par_medicion_transicion
+  after update of estado on proyecto
+  deferrable initially deferred
+  for each row when (new.estado in ('activo', 'en-implementacion')
+                     and old.estado is distinct from new.estado)
   execute function proyecto_par_medicion_guard();
 revoke execute on function proyecto_par_medicion_guard() from public;
 

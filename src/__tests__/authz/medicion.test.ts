@@ -2562,32 +2562,105 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       await admin`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
     }
 
-    // Y aquí, ANTES de abrir, la carrera: las reglas que sostienen el par del lado del
-    // proyecto son predicados sobre una INSTANTÁNEA. Esta transacción retoma el proyecto
-    // leyendo un reto que todavía está 'activo' —así que el guard inmediato la deja pasar,
-    // y con razón— y commitea DESPUÉS de que la medición abra. La comprobación diferida del
-    // reto tampoco la ve, porque cuando corre esa fila aún no está commiteada. Sin el
-    // espejo diferido del lado del proyecto, el par se rompía justo aquí y en silencio.
-    let avisarRetomando = () => {};
-    const retomando = new Promise<void>((resolve) => {
-      avisarRetomando = resolve;
+    // ── El candado compartido, por lo que un candado hace: ESPERAR ──
+    // Los dos guards del par son diferidos, y «diferido» no es «excluyente»: corren en la
+    // fase de commit y su `select` va antes de que el commit propio sea visible para nadie,
+    // así que dos que lleguen a la vez se miran sin verse. Lo que los serializa es que los
+    // DOS piden el mismo candado del reto como primera sentencia. Se comprueba en los dos
+    // lados y sin dejar rastro: `set constraints all immediate` dispara los diferidos dentro
+    // de la transacción —así que la comprobación corre, y espera, sin commitear nada— y el
+    // `throw` deshace el resto. Lo que se mide es quién espera a quién.
+    const candadoDelReto = (tx: TransactionSql) =>
+      tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${r.retoId}, 42))`;
+    const disparaDiferidos = (mover: (tx: TransactionSql) => Promise<unknown>) => () =>
+      conUsuario(leadId, async (tx) => {
+        await mover(tx);
+        await tx`set constraints all immediate`;
+        throw new Error('deshacer');
+      }).catch(() => undefined);
+    // El lado del PROYECTO: retomarlo espera a quien tenga el reto.
+    expect(
+      await esperaA(
+        candadoDelReto,
+        disparaDiferidos(
+          (tx) => tx`update proyecto set estado = 'en-implementacion' where id = ${bId}`,
+        ),
+      ),
+    ).toBe(true);
+    // Y el lado del RETO: abrir la medición, igual.
+    expect(
+      await esperaA(
+        candadoDelReto,
+        disparaDiferidos(async (tx) => {
+          await tx`update reto set estado = 'en-medicion' where id = ${r.retoId}`;
+          await tx`update proyecto set estado = 'en-medicion' where id = ${a.proyectoId}`;
+        }),
+      ),
+    ).toBe(true);
+
+    // ── La carrera SIMULTÁNEA, que es la que ningún intercalado secuencial enseña ──
+    // Las reglas que sostienen el par del lado del proyecto son predicados sobre una
+    // INSTANTÁNEA, así que la red es el espejo DIFERIDO. Pero «diferido» no es
+    // «excluyente»: los dos guards corren en la fase de commit y su `select` se ejecuta
+    // antes de que el commit de su propia transacción sea visible para nadie. Si las dos
+    // llegan a la vez, cada una mira, ve el estado VIEJO, y las dos pasan — un proyecto sin
+    // abrir bajo un reto que ya mide, otra vez y en silencio. Lo que las serializa es el
+    // candado compartido del reto que los dos guards piden como PRIMERA sentencia: el
+    // segundo espera, vuelve a mirar con snapshot nuevo y sí ve lo que el primero dejó.
+    //
+    // Las dos transacciones se sostienen hasta que las DOS están listas y se sueltan a la
+    // vez. Forzar un orden de commit —soltar una cuando la otra ya terminó— probaría el
+    // caso secuencial, que ya pasaba sin candado y diría que sí cuando la respuesta es no.
+    // Y las dos van por SQL crudo a propósito: `abrirMedicion` toma el candado del reto al
+    // empezar, así que por el servicio esta carrera ni se plantea.
+    let listoProyecto = () => {};
+    const proyectoListo = new Promise<void>((resolve) => {
+      listoProyecto = resolve;
     });
-    let avisarAbierta = () => {};
-    const abierta = new Promise<void>((resolve) => {
-      avisarAbierta = resolve;
+    let listaApertura = () => {};
+    const aperturaLista = new Promise<void>((resolve) => {
+      listaApertura = resolve;
+    });
+    let soltar = () => {};
+    const barrera = new Promise<void>((resolve) => {
+      soltar = resolve;
     });
     const tardia = conUsuario(leadId, async (tx) => {
       await tx`update proyecto set estado = 'en-implementacion' where id = ${bId}`;
-      avisarRetomando();
-      await abierta;
+      listoProyecto();
+      await barrera;
     });
-    await retomando;
-    const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId });
-    expect(abierto.proyectos).toBe(1);
-    avisarAbierta();
-    // El rechazo llega al COMMIT, que es cuando esta transacción puede ver lo que la otra
-    // dejó escrito. La apertura de la medición se queda como estaba: entera.
-    await expect(tardia).rejects.toThrow(/su proyecto no puede quedarse sin abrir/);
+    const apertura = conUsuario(leadId, async (tx) => {
+      await tx`update reto set estado = 'en-medicion' where id = ${r.retoId}`;
+      await tx`update proyecto set estado = 'en-medicion' where id = ${a.proyectoId}`;
+      listaApertura();
+      await barrera;
+    });
+    await Promise.all([proyectoListo, aperturaLista]);
+    soltar();
+    const [resProyecto, resApertura] = await Promise.allSettled([tardia, apertura]);
+    // Exactamente UNA sobrevive. Cuál, da igual —lo decide quién coge antes el candado— y
+    // por eso no se fija: lo que se fija es que no sobrevivan las dos.
+    const motivos = [resProyecto, resApertura]
+      .filter((x): x is PromiseRejectedResult => x.status === 'rejected')
+      .map((x) => String(x.reason));
+    expect(motivos.length).toBe(1);
+    expect(motivos[0]).toMatch(/(no puede quedarse sin abrir|mueve los dos a la vez)/);
+    // Y el invariante queda entero gane quien gane, que es lo que se está protegiendo y no
+    // el reparto: nunca un proyecto sin abrir bajo un reto que mide.
+    const [par] = await conUsuario(leadId, (tx) => tx`select r.estado as reto,
+      (select count(*) from proyecto p where p.reto_id = r.id and p.workspace_id = r.workspace_id
+        and p.estado in ('activo', 'en-implementacion')) as sin_abrir
+      from reto r where r.id = ${r.retoId}`);
+    expect((par!.reto as string) === 'en-medicion' && Number(par!.sin_abrir) > 0).toBe(false);
+
+    // Y se converge al mismo sitio para seguir el guion, gane quien gane.
+    if (resApertura.status === 'rejected') {
+      await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
+        where id = ${bId}`);
+      const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId });
+      expect(abierto.proyectos).toBe(1);
+    }
     const [trasCarrera] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
       where id = ${bId}`);
     expect(trasCarrera!.estado).toBe('pausado');

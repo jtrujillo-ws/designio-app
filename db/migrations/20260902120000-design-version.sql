@@ -804,6 +804,19 @@ revoke execute on function reto_aplica_a_servicio(uuid, uuid, uuid) from public;
 -- su versión ahora y llega a G7 por el camino normal, con todos los guards intactos — G7 le
 -- exigirá el tablero completo igual que a cualquiera.
 --
+-- Y se perdona SOLO el G6 de los proyectos que todavía no han aprobado su G7. Un G7 ya
+-- aprobado es una certificación EMITIDA y tiene que seguir contando como tal, precisamente
+-- porque no se puede reevaluar: aflojarlo dejaría que se le crearan y aprobaran design
+-- versions nuevas por debajo, con sus releases y su conciliación, sin que ese gate inmutable
+-- pueda volver a mirarlas. Sería peor que el encierro que esto viene a deshacer — aquel
+-- bloquea un proyecto, esto ablandaría una certificación ya firmada.
+--
+-- DEUDA DECLARADA, la otra mitad de la misma decisión: un proyecto cerrado bajo el esquema
+-- viejo se queda como está, certificado y sin design version, y sin poder crear ninguna. Su
+-- ciclo terminó antes de que estas reglas existieran y nada de lo que se haga ahora lo va a
+-- reconciliar hacia atrás. Si el método quiere reabrir esos ciclos, es una decisión de
+-- producto y necesita un mecanismo propio, no un perdón más ancho.
+--
 -- No es una puerta trasera, y la forma es lo que lo garantiza:
 --  · la columna se escribe UNA sola vez, aquí, en el instante del despliegue;
 --  · no entra en ningún grant —el de gate_instancia es por columnas y no la incluye—, así
@@ -822,7 +835,11 @@ revoke execute on function reto_aplica_a_servicio(uuid, uuid, uuid) from public;
 -- quiere exigir esa reconstrucción, es una decisión de producto, no de esta migración.
 alter table gate_instancia add column previo_a_design_version boolean not null default false;
 -- perdon-historico:inicio
-update gate_instancia set previo_a_design_version = true where estado = 'aprobado';
+update gate_instancia g set previo_a_design_version = true
+where g.estado = 'aprobado' and g.numero = 6
+  and not exists (select 1 from gate_instancia g7
+    where g7.proyecto_id = g.proyecto_id and g7.workspace_id = g.workspace_id
+      and g7.numero = 7 and g7.estado = 'aprobado');
 -- perdon-historico:fin
 
 -- ¿Este proyecto ya CERTIFICÓ un resultado que depende de sus design versions aprobadas?

@@ -3872,7 +3872,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       .split('-- perdon-historico:inicio')[1]!
       .split('-- perdon-historico:fin')[0]!
       .trim();
-    expect(bloque).toMatch(/^update gate_instancia set previo_a_design_version = true/);
+    expect(bloque).toMatch(/^update gate_instancia g set previo_a_design_version = true/);
     await admin.unsafe(bloque);
 
     // Y ahora el proyecto redacta su versión y llega a G7 por el camino normal, con todos
@@ -3918,6 +3918,42 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       conUsuario(leadId, (tx) => tx`update gate_instancia set previo_a_design_version = true
         where proyecto_id = ${proy} and workspace_id = ${ws}`),
     ).rejects.toThrow(/permission denied/);
+
+    // EL CASO HERMANO, que es el que sujeta el perdón por arriba: un proyecto heredado que
+    // ya había aprobado su G7 sigue CERTIFICADO. Su G7 es una certificación emitida y no
+    // puede volver a correr, así que dejarle crear design versions nuevas por debajo sería
+    // aflojarla — peor que el encierro que esto viene a deshacer. Se queda como está: sin
+    // design version y sin poder crear ninguna. Deuda declarada, no agujero.
+    const [pCerrado] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-113', 'Proyecto heredado ya cerrado', ${leadId}) returning id`;
+    const proyCerrado = pCerrado!.id as string;
+    for (let n = 0; n <= 7; n++) {
+      await admin`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+        values (${ws}, ${proyCerrado}, ${n},
+                ${[0, 3, 5, 6].includes(n) ? 'sponsor' : 'lead-boutique'},
+                'aprobado', ${leadId}, ${new Date()})`;
+    }
+    // El perdón se ejecuta OTRA VEZ, tal cual: es idempotente y este proyecto no entra.
+    await admin.unsafe(bloque);
+    const [g6Cerrado] = await admin`select previo_a_design_version from gate_instancia
+      where proyecto_id = ${proyCerrado} and workspace_id = ${ws} and numero = 6`;
+    expect(g6Cerrado!.previo_a_design_version).toBe(false);
+
+    const { servicioId: svcCerrado, journeyId: jCerrado } =
+      await servicioConToBe('Servicio del proyecto ya cerrado');
+    await expect(
+      crearDesignVersion(leadId, {
+        workspaceId: ws,
+        proyectoId: proyCerrado,
+        servicioId: svcCerrado,
+        journeyId: jCerrado,
+        titulo: 'La que no debe nacer bajo un ciclo cerrado',
+        resumen: '',
+        superaA: null,
+      }),
+    ).rejects.toThrow(/ya certificó G6/);
   });
 
   it('nada de esto cruza el workspace', async () => {

@@ -1008,6 +1008,7 @@ function VistaReleases({
           workspaceId={workspaceId}
           dv={dv}
           release={r}
+          puedePlanificar={puedePlanificar}
           puedeCompletar={puedeCompletar}
           onError={onError}
           onHecho={onHecho}
@@ -1076,6 +1077,7 @@ function TarjetaRelease({
   workspaceId,
   dv,
   release,
+  puedePlanificar,
   puedeCompletar,
   onError,
   onHecho,
@@ -1083,6 +1085,7 @@ function TarjetaRelease({
   workspaceId: string;
   dv: DesignVersionCompleta;
   release: ReleaseDeDesignVersion;
+  puedePlanificar: boolean;
   puedeCompletar: boolean;
   onError: (e: string | null) => void;
   onHecho: () => Promise<void>;
@@ -1130,9 +1133,17 @@ function TarjetaRelease({
                 {/* Mover, y no «quitar y volver a asignar»: con G6 aprobado, dejar el
                     elemento sin release aunque sea un instante es lo que el constraint de
                     cobertura rechaza —y como la aprobación de un gate no se deshace, no
-                    habría vuelta atrás—. El servicio lo resuelve en una transacción. */}
-                {dv.releases.filter((o) => o.estado === 'planificado' && o.id !== release.id)
-                  .length > 0 && (
+                    habría vuelta atrás—. El servicio lo resuelve en una transacción.
+
+                    Va con `puedePlanificar` y no con `puedeCompletar`, aunque esté al lado
+                    de «Quitar»: mover REINSERTA el elemento, y `release_elemento_insert`
+                    solo admite versiones que sigan a cargo de su proyecto. Sobre una que el
+                    propio proyecto reemplazó, todo movimiento revierte — y el cartel de
+                    arriba ya dice que ahí no entra trabajo nuevo. Quitar sí es cerrar, y se
+                    queda donde estaba. */}
+                {puedePlanificar &&
+                  dv.releases.filter((o) => o.estado === 'planificado' && o.id !== release.id)
+                    .length > 0 && (
                   <AsignarAExistente
                     workspaceId={workspaceId}
                     elementoId={e.elementoId}

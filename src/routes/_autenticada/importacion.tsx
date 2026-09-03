@@ -86,13 +86,24 @@ function PantallaImportacion() {
   const [masPendientes, setMasPendientes] = useState<ItemBandeja[]>([]);
   const [hayMasLocal, setHayMasLocal] = useState<boolean | null>(null);
   const [cargandoMas, setCargandoMas] = useState(false);
+  // Y lo mismo para el historial de decididas. No es simetría por gusto: un item
+  // RECHAZADO conserva sus archivos (SYS-17) y no tiene evidencia, así que esta lista es
+  // la ÚNICA pantalla desde la que se llega a sus originales. Sin recorrerla entera, la
+  // retención era una promesa sin ruta.
+  const [masDecididas, setMasDecididas] = useState<ItemBandeja[]>([]);
+  const [hayMasDecididasLocal, setHayMasDecididasLocal] = useState<boolean | null>(null);
+  const [cargandoDecididas, setCargandoDecididas] = useState(false);
 
   const pendientes = datos ? [...datos.pendientes, ...masPendientes] : [];
   const hayMas = hayMasLocal ?? datos?.hayMasPendientes ?? false;
+  const decididas = datos ? [...datos.decididas, ...masDecididas] : [];
+  const hayMasDecididas = hayMasDecididasLocal ?? datos?.hayMasDecididas ?? false;
 
   async function refrescar() {
     setMasPendientes([]);
     setHayMasLocal(null);
+    setMasDecididas([]);
+    setHayMasDecididasLocal(null);
     await router.invalidate();
   }
 
@@ -113,6 +124,26 @@ function PantallaImportacion() {
       setError('No se pudo cargar más pendientes; intenta de nuevo');
     } finally {
       setCargandoMas(false);
+    }
+  }
+
+  async function cargarMasDecididas() {
+    if (!datos || decididas.length === 0) return;
+    setCargandoDecididas(true);
+    setError(null);
+    try {
+      const ultima = decididas[decididas.length - 1]!;
+      const r = await bandejaDeImportacion({
+        data: { workspaceId: datos.workspaceId, antesDeDecidida: ultima.id },
+      });
+      if (r) {
+        setMasDecididas((previas) => [...previas, ...r.decididas]);
+        setHayMasDecididasLocal(r.hayMasDecididas);
+      }
+    } catch {
+      setError('No se pudo cargar más decididas; intenta de nuevo');
+    } finally {
+      setCargandoDecididas(false);
     }
   }
 
@@ -181,10 +212,12 @@ function PantallaImportacion() {
                 </Button>
               </div>
             )}
-            {datos.decididas.length > 0 && (
+            {decididas.length > 0 && (
               <>
-                <div style={{ ...etiqueta, paddingTop: 14 }}>Decididas recientes</div>
-                {datos.decididas.map((item) => (
+                <div style={{ ...etiqueta, paddingTop: 14 }}>
+                  Decididas — aquí siguen los originales de lo rechazado
+                </div>
+                {decididas.map((item) => (
                   <TarjetaItem
                     key={item.id}
                     item={item}
@@ -194,6 +227,18 @@ function PantallaImportacion() {
                     onError={setError}
                   />
                 ))}
+                {hayMasDecididas && (
+                  <div>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={cargandoDecididas}
+                      onClick={() => void cargarMasDecididas()}
+                    >
+                      {cargandoDecididas ? 'Cargando…' : 'Cargar decididas más antiguas'}
+                    </Button>
+                  </div>
+                )}
               </>
             )}
           </>

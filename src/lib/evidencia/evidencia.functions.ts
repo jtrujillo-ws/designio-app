@@ -58,7 +58,12 @@ export const bandejaDeImportacion = createServerFn({ method: 'GET' })
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
     try {
-      const bandeja = await listarBandeja(usuarioId, data.workspaceId, data.antesDe);
+      const bandeja = await listarBandeja(
+        usuarioId,
+        data.workspaceId,
+        data.antesDe,
+        data.antesDeDecidida,
+      );
       return { workspaceId: data.workspaceId, ...bandeja };
     } catch (e) {
       // Cuenta desactivada con JWT aún vigente: sin datos, como si no hubiera sesión.

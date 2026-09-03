@@ -81,9 +81,16 @@ export type Bandeja = {
   /** Cola operativa: TODOS los pendientes son alcanzables paginando por keyset. */
   pendientes: ItemBandeja[];
   hayMasPendientes: boolean;
-  /** Solo en la primera página: historial reciente de decisiones (acotado — el
-   * registro completo e inmutable vive en evento_dominio y en la propia evidencia). */
+  /**
+   * Historial de decisiones, también alcanzable ENTERO por keyset. Estuvo acotado a las
+   * más recientes, y eso dejaba una promesa sin ruta: un item RECHAZADO conserva sus
+   * archivos (SYS-17) y no tiene `evidencia_id`, así que no aparece en la pantalla de
+   * evidencias; pasadas las primeras decisiones, sus originales seguían ahí, RLS los
+   * dejaba leer y el producto no daba ningún camino para llegar. «Lo que la base permite,
+   * la pantalla lo ofrece» leído del revés: retener sin ruta de acceso es retener nada.
+   */
   decididas: ItemBandeja[];
+  hayMasDecididas: boolean;
 };
 
 function filaDeBandeja(f: Record<string, unknown>, archivos: ArchivoAdjunto[]): ItemBandeja {
@@ -134,10 +141,17 @@ async function archivosPorItem(
   return mapa;
 }
 
+/**
+ * Bandeja del workspace: pendientes e historial de decididas, cada lista con SU cursor
+ * keyset independiente. Pasar uno de los dos cursores pide la página siguiente de esa
+ * lista y devuelve la otra vacía: son dos recorridos distintos y mezclarlos duplicaría
+ * payload sin que nadie lo mirara.
+ */
 export async function listarBandeja(
   actorId: string,
   workspaceId: string,
   antesDe?: string,
+  antesDeDecidida?: string,
 ): Promise<Bandeja> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
@@ -145,7 +159,9 @@ export async function listarBandeja(
     // de un offset. El cursor viaja como id y su (creado_en, id) se resuelve aquí con la
     // precisión de la base (serializar el timestamp perdería los microsegundos y saltaría
     // o repetiría filas). Se pide una fila extra para saber si hay más.
-    const pendientes = await tx`
+    const pendientes = antesDeDecidida
+      ? []
+      : await tx`
       select id, titulo, tipo_fuente, referencia, estado,
              left(contenido, ${LARGO_EXTRACTO}) as extracto,
              length(contenido) > ${LARGO_EXTRACTO} as truncado,
@@ -159,6 +175,9 @@ export async function listarBandeja(
       order by creado_en desc, id desc
       limit ${PAGINA_PENDIENTES + 1}`;
 
+    // Mismo keyset que los pendientes, sobre `(decidido_en, id)`: el CHECK de la tabla
+    // garantiza que un item no pendiente tiene `decidido_en`, así que el par nunca es
+    // parcialmente nulo y el orden es total. Una fila extra para saber si hay más.
     const decididas = antesDe
       ? []
       : await tx`
@@ -168,10 +187,17 @@ export async function listarBandeja(
                creado_en, decidido_en
         from item_importacion
         where workspace_id = ${workspaceId} and estado <> 'pendiente'
-        order by decidido_en desc
-        limit ${DECIDIDAS_RECIENTES}`;
+          ${antesDeDecidida
+            ? tx`and (decidido_en, id) < (select i2.decidido_en, i2.id from item_importacion i2
+                  where i2.id = ${antesDeDecidida} and i2.workspace_id = ${workspaceId})`
+            : tx``}
+        order by decidido_en desc, id desc
+        limit ${DECIDIDAS_RECIENTES + 1}`;
 
-    const visibles = [...pendientes.slice(0, PAGINA_PENDIENTES), ...decididas];
+    const visibles = [
+      ...pendientes.slice(0, PAGINA_PENDIENTES),
+      ...decididas.slice(0, DECIDIDAS_RECIENTES),
+    ];
     const adjuntos = await archivosPorItem(
       tx,
       workspaceId,
@@ -183,7 +209,10 @@ export async function listarBandeja(
         .slice(0, PAGINA_PENDIENTES)
         .map((f) => filaDeBandeja(f, adjuntos.get(f.id as string) ?? [])),
       hayMasPendientes: pendientes.length > PAGINA_PENDIENTES,
-      decididas: decididas.map((f) => filaDeBandeja(f, adjuntos.get(f.id as string) ?? [])),
+      decididas: decididas
+        .slice(0, DECIDIDAS_RECIENTES)
+        .map((f) => filaDeBandeja(f, adjuntos.get(f.id as string) ?? [])),
+      hayMasDecididas: decididas.length > DECIDIDAS_RECIENTES,
     };
   });
 }

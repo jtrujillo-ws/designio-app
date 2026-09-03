@@ -247,20 +247,19 @@ async function sembrarEvidenciaProfunda(
  * esta función siembra, tanto si acaba de crearla como si ya estaba de una corrida
  * anterior. Cada una con la base documental que justifica su concesión.
  */
-const DERECHOS_CADENA = [
-  {
-    titulo: 'Funnel de apertura: 62% de abandono en verificación',
-    base: 'Cláusula 7 del contrato de servicios: analítica agregada, sin datos personales',
-  },
-  {
-    titulo: 'Entrevistas en sucursal: abandono del 20%',
-    base: 'Consentimiento informado firmado por los seis asesores entrevistados',
-  },
-] as const;
+/**
+ * La BASE documental de cada derecho, atada al PAPEL que esa evidencia cumple en la
+ * cadena de demo (la que se cita y la que sostiene el arquetipo), no a su título. El
+ * título es texto que cualquiera puede repetir; el papel sale de las relaciones.
+ */
+const BASE_DERECHO_CITADA =
+  'Cláusula 7 del contrato de servicios: analítica agregada, sin datos personales';
+const BASE_DERECHO_ARQUETIPO =
+  'Consentimiento informado firmado por los seis asesores entrevistados';
 
 /**
- * Derechos CONCEDIDOS (ámbito cliente) para la evidencia de la cadena de demo, tanto si la
- * fila de derechos falta como si existe todavía en 'pendiente'.
+ * Concede los derechos (ámbito cliente) de la evidencia de la cadena de demo, IDENTIFICADA
+ * POR ID. Quien llama tiene que haber acreditado antes que esos ids son de la cadena.
  *
  * Por qué concedidos y no pendientes: estas dos evidencias son justamente las que sostienen
  * la cadena —una está citada en el insight validado que respalda la decisión de G1, y citar
@@ -273,35 +272,93 @@ const DERECHOS_CADENA = [
  * pre-chequeo anti-oráculo de `evidencia_con_derechos_guard` sale antes y no comprueba
  * nada. El guard se salta la comprobación, no la regla.
  *
- * Dos propiedades que sostienen la idempotencia:
- *  · Solo toca lo que está en 'pendiente'. Si un operador denegó estos derechos a mano
- *    —o los concedió con otro ámbito— el seed NO le pisa la decisión: repara el estado
- *    fail-closed que dejó el backfill, no cualquier estado.
- *  · Identifica la evidencia por el título que ESTA función siembra, dentro de su
- *    workspace: mira lo que ella misma produce, que es la lección de la guarda anterior.
+ * Solo toca lo que está en 'pendiente'. Si un operador denegó estos derechos a mano —o los
+ * concedió con otro ámbito— el seed NO le pisa la decisión: repara el estado fail-closed que
+ * dejó el backfill, no cualquier estado. Y `pendiente` significa exactamente «nadie ha
+ * decidido todavía»: la transición nunca vuelve a ese estado, solo se nace en él.
  */
-async function asegurarDerechosDeCadena(
+async function concederDerechosDeCadena(
   tx: TransactionSql,
   wsId: string,
   luciaId: string,
+  filas: readonly { evidenciaId: string; base: string }[],
 ): Promise<void> {
-  for (const { titulo, base } of DERECHOS_CADENA) {
+  for (const { evidenciaId, base } of filas) {
     // Falta la fila entera (base sembrada por una versión sin derechos y nunca migrada).
     await tx`insert into derecho_uso
       (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
-      select ${wsId}, e.id, 'concedido', 'cliente', ${base}, ${luciaId}, now(), ${luciaId}
-      from evidencia e
-      where e.workspace_id = ${wsId} and e.titulo = ${titulo}
-        and not exists (select 1 from derecho_uso d where d.evidencia_id = e.id)`;
+      select ${wsId}, ${evidenciaId}, 'concedido', 'cliente', ${base}, ${luciaId}, now(), ${luciaId}
+      where not exists (select 1 from derecho_uso d where d.evidencia_id = ${evidenciaId})`;
     // O existe en 'pendiente' porque la puso el backfill de la migración.
     await tx`update derecho_uso d
       set estado = 'concedido', ambito = 'cliente', base = ${base},
           decidido_por = ${luciaId}, decidido_en = now()
-      from evidencia e
-      where e.id = d.evidencia_id and e.workspace_id = ${wsId}
-        and d.workspace_id = ${wsId} and e.titulo = ${titulo}
+      where d.evidencia_id = ${evidenciaId} and d.workspace_id = ${wsId}
         and d.estado = 'pendiente'`;
   }
+}
+
+/**
+ * Repara los derechos de una base sembrada por una versión ANTERIOR, donde la cadena ya
+ * existe pero el backfill de 20260902140000 dejó sus derechos en 'pendiente'.
+ *
+ * Aquí no hay ids en la mano —esta corrida no creó nada—, así que hay que acreditar la
+ * procedencia. Y se acredita por RELACIONES, nunca por título: el título es dato que
+ * cualquiera puede escribir, y emparejar por él significaba que una evidencia AJENA
+ * bautizada igual —material confidencial de un cliente, por ejemplo— recibía derechos de
+ * ámbito cliente firmados por Lucía, que nunca los concedió. En un producto cuya tesis es
+ * que conceder el uso es un acto propio, con su base documental y su responsable, un seed
+ * que firma consentimiento en nombre de alguien es la contradicción más grande posible.
+ *
+ * El camino arranca en `proyecto.codigo = 'P-01'`, que es una fila que ESTE seed crea y que
+ * tiene clave única `(workspace_id, codigo)`: no hay dos, y nadie puede fabricar una
+ * segunda para colarse. Desde ahí, todo por FK:
+ *
+ *   P-01 → gate 1 → decisión → decision_insight → insight → afirmación → cita → evidencia
+ *   P-01 → reto → arquetipo → arquetipo_evidencia → evidencia
+ *
+ * Y se exige que cada camino devuelva EXACTAMENTE UNA evidencia, que es la forma que este
+ * seed produce. Si hay más de una, la base no tiene la forma que esta función sembró y no
+ * se toca nada: fail-closed, como todo lo demás en este dominio.
+ *
+ * Lo que esto NO afirma, para no dejar escrita una tranquilidad falsa: no demuestra que la
+ * fila la escribiera esta función. Un lead-boutique que construya a mano su propia decisión
+ * sobre el G1 de P-01 citando su propia evidencia entraría en el camino. Lo que sí quita es
+ * la vía por la que se colaba material que no tiene NADA que ver con la cadena, y acota lo
+ * alcanzable a la evidencia de la que el demo depende estructuralmente — que es justo la
+ * que, bloqueada, deja el demo contradiciéndose.
+ */
+async function repararDerechosDeCadena(
+  tx: TransactionSql,
+  wsId: string,
+  luciaId: string,
+): Promise<void> {
+  const citadas = await tx`select distinct c.evidencia_id
+    from proyecto p
+    join gate_instancia g on g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+      and g.numero = 1
+    join decision d on d.gate_id = g.id and d.workspace_id = g.workspace_id
+    join decision_insight di on di.decision_id = d.id and di.workspace_id = d.workspace_id
+    join afirmacion a on a.insight_id = di.insight_id and a.workspace_id = di.workspace_id
+    join cita c on c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
+    where p.workspace_id = ${wsId} and p.codigo = 'P-01'`;
+  const deArquetipo = await tx`select distinct ae.evidencia_id
+    from proyecto p
+    join arquetipo arq on arq.reto_id = p.reto_id and arq.workspace_id = p.workspace_id
+    join arquetipo_evidencia ae on ae.arquetipo_id = arq.id and ae.workspace_id = arq.workspace_id
+    where p.workspace_id = ${wsId} and p.codigo = 'P-01'`;
+
+  const filas: { evidenciaId: string; base: string }[] = [];
+  if (citadas.length === 1) {
+    filas.push({ evidenciaId: citadas[0]!.evidencia_id as string, base: BASE_DERECHO_CITADA });
+  }
+  if (deArquetipo.length === 1) {
+    filas.push({
+      evidenciaId: deArquetipo[0]!.evidencia_id as string,
+      base: BASE_DERECHO_ARQUETIPO,
+    });
+  }
+  await concederDerechosDeCadena(tx, wsId, luciaId, filas);
 }
 
 /**
@@ -406,7 +463,7 @@ async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string):
     // upgrade es un demo que se contradice: un insight validado cuya cita apunta a
     // evidencia bloqueada, y una cita que hoy el propio producto no dejaría crear. Los
     // derechos de la cadena CONOCIDA se ponen igual, sin volver a sembrar nada.
-    await asegurarDerechosDeCadena(tx, wsId, luciaId);
+    await repararDerechosDeCadena(tx, wsId, luciaId);
     return;
   }
 
@@ -439,7 +496,12 @@ async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string):
     returning id`;
   const evDigital = ev1!.id as string;
   const evSucursal = ev2!.id as string;
-  await asegurarDerechosDeCadena(tx, wsId, luciaId);
+  // Alta: los ids acaban de salir del INSERT, así que la procedencia es certeza y no hay
+  // nada que emparejar. Emparejar por título aquí era, además de peligroso, innecesario.
+  await concederDerechosDeCadena(tx, wsId, luciaId, [
+    { evidenciaId: evDigital, base: BASE_DERECHO_CITADA },
+    { evidenciaId: evSucursal, base: BASE_DERECHO_ARQUETIPO },
+  ]);
 
   const [ins] = await tx`insert into insight (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
     values (${wsId}, 'La verificación de identidad digital concentra el abandono',

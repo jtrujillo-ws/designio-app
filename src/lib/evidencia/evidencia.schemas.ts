@@ -157,6 +157,10 @@ export const BandejaInputSchema = z.object({
   /** Cursor: id del último pendiente devuelto — el server resuelve su (creado_en, id)
    * con precisión exacta y pide los más antiguos (keyset estable ante inserciones). */
   antesDe: z.string().uuid().optional(),
+  /** El mismo cursor para el historial de decididas, sobre `(decidido_en, id)`. Existe
+   * porque un item rechazado conserva sus archivos y no aparece en ninguna otra pantalla:
+   * sin recorrer el historial entero, esos originales no tenían camino. */
+  antesDeDecidida: z.string().uuid().optional(),
 });
 
 export const ItemInputSchema = z.object({

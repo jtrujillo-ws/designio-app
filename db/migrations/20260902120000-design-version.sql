@@ -1708,7 +1708,25 @@ revoke execute on function release_elemento_misma_dv_guard() from public;
 -- sale nada de él.
 create function release_elemento_cobertura_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_reto uuid;
 begin
+  -- El candado del RETO, y PRIMERO, por lo mismo que el del alcance de abajo: firmar G6 y
+  -- quitarle el release a un elemento escriben tablas distintas —gate_instancia y
+  -- release_elemento—, y sin candado compartido en la BASE las dos se miran sin verse y
+  -- commitean. La cita existía solo en el servicio, que es una convención.
+  --
+  -- Es el reto y no el proyecto porque es la clave que ya usa el método: `aprobarGate` lo
+  -- toma primero de todo, y `desasignarElemento` también. Resolverlo antes de tomarlo no
+  -- abre carrera: el reto de un proyecto y la design version de un elemento son inmutables.
+  select p.reto_id into v_reto
+  from elemento_cambio ec
+  join design_version dv on dv.id = ec.design_version_id and dv.workspace_id = ec.workspace_id
+  join proyecto p on p.id = dv.proyecto_id and p.workspace_id = dv.workspace_id
+  where ec.id = old.elemento_id and ec.workspace_id = old.workspace_id;
+  if v_reto is not null then
+    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+  end if;
   if not is_workspace_member(app_user_id(), old.workspace_id) then
     return old;
   end if;
@@ -1744,6 +1762,82 @@ create constraint trigger release_elemento_cobertura
   deferrable initially deferred
   for each row execute function release_elemento_cobertura_guard();
 revoke execute on function release_elemento_cobertura_guard() from public;
+
+-- ══ UN RELEASE QUE YA SALIÓ NO SE QUEDA SIN ALCANCE (SYS-06) ══
+-- El guard de transición ya lo comprueba al desplegar, pero es INMEDIATO y por tanto ciego a
+-- lo que otra transacción tenga a medias. Quitar el último elemento y desplegar el release
+-- escriben TABLAS DISTINTAS —release_elemento y release—, así que ningún candado de fila las
+-- cruza: la política del borrado ve 'planificado', el guard del despliegue ve el elemento
+-- todavía ahí, y las dos commitean. Queda un release desplegado sin alcance declarado.
+--
+-- La cita existía, pero solo en el servicio (`bloquearRelease` en los dos caminos). Y eso es
+-- una convención, no una garantía: vale mientras todo el mundo entre por la puerta buena.
+-- Este esquema no se apoya en eso —por eso el código lo pone un trigger y por eso el perdón
+-- histórico está fuera de todo grant—, así que la cooperación tiene que vivir aquí.
+--
+-- Es UNA sola función para los dos lados a propósito: la invariante se enuncia una vez y la
+-- comprueba quien la pueda romper, venga del borrado o del despliegue.
+--
+-- ── Y LO QUE NO BASTA: diferido no es excluyente ──
+-- Un constraint trigger diferido corre en la fase de commit, pero su `select` va ANTES de que
+-- el commit propio sea visible para nadie. Dos que lleguen a la vez se miran sin verse y
+-- pasan los dos: el diferido por sí solo mueve la ceguera de sitio, no la quita.
+--
+-- Lo que la quita es el candado COMPARTIDO como PRIMERA sentencia de los dos lados. Ahí no
+-- hay ningún candado de fila por delante al que adelantarse, así que uno espera de verdad al
+-- otro; y cuando entra, su `select` ya es una sentencia nueva —READ COMMITTED, instantánea
+-- fresca— y ve lo que el primero acaba de commitear. Sobrevive exactamente uno.
+--
+-- La clave es la MISMA cadena que usa el servicio ('designio:release:' || id), porque un
+-- candado que no es el mismo no es un candado compartido.
+--
+-- ── Orden de adquisición ──
+-- En el borrado de un release_elemento corren DOS diferidos: `release_elemento_cobertura`
+-- toma el candado del RETO y este toma el del RELEASE. Los constraint triggers de una tabla
+-- disparan en orden alfabético, y `cobertura` va antes que `sin_alcance`, así que se toman en
+-- el orden canónico del módulo (reto → … → release) y no al revés. Invertirlos cerraría un
+-- ciclo contra `desasignarElemento`, que los toma en ese mismo orden. El nombre es funcional:
+-- renombrar estos triggers sin mirar esto reintroduce el interbloqueo.
+create function release_alcance_no_vacio_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_release uuid;
+  v_workspace uuid;
+  v_estado text;
+begin
+  if tg_table_name = 'release_elemento' then
+    v_release := old.release_id;
+    v_workspace := old.workspace_id;
+  else
+    v_release := new.id;
+    v_workspace := new.workspace_id;
+  end if;
+  -- PRIMERO el candado. Nada de comprobar membresía antes: esto no es una regla de dominio
+  -- que dependa de quién mira, es una invariante estructural que tiene que valer también
+  -- para un script de administración.
+  perform pg_advisory_xact_lock(hashtextextended('designio:release:' || v_release, 42));
+  select r.estado into v_estado from release r
+    where r.id = v_release and r.workspace_id = v_workspace;
+  -- El release ya no existe, o sigue planificado: quitarle el alcance a lo que aún no ha
+  -- salido es legítimo —es como se cierra un release que ya no va a construirse—.
+  if v_estado is null or v_estado = 'planificado' then
+    return null;
+  end if;
+  if not exists (select 1 from release_elemento re
+    where re.release_id = v_release and re.workspace_id = v_workspace) then
+    raise exception 'un release que ya salió no puede quedarse sin alcance declarado (SYS-06)';
+  end if;
+  return null;
+end $$;
+create constraint trigger release_elemento_sin_alcance
+  after delete on release_elemento
+  deferrable initially deferred
+  for each row execute function release_alcance_no_vacio_guard();
+create constraint trigger release_sin_alcance
+  after update on release
+  deferrable initially deferred
+  for each row execute function release_alcance_no_vacio_guard();
+revoke execute on function release_alcance_no_vacio_guard() from public;
 
 -- ══ EL CALENDARIO QUE MANDA ES EL DE QUIEN ESCRIBE (RF-06.5, RF-06.6) ══
 -- «La fecha no puede ser futura» no dice nada hasta que se responde «futura ¿en qué
@@ -2056,8 +2150,24 @@ create or replace function gate_aprobar_suficiencia_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_motivo text;
+  v_reto uuid;
 begin
   if new.estado = 'aprobado' and old.estado = 'pendiente' then
+    -- El candado del RETO antes de mirar nada. Este guard decide sobre filas de OTRAS tablas
+    -- —el checklist, los releases, las constataciones—, así que sin candado compartido en la
+    -- base una aprobación y una escritura concurrente sobre lo que afirma se miran sin verse
+    -- y commitean las dos: G6 firmando un plan al que otra transacción le acaba de quitar la
+    -- cobertura. El servicio ya lo tomaba (`aprobarGate` lo toma primero de todo), pero eso
+    -- vale solo para quien entra por ahí.
+    --
+    -- Es la misma clave y el mismo primer lugar que en `release_elemento_cobertura_guard`,
+    -- que es el otro lado del par. Y va aquí dentro, en la rama de la aprobación, para no
+    -- serializar por el reto transiciones que no afirman nada sobre otras tablas.
+    select p.reto_id into v_reto from proyecto p
+      where p.id = new.proyecto_id and p.workspace_id = new.workspace_id;
+    if v_reto is not null then
+      perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+    end if;
     -- El sello temporal lo pone la BASE, no el caller: un update directo no puede
     -- retro ni post-datar el registro inmutable.
     new.aprobado_en := now();

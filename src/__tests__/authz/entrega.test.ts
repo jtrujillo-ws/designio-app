@@ -274,8 +274,17 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     await admin`delete from hilo_comentario where workspace_id = ${ws}`;
     await admin`delete from constatacion where workspace_id = ${ws}`;
     await admin`delete from effective_state where workspace_id = ${ws}`;
-    await admin`delete from release_elemento where workspace_id = ${ws}`;
-    await admin`delete from release where workspace_id = ${ws}`;
+    // El alcance y los releases se van en LA MISMA transacción. El guard diferido del
+    // alcance (SYS-06) exige que un release que ya salió no se quede sin elementos, y en
+    // sentencias sueltas —cada una su propia transacción— el borrado del alcance commitea
+    // con los releases todavía ahí y lo levanta, con razón. Juntas, al commit no queda
+    // ningún release al que exigirle nada. Es la misma forma que el desmontaje ya usa para
+    // la cadena de superación: la invariante se cumple al final de la transacción, no en
+    // mitad de ella.
+    await admin.begin(async (tx) => {
+      await tx`delete from release_elemento where workspace_id = ${ws}`;
+      await tx`delete from release where workspace_id = ${ws}`;
+    });
     await admin`delete from elemento_decision where workspace_id = ${ws}`;
     await admin`delete from elemento_insight where workspace_id = ${ws}`;
     await admin`delete from elemento_cambio where workspace_id = ${ws}`;
@@ -4195,6 +4204,102 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const [dvSig] = await admin`select codigo from design_version
       where id = ${siguiente.designVersionId}`;
     expect(numeroDe(dvSig!.codigo as string)).toBeGreaterThan(numeroDe(creada!.codigo as string));
+  });
+
+  it('quitar el último elemento y desplegar NO pueden commitear los dos (SYS-06)', async () => {
+    // Escriben tablas DISTINTAS —release_elemento y release—, así que ningún candado de fila
+    // las cruza: la política del borrado ve 'planificado', el guard del despliegue ve el
+    // elemento todavía ahí, y las dos pasan. Queda un release desplegado sin alcance.
+    //
+    // La cita existía solo en el servicio, y eso es una convención: vale mientras todo el
+    // mundo entre por la puerta buena. Este test entra por la otra, con SQL directo bajo el
+    // contexto RLS del lead — que es exactamente la vía que el esquema promete cubrir.
+    //
+    // Y el caso es el SIMULTÁNEO, no el intercalado: las dos transacciones se sostienen
+    // hasta estar las dos listas y se sueltan a la vez. El intercalado secuencial pasa
+    // incluso sin arreglo, así que probaría otra cosa.
+    //
+    // HASTA DÓNDE LLEGA ESTE TEST, dicho con precisión: se pone rojo si se quita el guard
+    // diferido —sin él commitean las dos—, pero NO si se quita solo el candado compartido.
+    // El candado hace falta igual: sin él, las dos fases de commit pueden solaparse y los
+    // dos `select` de los guards diferidos corren antes de que ninguno de los dos commits
+    // sea visible, así que se miran sin verse. Lo que pasa es que este test no puede FORZAR
+    // ese solape —las dos transacciones salen del mismo proceso y sus viajes de ida y vuelta
+    // las escalonan—, así que sin candado pasa por suerte de temporización. El candado quita
+    // la suerte de la ecuación; su necesidad se sostiene en el argumento, no en este rojo.
+    const admin = sqlAdmin();
+    const proy = await proyectoConGates('P-133', 'Proyecto de la carrera del alcance');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la carrera');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La del alcance en disputa',
+      resumen: '',
+      superaA: null,
+    });
+    const el = await elementoSuelto(dv.designVersionId, 'El único del alcance');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const rl = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'El que quiere salir vacío',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: el, razon: '' }],
+    });
+
+    // Las dos escriben lo suyo y se quedan esperando: nadie ha commiteado todavía, así que
+    // ninguna puede ver a la otra. Solo entonces se sueltan.
+    let listaA!: () => void;
+    let listaB!: () => void;
+    const ambasEscritas = Promise.all([
+      new Promise<void>((r) => (listaA = r)),
+      new Promise<void>((r) => (listaB = r)),
+    ]);
+    let soltar!: () => void;
+    const salida = new Promise<void>((r) => (soltar = r));
+
+    const quitando = conUsuario(leadId, async (tx) => {
+      const filas = await tx`delete from release_elemento
+        where release_id = ${rl.releaseId} and workspace_id = ${ws}`;
+      if (filas.count !== 1) throw new Error('el borrado directo no alcanzó su fila');
+      listaA();
+      await salida;
+    });
+    const desplegando = conUsuario(leadId, async (tx) => {
+      const filas = await tx`update release set estado = 'desplegado', desplegado_en = ${HOY}::date
+        where id = ${rl.releaseId} and workspace_id = ${ws} and estado = 'planificado'`;
+      if (filas.count !== 1) throw new Error('el despliegue directo no alcanzó su fila');
+      listaB();
+      await salida;
+    });
+
+    await ambasEscritas;
+    soltar();
+    const desenlaces = await Promise.allSettled([quitando, desplegando]);
+    const cumplidas = desenlaces.filter((d) => d.status === 'fulfilled');
+    const rotas = desenlaces.filter((d) => d.status === 'rejected');
+    // Exactamente una sobrevive. Cuál da igual: las dos son operaciones legítimas por
+    // separado, y lo que no puede quedar es el estado que producirían juntas.
+    expect(cumplidas).toHaveLength(1);
+    expect(rotas).toHaveLength(1);
+
+    // Y el invariante queda ENTERO gane quien gane: o el release sigue planificado (ganó el
+    // borrado) o salió con su alcance declarado (ganó el despliegue). Lo que no existe es un
+    // release desplegado y vacío.
+    const [estado] = await admin`select r.estado,
+        (select count(*)::int from release_elemento re
+          where re.release_id = r.id and re.workspace_id = r.workspace_id) as elementos
+      from release r where r.id = ${rl.releaseId} and r.workspace_id = ${ws}`;
+    const desplegadoSinAlcance =
+      estado!.estado !== 'planificado' && (estado!.elementos as number) === 0;
+    expect(desplegadoSinAlcance).toBe(false);
   });
 
   it('los releases se ordenan por NÚMERO de serie, no como texto', async () => {

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { CSSProperties, FormEvent } from 'react';
 import { createFileRoute, useNavigate, useRouter } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
+import { hoyCalendario } from '@/lib/fecha-calendario';
 import { Card } from '@/components/ui/Card';
 import { Checkbox } from '@/components/ui/Checkbox';
 import { Input } from '@/components/ui/Input';
@@ -565,9 +566,11 @@ function FormularioCuraduria({
   onCancelar: () => void;
   onError: (e: string | null) => void;
 }) {
-  // Fecha CALENDÁRICA local (no UTC): a las 8pm de Bogotá el default no debe ser "mañana".
-  const ahora = new Date();
-  const hoy = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}-${String(ahora.getDate()).padStart(2, '0')}`;
+  // Fecha CALENDÁRICA local (no UTC): a las 8pm de Bogotá el default no debe ser «mañana».
+  // La regla vive en `hoyCalendario` y no aquí: estaba escrita dos veces y la otra copia
+  // —la del selector de snapshots— usaba UTC, que es exactamente el defecto que este
+  // comentario describía.
+  const hoy = hoyCalendario();
   const [fecha, setFecha] = useState(hoy);
   const [recoleccion, setRecoleccion] = useState('');
   const [confianza, setConfianza] = useState<'alta' | 'media' | 'baja'>('media');

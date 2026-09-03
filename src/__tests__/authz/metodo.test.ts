@@ -565,15 +565,27 @@ describeAuthz('método: etapas, gates y checklists', () => {
     ).rejects.toThrow(/permission denied/);
 
     // Las transiciones LEGALES por SQL directo también dejan rastro: el guard emite
-    // RetoTransicionado con el par y el actor.
-    await conUsuario(leadId, (tx) => tx`update reto set estado = 'en-medicion'
-      where id = ${r.retoId}`);
+    // RetoTransicionado con el par y el actor. Se ejercita con el descarte de un
+    // candidato porque abrir la MEDICIÓN exige, desde SPEC-07, el Metric Registry
+    // firmado en G6 (SYS-22) — ese par tiene su propio test en medicion.test.ts.
+    const descartado = await crearReto(leadId, {
+      workspaceId: ws,
+      servicioAnclaId: svcId,
+      codigo: 'R-96',
+      titulo: 'Candidato descartado',
+      descripcion: '',
+      origen: 'peticion-cliente',
+      metricaObjetivo: '',
+      serviciosAfectados: [],
+    });
+    await conUsuario(leadId, (tx) => tx`update reto set estado = 'archivado'
+      where id = ${descartado.retoId}`);
     const [trans] = await admin`select payload, actor_id from evento_dominio
       where workspace_id = ${ws} and tipo = 'RetoTransicionado'
-        and payload->>'retoId' = ${r.retoId}
+        and payload->>'retoId' = ${descartado.retoId}
       order by creado_en desc limit 1`;
-    expect((trans!.payload as { de: string; a: string }).de).toBe('activo');
-    expect((trans!.payload as { de: string; a: string }).a).toBe('en-medicion');
+    expect((trans!.payload as { de: string; a: string }).de).toBe('candidato');
+    expect((trans!.payload as { de: string; a: string }).a).toBe('archivado');
     expect(trans!.actor_id).toBe(leadId);
   });
 

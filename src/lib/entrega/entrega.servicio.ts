@@ -1103,11 +1103,17 @@ export async function designVersionCompleta(
             'designVersionCodigo', v.dv_codigo,
             'constataciones', coalesce((
               select jsonb_agg(jsonb_build_object('elementoId', u.elemento_id,
-                'titulo', u.titulo, 'nodoId', u.nodo_id, 'catalogoId', u.catalogo_id,
+                'titulo', u.titulo, 'tipo', u.tipo,
+                'nodoId', u.nodo_id, 'catalogoId', u.catalogo_id,
                 'operacion', u.operacion, 'resultado', u.resultado)
                 order by u.constatado_en, u.es_creado_en, u.orden, u.elemento_creado_en)
               from (
-                select c.elemento_id, ec2.titulo, ec2.nodo_id,
+                -- El tipo es parte de la identidad de respaldo (ver «clave» en
+                -- entrega.diff.ts) y sale de ec2, la fila HISTÓRICA que se constató. No se
+                -- recalcula con nada vivo, por el mismo motivo que el catálogo se lee del
+                -- snapshot: reclasificar un elemento hoy no puede cambiar contra qué se
+                -- emparejó una design version de hace tres ciclos.
+                select c.elemento_id, ec2.titulo, ec2.tipo, ec2.nodo_id,
                   -- La identidad del elemento histórico sale del snapshot de SU design
                   -- version, no del grafo vivo: es lo que la hace estable entre ciclos.
                   coalesce(

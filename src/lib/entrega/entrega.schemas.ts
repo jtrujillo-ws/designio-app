@@ -102,13 +102,43 @@ export const ETIQUETA_RESULTADO: Record<ResultadoConstatacion, string> = {
 /** Fecha calendárica: `date` en SQL, texto YYYY-MM-DD en TypeScript. */
 const FechaSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Fecha con formato YYYY-MM-DD');
 
+/**
+ * Los topes del texto libre, en UN solo sitio porque los leen DOS que no pueden discrepar:
+ * el esquema que RECHAZA el envío y el `maxLength` del control que impide construir el
+ * valor rechazable.
+ *
+ * Y esa segunda mitad no es cosmética. Un esquema de entrada rechaza ANTES del handler, así
+ * que el fallo no vuelve como `{ ok: false, error }` —el camino por el que la pantalla sabe
+ * explicar—, sino como un fallo genérico de petición sobre un control que la pantalla había
+ * ofrecido habilitado. Es exactamente el mismo agujero que la fecha de despliegue vacía, y
+ * la lección es la misma: un control habilitado promete que el envío tiene sentido, y esa
+ * promesa hay que sostenerla contra TODO lo que puede rechazarlo —guard, política y
+ * esquema—, no solo contra los guards.
+ *
+ * Con `maxLength` el control no deja siquiera teclear ni pegar de más, que es mejor que un
+ * mensaje: el valor inválido no llega a existir. Copiar los números a mano en cada JSX sería
+ * volver a tener dos definiciones de lo mismo, y la que se queda vieja es siempre la de la
+ * pantalla.
+ */
+export const LARGO_MAXIMO = {
+  titulo: 200,
+  resumen: 2000,
+  detalle: 2000,
+  responsable: 200,
+  motivo: 500,
+  /** Por qué un elemento cae en ESTE release (parcialidad explícita, SYS-06). */
+  razonDeAsignacion: 500,
+  /** Qué quedó distinto y por qué, al constatar una desviación (SYS-07). */
+  textoDeDesviacion: 2000,
+} as const;
+
 export const CrearDesignVersionSchema = z.object({
   workspaceId: z.string().uuid(),
   proyectoId: z.string().uuid(),
   servicioId: z.string().uuid(),
   journeyId: z.string().uuid().nullable().default(null),
-  titulo: z.string().trim().min(1, 'El título es obligatorio').max(200),
-  resumen: z.string().trim().max(2000).default(''),
+  titulo: z.string().trim().min(1, 'El título es obligatorio').max(LARGO_MAXIMO.titulo),
+  resumen: z.string().trim().max(LARGO_MAXIMO.resumen).default(''),
   /** A qué design version aprobada reemplaza (SYS-05). Null en la primera del servicio. */
   superaA: z.string().uuid().nullable().default(null),
 });
@@ -119,8 +149,8 @@ export const AgregarElementoSchema = z.object({
   designVersionId: z.string().uuid(),
   tipo: z.enum(TIPOS_ELEMENTO),
   operacion: z.enum(OPERACIONES),
-  titulo: z.string().trim().min(1, 'El título es obligatorio').max(200),
-  detalle: z.string().trim().max(2000).default(''),
+  titulo: z.string().trim().min(1, 'El título es obligatorio').max(LARGO_MAXIMO.titulo),
+  detalle: z.string().trim().max(LARGO_MAXIMO.detalle).default(''),
   nodoId: z.string().uuid().nullable().default(null),
   decisionIds: z.array(z.string().uuid()).max(20).default([]),
   insightIds: z.array(z.string().uuid()).max(20).default([]),
@@ -132,8 +162,8 @@ export const EditarElementoSchema = z.object({
   elementoId: z.string().uuid(),
   tipo: z.enum(TIPOS_ELEMENTO),
   operacion: z.enum(OPERACIONES),
-  titulo: z.string().trim().min(1, 'El título es obligatorio').max(200),
-  detalle: z.string().trim().max(2000).default(''),
+  titulo: z.string().trim().min(1, 'El título es obligatorio').max(LARGO_MAXIMO.titulo),
+  detalle: z.string().trim().max(LARGO_MAXIMO.detalle).default(''),
   nodoId: z.string().uuid().nullable().default(null),
 });
 export type EditarElemento = z.infer<typeof EditarElementoSchema>;
@@ -166,22 +196,26 @@ export type DeclararSuperaA = z.infer<typeof DeclararSuperaASchema>;
 export const AprobarDesignVersionSchema = z.object({
   workspaceId: z.string().uuid(),
   designVersionId: z.string().uuid(),
-  motivo: z.string().trim().max(500).default(''),
+  motivo: z.string().trim().max(LARGO_MAXIMO.motivo).default(''),
 });
 export type AprobarDesignVersion = z.infer<typeof AprobarDesignVersionSchema>;
 
 export const PlanificarReleaseSchema = z.object({
   workspaceId: z.string().uuid(),
   designVersionId: z.string().uuid(),
-  titulo: z.string().trim().min(1, 'El título es obligatorio').max(200),
-  responsable: z.string().trim().min(1, 'El dueño del release es obligatorio').max(200),
+  titulo: z.string().trim().min(1, 'El título es obligatorio').max(LARGO_MAXIMO.titulo),
+  responsable: z
+    .string()
+    .trim()
+    .min(1, 'El dueño del release es obligatorio')
+    .max(LARGO_MAXIMO.responsable),
   fechaObjetivo: FechaSchema,
   /** Parcialidad explícita: cada elemento con la razón de caer en ESTE release. */
   elementos: z
     .array(
       z.object({
         elementoId: z.string().uuid(),
-        razon: z.string().trim().max(500).default(''),
+        razon: z.string().trim().max(LARGO_MAXIMO.razonDeAsignacion).default(''),
       }),
     )
     .max(200)
@@ -193,7 +227,7 @@ export const AsignarElementoSchema = z.object({
   workspaceId: z.string().uuid(),
   releaseId: z.string().uuid(),
   elementoId: z.string().uuid(),
-  razon: z.string().trim().max(500).default(''),
+  razon: z.string().trim().max(LARGO_MAXIMO.razonDeAsignacion).default(''),
 });
 export type AsignarElemento = z.infer<typeof AsignarElementoSchema>;
 
@@ -213,14 +247,14 @@ export const ConstatarSchema = z.object({
   workspaceId: z.string().uuid(),
   releaseId: z.string().uuid(),
   constatadoEn: FechaSchema,
-  resumen: z.string().trim().max(2000).default(''),
+  resumen: z.string().trim().max(LARGO_MAXIMO.resumen).default(''),
   constataciones: z
     .array(
       z.object({
         elementoId: z.string().uuid(),
         resultado: z.enum(RESULTADOS_CONSTATACION),
-        queQuedoDistinto: z.string().trim().max(2000).default(''),
-        razon: z.string().trim().max(2000).default(''),
+        queQuedoDistinto: z.string().trim().max(LARGO_MAXIMO.textoDeDesviacion).default(''),
+        razon: z.string().trim().max(LARGO_MAXIMO.textoDeDesviacion).default(''),
       }),
     )
     .min(1, 'Constatar exige al menos un elemento'),
@@ -313,13 +347,19 @@ export type ReleaseDeDesignVersion = {
  *  2. `nodoId` — para los tipos que NO tienen catálogo (un paso, una fricción): existen
  *     dentro de su journey, y el journey de trabajo sigue vivo entre ciclos (RF-05.8),
  *     así que el nodo aguanta mientras el grafo sea el mismo.
- *  3. el título normalizado — para los elementos sin nodo. Es un apaño y se sabe: dos
- *     elementos distintos pueden compartir título. Se prefiere a no emparejar nada,
- *     pero es la razón por la que enlazar el nodo importa.
+ *  3. el título normalizado DENTRO DE SU TIPO — para los elementos sin nodo. Es un apaño
+ *     y se sabe: dos elementos del mismo tipo pueden compartir título. Se prefiere a no
+ *     emparejar nada, pero es la razón por la que enlazar el nodo importa.
+ *
+ * El `tipo` viaja por eso último, y viaja el HISTÓRICO —el de la fila de `elemento_cambio`
+ * que se constató, no el que ese elemento tendría hoy—, igual que el `catalogoId` se lee
+ * del snapshot de SU design version. Una identidad que se recalcula con los datos de hoy
+ * hace que el diff de una versión antigua cambie de significado cuando alguien reclasifica.
  */
 export type ConstatacionDelServicio = {
   elementoId: string;
   titulo: string;
+  tipo: TipoElemento;
   nodoId: string | null;
   catalogoId: string | null;
   operacion: Operacion;

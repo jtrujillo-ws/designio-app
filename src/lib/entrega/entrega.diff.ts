@@ -6,6 +6,7 @@ import {
   type EstadoEfectivoVigente,
   type FilaConciliacion,
   type Operacion,
+  type TipoElemento,
 } from './entrega.schemas';
 
 /**
@@ -32,14 +33,41 @@ import {
  *
  * Por orden: el catálogo del servicio (SPEC-05) es identidad de verdad y sobrevive a un
  * journey nuevo y a un renombre; el nodo aguanta para los tipos sin catálogo mientras el
- * grafo de trabajo sea el mismo; el título normalizado es el apaño honesto de los
- * elementos sin nodo — comparar cadenas es exactamente lo que el catálogo vino a evitar,
- * y por eso el elemento sin nodo empareja peor.
+ * grafo de trabajo sea el mismo; el título normalizado DENTRO DE SU TIPO es el apaño
+ * honesto de los elementos sin nodo — comparar cadenas es exactamente lo que el catálogo
+ * vino a evitar, y por eso el elemento sin nodo empareja peor.
+ *
+ * El TIPO entra solo en el tercer escalón, y esa asimetría es la regla, no un descuido:
+ *
+ *  · En el respaldo el tipo DESEMPATA. El título es un proxy débil y solo distingue
+ *    dentro de un tipo: «Atención telefónica» como `canal` (por dónde entra el cliente) y
+ *    como `rol` (quién atiende) son dos elementos lógicos distintos. Sin el tipo se
+ *    plegaban en uno y el daño no era una excepción sino un diff que MIENTE en silencio:
+ *    el pliegue machacaba un elemento con el otro, `retira` sobre uno borraba al otro
+ *    —una ausencia que nadie constató—, y `calcularDiff` señalaba el predecesor
+ *    equivocado o dejaba fuera de `seMantiene` algo que no había cambiado.
+ *
+ *  · Con catálogo o con nodo el tipo SOBRA, y meterlo sería peor. Ahí la identidad ya
+ *    está resuelta por una referencia, y añadir el tipo la volvería frágil: reclasificar
+ *    un elemento entre ciclos —de `touchpoint` a `sistema`, pongamos— partiría una cosa
+ *    en dos y el diff diría «alta» de algo que lleva ahí desde el primer ciclo. El tipo
+ *    solo desempata donde la identidad es una conjetura; donde es una referencia, estorba.
+ *
+ * Y el tipo que se compara es el HISTÓRICO: `ConstatacionDelServicio` lo trae de la fila
+ * de `elemento_cambio` que se constató, no del elemento tal como esté hoy. Si se
+ * recalculara, reclasificar un elemento cambiaría el significado del diff de una design
+ * version de hace tres ciclos — la misma razón por la que el `catalogoId` se lee del
+ * snapshot de su versión y no del grafo vivo.
  */
-function clave(e: { titulo: string; nodoId: string | null; catalogoId: string | null }): string {
+function clave(e: {
+  titulo: string;
+  tipo: TipoElemento;
+  nodoId: string | null;
+  catalogoId: string | null;
+}): string {
   if (e.catalogoId) return `catalogo:${e.catalogoId}`;
   if (e.nodoId) return `nodo:${e.nodoId}`;
-  return `titulo:${normalizar(e.titulo)}`;
+  return `titulo:${e.tipo}:${normalizar(e.titulo)}`;
 }
 
 function normalizar(texto: string): string {

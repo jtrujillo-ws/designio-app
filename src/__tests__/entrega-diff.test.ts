@@ -39,6 +39,7 @@ function constatado(
   p: Partial<ConstatacionDelServicio> & { elementoId: string; titulo: string },
 ): ConstatacionDelServicio {
   return {
+    tipo: 'touchpoint',
     nodoId: null,
     catalogoId: null,
     operacion: 'agrega',
@@ -132,6 +133,27 @@ describe('diff contra el effective state vigente', () => {
     expect(d.filas[0]!.precedente?.elementoId).toBe('viejo');
   });
 
+  it('el respaldo por título NO cruza tipos: un canal y un rol con el mismo nombre son dos cosas', () => {
+    // Sin catálogo y sin nodo, el título es lo único que queda para emparejar. Pero el
+    // título solo desambigua DENTRO de un tipo: «Atención telefónica» como canal (por
+    // dónde entra el cliente) y como rol (quién atiende) son dos elementos lógicos, y
+    // tratarlos como uno hace que el diff mienta en silencio — el peor fallo posible
+    // aquí, porque no hay excepción que lo delate.
+    const d = calcularDiff(
+      [elemento({ id: 'a', titulo: 'Atención telefónica', tipo: 'canal', operacion: 'modifica' })],
+      vigente([
+        constatado({ elementoId: 'v-canal', titulo: 'Atención telefónica', tipo: 'canal' }),
+        constatado({ elementoId: 'v-rol', titulo: 'Atención telefónica', tipo: 'rol' }),
+      ]),
+    );
+    // El precedente es el canal, no el rol que casualmente se llama igual.
+    expect(d.filas[0]!.precedente?.elementoId).toBe('v-canal');
+    // Y el rol sigue vigente: nadie lo ha tocado, así que se mantiene. Con la clave sin
+    // tipo, uno de los dos desaparecía del pliegue y este «se mantiene» salía vacío.
+    expect(d.seMantiene.map((v) => v.elementoId)).toEqual(['v-rol']);
+    expect(d.filas[0]!.senal).toBeNull();
+  });
+
   it('señala la declaración que no cuadra con lo vigente, sin bloquear (I2)', () => {
     const d = calcularDiff(
       [
@@ -199,6 +221,53 @@ describe('pliegue del estado efectivo vigente por identidad lógica', () => {
     expect([...estado.values()]).toEqual([
       expect.objectContaining({ elementoId: 'v2', resultado: 'desviado' }),
     ]);
+  });
+
+  it('dos tipos distintos con el mismo título son dos identidades: el pliegue no machaca', () => {
+    // El pliegue es un Map por identidad lógica: si la clave no distingue el canal del
+    // rol, la segunda constatación PISA a la primera y el estado vigente pierde un
+    // elemento que nadie retiró.
+    const estado = plegarEstadoVigente([
+      constatado({ elementoId: 'v-canal', titulo: 'Atención telefónica', tipo: 'canal' }),
+      constatado({ elementoId: 'v-rol', titulo: 'Atención telefónica', tipo: 'rol' }),
+    ]);
+    expect(estado.size).toBe(2);
+    expect([...estado.values()].map((v) => v.elementoId).sort()).toEqual(['v-canal', 'v-rol']);
+  });
+
+  it('el retiro de un tipo no arrastra al otro que comparte título', () => {
+    // Y la consecuencia peor del pliegue compartido: `retira` borra por CLAVE, así que
+    // retirar el canal se llevaba por delante al rol — una ausencia que nadie constató,
+    // que es justo lo que el estado efectivo no puede afirmar.
+    const estado = plegarEstadoVigente([
+      constatado({ elementoId: 'v-rol', titulo: 'Atención telefónica', tipo: 'rol' }),
+      constatado({
+        elementoId: 'v-canal',
+        titulo: 'Atención telefónica',
+        tipo: 'canal',
+        operacion: 'retira',
+      }),
+    ]);
+    expect([...estado.values()].map((v) => v.elementoId)).toEqual(['v-rol']);
+  });
+
+  it('el respaldo por tipo NO se aplica al catálogo: reclasificar no parte la identidad', () => {
+    // La otra mitad de la regla. Con catálogo o con nodo, la identidad ya está resuelta y
+    // meter el tipo en la clave la haría MÁS frágil: reclasificar un elemento entre
+    // ciclos partiría una cosa en dos, y el diff diría «alta» de algo que lleva ahí
+    // desde el primer ciclo. El tipo solo desempata donde la identidad es una conjetura.
+    const estado = plegarEstadoVigente([
+      constatado({ elementoId: 'v1', titulo: 'Video-verificación', tipo: 'touchpoint', catalogoId: 'cat-video' }),
+      constatado({
+        elementoId: 'v2',
+        titulo: 'Video-verificación',
+        tipo: 'sistema',
+        catalogoId: 'cat-video',
+        operacion: 'modifica',
+      }),
+    ]);
+    expect(estado.size).toBe(1);
+    expect([...estado.values()][0]!.elementoId).toBe('v2');
   });
 
   it('un retiro constatado como se aprobó SACA el elemento del estado vigente', () => {

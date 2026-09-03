@@ -35,6 +35,7 @@ import {
   ETIQUETA_CONCILIACION,
   ETIQUETA_RESULTADO,
   ETIQUETA_TIPO_ELEMENTO,
+  LARGO_MAXIMO,
   OPERACIONES,
   RESULTADOS_CONSTATACION,
   TIPOS_ELEMENTO,
@@ -547,10 +548,15 @@ function AprobarDesignVersion({
         la marca como superada.
       </span>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {/* `maxLength` desde `LARGO_MAXIMO`, el mismo número que el esquema: un texto
+            más largo lo rechaza el ESQUEMA antes del handler, así que no vuelve como
+            `{ ok: false, error }` sino como fallo genérico sobre un control ofrecido
+            habilitado. Es la misma clase que la fecha de despliegue vacía. */}
         <Input
           placeholder="Motivo del snapshot (opcional)"
           value={motivo}
           onChange={(e) => setMotivo(e.target.value)}
+          maxLength={LARGO_MAXIMO.motivo}
           style={{ flex: '1 1 280px' }}
         />
         <Button
@@ -794,12 +800,14 @@ function FormularioElemento({
           placeholder="Qué cambia (una frase)"
           value={titulo}
           onChange={(e) => setTitulo(e.target.value)}
+          maxLength={LARGO_MAXIMO.titulo}
           required
         />
         <Textarea
           placeholder="Detalle (opcional)"
           value={detalle}
           onChange={(e) => setDetalle(e.target.value)}
+          maxLength={LARGO_MAXIMO.detalle}
           rows={2}
         />
         <Select value={nodoId} onChange={(e) => setNodoId(e.target.value)}>
@@ -1083,6 +1091,7 @@ function AsignarAExistente({
         placeholder="Razón de que caiga ahí"
         value={razon}
         onChange={(e) => setRazon(e.target.value)}
+        maxLength={LARGO_MAXIMO.razonDeAsignacion}
         style={{ width: 220 }}
       />
       <Button
@@ -1411,6 +1420,7 @@ function FormularioRelease({
           placeholder="Título del release"
           value={titulo}
           onChange={(e) => setTitulo(e.target.value)}
+          maxLength={LARGO_MAXIMO.titulo}
           required
         />
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -1418,6 +1428,7 @@ function FormularioRelease({
             placeholder="Dueño del release"
             value={responsable}
             onChange={(e) => setResponsable(e.target.value)}
+            maxLength={LARGO_MAXIMO.responsable}
             required
             style={{ flex: '1 1 220px' }}
           />
@@ -1452,6 +1463,7 @@ function FormularioRelease({
                   placeholder="Razón de que caiga en este release"
                   value={seleccion[el.id] ?? ''}
                   onChange={(e) => setSeleccion((s) => ({ ...s, [el.id]: e.target.value }))}
+                  maxLength={LARGO_MAXIMO.razonDeAsignacion}
                   style={{ flex: '1 1 240px' }}
                 />
               )}
@@ -1554,6 +1566,7 @@ function FormularioConstatacion({
           placeholder="Resumen de la constatación (opcional)"
           value={resumen}
           onChange={(e) => setResumen(e.target.value)}
+          maxLength={LARGO_MAXIMO.resumen}
           rows={2}
         />
         {release.elementos.map((el) => {
@@ -1599,6 +1612,7 @@ function FormularioConstatacion({
                         [el.elementoId]: { ...fila, queQuedoDistinto: e.target.value },
                       }))
                     }
+                    maxLength={LARGO_MAXIMO.textoDeDesviacion}
                     required
                   />
                   <Input
@@ -1607,6 +1621,7 @@ function FormularioConstatacion({
                     onChange={(e) =>
                       setFilas((f) => ({ ...f, [el.elementoId]: { ...fila, razon: e.target.value } }))
                     }
+                    maxLength={LARGO_MAXIMO.textoDeDesviacion}
                     required
                   />
                 </>

@@ -16,7 +16,7 @@ import {
   proyectosYaCertificados,
   versionAprobadaDeServicio,
 } from '@/lib/entrega/entrega.functions';
-import type { ResumenDesignVersion } from '@/lib/entrega/entrega.schemas';
+import { LARGO_MAXIMO, type ResumenDesignVersion } from '@/lib/entrega/entrega.schemas';
 import { listaDeJourneys } from '@/lib/journey/journey.functions';
 
 /**
@@ -474,16 +474,22 @@ function FormularioDesignVersion({
             </>
           )}
         </Select>
+        {/* `maxLength` desde `LARGO_MAXIMO`, que es el mismo número que usa el esquema:
+            un texto más largo lo rechaza `CrearDesignVersionSchema` ANTES del handler, así
+            que no vuelve como `{ ok: false, error }` sino como fallo genérico. Aquí el
+            control directamente no deja escribirlo. */}
         <Input
           placeholder="Título de la design version"
           value={titulo}
           onChange={(e) => setTitulo(e.target.value)}
+          maxLength={LARGO_MAXIMO.titulo}
           required
         />
         <Textarea
           placeholder="Qué propone, en una frase (opcional)"
           value={resumen}
           onChange={(e) => setResumen(e.target.value)}
+          maxLength={LARGO_MAXIMO.resumen}
           rows={2}
         />
         <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>

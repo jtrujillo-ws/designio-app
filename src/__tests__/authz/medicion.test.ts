@@ -17,11 +17,13 @@ import {
   abrirOutcomeReview,
   abrirRegistry,
   agregarEntrada,
+  borrarEntrada,
   cargarSnapshotsCsv,
   completarOutcomeReview,
   editarEntrada,
   ErrorMedicion,
   firmarRegistry,
+  guardarBorradorReview,
   registrarResultado,
   pausarProyecto,
   retomarProyecto,
@@ -51,6 +53,7 @@ import {
   proyectoPorRetomar,
 } from '@/lib/medicion/medicion.schemas';
 import { faltaParaAprobarGate } from '@/lib/metodo/metodo.schemas';
+import { hoyCalendario } from '@/lib/fecha-calendario';
 import { describeAuthz } from './helpers';
 
 /**
@@ -459,6 +462,43 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       /entradas incompletas \(SYS-22\): Reintentos medios/,
     );
     expect(await reparos()).toEqual(['entradas incompletas (SYS-22): Reintentos medios']);
+
+    // ── Una entrada que SOBRA se quita; una que sobra y no se puede quitar, bloquea ──
+    // El motivo escrito para no tener DELETE contestaba «¿hace falta borrar para DESHACER
+    // algo?» —no, porque en borrador la entrada se corrige entera y no puede tener
+    // snapshots—. La pregunta real es otra: «¿hace falta borrar para que algo DEJE DE
+    // EXISTIR?». Una entrada creada por error no se arregla editándola, porque el problema no
+    // es su contenido sino su presencia; y encima BLOQUEA, porque la firma exige toda entrada
+    // completa y el registry es 1:1 con el reto. Sin borrado, la única salida era inventarse
+    // un KPI para poder firmar — justo lo que este slice existe para impedir.
+    const sobra = await agregarEntrada(leadId, {
+      workspaceId: ws,
+      registryId,
+      criterioId: criterioAbandonoId,
+      nombre: 'KPI creado por error',
+      definicion: '',
+      fuente: '',
+      dimensiones: '',
+      propietarioMiembroId: null,
+      frecuencia: 'mensual',
+      dashboardUrl: '',
+      lineaBaseValor: null,
+      lineaBaseFecha: null,
+      ventanaInicio: null,
+      fechaPostMortem: null,
+    });
+    // La entrada que sobra aparece en los reparos y arrastra los suyos: sin ventana ni línea
+    // base también incumple las reglas de coherencia. No se puede firmar con ella dentro.
+    expect(await reparos()).toContain(
+      'entradas incompletas (SYS-22): KPI creado por error, Reintentos medios',
+    );
+    expect((await reparos()).length).toBeGreaterThan(1);
+    await borrarEntrada(leadId, { workspaceId: ws, entradaId: sobra.entradaId });
+    expect(await reparos()).toEqual(['entradas incompletas (SYS-22): Reintentos medios']);
+    // Y el borrado deja RASTRO, como toda escritura del slice: lo emite la base.
+    const [borrado] = await sqlAdmin()`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'EntradaKpiBorrada' order by creado_en desc limit 1`;
+    expect((borrado!.payload as Record<string, unknown>).entradaId).toBe(sobra.entradaId);
 
     // Post-mortem previsto ANTES del cierre de la ventana: comprometerse a un veredicto
     // sobre datos que aún no existen.
@@ -1669,6 +1709,41 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const entera = sinTope!.entradas.find((e) => e.id === entradaAbandonoId)!;
     expect(entera.totalSnapshots).toBe(entera.snapshots.length);
 
+    // ── El borrador del post mortem se GUARDA sin completarlo ──
+    // Había un lector sin escritor: la base admite y AUDITA los updates del review en
+    // borrador, y la pantalla hidrata el formulario desde lo guardado — pero la única acción
+    // era completar, que es irreversible. Así que navegar, recargar o toparse con una
+    // validación tiraba los cinco campos narrativos, que es texto redactado a mano y lo caro
+    // de un post mortem; y el review completado es inmutable, así que no vuelve.
+    await guardarBorradorReview(leadId, {
+      workspaceId: ws,
+      reviewId,
+      // SIN veredicto: se guarda la redacción antes de tener el dictamen, que es para lo
+      // que sirve guardar. Exigirlo obligaría a elegir un veredicto para conservar media
+      // redacción — la presión por concluir que SYS-24 nombra como riesgo.
+      veredicto: null,
+      contribucion: 'Media redacción que todavía no cierra nada',
+      factoresExternos: 'Cambió el proveedor de verificación a mitad de ventana',
+      hipotesisAbiertas: '',
+      aprendizajes: '',
+      disenoExperimentalSuficiente: false,
+      disenoExperimentalJustificacion: '',
+    });
+    const guardado = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    // Sigue en BORRADOR: guardar no es firmar. El reto no se ha cerrado ni tiene veredicto.
+    expect(guardado!.review!.estado).toBe('borrador');
+    expect(guardado!.review!.contribucion).toBe('Media redacción que todavía no cierra nada');
+    expect(guardado!.review!.factoresExternos).toBe(
+      'Cambió el proveedor de verificación a mitad de ventana',
+    );
+    expect(guardado!.retoEstado).toBe('en-medicion');
+    // Y el guardado deja su rastro con el «antes», que es lo que hace auditable una edición.
+    const [editado] = await sqlAdmin()`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'OutcomeReviewEditado' order by creado_en desc limit 1`;
+    expect((editado!.payload as Record<string, unknown>).contribucion).toBe(
+      'Media redacción que todavía no cierra nada',
+    );
+
     // Con UN criterio resuelto y el otro no, el post mortem todavía no se puede completar:
     // el guard del cierre lo rechaza mientras falte el resultado de cualquier criterio. La
     // pantalla lo dice ANTES en vez de ofrecer el botón y dejar que el lead lo descubra por
@@ -2753,6 +2828,34 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: viejo.retoId })).rejects.toThrow(
       /ya está abierta/,
     );
+  });
+
+  it('el «hoy» de la pantalla es el día LOCAL, no el de UTC', () => {
+    // Una fecha de calendario no es un instante, y `toISOString()` sí lo es: convierte a UTC
+    // y recorta. El máximo del selector de snapshots salía de ahí, así que al oeste de UTC
+    // por la tarde dejaba elegir MAÑANA —que `snapshot_insert` rechaza por `fecha <=
+    // current_date`— y al este, cerca de medianoche, escondía el día local en curso y el dato
+    // de la jornada se quedaba sin poder cargarse. El formulario de importación ya lo hacía
+    // bien por este mismo motivo: eran dos redacciones de «qué día es hoy» y mandaba la que
+    // no sabía. Ahora hay una y la comprueban los dos extremos del huso.
+    //
+    // El huso se fija en el test porque la suite corre en UTC, que es justo el único sitio
+    // donde el defecto no se ve: con TZ=UTC las dos redacciones coinciden y un test escrito
+    // sin esto pasaría con la implementación rota.
+    const previo = process.env.TZ;
+    try {
+      process.env.TZ = 'America/Bogota';
+      const tardeAlOeste = new Date('2026-08-01T23:30:00-05:00'); // 04:30Z del día 2
+      expect(tardeAlOeste.toISOString().slice(0, 10)).toBe('2026-08-02');
+      expect(hoyCalendario(tardeAlOeste)).toBe('2026-08-01');
+
+      process.env.TZ = 'Asia/Tokyo';
+      const madrugadaAlEste = new Date('2026-08-02T00:30:00+09:00'); // 15:30Z del día 1
+      expect(madrugadaAlEste.toISOString().slice(0, 10)).toBe('2026-08-01');
+      expect(hoyCalendario(madrugadaAlEste)).toBe('2026-08-02');
+    } finally {
+      process.env.TZ = previo;
+    }
   });
 
   it('la cadencia es un compromiso de CALENDARIO: «mensual» es el mes siguiente, no 30 días', async () => {

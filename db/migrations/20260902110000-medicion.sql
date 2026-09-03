@@ -621,6 +621,30 @@ create policy entrada_update on entrada_kpi
 -- Snapshots: quien tiene el dato lo aporta. El propietario del dato es SIEMPRE del cliente
 -- (RF-07.1, exigido al escribir la entrada y al firmar): sin esta rama, medir dependería
 -- de que la boutique transcriba, que es justo el compromiso que G6 formaliza.
+-- ── Y una entrada que SOBRA se quita, mientras el contrato sigue en borrador ──
+-- El motivo escrito para no tener DELETE respondía a otra pregunta. Decía —con razón— que
+-- en borrador la entrada se corrige ENTERA y no puede tener snapshots, así que no hay estado
+-- que solo el borrado pudiera deshacer. Eso contesta «¿hace falta borrar para DESHACER algo?».
+-- La pregunta que de verdad se hace es otra: «¿hace falta borrar para que algo DEJE DE
+-- EXISTIR?». Una entrada creada por error no se arregla editándola, porque el problema no es
+-- su contenido sino su PRESENCIA — y además bloquea: la firma exige toda entrada completa, y
+-- el registry es 1:1 con el reto, así que la única salida era inventarse un KPI para poder
+-- firmar, o borrar a mano en la base. Inventar un KPI en el contrato que el cliente firma es
+-- exactamente lo que este slice existe para impedir.
+--
+-- Se acota igual que la edición y por el mismo motivo: solo mientras el registry es BORRADOR.
+-- Firmar es lo que congela, y después la entrada es parte de un contrato acordado — ahí sí
+-- «no hay estado que deshacer» es la respuesta correcta. Y en borrador la entrada no puede
+-- tener snapshots (`snapshot_insert` exige el registry firmado), así que quitarla no deja
+-- ninguna serie huérfana: no hay nada colgando.
+create policy entrada_delete on entrada_kpi
+  for delete using (
+    workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and exists (select 1 from metric_registry r
+      where r.id = entrada_kpi.registry_id and r.workspace_id = entrada_kpi.workspace_id
+        and r.estado = 'borrador')
+  );
+
 create policy snapshot_insert on snapshot
   for insert with check (
     creado_por = app_user_id()
@@ -2265,18 +2289,29 @@ end $$;
 create function medicion_auditoria() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
-  fila jsonb := to_jsonb(new);
-  previa jsonb := case when tg_op = 'UPDATE' then to_jsonb(old) end;
+  -- En un DELETE no hay `new`, y nombrarlo aquí reventaría el trigger: la fila auditada es
+  -- `old`. Se asigna en el cuerpo y no en la declaración justamente por eso.
+  fila jsonb;
+  previa jsonb;
   cuerpo jsonb;
   evento text;
 begin
+  if tg_op = 'DELETE' then
+    fila := to_jsonb(old);
+  else
+    fila := to_jsonb(new);
+    if tg_op = 'UPDATE' then previa := to_jsonb(old); end if;
+  end if;
   -- Guard compartido entre tablas con columnas distintas: se trabaja sobre jsonb porque
   -- plpgsql resuelve TODAS las referencias de campo aunque su rama no se ejecute.
   if tg_table_name = 'metric_registry' then
     evento := 'MetricRegistryAbierto';
     cuerpo := jsonb_build_object('registryId', fila->'id', 'retoId', fila->'reto_id');
   elsif tg_table_name = 'entrada_kpi' then
-    evento := case tg_op when 'INSERT' then 'EntradaKpiAgregada' else 'EntradaKpiEditada' end;
+    evento := case tg_op
+      when 'INSERT' then 'EntradaKpiAgregada'
+      when 'DELETE' then 'EntradaKpiBorrada'
+      else 'EntradaKpiEditada' end;
     cuerpo := jsonb_build_object('entradaId', fila->'id', 'registryId', fila->'registry_id')
       || entrada_kpi_contenido(fila);
     -- El «antes» es lo que hace auditable una EDICIÓN: sin él, el rastro dice que alguien
@@ -2297,7 +2332,7 @@ begin
     -- mortem —la pieza de la que sale el veredicto de un reto— era lo único del slice que
     -- se podía reescribir sin que nadie pudiera decir quién lo cambió ni qué reemplazó.
     if tg_op = 'UPDATE' and fila->>'estado' <> 'borrador' then
-      return new;
+      return null;
     end if;
     evento := case tg_op when 'INSERT' then 'OutcomeReviewAbierto'
                          else 'OutcomeReviewEditado' end;
@@ -2323,16 +2358,19 @@ begin
   -- que quitar la clave nula borraría de qué tipo de resultado se trataba; y en `antes`
   -- convertiría «este campo estaba vacío y ahora tiene valor» en «este campo no se
   -- audita». El rastro dice lo que había, incluido que no había nada.
+  -- El workspace sale de `fila`, que es `new` u `old` según la operación: en un DELETE no hay
+  -- `new` que nombrar, y el rastro de una fila borrada es tan escritura como los demás.
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-    values (new.workspace_id, evento, cuerpo,
-      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
-  return new;
+    values ((fila->>'workspace_id')::uuid, evento, cuerpo,
+      app_user_id(), workspace_role(app_user_id(), (fila->>'workspace_id')::uuid));
+  return null;
 end $$;
 -- AFTER: el rastro se emite cuando la escritura ya es un hecho, no cuando se propone.
 create trigger registry_auditoria
   after insert on metric_registry for each row execute function medicion_auditoria();
 create trigger entrada_auditoria
-  after insert or update on entrada_kpi for each row execute function medicion_auditoria();
+  after insert or update or delete on entrada_kpi
+  for each row execute function medicion_auditoria();
 create trigger snapshot_auditoria
   after insert on snapshot for each row execute function medicion_auditoria();
 create trigger review_auditoria
@@ -2371,6 +2409,10 @@ grant update (estado, firmado_por) on metric_registry to designio_app;
 grant update (nombre, definicion, fuente, dimensiones, criterio_id, propietario_miembro_id,
   frecuencia, dashboard_url, linea_base_valor, linea_base_fecha, ventana_inicio,
   fecha_post_mortem) on entrada_kpi to designio_app;
+-- Y el BORRADO, que la política acota al registry en borrador: una entrada que sobra no se
+-- arregla editándola. Es lo único de este slice que quita una fila, y solo puede quitarla
+-- mientras el contrato no está firmado.
+grant delete on entrada_kpi to designio_app;
 -- snapshot SIN update ni delete: append-only por ausencia de política Y de grant (SYS-23).
 grant update (estado, veredicto, contribucion, factores_externos, hipotesis_abiertas,
   aprendizajes, diseno_experimental_suficiente, diseno_experimental_justificacion,

@@ -8,6 +8,7 @@ import {
   motivoFechaDeSnapshot,
   ValorMetricoSchema,
   type CargarCsv,
+  type BorradorReview,
   type CompletarReview,
   type CrearEntrada,
   type EditarEntrada,
@@ -571,6 +572,92 @@ export async function retomarProyecto(
       );
     }
     return { proyectoId: entrada.proyectoId, estado: destino };
+  });
+}
+
+/**
+ * BORRAR una entrada KPI mientras el contrato sigue en borrador (RF-07.2).
+ *
+ * El motivo por el que este slice no tenía DELETE respondía a otra pregunta: decía que en
+ * borrador la entrada se corrige entera y no puede tener snapshots, o sea que no hay estado
+ * que solo el borrado pudiera deshacer. Eso contesta «¿hace falta borrar para DESHACER algo?».
+ * La pregunta real es «¿hace falta borrar para que algo DEJE DE EXISTIR?»: una entrada creada
+ * por error no se arregla editándola, porque el problema no es su contenido sino su presencia
+ * — y además BLOQUEA, porque la firma exige toda entrada completa y el registry es 1:1 con el
+ * reto. La única salida era inventarse un KPI para poder firmar, que es justo lo que este
+ * slice existe para impedir.
+ *
+ * La política lo acota al registry en BORRADOR, igual que la edición y por lo mismo: firmar
+ * es lo que congela. Y en borrador la entrada no puede tener snapshots, así que quitarla no
+ * deja ninguna serie huérfana.
+ */
+export async function borrarEntrada(
+  actorId: string,
+  entrada: { workspaceId: string; entradaId: string },
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [dueno] = await tx`select r.reto_id from entrada_kpi e
+      join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
+      where e.id = ${entrada.entradaId} and e.workspace_id = ${entrada.workspaceId}`;
+    if (!dueno) throw new ErrorMedicion('La entrada no existe en este workspace');
+    // Mismo candado que el resto del slice: quitar una entrada y FIRMAR el contrato deciden
+    // sobre lo mismo desde tablas distintas, así que sin cita la firma validaría un conjunto
+    // de entradas y congelaría otro.
+    await bloquearReto(tx, dueno.reto_id as string);
+    const borrada = await tx`delete from entrada_kpi
+      where id = ${entrada.entradaId} and workspace_id = ${entrada.workspaceId}
+      returning id`;
+    if (borrada.length === 0) {
+      throw new ErrorMedicion(
+        'No se puede quitar esta entrada: el contrato ya está firmado o no puedes editarlo',
+      );
+    }
+  });
+}
+
+/**
+ * GUARDAR el borrador del post mortem sin completarlo (RF-07.7).
+ *
+ * Había un lector sin escritor: la base ADMITE y AUDITA los updates del review en borrador
+ * —la política los deja pasar en su WITH CHECK y el rastro tiene su propio evento— y la
+ * pantalla HIDRATA el formulario desde el borrador guardado. Faltaba lo del medio, así que la
+ * única acción era completar, que es irreversible: navegar, recargar o toparse con una
+ * validación tiraba los cinco campos narrativos. Y lo que se pierde ahí es texto redactado a
+ * mano, que es lo caro de un post mortem — y el review completado es inmutable, así que no
+ * vuelve.
+ *
+ * No escribe `completado_por` ni `completado_en` ni mueve el estado: guardar no es firmar. Su
+ * esquema tampoco es el del cierre, porque guardar existe para poder dejarlo a medias.
+ */
+export async function guardarBorradorReview(
+  actorId: string,
+  entrada: BorradorReview,
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [dueno] = await tx`select estado, reto_id from outcome_review
+      where id = ${entrada.reviewId} and workspace_id = ${entrada.workspaceId}`;
+    if (!dueno) throw new ErrorMedicion('El outcome review no existe en este workspace');
+    if (dueno.estado === 'completado') {
+      throw new ErrorMedicion('El outcome review ya está completado: es inmutable (SYS-08)');
+    }
+    await bloquearReto(tx, dueno.reto_id as string);
+    const guardado = await tx`
+      update outcome_review
+      set veredicto = ${entrada.veredicto},
+          contribucion = ${entrada.contribucion},
+          factores_externos = ${entrada.factoresExternos},
+          hipotesis_abiertas = ${entrada.hipotesisAbiertas},
+          aprendizajes = ${entrada.aprendizajes},
+          diseno_experimental_suficiente = ${entrada.disenoExperimentalSuficiente},
+          diseno_experimental_justificacion = ${entrada.disenoExperimentalJustificacion}
+      where id = ${entrada.reviewId} and workspace_id = ${entrada.workspaceId}
+        and estado = 'borrador'
+      returning id`;
+    if (guardado.length === 0) {
+      throw new ErrorMedicion('No puedes guardar este post mortem: lo redacta el lead');
+    }
   });
 }
 

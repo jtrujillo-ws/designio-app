@@ -2,10 +2,12 @@ import { createServerFn } from '@tanstack/react-start';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { requerirUsuarioId, usuarioIdDeRequest } from '@/lib/auth/guardia.server';
 import {
+  BorradorReviewSchema,
   CargarCsvSchema,
   CompletarReviewSchema,
   CrearEntradaSchema,
   EditarEntradaSchema,
+  EntradaInputSchema,
   RegistrarSnapshotSchema,
   RegistryInputSchema,
   ResultadoCriterioSchema,
@@ -16,12 +18,14 @@ import {
   abrirMedicion,
   abrirOutcomeReview,
   abrirRegistry,
+  borrarEntrada,
   agregarEntrada,
   cargarSnapshotsCsv,
   completarOutcomeReview,
   editarEntrada,
   ErrorMedicion,
   firmarRegistry,
+  guardarBorradorReview,
   registrarResultado,
   pausarProyecto,
   retomarProyecto,
@@ -124,6 +128,36 @@ export const abrirMedicionDelReto = createServerFn({ method: 'POST' })
     try {
       const r = await abrirMedicion(actorId, data);
       return { ok: true as const, proyectos: r.proyectos };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+export const borrarEntradaKpi = createServerFn({ method: 'POST' })
+  .inputValidator(EntradaInputSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await borrarEntrada(actorId, data);
+      return { ok: true as const };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+export const guardarBorradorDelReview = createServerFn({ method: 'POST' })
+  .inputValidator(BorradorReviewSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await guardarBorradorReview(actorId, data);
+      return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

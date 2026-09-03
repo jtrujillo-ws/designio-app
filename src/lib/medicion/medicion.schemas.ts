@@ -160,6 +160,12 @@ export const RegistryInputSchema = z.object({
   registryId: z.string().uuid(),
 });
 
+/** Quitar una entrada del contrato en borrador: solo hace falta decir CUÁL. */
+export const EntradaInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  entradaId: z.string().uuid(),
+});
+
 export const RegistrarSnapshotSchema = z.object({
   workspaceId: z.string().uuid(),
   entradaId: z.string().uuid(),
@@ -221,6 +227,36 @@ export const CompletarReviewSchema = z
     path: ['disenoExperimentalJustificacion'],
   });
 export type CompletarReview = z.infer<typeof CompletarReviewSchema>;
+
+/**
+ * GUARDAR el borrador del post mortem, que es otra escritura y por eso otro esquema.
+ *
+ * Completar es irreversible y por eso exige la contribución escrita y la justificación del
+ * diseño experimental; guardar el borrador es lo contrario — existe justamente para poder
+ * dejar el texto a medias y volver mañana—, así que esas dos exigencias no aplican. Con el
+ * esquema del cierre, el guardado habría rechazado el borrador a medio escribir: el único
+ * estado en el que alguien quiere guardar.
+ *
+ * El veredicto viaja porque la columna existe desde que el review se abre y el lead puede
+ * tenerlo ya elegido; lo que NO hace guardar es firmarlo — eso es `completado_por` y solo lo
+ * escribe el cierre.
+ */
+export const BorradorReviewSchema = z.object({
+  workspaceId: z.string().uuid(),
+  reviewId: z.string().uuid(),
+  /** NULLABLE, y es la diferencia que importa: la columna lo admite mientras el review es
+   * borrador, y guardar existe para poder escribir la narrativa ANTES de tener el veredicto.
+   * Exigirlo aquí obligaría a elegir un dictamen para poder guardar media redacción, que es
+   * justo la presión por concluir que SYS-24 nombra como riesgo. */
+  veredicto: z.enum(VEREDICTOS).nullable(),
+  contribucion: z.string().trim().max(8000),
+  factoresExternos: z.string().trim().max(8000).default(''),
+  hipotesisAbiertas: z.string().trim().max(8000).default(''),
+  aprendizajes: z.string().trim().max(8000).default(''),
+  disenoExperimentalSuficiente: z.boolean().default(false),
+  disenoExperimentalJustificacion: z.string().trim().max(4000).default(''),
+});
+export type BorradorReview = z.infer<typeof BorradorReviewSchema>;
 
 // ── Proyección de lectura del seguimiento de impacto (vive DENTRO del proyecto: RF-07.6) ──
 

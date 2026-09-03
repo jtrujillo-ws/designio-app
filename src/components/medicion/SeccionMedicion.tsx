@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Button } from '@/components/ui/Button';
+import { hoyCalendario } from '@/lib/fecha-calendario';
 import { Card } from '@/components/ui/Card';
 import { Checkbox } from '@/components/ui/Checkbox';
 import { Input } from '@/components/ui/Input';
@@ -17,6 +18,8 @@ import {
   completarReviewDelReto,
   editarEntradaKpi,
   firmarMetricRegistry,
+  borrarEntradaKpi,
+  guardarBorradorDelReview,
   pausarProyectoDelReto,
   retomarProyectoDelReto,
   guardarResultadoDeCriterio,
@@ -279,6 +282,12 @@ function BloqueRegistry({
             entrada={entrada}
             editable={esCurador && !firmado}
             onEditar={() => setEditando(entrada.id)}
+            onQuitar={() =>
+              void accion(
+                () => borrarEntradaKpi({ data: { workspaceId, entradaId: entrada.id } }),
+                'No se pudo quitar el KPI; intenta de nuevo',
+              )
+            }
           />
         ),
       )}
@@ -432,10 +441,12 @@ function FichaEntrada({
   entrada,
   editable,
   onEditar,
+  onQuitar,
 }: {
   entrada: EntradaDeRegistry;
   editable: boolean;
   onEditar: () => void;
+  onQuitar: () => void;
 }) {
   return (
     <div
@@ -457,9 +468,17 @@ function FichaEntrada({
           {ETIQUETA_ESTADO_SNAPSHOT[entrada.estadoSnapshot]}
         </span>
         {editable && (
-          <Button size="sm" variant="ghost" onClick={onEditar}>
-            Editar
-          </Button>
+          <>
+            <Button size="sm" variant="ghost" onClick={onEditar}>
+              Editar
+            </Button>
+            {/* Una entrada que SOBRA no se arregla editándola: el problema no es su contenido
+                sino su presencia, y además bloquea la firma, que exige toda entrada completa.
+                Solo mientras el contrato es borrador — firmar es lo que congela. */}
+            <Button size="sm" variant="ghost" onClick={onQuitar}>
+              Quitar
+            </Button>
+          </>
         )}
       </div>
       <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-body)' }}>
@@ -709,7 +728,11 @@ function FormularioEntrada({
 /** Último día que la base aceptaría para un snapshot: el cierre de la ventana firmada o
  * hoy, lo que llegue antes. */
 function maxFechaDeSnapshot(entrada: EntradaDeRegistry): string {
-  const hoy = new Date().toISOString().slice(0, 10);
+  // El hoy LOCAL, no el de UTC: `toISOString()` convierte a instante y recorta, así que al
+  // oeste de UTC por la tarde dejaba elegir mañana —que la política rechaza— y al este, cerca
+  // de medianoche, escondía el día en curso. Sale de `hoyCalendario`, la misma función que
+  // usa el formulario de importación: dos redacciones de «qué día es hoy» son dos verdades.
+  const hoy = hoyCalendario();
   return entrada.ventanaFin !== null && entrada.ventanaFin < hoy ? entrada.ventanaFin : hoy;
 }
 
@@ -1030,6 +1053,22 @@ function BloqueReview({
     }
   }
 
+  /** Guardar sin completar: misma forma que `completar`, sin la parte irreversible. */
+  async function guardarBorrador() {
+    if (!review) return;
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await guardarBorradorDelReview({ data: borrador });
+      if (r.ok) await onCambio();
+      else onError(r.error);
+    } catch {
+      onError('No se pudo guardar el borrador; intenta de nuevo');
+    } finally {
+      setOcupado(false);
+    }
+  }
+
   async function completar() {
     if (!review) return;
     setOcupado(true);
@@ -1215,7 +1254,21 @@ function BloqueReview({
                     Falta para poder completarlo: {falta.join(' · ')}
                   </span>
                 )}
-                <div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {/* GUARDAR sin completar. Completar es irreversible, así que sin esto la
+                      única forma de conservar los cinco campos narrativos era cerrar el reto:
+                      navegar, recargar o toparse con una validación tiraba texto redactado a
+                      mano, que es lo caro de un post mortem — y el review completado es
+                      inmutable, así que no vuelve. La base ya admitía y auditaba el borrador
+                      y la pantalla ya lo hidrataba: faltaba lo del medio. */}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={ocupado}
+                    onClick={() => void guardarBorrador()}
+                  >
+                    Guardar borrador
+                  </Button>
                   <Button
                     size="sm"
                     disabled={ocupado || falta.length > 0}

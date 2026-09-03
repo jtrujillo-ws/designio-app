@@ -23,7 +23,8 @@ import {
   ErrorMedicion,
   firmarRegistry,
   registrarResultado,
-  retomarProyectoAMedicion,
+  pausarProyecto,
+  retomarProyecto,
   SNAPSHOTS_POR_ENTRADA,
   registrarSnapshot,
   seguimientoDeImpacto,
@@ -44,7 +45,11 @@ import {
   type CompletarReview,
 } from '@/lib/medicion/medicion.schemas';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
-import { proyectoPorRetomar } from '@/lib/medicion/medicion.schemas';
+import {
+  destinoAlRetomar,
+  proyectoPorPausar,
+  proyectoPorRetomar,
+} from '@/lib/medicion/medicion.schemas';
 import { faltaParaAprobarGate } from '@/lib/metodo/metodo.schemas';
 import { describeAuthz } from './helpers';
 
@@ -2617,14 +2622,34 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // Implementando también se puede parar — y retomar es DETERMINISTA: con el G6 aprobado
     // vuelve a implementación, no a 'activo', que sería andar hacia atrás en el método y
     // dejarlo saltar a medición saltándose la fase que acaba de empezar.
-    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
-      where id = ${actVieja.proyectoId}`);
+    // Y las dos por la RUTA DEL PRODUCTO, que es lo que faltaba: la tabla declaraba los
+    // pares de pausar y de retomar antes de que el reto midiera, y ningún camino los
+    // recorría. Un reto ACTIVO con su único proyecto parado tras G6 no tenía entonces ni
+    // acción de abrir la medición —no queda nadie en implementación a quien mover— ni acción
+    // de volver: la reanudación exigía el reto ya midiendo. Callejón con el par declarado.
+    const segAntesDePausar = await seguimientoDeImpacto(leadId, ws, actVieja.proyectoId);
+    expect(proyectoPorPausar(segAntesDePausar!)).toBe(true);
+    await pausarProyecto(leadId, { workspaceId: ws, proyectoId: actVieja.proyectoId });
+    const segParado = await seguimientoDeImpacto(leadId, ws, actVieja.proyectoId);
+    expect(segParado!.proyectoEstado).toBe('pausado');
+    // Parado no se vuelve a parar, y el destino de la vuelta es UNO y lo dicta la regla, no
+    // la pantalla: con el G6 aprobado y el reto todavía sin medir, implementación.
+    expect(proyectoPorPausar(segParado!)).toBe(false);
+    expect(proyectoPorRetomar(segParado!)).toBe(true);
+    expect(destinoAlRetomar(segParado!)).toBe('en-implementacion');
+    // Y por SQL directo el otro destino sigue rechazado: retomar no es elegir.
     await expect(
       conUsuario(leadId, (tx) => tx`update proyecto set estado = 'activo'
         where id = ${actVieja.proyectoId}`),
     ).rejects.toThrow(/vuelve a implementación/);
-    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
-      where id = ${actVieja.proyectoId}`);
+    const vuelta = await retomarProyecto(leadId, {
+      workspaceId: ws,
+      proyectoId: actVieja.proyectoId,
+    });
+    expect(vuelta.estado).toBe('en-implementacion');
+    const segVuelto = await seguimientoDeImpacto(leadId, ws, actVieja.proyectoId);
+    expect(segVuelto!.proyectoEstado).toBe('en-implementacion');
+    expect(proyectoPorRetomar(segVuelto!)).toBe(false);
 
     await aprobarGateNumero(7, actVieja.proyectoId);
 
@@ -3310,7 +3335,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     const segPausado = await seguimientoDeImpacto(leadId, ws, bId);
     expect(segPausado!.proyectoEstado).toBe('pausado');
     expect(proyectoPorRetomar(segPausado!)).toBe(true);
-    await retomarProyectoAMedicion(leadId, { workspaceId: ws, proyectoId: bId });
+    await retomarProyecto(leadId, { workspaceId: ws, proyectoId: bId });
     const [tras] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
       where id = ${bId}`);
     expect(tras!.estado).toBe('en-medicion');

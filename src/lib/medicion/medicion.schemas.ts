@@ -305,6 +305,8 @@ export type SeguimientoDeImpacto = {
   /** G7 del proyecto que se mira: a medición se entra por G7, así que es la precondición
    * del botón de RETOMAR igual que lo es del guard. */
   proyectoG7Aprobado: boolean;
+  /** Y su G6, que decide el DESTINO de la reanudación mientras el reto no mide. */
+  proyectoG6Aprobado: boolean;
   registry: { id: string; estado: 'borrador' | 'firmado'; firmadoEn: string | null } | null;
   entradas: EntradaDeRegistry[];
   /** Criterios del reto sin KPI que los responda: la firma los exige (SYS-22). */
@@ -389,15 +391,57 @@ export function medicionPorAbrir(seguimiento: {
  * entra por G7— y el reto ya midiendo. Ofrecerlo sin la del gate sería el botón que promete
  * lo que la base niega, que es la avería que este slice ya ha corregido en todos los demás.
  */
+export function destinoAlRetomar(seguimiento: {
+  retoEstado: string;
+  proyectoG6Aprobado: boolean;
+  proyectoG7Aprobado: boolean;
+  medicionSinRegistry: boolean;
+  registry: { estado: 'borrador' | 'firmado' } | null;
+}): 'activo' | 'en-implementacion' | 'en-medicion' {
+  // Con el reto midiendo, la reanudación entra en medición CON él y no por detrás (§5.2)…
+  // salvo la excepción exacta del reto HEREDADO cuyo proyecto todavía no puede seguirlo —le
+  // faltan su G7 o el contrato firmado—: ahí la vuelta es a la fase que le toca, que es
+  // justamente el camino de reparación. Es el mismo `proyecto_puede_seguir_al_reto` que
+  // aplica el guard, y por eso vive aquí y no dentro del componente.
+  const puedeSeguir =
+    seguimiento.proyectoG7Aprobado && seguimiento.registry?.estado === 'firmado';
+  if (
+    seguimiento.retoEstado === 'en-medicion' &&
+    (!seguimiento.medicionSinRegistry || puedeSeguir)
+  ) {
+    return 'en-medicion';
+  }
+  return seguimiento.proyectoG6Aprobado ? 'en-implementacion' : 'activo';
+}
+
 export function proyectoPorRetomar(seguimiento: {
   retoEstado: string;
   proyectoEstado: string;
+  proyectoG6Aprobado: boolean;
   proyectoG7Aprobado: boolean;
+  medicionSinRegistry: boolean;
+  registry: { estado: 'borrador' | 'firmado' } | null;
+}): boolean {
+  if (seguimiento.proyectoEstado !== 'pausado') return false;
+  // Un reto TERMINADO congela a sus proyectos donde estén (SYS-08 aplicado al hijo).
+  if (seguimiento.retoEstado === 'cerrado' || seguimiento.retoEstado === 'archivado') {
+    return false;
+  }
+  // Y si el destino es medición, hace falta su G7: a medición se entra por G7.
+  return destinoAlRetomar(seguimiento) === 'en-medicion' ? seguimiento.proyectoG7Aprobado : true;
+}
+
+/** ¿Se puede PAUSAR? Los dos orígenes legales, y ninguno más: el que ya mide sigue a su reto
+ * (no hay par) y el cerrado es inmutable. Un reto terminado también congela a los suyos. */
+export function proyectoPorPausar(seguimiento: {
+  retoEstado: string;
+  proyectoEstado: string;
 }): boolean {
   return (
-    seguimiento.proyectoEstado === 'pausado' &&
-    seguimiento.retoEstado === 'en-medicion' &&
-    seguimiento.proyectoG7Aprobado
+    (seguimiento.proyectoEstado === 'activo' ||
+      seguimiento.proyectoEstado === 'en-implementacion') &&
+    seguimiento.retoEstado !== 'cerrado' &&
+    seguimiento.retoEstado !== 'archivado'
   );
 }
 

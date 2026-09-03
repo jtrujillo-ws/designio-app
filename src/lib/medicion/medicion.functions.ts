@@ -23,7 +23,8 @@ import {
   ErrorMedicion,
   firmarRegistry,
   registrarResultado,
-  retomarProyectoAMedicion,
+  pausarProyecto,
+  retomarProyecto,
   registrarSnapshot,
   seguimientoDeImpacto,
 } from './medicion.servicio';
@@ -130,14 +131,29 @@ export const abrirMedicionDelReto = createServerFn({ method: 'POST' })
     }
   });
 
-export const retomarProyectoDeMedicion = createServerFn({ method: 'POST' })
+export const pausarProyectoDelReto = createServerFn({ method: 'POST' })
   .inputValidator(SeguimientoInputSchema)
   .handler(async ({ data }) => {
     const actorId = await usuarioIdDeRequest();
     if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
     try {
-      await retomarProyectoAMedicion(actorId, data);
+      await pausarProyecto(actorId, data);
       return { ok: true as const };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+export const retomarProyectoDelReto = createServerFn({ method: 'POST' })
+  .inputValidator(SeguimientoInputSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      const r = await retomarProyecto(actorId, data);
+      return { ok: true as const, estado: r.estado };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

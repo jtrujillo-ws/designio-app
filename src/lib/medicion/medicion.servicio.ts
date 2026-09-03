@@ -463,40 +463,102 @@ export async function abrirMedicion(
 }
 
 /**
- * Retomar a MEDICIÓN el proyecto que se quedó pausado (§5.2, RF-04.12).
+ * PAUSAR y RETOMAR el proyecto (RF-04.12, §7). Las dos rutas que le faltaban a la tabla.
  *
- * Es la salida que faltaba, y sin ella el esquema estaba sancionando un estado del que el
- * producto no sabía salir. `proyectos_frenan_medicion` deja pasar al proyecto pausado que YA
- * tiene su G7 —«puede volver cuando quiera»—, así que la medición se abre dejándolo atrás; y
- * el par `pausado → en-medicion` es legal en la tabla con su precondición al lado. Pero
- * NINGUNA ruta lo ejecutaba: `abrirMedicion` solo mueve los que están en 'en-implementacion',
- * y el reto acababa sin final, porque el guard del outcome review no cierra mientras quede un
- * proyecto sin cerrar. Un par legal que ningún camino recorre es una promesa a medias, y es
- * la misma lección que el relleno de los retos cerrados: dejarlo quieto solo es una decisión
- * si además PUEDE dejar de estarlo.
+ * Este slice declaró la máquina de estados entera del proyecto —cada par legal con su
+ * precondición al lado— y dejó CUATRO pares sin ninguna ruta de producto que los recorriera:
+ * los dos de pausar y los dos de retomar antes de que el reto mida. Un par legal que ningún
+ * camino recorre es una promesa que la máquina hace y el producto no cumple; y cuando el
+ * estado de origen es alcanzable —lo es: `activo` y `en-implementacion` son el curso normal—
+ * la promesa incumplida es un callejón. El caso que lo destapó: un reto ACTIVO con todos sus
+ * proyectos pausados tras G6 no tenía ni cómo abrir la medición (no queda nadie en
+ * implementación a quien mover) ni cómo retomar (la reanudación exigía el reto ya midiendo).
  *
- * No repite ninguna precondición: las tres —par legal, G7 aprobado y reto midiendo— viven en
- * `proyecto_estado_transicion_guard` y esta operación solo las invoca. Lo que sí hace es
- * tomar el candado del reto primero, como todas las rutas de este slice, para no decidir
- * sobre una instantánea; y convertir el cero filas en un motivo, que es lo que separa un
- * rechazo de un silencio.
+ * Retomar es UNA operación y no tres porque el destino es DETERMINISTA, y eso ya estaba
+ * escrito en el guard: manda dónde está el reto y, si todavía no mide, si el plan estaba
+ * aprobado. Ofrecer el destino como opción del usuario habría convertido la regla en una
+ * pantalla — justo el reparto que este slice bajó al dato.
  */
-export async function retomarProyectoAMedicion(
+export async function pausarProyecto(
   actorId: string,
   entrada: { workspaceId: string; proyectoId: string },
 ): Promise<{ proyectoId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const [proyecto] = await tx`select reto_id, estado from proyecto
+    const [proyecto] = await tx`select reto_id from proyecto
       where id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}`;
     if (!proyecto) throw new ErrorMedicion('El proyecto no existe en este workspace');
     await bloquearReto(tx, proyecto.reto_id as string);
     let movido;
     try {
-      // El estado va en el WHERE y no solo en la lectura: el UPDATE lo reevalúa DESPUÉS del
-      // candado, que es lo único que ve una pausa o una reanudación ajena en vuelo.
+      // Los DOS orígenes legales en una sentencia, y el estado en el WHERE: el UPDATE lo
+      // reevalúa después del candado, que es lo único que ve un movimiento ajeno en vuelo.
+      // Parar es del cliente y no tiene precondición; lo que no se para es lo que ya mide
+      // —el par no existe— ni lo cerrado, que es inmutable (SYS-08).
       movido = await tx`
-        update proyecto set estado = 'en-medicion'
+        update proyecto set estado = 'pausado'
+        where id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}
+          and estado in ('activo', 'en-implementacion')
+        returning id`;
+    } catch (e) {
+      comoErrorDeDominio(e);
+    }
+    if (movido!.length === 0) {
+      throw new ErrorMedicion(
+        'Solo se pausa un proyecto activo o en implementación: el que ya mide sigue con su reto y el cerrado es inmutable (SYS-08)',
+      );
+    }
+    return { proyectoId: entrada.proyectoId };
+  });
+}
+
+/**
+ * Retomar el proyecto pausado, al ÚNICO destino que le corresponde.
+ *
+ * El destino sale de dos preguntas en este orden, que son las del guard: dónde está el RETO
+ * y, si todavía no mide, si el plan ya estaba aprobado. Un proyecto pausado antes del plan
+ * vuelve a 'activo'; uno pausado durante la implementación, a 'en-implementacion'; y
+ * cualquiera de los dos entra en 'en-medicion' si mientras estaba parado su reto abrió la
+ * medición — ahí no puede quedarse por detrás (§5.2).
+ *
+ * No repite ninguna precondición: las tres del par —legalidad, G6/G7 y estado del reto— viven
+ * en `proyecto_estado_transicion_guard` y esta operación solo las invoca. Lo que hace es
+ * tomar el candado del reto primero para no decidir sobre una instantánea, poner el estado en
+ * el WHERE para que el UPDATE lo reevalúe DESPUÉS del candado, y convertir el cero filas en
+ * un motivo: un update filtrado no levanta nada por sí solo.
+ */
+export async function retomarProyecto(
+  actorId: string,
+  entrada: { workspaceId: string; proyectoId: string },
+): Promise<{ proyectoId: string; estado: string }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [proyecto] = await tx`select reto_id from proyecto
+      where id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}`;
+    if (!proyecto) throw new ErrorMedicion('El proyecto no existe en este workspace');
+    await bloquearReto(tx, proyecto.reto_id as string);
+    // El destino se lee DESPUÉS del candado, que es cuando el estado del reto deja de
+    // moverse: decidirlo antes sería elegir contra una instantánea y escribir contra otra.
+    const [ctx] = await tx`
+      select r.estado as reto, r.medicion_sin_registry,
+        exists (select 1 from gate_instancia g
+          where g.proyecto_id = ${entrada.proyectoId} and g.workspace_id = r.workspace_id
+            and g.numero = 6 and g.estado = 'aprobado') as g6,
+        -- «Puede seguir a su reto» es el MISMO predicado que aplica el guard, y aquí decide
+        -- el destino: el reto heredado cuyo proyecto todavía no puede seguirlo vuelve a su
+        -- fase —el camino de reparación— y no a medición, donde el guard lo rechazaría.
+        proyecto_puede_seguir_al_reto(${entrada.proyectoId}::uuid, r.id, r.workspace_id)
+          as puede_seguir
+      from reto r
+      where r.id = ${proyecto.reto_id as string} and r.workspace_id = ${entrada.workspaceId}`;
+    if (!ctx) throw new ErrorMedicion('El reto del proyecto no existe en este workspace');
+    const sigueAlReto =
+      ctx.reto === 'en-medicion' && (!ctx.medicion_sin_registry || ctx.puede_seguir);
+    const destino = sigueAlReto ? 'en-medicion' : ctx.g6 ? 'en-implementacion' : 'activo';
+    let movido;
+    try {
+      movido = await tx`
+        update proyecto set estado = ${destino}
         where id = ${entrada.proyectoId} and workspace_id = ${entrada.workspaceId}
           and estado = 'pausado'
         returning id`;
@@ -504,14 +566,11 @@ export async function retomarProyectoAMedicion(
       comoErrorDeDominio(e);
     }
     if (movido!.length === 0) {
-      // Sin fila afectada el motivo es la POSICIÓN, no el contenido: o no estaba pausado, o
-      // quien pide no puede escribir su estado. Decirlo así evita el silencio de un update
-      // que no escribió nada.
       throw new ErrorMedicion(
-        'Este proyecto no está pausado o no puedes cambiar su estado: solo se retoma a medición un proyecto pausado de un reto que ya mide',
+        'Este proyecto no está pausado o no puedes cambiar su estado: retomar es para un proyecto parado',
       );
     }
-    return { proyectoId: entrada.proyectoId };
+    return { proyectoId: entrada.proyectoId, estado: destino };
   });
 }
 
@@ -1103,6 +1162,13 @@ export async function seguimientoDeImpacto(
         exists (select 1 from gate_instancia g7
           where g7.proyecto_id = p.id and g7.workspace_id = p.workspace_id
             and g7.numero = 7 and g7.estado = 'aprobado') as proyecto_g7,
+        -- Y su G6, que es lo que decide el destino de la reanudación cuando el reto todavía
+        -- no mide: pausado antes del plan vuelve a 'activo'; pausado con el plan aprobado,
+        -- a 'en-implementacion'. La pantalla lo ANUNCIA en vez de ofrecer un menú de
+        -- destinos, porque el destino es una regla y no una decisión de quien pulsa.
+        exists (select 1 from gate_instancia g6
+          where g6.proyecto_id = p.id and g6.workspace_id = p.workspace_id
+            and g6.numero = 6 and g6.estado = 'aprobado') as proyecto_g6,
         case when mr.id is null then null else jsonb_build_object(
           'id', mr.id, 'estado', mr.estado, 'firmadoEn', mr.firmado_en::text) end as registry,
         coalesce((
@@ -1283,6 +1349,7 @@ export async function seguimientoDeImpacto(
       proyectoEstado: fila.proyecto_estado as string,
       medicionSinRegistry: fila.medicion_sin_registry as boolean,
       proyectoG7Aprobado: fila.proyecto_g7 as boolean,
+      proyectoG6Aprobado: fila.proyecto_g6 as boolean,
       registry: fila.registry as SeguimientoDeImpacto['registry'],
       entradas: fila.entradas as SeguimientoDeImpacto['entradas'],
       criteriosSinEntrada: fila.criterios_sin_entrada as SeguimientoDeImpacto['criteriosSinEntrada'],

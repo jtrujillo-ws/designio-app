@@ -17,7 +17,8 @@ import {
   completarReviewDelReto,
   editarEntradaKpi,
   firmarMetricRegistry,
-  retomarProyectoDeMedicion,
+  pausarProyectoDelReto,
+  retomarProyectoDelReto,
   guardarResultadoDeCriterio,
 } from '@/lib/medicion/medicion.functions';
 import {
@@ -33,6 +34,8 @@ import {
   arranqueDelResultado,
   faltaParaCompletar,
   medicionPorAbrir,
+  destinoAlRetomar,
+  proyectoPorPausar,
   proyectoPorRetomar,
   narrativaDelBorrador,
   registryPorAbrir,
@@ -148,6 +151,13 @@ export function SeccionMedicion({
     </>
   );
 }
+
+/** Cómo se dice cada destino de la reanudación, en UN sitio. */
+const ETIQUETA_DESTINO: Record<string, string> = {
+  activo: 'vuelve a activo',
+  'en-implementacion': 'vuelve a implementación',
+  'en-medicion': 'entra en medición',
+};
 
 function BloqueRegistry({
   workspaceId,
@@ -335,17 +345,40 @@ function BloqueRegistry({
         </span>
       )}
 
-      {/* La SALIDA del proyecto que se quedó pausado mientras su reto abría la medición.
-          `proyectosFrenan` lo deja quedarse atrás cuando ya tiene su G7 —«puede volver
-          cuando quiera»— y esa frase solo es verdad si existe el camino de vuelta: sin él,
-          el guard del outcome review no cierra el reto mientras quede un proyecto sin cerrar
-          y el reto se queda SIN FINAL. El par ya era legal en la tabla; lo que faltaba era
-          que algo lo recorriera. */}
+      {/* PARAR y RETOMAR: las dos rutas que le faltaban a la tabla de pares. Este slice
+          declaró la máquina entera del proyecto y cuatro de sus ocho pares no los recorría
+          ningún camino del producto —los dos de pausar y los dos de retomar antes de que el
+          reto mida—, así que un reto activo con todos sus proyectos parados no tenía ni cómo
+          abrir la medición ni cómo volver. Un par legal sin ruta es una promesa que la
+          máquina hace y el producto no cumple. */}
+      {esLead && proyectoPorPausar(seguimiento) && (
+        <div>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={ocupado}
+            onClick={() =>
+              void accion(
+                () => pausarProyectoDelReto({ data: { workspaceId, proyectoId } }),
+                'No se pudo pausar el proyecto; intenta de nuevo',
+              )
+            }
+          >
+            Pausar el proyecto
+          </Button>
+        </div>
+      )}
       {esLead && proyectoPorRetomar(seguimiento) && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <span style={{ font: '400 12px var(--font-sans)', color: 'var(--warn)' }}>
-            Este proyecto se quedó pausado con su reto ya midiendo. Hasta que vuelva a
-            medición, el post mortem no puede cerrar el reto.
+          {/* El destino se ANUNCIA, no se elige: es una regla del método —manda dónde está el
+              reto y, si aún no mide, si el plan estaba aprobado— y ofrecerlo como menú la
+              habría convertido en una pantalla. */}
+          <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
+            {seguimiento.retoEstado === 'en-medicion'
+              ? 'Su reto ya mide: al retomarlo el proyecto entra en medición con él, no por detrás. Hasta entonces el post mortem no puede cerrar el reto.'
+              : seguimiento.proyectoG6Aprobado
+                ? 'Se paró con su plan ya aprobado, así que vuelve a implementación.'
+                : 'Se paró antes de aprobar el plan, así que vuelve a activo.'}
           </span>
           <div>
             <Button
@@ -353,12 +386,12 @@ function BloqueRegistry({
               disabled={ocupado}
               onClick={() =>
                 void accion(
-                  () => retomarProyectoDeMedicion({ data: { workspaceId, proyectoId } }),
+                  () => retomarProyectoDelReto({ data: { workspaceId, proyectoId } }),
                   'No se pudo retomar el proyecto; intenta de nuevo',
                 )
               }
             >
-              Retomar el proyecto a medición
+              Retomar el proyecto ({ETIQUETA_DESTINO[destinoAlRetomar(seguimiento)]})
             </Button>
           </div>
         </div>

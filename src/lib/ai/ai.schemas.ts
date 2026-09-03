@@ -90,6 +90,17 @@ export const DESTINO_DE_CAPACIDAD: Record<CapacidadActiva, Destino> = {
  * humana necesita. Y es una AFIRMACIÓN del modelo, no una medida — la medida de verdad es la
  * fidelidad de las citas, que se calcula contra el material.
  */
+/**
+ * Cuántos criterios como MÁXIMO puede traer una respuesta de C0, y por tanto cuántas
+ * propuestas puede respaldar una sola llamada de esa capacidad. Vive aquí, en un único
+ * sitio, porque la sostienen tres capas que tienen que decir lo mismo: el esquema de salida
+ * que se le manda al proveedor, el parseo que valida lo que devuelve, y —desde la migración
+ * de este slice— un CHECK sobre el orden dentro del lote, para que la cota la imponga la
+ * base y no dependa de que el servicio inserte de a cuatro. Subirla aquí obliga a mover la
+ * migración: hay una prueba que lo comprueba insertando exactamente esta cantidad y una más.
+ */
+export const MAX_CRITERIOS_POR_LOTE = 4;
+
 export const CONFIANZA_PROPUESTA = ['alta', 'media', 'baja'] as const;
 export const CONFIANZA_PROPUESTA_NUMERICA: Record<(typeof CONFIANZA_PROPUESTA)[number], number> =
   { alta: 0.9, media: 0.6, baja: 0.3 };

@@ -59,6 +59,11 @@ export type IntentoProveedor = {
    * el libro afirmara en falso bajo qué permiso salió el material. `null` cuando el
    * material no es de personas. */
   consentimientoVersion: number | null;
+  /** La línea del libro de costos que se abrió ANTES de despachar este intento. Existe
+   * siempre —sin línea no hay despacho— y es la fila que después se completa con el
+   * desenlace. Que el id venga de aquí es lo que permite que anotar el gasto no dependa de
+   * que la transacción POSTERIOR a la llamada salga bien. */
+  registroId: string;
 };
 
 /**
@@ -201,6 +206,16 @@ export type Revalidacion =
   | { ok: true; consentimientoVersion: number | null }
   | { ok: false; motivo: string };
 
+/**
+ * Lo que el adaptador tiene que poder hacer ANTES de cada despacho: abrir la línea del
+ * libro para ese intento. No sabe de base de datos, así que la abre quien sí sabe y le
+ * devuelve el id — o un motivo, y entonces NO se despacha. Ese orden es la regla: no se
+ * gasta lo que no se puede anotar.
+ */
+export type ApunteDespacho =
+  | { ok: true; registroId: string }
+  | { ok: false; motivo: string };
+
 export async function generarConProveedor(entrada: {
   key: string;
   capacidad: CapacidadActiva;
@@ -220,6 +235,21 @@ export async function generarConProveedor(entrada: {
    * despacha— y el respaldo saldría sin él.
    */
   revalidar?: () => Promise<Revalidacion>;
+  /**
+   * Se llama ANTES de CADA despacho y abre su línea en el libro de costos; si no puede,
+   * no hay despacho.
+   *
+   * El orden importa y es el arreglo entero: antes la fila se escribía al VOLVER, así que
+   * un fallo transitorio de esa transacción borraba del libro —y del tope diario— una
+   * llamada que el proveedor ya había atendido y cobrado, mientras la limpieza de fuera
+   * soltaba la reserva y dejaba reintentar. La promesa «el libro registra toda invocación»
+   * dependía de que algo POSTERIOR saliera bien. Ahora depende de algo ANTERIOR, y si eso
+   * falla el gasto sencillamente no ocurre.
+   */
+  anotarDespacho: (
+    modelo: string,
+    consentimientoVersion: number | null,
+  ) => Promise<ApunteDespacho>;
 }): Promise<ResultadoProveedor> {
   // Cada intento se anota antes de decidir si hay otro: una degradación de modelo son DOS
   // llamadas al proveedor, y la del primario existió aunque no sirviera. Devolver solo la
@@ -229,6 +259,12 @@ export async function generarConProveedor(entrada: {
   // el respaldo, la que devuelva la revalidación justo antes de salir.
   let consentimientoVersion = entrada.consentimientoVersion;
   for (const [indice, modelo] of [MODELO_PRIMARIO, MODELO_FALLBACK].entries()) {
+    // Primero el apunte, después la llamada. Si el libro no admite la línea, este intento
+    // no ocurre: los anteriores viajan anotados y el motivo llega a la pantalla como
+    // cualquier otro (SYS-21: aquí no se lanza nunca).
+    const apunte = await entrada.anotarDespacho(modelo, consentimientoVersion);
+    if (!apunte.ok) return { ok: false, motivo: apunte.motivo, intentos };
+    const registroId = apunte.registroId;
     const inicio = Date.now();
     try {
       const { datos, uso } = await unaLlamada(
@@ -245,6 +281,7 @@ export async function generarConProveedor(entrada: {
         latenciaMs: Date.now() - inicio,
         uso,
         consentimientoVersion,
+        registroId,
       });
       return { ok: true, datos, intentos };
     } catch (e) {
@@ -265,6 +302,7 @@ export async function generarConProveedor(entrada: {
         latenciaMs: Date.now() - inicio,
         uso: usoDelError(e),
         consentimientoVersion,
+        registroId,
       });
       // JSON ilegible: el modelo respondió pero fuera de contrato. No se reintenta con otro
       // modelo (no es indisponibilidad) y la propuesta se descarta entera.

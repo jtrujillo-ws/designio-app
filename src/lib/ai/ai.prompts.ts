@@ -1,4 +1,4 @@
-import type { CapacidadActiva } from './ai.schemas';
+import { MAX_CRITERIOS_POR_LOTE, type CapacidadActiva } from './ai.schemas';
 
 /**
  * Prompts y esquemas de salida como ARTEFACTOS VERSIONADOS del repo (diseño técnico ·
@@ -288,7 +288,7 @@ export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = 
       criterios: {
         type: 'array',
         minItems: 1,
-        maxItems: 4,
+        maxItems: MAX_CRITERIOS_POR_LOTE,
         items: {
           type: 'object',
           additionalProperties: false,

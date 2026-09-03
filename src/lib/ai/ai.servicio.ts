@@ -21,6 +21,7 @@ import {
   ContenidoCriterioSchema,
   ContenidoExtraccionSchema,
   DESTINO_DE_CAPACIDAD,
+  MAX_CRITERIOS_POR_LOTE,
   parsearContenido,
   type CapacidadActiva,
   type ContenidoCriterio,
@@ -962,7 +963,7 @@ async function confirmarDespacho(
 function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): ContenidoPropuesta[] {
   if (capacidad === 'CI') return [ContenidoExtraccionSchema.parse(datos)];
   const lote = (datos ?? {}) as { criterios?: unknown };
-  return ContenidoCriterioSchema.array().min(1).max(4).parse(lote.criterios);
+  return ContenidoCriterioSchema.array().min(1).max(MAX_CRITERIOS_POR_LOTE).parse(lote.criterios);
 }
 
 /**
@@ -985,8 +986,6 @@ function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): Contenid
  */
 async function registrarLlamadas(
   actorId: string,
-  entrada: GenerarPropuestas,
-  alcance: Alcance,
   intentos: IntentoProveedor[],
 ): Promise<{ ids: string[]; idSalidaValida: string | null }> {
   if (intentos.length === 0) return { ids: [], idSalidaValida: null };
@@ -1004,30 +1003,70 @@ async function registrarLlamadas(
     const ids: string[] = [];
     let idSalidaValida: string | null = null;
     for (const intento of intentos) {
-      const [fila] = await tx`insert into llamada_ai
-        (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado, motivo,
-         tokens_entrada, tokens_salida, costo_usd, latencia_ms, consentimiento_version,
-         creado_por)
-        values (${entrada.workspaceId}, ${entrada.capacidad},
-                ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
-                ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
-                ${intento.modelo}, ${alcance.origenKey}, ${intento.resultado},
-                ${intento.motivo.slice(0, 500)},
-                ${intento.uso?.entrada ?? null}, ${intento.uso?.salida ?? null},
-                ${intento.uso?.costoUsd ?? null}, ${intento.latenciaMs},
-                ${intento.consentimientoVersion},
-                ${actorId})
+      // UPDATE, no INSERT: la fila la abrió `anotarDespacho` antes de que el intento
+      // saliera. Solo las seis columnas del desenlace están en el grant y la política solo
+      // deja `despachada → algo`, así que esto cierra la línea y nadie puede reabrirla.
+      const cerradas = await tx`update llamada_ai
+        set resultado = ${intento.resultado},
+            motivo = ${intento.motivo.slice(0, 500)},
+            tokens_entrada = ${intento.uso?.entrada ?? null},
+            tokens_salida = ${intento.uso?.salida ?? null},
+            costo_usd = ${intento.uso?.costoUsd ?? null},
+            latencia_ms = ${intento.latenciaMs}
+        where id = ${intento.registroId}
         returning id`;
-      const id = fila!.id as string;
-      ids.push(id);
+      // Si no cerró ninguna, la fila ya no está en `despachada`: alguien la completó antes
+      // (no hay camino que lo haga) o la política la rechazó. No se inventa una fila nueva
+      // —duplicaría el gasto— y el intento se queda como salió: `despachada`, contado.
+      if (cerradas.length === 0) continue;
+      ids.push(intento.registroId);
       // El id que las propuestas referencian se busca por su RESULTADO, no por su posición:
       // como mucho hay un intento con salida válida (el bucle del adaptador para en el
-      // primero que la da), y depender del orden de un `returning` sería depender de algo
-      // que Postgres no promete.
-      if (intento.resultado === 'salida-valida') idSalidaValida = id;
+      // primero que la da).
+      if (intento.resultado === 'salida-valida') idSalidaValida = intento.registroId;
     }
     return { ids, idSalidaValida };
   });
+}
+
+/**
+ * Abre la línea del libro ANTES de que el intento salga, y devuelve su id. Es la mitad que
+ * faltaba de «el libro registra TODA invocación»: mientras la fila se escribía al volver,
+ * esa promesa dependía de que una transacción POSTERIOR a la llamada saliera bien, y un
+ * fallo transitorio suyo borraba del coste y del tope diario una llamada ya atendida y
+ * cobrada — mientras la limpieza soltaba la reserva y dejaba reintentar. Ahora el orden es
+ * el contrario, así que lo peor que puede pasar es que la fila se quede en `despachada`:
+ * sigue contada para el tope (dirección segura) y visible con su ancla, su modelo, su
+ * credencial y bajo qué consentimiento salió.
+ *
+ * Si esto falla, no hay despacho. No se gasta lo que no se puede anotar.
+ */
+async function anotarDespacho(
+  actorId: string,
+  entrada: GenerarPropuestas,
+  alcance: Alcance,
+  modelo: string,
+  consentimientoVersion: number | null,
+): Promise<{ ok: true; registroId: string } | { ok: false; motivo: string }> {
+  try {
+    const [fila] = await conUsuario(actorId, (tx) => tx`insert into llamada_ai
+      (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado, motivo,
+       consentimiento_version, creado_por)
+      values (${entrada.workspaceId}, ${entrada.capacidad},
+              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
+              ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
+              ${modelo}, ${alcance.origenKey}, 'despachada',
+              'despachada al proveedor; su desenlace aún no consta',
+              ${consentimientoVersion}, ${actorId})
+      returning id`);
+    return { ok: true, registroId: fila!.id as string };
+  } catch {
+    return {
+      ok: false,
+      motivo:
+        'No se pudo abrir la línea del libro de costos para esta llamada, así que no se ha despachado. Todo el flujo sigue disponible a mano.',
+    };
+  }
 }
 
 /**
@@ -1051,6 +1090,10 @@ export async function generarPropuestas(
       sistema: alcance.sistema,
       usuario: alcance.usuario,
       consentimientoVersion: versionConsentimiento,
+      // Cada intento abre su línea del libro ANTES de salir. Si no se puede abrir, no sale:
+      // el gasto que no se puede anotar no se hace.
+      anotarDespacho: (modelo, version) =>
+        anotarDespacho(actorId, entrada, alcance, modelo, version),
       // Degradar de modelo es un despacho NUEVO, no la misma llamada otra vez: ocurre con la
       // primera ya terminada, el control de vuelta aquí y ni un byte en el aire. Así que se
       // vuelve a pedir permiso con EXACTAMENTE la misma comprobación que autorizó el
@@ -1074,12 +1117,15 @@ export async function generarPropuestas(
       },
     });
 
-    // El proveedor no dio contenido utilizable. Los intentos se anotan igual —con su uso,
-    // si la respuesta llegó a existir— y solo DESPUÉS se corta: registrar el gasto no puede
-    // depender de que el resultado nos guste. Si el propio registro falla, manda el motivo
-    // del proveedor: es lo que la persona necesita leer.
+    // El proveedor no dio contenido utilizable. Las líneas ya están abiertas desde antes de
+    // despachar, así que aquí solo se CIERRAN con su desenlace —y con su uso, si la
+    // respuesta llegó a existir—. Si ese cierre falla, el `catch` ya no pierde nada
+    // importante: la fila se queda en `despachada`, que sigue contando para el tope y
+    // conserva ancla, modelo, credencial y consentimiento. Lo que se pierde es el DETALLE
+    // (tokens, coste, latencia, motivo), y manda el motivo del proveedor porque es lo que
+    // la persona necesita leer.
     if (!respuesta.ok) {
-      await registrarLlamadas(actorId, entrada, alcance, respuesta.intentos).catch(() => {});
+      await registrarLlamadas(actorId, respuesta.intentos).catch(() => {});
       throw new ErrorAI(respuesta.motivo);
     }
 
@@ -1099,21 +1145,21 @@ export async function generarPropuestas(
           ? { ...i, resultado: 'fuera-de-contrato' as const, motivo }
           : i,
       );
-      await registrarLlamadas(actorId, entrada, alcance, intentos).catch(() => {});
+      await registrarLlamadas(actorId, intentos).catch(() => {});
       throw new ErrorAI(motivo);
     }
 
-    const { idSalidaValida } = await registrarLlamadas(
-      actorId,
-      entrada,
-      alcance,
-      respuesta.intentos,
-    );
+    const { idSalidaValida } = await registrarLlamadas(actorId, respuesta.intentos);
     const exitoso = respuesta.intentos[respuesta.intentos.length - 1]!;
-    // Sin línea de gasto no hay propuesta: la FK lo impone y aquí se dice con un mensaje
-    // legible en vez de dejar que reviente el insert.
+    // Sin línea de gasto CERRADA como salida válida no hay propuesta: el guard de
+    // `propuesta_ai` exige `resultado = 'salida-valida'` en la llamada de la que cuelga, así
+    // que una línea que se quedó en `despachada` —porque el cierre falló— no puede
+    // respaldar nada. Se dice con un mensaje legible en vez de dejar que reviente el insert,
+    // y el gasto no se pierde: esa línea sigue en el libro y sigue contando.
     if (!idSalidaValida) {
-      throw new ErrorAI('No se pudo registrar la llamada al proveedor: la generación se descarta');
+      throw new ErrorAI(
+        'La llamada al proveedor no pudo cerrarse en el libro de costos, así que la generación se descarta. El gasto queda anotado y el trabajo sigue disponible a mano.',
+      );
     }
     return await persistirPropuestas(actorId, entrada, alcance, contenidos, {
       id: idSalidaValida,
@@ -1206,7 +1252,7 @@ async function persistirPropuestas(
       const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
-         confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id,
+         confianza, orden, modelo, prompt_version, alcance_resumen, origen_key, llamada_id,
          creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino},
              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
@@ -1220,9 +1266,14 @@ async function persistirPropuestas(
              -- para que viaje también en contenido_original y la corrección no la pueda
              -- maquillar sin que se vea.
              (${tx.json(CONFIANZA_PROPUESTA_NUMERICA)}::jsonb ->> (c.contenido ->> 'confianzaPropuesta'))::numeric,
+             -- El puesto DENTRO del lote que devolvió esta llamada. Es lo que convierte la
+             -- cardinalidad del lote en una regla de fila: con el índice único por
+             -- (llamada, puesto), una llamada no puede respaldar más propuestas de las que
+             -- su contrato permite devolver.
+             (c.n - 1)::smallint,
              ${llamada.modelo}, ${PROMPT_VERSION}, ${alcance.alcanceResumen},
              ${alcance.origenKey}, ${llamada.id}, ${actorId}
-      from jsonb_array_elements(${tx.json(contenidos)}) as c(contenido)
+      from jsonb_array_elements(${tx.json(contenidos)}) with ordinality as c(contenido, n)
       returning id`;
       return { generadas: filas.length };
     } catch (e) {

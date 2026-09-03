@@ -35,7 +35,14 @@ import type { Revalidacion } from '../proveedor.server';
 const USO_CRUDO = { input_tokens: 1000, output_tokens: 40 };
 const USO_ESPERADO = { entrada: 1000, salida: 40 };
 
-function llamar(revalidar?: () => Promise<Revalidacion>) {
+/** Los apuntes previos que el adaptador pide antes de CADA despacho, en orden. Sin uno de
+ * estos no hay llamada: el libro se abre primero y solo entonces se gasta. */
+const apuntes: string[] = [];
+
+function llamar(
+  revalidar?: () => Promise<Revalidacion>,
+  anotar?: (modelo: string, version: number | null) => Promise<{ ok: true; registroId: string } | { ok: false; motivo: string }>,
+) {
   return generarConProveedor({
     key: 'sk-de-prueba',
     capacidad: 'CI',
@@ -43,6 +50,12 @@ function llamar(revalidar?: () => Promise<Revalidacion>) {
     usuario: 'material',
     consentimientoVersion: 1,
     revalidar,
+    anotarDespacho:
+      anotar ??
+      (async (modelo) => {
+        apuntes.push(modelo);
+        return { ok: true, registroId: `registro-${apuntes.length}` };
+      }),
   });
 }
 
@@ -50,6 +63,25 @@ describe('adaptador del proveedor AI', () => {
   beforeEach(() => {
     sdk.respuestas = [];
     sdk.modelosLlamados = [];
+    apuntes.length = 0;
+  });
+
+  it('sin línea en el libro no hay despacho: el gasto que no se puede anotar no se hace', async () => {
+    // El orden ES el arreglo. Mientras la fila se escribía al VOLVER, un fallo transitorio
+    // de esa transacción borraba del libro —y del tope diario— una llamada ya atendida y
+    // cobrada. Ahora el apunte va delante: si no entra, el SDK no se toca.
+    sdk.respuestas = [{ content: [{ type: 'text', text: '{}' }], usage: USO_CRUDO }];
+    const r = await llamar(undefined, async () => ({ ok: false, motivo: 'el libro no admite la línea' }));
+    expect(r.ok).toBe(false);
+    expect(r.intentos).toHaveLength(0);
+    expect(sdk.modelosLlamados).toEqual([]);
+  });
+
+  it('cada intento lleva la línea del libro que se abrió para él', async () => {
+    sdk.respuestas = [{ content: [{ type: 'text', text: '{"a":1}' }], usage: USO_CRUDO }];
+    const r = await llamar();
+    expect(apuntes).toEqual([MODELO_PRIMARIO]);
+    expect(r.intentos.map((i) => i.registroId)).toEqual(['registro-1']);
   });
 
   it('una negativa del proveedor conserva el uso: la llamada ocurrió y se pagó', async () => {

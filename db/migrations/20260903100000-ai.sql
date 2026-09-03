@@ -439,8 +439,20 @@ create table llamada_ai (
   origen_key text not null check (origen_key in ('workspace', 'entorno')),
   -- Qué devolvió el proveedor. 'salida-valida' es «contenido que pasó el esquema de la
   -- capacidad»; lo demás son llamadas pagadas de las que no puede nacer nada.
+  -- `despachada` es el estado con el que NACE toda fila: se anota ANTES de salir al
+  -- proveedor y se completa después con el desenlace real. Antes la fila se escribía al
+  -- volver, así que un fallo transitorio de esa transacción borraba del libro —y del tope
+  -- diario— una llamada que el proveedor ya había atendido y cobrado. El libro prometía
+  -- registrar TODA invocación y esa promesa dependía de que una transacción POSTERIOR
+  -- saliera bien; ahora depende de una ANTERIOR, y si esa falla no hay despacho: no se
+  -- gasta lo que no se puede anotar.
+  --
+  -- Una fila que se queda en `despachada` significa exactamente lo que dice —salió y su
+  -- desenlace no consta— y CUENTA para el tope (`resultado <> 'sin-respuesta'`), que es la
+  -- dirección segura: ante la duda, el dinero se da por gastado. `sin-respuesta` es otra
+  -- cosa y por eso no cuenta: ahí se sabe que no hubo respuesta, así que no hubo factura.
   resultado text not null check (resultado in
-    ('salida-valida', 'rechazo-proveedor', 'fuera-de-contrato', 'sin-respuesta')),
+    ('despachada', 'salida-valida', 'rechazo-proveedor', 'fuera-de-contrato', 'sin-respuesta')),
   motivo text not null default '' check (length(motivo) <= 500),
   -- Uso medido, no estimado. Los dos contadores viajan juntos o no viaja ninguno: medio
   -- `usage` no es un uso, es un número que engaña al sumarlo.
@@ -568,13 +580,31 @@ begin
   return new;
 end $$;
 
+-- Completar el despacho es el ÚNICO UPDATE, y es de un solo sentido: de `despachada` a un
+-- desenlace, nunca al revés y nunca dos veces. El `using` fija el origen y el `with check`
+-- el destino, así que reescribir el coste de una llamada ya cerrada no tiene superficie —
+-- que era la garantía de antes, cuando no había UPDATE ninguno, y sigue en pie.
+create policy llamada_completar on llamada_ai
+  for update
+  using (
+    resultado = 'despachada'
+    and creado_por = app_user_id()
+    and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+  )
+  with check (
+    resultado <> 'despachada'
+    and creado_por = app_user_id()
+    and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+  );
+
 create trigger llamada_ai_registro
   before insert on llamada_ai
   for each row execute function llamada_ai_registro_guard();
 
 revoke execute on function llamada_ai_registro_guard() from public;
 
--- Sin UPDATE ni DELETE: lo que costó una llamada ya hecha no se reescribe ni se borra.
+-- Sin DELETE, y con un único UPDATE de un solo sentido (completar el despacho, arriba):
+-- lo que costó una llamada ya cerrada no se reescribe ni se borra.
 -- Y por COLUMNA, para dejar `creado_en` fuera: es el reloj con el que se cuenta el tope
 -- diario del workspace (`creado_en >= date_trunc('day', now())`), así que con el grant
 -- puesto una llamada podía nacer fechada ayer y no contar para hoy — el presupuesto de
@@ -584,6 +614,13 @@ grant select on llamada_ai to designio_app;
 grant insert (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado,
               motivo, tokens_entrada, tokens_salida, costo_usd, latencia_ms,
               consentimiento_version, creado_por)
+  on llamada_ai to designio_app;
+-- El UPDATE que completa el despacho, y SOLO las seis columnas del desenlace. El ancla, el
+-- modelo, la credencial y la versión de consentimiento se deciden al anotar y quedan fuera:
+-- si fueran editables, el escritor podría mover la llamada a otra ancla o a otro permiso
+-- DESPUÉS de que saliera, y el libro afirmaría bajo qué autorización viajó un material que
+-- viajó bajo otra. `creado_en` sigue fuera por lo mismo de siempre: es el reloj del tope.
+grant update (resultado, motivo, tokens_entrada, tokens_salida, costo_usd, latencia_ms)
   on llamada_ai to designio_app;
 
 create table propuesta_ai (
@@ -631,6 +668,16 @@ create table propuesta_ai (
   -- una. Lo que sí es de la propuesta —modelo, versión de prompt, credencial, alcance— se
   -- queda: es su LINEAGE (SYS-19) y la evidencia materializada lo copia.
   llamada_id uuid not null,
+  -- Qué puesto ocupa esta propuesta DENTRO del lote que devolvió esa llamada. Existe para
+  -- que la cardinalidad del lote sea una regla de la base y no una costumbre del servicio:
+  -- con el índice único de abajo, una llamada respalda como mucho cuatro propuestas —la
+  -- cota que el propio contrato del proveedor impone a la respuesta de C0— y cada una
+  -- ocupa un puesto distinto. Sin esto, un escritor podía colgar propuestas sin límite de
+  -- una sola llamada C0 genuina: todas heredaban su coste, y el recuento de propuestas
+  -- crecía sin gasto detrás. El 3 es `MAX_CRITERIOS_POR_LOTE - 1`; hay una prueba que
+  -- inserta exactamente esa cantidad y una más, así que subir la constante sin mover esta
+  -- línea rompe la suite en vez de pasar callando.
+  orden smallint not null default 0 check (orden >= 0 and orden <= 3),
 
   -- ── Revisión humana y materialización ──
   revisada_por uuid references usuario(id),
@@ -670,7 +717,11 @@ create table propuesta_ai (
   check ((estado in ('aceptada', 'corregida')) = (coalesce(evidencia_id, criterio_id) is not null)),
   -- 'aceptada' es aceptación LITERAL; editar es 'corregida', y ese es el dato que
   -- alimenta la tasa de corrección humana (SYS-17/§17).
-  check (estado <> 'aceptada' or contenido = contenido_original)
+  check (estado <> 'aceptada' or contenido = contenido_original),
+  -- CI devuelve UNA evidencia por llamada, así que su puesto es siempre el 0 y el índice
+  -- único de abajo la deja en una. Sin esta línea, una extracción podría ocupar los cuatro
+  -- puestos y colgar cuatro propuestas de la misma llamada pagada.
+  check (capacidad <> 'CI' or orden = 0)
 );
 
 -- ── El asiento que llevaba reservado desde SPEC-02 ──
@@ -722,24 +773,26 @@ create index propuesta_ai_ws_idx on propuesta_ai (workspace_id, estado, creado_e
 create unique index propuesta_ai_item_pendiente_idx on propuesta_ai (workspace_id, item_id)
   where item_id is not null and estado = 'propuesta';
 
--- Una llamada de CI respalda COMO MUCHO UNA propuesta. `llamada_id` afirma «la llamada que
--- ME produjo», y con N propuestas colgadas de la misma llamada de extracción esa frase solo
--- puede ser cierta en una de ellas: las demás heredan un coste, una latencia y un `usage`
--- que no son suyos. El daño no es solo de lectura — el coste por propuesta se divide entre
--- filas que nadie pagó y el recuento de propuestas generadas crece sin gasto detrás, que es
--- justo la dirección que esconde el problema.
+-- Una llamada respalda COMO MUCHO el lote que su contrato permite devolver: cuatro para C0
+-- —y una para CI, que además tiene su puesto fijado en 0 por el CHECK de arriba—.
+-- `llamada_id` afirma «la llamada que ME produjo», y con más propuestas de las que esa
+-- llamada pudo producir la frase deja de ser cierta en casi todas: heredan un coste, una
+-- latencia y un `usage` que no son suyos. El daño no es de lectura — el coste por propuesta
+-- se divide entre filas que nadie pagó y el recuento de propuestas crece sin gasto detrás,
+-- que es justo la dirección que esconde el problema.
 --
--- El índice parcial es el que lo impone porque el guard no puede: comprueba la fila que
--- entra, y «cuántas hay ya» es una pregunta sobre el conjunto, que bajo READ COMMITTED dos
--- transacciones responden a la vez sobre snapshots distintos. `propuesta_ai_item_pendiente_idx`
--- tampoco lo cubre: solo alcanza a las PENDIENTES, así que decidir la primera dejaba el
--- hueco libre para colgar una segunda de la misma llamada ya pagada.
+-- Lo impone un índice único y no el guard porque el guard comprueba la fila que entra, y
+-- «cuántas hay ya» es una pregunta sobre el CONJUNTO, que bajo READ COMMITTED dos
+-- transacciones responden a la vez sobre snapshots distintos. Con un puesto por fila, en
+-- cambio, la cota vuelve a ser una regla de fila: cuatro puestos, cuatro filas como mucho.
+-- `propuesta_ai_item_pendiente_idx` tampoco lo cubría: solo alcanza a las PENDIENTES, así
+-- que decidir la primera dejaba el hueco libre para colgar otra de la llamada ya pagada.
 --
--- Solo CI, y la asimetría es la misma que la de `reserva_ai`: C0 persiste un LOTE —de uno a
--- cuatro criterios de una sola llamada— y sus filas hermanas violarían el índice. Ahí el
--- invariante no es una fila que Postgres pueda rechazar.
-create unique index propuesta_ai_llamada_ci_idx on propuesta_ai (workspace_id, llamada_id)
-  where capacidad = 'CI';
+-- Y respeta el LOTE, que es lo que un índice único a secas sobre `llamada_id` habría roto:
+-- C0 persiste de uno a cuatro criterios de una sola llamada, y sus filas hermanas son
+-- legítimas — cada una en su puesto. «Único» y «sin techo» no eran las dos únicas opciones.
+create unique index propuesta_ai_llamada_orden_idx
+  on propuesta_ai (workspace_id, llamada_id, orden);
 
 -- Y un objeto materializado cuelga de UNA sola propuesta. El guard diferido exige que lo
 -- haya creado la aceptación que lo reclama, lo que ya impide adoptar algo preexistente;
@@ -1386,7 +1439,7 @@ grant select on propuesta_ai to designio_app;
 -- `creado_en` fuera también aquí: es el orden de la cola FIFO que la pantalla drena por el
 -- frente, y una propuesta fechada al principio del tiempo se queda delante de todas para
 -- siempre. Y `revisada_en` fuera porque lo estampa el guard al decidir, no el caller.
-grant insert (workspace_id, capacidad, destino, item_id, reto_id, contenido,
+grant insert (workspace_id, capacidad, destino, item_id, reto_id, contenido, orden,
               contenido_original, confianza, es_simulacion, modelo, prompt_version,
               alcance_resumen, origen_key, llamada_id, creado_por)
   on propuesta_ai to designio_app;

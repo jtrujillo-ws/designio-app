@@ -41,13 +41,32 @@ vi.mock('@/lib/ai/proveedor.server', async (original) => {
   const real = await original<typeof import('@/lib/ai/proveedor.server')>();
   return {
     ...real,
-    generarConProveedor: async (entrada: { consentimientoVersion: number | null }) => {
-      if (proveedor.duranteLlamada) await proveedor.duranteLlamada();
+    generarConProveedor: async (entrada: {
+      consentimientoVersion: number | null;
+      anotarDespacho: (
+        modelo: string,
+        version: number | null,
+      ) => Promise<{ ok: true; registroId: string } | { ok: false; motivo: string }>;
+    }) => {
       const r = proveedor.respuesta!;
-      // El adaptador real SELLA cada intento con la autorización bajo la que salió, y el
-      // libro se escribe a partir de ahí. El doble tiene que hacer lo mismo o las pruebas
-      // dejarían de ver justo eso: con qué permiso se despachó cada llamada.
-      return { ...r, intentos: r.intentos.map((i) => ({ ...i, consentimientoVersion: entrada.consentimientoVersion })) };
+      // El adaptador real abre la línea del libro ANTES de cada despacho y solo entonces
+      // llama. El doble hace lo mismo, y por eso `duranteLlamada` ocurre DESPUÉS del
+      // apunte: ese hueco es el material en vuelo, que empieza cuando la petición sale.
+      const intentos = [];
+      for (const i of r.intentos) {
+        const apunte = await entrada.anotarDespacho(i.modelo, entrada.consentimientoVersion);
+        if (!apunte.ok) return { ok: false as const, motivo: apunte.motivo, intentos };
+        // El adaptador real SELLA cada intento con la autorización bajo la que salió y con
+        // la línea que abrió: el libro se cierra a partir de ahí. El doble tiene que hacer
+        // lo mismo o las pruebas dejarían de ver con qué permiso se despachó cada llamada.
+        intentos.push({
+          ...i,
+          consentimientoVersion: entrada.consentimientoVersion,
+          registroId: apunte.registroId,
+        });
+      }
+      if (proveedor.duranteLlamada) await proveedor.duranteLlamada();
+      return { ...r, intentos };
     },
   };
 });
@@ -131,6 +150,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       latenciaMs: 900,
       uso: USO_CI_COMPLETO,
       consentimientoVersion: null,
+      // El doble lo sustituye por el id de la línea que abre de verdad; este valor solo
+      // existe para que el objeto esté completo antes de pasar por él.
+      registroId: '00000000-0000-0000-0000-000000000000',
       ...campos,
     };
   }

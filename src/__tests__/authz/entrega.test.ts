@@ -21,7 +21,6 @@ import {
   PAGINA_DESIGN_VERSIONS,
   planificarRelease,
   proyectosCertificados,
-  tableroDeConciliacion,
   versionAprobadaDelServicio,
 } from '@/lib/entrega/entrega.servicio';
 import {
@@ -36,6 +35,7 @@ import {
   DesplegarReleaseSchema,
   MAXIMO_MOTIVOS_POR_ELEMENTO,
   PlanificarReleaseSchema,
+  type DesignVersionCompleta,
 } from '@/lib/entrega/entrega.schemas';
 import { aprobarGate, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
 import { revalidarDecision } from '@/lib/metodo/gobernanza.servicio';
@@ -700,13 +700,13 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
   it('G7 se bloquea mientras haya un elemento en estado desconocido (RF-06.7)', async () => {
     const admin = sqlAdmin();
-    const tablero = await tableroDeConciliacion(leadId, ws, dv1);
-    expect(tablero!.filas.map((f) => f.estado).sort()).toEqual([
+    const tablero = await designVersionCompleta(leadId, ws, dv1);
+    expect(tablero!.conciliacion.map((f) => f.estado).sort()).toEqual([
       'constatado',
       'desviado',
       'en-release',
     ]);
-    expect(conciliacionCompleta(tablero!.filas)).toBe(false);
+    expect(conciliacionCompleta(tablero!.conciliacion)).toBe(false);
 
     // La escalera de gates: G7 no se decide con anteriores pendientes.
     for (let n = 0; n <= 6; n++) {
@@ -741,9 +741,9 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       ],
     });
 
-    const cerrado = await tableroDeConciliacion(leadId, ws, dv1);
+    const cerrado = await designVersionCompleta(leadId, ws, dv1);
     // 'no-implementado' es una respuesta CONOCIDA: el gate exige honestidad, no éxito.
-    expect(conciliacionCompleta(cerrado!.filas)).toBe(true);
+    expect(conciliacionCompleta(cerrado!.conciliacion)).toBe(true);
     await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
       where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = 7`;
     const [g7] = await admin`select estado from gate_instancia
@@ -2116,8 +2116,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     // La versión VIGENTE está conciliada y su tablero no tiene huecos… y aun así G7 no
     // pasa: la superada dejó un despliegue sin observar y un plan sin cerrar.
-    const tableroVigente = await tableroDeConciliacion(leadId, ws, segunda.designVersionId);
-    expect(conciliacionCompleta(tableroVigente!.filas)).toBe(true);
+    const tableroVigente = await designVersionCompleta(leadId, ws, segunda.designVersionId);
+    expect(conciliacionCompleta(tableroVigente!.conciliacion)).toBe(true);
     await expect(aprobarGateCrudo(7)).rejects.toThrow(/superada dejó releases sin resolver/);
     // Y la pantalla dice LO MISMO que el gate, no lo que deduzca del tablero de esta
     // versión: su tablero está completo y aun así el proyecto está bloqueado, por la que se
@@ -2914,6 +2914,111 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     }
   };
 
+  it('el tablero de conciliación y el plan de releases salen de la MISMA lectura', async () => {
+    // El caso es el del loader de la pantalla, que pintaba el plan de releases con una
+    // consulta y el tablero de conciliación con OTRA, las dos en paralelo. Entre ambas,
+    // otro lead constata y verifica el release, y la página quedaba diciendo dos cosas
+    // incompatibles a la vez: ofrecía «constatar effective state» —por la mitad vieja—
+    // mientras daba la conciliación por completa —por la mitad nueva—. Meterlas en una
+    // transacción no lo habría arreglado: en READ COMMITTED cada sentencia toma su propia
+    // foto, así que «una sola transacción» no es «una sola foto». Lo que lo arregla es que
+    // haya UNA lectura, y por eso el tablero viaja dentro del detalle.
+    //
+    // Lo que esto comprueba —y conviene decirlo— no es que la carrera sea imposible: el
+    // otro lead sigue pudiendo constatar cuando quiera, y las dos lecturas de abajo cuentan
+    // cosas distintas a propósito. Es que NINGUNA lectura se contradice a sí misma.
+    const proy = await proyectoConGates('P-140', 'Proyecto de la foto única');
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio de la foto única');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que se constata a mitad de la lectura',
+      resumen: '',
+      superaA: null,
+    });
+    const el = await elementoSuelto(dv.designVersionId, 'Lo que otro lead cierra por su lado');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const rl = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'El release que se cierra entre lecturas',
+      responsable: 'Equipo de la foto',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: el, razon: '' }],
+    });
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: rl.releaseId,
+      desplegadoEn: HOY,
+      desfaseUtcMinutos: 0,
+    });
+
+    /**
+     * Las dos mitades que la pantalla enseña una al lado de la otra: el estado que el
+     * tablero le da a cada elemento y el release que el plan pinta para ese mismo elemento.
+     * Un estado CONOCIDO exige un release verificado con la constatación que lo dice; un
+     * elemento «desplegado, sin constatar» exige lo contrario. Eso es justo lo que se
+     * rompía cuando cada mitad venía de una consulta distinta.
+     */
+    const RESULTADO_A_ESTADO: Record<string, string> = {
+      'como-aprobado': 'constatado',
+      desviado: 'desviado',
+      'no-implementado': 'no-implementado',
+    };
+    const coherente = (v: DesignVersionCompleta): boolean =>
+      v.conciliacion.every((f) => {
+        if (f.estado === 'aprobado') return f.releaseCodigo === null;
+        const rel = v.releases.find((r) => r.codigo === f.releaseCodigo);
+        if (!rel) return false;
+        const c = rel.effectiveState?.constataciones.find((x) => x.elementoId === f.elementoId);
+        if (f.estado === 'en-release') return rel.estado === 'planificado';
+        // El tablero solo cuenta la constatación de un release VERIFICADO, que es el umbral
+        // del guard de G7: mientras el release no se verifica, el elemento sigue desplegado
+        // aunque su effective state ya exista.
+        if (f.estado === 'desplegado') return rel.estado !== 'planificado' && !(rel.estado === 'verificado' && c);
+        return rel.estado === 'verificado' && !!c && RESULTADO_A_ESTADO[c.resultado] === f.estado;
+      });
+
+    const antes = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    expect(antes!.conciliacion.map((f) => f.estado)).toEqual(['desplegado']);
+    expect(antes!.releases.map((r) => r.estado)).toEqual(['desplegado']);
+    expect(coherente(antes!)).toBe(true);
+
+    // Otro lead cierra el release: es lo que antes caía ENTRE las dos consultas.
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rl.releaseId,
+      constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
+      resumen: '',
+      constataciones: [
+        {
+          elementoId: el,
+          resultado: 'desviado',
+          queQuedoDistinto: 'Salió con el aviso en otro sitio',
+          razon: 'El proveedor movió la pantalla',
+        },
+      ],
+    });
+
+    const despues = await designVersionCompleta(leadId, ws, dv.designVersionId);
+    // La segunda lectura cuenta otra cosa —así es la vida— pero la cuenta ENTERA: el
+    // tablero y el plan se mueven juntos porque son la misma sentencia.
+    expect(despues!.conciliacion.map((f) => f.estado)).toEqual(['desviado']);
+    expect(despues!.releases.map((r) => r.estado)).toEqual(['verificado']);
+    expect(coherente(despues!)).toBe(true);
+    // Y la pantalla ya no puede ofrecer constatar lo que su otra mitad da por conciliado:
+    // conciliación completa y release por constatar son, ahora, mutuamente excluyentes.
+    expect(conciliacionCompleta(antes!.conciliacion)).toBe(false);
+    expect(conciliacionCompleta(despues!.conciliacion)).toBe(true);
+  });
+
   it('firmar G6 y quitarle el release a un elemento no pueden cruzarse (RF-06.4)', async () => {
     // La carrera es entre dos caminos que escriben TABLAS distintas —gate_instancia y
     // release_elemento— y que además deciden en momentos distintos: la aprobación de G6
@@ -3362,8 +3467,8 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     // El tablero de B está completo y aun así G7 no pasa: la superada es de OTRO proyecto,
     // pero del MISMO servicio, y su vuelo sigue abierto.
-    const tablero = await tableroDeConciliacion(leadId, ws, dvB.designVersionId);
-    expect(conciliacionCompleta(tablero!.filas)).toBe(true);
+    const tablero = await designVersionCompleta(leadId, ws, dvB.designVersionId);
+    expect(conciliacionCompleta(tablero!.conciliacion)).toBe(true);
     const aprobarG7 = () =>
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proyB} and workspace_id = ${ws} and numero = 7`;

@@ -16,7 +16,6 @@ import type {
   EnlazarJourney,
   PlanificarRelease,
   ResumenDesignVersion,
-  TableroConciliacion,
 } from './entrega.schemas';
 
 /**
@@ -314,6 +313,63 @@ async function bloquearRetoDelElemento(
  * después, y las dos están bien porque son series distintas. Quien añada una función que
  * tome `codigo-es` y LUEGO el candado de un release cerraría el ciclo contra
  * `constatarEffectiveState` — que es justo el error que se comete creyendo seguir la regla.
+ *
+ * ── CENSO DE TRIGGERS QUE TOMAN CANDADO ─────────────────────────────────────────────────
+ *
+ * Un candado que toma un trigger cuenta para el orden igual que uno del servicio, así que
+ * el censo va aquí y no en la migración: es la misma regla, y tenerla en dos sitios es
+ * tenerla mal. Por candado, con la tabla de cada trigger y si es DIFERIDO (o sea, si corre
+ * en la fase de commit y con su propia foto):
+ *
+ *   reto ......... codigo_de_design_version (design_version, before insert · el prefijo
+ *                    canónico, antes de codigo-dv)
+ *                  design_version_anclaje (design_version, before insert/update)
+ *                  design_version_transicion (design_version, before update · y luego
+ *                    dv-elemento: es el único trigger que toma dos)
+ *                  release_elemento_cobertura (release_elemento, DIFERIDO en delete)
+ *                  gate_aprobar_suficiencia (gate_instancia, before update · es del método
+ *                    y esta migración lo reemplaza, así que también responde por él)
+ *   dv-elemento .. design_version_transicion (su segundo candado, ver arriba)
+ *                  elemento_cambio_identidad (elemento_cambio, DIFERIDO)
+ *                  elemento_cambio_version_editable, elemento_decision_version_editable e
+ *                    elemento_insight_version_editable (DIFERIDOS, tres tablas y un guard)
+ *   servicio ..... codigo_de_release (release, before insert · antes de codigo-rl)
+ *   codigo-* ..... codigo_de_design_version, codigo_de_release, codigo_de_effective_state
+ *   release ...... codigo_de_effective_state (effective_state, before insert · antes de
+ *                    codigo-es)
+ *                  release_transicion (release, before update)
+ *                  release_sin_alcance (release, DIFERIDO en update)
+ *                  release_elemento_sin_alcance (release_elemento, DIFERIDO en delete)
+ *                  release_elemento_fijo (release_elemento, DIFERIDO en insert/delete)
+ *
+ * Y la parte que no se ve mirando cada trigger por separado: cuando DOS de ellos cuelgan de
+ * la MISMA tabla y en el mismo momento, quien fija su orden entre sí es el ALFABETO de sus
+ * nombres — Postgres dispara por nombre, y lo hace igual con los inmediatos que con los
+ * diferidos. O sea que el nombre de un trigger es parte del orden de candados. Las
+ * adyacencias que existen hoy, y por qué están bien:
+ *
+ *   release_elemento (diferidos, en delete) ... release_elemento_cobertura <
+ *     release_elemento_fijo < release_elemento_sin_alcance: primero `reto` y después
+ *     `release`, que es el orden canónico. Esta es la que se cobró una ronda — el trigger
+ *     del alcance fijo se llamaba de forma que caía ANTES que el de cobertura y tomaba
+ *     `release` antes que `reto`. Renombrarlo no fue cosmética: fue el arreglo.
+ *   design_version (inmediatos) ... codigo_de_design_version < design_version_anclaje <
+ *     design_version_transicion. Los tres empiezan por `reto`; el primero solo corre en el
+ *     insert y el último solo en el update, así que nunca coinciden, y el único que añade
+ *     un segundo candado lo añade DESPUÉS. El alfabeto coincide con el orden canónico.
+ *   elemento_cambio (diferidos) ... elemento_cambio_identidad <
+ *     elemento_cambio_version_editable: los dos piden el MISMO candado, así que su orden
+ *     entre sí da igual — lo que importa es que ninguno pide otro después.
+ *   effective_state (inmediatos) ... codigo_de_effective_state < effective_state_alta, y
+ *     el segundo no toma candado: no hay orden que romper.
+ *   release (inmediatos y diferido) ... codigo_de_release (solo insert), release_transicion
+ *     (solo update) y release_sin_alcance (diferido) piden todos `release`; el primero
+ *     añade `codigo-rl` después, que es su sitio.
+ *
+ * Los que no tienen vecino en su tabla (gate_instancia, elemento_decision,
+ * elemento_insight) o no toman más de un candado —los diferidos de medición sobre `reto` y
+ * `proyecto`, que solo piden `reto`— no participan en ningún orden. Se enumeran igual: lo
+ * que hoy está bien por no tener vecino deja de estarlo en cuanto alguien le añada uno.
  */
 async function bloquearSerie(tx: TransactionSql, serie: string, workspaceId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(
@@ -968,9 +1024,11 @@ export async function constatarEffectiveState(
 
 // ══ Lecturas ══
 
-/** La design version ENTERA en una sentencia, incluido el effective state vigente contra
- * el que se calcula el diff: el diagrama, el diff y el tablero derivan del MISMO estado,
- * así que no puede pasar que uno muestre un elemento que otro ya no ve. */
+/** La design version ENTERA en una sentencia: los elementos, el plan de releases, el
+ * tablero de conciliación y el effective state vigente contra el que se calcula el diff.
+ * Todo lo que la pantalla enseña sale de la MISMA foto, así que no puede pasar que una
+ * vista muestre un elemento que otra ya no ve, ni que el tablero dé por conciliado un
+ * release que el plan sigue pintando desplegado. */
 export async function designVersionCompleta(
   actorId: string,
   workspaceId: string,
@@ -1088,6 +1146,14 @@ export async function designVersionCompleta(
         -- proyecto se auto-superó, con un release en vuelo, salía como que no bloqueaba
         -- mientras el gate la rechazaba. El espejo se lee de la fuente o miente.
         g7_motivo_de_bloqueo(dv.proyecto_id, dv.workspace_id) as bloqueo_de_g7,
+        -- El tablero de conciliación, DENTRO de esta sentencia. Era una segunda lectura en
+        -- paralelo, y dos lecturas son dos instantes: entre una y otra, otro lead podía
+        -- verificar el release, y la pantalla ofrecía «constatar effective state» —por la
+        -- primera— mientras daba la conciliación por completa —por la segunda—. Juntarlas
+        -- en una transacción no habría bastado: en READ COMMITTED cada sentencia toma su
+        -- propia foto, así que una sola transacción no es una sola foto. La redacta
+        -- filas_de_conciliacion en la base, que es lo único que la redacta.
+        filas_de_conciliacion(dv.id, dv.workspace_id) as conciliacion,
         -- Qué gate del proyecto impide aprobar aquí, si es que alguno: la misma función que
         -- lo rechaza. El botón de aprobar ya se apaga por lo que falta (journey, elementos);
         -- este es el único blocante que NO se resuelve trabajando en esta versión, así que
@@ -1219,6 +1285,7 @@ export async function designVersionCompleta(
       proyectoCodigo: fila.proyecto_codigo as string,
       aCargoDelProyecto: fila.a_cargo_del_proyecto as boolean,
       bloqueoDeG7: (fila.bloqueo_de_g7 as string | null) ?? null,
+      conciliacion: fila.conciliacion as DesignVersionCompleta['conciliacion'],
       proyectoCertificadoPor: (fila.proyecto_certificado_por as number | null) ?? null,
       journeyId: (fila.journey_id as string | null) ?? null,
       journeyNombre: (fila.journey_nombre as string | null) ?? null,
@@ -1371,69 +1438,6 @@ export async function proyectosCertificados(
       where p.workspace_id = ${workspaceId}
         and gate_certificado_del_proyecto(p.id, p.workspace_id) is not null`;
     return filas.map((f) => f.id as string);
-  });
-}
-
-/**
- * El tablero de conciliación (RF-06.7): elemento por elemento, dónde está en la cadena.
- * El CASE es el mismo predicado que bloquea G7 en `gate_aprobar_suficiencia_guard` — la
- * base decide, esto lo EXPLICA antes de que el lead se estrelle contra el gate.
- */
-export async function tableroDeConciliacion(
-  actorId: string,
-  workspaceId: string,
-  designVersionId: string,
-): Promise<TableroConciliacion | null> {
-  return conUsuario(actorId, async (tx) => {
-    await exigirCuentaActiva(tx, actorId);
-    const [dv] = await tx`select id, codigo from design_version
-      where id = ${designVersionId} and workspace_id = ${workspaceId}`;
-    if (!dv) return null;
-    const filas = await tx`
-      select ec.id, ec.titulo, ec.tipo, ec.operacion,
-        r.codigo as release_codigo, r.responsable as release_responsable,
-        to_char(r.fecha_objetivo, 'YYYY-MM-DD') as release_fecha,
-        coalesce(re.razon, '') as razon_asignacion,
-        coalesce(c.que_quedo_distinto, '') as que_quedo_distinto,
-        coalesce(c.razon, '') as razon_desviacion,
-        case
-          when c.resultado = 'como-aprobado' then 'constatado'
-          when c.resultado = 'desviado' then 'desviado'
-          when c.resultado = 'no-implementado' then 'no-implementado'
-          when r.estado in ('desplegado', 'verificado') then 'desplegado'
-          when r.id is not null then 'en-release'
-          else 'aprobado'
-        end as estado
-      from elemento_cambio ec
-      left join release_elemento re
-        on re.elemento_id = ec.id and re.workspace_id = ec.workspace_id
-      left join release r on r.id = re.release_id and r.workspace_id = re.workspace_id
-      -- Solo cuenta la constatación de un release VERIFICADO: es el mismo umbral que usa
-      -- el guard de G7, y así el tablero nunca dice «constatado» donde el gate ve un hueco.
-      left join effective_state es
-        on es.release_id = r.id and es.workspace_id = r.workspace_id and r.estado = 'verificado'
-      left join constatacion c
-        on c.effective_state_id = es.id and c.elemento_id = ec.id
-          and c.workspace_id = ec.workspace_id
-      where ec.design_version_id = ${designVersionId} and ec.workspace_id = ${workspaceId}
-      order by ec.orden, ec.creado_en`;
-    return {
-      designVersionId: dv.id as string,
-      designVersionCodigo: dv.codigo as string,
-      filas: filas.map((f) => ({
-        elementoId: f.id as string,
-        elementoTitulo: f.titulo as string,
-        tipo: f.tipo as TableroConciliacion['filas'][number]['tipo'],
-        operacion: f.operacion as TableroConciliacion['filas'][number]['operacion'],
-        estado: f.estado as TableroConciliacion['filas'][number]['estado'],
-        releaseCodigo: (f.release_codigo as string | null) ?? null,
-        releaseResponsable: (f.release_responsable as string | null) ?? null,
-        releaseFecha: (f.release_fecha as string | null) ?? null,
-        razonAsignacion: f.razon_asignacion as string,
-        queQuedoDistinto: f.que_quedo_distinto as string,
-        razonDesviacion: f.razon_desviacion as string,
-      })),
-    };
   });
 }
 

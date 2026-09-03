@@ -21,7 +21,6 @@ import {
   moverElementoDeRelease,
   borrarElementoDeCambio,
   cadenaDelRelease,
-  conciliacionDeDesignVersion,
   constatarReleaseDesplegado,
   declararSuperaADeDesignVersion,
   designVersionDelWorkspace,
@@ -59,14 +58,18 @@ export const Route = createFileRoute('/_autenticada/design-version/$designVersio
   loader: async ({ context, params }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
     if (!workspaceId || !ES_UUID.test(params.designVersionId)) return null;
-    const [dv, tablero, portal] = await Promise.all([
+    // El tablero de conciliación NO es una segunda consulta: viaja dentro de `dv`, en su
+    // misma sentencia. Cuando eran dos, la pantalla mezclaba dos instantes — si otro lead
+    // verificaba el release entre ambas, ofrecía «constatar effective state» por una
+    // mitad mientras la otra daba la conciliación por completa. Y meterlas en una
+    // transacción no lo habría arreglado: en READ COMMITTED cada sentencia toma su propia
+    // foto, así que «una sola transacción» no es «una sola foto».
+    const [dv, portal] = await Promise.all([
       designVersionDelWorkspace({ data: { workspaceId, designVersionId: params.designVersionId } }),
-      conciliacionDeDesignVersion({
-        data: { workspaceId, designVersionId: params.designVersionId },
-      }),
       // El portal (RF-01.5) sobre la design version: es el objeto que el cliente discute
       // —qué se decidió cambiar—, y hasta ahora era el único de la cadena sin hilos. Va
-      // en paralelo porque su id ya se conoce: no hace falta esperar a la proyección.
+      // en paralelo porque su id ya se conoce: no hace falta esperar a la proyección. Y
+      // puede: los hilos son de otra cadena, no cuentan la misma historia que el tablero.
       hilosDelPortal({
         data: {
           workspaceId,
@@ -78,7 +81,6 @@ export const Route = createFileRoute('/_autenticada/design-version/$designVersio
     return {
       workspaceId,
       dv,
-      tablero,
       hilos: portal?.hilos ?? [],
       hayMasHilos: portal?.hayMas ?? false,
     };
@@ -154,7 +156,7 @@ function PantallaDesignVersion() {
     [datos],
   );
   const desconocidos = useMemo(
-    () => (datos?.tablero ? elementosEnEstadoDesconocido(datos.tablero.filas) : []),
+    () => (datos ? elementosEnEstadoDesconocido(datos.dv.conciliacion) : []),
     [datos],
   );
 
@@ -283,7 +285,7 @@ function PantallaDesignVersion() {
 
         {vista === 'Conciliación' && (
           <VistaConciliacion
-            tablero={datos.tablero}
+            filas={dv.conciliacion}
             desconocidos={desconocidos}
             proyectoId={dv.proyectoId}
             aCargo={dv.aCargoDelProyecto}
@@ -1746,13 +1748,15 @@ function FormularioConstatacion({
 // ── Tablero de conciliación (RF-06.7) ──
 
 function VistaConciliacion({
-  tablero,
+  filas,
   desconocidos,
   proyectoId,
   aCargo,
   bloqueo,
 }: {
-  tablero: Awaited<ReturnType<typeof conciliacionDeDesignVersion>>;
+  /** Las filas salen del detalle, no de una consulta propia: es lo que garantiza que el
+   * tablero y el plan de releases de al lado cuenten el mismo instante. */
+  filas: DesignVersionCompleta['conciliacion'];
   desconocidos: { elementoId: string; elementoTitulo: string }[];
   proyectoId: string;
   /** Si el proyecto sigue respondiendo por esta versión ante sus gates. Sustituye a
@@ -1765,7 +1769,7 @@ function VistaConciliacion({
    * no bloqueaba. */
   bloqueo: string | null;
 }) {
-  if (!tablero || tablero.filas.length === 0) {
+  if (filas.length === 0) {
     return (
       <Card style={{ padding: 20 }}>
         <span style={apunte}>
@@ -1838,7 +1842,7 @@ function VistaConciliacion({
             </tr>
           </thead>
           <tbody>
-            {tablero.filas.map((f) => {
+            {filas.map((f) => {
               const desconocido = desconocidos.some((d) => d.elementoId === f.elementoId);
               return (
                 <tr key={f.elementoId}>

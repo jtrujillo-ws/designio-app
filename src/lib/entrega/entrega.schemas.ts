@@ -481,6 +481,11 @@ export type DesignVersionCompleta = {
   decisionesDelProyecto: { id: string; titulo: string }[];
   insightsValidados: { id: string; titulo: string }[];
   vigente: EstadoEfectivoVigente;
+  /** El tablero de conciliación (RF-06.7), en la MISMA lectura que los releases. Fue una
+   * segunda consulta y por eso podía contradecirlos: entre las dos, otro lead verificaba
+   * el release y la pantalla ofrecía constatarlo mientras daba la conciliación por
+   * completa. Lo redacta `filas_de_conciliacion` en la base, una sola vez. */
+  conciliacion: FilaConciliacion[];
 };
 
 export type ResumenDesignVersion = {
@@ -544,10 +549,4 @@ export type FilaConciliacion = {
   razonAsignacion: string;
   queQuedoDistinto: string;
   razonDesviacion: string;
-};
-
-export type TableroConciliacion = {
-  designVersionId: string;
-  designVersionCodigo: string;
-  filas: FilaConciliacion[];
 };

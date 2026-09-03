@@ -677,6 +677,70 @@ revoke execute on function g7_motivo_de_bloqueo(uuid, uuid) from public;
 grant execute on function g7_motivo_de_bloqueo(uuid, uuid) to designio_app;
 grant execute on function design_versions_superadas_del_ambito(uuid, uuid) to designio_app;
 
+-- El tablero de conciliación (RF-06.7) fila por fila: dónde está cada elemento en la
+-- cadena aprobado → release → despliegue → constatación. Vive en la base y no en el
+-- servicio por la misma razón que `g7_motivo_de_bloqueo`, y además por otra:
+--
+--  1. UNA redacción. El CASE es el reverso del predicado que bloquea G7 —«en estado
+--     desconocido» es exactamente «ninguna de las tres ramas de constatación»—, así que
+--     las dos tienen que moverse juntas o el tablero acaba explicando una regla que el
+--     gate ya no aplica.
+--  2. UNA foto. Devolviendo jsonb, el detalle de la design version se lo lleva dentro de
+--     su ÚNICA sentencia. Mientras el tablero fue una segunda lectura, la pantalla
+--     mezclaba dos instantes: entre una y otra, otro lead podía verificar el release, y
+--     la página ofrecía «constatar» (por la primera) diciendo a la vez que la
+--     conciliación estaba completa (por la segunda). Meterlas en una transacción no
+--     habría bastado: en READ COMMITTED cada sentencia toma su propia foto.
+--
+-- Solo cuenta la constatación de un release VERIFICADO: mismo umbral que el guard de G7,
+-- y así el tablero nunca dice «constatado» donde el gate ve un hueco.
+create function filas_de_conciliacion(p_design_version uuid, p_workspace uuid)
+returns jsonb language sql stable as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'elementoId', t.id,
+      'elementoTitulo', t.titulo,
+      'tipo', t.tipo,
+      'operacion', t.operacion,
+      'estado', t.estado,
+      'releaseCodigo', t.release_codigo,
+      'releaseResponsable', t.release_responsable,
+      'releaseFecha', t.release_fecha,
+      'razonAsignacion', t.razon_asignacion,
+      'queQuedoDistinto', t.que_quedo_distinto,
+      'razonDesviacion', t.razon_desviacion)
+    order by t.orden, t.creado_en), '[]'::jsonb)
+  from (
+    select ec.id, ec.titulo, ec.tipo, ec.operacion, ec.orden, ec.creado_en,
+      r.codigo as release_codigo, r.responsable as release_responsable,
+      to_char(r.fecha_objetivo, 'YYYY-MM-DD') as release_fecha,
+      coalesce(re.razon, '') as razon_asignacion,
+      coalesce(c.que_quedo_distinto, '') as que_quedo_distinto,
+      coalesce(c.razon, '') as razon_desviacion,
+      case
+        when c.resultado = 'como-aprobado' then 'constatado'
+        when c.resultado = 'desviado' then 'desviado'
+        when c.resultado = 'no-implementado' then 'no-implementado'
+        when r.estado in ('desplegado', 'verificado') then 'desplegado'
+        when r.id is not null then 'en-release'
+        else 'aprobado'
+      end as estado
+    from elemento_cambio ec
+    left join release_elemento re
+      on re.elemento_id = ec.id and re.workspace_id = ec.workspace_id
+    left join release r on r.id = re.release_id and r.workspace_id = re.workspace_id
+    left join effective_state es
+      on es.release_id = r.id and es.workspace_id = r.workspace_id and r.estado = 'verificado'
+    left join constatacion c
+      on c.effective_state_id = es.id and c.elemento_id = ec.id
+        and c.workspace_id = ec.workspace_id
+    where ec.design_version_id = p_design_version and ec.workspace_id = p_workspace
+  ) t
+$$;
+revoke execute on function filas_de_conciliacion(uuid, uuid) from public;
+-- No es SECURITY DEFINER: lee bajo las políticas del rol de la app, igual que la sentencia
+-- que la llama. Un tablero que viera filas que su lector no puede leer sería otro oráculo.
+grant execute on function filas_de_conciliacion(uuid, uuid) to designio_app;
+
 -- ══ RLS ══
 -- Lectura: todo miembro. La cadena evidencia→resultado es lo que el cliente audita; un
 -- effective state que el sponsor no puede leer no demuestra nada.

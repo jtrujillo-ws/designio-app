@@ -39,7 +39,6 @@ import {
   ErrorEntrega,
   planificarRelease,
   proyectosCertificados,
-  tableroDeConciliacion,
   versionAprobadaDelServicio,
 } from './entrega.servicio';
 
@@ -109,18 +108,6 @@ export const proyectosYaCertificados = createServerFn({ method: 'GET' })
       return await proyectosCertificados(usuarioId, data.workspaceId);
     } catch (e) {
       if (e instanceof ErrorAutorizacion) return [];
-      throw e;
-    }
-  });
-
-export const conciliacionDeDesignVersion = createServerFn({ method: 'GET' })
-  .inputValidator(DesignVersionInputSchema)
-  .handler(async ({ data }) => {
-    const usuarioId = await requerirUsuarioId();
-    try {
-      return await tableroDeConciliacion(usuarioId, data.workspaceId, data.designVersionId);
-    } catch (e) {
-      if (e instanceof ErrorAutorizacion) return null;
       throw e;
     }
   });

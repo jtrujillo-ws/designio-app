@@ -24,6 +24,22 @@ const PERSONAS = [
   { email: 'canales@bancoandino.demo', nombre: 'Gerente de Canales', rol: 'stakeholder' },
 ] as const;
 
+/**
+ * Declara QUIÉN escribe en esta transacción.
+ *
+ * El seed corre con la conexión admin, y sin esto `app_user_id()` es nulo dentro de los
+ * triggers: los guards que auditan sin mirar la membresía dejaban eventos SIN AUTOR —un
+ * acta que no dice quién hizo qué es media acta— y los que sí la miran se saltaban su
+ * evento entero, lo que obligaba a escribirlo a mano y acababa duplicando el del trigger.
+ * Declarado el actor, el seed produce exactamente los mismos eventos que la aplicación.
+ *
+ * Va con `is_local = true`: el ajuste muere con la transacción, así que ninguna conexión
+ * del pool se queda hablando en nombre de Lucía.
+ */
+async function declararActor(tx: TransactionSql, actorId: string): Promise<void> {
+  await tx`select set_config('app.user_id', ${actorId}, true)`;
+}
+
 /** Árbol del ejemplo §19: servicio → retos (R-01 activo con métrica; R-02/R-03 candidatos
  * nacidos del post mortem, cerrando el loop J7→J2) → proyecto P-01. */
 async function sembrarArbol(tx: TransactionSql, wsId: string, luciaId: string): Promise<void> {
@@ -103,6 +119,9 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
  * ignorar el informe. Devuelve si lo creó en esta corrida.
  */
 async function sembrarJourney(tx: TransactionSql, wsId: string, luciaId: string): Promise<boolean> {
+  // El grafo del as-is deja el mismo rastro que el del to-be: su trigger de auditoría no
+  // mira la membresía, así que sin actor declarado escribía veinte eventos sin autor.
+  await declararActor(tx, luciaId);
   const [svc] = await tx`select id from servicio
     where workspace_id = ${wsId} and nombre = 'Apertura de cuenta nómina digital'`;
   if (!svc) return false;
@@ -213,6 +232,7 @@ async function sembrarEntrega(
   const yaHay = await conexion`select 1 from design_version where workspace_id = ${wsId}`;
   if (yaHay.length > 0) return false;
   const ids = await conexion.begin(async (tx) => {
+    await declararActor(tx, luciaId);
     const [svc] = await tx`select id from servicio
       where workspace_id = ${wsId} and nombre = 'Apertura de cuenta nómina digital'`;
     const [p01] = await tx`select id from proyecto where workspace_id = ${wsId} and codigo = 'P-01'`;
@@ -342,7 +362,7 @@ async function sembrarEntrega(
   // juntos — igual que en `aprobarDesignVersion`. Se declara quién actúa porque los
   // guards levantan eventos de dominio con el actor y su rol.
   await conexion.begin(async (tx) => {
-    await tx`select set_config('app.user_id', ${luciaId}, true)`;
+    await declararActor(tx, luciaId);
     // ── DV-1 aprobada: el snapshot del grafo congelado es parte de la aprobación ──
     const [snap] = await tx`insert into journey_snapshot
       (workspace_id, journey_id, motivo, grafo, congelado_por) values
@@ -361,6 +381,7 @@ async function sembrarEntrega(
   });
 
   const releaseDesplegado = await conexion.begin(async (tx) => {
+    await declararActor(tx, luciaId);
     // ── RL-1: tres de los cuatro elementos, desplegado y constatado ──
     // Nace PLANIFICADO y recorre sus transiciones, no se fabrica ya verificado. El alcance de
     // un release que ya salió es FIJO (lo impone release_alcance_fijo_guard, diferido), así
@@ -391,6 +412,7 @@ async function sembrarEntrega(
   // a mitad de la transacción, así que declarar el alcance y salir tienen que ser dos commits
   // — que es además lo que son en la vida real: planificar y desplegar son dos actos.
   await conexion.begin(async (tx) => {
+    await declararActor(tx, luciaId);
     await tx`update release set estado = 'desplegado', desplegado_en = '2026-08-10'
       where id = ${releaseDesplegado} and workspace_id = ${wsId}`;
   });
@@ -398,6 +420,7 @@ async function sembrarEntrega(
   // Y la CONSTATACIÓN, que es el tercer acto: el effective state con la constatación de cada
   // elemento y el release a verificado, inseparables y en la misma transacción.
   await conexion.begin(async (tx) => {
+    await declararActor(tx, luciaId);
     const rl1Id = releaseDesplegado;
     // ── ES-1: cómo quedó de verdad, con la desviación y su razón (SYS-07) ──
     const [es] = await tx`insert into effective_state
@@ -419,17 +442,47 @@ async function sembrarEntrega(
     await tx`update release set estado = 'verificado'
       where id = ${rl1Id} and workspace_id = ${wsId}`;
 
-    // `DesignVersionAprobada` ya NO se inserta a mano: lo levanta el guard de transición al
-    // aprobar de verdad, arriba. Los demás sí, porque sus triggers de auditoría se saltan
-    // para quien no es miembro y esta transacción corre como administrador.
+    // Del acta de esta cadena no se escribe NADA a mano: la levantan los mismos triggers
+    // que en producción —planificar, desplegar, constatar, registrar la desviación y
+    // verificar—, ahora que el actor está declarado. Lo que había aquí duplicaba dos de
+    // esos eventos (`ReleaseDesplegado` y `ReleaseVerificado`, cuyo guard audita sin
+    // mirar la membresía) y dejaba los otros cuatro escritos por una segunda mano con su
+    // propio formato de payload. Los pares del acta no se apañan omitiendo la fila que
+    // sobra: se apañan diciendo quién escribe, que es lo que le faltaba al seed.
     await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
-      (${wsId}, 'JourneyCreado', ${tx.json({ nombre: 'Apertura con verificación asistida', tipo: 'to-be', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-      (${wsId}, 'ReleaseDesplegado', ${tx.json({ codigo: 'RL-1', desplegadoEn: '2026-08-10', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-      (${wsId}, 'ReleaseVerificado', ${tx.json({ codigo: 'RL-1', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-      (${wsId}, 'ReleasePlanificado', ${tx.json({ codigo: 'RL-2', razon: 'dependencia del área de riesgo', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-      (${wsId}, 'EffectiveStateConstatado', ${tx.json({ codigo: 'ES-1', constatadoEn: '2026-08-20', origen: 'seed' })}, ${luciaId}, 'lead-boutique'),
-      (${wsId}, 'DesviacionRegistrada', ${tx.json({ elemento: 'El motivo del rechazo se explica al cliente', razon: 'Cumplimiento exigió un paso adicional de revisión antes de mostrar el motivo', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
+      (${wsId}, 'JourneyCreado', ${tx.json({ nombre: 'Apertura con verificación asistida', tipo: 'to-be', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
   });
+
+  // ── El acta de la cadena, contada ──
+  // Un evento de más no rompe nada: el seed termina, la pantalla pinta y el rastro miente
+  // en silencio. Es justo por eso que esto se comprueba aquí, que es la única red que el
+  // seed tiene. Un acto, un evento, y todos con autor.
+  const ACTOS = {
+    DesignVersionBorrador: 1,
+    DesignVersionAprobada: 1,
+    ReleasePlanificado: 2,
+    ReleaseDesplegado: 1,
+    EffectiveStateConstatado: 1,
+    DesviacionRegistrada: 1,
+    ReleaseVerificado: 1,
+  } as const;
+  const acta = await conexion`select tipo, count(*)::int as n,
+      count(*) filter (where actor_id is null)::int as sin_autor
+    from evento_dominio
+    where workspace_id = ${wsId} and tipo in ${conexion(Object.keys(ACTOS))}
+    group by tipo`;
+  const contados = new Map(acta.map((f) => [f.tipo as string, f]));
+  for (const [tipo, esperados] of Object.entries(ACTOS)) {
+    const f = contados.get(tipo);
+    if (!f || f.n !== esperados) {
+      throw new Error(
+        `seed: el acta de la entrega esperaba ${esperados} evento(s) ${tipo} y tiene ${f?.n ?? 0}`,
+      );
+    }
+    if (f.sin_autor > 0) {
+      throw new Error(`seed: ${f.sin_autor} evento(s) ${tipo} sin autor: falta declarar quién escribe`);
+    }
+  }
   return true;
 }
 

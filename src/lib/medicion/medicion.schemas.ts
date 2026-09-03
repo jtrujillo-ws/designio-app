@@ -258,6 +258,12 @@ export type EntradaDeRegistry = {
   diasRestantes: number | null;
   ultimaFecha: string | null;
   estadoSnapshot: EstadoSnapshot;
+  /** Cuántos snapshots tiene la entrada EN LA BASE. `snapshots` puede venir recortada a las
+   * más recientes, y el recorte se muestra en vez de ocultarse: en una serie de medición lo
+   * que se pierde es el arranque, el tramo pegado a la línea base contra el que se juzga si
+   * el rediseño movió la aguja. Un gráfico al que le falta el principio no dice menos: dice
+   * otra cosa. */
+  totalSnapshots: number;
   snapshots: SnapshotDeEntrada[];
 };
 

@@ -35,7 +35,12 @@ import {
 
 export class ErrorMedicion extends Error {}
 
-/** Corte de la serie por entrada: una lectura no es un data warehouse. */
+/** Corte de la serie por entrada: una lectura no es un data warehouse. Se anuncia con
+ * `totalSnapshots` —un tope que el usuario no ve es un recorte silencioso— y NUNCA se lleva
+ * por delante un snapshot que un resultado del post mortem ya referencia: la proyección lo
+ * vuelve a incluir aparte, porque si no el editor del review no podría representar lo que
+ * hay guardado. Recorta por los MÁS ANTIGUOS, que en una serie de medición es el tramo
+ * pegado a la línea base: por eso hace falta decirlo y no solo hacerlo. */
 export const SNAPSHOTS_POR_ENTRADA = 500;
 
 /** Tope de filas por carga CSV: la ingesta es manual y acotada (ADR-0007, decisión 4). */
@@ -1093,14 +1098,31 @@ export async function seguimientoDeImpacto(
               -- ramas la cubren sin un caso aparte: lo que hay es lo que se dice.
               when ult.fecha is not null then 'recibido'
               else 'esperado' end,
+            -- CUÁNTAS hay de verdad, para poder decir que la serie viene recortada. Un tope
+            -- que el usuario no ve es el defecto; uno que se anuncia es una decisión.
+            'totalSnapshots', (select count(*) from snapshot s4
+              where s4.entrada_kpi_id = e.id and s4.workspace_id = e.workspace_id),
+            -- La serie: las ÚLTIMAS del tope… más, siempre, las que un resultado del post
+            -- mortem ya referencia. Recortar por «los más antiguos» tiene dos filos y el
+            -- segundo es el peligroso: la fila de resultado_criterio existe y es correcta
+            -- en la base, pero si su snapshot cae fuera del recorte el editor del review no
+            -- puede representar lo que hay GUARDADO — la pantalla afirmando algo que no es
+            -- cierto, sobre el dato que sostiene el veredicto. El union las trae de vuelta
+            -- y es acotado: como mucho una por criterio.
             'snapshots', coalesce((
               select jsonb_agg(jsonb_build_object(
                 'id', s.id, 'valor', s.valor::text, 'fecha', s.fecha::text,
                 'origen', s.origen, 'nota', s.nota) order by s.fecha, s.creado_en)
-              from (select * from snapshot s2
-                    where s2.entrada_kpi_id = e.id and s2.workspace_id = e.workspace_id
-                    order by s2.fecha desc, s2.creado_en desc
-                    limit ${SNAPSHOTS_POR_ENTRADA}) s), '[]'::jsonb))
+              from ((select * from snapshot s2
+                     where s2.entrada_kpi_id = e.id and s2.workspace_id = e.workspace_id
+                     order by s2.fecha desc, s2.creado_en desc
+                     limit ${SNAPSHOTS_POR_ENTRADA})
+                    union
+                    (select s3.* from snapshot s3
+                     join resultado_criterio rc on rc.snapshot_final_id = s3.id
+                       and rc.workspace_id = s3.workspace_id
+                     where s3.entrada_kpi_id = e.id
+                       and s3.workspace_id = e.workspace_id)) s), '[]'::jsonb))
             order by e.nombre)
           from entrada_kpi e
           join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id

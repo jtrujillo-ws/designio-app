@@ -751,6 +751,17 @@ function BloqueSerie({
           tono="var(--ok)"
         />
       </div>
+      {/* El recorte se DICE. La serie viene con las más recientes (más las que un resultado
+          ya referencia), y lo que se queda fuera es el arranque — justo el tramo contra el
+          que se lee si el rediseño movió la aguja. Callarlo convertiría un gráfico incompleto
+          en uno que parece completo y dice otra cosa. */}
+      {entrada.totalSnapshots > entrada.snapshots.length && (
+        <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
+          Serie recortada: se muestran las {entrada.snapshots.length} lecturas más recientes
+          de {entrada.totalSnapshots}. Las más antiguas —el arranque de la serie— no están en
+          esta vista.
+        </span>
+      )}
       {entrada.snapshots.length === 0 && (
         <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-faint)' }}>
           Sin snapshots todavía. El dueño del dato es {entrada.propietarioNombre ?? '—'} y el

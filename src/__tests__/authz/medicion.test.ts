@@ -23,6 +23,7 @@ import {
   ErrorMedicion,
   firmarRegistry,
   registrarResultado,
+  SNAPSHOTS_POR_ENTRADA,
   registrarSnapshot,
   seguimientoDeImpacto,
 } from '@/lib/medicion/medicion.servicio';
@@ -1564,6 +1565,41 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       lectura: 'De 62 a 49: mejora sostenida tras el rediseño de la verificación',
       sinDatosMotivo: '',
     });
+
+    // ── El tope de la serie no se lleva por delante lo que el post mortem ya referencia ──
+    // La proyección recorta a las N más recientes, y recorta por los MÁS ANTIGUOS: en una
+    // serie de medición eso es el arranque, el tramo pegado a la línea base contra el que se
+    // juzga si el rediseño movió la aguja. Tiene dos filos y el segundo es el peligroso: la
+    // fila de `resultado_criterio` que se acaba de guardar existe y es correcta en la base,
+    // pero si su snapshot cae fuera del recorte el editor del review no puede representar lo
+    // que hay GUARDADO — la pantalla afirmando algo que no es cierto, sobre el dato que
+    // sostiene el veredicto.
+    //
+    // Se empuja fuera con SNAPSHOTS_POR_ENTRADA lecturas de la misma fecha y creadas después:
+    // el orden es `fecha desc, creado_en desc`, así que el referenciado queda justo detrás
+    // del corte. Con el rol admin porque la ventana y la cadencia no son lo que se prueba.
+    const adminTope = sqlAdmin();
+    try {
+      await adminTope`
+        insert into snapshot (workspace_id, entrada_kpi_id, valor, fecha, origen, nota, creado_por)
+        select ${ws}, ${entradaAbandonoId}, 50, ${ultimo.fecha}::date, 'formulario',
+               'relleno del tope', ${leadId}
+        from generate_series(1, ${SNAPSHOTS_POR_ENTRADA})`;
+      const conTope = await seguimientoDeImpacto(leadId, ws, proyectoId);
+      const recortada = conTope!.entradas.find((e) => e.id === entradaAbandonoId)!;
+      // El recorte EXISTE y se anuncia: sin `totalSnapshots` la pantalla enseñaría una serie
+      // incompleta con aspecto de completa, que no dice menos — dice otra cosa.
+      expect(recortada.totalSnapshots).toBeGreaterThan(recortada.snapshots.length);
+      // Y el snapshot que el resultado referencia sigue estando, pese a caer fuera del tope.
+      expect(recortada.snapshots.map((sn) => sn.id)).toContain(ultimo.id);
+    } finally {
+      await adminTope`delete from snapshot
+        where entrada_kpi_id = ${entradaAbandonoId} and nota = 'relleno del tope'`;
+    }
+    // Sin recorte, no se anuncia nada: anunciar de más es tan mentira como callarlo.
+    const sinTope = await seguimientoDeImpacto(leadId, ws, proyectoId);
+    const entera = sinTope!.entradas.find((e) => e.id === entradaAbandonoId)!;
+    expect(entera.totalSnapshots).toBe(entera.snapshots.length);
 
     // Con UN criterio resuelto y el otro no, el post mortem todavía no se puede completar:
     // el guard del cierre lo rechaza mientras falte el resultado de cualquier criterio. La

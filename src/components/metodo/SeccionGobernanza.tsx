@@ -5,7 +5,10 @@ import { Card } from '@/components/ui/Card';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
-import type { EvidenciaCitable } from '@/lib/evidencia/evidencia.schemas';
+import {
+  etiquetaObjetoBloqueado,
+  type EvidenciaCitable,
+} from '@/lib/evidencia/evidencia.schemas';
 import {
   aprobarDecision,
   definirArquetipo,
@@ -488,11 +491,7 @@ function BloqueArquetipos({
                     lo impide, y aquí se dice por qué antes de elegir (SYS-14). */}
                 {evidencias.map((e) => (
                   <option key={e.id} value={e.id} disabled={!e.citable}>
-                    {e.citable
-                      ? e.titulo
-                      : `${e.titulo} — sin derechos: ${
-                          e.motivoBloqueo ?? 'faltan derechos de uso para el ámbito cliente'
-                        }`}
+                    {e.citable ? e.titulo : etiquetaObjetoBloqueado(e.titulo, e.motivoBloqueo)}
                   </option>
                 ))}
                 {/* Confirmar un arquetipo EXIGE evidencia enlazada: si la lista viene

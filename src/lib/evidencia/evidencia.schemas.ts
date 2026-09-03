@@ -298,3 +298,38 @@ export type EvidenciaConDerechos = {
   motivoBloqueo: string | null;
   archivos: ArchivoAdjunto[];
 };
+
+/**
+ * Rótulo de una opción BLOQUEADA en cualquier picker de objetos citables (SYS-14: se
+ * bloquea *explicando*, y el criterio de aceptación 3 pide nombrar **la dimensión que
+ * falta**).
+ *
+ * El motivo manda, y el prefijo fijo desapareció por eso. Los cuatro pickers escribían
+ * «— sin derechos: » delante del motivo, lo cual es cierto para la evidencia pero no para
+ * todo lo que se ofrece: el picker del checklist también deshabilita DECISIONES por estar
+ * `en-revision` tras una reapertura (SYS-10), y salía «sin derechos: está en revisión…».
+ * Decir la dimensión equivocada es peor que no decir ninguna, porque manda a reparar
+ * donde no hay nada roto.
+ *
+ * Los motivos que llegan ya son frases completas y se leen solas —«derechos pendientes:
+ * …», «los derechos vencieron el …», «su respaldo perdió los derechos: …», «está en
+ * revisión tras una reapertura…»— porque los redacta quien conoce la causa: la base en
+ * `evidencia_motivo_bloqueo`, o el servicio que evalúa la cadena.
+ *
+ * El texto de reserva sí nombra los derechos, y es correcto ahí: `motivoBloqueo` es null
+ * cuando `evidencia_motivo_bloqueo` calla a propósito —el pre-chequeo anti-oráculo de
+ * 20260902190000 devuelve null a quien no es miembro del workspace— y ese caso solo se
+ * alcanza por la vía de los derechos.
+ *
+ * Vive aquí, y no repetido en cada pantalla, porque era literalmente el mismo literal
+ * copiado cuatro veces «para que no se separen»: una función no se separa sola.
+ */
+export function etiquetaObjetoBloqueado(
+  titulo: string,
+  // `undefined` además de `null` porque el picker del checklist compone objetos de tres
+  // clases y el campo llega opcional; ausente y nulo significan aquí lo mismo (no hay
+  // motivo que dar), y distinguirlos obligaría a cada llamante a normalizarlo.
+  motivoBloqueo: string | null | undefined,
+): string {
+  return `${titulo} — ${motivoBloqueo ?? 'sin derechos: faltan derechos de uso para el ámbito cliente'}`;
+}

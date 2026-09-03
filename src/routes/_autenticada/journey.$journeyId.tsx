@@ -11,7 +11,11 @@ import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { DiagramaMermaid } from '@/components/journey/DiagramaMermaid';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES, type EvidenciaCitable } from '@/lib/evidencia/evidencia.schemas';
+import {
+  etiquetaObjetoBloqueado,
+  ROLES_CURADORES,
+  type EvidenciaCitable,
+} from '@/lib/evidencia/evidencia.schemas';
 import {
   agregarAristaAlJourney,
   agregarNodoAlJourney,
@@ -811,11 +815,7 @@ function FilaNodo({
                 picker de arquetipos: es la misma regla, no dos parecidas. */}
             {evidencias.map((e) => (
               <option key={e.id} value={e.id} disabled={!e.citable}>
-                {e.citable
-                  ? e.titulo
-                  : `${e.titulo} — sin derechos: ${
-                      e.motivoBloqueo ?? 'faltan derechos de uso para el ámbito cliente'
-                    }`}
+                {e.citable ? e.titulo : etiquetaObjetoBloqueado(e.titulo, e.motivoBloqueo)}
               </option>
             ))}
             {hayMasEvidencias && (

@@ -9,7 +9,7 @@ import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { etiquetaObjetoBloqueado, ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
   aprobarGateDeProyecto,
   marcarItemDeChecklist,
@@ -663,9 +663,7 @@ function ItemChecklist({
                       disabled={o.citable === false}
                     >
                       {o.citable === false
-                        ? `${o.titulo} — sin derechos: ${
-                            o.motivoBloqueo ?? 'faltan derechos de uso para el ámbito cliente'
-                          }`
+                        ? etiquetaObjetoBloqueado(o.titulo, o.motivoBloqueo)
                         : o.titulo}
                     </option>
                   ))}

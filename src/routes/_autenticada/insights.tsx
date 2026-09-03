@@ -8,7 +8,11 @@ import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
-import { ROLES_CURADORES, type EvidenciaCitable } from '@/lib/evidencia/evidencia.schemas';
+import {
+  etiquetaObjetoBloqueado,
+  ROLES_CURADORES,
+  type EvidenciaCitable,
+} from '@/lib/evidencia/evidencia.schemas';
 import {
   afirmarEnInsight,
   anotarContradiccion,
@@ -406,11 +410,7 @@ function FichaInsight({
                       crea. Deshabilitada CON su motivo, nunca oculta (SYS-14). */}
                   {evidencias.map((e) => (
                     <option key={e.id} value={e.id} disabled={!e.citable}>
-                      {e.citable
-                        ? e.titulo
-                        : `${e.titulo} — sin derechos: ${
-                            e.motivoBloqueo ?? 'faltan derechos de uso para el ámbito cliente'
-                          }`}
+                      {e.citable ? e.titulo : etiquetaObjetoBloqueado(e.titulo, e.motivoBloqueo)}
                     </option>
                   ))}
                   {hayMasEvidencias && (

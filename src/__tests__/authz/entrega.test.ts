@@ -2407,6 +2407,29 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       fechaObjetivo: HOY,
       elementos: [{ elementoId: elUno, razon: '' }],
     });
+    // La sucesora que la va a reemplazar, en borrador y con su elemento: sin ella la
+    // supersión de abajo no sería la de verdad.
+    const sucesora = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoAbierto,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que la reemplaza en vuelo',
+      resumen: '',
+      superaA: dv.designVersionId,
+    });
+    const sucesoraEnVuelo = sucesora.designVersionId;
+    await agregarElemento(leadId, {
+      workspaceId: ws,
+      designVersionId: sucesoraEnVuelo,
+      tipo: 'canal',
+      operacion: 'agrega',
+      titulo: 'Elemento de la sucesora',
+      detalle: '',
+      nodoId: null,
+      decisionIds: [],
+      insightIds: [],
+    });
 
     // Transacción A: toma el candado del SERVICIO —el mismo que toman aprobar y los dos
     // caminos del alcance— y supera la versión, y queda abierta. Avisa al TENER el
@@ -2419,8 +2442,24 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const supersion = conUsuario(leadId, async (tx) => {
       await tx`select pg_advisory_xact_lock(
         hashtextextended('designio:design-version:' || ${svcId}, 42))`;
+      // La supersión ENTERA, que es lo que esta transacción dice simular: aprobar la
+      // sucesora marca superada a la anterior y aprueba la nueva en la MISMA transacción.
+      // Se escribe a mano —y no llamando a `aprobarDesignVersion`— porque hay que dejarla
+      // abierta a mitad, que es justo lo que el servicio no permite. Marcar superada a
+      // secas ya no vale: sin sucesora aprobada al commit, el constraint diferido lo
+      // rechaza, y con razón.
       await tx`update design_version set estado = 'superada'
         where id = ${dv.designVersionId} and workspace_id = ${ws}`;
+      const [snap] = await tx`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${ws}, ${journeyId}, 'sucesión en vuelo',
+                jsonb_build_object('nodos', '[]'::jsonb, 'aristas', '[]'::jsonb,
+                                   'evidencias', '[]'::jsonb),
+                ${leadId})
+        returning id`;
+      await tx`update design_version
+        set estado = 'aprobada', aprobada_por = ${leadId}, snapshot_id = ${snap!.id as string}
+        where id = ${sucesoraEnVuelo} and workspace_id = ${ws}`;
       listo();
       await espera;
     });
@@ -2455,6 +2494,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
 
     const trasCarrera = await designVersionCompleta(leadId, ws, dv.designVersionId);
     expect(trasCarrera!.estado).toBe('superada');
+    expect(trasCarrera!.superadaPor!.id).toBe(sucesoraEnVuelo);
     expect(trasCarrera!.releases).toHaveLength(1);
     expect(
       trasCarrera!.releases[0]!.elementos.map((e) => e.elementoId),
@@ -3397,6 +3437,63 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const anclados = new Map(pagina.journeys.map((j) => [j.id, j.proyectoId]));
     expect(anclados.get(journeyAjeno)).toBe(otroProyectoId);
     expect([...anclados.values()]).toContain(null);
+  });
+
+  it('una versión no queda superada sin nadie que la reemplace (SYS-05)', async () => {
+    // `estado` está en el grant de columna y la política de supersión solo mira el par de
+    // estados, así que un UPDATE suelto las pasaba las dos y dejaba al servicio SIN versión
+    // vigente. Y ese estado NO TIENE SALIDA: el selector de «supera a» solo ofrece
+    // aprobadas —mismo predicado que el guard de anclaje— y `aprobarDesignVersion` exige
+    // mover la predecesora de 'aprobada' a 'superada', que ahí ya no alcanza ninguna fila.
+    // Misma familia que el effective state a medias, y misma respuesta: se endurece la
+    // invariante para que el estado sea inalcanzable, no se construye una reparación.
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio sin sucesora');
+    const primera = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoAbierto,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que nadie reemplaza',
+      resumen: '',
+      superaA: null,
+    });
+    await elementoSuelto(primera.designVersionId, 'Elemento de la primera');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: primera.designVersionId,
+      motivo: '',
+    });
+
+    // EL ATAQUE: la transición es legal y la política la deja pasar; lo que no hay es quien
+    // la suceda. Revienta al COMMIT, que es cuando la condición se puede exigir entera.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update design_version set estado = 'superada'
+        where id = ${primera.designVersionId} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/no hay ninguna versión aprobada que suceda a esta/);
+    const sigue = await designVersionCompleta(leadId, ws, primera.designVersionId);
+    expect(sigue!.estado).toBe('aprobada');
+
+    // Y el camino normal pasa, que es el otro extremo que hay que fijar: la supersión
+    // ocurre DENTRO de la transacción que aprueba a la sucesora, donde al marcar superada
+    // la sucesora todavía es un borrador. Por eso el constraint es diferido.
+    const siguienteCiclo = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoAbierto,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que sí la reemplaza',
+      resumen: '',
+      superaA: primera.designVersionId,
+    });
+    await elementoSuelto(siguienteCiclo.designVersionId, 'Elemento del ciclo siguiente');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: siguienteCiclo.designVersionId,
+      motivo: '',
+    });
+    const superada = await designVersionCompleta(leadId, ws, primera.designVersionId);
+    expect(superada!.estado).toBe('superada');
+    expect(superada!.superadaPor!.id).toBe(siguienteCiclo.designVersionId);
   });
 
   it('nada de esto cruza el workspace', async () => {

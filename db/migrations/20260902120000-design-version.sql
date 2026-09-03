@@ -1091,6 +1091,53 @@ create trigger design_version_transicion
   for each row execute function design_version_transicion_guard();
 revoke execute on function design_version_transicion_guard() from public;
 
+-- Y el otro lado de SYS-05: una design version pasa a 'superada' PORQUE otra la reemplaza,
+-- nunca a secas. La política de supersión solo mira el par de estados y `estado` está en el
+-- grant de columna, así que un UPDATE suelto del rol de la app las pasaba las dos y dejaba
+-- al servicio SIN versión vigente.
+--
+-- Y ese estado NO TIENE SALIDA, que es lo que decide el remedio: el selector de «supera a»
+-- solo ofrece versiones APROBADAS (mismo predicado que el guard de anclaje), y
+-- `aprobarDesignVersion` exige mover la predecesora de 'aprobada' a 'superada' — un update
+-- que ahí ya no alcanza ninguna fila. El servicio se quedaba sin poder declarar una versión
+-- nueva y sin nada que la app pudiera hacer al respecto. Misma familia que el effective
+-- state a medias, y misma respuesta: se endurece la invariante para que el estado sea
+-- INALCANZABLE, en vez de construir una reparación que legitimaría en el servicio lo que la
+-- base prohíbe. El conjunto de filas heredadas vuelve a ser vacío: la tabla nace aquí.
+--
+-- DIFERIDO por el mismo motivo que los otros dos de este esquema: en el instante del UPDATE
+-- la sucesora todavía es un BORRADOR — `aprobarDesignVersion` marca superada a la anterior
+-- ANTES de aprobar la nueva, porque el índice único parcial no admite dos aprobadas del
+-- mismo servicio a la vez—. Al COMMIT las dos escrituras están hechas y la condición se
+-- puede exigir entera sin imponer un orden de sentencias.
+--
+-- La sucesora NO tiene que ser del mismo proyecto, y esto es deliberado: `supera_a` está
+-- restringido por SERVICIO (design_version_anclaje_guard), y esa libertad es la salida que
+-- deja la regla del proyecto certificado —el ciclo siguiente se abre en otro proyecto— y lo
+-- que obliga a G7 a recorrer la cadena por servicio. Exigir aquí el mismo proyecto cerraría
+-- esa puerta por detrás.
+create function design_version_superada_con_sucesora_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  if not exists (
+    select 1 from design_version suc
+    where suc.supera_a = new.id and suc.workspace_id = new.workspace_id
+      and suc.estado = 'aprobada'
+  ) then
+    raise exception 'una design version se supera cuando otra la reemplaza: no hay ninguna versión aprobada que suceda a esta (SYS-05)';
+  end if;
+  return new;
+end $$;
+create constraint trigger design_version_superada_con_sucesora
+  after update on design_version
+  deferrable initially deferred
+  for each row when (new.estado = 'superada' and old.estado <> 'superada')
+  execute function design_version_superada_con_sucesora_guard();
+revoke execute on function design_version_superada_con_sucesora_guard() from public;
+
 -- El release nace planificado y deja su rastro; la DV aprobada la exige la política.
 create function release_alta_auditoria() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$

@@ -144,6 +144,7 @@ export const SISTEMA_EXTRACCION = [
   'Eres una capacidad de extracción de una plataforma de service design. Propones; una persona decide.',
   'Tu salida es una PROPUESTA de evidencia a partir de material importado: nunca crea nada por sí sola.',
   'Cada cita debe ser un fragmento LITERAL del material (copiado carácter a carácter, sin parafrasear) y su localización aproximada.',
+  'La FECHA del material se extrae, no se deduce: si el material la trae, dila con el sitio donde se lee; si no la trae, deja `fecha` en null y escribe en `fechaSinDatoMotivo` por qué no la hay. Una fecha inventada se persiste como proveniencia de la evidencia, así que es de lo más caro que puedes equivocarte.',
   'No afirmes nada sobre consentimiento de las personas: ese dato lo registra un humano fuera de aquí.',
   REGLAS_COMUNES,
 ].join('\n');
@@ -152,6 +153,7 @@ export const SISTEMA_CRITERIOS = [
   'Eres una capacidad de encuadre de retos de una plataforma de service design. Propones; una persona decide.',
   'Propones criterios de éxito MEDIBLES para un reto: cada uno con su definición de cálculo, su objetivo y su ventana de medición en días.',
   'Nunca inventes una línea base: propón el PLAN para obtenerla (qué dato, de qué fuente, quién lo saca).',
+  'Cada criterio CITA la parte de la formulación del reto que lo sostiene, con fragmentos LITERALES del material (copiados carácter a carácter): quien lo apruebe tiene que poder ver de dónde sale, y el G0 lo va a certificar después.',
   REGLAS_COMUNES,
 ].join('\n');
 
@@ -208,21 +210,46 @@ export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = 
       'resumen',
       'recoleccion',
       'fecha',
+      'fechaLocalizacion',
+      'fechaSinDatoMotivo',
       'derivada',
       'confianza',
       'confidencialidad',
       'esEstadoActual',
+      'confianzaPropuesta',
       'citas',
     ],
     properties: {
       titulo: { type: 'string', description: 'Título de la evidencia propuesta' },
       resumen: { type: 'string', description: 'Qué aporta esta evidencia' },
       recoleccion: { type: 'string', description: 'Cómo se recolectó el material' },
-      fecha: { type: 'string', description: 'Fecha del material en formato AAAA-MM-DD' },
+      fecha: {
+        type: ['string', 'null'],
+        description:
+          'Fecha del material en formato AAAA-MM-DD, o null si el material no la trae. NO la inventes ni la deduzcas de hoy',
+      },
+      fechaLocalizacion: {
+        type: 'string',
+        description: 'Dónde se lee esa fecha en el material. Cadena vacía si fecha es null',
+      },
+      fechaSinDatoMotivo: {
+        type: 'string',
+        description:
+          'Por qué no hay fecha, si fecha es null (p. ej. «el material no la menciona»). Cadena vacía si sí la hay',
+      },
       derivada: { type: 'boolean', description: 'true si NO es evidencia primaria' },
-      confianza: { type: 'string', enum: ['alta', 'media', 'baja'] },
+      confianza: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description: 'Cómo de sólida es la EVIDENCIA como prueba',
+      },
       confidencialidad: { type: 'string', enum: ['interna', 'cliente', 'restringida'] },
       esEstadoActual: { type: 'boolean', description: 'Describe el estado actual del servicio' },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description: 'Cómo de seguro estás de ESTA propuesta (no de la evidencia)',
+      },
       citas: {
         type: 'array',
         minItems: 1,
@@ -251,7 +278,16 @@ export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = 
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['kpi', 'definicion', 'objetivo', 'ventanaDias', 'lineaBasePlan', 'razonamiento'],
+          required: [
+            'kpi',
+            'definicion',
+            'objetivo',
+            'ventanaDias',
+            'lineaBasePlan',
+            'razonamiento',
+            'confianzaPropuesta',
+            'citas',
+          ],
           properties: {
             kpi: { type: 'string' },
             definicion: { type: 'string', description: 'Cómo se calcula exactamente' },
@@ -259,6 +295,28 @@ export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = 
             ventanaDias: { type: 'integer', minimum: 1, maximum: 3650 },
             lineaBasePlan: { type: 'string', description: 'Cómo obtener la línea base' },
             razonamiento: { type: 'string', description: 'Por qué este criterio sirve al reto' },
+            confianzaPropuesta: {
+              type: 'string',
+              enum: ['alta', 'media', 'baja'],
+              description: 'Cómo de seguro estás de ESTE criterio',
+            },
+            citas: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 6,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['fragmento', 'localizacion'],
+                properties: {
+                  fragmento: {
+                    type: 'string',
+                    description: 'Fragmento LITERAL de la formulación del reto que sostiene el criterio',
+                  },
+                  localizacion: { type: 'string', description: 'Qué parte del material es' },
+                },
+              },
+            },
           },
         },
       },

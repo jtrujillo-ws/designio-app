@@ -1073,10 +1073,16 @@ async function sembrarPropuestaAI(
       'El grueso del abandono se concentra en la carga del documento y en la espera del buró, sin aviso al cliente.',
     recoleccion: 'Sesión de análisis del funnel con el equipo de datos y Riesgo',
     fecha: '2026-07-20',
+    fechaLocalizacion: 'cabecera de la sesión',
+    fechaSinDatoMotivo: '',
     derivada: true,
     confianza: 'media',
     confidencialidad: 'cliente',
     esEstadoActual: true,
+    // Lo que el modelo dice de SU propuesta, que es lo que ordena la cola de revisión. No se
+    // confunde con `confianza`, que habla de la evidencia: esta propuesta se declara
+    // bastante segura y aun así trae una cita inventada — que es justo la lección.
+    confianzaPropuesta: 'alta',
     citas: [
       {
         fragmento:

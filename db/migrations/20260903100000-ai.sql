@@ -889,9 +889,16 @@ begin
   -- otra literal deja una propuesta de aspecto impecable y borra la señal que hay que ver.
   -- El servicio lo rechaza con su mensaje; esto es el suelo, porque una promesa que solo
   -- vive en un formulario la rompe cualquier cliente que hable con la server function.
-  if new.destino = 'evidencia'
-     and new.contenido -> 'citas' is distinct from new.contenido_original -> 'citas' then
-    raise exception 'las citas de una propuesta AI no se corrigen: son el rastro de lo que el modelo dijo haber leído';
+  -- Sin condicionar al destino: desde que C0 también cita —I4 dice «la AI propone Y CITA»—
+  -- la regla es de las citas y no del tipo de propuesta. Atarla a 'evidencia' habría dejado
+  -- las de C0 editables el mismo día que existieron. Y con ellas viaja la confianza que el
+  -- modelo declaró sobre su propia propuesta: es el dato que ORDENA la revisión humana, así
+  -- que dejar que la reescriba quien revisa sería maquillar la medida con la mano que se
+  -- está midiendo.
+  if new.contenido -> 'citas' is distinct from new.contenido_original -> 'citas'
+     or new.contenido -> 'confianzaPropuesta'
+        is distinct from new.contenido_original -> 'confianzaPropuesta' then
+    raise exception 'las citas y la confianza declarada de una propuesta AI no se corrigen: son el rastro de lo que el modelo dijo y con lo que se ordena la revisión';
   end if;
 
   -- RF-09.4/09.5 en la ACEPTACIÓN, que es la otra mitad del permiso. Generar ya exigía
@@ -1097,6 +1104,15 @@ begin
      and not reto_admite_criterios(new.reto_id, new.workspace_id) then
     raise exception 'ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo';
   end if;
+  -- Sin fecha no hay proveniencia que escribir, así que una extracción sin fechar no se
+  -- materializa: el modelo tiene permitido decir «el material no la trae» —para eso existe
+  -- el par fecha/motivo— y ponerla es entonces trabajo del humano al corregir (I4). El
+  -- servicio lo dice con el motivo que dio el modelo; esto es el suelo, y va antes de la
+  -- proyección para que el mensaje sea el de la causa y no el genérico.
+  if new.destino = 'evidencia' and new.contenido ->> 'fecha' is null then
+    raise exception 'esa propuesta no trae fecha del material: una evidencia se sitúa en el tiempo, así que hay que fecharla al corregir antes de aceptarla';
+  end if;
+
   -- LA PROYECCIÓN: los campos que la propuesta dicta, el objeto los lleva TAL CUAL. Es lo
   -- que convierte «nació en esta transacción» en «salió de esta propuesta», y lo que impide
   -- el caso que el `xmin` solo no veía: una evidencia escrita a mano, sellada en el mismo

@@ -248,9 +248,16 @@ export function normalizarNombreArchivo(nombre: string): string {
     // Y los overrides bidi, con la MISMA clase que rechaza el material importado: no se
     // reescriben dos veces los mismos rangos, se usa el que ya existe.
     .replace(new RegExp(BIDI.source, 'g'), '')
-    .replace(/\s+/g, ' ')
-    .replace(/^\.+/, '')
-    .trim()
+    // El ORDEN es parte de la regla, y esto se aprendió dos veces. Los espacios y los
+    // puntos iniciales se quitan JUNTOS: quitar los puntos primero no llega a `« .pdf»`
+    // (el espacio se interpone) y quitar los espacios primero no llega a `«. pdf»`. Con
+    // `^[ .]+` el resultado no depende de cuál llegue antes. Y la clase de espacio es
+    // LITERAL, no `\s`: `\s` de JavaScript incluye espacios Unicode que `[[:space:]]` de
+    // Postgres no, y el espejo de la base tiene que ser de la secuencia entera, no solo de
+    // los predicados. Los controles ya se fueron arriba, así que aquí solo queda U+0020.
+    .replace(/ +/g, ' ')
+    .replace(/^[ .]+/, '')
+    .replace(/ +$/, '')
     .slice(0, 200);
   return limpio.length > 0 ? limpio : 'adjunto';
 }

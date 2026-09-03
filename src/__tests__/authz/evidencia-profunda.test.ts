@@ -27,7 +27,11 @@ import {
 import { aprobarGate, marcarItem, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
 import { rechazarItem } from '@/lib/evidencia/evidencia.servicio';
 import { gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
-import { bytesABase64, MAX_ARCHIVOS_POR_ITEM } from '@/lib/evidencia/sanitizacion';
+import {
+  bytesABase64,
+  MAX_ARCHIVOS_POR_ITEM,
+  nombreSeguroParaFormato,
+} from '@/lib/evidencia/sanitizacion';
 import { describeAuthz, enVuelo, sigueEsperando } from './helpers';
 
 /**
@@ -2245,6 +2249,158 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
           where id = ${f.id as string}`;
       }
     }
+  });
+
+  it('para todo nombre que las restricciones VIEJAS aceptaban, la remediación produce uno que las NUEVAS aceptan', async () => {
+    // Esta migración abortó un despliegue DOS veces, con dos entradas distintas, y las dos
+    // se arreglaron probando «el ejemplo del hallazgo». Cuando eso pasa dos veces, lo que
+    // está mal no es solo el código: es el método de verificación. Así que el invariante se
+    // enuncia y se prueba sobre un corpus GENERADO, no sobre ejemplos elegidos a mano:
+    //
+    //   para todo nombre que las restricciones VIEJAS aceptaban, la remediación de la
+    //   migración produce un nombre que las restricciones NUEVAS aceptan.
+    //
+    // Es exactamente lo que la migración necesita cumplir para no abortar sobre una base
+    // con historia. Si algo cae, el caso concreto sale impreso sin que nadie tenga que
+    // imaginarlo.
+    //
+    // Y se comprueba también el ESPEJO: que la app y la base producen el MISMO nombre para
+    // toda entrada del corpus. La ronda anterior unificó los predicados
+    // (`sin_overrides_bidi`, la constante `BIDI`) y dejó sin unificar la SECUENCIA, que es
+    // donde estaba el segundo aborto: dos implementaciones pueden compartir todas sus
+    // piezas y componerlas en otro orden. El orden es parte de la regla.
+    const RLO = '‮'; // right-to-left override
+    const LRM = '‎'; // left-to-right mark
+    const PDI = '⁩'; // pop directional isolate
+    const NBSP = ' ';
+
+    const PREFIJOS = ['', ' ', '  ', '.', '..', ' .', '. ', ' . ', '  ..  '];
+    const BASES = ['informe', 'informe  final', 'análisis de canal', '', 'a'.repeat(205)];
+    const BIDIS: readonly ((b: string) => string)[] = [
+      (b) => b,
+      (b) => RLO + b,
+      (b) => b.slice(0, 2) + LRM + b.slice(2),
+      (b) => b + PDI,
+      () => RLO + LRM + PDI,
+    ];
+    const EXTENSIONES = ['', '.pdf', '.txt', '.PDF', '.tar.gz'];
+    const SUFIJOS = ['', ' ', '  ', NBSP];
+    const MIMES = ['application/pdf', 'text/plain'];
+
+    const casos: { nombre: string; mime: string }[] = [];
+    const vistos = new Set<string>();
+    let combinaciones = 0;
+    for (const pre of PREFIJOS) {
+      for (const base of BASES) {
+        for (const bidi of BIDIS) {
+          for (const ext of EXTENSIONES) {
+            for (const suf of SUFIJOS) {
+              for (const mime of MIMES) {
+                combinaciones += 1;
+                const nombre = pre + bidi(base) + ext + suf;
+                const clave = `${mime} ${nombre}`;
+                if (vistos.has(clave)) continue;
+                vistos.add(clave);
+                casos.push({ nombre, mime });
+              }
+            }
+          }
+        }
+      }
+    }
+    // El corpus tiene que contener los DOS abortos ya conocidos, o no está bien construido:
+    // si una refactorización futura deja de generarlos, este test lo dice aquí y no en el
+    // despliegue.
+    expect(casos.some((c) => c.nombre === `${RLO}.pdf`)).toBe(true);
+    expect(casos.some((c) => c.nombre === ` ${RLO}.pdf`)).toBe(true);
+    expect(combinaciones).toBeGreaterThan(3000);
+    expect(casos.length).toBeGreaterThan(500);
+
+    const admin = sqlAdmin();
+    const { fallos, espejoRoto, aceptadosPorLasViejas } = await admin.begin(async (tx) => {
+      // El juez de «las restricciones NUEVAS» no es una transcripción: es una tabla creada
+      // con las restricciones REALES de `archivo_importado`. Transcribirlas aquí sería la
+      // segunda redacción de la regla, que es el defecto que este PR lleva toda la revisión
+      // cerrando. Sin triggers (LIKE no los copia), así que el tope de adjuntos por item no
+      // estorba y cada fila la juzgan solo los CHECK.
+      await tx`create temp table espejo_nombres
+        (like archivo_importado including constraints) on commit drop`;
+      await tx`create temp table corpus (nombre text, mime text) on commit drop`;
+      await tx`create temp table fallos
+        (nombre text, mime text, nuevo text, err text) on commit drop`;
+      for (let i = 0; i < casos.length; i += 500) {
+        await tx`insert into corpus ${tx(casos.slice(i, i + 500), 'nombre', 'mime')}`;
+      }
+
+      await tx.unsafe(`
+        do $$
+        declare r record; v_nuevo text;
+        begin
+          for r in select nombre, mime from corpus loop
+            v_nuevo := nombre_con_extension_del_formato(
+                         nombre_archivo_saneado(r.nombre), r.mime);
+            begin
+              insert into espejo_nombres
+                (id, workspace_id, item_id, nombre, tipo_mime, contenido, creado_por, creado_en)
+              values (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), v_nuevo,
+                      r.mime, decode('25504446', 'hex'), gen_random_uuid(), now());
+            exception when others then
+              insert into fallos values (r.nombre, r.mime, v_nuevo, sqlerrm);
+            end;
+          end loop;
+        end $$`);
+
+      // «Las restricciones VIEJAS» es el texto que `archivo_nombre_seguro` tenía ANTES de
+      // esta migración, más `archivo_extension_del_formato` de 20260902150000. Esto sí se
+      // transcribe, y no hay con qué compartirlo: es una regla histórica que ya no existe
+      // en la base y es el ANTECEDENTE del invariante, no una regla viva. El backslash sale
+      // de `chr(92)` para que el literal no dependa de tres capas de escapes.
+      const aceptados = await tx`select c.nombre, c.mime,
+          nombre_con_extension_del_formato(nombre_archivo_saneado(c.nombre), c.mime) as nuevo
+        from corpus c
+        where length(c.nombre) between 1 and 200
+          and c.nombre !~ '[[:cntrl:]]'
+          and strpos(c.nombre, '/') = 0
+          and strpos(c.nombre, chr(92)) = 0
+          and strpos(c.nombre, '"') = 0
+          and c.nombre not like '.%'
+          and lower(c.nombre) like any (
+                coalesce(patrones_extension_formato(c.mime), array[]::text[]))`;
+
+      const viejasOk = new Set(aceptados.map((f) => `${f.mime as string} ${f.nombre as string}`));
+      const caidos = await tx`select nombre, mime, nuevo, err from fallos`;
+      // Y el espejo se comprueba sobre TODO el corpus, no solo sobre lo que las viejas
+      // aceptaban: la app normaliza cualquier nombre que llegue, venga de donde venga.
+      const todos = await tx`select c.nombre, c.mime,
+          nombre_con_extension_del_formato(nombre_archivo_saneado(c.nombre), c.mime) as nuevo
+        from corpus c`;
+      return {
+        aceptadosPorLasViejas: aceptados.length,
+        // Solo incumplen el invariante los que las viejas SÍ aceptaban: de un nombre que ya
+        // era ilegal antes no se promete nada.
+        fallos: caidos.filter((f) => viejasOk.has(`${f.mime as string} ${f.nombre as string}`)),
+        espejoRoto: todos
+          .filter((f) => nombreSeguroParaFormato(f.nombre as string, f.mime as string) !== f.nuevo)
+          .slice(0, 5),
+      };
+    });
+
+    // No vacuo: si el filtro dejara fuera casi todo, el invariante se cumpliría por no
+    // tener nada que cumplir.
+    expect(aceptadosPorLasViejas).toBeGreaterThan(100);
+    expect(
+      fallos.map(
+        (f) =>
+          `${JSON.stringify(f.nombre)} (${f.mime as string}) → ${JSON.stringify(f.nuevo)}: ${f.err as string}`,
+      ),
+    ).toEqual([]);
+    expect(
+      espejoRoto.map(
+        (f) =>
+          `${JSON.stringify(f.nombre)} (${f.mime as string}): base ${JSON.stringify(f.nuevo)} vs app ` +
+          JSON.stringify(nombreSeguroParaFormato(f.nombre as string, f.mime as string)),
+      ),
+    ).toEqual([]);
   });
 
   it('la procedencia del sembrado es un SELLO: la aplicación la lee y no la escribe', async () => {

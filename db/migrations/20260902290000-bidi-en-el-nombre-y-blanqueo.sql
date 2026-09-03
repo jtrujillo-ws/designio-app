@@ -40,30 +40,48 @@ comment on function texto_importado_limpio(text) is
 -- lleva toda la revisión cerrando: dos redacciones de la misma regla, una con su caso de
 -- reserva y otra sin él.
 --
--- El caso que lo destapa: un adjunto llamado `<RLO>.pdf` es perfectamente legal con las
--- restricciones viejas. Quitarle solo el bidi deja `.pdf`, que NO es un nombre —es un
--- fichero oculto sin base— y que además el `archivo_nombre_seguro` de entonces rechaza por
--- empezar con punto. La app ya resolvía esto (quita los puntos iniciales y cae a `adjunto`
--- si no queda nada); la migración tenía que salir de la misma limpieza, no de una versión
--- corta escrita aparte.
-create function nombre_archivo_saneado(t text) returns text
+-- Y NO BASTA CON COMPARTIR LAS PIEZAS: el orden en que se componen ES parte de la regla.
+-- Esta migración ha abortado un despliegue DOS veces, con dos entradas distintas, y las dos
+-- por lo mismo. Primero `<RLO>.pdf`: quitarle solo el bidi deja `.pdf`, que no es un nombre
+-- —es un fichero oculto sin base— y que `archivo_nombre_seguro` rechaza por empezar con
+-- punto. Después `« <RLO>.pdf»` —con un espacio delante, igual de legal para las
+-- restricciones viejas—: se quitaba el bidi, se intentaban quitar los puntos iniciales CON
+-- EL ESPACIO TODAVÍA DELANTE (así que `^\.+` no casaba con nada) y solo al final se
+-- recortaban los espacios. Resultado: `.pdf` otra vez.
+--
+-- La lección es la de este PR entero leída un nivel más arriba. La ronda anterior unificó
+-- el PREDICADO —`sin_overrides_bidi` en la base, la constante `BIDI` en la app— y dejó sin
+-- unificar la SECUENCIA. Dos implementaciones pueden compartir todos sus predicados y
+-- seguir difiriendo en el orden en que los componen; ahí el espejo deja de serlo. Ahora los
+-- espacios y los puntos iniciales se quitan JUNTOS (`^[ .]+`), que es lo único que no
+-- depende de cuál llegue primero, y los espacios se colapsan con una clase LITERAL (` +`)
+-- en vez de `\s`: `\s` de JavaScript incluye espacios Unicode que `[[:space:]]` de Postgres
+-- no, y una clase que difiere entre motores tampoco es un espejo.
+--
+-- Y el método de verificación cambia con el código: dos abortos con dos entradas distintas
+-- dicen que probar «el ejemplo del hallazgo» no cierra nada. El invariante está enunciado y
+-- probado sobre un corpus GENERADO en `evidencia-profunda.test.ts`: para todo nombre que
+-- las restricciones VIEJAS aceptaban, la remediación produce uno que las NUEVAS aceptan.
+create or replace function nombre_archivo_saneado(t text) returns text
 language sql immutable parallel safe as
 $$
   select coalesce(nullif(
-    left(btrim(
-      regexp_replace(                                    -- 5) puntos iniciales
-        regexp_replace(                                  -- 4) espacios colapsados
-          regexp_replace(                                -- 3) overrides bidi
-            regexp_replace(                              -- 2) controles y comilla doble
-              regexp_replace(t, '^.*[/\\]', ''),       -- 1) solo el nombre base
-            '[\u0000-\u001f\u007f-\u009f"]', '', 'g'),
-          '[\u200e\u200f\u202a-\u202e\u2066-\u2069]', '', 'g'),
-        '\s+', ' ', 'g'),
-      '^\.+', '')
-    ), 200), ''), 'adjunto')
+    left(
+      regexp_replace(                                  -- 6) espacios finales
+        regexp_replace(                                -- 5) espacios Y puntos iniciales
+          regexp_replace(                              -- 4) espacios colapsados
+            regexp_replace(                            -- 3) overrides bidi
+              regexp_replace(                          -- 2) controles y comilla doble
+                regexp_replace(t, '^.*[/\\]', ''),   -- 1) solo el nombre base
+              '[\u0000-\u001f\u007f-\u009f"]', '', 'g'),
+            '[\u200e\u200f\u202a-\u202e\u2066-\u2069]', '', 'g'),
+          ' +', ' ', 'g'),
+        '^[ .]+', ''),
+      ' +$', '')
+    , 200), ''), 'adjunto')
 $$;
 comment on function nombre_archivo_saneado(text) is
-'Espejo de normalizarNombreArchivo: base sin ruta, sin controles ni comilla doble, sin overrides bidi, espacios colapsados, sin puntos iniciales, recortado a 200 y con «adjunto» de reserva si no queda nada.';
+'Espejo de normalizarNombreArchivo, PASO A PASO Y EN EL MISMO ORDEN: base sin ruta, sin controles ni comilla doble, sin overrides bidi, espacios colapsados, sin espacios ni puntos por delante (juntos: quitarlos por separado depende de cual llegue primero), sin espacios por detras, recortado a 200 y con «adjunto» de reserva si no queda nada.';
 
 -- ── Y la extensión canónica, que es el TERCER predicado en juego ──
 -- Sanear el nombre no basta: `<RLO>.pdf` queda `pdf`, que ya no casa con

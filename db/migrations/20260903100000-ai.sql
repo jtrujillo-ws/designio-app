@@ -499,16 +499,33 @@ create policy llamada_insert on llamada_ai
 create function llamada_ai_registro_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
+  -- Este guard tiene TRES casos, no dos, y por eso el pre-chequeo de aquí arriba no es el
+  -- mismo que el de los demás. El anti-oráculo de siempre —«no miembro ⇒ `return new`»— no
+  -- sirve tal cual porque `app_user_id()` es nulo también para el PROPIETARIO, así que
+  -- aplicarlo a secas dejaría sin regla justo a la escritura privilegiada, que es donde más
+  -- falta hace un suelo. Y quitarlo a secas abre un oráculo de verdad: los `raise` de abajo
+  -- DISTINGUEN casos («este material exige consentimiento» vs. «no lo exige»), así que
+  -- alguien sondeando uuids desde el rol de aplicación aprendería si un item de otro tenant
+  -- existe y de qué tipo es — la política rechazaría el insert después, pero lo que se
+  -- filtra no es la fila, es la respuesta.
+  --
+  -- Los tres casos, separados por QUIÉN está conectado (`session_user`, que sí distingue al
+  -- llamante: `current_user` no vale porque SECURITY DEFINER lo cambia al propietario):
+  --
+  --   · propietario o superusuario  → se aplica la regla. Es el suelo del SQL directo.
+  --   · rol de aplicación, miembro  → se aplica la regla, con sus mensajes diagnósticos.
+  --   · rol de aplicación, no miembro → `return new`: no hay nada que diagnosticarle a quien
+  --     la política no va a dejar escribir, y callar aquí es lo que cierra el oráculo.
+  if session_user = 'designio_app'
+     and not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+
   -- La OTRA mitad de la ligadura del consentimiento, la que ninguna FK puede expresar
   -- porque depende del `tipo_fuente` del item: citar una versión es obligatorio cuando el
   -- material es de personas, y está prohibido cuando no lo es. Sin las dos direcciones, un
   -- `null` sería ambiguo entre «no aplicaba» y «no lo escribí», y la remediación de RF-09.4
   -- no puede distinguir esas dos cosas leyendo el libro — que es para lo único que sirve.
-  --
-  -- Va ANTES del pre-chequeo anti-oráculo de abajo, y a propósito: esto no revela nada (el
-  -- caller ya trae el item y la versión, y sin ser miembro la política no le deja insertar
-  -- de todos modos), y ponerlo después dejaría la regla sin aplicar justo en la escritura
-  -- privilegiada, que es donde más falta hace un suelo.
   if new.item_id is not null then
     if exists (select 1 from item_importacion i
       where i.id = new.item_id and i.workspace_id = new.workspace_id
@@ -521,6 +538,8 @@ begin
       raise exception 'ese material no exige consentimiento: la llamada no puede citar uno, porque la ausencia es lo que significa «no aplicaba»';
     end if;
   end if;
+  -- Y el evento sigue siendo cosa de miembros, como en el resto de guards: una escritura
+  -- privilegiada no tiene rol de workspace que anotar, y el `actor_rol` quedaría vacío.
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
@@ -1079,13 +1098,44 @@ begin
   -- dice la propuesta con lo que dicen el item y la bitácora de consentimiento, así que
   -- compararla entera ataría este guard al mapeo del servicio y se rompería a la primera
   -- que alguien añada una dimensión.
+  --
+  -- Y la lista NO se detiene en el borde de la columna: dentro de `dimensiones` hay claves
+  -- que también vienen verbatim de la propuesta, y dejarlas fuera dejaba el mismo agujero
+  -- abierto para ellas. De dónde sale CADA clave del jsonb, que es lo que hay que mirar
+  -- antes de añadir una dimensión nueva:
+  --
+  --   · de la PROPUESTA (y por tanto se comparan aquí):
+  --       proveniencia.fecha, metodo.recoleccion, metodo.derivada,
+  --       calidad.confianza, derechos.confidencialidad
+  --   · del LINEAGE de la propia fila (columnas `modelo` y `prompt_version`, no `contenido`):
+  --       lineage.modelo, lineage.promptVersion  — se comparan también, porque afirman por
+  --       qué modelo pasó esta evidencia y eso es exactamente lo que SYS-19 exige que sea
+  --       cierto
+  --   · del ITEM de la bandeja (no se comparan: la propuesta no los dice):
+  --       proveniencia.tipoFuente, proveniencia.localizacion
+  --   · de la BITÁCORA de consentimiento (no se compara, y a propósito: los derechos no los
+  --     propone la AI):
+  --       derechos.consentimiento
+  --   · constantes de la materialización (no se comparan):
+  --       metodo.segmentoIds, calidad.corroboraIds, calidad.contradiceIds
+  --
+  -- Una dimensión nueva que venga del item o del consentimiento no rompe nada porque no
+  -- está en la lista; una que venga de la propuesta hay que añadirla, que es justo la
+  -- decisión que conviene que alguien tome a conciencia.
   if new.destino = 'evidencia' and not exists (
     select 1 from evidencia e
     where e.id = new.evidencia_id and e.workspace_id = new.workspace_id
       and e.titulo = new.contenido->>'titulo'
       and e.resumen = new.contenido->>'resumen'
-      and e.es_estado_actual = (new.contenido->>'esEstadoActual')::boolean) then
-    raise exception 'la evidencia materializada no dice lo que dice la propuesta: el título, el resumen y «es estado actual» se copian tal cual de la propuesta aceptada (SYS-19)';
+      and e.es_estado_actual = (new.contenido->>'esEstadoActual')::boolean
+      and e.dimensiones#>>'{proveniencia,fecha}' = new.contenido->>'fecha'
+      and e.dimensiones#>>'{metodo,recoleccion}' = new.contenido->>'recoleccion'
+      and e.dimensiones#>>'{metodo,derivada}' = new.contenido->>'derivada'
+      and e.dimensiones#>>'{calidad,confianza}' = new.contenido->>'confianza'
+      and e.dimensiones#>>'{derechos,confidencialidad}' = new.contenido->>'confidencialidad'
+      and e.dimensiones#>>'{lineage,modelo}' = new.modelo
+      and e.dimensiones#>>'{lineage,promptVersion}' = new.prompt_version) then
+    raise exception 'la evidencia materializada no dice lo que dice la propuesta: el título, el resumen, «es estado actual», la fecha, la recolección, si es derivada, la confianza, la confidencialidad y el lineage se copian tal cual de la propuesta aceptada (SYS-19)';
   end if;
   if new.destino = 'criterio-exito' and not exists (
     select 1 from criterio_exito c

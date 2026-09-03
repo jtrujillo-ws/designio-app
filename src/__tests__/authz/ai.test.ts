@@ -2699,6 +2699,32 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     await expect(llamada(entrevista, null)).rejects.toThrow(/falta consentimiento_version/i);
     await expect(llamada(nota, 1)).rejects.toThrow(/no exige consentimiento/i);
 
+    // Y el guard NO responde a quien no es de aquí: sus mensajes distinguen «este material
+    // exige consentimiento» de «no lo exige» y de «esa versión no existe», así que
+    // contestarle a un no-miembro convertiría el guard en un oráculo — sondeando uuids se
+    // aprendería si un item de otro tenant existe y de qué tipo es, aunque la política
+    // rechace el insert justo después. Lo que se filtraría no es la fila, es la respuesta.
+    const [wsZ] = await admin`insert into workspace (nombre) values (${marca + '-Z'}) returning id`;
+    const [uz] = await admin`insert into usuario (email, nombre, estado)
+      values (${marca + '-z@test.demo'}, 'De otra casa', 'activo') returning id`;
+    await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${wsZ!.id as string}, ${uz!.id as string}, 'De otra casa',
+              ${marca + '-z@test.demo'}, 'lead-boutique')`;
+    try {
+      const forastero = conUsuario(uz!.id as string, (tx) => tx`insert into llamada_ai
+        (workspace_id, capacidad, item_id, modelo, origen_key, resultado, motivo,
+         consentimiento_version, creado_por)
+        values (${ws}, 'CI', ${entrevista}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                '', null, ${uz!.id as string})`);
+      await expect(forastero).rejects.toThrow(/row-level security/i);
+      // Y en concreto: NO se lleva el diagnóstico que sí recibe quien sí es de aquí.
+      await expect(forastero).rejects.not.toThrow(/falta consentimiento_version/i);
+    } finally {
+      await admin`delete from miembro where workspace_id = ${wsZ!.id as string}`;
+      await admin`delete from workspace where id = ${wsZ!.id as string}`;
+      await admin`delete from usuario where id = ${uz!.id as string}`;
+    }
+
     // Control: los dos casos buenos entran.
     const [buena] = await llamada(entrevista, 1);
     const [sinPersonas] = await llamada(nota, null);
@@ -2756,16 +2782,55 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       }),
     ).rejects.toThrow(/no dice lo que dice la propuesta/i);
 
+    // Y la variante fina, que es la que se escapaba: los tres campos de columna coinciden
+    // con la propuesta —así que la comprobación de arriba pasa— y lo falsificado vive DENTRO
+    // de `dimensiones`, que también se copia verbatim en cinco de sus claves más el lineage.
+    // Una fecha, una confianza o un modelo distintos convierten la evidencia en otra cosa
+    // mientras la propuesta consta como aceptada tal cual.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [f] = await tx`insert into fuente (workspace_id, tipo, titulo, referencia,
+            creado_por)
+          values (${ws}, 'nota', 'Fuente a mano', 'ref', ${leadId}) returning id`;
+        const [e] = await tx`insert into evidencia
+          (workspace_id, fuente_id, titulo, resumen, dimensiones, es_estado_actual, creado_por)
+          values (${ws}, ${f!.id as string}, ${CONTENIDO_CI.titulo}, ${CONTENIDO_CI.resumen},
+                  ${tx.json({
+                    proveniencia: { tipoFuente: 'nota', fecha: '2020-01-01', localizacion: 'ref' },
+                    metodo: { recoleccion: 'otra cosa', derivada: false, segmentoIds: [] },
+                    calidad: { confianza: 'alta', corroboraIds: [], contradiceIds: [] },
+                    derechos: { consentimiento: false, confidencialidad: 'interna' },
+                    lineage: { modelo: 'otro-modelo', promptVersion: 'v0' },
+                  })},
+                  ${CONTENIDO_CI.esEstadoActual}, ${leadId}) returning id`;
+        const evidenciaId = e!.id as string;
+        await tx`update item_importacion
+          set estado = 'aprobado', decidido_por = ${leadId}, decidido_en = now(),
+              evidencia_id = ${evidenciaId}
+          where id = ${itemId} and workspace_id = ${ws}`;
+        await tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${evidenciaId}
+          where id = ${propuestaId} and workspace_id = ${ws}`;
+      }),
+    ).rejects.toThrow(/no dice lo que dice la propuesta/i);
+
     // Y por el camino bueno, el vínculo queda ESCRITO en la fila materializada — no en la
     // propuesta, que es la que afirma— y lo escribe el guard: la aplicación no tiene grant
     // sobre esa columna ni para ponerla ni para quitarla.
     const r = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
     expect(r.estado).toBe('aceptada');
-    const [ev] = await conUsuario(leadId, (tx) => tx`select titulo, propuesta_ai_id
-      from evidencia where id = ${r.objetoId}`);
+    const [ev] = await conUsuario(leadId, (tx) => tx`select titulo, dimensiones,
+        propuesta_ai_id from evidencia where id = ${r.objetoId}`);
     expect(ev!.propuesta_ai_id).toBe(propuestaId);
-    // El título es el de la propuesta, que es lo que la proyección exige.
+    // El título es el de la propuesta, que es lo que la proyección exige — y las claves del
+    // jsonb que también se copian, también.
     expect(ev!.titulo).toBe(CONTENIDO_CI.titulo);
+    const dim = ev!.dimensiones as Record<string, Record<string, unknown>>;
+    expect(dim.proveniencia!.fecha).toBe(CONTENIDO_CI.fecha);
+    expect(dim.metodo!.recoleccion).toBe(CONTENIDO_CI.recoleccion);
+    expect(dim.calidad!.confianza).toBe(CONTENIDO_CI.confianza);
+    expect(dim.derechos!.confidencialidad).toBe(CONTENIDO_CI.confidencialidad);
+    expect(dim.lineage!.modelo).toBe(MODELO_PRIMARIO);
     await expect(
       conUsuario(leadId, (tx) => tx`update evidencia set propuesta_ai_id = null
         where id = ${r.objetoId}`),

@@ -1255,11 +1255,15 @@ export async function proyectosCertificados(
 ): Promise<string[]> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // La misma función que usan los dos guards, no una consulta que se le parezca: si el
+    // picker y el guard tuvieran cada uno su definición de «proyecto certificado», bastaría
+    // tocar una para que la pantalla ofreciera lo que la base rechaza.
     const filas = await tx`
-      select distinct g.proyecto_id
-      from gate_instancia g
-      where g.workspace_id = ${workspaceId} and g.numero in (6, 7) and g.estado = 'aprobado'`;
-    return filas.map((f) => f.proyecto_id as string);
+      select p.id
+      from proyecto p
+      where p.workspace_id = ${workspaceId}
+        and gate_certificado_del_proyecto(p.id, p.workspace_id) is not null`;
+    return filas.map((f) => f.id as string);
   });
 }
 

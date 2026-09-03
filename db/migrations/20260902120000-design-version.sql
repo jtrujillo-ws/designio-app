@@ -658,6 +658,12 @@ returns int language sql stable as $$
     and g.numero in (6, 7) and g.estado = 'aprobado'
 $$;
 revoke execute on function gate_certificado_del_proyecto(uuid, uuid) from public;
+-- La pantalla de alta la llama para no ofrecer proyectos que el guard va a rechazar. Se le
+-- da la MISMA función y no una consulta parecida: «qué gate certifica» tiene que decirse en
+-- un solo sitio o el picker y el guard acaban discrepando, que es justo el fallo que ya
+-- costó una ronda con el vigilante de la cobertura. No es SECURITY DEFINER, así que leer
+-- gate_instancia desde el rol de la app pasa por su política de siempre.
+grant execute on function gate_certificado_del_proyecto(uuid, uuid) to designio_app;
 
 -- ¿De qué design versions responde ESTE proyecto ante sus gates? La pregunta del gate y la
 -- pregunta de la supersión son distintas, y durante un tiempo las contestó el mismo filtro:

@@ -82,6 +82,28 @@ export function costoDeUso(modelo: string, uso: UsoTokens): number | null {
   return Math.round(Math.max(0, usd) * 1_000_000) / 1_000_000;
 }
 
+/** Cuántos decimales tiene de verdad un coste: los que persiste `llamada_ai.costo_usd`
+ * (`numeric(12,6)`) y a los que redondea `costoDeUso`. Vive aquí, pegado a quien calcula,
+ * para que la pantalla no pueda enseñar menos precisión de la que hay sin que se vea. */
+const DECIMALES_COSTE = 6;
+
+/** El coste de una llamada, escrito con la precisión que tiene. La pantalla lo mostraba con
+ * `toFixed(4)`, que convierte un coste real de `$0.00004` en `$0.0000`: decía «gratis» sobre
+ * algo que se paga, y mentía en la dirección que ESCONDE el problema — mil llamadas
+ * invisibles son los céntimos que un presupuesto por workspace (RF-09.12) existe justo para
+ * ver venir, y el mismo número que el reporte de costes suma.
+ *
+ * Sin ceros de relleno más allá de los dos habituales, para que un coste normal se lea de un
+ * vistazo. Y la regla que no se negocia: un valor distinto de cero JAMÁS se presenta como
+ * cero — si cayera por debajo de lo representable, se dice con esas palabras. */
+export function formatearCosteUsd(usd: number): string {
+  if (usd === 0) return '$0.00';
+  const recortado = usd.toFixed(DECIMALES_COSTE).replace(/0+$/, '').replace(/\.$/, '');
+  if (Number(recortado) === 0) return `< $${(10 ** -DECIMALES_COSTE).toFixed(DECIMALES_COSTE)}`;
+  const decimales = recortado.split('.')[1]?.length ?? 0;
+  return `$${decimales >= 2 ? recortado : Number(recortado).toFixed(2)}`;
+}
+
 /** El proveedor no puede colgar una pantalla: pasado este techo la llamada se aborta y
  * la capacidad se reporta como no disponible en esta operación. */
 export const TIMEOUT_PROVEEDOR_MS = 25_000;

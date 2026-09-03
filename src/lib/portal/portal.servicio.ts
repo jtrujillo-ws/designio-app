@@ -52,12 +52,14 @@ export async function abrirHilo(
       // dinámicos y con la FK compuesta de cada padre rechazando el objeto ajeno.
       const [hilo] = await tx`
         insert into hilo_comentario
-          (workspace_id, reto_id, proyecto_id, gate_id, evidencia_id, abierto_por)
+          (workspace_id, reto_id, proyecto_id, gate_id, evidencia_id, design_version_id,
+           abierto_por)
         values (${entrada.workspaceId},
                 ${tipo === 'reto' ? id : null},
                 ${tipo === 'proyecto' ? id : null},
                 ${tipo === 'gate_instancia' ? id : null},
                 ${tipo === 'evidencia' ? id : null},
+                ${tipo === 'design_version' ? id : null},
                 ${actorId})
         returning id`;
       hiloId = hilo!.id as string;

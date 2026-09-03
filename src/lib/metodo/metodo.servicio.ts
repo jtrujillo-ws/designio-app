@@ -213,8 +213,15 @@ async function bloquearGate(tx: TransactionSql, gateId: string): Promise<void> {
  * así que mutar criterios y decidir un G0 deben serializarse a nivel de reto (misma
  * carrera de snapshots que marcar↔aprobar). Toda operación que tome ambos candados los
  * toma en este orden — reto y DESPUÉS gate — y cualquier servicio futuro que edite
- * criterios debe tomar este candado antes de su sentencia decisora. */
-async function bloquearReto(tx: TransactionSql, retoId: string): Promise<void> {
+ * criterios debe tomar este candado antes de su sentencia decisora.
+ *
+ * Se EXPORTA porque ya no es solo del método: desde SPEC-06, quitarle el release a un
+ * elemento tiene que serializarse contra la aprobación de G6 (lo que el gate certificó
+ * sigue siendo cierto), y `entrega.servicio` lo toma para eso. El nombre del candado tiene
+ * que ser el mismo en los dos lados o no hay serialización ninguna, así que se comparte la
+ * función en vez de repetir la cadena — es el primero de los dos que toma `aprobarGate`,
+ * de modo que quien lo tome no puede adelantarse a una aprobación en curso. */
+export async function bloquearReto(tx: TransactionSql, retoId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
 }
 
@@ -347,6 +354,11 @@ export async function aprobarGate(
       // mensaje genérico de reintento en vez del motivo — y el motivo es lo único que
       // dice qué hacer. Vale para las condiciones que la consulta de arriba espeja y
       // también para las que no: el traductor cubre la que se añada mañana.
+      //
+      // De SPEC-06 llegan por aquí los motivos más concretos —«hay elementos de la design
+      // version sin release asignado», «el proyecto no tiene ninguna design version
+      // aprobada con elementos que certificar»—, y el diagnóstico por cero filas sigue
+      // detrás para lo que la política rechaza sin decir nada.
       const err = e as { code?: string; message?: string };
       if (err.code === 'P0001' && err.message) throw new ErrorMetodo(err.message);
       throw e;

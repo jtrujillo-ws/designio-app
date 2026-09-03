@@ -533,12 +533,14 @@ export async function journeysDelWorkspace(
   actorId: string,
   workspaceId: string,
   cursor: string | null = null,
+  filtro: { servicioId?: string | null; tipo?: string | null } = {},
 ): Promise<{ journeys: ResumenJourney[]; siguiente: string | null }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     // Se pide una fila de más para saber si hubo recorte sin contar la tabla entera.
     const filas = await tx`
-      select j.id, j.nombre, j.tipo, s.nombre as servicio_nombre,
+      select j.id, j.nombre, j.tipo, j.servicio_id, s.nombre as servicio_nombre,
+        j.proyecto_id,
         (select count(*)::int from journey_nodo n
           where n.journey_id = j.id and n.workspace_id = j.workspace_id) as nodos,
         (select count(*)::int from journey_snapshot sn
@@ -546,6 +548,9 @@ export async function journeysDelWorkspace(
       from journey j
       join servicio s on s.id = j.servicio_id and s.workspace_id = j.workspace_id
       where j.workspace_id = ${workspaceId}
+        and (${filtro.servicioId ?? null}::uuid is null
+             or j.servicio_id = ${filtro.servicioId ?? null}::uuid)
+        and (${filtro.tipo ?? null}::text is null or j.tipo = ${filtro.tipo ?? null}::text)
         and (${cursor}::uuid is null or (j.creado_en, j.id) < (
           select c.creado_en, c.id from journey c
           where c.id = ${cursor}::uuid and c.workspace_id = ${workspaceId}))
@@ -557,7 +562,9 @@ export async function journeysDelWorkspace(
         id: f.id as string,
         nombre: f.nombre as string,
         tipo: f.tipo as ResumenJourney['tipo'],
+        servicioId: f.servicio_id as string,
         servicioNombre: f.servicio_nombre as string,
+        proyectoId: (f.proyecto_id as string | null) ?? null,
         nodos: f.nodos as number,
         snapshots: f.snapshots as number,
       })),

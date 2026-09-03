@@ -319,6 +319,32 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
           >
             {servicio.nombre}
           </div>
+          {/* Lo que el servicio hace HOY (RF-06.10). Va bajo su nombre y no dentro de un
+              reto porque el estado efectivo es del SERVICIO: lo dejan ahí los releases
+              verificados de cualquiera de sus design versions, sea cual sea el proyecto que
+              las llevó. Sin esto, el dato que este árbol existe para ubicar solo se veía
+              entrando en una design version concreta — o sea, sabiendo ya la respuesta. */}
+          {servicio.estadoEfectivo && (
+            <div
+              style={{
+                font: '400 11px var(--font-sans)',
+                color: 'var(--text-faint)',
+                padding: '0 10px 5px 22px',
+                display: 'flex',
+                gap: 6,
+                alignItems: 'baseline',
+              }}
+            >
+              <span style={{ font: '500 10.5px var(--font-mono)', color: 'var(--accent)', flexShrink: 0 }}>
+                {servicio.estadoEfectivo.codigo}
+              </span>
+              <span style={truncado}>
+                {servicio.estadoEfectivo.resumen !== ''
+                  ? servicio.estadoEfectivo.resumen
+                  : `constatado el ${servicio.estadoEfectivo.constatadoEn} sobre ${servicio.estadoEfectivo.designVersionCodigo}`}
+              </span>
+            </div>
+          )}
           {servicio.retos.map((reto) => (
             <div key={reto.id}>
               <div style={filaArbol}>
@@ -370,6 +396,9 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
       </Link>
       <Link to="/journeys" style={{ ...item, textDecoration: 'none' }}>
         <span>Journeys y blueprints</span>
+      </Link>
+      <Link to="/design-versions" style={{ ...item, textDecoration: 'none' }}>
+        <span>Design versions y releases</span>
       </Link>
       <div style={item}>
         <span>Aprobaciones pendientes</span>

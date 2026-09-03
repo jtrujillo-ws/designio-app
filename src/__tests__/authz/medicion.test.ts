@@ -144,8 +144,94 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     return d.toISOString().slice(0, 10);
   }
 
+  /** Hoy en UTC: es el calendario en el que la base juzga cuando nadie declara desfase. */
+  const hoy = (): string => new Date().toISOString().slice(0, 10);
+
+  /**
+   * Deja al proyecto con una design version APROBADA y con elementos.
+   *
+   * Desde SPEC-06, G5 firma el diseño y no se aprueba sin él: la etapa 5 entrega justamente
+   * la design version. Estos tests van de medición, no de diseño, así que el artefacto se
+   * fabrica por el camino corto —pero por el camino REAL, que es el único que la base acepta:
+   * nace en borrador, recibe su elemento, y se aprueba congelando el snapshot en esa misma
+   * transición. Tres commits, porque los guards diferidos miran al COMMIT y no a mitad de
+   * transacción.
+   */
+  async function disenoAprobado(proyecto: string): Promise<void> {
+    const admin = sqlAdmin();
+    const [ya] = await admin`select 1 from design_version
+      where proyecto_id = ${proyecto} and workspace_id = ${ws} and estado <> 'borrador'`;
+    if (ya) return;
+    // Servicio PROPIO para cada proyecto, no el que ancla su reto: una design version
+    // aprobada es única por servicio (`design_version_vigente_uniq`), así que dos proyectos
+    // del mismo reto chocarían; y además el servicio ancla es el que los tests de medición ya
+    // usan para lo suyo, y este fixture no tiene por qué moverlo.
+    const [s2] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, ${'Servicio del diseño de ' + proyecto}, ${leadId}) returning id`;
+    const svc = s2!.id as string;
+    // Y el reto lo declara AFECTADO: aprobar revalida que el proyecto cuelgue de un reto que
+    // toque este servicio, y esa comprobación no se salta ni para el administrador.
+    const [ctx] = await admin`select reto_id from proyecto
+      where id = ${proyecto} and workspace_id = ${ws}`;
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${ctx!.reto_id as string}, ${svc}, ${ws}, ${leadId})
+      on conflict do nothing`;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svc}, 'to-be', ${'To-be de ' + proyecto}, ${leadId}) returning id`;
+    const jId = j!.id as string;
+    const [dv] = await admin`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, journey_id, titulo, creado_por)
+      values (${ws}, ${proyecto}, ${svc}, ${jId}, 'Diseño del fixture', ${leadId}) returning id`;
+    const dvId = dv!.id as string;
+    await admin`insert into elemento_cambio
+      (workspace_id, design_version_id, tipo, operacion, titulo, creado_por)
+      values (${ws}, ${dvId}, 'canal', 'agrega', 'Lo que el fixture cambia', ${leadId})`;
+    await admin.begin(async (tx) => {
+      const [snap] = await tx`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${ws}, ${jId}, 'Aprobación del fixture',
+          jsonb_build_object('nodos', '[]'::jsonb, 'aristas', '[]'::jsonb, 'evidencias', '[]'::jsonb),
+          ${leadId}) returning id`;
+      await tx`update design_version
+        set estado = 'aprobada', snapshot_id = ${snap!.id as string}, aprobada_por = ${leadId}
+        where id = ${dvId} and workspace_id = ${ws}`;
+    });
+    // Y el diseño queda CONCILIADO, porque G6 exige que cada elemento tenga release (RF-06.4)
+    // y G7 que ninguno quede en estado desconocido (RF-06.7). Se recorre la cadena entera —
+    // planificar, desplegar, constatar, verificar— en transacciones separadas, que es como la
+    // acepta la base: los guards diferidos miran al COMMIT.
+    const [el] = await admin`select id from elemento_cambio
+      where design_version_id = ${dvId} and workspace_id = ${ws}`;
+    const elId = el!.id as string;
+    const [rl] = await admin`insert into release
+      (workspace_id, design_version_id, titulo, responsable, fecha_objetivo, creado_por)
+      values (${ws}, ${dvId}, 'Release del fixture', 'Equipo', ${hoy()}::date, ${leadId})
+      returning id`;
+    const rlId = rl!.id as string;
+    await admin`insert into release_elemento
+      (elemento_id, release_id, workspace_id, razon, creado_por)
+      values (${elId}, ${rlId}, ${ws}, '', ${leadId})`;
+    await admin`update release set estado = 'desplegado', desplegado_en = ${hoy()}::date
+      where id = ${rlId} and workspace_id = ${ws}`;
+    await admin.begin(async (tx) => {
+      const [es] = await tx`insert into effective_state
+        (workspace_id, servicio_id, release_id, resumen, constatado_por, constatado_en)
+        values (${ws}, ${svc}, ${rlId}, '', ${leadId}, ${hoy()}::date) returning id`;
+      await tx`insert into constatacion
+        (workspace_id, effective_state_id, elemento_id, resultado, creado_por)
+        values (${ws}, ${es!.id as string}, ${elId}, 'como-aprobado', ${leadId})`;
+      await tx`update release set estado = 'verificado'
+        where id = ${rlId} and workspace_id = ${ws}`;
+    });
+  }
+
   /** Deja el checklist de un gate limpio y lo aprueba con SU rol aprobador. */
   async function aprobarGateNumero(numero: number, deProyecto = ''): Promise<void> {
+    const objetivo = deProyecto === '' ? proyectoId : deProyecto;
+    // G5 firma el diseño, así que el diseño tiene que existir y estar congelado (RF-06.3).
+    if (numero >= 5) await disenoAprobado(objetivo);
     const p = await proyectoMetodo(leadId, ws, deProyecto === '' ? proyectoId : deProyecto);
     const gate = p!.gates[numero]!;
     for (const item of gate.items) {
@@ -274,6 +360,20 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
       await admin`delete from reapertura_insight where workspace_id = ${ws}`;
       await admin`delete from reapertura_etapa where workspace_id = ${ws}`;
+      // La cadena de entrega que `disenoAprobado` fabrica para pasar G5/G6/G7 (SPEC-06). Va
+      // en UNA transacción porque sus guards diferidos exigen que el alcance no cambie
+      // después del despliegue y que un elemento solo viva en un borrador: en sentencias
+      // sueltas, cada borrado commitea con el resto todavía en pie y los levanta con razón.
+      await admin.begin(async (tx) => {
+        await tx`delete from constatacion where workspace_id = ${ws}`;
+        await tx`delete from effective_state where workspace_id = ${ws}`;
+        await tx`delete from release_elemento where workspace_id = ${ws}`;
+        await tx`delete from release where workspace_id = ${ws}`;
+        await tx`delete from elemento_cambio where workspace_id = ${ws}`;
+        await tx`delete from design_version where workspace_id = ${ws}`;
+      });
+      await admin`delete from journey_snapshot where workspace_id = ${ws}`;
+      await admin`delete from journey where workspace_id = ${ws}`;
       await admin`delete from proyecto where workspace_id = ${ws}`;
       await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
       await admin`delete from reto where workspace_id = ${ws}`;
@@ -2485,6 +2585,12 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       fechaPostMortem: null,
     });
     criterioHeredadoId = c.criterioId;
+    // Su diseño va PRIMERO, y el orden no es cosmético: aprobar una design version en un
+    // proyecto que ya certificó G6 lo rechaza `design_version_transicion_guard` (el ciclo
+    // siguiente va en otro proyecto, SPEC-04), así que una historia escrita al revés no se
+    // puede completar después. Este proyecto llega hasta G7 por el camino normal más abajo,
+    // y ese gate exige la cadena conciliada (RF-06.7): el fixture la deja hecha aquí.
+    await disenoAprobado(proyectoHeredadoId);
     // El guard que hoy exige el registry en G6 es `before update`, así que se apaga solo
     // para ESCRIBIR ese pasado: es lo único que la base no deja inventar de otra forma.
     await admin`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;

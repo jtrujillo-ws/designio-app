@@ -252,6 +252,41 @@ revoke execute on function numero_de_serie(text) from public;
 -- Las dos lecturas corren como el rol de la app, así que necesita el grant.
 grant execute on function numero_de_serie(text) to designio_app;
 
+-- ── El EFFECTIVE STATE VIGENTE de un servicio (RF-06.10) ──
+-- La constatación más reciente de todas las que dejaron sus releases VERIFICADOS, cuelguen
+-- de la design version que cuelguen: el estado es del SERVICIO, no de la versión. Un release
+-- de DV-1 que ya salió cambió el servicio de verdad aunque DV-2 lo haya reemplazado en el
+-- papel, y su constatación es lo que mete ese cambio en el estado contra el que se calculan
+-- los diffs siguientes.
+--
+-- `p_excluir_dv` está por el único lector que necesita apartar algo: el detalle de una design
+-- version calcula su diff contra «lo que hay SIN contar lo mío», así que excluye sus propios
+-- effective states. El árbol no aparta nada y pasa null. Es UN parámetro y no dos funciones
+-- porque lo que tiene que ser idéntico —cuál es el más reciente— es justo lo que se comparte;
+-- si cada lector eligiera por su cuenta volveríamos a tener dos verdades sobre el mismo
+-- estado, que es el fallo que este esquema ya se ha comido dos veces (ver
+-- `gate_certificado_del_proyecto` y `g7_motivo_de_bloqueo`).
+--
+-- El desempate del mismo día es por NÚMERO DE SERIE y no por el sello, por lo que explica
+-- `numero_de_serie` ahí arriba.
+create function effective_state_vigente_del_servicio(
+  p_servicio uuid, p_workspace uuid, p_excluir_dv uuid default null
+) returns uuid language sql stable as $$
+  select es.id
+  from effective_state es
+  join release r on r.id = es.release_id and r.workspace_id = es.workspace_id
+  where es.servicio_id = p_servicio and es.workspace_id = p_workspace
+    and r.estado = 'verificado'
+    and (p_excluir_dv is null or r.design_version_id <> p_excluir_dv)
+  order by es.constatado_en desc, numero_de_serie(es.codigo) desc
+  limit 1
+$$;
+revoke execute on function effective_state_vigente_del_servicio(uuid, uuid, uuid) from public;
+-- La llaman el detalle de la design version y el ÁRBOL, los dos como el rol de la app. No es
+-- SECURITY DEFINER: leer effective_state desde ella pasa por su política de siempre, así que
+-- el árbol no puede ver por aquí un estado que su RLS le negaría por la puerta principal.
+grant execute on function effective_state_vigente_del_servicio(uuid, uuid, uuid) to designio_app;
+
 -- ── Constatación por elemento, con la desviación dentro (RF-06.6, SYS-07) ──
 -- La «Desviación» del modelo NO es otra tabla: es una constatación cuyo resultado no es
 -- 'como-aprobado'. Separarlas permitiría constatar un elemento como desviado sin

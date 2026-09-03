@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 
 /**
  * CTX-04/CTX-05 — Los cuatro objetos de resultado (SPEC-06, ADR-0004): design version
@@ -99,8 +100,27 @@ export const ETIQUETA_RESULTADO: Record<ResultadoConstatacion, string> = {
 
 // ── Contratos de entrada ──
 
-/** Fecha calendárica: `date` en SQL, texto YYYY-MM-DD en TypeScript. */
-const FechaSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Fecha con formato YYYY-MM-DD');
+/**
+ * Fecha calendárica: `date` en SQL, texto AAAA-MM-DD en TypeScript.
+ *
+ * Se REUTILIZA `FechaCalendarioSchema` en vez de escribir aquí otro patrón, y el patrón que
+ * había estaba mal por lo que este módulo lleva toda la noche corrigiendo: dos redacciones
+ * de la misma regla, y la de aquí era la que no sabía. Comprobaba la FORMA —cuatro dígitos,
+ * dos, dos— y no el CALENDARIO, así que `2026-02-31` pasaba el validador, llegaba al
+ * `::date` de Postgres y reventaba con un 22008 que ni `comoErrorDeDominio` ni `mensajeDe`
+ * traducen: el llamador recibía un fallo genérico en vez del `{ ok: false, error }` del
+ * contrato, y con un código de error de la base asomando por debajo.
+ *
+ * El compartido sí valida el calendario, y con el cuidado que hace falta: compara por
+ * componentes porque el parser ISO de V8 RUEDA los desbordes (2026-02-30 → 2 de marzo) en
+ * vez de rechazarlos. Un `refine` propio aquí habría sido una tercera redacción del mismo
+ * problema; `metodo.schemas.ts` ya lo importa de evidencia por lo mismo, así que el camino
+ * estaba abierto.
+ *
+ * Vive en el módulo de evidencia por dónde nació, no porque sea suyo: «qué es un día del
+ * calendario» no es de ningún contexto en particular.
+ */
+const FechaSchema = FechaCalendarioSchema;
 
 /**
  * Los topes del texto libre, en UN solo sitio porque los leen DOS que no pueden discrepar:

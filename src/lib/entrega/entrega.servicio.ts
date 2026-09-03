@@ -1166,18 +1166,19 @@ export async function designVersionCompleta(
                 where es2.servicio_id = dv.servicio_id and es2.workspace_id = dv.workspace_id
                   and r2.design_version_id <> dv.id and r2.estado = 'verificado'
               ) u), '[]'::jsonb))
+          -- CUÁL es el vigente lo decide effective_state_vigente_del_servicio, que es la
+          -- misma función que usa el árbol: si cada lector eligiera por su cuenta, la
+          -- pantalla del servicio y el detalle de la versión acabarían enseñando estados
+          -- distintos del mismo servicio. Aquí se le pasa dv.id a excluir, porque el diff
+          -- se calcula contra lo que hay SIN contar esta versión.
           from (
             select es3.id, es3.codigo, es3.constatado_en, dv3.codigo as dv_codigo
             from effective_state es3
             join release r3 on r3.id = es3.release_id and r3.workspace_id = es3.workspace_id
             join design_version dv3 on dv3.id = r3.design_version_id
               and dv3.workspace_id = r3.workspace_id
-            where es3.servicio_id = dv.servicio_id and es3.workspace_id = dv.workspace_id
-              and r3.design_version_id <> dv.id and r3.estado = 'verificado'
-            -- Mismo desempate y por el mismo motivo que la historia de arriba: el ES
-            -- vigente es el ÚLTIMO de la serie, no el del sello más nuevo.
-            order by es3.constatado_en desc, numero_de_serie(es3.codigo) desc
-            limit 1
+            where es3.id = effective_state_vigente_del_servicio(
+              dv.servicio_id, dv.workspace_id, dv.id)
           ) v) as vigente
       from design_version dv
       join servicio s on s.id = dv.servicio_id and s.workspace_id = dv.workspace_id

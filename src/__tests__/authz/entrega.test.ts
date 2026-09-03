@@ -25,10 +25,16 @@ import {
   versionAprobadaDelServicio,
 } from '@/lib/entrega/entrega.servicio';
 import { calcularDiff, conciliacionCompleta, plegarEstadoVigente } from '@/lib/entrega/entrega.diff';
+import {
+  ConstatarSchema,
+  DesplegarReleaseSchema,
+  PlanificarReleaseSchema,
+} from '@/lib/entrega/entrega.schemas';
 import { aprobarGate, ErrorMetodo } from '@/lib/metodo/metodo.servicio';
 import { revalidarDecision } from '@/lib/metodo/gobernanza.servicio';
 import { abrirHilo, hilosDeObjetos } from '@/lib/portal/portal.servicio';
 import { borrarNodo, journeysDelWorkspace } from '@/lib/journey/journey.servicio';
+import { arbolParaUsuario } from '@/lib/arbol/arbol.queries';
 import { describeAuthz } from './helpers';
 
 /**
@@ -3985,6 +3991,122 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proyC} and workspace_id = ${ws} and numero = 7`,
     ).rejects.toThrow(/estado desconocido/);
+  });
+
+  it('el estado efectivo llega al ÁRBOL, que es donde se busca un servicio (RF-06.10)', async () => {
+    // RF-06.10 pide el estado operativo DERIVADO del servicio. Existía —lo calcula el
+    // detalle de una design version—, pero solo ahí: para verlo había que saber ya qué
+    // design version mirar, o sea tener la respuesta antes de la pregunta. El árbol es donde
+    // se busca un servicio, así que es donde el dato tiene que estar.
+    const { servicioId: svcId, journeyId } = await servicioConToBe('Servicio con estado operativo');
+    const { servicioId: svcVirgen } = await servicioConToBe('Servicio que nadie ha tocado');
+    const proy = await proyectoConGates('P-126', 'Proyecto del estado operativo');
+    const dv = await crearDesignVersion(leadId, {
+      workspaceId: ws,
+      proyectoId: proy,
+      servicioId: svcId,
+      journeyId,
+      titulo: 'La que deja estado',
+      resumen: '',
+      superaA: null,
+    });
+    const el = await elementoSuelto(dv.designVersionId, 'Lo que cambia de verdad');
+    await aprobarDesignVersion(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      motivo: '',
+    });
+    const rl = await planificarRelease(leadId, {
+      workspaceId: ws,
+      designVersionId: dv.designVersionId,
+      titulo: 'El que sale',
+      responsable: 'Equipo',
+      fechaObjetivo: HOY,
+      elementos: [{ elementoId: el, razon: '' }],
+    });
+
+    const servicioEnElArbol = async (id: string) => {
+      const arbol = await arbolParaUsuario(leadId, ws);
+      return arbol!.servicios.find((s) => s.id === id)!;
+    };
+
+    // Antes de constatar no hay estado efectivo, y decirlo con null es más honesto que
+    // fingir uno vacío: el release ha salido pero nadie ha mirado todavía cómo quedó.
+    await desplegarRelease(leadId, {
+      workspaceId: ws,
+      releaseId: rl.releaseId,
+      desplegadoEn: HOY,
+      desfaseUtcMinutos: 0,
+    });
+    expect((await servicioEnElArbol(svcId)).estadoEfectivo).toBeNull();
+
+    await constatarEffectiveState(leadId, {
+      workspaceId: ws,
+      releaseId: rl.releaseId,
+      constatadoEn: HOY,
+      desfaseUtcMinutos: 0,
+      resumen: 'La atención pasó a ser asistida',
+      constataciones: [
+        { elementoId: el, resultado: 'como-aprobado', queQuedoDistinto: '', razon: '' },
+      ],
+    });
+
+    const conEstado = await servicioEnElArbol(svcId);
+    expect(conEstado.estadoEfectivo).not.toBeNull();
+    expect(conEstado.estadoEfectivo!.resumen).toBe('La atención pasó a ser asistida');
+    expect(conEstado.estadoEfectivo!.constatadoEn).toBe(HOY);
+    // Y de qué versión salió, que es lo que hace que el código ubique algo.
+    const [dvCodigo] = await sqlAdmin()`select codigo from design_version
+      where id = ${dv.designVersionId} and workspace_id = ${ws}`;
+    expect(conEstado.estadoEfectivo!.designVersionCodigo).toBe(dvCodigo!.codigo as string);
+    // El código es el que la MISMA función elige como vigente, no uno cualquiera.
+    const [vigente] = await sqlAdmin()`select codigo from effective_state
+      where id = effective_state_vigente_del_servicio(${svcId}, ${ws})`;
+    expect(conEstado.estadoEfectivo!.codigo).toBe(vigente!.codigo as string);
+
+    // Un servicio que nadie ha tocado no inventa estado.
+    expect((await servicioEnElArbol(svcVirgen)).estadoEfectivo).toBeNull();
+  });
+
+  it('una fecha que no existe se rechaza en el borde, no en el ::date de Postgres', async () => {
+    // El patrón de antes comprobaba la FORMA y no el CALENDARIO, así que '2026-02-31' pasaba
+    // el validador, llegaba al `::date` y reventaba con un 22008 que ni `comoErrorDeDominio`
+    // ni `mensajeDe` traducen: el llamador recibía un fallo genérico —con un código de la
+    // base asomando— en vez del `{ ok: false, error }` del contrato.
+    //
+    // Ahora las tres fechas del módulo usan el MISMO esquema que ya validaba el calendario
+    // en el resto del repositorio. Se prueban las tres: si mañana nace un campo de fecha con
+    // otro patrón, este test no lo ve, pero al menos las que hay comparten redacción.
+    const base = { workspaceId: crypto.randomUUID(), releaseId: crypto.randomUUID() };
+    const imposibles = ['2026-02-31', '2026-04-31', '2026-13-01', '2026-00-10'];
+    const bisiesto = '2028-02-29';
+
+    for (const fecha of imposibles) {
+      expect(
+        PlanificarReleaseSchema.safeParse({
+          workspaceId: base.workspaceId,
+          designVersionId: crypto.randomUUID(),
+          titulo: 'Da igual',
+          responsable: 'Da igual',
+          fechaObjetivo: fecha,
+        }).success,
+      ).toBe(false);
+      expect(
+        DesplegarReleaseSchema.safeParse({ ...base, desplegadoEn: fecha }).success,
+      ).toBe(false);
+      expect(
+        ConstatarSchema.safeParse({
+          ...base,
+          constatadoEn: fecha,
+          constataciones: [{ elementoId: crypto.randomUUID(), resultado: 'como-aprobado' }],
+        }).success,
+      ).toBe(false);
+    }
+
+    // Y un 29 de febrero de año bisiesto SÍ existe: rechazar de más sería el otro fallo.
+    expect(DesplegarReleaseSchema.safeParse({ ...base, desplegadoEn: bisiesto }).success).toBe(
+      true,
+    );
   });
 
   it('el orden del pliegue es la SERIE, no el sello: la que empieza antes puede numerar después', async () => {

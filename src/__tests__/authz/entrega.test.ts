@@ -1601,7 +1601,7 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     expect(dv!.journeyId).toBe(ja!.id as string);
   });
 
-  it('G6 no firma un plan que no existe ni uno con elementos sin release (RF-06.4)', async () => {
+  it('G5 no firma un diseño que no existe, y G6 no firma un plan sin cobertura (RF-06.3, RF-06.4)', async () => {
     const admin = sqlAdmin();
     const [p] = await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
       values (${ws}, ${retoId}, 'P-94', 'Proyecto del plan', ${leadId}) returning id`;
@@ -1619,27 +1619,29 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
     const aprobarGateCrudo = (n: number) =>
       admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
         where proyecto_id = ${proyG6} and workspace_id = ${ws} and numero = ${n}`;
-    for (let n = 0; n <= 5; n++) await aprobarGateCrudo(n);
+    for (let n = 0; n <= 4; n++) await aprobarGateCrudo(n);
 
-    // Sin design version aprobada no hay plan que firmar: el gemelo vacuo de la regla,
-    // igual que en G7. El ítem del checklist está cumplido y no demuestra nada — registra
-    // un objeto citado o un N/A, no deriva cobertura de release_elemento.
-    await expect(aprobarGateCrudo(6)).rejects.toThrow(
-      /ninguna design version con elementos que planificar/,
+    // Sin design version no se llega ni a G6: G5 firma el DISEÑO, y la etapa 5 entrega
+    // precisamente la design version. El ítem del checklist está cumplido y no demuestra
+    // nada — registra un objeto citado o un N/A, no deriva nada de design_version.
+    await expect(aprobarGateCrudo(5)).rejects.toThrow(
+      /ninguna design version aprobada con elementos que certificar/,
     );
     // Y por el camino de la app llega el MISMO motivo, no un fallo genérico: el porqué es
     // el producto de este guard, y sin traducir el P0001 la pantalla no lo enseñaba.
-    const [g6Crudo] = await admin`select id from gate_instancia
-      where proyecto_id = ${proyG6} and workspace_id = ${ws} and numero = 6`;
+    const [g5Crudo] = await admin`select id from gate_instancia
+      where proyecto_id = ${proyG6} and workspace_id = ${ws} and numero = 5`;
     const fallo = await aprobarGate(sponsorId, {
       workspaceId: ws,
-      gateId: g6Crudo!.id as string,
+      gateId: g5Crudo!.id as string,
     }).catch((e: unknown) => e);
     // Del TIPO depende que la pantalla lo enseñe: el mapeador de las server functions
     // devuelve el mensaje de un ErrorMetodo y deja escapar cualquier otro como fallo
     // genérico. Que el texto coincida no basta si llega como error de Postgres.
     expect(fallo).toBeInstanceOf(ErrorMetodo);
-    expect((fallo as Error).message).toMatch(/ninguna design version con elementos que planificar/);
+    expect((fallo as Error).message).toMatch(
+      /ninguna design version aprobada con elementos que certificar/,
+    );
 
     const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
       values (${ws}, 'Servicio del plan', ${leadId}) returning id`;
@@ -1680,11 +1682,21 @@ describeAuthz('entrega: design version, releases parciales, effective state y G7
       decisionIds: [],
       insightIds: [],
     });
+    // Con la versión creada pero en BORRADOR, G5 sigue sin poder firmarse: lo que el cliente
+    // firma tiene que estar CONGELADO. Un borrador se sigue editando después de la firma, que
+    // es la certificación-que-cambia-de-contenido que este esquema existe para impedir.
+    await expect(aprobarGateCrudo(5)).rejects.toThrow(
+      /ninguna design version aprobada con elementos que certificar/,
+    );
+
     await aprobarDesignVersion(leadId, {
       workspaceId: ws,
       designVersionId: dvPlan.designVersionId,
       motivo: '',
     });
+    // Ahora sí hay diseño congelado que certificar, así que G5 pasa. Y este es el orden que
+    // el método describe: la etapa 5 entrega la design version y G5 la firma.
+    await aprobarGateCrudo(5);
 
     // Con la versión aprobada pero un elemento sin release, G6 sigue sin poder firmarse:
     // RF-06.4 dice «CADA elemento asignado a exactamente un release con dueño y fecha».

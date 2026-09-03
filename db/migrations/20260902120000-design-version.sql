@@ -2220,6 +2220,36 @@ begin
         and a.estado = 'hipotesis') then
       raise exception 'no se puede aprobar G2: hay arquetipos sin confirmar ni refutar (RF-04.11)';
     end if;
+    -- G5 firma el DISEÑO. La etapa 5 («Detalle de solución») entrega precisamente la design
+    -- version, y el criterio del gate es «design version completa y consistente, piezas
+    -- críticas validadas, APROBADA POR EL CLIENTE». Así que el gate no puede aprobarse sin
+    -- que exista lo que dice certificar.
+    --
+    -- Es el mismo argumento que la rama de G6, palabra por palabra: que el ítem del checklist
+    -- esté cumplido no lo demuestra —un ítem registra un objeto citado o un N/A razonado, y
+    -- no deriva nada de design_version—, así que sin esto G5 certificaba un diseño que podía
+    -- no existir. Y con G5 firmado sobre la nada, `gate_certificado_del_proyecto` tampoco lo
+    -- ve, con lo que después se puede aprobar cualquier versión: la aprobación del cliente
+    -- acababa desligada de todo diseño concreto.
+    --
+    -- Se exige APROBADA (o superada: aprobada estuvo) y no un borrador, porque lo que el
+    -- cliente firma tiene que estar CONGELADO. Un borrador sigue editándose después de la
+    -- firma, que es exactamente la certificación-que-cambia-de-contenido que este esquema
+    -- existe para impedir. `design_versions_a_cargo_del_proyecto` ya devuelve solo no
+    -- borradores, así que basta con reusarla — la misma que usan G6 y G7.
+    --
+    -- Lo que esto NO hace es fijar G5 a UNA versión concreta, y es deliberado: ver el porqué
+    -- en `gate_certificado_del_proyecto`, donde se explica por qué G5 no entra en ese
+    -- conjunto. Aquí se exige que el diseño exista y esté congelado, no que sea para siempre
+    -- el único.
+    if new.numero = 5 and not exists (
+      select 1 from design_version dv
+      where dv.id in (select design_versions_a_cargo_del_proyecto(new.proyecto_id, new.workspace_id))
+        and exists (select 1 from elemento_cambio ec
+          where ec.design_version_id = dv.id and ec.workspace_id = dv.workspace_id)
+    ) then
+      raise exception 'no se puede aprobar G5: el proyecto no tiene ninguna design version aprobada con elementos que certificar (RF-06.3)';
+    end if;
     -- G6 firma el PLAN (RF-06.4): «cada elemento de la design version queda asignado a
     -- exactamente un release con dueño y fecha». Que el ítem del checklist esté cumplido
     -- no lo demuestra — un ítem cumplido registra un objeto citado o un N/A razonado, y

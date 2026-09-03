@@ -300,11 +300,18 @@ begin
   -- SQL crudo —el único camino que hoy inserta aquí sin crear la decisión a la vez—
   -- participe también.
   --
-  -- Cero filas es el resultado NORMAL por el camino del servicio, y es correcto:
-  -- `registrarDecision` crea la decisión y sus enlaces en UNA sentencia, y una fila
-  -- insertada por un CTE hermano no es visible para este trigger. Una decisión que nace en
-  -- esta misma sentencia no puede estar citada todavía por el ítem de ningún gate, así que
-  -- no hay nada contra lo que serializarse: `perform` sin filas no es un fallo.
+  -- Sobre el camino del servicio, COMPROBADO con una sonda en la base y no razonado: en
+  -- `registrarDecision` la decisión y sus enlaces salen de UNA sentencia con CTEs, y este
+  -- trigger SÍ ve la fila que insertó el CTE hermano (la sonda contó 1). O sea que toma su
+  -- candado con normalidad; no hace falta ninguna excepción.
+  --
+  -- Y la corrección tampoco depende de eso: una decisión que nace en esta misma sentencia
+  -- no puede estar citada todavía por el ítem de ningún gate, así que aunque la fila no se
+  -- viera y `perform` no encontrara ninguna, no habría nada contra lo que serializarse.
+  -- `perform` sin filas no es un fallo. Se deja dicho porque lo primero que escribí aquí
+  -- fue justo lo contrario —«una fila insertada por un CTE hermano no es visible»— y era
+  -- falso: un comentario que afirma una propiedad que la base no tiene es peor que
+  -- ninguno.
   perform 1 from decision d
     where d.id = new.decision_id and d.workspace_id = new.workspace_id
     for no key update;

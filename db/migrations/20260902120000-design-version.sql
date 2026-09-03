@@ -1086,7 +1086,10 @@ begin
         where n2.journey_id = new.journey_id and ne.workspace_id = new.workspace_id), '[]'::jsonb))
     where s.id = new.snapshot_id and s.workspace_id = new.workspace_id
       and s.journey_id = new.journey_id;
-    if not found then
+    -- Sin sello no hay nada que escribir, y el veredicto es del CHECK de la tabla («una
+    -- no-borrador exige los tres sellos»), no de aquí: si esto abortara, el mensaje diría
+    -- «el snapshot no es de este journey» sobre una aprobación que ni siquiera declaró uno.
+    if new.snapshot_id is not null and not found then
       raise exception 'el snapshot que se congela no es del journey de esta design version';
     end if;
     -- Y que el snapshot que se congela pueda RESPONDER por cada nodo enlazado. Sin FK en

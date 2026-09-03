@@ -2816,6 +2816,38 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     await sqlAdmin()`update evidencia set propuesta_ai_id = null where id = ${r.objetoId}`;
   });
 
+  it('una ventana de medio día no se guarda como un día: la rechaza el contrato, no el navegador', async () => {
+    // El `step={1}` del input es una ayuda al usuario y no llega al servidor. Lo que sostiene
+    // el dato es el esquema, y para que pueda hacerlo el valor tiene que llegarle ENTERO:
+    // con `parseInt` el 2.5 se convertía en 2 antes de que Zod lo viera, así que quien
+    // escribía dos días y medio guardaba dos sin enterarse. En una ventana de medición ese
+    // día decide qué snapshots entran.
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C0',
+      destino: 'criterio-exito',
+      retoId,
+      contenido: CONTENIDO_C0,
+    });
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...CONTENIDO_C0, ventanaDias: 2.5 },
+      }),
+    ).rejects.toThrow(/no cumple el formato/i);
+    // Y el entero equivalente sí entra: lo que se rechaza es la fracción, no la corrección.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: { ...CONTENIDO_C0, ventanaDias: 3 },
+    });
+    expect(r.estado).toBe('corregida');
+    const [c] = await conUsuario(leadId, (tx) => tx`select ventana_dias from criterio_exito
+      where id = ${r.objetoId}`);
+    expect(c!.ventana_dias).toBe(3);
+    await sqlAdmin()`update criterio_exito set propuesta_ai_id = null where id = ${r.objetoId}`;
+  });
+
   it('los relojes del slice no los escribe quien se mide con ellos', async () => {
     // Tres relojes que gobiernan decisiones y que la aplicación NO puede escribir, porque
     // `creado_en` está fuera de los tres grants de INSERT: el tope diario del workspace se

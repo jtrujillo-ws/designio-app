@@ -1197,7 +1197,13 @@ function FormularioCriterio({
           kpi,
           definicion,
           objetivo,
-          ventanaDias: Number.parseInt(ventanaDias, 10),
+          // `Number` y no `parseInt`: `parseInt('2.5')` devuelve 2 en SILENCIO, así que
+          // quien escribiera dos días y medio guardaba dos sin que nadie se lo dijera — y
+          // en una ventana de medición ese día decide qué snapshots entran. `Number` deja
+          // pasar el 2.5 hasta el esquema, que es quien tiene que rechazarlo (`.int()`), y
+          // convierte el vacío en 0 y la basura en NaN, que `.positive()` también rechaza.
+          // El `step` del input es una ayuda al usuario; el contrato lo sostiene Zod.
+          ventanaDias: Number(ventanaDias),
           lineaBasePlan,
           razonamiento: inicial.razonamiento,
         });
@@ -1230,6 +1236,7 @@ function FormularioCriterio({
           <Input
             required
             type="number"
+            step={1}
             min={1}
             max={3650}
             value={ventanaDias}

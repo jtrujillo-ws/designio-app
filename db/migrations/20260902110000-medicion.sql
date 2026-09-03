@@ -420,6 +420,85 @@ create function ventana_de_medicion_abierta(p_inicio date, p_dias integer) retur
 language sql stable parallel safe as
 $$ select p_inicio is null or p_dias is null or p_inicio + p_dias >= current_date $$;
 
+-- ── El CALENDARIO de la cadencia se deriva del ANCLA, no se encadena ──
+-- Tercera vez que este PR tropieza con la misma familia: dos aritméticas distintas sobre el
+-- mismo compromiso. Primero fueron los 30/90 días fijos contra meses de calendario. Ahora,
+-- la deriva: las fechas prometidas se calculaban ENCADENANDO desde la lectura anterior
+-- (`previa + paso`), y encadenar deja que cada entrega real redefina el calendario.
+--
+-- En fin de mes la deriva es de un solo sentido y no vuelve. Serie mensual 31-ene → 28-feb
+-- → 31-mar, entregada PUNTUALMENTE: PostgreSQL evalúa `28-feb + 1 mes` como 28-mar —febrero
+-- baja el ancla al 28 y ya no sube—, así que la entrega del 31 de marzo aparecía como
+-- retrasada. Con la ventana cerrada ese KPI quedaba `vencido` PARA SIEMPRE, y el registro
+-- histórico de un compromiso cumplido decía que no se cumplió. Eso es exactamente lo que
+-- lee el outcome review cuando alguien juzga si el compromiso se cumplió, y este slice
+-- existe para poder defender ese juicio.
+--
+-- El arreglo no es el caso de febrero sino la raíz: las fechas prometidas se generan desde
+-- `ventana_inicio` —d(n) = inicio + n·paso, SIEMPRE sobre el ancla original—, así que el
+-- calendario no se mueve pase lo que pase con las entregas reales. `31-ene + 1 mes` sigue
+-- siendo 28-feb, pero `31-ene + 2 meses` vuelve a ser 31-mar en vez de quedarse en 28-mar.
+--
+-- Y se escribe UNA vez para los DOS sitios que juzgan cadencia —el estado de recepción de
+-- la proyección y la coherencia que exige la firma—, por el mismo motivo que
+-- `ventana_de_medicion_abierta`: si uno deriva del ancla y el otro encadena, vuelve a haber
+-- dos verdades sobre el mismo compromiso y la firma bendice lo que la lectura llamará
+-- incumplido.
+
+-- El paso comprometido. 'unica' no tiene cadencia y devuelve null, que es lo que apaga
+-- todas las reglas de abajo sin un caso aparte en cada una.
+create function paso_de_cadencia(p_frecuencia text) returns interval
+language sql immutable parallel safe as
+$$ select case p_frecuencia
+     when 'semanal' then interval '7 days'
+     when 'mensual' then interval '1 month'
+     when 'trimestral' then interval '3 months' end $$;
+
+-- Las entregas que el compromiso promete dentro de [p_inicio, p_hasta], con el periodo que
+-- cubre cada una. `previo` es el vencimiento ANTERIOR —también derivado del ancla, no
+-- `vence - paso`, que en meses no es la operación inversa (28-feb − 1 mes = 28-ene, no
+-- 31-ene)—, y el primero es el propio inicio de la ventana.
+--
+-- La cota del `generate_series` sale del paso más corto (7 días), así que sobra para las
+-- tres frecuencias; lo que decide de verdad cuántas entregas hay es el `where`.
+create function vencimientos_de_cadencia(p_inicio date, p_frecuencia text, p_hasta date)
+returns table (n integer, previo date, vence date)
+language sql stable parallel safe as $$
+  select i,
+    (p_inicio + (i - 1) * paso_de_cadencia(p_frecuencia))::date,
+    (p_inicio + i * paso_de_cadencia(p_frecuencia))::date
+  from generate_series(1, greatest((p_hasta - p_inicio) / 7 + 1, 1)) as i
+  where paso_de_cadencia(p_frecuencia) is not null
+    and (p_inicio + i * paso_de_cadencia(p_frecuencia))::date <= p_hasta
+$$;
+
+-- ¿Quedó sin cubrir alguna entrega prometida hasta `p_hasta`? Es la pregunta que responden
+-- las cuatro ramas del estado de recepción, cambiando solo hasta DÓNDE se juzga: con la
+-- ventana abierta, hasta AYER —hoy no ha terminado y el dato de la jornada todavía puede
+-- llegar—; cerrada, hasta su último día, que es un día medido.
+--
+-- El periodo de cada entrega es `(previo, vence]`, con el PRIMERO inclusivo por los dos
+-- extremos: el día que abre la ventana es un día medido, así que un corte fechado ahí es la
+-- primera entrega y no un dato anterior al compromiso. Es el mismo corte inclusivo que usa
+-- toda la ventana de este slice.
+--
+-- Sin SECURITY DEFINER: lee los snapshots de la entrada que el llamador ya está leyendo, así
+-- que corre bajo su RLS y no puede volverse oráculo.
+create function cadencia_incumplida(p_entrada uuid, p_ws uuid, p_inicio date,
+                                    p_frecuencia text, p_hasta date) returns boolean
+language sql stable as $$
+  select exists (
+    select 1 from vencimientos_de_cadencia(p_inicio, p_frecuencia, p_hasta) v
+    where not exists (
+      select 1 from snapshot s
+      where s.entrada_kpi_id = p_entrada and s.workspace_id = p_ws
+        and s.fecha <= v.vence
+        and (s.fecha > v.previo or v.n = 1 and s.fecha >= v.previo))
+  )
+$$;
+revoke execute on function cadencia_incumplida(uuid, uuid, date, text, date) from public;
+grant execute on function cadencia_incumplida(uuid, uuid, date, text, date) to designio_app;
+
 -- ── RLS ──
 -- Lectura: TODO miembro (ver el tablero completo es el punto del portal; el stakeholder
 -- lee el impacto aunque no escriba nada). Escrituras:
@@ -1520,19 +1599,22 @@ begin
     --
     -- 'unica' se queda fuera porque no tiene cadencia que quepa, y se excluye por el `paso`
     -- nulo en vez de por un `else 0`: así la regla habla solo de lo que promete repetirse.
-    -- El `coalesce(…, false)` sigue haciendo su trabajo con los otros dos nulos posibles
-    -- —ventana sin inicio o sin largo—: en ausencia de prueba, no se firma.
+    --
+    -- Y se pregunta con la MISMA función que después juzgará las entregas de verdad
+    -- (`vencimientos_de_cadencia`), no con una copia de su aritmética: «cabe al menos una
+    -- vez» es exactamente «el calendario del compromiso tiene al menos una entrega dentro
+    -- de la ventana». Mientras fueron dos redacciones, bastaba que una derivara del ancla y
+    -- la otra encadenara para que la firma bendijera lo que la lectura llamaría incumplido.
+    -- El `not exists` conserva además el «en ausencia de prueba, no se firma» que hacía el
+    -- `coalesce(…, false)`: sin inicio o sin largo de ventana no hay vencimientos que
+    -- generar, así que la entrada queda señalada.
     select string_agg(e.nombre, ', ' order by e.nombre) into faltan
     from entrada_kpi e
     join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
-    cross join lateral (select case e.frecuencia
-      when 'semanal' then interval '7 days'
-      when 'mensual' then interval '1 month'
-      when 'trimestral' then interval '3 months' end as paso) cad
     where e.registry_id = new.id and e.workspace_id = new.workspace_id
-      and cad.paso is not null
-      and not coalesce((e.ventana_inicio + cad.paso)::date
-                       <= e.ventana_inicio + c.ventana_dias, false);
+      and paso_de_cadencia(e.frecuencia) is not null
+      and not exists (select 1 from vencimientos_de_cadencia(
+        e.ventana_inicio, e.frecuencia, (e.ventana_inicio + c.ventana_dias)::date));
     if faltan is not null then
       raise exception 'no se puede firmar: la cadencia comprometida no cabe en la ventana del criterio: %', faltan;
     end if;

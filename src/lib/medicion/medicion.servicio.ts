@@ -1066,46 +1066,36 @@ export async function seguimientoDeImpacto(
               when not ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias) then case
                 -- La ventana entera pasó sin un solo dato: vencido, y ya sin remedio.
                 when ult.fecha is null then 'vencido'
-                -- Recurrente que dejó de aportar ANTES del cierre: la cadencia se
-                -- incumplió dentro de la ventana y eso no lo borra el calendario. Que aquí
-                -- el corte sea «menor o igual» y abajo «menor» no es una asimetría: es la
-                -- misma regla —una entrega vence cuando su día YA PASÓ— leída sobre días
-                -- distintos. El último día de la ventana ya pasó (esta rama exige que
-                -- cerrara ayer o antes), mientras que abajo se compara contra hoy, y hoy
-                -- todavía no ha terminado. Con el corte estricto se daba por cumplida la
-                -- entrega que tocaba justo el último día y nunca llegó.
+                -- ¿Llegó todo lo prometido DENTRO de la ventana? La pregunta es una sola y
+                -- la responde cadencia_incumplida contra el calendario derivado del
+                -- ANCLA: cada entrega prometida tiene que tener su dato en su periodo.
                 --
-                -- Y el HUECO, que es la otra mitad y faltaba. Mirar solo la ÚLTIMA fecha
-                -- responde «¿siguió aportando hasta el final?» y no «¿aportó lo
-                -- comprometido?»: en una ventana mensual de tres meses, un único dato el
-                -- último día dejaba la entrada en 'cerrado' —«llegó lo comprometido»— con
-                -- dos entregas de tres sin llegar. Y 'cerrado' es lo que lee el outcome
-                -- review, así que un KPI que incumplió se presentaba como cumplido en el
-                -- sitio exacto donde este slice dice existir para impedirlo (la mitigación
-                -- del riesgo «presión por demostrar éxito»). La última fecha sola no puede
-                -- decidirlo porque no sabe cuántas entregas se prometieron; hay que
-                -- recorrer la ventana. Se recorre por HUECOS —entre el inicio y la primera
-                -- lectura, y entre cada dos consecutivas— porque un hueco mayor que el
-                -- paso ES una entrega prevista que no llegó, y contar huecos no exige
-                -- inventar el calendario de vencimientos.
+                -- Antes eran dos comprobaciones encadenadas —«¿dejó de aportar antes del
+                -- final?», con ult.fecha + paso, y «¿hubo algún hueco?», con
+                -- previa + paso— y las dos encadenaban desde lo que pasó en vez de
+                -- derivar del compromiso. Encadenar deja que cada entrega real redefina el
+                -- calendario, y en fin de mes la deriva es de un solo sentido: 31-ene →
+                -- 28-feb → 31-mar, entregado puntualmente, se leía como retrasado porque
+                -- 28-feb + 1 mes es 28-mar. Con la ventana cerrada eso es vencido PARA
+                -- SIEMPRE sobre un compromiso que SÍ se cumplió — y es lo que lee el
+                -- outcome review al juzgar si se cumplió.
                 --
-                -- El estado del que incumplió y ya no puede remediarlo sigue siendo
-                -- 'vencido': «se esperaba y no llegó» era cierto el último día y lo sigue
-                -- siendo después. 'cerrado' queda para quien cumplió hasta el final, que
-                -- es lo único que esa palabra promete.
-                when cad.paso is not null
-                     and ((ult.fecha + cad.paso)::date <= e.ventana_inicio + c.ventana_dias
-                          or coalesce(hue.hubo_hueco, false))
+                -- Las dos preguntas viejas son la misma cuando el calendario no se mueve:
+                -- «dejó de aportar» es el hueco de la ÚLTIMA entrega prometida.
+                when cadencia_incumplida(e.id, e.workspace_id, e.ventana_inicio,
+                       e.frecuencia, (e.ventana_inicio + c.ventana_dias)::date)
                   then 'vencido'
                 -- Llegó lo comprometido hasta el final: la medición terminó.
                 else 'cerrado' end
-              when cad.paso is null then
-                case when ult.fecha is not null then 'recibido' else 'esperado' end
-              when ult.fecha is null then
-                case when (e.ventana_inicio + cad.paso)::date < current_date then 'vencido'
-                     else 'esperado' end
-              when (ult.fecha + cad.paso)::date < current_date then 'vencido'
-              else 'recibido' end,
+              -- Ventana ABIERTA: la misma pregunta, juzgada hasta AYER. Hoy todavía no ha
+              -- terminado, así que la entrega que vence HOY aún puede llegar — es el mismo
+              -- corte inclusivo de la ventana, visto contra el calendario.
+              when cadencia_incumplida(e.id, e.workspace_id, e.ventana_inicio,
+                     e.frecuencia, current_date - 1) then 'vencido'
+              -- Sin cadencia ('unica') no hay vencimientos que generar, así que estas dos
+              -- ramas la cubren sin un caso aparte: lo que hay es lo que se dice.
+              when ult.fecha is not null then 'recibido'
+              else 'esperado' end,
             'snapshots', coalesce((
               select jsonb_agg(jsonb_build_object(
                 'id', s.id, 'valor', s.valor::text, 'fecha', s.fecha::text,
@@ -1120,29 +1110,6 @@ export async function seguimientoDeImpacto(
           left join miembro m on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
           left join lateral (select max(s.fecha) as fecha from snapshot s
             where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id) ult on true
-          -- La cadencia es un compromiso de CALENDARIO, no de aritmética: «mensual» es el
-          -- mes siguiente, no treinta días. Con 30 fijos la fecha prometida dependía de la
-          -- longitud del mes — un dato del 1 de agosto vencía el 31 y entraba en mora el 1
-          -- de septiembre, antes de que tocara el de septiembre; y uno del 31 de enero no
-          -- vencía hasta el 2 de marzo. Sumar un mes de calendario respeta el fin de mes.
-          cross join lateral (select case e.frecuencia
-            when 'semanal' then interval '7 days'
-            when 'mensual' then interval '1 month'
-            when 'trimestral' then interval '3 months' end as paso) cad
-          -- ¿Se quedó sin llegar alguna entrega DENTRO de la ventana? Un hueco mayor que el
-          -- paso entre dos lecturas consecutivas —o entre el inicio de la ventana y la
-          -- primera— es exactamente eso. El lag con valor por defecto ventana_inicio
-          -- hace que la primera lectura se mida contra el inicio sin un caso aparte.
-          left join lateral (
-            -- Estricto: la entrega vence el día previa+paso y ese día todavía cuenta,
-            -- así que solo hay hueco si la siguiente lectura llega DESPUÉS. Es el mismo
-            -- corte inclusivo que usa toda la ventana de este slice.
-            select bool_or((g.previa + cad.paso)::date < g.fecha) as hubo_hueco
-            from (select s.fecha,
-                    lag(s.fecha, 1, e.ventana_inicio) over (order by s.fecha) as previa
-                  from snapshot s
-                  where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id) g
-          ) hue on true
           where e.registry_id = mr.id and e.workspace_id = mr.workspace_id), '[]'::jsonb) as entradas,
         coalesce((
           select jsonb_agg(jsonb_build_object('id', c.id, 'kpi', c.kpi) order by c.creado_en, c.id)

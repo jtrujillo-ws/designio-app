@@ -2557,7 +2557,8 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // la diferencia entre 30 días y un mes solo se manifiesta si el mes recién pasado tiene
     // 31, así que el test pasaría o fallaría según el día en que se ejecutase — que es
     // exactamente el defecto que se está corrigiendo. La aritmética es la MISMA expresión
-    // (`cad.paso`) en las cuatro ramas del estado, así que fijarla aquí la fija entera.
+    // en todas las ramas del estado y también en la coherencia que exige la firma
+    // (`paso_de_cadencia` / `vencimientos_de_cadencia`), así que fijarla aquí la fija entera.
     //
     // Ventana [2026-03-01, 2026-03-31]: un mes de calendario y 30 días de aritmética, que es
     // donde las dos reglas se separan. Con el dato el día que abre, la cadencia mensual
@@ -2616,6 +2617,50 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         nota: 'último día de la ventana larga, con dos meses sin aportar en medio',
       });
       expect((await leer()).estadoSnapshot).toBe('vencido');
+
+      // ── Y la DERIVA: el calendario se deriva del ANCLA, no se encadena ──
+      // Encadenar («la siguiente vence un mes después de la ÚLTIMA que llegó») deja que
+      // cada entrega real redefina el calendario, y en fin de mes la deriva va en un solo
+      // sentido y no vuelve: febrero baja el ancla al 28 y ya no sube. La serie 31-ene →
+      // 28-feb → 31-mar es un compromiso mensual entregado PUNTUALMENTE, y encadenando se
+      // leía retrasado porque PostgreSQL evalúa `28-feb + 1 mes` como 28-mar, o sea tres
+      // días ANTES del 31 de marzo que sí llegó. Con la ventana cerrada eso deja el KPI
+      // `vencido` PARA SIEMPRE: el registro histórico de un compromiso cumplido diciendo
+      // que no se cumplió, justo en lo que lee el outcome review para juzgarlo.
+      //
+      // Ventana [2026-01-31, 2026-04-29]: 88 días, elegidos para que la ÚLTIMA entrega
+      // prometida sea la del 31 de marzo — la siguiente (30 de abril) cae fuera del cierre,
+      // así que no se debe y la serie está completa. Derivando del ancla, `31-ene + 2
+      // meses` vuelve a ser 31-mar en vez de quedarse en el 28 al que lo bajó febrero.
+      await admin`delete from snapshot where entrada_kpi_id = ${entradaViejaId}`;
+      await admin`update entrada_kpi set ventana_inicio = '2026-01-31'
+        where id = ${entradaViejaId}`;
+      await admin`update criterio_exito set ventana_dias = 88
+        where id = (select criterio_id from entrada_kpi where id = ${entradaViejaId})`;
+      for (const dia of ['2026-01-31', '2026-02-28', '2026-03-31']) {
+        await registrarSnapshot(sponsorId, {
+          workspaceId: ws,
+          entradaId: entradaViejaId,
+          valor: '23',
+          fecha: dia,
+          nota: 'corte mensual, en su día',
+        });
+      }
+      const finDeMes = await leer();
+      expect(finDeMes.ultimaFecha).toBe('2026-03-31');
+      expect(finDeMes.estadoSnapshot).toBe('cerrado');
+
+      // Y el calendario mismo, que es la raíz y la comparten los DOS sitios que juzgan
+      // cadencia —el estado de recepción y la coherencia que exige la firma—: las entregas
+      // prometidas salen del ancla, así que la del 28 de febrero no arrastra a la siguiente.
+      const vencimientos = await admin`select vence::text as vence
+        from vencimientos_de_cadencia('2026-01-31'::date, 'mensual', '2026-04-29'::date)
+        order by n`;
+      expect(vencimientos.map((v) => v.vence as string)).toEqual(['2026-02-28', '2026-03-31']);
+
+      await admin`delete from snapshot where entrada_kpi_id = ${entradaViejaId}`;
+      await admin`update entrada_kpi set ventana_inicio = '2026-03-01'
+        where id = ${entradaViejaId}`;
       await admin`update criterio_exito set ventana_dias = 30
         where id = (select criterio_id from entrada_kpi where id = ${entradaViejaId})`;
     } finally {

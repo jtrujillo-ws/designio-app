@@ -981,6 +981,12 @@ function TarjetaPropuesta({
             Citas · {citasPresentes}/{propuesta.citas.length} presentes literalmente en el
             material
           </span>
+          {/* El índice vale como identidad AQUÍ, y conviene decir por qué en vez de dejar
+              que cada lector lo deduzca: las citas de una propuesta no cambian nunca. Se
+              leen de `contenidoOriginal`, corregirlas lo rechaza el servicio y lo vuelve a
+              rechazar el guard de la base, y la tarjeta va keyeada por `p.id`, así que una
+              instancia siempre pinta las mismas citas en el mismo orden. No hay reordenado
+              del que protegerse; una key compuesta sugeriría que sí lo hay. */}
           {propuesta.citas.map((c, i) => (
             <div
               key={i}

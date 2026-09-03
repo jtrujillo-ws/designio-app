@@ -82,8 +82,10 @@ export type EntradaCatalogo = {
  * test comprueba la otra mitad: toda tabla real con `evidencia_id` o queda `fuera` del
  * entregable o se poda EXACTAMENTE por esa columna.
  *
- * `workspace` no aparece aquí porque se filtra por `id`, no por `workspace_id`; se
- * exporta aparte, siempre.
+ * `workspace` no aparece aquí porque se filtra por `id`, no por `workspace_id`; se exporta
+ * aparte, siempre. «Aparte» significaba también «sin vigilar»: su lista de columnas se
+ * escribía a mano y una columna nueva se caía del archivo sin que nada avisara. Tiene su
+ * propio test estructural, hermano de éste y con la misma derivación desde la base.
  */
 export const CATALOGO_EXPORT = [
   { tabla: 'miembro', orden: 'creado_en, id', poda: { modo: 'fuera' } },

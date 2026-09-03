@@ -76,7 +76,13 @@ export async function exportarWorkspace(
       throw e;
     }
 
-    const [ws] = await tx`select id, nombre, creado_en from workspace
+    // Todas las columnas de `workspace`, y no las tres de siempre: la fila viaja «aparte»
+    // porque se filtra por `id` y no por `workspace_id`, así que queda fuera del catálogo y
+    // de su test estructural. Esa lista escrita a mano era el único sitio del export que
+    // nadie vigilaba, y una columna nueva se caía del archivo en silencio —le pasó a
+    // `limite_llamadas_ai_dia` en cuanto nació—. Hay un test que deriva las columnas de la
+    // base y exige que estén todas: mientras exista, esta consulta no se puede quedar corta.
+    const [ws] = await tx`select id, nombre, creado_en, limite_llamadas_ai_dia from workspace
       where id = ${entrada.workspaceId}`;
     // RLS: un workspace ajeno simplemente no existe para esta sesión.
     if (!ws) throw new ErrorExportacion('El workspace no existe o no eres miembro');
@@ -160,6 +166,11 @@ export async function exportarWorkspace(
         id: ws.id as string,
         nombre: ws.nombre as string,
         creadoEn: (ws.creado_en as Date).toISOString(),
+        // El cupo AI pactado. No es secreto —el panel se lo enseña a cualquier miembro como
+        // `limiteDiario`—, así que omitirlo del archivo no protegía nada: solo lo hacía
+        // incompleto. `null` cuando no hay cupo pactado, que es un dato en sí mismo.
+        limiteLlamadasAiDia:
+          ws.limite_llamadas_ai_dia === null ? null : Number(ws.limite_llamadas_ai_dia),
       },
       datos,
       archivos,

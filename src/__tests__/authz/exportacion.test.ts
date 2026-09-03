@@ -209,6 +209,40 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     expect(catalogo).toEqual(tablas.sort());
   });
 
+  it('la fila del workspace viaja ENTERA: ninguna columna suya se cae del archivo', async () => {
+    // El hermano del test de arriba, para la mitad que aquél no cubre. `workspace` se filtra
+    // por `id` y no por `workspace_id`, así que queda fuera del catálogo y se exporta con una
+    // lista de columnas escrita a mano — el único sitio del export que nadie vigilaba—. Una
+    // columna nueva se caía del archivo en silencio, y le pasó a `limite_llamadas_ai_dia` en
+    // cuanto nació: un archivo que se anuncia completo omitiéndola es la clase de afirmación
+    // que esta base no escribe.
+    //
+    // Las columnas se DERIVAN de la base, igual que allí. Si alguna llegara a tener que
+    // quedarse fuera, se declara aquí con su motivo: la exclusión es una decisión que se
+    // escribe, no un olvido que se hereda.
+    const FUERA_DEL_ARCHIVO: Record<string, string> = {};
+
+    const admin = sqlAdmin();
+    const columnas = (
+      await admin`select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'workspace'
+        order by 1`
+    ).map((f) => f.column_name as string);
+
+    const exportado = await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    // snake_case de la base ↔ camelCase del JSON, que es la forma en que viaja todo el export.
+    const aCamel = (c: string) => c.replace(/_([a-z0-9])/g, (_, x: string) => x.toUpperCase());
+    const presentes = new Set(Object.keys(exportado.workspace));
+
+    const faltan = columnas
+      .filter((c) => !(c in FUERA_DEL_ARCHIVO))
+      .filter((c) => !presentes.has(aCamel(c)));
+    expect(faltan).toEqual([]);
+    // Y el cupo concreto que destapó el hueco, por su nombre: sin esto el test pasaría con
+    // una derivación rota.
+    expect(presentes.has('limiteLlamadasAiDia')).toBe(true);
+  });
+
   it('toda tabla que apunte a evidencia declara cómo se poda en el entregable', async () => {
     // La otra mitad del invariante de SYS-04, y la que faltaba: no basta con exportar
     // toda tabla, hay que saber podarla. Mientras la poda tuvo un `default: true`, una

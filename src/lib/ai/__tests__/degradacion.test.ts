@@ -4,6 +4,7 @@ import {
   costoDeUso,
   formatearCosteUsd,
   evaluarCapacidadAI,
+  INTENTOS_POR_GENERACION,
   LIMITE_LLAMADAS_DIA,
   MODELO_FALLBACK,
   VENTANA_SALUD_PROVEEDOR_MS,
@@ -55,6 +56,48 @@ describe('estado de la capacidad AI (SYS-21)', () => {
     expect(estado.origenKey).toBe('entorno');
     expect(estado.modelo).toBe(MODELO_PRIMARIO);
     expect(estado.motivo).toBe('');
+  });
+
+  it('el gasto que se muestra y el que cita el motivo son el mismo número', () => {
+    // Las reservas DECIDEN pero no se enseñan, y antes viajaban sumadas al gasto: el motivo
+    // citaba el total —«61, de 60»— justo encima de la tarjeta, que mostraba las atendidas.
+    // Un cociente por encima del 100% contradiciendo a la línea de al lado.
+    const estado = evaluarCapacidadAI({
+      keyEntorno: 'sk-test',
+      llamadasHoy: 59,
+      reservadas: 2,
+      limiteDiario: 60,
+      unidades: 2,
+    });
+    expect(estado.disponible).toBe(false);
+    expect(estado.llamadasHoy).toBe(59);
+    expect(estado.llamadasHoy).toBeLessThanOrEqual(estado.limiteDiario);
+    // Y el motivo dice de dónde sale la diferencia en vez de esconderla: los dos números,
+    // cada uno con su nombre.
+    expect(estado.motivo).toContain('59 atendidas y 2 en curso');
+    expect(estado.motivo).not.toContain('61');
+  });
+
+  it('un cupo por debajo de lo que cuesta una generación no admitiría ninguna', () => {
+    // Por eso el CHECK de la base exige >= INTENTOS_POR_GENERACION: con cupo 1 el hueco nunca
+    // alcanza y la capacidad quedaría apagada para siempre detrás de un mensaje que se lee
+    // como «vuelve mañana». Aquí se fija el porqué; el test de authz fija que la base lo
+    // impide.
+    const conUno = evaluarCapacidadAI({
+      keyEntorno: 'sk-test',
+      llamadasHoy: 0,
+      limiteDiario: 1,
+      unidades: INTENTOS_POR_GENERACION,
+    });
+    expect(conUno.disponible).toBe(false);
+    // Con el mínimo que la base sí admite, la misma generación entra.
+    const conElMinimo = evaluarCapacidadAI({
+      keyEntorno: 'sk-test',
+      llamadasHoy: 0,
+      limiteDiario: INTENTOS_POR_GENERACION,
+      unidades: INTENTOS_POR_GENERACION,
+    });
+    expect(conElMinimo.disponible).toBe(true);
   });
 
   it('la salud del proveedor es un dato APARTE de la capacidad, y no la apaga', () => {

@@ -3,6 +3,7 @@ import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import {
   costoDeUso,
+  INTENTOS_POR_GENERACION,
   LIMITE_LLAMADAS_DIA,
   MODELO_FALLBACK,
   MODELO_PRIMARIO,
@@ -1621,6 +1622,57 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
+  it('el motivo del guard llega a la pantalla también al GENERAR, no solo al aceptar', async () => {
+    // El `catch` de la persistencia traducía el 23505 y el P0001 del consentimiento, y dejaba
+    // escapar los demás `raise` del guard como PostgresError crudo. `mensajeDe` no traduce
+    // P0001, así que devolvía null y la pantalla enseñaba «No se pudo pedir la propuesta;
+    // intenta de nuevo» en vez del motivo — que es justo el dato que dice qué hacer. La
+    // aceptación ya lo traducía; era la generación la mitad que faltaba.
+    //
+    // Se recorre la carrera real: el item se cura A MANO mientras la llamada está en vuelo,
+    // así que el guard rechaza al persistir y no antes.
+    const itemId = await nuevoItem('Item que alguien cura mientras la AI piensa', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    const admin = sqlAdmin();
+    try {
+      const error = await conProveedor(RESPUESTA_CI, async () => {
+        proveedor.duranteLlamada = async () => {
+          // 'rechazado' es la decisión que no exige evidencia: basta con que el item deje de
+          // estar 'pendiente' para que el guard rechace la propuesta al persistirla.
+          await admin`update item_importacion set estado = 'rechazado', decidido_por = ${leadId},
+              decidido_en = now() where id = ${itemId}`;
+        };
+        try {
+          return await generarPropuestas(leadId, {
+            workspaceId: ws,
+            capacidad: 'CI',
+            anclaId: itemId,
+          }).then(() => null);
+        } catch (e) {
+          return e;
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+      // Un ErrorAI, que es lo que la capa de servidor sabe traducir a {ok:false, error}: no
+      // un PostgresError que acabe en el boundary del router.
+      expect(error).toBeInstanceOf(ErrorAI);
+      // Y el texto es el del guard, no un genérico: nombra QUÉ pasó con el item.
+      expect((error as ErrorAI).message).toMatch(/decidido|admite propuestas/i);
+    } finally {
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
   it('el respaldo lo cuenta el ACTO HUMANO, sobre todo el workspace y no sobre una página', async () => {
     // La presencia literal de las citas mide una subcadena y no verifica nada por sí sola:
     // una alucinación bien citada saca 2/2 «presentes». La medida que alguien sostiene es
@@ -1698,10 +1750,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await conProveedor(RESPUESTA_CI, async () => {
         const panel = await panelPropuestas(leadId, ws);
         expect(panel.ai.disponible).toBe(false);
-        // El motivo CITA el cupo pactado, no el del despliegue: quien lee «N/N» sabe cuál es
-        // su tope; con «N/60» leería que le sobra presupuesto y que algo se rompió.
-        expect(panel.ai.motivo).toContain(`${usadas}/${usadas} llamadas`);
-        expect(panel.ai.motivo).not.toContain(`/${LIMITE_LLAMADAS_DIA} llamadas`);
+        // El motivo CITA el cupo pactado, no el del despliegue: quien lee «de N» sabe cuál es
+        // su tope; con «de 60» leería que le sobra presupuesto y que algo se rompió.
+        expect(panel.ai.motivo).toContain(`de ${usadas} llamadas al proveedor`);
+        expect(panel.ai.motivo).not.toContain(`de ${LIMITE_LLAMADAS_DIA} llamadas`);
+        // Y el gasto que cita el motivo es el MISMO que enseña la tarjeta: nunca un total
+        // por encima del tope. Con las reservas sumadas antes de entrar, esta línea decía
+        // «61, de 60» justo encima de un «59/60».
+        expect(panel.ai.motivo).toContain(`${panel.ai.llamadasHoy}`);
+        expect(panel.ai.llamadasHoy).toBeLessThanOrEqual(panel.ai.limiteDiario);
         expect(panel.ai.limiteDiario).toBe(usadas);
 
         // Y la ADMISIÓN dice lo mismo que la bandera: la pantalla no ofrece lo que el
@@ -1882,6 +1939,28 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     await expect(
       sqlAdmin()`update workspace set limite_llamadas_ai_dia = 0 where id = ${ws}`,
     ).rejects.toThrow(/limite_llamadas_ai_dia/);
+
+    // El suelo no es 1, es INTENTOS_POR_GENERACION. Una generación reserva sus dos intentos
+    // antes de llamar, así que con cupo 1 el hueco nunca alcanza: la capacidad quedaría
+    // apagada para siempre detrás de un mensaje que se lee como «vuelve mañana». El número
+    // sale de la constante, que es lo que ata este CHECK al código que lo hace necesario.
+    await expect(
+      sqlAdmin()`update workspace set limite_llamadas_ai_dia = ${INTENTOS_POR_GENERACION - 1}
+        where id = ${ws}`,
+    ).rejects.toThrow(/limite_llamadas_ai_dia/);
+
+    // Y con EXACTAMENTE el mínimo sí se puede generar: el suelo está donde deja pasar, no un
+    // hueco por encima.
+    await sqlAdmin()`update workspace set limite_llamadas_ai_dia = ${INTENTOS_POR_GENERACION}
+      where id = ${ws}`;
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        const panel = await panelPropuestas(leadId, ws);
+        expect(panel.ai.limiteDiario).toBe(INTENTOS_POR_GENERACION);
+      });
+    } finally {
+      await sqlAdmin()`update workspace set limite_llamadas_ai_dia = null where id = ${ws}`;
+    }
     const [tras] = await sqlAdmin()`select limite_llamadas_ai_dia from workspace where id = ${ws}`;
     expect(tras!.limite_llamadas_ai_dia).toBeNull();
   });

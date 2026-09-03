@@ -4,9 +4,13 @@ import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { DimensionesEvidenciaSchema, ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { bloquearReto } from '@/lib/metodo/metodo.servicio';
-import { evaluarCapacidadAI, LIMITE_LLAMADAS_DIA } from './ai.degradacion';
 import {
-  presenciaLiteralDeCitas,
+  evaluarCapacidadAI,
+  INTENTOS_POR_GENERACION,
+  LIMITE_LLAMADAS_DIA,
+} from './ai.degradacion';
+import {
+  presenciaLiteralPorCita,
   materialDeItem,
   materialDeReto,
   MAX_CRITERIOS_POR_LOTE,
@@ -70,7 +74,6 @@ const CRITERIOS_POR_GENERACION = 3;
  * primario y, si cae por indisponibilidad, la del respaldo. Es lo que se aparta del
  * presupuesto antes de llamar, porque el tope cuenta llamadas atendidas y no propuestas —
  * el techo de propuestas de cada capacidad ya no dice nada sobre lo que se paga. */
-const INTENTOS_POR_GENERACION = 2;
 
 /** Capa 2: re-check explícito del rol curador (la política RLS es la capa 1). Los mismos
  * que curan la bandeja (RF-03.4) piden y revisan propuestas; `agente-ai` no aparece por
@@ -117,11 +120,11 @@ async function presupuestoDeHoy(
   // números deciden juntos: leerlos en dos sentencias es leerlos en dos snapshots, y en el
   // hueco cabe un cupo que cambia entre el «cuánto llevas» y el «cuánto puedes».
   //
-  // El `left join` es deliberado: bajo RLS el workspace de otro no existe, y un `join` a
-  // secas devolvería CERO filas —que este código leería como «0 atendidas», es decir, como
-  // presupuesto entero disponible—. Con `left join`, si la fila del workspace no se ve, el
-  // gasto se sigue contando y el cupo cae al respaldo; una lectura ciega nunca se convierte
-  // en una autorización.
+  // Los tres son SUBCONSULTAS ESCALARES, no un join, y la diferencia es la que importa bajo
+  // RLS: un join contra `workspace` no devolvería fila ninguna cuando el workspace no se ve
+  // —y este código leería esa ausencia como «0 atendidas», es decir, como presupuesto entero
+  // disponible—. Así, en cambio, el gasto se sigue contando y el cupo invisible llega como
+  // null, que cae al respaldo. Una lectura ciega no se convierte en una autorización.
   const [fila] = await tx`select
       (select count(*) from llamada_ai
         where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now())
@@ -193,15 +196,19 @@ async function estadoCapacidad(tx: TransactionSql, workspaceId: string) {
     tx,
     workspaceId,
   );
-  const ai = evaluarCapacidadAI({
+  // Los dos números viajan SEPARADOS y ya no se re-escribe el resultado: antes se pasaba la
+  // suma y luego se pisaba `llamadasHoy` con las atendidas, así que el motivo hablaba del
+  // total y la tarjeta del gasto —y con reservas en vuelo la tarjeta decía «59/60» encima de
+  // un motivo que decía «61/60»—. Una sola verdad, construida en un solo sitio.
+  return evaluarCapacidadAI({
     keyWorkspace,
     keyEntorno,
-    llamadasHoy: atendidas + reservadas,
+    llamadasHoy: atendidas,
+    reservadas,
     limiteDiario,
     unidades: INTENTOS_POR_GENERACION,
     ultimaCaidaHaceMs,
   });
-  return { ...ai, llamadasHoy: atendidas };
 }
 
 /**
@@ -264,10 +271,15 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
             metricaObjetivo: (f.reto_metrica as string | null) ?? '',
           }).texto
         : '';
+  // Las presencias se resuelven de una vez para toda la fila: el pajar es el mismo para
+  // todas sus citas, y normalizarlo por cita multiplicaba el trabajo por seis sin cambiar
+  // ninguna respuesta.
+  //
   // Las citas se leen del ORIGINAL: son el testimonio del modelo sobre lo que leyó, no del
   // humano que corrige. Hoy son siempre las mismas —corregirlas está prohibido en el
   // servicio y en el guard— y leerlas de aquí lo deja dicho en la proyección también.
   const citas = 'citas' in original ? original.citas : [];
+  const presencias = presenciaLiteralPorCita(material, citas);
   return {
     id: f.id as string,
     capacidad: f.capacidad as PropuestaEnPanel['capacidad'],
@@ -279,10 +291,10 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     // El original solo viaja cuando difiere: una corrección nunca oculta lo que la AI
     // había dicho de verdad (SYS-17).
     contenidoOriginal: JSON.stringify(contenido) === JSON.stringify(original) ? null : original,
-    citas: citas.map((c) => ({
+    citas: citas.map((c, i) => ({
       fragmento: c.fragmento,
       localizacion: c.localizacion,
-      presenteLiteral: presenciaLiteralDeCitas(material, [c]).presentes === 1,
+      presenteLiteral: presencias[i]!,
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
     anclaId: ((f.item_id ?? f.reto_id) as string | null) ?? '',
@@ -713,7 +725,8 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const ai = evaluarCapacidadAI({
       keyWorkspace,
       keyEntorno,
-      llamadasHoy: atendidas + reservadas,
+      llamadasHoy: atendidas,
+      reservadas,
       limiteDiario,
       unidades,
       ultimaCaidaHaceMs,
@@ -1052,6 +1065,28 @@ async function confirmarDespacho(
   return versionConsentimiento;
 }
 
+/**
+ * Forma canónica de un valor JSON: claves ordenadas en todo nivel. Compara por CONTENIDO dos
+ * objetos que llegaron por caminos distintos —uno parseado por Zod, otro leído de `jsonb`—
+ * sin heredar el orden de claves de ninguno de los dos. `JSON.stringify` a secas conserva el
+ * orden de inserción, así que comparar así era comparar también por cómo se construyó cada
+ * lado, que no es lo que se quiere saber.
+ */
+function canonico(valor: unknown): string {
+  const ordenar = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(ordenar);
+    if (v && typeof v === 'object') {
+      return Object.fromEntries(
+        Object.entries(v as Record<string, unknown>)
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          .map(([k, x]) => [k, ordenar(x)]),
+      );
+    }
+    return v;
+  };
+  return JSON.stringify(ordenar(valor));
+}
+
 /** Valida la salida cruda del proveedor contra el esquema de la capacidad. Una salida
  * fuera de contrato se descarta ENTERA: media propuesta no es revisable. */
 function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): ContenidoPropuesta[] {
@@ -1344,6 +1379,16 @@ async function persistirPropuestas(
           'Ese material exige consentimiento registrado para procesamiento externo (RF-09.5)',
         );
       }
+      // Y CUALQUIER otro `raise` del guard, que es lo que faltaba: el guard tiene más motivos
+      // que el consentimiento —«ese item ya fue decidido», «ese reto ya no admite criterios
+      // nuevos», «la propuesta debe colgar de la llamada que la produjo»— y todos salían de
+      // aquí como PostgresError crudo. `mensajeDe` no traduce P0001, así que devolvía null y
+      // la pantalla enseñaba «No se pudo pedir la propuesta; intenta de nuevo» en lugar del
+      // motivo, que es justo el dato que dice qué hacer. La aceptación ya lo hacía así; era
+      // la generación la mitad que se quedó fuera.
+      if (err.code === 'P0001' && typeof err.message === 'string' && err.message.length > 0) {
+        throw new ErrorAI(`${err.message.charAt(0).toUpperCase()}${err.message.slice(1)}`);
+      }
       throw e;
     }
   });
@@ -1540,9 +1585,15 @@ async function aceptarPropuestaEnTransaccion(
       // Vale para las DOS capacidades desde que C0 también cita: la regla es de las citas,
       // no del destino, y atarla a `evidencia` habría dejado las de C0 editables el día que
       // existieron.
+      // Se comparan CANÓNICAMENTE y no con `JSON.stringify` a secas: un lado viene de Zod
+      // (orden de la forma declarada) y el otro de `jsonb` (orden por longitud y luego
+      // bytes). Hoy coinciden por casualidad, con dos claves; el día que se añada una
+      // tercera que ordene distinto —`pagina`, por ejemplo— toda corrección se rechazaría con
+      // «las citas no se corrigen» aunque fueran idénticas. El guard de la base compara
+      // `jsonb`, que es insensible al orden, así que el suelo y el servicio discreparían.
       if (
-        JSON.stringify((contenido as ContenidoPropuesta).citas) !==
-        JSON.stringify((p.contenidoOriginal as ContenidoPropuesta).citas)
+        canonico((contenido as ContenidoPropuesta).citas) !==
+        canonico((p.contenidoOriginal as ContenidoPropuesta).citas)
       ) {
         throw new ErrorAI(
           'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',

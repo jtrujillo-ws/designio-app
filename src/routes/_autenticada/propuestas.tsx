@@ -112,23 +112,19 @@ function PantallaPropuestas() {
   const router = useRouter();
   const rol = membresiaActiva?.rol ?? '';
   const puedeRevisar = (ROLES_CURADORES as readonly string[]).includes(rol);
-  // Los mensajes PERTENECEN al workspace en el que se produjeron, así que se guardan con su
-  // dueño y se descartan al pintar si ya no coincide. Esta ruta no se desmonta al cambiar de
-  // workspace —el selector solo cambia sus `loaderDeps`, y el componente se reutiliza—, de
-  // modo que un aviso guardado a secas sobrevivía al workspace del que hablaba: «3 propuestas
-  // en espera de revisión humana» leído sobre el cliente de al lado. Misma forma que el ancla
-  // del formulario de generación y por la misma razón: la validez se DERIVA de la identidad
-  // que hay delante, no se recuerda y se invalida a mano.
-  const wsActual = datos?.workspaceId ?? '';
-  type Mensaje = { ws: string; texto: string } | null;
-  const [errorGuardado, setErrorGuardado] = useState<Mensaje>(null);
-  const [avisoGuardado, setAvisoGuardado] = useState<Mensaje>(null);
-  const error = errorGuardado?.ws === wsActual ? errorGuardado.texto : null;
-  const aviso = avisoGuardado?.ws === wsActual ? avisoGuardado.texto : null;
-  const errar = (texto: string | null) =>
-    setErrorGuardado(texto === null ? null : { ws: wsActual, texto });
-  const avisar = (texto: string | null) =>
-    setAvisoGuardado(texto === null ? null : { ws: wsActual, texto });
+  // Los mensajes son estado local y se quedan en estado local: cambiar de workspace REMONTA
+  // esta pantalla, así que no pueden sobrevivir al workspace del que hablaban.
+  //
+  // Aquí vivía una etiqueta de dueño por mensaje —`{ ws, texto }`, descartada al pintar si no
+  // coincidía— defendiendo de que la ruta se reutilizara entre workspaces. No se reutiliza:
+  // `_autenticada.tsx` renderiza `<Outlet key={membresiaActiva?.workspaceId} />` justamente
+  // para que todo lo que cuelga de ahí se remonte y el `useState` vuelva a nacer, y su
+  // docstring dice que ésa es la única razón de que ese componente exista. La etiqueta no
+  // podía diferir nunca, y el comentario que la justificaba enseñaba lo contrario de cómo
+  // está montado el router — que es peor que el estado de más: el siguiente que escriba una
+  // pantalla se lo habría creído.
+  const [error, errar] = useState<string | null>(null);
+  const [aviso, avisar] = useState<string | null>(null);
 
   async function refrescar() {
     errar(null);

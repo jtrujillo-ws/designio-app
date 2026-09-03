@@ -11,14 +11,24 @@
 -- respaldo del código. Distinguir las dos cosas importa porque un tope AUSENTE y un tope
 -- INFINITO se parecen en la columna y son opuestos en la factura; con NULL, el corte suave
 -- de RF-09.11 sigue existiendo siempre y nadie puede apagarlo dejando el campo vacío.
+-- El mínimo es 2 y no 1, y el 2 es INTENTOS_POR_GENERACION: una generación reserva el
+-- intento primario y el de respaldo ANTES de llamar, así que un cupo de 1 no admite ninguna
+-- —el hueco nunca alcanza— y el workspace se quedaría con la capacidad apagada para siempre
+-- detrás de un mensaje que se lee como «vuelve mañana». Un tope que no deja pasar nada no es
+-- un tope, es un interruptor; y para apagar la AI ya está no configurar credencial, que lo
+-- dice con todas las letras.
+--
+-- La base no puede importar la constante, así que el vínculo es el mismo que el del techo del
+-- lote: una prueba pacta el cupo mínimo, comprueba que con él SÍ se puede generar, e intenta
+-- pactar uno por debajo y exige que la base lo rechace.
 alter table workspace
   add column limite_llamadas_ai_dia integer
-    check (limite_llamadas_ai_dia is null or limite_llamadas_ai_dia > 0);
+    check (limite_llamadas_ai_dia is null or limite_llamadas_ai_dia >= 2);
 
 comment on column workspace.limite_llamadas_ai_dia is
   'Cuota diaria de llamadas AI atendidas de este workspace (RF-08.5). NULL = sin cupo '
-  'pactado, rige LIMITE_LLAMADAS_DIA del código. El CHECK impide almacenar un valor no '
-  'positivo, así que la validación de TS es la última línea y no la única.';
+  'pactado, rige LIMITE_LLAMADAS_DIA del código. El CHECK impide almacenar un cupo por '
+  'debajo de INTENTOS_POR_GENERACION, que no admitiría ninguna generación.';
 
 -- ── Por qué NO hay grant, y por qué eso es el arreglo y no un olvido ──
 --

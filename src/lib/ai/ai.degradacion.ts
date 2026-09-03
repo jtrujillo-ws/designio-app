@@ -57,6 +57,15 @@ export const MODELO_FALLBACK = 'claude-sonnet-4-6';
 export const LIMITE_LLAMADAS_DIA = 60;
 
 /**
+ * Cuántas llamadas al proveedor puede llegar a costar UNA generación: el intento primario y,
+ * si el modelo no está, el de respaldo. Vive aquí y no en el servicio porque es política —la
+ * misma familia que el par de modelos y el tope diario— y porque el cupo mínimo que tiene
+ * sentido pactar se deriva de ella: un workspace con menos huecos que esto nunca podría
+ * generar nada, y su CHECK en la base lo impide.
+ */
+export const INTENTOS_POR_GENERACION = 2;
+
+/**
  * Tarifa del proveedor en USD por millón de tokens, por modelo de la política. Vive en
  * código junto a la política de modelos y no en la base: el coste se calcula con el
  * precio VIGENTE al generar y se persiste con la propuesta, así que una tarifa nueva no
@@ -201,7 +210,15 @@ function minutosLegibles(ms: number): string {
 export function evaluarCapacidadAI(entrada: {
   keyWorkspace?: string | null;
   keyEntorno?: string | null;
+  /** Llamadas ATENDIDAS hoy: gasto consumado. Es también el número que se muestra. */
   llamadasHoy?: number;
+  /**
+   * Huecos apartados por generaciones EN CURSO. Viajan aparte del gasto y no sumados por el
+   * llamante, porque son dos números con dos propósitos: los dos deciden, pero solo el gasto
+   * se enseña. Sumarlos antes de entrar hacía que el motivo citara el total —«61/60», un
+   * cociente por encima del 100%— justo encima de la tarjeta que mostraba «59/60».
+   */
+  reservadas?: number;
   limiteDiario?: number;
   /** Cuántas llamadas puede llegar a hacer la generación que se está admitiendo (primario
    * y, si cae, respaldo). El panel no pasa ninguna: pregunta por el estado, no pide hueco.
@@ -219,7 +236,14 @@ export function evaluarCapacidadAI(entrada: {
     Number.isInteger(entrada.limiteDiario) && (entrada.limiteDiario as number) > 0
       ? (entrada.limiteDiario as number)
       : LIMITE_LLAMADAS_DIA;
-  const usadas = Number.isFinite(entrada.llamadasHoy) ? Math.max(0, entrada.llamadasHoy!) : 0;
+  const atendidas = Number.isFinite(entrada.llamadasHoy) ? Math.max(0, entrada.llamadasHoy!) : 0;
+  const reservadas = Number.isFinite(entrada.reservadas) ? Math.max(0, entrada.reservadas!) : 0;
+  // Lo comprometido: lo que ya se pagó más lo que otros tienen apartado. Decide, pero no se
+  // muestra —el número de la tarjeta sigue siendo el gasto—.
+  const comprometidas = atendidas + reservadas;
+  /** «59» o «59 atendidas y 2 en curso»: el motivo nunca enseña un total que contradiga la
+   * tarjeta, y cuando hay reservas dice de dónde sale la diferencia en vez de esconderla. */
+  const desglose = reservadas > 0 ? `${atendidas} atendidas y ${reservadas} en curso` : `${atendidas}`;
   const piden =
     Number.isInteger(entrada.unidades) && (entrada.unidades as number) > 0
       ? (entrada.unidades as number)
@@ -248,7 +272,7 @@ export function evaluarCapacidadAI(entrada: {
 
   const base = {
     modelo: MODELO_PRIMARIO,
-    llamadasHoy: usadas,
+    llamadasHoy: atendidas,
     limiteDiario: limite,
     proveedorResponde,
     advertencia,
@@ -262,20 +286,20 @@ export function evaluarCapacidadAI(entrada: {
       motivo: `Capacidad AI apagada: este despliegue no tiene credencial del proveedor configurada. ${COLA_MANUAL}`,
     };
   }
-  if (usadas >= limite) {
+  if (comprometidas >= limite) {
     return {
       ...base,
       disponible: false,
       origenKey,
-      motivo: `Presupuesto AI del workspace agotado por hoy (${usadas}/${limite} llamadas al proveedor). Las capacidades AI quedan en pausa hasta mañana. ${COLA_MANUAL}`,
+      motivo: `Presupuesto AI del workspace agotado por hoy (${desglose}, de ${limite} llamadas al proveedor). Las capacidades AI quedan en pausa hasta mañana. ${COLA_MANUAL}`,
     };
   }
-  if (usadas + piden > limite) {
+  if (comprometidas + piden > limite) {
     return {
       ...base,
       disponible: false,
       origenKey,
-      motivo: `El presupuesto AI de hoy no alcanza para esta generación: quedan ${limite - usadas} llamadas de ${limite} y esta puede gastar hasta ${piden}. ${COLA_MANUAL}`,
+      motivo: `El presupuesto AI de hoy no alcanza para esta generación: quedan ${limite - comprometidas} llamadas de ${limite} y esta puede gastar hasta ${piden}. ${COLA_MANUAL}`,
     };
   }
   return { ...base, disponible: true, origenKey, motivo: '' };

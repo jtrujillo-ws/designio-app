@@ -385,6 +385,24 @@ export function citaApareceLiteral(material: string, fragmento: string): boolean
   return aguja.length > 0 && normalizar(material).includes(aguja);
 }
 
+/**
+ * Presencia literal de CADA cita, con el material normalizado una sola vez. Existe porque el
+ * panel necesita la respuesta por cita y la pedía llamando al contador con un array de una:
+ * eso re-normalizaba el material entero —hasta 20.000 caracteres, en minúsculas y con los
+ * espacios colapsados— por cada cita y de cada fila de la página. El pajar es el mismo para
+ * todas; se prepara una vez.
+ */
+export function presenciaLiteralPorCita(
+  material: string,
+  citas: { fragmento: string }[],
+): boolean[] {
+  const pajar = normalizar(material);
+  return citas.map((c) => {
+    const aguja = normalizar(c.fragmento);
+    return aguja.length > 0 && pajar.includes(aguja);
+  });
+}
+
 export function presenciaLiteralDeCitas(
   material: string,
   citas: { fragmento: string }[],

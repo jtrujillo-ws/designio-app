@@ -99,8 +99,17 @@ export function credencialesAI(): {
   return { keyWorkspace: null, keyEntorno: entorno ? entorno : null };
 }
 
-/** ¿Conviene reintentar con el modelo de respaldo? Solo cuando el fallo es del modelo o
- * de la capacidad del proveedor, nunca cuando es de la petición o de la credencial. */
+/**
+ * ¿Conviene reintentar con el modelo de respaldo? Solo cuando el modelo NO ESTÁ: un 404 (no
+ * existe o no está habilitado para esta cuenta) o un 5xx.
+ *
+ * Deliberadamente NO degrada ante timeout ni fallo de conexión, aunque «el proveedor no
+ * responde» suene a lo mismo. Dos razones, y conviene dejarlas escritas porque el nombre
+ * invita a lo contrario: cambiar de modelo no arregla una red caída ni un proveedor
+ * saturado, y sobre todo el respaldo costaría OTROS `TIMEOUT_PROVEEDOR_MS` con una persona
+ * mirando la pantalla — los mismos 25 s × 2 que `maxRetries: 0` existe para no pagar. Un
+ * timeout se anota como `sin-respuesta`, apaga la señal de salud del panel y se reintenta
+ * cuando quien está delante lo decida. */
 function degradaModelo(e: unknown): boolean {
   const status = (e as { status?: unknown }).status;
   return typeof status === 'number' && (status === 404 || status >= 500);
@@ -163,6 +172,22 @@ async function unaLlamada(
   if (respuesta.stop_reason === 'refusal') {
     throw Object.assign(new Error('refusal'), { status: 422, uso, causa: 'rechazo-proveedor' });
   }
+  // Una respuesta CORTADA por el techo de salida no es lo mismo que una que incumple el
+  // contrato, aunque las dos acaben con un JSON que no parsea. Se distingue aquí porque
+  // después ya no se puede: el libro de costos vería «fuera-de-contrato» en los dos casos y
+  // nadie podría separar «el modelo se inventa la forma» —que se investiga mirando el
+  // prompt— de «nuestro MAX_TOKENS se queda corto», que se arregla subiéndolo. El resultado
+  // sigue siendo `fuera-de-contrato` (no hay salida utilizable y el vocabulario del CHECK de
+  // `llamada_ai` es cerrado), pero el MOTIVO dice cuál de los dos fue.
+  if (respuesta.stop_reason === 'max_tokens') {
+    throw Object.assign(
+      new Error(
+        `La respuesta del proveedor se cortó por el techo de salida (${MAX_TOKENS} tokens): ` +
+          'llegó incompleta y no se puede usar. No es que el modelo incumpliera el formato.',
+      ),
+      { status: 422, uso, causa: 'fuera-de-contrato' },
+    );
+  }
   const texto = respuesta.content
     .map((b) => (b.type === 'text' ? b.text : ''))
     .join('')
@@ -189,7 +214,9 @@ function usoDelError(e: unknown): UsoLlamada | null {
 function causaDelError(e: unknown): MotivoSinSalida {
   if (e instanceof SyntaxError) return 'fuera-de-contrato';
   const causa = (e as { causa?: unknown }).causa;
-  return causa === 'rechazo-proveedor' ? 'rechazo-proveedor' : 'sin-respuesta';
+  if (causa === 'rechazo-proveedor') return 'rechazo-proveedor';
+  if (causa === 'fuera-de-contrato') return 'fuera-de-contrato';
+  return 'sin-respuesta';
 }
 
 /**

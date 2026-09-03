@@ -169,10 +169,21 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const [l] = await conUsuario(leadId, (tx) => tx`
       insert into llamada_ai (workspace_id, capacidad, item_id, reto_id, modelo, origen_key,
                               resultado, tokens_entrada, tokens_salida, costo_usd,
-                              latencia_ms, creado_por)
+                              latencia_ms, consentimiento_version, creado_por)
       values (${ws}, ${campos.capacidad}, ${campos.itemId ?? null}, ${campos.retoId ?? null},
               ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', 1200, 300,
-              ${costoDeUso(MODELO_PRIMARIO, USO_CI)}, 900, ${leadId})
+              ${costoDeUso(MODELO_PRIMARIO, USO_CI)}, 900,
+              -- La misma regla que aplica el servicio, y que la base exige en las dos
+              -- direcciones: se cita el permiso vigente si el tipo de fuente lo exige, y no
+              -- se cita nada si no. Escrita aquí para que el fixture no tenga que saberla
+              -- item por item.
+              (select case when tipo_fuente_exige_consentimiento(i.tipo_fuente)
+                        then (select max(c.version) from consentimiento_item c
+                               where c.item_id = i.id and c.workspace_id = i.workspace_id)
+                      end
+                 from item_importacion i
+                where i.id = ${campos.itemId ?? null} and i.workspace_id = ${ws}),
+              ${leadId})
       returning id`);
     return l!.id as string;
   }
@@ -398,7 +409,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   it('una propuesta no puede nacer ya decidida ni con un «original» distinto de lo propuesto', async () => {
     const itemId = await nuevoItem('Item para altas forzadas');
     const llamadaId = await nuevaLlamada({ capacidad: 'CI', itemId });
-    // Nacer aceptada saltaría la firma humana: la política de INSERT lo impide.
+    // Nacer aceptada saltaría la firma humana, y ahora se corta una capa ANTES de la
+    // política: `estado` y `revisada_por` no están en el grant de INSERT —solo en el de
+    // UPDATE—, así que la aplicación ni siquiera tiene superficie para nombrarlos al dar de
+    // alta. El DEFAULT pone 'propuesta' y no hay forma de decir otra cosa.
     await expect(
       conUsuario(leadId, (tx) => tx`insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
@@ -406,7 +420,19 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         values (${ws}, 'CI', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":1}'::jsonb,
                 ${MODELO_PRIMARIO}, 'v', 'entorno', ${llamadaId}, ${leadId}, 'aceptada',
                 ${leadId})`),
-    ).rejects.toThrow(/row-level security|check constraint/);
+    ).rejects.toThrow(/permission denied/i);
+    // Y el suelo sigue debajo del grant, que es lo que importa: por la vía privilegiada —sin
+    // RLS y sin grants— la fila tampoco entra, porque una propuesta decidida sin objeto
+    // materializado es un estado que los CHECK hacen imposible (SYS-19).
+    await expect(
+      sqlAdmin()`insert into propuesta_ai
+        (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, llamada_id, creado_por, estado, revisada_por,
+         revisada_en)
+        values (${ws}, 'CI', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":1}'::jsonb,
+                ${MODELO_PRIMARIO}, 'v', 'entorno', ${llamadaId}, ${leadId}, 'aceptada',
+                ${leadId}, now())`,
+    ).rejects.toThrow(/check constraint/i);
     // Y el «original» tiene que ser de verdad el original (SYS-17).
     await expect(
       conUsuario(leadId, (tx) => tx`insert into propuesta_ai
@@ -2572,11 +2598,19 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(panel.retosAbiertos.some((r) => r.id === retoR)).toBe(false);
 
       // Y lo que dice la pantalla se confirma contra la base, por los tres caminos:
-      // aceptar la propuesta…
+      // aceptar la propuesta… y con un error de DOMINIO, no con el del driver. Esto es lo
+      // que se había roto: el `catch` de `materializarCriterio` reconocía la palabra
+      // «congelados» —la del mensaje del G0— y el `raise` del registry no la lleva, así que
+      // el PostgresError crudo llegaba entero a la pantalla de revisión. Comprobar solo el
+      // texto habría pasado igual, porque el mensaje que se lee es el mismo: lo que
+      // distingue una cosa de la otra es la CLASE.
       const p = panel.pendientes[0]!;
-      await expect(
-        aceptarPropuesta(curadorId, { workspaceId: wsR, propuestaId: p.id }),
-      ).rejects.toThrow(/registry del reto está firmado/i);
+      const alAceptar = await aceptarPropuesta(curadorId, {
+        workspaceId: wsR,
+        propuestaId: p.id,
+      }).catch((e: unknown) => e);
+      expect(alAceptar).toBeInstanceOf(ErrorAI);
+      expect((alAceptar as ErrorAI).message).toMatch(/registry de medición de ese reto/i);
       // …volver a generar sobre ese reto, que se corta en la ADMISIÓN, antes de gastar la
       // llamada y con el motivo correcto…
       await expect(
@@ -2598,6 +2632,112 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // Rechazar, que es la salida de toda propuesta obsoleta, sigue abierta.
       await rechazarPropuesta(curadorId, { workspaceId: wsR, propuestaId: p.id });
     });
+  });
+
+  it('el libro no puede afirmar un consentimiento que no existe, no es del item o denegaba', async () => {
+    // `consentimiento_version` es el sustrato de la remediación de RF-09.4: «qué salió, a
+    // qué proveedor y bajo qué permiso». Un entero suelto lo convertía en una afirmación
+    // que nadie comprueba, y un número en el que se confía sin poder verificarlo es peor
+    // que no tenerlo. Aquí se prueba que está ATADO, en las cuatro direcciones.
+    const admin = sqlAdmin();
+    const entrevista = await nuevoItem('Entrevista atada', 'entrevista');
+    const otra = await nuevoItem('Otra entrevista', 'entrevista');
+    const nota = await nuevoItem('Nota sin personas', 'nota');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId: entrevista,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    // En el otro item, una v1 que NIEGA y una v2 que autoriza: existen las dos y son
+    // reales, y ninguna de las dos puede amparar una salida del PRIMER item.
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId: otra,
+      alcance: 'Solo uso interno: no autoriza al proveedor',
+      procesamientoExterno: false,
+    });
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId: otra,
+      alcance: 'Ahora sí autoriza al proveedor',
+      procesamientoExterno: true,
+    });
+
+    const llamada = (itemId: string, version: number | null) => admin`insert into llamada_ai
+      (workspace_id, capacidad, item_id, modelo, origen_key, resultado, motivo,
+       consentimiento_version, creado_por)
+      values (${ws}, 'CI', ${itemId}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', '',
+              ${version}, ${leadId})
+      returning id`;
+
+    // 1) Una versión que no existe para nadie.
+    await expect(llamada(entrevista, 9)).rejects.toThrow(/foreign key|llave foránea/i);
+    // 2) Una versión que existe, que AUTORIZA… pero es de OTRO item. La FK es compuesta con
+    //    `item_id`, así que la v2 de `otra` no ampara una salida de `entrevista`.
+    await expect(llamada(entrevista, 2)).rejects.toThrow(/foreign key|llave foránea/i);
+    // 3) La versión existe, es de su item… y DENEGABA el procesamiento externo. Es el caso
+    //    que una FK simple a la bitácora no habría visto, y el que más importa: material
+    //    personal figurando como amparado por un permiso que decía que no.
+    await expect(llamada(otra, 1)).rejects.toThrow(/foreign key|llave foránea/i);
+    // 4) Y las dos direcciones del «null significa no aplicaba»: material de personas sin
+    //    citar permiso, y material que no lo exige citando uno.
+    await expect(llamada(entrevista, null)).rejects.toThrow(/falta consentimiento_version/i);
+    await expect(llamada(nota, 1)).rejects.toThrow(/no exige consentimiento/i);
+
+    // Control: los dos casos buenos entran.
+    const [buena] = await llamada(entrevista, 1);
+    const [sinPersonas] = await llamada(nota, null);
+    const [leida] = await admin`select consentimiento_version, consentimiento_autoriza_externo
+      from llamada_ai where id = ${buena!.id as string}`;
+    expect(leida!.consentimiento_version).toBe(1);
+    // La columna que lleva la constante dentro de la FK la deriva la BASE: no está en el
+    // insert de nadie, así que no se puede mentir en ella.
+    expect(leida!.consentimiento_autoriza_externo).toBe(true);
+    await admin`delete from llamada_ai where id in
+      (${buena!.id as string}, ${sinPersonas!.id as string})`;
+  });
+
+  it('los relojes del slice no los escribe quien se mide con ellos', async () => {
+    // Tres relojes que gobiernan decisiones y que la aplicación NO puede escribir, porque
+    // `creado_en` está fuera de los tres grants de INSERT: el tope diario del workspace se
+    // cuenta sobre `llamada_ai.creado_en` (RF-09.12), la caducidad del arrendamiento sobre
+    // `reserva_ai.creado_en` —admisión, despacho y fencing— y el orden de la cola FIFO
+    // sobre `propuesta_ai.creado_en`. Con el grant puesto, una llamada nacía fechada ayer y
+    // no contaba para hoy, y una reserva nacía inmortal y bloqueaba su ancla para siempre.
+    const itemId = await nuevoItem('Item de los relojes');
+    const ayer = new Date(Date.now() - 36 * 3600 * 1000);
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into llamada_ai
+        (workspace_id, capacidad, item_id, modelo, origen_key, resultado, motivo,
+         creado_por, creado_en)
+        values (${ws}, 'CI', ${itemId}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', '',
+                ${leadId}, ${ayer})`),
+    ).rejects.toThrow(/permission denied/i);
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into reserva_ai
+        (workspace_id, capacidad, item_id, unidades, creado_por, creado_en)
+        values (${ws}, 'CI', ${itemId}, 1, ${leadId}, ${new Date(Date.now() + 9e8)})`),
+    ).rejects.toThrow(/permission denied/i);
+    const llamadaId = await nuevaLlamada({ capacidad: 'CI', itemId });
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into propuesta_ai
+        (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, llamada_id, creado_por, creado_en)
+        values (${ws}, 'CI', 'evidencia', ${itemId}, '{"a":1}'::jsonb, '{"a":1}'::jsonb,
+                ${MODELO_PRIMARIO}, 'v', 'entorno', ${llamadaId}, ${leadId}, ${ayer})`),
+    ).rejects.toThrow(/permission denied/i);
+
+    // Y sin nombrarlo, las mismas filas entran: lo estampa el DEFAULT, que es la única mano
+    // sin motivos para mentir. Se comprueba que la fecha es de AHORA y no la que se pidió.
+    await conUsuario(leadId, (tx) => tx`insert into reserva_ai
+      (workspace_id, capacidad, item_id, unidades, creado_por)
+      values (${ws}, 'CI', ${itemId}, 1, ${leadId})`);
+    const [r] = await conUsuario(leadId, (tx) => tx`select creado_en from reserva_ai
+      where workspace_id = ${ws} and item_id = ${itemId}`);
+    expect(Date.now() - new Date(r!.creado_en as string).getTime()).toBeLessThan(60_000);
+    await sqlAdmin()`delete from reserva_ai where workspace_id = ${ws} and item_id = ${itemId}`;
+    await sqlAdmin()`delete from llamada_ai where id = ${llamadaId}`;
   });
 
   it('el asiento reservado del árbol ya no puede apuntar al vacío ni a otro workspace', async () => {

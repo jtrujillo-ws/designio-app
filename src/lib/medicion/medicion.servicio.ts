@@ -378,6 +378,27 @@ export async function abrirMedicion(
     if (yaMedia && !listo!.medicion_sin_registry) {
       throw new ErrorMedicion('La medición de este reto ya está abierta');
     }
+    // El G7 es del CONJUNTO, no del proyecto que se esté mirando: esta operación mueve
+    // TODOS los que están en implementación y el guard de transición rechaza al que no
+    // tenga el suyo, así que basta un hermano sin G7 para que la apertura entera falle. Se
+    // dice antes de mover nada y con nombres, porque «falta un G7» sin decir cuál manda a
+    // buscarlo a mano. La pantalla mira exactamente esto (`proyectosSinG7`).
+    if (listo) {
+      const sinG7 = await tx`
+        select p.codigo from proyecto p
+        where p.reto_id = ${entrada.retoId} and p.workspace_id = ${entrada.workspaceId}
+          and p.estado = 'en-implementacion'
+          and not exists (select 1 from gate_instancia g
+            where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+              and g.numero = 7 and g.estado = 'aprobado')
+        order by p.codigo`;
+      if (sinG7.length > 0) {
+        const lista = sinG7.map((p) => p.codigo as string).join(', ');
+        throw new ErrorMedicion(
+          `Falta el G7 en (${lista}): la apertura mueve a todos los proyectos del reto a la vez, así que hasta que lo tengan la medición no abre`,
+        );
+      }
+    }
     // Un proyecto PAUSADO puede quedarse atrás —parar es del cliente y esta operación no
     // lo toca— pero solo si todavía puede seguir al reto después. Sin su G7 aprobado no
     // puede, y por tres reglas que se cierran entre sí: con el reto ya midiendo, retomarlo
@@ -498,8 +519,23 @@ export async function registrarSnapshot(
 export async function cargarSnapshotsCsv(
   actorId: string,
   entrada: CargarCsv,
-): Promise<{ insertados: number; rechazadas: FilaRechazada[] }> {
-  const { validas, rechazadas } = parsearCsv(entrada.csv);
+): Promise<{ insertados: number; rechazadas: FilaRechazada[]; csvRestante: string }> {
+  const { validas, rechazadas, cabecera } = parsearCsv(entrada.csv);
+  /** El texto que queda por reintentar: la cabecera —si la había— y las filas rechazadas,
+   * en su orden original. Se construye AQUÍ y no en la pantalla porque las reglas del
+   * parseo viven aquí: el delimitador sale del primer renglón con contenido y la cabecera
+   * solo se salta si lo parece, así que un recorte hecho a ojo puede cambiar cómo se lee el
+   * reintento — otra corrupción distinta en lugar de la que se está evitando. */
+  const restante = (rechazadas: FilaRechazada[]): string => {
+    if (rechazadas.length === 0) return '';
+    const lineas = entrada.csv.split(/\r?\n/);
+    const quedan = new Set(rechazadas.map((f) => f.linea));
+    if (cabecera !== null) quedan.add(cabecera);
+    return [...quedan]
+      .sort((a, b) => a - b)
+      .map((n) => lineas[n - 1] ?? '')
+      .join('\n');
+  };
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     const ctx = await contextoDeEntrada(tx, entrada.workspaceId, entrada.entradaId);
@@ -516,11 +552,36 @@ export async function cargarSnapshotsCsv(
           return false;
         })
       : validas;
+    // Y una CARGA no corrige (ver el guard `snapshot_carga_no_corrige`): por CSV no se
+    // escribe sobre una fecha que ya tiene dato de esta entrada. Es lo que hace que
+    // reenviar un fichero ya cargado —un doble clic, un reintento, volver a pegarlo
+    // mañana— no duplique una serie que después nadie puede limpiar, porque no hay
+    // borrado. La base lo exige igual; aquí se hace FILA A FILA para que el rechazo diga
+    // qué fecha es y qué hacer, en vez de tumbar la tanda entera con el motivo del guard.
+    //
+    // Incluye los repetidos DENTRO del propio fichero, que el guard no puede ver: su
+    // consulta no incluye lo que la misma sentencia acaba de escribir.
+    const yaCargadas = await tx`
+      select fecha::text as fecha from snapshot
+      where entrada_kpi_id = ${entrada.entradaId} and workspace_id = ${entrada.workspaceId}`;
+    const ocupadas = new Set(yaCargadas.map((f) => f.fecha as string));
+    const nuevas = enVentana.filter((f) => {
+      if (!ocupadas.has(f.fecha)) {
+        ocupadas.add(f.fecha);
+        return true;
+      }
+      rechazadas.push({
+        linea: f.linea,
+        contenido: f.contenido,
+        motivo: `Ya hay un dato de ${f.fecha}: una carga no corrige — corrige desde el formulario, con su nota`,
+      });
+      return false;
+    });
     rechazadas.sort((a, b) => a.linea - b.linea);
-    if (enVentana.length === 0) {
+    if (nuevas.length === 0) {
       // Sin filas válidas no hay escritura, pero el diagnóstico sí importa: la pantalla
       // muestra por qué se rechazó cada línea.
-      return { insertados: 0, rechazadas };
+      return { insertados: 0, rechazadas, csvRestante: restante(rechazadas) };
     }
     let insertadas;
     try {
@@ -530,7 +591,7 @@ export async function cargarSnapshotsCsv(
         insert into snapshot (workspace_id, entrada_kpi_id, valor, fecha, origen, nota, creado_por)
         select ${entrada.workspaceId}, ${entrada.entradaId}, f.valor::numeric, f.fecha::date,
                'csv', f.nota, ${actorId}
-        from jsonb_to_recordset(${tx.json(enVentana)}) as f(fecha text, valor text, nota text)
+        from jsonb_to_recordset(${tx.json(nuevas)}) as f(fecha text, valor text, nota text)
         returning id`;
     } catch (e) {
       if (esRechazoDePolitica(e)) throw new ErrorMedicion(RECHAZO_SNAPSHOT);
@@ -552,7 +613,7 @@ export async function cargarSnapshotsCsv(
           rechazadas: rechazadas.length,
         })},
         ${actorId}, ${quien!.rol as string})`;
-    return { insertados: insertadas.length, rechazadas };
+    return { insertados: insertadas.length, rechazadas, csvRestante: restante(rechazadas) };
   });
 }
 
@@ -607,9 +668,14 @@ function delimitadorCsv(primera: string): string {
 export function parsearCsv(csv: string): {
   validas: FilaCsv[];
   rechazadas: FilaRechazada[];
+  /** Línea (1-based) que se saltó por ser cabecera, o null. La necesita quien reconstruya
+   * el texto que queda por reintentar: sin ella, el recorte se comería el renglón que
+   * decide el delimitador y el reintento se parsearía de otra forma. */
+  cabecera: number | null;
 } {
   const validas: FilaCsv[] = [];
   const rechazadas: FilaRechazada[] = [];
+  let cabecera: number | null = null;
   const lineas = csv.split(/\r?\n/);
   const delim = delimitadorCsv(lineas.find((l) => l.trim() !== '')?.trim() ?? '');
   // Con el delimitador fijado, la coma solo puede ser una cosa. Si NO es el delimitador es
@@ -630,6 +696,7 @@ export function parsearCsv(csv: string): {
     // Cabecera de hoja de cálculo: se salta sin contarla como rechazo.
     if (cabeceraPosible && fecha.toLowerCase() === 'fecha') {
       cabeceraPosible = false;
+      cabecera = i + 1;
       continue;
     }
     cabeceraPosible = false;
@@ -702,7 +769,7 @@ export function parsearCsv(csv: string): {
       nota,
     });
   }
-  return { validas, rechazadas };
+  return { validas, rechazadas, cabecera };
 }
 
 /** Abrir el outcome review (RF-07.7): la política solo lo permite con la ventana del
@@ -1001,6 +1068,21 @@ export async function seguimientoDeImpacto(
             and not exists (select 1 from entrada_kpi e
               where e.criterio_id = c.id and e.workspace_id = c.workspace_id)), '[]'::jsonb)
           as criterios_sin_entrada,
+        -- Qué proyectos del RETO impedirían abrir la medición por faltarles su G7. La
+        -- disponibilidad de esa operación es propiedad del CONJUNTO y no del proyecto que
+        -- se está mirando: abrirMedicion mueve todos los que están en implementación y el
+        -- guard rechaza al hermano sin G7, así que una pantalla que solo mire su gate
+        -- anuncia lista una acción que la base va a negar. Van los CÓDIGOS porque el motivo
+        -- tiene que decir cuál falta, no solo que falta alguno.
+        coalesce((
+          select jsonb_agg(p2.codigo order by p2.codigo)
+          from proyecto p2
+          where p2.reto_id = r.id and p2.workspace_id = r.workspace_id
+            and p2.estado = 'en-implementacion'
+            and not exists (select 1 from gate_instancia g
+              where g.proyecto_id = p2.id and g.workspace_id = p2.workspace_id
+                and g.numero = 7 and g.estado = 'aprobado')), '[]'::jsonb)
+          as proyectos_sin_g7,
         -- Candidatos a dueño del dato: SOLO el lado cliente (RF-07.1), con el mismo
         -- predicado que la política de la entrada y el guard de la firma. Ofrecer a un
         -- curador aquí sería ofrecer lo que la base rechaza, y ese rechazo llegaría —en el
@@ -1045,6 +1127,7 @@ export async function seguimientoDeImpacto(
       registry: fila.registry as SeguimientoDeImpacto['registry'],
       entradas: fila.entradas as SeguimientoDeImpacto['entradas'],
       criteriosSinEntrada: fila.criterios_sin_entrada as SeguimientoDeImpacto['criteriosSinEntrada'],
+      proyectosSinG7: fila.proyectos_sin_g7 as string[],
       propietariosPosibles:
         fila.propietarios_posibles as SeguimientoDeImpacto['propietariosPosibles'],
       review: fila.review as SeguimientoDeImpacto['review'],

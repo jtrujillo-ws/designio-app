@@ -553,6 +553,48 @@ create policy snapshot_insert on snapshot
   );
 -- Deliberadamente SIN update ni delete en snapshot: append-only (SYS-23).
 
+-- ── Una CARGA no corrige: corregir es un acto explícito y de uno en uno ──
+-- Aquí hay dos escrituras que la fila no distingue y que significan lo contrario. Con la
+-- tabla append-only y sin UPDATE ni DELETE, insertar otro dato para la misma entrada y la
+-- misma fecha es la ÚNICA forma que existe de corregir un valor mal tecleado: eso es
+-- deliberado y es lo que SYS-23 pide. Y es también, exactamente, lo que produce reenviar
+-- un CSV que ya se cargó — un doble clic, un reintento del navegador, volver a pegar el
+-- fichero mañana—, con la diferencia de que ahí nadie quiso corregir nada y el duplicado
+-- es PERMANENTE, porque no hay borrado que lo saque.
+--
+-- Por eso se descartó el arreglo que parece obvio: un `unique (entrada_kpi_id, fecha)`
+-- convertiría cada errata en incorregible para siempre —prohibiría el caso bueno para
+-- frenar el malo— y contradiría la razón por la que esta tabla es append-only.
+--
+-- Lo que sí separa los dos casos es la INTENCIÓN, y la fila la lleva escrita: `origen`. Una
+-- carga masiva es un export de una hoja de cálculo, no una decisión sobre un dato concreto;
+-- corregir es un acto de uno en uno, con su nota, y para eso está el formulario. Así que la
+-- regla es: por CSV no se escribe sobre una fecha que ya tiene dato. El reenvío accidental
+-- se para solo, la corrección sigue existiendo por donde de verdad se declara, y la promesa
+-- deja de depender de que una pantalla se acuerde de vaciar un textarea.
+--
+-- No es SECURITY DEFINER: consulta snapshots de la MISMA entrada, que cualquier miembro del
+-- workspace ya puede leer, así que no puede volverse oráculo de nada.
+--
+-- Y no ve las filas anteriores de su propia sentencia —una carga entra en un solo INSERT y
+-- el snapshot del trigger no incluye lo que esa misma orden acaba de escribir—, así que los
+-- duplicados DENTRO del fichero los rechaza el servicio, fila a fila y con su motivo, que es
+-- además donde ese diagnóstico sirve de algo.
+create function snapshot_carga_no_corrige_guard() returns trigger
+language plpgsql as $$
+begin
+  if new.origen = 'csv' and exists (select 1 from snapshot s
+    where s.entrada_kpi_id = new.entrada_kpi_id and s.workspace_id = new.workspace_id
+      and s.fecha = new.fecha) then
+    raise exception 'ya hay un dato de esta entrada para el %: una carga no corrige — corregir es un dato NUEVO desde el formulario, con su nota (SYS-23)', new.fecha;
+  end if;
+  return new;
+end $$;
+create trigger snapshot_carga_no_corrige
+  before insert on snapshot
+  for each row execute function snapshot_carga_no_corrige_guard();
+revoke execute on function snapshot_carga_no_corrige_guard() from public;
+
 -- El outcome review se HABILITA al cerrar la ventana del último criterio (RF-07.7): la
 -- condición vive en la política, no solo en la pantalla.
 create policy review_insert on outcome_review

@@ -107,7 +107,13 @@ export function SeccionMedicion({
   const firmaG6 = proyecto.gates.find((g) => g.numero === 6)?.rolAprobador;
   // Y la medición se ABRE en G7 (§5.2): el gate de seguimiento, con los releases
   // conciliados y el effective state constatado. Firmar el contrato no basta.
-  const g7Aprobado = proyecto.gates.find((g) => g.numero === 7)?.estado === 'aprobado';
+  //
+  // Y es propiedad del CONJUNTO, no del proyecto que se está mirando: `abrirMedicion` mueve
+  // todos los proyectos del reto que están en implementación, y el guard de transición
+  // rechaza al hermano sin G7 — así que mirar solo este gate anunciaba lista una acción que
+  // la base iba a negar. La proyección trae los que faltan, con su código, porque el motivo
+  // tiene que decir CUÁL falta.
+  const faltanG7 = seguimiento.proyectosSinG7;
   const comunes = { workspaceId, seguimiento, onCambio, onError };
 
   return (
@@ -118,7 +124,7 @@ export function SeccionMedicion({
         esCurador={esCurador}
         esLead={esLead}
         puedeFirmar={rol === firmaG6}
-        g7Aprobado={g7Aprobado}
+        faltanG7={faltanG7}
       />
       {seguimiento.registry?.estado === 'firmado' &&
         seguimiento.entradas.map((entrada) => (
@@ -138,7 +144,7 @@ function BloqueRegistry({
   esCurador,
   esLead,
   puedeFirmar,
-  g7Aprobado,
+  faltanG7,
   onCambio,
   onError,
 }: Comunes & {
@@ -146,7 +152,7 @@ function BloqueRegistry({
   esCurador: boolean;
   esLead: boolean;
   puedeFirmar: boolean;
-  g7Aprobado: boolean;
+  faltanG7: string[];
 }) {
   const [ocupado, setOcupado] = useState(false);
   const [editando, setEditando] = useState<string | null>(null);
@@ -299,7 +305,7 @@ function BloqueRegistry({
         </span>
       )}
 
-      {firmado && porAbrir && esLead && g7Aprobado && (
+      {firmado && porAbrir && esLead && faltanG7.length === 0 && (
         <div>
           <Button
             size="sm"
@@ -320,10 +326,10 @@ function BloqueRegistry({
           </Button>
         </div>
       )}
-      {firmado && porAbrir && esLead && !g7Aprobado && (
+      {firmado && porAbrir && esLead && faltanG7.length > 0 && (
         <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
           La medición se abre al aprobarse el G7: primero se concilian los releases contra
-          la design version y se constata el effective state.
+          la design version y se constata el effective state. Falta en {faltanG7.join(', ')}.
         </span>
       )}
     </Card>
@@ -653,10 +659,13 @@ function BloqueSerie({
       const r = await cargarSnapshotsPegados({ data: { workspaceId, entradaId: entrada.id, csv } });
       if (r.ok) {
         setRechazadas(r.rechazadas);
-        if (r.rechazadas.length === 0) {
-          setCsv('');
-          setPegando(false);
-        }
+        // En el textarea queda SOLO lo que hay que reintentar (cabecera incluida, para que
+        // se lea igual). Dejarlo entero invitaba a corregir la fila mala y volver a pulsar,
+        // reenviando las que ya habían entrado — y un snapshot duplicado es permanente,
+        // porque la serie es append-only y no hay borrado. La base lo impide igual (una
+        // carga no corrige); esto es que la pantalla no lo proponga.
+        setCsv(r.csvRestante);
+        if (r.rechazadas.length === 0) setPegando(false);
         await onCambio();
       } else onError(r.error);
     } catch {

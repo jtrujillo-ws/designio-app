@@ -300,6 +300,9 @@ export type SeguimientoDeImpacto = {
   entradas: EntradaDeRegistry[];
   /** Criterios del reto sin KPI que los responda: la firma los exige (SYS-22). */
   criteriosSinEntrada: { id: string; kpi: string }[];
+  /** Códigos de los proyectos del reto que están en implementación SIN su G7 aprobado:
+   * los que harían fallar la apertura de la medición, que mueve a todos a la vez. */
+  proyectosSinG7: string[];
   /** Candidatos a propietario del dato: SOLO los miembros del lado cliente (RF-07.1). No
    * es «los miembros del workspace» filtrados por conveniencia de pantalla — es la misma
    * lista que la política de la entrada y el guard de la firma exigen, así que ofrecer

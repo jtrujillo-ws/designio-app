@@ -1191,9 +1191,48 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       .find((e) => e.id === entradaAbandonoId)!
       .snapshots.find((sn) => sn.nota === 'corte con coma decimal')!;
     expect(conComa.valor).toBe('55.2');
-    // Fixture: la serie que leen los tests siguientes es la de arriba, así que este corte
-    // —que solo existía para fijar el valor— se retira. Solo el rol admin puede (SYS-23).
-    await admin`delete from snapshot where id = ${conComa.id}`;
+    // ── Reenviar la misma carga NO duplica la serie ──
+    // Es el daño peor de esta pantalla y es permanente: los snapshots son append-only, sin
+    // política ni grant de DELETE, así que un duplicado no se puede sacar. Y no lo puede
+    // impedir un unique sobre (entrada, fecha), porque insertar otro dato del mismo día es
+    // la ÚNICA forma que existe de CORREGIR uno mal tecleado — prohibirlo dejaría cada
+    // errata sin arreglo posible. Lo que separa los dos casos es la intención, y la fila la
+    // lleva escrita: por CSV no se escribe sobre una fecha que ya tiene dato; corregir es un
+    // acto de uno en uno, desde el formulario y con su nota.
+    const reenvio = await cargarSnapshotsCsv(sponsorId, {
+      workspaceId: ws,
+      entradaId: entradaAbandonoId,
+      csv: csvEuropeo,
+    });
+    expect(reenvio.insertados).toBe(0);
+    expect(reenvio.rechazadas.some((f) => /Ya hay un dato de/.test(f.motivo))).toBe(true);
+    // Y la regla es de la BASE, no del diagnóstico: por SQL directo el rechazo llega igual.
+    await expect(
+      conUsuario(sponsorId, (tx) => tx`insert into snapshot
+        (workspace_id, entrada_kpi_id, valor, fecha, origen, nota, creado_por)
+        values (${ws}, ${entradaAbandonoId}, 9, ${fecha(-5)}::date, 'csv', '', ${sponsorId})`),
+    ).rejects.toThrow(/una carga no corrige/);
+    // Lo que SÍ sigue existiendo es corregir: mismo día, dato nuevo, por el formulario y con
+    // su nota. Si esto dejara de poder hacerse, el arreglo sería peor que el problema.
+    const correccion = await registrarSnapshot(sponsorId, {
+      workspaceId: ws,
+      entradaId: entradaAbandonoId,
+      valor: '55.9',
+      fecha: fecha(-5),
+      nota: 'corrige el corte anterior: la extracción venía con el filtro puesto',
+    });
+    expect(correccion.snapshotId).toBeTruthy();
+
+    // Y en el textarea queda SOLO lo que hay que reintentar, con su cabecera, para que el
+    // reintento se lea igual: el delimitador sale del primer renglón con contenido.
+    expect(euro.csvRestante.split('\n')[0]).toBe('fecha;valor;nota');
+    expect(euro.csvRestante).toContain('1.234,5');
+    expect(euro.csvRestante).not.toContain('corte con coma decimal');
+
+    // Fixture: la serie que leen los tests siguientes es la de arriba, así que estos cortes
+    // —que solo existían para fijar el valor y la corrección— se retiran. Solo el admin
+    // puede (SYS-23).
+    await admin`delete from snapshot where id in (${conComa.id}, ${correccion.snapshotId})`;
   });
 
   it('el ÚLTIMO día de la ventana todavía mide: el review no se abre y el snapshot entra', async () => {
@@ -2576,6 +2615,21 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
       select workspace_id, ${bId}, numero, rol_aprobador, 'aprobado', ${leadId}, now()
       from gate_instancia where proyecto_id = ${a.proyectoId}`;
+    // ── El G7 es del CONJUNTO, no del proyecto que se está mirando ──
+    // La apertura mueve TODOS los proyectos en implementación y el guard rechaza al que no
+    // tenga el suyo, así que basta un hermano sin G7 para que la apertura entera falle. Una
+    // pantalla que mirase solo el gate del proyecto abierto anunciaría lista una acción que
+    // la base va a negar — el mismo patrón del espejo, en otra puerta.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-implementacion'
+      where id = ${bId}`);
+    await admin`update gate_instancia set estado = 'pendiente', aprobado_por = null,
+      aprobado_en = null where proyecto_id = ${bId} and numero = 7`;
+    const segSinG7 = await seguimientoDeImpacto(leadId, ws, a.proyectoId);
+    expect(segSinG7!.proyectosSinG7).toEqual(['P-75B']);
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId })).rejects.toThrow(
+      /Falta el G7 en \(P-75B\)/,
+    );
+
     // Se para ANTES de abrir la medición. Que un pausado se quede atrás es deliberado
     // —parar es del cliente— pero solo vale si TODAVÍA PUEDE SEGUIR al reto: sin su G7 el
     // proyecto quedaría atrapado en un triángulo cerrado —retomarlo con el reto midiendo
@@ -2583,8 +2637,6 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     // parado se rechaza— y, atrapado él, el outcome review no puede cerrar el reto: lo que
     // se pierde no es un proyecto, es el final del reto. Se comprueba AL ABRIR, que es el
     // único momento en el que la salida —retomarlo y cerrar sus gates— todavía existe.
-    await admin`update gate_instancia set estado = 'pendiente', aprobado_por = null,
-      aprobado_en = null where proyecto_id = ${bId} and numero = 7`;
     await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
       where id = ${bId}`);
     await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId })).rejects.toThrow(

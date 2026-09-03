@@ -153,7 +153,15 @@ export const cargarSnapshotsPegados = createServerFn({ method: 'POST' })
       const r = await cargarSnapshotsCsv(actorId, data);
       // Éxito PARCIAL: las filas válidas entraron y las rechazadas vuelven con su motivo
       // (criterio de aceptación 1) — no es un error, es el resultado de la carga.
-      return { ok: true as const, insertados: r.insertados, rechazadas: r.rechazadas };
+      // `csvRestante` es el texto que queda por reintentar —cabecera y filas rechazadas—,
+      // construido donde viven las reglas del parseo. Dejar el CSV entero en la pantalla
+      // invitaba a reenviar filas que ya habían entrado.
+      return {
+        ok: true as const,
+        insertados: r.insertados,
+        rechazadas: r.rechazadas,
+        csvRestante: r.csvRestante,
+      };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

@@ -198,6 +198,15 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       values (${ws}, ${fuente!.id as string}, 'Evidencia medición', '{}'::jsonb, ${leadId})
       returning id`;
     evidenciaId = ev!.id as string;
+    // Marcar un ítem de checklist como `cumplido` citando evidencia exige DERECHOS
+    // vigentes para el ámbito cliente (SPEC-03, RF-03.10): un gate se aprueba con el
+    // cliente delante. La evidencia de este workspace de prueba los tiene concedidos,
+    // que es lo que deja aprobar los gates de este fixture; el caso contrario —citar sin
+    // derechos, y la revocación posterior— lo cubre la suite de evidencia profunda.
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaId}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${leadId}, now(), ${leadId})`;
 
     // Reto activo con su método y DOS criterios de éxito con ventana propia (SYS-22).
     const r = await crearReto(leadId, {
@@ -277,6 +286,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       await admin`delete from proyecto where workspace_id = ${ws}`;
       await admin`delete from reto_servicio_afectado where workspace_id = ${ws}`;
       await admin`delete from reto where workspace_id = ${ws}`;
+      await admin`delete from derecho_uso where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
       await admin`delete from servicio where workspace_id = ${ws}`;

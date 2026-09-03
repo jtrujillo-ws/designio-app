@@ -206,13 +206,34 @@ begin
         and a.estado = 'hipotesis') then
       raise exception 'no se puede aprobar G2: hay arquetipos sin confirmar ni refutar (RF-04.11)';
     end if;
+    -- ── ABSORBIDO de 20260902110000-medicion.sql, no reescrito ──
+    -- G6 es donde el Metric Registry se acuerda y se FIRMA (SYS-22): aprobar el plan de
+    -- implementación sin contrato de medición firmado deja el loop abierto por diseño.
+    -- Este `create or replace` reescribe la función ENTERA, así que omitirlo la desharía;
+    -- es la misma advertencia que ya lleva la rama de decisiones en revisión, con el
+    -- mismo motivo. Lo que NO se copia aquí es el efecto de G6 sobre el proyecto
+    -- (`en-implementacion`): vive en su propio trigger AFTER
+    -- (`proyecto_a_implementacion_tras_g6`) precisamente porque su precondición lee la
+    -- fila del gate que este guard, siendo BEFORE, todavía no ha escrito. Traérselo aquí
+    -- lo duplicaría y encima en el único momento en que no puede funcionar.
+    if new.numero = 6 and not exists (select 1 from metric_registry r
+      join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+      where r.reto_id = p.reto_id and r.workspace_id = new.workspace_id
+        and r.estado = 'firmado') then
+      raise exception 'no se puede aprobar G6: el Metric Registry no está firmado (SYS-22)';
+    end if;
     update etapa_instancia set estado = 'completada'
       where proyecto_id = new.proyecto_id and workspace_id = new.workspace_id
         and numero = new.numero;
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
       values (new.workspace_id, 'GateAprobado',
+        -- Payload también absorbido de 110000: `aprobado_en` está en el grant y el WITH
+        -- CHECK solo le exige no ser nulo, así que la fecha la propone la aplicación y
+        -- nada la ata al instante real — es la clase de dato que el rastro conserva tal
+        -- cual quedó.
         jsonb_build_object('gateId', new.id, 'proyectoId', new.proyecto_id,
-                           'numero', new.numero),
+                           'numero', new.numero, 'estado', new.estado,
+                           'aprobadoPor', new.aprobado_por, 'aprobadoEn', new.aprobado_en),
         app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   end if;
   return new;

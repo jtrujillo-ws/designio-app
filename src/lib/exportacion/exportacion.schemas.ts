@@ -133,6 +133,44 @@ export const CATALOGO_EXPORT = [
   { tabla: 'arquetipo_evidencia', orden: 'arquetipo_id, evidencia_id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_etapa', orden: 'reabierto_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id', poda: { modo: 'fuera' } },
+  // Medición temporal de impacto y post mortem (SPEC-07 / SYS-22): el contrato de
+  // medición que se firma en G6, sus KPI, las lecturas append-only y el veredicto del
+  // cierre. Las cinco entran en el catálogo porque SYS-04 exige que el ARCHIVO del
+  // propietario lo lleve todo, y ahí van enteras.
+  //
+  // En el ENTREGABLE las cinco quedan `fuera`, y conviene decir por qué no es la
+  // respuesta cómoda sino la única defendible. Ninguna cuelga de una evidencia —no hay
+  // `evidencia_id` en ninguna—, así que el eje de poda de este ámbito (derechos de uso
+  // sobre material de terceros) no las alcanza: la pregunta no es «¿con qué derechos?»
+  // sino «¿pertenecen al paquete?». Y el `entregable` de este slice es el MATERIAL
+  // citable con sus derechos —evidencia, su fuente, sus segmentos, su registro de
+  // derechos y sus originales—, no el expediente del método; por eso ya están fuera el
+  // `criterio_exito` contra el que se mide, los gates que lo aprueban y la cadena de
+  // razonamiento entera.
+  //
+  // La regla general del catálogo lo cierra por el otro lado: una fila viaja solo si
+  // viaja aquello a lo que apunta, y los padres de estas cinco son `reto`,
+  // `criterio_exito`, `miembro` y entre ellas mismas — todos `fuera`. Meterlas sin sus
+  // padres dejaría un contrato firmado sin el reto que contrata, KPI sin el criterio que
+  // miden y un veredicto sin los criterios que juzga: ids colgando, que es exactamente lo
+  // que esa regla existe para impedir.
+  { tabla: 'metric_registry', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  // Además nombra a una persona (`propietario_miembro_id` → `miembro`, que el entregable
+  // no lleva): el dueño de cada KPI por parte del cliente.
+  { tabla: 'entrada_kpi', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  // Lecturas append-only con su `nota`: apuntes de operación de quien mide, no material
+  // entregable. Sin su `entrada_kpi` serían números sin unidad ni objetivo.
+  { tabla: 'snapshot', orden: 'entrada_kpi_id, fecha, id', poda: { modo: 'fuera' } },
+  // El post mortem es el caso donde `fuera` incomoda más, y aun así es el correcto AQUÍ:
+  // `contribucion`, `factores_externos` y `diseno_experimental_justificacion` son el
+  // juicio de la boutique sobre si su propio trabajo funcionó y sobre el rigor de su
+  // método. Que el cliente deba recibirlo es muy probable — pero entonces lo recibe como
+  // informe de resultados, con los criterios y las lecturas que lo sostienen, no colado
+  // dentro de un paquete cuyo contrato es «material con derechos vigentes». Ensanchar el
+  // `entregable` en silencio sería cambiar lo que ese ámbito significa; queda anotado como
+  // pregunta de producto, no resuelto de tapadillo aquí.
+  { tabla: 'outcome_review', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'resultado_criterio', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   // Journey (SPEC-05): el mapa del servicio, su catálogo de touchpoints/canales/sistemas,
   // los nodos y aristas del grafo y los snapshots congelados. Es modelo PROPIO del
   // workspace, no material de terceros, así que el archivo del dueño lo lleva entero y el

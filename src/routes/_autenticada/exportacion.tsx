@@ -58,6 +58,13 @@ function PantallaExportacion() {
     if (!workspaceId) return;
     setExportando(true);
     setError(null);
+    // El recibo anterior se descarta ANTES de pedir nada. Si el intento nuevo falla, dejar
+    // en pantalla el manifiesto y las bloqueadas de la vez anterior hace creer que ese
+    // recibo es de esta operación — y un manifiesto que no acredita la operación que se
+    // está mirando es exactamente lo que SYS-04 no puede permitir. La misma tesis que
+    // obliga a que el paquete salga de una sola foto obliga a que la pantalla no cosa dos.
+    setManifiesto(null);
+    setBloqueadas([]);
     try {
       const r = await exportarWorkspaceFn({ data: { workspaceId, ambito } });
       if (!r.ok) {
@@ -78,7 +85,11 @@ function PantallaExportacion() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = nombreDeArchivoExport(r.exportacion.manifiesto.workspaceNombre, ambito);
+      a.download = nombreDeArchivoExport(
+        r.exportacion.manifiesto.workspaceNombre,
+        ambito,
+        r.exportacion.manifiesto.generadoEn,
+      );
       a.click();
       // El revoke va al siguiente tick: revocar justo después del click cancela o trunca
       // la descarga en navegadores que aún no han empezado a leer el blob (Safari).

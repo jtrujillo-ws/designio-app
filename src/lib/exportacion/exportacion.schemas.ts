@@ -354,7 +354,21 @@ export type Exportacion = {
 
 /** Nombre del archivo que se descarga. Solo caracteres seguros: el nombre del workspace
  * es dato de cliente y termina en un `download` del navegador. */
-export function nombreDeArchivoExport(nombreWorkspace: string, ambito: AmbitoExport): string {
+export function nombreDeArchivoExport(
+  nombreWorkspace: string,
+  ambito: AmbitoExport,
+  /**
+   * El `generadoEn` del MANIFIESTO (ISO), no el reloj de quien descarga. Es el mismo
+   * arreglo que ya se hizo DENTRO del recibo y que aquí faltaba: `generadoEn` sale del
+   * `now()` de la transacción que leyó los datos —el mismo del que `current_date` derivó
+   * para decidir qué derechos seguían vigentes—, mientras que el nombre del fichero salía
+   * de `new Date()` en el navegador. Con desfase de relojes o cruzando medianoche, el
+   * fichero que el auditor archiva llevaba un día distinto del que dice el recibo que
+   * contiene. Un recibo y su etiqueta tienen que venir del mismo reloj, y el que manda es
+   * el de la base porque es el único que decidió algo.
+   */
+  generadoEn: string,
+): string {
   const base = nombreWorkspace
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
@@ -362,6 +376,6 @@ export function nombreDeArchivoExport(nombreWorkspace: string, ambito: AmbitoExp
     .replace(/^-+|-+$/g, '')
     .slice(0, 60)
     .toLowerCase();
-  const dia = new Date().toISOString().slice(0, 10);
+  const dia = generadoEn.slice(0, 10);
   return `whitespace-${base || 'workspace'}-${ambito}-${dia}.json`;
 }

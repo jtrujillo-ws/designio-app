@@ -330,9 +330,9 @@ async function diagnosticoDeFirma(
  * Abrir la medición (RF-07.6): el reto pasa a «en medición» y su proyecto también. Los
  * guards de transición de la base exigen el registry FIRMADO (SYS-22) y el G7 APROBADO
  * (§5.2), y la política, el rol que opera el método. Los dos movimientos van en la misma
- * transacción: un reto midiendo con el proyecto todavía «activo» sería un tablero que
- * miente — y en una base con historia ese tablero YA existe, así que la operación también
- * sabe terminar el movimiento a medias que dejó el ciclo anterior.
+ * transacción: un reto midiendo con el proyecto todavía en implementación sería un tablero
+ * que miente — y en una base con historia ese tablero YA existe, así que la operación
+ * también sabe terminar el movimiento a medias que dejó el ciclo anterior.
  */
 export async function abrirMedicion(
   actorId: string,
@@ -371,9 +371,9 @@ export async function abrirMedicion(
     }
     // Un reto que YA venía midiendo de antes de este esquema no tiene que moverse —ya está
     // donde toca—: lo que le falta es su proyecto, que bajo el ciclo anterior no tenía
-    // siquiera grant para cambiar de estado y por eso se quedó en 'activo'. Esta operación
-    // le termina el movimiento en vez de negarse, que es lo que dejaba el tablero mintiendo
-    // (reto midiendo, proyecto activo) sin ninguna forma de arreglarlo.
+    // siquiera grant para cambiar de estado y por eso se quedó atrás. Esta operación le
+    // termina el movimiento en vez de negarse, que es lo que dejaba el tablero mintiendo
+    // (reto midiendo, proyecto sin medir) sin ninguna forma de arreglarlo.
     const yaMedia = listo?.estado === 'en-medicion';
     if (yaMedia && !listo!.medicion_sin_registry) {
       throw new ErrorMedicion('La medición de este reto ya está abierta');
@@ -395,18 +395,24 @@ export async function abrirMedicion(
     }
     let movidos;
     try {
+      // Solo desde IMPLEMENTACIÓN: al método se entra en medición por G7 y a G7 se llega
+      // por G6, que es el que mete el proyecto en implementación (§7). Un proyecto en
+      // 'activo' con su G7 aprobado solo existía como historia previa a este esquema, y a
+      // esa la mueve el relleno de la migración; mover también los 'activo' aquí era el
+      // atajo por el que un proyecto heredado se saltaba la fase entera.
       movidos = await tx`
         update proyecto set estado = 'en-medicion'
         where reto_id = ${entrada.retoId} and workspace_id = ${entrada.workspaceId}
-          and estado in ('activo', 'en-implementacion')`;
+          and estado = 'en-implementacion'`;
     } catch (e) {
       comoErrorDeDominio(e);
     }
     // Los dos movimientos son uno solo: si ningún proyecto entró en medición (todos
-    // pausados o ya cerrados), el reto tampoco — se revierte la transacción completa.
+    // pausados, ya cerrados o todavía sin pasar por implementación), el reto tampoco — se
+    // revierte la transacción completa.
     if (movidos!.count === 0) {
       throw new ErrorMedicion(
-        'Ningún proyecto del reto puede pasar a medición (revisa si está pausado o cerrado)',
+        'Ningún proyecto del reto puede pasar a medición (revisa si está pausado, cerrado o sin entrar en implementación)',
       );
     }
     return { proyectos: movidos!.count };

@@ -256,6 +256,51 @@ alter table gate_instancia add column aprobado_sin_registry boolean not null def
 update gate_instancia set aprobado_sin_registry = true
   where numero = 6 and estado = 'aprobado';
 
+-- …y la marca sola no basta, porque G6 no es solo un permiso: es el momento en que el
+-- proyecto ENTRA EN IMPLEMENTACIÓN (§7). Ese efecto lo pone un trigger que nace en esta
+-- misma migración y que solo observa los `pendiente → aprobado` que vengan DESPUÉS, así
+-- que los proyectos cuyo G6 ya estaba aprobado se quedarían en 'activo' teniendo el plan
+-- acordado — y tras su G7 pasarían directos de 'activo' a 'en-medicion', saltándose
+-- entera la fase que ese trigger existe para representar. Es la misma forma que la marca
+-- de arriba y que el veredicto de los retos ya cerrados: una regla nueva gobierna las
+-- transiciones futuras y no dice nada de quien YA estaba en el estado anterior, así que
+-- la historia hay que moverla aquí, a mano y una sola vez.
+--
+-- Elegibles son los ACTIVOS y solo ellos: un proyecto pausado se retoma a implementación
+-- por su propio par legal —parar es del cliente y una migración no deshace una pausa— y
+-- los que ya miden o están cerrados están más adelante, no más atrás.
+--
+-- Y la política de auditoría es EXPLÍCITA, que es la otra mitad de traer una historia. El
+-- rastro lo escribe esta sentencia y no el guard de transición —que en este punto del
+-- archivo todavía no existe, así que el movimiento es silencioso—, va marcado `heredado`
+-- y con actor NULO: ninguna persona hizo esto, lo hizo el despliegue, y un evento que se
+-- lo atribuyera a alguien sería peor que no tenerlo. El resto del payload es idéntico al
+-- que emite el guard, para que la serie de `ProyectoTransicionado` se lea entera igual.
+do $$
+declare
+  heredados int;
+begin
+  with movidos as (
+    update proyecto p set estado = 'en-implementacion'
+      where p.estado = 'activo'
+        and exists (select 1 from gate_instancia g
+          where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+            and g.numero = 6 and g.estado = 'aprobado')
+      returning p.id, p.workspace_id
+  )
+  insert into evento_dominio (workspace_id, tipo, payload)
+  select m.workspace_id, 'ProyectoTransicionado',
+    jsonb_build_object('proyectoId', m.id, 'de', 'activo', 'a', 'en-implementacion',
+                       'heredado', true)
+  from movidos m;
+  get diagnostics heredados = row_count;
+  if heredados > 0 then
+    raise notice
+      '% proyecto(s) con G6 aprobado antes de SPEC-07 pasan a en-implementacion: es la fase que su aprobación ya significaba (§7)',
+      heredados;
+  end if;
+end $$;
+
 -- ── Y los retos que YA estaban midiendo sin contrato de medición ──
 -- El mismo problema un paso más allá, y peor: el ciclo anterior (20260902070000) admitía
 -- `activo → en-medicion` sin registry porque la medición no existía todavía. Esos retos
@@ -652,17 +697,28 @@ create policy proyecto_update_estado on proyecto
 --
 --   activo            → pausado            · sin precondición (parar es del cliente)
 --   en-implementacion → pausado            · sin precondición (también se para implementando)
---   pausado           → activo             · G6 NO aprobado: se paró antes del plan
---   pausado           → en-implementacion  · G6 aprobado: se paró implementando
+--   pausado           → activo             · G6 NO aprobado y el reto sin abrir medición
+--   pausado           → en-implementacion  · G6 aprobado y el reto sin abrir medición
+--   pausado           → en-medicion        · el reto YA midiendo (y su G7 aprobado)
 --   activo            → en-implementacion  · G6 aprobado (§7)
---   activo            → en-medicion        · G7 aprobado Y el reto ya midiendo
 --   en-implementacion → en-medicion        · G7 aprobado Y el reto ya midiendo
 --   en-medicion       → cerrado            · el reto con veredicto (RF-07.10)
 --
--- Retomar es DETERMINISTA gracias a G6: un proyecto pausado antes del plan vuelve a
--- 'activo' y uno pausado durante la implementación vuelve a 'en-implementacion'. Sin esa
--- discriminación, «reanudar» habría tenido dos destinos posibles y el que eligiera la
--- pantalla se habría convertido en la regla — otra vez la precondición en quien escribe.
+-- Retomar es DETERMINISTA y tiene UN destino, que sale de dos preguntas en este orden:
+-- dónde está el RETO y, si el reto todavía no mide, si el plan ya estaba aprobado. Un
+-- proyecto pausado antes del plan vuelve a 'activo', uno pausado durante la implementación
+-- vuelve a 'en-implementacion', y cualquiera de los dos vuelve a 'en-medicion' si mientras
+-- estaba parado su reto abrió la medición. Sin esa discriminación «reanudar» habría tenido
+-- varios destinos posibles y el que eligiera la pantalla se habría convertido en la regla
+-- — otra vez la precondición en quien escribe.
+--
+-- Y `activo → en-medicion` NO está: no es una restricción nueva sino el par que sobraba.
+-- Medir exige G7, G7 exige G6 y aprobar G6 mete el proyecto en implementación, así que un
+-- proyecto en 'activo' con su G7 aprobado solo podía existir como HISTORIA —G6 aprobado
+-- antes de que ese efecto existiera—, y a esa historia la mueve el relleno del preámbulo.
+-- Mientras el par siguió declarado, ese proyecto heredado saltaba de 'activo' a medición
+-- sin pasar por la fase que su propio G6 significaba; declarar solo los pares alcanzables
+-- es lo que hace que la tabla describa el método en vez de dejarle un atajo.
 create function proyecto_estado_transicion_guard() returns trigger
 language plpgsql as $$
 declare
@@ -678,8 +734,8 @@ begin
     ('en-implementacion', 'pausado'),
     ('pausado', 'activo'),
     ('pausado', 'en-implementacion'),
+    ('pausado', 'en-medicion'),
     ('activo', 'en-implementacion'),
-    ('activo', 'en-medicion'),
     ('en-implementacion', 'en-medicion'),
     ('en-medicion', 'cerrado')
   ) then
@@ -688,6 +744,30 @@ begin
   select exists (select 1 from gate_instancia g
     where g.proyecto_id = new.id and g.workspace_id = new.workspace_id
       and g.numero = 6 and g.estado = 'aprobado') into g6_aprobado;
+  -- Retomar SIGUE AL RETO, y esta es la primera pregunta porque manda sobre las otras: si
+  -- el reto abrió la medición mientras el proyecto estaba parado, el único destino de la
+  -- reanudación es 'en-medicion'. El par «reto midiendo ⇔ proyecto midiendo» lo sostiene un
+  -- constraint trigger que solo corre cuando el reto ENTRA en medición, así que no ve nada
+  -- de lo que pase DESPUÉS: una pausa retomada más tarde dejaba el proyecto por detrás de
+  -- su reto sin que nadie levantara. Y eso no era un tablero feo sino un callejón sin
+  -- salida — `abrirMedicion` se niega a correr otra vez sobre un reto que ya mide y no es
+  -- heredado, y el guard del cierre del outcome review no cierra un reto cuyo proyecto no
+  -- está midiendo: el reto se quedaba sin poder terminar por el camino normal del producto.
+  -- La mitad que le falta al constraint diferido se comprueba aquí, en la transición del
+  -- PROYECTO, que es la que llega tarde.
+  --
+  -- Con la excepción EXACTA del reto heredado (`medicion_sin_registry`), que es el único
+  -- que mide teniendo por definición su proyecto detrás: ahí «estar detrás» no es la
+  -- avería sino el estado que la migración encontró, y el camino de reparación consiste
+  -- justamente en recorrer G6 y G7 antes de que `abrirMedicion` termine el movimiento.
+  -- Prohibir ahí la reanudación cerraría la única salida que ese reto tiene. La marca la
+  -- escribió la migración y ningún grant la vuelve a escribir, así que la excepción es un
+  -- conjunto cerrado que solo puede encoger.
+  if old.estado = 'pausado' and new.estado <> 'en-medicion' and exists (select 1 from reto r
+    where r.id = new.reto_id and r.workspace_id = new.workspace_id
+      and r.estado = 'en-medicion' and not r.medicion_sin_registry) then
+    raise exception 'el reto ya está midiendo: al retomarlo el proyecto entra en medición con él, no por detrás (§5.2)';
+  end if;
   -- §7: se entra en implementación al aprobarse el PLAN, no por decisión de nadie.
   if new.estado = 'en-implementacion' and not g6_aprobado then
     raise exception 'el proyecto entra en implementación al aprobarse su G6 (§7)';
@@ -876,6 +956,13 @@ create policy gate_insert on gate_instancia
 -- Un proyecto 'pausado' o 'cerrado' sí puede quedarse atrás: la operación no los toca a
 -- propósito y parar es del cliente.
 --
+-- Y este trigger corre en UN instante, el de la entrada: `when (new.estado = 'en-medicion'
+-- and old.estado is distinct from 'en-medicion')` no vuelve a mirar nada después, así que
+-- por sí solo no gobierna al proyecto pausado que se retoma MÁS TARDE. Esa mitad la
+-- sostiene `proyecto_estado_transicion_guard`, que en ese caso obliga a la reanudación a
+-- entrar directamente en medición. Las dos reglas son el mismo invariante mirado desde
+-- cada lado del par, y ninguna se basta sola.
+--
 -- Sin SECURITY DEFINER, como su hermano el guard de transición: consulta los proyectos
 -- del MISMO reto que el actor acaba de escribir, todos visibles para cualquier miembro
 -- del workspace, así que no puede volverse oráculo de nada que no se pudiera leer ya.
@@ -962,14 +1049,17 @@ begin
     -- dueño del dato, línea base con valor y fecha, y ventana con post-mortem previsto.
     -- btrim en los textos: whitespace no es contenido, tampoco por SQL directo.
     --
-    -- La lista CRUZA al criterio, y esa es la mitad que faltaba. La ventana tiene dos
-    -- piezas y viven en tablas distintas a propósito —el inicio en la entrada, el largo en
+    -- La ventana se comprueba en DOS bloques, y no por gusto: tiene dos piezas que viven
+    -- en tablas distintas a propósito —el inicio en la entrada, el largo en
     -- `criterio_exito.ventana_dias`, que el registry NO copia porque dos copias son dos
-    -- verdades—, así que una lista que solo enumera columnas de `entrada_kpi` comprueba
-    -- media ventana. G0 exige `ventana_dias`, pero G0 corre ANTES: reabrir la etapa 0
-    -- —el camino de reparación que SPEC-04.9 ofrece— permite devolverlo a nulo sin que el
-    -- gate vuelva a pendiente, y desde ahí la firma pasaba y CONGELABA un contrato
-    -- imposible de cumplir.
+    -- verdades—. Una lista que solo enumera columnas de `entrada_kpi` comprueba media
+    -- ventana; una que las junta con un join comprueba las dos pero señala la ENTRADA,
+    -- que es donde no está el hueco, y manda a revisar el KPI a quien tiene que arreglar
+    -- el criterio. Cada mitad se reclama donde vive su dato y con su propio mensaje.
+    --
+    -- G0 exige `ventana_dias`, pero G0 corre ANTES: reabrir la etapa 0 —el camino de
+    -- reparación que SPEC-04.9 ofrece— permite devolverlo a nulo sin que el gate vuelva a
+    -- pendiente, y desde ahí la firma pasaba y CONGELABA un contrato imposible de cumplir.
     --
     -- Y lo que quedaba después era el encierro entero, no una molestia: sin ventana,
     -- `ventana_de_medicion_abierta` devuelve true para siempre, así que el outcome review
@@ -982,14 +1072,26 @@ begin
     -- las saque.
     select string_agg(e.nombre, ', ' order by e.nombre) into faltan
     from entrada_kpi e
-    join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
     where e.registry_id = new.id and e.workspace_id = new.workspace_id
       and (btrim(e.nombre) = '' or btrim(e.definicion) = '' or btrim(e.fuente) = ''
            or e.propietario_miembro_id is null or e.linea_base_valor is null
            or e.linea_base_fecha is null or e.ventana_inicio is null
-           or e.fecha_post_mortem is null or c.ventana_dias is null);
+           or e.fecha_post_mortem is null);
     if faltan is not null then
       raise exception 'no se puede firmar: entradas incompletas (SYS-22): %', faltan;
+    end if;
+    -- La otra mitad de la ventana, en su propio bloque: el hueco está en el CRITERIO, así
+    -- que lo que se nombra es el criterio —la fila que hay que arreglar— y no el KPI que
+    -- lo acompaña. Mira TODOS los criterios del reto y no solo los que ya tienen entrada:
+    -- a estas alturas son el mismo conjunto (el bloque de «criterios sin entrada KPI»
+    -- acaba de rechazar la firma si alguno estaba huérfano), y entre dos formas
+    -- equivalentes se prefiere la que sigue siendo correcta si mañana se reordenan.
+    select string_agg(c.kpi, ', ' order by c.kpi) into faltan
+    from criterio_exito c
+    where c.reto_id = new.reto_id and c.workspace_id = new.workspace_id
+      and c.ventana_dias is null;
+    if faltan is not null then
+      raise exception 'no se puede firmar: criterios sin ventana declarada (SYS-22): %', faltan;
     end if;
     -- Y ese dueño es una persona del CLIENTE (RF-07.1, §8.1): el bloque anterior exige un
     -- id no nulo, que no dice de QUIÉN es. La política de la entrada ya lo impide al

@@ -324,30 +324,30 @@ export function ventanaAbierta(entrada: { diasRestantes: number | null }): boole
  * nada. Son DOS caminos, no uno.
  *
  * El normal —reto 'activo'— y el HEREDADO: un reto que ya estaba en medición cuando corrió
- * la migración, cuyo proyecto se quedó en 'activo' o 'en-implementacion' porque el ciclo
- * anterior ni siquiera le daba grant para moverse. Ese reto no tiene que moverse (ya está
- * donde toca): lo que falta es terminarle el movimiento al proyecto, y esta es la ÚNICA
- * puerta del producto a esa reparación. Escrito solo como `retoEstado === 'activo'`, la
- * salida existía en el servicio y era inalcanzable desde la pantalla: el proyecto se
- * quedaba fuera de medición y su outcome review no podía completarse, porque el guard del
- * cierre exige que el proyecto esté midiendo. Media salida no es una salida.
+ * la migración, cuyo proyecto se quedó atrás porque el ciclo anterior ni siquiera le daba
+ * grant para moverse. Ese reto no tiene que moverse (ya está donde toca): lo que falta es
+ * terminarle el movimiento al proyecto, y esta es la ÚNICA puerta del producto a esa
+ * reparación. Escrito solo como `retoEstado === 'activo'`, la salida existía en el servicio
+ * y era inalcanzable desde la pantalla: el proyecto se quedaba fuera de medición y su
+ * outcome review no podía completarse, porque el guard del cierre exige que el proyecto
+ * esté midiendo. Media salida no es una salida.
  *
  * La condición sobre el PROYECTO es la otra mitad del espejo, y no es cosmética: la marca
  * `medicionSinRegistry` no se borra al reparar —la migración la escribió y nadie la vuelve
  * a escribir—, así que sin ella el botón seguiría dibujándose después del arreglo para
- * fallar con «ningún proyecto puede pasar a medición». Lo que decide es el proyecto: solo
- * hay algo que abrir mientras siga en 'activo' o 'en-implementacion', que son exactamente
- * los dos estados que la operación mueve.
+ * fallar con «ningún proyecto puede pasar a medición». Lo que decide es el proyecto, y el
+ * estado que decide es UNO: 'en-implementacion', que es el único desde el que la operación
+ * mueve. 'activo' no está porque a medición se entra por G7, a G7 por G6 y G6 mete el
+ * proyecto en implementación; el proyecto heredado que se quedó en 'activo' con su G6 ya
+ * aprobado lo movió el relleno de la migración, y ofrecer aquí el botón para él era
+ * ofrecerle el atajo que se salta la fase.
  */
 export function medicionPorAbrir(seguimiento: {
   retoEstado: string;
   proyectoEstado: string;
   medicionSinRegistry: boolean;
 }): boolean {
-  if (
-    seguimiento.proyectoEstado !== 'activo' &&
-    seguimiento.proyectoEstado !== 'en-implementacion'
-  ) {
+  if (seguimiento.proyectoEstado !== 'en-implementacion') {
     return false;
   }
   return (

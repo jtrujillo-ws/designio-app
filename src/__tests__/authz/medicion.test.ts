@@ -711,7 +711,7 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await adminVentana`update criterio_exito set ventana_dias = null
       where id = ${criterioAbandonoId}`;
     await expect(firmarRegistry(sponsorId, { workspaceId: ws, registryId })).rejects.toThrow(
-      /entradas incompletas/,
+      /criterios sin ventana declarada/,
     );
     // Las dos reglas de coherencia que existían justo para esto tampoco saltaban, y por una
     // razón que es el patrón y no el caso: escritas como «rechaza si la incoherencia es
@@ -1972,12 +1972,35 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     });
     expect(firma.entradas).toBe(1);
 
+    // Y la marca del gate era MEDIA historia. G6 no es solo un permiso: es el momento en
+    // que el proyecto entra en implementación (§7), y ese efecto lo pone un trigger que
+    // solo mira los `pendiente → aprobado` FUTUROS — así que este proyecto se quedó en
+    // 'activo' con su plan ya acordado. Tras su G7 pasaba directo de 'activo' a medición,
+    // saltándose entera la fase que su propio G6 significaba. El par ya no existe, así que
+    // ni por SQL directo: una regla que gobierna las transiciones nuevas tiene que venir
+    // con el movimiento de lo que ya estaba en el estado anterior.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
+        where id = ${proyectoHeredadoId}`),
+    ).rejects.toThrow(/transición de proyecto ilegal: activo → en-medicion/);
+    // Ese movimiento es el que hace la migración con el MISMO predicado que su sentencia
+    // (proyecto 'activo' con G6 aprobado), y con él el camino vuelve a ser el del método.
+    await admin`update proyecto p set estado = 'en-implementacion'
+      where p.id = ${proyectoHeredadoId} and p.estado = 'activo'
+        and exists (select 1 from gate_instancia g
+          where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+            and g.numero = 6 and g.estado = 'aprobado')`;
+    const [faseHeredada] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where id = ${proyectoHeredadoId}`);
+    expect(faseHeredada!.estado).toBe('en-implementacion');
+
     // Y deja de estar varado: con el contrato firmado, su G7 se aprueba y la medición abre.
     await aprobarGateNumero(7, proyectoHeredadoId);
     // El camino NORMAL —reto activo— sigue ofreciéndose en la pantalla: el espejo del
     // cliente ensancha el predicado, no lo cambia de sitio.
     const segNormal = await seguimientoDeImpacto(leadId, ws, proyectoHeredadoId);
     expect(segNormal!.retoEstado).toBe('activo');
+    expect(segNormal!.proyectoEstado).toBe('en-implementacion');
     expect(medicionPorAbrir(segNormal!)).toBe(true);
     const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: retoHeredadoId });
     expect(abierto.proyectos).toBe(1);
@@ -2368,6 +2391,142 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       await admin`delete from workspace where id = ${wsXId}`;
       await admin`delete from usuario where id = ${uxId}`;
     }
+  });
+
+  it('con el reto midiendo, retomar un proyecto pausado entra en MEDICIÓN y no por detrás', async () => {
+    // El par «reto midiendo ⇔ proyecto midiendo» lo sostiene un constraint trigger que solo
+    // corre cuando el reto ENTRA en medición, así que no ve nada de lo que pase DESPUÉS. Con
+    // un reto de VARIOS proyectos, uno pausado se queda atrás a propósito («parar es del
+    // cliente»), y retomarlo lo devolvía a 'activo' o a 'en-implementacion' —por detrás de un
+    // reto que ya mide— sin que nadie levantara. Y de ahí no se salía: `abrirMedicion` se
+    // niega a correr otra vez sobre un reto que ya mide y no es heredado, y el cierre del
+    // post mortem no cierra un reto cuyo proyecto no está midiendo. El reto se quedaba sin
+    // poder terminar por el camino normal del producto, que es el precio real del hueco.
+    const admin = sqlAdmin();
+    const r = await crearReto(leadId, {
+      workspaceId: ws,
+      servicioAnclaId: svcId,
+      codigo: 'R-75',
+      titulo: 'Reto con dos frentes a la vez',
+      descripcion: '',
+      origen: 'peticion-cliente',
+      metricaObjetivo: '9→5',
+      serviciosAfectados: [],
+    });
+    const a = await activarReto(leadId, {
+      workspaceId: ws,
+      retoId: r.retoId,
+      perfil: 'rapido',
+      proyectoCodigo: 'P-75A',
+      proyectoTitulo: 'Frente que llega a medición',
+    });
+    const c = await agregarCriterio(leadId, {
+      workspaceId: ws,
+      retoId: r.retoId,
+      kpi: 'Incidencias por semana',
+      definicion: 'Incidencias abiertas por el cliente cada semana',
+      lineaBaseValor: '9',
+      lineaBaseFecha: fecha(-200),
+      lineaBasePlan: '',
+      objetivo: '5',
+      ventanaDias: 30,
+      fechaPostMortem: null,
+    });
+    for (const n of [0, 1, 2, 3, 4, 5]) {
+      await aprobarGateNumero(n, a.proyectoId);
+    }
+    const reg = await abrirRegistry(leadId, { workspaceId: ws, retoId: r.retoId });
+    await agregarEntrada(leadId, {
+      workspaceId: ws,
+      registryId: reg.registryId,
+      criterioId: c.criterioId,
+      nombre: 'Incidencias semanales',
+      definicion: 'Incidencias abiertas por el cliente',
+      fuente: 'Mesa de ayuda',
+      dimensiones: '',
+      propietarioMiembroId: sponsorMiembroId,
+      frecuencia: 'semanal',
+      dashboardUrl: '',
+      lineaBaseValor: '9',
+      lineaBaseFecha: fecha(-200),
+      // Ventana ya CERRADA: así el post mortem de este reto se puede abrir y el caso llega
+      // hasta el final del método, que es donde se ve el encierro.
+      ventanaInicio: fecha(-40),
+      fechaPostMortem: fecha(5),
+    });
+    await firmarRegistry(sponsorId, { workspaceId: ws, registryId: reg.registryId });
+    await aprobarGateNumero(6, a.proyectoId);
+    await aprobarGateNumero(7, a.proyectoId);
+
+    // El SEGUNDO proyecto del reto: la activación solo sabe crear el primero, así que este
+    // se escribe con el rol admin y con sus gates ya aprobados —lo único que el caso
+    // necesita de él es su G7, que es lo que le permitirá seguir al reto al retomarse—.
+    const [b] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${r.retoId}, 'P-75B', 'Frente que se para a mitad', ${leadId})
+      returning id`;
+    const bId = b!.id as string;
+    await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+      select workspace_id, ${bId}, numero, rol_aprobador, 'aprobado', ${leadId}, now()
+      from gate_instancia where proyecto_id = ${a.proyectoId}`;
+    // Se para ANTES de abrir la medición: eso el par indivisible lo tolera a propósito, y
+    // es exactamente la puerta por la que entraba el problema.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
+      where id = ${bId}`);
+    const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId });
+    expect(abierto.proyectos).toBe(1);
+
+    // Retomar POR DETRÁS ya no existe, en los DOS destinos que tenía la reanudación.
+    for (const destino of ['activo', 'en-implementacion']) {
+      await expect(
+        conUsuario(leadId, (tx) => tx`update proyecto set estado = ${destino}
+          where id = ${bId}`),
+      ).rejects.toThrow(/el reto ya está midiendo/);
+    }
+
+    // Y que no era una molestia estética: con el proyecto atrás no había salida. La
+    // operación que mueve el par se niega a correr otra vez…
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId })).rejects.toThrow(
+      /ya está abierta/,
+    );
+    // …y el post mortem, que es el final del método, tampoco cierra el reto.
+    const review = await abrirOutcomeReview(leadId, { workspaceId: ws, retoId: r.retoId });
+    await registrarResultado(leadId, {
+      workspaceId: ws,
+      reviewId: review.reviewId,
+      criterioId: c.criterioId,
+      snapshotFinalId: null,
+      lectura: '',
+      sinDatosMotivo: 'El frente parado se llevó la instrumentación: no hay corte comparable',
+    });
+    const completar = () =>
+      completarOutcomeReview(leadId, {
+        workspaceId: ws,
+        reviewId: review.reviewId,
+        veredicto: 'no-concluyente',
+        contribucion: 'Con un frente parado a mitad de ventana no se puede atribuir el cambio',
+        factoresExternos: '',
+        hipotesisAbiertas: '',
+        aprendizajes: '',
+        disenoExperimentalSuficiente: false,
+        disenoExperimentalJustificacion: '',
+      });
+    await expect(completar()).rejects.toThrow(/no está en medición/);
+
+    // La reanudación tiene UN destino y es la fase en la que está el reto.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
+      where id = ${bId}`);
+    const [tras] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where id = ${bId}`);
+    expect(tras!.estado).toBe('en-medicion');
+    // Y con los dos frentes midiendo el reto SÍ termina: el flujo normal del producto llega
+    // hasta el veredicto en vez de quedarse encerrado.
+    const veredicto = await completar();
+    expect(veredicto.veredicto).toBe('no-concluyente');
+    const cerrados = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where reto_id = ${r.retoId} order by codigo`);
+    expect(cerrados.map((p) => p.estado as string)).toEqual(['cerrado', 'cerrado']);
   });
 
   it('una cuenta desactivada con sesión viva no lee el seguimiento ni carga snapshots', async () => {

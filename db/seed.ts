@@ -310,11 +310,12 @@ async function concederDerechosDeCadena(
 }
 
 /**
- * Tipos de evento con los que el seed deja constancia de LO QUE ÉL CREA y del aviso que
- * emite cuando decide no tocar nada. Viven aquí, y no sueltos donde se usan, porque la
- * reparación los LEE: son el contrato entre dos corridas distintas del seed.
+ * La clave con la que el seed registra la cadena de demo en `sembrado_registro`, y el tipo
+ * de evento del aviso que emite cuando decide no tocar nada. Viven aquí, y no sueltos
+ * donde se usan, porque la reparación los LEE: son el contrato entre dos corridas
+ * distintas del seed.
  */
-const MARCA_CADENA_SEMBRADA = 'CadenaDemoSembrada';
+const CLAVE_CADENA_SEMBRADA = 'cadena-demo';
 const AVISO_CADENA_SIN_PROCEDENCIA = 'DerechosDeCadenaSinRepararPorProcedencia';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -400,38 +401,40 @@ async function declinarReparacionDeCadena(tx: TransactionSql, wsId: string): Pro
  * forma de la base no dice quién escribió sus filas.
  *
  * Así que la procedencia ya no se deduce: se LEE. `sembrarCadena` deja constancia de lo
- * que crea —evento `CadenaDemoSembrada` con los ids de sus dos evidencias— y la reparación
- * concede solo a esos ids. Sin ese registro no hay nada que acreditar y NO SE CONCEDE
- * NADA: fallar cerrado, no adoptar. En su lugar queda un evento que nombra lo que habría
- * tocado, para que un operador lo conceda a mano si de verdad procede — que es como debe
- * entrar un consentimiento en un producto cuya tesis es que conceder el uso es un acto
- * propio, con su base documental y su responsable.
+ * que crea —una fila de `sembrado_registro` con los ids de sus dos evidencias— y la
+ * reparación concede solo a esos ids. Sin ese registro no hay nada que acreditar y NO SE
+ * CONCEDE NADA: fallar cerrado, no adoptar. En su lugar queda un evento que nombra lo que
+ * habría tocado, para que un operador lo conceda a mano si de verdad procede — que es como
+ * debe entrar un consentimiento en un producto cuya tesis es que conceder el uso es un
+ * acto propio, con su base documental y su responsable.
  *
- * Lo que el registro prueba y lo que no, para no dejar escrita una tranquilidad falsa: es
- * una fila de `evento_dominio`, y la política `evento_insert` permite a cualquier miembro
- * del workspace escribir eventos. No es un sello criptográfico. Lo que cierra es la vía
- * ACCIDENTAL —que la forma de la base coincida por casualidad—; falsificarlo exige que un
- * miembro escriba a propósito un registro de procedencia mintiendo. Y aun entonces la
- * concesión sigue acotada: solo evidencia DE ESTE workspace, y solo mientras su derecho
- * siga en 'pendiente' (lo decidido a mano nunca se pisa).
+ * Y el registro SÍ es un sello, que es lo que le faltaba a la versión anterior. Vivió un
+ * rato en `evento_dominio`, y ahí no lo era: la política `evento_insert` autoriza a
+ * CUALQUIER miembro a escribir eventos, mientras que conceder derechos está reservado a
+ * lead-boutique y admin-cliente. Un stakeholder podía escribir su propio registro de
+ * procedencia y esperar a la siguiente corrida del seed para cobrar derechos de ámbito
+ * cliente a nombre de Lucía: una escalada de privilegio con dos pasos y una espera. Ahora
+ * vive en `sembrado_registro`, que el rol de aplicación puede leer y NO puede escribir —
+ * sin política ni grant de insert/update/delete—, así que la ausencia de otra mano es
+ * estructural y no hay que razonar sobre quién mentiría.
+ *
+ * La concesión sigue acotada además por lo de siempre: solo evidencia DE ESTE workspace y
+ * solo mientras su derecho siga en 'pendiente' (lo decidido a mano nunca se pisa).
  */
 async function repararDerechosDeCadena(
   tx: TransactionSql,
   wsId: string,
   luciaId: string,
 ): Promise<void> {
-  const [marca] = await tx`select payload from evento_dominio
-    where workspace_id = ${wsId} and tipo = ${MARCA_CADENA_SEMBRADA}
-      and payload->>'origen' = 'seed'
-    order by creado_en, id
-    limit 1`;
+  const [marca] = await tx`select payload from sembrado_registro
+    where workspace_id = ${wsId} and clave = ${CLAVE_CADENA_SEMBRADA}`;
   const registro = (marca?.payload ?? {}) as {
     evidenciaCitadaId?: unknown;
     evidenciaArquetipoId?: unknown;
   };
-  // La forma de uuid se comprueba ANTES de consultar: el payload es texto que escribe quien
-  // puede escribir eventos, y un `id in ('no-soy-uuid')` no devuelve cero filas, revienta la
-  // sentencia y con ella el seed entero. Fallar cerrado aquí significa declinar, no caerse.
+  // La forma de uuid se comprueba ANTES de consultar: el payload es jsonb libre y un
+  // `id in ('no-soy-uuid')` no devuelve cero filas, revienta la sentencia y con ella el
+  // seed entero. Fallar cerrado aquí significa declinar, no caerse.
   const declarados = [
     { evidenciaId: registro.evidenciaCitadaId, base: BASE_DERECHO_CITADA },
     { evidenciaId: registro.evidenciaArquetipoId, base: BASE_DERECHO_ARQUETIPO },
@@ -444,9 +447,10 @@ async function repararDerechosDeCadena(
     return;
   }
 
-  // El registro nombra ids, y que esos ids sean de ESTE workspace no se da por supuesto:
-  // un payload es texto y el evento lo escribe quien puede escribir eventos. Filtrar aquí
-  // cuesta una consulta y evita que un registro torcido alcance material de otro tenant.
+  // El registro nombra ids, y que esos ids sean de ESTE workspace no se da por supuesto.
+  // No porque quepa una falsificación —ya no cabe— sino porque un payload es dato libre y
+  // una pieza futura del seed podría escribir ahí un id equivocado; el filtro cuesta una
+  // consulta y evita que un registro torcido alcance material de otro tenant.
   const propias = await tx`select id from evidencia
     where workspace_id = ${wsId} and id in ${tx(declarados.map((f) => f.evidenciaId))}`;
   const enElWorkspace = new Set(propias.map((f) => f.id as string));
@@ -893,17 +897,17 @@ async function sembrarCadena(tx: TransactionSql, wsId: string, luciaId: string):
     { evidenciaId: evDigital, base: BASE_DERECHO_CITADA },
     { evidenciaId: evSucursal, base: BASE_DERECHO_ARQUETIPO },
   ]);
-  // Y queda CONSTANCIA de qué evidencia creó ESTA corrida. No es decoración de auditoría:
-  // es lo único que una corrida futura puede leer para reparar sin adivinar. Deducir la
-  // procedencia de la FORMA de la base —«el único camino desde P-01 llega aquí»— adopta lo
-  // que encuentre, y lo que encuentre puede ser material de un usuario. Ver
-  // `repararDerechosDeCadena`, que es quien lo lee.
-  await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-    values (${wsId}, ${MARCA_CADENA_SEMBRADA}, ${tx.json({
-      origen: 'seed',
+  // Y queda CONSTANCIA de qué evidencia creó ESTA corrida, en `sembrado_registro`, que el
+  // rol de aplicación puede leer y NO puede escribir. No es decoración: es lo único que una
+  // corrida futura puede leer para reparar sin adivinar. Deducir la procedencia de la FORMA
+  // de la base —«el único camino desde P-01 llega aquí»— adopta lo que encuentre, y lo que
+  // encuentre puede ser material de un usuario. Ver `repararDerechosDeCadena`, que lo lee.
+  await tx`insert into sembrado_registro (workspace_id, clave, payload)
+    values (${wsId}, ${CLAVE_CADENA_SEMBRADA}, ${tx.json({
       evidenciaCitadaId: evDigital,
       evidenciaArquetipoId: evSucursal,
-    })}, ${luciaId}, 'lead-boutique')`;
+    })})
+    on conflict (workspace_id, clave) do nothing`;
 
   const [ins] = await tx`insert into insight (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
     values (${wsId}, 'La verificación de identidad digital concentra el abandono',

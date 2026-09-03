@@ -2127,12 +2127,11 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       where e.workspace_id = ${wsDemoId} and f.titulo = 'Estudio CX apertura de cuenta 2026'
       order by d.evidencia_id`;
     expect(previos.length).toBe(2);
-    const marcas = await admin`select id, payload, actor_id, actor_rol, creado_en
-      from evento_dominio
-      where workspace_id = ${wsDemoId} and tipo = 'CadenaDemoSembrada'`;
+    const marcas = await admin`select payload from sembrado_registro
+      where workspace_id = ${wsDemoId} and clave = 'cadena-demo'`;
     // El registro tiene que EXISTIR en una base recién sembrada: si no, el resto del test
     // pasaría por la razón equivocada (declinar por una base que nunca lo tuvo).
-    expect(marcas.length).toBeGreaterThan(0);
+    expect(marcas.length).toBe(1);
 
     // Y una evidencia que NO es de la cadena, colgada del arquetipo de demo: es lo que el
     // recorrido alcanza y lo que el aviso tiene que nombrar sin concederle nada.
@@ -2150,13 +2149,12 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     // Restaurar el registro es idempotente: borra los que haya y repone los capturados,
     // así da igual en qué punto se llame.
     const restaurarMarcas = async (): Promise<void> => {
-      await admin`delete from evento_dominio
-        where workspace_id = ${wsDemoId} and tipo = 'CadenaDemoSembrada'`;
+      await admin`delete from sembrado_registro
+        where workspace_id = ${wsDemoId} and clave = 'cadena-demo'`;
       for (const m of marcas) {
-        await admin`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-          values (${wsDemoId}, 'CadenaDemoSembrada',
-            ${admin.json(m.payload as Record<string, string>)},
-            ${m.actor_id as string | null}, ${m.actor_rol as string | null})`;
+        await admin`insert into sembrado_registro (workspace_id, clave, payload)
+          values (${wsDemoId}, 'cadena-demo',
+            ${admin.json(m.payload as Record<string, string>)})`;
       }
     };
     const [arq] = await admin`select id from arquetipo
@@ -2165,9 +2163,10 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       values (${arq!.id as string}, ${ajenaId}, ${wsDemoId})`;
 
     try {
-      await admin`delete from evento_dominio
-        where workspace_id = ${wsDemoId}
-          and tipo in ('CadenaDemoSembrada', 'DerechosDeCadenaSinRepararPorProcedencia')`;
+      await admin`delete from sembrado_registro
+        where workspace_id = ${wsDemoId} and clave = 'cadena-demo'`;
+      await admin`delete from evento_dominio where workspace_id = ${wsDemoId}
+        and tipo = 'DerechosDeCadenaSinRepararPorProcedencia'`;
       await admin`update derecho_uso set estado = 'pendiente', ambito = 'interno', base = '',
           decidido_por = null, decidido_en = null, vence_en = null
         where id = any(${previos.map((f) => f.id as string)}::uuid[])`;
@@ -2246,6 +2245,52 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
           where id = ${f.id as string}`;
       }
     }
+  });
+
+  it('la procedencia del sembrado es un SELLO: la aplicación la lee y no la escribe', async () => {
+    // El registro de procedencia vivió un rato en `evento_dominio`, y ahí no era un sello:
+    // la política `evento_insert` autoriza a CUALQUIER miembro a escribir eventos, con
+    // cualquier tipo y cualquier payload, mientras que conceder derechos está reservado a
+    // lead-boutique y admin-cliente. La cadena completa era una escalada de privilegio con
+    // dos pasos y una espera: un stakeholder escribe un registro con los ids que él elige,
+    // alguien re-ejecuta el seed, y le quedan derechos de ámbito CLIENTE a nombre de Lucía
+    // sobre material que él eligió. «Exige mentir a propósito» no es una defensa cuando
+    // quien miente obtiene un permiso que no tenía.
+    //
+    // Ahora vive en `sembrado_registro`, que el seed escribe con la conexión de PROPIETARIO
+    // y para la que el rol de aplicación no tiene grant ni política de escritura. Este test
+    // es esa propiedad, no una promesa sobre ella: se prueban las cuatro operaciones, con
+    // el rol de más permiso del workspace, para que nadie pueda decir «será que el lead sí
+    // puede». Leer sí: lo necesita la exportación del archivo del propietario (SYS-04).
+    const admin = sqlAdmin();
+    const [wsDemo] = await admin`select id from workspace where nombre = 'Banco Andino'`;
+    expect(wsDemo).toBeTruthy();
+    const wsDemoId = wsDemo!.id as string;
+
+    // Leer: permitido, y con la RLS puesta (solo el workspace del que se es miembro).
+    const propias = await conUsuario(leadId, (tx) => tx`select clave from sembrado_registro`);
+    expect(propias.every((f) => typeof f.clave === 'string')).toBe(true);
+    const ajenas = await conUsuario(
+      leadId,
+      (tx) => tx`select 1 from sembrado_registro where workspace_id = ${wsDemoId}`,
+    );
+    expect(ajenas.length).toBe(0);
+
+    // Escribir: ninguna de las cuatro. 42501 es «permission denied»: no hay grant, así que
+    // ni siquiera se llega a mirar si hay política.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into sembrado_registro (workspace_id, clave, payload)
+        values (${ws}, ${marca + '-falsificada'}, '{}'::jsonb)`),
+    ).rejects.toMatchObject({ code: '42501' });
+    await expect(
+      conUsuario(leadId, (tx) => tx`update sembrado_registro set payload = '{}'::jsonb`),
+    ).rejects.toMatchObject({ code: '42501' });
+    await expect(
+      conUsuario(leadId, (tx) => tx`delete from sembrado_registro`),
+    ).rejects.toMatchObject({ code: '42501' });
+    await expect(
+      conUsuario(leadId, (tx) => tx`truncate sembrado_registro`),
+    ).rejects.toMatchObject({ code: '42501' });
   });
 
   it('un item RECHAZADO conserva sus archivos Y tiene camino: el historial se pagina entero', async () => {

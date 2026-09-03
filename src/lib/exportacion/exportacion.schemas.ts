@@ -240,6 +240,14 @@ export const CATALOGO_EXPORT = [
     ],
   },
   { tabla: 'evento_dominio', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  // Bookkeeping del sembrado de desarrollo: registra qué objetos creó el seed, para que
+  // reparar una base vieja sea exacto en vez de adivinado. Viaja en el ARCHIVO del
+  // propietario, como todo lo que lleva `workspace_id` (SYS-04), y queda FUERA del
+  // entregable por dos motivos: no es material del proyecto que se entrega —es traza de
+  // una herramienta— y su `payload` nombra ids de evidencia dentro de un jsonb que el eje
+  // de poda de este ámbito no sabe recorrer, así que meterlo delataría justo lo que la
+  // poda quita. La aplicación solo puede LEERLA: no hay grant ni política de escritura.
+  { tabla: 'sembrado_registro', orden: 'creado_en, id', poda: { modo: 'fuera' } },
 ] as const satisfies readonly EntradaCatalogo[];
 
 /** Tablas que viajan en un paquete `entregable`. DERIVADA del catálogo, no una lista

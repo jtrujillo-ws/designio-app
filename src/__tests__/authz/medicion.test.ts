@@ -2524,12 +2524,73 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
       (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
       select workspace_id, ${bId}, numero, rol_aprobador, 'aprobado', ${leadId}, now()
       from gate_instancia where proyecto_id = ${a.proyectoId}`;
-    // Se para ANTES de abrir la medición: eso el par indivisible lo tolera a propósito, y
-    // es exactamente la puerta por la que entraba el problema.
+    // Se para ANTES de abrir la medición. Que un pausado se quede atrás es deliberado
+    // —parar es del cliente— pero solo vale si TODAVÍA PUEDE SEGUIR al reto: sin su G7 el
+    // proyecto quedaría atrapado en un triángulo cerrado —retomarlo con el reto midiendo
+    // exige entrar en medición, medir exige su G7, G7 exige G6 y aprobar G6 con el proyecto
+    // parado se rechaza— y, atrapado él, el outcome review no puede cerrar el reto: lo que
+    // se pierde no es un proyecto, es el final del reto. Se comprueba AL ABRIR, que es el
+    // único momento en el que la salida —retomarlo y cerrar sus gates— todavía existe.
+    await admin`update gate_instancia set estado = 'pendiente', aprobado_por = null,
+      aprobado_en = null where proyecto_id = ${bId} and numero = 7`;
     await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'pausado'
       where id = ${bId}`);
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId })).rejects.toThrow(
+      /P-75B/,
+    );
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId })).rejects.toThrow(
+      /Retómalos y cierra sus gates antes de abrir la medición/,
+    );
+    // Y la regla es de la BASE, no del diagnóstico: por SQL directo, moviendo el par entero
+    // a mano —que es lo único que llega hasta la tercera comprobación, porque las dos
+    // primeras hablan antes—, el rechazo llega igual al COMMIT.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        await tx`update reto set estado = 'en-medicion' where id = ${r.retoId}`;
+        await tx`update proyecto set estado = 'en-medicion' where id = ${a.proyectoId}`;
+      }),
+    ).rejects.toThrow(/no podría seguir al reto ni dejarlo cerrar/);
+    // Y la salida existe y es la normal: se le cierra el gate que le faltaba y ya puede
+    // quedarse atrás, porque ahora sí podrá volver. (Aquí con el guard de suficiencia
+    // apagado, porque este segundo proyecto se fabricó con sus gates y sin checklist; el
+    // camino real es aprobarlo por el servicio como hace su hermano.)
+    await admin`alter table gate_instancia disable trigger gate_aprobar_suficiencia`;
+    try {
+      await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+        aprobado_en = now() where proyecto_id = ${bId} and numero = 7`;
+    } finally {
+      await admin`alter table gate_instancia enable trigger gate_aprobar_suficiencia`;
+    }
+
+    // Y aquí, ANTES de abrir, la carrera: las reglas que sostienen el par del lado del
+    // proyecto son predicados sobre una INSTANTÁNEA. Esta transacción retoma el proyecto
+    // leyendo un reto que todavía está 'activo' —así que el guard inmediato la deja pasar,
+    // y con razón— y commitea DESPUÉS de que la medición abra. La comprobación diferida del
+    // reto tampoco la ve, porque cuando corre esa fila aún no está commiteada. Sin el
+    // espejo diferido del lado del proyecto, el par se rompía justo aquí y en silencio.
+    let avisarRetomando = () => {};
+    const retomando = new Promise<void>((resolve) => {
+      avisarRetomando = resolve;
+    });
+    let avisarAbierta = () => {};
+    const abierta = new Promise<void>((resolve) => {
+      avisarAbierta = resolve;
+    });
+    const tardia = conUsuario(leadId, async (tx) => {
+      await tx`update proyecto set estado = 'en-implementacion' where id = ${bId}`;
+      avisarRetomando();
+      await abierta;
+    });
+    await retomando;
     const abierto = await abrirMedicion(leadId, { workspaceId: ws, retoId: r.retoId });
     expect(abierto.proyectos).toBe(1);
+    avisarAbierta();
+    // El rechazo llega al COMMIT, que es cuando esta transacción puede ver lo que la otra
+    // dejó escrito. La apertura de la medición se queda como estaba: entera.
+    await expect(tardia).rejects.toThrow(/su proyecto no puede quedarse sin abrir/);
+    const [trasCarrera] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
+      where id = ${bId}`);
+    expect(trasCarrera!.estado).toBe('pausado');
 
     // Retomar POR DETRÁS ya no existe, en los DOS destinos que tenía la reanudación.
     for (const destino of ['activo', 'en-implementacion']) {
@@ -2569,44 +2630,23 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
     await expect(completar()).rejects.toThrow(/no está en medición/);
 
     // Y la OTRA puerta del par, la de las filas que NACEN: `proyecto_insert` comprueba «el
-    // reto está activo» y eso es un predicado sobre una instantánea, no un candado. Con
-    // `abrirMedicion` en vuelo, el insert veía el 'activo' viejo y commiteaba un proyecto
-    // 'activo' bajo un reto que ya mide — el par roto sin que ninguna regla de transición
-    // pudiera verlo, porque no hubo transición. Ahora el insert toma la fila del RETO y la
-    // relee después del candado: primero se comprueba que ESPERA a quien la tiene…
-    expect(
-      await esperaA(
-        (tx) => tx`select 1 from reto
-          where id = ${r.retoId} and workspace_id = ${ws} for update`,
-        () =>
-          conUsuario(leadId, (tx) => tx`insert into proyecto
-            (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
-            values (${ws}, ${r.retoId}, 'P-75C', 'Frente que llega tarde', 'activo',
-                    'rapido', ${leadId})`),
-      ),
-    ).toBe(true);
-    // …y después, que al releer bajo el candado el motivo es el estado del reto.
+    // reto está activo» contra su instantánea, así que el insert que ganó la carrera
+    // commitea un proyecto 'activo' bajo un reto que ya mide, y ninguna regla de transición
+    // puede verlo porque no hubo transición. El espejo diferido cubre también esa puerta.
+    // Se prueba por su MECÁNICA, con el rol admin: no pasa por la política —igual que no la
+    // detiene el insert que la evaluó contra el estado viejo— y aun así muere al COMMIT.
     await expect(
-      conUsuario(leadId, (tx) => tx`insert into proyecto
-        (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
-        values (${ws}, ${r.retoId}, 'P-75C', 'Frente que llega tarde', 'activo',
-                'rapido', ${leadId})`),
-    ).rejects.toThrow(/el reto no está activo/);
-
-    // La reanudación tiene UN destino y es la fase en la que está el reto — y toma el MISMO
-    // candado antes de leer dónde está: sin él, esta transición decidiría sobre una
-    // instantánea y commitearía por detrás de un reto que acaba de empezar a medir. Es el
-    // mismo agujero que el de arriba, en la puerta de al lado, así que se prueba igual: la
-    // reanudación de verdad se hace esperando a quien tiene la fila del reto.
-    expect(
-      await esperaA(
-        (tx) => tx`select 1 from reto
-          where id = ${r.retoId} and workspace_id = ${ws} for update`,
-        () =>
-          conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
-            where id = ${bId}`),
+      admin.begin(
+        (tx) => tx`insert into proyecto
+          (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+          values (${ws}, ${r.retoId}, 'P-75C', 'Frente que llega tarde', 'activo',
+                  'rapido', ${leadId})`,
       ),
-    ).toBe(true);
+    ).rejects.toThrow(/su proyecto no puede quedarse sin abrir/);
+
+    // La reanudación tiene UN destino y es la fase en la que está el reto.
+    await conUsuario(leadId, (tx) => tx`update proyecto set estado = 'en-medicion'
+      where id = ${bId}`);
     const [tras] = await conUsuario(leadId, (tx) => tx`select estado from proyecto
       where id = ${bId}`);
     expect(tras!.estado).toBe('en-medicion');

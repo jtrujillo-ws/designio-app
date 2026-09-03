@@ -727,17 +727,10 @@ begin
   if new.estado = old.estado then
     return new;
   end if;
-  -- El punto de cita, y ANTES de leer nada del reto. Tres de las reglas de abajo consultan
-  -- `reto` —retomar sigue al reto, medir con el reto, cerrar con su veredicto— y las tres
-  -- serían predicados sobre una instantánea sin bloquear primero: con `abrirMedicion` o la
-  -- completación del post mortem en vuelo, esta transición leería el estado VIEJO del reto
-  -- y commitearía por detrás — un proyecto retomado detrás de un reto que ya mide, o
-  -- midiendo bajo uno que acaba de cerrar. Mismo candado y mismo ORDEN (`reto → proyecto`)
-  -- que ya toman `abrirMedicion`, el guard del cierre y el bloqueo compartido de las
-  -- escrituras de medición, así que no añade ciclo posible; y las dos rutas que mueven el
-  -- par no pagan nada por repetirlo, porque ya lo tienen.
-  perform 1 from reto where id = new.reto_id and workspace_id = new.workspace_id
-    for update;
+  -- (Las reglas de abajo que consultan `reto` son predicados sobre una instantánea, como
+  -- toda lectura sin candado. Quien cierra esa carrera es el espejo DIFERIDO del par, más
+  -- abajo, y no un `for update` aquí: ver allí por qué el candado no podía ir en este
+  -- guard.)
   -- Ciclo de vida del proyecto (RF-04.12, §7): pausar y retomar es reversible; avanzar en
   -- el método no. Nada sale de 'cerrado' — el trabajo posterior es un reto nuevo (SYS-08).
   if (old.estado, new.estado) not in (
@@ -911,57 +904,6 @@ create policy proyecto_insert on proyecto
         and r.estado = 'activo')
   );
 
--- ── …y ese `exists` es un predicado sobre una INSTANTÁNEA, no un candado ──
--- La regla de arriba está bien enunciada y mal sostenida, por el axioma que este slice
--- repite en todas partes menos aquí: una política comprueba lo que veía cuando miró, y
--- nada impide que el reto cambie mientras tanto. Con `abrirMedicion` corriendo en otra
--- sesión, el insert evalúa su `exists` contra el 'activo' VIEJO y commitea después; la
--- comprobación diferida del par indivisible ya corrió en la otra transacción y no pudo ver
--- esta fila, que aún no existía. Resultado: un proyecto 'activo' colgando de un reto que ya
--- mide — el par roto por la puerta de las filas que NACEN, que ninguna regla sobre
--- transiciones puede vigilar, y con ella el cierre del outcome review bloqueado.
---
--- Es exactamente el error que este mismo slice ya corrigió en el efecto de G6 —decidir
--- sobre una instantánea y escribir sobre un candado—, cometido en el sitio donde se había
--- dado por cerrado «porque la política ya lo comprueba». Ninguna política cierra una
--- carrera.
---
--- La forma correcta es la del resto del archivo: bloquear la FILA DEL RETO y volver a
--- leerla DESPUÉS del candado —cada sentencia de plpgsql toma su propio snapshot, así que
--- ve lo que commiteó quien la tenía—. El WITH CHECK no serviría ni con el candado puesto:
--- su subconsulta se evalúa contra el snapshot de la SENTENCIA, que no se renueva. Con esto
--- los dos órdenes quedan bien: si el insert llega primero, `abrirMedicion` espera y su
--- comprobación diferida sí ve el proyecto nuevo y rechaza la apertura; si llega segundo,
--- este guard lee 'en-medicion' y el rechazado es el insert.
---
--- Mismo punto de cita y mismo ORDEN que las demás rutas (`reto → proyecto`), así que no
--- añade ciclo posible. `activarReto` no paga nada: ya tiene la fila del reto bloqueada por
--- su propio `update` de la sentencia anterior y lee su 'activo' sin commitear.
---
--- SECURITY DEFINER con el pre-chequeo anti-oráculo de siempre: a quien no es miembro lo
--- rechaza la política, como debe ser, y el seed y los rellenos —que corren como owner sin
--- contexto— lo saltan, igual que en `proyecto_con_metodo_guard`.
-create function proyecto_reto_activo_guard() returns trigger
-language plpgsql security definer set search_path = public, pg_temp as $$
-declare
-  actual text;
-begin
-  if not is_workspace_member(app_user_id(), new.workspace_id) then
-    return new;
-  end if;
-  select r.estado into actual from reto r
-    where r.id = new.reto_id and r.workspace_id = new.workspace_id
-    for update;
-  if actual is distinct from 'activo' then
-    raise exception 'el reto no está activo: un proyecto nuevo no nace bajo un reto que ya mide, que cerró o que sigue en candidato';
-  end if;
-  return new;
-end $$;
-create trigger proyecto_reto_activo
-  before insert on proyecto
-  for each row execute function proyecto_reto_activo_guard();
-revoke execute on function proyecto_reto_activo_guard() from public;
-
 -- ── Y las dos columnas del perdón histórico se cierran en la PUERTA, no en el grant ──
 -- El preámbulo de esta migración da dos razones independientes para que esas marcas no
 -- sean una puerta trasera permanente, y la primera —«no entran en ningún grant, así que el
@@ -1016,8 +958,10 @@ create policy gate_insert on gate_instancia
 -- reto se queda en 'activo' ni en 'en-implementacion' (si quedara, ese es exactamente el
 -- tablero que miente), y al menos uno está midiendo (si no, el reto mide sin que nadie
 -- mida: `abrirMedicion` ya lo rechaza contando los movidos, y por SQL directo también).
--- Un proyecto 'pausado' o 'cerrado' sí puede quedarse atrás: la operación no los toca a
--- propósito y parar es del cliente.
+-- Un proyecto 'cerrado' puede quedarse atrás sin más: ya terminó. Uno 'pausado' también,
+-- pero SOLO si todavía puede seguir al reto después — y esa condición es la tercera
+-- comprobación, no una tolerancia. Parar es del cliente, sí; lo que no puede es dejar al
+-- reto sin final.
 --
 -- Y este trigger corre en UN instante, el de la entrada: `when (new.estado = 'en-medicion'
 -- and old.estado is distinct from 'en-medicion')` no vuelve a mirar nada después, así que
@@ -1031,6 +975,8 @@ create policy gate_insert on gate_instancia
 -- del workspace, así que no puede volverse oráculo de nada que no se pudiera leer ya.
 create function reto_medicion_par_indivisible_guard() returns trigger
 language plpgsql as $$
+declare
+  atrapados text;
 begin
   if exists (select 1 from proyecto p
     where p.reto_id = new.id and p.workspace_id = new.workspace_id
@@ -1042,6 +988,33 @@ begin
       and p.estado = 'en-medicion') then
     raise exception 'el reto no puede medir sin ningún proyecto en medición (§5.2)';
   end if;
+  -- Y la tercera, que es la que cierra el triángulo. Dejar atrás a un proyecto pausado
+  -- parecía inofensivo —«la operación no los toca a propósito»— pero solo lo es mientras
+  -- ese proyecto PUEDA volver. Sin su G7 aprobado no puede, y no por una regla sino por
+  -- tres que se cierran entre sí: retomarlo con el reto midiendo exige entrar directamente
+  -- en medición (guard de transición), medir exige su G7 (§5.2), G7 exige G6 aprobado
+  -- antes (orden de gates) y aprobar G6 con el proyecto parado se rechaza a propósito
+  -- (§7). Ninguna de las tres sobra y ninguna tiene lado abierto.
+  --
+  -- Y lo caro no es el proyecto atrapado sino lo que arrastra: el guard del cierre del
+  -- outcome review no cierra el reto mientras quede un proyecto sin cerrar, así que un
+  -- pausado que ya no puede volver deja al RETO sin final. Lo mismo que este slice arregló
+  -- para la pausa retomada tarde, un paso antes.
+  --
+  -- Por eso se rechaza AQUÍ, al abrir, y no se descubre después: mientras el reto sigue
+  -- 'activo' la salida existe y es normal —retomar el proyecto, que vuelve a 'activo' o a
+  -- implementación según su G6, y cerrar sus gates hasta G7—; en cuanto el reto se mueve,
+  -- esa salida desaparece. Descubrirlo después es descubrirlo cuando ya no hay ninguna.
+  select string_agg(p.codigo, ', ' order by p.codigo) into atrapados
+  from proyecto p
+  where p.reto_id = new.id and p.workspace_id = new.workspace_id
+    and p.estado = 'pausado'
+    and not exists (select 1 from gate_instancia g
+      where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+        and g.numero = 7 and g.estado = 'aprobado');
+  if atrapados is not null then
+    raise exception 'un proyecto pausado sin su G7 no podría seguir al reto ni dejarlo cerrar: retómalo y cierra sus gates antes de abrir la medición (§5.2): %', atrapados;
+  end if;
   return null;
 end $$;
 create constraint trigger reto_medicion_par_indivisible
@@ -1050,6 +1023,57 @@ create constraint trigger reto_medicion_par_indivisible
   for each row when (new.estado = 'en-medicion' and old.estado is distinct from 'en-medicion')
   execute function reto_medicion_par_indivisible_guard();
 revoke execute on function reto_medicion_par_indivisible_guard() from public;
+
+-- ── …y el MISMO invariante desde el lado del proyecto, porque una política no cierra
+-- una carrera ──
+-- Las reglas que sostienen el par del lado del proyecto —`proyecto_insert` exigiendo un
+-- reto 'activo', y el guard de transición negando que una pausa se retome por detrás— son
+-- predicados sobre una INSTANTÁNEA. Ninguna impide que el reto cambie mientras deciden:
+-- con `abrirMedicion` corriendo en otra sesión, el insert evalúa su `exists` contra el
+-- 'activo' viejo, la comprobación diferida del reto corre sin poder ver una fila que aún no
+-- existe, y los dos commitean dejando un proyecto 'activo' colgado de un reto que ya mide.
+-- El par roto por la puerta de las filas que NACEN, y con él el cierre del outcome review
+-- bloqueado. La transición tiene la misma grieta un paso más allá: lee el estado del reto
+-- sin bloquearlo y commitea detrás de quien acaba de moverlo.
+--
+-- El candado inmediato (`select … for update` sobre el reto dentro de los guards del
+-- proyecto) cerraba la carrera pero introducía un CICLO: un `BEFORE UPDATE` de fila no
+-- puede adelantarse a su propio tuple lock —PostgreSQL bloquea la fila vieja para
+-- construir el `old` antes de ejecutar el trigger—, así que ese camino toma
+-- `proyecto → reto` mientras `abrirMedicion` toma `reto → proyecto`. Un interbloqueo se
+-- detecta y aborta, no corrompe nada, pero cambia un rechazo explicado por un 40P01 y
+-- rompe el orden único que este archivo mantiene en todas las demás rutas.
+--
+-- Se cierra donde no hay orden que romper: DIFERIDO, como su hermano de arriba y por la
+-- misma mecánica —al COMMIT cada sentencia toma su propio snapshot, así que ve lo que
+-- commiteó el otro—. Los dos órdenes quedan cubiertos sin bloquear nada: si el proyecto
+-- commitea primero, es la comprobación del RETO la que ve la fila nueva y rechaza la
+-- apertura; si commitea segundo, es esta la que ve el reto midiendo y rechaza el proyecto.
+--
+-- Cubre INSERT y transición a la vez, que son las dos puertas por las que un proyecto llega
+-- a 'activo' o 'en-implementacion'. El rechazo inmediato y explicado sigue siendo el de
+-- siempre en el caso secuencial —la política para el insert, el guard de transición para la
+-- pausa retomada—: esto es la red de la carrera, no el diagnóstico.
+--
+-- Con la excepción EXACTA del reto heredado, igual que el guard de transición: es el único
+-- que mide teniendo su proyecto detrás por definición, y ese «detrás» es el estado que
+-- encontró la migración, no una avería.
+create function proyecto_par_medicion_guard() returns trigger
+language plpgsql as $$
+begin
+  if exists (select 1 from reto r
+    where r.id = new.reto_id and r.workspace_id = new.workspace_id
+      and r.estado = 'en-medicion' and not r.medicion_sin_registry) then
+    raise exception 'el reto ya está midiendo: su proyecto no puede quedarse sin abrir (§5.2)';
+  end if;
+  return null;
+end $$;
+create constraint trigger proyecto_par_medicion
+  after insert or update of estado on proyecto
+  deferrable initially deferred
+  for each row when (new.estado in ('activo', 'en-implementacion'))
+  execute function proyecto_par_medicion_guard();
+revoke execute on function proyecto_par_medicion_guard() from public;
 
 -- ── Guard de la firma del registry (SYS-22) ──
 -- La completitud del contrato vive en el DATO: ni el propio sponsor firma por SQL

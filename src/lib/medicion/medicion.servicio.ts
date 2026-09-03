@@ -378,6 +378,34 @@ export async function abrirMedicion(
     if (yaMedia && !listo!.medicion_sin_registry) {
       throw new ErrorMedicion('La medición de este reto ya está abierta');
     }
+    // Un proyecto PAUSADO puede quedarse atrás —parar es del cliente y esta operación no
+    // lo toca— pero solo si todavía puede seguir al reto después. Sin su G7 aprobado no
+    // puede, y por tres reglas que se cierran entre sí: con el reto ya midiendo, retomarlo
+    // exige entrar directamente en medición, medir exige su G7, G7 exige G6 antes y
+    // aprobar G6 con el proyecto parado se rechaza. Atrapado él, el outcome review tampoco
+    // cierra el reto —exige que no quede ningún proyecto sin cerrar—, así que lo que se
+    // pierde no es un proyecto sino el final del reto.
+    //
+    // Se dice ANTES de mover nada, que es lo único que deja al operador una salida: con el
+    // reto todavía activo, retomar el proyecto y cerrar sus gates es el camino normal; en
+    // cuanto el reto se mueve, ese camino desaparece. El guard diferido lo vuelve a exigir
+    // para el SQL directo, pero allí el diagnóstico llega al COMMIT y sin nombres a mano.
+    if (listo && !yaMedia) {
+      const atrapados = await tx`
+        select p.codigo from proyecto p
+        where p.reto_id = ${entrada.retoId} and p.workspace_id = ${entrada.workspaceId}
+          and p.estado = 'pausado'
+          and not exists (select 1 from gate_instancia g
+            where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
+              and g.numero = 7 and g.estado = 'aprobado')
+        order by p.codigo`;
+      if (atrapados.length > 0) {
+        const lista = atrapados.map((p) => p.codigo as string).join(', ');
+        throw new ErrorMedicion(
+          `Retómalos y cierra sus gates antes de abrir la medición (${lista}): un proyecto pausado sin su G7 no podría seguir al reto ni dejarlo cerrar`,
+        );
+      }
+    }
     if (!yaMedia) {
       let abierto;
       try {

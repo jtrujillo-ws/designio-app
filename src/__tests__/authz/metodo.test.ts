@@ -642,17 +642,13 @@ describeAuthz('método: etapas, gates y checklists', () => {
       select estado from reto where id = ${r97.retoId}`);
     expect(sigueCandidato!.estado).toBe('candidato');
 
-    // Y bajo un reto que NO está activo no se cuelga proyecto alguno (solo activarReto,
-    // que activa antes en la misma tx, pasa). La regla vive en DOS capas: la política la
-    // enuncia y un guard `before insert` la sostiene bloqueando la fila del reto y
-    // releyéndola —una política es un predicado sobre una instantánea y no cierra la
-    // carrera con quien mueve el reto a la vez—. El guard habla ANTES que el WITH CHECK,
-    // así que el mensaje que llega es el suyo.
+    // Y bajo un reto que NO está activo no se cuelga proyecto alguno: la política
+    // exige reto activo (solo activarReto, que activa antes en la misma tx, pasa).
     await expect(
       conUsuario(leadId, (tx) => tx`insert into proyecto
         (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
         values (${ws}, ${r97.retoId}, 'P-97', 'Bajo candidato', 'activo', 'rapido', ${leadId})`),
-    ).rejects.toThrow(/el reto no está activo/);
+    ).rejects.toThrow(/row-level security/);
 
     // Oráculo: un miembro de OTRO workspace que apunte a nuestro reto (G0 aprobado)
     // recibe el error de política de siempre — el pre-chequeo de membresía del guard

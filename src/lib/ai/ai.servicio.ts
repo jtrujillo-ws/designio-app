@@ -972,7 +972,6 @@ async function registrarLlamadas(
   entrada: GenerarPropuestas,
   alcance: Alcance,
   intentos: IntentoProveedor[],
-  versionConsentimiento: number | null,
 ): Promise<{ ids: string[]; idSalidaValida: string | null }> {
   if (intentos.length === 0) return { ids: [], idSalidaValida: null };
   return conUsuario(actorId, async (tx) => {
@@ -1000,7 +999,7 @@ async function registrarLlamadas(
                 ${intento.motivo.slice(0, 500)},
                 ${intento.uso?.entrada ?? null}, ${intento.uso?.salida ?? null},
                 ${intento.uso?.costoUsd ?? null}, ${intento.latenciaMs},
-                ${versionConsentimiento},
+                ${intento.consentimientoVersion},
                 ${actorId})
         returning id`;
       const id = fila!.id as string;
@@ -1035,6 +1034,28 @@ export async function generarPropuestas(
       capacidad: entrada.capacidad,
       sistema: alcance.sistema,
       usuario: alcance.usuario,
+      consentimientoVersion: versionConsentimiento,
+      // Degradar de modelo es un despacho NUEVO, no la misma llamada otra vez: ocurre con la
+      // primera ya terminada, el control de vuelta aquí y ni un byte en el aire. Así que se
+      // vuelve a pedir permiso con EXACTAMENTE la misma comprobación que autorizó el
+      // primario —consentimiento vigente bajo el candado por item, item aún pendiente, reto
+      // que sigue admitiendo criterios y reserva viva— y la versión que devuelve es la que
+      // ampara al respaldo. `confirmarDespacho` lanza `ErrorAI` al rechazar; aquí se traduce
+      // a un `ok:false` porque el adaptador no lanza nunca (SYS-21) y el motivo tiene que
+      // llegar al libro y a la pantalla como cualquier otro.
+      revalidar: async () => {
+        try {
+          return { ok: true, consentimientoVersion: await confirmarDespacho(actorId, entrada, alcance) };
+        } catch (e) {
+          return {
+            ok: false,
+            motivo:
+              e instanceof ErrorAI
+                ? e.message
+                : 'La autorización de esta generación dejó de ser válida antes de reintentar con el modelo de respaldo',
+          };
+        }
+      },
     });
 
     // El proveedor no dio contenido utilizable. Los intentos se anotan igual —con su uso,
@@ -1042,9 +1063,7 @@ export async function generarPropuestas(
     // depender de que el resultado nos guste. Si el propio registro falla, manda el motivo
     // del proveedor: es lo que la persona necesita leer.
     if (!respuesta.ok) {
-      await registrarLlamadas(actorId, entrada, alcance, respuesta.intentos, versionConsentimiento).catch(
-        () => {},
-      );
+      await registrarLlamadas(actorId, entrada, alcance, respuesta.intentos).catch(() => {});
       throw new ErrorAI(respuesta.motivo);
     }
 
@@ -1064,9 +1083,7 @@ export async function generarPropuestas(
           ? { ...i, resultado: 'fuera-de-contrato' as const, motivo }
           : i,
       );
-      await registrarLlamadas(actorId, entrada, alcance, intentos, versionConsentimiento).catch(
-        () => {},
-      );
+      await registrarLlamadas(actorId, entrada, alcance, intentos).catch(() => {});
       throw new ErrorAI(motivo);
     }
 
@@ -1075,7 +1092,6 @@ export async function generarPropuestas(
       entrada,
       alcance,
       respuesta.intentos,
-      versionConsentimiento,
     );
     const exitoso = respuesta.intentos[respuesta.intentos.length - 1]!;
     // Sin línea de gasto no hay propuesta: la FK lo impone y aquí se dice con un mensaje

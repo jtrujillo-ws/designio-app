@@ -119,13 +119,33 @@ async function sembrarMetodo(tx: TransactionSql, wsId: string, luciaId: string):
  * El seed corre como owner (sin contexto RLS) y por eso escribe la evidencia directamente
  * en vez de pasar por la curaduría; los items quedan marcados como aprobados igual que
  * lo haría la app, para que la bandeja cuente la misma historia.
- * Idempotente por la presencia de MATERIAL EN LA BANDEJA (`item_importacion`), que es lo
- * único que siembra en exclusiva esta función. La señal era antes «hay algún derecho_uso
- * en el workspace», y eso la ataba a un dato que otras funciones también producen: en
- * cuanto sembrarCadena empezó a crear los derechos de sus dos evidencias —y en el camino
- * de upgrade corre ANTES que esta—, la señal se activaba sola y el material de la bandeja
- * no llegaba a sembrarse nunca. Una guarda de idempotencia tiene que mirar lo que la
- * propia función escribe, no un efecto que comparte con otras.
+ * Idempotente por su MARCADOR EN `sembrado_registro`, no por lo que encuentre en las
+ * tablas de producto. La señal ha fallado ya dos veces por el mismo motivo, y las dos
+ * enseñan la misma frase con distinta letra:
+ *
+ *  1. Fue «hay algún `derecho_uso` en el workspace», y eso la ataba a un dato que otras
+ *     funciones también producen: en cuanto `sembrarCadena` empezó a crear los derechos
+ *     de sus dos evidencias —y en el camino de upgrade corre ANTES que ésta—, la señal se
+ *     activaba sola y el material de la bandeja no se sembraba nunca.
+ *  2. Fue «hay algún `item_importacion` en el workspace», que es más estrecho pero sigue
+ *     siendo una tabla DE PRODUCTO: cualquiera puede dar de alta material en la bandeja
+ *     de un Banco Andino ya existente, y desde ese momento esta función concluye que sus
+ *     tres registros ya están y los salta PARA SIEMPRE. Nadie ha borrado nada; el demo
+ *     simplemente nunca llega, y no hay forma de distinguirlo de que sí llegó.
+ *
+ * El arreglo es el mismo que el de `sembrarCadena`, y por eso lo comparte en vez de
+ * copiarlo: la procedencia del sembrado no la deduce el seed de la forma de la base, la
+ * ESCRIBE donde el rol de aplicación no llega. `sembrado_registro` no tiene política ni
+ * grant de escritura para `designio_app`, así que «existe el marcador» solo puede haberlo
+ * puesto una corrida del seed.
+ *
+ * Con una salvedad que conviene decir en vez de dejar implícita, porque esta función corre
+ * también en el camino de UPGRADE sobre un Banco Andino ya existente: las bases sembradas
+ * por la versión anterior tienen el material y no tienen marcador, y sembrar otra vez ahí
+ * lo DUPLICA. Así que la guarda son dos preguntas —el marcador primero, y sólo si falta,
+ * la presencia de los registros propios de esta función por su título exacto— y no una.
+ * La segunda es la concesión al pasado y se apaga sola; el detalle de por qué emparejar
+ * por título es admisible aquí y no en `repararDerechosDeCadena` está junto a ella.
  */
 const ARCHIVO_DEMO = `Estudio CX — apertura de cuenta nomina (extracto)
 
@@ -139,9 +159,7 @@ async function sembrarEvidenciaProfunda(
   wsId: string,
   luciaId: string,
 ): Promise<boolean> {
-  const yaHay = await tx`select 1 from item_importacion where workspace_id = ${wsId} limit 1`;
-  if (yaHay.length > 0) return false;
-
+  const sembrados: { itemId: string; evidenciaId: string }[] = [];
   const material = [
     {
       titulo: 'Estudio CX apertura de cuenta (PDF del proveedor)',
@@ -202,6 +220,31 @@ async function sembrarEvidenciaProfunda(
     },
   ] as const;
 
+  // ── ¿Ya está sembrado? Dos preguntas, y ninguna es «¿hay algo en la bandeja?» ──
+  const [marca] = await tx`select 1 from sembrado_registro
+    where workspace_id = ${wsId} and clave = ${CLAVE_EVIDENCIA_PROFUNDA}`;
+  if (marca) return false;
+
+  // Sin marcador quedan las bases sembradas por una versión anterior, que sí tienen este
+  // material y no tienen cómo acreditarlo. Para ésas la pregunta se hace sobre LOS
+  // REGISTROS DE ESTA FUNCIÓN —sus títulos exactos, derivados del mismo array que los
+  // crea y no de una lista paralela que se desincronice—, no sobre la tabla entera.
+  //
+  // Emparejar por título está proscrito en `repararDerechosDeCadena` y aquí no lo está, y
+  // la diferencia importa: allí decide a quién se le CONCEDEN derechos, así que un acierto
+  // falso regala permisos sobre material ajeno. Aquí solo decide si se ESCRIBE material de
+  // demo, y el peor acierto falso es no añadirlo. La dirección conservadora es la contraria
+  // en cada caso, y por eso la respuesta también.
+  //
+  // Esta rama se apaga sola: en cuanto una corrida siembra deja marcador, y desde ahí la
+  // pregunta vuelve a ser exacta. NO se le escribe marcador a las bases viejas a propósito
+  // —sellar en nombre de una corrida que no consta es justo lo que este registro existe
+  // para impedir—, así que sigue costando una consulta y diciendo la verdad.
+  const heredado = await tx`select 1 from item_importacion
+    where workspace_id = ${wsId} and titulo = any(${material.map((m) => m.titulo)})
+    limit 1`;
+  if (heredado.length > 0) return false;
+
   for (const m of material) {
     const [item] = await tx`insert into item_importacion
       (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
@@ -254,7 +297,15 @@ async function sembrarEvidenciaProfunda(
       (${wsId}, 'EvidenciaCurada',
        ${tx.json({ itemId, evidenciaId, esEstadoActual: m.esEstadoActual })},
        ${luciaId}, 'lead-boutique')`;
+    sembrados.push({ itemId, evidenciaId });
   }
+  // La constancia de ESTA corrida, donde la aplicación no escribe. Lleva los ids además de
+  // la clave: hoy la guarda solo pregunta si la fila existe, pero un marcador que no dice
+  // QUÉ creó obliga a la siguiente reparación a adivinarlo, que es exactamente el defecto
+  // que `repararDerechosDeCadena` existe para no repetir.
+  await tx`insert into sembrado_registro (workspace_id, clave, payload)
+    values (${wsId}, ${CLAVE_EVIDENCIA_PROFUNDA}, ${tx.json({ sembrados })})
+    on conflict (workspace_id, clave) do nothing`;
   return true;
 }
 
@@ -316,6 +367,8 @@ async function concederDerechosDeCadena(
  * distintas del seed.
  */
 const CLAVE_CADENA_SEMBRADA = 'cadena-demo';
+/** La clave con la que el seed registra el material de bandeja de §19.1. */
+const CLAVE_EVIDENCIA_PROFUNDA = 'evidencia-profunda-demo';
 const AVISO_CADENA_SIN_PROCEDENCIA = 'DerechosDeCadenaSinRepararPorProcedencia';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

@@ -94,6 +94,36 @@ function PantallaImportacion() {
   const [hayMasDecididasLocal, setHayMasDecididasLocal] = useState<boolean | null>(null);
   const [cargandoDecididas, setCargandoDecididas] = useState(false);
 
+  // Lo acumulado cuelga de un cursor: la ÚLTIMA fila de la primera página que trajo el
+  // loader. Si el loader se revalida y ese borde cambia, las páginas ya cargadas se
+  // pidieron desde un punto que ya no existe, y concatenarlas salta o repite filas. Se
+  // descarta AQUÍ, durante el render, y no en un efecto: un efecto pintaría primero un
+  // fotograma con la lista mal empalmada. Es la misma redacción que la pantalla de
+  // derechos (`evidencia.tsx`), que decide exactamente esto mismo.
+  //
+  // El workspace entra en el centinela aunque el layout `_autenticada` ya remonte por
+  // `key` al cambiarlo: esta pantalla no debería depender de que esa `key` siga puesta
+  // para no mezclar material de dos clientes. Cuesta una comparación de cadenas.
+  //
+  // Las dos listas llevan centinela propio porque tienen cursores propios: curar un item
+  // lo mueve de pendientes a decididas y mueve los dos bordes, pero cargar más pendientes
+  // no tiene por qué tirar el historial de decididas ya recorrido.
+  const wsActual = datos?.workspaceId ?? null;
+  const bordePendientes = `${wsActual}|${datos?.pendientes.at(-1)?.id ?? ''}`;
+  const bordeDecididas = `${wsActual}|${datos?.decididas.at(-1)?.id ?? ''}`;
+  const [bordePendientesVisto, setBordePendientesVisto] = useState(bordePendientes);
+  if (bordePendientesVisto !== bordePendientes) {
+    setBordePendientesVisto(bordePendientes);
+    setMasPendientes([]);
+    setHayMasLocal(null);
+  }
+  const [bordeDecididasVisto, setBordeDecididasVisto] = useState(bordeDecididas);
+  if (bordeDecididasVisto !== bordeDecididas) {
+    setBordeDecididasVisto(bordeDecididas);
+    setMasDecididas([]);
+    setHayMasDecididasLocal(null);
+  }
+
   const pendientes = datos ? [...datos.pendientes, ...masPendientes] : [];
   const hayMas = hayMasLocal ?? datos?.hayMasPendientes ?? false;
   const decididas = datos ? [...datos.decididas, ...masDecididas] : [];

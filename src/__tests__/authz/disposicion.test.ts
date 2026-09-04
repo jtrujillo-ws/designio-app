@@ -1686,7 +1686,9 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        *    módulo, y `exigirCuentaActiva` se IMPORTA en casi todos, así que una proyección
        *    nueva en cualquier fichero salvo `auth.servicio.ts` se contaba de menos.
        */
-      const analizar = (nodo: TS.Node) => {
+      /** Ayudantes ya en la pila, para no caer en un ciclo si dos se llaman entre sí. */
+      const enCurso = new Set<TS.Node>();
+      const analizar = (nodo: TS.Node): { sentencias: number; escribe: boolean } => {
         let sentencias = 0;
         let escribe = false;
         /*
@@ -1726,7 +1728,28 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
               n.arguments.length > 0 &&
               ts.isIdentifier(n.arguments[0]!) &&
               (n.arguments[0] as TS.Identifier).text === 'tx';
-            if (esUnsafe || primeroEsTx) contar(n);
+            if (esUnsafe) contar(n);
+            else if (primeroEsTx) {
+              /*
+               * Un ayudante que recibe `tx` ejecuta SUS consultas en esta transacción, así que
+               * cuenta lo que ejecuta él, no uno. Contando uno, una proyección que delegara
+               * todas sus lecturas —`return cargarPanel(tx, …)`— salía con una sola sentencia
+               * y se escapaba. Se expande si es del módulo; si viene de otro (`import`), no
+               * hay cuerpo que mirar y se cuenta como una, que es el suelo conservador.
+               */
+              const destino = ts.isIdentifier(f) ? porNombre.get(f.text) : undefined;
+              if (destino && !enCurso.has(destino)) {
+                enCurso.add(destino);
+                const sub = analizar(destino);
+                enCurso.delete(destino);
+                escribe ||= sub.escribe;
+                // Las del ayudante heredan el destino del valor de ESTA llamada: si aquí se
+                // descarta, son una puerta entera y no cuentan.
+                for (let i = 0; i < sub.sentencias; i++) contar(n);
+              } else {
+                contar(n);
+              }
+            }
           }
           // El SQL, para saber si ESCRIBE.
           if (
@@ -1782,8 +1805,24 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         if (!llamada) continue;
 
         // El aislamiento se lee del TERCER ARGUMENTO real, no de la palabra suelta.
+        /*
+         * La opción se lee del AST, no del texto del argumento: `conUsuario(…, { /* …
+         * aislamiento: pendiente … *\/ })` es TypeScript válido, no fija nada, y con una
+         * comprobación textual daba por declarada la proyección. Tiene que ser una PROPIEDAD
+         * llamada `aislamiento` con el valor que se espera.
+         */
         const opciones = llamada.arguments[2];
-        const fijaAislamiento = Boolean(opciones && /aislamiento\s*:/.test(opciones.getText()));
+        const fijaAislamiento =
+          Boolean(opciones) &&
+          ts.isObjectLiteralExpression(opciones!) &&
+          opciones!.properties.some(
+            (prop) =>
+              ts.isPropertyAssignment(prop) &&
+              ((ts.isIdentifier(prop.name) && prop.name.text === 'aislamiento') ||
+                (ts.isStringLiteral(prop.name) && prop.name.text === 'aislamiento')) &&
+              ts.isStringLiteral(prop.initializer) &&
+              prop.initializer.text === 'repeatable read',
+          );
 
         const { sentencias, escribe } = analizar(nodo);
 

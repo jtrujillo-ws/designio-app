@@ -167,7 +167,8 @@ export const CONTRATO_CONSTANCIA = 'whitespace-constancia/1';
  *  · hay un espacio tras los dos puntos y tras cada coma;
  *  · un objeto vacío es `{}`.
  *
- * Solo admite lo que la constancia guarda —objetos, enteros, cadenas, null y arrays de eso—
+ * Solo admite lo que la constancia guarda —objetos, enteros, cadenas, booleanos, null y
+ * arrays de eso—
  * y lanza ante un decimal en vez de arriesgar un hash distinto: en `jsonb` un número conserva
  * la forma léxica con que se escribió (`1.50` sigue siendo `1.50`), y eso no se puede derivar
  * de un `number` de JavaScript. Los inventarios son conteos enteros, así que el caso no

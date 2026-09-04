@@ -53,6 +53,21 @@ const parrafo: CSSProperties = {
   margin: 0,
 };
 
+/**
+ * El instante, en UTC y con forma fija.
+ *
+ * `toLocaleString()` no vale aquí por dos razones que se suman. La primera es de correcciÓn:
+ * esta aplicación renderiza en el servidor, así que ese texto se calcula una vez con el locale
+ * y el huso del proceso y otra con los del navegador — y cuando difieren, React encuentra dos
+ * árboles distintos al hidratar. La segunda es de sentido: esto es la fecha que acredita que
+ * el archivo se entregó ANTES de disponer, y una fecha que cambia según quién mire no acredita
+ * nada. Se pinta el instante en UTC, dicho, que es el mismo para las dos partes del contrato
+ * aunque estén en husos distintos.
+ */
+function instanteUTC(iso: string): string {
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+}
+
 function PantallaDisposicion() {
   const { membresiaActiva } = Route.useRouteContext();
   const navigate = useNavigate();
@@ -281,7 +296,7 @@ function PantallaDisposicion() {
               )}
               <p style={{ ...parrafo, color: 'var(--text-muted)' }}>
                 {panel?.ultimaExportacion
-                  ? `Última exportación del archivo completo: ${new Date(panel.ultimaExportacion).toLocaleString()}`
+                  ? `Última exportación del archivo completo: ${instanteUTC(panel.ultimaExportacion)}`
                   : 'Todavía no se ha entregado el archivo completo del workspace.'}
               </p>
             </Card>

@@ -41,9 +41,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * timezone('UTC', now()))` no case con la primera, porque su segundo argumento empieza por
    * `timezone`. Comprobado contra las dos formas.
    */
+  const RELOJES = String.raw`now\s*\(\s*\)|current_timestamp|transaction_timestamp\s*\(\s*\)|clock_timestamp\s*\(\s*\)`;
   const RELOJ_COLAPSADO_A_DIA = [
-    /date_trunc\s*\(\s*'[^']*'\s*,\s*(now\s*\(\s*\)|current_timestamp|transaction_timestamp\s*\(\s*\)|clock_timestamp\s*\(\s*\))\s*\)/i,
-    /\b(now\s*\(\s*\)|current_timestamp|transaction_timestamp\s*\(\s*\)|clock_timestamp\s*\(\s*\))\s*::\s*(date|time)\b/i,
+    // `date_trunc('day', now())`. El `(::\w+)?` es por la forma DEPARSEADA: Postgres devuelve
+    // `date_trunc('day'::text, now())`, y sin eso el patrón solo veía el código fuente.
+    new RegExp(String.raw`date_trunc\s*\(\s*'[^']*'(::\w+)?\s*,\s*(${RELOJES})\s*\)`, 'i'),
+    // `now()::date` tal como se escribe…
+    new RegExp(String.raw`\b(${RELOJES})\s*::\s*(date|time)\b`, 'i'),
+    // …y tal como Postgres la devuelve, que es `(now())::date` — con paréntesis propios. La
+    // misma forma canónica a la que reduce `cast(now() as date)`, así que este patrón cubre
+    // las dos. Y NO marca `(timezone('UTC'::text, now()))::date`, porque ahí el paréntesis que
+    // precede al `::` no es el de `now()` sino el de `timezone`: el reloj va envuelto.
+    new RegExp(String.raw`\(\s*(${RELOJES})\s*\)\s*::\s*(date|time)\b`, 'i'),
+    // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
+    new RegExp(String.raw`cast\s*\(\s*(${RELOJES})\s+as\s+(date|time)\b`, 'i'),
+    // `date(now())`, la tercera forma de escribir la misma conversión.
+    new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJES})\s*\)`, 'i'),
   ];
 
   /** Lo que hace culpable a un cuerpo: cualquiera de las dos vías. */
@@ -63,41 +76,49 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
 
   it('ninguna función lee el reloj de pared de quien la llama', async () => {
-    // `pg_get_functiondef` y no `prosrc`: una función con cuerpo SQL estándar
-    // (`LANGUAGE SQL … RETURN …` o `BEGIN ATOMIC`) guarda el árbol analizado en `prosqlbody`
-    // y deja `prosrc` VACÍO (medido). Leyendo `prosrc`, esa función contaba para el mínimo de
-    // la categoría y su cuerpo no llegaba nunca al filtro: el censo la habría dado por
-    // limpia sin haberla mirado. `prokind = 'f'` porque `pg_get_functiondef` no acepta
-    // agregados ni funciones de ventana.
-    const funciones = await sqlAdmin()`
-      select p.proname as nombre, pg_get_functiondef(p.oid) as cuerpo
-      from pg_proc p
-      join pg_namespace n on n.oid = p.pronamespace
-      join pg_language l on l.oid = p.prolang
-      where n.nspname = 'public' and l.lanname not in ('internal', 'c')
-        and p.prokind = 'f'
-      order by 1`;
-    // El censo tiene que estar mirando algo: sin esto, un cambio en la consulta que devuelva
-    // cero filas dejaría el test en verde para siempre sin comprobar nada.
-    expect(funciones.length).toBeGreaterThan(50);
-
-    const culpables = funciones
-      .filter((f) => culpable(sinComentarios(f.cuerpo as string)))
-      .map((f) => f.nombre as string)
-      .filter((n) => !(n in DECLARADAS));
-    expect(culpables).toEqual([]);
-
-    // Y la vía que `prosrc` no veía se comprueba fabricando una culpable con cuerpo SQL
-    // estándar: sin esto, cambiar la consulta de vuelta a `prosrc` dejaría el censo en verde.
+    /*
+     * La sonda se crea ANTES de capturar el censo y se exige que salga entre SUS culpables,
+     * usando la misma consulta y el mismo filtro. Antes hacía una consulta aparte, y eso no
+     * protegía nada: volver la consulta principal a `prosrc` la habría dejado en verde, porque
+     * la sonda conservaba su propio `pg_get_functiondef`. Lo comprobé mal —cambié las dos a la
+     * vez— y por eso el rojo me pareció una prueba cuando no lo era.
+     *
+     * Una sonda que no atraviesa el camino que dice proteger es peor que ninguna: da la
+     * impresión de cubrirlo.
+     */
     const admin = sqlAdmin();
     await admin`create function censo_probe_sqlbody() returns date
       language sql stable return current_date`;
     try {
-      const [probe] = await admin`select pg_get_functiondef(p.oid) as cuerpo, p.prosrc
-        from pg_proc p where p.proname = 'censo_probe_sqlbody'`;
-      // La premisa del hallazgo, comprobada aquí y no supuesta: `prosrc` viene vacío.
-      expect(probe!.prosrc).toBe('');
-      expect(culpable(sinComentarios(probe!.cuerpo as string))).toBe(true);
+      // `pg_get_functiondef` y no `prosrc`: una función con cuerpo SQL estándar
+      // (`LANGUAGE SQL … RETURN …` o `BEGIN ATOMIC`) guarda el árbol analizado en
+      // `prosqlbody` y deja `prosrc` VACÍO (comprobado abajo). Leyendo `prosrc`, esa función
+      // contaba para el mínimo y su cuerpo no llegaba nunca al filtro. `prokind = 'f'` porque
+      // `pg_get_functiondef` no acepta agregados ni funciones de ventana.
+      const funciones = await admin`
+        select p.proname as nombre, pg_get_functiondef(p.oid) as cuerpo, p.prosrc
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+        join pg_language l on l.oid = p.prolang
+        where n.nspname = 'public' and l.lanname not in ('internal', 'c')
+          and p.prokind = 'f'
+        order by 1`;
+      // El censo tiene que estar mirando algo: sin esto, un cambio en la consulta que
+      // devolviera cero filas dejaría el test en verde para siempre sin comprobar nada.
+      expect(funciones.length).toBeGreaterThan(50);
+
+      // La premisa del hallazgo, comprobada aquí y no supuesta.
+      const sonda = funciones.find((f) => f.nombre === 'censo_probe_sqlbody');
+      expect(sonda!.prosrc).toBe('');
+
+      const culpables = funciones
+        .filter((f) => culpable(sinComentarios(f.cuerpo as string)))
+        .map((f) => f.nombre as string)
+        .filter((n) => !(n in DECLARADAS));
+      // La sonda sale por el MISMO recorrido que protege: si la consulta vuelve a `prosrc`,
+      // desaparece de aquí y este caso se pone rojo.
+      expect(culpables).toContain('censo_probe_sqlbody');
+      expect(culpables.filter((n) => n !== 'censo_probe_sqlbody')).toEqual([]);
     } finally {
       await admin`drop function censo_probe_sqlbody()`;
     }
@@ -140,6 +161,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * palabra: verde porque no estaba buscando nada.
      */
     const admin = sqlAdmin();
+    // La sonda de vistas materializadas se crea ANTES de capturar las categorías y sale por el
+    // MISMO recorrido que protege, por lo mismo que la de cuerpos SQL estándar: una consulta
+    // aparte no protegería la del censo. Con cero matviews reales, es lo único que distingue
+    // «no hay ninguna» de «no estoy mirando».
+    await admin`create materialized view censo_tmp_matview as select current_date as d`;
+    try {
     const categorias = {
       vista: await admin`select viewname as nombre, definition as cuerpo
         from pg_views where schemaname = 'public'`,
@@ -160,36 +187,27 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         from pg_matviews where schemaname = 'public'`,
     };
 
-    /* Lo que cada categoría tiene que estar mirando para que su verde signifique algo. La
-     * de vistas materializadas va a CERO a propósito —hoy no hay ninguna— y por eso su rama
-     * se comprueba abajo fabricando una, que es la única forma de saber que funciona. */
+    /* Lo que cada categoría tiene que estar mirando para que su verde signifique algo. */
     const MINIMO: Record<keyof typeof categorias, number> = {
       vista: 1,
       check: 100,
       default: 100,
-      matview: 0,
+      // Uno: el que fabrica la sonda. Hoy no hay ninguna real, y por eso su rama se comprueba
+      // con ella en vez de con un conteo — cero es el conteo correcto y no prueba nada.
+      matview: 1,
     };
-    for (const [nombre, filas] of Object.entries(categorias)) {
-      expect(filas.length, `la rama «${nombre}» no está mirando nada`).toBeGreaterThanOrEqual(
-        MINIMO[nombre as keyof typeof categorias],
-      );
-      const culpables = filas
-        .filter((o) => culpable(o.cuerpo as string))
-        .map((o) => `${nombre} ${o.nombre as string}`)
-        .filter((n) => !(n in DECLARADAS));
-      expect(culpables).toEqual([]);
-    }
-
-    // Y la rama de materializadas se comprueba de verdad: con cero filas, un `select` roto
-    // daría el mismo verde que uno correcto. Se fabrica una culpable y se exige que la vea.
-    await admin`create materialized view censo_tmp_matview as select current_date as d`;
-    try {
-      const vistas = await admin`select matviewname as nombre, definition as cuerpo
-        from pg_matviews where schemaname = 'public'`;
-      const pilladas = vistas
-        .filter((o) => culpable(o.cuerpo as string))
-        .map((o) => o.nombre as string);
-      expect(pilladas).toEqual(['censo_tmp_matview']);
+      for (const [nombre, filas] of Object.entries(categorias)) {
+        expect(filas.length, `la rama «${nombre}» no está mirando nada`).toBeGreaterThanOrEqual(
+          MINIMO[nombre as keyof typeof categorias],
+        );
+        const culpables = filas
+          .filter((o) => culpable(o!.cuerpo as string))
+          .map((o) => `${nombre} ${o!.nombre as string}`)
+          .filter((n) => !(n in DECLARADAS));
+        // La única culpable admitida es la sonda, y tiene que ESTAR: si la rama de matviews
+        // deja de devolver filas, desaparece de aquí y este caso se pone rojo.
+        expect(culpables).toEqual(nombre === 'matview' ? ['matview censo_tmp_matview'] : []);
+      }
     } finally {
       await admin`drop materialized view censo_tmp_matview`;
     }
@@ -210,19 +228,29 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * legítimo para construir un caso.
      */
     const { readdir, readFile } = await import('node:fs/promises');
-    const raiz = new URL('../../', import.meta.url).pathname;
+    // Desde la RAÍZ del repositorio y no desde `src/`: hay TypeScript de producción fuera de
+    // `src/` —`serve.ts` es el entrypoint del servidor y ya lleva plantillas SQL—, y con el
+    // recorrido empezando en `src/` quedaba fuera del censo mientras el mínimo de ficheros se
+    // seguía cumpliendo de sobra. Un guardián que no mira el entrypoint no guarda la puerta.
+    const raiz = new URL('../../../', import.meta.url).pathname.replace(/\/$/, '');
+    /* Lo que se salta, con su motivo: dependencias y artefactos no son código de este
+     * repositorio, y en los tests `current_date` es legítimo para construir un caso. */
+    const FUERA = new Set(['node_modules', '.git', 'dist', 'build', '.output', '.vinxi',
+      '.nitro', 'coverage', '__tests__']);
     const ficheros: string[] = [];
     const recorrer = async (dir: string) => {
       for (const e of await readdir(dir, { withFileTypes: true })) {
         const ruta = `${dir}/${e.name}`;
         if (e.isDirectory()) {
-          if (e.name !== '__tests__') await recorrer(ruta);
+          if (!FUERA.has(e.name)) await recorrer(ruta);
         } else if (e.name.endsWith('.ts') || e.name.endsWith('.tsx')) ficheros.push(ruta);
       }
     };
-    await recorrer(raiz.replace(/\/$/, ''));
+    await recorrer(raiz);
     // Que el censo esté mirando algo, y no un directorio que alguien movió.
     expect(ficheros.length).toBeGreaterThan(50);
+    // Y que alcance de verdad la raíz: `serve.ts` es el fichero que se le escapaba.
+    expect(ficheros.map((f) => f.slice(raiz.length + 1))).toContain('serve.ts');
 
     const culpables: string[] = [];
     for (const f of ficheros) {
@@ -231,7 +259,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       const codigo = (await readFile(f, 'utf8'))
         .replace(/\/\*[\s\S]*?\*\//g, '')
         .replace(/\/\/[^\n]*/g, '');
-      if (culpable(codigo)) culpables.push(f.slice(raiz.length));
+      if (culpable(codigo)) culpables.push(f.slice(raiz.length + 1));
     }
     expect(culpables.filter((c) => !(c in DECLARADAS))).toEqual([]);
   });

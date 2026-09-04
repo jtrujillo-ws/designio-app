@@ -19,6 +19,7 @@ import { describeAuthz } from './helpers';
 describeAuthz('el calendario de las garantías lo fija la base', () => {
   afterAll(async () => {
     await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
+    await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
     await cerrarPools();
   });
 
@@ -198,6 +199,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
     await sqlAdmin().unsafe(
       'create table censo_probe_escritura (k int primary key, d date, ts timestamptz)',
+    );
+    /*
+     * Y una SEGUNDA tabla con una columna que se llama igual y tiene otro tipo. Existe para
+     * una sola sonda, la que comprueba que la culpa no se atribuye a la tabla equivocada: sin
+     * dos tablas donde el mismo nombre de columna signifique cosas distintas, ese caso no se
+     * puede escribir.
+     */
+    await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
+    await sqlAdmin().unsafe(
+      'create table censo_probe_otra (k int primary key, d timestamptz)',
     );
     /*
      * Los relojes que son FUNCIONES se derivan del catálogo en vez de escribirlos: cualquier
@@ -1443,7 +1454,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         // +2: uno por el paréntesis que abre y otro por el que cierra.
         const cola = texto.slice(abre + dentro.length + 2);
         const enConflicto =
-          /^\s*on\s+conflict\b[\s\S]*?\bdo\s+update\s+set\s+([\s\S]*?)(?=\s+(?:where|returning)\b|;|$)/i.exec(
+          // El salto hasta el `do update` no cruza un `;`: si lo cruzara, un
+          // `on conflict … do nothing;` seguido de un `update` de OTRA tabla se leería como
+          // si el `set` de aquél fuera de ésta, y la culpa saldría atribuida a quien no es.
+          /^\s*on\s+conflict\b[^;]*?\bdo\s+update\s+set\s+([^;]*?)(?=\s+(?:where|returning)\b|;|$)/i.exec(
             cola,
           );
         if (enConflicto && asignacionCulpable(tabla, enConflicto[1]!)) return true;
@@ -3323,6 +3337,27 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           " insert into censo_probe_escritura(k, d) values (1, date '2020-01-01')" +
           ' on conflict (k) do update set d = now(); end $c$',
       ],
+      /*
+       * Y la que comprueba que la culpa va a la tabla que TOCA. Las dos sentencias son
+       * seguras por separado: la primera resuelve su conflicto sin escribir nada y la segunda
+       * escribe el reloj en una columna que SÍ lleva huso. Pero el salto desde `on conflict`
+       * hasta un `do update set` no puede cruzar el `;`: si lo cruza, el `set d = …` de la
+       * segunda se lee como si fuera de la tabla de la primera, donde `d` es un `date`, y sale
+       * un culpable que no existe. Es un falso positivo, que en un guardián cuesta lo mismo
+       * que un hueco: se acaba desactivando.
+       *
+       * Por eso la segunda tabla tiene una columna que se llama IGUAL y significa otra cosa.
+       * Sin eso el caso no se puede escribir: la atribución equivocada daría el mismo
+       * veredicto que la correcta y la sonda pasaría por los dos motivos.
+       */
+      [
+        'censo_probe_ok_conflicto_otra_tabla',
+        'returns void language plpgsql as $c$ begin' +
+          " insert into censo_probe_escritura(k, ts) values (1, timestamptz '2020-01-01Z')" +
+          ' on conflict (k) do nothing;' +
+          " insert into censo_probe_otra(k, d) values (1, timestamptz '2020-01-01Z')" +
+          ' on conflict (k) do update set d = now(); end $c$',
+      ],
       [
         'censo_probe_ok_conflicto_instante',
         'returns void language plpgsql as $c$ begin' +
@@ -3566,6 +3601,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_update_date',
         'censo_probe_conflicto_date',
         'censo_probe_ok_conflicto_instante',
+        'censo_probe_ok_conflicto_otra_tabla',
         'censo_probe_ok_insert_instante',
         'censo_probe_ok_insert_huso_fijo',
         'censo_probe_ok_decl_constant_instante',

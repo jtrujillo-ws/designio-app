@@ -45,6 +45,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * (medido: `' NOW '::date` y `'NOW'::date` son la misma lectura), así que aquí igual.
    */
   const ESPECIAL_TEMPORAL = /^\s*(?:now|today|tomorrow|yesterday)\s*$/i;
+  /*
+   * Y el nombre de un tipo tal como lo ESCRIBE el catálogo, que es la otra mitad de esa misma
+   * lección: `format_type` devuelve `timestamp without time zone`, no `timestamp`, y la
+   * precisión va dentro del nombre. La regla es la misma que ya se mide arriba —un valor de
+   * reloj es independiente del huso si su tipo LLEVA huso— escrita aquí sobre el nombre en vez
+   * de sobre la palabra.
+   */
+  const SIN_HUSO_DECLARADO =
+    /^\s*(?:date|(?:timestamp|time)(?:\s*\(\s*\d+\s*\))?(?:\s+without\s+time\s+zone)?)\s*$/i;
   const PALABRAS_DEL_RELOJ = [
     // De más larga a más corta: con `current_time` delante, la alternación la casaba dentro
     // de `current_timestamp` y el resto quedaba suelto. (Con la frontera derecha puesta ya no
@@ -144,6 +153,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   /** Los dos patrones que LEEN el literal: van contra el texto SIN vaciar. */
   let RELOJ_LEYENDO_LITERAL: RegExp[] = [];
   let DEL_HUSO_DE_LA_SESION: RegExp;
+  /*
+   * Y los dos que NO se pueden decidir mirando la expresión, porque lo decisivo está FUERA de
+   * ella: el TIPO del destino. Van aparte por eso, y no porque sean otra clase de reloj.
+   */
+  let RELOJ_ENTREGADO: RegExp[] = [];
+  let RELOJ_ASIGNADO_A_VARIABLE: (texto: string) => boolean = () => false;
 
   beforeAll(async () => {
     /*
@@ -933,6 +948,69 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        */
       new RegExp(String.raw`${nombreDeFuncion('age')}\s*\(\s*${PRIMER_ARGUMENTO}\)`, 'i'),
     ];
+
+    /*
+     * Y los dos reconocedores del destino TIPADO, que es lo que la expresión no dice.
+     *
+     * El primero: dónde se ENTREGA un valor al tipo declarado de fuera. Son tres posiciones y
+     * las tres se miden: `return now();` en un cuerpo plpgsql, `select now()` como cuerpo SQL
+     * —las dos formas, la antigua entre dólares y la nueva `RETURN now()`, que el catálogo
+     * guarda SIN cast (comprobado)— y la expresión entera, que es como llega un `default`.
+     * Las tres dan 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12 con
+     * `returns date`, y las tres son un `now()` desnudo en el texto.
+     *
+     * El reloj tiene que ser TERMINAL en su posición: si detrás hay algo más —un cast, una
+     * coma, un `into`— la coerción implícita ya no es lo que decide, y lo que decida ya lo
+     * miran los demás patrones. Por eso el fin de expresión es una aserción y no un consumo.
+     *
+     * Con una salida: el `from`. `select now() from t` entrega el mismo valor al mismo tipo
+     * declarado —medido, 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12 con
+     * `returns date`— y sin admitirlo bastaba escribir un `from` para salirse. Un `into` NO es
+     * salida, y la asimetría es a propósito: ahí el destino es la variable, y de eso se ocupa
+     * el reconocedor de al lado.
+     */
+    const FIN_DE_EXPRESION = String.raw`(?=\s*(?:;|\$|$)|\s+from\b)`;
+    RELOJ_ENTREGADO = [
+      new RegExp(
+        String.raw`\breturn\s+(?:query\s+select\s+)?(?:${RELOJ})${FIN_DE_EXPRESION}`,
+        'i',
+      ),
+      new RegExp(String.raw`\bselect\s+(?:${RELOJ})${FIN_DE_EXPRESION}`, 'i'),
+      new RegExp(String.raw`^\s*(?:${RELOJ})\s*$`, 'i'),
+    ];
+
+    /*
+     * El segundo no necesita que nadie le pase el tipo, porque lo declara el propio texto: una
+     * VARIABLE plpgsql. `declare d date; begin d := now(); …` guarda el día del huso de quien
+     * llama —medido, 09-05 contra 09-04— y en el texto solo hay, otra vez, un `now()` desnudo.
+     *
+     * Se leen los nombres declarados con un tipo sin huso y se busca la asignación a UNO DE
+     * ELLOS, en las dos formas que tiene plpgsql: `:=` y `select … into`. Buscar la asignación
+     * sin la declaración marcaría `v := now()` sobre una variable `timestamptz`, que es
+     * correcto; buscar la declaración sin la asignación marcaría una variable que solo se lee.
+     *
+     * LÍMITE DECLARADO: el reconocedor de declaraciones no distingue el bloque `declare` del
+     * resto del cuerpo, así que puede recoger un nombre de más —`cast(x as date);` daría «as»—.
+     * No importa mientras ese nombre no aparezca además asignándose un reloj, que es lo que se
+     * marca; queda dicho aquí en vez de descubrirse. Y las variables de un bloque ANIDADO se
+     * mezclan con las de fuera, que es de más y no de menos.
+     */
+    const DECLARADAS_SIN_HUSO = new RegExp(
+      String.raw`\b(\w+)\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*(?::=|;|:)`,
+      'gi',
+    );
+    RELOJ_ASIGNADO_A_VARIABLE = (texto: string): boolean => {
+      const nombres = [...texto.matchAll(DECLARADAS_SIN_HUSO)].map((m) => m[1]!);
+      if (nombres.length === 0) return false;
+      const cualquiera = nombres.map((n) => n.replace(/[^\w]/g, '')).join('|');
+      return (
+        new RegExp(String.raw`\b(?:${cualquiera})\s*:=\s*(?:${RELOJ})\s*;`, 'i').test(texto) ||
+        new RegExp(
+          String.raw`\bselect\s+(?:${RELOJ})\s+into\s+(?:strict\s+)?(?:${cualquiera})\b`,
+          'i',
+        ).test(texto)
+      );
+    };
   });
 
   /** Lo que hace culpable a un cuerpo: la palabra clave o cualquiera de las operaciones. */
@@ -945,13 +1023,34 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * demás, contra el texto con los literales vacíos, porque una palabra del reloj dentro de un
    * literal es un dato y no una lectura del calendario.
    */
-  const culpable = (crudo: string, dialecto: 'sql' | 'ts' = 'sql'): boolean => {
+  /*
+   * El `tipoDeclarado` es lo que la EXPRESIÓN NO DICE. Postgres coerciona sin que nadie
+   * escriba un cast: una función `returns date` cuyo cuerpo es `return now()` devuelve el día
+   * del huso de quien llama —medido: 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en
+   * Etc/GMT+12— y en el texto solo hay un `now()` desnudo, que este censo declara seguro y con
+   * razón. Lo mismo un `default now()` sobre una columna `date`, que el catálogo guarda como
+   * `now()` a secas (comprobado) y coerciona en cada `INSERT`.
+   *
+   * O sea que había una familia entera invisible, y no porque el reconocedor fuera corto: el
+   * dato que decide no está en lo que el reconocedor lee. Quien llama a `culpable` sobre algo
+   * cuyo destino tiene tipo —una función por su `prorettype`, un default por el tipo de su
+   * columna— lo pasa, y quien no lo tiene lo omite.
+   */
+  const culpable = (
+    crudo: string,
+    dialecto: 'sql' | 'ts' = 'sql',
+    tipoDeclarado?: string,
+  ): boolean => {
     const conLiterales = sinComentarios(crudo, dialecto);
     const sinLiterales = sinComentarios(crudo, dialecto, true);
     return (
       DEL_HUSO_DE_LA_SESION.test(sinLiterales) ||
       RELOJ_COLAPSADO_A_DIA.some((r) => r.test(sinLiterales)) ||
       RELOJ_LEYENDO_LITERAL.some((r) => r.test(conLiterales)) ||
+      (tipoDeclarado !== undefined &&
+        SIN_HUSO_DECLARADO.test(tipoDeclarado) &&
+        RELOJ_ENTREGADO.some((r) => r.test(sinLiterales))) ||
+      RELOJ_ASIGNADO_A_VARIABLE(sinLiterales) ||
       /*
        * Y el SQL DINÁMICO: `execute 'select now()::date'` guarda la operación DENTRO de un
        * literal, que el vaciado se lleva por delante. La función depende del huso de quien la
@@ -2550,11 +2649,56 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "create function censo_probe_literal_reloj() returns void language plpgsql as $c$ " +
         "begin perform 'today'::date; end $c$",
     );
+    /*
+     * Y las sondas del DESTINO TIPADO, que son las únicas de este fichero donde el cuerpo, por
+     * sí solo, es CORRECTO: `begin return now(); end` no tiene nada que marcar hasta que se
+     * sabe qué tipo declara la firma. Por eso van en pares —la misma expresión con `date` y
+     * con `timestamptz`— y por eso ninguna sonda de texto podía sostenerlas: lo que decide no
+     * está en el texto que se le pasa al reconocedor.
+     *
+     * Las cinco culpables son las cinco formas medidas de entregar un reloj a un tipo sin
+     * huso, todas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12: el
+     * `return` de plpgsql, la asignación a una variable declarada, el `select … into`, el
+     * cuerpo SQL antiguo y el nuevo —que el catálogo guarda como `RETURN now()`, sin cast—.
+     * Las dos seguras son las mismas expresiones devolviendo el instante, que es lo que hacen
+     * bien las funciones de este esquema y no puede enrojecer.
+     */
+    for (const [nombre, sql] of [
+      ['censo_probe_devuelve_date', 'returns date language plpgsql as $c$ begin return now(); end $c$'],
+      [
+        'censo_probe_variable_date',
+        'returns date language plpgsql as $c$ declare d date; begin d := now(); return d; end $c$',
+      ],
+      [
+        'censo_probe_into_date',
+        'returns date language plpgsql as $c$ declare d date; begin select now() into d; return d; end $c$',
+      ],
+      ['censo_probe_cuerpo_viejo_date', 'returns date language sql stable as $c$ select now() $c$'],
+      [
+        'censo_probe_cuerpo_from_date',
+        'returns date language sql stable as $c$ select now() from generate_series(1, 1) $c$',
+      ],
+      ['censo_probe_cuerpo_nuevo_date', 'returns date language sql stable return now()'],
+      [
+        'censo_probe_devuelve_instante',
+        'returns timestamptz language plpgsql as $c$ begin return now(); end $c$',
+      ],
+      [
+        'censo_probe_variable_instante',
+        'returns timestamptz language plpgsql as $c$ declare d timestamptz; begin d := now(); return d; end $c$',
+      ],
+    ] as const) {
+      await admin.unsafe(`create function ${nombre}() ${sql}`);
+    }
     try {
       // `pg_get_functiondef` y no `prosrc`, y `prokind = 'f'` porque aquél no acepta
       // agregados ni funciones de ventana.
       const funciones = await admin`
-        select p.proname as nombre, pg_get_functiondef(p.oid) as cuerpo, p.prosrc
+        select p.proname as nombre, pg_get_functiondef(p.oid) as cuerpo, p.prosrc,
+               -- El TIPO DE VUELTA, que es lo que la expresión no dice: una funcion
+               -- que devuelve date con un now() desnudo dentro coerciona con el huso de
+               -- quien llama, y en el texto no hay ningun cast que mirar.
+               format_type(p.prorettype, null) as tipo
         from pg_proc p
         join pg_namespace n on n.oid = p.pronamespace
         join pg_language l on l.oid = p.prolang
@@ -2572,7 +2716,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       expect(funciones.find((f) => f.nombre === 'censo_probe_castop')!.prosrc).toBe('');
 
       const culpables = funciones
-        .filter((f) => culpable(f.cuerpo as string))
+        .filter((f) => culpable(f.cuerpo as string, 'sql', f.tipo as string))
         .map((f) => f.nombre as string)
         .filter((n) => !(n in DECLARADAS));
       // Exactamente las peligrosas y ninguna más: si un patrón se rompe, su sonda desaparece
@@ -2585,6 +2729,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_procedimiento',
           'censo_probe_bloque_anidado',
           'censo_probe_literal_reloj',
+          'censo_probe_devuelve_date',
+          'censo_probe_variable_date',
+          'censo_probe_into_date',
+          'censo_probe_cuerpo_viejo_date',
+          'censo_probe_cuerpo_from_date',
+          'censo_probe_cuerpo_nuevo_date',
         ].sort(),
       );
     } finally {
@@ -2594,6 +2744,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       await admin`drop procedure censo_probe_procedimiento()`;
       await admin`drop function censo_probe_bloque_anidado()`;
       await admin`drop function censo_probe_literal_reloj()`;
+      for (const nombre of [
+        'censo_probe_devuelve_date',
+        'censo_probe_variable_date',
+        'censo_probe_into_date',
+        'censo_probe_cuerpo_viejo_date',
+        'censo_probe_cuerpo_from_date',
+        'censo_probe_cuerpo_nuevo_date',
+        'censo_probe_devuelve_instante',
+        'censo_probe_variable_instante',
+      ]) {
+        await admin.unsafe(`drop function ${nombre}()`);
+      }
     }
   });
 
@@ -2647,6 +2809,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       language plpgsql as $$ begin return new; end $$`;
     await admin`create trigger censo_tmp_trg before insert on censo_tmp_tabla
       for each row when (new.f > current_date) execute function censo_tmp_guard()`;
+    /*
+     * Y el DEFAULT tipado, que es la otra mitad de la coerción implícita y la que ninguna sonda
+     * de texto puede enseñar: el catálogo guarda `now()` a secas en las dos columnas
+     * (comprobado con `pg_get_expr`), y lo que las separa es el TIPO. Medido insertando en las
+     * dos: la de `date` da 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12; la de
+     * `timestamptz` guarda el mismo instante. La segunda columna no es adorno: sin ella, una
+     * regla que marcara cualquier `default now()` pasaría esta sonda igual y estaría rompiendo
+     * el patrón correcto que usa medio esquema.
+     */
+    await admin`create table censo_tmp_defecto (d date default now(), t timestamptz default now())`;
     // Y una REGLA de reescritura, por lo mismo que la matview: hoy no hay ninguna real
     // (medido: cero), así que sin sonda su rama estaría en verde por no mirar nada.
     await admin`create table censo_tmp_regla_log (d date)`;
@@ -2663,7 +2835,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         from pg_constraint c join pg_namespace n on n.oid = c.connamespace
         where n.nspname = 'public' and c.contype = 'c'`,
       default: await admin`select a.attrelid::regclass || '.' || a.attname as nombre,
-             pg_get_expr(d.adbin, d.adrelid) as cuerpo
+             pg_get_expr(d.adbin, d.adrelid) as cuerpo,
+             -- Y aquí el tipo de la COLUMNA, por lo mismo: el catálogo guarda
+             -- default now() tal cual sobre una columna date (comprobado) y la
+             -- coerción la hace cada INSERT con el huso de quien inserta.
+             format_type(a.atttypid, a.atttypmod) as tipo
         from pg_attribute a
         join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
         join pg_class rel on rel.oid = a.attrelid
@@ -2713,7 +2889,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           MINIMO[nombre as keyof typeof categorias],
         );
         const culpables = filas
-          .filter((o) => culpable(o!.cuerpo as string))
+          .filter((o) => culpable(o!.cuerpo as string, 'sql', o!.tipo as string | undefined))
           .map((o) => `${nombre} ${o!.nombre as string}`)
           .filter((n) => !(n in DECLARADAS));
         // La única culpable admitida es la sonda, y tiene que ESTAR: si la rama de matviews
@@ -2721,6 +2897,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         // La única culpable admitida por categoría es su sonda, y tiene que ESTAR: si la
         // rama deja de devolver filas o mira la columna equivocada, desaparece de aquí.
         const esperadas: Record<string, string[]> = {
+          default: ['default censo_tmp_defecto.d'],
           matview: ['matview censo_tmp_matview'],
           trigger: ['trigger censo_tmp_trg on censo_tmp_tabla'],
           regla: ['regla censo_tmp_tabla / censo_tmp_regla'],
@@ -2731,6 +2908,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       await admin`drop materialized view censo_tmp_matview`;
       await admin`drop table censo_tmp_tabla cascade`;
       await admin`drop table censo_tmp_regla_log cascade`;
+      await admin`drop table censo_tmp_defecto cascade`;
       await admin`drop function censo_tmp_guard()`;
     }
   });

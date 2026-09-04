@@ -1307,7 +1307,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * dentro de paréntesis y ahí no se toca. Y solo si queda algo delante, para que
      * `select current_date` no se convierta en la cadena vacía.
      */
-    const NOMBRE_LLANO = String.raw`(?:"(?:[^"]|"")+"|[A-Za-z_]\w*)`;
+    /*
+     * Un ALIAS admite las mismas tres ortografías que cualquier nombre SQL, la Unicode
+     * incluida: `select now() as U&"\\0064"` es válido y nombra la columna `d` —medido,
+     * 2026-09-05 contra 2026-09-04—. Con la forma desnuda y la entrecomillada solamente, el
+     * alias no se quitaba y la hoja no era ningún reloj.
+     */
+    const NOMBRE_LLANO =
+      String.raw`(?:[Uu]&"(?:[^"]|"")*"(?:\s+uescape\s+'.')?|"(?:[^"]|"")+"|[A-Za-z_]\w*)`;
     const CON_ALIAS = new RegExp(String.raw`^([\s\S]*?\S)\s+(?:as\s+)?(${NOMBRE_LLANO})$`, 'i');
     const profundidad = (t: string): number => {
       let nivel = 0;
@@ -1326,9 +1333,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     const nombreProyectado = (e: string): string | null => {
       const t = e.trim();
       const m = CON_ALIAS.exec(t);
-      if (m !== null && aNivelCero(m[1]!)) return sinComillas(m[2]!).toLowerCase();
-      return new RegExp(String.raw`^${NOMBRE_LLANO}$`).test(t)
-        ? sinComillas(t).toLowerCase()
+      if (m !== null && aNivelCero(m[1]!)) return nombreCanonico(m[2]!);
+      /*
+       * Y la proyección de fuera puede venir CALIFICADA por el alias de la subconsulta —
+       * `select s.d from (select now() d) s`, medido con el mismo par—. El calificador se
+       * descarta en quien llama, porque la subconsulta es una sola; aquí solo hace falta que
+       * el nombre llegue en vez de perderse por no ser un identificador llano.
+       */
+      return new RegExp(String.raw`^${NOMBRE_LLANO}(?:\s*\.\s*${NOMBRE_LLANO})?$`).test(t)
+        ? t
+            .split('.')
+            .map((parte) => nombreCanonico(parte))
+            .join('.')
         : null;
     };
     /*
@@ -1602,9 +1618,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * Va por la CLÁUSULA y no por la sentencia, así que vale para las tres que admiten
      * `RETURNING` —`insert`, `update`, `delete`— sin escribir ninguna: medido también sobre
      * `insert … values (…) returning now() into d`, con el mismo par de fechas.
+     *
+     * Son DOS patrones y no una alternación, porque una alternación se queda con el primero
+     * que aparezca y el `into` es uno solo: en `insert into t(k, d) select 1, timestamptz
+     * '2020-01-01' returning now() into d`, empezar por el `select` empareja `d` con `1` y no
+     * vuelve a intentarlo desde el `returning`. La columna escrita ahí lleva huso, así que
+     * ningún otro reconocedor lo veía. Medido: 2026-09-05 contra 2026-09-04.
      */
-    const PARES_INTO =
-      String.raw`\b(?:select|returning)\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`;
+    const PARES_INTO = ['select', 'returning'].map(
+      (clausula) =>
+        String.raw`\b${clausula}\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`,
+    );
 
     /** Un nombre listo para meterse en una expresión regular sin significar otra cosa. */
     const escapado = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1705,7 +1729,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * parten las dos listas y se emparejan, que es lo que hace plpgsql.
        */
       const entradas = [
-        ...texto.matchAll(new RegExp(PARES_INTO, 'gi')),
+        ...PARES_INTO.flatMap((r) => [...texto.matchAll(new RegExp(r, 'gi'))]),
       ].flatMap((m) => {
         /*
          * Los destinos se cortan donde empiezan las cláusulas del `select`. Sin eso,
@@ -1717,7 +1741,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * sonda la cubría, porque las dos que había del `into` no llevan `from`. La nueva sí.
          */
         const destinos = argumentosDe(hastaLaClausula(m[2]!)).map((d) => sinComillas(d.trim()));
-        const valores = argumentosDe(m[1]!).map(sinAlias);
+        const valores = argumentosDe(hastaLaClausula(m[1]!)).map(sinAlias);
         return destinos
           .map((d, i) => (nombres.includes(d) ? valores[i] : undefined))
           .filter((v): v is string => v !== undefined);
@@ -2146,11 +2170,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * `declare v t.d%type; begin select now() into v; …` da 2026-09-05 en
          * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
          */
-        for (const a of texto.matchAll(new RegExp(PARES_INTO, 'gi'))) {
+        for (const a of PARES_INTO.flatMap((r) => [...texto.matchAll(new RegExp(r, 'gi'))])) {
           const destinos = argumentosDe(hastaLaClausula(a[2]!)).map((d) =>
             sinComillas(d.trim()).toLowerCase(),
           );
-          const valores = argumentosDe(a[1]!).map(sinAlias);
+          const valores = argumentosDe(hastaLaClausula(a[1]!)).map(sinAlias);
           const i = destinos.indexOf(sinComillas(m[1]!.trim()).toLowerCase());
           if (i >= 0 && valores[i] !== undefined && entrega(tabla, columna, valores[i]!))
             return true;
@@ -4644,6 +4668,37 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        *   d[1] := now()   con `d date[]`              la asignación a un elemento
        *   as $$ values (now()) $$                     el cuerpo que entrega con VALUES
        */
+      /*
+       * Y cuatro formas que salieron de revisar lo de arriba, las cuatro medidas 2026-09-05 en
+       * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   insert … select … returning now() into d   el `select` se comía la coincidencia
+       *   select s.d from (select now() d) s         la proyección calificada
+       *   select now() as U&"\\0064"                  el alias por puntos de código
+       *   select d from (select now() as U&"\\0064") s   y el mismo alias, resuelto por nombre
+       *
+       * La primera escribe en una columna CON huso a propósito: así ningún otro reconocedor la
+       * caza y lo que se prueba es el emparejamiento del `into`, no otra cosa.
+       */
+      [
+        'censo_probe_returning_tras_select_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          " insert into censo_probe_otra(k, d) select 1, timestamptz '2020-01-01'" +
+          ' returning now() into d; return d; end $c$',
+      ],
+      [
+        'censo_probe_derivada_calificada_date',
+        'returns date language sql stable as $c$ select s.d from (select now() d) s $c$',
+      ],
+      [
+        'censo_probe_alias_unicode_date',
+        'returns date language sql stable as $c$ select now() as U&"\\0064" $c$',
+      ],
+      [
+        'censo_probe_derivada_unicode_date',
+        'returns date language sql stable as $c$ select d from' +
+          ' (select now() as U&"\\0064") s $c$',
+      ],
       [
         'censo_probe_overriding_date',
         'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
@@ -5071,6 +5126,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_parametro_default_date',
           'censo_probe_tabla_unicode_date',
           'censo_probe_returning_into_date',
+          'censo_probe_returning_tras_select_date',
+          'censo_probe_derivada_calificada_date',
+          'censo_probe_alias_unicode_date',
+          'censo_probe_derivada_unicode_date',
           'censo_probe_overriding_date',
           'censo_probe_conflicto_select_date',
           'censo_probe_arreglo_variable_date',
@@ -5187,6 +5246,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_derivada_otra_columna',
         'censo_probe_ok_alias_fecha_fija',
         'censo_probe_returning_into_date',
+        'censo_probe_returning_tras_select_date',
+        'censo_probe_derivada_calificada_date',
+        'censo_probe_alias_unicode_date',
+        'censo_probe_derivada_unicode_date',
         'censo_probe_overriding_date',
         'censo_probe_conflicto_select_date',
         'censo_probe_arreglo_variable_date',

@@ -711,6 +711,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         String.raw`date_part\s*\(\s*(?!${unidadSegura(CAMPOS_SEGUROS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})`,
         'i',
       ),
+      /*
+       * `age(x)` con UN argumento, que es el único de esta lista donde el reloj no se escribe:
+       * lo pone Postgres. La documentación dice «resta el argumento de current_date (a
+       * medianoche)», y medido sobre el mismo instante sale `8 mons 3 days 10:00:00` en
+       * Kiritimati y `8 mons 3 days 12:00:00` en Etc/GMT+12. Una regla escrita como
+       * `age(vence_en) > interval '30 days'` cambia de respuesta con la sesión igual que
+       * `current_date`, y por eso no hacía falta que hubiera un reloj a la vista para marcarla:
+       * la peligrosa es la FORMA de un solo argumento.
+       *
+       * Con DOS argumentos no hay calendario que leer —los dos instantes vienen dados, medido
+       * idéntico en los dos husos— y no se marca. Los separa `PRIMER_ARGUMENTO`, que no cruza
+       * comas de primer nivel: si detrás del primer argumento hay `)`, era uno solo.
+       *
+       * Hoy `age` no aparece en el repositorio. Entra igual, que es para lo que existe un censo
+       * y no una lista de hallazgos: la garantía que lo use mañana ya nace vigilada.
+       */
+      new RegExp(String.raw`\bage\s*\(\s*${PRIMER_ARGUMENTO}\)`, 'i'),
     ];
   });
 
@@ -1282,6 +1299,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'date',
       culpable: false,
     },
+    // La edad contra HOY, que es el reloj que no se escribe: lo pone `age` con un solo
+    // argumento. Medido: 10:00:00 en Kiritimati y 12:00:00 en Etc/GMT+12 sobre el mismo
+    // instante.
+    censo_probe_edad: { expr: "age(timestamptz '2020-01-01 00:00:00+00')", tipo: 'interval', culpable: true },
+    // Y con los DOS instantes dados no hay calendario que leer: medido idéntico en los dos.
+    censo_probe_ok_edad_dos: {
+      expr: "age(now(), timestamptz '2020-01-01 00:00:00+00')",
+      tipo: 'interval',
+      culpable: false,
+    },
     // `epoch` es el instante absoluto: medido, no cambia con el huso.
     censo_probe_ok_epoch: {
       expr: 'extract(epoch from now())::bigint',
@@ -1304,6 +1331,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * ejercitaba nada.
      */
     const PELIGROSAS = [
+      // La edad contra HOY, sin ningún reloj escrito: la forma de un solo argumento basta.
+      'age(vence_en)',
+      "select age(t.creado_en) > interval '30 days' from t",
+      'pg_catalog.age(vence_en)',
       // El nombre del tipo ENTRECOMILLADO, y el del esquema. Las tres medidas: 2026-09-05 en
       // Kiritimati y 2026-09-04 en Etc/GMT+12, igual que sin comillas. El catálogo tampoco
       // produce esta forma —deparsea el nombre desnudo—, así que solo el reconocedor la cubre.
@@ -1582,6 +1613,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // La ida y vuelta escrita con CAST … AS, en sus dos mitades. El catálogo NUNCA produce
       // esta forma —la deparsea con `::`—, así que ninguna sonda de objeto real la cubre.
       'cast(now()::text as timestamptz)',
+      // Con los dos instantes dados, `age` no lee ningún calendario (medido). Y el nombre
+      // dentro de otro identificador tampoco: `promedio_age` y `average` no son la función.
+      'age(now(), t.creado_en)',
+      'select average(x) from t',
+      'select promedio_age(x) from t',
       // Y con el tipo de la vuelta ENTRECOMILLADO, que sigue recuperando el instante (medido
       // por epoch: 1788530625 en los dos husos). Sin reconocerlo, el censo marcaba correcto.
       'now()::text::"timestamptz"',

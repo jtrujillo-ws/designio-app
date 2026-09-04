@@ -2025,6 +2025,20 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        */
       const alias = new Map<string, string>();
       /**
+       * Las llamadas a `conUsuario` que el censo ha llegado a ANALIZAR.
+       *
+       * Enumerar las formas de exportar era perseguir el caso: van cuatro puertas cerradas
+       * —el modificador, la cláusula, el callback por nombre, el alias— y probando salieron
+       * dos más, un objeto (`export const api = { panel: leerPanel }`) y una
+       * desestructuración. La lista no se acaba.
+       *
+       * Así que la pregunta se invierte, igual que con las unidades del otro censo: en vez de
+       * enumerar por dónde puede salir una proyección, se exige que **toda** transacción del
+       * fichero haya sido mirada por alguien. La que no, se nombra. Cierra la clase entera,
+       * incluidas las formas que nadie ha inventado todavía.
+       */
+      const alcanzadas = new Set<TS.CallExpression>();
+      /**
        * Lo que envuelve a un valor sin cambiarlo: `(f) satisfies T`, `f as T`, `(f)`, `f!`.
        * Sin desenvolver, `export const p = (async (…) => conUsuario(…)) satisfies Proyeccion`
        * tiene un `SatisfiesExpression` por inicializador, no una flecha, y la rama de abajo lo
@@ -2150,7 +2164,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
          * usan salían como «callback sin resolver». El envoltorio no es un caso raro, es un
          * patrón normal, y quien lo escribe no está escondiendo nada.
          */
-        const envoltorios = new Map<string, number>();
+        const envoltorios = new Map<string, { arg: number; nodo: TS.CallExpression }>();
         for (const [nom, fn] of porNombre) {
           if (
             !ts.isFunctionDeclaration(fn) &&
@@ -2163,6 +2177,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
             ts.isIdentifier(pp.name) ? pp.name.text : undefined,
           );
           let reenvia: number | undefined;
+          let nodoInterior: TS.CallExpression | undefined;
           const mirar = (x: TS.Node) => {
             if (
               ts.isCallExpression(x) &&
@@ -2172,17 +2187,20 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
               const a1 = x.arguments[1];
               if (a1 && ts.isIdentifier(a1)) {
                 const k = params.indexOf(a1.text);
-                if (k >= 0) reenvia = k;
+                if (k >= 0) {
+                  reenvia = k;
+                  nodoInterior = x;
+                }
               }
             }
             ts.forEachChild(x, mirar);
           };
           ts.forEachChild(fn, mirar);
-          if (reenvia !== undefined) envoltorios.set(nom, reenvia);
+          if (reenvia !== undefined && nodoInterior) envoltorios.set(nom, { arg: reenvia, nodo: nodoInterior });
         }
 
         /** Cada transacción, con la posición del argumento que lleva su callback. */
-        const llamadas: { nodo: TS.CallExpression; arg: number }[] = [];
+        const llamadas: { nodo: TS.CallExpression; arg: number; abre: TS.CallExpression }[] = [];
         /*
          * Y se sigue a los AYUDANTES locales. Si la exportada delega —`return
          * cargarPanel(actorId)`— y es el ayudante quien abre la transacción, mirar solo el
@@ -2196,8 +2214,9 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         const buscar = (n: TS.Node) => {
           if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) {
             const envuelve = envoltorios.get(n.expression.text);
-            if (n.expression.text === 'conUsuario') llamadas.push({ nodo: n, arg: 1 });
-            else if (envuelve !== undefined) llamadas.push({ nodo: n, arg: envuelve });
+            if (n.expression.text === 'conUsuario') llamadas.push({ nodo: n, arg: 1, abre: n });
+            else if (envuelve !== undefined)
+              llamadas.push({ nodo: n, arg: envuelve.arg, abre: envuelve.nodo });
             else {
               const destino = porNombre.get(n.expression.text);
               if (destino && !vistos.has(destino)) {
@@ -2221,7 +2240,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return undefined;
         };
 
-        llamadas.forEach(({ nodo: llamada, arg }, i) => {
+        llamadas.forEach(({ nodo: llamada, arg, abre }, i) => {
+          alcanzadas.add(abre);
           const clave =
             llamadas.length > 1 ? `${ruta}:${nombre}#${i + 1}` : `${ruta}:${nombre}`;
           /*
@@ -2327,6 +2347,23 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           if (sentencias >= 2 && !escribe) nombradas.push(clave);
         });
       }
+      /*
+       * Y el CIERRE: toda llamada a `conUsuario` del fichero tiene que haber sido analizada.
+       * Una que no lo fue es una proyección que salió del módulo por una puerta que el censo
+       * no conoce, y el silencio es exactamente su forma de fallar.
+       */
+      const todas: TS.CallExpression[] = [];
+      const recogerLlamadas = (n: TS.Node) => {
+        if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'conUsuario') {
+          todas.push(n);
+        }
+        ts.forEachChild(n, recogerLlamadas);
+      };
+      ts.forEachChild(fuente, recogerLlamadas);
+      todas.forEach((c, i) => {
+        if (!alcanzadas.has(c)) nombradas.push(`${ruta}:conUsuario#${i + 1} (sin alcanzar)`);
+      });
+
       return nombradas;
     };
 
@@ -2497,6 +2534,24 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       // Y el alias de un alias, que es lo que exige resolver en CADENA y no un salto.
       const aliasIntermedio = leerPanelAliasado;
       export const sondaAliasDoble = aliasIntermedio;
+      // Dos formas de exportar que el censo NO conoce, y que el cierre por alcance caza sin
+      // saber nada de ellas: dentro de un objeto y por desestructuración. Salen nombradas por
+      // su posición, no por su nombre, que es lo único que se puede decir de algo que no se
+      // supo leer.
+      const leerPanelObjeto = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      export const apiSonda = { panel: leerPanelObjeto };
+      const leerPanelDes = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      export const { sondaDesestructurada } = { sondaDesestructurada: leerPanelDes };
       // Un identificador ENTRE COMILLAS DOBLES: en SQL es un NOMBRE, no un dato, pero tampoco
       // es una sentencia de escritura.
       export const sondaIdentificador = async (actorId: string) =>
@@ -2595,6 +2650,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaCadenaE',
         'sonda.ts:sondaAlias',
         'sonda.ts:sondaAliasDoble',
+        // Las dos que el censo no sabe leer: las caza el cierre por ALCANCE, no la lista de
+        // puertas. Se nombran por posición porque de algo ilegible no se puede decir más.
+        'sonda.ts:conUsuario#21 (sin alcanzar)',
+        'sonda.ts:conUsuario#22 (sin alcanzar)',
       ].sort(),
     );
 

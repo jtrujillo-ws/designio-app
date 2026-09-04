@@ -1115,6 +1115,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * llega por un `return`, llega por la ASIGNACIÓN, así que el reconocedor del destino no lo
      * ve pase lo que pase con el tipo de vuelta. Los parámetros `IN` de tipo fecha entran por
      * el mismo camino, y también es correcto: asignarles un reloj colapsa igual.
+     *
+     * LÍMITE DECLARADO, y va escrito aquí en vez de descubrirse: cuando el valor llega por una
+     * LISTA de selección y no por una asignación —`returns table(d date, n int) as $$ select
+     * now(), 1 $$`— nadie lo caza. Emparejar cada elemento de la lista con su columna declarada
+     * es un analizador de listas de selección, no un censo de texto, y sin ese emparejamiento
+     * el tipo de la columna no decide nada por sí solo. Lo que llega por asignación, que es
+     * como se escribe un `RETURNS TABLE` en plpgsql, sí está cubierto.
      */
     const DECLARADAS_SIN_HUSO = new RegExp(
       String.raw`\b(\w+)\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*(?::=|;|:|,|\))`,

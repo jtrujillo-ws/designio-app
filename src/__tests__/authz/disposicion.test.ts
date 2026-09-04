@@ -1721,11 +1721,40 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // Y el techo no puede haberse comido la otra mitad de lo que el `btrim` daba: una
     // referencia EN BLANCO mide cinco y está «entre 1 y 300», así que acotar solo la longitud
     // del valor almacenado la habría dejado entrar por este mismo camino.
-    await expect(
-      sqlAdmin()`insert into acuerdo_disposicion
-        (workspace_id, modalidad, base, efectivo_desde, acordado_por, version, acordado_rol)
-        values (${ws}, 'archivo', '     ', ${EFECTIVO_PASADO}, ${adminId}, 2,
-                'admin-cliente')`,
-    ).rejects.toThrow(/base_check/i);
+    //
+    // «En blanco» son TODOS éstos y no solo el espacio: `btrim(t)` sin segundo argumento
+    // recorta espacios y nada más, y ninguno de los otros es un control C0/C1, así que
+    // `texto_importado_limpio` los deja pasar. El `.trim()` del esquema Zod sí los quita —los
+    // cuatro—, y que la base recorte distinto que el esquema es una segunda verdad: por el
+    // camino de la aplicación la referencia se guarda de una forma y por el de SQL crudo de
+    // otra, y es la de SQL crudo la que acaba dentro del documento sellado.
+    const EN_BLANCO: Record<string, string> = {
+      espacios: ' '.repeat(5),
+      tabuladores: '\t'.repeat(5),
+      NBSP: '\u00a0'.repeat(3),
+      'espacio estrecho': '\u202f'.repeat(3),
+      'espacio ideográfico': '\u3000'.repeat(3),
+      BOM: '\ufeff'.repeat(3),
+    };
+    for (const [nombre, blanco] of Object.entries(EN_BLANCO)) {
+      await expect(
+        sqlAdmin()`insert into acuerdo_disposicion
+          (workspace_id, modalidad, base, efectivo_desde, acordado_por, version, acordado_rol)
+          values (${ws}, 'archivo', ${blanco}, ${EFECTIVO_PASADO}, ${adminId}, 2,
+                  'admin-cliente')`,
+        `una referencia hecha solo de ${nombre} entró como si dijera algo`,
+      ).rejects.toThrow(/base_check/i);
+    }
+
+    // Y el guard los recorta igual que el esquema, por el camino de la aplicación: lo que se
+    // guarda es lo mismo se llame desde donde se llame.
+    const [ok] = await conUsuario(adminId, async (tx) => {
+      return tx`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+        values (${ws}, 'archivo', ${'\u00a0\t Cláusula 9.1 \ufeff'}, ${EFECTIVO_PASADO},
+                ${adminId})
+        returning base`;
+    });
+    expect(ok!.base).toBe('Cláusula 9.1');
   });
 });

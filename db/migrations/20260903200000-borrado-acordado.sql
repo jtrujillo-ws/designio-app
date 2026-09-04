@@ -307,6 +307,28 @@ end $$;
 -- conducta correcta cuando la prueba anterior no era prueba. Fallar cerrado también cuando el
 -- que falla cerrado es el upgrade.
 
+-- ── Recortar como recorta el esquema, y no una aproximación ──────────────────────────
+-- `btrim(t)` sin segundo argumento recorta ESPACIOS y nada más. El tabulador lo deja, y
+-- `texto_importado_limpio` lo permite expresamente, así que `repeat(chr(9), 5)` medía 5,
+-- sobrevivía a `btrim` y pasaba por una referencia contractual con contenido (medido). Y no
+-- es solo el tabulador: NBSP (U+00A0), el espacio estrecho (U+202F) y hasta la BOM (U+FEFF)
+-- hacían lo mismo — ninguno es un control C0/C1, así que ninguno se filtraba.
+--
+-- El `.trim()` de JavaScript, que es lo que aplica el esquema Zod antes de llamar, SÍ quita
+-- los cuatro. Que la base y el esquema no recorten lo mismo es una segunda verdad: por el
+-- camino de la aplicación la referencia se guardaba de una forma y por el camino de SQL
+-- crudo de otra, y es la de SQL crudo la que se copia al evento y al documento sellado.
+--
+-- La clase de abajo es la de `String.prototype.trim()`, medida carácter a carácter contra
+-- esta base: `[[:space:]]` de Postgres cubre el espacio, el tabulador, VT, FF, CR, LF, los
+-- separadores Unicode (U+1680, U+2000-U+200A, U+2028, U+2029, U+205F, U+3000)… y deja fuera
+-- exactamente tres, que se añaden a mano. Una letra o un guion no entran (comprobado).
+create function texto_recortado(t text) returns text
+language sql immutable parallel safe as
+$$ select regexp_replace(t, '^[[:space:]\u00a0\u202f\ufeff]+|[[:space:]\u00a0\u202f\ufeff]+$', '', 'g') $$;
+comment on function texto_recortado(text) is
+  'Recorta el mismo conjunto de espacios que `String.prototype.trim()`, para que la base y el esquema Zod no guarden versiones distintas del mismo texto.';
+
 -- ── El acuerdo, como bitácora versionada (RF-01.9 «según el acuerdo») ─────────────────
 create table acuerdo_disposicion (
   id uuid primary key default gen_random_uuid(),
@@ -356,7 +378,8 @@ create table acuerdo_disposicion (
   -- guard: miden 5, están «entre 1 y 300», y una referencia contractual en blanco es
   -- exactamente lo que este límite existe para impedir (medido).
   base text not null check (
-    length(base) between 1 and 300 and btrim(base) <> '' and texto_importado_limpio(base)
+    length(base) between 1 and 300 and texto_recortado(base) <> ''
+    and texto_importado_limpio(base)
     and base !~ '[\n\r\u2028\u2029]'),
   -- El rol de la parte que lo registró, sellado AQUÍ y no reconstruido después: los roles
   -- cambian, y un acuerdo dice quién era quién CUANDO se acordó. Es la mitad que hace
@@ -404,7 +427,7 @@ create table constancia_disposicion (
    * propia destrucción no es un recibo.
    */
   acuerdo_base text not null check (
-    length(acuerdo_base) between 1 and 300 and btrim(acuerdo_base) <> ''
+    length(acuerdo_base) between 1 and 300 and texto_recortado(acuerdo_base) <> ''
     and acuerdo_base !~ '[\n\r\u2028\u2029]'),
   -- La fecha efectiva viaja como TEXTO en ISO, y no como `date`, por la misma razón que los
   -- dos instantes: lo que entra en el sello tiene que ser BYTES fijos. `date::text` y
@@ -460,7 +483,7 @@ create table constancia_disposicion (
   -- habiendo —esto es un recibo, no un anexo— y una sola línea, que es lo que mantiene
   -- inequívoca la carga sellada: cada campo ocupa exactamente un renglón.
   alcance text not null check (
-    length(alcance) between 1 and 2000 and btrim(alcance) <> ''
+    length(alcance) between 1 and 2000 and texto_recortado(alcance) <> ''
     and alcance !~ '[\n\r\u2028\u2029]'),
   -- ── El sello ──
   -- Columna GENERADA y no un trigger, y la diferencia es operativa, no estética: el
@@ -766,7 +789,7 @@ begin
   -- ese camino entraba el valor tal cual. Y lo que se guarda aquí es lo que se copia al
   -- evento de abajo y, más tarde, a la constancia sellada — tres sitios donde el mismo dato
   -- tiene que ser el MISMO. Normalizar en un solo punto es lo que lo garantiza.
-  new.base := btrim(new.base);
+  new.base := texto_recortado(new.base);
   new.acordado_rol := workspace_role(app_user_id(), new.workspace_id);
   new.version := coalesce(
     (select max(a.version) + 1 from acuerdo_disposicion a

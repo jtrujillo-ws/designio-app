@@ -131,14 +131,28 @@ async function presupuestoDeHoy(
         where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now())
           and resultado <> 'sin-respuesta'
           -- Una línea EN VUELO no se cuenta dos veces. Con el libro anticipado la fila nace
-          -- antes de llamar, así que durante toda la llamada coexiste con la reserva que ya
-          -- apartó su hueco: sumar las dos cobraba el doble por la misma generación durante
-          -- hasta dos timeouts, y con un cupo pequeño eso echaba fuera al siguiente curador.
-          -- La reserva la cubre mientras vive; pasada su ventana ya no la cubre nadie, y
-          -- entonces la línea abierta sí cuenta —es la dirección segura para una llamada cuyo
-          -- cierre se perdió: ante la duda de si el proveedor cobró, se asume que sí—.
-          and (resultado <> 'despachada'
-               or creado_en <= now() - reserva_ai_ventana()))::int as atendidas,
+          -- antes de llamar, así que durante la llamada coexiste con la reserva que ya apartó
+          -- su hueco: sumar las dos cobraba el doble por la misma generación durante hasta dos
+          -- timeouts, y con un cupo pequeño eso echaba fuera al siguiente curador.
+          --
+          -- La exclusión mira si HAY una reserva que la cubra, no cuánto tiempo lleva abierta.
+          -- La diferencia es un agujero: cuando el cierre falla, la limpieza retira la reserva
+          -- en el acto, y con un criterio por TIEMPO la fila seguía sin contar el resto de la
+          -- ventana. En ese hueco no contaba ni la reserva ni la llamada pagada, así que
+          -- fallos de cierre repetidos dejaban reintentar por encima del cupo — justo el fallo
+          -- posterior al despacho que este cambio existe para contener.
+          --
+          -- Atada al ANCLA porque así es como la reserva aparta el hueco. En cuanto la reserva
+          -- desaparece —se retire por limpieza, por revocación o por caducidad—, la línea
+          -- abierta cuenta: es la dirección segura para una llamada cuyo cierre se perdió,
+          -- porque ante la duda de si el proveedor cobró se asume que sí.
+          and (resultado <> 'despachada' or not exists (
+            select 1 from reserva_ai r
+            where r.workspace_id = llamada_ai.workspace_id
+              and r.creado_en > now() - reserva_ai_ventana()
+              and ((llamada_ai.item_id is not null and r.item_id = llamada_ai.item_id)
+                   or (llamada_ai.reto_id is not null and r.reto_id = llamada_ai.reto_id))
+          )))::int as atendidas,
       (select coalesce(sum(unidades), 0) from reserva_ai
         where workspace_id = ${workspaceId} and creado_en > now() - reserva_ai_ventana())::int
         as reservadas,

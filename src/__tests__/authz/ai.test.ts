@@ -1694,25 +1694,27 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         conProveedor(RESPUESTA_CI, async () => (await panelPropuestas(leadId, ws)).ai.llamadasHoy);
       const antes = await mide();
 
-      // (a) Una línea EN VUELO no se cuenta: la reserva de su generación ya apartó el hueco, y
-      // sumar las dos cobraría el doble por la misma generación durante hasta dos timeouts.
-      const [enCurso] = await admin`insert into llamada_ai
+      // (a) Una línea EN VUELO, con la reserva de su generación viva, no se cuenta dos veces:
+      // la reserva ya apartó el hueco. Sumar las dos cobraba el doble por la misma generación
+      // durante hasta dos timeouts.
+      const [reserva] = await admin`insert into reserva_ai
+        (workspace_id, capacidad, reto_id, unidades, creado_por)
+        values (${ws}, 'C0', ${retoId}, 2, ${leadId}) returning id`;
+      const [cubierta] = await admin`insert into llamada_ai
         (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
         values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'despachada', ${leadId})
         returning id`;
       expect(await mide()).toBe(antes);
-      await admin`delete from llamada_ai where id = ${enCurso!.id as string}`;
 
-      // (b) Una línea cuyo cierre se PERDIÓ sí cuenta, en cuanto su reserva deja de cubrirla.
-      // Es la dirección segura: ante la duda de si el proveedor cobró, se asume que sí — de lo
-      // contrario un cierre perdido regalaría cuota para siempre.
-      const [atascada] = await admin`insert into llamada_ai
-        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por, creado_en)
-        values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'despachada', ${leadId},
-                now() - reserva_ai_ventana() - interval '1 minute')
-        returning id`;
+      // (b) Y en cuanto la reserva desaparece, la MISMA fila cuenta — en el acto, sin esperar
+      // a que venza ningún reloj. Cuando el cierre falla, la limpieza retira la reserva de
+      // inmediato; si la exclusión mirase el tiempo transcurrido, durante el resto de la
+      // ventana no contaría ni la reserva ni la llamada pagada, y fallos repetidos dejarían
+      // reintentar por encima del cupo — justo el fallo posterior al despacho que este cambio
+      // existe para contener.
+      await admin`delete from reserva_ai where id = ${reserva!.id as string}`;
       expect(await mide()).toBe(antes + 1);
-      await admin`delete from llamada_ai where id = ${atascada!.id as string}`;
+      await admin`delete from llamada_ai where id = ${cubierta!.id as string}`;
 
       // Cerrada: el desenlace y el coste ya constan, en la MISMA fila que se abrió antes.
       const [cerrada] = await admin`select resultado, costo_usd, intento from llamada_ai

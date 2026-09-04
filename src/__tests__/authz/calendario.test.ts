@@ -334,6 +334,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     const TIPO_SIN_HUSO = String.raw`(?!(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)(?:date|time|timestamp)\b${PRECISION}`;
 
+    /*
+     * Y un operando cuyo tipo NO lleva huso, en las dos formas que se pueden leer del texto:
+     * el literal tipado (`date '…'`) y el cast (`'…'::date`, `columna::date`). La segunda es
+     * la que devuelve el catálogo: Postgres deparsea `current_timestamp < date '2026-09-04'`
+     * como `(CURRENT_TIMESTAMP < '2026-09-04'::date)`.
+     *
+     * LÍMITE DECLARADO, porque conviene que esté escrito y no descubierto: una COLUMNA cuyo
+     * tipo es `date` no se distingue de cualquier otro identificador mirando el texto. Este
+     * censo no resuelve tipos de columnas, así que `vence_en > current_timestamp` con
+     * `vence_en date` se le escapa. Lo que sí cubre es la forma en que aparece escrita una
+     * garantía: un literal o un cast.
+     */
+    const OPERANDO_SIN_HUSO = String.raw`(?:${TIPO_SIN_HUSO}\s*'[^']*'|(?:'[^']*'|[\w."]+)\s*::\s*${TIPO_SIN_HUSO})`;
+    const COMPARADOR = String.raw`(?:<=|>=|<>|!=|<|>|=|\bbetween\b)`;
+
     RELOJ_COLAPSADO_A_DIA = [
       // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
       // que lleva cast: `date_trunc('day', timeofday()::timestamptz)`, obligada porque ese
@@ -373,6 +388,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         String.raw`date_part\s*\(\s*'(?!(?:${CAMPOS_SEGUROS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})`,
         'i',
       ),
+      /*
+       * Y la COMPARACIÓN MIXTA, que es la puerta que abrió declarar seguro el reloj desnudo.
+       * `current_timestamp` es un instante absoluto, sí — pero comparado contra un valor SIN
+       * huso, el que se mueve es el otro: Postgres promociona el `date` a `timestamptz`
+       * usando la MEDIANOCHE LOCAL de la sesión. Medido:
+       *
+       *   current_timestamp < date '2026-09-04'   →  false en UTC+14, true en UTC-12
+       *
+       * O sea que la garantía la sigue eligiendo quien llama, aunque el reloj no tenga la
+       * culpa. Marcar el reloj a secas lo cazaba por accidente y a costa de marcar todo uso
+       * legítimo; esto lo caza por lo que es, y solo eso.
+       *
+       * En los dos órdenes, porque el reloj puede ir a cualquier lado del comparador.
+       */
+      new RegExp(String.raw`(${RELOJ})\s*${COMPARADOR}\s*(${OPERANDO_SIN_HUSO})`, 'i'),
+      new RegExp(String.raw`(${OPERANDO_SIN_HUSO})\s*${COMPARADOR}\s*(${RELOJ})`, 'i'),
     ];
   });
 
@@ -539,6 +570,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'timestamptz',
       culpable: false,
     },
+    // La comparación MIXTA: el reloj es absoluto, pero el `date` del otro lado se promociona
+    // con la medianoche LOCAL. Medido: false en UTC+14 y true en UTC-12. Se guarda deparseada
+    // como `(CURRENT_TIMESTAMP < '2026-09-04'::date)`, que es la forma que hay que cazar.
+    censo_probe_mixta: {
+      expr: "current_timestamp < date '2026-09-04'",
+      tipo: 'boolean',
+      culpable: true,
+    },
+    // Y en el otro orden, porque el reloj puede ir a cualquier lado del comparador.
+    censo_probe_mixta_der: {
+      expr: "date '2026-09-04' > now()",
+      tipo: 'boolean',
+      culpable: true,
+    },
+    // Comparar dos instantes absolutos no elige nada: el otro operando LLEVA huso.
+    censo_probe_ok_mixta: {
+      expr: "now() < timestamptz '2026-09-04 00:00:00+00'",
+      tipo: 'boolean',
+      culpable: false,
+    },
     // `current_timestamp` desnudo es un instante absoluto —la cabecera de este fichero lo dice
     // desde el principio— y el censo lo marcaba igual. Con la lista derivada del tipo, ya no.
     censo_probe_ok_ct: {
@@ -646,6 +697,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       '(now()::timetz)::time',
       'extract(hour from now()::time with time zone)',
       'current_time::time',
+      // La comparación mixta: el reloj es absoluto y el otro operando se promociona con la
+      // medianoche LOCAL. Medido: false en UTC+14 y true en UTC-12.
+      "current_timestamp < date '2026-09-04'",
+      "CURRENT_TIMESTAMP < '2026-09-04'::date",
+      "now() < '2026-09-04'::date",
+      "now() >= timestamp '2026-09-04 00:00:00'",
+      "date '2026-09-04' > now()",
+      "'2026-09-04'::date > current_timestamp",
+      "now() between date '2026-09-01' and date '2026-09-30'",
+      'vence_en::date = current_timestamp',
     ];
     const SEGURAS = [
       "timezone('UTC', now())::date",
@@ -693,6 +754,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'current_time',
       'select current_timestamp - creado_en from disposicion',
       'vence_en > current_timestamp',
+      // Comparar dos instantes absolutos no elige calendario: el otro operando lleva huso.
+      "now() < timestamptz '2026-09-04 00:00:00+00'",
+      "now() >= '2026-09-04 00:00:00+00'::timestamptz",
+      'now() < creado_en',
+      // Y comparar dos FECHAS tampoco: ninguna tiene huso del que moverse.
+      "fecha_de_la_base() = date '2026-09-04'",
+      "(now() at time zone 'UTC')::date = date '2026-09-04'",
       // …y `timetz` como destino conserva el instante igual.
       'now()::time with time zone',
       'now()::timetz',

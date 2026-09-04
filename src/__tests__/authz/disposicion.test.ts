@@ -485,16 +485,18 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         hashtextextended('designio:workspace:' || ${ws}::text, 42))`;
     });
     try {
-      const registro = registrarAcuerdo(adminId, {
-        workspaceId: ws,
-        modalidad: 'borrado',
-        base: 'Intento de colarse a media ejecución',
-        efectivoDesde: new Date().toISOString().slice(0, 10),
-      });
+      // Por SQL DIRECTO y no por el servicio: el grant de insert permite rodear la capa, así
+      // que si el candado viviera solo allí este camino se colaría igual. Lo toma el guard,
+      // que es por donde pasa todo insert.
+      const registro = conUsuario(adminId, (tx) => tx`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+        values (${ws}, 'borrado', 'Intento de colarse a media ejecución', current_date,
+                ${adminId})
+        returning version`);
       expect(await sigueEsperando(registro)).toBe(true);
       await enCurso.cerrar();
       // Y cuando la de delante suelta, entra: esperar no es fallar.
-      expect((await registro).version).toBe(2);
+      expect(Number((await registro)[0]!.version)).toBe(2);
     } finally {
       await enCurso.cerrar().catch(() => {});
     }
@@ -554,6 +556,35 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       where id = ${ws}`;
     expect(w!.nombre).toBe('Workspace borrado por acuerdo');
     expect(w!.limite_llamadas_ai_dia).toBeNull();
+  });
+
+  it('el ayudante de la RLS no responde por terceros: no hay oráculo entre inquilinos', async () => {
+    // `firmo_esta_disposicion` es SECURITY DEFINER, así que salta la RLS por diseño — es lo que
+    // corta la recursión entre las dos políticas. Con el firmante como PARÁMETRO, cualquiera
+    // con el grant podía preguntar «¿firmó esta persona ese acuerdo de ese workspace?» sobre
+    // uuids ajenos y recibir la respuesta por encima de la RLS: existencia y autoría de
+    // acuerdos de otro inquilino. Derivando el usuario de `app_user_id()` dentro, lo único
+    // preguntable es sobre uno mismo.
+    const ws = await nuevoWorkspace('sin-oraculo');
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws,
+      modalidad: 'archivo',
+      base: 'Acuerdo del cliente',
+      efectivoDesde: new Date().toISOString().slice(0, 10),
+    });
+
+    // La firma de tres argumentos ya no existe: no se puede preguntar por un tercero.
+    await expect(
+      conUsuario(leadId, (tx) => tx`select firmo_esta_disposicion(${ws}, 1, ${adminId})`),
+    ).rejects.toMatchObject({ code: '42883' });
+
+    // Y la de dos responde por QUIEN PREGUNTA, no por quien se nombre.
+    const [comoFirmante] = await conUsuario(adminId, (tx) =>
+      tx`select firmo_esta_disposicion(${ws}, 1) as si`);
+    expect(comoFirmante!.si).toBe(true);
+    const [comoOtro] = await conUsuario(leadId, (tx) =>
+      tx`select firmo_esta_disposicion(${ws}, 1) as si`);
+    expect(comoOtro!.si).toBe(false);
   });
 
   it('la carga canónica reproduce jsonb::text de Postgres, clave a clave', async () => {

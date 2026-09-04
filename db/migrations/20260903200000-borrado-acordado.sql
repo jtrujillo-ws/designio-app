@@ -320,12 +320,19 @@ $$;
 -- tabla cuya RLS la consulta a ella es recursión infinita, que Postgres detecta y rechaza.
 -- Corriendo como el dueño, esta lectura no vuelve a entrar en la política y el ciclo se corta
 -- por un solo lado. Es el mismo recurso con el que `is_workspace_member` sostiene el resto.
-create function firmo_esta_disposicion(p_ws uuid, p_version integer, p_usuario uuid)
+-- El usuario se deriva DENTRO, de `app_user_id()`, y no se acepta como parámetro. La
+-- diferencia es la que separa un ayudante de un oráculo: siendo SECURITY DEFINER salta la RLS
+-- por diseño, y con el firmante en la firma cualquiera con el grant podía preguntar
+-- «¿firmó ESTA persona ESE acuerdo de ESE workspace?» sobre uuids ajenos y recibir la
+-- respuesta por encima de la RLS — existencia y autoría de acuerdos de otro inquilino. Sin ese
+-- parámetro, lo único que se puede preguntar es sobre uno mismo, que es algo que ya se sabe.
+create function firmo_esta_disposicion(p_ws uuid, p_version integer)
   returns boolean
 language sql stable security definer set search_path = public, pg_temp as $$
   select exists (
     select 1 from acuerdo_disposicion a
-    where a.workspace_id = p_ws and a.version = p_version and a.acordado_por = p_usuario)
+    where a.workspace_id = p_ws and a.version = p_version
+      and a.acordado_por = app_user_id())
 $$;
 
 -- ── La disposición vigente, en UN sitio ───────────────────────────────────────────────
@@ -455,6 +462,49 @@ begin
   end loop;
 end $$;
 
+
+-- ── Registrar un acuerdo: la posición y el sello temporal los pone la base ────────────
+create function acuerdo_disposicion_registro_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+  -- EL CANDADO VA AQUÍ, no solo en el servicio. El grant de insert permite escribir en esta
+  -- tabla por SQL directo, saltándose la capa que lo tomaba, y entonces el registro puede
+  -- confirmar con una ejecución EN VUELO — después de que validó el acuerdo anterior y antes
+  -- de que relea el vigente—, haciéndole ejecutar un acuerdo nuevo sin volver a comprobar su
+  -- retención, su exportación, su doble firma ni la modalidad que se vio en la pantalla.
+  --
+  -- El guard es el camino que cubre TODO insert; el servicio solo cubre el suyo. Es la misma
+  -- lección que la de la exportación falsificable: lo que sostiene una promesa tiene que estar
+  -- donde no se pueda rodear. Y de paso hace estructural lo que el índice único de
+  -- `(workspace_id, version)` solo atrapaba a posteriori: leer el máximo y sumar uno es seguro
+  -- porque nadie más está leyéndolo a la vez.
+  perform pg_advisory_xact_lock(hashtextextended('designio:workspace:' || new.workspace_id, 42));
+  new.acordado_en := now();
+  new.acordado_rol := workspace_role(app_user_id(), new.workspace_id);
+  new.version := coalesce(
+    (select max(a.version) + 1 from acuerdo_disposicion a
+      where a.workspace_id = new.workspace_id),
+    1);
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+  values (new.workspace_id, 'DisposicionAcordada',
+    jsonb_build_object('version', new.version, 'modalidad', new.modalidad,
+                       'efectivoDesde', new.efectivo_desde, 'base', new.base,
+                       'acordadoRol', new.acordado_rol),
+    app_user_id(), new.acordado_rol);
+  return new;
+end $$;
+
+create trigger acuerdo_disposicion_registro
+  before insert on acuerdo_disposicion
+  for each row execute function acuerdo_disposicion_registro_guard();
+
+-- Va AQUÍ, y no antes: esta derivación mira el cuerpo de los guards ya instalados, así que
+-- tiene que correr cuando estén TODOS. El del registro del acuerdo toma candado y relee, y
+-- colocándola más arriba se lo saltaba en silencio — la clase de omisión que esta derivación
+-- existe precisamente para no cometer.
 -- ── Consecuencia derivada, no descubierta: la premisa del aislamiento se amplía ───────
 -- El guard de arriba toma candado y RELEE, así que cae exactamente dentro del criterio que
 -- 20260902330000 fijó: toda tabla cuyos guards serializan y releen depende de que cada
@@ -495,32 +545,6 @@ begin
     end if;
   end loop;
 end $$;
-
--- ── Registrar un acuerdo: la posición y el sello temporal los pone la base ────────────
-create function acuerdo_disposicion_registro_guard() returns trigger
-language plpgsql security definer set search_path = public, pg_temp as $$
-begin
-  if not is_workspace_member(app_user_id(), new.workspace_id) then
-    return new;
-  end if;
-  new.acordado_en := now();
-  new.acordado_rol := workspace_role(app_user_id(), new.workspace_id);
-  new.version := coalesce(
-    (select max(a.version) + 1 from acuerdo_disposicion a
-      where a.workspace_id = new.workspace_id),
-    1);
-  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-  values (new.workspace_id, 'DisposicionAcordada',
-    jsonb_build_object('version', new.version, 'modalidad', new.modalidad,
-                       'efectivoDesde', new.efectivo_desde, 'base', new.base,
-                       'acordadoRol', new.acordado_rol),
-    app_user_id(), new.acordado_rol);
-  return new;
-end $$;
-
-create trigger acuerdo_disposicion_registro
-  before insert on acuerdo_disposicion
-  for each row execute function acuerdo_disposicion_registro_guard();
 
 revoke execute on function acuerdo_disposicion_registro_guard() from public;
 
@@ -834,7 +858,7 @@ create policy constancia_select on constancia_disposicion
   for select using (
     is_workspace_member(app_user_id(), workspace_id)
     or ejecutado_por = app_user_id()
-    or firmo_esta_disposicion(workspace_id, acuerdo_version, app_user_id())
+    or firmo_esta_disposicion(workspace_id, acuerdo_version)
   );
 
 -- ── Grants mínimos ────────────────────────────────────────────────────────────────────
@@ -847,7 +871,7 @@ grant insert (workspace_id, modalidad, base, efectivo_desde, acordado_por)
 grant select on constancia_disposicion to designio_app;
 
 revoke execute on function
-  firmo_esta_disposicion(uuid, integer, uuid),
+  firmo_esta_disposicion(uuid, integer),
   sello_constancia(text),
   alcance_de_constancia(),
   tablas_del_workspace(),
@@ -858,7 +882,7 @@ revoke execute on function
   ejecutar_disposicion(uuid)
 from public;
 grant execute on function
-  firmo_esta_disposicion(uuid, integer, uuid),
+  firmo_esta_disposicion(uuid, integer),
   disposicion_vigente(uuid),
   disposicion_motivo_no_ejecutable(uuid),
   ejecutar_disposicion(uuid)

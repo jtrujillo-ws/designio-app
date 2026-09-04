@@ -2019,6 +2019,12 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        */
       const exportadas = new Set<string>();
       /**
+       * Los ALIAS: `const panel = leerPanel;`. El nombre exportado no tiene cuerpo propio, y
+       * sin esto ni el alias ni la original entraban en el censo — la proyección entera
+       * desaparecía.
+       */
+      const alias = new Map<string, string>();
+      /**
        * Lo que envuelve a un valor sin cambiarlo: `(f) satisfies T`, `f as T`, `(f)`, `f!`.
        * Sin desenvolver, `export const p = (async (…) => conUsuario(…)) satisfies Proyeccion`
        * tiene un `SatisfiesExpression` por inicializador, no una flecha, y la rama de abajo lo
@@ -2062,9 +2068,21 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           for (const d of st.declarationList.declarations) {
             if (!ts.isIdentifier(d.name) || !d.initializer) continue;
             const valor = desenvolver(d.initializer);
-            if (!ts.isArrowFunction(valor) && !ts.isFunctionExpression(valor)) continue;
-            porNombre.set(d.name.text, valor);
-            if (llevaExport(st)) exportadas.add(d.name.text);
+            if (ts.isArrowFunction(valor) || ts.isFunctionExpression(valor)) {
+              porNombre.set(d.name.text, valor);
+              if (llevaExport(st)) exportadas.add(d.name.text);
+              continue;
+            }
+            /*
+             * Y si el valor es un IDENTIFICADOR, es un alias de otra cosa del módulo. Antes
+             * aquí había un `continue` y por ahí se iba la proyección ENTERA: el alias no
+             * tenía cuerpo, así que no entraba; y la original no llevaba `export`, así que
+             * tampoco. Ninguno de los dos censos la veía.
+             */
+            if (ts.isIdentifier(valor)) {
+              alias.set(d.name.text, valor.text);
+              if (llevaExport(st)) exportadas.add(d.name.text);
+            }
           }
         }
         /*
@@ -2094,8 +2112,25 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         }
       }
 
+      /**
+       * El cuerpo de un nombre, siguiendo la CADENA de alias —`const b = a; const c = b;`— con
+       * los vistos apuntados: un ciclo dejaría el bucle colgado, y aunque hoy TypeScript no
+       * deja escribir uno, la guarda no depende de eso.
+       */
+      const cuerpoDe = (inicial: string) => {
+        const vistos = new Set<string>();
+        let actual: string | undefined = inicial;
+        while (actual !== undefined && !vistos.has(actual)) {
+          vistos.add(actual);
+          const cuerpo = porNombre.get(actual);
+          if (cuerpo) return cuerpo;
+          actual = alias.get(actual);
+        }
+        return undefined;
+      };
+
       for (const nombre of exportadas) {
-        const nodo = porNombre.get(nombre);
+        const nodo = cuerpoDe(nombre);
         if (!nodo) continue;
         /*
          * TODAS las llamadas a `conUsuario` de esta función, no la primera. Cada una abre su
@@ -2450,6 +2485,18 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a, b };
         });
       export { sondaOkDolarInterpolado };
+      // La exportada es un ALIAS de una función local: el inicializador es un Identifier, no
+      // una flecha, así que ni el alias ni la original entraban en el censo.
+      const leerPanelAliasado = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      export const sondaAlias = leerPanelAliasado;
+      // Y el alias de un alias, que es lo que exige resolver en CADENA y no un salto.
+      const aliasIntermedio = leerPanelAliasado;
+      export const sondaAliasDoble = aliasIntermedio;
       // Un identificador ENTRE COMILLAS DOBLES: en SQL es un NOMBRE, no un dato, pero tampoco
       // es una sentencia de escritura.
       export const sondaIdentificador = async (actorId: string) =>
@@ -2546,6 +2593,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaDolarEscritura',
         'sonda.ts:sondaIdentificador',
         'sonda.ts:sondaCadenaE',
+        'sonda.ts:sondaAlias',
+        'sonda.ts:sondaAliasDoble',
       ].sort(),
     );
 

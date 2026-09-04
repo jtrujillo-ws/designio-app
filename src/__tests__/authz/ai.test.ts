@@ -3619,10 +3619,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
-  it('la cola se ordena por la confianza declarada, con la antigüedad de desempate', async () => {
+  it('la cola pone lo más DUDOSO primero, con la antigüedad de desempate', async () => {
     // Persistir `confianza` argumentando que «ordena la revisión humana» y después no ordenar
-    // por ella no entrega esa conducta: con FIFO puro, una propuesta nueva y sólida se
-    // quedaba detrás de las viejas y flojas, y el dato no servía para nada.
+    // por ella no entrega esa conducta. Pero la DIRECCIÓN importa tanto como ordenar: la
+    // revisión humana es el recurso escaso, y lo escaso se gasta donde más rinde. Lo que el
+    // modelo declara muy seguro es lo que menos probablemente cambie al mirarlo; lo dudoso es
+    // donde el ojo humano decide de verdad.
     await enWorkspaceLimpio('orden', async ({ ws: wsO, curadorId }) => {
       const admin = sqlAdmin();
       const niveles = ['baja', 'alta', 'media'] as const;
@@ -3647,17 +3649,43 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       }
 
       const panel = await panelPropuestas(curadorId, wsO);
-      // Se generaron en orden baja → alta → media; la cola las devuelve por confianza.
+      // Se generaron en orden baja → alta → media; la cola las devuelve de menor a mayor.
       expect(panel.pendientes.map((p) => p.confianza)).toEqual([
-        CONFIANZA_PROPUESTA_NUMERICA.alta,
-        CONFIANZA_PROPUESTA_NUMERICA.media,
         CONFIANZA_PROPUESTA_NUMERICA.baja,
+        CONFIANZA_PROPUESTA_NUMERICA.media,
+        CONFIANZA_PROPUESTA_NUMERICA.alta,
       ]);
-      // Y el total es el total, no lo que cabe: con el corte por confianza, lo que queda
-      // detrás son las MENOS fiables, así que decir el número es lo que distingue «esto es
-      // todo» de «esto es lo que cabe».
+      // Y el total es el total, no lo que cabe: con el corte, lo que queda detrás son ahora las
+      // MÁS fiables, que siguen siendo trabajo pendiente aunque ya no sean lo que más urge.
       expect(panel.totalPendientes).toBe(3);
       expect(panel.hayMasPendientes).toBe(false);
+
+      // ── Los nulos NO se promueven al invertir ──
+      // «Sin confianza declarada» no es «confianza cero»: son las sembradas o las escritas por
+      // SQL crudo. Con el orden ascendente, tratarlas como el valor más dudoso posible las
+      // pondría en cabeza — que es justo la mentira que `nulls last` existe para no contar.
+      const [iSin] = await admin`insert into item_importacion
+        (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+        values (${wsO}, 'Item sin confianza declarada', ${MATERIAL}, 'nota', 'ref', ${curadorId})
+        returning id`;
+      const [lSin] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, item_id, modelo, origen_key, resultado, creado_por)
+        values (${wsO}, 'CI', ${iSin!.id as string}, ${MODELO_PRIMARIO}, 'entorno',
+                'salida-valida', ${curadorId})
+        returning id`;
+      await admin`insert into propuesta_ai
+        (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, llamada_id, creado_por)
+        values (${wsO}, 'CI', 'evidencia', ${iSin!.id as string}, ${admin.json(CONTENIDO_CI)},
+                ${admin.json(CONTENIDO_CI)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+                ${lSin!.id as string}, ${curadorId})`;
+      const conNulo = await panelPropuestas(curadorId, wsO);
+      expect(conNulo.pendientes.map((p) => p.confianza)).toEqual([
+        CONFIANZA_PROPUESTA_NUMERICA.baja,
+        CONFIANZA_PROPUESTA_NUMERICA.media,
+        CONFIANZA_PROPUESTA_NUMERICA.alta,
+        null,
+      ]);
     });
   });
 

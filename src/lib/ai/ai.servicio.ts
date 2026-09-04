@@ -405,21 +405,33 @@ export async function panelPropuestas(
     // Se pide una fila de más para saber si el corte dejó algo fuera (mismo truco que la
     // bandeja): el panel lo dice en vez de fingir que eso es todo.
     //
-    // Y el orden es por CONFIANZA, no por antigüedad. Persistir `confianza` argumentando que
-    // «ordena la revisión humana» y después no ordenar por ella no entrega esa conducta: con
-    // FIFO puro, una propuesta nueva y sólida se quedaba detrás de cien viejas y flojas, y el
-    // dato no servía para nada. La antigüedad sigue siendo el desempate, así que entre iguales
-    // manda la cola de siempre y el drenaje no se rompe.
+    // Y el orden es por CONFIANZA ASCENDENTE: lo más dudoso primero. Persistir `confianza`
+    // argumentando que «ordena la revisión humana» y después no ordenar por ella no entrega esa
+    // conducta —con FIFO puro, una propuesta nueva y endeble se quedaba detrás de cien viejas y
+    // sólidas—, pero la DIRECCIÓN importa tanto como el hecho de ordenar.
     //
-    // `nulls last` porque «sin confianza declarada» no es «confianza cero»: son las sembradas
-    // o las escritas por SQL crudo, y van al final sin fingir un valor que nadie dijo.
+    // Va ascendente porque la revisión humana es el recurso escaso del pipeline, y lo escaso se
+    // gasta donde más rinde. Una propuesta que el modelo declara muy segura es la que menos
+    // probablemente cambie al mirarla; una que declara dudosa es donde el ojo humano decide de
+    // verdad. Con el orden descendente, la persona empezaba por lo que casi seguro iba a
+    // aceptar tal cual y llegaba cansada —o no llegaba— a lo que había que corregir.
+    //
+    // La antigüedad sigue siendo el desempate, así que entre iguales manda la cola de siempre y
+    // el drenaje no se rompe.
+    //
+    // `nulls last` NO se invierte, y conviene decir por qué en vez de dejarlo raro: «sin
+    // confianza declarada» no es «confianza cero». Son las sembradas o las escritas por SQL
+    // crudo. Moverlas al frente al invertir el orden sería tratar la ausencia del dato como el
+    // valor más dudoso posible, que es justo la mentira que `nulls last` existe para no contar.
     const pendientes = await tx`select ${columnas} ${origen}
       where p.workspace_id = ${workspaceId} and p.estado = 'propuesta'
-      order by p.confianza desc nulls last, p.creado_en asc, p.id asc
+      order by p.confianza asc nulls last, p.creado_en asc, p.id asc
       limit ${PAGINA_PENDIENTES + 1}`;
     // Cuántas hay en total, para que el recorte diga un número y no «hay más». Con el orden
-    // por confianza, lo que queda detrás del corte son las MENOS fiables: saber cuántas son
-    // es lo que convierte el corte en algo que se puede drenar en vez de en un final falso.
+    // ascendente, lo que queda detrás del corte son las que el modelo dio por MÁS fiables —lo
+    // contrario que antes—, así que el número importa por otra razón: lo escondido ya no es lo
+    // que más urge mirar, pero sigue siendo trabajo pendiente, y decir cuánto es lo que
+    // convierte el corte en algo que se puede drenar en vez de en un final falso.
     const [conteo] = await tx`select count(*)::int as n from propuesta_ai
       where workspace_id = ${workspaceId} and estado = 'propuesta'`;
 

@@ -1197,7 +1197,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * el texto ENTERO, que es como llega un `default`.
      */
     const ENTREGAS = [
-      /\breturn\s+(?:query\s+select\s+)?([^;]*?)(?=;|\s*\$|\s*$)/gi,
+      // `return next` es otra entrega al mismo tipo declarado, no una palabra suelta: medido,
+      // `returns setof date` con `return next now();` da 2026-09-05 en Pacific/Kiritimati y
+      // 2026-09-04 en Etc/GMT+12. Sin la alternativa, lo que se leía era `next now()`, que no
+      // es ningún reloj. (`return next;` a secas —el de un RETURNS TABLE que ya asignó sus
+      // columnas— no casa esta rama y sigue yendo por la de al lado, que es lo correcto: ahí
+      // el valor lo pusieron las variables.)
+      /\breturn\s+(?:query\s+select\s+|next\s+)?([^;]*?)(?=;|\s*\$|\s*$)/gi,
       /\bselect\s+([^;]*?)(?=;|\s+from\b|\s*\$|\s*$)/gi,
     ];
     RELOJ_ENTREGADO = (texto: string): boolean =>
@@ -1342,6 +1348,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         ...texto.matchAll(
           new RegExp(String.raw`(?<![\w"])(?:${cualquiera})\s*:=\s*([^;]*)`, 'gi'),
         ),
+        /*
+         * Y plpgsql también asigna con `=` a secas: `declare d date; begin d = now();` hace la
+         * misma coerción (medido, 2026-09-05 contra 2026-09-04). Va en su propia búsqueda y
+         * no como alternativa del `:=`, porque el `=` es AMBIGUO: en `if d = now() then` es una
+         * comparación, no una asignación. Lo que las separa es la posición, así que se exige
+         * que el nombre empiece SENTENCIA — detrás de un `;`, o de las palabras que abren un
+         * bloque—. El `:=` no necesita esa guarda porque no significa otra cosa.
+         */
+        ...texto.matchAll(
+          new RegExp(
+            String.raw`(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*(?:${cualquiera})\s*=(?!=)\s*([^;]*)`,
+            'gi',
+          ),
+        ),
         ...texto.matchAll(
           new RegExp(
             String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?(?:${cualquiera})(?![\w"])`,
@@ -1412,7 +1432,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'gi',
     );
     const ACTUALIZA = new RegExp(
-      String.raw`\bupdate\s+(?:only\s+)?(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s+set\s+([\s\S]*?)(?=\s+(?:from|where|returning)\b|;|$)`,
+      // El destino puede llevar ALIAS —`update t as x set …`, con `as` o sin él—, y el tipo
+      // de la columna se sigue consultando por la tabla de verdad, no por el alias. Medido:
+      // 2026-09-05 contra 2026-09-04. El `(?!set\b)` es para que un `update t set …` no tome
+      // `set` por alias y se quede sin cláusula que mirar.
+      String.raw`\bupdate\s+(?:only\s+)?(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
+        String.raw`(?:\s+(?:as\s+)?(?!set\b)${NOMBRE_SQL})?\s+set\s+([\s\S]*?)(?=\s+(?:from|where|returning)\b|;|$)`,
       'gi',
     );
     RELOJ_ESCRITO_EN_COLUMNA = (texto: string): boolean => {
@@ -1434,15 +1459,37 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         });
       for (const m of texto.matchAll(INSERTA)) {
         const tabla = nombreCanonico(m[1]!);
-        const abre = m.index + m[0].length - 1;
-        const dentro = parejaDeParentesis(texto, abre);
-        if (dentro === null) continue;
-        const valores = argumentosDe(dentro);
+        /*
+         * TODAS las tuplas, no la primera: un `values (…), (…)` mete varias filas y cada una
+         * se coerciona por su cuenta. Medido: `values (date '2026-01-01'), (now())` sobre una
+         * columna `date` guarda 2026-01-01 y 2026-09-05 en Pacific/Kiritimati, y 2026-01-01 y
+         * 2026-09-04 en Etc/GMT+12 — o sea que quedarse con la primera es mirar justo la fila
+         * que suele ser inocente.
+         */
+        let cursor = m.index + m[0].length - 1;
+        const tuplas: string[] = [];
+        for (;;) {
+          const dentro = parejaDeParentesis(texto, cursor);
+          if (dentro === null) break;
+          tuplas.push(dentro);
+          cursor += dentro.length + 2;
+          const siguiente = /^\s*,\s*\(/.exec(texto.slice(cursor));
+          if (!siguiente) break;
+          cursor += siguiente[0].length - 1;
+        }
+        if (tuplas.length === 0) continue;
         const destinos =
           m[2] === undefined
             ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
             : argumentosDe(m[2]).map(nombreCanonico);
-        if (destinos.some((c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!)))
+        if (
+          tuplas.some((t) => {
+            const valores = argumentosDe(t);
+            return destinos.some(
+              (c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!),
+            );
+          })
+        )
           return true;
         /*
          * Y el `ON CONFLICT … DO UPDATE SET`, que es un `update` con la tabla escrita arriba:
@@ -1451,8 +1498,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * `on conflict (k) do update set d = now()` sobre una columna `date` guarda
          * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
          */
-        // +2: uno por el paréntesis que abre y otro por el que cierra.
-        const cola = texto.slice(abre + dentro.length + 2);
+        // `cursor` quedó justo detrás del paréntesis que cierra la última tupla.
+        const cola = texto.slice(cursor);
         const enConflicto =
           // El salto hasta el `do update` no cruza un `;`: si lo cruzara, un
           // `on conflict … do nothing;` seguido de un `update` de OTRA tabla se leería como
@@ -3350,6 +3397,49 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * Sin eso el caso no se puede escribir: la atribución equivocada daría el mismo
        * veredicto que la correcta y la sonda pasaría por los dos motivos.
        */
+      /*
+       * Cuatro formas más de escribir lo mismo, las cuatro medidas 2026-09-05 en
+       * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   values (…), (…)          la SEGUNDA tupla, que es donde no se mira
+       *   d = now()                plpgsql también asigna con `=` a secas
+       *   update t as x set …      el destino puede llevar alias
+       *   return next now()        con `returns setof date`
+       *
+       * La del `values` es la que más dice de cómo falla un reconocedor a mano: leía la
+       * primera tupla, y la primera suele ser la inocente.
+       *
+       * Y la del `=` va con su segura al lado, que es la que separa las dos cosas que ese
+       * signo significa. La comparación tiene que terminar EN el `;` para que el caso valga:
+       * en `if d = now() then …` la captura se lleva el `then …` detrás y ya no parece un
+       * reloj a secas, así que ese escrito no distingue nada. En `perform 1 where d = now();`
+       * sí —la captura es exactamente `now()`—, y ahí se ve que lo único que separa una
+       * asignación de una comparación es la POSICIÓN. Medido: 2026-09-04 en los dos husos, o
+       * sea que no elige calendario y marcarla sería un falso positivo.
+       */
+      [
+        'censo_probe_values_dos_tuplas_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          " values (1, date '2026-01-01'), (2, now()); end $c$",
+      ],
+      [
+        'censo_probe_asigna_igual_date',
+        'returns date language plpgsql as $c$ declare d date; begin d = now(); return d; end $c$',
+      ],
+      [
+        'censo_probe_update_alias_date',
+        'returns void language plpgsql as $c$' +
+          ' begin update censo_probe_escritura as x set d = now(); end $c$',
+      ],
+      [
+        'censo_probe_return_next_date',
+        'returns setof date language plpgsql as $c$ begin return next now(); end $c$',
+      ],
+      [
+        'censo_probe_ok_compara_igual',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          " d := timezone('UTC', now())::date; perform 1 where d = now(); return d; end $c$",
+      ],
       [
         'censo_probe_ok_conflicto_otra_tabla',
         'returns void language plpgsql as $c$ begin' +
@@ -3556,6 +3646,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_insert_posicional_date',
           'censo_probe_update_date',
           'censo_probe_conflicto_date',
+          'censo_probe_values_dos_tuplas_date',
+          'censo_probe_asigna_igual_date',
+          'censo_probe_update_alias_date',
+          'censo_probe_return_next_date',
         ].sort(),
       );
     } finally {
@@ -3600,6 +3694,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_insert_posicional_date',
         'censo_probe_update_date',
         'censo_probe_conflicto_date',
+        'censo_probe_values_dos_tuplas_date',
+        'censo_probe_asigna_igual_date',
+        'censo_probe_update_alias_date',
+        'censo_probe_return_next_date',
+        'censo_probe_ok_compara_igual',
         'censo_probe_ok_conflicto_instante',
         'censo_probe_ok_conflicto_otra_tabla',
         'censo_probe_ok_insert_instante',

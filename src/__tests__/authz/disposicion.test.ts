@@ -1472,11 +1472,15 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       commitea = r;
     });
 
-    // Un miembro escribe en el libro con el payload que quiere, y se queda sin commitear.
+    // Un miembro escribe en el libro con el payload que quiere —DOS veces, porque el tamaño
+    // de la ventana no es «una fila»: una transacción puede escribir varias, y una exportación
+    // en vuelo confirma su evento y su registro— y se queda sin commitear.
     const enVuelo = conUsuario(leadId, async (tx) => {
-      await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-        values (${ws}, 'AuthzTest', ${tx.json({ colado: 'texto elegido' })}::jsonb,
-                ${leadId}, 'lead-boutique')`;
+      for (const n of [1, 2]) {
+        await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+          values (${ws}, 'AuthzTest', ${tx.json({ colado: `texto elegido ${n}` })}::jsonb,
+                  ${leadId}, 'lead-boutique')`;
+      }
       escrito();
       await puedeCommitear;
     });
@@ -1492,10 +1496,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     commitea();
     await enVuelo;
 
-    // Lo que queda: el evento de la disposición y el que se coló. Ni uno más.
+    // Lo que queda: el evento de la disposición y los DOS que se colaron.
     const filas = await admin`select tipo from evento_dominio where workspace_id = ${ws}
       order by tipo`;
-    expect(filas.map((f) => f.tipo)).toEqual(['AuthzTest', 'WorkspaceDispuesto']);
+    expect(filas.map((f) => f.tipo)).toEqual(['AuthzTest', 'AuthzTest', 'WorkspaceDispuesto']);
 
     // Y el tamaño de la ventana: una fila suelta y nada más. No devuelve acceso a lo
     // destruido —el resto del workspace sigue vacío— ni permite leerla, porque la RLS del
@@ -1506,9 +1510,13 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       where workspace_id = ${ws}`);
     expect(suyas.length).toBe(0);
 
-    // Y el alcance sellado la declara, en vez de que el recibo prometa de más.
+    // Y el alcance sellado la declara con su tamaño REAL —«varias», no «una»—, en vez de que
+    // el recibo prometa de más. Una versión anterior de este texto decía «una fila suelta», y
+    // era falso por dos vías: una exportación en vuelo confirma su evento Y su registro, y una
+    // transacción puede escribir varios eventos, que es lo que este caso provoca.
     expect(c.alcance).toContain('escribiendo en el libro de auditoría');
-    expect(c.alcance).toContain('ventana declarada');
+    expect(c.alcance).toContain('VARIAS filas');
+    expect(c.alcance).not.toContain('una fila suelta');
   });
 
   it('los conteos de un archivo cuadran tabla a tabla con lo que queda, y la única diferencia está declarada', async () => {

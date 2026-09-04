@@ -170,6 +170,9 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     const wss = [ws, wsB].filter((id) => id !== '');
     if (wss.length > 0) {
       await admin`delete from evento_dominio where workspace_id in ${admin(wss)}`;
+      // El registro infalsificable de exportaciones: lo escribe `registrar_exportacion`, que
+      // este suite invoca en casi todos sus casos, y cuelga del workspace por FK.
+      await admin`delete from exportacion_registro where workspace_id in ${admin(wss)}`;
       await admin`delete from arquetipo_evidencia where workspace_id in ${admin(wss)}`;
       await admin`delete from arquetipo where workspace_id in ${admin(wss)}`;
       await admin`delete from cita where workspace_id in ${admin(wss)}`;

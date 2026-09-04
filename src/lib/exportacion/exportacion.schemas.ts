@@ -314,6 +314,11 @@ export const CATALOGO_EXPORT = [
   // expediente de la relación comercial: `acuerdo_disposicion.base` cita cláusula, contrato o
   // acta, que es lo más lejano al material que hay en todo el esquema. Mismo criterio con el
   // que ya están fuera el método, la medición y el post mortem.
+  // Qué exportaciones se ejecutaron de verdad. Va al archivo del propietario como todo lo que
+  // lleva `workspace_id`, y queda FUERA del entregable por lo mismo que la disposición: es
+  // traza de operación, no material citable. La aplicación solo puede LEERLA — es lo que la
+  // hace servir de prueba de que la entrega previa a una disposición ocurrió.
+  { tabla: 'exportacion_registro', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'acuerdo_disposicion', orden: 'version, id', poda: { modo: 'fuera' } },
   { tabla: 'constancia_disposicion', orden: 'acuerdo_version, id', poda: { modo: 'fuera' } },
 ] as const satisfies readonly EntradaCatalogo[];

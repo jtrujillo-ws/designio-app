@@ -500,6 +500,62 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     }
   });
 
+  it('un evento de exportación escrito a mano NO desbloquea la disposición', async () => {
+    // La exportación previa que RF-01.9 exige tiene que ser una PRUEBA, no una afirmación. Con
+    // la condición apoyada en `evento_dominio`, cualquier miembro podía escribírsela: la app
+    // tiene grant de INSERT sobre `tipo` y `payload` y la política solo pide membresía. Con eso
+    // se simulaba una entrega que nunca ocurrió y se desbloqueaba el archivo — y, con la
+    // segunda firma, el borrado irreversible. El esquema ya declaraba falsificable ese dato en
+    // otra migración; aquí se deja de aceptar como prueba.
+    const ws = await nuevoWorkspace('exportacion-falsa');
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws,
+      modalidad: 'borrado',
+      base: 'Acuerdo con exportación simulada',
+      efectivoDesde: new Date().toISOString().slice(0, 10),
+    });
+
+    // El evento, escrito por el ROL DE APLICACIÓN: exactamente lo que un miembro puede hacer.
+    await conUsuario(leadId, (tx) => tx`insert into evento_dominio
+      (workspace_id, tipo, payload, actor_id, actor_rol)
+      values (${ws}, 'WorkspaceExportado', ${tx.json({ ambito: 'archivo' })}::jsonb,
+              ${leadId}, 'lead-boutique')`);
+
+    // Sigue bloqueada, y lo dice por el motivo correcto.
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/exportación previa/i);
+    await expect(
+      ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'borrado' }),
+    ).rejects.toThrow(/exportación previa/i);
+
+    // Y la aplicación tampoco puede escribir el registro que sí cuenta.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into exportacion_registro
+        (workspace_id, ambito, ejecutado_por, ejecutado_rol)
+        values (${ws}, 'archivo', ${leadId}, 'lead-boutique')`),
+    ).rejects.toMatchObject({ code: '42501' });
+
+    // Exportando de verdad —por la función que autoriza y sella— sí se desbloquea.
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
+  });
+
+  it('la lápida no conserva el cupo pactado: es condición del contrato que se borró', async () => {
+    // `workspace` dejó de ser `(id, nombre, creado_en)` cuando nació el cupo de llamadas AI, y
+    // la exportación lo trata como dato propio del workspace. Si la lápida lo conservara,
+    // sobreviviría al borrado una condición pactada con una organización cuyos datos se acaban
+    // de destruir — y no figura entre las ausencias que la constancia declara.
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('lapida-cupo');
+    await admin`update workspace set limite_llamadas_ai_dia = 40 where id = ${ws}`;
+    await acordarYExportar(ws, 'borrado', adminId);
+    await ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'borrado' });
+
+    const [w] = await admin`select nombre, limite_llamadas_ai_dia from workspace
+      where id = ${ws}`;
+    expect(w!.nombre).toBe('Workspace borrado por acuerdo');
+    expect(w!.limite_llamadas_ai_dia).toBeNull();
+  });
+
   it('la carga canónica reproduce jsonb::text de Postgres, clave a clave', async () => {
     // El sello se calcula sobre `conteos::text` y `remediacion::text`, así que la app tiene que
     // imprimir jsonb EXACTAMENTE como Postgres o la constancia no verifica en manos de nadie.

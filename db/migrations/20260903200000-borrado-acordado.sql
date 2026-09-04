@@ -80,6 +80,81 @@ language sql immutable parallel safe as $$
   select 'Alcance (whitespace-constancia/1): cubre TODA fila del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, derivada del catálogo vivo de la base y no de una lista escrita a mano. NO cubre: (1) las cuentas de usuario, que son identidad de plataforma y pueden pertenecer a otros workspaces, así que su borrado es otra operación con su propio acuerdo; (2) el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor, porque los bytes enviados no se des-envían.'
 $$;
 
+-- ── La exportación previa tiene que ser INFALSIFICABLE ────────────────────────────────
+/*
+ * RF-01.9 exige que el archivo completo se entregue ANTES de disponer, y hasta aquí esa
+ * condición se comprobaba mirando un `evento_dominio` de tipo `WorkspaceExportado`. Eso no
+ * vale como prueba: la aplicación tiene grant de INSERT sobre `tipo` y `payload` y la política
+ * solo pide membresía, así que CUALQUIER miembro podía escribirse el evento a mano y simular
+ * una exportación que nunca se generó ni se entregó. Con eso desbloqueaba el archivo y —con la
+ * segunda firma— el borrado irreversible. El esquema ya lo tenía dicho en otro sitio: la
+ * migración de la procedencia del sembrado declara explícitamente que el tipo y el payload de
+ * un evento son falsificables, y por eso movió su marcador a una tabla propia.
+ *
+ * Se hace lo mismo. La condición pasa a apoyarse en una fila que la aplicación NO puede
+ * fabricar: sin grant ni política de INSERT, la escribe únicamente `registrar_exportacion`,
+ * que es la misma función que autoriza la exportación. Es la diferencia entre un sello y una
+ * afirmación.
+ *
+ * El evento se sigue emitiendo: es la auditoría legible de RF-01.6 y no cambia. Lo que cambia
+ * es qué se acepta como PRUEBA.
+ */
+create table exportacion_registro (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspace(id),
+  ambito text not null check (ambito in ('archivo', 'entregable')),
+  ejecutado_por uuid not null references usuario(id),
+  ejecutado_rol text not null,
+  creado_en timestamptz not null default now(),
+  unique (id, workspace_id)
+);
+comment on table exportacion_registro is
+'Qué exportaciones se ejecutaron de verdad. Escribible SOLO por el propietario, a través de registrar_exportacion: es lo que la convierte en prueba de que la entrega previa a una disposición ocurrió, en vez de en una afirmación que cualquier miembro puede escribir.';
+
+create index exportacion_registro_ws_idx
+  on exportacion_registro (workspace_id, ambito, creado_en desc);
+
+alter table exportacion_registro enable row level security;
+
+-- SELECT sí —SYS-04 exige que el archivo del propietario lleve todo lo del workspace, y la
+-- exportación corre bajo RLS con el rol de aplicación, así que una tabla ilegible rompería la
+-- exportación entera—. Lo que no existe, y es todo el punto, es política ni grant de INSERT,
+-- UPDATE o DELETE.
+create policy exportacion_registro_select on exportacion_registro
+  for select using (is_workspace_member(app_user_id(), workspace_id));
+grant select on exportacion_registro to designio_app;
+
+-- La misma función que ya autorizaba y auditaba, ahora dejando además el sello. Cuerpo copiado
+-- del árbol migrado con `pg_get_functiondef`; el insert de abajo es el único cambio.
+create or replace function registrar_exportacion(p_ws uuid, p_ambito text) returns text
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_rol text;
+begin
+  if p_ambito not in ('archivo', 'entregable') then
+    raise exception 'ámbito de exportación desconocido: %', p_ambito;
+  end if;
+  v_rol := workspace_role(app_user_id(), p_ws);
+  if coalesce(v_rol, '') not in ('lead-boutique', 'admin-cliente') then
+    raise exception 'solo lead-boutique o admin-cliente ejecutan la exportación del workspace'
+      using errcode = 'insufficient_privilege';
+  end if;
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+  values (p_ws, 'WorkspaceExportado', jsonb_build_object('ambito', p_ambito),
+          app_user_id(), v_rol);
+  insert into exportacion_registro (workspace_id, ambito, ejecutado_por, ejecutado_rol)
+  values (p_ws, p_ambito, app_user_id(), v_rol);
+  return v_rol;
+end $$;
+
+-- ── Y NO se migran los eventos viejos ─────────────────────────────────────────────────
+-- Copiar aquí los `WorkspaceExportado` que ya existan sería meter en el sitio infalsificable
+-- justo el dato que se acaba de declarar falsificable: el ataque quedaría consumado por la
+-- migración. Una base con exportaciones previas se queda sin registro de ellas, y lo que eso
+-- significa es que hay que volver a exportar antes de disponer — que es exactamente la
+-- conducta correcta cuando la prueba anterior no era prueba. Fallar cerrado también cuando el
+-- que falla cerrado es el upgrade.
+
 -- ── El acuerdo, como bitácora versionada (RF-01.9 «según el acuerdo») ─────────────────
 create table acuerdo_disposicion (
   id uuid primary key default gen_random_uuid(),
@@ -234,7 +309,8 @@ $$;
 create function tablas_congelables() returns table (tabla text)
 language sql stable as $$
   select t.tabla from tablas_del_workspace() t
-  where t.tabla not in ('acuerdo_disposicion', 'constancia_disposicion', 'evento_dominio')
+  where t.tabla not in ('acuerdo_disposicion', 'constancia_disposicion', 'evento_dominio',
+                        'exportacion_registro')
 $$;
 
 -- ── Quién firmó el acuerdo que una constancia ejecutó ─────────────────────────────────
@@ -516,9 +592,11 @@ begin
   -- ACUERDO, que es la mitad que se escapa: un archivo entregado antes de pactar la
   -- disposición no refleja lo que se acordó disponer, así que certificar sobre él sería
   -- certificar sobre otra cosa.
-  select max(e.creado_en) into v_export from evento_dominio e
-    where e.workspace_id = p_ws and e.tipo = 'WorkspaceExportado'
-      and e.payload->>'ambito' = 'archivo';
+  -- Alias `xp` y no `r`: `ejecutar_disposicion` declara una variable `record r` para recorrer
+  -- las tablas, y en plpgsql la variable GANA al alias de la consulta. Con `r` aquí, la
+  -- referencia se resuelve contra el record sin asignar y revienta en tiempo de ejecución.
+  select max(xp.creado_en) into v_export from exportacion_registro xp
+    where xp.workspace_id = p_ws and xp.ambito = 'archivo';
   if v_export is null then
     return 'Falta la exportación previa: el archivo completo del workspace se entrega ANTES de disponer de él (RF-01.8/01.9)';
   end if;
@@ -603,9 +681,11 @@ begin
   v_rol := workspace_role(v_actor, p_ws);
   select * into v_ac from acuerdo_disposicion a
     where a.workspace_id = p_ws order by a.version desc limit 1;
-  select max(e.creado_en) into v_export from evento_dominio e
-    where e.workspace_id = p_ws and e.tipo = 'WorkspaceExportado'
-      and e.payload->>'ambito' = 'archivo';
+  -- Alias `xp` y no `r`: `ejecutar_disposicion` declara una variable `record r` para recorrer
+  -- las tablas, y en plpgsql la variable GANA al alias de la consulta. Con `r` aquí, la
+  -- referencia se resuelve contra el record sin asignar y revienta en tiempo de ejecución.
+  select max(xp.creado_en) into v_export from exportacion_registro xp
+    where xp.workspace_id = p_ws and xp.ambito = 'archivo';
 
   -- Remediación ANTES de tocar nada: lo que ya salió hacia un proveedor no lo alcanza este
   -- borrado, y el libro que lo sabe es de los que se vacían.
@@ -640,9 +720,19 @@ begin
         v_conteos := v_conteos || jsonb_build_object(r.tabla, v_n);
       end if;
     end loop;
-    -- La lápida: la fila sobrevive porque de ella cuelga todo, incluida la constancia; el
-    -- nombre no, porque es dato del cliente.
-    update workspace set nombre = 'Workspace borrado por acuerdo' where id = p_ws;
+    -- La lápida: la fila sobrevive porque de ella cuelga todo, incluida la constancia; su
+    -- CONTENIDO no, porque es dato del cliente. El nombre nombra a la organización, y el cupo
+    -- de llamadas AI es una condición pactada con ella — nada de eso tiene por qué sobrevivir
+    -- al borrado de lo que gobernaba.
+    --
+    -- Y se enumeran una a una a propósito, en vez de decir «la fila queda como estaba menos el
+    -- nombre»: `workspace` ya no es `(id, nombre, creado_en)` como suponía la primera versión
+    -- de esta migración —el cupo llegó después, y el archivo del propietario lo trata como dato
+    -- suyo—, así que lo que sobrevive tiene que ser una decisión escrita y no lo que quede por
+    -- omisión. El test que deriva las columnas de la base es quien obliga a revisar esto cuando
+    -- nazca la siguiente.
+    update workspace set nombre = 'Workspace borrado por acuerdo', limite_llamadas_ai_dia = null
+      where id = p_ws;
     -- La verificación que sustituye a las FK apagadas, y que es más fuerte que ellas.
     for r in select tabla from tablas_alcanzadas_por_borrado() loop
       execute format('select count(*) from %I where workspace_id = $1', r.tabla)

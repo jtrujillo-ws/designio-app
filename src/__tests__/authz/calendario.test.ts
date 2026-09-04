@@ -1904,7 +1904,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(culpables).toEqual([]);
   });
 
-  it('ni una vista, ni un CHECK, ni un default, ni una vista MATERIALIZADA', async () => {
+  it('ni una vista, ni un CHECK, ni un default, ni una vista MATERIALIZADA, ni una REGLA', async () => {
     /*
      * Los cuatro sitios que quedan donde una expresión se guarda y se vuelve a evaluar.
      *
@@ -1937,6 +1937,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       language plpgsql as $$ begin return new; end $$`;
     await admin`create trigger censo_tmp_trg before insert on censo_tmp_tabla
       for each row when (new.f > current_date) execute function censo_tmp_guard()`;
+    // Y una REGLA de reescritura, por lo mismo que la matview: hoy no hay ninguna real
+    // (medido: cero), así que sin sonda su rama estaría en verde por no mirar nada.
+    await admin`create table censo_tmp_regla_log (d date)`;
+    await admin`create rule censo_tmp_regla as on insert to censo_tmp_tabla
+      do also insert into censo_tmp_regla_log values (current_date)`;
     try {
     const categorias = {
       vista: await admin`select viewname as nombre, definition as cuerpo
@@ -1967,6 +1972,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         join pg_class c on c.oid = t.tgrelid
         join pg_namespace n on n.oid = c.relnamespace
         where n.nspname = 'public' and not t.tgisinternal`,
+      // La SÉPTIMA, y la última que queda: una REGLA de reescritura. No es una vista —esas
+      // son la regla `_RETURN` de su propia relación, y ya se cuentan por `pg_views`— sino la
+      // forma legada de `CREATE RULE … DO ALSO`: una expresión guardada que se inserta DENTRO
+      // de la sentencia de quien escribe y se evalúa en su sesión, igual que una condición
+      // `WHEN`. Ninguna de las otras seis mira `pg_rewrite`, así que una regla calendárica
+      // pasaba entera. Medido: hoy este repositorio no tiene ninguna, y precisamente por eso
+      // entra — un censo cubre la clase, no los hallazgos.
+      regla: await admin`select c.relname || ' / ' || r.rulename as nombre,
+             pg_get_ruledef(r.oid) as cuerpo
+        from pg_rewrite r
+        join pg_class c on c.oid = r.ev_class
+        join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and r.rulename <> '_RETURN'`,
     };
 
     /* Lo que cada categoría tiene que estar mirando para que su verde signifique algo. */
@@ -1978,6 +1996,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Uno: el que fabrica la sonda. Hoy no hay ninguna real, y por eso su rama se comprueba
       // con ella en vez de con un conteo — cero es el conteo correcto y no prueba nada.
       matview: 1,
+      regla: 1,
     };
       for (const [nombre, filas] of Object.entries(categorias)) {
         expect(filas.length, `la rama «${nombre}» no está mirando nada`).toBeGreaterThanOrEqual(
@@ -1994,12 +2013,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         const esperadas: Record<string, string[]> = {
           matview: ['matview censo_tmp_matview'],
           trigger: ['trigger censo_tmp_trg on censo_tmp_tabla'],
+          regla: ['regla censo_tmp_tabla / censo_tmp_regla'],
         };
         expect(culpables).toEqual(esperadas[nombre] ?? []);
       }
     } finally {
       await admin`drop materialized view censo_tmp_matview`;
       await admin`drop table censo_tmp_tabla cascade`;
+      await admin`drop table censo_tmp_regla_log cascade`;
       await admin`drop function censo_tmp_guard()`;
     }
   });

@@ -1418,6 +1418,53 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
+  it('un cierre fallido tras una llamada sin propuesta no se traga: queda registrado', async () => {
+    // El momento en que el fallo se conoce era el único, y un `catch` vacío lo descartaba: la
+    // fila se queda en `despachada` para siempre, el trigger no llega a emitir
+    // `LlamadaAISinPropuesta` y no hay ninguna ruta de reconciliación que las recoja después.
+    // La persona sigue leyendo el motivo del PROVEEDOR —que es lo que explica lo que pasó, y
+    // un detalle de la base no la ayuda a decidir—, pero el servidor se entera.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item cuyo cierre se pierde tras un rechazo', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    const registrado = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await conProveedor(RESPUESTA_RECHAZO, async () => {
+        // La línea se cierra POR FUERA mientras la llamada está en vuelo, así que el cierre
+        // legítimo ya no la alcanza: la política filtra y el UPDATE toca cero filas.
+        proveedor.duranteLlamada = async () => {
+          await admin`update llamada_ai set resultado = 'sin-respuesta', motivo = 'cerrada por fuera'
+            where workspace_id = ${ws} and item_id = ${itemId} and resultado = 'despachada'`;
+        };
+        try {
+          // Lo que la persona lee sigue siendo el motivo del proveedor.
+          await expect(
+            generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+          ).rejects.toThrow(/se negó a procesar/);
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+
+      // Y el fallo del cierre consta, con lo que hace falta para encontrar la línea.
+      const dicho = registrado.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(dicho).toMatch(/no se pudieron cerrar las líneas/i);
+      expect(dicho).toContain(ws);
+    } finally {
+      registrado.mockRestore();
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
   it('revocar mientras el material viaja: la llamada ya salió, pero ninguna propuesta nace', async () => {
     const itemId = await nuevoItem('Entrevista revocada a media llamada', 'entrevista');
     await registrarConsentimiento(leadId, {

@@ -1307,6 +1307,37 @@ async function cerrarLlamadas(
 }
 
 /**
+ * Cierra las líneas de una generación que acabó SIN propuesta, sin dejar que un fallo del
+ * cierre tape el motivo del proveedor — que es el que la persona necesita leer— y sin
+ * tragárselo.
+ *
+ * Un `catch` vacío costaba la única señal de que algo quedó a medias: la fila se queda en
+ * `despachada` indefinidamente, el trigger no llega a emitir `LlamadaAISinPropuesta` y en el
+ * repositorio no hay ninguna ruta de reconciliación que las recoja después. O sea que el
+ * momento en que el fallo se conoce era el único, y se descartaba.
+ *
+ * No se le añade al mensaje de la persona: el motivo del proveedor es lo que explica lo que
+ * pasó, y un detalle de la base no la ayuda a decidir. Va al registro del servidor, con el
+ * workspace y los ids de las líneas, que es lo que hace falta para encontrarlas.
+ */
+async function cerrarSinTaparElMotivo(
+  actorId: string,
+  entrada: GenerarPropuestas,
+  intentos: IntentoProveedor[],
+): Promise<void> {
+  try {
+    await cerrarLlamadas(actorId, intentos);
+  } catch (e) {
+    console.error(
+      '[ai] no se pudieron cerrar las líneas del libro de costos de una generación sin ' +
+        `propuesta (workspace ${entrada.workspaceId}, líneas ` +
+        `${intentos.map((i) => i.registroId).join(', ')}): quedan en «despachada», cuentan ` +
+        `para el tope y no llevan su desenlace. Causa: ${(e as Error).message}`,
+    );
+  }
+}
+
+/**
  * Genera propuestas para un ancla (RF-08.1). Nada del dominio cambia aquí: solo nacen
  * filas de `propuesta_ai` en estado `propuesta`, con su lineage completo (SYS-19).
  * Devuelve cuántas quedaron pendientes de revisión humana.
@@ -1336,12 +1367,12 @@ export async function generarPropuestas(
       anotarDespacho: (modelo, puesto) => abrirLlamada(actorId, entrada, alcance, modelo, puesto),
     });
 
-    // El proveedor no dio contenido utilizable. Los intentos se anotan igual —con su uso,
+    // El proveedor no dio contenido utilizable. Los intentos se cierran igual —con su uso,
     // si la respuesta llegó a existir— y solo DESPUÉS se corta: registrar el gasto no puede
-    // depender de que el resultado nos guste. Si el propio registro falla, manda el motivo
-    // del proveedor: es lo que la persona necesita leer.
+    // depender de que el resultado nos guste. Si el propio cierre falla, manda el motivo del
+    // proveedor: es lo que la persona necesita leer.
     if (!respuesta.ok) {
-      await cerrarLlamadas(actorId, respuesta.intentos).catch(() => {});
+      await cerrarSinTaparElMotivo(actorId, entrada, respuesta.intentos);
       throw new ErrorAI(respuesta.motivo);
     }
 
@@ -1361,7 +1392,7 @@ export async function generarPropuestas(
           ? { ...i, resultado: 'fuera-de-contrato' as const, motivo }
           : i,
       );
-      await cerrarLlamadas(actorId, intentos).catch(() => {});
+      await cerrarSinTaparElMotivo(actorId, entrada, intentos);
       throw new ErrorAI(motivo);
     }
 

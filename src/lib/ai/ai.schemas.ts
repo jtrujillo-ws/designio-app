@@ -380,8 +380,8 @@ export type PanelPropuestas = {
    */
   respaldo: { aceptadas: number; corregidas: number; rechazadas: number };
   hayMasPendientes: boolean;
-  /** Cuántas pendientes hay en total, no cuántas caben. Con la cola ordenada por confianza,
-   * lo que el corte deja fuera son las menos fiables, así que decir el número es lo que
+  /** Cuántas pendientes hay en total, no cuántas caben. Con la cola ordenada por confianza
+   * ASCENDENTE, lo que el corte deja fuera son las más fiables, así que decir el número es lo que
    * distingue «esto es todo» de «esto es lo que cabe». */
   totalPendientes: number;
   hayMasDecididas: boolean;

@@ -42,6 +42,7 @@ import {
 import {
   credencialesAI,
   generarConProveedor,
+  type ApunteDespacho,
   type IntentoProveedor,
 } from './proveedor.server';
 
@@ -128,7 +129,36 @@ async function presupuestoDeHoy(
   const [fila] = await tx`select
       (select count(*) from llamada_ai
         where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now())
-          and resultado <> 'sin-respuesta')::int as atendidas,
+          and resultado <> 'sin-respuesta'
+          -- Una línea EN VUELO no se cuenta dos veces. Con el libro anticipado la fila nace
+          -- antes de llamar, así que durante la llamada coexiste con la reserva que ya apartó
+          -- su hueco: sumar las dos cobraba el doble por la misma generación durante hasta dos
+          -- timeouts, y con un cupo pequeño eso echaba fuera al siguiente curador.
+          --
+          -- La exclusión mira si sigue viva LA RESERVA QUE PAGÓ ESTA LLAMADA, por su id. Ni el
+          -- tiempo transcurrido ni el ancla sirven, y las dos formas de equivocarse dejan el
+          -- mismo agujero por caminos distintos:
+          --
+          --  · por TIEMPO: cuando el cierre falla, la limpieza retira la reserva en el acto,
+          --    pero la fila seguía sin contar el resto de la ventana. En ese hueco no contaba
+          --    ni la reserva ni la llamada pagada.
+          --  · por ANCLA: retirada la reserva, la línea huérfana cuenta — hasta que el
+          --    reintento crea una reserva NUEVA sobre la misma ancla y vuelve a esconderla.
+          --    Esa reserva presupuesta la generación nueva, no la vieja, así que con fallos
+          --    repetidos se acumulaban líneas huérfanas invisibles bajo una sola reserva.
+          --
+          -- Las dos dejaban reintentar por encima del cupo, que es justo el fallo posterior al
+          -- despacho que este cambio existe para contener. Por identidad no hay ambigüedad: en
+          -- cuanto la reserva desaparece —por limpieza, por revocación o por caducidad— su
+          -- línea cuenta, y ninguna otra reserva la cubre. Es la dirección segura para una
+          -- llamada cuyo cierre se perdió, porque ante la duda de si el proveedor cobró se
+          -- asume que sí; una fila sin reserva anotada cuenta por lo mismo.
+          and (resultado <> 'despachada' or not exists (
+            select 1 from reserva_ai r
+            where r.id = llamada_ai.reserva_id
+              and r.workspace_id = llamada_ai.workspace_id
+              and r.creado_en > now() - reserva_ai_ventana()
+          )))::int as atendidas,
       (select coalesce(sum(unidades), 0) from reserva_ai
         where workspace_id = ${workspaceId} and creado_en > now() - reserva_ai_ventana())::int
         as reservadas,
@@ -139,27 +169,37 @@ async function presupuestoDeHoy(
       -- workspace y su reloj, así que el aislamiento por inquilino y la caducidad vienen
       -- dados y no hay interruptor que se pueda quedar pegado en caido.
       --
-      -- Se mira el intento MAS RECIENTE, no "hubo alguna caida": una llamada buena posterior
-      -- tiene que borrar la caida al instante, porque la ultima observacion es la unica que
-      -- habla del presente.
+      -- Se mira la OBSERVACION mas reciente, no "hubo alguna caida": una llamada buena
+      -- posterior tiene que borrar la caida al instante, porque la ultima observacion es la
+      -- unica que habla del presente.
       --
-      -- El desempate es el PUESTO del intento, no su id. Dos intentos de una generacion
-      -- degradada comparten creado_en exacto —now() es la hora de inicio de la transaccion—
-      -- y el id es un uuid v4, o sea aleatorio: desempatar por el daba un orden total pero
-      -- NO cronologico, y tras una degradacion con exito el primario fallido salia elegido
-      -- como "ultimo intento" la mitad de las veces. El panel avisaba de una caida justo
-      -- despues de una generacion correcta. El id se queda al final solo para que el orden
-      -- siga siendo total entre filas anteriores a la columna, que empatan todas en 0.
+      -- Y "mas reciente" se mide por cerrado_en, no por creado_en. Con el libro
+      -- anticipado la fila nace al DESPACHAR, asi que creado_en dejo de ser el momento en
+      -- que se supo el desenlace: entre dos llamadas concurrentes, la que salio primero puede
+      -- ser la ultima en volver, y ordenar por el despacho elegiria la equivocada. Ademas la
+      -- antiguedad de una caida salia inflada por todo el timeout, y la ventana de salud
+      -- caducaba antes de tiempo.
+      --
+      -- Las lineas todavia EN VUELO (despachada) se excluyen: no son una observacion, son
+      -- una pregunta sin responder. Contarlas como la mas reciente borraba un aviso de caida
+      -- de verdad en cuanto alguien pedia otra generacion, que es justo cuando el aviso hace
+      -- falta.
+      --
+      -- El desempate sigue siendo el PUESTO del intento y luego el id: clock_timestamp()
+      -- separa a los hermanos de una misma transaccion, pero el puesto es lo que da el orden
+      -- verdadero si dos sellos empataran, y el id lo deja total para las filas anteriores a
+      -- la columna.
       --
       -- Solo sin-respuesta: un rechazo del proveedor o una salida fuera de contrato son
       -- llamadas ATENDIDAS, el tercero contesto y de hecho cobro. Contarlas como caida
       -- pintaria el proveedor de rojo por un material que el modelo se niega a procesar,
       -- que es un problema del material y no de la disponibilidad.
       (select case when u.resultado = 'sin-respuesta'
-                then (extract(epoch from (now() - u.creado_en)) * 1000)::bigint end
+                then (extract(epoch from (now() - coalesce(u.cerrado_en, u.creado_en)))
+                        * 1000)::bigint end
          from llamada_ai u
-        where u.workspace_id = ${workspaceId}
-        order by u.creado_en desc, u.intento desc, u.id desc
+        where u.workspace_id = ${workspaceId} and u.resultado <> 'despachada'
+        order by coalesce(u.cerrado_en, u.creado_en) desc, u.intento desc, u.id desc
         limit 1) as caida_hace_ms`;
   // El cupo pactado del workspace manda; la constante del código es el RESPALDO para
   // «no hay cupo pactado» (NULL) y para cualquier valor que no sea un entero positivo, no
@@ -405,21 +445,33 @@ export async function panelPropuestas(
     // Se pide una fila de más para saber si el corte dejó algo fuera (mismo truco que la
     // bandeja): el panel lo dice en vez de fingir que eso es todo.
     //
-    // Y el orden es por CONFIANZA, no por antigüedad. Persistir `confianza` argumentando que
-    // «ordena la revisión humana» y después no ordenar por ella no entrega esa conducta: con
-    // FIFO puro, una propuesta nueva y sólida se quedaba detrás de cien viejas y flojas, y el
-    // dato no servía para nada. La antigüedad sigue siendo el desempate, así que entre iguales
-    // manda la cola de siempre y el drenaje no se rompe.
+    // Y el orden es por CONFIANZA ASCENDENTE: lo más dudoso primero. Persistir `confianza`
+    // argumentando que «ordena la revisión humana» y después no ordenar por ella no entrega esa
+    // conducta —con FIFO puro, una propuesta nueva y endeble se quedaba detrás de cien viejas y
+    // sólidas—, pero la DIRECCIÓN importa tanto como el hecho de ordenar.
     //
-    // `nulls last` porque «sin confianza declarada» no es «confianza cero»: son las sembradas
-    // o las escritas por SQL crudo, y van al final sin fingir un valor que nadie dijo.
+    // Va ascendente porque la revisión humana es el recurso escaso del pipeline, y lo escaso se
+    // gasta donde más rinde. Una propuesta que el modelo declara muy segura es la que menos
+    // probablemente cambie al mirarla; una que declara dudosa es donde el ojo humano decide de
+    // verdad. Con el orden descendente, la persona empezaba por lo que casi seguro iba a
+    // aceptar tal cual y llegaba cansada —o no llegaba— a lo que había que corregir.
+    //
+    // La antigüedad sigue siendo el desempate, así que entre iguales manda la cola de siempre y
+    // el drenaje no se rompe.
+    //
+    // `nulls last` NO se invierte, y conviene decir por qué en vez de dejarlo raro: «sin
+    // confianza declarada» no es «confianza cero». Son las sembradas o las escritas por SQL
+    // crudo. Moverlas al frente al invertir el orden sería tratar la ausencia del dato como el
+    // valor más dudoso posible, que es justo la mentira que `nulls last` existe para no contar.
     const pendientes = await tx`select ${columnas} ${origen}
       where p.workspace_id = ${workspaceId} and p.estado = 'propuesta'
-      order by p.confianza desc nulls last, p.creado_en asc, p.id asc
+      order by p.confianza asc nulls last, p.creado_en asc, p.id asc
       limit ${PAGINA_PENDIENTES + 1}`;
     // Cuántas hay en total, para que el recorte diga un número y no «hay más». Con el orden
-    // por confianza, lo que queda detrás del corte son las MENOS fiables: saber cuántas son
-    // es lo que convierte el corte en algo que se puede drenar en vez de en un final falso.
+    // ascendente, lo que queda detrás del corte son las que el modelo dio por MÁS fiables —lo
+    // contrario que antes—, así que el número importa por otra razón: lo escondido ya no es lo
+    // que más urge mirar, pero sigue siendo trabajo pendiente, y decir cuánto es lo que
+    // convierte el corte en algo que se puede drenar en vez de en un final falso.
     const [conteo] = await tx`select count(*)::int as n from propuesta_ai
       where workspace_id = ${workspaceId} and estado = 'propuesta'`;
 
@@ -982,13 +1034,28 @@ async function liberarReserva(
  * versionada es justo lo que hace ese caso alcanzable: un registro con
  * `procesamiento_externo = false` puede pasar a vigente ahí en medio.
  *
+ * Recibe la TRANSACCIÓN en vez de abrir la suya, y ahí está la mitad que faltaba. Antes esto
+ * commiteaba y después `abrirLlamada` abría otra transacción para anotar la línea: entre las
+ * dos volvía a caber la misma revocación, y ni la FK del consentimiento ni el guard la
+ * atrapaban —la versión citada sigue existiendo, solo ha dejado de ser la vigente, y el guard
+ * únicamente exige que se cite alguna—. Así que el permiso se lee en la MISMA transacción que
+ * abre el libro, que es la última que toca la base antes del despacho. Un candado no puede
+ * llegar más cerca que eso.
+ *
+ * Y por eso lo invoca UNA sola vía. El respaldo de una degradación ya se re-autorizaba —«el
+ * segundo despacho se autoriza otra vez, o no sale»—, pero el primario no: la misma regla
+ * escrita para un intento y no para el otro. Con la comprobación dentro del apunte, y el
+ * apunte antes de cada despacho, los dos intentos pasan por ella sin que nadie tenga que
+ * acordarse.
+ *
  * Qué se puede garantizar y qué no, dicho sin rodeos:
  *
  *  · **Sí**: que en el INSTANTE DEL DESPACHO el consentimiento vigente autoriza el
  *    procesamiento externo, y que el hueco de presupuesto sigue vivo. La lectura se hace
  *    bajo el MISMO candado por item que toma `registrarConsentimiento`, así que una
  *    revocación a medio commit no se lee a medias: o se espera a que termine y se ve, o
- *    todavía no había empezado.
+ *    todavía no había empezado. Y como la línea del libro nace en esa misma transacción, lo
+ *    leído no puede quedarse viejo entre la comprobación y el apunte.
  *  · **No**: que una revocación que llegue mientras los bytes viajan alcance a la llamada.
  *    Ningún candado puede abarcar una petición HTTP fuera de transacción, y eso es
  *    deliberado — un tercero lento no puede retener una conexión de la base. Lo que sí
@@ -996,14 +1063,22 @@ async function liberarReserva(
  *    lee el vigente y ninguna propuesta llega a nacer, y la llamada queda en el libro con
  *    su coste. El material que ya salió no se puede des-enviar, y la UI lo dice.
  */
-async function confirmarDespacho(
+async function comprobarDespacho(
+  tx: TransactionSql,
   actorId: string,
   entrada: GenerarPropuestas,
   alcance: Alcance,
 ): Promise<number | null> {
   let versionConsentimiento: number | null = null;
-  await conUsuario(actorId, async (tx) => {
+  {
     await exigirCuentaActiva(tx, actorId);
+    // La cuenta Y el rol. Comprobar solo la cuenta era media autorización: `prepararAlcance`
+    // exige rol curador y commitea, así que entre aquel commit y este despacho cabe una
+    // degradación a stakeholder — y quien deja de poder pedir propuestas deja de poder
+    // despachar material a un tercero. La política de inserción lo rechazaría de todos modos
+    // (es el suelo, y sigue estando), pero un 42501 llega aquí sin nada que decirle a la
+    // persona salvo «vuelve a intentarlo», que además es falso: reintentar no devuelve un rol.
+    await rolCurador(tx, actorId, entrada.workspaceId);
     if (entrada.capacidad === 'CI') {
       await bloquearConsentimiento(tx, entrada.anclaId);
       const [item] = await tx`select
@@ -1067,7 +1142,7 @@ async function confirmarDespacho(
         'La reserva de presupuesto de esta generación ya no está vigente (se retiró o caducó): no se llamó al proveedor. Vuelve a pedirla.',
       );
     }
-  });
+  }
   return versionConsentimiento;
 }
 
@@ -1102,72 +1177,169 @@ function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): Contenid
 }
 
 /**
- * Anota en el libro de costos (RF-09.14) TODOS los intentos contra el proveedor, haya
- * nacido o no una propuesta. Era la mitad que faltaba: una negativa del proveedor o una
- * salida fuera de contrato son llamadas atendidas y FACTURADAS, con su `usage` dentro, y se
- * perdían enteras porque el uso solo se guardaba colgado de una propuesta que en esos casos
- * no existe.
+ * Abre la línea del libro de costos para UN intento, ANTES de despacharlo (RF-09.14).
  *
- * Y son TODOS los intentos, no el último: una degradación de modelo son dos llamadas, las
- * dos ocurrieron y la del primario también falló por algo. Con una sola fila, la tasa de
- * error por modelo decía que el primario nunca falla y su latencia acababa sumada a la del
- * respaldo. Una fila por llamada, que es lo que la tabla promete.
- *
- * Transacción propia —todos los intentos entran o no entra ninguno— y ANTES de persistir el
- * lote: si el guardado falla después (una carrera por el item, un esquema que no cuadra),
- * las llamadas siguen anotadas porque el dinero se gastó igual. Devuelve los ids en el mismo
- * orden; el de la salida válida es el que las propuestas referencian, así que ninguna puede
- * existir sin su línea de gasto.
+ * Nace en `despachada`, que es el estado que significa «salió y su desenlace no consta». Si
+ * este insert falla, `generarConProveedor` no despacha: no se gasta lo que no se puede
+ * anotar.
  */
-async function registrarLlamadas(
+async function abrirLlamada(
   actorId: string,
   entrada: GenerarPropuestas,
   alcance: Alcance,
-  intentos: IntentoProveedor[],
-): Promise<{ ids: string[]; idSalidaValida: string | null }> {
-  if (intentos.length === 0) return { ids: [], idSalidaValida: null };
-  return conUsuario(actorId, async (tx) => {
-    // SIN `exigirCuentaActiva`, y es la única función del módulo que se lo salta a
-    // propósito. Anotar lo que pasó y autorizar lo que viene son dos preguntas distintas:
-    // la cuenta activa responde a la segunda —«¿puede esta persona actuar ahora?»— y aquí
-    // no se actúa, se registra un hecho consumado. Si la cuenta se desactiva con la llamada
-    // en vuelo, el proveedor ya respondió y quizá ya facturó; dejar caer la anotación
-    // borraría gasto real del libro y del tope, que es la misma doctrina que ya rige para
-    // `sin-respuesta` («no se sabe» no es «salió gratis») aplicada a un caso donde sí se
-    // sabe. La autorización de verdad no desaparece: la RLS sigue exigiendo que quien
-    // firma sea miembro con rol curador del workspace, y persistir propuestas —que sí es
-    // actuar— conserva su chequeo.
-    const ids: string[] = [];
-    let idSalidaValida: string | null = null;
-    // El índice del bucle ES el puesto del intento (0 primario, 1 respaldo): el adaptador
-    // devuelve `intentos` EN ORDEN y hasta ahora esa información se tiraba al persistir.
-    // Sin ella, dos filas de la misma transacción comparten `creado_en` y no hay forma
-    // cronológica de saber cuál fue la última.
-    for (const [puesto, intento] of intentos.entries()) {
-      const [fila] = await tx`insert into llamada_ai
-        (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado, motivo,
-         tokens_entrada, tokens_salida, costo_usd, latencia_ms, consentimiento_version,
-         intento, creado_por)
+  modelo: string,
+  puesto: number,
+): Promise<ApunteDespacho> {
+  try {
+    const [fila] = await conUsuario(actorId, async (tx) => {
+      // El permiso, en la MISMA transacción que abre la línea. La versión que se anota es la
+      // que se acaba de leer bajo el candado, no una que llegó de fuera: entre leerla y
+      // escribirla no hay commit por medio en el que pueda dejar de ser la vigente.
+      const consentimientoVersion = await comprobarDespacho(tx, actorId, entrada, alcance);
+      return tx`insert into llamada_ai
+        (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado,
+         consentimiento_version, reserva_id, intento, creado_por)
         values (${entrada.workspaceId}, ${entrada.capacidad},
                 ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
                 ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
-                ${intento.modelo}, ${alcance.origenKey}, ${intento.resultado},
-                ${intento.motivo.slice(0, 500)},
-                ${intento.uso?.entrada ?? null}, ${intento.uso?.salida ?? null},
-                ${intento.uso?.costoUsd ?? null}, ${intento.latenciaMs},
-                ${intento.consentimientoVersion}, ${puesto},
-                ${actorId})
+                ${modelo}, ${alcance.origenKey}, 'despachada',
+                ${consentimientoVersion}, ${alcance.reservaId}, ${puesto}, ${actorId})
         returning id`;
-      const id = fila!.id as string;
-      ids.push(id);
+    });
+    return { ok: true, registroId: fila!.id as string };
+  } catch (e) {
+    // No se lanza: el adaptador no lanza nunca (SYS-21) y quien llama necesita el motivo, no
+    // una excepción. Y sobre todo, el despacho NO ocurre — que es el punto entero.
+    //
+    // Pero un `catch` a secas mandaba «vuelve a intentarlo» para TODO, y no todo se arregla
+    // reintentando: el permiso retirado, el guard con su P0001, y una FK o un CHECK rotos no
+    // van a dejar de estarlo por insistir. Decirle a alguien que reintente lo que no puede
+    // funcionar es peor que no decir nada, porque se lo cree. Mismo criterio que usa la
+    // persistencia del lote.
+    //
+    // El primero es el motivo por el que NO se despacha casi siempre: el permiso se retiró, el
+    // ancla se curó o la reserva caducó entre que se preparó la llamada y el momento de
+    // sacarla. `comprobarDespacho` ya lo dice con las palabras que la persona necesita leer.
+    if (e instanceof ErrorAI) return { ok: false, motivo: e.message };
+    const err = e as { code?: string; message?: string };
+    if (err.code === 'P0001' && typeof err.message === 'string' && err.message.length > 0) {
+      return {
+        ok: false,
+        motivo: `${err.message.charAt(0).toUpperCase()}${err.message.slice(1)}`,
+      };
+    }
+    if (err.code === '23503' || err.code === '23514') {
+      return {
+        ok: false,
+        motivo:
+          'La línea del libro de costos de esta llamada no cumple las reglas del pipeline AI, así que no se despachó. No se arregla reintentando: revisa el consentimiento del material y el estado del ancla.',
+      };
+    }
+    return {
+      ok: false,
+      motivo:
+        'No se pudo abrir la línea del libro de costos para esta llamada, así que no se despachó. Vuelve a intentarlo; todo el flujo sigue disponible a mano.',
+    };
+  }
+}
+
+/**
+ * Cierra las líneas que `abrirLlamada` dejó en `despachada`, cada una con su desenlace.
+ *
+ * Aquí es donde se escriben el uso y el coste, que es el único momento en que ese dato
+ * existe: una negativa del proveedor y un JSON ilegible son respuestas completas y
+ * facturadas, y antes de esto se perdían enteras porque el uso solo se guardaba colgado de
+ * una propuesta que en esos casos no existe. Y son TODOS los intentos, no el último: una
+ * degradación de modelo son dos llamadas, las dos ocurrieron y la del primario también falló
+ * por algo. Con una sola fila, la tasa de error por modelo decía que el primario nunca falla
+ * y su latencia acababa sumada a la del respaldo.
+ *
+ * Transacción propia —todas las líneas se cierran o no se cierra ninguna— y ANTES de
+ * persistir el lote: si el guardado falla después, el gasto ya consta. Devuelve el id de la
+ * salida válida, que es el que las propuestas referencian, así que ninguna puede existir sin
+ * su línea de gasto.
+ *
+ * Si ESTO falla, ya no se pierde nada esencial: las filas se quedan en `despachada`, siguen
+ * contando para el tope y conservan ancla, modelo, credencial y consentimiento. Lo único que
+ * se pierde es el detalle del desenlace — que es exactamente el cambio de esta migración: el
+ * fallo pasó de «desaparece una llamada pagada» a «una llamada pagada consta con menos
+ * detalle».
+ */
+async function cerrarLlamadas(
+  actorId: string,
+  intentos: IntentoProveedor[],
+): Promise<{ idSalidaValida: string | null }> {
+  if (intentos.length === 0) return { idSalidaValida: null };
+  return conUsuario(actorId, async (tx) => {
+    // SIN `exigirCuentaActiva`, y es la única función del módulo que se lo salta a
+    // propósito. Anotar lo que pasó y autorizar lo que viene son dos preguntas distintas: la
+    // cuenta activa responde a la segunda —«¿puede esta persona actuar ahora?»— y aquí no se
+    // actúa, se cierra un hecho consumado. Si la cuenta se desactiva con la llamada en vuelo,
+    // el proveedor ya respondió y quizá ya facturó.
+    //
+    // Lo que la política de completar exige es AUTORÍA y MEMBRESÍA, no rol — y no es un
+    // descuido suyo sino el mismo razonamiento llevado hasta el final: pedir rol convertía una
+    // degradación a mitad de llamada en una línea `despachada` para siempre, sin desenlace ni
+    // coste. Lo que queda ata lo que hay que atar: la línea la cierra quien la abrió, y solo
+    // dentro del workspace al que pertenece.
+    let idSalidaValida: string | null = null;
+    for (const intento of intentos) {
+      const cerradas = await tx`update llamada_ai set
+          resultado = ${intento.resultado},
+          motivo = ${intento.motivo.slice(0, 500)},
+          tokens_entrada = ${intento.uso?.entrada ?? null},
+          tokens_salida = ${intento.uso?.salida ?? null},
+          costo_usd = ${intento.uso?.costoUsd ?? null},
+          latencia_ms = ${intento.latenciaMs}
+        where id = ${intento.registroId}
+        returning id`;
+      // La política de completar FILTRA en vez de rechazar, así que un cierre que no alcanza
+      // su fila sale sin error y con cero filas tocadas. Sin esta comprobación, eso pasaba
+      // por un cierre bueno: la propuesta se persistía apuntando a una línea que seguía
+      // `despachada`, sin coste ni latencia, y el panel la mostraba así para siempre.
+      if (cerradas.length !== 1) {
+        throw new ErrorAI(
+          'No se pudo cerrar la línea del libro de costos de esta llamada, así que la generación se descarta. La llamada queda anotada como despachada y cuenta para el presupuesto.',
+        );
+      }
       // El id que las propuestas referencian se busca por su RESULTADO, no por su posición:
       // como mucho hay un intento con salida válida (el bucle del adaptador para en el
-      // primero que la da), y depender del orden de un `returning` sería depender de algo
-      // que Postgres no promete.
-      if (intento.resultado === 'salida-valida') idSalidaValida = id;
+      // primero que la da).
+      if (intento.resultado === 'salida-valida') idSalidaValida = intento.registroId;
     }
-    return { ids, idSalidaValida };
+    return { idSalidaValida };
   });
+}
+
+/**
+ * Cierra las líneas de una generación que acabó SIN propuesta, sin dejar que un fallo del
+ * cierre tape el motivo del proveedor — que es el que la persona necesita leer— y sin
+ * tragárselo.
+ *
+ * Un `catch` vacío costaba la única señal de que algo quedó a medias: la fila se queda en
+ * `despachada` indefinidamente, el trigger no llega a emitir `LlamadaAISinPropuesta` y en el
+ * repositorio no hay ninguna ruta de reconciliación que las recoja después. O sea que el
+ * momento en que el fallo se conoce era el único, y se descartaba.
+ *
+ * No se le añade al mensaje de la persona: el motivo del proveedor es lo que explica lo que
+ * pasó, y un detalle de la base no la ayuda a decidir. Va al registro del servidor, con el
+ * workspace y los ids de las líneas, que es lo que hace falta para encontrarlas.
+ */
+async function cerrarSinTaparElMotivo(
+  actorId: string,
+  entrada: GenerarPropuestas,
+  intentos: IntentoProveedor[],
+): Promise<void> {
+  try {
+    await cerrarLlamadas(actorId, intentos);
+  } catch (e) {
+    console.error(
+      '[ai] no se pudieron cerrar las líneas del libro de costos de una generación sin ' +
+        `propuesta (workspace ${entrada.workspaceId}, líneas ` +
+        `${intentos.map((i) => i.registroId).join(', ')}): quedan en «despachada», cuentan ` +
+        `para el tope y no llevan su desenlace. Causa: ${(e as Error).message}`,
+    );
+  }
 }
 
 /**
@@ -1181,45 +1353,31 @@ export async function generarPropuestas(
 ): Promise<{ generadas: number }> {
   const alcance = await prepararAlcance(actorId, entrada);
   try {
-    // Última parada antes de que el material salga del sistema. Todo lo anterior está
-    // commiteado desde hace una transacción entera.
-    const versionConsentimiento = await confirmarDespacho(actorId, entrada, alcance);
-
     const respuesta = await generarConProveedor({
       key: alcance.key,
       capacidad: entrada.capacidad,
       sistema: alcance.sistema,
       usuario: alcance.usuario,
-      consentimientoVersion: versionConsentimiento,
-      // Degradar de modelo es un despacho NUEVO, no la misma llamada otra vez: ocurre con la
-      // primera ya terminada, el control de vuelta aquí y ni un byte en el aire. Así que se
-      // vuelve a pedir permiso con EXACTAMENTE la misma comprobación que autorizó el
-      // primario —consentimiento vigente bajo el candado por item, item aún pendiente, reto
-      // que sigue admitiendo criterios y reserva viva— y la versión que devuelve es la que
-      // ampara al respaldo. `confirmarDespacho` lanza `ErrorAI` al rechazar; aquí se traduce
-      // a un `ok:false` porque el adaptador no lanza nunca (SYS-21) y el motivo tiene que
-      // llegar al libro y a la pantalla como cualquier otro.
-      revalidar: async () => {
-        try {
-          return { ok: true, consentimientoVersion: await confirmarDespacho(actorId, entrada, alcance) };
-        } catch (e) {
-          return {
-            ok: false,
-            motivo:
-              e instanceof ErrorAI
-                ? e.message
-                : 'La autorización de esta generación dejó de ser válida antes de reintentar con el modelo de respaldo',
-          };
-        }
-      },
+      // Abrir la línea del libro es AHORA también pedir permiso, y por eso el adaptador ya no
+      // lleva ni la versión del consentimiento ni una revalidación aparte para el respaldo.
+      // Antes había dos comprobaciones distintas: una antes del bucle que amparaba al
+      // primario y otra dentro que amparaba al respaldo. Dos escrituras de la misma regla, y
+      // la del primario commiteaba una transacción antes del apunte — el hueco por el que una
+      // revocación dejaba salir el material igual. Con una sola, invocada dentro del apunte,
+      // los dos intentos pasan por la misma puerta y ninguno la cruza con permiso viejo.
+      //
+      // El puesto lo pasa el ADAPTADOR, que es quien recorre los intentos y por tanto quien
+      // lo sabe. Aquí vivía un contador propio que no podía diferir de su índice —el bucle
+      // devuelve en cuanto un apunte falla— y que solo servía para duplicarlo.
+      anotarDespacho: (modelo, puesto) => abrirLlamada(actorId, entrada, alcance, modelo, puesto),
     });
 
-    // El proveedor no dio contenido utilizable. Los intentos se anotan igual —con su uso,
+    // El proveedor no dio contenido utilizable. Los intentos se cierran igual —con su uso,
     // si la respuesta llegó a existir— y solo DESPUÉS se corta: registrar el gasto no puede
-    // depender de que el resultado nos guste. Si el propio registro falla, manda el motivo
-    // del proveedor: es lo que la persona necesita leer.
+    // depender de que el resultado nos guste. Si el propio cierre falla, manda el motivo del
+    // proveedor: es lo que la persona necesita leer.
     if (!respuesta.ok) {
-      await registrarLlamadas(actorId, entrada, alcance, respuesta.intentos).catch(() => {});
+      await cerrarSinTaparElMotivo(actorId, entrada, respuesta.intentos);
       throw new ErrorAI(respuesta.motivo);
     }
 
@@ -1239,16 +1397,11 @@ export async function generarPropuestas(
           ? { ...i, resultado: 'fuera-de-contrato' as const, motivo }
           : i,
       );
-      await registrarLlamadas(actorId, entrada, alcance, intentos).catch(() => {});
+      await cerrarSinTaparElMotivo(actorId, entrada, intentos);
       throw new ErrorAI(motivo);
     }
 
-    const { idSalidaValida } = await registrarLlamadas(
-      actorId,
-      entrada,
-      alcance,
-      respuesta.intentos,
-    );
+    const { idSalidaValida } = await cerrarLlamadas(actorId, respuesta.intentos);
     const exitoso = respuesta.intentos[respuesta.intentos.length - 1]!;
     // Sin línea de gasto no hay propuesta: la FK lo impone y aquí se dice con un mensaje
     // legible en vez de dejar que reviente el insert.

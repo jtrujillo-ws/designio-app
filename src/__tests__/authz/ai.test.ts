@@ -38,18 +38,44 @@ import { describeAuthz } from './helpers';
 const proveedor = vi.hoisted(() => ({
   respuesta: null as ResultadoProveedor | null,
   duranteLlamada: null as (() => Promise<void>) | null,
+  antesDelApunte: null as (() => Promise<void>) | null,
 }));
 vi.mock('@/lib/ai/proveedor.server', async (original) => {
   const real = await original<typeof import('@/lib/ai/proveedor.server')>();
   return {
     ...real,
-    generarConProveedor: async (entrada: { consentimientoVersion: number | null }) => {
-      if (proveedor.duranteLlamada) await proveedor.duranteLlamada();
+    generarConProveedor: async (entrada: {
+      anotarDespacho: (
+        modelo: string,
+        puesto: number,
+      ) => Promise<{ ok: true; registroId: string } | { ok: false; motivo: string }>;
+    }) => {
       const r = proveedor.respuesta!;
-      // El adaptador real SELLA cada intento con la autorización bajo la que salió, y el
-      // libro se escribe a partir de ahí. El doble tiene que hacer lo mismo o las pruebas
-      // dejarían de ver justo eso: con qué permiso se despachó cada llamada.
-      return { ...r, intentos: r.intentos.map((i) => ({ ...i, consentimientoVersion: entrada.consentimientoVersion })) };
+      // El doble ABRE la línea de cada intento antes de «despachar», igual que el adaptador
+      // real: es el orden que este slice existe para garantizar —no se gasta lo que no se
+      // puede anotar— y un doble que se lo saltara dejaría el arreglo sin probar. De aquí
+      // salen los `registroId` que después cierra el servicio.
+      //
+      // Y el apunte es también la puerta del PERMISO: comprueba y anota en la misma
+      // transacción. Un doble que lo tratara como un simple insert dejaría sin probar que una
+      // revocación llegada justo antes del despacho para el material antes de que salga.
+      const intentos = [];
+      for (const [puesto, i] of r.intentos.entries()) {
+        // El hueco ANTES del apunte: lo que ocurra aquí pasa con la autorización ya leída y
+        // ni un byte todavía en el aire. Es el otro lado del de abajo, y el que decide si el
+        // material llega a salir — por eso el apunte tiene que volver a preguntar.
+        if (proveedor.antesDelApunte) await proveedor.antesDelApunte();
+        const apunte = await entrada.anotarDespacho(i.modelo, puesto);
+        if (!apunte.ok) return { ok: false as const, motivo: apunte.motivo, intentos };
+        // El hueco en el que el material está EN VUELO: lo que ocurra aquí pasa con la
+        // llamada ya despachada y su línea ya abierta, que es justo el caso que ningún
+        // candado puede cubrir. Va después del apunte para que el orden sea el real.
+        if (proveedor.duranteLlamada) await proveedor.duranteLlamada();
+        // Cada intento sube sellado con LA LÍNEA que se abrió para él: es la que el servicio
+        // cierra después, y la que ya lleva anotada la autorización bajo la que salió.
+        intentos.push({ ...i, registroId: apunte.registroId });
+      }
+      return { ...r, intentos };
     },
   };
 });
@@ -132,7 +158,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       motivo: '',
       latenciaMs: 900,
       uso: USO_CI_COMPLETO,
-      consentimientoVersion: null,
+      // Lo rellena el doble al abrir la línea; aquí solo tiene que existir para el tipo.
+      registroId: '',
       ...campos,
     };
   }
@@ -1218,6 +1245,226 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     await sqlAdmin()`delete from reserva_ai where workspace_id = ${ws} and item_id = ${itemId}`;
   });
 
+  it('una revocación entre autorizar y despachar para el material ANTES de que salga', async () => {
+    // El otro lado de «revocar mientras el material viaja». Allí la llamada ya había salido y
+    // lo único que queda es no dejar nacer la propuesta; aquí todavía no ha salido nada, así
+    // que la promesa que toca es más fuerte: el material NO se despacha.
+    //
+    // El hueco es real y es el que abre este slice: la autorización se leía en una
+    // transacción y la línea del libro se abría en otra, así que entre las dos cabía una
+    // revocación commiteada. La FK del consentimiento no la atrapa —la versión citada sigue
+    // existiendo, solo ha dejado de ser la vigente— y el guard solo exige que se cite alguna.
+    // Por eso el apunte vuelve a preguntar, en su propia transacción: es la última parada
+    // antes del despacho, y ahora es la única.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Entrevista revocada justo antes de salir', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    try {
+      let despachos = 0;
+      await conProveedor(RESPUESTA_CI, async () => {
+        proveedor.antesDelApunte = async () => {
+          await registrarConsentimiento(disenadorId, {
+            workspaceId: ws,
+            itemId,
+            alcance: 'La persona retira el permiso de procesamiento externo',
+            procesamientoExterno: false,
+          });
+        };
+        proveedor.duranteLlamada = async () => {
+          despachos += 1;
+        };
+        try {
+          await expect(
+            generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+          ).rejects.toThrow(/consentimiento/i);
+        } finally {
+          proveedor.antesDelApunte = null;
+          proveedor.duranteLlamada = null;
+        }
+      });
+
+      // Ni un byte en el aire: el material no llegó a salir.
+      expect(despachos).toBe(0);
+      // Y no queda línea de gasto: no se abre el libro para una llamada que no ocurre.
+      const lineas = await admin`select 1 as x from llamada_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`;
+      expect(lineas.length).toBe(0);
+      const propuestas = await admin`select 1 as x from propuesta_ai where item_id = ${itemId}`;
+      expect(propuestas.length).toBe(0);
+    } finally {
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
+  it('quien deja de ser curador a mitad de camino tampoco despacha, y se le dice por qué', async () => {
+    // La otra mitad de la autorización que el apunte tiene que rehacer. `prepararAlcance`
+    // exige rol curador y commitea; entre aquel commit y el despacho cabe una degradación a
+    // stakeholder, y quien ya no puede pedir propuestas tampoco puede mandar material a un
+    // tercero. La política de inserción lo rechaza igual —es el suelo—, pero por esa vía la
+    // persona solo recibiría un «vuelve a intentarlo» que además es falso: reintentar no
+    // devuelve un rol. Se comprueba donde se decide el permiso, y se dice con sus palabras.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Entrevista de quien pierde el rol a media llamada', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    const [miembro] = await admin`select id, rol from miembro
+      where usuario_id = ${disenadorId} and workspace_id = ${ws}`;
+    try {
+      let despachos = 0;
+      await conProveedor(RESPUESTA_CI, async () => {
+        proveedor.antesDelApunte = async () => {
+          await admin`update miembro set rol = 'stakeholder' where id = ${miembro!.id as string}`;
+        };
+        proveedor.duranteLlamada = async () => {
+          despachos += 1;
+        };
+        try {
+          await expect(
+            generarPropuestas(disenadorId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+          ).rejects.toThrow(/lead-boutique o diseñador/i);
+        } finally {
+          proveedor.antesDelApunte = null;
+          proveedor.duranteLlamada = null;
+        }
+      });
+      expect(despachos).toBe(0);
+      const lineas = await admin`select 1 as x from llamada_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`;
+      expect(lineas.length).toBe(0);
+    } finally {
+      await admin`update miembro set rol = ${miembro!.rol as string}
+        where id = ${miembro!.id as string}`;
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
+  it('perder el rol con la llamada EN VUELO no borra su coste: el cierre es un hecho consumado', async () => {
+    // El otro extremo del mismo reloj. Antes del apunte, perder el rol impide despachar — eso
+    // es autorizar. Después del apunte el material YA salió y el proveedor YA cobró, y lo
+    // único que queda es anotar lo que pasó. Son dos preguntas distintas, y `cerrarLlamadas`
+    // ya lo tenía dicho: se salta `exigirCuentaActiva` a propósito porque aquí no se actúa.
+    //
+    // La política de completar no lo tenía. Exigía rol curador, así que una degradación con la
+    // llamada en vuelo escondía la fila del UPDATE —filtra, no rechaza— y la línea se quedaba
+    // en `despachada` para siempre: sin desenlace, sin tokens, sin coste y sin su evento. Una
+    // llamada pagada perdiendo su rastro es exactamente lo que este slice existe para impedir.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Entrevista de quien se degrada a media llamada', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    const [miembro] = await admin`select id, rol from miembro
+      where usuario_id = ${disenadorId} and workspace_id = ${ws}`;
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        // La degradación ocurre con la línea ya abierta y el material en el aire.
+        proveedor.duranteLlamada = async () => {
+          await admin`update miembro set rol = 'stakeholder' where id = ${miembro!.id as string}`;
+        };
+        try {
+          // La generación NO llega a término, y eso es lo correcto: persistir el lote sí es
+          // una escritura de dominio —nacen `propuesta_ai`— y quien ya no es curador no puede
+          // hacerla. Lo que este caso exige es que el GASTO no se pierda por el camino.
+          await expect(
+            generarPropuestas(disenadorId, {
+              workspaceId: ws,
+              capacidad: 'CI',
+              anclaId: itemId,
+            }),
+          ).rejects.toThrow();
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+
+      // La línea se cerró con su desenlace y su coste: el gasto no se pierde.
+      const [linea] = await admin`select resultado, costo_usd, tokens_entrada, cerrado_en
+        from llamada_ai where workspace_id = ${ws} and item_id = ${itemId}`;
+      expect(linea!.resultado).toBe('salida-valida');
+      expect(linea!.costo_usd).not.toBeNull();
+      expect(linea!.tokens_entrada).not.toBeNull();
+      expect(linea!.cerrado_en).not.toBeNull();
+      // Y ninguna propuesta nació: el dominio no cambia por una llamada que nadie podía pedir.
+      const propuestas = await admin`select 1 as x from propuesta_ai where item_id = ${itemId}`;
+      expect(propuestas.length).toBe(0);
+    } finally {
+      await admin`update miembro set rol = ${miembro!.rol as string}
+        where id = ${miembro!.id as string}`;
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
+  it('un cierre fallido tras una llamada sin propuesta no se traga: queda registrado', async () => {
+    // El momento en que el fallo se conoce era el único, y un `catch` vacío lo descartaba: la
+    // fila se queda en `despachada` para siempre, el trigger no llega a emitir
+    // `LlamadaAISinPropuesta` y no hay ninguna ruta de reconciliación que las recoja después.
+    // La persona sigue leyendo el motivo del PROVEEDOR —que es lo que explica lo que pasó, y
+    // un detalle de la base no la ayuda a decidir—, pero el servidor se entera.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item cuyo cierre se pierde tras un rechazo', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    const registrado = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await conProveedor(RESPUESTA_RECHAZO, async () => {
+        // La línea se cierra POR FUERA mientras la llamada está en vuelo, así que el cierre
+        // legítimo ya no la alcanza: la política filtra y el UPDATE toca cero filas.
+        proveedor.duranteLlamada = async () => {
+          await admin`update llamada_ai set resultado = 'sin-respuesta', motivo = 'cerrada por fuera'
+            where workspace_id = ${ws} and item_id = ${itemId} and resultado = 'despachada'`;
+        };
+        try {
+          // Lo que la persona lee sigue siendo el motivo del proveedor.
+          await expect(
+            generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+          ).rejects.toThrow(/se negó a procesar/);
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+
+      // Y el fallo del cierre consta, con lo que hace falta para encontrar la línea.
+      const dicho = registrado.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(dicho).toMatch(/no se pudieron cerrar las líneas/i);
+      expect(dicho).toContain(ws);
+    } finally {
+      registrado.mockRestore();
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
   it('revocar mientras el material viaja: la llamada ya salió, pero ninguna propuesta nace', async () => {
     const itemId = await nuevoItem('Entrevista revocada a media llamada', 'entrevista');
     await registrarConsentimiento(leadId, {
@@ -1622,6 +1869,308 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
+  it('una llamada despachada consta y cuenta aunque su cierre no llegue a escribirse', async () => {
+    // La propiedad que este slice existe para dar: el libro registra TODA invocación, y ya no
+    // depende de que una transacción POSTERIOR a la llamada salga bien. Se comprueba mirando
+    // el estado intermedio real —la fila abierta antes de despachar— y lo que significa.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item cuya llamada se queda a medio anotar', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    try {
+      // Dentro del hueco «en vuelo» la línea YA existe, en `despachada`: ése es el momento en
+      // el que antes no había nada escrito y un fallo se llevaba el gasto por delante.
+      let enVuelo: { resultado: string; modelo: string; costo: unknown } | null = null;
+      await conProveedor(RESPUESTA_CI, async () => {
+        proveedor.duranteLlamada = async () => {
+          const [f] = await admin`select resultado, modelo, costo_usd from llamada_ai
+            where workspace_id = ${ws} and item_id = ${itemId}`;
+          enVuelo = f
+            ? { resultado: f.resultado as string, modelo: f.modelo as string, costo: f.costo_usd }
+            : null;
+        };
+        try {
+          await generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId });
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+
+      expect(enVuelo).not.toBeNull();
+      expect(enVuelo!.resultado).toBe('despachada');
+      // Y ya trae lo que la línea AFIRMA al abrirse: con qué modelo salió. Lo que todavía no
+      // consta es el desenlace —ni el coste—, que es justo lo que el cierre añade.
+      expect(enVuelo!.modelo).toBe(MODELO_PRIMARIO);
+      expect(enVuelo!.costo).toBeNull();
+
+      // Una fila que se QUEDE en `despachada` cuenta para el tope. Es la dirección segura
+      // —ante la duda de si el proveedor cobró, se asume que sí— y hay que comprobarlo contra
+      // el contador de verdad, porque si no un cierre perdido regalaría cuota. Se mide con el
+      // número que enseña el panel, antes y después de dejar una línea abierta a mano.
+      const mide = () =>
+        conProveedor(RESPUESTA_CI, async () => (await panelPropuestas(leadId, ws)).ai.llamadasHoy);
+      const antes = await mide();
+
+      // (a) Una línea EN VUELO, con la reserva de su generación viva, no se cuenta dos veces:
+      // la reserva ya apartó el hueco. Sumar las dos cobraba el doble por la misma generación
+      // durante hasta dos timeouts.
+      const [reserva] = await admin`insert into reserva_ai
+        (workspace_id, capacidad, reto_id, unidades, creado_por)
+        values (${ws}, 'C0', ${retoId}, 2, ${leadId}) returning id`;
+      const [cubierta] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, reserva_id, creado_por)
+        values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'despachada',
+                ${reserva!.id as string}, ${leadId})
+        returning id`;
+      expect(await mide()).toBe(antes);
+
+      // (b) Y en cuanto la reserva desaparece, la MISMA fila cuenta — en el acto, sin esperar
+      // a que venza ningún reloj. Cuando el cierre falla, la limpieza retira la reserva de
+      // inmediato; si la exclusión mirase el tiempo transcurrido, durante el resto de la
+      // ventana no contaría ni la reserva ni la llamada pagada, y fallos repetidos dejarían
+      // reintentar por encima del cupo — justo el fallo posterior al despacho que este cambio
+      // existe para contener.
+      await admin`delete from reserva_ai where id = ${reserva!.id as string}`;
+      expect(await mide()).toBe(antes + 1);
+
+      // (c) Y no vuelve a dejar de contar cuando el ancla se reintenta. Una reserva NUEVA
+      // presupuesta la generación nueva, no la vieja: si la exclusión mirase solo el ancla, el
+      // reintento volvería a esconder la llamada ya pagada, y con fallos repetidos se
+      // acumularían líneas huérfanas invisibles mientras una sola reserva las tapa a todas.
+      // La reserva que cuenta es LA SUYA, la que apartó su hueco, y por eso viaja en la fila.
+      const [otra] = await admin`insert into reserva_ai
+        (workspace_id, capacidad, reto_id, unidades, creado_por)
+        values (${ws}, 'C0', ${retoId}, 2, ${leadId}) returning id`;
+      expect(await mide()).toBe(antes + 1);
+      await admin`delete from reserva_ai where id = ${otra!.id as string}`;
+      await admin`delete from llamada_ai where id = ${cubierta!.id as string}`;
+
+      // Cerrada: el desenlace y el coste ya constan, en la MISMA fila que se abrió antes.
+      const [cerrada] = await admin`select resultado, costo_usd, intento from llamada_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`;
+      expect(cerrada!.resultado).toBe('salida-valida');
+      expect(cerrada!.costo_usd).not.toBeNull();
+      expect(cerrada!.intento).toBe(0);
+    } finally {
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      // Las líneas que este test abre a mano son C0 y NO tienen `item_id`, así que el barrido
+      // de arriba no las alcanzaría. Se borran por su modelo de relleno: si una aserción cae
+      // antes del borrado en línea, una fila `despachada` huérfana quedaría en el workspace
+      // compartido inflando `llamadasHoy` para todos los tests que vienen después.
+      await admin`delete from llamada_ai
+        where workspace_id = ${ws} and modelo = ${MODELO_RELLENO}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
+  it('una línea EN VUELO no borra un aviso de caída, y el sello de cierre es el que ordena', async () => {
+    // Dos consecuencias del libro anticipado sobre la señal de salud, las dos medidas:
+    //
+    //  (a) `creado_en` pasó a ser la hora del DESPACHO. Si la salud se ordenara por él, una
+    //      línea recién abierta sería «lo más reciente» y taparía una caída real justo cuando
+    //      alguien pide otra generación — o sea, justo cuando el aviso hace falta.
+    //  (b) el reloj que ordena es `cerrado_en`, el de la OBSERVACIÓN, que lo estampa el guard.
+    const admin = sqlAdmin();
+    const [w] = await admin`insert into workspace (nombre) values (${marca + ' vuelo'})
+      returning id`;
+    const wsV = w!.id as string;
+    try {
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsV}, ${leadId}, 'lead', ${`${marca}-vuelo@test.demo`}, 'lead-boutique')`;
+      const [svcV] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+        values (${wsV}, 'Servicio en vuelo', ${leadId}) returning id`;
+      const [retoV] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+        values (${wsV}, ${svcV!.id as string}, 'R-V2', 'Reto en vuelo', 'candidato',
+                'peticion-cliente', ${leadId})
+        returning id`;
+      const salud = () =>
+        conProveedor(RESPUESTA_CI, async () => (await panelPropuestas(leadId, wsV)).ai);
+
+      // Una caída observada hace un instante.
+      const [caida] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo, creado_por)
+        values (${wsV}, 'C0', ${retoV!.id as string}, ${MODELO_RELLENO}, 'entorno',
+                'despachada', '', ${leadId})
+        returning id`;
+      await admin`update llamada_ai set resultado = 'sin-respuesta', motivo = 'no respondió'
+        where id = ${caida!.id as string}`;
+      expect((await salud()).proveedorResponde).toBe(false);
+      // El guard selló la observación: es lo que ordena, y no puede quedarse en null.
+      const [sellada] = await admin`select cerrado_en from llamada_ai
+        where id = ${caida!.id as string}`;
+      expect(sellada!.cerrado_en).not.toBeNull();
+
+      // (a) Ahora alguien despacha otra: la línea nace con `creado_en` MÁS NUEVO que la caída.
+      // Si la salud ordenara por el despacho, esto la taparía. No debe.
+      await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsV}, 'C0', ${retoV!.id as string}, ${MODELO_RELLENO}, 'entorno',
+                'despachada', ${leadId})`;
+      const conVuelo = await salud();
+      expect(conVuelo.proveedorResponde).toBe(false);
+      expect(conVuelo.advertencia).toMatch(/no respondió al último intento/i);
+    } finally {
+      await admin`delete from llamada_ai where workspace_id = ${wsV}`;
+      await admin`delete from reto where workspace_id = ${wsV}`;
+      await admin`delete from servicio where workspace_id = ${wsV}`;
+      await admin`delete from miembro where workspace_id = ${wsV}`;
+      await admin`delete from workspace where id = ${wsV}`;
+    }
+  });
+
+  it('un cierre que no alcanza su línea FALLA, en vez de dejar una propuesta sin gasto', async () => {
+    // La política de completar FILTRA en vez de rechazar: un update que ya no alcanza su fila
+    // sale sin error y con cero filas tocadas. Sin comprobar el recuento, eso pasaba por un
+    // cierre bueno — y la propuesta se persistía apuntando a una línea que seguía
+    // `despachada`, sin coste ni latencia, que el panel mostraría así para siempre y el
+    // contador cobraría como despacho abierto.
+    //
+    // Se provoca cerrando la línea POR FUERA mientras la llamada está en vuelo, que es el
+    // hueco real: entre el apunte y el cierre no hay transacción que los una.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Item cuya línea se cierra por detrás', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    try {
+      const error = await conProveedor(RESPUESTA_CI, async () => {
+        proveedor.duranteLlamada = async () => {
+          await admin`update llamada_ai set resultado = 'sin-respuesta', motivo = 'cerrada por fuera'
+            where workspace_id = ${ws} and item_id = ${itemId} and resultado = 'despachada'`;
+        };
+        try {
+          return await generarPropuestas(leadId, {
+            workspaceId: ws,
+            capacidad: 'CI',
+            anclaId: itemId,
+          }).then(() => null);
+        } catch (e) {
+          return e;
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+      expect(error).toBeInstanceOf(ErrorAI);
+      expect((error as ErrorAI).message).toMatch(/no se pudo cerrar la línea/i);
+
+      // Y lo que importa: NO quedó una propuesta colgada de una línea sin desenlace.
+      const propuestas = await admin`select id from propuesta_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`;
+      expect(propuestas.length).toBe(0);
+    } finally {
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
+  it('un curador no puede cerrar la línea que abrió otro', async () => {
+    // `llamada_insert` fija `creado_por = app_user_id()`; la política de completar nació sin
+    // ese anclaje, y esa asimetría era un agujero: cualquier curador del workspace podía
+    // escribirle a la línea de OTRO un desenlace y un coste inventados, que el libro
+    // atribuiría a quien la abrió. Y de paso dejaba al cierre legítimo sin fila que tocar.
+    const admin = sqlAdmin();
+    const [abierta] = await conUsuario(leadId, (tx) => tx`insert into llamada_ai
+      (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+      values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'despachada', ${leadId})
+      returning id`);
+    const id = abierta!.id as string;
+    try {
+      // El OTRO curador del workspace (diseñador, mismo rol de escritura) no la alcanza.
+      const ajenas = await conUsuario(disenadorId, (tx) => tx`update llamada_ai
+        set resultado = 'fuera-de-contrato', motivo = 'escrito por quien no la abrió',
+            costo_usd = 99
+        where id = ${id} returning id`);
+      expect(ajenas.length).toBe(0);
+      const [intacta] = await admin`select resultado, costo_usd, creado_por from llamada_ai
+        where id = ${id}`;
+      expect(intacta!.resultado).toBe('despachada');
+      expect(intacta!.costo_usd).toBeNull();
+      expect(intacta!.creado_por).toBe(leadId);
+
+      // Y quien la abrió sí la cierra: la puerta se cierra al ajeno, no a todos.
+      const propias = await conUsuario(leadId, (tx) => tx`update llamada_ai
+        set resultado = 'salida-valida', costo_usd = 1 where id = ${id} returning id`);
+      expect(propias.length).toBe(1);
+    } finally {
+      await admin`delete from llamada_ai where id = ${id}`;
+    }
+  });
+
+  it('una escritura cruda que nace con desenlace sigue dejando su evento', async () => {
+    // La migración base puso este evento DENTRO del guard para que el SQL crudo lo produjera
+    // igual. Mover la emisión al UPDATE a secas habría retirado ese suelo en silencio: el
+    // grant de insert incluye `resultado`, así que una fila puede nacer ya en `sin-respuesta`
+    // sin pasar nunca por `despachada`. Las dos vías, entonces.
+    const admin = sqlAdmin();
+    const antes = await conUsuario(leadId, (tx) => tx`select count(*)::int as n
+      from evento_dominio where workspace_id = ${ws} and tipo = 'LlamadaAISinPropuesta'`);
+    const [cruda] = await conUsuario(leadId, (tx) => tx`insert into llamada_ai
+      (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo, creado_por)
+      values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'sin-respuesta',
+              'nació con desenlace', ${leadId})
+      returning id`);
+    try {
+      const despues = await conUsuario(leadId, (tx) => tx`select count(*)::int as n
+        from evento_dominio where workspace_id = ${ws} and tipo = 'LlamadaAISinPropuesta'`);
+      expect((despues[0]!.n as number)).toBe((antes[0]!.n as number) + 1);
+
+      // Y nace SELLADA: una fila con desenlace y sin hora de observación afirmaría dos cosas
+      // incompatibles, y la señal de salud la ordenaría por el reloj equivocado.
+      const [sellada] = await admin`select cerrado_en from llamada_ai
+        where id = ${cruda!.id as string}`;
+      expect(sellada!.cerrado_en).not.toBeNull();
+    } finally {
+      await admin`delete from llamada_ai where id = ${cruda!.id as string}`;
+    }
+  });
+
+  it('una línea cerrada no se puede volver a cerrar: el tránsito es de un solo sentido', async () => {
+    // `using` fija el origen y `with check` el destino. Sin el segundo, una línea ya cerrada
+    // podría reescribirse pasando por «despachada», que es la puerta trasera que el grant de
+    // UPDATE abriría si nadie la cerrara.
+    const admin = sqlAdmin();
+    const [l] = await admin`insert into llamada_ai
+      (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+      values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'despachada', ${leadId})
+      returning id`;
+    const id = l!.id as string;
+    try {
+      // Primer cierre: pasa.
+      const cerrada = await conUsuario(leadId, (tx) => tx`update llamada_ai
+        set resultado = 'salida-valida', costo_usd = 1 where id = ${id} returning id`);
+      expect(cerrada.length).toBe(1);
+
+      // Segundo cierre: la fila ya no está en `despachada`, así que el `using` no la alcanza.
+      const otraVez = await conUsuario(leadId, (tx) => tx`update llamada_ai
+        set costo_usd = 0 where id = ${id} returning id`);
+      expect(otraVez.length).toBe(0);
+
+      // Y no se puede dejar abierta otra vez para reescribirla después: lo impide el
+      // `with check`, que sí rechaza en vez de filtrar.
+      await admin`update llamada_ai set resultado = 'despachada', motivo = '' where id = ${id}`;
+      await expect(
+        conUsuario(leadId, (tx) => tx`update llamada_ai set resultado = 'despachada'
+          where id = ${id}`),
+      ).rejects.toThrow(/row-level security|política|policy/i);
+    } finally {
+      await admin`delete from llamada_ai where id = ${id}`;
+    }
+  });
+
   it('el motivo del guard llega a la pantalla también al GENERAR, no solo al aceptar', async () => {
     // El `catch` de la persistencia traducía el 23505 y el P0001 del consentimiento, y dejaba
     // escapar los demás `raise` del guard como PostgresError crudo. `mensajeDe` no traduce
@@ -1735,10 +2284,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
       select ${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'salida-valida', ${leadId}
       from generate_series(1, 3)`;
-    const [gasto] = await admin`select count(*)::int as n from llamada_ai
-      where workspace_id = ${ws} and creado_en >= date_trunc('day', now())
-        and resultado <> 'sin-respuesta'`;
-    const usadas = gasto!.n as number;
+    // El gasto se lee del PANEL, no de una consulta propia: la regla de qué cuenta vive en
+    // `presupuestoDeHoy` —y desde el libro anticipado excluye además las líneas en vuelo que
+    // ya cubre una reserva—, así que reescribirla aquí era tener dos redacciones de la misma
+    // regla esperando a divergir. Divergieron.
+    const usadas = await conProveedor(RESPUESTA_CI, async () =>
+      (await panelPropuestas(leadId, ws)).ai.llamadasHoy,
+    );
     // Con el respaldo global esto no agotaría nada: si el cupo pactado no se leyera, todo lo
     // de abajo pasaría en verde y el defecto seguiría vivo. Ése era el estado anterior —el
     // parámetro `limiteDiario` existía y las dos llamadas vivas le pasaban la constante—,
@@ -1824,12 +2376,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
       // Una llamada que no dio contenido utilizable DICE por qué: lo exige el CHECK de
       // `llamada_ai`, así que el fixture lo respeta en vez de esquivarlo.
+      // `cerrado_en` va explícito además de `creado_en`: es el reloj que ordena la salud, y el
+      // guard solo lo estampa cuando viene vacío — precisamente para que una escritura
+      // administrativa como ésta pueda fechar la observación donde de verdad ocurrió.
       const anotar = (resultado: string, haceSegundos: number) => admin`insert into llamada_ai
         (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo, creado_por,
-         creado_en)
+         creado_en, cerrado_en)
         values (${wsS}, 'C0', ${retoS_id}, ${MODELO_RELLENO}, 'entorno', ${resultado},
                 ${resultado === 'salida-valida' ? '' : 'anotado por la prueba de salud'},
-                ${leadId}, now() - make_interval(secs => ${haceSegundos}))`;
+                ${leadId}, now() - make_interval(secs => ${haceSegundos}),
+                now() - make_interval(secs => ${haceSegundos}))`;
       const salud = () =>
         conProveedor(RESPUESTA_CI, async () => {
           const panel = await panelPropuestas(leadId, wsS);
@@ -2748,14 +3304,33 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(enPanel!.costoUsd).toBeCloseTo(Number(fila!.costo_usd), 6);
     expect(enPanel!.latenciaMs).toBe(900);
 
-    // El libro no tiene superficie de escritura: lo que costó una llamada ya hecha no se
-    // reescribe ni se borra desde la app.
-    await expect(
-      conUsuario(leadId, (tx) => tx`update llamada_ai set costo_usd = 0
-        where id = ${fila!.llamada_id as string}`),
-    ).rejects.toThrow(/permission denied/);
+    // Lo que costó una llamada YA CERRADA no se reescribe ni se borra desde la app. La
+    // garantía es la misma de siempre, pero desde el libro anticipado la impone otra pieza y
+    // conviene que el test lo diga: antes era la AUSENCIA de grant de UPDATE; ahora el grant
+    // existe —hace falta para cerrar la línea— y quien cierra la puerta es el `using` de
+    // `llamada_completar`, que solo alcanza a las filas en `despachada`.
+    //
+    // Por eso esto NO lanza: la política no rechaza, FILTRA. La fila ya cerrada queda fuera
+    // del alcance del update y no se toca ninguna, que es un rechazo igual de firme y con
+    // otra forma. Se comprueba contando filas afectadas, no esperando una excepción.
+    const tocadas = await conUsuario(leadId, (tx) => tx`update llamada_ai set costo_usd = 0
+      where id = ${fila!.llamada_id as string} returning id`);
+    expect(tocadas.length).toBe(0);
+    const [intacta] = await sqlAdmin()`select costo_usd from llamada_ai
+      where id = ${fila!.llamada_id as string}`;
+    expect(Number(intacta!.costo_usd)).toBeCloseTo(costoDeUso(MODELO_PRIMARIO, USO_CI)!, 6);
+
+    // El DELETE sí sigue siendo permiso denegado: nunca hubo grant y no lo hay ahora.
     await expect(
       conUsuario(leadId, (tx) => tx`delete from llamada_ai
+        where id = ${fila!.llamada_id as string}`),
+    ).rejects.toThrow(/permission denied/);
+
+    // Y las columnas que la línea AFIRMÓ al abrirse tampoco se pueden reescribir: el modelo,
+    // el ancla, la credencial y el consentimiento quedaron fuera del grant a propósito.
+    // Poder cambiarlos después convertiría el apunte previo en una promesa vacía.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update llamada_ai set modelo = 'otro'
         where id = ${fila!.llamada_id as string}`),
     ).rejects.toThrow(/permission denied/);
     // Y una propuesta no puede reapuntar a otra llamada (el gasto no se muda de sitio).
@@ -3619,10 +4194,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
-  it('la cola se ordena por la confianza declarada, con la antigüedad de desempate', async () => {
+  it('la cola pone lo más DUDOSO primero, con la antigüedad de desempate', async () => {
     // Persistir `confianza` argumentando que «ordena la revisión humana» y después no ordenar
-    // por ella no entrega esa conducta: con FIFO puro, una propuesta nueva y sólida se
-    // quedaba detrás de las viejas y flojas, y el dato no servía para nada.
+    // por ella no entrega esa conducta. Pero la DIRECCIÓN importa tanto como ordenar: la
+    // revisión humana es el recurso escaso, y lo escaso se gasta donde más rinde. Lo que el
+    // modelo declara muy seguro es lo que menos probablemente cambie al mirarlo; lo dudoso es
+    // donde el ojo humano decide de verdad.
     await enWorkspaceLimpio('orden', async ({ ws: wsO, curadorId }) => {
       const admin = sqlAdmin();
       const niveles = ['baja', 'alta', 'media'] as const;
@@ -3647,17 +4224,43 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       }
 
       const panel = await panelPropuestas(curadorId, wsO);
-      // Se generaron en orden baja → alta → media; la cola las devuelve por confianza.
+      // Se generaron en orden baja → alta → media; la cola las devuelve de menor a mayor.
       expect(panel.pendientes.map((p) => p.confianza)).toEqual([
-        CONFIANZA_PROPUESTA_NUMERICA.alta,
-        CONFIANZA_PROPUESTA_NUMERICA.media,
         CONFIANZA_PROPUESTA_NUMERICA.baja,
+        CONFIANZA_PROPUESTA_NUMERICA.media,
+        CONFIANZA_PROPUESTA_NUMERICA.alta,
       ]);
-      // Y el total es el total, no lo que cabe: con el corte por confianza, lo que queda
-      // detrás son las MENOS fiables, así que decir el número es lo que distingue «esto es
-      // todo» de «esto es lo que cabe».
+      // Y el total es el total, no lo que cabe: con el corte, lo que queda detrás son ahora las
+      // MÁS fiables, que siguen siendo trabajo pendiente aunque ya no sean lo que más urge.
       expect(panel.totalPendientes).toBe(3);
       expect(panel.hayMasPendientes).toBe(false);
+
+      // ── Los nulos NO se promueven al invertir ──
+      // «Sin confianza declarada» no es «confianza cero»: son las sembradas o las escritas por
+      // SQL crudo. Con el orden ascendente, tratarlas como el valor más dudoso posible las
+      // pondría en cabeza — que es justo la mentira que `nulls last` existe para no contar.
+      const [iSin] = await admin`insert into item_importacion
+        (workspace_id, titulo, contenido, tipo_fuente, referencia, creado_por)
+        values (${wsO}, 'Item sin confianza declarada', ${MATERIAL}, 'nota', 'ref', ${curadorId})
+        returning id`;
+      const [lSin] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, item_id, modelo, origen_key, resultado, creado_por)
+        values (${wsO}, 'CI', ${iSin!.id as string}, ${MODELO_PRIMARIO}, 'entorno',
+                'salida-valida', ${curadorId})
+        returning id`;
+      await admin`insert into propuesta_ai
+        (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
+         prompt_version, origen_key, llamada_id, creado_por)
+        values (${wsO}, 'CI', 'evidencia', ${iSin!.id as string}, ${admin.json(CONTENIDO_CI)},
+                ${admin.json(CONTENIDO_CI)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+                ${lSin!.id as string}, ${curadorId})`;
+      const conNulo = await panelPropuestas(curadorId, wsO);
+      expect(conNulo.pendientes.map((p) => p.confianza)).toEqual([
+        CONFIANZA_PROPUESTA_NUMERICA.baja,
+        CONFIANZA_PROPUESTA_NUMERICA.media,
+        CONFIANZA_PROPUESTA_NUMERICA.alta,
+        null,
+      ]);
     });
   });
 

@@ -53,12 +53,13 @@ export type IntentoProveedor = {
    * primario, la latencia por modelo mediría otra cosa. */
   latenciaMs: number;
   uso: UsoLlamada | null;
-  /** Bajo qué versión del consentimiento salió ESTE intento. Por intento y no por
-   * operación: el respaldo es un despacho NUEVO, con su propia autorización leída en su
-   * propio momento, y anotar los dos contra la versión que autorizó al primario haría que
-   * el libro afirmara en falso bajo qué permiso salió el material. `null` cuando el
-   * material no es de personas. */
-  consentimientoVersion: number | null;
+  /**
+   * La línea del libro de costos que se abrió ANTES de despachar este intento. Existe
+   * siempre —sin línea no hay despacho— y es la fila que después se cierra con el desenlace.
+   * Que el id venga de aquí es lo que permite que anotar el gasto no dependa de que una
+   * transacción POSTERIOR a la llamada salga bien.
+   */
+  registroId: string;
 };
 
 /**
@@ -220,42 +221,55 @@ function causaDelError(e: unknown): MotivoSinSalida {
 }
 
 /**
- * Lo que el adaptador tiene que poder preguntar antes de despachar OTRA vez. No sabe de
- * base de datos —ese es el punto de este módulo— así que el permiso se lo pasa quien sí
- * sabe, y con la MISMA comprobación que autorizó el despacho primario.
+ * Lo que devuelve abrir la línea del libro para un intento: su id, o el motivo por el que no
+ * se pudo abrir — y entonces NO se despacha. Ese orden es el arreglo entero.
  */
-export type Revalidacion =
-  | { ok: true; consentimientoVersion: number | null }
-  | { ok: false; motivo: string };
+export type ApunteDespacho = { ok: true; registroId: string } | { ok: false; motivo: string };
 
 export async function generarConProveedor(entrada: {
   key: string;
   capacidad: CapacidadActiva;
   sistema: string;
   usuario: string;
-  /** La versión que autorizó el despacho PRIMARIO, ya leída bajo candado por quien llama. */
-  consentimientoVersion: number | null;
   /**
-   * Se llama ANTES de degradar de modelo, y su respuesta decide si hay segundo despacho.
+   * Se llama ANTES de CADA despacho: abre su línea en el libro de costos y, en la misma
+   * transacción, comprueba que el despacho sigue autorizado. Si no puede, ese intento no
+   * ocurre.
    *
-   * La degradación no es «la misma llamada otra vez»: es una petición NUEVA que sale cuando
-   * la primera ya terminó — o sea, con el control de vuelta aquí, la base a mano y ni un
-   * byte en el aire todavía. El argumento de que ningún candado alcanza a una llamada en
-   * vuelo, que es cierto para el material ya enviado, no dice nada de este caso: aquí no hay
-   * límite físico, hay una comprobación que hacer. Si entre medias se revocó el
-   * consentimiento, la revocación ya retiró la reserva —el token sin el cual no se
-   * despacha— y el respaldo saldría sin él.
+   * El orden es el arreglo: antes la fila se escribía al VOLVER, así que un fallo transitorio
+   * de esa transacción borraba del libro —y del tope diario— una llamada que el proveedor ya
+   * había atendido y cobrado, mientras la limpieza de fuera soltaba la reserva y dejaba
+   * reintentar. La promesa «el libro registra toda invocación» dependía de que algo POSTERIOR
+   * saliera bien; ahora depende de algo ANTERIOR, y si eso falla el gasto no llega a ocurrir.
+   *
+   * Que el permiso viva DENTRO de este apunte es lo que hace que el respaldo no necesite una
+   * revalidación aparte. La tenía, y el primario no: la degradación es una petición NUEVA que
+   * sale con la primera ya terminada y ni un byte en el aire, así que allí no hay límite
+   * físico sino una comprobación que hacer — pero exactamente lo mismo vale para el primario,
+   * que salía con un permiso leído y commiteado una transacción antes. Una sola puerta, y la
+   * cruzan los dos intentos.
+   *
+   * El adaptador no sabe de base de datos —ese es el punto de este módulo—, así que la abre
+   * quien sí sabe y le devuelve el id.
    */
-  revalidar?: () => Promise<Revalidacion>;
+  anotarDespacho: (
+    modelo: string,
+    /** El puesto del intento en la operación: 0 primario, 1 respaldo. Lo sabe este bucle. */
+    puesto: number,
+  ) => Promise<ApunteDespacho>;
 }): Promise<ResultadoProveedor> {
   // Cada intento se anota antes de decidir si hay otro: una degradación de modelo son DOS
   // llamadas al proveedor, y la del primario existió aunque no sirviera. Devolver solo la
   // última la borraba del libro y dejaba una latencia que sumaba las dos.
   const intentos: IntentoProveedor[] = [];
-  // La autorización con la que sale CADA intento. El primario trae la que leyó quien llama;
-  // el respaldo, la que devuelva la revalidación justo antes de salir.
-  let consentimientoVersion = entrada.consentimientoVersion;
   for (const [indice, modelo] of [MODELO_PRIMARIO, MODELO_FALLBACK].entries()) {
+    // Primero el apunte, después la llamada. Si el libro no admite la línea —porque no se
+    // pudo escribir o porque el despacho ya no está autorizado—, este intento no ocurre: los
+    // anteriores viajan anotados y el motivo llega a la pantalla como cualquier otro
+    // (SYS-21: aquí no se lanza nunca).
+    const apunte = await entrada.anotarDespacho(modelo, indice);
+    if (!apunte.ok) return { ok: false, motivo: apunte.motivo, intentos };
+    const registroId = apunte.registroId;
     const inicio = Date.now();
     try {
       const { datos, uso } = await unaLlamada(
@@ -271,7 +285,7 @@ export async function generarConProveedor(entrada: {
         motivo: '',
         latenciaMs: Date.now() - inicio,
         uso,
-        consentimientoVersion,
+        registroId,
       });
       return { ok: true, datos, intentos };
     } catch (e) {
@@ -291,23 +305,15 @@ export async function generarConProveedor(entrada: {
         motivo,
         latenciaMs: Date.now() - inicio,
         uso: usoDelError(e),
-        consentimientoVersion,
+        registroId,
       });
       // JSON ilegible: el modelo respondió pero fuera de contrato. No se reintenta con otro
       // modelo (no es indisponibilidad) y la propuesta se descarta entera.
       if (causa === 'fuera-de-contrato') return { ok: false, motivo, intentos };
-      if (indice === 0 && degradaModelo(e)) {
-        // El segundo despacho se autoriza otra vez, o no sale. Sin esto, una revocación que
-        // commiteó mientras el primario estaba en vuelo dejaba salir el material de todos
-        // modos —sin reserva, porque la revocación ya la retiró— y la llamada se anotaba
-        // contra una versión de consentimiento que había dejado de ser la vigente.
-        if (entrada.revalidar) {
-          const permiso = await entrada.revalidar();
-          if (!permiso.ok) return { ok: false, motivo: permiso.motivo, intentos };
-          consentimientoVersion = permiso.consentimientoVersion;
-        }
-        continue;
-      }
+      // El segundo despacho se autoriza otra vez, o no sale — y de eso se encarga su propio
+      // apunte al principio de la vuelta siguiente. Una revocación que commiteó mientras el
+      // primario estaba en vuelo retira la reserva, y sin reserva viva no hay línea que abrir.
+      if (indice === 0 && degradaModelo(e)) continue;
       return { ok: false, motivo, intentos };
     }
   }

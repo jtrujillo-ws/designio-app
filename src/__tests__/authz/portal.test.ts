@@ -412,15 +412,28 @@ describeAuthz('portal: hilos de comentarios y auditoría', () => {
       await tx`update hilo_comentario set estado = 'resuelto' where id = ${abierto.hiloId}`;
       await espera;
     });
-    const comentario = comentar(stakeId, {
-      workspaceId: ws,
-      hiloId: abierto.hiloId,
-      cuerpo: 'colado en plena resolución',
-    });
+    /*
+     * La aserción se ENGANCHA aquí, al crear la promesa, y no después de esperar.
+     *
+     * Este comentario va a rechazar en cuanto la transacción A commitee, que ocurre dentro
+     * del `await resolucion` de abajo. Si en ese momento nadie está mirando la promesa, Node
+     * la cuenta como `unhandled rejection`, y vitest termina la corrida con error aunque
+     * TODOS los casos pasen: «537 passed, 1 error», salida 1. No es hipotético — así se puso
+     * en rojo una corrida de CI con la suite entera en verde, y depende del planificador, así
+     * que en local puede no verse nunca. `rejects.toThrow` adjunta el manejador al construir
+     * la expectativa, y la espera se hace al final: mismo caso, sin rejection suelta.
+     */
+    const comentario = expect(
+      comentar(stakeId, {
+        workspaceId: ws,
+        hiloId: abierto.hiloId,
+        cuerpo: 'colado en plena resolución',
+      }),
+    ).rejects.toThrow(/se resolvió mientras escribías/);
     await new Promise((r) => setTimeout(r, 150));
     liberar();
     await resolucion;
-    await expect(comentario).rejects.toThrow(/se resolvió mientras escribías/);
+    await comentario;
 
     const { hilos } = await hilosDeObjetos(leadId, ws, [{ tipo: 'proyecto', id: proyectoId }]);
     const elHilo = hilos.find((h) => h.id === abierto.hiloId);

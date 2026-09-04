@@ -1246,8 +1246,15 @@ create policy acuerdo_select on acuerdo_disposicion
     -- disposición perdería el papel que acredita lo que pactó, que es al revés de para qué
     -- se registra.
     or acordado_por = app_user_id()
+    -- Y quien EJECUTÓ una disposición conserva la lectura del acuerdo que la ordenó. Atado a
+    -- ESE acuerdo y no al workspace: sin `c.acuerdo_version = version`, la constancia vieja de
+    -- un archivo dejaba abierta la lectura de TODA fila del workspace, así que un exmiembro
+    -- —el borrado o una baja destruyen la membresía, pero su constancia conserva su uuid—
+    -- podía leer la base contractual, la fecha y el firmante de acuerdos FUTUROS, pactados
+    -- cuando él ya no estaba. Se conserva lo que se ejecutó, no una ventana permanente.
     or exists (select 1 from constancia_disposicion c
                where c.workspace_id = acuerdo_disposicion.workspace_id
+                 and c.acuerdo_version = acuerdo_disposicion.version
                  and c.ejecutado_por = app_user_id())
   );
 

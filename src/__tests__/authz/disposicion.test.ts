@@ -1067,6 +1067,46 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
   });
 
+  it('quien ejecutó conserva la lectura de SU acuerdo, no una ventana a los futuros', async () => {
+    /*
+     * La política conserva la lectura del acuerdo a quien ejecutó su disposición —conservar el
+     * derecho es el punto de este slice—, pero el `exists` no estaba atado a la VERSIÓN: era
+     * verdadero para toda fila del workspace. Y una constancia conserva el uuid de quien
+     * ejecutó aunque su membresía desaparezca, así que un exmiembro seguía leyendo la base
+     * contractual, la fecha y el firmante de acuerdos pactados cuando él ya no estaba.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('lectura-atada');
+    await acordarYExportar(ws, 'archivo', adminId);
+    await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'archivo',
+      acuerdoVersionEsperada: 1,
+      confirmacion: '',
+    });
+
+    // El ejecutor deja de ser miembro, y el cliente pacta un acuerdo nuevo sin él.
+    await admin`delete from miembro where workspace_id = ${ws} and usuario_id = ${leadId}`;
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws,
+      modalidad: 'archivo',
+      base: 'Cláusula que el exmiembro no debería leer',
+      efectivoDesde: EFECTIVO_PASADO,
+    });
+
+    const suyos = await conUsuario(leadId, (tx) => tx`select version, base
+      from acuerdo_disposicion where workspace_id = ${ws} order by version`);
+    // Ve el que ejecutó…
+    expect(suyos.map((f) => Number(f.version))).toEqual([1]);
+    // …y NO el posterior, ni su base contractual.
+    expect(suyos.map((f) => f.base as string).join(' ')).not.toContain('no debería leer');
+
+    // El cliente, que sigue dentro, ve los dos.
+    const delCliente = await conUsuario(adminId, (tx) => tx`select version
+      from acuerdo_disposicion where workspace_id = ${ws} order by version`);
+    expect(delCliente.map((f) => Number(f.version))).toEqual([1, 2]);
+  });
+
   it('cambiar de rol no convierte a una persona en las DOS partes de un borrado', async () => {
     /*
      * La doble firma se comprobaba solo por el ROL, con este argumento escrito en la

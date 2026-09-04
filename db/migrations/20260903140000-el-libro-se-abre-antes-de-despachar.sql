@@ -20,9 +20,59 @@ alter table llamada_ai add constraint llamada_ai_resultado_check
 -- El motivo se exigía a todo lo que no fuera `salida-valida`, y una línea recién abierta no
 -- tiene motivo que dar todavía: su desenlace no ha ocurrido. Se exime a `despachada` y solo a
 -- ella; los tres desenlaces sin contenido siguen teniendo que decir por qué.
-alter table llamada_ai drop constraint llamada_ai_check4;
+--
+-- Se busca por lo que DICE, no por el nombre que Postgres le puso. `llamada_ai_check4` es un
+-- ordinal: cuenta los CHECK de tabla en el orden en que se declararon, así que es un nombre
+-- que nadie eligió y que depende de la forma del `create table`. Citarlo aquí no rompería en
+-- silencio —un `drop constraint` que no encuentra su nombre aborta la migración— pero sí
+-- dejaría este paso atado a un detalle que ninguna regla sostiene. Se localiza por su
+-- definición, que es lo único estable, y si no aparece se dice por qué en vez de seguir.
+do $$
+declare v_nombre text;
+begin
+  select c.conname into v_nombre from pg_constraint c
+    where c.conrelid = 'llamada_ai'::regclass and c.contype = 'c'
+      and pg_get_constraintdef(c.oid) like '%btrim(motivo)%'
+      -- Y que NO sea ya el de después: el que se instala abajo también menciona
+      -- btrim(motivo), así que sin esta mitad la búsqueda se encontraría a sí misma.
+      and pg_get_constraintdef(c.oid) not like '%despachada%';
+  if v_nombre is null then
+    raise exception 'no se encuentra en llamada_ai el CHECK que exige motivo fuera de salida-valida: esta migración lo sustituye por uno que exime a despachada, y sin quitarlo el estado nuevo no podría insertarse';
+  end if;
+  execute format('alter table llamada_ai drop constraint %I', v_nombre);
+end $$;
 alter table llamada_ai add constraint llamada_ai_motivo_del_desenlace_check
   check (resultado in ('salida-valida', 'despachada') or length(btrim(motivo)) > 0);
+
+-- ── Qué reserva pagó esta llamada ─────────────────────────────────────────────────────
+--
+-- El tope no cuenta una línea en vuelo mientras la reserva de su generación siga viva: la
+-- reserva ya apartó ese hueco, y sumar las dos cobra el doble por la misma generación. La
+-- pregunta que hay que saber responder es «¿sigue viva LA RESERVA QUE PAGÓ ESTA LLAMADA?»,
+-- y hasta aquí se respondía por el ANCLA — que es una respuesta distinta en cuanto el ancla
+-- se reintenta. Al fallar un cierre, la limpieza retira la reserva y la línea huérfana pasa
+-- a contar (bien); pero el reintento crea una reserva NUEVA sobre la misma ancla, y con el
+-- criterio por ancla esa reserva volvía a esconder la llamada ya pagada. Con fallos
+-- repetidos se acumulaban líneas huérfanas invisibles mientras una sola reserva las tapaba
+-- a todas, y el cupo diario dejaba pasar generaciones de más.
+--
+-- Sin FK, y a propósito: la reserva se BORRA cuando la generación termina —es su final
+-- normal, no una pérdida—, así que una FK obligaría a elegir entre bloquear ese borrado o
+-- poner el id a null, y lo segundo destruiría justo el dato que hace falta. Es el mismo
+-- caso que un recibo que nombra un instante cuyo referente desaparece: lo que se guarda es
+-- la identidad, y quien la lee comprueba si sigue existiendo. Nadie más la consulta.
+--
+-- `null` en las filas viejas y en las escrituras crudas, y es la dirección segura: sin
+-- reserva que la cubra, la línea CUENTA. Ante la duda de si el proveedor cobró se asume
+-- que sí.
+alter table llamada_ai add column reserva_id uuid;
+
+comment on column llamada_ai.reserva_id is
+  'La reserva de presupuesto que apartó el hueco de esta llamada. Sin FK: la reserva se borra '
+  'al terminar la generación. Sirve para no contar dos veces una línea en vuelo, y solo '
+  'mientras SU reserva siga viva.';
+
+grant insert (reserva_id) on llamada_ai to designio_app;
 
 -- ── Dos relojes, porque ahora son dos momentos distintos ──
 --

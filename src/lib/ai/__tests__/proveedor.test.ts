@@ -30,28 +30,27 @@ vi.mock('@anthropic-ai/sdk', () => ({
 }));
 
 const { generarConProveedor } = await import('../proveedor.server');
-import type { Revalidacion } from '../proveedor.server';
 
 const USO_CRUDO = { input_tokens: 1000, output_tokens: 40 };
 const USO_ESPERADO = { entrada: 1000, salida: 40 };
 
 /** Los apuntes que el adaptador pidió abrir, en orden. Es lo que permite comprobar que el
  * libro se abre ANTES de cada despacho y no después. */
-const apuntes: { modelo: string; consentimientoVersion: number | null; puesto: number }[] = [];
-/** Cuando se pone, el siguiente apunte falla con este motivo: sin línea no hay despacho. */
-let apunteFalla: string | null = null;
+const apuntes: { modelo: string; puesto: number }[] = [];
+/** Cuando se pone, el apunte de ESE puesto falla con este motivo: sin línea no hay despacho.
+ * Por puesto y no global porque el apunte es también la puerta del permiso, y lo que hay que
+ * poder representar es que el primario pase y el respaldo no. */
+let apunteFalla: { puesto: number; motivo: string } | null = null;
 
-function llamar(revalidar?: () => Promise<Revalidacion>) {
+function llamar() {
   return generarConProveedor({
     key: 'sk-de-prueba',
     capacidad: 'CI',
     sistema: 'sistema',
     usuario: 'material',
-    consentimientoVersion: 1,
-    revalidar,
-    anotarDespacho: async (modelo, consentimientoVersion, puesto) => {
-      if (apunteFalla) return { ok: false, motivo: apunteFalla };
-      apuntes.push({ modelo, consentimientoVersion, puesto });
+    anotarDespacho: async (modelo, puesto) => {
+      if (apunteFalla?.puesto === puesto) return { ok: false, motivo: apunteFalla.motivo };
+      apuntes.push({ modelo, puesto });
       return { ok: true, registroId: `linea-${apuntes.length}` };
     },
   });
@@ -61,6 +60,11 @@ describe('adaptador del proveedor AI', () => {
   beforeEach(() => {
     sdk.respuestas = [];
     sdk.modelosLlamados = [];
+    // También aquí: desde que el apunte es la puerta del permiso, hay tests de ESTE bloque
+    // que lo hacen fallar, y un `apunteFalla` que sobreviviera al test dejaría al siguiente
+    // sin despachar por un motivo que no es el suyo.
+    apuntes.length = 0;
+    apunteFalla = null;
   });
 
   it('una negativa del proveedor conserva el uso: la llamada ocurrió y se pagó', async () => {
@@ -118,14 +122,20 @@ describe('adaptador del proveedor AI', () => {
     // comprobación que hacer. Y si el consentimiento se revocó mientras el primario viajaba,
     // la revocación ya retiró la reserva, así que el respaldo saldría sin el token que
     // debía impedirlo.
+    //
+    // El permiso ya no se pide por un canal aparte: lo pide el APUNTE del respaldo, que abre
+    // su línea y comprueba en la misma transacción. Que la puerta sea una sola es lo que hace
+    // que el primario esté igual de cubierto — antes tenía la suya, leída y commiteada una
+    // transacción antes de despachar.
     sdk.respuestas = [
       Object.assign(new Error('no disponible'), { status: 503 }),
       { stop_reason: 'end_turn', content: [{ type: 'text', text: '{"titulo":"ok"}' }], usage: USO_CRUDO },
     ];
-    const r = await llamar(async () => ({
-      ok: false,
+    apunteFalla = {
+      puesto: 1,
       motivo: 'El consentimiento de ese material dejó de autorizar el procesamiento externo',
-    }));
+    };
+    const r = await llamar();
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.motivo).toMatch(/consentimiento/i);
@@ -136,17 +146,18 @@ describe('adaptador del proveedor AI', () => {
     expect(sdk.modelosLlamados).toEqual([MODELO_PRIMARIO]);
   });
 
-  it('y si el permiso sigue vigente, el respaldo sale anotado con la versión de ESE momento', async () => {
-    // La otra mitad: revalidar no es bloquear. Y la versión que ampara al respaldo es la
-    // que se lee al degradar, no la que autorizó al primario — anotar las dos contra la
-    // primera haría que el libro afirmara en falso bajo qué permiso salió el material.
+  it('y si el permiso sigue vigente, el respaldo sale con su PROPIO apunte, no con el del primario', async () => {
+    // La otra mitad: pedir permiso otra vez no es bloquear. Y cada intento abre su propia
+    // línea, que es donde queda anotada la autorización bajo la que salió: compartir la del
+    // primario haría que el libro afirmara en falso bajo qué permiso viajó el material.
     sdk.respuestas = [
       Object.assign(new Error('no disponible'), { status: 503 }),
       { stop_reason: 'end_turn', content: [{ type: 'text', text: '{"titulo":"ok"}' }], usage: USO_CRUDO },
     ];
-    const r = await llamar(async () => ({ ok: true, consentimientoVersion: 7 }));
+    const r = await llamar();
     expect(r.ok).toBe(true);
-    expect(r.intentos.map((i) => i.consentimientoVersion)).toEqual([1, 7]);
+    expect(apuntes.map((a) => a.puesto)).toEqual([0, 1]);
+    expect(r.intentos.map((i) => i.registroId)).toEqual(['linea-1', 'linea-2']);
     expect(sdk.modelosLlamados).toEqual([MODELO_PRIMARIO, MODELO_FALLBACK]);
   });
 
@@ -215,7 +226,7 @@ describe('el libro se abre antes de despachar (RF-09.14)', () => {
     // escribía al VOLVER, y un fallo transitorio de esa transacción borraba del libro una
     // llamada que el proveedor ya había cobrado. Ahora, si no se puede anotar, sencillamente
     // no ocurre — y se comprueba mirando que el SDK ni siquiera se llamó.
-    apunteFalla = 'el libro no admite la línea';
+    apunteFalla = { puesto: 0, motivo: 'el libro no admite la línea' };
     const r = await llamar();
     expect(r.ok).toBe(false);
     expect(sdk.modelosLlamados).toEqual([]);

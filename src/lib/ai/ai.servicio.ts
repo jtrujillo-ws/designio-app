@@ -135,23 +135,29 @@ async function presupuestoDeHoy(
           -- su hueco: sumar las dos cobraba el doble por la misma generación durante hasta dos
           -- timeouts, y con un cupo pequeño eso echaba fuera al siguiente curador.
           --
-          -- La exclusión mira si HAY una reserva que la cubra, no cuánto tiempo lleva abierta.
-          -- La diferencia es un agujero: cuando el cierre falla, la limpieza retira la reserva
-          -- en el acto, y con un criterio por TIEMPO la fila seguía sin contar el resto de la
-          -- ventana. En ese hueco no contaba ni la reserva ni la llamada pagada, así que
-          -- fallos de cierre repetidos dejaban reintentar por encima del cupo — justo el fallo
-          -- posterior al despacho que este cambio existe para contener.
+          -- La exclusión mira si sigue viva LA RESERVA QUE PAGÓ ESTA LLAMADA, por su id. Ni el
+          -- tiempo transcurrido ni el ancla sirven, y las dos formas de equivocarse dejan el
+          -- mismo agujero por caminos distintos:
           --
-          -- Atada al ANCLA porque así es como la reserva aparta el hueco. En cuanto la reserva
-          -- desaparece —se retire por limpieza, por revocación o por caducidad—, la línea
-          -- abierta cuenta: es la dirección segura para una llamada cuyo cierre se perdió,
-          -- porque ante la duda de si el proveedor cobró se asume que sí.
+          --  · por TIEMPO: cuando el cierre falla, la limpieza retira la reserva en el acto,
+          --    pero la fila seguía sin contar el resto de la ventana. En ese hueco no contaba
+          --    ni la reserva ni la llamada pagada.
+          --  · por ANCLA: retirada la reserva, la línea huérfana cuenta — hasta que el
+          --    reintento crea una reserva NUEVA sobre la misma ancla y vuelve a esconderla.
+          --    Esa reserva presupuesta la generación nueva, no la vieja, así que con fallos
+          --    repetidos se acumulaban líneas huérfanas invisibles bajo una sola reserva.
+          --
+          -- Las dos dejaban reintentar por encima del cupo, que es justo el fallo posterior al
+          -- despacho que este cambio existe para contener. Por identidad no hay ambigüedad: en
+          -- cuanto la reserva desaparece —por limpieza, por revocación o por caducidad— su
+          -- línea cuenta, y ninguna otra reserva la cubre. Es la dirección segura para una
+          -- llamada cuyo cierre se perdió, porque ante la duda de si el proveedor cobró se
+          -- asume que sí; una fila sin reserva anotada cuenta por lo mismo.
           and (resultado <> 'despachada' or not exists (
             select 1 from reserva_ai r
-            where r.workspace_id = llamada_ai.workspace_id
+            where r.id = llamada_ai.reserva_id
+              and r.workspace_id = llamada_ai.workspace_id
               and r.creado_en > now() - reserva_ai_ventana()
-              and ((llamada_ai.item_id is not null and r.item_id = llamada_ai.item_id)
-                   or (llamada_ai.reto_id is not null and r.reto_id = llamada_ai.reto_id))
           )))::int as atendidas,
       (select coalesce(sum(unidades), 0) from reserva_ai
         where workspace_id = ${workspaceId} and creado_en > now() - reserva_ai_ventana())::int
@@ -1028,13 +1034,28 @@ async function liberarReserva(
  * versionada es justo lo que hace ese caso alcanzable: un registro con
  * `procesamiento_externo = false` puede pasar a vigente ahí en medio.
  *
+ * Recibe la TRANSACCIÓN en vez de abrir la suya, y ahí está la mitad que faltaba. Antes esto
+ * commiteaba y después `abrirLlamada` abría otra transacción para anotar la línea: entre las
+ * dos volvía a caber la misma revocación, y ni la FK del consentimiento ni el guard la
+ * atrapaban —la versión citada sigue existiendo, solo ha dejado de ser la vigente, y el guard
+ * únicamente exige que se cite alguna—. Así que el permiso se lee en la MISMA transacción que
+ * abre el libro, que es la última que toca la base antes del despacho. Un candado no puede
+ * llegar más cerca que eso.
+ *
+ * Y por eso lo invoca UNA sola vía. El respaldo de una degradación ya se re-autorizaba —«el
+ * segundo despacho se autoriza otra vez, o no sale»—, pero el primario no: la misma regla
+ * escrita para un intento y no para el otro. Con la comprobación dentro del apunte, y el
+ * apunte antes de cada despacho, los dos intentos pasan por ella sin que nadie tenga que
+ * acordarse.
+ *
  * Qué se puede garantizar y qué no, dicho sin rodeos:
  *
  *  · **Sí**: que en el INSTANTE DEL DESPACHO el consentimiento vigente autoriza el
  *    procesamiento externo, y que el hueco de presupuesto sigue vivo. La lectura se hace
  *    bajo el MISMO candado por item que toma `registrarConsentimiento`, así que una
  *    revocación a medio commit no se lee a medias: o se espera a que termine y se ve, o
- *    todavía no había empezado.
+ *    todavía no había empezado. Y como la línea del libro nace en esa misma transacción, lo
+ *    leído no puede quedarse viejo entre la comprobación y el apunte.
  *  · **No**: que una revocación que llegue mientras los bytes viajan alcance a la llamada.
  *    Ningún candado puede abarcar una petición HTTP fuera de transacción, y eso es
  *    deliberado — un tercero lento no puede retener una conexión de la base. Lo que sí
@@ -1042,14 +1063,22 @@ async function liberarReserva(
  *    lee el vigente y ninguna propuesta llega a nacer, y la llamada queda en el libro con
  *    su coste. El material que ya salió no se puede des-enviar, y la UI lo dice.
  */
-async function confirmarDespacho(
+async function comprobarDespacho(
+  tx: TransactionSql,
   actorId: string,
   entrada: GenerarPropuestas,
   alcance: Alcance,
 ): Promise<number | null> {
   let versionConsentimiento: number | null = null;
-  await conUsuario(actorId, async (tx) => {
+  {
     await exigirCuentaActiva(tx, actorId);
+    // La cuenta Y el rol. Comprobar solo la cuenta era media autorización: `prepararAlcance`
+    // exige rol curador y commitea, así que entre aquel commit y este despacho cabe una
+    // degradación a stakeholder — y quien deja de poder pedir propuestas deja de poder
+    // despachar material a un tercero. La política de inserción lo rechazaría de todos modos
+    // (es el suelo, y sigue estando), pero un 42501 llega aquí sin nada que decirle a la
+    // persona salvo «vuelve a intentarlo», que además es falso: reintentar no devuelve un rol.
+    await rolCurador(tx, actorId, entrada.workspaceId);
     if (entrada.capacidad === 'CI') {
       await bloquearConsentimiento(tx, entrada.anclaId);
       const [item] = await tx`select
@@ -1113,7 +1142,7 @@ async function confirmarDespacho(
         'La reserva de presupuesto de esta generación ya no está vigente (se retiró o caducó): no se llamó al proveedor. Vuelve a pedirla.',
       );
     }
-  });
+  }
   return versionConsentimiento;
 }
 
@@ -1159,29 +1188,39 @@ async function abrirLlamada(
   entrada: GenerarPropuestas,
   alcance: Alcance,
   modelo: string,
-  consentimientoVersion: number | null,
   puesto: number,
 ): Promise<ApunteDespacho> {
   try {
-    const [fila] = await conUsuario(actorId, (tx) => tx`insert into llamada_ai
-      (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado,
-       consentimiento_version, intento, creado_por)
-      values (${entrada.workspaceId}, ${entrada.capacidad},
-              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
-              ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
-              ${modelo}, ${alcance.origenKey}, 'despachada',
-              ${consentimientoVersion}, ${puesto}, ${actorId})
-      returning id`);
+    const [fila] = await conUsuario(actorId, async (tx) => {
+      // El permiso, en la MISMA transacción que abre la línea. La versión que se anota es la
+      // que se acaba de leer bajo el candado, no una que llegó de fuera: entre leerla y
+      // escribirla no hay commit por medio en el que pueda dejar de ser la vigente.
+      const consentimientoVersion = await comprobarDespacho(tx, actorId, entrada, alcance);
+      return tx`insert into llamada_ai
+        (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado,
+         consentimiento_version, reserva_id, intento, creado_por)
+        values (${entrada.workspaceId}, ${entrada.capacidad},
+                ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
+                ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
+                ${modelo}, ${alcance.origenKey}, 'despachada',
+                ${consentimientoVersion}, ${alcance.reservaId}, ${puesto}, ${actorId})
+        returning id`;
+    });
     return { ok: true, registroId: fila!.id as string };
   } catch (e) {
     // No se lanza: el adaptador no lanza nunca (SYS-21) y quien llama necesita el motivo, no
     // una excepción. Y sobre todo, el despacho NO ocurre — que es el punto entero.
     //
     // Pero un `catch` a secas mandaba «vuelve a intentarlo» para TODO, y no todo se arregla
-    // reintentando: el guard rechaza con P0001 cuando falta el consentimiento o cuando se cita
-    // uno que no aplicaba, y una FK o un CHECK rotos no van a dejar de estarlo por insistir.
-    // Decirle a alguien que reintente lo que no puede funcionar es peor que no decir nada,
-    // porque se lo cree. Mismo criterio que usa la persistencia del lote.
+    // reintentando: el permiso retirado, el guard con su P0001, y una FK o un CHECK rotos no
+    // van a dejar de estarlo por insistir. Decirle a alguien que reintente lo que no puede
+    // funcionar es peor que no decir nada, porque se lo cree. Mismo criterio que usa la
+    // persistencia del lote.
+    //
+    // El primero es el motivo por el que NO se despacha casi siempre: el permiso se retiró, el
+    // ancla se curó o la reserva caducó entre que se preparó la llamada y el momento de
+    // sacarla. `comprobarDespacho` ya lo dice con las palabras que la persona necesita leer.
+    if (e instanceof ErrorAI) return { ok: false, motivo: e.message };
     const err = e as { code?: string; message?: string };
     if (err.code === 'P0001' && typeof err.message === 'string' && err.message.length > 0) {
       return {
@@ -1278,42 +1317,23 @@ export async function generarPropuestas(
 ): Promise<{ generadas: number }> {
   const alcance = await prepararAlcance(actorId, entrada);
   try {
-    // Última parada antes de que el material salga del sistema. Todo lo anterior está
-    // commiteado desde hace una transacción entera.
-    const versionConsentimiento = await confirmarDespacho(actorId, entrada, alcance);
-
     const respuesta = await generarConProveedor({
       key: alcance.key,
       capacidad: entrada.capacidad,
       sistema: alcance.sistema,
       usuario: alcance.usuario,
-      consentimientoVersion: versionConsentimiento,
+      // Abrir la línea del libro es AHORA también pedir permiso, y por eso el adaptador ya no
+      // lleva ni la versión del consentimiento ni una revalidación aparte para el respaldo.
+      // Antes había dos comprobaciones distintas: una antes del bucle que amparaba al
+      // primario y otra dentro que amparaba al respaldo. Dos escrituras de la misma regla, y
+      // la del primario commiteaba una transacción antes del apunte — el hueco por el que una
+      // revocación dejaba salir el material igual. Con una sola, invocada dentro del apunte,
+      // los dos intentos pasan por la misma puerta y ninguno la cruza con permiso viejo.
+      //
       // El puesto lo pasa el ADAPTADOR, que es quien recorre los intentos y por tanto quien
       // lo sabe. Aquí vivía un contador propio que no podía diferir de su índice —el bucle
       // devuelve en cuanto un apunte falla— y que solo servía para duplicarlo.
-      anotarDespacho: (modelo, cv, puesto) =>
-        abrirLlamada(actorId, entrada, alcance, modelo, cv, puesto),
-      // Degradar de modelo es un despacho NUEVO, no la misma llamada otra vez: ocurre con la
-      // primera ya terminada, el control de vuelta aquí y ni un byte en el aire. Así que se
-      // vuelve a pedir permiso con EXACTAMENTE la misma comprobación que autorizó el
-      // primario —consentimiento vigente bajo el candado por item, item aún pendiente, reto
-      // que sigue admitiendo criterios y reserva viva— y la versión que devuelve es la que
-      // ampara al respaldo. `confirmarDespacho` lanza `ErrorAI` al rechazar; aquí se traduce
-      // a un `ok:false` porque el adaptador no lanza nunca (SYS-21) y el motivo tiene que
-      // llegar al libro y a la pantalla como cualquier otro.
-      revalidar: async () => {
-        try {
-          return { ok: true, consentimientoVersion: await confirmarDespacho(actorId, entrada, alcance) };
-        } catch (e) {
-          return {
-            ok: false,
-            motivo:
-              e instanceof ErrorAI
-                ? e.message
-                : 'La autorización de esta generación dejó de ser válida antes de reintentar con el modelo de respaldo',
-          };
-        }
-      },
+      anotarDespacho: (modelo, puesto) => abrirLlamada(actorId, entrada, alcance, modelo, puesto),
     });
 
     // El proveedor no dio contenido utilizable. Los intentos se anotan igual —con su uso,

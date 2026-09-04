@@ -38,16 +38,15 @@ import { describeAuthz } from './helpers';
 const proveedor = vi.hoisted(() => ({
   respuesta: null as ResultadoProveedor | null,
   duranteLlamada: null as (() => Promise<void>) | null,
+  antesDelApunte: null as (() => Promise<void>) | null,
 }));
 vi.mock('@/lib/ai/proveedor.server', async (original) => {
   const real = await original<typeof import('@/lib/ai/proveedor.server')>();
   return {
     ...real,
     generarConProveedor: async (entrada: {
-      consentimientoVersion: number | null;
       anotarDespacho: (
         modelo: string,
-        cv: number | null,
         puesto: number,
       ) => Promise<{ ok: true; registroId: string } | { ok: false; motivo: string }>;
     }) => {
@@ -56,22 +55,25 @@ vi.mock('@/lib/ai/proveedor.server', async (original) => {
       // real: es el orden que este slice existe para garantizar —no se gasta lo que no se
       // puede anotar— y un doble que se lo saltara dejaría el arreglo sin probar. De aquí
       // salen los `registroId` que después cierra el servicio.
+      //
+      // Y el apunte es también la puerta del PERMISO: comprueba y anota en la misma
+      // transacción. Un doble que lo tratara como un simple insert dejaría sin probar que una
+      // revocación llegada justo antes del despacho para el material antes de que salga.
       const intentos = [];
       for (const [puesto, i] of r.intentos.entries()) {
-        const apunte = await entrada.anotarDespacho(i.modelo, entrada.consentimientoVersion, puesto);
+        // El hueco ANTES del apunte: lo que ocurra aquí pasa con la autorización ya leída y
+        // ni un byte todavía en el aire. Es el otro lado del de abajo, y el que decide si el
+        // material llega a salir — por eso el apunte tiene que volver a preguntar.
+        if (proveedor.antesDelApunte) await proveedor.antesDelApunte();
+        const apunte = await entrada.anotarDespacho(i.modelo, puesto);
         if (!apunte.ok) return { ok: false as const, motivo: apunte.motivo, intentos };
         // El hueco en el que el material está EN VUELO: lo que ocurra aquí pasa con la
         // llamada ya despachada y su línea ya abierta, que es justo el caso que ningún
         // candado puede cubrir. Va después del apunte para que el orden sea el real.
         if (proveedor.duranteLlamada) await proveedor.duranteLlamada();
-        // El adaptador real SELLA cada intento con la autorización bajo la que salió, y el
-        // libro se escribe a partir de ahí. El doble tiene que hacer lo mismo o las pruebas
-        // dejarían de ver justo eso: con qué permiso se despachó cada llamada.
-        intentos.push({
-          ...i,
-          registroId: apunte.registroId,
-          consentimientoVersion: entrada.consentimientoVersion,
-        });
+        // Cada intento sube sellado con LA LÍNEA que se abrió para él: es la que el servicio
+        // cierra después, y la que ya lleva anotada la autorización bajo la que salió.
+        intentos.push({ ...i, registroId: apunte.registroId });
       }
       return { ...r, intentos };
     },
@@ -158,7 +160,6 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       uso: USO_CI_COMPLETO,
       // Lo rellena el doble al abrir la línea; aquí solo tiene que existir para el tipo.
       registroId: '',
-      consentimientoVersion: null,
       ...campos,
     };
   }
@@ -1244,6 +1245,116 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     await sqlAdmin()`delete from reserva_ai where workspace_id = ${ws} and item_id = ${itemId}`;
   });
 
+  it('una revocación entre autorizar y despachar para el material ANTES de que salga', async () => {
+    // El otro lado de «revocar mientras el material viaja». Allí la llamada ya había salido y
+    // lo único que queda es no dejar nacer la propuesta; aquí todavía no ha salido nada, así
+    // que la promesa que toca es más fuerte: el material NO se despacha.
+    //
+    // El hueco es real y es el que abre este slice: la autorización se leía en una
+    // transacción y la línea del libro se abría en otra, así que entre las dos cabía una
+    // revocación commiteada. La FK del consentimiento no la atrapa —la versión citada sigue
+    // existiendo, solo ha dejado de ser la vigente— y el guard solo exige que se cite alguna.
+    // Por eso el apunte vuelve a preguntar, en su propia transacción: es la última parada
+    // antes del despacho, y ahora es la única.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Entrevista revocada justo antes de salir', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    try {
+      let despachos = 0;
+      await conProveedor(RESPUESTA_CI, async () => {
+        proveedor.antesDelApunte = async () => {
+          await registrarConsentimiento(disenadorId, {
+            workspaceId: ws,
+            itemId,
+            alcance: 'La persona retira el permiso de procesamiento externo',
+            procesamientoExterno: false,
+          });
+        };
+        proveedor.duranteLlamada = async () => {
+          despachos += 1;
+        };
+        try {
+          await expect(
+            generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+          ).rejects.toThrow(/consentimiento/i);
+        } finally {
+          proveedor.antesDelApunte = null;
+          proveedor.duranteLlamada = null;
+        }
+      });
+
+      // Ni un byte en el aire: el material no llegó a salir.
+      expect(despachos).toBe(0);
+      // Y no queda línea de gasto: no se abre el libro para una llamada que no ocurre.
+      const lineas = await admin`select 1 as x from llamada_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`;
+      expect(lineas.length).toBe(0);
+      const propuestas = await admin`select 1 as x from propuesta_ai where item_id = ${itemId}`;
+      expect(propuestas.length).toBe(0);
+    } finally {
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
+  it('quien deja de ser curador a mitad de camino tampoco despacha, y se le dice por qué', async () => {
+    // La otra mitad de la autorización que el apunte tiene que rehacer. `prepararAlcance`
+    // exige rol curador y commitea; entre aquel commit y el despacho cabe una degradación a
+    // stakeholder, y quien ya no puede pedir propuestas tampoco puede mandar material a un
+    // tercero. La política de inserción lo rechaza igual —es el suelo—, pero por esa vía la
+    // persona solo recibiría un «vuelve a intentarlo» que además es falso: reintentar no
+    // devuelve un rol. Se comprueba donde se decide el permiso, y se dice con sus palabras.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Entrevista de quien pierde el rol a media llamada', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    const [miembro] = await admin`select id, rol from miembro
+      where usuario_id = ${disenadorId} and workspace_id = ${ws}`;
+    try {
+      let despachos = 0;
+      await conProveedor(RESPUESTA_CI, async () => {
+        proveedor.antesDelApunte = async () => {
+          await admin`update miembro set rol = 'stakeholder' where id = ${miembro!.id as string}`;
+        };
+        proveedor.duranteLlamada = async () => {
+          despachos += 1;
+        };
+        try {
+          await expect(
+            generarPropuestas(disenadorId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+          ).rejects.toThrow(/lead-boutique o diseñador/i);
+        } finally {
+          proveedor.antesDelApunte = null;
+          proveedor.duranteLlamada = null;
+        }
+      });
+      expect(despachos).toBe(0);
+      const lineas = await admin`select 1 as x from llamada_ai
+        where workspace_id = ${ws} and item_id = ${itemId}`;
+      expect(lineas.length).toBe(0);
+    } finally {
+      await admin`update miembro set rol = ${miembro!.rol as string}
+        where id = ${miembro!.id as string}`;
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
   it('revocar mientras el material viaja: la llamada ya salió, pero ninguna propuesta nace', async () => {
     const itemId = await nuevoItem('Entrevista revocada a media llamada', 'entrevista');
     await registrarConsentimiento(leadId, {
@@ -1701,8 +1812,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (workspace_id, capacidad, reto_id, unidades, creado_por)
         values (${ws}, 'C0', ${retoId}, 2, ${leadId}) returning id`;
       const [cubierta] = await admin`insert into llamada_ai
-        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
-        values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'despachada', ${leadId})
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, reserva_id, creado_por)
+        values (${ws}, 'C0', ${retoId}, ${MODELO_RELLENO}, 'entorno', 'despachada',
+                ${reserva!.id as string}, ${leadId})
         returning id`;
       expect(await mide()).toBe(antes);
 
@@ -1714,6 +1826,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // existe para contener.
       await admin`delete from reserva_ai where id = ${reserva!.id as string}`;
       expect(await mide()).toBe(antes + 1);
+
+      // (c) Y no vuelve a dejar de contar cuando el ancla se reintenta. Una reserva NUEVA
+      // presupuesta la generación nueva, no la vieja: si la exclusión mirase solo el ancla, el
+      // reintento volvería a esconder la llamada ya pagada, y con fallos repetidos se
+      // acumularían líneas huérfanas invisibles mientras una sola reserva las tapa a todas.
+      // La reserva que cuenta es LA SUYA, la que apartó su hueco, y por eso viaja en la fila.
+      const [otra] = await admin`insert into reserva_ai
+        (workspace_id, capacidad, reto_id, unidades, creado_por)
+        values (${ws}, 'C0', ${retoId}, 2, ${leadId}) returning id`;
+      expect(await mide()).toBe(antes + 1);
+      await admin`delete from reserva_ai where id = ${otra!.id as string}`;
       await admin`delete from llamada_ai where id = ${cubierta!.id as string}`;
 
       // Cerrada: el desenlace y el coste ya constan, en la MISMA fila que se abrió antes.

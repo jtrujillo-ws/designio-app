@@ -2,7 +2,11 @@ import { afterAll, beforeAll, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { exportarWorkspace } from '@/lib/exportacion/exportacion.servicio';
-import { cargaCanonicaConstancia, jsonbTexto } from '@/lib/disposicion/disposicion.schemas';
+import {
+  RegistrarAcuerdoSchema,
+  cargaCanonicaConstancia,
+  jsonbTexto,
+} from '@/lib/disposicion/disposicion.schemas';
 import {
   ErrorDisposicion,
   ejecutarDisposicion,
@@ -1443,6 +1447,21 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       from constancia_disposicion where id = ${c.id as string}`;
     expect(f!.coherente).toBe(true);
     expect(f!.tras_el_acuerdo).toBe(true);
+
+    // Y el EVENTO va con el sello, no con el inicio de la transacción. No lo escribe esta
+    // migración —`evento_dominio.creado_en` toma su default, que `20260902090000` fijó en
+    // `clock_timestamp()`—, y precisamente por eso se ancla aquí: es una garantía de la que
+    // este slice depende y que vive en otro fichero, así que un cambio allí la rompería en
+    // silencio. Lo que se rompería es la cronología del panel de auditoría, que ordena por
+    // `creado_en`: el evento quedaría fechado antes de la ejecución que lo produjo y antes
+    // de la exportación que la habilitó — una historia causalmente falsa.
+    const [ev] = await sqlAdmin()`select e.creado_en >= c.ejecutado_en as tras_ejecutar,
+        e.creado_en > c.exportado_en as tras_exportar
+      from evento_dominio e, constancia_disposicion c
+      where c.id = ${c.id as string} and e.workspace_id = ${ws}
+        and e.tipo = 'WorkspaceDispuesto'`;
+    expect(ev!.tras_ejecutar).toBe(true);
+    expect(ev!.tras_exportar).toBe(true);
   });
 
   it('la ventana declarada existe, y es exactamente lo que el alcance dice que es', async () => {
@@ -1756,5 +1775,32 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         returning base`;
     });
     expect(ok!.base).toBe('Cláusula 9.1');
+
+    // Y las dos capas cuentan el tope en la MISMA unidad. `length()` de Postgres cuenta
+    // puntos de código y el `.length` de JavaScript cuenta unidades UTF-16, así que un
+    // carácter astral vale uno para la base y dos para el esquema: 151 emoji medían 151 y
+    // 302 (medido), el CHECK los aceptaba y Zod los rechazaba, y por SQL crudo entraba una
+    // referencia contractual que la ruta normal no podía registrar.
+    const astral = '😀';
+    expect([...astral].length).toBe(1);
+    expect(astral.length).toBe(2);
+    const [medida] = await sqlAdmin()`select length(${astral.repeat(151)}) as n`;
+    expect(medida!.n).toBe([...astral.repeat(151)].length);
+    // El esquema rechaza lo que la base rechaza, contando igual: 301 puntos de código.
+    expect(RegistrarAcuerdoSchema.safeParse({
+      workspaceId: ws, modalidad: 'archivo', base: astral.repeat(301),
+      efectivoDesde: EFECTIVO_PASADO,
+    }).success).toBe(false);
+    // Y acepta lo que la base acepta: 300 puntos de código, aunque sean 600 unidades UTF-16.
+    const trescientos = astral.repeat(300);
+    expect(RegistrarAcuerdoSchema.safeParse({
+      workspaceId: ws, modalidad: 'archivo', base: trescientos,
+      efectivoDesde: EFECTIVO_PASADO,
+    }).success).toBe(true);
+    await conUsuario(adminId, async (tx) => {
+      await tx`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+        values (${ws}, 'archivo', ${trescientos}, ${EFECTIVO_PASADO}, ${adminId})`;
+    });
   });
 });

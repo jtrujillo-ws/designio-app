@@ -35,7 +35,25 @@ export const RegistrarAcuerdoSchema = z.object({
     .string()
     .trim()
     .min(1)
-    .max(300)
+    /*
+     * El tope se cuenta en PUNTOS DE CÓDIGO, que es lo que cuenta `length()` en Postgres, y
+     * no con `.max(300)`: el `.length` de JavaScript cuenta unidades UTF-16, así que un
+     * carácter astral —un emoji— vale dos. Medido: 151 emoji miden 151 para la base y 302
+     * para `.max(300)`, de modo que el `CHECK` los aceptaba y el esquema los rechazaba. Las
+     * dos capas declaraban «300 caracteres» y no era el mismo 300: por SQL crudo entraban
+     * referencias contractuales que la ruta normal no podía registrar.
+     *
+     * Se elige el punto de código y no la unidad UTF-16 porque es lo que «300 caracteres»
+     * significa para quien lo lee, y porque el tope existe para acotar el documento sellado:
+     * 300 puntos de código son 1.200 bytes en el peor caso, que sigue acotado.
+     *
+     * El `maxLength={300}` del campo se queda como está y no es una tercera regla: el
+     * navegador solo puede contar UTF-16, así que corta ANTES —150 emoji— y nunca deja
+     * escribir algo que el esquema vaya a rechazar. Es más estricto, no distinto.
+     */
+    .refine((v) => [...v].length <= 300, {
+      message: 'La referencia del acuerdo no puede pasar de 300 caracteres',
+    })
     /*
      * Y en UNA sola línea. No es cosmética: esta referencia se COPIA dentro de la carga
      * canónica de la constancia, que es un campo por renglón, así que un salto de línea

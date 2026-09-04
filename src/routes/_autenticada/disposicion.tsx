@@ -56,7 +56,7 @@ const parrafo: CSSProperties = {
 /**
  * El instante, en UTC y con forma fija.
  *
- * `toLocaleString()` no vale aquí por dos razones que se suman. La primera es de correcciÓn:
+ * `toLocaleString()` no vale aquí por dos razones que se suman. La primera es de corrección:
  * esta aplicación renderiza en el servidor, así que ese texto se calcula una vez con el locale
  * y el huso del proceso y otra con los del navegador — y cuando difieren, React encuentra dos
  * árboles distintos al hidratar. La segunda es de sentido: esto es la fecha que acredita que

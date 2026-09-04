@@ -15,6 +15,32 @@ import { describeAuthz } from './helpers';
  * `now()` y `current_timestamp` NO están en la lista y es a propósito: devuelven un
  * `timestamptz`, o sea un instante absoluto. El huso solo cambia cómo se IMPRIMEN, no lo que
  * valen, así que compararlos es seguro. Lo que no es seguro es colapsarlos a un día.
+ *
+ * ───────────────────────────────────────────────────────────────────────────────────────
+ *
+ * Este fichero tiene DOS mitades, y conviene saber cuál sostiene qué antes de leerlo.
+ *
+ * La primera ACUSA. Es un reconocedor: un catálogo de formas peligrosas —el cast, la
+ * asignación a una variable, el `select … into`, el SQL dinámico, el serializador, el
+ * `format`— que recorre cada expresión guardada del esquema y señala las que lee como
+ * culpables. Sirve, y su virtud es que cuando marca algo DICE POR QUÉ. Pero su modo de fallo
+ * es el peor posible: lo que no sabe leer, pasa en verde. Doce rondas de revisión seguidas
+ * encontraron doce formas más, cada una un parche, y ninguna respondía la única pregunta que
+ * importaba — cuántas quedaban.
+ *
+ * La segunda CERTIFICA, y es la que sostiene la garantía. Le da la vuelta a la obligación:
+ * un instante solo puede volverse dependiente del huso de quien llama encontrándose con un
+ * tipo temporal que no es un instante, así que toda expresión que junte las dos cosas tiene
+ * que estar CERTIFICADA como segura o enrojece. Lo que cuenta como «tipo que no es un
+ * instante» sale del CATÁLOGO —columnas, retornos, parámetros, dominios, built-ins—, no de
+ * una expresión regular de este fichero, así que su alcance crece con el esquema sin que
+ * nadie lo escriba aquí. Su incompletitud cuesta falsos positivos, que se ven y se declaran
+ * a mano con el motivo escrito, en vez de huecos, que no se ven y se quedan.
+ *
+ * Medido sobre cuatro formas que el reconocedor no leía —un dominio en el tipo de vuelta,
+ * una vista actualizable como destino de escritura, un `RETURNING` como entrega final de un
+ * cuerpo SQL, y un `WITH` delante de un `INSERT … VALUES`—: el reconocedor marcó UNA de las
+ * cuatro; la certificación, las cuatro.
  */
 describeAuthz('el calendario de las garantías lo fija la base', () => {
   /*
@@ -3169,6 +3195,349 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     return salida;
   };
 
+  /*
+   * ─── LA REGLA, DEL REVÉS ──────────────────────────────────────────────────────────────
+   *
+   * Todo lo de arriba ACUSA: busca formas peligrosas y deja pasar lo que no sabe leer. Ese
+   * modo de fallo costó doce rondas de revisión seguidas, y cada hallazgo era el mismo
+   * hallazgo: una forma más de entregar un reloj que el reconocedor no tenía. Arreglarlas una
+   * a una no responde nunca la única pregunta que importa —cuántas quedan—, porque un censo
+   * cuya incompletitud sale en VERDE no es un censo: es la lista de lo que a alguien se le
+   * ocurrió mirar.
+   *
+   * Así que la obligación se invierte. Un instante —`now()`, `clock_timestamp()`, cualquier
+   * `timestamptz`— solo puede volverse dependiente del huso de quien llama de UNA manera:
+   * encontrándose con un tipo temporal que NO es un instante. La pregunta deja de ser
+   * «¿reconozco esta forma peligrosa?» y pasa a ser «¿puedo CERTIFICAR que este reloj no
+   * tiene con qué encontrarse?». Lo que no se certifica enrojece, y para ponerlo en verde
+   * hay que declararlo A MANO con el motivo escrito y medido.
+   *
+   * Lo que hace que esto no sea otro reconocedor con otro nombre es de dónde sale la lista de
+   * lo que cuenta: del CATÁLOGO, no de una expresión regular. Los nombres —columnas,
+   * retornos, parámetros, dominios— los enumera Postgres; los built-ins que aceptan un
+   * instante los enumera Postgres. Añadir mañana una columna `date` mete su nombre en el
+   * conjunto sin que nadie lo escriba aquí, y desde ese momento cualquier objeto que la
+   * mezcle con un reloj deja de certificarse — aunque su forma sea una que este fichero no
+   * haya visto nunca. La incompletitud pasa a costar falsos positivos, que se ven y se
+   * declaran, en vez de huecos, que no se ven y se quedan.
+   *
+   * El alcance del certificado es el OBJETO ENTERO y no la sentencia, y es a propósito. Con
+   * alcance de sentencia, `for r in select now() as t loop v_d := r.t; end loop` se certifica
+   * y no debería: el registro `r` se lleva el instante a la sentencia siguiente, donde le
+   * espera un `date`. Seguir el valor de una sentencia a otra es exactamente el análisis que
+   * este cambio viene a dejar de necesitar, así que el corte se pone donde no hace falta
+   * seguirlo. El precio son doce declaraciones a mano hoy —medido— y una por cada objeto
+   * futuro que mezcle las dos cosas; a cambio, mezclarlas nunca es gratis ni silencioso.
+   */
+
+  /**
+   * Los built-ins que ACEPTAN un instante, clasificados uno a uno. `colapsa` es el que puede
+   * devolver algo que dependa del huso de la sesión; `conserva`, el que no.
+   *
+   * Cada `colapsa` está MEDIDO, no supuesto, comparando el resultado en dos husos:
+   *
+   *   to_char(t,'YYYY-MM-DD')      2026-03-08 en Pacific/Kiritimati · 2026-03-07 en Etc/GMT+12
+   *   extract(day from t)          8 · 7
+   *   date_part('day', t)          igual que extract, es su misma implementación
+   *   date_trunc('day', t)         dos INSTANTES distintos (10:00Z · 12:00Z), aunque el tipo
+   *                                de vuelta sí lleve huso: trunca en el huso de la sesión
+   *   age(t)                       …27 days 04:00:00 · …27 days 06:00:00
+   *   date/time/timetz/timestamp   el cast, que es de lo que va todo este fichero
+   *   timezone                     seguro SOLO con 'UTC' escrito; con otro huso, no
+   *   t + interval / t - interval  medido con DST y no con husos fijos, que es donde se ve:
+   *                                `t + interval '1 day'` da 11:00Z en America/New_York y
+   *                                12:00Z en UTC. Con campos de hora es exacto, pero eso no
+   *                                se sabe desde el nombre de la función, así que colapsa
+   *   generate_series(t,t,step)    por lo mismo: los pasos de un día saltan el cambio de hora
+   *   date_add / date_subtract     el mismo cálculo con nombre de función (Postgres 16+)
+   *
+   * Y los `conserva` que podrían sorprender, también medidos:
+   *
+   *   date_bin(iv, t, origen)      mismo INSTANTE en los dos husos: bina desde el origen en
+   *                                tiempo absoluto, no en el calendario de la sesión
+   *   t - t                        66 days 06:00:00 en los dos: una resta de instantes
+   *   isfinite / overlaps          booleanos sobre instantes
+   *
+   * La lista NO se escribe a ojo: el censo la compara contra el catálogo y exige que TODO
+   * built-in que acepte un instante esté aquí clasificado. Un Postgres que traiga uno nuevo
+   * enrojece hasta que alguien lo mire — la misma inversión, aplicada a la propia lista.
+   */
+  const ACEPTAN_INSTANTE: Record<string, 'colapsa' | 'conserva'> = {
+    age: 'colapsa',
+    date: 'colapsa',
+    date_add: 'colapsa',
+    date_part: 'colapsa',
+    date_subtract: 'colapsa',
+    date_trunc: 'colapsa',
+    extract: 'colapsa',
+    generate_series: 'colapsa',
+    interval_pl_timestamptz: 'colapsa',
+    time: 'colapsa',
+    timestamp: 'colapsa',
+    timestamptz_mi_interval: 'colapsa',
+    timestamptz_pl_interval: 'colapsa',
+    timetz: 'colapsa',
+    timezone: 'colapsa',
+    to_char: 'colapsa',
+    date_bin: 'conserva',
+    in_range: 'conserva',
+    isfinite: 'conserva',
+    max: 'conserva',
+    min: 'conserva',
+    overlaps: 'conserva',
+    pg_replication_origin_xact_setup: 'conserva',
+    pg_sleep_until: 'conserva',
+    timestamptz: 'conserva',
+    timestamptz_larger: 'conserva',
+    timestamptz_mi: 'conserva',
+    timestamptz_out: 'conserva',
+    timestamptz_send: 'conserva',
+    timestamptz_smaller: 'conserva',
+    tstzrange: 'conserva',
+    tstzrange_subdiff: 'conserva',
+    /*
+     * Y las implementaciones de los OPERADORES de comparación, que nadie escribe por su
+     * nombre pero que el catálogo devuelve igual. Todas comparan instantes contra instantes,
+     * fechas o marcas sin huso y devuelven un booleano o un entero de orden: la comparación
+     * la hace Postgres promoviendo el operando sin huso CON EL HUSO DE LA SESIÓN, así que la
+     * peligrosa es la fecha que entra, no la función — y esa fecha ya está en el conjunto de
+     * nombres por su tipo. Aquí van clasificadas para que la comparación contra el catálogo
+     * sea exhaustiva y no para que alguien las busque en un cuerpo.
+     */
+    date_cmp_timestamptz: 'conserva',
+    date_eq_timestamptz: 'conserva',
+    date_ge_timestamptz: 'conserva',
+    date_gt_timestamptz: 'conserva',
+    date_le_timestamptz: 'conserva',
+    date_lt_timestamptz: 'conserva',
+    date_ne_timestamptz: 'conserva',
+    timestamp_cmp_timestamptz: 'conserva',
+    timestamp_eq_timestamptz: 'conserva',
+    timestamp_ge_timestamptz: 'conserva',
+    timestamp_gt_timestamptz: 'conserva',
+    timestamp_le_timestamptz: 'conserva',
+    timestamp_lt_timestamptz: 'conserva',
+    timestamp_ne_timestamptz: 'conserva',
+    timestamptz_cmp: 'conserva',
+    timestamptz_cmp_date: 'conserva',
+    timestamptz_cmp_timestamp: 'conserva',
+    timestamptz_eq: 'conserva',
+    timestamptz_eq_date: 'conserva',
+    timestamptz_eq_timestamp: 'conserva',
+    timestamptz_ge: 'conserva',
+    timestamptz_ge_date: 'conserva',
+    timestamptz_ge_timestamp: 'conserva',
+    timestamptz_gt: 'conserva',
+    timestamptz_gt_date: 'conserva',
+    timestamptz_gt_timestamp: 'conserva',
+    timestamptz_le: 'conserva',
+    timestamptz_le_date: 'conserva',
+    timestamptz_le_timestamp: 'conserva',
+    timestamptz_lt: 'conserva',
+    timestamptz_lt_date: 'conserva',
+    timestamptz_lt_timestamp: 'conserva',
+    timestamptz_ne: 'conserva',
+    timestamptz_ne_date: 'conserva',
+    timestamptz_ne_timestamp: 'conserva',
+  };
+
+  /**
+   * Un tipo temporal que NO es un instante, escrito como palabra. `date`, `time`, `timestamp`
+   * a secas e `interval`; `timestamptz` y `timetz` no casan porque la frontera de palabra
+   * cae dentro, y `timestamp with time zone` lo saca la mirada hacia adelante — que también
+   * tiene que descartar el `time` de «time zone», o `timestamp with time zone` se marcaría a
+   * sí mismo por su propia mitad.
+   *
+   * `interval` está aquí por lo medido arriba: sumarle un intervalo a un instante da
+   * instantes DISTINTOS según el huso en cuanto el intervalo lleva días.
+   */
+  const TEMPORAL_QUE_MUEVE = /\b(?:date|time|timestamp|interval)\b(?!\s*(?:with\s+time\s+)?zone)/i;
+
+  /**
+   * Los que pueden mover un instante, POR SU NOMBRE, para buscarlos en un cuerpo — menos los
+   * que ya son una palabra de tipo. `date`, `time` y `timestamp` son a la vez el nombre de un
+   * cast y el de un tipo, y buscarlos como palabra suelta los saca de contexto: una firma tan
+   * correcta como `p_expira timestamp with time zone` obligaba a declarar la función entera.
+   * De esas se ocupa `TEMPORAL_QUE_MUEVE`, que sí mira lo que viene detrás — y el filtro es
+   * ella misma, no una lista aparte que se pudiera desincronizar. `timetz` y `timestamptz` no
+   * casan con ella (la frontera de palabra cae dentro), así que se quedan aquí.
+   */
+  const COLAPSAN = new Set(
+    Object.entries(ACEPTAN_INSTANTE)
+      .filter(([nombre, papel]) => papel === 'colapsa' && !TEMPORAL_QUE_MUEVE.test(nombre))
+      .map(([nombre]) => nombre),
+  );
+
+  /**
+   * Los relojes, para BUSCARLOS en un texto. Es la misma lista de siempre más `now()` y sus
+   * hermanos con huso: aquí no se trata de prohibirlos —son seguros— sino de encontrarlos
+   * para poder certificar dónde terminan.
+   */
+  const RELOJ_EN_EL_TEXTO =
+    /\b(?:now|current_timestamp|current_date|current_time|localtime|localtimestamp|clock_timestamp|statement_timestamp|transaction_timestamp|timeofday)\b/gi;
+
+  /**
+   * El reloj ENVUELTO en UTC, en las dos escrituras: la que `pg_get_functiondef` conserva
+   * verbatim de un cuerpo plpgsql (`now() at time zone 'UTC'`) y la que Postgres deparsea de
+   * un cuerpo SQL o un default (`timezone('UTC'::text, now())`). Envuelto así, el resultado
+   * es un `timestamp` sin huso que ya no tiene de dónde moverse: lo que venga después da
+   * igual, y por eso este certificado corta el análisis.
+   */
+  const ENVUELTO_ANTES = /\btimezone\s*\(\s*'utc'(?:\s*::\s*[a-z_"]+)?\s*,\s*$/i;
+  const ENVUELTO_DESPUES = /^\s*(?:\(\s*\)\s*)?at\s+time\s+zone\s+'utc'/i;
+
+  /**
+   * El veredicto, del revés: devuelve el certificado si lo hay, o `null` si no se puede
+   * certificar. Tres certificados y ninguno más — que sean pocos y cortos es la propiedad,
+   * no una limitación: cada uno que se añadiera sería una forma más de pasar en silencio.
+   */
+  const certificar = (
+    crudo: string,
+    tipoDestino: string | undefined,
+    nombresQueMueven: Set<string>,
+  ): string | null => {
+    const texto = sinComentarios(crudo, 'sql');
+    const relojes = [...texto.matchAll(RELOJ_EN_EL_TEXTO)];
+    // «SIN RELOJ»: no hay ningún instante que colocar.
+    if (relojes.length === 0) return 'sin reloj';
+    // «ENVUELTO EN UTC»: todos los relojes del objeto están fijados al huso del servidor.
+    if (
+      relojes.every(
+        (r) =>
+          ENVUELTO_ANTES.test(texto.slice(Math.max(0, r.index - 60), r.index)) ||
+          ENVUELTO_DESPUES.test(texto.slice(r.index + r[0].length, r.index + r[0].length + 40)),
+      )
+    )
+      return 'envuelto en UTC';
+    /*
+     * «SIN DÓNDE CAER»: en todo el objeto no hay un solo tipo temporal que no sea un instante,
+     * ni un nombre del catálogo que valga uno, ni un built-in que pueda producirlo. Es el
+     * certificado que cubre los 56 defaults `now()` sobre `timestamptz` y los guards que
+     * sellan una marca de tiempo — y el que deja de valer en cuanto alguien añade una columna
+     * `date` y la toca desde el mismo sitio.
+     *
+     * El destino se mira aparte porque NO está escrito en la expresión: el catálogo guarda
+     * `now()` a secas tanto en una columna `date` como en una `timestamptz`, y lo único que
+     * las separa es el tipo de la columna.
+     */
+    if (tipoDestino !== undefined && TEMPORAL_QUE_MUEVE.test(tipoDestino)) return null;
+    if (TEMPORAL_QUE_MUEVE.test(texto)) return null;
+    for (const palabra of texto.toLowerCase().match(/[a-z_][a-z0-9_$]*/g) ?? [])
+      if (nombresQueMueven.has(palabra) || COLAPSAN.has(palabra)) return null;
+    return 'sin dónde caer';
+  };
+
+  /**
+   * Los NOMBRES que pueden mover un instante, del CATÁLOGO: toda columna, todo retorno, todo
+   * parámetro y todo dominio cuyo tipo sea temporal y no sea un instante. Aquí es donde la
+   * certificación deja de depender de lo que este fichero sepa leer — la lista la escribe el
+   * esquema, y crece con él sin que nadie la toque.
+   *
+   * Vive fuera de las comprobaciones porque la usan DOS: la del catálogo y la del SQL de la
+   * aplicación. Duplicar la consulta sería dejar que las dos se desviaran.
+   */
+  const nombresQueMuevenDelCatalogo = async (): Promise<Set<string>> => {
+    const filas = await sqlAdmin()`
+      select distinct nombre from (
+        select a.attname::text as nombre, format_type(a.atttypid, a.atttypmod) as tipo
+          from pg_attribute a
+          join pg_class c on c.oid = a.attrelid
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and a.attnum > 0 and not a.attisdropped
+           and c.relkind in ('r', 'p', 'v', 'm', 'c')
+           -- Fuera las sondas de las OTRAS familias de este fichero, que viven en el mismo
+           -- esquema mientras corre la suite: censo_probe_escritura tiene una columna
+           -- «d date», y con «d» aquí dentro cualquier función con una variable llamada d
+           -- dejaba de certificarse. Es contaminación entre pruebas, no esquema — y el
+           -- filtro va por el nombre de la TABLA, que es lo que las identifica.
+           and c.relname not like 'censo_probe%' and c.relname not like 'censo_tmp%'
+           and c.relname not like 'CensoProbe%'
+        union all
+        select p.proname::text, format_type(p.prorettype, null)
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+         where n.nspname in ('public', 'pg_catalog') and p.prokind = 'f'
+        union all
+        select p.proname::text, format_type(t.oid, null)
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace,
+               unnest(coalesce(p.proallargtypes, p.proargtypes::oid[])) t(oid)
+         where n.nspname = 'public' and p.prokind in ('f', 'p')
+        union all
+        select t.typname::text, format_type(t.typbasetype, t.typtypmod)
+          from pg_type t join pg_namespace n on n.oid = t.typnamespace
+         where n.nspname = 'public' and t.typtype = 'd'
+      ) x
+      where (tipo like 'date%' or tipo like 'time%' or tipo like 'interval%')
+        and tipo not like 'timestamp with time zone%'
+        -- Fuera los nombres que son el de un TIPO built-in: date, time, timestamp e
+        -- interval existen también como funciones de cast, y meterlos aquí los volvía
+        -- palabras sueltas sin contexto — con lo que una firma perfectamente correcta como
+        -- «p_expira timestamp with time zone» obligaba a declarar la función entera. El
+        -- contexto de esas cuatro lo mira TEMPORAL_QUE_MUEVE, que sí sabe leer el «with
+        -- time zone» de al lado. Los dominios del esquema NO se van: los excluye el
+        -- pg_catalog del where, y un x::mi_dominio_fecha tiene que seguir contando.
+        -- (Sin comillas invertidas: esto vive en una template literal y las terminaría.)
+        and not exists (
+          select 1 from pg_type ty join pg_namespace tn on tn.oid = ty.typnamespace
+          where tn.nspname = 'pg_catalog' and ty.typname = x.nombre)
+        -- Y fuera las sondas de las OTRAS familias de este fichero, que viven en el mismo
+        -- esquema mientras corre la suite: censo_probe_escritura tiene una columna «d date»,
+        -- y con «d» en este conjunto cualquier función que use una variable llamada d
+        -- dejaba de certificarse. Es contaminación entre pruebas, no esquema.
+        and x.nombre not like 'censo_probe%' and x.nombre not like 'censo_tmp%'`;
+    return new Set(filas.map((r) => (r.nombre as string).toLowerCase()));
+  };
+
+  /**
+   * Lo que NO se certifica y aun así está bien, uno por uno y con el motivo escrito. Esta
+   * lista es el precio del cambio y también su prueba: mientras sea corta y cada línea diga
+   * algo medido, la inversión está haciendo su trabajo; el día que crezca sin que nadie lea
+   * lo que añade, habrá vuelto a ser una lista de excepciones.
+   *
+   * Los cuatro primeros son la MISMA forma: un guard que sella su marca de tiempo con
+   * `now()` o `clock_timestamp()` sobre una columna `timestamp with time zone` —comprobados
+   * los cuatro tipos en el catálogo— y que, en OTRA sentencia del mismo cuerpo, nombra una
+   * columna sin huso que no tiene nada que ver. El certificado «sin dónde caer» mira el
+   * objeto entero y por eso no los deja pasar; seguir el valor de una sentencia a otra es
+   * justo el análisis que este fichero deja de hacer, así que la respuesta va aquí escrita.
+   */
+  const CERTIFICADAS_A_MANO: Record<string, string> = {
+    'funcion acuerdo_disposicion_registro_guard':
+      'el reloj es «new.acordado_en := clock_timestamp()» y acuerdo_disposicion.acordado_en es ' +
+      'timestamp with time zone. El nombre sin huso que obliga es efectivo_desde, y aparece ' +
+      'veinte líneas más abajo dentro del jsonb del evento («efectivoDesde», new.efectivo_desde), ' +
+      'sin tocar el instante.',
+    'funcion derecho_uso_transicion_guard':
+      'el reloj es «new.decidido_en := now()» y derecho_uso.decidido_en es timestamp with time ' +
+      'zone. Obliga vence_en, que es date y se usa en dos sitios ajenos: una comparación con ' +
+      'old.vence_en y un to_char(new.vence_en, YYYY-MM-DD) para el evento. Ese to_char está ' +
+      'medido y no depende del huso: 2026-03-08 en Pacific/Kiritimati y en Etc/GMT+12 — es la ' +
+      'sobrecarga sobre date, que Postgres promueve a timestamp SIN huso.',
+    'funcion gate_aprobar_suficiencia_guard':
+      'el reloj es «new.aprobado_en := now()» y gate_instancia.aprobado_en es timestamp with ' +
+      'time zone. Obligan fecha, fecha_objetivo y linea_base_fecha, que se leen setenta líneas ' +
+      'más abajo para comprobar la suficiencia del gate y nunca se cruzan con el instante.',
+    'funcion outcome_review_completar_guard':
+      'el reloj es «new.completado_en := now()» y outcome_review.completado_en es timestamp ' +
+      'with time zone. Obligan ventana_inicio (date) y ventana_de_medicion_abierta (que la ' +
+      'recibe), en la comprobación de la ventana de medición, otra sentencia.',
+    'politica reserva_delete en reserva_ai':
+      'la comparación es «creado_en <= now() - reserva_ai_ventana()», los dos lados instantes. ' +
+      'Obliga que reserva_ai_ventana() devuelva interval, y un intervalo movería el instante ' +
+      'según el huso si llevara días — medido: t + interval 1 day da 11:00Z en America/New_York ' +
+      'y 12:00Z en UTC. Éste no los lleva: la función es «select interval 100 seconds», y la ' +
+      'resta da el mismo instante (05:58:20Z) en Pacific/Kiritimati, Etc/GMT+12, ' +
+      'America/New_York y UTC. Si algún día la ventana pasa a contarse en días, esta línea ' +
+      'deja de valer y hay que volver a medirla.',
+  };
+
+  /**
+   * Y las sondas de esta misma comprobación que TIENEN que salir sin certificar. Van aparte
+   * de las de arriba porque no son una excusa sino lo contrario: si alguna desapareciera de
+   * la lista, sería que el certificado se ha vuelto demasiado generoso y todo lo demás dejó
+   * de significar nada.
+   */
+  const SONDAS_SIN_CERTIFICAR = ['funcion censo_cert_opaca', 'funcion censo_cert_por_nombre'];
+
   /**
    * Una forma peligrosa por CADA patrón, y una segura por cada trampa que los patrones tienen
    * que esquivar. Se fabrican como funciones y se exige que el censo señale exactamente las
@@ -5942,6 +6311,188 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     }
   }, PACIENCIA);
 
+  it('toda expresión guardada que mezcle un reloj con algo sin huso está CERTIFICADA', async () => {
+    const admin = sqlAdmin();
+    /*
+     * Las sondas van ANTES de leer el catálogo y salen por el MISMO recorrido, como todas las
+     * de este fichero: una consulta aparte no protegería la del censo.
+     *
+     * La primera es la que da sentido a todo el cambio: entrega el instante por un camino que
+     * NINGÚN patrón de este fichero lee —un bucle `for` que deja el reloj en un registro, y la
+     * asignación a la variable `date` en la sentencia siguiente, con el registro de por
+     * medio—. El reconocedor de arriba la da por limpia, comprobado; la certificación no,
+     * porque no tiene con qué certificarla.
+     */
+    await admin.unsafe(`create function censo_cert_opaca() returns void language plpgsql as $c$
+      declare v_d date; r record;
+      begin for r in select now() as t loop v_d := r.t; end loop; end $c$`);
+    /*
+     * Y sus dos parejas seguras, que son las que impiden que la certificación se vuelva un
+     * «todo lo que mencione un reloj enrojece»: una envuelta en UTC y otra que sella una marca
+     * de tiempo sin tocar nada sin huso. Si el certificado se rompiera, saldrían aquí.
+     */
+    await admin.unsafe(`create function censo_cert_envuelta() returns date language plpgsql as $c$
+      declare v_d date;
+      begin v_d := timezone('UTC', now())::date; return v_d; end $c$`);
+    await admin`create table censo_cert_sello (id int, sellado_en timestamptz)`;
+    await admin.unsafe(`create function censo_cert_instante() returns void language plpgsql as $c$
+      begin update censo_cert_sello set sellado_en = now() where id = 1; end $c$`);
+    /*
+     * Y la sonda que prueba de dónde sale la obligación: DOS funciones con la MISMA forma,
+     * distinguidas solo por el tipo de la columna que tocan. Ninguna palabra del texto las
+     * separa —las dos dicen `now()` y las dos nombran una columna—, así que si la que toca la
+     * columna `date` sale sin certificar y la que toca la `timestamptz` no, es porque el
+     * conjunto de nombres viene del CATÁLOGO y no de este fichero. Es la misma prueba que la
+     * pareja de defaults tipados de la otra familia, y por la misma razón: una sonda de texto
+     * no puede sostener una regla que no lee el texto.
+     */
+    await admin`create table censo_cert_agenda (censo_cert_dia date, censo_cert_hito timestamptz)`;
+    await admin.unsafe(`create function censo_cert_por_nombre() returns void language plpgsql as $c$
+      begin insert into censo_cert_agenda (censo_cert_dia) select censo_cert_dia
+            from censo_cert_agenda where censo_cert_hito < now(); end $c$`);
+    await admin.unsafe(`create function censo_cert_por_nombre_ok() returns void language plpgsql as $c$
+      begin insert into censo_cert_agenda (censo_cert_hito) select censo_cert_hito
+            from censo_cert_agenda where censo_cert_hito < now(); end $c$`);
+    try {
+      /*
+       * 1. La clasificación de los built-ins, contra el catálogo. Es la inversión aplicada a
+       *    la propia lista: no se comprueba que la lista sea correcta —eso lo dicen las
+       *    medidas de su docblock— sino que sea COMPLETA, o sea que ningún built-in que acepte
+       *    un instante se haya quedado sin mirar.
+       *
+       *    Se exige la inclusión y no la igualdad, y por una razón medida: CI corre Postgres
+       *    15 y este contenedor el 16, y `date_add`/`date_subtract` solo existen desde el 16.
+       *    Con igualdad, el censo enrojecería en CI por la versión del motor en vez de por lo
+       *    que vigila. Al revés —un built-in nuevo sin clasificar— sí enrojece, que es la
+       *    dirección que importa. LÍMITE DECLARADO: una entrada que sobre no se nota.
+       */
+      const aceptan = await admin`
+        select distinct p.proname as nombre
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace,
+             unnest(p.proargtypes::oid[]) a(oid)
+        where n.nspname = 'pg_catalog'
+          and format_type(a.oid, null) = 'timestamp with time zone'`;
+      expect(aceptan.length).toBeGreaterThan(40);
+      expect(
+        aceptan.map((r) => r.nombre as string).filter((n) => !(n in ACEPTAN_INSTANTE)),
+      ).toEqual([]);
+
+      /*
+       * 2. Los NOMBRES que pueden mover un instante, del catálogo: toda columna, todo retorno,
+       *    todo parámetro y todo dominio cuyo tipo sea temporal y no sea un instante. Aquí es
+       *    donde esta comprobación deja de depender de lo que este fichero sepa leer: la lista
+       *    la escribe el esquema.
+       *
+       *    Sin agregados (`prokind = 'a'`): `max` y `sum` tienen una entrada que devuelve
+       *    `interval` y sus nombres son demasiado comunes, así que obligaban a declarar tres
+       *    guards que no tocan ningún intervalo. El tipo de un agregado lo pone su ENTRADA, y
+       *    esa entrada es una columna — que ya está en este conjunto si es de las que mueven.
+       */
+      const NOMBRES_QUE_MUEVEN = await nombresQueMuevenDelCatalogo();
+      // Tiene que estar mirando algo, y en concreto la columna que fabrica la sonda: si esta
+      // consulta dejara de devolverla, la pareja de arriba se certificaría y el censo daría
+      // verde por no saber que existe una columna `date`.
+      expect(NOMBRES_QUE_MUEVEN.size).toBeGreaterThan(20);
+      expect(NOMBRES_QUE_MUEVEN.has('censo_cert_dia')).toBe(true);
+      expect(NOMBRES_QUE_MUEVEN.has('censo_cert_hito')).toBe(false);
+
+      /*
+       * 3. Las expresiones guardadas, los ocho sitios en una sola consulta y con su tipo de
+       *    DESTINO donde lo hay. Los ocho son los mismos que censa la familia de arriba, y
+       *    van juntos a propósito: la certificación no es una comprobación más al lado de las
+       *    otras sino la que decide, así que tiene que cubrir exactamente lo mismo.
+       */
+      const guardadas = await admin`
+        select 'funcion' as sitio, p.proname::text as objeto,
+               pg_get_functiondef(p.oid) as cuerpo, format_type(p.prorettype, null) as tipo
+          from pg_proc p
+          join pg_namespace n on n.oid = p.pronamespace
+          join pg_language l on l.oid = p.prolang
+         where n.nspname = 'public' and l.lanname not in ('internal', 'c')
+           and p.prokind in ('f', 'p')
+        union all
+        select 'default', c.relname || '.' || a.attname,
+               pg_get_expr(d.adbin, d.adrelid), format_type(a.atttypid, a.atttypmod)
+          from pg_attrdef d
+          join pg_class c on c.oid = d.adrelid
+          join pg_namespace n on n.oid = c.relnamespace
+          join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+         where n.nspname = 'public'
+        union all
+        select 'dominio', t.typname, pg_get_expr(t.typdefaultbin, 0),
+               format_type(t.typbasetype, t.typtypmod)
+          from pg_type t join pg_namespace n on n.oid = t.typnamespace
+         where n.nspname = 'public' and t.typtype = 'd' and t.typdefaultbin is not null
+        union all
+        select 'check', conrelid::regclass || '/' || conname, pg_get_constraintdef(c.oid), null
+          from pg_constraint c join pg_namespace n on n.oid = c.connamespace
+         where n.nspname = 'public' and c.contype = 'c'
+        union all
+        select 'politica', pol.polname || ' en ' || c.relname,
+               coalesce(pg_get_expr(pol.polqual, pol.polrelid), '') || ' ' ||
+               coalesce(pg_get_expr(pol.polwithcheck, pol.polrelid), ''), null
+          from pg_policy pol
+          join pg_class c on c.oid = pol.polrelid
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public'
+        union all
+        select case when c.relkind = 'm' then 'matview' else 'vista' end, c.relname,
+               pg_get_viewdef(c.oid), null
+          from pg_class c join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and c.relkind in ('v', 'm')
+        union all
+        select 'trigger', t.tgname || ' on ' || t.tgrelid::regclass, pg_get_triggerdef(t.oid), null
+          from pg_trigger t
+          join pg_class c on c.oid = t.tgrelid
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and not t.tgisinternal
+        union all
+        select 'regla', c.relname || ' / ' || r.rulename, pg_get_ruledef(r.oid), null
+          from pg_rewrite r
+          join pg_class c on c.oid = r.ev_class
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and r.rulename <> '_RETURN'`;
+      // Que esté mirando el esquema entero y no un trozo: la familia de arriba cuenta cada
+      // categoría por separado y aquí van juntas, así que el listón es el del conjunto.
+      expect(guardadas.length).toBeGreaterThan(500);
+      /*
+       * Y la premisa que hace que la sonda opaca signifique algo, COMPROBADA y no supuesta: el
+       * reconocedor de arriba la da por LIMPIA. Es toda la diferencia entre las dos mitades en
+       * una línea — si algún día llegara a reconocerla, esta sonda dejaría de probar que la
+       * certificación ve lo que él no ve, y habría que buscar otra que sí.
+       */
+      const opaca = guardadas.find((g) => g.objeto === 'censo_cert_opaca')!;
+      expect(culpable(opaca.cuerpo as string, 'sql', opaca.tipo as string)).toBe(false);
+
+      /*
+       * 4. El veredicto. Lo que no se certifica tiene que estar DECLARADO A MANO, y la
+       *    igualdad va en los dos sentidos: un objeto nuevo sin declarar enrojece, y una
+       *    declaración que sobra —porque el objeto se arregló o desapareció— también. Una
+       *    lista de excepciones que no caduca deja de ser una lista de excepciones.
+       */
+      const sinCertificar = guardadas
+        .filter(
+          (g) =>
+            certificar(g.cuerpo as string, (g.tipo as string | null) ?? undefined, NOMBRES_QUE_MUEVEN) ===
+            null,
+        )
+        .map((g) => `${g.sitio as string} ${g.objeto as string}`)
+        .sort();
+      expect(sinCertificar).toEqual(
+        [...Object.keys(CERTIFICADAS_A_MANO), ...SONDAS_SIN_CERTIFICAR].sort(),
+      );
+    } finally {
+      await admin`drop function censo_cert_opaca()`;
+      await admin`drop function censo_cert_envuelta()`;
+      await admin`drop function censo_cert_instante()`;
+      await admin`drop function censo_cert_por_nombre()`;
+      await admin`drop function censo_cert_por_nombre_ok()`;
+      await admin`drop table censo_cert_sello`;
+      await admin`drop table censo_cert_agenda`;
+    }
+  }, PACIENCIA);
+
   it('ni el SQL de la aplicación, que es por donde volvió', async () => {
     /*
      * El censo del catálogo no alcanzaba al SQL que la aplicación escribe en sus plantillas,
@@ -5981,6 +6532,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // Y que alcance de verdad la raíz: `serve.ts` es el fichero que se le escapaba.
     expect(ficheros.map((f) => f.slice(raiz.length + 1))).toContain('serve.ts');
 
+    /*
+     * LÍMITE DECLARADO, y medido antes de declararlo: aquí NO corre la certificación, solo el
+     * reconocedor. Lo intenté y el resultado fue una lista de once ficheros que no tenían
+     * nada — `Date.now()` de JavaScript casa con la palabra `now`, y devuelve milisegundos
+     * desde la época, que es lo más independiente del huso que hay. El vocabulario de la
+     * certificación es el de SQL: «tipo temporal sin huso», «columna del catálogo»,
+     * «built-in que colapsa». Trasplantarlo a TypeScript pediría un segundo modelo, el de
+     * JavaScript —`Date.now()` seguro, `toLocaleDateString()` no, `toISOString().slice(0,10)`
+     * tampoco—, y eso es otro trabajo, no una línea más de éste. Poner una lista de once
+     * excepciones para que el rojo se callara habría sido exactamente el vicio que este
+     * cambio viene a quitar.
+     *
+     * Lo que sostiene esta mitad mientras tanto: el recorrido lo hace el PARSER de TypeScript
+     * y no una expresión regular, así que visita todas las plantillas del repositorio sin
+     * adivinar dónde empieza ninguna. Y medido hoy, en todo el repositorio hay CUATRO
+     * menciones del reloj fuera de los tests, las cuatro dentro de comentarios que explican
+     * el arreglo: el SQL de la aplicación no lee ningún calendario.
+     */
     const culpables: string[] = [];
     for (const f of ficheros) {
       // Sin comentarios: un `current_date` que EXPLICA por qué ya no se usa no es un

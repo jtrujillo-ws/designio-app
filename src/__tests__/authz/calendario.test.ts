@@ -43,19 +43,42 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   ];
 
   /**
-   * Los CAMPOS que no dependen del huso, medidos contra dos husos extremos y siete instantes
-   * elegidos para cruzar frontera de día, mes, año, década, siglo y milenio. La lista va al
-   * revés que la primera versión —enumera lo SEGURO y marca todo lo demás— y ese giro importa
-   * más que su contenido: enumerando lo peligroso, un campo que no se me ocurriera quedaba sin
-   * marcar; enumerando lo seguro, queda marcado. El error cae del lado que avisa.
+   * Los campos y precisiones seguros NO se escriben: se MIDEN contra la base, comparando el
+   * mismo instante en varios husos. Dos veces me equivoqué escribiéndolos a mano:
    *
-   * Medir con UN solo instante daba `month`, `year` y `week` como independientes, porque ese
-   * instante no cruzaba esas fronteras. Es el mismo muestreo que ya me costó un carácter
-   * Unicode, así que aquí van siete instantes y dos husos.
+   *  · con UN instante, `month`, `year` y `week` salían independientes porque ese instante no
+   *    cruzaba esas fronteras;
+   *  · con dos husos de desfase ENTERO, `minute` salía independiente — y no lo es: en
+   *    `Asia/Kathmandu` (UTC+05:45) `extract(minute from …)` da 20 donde UTC da 35.
+   *
+   * Así que el suite hace el barrido él: ocho instantes que cruzan día, mes, año, década,
+   * siglo y milenio, y cinco husos, dos de ellos con desfase de 45 minutos. Un campo entra en
+   * la lista segura solo si da el mismo valor en TODOS. Si mañana aparece un huso más raro,
+   * basta añadirlo aquí y las listas se recalculan solas.
+   *
+   * Las dos listas NO coinciden, y la diferencia es instructiva: `minute` es seguro para
+   * `date_trunc` —truncar al minuto deja el mismo instante, porque todos los desfases son
+   * minutos enteros— y peligroso para `extract`, que lee la esfera del reloj de pared.
    */
-  const CAMPOS_SEGUROS = 'epoch|microseconds|milliseconds|second|minute';
-  /** Y las precisiones de `date_trunc`, por el mismo criterio y la misma medición. */
-  const UNIDADES_SEGURAS = 'microseconds|milliseconds|second|minute';
+  const HUSOS = ['UTC', 'Etc/GMT+12', 'Pacific/Kiritimati', 'Asia/Kathmandu', 'Australia/Eucla'];
+  const INSTANTES = [
+    '2026-09-04 06:35:00+00',
+    '2026-09-04 00:10:00+00',
+    '2026-09-30 23:30:00+00',
+    '2026-12-31 23:30:00+00',
+    '2029-12-31 23:30:00+00',
+    '2099-12-31 23:30:00+00',
+    '2000-12-31 23:30:00+00',
+    '2026-01-01 00:30:00+00',
+  ];
+  const CAMPOS = ['epoch', 'microseconds', 'milliseconds', 'second', 'minute', 'hour', 'day',
+    'dow', 'doy', 'week', 'month', 'quarter', 'year', 'isodow', 'isoyear', 'decade', 'century',
+    'millennium', 'timezone', 'timezone_hour', 'timezone_minute', 'julian'];
+  const UNIDADES = ['microseconds', 'milliseconds', 'second', 'minute', 'hour', 'day', 'week',
+    'month', 'quarter', 'year', 'decade', 'century', 'millennium'];
+
+  let CAMPOS_SEGUROS = '';
+  let UNIDADES_SEGURAS = '';
 
   /** Se rellena en el primer caso: los relojes que el CATÁLOGO declara, para no listarlos. */
   let RELOJES = '';
@@ -74,12 +97,65 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       select p.proname as nombre
       from pg_proc p join pg_namespace n on n.oid = p.pronamespace
       where n.nspname = 'pg_catalog' and p.pronargs = 0 and p.provolatile in ('s', 'v')
-        and format_type(p.prorettype, null) in ('timestamp with time zone',
-            'timestamp without time zone', 'date', 'time with time zone',
-            'time without time zone')
+        and (format_type(p.prorettype, null) in ('timestamp with time zone',
+              'timestamp without time zone', 'date', 'time with time zone',
+              'time without time zone')
+          -- timeofday() es un reloj que devuelve TEXTO, así que el filtro por tipo no lo
+          -- alcanza: timeofday()::timestamptz::date elige día igual. Va por nombre porque
+          -- filtrar por text arrastraría media biblioteca. (Sin comillas invertidas: esto
+          -- vive dentro de una template literal y las terminaría.)
+          or p.proname = 'timeofday')
       order by 1`;
     const funciones = filas.map((f) => `${f.nombre as string}\\s*\\(\\s*\\)`);
-    expect(funciones.length).toBeGreaterThanOrEqual(4);
+    expect(funciones.length).toBeGreaterThanOrEqual(5);
+
+    /* Y las dos listas seguras, MEDIDAS: un campo o una precisión entra solo si da el mismo
+     * valor para el mismo instante en los cinco husos. Se hace en una sola ida y vuelta. */
+    const medir = async (fn: 'date_part' | 'date_trunc', nombres: string[]) => {
+      /* Un huso por SENTENCIA, dentro de una transacción: `set_config(…, true)` dentro de una
+       * consulta no se aplica por fila —el orden de evaluación no está definido—, y mi primer
+       * intento midió mal por eso: `epoch` salía inestable. Así se fija el huso, se mide, y se
+       * pasa al siguiente. */
+      const porHuso: string[][] = [];
+      for (const huso of HUSOS) {
+        const valores = await sqlAdmin().begin(async (tx) => {
+          await tx`select set_config('TimeZone', ${huso}, true)`;
+          /* El valor se compara como NÚMERO ABSOLUTO, no como texto. `date_trunc` devuelve
+           * `timestamptz`, y su representación textual lleva el desfase del huso: mi primer
+           * intento comparaba `…::text` y daba `second` y `milliseconds` como inestables
+           * porque «06:35:00+00» y «12:20:00+05:45» son cadenas distintas… del mismo
+           * instante. Comparar la impresión en vez del valor es el mismo error que este censo
+           * existe para cazar, cometido al medirlo. */
+          const expr = fn === 'date_trunc' ? `extract(epoch from ${fn}(n, i))` : `${fn}(n, i)`;
+          const filas = await tx.unsafe(
+            `select n as nombre, i as t, ${expr}::text as v
+             from unnest($1::text[]) n, unnest($2::timestamptz[]) i`,
+            [nombres, INSTANTES],
+          );
+          return filas.map((f) => `${f.nombre as string}|${String(f.t)}|${f.v as string}`);
+        });
+        porHuso.push(valores);
+      }
+      // Estable = el mismo valor para el mismo (nombre, instante) en todos los husos.
+      const primero = new Map(porHuso[0]!.map((x) => [x.split('|').slice(0, 2).join('|'), x]));
+      const inestables = new Set<string>();
+      for (const valores of porHuso.slice(1)) {
+        for (const x of valores) {
+          const clave = x.split('|').slice(0, 2).join('|');
+          if (primero.get(clave) !== x) inestables.add(clave.split('|')[0]!);
+        }
+      }
+      return nombres.filter((n) => !inestables.has(n));
+    };
+    const campos = await medir('date_part', CAMPOS);
+    const unidades = await medir('date_trunc', UNIDADES);
+    // Que la medición esté midiendo: `epoch` es un instante absoluto y tiene que salir seguro,
+    // y `day` depende del huso por definición y no puede salir.
+    expect(campos).toContain('epoch');
+    expect(campos).not.toContain('day');
+    expect(unidades).not.toContain('day');
+    CAMPOS_SEGUROS = campos.join('|');
+    UNIDADES_SEGURAS = unidades.join('|');
     RELOJES = [...funciones, ...PALABRAS_DEL_RELOJ].join('|');
     // La frontera de palabra va a los DOS lados: sin la de la derecha,
     // `current_date_pactada` —un identificador que contiene la palabra— salía marcado, y un
@@ -97,13 +173,27 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         String.raw`date_trunc\s*\(\s*'(?!(?:${UNIDADES_SEGURAS})')[^']*'(::\w+)?\s*,\s*(${RELOJES})\s*\)`,
         'i',
       ),
-      // `now()::date` tal como se escribe…
-      new RegExp(String.raw`\b(${RELOJES})\s*::\s*(date|time)\b`, 'i'),
+      // `now()::date` tal como se escribe, admitiendo castos intermedios a timestamp:
+      // `timeofday()::timestamptz::date` es la forma que los necesita, porque ese reloj
+      // devuelve texto y Postgres no puede colapsar el salto como hace con `now()`.
+      new RegExp(
+        String.raw`\b(${RELOJES})\s*(?:::\s*timestamptz?\s*)*::\s*(date|time)\b`,
+        'i',
+      ),
       // …y tal como Postgres la devuelve: `(now())::date`, con paréntesis propios. Es la forma
       // canónica a la que reduce también `cast(now() as date)`. NO marca
       // `(timezone('UTC'::text, now()))::date`, porque ahí el paréntesis que precede al `::`
       // es el de `timezone`: el reloj va envuelto.
       new RegExp(String.raw`\(\s*(${RELOJES})\s*\)\s*::\s*(date|time)\b`, 'i'),
+      // Un reloj que pasa por un cast INTERMEDIO antes de llegar al día. Postgres colapsa
+      // `now()::timestamptz::date` a `(now())::date`, pero no puede colapsar el de un reloj
+      // que devuelve TEXTO: `timeofday()::timestamptz::date` se guarda como
+      // `((timeofday())::timestamp with time zone)::date`, y sin este patrón el salto
+      // intermedio lo dejaba fuera de todos los demás.
+      new RegExp(
+        String.raw`\(\s*\(\s*(${RELOJES})\s*\)\s*::\s*timestamp[^)]*\)\s*::\s*(date|time)\b`,
+        'i',
+      ),
       // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
       new RegExp(String.raw`cast\s*\(\s*(${RELOJES})\s+as\s+(date|time)\b`, 'i'),
       // `date(now())`, la tercera forma de escribir la misma conversión.
@@ -177,6 +267,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'integer',
       culpable: true,
     },
+    // El reloj que devuelve TEXTO, con su salto de cast intermedio.
+    censo_probe_tod: {
+      expr: 'timeofday()::timestamptz::date',
+      tipo: 'date',
+      culpable: true,
+    },
     // Y las seguras, que son la otra mitad del contrato: un censo que marcara el propio
     // arreglo acabaría desactivado, así que se exige explícitamente que NO las señale.
     censo_probe_ok_utc: {
@@ -245,9 +341,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'localtimestamp(3)',
       'extract(day from now())',
       'EXTRACT(day FROM now())',
+      // `minute` NO es seguro para `extract`: con un desfase de 45 minutos (`Asia/Kathmandu`)
+      // da 20 donde UTC da 35. Sí lo es para `date_trunc`, que conserva el instante — y esa
+      // asimetría es la razón de que las dos listas se midan por separado.
+      'extract(minute from now())',
+      "date_part('minute', now())",
       'extract(month from clock_timestamp())',
       "date_part('dow', now())",
       "date_part('dow'::text, now())",
+      'timeofday()::timestamptz::date',
+      '((timeofday())::timestamp with time zone)::date',
     ];
     const SEGURAS = [
       "timezone('UTC', now())::date",
@@ -266,7 +369,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // instantes que cruzan día, mes, año, década, siglo y milenio, y dos husos extremos).
       'extract(epoch from now())',
       "date_part('epoch', now())",
-      'extract(minute from now())',
       "extract(day from timezone('UTC', now()))",
       // Y las precisiones de `date_trunc` que solo quitan fracciones del instante.
       "date_trunc('milliseconds', now())",
@@ -294,6 +396,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         `create function ${nombre}() returns ${tipo} language sql stable return ${expr}`,
       );
     }
+    /* Y un PROCEDIMIENTO, que no se puede crear con la forma de arriba y que `prokind = 'f'`
+     * dejaba invisible: un procedimiento puede validar o escribir con el calendario de la
+     * sesión igual que una función. Va aparte porque su sintaxis lo es. */
+    await admin`create procedure censo_probe_procedimiento()
+      language plpgsql as $$ begin perform current_date; end $$`;
     try {
       // `pg_get_functiondef` y no `prosrc`, y `prokind = 'f'` porque aquél no acepta
       // agregados ni funciones de ventana.
@@ -303,7 +410,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         join pg_namespace n on n.oid = p.pronamespace
         join pg_language l on l.oid = p.prolang
         where n.nspname = 'public' and l.lanname not in ('internal', 'c')
-          and p.prokind = 'f'
+          -- Funciones Y PROCEDIMIENTOS: pg_get_functiondef reconstruye los dos, y lo que no
+          -- acepta son agregados (a) y funciones de ventana (w). Con prokind = f a secas, un
+          -- procedimiento que validara con el calendario de la sesión quedaba invisible.
+          -- (Sin comillas invertidas: esto vive en una template literal y las terminaría.)
+          and p.prokind in ('f', 'p')
         order by 1`;
       // El censo tiene que estar mirando algo: sin esto, un cambio en la consulta que
       // devolviera cero filas dejaría el test en verde para siempre sin comprobar nada.
@@ -318,15 +429,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Exactamente las peligrosas y ninguna más: si un patrón se rompe, su sonda desaparece
       // de aquí; si un patrón se pasa de ancho, aparece una segura.
       expect(culpables.sort()).toEqual(
-        Object.entries(SONDAS)
-          .filter(([, v]) => v.culpable)
-          .map(([n]) => n)
-          .sort(),
+        [
+          ...Object.entries(SONDAS)
+            .filter(([, v]) => v.culpable)
+            .map(([n]) => n),
+          'censo_probe_procedimiento',
+        ].sort(),
       );
     } finally {
       for (const nombre of Object.keys(SONDAS)) {
         await admin.unsafe(`drop function ${nombre}()`);
       }
+      await admin`drop procedure censo_probe_procedimiento()`;
     }
   });
 

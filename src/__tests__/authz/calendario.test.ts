@@ -465,7 +465,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * LÍMITE DECLARADO: ese mismo alias dentro de un paréntesis —`(select now()::text as
      * timestamptz)`— se leería como cast y se escaparía.
      */
-    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})|as\s+${ESQUEMA}(?:${TIPO_CON_HUSO})\s*\)))`;
+    /*
+     * Y la vuelta solo salva si es TERMINAL. `now()::text::timestamptz::date` recupera el
+     * instante y a continuación vuelve a elegir día con el huso de la sesión —medido:
+     * 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12—, y la excepción lo tapaba: el
+     * patrón descartaba la coincidencia en `::text` y el RELOJ no puede atravesar el paso por
+     * texto para llegar al destino final, así que la expresión entera se escapaba.
+     *
+     * Ahora la excepción lleva su propia condición: la vuelta con huso NO salva si detrás hay
+     * otro casto a un tipo sin huso.
+     *
+     * LÍMITE DECLARADO: una cadena más larga —volver a texto y de ahí a fecha— no la cubre.
+     */
+    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})|as\s+${ESQUEMA}(?:${TIPO_CON_HUSO})\s*\))(?!(?:\s*\))*\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO})))`;
     const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:${TIPO_TEXTUAL})${VUELTA_CON_HUSO}`;
 
     /*
@@ -1217,6 +1229,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "(now() + '1 day'::pg_catalog.interval)::date",
       "current_timestamp < '2026-09-05'::pg_catalog.date",
       'now()::pg_catalog.date',
+      // La ida y vuelta que NO termina ahí: recupera el instante y vuelve a elegir día.
+      // En su forma fuente y en la que devuelve el catálogo.
+      'now()::text::timestamptz::date',
+      '(((now())::text)::timestamp with time zone)::date',
       "to_char(now(), E'YYYY'::text)",
       // El formato de `to_char` que SÍ lee el calendario, y `SSSS` —segundos desde
       // medianoche— que sin la guardia de frontera se leería como dos `SS` seguros.

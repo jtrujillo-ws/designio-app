@@ -916,7 +916,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * una coma ni un cierre.)
        */
       new RegExp(
-        String.raw`${nombreDeFuncion(SERIALIZAN)}\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\)|\()*?(?<!${HUSO_YA_FIJADO})(${RELOJ})\s*(?=[,)])`,
+        String.raw`${nombreDeFuncion(SERIALIZAN)}\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\)|\()*?(?<!${HUSO_YA_FIJADO})(${RELOJ})\s*(?=[,)\]])`,
         'i',
       ),
       /*
@@ -1410,7 +1410,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           fin,
           texto:
             crudo.slice(0, 1) +
-            sinComentarios(dentro, 'sql', vaciarLiterales) +
+            sinComentarios(dentro, 'sql', vaciarLiterales, false) +
             crudo.slice(crudo.length - cierra),
         });
         return;
@@ -1453,6 +1453,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     texto: string,
     dialecto: 'sql' | 'ts' = 'sql',
     vaciarLiterales = false,
+    /*
+     * Si el texto es un CUERPO del catálogo —lo que devuelve `pg_get_functiondef`— o un trozo
+     * de plantilla de TypeScript. Lo único que cambia es qué significa el primer `$tag$`, y
+     * cambia del todo: en un cuerpo es el delimitador que lo envuelve y lo de dentro es CÓDIGO;
+     * en una plantilla no hay nada que envolver, así que el primer par es un LITERAL y lo de
+     * dentro es dato.
+     *
+     * Lo rompí yo al borrar el reconocedor a mano: la distinción vivía en la pila —el `$` solo
+     * se leía como cuerpo en el marco raíz— y se fue con ella sin que ninguna sonda lo notara.
+     * Ahora va en un parámetro, que es donde se ve y donde se puede leer sin reconstruir una
+     * máquina de estados en la cabeza.
+     */
+    cuerpoDelCatalogo = true,
   ): string => {
     if (dialecto === 'ts') return barridoTs(texto, vaciarLiterales);
     let salida = '';
@@ -1633,7 +1646,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         const m = DOLAR.exec(texto.slice(i));
         if (m) {
           const etiqueta = m[0];
-          if (cuerpoPorDolar === null) {
+          if (cuerpoDelCatalogo && cuerpoPorDolar === null) {
             cuerpoPorDolar = etiqueta;
             salida += etiqueta;
             i += etiqueta.length;
@@ -1646,6 +1659,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
             continue;
           }
           const cierra = texto.indexOf(etiqueta, i + etiqueta.length);
+          /*
+           * Y en una plantilla solo cuenta el par BALANCEADO. Un `$x$` sin cierre no es un
+           * literal: es SQL a medio escribir —o una plantilla que se corta en una
+           * interpolación—, y tragarse el resto sería dejar de mirar por un fallo de sintaxis
+           * ajeno, que es la forma en que este barrido ha fallado siempre. Se copia la etiqueta
+           * y se sigue leyendo lo de detrás como código.
+           *
+           * En un cuerpo del catálogo no hace falta la salvedad: ahí el primer par SÍ envuelve,
+           * y lo que no cierra ya lo cubre la rama de arriba.
+           */
+          if (!cuerpoDelCatalogo && cierra === -1) {
+            salida += etiqueta;
+            i += etiqueta.length;
+            continue;
+          }
           const hasta = cierra === -1 ? texto.length : cierra + etiqueta.length;
           salida += vaciarLiterales ? `${etiqueta}${etiqueta}` : texto.slice(i, hasta);
           i = hasta;
@@ -2076,6 +2104,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "date_trunc('day', now()::text::timestamptz)",
       "to_char(now()::text::timestamptz, 'YYYY-MM-DD')",
       'concat(now()::text::timestamptz)',
+      // Y el reloj dentro de un CONSTRUCTOR de array: `to_json` serializa recursivamente, así
+      // que el instante sale con el desfase de quien llama (medido:
+      // `["2026-09-05T…+14:00"]` contra `["2026-09-04T…-12:00"]`).
+      'to_json(array[now()])',
+      'to_jsonb(array[now()])',
       // El huso DINÁMICO en las dos sintaxis: vuelve a decidir quien llama.
       "timezone(current_setting('TimeZone'), now())::date",
       "(now() at time zone current_setting('TimeZone'))::date",
@@ -2278,6 +2311,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Y la sustitución no INVENTA culpa: el mismo `format` con un argumento que no lee el
       // calendario sigue limpio.
       "execute format('select %s', '1')",
+      // Y serializar un array de algo que YA es fecha no elige calendario: un `date` no tiene
+      // huso del que moverse (medido: `["2026-09-04"]` en los dos husos). Es la mitad que
+      // acota el descenso por los corchetes.
+      'to_json(array[fecha_de_la_base()])',
       // `'now'` con huso es el instante y no elige nada: mismo epoch en husos opuestos
       // (1788538089, medido), igual que `now()` a secas.
       "'now'::timestamptz",
@@ -2670,6 +2707,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(
       culpable('const p = `< $${n}`; const q = sql`select $x$ now()::date`;', 'ts'),
     ).toBe(true);
+    /*
+     * Y el literal por DÓLAR dentro de una plantilla no es el cuerpo de nada: en
+     * `` sql`select $q$--$q$, now()::date` `` el `$q$…$q$` es un literal cuyo contenido es
+     * `--` —medido: la consulta devuelve el texto `--` y la fecha—, así que tomarlo por la
+     * apertura de un cuerpo dejaba ese `--` de código y se comía la operación de después.
+     *
+     * Esto lo rompí yo al quitar el reconocedor a mano: la guarda que lo distinguía vivía en
+     * la pila que se fue con él, y ninguna sonda cubría el caso. La distinción va ahora en un
+     * parámetro, que es donde se ve.
+     */
+    expect(culpable('const q = sql`select $q$--$q$, now()::date`;', 'ts')).toBe(true);
     // Y la interpolación se sigue reconociendo detrás de un dólar literal: si no, el
     // comentario de dentro volvería a anidar como SQL.
     expect(

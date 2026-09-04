@@ -458,6 +458,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     const OPERANDO_SIN_HUSO = String.raw`(?:${TIPO_SIN_HUSO}\s*'[^']*'|(?:'[^']*'|[\w."]+)\s*::\s*${TIPO_SIN_HUSO})`;
     const COMPARADOR = String.raw`(?:<=|>=|<>|!=|<|>|=)`;
 
+    /*
+     * La UNIDAD de `date_trunc`/`date_part` no siempre es un literal pegado al paréntesis:
+     * `date_trunc(CAST('day' AS text), now())` elige día igual —medido: 2026-09-05 00:00+14 y
+     * 2026-09-04 00:00-12— y `date_trunc(v_unidad, now())` ni siquiera se puede leer.
+     *
+     * Así que la pregunta se INVIERTE, que es lo que cierra la clase en vez del caso: en lugar
+     * de reconocer las unidades peligrosas —lista infinita— se exige que la unidad sea una de
+     * las SEGURAS, medidas contra todos los husos, escrita de alguna de sus tres formas. Todo
+     * lo demás se marca, incluida una unidad que no sea literal.
+     *
+     * LÍMITE DECLARADO: una unidad con una coma dentro del literal partiría el argumento. No
+     * existe ninguna unidad válida así.
+     */
+    const unidadSegura = (lista: string) =>
+      String.raw`(?:'(?:${lista})'(?:\s*::\s*[\w ]+)?|cast\s*\(\s*'(?:${lista})'\s+as\s+[\w ]+\s*\))`;
+    const PRIMER_ARGUMENTO = String.raw`(?:[^,()]|\([^()]*\))*`;
     RELOJ_COLAPSADO_A_DIA = [
       // El cast al tipo sin huso, en sus cuatro formas de una sola vez: `now()::date` tal como
       // se escribe, `(now())::date` tal como Postgres la devuelve —y a la que reduce también
@@ -478,12 +494,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // huso, y una regla escrita sobre esa cadena decide igual. El reloj tiene que ser el
       // PRIMER argumento — envuelto en `timezone('UTC', …)` ya no lo es.
       new RegExp(String.raw`to_char\s*\(\s*(${RELOJ})\s*,`, 'i'),
-      // `extract(day from now())` y `EXTRACT(day FROM now())`: no colapsa a un día entero,
-      // extrae UN campo del calendario, y el campo cambia con el huso igual.
-      new RegExp(
-        String.raw`extract\s*\(\s*(?!(?:${CAMPOS_SEGUROS})\b)\w+\s+from\s+(${RELOJ})`,
-        'i',
-      ),
       /*
        * Y la COMPARACIÓN MIXTA, que es la puerta que abrió declarar seguro el reloj desnudo.
        * `current_timestamp` es un instante absoluto, sí — pero comparado contra un valor SIN
@@ -529,17 +539,27 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * para todo lo demás sin romper `date_trunc('milliseconds', now())`.
      */
     RELOJ_LEYENDO_LITERAL = [
+      /*
+       * `extract` entra aquí desde que el campo puede ser un LITERAL —`extract('dow' from
+       * now())` es SQL válido, comprobado contra la base—: si el literal viene vaciado, el
+       * nombre del campo desaparece y hasta `extract('epoch' …)` —seguro— saldría marcado.
+       * Lo cazó su propia sonda segura, que para eso está.
+       */
+      new RegExp(
+        String.raw`extract\s*\(\s*(?!(?:(?:${CAMPOS_SEGUROS})\b|'(?:${CAMPOS_SEGUROS})')\s*from)(?:'[^']*'|\w+)\s+from\s+(${RELOJ})`,
+        'i',
+      ),
       // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
       // que lleva cast: `date_trunc('day', timeofday()::timestamptz)`, obligada porque ese
       // reloj devuelve texto. Marca CUALQUIER unidad que no esté en la lista medida.
       new RegExp(
-        String.raw`date_trunc\s*\(\s*'(?!(?:${UNIDADES_SEGURAS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})\s*\)`,
+        String.raw`date_trunc\s*\(\s*(?!${unidadSegura(UNIDADES_SEGURAS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*\)`,
         'i',
       ),
       // `date_part('dow', now())`, que es la misma operación con la otra sintaxis, y su forma
       // deparseada `date_part('dow'::text, now())`.
       new RegExp(
-        String.raw`date_part\s*\(\s*'(?!(?:${CAMPOS_SEGUROS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})`,
+        String.raw`date_part\s*\(\s*(?!${unidadSegura(CAMPOS_SEGUROS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})`,
         'i',
       ),
     ];
@@ -716,9 +736,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // duplicándolo; en TypeScript, con barra invertida.
       if (c === "'" || (modo === 'ts' && c === '"')) {
         const desde = i;
+        /*
+         * La cadena con prefijo `E` de SQL escapa con BARRA y no duplicando la comilla, y
+         * `pg_get_functiondef` la conserva tal cual. Sin esto, `E'a\\'--b'` terminaba el
+         * literal en la barra y el `--` —que todavía es DATO— abría un comentario que se
+         * llevaba por delante la operación de después: el censo en verde sin haber mirado.
+         *
+         * Es el mismo arreglo que acaba de entrar en el censo de proyecciones, allí en la
+         * dirección contraria. Las demás formas con prefijo —`U&'…'`, `B'…'`, `X'…'`— escapan
+         * duplicando como la normal.
+         */
+        const prefijoE =
+          modo === 'sql' &&
+          c === "'" &&
+          (texto[i - 1] === 'E' || texto[i - 1] === 'e') &&
+          !/[A-Za-z0-9_]/.test(texto[i - 2] ?? ' ');
         i++;
         while (i < texto.length) {
-          if (modo === 'ts' && texto[i] === '\\') i += 2;
+          if ((modo === 'ts' || prefijoE) && texto[i] === '\\') i += 2;
           else if (texto[i] === c && modo === 'sql' && texto[i + 1] === c) i += 2;
           else if (texto[i] === c) {
             i++;
@@ -1089,6 +1124,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // El nombre del reloj ENTRE COMILLAS: `pg_catalog."now"()` es la misma función y el día
       // cambia igual (medido: 2026-09-05 en Kiritimati y 2026-09-03 en Etc/GMT+12).
       'pg_catalog."now"()::date',
+      // La unidad puede llegar CASTEADA con la sintaxis larga, o no ser un literal siquiera.
+      "date_trunc(CAST('day' AS text), now())",
+      'date_trunc(v_unidad, now())',
+      "date_part(CAST('dow' AS text), now())",
+      'date_part(v_campo, now())',
+      // Y el campo de `extract` también admite literal: `extract('dow' from now())` es SQL
+      // válido —comprobado contra la base— y la palabra desnuda no lo casaba.
+      "extract('dow' from now())",
       'statement_timestamp()::date',
       '(statement_timestamp())::date',
       'transaction_timestamp()::date',
@@ -1246,6 +1289,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "(vence_en + interval '1 day')::date",
       // Y serializar algo que ya es fecha tampoco: un `date` no tiene huso del que moverse.
       'fecha_de_la_base()::text',
+      // …y la unidad segura sigue siéndolo escrita con la sintaxis larga.
+      "date_trunc(CAST('milliseconds' AS text), now())",
+      "date_part(CAST('epoch' AS text), now())",
+      "extract('epoch' from now())",
       // …y `timetz` como destino conserva el instante igual.
       'now()::time with time zone',
       'now()::timetz',
@@ -1397,6 +1444,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // Pero vaciar el literal NO puede romper a los dos patrones que lo LEEN.
     expect(culpable("date_trunc('milliseconds', now())")).toBe(false);
     expect(culpable("date_trunc('day', now())")).toBe(true);
+    /*
+     * Y la cadena con prefijo E dentro de un cuerpo plpgsql: la comilla escapada con BARRA no
+     * termina el literal, así que el `--` de dentro sigue siendo dato y no se come la
+     * operación de después.
+     */
+    expect(
+      culpable(
+        "create function f() returns void language plpgsql as $function$ begin perform E'a\\'--b'; perform now()::date; end $function$",
+        'sql',
+      ),
+    ).toBe(true);
     /*
      * El dólar dentro de una PLANTILLA no es un entrecomillado por dólar. `` `< $${n}` `` es
      * TypeScript real —está en `ai.degradacion.ts`—, y tomarlo por apertura de cuerpo dejaba

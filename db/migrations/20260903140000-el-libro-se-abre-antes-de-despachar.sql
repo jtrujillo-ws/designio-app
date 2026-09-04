@@ -143,8 +143,21 @@ begin
   -- `clock_timestamp()` y no `now()`: dos intentos de una misma generación se cierran en la
   -- misma transacción, y `now()` les daría el mismo instante — justo el empate que el puesto
   -- del intento tuvo que venir a deshacer.
-  if tg_op = 'UPDATE' and old.resultado = 'despachada' and new.resultado <> 'despachada' then
-    new.cerrado_en := clock_timestamp();
+  --
+  -- Y también en el INSERT que nace ya con desenlace. El grant de insert incluye `resultado`,
+  -- así que una escritura cruda puede anotar una llamada completa en una sola sentencia —es
+  -- legítimo: no reescribe nada, registra un hecho consumado— y sin este sello quedaría con
+  -- un desenlace y sin hora de observación, que es una fila que afirma dos cosas
+  -- incompatibles. `cerrado_en` significa lo mismo por las dos vías o no significa nada.
+  --
+  -- Se sella solo si viene VACÍO, y esa distinción importa: la aplicación no puede ponerlo
+  -- —`cerrado_en` está fuera de los dos grants—, así que un valor explícito solo puede venir
+  -- de una escritura administrativa: una restauración, una migración de datos, un seed. Ésas
+  -- sí saben cuándo se observó de verdad el desenlace, y pisárselo con la hora de la
+  -- restauración convertiría el reloj de la observación en el reloj de la copia.
+  if (tg_op = 'UPDATE' and old.resultado = 'despachada' and new.resultado <> 'despachada')
+     or (tg_op = 'INSERT' and new.resultado <> 'despachada') then
+    new.cerrado_en := coalesce(new.cerrado_en, clock_timestamp());
   end if;
 
   -- Y el evento sigue siendo cosa de miembros, como en el resto de guards: una escritura

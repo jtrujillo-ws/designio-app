@@ -1892,6 +1892,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const despues = await conUsuario(leadId, (tx) => tx`select count(*)::int as n
         from evento_dominio where workspace_id = ${ws} and tipo = 'LlamadaAISinPropuesta'`);
       expect((despues[0]!.n as number)).toBe((antes[0]!.n as number) + 1);
+
+      // Y nace SELLADA: una fila con desenlace y sin hora de observación afirmaría dos cosas
+      // incompatibles, y la señal de salud la ordenaría por el reloj equivocado.
+      const [sellada] = await admin`select cerrado_en from llamada_ai
+        where id = ${cruda!.id as string}`;
+      expect(sellada!.cerrado_en).not.toBeNull();
     } finally {
       await admin`delete from llamada_ai where id = ${cruda!.id as string}`;
     }
@@ -2135,12 +2141,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
       // Una llamada que no dio contenido utilizable DICE por qué: lo exige el CHECK de
       // `llamada_ai`, así que el fixture lo respeta en vez de esquivarlo.
+      // `cerrado_en` va explícito además de `creado_en`: es el reloj que ordena la salud, y el
+      // guard solo lo estampa cuando viene vacío — precisamente para que una escritura
+      // administrativa como ésta pueda fechar la observación donde de verdad ocurrió.
       const anotar = (resultado: string, haceSegundos: number) => admin`insert into llamada_ai
         (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo, creado_por,
-         creado_en)
+         creado_en, cerrado_en)
         values (${wsS}, 'C0', ${retoS_id}, ${MODELO_RELLENO}, 'entorno', ${resultado},
                 ${resultado === 'salida-valida' ? '' : 'anotado por la prueba de salud'},
-                ${leadId}, now() - make_interval(secs => ${haceSegundos}))`;
+                ${leadId}, now() - make_interval(secs => ${haceSegundos}),
+                now() - make_interval(secs => ${haceSegundos}))`;
       const salud = () =>
         conProveedor(RESPUESTA_CI, async () => {
           const panel = await panelPropuestas(leadId, wsS);

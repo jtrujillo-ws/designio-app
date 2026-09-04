@@ -1038,7 +1038,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           hondura > 0 &&
           !(pila.length > 1 && modo === 'sql' && texto[i] === '`')
         ) {
-          if (texto[i] === '\\') {
+          // La barra escapa DENTRO de una plantilla y solo ahí: el texto está en un literal de
+          // TypeScript y sus escapes son suyos. En un cuerpo del catálogo no escapa nada —SQL
+          // no lo trata como escape—, y saltarlo se comía el `*` de un `\\*/` y con él el
+          // cierre del comentario: el recorrido seguía tragando SQL de verdad. Un arreglo que
+          // abre un hueco al lado es el modo de fallo de este fichero, y este lo abrí yo.
+          if (pila.length > 1 && texto[i] === '\\') {
             i += 2;
             continue;
           }
@@ -1920,6 +1925,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * literal que se llevaba por delante la operación de la línea siguiente.
      */
     expect(culpable("const q = sql`select 1 -- \\` '\nnow()::date`;", 'ts')).toBe(true);
+    /*
+     * Y la otra cara de ese mismo escape: en un cuerpo del CATÁLOGO la barra no escapa nada
+     * —SQL no la trata como escape—, así que `\*` no protege al `/` que le sigue y el
+     * comentario SÍ cierra ahí. Saltando el par, el recorrido se comía el cierre y seguía
+     * tragando SQL de verdad. Es el hueco que abrió el arreglo de arriba antes de acotarlo.
+     */
+    expect(culpable('/* nota \\*/ select now()::date', 'sql')).toBe(true);
+    /*
+     * Y dentro de una plantilla sí escapa, también en un comentario de BLOQUE: parando en ese
+     * backtick, el recorrido salía de la plantilla a mitad y lo que aún era comentario pasaba
+     * a leerse como TypeScript, donde el cierre del comentario ya no significa nada y lo de
+     * detrás desaparece.
+     */
+    expect(culpable("const q = sql`select 1 /* \\` */ , now()::date`;", 'ts')).toBe(true);
     // Un `--` DENTRO de un literal no abre comentario.
     expect(culpable("select '--', now()::date", 'sql')).toBe(true);
     // Ni un `//` dentro de una cadena de TypeScript.

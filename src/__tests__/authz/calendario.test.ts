@@ -1330,6 +1330,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         String.raw`(?:(?::=|=|\bdefault\b)\s*(?<inicial>[^;]*)|[;:,)])`,
       'gi',
     );
+    /** Un nombre listo para meterse en una expresión regular sin significar otra cosa. */
+    const escapado = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     /** El nombre como lo escribe quien lo declara, sin las comillas ni su duplicación. */
     const sinComillas = (n: string): string =>
       n.startsWith('"') ? n.slice(1, -1).replace(/""/g, '"') : n;
@@ -1365,7 +1367,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * La forma DESNUDA solo se genera cuando el nombre puede escribirse sin comillas. Con un
        * espacio dentro no se puede, y buscarla sería buscar algo que Postgres no acepta.
        */
-      const escapado = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const formasDelNombre = (n: string): string[] => {
         const citada = `"${escapado(n.replace(/"/g, '""'))}"`;
         return /^[A-Za-z_]\w*$/.test(n) ? [escapado(n), citada] : [citada];
@@ -1531,6 +1532,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'gi',
     );
     const RAMA_ACTUALIZA = /\bthen\s+update\s+set\s+([\s\S]*?)(?=\bwhen\b|$)/gi;
+    /** `declare r <tabla>%rowtype;` y `declare v <tabla>.<columna>%type;`. */
+    const FILA_DEL_CATALOGO = new RegExp(
+      String.raw`(?<![\w"])(${NOMBRE_SQL})\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s*%\s*rowtype\b`,
+      'gi',
+    );
+    const COLUMNA_DEL_CATALOGO = new RegExp(
+      String.raw`(?<![\w"])(${NOMBRE_SQL})\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s*\.\s*(${NOMBRE_SQL})\s*%\s*type\b`,
+      'gi',
+    );
     const RAMA_INSERTA = /\bthen\s+insert\s*(?:\(([^)]*)\)\s*)?values\s*\(([\s\S]*?)\)(?=\s*(?:\bwhen\b|$))/gi;
     const ACTUALIZA = new RegExp(
       // El destino puede llevar ALIAS —`update t as x set …`, con `as` o sin él—, y el tipo
@@ -1622,6 +1632,36 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       /** Una lista de valores emparejada por POSICIÓN con una lista de columnas. */
       const porPosicion = (tabla: string, destinos: string[], valores: string[]): boolean =>
         destinos.some((c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!));
+      /*
+       * Y las variables que toman su tipo del CATÁLOGO en vez de escribirlo. Son dos formas y
+       * las dos se miden 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   declare r t%rowtype;   begin r.d := now();   el campo `d` de la fila
+       *   declare v t.d%type;    begin v := now();     el tipo de esa columna
+       *
+       * Van aquí y no con las demás variables porque lo que decide está en el catálogo, que es
+       * lo que este reconocedor tiene a mano. En el texto no hay ningún tipo que leer: hay un
+       * nombre de tabla y un `%`.
+       */
+      for (const m of texto.matchAll(FILA_DEL_CATALOGO)) {
+        const tabla = nombreCanonico(m[2]!);
+        const variable = escapado(sinComillas(m[1]!.trim()));
+        for (const a of texto.matchAll(
+          new RegExp(String.raw`(?<![\w"])${variable}\s*\.\s*(${NOMBRE_SQL})\s*:=\s*([^;]*)`, 'gi'),
+        )) {
+          if (entrega(tabla, nombreCanonico(a[1]!), a[2]!)) return true;
+        }
+      }
+      for (const m of texto.matchAll(COLUMNA_DEL_CATALOGO)) {
+        const tabla = nombreCanonico(m[2]!);
+        const columna = nombreCanonico(m[3]!);
+        const variable = escapado(sinComillas(m[1]!.trim()));
+        for (const a of texto.matchAll(
+          new RegExp(String.raw`(?<![\w".])${variable}\s*:=\s*([^;]*)`, 'gi'),
+        )) {
+          if (entrega(tabla, columna, a[1]!)) return true;
+        }
+      }
       for (const m of texto.matchAll(INSERTA)) {
         const tabla = nombreCanonico(m[1]!);
         /*
@@ -3768,6 +3808,32 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * y el mismo `into` de dos columnas con el reloj cayendo en la que lleva huso tampoco
        * elige calendario. Las dos fijan que lo que se empareja es la POSICIÓN y no la lista.
        */
+      /*
+       * Y las variables que toman su tipo del catálogo: no hay ningún tipo escrito en el
+       * texto, solo un nombre de tabla y un `%`. Las dos medidas 2026-09-05 contra 2026-09-04.
+       *
+       * La segunda —`%type`— no la señaló nadie: salió de preguntarme cuál era la hermana de
+       * la primera, y son la misma idea con distinto alcance (una fila entera contra una
+       * columna). Van juntas por eso.
+       *
+       * Y su segura, que fija que lo que decide es el CAMPO y no la fila: el mismo `%rowtype`
+       * escribiendo en el campo CON huso conserva el instante (mismo epoch en los dos husos).
+       */
+      [
+        'censo_probe_rowtype_date',
+        'returns date language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
+          ' begin r.d := now(); return r.d; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
+          ' begin v := now(); return v; end $c$',
+      ],
+      [
+        'censo_probe_ok_rowtype_instante',
+        'returns timestamptz language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
+          ' begin r.ts := now(); return r.ts; end $c$',
+      ],
       [
         'censo_probe_ok_using_instante',
         "returns timestamptz language plpgsql as $c$ declare d timestamptz;" +
@@ -4012,6 +4078,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_identificador_unicode_date',
           'censo_probe_using_date',
           'censo_probe_into_dos_columnas_date',
+          'censo_probe_rowtype_date',
+          'censo_probe_pct_type_date',
         ].sort(),
       );
     } finally {
@@ -4069,6 +4137,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_identificador_unicode_date',
         'censo_probe_using_date',
         'censo_probe_into_dos_columnas_date',
+        'censo_probe_rowtype_date',
+        'censo_probe_pct_type_date',
+        'censo_probe_ok_rowtype_instante',
         'censo_probe_ok_using_instante',
         'censo_probe_ok_into_dos_columnas',
         'censo_probe_ok_insert_select_where',

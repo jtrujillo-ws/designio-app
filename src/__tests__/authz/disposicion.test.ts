@@ -1,4 +1,7 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
+/* Solo para los TIPOS del censo de abajo: el valor llega por `import()` dinámico, que no
+ * sirve como espacio de nombres de tipos. Se borra al compilar. */
+import type * as TS from 'typescript';
 import { createHash } from 'node:crypto';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { exportarWorkspace } from '@/lib/exportacion/exportacion.servicio';
@@ -1622,18 +1625,23 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
      * El censo de la clase, en vez del cuarto arreglo suelto. Tres rondas seguidas
      * encontraron la misma forma —el panel de disposición, la auditoría, el panel de
      * propuestas— y las tres son la misma causa: una proyección de SOLO LECTURA con varias
-     * sentencias, que este slice puede cruzar borrando el workspace a mitad.
+     * sentencias, que este slice puede cruzar borrando el workspace a mitad. Antes de este PR
+     * nada borraba datos de un workspace, así que la carrera no existía en ninguna.
      *
-     * Antes de este PR no había nada que borrara datos de un workspace, así que la carrera no
-     * existía en ninguna de ellas. La abre este slice, y por eso se cierran aquí las que hay
-     * en vez de esperar a que la revisión encuentre la cuarta.
+     * Se lee con el PARSER de TypeScript y no con expresiones regulares, y eso no es
+     * elegancia: la versión con regex tenía tres formas de dar verde sin mirar, las tres
+     * señaladas en revisión. Una función exportada como `const f = async () => …` no casaba
+     * con `^export function`; el recuento de sentencias solo veía las `tx` LÉXICAS del cuerpo,
+     * así que delegar una consulta a un ayudante bajaba el contador a una; y la comprobación
+     * del aislamiento aceptaba la palabra en cualquier sitio, incluido un comentario SQL
+     * dentro de una plantilla —y `ai.servicio.ts` tiene uno que dice «el aislamiento por
+     * inquilino», en el mismo fichero que una de las proyecciones corregidas—.
      *
-     * Lo que se busca: una función exportada que abra `conUsuario`, ejecute DOS o más
-     * sentencias, no escriba nada, y no fije el aislamiento. Las que escriben quedan fuera a
-     * propósito —la doctrina del esquema les exige READ COMMITTED, porque serializan con un
-     * candado y releen—, y ésa es justamente la razón de que esto no se pueda arreglar
-     * poniendo REPEATABLE READ en `conUsuario` y olvidarse.
+     * Con el AST las tres se cierran de raíz: la declaración se reconoce por su forma, las
+     * sentencias se cuentan siguiendo también a los ayudantes locales que reciben `tx`, y el
+     * aislamiento se lee del TERCER ARGUMENTO real de la llamada a `conUsuario`.
      */
+    const ts = (await import('typescript')).default;
     const { readdir, readFile } = await import('node:fs/promises');
     const raiz = new URL('../../lib/', import.meta.url).pathname;
     const ficheros: string[] = [];
@@ -1650,46 +1658,136 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     /** Las que quedan fuera se declaran AQUÍ con su motivo, o no quedan fuera. */
     const DECLARADAS: Record<string, string> = {
       'disposicion/disposicion.servicio.ts:ejecutarDisposicion':
-        'ESCRIBE: invoca `ejecutar_disposicion`, que toma el candado del workspace y relee. La doctrina de aislamiento del esquema le exige READ COMMITTED, y de hecho la función lo comprueba y se niega bajo REPEATABLE READ.',
+        'ESCRIBE: invoca `ejecutar_disposicion`, que toma el candado del workspace y relee. La doctrina de aislamiento del esquema le exige READ COMMITTED, y la función lo comprueba y se niega bajo REPEATABLE READ.',
       'exportacion/exportacion.servicio.ts:exportarWorkspace':
         'ESCRIBE, y corre a propósito en REPEATABLE READ por SYS-04 —el archivo tiene que ser una foto—, declarado con su fecha en la cabecera de la migración.',
     };
 
     const sueltas: string[] = [];
     for (const f of ficheros) {
-      const src = await readFile(f, 'utf8');
-      const cortes = [...src.matchAll(/^export (?:async )?function (\w+)/gm)];
-      /* Todas las declaraciones de nivel superior, no solo las exportadas: el cuerpo de una
-       * función termina en la SIGUIENTE, sea cual sea. Cortando solo por `export function`,
-       * `panelPropuestas` se comía los ayudantes privados que hay debajo —que sí escriben— y
-       * el censo la descartaba por escritora. Se escapaba justamente la que motivó el censo. */
-      const limites = [...src.matchAll(/^(?:export )?(?:async )?(?:function|const|type|interface|class) /gm)]
-        .map((m) => m.index!)
-        .sort((a, b) => a - b);
-      for (let i = 0; i < cortes.length; i++) {
-        const desde = cortes[i]!.index!;
-        const hasta = limites.find((x) => x > desde) ?? src.length;
-        /* Sin comentarios, y no es un detalle: la nota que EXPLICA por qué una proyección
-         * fija el aislamiento contiene la palabra «aislamiento», así que sin quitarla el censo
-         * daba por declarada cualquier función que la mencionara — incluidas las cinco al
-         * quitarles la opción. Lo descubrí quitándosela una a una y viendo que ninguna
-         * enrojecía: es el mismo defecto que el censo del calendario ya tenía resuelto, y aquí
-         * lo repetí. */
-        const cuerpo = src
-          .slice(desde, hasta)
-          .replace(/\/\*[\s\S]*?\*\//g, '')
-          .replace(/\/\/[^\n]*/g, '');
-        const nombre = cortes[i]![1]!;
-        if (!cuerpo.includes('conUsuario(')) continue;
-        const sentencias = (cuerpo.match(/\btx(?:\.unsafe)?[`(]/g) ?? []).length;
-        // Solo ESCRITURAS LITERALES. El `(\s+\w+)?` del `update` es por el alias —`update
-        // gate_instancia g set …` no casaba sin él, y `aprobarGate` escribe y por tanto DEBE
-        // quedarse en READ COMMITTED—. Y NO se adivina «escribe» por llamar a una función con
-        // guion bajo: eso descartaba `panelDisposicion` y `listarAuditoria` por invocar
-        // `disposicion_motivo_no_ejecutable` y `workspace_role`, que solo leen. Lo que escribe
-        // llamando a una función definer se declara abajo, con su nombre y su motivo.
-        const escribe = /insert\s+into|update\s+\w+(\s+\w+)?\s+set|delete\s+from/i.test(cuerpo);
-        if (sentencias >= 2 && !escribe && !cuerpo.includes('aislamiento')) {
+      const fuente = ts.createSourceFile(
+        f,
+        await readFile(f, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true,
+      );
+
+      /**
+       * Cuántas sentencias corren en ESTA transacción bajo el nodo. Tres formas, y la tercera
+       * es la que importa:
+       *
+       *  · `tx\`select …\`` — la plantilla etiquetada;
+       *  · `tx.unsafe(…)` — la única llamada sobre `tx` que ejecuta algo. `tx.json(…)` NO
+       *    cuenta: serializa un valor y no es una sentencia. Contarla marcó `hilosDeObjetos`
+       *    por el motivo equivocado, aunque resultara culpable por otro;
+       *  · **cualquier llamada cuyo PRIMER argumento sea `tx`** —`exigirCuentaActiva(tx, …)`—,
+       *    porque ese ayudante ejecuta sus consultas dentro de esta misma transacción. Es lo
+       *    que sustituye a seguir ayudantes por nombre: aquello solo veía los del propio
+       *    módulo, y `exigirCuentaActiva` se IMPORTA en casi todos, así que una proyección
+       *    nueva en cualquier fichero salvo `auth.servicio.ts` se contaba de menos.
+       */
+      const analizar = (nodo: TS.Node) => {
+        let sentencias = 0;
+        let escribe = false;
+        /*
+         * Solo cuentan las sentencias cuyo RESULTADO llega a la respuesta. Una cuyo valor se
+         * descarta —`await exigirCuentaActiva(tx, actorId);`, una sentencia de expresión a
+         * secas— es una PUERTA: o pasa o lanza, y no aporta ningún campo. No puede hacer
+         * incoherente lo que se devuelve, que es lo que este censo protege.
+         *
+         * La distinción no es cosmética: contando las puertas salían diecisiete proyecciones,
+         * casi todas con una sola lectura de datos detrás de su comprobación de cuenta. Habría
+         * sido ensanchar el PR a ocho slices por una incoherencia que nadie puede observar.
+         */
+        const contar = (n: TS.Node) => {
+          let p: TS.Node | undefined = n.parent;
+          while (p && (ts.isAwaitExpression(p) || ts.isParenthesizedExpression(p))) {
+            p = p.parent;
+          }
+          if (p && ts.isExpressionStatement(p)) return; // puerta: su valor se tira
+          sentencias++;
+        };
+        const visitar = (n: TS.Node) => {
+          if (
+            ts.isTaggedTemplateExpression(n) &&
+            ts.isIdentifier(n.tag) &&
+            n.tag.text === 'tx'
+          ) {
+            contar(n);
+          }
+          if (ts.isCallExpression(n)) {
+            const f = n.expression;
+            const esUnsafe =
+              ts.isPropertyAccessExpression(f) &&
+              ts.isIdentifier(f.expression) &&
+              f.expression.text === 'tx' &&
+              f.name.text === 'unsafe';
+            const primeroEsTx =
+              n.arguments.length > 0 &&
+              ts.isIdentifier(n.arguments[0]!) &&
+              (n.arguments[0] as TS.Identifier).text === 'tx';
+            if (esUnsafe || primeroEsTx) contar(n);
+          }
+          // El SQL, para saber si ESCRIBE.
+          if (
+            ts.isTemplateLiteral(n) &&
+            /insert\s+into|update\s+\w+(\s+\w+)?\s+set|delete\s+from/i.test(n.getText())
+          ) {
+            escribe = true;
+          }
+          ts.forEachChild(n, visitar);
+        };
+        ts.forEachChild(nodo, visitar);
+        return { sentencias, escribe };
+      };
+
+      /** Todas las funciones del módulo por nombre, exportadas o no. */
+      const porNombre = new Map<string, TS.Node>();
+      const exportadas: { nombre: string; nodo: TS.Node }[] = [];
+      const exportada = (n: TS.Node) =>
+        ts.canHaveModifiers(n) &&
+        (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+      for (const st of fuente.statements) {
+        if (ts.isFunctionDeclaration(st) && st.name) {
+          porNombre.set(st.name.text, st);
+          if (exportada(st)) exportadas.push({ nombre: st.name.text, nodo: st });
+        }
+        // `const f = async (…) => …` y `const f = async function (…) {…}`, exportadas o no.
+        if (ts.isVariableStatement(st)) {
+          for (const d of st.declarationList.declarations) {
+            if (!ts.isIdentifier(d.name) || !d.initializer) continue;
+            if (!ts.isArrowFunction(d.initializer) && !ts.isFunctionExpression(d.initializer)) {
+              continue;
+            }
+            porNombre.set(d.name.text, d.initializer);
+            if (exportada(st)) exportadas.push({ nombre: d.name.text, nodo: d.initializer });
+          }
+        }
+      }
+
+      for (const { nombre, nodo } of exportadas) {
+        // La llamada a `conUsuario` de ESTA función, con su tercer argumento.
+        let llamada: TS.CallExpression | undefined;
+        const buscar = (n: TS.Node) => {
+          if (
+            ts.isCallExpression(n) &&
+            ts.isIdentifier(n.expression) &&
+            n.expression.text === 'conUsuario'
+          ) {
+            llamada ??= n;
+          }
+          ts.forEachChild(n, buscar);
+        };
+        ts.forEachChild(nodo, buscar);
+        if (!llamada) continue;
+
+        // El aislamiento se lee del TERCER ARGUMENTO real, no de la palabra suelta.
+        const opciones = llamada.arguments[2];
+        const fijaAislamiento = Boolean(opciones && /aislamiento\s*:/.test(opciones.getText()));
+
+        const { sentencias, escribe } = analizar(nodo);
+
+        if (sentencias >= 2 && !escribe && !fijaAislamiento) {
           const clave = `${f.slice(raiz.length)}:${nombre}`;
           if (!(clave in DECLARADAS)) sueltas.push(clave);
         }

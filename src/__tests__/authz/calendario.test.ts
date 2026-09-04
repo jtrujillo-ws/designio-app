@@ -720,7 +720,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * cuatro veces. Medido, no supuesto.
      */
     /** Lo que RENDERIZA un valor a texto: la clase del JSON, más los de la biblioteca. */
-    const SERIALIZAN = String.raw`\w*json\w*|concat|concat_ws|quote_literal|quote_nullable|quote_ident|format`;
+    /*
+     * `array_to_string` va en la lista aunque no lo parezca: no renderiza UN valor, renderiza
+     * cada ELEMENTO con la función de salida de su tipo, que es exactamente lo mismo un piso
+     * más abajo. Medido: `array_to_string(array[now()], ',')` da
+     * `2026-09-05 08:26:19.88+14` en Pacific/Kiritimati y `2026-09-04 06:26:19.92-12` en
+     * Etc/GMT+12 — fecha distinta dentro del texto, no solo desfase distinto.
+     *
+     * Los demás serializadores de array ya entraban por `\w*json\w*`: `array_to_json`,
+     * `to_jsonb`, `jsonb_build_array`. Éste era el único que renderiza a texto plano sin
+     * llevar `json` en el nombre.
+     */
+    const SERIALIZAN = String.raw`\w*json\w*|array_to_string|concat|concat_ws|quote_literal|quote_nullable|quote_ident|format`;
     const HUSO_YA_FIJADO = String.raw`${nombreDeFuncion('timezone')}\s*\(\s*${envuelto(HUSO_LITERAL)}\s*,\s*`;
     /*
      * Y el FORMATO de `to_char`, que hasta ahora no se miraba: se marcaba cualquier `to_char`
@@ -1177,10 +1188,29 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * el tipo de la columna no decide nada por sí solo. Lo que llega por asignación, que es
      * como se escribe un `RETURNS TABLE` en plpgsql, sí está cubierto.
      */
+    /*
+     * El nombre de una variable plpgsql puede venir ENTRECOMILLADO, y entonces no es `\w+`:
+     * `declare "d" date; begin "d" := now(); return "d"; end` con `returns date` devuelve
+     * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12 —medido—, y el catálogo lo
+     * guarda con las comillas puestas. El barrido las conserva bien (los nombres sí los leen
+     * los patrones), pero la gramática del nombre no las admitía, así que no casaba ni la
+     * declaración ni la asignación, y por el lado del tipo de vuelta solo se veía un
+     * `return "d"` que no es ningún reloj. La variable quedaba invisible por los dos lados a
+     * la vez.
+     *
+     * LÍMITE DECLARADO: un identificador entrecomillado distingue mayúsculas y uno desnudo
+     * no, así que `declare "D" date; begin d := now();` son en Postgres dos variables
+     * distintas y aquí se conflan. Ya se conflaban antes —estos patrones van con `i`— y el
+     * error es hacia marcar de más, no de menos.
+     */
+    const NOMBRE_DE_VARIABLE = String.raw`"(?:[^"]|"")+"|\w+`;
     const DECLARADAS_SIN_HUSO = new RegExp(
-      String.raw`\b(\w+)\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*(?::=|;|:|,|\))`,
+      String.raw`(?<![\w"])(${NOMBRE_DE_VARIABLE})\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*(?::=|;|:|,|\))`,
       'gi',
     );
+    /** El nombre como lo escribe quien lo declara, sin las comillas ni su duplicación. */
+    const sinComillas = (n: string): string =>
+      n.startsWith('"') ? n.slice(1, -1).replace(/""/g, '"') : n;
     /*
      * Y lo que se asigna se mira con las MISMAS hojas que lo que se devuelve, que es la lección
      * de aquí al lado escrita una vez más: `declare d date; begin d := coalesce(now(), now());`
@@ -1190,14 +1220,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * por donde se entra.
      */
     RELOJ_ASIGNADO_A_VARIABLE = (texto: string): boolean => {
-      const nombres = [...texto.matchAll(DECLARADAS_SIN_HUSO)].map((m) => m[1]!);
+      const nombres = [...texto.matchAll(DECLARADAS_SIN_HUSO)].map((m) => sinComillas(m[1]!));
       if (nombres.length === 0) return false;
-      const cualquiera = nombres.map((n) => n.replace(/[^\w]/g, '')).join('|');
+      // Cada nombre se busca en las DOS formas en que se puede volver a escribir, porque
+      // declararlo entrecomillado no obliga a usarlo así después (ni al revés).
+      const cualquiera = nombres
+        .map((n) => n.replace(/[^\w]/g, ''))
+        .filter((n) => n !== '')
+        .flatMap((n) => [n, `"${n}"`])
+        .join('|');
+      if (cualquiera === '') return false;
       const derechas = [
-        ...texto.matchAll(new RegExp(String.raw`\b(?:${cualquiera})\s*:=\s*([^;]*)`, 'gi')),
+        ...texto.matchAll(
+          new RegExp(String.raw`(?<![\w"])(?:${cualquiera})\s*:=\s*([^;]*)`, 'gi'),
+        ),
         ...texto.matchAll(
           new RegExp(
-            String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?(?:${cualquiera})\b`,
+            String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?(?:${cualquiera})(?![\w"])`,
             'gi',
           ),
         ),
@@ -1276,7 +1315,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       ].some((m) => culpable(m[2]!, 'sql')) ||
       [
         ...conLiterales.matchAll(
-          /\bexecute\s+(?:\w+\s*\(\s*)*((?:[A-Za-z_]*&?'(?:[^']|'')*'\s*(?:(?:\|\||,)\s*)?)+)/gi,
+          /\bexecute\s+(?:\w+\s*\(\s*)*((?:(?:[A-Za-z_]*&?'(?:[^']|'')*'|\d+)\s*(?:(?:\|\||,)\s*)?)+)/gi,
         ),
       ].some((m) =>
         /*
@@ -1290,8 +1329,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * ahí, igual que `execute v_sql` no se puede leer.
          */
         (() => {
-          const trozos = [...m[1]!.matchAll(/[A-Za-z_]*&?'((?:[^']|'')*)'/g)].map((l) =>
-            l[1]!.replace(/''/g, "'"),
+          /*
+           * Los argumentos, y no solo los LITERALES. Un número desnudo es un argumento con
+           * todas las letras —`format('select %2$*1$s::date', 0, 'now()')` da exactamente
+           * `select now()::date`, medido— y dejarlo fuera no lo omitía: DESPLAZABA todo lo de
+           * detrás, porque las posiciones de `format` cuentan argumentos, no comillas. La
+           * lista se cortaba además en el primer número, así que el reloj ni siquiera
+           * llegaba. Un número se sustituye por su propio texto, que es lo que hace Postgres.
+           *
+           * Lo que sigue sin poder leerse es una VARIABLE, por lo de siempre: su contenido no
+           * está en el texto. Ahí la cadena se corta, igual que en `execute v_sql`.
+           */
+          const trozos = [...m[1]!.matchAll(/[A-Za-z_]*&?'((?:[^']|'')*)'|(\d+)/g)].map((l) =>
+            l[1] === undefined ? l[2]! : l[1].replace(/''/g, "'"),
           );
           /*
            * Los DOS pegados, y no uno: ninguno es la verdad para las dos formas. `||` une
@@ -1334,9 +1384,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           const comoFormat = (partes: string[]): string => {
             let siguiente = 1;
             return partes[0]!.replace(
-              /%(?:(\d+)\$)?[-+ 0]*\d*([sIL%])/g,
-              (_todo, posicion: string | undefined, tipo: string) => {
+              /%(?:(\d+)\$)?[-+ 0]*(\d+|\*(?:\d+\$)?)?([sIL%])/g,
+              (
+                _todo,
+                posicion: string | undefined,
+                ancho: string | undefined,
+                tipo: string,
+              ) => {
                 if (tipo === '%') return '%';
+                /*
+                 * El ancho puede venir de OTRO ARGUMENTO —`%*s` lo toma del siguiente,
+                 * `%*n$s` del n-ésimo—, y eso no es cosmética: el `*` a secas SE COME un
+                 * argumento del contador secuencial, así que sin contarlo todo lo que viene
+                 * detrás se lee corrido. Medido: `format('[%*s][%s]', 4, 'a', 'b')` da
+                 * `[   a][b]`, o sea que el 4 fue el ancho y la `a` el valor.
+                 *
+                 * El relleno NO se aplica, y es deliberado: son espacios, y un espacio no
+                 * separa un valor de su cast —medido, `select now()     ::date` devuelve la
+                 * fecha—. Lo que hay que reconstruir bien es QUÉ argumento va en cada hueco.
+                 */
+                if (ancho === '*') siguiente++;
                 const arg = partes[posicion === undefined ? siguiente++ : Number(posicion)];
                 if (arg === undefined) return '';
                 if (tipo === 'L') return `'${arg.replace(/'/g, "''")}'`;
@@ -2029,6 +2096,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // 'now()')` da `select now()::date`.
       "execute format('select %2$s::date', 'columna', 'now()')",
       "execute format('select %10s::date', 'now()')",
+      // Y el ancho tomado de OTRO argumento, que es la parte de la gramática de `format` que
+      // faltaba. Medido: `format('select %2$*1$s::date', 0, 'now()')` da exactamente
+      // `select now()::date`. Va con posición SALTEADA y con ancho posicional a la vez,
+      // porque es la forma en que reconstruir mal el marcador desalinea todo lo de detrás.
+      "execute format('select %2$*1$s::date', 0, 'now()')",
+      // Y el ancho por `*` a secas, que se COME un argumento del contador secuencial: sin
+      // contarlo, el valor que se sustituye es el ancho y el reloj se queda fuera.
+      "execute format('select %*s::date', 4, 'now()')",
+      // Serializar un ARRAY a texto plano: `array_to_string` aplica la función de salida a
+      // cada elemento. Medido: `2026-09-05 …+14` contra `2026-09-04 …-12`, con fecha distinta
+      // dentro del texto. Era el único serializador de array sin `json` en el nombre.
+      "array_to_string(array[now()], ',')",
       // La coerción IMPLÍCITA a texto, que renderiza igual sin nombrar ningún formato. Las
       // cuatro medidas: cadena distinta en husos opuestos.
       'concat(now())',
@@ -2364,6 +2443,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Y la sustitución no INVENTA culpa: el mismo `format` con un argumento que no lee el
       // calendario sigue limpio.
       "execute format('select %s', '1')",
+      // Y la mitad que acota a `array_to_string`: serializar un array de algo que YA es fecha
+      // no elige calendario (medido: `2026-09-04` en los dos husos). El huso ya fijado dentro
+      // del corchete se respeta igual que fuera — comprobado retirando esa mirada de atrás,
+      // que la mueve junto a las tres seguras que ya la sostenían.
+      "array_to_string(array[timezone('UTC', now())::date], ',')",
       // Y serializar un array de algo que YA es fecha no elige calendario: un `date` no tiene
       // huso del que moverse (medido: `["2026-09-04"]` en los dos husos). Es la mitad que
       // acota el descenso por los corchetes.
@@ -2878,6 +2962,30 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_variable_instante',
         'returns timestamptz language plpgsql as $c$ declare d timestamptz; begin d := now(); return d; end $c$',
       ],
+      /*
+       * Y la misma variable con el nombre ENTRECOMILLADO, que es un identificador SQL con
+       * todas las letras y que el catálogo guarda con las comillas puestas (comprobado).
+       * Medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12, igual que
+       * su hermana desnuda. Se escapaba por los DOS lados a la vez —ni la declaración ni la
+       * asignación casaban con `\w+`— y por el del tipo de vuelta solo se veía un
+       * `return "d"`, que no es ningún reloj.
+       *
+       * Con su pareja segura, que acota la forma: el mismo nombre entrecomillado sobre un
+       * tipo CON huso conserva el instante. Dicho lo que vale, que es poco: no carga peso
+       * propio —lo que la mantiene limpia es que `timestamptz` no case como tipo sin huso,
+       * exactamente lo mismo que mantiene limpia a `censo_probe_variable_instante`—. Está
+       * para que la forma nueva no entre sin su mitad, no como cobertura.
+       */
+      [
+        'censo_probe_var_comillas_date',
+        'returns date language plpgsql as $c$ declare "d" date;' +
+          ' begin "d" := now(); return "d"; end $c$',
+      ],
+      [
+        'censo_probe_var_comillas_instante',
+        'returns timestamptz language plpgsql as $c$ declare "d" timestamptz;' +
+          ' begin "d" := now(); return "d"; end $c$',
+      ],
       // Y el reloj ENVUELTO en algo que no cambia su tipo, que es como llega de verdad una
       // expresión escrita por una persona. Las cuatro medidas: 2026-09-05 en
       // Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
@@ -3048,6 +3156,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_tabla_date',
           'censo_probe_tabla_dos_date',
           'censo_probe_arreglo_date',
+          'censo_probe_var_comillas_date',
         ].sort(),
       );
     } finally {
@@ -3078,6 +3187,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_tabla_instante',
         'censo_probe_arreglo_date',
         'censo_probe_arreglo_instante',
+        'censo_probe_var_comillas_date',
+        'censo_probe_var_comillas_instante',
         'censo_probe_ok_arreglo_huso_fijo',
         'censo_probe_ok_huso_fijo_date',
         'censo_probe_ok_subconsulta_date',

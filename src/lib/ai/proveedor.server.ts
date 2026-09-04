@@ -53,6 +53,13 @@ export type IntentoProveedor = {
    * primario, la latencia por modelo mediría otra cosa. */
   latenciaMs: number;
   uso: UsoLlamada | null;
+  /**
+   * La línea del libro de costos que se abrió ANTES de despachar este intento. Existe
+   * siempre —sin línea no hay despacho— y es la fila que después se cierra con el desenlace.
+   * Que el id venga de aquí es lo que permite que anotar el gasto no dependa de que una
+   * transacción POSTERIOR a la llamada salga bien.
+   */
+  registroId: string;
   /** Bajo qué versión del consentimiento salió ESTE intento. Por intento y no por
    * operación: el respaldo es un despacho NUEVO, con su propia autorización leída en su
    * propio momento, y anotar los dos contra la versión que autorizó al primario haría que
@@ -220,6 +227,12 @@ function causaDelError(e: unknown): MotivoSinSalida {
 }
 
 /**
+ * Lo que devuelve abrir la línea del libro para un intento: su id, o el motivo por el que no
+ * se pudo abrir — y entonces NO se despacha. Ese orden es el arreglo entero.
+ */
+export type ApunteDespacho = { ok: true; registroId: string } | { ok: false; motivo: string };
+
+/**
  * Lo que el adaptador tiene que poder preguntar antes de despachar OTRA vez. No sabe de
  * base de datos —ese es el punto de este módulo— así que el permiso se lo pasa quien sí
  * sabe, y con la MISMA comprobación que autorizó el despacho primario.
@@ -247,6 +260,23 @@ export async function generarConProveedor(entrada: {
    * despacha— y el respaldo saldría sin él.
    */
   revalidar?: () => Promise<Revalidacion>;
+  /**
+   * Se llama ANTES de CADA despacho y abre su línea en el libro de costos; si no puede, ese
+   * intento no ocurre.
+   *
+   * El orden es el arreglo: antes la fila se escribía al VOLVER, así que un fallo transitorio
+   * de esa transacción borraba del libro —y del tope diario— una llamada que el proveedor ya
+   * había atendido y cobrado, mientras la limpieza de fuera soltaba la reserva y dejaba
+   * reintentar. La promesa «el libro registra toda invocación» dependía de que algo POSTERIOR
+   * saliera bien; ahora depende de algo ANTERIOR, y si eso falla el gasto no llega a ocurrir.
+   *
+   * El adaptador no sabe de base de datos —ese es el punto de este módulo—, así que la abre
+   * quien sí sabe y le devuelve el id.
+   */
+  anotarDespacho: (
+    modelo: string,
+    consentimientoVersion: number | null,
+  ) => Promise<ApunteDespacho>;
 }): Promise<ResultadoProveedor> {
   // Cada intento se anota antes de decidir si hay otro: una degradación de modelo son DOS
   // llamadas al proveedor, y la del primario existió aunque no sirviera. Devolver solo la
@@ -256,6 +286,12 @@ export async function generarConProveedor(entrada: {
   // el respaldo, la que devuelva la revalidación justo antes de salir.
   let consentimientoVersion = entrada.consentimientoVersion;
   for (const [indice, modelo] of [MODELO_PRIMARIO, MODELO_FALLBACK].entries()) {
+    // Primero el apunte, después la llamada. Si el libro no admite la línea, este intento no
+    // ocurre: los anteriores viajan anotados y el motivo llega a la pantalla como cualquier
+    // otro (SYS-21: aquí no se lanza nunca).
+    const apunte = await entrada.anotarDespacho(modelo, consentimientoVersion);
+    if (!apunte.ok) return { ok: false, motivo: apunte.motivo, intentos };
+    const registroId = apunte.registroId;
     const inicio = Date.now();
     try {
       const { datos, uso } = await unaLlamada(
@@ -271,6 +307,7 @@ export async function generarConProveedor(entrada: {
         motivo: '',
         latenciaMs: Date.now() - inicio,
         uso,
+        registroId,
         consentimientoVersion,
       });
       return { ok: true, datos, intentos };
@@ -291,6 +328,7 @@ export async function generarConProveedor(entrada: {
         motivo,
         latenciaMs: Date.now() - inicio,
         uso: usoDelError(e),
+        registroId,
         consentimientoVersion,
       });
       // JSON ilegible: el modelo respondió pero fuera de contrato. No se reintenta con otro

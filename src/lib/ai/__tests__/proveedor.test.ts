@@ -35,6 +35,12 @@ import type { Revalidacion } from '../proveedor.server';
 const USO_CRUDO = { input_tokens: 1000, output_tokens: 40 };
 const USO_ESPERADO = { entrada: 1000, salida: 40 };
 
+/** Los apuntes que el adaptador pidió abrir, en orden. Es lo que permite comprobar que el
+ * libro se abre ANTES de cada despacho y no después. */
+const apuntes: { modelo: string; consentimientoVersion: number | null }[] = [];
+/** Cuando se pone, el siguiente apunte falla con este motivo: sin línea no hay despacho. */
+let apunteFalla: string | null = null;
+
 function llamar(revalidar?: () => Promise<Revalidacion>) {
   return generarConProveedor({
     key: 'sk-de-prueba',
@@ -43,6 +49,11 @@ function llamar(revalidar?: () => Promise<Revalidacion>) {
     usuario: 'material',
     consentimientoVersion: 1,
     revalidar,
+    anotarDespacho: async (modelo, consentimientoVersion) => {
+      if (apunteFalla) return { ok: false, motivo: apunteFalla };
+      apuntes.push({ modelo, consentimientoVersion });
+      return { ok: true, registroId: `linea-${apuntes.length}` };
+    },
   });
 }
 
@@ -168,5 +179,40 @@ describe('adaptador del proveedor AI', () => {
     // Y cada latencia es la de SU intento: la del respaldo no arrastra la espera del
     // primario, que era lo que hacía irreal la latencia por modelo.
     expect(r.intentos.every((i) => i.latenciaMs >= 0)).toBe(true);
+  });
+});
+
+describe('el libro se abre antes de despachar (RF-09.14)', () => {
+  it('cada intento abre su línea ANTES de la llamada, y con su propio modelo', async () => {
+    apuntes.length = 0;
+    apunteFalla = null;
+    // Primario cae con 5xx → degrada; el respaldo tampoco responde. Dos despachos, dos
+    // apuntes, en orden y cada uno con su modelo: la línea no se comparte entre intentos.
+    sdk.respuestas = [
+      Object.assign(new Error('boom'), { status: 500 }),
+      Object.assign(new Error('boom'), { status: 500 }),
+    ];
+    const r = await llamar();
+    expect(r.ok).toBe(false);
+    expect(apuntes.map((a) => a.modelo)).toEqual([MODELO_PRIMARIO, MODELO_FALLBACK]);
+    // Y cada intento sube sellado con la línea que se abrió para él.
+    expect(r.intentos.map((i) => i.registroId)).toEqual(['linea-1', 'linea-2']);
+  });
+
+  it('si la línea no se puede abrir, NO se despacha', async () => {
+    apuntes.length = 0;
+    sdk.modelosLlamados = [];
+    sdk.respuestas = [];
+    // Éste es el arreglo entero. Antes, el gasto podía ocurrir y perderse: la fila se
+    // escribía al VOLVER, y un fallo transitorio de esa transacción borraba del libro una
+    // llamada que el proveedor ya había cobrado. Ahora, si no se puede anotar, sencillamente
+    // no ocurre — y se comprueba mirando que el SDK ni siquiera se llamó.
+    apunteFalla = 'el libro no admite la línea';
+    const r = await llamar();
+    expect(r.ok).toBe(false);
+    expect(sdk.modelosLlamados).toEqual([]);
+    expect(r.intentos).toEqual([]);
+    if (!r.ok) expect(r.motivo).toBe('el libro no admite la línea');
+    apunteFalla = null;
   });
 });

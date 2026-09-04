@@ -42,6 +42,7 @@ import {
 import {
   credencialesAI,
   generarConProveedor,
+  type ApunteDespacho,
   type IntentoProveedor,
 } from './proveedor.server';
 
@@ -1125,60 +1126,84 @@ function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): Contenid
  * error por modelo decía que el primario nunca falla y su latencia acababa sumada a la del
  * respaldo. Una fila por llamada, que es lo que la tabla promete.
  *
- * Transacción propia —todos los intentos entran o no entra ninguno— y ANTES de persistir el
- * lote: si el guardado falla después (una carrera por el item, un esquema que no cuadra),
- * las llamadas siguen anotadas porque el dinero se gastó igual. Devuelve los ids en el mismo
- * orden; el de la salida válida es el que las propuestas referencian, así que ninguna puede
- * existir sin su línea de gasto.
+ * Abre la línea del libro de costos para UN intento, ANTES de despacharlo (RF-09.14).
+ *
+ * Nace en `despachada`, que es el estado que significa «salió y su desenlace no consta». Si
+ * este insert falla, `generarConProveedor` no despacha: no se gasta lo que no se puede
+ * anotar.
  */
-async function registrarLlamadas(
+async function abrirLlamada(
   actorId: string,
   entrada: GenerarPropuestas,
   alcance: Alcance,
+  modelo: string,
+  consentimientoVersion: number | null,
+  puesto: number,
+): Promise<ApunteDespacho> {
+  try {
+    const [fila] = await conUsuario(actorId, (tx) => tx`insert into llamada_ai
+      (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado,
+       consentimiento_version, intento, creado_por)
+      values (${entrada.workspaceId}, ${entrada.capacidad},
+              ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
+              ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
+              ${modelo}, ${alcance.origenKey}, 'despachada',
+              ${consentimientoVersion}, ${puesto}, ${actorId})
+      returning id`);
+    return { ok: true, registroId: fila!.id as string };
+  } catch {
+    // No se lanza: el adaptador no lanza nunca (SYS-21) y quien llama necesita el motivo,
+    // no una excepción. Y sobre todo, el despacho NO ocurre — que es el punto entero.
+    return {
+      ok: false,
+      motivo:
+        'No se pudo abrir la línea del libro de costos para esta llamada, así que no se despachó. Vuelve a intentarlo; todo el flujo sigue disponible a mano.',
+    };
+  }
+}
+
+/**
+ * Cierra las líneas que `abrirLlamada` dejó en `despachada`, cada una con su desenlace.
+ *
+ * Transacción propia —todas las líneas se cierran o no se cierra ninguna— y ANTES de
+ * persistir el lote: si el guardado falla después, el gasto ya consta. Devuelve el id de la
+ * salida válida, que es el que las propuestas referencian, así que ninguna puede existir sin
+ * su línea de gasto.
+ *
+ * Si ESTO falla, ya no se pierde nada esencial: las filas se quedan en `despachada`, siguen
+ * contando para el tope y conservan ancla, modelo, credencial y consentimiento. Lo único que
+ * se pierde es el detalle del desenlace — que es exactamente el cambio de esta migración: el
+ * fallo pasó de «desaparece una llamada pagada» a «una llamada pagada consta con menos
+ * detalle».
+ */
+async function cerrarLlamadas(
+  actorId: string,
   intentos: IntentoProveedor[],
-): Promise<{ ids: string[]; idSalidaValida: string | null }> {
-  if (intentos.length === 0) return { ids: [], idSalidaValida: null };
+): Promise<{ idSalidaValida: string | null }> {
+  if (intentos.length === 0) return { idSalidaValida: null };
   return conUsuario(actorId, async (tx) => {
     // SIN `exigirCuentaActiva`, y es la única función del módulo que se lo salta a
-    // propósito. Anotar lo que pasó y autorizar lo que viene son dos preguntas distintas:
-    // la cuenta activa responde a la segunda —«¿puede esta persona actuar ahora?»— y aquí
-    // no se actúa, se registra un hecho consumado. Si la cuenta se desactiva con la llamada
-    // en vuelo, el proveedor ya respondió y quizá ya facturó; dejar caer la anotación
-    // borraría gasto real del libro y del tope, que es la misma doctrina que ya rige para
-    // `sin-respuesta` («no se sabe» no es «salió gratis») aplicada a un caso donde sí se
-    // sabe. La autorización de verdad no desaparece: la RLS sigue exigiendo que quien
-    // firma sea miembro con rol curador del workspace, y persistir propuestas —que sí es
-    // actuar— conserva su chequeo.
-    const ids: string[] = [];
+    // propósito. Anotar lo que pasó y autorizar lo que viene son dos preguntas distintas: la
+    // cuenta activa responde a la segunda —«¿puede esta persona actuar ahora?»— y aquí no se
+    // actúa, se cierra un hecho consumado. Si la cuenta se desactiva con la llamada en vuelo,
+    // el proveedor ya respondió y quizá ya facturó. La autorización de verdad no desaparece:
+    // la política de completar sigue exigiendo rol curador del workspace.
     let idSalidaValida: string | null = null;
-    // El índice del bucle ES el puesto del intento (0 primario, 1 respaldo): el adaptador
-    // devuelve `intentos` EN ORDEN y hasta ahora esa información se tiraba al persistir.
-    // Sin ella, dos filas de la misma transacción comparten `creado_en` y no hay forma
-    // cronológica de saber cuál fue la última.
-    for (const [puesto, intento] of intentos.entries()) {
-      const [fila] = await tx`insert into llamada_ai
-        (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado, motivo,
-         tokens_entrada, tokens_salida, costo_usd, latencia_ms, consentimiento_version,
-         intento, creado_por)
-        values (${entrada.workspaceId}, ${entrada.capacidad},
-                ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
-                ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
-                ${intento.modelo}, ${alcance.origenKey}, ${intento.resultado},
-                ${intento.motivo.slice(0, 500)},
-                ${intento.uso?.entrada ?? null}, ${intento.uso?.salida ?? null},
-                ${intento.uso?.costoUsd ?? null}, ${intento.latenciaMs},
-                ${intento.consentimientoVersion}, ${puesto},
-                ${actorId})
-        returning id`;
-      const id = fila!.id as string;
-      ids.push(id);
+    for (const intento of intentos) {
+      await tx`update llamada_ai set
+          resultado = ${intento.resultado},
+          motivo = ${intento.motivo.slice(0, 500)},
+          tokens_entrada = ${intento.uso?.entrada ?? null},
+          tokens_salida = ${intento.uso?.salida ?? null},
+          costo_usd = ${intento.uso?.costoUsd ?? null},
+          latencia_ms = ${intento.latenciaMs}
+        where id = ${intento.registroId}`;
       // El id que las propuestas referencian se busca por su RESULTADO, no por su posición:
       // como mucho hay un intento con salida válida (el bucle del adaptador para en el
-      // primero que la da), y depender del orden de un `returning` sería depender de algo
-      // que Postgres no promete.
-      if (intento.resultado === 'salida-valida') idSalidaValida = id;
+      // primero que la da).
+      if (intento.resultado === 'salida-valida') idSalidaValida = intento.registroId;
     }
-    return { ids, idSalidaValida };
+    return { idSalidaValida };
   });
 }
 
@@ -1197,12 +1222,21 @@ export async function generarPropuestas(
     // commiteado desde hace una transacción entera.
     const versionConsentimiento = await confirmarDespacho(actorId, entrada, alcance);
 
+    let puestoIntento = 0;
     const respuesta = await generarConProveedor({
       key: alcance.key,
       capacidad: entrada.capacidad,
       sistema: alcance.sistema,
       usuario: alcance.usuario,
       consentimientoVersion: versionConsentimiento,
+      // El puesto lo lleva este contador y no el adaptador: el adaptador no sabe de base de
+      // datos, y el orden de sus intentos es justo lo que hay que persistir. Solo avanza
+      // cuando la línea se abrió de verdad, así que no deja huecos.
+      anotarDespacho: async (modelo, cv) => {
+        const apunte = await abrirLlamada(actorId, entrada, alcance, modelo, cv, puestoIntento);
+        if (apunte.ok) puestoIntento += 1;
+        return apunte;
+      },
       // Degradar de modelo es un despacho NUEVO, no la misma llamada otra vez: ocurre con la
       // primera ya terminada, el control de vuelta aquí y ni un byte en el aire. Así que se
       // vuelve a pedir permiso con EXACTAMENTE la misma comprobación que autorizó el
@@ -1231,7 +1265,7 @@ export async function generarPropuestas(
     // depender de que el resultado nos guste. Si el propio registro falla, manda el motivo
     // del proveedor: es lo que la persona necesita leer.
     if (!respuesta.ok) {
-      await registrarLlamadas(actorId, entrada, alcance, respuesta.intentos).catch(() => {});
+      await cerrarLlamadas(actorId, respuesta.intentos).catch(() => {});
       throw new ErrorAI(respuesta.motivo);
     }
 
@@ -1251,16 +1285,11 @@ export async function generarPropuestas(
           ? { ...i, resultado: 'fuera-de-contrato' as const, motivo }
           : i,
       );
-      await registrarLlamadas(actorId, entrada, alcance, intentos).catch(() => {});
+      await cerrarLlamadas(actorId, intentos).catch(() => {});
       throw new ErrorAI(motivo);
     }
 
-    const { idSalidaValida } = await registrarLlamadas(
-      actorId,
-      entrada,
-      alcance,
-      respuesta.intentos,
-    );
+    const { idSalidaValida } = await cerrarLlamadas(actorId, respuesta.intentos);
     const exitoso = respuesta.intentos[respuesta.intentos.length - 1]!;
     // Sin línea de gasto no hay propuesta: la FK lo impone y aquí se dice con un mensaje
     // legible en vez de dejar que reviente el insert.

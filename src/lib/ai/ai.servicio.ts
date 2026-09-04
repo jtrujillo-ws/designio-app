@@ -1275,8 +1275,13 @@ async function cerrarLlamadas(
     // propósito. Anotar lo que pasó y autorizar lo que viene son dos preguntas distintas: la
     // cuenta activa responde a la segunda —«¿puede esta persona actuar ahora?»— y aquí no se
     // actúa, se cierra un hecho consumado. Si la cuenta se desactiva con la llamada en vuelo,
-    // el proveedor ya respondió y quizá ya facturó. La autorización de verdad no desaparece:
-    // la política de completar sigue exigiendo rol curador del workspace.
+    // el proveedor ya respondió y quizá ya facturó.
+    //
+    // Lo que la política de completar exige es AUTORÍA y MEMBRESÍA, no rol — y no es un
+    // descuido suyo sino el mismo razonamiento llevado hasta el final: pedir rol convertía una
+    // degradación a mitad de llamada en una línea `despachada` para siempre, sin desenlace ni
+    // coste. Lo que queda ata lo que hay que atar: la línea la cierra quien la abrió, y solo
+    // dentro del workspace al que pertenece.
     let idSalidaValida: string | null = null;
     for (const intento of intentos) {
       const cerradas = await tx`update llamada_ai set

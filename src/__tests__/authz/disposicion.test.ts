@@ -1067,6 +1067,45 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
   });
 
+  it('desactivar la cuenta DURANTE la espera del candado tumba el registro que ya la había pasado', async () => {
+    /*
+     * El lado del candado importa, y aquí lo tenía mal. La comprobación de cuenta activa iba
+     * ANTES de tomar el candado, así que una inserción que se queda esperando a otra
+     * disposición la pasaba con la cuenta viva y registraba el acuerdo aunque la desactivaran
+     * durante la espera. Y ese acuerdo no es poca cosa: revierte un archivo, o aporta la
+     * primera de las dos firmas de un borrado.
+     *
+     * El caso de «cuenta ya inactiva» no cubría esto, porque allí la comprobación falla en
+     * cualquier posición. Lo que discrimina es la espera en medio.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('desactivada-en-la-espera');
+
+    const enCurso = await enVuelo(async (tx) => {
+      await tx`select set_config('app.user_id', ${leadId}, true)`;
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:workspace:' || ${ws}::text, 42))`;
+    });
+    try {
+      const registro = conUsuario(adminId, (tx) => tx`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+        values (${ws}, 'borrado', 'Colado con la cuenta apagándose', ${EFECTIVO_PASADO}::date,
+                ${adminId})`);
+      // Está esperando el candado, ya con la cuenta viva comprobada si la puerta fuera previa.
+      expect(await sigueEsperando(registro)).toBe(true);
+      await admin`update usuario set estado = 'inactivo' where id = ${adminId}`;
+      await enCurso.cerrar();
+      await expect(registro).rejects.toMatchObject({ code: '42501' });
+    } finally {
+      await enCurso.cerrar().catch(() => {});
+      await admin`update usuario set estado = 'activo' where id = ${adminId}`;
+    }
+
+    const [n] = await admin`select count(*)::int as n from acuerdo_disposicion
+      where workspace_id = ${ws}`;
+    expect(n!.n).toBe(0);
+  });
+
   it('quien ejecutó conserva la lectura de SU acuerdo, no una ventana a los futuros', async () => {
     /*
      * La política conserva la lectura del acuerdo a quien ejecutó su disposición —conservar el

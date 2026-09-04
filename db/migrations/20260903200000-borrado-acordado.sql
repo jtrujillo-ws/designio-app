@@ -704,13 +704,6 @@ begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
-  -- La cuenta activa, por el mismo motivo que en la ejecución y en la exportación: el grant de
-  -- insert sobre esta tabla permite registrar un acuerdo por SQL crudo, y `is_workspace_member`
-  -- no mira `usuario.estado`. Un acuerdo es la primera de las dos firmas de un borrado.
-  if not cuenta_activa() then
-    raise exception 'la cuenta que registra el acuerdo de disposición no está activa'
-      using errcode = 'insufficient_privilege';
-  end if;
   -- EL CANDADO VA AQUÍ, no solo en el servicio. El grant de insert permite escribir en esta
   -- tabla por SQL directo, saltándose la capa que lo tomaba, y entonces el registro puede
   -- confirmar con una ejecución EN VUELO — después de que validó el acuerdo anterior y antes
@@ -723,6 +716,24 @@ begin
   -- `(workspace_id, version)` solo atrapaba a posteriori: leer el máximo y sumar uno es seguro
   -- porque nadie más está leyéndolo a la vez.
   perform pg_advisory_xact_lock(hashtextextended('designio:workspace:' || new.workspace_id, 42));
+
+  -- La cuenta activa, comprobada DESPUÉS del candado, que es lo único que la hace valer. El
+  -- motivo es el mismo que en la ejecución y en la exportación —el grant de insert permite
+  -- registrar por SQL crudo, y `is_workspace_member` no mira `usuario.estado`—, pero el LADO
+  -- del candado importa: comprobándola antes, una inserción que se queda esperando a otra
+  -- disposición pasa la comprobación con la cuenta viva y registra el acuerdo aunque la
+  -- desactiven durante la espera. Y ese acuerdo no es poca cosa: revierte un archivo, o aporta
+  -- la primera de las dos firmas de un borrado. Bajo READ COMMITTED —que esta tabla exige por
+  -- la derivación del aislamiento— la sentencia de aquí abajo abre instantánea nueva, así que
+  -- esperar y volver a mirar sí ve la desactivación.
+  --
+  -- La membresía no necesita su propia relectura: `workspace_role` se lee también después del
+  -- candado y una membresía revocada devuelve null, que el CHECK de `acordado_rol` rechaza.
+  if not cuenta_activa() then
+    raise exception 'la cuenta que registra el acuerdo de disposición no está activa'
+      using errcode = 'insufficient_privilege';
+  end if;
+
   -- `clock_timestamp()` y no `now()`: `now()` es el inicio de la TRANSACCIÓN, y entre ese
   -- instante y este insert cabe una espera —la del candado de arriba, o la comprobación de la
   -- cuenta— durante la cual una exportación puede confirmar. Con `now()` el acuerdo quedaría

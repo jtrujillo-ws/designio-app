@@ -216,6 +216,21 @@ export async function listarAuditoria(
   workspaceId: string,
   filtro: { tipo?: string; antesDe?: string },
 ): Promise<PaginaAuditoria> {
+  /*
+   * REPEATABLE READ. La auditoría son varias lecturas —cuenta, rol, la página de eventos y el
+   * catálogo de tipos—, y desde que existe la disposición acordada el libro de un workspace
+   * puede VACIARSE entero mientras alguien lo mira: es la única operación del sistema que
+   * borra de `evento_dominio`, que por lo demás es append-only.
+   *
+   * Bajo READ COMMITTED eso partía la respuesta: la página de eventos conservaba los de antes
+   * y el catálogo de tipos veía el libro ya vacío —o cero filas por RLS, porque el borrado
+   * también quita la membresía—, así que la pantalla recibía eventos cuyos tipos no aparecen
+   * en su propio filtro. No es una lista incompleta: es una lista que no corresponde a ningún
+   * estado que la auditoría haya tenido.
+   *
+   * No choca con la doctrina de aislamiento del esquema: ésa exige READ COMMITTED a las
+   * transacciones que ESCRIBEN y releen tras un candado, y aquí no se escribe nada.
+   */
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
     // Capa 2 con MOTIVO: la RLS ya devolvería cero filas a los demás roles, pero una
@@ -266,7 +281,7 @@ export async function listarAuditoria(
       hayMas: filas.length > PAGINA_AUDITORIA,
       tipos,
     };
-  });
+  }, { aislamiento: 'repeatable read' });
 }
 
 /** Traduce los rechazos de la base al contrato del módulo. El guard de fila habla ANTES

@@ -1696,6 +1696,22 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       fuente.indexOf('export async function registrarAcuerdo'),
     );
     expect(cuerpo).toContain("aislamiento: 'repeatable read'");
+
+    // Y el MISMO problema en la auditoría, que este slice crea aunque el código sea ajeno:
+    // `listarAuditoria` lee la página de eventos y el catálogo de tipos en dos sentencias, y
+    // desde que existe la disposición acordada el libro puede VACIARSE entre una y otra —es
+    // la única operación del sistema que borra de `evento_dominio`, que por lo demás es
+    // append-only (comprobado: ninguna otra migración ni servicio lo borra)—. La pantalla
+    // recibía entonces eventos cuyos tipos no aparecen en su propio filtro.
+    const portal = await readFile(
+      new URL('../../lib/portal/portal.servicio.ts', import.meta.url).pathname,
+      'utf8',
+    );
+    const auditoria = portal.slice(
+      portal.indexOf('export async function listarAuditoria'),
+      portal.indexOf('function traducirEscritura'),
+    );
+    expect(auditoria).toContain("aislamiento: 'repeatable read'");
   });
 
   it('la retención se mide con un calendario FIJO, y no con el huso que elige quien llama', async () => {

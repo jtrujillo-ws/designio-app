@@ -1617,6 +1617,87 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // Y el sello sigue verificando con un `remediacion` no vacío y un contador en cero.
     expect(selloRecomputado(c)).toBe(c.sello);
   });
+  it('ninguna proyección de solo lectura queda leyendo de varios momentos', async () => {
+    /*
+     * El censo de la clase, en vez del cuarto arreglo suelto. Tres rondas seguidas
+     * encontraron la misma forma —el panel de disposición, la auditoría, el panel de
+     * propuestas— y las tres son la misma causa: una proyección de SOLO LECTURA con varias
+     * sentencias, que este slice puede cruzar borrando el workspace a mitad.
+     *
+     * Antes de este PR no había nada que borrara datos de un workspace, así que la carrera no
+     * existía en ninguna de ellas. La abre este slice, y por eso se cierran aquí las que hay
+     * en vez de esperar a que la revisión encuentre la cuarta.
+     *
+     * Lo que se busca: una función exportada que abra `conUsuario`, ejecute DOS o más
+     * sentencias, no escriba nada, y no fije el aislamiento. Las que escriben quedan fuera a
+     * propósito —la doctrina del esquema les exige READ COMMITTED, porque serializan con un
+     * candado y releen—, y ésa es justamente la razón de que esto no se pueda arreglar
+     * poniendo REPEATABLE READ en `conUsuario` y olvidarse.
+     */
+    const { readdir, readFile } = await import('node:fs/promises');
+    const raiz = new URL('../../lib/', import.meta.url).pathname;
+    const ficheros: string[] = [];
+    const recorrer = async (dir: string) => {
+      for (const e of await readdir(dir, { withFileTypes: true })) {
+        const ruta = `${dir}${e.name}`;
+        if (e.isDirectory()) await recorrer(`${ruta}/`);
+        else if (e.name.endsWith('.ts')) ficheros.push(ruta);
+      }
+    };
+    await recorrer(raiz);
+    expect(ficheros.length).toBeGreaterThan(20);
+
+    /** Las que quedan fuera se declaran AQUÍ con su motivo, o no quedan fuera. */
+    const DECLARADAS: Record<string, string> = {
+      'disposicion/disposicion.servicio.ts:ejecutarDisposicion':
+        'ESCRIBE: invoca `ejecutar_disposicion`, que toma el candado del workspace y relee. La doctrina de aislamiento del esquema le exige READ COMMITTED, y de hecho la función lo comprueba y se niega bajo REPEATABLE READ.',
+      'exportacion/exportacion.servicio.ts:exportarWorkspace':
+        'ESCRIBE, y corre a propósito en REPEATABLE READ por SYS-04 —el archivo tiene que ser una foto—, declarado con su fecha en la cabecera de la migración.',
+    };
+
+    const sueltas: string[] = [];
+    for (const f of ficheros) {
+      const src = await readFile(f, 'utf8');
+      const cortes = [...src.matchAll(/^export (?:async )?function (\w+)/gm)];
+      /* Todas las declaraciones de nivel superior, no solo las exportadas: el cuerpo de una
+       * función termina en la SIGUIENTE, sea cual sea. Cortando solo por `export function`,
+       * `panelPropuestas` se comía los ayudantes privados que hay debajo —que sí escriben— y
+       * el censo la descartaba por escritora. Se escapaba justamente la que motivó el censo. */
+      const limites = [...src.matchAll(/^(?:export )?(?:async )?(?:function|const|type|interface|class) /gm)]
+        .map((m) => m.index!)
+        .sort((a, b) => a - b);
+      for (let i = 0; i < cortes.length; i++) {
+        const desde = cortes[i]!.index!;
+        const hasta = limites.find((x) => x > desde) ?? src.length;
+        /* Sin comentarios, y no es un detalle: la nota que EXPLICA por qué una proyección
+         * fija el aislamiento contiene la palabra «aislamiento», así que sin quitarla el censo
+         * daba por declarada cualquier función que la mencionara — incluidas las cinco al
+         * quitarles la opción. Lo descubrí quitándosela una a una y viendo que ninguna
+         * enrojecía: es el mismo defecto que el censo del calendario ya tenía resuelto, y aquí
+         * lo repetí. */
+        const cuerpo = src
+          .slice(desde, hasta)
+          .replace(/\/\*[\s\S]*?\*\//g, '')
+          .replace(/\/\/[^\n]*/g, '');
+        const nombre = cortes[i]![1]!;
+        if (!cuerpo.includes('conUsuario(')) continue;
+        const sentencias = (cuerpo.match(/\btx(?:\.unsafe)?[`(]/g) ?? []).length;
+        // Solo ESCRITURAS LITERALES. El `(\s+\w+)?` del `update` es por el alias —`update
+        // gate_instancia g set …` no casaba sin él, y `aprobarGate` escribe y por tanto DEBE
+        // quedarse en READ COMMITTED—. Y NO se adivina «escribe» por llamar a una función con
+        // guion bajo: eso descartaba `panelDisposicion` y `listarAuditoria` por invocar
+        // `disposicion_motivo_no_ejecutable` y `workspace_role`, que solo leen. Lo que escribe
+        // llamando a una función definer se declara abajo, con su nombre y su motivo.
+        const escribe = /insert\s+into|update\s+\w+(\s+\w+)?\s+set|delete\s+from/i.test(cuerpo);
+        if (sentencias >= 2 && !escribe && !cuerpo.includes('aislamiento')) {
+          const clave = `${f.slice(raiz.length)}:${nombre}`;
+          if (!(clave in DECLARADAS)) sueltas.push(clave);
+        }
+      }
+    }
+    expect(sueltas.sort()).toEqual([]);
+  });
+
   it('el panel se lee de UNA instantánea: sus campos no vienen de dos momentos', async () => {
     /*
      * El panel son cuatro lecturas —cuenta, acuerdo, constancia y motivo—. Bajo READ
@@ -1683,35 +1764,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const rr = await leerConAcuerdoNuevoEnMedio('repeatable read');
     expect(rr.despues).toBe(rr.antes);
 
-    // Y que el panel PIDE esa instantánea. Se lee de su propio código porque la carrera no se
-    // puede provocar contra él desde fuera (arriba está el motivo, medido); sin esto, quitar
-    // la opción devolvería el defecto sin que nada se pusiera rojo.
-    const { readFile } = await import('node:fs/promises');
-    const fuente = await readFile(
-      new URL('../../lib/disposicion/disposicion.servicio.ts', import.meta.url).pathname,
-      'utf8',
-    );
-    const cuerpo = fuente.slice(
-      fuente.indexOf('export async function panelDisposicion'),
-      fuente.indexOf('export async function registrarAcuerdo'),
-    );
-    expect(cuerpo).toContain("aislamiento: 'repeatable read'");
-
-    // Y el MISMO problema en la auditoría, que este slice crea aunque el código sea ajeno:
-    // `listarAuditoria` lee la página de eventos y el catálogo de tipos en dos sentencias, y
-    // desde que existe la disposición acordada el libro puede VACIARSE entre una y otra —es
-    // la única operación del sistema que borra de `evento_dominio`, que por lo demás es
-    // append-only (comprobado: ninguna otra migración ni servicio lo borra)—. La pantalla
-    // recibía entonces eventos cuyos tipos no aparecen en su propio filtro.
-    const portal = await readFile(
-      new URL('../../lib/portal/portal.servicio.ts', import.meta.url).pathname,
-      'utf8',
-    );
-    const auditoria = portal.slice(
-      portal.indexOf('export async function listarAuditoria'),
-      portal.indexOf('function traducirEscritura'),
-    );
-    expect(auditoria).toContain("aislamiento: 'repeatable read'");
+    // Que el panel y la auditoría PIDAN esa instantánea lo comprueba el censo de la clase,
+    // arriba: al quitarles la opción salen nombradas. Aquí había dos lecturas del código
+    // fuente que hacían lo mismo peor —atadas a un nombre de función y a un `indexOf`—, y con
+    // el censo cubriendo las siete proyecciones sobran.
   });
 
   it('la retención se mide con un calendario FIJO, y no con el huso que elige quien llama', async () => {

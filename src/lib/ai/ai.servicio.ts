@@ -370,6 +370,17 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
  * de la MÁS ANTIGUA a la más nueva: una cola de revisión se drena por el frente, así que
  * el recorte cae siempre sobre lo recién llegado, que se ve en la siguiente pasada.
  */
+  /*
+   * REPEATABLE READ: es una proyección de SOLO LECTURA con varias sentencias, y desde que
+   * existe la disposición acordada los datos de un workspace pueden desaparecer entre una y
+   * otra. Bajo READ COMMITTED cada sentencia toma su instantánea, así que la respuesta podía
+   * mezclar dos momentos —y con la membresía ya borrada, la mitad tardía vuelve VACÍA por RLS,
+   * no corta—. Lo que llega a la pantalla no es entonces un estado incompleto: es uno que no
+   * ha existido nunca.
+   *
+   * No choca con la doctrina de aislamiento del esquema, que exige READ COMMITTED a las
+   * transacciones que ESCRIBEN y releen tras un candado: aquí no se escribe nada.
+   */
 export async function panelPropuestas(
   actorId: string,
   workspaceId: string,
@@ -613,7 +624,7 @@ export async function panelPropuestas(
       hayMasMaterial: personas.length > PAGINA_ANCLAS,
       busqueda,
     };
-  });
+  }, { aislamiento: 'repeatable read' });
 }
 
 type Alcance = {

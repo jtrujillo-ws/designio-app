@@ -147,6 +147,17 @@ async function archivosPorItem(
  * lista y devuelve la otra vacía: son dos recorridos distintos y mezclarlos duplicaría
  * payload sin que nadie lo mirara.
  */
+  /*
+   * REPEATABLE READ: es una proyección de SOLO LECTURA con varias sentencias, y desde que
+   * existe la disposición acordada los datos de un workspace pueden desaparecer entre una y
+   * otra. Bajo READ COMMITTED cada sentencia toma su instantánea, así que la respuesta podía
+   * mezclar dos momentos —y con la membresía ya borrada, la mitad tardía vuelve VACÍA por RLS,
+   * no corta—. Lo que llega a la pantalla no es entonces un estado incompleto: es uno que no
+   * ha existido nunca.
+   *
+   * No choca con la doctrina de aislamiento del esquema, que exige READ COMMITTED a las
+   * transacciones que ESCRIBEN y releen tras un candado: aquí no se escribe nada.
+   */
 export async function listarBandeja(
   actorId: string,
   workspaceId: string,
@@ -214,7 +225,7 @@ export async function listarBandeja(
         .map((f) => filaDeBandeja(f, adjuntos.get(f.id as string) ?? [])),
       hayMasDecididas: decididas.length > DECIDIDAS_RECIENTES,
     };
-  });
+  }, { aislamiento: 'repeatable read' });
 }
 
 /**
@@ -287,6 +298,17 @@ export const PAGINA_DERECHOS = 50;
  * reparación en el producto. El cursor viaja como id y su `(creado_en, id)` se resuelve
  * en la base: serializar el timestamp perdería microsegundos y saltaría o repetiría filas.
  */
+  /*
+   * REPEATABLE READ: es una proyección de SOLO LECTURA con varias sentencias, y desde que
+   * existe la disposición acordada los datos de un workspace pueden desaparecer entre una y
+   * otra. Bajo READ COMMITTED cada sentencia toma su instantánea, así que la respuesta podía
+   * mezclar dos momentos —y con la membresía ya borrada, la mitad tardía vuelve VACÍA por RLS,
+   * no corta—. Lo que llega a la pantalla no es entonces un estado incompleto: es uno que no
+   * ha existido nunca.
+   *
+   * No choca con la doctrina de aislamiento del esquema, que exige READ COMMITTED a las
+   * transacciones que ESCRIBEN y releen tras un candado: aquí no se escribe nada.
+   */
 export async function listarEvidenciaConDerechos(
   actorId: string,
   workspaceId: string,
@@ -345,7 +367,7 @@ export async function listarEvidenciaConDerechos(
       })),
       hayMas: filas.length > PAGINA_DERECHOS,
     };
-  });
+  }, { aislamiento: 'repeatable read' });
 }
 
 /**

@@ -638,6 +638,18 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       where proname = 'firmo_esta_disposicion'`;
     expect(f!.n).toBe(0);
 
+
+    // Y el ayudante que la sustituyó no repite su forma. `cuenta_activa` nació tomando el
+    // usuario como parámetro y con grant para el rol de aplicación: el mismo oráculo con otro
+    // nombre —siendo SECURITY DEFINER salta la RLS de `usuario`, así que con el sujeto en la
+    // firma se preguntaba por uuids ajenos—. Sin parámetro y sin grant, lo único preguntable
+    // es sobre uno mismo, y ni eso desde fuera.
+    const [ca] = await admin`select pg_get_function_arguments(oid) as args,
+        has_function_privilege('designio_app', oid, 'execute') as la_puede_llamar
+      from pg_proc where proname = 'cuenta_activa'`;
+    expect(ca!.args).toBe('');
+    expect(ca!.la_puede_llamar).toBe(false);
+
     // Y, más al fondo: la política de la constancia no invoca NINGUNA función SECURITY
     // DEFINER que no sea la que ya sostiene el resto de la casa. Derivado del catálogo, no
     // de una lista escrita aquí: si mañana alguien mete un ayudante nuevo en el predicado,

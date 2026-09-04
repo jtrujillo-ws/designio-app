@@ -235,7 +235,7 @@ begin
   -- Y con la cuenta activa: una desactivada a mitad de sesión conserva su membresía, así que
   -- `workspace_role` le sigue respondiendo. La exportación es la puerta que desbloquea una
   -- disposición, así que aquí también.
-  if not cuenta_activa(app_user_id()) then
+  if not cuenta_activa() then
     raise exception 'la cuenta que ejecuta la exportación no está activa'
       using errcode = 'insufficient_privilege';
   end if;
@@ -692,7 +692,7 @@ begin
   -- La cuenta activa, por el mismo motivo que en la ejecución y en la exportación: el grant de
   -- insert sobre esta tabla permite registrar un acuerdo por SQL crudo, y `is_workspace_member`
   -- no mira `usuario.estado`. Un acuerdo es la primera de las dos firmas de un borrado.
-  if not cuenta_activa(app_user_id()) then
+  if not cuenta_activa() then
     raise exception 'la cuenta que registra el acuerdo de disposición no está activa'
       using errcode = 'insufficient_privilege';
   end if;
@@ -807,7 +807,7 @@ begin
   if coalesce(v_rol, '') not in ('lead-boutique', 'admin-cliente') then
     return 'Solo el admin del cliente o el lead de la boutique ejecutan la disposición acordada';
   end if;
-  if not cuenta_activa(app_user_id()) then
+  if not cuenta_activa() then
     return 'Tu cuenta no está activa: una disposición acordada la ejecuta una persona en activo';
   end if;
 
@@ -941,15 +941,27 @@ end $$;
  * aquella la invocan las políticas RLS de 54 tablas, así que meterle el estado de la cuenta
  * cambia el comportamiento de todo el esquema y es un cambio que merece su propia medida y su
  * propio slice. Queda anotado; lo que este PR cierra es lo que este PR abre.
+ *
+ * ── Y sin parámetro, y sin grant ──
+ * La primera versión de esta función tomaba el usuario como argumento y se concedía a
+ * `designio_app`. Eso es un ORÁCULO, y del mismo modelo exacto que ya se corrigió en este
+ * mismo archivo: siendo SECURITY DEFINER salta la RLS de `usuario` por diseño, así que con el
+ * sujeto en la firma cualquiera con el grant preguntaba por uuids ajenos y distinguía una
+ * cuenta activa de una inactiva o inexistente. Es el defecto de `firmo_esta_disposicion`
+ * reintroducido con otro nombre, y por eso el remedio es el mismo: el usuario se deriva DENTRO
+ * de `app_user_id()`, y lo único preguntable es sobre uno mismo.
+ *
+ * El grant, además, no hacía falta: las cuatro puertas que la invocan son SECURITY DEFINER y
+ * corren como el dueño. Se concedía por inercia, copiando el de `exigir_read_committed`, que
+ * sí lo necesita porque a aquélla la llama un trigger que NO es definer.
  */
-create function cuenta_activa(p_user uuid) returns boolean
+create function cuenta_activa() returns boolean
 language sql stable security definer set search_path = public, pg_temp as $$
-  select exists (select 1 from usuario u where u.id = p_user and u.estado = 'activo')
+  select exists (select 1 from usuario u where u.id = app_user_id() and u.estado = 'activo')
 $$;
-revoke execute on function cuenta_activa(uuid) from public;
-grant execute on function cuenta_activa(uuid) to designio_app;
-comment on function cuenta_activa(uuid) is
-'Si la cuenta sigue activa. SECURITY DEFINER porque `usuario` no es legible por el rol de aplicación, y no es oráculo: responde false igual para una cuenta inactiva que para un uuid que no existe.';
+revoke execute on function cuenta_activa() from public;
+comment on function cuenta_activa() is
+'Si la cuenta de QUIEN LLAMA sigue activa. SECURITY DEFINER porque `usuario` no es legible por el rol de aplicación; sin parámetro y sin grant, para que no sirva de oráculo sobre cuentas ajenas.';
 
 create function exigir_read_committed(p_operacion text) returns void
 language plpgsql as $$
@@ -1025,7 +1037,7 @@ begin
   -- Y la cuenta tiene que seguir activa. Va aquí y no solo en el servicio porque esta función
   -- está concedida al rol de aplicación: una cuenta desactivada a mitad de sesión que conserve
   -- su membresía pasaba `is_workspace_member` sin más y llegaba hasta el borrado.
-  if not cuenta_activa(v_actor) then
+  if not cuenta_activa() then
     raise exception 'la cuenta que ejecuta la disposición no está activa'
       using errcode = 'insufficient_privilege';
   end if;

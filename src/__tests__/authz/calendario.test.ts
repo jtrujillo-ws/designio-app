@@ -17,11 +17,25 @@ import { describeAuthz } from './helpers';
  * valen, así que compararlos es seguro. Lo que no es seguro es colapsarlos a un día.
  */
 describeAuthz('el calendario de las garantías lo fija la base', () => {
+  /*
+   * El presupuesto de tiempo, explícito y no por omisión. Estas comprobaciones no son
+   * unitarias: la del catálogo crea ~150 sondas en la base y las lee de vuelta, y la de las
+   * plantillas analiza con el compilador de TypeScript TODO el `src` del repositorio. En local
+   * la más cara tarda 3,3 s; en el runner de CI, que además compila el árbol FUSIONADO —más
+   * ficheros que analizar—, cruzó los 5 s por omisión de vitest y el `Tests` salió rojo con un
+   * `Test timed out in 5000ms`, dos veces de cuatro, justo por encima del borde.
+   *
+   * No es aflojar nada: las aserciones son las mismas y ninguna se salta. Es dejar de medir un
+   * censo del esquema entero con el cronómetro de una función pura, y que crezca sin volver a
+   * enrojecer por el reloj en vez de por lo que vigila.
+   */
+  const PACIENCIA = 120_000;
+
   afterAll(async () => {
     await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
     await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
     await cerrarPools();
-  });
+  }, PACIENCIA);
 
   /**
    * Las palabras clave del reloj de pared. Son de la GRAMÁTICA, no funciones, así que no
@@ -2283,7 +2297,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       return false;
     };
-  });
+  }, PACIENCIA);
 
   /** Lo que hace culpable a un cuerpo: la palabra clave o cualquiera de las operaciones. */
   /**
@@ -4006,7 +4020,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(
       culpable('const p = sql`a $${n} ${/* uno /* dos */ v}, now()::date`;', 'ts'),
     ).toBe(true);
-  });
+  }, PACIENCIA);
 
   it('ninguna función lee el reloj de pared de quien la llama', async () => {
     /*
@@ -5293,7 +5307,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         await admin.unsafe(`drop function ${nombre}`);
       }
     }
-  });
+  }, PACIENCIA);
 
   it('ninguna política RLS lo lee tampoco', async () => {
     // Una política es el caso peor de todos: se evalúa ENTERA en la sesión de quien escribe,
@@ -5310,7 +5324,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       .map((p) => p.nombre as string)
       .filter((n) => !(n in DECLARADAS));
     expect(culpables).toEqual([]);
-  });
+  }, PACIENCIA);
 
   it('ni una vista, ni un CHECK, ni un default, ni una vista MATERIALIZADA, ni una REGLA', async () => {
     /*
@@ -5447,7 +5461,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       await admin`drop table censo_tmp_defecto cascade`;
       await admin`drop function censo_tmp_guard()`;
     }
-  });
+  }, PACIENCIA);
 
   it('ni el SQL de la aplicación, que es por donde volvió', async () => {
     /*
@@ -5496,7 +5510,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       if (culpable(codigo, 'ts')) culpables.push(f.slice(raiz.length + 1));
     }
     expect(culpables.filter((c) => !(c in DECLARADAS))).toEqual([]);
-  });
+  }, PACIENCIA);
 
   it('la ventana de medición no se alarga cambiando de huso', async () => {
     /*
@@ -5532,5 +5546,5 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // es la que corresponde a la fecha de la base, que a esta altura ya pasó o es hoy.
     const [hoy] = await admin`select (timezone('UTC', now()))::date as d`;
     expect(respuestas['UTC']).toBe(temprana >= (hoy!.d as Date).toISOString().slice(0, 10));
-  });
+  }, PACIENCIA);
 });

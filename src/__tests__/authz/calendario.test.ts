@@ -1107,17 +1107,28 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       String.raw`\b(\w+)\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*(?::=|;|:)`,
       'gi',
     );
+    /*
+     * Y lo que se asigna se mira con las MISMAS hojas que lo que se devuelve, que es la lección
+     * de aquí al lado escrita una vez más: `declare d date; begin d := coalesce(now(), now());`
+     * colapsa igual (medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12)
+     * y exigir el reloj pegado al `:=` lo dejaba pasar. El destino tipado y la asignación son
+     * dos puertas del mismo sitio: si una sigue el valor y la otra no, la que no lo sigue es
+     * por donde se entra.
+     */
     RELOJ_ASIGNADO_A_VARIABLE = (texto: string): boolean => {
       const nombres = [...texto.matchAll(DECLARADAS_SIN_HUSO)].map((m) => m[1]!);
       if (nombres.length === 0) return false;
       const cualquiera = nombres.map((n) => n.replace(/[^\w]/g, '')).join('|');
-      return (
-        new RegExp(String.raw`\b(?:${cualquiera})\s*:=\s*(?:${RELOJ})\s*;`, 'i').test(texto) ||
-        new RegExp(
-          String.raw`\bselect\s+(?:${RELOJ})\s+into\s+(?:strict\s+)?(?:${cualquiera})\b`,
-          'i',
-        ).test(texto)
-      );
+      const derechas = [
+        ...texto.matchAll(new RegExp(String.raw`\b(?:${cualquiera})\s*:=\s*([^;]*)`, 'gi')),
+        ...texto.matchAll(
+          new RegExp(
+            String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?(?:${cualquiera})\b`,
+            'gi',
+          ),
+        ),
+      ].map((m) => m[1]!);
+      return derechas.some((d) => hojasDelValor(d).some((hoja) => RELOJ_A_SECAS.test(hoja)));
     };
   });
 
@@ -2818,6 +2829,25 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // dan lo mismo en husos opuestos (2026-09-04 y 2026-01-01, medidas). La primera es el
       // arreglo canónico de este PR; la segunda devuelve una columna y usa el reloj solo para
       // filtrar. Sin ellas, seguir el valor y buscar dentro se verían igual de verdes.
+      // Y la envoltura también en lo que se ASIGNA, que es la misma puerta por el otro lado.
+      // Medidas las dos: 2026-09-05 contra 2026-09-04.
+      [
+        'censo_probe_variable_coalesce_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin d := coalesce(now(), now()); return d; end $c$',
+      ],
+      [
+        'censo_probe_into_coalesce_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin select coalesce(now(), now()) into d; return d; end $c$',
+      ],
+      // Y su pareja segura: la misma envoltura sobre una variable CON huso conserva el
+      // instante, así que seguir el valor no puede enrojecerla.
+      [
+        'censo_probe_variable_coalesce_instante',
+        'returns timestamptz language plpgsql as $c$ declare d timestamptz;' +
+          ' begin d := coalesce(now(), now()); return d; end $c$',
+      ],
       [
         'censo_probe_ok_huso_fijo_date',
         "returns date language plpgsql as $c$ begin return timezone('UTC', now())::date; end $c$",
@@ -2879,6 +2909,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_greatest_date',
           'censo_probe_case_date',
           'censo_probe_coalesce_sql_date',
+          'censo_probe_variable_coalesce_date',
+          'censo_probe_into_coalesce_date',
         ].sort(),
       );
     } finally {
@@ -2901,6 +2933,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_greatest_date',
         'censo_probe_case_date',
         'censo_probe_coalesce_sql_date',
+        'censo_probe_variable_coalesce_date',
+        'censo_probe_into_coalesce_date',
+        'censo_probe_variable_coalesce_instante',
         'censo_probe_ok_huso_fijo_date',
         'censo_probe_ok_subconsulta_date',
       ]) {

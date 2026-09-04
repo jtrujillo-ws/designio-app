@@ -34,6 +34,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   afterAll(async () => {
     await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
     await sqlAdmin().unsafe('drop table if exists censo_probe_particionada cascade');
+    await sqlAdmin().unsafe('drop table if exists "CensoProbeCitada"');
     await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
     await cerrarPools();
   }, PACIENCIA);
@@ -293,6 +294,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     await sqlAdmin().unsafe(
       'create table censo_probe_particionada_p0 partition of censo_probe_particionada' +
         ' for values from (0) to (1000)',
+    );
+    /*
+     * Y una con el nombre y la columna CITADOS en mayúsculas, que es donde se ve si la
+     * canonicalización se aplica a los dos lados: el catálogo la entrega como `T`/`D`, y un
+     * cuerpo que escriba `insert into "T"("D") …` busca exactamente eso.
+     */
+    await sqlAdmin().unsafe('drop table if exists "CensoProbeCitada"');
+    await sqlAdmin().unsafe(
+      'create table "CensoProbeCitada" ("K" int primary key, "FechaCitada" date)',
     );
     await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
     await sqlAdmin().unsafe(
@@ -1816,7 +1826,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
             : dinamico === null
               ? t
               : dinamico[1]!.replace(/^[A-Za-z_]*&?'/, '').replace(/'$/, '').replace(/''/g, "'");
-        return /^\s*select\b/i.test(sql) ? proyectadas(sql) : [];
+        /*
+         * Y no solo `select`: un `for … in values (now()) loop` asigna igual —medido, el mismo
+         * par de fechas—, y una consulta puede venir encabezada por su propio `WITH`.
+         */
+        const tras = /^\s*with\b/i.test(sql) ? finDeLosCTEs(sql, sql.search(/\bwith\b/i) + 4) : 0;
+        const cuerpo = tras === null ? sql : sql.slice(tras);
+        if (/^\s*select\b/i.test(cuerpo)) return proyectadas(cuerpo);
+        const filas = /^\s*values\s*\(/i.exec(cuerpo);
+        if (filas === null) return [];
+        const dentro = parejaDeParentesis(cuerpo, filas[0].length - 1);
+        return dentro === null ? [] : argumentosDe(dentro).map(sinAlias);
       };
       /** `<destinos>` de un `into` o de un `for`, en minúsculas y sin comillas. */
       const listaDeDestinos = (t: string): string[] =>
@@ -1924,10 +1944,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       columna: string;
       tipo: string;
     }[]) {
-      TIPO_DE_COLUMNA.set(`${f.tabla.toLowerCase()}.${f.columna.toLowerCase()}`, f.tipo);
-      const ya = COLUMNAS_EN_ORDEN.get(f.tabla.toLowerCase()) ?? [];
-      ya.push(f.columna.toLowerCase());
-      COLUMNAS_EN_ORDEN.set(f.tabla.toLowerCase(), ya);
+      /*
+       * Las claves van con el nombre TAL CUAL lo da el catálogo, que ya es el canónico:
+       * plegarlo otra vez rompe justo los citados. Medido: `create table "T" ("D" date)` se
+       * inventariaba como `t.d`, y `insert into "T"("D") values (now())` busca `T.D` —que es
+       * lo correcto—, no lo encuentra, y la escritura salía limpia (2026-09-05 en
+       * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12).
+       *
+       * Es la misma lección que el nombre de las variables, un sitio más: canonicalizar es una
+       * regla, y aplicarla en un lado y no en el otro es no aplicarla.
+       */
+      TIPO_DE_COLUMNA.set(`${f.tabla}.${f.columna}`, f.tipo);
+      const ya = COLUMNAS_EN_ORDEN.get(f.tabla) ?? [];
+      ya.push(f.columna);
+      COLUMNAS_EN_ORDEN.set(f.tabla, ya);
     }
 
     /**
@@ -4857,6 +4887,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * el destino ENTRECOMILLADO con mayúsculas —que hay que canonicalizar igual a los dos
        * lados— y el modificador `SLICE <n>` del `FOREACH`, que va entre el destino y el array.
        */
+      /*
+       * Dos formas más, medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12: la tabla y la columna CITADAS en mayúsculas —donde se ve si la
+       * canonicalización se aplica a los dos lados— y el `for … in values`.
+       */
+      [
+        'censo_probe_tabla_citada_mayus_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into "CensoProbeCitada"("K", "FechaCitada") values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_bucle_values_date',
+        'returns void language plpgsql as $c$ declare d date; begin' +
+          ' for d in values (now()) loop' +
+          ' insert into censo_probe_escritura(k, d) values (1, d); end loop; end $c$',
+      ],
       [
         'censo_probe_destino_citado_mayus_date',
         'returns void language plpgsql as $c$ declare "D" date; begin' +
@@ -5383,6 +5429,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_tabla_unicode_date',
           'censo_probe_returning_into_date',
           'censo_probe_execute_dolar_into_date',
+          'censo_probe_tabla_citada_mayus_date',
+          'censo_probe_bucle_values_date',
           'censo_probe_destino_citado_mayus_date',
           'censo_probe_foreach_slice_date',
           'censo_probe_foreach_date',
@@ -5513,6 +5561,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_alias_fecha_fija',
         'censo_probe_returning_into_date',
         'censo_probe_execute_dolar_into_date',
+        'censo_probe_tabla_citada_mayus_date',
+        'censo_probe_bucle_values_date',
         'censo_probe_destino_citado_mayus_date',
         'censo_probe_foreach_slice_date',
         'censo_probe_foreach_date',
@@ -5636,6 +5686,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     await admin`create table censo_tmp_defecto (d date default now(), t timestamptz default now())`;
     // Y una REGLA de reescritura, por lo mismo que la matview: hoy no hay ninguna real
     // (medido: cero), así que sin sonda su rama estaría en verde por no mirar nada.
+    /*
+     * El dominio va con su sonda por lo mismo que la matview y la regla: el esquema real no
+     * tiene ninguno hoy, así que cero es el conteo correcto y no prueba nada.
+     *
+     * Y la culpable lleva `now()` y no `current_date` a propósito: con `current_date` la caza
+     * cualquier reconocedor y la sonda no probaría que a esta rama se le pasa el TIPO BASE del
+     * dominio. Con `now()` sobre una base `date`, lo único que la hace culpable es ese tipo
+     * —medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12—, y su pareja
+     * segura es el mismo `now()` sobre una base con huso.
+     */
+    await admin`create domain censo_tmp_dominio as date default now()`;
+    await admin`create domain censo_tmp_dominio_ok as timestamptz default now()`;
     await admin`create table censo_tmp_regla_log (d date)`;
     await admin`create rule censo_tmp_regla as on insert to censo_tmp_tabla
       do also insert into censo_tmp_regla_log values (current_date)`;
@@ -5660,6 +5722,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         join pg_class rel on rel.oid = a.attrelid
         join pg_namespace n2 on n2.oid = rel.relnamespace
         where n2.nspname = 'public'`,
+      /*
+       * Y el DEFAULT de un DOMINIO, que es el octavo sitio y no estaba: no vive en
+       * `pg_attrdef` sino en `pg_type.typdefaultbin`, y se vuelve a evaluar en cada `INSERT`
+       * que omita una columna de ese dominio sin default propio. Medido: un dominio sobre
+       * `date` con `default current_date` guarda 2026-09-05 en Pacific/Kiritimati y 2026-09-04
+       * en Etc/GMT+12.
+       *
+       * El tipo que decide es el BASE del dominio, no el dominio: es sobre él sobre el que
+       * Postgres coerciona.
+       */
+      dominio: await admin`select t.typname as nombre,
+             pg_get_expr(t.typdefaultbin, 0) as cuerpo,
+             format_type(t.typbasetype, t.typtypmod) as tipo
+        from pg_type t join pg_namespace n on n.oid = t.typnamespace
+        where n.nspname = 'public' and t.typtype = 'd' and t.typdefaultbin is not null`,
       matview: await admin`select matviewname as nombre, definition as cuerpo
         from pg_matviews where schemaname = 'public'`,
       // La condición `WHEN` de un trigger no vive en el cuerpo de su función: vive en
@@ -5698,6 +5775,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // con ella en vez de con un conteo — cero es el conteo correcto y no prueba nada.
       matview: 1,
       regla: 1,
+      // Dos: el dominio de la sonda y su pareja segura. Tampoco hay ninguno real todavía.
+      dominio: 2,
     };
       for (const [nombre, filas] of Object.entries(categorias)) {
         expect(filas.length, `la rama «${nombre}» no está mirando nada`).toBeGreaterThanOrEqual(
@@ -5716,6 +5795,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           matview: ['matview censo_tmp_matview'],
           trigger: ['trigger censo_tmp_trg on censo_tmp_tabla'],
           regla: ['regla censo_tmp_tabla / censo_tmp_regla'],
+          dominio: ['dominio censo_tmp_dominio'],
         };
         expect(culpables).toEqual(esperadas[nombre] ?? []);
       }
@@ -5723,6 +5803,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       await admin`drop materialized view censo_tmp_matview`;
       await admin`drop table censo_tmp_tabla cascade`;
       await admin`drop table censo_tmp_regla_log cascade`;
+      await admin`drop domain censo_tmp_dominio cascade`;
+      await admin`drop domain censo_tmp_dominio_ok cascade`;
       await admin`drop table censo_tmp_defecto cascade`;
       await admin`drop function censo_tmp_guard()`;
     }

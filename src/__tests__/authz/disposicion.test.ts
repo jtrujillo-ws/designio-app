@@ -1816,6 +1816,23 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         return t;
       };
       /**
+       * Y los ALIAS de un módulo —`const abrir = conUsuario;`—, que también hacen falta para
+       * los AJENOS: el predicado de «esto abre una transacción» se resuelve contra ellos, y
+       * cerrado sobre los del módulo que LLAMA no reconoce el alias del que se analiza.
+       */
+      const aliasDe = (f: TS.SourceFile) => {
+        const m = new Map<string, string>();
+        for (const st of f.statements) {
+          if (!ts.isVariableStatement(st)) continue;
+          for (const d of st.declarationList.declarations) {
+            if (!ts.isIdentifier(d.name) || !d.initializer) continue;
+            const v2 = desenvolver(d.initializer);
+            if (ts.isIdentifier(v2)) m.set(d.name.text, v2.text);
+          }
+        }
+        return m;
+      };
+      /**
        * Y de dónde viene un nombre IMPORTADO: se busca su `import`, se resuelve la ruta
        * relativa —con `.ts` y con `/index.ts`— y se mira la tabla de ESE módulo. Si el
        * ayudante llama a su vez a otro que tampoco se resuelve, el desconocimiento se propaga
@@ -1851,9 +1868,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           for (const cand of [`${raizMod}.ts`, `${raizMod}/index.ts`]) {
             const texto2 = fuentesDelRepo.get(cand);
             if (texto2 === undefined) continue;
-            const tabla = tablaDe(parsear(cand, texto2));
+            const ajeno = parsear(cand, texto2);
+            const tabla = tablaDe(ajeno);
             const nodo = tabla.get(local);
-            if (nodo) return { nodo, tabla };
+            if (nodo) return { nodo, tabla, alias: aliasDe(ajeno) };
           }
           return undefined;
         }
@@ -1998,6 +2016,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         nodo: TS.Node,
         tx: string,
         tabla: Map<string, TS.Node> = porNombre,
+        aliasMod: Map<string, string> = alias,
       ): { sentencias: number; escribe: boolean; desconocido: boolean } => {
         let sentencias = 0;
         let escribe = false;
@@ -2036,7 +2055,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
            * no en el otro: dos recorridos que discrepan es la forma en que esto falla callado,
            * y lo escribí como riesgo una vuelta antes de cometerlo.
            */
-          if (ts.isCallExpression(n) && esApertura(n)) return;
+          if (ts.isCallExpression(n) && esApertura(n, aliasMod)) return;
           if (ts.isCallExpression(n)) {
             const f = n.expression;
             const esUnsafe =
@@ -2079,7 +2098,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
               const txDelAyudante = destino ? primerParametro(destino) : undefined;
               if (destino && txDelAyudante && !enCurso.has(destino)) {
                 enCurso.add(destino);
-                const sub = analizar(destino, txDelAyudante, tabla);
+                const sub = analizar(destino, txDelAyudante, tabla, aliasMod);
                 enCurso.delete(destino);
                 escribe ||= sub.escribe;
                 desconocido ||= sub.desconocido;
@@ -2093,7 +2112,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
                 const txAjeno = fuera ? primerParametro(fuera.nodo) : undefined;
                 if (fuera && txAjeno && !enCurso.has(fuera.nodo)) {
                   enCurso.add(fuera.nodo);
-                  const sub = analizar(fuera.nodo, txAjeno, fuera.tabla);
+                  const sub = analizar(fuera.nodo, txAjeno, fuera.tabla, fuera.alias);
                   enCurso.delete(fuera.nodo);
                   escribe ||= sub.escribe;
                   desconocido ||= sub.desconocido;
@@ -2180,18 +2199,18 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        * `import * as`. Las dos últimas las encontré probando, después de escribir que eran el
        * hueco que le quedaba al cierre.
        */
-      const abreTransaccion = (nombre: string) => {
+      const abreTransaccion = (nombre: string, mapa: Map<string, string> = alias) => {
         const vistos = new Set<string>();
         let actual: string | undefined = nombre;
         while (actual !== undefined && !vistos.has(actual)) {
           if (actual === 'conUsuario') return true;
           vistos.add(actual);
-          actual = alias.get(actual);
+          actual = mapa.get(actual);
         }
         return false;
       };
-      const esApertura = (n: TS.CallExpression) =>
-        (ts.isIdentifier(n.expression) && abreTransaccion(n.expression.text)) ||
+      const esApertura = (n: TS.CallExpression, mapa: Map<string, string> = alias) =>
+        (ts.isIdentifier(n.expression) && abreTransaccion(n.expression.text, mapa)) ||
         (ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === 'conUsuario');
       /**
        * Lo que envuelve a un valor sin cambiarlo: `(f) satisfies T`, `f as T`, `(f)`, `f!`.
@@ -2548,7 +2567,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         return { a, b };
       });`;
     const FUENTE_SONDA = `
-      import { leerDosAjenas, leerUnaAjena, ajenoQueAnidaYEscribe } from '@/lib/sonda/ayudante';
+      import { leerDosAjenas, leerUnaAjena, ajenoQueAnidaYEscribe, ajenoQueAnidaPorAlias } from '@/lib/sonda/ayudante';
       import { leerDeModuloAusente } from '@/lib/sonda/no-existe';
       ${cuerpo('sondaModificador').replace('const sondaModificador', 'export const sondaModificador')}
       ${cuerpo('sondaClausula')}
@@ -2741,6 +2760,15 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a, b };
         });
       export { sondaOkUnsafe };
+      // Y la misma anidada, pero abierta por un ALIAS declarado en el modulo AJENO. El
+      // predicado tiene que viajar con la tabla: cerrado sobre los alias del modulo que
+      // llama, no reconoce el alias del que se analiza y no corta.
+      export const sondaAjenoQueAnidaPorAlias = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const c = await ajenoQueAnidaPorAlias(tx);
+          return { a, c };
+        });
       // Cruzar modulo Y anidar a la vez, la combinacion que no tenia sonda. El ayudante ajeno
       // abre SU transaccion y escribe en ella, y su callback llama tx a la suya igual que el de
       // fuera: por eso no se pueden distinguir por el nombre de la etiqueta y el CORTE es lo
@@ -2864,6 +2892,12 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
          const [a] = await tx\`select 1 as x\`;
          return a;
        };
+       const abrirAjeno = conUsuario;
+       export const ajenoQueAnidaPorAlias = async (tx: TransactionSql) => {
+         const [a] = await tx\`select 1 as x\`;
+         await abrirAjeno('otro', async (tx) => tx\`insert into t (x) values (1)\`);
+         return a;
+       };
        export const ajenoQueAnidaYEscribe = async (tx: TransactionSql) => {
          const [a] = await tx\`select 1 as x\`;
          await conUsuario('otro', async (tx) => tx\`insert into t (x) values (1)\`);
@@ -2904,6 +2938,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaAyudanteAjeno',
         'sonda.ts:sondaMensajeEscritura',
         'sonda.ts:sondaAjenoQueAnida',
+        'sonda.ts:sondaAjenoQueAnidaPorAlias',
         // Con el corte puesto, la anidada cuenta como transacción PROPIA: por eso la exterior
         // lleva sufijo. La interior escribe y no sale, que es lo correcto.
         'sonda.ts:sondaAnidadaPorPropiedad#1',

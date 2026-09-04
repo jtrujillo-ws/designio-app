@@ -32,6 +32,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * se marca.
    */
   const PRECISION = String.raw`(?:\s*\(\s*\d+\s*\))?`;
+  /*
+   * Las cuatro cadenas que Postgres NO trata como dato. `'now'`, `'today'`, `'tomorrow'` y
+   * `'yesterday'` se EVALÚAN contra el reloj de la sesión en cuanto se castean a un tipo
+   * temporal, así que son expresiones escritas entre comillas. Medido en husos opuestos:
+   * `'today'::date` da 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12,
+   * `'now'::timestamp` da la hora de pared de cada uno, y `'yesterday'`/`'tomorrow'` se mueven
+   * con ellas. Las otras especiales —`'epoch'`, `'infinity'`, `'allballs'`— son fijas, medidas
+   * las tres, y no entran.
+   *
+   * Postgres las reconoce sin distinguir mayúsculas y recortando los espacios de los bordes
+   * (medido: `' NOW '::date` y `'NOW'::date` son la misma lectura), así que aquí igual.
+   */
+  const ESPECIAL_TEMPORAL = /^\s*(?:now|today|tomorrow|yesterday)\s*$/i;
   const PALABRAS_DEL_RELOJ = [
     // De más larga a más corta: con `current_time` delante, la alternación la casaba dentro
     // de `current_timestamp` y el resto quedaba suelto. (Con la frontera derecha puesta ya no
@@ -251,14 +264,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(Number(desfases!.con_segundos_en_1900)).toBeGreaterThan(0);
     CAMPOS_SEGUROS = campos.join('|');
     UNIDADES_SEGURAS = unidades.join('|');
-    RELOJES = [
-      // Las funciones llevan su frontera IZQUIERDA —sin ella, `mi_now()` salía marcado— o la
-      // comilla de apertura, que separa igual. A la derecha no hace falta, porque el `(` cierra.
-      ...funciones,
-      // Y TODAS las palabras: colapsar cualquiera de ellas a un día es peligroso, aunque la
-      // palabra desnuda no lo sea.
-      ...PALABRAS_DEL_RELOJ.map(patronDe),
-    ].join('|');
 
     /*
      * Cuáles de esas palabras son peligrosas POR SÍ SOLAS, sin colapsar nada. No se decide a
@@ -341,7 +346,64 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // Y el esquema, entrecomillado o no: `now()::"pg_catalog".date` es el mismo cast
     // (medido). Un identificador entre comillas dobles es un NOMBRE, no un dato.
     const ESQUEMA = String.raw`(?:(?:\w+|"\w+")\s*\.\s*)?`;
-    const CASTOS = String.raw`(?:\s*::\s*${ESQUEMA}(?:${TIPO_DE_TIEMPO}))*`;
+    /*
+     * El destino de los CASTS incluye además el TEXTO. Serializar un reloj es elegir día igual
+     * que `to_char`: medido, `now()::text` da «2026-09-05 00:08…+14» y «2026-09-03 22:08…-12»,
+     * y una regla escrita sobre `substring(now()::text, 1, 10)` decide con el huso de quien
+     * llama. Va aparte de `TIPO_SIN_HUSO` a propósito: en una COMPARACIÓN mixta el texto no
+     * es el caso —ahí lo que importa es la promoción de un temporal sin huso— así que el
+     * operando de aquellas sigue siendo el otro.
+     */
+    /*
+     * Los nombres COMPLETOS: `character varying` y `character` son como se escribe en SQL
+     * estándar y como Postgres deparsea `varchar`. De más largo a más corto, que si no
+     * `character` casa dentro de `character varying` y deja el resto suelto.
+     *
+     * Y el texto tiene una salida: si el cast a texto es solo un PASO y se vuelve a un tipo
+     * CON huso, la ida y vuelta recupera el mismo instante —medido: `now()::text::timestamptz`
+     * es estable, porque la representación lleva el desfase—. Marcar eso sería un falso
+     * positivo sobre una serialización correcta. Volver a un tipo SIN huso sigue eligiendo
+     * calendario (`now()::text::date` depende, medido), y ese lo caza el destino de siempre.
+     */
+    // `character` lleva su propia guardia contra `varying`: el ORDEN de las alternativas no
+    // basta, porque el motor RETROCEDE. Con `character varying::timestamptz`, la alternativa
+    // larga la rechaza el lookahead de la vuelta, y entonces el motor prueba la corta —hay
+    // frontera de palabra antes del espacio— que ya no ve el cast de vuelta y la marca.
+    const TIPO_TEXTUAL = String.raw`(?:"(?:text|varchar|bpchar)"${PRECISION}|character\s+varying\b${PRECISION}|character\b(?!\s+varying)${PRECISION}|varchar\b${PRECISION}|bpchar\b${PRECISION}|text\b)`;
+    // Con un `)` opcional en medio: Postgres deparsea `now()::text::timestamptz` como
+    // `((now())::text)::timestamp with time zone`, o sea que el cast de vuelta NO va pegado al
+    // nombre del tipo sino detrás del paréntesis que cierra. Sin admitirlo, la forma del
+    // CATÁLOGO —la única que las sondas pueden ejercitar— salía marcada igual.
+    // Entrecomillados también, por lo mismo — y aquí el efecto es el CONTRARIO: sin ellos,
+    // `now()::text::"timestamptz"` salía marcada siendo una ida y vuelta que recupera el
+    // instante (medido por epoch: idéntico en Kiritimati y en Etc/GMT+12). Un falso positivo
+    // sobre código correcto.
+    const TIPO_CON_HUSO = String.raw`(?:"(?:timestamptz|timetz)"|timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)`;
+    /*
+     * Y la IDA Y VUELTA por texto es un PASO de la cadena, no un final. `now()::text::timestamptz`
+     * recupera el mismo instante —medido por epoch: 1788537725 en Kiritimati y en Etc/GMT+12— y por
+     * eso el destino de más abajo no la marca. Pero seguir siendo el mismo instante es exactamente
+     * lo que la hace un RELOJ, y el reloj se paraba ante el paso por texto: la cadena de castos solo
+     * admitía tipos de tiempo, así que `date_trunc('day', now()::text::timestamptz)` se escapaba
+     * entera —medido: `2026-09-05 00:00:00+14` en Kiritimati y `2026-09-04 00:00:00-12` en
+     * Etc/GMT+12—, y con ella `to_char(now()::text::timestamptz, 'YYYY-MM-DD')` (2026-09-05 contra
+     * 2026-09-04) y `concat(now()::text::timestamptz)`, que renderiza el instante con el huso de
+     * quien llama. No era un agujero de `date_trunc`: era el reloj que no atravesaba, y por eso el
+     * arreglo va donde se define el reloj y no en el patrón que lo consume.
+     *
+     * La vuelta va como ASERCIÓN, sin consumirse: el paso por texto cuenta como reloj SOLO si detrás
+     * vuelve un tipo con huso, porque es la vuelta —y no el paso— lo que conserva el instante. El
+     * `)` opcional en medio es el del deparseador: `((now())::text)::timestamp with time zone`.
+     *
+     * Dicho con la misma honestidad que la precisión de más abajo: la ASERCIÓN no mueve ninguna
+     * sonda. Vaciándola no enrojece nada, y buscando el falso positivo que la justificara no lo hay,
+     * porque `now()::text` a secas NO es seguro en ningún caso de este censo —ya lo caza el destino,
+     * con vuelta o sin ella—. Se queda porque dice la verdad de por qué esto es un reloj: si el
+     * criterio se relaja a «cualquier paso por texto», la próxima regla que se escriba sobre `RELOJ`
+     * heredará una definición falsa y nadie sabrá por qué. Medido, no supuesto.
+     */
+    const VUELVE_CON_HUSO = String.raw`(?=(?:\s*\))*\s*::\s*${ESQUEMA}(?:${TIPO_CON_HUSO}))`;
+    const CASTOS = String.raw`(?:\s*::\s*${ESQUEMA}(?:${TIPO_DE_TIEMPO}|(?:${TIPO_TEXTUAL})${VUELVE_CON_HUSO}))*`;
     const entreParentesis = (x: string) => String.raw`(?:${x}|\(\s*(?:${x})\s*\))`;
     /*
      * Y la ARITMÉTICA, porque una garantía ajusta el instante antes de colapsarlo:
@@ -379,6 +441,45 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     const CASTO = String.raw`(?:\s*::\s*[\w. ]+)?`;
     const literalDe = (contenido: string) => String.raw`${PREFIJO}'(?:${contenido})'${CASTO}`;
     const envuelto = (x: string) => String.raw`(?:\(\s*)?(?:${x})(?:\s*\))?`;
+    /*
+     * Y AQUÍ se cierra la lista de relojes, y no arriba con las palabras, porque falta uno que
+     * necesita saber qué tipos llevan huso: el reloj escrito como LITERAL.
+     *
+     * `'now'::timestamptz` es el mismo instante que `now()` —medido por epoch: 1788538089 en
+     * Pacific/Kiritimati y en Etc/GMT+12—, o sea que no es un hallazgo por sí solo pero es un
+     * RELOJ, y todo lo que este censo prohíbe hacerle a `now()` estaba permitido escribiéndolo
+     * así. Metido en la lista, lo heredan de golpe el destino, `date_trunc`, `to_char`, la
+     * comparación mixta, los serializadores y el `||`, que es lo que se gana definiendo el
+     * reloj en un sitio.
+     *
+     * Va con el tipo EXIGIDO, en las dos sintaxis, y esa es la diferencia entre esto y marcar
+     * la palabra: `'now'` a secas es un dato como cualquier otro —`concat('now')` devuelve la
+     * cadena, y `jsonb_build_object('now', x)` es una clave— y marcarla sería el falso positivo
+     * que acaba con el censo desactivado. Solo cuenta cuando lleva encima un tipo temporal, que
+     * es exactamente cuando Postgres la evalúa.
+     */
+    const AHORA_LITERAL = String.raw`${PREFIJO}'\s*now\s*'`;
+    /*
+     * Y sus tres hermanas, que no son relojes sino el calendario YA leído: `'today'`,
+     * `'tomorrow'` y `'yesterday'` no conservan el instante ni siquiera con huso —medido:
+     * `'today'::timestamptz` da epoch 1788516000 en Pacific/Kiritimati y 1788523200 en
+     * Etc/GMT+12, dos instantes distintos—, así que con CUALQUIER tipo temporal encima son un
+     * hallazgo, y por eso van aparte y no en la lista de relojes.
+     */
+    const DIA_LITERAL = String.raw`${PREFIJO}'\s*(?:today|tomorrow|yesterday)\s*'`;
+    RELOJES = [
+      // Las funciones llevan su frontera IZQUIERDA —sin ella, `mi_now()` salía marcado— o la
+      // comilla de apertura, que separa igual. A la derecha no hace falta, porque el `(` cierra.
+      ...funciones,
+      // Y TODAS las palabras: colapsar cualquiera de ellas a un día es peligroso, aunque la
+      // palabra desnuda no lo sea.
+      ...PALABRAS_DEL_RELOJ.map(patronDe),
+      // El literal con su tipo detrás y con su tipo delante: `'now'::timestamptz` y
+      // `timestamptz 'now'` (medidas las dos, mismo epoch en husos opuestos).
+      String.raw`${AHORA_LITERAL}\s*::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})`,
+      String.raw`(?<![\w.])${ESQUEMA}(?:${TIPO_CON_HUSO})\s*${AHORA_LITERAL}`,
+    ].join('|');
+
     // Un grupo entre paréntesis con UN nivel de anidamiento dentro, porque así llega del
     // deparseador: `interval '1 day' * 2` se guarda como
     // `('1 day'::interval * (2)::double precision)`, con el número casteado dentro de su
@@ -462,39 +563,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     const SIN_HUSO = String.raw`date|time|timestamp`;
     const TIPO_SIN_HUSO = String.raw`(?:"(?:${SIN_HUSO})"${PRECISION}|(?!(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)(?:${SIN_HUSO})\b${PRECISION})`;
-    /*
-     * El destino de los CASTS incluye además el TEXTO. Serializar un reloj es elegir día igual
-     * que `to_char`: medido, `now()::text` da «2026-09-05 00:08…+14» y «2026-09-03 22:08…-12»,
-     * y una regla escrita sobre `substring(now()::text, 1, 10)` decide con el huso de quien
-     * llama. Va aparte de `TIPO_SIN_HUSO` a propósito: en una COMPARACIÓN mixta el texto no
-     * es el caso —ahí lo que importa es la promoción de un temporal sin huso— así que el
-     * operando de aquellas sigue siendo el otro.
-     */
-    /*
-     * Los nombres COMPLETOS: `character varying` y `character` son como se escribe en SQL
-     * estándar y como Postgres deparsea `varchar`. De más largo a más corto, que si no
-     * `character` casa dentro de `character varying` y deja el resto suelto.
-     *
-     * Y el texto tiene una salida: si el cast a texto es solo un PASO y se vuelve a un tipo
-     * CON huso, la ida y vuelta recupera el mismo instante —medido: `now()::text::timestamptz`
-     * es estable, porque la representación lleva el desfase—. Marcar eso sería un falso
-     * positivo sobre una serialización correcta. Volver a un tipo SIN huso sigue eligiendo
-     * calendario (`now()::text::date` depende, medido), y ese lo caza el destino de siempre.
-     */
-    // `character` lleva su propia guardia contra `varying`: el ORDEN de las alternativas no
-    // basta, porque el motor RETROCEDE. Con `character varying::timestamptz`, la alternativa
-    // larga la rechaza el lookahead de la vuelta, y entonces el motor prueba la corta —hay
-    // frontera de palabra antes del espacio— que ya no ve el cast de vuelta y la marca.
-    const TIPO_TEXTUAL = String.raw`(?:"(?:text|varchar|bpchar)"${PRECISION}|character\s+varying\b${PRECISION}|character\b(?!\s+varying)${PRECISION}|varchar\b${PRECISION}|bpchar\b${PRECISION}|text\b)`;
-    // Con un `)` opcional en medio: Postgres deparsea `now()::text::timestamptz` como
-    // `((now())::text)::timestamp with time zone`, o sea que el cast de vuelta NO va pegado al
-    // nombre del tipo sino detrás del paréntesis que cierra. Sin admitirlo, la forma del
-    // CATÁLOGO —la única que las sondas pueden ejercitar— salía marcada igual.
-    // Entrecomillados también, por lo mismo — y aquí el efecto es el CONTRARIO: sin ellos,
-    // `now()::text::"timestamptz"` salía marcada siendo una ida y vuelta que recupera el
-    // instante (medido por epoch: idéntico en Kiritimati y en Etc/GMT+12). Un falso positivo
-    // sobre código correcto.
-    const TIPO_CON_HUSO = String.raw`(?:"(?:timestamptz|timetz)"|timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)`;
     /*
      * Y la vuelta se escribe de DOS maneras. `now()::text::timestamptz` la introduce un `::`;
      * `cast(now()::text as timestamptz)` la introduce el `as` del cast exterior, y esa mitad
@@ -682,6 +750,46 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'i',
       ),
       new RegExp(String.raw`(${RELOJ})\s*::\s*${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
+      /*
+       * Y el reloj escrito ENTERO entre comillas, que era la puerta de al lado: `'now'::date`
+       * es exactamente `current_date` —2026-09-05 en Pacific/Kiritimati y 2026-09-04 en
+       * Etc/GMT+12, medido— y `current_date` está prohibido desde la primera línea de este
+       * fichero mientras su sinónimo pasaba limpio, porque el vaciado de literales se llevaba
+       * el contenido antes de que nadie lo mirara. No es un caso raro: es la forma de saltarse
+       * el censo entero sin escribir ninguna de las palabras que vigila.
+       *
+       * `'now'` con un tipo CON huso es el instante y ya está en la lista de relojes; aquí van
+       * los tipos SIN huso, que es donde se elige calendario. Las tres sintaxis, porque el
+       * literal tipado (`date 'now'`) y el `cast` no se deparsean igual que el `::`.
+       *
+       * La frontera IZQUIERDA es la misma disciplina que llevan las funciones —sin ella,
+       * `mi_now()` salía marcado—: un `creado_date` con un literal pegado detrás casaría el
+       * nombre del tipo DENTRO del identificador. Dicho con honestidad: no mueve ninguna sonda,
+       * y no por falta de buscarla, sino porque en SQL válido no hay sitio donde un
+       * identificador pueda ir pegado a un literal —ahí solo cabe un literal TIPADO—. Se queda
+       * porque el reconocedor de un nombre de tipo tiene que reconocer el nombre entero, no un
+       * trozo; la alternativa es descubrir el falso positivo en el primer nombre de columna que
+       * acabe en `_date`.
+       */
+      new RegExp(String.raw`${AHORA_LITERAL}\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO})`, 'i'),
+      new RegExp(String.raw`(?<![\w.])${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*${AHORA_LITERAL}`, 'i'),
+      new RegExp(
+        String.raw`cast\s*\(\s*${AHORA_LITERAL}\s+as\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})`,
+        'i',
+      ),
+      // Y las tres hermanas, con cualquier tipo temporal: ni con huso conservan el instante.
+      new RegExp(
+        String.raw`${DIA_LITERAL}\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO}|${TIPO_CON_HUSO})`,
+        'i',
+      ),
+      new RegExp(
+        String.raw`(?<![\w.])${ESQUEMA}(?:${TIPO_SIN_HUSO}|${TIPO_CON_HUSO})\s*${DIA_LITERAL}`,
+        'i',
+      ),
+      new RegExp(
+        String.raw`cast\s*\(\s*${DIA_LITERAL}\s+as\s+${ESQUEMA}(?:${TIPO_SIN_HUSO}|${TIPO_CON_HUSO})`,
+        'i',
+      ),
       // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
       new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `date(now())`, la tercera forma de escribir la misma conversión.
@@ -902,7 +1010,54 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
            * 'te_trunc'`. Se miran los dos y basta con que uno sea culpable, que es el lado
            * seguro.
            */
-          return culpable(trozos.join(''), 'sql') || culpable(trozos.join(' '), 'sql');
+          /*
+           * Y una TERCERA lectura, porque `format` no PEGA los trozos: los mete DONDE está el
+           * marcador. `execute format('select %s::date', 'now()')` ejecuta `select now()::date`
+           * —medido— y las dos concatenaciones daban `select %s::datenow()` y
+           * `select %s::date now()`: en ninguna de las dos se reconoce el reloj pegado a su casto,
+           * así que la consulta se escapaba entera. Un marcador que PARTE la expresión no se
+           * arregla pegando los trozos, ni con hueco ni sin él; hay que sustituirlo.
+           *
+           * Se reconstruye lo que `format` produce, medido cada caso: `%s` mete el argumento tal
+           * cual, `%L` entre comillas simples duplicando las de dentro, `%I` entre dobles, `%%` es
+           * un porciento. Es una lectura MÁS, no en vez de: si el envoltorio no era `format`, no
+           * hay marcadores que sustituir y la reconstrucción se queda en el primer trozo, que las
+           * otras dos ya miraban.
+           *
+           * Los POSICIONALES se resuelven por su número, que es como los resuelve Postgres
+           * —medido: `format('%1$s y %1$s', 'now()')` da `now() y now()`—. La anchura (`%10s`) se
+           * reconoce en la sintaxis y se ignora al rellenar: los espacios de más no cambian que el
+           * reloj esté ahí.
+           *
+           * LÍMITE DECLARADO: un argumento que NO esté en el texto —una variable— deja su marcador
+           * sin nada que poner, igual que en las otras dos lecturas la cadena se corta ahí.
+           *
+           * Y una honestidad sobre el `%%`: la rama existe porque sin ella `'%%s'` se leería como
+           * marcador y metería el argumento donde Postgres no mete nada (medido: `format('%%s',
+           * 'now()::date')` da `select %s`). Pero NINGUNA sonda la sostiene, y no por falta de
+           * ganas: el pegado con hueco ya marca ese caso —`select %%s now()::date`— y marcar de
+           * más ahí es la postura declarada de las dos lecturas de arriba. La rama se queda para
+           * que la reconstrucción diga la verdad, no para que aporte una marca.
+           */
+          const comoFormat = (partes: string[]): string => {
+            let siguiente = 1;
+            return partes[0]!.replace(
+              /%(?:(\d+)\$)?[-+ 0]*\d*([sIL%])/g,
+              (_todo, posicion: string | undefined, tipo: string) => {
+                if (tipo === '%') return '%';
+                const arg = partes[posicion === undefined ? siguiente++ : Number(posicion)];
+                if (arg === undefined) return '';
+                if (tipo === 'L') return `'${arg.replace(/'/g, "''")}'`;
+                if (tipo === 'I') return `"${arg.replace(/"/g, '""')}"`;
+                return arg;
+              },
+            );
+          };
+          return (
+            culpable(trozos.join(''), 'sql') ||
+            culpable(trozos.join(' '), 'sql') ||
+            culpable(comoFormat(trozos), 'sql')
+          );
         })(),
       )
     );
@@ -1275,7 +1430,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * `date_part`— necesitan el texto tal cual; los demás no, y con él dentro una función
          * que devuelva la cadena 'current_date' salía marcada sin leer ningún reloj.
          */
-        salida += vaciarLiterales ? `${c}${c}` : texto.slice(desde, i);
+        /*
+         * Con UNA excepción, y es la que impedía que el censo entero se rodeara con dos
+         * comillas: `'now'`, `'today'`, `'tomorrow'` y `'yesterday'` no son datos —Postgres las
+         * EVALÚA— y vaciarlas dejaba `'today'::date` indistinguible de `''::date`. O sea que
+         * `current_date` estaba prohibido y su sinónimo exacto pasaba limpio: el mismo día
+         * distinto en husos opuestos (2026-09-05 contra 2026-09-04, medido), escrito de otra
+         * manera. Se conserva SOLO ese contenido, así que la función que devuelve la cadena
+         * `'current_date'` —el falso positivo que motivó el vaciado— se sigue vaciando.
+         */
+        salida +=
+          vaciarLiterales && !ESPECIAL_TEMPORAL.test(texto.slice(desde + 1, i - 1))
+            ? `${c}${c}`
+            : texto.slice(desde, i);
         continue;
       }
       /*
@@ -1631,6 +1798,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "execute 'select now()' || '::date'",
       "execute 'select ' || 'now()::date'",
       "execute format('select %s', 'now()::date')",
+      // Y el marcador PARTIENDO la expresión, que es donde pegar los trozos ya no alcanza:
+      // Postgres ejecuta `select now()::date` (medido) y las dos concatenaciones daban
+      // `select %s::datenow()` y `select %s::date now()`, ninguna culpable.
+      "execute format('select %s::date', 'now()')",
+      // Con marcador POSICIONAL y con anchura, que es la misma sustitución escrita distinto. El
+      // posicional se elige SALTEADO a propósito: con `%1$s` el orden natural acierta por
+      // casualidad y la sonda no probaría nada. Medido: `format('select %2$s::date', 'columna',
+      // 'now()')` da `select now()::date`.
+      "execute format('select %2$s::date', 'columna', 'now()')",
+      "execute format('select %10s::date', 'now()')",
       // La coerción IMPLÍCITA a texto, que renderiza igual sin nombrar ningún formato. Las
       // cuatro medidas: cadena distinta en husos opuestos.
       'concat(now())',
@@ -1723,9 +1900,42 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "(now() + '1 day'::pg_catalog.interval)::date",
       "current_timestamp < '2026-09-05'::pg_catalog.date",
       'now()::pg_catalog.date',
+      // El RELOJ escrito entre comillas, que es `current_date` con otra ortografía. Medidas
+      // todas en husos opuestos: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+      // Etc/GMT+12 las que colapsan a día, y la hora de pared de cada uno las de `timestamp`.
+      "'now'::date",
+      "'now'::timestamp",
+      "date 'now'",
+      "cast('now' as date)",
+      "'now'::pg_catalog.date",
+      // Sin distinguir mayúsculas, con espacios de sobra y con prefijo: las tres son la misma
+      // lectura para Postgres (medido).
+      "'NOW'::date",
+      "' now '::date",
+      "E'now'::date",
+      // Y `'now'` CON huso es el instante, o sea un reloj: no es hallazgo solo, pero todo lo
+      // que este censo prohíbe hacerle a `now()` vale igual escrito así.
+      "'now'::timestamptz::date",
+      "date_trunc('day', 'now'::timestamptz)",
+      "to_char(timestamptz 'now', 'YYYY-MM-DD')",
+      "concat('now'::timestamptz)",
+      // Y las tres hermanas, que ni con huso conservan el instante (medido por epoch:
+      // 1788516000 contra 1788523200).
+      "'today'::date",
+      "'today'::timestamptz",
+      "timestamptz 'today'",
+      "'tomorrow'::date",
+      "cast('yesterday' as date)",
       // La ida y vuelta que NO termina ahí: recupera el instante y vuelve a elegir día.
       // En su forma fuente y en la que devuelve el catálogo.
       'now()::text::timestamptz::date',
+      // Y la ida y vuelta USADA COMO OPERANDO de otra cosa: el instante es el mismo, pero
+      // quien elige calendario es la operación de fuera. Medidas las tres en husos opuestos:
+      // `2026-09-05 00:00:00+14` contra `2026-09-04 00:00:00-12`, `2026-09-05` contra
+      // `2026-09-04`, y el renderizado con su desfase.
+      "date_trunc('day', now()::text::timestamptz)",
+      "to_char(now()::text::timestamptz, 'YYYY-MM-DD')",
+      'concat(now()::text::timestamptz)',
       // El huso DINÁMICO en las dos sintaxis: vuelve a decidir quien llama.
       "timezone(current_setting('TimeZone'), now())::date",
       "(now() at time zone current_setting('TimeZone'))::date",
@@ -1925,6 +2135,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Ni un EXECUTE cuyo SQL no lee el calendario.
       "execute 'select 1'",
       "execute format('select 1')",
+      // Y la sustitución no INVENTA culpa: el mismo `format` con un argumento que no lee el
+      // calendario sigue limpio.
+      "execute format('select %s', '1')",
+      // `'now'` con huso es el instante y no elige nada: mismo epoch en husos opuestos
+      // (1788538089, medido), igual que `now()` a secas.
+      "'now'::timestamptz",
+      "timestamptz 'now'",
+      // Y las especiales que NO se mueven: las tres medidas iguales en husos opuestos.
+      "'epoch'::date",
+      "'infinity'::date",
+      "'allballs'::timetz",
+      // La palabra entre comillas SIN tipo encima es un dato como cualquier otro, y marcarla
+      // sería el falso positivo que desactiva un censo: una clave de JSON, un texto que se
+      // devuelve, una comparación contra una columna de texto.
+      "concat('now')",
+      "jsonb_build_object('now', creado_en)",
+      "select 'today' as etiqueta",
+      "where clase = 'yesterday'",
       // Y los formatos que NO leen el calendario: texto entrecomillado y campos por debajo
       // del minuto (ningún huso tiene desfase con segundos — medido sobre los 499).
       "to_char(now(), '\"fijo\"')",
@@ -2097,6 +2325,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(
       culpable("const u = 'https://host'; const q = sql`select now()::date`;", 'ts'),
     ).toBe(true);
+    /*
+     * Y el literal que SÍ es código sobrevive al vaciado en los dos dialectos, sin que la
+     * cadena que solo lo NOMBRA se contagie. Las dos mitades hacen falta: conservar el
+     * contenido de un literal es exactamente lo que el vaciado existe para no hacer, y sin la
+     * segunda mitad esto sería la puerta de vuelta al falso positivo que lo motivó.
+     */
+    expect(culpable("const q = sql`select 'today'::date from t`;", 'ts')).toBe(true);
+    expect(culpable("const modo = 'now'; const q = sql`select 1`;", 'ts')).toBe(false);
+    expect(culpable("select clase from t where clase = 'now'", 'sql')).toBe(false);
     // SQL ANIDA: el cierre interior no termina el comentario, así que el `--` de después sigue
     // comentado y no puede comerse el código que viene tras el cierre exterior.
     expect(
@@ -2292,6 +2529,27 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'create function censo_probe_bloque_anidado() returns void language plpgsql as $c$ ' +
         'begin /* fuera /* dentro */ -- sigue fuera */ perform (now())::date; end $c$',
     );
+    /*
+     * Y el RELOJ ESCRITO ENTRE COMILLAS, que también tiene que ir en plpgsql, y por una razón
+     * que conviene medir antes que suponer: Postgres PLIEGA `'today'::date` en cuanto puede.
+     * Medido sobre cuatro sitios distintos —
+     *
+     *   cuerpo SQL nuevo (`return 'now'::date`)   se guarda ya como `'2026-09-04'::date`
+     *   vista (`select 'today'::date`)            se guarda ya como `'2026-09-04'::date`
+     *   cuerpo SQL antiguo (`as $$ select … $$`)  se guarda VERBATIM y depende: 09-05 / 09-04
+     *   cuerpo plpgsql                            se guarda VERBATIM y depende: 09-05 / 09-04
+     *
+     * — o sea que donde el literal queda congelado ya no hay nada que censar (el problema ahí
+     * es otro: una fecha fija que nadie escribió), y donde SÍ lee el reloj de quien llama el
+     * texto sigue en el catálogo. La sonda va en el lado que el censo tiene que ver.
+     *
+     * Sin ella, todo lo que sostiene a esta familia serían sondas de TEXTO: el patrón podría
+     * estar bien y el recorrido del catálogo no llegar nunca a enseñárselo.
+     */
+    await admin.unsafe(
+      "create function censo_probe_literal_reloj() returns void language plpgsql as $c$ " +
+        "begin perform 'today'::date; end $c$",
+    );
     try {
       // `pg_get_functiondef` y no `prosrc`, y `prokind = 'f'` porque aquél no acepta
       // agregados ni funciones de ventana.
@@ -2326,6 +2584,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
             .map(([n]) => n),
           'censo_probe_procedimiento',
           'censo_probe_bloque_anidado',
+          'censo_probe_literal_reloj',
         ].sort(),
       );
     } finally {
@@ -2334,6 +2593,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       await admin`drop procedure censo_probe_procedimiento()`;
       await admin`drop function censo_probe_bloque_anidado()`;
+      await admin`drop function censo_probe_literal_reloj()`;
     }
   });
 

@@ -850,9 +850,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    */
   /** Lo que puede ir DELANTE de una barra que abre una expresión regular. */
   const ABRE_REGEX = /[([{,;:=!&|?+\-*%<>~^]/;
+  /**
+   * Las palabras tras las que puede empezar una EXPRESIÓN, que es el criterio: no una lista de
+   * casos vistos. `throw /re/` y `export default /re/` faltaban y las dos son código válido
+   * —medido: sin ellas, el `/*` de una clase de caracteres abría un comentario sin cierre—.
+   * `default:` de un `switch` no hace falta: ahí el carácter anterior son los dos puntos.
+   */
   const PALABRAS_ANTES_DE_REGEX = new Set([
-    'return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'instanceof', 'do',
-    'else', 'yield', 'await',
+    'return', 'throw', 'typeof', 'case', 'default', 'in', 'of', 'new', 'delete', 'void',
+    'instanceof', 'do', 'else', 'yield', 'await',
   ]);
   /**
    * Y las que abren un paréntesis de CONTROL: tras su cierre viene una sentencia, y una
@@ -1905,6 +1911,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     expect(
       culpable('if (activo) /[/*]/.test(x); const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y las dos posiciones que faltaban tras una PALABRA: lo que sigue a `throw` y a un
+    // `export default` es una expresión, y puede ser una regex.
+    expect(
+      culpable('if (error) throw /[/*]/; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    expect(
+      culpable('export default /[/*]/; const q = sql`select now()::date`;', 'ts'),
     ).toBe(true);
     // Y el lado seguro del mismo carácter: un valor entre paréntesis dividido, que NO puede
     // tomarse por regex o se comería la consulta de después.

@@ -56,6 +56,25 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   ];
   /** El patrón de una palabra: sus dos fronteras y su precisión opcional. */
   const patronDe = (palabra: string) => String.raw`\b${palabra}\b${PRECISION}`;
+  /**
+   * El NOMBRE de una función, entrecomillado o no. `pg_catalog."to_json"(now())`,
+   * `"date_trunc"('day', now())`, `"to_char"(…)`, `"age"(…)`, `"date"(…)`, `"date_part"(…)` y
+   * `"timezone"(…)` son llamadas válidas —medidas las siete contra la base— y un patrón que
+   * exija el paréntesis pegado al nombre DESNUDO no ve ninguna: encuentra antes la comilla.
+   *
+   * La variante ya existía en un sitio, el de las funciones de reloj, y faltaba en los otros
+   * siete. Es el mismo modo de fallo de siempre —un criterio repetido aprende en un sitio y se
+   * queda viejo en los demás—, así que aquí vive UNA vez y la usan todos.
+   *
+   * `extract` y `cast` NO la llevan, y no es un olvido: son palabras clave con sintaxis propia
+   * —`extract(campo from x)`, `cast(x as t)`— y entrecomilladas son errores de sintaxis, las
+   * dos medidas. Añadirles la variante sería cobertura de algo que no existe.
+   *
+   * Las PALABRAS del reloj tampoco: `current_date` es palabra clave, y `"current_date"` ya no
+   * lo es — sería el nombre de una columna, que no lee ningún reloj.
+   */
+  const nombreDeFuncion = (nombres: string) =>
+    String.raw`(?:\b(?:${nombres})|"(?:${nombres})")`;
 
   /**
    * Los campos y precisiones seguros NO se escriben: se MIDEN contra la base, comparando el
@@ -144,7 +163,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * columna, que no lee ningún reloj.
      */
     const funciones = filas.map(
-      (f) => String.raw`(?:\b${f.nombre as string}|"${f.nombre as string}")\s*\(\s*\)`,
+      (f) => String.raw`${nombreDeFuncion(f.nombre as string)}\s*\(\s*\)`,
     );
     expect(funciones.length).toBeGreaterThanOrEqual(5);
 
@@ -639,7 +658,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * `\s+` por medio el motor lo devuelve a cero y la aserción deja de guardar.
        */
       new RegExp(
-        String.raw`timezone\s*\((?!\s*${envuelto(HUSO_LITERAL)}\s*,)\s*${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*\)`,
+        String.raw`${nombreDeFuncion('timezone')}\s*\((?!\s*${envuelto(HUSO_LITERAL)}\s*,)\s*${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*\)`,
         'i',
       ),
       new RegExp(
@@ -650,7 +669,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
       new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `date(now())`, la tercera forma de escribir la misma conversión.
-      new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJ})\s*\)`, 'i'),
+      new RegExp(String.raw`${nombreDeFuncion('date|time')}\s*\(\s*(${RELOJ})\s*\)`, 'i'),
       /*
        * Y la COMPARACIÓN MIXTA, que es la puerta que abrió declarar seguro el reloj desnudo.
        * `current_timestamp` es un instante absoluto, sí — pero comparado contra un valor SIN
@@ -703,7 +722,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       //
       // La guardia va pegada a la coma y NO detrás del `\s*`: con el espacio por medio el
       // motor lo devuelve a cero y la aserción se evalúa donde no hay literal.
-      new RegExp(String.raw`to_char\s*\(\s*(${RELOJ})\s*,(?!\s*${FORMATO_SEGURO}\s*\))`, 'i'),
+      new RegExp(String.raw`${nombreDeFuncion('to_char')}\s*\(\s*(${RELOJ})\s*,(?!\s*${FORMATO_SEGURO}\s*\))`, 'i'),
       /*
        * `extract` entra aquí desde que el campo puede ser un LITERAL —`extract('dow' from
        * now())` es SQL válido, comprobado contra la base—: si el literal viene vaciado, el
@@ -718,13 +737,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // que lleva cast: `date_trunc('day', timeofday()::timestamptz)`, obligada porque ese
       // reloj devuelve texto. Marca CUALQUIER unidad que no esté en la lista medida.
       new RegExp(
-        String.raw`date_trunc\s*\(\s*(?!${unidadSegura(UNIDADES_SEGURAS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*(?:,(?!\s*${HUSO_FIJO})\s*${PRIMER_ARGUMENTO})?\s*\)`,
+        String.raw`${nombreDeFuncion('date_trunc')}\s*\(\s*(?!${unidadSegura(UNIDADES_SEGURAS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*(?:,(?!\s*${HUSO_FIJO})\s*${PRIMER_ARGUMENTO})?\s*\)`,
         'i',
       ),
       // `date_part('dow', now())`, que es la misma operación con la otra sintaxis, y su forma
       // deparseada `date_part('dow'::text, now())`.
       new RegExp(
-        String.raw`date_part\s*\(\s*(?!${unidadSegura(CAMPOS_SEGUROS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})`,
+        String.raw`${nombreDeFuncion('date_part')}\s*\(\s*(?!${unidadSegura(CAMPOS_SEGUROS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})`,
         'i',
       ),
       /*
@@ -747,7 +766,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * `date_trunc`. Una expresión regular no cuenta paréntesis.
        */
       new RegExp(
-        String.raw`\b\w*json\w*\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*?(${RELOJ})\s*(?=[,)])`,
+        String.raw`${nombreDeFuncion(String.raw`\w*json\w*`)}\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*?(${RELOJ})\s*(?=[,)])`,
         'i',
       ),
       /*
@@ -766,7 +785,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * Hoy `age` no aparece en el repositorio. Entra igual, que es para lo que existe un censo
        * y no una lista de hallazgos: la garantía que lo use mañana ya nace vigilada.
        */
-      new RegExp(String.raw`\bage\s*\(\s*${PRIMER_ARGUMENTO}\)`, 'i'),
+      new RegExp(String.raw`${nombreDeFuncion('age')}\s*\(\s*${PRIMER_ARGUMENTO}\)`, 'i'),
     ];
   });
 
@@ -1563,6 +1582,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Y el SQL de un EXECUTE compuesto por concatenación, en sus dos cortes.
       "execute 'select now()' || '::date'",
       "execute 'select ' || 'now()::date'",
+      // El NOMBRE de la función, entrecomillado. Las siete son llamadas válidas (medidas) y
+      // ninguna casaba: el patrón exigía el paréntesis pegado al nombre desnudo.
+      'pg_catalog."to_json"(now())',
+      '"date_trunc"(\'day\', now())',
+      '"to_char"(now(), \'YYYY-MM-DD\')',
+      '"date_part"(\'dow\', now())',
+      '"date"(now())',
+      '"age"(vence_en)',
+      '"timezone"(current_setting(\'TimeZone\'), now())::date',
       // La serialización a JSON, que es la misma elección de calendario que `::text` escrita
       // con otra función. Las cuatro medidas: cadena distinta en husos opuestos.
       'to_json(now())',
@@ -1856,6 +1884,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // La ida y vuelta escrita con CAST … AS, en sus dos mitades. El catálogo NUNCA produce
       // esta forma —la deparsea con `::`—, así que ninguna sonda de objeto real la cubre.
       'cast(now()::text as timestamptz)',
+      // Y el nombre entrecomillado no puede volverse una excusa para marcar: el arreglo
+      // canónico y una unidad segura siguen siéndolo escritos así (medidos los dos).
+      '"timezone"(\'UTC\', now())::date',
+      '"date_trunc"(\'second\', now())',
       // Y el arreglo canónico DENTRO del JSON: lo que se serializa ya es un `timestamp` sin
       // huso, y sale igual en los dos (medido). Sin esta mitad, el patrón de arriba habría
       // marcado justo la forma que este PR propone como solución.

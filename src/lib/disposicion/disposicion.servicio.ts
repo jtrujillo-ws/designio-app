@@ -129,6 +129,22 @@ export async function panelDisposicion(
   actorId: string,
   workspaceId: string,
 ): Promise<PanelDisposicion> {
+  /*
+   * REPEATABLE READ, y es lo único de este servicio que lo pide. El panel son CUATRO lecturas
+   * —cuenta, acuerdo, constancia y motivo— y bajo READ COMMITTED cada sentencia toma su propia
+   * instantánea: si alguien registra un acuerdo entre la primera y la última, la pantalla
+   * muestra el acuerdo #1 junto al motivo y la constancia del #2.
+   *
+   * Lo que eso produce no es un borrado indebido —la versión esperada viaja y la función la
+   * rechaza, así que falla cerrado—, sino algo que para esta pantalla es igual de grave: un
+   * recibo enseñado al lado del acuerdo que no le corresponde, y un botón habilitado por un
+   * motivo que no es el del acuerdo que se está mirando. Esta pantalla existe para que una
+   * persona decida un borrado irreversible con lo que ve delante; si lo que ve viene de dos
+   * momentos distintos, no está decidiendo sobre nada en concreto.
+   *
+   * No choca con la doctrina de aislamiento del esquema: ésa exige READ COMMITTED a las
+   * transacciones que ESCRIBEN y releen tras un candado, y aquí no se escribe nada.
+   */
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
 
@@ -167,7 +183,7 @@ export async function panelDisposicion(
       rol: (estado?.rol ?? null) as string | null,
       ultimaExportacion: estado?.exportado ? (estado.exportado as Date).toISOString() : null,
     };
-  });
+  }, { aislamiento: 'repeatable read' });
 }
 
 /**

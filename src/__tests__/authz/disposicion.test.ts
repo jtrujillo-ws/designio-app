@@ -1617,6 +1617,87 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // Y el sello sigue verificando con un `remediacion` no vacío y un contador en cero.
     expect(selloRecomputado(c)).toBe(c.sello);
   });
+  it('el panel se lee de UNA instantánea: sus campos no vienen de dos momentos', async () => {
+    /*
+     * El panel son cuatro lecturas —cuenta, acuerdo, constancia y motivo—. Bajo READ
+     * COMMITTED cada sentencia toma su propia instantánea, así que un acuerdo registrado por
+     * otra persona a mitad de camino partía la pantalla en dos: el acuerdo #1 arriba, y el
+     * motivo y la constancia del #2 debajo.
+     *
+     * Lo que produce no es un borrado indebido —la versión esperada viaja y la función la
+     * rechaza, así que falla cerrado— sino un recibo enseñado junto al acuerdo que no le
+     * corresponde y un botón gobernado por un motivo que no es el del acuerdo que se mira.
+     * Para la pantalla desde la que alguien decide un borrado irreversible, eso es el fallo:
+     * lo que ve delante no describe ningún estado que haya existido.
+     *
+     * SOBRE LO QUE ESTE CASO CUBRE Y LO QUE NO, que conviene decirlo en vez de sugerir más:
+     * la carrera no se puede fabricar contra `panelDisposicion` desde fuera. Lo intenté con un
+     * `lock table` sobre `constancia_disposicion` —la tabla que leen sus sentencias tercera y
+     * cuarta— para pararlo a medio camino, y no sirve: registrar el acuerdo que provoca la
+     * carrera TAMBIÉN lee esa tabla (el guard de congelación pregunta por `workspace_borrado`),
+     * así que el escritor se bloquea con él y no hay interleaving. Medido con
+     * `pg_stat_activity`: las dos sesiones esperando en `Lock/relation`.
+     *
+     * Así que se comprueban las dos mitades por separado, y juntas cubren la afirmación:
+     *  · que el aislamiento es lo que hace coherentes ESAS lecturas, con las mismas sentencias
+     *    del panel y un commit real por medio, a los dos niveles;
+     *  · y que el panel pide ese aislamiento, leído de su propio código.
+     */
+    const ws = await nuevoWorkspace('instantanea');
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws,
+      modalidad: 'archivo',
+      base: 'Acuerdo primero',
+      efectivoDesde: EFECTIVO_PASADO,
+    });
+
+    /** Las dos lecturas del panel que pueden discrepar, con un commit ajeno en medio. */
+    async function leerConAcuerdoNuevoEnMedio(aislamiento?: 'repeatable read') {
+      return conUsuario(
+        leadId,
+        async (tx) => {
+          const [antes] = await tx`select version from acuerdo_disposicion
+            where workspace_id = ${ws} order by version desc limit 1`;
+          // Otra parte registra un acuerdo y lo CONFIRMA mientras esta transacción vive.
+          await registrarAcuerdo(leadId, {
+            workspaceId: ws,
+            modalidad: 'borrado',
+            base: `Acuerdo ${(antes!.version as number) + 1}`,
+            efectivoDesde: EFECTIVO_PASADO,
+          });
+          const [despues] = await tx`select version from acuerdo_disposicion
+            where workspace_id = ${ws} order by version desc limit 1`;
+          return { antes: antes!.version as number, despues: despues!.version as number };
+        },
+        aislamiento ? { aislamiento } : undefined,
+      );
+    }
+
+    // READ COMMITTED: la segunda lectura ve un acuerdo que la primera no veía. Es exactamente
+    // la grieta por la que el panel enseñaba dos momentos a la vez.
+    const rc = await leerConAcuerdoNuevoEnMedio();
+    expect(rc.despues).toBe(rc.antes + 1);
+
+    // REPEATABLE READ: la instantánea queda fija en la primera sentencia, así que las dos
+    // lecturas describen el mismo momento aunque el acuerdo nuevo ya esté confirmado.
+    const rr = await leerConAcuerdoNuevoEnMedio('repeatable read');
+    expect(rr.despues).toBe(rr.antes);
+
+    // Y que el panel PIDE esa instantánea. Se lee de su propio código porque la carrera no se
+    // puede provocar contra él desde fuera (arriba está el motivo, medido); sin esto, quitar
+    // la opción devolvería el defecto sin que nada se pusiera rojo.
+    const { readFile } = await import('node:fs/promises');
+    const fuente = await readFile(
+      new URL('../../lib/disposicion/disposicion.servicio.ts', import.meta.url).pathname,
+      'utf8',
+    );
+    const cuerpo = fuente.slice(
+      fuente.indexOf('export async function panelDisposicion'),
+      fuente.indexOf('export async function registrarAcuerdo'),
+    );
+    expect(cuerpo).toContain("aislamiento: 'repeatable read'");
+  });
+
   it('la retención se mide con un calendario FIJO, y no con el huso que elige quien llama', async () => {
     /*
      * `current_date` no es una fecha: es una fecha EN EL HUSO DE LA SESIÓN, y el huso lo pone

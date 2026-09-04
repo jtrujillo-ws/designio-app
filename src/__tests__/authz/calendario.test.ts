@@ -77,33 +77,79 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(culpables).toEqual([]);
   });
 
-  it('ni las vistas, ni un CHECK, ni una columna generada', async () => {
-    // Los tres sitios que quedan donde una expresión se guarda y se vuelve a evaluar. Un
-    // CHECK es el más traicionero: se comprueba al escribir, así que fijaría la fila contra
-    // el calendario de quien la escribió y la dejaría incumpliendo su propia restricción.
-    const otros = await sqlAdmin()`
-      select 'vista ' || viewname as nombre, definition as cuerpo
-        from pg_views where schemaname = 'public'
-      union all
-      select 'check ' || conrelid::regclass || '/' || conname, pg_get_constraintdef(c.oid)
-        from pg_constraint c
-        join pg_namespace n on n.oid = c.connamespace where n.nspname = 'public'
-      union all
-      select 'default ' || a.attrelid::regclass || '.' || a.attname,
-             pg_get_expr(d.adbin, d.adrelid)
+  it('ni una vista, ni un CHECK, ni un default, ni una vista MATERIALIZADA', async () => {
+    /*
+     * Los cuatro sitios que quedan donde una expresión se guarda y se vuelve a evaluar.
+     *
+     * Un CHECK es el más traicionero: se comprueba al escribir, así que fijaría la fila
+     * contra el calendario de quien la escribió y la dejaría incumpliendo su propia
+     * restricción. Y una vista MATERIALIZADA es peor todavía, porque no está en `pg_views`
+     * sino en `pg_matviews`: su valor se CALCULA con el huso de la sesión que ejecuta el
+     * `CREATE` o el `REFRESH`, y se queda ahí congelado — el calendario elegido por quien
+     * refrescó, servido después a todo el mundo como si fuera un hecho.
+     *
+     * Cada categoría se cuenta POR SEPARADO y no en un montón. La versión anterior las unía y
+     * exigía «más de 50 filas en total», y eso no comprobaba lo que parecía: medido contra
+     * esta base hay 485 constraints —de los cuales solo 141 son CHECK— frente a UNA vista y
+     * cero materializadas. Los constraints solos pasaban el listón, así que si la rama de
+     * vistas o la de defaults dejaba de devolver filas, el censo seguía en verde sin mirarlas.
+     * Es el mismo modo de fallo que ya me comió una vez en este fichero, con la frontera de
+     * palabra: verde porque no estaba buscando nada.
+     */
+    const admin = sqlAdmin();
+    const categorias = {
+      vista: await admin`select viewname as nombre, definition as cuerpo
+        from pg_views where schemaname = 'public'`,
+      // Solo `contype = 'c'`: una PK, una unique o una FK no pueden contener una expresión
+      // de reloj, así que contarlas era inflar el censo con filas que no prueban nada.
+      check: await admin`select conrelid::regclass || '/' || conname as nombre,
+             pg_get_constraintdef(c.oid) as cuerpo
+        from pg_constraint c join pg_namespace n on n.oid = c.connamespace
+        where n.nspname = 'public' and c.contype = 'c'`,
+      default: await admin`select a.attrelid::regclass || '.' || a.attname as nombre,
+             pg_get_expr(d.adbin, d.adrelid) as cuerpo
         from pg_attribute a
         join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
         join pg_class rel on rel.oid = a.attrelid
         join pg_namespace n2 on n2.oid = rel.relnamespace
-        where n2.nspname = 'public'
-      order by 1`;
-    expect(otros.length).toBeGreaterThan(50);
+        where n2.nspname = 'public'`,
+      matview: await admin`select matviewname as nombre, definition as cuerpo
+        from pg_matviews where schemaname = 'public'`,
+    };
 
-    const culpables = otros
-      .filter((o) => DEL_HUSO_DE_LA_SESION.test(o.cuerpo as string))
-      .map((o) => o.nombre as string)
-      .filter((n) => !(n in DECLARADAS));
-    expect(culpables).toEqual([]);
+    /* Lo que cada categoría tiene que estar mirando para que su verde signifique algo. La
+     * de vistas materializadas va a CERO a propósito —hoy no hay ninguna— y por eso su rama
+     * se comprueba abajo fabricando una, que es la única forma de saber que funciona. */
+    const MINIMO: Record<keyof typeof categorias, number> = {
+      vista: 1,
+      check: 100,
+      default: 100,
+      matview: 0,
+    };
+    for (const [nombre, filas] of Object.entries(categorias)) {
+      expect(filas.length, `la rama «${nombre}» no está mirando nada`).toBeGreaterThanOrEqual(
+        MINIMO[nombre as keyof typeof categorias],
+      );
+      const culpables = filas
+        .filter((o) => DEL_HUSO_DE_LA_SESION.test(o.cuerpo as string))
+        .map((o) => `${nombre} ${o.nombre as string}`)
+        .filter((n) => !(n in DECLARADAS));
+      expect(culpables).toEqual([]);
+    }
+
+    // Y la rama de materializadas se comprueba de verdad: con cero filas, un `select` roto
+    // daría el mismo verde que uno correcto. Se fabrica una culpable y se exige que la vea.
+    await admin`create materialized view censo_tmp_matview as select current_date as d`;
+    try {
+      const vistas = await admin`select matviewname as nombre, definition as cuerpo
+        from pg_matviews where schemaname = 'public'`;
+      const pilladas = vistas
+        .filter((o) => DEL_HUSO_DE_LA_SESION.test(o.cuerpo as string))
+        .map((o) => o.nombre as string);
+      expect(pilladas).toEqual(['censo_tmp_matview']);
+    } finally {
+      await admin`drop materialized view censo_tmp_matview`;
+    }
   });
 
   it('ni el SQL de la aplicación, que es por donde volvió', async () => {

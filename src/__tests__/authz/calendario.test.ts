@@ -196,7 +196,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * del catálogo tres líneas después: si naciera más tarde, no estaría en el mapa.
      */
     await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
-    await sqlAdmin().unsafe('create table censo_probe_escritura (d date, ts timestamptz)');
+    await sqlAdmin().unsafe(
+      'create table censo_probe_escritura (k int primary key, d date, ts timestamptz)',
+    );
     /*
      * Los relojes que son FUNCIONES se derivan del catálogo en vez de escribirlos: cualquier
      * función de `pg_catalog` sin argumentos que devuelva un tipo de tiempo y no sea inmutable
@@ -1411,9 +1413,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           hojasDelValor(expr).some((hoja) => RELOJ_A_SECAS.test(hoja))
         );
       };
+      /** Una cláusula `set`: `col = expr` separados por comas de primer nivel. */
+      const asignacionCulpable = (tabla: string, clausula: string): boolean =>
+        argumentosDe(clausula).some((pieza) => {
+          const corte = pieza.indexOf('=');
+          return (
+            corte >= 0 && entrega(tabla, nombreCanonico(pieza.slice(0, corte)), pieza.slice(corte + 1))
+          );
+        });
       for (const m of texto.matchAll(INSERTA)) {
         const tabla = nombreCanonico(m[1]!);
-        const dentro = parejaDeParentesis(texto, m.index + m[0].length - 1);
+        const abre = m.index + m[0].length - 1;
+        const dentro = parejaDeParentesis(texto, abre);
         if (dentro === null) continue;
         const valores = argumentosDe(dentro);
         const destinos =
@@ -1422,17 +1433,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
             : argumentosDe(m[2]).map(nombreCanonico);
         if (destinos.some((c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!)))
           return true;
+        /*
+         * Y el `ON CONFLICT … DO UPDATE SET`, que es un `update` con la tabla escrita arriba:
+         * el propio `update` no lleva nombre detrás, así que el reconocedor de `UPDATE` no lo
+         * ve y la tabla hay que traerla del `insert` que lo contiene. Medido:
+         * `on conflict (k) do update set d = now()` sobre una columna `date` guarda
+         * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+         */
+        // +2: uno por el paréntesis que abre y otro por el que cierra.
+        const cola = texto.slice(abre + dentro.length + 2);
+        const enConflicto =
+          /^\s*on\s+conflict\b[\s\S]*?\bdo\s+update\s+set\s+([\s\S]*?)(?=\s+(?:where|returning)\b|;|$)/i.exec(
+            cola,
+          );
+        if (enConflicto && asignacionCulpable(tabla, enConflicto[1]!)) return true;
       }
       for (const m of texto.matchAll(ACTUALIZA)) {
-        const tabla = nombreCanonico(m[1]!);
-        for (const pieza of argumentosDe(m[2]!)) {
-          const corte = pieza.indexOf('=');
-          if (corte < 0) continue;
-          if (
-            entrega(tabla, nombreCanonico(pieza.slice(0, corte)), pieza.slice(corte + 1))
-          )
-            return true;
-        }
+        if (asignacionCulpable(nombreCanonico(m[1]!), m[2]!)) return true;
       }
       return false;
     };
@@ -3269,12 +3286,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       [
         'censo_probe_insert_date',
         'returns void language plpgsql as $c$' +
-          ' begin insert into censo_probe_escritura(d) values (now()); end $c$',
+          ' begin insert into censo_probe_escritura(k, d) values (1, now()); end $c$',
       ],
       [
         'censo_probe_insert_posicional_date',
         'returns void language plpgsql as $c$' +
-          ' begin insert into censo_probe_escritura values (now(), now()); end $c$',
+          ' begin insert into censo_probe_escritura values (1, now(), now()); end $c$',
       ],
       [
         'censo_probe_update_date',
@@ -3284,12 +3301,38 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       [
         'censo_probe_ok_insert_instante',
         'returns void language plpgsql as $c$' +
-          ' begin insert into censo_probe_escritura(ts) values (now()); end $c$',
+          ' begin insert into censo_probe_escritura(k, ts) values (1, now()); end $c$',
+      ],
+      /*
+       * Y el `ON CONFLICT … DO UPDATE SET`, que es un `update` cuya tabla está escrita arriba,
+       * en el `insert`. Medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12. Con su segura sobre la columna con huso.
+       *
+       * Salió de preguntarme dónde MÁS se entrega una expresión a un tipo que no está escrito,
+       * y de esa pregunta salieron tres candidatos. Los otros dos NO son huecos, y queda
+       * medido para que nadie los persiga: pasar un `timestamptz` a una función de parámetro
+       * `date` es un error —«function … (timestamp with time zone) does not exist»— y un
+       * `return query select now()` contra un `returns table(d date)` también —«structure of
+       * query does not match function result type»—. Postgres coerciona en ASIGNACIÓN, no en
+       * llamada ni en proyección, y por eso el destino tipado tiene las puertas que tiene y
+       * no más.
+       */
+      [
+        'censo_probe_conflicto_date',
+        'returns void language plpgsql as $c$ begin' +
+          " insert into censo_probe_escritura(k, d) values (1, date '2020-01-01')" +
+          ' on conflict (k) do update set d = now(); end $c$',
+      ],
+      [
+        'censo_probe_ok_conflicto_instante',
+        'returns void language plpgsql as $c$ begin' +
+          " insert into censo_probe_escritura(k, ts) values (1, timestamptz '2020-01-01Z')" +
+          ' on conflict (k) do update set ts = now(); end $c$',
       ],
       [
         'censo_probe_ok_insert_huso_fijo',
-        "returns void language plpgsql as $c$ begin insert into censo_probe_escritura(d)" +
-          " values (timezone('UTC', now())::date); end $c$",
+        "returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)" +
+          " values (1, timezone('UTC', now())::date); end $c$",
       ],
       [
         'censo_probe_ok_arreglo_subconsulta_where',
@@ -3477,6 +3520,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_insert_date',
           'censo_probe_insert_posicional_date',
           'censo_probe_update_date',
+          'censo_probe_conflicto_date',
         ].sort(),
       );
     } finally {
@@ -3520,6 +3564,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_insert_date',
         'censo_probe_insert_posicional_date',
         'censo_probe_update_date',
+        'censo_probe_conflicto_date',
+        'censo_probe_ok_conflicto_instante',
         'censo_probe_ok_insert_instante',
         'censo_probe_ok_insert_huso_fijo',
         'censo_probe_ok_decl_constant_instante',

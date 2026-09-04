@@ -1659,9 +1659,15 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const DECLARADAS: Record<string, string> = {
       'disposicion/disposicion.servicio.ts:ejecutarDisposicion':
         'ESCRIBE: invoca `ejecutar_disposicion`, que toma el candado del workspace y relee. La doctrina de aislamiento del esquema le exige READ COMMITTED, y la función lo comprueba y se niega bajo REPEATABLE READ.',
-      'exportacion/exportacion.servicio.ts:exportarWorkspace':
-        'ESCRIBE, y corre a propósito en REPEATABLE READ por SYS-04 —el archivo tiene que ser una foto—, declarado con su fecha en la cabecera de la migración.',
     };
+    /*
+     * `exportarWorkspace` estuvo aquí y se ha ido, y el motivo es el hallazgo: ya fija
+     * `{ aislamiento: 'repeatable read' }` —por SYS-04, el archivo tiene que ser una foto—,
+     * así que el censo no la nombraba y la excepción no se consumía nunca. Una excepción
+     * inerte no es inofensiva: el día que alguien le quitara el aislamiento, el censo sí la
+     * nombraría y este filtro la callaría, dejando en verde justo la regresión que existe
+     * para detectar. Por eso abajo se exige que TODA excepción declarada se consuma.
+     */
 
     /*
      * El censo va como FUNCIÓN y no como bucle sobre el disco, y eso no es orden: es que sin
@@ -1782,9 +1788,18 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         ts.canHaveModifiers(n) &&
         (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
       for (const st of fuente.statements) {
-        if (ts.isFunctionDeclaration(st) && st.name) {
-          porNombre.set(st.name.text, st);
-          if (llevaExport(st)) exportadas.add(st.name.text);
+        if (ts.isFunctionDeclaration(st)) {
+          /*
+           * `export default async function (…) {}` llega como `FunctionDeclaration` SIN
+           * nombre, y el `&& st.name` de antes la descartaba entera. Va bajo el nombre
+           * sintético `default`, el mismo que usa la flecha exportada por defecto: `default`
+           * es palabra reservada, así que no puede chocar con ninguna función del módulo.
+           */
+          const nombre = st.name?.text ?? (llevaExport(st) ? 'default' : undefined);
+          if (nombre) {
+            porNombre.set(nombre, st);
+            if (llevaExport(st)) exportadas.add(nombre);
+          }
         }
         // `const f = async (…) => …` y `const f = async function (…) {…}`, exportadas o no.
         if (ts.isVariableStatement(st)) {
@@ -1921,6 +1936,22 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         });
       export { sondaOkUna };
     `;
+    /*
+     * La `default` ANÓNIMA va en su propia fuente: solo cabe un `export default` por módulo.
+     * Llega como `FunctionDeclaration` sin nombre —comprobado con el parser— y el censo la
+     * descartaba antes de mirarla siquiera.
+     */
+    const FUENTE_SONDA_ANONIMA = `
+      export default async function (actorId: string) {
+        return conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      }
+    `;
+    expect(censar('anon.ts', FUENTE_SONDA_ANONIMA)).toEqual(['anon.ts:default']);
+
     expect(censar('sonda.ts', FUENTE_SONDA).sort()).toEqual(
       [
         'sonda.ts:sondaModificador',
@@ -1933,13 +1964,21 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     );
 
     // Y ahora las reales.
-    const sueltas: string[] = [];
+    const nombradasReales: string[] = [];
     for (const f of ficheros) {
-      for (const clave of censar(f.slice(raiz.length), await readFile(f, 'utf8'))) {
-        if (!(clave in DECLARADAS)) sueltas.push(clave);
-      }
+      nombradasReales.push(...censar(f.slice(raiz.length), await readFile(f, 'utf8')));
     }
-    expect(sueltas.sort()).toEqual([]);
+    expect(nombradasReales.filter((c) => !(c in DECLARADAS)).sort()).toEqual([]);
+    /*
+     * Y ninguna excepción de más. Una entrada que el censo NO nombra no está exceptuando
+     * nada: está esperando en silencio a callar el día que la proyección deje de cumplir.
+     * Comprobado que esta comprobación comprueba: `ejecutarDisposicion` sí se consume —el
+     * censo la nombra al vaciar la lista—, y `exportarWorkspace` no se consumía, que es por
+     * lo que ya no está.
+     */
+    expect(Object.keys(DECLARADAS).filter((c) => !nombradasReales.includes(c)).sort()).toEqual(
+      [],
+    );
   });
 
   it('el panel se lee de UNA instantánea: sus campos no vienen de dos momentos', async () => {

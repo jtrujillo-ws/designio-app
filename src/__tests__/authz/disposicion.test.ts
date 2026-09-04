@@ -1871,10 +1871,40 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
             continue;
           }
         }
-        if (c === "'") {
+        /*
+         * Un identificador entre COMILLAS DOBLES es un nombre, no un dato — pero tampoco es
+         * una sentencia. `select 1 as "insert into t"` daba la transacción por escritora.
+         * Se vacía igual: lo que se busca aquí es sintaxis, y un nombre no la aporta. (Con
+         * un nombre entrecomillado, `update "t" set` ya no lo detectaba nadie: la `"` no es
+         * carácter de palabra, así que esto no quita nada que hoy funcione.)
+         */
+        if (c === '"') {
           i++;
           while (i < texto.length) {
-            if (texto[i] === "'" && texto[i + 1] === "'") i += 2;
+            if (texto[i] === '"' && texto[i + 1] === '"') i += 2;
+            else if (texto[i] === '"') {
+              i++;
+              break;
+            } else i++;
+          }
+          fuera += ' "" ';
+          continue;
+        }
+        if (c === "'") {
+          /*
+           * La cadena con prefijo `E` escapa con BARRA y no duplicando la comilla, así que
+           * `E'a\' insert into t --'` terminaba el literal en la barra y dejaba la escritura
+           * FUERA: la transacción salía exenta. Las demás formas con prefijo —`U&'…'`,
+           * `B'…'`, `X'…'`— escapan duplicando como la normal, y las dos últimas ni siquiera
+           * admiten letras suficientes para formar una palabra clave.
+           */
+          const prefijoE =
+            (texto[i - 1] === 'E' || texto[i - 1] === 'e') &&
+            !/[A-Za-z0-9_]/.test(texto[i - 2] ?? ' ');
+          i++;
+          while (i < texto.length) {
+            if (prefijoE && texto[i] === '\\') i += 2;
+            else if (texto[i] === "'" && texto[i + 1] === "'") i += 2;
             else if (texto[i] === "'") {
               i++;
               break;
@@ -2420,6 +2450,21 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a, b };
         });
       export { sondaOkDolarInterpolado };
+      // Un identificador ENTRE COMILLAS DOBLES: en SQL es un NOMBRE, no un dato, pero tampoco
+      // es una sentencia de escritura.
+      export const sondaIdentificador = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as "insert into temporal"\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      // Y la cadena con prefijo E, que escapa con BARRA y no duplicando la comilla.
+      export const sondaCadenaE = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select E'a\\' insert into temporal --' as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
       // Y lo mismo dentro de un LITERAL, que tampoco se ejecuta.
       export const sondaLiteralEscritura = async (actorId: string) =>
         conUsuario(actorId, async (tx) => {
@@ -2499,6 +2544,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaComentarioEscritura',
         'sonda.ts:sondaLiteralEscritura',
         'sonda.ts:sondaDolarEscritura',
+        'sonda.ts:sondaIdentificador',
+        'sonda.ts:sondaCadenaE',
       ].sort(),
     );
 

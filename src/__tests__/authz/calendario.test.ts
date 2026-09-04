@@ -1402,6 +1402,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       return t;
     };
+    /** Lo que hay antes del primer `,`, `)` o `;` que esté a profundidad cero. */
+    const hastaElDelimitador = (t: string): string => {
+      let nivel = 0;
+      for (let i = 0; i < t.length; i++) {
+        const c = t[i];
+        if (c === '(' || c === '[') nivel++;
+        else if (c === ')' || c === ']') {
+          if (nivel === 0) return t.slice(0, i);
+          nivel--;
+        } else if ((c === ',' || c === ';') && nivel === 0) return t.slice(0, i);
+      }
+      return t;
+    };
+
     /** Un nombre listo para meterse en una expresión regular sin significar otra cosa. */
     const escapado = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     /** El nombre como lo escribe quien lo declara, sin las comillas ni su duplicación. */
@@ -1421,9 +1435,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       if (nombres.length === 0) return false;
       // Lo que la propia declaración le pone dentro, que no es ninguna sentencia y por eso no
       // lo encontraba la búsqueda de asignaciones.
+      /*
+       * El inicializador se acota a PROFUNDIDAD CERO: termina en el primer `,`, `)` o `;` que
+       * no esté dentro de un paréntesis. Antes se capturaba hasta el `;` y eso, en el
+       * ENCABEZADO de una función, se llevaba por delante el resto de la definición —el
+       * `RETURNS`, el `LANGUAGE`, el cuerpo entero— y lo que llegaba a mirarse no se parecía a
+       * ningún reloj.
+       *
+       * Acotarlo arregla dos cosas de una: la captura deja de desbordarse, y el DEFAULT de un
+       * PARÁMETRO pasa a leerse como lo que es. Porque un parámetro también es un destino
+       * tipado, evaluado al invocar: medido, `f(p date default now())` devuelve 2026-09-05 en
+       * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12 cuando se omite el argumento, y
+       * `pg_get_functiondef` guarda el encabezado verbatim.
+       */
       const inicializadas = declaradas
         .map((m) => m.groups!.inicial)
-        .filter((x): x is string => x !== undefined);
+        .filter((x): x is string => x !== undefined)
+        .map(hastaElDelimitador);
       /*
        * Cada nombre se busca en las formas en que se puede volver a escribir, porque
        * declararlo entrecomillado no obliga a usarlo así después (ni al revés).
@@ -4184,6 +4212,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
           ' begin select now() into v; return v; end $c$',
       ],
+      /*
+       * El DEFAULT de un parámetro, que también es un destino tipado —se evalúa al invocar, con
+       * el huso de quien llama, cuando se omite el argumento—. Medido: `f(p date default
+       * now())` devuelve 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12, y el
+       * catálogo guarda el encabezado verbatim.
+       *
+       * Con su segura al lado, que fija que lo que decide es el TIPO del parámetro y no la
+       * palabra `default`: el mismo encabezado con huso conserva el instante.
+       */
+      [
+        'censo_probe_parametro_default_date',
+        '(p date default now()) returns date language sql immutable as $c$ select p $c$',
+      ],
+      [
+        'censo_probe_ok_parametro_default_instante',
+        '(p timestamptz default now()) returns timestamptz language sql immutable' +
+          ' as $c$ select p $c$',
+      ],
       [
         'censo_probe_ok_compara_columna_ambigua',
         'returns boolean language sql stable as $c$ select now() < d from censo_probe_otra $c$',
@@ -4356,7 +4402,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           " where now() > timestamptz '2000-01-01' $c$",
       ],
     ] as const) {
-      await admin.unsafe(`create function ${nombre}() ${sql}`);
+      // La mayoría no lleva argumentos y por eso el `()` va aquí; las que sí —el `DEFAULT` de
+      // un parámetro— traen su propia lista y empiezan por paréntesis.
+      await admin.unsafe(
+        sql.startsWith('(')
+          ? `create function ${nombre}${sql}`
+          : `create function ${nombre}() ${sql}`,
+      );
     }
     try {
       // `pg_get_functiondef` y no `prosrc`, y `prokind = 'f'` porque aquél no acepta
@@ -4462,6 +4514,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_subconsulta_escalar_date',
           'censo_probe_subconsulta_escritura_date',
           'censo_probe_pct_type_into_date',
+          'censo_probe_parametro_default_date',
           'censo_probe_tabla_unicode_date',
         ].sort(),
       );
@@ -4535,6 +4588,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_subconsulta_escalar_date',
         'censo_probe_subconsulta_escritura_date',
         'censo_probe_pct_type_into_date',
+        'censo_probe_parametro_default_date',
+        'censo_probe_ok_parametro_default_instante',
         'censo_probe_tabla_unicode_date',
         'censo_probe_ok_compara_columna_ambigua',
         'censo_probe_ok_rowtype_instante',
@@ -4553,7 +4608,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_huso_fijo_date',
         'censo_probe_ok_subconsulta_date',
       ]) {
-        await admin.unsafe(`drop function ${nombre}()`);
+        // Sin la lista de argumentos: alguna sonda lleva parámetro y `()` no la nombraría.
+        await admin.unsafe(`drop function ${nombre}`);
       }
     }
   });

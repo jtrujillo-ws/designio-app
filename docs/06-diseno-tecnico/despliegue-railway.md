@@ -48,6 +48,9 @@ El patrón de datos usa **dos conexiones** (diseño técnico · Multi-tenancy): 
 | `DATABASE_URL_APP` | `postgresql://designio_app:${{APP_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` | Se compone con referencias; si la referencia a la variable propia no resuelve en tu plan, usar una *shared variable* del environment (`${{shared.APP_DB_PASSWORD}}`) para ambas |
 | `JWT_SECRET` | secret generado (`openssl rand -hex 32`), distinto por environment | Sesiones y tokens de capacidad (cuando llegue auth) |
 | `SEED_ON_START` | `true` solo en `dev` | Crea el workspace demo Banco Andino; en `stg`/`production` va `false` |
+| `SEED_ADMIN_EMAIL` | tu correo real, opcional | Con `SEED_ON_START=true`, siembra **tu** cuenta como `lead-boutique` en los dos workspaces demo. Va por variable y no en el seed del repo a propósito: una dirección real escrita en el código queda en el historial para siempre |
+| `SEED_ADMIN_PASSWORD` | secret, **mínimo 12 caracteres** | Obligatoria si pones la anterior: el seed **falla** en vez de inventar una clave. Solo se aplica cuando la cuenta no tiene contraseña todavía, así que una variable vieja no reabre el acceso en el siguiente arranque |
+| `SEED_ADMIN_NOMBRE` | opcional | Por omisión, la parte del correo antes de la arroba |
 | `ANTHROPIC_API_KEY` | secret | Solo cuando llegue la capa AI (PR del pipeline PropuestaAI) |
 | `CRON_SECRET` | secret generado | Solo cuando lleguen los hooks de jobs |
 
@@ -65,6 +68,8 @@ El patrón de datos usa **dos conexiones** (diseño técnico · Multi-tenancy): 
 La migración `00-init.sql` intenta `create extension vector` de forma **tolerante**: si la imagen del plugin no la trae, avisa y continúa (la búsqueda semántica llegará en un PR posterior). Si el plugin estándar no incluye pgvector, desplegar la plantilla de Postgres con pgvector de Railway y apuntar las variables a ese servicio.
 
 ## 5. Verificación post-deploy (cada environment)
+
+Las tres cuentas demo que siembra `SEED_ON_START` son `lucia@whitespace.demo` (lead-boutique, en los dos workspaces), `maria@bancoandino.demo` (sponsor) y `canales@bancoandino.demo` (stakeholder), todas con la contraseña `designio.demo`. Son de dominios inexistentes a propósito y **no sirven fuera de `dev`**.
 
 ```bash
 # 1. Salud

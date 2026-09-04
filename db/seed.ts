@@ -1166,6 +1166,62 @@ async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Pro
   return true;
 }
 
+/**
+ * La cuenta PROPIA de quien despliega, por variable de entorno y no escrita aquí.
+ *
+ * Por qué no va en `PERSONAS`: una dirección real metida en el seed queda en el historial
+ * del repositorio para siempre y se la lleva cualquiera que clone. Las tres de arriba son
+ * de dominios `.demo` inexistentes a propósito; una de verdad no lo es.
+ *
+ * Idempotente y con la MISMA regla que las demo: si la cuenta ya existe, solo se le pone
+ * contraseña cuando no tiene ninguna. Un seed que reescribiera la contraseña en cada
+ * arranque convertiría una variable de entorno vieja en una puerta abierta — y este seed
+ * corre en CADA despliegue con `SEED_ON_START=true`.
+ *
+ * Entra como `lead-boutique` en los dos workspaces sembrados, que es lo que hace útil la
+ * cuenta: uno solo no ejercita el selector.
+ */
+async function sembrarAdminPropio(cliente: typeof sql, wsId: string): Promise<string | null> {
+  const email = process.env.SEED_ADMIN_EMAIL?.trim().toLowerCase();
+  if (!email) return null;
+  const clave = process.env.SEED_ADMIN_PASSWORD ?? '';
+  // Se falla en vez de inventar una contraseña: una cuenta con acceso de lead-boutique y
+  // una clave que nadie eligió es peor que no tener cuenta.
+  if (clave.length < 12) {
+    throw new Error(
+      'SEED_ADMIN_EMAIL está puesta pero SEED_ADMIN_PASSWORD falta o tiene menos de 12 caracteres',
+    );
+  }
+  const nombre = process.env.SEED_ADMIN_NOMBRE?.trim() || email.split('@')[0]!;
+  const hash = await bcrypt.hash(clave, 10);
+  const [existente] = await cliente`select id, password_hash from usuario
+    where lower(email) = ${email}`;
+  let id: string;
+  if (existente) {
+    id = existente.id as string;
+    if (existente.password_hash === null) {
+      await cliente`update usuario
+        set password_hash = ${hash}, estado = 'activo',
+            invitacion_token_hash = null, invitacion_expira = null, actualizado_en = now()
+        where id = ${id}`;
+    }
+  } else {
+    const [u] = await cliente`insert into usuario (email, nombre, password_hash, estado)
+      values (${email}, ${nombre}, ${hash}, 'activo') returning id`;
+    id = u!.id as string;
+  }
+  // La membresía va por workspace y se salta la que ya esté: `on conflict do nothing` y no
+  // un `select` previo, porque entre mirar y escribir cabe otro arranque del mismo deploy.
+  const [ws2] = await cliente`select id from workspace where nombre = 'Clínica del Valle'`;
+  for (const w of [wsId, ws2?.id as string | undefined]) {
+    if (!w) continue;
+    await cliente`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${w}, ${id}, ${nombre}, ${email}, 'lead-boutique')
+      on conflict do nothing`;
+  }
+  return email;
+}
+
 async function main() {
   const hash = await bcrypt.hash(PASSWORD_DEMO, 10);
 
@@ -1231,8 +1287,10 @@ async function main() {
       );
       propuestaSembrada = await sql.begin((tx) => sembrarPropuestaAI(tx, wsId, lucia.id as string));
     }
+    const adminPropio = await sembrarAdminPropio(sql, wsId);
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
+        (adminPropio ? `; cuenta propia ${adminPropio} asegurada como lead-boutique` : '') +
         (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
         (metodoSembrado ? '; método de P-01 sembrado' : '') +
         (journeySembrado ? '; journey as-is sembrado' : '') +
@@ -1281,6 +1339,8 @@ async function main() {
   // borrador y su aprobación cayeran en el mismo commit, que es justo el estado que el
   // producto no puede producir y que el guard diferido rechaza.
   await sembrarEntrega(sql, creado.wsId, creado.luciaId);
+  const adminPropio = await sembrarAdminPropio(sql, creado.wsId);
+  if (adminPropio) console.log(`seed: cuenta propia ${adminPropio} creada como lead-boutique`);
   console.log(
     `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1, item de bandeja con propuesta AI pendiente) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );

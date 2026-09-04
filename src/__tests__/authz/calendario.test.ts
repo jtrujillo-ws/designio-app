@@ -34,7 +34,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   const PRECISION = String.raw`(?:\s*\(\s*\d+\s*\))?`;
   const PALABRAS_DEL_RELOJ = [
     // De más larga a más corta: con `current_time` delante, la alternación la casaba dentro
-    // de `current_timestamp` y el resto quedaba suelto.
+    // de `current_timestamp` y el resto quedaba suelto. (Con la frontera derecha puesta ya no
+    // haría falta —`current_time\b` no casa dentro de `current_timestamp`— pero el orden no
+    // estorba y una alternación ordenada se lee sin tener que razonar el caso.)
     //
     // Las DOS fronteras van DENTRO de cada palabra. Antes vivían al final de la alternación
     // entera —`\b(…)\b`— y ahí no se podían reutilizar: `current_timestamp(0)` termina en
@@ -46,12 +48,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // no: `mi_current_timestamp::date` casaba desde la mitad del identificador. Es el mismo
     // patrón de siempre —lo que se queda atrás al mover algo— y por eso las fronteras viajan
     // ahora CON la palabra, no alrededor de quien la usa.
-    `\\bcurrent_timestamp\\b${PRECISION}`,
-    `\\bcurrent_time\\b${PRECISION}`,
-    `\\blocaltimestamp\\b${PRECISION}`,
-    `\\blocaltime\\b${PRECISION}`,
-    String.raw`\bcurrent_date\b`,
+    'current_timestamp',
+    'current_time',
+    'localtimestamp',
+    'localtime',
+    'current_date',
   ];
+  /** El patrón de una palabra: sus dos fronteras y su precisión opcional. */
+  const patronDe = (palabra: string) => String.raw`\b${palabra}\b${PRECISION}`;
 
   /**
    * Los campos y precisiones seguros NO se escriben: se MIDEN contra la base, comparando el
@@ -219,12 +223,49 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Las funciones llevan su frontera IZQUIERDA: sin ella, `mi_now()` salía marcado. A la
       // derecha no hace falta ninguna, porque el `\)` del nombre ya cierra.
       ...funciones.map((f) => String.raw`\b${f}`),
-      ...PALABRAS_DEL_RELOJ,
+      // Y TODAS las palabras: colapsar cualquiera de ellas a un día es peligroso, aunque la
+      // palabra desnuda no lo sea.
+      ...PALABRAS_DEL_RELOJ.map(patronDe),
     ].join('|');
+
+    /*
+     * Cuáles de esas palabras son peligrosas POR SÍ SOLAS, sin colapsar nada. No se decide a
+     * mano: se deriva del TIPO que devuelven, preguntándoselo a la base.
+     *
+     * La regla —medida, no supuesta— es que un valor de reloj es independiente del huso si su
+     * tipo LLEVA huso. Con un instante fijo y dos husos opuestos:
+     *
+     *   current_timestamp  timestamp with time zone     igualdad → true    estable
+     *   current_time       time with time zone          igualdad → true    estable
+     *   localtimestamp     timestamp without time zone  20:35 vs 18:35     DEPENDE
+     *   localtime          time without time zone       20:35 vs 18:35     DEPENDE
+     *   current_date       date                         09-04 vs 09-03     DEPENDE
+     *
+     * La cabecera de este fichero ya decía que `current_timestamp` es un instante absoluto y
+     * no debía marcarse, y sin embargo `DEL_HUSO_DE_LA_SESION` se construía con la lista
+     * ENTERA y lo marcaba: el contrato escrito y el código decían cosas distintas. Ahora lo
+     * dice una sola vez, y lo dice la base.
+     */
+    expect(PALABRAS_DEL_RELOJ.every((w) => /^[a-z_]+$/.test(w))).toBe(true);
+    const tipos = await sqlAdmin().unsafe(
+      PALABRAS_DEL_RELOJ.map(
+        (w) => `select '${w}' as palabra, pg_typeof(${w})::text as tipo`,
+      ).join(' union all '),
+    );
+    const yaLeenLaPared = tipos
+      .filter((f) => !(f.tipo as string).endsWith('with time zone'))
+      .map((f) => f.palabra as string);
+    // Que la derivación esté derivando: `current_date` es una fecha y tiene que salir; el
+    // `timestamptz` de `current_timestamp` es un instante absoluto y no puede.
+    expect(yaLeenLaPared).toContain('current_date');
+    expect(yaLeenLaPared).not.toContain('current_timestamp');
     // Sin `\b` alrededor: cada palabra trae ya las suyas, y ponerlas dos veces esconde de
     // quién son. Comprobado que sigue distinguiendo `current_date` de `current_date_pactada`
-    // y de `mi_current_timestamp`, y que sigue viendo `current_timestamp(0)`.
-    DEL_HUSO_DE_LA_SESION = new RegExp(String.raw`(?:${PALABRAS_DEL_RELOJ.join('|')})`, 'i');
+    // y de `mi_current_timestamp`, y que sigue viendo `localtimestamp(3)`.
+    DEL_HUSO_DE_LA_SESION = new RegExp(
+      String.raw`(?:${yaLeenLaPared.map(patronDe).join('|')})`,
+      'i',
+    );
 
     /*
      * Un reloj rara vez llega DESNUDO a la operación que elige el calendario: se le pone un
@@ -248,7 +289,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * destino ampliado de aquí abajo se escapan `now()::timestamp` y su deparseo. Ninguna de
      * las dos enrojece nada que no sea suyo.
      */
-    const TIPO_DE_TIEMPO = String.raw`timestamptz\b${PRECISION}|timestamp\b${PRECISION}(?:\s+with(?:out)?\s+time\s+zone\b)?`;
+    const TIPO_DE_TIEMPO = [
+      String.raw`timestamptz\b${PRECISION}`,
+      String.raw`timestamp\b${PRECISION}(?:\s+with(?:out)?\s+time\s+zone\b)?`,
+      // `timetz` conserva el instante —medido: dos husos opuestos dan valores IGUALES— así
+      // que no es un destino que elija calendario. Pero es un paso por el que el reloj puede
+      // ATRAVESAR hacia uno que sí: `(now()::time with time zone)::time` tira el desfase y se
+      // queda la esfera local, 20:35 en Kiritimati y 18:35 en Etc/GMT+12. Excluirlo del
+      // destino y no admitirlo como paso dejaba la expresión entera fuera del censo.
+      String.raw`timetz\b${PRECISION}`,
+      String.raw`time\b${PRECISION}\s+with\s+time\s+zone\b`,
+    ].join('|');
     const CASTOS = String.raw`(?:\s*::\s*(?:${TIPO_DE_TIEMPO}))*`;
     const entreParentesis = (x: string) => String.raw`(?:${x}|\(\s*(?:${x})\s*\))`;
     const RELOJ = entreParentesis(entreParentesis(RELOJES) + CASTOS) + CASTOS;
@@ -440,6 +491,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'timestamp',
       culpable: true,
     },
+    // El reloj que ATRAVIESA un `timetz` para quedarse la esfera local. El `timetz` conserva
+    // el instante, pero tirar su desfase no: 20:35 en Kiritimati, 18:35 en Etc/GMT+12.
+    censo_probe_timetz: {
+      expr: '(now()::time with time zone)::time',
+      tipo: 'time',
+      culpable: true,
+    },
     // Y las seguras, que son la otra mitad del contrato: un censo que marcara el propio
     // arreglo acabaría desactivado, así que se exige explícitamente que NO las señale.
     censo_probe_ok_utc: {
@@ -479,6 +537,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     censo_probe_ok_tz_prec: {
       expr: 'now()::timestamp(0) with time zone',
       tipo: 'timestamptz',
+      culpable: false,
+    },
+    // `current_timestamp` desnudo es un instante absoluto —la cabecera de este fichero lo dice
+    // desde el principio— y el censo lo marcaba igual. Con la lista derivada del tipo, ya no.
+    censo_probe_ok_ct: {
+      expr: 'current_timestamp',
+      tipo: 'timestamptz',
+      culpable: false,
+    },
+    // Y `timetz` desnudo, que conserva el instante (medido por igualdad, no por impresión).
+    censo_probe_ok_timetz: {
+      expr: 'now()::time with time zone',
+      tipo: 'timetz',
       culpable: false,
     },
     // Un identificador que TERMINA en la palabra clave no es una lectura del reloj, y solo la
@@ -569,6 +640,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'now()::timestamp(0)',
       'cast(now()::timestamptz(3) as date)',
       'current_timestamp(0)::timestamp(0)',
+      // El reloj que atraviesa un `timetz` y se queda la esfera local.
+      '(now()::time with time zone)::time',
+      'now()::timetz::time',
+      '(now()::timetz)::time',
+      'extract(hour from now()::time with time zone)',
+      'current_time::time',
     ];
     const SEGURAS = [
       "timezone('UTC', now())::date",
@@ -610,6 +687,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'now()::timestamp(0) with time zone',
       '(now())::timestamp(0) with time zone',
       'now()::timestamptz(0)',
+      // Las palabras cuyo tipo LLEVA huso son instantes absolutos y no se marcan solas.
+      // Medido: con instante fijo, la igualdad da `true` en husos opuestos.
+      'current_timestamp',
+      'current_time',
+      'select current_timestamp - creado_en from disposicion',
+      'vence_en > current_timestamp',
+      // …y `timetz` como destino conserva el instante igual.
+      'now()::time with time zone',
+      'now()::timetz',
       // Un identificador que TERMINA en la palabra clave. Solo la frontera IZQUIERDA lo
       // separa: `current_date_pactada` lo para la derecha, y por eso no prueba esta mitad.
       'mi_current_timestamp::date',

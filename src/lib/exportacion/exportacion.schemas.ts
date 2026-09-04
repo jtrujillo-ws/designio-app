@@ -416,8 +416,8 @@ export function nombreDeArchivoExport(
   /**
    * El `generadoEn` del MANIFIESTO (ISO), no el reloj de quien descarga. Es el mismo
    * arreglo que ya se hizo DENTRO del recibo y que aquí faltaba: `generadoEn` sale del
-   * `now()` de la transacción que leyó los datos —el mismo del que `current_date` derivó
-   * para decidir qué derechos seguían vigentes—, mientras que el nombre del fichero salía
+   * `now()` de la transacción que leyó los datos —el mismo del que `fecha_de_la_base()`
+   * derivó para decidir qué derechos seguían vigentes—, mientras que el nombre del fichero salía
    * de `new Date()` en el navegador. Con desfase de relojes o cruzando medianoche, el
    * fichero que el auditor archiva llevaba un día distinto del que dice el recibo que
    * contiene. Un recibo y su etiqueta tienen que venir del mismo reloj, y el que manda es

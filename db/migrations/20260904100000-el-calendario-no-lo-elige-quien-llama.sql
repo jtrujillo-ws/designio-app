@@ -45,6 +45,23 @@
 -- huso —un `date` no tiene ninguno—, así que los mensajes que imprimen `vence_en` ya estaban
 -- bien. Solo `to_char` sobre un `timestamptz` se mueve, y en estos objetos no hay ninguno.
 
+-- ── 0. El calendario, con un nombre ──────────────────────────────────────────────────
+-- Una función y no la expresión repetida en cada sitio, por la razón que este esquema ya
+-- tiene escrita para el espejo de la pantalla: «el espejo LEE la regla; no la reproduce».
+-- Con `timezone('UTC', now())::date` copiado en ocho sitios, la regla vuelve a ser ocho
+-- reglas, y basta con arreglar siete para que el octavo empiece a discrepar justo en el
+-- borde del día — que es exactamente el fallo que esta migración viene a cerrar.
+--
+-- STABLE y no IMMUTABLE: depende del reloj, no de la sesión. Concedida a `designio_app`
+-- porque el servicio la NECESITA: sus consultas de diagnóstico tienen que juzgar con el
+-- mismo día que la política que autoriza, o el lead ve «no falta nada» junto a un rechazo.
+create function fecha_de_la_base() returns date
+language sql stable parallel safe as
+$$ select timezone('UTC', now())::date $$;
+comment on function fecha_de_la_base() is
+  'El día de calendario contra el que juzga la base: UTC, fijo, nunca el huso de la sesión. Lo leen las reglas y también los espejos que las diagnostican, para que no puedan discrepar.';
+grant execute on function fecha_de_la_base() to designio_app;
+
 -- ── 1. Los derechos vigentes ──
 create or replace function derechos_vigentes(p_evidencia uuid, p_ws uuid, p_ambito text)
 returns boolean language sql stable security definer set search_path = public, pg_temp as $$
@@ -55,7 +72,7 @@ returns boolean language sql stable security definer set search_path = public, p
       and d.estado = 'concedido'
       -- Caducado ⇒ ya no hay derechos (fecha calendárica, comparada como día, en el
       -- calendario de la BASE y no en el de quien pregunta).
-      and (d.vence_en is null or d.vence_en >= timezone('UTC', now())::date)
+      and (d.vence_en is null or d.vence_en >= fecha_de_la_base())
       and case p_ambito
             when 'interno' then d.ambito in ('interno', 'cliente', 'publico')
             when 'cliente' then d.ambito in ('cliente', 'publico')
@@ -77,7 +94,7 @@ returns text language sql stable security definer set search_path = public, pg_t
       'derechos pendientes: nadie ha registrado la base (consentimiento o cláusula) que autoriza este uso'
     when d.estado = 'denegado' then
       'derechos denegados: ' || d.base
-    when d.vence_en is not null and d.vence_en < timezone('UTC', now())::date then
+    when d.vence_en is not null and d.vence_en < fecha_de_la_base() then
       -- `to_char` sobre un `date` no depende del huso (medido): la fecha que se imprime ya
       -- era estable, y ahora también lo es la comparación que decide imprimirla.
       'los derechos vencieron el ' || to_char(d.vence_en, 'YYYY-MM-DD')
@@ -93,7 +110,7 @@ $$;
 create or replace function ventana_de_medicion_abierta(p_inicio date, p_dias integer)
 returns boolean language sql stable parallel safe as $$
   select p_inicio is null or p_dias is null
-     or p_inicio + p_dias >= timezone('UTC', now())::date
+     or p_inicio + p_dias >= fecha_de_la_base()
 $$;
 
 -- ── 4. La fecha del dato no puede ser del futuro ──
@@ -110,7 +127,7 @@ create policy snapshot_insert on snapshot
     --
     -- Contra el calendario de la base: una política se evalúa entera en la sesión de quien
     -- escribe, así que con `current_date` «el futuro» empezaba donde el que inserta dijera.
-    and snapshot.fecha <= timezone('UTC', now())::date
+    and snapshot.fecha <= fecha_de_la_base()
     and exists (select 1 from entrada_kpi e
       join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
       join reto rt on rt.id = r.reto_id and rt.workspace_id = r.workspace_id

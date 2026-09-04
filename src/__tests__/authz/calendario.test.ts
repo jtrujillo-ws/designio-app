@@ -106,6 +106,47 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(culpables).toEqual([]);
   });
 
+  it('ni el SQL de la aplicación, que es por donde volvió', async () => {
+    /*
+     * El censo del catálogo no alcanzaba al SQL que la aplicación escribe en sus plantillas,
+     * y por ahí volvió el defecto en cuanto se arregló la base: `snapshot_insert` pasó a
+     * juzgar con el calendario fijo mientras `contextoDeEntrada` y `seguimientoDeImpacto`
+     * seguían diagnosticando con `current_date`. En el borde del día la pantalla ofrecía una
+     * fecha que la política rechaza —con el error genérico de RLS— o escondía una que sí
+     * acepta, que es justo lo que el comentario de ese módulo dice que no puede pasar: «el
+     * espejo LEE la regla; no la reproduce».
+     *
+     * Se leen los ficheros del repositorio y no el catálogo, porque lo que se vigila es la
+     * plantilla, no un objeto de la base. Los tests quedan fuera: ahí `current_date` es
+     * legítimo para construir un caso.
+     */
+    const { readdir, readFile } = await import('node:fs/promises');
+    const raiz = new URL('../../', import.meta.url).pathname;
+    const ficheros: string[] = [];
+    const recorrer = async (dir: string) => {
+      for (const e of await readdir(dir, { withFileTypes: true })) {
+        const ruta = `${dir}/${e.name}`;
+        if (e.isDirectory()) {
+          if (e.name !== '__tests__') await recorrer(ruta);
+        } else if (e.name.endsWith('.ts') || e.name.endsWith('.tsx')) ficheros.push(ruta);
+      }
+    };
+    await recorrer(raiz.replace(/\/$/, ''));
+    // Que el censo esté mirando algo, y no un directorio que alguien movió.
+    expect(ficheros.length).toBeGreaterThan(50);
+
+    const culpables: string[] = [];
+    for (const f of ficheros) {
+      // Sin comentarios: un `current_date` que EXPLICA por qué ya no se usa no es un
+      // hallazgo, y sin esto el censo se volvería contra quien documenta el arreglo.
+      const codigo = (await readFile(f, 'utf8'))
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/[^\n]*/g, '');
+      if (DEL_HUSO_DE_LA_SESION.test(codigo)) culpables.push(f.slice(raiz.length));
+    }
+    expect(culpables.filter((c) => !(c in DECLARADAS))).toEqual([]);
+  });
+
   it('la ventana de medición no se alarga cambiando de huso', async () => {
     /*
      * El caso concreto, sobre la única de las cuatro que es una función PURA —sin filas de por

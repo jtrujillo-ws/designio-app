@@ -51,8 +51,8 @@ export async function exportarWorkspace(
 
     // Permiso + auditoría en la misma transacción que lee los datos (RF-01.6/01.8).
     // El instante del manifiesto se lee AQUÍ, del reloj de la base y no del proceso: es el
-    // `now()` de la transacción, exactamente el mismo del que `current_date` deriva dentro
-    // de `evidencia_usable` para decidir qué derechos siguen vigentes. Sellarlo después
+    // `now()` de la transacción, exactamente el mismo del que `fecha_de_la_base()` deriva
+    // dentro de `evidencia_usable` para decidir qué derechos siguen vigentes. Sellarlo después
     // con `new Date()` era firmar el recibo con un reloj distinto del que lo emitió: una
     // exportación arrancada antes de medianoche podía incluir evidencia cuyos derechos
     // vencían ese día y fecharse al día siguiente, y cualquier desfase entre el reloj de

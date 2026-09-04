@@ -1767,9 +1767,20 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
      * nada, y solo se encuentra razonando. Fabricando fuentes se prueba el censo a sí mismo,
      * que es lo que el censo del calendario ya hacía con sus sondas.
      */
+    /** Las fuentes del repositorio por ruta, para poder seguir a un ayudante IMPORTADO. */
+    const fuentesDelRepo = new Map<string, string>();
+    const analizadas = new Map<string, TS.SourceFile>();
+    const parsear = (ruta: string, texto: string) => {
+      const ya = analizadas.get(ruta);
+      if (ya) return ya;
+      const f = ts.createSourceFile(ruta, texto, ts.ScriptTarget.Latest, true);
+      analizadas.set(ruta, f);
+      return f;
+    };
+
     const censar = (ruta: string, texto: string): string[] => {
       const nombradas: string[] = [];
-      const fuente = ts.createSourceFile(ruta, texto, ts.ScriptTarget.Latest, true);
+      const fuente = parsear(ruta, texto);
 
       /**
        * Cuántas sentencias corren en ESTA transacción bajo el nodo. Tres formas, y la tercera
@@ -1785,6 +1796,70 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        *    módulo, y `exigirCuentaActiva` se IMPORTA en casi todos, así que una proyección
        *    nueva en cualquier fichero salvo `auth.servicio.ts` se contaba de menos.
        */
+      /**
+       * Las funciones de un módulo por nombre. Va aparte porque hace falta también para los
+       * módulos AJENOS: sin poder mirar dentro de un ayudante importado, su recuento se
+       * quedaba en una sentencia, que es el TECHO optimista y no el suelo.
+       */
+      const tablaDe = (f: TS.SourceFile) => {
+        const t = new Map<string, TS.Node>();
+        for (const st of f.statements) {
+          if (ts.isFunctionDeclaration(st) && st.name) t.set(st.name.text, st);
+          if (ts.isVariableStatement(st)) {
+            for (const d of st.declarationList.declarations) {
+              if (!ts.isIdentifier(d.name) || !d.initializer) continue;
+              const v = desenvolver(d.initializer);
+              if (ts.isArrowFunction(v) || ts.isFunctionExpression(v)) t.set(d.name.text, v);
+            }
+          }
+        }
+        return t;
+      };
+      /**
+       * Y de dónde viene un nombre IMPORTADO: se busca su `import`, se resuelve la ruta
+       * relativa —con `.ts` y con `/index.ts`— y se mira la tabla de ESE módulo. Si el
+       * ayudante llama a su vez a otro que tampoco se resuelve, el desconocimiento se propaga
+       * y la transacción falla cerrado, que es lo correcto.
+       */
+      const resolverImportado = (nombre: string) => {
+        for (const st of fuente.statements) {
+          if (!ts.isImportDeclaration(st) || !st.importClause) continue;
+          const enlaces = st.importClause.namedBindings;
+          if (!enlaces || !ts.isNamedImports(enlaces)) continue;
+          const el = enlaces.elements.find((e) => e.name.text === nombre);
+          if (!el) continue;
+          const local = (el.propertyName ?? el.name).text;
+          const espec = st.moduleSpecifier;
+          if (!ts.isStringLiteral(espec)) return undefined;
+          /*
+           * Dos formas de nombrar el módulo, y la que se usa aquí es la del ALIAS: en este
+           * repositorio los ayudantes compartidos se importan como `@/lib/auth/auth.servicio`.
+           * Las claves del mapa son relativas a `src/lib/`, así que el alias es un recorte.
+           * La relativa va también, que es lo que se escribirá el día que alguien mueva algo.
+           */
+          let raizMod: string;
+          if (espec.text.startsWith('@/lib/')) raizMod = espec.text.slice('@/lib/'.length);
+          else if (espec.text.startsWith('.')) {
+            const base = ruta.split('/').slice(0, -1);
+            for (const trozo of espec.text.split('/')) {
+              if (trozo === '.') continue;
+              else if (trozo === '..') base.pop();
+              else base.push(trozo);
+            }
+            raizMod = base.join('/');
+          } else return undefined;
+          for (const cand of [`${raizMod}.ts`, `${raizMod}/index.ts`]) {
+            const texto2 = fuentesDelRepo.get(cand);
+            if (texto2 === undefined) continue;
+            const tabla = tablaDe(parsear(cand, texto2));
+            const nodo = tabla.get(local);
+            if (nodo) return { nodo, tabla };
+          }
+          return undefined;
+        }
+        return undefined;
+      };
+
       /** Ayudantes ya en la pila, para no caer en un ciclo si dos se llaman entre sí. */
       const enCurso = new Set<TS.Node>();
       /**
@@ -1922,9 +1997,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       const analizar = (
         nodo: TS.Node,
         tx: string,
-      ): { sentencias: number; escribe: boolean } => {
+        tabla: Map<string, TS.Node> = porNombre,
+      ): { sentencias: number; escribe: boolean; desconocido: boolean } => {
         let sentencias = 0;
         let escribe = false;
+        let desconocido = false;
         /*
          * Solo cuentan las sentencias cuyo RESULTADO llega a la respuesta. Una cuyo valor se
          * descarta —`await exigirCuentaActiva(tx, actorId);`, una sentencia de expresión a
@@ -1975,22 +2052,42 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
                * Un ayudante que recibe `tx` ejecuta SUS consultas en esta transacción, así que
                * cuenta lo que ejecuta él, no uno. Contando uno, una proyección que delegara
                * todas sus lecturas —`return cargarPanel(tx, …)`— salía con una sola sentencia
-               * y se escapaba. Se expande si es del módulo; si viene de otro (`import`), no
-               * hay cuerpo que mirar y se cuenta como una, que es el suelo conservador.
+               * y se escapaba. Se expande si es del módulo.
+               *
+               * Y si viene de OTRO módulo, no hay cuerpo que mirar. Aquí decía que contar una
+               * era «el suelo conservador» y era falso al revés: la regla nombra a partir de
+               * DOS sentencias, así que contar una es el techo OPTIMISTA — un ayudante
+               * importado con tres lecturas dejaba la proyección en una y fuera del censo.
+               * Ahora el recuento queda DESCONOCIDO, que falla cerrado.
                */
-              const destino = ts.isIdentifier(f) ? porNombre.get(f.text) : undefined;
+              const destino = ts.isIdentifier(f) ? tabla.get(f.text) : undefined;
               // El ayudante llama a la transacción como quiera: se lee de SU declaración.
               const txDelAyudante = destino ? primerParametro(destino) : undefined;
               if (destino && txDelAyudante && !enCurso.has(destino)) {
                 enCurso.add(destino);
-                const sub = analizar(destino, txDelAyudante);
+                const sub = analizar(destino, txDelAyudante, tabla);
                 enCurso.delete(destino);
                 escribe ||= sub.escribe;
+                desconocido ||= sub.desconocido;
                 // Las del ayudante heredan el destino del valor de ESTA llamada: si aquí se
                 // descarta, son una puerta entera y no cuentan.
                 for (let i = 0; i < sub.sentencias; i++) contar(n);
               } else {
-                contar(n);
+                // Y si no es del módulo, se busca en el que lo EXPORTA antes de darse por
+                // vencido. Solo cuando tampoco ahí hay cuerpo queda desconocido.
+                const fuera = ts.isIdentifier(f) ? resolverImportado(f.text) : undefined;
+                const txAjeno = fuera ? primerParametro(fuera.nodo) : undefined;
+                if (fuera && txAjeno && !enCurso.has(fuera.nodo)) {
+                  enCurso.add(fuera.nodo);
+                  const sub = analizar(fuera.nodo, txAjeno, fuera.tabla);
+                  enCurso.delete(fuera.nodo);
+                  escribe ||= sub.escribe;
+                  desconocido ||= sub.desconocido;
+                  for (let i = 0; i < sub.sentencias; i++) contar(n);
+                } else {
+                  desconocido = true;
+                  contar(n);
+                }
               }
             }
           }
@@ -2003,10 +2100,14 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           ts.forEachChild(n, visitar);
         };
         ts.forEachChild(nodo, visitar);
-        return { sentencias, escribe };
+        return { sentencias, escribe, desconocido };
       };
 
-      /** Todas las funciones del módulo por nombre, exportadas o no. */
+      /**
+       * Todas las funciones del módulo por nombre, exportadas o no. Se siembra con la MISMA
+       * tabla que se usa para los módulos ajenos, para que las dos no puedan divergir; el
+       * recorrido de abajo añade además lo que solo tiene sentido en el módulo propio.
+       */
       const porNombre = new Map<string, TS.Node>();
       /**
        * Y los nombres que SALEN del módulo, por cualquiera de las cuatro puertas. Antes esto
@@ -2087,6 +2188,9 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       const llevaExport = (n: TS.Node) =>
         ts.canHaveModifiers(n) &&
         (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+      // La tabla se siembra AQUÍ y no en la declaración: `tablaDe` usa `desenvolver`, que se
+      // define más abajo, y llamarla antes muere en la zona muerta temporal.
+      for (const [k, v] of tablaDe(fuente)) porNombre.set(k, v);
       for (const st of fuente.statements) {
         if (ts.isFunctionDeclaration(st)) {
           /*
@@ -2359,13 +2463,20 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
             return;
           }
 
-          const { sentencias, escribe } = analizar(callback, tx);
+          const { sentencias, escribe, desconocido } = analizar(callback, tx);
 
           // Con varias transacciones en la misma función, la clave dice CUÁL. El aislamiento
           // ya se comprobó arriba: si estuviera fijado, no se llegaría hasta aquí — y dejarlo
           // en esta condición sería una comprobación que no puede ser falsa, o sea ruido que
           // el día de mañana hace creer que aquí se decide algo.
-          if (sentencias >= 2 && !escribe) nombradas.push(clave);
+          /*
+           * Y un recuento DESCONOCIDO cuenta como varias: si no se sabe cuántas consultas
+           * ejecuta el ayudante importado, no se puede afirmar que sea una sola, y una
+           * afirmación que no se puede sostener no exime de nada.
+           */
+          if ((sentencias >= 2 || desconocido) && !escribe) {
+            nombradas.push(desconocido && sentencias < 2 ? `${clave} (ayudante sin resolver)` : clave);
+          }
         });
       }
       /*
@@ -2407,6 +2518,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         return { a, b };
       });`;
     const FUENTE_SONDA = `
+      import { leerDosAjenas, leerUnaAjena } from '@/lib/sonda/ayudante';
+      import { leerDeModuloAusente } from '@/lib/sonda/no-existe';
       ${cuerpo('sondaModificador').replace('const sondaModificador', 'export const sondaModificador')}
       ${cuerpo('sondaClausula')}
       export { sondaClausula };
@@ -2571,6 +2684,16 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a, b };
         });
       export const { sondaDesestructurada } = { sondaDesestructurada: leerPanelDes };
+      // Un ayudante de OTRO módulo que ejecuta DOS consultas. Contando uno —el techo
+      // optimista— esta proyección salía con una sentencia y se escapaba entera.
+      export const sondaAyudanteAjeno = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => leerDosAjenas(tx));
+      // Y el mismo camino con UNA sola: fallar cerrado sobre ella sería un falso positivo.
+      export const sondaOkAyudanteAjeno = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => leerUnaAjena(tx));
+      // Y uno cuyo módulo no se puede leer: ahí SÍ falla cerrado, con el motivo en el nombre.
+      export const sondaAyudanteIlegible = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => leerDeModuloAusente(tx));
       // La llamada por PROPIEDAD, que es como queda conUsuario con un import de espacio.
       export const sondaPropiedad = async (actorId: string) =>
         db.conUsuario(actorId, async (tx) => {
@@ -2656,6 +2779,24 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         });
       }
     `;
+    /*
+     * Un módulo AJENO fabricado, para que el seguimiento entre módulos tenga qué seguir. Sin
+     * él las dos sondas del ayudante ajeno saldrían nombradas por desconocimiento y no se
+     * distinguiría resolverlo de fallar cerrado, que son las dos mitades que hay que probar.
+     */
+    fuentesDelRepo.set(
+      'sonda/ayudante.ts',
+      `export const leerDosAjenas = async (tx: TransactionSql) => {
+         const [a] = await tx\`select 1 as x\`;
+         const [b] = await tx\`select 2 as y\`;
+         return { a, b };
+       };
+       export const leerUnaAjena = async (tx: TransactionSql) => {
+         const [a] = await tx\`select 1 as x\`;
+         return a;
+       };`,
+    );
+
     expect(censar('anon.ts', FUENTE_SONDA_ANONIMA)).toEqual(['anon.ts:default']);
 
     expect(censar('sonda.ts', FUENTE_SONDA).sort()).toEqual(
@@ -2686,6 +2827,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaAliasDoble',
         'sonda.ts:sondaPropiedad',
         'sonda.ts:sondaIndirecta',
+        'sonda.ts:sondaAyudanteAjeno',
+        'sonda.ts:sondaAyudanteIlegible (ayudante sin resolver)',
         // Las dos que el censo no sabe leer: las caza el cierre por ALCANCE, no la lista de
         // puertas. Se nombran por posición porque de algo ilegible no se puede decir más.
         'sonda.ts:conUsuario#21 (sin alcanzar)',
@@ -2695,8 +2838,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
 
     // Y ahora las reales.
     const nombradasReales: string[] = [];
+    // Todas las fuentes ANTES de censar ninguna: seguir a un ayudante importado exige tener
+    // el módulo que lo exporta, y el orden del recorrido no lo garantiza.
+    for (const f of ficheros) fuentesDelRepo.set(f.slice(raiz.length), await readFile(f, 'utf8'));
     for (const f of ficheros) {
-      nombradasReales.push(...censar(f.slice(raiz.length), await readFile(f, 'utf8')));
+      nombradasReales.push(...censar(f.slice(raiz.length), fuentesDelRepo.get(f.slice(raiz.length))!));
     }
     expect(nombradasReales.filter((c) => !(c in DECLARADAS)).sort()).toEqual([]);
     /*

@@ -1345,6 +1345,29 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         String.raw`(?:(?::=|=|\bdefault\b)\s*(?<inicial>[^;]*)|[;:,)])`,
       'gi',
     );
+    /*
+     * Dónde acaba de verdad una cláusula. El corte NO puede ser la primera palabra que
+     * aparezca: en `set ts = (select now() where true), d = now()` ese `where` es de la
+     * SUBCONSULTA, y cortar ahí deja fuera la asignación peligrosa —medido, esa función guarda
+     * 2026-09-05 y 2026-09-04—. Se corta en la primera que esté a profundidad CERO de
+     * paréntesis.
+     *
+     * Vive en el ámbito compartido porque hacen falta tres cortes iguales: la cláusula `set`,
+     * la lista de selección de un `insert … select`, y los destinos de un `select … into`.
+     */
+    const CLAUSULA_SIGUIENTE = /\s(?:from|where|using|group|order|limit|offset|returning)\b/gi;
+    const hastaLaClausula = (t: string): string => {
+      CLAUSULA_SIGUIENTE.lastIndex = 0;
+      for (let m = CLAUSULA_SIGUIENTE.exec(t); m !== null; m = CLAUSULA_SIGUIENTE.exec(t)) {
+        let nivel = 0;
+        for (let i = 0; i < m.index; i++) {
+          if (t[i] === '(' || t[i] === '[') nivel++;
+          else if (t[i] === ')' || t[i] === ']') nivel--;
+        }
+        if (nivel === 0) return t.slice(0, m.index);
+      }
+      return t;
+    };
     /** Un nombre listo para meterse en una expresión regular sin significar otra cosa. */
     const escapado = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     /** El nombre como lo escribe quien lo declara, sin las comillas ni su duplicación. */
@@ -1424,7 +1447,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           new RegExp(String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`, 'gi'),
         ),
       ].flatMap((m) => {
-        const destinos = argumentosDe(m[2]!).map((d) => sinComillas(d.trim()));
+        /*
+         * Los destinos se cortan donde empiezan las cláusulas del `select`. Sin eso,
+         * `select now() into d from generate_series(1, 1)` daba el destino
+         * `d from generate_series(1, 1)`, que no casa con ninguna variable.
+         *
+         * Es una REGRESIÓN mía: esa forma la cogía el reconocedor anterior —exigía la variable
+         * pegada al `into`— y se perdió al reescribirlo para emparejar varias columnas. Ninguna
+         * sonda la cubría, porque las dos que había del `into` no llevan `from`. La nueva sí.
+         */
+        const destinos = argumentosDe(hastaLaClausula(m[2]!)).map((d) => sinComillas(d.trim()));
         const valores = argumentosDe(m[1]!);
         return destinos
           .map((d, i) => (nombres.includes(d) ? valores[i] : undefined))
@@ -1566,7 +1598,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * lista —que va por posición, y por eso el catálogo se lee ordenado por `attnum`— y el
      * `update … set col = expr`.
      */
-    const NOMBRE_SQL = String.raw`(?:"(?:[^"]|"")+"|\w+)`;
+    /*
+     * Un nombre SQL, en las tres ortografías: desnudo, entrecomillado y por puntos de código.
+     * La tercera vale también para la TABLA, no solo para la columna —
+     * `insert into U&"\\0073onda"."\\006b2"(…)` escribe en `sonda.k2`—, y sin admitirla aquí
+     * el reconocedor ni siquiera llegaba a `nombreCanonico`, que ya sabía decodificarla.
+     */
+    const NOMBRE_SQL = String.raw`(?:[Uu]&"(?:[^"]|"")*"(?:\s+uescape\s+'.')?|"(?:[^"]|"")+"|\w+)`;
     const INSERTA = new RegExp(
       // El destino de un `insert` también admite ALIAS, entre la tabla y la lista de
       // columnas: `insert into t as x(k, d) values (…)`. Medido: 2026-09-05 contra
@@ -1608,10 +1646,27 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       String.raw`(?<![\w"])(${NOMBRE_SQL})\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s*%\s*rowtype\b`,
       'gi',
     );
+    /*
+     * Y con su inicializador, que es la misma lección que ya se aprendió con las variables de
+     * tipo escrito: `declare v t.d%type := now();` no tiene ninguna sentencia de asignación
+     * que buscar. Medido: 2026-09-05 contra 2026-09-04.
+     */
     const COLUMNA_DEL_CATALOGO = new RegExp(
-      String.raw`(?<![\w"])(${NOMBRE_SQL})\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s*\.\s*(${NOMBRE_SQL})\s*%\s*type\b`,
+      String.raw`(?<![\w"])(${NOMBRE_SQL})\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s*\.\s*(${NOMBRE_SQL})\s*%\s*type\b` +
+        String.raw`(?:\s*(?::=|=|\bdefault\b)\s*(?<inicial>[^;]*))?`,
       'gi',
     );
+    /*
+     * Las dos formas de asignar después: `:=` sin más, y `=` exigiendo empezar SENTENCIA,
+     * porque ese signo también es una comparación. Es la misma distinción que ya rige para las
+     * variables con el tipo escrito, y aquí faltaba.
+     */
+    const ASIGNA_DESPUES = (variable: string): RegExp =>
+      new RegExp(
+        String.raw`(?<![\w".])${variable}\s*:=\s*([^;]*)` +
+          String.raw`|(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*${variable}\s*=(?!=)\s*([^;]*)`,
+        'gi',
+      );
     const RAMA_INSERTA = /\bthen\s+insert\s*(?:\(([^)]*)\)\s*)?values\s*\(([\s\S]*?)\)(?=\s*(?:\bwhen\b|$))/gi;
     const ACTUALIZA = new RegExp(
       // El destino puede llevar ALIAS —`update t as x set …`, con `as` o sin él—, y el tipo
@@ -1659,26 +1714,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           hojasDelValor(expr).some((hoja) => RELOJ_A_SECAS.test(hoja))
         );
       };
-      /*
-       * Dónde acaba de verdad la cláusula `set`. El corte NO puede ser la primera palabra
-       * `from`/`where`/`returning` que aparezca: en
-       * `set ts = (select now() where true), d = now()` ese `where` es de la SUBCONSULTA, y
-       * cortar ahí deja fuera la asignación peligrosa —medido, esa función guarda 2026-09-05
-       * y 2026-09-04—. Se corta en la primera que esté a profundidad CERO de paréntesis.
-       */
-      const CLAUSULA_SIGUIENTE = /\s(?:from|where|returning)\b/gi;
-      const hastaLaClausula = (t: string): string => {
-        CLAUSULA_SIGUIENTE.lastIndex = 0;
-        for (let m = CLAUSULA_SIGUIENTE.exec(t); m !== null; m = CLAUSULA_SIGUIENTE.exec(t)) {
-          let nivel = 0;
-          for (let i = 0; i < m.index; i++) {
-            if (t[i] === '(' || t[i] === '[') nivel++;
-            else if (t[i] === ')' || t[i] === ']') nivel--;
-          }
-          if (nivel === 0) return t.slice(0, m.index);
-        }
-        return t;
-      };
       /**
        * Una cláusula `set`. Cada pieza es `col = expr`, y también la forma de FILA
        * —`set (a, b) = (e1, e2)`—, que reparte por posición y ya no es un límite declarado:
@@ -1718,19 +1753,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         const tabla = nombreCanonico(m[2]!);
         const variable = escapado(sinComillas(m[1]!.trim()));
         for (const a of texto.matchAll(
-          new RegExp(String.raw`(?<![\w"])${variable}\s*\.\s*(${NOMBRE_SQL})\s*:=\s*([^;]*)`, 'gi'),
+          new RegExp(
+            String.raw`(?<![\w"])${variable}\s*\.\s*(${NOMBRE_SQL})\s*:=\s*([^;]*)` +
+              String.raw`|(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*${variable}\s*\.\s*(${NOMBRE_SQL})\s*=(?!=)\s*([^;]*)`,
+            'gi',
+          ),
         )) {
-          if (entrega(tabla, nombreCanonico(a[1]!), a[2]!)) return true;
+          if (entrega(tabla, nombreCanonico(a[1] ?? a[3]!), a[2] ?? a[4]!)) return true;
         }
       }
       for (const m of texto.matchAll(COLUMNA_DEL_CATALOGO)) {
         const tabla = nombreCanonico(m[2]!);
         const columna = nombreCanonico(m[3]!);
         const variable = escapado(sinComillas(m[1]!.trim()));
-        for (const a of texto.matchAll(
-          new RegExp(String.raw`(?<![\w".])${variable}\s*:=\s*([^;]*)`, 'gi'),
-        )) {
-          if (entrega(tabla, columna, a[1]!)) return true;
+        const inicial = m.groups?.inicial;
+        if (inicial !== undefined && entrega(tabla, columna, inicial)) return true;
+        for (const a of texto.matchAll(ASIGNA_DESPUES(variable))) {
+          if (entrega(tabla, columna, a[1] ?? a[2]!)) return true;
         }
       }
       for (const m of texto.matchAll(INSERTA)) {
@@ -2097,7 +2136,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           n.parent.arguments.some((a) => a === n) &&
           /(^|\.)unsafe$/.test(n.parent.expression.getText(arbol).trim());
         if (esSqlCrudo) {
-          piezas.push({ inicio, fin, texto: crudo });
+          // Cocinado, por lo mismo que la plantilla: `tx.unsafe('select \\x6eow()::date')`
+          // ejecuta `select now()::date`. Conservar la cadena sin deshacer los escapes era
+          // dejar de mirar por la ortografía justo después de haber dejado de vaciarla.
+          const q = crudo[0] ?? "'";
+          piezas.push({
+            inicio,
+            fin,
+            texto: `${q}${(n as ts.LiteralLikeNode).text.split(q).join(`\\${q}`)}${q}`,
+          });
           return;
         }
         const comilla = crudo[0] ?? "'";
@@ -3502,6 +3549,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * misma consulta escrita en una variable que nadie ejecuta se sigue vaciando.
      */
     expect(culpable("await tx.unsafe('select now()::date');", 'ts')).toBe(true);
+    // Y cocinada, que es el cruce de las dos cosas anteriores: la cadena de `unsafe` deja de
+    // vaciarse Y se lee por su valor. Sin lo segundo, conservarla entera no servía de nada.
+    expect(culpable("await tx.unsafe('select \\x6eow()::date');", 'ts')).toBe(true);
     expect(culpable("const t = 'select now()::date';", 'ts')).toBe(false);
     expect(culpable('const q = sql`select \\x64ato from t`;', 'ts')).toBe(false);
     // Y la interpolación se sigue reconociendo detrás de un dólar literal: si no, el
@@ -3917,6 +3967,35 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * Es el falso positivo que la omisión evita, y sin dos tablas donde `d` signifique cosas
        * distintas no se puede escribir.
        */
+      /*
+       * Y los CRUCES de lo anterior consigo mismo, que es donde la revisión encontró lo que yo
+       * no: cada pieza nueva vuelve a abrir las puertas que las viejas ya tenían cerradas.
+       * Las cuatro medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
+       *
+       * La del `into … from` es una REGRESIÓN mía y va la primera por eso: esa forma la cogía
+       * el reconocedor anterior y se perdió al reescribirlo. Las dos sondas que había del
+       * `into` no llevan `from`, así que no lo notaron.
+       */
+      [
+        'censo_probe_into_con_from_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin select now() into d from generate_series(1, 1); return d; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_inicializada_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type := now();' +
+          ' begin return v; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_igual_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
+          ' begin v = now(); return v; end $c$',
+      ],
+      [
+        'censo_probe_tabla_unicode_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into U&"\\0063enso_probe_escritura"(k, d) values (1, now()); end $c$',
+      ],
       [
         'censo_probe_ok_compara_columna_ambigua',
         'returns boolean language sql stable as $c$ select now() < d from censo_probe_otra $c$',
@@ -4182,6 +4261,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_into_dos_columnas_date',
           'censo_probe_rowtype_date',
           'censo_probe_pct_type_date',
+          'censo_probe_into_con_from_date',
+          'censo_probe_pct_type_inicializada_date',
+          'censo_probe_pct_type_igual_date',
+          'censo_probe_tabla_unicode_date',
         ].sort(),
       );
     } finally {
@@ -4241,6 +4324,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_into_dos_columnas_date',
         'censo_probe_rowtype_date',
         'censo_probe_pct_type_date',
+        'censo_probe_into_con_from_date',
+        'censo_probe_pct_type_inicializada_date',
+        'censo_probe_pct_type_igual_date',
+        'censo_probe_tabla_unicode_date',
         'censo_probe_ok_compara_columna_ambigua',
         'censo_probe_ok_rowtype_instante',
         'censo_probe_ok_using_instante',

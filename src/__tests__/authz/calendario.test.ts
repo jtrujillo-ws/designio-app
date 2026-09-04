@@ -1,4 +1,4 @@
-import { afterAll, expect, it } from 'vitest';
+import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, sqlAdmin } from '@/lib/db';
 import { describeAuthz } from './helpers';
 
@@ -21,67 +21,113 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   });
 
   /**
-   * Lo que un objeto puede leer del reloj de pared de la sesión. Con `\\b` y no `\\y`: `\\y`
-   * es la frontera de palabra de POSIX y en JavaScript no es un escape, así que la expresión
-   * pasaba a buscar el literal «ycurrent_datey» y el censo daba verde sin mirar nada. Lo
-   * descubrí retirando la migración y viendo que estos tres casos NO enrojecían.
-   * `_` cuenta como carácter de palabra, así que un `current_date_de_algo` no se marca.
-   */
-  const DEL_HUSO_DE_LA_SESION =
-    /\b(current_date|current_time|localtime|localtimestamp)\b/i;
-
-  /**
-   * La otra forma de leer el huso de la sesión, que no es una palabra clave sino una
-   * OPERACIÓN: colapsar un `timestamptz` a un día. `date_trunc('day', now())` da dos días
-   * distintos entre UTC-12 y UTC+14 (medido), igual que `now()::date`.
+   * Las palabras clave del reloj de pared. Son de la GRAMÁTICA, no funciones, así que no
+   * salen del catálogo y esta lista es a mano — pero es cerrada: la define el estándar SQL y
+   * no crece. `(\s*\(\s*\d+\s*\))?` es por la precisión opcional, que Postgres conserva
+   * al deparsear: `current_timestamp(0)` se guarda tal cual y sin eso quedaba fuera.
    *
-   * Se marcan solo las formas en que el reloj entra CRUDO, porque las seguras siempre llevan
-   * `timezone('UTC', …)` en medio: `timezone('UTC', now())::date` no case con la segunda —el
-   * `::date` no sigue a `now()` sino al paréntesis de `timezone`— y `date_trunc('day',
-   * timezone('UTC', now()))` no case con la primera, porque su segundo argumento empieza por
-   * `timezone`. Comprobado contra las dos formas.
+   * Con `\b` y no `\y`: `\y` es la frontera de palabra de POSIX y en JavaScript no es un
+   * escape, así que la expresión buscaba el literal «ycurrent_datey» y el censo daba verde
+   * sin mirar nada. `_` cuenta como carácter de palabra, así que `current_date_pactada` no
+   * se marca.
    */
-  const RELOJES = String.raw`now\s*\(\s*\)|current_timestamp|transaction_timestamp\s*\(\s*\)|clock_timestamp\s*\(\s*\)`;
-  /**
-   * Las precisiones de `date_trunc` cuyo resultado DEPENDE del huso, medidas una a una
-   * comparando el mismo instante en dos husos: de `hour` para arriba cambian, y de `minute`
-   * para abajo no. `hour` está dentro porque hay husos con desfase de 45 minutos
-   * (`Asia/Kathmandu`), donde truncar a la hora sí da instantes distintos.
-   *
-   * Acotarlo importa en la dirección contraria a la habitual: `date_trunc('milliseconds',
-   * now())` solo quita fracciones del instante y no elige ningún día, así que marcarlo sería
-   * un falso positivo — y un censo que marca código correcto se acaba desactivando.
-   */
-  const UNIDADES_DEL_CALENDARIO =
-    'hour|day|week|month|quarter|year|decade|century|millennium';
-
-  const RELOJ_COLAPSADO_A_DIA = [
-    // `date_trunc('day', now())`. El `(::\w+)?` es por la forma DEPARSEADA: Postgres devuelve
-    // `date_trunc('day'::text, now())`, y sin eso el patrón solo veía el código fuente.
-    new RegExp(
-      String.raw`date_trunc\s*\(\s*'(${UNIDADES_DEL_CALENDARIO})s?'(::\w+)?\s*,\s*(${RELOJES})\s*\)`,
-      'i',
-    ),
-    // `now()::date` tal como se escribe…
-    new RegExp(String.raw`\b(${RELOJES})\s*::\s*(date|time)\b`, 'i'),
-    // …y tal como Postgres la devuelve, que es `(now())::date` — con paréntesis propios. La
-    // misma forma canónica a la que reduce `cast(now() as date)`, así que este patrón cubre
-    // las dos. Y NO marca `(timezone('UTC'::text, now()))::date`, porque ahí el paréntesis que
-    // precede al `::` no es el de `now()` sino el de `timezone`: el reloj va envuelto.
-    new RegExp(String.raw`\(\s*(${RELOJES})\s*\)\s*::\s*(date|time)\b`, 'i'),
-    // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
-    new RegExp(String.raw`cast\s*\(\s*(${RELOJES})\s+as\s+(date|time)\b`, 'i'),
-    // `date(now())`, la tercera forma de escribir la misma conversión.
-    new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJES})\s*\)`, 'i'),
-    // `to_char(now(), 'YYYY-MM-DD')`: no colapsa a un `date` pero produce el mismo día del
-    // huso de la sesión, y una regla escrita sobre esa cadena decide igual (medido: 09-03 en
-    // UTC-12 y 09-04 en UTC+14). El reloj tiene que ser el PRIMER argumento —envuelto en
-    // `timezone('UTC', …)` ya no lo es—, y sobre un `date` no se marca, porque un `date` no
-    // tiene huso del que moverse.
-    new RegExp(String.raw`to_char\s*\(\s*(${RELOJES})\s*,`, 'i'),
+  const PRECISION = String.raw`(?:\s*\(\s*\d+\s*\))?`;
+  const PALABRAS_DEL_RELOJ = [
+    // De más larga a más corta: con `current_time` delante, la alternación la casaba dentro
+    // de `current_timestamp` y el resto quedaba suelto.
+    `current_timestamp${PRECISION}`,
+    `current_time${PRECISION}`,
+    `localtimestamp${PRECISION}`,
+    `localtime${PRECISION}`,
+    'current_date',
   ];
 
-  /** Lo que hace culpable a un cuerpo: cualquiera de las dos vías. */
+  /**
+   * Los CAMPOS que no dependen del huso, medidos contra dos husos extremos y siete instantes
+   * elegidos para cruzar frontera de día, mes, año, década, siglo y milenio. La lista va al
+   * revés que la primera versión —enumera lo SEGURO y marca todo lo demás— y ese giro importa
+   * más que su contenido: enumerando lo peligroso, un campo que no se me ocurriera quedaba sin
+   * marcar; enumerando lo seguro, queda marcado. El error cae del lado que avisa.
+   *
+   * Medir con UN solo instante daba `month`, `year` y `week` como independientes, porque ese
+   * instante no cruzaba esas fronteras. Es el mismo muestreo que ya me costó un carácter
+   * Unicode, así que aquí van siete instantes y dos husos.
+   */
+  const CAMPOS_SEGUROS = 'epoch|microseconds|milliseconds|second|minute';
+  /** Y las precisiones de `date_trunc`, por el mismo criterio y la misma medición. */
+  const UNIDADES_SEGURAS = 'microseconds|milliseconds|second|minute';
+
+  /** Se rellena en el primer caso: los relojes que el CATÁLOGO declara, para no listarlos. */
+  let RELOJES = '';
+  let RELOJ_COLAPSADO_A_DIA: RegExp[] = [];
+  let DEL_HUSO_DE_LA_SESION: RegExp;
+
+  beforeAll(async () => {
+    /*
+     * Los relojes que son FUNCIONES se derivan del catálogo en vez de escribirlos: cualquier
+     * función de `pg_catalog` sin argumentos que devuelva un tipo de tiempo y no sea inmutable
+     * lee el reloj. Así salen `now`, `clock_timestamp`, `statement_timestamp` y
+     * `transaction_timestamp` —el que faltaba— sin que nadie tenga que acordarse, y también
+     * las de información del servidor, cuyo día colapsado depende del huso igual.
+     */
+    const filas = await sqlAdmin()`
+      select p.proname as nombre
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'pg_catalog' and p.pronargs = 0 and p.provolatile in ('s', 'v')
+        and format_type(p.prorettype, null) in ('timestamp with time zone',
+            'timestamp without time zone', 'date', 'time with time zone',
+            'time without time zone')
+      order by 1`;
+    const funciones = filas.map((f) => `${f.nombre as string}\\s*\\(\\s*\\)`);
+    expect(funciones.length).toBeGreaterThanOrEqual(4);
+    RELOJES = [...funciones, ...PALABRAS_DEL_RELOJ].join('|');
+    // La frontera de palabra va a los DOS lados: sin la de la derecha,
+    // `current_date_pactada` —un identificador que contiene la palabra— salía marcado, y un
+    // censo que marca lo que no es se acaba desactivando. Con `_` como carácter de palabra,
+    // `\b` la separa; y no estorba a la precisión, porque `current_time(3)` sí tiene
+    // frontera entre la `e` y el paréntesis.
+    DEL_HUSO_DE_LA_SESION = new RegExp(
+      String.raw`\b(${PALABRAS_DEL_RELOJ.join('|')})\b`,
+      'i',
+    );
+    RELOJ_COLAPSADO_A_DIA = [
+      // `date_trunc('day', now())`, y su forma deparseada `date_trunc('day'::text, now())`.
+      // Marca CUALQUIER unidad que no esté en la lista segura.
+      new RegExp(
+        String.raw`date_trunc\s*\(\s*'(?!(?:${UNIDADES_SEGURAS})')[^']*'(::\w+)?\s*,\s*(${RELOJES})\s*\)`,
+        'i',
+      ),
+      // `now()::date` tal como se escribe…
+      new RegExp(String.raw`\b(${RELOJES})\s*::\s*(date|time)\b`, 'i'),
+      // …y tal como Postgres la devuelve: `(now())::date`, con paréntesis propios. Es la forma
+      // canónica a la que reduce también `cast(now() as date)`. NO marca
+      // `(timezone('UTC'::text, now()))::date`, porque ahí el paréntesis que precede al `::`
+      // es el de `timezone`: el reloj va envuelto.
+      new RegExp(String.raw`\(\s*(${RELOJES})\s*\)\s*::\s*(date|time)\b`, 'i'),
+      // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
+      new RegExp(String.raw`cast\s*\(\s*(${RELOJES})\s+as\s+(date|time)\b`, 'i'),
+      // `date(now())`, la tercera forma de escribir la misma conversión.
+      new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJES})\s*\)`, 'i'),
+      // `to_char(now(), 'YYYY-MM-DD')`: no colapsa a un `date` pero produce el mismo día del
+      // huso, y una regla escrita sobre esa cadena decide igual. El reloj tiene que ser el
+      // PRIMER argumento — envuelto en `timezone('UTC', …)` ya no lo es.
+      new RegExp(String.raw`to_char\s*\(\s*(${RELOJES})\s*,`, 'i'),
+      // `extract(day from now())` y `EXTRACT(day FROM now())`: no colapsa a un día entero,
+      // extrae UN campo del calendario, y el campo cambia con el huso igual.
+      new RegExp(
+        String.raw`extract\s*\(\s*(?!(?:${CAMPOS_SEGUROS})\b)\w+\s+from\s+(${RELOJES})`,
+        'i',
+      ),
+      // `date_part('dow', now())`, que es la misma operación con la otra sintaxis, y su forma
+      // deparseada `date_part('dow'::text, now())`.
+      new RegExp(
+        String.raw`date_part\s*\(\s*'(?!(?:${CAMPOS_SEGUROS})')[^']*'(::\w+)?\s*,\s*(${RELOJES})`,
+        'i',
+      ),
+    ];
+  });
+
+  /** Lo que hace culpable a un cuerpo: la palabra clave o cualquiera de las operaciones. */
   const culpable = (cuerpo: string) =>
     DEL_HUSO_DE_LA_SESION.test(cuerpo) || RELOJ_COLAPSADO_A_DIA.some((r) => r.test(cuerpo));
 
@@ -119,6 +165,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'text',
       culpable: true,
     },
+    censo_probe_stmt: { expr: 'statement_timestamp()::date', tipo: 'date', culpable: true },
+    censo_probe_prec: { expr: 'current_timestamp(0)::date', tipo: 'date', culpable: true },
+    censo_probe_extract: {
+      expr: 'extract(day from now())::int',
+      tipo: 'integer',
+      culpable: true,
+    },
+    censo_probe_datepart: {
+      expr: "date_part('dow', now())::int",
+      tipo: 'integer',
+      culpable: true,
+    },
     // Y las seguras, que son la otra mitad del contrato: un censo que marcara el propio
     // arreglo acabaría desactivado, así que se exige explícitamente que NO las señale.
     censo_probe_ok_utc: {
@@ -142,6 +200,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     censo_probe_ok_fecha: {
       expr: "to_char(fecha_de_la_base(), 'YYYY-MM-DD')",
       tipo: 'text',
+      culpable: false,
+    },
+    // `epoch` es el instante absoluto: medido, no cambia con el huso.
+    censo_probe_ok_epoch: {
+      expr: 'extract(epoch from now())::bigint',
+      tipo: 'bigint',
       culpable: false,
     },
   };
@@ -173,6 +237,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'date(now())',
       "to_char(now(), 'YYYY-MM-DD')",
       "to_char(now(), 'YYYY-MM-DD'::text)",
+      'statement_timestamp()::date',
+      '(statement_timestamp())::date',
+      'transaction_timestamp()::date',
+      'current_timestamp(0)::date',
+      '(CURRENT_TIMESTAMP(0))::date',
+      'localtimestamp(3)',
+      'extract(day from now())',
+      'EXTRACT(day FROM now())',
+      'extract(month from clock_timestamp())',
+      "date_part('dow', now())",
+      "date_part('dow'::text, now())",
     ];
     const SEGURAS = [
       "timezone('UTC', now())::date",
@@ -187,6 +262,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'creado_en >= inicio_del_dia_de_la_base()',
       // Un identificador que CONTIENE una palabra clave no es una lectura del reloj.
       'select current_date_pactada from acuerdo',
+      // `epoch` y los campos por debajo del minuto NO dependen del huso (medido con siete
+      // instantes que cruzan día, mes, año, década, siglo y milenio, y dos husos extremos).
+      'extract(epoch from now())',
+      "date_part('epoch', now())",
+      'extract(minute from now())',
+      "extract(day from timezone('UTC', now()))",
+      // Y las precisiones de `date_trunc` que solo quitan fracciones del instante.
+      "date_trunc('milliseconds', now())",
     ];
     expect(PELIGROSAS.filter((f) => !culpable(f))).toEqual([]);
     expect(SEGURAS.filter((f) => culpable(f))).toEqual([]);
@@ -289,6 +372,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // aparte no protegería la del censo. Con cero matviews reales, es lo único que distingue
     // «no hay ninguna» de «no estoy mirando».
     await admin`create materialized view censo_tmp_matview as select current_date as d`;
+    // Y una culpable para la rama de triggers, por lo mismo: sin ella, la consulta podría
+    // dejar de devolver filas o mirar la columna equivocada y el mínimo seguiría cumpliéndose
+    // con los siete triggers reales, que están limpios.
+    await admin`create table censo_tmp_tabla (id int, f date)`;
+    await admin`create function censo_tmp_guard() returns trigger
+      language plpgsql as $$ begin return new; end $$`;
+    await admin`create trigger censo_tmp_trg before insert on censo_tmp_tabla
+      for each row when (new.f > current_date) execute function censo_tmp_guard()`;
     try {
     const categorias = {
       vista: await admin`select viewname as nombre, definition as cuerpo
@@ -308,6 +399,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         where n2.nspname = 'public'`,
       matview: await admin`select matviewname as nombre, definition as cuerpo
         from pg_matviews where schemaname = 'public'`,
+      // La condición `WHEN` de un trigger no vive en el cuerpo de su función: vive en
+      // `pg_trigger.tgqual`, y decide SI el guard llega a ejecutarse. Se evalúa en la sesión
+      // de quien escribe, así que una condición calendárica ahí elige el día igual que una
+      // política — y ninguna de las otras cuatro categorías la miraba. Este repositorio ya
+      // usa siete condiciones `WHEN`, así que no es una categoría hipotética.
+      trigger: await admin`select t.tgname || ' on ' || t.tgrelid::regclass as nombre,
+             pg_get_triggerdef(t.oid) as cuerpo
+        from pg_trigger t
+        join pg_class c on c.oid = t.tgrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and not t.tgisinternal`,
     };
 
     /* Lo que cada categoría tiene que estar mirando para que su verde signifique algo. */
@@ -315,6 +417,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       vista: 1,
       check: 100,
       default: 100,
+      trigger: 50,
       // Uno: el que fabrica la sonda. Hoy no hay ninguna real, y por eso su rama se comprueba
       // con ella en vez de con un conteo — cero es el conteo correcto y no prueba nada.
       matview: 1,
@@ -329,10 +432,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           .filter((n) => !(n in DECLARADAS));
         // La única culpable admitida es la sonda, y tiene que ESTAR: si la rama de matviews
         // deja de devolver filas, desaparece de aquí y este caso se pone rojo.
-        expect(culpables).toEqual(nombre === 'matview' ? ['matview censo_tmp_matview'] : []);
+        // La única culpable admitida por categoría es su sonda, y tiene que ESTAR: si la
+        // rama deja de devolver filas o mira la columna equivocada, desaparece de aquí.
+        const esperadas: Record<string, string[]> = {
+          matview: ['matview censo_tmp_matview'],
+          trigger: ['trigger censo_tmp_trg on censo_tmp_tabla'],
+        };
+        expect(culpables).toEqual(esperadas[nombre] ?? []);
       }
     } finally {
       await admin`drop materialized view censo_tmp_matview`;
+      await admin`drop table censo_tmp_tabla cascade`;
+      await admin`drop function censo_tmp_guard()`;
     }
   });
 

@@ -302,7 +302,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     ].join('|');
     const CASTOS = String.raw`(?:\s*::\s*(?:${TIPO_DE_TIEMPO}))*`;
     const entreParentesis = (x: string) => String.raw`(?:${x}|\(\s*(?:${x})\s*\))`;
-    const RELOJ = entreParentesis(entreParentesis(RELOJES) + CASTOS) + CASTOS;
+    /*
+     * Y la ARITMÉTICA, porque una garantía ajusta el instante antes de colapsarlo:
+     * `(now() + interval '1 day')::date` sigue eligiendo día con el huso de la sesión —medido:
+     * 09-06 en Kiritimati y 09-04 en Etc/GMT+12— y el operando se paraba ante el `+`.
+     * Postgres la deparsea como `((now() + '1 day'::interval))::date`, con el intervalo
+     * casteado y un paréntesis de más, así que hacen falta las dos formas del intervalo y un
+     * nivel más de envoltura.
+     */
+    const ARITMETICA = String.raw`(?:\s*[-+]\s*(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\d+))*`;
+    const NUCLEO = entreParentesis(RELOJES) + CASTOS + ARITMETICA;
+    const RELOJ = entreParentesis(entreParentesis(NUCLEO)) + CASTOS;
 
     /*
      * Y el DESTINO que elige calendario: un tipo SIN huso. `timestamptz` no entra porque
@@ -333,6 +343,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * hace que la próxima vez nadie sepa por qué falta. Medido, no supuesto.)
      */
     const TIPO_SIN_HUSO = String.raw`(?!(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)(?:date|time|timestamp)\b${PRECISION}`;
+    /*
+     * El destino de los CASTS incluye además el TEXTO. Serializar un reloj es elegir día igual
+     * que `to_char`: medido, `now()::text` da «2026-09-05 00:08…+14» y «2026-09-03 22:08…-12»,
+     * y una regla escrita sobre `substring(now()::text, 1, 10)` decide con el huso de quien
+     * llama. Va aparte de `TIPO_SIN_HUSO` a propósito: en una COMPARACIÓN mixta el texto no
+     * es el caso —ahí lo que importa es la promoción de un temporal sin huso— así que el
+     * operando de aquellas sigue siendo el otro.
+     */
+    const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:text|varchar|char)\b${PRECISION}`;
 
     /*
      * Y un operando cuyo tipo NO lleva huso, en las dos formas que se pueden leer del texto:
@@ -347,7 +366,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * garantía: un literal o un cast.
      */
     const OPERANDO_SIN_HUSO = String.raw`(?:${TIPO_SIN_HUSO}\s*'[^']*'|(?:'[^']*'|[\w."]+)\s*::\s*${TIPO_SIN_HUSO})`;
-    const COMPARADOR = String.raw`(?:<=|>=|<>|!=|<|>|=|\bbetween\b)`;
+    const COMPARADOR = String.raw`(?:<=|>=|<>|!=|<|>|=)`;
 
     RELOJ_COLAPSADO_A_DIA = [
       // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
@@ -367,9 +386,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       //
       // NO marca `(timezone('UTC'::text, now()))::date`: ahí el paréntesis que precede al
       // `::` es el de `timezone`, y `timezone` no es un reloj — el reloj va envuelto.
-      new RegExp(String.raw`(${RELOJ})\s*::\s*(${TIPO_SIN_HUSO})`, 'i'),
+      new RegExp(String.raw`(${RELOJ})\s*::\s*(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
-      new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+(${TIPO_SIN_HUSO})`, 'i'),
+      new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `date(now())`, la tercera forma de escribir la misma conversión.
       new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJ})\s*\)`, 'i'),
       // `to_char(now(), 'YYYY-MM-DD')`: no colapsa a un `date` pero produce el mismo día del
@@ -404,6 +423,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        */
       new RegExp(String.raw`(${RELOJ})\s*${COMPARADOR}\s*(${OPERANDO_SIN_HUSO})`, 'i'),
       new RegExp(String.raw`(${OPERANDO_SIN_HUSO})\s*${COMPARADOR}\s*(${RELOJ})`, 'i'),
+      /*
+       * `BETWEEN` es TERNARIO y lo trataba como binario: solo miraba el primer límite, así
+       * que `now() between timestamptz '…' and date '2026-09-04'` —peligrosa por el límite
+       * de arriba, medida— pasaba limpia, y `NOT BETWEEN` no casaba siquiera por el `not`
+       * de en medio. Un patrón por límite, y el `not` opcional.
+       *
+       * (En el CATÁLOGO no hacía falta: Postgres deparsea el `between` como
+       * `(x >= a) AND (x <= b)`, y esos dos ya los cazaban los comparadores de arriba. Esto
+       * es para el censo de plantillas, donde el SQL está tal como se escribió.)
+       */
+      new RegExp(
+        String.raw`(${RELOJ})\s+(?:not\s+)?between\s+(${OPERANDO_SIN_HUSO})`,
+        'i',
+      ),
+      new RegExp(
+        String.raw`(${RELOJ})\s+(?:not\s+)?between\b[^;]*?\band\s+(${OPERANDO_SIN_HUSO})`,
+        'i',
+      ),
     ];
   });
 
@@ -417,11 +454,88 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    */
   const DECLARADAS: Record<string, string> = {};
 
-  /** Quita los comentarios SQL antes de buscar: un `current_date` dentro de un comentario que
+  /**
+   * Quita los comentarios antes de buscar: un `current_date` dentro de un comentario que
    * EXPLICA por qué ya no se usa es exactamente lo contrario de un hallazgo, y sin esto el
-   * censo se volvería contra quien documenta el arreglo. */
-  const sinComentarios = (s: string) =>
-    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+   * censo se volvería contra quien documenta el arreglo.
+   *
+   * Va como RECORRIDO y no como expresión regular, y esta vez la diferencia no es de estilo:
+   * con `replace(/--[^\n]*!/g, '')` un cuerpo legítimo como `select '--', now()::date` se
+   * queda en `select '` —el resto se va como si fuera comentario— y el censo pasa en verde
+   * sin haber mirado la expresión. Lo mismo en TypeScript con una URL: `'https://host'` hace
+   * que el barrido de `//` se lleve el resto de la línea. Es la peor forma de fallar de un
+   * guardián: no encontrar nada porque no está mirando.
+   *
+   * Dos decisiones que no son obvias y conviene dejar dichas:
+   *
+   *  · las comillas invertidas de TypeScript se ATRAVIESAN y su contenido se lee como SQL,
+   *    porque ahí es justo donde vive el SQL que este censo busca. Las comillas simples y
+   *    dobles sí son datos y se saltan;
+   *  · el entrecomillado por dólar de SQL —`$function$ … $function$`— también se atraviesa,
+   *    porque `pg_get_functiondef` devuelve así los cuerpos plpgsql. Saltárselo dejaría de
+   *    mirar el cuerpo de cada función plpgsql, que es exactamente el error que este arreglo
+   *    viene a evitar. El precio es que un literal por dólar que contuviera `--` se leería
+   *    como comentario; queda dicho, y no existe ninguno en el esquema.
+   */
+  const sinComentarios = (texto: string, dialecto: 'sql' | 'ts' = 'sql'): string => {
+    let salida = '';
+    let i = 0;
+    const modos: ('sql' | 'ts')[] = [dialecto];
+    while (i < texto.length) {
+      const modo = modos[modos.length - 1]!;
+      const c = texto[i]!;
+      const d = texto[i + 1];
+      // Comentario de bloque, igual en los dos dialectos.
+      if (c === '/' && d === '*') {
+        const fin = texto.indexOf('*/', i + 2);
+        i = fin === -1 ? texto.length : fin + 2;
+        salida += ' ';
+        continue;
+      }
+      // Comentario de línea: `--` en SQL, `//` en TypeScript.
+      if (modo === 'sql' ? c === '-' && d === '-' : c === '/' && d === '/') {
+        const fin = texto.indexOf('\n', i);
+        i = fin === -1 ? texto.length : fin;
+        salida += ' ';
+        continue;
+      }
+      // Literal de comillas simples: dato en los dos dialectos. En SQL se escapa
+      // duplicándolo; en TypeScript, con barra invertida.
+      if (c === "'" || (modo === 'ts' && c === '"')) {
+        const desde = i;
+        i++;
+        while (i < texto.length) {
+          if (modo === 'ts' && texto[i] === '\\') i += 2;
+          else if (texto[i] === c && modo === 'sql' && texto[i + 1] === c) i += 2;
+          else if (texto[i] === c) {
+            i++;
+            break;
+          } else i++;
+        }
+        /*
+         * El literal se copia TAL CUAL, no se borra. Borrarlo parecía inofensivo —es un dato,
+         * no código— y rompió tres patrones a la vez: los que LEEN el literal,
+         * `date_trunc('day', …)`, `date_part('dow', …)` y `to_char(…, 'YYYY-MM-DD')`. Con el
+         * contenido fuera, `date_trunc('milliseconds', now())` —seguro— pasaba a marcarse.
+         * Lo cazó su propia sonda segura, que para eso está. Aquí el recorrido solo sirve para
+         * NO confundir un `--` de dentro de un literal con un comentario.
+         */
+        salida += texto.slice(desde, i);
+        continue;
+      }
+      // Las comillas invertidas abren y cierran SQL dentro de TypeScript.
+      if (c === '`') {
+        if (modo === 'ts') modos.push('sql');
+        else if (modos.length > 1) modos.pop();
+        salida += c;
+        i++;
+        continue;
+      }
+      salida += c;
+      i++;
+    }
+    return salida;
+  };
 
   /**
    * Una forma peligrosa por CADA patrón, y una segura por cada trampa que los patrones tienen
@@ -570,6 +684,32 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'timestamptz',
       culpable: false,
     },
+    // El reloj AJUSTADO antes de colapsarlo. Medido: 09-06 en Kiritimati, 09-04 en Etc/GMT+12.
+    censo_probe_aritmetica: {
+      expr: "(now() + interval '1 day')::date",
+      tipo: 'date',
+      culpable: true,
+    },
+    // Serializar el reloj elige día igual que `to_char`. Se guarda deparseada como
+    // `"substring"((now())::text, 1, 10)`.
+    censo_probe_texto: {
+      expr: 'substring(now()::text, 1, 10)',
+      tipo: 'text',
+      culpable: true,
+    },
+    censo_probe_texto_cast: {
+      expr: 'cast(current_timestamp as text)',
+      tipo: 'text',
+      culpable: true,
+    },
+    // Un literal con `--` DENTRO: sin recorrer las comillas, todo lo que sigue se iba como
+    // comentario y el censo no llegaba a mirar el `::date`. Esta sonda solo sale marcada si
+    // el barrido de comentarios respeta el literal.
+    censo_probe_guion_en_literal: {
+      expr: "('--' || (now())::date::text)",
+      tipo: 'text',
+      culpable: true,
+    },
     // La comparación MIXTA: el reloj es absoluto, pero el `date` del otro lado se promociona
     // con la medianoche LOCAL. Medido: false en UTC+14 y true en UTC-12. Se guarda deparseada
     // como `(CURRENT_TIMESTAMP < '2026-09-04'::date)`, que es la forma que hay que cazar.
@@ -707,6 +847,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "'2026-09-04'::date > current_timestamp",
       "now() between date '2026-09-01' and date '2026-09-30'",
       'vence_en::date = current_timestamp',
+      // `BETWEEN` es ternario: el límite peligroso puede ser el de ARRIBA, y el `not` va en
+      // medio. Medido: el primero da false en UTC+14 y true en UTC-12.
+      "now() between timestamptz '2020-01-01 00:00+00' and date '2026-09-04'",
+      "now() not between timestamptz '2020-01-01 00:00+00' and '2026-09-04'::date",
+      // La aritmética antes del colapso.
+      "(now() + interval '1 day')::date",
+      "((now() + '1 day'::interval))::date",
+      "(current_timestamp - interval '2 hours')::date",
+      "date(now() + interval '1 day')",
+      // Y el destino de TEXTO, que serializa el reloj con el huso de la sesión.
+      'now()::text',
+      'substring(now()::text, 1, 10)',
+      'cast(current_timestamp as text)',
+      '((now())::text)',
     ];
     const SEGURAS = [
       "timezone('UTC', now())::date",
@@ -761,6 +915,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Y comparar dos FECHAS tampoco: ninguna tiene huso del que moverse.
       "fecha_de_la_base() = date '2026-09-04'",
       "(now() at time zone 'UTC')::date = date '2026-09-04'",
+      // Un intervalo sobre un valor que NO es reloj no colapsa ningún calendario.
+      "(vence_en + interval '1 day')::date",
+      // Y serializar algo que ya es fecha tampoco: un `date` no tiene huso del que moverse.
+      'fecha_de_la_base()::text',
       // …y `timetz` como destino conserva el instante igual.
       'now()::time with time zone',
       'now()::timetz',
@@ -1001,9 +1159,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     for (const f of ficheros) {
       // Sin comentarios: un `current_date` que EXPLICA por qué ya no se usa no es un
       // hallazgo, y sin esto el censo se volvería contra quien documenta el arreglo.
-      const codigo = (await readFile(f, 'utf8'))
-        .replace(/\/\*[\s\S]*?\*\//g, '')
-        .replace(/\/\/[^\n]*/g, '');
+      const codigo = sinComentarios(await readFile(f, 'utf8'), 'ts');
       if (culpable(codigo)) culpables.push(f.slice(raiz.length + 1));
     }
     expect(culpables.filter((c) => !(c in DECLARADAS))).toEqual([]);

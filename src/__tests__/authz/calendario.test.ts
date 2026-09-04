@@ -214,7 +214,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * ella: el TIPO del destino. Van aparte por eso, y no porque sean otra clase de reloj.
    */
   let RELOJ_ENTREGADO: (texto: string) => boolean = () => false;
-  let RELOJ_ASIGNADO_A_VARIABLE: (texto: string) => boolean = () => false;
+  let RELOJ_ASIGNADO_A_VARIABLE: (texto: string, conLiterales: string) => boolean =
+    () => false;
   /*
    * Y el TERCER destino tipado, que es el que faltaba: la COLUMNA en la que se escribe.
    * `insert into t(d) values (now())` con `t.d date` guarda 2026-09-05 en Pacific/Kiritimati
@@ -1659,7 +1660,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * dos puertas del mismo sitio: si una sigue el valor y la otra no, la que no lo sigue es
      * por donde se entra.
      */
-    RELOJ_ASIGNADO_A_VARIABLE = (texto: string): boolean => {
+    RELOJ_ASIGNADO_A_VARIABLE = (texto: string, conLiterales: string): boolean => {
       const declaradas = [...texto.matchAll(DECLARADAS_SIN_HUSO)];
       const nombres = declaradas.map((m) => sinComillas(m.groups!.nombre!));
       if (nombres.length === 0) return false;
@@ -1760,7 +1761,77 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           .map((d, i) => (nombres.includes(d) ? valores[i] : undefined))
           .filter((v): v is string => v !== undefined);
       });
-      const derechas = [...inicializadas, ...asignaciones, ...entradas];
+      /*
+       * ── Las otras tres ataduras de plpgsql ──
+       *
+       * Un valor llega a una variable declarada por más caminos que el `:=` y el `into` de un
+       * `select`. Las tres siguientes coercionan igual y ninguna se veía. Medidas las cuatro
+       * formas: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
+       *
+       *   for d in select now() loop …            el bucle de consulta asigna cada vuelta
+       *   for d in execute 'select now()' loop …  y su variante dinámica
+       *   fetch c into d   con `c cursor for …`   el cursor trae su consulta de otro sitio
+       *   execute 'select now()' into d           el tipo que coerciona está FUERA del literal
+       *
+       * Las dos dinámicas se miran sobre el texto CON literales, porque ahí es donde está la
+       * consulta: vaciado el literal no queda nada que leer. Y por eso la recursión de SQL
+       * dinámico no bastaba — analiza `select now()` por su cuenta, que es seguro; lo que lo
+       * vuelve peligroso es el tipo del destino, y ése está en el `into` de fuera.
+       */
+      const proyeccionDe = (consulta: string): string[] => {
+        const t = consulta.trim();
+        const dinamico = /^execute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'))/i.exec(t);
+        const sql =
+          dinamico === null
+            ? t
+            : dinamico[1]!.replace(/^[A-Za-z_]*&?'/, '').replace(/'$/, '').replace(/''/g, "'");
+        return /^\s*select\b/i.test(sql) ? proyectadas(sql) : [];
+      };
+      /** `<destinos>` de un `into` o de un `for`, en minúsculas y sin comillas. */
+      const listaDeDestinos = (t: string): string[] =>
+        argumentosDe(hastaLaClausula(t)).map((x) => sinComillas(x.trim()).toLowerCase());
+      const porPosicionDeNombre = (destinos: string[], valores: string[]): string[] =>
+        destinos
+          .map((n, i) => (nombres.includes(n) ? valores[i] : undefined))
+          .filter((v): v is string => v !== undefined);
+      const bucles = [
+        ...conLiterales.matchAll(/\bfor\s+([^;]*?)\s+in\s+([\s\S]*?)\s+loop\b/gi),
+      ].flatMap((m) => porPosicionDeNombre(listaDeDestinos(m[1]!), proyeccionDe(m[2]!)));
+      const dinamicas = [
+        ...conLiterales.matchAll(
+          /\bexecute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'))\s+into\s+(?:strict\s+)?([^;]*)/gi,
+        ),
+      ].flatMap((m) =>
+        porPosicionDeNombre(listaDeDestinos(m[2]!), proyeccionDe(`execute ${m[1]!}`)),
+      );
+      /*
+       * El cursor trae su consulta de donde se declaró —o de su `open … for`—, así que el
+       * `fetch` por sí solo no dice nada: hay que resolver el nombre primero.
+       */
+      const consultaDelCursor = new Map<string, string>();
+      for (const m of conLiterales.matchAll(
+        /(?:(\w+)\s+(?:(?:no\s+)?scroll\s+)?cursor\s*(?:\([^)]*\)\s*)?for\s+([^;]*)|\bopen\s+(\w+)(?:\s*\([^)]*\))?\s+for\s+([^;]*))/gi,
+      )) {
+        consultaDelCursor.set((m[1] ?? m[3]!).toLowerCase(), m[2] ?? m[4]!);
+      }
+      const cursores = [
+        ...conLiterales.matchAll(
+          /\bfetch\s+(?:(?:next|prior|first|last|absolute\s+\S+|relative\s+\S+|forward|backward)\s+)?(?:(?:from|in)\s+)?(\w+)\s+into\s+(?:strict\s+)?([^;]*)/gi,
+        ),
+      ].flatMap((m) => {
+        const consulta = consultaDelCursor.get(m[1]!.toLowerCase());
+        return consulta === undefined
+          ? []
+          : porPosicionDeNombre(listaDeDestinos(m[2]!), proyeccionDe(consulta));
+      });
+      const derechas = [
+        ...inicializadas,
+        ...asignaciones,
+        ...entradas,
+        ...bucles,
+        ...dinamicas,
+        ...cursores,
+      ];
       return derechas.some((d) => hojasDelValor(d).some((hoja) => RELOJ_A_SECAS.test(hoja)));
     };
 
@@ -2336,7 +2407,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       (tipoDeclarado !== undefined &&
         SIN_HUSO_DECLARADO.test(tipoDeclarado) &&
         RELOJ_ENTREGADO(sinLiterales)) ||
-      RELOJ_ASIGNADO_A_VARIABLE(sinLiterales) ||
+      RELOJ_ASIGNADO_A_VARIABLE(sinLiterales, conLiterales) ||
       RELOJ_ESCRITO_EN_COLUMNA(sinLiterales) ||
       /*
        * Y el parámetro de un `EXECUTE … USING`, que es otro destino tipado con el tipo escrito
@@ -4694,6 +4765,71 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * La primera escribe en una columna CON huso a propósito: así ningún otro reconocedor la
        * caza y lo que se prueba es el emparejamiento del `into`, no otra cosa.
        */
+      /*
+       * Las otras cuatro ataduras de plpgsql, medidas las cuatro 2026-09-05 en
+       * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   for d in select now() loop …            el bucle asigna cada vuelta
+       *   for d in execute 'select now()' loop …  y su variante dinámica
+       *   fetch c into d   con `c cursor for …`   el cursor trae su consulta de otro sitio
+       *   execute 'select now()' into d           el tipo que coerciona está FUERA del literal
+       */
+      [
+        'censo_probe_bucle_for_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          ' for d in select now() loop return d; end loop; return null; end $c$',
+      ],
+      [
+        'censo_probe_bucle_for_execute_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          " for d in execute 'select now()' loop return d; end loop; return null; end $c$",
+      ],
+      /*
+       * Las del cursor van `returns void` y escriben en una columna a propósito. Escritas como
+       * `returns date`, el `select now()` de la declaración del cursor lo caza el reconocedor
+       * del tipo de RETORNO y la sonda pasaba sin probar lo suyo: neutralizar el cursor entero
+       * no la movía. Así, el único camino que puede verlas es el que resuelve el cursor.
+       *
+       * Y son dos, porque un cursor trae su consulta de dos sitios: de su declaración y de un
+       * `open … for`. Las dos medidas con el mismo par de fechas.
+       */
+      [
+        'censo_probe_fetch_date',
+        'returns void language plpgsql as $c$ declare d date; c cursor for select now();' +
+          ' begin open c; fetch c into d; close c;' +
+          ' insert into censo_probe_escritura(k, d) values (1, d); end $c$',
+      ],
+      [
+        'censo_probe_fetch_open_for_date',
+        'returns void language plpgsql as $c$ declare d date; c refcursor;' +
+          ' begin open c for select now(); fetch c into d; close c;' +
+          ' insert into censo_probe_escritura(k, d) values (2, d); end $c$',
+      ],
+      [
+        'censo_probe_execute_into_date',
+        "returns date language plpgsql as $c$ declare d date; begin execute 'select now()'" +
+          ' into d; return d; end $c$',
+      ],
+      /*
+       * Y sus seguras, que fijan que lo que decide sigue siendo el TIPO del destino y no la
+       * palabra: las mismas cuatro formas sobre una variable CON huso conservan el instante.
+       */
+      [
+        'censo_probe_ok_bucle_for_instante',
+        'returns timestamptz language plpgsql as $c$ declare t timestamptz; begin' +
+          ' for t in select now() loop return t; end loop; return null; end $c$',
+      ],
+      [
+        'censo_probe_ok_fetch_instante',
+        'returns void language plpgsql as $c$ declare t timestamptz;' +
+          ' c cursor for select now(); begin open c; fetch c into t; close c;' +
+          ' insert into censo_probe_escritura(k, ts) values (3, t); end $c$',
+      ],
+      [
+        'censo_probe_ok_execute_into_instante',
+        'returns timestamptz language plpgsql as $c$ declare t timestamptz; begin' +
+          " execute 'select now()' into t; return t; end $c$",
+      ],
       [
         'censo_probe_returning_tras_select_date',
         'returns date language plpgsql as $c$ declare d date; begin' +
@@ -5140,6 +5276,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_parametro_default_date',
           'censo_probe_tabla_unicode_date',
           'censo_probe_returning_into_date',
+          'censo_probe_bucle_for_date',
+          'censo_probe_bucle_for_execute_date',
+          'censo_probe_fetch_date',
+          'censo_probe_fetch_open_for_date',
+          'censo_probe_execute_into_date',
           'censo_probe_returning_tras_select_date',
           'censo_probe_derivada_calificada_date',
           'censo_probe_alias_unicode_date',
@@ -5260,6 +5401,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_derivada_otra_columna',
         'censo_probe_ok_alias_fecha_fija',
         'censo_probe_returning_into_date',
+        'censo_probe_bucle_for_date',
+        'censo_probe_bucle_for_execute_date',
+        'censo_probe_fetch_date',
+        'censo_probe_fetch_open_for_date',
+        'censo_probe_execute_into_date',
+        'censo_probe_ok_bucle_for_instante',
+        'censo_probe_ok_fetch_instante',
+        'censo_probe_ok_execute_into_instante',
         'censo_probe_returning_tras_select_date',
         'censo_probe_derivada_calificada_date',
         'censo_probe_alias_unicode_date',

@@ -1823,6 +1823,21 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       const aliasDe = (f: TS.SourceFile) => {
         const m = new Map<string, string>();
         for (const st of f.statements) {
+          /*
+           * Renombrar al IMPORTAR es tan alias como declararlo: con
+           * `import { conUsuario as conActor }`, `conActor` abre una transacción igual. Y
+           * escapaba de las DOS listas a la vez —la que busca y el cierre por alcance—,
+           * porque las dos preguntan por el mismo predicado: el cierre no puede echar de
+           * menos lo que tampoco supo reconocer.
+           */
+          if (ts.isImportDeclaration(st) && st.importClause) {
+            const enlaces = st.importClause.namedBindings;
+            if (enlaces && ts.isNamedImports(enlaces)) {
+              for (const el of enlaces.elements) {
+                if (el.propertyName) m.set(el.name.text, el.propertyName.text);
+              }
+            }
+          }
           if (!ts.isVariableStatement(st)) continue;
           for (const d of st.declarationList.declarations) {
             if (!ts.isIdentifier(d.name) || !d.initializer) continue;
@@ -2573,6 +2588,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       });`;
     const FUENTE_SONDA = `
       import { leerDosAjenas, leerUnaAjena, ajenoQueAnidaYEscribe, ajenoQueAnidaPorAlias } from '@/lib/sonda/ayudante';
+      import { conUsuario as conActor } from '@/lib/db';
       import { leerDeModuloAusente } from '@/lib/sonda/no-existe';
       ${cuerpo('sondaModificador').replace('const sondaModificador', 'export const sondaModificador')}
       ${cuerpo('sondaClausula')}
@@ -2774,6 +2790,15 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           const c = await ajenoQueAnidaPorAlias(tx);
           return { a, c };
         });
+      // El alias de IMPORTACION: renombrar al importar es tan alias como declararlo con const,
+      // y ademas escapaba de las DOS listas —la que busca y el cierre por alcance— porque las
+      // dos usan el mismo predicado.
+      export const sondaAliasImportado = async (actorId: string) =>
+        conActor(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
       // Cruzar modulo Y anidar a la vez, la combinacion que no tenia sonda. El ayudante ajeno
       // abre SU transaccion y escribe en ella, y su callback llama tx a la suya igual que el de
       // fuera: por eso no se pueden distinguir por el nombre de la etiqueta y el CORTE es lo
@@ -2944,6 +2969,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaMensajeEscritura',
         'sonda.ts:sondaAjenoQueAnida',
         'sonda.ts:sondaAjenoQueAnidaPorAlias',
+        'sonda.ts:sondaAliasImportado',
         // Con el corte puesto, la anidada cuenta como transacción PROPIA: por eso la exterior
         // lleva sufijo. La interior escribe y no sale, que es lo correcto.
         'sonda.ts:sondaAnidadaPorPropiedad#1',

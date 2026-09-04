@@ -18,8 +18,23 @@
 --    el nombre de la organización es dato del cliente.
 --  · **El `evento_dominio` del workspace SÍ se borra**: es contenido, y viajó en la
 --    exportación que RF-01.8 exige entregar antes. Tras un borrado, el libro de ese
---    workspace contiene exactamente UN evento — el `WorkspaceDispuesto` que emite este
---    guard después de vaciar.
+--    workspace contiene el `WorkspaceDispuesto` que emite este guard después de vaciar, y
+--    normalmente nada más.
+--
+--    «Normalmente» y no «exactamente», porque hay una ventana medida y conviene decirla en
+--    vez de prometer de más: `evento_dominio` y `exportacion_registro` quedan FUERA de la
+--    congelación —un workspace archivado tiene que seguir auditando y poder re-exportarse—,
+--    así que no toman el candado del workspace y una EXPORTACIÓN YA EN VUELO puede confirmar
+--    sus dos filas después de que este guard vació y recontó. Sus conteos no las incluyen.
+--
+--    La ventana es estrecha y se cierra sola: escribir en esas dos exige membresía, y el
+--    borrado la destruye, así que solo alcanza a transacciones que ya habían pasado su
+--    comprobación. Y no se tapa metiéndolas en el candado, que era lo primero que se probó:
+--    el guard que lo hace las convierte en tablas que serializan y releen, y eso les impone
+--    READ COMMITTED — con lo que la exportación, que corre en REPEATABLE READ a propósito
+--    para que su manifiesto salga de una sola foto (SYS-04), dejaría de funcionar. Medido: 18
+--    casos en rojo. Cerrarla de verdad pide mover el registro de la exportación a su propia
+--    transacción READ COMMITTED, que es cirugía en el slice de exportación y no en éste.
 --  · **La constancia no depende de que la base la guarde.** Tras un borrado se destruyen
 --    también los `miembro`, así que `is_workspace_member` es falso y RLS le niega al
 --    cliente hasta la lápida: lo único que hace la constancia verificable PARA ÉL es su
@@ -242,10 +257,14 @@ create table constancia_disposicion (
   -- borrado corre con `session_replication_role = replica` (ver abajo), así que un trigger
   -- que calculara el sello NO se dispararía durante la única operación que escribe aquí.
   -- Una columna generada no es un trigger: se aplica siempre.
-  -- Lo que el sello aporta no es impedir una fila falsa —quien puede insertar filas puede
-  -- insertar una coherente— sino que el documento ENTREGADO al cliente sea verificable
-  -- fuera de esta base: recomputa el hash sobre la carga canónica y detecta cualquier
-  -- alteración posterior a la entrega. Que la fila no se pueda reescribir lo garantiza
+  -- Qué prueba y qué NO, dicho con precisión porque la diferencia importa: es un sha256 SIN
+  -- clave, así que da INTEGRIDAD, no autenticidad. Sirve para que el cliente compruebe que el
+  -- documento que tiene coincide con el sello que le entregaron —contra copias corrompidas,
+  -- truncadas o editadas conservando el sello original—. NO acredita que lo emitiera Designio,
+  -- y no resiste a un adversario que controle el documento ENTERO: quien altere la carga puede
+  -- recalcular el hash y sustituir también el sello. Para eso haría falta firmarlo con una
+  -- clave cuya pública se publique, o anclar el digest en un registro independiente; queda
+  -- anotado como el siguiente paso y no se finge aquí. Que la fila no se pueda reescribir lo garantiza
   -- otra cosa: no hay grant ni política de UPDATE/DELETE, ni de INSERT.
   sello text generated always as (sello_constancia(
     'whitespace-constancia/1' || E'\n'

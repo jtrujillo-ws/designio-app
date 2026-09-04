@@ -8,6 +8,7 @@ import { Select } from '@/components/ui/Select';
 import { Wordmark } from '@/components/ui/Wordmark';
 import {
   ejecutarDisposicionFn,
+  misConstanciasFn,
   panelDisposicionFn,
   registrarAcuerdoFn,
 } from '@/lib/disposicion/disposicion.functions';
@@ -69,6 +70,10 @@ function PantallaDisposicion() {
   const [confirmacion, setConfirmacion] = useState('');
   const [trabajando, setTrabajando] = useState(false);
   const [constancia, setConstancia] = useState<ConstanciaDisposicion | null>(null);
+  // Las constancias que esta persona conserva, en cualquier workspace y sin depender de
+  // seguir siendo miembro. Es la única vía por la que se llega a la de un workspace BORRADO:
+  // el workspace activo se resuelve desde las membresías, y tras un borrado no queda ninguna.
+  const [mias, setMias] = useState<ConstanciaDisposicion[]>([]);
 
   const puedeAcordar = ROLES_DISPOSICION.includes(
     (membresiaActiva?.rol ?? '') as (typeof ROLES_DISPOSICION)[number],
@@ -94,9 +99,19 @@ function PantallaDisposicion() {
     }
   }, [workspaceId]);
 
+  const recargarMias = useCallback(async () => {
+    try {
+      const r = await misConstanciasFn();
+      if (r.ok) setMias(r.constancias);
+    } catch {
+      /* la lista es complementaria: si falla, la pantalla sigue sirviendo para lo demás */
+    }
+  }, []);
+
   useEffect(() => {
     void recargar();
-  }, [recargar]);
+    void recargarMias();
+  }, [recargar, recargarMias]);
 
   async function acordar() {
     if (!workspaceId) return;
@@ -136,6 +151,7 @@ function PantallaDisposicion() {
         setConfirmacion('');
       }
       await recargar();
+      await recargarMias();
     } catch {
       setError('No se pudo ejecutar la disposición');
     } finally {
@@ -311,6 +327,32 @@ function PantallaDisposicion() {
             )}
           </>
         )}
+
+        {mias.length > 0 && (
+          <Card style={{ padding: 22, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <span style={etiqueta}>Constancias que conservas</span>
+            <p style={{ ...parrafo, color: 'var(--text-muted)' }}>
+              De cualquier workspace del que seas —o hayas sido— parte. Tras un borrado dejas de
+              ser miembro, así que ésta es la única vía por la que se llega a la suya.
+            </p>
+            {mias.map((c) => (
+              <details key={c.id}>
+                <summary style={{ ...parrafo, cursor: 'pointer' }}>
+                  {c.modalidad === 'borrado' ? 'Borrado' : 'Archivo'} del workspace{' '}
+                  <span style={{ fontFamily: 'var(--font-mono)' }}>
+                    {c.workspaceId.slice(0, 8)}
+                  </span>{' '}
+                  <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
+                    · sello {c.sello.slice(0, 12)}…
+                  </span>
+                </summary>
+                <div style={{ marginTop: 10 }}>
+                  <Constancia c={c} reciente={false} />
+                </div>
+              </details>
+            ))}
+          </Card>
+        )}
       </main>
     </div>
   );
@@ -367,7 +409,14 @@ function Constancia({ c, reciente }: { c: ConstanciaDisposicion; reciente: boole
         <p style={{ ...parrafo, color: 'var(--text-muted)', marginTop: 8 }}>
           El sello es el sha256 del texto de abajo, en UTF-8 y sin salto final. Guárdalo y
           ejecuta <code>printf &apos;%s&apos; &quot;$(cat constancia.txt)&quot; | sha256sum</code>:
-          tiene que dar el mismo valor. Si difiere, el documento se alteró después de emitirse.
+          tiene que dar el mismo valor. Si difiere, la copia que tienes no es la que se emitió.
+        </p>
+        <p style={{ ...parrafo, color: 'var(--text-muted)', marginTop: 8 }}>
+          Conviene saber hasta dónde llega: es un hash <strong>sin clave</strong>, así que
+          comprueba <strong>integridad</strong> —que tu copia coincida con el sello que
+          recibiste— pero no <strong>autenticidad</strong>. No demuestra por sí solo que lo
+          emitiéramos nosotros, y quien altere el documento entero puede recalcular también el
+          sello. Anota el sello por separado y compáralo con éste.
         </p>
         <pre
           style={{

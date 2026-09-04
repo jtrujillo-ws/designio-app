@@ -88,6 +88,35 @@ export function selloRecomputado(c: ConstanciaDisposicion): string {
   return createHash('sha256').update(cargaCanonicaConstancia(c), 'utf8').digest('hex');
 }
 
+/**
+ * Las constancias que esta persona conserva, en TODOS los workspaces, sea o no miembro.
+ *
+ * Existe porque sin ella la política que las conserva sería una promesa que nadie puede
+ * ejercer — el mismo defecto que aquella política vino a arreglar, una capa más arriba. Tras
+ * un borrado no queda membresía, y el resto de la aplicación resuelve el workspace activo a
+ * partir de las membresías: por ahí no se llega nunca a una constancia de un workspace
+ * borrado, ni siquiera con su id en la URL. Quien firmó no recibe la respuesta inmediata —la
+ * recibe quien ejecuta— y quien ejecutó la pierde en cuanto recarga.
+ *
+ * No lleva `workspaceId`: es la lista de lo que te pertenece, y filtrarla es trabajo de la RLS
+ * —membresía, haber ejecutado, o haber firmado el acuerdo que se ejecutó—. Pedir un workspace
+ * concreto sería volver a exigir saber a cuál pertenece, que es justo lo que ya no se sabe.
+ */
+export async function misConstancias(actorId: string): Promise<ConstanciaDisposicion[]> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    // Sin el nombre del workspace, y no por descuido: tras un borrado la RLS de `workspace` le
+    // niega la fila a quien ya no es miembro, así que vendría VACÍO justo en el caso para el
+    // que esta lista existe. Y aunque se viera, sería la lápida —constante para todos— que no
+    // identifica nada. Lo que identifica una constancia es su `workspaceId` y su sello.
+    const filas = await tx.unsafe(
+      `select ${COLUMNAS_CONSTANCIA} from constancia_disposicion order by ejecutado_en desc`,
+      [],
+    );
+    return filas.map(constanciaDeFila);
+  });
+}
+
 export async function panelDisposicion(
   actorId: string,
   workspaceId: string,

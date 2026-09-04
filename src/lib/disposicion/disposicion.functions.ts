@@ -5,6 +5,7 @@ import { EjecutarDisposicionSchema, RegistrarAcuerdoSchema } from './disposicion
 import {
   ErrorDisposicion,
   ejecutarDisposicion,
+  misConstancias,
   panelDisposicion,
   registrarAcuerdo,
 } from './disposicion.servicio';
@@ -31,6 +32,20 @@ export const panelDisposicionFn = createServerFn({ method: 'GET' })
       throw e;
     }
   });
+
+/** Sin `workspaceId` a propósito: es la lista de lo que conservas, y tras un borrado ya no
+ * sabes —ni la aplicación sabe— a qué workspace pertenecías. La RLS es quien filtra. */
+export const misConstanciasFn = createServerFn({ method: 'GET' }).handler(async () => {
+  const actorId = await usuarioIdDeRequest();
+  if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+  try {
+    return { ok: true as const, constancias: await misConstancias(actorId) };
+  } catch (e) {
+    const m = motivo(e);
+    if (m) return { ok: false as const, error: m };
+    throw e;
+  }
+});
 
 export const registrarAcuerdoFn = createServerFn({ method: 'POST' })
   .inputValidator(RegistrarAcuerdoSchema)

@@ -6,6 +6,7 @@ import { cargaCanonicaConstancia, jsonbTexto } from '@/lib/disposicion/disposici
 import {
   ErrorDisposicion,
   ejecutarDisposicion,
+  misConstancias,
   panelDisposicion,
   registrarAcuerdo,
   selloRecomputado,
@@ -585,6 +586,43 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const [comoOtro] = await conUsuario(leadId, (tx) =>
       tx`select firmo_esta_disposicion(${ws}, 1) as si`);
     expect(comoOtro!.si).toBe(false);
+  });
+
+  it('la constancia de un workspace borrado se alcanza SIN membresía, por su propia lista', async () => {
+    // Conservar el derecho en la RLS no sirve de nada si no hay por dónde ejercerlo. El resto
+    // de la aplicación resuelve el workspace activo a partir de las MEMBRESÍAS, y el borrado
+    // las destruye: por ahí no se llega nunca a la constancia de un workspace borrado, ni
+    // siquiera con su id en la URL. Sería la misma promesa inejercitable que la política vino a
+    // arreglar, una capa más arriba.
+    //
+    // Por eso la lista no recibe workspace: se pide «lo que conservo» y filtra la RLS.
+    const ws = await nuevoWorkspace('sin-membresia');
+    await acordarYExportar(ws, 'borrado', adminId);
+    const emitida = await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'borrado',
+    });
+
+    const [m] = await sqlAdmin()`select count(*)::int as n from miembro where workspace_id = ${ws}`;
+    expect(m!.n).toBe(0);
+
+    // Las dos partes la alcanzan por esta vía, sin saber a qué workspace pertenecían.
+    for (const quien of [leadId, adminId]) {
+      const lista = await misConstancias(quien);
+      const suya = lista.find((c) => c.id === emitida.id);
+      expect(suya?.sello).toBe(emitida.sello);
+      // Y llega entera: se puede volver a verificar fuera de la base desde la lista.
+      expect(selloRecomputado(suya!)).toBe(suya!.sello);
+      // Y lo identifica por su workspace, que es lo único que queda: la RLS de `workspace` le
+      // niega hasta la lápida a quien ya no es miembro, así que un nombre vendría vacío.
+      expect(suya!.workspaceId).toBe(ws);
+    }
+
+    // Y a un tercero no le aparece.
+    const [ajeno] = await sqlAdmin()`insert into usuario (email, nombre, estado)
+      values (${`${marca}-ajeno2@test.demo`}, 'ajeno2', 'activo') returning id`;
+    const deOtro = await misConstancias(ajeno!.id as string);
+    expect(deOtro.find((c) => c.id === emitida.id)).toBeUndefined();
   });
 
   it('la carga canónica reproduce jsonb::text de Postgres, clave a clave', async () => {

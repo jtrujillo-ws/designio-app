@@ -3406,6 +3406,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   const ENVUELTO_ANTES =
     /\btimezone\s*\(\s*'utc'(?:\s*::\s*[a-z_"]+)?\s*,\s*(?:[A-Za-z_"][\w$"]*\s*\.\s*)*$/i;
   const ENVUELTO_DESPUES = /^\s*(?:\(\s*\)\s*)?at\s+time\s+zone\s+'utc'/i;
+  /*
+   * Y el propio ENVOLVEDOR. `timezone` esta en el conjunto de instantes por su sobrecarga
+   * `(text, timestamp) -> timestamptz`, pero escrito como `timezone('UTC', …)` es la otra
+   * —`(text, timestamptz) -> timestamp`—, que es justo el arreglo canonico de este PR. El
+   * nombre no distingue las dos sobrecargas; la LLAMADA si, y es lo unico que hace falta
+   * mirar: con `'UTC'` escrito de primer argumento, lo que sale ya no depende de la sesion.
+   */
+  const ENVUELTO_ES_LA_ENVOLTURA = /^\s*\(\s*'utc'(?:\s*::\s*[a-z_"]+)?\s*,/i;
 
   /**
    * El veredicto, del revés: devuelve el certificado si lo hay, o `null` si no se puede
@@ -3436,11 +3444,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // «SIN INSTANTE»: no hay nada que colocar.
     if (relojes.length === 0) return { certificado: 'sin instante' };
     // «ENVUELTO EN UTC»: todos los instantes del objeto están fijados al huso del servidor.
-    const envuelto = (r: RegExpMatchArray): boolean =>
-      ENVUELTO_ANTES.test(dondeBuscar.slice(Math.max(0, r.index! - 60), r.index!)) ||
-      ENVUELTO_DESPUES.test(
-        dondeBuscar.slice(r.index! + r[0].length, r.index! + r[0].length + 40),
+    const envuelto = (r: RegExpMatchArray): boolean => {
+      const detras = dondeBuscar.slice(r.index! + r[0].length, r.index! + r[0].length + 40);
+      return (
+        ENVUELTO_ANTES.test(dondeBuscar.slice(Math.max(0, r.index! - 60), r.index!)) ||
+        ENVUELTO_DESPUES.test(detras) ||
+        ENVUELTO_ES_LA_ENVOLTURA.test(detras)
       );
+    };
     if (relojes.every(envuelto)) return { certificado: 'envuelto en UTC' };
     /*
      * «SIN DÓNDE CAER»: en todo el objeto no hay un solo tipo temporal que no sea un instante,
@@ -3561,16 +3572,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
            and c.relname not like 'censo_probe%' and c.relname not like 'censo_tmp%'
            and c.relname not like 'CensoProbe%'
         union all
-        -- Solo las NULARIAS. Una funcion con argumentos que devuelve un instante no lo
-        -- ORIGINA: lo hereda de lo que le pasan, y esa fuente ya se cuenta por su cuenta.
-        -- Contarla igual rompia el certificado de la envoltura y de la peor manera: en
-        -- timezone('UTC', now()) el propio timezone tiene una sobrecarga que devuelve
-        -- timestamptz, asi que casaba como un instante SIN envolver y el arreglo canonico de
-        -- este PR salia sin certificar. Medido sobre fecha_de_la_base y sobre la sonda segura.
+        -- TODA funcion que devuelva un instante, tenga argumentos o no. Lo intente con solo
+        -- las nularias —«una funcion con argumentos hereda el instante de lo que le pasan»— y
+        -- es falso: momento(boolean) con cuerpo «select now()» devuelve un instante que no
+        -- viene de su argumento, y una segunda funcion «returns date» que la llame se
+        -- certificaba como «sin instante» mientras Postgres la colapsaba con el huso de la
+        -- sesion. Reproducido antes de aceptarlo.
+        --
+        -- El falso positivo que aquel filtro evitaba —timezone tiene una sobrecarga
+        -- (text, timestamp) que devuelve timestamptz, asi que su NOMBRE casa aqui aunque en
+        -- timezone('UTC', now()) devuelva un timestamp sin huso— se resuelve distinguiendo la
+        -- LLAMADA, no borrando media familia: lo hace ENVUELTO_ES_LA_ENVOLTURA.
         select p.proname::text, format_type(p.prorettype, null)
           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
          where n.nspname in ('public', 'pg_catalog') and p.prokind = 'f'
-           and coalesce(array_length(p.proargtypes, 1), 0) = 0
         union all
         select p.proname::text, format_type(t.oid, null)
           from pg_proc p join pg_namespace n on n.oid = p.pronamespace,
@@ -3638,6 +3653,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'el mismo «max(xp.completado_en) into v_export» con v_export timestamptz. Lo que obliga ' +
       'es un to_char, y su argumento es timezone(UTC, v_disp.ejecutado_en) — o sea el instante ' +
       'ya fijado al huso del servidor antes de imprimirlo.',
+    'funcion vencimientos_de_cadencia':
+      'no hay ningún instante: la función trabaja solo con date —sus tres parámetros, su ' +
+      'RETURNS TABLE y toda su aritmética—. Lo que la obliga es «generate_series», que está ' +
+      'en el conjunto de instantes porque UNA de sus sobrecargas devuelve timestamptz; aquí ' +
+      'se llama con enteros, «generate_series(1, greatest(…))», y devuelve integer. Es la ' +
+      'misma ambigüedad de sobrecarga que timezone, y la resuelve la LLAMADA, que un ' +
+      'conjunto de nombres no puede ver. Son las dos únicas del esquema.',
     'politica derecho_insert en derecho_uso':
       'el instante es «decidido_en IS NULL» y lo que obliga es «vence_en IS NULL». Las dos son ' +
       'pruebas de nulidad: no hay comparación ni cast que pueda colapsar nada.',
@@ -3660,7 +3682,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * la lista, sería que el certificado se ha vuelto demasiado generoso y todo lo demás dejó
    * de significar nada.
    */
-  const SONDAS_SIN_CERTIFICAR = ['funcion censo_cert_opaca', 'funcion censo_cert_por_nombre'];
+  const SONDAS_SIN_CERTIFICAR = [
+    'funcion censo_cert_opaca',
+    'funcion censo_cert_por_nombre',
+    'funcion censo_cert_indirecta',
+  ];
 
   /**
    * Una forma peligrosa por CADA patrón, y una segura por cada trampa que los patrones tienen
@@ -6470,6 +6496,25 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * pareja de defaults tipados de la otra familia, y por la misma razón: una sonda de texto
      * no puede sostener una regla que no lee el texto.
      */
+    /*
+     * Y la sonda del INSTANTE INDIRECTO, que salió de una ronda de revisión sobre este mismo
+     * rework: una función con argumentos que devuelve un instante NO lo hereda de ellos
+     * —`censo_cert_momento(boolean)` devuelve `now()` y su argumento no pinta nada—, así que
+     * una segunda que la llame y devuelva `date` colapsa con el huso de quien llama. Con el
+     * conjunto de instantes limitado a las funciones NULARIAS, la segunda se certificaba como
+     * «sin instante»: el reconocedor no conoce ese nombre y el catálogo no lo incluía.
+     *
+     * Es la sonda que sostiene que el conjunto salga del catálogo ENTERO y no de la parte
+     * cómoda de él, y la única forma de que la comodidad de ayer no vuelva mañana.
+     */
+    await admin.unsafe(
+      'create function censo_cert_momento(boolean) returns timestamptz language sql as ' +
+        '$c$ select now() $c$',
+    );
+    await admin.unsafe(
+      'create function censo_cert_indirecta() returns date language sql as ' +
+        '$c$ select censo_cert_momento(true) $c$',
+    );
     await admin`create table censo_cert_agenda (censo_cert_dia date, censo_cert_hito timestamptz)`;
     await admin.unsafe(`create function censo_cert_por_nombre() returns void language plpgsql as $c$
       begin insert into censo_cert_agenda (censo_cert_dia) select censo_cert_dia
@@ -6623,6 +6668,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       await admin`drop function censo_cert_envuelta()`;
       await admin`drop function censo_cert_instante()`;
       await admin`drop function censo_cert_por_nombre()`;
+      await admin`drop function censo_cert_indirecta()`;
+      await admin.unsafe('drop function censo_cert_momento(boolean)');
       await admin`drop function censo_cert_por_nombre_ok()`;
       await admin`drop table censo_cert_sello`;
       await admin`drop table censo_cert_agenda`;

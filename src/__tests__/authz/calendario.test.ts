@@ -728,6 +728,29 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'i',
       ),
       /*
+       * La serialización a JSON. `to_json(now())` imprime el `timestamptz` con la fecha, la
+       * hora y el desfase LOCALES —medido: «2026-09-05T05:11:45+14:00» en Kiritimati y
+       * «2026-09-04T03:11:45-12:00» en Etc/GMT+12—, así que es la MISMA elección de calendario
+       * que `now()::text`, que ya se marcaba, escrita con otra función.
+       *
+       * Se reconoce por la CLASE y no por una lista de nombres: cualquier función cuyo nombre
+       * lleve `json` y reciba un reloj como argumento de PRIMER NIVEL. Así entran `to_json`,
+       * `to_jsonb`, `json_build_object`, `jsonb_agg`, `row_to_json` y las que nazcan mañana,
+       * sin que nadie tenga que acordarse — que es como falla una lista escrita a mano.
+       *
+       * «De primer nivel» es lo que deja fuera el ARREGLO canónico: `to_json(timezone('UTC',
+       * now()))` da el mismo texto en los dos husos (medido) porque lo que se serializa ya es
+       * un `timestamp` SIN huso. El consumidor de argumentos no puede entrar en un grupo
+       * anidado —lo traga entero—, así que un reloj envuelto en una conversión no casa.
+       *
+       * LÍMITE DECLARADO: dos niveles de anidamiento, como en el primer argumento de
+       * `date_trunc`. Una expresión regular no cuenta paréntesis.
+       */
+      new RegExp(
+        String.raw`\b\w*json\w*\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*?(${RELOJ})\s*(?=[,)])`,
+        'i',
+      ),
+      /*
        * `age(x)` con UN argumento, que es el único de esta lista donde el reloj no se escribe:
        * lo pone Postgres. La documentación dice «resta el argumento de current_date (a
        * medianoche)», y medido sobre el mismo instante sale `8 mons 3 days 10:00:00` en
@@ -1540,6 +1563,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Y el SQL de un EXECUTE compuesto por concatenación, en sus dos cortes.
       "execute 'select now()' || '::date'",
       "execute 'select ' || 'now()::date'",
+      // La serialización a JSON, que es la misma elección de calendario que `::text` escrita
+      // con otra función. Las cuatro medidas: cadena distinta en husos opuestos.
+      'to_json(now())',
+      'to_jsonb(now())',
+      "jsonb_build_object('cuando', now())",
+      'json_agg(now())',
       // La edad contra HOY, sin ningún reloj escrito: la forma de un solo argumento basta.
       'age(vence_en)',
       "select age(t.creado_en) > interval '30 days' from t",
@@ -1827,6 +1856,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // La ida y vuelta escrita con CAST … AS, en sus dos mitades. El catálogo NUNCA produce
       // esta forma —la deparsea con `::`—, así que ninguna sonda de objeto real la cubre.
       'cast(now()::text as timestamptz)',
+      // Y el arreglo canónico DENTRO del JSON: lo que se serializa ya es un `timestamp` sin
+      // huso, y sale igual en los dos (medido). Sin esta mitad, el patrón de arriba habría
+      // marcado justo la forma que este PR propone como solución.
+      "to_json(timezone('UTC', now()))",
+      "jsonb_build_object('d', timezone('UTC', now()))",
       // Con los dos instantes dados, `age` no lee ningún calendario (medido). Y el nombre
       // dentro de otro identificador tampoco: `promedio_age` y `average` no son la función.
       'age(now(), t.creado_en)',

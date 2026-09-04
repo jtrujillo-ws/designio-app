@@ -325,7 +325,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // `('1 day'::interval * (2)::double precision)`, con el número casteado dentro de su
     // propio paréntesis. Escribiendo solo la forma fuente, la del catálogo se escapaba.
     const GRUPO = String.raw`\([^()]*(?:\([^()]*\)[^()]*)*\)`;
-    const OPERANDO_ARITMETICO = String.raw`(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*[\w.]+(?:\s*::\s*[\w ]+)?)*`;
+    /*
+     * El operando NO puede ser otro reloj: `(now() - now())::text` es la diferencia de dos
+     * instantes —el intervalo cero, estable entre husos, medido— y entraba como «reloj
+     * ajustado y serializado». Restar un reloj de otro da un intervalo, no una lectura del
+     * calendario, así que se excluye explícitamente.
+     *
+     * Y el multiplicador admite un grupo entre paréntesis: `interval '1 day' * (2)` es
+     * TypeScript y SQL válidos y dependía del huso igual (medido).
+     */
+    const OPERANDO_ARITMETICO = String.raw`(?!\s*(?:${RELOJES}))(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*(?:${GRUPO}|[\w.]+)(?:\s*::\s*[\w ]+)?)*`;
     const ARITMETICA = String.raw`(?:\s*[-+]\s*${OPERANDO_ARITMETICO})*`;
     const NUCLEO = entreParentesis(RELOJES) + CASTOS + ARITMETICA;
     const RELOJ = entreParentesis(entreParentesis(NUCLEO)) + CASTOS;
@@ -378,12 +387,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * positivo sobre una serialización correcta. Volver a un tipo SIN huso sigue eligiendo
      * calendario (`now()::text::date` depende, medido), y ese lo caza el destino de siempre.
      */
-    const TIPO_TEXTUAL = String.raw`character\s+varying\b${PRECISION}|character\b${PRECISION}|varchar\b${PRECISION}|bpchar\b${PRECISION}|text\b`;
+    // `character` lleva su propia guardia contra `varying`: el ORDEN de las alternativas no
+    // basta, porque el motor RETROCEDE. Con `character varying::timestamptz`, la alternativa
+    // larga la rechaza el lookahead de la vuelta, y entonces el motor prueba la corta —hay
+    // frontera de palabra antes del espacio— que ya no ve el cast de vuelta y la marca.
+    const TIPO_TEXTUAL = String.raw`character\s+varying\b${PRECISION}|character\b(?!\s+varying)${PRECISION}|varchar\b${PRECISION}|bpchar\b${PRECISION}|text\b`;
     // Con un `)` opcional en medio: Postgres deparsea `now()::text::timestamptz` como
     // `((now())::text)::timestamp with time zone`, o sea que el cast de vuelta NO va pegado al
     // nombre del tipo sino detrás del paréntesis que cierra. Sin admitirlo, la forma del
     // CATÁLOGO —la única que las sondas pueden ejercitar— salía marcada igual.
-    const VUELTA_CON_HUSO = String.raw`(?!\s*\)?\s*::\s*(?:timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b))`;
+    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*::\s*(?:timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b))`;
     const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:${TIPO_TEXTUAL})${VUELTA_CON_HUSO}`;
 
     /*
@@ -537,13 +550,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * comentario de bloque lo termina, y me costó un fichero sin compilar. La sonda lo
          * lleva, que es donde tiene que estar.)
          *
-         * En TypeScript no anidan, pero contar la profundidad tampoco estorba ahí: `/*`
-         * dentro de un bloque no es válido en ninguno de los dos.
          */
         let hondura = 1;
         i += 2;
         while (i < texto.length && hondura > 0) {
-          if (texto[i] === '/' && texto[i + 1] === '*') {
+          // Solo SQL anida. En TypeScript un `/*` dentro de un comentario es texto normal y
+          // cierra el PRIMER `*/` —comprobado compilando un fichero con uno dentro de otro: no
+          // da error, o sea que lo de después es código—. Contando profundidad también aquí,
+          // `/* explica /* de SQL */ const q = sql\`select now()::date\`;` dejaba la cuenta en
+          // uno y se comía la consulta real hasta otro cierre o el final del fichero.
+          //
+          // Yo había escrito en este mismo comentario que contar profundidad «tampoco estorba»
+          // en TypeScript. Estorba. Era una afirmación mía que no comprobaba nadie.
+          if (modo === 'sql' && texto[i] === '/' && texto[i + 1] === '*') {
             hondura++;
             i += 2;
           } else if (texto[i] === '*' && texto[i + 1] === '/') {
@@ -938,9 +957,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // medio. Medido: el primero da false en UTC+14 y true en UTC-12.
       "now() between timestamptz '2020-01-01 00:00+00' and date '2026-09-04'",
       "now() not between timestamptz '2020-01-01 00:00+00' and '2026-09-04'::date",
-      // La aritmética con llamada y con multiplicación.
+      // La aritmética con llamada y con multiplicación, y con el multiplicador entre
+      // paréntesis, que es la forma FUENTE que el deparseo no enseña.
       '(now() + make_interval(days => 1))::date',
       "(now() + interval '1 day' * 2)::date",
+      "(now() + interval '1 day' * (2))::date",
       // Y los nombres completos del tipo textual.
       'cast(now() as character varying)',
       'now()::character varying',
@@ -1012,9 +1033,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "fecha_de_la_base() = date '2026-09-04'",
       // El `and` de al lado no es el límite superior del `between`. Medida: estable.
       "now() between timestamptz '2020-01-01+00' and timestamptz '2030-01-01+00' and date '2026-09-04' = fecha_de_la_base()",
-      // La ida y vuelta por texto conserva el instante (medido).
+      // La ida y vuelta por texto conserva el instante (medido por valor: mismo epoch en husos
+      // opuestos). Con cualquier envoltura de paréntesis y con el nombre largo del tipo, que
+      // son las dos formas por las que el guardia se dejaba rodear.
       'now()::text::timestamptz',
       'now()::text::timestamp with time zone',
+      '((now()::text))::timestamptz',
+      '(((now())::text))::timestamptz',
+      'now()::character varying::timestamptz',
+      // La RESTA de dos relojes es un intervalo, no una lectura del calendario: el cero es el
+      // cero en todos los husos (medido).
+      '(now() - now())::text',
+      '(now() - now())::interval',
       "(now() at time zone 'UTC')::date = date '2026-09-04'",
       // Un intervalo sobre un valor que NO es reloj no colapsa ningún calendario.
       "(vence_en + interval '1 day')::date",
@@ -1031,6 +1061,39 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     ];
     expect(PELIGROSAS.filter((f) => !culpable(f))).toEqual([]);
     expect(SEGURAS.filter((f) => culpable(f))).toEqual([]);
+
+    /*
+     * Y el BARRIDO DE COMENTARIOS por los dos dialectos, que es por donde pasa TODO lo que
+     * este censo inspecciona: si se come código, el censo da verde sin haber mirado.
+     *
+     * La diferencia entre los dialectos no es un detalle: **SQL anida los comentarios de
+     * bloque y TypeScript no** (comprobados los dos). Contar profundidad en TypeScript deja la
+     * cuenta abierta en el primer cierre y se lleva por delante la consulta real hasta el
+     * siguiente cierre o el final del fichero.
+     */
+    const tras = (t: string, d: 'sql' | 'ts') => sinComentarios(t, d);
+    // Un `--` DENTRO de un literal no abre comentario.
+    expect(culpable(tras("select '--', now()::date", 'sql'))).toBe(true);
+    // Ni un `//` dentro de una cadena de TypeScript.
+    expect(
+      culpable(tras("const u = 'https://host'; const q = sql`select now()::date`;", 'ts')),
+    ).toBe(true);
+    // SQL ANIDA: el cierre interior no termina el comentario, así que el `--` de después sigue
+    // comentado y no puede comerse el código que viene tras el cierre exterior.
+    expect(
+      culpable(tras('/* fuera /* dentro */ -- sigue fuera */ select now()::date', 'sql')),
+    ).toBe(true);
+    // TypeScript NO anida: el primer cierre termina el comentario y lo de después es código.
+    expect(
+      culpable(tras('/* explica /* de SQL */ const q = sql`select now()::date`;', 'ts')),
+    ).toBe(true);
+    // Y la otra mitad: un comentario de verdad no se convierte en hallazgo.
+    expect(culpable(tras('-- antes usaba current_date; ahora fecha_de_la_base()', 'sql'))).toBe(
+      false,
+    );
+    expect(culpable(tras('// antes usaba current_date; ahora fecha_de_la_base()', 'ts'))).toBe(
+      false,
+    );
   });
 
   it('ninguna función lee el reloj de pared de quien la llama', async () => {

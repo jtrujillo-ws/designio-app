@@ -3369,12 +3369,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   );
 
   /**
-   * Los relojes, para BUSCARLOS en un texto. Es la misma lista de siempre más `now()` y sus
-   * hermanos con huso: aquí no se trata de prohibirlos —son seguros— sino de encontrarlos
-   * para poder certificar dónde terminan.
+   * Las palabras del reloj que son de la GRAMÁTICA y no funciones, así que no salen del
+   * catálogo: `current_date` y sus hermanos, más las cuatro cadenas que Postgres EVALÚA. Es
+   * la única parte de «qué es un instante» escrita a mano, y puede estarlo porque la define
+   * el estándar SQL y no crece.
+   *
+   * Todo lo DEMÁS —qué función devuelve un instante, qué columna vale uno— sale del catálogo,
+   * y por una razón que costó un hallazgo: la primera versión de esta comprobación llevaba
+   * los relojes en una lista a mano, y esa lista se dejaba fuera `pg_postmaster_start_time()`
+   * y ocho más que el propio Postgres publica. Una función que guardara uno de ésos en un
+   * registro y lo asignara después a una variable `date` recibía el certificado «sin reloj» y
+   * pasaba en verde — el mismo modo de fallo que esta comprobación vino a quitar, reaparecido
+   * dentro de ella. Una lista a mano en un guardián es una promesa que caduca sin avisar.
    */
-  const RELOJ_EN_EL_TEXTO =
-    /\b(?:now|current_timestamp|current_date|current_time|localtime|localtimestamp|clock_timestamp|statement_timestamp|transaction_timestamp|timeofday)\b/gi;
+  const RELOJ_DE_LA_GRAMATICA = [
+    'current_date',
+    'current_time',
+    'current_timestamp',
+    'localtime',
+    'localtimestamp',
+  ];
 
   /**
    * El reloj ENVUELTO en UTC, en las dos escrituras: la que `pg_get_functiondef` conserva
@@ -3382,8 +3396,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * un cuerpo SQL o un default (`timezone('UTC'::text, now())`). Envuelto así, el resultado
    * es un `timestamp` sin huso que ya no tiene de dónde moverse: lo que venga después da
    * igual, y por eso este certificado corta el análisis.
+   *
+   * Y el CALIFICADOR cuenta como parte del envuelto: lo que se envuelve en
+   * `timezone('UTC', v_disp.ejecutado_en)` es la columna entera, pero el instante se
+   * encuentra por su último identificador, así que sin admitir el `v_disp.` de en medio el
+   * arreglo canónico sobre una columna calificada salía sin certificar. Lo encontraron tres
+   * guards del borrado acordado, que lo escriben todos así.
    */
-  const ENVUELTO_ANTES = /\btimezone\s*\(\s*'utc'(?:\s*::\s*[a-z_"]+)?\s*,\s*$/i;
+  const ENVUELTO_ANTES =
+    /\btimezone\s*\(\s*'utc'(?:\s*::\s*[a-z_"]+)?\s*,\s*(?:[A-Za-z_"][\w$"]*\s*\.\s*)*$/i;
   const ENVUELTO_DESPUES = /^\s*(?:\(\s*\)\s*)?at\s+time\s+zone\s+'utc'/i;
 
   /**
@@ -3395,20 +3416,32 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     crudo: string,
     tipoDestino: string | undefined,
     nombresQueMueven: Set<string>,
-  ): string | null => {
+    instantes: RegExp,
+  ): { certificado: string } | { motivo: string } => {
     const texto = sinComentarios(crudo, 'sql');
-    const relojes = [...texto.matchAll(RELOJ_EN_EL_TEXTO)];
-    // «SIN RELOJ»: no hay ningún instante que colocar.
-    if (relojes.length === 0) return 'sin reloj';
-    // «ENVUELTO EN UTC»: todos los relojes del objeto están fijados al huso del servidor.
-    if (
-      relojes.every(
-        (r) =>
-          ENVUELTO_ANTES.test(texto.slice(Math.max(0, r.index - 60), r.index)) ||
-          ENVUELTO_DESPUES.test(texto.slice(r.index + r[0].length, r.index + r[0].length + 40)),
-      )
-    )
-      return 'envuelto en UTC';
+    /*
+     * Los instantes se buscan en el CUERPO, no en el encabezado que `pg_get_functiondef`
+     * antepone. Ahí el nombre de la propia función y sus tipos son una FIRMA, no un uso: una
+     * función nularia que devuelve `timestamptz` —`inicio_del_dia_de_la_base`— está en el
+     * conjunto de instantes por su tipo de vuelta, y al leer su encabezado casaba consigo
+     * misma y salía con un instante sin envolver que no existe en ninguna parte.
+     *
+     * Lo que el encabezado sí aporta —el tipo del DESTINO— llega por su parámetro, que es
+     * donde se puede mirar sin confundirlo con un uso.
+     */
+    const cuerpo = /\bas\s+(\$[A-Za-z_]*\$)/i.exec(texto);
+    const dondeBuscar = cuerpo ? texto.slice(cuerpo.index + cuerpo[0].length) : texto;
+    instantes.lastIndex = 0;
+    const relojes = [...dondeBuscar.matchAll(instantes)];
+    // «SIN INSTANTE»: no hay nada que colocar.
+    if (relojes.length === 0) return { certificado: 'sin instante' };
+    // «ENVUELTO EN UTC»: todos los instantes del objeto están fijados al huso del servidor.
+    const envuelto = (r: RegExpMatchArray): boolean =>
+      ENVUELTO_ANTES.test(dondeBuscar.slice(Math.max(0, r.index! - 60), r.index!)) ||
+      ENVUELTO_DESPUES.test(
+        dondeBuscar.slice(r.index! + r[0].length, r.index! + r[0].length + 40),
+      );
+    if (relojes.every(envuelto)) return { certificado: 'envuelto en UTC' };
     /*
      * «SIN DÓNDE CAER»: en todo el objeto no hay un solo tipo temporal que no sea un instante,
      * ni un nombre del catálogo que valga uno, ni un built-in que pueda producirlo. Es el
@@ -3420,11 +3453,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * `now()` a secas tanto en una columna `date` como en una `timestamptz`, y lo único que
      * las separa es el tipo de la columna.
      */
-    if (tipoDestino !== undefined && TEMPORAL_QUE_MUEVE.test(tipoDestino)) return null;
-    if (TEMPORAL_QUE_MUEVE.test(texto)) return null;
+    /*
+     * Y cuando no se certifica, el veredicto DICE POR QUÉ: qué instante quedó sin envolver y
+     * con qué se podría encontrar. Un guardián que enrojece sin nombrar lo que vio obliga a
+     * reconstruir su razonamiento a mano, y eso es lo que hace que una lista de excepciones
+     * crezca sin que nadie la lea.
+     */
+    const suelto = relojes.find((r) => !envuelto(r))!;
+    const donde = dondeBuscar
+      .slice(Math.max(0, suelto.index! - 40), suelto.index! + suelto[0].length + 20)
+      .replace(/\s+/g, ' ')
+      .trim();
+    const mueve = (razon: string) => ({ motivo: `${razon} · «…${donde}…»` });
+    if (tipoDestino !== undefined && TEMPORAL_QUE_MUEVE.test(tipoDestino))
+      return mueve(`el destino es ${tipoDestino}`);
+    const tipo = TEMPORAL_QUE_MUEVE.exec(texto);
+    if (tipo !== null) return mueve(`menciona el tipo «${tipo[0]}»`);
     for (const palabra of texto.toLowerCase().match(/[a-z_][a-z0-9_$]*/g) ?? [])
-      if (nombresQueMueven.has(palabra) || COLAPSAN.has(palabra)) return null;
-    return 'sin dónde caer';
+      if (nombresQueMueven.has(palabra)) return mueve(`menciona «${palabra}», que no es un instante`);
+      else if (COLAPSAN.has(palabra)) return mueve(`llama a «${palabra}», que colapsa`);
+    return { certificado: 'sin dónde caer' };
   };
 
   /**
@@ -3488,6 +3536,62 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   };
 
   /**
+   * QUÉ ES UN INSTANTE, del catálogo: toda función que devuelva `timestamp with time zone`
+   * —incluidas las NULARIAS, que son los relojes de verdad: `now`, `clock_timestamp`,
+   * `pg_postmaster_start_time`, `pg_conf_load_time`…— y todo nombre (columna, retorno,
+   * parámetro, dominio) que valga uno. Más las palabras de la gramática, que no son funciones.
+   *
+   * Se busca por NOMBRE y con posición, porque el certificado de la envoltura necesita saber
+   * dónde está cada uno. La alternativa —una lista a mano— es justo lo que falló.
+   *
+   * Sin AGREGADOS, por lo mismo que en el conjunto de los que mueven: `max` y `min` tienen una
+   * entrada que devuelve `timestamptz`, sus nombres son demasiado comunes, y el tipo de un
+   * agregado lo pone su ENTRADA — que es una columna, y esa columna ya está aquí si vale un
+   * instante.
+   */
+  const instantesDelCatalogo = async (): Promise<RegExp> => {
+    const filas = await sqlAdmin()`
+      select distinct nombre from (
+        select a.attname::text as nombre, format_type(a.atttypid, a.atttypmod) as tipo
+          from pg_attribute a
+          join pg_class c on c.oid = a.attrelid
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and a.attnum > 0 and not a.attisdropped
+           and c.relkind in ('r', 'p', 'v', 'm', 'c')
+           and c.relname not like 'censo_probe%' and c.relname not like 'censo_tmp%'
+           and c.relname not like 'CensoProbe%'
+        union all
+        -- Solo las NULARIAS. Una funcion con argumentos que devuelve un instante no lo
+        -- ORIGINA: lo hereda de lo que le pasan, y esa fuente ya se cuenta por su cuenta.
+        -- Contarla igual rompia el certificado de la envoltura y de la peor manera: en
+        -- timezone('UTC', now()) el propio timezone tiene una sobrecarga que devuelve
+        -- timestamptz, asi que casaba como un instante SIN envolver y el arreglo canonico de
+        -- este PR salia sin certificar. Medido sobre fecha_de_la_base y sobre la sonda segura.
+        select p.proname::text, format_type(p.prorettype, null)
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+         where n.nspname in ('public', 'pg_catalog') and p.prokind = 'f'
+           and coalesce(array_length(p.proargtypes, 1), 0) = 0
+        union all
+        select p.proname::text, format_type(t.oid, null)
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace,
+               unnest(coalesce(p.proallargtypes, p.proargtypes::oid[])) t(oid)
+         where n.nspname = 'public' and p.prokind in ('f', 'p')
+        union all
+        select t.typname::text, format_type(t.typbasetype, t.typtypmod)
+          from pg_type t join pg_namespace n on n.oid = t.typnamespace
+         where n.nspname = 'public' and t.typtype = 'd'
+      ) x
+      where tipo like 'timestamp with time zone%'`;
+    const nombres = [
+      ...RELOJ_DE_LA_GRAMATICA,
+      ...filas.map((r) => (r.nombre as string).toLowerCase()),
+    ];
+    // De mayor a menor, para que una alternativa corta no se coma el prefijo de una larga.
+    nombres.sort((a, b) => b.length - a.length);
+    return new RegExp(String.raw`\b(?:${nombres.join('|')})\b`, 'gi');
+  };
+
+  /**
    * Lo que NO se certifica y aun así está bien, uno por uno y con el motivo escrito. Esta
    * lista es el precio del cambio y también su prueba: mientras sea corta y cada línea diga
    * algo medido, la inversión está haciendo su trabajo; el día que crezca sin que nadie lea
@@ -3520,6 +3624,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'el reloj es «new.completado_en := now()» y outcome_review.completado_en es timestamp ' +
       'with time zone. Obligan ventana_inicio (date) y ventana_de_medicion_abierta (que la ' +
       'recibe), en la comprobación de la ventana de medición, otra sentencia.',
+    'funcion filas_de_conciliacion':
+      'el instante es «order by t.orden, t.creado_en», que ordena y no colapsa. Lo que mueve ' +
+      'es un to_char, pero sobre r.fecha_objetivo, que es date: medido, to_char(date, ' +
+      'YYYY-MM-DD) da 2026-03-08 en Pacific/Kiritimati y en Etc/GMT+12 — un date no tiene huso ' +
+      'que perder. Los dos nunca se cruzan.',
+    'funcion disposicion_motivo_no_ejecutable':
+      'el instante suelto es «select max(xp.completado_en) into v_export», y v_export está ' +
+      'declarada timestamptz: instante a instante. El tipo date que obliga es el del arreglo ' +
+      'canónico de este mismo PR, timezone(UTC, now())::date, sesenta líneas más abajo y ya ' +
+      'envuelto.',
+    'funcion ejecutar_disposicion':
+      'el mismo «max(xp.completado_en) into v_export» con v_export timestamptz. Lo que obliga ' +
+      'es un to_char, y su argumento es timezone(UTC, v_disp.ejecutado_en) — o sea el instante ' +
+      'ya fijado al huso del servidor antes de imprimirlo.',
+    'politica derecho_insert en derecho_uso':
+      'el instante es «decidido_en IS NULL» y lo que obliga es «vence_en IS NULL». Las dos son ' +
+      'pruebas de nulidad: no hay comparación ni cast que pueda colapsar nada.',
+    'politica gate_update_aprobar en gate_instancia':
+      'lo mismo del revés: «aprobado_en IS NOT NULL» contra «c.linea_base_fecha IS NULL». Dos ' +
+      'pruebas de nulidad, en ramas distintas del predicado.',
     'politica reserva_delete en reserva_ai':
       'la comparación es «creado_en <= now() - reserva_ai_ventana()», los dos lados instantes. ' +
       'Obliga que reserva_ai_ventana() devuelva interval, y un intervalo movería el instante ' +
@@ -6390,6 +6514,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        *    esa entrada es una columna — que ya está en este conjunto si es de las que mueven.
        */
       const NOMBRES_QUE_MUEVEN = await nombresQueMuevenDelCatalogo();
+      const INSTANTES = await instantesDelCatalogo();
+      // El reconocedor de instantes tiene que estar mirando lo que el catálogo publica, y en
+      // concreto el reloj que la lista a mano se dejaba fuera. Sin esto, volver a una lista
+      // corta dejaría esta comprobación en verde sin mirar la mitad de las fuentes.
+      expect(INSTANTES.test('select pg_postmaster_start_time()')).toBe(true);
+      expect(INSTANTES.test('select 1')).toBe(false);
       // Tiene que estar mirando algo, y en concreto la columna que fabrica la sonda: si esta
       // consulta dejara de devolverla, la pareja de arriba se certificaría y el censo daría
       // verde por no saber que existe una columna `date`.
@@ -6471,15 +6601,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        *    declaración que sobra —porque el objeto se arregló o desapareció— también. Una
        *    lista de excepciones que no caduca deja de ser una lista de excepciones.
        */
-      const sinCertificar = guardadas
-        .filter(
-          (g) =>
-            certificar(g.cuerpo as string, (g.tipo as string | null) ?? undefined, NOMBRES_QUE_MUEVEN) ===
-            null,
-        )
-        .map((g) => `${g.sitio as string} ${g.objeto as string}`)
-        .sort();
-      expect(sinCertificar).toEqual(
+      const diagnostico: string[] = [];
+      const sinCertificar: string[] = [];
+      for (const g of guardadas) {
+        const v = certificar(
+          g.cuerpo as string,
+          (g.tipo as string | null) ?? undefined,
+          NOMBRES_QUE_MUEVEN,
+          INSTANTES,
+        );
+        if ('motivo' in v) {
+          sinCertificar.push(`${g.sitio as string} ${g.objeto as string}`);
+          diagnostico.push(`${g.sitio as string} ${g.objeto as string}: ${v.motivo}`);
+        }
+      }
+      expect(sinCertificar.sort(), diagnostico.join('\n')).toEqual(
         [...Object.keys(CERTIFICADAS_A_MANO), ...SONDAS_SIN_CERTIFICAR].sort(),
       );
     } finally {

@@ -35,32 +35,50 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   const PALABRAS_DEL_RELOJ = [
     // De más larga a más corta: con `current_time` delante, la alternación la casaba dentro
     // de `current_timestamp` y el resto quedaba suelto.
-    `current_timestamp${PRECISION}`,
-    `current_time${PRECISION}`,
-    `localtimestamp${PRECISION}`,
-    `localtime${PRECISION}`,
-    'current_date',
+    //
+    // La frontera derecha va DENTRO de cada palabra, justo después del nombre y ANTES de la
+    // precisión opcional. Antes vivía al final de la alternación entera, y ahí no se podía
+    // reutilizar: `current_timestamp(0)` termina en `)`, y un `\b` detrás de un paréntesis
+    // exige un carácter de palabra que no existe. Puesta aquí, `current_date_pactada` sigue
+    // sin marcarse —`e` y `_` son los dos de palabra— y la alternación entera se puede
+    // insertar como operando en cualquier otro patrón.
+    `current_timestamp\\b${PRECISION}`,
+    `current_time\\b${PRECISION}`,
+    `localtimestamp\\b${PRECISION}`,
+    `localtime\\b${PRECISION}`,
+    String.raw`current_date\b`,
   ];
 
   /**
    * Los campos y precisiones seguros NO se escriben: se MIDEN contra la base, comparando el
-   * mismo instante en varios husos. Dos veces me equivoqué escribiéndolos a mano:
+   * mismo instante en husos distintos. Tres veces me equivoqué al elegir la muestra:
    *
    *  · con UN instante, `month`, `year` y `week` salían independientes porque ese instante no
    *    cruzaba esas fronteras;
    *  · con dos husos de desfase ENTERO, `minute` salía independiente — y no lo es: en
-   *    `Asia/Kathmandu` (UTC+05:45) `extract(minute from …)` da 20 donde UTC da 35.
+   *    `Asia/Kathmandu` (UTC+05:45) `extract(minute from …)` da 20 donde UTC da 35;
+   *  · con CINCO husos escogidos a mano quedaba la pregunta de siempre, «¿y el que no se me
+   *    ocurrió?». Escoger la muestra era el punto débil, así que ya no se escoge: el barrido
+   *    va sobre TODO `pg_timezone_names` —499 husos en la tzdata de esta máquina, los que
+   *    haya en la del servidor— en un bucle del lado suyo (230 ms). Las listas salen iguales
+   *    que con los cinco escogidos a mano — pero
+   *    ahora eso es un RESULTADO y no una suposición, y si mañana tzdata añade un huso raro
+   *    las listas se recalculan solas sin que nadie tenga que acordarse.
    *
-   * Así que el suite hace el barrido él: ocho instantes que cruzan día, mes, año, década,
-   * siglo y milenio, y cinco husos, dos de ellos con desfase de 45 minutos. Un campo entra en
-   * la lista segura solo si da el mismo valor en TODOS. Si mañana aparece un huso más raro,
-   * basta añadirlo aquí y las listas se recalculan solas.
+   * Los INSTANTES sí siguen escritos, y son todos de hoy o del futuro a propósito: son los
+   * que un RELOJ puede devolver, que es lo único que estos patrones miran. La distinción no
+   * es cosmética. Con un instante de 1900 en la muestra, `second`, `milliseconds` y
+   * `microseconds` se caen de la lista de campos y `minute` de la de precisiones, porque 297
+   * de esos husos tenían entonces desfases de HORA LOCAL MEDIA con segundos sueltos
+   * (`Europe/Amsterdam` iba a UTC+00:19:32). Medirlo con 1900 dentro dejaría la lista de
+   * campos en `epoch` a secas y convertiría `extract(milliseconds from now())` —que es
+   * seguro— en un hallazgo. El caso se comprueba abajo por los dos lados en vez de confiarse.
    *
    * Las dos listas NO coinciden, y la diferencia es instructiva: `minute` es seguro para
-   * `date_trunc` —truncar al minuto deja el mismo instante, porque todos los desfases son
-   * minutos enteros— y peligroso para `extract`, que lee la esfera del reloj de pared.
+   * `date_trunc` —truncar al minuto deja el mismo instante, porque todos los desfases
+   * ALCANZABLES POR UN RELOJ son minutos enteros— y peligroso para `extract`, que lee la
+   * esfera del reloj de pared.
    */
-  const HUSOS = ['UTC', 'Etc/GMT+12', 'Pacific/Kiritimati', 'Asia/Kathmandu', 'Australia/Eucla'];
   const INSTANTES = [
     '2026-09-04 06:35:00+00',
     '2026-09-04 00:10:00+00',
@@ -109,109 +127,175 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     const funciones = filas.map((f) => `${f.nombre as string}\\s*\\(\\s*\\)`);
     expect(funciones.length).toBeGreaterThanOrEqual(5);
 
-    /* Y las dos listas seguras, MEDIDAS: un campo o una precisión entra solo si da el mismo
-     * valor para el mismo instante en los cinco husos. Se hace en una sola ida y vuelta. */
-    const medir = async (fn: 'date_part' | 'date_trunc', nombres: string[]) => {
-      /* Un huso por SENTENCIA, dentro de una transacción: `set_config(…, true)` dentro de una
-       * consulta no se aplica por fila —el orden de evaluación no está definido—, y mi primer
-       * intento midió mal por eso: `epoch` salía inestable. Así se fija el huso, se mide, y se
-       * pasa al siguiente. */
-      const porHuso: string[][] = [];
-      for (const huso of HUSOS) {
-        const valores = await sqlAdmin().begin(async (tx) => {
-          await tx`select set_config('TimeZone', ${huso}, true)`;
-          /* El valor se compara como NÚMERO ABSOLUTO, no como texto. `date_trunc` devuelve
-           * `timestamptz`, y su representación textual lleva el desfase del huso: mi primer
-           * intento comparaba `…::text` y daba `second` y `milliseconds` como inestables
-           * porque «06:35:00+00» y «12:20:00+05:45» son cadenas distintas… del mismo
-           * instante. Comparar la impresión en vez del valor es el mismo error que este censo
-           * existe para cazar, cometido al medirlo. */
-          const expr = fn === 'date_trunc' ? `extract(epoch from ${fn}(n, i))` : `${fn}(n, i)`;
-          const filas = await tx.unsafe(
-            `select n as nombre, i as t, ${expr}::text as v
-             from unnest($1::text[]) n, unnest($2::timestamptz[]) i`,
-            [nombres, INSTANTES],
-          );
-          return filas.map((f) => `${f.nombre as string}|${String(f.t)}|${f.v as string}`);
-        });
-        porHuso.push(valores);
-      }
-      // Estable = el mismo valor para el mismo (nombre, instante) en todos los husos.
-      const primero = new Map(porHuso[0]!.map((x) => [x.split('|').slice(0, 2).join('|'), x]));
-      const inestables = new Set<string>();
-      for (const valores of porHuso.slice(1)) {
-        for (const x of valores) {
-          const clave = x.split('|').slice(0, 2).join('|');
-          if (primero.get(clave) !== x) inestables.add(clave.split('|')[0]!);
-        }
-      }
-      return nombres.filter((n) => !inestables.has(n));
-    };
-    const campos = await medir('date_part', CAMPOS);
-    const unidades = await medir('date_trunc', UNIDADES);
-    // Que la medición esté midiendo: `epoch` es un instante absoluto y tiene que salir seguro,
-    // y `day` depende del huso por definición y no puede salir.
+    /*
+     * Y las dos listas seguras, MEDIDAS sobre TODOS los husos que el servidor conoce.
+     *
+     * El bucle va del lado del servidor, en un bloque `DO`, y no en TypeScript. No es por
+     * velocidad: es porque `set_config(…, true)` DENTRO de una consulta no se aplica por
+     * fila —el orden de evaluación no está definido— y mi primer intento midió mal por eso
+     * («epoch» salía inestable). En plpgsql cada sentencia ve el huso que fijó la anterior,
+     * que es la única forma honesta de barrer 499 husos en una ida y vuelta.
+     *
+     * El valor se compara como NÚMERO ABSOLUTO, no como texto. `date_trunc` devuelve
+     * `timestamptz` y su representación textual lleva el desfase: mi primer intento comparaba
+     * `…::text` y daba `second` y `milliseconds` como inestables porque «06:35:00+00» y
+     * «12:20:00+05:45» son cadenas distintas… del mismo instante. Comparar la impresión en
+     * vez del valor es el mismo error que este censo existe para cazar, cometido al medirlo.
+     *
+     * La reducción también va en el servidor: 140.000 mediciones no tienen por qué cruzar el
+     * cable para acabar en dos listas de una línea.
+     */
+    const [campos, unidades] = await sqlAdmin().begin(async (tx) => {
+      await tx`create temp table censo_entrada(clase text, nombre text) on commit drop`;
+      await tx`create temp table censo_instante(t timestamptz) on commit drop`;
+      await tx`create temp table censo_medicion(clase text, nombre text, t timestamptz, v text)
+               on commit drop`;
+      await tx`insert into censo_entrada select 'campo', unnest(${CAMPOS}::text[])`;
+      await tx`insert into censo_entrada select 'unidad', unnest(${UNIDADES}::text[])`;
+      await tx`insert into censo_instante select unnest(${INSTANTES}::timestamptz[])`;
+      await tx`do $medir$
+        declare z text;
+        begin
+          for z in select name from pg_timezone_names loop
+            perform set_config('TimeZone', z, true);
+            insert into censo_medicion
+              select e.clase, e.nombre, i.t,
+                     case e.clase
+                       when 'campo' then date_part(e.nombre, i.t)::text
+                       else extract(epoch from date_trunc(e.nombre, i.t))::text
+                     end
+              from censo_entrada e, censo_instante i;
+          end loop;
+          perform set_config('TimeZone', 'UTC', true);
+        end $medir$`;
+      // Estable = para cada instante, un único valor en los 499 husos.
+      const estables = await tx`
+        select clase, nombre from censo_medicion
+        group by clase, nombre
+        having count(distinct t::text || '|' || v) = count(distinct t)
+        order by clase, nombre`;
+      const de = (clase: string) =>
+        estables.filter((f) => f.clase === clase).map((f) => f.nombre as string);
+      return [de('campo'), de('unidad')];
+    });
+    /*
+     * Que la medición esté midiendo: `epoch` es un instante absoluto y tiene que salir seguro,
+     * y `day` depende del huso por definición y no puede salir.
+     */
     expect(campos).toContain('epoch');
     expect(campos).not.toContain('day');
     expect(unidades).not.toContain('day');
+    /*
+     * Y la premisa que sostiene a `second`, `milliseconds`, `microseconds` y al `minute` de
+     * `date_trunc`: en los instantes que un RELOJ puede devolver, ningún huso del servidor
+     * tiene un desfase con segundos sueltos. Se comprueba por los dos lados, porque un
+     * guardián que nunca ve un culpable no está probado: en 1900 sí los hay, en la era de la
+     * hora local media, y la misma consulta los encuentra.
+     *
+     * (Postgres 16 no ofrece otra vía: `set time zone interval '00:00:30' hour to second` la
+     * rechaza con «time zone interval must be HOUR or HOUR TO MINUTE», y un huso POSIX con
+     * segundos lo rechaza como segundos intercalares. Comprobado, no supuesto.)
+     */
+    const [desfases] = await sqlAdmin()`
+      select
+        count(*) filter (where
+          extract(second from (i.t at time zone z.name) - (i.t at time zone 'UTC')) <> 0
+        ) as con_segundos,
+        count(*) filter (where
+          extract(second from (h.t at time zone z.name) - (h.t at time zone 'UTC')) <> 0
+        ) as con_segundos_en_1900
+      from pg_timezone_names z,
+        unnest(${INSTANTES}::timestamptz[]) i(t),
+        (select timestamptz '1900-01-01 12:00:00+00') h(t)`;
+    expect(Number(desfases!.con_segundos)).toBe(0);
+    expect(Number(desfases!.con_segundos_en_1900)).toBeGreaterThan(0);
     CAMPOS_SEGUROS = campos.join('|');
     UNIDADES_SEGURAS = unidades.join('|');
-    RELOJES = [...funciones, ...PALABRAS_DEL_RELOJ].join('|');
-    // La frontera de palabra va a los DOS lados: sin la de la derecha,
-    // `current_date_pactada` —un identificador que contiene la palabra— salía marcado, y un
-    // censo que marca lo que no es se acaba desactivando. Con `_` como carácter de palabra,
-    // `\b` la separa; y no estorba a la precisión, porque `current_time(3)` sí tiene
-    // frontera entre la `e` y el paréntesis.
-    DEL_HUSO_DE_LA_SESION = new RegExp(
-      String.raw`\b(${PALABRAS_DEL_RELOJ.join('|')})\b`,
-      'i',
-    );
+    RELOJES = [
+      // Las funciones llevan su frontera IZQUIERDA: sin ella, `mi_now()` salía marcado. A la
+      // derecha no hace falta ninguna, porque el `\)` del nombre ya cierra.
+      ...funciones.map((f) => String.raw`\b${f}`),
+      ...PALABRAS_DEL_RELOJ,
+    ].join('|');
+    DEL_HUSO_DE_LA_SESION = new RegExp(String.raw`\b(?:${PALABRAS_DEL_RELOJ.join('|')})`, 'i');
+
+    /*
+     * Un reloj rara vez llega DESNUDO a la operación que elige el calendario: se le pone un
+     * cast por el camino, o Postgres se lo envuelve en paréntesis al deparsear. Los patrones
+     * exigían el reloj a secas, y eso NO eran tres agujeros sueltos sino UNA causa con ocho:
+     * `now()::timestamp::date`, `date_trunc('day', timeofday()::timestamptz)` y su forma
+     * deparseada, `date_trunc('day', now()::timestamp)`, `cast(now()::timestamp as date)`,
+     * `date(now()::timestamp)`, `to_char(now()::timestamp, …)` y
+     * `extract(day from (now())::timestamp)` se escapaban todas. Medido — y medido también
+     * que las ocho eligen día distinto en husos opuestos, que es lo que las hace hallazgos:
+     * `now()::timestamp` da día 4 en `Pacific/Kiritimati` y día 3 en `Etc/GMT+12`.
+     *
+     * Así que el reloj como OPERANDO se define UNA vez y se usa en todos: el reloj, con o sin
+     * paréntesis propios, seguido de cualquier cadena de castos a un tipo de tiempo, y todo
+     * ello envolvible otra vez —que es exactamente como sale del deparseador:
+     * `((timeofday())::timestamp with time zone)`.
+     *
+     * El arreglo tiene DOS mitades y las dos cargan peso, comprobado neutralizando cada una
+     * por separado: sin el operando se escapan ocho formas —entre ellas las dos del reloj de
+     * texto, que es la prueba de que fundir tres patrones en uno no perdió nada—; sin el
+     * destino ampliado de aquí abajo se escapan `now()::timestamp` y su deparseo. Ninguna de
+     * las dos enrojece nada que no sea suyo.
+     */
+    const TIPO_DE_TIEMPO = String.raw`timestamptz\b|timestamp\b(?:\s+with(?:out)?\s+time\s+zone\b)?`;
+    const CASTOS = String.raw`(?:\s*::\s*(?:${TIPO_DE_TIEMPO}))*`;
+    const entreParentesis = (x: string) => String.raw`(?:${x}|\(\s*(?:${x})\s*\))`;
+    const RELOJ = entreParentesis(entreParentesis(RELOJES) + CASTOS) + CASTOS;
+
+    /*
+     * Y el DESTINO que elige calendario: un tipo SIN huso. `timestamptz` no entra porque
+     * conserva el instante; `timestamp` a secas sí, porque es ya el reloj de pared de quien
+     * llama —medido: `now()::timestamp` da día 4 en Kiritimati y día 3 en Etc/GMT+12—.
+     *
+     * El nombre del tipo va ACOTADO. Antes el cast intermedio se escribía `timestamp[^)]*`, y
+     * ese `[^)]*` se tragaba la cláusula que precisamente FIJA el huso: en
+     * `((now())::timestamp with time zone AT TIME ZONE 'UTC')::date` —que medido NO depende
+     * del huso— el `AT TIME ZONE 'UTC'` entraba en el tipo y la forma correcta salía marcada.
+     * Un censo que marca el propio arreglo se acaba desactivando.
+     */
+    const TIPO_SIN_HUSO = String.raw`(?:date|time|timestamp)\b(?!\s+with\s+time\s+zone\b)`;
+
     RELOJ_COLAPSADO_A_DIA = [
-      // `date_trunc('day', now())`, y su forma deparseada `date_trunc('day'::text, now())`.
-      // Marca CUALQUIER unidad que no esté en la lista segura.
+      // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
+      // que lleva cast: `date_trunc('day', timeofday()::timestamptz)`, obligada porque ese
+      // reloj devuelve texto. Marca CUALQUIER unidad que no esté en la lista medida.
       new RegExp(
-        String.raw`date_trunc\s*\(\s*'(?!(?:${UNIDADES_SEGURAS})')[^']*'(::\w+)?\s*,\s*(${RELOJES})\s*\)`,
+        String.raw`date_trunc\s*\(\s*'(?!(?:${UNIDADES_SEGURAS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})\s*\)`,
         'i',
       ),
-      // `now()::date` tal como se escribe, admitiendo castos intermedios a timestamp:
-      // `timeofday()::timestamptz::date` es la forma que los necesita, porque ese reloj
-      // devuelve texto y Postgres no puede colapsar el salto como hace con `now()`.
-      new RegExp(
-        String.raw`\b(${RELOJES})\s*(?:::\s*timestamptz?\s*)*::\s*(date|time)\b`,
-        'i',
-      ),
-      // …y tal como Postgres la devuelve: `(now())::date`, con paréntesis propios. Es la forma
-      // canónica a la que reduce también `cast(now() as date)`. NO marca
-      // `(timezone('UTC'::text, now()))::date`, porque ahí el paréntesis que precede al `::`
-      // es el de `timezone`: el reloj va envuelto.
-      new RegExp(String.raw`\(\s*(${RELOJES})\s*\)\s*::\s*(date|time)\b`, 'i'),
-      // Un reloj que pasa por un cast INTERMEDIO antes de llegar al día. Postgres colapsa
-      // `now()::timestamptz::date` a `(now())::date`, pero no puede colapsar el de un reloj
-      // que devuelve TEXTO: `timeofday()::timestamptz::date` se guarda como
-      // `((timeofday())::timestamp with time zone)::date`, y sin este patrón el salto
-      // intermedio lo dejaba fuera de todos los demás.
-      new RegExp(
-        String.raw`\(\s*\(\s*(${RELOJES})\s*\)\s*::\s*timestamp[^)]*\)\s*::\s*(date|time)\b`,
-        'i',
-      ),
+      // El cast al tipo sin huso, en sus cuatro formas de una sola vez: `now()::date` tal como
+      // se escribe, `(now())::date` tal como Postgres la devuelve —y a la que reduce también
+      // `cast(now() as date)`—, `now()::timestamp::date` con salto intermedio, y
+      // `((timeofday())::timestamp with time zone)::date`, que es la anterior deparseada.
+      //
+      // Eran tres patrones y ahora es uno; las cuatro formas siguen teniendo sonda propia,
+      // porque juntar patrones sin dejar prueba de cada forma es cambiar un hueco por otro.
+      //
+      // NO marca `(timezone('UTC'::text, now()))::date`: ahí el paréntesis que precede al
+      // `::` es el de `timezone`, y `timezone` no es un reloj — el reloj va envuelto.
+      new RegExp(String.raw`(${RELOJ})\s*::\s*(${TIPO_SIN_HUSO})`, 'i'),
       // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
-      new RegExp(String.raw`cast\s*\(\s*(${RELOJES})\s+as\s+(date|time)\b`, 'i'),
+      new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+(${TIPO_SIN_HUSO})`, 'i'),
       // `date(now())`, la tercera forma de escribir la misma conversión.
-      new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJES})\s*\)`, 'i'),
+      new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJ})\s*\)`, 'i'),
       // `to_char(now(), 'YYYY-MM-DD')`: no colapsa a un `date` pero produce el mismo día del
       // huso, y una regla escrita sobre esa cadena decide igual. El reloj tiene que ser el
       // PRIMER argumento — envuelto en `timezone('UTC', …)` ya no lo es.
-      new RegExp(String.raw`to_char\s*\(\s*(${RELOJES})\s*,`, 'i'),
+      new RegExp(String.raw`to_char\s*\(\s*(${RELOJ})\s*,`, 'i'),
       // `extract(day from now())` y `EXTRACT(day FROM now())`: no colapsa a un día entero,
       // extrae UN campo del calendario, y el campo cambia con el huso igual.
       new RegExp(
-        String.raw`extract\s*\(\s*(?!(?:${CAMPOS_SEGUROS})\b)\w+\s+from\s+(${RELOJES})`,
+        String.raw`extract\s*\(\s*(?!(?:${CAMPOS_SEGUROS})\b)\w+\s+from\s+(${RELOJ})`,
         'i',
       ),
       // `date_part('dow', now())`, que es la misma operación con la otra sintaxis, y su forma
       // deparseada `date_part('dow'::text, now())`.
       new RegExp(
-        String.raw`date_part\s*\(\s*'(?!(?:${CAMPOS_SEGUROS})')[^']*'(::\w+)?\s*,\s*(${RELOJES})`,
+        String.raw`date_part\s*\(\s*'(?!(?:${CAMPOS_SEGUROS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})`,
         'i',
       ),
     ];
@@ -273,6 +357,52 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'date',
       culpable: true,
     },
+    // Las OCHO formas que el reloj desnudo dejaba pasar. Todas medidas: eligen día distinto
+    // en husos opuestos. Van con sonda propia porque un patrón sin culpable no está probado,
+    // y porque tres de los patrones se fundieron en uno — sin una sonda por FORMA, la fusión
+    // habría podido perder una sin que nada enrojeciera.
+    censo_probe_cast_interm: {
+      expr: 'now()::timestamp::date',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_trunc_tod: {
+      expr: "date_trunc('day', timeofday()::timestamptz)",
+      tipo: 'timestamptz',
+      culpable: true,
+    },
+    censo_probe_trunc_ts: {
+      expr: "date_trunc('day', now()::timestamp)",
+      tipo: 'timestamp',
+      culpable: true,
+    },
+    censo_probe_cast_kw_ts: {
+      expr: 'cast(now()::timestamp as date)',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_datefn_ts: {
+      expr: 'date(now()::timestamp)',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_tochar_ts: {
+      expr: "to_char(now()::timestamp, 'YYYY-MM-DD')",
+      tipo: 'text',
+      culpable: true,
+    },
+    censo_probe_extract_ts: {
+      expr: 'extract(day from (now())::timestamp)::int',
+      tipo: 'integer',
+      culpable: true,
+    },
+    // El destino ampliado: un cast a un tipo SIN huso ya es el reloj de pared de quien llama,
+    // aunque no llegue a `date`.
+    censo_probe_pared: {
+      expr: 'now()::timestamp',
+      tipo: 'timestamp',
+      culpable: true,
+    },
     // Y las seguras, que son la otra mitad del contrato: un censo que marcara el propio
     // arreglo acabaría desactivado, así que se exige explícitamente que NO las señale.
     censo_probe_ok_utc: {
@@ -296,6 +426,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     censo_probe_ok_fecha: {
       expr: "to_char(fecha_de_la_base(), 'YYYY-MM-DD')",
       tipo: 'text',
+      culpable: false,
+    },
+    // El cast que CONSERVA el instante no elige calendario: `timestamptz` se queda fuera del
+    // destino a propósito. Sin esta sonda, ampliar el destino a `timestamp` podía haberse
+    // pasado de largo y llevarse también el que no molesta.
+    censo_probe_ok_tz: {
+      expr: 'now()::timestamptz',
+      tipo: 'timestamptz',
       culpable: false,
     },
     // `epoch` es el instante absoluto: medido, no cambia con el huso.
@@ -351,6 +489,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "date_part('dow'::text, now())",
       'timeofday()::timestamptz::date',
       '((timeofday())::timestamp with time zone)::date',
+      // El reloj con cast por el camino, en las ocho formas que el reloj desnudo dejaba
+      // pasar. Medidas: las ocho eligen día distinto en husos opuestos.
+      'now()::timestamp::date',
+      'now()::timestamp without time zone::date',
+      "date_trunc('day', timeofday()::timestamptz)",
+      "date_trunc('day'::text, (timeofday())::timestamp with time zone)",
+      "date_trunc('day', now()::timestamp)",
+      'cast(now()::timestamp as date)',
+      'date(now()::timestamp)',
+      "to_char(now()::timestamp, 'YYYY-MM-DD')",
+      'extract(day from (now())::timestamp)',
+      "date_part('day', now()::timestamp)",
+      // Y el destino ampliado: un tipo SIN huso ya es el reloj de pared, no haga falta llegar
+      // a `date`. `now()::timestamp` da día 4 en Kiritimati y día 3 en Etc/GMT+12 (medido).
+      'now()::timestamp',
+      '(now())::timestamp without time zone',
+      'localtimestamp::date',
     ];
     const SEGURAS = [
       "timezone('UTC', now())::date",
@@ -372,6 +527,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "extract(day from timezone('UTC', now()))",
       // Y las precisiones de `date_trunc` que solo quitan fracciones del instante.
       "date_trunc('milliseconds', now())",
+      // `AT TIME ZONE 'UTC'` es justo lo que FIJA el reloj, y la expresión entera es
+      // independiente del huso (medido). El cast intermedio se escribía `timestamp[^)]*` y
+      // ese `[^)]*` se tragaba la cláusula, así que la forma CORRECTA salía marcada: un censo
+      // que marca su propio arreglo se acaba desactivando.
+      "((now())::timestamp with time zone AT TIME ZONE 'UTC')::date",
+      "(now() at time zone 'UTC')::date",
+      // El cast que CONSERVA el instante: `timestamptz` no elige calendario.
+      'now()::timestamptz',
+      '(now())::timestamp with time zone',
+      'clock_timestamp()::timestamptz',
+      // Un campo por debajo del minuto sí es seguro sobre un reloj — y lo sería mal si los
+      // instantes de la medición incluyeran la era de la hora local media.
+      'extract(milliseconds from now())',
     ];
     expect(PELIGROSAS.filter((f) => !culpable(f))).toEqual([]);
     expect(SEGURAS.filter((f) => culpable(f))).toEqual([]);

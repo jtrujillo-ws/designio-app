@@ -1366,6 +1366,72 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect(f!.tras_el_acuerdo).toBe(true);
   });
 
+  it('la ventana declarada existe, y es exactamente lo que el alcance dice que es', async () => {
+    /*
+     * Este caso NO comprueba un candado: comprueba una AUSENCIA de candado, declarada dentro
+     * del sello. `evento_dominio` y `exportacion_registro` quedan fuera de la congelación —un
+     * archivo tiene que poder seguir auditándose y re-exportándose—, así que una escritura que
+     * pasó su comprobación de política antes del vaciado puede commitear después. Y el rol de
+     * aplicación tiene INSERT directo sobre el libro, así que la vía no es solo una
+     * exportación en vuelo: un miembro con SQL crudo puede elegir el `payload`.
+     *
+     * Se prueba para que la ventana esté MEDIDA y no supuesta, y para fijar su tamaño: deja
+     * una fila y nada más. Ni devuelve acceso a lo destruido, ni desmiente los conteos, ni la
+     * puede leer después quien la escribió. Si algún día se cierra —moviendo el registro de la
+     * exportación a su propia transacción, o quitando el INSERT directo—, este caso lo dice.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('ventana-declarada');
+    await acordarYExportar(ws, 'borrado', adminId);
+
+    let escrito!: () => void;
+    const eventoEscrito = new Promise<void>((r) => {
+      escrito = r;
+    });
+    let commitea!: () => void;
+    const puedeCommitear = new Promise<void>((r) => {
+      commitea = r;
+    });
+
+    // Un miembro escribe en el libro con el payload que quiere, y se queda sin commitear.
+    const enVuelo = conUsuario(leadId, async (tx) => {
+      await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        values (${ws}, 'AuthzTest', ${tx.json({ colado: 'texto elegido' })}::jsonb,
+                ${leadId}, 'lead-boutique')`;
+      escrito();
+      await puedeCommitear;
+    });
+    await eventoEscrito;
+
+    // El borrado corre sin verla, y sus conteos son verdad sobre lo que SÍ vio.
+    const c = await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'borrado',
+      acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
+    });
+    commitea();
+    await enVuelo;
+
+    // Lo que queda: el evento de la disposición y el que se coló. Ni uno más.
+    const filas = await admin`select tipo from evento_dominio where workspace_id = ${ws}
+      order by tipo`;
+    expect(filas.map((f) => f.tipo)).toEqual(['AuthzTest', 'WorkspaceDispuesto']);
+
+    // Y el tamaño de la ventana: una fila suelta y nada más. No devuelve acceso a lo
+    // destruido —el resto del workspace sigue vacío— ni permite leerla, porque la RLS del
+    // libro pide rol de miembro y el borrado destruyó la membresía.
+    const [seg] = await admin`select count(*)::int as n from segmento where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(0);
+    const suyas = await conUsuario(leadId, (tx) => tx`select id from evento_dominio
+      where workspace_id = ${ws}`);
+    expect(suyas.length).toBe(0);
+
+    // Y el alcance sellado la declara, en vez de que el recibo prometa de más.
+    expect(c.alcance).toContain('escribiendo en el libro de auditoría');
+    expect(c.alcance).toContain('ventana declarada');
+  });
+
   it('los conteos de un archivo cuadran tabla a tabla con lo que queda, y la única diferencia está declarada', async () => {
     /*
      * El recibo de un archivo dice cuántas filas quedan CONSERVADAS, y la disposición escribe
@@ -1405,7 +1471,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // el recuento no puede incluir: una exportación de este workspace que estuviera EN VUELO
     // confirma su evento y su registro después de contar, y el alcance lo dice.
     expect(c.alcance).toContain('escribe su evento de auditoría');
-    expect(c.alcance).toContain('EN VUELO');
+    expect(c.alcance).toContain('escribiendo en el libro de auditoría');
     // Y la excepción de la baja de miembros, que la congelación deja fuera a propósito.
     expect(c.alcance).toContain('la BAJA');
   });

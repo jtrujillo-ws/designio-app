@@ -42,10 +42,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * `timezone`. Comprobado contra las dos formas.
    */
   const RELOJES = String.raw`now\s*\(\s*\)|current_timestamp|transaction_timestamp\s*\(\s*\)|clock_timestamp\s*\(\s*\)`;
+  /**
+   * Las precisiones de `date_trunc` cuyo resultado DEPENDE del huso, medidas una a una
+   * comparando el mismo instante en dos husos: de `hour` para arriba cambian, y de `minute`
+   * para abajo no. `hour` está dentro porque hay husos con desfase de 45 minutos
+   * (`Asia/Kathmandu`), donde truncar a la hora sí da instantes distintos.
+   *
+   * Acotarlo importa en la dirección contraria a la habitual: `date_trunc('milliseconds',
+   * now())` solo quita fracciones del instante y no elige ningún día, así que marcarlo sería
+   * un falso positivo — y un censo que marca código correcto se acaba desactivando.
+   */
+  const UNIDADES_DEL_CALENDARIO =
+    'hour|day|week|month|quarter|year|decade|century|millennium';
+
   const RELOJ_COLAPSADO_A_DIA = [
     // `date_trunc('day', now())`. El `(::\w+)?` es por la forma DEPARSEADA: Postgres devuelve
     // `date_trunc('day'::text, now())`, y sin eso el patrón solo veía el código fuente.
-    new RegExp(String.raw`date_trunc\s*\(\s*'[^']*'(::\w+)?\s*,\s*(${RELOJES})\s*\)`, 'i'),
+    new RegExp(
+      String.raw`date_trunc\s*\(\s*'(${UNIDADES_DEL_CALENDARIO})s?'(::\w+)?\s*,\s*(${RELOJES})\s*\)`,
+      'i',
+    ),
     // `now()::date` tal como se escribe…
     new RegExp(String.raw`\b(${RELOJES})\s*::\s*(date|time)\b`, 'i'),
     // …y tal como Postgres la devuelve, que es `(now())::date` — con paréntesis propios. La
@@ -57,6 +73,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     new RegExp(String.raw`cast\s*\(\s*(${RELOJES})\s+as\s+(date|time)\b`, 'i'),
     // `date(now())`, la tercera forma de escribir la misma conversión.
     new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJES})\s*\)`, 'i'),
+    // `to_char(now(), 'YYYY-MM-DD')`: no colapsa a un `date` pero produce el mismo día del
+    // huso de la sesión, y una regla escrita sobre esa cadena decide igual (medido: 09-03 en
+    // UTC-12 y 09-04 en UTC+14). El reloj tiene que ser el PRIMER argumento —envuelto en
+    // `timezone('UTC', …)` ya no lo es—, y sobre un `date` no se marca, porque un `date` no
+    // tiene huso del que moverse.
+    new RegExp(String.raw`to_char\s*\(\s*(${RELOJES})\s*,`, 'i'),
   ];
 
   /** Lo que hace culpable a un cuerpo: cualquiera de las dos vías. */
@@ -75,26 +97,123 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   const sinComentarios = (s: string) =>
     s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
 
+  /**
+   * Una forma peligrosa por CADA patrón, y una segura por cada trampa que los patrones tienen
+   * que esquivar. Se fabrican como funciones y se exige que el censo señale exactamente las
+   * primeras: sin esto, los patrones solo se ejercitaban con `current_date` —los objetos
+   * reales ya están limpios—, así que cualquiera de los otros podía romperse y el censo seguir
+   * en verde. Es la tercera vuelta de la misma lección: un guardián sin culpable no se prueba.
+   */
+  const SONDAS: Record<string, { expr: string; tipo: string; culpable: boolean }> = {
+    censo_probe_current_date: { expr: 'current_date', tipo: 'date', culpable: true },
+    censo_probe_cast: { expr: 'cast(now() as date)', tipo: 'date', culpable: true },
+    censo_probe_castop: { expr: 'now()::date', tipo: 'date', culpable: true },
+    censo_probe_datefn: { expr: 'date(now())', tipo: 'date', culpable: true },
+    censo_probe_trunc: {
+      expr: "(date_trunc('day', now()))::date",
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_tochar: {
+      expr: "to_char(now(), 'YYYY-MM-DD')",
+      tipo: 'text',
+      culpable: true,
+    },
+    // Y las seguras, que son la otra mitad del contrato: un censo que marcara el propio
+    // arreglo acabaría desactivado, así que se exige explícitamente que NO las señale.
+    censo_probe_ok_utc: {
+      expr: "timezone('UTC', now())::date",
+      tipo: 'date',
+      culpable: false,
+    },
+    censo_probe_ok_trunc: {
+      expr: "(date_trunc('day', timezone('UTC', now())))::date",
+      tipo: 'date',
+      culpable: false,
+    },
+    // `date_trunc` a una precisión que NO elige día: solo quita fracciones del instante, y
+    // medido no depende del huso. Marcarla sería un falso positivo.
+    censo_probe_ok_ms: {
+      expr: "date_trunc('milliseconds', now())",
+      tipo: 'timestamptz',
+      culpable: false,
+    },
+    // `to_char` sobre un `date`: un `date` no tiene huso del que moverse (medido).
+    censo_probe_ok_fecha: {
+      expr: "to_char(fecha_de_la_base(), 'YYYY-MM-DD')",
+      tipo: 'text',
+      culpable: false,
+    },
+  };
+
+  it('el reconocedor dice que sí a cada forma peligrosa y que no a cada segura', async () => {
+    /*
+     * Las sondas de más abajo son objetos REALES y por eso solo pueden ejercitar lo que el
+     * catálogo devuelve, que es la forma DEPARSEADA. Dos de los patrones existen para el otro
+     * censo —el del código TypeScript, donde el SQL está tal como se escribió— y ningún objeto
+     * puede producirlos: Postgres reduce `now()::date` y `cast(now() as date)` a
+     * `(now())::date` antes de guardarlos. Comprobado: rompiendo esos dos patrones, las sondas
+     * del catálogo siguen en verde.
+     *
+     * Así que el reconocedor se prueba también solo, con las dos formas de cada cosa. Es la
+     * mitad que las sondas no pueden cubrir, y sin ella dos de los siete patrones no los
+     * ejercitaba nada.
+     */
+    const PELIGROSAS = [
+      'current_date',
+      'CURRENT_DATE',
+      'select localtimestamp',
+      "date_trunc('day', now())",
+      "date_trunc('day'::text, now())",
+      "date_trunc('month', current_timestamp)",
+      'now()::date',
+      '(now())::date',
+      'cast(now() as date)',
+      'CAST(clock_timestamp() AS date)',
+      'date(now())',
+      "to_char(now(), 'YYYY-MM-DD')",
+      "to_char(now(), 'YYYY-MM-DD'::text)",
+    ];
+    const SEGURAS = [
+      "timezone('UTC', now())::date",
+      "(timezone('UTC'::text, now()))::date",
+      "date_trunc('day', timezone('UTC', now()))",
+      "date_trunc('milliseconds', now())",
+      "date_trunc('second', now())",
+      'fecha_de_la_base()',
+      'inicio_del_dia_de_la_base()',
+      "to_char(vence_en, 'YYYY-MM-DD')",
+      "to_char(fecha_de_la_base(), 'YYYY-MM-DD')",
+      'creado_en >= inicio_del_dia_de_la_base()',
+      // Un identificador que CONTIENE una palabra clave no es una lectura del reloj.
+      'select current_date_pactada from acuerdo',
+    ];
+    expect(PELIGROSAS.filter((f) => !culpable(f))).toEqual([]);
+    expect(SEGURAS.filter((f) => culpable(f))).toEqual([]);
+  });
+
   it('ninguna función lee el reloj de pared de quien la llama', async () => {
     /*
-     * La sonda se crea ANTES de capturar el censo y se exige que salga entre SUS culpables,
-     * usando la misma consulta y el mismo filtro. Antes hacía una consulta aparte, y eso no
-     * protegía nada: volver la consulta principal a `prosrc` la habría dejado en verde, porque
-     * la sonda conservaba su propio `pg_get_functiondef`. Lo comprobé mal —cambié las dos a la
-     * vez— y por eso el rojo me pareció una prueba cuando no lo era.
+     * Las sondas se crean ANTES de capturar el censo y se exige que salgan entre SUS
+     * culpables, usando la misma consulta y el mismo filtro. Antes hacían una consulta aparte,
+     * y eso no protegía nada: volver la consulta principal a `prosrc` las habría dejado en
+     * verde. Lo comprobé mal —cambié las dos a la vez— y por eso el rojo me pareció una prueba
+     * cuando no lo era. Una sonda que no atraviesa el camino que dice proteger es peor que
+     * ninguna: da la impresión de cubrirlo.
      *
-     * Una sonda que no atraviesa el camino que dice proteger es peor que ninguna: da la
-     * impresión de cubrirlo.
+     * Van como `LANGUAGE SQL … RETURN …`, así que de paso ejercitan la otra mitad: ese cuerpo
+     * vive en `prosqlbody` y deja `prosrc` VACÍO (comprobado abajo), que es lo que hacía
+     * invisible a una función entera cuando el censo leía `prosrc`.
      */
     const admin = sqlAdmin();
-    await admin`create function censo_probe_sqlbody() returns date
-      language sql stable return current_date`;
+    for (const [nombre, { expr, tipo }] of Object.entries(SONDAS)) {
+      await admin.unsafe(
+        `create function ${nombre}() returns ${tipo} language sql stable return ${expr}`,
+      );
+    }
     try {
-      // `pg_get_functiondef` y no `prosrc`: una función con cuerpo SQL estándar
-      // (`LANGUAGE SQL … RETURN …` o `BEGIN ATOMIC`) guarda el árbol analizado en
-      // `prosqlbody` y deja `prosrc` VACÍO (comprobado abajo). Leyendo `prosrc`, esa función
-      // contaba para el mínimo y su cuerpo no llegaba nunca al filtro. `prokind = 'f'` porque
-      // `pg_get_functiondef` no acepta agregados ni funciones de ventana.
+      // `pg_get_functiondef` y no `prosrc`, y `prokind = 'f'` porque aquél no acepta
+      // agregados ni funciones de ventana.
       const funciones = await admin`
         select p.proname as nombre, pg_get_functiondef(p.oid) as cuerpo, p.prosrc
         from pg_proc p
@@ -106,21 +225,25 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // El censo tiene que estar mirando algo: sin esto, un cambio en la consulta que
       // devolviera cero filas dejaría el test en verde para siempre sin comprobar nada.
       expect(funciones.length).toBeGreaterThan(50);
-
-      // La premisa del hallazgo, comprobada aquí y no supuesta.
-      const sonda = funciones.find((f) => f.nombre === 'censo_probe_sqlbody');
-      expect(sonda!.prosrc).toBe('');
+      // Y la premisa del hallazgo del `prosqlbody`, comprobada y no supuesta.
+      expect(funciones.find((f) => f.nombre === 'censo_probe_castop')!.prosrc).toBe('');
 
       const culpables = funciones
         .filter((f) => culpable(sinComentarios(f.cuerpo as string)))
         .map((f) => f.nombre as string)
         .filter((n) => !(n in DECLARADAS));
-      // La sonda sale por el MISMO recorrido que protege: si la consulta vuelve a `prosrc`,
-      // desaparece de aquí y este caso se pone rojo.
-      expect(culpables).toContain('censo_probe_sqlbody');
-      expect(culpables.filter((n) => n !== 'censo_probe_sqlbody')).toEqual([]);
+      // Exactamente las peligrosas y ninguna más: si un patrón se rompe, su sonda desaparece
+      // de aquí; si un patrón se pasa de ancho, aparece una segura.
+      expect(culpables.sort()).toEqual(
+        Object.entries(SONDAS)
+          .filter(([, v]) => v.culpable)
+          .map(([n]) => n)
+          .sort(),
+      );
     } finally {
-      await admin`drop function censo_probe_sqlbody()`;
+      for (const nombre of Object.keys(SONDAS)) {
+        await admin.unsafe(`drop function ${nombre}()`);
+      }
     }
   });
 

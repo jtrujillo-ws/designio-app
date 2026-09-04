@@ -1398,6 +1398,42 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       return salida;
     };
+    /*
+     * Una función SQL también entrega su resultado con `VALUES`: `returns date … as $$ values
+     * (now()) $$` coerciona ese `timestamptz` al `date` declarado con el huso de la sesión
+     * —medido, 2026-09-05 contra 2026-09-04—, y `ENTREGAS` solo sabía sacar proyecciones que
+     * empiezan por `select`, así que el cuerpo entero quedaba como una hoja opaca.
+     *
+     * El `values` tiene que EMPEZAR la sentencia, y esa condición es la que evita el falso
+     * positivo que la versión ingenua trae de la mano: el `values` de un `insert into t(k, ts)
+     * values (1, now())` dentro de una función `returns date` no entrega nada al tipo de
+     * retorno —va a una columna CON huso— y marcarlo sería culpar por vecindad. Su sonda
+     * segura está abajo. Se mira el último carácter que no sea espacio: solo valen el `$` que
+     * cierra la etiqueta del cuerpo, el `;` de la sentencia anterior, o el principio del texto.
+     *
+     * Y TODAS las tuplas, no la primera: `returns setof date … values (date '2026-01-01'),
+     * (now())` devuelve las dos filas y solo la segunda se mueve con el huso.
+     */
+    const EMPIEZA_VALUES = /\bvalues\s*\(/gi;
+    const tuplasEntregadas = (texto: string): string[] => {
+      const salida: string[] = [];
+      for (const m of texto.matchAll(EMPIEZA_VALUES)) {
+        const antes = texto.slice(0, m.index).replace(/\s+$/, '');
+        const ultimo = antes.slice(-1);
+        if (antes !== '' && ultimo !== '$' && ultimo !== ';') continue;
+        let cursor = m.index + m[0].length - 1;
+        for (;;) {
+          const dentro = parejaDeParentesis(texto, cursor);
+          if (dentro === null) break;
+          salida.push(...argumentosDe(dentro).map(sinAlias));
+          cursor += dentro.length + 2;
+          const siguiente = /^\s*,\s*\(/.exec(texto.slice(cursor));
+          if (siguiente === null) break;
+          cursor += siguiente[0].length - 1;
+        }
+      }
+      return salida;
+    };
     RELOJ_ENTREGADO = (texto: string): boolean => {
       const entregadas = [
         texto,
@@ -1419,6 +1455,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           .filter((m) => profundidad(texto.slice(0, m.index)) === 0)
           .flatMap((m) => ramasDeConjunto(m[1]!).flatMap(proyectadas)),
         ...columnasDerivadas(texto),
+        ...tuplasEntregadas(texto),
       ];
       return entregadas.some((e) => hojasDelValor(e).some((hoja) => RELOJ_A_SECAS.test(hoja)));
     };
@@ -1506,9 +1543,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * una `CONSTANT`, así que esa rama siempre está. Se queda porque el nombre que se lleva la
      * lista tiene que ser el de verdad y no una palabra clave, no porque atrape nada.
      */
+    /*
+     * El tipo declarado admite SUFIJO DE ARRAY, que `SIN_HUSO_DECLARADO` ya sabía leer para las
+     * columnas del catálogo y aquí faltaba: una variable `date[]` ni siquiera llegaba a
+     * declararse, así que ninguna asignación suya se miraba. Medido: `declare d date[]; begin
+     * d := array[now()]; return d; end` devuelve `{2026-09-05}` en Pacific/Kiritimati y
+     * `{2026-09-04}` en Etc/GMT+12.
+     */
     const DECLARADAS_SIN_HUSO = new RegExp(
       String.raw`(?<![\w"])(?<nombre>${NOMBRE_DE_VARIABLE})\s+(?:constant\s+)?${ESQUEMA}` +
-        String.raw`(?:${TIPO_SIN_HUSO})\s*(?:collate\s+(?:\w+|"\w+")\s*)?(?:not\s+null\s*)?` +
+        String.raw`(?:${TIPO_SIN_HUSO})(?:\s*\[\s*\d*\s*\])*` +
+        String.raw`\s*(?:collate\s+(?:\w+|"\w+")\s*)?(?:not\s+null\s*)?` +
         String.raw`(?:(?::=|=|\bdefault\b)\s*(?<inicial>[^;]*)|[;:,)])`,
       'gi',
     );
@@ -1563,6 +1608,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
 
     /** Un nombre listo para meterse en una expresión regular sin significar otra cosa. */
     const escapado = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    /** Los subíndices o rebanadas que pueden ir entre un nombre y el operador que lo asigna. */
+    const SUBINDICES = String.raw`(?:\s*\[[^\]]*\])*`;
     /** El nombre como lo escribe quien lo declara, sin las comillas ni su duplicación. */
     const sinComillas = (n: string): string =>
       n.startsWith('"') ? n.slice(1, -1).replace(/""/g, '"') : n;
@@ -1617,13 +1664,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         return /^[A-Za-z_]\w*$/.test(n) ? [escapado(n), citada] : [citada];
       };
       const cualquiera = nombres.flatMap(formasDelNombre).join('|');
+      /*
+       * Y entre el nombre y el operador caben SUBÍNDICES: si la variable es un array sin huso,
+       * plpgsql asigna elemento a elemento y coerciona igual. Medido: `declare d date[] :=
+       * array[date '2000-01-01']; begin d[1] := now(); return d; end` devuelve `{2026-09-05}`
+       * en Pacific/Kiritimati y `{2026-09-04}` en Etc/GMT+12.
+       */
       if (cualquiera === '') return false;
       // Las tres formas de que a una de esas variables le caiga un valor: en su propia
       // declaración, por una asignación posterior, y por un `into` —el del `select` y el del
       // `returning`, que son la misma entrega por posición—.
       const asignaciones = [
         ...texto.matchAll(
-          new RegExp(String.raw`(?<![\w"])(?:${cualquiera})\s*:=\s*([^;]*)`, 'gi'),
+          new RegExp(String.raw`(?<![\w"])(?:${cualquiera})${SUBINDICES}\s*:=\s*([^;]*)`, 'gi'),
         ),
         /*
          * Y plpgsql también asigna con `=` a secas: `declare d date; begin d = now();` hace la
@@ -1635,7 +1688,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          */
         ...texto.matchAll(
           new RegExp(
-            String.raw`(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*(?:${cualquiera})\s*=(?!=)\s*([^;]*)`,
+            String.raw`(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*(?:${cualquiera})` +
+              String.raw`${SUBINDICES}\s*=(?!=)\s*([^;]*)`,
             'gi',
           ),
         ),
@@ -1851,14 +1905,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * el reconocedor ni siquiera llegaba a `nombreCanonico`, que ya sabía decodificarla.
      */
     const NOMBRE_SQL = String.raw`(?:[Uu]&"(?:[^"]|"")*"(?:\s+uescape\s+'.')?|"(?:[^"]|"")+"|\w+)`;
+    /*
+     * Entre la lista de columnas y la fuente de las filas cabe además el `OVERRIDING`, que
+     * decide qué gana cuando la columna es de identidad. Medido: `insert into t(k, d)
+     * overriding user value values (1, now())` guarda 2026-09-05 en Pacific/Kiritimati y
+     * 2026-09-04 en Etc/GMT+12. Y sin lista de columnas era peor que un hueco: `overriding` se
+     * tomaba por ALIAS de la tabla y el patrón moría al llegar a `user`.
+     */
+    const SOBRESCRIBE = String.raw`(?:overriding\s+(?:system|user)\s+value\s+)?`;
     const INSERTA = new RegExp(
       // El destino de un `insert` también admite ALIAS, entre la tabla y la lista de
       // columnas: `insert into t as x(k, d) values (…)`. Medido: 2026-09-05 contra
       // 2026-09-04. El `(?!values\b)` evita que un `insert into t values (…)` tome `values`
       // por alias.
       String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
-        String.raw`(?:\s+(?:as\s+)?(?!values\b|with\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?` +
-        String.raw`(?:values\s*\(|(with)\s+)`,
+        String.raw`(?:\s+(?:as\s+)?(?!values\b|with\b|overriding\b)${NOMBRE_SQL})?\s*` +
+        String.raw`(?:\(([^)]*)\)\s*)?${SOBRESCRIBE}(?:values\s*\(|(with)\s+)`,
       'gi',
     );
     /*
@@ -1874,8 +1936,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     const INSERTA_SELECT = new RegExp(
       String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
-        String.raw`(?:\s+(?:as\s+)?(?!select\b|values\b|with\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?` +
-        String.raw`(?:select\s+([^;]*)|(with)\s+)`,
+        String.raw`(?:\s+(?:as\s+)?(?!select\b|values\b|with\b|overriding\b)${NOMBRE_SQL})?\s*` +
+        String.raw`(?:\(([^)]*)\)\s*)?${SOBRESCRIBE}(?:select\s+([^;]*)|(with)\s+)`,
       'gi',
     );
     /*
@@ -2163,8 +2225,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           m[2] === undefined
             ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
             : argumentosDe(m[2]).map(nombreCanonico);
-        if (porPosicion(tabla, destinos, argumentosDe(hastaLaClausula(lista)).map(sinAlias)))
+        /*
+         * El `ON CONFLICT` también viene detrás de un `SELECT`, y ahí no lo miraba nadie: la
+         * rama que analiza el `DO UPDATE SET` vive en el reconocedor del `VALUES`, y `ACTUALIZA`
+         * no ve este `update` porque no lleva tabla detrás. Medido: `insert into t(k, d) select
+         * 1, date '2026-01-01' on conflict (k) do update set d = now()` guarda 2026-09-05 en
+         * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12 cuando hay conflicto.
+         *
+         * Y la proyección se corta ahí antes de emparejarla: la cláusula no es una columna.
+         */
+        const conflicto = /\bon\s+conflict\b/i.exec(lista);
+        const proyeccion = conflicto === null ? lista : lista.slice(0, conflicto.index);
+        if (porPosicion(tabla, destinos, argumentosDe(hastaLaClausula(proyeccion)).map(sinAlias)))
           return true;
+        const enConflicto = /\bon\s+conflict\b[^;]*?\bdo\s+update\s+set\s+([^;]*)/i.exec(
+          lista,
+        );
+        if (enConflicto !== null && asignacionCulpable(tabla, enConflicto[1]!)) return true;
       }
       for (const m of texto.matchAll(FUSIONA)) {
         const tabla = nombreCanonico(m[1]!);
@@ -4558,6 +4635,59 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_alias_fecha_fija',
         "returns date language sql stable as $c$ select date '2026-01-01' as now $c$",
       ],
+      /*
+       * Cuatro formas más, las cuatro medidas 2026-09-05 en Pacific/Kiritimati contra
+       * 2026-09-04 en Etc/GMT+12:
+       *
+       *   insert … overriding user value values (…)   el OVERRIDING entre la lista y la fuente
+       *   insert … select … on conflict do update     el ON CONFLICT detrás de un SELECT
+       *   d[1] := now()   con `d date[]`              la asignación a un elemento
+       *   as $$ values (now()) $$                     el cuerpo que entrega con VALUES
+       */
+      [
+        'censo_probe_overriding_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' overriding user value values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_conflicto_select_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          " select 1, date '2026-01-01' on conflict (k) do update set d = now(); end $c$",
+      ],
+      [
+        'censo_probe_arreglo_variable_date',
+        'returns date[] language plpgsql as $c$ declare d date[];' +
+          ' begin d := array[now()]; return d; end $c$',
+      ],
+      [
+        'censo_probe_subindice_date',
+        "returns date[] language plpgsql as $c$ declare d date[] := array[date '2000-01-01'];" +
+          ' begin d[1] := now(); return d; end $c$',
+      ],
+      [
+        'censo_probe_values_cuerpo_date',
+        'returns date language sql stable as $c$ values (now()) $c$',
+      ],
+      [
+        'censo_probe_values_dos_filas_date',
+        "returns setof date language sql stable as $c$ values (date '2026-01-01'), (now()) $c$",
+      ],
+      /*
+       * Y las seguras. La del `values` es la que sostiene la guarda de «tiene que EMPEZAR la
+       * sentencia»: sin ella, el `values` de un `insert` hacia una columna CON huso, dentro de
+       * una función `returns date`, saldría culpable por vecindad.
+       */
+      [
+        'censo_probe_ok_values_de_insert',
+        'returns date language plpgsql as $c$ begin' +
+          ' insert into censo_probe_escritura(k, ts) values (1, now());' +
+          " return date '2026-01-01'; end $c$",
+      ],
+      [
+        'censo_probe_ok_overriding_instante',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, ts)' +
+          ' overriding user value values (1, now()); end $c$',
+      ],
       [
         'censo_probe_returning_into_date',
         'returns date language plpgsql as $c$ declare d date; begin' +
@@ -4941,6 +5071,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_parametro_default_date',
           'censo_probe_tabla_unicode_date',
           'censo_probe_returning_into_date',
+          'censo_probe_overriding_date',
+          'censo_probe_conflicto_select_date',
+          'censo_probe_arreglo_variable_date',
+          'censo_probe_subindice_date',
+          'censo_probe_values_cuerpo_date',
+          'censo_probe_values_dos_filas_date',
           'censo_probe_alias_date',
           'censo_probe_alias_desnudo_date',
           'censo_probe_insert_select_alias_date',
@@ -5051,6 +5187,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_derivada_otra_columna',
         'censo_probe_ok_alias_fecha_fija',
         'censo_probe_returning_into_date',
+        'censo_probe_overriding_date',
+        'censo_probe_conflicto_select_date',
+        'censo_probe_arreglo_variable_date',
+        'censo_probe_subindice_date',
+        'censo_probe_values_cuerpo_date',
+        'censo_probe_values_dos_filas_date',
+        'censo_probe_ok_values_de_insert',
+        'censo_probe_ok_overriding_instante',
         'censo_probe_between_date',
         'censo_probe_between_reloj_izquierdo_date',
         'censo_probe_between_superior_date',

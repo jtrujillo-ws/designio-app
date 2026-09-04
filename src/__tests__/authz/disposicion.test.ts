@@ -1663,14 +1663,16 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'ESCRIBE, y corre a propósito en REPEATABLE READ por SYS-04 —el archivo tiene que ser una foto—, declarado con su fecha en la cabecera de la migración.',
     };
 
-    const sueltas: string[] = [];
-    for (const f of ficheros) {
-      const fuente = ts.createSourceFile(
-        f,
-        await readFile(f, 'utf8'),
-        ts.ScriptTarget.Latest,
-        true,
-      );
+    /*
+     * El censo va como FUNCIÓN y no como bucle sobre el disco, y eso no es orden: es que sin
+     * ello solo puede mirar los ficheros REALES, y los ficheros reales están limpios. Un
+     * hueco del censo —una forma de exportar que no reconoce, por ejemplo— no lo enrojece
+     * nada, y solo se encuentra razonando. Fabricando fuentes se prueba el censo a sí mismo,
+     * que es lo que el censo del calendario ya hacía con sus sondas.
+     */
+    const censar = (ruta: string, texto: string): string[] => {
+      const nombradas: string[] = [];
+      const fuente = ts.createSourceFile(ruta, texto, ts.ScriptTarget.Latest, true);
 
       /**
        * Cuántas sentencias corren en ESTA transacción bajo el nodo. Tres formas, y la tercera
@@ -1766,14 +1768,23 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
 
       /** Todas las funciones del módulo por nombre, exportadas o no. */
       const porNombre = new Map<string, TS.Node>();
-      const exportadas: { nombre: string; nodo: TS.Node }[] = [];
-      const exportada = (n: TS.Node) =>
+      /**
+       * Y los nombres que SALEN del módulo, por cualquiera de las cuatro puertas. Antes esto
+       * miraba solo el modificador `export` de la declaración, y una proyección declarada
+       * aparte y exportada después —`const p = …; export { p };`— quedaba fuera del censo por
+       * completo: `porNombre` la tenía, pero el recorrido no la visitaba.
+       *
+       * Se recogen como NOMBRES y se resuelven al final contra `porNombre`, para no depender
+       * del orden: la cláusula de exportación puede ir antes que la declaración.
+       */
+      const exportadas = new Set<string>();
+      const llevaExport = (n: TS.Node) =>
         ts.canHaveModifiers(n) &&
         (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
       for (const st of fuente.statements) {
         if (ts.isFunctionDeclaration(st) && st.name) {
           porNombre.set(st.name.text, st);
-          if (exportada(st)) exportadas.push({ nombre: st.name.text, nodo: st });
+          if (llevaExport(st)) exportadas.add(st.name.text);
         }
         // `const f = async (…) => …` y `const f = async function (…) {…}`, exportadas o no.
         if (ts.isVariableStatement(st)) {
@@ -1783,12 +1794,41 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
               continue;
             }
             porNombre.set(d.name.text, d.initializer);
-            if (exportada(st)) exportadas.push({ nombre: d.name.text, nodo: d.initializer });
+            if (llevaExport(st)) exportadas.add(d.name.text);
+          }
+        }
+        /*
+         * `export { p }` y `export { interna as publica }`. El símbolo que hay que buscar es
+         * el LOCAL, o sea `propertyName` cuando lo hay y `name` cuando no: con `name` a secas,
+         * la renombrada no encuentra ningún cuerpo y se escapa igual que antes.
+         *
+         * `export { x } from './otro'` se salta a propósito: ahí no hay cuerpo en ESTE
+         * fichero, y el censo lo verá en el suyo, donde sí está declarado.
+         */
+        if (
+          ts.isExportDeclaration(st) &&
+          !st.moduleSpecifier &&
+          st.exportClause &&
+          ts.isNamedExports(st.exportClause)
+        ) {
+          for (const el of st.exportClause.elements) exportadas.add((el.propertyName ?? el.name).text);
+        }
+        // `export default p`, y `export default async (…) => …` sin nombre por el que buscar.
+        if (ts.isExportAssignment(st) && !st.isExportEquals) {
+          if (ts.isIdentifier(st.expression)) exportadas.add(st.expression.text);
+          else if (
+            ts.isArrowFunction(st.expression) ||
+            ts.isFunctionExpression(st.expression)
+          ) {
+            porNombre.set('default', st.expression);
+            exportadas.add('default');
           }
         }
       }
 
-      for (const { nombre, nodo } of exportadas) {
+      for (const nombre of exportadas) {
+        const nodo = porNombre.get(nombre);
+        if (!nodo) continue;
         // La llamada a `conUsuario` de ESTA función, con su tercer argumento.
         let llamada: TS.CallExpression | undefined;
         const buscar = (n: TS.Node) => {
@@ -1827,9 +1867,76 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         const { sentencias, escribe } = analizar(nodo);
 
         if (sentencias >= 2 && !escribe && !fijaAislamiento) {
-          const clave = `${f.slice(raiz.length)}:${nombre}`;
-          if (!(clave in DECLARADAS)) sueltas.push(clave);
+          nombradas.push(`${ruta}:${nombre}`);
         }
+      }
+      return nombradas;
+    };
+
+    /*
+     * Primero el censo contra SÍ MISMO. Cada sonda es una proyección de solo lectura con dos
+     * sentencias y sin aislamiento —o sea, culpable— que se exporta de una forma distinta. Si
+     * el censo no reconoce esa forma, la sonda no sale y aquí se ve.
+     *
+     * Las tres últimas son el hallazgo: `exportadas` se llenaba solo con el modificador
+     * `export` de la propia declaración, así que una proyección declarada aparte y exportada
+     * después quedaba fuera del censo ENTERA. `porNombre` sí la tenía —por eso el ayudante se
+     * podía expandir— pero nadie la recorría. Comprobado: de las cuatro, el censo anterior
+     * solo veía `visible`.
+     *
+     * Y las seguras, que son la otra mitad: una que fija el aislamiento, una que escribe y una
+     * de una sola sentencia. Un censo que nombra lo correcto se acaba desactivando.
+     */
+    const cuerpo = (nombre: string) => `const ${nombre} = async (actorId: string) =>
+      conUsuario(actorId, async (tx) => {
+        const [a] = await tx\`select 1 as x\`;
+        const [b] = await tx\`select 2 as y\`;
+        return { a, b };
+      });`;
+    const FUENTE_SONDA = `
+      ${cuerpo('sondaModificador').replace('const sondaModificador', 'export const sondaModificador')}
+      ${cuerpo('sondaClausula')}
+      export { sondaClausula };
+      ${cuerpo('sondaInterna')}
+      export { sondaInterna as sondaRenombrada };
+      ${cuerpo('sondaDefecto')}
+      export default sondaDefecto;
+      export const sondaOkAislada = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        }, { aislamiento: 'repeatable read' });
+      const sondaOkEscribe = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`insert into t (x) values (1) returning x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      export { sondaOkEscribe };
+      const sondaOkUna = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          return { a };
+        });
+      export { sondaOkUna };
+    `;
+    expect(censar('sonda.ts', FUENTE_SONDA).sort()).toEqual(
+      [
+        'sonda.ts:sondaModificador',
+        'sonda.ts:sondaClausula',
+        // `export { interna as publica }`: lo que hay que buscar es el símbolo LOCAL, que es
+        // `propertyName` y no `name`. Buscando `name` no se encuentra ningún cuerpo.
+        'sonda.ts:sondaInterna',
+        'sonda.ts:sondaDefecto',
+      ].sort(),
+    );
+
+    // Y ahora las reales.
+    const sueltas: string[] = [];
+    for (const f of ficheros) {
+      for (const clave of censar(f.slice(raiz.length), await readFile(f, 'utf8'))) {
+        if (!(clave in DECLARADAS)) sueltas.push(clave);
       }
     }
     expect(sueltas.sort()).toEqual([]);

@@ -1204,8 +1204,41 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * error es hacia marcar de más, no de menos.
      */
     const NOMBRE_DE_VARIABLE = String.raw`"(?:[^"]|"")+"|\w+`;
+    /*
+     * Y la declaración se escribe con la gramática ENTERA de plpgsql, no con el trozo mínimo:
+     *
+     *     nombre [CONSTANT] tipo [COLLATE x] [NOT NULL] [ { DEFAULT | := | = } expresión ] ;
+     *
+     * Cada pieza opcional que faltaba aquí era una forma de declarar lo mismo y quedar fuera.
+     * Las cinco medidas, todas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+     * Etc/GMT+12 y todas guardadas verbatim en el catálogo:
+     *
+     *   d date := now()              el inicializador va DENTRO de la declaración
+     *   d constant date := now()     `constant` se mete entre el nombre y el tipo
+     *   d date not null := now()     `not null` se mete entre el tipo y el inicializador
+     *   d date default now()         la palabra `default` en vez del `:=`
+     *   d date = now()               y el `=` a secas, que plpgsql también acepta
+     *
+     * El primero es el que más dice: el reconocedor separaba «declarar el nombre» de «buscarle
+     * una asignación», y eso solo funciona cuando la asignación es una SENTENCIA aparte
+     * —`declare d date; begin d := now();`—. Con el valor puesto en la propia declaración no
+     * había ninguna sentencia que buscar, y era la forma más corta de escribirlo.
+     *
+     * Así que el inicializador se captura AQUÍ y se mira con las mismas hojas que todo lo
+     * demás. Grupos con nombre y no por número, para que meter una pieza más en el medio no
+     * vuelva a mover lo que lee quien llama.
+     *
+     * PIEZA QUE NO MUEVE NINGUNA SONDA, y se queda dicho en vez de venderse: el
+     * `(?:constant\s+)?`. Sin él, `d constant date := now()` casa igual, solo que tomando
+     * `constant` por el nombre de la variable — y como el inicializador se captura de todas
+     * formas, el veredicto no cambia. Y no puede cambiar nunca: plpgsql **exige** inicializar
+     * una `CONSTANT`, así que esa rama siempre está. Se queda porque el nombre que se lleva la
+     * lista tiene que ser el de verdad y no una palabra clave, no porque atrape nada.
+     */
     const DECLARADAS_SIN_HUSO = new RegExp(
-      String.raw`(?<![\w"])(${NOMBRE_DE_VARIABLE})\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*(?::=|;|:|,|\))`,
+      String.raw`(?<![\w"])(?<nombre>${NOMBRE_DE_VARIABLE})\s+(?:constant\s+)?${ESQUEMA}` +
+        String.raw`(?:${TIPO_SIN_HUSO})\s*(?:collate\s+(?:\w+|"\w+")\s*)?(?:not\s+null\s*)?` +
+        String.raw`(?:(?::=|=|\bdefault\b)\s*(?<inicial>[^;]*)|[;:,)])`,
       'gi',
     );
     /** El nombre como lo escribe quien lo declara, sin las comillas ni su duplicación. */
@@ -1220,8 +1253,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * por donde se entra.
      */
     RELOJ_ASIGNADO_A_VARIABLE = (texto: string): boolean => {
-      const nombres = [...texto.matchAll(DECLARADAS_SIN_HUSO)].map((m) => sinComillas(m[1]!));
+      const declaradas = [...texto.matchAll(DECLARADAS_SIN_HUSO)];
+      const nombres = declaradas.map((m) => sinComillas(m.groups!.nombre!));
       if (nombres.length === 0) return false;
+      // Lo que la propia declaración le pone dentro, que no es ninguna sentencia y por eso no
+      // lo encontraba la búsqueda de asignaciones.
+      const inicializadas = declaradas
+        .map((m) => m.groups!.inicial)
+        .filter((x): x is string => x !== undefined);
       // Cada nombre se busca en las DOS formas en que se puede volver a escribir, porque
       // declararlo entrecomillado no obliga a usarlo así después (ni al revés).
       const cualquiera = nombres
@@ -1230,7 +1269,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         .flatMap((n) => [n, `"${n}"`])
         .join('|');
       if (cualquiera === '') return false;
-      const derechas = [
+      // Las tres formas de que a una de esas variables le caiga un valor: en su propia
+      // declaración, por una asignación posterior, y por un `select … into`.
+      const asignaciones = [
         ...texto.matchAll(
           new RegExp(String.raw`(?<![\w"])(?:${cualquiera})\s*:=\s*([^;]*)`, 'gi'),
         ),
@@ -1241,6 +1282,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           ),
         ),
       ].map((m) => m[1]!);
+      const derechas = [...inicializadas, ...asignaciones];
       return derechas.some((d) => hojasDelValor(d).some((hoja) => RELOJ_A_SECAS.test(hoja)));
     };
   });
@@ -2986,6 +3028,51 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns timestamptz language plpgsql as $c$ declare "d" timestamptz;' +
           ' begin "d" := now(); return "d"; end $c$',
       ],
+      /*
+       * La gramática ENTERA de una declaración plpgsql, que es donde estaba la familia. Las
+       * cinco culpables, todas medidas 2026-09-05 contra 2026-09-04 y todas verbatim en el
+       * catálogo. La primera es la que más dice: el valor puesto en la PROPIA declaración no
+       * es ninguna sentencia, así que la búsqueda de asignaciones no tenía qué buscar — y es
+       * la forma más corta de escribirlo.
+       *
+       * Y sus dos seguras, que acotan las dos mitades por separado: el `constant` sobre un
+       * tipo CON huso conserva el instante (mismo epoch en husos opuestos, medido) y el
+       * `default` con el huso ya fijado da 2026-09-04 en los dos, o sea que capturar el
+       * inicializador no se convierte en «hay un reloj dentro».
+       */
+      [
+        'censo_probe_decl_inicializada',
+        'returns date language plpgsql as $c$ declare d date := now(); begin return d; end $c$',
+      ],
+      [
+        'censo_probe_decl_constant',
+        'returns date language plpgsql as $c$ declare d constant date := now();' +
+          ' begin return d; end $c$',
+      ],
+      [
+        'censo_probe_decl_notnull',
+        'returns date language plpgsql as $c$ declare d date not null := now();' +
+          ' begin return d; end $c$',
+      ],
+      [
+        'censo_probe_decl_default',
+        'returns date language plpgsql as $c$ declare d date default now();' +
+          ' begin return d; end $c$',
+      ],
+      [
+        'censo_probe_decl_igual',
+        'returns date language plpgsql as $c$ declare d date = now(); begin return d; end $c$',
+      ],
+      [
+        'censo_probe_ok_decl_constant_instante',
+        'returns timestamptz language plpgsql as $c$ declare d constant timestamptz := now();' +
+          ' begin return d; end $c$',
+      ],
+      [
+        'censo_probe_ok_decl_default_huso_fijo',
+        "returns date language plpgsql as $c$ declare d date default timezone('UTC', now())::date;" +
+          ' begin return d; end $c$',
+      ],
       // Y el reloj ENVUELTO en algo que no cambia su tipo, que es como llega de verdad una
       // expresión escrita por una persona. Las cuatro medidas: 2026-09-05 en
       // Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
@@ -3157,6 +3244,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_tabla_dos_date',
           'censo_probe_arreglo_date',
           'censo_probe_var_comillas_date',
+          'censo_probe_decl_inicializada',
+          'censo_probe_decl_constant',
+          'censo_probe_decl_notnull',
+          'censo_probe_decl_default',
+          'censo_probe_decl_igual',
         ].sort(),
       );
     } finally {
@@ -3189,6 +3281,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_arreglo_instante',
         'censo_probe_var_comillas_date',
         'censo_probe_var_comillas_instante',
+        'censo_probe_decl_inicializada',
+        'censo_probe_decl_constant',
+        'censo_probe_decl_notnull',
+        'censo_probe_decl_default',
+        'censo_probe_decl_igual',
+        'censo_probe_ok_decl_constant_instante',
+        'censo_probe_ok_decl_default_huso_fijo',
         'censo_probe_ok_arreglo_huso_fijo',
         'censo_probe_ok_huso_fijo_date',
         'censo_probe_ok_subconsulta_date',

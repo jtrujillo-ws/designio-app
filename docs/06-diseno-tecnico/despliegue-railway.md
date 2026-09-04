@@ -30,6 +30,17 @@ Pasos: crear el proyecto → añadir el plugin PostgreSQL → añadir el servici
 
 El patrón de datos usa **dos conexiones** (diseño técnico · Multi-tenancy): la admin (migraciones/seed, superusuario del plugin) y la de aplicación (rol `designio_app`, no privilegiado, RLS activo). El rol lo crea el bootstrap de las migraciones con `APP_DB_PASSWORD`.
 
+> **La conexión admin tiene que ser superusuario, y no solo por comodidad.** Además de
+> crear el rol de aplicación, el borrado acordado de un workspace (RF-01.9) vacía sus
+> tablas con `session_replication_role = replica` para que los guards del dominio no
+> arbitren el fin del dominio, y ese parámetro **solo lo puede fijar un superusuario**
+> (medido: con un dueño no-superusuario la llamada falla con «permission denied to set
+> parameter», aunque la función sea `SECURITY DEFINER`). En un Postgres gestionado donde
+> la conexión admin no fuese superusuario, las migraciones aplicarían igual y lo que
+> fallaría sería la ejecución del borrado, en caliente; por eso `ejecutar_disposicion`
+> comprueba la condición antes de intentarlo y falla con un error propio (`DS003`) que
+> nombra la causa y apunta aquí.
+
 | Variable | Valor | Nota |
 |---|---|---|
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | Conexión admin del plugin. Preferir la URL **privada** (`postgres.railway.internal`) si el plugin expone ambas — verificar los nombres en la pestaña Variables del plugin, han cambiado entre versiones |

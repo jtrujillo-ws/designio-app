@@ -68,7 +68,14 @@ export async function exportarWorkspace(
       rol = fila!.rol as string;
       generadoEn = (fila!.instante as Date).toISOString();
     } catch (e) {
-      if ((e as { code?: string }).code === '42501') {
+      const err = e as { code?: string; message?: string };
+      // La cuenta inactiva trae su propio código y su propio motivo: la puerta la comprueba
+      // después de la del rol, así que quien lo recibe TIENE el rol y el mensaje de rol le
+      // manda a mirar donde no es.
+      if (err.code === 'DS005' && err.message) {
+        throw new ErrorExportacion(err.message);
+      }
+      if (err.code === '42501') {
         throw new ErrorExportacion(
           'Solo lead-boutique o admin-cliente ejecutan la exportación del workspace',
         );
@@ -86,6 +93,7 @@ export async function exportarWorkspace(
       where id = ${entrada.workspaceId}`;
     // RLS: un workspace ajeno simplemente no existe para esta sesión.
     if (!ws) throw new ErrorExportacion('El workspace no existe o no eres miembro');
+
 
     // Qué puede viajar en un entregable lo decide la VISTA de la base, no un where de la
     // app, y el predicado se aplica dentro de cada consulta: nada del séquito de una
@@ -142,6 +150,44 @@ export async function exportarWorkspace(
     const bytesIncluidos = archivos
       .filter((a) => a.contenidoBase64 !== null)
       .reduce((suma, a) => suma + a.bytes, 0);
+
+    /*
+     * El sello del registro, AL FINAL, y su tabla volcada después.
+     *
+     * Las dos mitades responden a dos exigencias que se contradicen si se atiende una sola:
+     *
+     *  · `confirmar_exportacion` estampa `completado_en` con `clock_timestamp()`, y ese
+     *    instante es el que la constancia sella como `exportado_en`. Si se llama antes de
+     *    armar el paquete, el sello dice que la exportación terminó minutos antes de que
+     *    terminara de verdad: una fecha inexacta dentro de un documento cuyo propósito es
+     *    acreditar que el archivo se entregó ANTES de disponer. Así que va al final.
+     *  · Pero el catálogo vuelca `exportacion_registro`, y la transacción ve sus propias
+     *    escrituras: con la confirmación al final, el paquete se llevaba su propio registro
+     *    con `completado_en` en nulo, y en la PRIMERA exportación de un workspace eso es un
+     *    archivo sin ninguna prueba completa dentro.
+     *
+     * Se cumplen las dos volviendo a volcar ESA tabla —solo ésa— después de confirmar. Es el
+     * único caso especial del volcado y por eso está aquí y no escondido en el catálogo: el
+     * resto del paquete se deriva sin excepciones, y ésta se lee entera en cinco líneas.
+     *
+     * Lo que garantiza que la fila acredite una exportación completa no es su posición sino
+     * la TRANSACCIÓN: si algo revienta, el rollback se lleva la fila entera. Lo que la
+     * posición sí decide es qué HORA lleva escrita.
+     */
+    await tx`select confirmar_exportacion(${entrada.workspaceId}, ${entrada.ambito})`;
+    if (!entregable) {
+      const entrada_ = CATALOGO_EXPORT.find((c) => c.tabla === 'exportacion_registro')!;
+      const filas = await filasDeTabla(
+        tx,
+        'exportacion_registro',
+        entrada_.orden,
+        entrada.workspaceId,
+        entregable,
+        entrada_.poda,
+      );
+      datos.exportacion_registro = filas;
+      conteos.exportacion_registro = filas.length;
+    }
 
     return {
       manifiesto: {

@@ -170,6 +170,9 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     const wss = [ws, wsB].filter((id) => id !== '');
     if (wss.length > 0) {
       await admin`delete from evento_dominio where workspace_id in ${admin(wss)}`;
+      // El registro infalsificable de exportaciones: lo escribe `registrar_exportacion`, que
+      // este suite invoca en casi todos sus casos, y cuelga del workspace por FK.
+      await admin`delete from exportacion_registro where workspace_id in ${admin(wss)}`;
       await admin`delete from arquetipo_evidencia where workspace_id in ${admin(wss)}`;
       await admin`delete from arquetipo where workspace_id in ${admin(wss)}`;
       await admin`delete from cita where workspace_id in ${admin(wss)}`;
@@ -534,6 +537,75 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
       return { antes: antes!.n as number, despues: despues!.n as number };
     });
     expect(porDefecto.despues).toBe(porDefecto.antes + 1);
+  });
+
+  it('el sello del registro se estampa al TERMINAR de armar el paquete, no al autorizarlo', async () => {
+    /*
+     * `completado_en` es el instante que la constancia de disposición sella como
+     * `exportado_en`, o sea la fecha con la que se acredita que el archivo se entregó ANTES de
+     * disponer. Si `confirmar_exportacion` se llama al principio, ese instante es el de
+     * AUTORIZAR y el documento queda fechado minutos antes de que la exportación terminara.
+     *
+     * Se mide en vez de suponerse, y el umbral tiene margen deliberado: armar el paquete de
+     * este workspace tarda decenas de milisegundos (medido: 33, 33, 79 en tres pasadas), y con
+     * la confirmación al principio el hueco entre autorizar y sellar es de uno o cero. Diez
+     * milisegundos separan las dos situaciones con holgura, y el error solo puede ir hacia el
+     * lado seguro: una máquina más lenta agranda el delta, no lo encoge.
+     */
+    const admin = sqlAdmin();
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    const [f] = await admin`select extract(milliseconds from (completado_en - creado_en)) as ms
+      from exportacion_registro where workspace_id = ${ws} order by creado_en desc limit 1`;
+    expect(Number(f!.ms)).toBeGreaterThan(10);
+  });
+
+  it('el archivo entregado lleva DENTRO su propio registro de exportación, y completo', async () => {
+    /*
+     * `registrar_exportacion` crea la fila incompleta al autorizar y `confirmar_exportacion`
+     * la completa. Con la confirmación al FINAL, el catálogo volcaba `exportacion_registro`
+     * antes de llegar a ella y —como la transacción ve sus propias escrituras— el paquete se
+     * llevaba su propio registro con `completado_en` en nulo: en la primera exportación de un
+     * workspace, un archivo sin ninguna prueba completa dentro, justo el documento que
+     * después hay que cotejar contra la constancia. La confirmación va ahora antes del
+     * volcado; lo que garantiza que la fila acredite una exportación COMPLETA no es dónde se
+     * llame sino la transacción, que se lleva la fila entera si el volcado revienta.
+     */
+    const admin = sqlAdmin();
+    const wsNuevo = (await admin`insert into workspace (nombre)
+      values (${marca + ' registro-dentro'}) returning id`)[0]!.id as string;
+    try {
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsNuevo}, ${leadId}, 'x', ${marca + '-dentro@test.demo'}, 'lead-boutique')`;
+
+      const { datos } = await exportarWorkspace(leadId, {
+        workspaceId: wsNuevo,
+        ambito: 'archivo',
+      });
+      const registros = datos.exportacion_registro ?? [];
+      expect(registros.length).toBe(1);
+      expect(registros[0]!.completado_en).not.toBeNull();
+      expect(registros[0]!.ambito).toBe('archivo');
+
+      // Y es la fila CONFIRMADA, no una foto anterior: el sello se estampa al final —para que
+      // `completado_en`, que la constancia sella como `exportado_en`, diga cuándo terminó la
+      // exportación de verdad y no cuándo se autorizó— y esta tabla se vuelve a volcar después.
+      // Comparar contra la base es lo que distingue «se volcó después de confirmar» de «se
+      // confirmó antes de volcar»: con la confirmación al principio, el instante del paquete
+      // sería el de empezar.
+      const [enBase] = await admin`select completado_en, creado_en from exportacion_registro
+        where workspace_id = ${wsNuevo}`;
+      expect(new Date(registros[0]!.completado_en as string).toISOString()).toBe(
+        (enBase!.completado_en as Date).toISOString(),
+      );
+      expect((enBase!.completado_en as Date).getTime()).toBeGreaterThanOrEqual(
+        (enBase!.creado_en as Date).getTime(),
+      );
+    } finally {
+      await admin`delete from evento_dominio where workspace_id = ${wsNuevo}`;
+      await admin`delete from exportacion_registro where workspace_id = ${wsNuevo}`;
+      await admin`delete from miembro where workspace_id = ${wsNuevo}`;
+      await admin`delete from workspace where id = ${wsNuevo}`;
+    }
   });
 
   it('una cuenta desactivada con sesión viva no exporta (re-check de estado)', async () => {

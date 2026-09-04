@@ -11,6 +11,17 @@ import type { ArbolWorkspace, ServicioArbol } from './arbol.schemas';
  * Sin workspaceId usa el primer workspace del usuario ordenado por nombre (el mismo
  * criterio que usuarioConMembresias/topbar).
  */
+  /*
+   * REPEATABLE READ: es una proyección de SOLO LECTURA con varias sentencias, y desde que
+   * existe la disposición acordada los datos de un workspace pueden desaparecer entre una y
+   * otra. Bajo READ COMMITTED cada sentencia toma su instantánea, así que la respuesta podía
+   * mezclar dos momentos —y con la membresía ya borrada, la mitad tardía vuelve VACÍA por RLS,
+   * no corta—. Lo que llega a la pantalla no es entonces un estado incompleto: es uno que no
+   * ha existido nunca.
+   *
+   * No choca con la doctrina de aislamiento del esquema, que exige READ COMMITTED a las
+   * transacciones que ESCRIBEN y releen tras un candado: aquí no se escribe nada.
+   */
 export async function arbolParaUsuario(
   usuarioId: string,
   workspaceId?: string,
@@ -29,7 +40,7 @@ export async function arbolParaUsuario(
       return null; // usuario sin workspaces todavía
     }
     return construirArbol(tx, ws.id as string, ws.nombre as string);
-  });
+  }, { aislamiento: 'repeatable read' });
 }
 
 /**

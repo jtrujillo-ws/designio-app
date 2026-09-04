@@ -25,3 +25,23 @@ export function membresiaActivaDe<M extends { workspaceId: string }>(
 ): M | undefined {
   return membresias.find((m) => m.workspaceId === ws) ?? membresias[0];
 }
+
+/**
+ * Si la dirección pedía un workspace que NO es ninguno de los tuyos, y por tanto el activo lo
+ * eligió la caída de arriba y no quien navega.
+ *
+ * La caída es la conducta correcta para navegar —entrar por un enlace viejo no debería dejarte
+ * en una pantalla vacía— pero es SILENCIOSA, y hay una pantalla donde el silencio no vale: la
+ * de la disposición. Recargar después de borrar el workspace que iba en la URL te deja en otro,
+ * con el mismo aspecto y los mismos botones, y uno de esos botones destruye. Que la pantalla
+ * pueda decirlo depende de poder preguntarlo, y eso se pregunta aquí.
+ *
+ * Con CERO membresías no hay sustitución que avisar: no se cayó a ninguna parte, y de eso ya
+ * habla la pantalla por su cuenta.
+ */
+export function elWorkspacePedidoNoEsElActivo<M extends { workspaceId: string }>(
+  membresias: readonly M[],
+  ws: string | undefined,
+): boolean {
+  return ws !== undefined && membresias.length > 0 && !membresias.some((m) => m.workspaceId === ws);
+}

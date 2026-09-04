@@ -1394,6 +1394,27 @@ begin
   -- Y la condición entra en el WHERE en vez de comprobarse después: así `v_export` —lo que la
   -- constancia sella como `exportado_en`— nombra la exportación que de verdad la sostiene, y
   -- no la última que hubo.
+  /*
+   * Y la fila RAÍZ se bloquea aparte, porque el candado consultivo no la cubre: `workspace` no
+   * lleva el guard de congelación —no pertenece al conjunto derivado, y eso está DICHO en el
+   * alcance que se sella—, así que quien la actualiza no pide nada y podría confirmar entre
+   * este inventario y la lápida que lo sobrescribe.
+   *
+   * Un candado de FILA y no la congelación, que sería otra cosa: la fila del workspace sigue
+   * sin congelarse —un archivo no le cierra el nombre ni el cupo, y así lo promete su
+   * constancia—; lo único que se exige es que no cambie MIENTRAS se decide. El orden es el
+   * seguro: el consultivo ya está tomado, así que nadie puede estar esperándolo con esta fila
+   * retenida.
+   *
+   * `for no key update` y NO `for update`, y la diferencia importa: toda inserción en una tabla
+   * del workspace toma un `for key share` sobre esta fila para comprobar su clave foránea, y
+   * `for update` choca con él. Con esa variante, la disposición se quedaba esperando a
+   * cualquier escritura en vuelo del libro de auditoría —medido: el caso de la ventana
+   * declarada se colgaba— y habría cerrado por accidente una ventana que el alcance sellado
+   * declara ABIERTA. `for no key update` choca con quien actualiza la fila y con nadie más,
+   * que es exactamente lo que hay que impedir.
+   */
+  perform 1 from workspace where id = p_ws for no key update;
   v_inv := inventario_del_workspace(p_ws);
   select max(xp.completado_en) into v_export from exportacion_registro xp
     where xp.workspace_id = p_ws and xp.ambito = 'archivo'

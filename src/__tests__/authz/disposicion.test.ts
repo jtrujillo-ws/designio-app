@@ -587,6 +587,40 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect(tras!.n).toBe(0);
   });
 
+  it('la fila raíz no puede cambiar entre el inventario y la lápida', async () => {
+    /*
+     * `workspace` no lleva el guard de congelación —no pertenece al conjunto derivado— así que
+     * quien la actualiza no pide el candado compartido. Sin nada más, una actualización
+     * administrativa podía confirmar DESPUÉS del inventario y ser sobrescrita por la lápida:
+     * el mismo dato perdido que el caso de arriba, ganado por carrera en vez de por orden.
+     *
+     * El `sigueEsperando` de abajo sincroniza y documenta, pero NO es lo que discrimina: sin el
+     * candado de fila la disposición también acaba esperando, solo que en la lápida, o sea
+     * DESPUÉS de haber decidido. Lo que discrimina es lo que pasa al soltar — con el candado se
+     * niega, y sin él destruye.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('raiz-en-vuelo');
+    await acordarYExportar(ws, 'borrado', adminId);
+
+    const enCurso = await enVuelo(async (tx) => {
+      await tx`update workspace set nombre = ${marca + ' en vuelo'} where id = ${ws}`;
+    });
+    const ejecucion = ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'borrado',
+      acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
+    });
+    expect(await sigueEsperando(ejecucion)).toBe(true);
+    await enCurso.cerrar();
+    await expect(ejecucion).rejects.toThrow(/«workspace»/);
+
+    // Y no se destruyó nada.
+    const [seg] = await admin`select count(*)::int as n from segmento where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(1);
+  });
+
   it('el inventario que ata el archivo a la base no lo mueve la sesión que lo lee', async () => {
     // La comparación del inventario solo vale si las dos lecturas —la de exportar y la de
     // ejecutar— hablan el mismo idioma. La huella se calcula sobre `fila::text`, y ese texto lo
@@ -2220,6 +2254,22 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       return fuera;
     };
 
+      /**
+       * El texto que la base va a EJECUTAR de una plantilla: sus partes literales, con un
+       * marcador donde va cada interpolación. `getText()` devolvía el código FUENTE, y ahí la
+       * interpolación es TypeScript: con una plantilla anidada dentro —`tx`…${'${'}f(`insert into
+       * t`)}`— el texto de dentro se leía como SQL, la transacción salía por ESCRITORA y con
+       * eso quedaba EXENTA de fijar el aislamiento. Un hueco en la dirección que abre, no en
+       * la que molesta.
+       *
+       * postgres.js manda cada interpolación como PARÁMETRO, así que el marcador es lo que de
+       * verdad llega. Y se usa el texto COCIDO (`.text`), no el fuente: los escapes ya están
+       * resueltos, que es como los ve Postgres.
+       */
+      const textoDePlantilla = (t: TS.TemplateLiteral): string =>
+        ts.isNoSubstitutionTemplateLiteral(t)
+          ? t.text
+          : t.head.text + t.templateSpans.map((e) => ` ? ${e.literal.text}`).join('');
       const analizar = (
         nodo: TS.Node,
         tx: string,
@@ -2377,7 +2427,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
             ts.isTaggedTemplateExpression(n) &&
             ts.isIdentifier(n.tag) &&
             simbolosTx.has(n.tag.text) &&
-            ESCRITURA.test(sqlEjecutable(n.template.getText()))
+            ESCRITURA.test(sqlEjecutable(textoDePlantilla(n.template)))
           ) {
             escribe = true;
           }
@@ -3100,6 +3150,18 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a, b };
         });
       export { sondaOkTxAliasadaEscribe };
+      // Una plantilla ANIDADA dentro de una interpolación. Su texto es TypeScript y no llega a
+      // la base —postgres.js manda la interpolación como parámetro—, pero leído como fuente
+      // parecía una escritura y EXIMÍA a la transacción de fijar el aislamiento.
+      export const sondaInterpolacionEscritura = async (
+        actorId: string,
+        f: (s: string) => string,
+      ) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x where t = \${f(\`insert into temporal\`)}\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
       // Un identificador ENTRE COMILLAS DOBLES: en SQL es un NOMBRE, no un dato, pero tampoco
       // es una sentencia de escritura.
       export const sondaIdentificador = async (actorId: string) =>
@@ -3108,10 +3170,13 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           const [b] = await tx\`select 2 as y\`;
           return { a, b };
         });
-      // Y la cadena con prefijo E, que escapa con BARRA y no duplicando la comilla.
+      // Y la cadena con prefijo E, que escapa con BARRA y no duplicando la comilla. La barra va
+      // DOBLE en el código fuente, que es como hay que escribirla de verdad: en una plantilla
+      // de TypeScript una sola la consume el propio lenguaje y a Postgres no llega ninguna. Es
+      // el mismo motivo por el que el censo mira ahora el texto COCIDO y no el fuente.
       export const sondaCadenaE = async (actorId: string) =>
         conUsuario(actorId, async (tx) => {
-          const [a] = await tx\`select E'a\\' insert into temporal --' as x\`;
+          const [a] = await tx\`select E'a\\\\' insert into temporal --' as x\`;
           const [b] = await tx\`select 2 as y\`;
           return { a, b };
         });
@@ -3232,6 +3297,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaIndirectaPorPropiedad',
         'sonda.ts:sondaIndirectaPorDesestructuracion',
         'sonda.ts:sondaTxAliasada',
+        'sonda.ts:sondaInterpolacionEscritura',
         'sonda.ts:sondaAyudanteAjeno',
         'sonda.ts:sondaMensajeEscritura',
         'sonda.ts:sondaAjenoQueAnida',

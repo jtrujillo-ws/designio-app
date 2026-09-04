@@ -1428,7 +1428,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     const NOMBRE_SQL = String.raw`(?:"(?:[^"]|"")+"|\w+)`;
     const INSERTA = new RegExp(
-      String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s*(?:\(([^)]*)\)\s*)?values\s*\(`,
+      // El destino de un `insert` también admite ALIAS, entre la tabla y la lista de
+      // columnas: `insert into t as x(k, d) values (…)`. Medido: 2026-09-05 contra
+      // 2026-09-04. El `(?!values\b)` evita que un `insert into t values (…)` tome `values`
+      // por alias.
+      String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
+        String.raw`(?:\s+(?:as\s+)?(?!values\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?values\s*\(`,
       'gi',
     );
     const ACTUALIZA = new RegExp(
@@ -1437,7 +1442,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // 2026-09-05 contra 2026-09-04. El `(?!set\b)` es para que un `update t set …` no tome
       // `set` por alias y se quede sin cláusula que mirar.
       String.raw`\bupdate\s+(?:only\s+)?(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
-        String.raw`(?:\s+(?:as\s+)?(?!set\b)${NOMBRE_SQL})?\s+set\s+([\s\S]*?)(?=\s+(?:from|where|returning)\b|;|$)`,
+        String.raw`(?:\s+(?:as\s+)?(?!set\b)${NOMBRE_SQL})?\s+set\s+([^;]*)`,
       'gi',
     );
     RELOJ_ESCRITO_EN_COLUMNA = (texto: string): boolean => {
@@ -1449,9 +1454,29 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           hojasDelValor(expr).some((hoja) => RELOJ_A_SECAS.test(hoja))
         );
       };
+      /*
+       * Dónde acaba de verdad la cláusula `set`. El corte NO puede ser la primera palabra
+       * `from`/`where`/`returning` que aparezca: en
+       * `set ts = (select now() where true), d = now()` ese `where` es de la SUBCONSULTA, y
+       * cortar ahí deja fuera la asignación peligrosa —medido, esa función guarda 2026-09-05
+       * y 2026-09-04—. Se corta en la primera que esté a profundidad CERO de paréntesis.
+       */
+      const CLAUSULA_SIGUIENTE = /\s(?:from|where|returning)\b/gi;
+      const hastaLaClausula = (t: string): string => {
+        CLAUSULA_SIGUIENTE.lastIndex = 0;
+        for (let m = CLAUSULA_SIGUIENTE.exec(t); m !== null; m = CLAUSULA_SIGUIENTE.exec(t)) {
+          let nivel = 0;
+          for (let i = 0; i < m.index; i++) {
+            if (t[i] === '(' || t[i] === '[') nivel++;
+            else if (t[i] === ')' || t[i] === ']') nivel--;
+          }
+          if (nivel === 0) return t.slice(0, m.index);
+        }
+        return t;
+      };
       /** Una cláusula `set`: `col = expr` separados por comas de primer nivel. */
-      const asignacionCulpable = (tabla: string, clausula: string): boolean =>
-        argumentosDe(clausula).some((pieza) => {
+      const asignacionCulpable = (tabla: string, clausulaCruda: string): boolean =>
+        argumentosDe(hastaLaClausula(clausulaCruda)).some((pieza) => {
           const corte = pieza.indexOf('=');
           return (
             corte >= 0 && entrega(tabla, nombreCanonico(pieza.slice(0, corte)), pieza.slice(corte + 1))
@@ -1504,7 +1529,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           // El salto hasta el `do update` no cruza un `;`: si lo cruzara, un
           // `on conflict … do nothing;` seguido de un `update` de OTRA tabla se leería como
           // si el `set` de aquél fuera de ésta, y la culpa saldría atribuida a quien no es.
-          /^\s*on\s+conflict\b[^;]*?\bdo\s+update\s+set\s+([^;]*?)(?=\s+(?:where|returning)\b|;|$)/i.exec(
+          /^\s*on\s+conflict\b[^;]*?\bdo\s+update\s+set\s+([^;]*)/i.exec(
             cola,
           );
         if (enConflicto && asignacionCulpable(tabla, enConflicto[1]!)) return true;
@@ -1781,7 +1806,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       if (n.kind === ts.SyntaxKind.StringLiteral) {
         const comilla = crudo[0] ?? "'";
-        const dentro = crudo.slice(1, -1);
+        // Cocinado también aquí, por lo mismo, y con la comilla vuelta a escapar para que el
+        // literal siga teniendo los bordes donde los tenía.
+        const dentro = (n as ts.LiteralLikeNode).text.split(comilla).join(`\\${comilla}`);
         piezas.push({
           inicio,
           fin,
@@ -1800,7 +1827,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         // con un backtick o con el `${` que abre la siguiente. Los delimitadores se conservan
         // para no mover nada de sitio; lo de dentro es SQL y va por el barrido de SQL.
         const cierra = crudo.endsWith('${') ? 2 : 1;
-        const dentro = crudo.slice(1, crudo.length - cierra);
+        /*
+         * Y lo de dentro se lee COCINADO, que es lo que la etiqueta recibe de verdad. Una
+         * plantilla `select \x6eow()::date` entrega `select now()::date` —comprobado con
+         * node—, y leer la ortografía en vez del valor es dejar de mirar por cómo está
+         * escrito algo. `n.text` es justo eso: el parser ya deshizo los escapes.
+         *
+         * La salida se construye concatenando, no por posiciones, así que la longitud puede
+         * cambiar sin descolocar nada.
+         */
+        const dentro = (n as ts.LiteralLikeNode).text;
         piezas.push({
           inicio,
           fin,
@@ -3134,6 +3170,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * parámetro, que es donde se ve.
      */
     expect(culpable('const q = sql`select $q$--$q$, now()::date`;', 'ts')).toBe(true);
+    /*
+     * Y la plantilla se lee por lo que VALE, no por cómo está escrita. `\x6e` es una `n`
+     * —comprobado con node: `` `select \x6eow()::date` `` es exactamente la cadena
+     * `select now()::date` —, así que la etiqueta `sql` recibe el reloj aunque en el fichero
+     * no aparezca escrito. Leer la ortografía es dejar de mirar por la forma de teclear algo,
+     * que es la misma familia que el `$q$` de aquí arriba.
+     *
+     * Va con su mitad segura: un escape que NO compone ningún reloj se sigue leyendo como lo
+     * que es, y no enrojece por llevar barras.
+     */
+    expect(culpable('const q = sql`select \\x6eow()::date`;', 'ts')).toBe(true);
+    expect(culpable('const q = sql`select \\x64ato from t`;', 'ts')).toBe(false);
     // Y la interpolación se sigue reconociendo detrás de un dólar literal: si no, el
     // comentario de dentro volvería a anidar como SQL.
     expect(
@@ -3435,6 +3483,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_return_next_date',
         'returns setof date language plpgsql as $c$ begin return next now(); end $c$',
       ],
+      /*
+       * El `where` de una SUBCONSULTA no cierra la cláusula `set`. Medido: la función guarda
+       * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12, y la asignación que lo
+       * hace es la SEGUNDA — la primera es segura (`ts` lleva huso) y estaba puesta ahí para
+       * que cortar por la primera palabra suelta pareciera correcto.
+       */
+      [
+        'censo_probe_set_subconsulta_date',
+        'returns void language plpgsql as $c$ begin update censo_probe_escritura' +
+          ' set ts = (select now() where true), d = now(); end $c$',
+      ],
+      // Y el alias en el destino de un `insert`, que va entre la tabla y la lista de columnas.
+      [
+        'censo_probe_insert_alias_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into censo_probe_escritura as x(k, d) values (1, now()); end $c$',
+      ],
       [
         'censo_probe_ok_compara_igual',
         'returns date language plpgsql as $c$ declare d date; begin' +
@@ -3650,6 +3715,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_asigna_igual_date',
           'censo_probe_update_alias_date',
           'censo_probe_return_next_date',
+          'censo_probe_set_subconsulta_date',
+          'censo_probe_insert_alias_date',
         ].sort(),
       );
     } finally {
@@ -3698,6 +3765,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_asigna_igual_date',
         'censo_probe_update_alias_date',
         'censo_probe_return_next_date',
+        'censo_probe_set_subconsulta_date',
+        'censo_probe_insert_alias_date',
         'censo_probe_ok_compara_igual',
         'censo_probe_ok_conflicto_instante',
         'censo_probe_ok_conflicto_otra_tabla',

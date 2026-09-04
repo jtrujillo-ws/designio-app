@@ -758,8 +758,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * LÍMITE DECLARADO: un cuerpo anidado escrito con otra etiqueta —una función que crea
        * otra— se leería como literal, así que sus comentarios no se quitarían. Eso da falsos
        * positivos, que se ven, no huecos.
+       *
+       * Y SOLO EN EL MARCO RAÍZ (`pila.length === 1`), que es donde `pg_get_functiondef` pone
+       * el cuerpo. Dentro de una plantilla de TypeScript, `$` no es esto: `` `< $${n}` `` —que
+       * está en `ai.degradacion.ts`— es un dólar literal seguido de una interpolación, y
+       * leerlo como apertura de cuerpo se comía el `${` y dejaba la etiqueta puesta para el
+       * resto del fichero. Con una etiqueta sin cerrar más adelante, el vaciado se llevaba
+       * por delante la consulta y el censo daba verde. Lo escribí sin este alcance y lo
+       * encontré al buscar en `src/` si el idioma existía: existe.
        */
-      if (modo === 'sql' && c === '$') {
+      if (modo === 'sql' && pila.length === 1 && c === '$') {
         const m = DOLAR.exec(texto.slice(i));
         if (m) {
           const etiqueta = m[0];
@@ -1389,6 +1397,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // Pero vaciar el literal NO puede romper a los dos patrones que lo LEEN.
     expect(culpable("date_trunc('milliseconds', now())")).toBe(false);
     expect(culpable("date_trunc('day', now())")).toBe(true);
+    /*
+     * El dólar dentro de una PLANTILLA no es un entrecomillado por dólar. `` `< $${n}` `` es
+     * TypeScript real —está en `ai.degradacion.ts`—, y tomarlo por apertura de cuerpo dejaba
+     * la etiqueta puesta: una etiqueta sin cerrar más adelante se leía como literal, el
+     * vaciado se llevaba el resto y el censo daba verde. Lo introduje yo con el arreglo del
+     * dólar y lo cacé buscando el idioma en `src/`.
+     */
+    expect(
+      culpable('const p = `< $${n}`; const q = sql`select $x$ now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y la interpolación se sigue reconociendo detrás de un dólar literal: si no, el
+    // comentario de dentro volvería a anidar como SQL.
+    expect(
+      culpable('const p = sql`a $${n} ${/* uno /* dos */ v}, now()::date`;', 'ts'),
+    ).toBe(true);
   });
 
   it('ninguna función lee el reloj de pared de quien la llama', async () => {

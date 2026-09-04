@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
@@ -16,6 +16,7 @@ import { hoyCalendario } from '@/lib/fecha-calendario';
 import {
   CONFIRMACION_BORRADO,
   cargaCanonicaConstancia,
+  laConstanciaSigueSiendoDeEsteAcuerdo,
   ROLES_DISPOSICION,
   type ConstanciaDisposicion,
   type ModalidadDisposicion,
@@ -154,14 +155,22 @@ function PantallaDisposicion() {
    * humano, y eso solo se puede hacer aquí.
    */
   const versionVigente = panel?.acuerdoVigente?.version;
+  const versionAnterior = useRef(versionVigente);
   useEffect(() => {
+    const antes = versionAnterior.current;
+    versionAnterior.current = versionVigente;
     setConfirmacion('');
     // Y la constancia recién emitida, por lo mismo. La expresión que decide qué documento se
     // pinta prefiere SIEMPRE el estado local sobre `panel.constanciaVigente`, así que tras
     // ejecutar un archivo y registrar acto seguido el acuerdo que lo revierte, la pantalla
     // seguía enseñando la constancia del #1 junto al acuerdo #2 —aunque la consulta ya
     // devolviera null—. Arreglar la consulta no alcanzaba a esa precedencia.
-    setConstancia(null);
+    //
+    // Pero solo entre acuerdos REALES: tras un borrado la versión no cambia, DESAPARECE —la
+    // ejecución destruye la membresía y la recarga trae un panel vacío—, y soltar ahí borraba
+    // de la pantalla el recibo recién emitido de la operación irreversible. El predicado vive
+    // en el esquema para poder comprobarlo sin montar React.
+    if (!laConstanciaSigueSiendoDeEsteAcuerdo(antes, versionVigente)) setConstancia(null);
   }, [versionVigente]);
 
   async function acordar() {

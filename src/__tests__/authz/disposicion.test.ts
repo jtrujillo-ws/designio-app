@@ -2013,7 +2013,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       const nombreAliasado = (init: TS.Expression) => {
         const v = desenvolver(init);
         if (ts.isIdentifier(v)) return v.text;
-        if (ts.isPropertyAccessExpression(v) && v.name.text === ABRE) return v.name.text;
+        if (propiedadQueAbre(v)) return ABRE;
         return undefined;
       };
       /**
@@ -2129,7 +2129,13 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        * cadena fija no se contaba ni una de sus consultas: renombrar el parámetro dejaba el
        * censo en verde sin cambiar nada de la semántica.
        */
-      const primerParametro = (fn: TS.Node): string | undefined => {
+      /**
+       * El nombre del parámetro que ocupa la posición `i`. Era siempre el CERO, y por eso un
+       * ayudante llamado como `cargar(id, tx)` no se analizaba: la transacción no tiene por qué
+       * ir delante. Con la posición mal, el recuento se quedaba en cero, la apertura constaba
+       * como alcanzada y una proyección multiconsulta sin aislamiento pasaba en verde.
+       */
+      const parametroEn = (fn: TS.Node, i: number): string | undefined => {
         if (
           !ts.isArrowFunction(fn) &&
           !ts.isFunctionExpression(fn) &&
@@ -2137,9 +2143,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         ) {
           return undefined;
         }
-        const p0 = fn.parameters[0];
-        return p0 && ts.isIdentifier(p0.name) ? p0.name.text : undefined;
+        const p = fn.parameters[i];
+        return p && ts.isIdentifier(p.name) ? p.name.text : undefined;
       };
+      const primerParametro = (fn: TS.Node): string | undefined => parametroEn(fn, 0);
     const ESCRITURA = /insert\s+into|update\s+\w+(\s+\w+)?\s+set|delete\s+from/i;
     /*
      * El SQL que de verdad se EJECUTA: sin comentarios y con los literales vaciados.
@@ -2348,10 +2355,12 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
               ts.isIdentifier(f.expression) &&
               simbolosTx.has(f.expression.text) &&
               f.name.text === 'unsafe';
-            const primeroEsTx =
-              n.arguments.length > 0 &&
-              ts.isIdentifier(n.arguments[0]!) &&
-              simbolosTx.has((n.arguments[0] as TS.Identifier).text);
+            // En CUALQUIER posición, no solo la primera: `cargar(id, tx)` ejecuta sus consultas
+            // en esta transacción igual que `cargar(tx, id)`.
+            const posicionTx = n.arguments.findIndex(
+              (a) => ts.isIdentifier(a) && simbolosTx.has(a.text),
+            );
+            const primeroEsTx = posicionTx >= 0;
             if (esUnsafe) {
               contar(n);
               for (const a of n.arguments) {
@@ -2380,7 +2389,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
                */
               const destino = ts.isIdentifier(f) ? tabla.get(f.text) : undefined;
               // El ayudante llama a la transacción como quiera: se lee de SU declaración.
-              const txDelAyudante = destino ? primerParametro(destino) : undefined;
+              const txDelAyudante = destino ? parametroEn(destino, posicionTx) : undefined;
               if (destino && txDelAyudante && !enCurso.has(destino)) {
                 enCurso.add(destino);
                 const sub = analizar(destino, txDelAyudante, tabla, aliasMod);
@@ -2394,7 +2403,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
                 // Y si no es del módulo, se busca en el que lo EXPORTA antes de darse por
                 // vencido. Solo cuando tampoco ahí hay cuerpo queda desconocido.
                 const fuera = ts.isIdentifier(f) ? resolverImportado(f.text) : undefined;
-                const txAjeno = fuera ? primerParametro(fuera.nodo) : undefined;
+                const txAjeno = fuera ? parametroEn(fuera.nodo, posicionTx) : undefined;
                 if (fuera && txAjeno && !enCurso.has(fuera.nodo)) {
                   enCurso.add(fuera.nodo);
                   const sub = analizar(fuera.nodo, txAjeno, fuera.tabla, fuera.alias);
@@ -2495,9 +2504,15 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         }
         return false;
       };
+      /** `obj.conUsuario` y `obj['conUsuario']`, que son la misma propiedad escrita distinto. */
+      const propiedadQueAbre = (e: TS.Expression) =>
+        (ts.isPropertyAccessExpression(e) && e.name.text === ABRE) ||
+        (ts.isElementAccessExpression(e) &&
+          ts.isStringLiteralLike(e.argumentExpression) &&
+          e.argumentExpression.text === ABRE);
       const esApertura = (n: TS.CallExpression, mapa: Map<string, string> = alias) =>
         (ts.isIdentifier(n.expression) && abreTransaccion(n.expression.text, mapa)) ||
-        (ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === ABRE);
+        propiedadQueAbre(n.expression);
       /**
        * Lo que envuelve a un valor sin cambiarlo: `(f) satisfies T`, `f as T`, `(f)`, `f!`.
        * Sin desenvolver, `export const p = (async (…) => conUsuario(…)) satisfies Proyeccion`
@@ -3162,6 +3177,22 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           const [b] = await tx\`select 2 as y\`;
           return { a, b };
         });
+      // Un ayudante que recibe la transacción en SEGUNDO lugar. Ejecuta sus consultas en ella
+      // igual que si la recibiera primera, y su recuento tiene que llegar a la exterior.
+      const cargarPorId = async (id: string, db: TransactionSql) => {
+        const [a] = await db\`select 1 as x\`;
+        const [b] = await db\`select 2 as y\`;
+        return { a, b, id };
+      };
+      export const sondaAyudanteTxSegundo = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => cargarPorId('x', tx));
+      // Y la apertura por acceso INDEXADO, que es la misma propiedad escrita de otra forma.
+      export const sondaIndexada = async (actorId: string) =>
+        db['conUsuario'](actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
       // Un identificador ENTRE COMILLAS DOBLES: en SQL es un NOMBRE, no un dato, pero tampoco
       // es una sentencia de escritura.
       export const sondaIdentificador = async (actorId: string) =>
@@ -3298,6 +3329,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaIndirectaPorDesestructuracion',
         'sonda.ts:sondaTxAliasada',
         'sonda.ts:sondaInterpolacionEscritura',
+        'sonda.ts:sondaAyudanteTxSegundo',
+        'sonda.ts:sondaIndexada',
         'sonda.ts:sondaAyudanteAjeno',
         'sonda.ts:sondaMensajeEscritura',
         'sonda.ts:sondaAjenoQueAnida',

@@ -172,6 +172,28 @@ export type ConstanciaDisposicion = {
 
 /** La versión del contrato de la carga. Viaja DENTRO del texto sellado: un sello solo
  * significa algo si dice bajo qué reglas se calculó. */
+/**
+ * ¿La pantalla tiene que soltar la constancia que está enseñando? Sí cuando se pasa de UN
+ * acuerdo a OTRO: el documento acredita el acuerdo que se ejecutó, y dejarlo junto a uno
+ * distinto es enseñar un recibo de otra cosa.
+ *
+ * Y NO cuando el acuerdo vigente simplemente DESAPARECE, que es lo que pasa justo después de
+ * un borrado: la ejecución destruye la membresía, la recarga siguiente devuelve un panel vacío
+ * y la versión pasa de un número a nada. Soltar ahí borraba de la pantalla el recibo recién
+ * emitido de la operación IRREVERSIBLE, que es el único momento en que perderlo importa de
+ * verdad. Reaparece en la lista plegada de constancias, pero esa lectura es complementaria y
+ * su error se ignora a propósito: no puede ser el único sitio donde vive el documento.
+ *
+ * Vive aquí y no dentro del componente para poder comprobarla: la suite corre en `node` y no
+ * monta React.
+ */
+export function laConstanciaSigueSiendoDeEsteAcuerdo(
+  antes: number | undefined,
+  ahora: number | undefined,
+): boolean {
+  return antes === undefined || ahora === undefined || antes === ahora;
+}
+
 export const CONTRATO_CONSTANCIA = 'whitespace-constancia/1';
 
 /**

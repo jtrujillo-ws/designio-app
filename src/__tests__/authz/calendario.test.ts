@@ -36,17 +36,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // De más larga a más corta: con `current_time` delante, la alternación la casaba dentro
     // de `current_timestamp` y el resto quedaba suelto.
     //
-    // La frontera derecha va DENTRO de cada palabra, justo después del nombre y ANTES de la
-    // precisión opcional. Antes vivía al final de la alternación entera, y ahí no se podía
-    // reutilizar: `current_timestamp(0)` termina en `)`, y un `\b` detrás de un paréntesis
-    // exige un carácter de palabra que no existe. Puesta aquí, `current_date_pactada` sigue
-    // sin marcarse —`e` y `_` son los dos de palabra— y la alternación entera se puede
-    // insertar como operando en cualquier otro patrón.
-    `current_timestamp\\b${PRECISION}`,
-    `current_time\\b${PRECISION}`,
-    `localtimestamp\\b${PRECISION}`,
-    `localtime\\b${PRECISION}`,
-    String.raw`current_date\b`,
+    // Las DOS fronteras van DENTRO de cada palabra. Antes vivían al final de la alternación
+    // entera —`\b(…)\b`— y ahí no se podían reutilizar: `current_timestamp(0)` termina en
+    // `)`, y un `\b` detrás de un paréntesis exige un carácter de palabra que no existe. Así
+    // que la derecha va justo después del NOMBRE y antes de la precisión opcional.
+    //
+    // Y la izquierda tuvo que venirse aquí también. Al reutilizar esta alternación como
+    // operando, `DEL_HUSO_DE_LA_SESION` se quedó con su `\b` de la izquierda y el operando
+    // no: `mi_current_timestamp::date` casaba desde la mitad del identificador. Es el mismo
+    // patrón de siempre —lo que se queda atrás al mover algo— y por eso las fronteras viajan
+    // ahora CON la palabra, no alrededor de quien la usa.
+    `\\bcurrent_timestamp\\b${PRECISION}`,
+    `\\bcurrent_time\\b${PRECISION}`,
+    `\\blocaltimestamp\\b${PRECISION}`,
+    `\\blocaltime\\b${PRECISION}`,
+    String.raw`\bcurrent_date\b`,
   ];
 
   /**
@@ -217,7 +221,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       ...funciones.map((f) => String.raw`\b${f}`),
       ...PALABRAS_DEL_RELOJ,
     ].join('|');
-    DEL_HUSO_DE_LA_SESION = new RegExp(String.raw`\b(?:${PALABRAS_DEL_RELOJ.join('|')})`, 'i');
+    // Sin `\b` alrededor: cada palabra trae ya las suyas, y ponerlas dos veces esconde de
+    // quién son. Comprobado que sigue distinguiendo `current_date` de `current_date_pactada`
+    // y de `mi_current_timestamp`, y que sigue viendo `current_timestamp(0)`.
+    DEL_HUSO_DE_LA_SESION = new RegExp(String.raw`(?:${PALABRAS_DEL_RELOJ.join('|')})`, 'i');
 
     /*
      * Un reloj rara vez llega DESNUDO a la operación que elige el calendario: se le pone un
@@ -241,7 +248,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * destino ampliado de aquí abajo se escapan `now()::timestamp` y su deparseo. Ninguna de
      * las dos enrojece nada que no sea suyo.
      */
-    const TIPO_DE_TIEMPO = String.raw`timestamptz\b|timestamp\b(?:\s+with(?:out)?\s+time\s+zone\b)?`;
+    const TIPO_DE_TIEMPO = String.raw`timestamptz\b${PRECISION}|timestamp\b${PRECISION}(?:\s+with(?:out)?\s+time\s+zone\b)?`;
     const CASTOS = String.raw`(?:\s*::\s*(?:${TIPO_DE_TIEMPO}))*`;
     const entreParentesis = (x: string) => String.raw`(?:${x}|\(\s*(?:${x})\s*\))`;
     const RELOJ = entreParentesis(entreParentesis(RELOJES) + CASTOS) + CASTOS;
@@ -256,8 +263,25 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * `((now())::timestamp with time zone AT TIME ZONE 'UTC')::date` —que medido NO depende
      * del huso— el `AT TIME ZONE 'UTC'` entraba en el tipo y la forma correcta salía marcada.
      * Un censo que marca el propio arreglo se acaba desactivando.
+     *
+     * Y el nombre de un tipo temporal incluye su PRECISIÓN. Sin ella se escapaban siete
+     * formas peligrosas —`now()::timestamptz(0)::date` entre ellas, que Postgres guarda como
+     * `((now())::timestamp(0) with time zone)::date`— porque la cadena de castos se paraba
+     * ante el `(0)` y no llegaba nunca al `::date`.
+     *
+     * La guardia del huso va DELANTE, como aserción, y esto sí es sutil: detrás de una
+     * precisión opcional NO sirve. Con `timestamp\b(precisión)?(?!\s+with time zone)`, el
+     * motor prueba `timestamp(0)`, ve que sigue ` with time zone`, RETROCEDE a la precisión
+     * vacía, y entonces el lookahead mira `(0)`, que no es ` with time zone`, y pasa. Así
+     * `now()::timestamp(0) with time zone` —que medido conserva el instante— salía marcada.
+     * Puesta delante se evalúa en una posición fija y el retroceso no la puede rodear.
+     *
+     * (La precisión que se CONSUME al final es la única parte de todo esto que no carga
+     * peso: quitarla no cambia ni un caso, porque detrás del tipo no hay nada más que casar.
+     * Se queda porque el nombre de un tipo la incluye, y una gramática a medias es la que
+     * hace que la próxima vez nadie sepa por qué falta. Medido, no supuesto.)
      */
-    const TIPO_SIN_HUSO = String.raw`(?:date|time|timestamp)\b(?!\s+with\s+time\s+zone\b)`;
+    const TIPO_SIN_HUSO = String.raw`(?!(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)(?:date|time|timestamp)\b${PRECISION}`;
 
     RELOJ_COLAPSADO_A_DIA = [
       // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
@@ -403,6 +427,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'timestamp',
       culpable: true,
     },
+    // Y las mismas con PRECISIÓN, que es parte del nombre del tipo. La primera se guarda
+    // deparseada como `((now())::timestamp(0) with time zone)::date`, así que la sonda del
+    // catálogo ejercita justo la forma que se escapaba.
+    censo_probe_prec_interm: {
+      expr: 'now()::timestamptz(0)::date',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_prec_pared: {
+      expr: 'now()::timestamp(0)',
+      tipo: 'timestamp',
+      culpable: true,
+    },
     // Y las seguras, que son la otra mitad del contrato: un censo que marcara el propio
     // arreglo acabaría desactivado, así que se exige explícitamente que NO las señale.
     censo_probe_ok_utc: {
@@ -434,6 +471,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     censo_probe_ok_tz: {
       expr: 'now()::timestamptz',
       tipo: 'timestamptz',
+      culpable: false,
+    },
+    // Con precisión sigue conservando el instante (medido comparando el VALOR): se guarda
+    // como `(now())::timestamp(0) with time zone`, y esa forma es la que el guardia del huso
+    // marcaba en falso cuando iba detrás de la precisión.
+    censo_probe_ok_tz_prec: {
+      expr: 'now()::timestamp(0) with time zone',
+      tipo: 'timestamptz',
+      culpable: false,
+    },
+    // Un identificador que TERMINA en la palabra clave no es una lectura del reloj, y solo la
+    // frontera IZQUIERDA lo distingue: `current_date_pactada` lo para la derecha, así que no
+    // sirve para probar la otra mitad. `mi_current_date` sí, y sobrevive al deparseo como
+    // alias de la subconsulta (comprobado). Sin la frontera izquierda, sale marcado.
+    censo_probe_ok_prefijo: {
+      expr: "(select q.mi_current_date from (select date '2026-01-01' as mi_current_date) q)",
+      tipo: 'date',
       culpable: false,
     },
     // `epoch` es el instante absoluto: medido, no cambia con el huso.
@@ -506,6 +560,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'now()::timestamp',
       '(now())::timestamp without time zone',
       'localtimestamp::date',
+      // Con precisión: el nombre del tipo la incluye, y sin ella la cadena de castos se
+      // paraba ante el `(0)` sin llegar nunca al `::date`. La segunda es la forma en que
+      // Postgres guarda la primera.
+      'now()::timestamptz(0)::date',
+      '((now())::timestamp(0) with time zone)::date',
+      'now()::timestamp(0)::date',
+      'now()::timestamp(0)',
+      'cast(now()::timestamptz(3) as date)',
+      'current_timestamp(0)::timestamp(0)',
     ];
     const SEGURAS = [
       "timezone('UTC', now())::date",
@@ -540,6 +603,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Un campo por debajo del minuto sí es seguro sobre un reloj — y lo sería mal si los
       // instantes de la medición incluyeran la era de la hora local media.
       'extract(milliseconds from now())',
+      // La precisión es parte del NOMBRE del tipo, y con ella el tipo sigue llevando huso:
+      // medido comparando el valor, `now()::timestamp(0) with time zone` es el mismo instante
+      // en husos opuestos. La guardia del huso tiene que ir DELANTE de la precisión para que
+      // el retroceso del motor no la rodee.
+      'now()::timestamp(0) with time zone',
+      '(now())::timestamp(0) with time zone',
+      'now()::timestamptz(0)',
+      // Un identificador que TERMINA en la palabra clave. Solo la frontera IZQUIERDA lo
+      // separa: `current_date_pactada` lo para la derecha, y por eso no prueba esta mitad.
+      'mi_current_timestamp::date',
+      'select mi_localtimestamp::date from t',
+      'tabla.current_date_previo::date',
     ];
     expect(PELIGROSAS.filter((f) => !culpable(f))).toEqual([]);
     expect(SEGURAS.filter((f) => culpable(f))).toEqual([]);

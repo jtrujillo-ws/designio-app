@@ -55,6 +55,15 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     return ws;
   }
 
+  /*
+   * Una fecha del PASADO, fija, para todo acuerdo cuya retención no es lo que se está
+   * probando. Con `new Date().toISOString().slice(0, 10)` el suite dependía del reloj: si la
+   * fecha se calcula a las 23:59:59 y `current_date` se evalúa un instante después, la
+   * retención queda en el futuro y el caso falla por el cambio de día y no por su regla. La
+   * fecha relativa se reserva para el caso que SÍ cubre la retención, donde es el dato.
+   */
+  const EFECTIVO_PASADO = '2020-01-01';
+
   /** El acuerdo lo registra una parte y lo ejecuta la OTRA: es la doble firma del borrado. */
   async function acordarYExportar(
     ws: string,
@@ -65,7 +74,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad,
       base: 'Cláusula 9.3 del contrato marco',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
     // «Posterior a la exportación» (RF-01.9) y posterior AL ACUERDO: el archivo se entrega
     // antes de disponer, y tiene que reflejar lo que se acordó disponer.
@@ -311,7 +320,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'borrado',
       base: 'Acta de cierre',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/exportación previa/i);
 
@@ -345,7 +354,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'borrado',
       base: 'Rectificación: se acuerda borrar',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
     // Y se vuelve a exportar, que es lo que deja a la BASE conforme con el acuerdo nuevo. Sin
     // este paso el caso se detendría igual pero por otro motivo —«la exportación es anterior
@@ -380,7 +389,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'archivo',
       base: 'Primer acuerdo',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
     expect(uno.version).toBe(1);
     expect(uno.acordadoRol).toBe('admin-cliente');
@@ -389,7 +398,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'borrado',
       base: 'Se rectifica: borrado',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
     expect(dos.version).toBe(2);
     expect(dos.acordadoRol).toBe('lead-boutique');
@@ -423,7 +432,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // transacciones y el caso pasa en verde la mayoría de las veces —medido: falla una de cada
     // tres—. Un test que solo delata el fallo a veces no es un test, es un aviso ocasional.
     const ws = await nuevoWorkspace('concurrentes');
-    const hoy = new Date().toISOString().slice(0, 10);
+    const hoy = EFECTIVO_PASADO;
     const partes = [adminId, leadId, adminId, leadId, adminId];
     const acuerdos = await Promise.all(
       partes.map((quien, i) =>
@@ -551,7 +560,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'borrado',
       base: 'Acuerdo con exportación simulada',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
 
     // El evento, escrito por el ROL DE APLICACIÓN: exactamente lo que un miembro puede hacer.
@@ -700,7 +709,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'archivo',
       base: 'Acuerdo 2: se reanuda el trabajo',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
 
     // Y el panel deja de enseñarla, porque ya no rige. Aquí había un `order by
@@ -872,7 +881,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // coincide — y se destruiría el workspace conforme a una base contractual y una retención
     // que quien ejecuta nunca vio. Lo que hay que confirmar es el acuerdo, no su etiqueta.
     const ws = await nuevoWorkspace('dos-borrados');
-    const hoy = new Date().toISOString().slice(0, 10);
+    const hoy = EFECTIVO_PASADO;
     await registrarAcuerdo(adminId, {
       workspaceId: ws,
       modalidad: 'borrado',
@@ -947,7 +956,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           workspaceId: ws,
           modalidad: 'archivo',
           base: inyectado,
-          efectivoDesde: new Date().toISOString().slice(0, 10),
+          efectivoDesde: EFECTIVO_PASADO,
         }),
       ).rejects.toThrow();
       await expect(
@@ -981,7 +990,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
      * que sea el que ejecuta.
      */
     const ws = await nuevoWorkspace('exportacion-ciega');
-    const hoy = new Date().toISOString().slice(0, 10);
+    const hoy = EFECTIVO_PASADO;
 
     let guardPasado!: () => void;
     const acuerdoEscrito = new Promise<void>((r) => {
@@ -1050,7 +1059,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'archivo',
       base: 'Acuerdo 2, sin exportar después',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/no llegó a VER/);
 
@@ -1172,7 +1181,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'borrado',
       base: 'Acuerdo 2: mejor borrar',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
     await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
 
@@ -1242,7 +1251,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'archivo',
       base: 'Acuerdo 2: mejor archivar',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
     await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
     sigue();
@@ -1271,7 +1280,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidad: 'borrado',
       base: 'Acuerdo con exportación en vuelo',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+      efectivoDesde: EFECTIVO_PASADO,
     });
 
     let abierta!: () => void;

@@ -1490,7 +1490,21 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
      * pudiendo descargar desde la bandeja, así que exigirle la entrega completa sería un
      * trámite sin riesgo detrás. Mismo workspace, mismos 30 MB, otro acuerdo.
      */
-    await acordarYExportar(ws, 'archivo', adminId);
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws,
+      modalidad: 'archivo',
+      base: 'Se archiva en vez de borrar, que es la salida que el rechazo nombra',
+      efectivoDesde: EFECTIVO_PASADO,
+    });
+    // La exportación de este segundo acuerdo va por las FUNCIONES de la base y no por el
+    // servicio, y es una decisión de coste con su motivo: lo que esta mitad mira es a quién
+    // deja pasar la base, y volver a armar el paquete —25 MB de adjuntos a base64— es trabajo
+    // sin pregunta que responda. Que el estado peligroso se alcanza por el camino del producto
+    // ya lo demuestra la mitad de arriba, que sí exporta de verdad.
+    await conUsuario(leadId, async (tx) => {
+      await tx`select registrar_exportacion(${ws}, 'archivo')`;
+      await tx`select confirmar_exportacion(${ws}, 'archivo')`;
+    });
     const constancia = await ejecutarDisposicion(leadId, {
       workspaceId: ws,
       modalidadEsperada: 'archivo',
@@ -1501,7 +1515,13 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const [tras] = await admin`select count(*)::int as n from archivo_importado
       where workspace_id = ${ws}`;
     expect(tras!.n).toBe(6);
-  });
+    /*
+     * El plazo, escrito y con su motivo: este caso mueve 30 MB de adjuntos porque ése es
+     * exactamente su asunto —el presupuesto son 25 MB y el CHECK topa cada archivo en 5— y
+     * entre insertarlos, armar el paquete y calcular dos veces el inventario se pasa del plazo
+     * por omisión de 5 s en un runner. Hacerlo barato sería hacerlo falso.
+     */
+  }, 30_000);
 
   it('el presupuesto de adjuntos es UN número, y lo dicen los dos lados igual', async () => {
     /*

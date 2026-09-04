@@ -624,6 +624,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * guardas que dicen cosas distintas del mismo hecho es como este fichero ha fallado ya
      * cuatro veces. Medido, no supuesto.
      */
+    /** Lo que RENDERIZA un valor a texto: la clase del JSON, más los de la biblioteca. */
+    const SERIALIZAN = String.raw`\w*json\w*|concat|concat_ws|quote_literal|quote_nullable|quote_ident|format`;
     const HUSO_YA_FIJADO = String.raw`${nombreDeFuncion('timezone')}\s*\(\s*${envuelto(HUSO_LITERAL)}\s*,\s*`;
     /*
      * Y el FORMATO de `to_char`, que hasta ahora no se miraba: se marcaba cualquier `to_char`
@@ -761,15 +763,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'i',
       ),
       /*
-       * La serialización a JSON. `to_json(now())` imprime el `timestamptz` con la fecha, la
-       * hora y el desfase LOCALES —medido: «2026-09-05T05:11:45+14:00» en Kiritimati y
+       * La SERIALIZACIÓN, en cualquiera de sus formas. `to_json(now())` imprime el
+       * `timestamptz` con la fecha, la hora y el desfase LOCALES —medido: «2026-09-05T05:11:45+14:00» en Kiritimati y
        * «2026-09-04T03:11:45-12:00» en Etc/GMT+12—, así que es la MISMA elección de calendario
        * que `now()::text`, que ya se marcaba, escrita con otra función.
        *
-       * Se reconoce por la CLASE y no por una lista de nombres: cualquier función cuyo nombre
-       * lleve `json` y reciba un reloj como argumento de PRIMER NIVEL. Así entran `to_json`,
-       * `to_jsonb`, `json_build_object`, `jsonb_agg`, `row_to_json` y las que nazcan mañana,
-       * sin que nadie tenga que acordarse — que es como falla una lista escrita a mano.
+       * Y no solo el JSON: `concat(now())`, `quote_literal(now())` y `format('%s', now())`
+       * hacen la MISMA coerción implícita a texto, medidas las tres igual de dependientes. Lo
+       * que las junta no es el formato de salida sino que todas RENDERIZAN el reloj.
+       *
+       * Los que llevan `json` en el nombre entran por la clase —`to_json`, `to_jsonb`,
+       * `json_build_object`, `jsonb_agg`, `row_to_json` y los que nazcan mañana, sin que nadie
+       * tenga que acordarse—; los demás son un conjunto CERRADO de la biblioteca estándar y
+       * por eso van nombrados.
        *
        * Y el reloj puede ir ANIDADO, que es como se usa `row_to_json` de verdad —exige
        * construir un registro—: `row_to_json(row(now()))` y `jsonb_build_object('d',
@@ -786,9 +792,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * una coma ni un cierre.)
        */
       new RegExp(
-        String.raw`${nombreDeFuncion(String.raw`\w*json\w*`)}\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\)|\()*?(?<!${HUSO_YA_FIJADO})(${RELOJ})\s*(?=[,)])`,
+        String.raw`${nombreDeFuncion(SERIALIZAN)}\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\)|\()*?(?<!${HUSO_YA_FIJADO})(${RELOJ})\s*(?=[,)])`,
         'i',
       ),
+      /*
+       * Y el OPERADOR de concatenación, que hace la misma coerción sin nombrar ninguna
+       * función: `now() || ''` da «2026-09-05 05:43…+14» y «2026-09-04 03:43…-12» (medido).
+       * En los dos órdenes, porque el reloj puede ir a cualquier lado.
+       *
+       * El arreglo no casa por dónde queda el reloj: en `timezone('UTC', now()) || ''` lo que
+       * precede al operador es el paréntesis de la conversión, no un reloj. Y la resta de dos
+       * relojes tampoco, por la misma gramática que ya usan las comparaciones: sigue siendo el
+       * intervalo cero, medido `00:00:00` en los dos husos.
+       */
+      new RegExp(String.raw`(${RELOJ})\s*\|\|`, 'i'),
+      new RegExp(String.raw`\|\|\s*(${RELOJ})`, 'i'),
       /*
        * `age(x)` con UN argumento, que es el único de esta lista donde el reloj no se escribe:
        * lo pone Postgres. La documentación dice «resta el argumento de current_date (a
@@ -858,7 +876,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       ].some((m) => culpable(m[2]!, 'sql')) ||
       [
         ...conLiterales.matchAll(
-          /\bexecute\s+(?:\w+\s*\(\s*)*((?:[A-Za-z_]*&?'(?:[^']|'')*'\s*(?:\|\|\s*)?)+)/gi,
+          /\bexecute\s+(?:\w+\s*\(\s*)*((?:[A-Za-z_]*&?'(?:[^']|'')*'\s*(?:(?:\|\||,)\s*)?)+)/gi,
         ),
       ].some((m) =>
         /*
@@ -871,12 +889,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * concatenación hay una VARIABLE, sus trozos no están en el texto. La cadena se corta
          * ahí, igual que `execute v_sql` no se puede leer.
          */
-        culpable(
-          [...m[1]!.matchAll(/[A-Za-z_]*&?'((?:[^']|'')*)'/g)]
-            .map((l) => l[1]!.replace(/''/g, "'"))
-            .join(''),
-          'sql',
-        ),
+        (() => {
+          const trozos = [...m[1]!.matchAll(/[A-Za-z_]*&?'((?:[^']|'')*)'/g)].map((l) =>
+            l[1]!.replace(/''/g, "'"),
+          );
+          /*
+           * Los DOS pegados, y no uno: ninguno es la verdad para las dos formas. `||` une
+           * exactamente —`'select now()' || '::date'` tiene que quedar sin hueco o el casto no
+           * se pega—, mientras que `format('select %s', 'now()::date')` mete el trozo donde
+           * está el marcador, y pegado a secas queda `%snow()` sin frontera de palabra: el
+           * reloj deja de reconocerse. Con hueco pasa lo contrario, se parte `'da' ||
+           * 'te_trunc'`. Se miran los dos y basta con que uno sea culpable, que es el lado
+           * seguro.
+           */
+          return culpable(trozos.join(''), 'sql') || culpable(trozos.join(' '), 'sql');
+        })(),
       )
     );
   };
@@ -1599,9 +1626,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // El huso dinámico ENVUELTO: el paréntesis de más impedía consumir el argumento y el
       // patrón no casaba. Medido: 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12.
       "timezone((current_setting('TimeZone')), now())::date",
-      // Y el SQL de un EXECUTE compuesto por concatenación, en sus dos cortes.
+      // Y el SQL de un EXECUTE compuesto por concatenación, en sus dos cortes, y por `format`,
+      // que es la forma idiomática de componerlo en plpgsql.
       "execute 'select now()' || '::date'",
       "execute 'select ' || 'now()::date'",
+      "execute format('select %s', 'now()::date')",
+      // La coerción IMPLÍCITA a texto, que renderiza igual sin nombrar ningún formato. Las
+      // cuatro medidas: cadena distinta en husos opuestos.
+      'concat(now())',
+      'quote_literal(now())',
+      "now() || ''",
+      "'fecha: ' || now()",
       // El NOMBRE de la función, entrecomillado. Las siete son llamadas válidas (medidas) y
       // ninguna casaba: el patrón exigía el paréntesis pegado al nombre desnudo.
       'pg_catalog."to_json"(now())',
@@ -1924,6 +1959,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Y la otra sintaxis de la conversión fija, que ni llega a probarse: detrás del reloj no
       // hay coma ni cierre. Medido estable en los dos husos.
       "to_json(now() at time zone 'UTC')",
+      // Y las dos formas en que el operador NO renderiza un reloj: con la conversión delante
+      // —lo que precede al operador es su paréntesis— y con la resta, que sigue siendo el
+      // intervalo cero. Medidas las dos: iguales en los dos husos.
+      "timezone('UTC', now()) || ''",
+      "(now() - now()) || ''",
+      "concat(timezone('UTC', now()))",
       // Con los dos instantes dados, `age` no lee ningún calendario (medido). Y el nombre
       // dentro de otro identificador tampoco: `promedio_age` y `average` no son la función.
       'age(now(), t.creado_en)',

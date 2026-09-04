@@ -4,6 +4,7 @@ import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import {
+  CONFIRMACION_BORRADO,
   cargaCanonicaConstancia,
   type AcuerdoDisposicion,
   type ConstanciaDisposicion,
@@ -240,6 +241,16 @@ export async function ejecutarDisposicion(
     if (ac.modalidad !== entrada.modalidadEsperada || version !== entrada.acuerdoVersionEsperada) {
       throw new ErrorDisposicion(
         `El acuerdo vigente pasó a ser el #${version} («${ac.modalidad}») mientras mirabas la pantalla, y tú confirmaste el #${entrada.acuerdoVersionEsperada} («${entrada.modalidadEsperada}»). No se ejecuta lo que no viste: vuelve a mirarlo y confírmalo.`,
+      );
+    }
+
+    // La confirmación escrita, comprobada AQUÍ y no solo en el `disabled` del botón: un
+    // atributo del DOM no es una comprobación, y cualquier llamada al transporte lo salta.
+    // Va después de conocer la modalidad real —bajo el candado— porque solo el borrado la
+    // pide, y pedírsela a un archivo sería trámite sin riesgo detrás.
+    if (ac.modalidad === 'borrado' && entrada.confirmacion !== CONFIRMACION_BORRADO) {
+      throw new ErrorDisposicion(
+        `Un borrado acordado es irreversible: escribe ${CONFIRMACION_BORRADO} para confirmarlo`,
       );
     }
 

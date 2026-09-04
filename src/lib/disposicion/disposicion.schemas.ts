@@ -81,7 +81,22 @@ export const EjecutarDisposicionSchema = z.object({
    * etiqueta.
    */
   acuerdoVersionEsperada: z.number().int().min(1),
+  /**
+   * La palabra que hay que teclear para un borrado. Viaja al SERVIDOR, y no se queda en el
+   * `disabled` del botón, porque el `disabled` no es una comprobación: es una sugerencia que
+   * el navegador puede no seguir. Cualquier llamada al transporte —una pestaña vieja, un
+   * cliente mal cableado, un script— ejecutaba el borrado sin que nadie hubiera escrito nada.
+   *
+   * Lo que defiende es el ERROR HUMANO, no a un adversario: quien escribe SQL crudo teclea
+   * «BORRAR» sin despeinarse, así que meterlo en la función de la base sería ceremonia sin
+   * defensa. Por eso vive en la frontera donde está la persona —la petición— y no más abajo.
+   */
+  confirmacion: z.string().default(''),
 });
+/** Lo que hay que teclear para ejecutar un borrado. Vive en el esquema —no en la pantalla—
+ * porque lo comprueban los dos lados y una constante en dos sitios es una constante que
+ * puede discrepar. */
+export const CONFIRMACION_BORRADO = 'BORRAR';
 export type EjecutarDisposicion = z.infer<typeof EjecutarDisposicionSchema>;
 
 export type AcuerdoDisposicion = {

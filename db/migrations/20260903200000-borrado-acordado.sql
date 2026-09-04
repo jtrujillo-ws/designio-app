@@ -153,6 +153,23 @@ create table exportacion_registro (
   -- abandona la borra al deshacerse. Es también el instante que la constancia sella como
   -- «exportado_en», porque lo que RF-01.9 pide es que la entrega haya TERMINADO antes.
   completado_en timestamptz,
+  /*
+   * Qué acuerdo de disposición VIO esta exportación, leído dentro de su propia instantánea.
+   * `null` = no había ninguno.
+   *
+   * Sustituye a comparar relojes, que era una inferencia y se quedaba corta. La exportación
+   * corre en REPEATABLE READ y no toma el candado del workspace, así que puede arrancar antes
+   * de que el acuerdo commitee y terminar después: entonces `creado_en > acordado_en` es
+   * cierto y su instantánea NO contiene ni la fila del acuerdo ni el `DisposicionAcordada`
+   * que el guard escribe en la misma transacción. Al archivo le faltaban las dos cosas, y tras
+   * un borrado esa auditoría desaparece para siempre.
+   *
+   * Un hecho de visibilidad no se infiere: se anota. Lo escribe `confirmar_exportacion`, bajo
+   * la instantánea de la exportación, y la disposición exige que coincida con la versión que
+   * ejecuta. Eso no deja ventana: o la exportación vio el acuerdo, o no vale.
+   */
+  acuerdo_version_visto integer check (acuerdo_version_visto is null
+                                       or acuerdo_version_visto >= 1),
   unique (id, workspace_id)
 );
 comment on table exportacion_registro is
@@ -215,6 +232,13 @@ begin
     raise exception 'solo lead-boutique o admin-cliente ejecutan la exportación del workspace'
       using errcode = 'insufficient_privilege';
   end if;
+  -- Y con la cuenta activa: una desactivada a mitad de sesión conserva su membresía, así que
+  -- `workspace_role` le sigue respondiendo. La exportación es la puerta que desbloquea una
+  -- disposición, así que aquí también.
+  if not cuenta_activa(app_user_id()) then
+    raise exception 'la cuenta que ejecuta la exportación no está activa'
+      using errcode = 'insufficient_privilege';
+  end if;
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
   values (p_ws, 'WorkspaceExportado', jsonb_build_object('ambito', p_ambito),
           app_user_id(), v_rol);
@@ -240,7 +264,12 @@ begin
   -- respuesta de `workspace_role` AHORA para una fila autorizada ANTES; con la fila delante,
   -- la autorización ya está acreditada.
   update exportacion_registro
-     set completado_en = clock_timestamp()
+     set completado_en = clock_timestamp(),
+         -- Bajo REPEATABLE READ —como corre la exportación— toda la transacción comparte
+         -- instantánea, así que este `max` es literalmente «el último acuerdo que este
+         -- archivo pudo ver», se lea antes o después del volcado.
+         acuerdo_version_visto = (select max(a.version) from acuerdo_disposicion a
+                                  where a.workspace_id = p_ws)
    where workspace_id = p_ws and ambito = p_ambito
      and completado_en is null
      and xmin = pg_current_xact_id()::xid;
@@ -630,6 +659,13 @@ begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
+  -- La cuenta activa, por el mismo motivo que en la ejecución y en la exportación: el grant de
+  -- insert sobre esta tabla permite registrar un acuerdo por SQL crudo, y `is_workspace_member`
+  -- no mira `usuario.estado`. Un acuerdo es la primera de las dos firmas de un borrado.
+  if not cuenta_activa(app_user_id()) then
+    raise exception 'la cuenta que registra el acuerdo de disposición no está activa'
+      using errcode = 'insufficient_privilege';
+  end if;
   -- EL CANDADO VA AQUÍ, no solo en el servicio. El grant de insert permite escribir en esta
   -- tabla por SQL directo, saltándose la capa que lo tomaba, y entonces el registro puede
   -- confirmar con una ejecución EN VUELO — después de que validó el acuerdo anterior y antes
@@ -741,6 +777,9 @@ begin
   if coalesce(v_rol, '') not in ('lead-boutique', 'admin-cliente') then
     return 'Solo el admin del cliente o el lead de la boutique ejecutan la disposición acordada';
   end if;
+  if not cuenta_activa(app_user_id()) then
+    return 'Tu cuenta no está activa: una disposición acordada la ejecuta una persona en activo';
+  end if;
 
   v_disp := disposicion_vigente(p_ws);
   if v_disp.modalidad = 'borrado' then
@@ -788,35 +827,31 @@ begin
   --
   -- ── Una exportación vale como prueba si cumple LAS DOS cosas ──
   -- Haber TERMINADO —lo que RF-01.9 pide es la entrega, y una fila sin completar es una
-  -- exportación autorizada y abandonada— y haber EMPEZADO después del acuerdo.
+  -- exportación autorizada y abandonada— y haber VISTO el acuerdo que se va a ejecutar.
   --
-  -- Lo segundo no es redundante, y mirar solo el final era un agujero: la exportación corre
-  -- en REPEATABLE READ y NO toma el candado del workspace, así que puede arrancar antes de
-  -- que se registre el acuerdo y terminar después. Su instantánea es entonces anterior a lo
-  -- pactado —no contiene ni el acuerdo ni nada posterior— y aun así `completado_en` caía del
-  -- lado bueno de la comparación. Con eso, un borrado irreversible se apoyaba en un archivo
-  -- que no refleja lo que se acordó disponer, que es justo lo que esta condición impide.
-  -- `creado_en` es el `now()` de la transacción de la exportación —su arranque—, y por tanto
-  -- no es posterior a su instantánea.
+  -- Lo segundo se comprueba contra un HECHO anotado y no contra un reloj. Comparar
+  -- `creado_en > acordado_en` era una inferencia, y dejaba una ventana real: la exportación
+  -- corre en REPEATABLE READ y no toma el candado del workspace, así que puede arrancar entre
+  -- que el guard del acuerdo fija `acordado_en` con `clock_timestamp()` y que esa transacción
+  -- COMMITEA. Su instantánea no contiene entonces ni la fila del acuerdo ni el
+  -- `DisposicionAcordada` que el mismo guard escribe, así que al archivo le faltan las dos —y
+  -- tras un borrado esa auditoría no está en ninguna otra parte—, mientras el reloj decía que
+  -- todo estaba en orden.
   --
-  -- Queda una ventana que esto NO cierra, y se dice en vez de callarse: entre que el guard
-  -- del acuerdo fija `acordado_en` con `clock_timestamp()` y que esa transacción COMMITEA,
-  -- una exportación que arranque ahí tiene `creado_en > acordado_en` y todavía no ve la fila
-  -- del acuerdo. Dura lo que dure ese commit y no alcanza a ningún dato del workspace —un
-  -- acuerdo no escribe nada más—, así que lo que puede faltar en el archivo es la propia
-  -- fila del acuerdo, y nada más.
+  -- `confirmar_exportacion` anota qué acuerdo vio, bajo la instantánea de la exportación, y
+  -- aquí se exige que sea EXACTAMENTE el que se ejecuta. Sin ventana y sin inferencia.
   select max(xp.completado_en) into v_export from exportacion_registro xp
     where xp.workspace_id = p_ws and xp.ambito = 'archivo'
       and xp.completado_en is not null
-      and xp.creado_en > v_ac.acordado_en;
+      and xp.acuerdo_version_visto = v_ac.version;
   if v_export is null then
     -- Se distingue «no hay ninguna» de «la que hay no sirve»: el remedio es el mismo, pero
     -- quien ya exportó merece saber por qué no le vale.
     if exists (select 1 from exportacion_registro xp
                where xp.workspace_id = p_ws and xp.ambito = 'archivo'
                  and xp.completado_en is not null) then
-      return format('La última exportación completa del archivo EMPEZÓ antes del acuerdo vigente (registrado el %s), así que no refleja lo que se acordó disponer: vuelve a exportar el archivo completo y ejecútalo después',
-        to_char(v_ac.acordado_en, 'YYYY-MM-DD HH24:MI'));
+      return format('La última exportación completa del archivo no llegó a VER el acuerdo vigente (el #%s): se generó sobre una foto que no lo incluye, así que no refleja lo que se acordó disponer. Vuelve a exportar el archivo completo y ejecútalo después',
+        v_ac.version);
     end if;
     return 'Falta la exportación previa: el archivo completo del workspace se entrega ANTES de disponer de él (RF-01.8/01.9)';
   end if;
@@ -860,6 +895,29 @@ end $$;
  * copiar la condición sería tener dos criterios que pueden discrepar. Se extrae, y el trigger
  * pasa a invocarla: misma regla, mismo mensaje, un solo sitio donde cambiarla.
  */
+/*
+ * ── La cuenta activa, comprobada también EN LA BASE ──
+ * `is_workspace_member` y `workspace_role` miran `miembro` y nada más: una cuenta puesta en
+ * `inactivo` que conserve su fila de membresía pasa todas las puertas SQL. Con el grant que
+ * el rol de aplicación tiene sobre estas funciones, eso alcanzaba para registrar el acuerdo,
+ * autorizar y confirmar la exportación y ejecutar el borrado por SQL crudo, saltándose
+ * `exigirCuentaActiva`, que solo vive en el servicio. Cuarta aparición del mismo patrón: una
+ * promesa sostenida donde el grant permite rodearla.
+ *
+ * Se cierra AQUÍ, en las puertas de la disposición, y no dentro de `is_workspace_member`:
+ * aquella la invocan las políticas RLS de 54 tablas, así que meterle el estado de la cuenta
+ * cambia el comportamiento de todo el esquema y es un cambio que merece su propia medida y su
+ * propio slice. Queda anotado; lo que este PR cierra es lo que este PR abre.
+ */
+create function cuenta_activa(p_user uuid) returns boolean
+language sql stable security definer set search_path = public, pg_temp as $$
+  select exists (select 1 from usuario u where u.id = p_user and u.estado = 'activo')
+$$;
+revoke execute on function cuenta_activa(uuid) from public;
+grant execute on function cuenta_activa(uuid) to designio_app;
+comment on function cuenta_activa(uuid) is
+'Si la cuenta sigue activa. SECURITY DEFINER porque `usuario` no es legible por el rol de aplicación, y no es oráculo: responde false igual para una cuenta inactiva que para un uuid que no existe.';
+
 create function exigir_read_committed(p_operacion text) returns void
 language plpgsql as $$
 declare
@@ -931,6 +989,13 @@ begin
   -- Lo PRIMERO, antes de leer nada: si la instantánea ya está fijada, esperar el candado no
   -- vuelve a mirar, y todo lo que sigue decidiría sobre una foto vieja.
   perform exigir_read_committed('la disposición acordada');
+  -- Y la cuenta tiene que seguir activa. Va aquí y no solo en el servicio porque esta función
+  -- está concedida al rol de aplicación: una cuenta desactivada a mitad de sesión que conserve
+  -- su membresía pasaba `is_workspace_member` sin más y llegaba hasta el borrado.
+  if not cuenta_activa(v_actor) then
+    raise exception 'la cuenta que ejecuta la disposición no está activa'
+      using errcode = 'insufficient_privilege';
+  end if;
 
   -- Anti-oráculo: a quien no es miembro se le responde lo mismo que a quien
   -- pregunta por un workspace que no existe.
@@ -985,7 +1050,7 @@ begin
   select max(xp.completado_en) into v_export from exportacion_registro xp
     where xp.workspace_id = p_ws and xp.ambito = 'archivo'
       and xp.completado_en is not null
-      and xp.creado_en > v_ac.acordado_en;
+      and xp.acuerdo_version_visto = v_ac.version;
 
   -- Remediación ANTES de tocar nada: lo que ya salió hacia un proveedor no lo alcanza este
   -- borrado, y el libro que lo sabe es de los que se vacían.

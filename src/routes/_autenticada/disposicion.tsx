@@ -14,6 +14,7 @@ import {
 } from '@/lib/disposicion/disposicion.functions';
 import { hoyCalendario } from '@/lib/fecha-calendario';
 import {
+  CONFIRMACION_BORRADO,
   cargaCanonicaConstancia,
   ROLES_DISPOSICION,
   type ConstanciaDisposicion,
@@ -51,11 +52,6 @@ const parrafo: CSSProperties = {
   color: 'var(--text-body)',
   margin: 0,
 };
-
-/** Lo que hay que teclear para ejecutar un borrado. No es teatro: es lo que convierte un
- * clic en un acto deliberado, y la única defensa que queda contra el error humano cuando
- * todas las demás —acuerdo, retención, exportación, doble firma— ya se han cumplido. */
-const CONFIRMACION_BORRADO = 'BORRAR';
 
 function PantallaDisposicion() {
   const { membresiaActiva } = Route.useRouteContext();
@@ -164,6 +160,10 @@ function PantallaDisposicion() {
           workspaceId,
           modalidadEsperada: panel.acuerdoVigente.modalidad,
           acuerdoVersionEsperada: panel.acuerdoVigente.version,
+          // La confirmación escrita VIAJA. El `disabled` del botón no es una comprobación
+          // —es una sugerencia que el navegador puede no seguir—, y sin esto cualquier
+          // llamada al transporte ejecutaba el borrado sin que nadie hubiera escrito nada.
+          confirmacion,
         },
       });
       if (!r.ok) setError(r.error);

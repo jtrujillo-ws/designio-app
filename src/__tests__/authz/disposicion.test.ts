@@ -172,6 +172,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidadEsperada: 'borrado',
       acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
     });
 
     // ── La constancia se verifica FUERA de la base ──
@@ -253,6 +254,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidadEsperada: 'archivo',
       acuerdoVersionEsperada: 1,
+      confirmacion: '',
     });
     expect(constancia.modalidad).toBe('archivo');
     expect(selloRecomputado(constancia)).toBe(constancia.sello);
@@ -275,7 +277,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
   it('el mismo acuerdo no se ejecuta dos veces, y la pantalla lo dice antes de ofrecerlo', async () => {
     const ws = await nuevoWorkspace('doble');
     await acordarYExportar(ws, 'archivo', leadId);
-    await ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1 });
+    await ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1, confirmacion: '' });
 
     // El motivo lo da la MISMA función que usa el guard: la pantalla no puede ofrecer algo
     // que la base va a rechazar, ni esconder algo que sí correspondía.
@@ -283,7 +285,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect(panel.motivoNoEjecutable).toMatch(/ya se ejecutó/i);
     expect(panel.constanciaVigente).not.toBeNull();
     await expect(
-      ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1 }),
+      ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1, confirmacion: '' }),
     ).rejects.toThrow(ErrorDisposicion);
   });
 
@@ -296,7 +298,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const panel = await panelDisposicion(adminId, ws);
     expect(panel.motivoNoEjecutable).toMatch(/las dos partes/i);
     await expect(
-      ejecutarDisposicion(adminId, { workspaceId: ws, modalidadEsperada: 'borrado', acuerdoVersionEsperada: 1 }),
+      ejecutarDisposicion(adminId, { workspaceId: ws, modalidadEsperada: 'borrado', acuerdoVersionEsperada: 1, confirmacion: 'BORRAR' }),
     ).rejects.toThrow(/las dos partes/i);
 
     // Y para la otra parte sí está disponible.
@@ -354,7 +356,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
 
     await expect(
-      ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1 }),
+      ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1, confirmacion: '' }),
     ).rejects.toThrow(/mientras mirabas/i);
     // Y el workspace sigue entero: no se ejecutó ninguna de las dos.
     const [seg] = await sqlAdmin()`select count(*)::int as n from segmento
@@ -365,6 +367,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidadEsperada: 'borrado',
       acuerdoVersionEsperada: 2,
+      confirmacion: 'BORRAR',
     });
     const [tras] = await sqlAdmin()`select count(*)::int as n from segmento
       where workspace_id = ${ws}`;
@@ -453,7 +456,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const [seg] = await admin`select id from segmento where workspace_id = ${congelado}`;
 
     await acordarYExportar(congelado, 'archivo', leadId);
-    await ejecutarDisposicion(leadId, { workspaceId: congelado, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1 });
+    await ejecutarDisposicion(leadId, { workspaceId: congelado, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1, confirmacion: '' });
 
     // Quien lo intenta es miembro de los dos, así que la RLS no lo detiene: lo único que puede
     // detenerlo es el guard, mirando también de dónde SALE la fila.
@@ -479,6 +482,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidadEsperada: 'borrado',
       acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
     });
 
     // Ya no queda membresía para nadie: es la situación real después de un borrado.
@@ -559,7 +563,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // Sigue bloqueada, y lo dice por el motivo correcto.
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/exportación previa/i);
     await expect(
-      ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'borrado', acuerdoVersionEsperada: 1 }),
+      ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'borrado', acuerdoVersionEsperada: 1, confirmacion: 'BORRAR' }),
     ).rejects.toThrow(/exportación previa/i);
 
     // Y la aplicación tampoco puede escribir el registro que sí cuenta.
@@ -615,7 +619,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const ws = await nuevoWorkspace('lapida-cupo');
     await admin`update workspace set limite_llamadas_ai_dia = 40 where id = ${ws}`;
     await acordarYExportar(ws, 'borrado', adminId);
-    await ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'borrado', acuerdoVersionEsperada: 1 });
+    await ejecutarDisposicion(leadId, { workspaceId: ws, modalidadEsperada: 'borrado', acuerdoVersionEsperada: 1, confirmacion: 'BORRAR' });
 
     const [w] = await admin`select nombre, limite_llamadas_ai_dia from workspace
       where id = ${ws}`;
@@ -674,6 +678,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: wsB,
       modalidadEsperada: 'borrado',
       acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
     });
     for (const f of sobreviven) expect(cb.alcance).toContain(f.tabla as string);
     // Y nombra lo que sobrevive SIN ser una tabla del conjunto: la fila del propio workspace.
@@ -689,6 +694,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: wsA,
       modalidadEsperada: 'archivo',
       acuerdoVersionEsperada: 1,
+      confirmacion: '',
     });
     for (const f of noCongeladas) expect(ca.alcance).toContain(f.tabla as string);
 
@@ -716,6 +722,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidadEsperada: 'borrado',
       acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
     });
 
     const [m] = await sqlAdmin()`select count(*)::int as n from miembro where workspace_id = ${ws}`;
@@ -770,6 +777,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         workspaceId: ws,
         modalidadEsperada: 'borrado',
         acuerdoVersionEsperada: 1,
+        confirmacion: 'BORRAR',
       }),
     ).rejects.toThrow(/no viste/i);
     // Y sigue entero: la coincidencia de etiqueta no lo destruyó.
@@ -839,73 +847,194 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     ).rejects.toMatchObject({ code: '23514' });
   });
 
-  it('una exportación que EMPEZÓ antes del acuerdo no lo acredita, aunque termine después', async () => {
+  it('una exportación que no VIO el acuerdo no lo acredita, aunque su reloj diga que sí', async () => {
     /*
-     * La exportación corre en REPEATABLE READ y NO toma el candado del workspace, así que
-     * puede arrancar antes de que se registre el acuerdo y terminar después. Su instantánea es
-     * entonces anterior a lo pactado —no contiene ni el acuerdo ni nada posterior— y aun así
-     * su `completado_en` caía del lado bueno de la comparación. Con eso, un borrado
-     * irreversible se apoyaba en un archivo que no refleja lo que se acordó disponer.
+     * El caso que la comparación de relojes no atrapaba, construido con precisión porque es la
+     * única forma de que el test discrimine: la transacción que registra el acuerdo fija
+     * `acordado_en` con `clock_timestamp()` en su guard y NO commitea todavía; la exportación
+     * arranca en ese hueco, así que su `creado_en` es POSTERIOR a `acordado_en` —el reloj dice
+     * que todo está en orden— y su instantánea REPEATABLE READ no contiene ni la fila del
+     * acuerdo ni el `DisposicionAcordada` que el mismo guard escribe. Al archivo entregado le
+     * faltan las dos cosas, y tras un borrado esa auditoría no queda en ninguna otra parte.
      *
-     * Se reproduce con las MISMAS dos funciones que usa la exportación real, en una
-     * transacción REPEATABLE READ, con el acuerdo colándose entre las dos.
+     * Un hecho de visibilidad no se infiere de un reloj: se anota. `confirmar_exportacion`
+     * apunta qué acuerdo vio, bajo la instantánea de la exportación, y la disposición exige
+     * que sea el que ejecuta.
      */
-    const ws = await nuevoWorkspace('export-antes-del-acuerdo');
+    const ws = await nuevoWorkspace('exportacion-ciega');
+    const hoy = new Date().toISOString().slice(0, 10);
 
-    let arrancada!: () => void;
-    const empezo = new Promise<void>((r) => {
-      arrancada = r;
+    let guardPasado!: () => void;
+    const acuerdoEscrito = new Promise<void>((r) => {
+      guardPasado = r;
     });
-    let sigue!: () => void;
-    const acuerdoHecho = new Promise<void>((r) => {
-      sigue = r;
+    let commitea!: () => void;
+    const puedeCommitear = new Promise<void>((r) => {
+      commitea = r;
     });
 
-    const exportacion = conUsuario(
-      leadId,
-      async (tx) => {
-        await tx`select registrar_exportacion(${ws}, 'archivo')`;
-        arrancada();
-        await acuerdoHecho;
-        await tx`select confirmar_exportacion(${ws}, 'archivo')`;
-      },
-      { aislamiento: 'repeatable read' },
-    );
-
-    await empezo;
-    await registrarAcuerdo(adminId, {
-      workspaceId: ws,
-      modalidad: 'borrado',
-      base: 'Acuerdo posterior al arranque de la exportación',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+    // El acuerdo se escribe —su guard fija `acordado_en`— y la transacción se queda abierta.
+    const registro = conUsuario(adminId, async (tx) => {
+      await tx`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+        values (${ws}, 'borrado', 'Acuerdo aún sin commitear', ${hoy}::date, ${adminId})`;
+      guardPasado();
+      await puedeCommitear;
     });
-    sigue();
-    await exportacion;
 
-    // La fila está COMPLETA y su `completado_en` es posterior al acuerdo…
-    const [reg] = await sqlAdmin()`select creado_en < a.acordado_en as empezo_antes,
-        completado_en > a.acordado_en as termino_despues
+    await acuerdoEscrito;
+    // La exportación arranca AHORA: después de `acordado_en`, antes del commit.
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    commitea();
+    await registro;
+
+    const [reg] = await sqlAdmin()`select r.creado_en > a.acordado_en as reloj_dice_que_si,
+        r.completado_en is not null as completa, r.acuerdo_version_visto
       from exportacion_registro r, acuerdo_disposicion a
       where r.workspace_id = ${ws} and a.workspace_id = ${ws}`;
-    expect(reg!.empezo_antes).toBe(true);
-    expect(reg!.termino_despues).toBe(true);
+    // El reloj dice que sí y la fila está completa: con la comparación de relojes, pasaba.
+    expect(reg!.reloj_dice_que_si).toBe(true);
+    expect(reg!.completa).toBe(true);
+    // Pero no vio el acuerdo, y por tanto tampoco su evento de auditoría.
+    expect(reg!.acuerdo_version_visto).toBeNull();
 
-    // …y aun así no acredita nada, porque su foto es anterior a lo pactado.
-    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/EMPEZÓ antes/);
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/no llegó a VER/);
     await expect(
       ejecutarDisposicion(leadId, {
         workspaceId: ws,
         modalidadEsperada: 'borrado',
         acuerdoVersionEsperada: 1,
+        confirmacion: 'BORRAR',
       }),
-    ).rejects.toThrow(/EMPEZÓ antes/);
+    ).rejects.toThrow(/no llegó a VER/);
     const [seg] = await sqlAdmin()`select count(*)::int as n from segmento
       where workspace_id = ${ws}`;
     expect(seg!.n).toBe(1);
 
-    // Exportando de nuevo —ahora sí, entera y después del acuerdo— se desbloquea.
+    // Exportando de nuevo —ahora sí, viendo el acuerdo— se desbloquea, y el registro lo dice.
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    const [vista] = await sqlAdmin()`select max(acuerdo_version_visto) as v
+      from exportacion_registro where workspace_id = ${ws}`;
+    expect(Number(vista!.v)).toBe(1);
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
+  });
+
+  it('un acuerdo NUEVO invalida la exportación que solo vio el anterior', async () => {
+    // El corolario del hecho anotado: no basta con que la exportación sea posterior a ALGÚN
+    // acuerdo, tiene que haber visto EL que se ejecuta. Con dos acuerdos seguidos y una sola
+    // exportación entre medias, la etiqueta y el reloj coincidían y la versión vista no.
+    const ws = await nuevoWorkspace('acuerdo-nuevo-invalida');
+    await acordarYExportar(ws, 'archivo', adminId);
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
+
+    await registrarAcuerdo(leadId, {
+      workspaceId: ws,
+      modalidad: 'archivo',
+      base: 'Acuerdo 2, sin exportar después',
+      efectivoDesde: new Date().toISOString().slice(0, 10),
+    });
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/no llegó a VER/);
+
     await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
+  });
+
+  it('una cuenta desactivada no dispone, ni por SQL crudo con su membresía viva', async () => {
+    /*
+     * `is_workspace_member` y `workspace_role` miran `miembro` y nada más, así que una cuenta
+     * puesta en `inactivo` que conserve su fila de membresía pasaba TODAS las puertas SQL.
+     * Con el grant que el rol de aplicación tiene sobre estas funciones, eso alcanzaba para
+     * registrar el acuerdo, autorizar y confirmar la exportación y ejecutar el borrado por SQL
+     * crudo, saltándose `exigirCuentaActiva`, que solo vive en el servicio. Cuarta aparición
+     * del mismo patrón: una promesa sostenida donde el grant permite rodearla.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('cuenta-inactiva');
+    await acordarYExportar(ws, 'borrado', adminId);
+
+    await admin`update usuario set estado = 'inactivo' where id = ${leadId}`;
+    try {
+      // Por el servicio: ya lo paraba `exigirCuentaActiva`.
+      await expect(
+        ejecutarDisposicion(leadId, {
+          workspaceId: ws,
+          modalidadEsperada: 'borrado',
+          acuerdoVersionEsperada: 1,
+          confirmacion: 'BORRAR',
+        }),
+      ).rejects.toThrow();
+
+      // Y por SQL crudo, que es la puerta que estaba abierta: las tres.
+      await expect(
+        conUsuario(leadId, (tx) => tx`select ejecutar_disposicion(${ws}, 1)`),
+      ).rejects.toMatchObject({ code: '42501' });
+      await expect(
+        conUsuario(leadId, (tx) => tx`select registrar_exportacion(${ws}, 'archivo')`),
+      ).rejects.toMatchObject({ code: '42501' });
+      await expect(
+        conUsuario(leadId, (tx) => tx`insert into acuerdo_disposicion
+          (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+          values (${ws}, 'archivo', 'Acuerdo de una cuenta apagada', current_date, ${leadId})`),
+      ).rejects.toMatchObject({ code: '42501' });
+
+      // Y el panel lo explica en vez de callarse.
+      expect((await panelDisposicion(adminId, ws)).motivoNoEjecutable).toBeTruthy();
+    } finally {
+      await admin`update usuario set estado = 'activo' where id = ${leadId}`;
+    }
+
+    // El workspace sigue entero.
+    const [seg] = await admin`select count(*)::int as n from segmento where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(1);
+  });
+
+  it('un borrado sin la palabra escrita no se ejecuta: el `disabled` del botón no es una comprobación', async () => {
+    /*
+     * `CONFIRMACION_BORRADO` se comprobaba SOLO en el estado `disabled` del botón, y no viajaba
+     * al servidor. Un atributo del DOM no es una comprobación: cualquier llamada al transporte
+     * —una pestaña vieja, un cliente mal cableado, un script— ejecutaba el borrado sin que
+     * nadie hubiera escrito nada, saltándose la que la propia pantalla declara como última
+     * defensa contra el error humano.
+     */
+    const ws = await nuevoWorkspace('sin-la-palabra');
+    await acordarYExportar(ws, 'borrado', adminId);
+
+    for (const intento of ['', 'borrar', 'BORRA', 'SÍ']) {
+      await expect(
+        ejecutarDisposicion(leadId, {
+          workspaceId: ws,
+          modalidadEsperada: 'borrado',
+          acuerdoVersionEsperada: 1,
+          confirmacion: intento,
+        }),
+      ).rejects.toThrow(/BORRAR/);
+    }
+    const [seg] = await sqlAdmin()`select count(*)::int as n from segmento
+      where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(1);
+
+    // Con la palabra, sí.
+    const c = await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'borrado',
+      acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
+    });
+    expect(c.modalidad).toBe('borrado');
+  });
+
+  it('un ARCHIVO no pide la palabra: la ceremonia va donde está el riesgo', async () => {
+    // Pedirla para algo reversible sería trámite sin riesgo detrás, y la ceremonia que se pide
+    // de más es la que se teclea sin leer.
+    const ws = await nuevoWorkspace('archivo-sin-palabra');
+    await acordarYExportar(ws, 'archivo', leadId);
+    const c = await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'archivo',
+      acuerdoVersionEsperada: 1,
+      confirmacion: '',
+    });
+    expect(c.modalidad).toBe('archivo');
   });
 
   it('la versión confirmada la exige la FUNCIÓN, no solo el servicio', async () => {
@@ -1079,6 +1208,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidadEsperada: 'archivo',
       acuerdoVersionEsperada: 1,
+      confirmacion: '',
     });
 
     const desajustes: string[] = [];
@@ -1124,6 +1254,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       workspaceId: ws,
       modalidadEsperada: 'borrado',
       acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
     });
 
     expect(c.remediacion).toEqual({ 'modelo-a': 2, 'modelo-b': 1 });

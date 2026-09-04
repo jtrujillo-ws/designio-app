@@ -310,7 +310,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * casteado y un paréntesis de más, así que hacen falta las dos formas del intervalo y un
      * nivel más de envoltura.
      */
-    const ARITMETICA = String.raw`(?:\s*[-+]\s*(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\d+))*`;
+    /*
+     * El operando del ajuste no es solo un literal de intervalo: `make_interval(days => 1)` y
+     * `interval '1 day' * 2` eligen día igual (medido) y el reconocedor se paraba ante ellos.
+     * Se admite una llamada a función, un literal, un número o un identificador, con
+     * multiplicaciones detrás.
+     *
+     * LÍMITE DECLARADO: una llamada con paréntesis ANIDADOS —`make_interval(days => f(1))`—
+     * no la cubre, porque contar paréntesis no es cosa de una expresión regular. Queda dicho
+     * aquí en vez de descubrirse.
+     */
+    // Un grupo entre paréntesis con UN nivel de anidamiento dentro, porque así llega del
+    // deparseador: `interval '1 day' * 2` se guarda como
+    // `('1 day'::interval * (2)::double precision)`, con el número casteado dentro de su
+    // propio paréntesis. Escribiendo solo la forma fuente, la del catálogo se escapaba.
+    const GRUPO = String.raw`\([^()]*(?:\([^()]*\)[^()]*)*\)`;
+    const OPERANDO_ARITMETICO = String.raw`(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*[\w.]+(?:\s*::\s*[\w ]+)?)*`;
+    const ARITMETICA = String.raw`(?:\s*[-+]\s*${OPERANDO_ARITMETICO})*`;
     const NUCLEO = entreParentesis(RELOJES) + CASTOS + ARITMETICA;
     const RELOJ = entreParentesis(entreParentesis(NUCLEO)) + CASTOS;
 
@@ -351,7 +367,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * es el caso —ahí lo que importa es la promoción de un temporal sin huso— así que el
      * operando de aquellas sigue siendo el otro.
      */
-    const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:text|varchar|char)\b${PRECISION}`;
+    /*
+     * Los nombres COMPLETOS: `character varying` y `character` son como se escribe en SQL
+     * estándar y como Postgres deparsea `varchar`. De más largo a más corto, que si no
+     * `character` casa dentro de `character varying` y deja el resto suelto.
+     *
+     * Y el texto tiene una salida: si el cast a texto es solo un PASO y se vuelve a un tipo
+     * CON huso, la ida y vuelta recupera el mismo instante —medido: `now()::text::timestamptz`
+     * es estable, porque la representación lleva el desfase—. Marcar eso sería un falso
+     * positivo sobre una serialización correcta. Volver a un tipo SIN huso sigue eligiendo
+     * calendario (`now()::text::date` depende, medido), y ese lo caza el destino de siempre.
+     */
+    const TIPO_TEXTUAL = String.raw`character\s+varying\b${PRECISION}|character\b${PRECISION}|varchar\b${PRECISION}|bpchar\b${PRECISION}|text\b`;
+    // Con un `)` opcional en medio: Postgres deparsea `now()::text::timestamptz` como
+    // `((now())::text)::timestamp with time zone`, o sea que el cast de vuelta NO va pegado al
+    // nombre del tipo sino detrás del paréntesis que cierra. Sin admitirlo, la forma del
+    // CATÁLOGO —la única que las sondas pueden ejercitar— salía marcada igual.
+    const VUELTA_CON_HUSO = String.raw`(?!\s*\)?\s*::\s*(?:timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b))`;
+    const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:${TIPO_TEXTUAL})${VUELTA_CON_HUSO}`;
 
     /*
      * Y un operando cuyo tipo NO lleva huso, en las dos formas que se pueden leer del texto:
@@ -438,7 +471,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'i',
       ),
       new RegExp(
-        String.raw`(${RELOJ})\s+(?:not\s+)?between\b[^;]*?\band\s+(${OPERANDO_SIN_HUSO})`,
+        // El hueco entre los dos límites no puede CRUZAR un `and`: con `[^;]*?` el patrón
+        // alcanzaba cualquier `and` posterior, y `now() between <tz> and <tz> and date … = …`
+        // —segura, medida— salía marcada por la condición de al lado. Con la clase templada,
+        // el `and` que encuentra es el del propio ternario.
+        String.raw`(${RELOJ})\s+(?:not\s+)?between\b(?:(?!\band\b)[^;])*?\band\s+(${OPERANDO_SIN_HUSO})`,
         'i',
       ),
     ];
@@ -487,8 +524,33 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       const d = texto[i + 1];
       // Comentario de bloque, igual en los dos dialectos.
       if (c === '/' && d === '*') {
-        const fin = texto.indexOf('*/', i + 2);
-        i = fin === -1 ? texto.length : fin + 2;
+        /*
+         * PostgreSQL ANIDA los comentarios de bloque: un bloque abierto dentro de otro exige
+         * DOS cierres, y comprobado que un `select` con uno dentro de otro devuelve su valor
+         * sin quejarse. Con `indexOf` del primer cierre, el recorrido salía en el INTERIOR. Lo
+         * que
+         * viene después sigue comentado, así que un `--` de ahí se tomaba por comentario de
+         * línea y se llevaba por delante el código real que hubiera detrás: el censo volvía a
+         * dejar de mirar. Se cuenta la profundidad.
+         *
+         * (El ejemplo no se escribe aquí dentro a propósito: un cierre de bloque dentro de un
+         * comentario de bloque lo termina, y me costó un fichero sin compilar. La sonda lo
+         * lleva, que es donde tiene que estar.)
+         *
+         * En TypeScript no anidan, pero contar la profundidad tampoco estorba ahí: `/*`
+         * dentro de un bloque no es válido en ninguno de los dos.
+         */
+        let hondura = 1;
+        i += 2;
+        while (i < texto.length && hondura > 0) {
+          if (texto[i] === '/' && texto[i + 1] === '*') {
+            hondura++;
+            i += 2;
+          } else if (texto[i] === '*' && texto[i + 1] === '/') {
+            hondura--;
+            i += 2;
+          } else i++;
+        }
         salida += ' ';
         continue;
       }
@@ -676,6 +738,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       tipo: 'timestamptz',
       culpable: false,
     },
+    // La ida y vuelta por TEXTO recupera el mismo instante —la representación lleva el
+    // desfase— así que marcarla sería un falso positivo sobre una serialización correcta.
+    censo_probe_ok_texto_vuelta: {
+      expr: 'now()::text::timestamptz',
+      tipo: 'timestamptz',
+      culpable: false,
+    },
     // Con precisión sigue conservando el instante (medido comparando el VALOR): se guarda
     // como `(now())::timestamp(0) with time zone`, y esa forma es la que el guardia del huso
     // marcaba en falso cuando iba detrás de la precisión.
@@ -707,6 +776,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // el barrido de comentarios respeta el literal.
     censo_probe_guion_en_literal: {
       expr: "('--' || (now())::date::text)",
+      tipo: 'text',
+      culpable: true,
+    },
+    // El ajuste con una LLAMADA y con una multiplicación: el operando de la aritmética no es
+    // solo un literal de intervalo. Medidas las dos.
+    censo_probe_make_interval: {
+      expr: '(now() + make_interval(days => 1))::date',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_interval_mult: {
+      expr: "(now() + interval '1 day' * 2)::date",
+      tipo: 'date',
+      culpable: true,
+    },
+    // El nombre SQL completo del tipo textual, que es como Postgres deparsea `varchar`.
+    censo_probe_character_varying: {
+      expr: 'cast(now() as character varying)',
       tipo: 'text',
       culpable: true,
     },
@@ -851,6 +938,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // medio. Medido: el primero da false en UTC+14 y true en UTC-12.
       "now() between timestamptz '2020-01-01 00:00+00' and date '2026-09-04'",
       "now() not between timestamptz '2020-01-01 00:00+00' and '2026-09-04'::date",
+      // La aritmética con llamada y con multiplicación.
+      '(now() + make_interval(days => 1))::date',
+      "(now() + interval '1 day' * 2)::date",
+      // Y los nombres completos del tipo textual.
+      'cast(now() as character varying)',
+      'now()::character varying',
+      'now()::character(10)',
+      // El texto que NO vuelve a un tipo con huso sigue eligiendo día.
+      'now()::text::date',
       // La aritmética antes del colapso.
       "(now() + interval '1 day')::date",
       "((now() + '1 day'::interval))::date",
@@ -914,6 +1010,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'now() < creado_en',
       // Y comparar dos FECHAS tampoco: ninguna tiene huso del que moverse.
       "fecha_de_la_base() = date '2026-09-04'",
+      // El `and` de al lado no es el límite superior del `between`. Medida: estable.
+      "now() between timestamptz '2020-01-01+00' and timestamptz '2030-01-01+00' and date '2026-09-04' = fecha_de_la_base()",
+      // La ida y vuelta por texto conserva el instante (medido).
+      'now()::text::timestamptz',
+      'now()::text::timestamp with time zone',
       "(now() at time zone 'UTC')::date = date '2026-09-04'",
       // Un intervalo sobre un valor que NO es reloj no colapsa ningún calendario.
       "(vence_en + interval '1 day')::date",
@@ -956,6 +1057,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * sesión igual que una función. Va aparte porque su sintaxis lo es. */
     await admin`create procedure censo_probe_procedimiento()
       language plpgsql as $$ begin perform current_date; end $$`;
+    /*
+     * Y el comentario de bloque ANIDADO, que tiene que ir en plpgsql y no en un cuerpo SQL.
+     * Mi primera sonda tenía cuerpo SQL con un comentario dentro, y no probaba NADA: un
+     * cuerpo SQL se guarda como ÁRBOL ANALIZADO, así que `pg_get_functiondef` lo devuelve sin
+     * comentarios —comprobado: sale `RETURN (SELECT (now())::date AS now)`— y el recorrido
+     * nunca veía uno. Un cuerpo plpgsql sí se guarda VERBATIM, comentarios incluidos.
+     *
+     * TODO EN UNA LÍNEA, y esto costó una segunda pasada: con el cierre exterior en su propio
+     * renglón, el recorrido roto salía en el interior, se comía una línea con el `--` y el
+     * `perform` de la siguiente SEGUÍA visible — la sonda no perdía nada y por tanto no probaba
+     * nada. En una línea, el `--` que sigue al cierre interior se lleva por delante el resto,
+     * cierre exterior y `perform` incluidos, que es justo la pérdida que hay que enseñar.
+     */
+    await admin.unsafe(
+      'create function censo_probe_bloque_anidado() returns void language plpgsql as $c$ ' +
+        'begin /* fuera /* dentro */ -- sigue fuera */ perform (now())::date; end $c$',
+    );
     try {
       // `pg_get_functiondef` y no `prosrc`, y `prokind = 'f'` porque aquél no acepta
       // agregados ni funciones de ventana.
@@ -989,6 +1107,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
             .filter(([, v]) => v.culpable)
             .map(([n]) => n),
           'censo_probe_procedimiento',
+          'censo_probe_bloque_anidado',
         ].sort(),
       );
     } finally {
@@ -996,6 +1115,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         await admin.unsafe(`drop function ${nombre}()`);
       }
       await admin`drop procedure censo_probe_procedimiento()`;
+      await admin`drop function censo_probe_bloque_anidado()`;
     }
   });
 

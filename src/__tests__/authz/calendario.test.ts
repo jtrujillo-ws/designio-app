@@ -480,7 +480,27 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * Sin admitirlas, el censo marcaba código correcto.
      */
     const unidadSegura = (lista: string) =>
-      String.raw`(?:\(\s*)?(?:'(?:${lista})'(?:\s*::\s*[\w. ]+)?|cast\s*\(\s*'(?:${lista})'\s+as\s+[\w. ]+\s*\))(?:\s*\))?`;
+      envuelto(
+        String.raw`${literalDe(lista)}|cast\s*\(\s*${PREFIJO}'(?:${lista})'\s+as\s+[\w. ]+\s*\)`,
+      );
+    /*
+     * La gramática de un LITERAL de SQL, en un solo sitio. Había cuatro reconocedores de «lo
+     * seguro» —la unidad, el campo de `extract`, el formato de `to_char` y el huso fijo— y
+     * cada uno aprendía por su cuenta: solo el del campo sabía de prefijos, así que
+     * `date_trunc(E'second', …)`, `to_char(now(), 'US'::text)` y `date_trunc(…, E'UTC')`
+     * —los tres estables, medidos por epoch— salían marcados.
+     *
+     * Es la misma lección que el predicado de las transacciones en el otro censo: si el
+     * criterio vive en cuatro sitios, aprende en uno y se queda viejo en tres.
+     *
+     * El prefijo se admite y NO relaja nada: el contenido tiene que seguir siendo el nombre
+     * seguro tal cual, así que un `E'seco\x6ed'` —que vale «second»— no se declara seguro y
+     * se marca. De más, no de menos.
+     */
+    const PREFIJO = String.raw`[A-Za-z_]*&?`;
+    const CASTO = String.raw`(?:\s*::\s*[\w. ]+)?`;
+    const literalDe = (contenido: string) => String.raw`${PREFIJO}'(?:${contenido})'${CASTO}`;
+    const envuelto = (x: string) => String.raw`(?:\(\s*)?(?:${x})(?:\s*\))?`;
     const PRIMER_ARGUMENTO = String.raw`(?:[^,()]|\([^()]*\))*`;
     /*
      * `date_trunc` tiene una sobrecarga de TRES argumentos, y el tercero es el huso. Con un
@@ -494,7 +514,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * —donde no hay literal— y pasa. Una aserción negativa detrás de algo opcional no asegura
      * nada; ya lo tenía escrito de otra vuelta y volví a hacerlo.
      */
-    const HUSO_FIJO = String.raw`'[^']*'(?:\s*::\s*[\w. ]+)?\s*\)`;
+    const HUSO_FIJO = String.raw`${literalDe(String.raw`[^']*`)}\s*\)`;
     /*
      * Y el FORMATO de `to_char`, que hasta ahora no se miraba: se marcaba cualquier `to_char`
      * con un reloj delante, y hay formatos que no leen el calendario —`'"fijo"'` devuelve
@@ -515,7 +535,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * detrás otra letra o dígito: sin esa guardia se leería como `SS` + `SS` y pasaría por
      * seguro.
      */
-    const FORMATO_SEGURO = String.raw`'(?:"[^"]*"|[^A-Za-z0-9"']|(?:SS|MS|US|FF[1-6])(?![A-Za-z0-9]))*'`;
+    const FORMATO_SEGURO = literalDe(
+      String.raw`(?:"[^"]*"|[^A-Za-z0-9"']|(?:SS|MS|US|FF[1-6])(?![A-Za-z0-9]))*`,
+    );
     RELOJ_COLAPSADO_A_DIA = [
       // El cast al tipo sin huso, en sus cuatro formas de una sola vez: `now()::date` tal como
       // se escribe, `(now())::date` tal como Postgres la devuelve —y a la que reduce también
@@ -592,7 +614,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * Lo cazó su propia sonda segura, que para eso está.
        */
       new RegExp(
-        String.raw`extract\s*\(\s*(?!(?:(?:${CAMPOS_SEGUROS})\b|[A-Za-z_]*&?'(?:${CAMPOS_SEGUROS})')\s*from)(?:[A-Za-z_]*&?'[^']*'|\w+)\s+from\s+(${RELOJ})`,
+        String.raw`extract\s*\(\s*(?!(?:(?:${CAMPOS_SEGUROS})\b|${literalDe(CAMPOS_SEGUROS)})\s*from)(?:${literalDe(String.raw`[^']*`)}|\w+)\s+from\s+(${RELOJ})`,
         'i',
       ),
       // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
@@ -1182,6 +1204,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "date_trunc('day', now(), current_setting('TimeZone'))",
       // Y el campo con PREFIJO, que es otra forma válida de escribir el mismo literal.
       "extract(E'dow' from now())",
+      // El prefijo no vuelve segura una unidad peligrosa, ni un contenido escapado la iguala.
+      "date_trunc(E'day', now())",
+      "to_char(now(), E'YYYY'::text)",
       // El formato de `to_char` que SÍ lee el calendario, y `SSSS` —segundos desde
       // medianoche— que sin la guardia de frontera se leería como dos `SS` seguros.
       "to_char(now(), 'SSSS')",
@@ -1355,6 +1380,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Y las envolturas que no cambian la unidad segura.
       "date_trunc(('second'), now())",
       "date_trunc('second'::pg_catalog.text, now())",
+      // Y las mismas formas SEGURAS escritas con prefijo o con cast, que es la gramática común
+      // del literal. Las cuatro medidas por epoch: iguales en los dos husos.
+      "date_trunc(E'second', now())",
+      "date_part(E'epoch', now())",
+      "date_trunc('day', now(), E'UTC')",
+      "to_char(now(), 'US'::text)",
       // Y los formatos que NO leen el calendario: texto entrecomillado y campos por debajo
       // del minuto (ningún huso tiene desfase con segundos — medido sobre los 499).
       "to_char(now(), '\"fijo\"')",

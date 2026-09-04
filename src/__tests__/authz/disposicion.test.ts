@@ -2240,6 +2240,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       // La tabla se siembra AQUÍ y no en la declaración: `tablaDe` usa `desenvolver`, que se
       // define más abajo, y llamarla antes muere en la zona muerta temporal.
       for (const [k, v] of tablaDe(fuente)) porNombre.set(k, v);
+      // Y los ALIAS por la misma vía, para que la versión local y la que se usa con los
+      // módulos ajenos no puedan divergir. Hoy dan lo mismo; el motivo de unificarlas es que
+      // esta forma —un criterio repetido que aprende en un sitio y envejece en el otro— ya ha
+      // producido cuatro hallazgos hoy entre los dos censos, dos de ellos huecos.
+      for (const [k, v] of aliasDe(fuente)) alias.set(k, v);
       for (const st of fuente.statements) {
         if (ts.isFunctionDeclaration(st)) {
           /*

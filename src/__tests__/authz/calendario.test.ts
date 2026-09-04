@@ -313,7 +313,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       String.raw`timetz\b${PRECISION}`,
       String.raw`time\b${PRECISION}\s+with\s+time\s+zone\b`,
     ].join('|');
-    const CASTOS = String.raw`(?:\s*::\s*(?:${TIPO_DE_TIEMPO}))*`;
+    /*
+     * Un nombre de tipo puede ir CALIFICADO con su esquema: `now()::pg_catalog.date` elige día
+     * igual —medido: distinto en Kiritimati y en Etc/GMT+12— y se escapaba porque los tipos se
+     * escribían sin admitir el punto. Va en un solo sitio y lo usan TODOS los sitios donde se
+     * consume un nombre de tipo, que es la lección de esta ronda.
+     */
+    const ESQUEMA = String.raw`(?:\w+\s*\.\s*)?`;
+    const CASTOS = String.raw`(?:\s*::\s*${ESQUEMA}(?:${TIPO_DE_TIEMPO}))*`;
     const entreParentesis = (x: string) => String.raw`(?:${x}|\(\s*(?:${x})\s*\))`;
     /*
      * Y la ARITMÉTICA, porque una garantía ajusta el instante antes de colapsarlo:
@@ -382,7 +389,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * no es cosa de una expresión regular. Queda dicho aquí en vez de descubrirse.
      */
     const RELOJ_COMO_OPERANDO = entreParentesis(entreParentesis(RELOJES) + CASTOS);
-    const OPERANDO_ARITMETICO = String.raw`(?!\s*(?:${RELOJ_COMO_OPERANDO}))(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*(?:${GRUPO}|[\w.]+)${CASTO})*`;
+    const OPERANDO_ARITMETICO = String.raw`(?!\s*(?:${RELOJ_COMO_OPERANDO}))(?:interval\s*'[^']*'|${PREFIJO}'[^']*'\s*::\s*${ESQUEMA}interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*(?:${GRUPO}|[\w.]+)${CASTO})*`;
     const ARITMETICA = String.raw`(?:\s*[-+]\s*${OPERANDO_ARITMETICO})*`;
     const NUCLEO = entreParentesis(RELOJES) + CASTOS + ARITMETICA;
     const RELOJ = entreParentesis(entreParentesis(NUCLEO)) + CASTOS;
@@ -458,7 +465,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * LÍMITE DECLARADO: ese mismo alias dentro de un paréntesis —`(select now()::text as
      * timestamptz)`— se leería como cast y se escaparía.
      */
-    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*(?:${TIPO_CON_HUSO})|as\s+(?:${TIPO_CON_HUSO})\s*\)))`;
+    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})|as\s+${ESQUEMA}(?:${TIPO_CON_HUSO})\s*\)))`;
     const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:${TIPO_TEXTUAL})${VUELTA_CON_HUSO}`;
 
     /*
@@ -473,7 +480,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * `vence_en date` se le escapa. Lo que sí cubre es la forma en que aparece escrita una
      * garantía: un literal o un cast.
      */
-    const OPERANDO_SIN_HUSO = String.raw`(?:${TIPO_SIN_HUSO}\s*'[^']*'|(?:'[^']*'|[\w."]+)\s*::\s*${TIPO_SIN_HUSO})`;
+    const OPERANDO_SIN_HUSO = String.raw`(?:${TIPO_SIN_HUSO}\s*${PREFIJO}'[^']*'|(?:${PREFIJO}'[^']*'|[\w."]+)\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO}))`;
     const COMPARADOR = String.raw`(?:<=|>=|<>|!=|<|>|=)`;
 
     /*
@@ -549,9 +556,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       //
       // NO marca `(timezone('UTC'::text, now()))::date`: ahí el paréntesis que precede al
       // `::` es el de `timezone`, y `timezone` no es un reloj — el reloj va envuelto.
-      new RegExp(String.raw`(${RELOJ})\s*::\s*(?:${DESTINO_QUE_ELIGE})`, 'i'),
+      new RegExp(String.raw`(${RELOJ})\s*::\s*${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
-      new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+(?:${DESTINO_QUE_ELIGE})`, 'i'),
+      new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `date(now())`, la tercera forma de escribir la misma conversión.
       new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJ})\s*\)`, 'i'),
       /*
@@ -1207,6 +1214,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // El prefijo no vuelve segura una unidad peligrosa, ni un contenido escapado la iguala.
       "date_trunc(E'day', now())",
       "(now() + interval '1 day' * (2)::pg_catalog.float8)::date",
+      "(now() + '1 day'::pg_catalog.interval)::date",
+      "current_timestamp < '2026-09-05'::pg_catalog.date",
+      'now()::pg_catalog.date',
       "to_char(now(), E'YYYY'::text)",
       // El formato de `to_char` que SÍ lee el calendario, y `SSSS` —segundos desde
       // medianoche— que sin la guardia de frontera se leería como dos `SS` seguros.
@@ -1387,6 +1397,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "date_part(E'epoch', now())",
       "date_trunc('day', now(), E'UTC')",
       "to_char(now(), 'US'::text)",
+      'now()::text::pg_catalog.timestamptz',
       // Y los formatos que NO leen el calendario: texto entrecomillado y campos por debajo
       // del minuto (ningún huso tiene desfase con segundos — medido sobre los 499).
       "to_char(now(), '\"fijo\"')",

@@ -841,10 +841,22 @@ begin
   -- clase de afirmación sin atar que el resto de este esquema no acepta. Así que quien
   -- registra y quien ejecuta tienen que ser partes DISTINTAS —la organización cliente
   -- (admin-cliente, RF-01.4) y la boutique que opera (lead-boutique, RF-01.1)—, y la
-  -- constancia acredita entonces dos voluntades. Roles distintos implica personas
-  -- distintas: una persona tiene exactamente una membresía por workspace.
+  -- constancia acredita entonces dos voluntades.
+  --
+  -- Se comprueban LAS DOS COSAS —el rol y la identidad— y no solo el rol, que es lo que
+  -- había. El argumento escrito aquí era «roles distintos implica personas distintas: una
+  -- persona tiene exactamente una membresía por workspace», y es falso EN EL TIEMPO: la
+  -- unicidad impide dos roles a la vez, no cambiar de rol entre un acto y el otro. El acuerdo
+  -- congela `acordado_rol` al firmarse, así que quien registró el borrado como admin-cliente y
+  -- pasó después a lead-boutique aparecía como «la otra parte» y podía ejecutar el borrado
+  -- irreversible aportando él solo las dos firmas. La identidad no cambia con el rol, y por eso
+  -- es ella la que cierra el caso.
+  --
   -- El `archivo` no lo exige y no es una inconsistencia: es reversible, no destruye nada, y
   -- pedir dos firmas para cerrar un workspace a escrituras sería trámite sin riesgo detrás.
+  if v_ac.modalidad = 'borrado' and app_user_id() = v_ac.acordado_por then
+    return 'Un borrado acordado exige constancia de las DOS partes, y este acuerdo lo registraste tú: lo ejecuta la otra parte del contrato, aunque tu rol haya cambiado desde entonces';
+  end if;
   if v_ac.modalidad = 'borrado' and v_rol = v_ac.acordado_rol then
     return format('Un borrado acordado exige constancia de las dos partes: el acuerdo vigente lo registró %s, así que lo ejecuta la otra parte (%s)',
       v_ac.acordado_rol,

@@ -1067,6 +1067,55 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
   });
 
+  it('cambiar de rol no convierte a una persona en las DOS partes de un borrado', async () => {
+    /*
+     * La doble firma se comprobaba solo por el ROL, con este argumento escrito en la
+     * migración: «roles distintos implica personas distintas, porque una persona tiene
+     * exactamente una membresía por workspace». Es cierto en un instante y falso EN EL TIEMPO:
+     * la unicidad impide dos roles a la vez, no cambiar de rol entre un acto y el otro. El
+     * acuerdo congela `acordado_rol` al firmarse, así que quien registró el borrado como
+     * admin-cliente y pasó después a lead-boutique aparecía como «la otra parte» y aportaba él
+     * solo las dos firmas de una operación irreversible.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('rol-cambiante');
+
+    // El acuerdo lo registra `adminId` con rol admin-cliente…
+    await acordarYExportar(ws, 'borrado', adminId);
+    const [ac] = await admin`select acordado_rol, acordado_por from acuerdo_disposicion
+      where workspace_id = ${ws}`;
+    expect(ac!.acordado_rol).toBe('admin-cliente');
+    expect(ac!.acordado_por).toBe(adminId);
+
+    // …y después su membresía pasa a lead-boutique. El acuerdo conserva el rol de entonces.
+    await admin`update miembro set rol = 'lead-boutique'
+      where workspace_id = ${ws} and usuario_id = ${adminId}`;
+    await admin`delete from miembro where workspace_id = ${ws} and usuario_id = ${leadId}`;
+
+    // Su rol ya NO coincide con el del acuerdo, así que la comprobación vieja lo dejaba pasar.
+    const [rolAhora] = await conUsuario(adminId, (tx) =>
+      tx`select workspace_role(app_user_id(), ${ws}) as rol`);
+    expect(rolAhora!.rol).toBe('lead-boutique');
+    expect(rolAhora!.rol).not.toBe(ac!.acordado_rol);
+
+    // Y aun así no puede: la identidad no cambia con el rol.
+    expect((await panelDisposicion(adminId, ws)).motivoNoEjecutable).toMatch(/registraste tú/i);
+    await expect(
+      ejecutarDisposicion(adminId, {
+        workspaceId: ws,
+        modalidadEsperada: 'borrado',
+        acuerdoVersionEsperada: 1,
+        confirmacion: 'BORRAR',
+      }),
+    ).rejects.toThrow(/registraste tú/i);
+    await expect(
+      conUsuario(adminId, (tx) => tx`select ejecutar_disposicion(${ws}, 1)`),
+    ).rejects.toMatchObject({ code: 'DS002' });
+
+    const [seg] = await admin`select count(*)::int as n from segmento where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(1);
+  });
+
   it('una cuenta desactivada no dispone, ni por SQL crudo con su membresía viva', async () => {
     /*
      * `is_workspace_member` y `workspace_role` miran `miembro` y nada más, así que una cuenta

@@ -156,6 +156,12 @@ function PantallaDisposicion() {
   const versionVigente = panel?.acuerdoVigente?.version;
   useEffect(() => {
     setConfirmacion('');
+    // Y la constancia recién emitida, por lo mismo. La expresión que decide qué documento se
+    // pinta prefiere SIEMPRE el estado local sobre `panel.constanciaVigente`, así que tras
+    // ejecutar un archivo y registrar acto seguido el acuerdo que lo revierte, la pantalla
+    // seguía enseñando la constancia del #1 junto al acuerdo #2 —aunque la consulta ya
+    // devolviera null—. Arreglar la consulta no alcanzaba a esa precedencia.
+    setConstancia(null);
   }, [versionVigente]);
 
   async function acordar() {

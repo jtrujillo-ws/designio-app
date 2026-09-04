@@ -44,8 +44,28 @@ async function appDbLista(): Promise<boolean> {
   let sql: ReturnType<typeof postgres>;
   try {
     sql = postgres(url, { max: 1, connect_timeout: 5, onnotice: () => {} });
-  } catch (e) {
-    console.error('healthz: DATABASE_URL_APP no es una URL de conexión válida', e);
+  } catch {
+    /*
+     * El error NO se imprime, y esto lo encontró la revisión de este mismo arreglo: el
+     * mensaje de `postgres()` lleva dentro la cadena que no pudo parsear. La libreria la
+     * redacta cuando RECONOCE un DSN —«<redacted> cannot be parsed as a URL»—, pero cuando la
+     * cadena no parece una URL en absoluto la imprime verbatim, y ese es justo el caso que
+     * llega aqui. Medido:
+     *
+     *   'postgresql://usuario:CLAVE@host / 5432/db'          -> <redacted>, no filtra
+     *   '{{Postgres.DATABASE_URL}} usuario:CLAVE'            -> la imprime ENTERA
+     *
+     * La segunda forma es la realista en un despliegue: una referencia sin resolver pegada a
+     * otra cosa. Los registros de la plataforma se conservan, asi que habria dejado la
+     * contrasena del rol de aplicacion escrita ahi para siempre — y por un log que anadi
+     * para EXPLICAR el fallo.
+     *
+     * No se pierde diagnostico: la causa ya esta dicha entera. Que la variable no parsea es
+     * todo lo que hay que saber, y quien opera sabe cual es su valor sin que se lo repitan.
+     */
+    console.error(
+      'healthz: DATABASE_URL_APP no es una URL de conexión válida (se omite el valor: llevaría la contraseña del rol)',
+    );
     return false;
   }
   try {

@@ -189,6 +189,24 @@ create table exportacion_registro (
    */
   acuerdo_version_visto integer check (acuerdo_version_visto is null
                                        or acuerdo_version_visto >= 1),
+  /*
+   * Qué HABÍA en el workspace cuando este archivo se generó, tabla por tabla, leído bajo la
+   * MISMA instantánea que el volcado. `null` en un `entregable`: solo el archivo completo
+   * acredita una disposición, y cobrarle a un entregable la lectura entera del workspace sería
+   * pagar por una prueba que nunca se usa.
+   *
+   * Sin esto, «hay exportación previa» era un hecho del PASADO que nadie volvía a comprobar.
+   * Entre exportar y disponer el workspace NO está congelado —la congelación arranca con la
+   * constancia, y la constancia nace al EJECUTAR—, así que se sigue trabajando en él con toda
+   * normalidad; y el borrado se llevaba por delante lo escrito en esa ventana, que no viajó en
+   * ningún archivo. RF-01.9 no pide haber exportado alguna vez: pide disponer DESPUÉS de
+   * entregar, y eso solo es cierto si lo que se destruye es lo que se entregó.
+   *
+   * Viaja además DENTRO del propio archivo —el catálogo de exportación vuelca esta tabla—, así
+   * que el inventario que sostiene la disposición se puede comprobar sin la base, igual que el
+   * sello de la constancia.
+   */
+  inventario jsonb,
   unique (id, workspace_id)
 );
 comment on table exportacion_registro is
@@ -288,7 +306,10 @@ begin
          -- instantánea, así que este `max` es literalmente «el último acuerdo que este
          -- archivo pudo ver», se lea antes o después del volcado.
          acuerdo_version_visto = (select max(a.version) from acuerdo_disposicion a
-                                  where a.workspace_id = p_ws)
+                                  where a.workspace_id = p_ws),
+         -- Bajo esa misma instantánea, y por eso el inventario dice qué se ENTREGÓ y no qué
+         -- hay ahora. Solo para el archivo completo: es el único que acredita una disposición.
+         inventario = case when p_ambito = 'archivo' then inventario_del_workspace(p_ws) end
    where workspace_id = p_ws and ambito = p_ambito
      and completado_en is null
      and xmin = pg_current_xact_id()::xid;
@@ -574,6 +595,68 @@ language sql stable as $$
   where t.tabla not in ('acuerdo_disposicion', 'constancia_disposicion', 'evento_dominio',
                         'exportacion_registro')
 $$;
+
+-- ── Qué había en el workspace, en un valor comparable ─────────────────────────────────
+/*
+ * El conjunto es el de la CONGELACIÓN y no el del borrado, y la simetría es el argumento: lo
+ * que la disposición deja quieto DESPUÉS es exactamente lo que la exportación tenía que haber
+ * visto ANTES. Las cuatro exclusiones valen igual en los dos sentidos — el acuerdo y la
+ * constancia son la disposición, no su contenido; el libro de auditoría y el registro de
+ * exportaciones crecen por su cuenta, y el libro crece con solo CONSULTAR el workspace, así
+ * que exigirlos idénticos haría que un archivo valiese únicamente si nadie lo miró. Lo que un
+ * borrado se lleva de ellos tras el archivo es el registro de haberlo consultado; re-exportar
+ * justo antes de ejecutar también lo captura.
+ *
+ * Por tabla, cuántas filas y una huella de su CONTENIDO. El conteo solo no bastaba: editar una
+ * fila —o borrar una y crear otra— lo deja igual, y el archivo se queda con la versión
+ * anterior. La huella es una SUMA de hashes y no un `string_agg` con `md5`, a propósito: no
+ * depende del orden de lectura, no materializa el workspace entero en memoria —aquí hay
+ * adjuntos en `bytea`— y detecta el cambio, que es lo que se pregunta. No es un sello contra
+ * quien fabrique colisiones y no tiene por qué serlo: quien puede escribir en el workspace
+ * puede borrar directamente lo que quiera, sin colisión ninguna.
+ *
+ * Y la representación la fija ESTA función, no la sesión que llama. `fila::text` de un
+ * `timestamptz` cambia con `TimeZone`, el de una `date` con `DateStyle`, el de un `bytea` con
+ * `bytea_output`: sin fijarlos, exportar desde una sesión y ejecutar desde otra darían huellas
+ * distintas sobre datos IDÉNTICOS, y la disposición se bloquearía sola. Se fijan los seis GUC
+ * que mueven la salida TEXTO de un tipo base, no solo los de los tipos que hoy existen: el
+ * conjunto de tablas se deriva del catálogo, así que una columna nueva entra sola.
+ *
+ * Lo que sí invalida un archivo pendiente es una MIGRACIÓN que añada o quite una columna de
+ * una tabla con filas: cambia `fila::text` y con él la huella. Es la respuesta correcta —el
+ * archivo ya no describe la forma de la base— y el remedio es el mismo de siempre, volver a
+ * exportar; se deja escrito para que no se lea como un fallo.
+ */
+create function inventario_del_workspace(p_ws uuid) returns jsonb
+language plpgsql stable
+set search_path = public, pg_temp
+set timezone = 'UTC'
+set datestyle = 'ISO, YMD'
+set intervalstyle = 'iso_8601'
+set extra_float_digits = 3
+set bytea_output = 'hex'
+set lc_monetary = 'C'
+as $$
+declare
+  v_inv jsonb := '{}'::jsonb;
+  v_n bigint;
+  v_h numeric;
+  r record;
+begin
+  for r in select tabla from tablas_congelables() loop
+    execute format('select count(*), coalesce(sum(hashtextextended(t::text, 42)), 0)'
+                   ' from %I t where t.workspace_id = $1', r.tabla)
+      into v_n, v_h using p_ws;
+    -- Las tablas VACÍAS no entran. Así el inventario no cambia de forma porque nazca una tabla
+    -- nueva sin filas, que es el caso normal de una migración de slice: si trae contenido del
+    -- workspace, aparece y el archivo deja de valer —correcto, ese contenido no viajó—; si no,
+    -- el archivo de ayer sigue sirviendo.
+    if v_n > 0 then
+      v_inv := v_inv || jsonb_build_object(r.tabla, jsonb_build_object('n', v_n, 'h', v_h));
+    end if;
+  end loop;
+  return v_inv;
+end $$;
 
 -- ── Por qué aquí NO hay un ayudante SECURITY DEFINER ──────────────────────────────────
 -- Lo hubo. Las dos políticas se necesitaban mutuamente —la del acuerdo mira la constancia
@@ -1173,6 +1256,9 @@ declare
   v_ac acuerdo_disposicion;
   v_export timestamptz;
   v_conteos jsonb := '{}'::jsonb;
+  v_inv jsonb;
+  v_inv_previo jsonb;
+  v_dif text;
   v_remediacion jsonb := '{}'::jsonb;
   v_items integer := 0;
   v_con_consentimiento integer := 0;
@@ -1243,10 +1329,57 @@ begin
       v_ac.version, v_ac.modalidad, p_version_esperada using errcode = 'DS002';
   end if;
 
+  -- ── Y que la exportación siga siendo VERDAD ──
+  -- `disposicion_motivo_no_ejecutable` ya comprobó que existe un archivo completo que VIO este
+  -- acuerdo. Eso es un hecho del pasado. Lo que decide si puede destruirse el workspace es si
+  -- ese archivo sigue describiéndolo: entre exportar y disponer no hay congelación —la escribe
+  -- esta misma función, al certificar—, así que se siguió trabajando en él, y lo escrito en esa
+  -- ventana no está en ningún archivo. La exportación previa dejaba de ser una entrega para
+  -- pasar a ser un trámite cumplido una vez.
+  --
+  -- Va aquí y no en el motivo, y no es una excepción a «el panel dice por qué no se puede»:
+  -- el inventario LEE el workspace entero —adjuntos incluidos— y el panel se pinta en cada
+  -- visita. Sobre todo, tiene que leerse bajo el CANDADO, que el panel no toma. Bajo él no
+  -- queda ventana entre comprobar y destruir: todo escritor de una tabla congelable pide este
+  -- mismo candado en compartido (`congelacion_por_disposicion_guard`), así que mientras esta
+  -- transacción lo tiene, ni hay escritura en vuelo ni puede empezar ninguna.
+  --
+  -- Y la condición entra en el WHERE en vez de comprobarse después: así `v_export` —lo que la
+  -- constancia sella como `exportado_en`— nombra la exportación que de verdad la sostiene, y
+  -- no la última que hubo.
+  v_inv := inventario_del_workspace(p_ws);
   select max(xp.completado_en) into v_export from exportacion_registro xp
     where xp.workspace_id = p_ws and xp.ambito = 'archivo'
       and xp.completado_en is not null
-      and xp.acuerdo_version_visto = v_ac.version;
+      and xp.acuerdo_version_visto = v_ac.version
+      and xp.inventario = v_inv;
+  if v_export is null then
+    -- QUÉ cambió, y no solo que cambió: el remedio es volver a exportar, y quien lo hace merece
+    -- saber si le falta una fila o le sobran cincuenta. Se compara contra la última exportación
+    -- válida, que es la que estaba a punto de sostener esta constancia.
+    select xp.inventario into v_inv_previo from exportacion_registro xp
+      where xp.workspace_id = p_ws and xp.ambito = 'archivo'
+        and xp.completado_en is not null
+        and xp.acuerdo_version_visto = v_ac.version
+      order by xp.completado_en desc limit 1;
+    select string_agg(
+             format('«%s»: %s', k.tabla,
+               case when (v_inv_previo -> k.tabla ->> 'n')
+                         is distinct from (v_inv -> k.tabla ->> 'n')
+                    then format('%s filas al exportar, %s ahora',
+                                coalesce(v_inv_previo -> k.tabla ->> 'n', '0'),
+                                coalesce(v_inv -> k.tabla ->> 'n', '0'))
+                    -- Mismo número y distinta huella: se editó una fila, o se borró una y se
+                    -- creó otra. El archivo lleva entonces la versión anterior, que es una
+                    -- pérdida igual de real que la fila que falta.
+                    else 'las mismas filas, con el contenido cambiado' end),
+             ', ' order by k.tabla)
+      into v_dif
+      from jsonb_object_keys(coalesce(v_inv_previo, '{}'::jsonb) || v_inv) k(tabla)
+      where (v_inv_previo -> k.tabla) is distinct from (v_inv -> k.tabla);
+    raise exception 'el workspace cambió desde la exportación (%): lo que se destruiría no es lo que se entregó. Vuelve a exportar el archivo completo y ejecuta la disposición después', v_dif
+      using errcode = 'DS002';
+  end if;
 
   -- Remediación ANTES de tocar nada: lo que ya salió hacia un proveedor no lo alcanza este
   -- borrado, y el libro que lo sabe es de los que se vacían.
@@ -1429,6 +1562,7 @@ revoke execute on function
   tablas_del_workspace(),
   tablas_alcanzadas_por_borrado(),
   tablas_congelables(),
+  inventario_del_workspace(uuid),
   disposicion_vigente(uuid),
   workspace_borrado(uuid),
   disposicion_motivo_no_ejecutable(uuid),

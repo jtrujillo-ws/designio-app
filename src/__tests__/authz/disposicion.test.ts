@@ -480,6 +480,91 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       where workspace_id = ${ws}`;
     expect(tras!.n).toBe(0);
   });
+  it('lo que se destruye es lo que se entregó: una escritura posterior al archivo detiene la disposición', async () => {
+    // La exportación previa es la condición de RF-01.9, y hasta ahora se comprobaba que
+    // EXISTIERA y que hubiera VISTO el acuerdo. Faltaba la mitad que la vuelve una garantía:
+    // que siga siendo CIERTA cuando se ejecuta. Entre exportar y disponer el workspace no
+    // está congelado —la congelación arranca con la constancia, y la constancia nace al
+    // ejecutar—, así que se sigue trabajando en él con toda normalidad; y lo escrito en esa
+    // ventana no viajó en el archivo y un borrado se lo lleva por delante.
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('deriva');
+    await acordarYExportar(ws, 'borrado', adminId);
+
+    const ejecutar = () =>
+      ejecutarDisposicion(leadId, {
+        workspaceId: ws,
+        modalidadEsperada: 'borrado',
+        acuerdoVersionEsperada: 1,
+        confirmacion: 'BORRAR',
+      });
+
+    // ── Primero lo que un CONTEO no ve ──
+    // Se edita una fila que sí viajó en el archivo. Hay las mismas filas que había, así que un
+    // inventario que solo contase daría el visto bueno — y el archivo se habría quedado con la
+    // versión anterior, que es una pérdida tan real como la fila que falta.
+    await admin`update segmento set definicion = 'reescrita después del archivo'
+      where workspace_id = ${ws}`;
+    await expect(ejecutar()).rejects.toThrow(
+      /cambió desde la exportación.*«segmento»: las mismas filas, con el contenido cambiado/is,
+    );
+
+    // ── Y después lo que sí ve ──
+    await admin`insert into segmento (workspace_id, nombre, definicion)
+      values (${ws}, 'nacido despues del archivo', 'no viajó en la exportación')`;
+    await expect(ejecutar()).rejects.toThrow(
+      /«segmento»: 1 filas al exportar, 2 ahora/i,
+    );
+
+    // Y no se destruyó nada: la disposición se aborta entera, no a medias.
+    const [seg] = await admin`select count(*)::int as n from segmento where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(2);
+
+    // El remedio es el mismo que ya tenían los otros dos motivos: volver a exportar. Y
+    // entonces sí se ejecuta — que es lo que separa una comprobación de un cerrojo.
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    const constancia = await ejecutar();
+    expect(constancia.modalidad).toBe('borrado');
+    const [tras] = await admin`select count(*)::int as n from segmento where workspace_id = ${ws}`;
+    expect(tras!.n).toBe(0);
+  });
+
+  it('el inventario que ata el archivo a la base no lo mueve la sesión que lo lee', async () => {
+    // La comparación del inventario solo vale si las dos lecturas —la de exportar y la de
+    // ejecutar— hablan el mismo idioma. La huella se calcula sobre `fila::text`, y ese texto lo
+    // mueve la SESIÓN: un `timestamptz` cambia con `TimeZone`, una `date` con `DateStyle`, un
+    // `bytea` con `bytea_output`. Sin fijarlos, exportar desde una sesión y ejecutar desde otra
+    // darían huellas distintas sobre datos idénticos y la disposición se bloquearía sola: una
+    // garantía que se cae cuando cambia la configuración del cliente no es una garantía.
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('rendicion');
+    // Que haya algo de cada tipo sensible: sin filas con fecha, el caso pasaría en verde con la
+    // fijación retirada y no probaría nada.
+    const [item] = await admin`insert into item_importacion
+      (workspace_id, titulo, contenido, tipo_fuente, creado_por)
+      values (${ws}, 'nota', 'texto', 'nota', ${leadId}) returning id`;
+    await admin`insert into archivo_importado
+      (workspace_id, item_id, nombre, tipo_mime, contenido, creado_por)
+      values (${ws}, ${item!.id}, 'x.txt', 'text/plain', ${Buffer.from('hola')}, ${leadId})`;
+    const leerCon = (guc: Record<string, string>) =>
+      admin.begin(async (tx) => {
+        for (const [k, v] of Object.entries(guc)) {
+          await tx.unsafe(`set local ${k} = '${v}'`);
+        }
+        const [f] = await tx`select inventario_del_workspace(${ws})::text as i`;
+        return f!.i as string;
+      });
+
+    const utc = await leerCon({ timezone: 'UTC', datestyle: 'ISO, YMD', bytea_output: 'hex' });
+    const tokio = await leerCon({
+      timezone: 'Asia/Tokyo',
+      datestyle: 'SQL, DMY',
+      bytea_output: 'escape',
+    });
+    // Y que el inventario NO esté vacío, o la igualdad de arriba sería la de dos nadas.
+    expect(JSON.parse(utc)).toHaveProperty('archivo_importado');
+    expect(tokio).toBe(utc);
+  });
 
   it('el acuerdo es append-only: la versión y el rol los pone la base, no quien escribe', async () => {
     const ws = await nuevoWorkspace('bitacora');

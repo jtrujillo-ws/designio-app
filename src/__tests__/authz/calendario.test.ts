@@ -471,9 +471,51 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * LÍMITE DECLARADO: una unidad con una coma dentro del literal partiría el argumento. No
      * existe ninguna unidad válida así.
      */
+    /*
+     * Y la unidad SEGURA se puede escribir con envolturas que no la cambian: entre paréntesis
+     * —`date_trunc(('second'), now())`— y con el tipo calificado —`'second'::pg_catalog.text`—.
+     * Las dos son estables (medido por EPOCH, no por texto: el resultado es `timestamptz` y su
+     * representación lleva el desfase, así que compararlo como texto dice que cambia cuando no
+     * cambia — la misma trampa que este censo existe para cazar, en la que caí al medirlo).
+     * Sin admitirlas, el censo marcaba código correcto.
+     */
     const unidadSegura = (lista: string) =>
-      String.raw`(?:'(?:${lista})'(?:\s*::\s*[\w ]+)?|cast\s*\(\s*'(?:${lista})'\s+as\s+[\w ]+\s*\))`;
+      String.raw`(?:\(\s*)?(?:'(?:${lista})'(?:\s*::\s*[\w. ]+)?|cast\s*\(\s*'(?:${lista})'\s+as\s+[\w. ]+\s*\))(?:\s*\))?`;
     const PRIMER_ARGUMENTO = String.raw`(?:[^,()]|\([^()]*\))*`;
+    /*
+     * `date_trunc` tiene una sobrecarga de TRES argumentos, y el tercero es el huso. Con un
+     * literal fijo —`date_trunc('day', now(), 'UTC')`— el resultado es el mismo instante en
+     * cualquier sesión (medido por epoch); con algo que LEA la sesión —`current_setting(
+     * 'TimeZone')`— vuelve a depender de quien llama, y el patrón no lo veía porque exigía el
+     * paréntesis pegado al reloj.
+     *
+     * La guardia va DELANTE del `\s*` y no detrás, que es donde la puse primero: con el
+     * espacio por medio, el motor lo devuelve a cero, la aserción se evalúa sobre el espacio
+     * —donde no hay literal— y pasa. Una aserción negativa detrás de algo opcional no asegura
+     * nada; ya lo tenía escrito de otra vuelta y volví a hacerlo.
+     */
+    const HUSO_FIJO = String.raw`'[^']*'(?:\s*::\s*[\w. ]+)?\s*\)`;
+    /*
+     * Y el FORMATO de `to_char`, que hasta ahora no se miraba: se marcaba cualquier `to_char`
+     * con un reloj delante, y hay formatos que no leen el calendario —`'"fijo"'` devuelve
+     * texto literal y `'US'` extrae microsegundos—.
+     *
+     * Qué declaro seguro, y por qué NO es la lista que medí. Barrí los 57 códigos contra los
+     * 499 husos y seis instantes de frontera y salieron 17 estables; pero seis instantes son
+     * una MUESTRA, no una prueba, y equivocarse aquí es un hueco SILENCIOSO. Así que solo
+     * declaro seguros aquellos cuya estabilidad se sigue de un invariante ya medido: los
+     * campos por debajo del minuto, porque ningún huso tiene hoy desfase con segundos —eso
+     * está medido en este mismo fichero, sobre los 499—. `CC`, `IYYY`, `IW` y compañía
+     * salieron estables en la muestra y aun así van fuera: marcarlos de más es un falso
+     * positivo, que se ve; darlos por seguros sin invariante sería un agujero que no.
+     *
+     * El texto entre comillas dobles es literal por definición del formato.
+     *
+     * `SSSS` —segundos desde medianoche— NO entra, y por eso los códigos exigen no llevar
+     * detrás otra letra o dígito: sin esa guardia se leería como `SS` + `SS` y pasaría por
+     * seguro.
+     */
+    const FORMATO_SEGURO = String.raw`'(?:"[^"]*"|[^A-Za-z0-9"']|(?:SS|MS|US|FF[1-6])(?![A-Za-z0-9]))*'`;
     RELOJ_COLAPSADO_A_DIA = [
       // El cast al tipo sin huso, en sus cuatro formas de una sola vez: `now()::date` tal como
       // se escribe, `(now())::date` tal como Postgres la devuelve —y a la que reduce también
@@ -490,10 +532,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `date(now())`, la tercera forma de escribir la misma conversión.
       new RegExp(String.raw`\b(date|time)\s*\(\s*(${RELOJ})\s*\)`, 'i'),
-      // `to_char(now(), 'YYYY-MM-DD')`: no colapsa a un `date` pero produce el mismo día del
-      // huso, y una regla escrita sobre esa cadena decide igual. El reloj tiene que ser el
-      // PRIMER argumento — envuelto en `timezone('UTC', …)` ya no lo es.
-      new RegExp(String.raw`to_char\s*\(\s*(${RELOJ})\s*,`, 'i'),
       /*
        * Y la COMPARACIÓN MIXTA, que es la puerta que abrió declarar seguro el reloj desnudo.
        * `current_timestamp` es un instante absoluto, sí — pero comparado contra un valor SIN
@@ -539,6 +577,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * para todo lo demás sin romper `date_trunc('milliseconds', now())`.
      */
     RELOJ_LEYENDO_LITERAL = [
+      // `to_char(now(), 'YYYY-MM-DD')`: no colapsa a un `date` pero produce el mismo día del
+      // huso, y una regla escrita sobre esa cadena decide igual. El reloj tiene que ser el
+      // PRIMER argumento — envuelto en `timezone('UTC', …)` ya no lo es. Y desde que mira el
+      // FORMATO tiene que ver el literal sin vaciar, como los otros dos.
+      //
+      // La guardia va pegada a la coma y NO detrás del `\s*`: con el espacio por medio el
+      // motor lo devuelve a cero y la aserción se evalúa donde no hay literal.
+      new RegExp(String.raw`to_char\s*\(\s*(${RELOJ})\s*,(?!\s*${FORMATO_SEGURO}\s*\))`, 'i'),
       /*
        * `extract` entra aquí desde que el campo puede ser un LITERAL —`extract('dow' from
        * now())` es SQL válido, comprobado contra la base—: si el literal viene vaciado, el
@@ -546,14 +592,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * Lo cazó su propia sonda segura, que para eso está.
        */
       new RegExp(
-        String.raw`extract\s*\(\s*(?!(?:(?:${CAMPOS_SEGUROS})\b|'(?:${CAMPOS_SEGUROS})')\s*from)(?:'[^']*'|\w+)\s+from\s+(${RELOJ})`,
+        String.raw`extract\s*\(\s*(?!(?:(?:${CAMPOS_SEGUROS})\b|[A-Za-z_]*&?'(?:${CAMPOS_SEGUROS})')\s*from)(?:[A-Za-z_]*&?'[^']*'|\w+)\s+from\s+(${RELOJ})`,
         'i',
       ),
       // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
       // que lleva cast: `date_trunc('day', timeofday()::timestamptz)`, obligada porque ese
       // reloj devuelve texto. Marca CUALQUIER unidad que no esté en la lista medida.
       new RegExp(
-        String.raw`date_trunc\s*\(\s*(?!${unidadSegura(UNIDADES_SEGURAS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*\)`,
+        String.raw`date_trunc\s*\(\s*(?!${unidadSegura(UNIDADES_SEGURAS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*(?:,(?!\s*${HUSO_FIJO})\s*${PRIMER_ARGUMENTO})?\s*\)`,
         'i',
       ),
       // `date_part('dow', now())`, que es la misma operación con la otra sintaxis, y su forma
@@ -1132,6 +1178,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Y el campo de `extract` también admite literal: `extract('dow' from now())` es SQL
       // válido —comprobado contra la base— y la palabra desnuda no lo casaba.
       "extract('dow' from now())",
+      // El TERCER argumento que lee la sesión: la sobrecarga de tres se escapaba entera.
+      "date_trunc('day', now(), current_setting('TimeZone'))",
+      // Y el campo con PREFIJO, que es otra forma válida de escribir el mismo literal.
+      "extract(E'dow' from now())",
+      // El formato de `to_char` que SÍ lee el calendario, y `SSSS` —segundos desde
+      // medianoche— que sin la guardia de frontera se leería como dos `SS` seguros.
+      "to_char(now(), 'SSSS')",
+      "to_char(now(), 'US HH24')",
       'statement_timestamp()::date',
       '(statement_timestamp())::date',
       'transaction_timestamp()::date',
@@ -1293,6 +1347,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "date_trunc(CAST('milliseconds' AS text), now())",
       "date_part(CAST('epoch' AS text), now())",
       "extract('epoch' from now())",
+      // Un huso FIJO como tercer argumento da el mismo instante en cualquier sesión (medido
+      // por epoch: idéntico en Kiritimati y en Etc/GMT+12), aunque su TEXTO se imprima
+      // distinto — que es justo la trampa que este censo persigue, y en la que caí midiendo.
+      "date_trunc('day', now(), 'UTC')",
+      "date_trunc('day', now(), 'UTC'::text)",
+      // Y las envolturas que no cambian la unidad segura.
+      "date_trunc(('second'), now())",
+      "date_trunc('second'::pg_catalog.text, now())",
+      // Y los formatos que NO leen el calendario: texto entrecomillado y campos por debajo
+      // del minuto (ningún huso tiene desfase con segundos — medido sobre los 499).
+      "to_char(now(), '\"fijo\"')",
+      "to_char(now(), 'US')",
+      "to_char(now(), 'SS.MS')",
       // …y `timetz` como destino conserva el instante igual.
       'now()::time with time zone',
       'now()::timetz',

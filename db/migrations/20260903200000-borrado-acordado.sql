@@ -661,8 +661,15 @@ begin
     -- nueva sin filas, que es el caso normal de una migración de slice: si trae contenido del
     -- workspace, aparece y el archivo deja de valer —correcto, ese contenido no viajó—; si no,
     -- el archivo de ayer sigue sirviendo.
+    -- La huella viaja como TEXTO y no como número, y no es cosmética: es una suma de hashes
+    -- de 64 bits, así que se pasa del entero seguro de JavaScript. El archivo lleva esta misma
+    -- fila dentro —el catálogo de exportación vuelca `exportacion_registro`—, y ahí el `jsonb`
+    -- pasa por `JSON.parse`: como número llegaría REDONDEADA, y el inventario que el archivo
+    -- dice llevar dejaría de poder cotejarse contra el de la base. Un texto no se redondea.
+    -- (`n` sí es número: es un conteo de filas, y a 2^53 no llega ninguna tabla.)
     if v_n > 0 then
-      v_inv := v_inv || jsonb_build_object(r.tabla, jsonb_build_object('n', v_n, 'h', v_h));
+      v_inv := v_inv || jsonb_build_object(r.tabla,
+                                           jsonb_build_object('n', v_n, 'h', v_h::text));
     end if;
   end loop;
   return v_inv;

@@ -505,6 +505,33 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     await acordarYExportar(ws, 'borrado', adminId);
     expect(await ultimoRegistro()).not.toBeNull();
 
+    /*
+     * Y el inventario viaja EXACTO dentro del propio archivo, que es lo que permite cotejar la
+     * prueba sin la base. La huella es una suma de hashes de 64 bits y no cabe en el entero
+     * seguro de JavaScript: como número, `JSON.parse` la redondearía al desempaquetar el
+     * volcado y el archivo diría llevar un inventario que no es el que quedó registrado. Por
+     * eso viaja como texto, y por eso se comprueba contra el `->>` de Postgres, que no pasa
+     * por ningún número.
+     */
+    const paquete = await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    const enArchivo = paquete.datos.exportacion_registro!.map((f) => f.inventario).filter(
+      (i): i is Record<string, { n: number; h: string }> => i !== null,
+    );
+    expect(enArchivo.length).toBeGreaterThan(0);
+    for (const inv of enArchivo) {
+      // Un texto no se puede haber redondeado. La igualdad de abajo compara además contra el
+      // texto que devuelve Postgres, sin número por medio en ninguno de los dos lados.
+      for (const valor of Object.values(inv)) expect(typeof valor.h).toBe('string');
+    }
+    const huellas = await admin`select e.k as tabla, e.v ->> 'h' as h
+      from exportacion_registro xp, lateral jsonb_each(xp.inventario) e(k, v)
+      where xp.workspace_id = ${ws} and xp.inventario is not null`;
+    expect(huellas.length).toBeGreaterThan(0);
+    for (const f of huellas) {
+      const cual = enArchivo.find((i) => (f.tabla as string) in i)!;
+      expect(cual[f.tabla as string]!.h).toBe(f.h as string);
+    }
+
     const ejecutar = () =>
       ejecutarDisposicion(leadId, {
         workspaceId: ws,
@@ -1939,6 +1966,31 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         return undefined;
       };
       /**
+       * Y los alias que llegan por DESESTRUCTURACIÓN: `const { conUsuario } = db;` y
+       * `const { conUsuario: abrir } = db;`, que es la tercera forma de guardarse la apertura
+       * —después del identificador y del acceso a propiedad— y la única cuyo inicializador no
+       * dice nada: el nombre está en el PATRÓN, no en el valor. Sin leerlo, `abrir(...)` no
+       * abría transacción para el censo y la proyección se caía de la búsqueda y del cierre a
+       * la vez, igual que con las otras dos.
+       *
+       * Solo cuando la propiedad es la que abre, por lo mismo que en el acceso: este mapa
+       * resuelve además CUERPOS, y mapear cualquier desestructuración a su nombre de origen
+       * haría que `const { cosa } = otra` se analizara como la `cosa` local del módulo.
+       */
+      const aliasDesestructurados = (d: TS.VariableDeclaration): [string, string][] => {
+        if (!ts.isObjectBindingPattern(d.name)) return [];
+        const pares: [string, string][] = [];
+        for (const el of d.name.elements) {
+          if (!ts.isIdentifier(el.name)) continue;
+          const origen =
+            el.propertyName && ts.isIdentifier(el.propertyName)
+              ? el.propertyName.text
+              : el.name.text;
+          if (origen === ABRE) pares.push([el.name.text, origen]);
+        }
+        return pares;
+      };
+      /**
        * Y los ALIAS de un módulo —`const abrir = conUsuario;`—, que también hacen falta para
        * los AJENOS: el predicado de «esto abre una transacción» se resuelve contra ellos, y
        * cerrado sobre los del módulo que LLAMA no reconoce el alias del que se analiza.
@@ -1963,6 +2015,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           }
           if (!ts.isVariableStatement(st)) continue;
           for (const d of st.declarationList.declarations) {
+            for (const [local, origen] of aliasDesestructurados(d)) m.set(local, origen);
             if (!ts.isIdentifier(d.name) || !d.initializer) continue;
             const apunta = nombreAliasado(d.initializer);
             if (apunta !== undefined) m.set(d.name.text, apunta);
@@ -2160,6 +2213,18 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         let escribe = false;
         let desconocido = false;
         /*
+         * Los nombres que APUNTAN a esta transacción, no uno solo. El símbolo sale del
+         * parámetro del callback, pero dentro se puede guardar en otro —`const tx = db;`, que
+         * es un refactor sin consecuencias— y entonces las plantillas etiquetadas con él no
+         * las contaba nadie: la proyección quedaba en cero sentencias, la apertura sí constaba
+         * como alcanzada, y una multiconsulta sin aislamiento dejaba el censo en verde. El
+         * mismo modo de fallo que el parámetro renombrado, una capa más adentro.
+         *
+         * Se va llenando durante el recorrido, que es en PREORDEN: la declaración se visita
+         * antes que los usos, porque está antes en el cuerpo.
+         */
+        const simbolosTx = new Set([tx]);
+        /*
          * Solo cuentan las sentencias cuyo RESULTADO llega a la respuesta. Una cuyo valor se
          * descarta —`await exigirCuentaActiva(tx, actorId);`, una sentencia de expresión a
          * secas— es una PUERTA: o pasa o lanza, y no aporta ningún campo. No puede hacer
@@ -2178,7 +2243,22 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           sentencias++;
         };
         const visitar = (n: TS.Node) => {
-          if (ts.isTaggedTemplateExpression(n) && ts.isIdentifier(n.tag) && n.tag.text === tx) {
+          if (
+            ts.isVariableDeclaration(n) &&
+            ts.isIdentifier(n.name) &&
+            n.initializer &&
+            (() => {
+              const v = desenvolver(n.initializer!);
+              return ts.isIdentifier(v) && simbolosTx.has(v.text);
+            })()
+          ) {
+            simbolosTx.add(n.name.text);
+          }
+          if (
+            ts.isTaggedTemplateExpression(n) &&
+            ts.isIdentifier(n.tag) &&
+            simbolosTx.has(n.tag.text)
+          ) {
             contar(n);
           }
           /*
@@ -2199,12 +2279,12 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
             const esUnsafe =
               ts.isPropertyAccessExpression(f) &&
               ts.isIdentifier(f.expression) &&
-              f.expression.text === tx &&
+              simbolosTx.has(f.expression.text) &&
               f.name.text === 'unsafe';
             const primeroEsTx =
               n.arguments.length > 0 &&
               ts.isIdentifier(n.arguments[0]!) &&
-              (n.arguments[0] as TS.Identifier).text === tx;
+              simbolosTx.has((n.arguments[0] as TS.Identifier).text);
             if (esUnsafe) {
               contar(n);
               for (const a of n.arguments) {
@@ -2279,7 +2359,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           if (
             ts.isTaggedTemplateExpression(n) &&
             ts.isIdentifier(n.tag) &&
-            n.tag.text === tx &&
+            simbolosTx.has(n.tag.text) &&
             ESCRITURA.test(sqlEjecutable(n.template.getText()))
           ) {
             escribe = true;
@@ -2401,6 +2481,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         // `const f = async (…) => …` y `const f = async function (…) {…}`, exportadas o no.
         if (ts.isVariableStatement(st)) {
           for (const d of st.declarationList.declarations) {
+            // La desestructuración no se exporta como proyección —es la apertura guardada con
+            // otro nombre, no una función con cuerpo—, así que entra en el mapa y no en la
+            // lista de exportadas.
+            for (const [local, origen] of aliasDesestructurados(d)) alias.set(local, origen);
             if (!ts.isIdentifier(d.name) || !d.initializer) continue;
             const valor = desenvolver(d.initializer);
             if (ts.isArrowFunction(valor) || ts.isFunctionExpression(valor)) {
@@ -2971,6 +3055,34 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           const [b] = await tx\`select 2 as y\`;
           return { a, b };
         });
+      // Y por DESESTRUCTURACIÓN, la tercera forma de guardarse la apertura: aquí el nombre
+      // está en el patrón y el inicializador no dice nada.
+      const { conUsuario: abrirDes } = db;
+      export const sondaIndirectaPorDesestructuracion = async (actorId: string) =>
+        abrirDes(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      // Y el símbolo de la TRANSACCIÓN guardado en otro nombre dentro del callback, que es un
+      // refactor sin consecuencias y dejaba el recuento en cero.
+      export const sondaTxAliasada = async (actorId: string) =>
+        conUsuario(actorId, async (db) => {
+          const tx = db;
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      // Y la misma indirección para una ESCRITORA, que es la dirección contraria: sin seguir
+      // el alias, su \`insert\` no se veía y salía nombrada siendo correcta.
+      const sondaOkTxAliasadaEscribe = async (actorId: string) =>
+        conUsuario(actorId, async (db) => {
+          const tx = db;
+          const [a] = await tx\`insert into t (x) values (1) returning x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      export { sondaOkTxAliasadaEscribe };
       // Un identificador ENTRE COMILLAS DOBLES: en SQL es un NOMBRE, no un dato, pero tampoco
       // es una sentencia de escritura.
       export const sondaIdentificador = async (actorId: string) =>
@@ -3101,6 +3213,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaPropiedad',
         'sonda.ts:sondaIndirecta',
         'sonda.ts:sondaIndirectaPorPropiedad',
+        'sonda.ts:sondaIndirectaPorDesestructuracion',
+        'sonda.ts:sondaTxAliasada',
         'sonda.ts:sondaAyudanteAjeno',
         'sonda.ts:sondaMensajeEscritura',
         'sonda.ts:sondaAjenoQueAnida',

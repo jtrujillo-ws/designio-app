@@ -214,6 +214,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   let RELOJ_ESCRITO_EN_COLUMNA: (texto: string) => boolean = () => false;
   /** El reloj entregado por `USING` a un marcador que el SQL dinámico colapsa a un día. */
   let RELOJ_EN_PARAMETRO_DINAMICO: (texto: string) => boolean = () => false;
+  /*
+   * Y la COMPARACIÓN implícita: `vence_en > current_timestamp` con `vence_en date` promociona
+   * la fecha a `timestamptz` por la medianoche del huso de la SESIÓN, así que quien llama
+   * decide el resultado. Medido, y no de canto: la misma fila da `f` en Pacific/Kiritimati y
+   * `t` en Etc/GMT+12 — la comparación se da la vuelta entera.
+   *
+   * Va aparte de la comparación con un literal tipado o un cast, que ya se miraban, porque
+   * aquí el tipo no está escrito en ningún sitio de la expresión: está en el catálogo.
+   */
+  let RELOJ_COMPARADO_CON_COLUMNA: (texto: string) => boolean = () => false;
+  /** Nombres de columna que son sin huso en una tabla y CON huso en otra. Debe estar vacío. */
+  let COLUMNAS_AMBIGUAS: string[] = [];
 
   beforeAll(async () => {
     /*
@@ -711,11 +723,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * la que devuelve el catálogo: Postgres deparsea `current_timestamp < date '2026-09-04'`
      * como `(CURRENT_TIMESTAMP < '2026-09-04'::date)`.
      *
-     * LÍMITE DECLARADO, porque conviene que esté escrito y no descubierto: una COLUMNA cuyo
-     * tipo es `date` no se distingue de cualquier otro identificador mirando el texto. Este
-     * censo no resuelve tipos de columnas, así que `vence_en > current_timestamp` con
-     * `vence_en date` se le escapa. Lo que sí cubre es la forma en que aparece escrita una
-     * garantía: un literal o un cast.
+     * Esto cubre lo que se puede leer del TEXTO. Lo que el texto no dice —que una columna
+     * llamada `vence_en` es un `date`— lo pone el catálogo, y de eso se ocupa
+     * `RELOJ_COMPARADO_CON_COLUMNA`, ahí abajo. Aquí había un límite declarado que decía que
+     * ese caso se escapaba; ya no, y conviene que se vea por qué importaba: medido,
+     * `vence_en > current_timestamp` da `f` en Pacific/Kiritimati y `t` en Etc/GMT+12 sobre la
+     * MISMA fila. No es que la fecha se desplace un día: la comparación se da la vuelta
+     * entera, y `derecho_uso.vence_en` es justo la columna que decide si una evidencia se
+     * puede citar.
      */
     const OPERANDO_SIN_HUSO = String.raw`(?:${TIPO_SIN_HUSO}\s*${PREFIJO}'[^']*'|(?:${PREFIJO}'[^']*'|[\w."]+)\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO}))`;
     const COMPARADOR = String.raw`(?:<=|>=|<>|!=|<|>|=)`;
@@ -1459,6 +1474,62 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * limpia. Tercera vez que el mismo error aparece en otro dialecto: preguntar cómo está
      * escrito algo en vez de qué es.
      */
+    /*
+     * El conjunto de NOMBRES sin huso, para la comparación implícita. Se casa por nombre y no
+     * por (tabla, columna) porque en una expresión el calificador es un alias —`e.ventana_inicio`,
+     * `new.vence_en`— y resolverlo pediría analizar el `from`, que no es cosa de este censo.
+     *
+     * La premisa que lo hace correcto se COMPRUEBA, no se supone: ningún nombre puede ser sin
+     * huso en una tabla y con huso en otra. Hoy son ocho nombres y ninguno lo es; si algún día
+     * lo fuera, el censo lo dice en vez de empezar a marcar de más en silencio.
+     */
+    const NOMBRES_SIN_HUSO = new Set<string>();
+    const NOMBRES_CON_HUSO = new Set<string>();
+    const AMBIGUAS_REALES = new Set<string>();
+    for (const f of columnas as unknown as { tabla: string; columna: string; tipo: string }[]) {
+      (SIN_HUSO_DECLARADO.test(f.tipo) ? NOMBRES_SIN_HUSO : NOMBRES_CON_HUSO).add(
+        f.columna.toLowerCase(),
+      );
+    }
+    /*
+     * Un nombre que significa un tipo sin huso en una tabla y uno CON huso en otra no lo
+     * resuelve el nombre, así que el censo NO lo adivina: lo saca del conjunto. Es una omisión
+     * declarada y no un descuido — marcar de más ahí sería un falso positivo sobre la tabla
+     * inocente, y en un guardián eso cuesta lo mismo que un hueco.
+     *
+     * Lo aprendí de una sonda propia: las dos tablas fabricadas para el caso de la atribución
+     * equivocada tienen a propósito una columna `d` que significa cosas distintas, y fue justo
+     * ella la que hizo saltar esta comprobación.
+     *
+     * Y para que la omisión no crezca en silencio, se anota aparte cuáles vienen del ESQUEMA
+     * de verdad; eso tiene que estar vacío.
+     */
+    for (const f of columnas as unknown as { tabla: string; columna: string; tipo: string }[]) {
+      const c = f.columna.toLowerCase();
+      if (NOMBRES_SIN_HUSO.has(c) && NOMBRES_CON_HUSO.has(c) && !/^censo_probe_/.test(f.tabla))
+        AMBIGUAS_REALES.add(c);
+    }
+    for (const c of [...NOMBRES_SIN_HUSO]) if (NOMBRES_CON_HUSO.has(c)) NOMBRES_SIN_HUSO.delete(c);
+    COLUMNAS_AMBIGUAS = [...AMBIGUAS_REALES].sort();
+
+    /*
+     * El reconocedor va como UN patrón y en las dos direcciones, en vez de buscar la columna y
+     * luego rebanar el operando de al lado. Lo intenté así primero y no servía: recortar por
+     * comas y paréntesis parte `now()` por la mitad y se lleva por delante el `from` de la
+     * cola, así que el operando que salía nunca parecía un reloj. La forma correcta es exigir
+     * el reloj PEGADO al comparador, que es justo lo que hace peligrosa a la comparación.
+     */
+    if (NOMBRES_SIN_HUSO.size > 0) {
+      const alternativa = [...NOMBRES_SIN_HUSO].map(escapado).join('|');
+      const COLUMNA = String.raw`(?<![\w."])(?:\w+\s*\.\s*)?(?:${alternativa})(?![\w"])`;
+      const COMPARA_CON_RELOJ = new RegExp(
+        String.raw`${COLUMNA}\s*${COMPARADOR}\s*(?:${RELOJ})` +
+          String.raw`|(?:${RELOJ})\s*${COMPARADOR}\s*${COLUMNA}`,
+        'i',
+      );
+      RELOJ_COMPARADO_CON_COLUMNA = (texto: string): boolean => COMPARA_CON_RELOJ.test(texto);
+    }
+
     const nombreCanonico = (t: string): string => {
       const n = t.trim();
       const uni = /^[Uu]&"((?:[^"]|"")*)"(?:\s+uescape\s+'(.)')?$/is.exec(n);
@@ -1783,6 +1854,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * cast que mirar. Se emparejan por número, que es como los empareja Postgres.
        */
       RELOJ_EN_PARAMETRO_DINAMICO(conLiterales) ||
+      RELOJ_COMPARADO_CON_COLUMNA(sinLiterales) ||
       /*
        * Y el SQL DINÁMICO: `execute 'select now()::date'` guarda la operación DENTRO de un
        * literal, que el vaciado se lleva por delante. La función depende del huso de quien la
@@ -2655,6 +2727,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // cada elemento. Medido: `2026-09-05 …+14` contra `2026-09-04 …-12`, con fecha distinta
       // dentro del texto. Era el único serializador de array sin `json` en el nombre.
       "array_to_string(array[now()], ',')",
+      // Y la comparación IMPLÍCITA con una columna cuyo tipo no está escrito en ninguna parte:
+      // Postgres promociona la fecha a `timestamptz` por la medianoche del huso de la sesión.
+      // Medido, y no de canto: la misma fila da `f` en Pacific/Kiritimati y `t` en Etc/GMT+12.
+      // Estaba como límite declarado, con esta misma línea del lado seguro.
+      'vence_en > current_timestamp',
       // La coerción IMPLÍCITA a texto, que renderiza igual sin nombrar ningún formato. Las
       // cuatro medidas: cadena distinta en husos opuestos.
       'concat(now())',
@@ -2931,11 +3008,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'current_timestamp',
       'current_time',
       'select current_timestamp - creado_en from disposicion',
-      'vence_en > current_timestamp',
       // Comparar dos instantes absolutos no elige calendario: el otro operando lleva huso.
       "now() < timestamptz '2026-09-04 00:00:00+00'",
       "now() >= '2026-09-04 00:00:00+00'::timestamptz",
       'now() < creado_en',
+      // Y la columna sin huso comparada con algo que YA es fecha: ninguna de las dos tiene
+      // huso del que moverse, así que resolver el tipo por el catálogo no puede inventar
+      // culpa. Es la mitad que acota a la comparación implícita.
+      "vence_en >= timezone('UTC', now())::date",
       // Y comparar dos FECHAS tampoco: ninguna tiene huso del que moverse.
       "fecha_de_la_base() = date '2026-09-04'",
       // El `and` de al lado no es el límite superior del `between`. Medida: estable.
@@ -3829,6 +3909,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
           ' begin v := now(); return v; end $c$',
       ],
+      /*
+       * Y la sonda que sostiene la OMISIÓN de los nombres ambiguos. `censo_probe_otra.d` lleva
+       * huso, así que comparar esa columna con el reloj es comparar dos instantes y no elige
+       * calendario. Pero el nombre `d` también existe, sin huso, en la otra tabla sonda: si el
+       * censo resolviera por nombre sin omitir los ambiguos, marcaría esta función inocente.
+       * Es el falso positivo que la omisión evita, y sin dos tablas donde `d` signifique cosas
+       * distintas no se puede escribir.
+       */
+      [
+        'censo_probe_ok_compara_columna_ambigua',
+        'returns boolean language sql stable as $c$ select now() < d from censo_probe_otra $c$',
+      ],
       [
         'censo_probe_ok_rowtype_instante',
         'returns timestamptz language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
@@ -4021,6 +4113,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // El censo tiene que estar mirando algo: sin esto, un cambio en la consulta que
       // devolviera cero filas dejaría el test en verde para siempre sin comprobar nada.
       expect(funciones.length).toBeGreaterThan(50);
+      /*
+       * Y la premisa que hace correcta la comparación implícita, COMPROBADA y no supuesta: la
+       * columna se casa por nombre —en una expresión el calificador es un alias, no la tabla—,
+       * y un nombre que significara un tipo sin huso en una tabla y uno con huso en otra no lo
+       * resolvería. Esos el censo los OMITE en vez de adivinar; lo que no puede pasar es que
+       * omita uno del esquema de verdad sin decirlo, porque entonces habría dejado de mirar
+       * una columna sin que nadie se entere. Las de las tablas sonda no cuentan: una de ellas
+       * es ambigua a propósito.
+       */
+      expect(COLUMNAS_AMBIGUAS).toEqual([]);
       // Y la premisa del hallazgo del `prosqlbody`, comprobada y no supuesta.
       expect(funciones.find((f) => f.nombre === 'censo_probe_castop')!.prosrc).toBe('');
 
@@ -4139,6 +4241,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_into_dos_columnas_date',
         'censo_probe_rowtype_date',
         'censo_probe_pct_type_date',
+        'censo_probe_ok_compara_columna_ambigua',
         'censo_probe_ok_rowtype_instante',
         'censo_probe_ok_using_instante',
         'censo_probe_ok_into_dos_columnas',

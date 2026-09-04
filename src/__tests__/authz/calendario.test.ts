@@ -35,6 +35,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
     await sqlAdmin().unsafe('drop table if exists censo_probe_particionada cascade');
     await sqlAdmin().unsafe('drop table if exists "CensoProbeCitada"');
+    await sqlAdmin().unsafe('drop table if exists censo_probe_dominio cascade');
+    await sqlAdmin().unsafe('drop domain if exists censo_probe_fecha cascade');
     await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
     await cerrarPools();
   }, PACIENCIA);
@@ -303,6 +305,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     await sqlAdmin().unsafe('drop table if exists "CensoProbeCitada"');
     await sqlAdmin().unsafe(
       'create table "CensoProbeCitada" ("K" int primary key, "FechaCitada" date)',
+    );
+    /*
+     * Y una columna cuyo tipo es un DOMINIO sobre `date`: coerciona igual que el `date`, pero
+     * `format_type` sobre el atributo imprime el nombre del dominio.
+     */
+    await sqlAdmin().unsafe('drop table if exists censo_probe_dominio cascade');
+    await sqlAdmin().unsafe('drop domain if exists censo_probe_fecha cascade');
+    await sqlAdmin().unsafe('create domain censo_probe_fecha as date');
+    await sqlAdmin().unsafe(
+      'create table censo_probe_dominio (k int primary key, fecha_dom censo_probe_fecha)',
     );
     await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
     await sqlAdmin().unsafe(
@@ -1424,6 +1436,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * volvían culpables: `select now(), timezone('UTC', now())::date into t, d`, donde el reloj
      * va a la variable CON huso, y la subconsulta del `from` de aquí abajo.
      */
+    /** Lo mismo, pero partido por columnas: para lo que se empareja por posición. */
+    const porColumnas = (t: string): string[] => {
+      const m = /^\s*select\s+(?:all\s+|distinct\s+(?:on\s*\([^)]*\)\s*)?)?([\s\S]*)$/i.exec(t);
+      return argumentosDe(hastaLaClausula(m === null ? t : m[1]!)).map(sinAlias);
+    };
     const proyectadas = (t: string): string[] => {
       const m = /^\s*select\s+(?:all\s+|distinct\s+(?:on\s*\([^)]*\)\s*)?)?([\s\S]*)$/i.exec(t);
       return [sinAlias(hastaLaClausula(m === null ? t : m[1]!))];
@@ -1816,7 +1833,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * dinámico no bastaba — analiza `select now()` por su cuenta, que es seguro; lo que lo
        * vuelve peligroso es el tipo del destino, y ése está en el `into` de fuera.
        */
-      const proyeccionDe = (consulta: string): string[] => {
+      /*
+       * Devuelve FILAS, no una lista plana: el emparejamiento por posición es por fila, y un
+       * `values (a), (b)` entrega `a` en una vuelta y `b` en la otra —las dos a la MISMA
+       * posición—. Aplanarlas emparejaba `b` contra el segundo destino, que no existe, y la
+       * segunda fila no se miraba nunca. Lo dijo su sonda: sin esto se quedaba limpia.
+       */
+      const proyeccionDe = (consulta: string): string[][] => {
         const t = consulta.trim();
         const dolar = /^execute\s+\$([A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$([\s\S]*?)\$\1\$/i.exec(t);
         const dinamico = /^execute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'))/i.exec(t);
@@ -1832,11 +1855,32 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          */
         const tras = /^\s*with\b/i.test(sql) ? finDeLosCTEs(sql, sql.search(/\bwith\b/i) + 4) : 0;
         const cuerpo = tras === null ? sql : sql.slice(tras);
-        if (/^\s*select\b/i.test(cuerpo)) return proyectadas(cuerpo);
+        /*
+         * Aquí SÍ se parte por columnas, al revés que en la entrega al tipo de retorno: esto
+         * se empareja por POSICIÓN contra una lista de destinos, y un `for n, d in select 1,
+         * now() loop` entrega la segunda columna a `d`. Medido: 2026-09-05 en
+         * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12. Allí no se parte porque el
+         * destino es escalar y Postgres no acepta más de una columna; aquí sí lo acepta.
+         */
+        if (/^\s*select\b/i.test(cuerpo)) return [porColumnas(cuerpo)];
+        /*
+         * Y TODAS las tuplas de un `values`, no la primera: `for d in values (date
+         * '2026-01-01'), (now()) loop` recorre las dos y solo la segunda se mueve con el huso.
+         */
         const filas = /^\s*values\s*\(/i.exec(cuerpo);
         if (filas === null) return [];
-        const dentro = parejaDeParentesis(cuerpo, filas[0].length - 1);
-        return dentro === null ? [] : argumentosDe(dentro).map(sinAlias);
+        const salida: string[][] = [];
+        let cursor = filas[0].length - 1;
+        for (;;) {
+          const dentro = parejaDeParentesis(cuerpo, cursor);
+          if (dentro === null) break;
+          salida.push(argumentosDe(dentro).map(sinAlias));
+          cursor += dentro.length + 2;
+          const siguiente = /^\s*,\s*\(/.exec(cuerpo.slice(cursor));
+          if (siguiente === null) break;
+          cursor += siguiente[0].length - 1;
+        }
+        return salida;
       };
       /** `<destinos>` de un `into` o de un `for`, en minúsculas y sin comillas. */
       const listaDeDestinos = (t: string): string[] =>
@@ -1847,7 +1891,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           .filter((v): v is string => v !== undefined);
       const bucles = [
         ...conLiterales.matchAll(/\bfor\s+([^;]*?)\s+in\s+([\s\S]*?)\s+loop\b/gi),
-      ].flatMap((m) => porPosicionDeNombre(listaDeDestinos(m[1]!), proyeccionDe(m[2]!)));
+      ].flatMap((m) => {
+        const destinos = listaDeDestinos(m[1]!);
+        return proyeccionDe(m[2]!).flatMap((fila) => porPosicionDeNombre(destinos, fila));
+      });
       const dinamicas = [
         /*
          * En las DOS ortografías del literal. La de dólar la lee el recorrido de SQL dinámico
@@ -1859,9 +1906,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         ...conLiterales.matchAll(
           /\bexecute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'|\$(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$[\s\S]*?\$(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$))\s+into\s+(?:strict\s+)?([^;]*)/gi,
         ),
-      ].flatMap((m) =>
-        porPosicionDeNombre(listaDeDestinos(m[2]!), proyeccionDe(`execute ${m[1]!}`)),
-      );
+      ].flatMap((m) => {
+        const destinos = listaDeDestinos(m[2]!);
+        return proyeccionDe(`execute ${m[1]!}`).flatMap((fila) =>
+          porPosicionDeNombre(destinos, fila),
+        );
+      });
       /*
        * Y el `FOREACH … IN ARRAY`, que asigna ELEMENTO a elemento y por eso no es un `for` de
        * consulta: lo que llega al destino es cada elemento del array, con la misma coerción.
@@ -1896,9 +1946,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         ),
       ].flatMap((m) => {
         const consulta = consultaDelCursor.get(m[1]!.toLowerCase());
-        return consulta === undefined
-          ? []
-          : porPosicionDeNombre(listaDeDestinos(m[2]!), proyeccionDe(consulta));
+        if (consulta === undefined) return [];
+        const destinos = listaDeDestinos(m[2]!);
+        return proyeccionDe(consulta).flatMap((fila) => porPosicionDeNombre(destinos, fila));
       });
       const derechas = [
         ...inicializadas,
@@ -1928,12 +1978,31 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * sobre un padre con `d date` guarda 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en
      * Etc/GMT+12.
      */
+    /*
+     * Y el tipo se DESENVUELVE si es un dominio: `create domain fecha as date` y una columna
+     * `fecha` coercionan igual que un `date` —medido, 2026-09-05 en Pacific/Kiritimati contra
+     * 2026-09-04 en Etc/GMT+12—, pero `format_type` sobre el atributo imprime el nombre del
+     * dominio y `SIN_HUSO_DECLARADO` no lo reconoce. Se baja recursivamente hasta el tipo base,
+     * porque un dominio puede estar definido sobre otro; el `typmod` propio solo vale si no se
+     * bajó ningún nivel.
+     */
     const columnas = await sqlAdmin()`
       select c.relname as tabla, a.attname as columna, a.attnum as posicion,
-             format_type(a.atttypid, a.atttypmod) as tipo
+             format_type(base.tipo, case when base.nivel = 0 then a.atttypmod else null end)
+               as tipo
       from pg_attribute a
       join pg_class c on c.oid = a.attrelid
       join pg_namespace n on n.oid = c.relnamespace
+      join lateral (
+        with recursive desenvuelve(tipo, nivel) as (
+          select a.atttypid, 0
+          union all
+          select t.typbasetype, d.nivel + 1
+          from desenvuelve d join pg_type t on t.oid = d.tipo
+          where t.typtype = 'd' and t.typbasetype <> 0 and d.nivel < 16
+        )
+        select tipo, nivel from desenvuelve order by nivel desc limit 1
+      ) base on true
       where n.nspname = 'public' and c.relkind in ('r', 'p')
         and a.attnum > 0 and not a.attisdropped
       order by c.relname, a.attnum`;
@@ -2207,10 +2276,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * porque ese signo también es una comparación. Es la misma distinción que ya rige para las
      * variables con el tipo escrito, y aquí faltaba.
      */
+    /*
+     * Y en las DOS ortografías, como las variables de tipo escrito: `declare "D" t.d%type;
+     * begin "D" := now();` es válida y depende del huso —medido, 2026-09-05 contra
+     * 2026-09-04—, y quitarle las comillas antes de construir el patrón la hacía invisible,
+     * porque la guarda de la izquierda impide casar la `D` de dentro de `"D"`.
+     */
+    const formasDeLaVariable = (crudo: string): string => {
+      const n = nombreCanonico(crudo.trim());
+      const citada = `"${escapado(n.replace(/"/g, '""'))}"`;
+      return (/^[A-Za-z_]\w*$/.test(n) ? [escapado(n), citada] : [citada]).join('|');
+    };
     const ASIGNA_DESPUES = (variable: string): RegExp =>
       new RegExp(
-        String.raw`(?<![\w".])${variable}\s*:=\s*([^;]*)` +
-          String.raw`|(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*${variable}\s*=(?!=)\s*([^;]*)`,
+        String.raw`(?<![\w".])(?:${variable})\s*:=\s*([^;]*)` +
+          String.raw`|(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*(?:${variable})\s*=(?!=)\s*([^;]*)`,
         'gi',
       );
     const RAMA_INSERTA = /\bthen\s+insert\s*(?:\(([^)]*)\)\s*)?values\s*\(([\s\S]*?)\)(?=\s*(?:\bwhen\b|$))/gi;
@@ -2338,10 +2418,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       for (const m of texto.matchAll(COLUMNA_DEL_CATALOGO)) {
         const tabla = nombreCanonico(m[2]!);
         const columna = nombreCanonico(m[3]!);
-        const variable = escapado(sinComillas(m[1]!.trim()));
         const inicial = m.groups?.inicial;
         if (inicial !== undefined && entrega(tabla, columna, inicial)) return true;
-        for (const a of texto.matchAll(ASIGNA_DESPUES(variable))) {
+        for (const a of texto.matchAll(ASIGNA_DESPUES(formasDeLaVariable(m[1]!)))) {
           if (entrega(tabla, columna, a[1] ?? a[2]!)) return true;
         }
         /*
@@ -4892,6 +4971,49 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * Etc/GMT+12: la tabla y la columna CITADAS en mayúsculas —donde se ve si la
        * canonicalización se aplica a los dos lados— y el `for … in values`.
        */
+      /*
+       * Cinco formas más, medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12. Las tres primeras son sobre código de esta misma sesión:
+       *
+       *   for n, d in select 1, now() loop         el destino MÚLTIPLE, emparejado por posición
+       *   for d in values (fija), (now()) loop     todas las tuplas, no la primera
+       *   declare "D" t.d%type; "D" := now()       la variable %TYPE entrecomillada
+       *   insert into t(d) values (now())  con `d` de un DOMINIO sobre date
+       *   update only t set d = now()
+       */
+      [
+        'censo_probe_bucle_multiple_date',
+        'returns void language plpgsql as $c$ declare n int; d date; begin' +
+          ' for n, d in select 1, now() loop' +
+          ' insert into censo_probe_escritura(k, d) values (n, d); end loop; end $c$',
+      ],
+      [
+        'censo_probe_bucle_values_dos_date',
+        "returns void language plpgsql as $c$ declare d date; i int := 10; begin" +
+          " for d in values (date '2026-01-01'), (now()) loop" +
+          ' insert into censo_probe_escritura(k, d) values (i, d); i := i + 1;' +
+          ' end loop; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_citada_date',
+        'returns date language plpgsql as $c$ declare "D" censo_probe_escritura.d%type;' +
+          ' begin "D" := now(); return "D"; end $c$',
+      ],
+      [
+        'censo_probe_columna_dominio_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into censo_probe_dominio(k, fecha_dom) values (1, now()); end $c$',
+      ],
+      /*
+       * La del `update only` estaba ya cubierta —el reconocedor del `UPDATE` admite el
+       * modificador desde antes—, y va escrita porque nadie lo había comprobado: una cobertura
+       * que no tiene sonda es una cobertura que nadie ha medido.
+       */
+      [
+        'censo_probe_update_only_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' update only censo_probe_escritura set d = now(); end $c$',
+      ],
       [
         'censo_probe_tabla_citada_mayus_date',
         'returns void language plpgsql as $c$ begin' +
@@ -5429,6 +5551,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_tabla_unicode_date',
           'censo_probe_returning_into_date',
           'censo_probe_execute_dolar_into_date',
+          'censo_probe_bucle_multiple_date',
+          'censo_probe_bucle_values_dos_date',
+          'censo_probe_pct_type_citada_date',
+          'censo_probe_columna_dominio_date',
+          'censo_probe_update_only_date',
           'censo_probe_tabla_citada_mayus_date',
           'censo_probe_bucle_values_date',
           'censo_probe_destino_citado_mayus_date',
@@ -5561,6 +5688,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_alias_fecha_fija',
         'censo_probe_returning_into_date',
         'censo_probe_execute_dolar_into_date',
+        'censo_probe_bucle_multiple_date',
+        'censo_probe_bucle_values_dos_date',
+        'censo_probe_pct_type_citada_date',
+        'censo_probe_columna_dominio_date',
+        'censo_probe_update_only_date',
         'censo_probe_tabla_citada_mayus_date',
         'censo_probe_bucle_values_date',
         'censo_probe_destino_citado_mayus_date',

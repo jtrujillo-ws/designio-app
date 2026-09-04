@@ -207,9 +207,17 @@ function PantallaDisposicion() {
           gap: 18,
         }}
       >
+        {/* Sin membresía no hay nada que disponer, pero puede quedar mucho que conservar: es
+            exactamente lo que le pasa a quien acaba de ver borrado su workspace. Decirle solo
+            «no perteneces a ningún workspace» sería despedirlo de la única pantalla que
+            todavía guarda su recibo. */}
         {!workspaceId && (
           <Card style={{ padding: 24 }}>
-            <p style={parrafo}>Aún no perteneces a ningún workspace.</p>
+            <p style={parrafo}>
+              {mias.length > 0
+                ? 'Ya no perteneces a ningún workspace activo. Las constancias que conservas siguen aquí abajo: cada una se verifica por su cuenta con su sello.'
+                : 'Aún no perteneces a ningún workspace.'}
+            </p>
           </Card>
         )}
 

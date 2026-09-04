@@ -148,8 +148,9 @@ export async function panelDisposicion(
     const [estado] = await tx`select
         disposicion_motivo_no_ejecutable(${workspaceId}) as motivo,
         workspace_role(app_user_id(), ${workspaceId}) as rol,
-        (select max(r.creado_en) from exportacion_registro r
-          where r.workspace_id = ${workspaceId} and r.ambito = 'archivo') as exportado`;
+        (select max(r.completado_en) from exportacion_registro r
+          where r.workspace_id = ${workspaceId} and r.ambito = 'archivo'
+            and r.completado_en is not null) as exportado`;
 
     return {
       workspaceId,

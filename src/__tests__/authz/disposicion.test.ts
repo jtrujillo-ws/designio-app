@@ -569,9 +569,41 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         values (${ws}, 'archivo', ${leadId}, 'lead-boutique')`),
     ).rejects.toMatchObject({ code: '42501' });
 
+    // ── Y tampoco combinando el evento a mano con la confirmación ──
+    // Esta era la vuelta que quedaba abierta. `confirmar_exportacion` comprobaba que ESTA
+    // transacción hubiera pasado por `registrar_exportacion`… mirando el `evento_dominio` que
+    // aquélla escribe, o sea el dato que esta misma migración declara falsificable. Con el
+    // evento escrito a mano y la confirmación llamada a continuación, el `xmin` casaba y nacía
+    // el registro que desbloquea la disposición sin haber exportado nada: el agujero que la
+    // tabla venía a cerrar, una vuelta más abajo. Ahora la fila la escribe la función que
+    // AUTORIZA y la confirmación solo la completa.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+          values (${ws}, 'WorkspaceExportado', ${tx.json({ ambito: 'archivo' })}::jsonb,
+                  ${leadId}, 'lead-boutique')`;
+        await tx`select confirmar_exportacion(${ws}, 'archivo')`;
+      }),
+    ).rejects.toMatchObject({ code: 'DS004' });
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/exportación previa/i);
+
+    // ── Ni una exportación autorizada y ABANDONADA ──
+    // La fila nace incompleta a propósito: lo que RF-01.9 pide es que la entrega haya
+    // terminado antes, no que se autorizara. Llamada suelta a la función que autoriza, sin la
+    // que cierra: queda la fila sin completar y la disposición sigue bloqueada.
+    await conUsuario(leadId, (tx) => tx`select registrar_exportacion(${ws}, 'archivo')`);
+    const [pendiente] = await sqlAdmin()`select count(*)::int as n from exportacion_registro
+      where workspace_id = ${ws} and completado_en is null`;
+    expect(pendiente!.n).toBe(1);
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/exportación previa/i);
+
     // Exportando de verdad —por la función que autoriza y sella— sí se desbloquea.
     await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
     expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
+    // Y lo que la desbloquea es una fila COMPLETA, no la que quedó a medias.
+    const [completas] = await sqlAdmin()`select count(*)::int as n from exportacion_registro
+      where workspace_id = ${ws} and completado_en is not null`;
+    expect(completas!.n).toBe(1);
   });
 
   it('la lápida no conserva el cupo pactado: es condición del contrato que se borró', async () => {

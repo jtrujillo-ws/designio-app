@@ -147,13 +147,20 @@ create table exportacion_registro (
   ejecutado_por uuid not null references usuario(id),
   ejecutado_rol text not null,
   creado_en timestamptz not null default now(),
+  -- La fila NACE incompleta —la escribe `registrar_exportacion` al autorizar— y la completa
+  -- `confirmar_exportacion` al final. Solo una fila COMPLETA acredita algo: una exportación
+  -- autorizada y abandonada a medias deja la fila sin completar, y la transacción que la
+  -- abandona la borra al deshacerse. Es también el instante que la constancia sella como
+  -- «exportado_en», porque lo que RF-01.9 pide es que la entrega haya TERMINADO antes.
+  completado_en timestamptz,
   unique (id, workspace_id)
 );
 comment on table exportacion_registro is
 'Qué exportaciones se ejecutaron de verdad. Escribible SOLO por el propietario, a través de registrar_exportacion: es lo que la convierte en prueba de que la entrega previa a una disposición ocurrió, en vez de en una afirmación que cualquier miembro puede escribir.';
 
 create index exportacion_registro_ws_idx
-  on exportacion_registro (workspace_id, ambito, creado_en desc);
+  on exportacion_registro (workspace_id, ambito, completado_en desc)
+  where completado_en is not null;
 
 alter table exportacion_registro enable row level security;
 
@@ -165,49 +172,83 @@ create policy exportacion_registro_select on exportacion_registro
   for select using (is_workspace_member(app_user_id(), workspace_id));
 grant select on exportacion_registro to designio_app;
 
--- `registrar_exportacion` NO cambia: sigue autorizando y auditando al PRINCIPIO, que es donde
--- tiene que estar el permiso. El sello lo deja otra función, al final.
---
--- ── Qué acredita este registro, exactamente ──
--- Acredita que una exportación autorizada llegó hasta el final EN UNA SOLA TRANSACCIÓN. No
--- acredita que los bytes se entregaran, y ninguna función de esta base puede acreditarlo: la
--- entrega ocurre fuera, y quien la haría es el mismo rol que llamaría aquí. Se dice en vez de
--- fingirlo.
---
--- Lo que sí se cierra es que la fila nazca de una llamada suelta: `confirmar_exportacion` exige
--- que ESTA MISMA transacción haya pasado por `registrar_exportacion` —comprobado contra el
--- evento que aquélla escribe, cuyo `creado_en` es el `now()` de la transacción—, así que una
--- exportación abandonada a medias no deja registro, y fabricar uno exige dos llamadas
--- deliberadas en vez de una. Para lo que queda —un recibo de ENTREGA firmado por quien
--- recibe— haría falta la firma que la constancia todavía no tiene; queda anotado junto a ella.
-create function confirmar_exportacion(p_ws uuid, p_ambito text) returns void
+/*
+ * ── Quién escribe el registro, y por qué el evento ya no sirve de puerta ──
+ *
+ * La primera versión de esto dejaba la escritura en `confirmar_exportacion` y la condicionaba
+ * a que ESTA transacción hubiera pasado por `registrar_exportacion`… comprobándolo contra el
+ * `evento_dominio` que aquélla escribe. Y ese evento es justo el dato que el bloque de arriba
+ * acaba de declarar FALSIFICABLE: la aplicación tiene grant de INSERT sobre `evento_dominio`
+ * —incluidos `actor_id` y `actor_rol`— y su política solo pide membresía. Reproducido: un
+ * `lead-boutique` abre transacción, se escribe a mano un `WorkspaceExportado` con su propio
+ * actor y ámbito, llama a `confirmar_exportacion`, el `xmin` casa, y nace el registro que
+ * desbloquea la disposición sin haber exportado nada. El agujero era el mismo que la tabla
+ * venía a cerrar, una vuelta más abajo.
+ *
+ * Ahora la fila la escribe `registrar_exportacion` —la función que AUTORIZA— y
+ * `confirmar_exportacion` solo la COMPLETA, exigiendo que la escribiera esta misma
+ * transacción. Eso sí es infalsificable por el rol de aplicación, porque sobre
+ * `exportacion_registro` no hay grant ni política de INSERT para nadie salvo el dueño. El
+ * evento se sigue emitiendo —es la auditoría legible de RF-01.6— pero deja de sostener nada.
+ *
+ * ── Y qué NO acredita, dicho aquí en vez de dejarlo entender ──
+ * Que el rol de aplicación tenga EXECUTE sobre `registrar_exportacion` es forzoso: esa
+ * llamada ES la exportación. Así que un miembro con rol de exportación puede llamar a las dos
+ * funciones por SQL crudo y producir una fila completa sin construir ni entregar un solo byte.
+ * No es un descuido que se pueda cerrar desde aquí, y tampoco compra nada: esa misma persona
+ * puede lanzar la exportación de verdad y tirar el resultado. Lo que la fila acredita es lo
+ * que dice y nada más —que alguien CON AUTORIDAD DE EXPORTACIÓN pasó por la función que
+ * autoriza, en una transacción que llegó al final—. La entrega ocurre fuera y la haría el
+ * mismo rol; para acreditarla haría falta un recibo firmado por quien recibe, que es la misma
+ * firma que a la constancia todavía le falta. Queda anotado junto a ella y no se finge aquí.
+ */
+create or replace function registrar_exportacion(p_ws uuid, p_ambito text) returns text
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_rol text;
 begin
+  if p_ambito not in ('archivo', 'entregable') then
+    raise exception 'ámbito de exportación desconocido: %', p_ambito;
+  end if;
   v_rol := workspace_role(app_user_id(), p_ws);
   if coalesce(v_rol, '') not in ('lead-boutique', 'admin-cliente') then
     raise exception 'solo lead-boutique o admin-cliente ejecutan la exportación del workspace'
       using errcode = 'insufficient_privilege';
   end if;
-  -- Se identifica por `xmin`, que es qué transacción escribió la fila, y no por su reloj:
-  -- `evento_dominio.creado_en` usa `clock_timestamp()`, así que comparar contra `now()` —el
-  -- inicio de la transacción— no casa nunca, y comparar con `>=` dejaría entrar el evento de
-  -- otra transacción concurrente. `xmin` responde exactamente la pregunta que hay que hacer.
-  -- Vale porque `conUsuario` abre UNA transacción y nadie usa savepoints: con ellos `xmin`
-  -- sería el subxid y esto dejaría de casar.
-  if not exists (
-    select 1 from evento_dominio e
-    where e.workspace_id = p_ws and e.tipo = 'WorkspaceExportado'
-      and e.payload->>'ambito' = p_ambito
-      and e.actor_id = app_user_id()
-      and e.xmin = pg_current_xact_id()::xid)
-  then
-    raise exception 'no se puede sellar una exportación que no se autorizó en esta misma transacción: el registro acredita una exportación completa, no una llamada suelta'
-      using errcode = 'DS004';
-  end if;
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+  values (p_ws, 'WorkspaceExportado', jsonb_build_object('ambito', p_ambito),
+          app_user_id(), v_rol);
+  -- La mitad nueva: el registro nace aquí, incompleto. Nadie más puede escribir esta fila.
   insert into exportacion_registro (workspace_id, ambito, ejecutado_por, ejecutado_rol)
   values (p_ws, p_ambito, app_user_id(), v_rol);
+  return v_rol;
+end $$;
+
+create function confirmar_exportacion(p_ws uuid, p_ambito text) returns void
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_n integer;
+begin
+  -- Se identifica por `xmin`, que es qué transacción escribió la fila, y no por su reloj:
+  -- comparar `creado_en` contra `now()` —el inicio de la transacción— casaría también con
+  -- una fila de otra transacción concurrente que arrancara a la vez. `xmin` responde
+  -- exactamente la pregunta que hay que hacer. Vale porque `conUsuario` abre UNA transacción
+  -- y nadie usa savepoints: con ellos `xmin` sería el subxid y esto dejaría de casar.
+  --
+  -- Y no se vuelve a comprobar el rol: lo comprobó `registrar_exportacion` al escribir la
+  -- fila que este update busca, y `ejecutado_rol` lo guarda. Repetirlo sería dar por buena la
+  -- respuesta de `workspace_role` AHORA para una fila autorizada ANTES; con la fila delante,
+  -- la autorización ya está acreditada.
+  update exportacion_registro
+     set completado_en = clock_timestamp()
+   where workspace_id = p_ws and ambito = p_ambito
+     and completado_en is null
+     and xmin = pg_current_xact_id()::xid;
+  get diagnostics v_n = row_count;
+  if v_n <> 1 then
+    raise exception 'no se puede sellar una exportación que esta misma transacción no autorizó: el registro acredita una exportación completa, no una llamada suelta (filas completadas: %)', v_n
+      using errcode = 'DS004';
+  end if;
 end $$;
 
 -- ── Y NO se migran los eventos viejos ─────────────────────────────────────────────────
@@ -728,8 +769,11 @@ begin
   -- Alias `xp` y no `r`: `ejecutar_disposicion` declara una variable `record r` para recorrer
   -- las tablas, y en plpgsql la variable GANA al alias de la consulta. Con `r` aquí, la
   -- referencia se resuelve contra el record sin asignar y revienta en tiempo de ejecución.
-  select max(xp.creado_en) into v_export from exportacion_registro xp
-    where xp.workspace_id = p_ws and xp.ambito = 'archivo';
+  -- `completado_en` y no `creado_en`: lo que RF-01.9 pide es que la entrega haya TERMINADO
+  -- antes, y una fila sin completar es una exportación que se autorizó y se abandonó.
+  select max(xp.completado_en) into v_export from exportacion_registro xp
+    where xp.workspace_id = p_ws and xp.ambito = 'archivo'
+      and xp.completado_en is not null;
   if v_export is null then
     return 'Falta la exportación previa: el archivo completo del workspace se entrega ANTES de disponer de él (RF-01.8/01.9)';
   end if;
@@ -817,8 +861,11 @@ begin
   -- Alias `xp` y no `r`: `ejecutar_disposicion` declara una variable `record r` para recorrer
   -- las tablas, y en plpgsql la variable GANA al alias de la consulta. Con `r` aquí, la
   -- referencia se resuelve contra el record sin asignar y revienta en tiempo de ejecución.
-  select max(xp.creado_en) into v_export from exportacion_registro xp
-    where xp.workspace_id = p_ws and xp.ambito = 'archivo';
+  -- `completado_en` y no `creado_en`: lo que RF-01.9 pide es que la entrega haya TERMINADO
+  -- antes, y una fila sin completar es una exportación que se autorizó y se abandonó.
+  select max(xp.completado_en) into v_export from exportacion_registro xp
+    where xp.workspace_id = p_ws and xp.ambito = 'archivo'
+      and xp.completado_en is not null;
 
   -- Remediación ANTES de tocar nada: lo que ya salió hacia un proveedor no lo alcanza este
   -- borrado, y el libro que lo sabe es de los que se vacían.

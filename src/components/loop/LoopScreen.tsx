@@ -425,10 +425,19 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
       </Link>
       {/* La disposición la acuerdan y la ejecutan las dos partes del contrato (RF-01.9): el
           enlace no aparece para los demás roles y, si lo teclean, la pantalla les dirá el
-          motivo que da la propia base en vez de ofrecerles un botón que va a rechazar. */}
-      {(ROLES_DISPOSICION as readonly string[]).includes(rol) && (
+          motivo que da la propia base en vez de ofrecerles un botón que va a rechazar.
+
+          Y aparece TAMBIÉN sin membresía activa, que es el caso para el que media pantalla
+          existe: un borrado destruye las membresías, así que quien firmó el acuerdo o lo
+          ejecutó vuelve a entrar con `rol === ''` y esa pantalla es lo único que le queda —la
+          RLS le sigue dando SUS constancias, y `misConstancias` no pide workspace—.
+          Condicionar la puerta al rol de una membresía que el borrado acaba de destruir era
+          conservar el derecho y quitar por dónde ejercerlo: el mismo defecto que la propia
+          política vino a arreglar, dos capas más arriba. El rótulo cambia porque lo que hay
+          detrás cambia: sin workspace no hay nada que disponer, solo lo que se conserva. */}
+      {(rol === '' || (ROLES_DISPOSICION as readonly string[]).includes(rol)) && (
         <Link to="/disposicion" style={{ ...item, textDecoration: 'none' }}>
-          <span>Disposición del workspace</span>
+          <span>{rol === '' ? 'Constancias que conservas' : 'Disposición del workspace'}</span>
         </Link>
       )}
       {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para

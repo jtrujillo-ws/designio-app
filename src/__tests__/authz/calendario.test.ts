@@ -778,6 +778,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * LÍMITE DECLARADO: `execute v_sql`, con la consulta en una variable, no se puede leer
        * desde el texto; y un `format` con marcadores mete trozos que aquí no están.
        */
+      /*
+       * Y el literal por DÓLAR, que es la otra forma de escribir el SQL de un `EXECUTE`.
+       * Dentro del cuerpo de una función el delimitador exterior ya es un dólar, así que
+       * `execute $q$select now()::date$q$` viajaba como literal ANIDADO: el vaciado se llevaba
+       * su contenido y la extracción, que solo miraba comillas simples, no lo recuperaba. La
+       * función dependía del huso igual y el censo la daba por limpia.
+       *
+       * `\\1` con la etiqueta opcional cubre las dos formas: con `$$…$$` el grupo no casa nada
+       * y la referencia vale la cadena vacía. Aquí no hay escapes que deshacer — un
+       * entrecomillado por dólar no los tiene, que es justo para lo que existe.
+       */
+      [
+        ...conLiterales.matchAll(
+          /\bexecute\s+(?:\w+\s*\(\s*)*\$([A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$([\s\S]*?)\$\1\$/gi,
+        ),
+      ].some((m) => culpable(m[2]!, 'sql')) ||
       [
         ...conLiterales.matchAll(
           /\bexecute\s+(?:\w+\s*\(\s*)*((?:[A-Za-z_]*&?'(?:[^']|'')*'\s*(?:\|\|\s*)?)+)/gi,
@@ -838,6 +854,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     'return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'instanceof', 'do',
     'else', 'yield', 'await',
   ]);
+  /**
+   * Y las que abren un paréntesis de CONTROL: tras su cierre viene una sentencia, y una
+   * sentencia puede empezar por una expresión regular. `if (activo) /[/*]/.test(x);` es código
+   * válido, y con el `)` tratado siempre como fin de valor esa regex se leía como comentario.
+   */
+  const PALABRAS_DE_CONTROL = new Set(['if', 'while', 'for']);
   const sinComentarios = (
     texto: string,
     dialecto: 'sql' | 'ts' = 'sql',
@@ -918,10 +940,43 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         let k = salida.length - 1;
         while (k >= 0 && /\s/.test(salida[k]!)) k--;
         const anterior = k >= 0 ? salida[k]! : '';
-        let j = k;
-        while (j >= 0 && /[A-Za-z_$]/.test(salida[j]!)) j--;
-        const palabra = salida.slice(j + 1, k + 1);
-        if (anterior === '' || ABRE_REGEX.test(anterior) || PALABRAS_ANTES_DE_REGEX.has(palabra)) {
+        const palabraAnteA = (fin: number) => {
+          let a = fin;
+          while (a >= 0 && /\s/.test(salida[a]!)) a--;
+          let b = a;
+          while (b >= 0 && /[A-Za-z_$]/.test(salida[b]!)) b--;
+          return salida.slice(b + 1, a + 1);
+        };
+        const palabra = palabraAnteA(k);
+        /*
+         * El `)` es el caso que no se puede decidir mirando un solo carácter: cierra tanto un
+         * valor entre paréntesis —y entonces la barra divide— como la condición de un `if` o un
+         * `while`, tras la cual viene una SENTENCIA que sí puede empezar por una regex. Se
+         * busca su `(` contando profundidad y se mira la palabra de antes.
+         *
+         * Si el conteo se desequilibra —un paréntesis dentro de una cadena, que aquí se copia
+         * tal cual— no se encuentra ninguna palabra de control y se cae al lado seguro, que es
+         * tratarlo como división: exactamente lo que hacía antes.
+         */
+        let trasControl = false;
+        if (anterior === ')') {
+          let profundidad = 0;
+          let m = k;
+          for (; m >= 0; m--) {
+            if (salida[m] === ')') profundidad++;
+            else if (salida[m] === '(') {
+              profundidad--;
+              if (profundidad === 0) break;
+            }
+          }
+          trasControl = m >= 0 && PALABRAS_DE_CONTROL.has(palabraAnteA(m - 1));
+        }
+        if (
+          anterior === '' ||
+          ABRE_REGEX.test(anterior) ||
+          PALABRAS_ANTES_DE_REGEX.has(palabra) ||
+          trasControl
+        ) {
           i++;
           let enClase = false;
           while (i < texto.length) {
@@ -967,7 +1022,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          */
         let hondura = 1;
         i += 2;
-        while (i < texto.length && hondura > 0 && !(pila.length > 1 && texto[i] === '`')) {
+        /*
+         * El backtick corta el comentario porque una plantilla no puede llevar uno suelto
+         * dentro: para JavaScript ahí TERMINA la plantilla, así que seguir leyendo comentario
+         * más allá sería leer código de fuera. Con dos precisiones que faltaban:
+         *
+         *  · solo en modo SQL. Dentro de una INTERPOLACIÓN el backtick de un comentario es
+         *    texto inerte —`sql${'${'}/* ` *${'/'} v}` es válido—, y cortando ahí ese backtick pasaba
+         *    a abrir una plantilla nueva: el `--` que viniera después se comía hasta el cierre
+         *    de verdad, consulta peligrosa incluida.
+         *  · y el backtick ESCAPADO no cierra nada. Se salta el par de abajo.
+         */
+        while (
+          i < texto.length &&
+          hondura > 0 &&
+          !(pila.length > 1 && modo === 'sql' && texto[i] === '`')
+        ) {
+          if (texto[i] === '\\') {
+            i += 2;
+            continue;
+          }
           // Solo SQL anida. En TypeScript un `/*` dentro de un comentario es texto normal y
           // cierra el PRIMER `*/` —comprobado compilando un fichero con uno dentro de otro: no
           // da error, o sea que lo de después es código—. Contando profundidad también aquí,
@@ -1004,7 +1078,25 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * sigue saliendo marcada. Es un falso positivo, o sea visible, y hoy no hay ninguno.
          */
         const salto = texto.indexOf('\n', i);
-        const cierre = pila.length > 1 ? texto.indexOf('`', i) : -1;
+        /*
+         * El cierre del marco es el primer backtick NO escapado: `indexOf` devolvía también
+         * los escapados, que no cierran nada. Con uno dentro del comentario, el recorrido
+         * salía de la plantilla a mitad, y lo que todavía era comentario —una comilla, otro
+         * `--`— pasaba a leerse como código y se llevaba por delante lo de después.
+         */
+        let cierre = -1;
+        if (pila.length > 1) {
+          for (let j = i; j < texto.length; j++) {
+            if (texto[j] === '\\') {
+              j++;
+              continue;
+            }
+            if (texto[j] === '`') {
+              cierre = j;
+              break;
+            }
+          }
+        }
         const fin =
           cierre !== -1 && (salto === -1 || cierre < salto)
             ? cierre
@@ -1783,6 +1875,51 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // Y una regex que MENCIONA una palabra del reloj es un dato, no una lectura: no se ejecuta
     // como SQL nunca. Copiarla tal cual la marcaba.
     expect(culpable('const r = /current_date/; const q = sql`select 1`;', 'ts')).toBe(false);
+    /*
+     * El SQL de un `EXECUTE` escrito con literal por DÓLAR, dentro del cuerpo de una función
+     * —que es donde aparece de verdad, y donde el delimitador exterior ya es otro dólar—.
+     */
+    expect(
+      culpable(
+        'create function f() returns void language plpgsql as $$ begin execute $q$select now()::date$q$; end $$',
+        'sql',
+      ),
+    ).toBe(true);
+    // Y la segura por la misma vía: fallar cerrado sobre un EXECUTE que no lee el calendario
+    // sería marcar cualquier SQL dinámico.
+    expect(
+      culpable(
+        'create function f() returns void language plpgsql as $$ begin execute $q$select 1$q$; end $$',
+        'sql',
+      ),
+    ).toBe(false);
+    /*
+     * Una expresión regular en posición de SENTENCIA, tras la condición de un `if`. El `)` no
+     * se puede decidir mirando un carácter: cierra un valor —y la barra divide— o cierra una
+     * condición, y entonces lo que sigue es una sentencia que puede empezar por una regex.
+     */
+    expect(
+      culpable('if (activo) /[/*]/.test(x); const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y el lado seguro del mismo carácter: un valor entre paréntesis dividido, que NO puede
+    // tomarse por regex o se comería la consulta de después.
+    expect(
+      culpable('const a = (b + c) / d; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Un backtick dentro de un comentario de bloque que está en una INTERPOLACIÓN: ahí es
+     * texto inerte y no cierra la plantilla. Cortando el comentario en él, ese backtick abría
+     * una plantilla nueva y el `--` de después se comía hasta el cierre de verdad.
+     */
+    expect(
+      culpable('const q = sql`select ${/* ` -- nota */ valor}, now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y el backtick ESCAPADO dentro de un comentario de línea de la plantilla: no cierra el
+     * marco. Saliendo de la plantilla ahí, la comilla que todavía era comentario abría un
+     * literal que se llevaba por delante la operación de la línea siguiente.
+     */
+    expect(culpable("const q = sql`select 1 -- \\` '\nnow()::date`;", 'ts')).toBe(true);
     // Un `--` DENTRO de un literal no abre comentario.
     expect(culpable("select '--', now()::date", 'sql')).toBe(true);
     // Ni un `//` dentro de una cadena de TypeScript.

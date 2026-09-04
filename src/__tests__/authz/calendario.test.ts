@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, sqlAdmin } from '@/lib/db';
+import * as ts from 'typescript';
 import { describeAuthz } from './helpers';
 
 /**
@@ -1332,193 +1333,137 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    */
   /** Lo que puede ir DELANTE de una barra que abre una expresión regular. */
   /*
-   * El `}` entra por la misma puerta que los demás: tras cerrar un BLOQUE empieza otra
-   * sentencia, y una sentencia puede empezar por una regex. Lo que no entra en ningún lado es
-   * su contrario —dividir un objeto, una función o un bloque no significa nada en JavaScript—,
-   * así que una barra pegada a un `}` no es una división en ningún código que compile.
+   * ── La mitad de TypeScript la hace el PARSER de TypeScript ──
+   *
+   * Aquí había un reconocedor escrito a mano que decidía si una barra abría una expresión
+   * regular o dividía, mirando el carácter anterior y una lista de palabras. La revisión le
+   * encontró CINCO agujeros seguidos —`throw` y `export default`, el paréntesis de un `if`, el
+   * `}` de un bloque, el `for await`, y el `}` de un objeto con `valueOf`— y el quinto refutó
+   * una afirmación que yo mismo había escrito aquí: dije que dividir un objeto no significa
+   * nada en JavaScript, y `{ valueOf() { return 1; } } / 2` es una división perfectamente
+   * válida. Cinco parches al mismo sitio no son cinco descuidos: son la señal de que el
+   * criterio no cabe en una heurística.
+   *
+   * Y no cabe por un motivo conocido: «regex o división» no se decide con el token anterior,
+   * se decide con la GRAMÁTICA. Así que la decide quien la tiene. Se parsea el fichero con
+   * `typescript` —que ya es dependencia de desarrollo y que el otro censo de este repositorio
+   * usa igual—, y del árbol salen los tramos exactos de cada literal: expresión regular,
+   * cadena, y cada trozo de plantilla.
+   *
+   * Con esos tramos, lo demás es aritmética: fuera de un literal, `//` y `/*` SIEMPRE abren
+   * comentario —eso sí es cierto sin contexto— y dentro de un literal nunca. El barrido pasa
+   * de adivinar a saber.
+   *
+   * Lo que NO cambia es el contrato: la salida sigue siendo el mismo texto con los comentarios
+   * fuera, las expresiones regulares fuera, las cadenas vaciadas si se pide, y el contenido de
+   * cada plantilla pasado por el barrido de SQL —que es donde vive el SQL que este censo
+   * busca—. Las sondas de este fichero son las que lo comprueban: siguen siendo las mismas y
+   * siguen en verde.
+   *
+   * Se parsea como TSX porque el barrido cubre `.ts` y `.tsx` y no sabe cuál está mirando.
+   * LÍMITE DECLARADO: en TSX, `<T>expr` es JSX y no un cast, y una función flecha genérica
+   * pide `<T,>`. Comprobado que este repositorio no usa ninguna de las dos formas; si algún
+   * día las usa, ese fichero se parsea con errores y sus literales dejan de reconocerse — y el
+   * fallo cae del lado seguro, que es MIRAR de más y no de menos.
    */
-  const ABRE_REGEX = /[([{},;:=!&|?+\-*%<>~^]/;
-  /**
-   * Las palabras tras las que puede empezar una EXPRESIÓN, que es el criterio: no una lista de
-   * casos vistos. `throw /re/` y `export default /re/` faltaban y las dos son código válido
-   * —medido: sin ellas, el `/*` de una clase de caracteres abría un comentario sin cierre—.
-   * `default:` de un `switch` no hace falta: ahí el carácter anterior son los dos puntos.
-   */
-  const PALABRAS_ANTES_DE_REGEX = new Set([
-    'return', 'throw', 'typeof', 'case', 'default', 'in', 'of', 'new', 'delete', 'void',
-    'instanceof', 'do', 'else', 'yield', 'await',
-  ]);
-  /**
-   * Y las que abren un paréntesis de CONTROL: tras su cierre viene una sentencia, y una
-   * sentencia puede empezar por una expresión regular. `if (activo) /[/*]/.test(x);` es código
-   * válido, y con el `)` tratado siempre como fin de valor esa regex se leía como comentario.
-   */
-  const PALABRAS_DE_CONTROL = new Set(['if', 'while', 'for']);
+  const barridoTs = (texto: string, vaciarLiterales: boolean): string => {
+    const arbol = ts.createSourceFile(
+      'censo.tsx',
+      texto,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TSX,
+    );
+    const piezas: { inicio: number; fin: number; texto: string }[] = [];
+    const recorrer = (n: ts.Node): void => {
+      const inicio = n.getStart(arbol);
+      const fin = n.getEnd();
+      const crudo = texto.slice(inicio, fin);
+      if (n.kind === ts.SyntaxKind.RegularExpressionLiteral) {
+        piezas.push({ inicio, fin, texto: ' ' });
+        return;
+      }
+      if (n.kind === ts.SyntaxKind.StringLiteral) {
+        const comilla = crudo[0] ?? "'";
+        const dentro = crudo.slice(1, -1);
+        piezas.push({
+          inicio,
+          fin,
+          texto:
+            vaciarLiterales && !ESPECIAL_TEMPORAL.test(dentro) ? `${comilla}${comilla}` : crudo,
+        });
+        return;
+      }
+      if (
+        n.kind === ts.SyntaxKind.NoSubstitutionTemplateLiteral ||
+        n.kind === ts.SyntaxKind.TemplateHead ||
+        n.kind === ts.SyntaxKind.TemplateMiddle ||
+        n.kind === ts.SyntaxKind.TemplateTail
+      ) {
+        // El trozo abre con un backtick o con el `}` que cierra una interpolación, y cierra
+        // con un backtick o con el `${` que abre la siguiente. Los delimitadores se conservan
+        // para no mover nada de sitio; lo de dentro es SQL y va por el barrido de SQL.
+        const cierra = crudo.endsWith('${') ? 2 : 1;
+        const dentro = crudo.slice(1, crudo.length - cierra);
+        piezas.push({
+          inicio,
+          fin,
+          texto:
+            crudo.slice(0, 1) +
+            sinComentarios(dentro, 'sql', vaciarLiterales) +
+            crudo.slice(crudo.length - cierra),
+        });
+        return;
+      }
+      n.forEachChild(recorrer);
+    };
+    recorrer(arbol);
+    piezas.sort((a, b) => a.inicio - b.inicio);
+
+    let salida = '';
+    let i = 0;
+    let p = 0;
+    while (i < texto.length) {
+      while (p < piezas.length && piezas[p]!.inicio < i) p++;
+      if (p < piezas.length && piezas[p]!.inicio === i) {
+        salida += piezas[p]!.texto;
+        i = piezas[p]!.fin;
+        p++;
+        continue;
+      }
+      if (texto[i] === '/' && texto[i + 1] === '/') {
+        const salto = texto.indexOf('\n', i);
+        salida += ' ';
+        i = salto === -1 ? texto.length : salto;
+        continue;
+      }
+      if (texto[i] === '/' && texto[i + 1] === '*') {
+        const cierre = texto.indexOf('*/', i + 2);
+        salida += ' ';
+        i = cierre === -1 ? texto.length : cierre + 2;
+        continue;
+      }
+      salida += texto[i];
+      i++;
+    }
+    return salida;
+  };
+
   const sinComentarios = (
     texto: string,
     dialecto: 'sql' | 'ts' = 'sql',
     vaciarLiterales = false,
   ): string => {
+    if (dialecto === 'ts') return barridoTs(texto, vaciarLiterales);
     let salida = '';
     let i = 0;
-    /*
-     * La pila no lleva solo el DIALECTO: lleva también si el marco es una INTERPOLACIÓN y
-     * cuántas llaves van abiertas dentro, que es lo único que dice dónde termina.
-     */
-    const pila: { modo: 'sql' | 'ts'; interpolacion: boolean; llaves: number }[] = [
-      { modo: dialecto, interpolacion: false, llaves: 0 },
-    ];
     /** La etiqueta del cuerpo por dólar que está abierto, o `null` si no hay ninguno. */
     let cuerpoPorDolar: string | null = null;
     const DOLAR = /^\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/;
     while (i < texto.length) {
-      const marco = pila[pila.length - 1]!;
-      const modo = marco.modo;
       const c = texto[i]!;
       const d = texto[i + 1];
-      /*
-       * `${` DENTRO de una plantilla vuelve a TypeScript, y `}` a su altura la cierra.
-       *
-       * Sin esta transición el interior de la interpolación se leía como SQL, y ahí SÍ anidan
-       * los comentarios: con `${/* uno /* dos *` + `/ v}` el segundo `/*` subía la cuenta a
-       * dos, el cierre la dejaba en uno, y el recorrido seguía comiéndose la consulta de
-       * después hasta otro cierre o el final del fichero. Lo mismo por el otro carácter: una
-       * comilla simple dentro de una cadena de comillas dobles —un apóstrofo— abría un literal
-       * de SQL que se tragaba el resto.
-       *
-       * Es la MISMA clase que el `/*` anidado de TypeScript, una capa más adentro: el
-       * guardián dejando de mirar sin que nada se ponga rojo.
-       *
-       * Solo cuenta dentro de una plantilla (`pila.length > 1`): en un cuerpo del catálogo,
-       * `${` no abre nada.
-       */
-      if (modo === 'sql' && pila.length > 1 && c === '$' && d === '{') {
-        pila.push({ modo: 'ts', interpolacion: true, llaves: 0 });
-        salida += '${';
-        i += 2;
-        continue;
-      }
-      if (marco.interpolacion && (c === '{' || c === '}')) {
-        if (c === '{') marco.llaves++;
-        else if (marco.llaves === 0) pila.pop();
-        else marco.llaves--;
-        salida += c;
-        i++;
-        continue;
-      }
-      /*
-       * Un literal de EXPRESIÓN REGULAR de TypeScript, que empieza por la misma barra que un
-       * comentario. `const sep = /[/*]/;` es código válido —dentro de una clase de caracteres
-       * la barra no se escapa—, y el recorrido tomaba ese `/*` por el principio de un
-       * comentario de bloque: sin cierre por delante se comía el resto del fichero, consulta
-       * peligrosa incluida. Es la misma clase que el `--` dentro de un identificador
-       * entrecomillado: el guardián dejando de mirar sin que nada se ponga rojo.
-       *
-       * QUÉ barra abre una expresión regular es el problema clásico de leer JavaScript, y aquí
-       * se resuelve por el lado seguro: solo se toma por regex cuando lo ANTERIOR no puede
-       * cerrar un valor. Con una lista de lo que SÍ la abre —puntuación de operador o una
-       * palabra clave— en vez de una lista de lo que no: equivocarse hacia «es una división»
-       * deja el comportamiento de antes, y equivocarse hacia «es una regex» se comería código
-       * hasta la siguiente barra, que es justo el fallo que esto viene a cerrar. Por eso `}`
-       * queda fuera: cierra tanto un bloque como un objeto, y en la duda, división.
-       *
-       * `//` y `/*` nunca abren una regex —una regex vacía se escribe `/(?:)/` y un `*` inicial
-       * no tiene qué repetir—, así que esas dos formas se dejan a los comentarios de abajo y
-       * no hay ambigüedad que resolver.
-       *
-       * El contenido se sustituye por un espacio, y esa es la otra mitad: una regex NO es SQL
-       * ni puede llegar a ejecutarse como tal, así que copiarla solo servía para que una que
-       * mencione `current_date` saliera marcada.
-       */
-      if (modo === 'ts' && c === '/' && d !== '/' && d !== '*') {
-        let k = salida.length - 1;
-        while (k >= 0 && /\s/.test(salida[k]!)) k--;
-        const anterior = k >= 0 ? salida[k]! : '';
-        const palabraAnteA = (fin: number) => {
-          let a = fin;
-          while (a >= 0 && /\s/.test(salida[a]!)) a--;
-          let b = a;
-          while (b >= 0 && /[A-Za-z_$]/.test(salida[b]!)) b--;
-          return salida.slice(b + 1, a + 1);
-        };
-        /** Dónde EMPIEZA esa palabra, para poder seguir mirando hacia atrás desde antes de ella. */
-        const antesDeLaPalabra = (fin: number) => {
-          let a = fin;
-          while (a >= 0 && /\s/.test(salida[a]!)) a--;
-          let b = a;
-          while (b >= 0 && /[A-Za-z_$]/.test(salida[b]!)) b--;
-          return b;
-        };
-        const palabra = palabraAnteA(k);
-        /*
-         * El `)` es el caso que no se puede decidir mirando un solo carácter: cierra tanto un
-         * valor entre paréntesis —y entonces la barra divide— como la condición de un `if` o un
-         * `while`, tras la cual viene una SENTENCIA que sí puede empezar por una regex. Se
-         * busca su `(` contando profundidad y se mira la palabra de antes.
-         *
-         * Si el conteo se desequilibra —un paréntesis dentro de una cadena, que aquí se copia
-         * tal cual— no se encuentra ninguna palabra de control y se cae al lado seguro, que es
-         * tratarlo como división: exactamente lo que hacía antes.
-         */
-        let trasControl = false;
-        if (anterior === ')') {
-          let profundidad = 0;
-          let m = k;
-          for (; m >= 0; m--) {
-            if (salida[m] === ')') profundidad++;
-            else if (salida[m] === '(') {
-              profundidad--;
-              if (profundidad === 0) break;
-            }
-          }
-          /*
-           * Y el modificador `await` de un bucle asíncrono se ATRAVIESA: en `for await (…)` la
-           * palabra pegada al paréntesis es `await`, no `for`, y sin cruzarla la sentencia de
-           * después dejaba de poder empezar por una regex.
-           *
-           * Atravesarlo y no meterlo en la lista de control, que sería lo corto y sería falso:
-           * `await (f()) / 2` es una división legítima, y darle rango de control convertiría su
-           * barra en el principio de una regex que se comería hasta el salto de línea lo que
-           * viniera detrás. El `for` de delante es lo que hace de aquello un bucle.
-           */
-          let dondeMirar = m - 1;
-          if (palabraAnteA(dondeMirar) === 'await') dondeMirar = antesDeLaPalabra(dondeMirar);
-          trasControl = m >= 0 && PALABRAS_DE_CONTROL.has(palabraAnteA(dondeMirar));
-        }
-        if (
-          anterior === '' ||
-          ABRE_REGEX.test(anterior) ||
-          PALABRAS_ANTES_DE_REGEX.has(palabra) ||
-          trasControl
-        ) {
-          i++;
-          let enClase = false;
-          while (i < texto.length) {
-            const ch = texto[i]!;
-            // Una regex no cruza el renglón: si se llega al salto, no era una regex y lo mejor
-            // que se puede hacer es soltarla ahí en vez de comerse el resto del fichero.
-            if (ch === '\n') break;
-            if (ch === '\\') {
-              i += 2;
-              continue;
-            }
-            if (enClase) {
-              if (ch === ']') enClase = false;
-              i++;
-              continue;
-            }
-            if (ch === '[') enClase = true;
-            else if (ch === '/') {
-              i++;
-              break;
-            }
-            i++;
-          }
-          salida += ' ';
-          continue;
-        }
-      }
-      // Comentario de bloque, igual en los dos dialectos.
+      // Comentario de bloque.
       if (c === '/' && d === '*') {
         /*
          * PostgreSQL ANIDA los comentarios de bloque: un bloque abierto dentro de otro exige
@@ -1536,40 +1481,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          */
         let hondura = 1;
         i += 2;
-        /*
-         * El backtick corta el comentario porque una plantilla no puede llevar uno suelto
-         * dentro: para JavaScript ahí TERMINA la plantilla, así que seguir leyendo comentario
-         * más allá sería leer código de fuera. Con dos precisiones que faltaban:
-         *
-         *  · solo en modo SQL. Dentro de una INTERPOLACIÓN el backtick de un comentario es
-         *    texto inerte —`sql${'${'}/* ` *${'/'} v}` es válido—, y cortando ahí ese backtick pasaba
-         *    a abrir una plantilla nueva: el `--` que viniera después se comía hasta el cierre
-         *    de verdad, consulta peligrosa incluida.
-         *  · y el backtick ESCAPADO no cierra nada. Se salta el par de abajo.
-         */
-        while (
-          i < texto.length &&
-          hondura > 0 &&
-          !(pila.length > 1 && modo === 'sql' && texto[i] === '`')
-        ) {
-          // La barra escapa DENTRO de una plantilla y solo ahí: el texto está en un literal de
-          // TypeScript y sus escapes son suyos. En un cuerpo del catálogo no escapa nada —SQL
-          // no lo trata como escape—, y saltarlo se comía el `*` de un `\\*/` y con él el
-          // cierre del comentario: el recorrido seguía tragando SQL de verdad. Un arreglo que
-          // abre un hueco al lado es el modo de fallo de este fichero, y este lo abrí yo.
-          if (pila.length > 1 && texto[i] === '\\') {
-            i += 2;
-            continue;
-          }
-          // Solo SQL anida. En TypeScript un `/*` dentro de un comentario es texto normal y
-          // cierra el PRIMER `*/` —comprobado compilando un fichero con uno dentro de otro: no
-          // da error, o sea que lo de después es código—. Contando profundidad también aquí,
-          // `/* explica /* de SQL */ const q = sql\`select now()::date\`;` dejaba la cuenta en
-          // uno y se comía la consulta real hasta otro cierre o el final del fichero.
-          //
-          // Yo había escrito en este mismo comentario que contar profundidad «tampoco estorba»
-          // en TypeScript. Estorba. Era una afirmación mía que no comprobaba nadie.
-          if (modo === 'sql' && texto[i] === '/' && texto[i + 1] === '*') {
+        while (i < texto.length && hondura > 0) {
+          // SQL anida y TypeScript no, y esa diferencia estuvo escrita al revés aquí durante
+          // un rato —yo mismo puse que contar profundidad «tampoco estorba» en TypeScript, y
+          // estorba—. Hoy no hay que elegir: este recorrido solo ve SQL, y el de TypeScript lo
+          // hace su parser.
+          if (texto[i] === '/' && texto[i + 1] === '*') {
             hondura++;
             i += 2;
           } else if (texto[i] === '*' && texto[i + 1] === '/') {
@@ -1581,20 +1498,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         continue;
       }
       // Comentario de línea: `--` en SQL, `//` en TypeScript.
-      if (modo === 'sql' ? c === '-' && d === '-' : c === '/' && d === '/') {
+      if (c === '-' && d === '-') {
         /*
-         * Y un comentario NO SALE DE SU PLANTILLA. Toda plantilla de TypeScript se lee como
-         * SQL —ahí es donde vive el SQL que este censo busca—, así que una plantilla AJENA
-         * bastaba para cegarlo: en `const ayuda = \`--x\`; const q = sql\`select now()::date\`;`
-         * el `--` de la primera se llevaba el resto de la línea, consulta peligrosa incluida.
+         * Un comentario no sale de su PLANTILLA, y eso ya no hay que vigilarlo aquí: cada
+         * trozo de plantilla llega a este recorrido por separado, recortado por el parser, así
+         * que un `--` nunca puede comerse nada de fuera. Antes sí podía, y bastaba una
+         * plantilla ajena —`const ayuda = \`--x\`;`— para cegar el censo entero.
          *
-         * El arreglo NO es reconocer qué plantillas son SQL por su etiqueta: eso sería una
-         * lista escrita a mano —la forma que ya me ha fallado— y dejaría fuera el SQL de una
-         * plantilla sin etiquetar, que es un HUECO. Acotar el comentario es estrictamente más
-         * seguro: nunca se come nada de fuera de la plantilla donde empieza.
-         *
-         * LÍMITE DECLARADO: una plantilla ajena que mencione una palabra del reloj en PROSA
-         * sigue saliendo marcada. Es un falso positivo, o sea visible, y hoy no hay ninguno.
+         * LÍMITE DECLARADO, ése sigue en pie: toda plantilla de TypeScript se lee como SQL
+         * —ahí es donde vive el SQL que este censo busca, y reconocerlas por su etiqueta sería
+         * una lista escrita a mano que dejaría fuera el SQL sin etiquetar—, así que una
+         * plantilla ajena que mencione una palabra del reloj en PROSA sale marcada. Es un
+         * falso positivo, o sea visible, y hoy no hay ninguno.
          */
         const salto = texto.indexOf('\n', i);
         /*
@@ -1603,26 +1518,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * salía de la plantilla a mitad, y lo que todavía era comentario —una comilla, otro
          * `--`— pasaba a leerse como código y se llevaba por delante lo de después.
          */
-        let cierre = -1;
-        if (pila.length > 1) {
-          for (let j = i; j < texto.length; j++) {
-            if (texto[j] === '\\') {
-              j++;
-              continue;
-            }
-            if (texto[j] === '`') {
-              cierre = j;
-              break;
-            }
-          }
-        }
-        const fin =
-          cierre !== -1 && (salto === -1 || cierre < salto)
-            ? cierre
-            : salto === -1
-              ? texto.length
-              : salto;
-        i = fin;
+        i = salto === -1 ? texto.length : salto;
         salida += ' ';
         continue;
       }
@@ -1639,7 +1535,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * LÍMITE DECLARADO: un identificador que se llame exactamente como una palabra del reloj
        * —`select 1 as "current_date"`— saldrá marcado. Es un falso positivo, o sea visible.
        */
-      if (modo === 'sql' && c === '"') {
+      if (c === '"') {
         const desde = i;
         i++;
         while (i < texto.length) {
@@ -1654,7 +1550,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       // Literal de comillas simples: dato en los dos dialectos. En SQL se escapa
       // duplicándolo; en TypeScript, con barra invertida.
-      if (c === "'" || (modo === 'ts' && c === '"')) {
+      if (c === "'") {
         const desde = i;
         /*
          * La cadena con prefijo `E` de SQL escapa con BARRA y no duplicando la comilla, y
@@ -1667,14 +1563,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * duplicando como la normal.
          */
         const prefijoE =
-          modo === 'sql' &&
           c === "'" &&
           (texto[i - 1] === 'E' || texto[i - 1] === 'e') &&
           !/[A-Za-z0-9_]/.test(texto[i - 2] ?? ' ');
         i++;
         while (i < texto.length) {
-          if ((modo === 'ts' || prefijoE) && texto[i] === '\\') i += 2;
-          else if (texto[i] === c && modo === 'sql' && texto[i + 1] === c) i += 2;
+          if (prefijoE && texto[i] === '\\') i += 2;
+          else if (texto[i] === c && texto[i + 1] === c) i += 2;
           else if (texto[i] === c) {
             i++;
             break;
@@ -1726,7 +1621,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * otra— se leería como literal, así que sus comentarios no se quitarían. Eso da falsos
        * positivos, que se ven, no huecos.
        *
-       * Y SOLO EN EL MARCO RAÍZ (`pila.length === 1`), que es donde `pg_get_functiondef` pone
+       * Y solo aquí, en el recorrido de SQL, que es donde `pg_get_functiondef` pone
        * el cuerpo. Dentro de una plantilla de TypeScript, `$` no es esto: `` `< $${n}` `` —que
        * está en `ai.degradacion.ts`— es un dólar literal seguido de una interpolación, y
        * leerlo como apertura de cuerpo se comía el `${` y dejaba la etiqueta puesta para el
@@ -1734,7 +1629,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * por delante la consulta y el censo daba verde. Lo escribí sin este alcance y lo
        * encontré al buscar en `src/` si el idioma existía: existe.
        */
-      if (modo === 'sql' && pila.length === 1 && c === '$') {
+      if (c === '$') {
         const m = DOLAR.exec(texto.slice(i));
         if (m) {
           const etiqueta = m[0];
@@ -1756,25 +1651,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           i = hasta;
           continue;
         }
-      }
-      /*
-       * Dentro de una plantilla, la BARRA escapa el carácter siguiente. Sin esto, un backtick
-       * escapado —`` `texto \` // ejemplo` ``, TypeScript válido— cerraba el marco antes de
-       * tiempo, y el `//` que en realidad es contenido de la plantilla se llevaba por delante
-       * el resto de la línea, consulta peligrosa incluida.
-       */
-      if (modo === 'sql' && pila.length > 1 && c === '\\') {
-        salida += c + (d ?? '');
-        i += 2;
-        continue;
-      }
-      // Las comillas invertidas abren y cierran SQL dentro de TypeScript.
-      if (c === '`') {
-        if (modo === 'ts') pila.push({ modo: 'sql', interpolacion: false, llaves: 0 });
-        else if (pila.length > 1) pila.pop();
-        salida += c;
-        i++;
-        continue;
       }
       salida += c;
       i++;
@@ -2573,6 +2449,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     ).toBe(true);
     expect(
       culpable('const n = await (f()) / 2; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y la división cuyo operando izquierdo es un OBJETO, que es la que refutó la afirmación
+     * con la que yo había justificado meter el `}` entre los abridores: escribí que dividir un
+     * objeto no significa nada en JavaScript, y con un `valueOf` significa exactamente lo que
+     * parece. Es la quinta de esta familia y la que la cerró: esto ya no lo decide una lista de
+     * caracteres, lo decide el parser.
+     */
+    expect(
+      culpable(
+        'const ratio = { valueOf() { return 1; } } / 2; const sep = /[/*]/;'
+          + ' const q = sql`select now()::date`;',
+        'ts',
+      ),
     ).toBe(true);
     expect(culpable('function f() {} /[/*]/.test(x); const q = sql`select now()::date`;', 'ts')).toBe(
       true,

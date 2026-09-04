@@ -1846,6 +1846,31 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           fuera += ' ';
           continue;
         }
+        /*
+         * El entrecomillado POR DÓLAR es la tercera forma de escribir un dato, y el barrido
+         * solo conocía las comillas simples: `select $$insert into temporal$$ as texto` daba
+         * la transacción por ESCRITORA y con eso la EXIME de fijar el aislamiento.
+         *
+         * Y una excepción que me acabo de ganar en el otro censo: `` `$${n}` `` es un dólar
+         * LITERAL seguido de una interpolación, no una etiqueta. Aquí la dirección del error
+         * sería la benigna —vaciar de más deja la transacción en «no escribe» y la NOMBRA, o
+         * sea ruido visible—, pero no hay razón para pagarlo pudiendo distinguirlo.
+         */
+        if (c === '$' && d === '$' && texto[i + 2] === '{') {
+          fuera += c;
+          i++;
+          continue;
+        }
+        if (c === '$') {
+          const m = /^\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/.exec(texto.slice(i));
+          if (m) {
+            const etiqueta = m[0];
+            const cierra = texto.indexOf(etiqueta, i + etiqueta.length);
+            i = cierra === -1 ? texto.length : cierra + etiqueta.length;
+            fuera += ' ';
+            continue;
+          }
+        }
         if (c === "'") {
           i++;
           while (i < texto.length) {
@@ -2378,6 +2403,23 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           const [b] = await tx\`select 2 as y\`;
           return { a, b };
         });
+      // Y dentro de un literal POR DÓLAR, que es la tercera forma de escribir un dato.
+      export const sondaDolarEscritura = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select $$insert into temporal$$ as texto\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      // Y una que SÍ escribe, con la escritura DETRÁS de un dólar seguido de interpolación:
+      // \`$\${n}\` es un dólar literal más una interpolación, no un entrecomillado por dólar.
+      // Tomarlo por literal vaciaría hasta el final y la haría parecer de solo lectura.
+      const sondaOkDolarInterpolado = async (actorId: string, n: number) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`with a as (select $\${n}) insert into t select * from a returning x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      export { sondaOkDolarInterpolado };
       // Y lo mismo dentro de un LITERAL, que tampoco se ejecuta.
       export const sondaLiteralEscritura = async (actorId: string) =>
         conUsuario(actorId, async (tx) => {
@@ -2456,6 +2498,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaComputada',
         'sonda.ts:sondaComentarioEscritura',
         'sonda.ts:sondaLiteralEscritura',
+        'sonda.ts:sondaDolarEscritura',
       ].sort(),
     );
 

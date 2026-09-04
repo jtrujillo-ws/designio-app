@@ -1210,9 +1210,22 @@ async function sembrarAdminPropio(cliente: typeof sql, wsId: string): Promise<st
       values (${email}, ${nombre}, ${hash}, 'activo') returning id`;
     id = u!.id as string;
   }
+  /*
+   * El segundo workspace se busca por la FIRMA DEL SEED —tener a Lucía de miembro— y no solo
+   * por su nombre. `workspace` no tiene unicidad por nombre (comprobado: su única restricción
+   * es la clave primaria por `id`), así que un tenant real llamado «Clínica del Valle» habría
+   * recibido una membresía `lead-boutique` de una persona de verdad. Eso no es un seed
+   * escribiendo de más: es escalada de privilegios entre tenants.
+   *
+   * Es el idioma que el propio seed ya usa en `sembrarSegundoWorkspace` para decidir si tiene
+   * que crearlo. Yo copié la intención y perdí el calificador; lo cazó la revisión.
+   */
+  const [ws2] = await cliente`select w.id from workspace w
+    join miembro m on m.workspace_id = w.id
+    join usuario u on u.id = m.usuario_id
+    where w.nombre = 'Clínica del Valle' and lower(u.email) = 'lucia@whitespace.demo'`;
   // La membresía va por workspace y se salta la que ya esté: `on conflict do nothing` y no
   // un `select` previo, porque entre mirar y escribir cabe otro arranque del mismo deploy.
-  const [ws2] = await cliente`select id from workspace where nombre = 'Clínica del Valle'`;
   for (const w of [wsId, ws2?.id as string | undefined]) {
     if (!w) continue;
     await cliente`insert into miembro (workspace_id, usuario_id, nombre, email, rol)

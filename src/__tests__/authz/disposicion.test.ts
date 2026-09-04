@@ -1900,6 +1900,30 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         }
         return t;
       };
+      /** El nombre que abre transacción. Una vez, porque lo preguntan tres sitios. */
+      const ABRE = 'conUsuario';
+      /**
+       * A qué nombre apunta un inicializador cuando es un ALIAS. Un identificador
+       * —`const abrir = conUsuario;`— apunta a su texto. Y un ACCESO A PROPIEDAD
+       * —`const abrir = db.conUsuario;`, que es como queda con un `import * as`—, al nombre de
+       * la propiedad: la llamada directa `db.conUsuario(…)` ya se reconocía, pero no que se
+       * GUARDE primero y se llame después, y por ahí se iba la proyección entera —de la lista
+       * que busca y del cierre por alcance, que preguntan lo mismo—.
+       *
+       * La propiedad se exige LITERAL, que es la misma regla que `esApertura` aplica a la
+       * llamada por propiedad. Resolverla en cadena mapearía también `const x = otra.cosa` a la
+       * `cosa` local de este módulo, y este mapa no solo decide qué abre transacción: también
+       * resuelve CUERPOS.
+       *
+       * En una función y no en dos: `aliasDe` y el recorrido del módulo hacen la misma
+       * pregunta, y un criterio repetido aprende en un sitio y se queda viejo en el otro.
+       */
+      const nombreAliasado = (init: TS.Expression) => {
+        const v = desenvolver(init);
+        if (ts.isIdentifier(v)) return v.text;
+        if (ts.isPropertyAccessExpression(v) && v.name.text === ABRE) return v.name.text;
+        return undefined;
+      };
       /**
        * Y los ALIAS de un módulo —`const abrir = conUsuario;`—, que también hacen falta para
        * los AJENOS: el predicado de «esto abre una transacción» se resuelve contra ellos, y
@@ -1926,8 +1950,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           if (!ts.isVariableStatement(st)) continue;
           for (const d of st.declarationList.declarations) {
             if (!ts.isIdentifier(d.name) || !d.initializer) continue;
-            const v2 = desenvolver(d.initializer);
-            if (ts.isIdentifier(v2)) m.set(d.name.text, v2.text);
+            const apunta = nombreAliasado(d.initializer);
+            if (apunta !== undefined) m.set(d.name.text, apunta);
           }
         }
         return m;
@@ -2295,15 +2319,16 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        * fuera de las DOS listas y nadie la echaría de menos.
        *
        * Cubre el nombre desnudo, un alias suyo —`const abrir = conUsuario;`, siguiendo la
-       * cadena— y la llamada por PROPIEDAD, `db.conUsuario(…)`, que es como queda con un
-       * `import * as`. Las dos últimas las encontré probando, después de escribir que eran el
-       * hueco que le quedaba al cierre.
+       * cadena—, la llamada por PROPIEDAD, `db.conUsuario(…)`, que es como queda con un
+       * `import * as`, y la propiedad GUARDADA y llamada después, `const abrir = db.conUsuario`,
+       * que entra por el mismo mapa de alias. Las encontré probando, después de escribir que
+       * eran el hueco que le quedaba al cierre.
        */
       const abreTransaccion = (nombre: string, mapa: Map<string, string> = alias) => {
         const vistos = new Set<string>();
         let actual: string | undefined = nombre;
         while (actual !== undefined && !vistos.has(actual)) {
-          if (actual === 'conUsuario') return true;
+          if (actual === ABRE) return true;
           vistos.add(actual);
           actual = mapa.get(actual);
         }
@@ -2311,7 +2336,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       };
       const esApertura = (n: TS.CallExpression, mapa: Map<string, string> = alias) =>
         (ts.isIdentifier(n.expression) && abreTransaccion(n.expression.text, mapa)) ||
-        (ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === 'conUsuario');
+        (ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === ABRE);
       /**
        * Lo que envuelve a un valor sin cambiarlo: `(f) satisfies T`, `f as T`, `(f)`, `f!`.
        * Sin desenvolver, `export const p = (async (…) => conUsuario(…)) satisfies Proyeccion`
@@ -2375,8 +2400,9 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
              * tenía cuerpo, así que no entraba; y la original no llevaba `export`, así que
              * tampoco. Ninguno de los dos censos la veía.
              */
-            if (ts.isIdentifier(valor)) {
-              alias.set(d.name.text, valor.text);
+            const apunta = nombreAliasado(d.initializer);
+            if (apunta !== undefined) {
+              alias.set(d.name.text, apunta);
               if (llevaExport(st)) exportadas.add(d.name.text);
             }
           }
@@ -2921,6 +2947,16 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           const [b] = await tx\`select 2 as y\`;
           return { a, b };
         });
+      // Y guardada desde el ESPACIO DE NOMBRES. La llamada directa \`db.conUsuario(…)\` ya se
+      // reconocía; guardarla primero y llamarla después, no — y las dos listas preguntan lo
+      // mismo, así que la proyección se caía del censo y del cierre a la vez.
+      const abrirProp = db.conUsuario;
+      export const sondaIndirectaPorPropiedad = async (actorId: string) =>
+        abrirProp(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
       // Un identificador ENTRE COMILLAS DOBLES: en SQL es un NOMBRE, no un dato, pero tampoco
       // es una sentencia de escritura.
       export const sondaIdentificador = async (actorId: string) =>
@@ -3050,6 +3086,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaAliasDoble',
         'sonda.ts:sondaPropiedad',
         'sonda.ts:sondaIndirecta',
+        'sonda.ts:sondaIndirectaPorPropiedad',
         'sonda.ts:sondaAyudanteAjeno',
         'sonda.ts:sondaMensajeEscritura',
         'sonda.ts:sondaAjenoQueAnida',

@@ -678,6 +678,35 @@ declare
   v_ws uuid;
   v_disp constancia_disposicion;
 begin
+  -- ── Excepción DECLARADA: SOLTAR una propiedad de KPI ──────────────────────────────────
+  -- La congelación exceptúa el DELETE en `miembro` porque revocar un acceso tiene que poder
+  -- hacerse siempre. Esa excepción sola NO bastaba: `entrada_kpi.propietario_miembro_id`
+  -- apunta a `miembro` y su clave foránea retiene la fila, así que dar de baja a quien es
+  -- dueño de un KPI terminaba en 23503 — y `entrada_kpi` está congelada para UPDATE, así que
+  -- tampoco se podía soltar la referencia antes. Con las dos puertas cerradas, el archivo se
+  -- convertía en el permiso perpetuo que la otra excepción existe para impedir.
+  --
+  -- La clave foránea pasa a `on delete set null` (más abajo), y eso dispara un UPDATE sobre
+  -- `entrada_kpi` que este guard vería y rechazaría: comprobado que una acción referencial SÍ
+  -- ejecuta los triggers de fila, y que si el trigger lanza, el DELETE entero falla.
+  --
+  -- Así que se permite exactamente ESA escritura y ninguna otra: un UPDATE que solo pone a
+  -- NULL el propietario y no cambia ningún otro campo. Comparado por el contenido de la fila
+  -- —`to_jsonb(...) - 'propietario_miembro_id'`— y no por la lista de columnas que alguien se
+  -- acuerde de escribir: si mañana se añade una columna, la comparación la cubre sola.
+  -- Todo por jsonb y no por `new.propietario_miembro_id`: este guard es el MISMO para las
+  -- 50 tablas congelables, y plpgsql resuelve el campo aunque la tabla no lo tenga —«record
+  -- new has no field», medido, rompiendo 38 casos de golpe—. `to_jsonb(new)` vale para
+  -- cualquier fila.
+  if tg_table_name = 'entrada_kpi'
+     and tg_op = 'UPDATE'
+     and to_jsonb(new) ->> 'propietario_miembro_id' is null
+     and to_jsonb(old) ->> 'propietario_miembro_id' is not null
+     and to_jsonb(new) - 'propietario_miembro_id' = to_jsonb(old) - 'propietario_miembro_id'
+  then
+    return new;
+  end if;
+
   foreach v_ws in array v_wss loop
     -- Anti-oráculo, y por workspace. En un INSERT los triggers BEFORE corren ANTES del WITH
     -- CHECK de la política, así que sin esto un no-miembro que intentara escribir en un
@@ -1397,3 +1426,23 @@ grant execute on function
   disposicion_motivo_no_ejecutable(uuid),
   ejecutar_disposicion(uuid, integer)
 to designio_app;
+
+
+-- ── Que la baja de un miembro pueda siempre: soltar la propiedad del KPI ──────────────
+-- `entrada_kpi.propietario_miembro_id` retenía al miembro con NO ACTION, así que la
+-- excepción de DELETE sobre `miembro` no alcanzaba a quien fuera dueño de un KPI. Pasa a
+-- soltar la referencia: la entrada de KPI se CONSERVA —el archivo no pierde nada— y se queda
+-- sin dueño, que es justo lo que significa dar de baja a esa persona. El guard de congelación
+-- permite ese UPDATE y solo ese.
+--
+-- CON LISTA DE COLUMNAS, y no es un adorno: un `set null` a secas sobre una clave foránea
+-- COMPUESTA pone a NULL las DOS columnas —medido: `(p, ws)` pasa de `(1, 7)` a
+-- `(NULL, NULL)`—, y aquí eso sería nular `workspace_id`, que es NOT NULL y además la columna
+-- por la que el guard decide de qué workspace hablamos. Con la lista solo se suelta el
+-- propietario y la fila se queda donde está. (`set null (columna)` existe desde PostgreSQL 15,
+-- que es la versión de CI.)
+alter table entrada_kpi
+  drop constraint entrada_kpi_propietario_miembro_id_workspace_id_fkey,
+  add constraint entrada_kpi_propietario_miembro_id_workspace_id_fkey
+    foreign key (propietario_miembro_id, workspace_id)
+    references miembro (id, workspace_id) on delete set null (propietario_miembro_id);

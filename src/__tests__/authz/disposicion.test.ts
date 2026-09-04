@@ -259,6 +259,72 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect(constancia.conteos.miembro).toBe(2);
   });
 
+  it('un workspace archivado no se convierte en un permiso perpetuo: la baja SIEMPRE puede', async () => {
+    /*
+     * La congelación exceptúa el DELETE en `miembro` a propósito, y el motivo está escrito en
+     * la migración: un workspace archivado durante años no puede quedarse sin forma de quitarle
+     * la entrada a quien se fue de la organización cliente. Congelar la salida convertiría el
+     * archivo en un permiso perpetuo.
+     *
+     * Pero la excepción sola no basta, y este caso es el que lo comprueba: si ese miembro es
+     * PROPIETARIO de una entrada de KPI, la clave foránea compuesta lo retiene, y
+     * `entrada_kpi` sí está congelada para UPDATE, así que tampoco se puede soltar la
+     * referencia antes. Sin las dos mitades, la baja es imposible y el acceso queda.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('permiso-perpetuo');
+    const [m] = await admin`select id from miembro
+      where workspace_id = ${ws} and usuario_id = ${adminId}`;
+    const [srv] = await admin`select id from servicio where workspace_id = ${ws}`;
+    const [reto] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
+      values (${ws}, ${srv!.id}, 'R-99', 'Reto', ${leadId}) returning id`;
+    const [cri] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, ventana_dias, creado_por)
+      values (${ws}, ${reto!.id}, 'KPI', 30, ${leadId}) returning id`;
+    const [reg] = await admin`insert into metric_registry (workspace_id, reto_id, estado, creado_por)
+      values (${ws}, ${reto!.id}, 'borrador', ${leadId}) returning id`;
+    await admin`insert into entrada_kpi (workspace_id, registry_id, criterio_id, nombre,
+        definicion, fuente, dimensiones, propietario_miembro_id, frecuencia, dashboard_url,
+        creado_por)
+      values (${ws}, ${reg!.id}, ${cri!.id}, 'KPI', 'def', 'fuente', 'dim', ${m!.id},
+        'mensual', 'https://x', ${leadId})`;
+
+    await acordarYExportar(ws, 'archivo', leadId);
+    await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'archivo',
+      acuerdoVersionEsperada: 1,
+      confirmacion: '',
+    });
+
+    // La baja tiene que poder. Es la afirmación entera de la excepción declarada.
+    await admin`delete from miembro where id = ${m!.id}`;
+    const [quedan] = await admin`select count(*)::int as n from miembro where id = ${m!.id}`;
+    expect(quedan!.n).toBe(0);
+    // Y la entrada de KPI sigue ahí, sin dueño: el archivo se conserva, el acceso no.
+    const [ek] = await admin`select propietario_miembro_id, workspace_id from entrada_kpi
+      where workspace_id = ${ws}`;
+    expect(ek!.propietario_miembro_id).toBeNull();
+    // El `set null` va con LISTA DE COLUMNAS: sin ella nula también `workspace_id` —medido— y
+    // la fila se saldría del workspace cuyo archivo la conserva.
+    expect(ek!.workspace_id).toBe(ws);
+
+    /*
+     * Y la CLASE, no el caso: hoy `entrada_kpi` es la única tabla que apunta a `miembro`, pero
+     * la excepción de la baja se rompe con que alguien añada mañana otra clave foránea que
+     * retenga. Se exige que NINGUNA bloquee el borrado —`a` es NO ACTION y `r` es RESTRICT—,
+     * así que la próxima nace con su acción referencial decidida o sale por aquí.
+     */
+    const retienen = await admin`
+      select c.conrelid::regclass::text as tabla, pg_get_constraintdef(c.oid) as fk
+      from pg_constraint c
+      where c.contype = 'f' and c.confrelid = 'miembro'::regclass
+        and c.confdeltype in ('a', 'r')
+      order by 1`;
+    expect(retienen.map((f) => f.tabla as string)).toEqual([]);
+  });
+
   it('un archivo no destruye nada, y aun así congela: la modalidad no es una etiqueta', async () => {
     const admin = sqlAdmin();
     const ws = await nuevoWorkspace('archivo');
@@ -1900,24 +1966,108 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
          * `catch` —cuatro consultas cuyo resultado forma el mensaje—, y con un indicador
          * global el `insert into` de la primera dejaba a la segunda fuera del censo.
          */
-        const llamadas: TS.CallExpression[] = [];
-        const buscar = (n: TS.Node) => {
+        /*
+         * Los ENVOLTORIOS locales de `conUsuario`: un ayudante que recibe el callback y se lo
+         * reenvía —`conUsuarioTraduciendoElCommit(actorId, fn)` hace
+         * `return await conUsuario(actorId, fn)` para traducir un error del commit—. Llamar a
+         * uno abre una transacción igual, y su callback es el argumento que reenvía.
+         *
+         * Sin esto, seguir a los ayudantes llevaba al `conUsuario(actorId, fn)` de dentro,
+         * donde `fn` es un PARÁMETRO y no hay función que mirar: las cuatro operaciones que lo
+         * usan salían como «callback sin resolver». El envoltorio no es un caso raro, es un
+         * patrón normal, y quien lo escribe no está escondiendo nada.
+         */
+        const envoltorios = new Map<string, number>();
+        for (const [nom, fn] of porNombre) {
           if (
-            ts.isCallExpression(n) &&
-            ts.isIdentifier(n.expression) &&
-            n.expression.text === 'conUsuario'
+            !ts.isFunctionDeclaration(fn) &&
+            !ts.isArrowFunction(fn) &&
+            !ts.isFunctionExpression(fn)
           ) {
-            llamadas.push(n);
+            continue;
+          }
+          const params = fn.parameters.map((pp) =>
+            ts.isIdentifier(pp.name) ? pp.name.text : undefined,
+          );
+          let reenvia: number | undefined;
+          const mirar = (x: TS.Node) => {
+            if (
+              ts.isCallExpression(x) &&
+              ts.isIdentifier(x.expression) &&
+              x.expression.text === 'conUsuario'
+            ) {
+              const a1 = x.arguments[1];
+              if (a1 && ts.isIdentifier(a1)) {
+                const k = params.indexOf(a1.text);
+                if (k >= 0) reenvia = k;
+              }
+            }
+            ts.forEachChild(x, mirar);
+          };
+          ts.forEachChild(fn, mirar);
+          if (reenvia !== undefined) envoltorios.set(nom, reenvia);
+        }
+
+        /** Cada transacción, con la posición del argumento que lleva su callback. */
+        const llamadas: { nodo: TS.CallExpression; arg: number }[] = [];
+        /*
+         * Y se sigue a los AYUDANTES locales. Si la exportada delega —`return
+         * cargarPanel(actorId)`— y es el ayudante quien abre la transacción, mirar solo el
+         * nodo de la exportada encuentra CERO transacciones y la deja fuera del censo entera.
+         * Es un refactor válido que producía un verde silencioso, y `porNombre` ya tenía el
+         * ayudante: solo faltaba recorrerlo.
+         *
+         * Con protección de ciclos, que dos ayudantes pueden llamarse entre sí.
+         */
+        const vistos = new Set<TS.Node>([nodo]);
+        const buscar = (n: TS.Node) => {
+          if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) {
+            const envuelve = envoltorios.get(n.expression.text);
+            if (n.expression.text === 'conUsuario') llamadas.push({ nodo: n, arg: 1 });
+            else if (envuelve !== undefined) llamadas.push({ nodo: n, arg: envuelve });
+            else {
+              const destino = porNombre.get(n.expression.text);
+              if (destino && !vistos.has(destino)) {
+                vistos.add(destino);
+                ts.forEachChild(destino, buscar);
+              }
+            }
           }
           ts.forEachChild(n, buscar);
         };
         ts.forEachChild(nodo, buscar);
 
-        llamadas.forEach((llamada, i) => {
-          const callback = llamada.arguments[1];
-          if (!callback) return;
-          const tx = primerParametro(callback);
-          if (!tx) return;
+        /**
+         * La función que hace de callback, venga como venga: escrita ahí, envuelta en
+         * `satisfies`/`as`/paréntesis, o pasada por NOMBRE —`conUsuario(actorId, leerPanel)`—.
+         */
+        const resolverFuncion = (n: TS.Expression): TS.Node | undefined => {
+          const v = desenvolver(n);
+          if (ts.isArrowFunction(v) || ts.isFunctionExpression(v)) return v;
+          if (ts.isIdentifier(v)) return porNombre.get(v.text);
+          return undefined;
+        };
+
+        llamadas.forEach(({ nodo: llamada, arg }, i) => {
+          const clave =
+            llamadas.length > 1 ? `${ruta}:${nombre}#${i + 1}` : `${ruta}:${nombre}`;
+          const bruto = llamada.arguments[arg];
+          const callback = bruto ? resolverFuncion(bruto) : undefined;
+          const tx = callback ? primerParametro(callback) : undefined;
+          if (!callback || !tx) {
+            /*
+             * FALLA CERRADO. Antes esto era un `return` silencioso, y por ahí se colaba una
+             * transacción entera: bastaba pasar el callback por nombre para que
+             * `primerParametro` recibiera un `Identifier`, devolviera `undefined` y el censo
+             * la descartara sin mirarla. Un guardián que se calla cuando no entiende algo es
+             * peor que uno que no existe, porque parece que cubre.
+             *
+             * Si no se puede resolver, se NOMBRA. Que quien lo lea decida: o lo hace
+             * resoluble, o lo declara con su motivo.
+             */
+            nombradas.push(`${clave} (callback sin resolver)`);
+            return;
+          }
 
           // El aislamiento se lee del TERCER ARGUMENTO real, no de la palabra suelta.
           /*
@@ -1926,7 +2076,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
            * comprobación textual daba por declarada la proyección. Tiene que ser una PROPIEDAD
            * llamada `aislamiento` con el valor que se espera.
            */
-          const opciones = llamada.arguments[2];
+          // Las opciones van justo detrás del callback, sea cual sea su posición: en
+          // `conUsuario` es la tercera, y en un envoltorio que no las reenvía no hay ninguna
+          // — y entonces esa proyección NO puede fijar el aislamiento, que es la respuesta
+          // correcta y no un descuido del censo.
+          const opciones = llamada.arguments[arg + 1];
           const fijaAislamiento =
             Boolean(opciones) &&
             ts.isObjectLiteralExpression(opciones!) &&
@@ -1941,12 +2095,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
 
           const { sentencias, escribe } = analizar(callback, tx);
 
-          if (sentencias >= 2 && !escribe && !fijaAislamiento) {
-            // Con varias transacciones en la misma función hace falta decir CUÁL.
-            nombradas.push(
-              llamadas.length > 1 ? `${ruta}:${nombre}#${i + 1}` : `${ruta}:${nombre}`,
-            );
-          }
+          // Con varias transacciones en la misma función, la clave dice CUÁL.
+          if (sentencias >= 2 && !escribe && !fijaAislamiento) nombradas.push(clave);
         });
       }
       return nombradas;
@@ -1999,6 +2149,36 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a };
         });
       export { sondaOkUna };
+      // La exportada DELEGA y es el ayudante quien abre la transacción. Mirando solo el nodo
+      // de la exportada salen cero transacciones y se escapa entera.
+      const abridorLocal = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      export const sondaDelega = async (actorId: string) => abridorLocal(actorId);
+      // El callback pasado por NOMBRE. Antes devolvía \`undefined\` y se descartaba en silencio.
+      const leerPanel = async (tx: TransactionSql) => {
+        const [a] = await tx\`select 1 as x\`;
+        const [b] = await tx\`select 2 as y\`;
+        return { a, b };
+      };
+      export const sondaPorNombre = async (actorId: string) => conUsuario(actorId, leerPanel);
+      // Un ENVOLTORIO local que reenvía el callback: llamarlo abre transacción igual.
+      const envolver = async (actorId: string, fn: (tx: TransactionSql) => Promise<unknown>) =>
+        conUsuario(actorId, fn);
+      export const sondaEnvuelta = async (actorId: string) =>
+        envolver(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      // Un callback que NO se puede resolver: viene de otro módulo y aquí no hay cuerpo que
+      // mirar. Tiene que salir NOMBRADO, no descartado en silencio — es la mitad que hace que
+      // el censo falle cerrado, y sin esta sonda esa rama no la ejercitaba nada.
+      export const sondaImportada = async (actorId: string) =>
+        conUsuario(actorId, leerDeOtroModulo);
       // La transacción no se llama siempre \`tx\`: el símbolo sale del parámetro del
       // callback. Con la cadena fija, renombrarlo no contaba NI UNA consulta.
       export const sondaRenombrada2 = async (actorId: string) =>
@@ -2062,6 +2242,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         // La SEGUNDA de las dos transacciones: la primera escribe y queda fuera, como debe.
         // El sufijo dice cuál, que con varias en la misma función hace falta.
         'sonda.ts:sondaDosTx#2',
+        'sonda.ts:sondaDelega',
+        'sonda.ts:sondaPorNombre',
+        'sonda.ts:sondaEnvuelta',
+        'sonda.ts:sondaImportada (callback sin resolver)',
       ].sort(),
     );
 

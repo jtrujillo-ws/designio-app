@@ -80,19 +80,45 @@ comment on function sello_constancia(text) is
 'sha256 hex de la carga canónica de una constancia. IMMUTABLE por la premisa comprobada en 20260903200000: el server_encoding de una base es fijo.';
 
 -- ── Qué cubre una constancia, y qué NO ────────────────────────────────────────────────
--- Vive en una función y viaja DENTRO del documento sellado porque un alcance que solo
--- estuviera en la documentación no acompaña al papel que el cliente conserva, y es
--- justamente cuando ya no tiene acceso cuando necesita saber qué se le borró y qué no.
--- Las dos ausencias son decisiones, no descuidos:
---  · las CUENTAS de usuario son identidad de plataforma: la misma persona puede ser
---    miembro de otros workspaces (en el propio seed lo es), así que la disposición de UN
---    workspace no puede decidir el destino de una identidad que otros siguen usando. Por
---    eso `usuario` no lleva `workspace_id` y queda fuera del conjunto cerrado por FK; el
---    borrado de una cuenta es otra operación, con su propio acuerdo, y no ésta;
---  · el material ya despachado a un proveedor no lo alcanza ningún candado de esta base.
-create function alcance_de_constancia() returns text
+/*
+ * Vive en una función y viaja DENTRO del documento sellado porque un alcance que solo
+ * estuviera en la documentación no acompaña al papel que el cliente conserva, y es
+ * justamente cuando ya no tiene acceso cuando necesita saber qué se le borró y qué no.
+ *
+ * Y es lo que MÁS caro sale si miente, porque miente con un sello al lado. La primera
+ * versión de este texto decía «cubre TODA fila» y enumeraba dos ausencias —las cuentas y
+ * el material externo—, cuando en realidad sobreviven CINCO cosas: aquellas dos, el
+ * acuerdo, esta misma constancia y la fila del workspace convertida en lápida, más el
+ * evento que la propia disposición escribe. Una constancia así acreditaba una eliminación
+ * más amplia que la ejecutada. Cada excepción existía por una razón escrita en su sitio;
+ * lo que faltaba era decirlas donde el cliente las lee.
+ *
+ * Toma la MODALIDAD porque las dos no hacen lo mismo y un solo texto no puede ser exacto
+ * para las dos: un borrado destruye el conjunto de `tablas_alcanzadas_por_borrado()`, y un
+ * archivo no destruye nada y congela el de `tablas_congelables()`, que es MÁS PEQUEÑO —la
+ * auditoría y el registro de exportaciones siguen escribiéndose a propósito—. Con un texto
+ * único, el recibo de un archivo declaraba congelado un libro que sigue aceptando
+ * escrituras.
+ *
+ * Las ausencias, y por qué cada una:
+ *  · las CUENTAS de usuario son identidad de plataforma: la misma persona puede ser
+ *    miembro de otros workspaces (en el propio seed lo es), así que la disposición de UN
+ *    workspace no puede decidir el destino de una identidad que otros siguen usando. Por
+ *    eso `usuario` no lleva `workspace_id` y queda fuera del conjunto cerrado por FK; el
+ *    borrado de una cuenta es otra operación, con su propio acuerdo, y no ésta;
+ *  · el material ya despachado a un proveedor no lo alcanza ningún candado de esta base;
+ *  · el ACUERDO y la CONSTANCIA son lo que acredita el borrado: destruirlas sería destruir
+ *    la prueba de lo que se hizo, y por eso `tablas_alcanzadas_por_borrado()` las excluye;
+ *  · la fila de `workspace` sobrevive vaciada porque de su identificador cuelga todo lo
+ *    demás, esta constancia incluida (la FK existe y es lo que la hace consultable);
+ *  · y el evento que escribe la propia disposición, que es lo único que queda en el libro.
+ */
+create function alcance_de_constancia(p_modalidad text) returns text
 language sql immutable parallel safe as $$
-  select 'Alcance (whitespace-constancia/1): cubre TODA fila del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, derivada del catálogo vivo de la base y no de una lista escrita a mano. NO cubre: (1) las cuentas de usuario, que son identidad de plataforma y pueden pertenecer a otros workspaces, así que su borrado es otra operación con su propio acuerdo; (2) el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor, porque los bytes enviados no se des-envían.'
+  select case p_modalidad
+    when 'borrado' then 'Alcance (whitespace-constancia/1, borrado): se destruyó TODA fila del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. SOBREVIVEN, y cada excepción es una decisión: (1) las cuentas de usuario, identidad de plataforma que puede pertenecer a otros workspaces, así que su borrado es otra operación con su propio acuerdo; (2) el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor, porque los bytes enviados no se des-envían; (3) el acuerdo que autoriza este borrado y esta misma constancia («acuerdo_disposicion» y «constancia_disposicion», con esos nombres en los conteos), que son lo que lo acredita y no pueden destruirse a sí mismas —por eso el acuerdo viaja aquí entero y sellado—; (4) la fila del propio workspace, vaciada de contenido (nombre sustituido por una lápida y cupo de llamadas AI anulado) y conservada solo como el identificador del que cuelga esta constancia; y (5) el único evento de auditoría que escribe esta misma disposición, que es lo que queda en el libro tras el vaciado.'
+    when 'archivo' then 'Alcance (whitespace-constancia/1, archivo): NO se destruyó ninguna fila. Los conteos dicen cuántas quedan CONSERVADAS del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. Quedan además CONGELADAS —ni altas, ni cambios, ni bajas— todas MENOS cuatro, y las cuatro son decisiones: la auditoría («evento_dominio») y el registro de exportaciones («exportacion_registro») siguen aceptando escrituras, porque un archivo tiene que poder seguir diciendo quién lo consulta y quién lo re-exporta; el acuerdo («acuerdo_disposicion») tampoco se congela, porque registrar uno nuevo es exactamente lo que revierte un archivo; y esta misma constancia («constancia_disposicion») queda fuera por lo mismo, aunque nadie pueda escribirla —no existe permiso de alta, cambio ni baja sobre ella para ninguna parte—. La fila del propio workspace (su nombre y su cupo de llamadas AI) ni se cuenta ni se congela: no pertenece al conjunto derivado. Fuera de alcance quedan, igual que en un borrado, las cuentas de usuario —identidad de plataforma que puede pertenecer a otros workspaces— y el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor.'
+  end
 $$;
 
 -- ── La exportación previa tiene que ser INFALSIFICABLE ────────────────────────────────
@@ -210,8 +236,16 @@ create table acuerdo_disposicion (
   -- texto libre que el borrado no alcanza. Y pasa por el mismo predicado que el material
   -- importado —controles C0/C1 y overrides bidi— invocado, no reescrito: es texto que se
   -- pinta y que perdura, la superficie exacta donde el bidi engaña.
+  -- Y en UNA SOLA LÍNEA. `texto_importado_limpio` prohíbe los controles pero deja pasar
+  -- tabulador, LF y CR a propósito —está pensado para material importado, que es
+  -- multilínea—, y aquí eso sería una puerta: esta referencia se COPIA dentro de la carga
+  -- canónica de la constancia, que es un campo por renglón, así que un salto de línea
+  -- dejaría el documento sellado ambiguo —la misma carga podría leerse como dos juegos de
+  -- campos distintos— y permitiría dibujar dentro del recibo campos que no se pactaron. Una
+  -- referencia contractual («cláusula 4.2 del MSA 2026-114») no necesita renglones.
   base text not null check (
-    length(btrim(base)) between 1 and 300 and texto_importado_limpio(base)),
+    length(btrim(base)) between 1 and 300 and texto_importado_limpio(base)
+    and base !~ '[\n\r]'),
   -- El rol de la parte que lo registró, sellado AQUÍ y no reconstruido después: los roles
   -- cambian, y un acuerdo dice quién era quién CUANDO se acordó. Es la mitad que hace
   -- comprobable la doble firma del borrado. Lo escribe el guard y está fuera del grant.
@@ -242,6 +276,33 @@ create table constancia_disposicion (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references workspace(id),
   acuerdo_version integer not null check (acuerdo_version >= 1),
+  /*
+   * ── Y el acuerdo ENTERO, no solo su número ──
+   * Un `acuerdo_version = 2` no dice nada fuera de esta base. Y fuera de esta base es
+   * exactamente donde vive una constancia: tras un borrado no queda membresía, así que lo
+   * único que le queda a cada parte es el documento sellado que conserva. Con la versión
+   * sola, ese documento acreditaba QUE se ejecutó una disposición y no CUÁL — ni bajo qué
+   * base contractual, ni desde cuándo podía ejecutarse, ni quién puso la primera firma. La
+   * doble firma es la garantía central de un borrado irreversible; sin el firmante dentro
+   * del sello, la constancia acredita una sola de las dos voluntades: la de quien ejecutó.
+   *
+   * Se COPIAN, no se referencian: la fila del acuerdo sobrevive al borrado, pero solo la
+   * ve quien la firmó (su RLS), y el sello tiene que valer con el papel en la mano y sin
+   * base delante. Un recibo que hay que ir a cotejar contra el sistema que certifica su
+   * propia destrucción no es un recibo.
+   */
+  acuerdo_base text not null check (
+    length(btrim(acuerdo_base)) between 1 and 300 and acuerdo_base !~ '[\n\r]'),
+  -- La fecha efectiva viaja como TEXTO en ISO, y no como `date`, por la misma razón que los
+  -- dos instantes: lo que entra en el sello tiene que ser BYTES fijos. `date::text` y
+  -- `to_char(date, …)` son STABLE —dependen de `DateStyle`, que es de sesión—, así que
+  -- Postgres los rechaza en una columna generada (medido) y, aunque los aceptara, el mismo
+  -- día daría dos textos distintos según quién mirara. Se guarda el renglón que el documento
+  -- enseña, formateado una vez al emitirlo.
+  acuerdo_efectivo_desde text not null
+    check (acuerdo_efectivo_desde ~ '^\d{4}-\d{2}-\d{2}$'),
+  acuerdo_por uuid not null references usuario(id),
+  acuerdo_rol text not null check (acuerdo_rol in ('lead-boutique', 'admin-cliente')),
   modalidad text not null check (modalidad in ('archivo', 'borrado')),
   -- El instante de la exportación que la precede. RF-01.9 dice «posterior a la
   -- exportación», así que el recibo nombra CUÁL: sin esto, «se exportó antes» sería una
@@ -273,7 +334,13 @@ create table constancia_disposicion (
   -- viaja dentro del sello porque una constancia emitida bajo este contrato tiene que
   -- seguir diciendo lo que ESTE contrato cubría, aunque una versión posterior cubra otra
   -- cosa. Lo escribe el guard; no hay grant de insert con el que contradecirlo.
-  alcance text not null check (length(btrim(alcance)) between 1 and 1000),
+  -- El tope subió de 1000 a 2000 cuando el texto pasó a decir la verdad: enumerar las cinco
+  -- cosas que sobreviven a un borrado, y las cuatro que un archivo no congela, no cabe en lo
+  -- que sí cabía la versión que afirmaba «TODA fila» con dos excepciones. Un tope sigue
+  -- habiendo —esto es un recibo, no un anexo— y una sola línea, que es lo que mantiene
+  -- inequívoca la carga sellada: cada campo ocupa exactamente un renglón.
+  alcance text not null check (
+    length(btrim(alcance)) between 1 and 2000 and alcance !~ '[\n\r]'),
   -- ── El sello ──
   -- Columna GENERADA y no un trigger, y la diferencia es operativa, no estética: el
   -- borrado corre con `session_replication_role = replica` (ver abajo), así que un trigger
@@ -294,6 +361,10 @@ create table constancia_disposicion (
     || workspace_id::text || E'\n'
     || modalidad || E'\n'
     || acuerdo_version::text || E'\n'
+    || acuerdo_base || E'\n'
+    || acuerdo_efectivo_desde || E'\n'
+    || acuerdo_por::text || E'\n'
+    || acuerdo_rol || E'\n'
     || extract(epoch from timezone('UTC', ejecutado_en))::text || E'\n'
     || ejecutado_por::text || E'\n'
     || ejecutado_rol || E'\n'
@@ -354,27 +425,18 @@ language sql stable as $$
                         'exportacion_registro')
 $$;
 
--- ── Quién firmó el acuerdo que una constancia ejecutó ─────────────────────────────────
--- SECURITY DEFINER, y no por comodidad: las dos políticas se necesitan mutuamente —la del
--- acuerdo mira la constancia para no cerrarle la puerta a quien la ejecutó, y la de la
--- constancia mira el acuerdo para no cerrársela a quien lo firmó— y una RLS que consulta la
--- tabla cuya RLS la consulta a ella es recursión infinita, que Postgres detecta y rechaza.
--- Corriendo como el dueño, esta lectura no vuelve a entrar en la política y el ciclo se corta
--- por un solo lado. Es el mismo recurso con el que `is_workspace_member` sostiene el resto.
--- El usuario se deriva DENTRO, de `app_user_id()`, y no se acepta como parámetro. La
--- diferencia es la que separa un ayudante de un oráculo: siendo SECURITY DEFINER salta la RLS
--- por diseño, y con el firmante en la firma cualquiera con el grant podía preguntar
--- «¿firmó ESTA persona ESE acuerdo de ESE workspace?» sobre uuids ajenos y recibir la
--- respuesta por encima de la RLS — existencia y autoría de acuerdos de otro inquilino. Sin ese
--- parámetro, lo único que se puede preguntar es sobre uno mismo, que es algo que ya se sabe.
-create function firmo_esta_disposicion(p_ws uuid, p_version integer)
-  returns boolean
-language sql stable security definer set search_path = public, pg_temp as $$
-  select exists (
-    select 1 from acuerdo_disposicion a
-    where a.workspace_id = p_ws and a.version = p_version
-      and a.acordado_por = app_user_id())
-$$;
+-- ── Por qué aquí NO hay un ayudante SECURITY DEFINER ──────────────────────────────────
+-- Lo hubo. Las dos políticas se necesitaban mutuamente —la del acuerdo mira la constancia
+-- para no cerrarle la puerta a quien la ejecutó, y la de la constancia miraba el acuerdo
+-- para no cerrársela a quien lo firmó—, y una RLS que consulta la tabla cuya RLS la
+-- consulta a ella es recursión infinita, que Postgres detecta y rechaza. Se cortaba con una
+-- función SECURITY DEFINER, que salta la RLS por diseño y hay que vigilar como tal.
+--
+-- Copiar el acuerdo dentro de la constancia disolvió el ciclo por su causa: la política de
+-- la constancia ya no tiene que ir a preguntar quién firmó, porque el firmante está EN LA
+-- FILA. Queda una referencia de ida (la del acuerdo hacia la constancia) y ninguna de
+-- vuelta, así que el ayudante sobra — y una función que salta la RLS que sobra se borra, no
+-- se conserva por si acaso. Un test comprueba que no vuelve a existir.
 
 -- ── La disposición vigente, en UN sitio ───────────────────────────────────────────────
 -- Devuelve la fila entera y no solo la modalidad porque quien la consulta necesita
@@ -828,11 +890,18 @@ begin
   end if;
 
   insert into constancia_disposicion
-    (workspace_id, acuerdo_version, modalidad, exportado_en, conteos, remediacion,
+    (workspace_id, acuerdo_version, acuerdo_base, acuerdo_efectivo_desde, acuerdo_por,
+     acuerdo_rol, modalidad, exportado_en, conteos, remediacion,
      remediacion_items, remediacion_con_consentimiento, ejecutado_por, ejecutado_rol,
      alcance)
-  values (p_ws, v_ac.version, v_ac.modalidad, v_export, v_conteos, v_remediacion,
-          v_items, v_con_consentimiento, v_actor, v_rol, alcance_de_constancia())
+  values (p_ws, v_ac.version, v_ac.base,
+          -- `to_char` aquí y no en la columna generada: es STABLE, y aquí eso no estorba
+          -- porque el valor se congela al escribirlo. Formato fijo, sin nombres de mes, así
+          -- que ni `DateStyle` ni `lc_time` lo mueven.
+          to_char(v_ac.efectivo_desde, 'YYYY-MM-DD'), v_ac.acordado_por, v_ac.acordado_rol,
+          v_ac.modalidad, v_export, v_conteos, v_remediacion,
+          v_items, v_con_consentimiento, v_actor, v_rol,
+          alcance_de_constancia(v_ac.modalidad))
   returning * into v_constancia;
 
   -- El evento va DESPUÉS del vaciado, así que sobrevive: tras un borrado, el libro de este
@@ -898,14 +967,15 @@ create policy acuerdo_insert on acuerdo_disposicion
 -- respuesta inmediata llega a la boutique y el cliente se queda sin nada en cuanto se
 -- destruyen las membresías. Justamente la parte que más necesita el recibo.
 --
--- Se ata al acuerdo CONCRETO que esta constancia ejecutó, y no a haber firmado alguno: quien
--- pactó una disposición anterior que no llegó a ejecutarse no gana con ella una ventana a lo
--- que pasó después.
 create policy constancia_select on constancia_disposicion
   for select using (
     is_workspace_member(app_user_id(), workspace_id)
     or ejecutado_por = app_user_id()
-    or firmo_esta_disposicion(workspace_id, acuerdo_version)
+    -- Y quien FIRMÓ el acuerdo que esta constancia ejecutó, leído de la propia fila. Se ata
+    -- al acuerdo CONCRETO —es el que se copió al emitirla— y no a haber firmado alguno:
+    -- quien pactó una disposición anterior que no llegó a ejecutarse no gana con ella una
+    -- ventana a lo que pasó después.
+    or acuerdo_por = app_user_id()
   );
 
 -- ── Grants mínimos ────────────────────────────────────────────────────────────────────
@@ -919,9 +989,8 @@ grant select on constancia_disposicion to designio_app;
 
 revoke execute on function
   confirmar_exportacion(uuid, text),
-  firmo_esta_disposicion(uuid, integer),
   sello_constancia(text),
-  alcance_de_constancia(),
+  alcance_de_constancia(text),
   tablas_del_workspace(),
   tablas_alcanzadas_por_borrado(),
   tablas_congelables(),
@@ -931,7 +1000,6 @@ revoke execute on function
 from public;
 grant execute on function
   confirmar_exportacion(uuid, text),
-  firmo_esta_disposicion(uuid, integer),
   disposicion_vigente(uuid),
   disposicion_motivo_no_ejecutable(uuid),
   ejecutar_disposicion(uuid)

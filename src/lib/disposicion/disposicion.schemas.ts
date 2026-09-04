@@ -31,7 +31,23 @@ export const RegistrarAcuerdoSchema = z.object({
    * que sin tope sería una puerta por la que colar texto libre que el borrado no alcanza.
    * El mismo límite que la base, para que el rechazo llegue antes y con palabras.
    */
-  base: z.string().trim().min(1).max(300),
+  base: z
+    .string()
+    .trim()
+    .min(1)
+    .max(300)
+    /*
+     * Y en UNA sola línea. No es cosmética: esta referencia se COPIA dentro de la carga
+     * canónica de la constancia, que es un campo por renglón, así que un salto de línea
+     * dejaría el documento sellado ambiguo —los mismos bytes leídos como dos juegos de campos
+     * distintos— y permitiría dibujar dentro del recibo una fecha efectiva u otro firmante
+     * que nadie pactó. La base lo impone con un CHECK; esto solo hace que el rechazo llegue
+     * antes y con palabras, que es lo mismo que hace el tope de 300.
+     */
+    .refine((v) => !/[\n\r]/.test(v), {
+      message:
+        'La referencia del acuerdo va en una sola línea: viaja dentro del documento sellado, que lleva un campo por renglón',
+    }),
   /**
    * La retención de RF-09.4: antes de esta fecha la disposición no se ejecuta. Es lo que
    * impide que un borrado irreversible sea un clic.
@@ -84,7 +100,23 @@ export type ConstanciaDisposicion = {
   id: string;
   workspaceId: string;
   modalidad: ModalidadDisposicion;
+  /**
+   * El acuerdo que se ejecutó, ENTERO y no solo su número. Un `acuerdoVersion = 2` no
+   * significa nada fuera de esta base, y fuera de esta base es donde vive una constancia:
+   * tras un borrado no queda membresía, así que lo único que le queda a cada parte es el
+   * documento sellado que conserva. Con la versión sola acreditaba QUE hubo disposición y no
+   * CUÁL, ni bajo qué base contractual, ni desde cuándo, ni quién puso la PRIMERA firma —que
+   * en un borrado es la mitad de la garantía, porque quien registra y quien ejecuta tienen
+   * que ser partes distintas—.
+   *
+   * La fecha viaja como texto ISO por lo mismo que los dos instantes: lo que entra en un
+   * sello tiene que ser bytes fijos, y el renderizado de una fecha depende de `DateStyle`.
+   */
   acuerdoVersion: number;
+  acuerdoBase: string;
+  acuerdoEfectivoDesde: string;
+  acuerdoPor: string;
+  acuerdoRol: string;
   ejecutadoEpoch: string;
   ejecutadoPor: string;
   ejecutadoRol: string;
@@ -159,6 +191,13 @@ export function jsonbTexto(valor: unknown): string {
  * Si esta función y la expresión de la columna dejaran de coincidir, el sello dejaría de
  * verificar y la promesa se caería en silencio. Por eso hay un test que compara ESTE texto
  * con el sello que calculó Postgres sobre una constancia real, en las dos modalidades.
+ *
+ * La carga es UN CAMPO POR RENGLÓN, y eso solo es inequívoco si ningún campo lleva saltos de
+ * línea. Los que vienen de la base los tiene prohibidos por CHECK —`acuerdo_base` y
+ * `alcance`, los dos únicos de texto libre—; los inventarios pasan por `jsonbTexto`, que
+ * escapa igual que `JSON.stringify`; y el resto son uuids, enteros, enums y epochs. Sin esa
+ * invariante, una referencia contractual con un salto de línea dibujaría dentro del recibo
+ * campos que nadie pactó.
  */
 export function cargaCanonicaConstancia(c: ConstanciaDisposicion): string {
   return [
@@ -167,6 +206,10 @@ export function cargaCanonicaConstancia(c: ConstanciaDisposicion): string {
     c.workspaceId,
     c.modalidad,
     String(c.acuerdoVersion),
+    c.acuerdoBase,
+    c.acuerdoEfectivoDesde,
+    c.acuerdoPor,
+    c.acuerdoRol,
     c.ejecutadoEpoch,
     c.ejecutadoPor,
     c.ejecutadoRol,

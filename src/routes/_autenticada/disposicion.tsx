@@ -374,6 +374,15 @@ function PantallaDisposicion() {
 function Constancia({ c, reciente }: { c: ConstanciaDisposicion; reciente: boolean }) {
   const carga = cargaCanonicaConstancia(c);
   const tablas = Object.entries(c.conteos).sort(([a], [b]) => (a < b ? -1 : 1));
+  /*
+   * Qué salió hacia fuera se decide por el MAPA, no por el contador de ítems. Un workspace
+   * que solo hizo llamadas de alcance de reto (C0) tiene `reto_id` e `item_id` nulo en cada
+   * fila, así que `remediacionItems` vale 0 con `remediacion` lleno: gobernar la visibilidad
+   * con el contador escondía el aviso entero justo en ese caso —el usuario no llegaba a
+   * saber que había material en un proveedor al que pedir la retirada—. El contador sigue
+   * siendo dato, y lo dice la frase; lo que ya no es, es la condición.
+   */
+  const modelos = Object.entries(c.remediacion).sort(([a], [b]) => (a < b ? -1 : 1));
   return (
     <Card style={{ padding: 22, display: 'flex', flexDirection: 'column', gap: 12 }}>
       <span style={etiqueta}>
@@ -383,6 +392,18 @@ function Constancia({ c, reciente }: { c: ConstanciaDisposicion; reciente: boole
         {c.modalidad === 'borrado' ? 'Borrado' : 'Archivo'} del acuerdo #{c.acuerdoVersion},
         ejecutado por {c.ejecutadoRol}.
       </p>
+      {/*
+        El acuerdo se enseña ENTERO y no solo por su número, porque entero es como viaja
+        dentro del sello: es lo que acredita la primera de las dos firmas cuando ya no queda
+        base que consultar. Sin esto, la pantalla enseñaría menos de lo que el documento dice.
+      */}
+      <div>
+        <span style={etiqueta}>Acuerdo ejecutado</span>
+        <p style={{ ...parrafo, color: 'var(--text-muted)' }}>
+          «{c.acuerdoBase}» — registrado por {c.acuerdoRol}, ejecutable desde el{' '}
+          {c.acuerdoEfectivoDesde}.
+        </p>
+      </div>
       <div>
         <span style={etiqueta}>Sello (sha256)</span>
         <p style={{ ...parrafo, fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
@@ -391,7 +412,7 @@ function Constancia({ c, reciente }: { c: ConstanciaDisposicion; reciente: boole
       </div>
       <div>
         <span style={etiqueta}>
-          {c.modalidad === 'borrado' ? 'Filas destruidas' : 'Filas conservadas y congeladas'}
+          {c.modalidad === 'borrado' ? 'Filas destruidas' : 'Filas conservadas'}
         </span>
         <p style={{ ...parrafo, color: 'var(--text-muted)' }}>
           {tablas.length === 0
@@ -399,14 +420,17 @@ function Constancia({ c, reciente }: { c: ConstanciaDisposicion; reciente: boole
             : tablas.map(([t, n]) => `${t}: ${n}`).join(' · ')}
         </p>
       </div>
-      {c.remediacionItems > 0 && (
+      {modelos.length > 0 && (
         <div>
           <span style={etiqueta}>Lo que ya salió y no alcanza este borrado</span>
           <p style={{ ...parrafo, color: 'var(--text-muted)' }}>
-            {c.remediacionItems} ítems tuvieron material despachado a un proveedor externo, de
-            ellos {c.remediacionConConsentimiento} llamadas amparadas por un consentimiento
-            —es decir, con material de personas—. Los bytes enviados no se des-envían: eso se
-            retira pidiéndoselo al proveedor, y esta es la lista con la que hacerlo.
+            {modelos.map(([m, n]) => `${m}: ${n}`).join(' · ')} — llamadas despachadas a un
+            proveedor externo.{' '}
+            {c.remediacionItems > 0
+              ? `De ellas, ${c.remediacionItems} ítems de bandeja tuvieron material enviado y ${c.remediacionConConsentimiento} llamadas iban amparadas por un consentimiento —es decir, con material de personas—.`
+              : 'Ninguna iba anclada a un ítem de la bandeja: son llamadas de alcance de reto, que no llevan material importado de personas.'}{' '}
+            Los bytes enviados no se des-envían: eso se retira pidiéndoselo al proveedor, y
+            esta es la lista con la que hacerlo.
           </p>
         </div>
       )}

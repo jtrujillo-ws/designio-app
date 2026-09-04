@@ -56,6 +56,7 @@ function acuerdoDeFila(f: Record<string, unknown>): AcuerdoDisposicion {
  * guarda microsegundos, así que reconstruir el epoch desde una fecha daría otro hash. Se
  * transporta lo que Postgres imprime. */
 const COLUMNAS_CONSTANCIA = `id::text, workspace_id::text, modalidad, acuerdo_version,
+  acuerdo_base, acuerdo_efectivo_desde, acuerdo_por::text, acuerdo_rol,
   extract(epoch from timezone('UTC', ejecutado_en))::text as ejecutado_epoch,
   ejecutado_por::text, ejecutado_rol,
   extract(epoch from timezone('UTC', exportado_en))::text as exportado_epoch,
@@ -67,6 +68,12 @@ function constanciaDeFila(f: Record<string, unknown>): ConstanciaDisposicion {
     workspaceId: f.workspace_id as string,
     modalidad: f.modalidad as ModalidadDisposicion,
     acuerdoVersion: Number(f.acuerdo_version),
+    acuerdoBase: f.acuerdo_base as string,
+    // Ya es texto en la base: `acuerdo_efectivo_desde` se guarda formateado para que lo que
+    // entra en el sello sean bytes fijos. Aquí no se reformatea nada, que es el punto.
+    acuerdoEfectivoDesde: f.acuerdo_efectivo_desde as string,
+    acuerdoPor: f.acuerdo_por as string,
+    acuerdoRol: f.acuerdo_rol as string,
     ejecutadoEpoch: f.ejecutado_epoch as string,
     ejecutadoPor: f.ejecutado_por as string,
     ejecutadoRol: f.ejecutado_rol as string,

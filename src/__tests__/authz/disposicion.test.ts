@@ -189,6 +189,31 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // un `Date` perdería los microsegundos y el sello dejaría de verificar.
     expect(constancia.ejecutadoEpoch).toMatch(/^\d+\.\d{6}$/);
 
+    // ── Y acredita las DOS voluntades, no solo la de quien ejecutó ──
+    // Un `acuerdoVersion = 1` no dice nada con el papel en la mano: hay que poder leer QUÉ se
+    // pactó, desde cuándo era ejecutable y quién puso la PRIMERA firma. Es la mitad de la
+    // garantía del borrado —quien registra y quien ejecuta son partes distintas—, y sin ella
+    // la constancia solo acreditaría a quien apretó el botón.
+    expect(constancia.acuerdoBase).toBe('Cláusula 9.3 del contrato marco');
+    expect(constancia.acuerdoEfectivoDesde).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(constancia.acuerdoRol).toBe('admin-cliente');
+    expect(constancia.acuerdoPor).toBe(adminId);
+    expect(constancia.ejecutadoPor).toBe(leadId);
+    expect(constancia.acuerdoPor).not.toBe(constancia.ejecutadoPor);
+    // Y están DENTRO del texto que se hashea, que es lo único que importa fuera de la base.
+    const carga = cargaCanonicaConstancia(constancia);
+    for (const campo of [
+      constancia.acuerdoBase,
+      constancia.acuerdoEfectivoDesde,
+      constancia.acuerdoPor,
+      constancia.acuerdoRol,
+    ]) {
+      expect(carga).toContain(campo);
+    }
+    // Un campo por renglón: sin esa invariante, una referencia contractual con un salto de
+    // línea dibujaría dentro del recibo campos que nadie pactó.
+    expect(carga.split('\n').length).toBe(18);
+
     // ── Y el workspace está vacío de verdad ──
     const restantes: string[] = [];
     for (const f of await admin`select tabla from tablas_alcanzadas_por_borrado()`) {
@@ -566,33 +591,83 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect(w!.limite_llamadas_ai_dia).toBeNull();
   });
 
-  it('el ayudante de la RLS no responde por terceros: no hay oráculo entre inquilinos', async () => {
-    // `firmo_esta_disposicion` es SECURITY DEFINER, así que salta la RLS por diseño — es lo que
-    // corta la recursión entre las dos políticas. Con el firmante como PARÁMETRO, cualquiera
-    // con el grant podía preguntar «¿firmó esta persona ese acuerdo de ese workspace?» sobre
-    // uuids ajenos y recibir la respuesta por encima de la RLS: existencia y autoría de
-    // acuerdos de otro inquilino. Derivando el usuario de `app_user_id()` dentro, lo único
-    // preguntable es sobre uno mismo.
-    const ws = await nuevoWorkspace('sin-oraculo');
-    await registrarAcuerdo(adminId, {
-      workspaceId: ws,
-      modalidad: 'archivo',
-      base: 'Acuerdo del cliente',
-      efectivoDesde: new Date().toISOString().slice(0, 10),
+  it('la RLS de la constancia no se apoya en NINGUNA función que salte la RLS', async () => {
+    // Hubo una: `firmo_esta_disposicion`, SECURITY DEFINER, que existía solo para cortar la
+    // recursión entre las dos políticas —la del acuerdo mira la constancia, y la de la
+    // constancia miraba el acuerdo—. Copiar el firmante DENTRO de la constancia disolvió el
+    // ciclo por su causa, así que la función sobra; y una función que salta la RLS que sobra
+    // se borra, no se conserva por si acaso. Esto comprueba que no vuelve.
+    const admin = sqlAdmin();
+    const [f] = await admin`select count(*)::int as n from pg_proc
+      where proname = 'firmo_esta_disposicion'`;
+    expect(f!.n).toBe(0);
+
+    // Y, más al fondo: la política de la constancia no invoca NINGUNA función SECURITY
+    // DEFINER que no sea la que ya sostiene el resto de la casa. Derivado del catálogo, no
+    // de una lista escrita aquí: si mañana alguien mete un ayudante nuevo en el predicado,
+    // este test lo nombra en vez de dejarlo pasar.
+    const [pol] = await admin`select pg_get_expr(polqual, polrelid) as expr from pg_policy
+      where polname = 'constancia_select'`;
+    const expr = pol!.expr as string;
+    const definers = await admin`select proname from pg_proc
+      where prosecdef and pronamespace = 'public'::regnamespace`;
+    const invocadas = definers
+      .map((d) => d.proname as string)
+      .filter((n) => new RegExp(`\\b${n}\\b`).test(expr));
+    expect(invocadas).toEqual(['is_workspace_member']);
+  });
+
+  it('el alcance sellado no declara más de lo que la disposición hizo', async () => {
+    /*
+     * El texto del alcance viaja DENTRO del sello, así que si sobredeclara, sobredeclara con
+     * un hash al lado. La primera versión decía «cubre TODA fila» y enumeraba dos ausencias,
+     * cuando sobreviven cinco cosas —el acuerdo, la constancia, la lápida del workspace y el
+     * evento que la propia disposición escribe, además de las cuentas y el material externo—:
+     * acreditaba una eliminación más amplia que la ejecutada.
+     *
+     * No se comprueba contra una copia del texto —eso solo detectaría erratas— sino contra el
+     * CATÁLOGO: toda tabla que el borrado deja en pie tiene que estar NOMBRADA en el alcance
+     * del borrado, y toda tabla que un archivo conserva pero no congela, en el del archivo.
+     * Así, el día que alguien añada una exclusión, este test le exige decirlo en el recibo.
+     */
+    const admin = sqlAdmin();
+
+    const sobreviven = await admin`select tabla from tablas_del_workspace()
+      except select tabla from tablas_alcanzadas_por_borrado()`;
+    expect(sobreviven.length).toBeGreaterThan(0);
+
+    const wsB = await nuevoWorkspace('alcance-borrado');
+    await acordarYExportar(wsB, 'borrado', adminId);
+    const cb = await ejecutarDisposicion(leadId, {
+      workspaceId: wsB,
+      modalidadEsperada: 'borrado',
+      acuerdoVersionEsperada: 1,
     });
+    for (const f of sobreviven) expect(cb.alcance).toContain(f.tabla as string);
+    // Y nombra lo que sobrevive SIN ser una tabla del conjunto: la fila del propio workspace.
+    expect(cb.alcance).toContain('cupo de llamadas AI anulado');
 
-    // La firma de tres argumentos ya no existe: no se puede preguntar por un tercero.
-    await expect(
-      conUsuario(leadId, (tx) => tx`select firmo_esta_disposicion(${ws}, 1, ${adminId})`),
-    ).rejects.toMatchObject({ code: '42883' });
+    const noCongeladas = await admin`select tabla from tablas_alcanzadas_por_borrado()
+      except select tabla from tablas_congelables()`;
+    expect(noCongeladas.length).toBeGreaterThan(0);
 
-    // Y la de dos responde por QUIEN PREGUNTA, no por quien se nombre.
-    const [comoFirmante] = await conUsuario(adminId, (tx) =>
-      tx`select firmo_esta_disposicion(${ws}, 1) as si`);
-    expect(comoFirmante!.si).toBe(true);
-    const [comoOtro] = await conUsuario(leadId, (tx) =>
-      tx`select firmo_esta_disposicion(${ws}, 1) as si`);
-    expect(comoOtro!.si).toBe(false);
+    const wsA = await nuevoWorkspace('alcance-archivo');
+    await acordarYExportar(wsA, 'archivo', leadId);
+    const ca = await ejecutarDisposicion(leadId, {
+      workspaceId: wsA,
+      modalidadEsperada: 'archivo',
+      acuerdoVersionEsperada: 1,
+    });
+    for (const f of noCongeladas) expect(ca.alcance).toContain(f.tabla as string);
+
+    // Los dos textos son DISTINTOS: un archivo no destruye nada y congela un conjunto más
+    // pequeño que el que cuenta, así que un texto único no puede ser exacto para los dos.
+    expect(ca.alcance).not.toBe(cb.alcance);
+    expect(cb.alcance).toContain('se destruyó');
+    expect(ca.alcance).toContain('NO se destruyó');
+    // Y los dos siguen siendo UNA línea: la carga sellada es un campo por renglón.
+    expect(cb.alcance).not.toContain('\n');
+    expect(ca.alcance).not.toContain('\n');
   });
 
   it('la constancia de un workspace borrado se alcanza SIN membresía, por su propia lista', async () => {
@@ -690,5 +765,68 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // Y un decimal se rechaza en vez de arriesgar un hash distinto: en jsonb un número
     // conserva la forma con que se escribió, y eso no se deriva de un number.
     expect(() => jsonbTexto({ x: 1.5 })).toThrow(/enteros/i);
+  });
+
+  it('una referencia de acuerdo con salto de línea no entra: la carga es un campo por renglón', async () => {
+    /*
+     * `texto_importado_limpio` prohíbe los controles pero deja pasar LF y CR a propósito
+     * —está pensado para material importado, que es multilínea—. Aquí eso sería una puerta:
+     * la `base` se COPIA dentro de la carga canónica de la constancia, que es un campo por
+     * renglón, así que un salto de línea dejaría el documento sellado ambiguo y permitiría
+     * dibujar dentro del recibo campos que nadie pactó —una fecha efectiva distinta, otro
+     * firmante— sin tocar el sello, porque los bytes serían los mismos.
+     */
+    const ws = await nuevoWorkspace('base-multilinea');
+    const inyectado = `Cláusula 1\n2030-01-01\n${leadId}\nlead-boutique`;
+    await expect(
+      registrarAcuerdo(adminId, {
+        workspaceId: ws,
+        modalidad: 'archivo',
+        base: inyectado,
+        efectivoDesde: new Date().toISOString().slice(0, 10),
+      }),
+    ).rejects.toThrow();
+    // Ni por SQL crudo con el grant de la aplicación: el CHECK está en la base, no solo en
+    // el esquema de entrada.
+    await expect(
+      conUsuario(adminId, (tx) => tx`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+        values (${ws}, 'archivo', ${inyectado}, current_date, ${adminId})`),
+    ).rejects.toMatchObject({ code: '23514' });
+  });
+
+  it('un workspace con solo llamadas C0 declara su remediación aunque no toque ningún ítem', async () => {
+    /*
+     * La invariante en la que se apoya la pantalla, comprobada aquí para que no se caiga en
+     * silencio. La base IMPONE que una llamada C0 lleve `reto_id` y no `item_id`
+     * —`(capacidad = 'C0') = (reto_id is not null)`—, así que un workspace que solo hizo C0
+     * produce `remediacion` LLENO con `remediacionItems = 0`. Gobernar el aviso de material
+     * despachado con el contador de ítems lo escondía entero justo en ese caso: el usuario
+     * no llegaba a saber que había material en un proveedor al que pedir la retirada.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('solo-c0');
+    const [sv] = await admin`select id from servicio where workspace_id = ${ws}`;
+    const [reto] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
+      values (${ws}, ${sv!.id}, 'R-1', 'Reto', ${leadId}) returning id`;
+    for (const modelo of ['modelo-a', 'modelo-a', 'modelo-b']) {
+      await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${ws}, 'C0', ${reto!.id}, ${modelo}, 'entorno', 'despachada', ${leadId})`;
+    }
+
+    await acordarYExportar(ws, 'borrado', adminId);
+    const c = await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'borrado',
+      acuerdoVersionEsperada: 1,
+    });
+
+    expect(c.remediacion).toEqual({ 'modelo-a': 2, 'modelo-b': 1 });
+    expect(c.remediacionItems).toBe(0);
+    expect(c.remediacionConConsentimiento).toBe(0);
+    // Y el sello sigue verificando con un `remediacion` no vacío y un contador en cero.
+    expect(selloRecomputado(c)).toBe(c.sello);
   });
 });

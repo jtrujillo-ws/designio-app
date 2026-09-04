@@ -612,6 +612,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     const HUSO_LITERAL = literalDe(String.raw`[^']*`);
     const HUSO_FIJO = String.raw`${HUSO_LITERAL}\s*\)`;
     /*
+     * Y el prefijo de una conversión con huso FIJO, para poder decir «este reloj ya está
+     * convertido» desde detrás. Se usa como mirada atrás, que es la única forma de excluir el
+     * ARREGLO sin dejar de mirar dentro de lo demás.
+     *
+     * Exige que el huso sea LITERAL, y conviene ser exacto sobre lo que eso vale hoy: NO carga
+     * peso por sí solo. Un huso dinámico dentro de un JSON ya lo marca el patrón de
+     * `timezone(...)`, que no necesita al de JSON para nada; comprobado aflojando esta
+     * condición a un argumento cualquiera, y no se mueve ninguna sonda. Se escribe así porque
+     * es el criterio correcto —«convertido» significa convertido a un huso fijo— y porque dos
+     * guardas que dicen cosas distintas del mismo hecho es como este fichero ha fallado ya
+     * cuatro veces. Medido, no supuesto.
+     */
+    const HUSO_YA_FIJADO = String.raw`${nombreDeFuncion('timezone')}\s*\(\s*${envuelto(HUSO_LITERAL)}\s*,\s*`;
+    /*
      * Y el FORMATO de `to_char`, que hasta ahora no se miraba: se marcaba cualquier `to_char`
      * con un reloj delante, y hay formatos que no leen el calendario —`'"fijo"'` devuelve
      * texto literal y `'US'` extrae microsegundos—.
@@ -757,16 +771,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * `to_jsonb`, `json_build_object`, `jsonb_agg`, `row_to_json` y las que nazcan mañana,
        * sin que nadie tenga que acordarse — que es como falla una lista escrita a mano.
        *
-       * «De primer nivel» es lo que deja fuera el ARREGLO canónico: `to_json(timezone('UTC',
-       * now()))` da el mismo texto en los dos husos (medido) porque lo que se serializa ya es
-       * un `timestamp` SIN huso. El consumidor de argumentos no puede entrar en un grupo
-       * anidado —lo traga entero—, así que un reloj envuelto en una conversión no casa.
+       * Y el reloj puede ir ANIDADO, que es como se usa `row_to_json` de verdad —exige
+       * construir un registro—: `row_to_json(row(now()))` y `jsonb_build_object('d',
+       * coalesce(now(), now()))` serializan igual de local (medido). Así que el consumidor
+       * DESCIENDE: puede saltarse una llamada anidada entera para seguir en el mismo nivel, o
+       * meterse dentro de ella. Lo que no puede es cruzar un `)`, así que nunca sale de la
+       * llamada JSON — que es lo que lo separa de un `.*` y de marcar un reloj de más allá.
        *
-       * LÍMITE DECLARADO: dos niveles de anidamiento, como en el primer argumento de
-       * `date_trunc`. Una expresión regular no cuenta paréntesis.
+       * Lo que deja fuera el ARREGLO canónico ya no es la profundidad sino una mirada ATRÁS:
+       * un reloj precedido de una conversión con huso LITERAL ya está convertido, y
+       * `to_json(timezone('UTC', now()))` da el mismo texto en los dos husos (medido). Con el
+       * huso dinámico la mirada no casa y la expresión se marca, que es justo lo correcto.
+       * (`to_json(now() at time zone 'UTC')` no llega ni a probarse: detrás del reloj no hay
+       * una coma ni un cierre.)
        */
       new RegExp(
-        String.raw`${nombreDeFuncion(String.raw`\w*json\w*`)}\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*?(${RELOJ})\s*(?=[,)])`,
+        String.raw`${nombreDeFuncion(String.raw`\w*json\w*`)}\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\)|\()*?(?<!${HUSO_YA_FIJADO})(${RELOJ})\s*(?=[,)])`,
         'i',
       ),
       /*
@@ -1597,6 +1617,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'to_jsonb(now())',
       "jsonb_build_object('cuando', now())",
       'json_agg(now())',
+      // Y el reloj ANIDADO dentro del valor que se serializa, que es como se usa `row_to_json`
+      // de verdad. Las dos medidas: cadena distinta en husos opuestos.
+      'row_to_json(row(now()))',
+      "jsonb_build_object('d', coalesce(now(), now()))",
+      // Ésta es peligrosa y está bien que esté, pero NO prueba el patrón de JSON: la marca el
+      // de `timezone(...)`, que ve el huso dinámico sin mirar el envoltorio. Se deja dicho para
+      // que nadie la lea como cobertura de lo que no cubre.
+      "jsonb_build_object('d', timezone(current_setting('TimeZone'), now()))",
       // La edad contra HOY, sin ningún reloj escrito: la forma de un solo argumento basta.
       'age(vence_en)',
       "select age(t.creado_en) > interval '30 days' from t",
@@ -1893,6 +1921,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // marcado justo la forma que este PR propone como solución.
       "to_json(timezone('UTC', now()))",
       "jsonb_build_object('d', timezone('UTC', now()))",
+      // Y la otra sintaxis de la conversión fija, que ni llega a probarse: detrás del reloj no
+      // hay coma ni cierre. Medido estable en los dos husos.
+      "to_json(now() at time zone 'UTC')",
       // Con los dos instantes dados, `age` no lee ningún calendario (medido). Y el nombre
       // dentro de otro identificador tampoco: `promedio_age` y `average` no son la función.
       'age(now(), t.creado_en)',

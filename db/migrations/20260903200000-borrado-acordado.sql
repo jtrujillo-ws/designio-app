@@ -319,13 +319,19 @@ end $$;
 -- camino de la aplicación la referencia se guardaba de una forma y por el camino de SQL
 -- crudo de otra, y es la de SQL crudo la que se copia al evento y al documento sellado.
 --
--- La clase de abajo es la de `String.prototype.trim()`, medida carácter a carácter contra
--- esta base: `[[:space:]]` de Postgres cubre el espacio, el tabulador, VT, FF, CR, LF, los
--- separadores Unicode (U+1680, U+2000-U+200A, U+2028, U+2029, U+205F, U+3000)… y deja fuera
--- exactamente tres, que se añaden a mano. Una letra o un guion no entran (comprobado).
+-- La clase de abajo ENUMERA el conjunto de `String.prototype.trim()`, y no se apoya en
+-- `[[:space:]]` con parches. La primera versión sí lo hacía, y por eso se le escapó U+2007
+-- (FIGURE SPACE): medido, `[[:space:]]` cubre 21 de los 25 puntos de código que JavaScript
+-- recorta y deja fuera CUATRO —U+00A0, U+2007, U+202F y U+FEFF, los cuatro «no separables»—,
+-- de los que yo había añadido tres a mano. Enumerar por muestreo es cómo se pierde el cuarto.
+--
+-- Los 25 son el WhiteSpace + LineTerminator de ECMAScript, y el suite los DERIVA de
+-- JavaScript en tiempo de ejecución y los compara contra esta clase sobre el rango Unicode
+-- entero, en vez de fiarse de esta lista. Si una versión futura del lenguaje mueve el
+-- conjunto, el rojo sale de ahí y no de que alguien se acuerde.
 create function texto_recortado(t text) returns text
 language sql immutable parallel safe as
-$$ select regexp_replace(t, '^[[:space:]\u00a0\u202f\ufeff]+|[[:space:]\u00a0\u202f\ufeff]+$', '', 'g') $$;
+$$ select regexp_replace(t, '^[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+|[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+$', '', 'g') $$;
 comment on function texto_recortado(text) is
   'Recorta el mismo conjunto de espacios que `String.prototype.trim()`, para que la base y el esquema Zod no guarden versiones distintas del mismo texto.';
 

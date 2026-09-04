@@ -1741,27 +1741,37 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // referencia EN BLANCO mide cinco y está «entre 1 y 300», así que acotar solo la longitud
     // del valor almacenado la habría dejado entrar por este mismo camino.
     //
-    // «En blanco» son TODOS éstos y no solo el espacio: `btrim(t)` sin segundo argumento
-    // recorta espacios y nada más, y ninguno de los otros es un control C0/C1, así que
-    // `texto_importado_limpio` los deja pasar. El `.trim()` del esquema Zod sí los quita —los
-    // cuatro—, y que la base recorte distinto que el esquema es una segunda verdad: por el
-    // camino de la aplicación la referencia se guarda de una forma y por el de SQL crudo de
-    // otra, y es la de SQL crudo la que acaba dentro del documento sellado.
-    const EN_BLANCO: Record<string, string> = {
-      espacios: ' '.repeat(5),
-      tabuladores: '\t'.repeat(5),
-      NBSP: '\u00a0'.repeat(3),
-      'espacio estrecho': '\u202f'.repeat(3),
-      'espacio ideográfico': '\u3000'.repeat(3),
-      BOM: '\ufeff'.repeat(3),
-    };
-    for (const [nombre, blanco] of Object.entries(EN_BLANCO)) {
+    // «En blanco» no es solo el espacio, y NO se comprueba con una lista escrita a mano: la
+    // lista escrita a mano es cómo se perdió U+2007. Se DERIVA el conjunto que
+    // `String.prototype.trim()` recorta —recorriendo el rango Unicode entero desde
+    // JavaScript— y se exige que la base recorte exactamente ése, ni uno más ni uno menos.
+    //
+    // Medido: son 25 puntos de código (el WhiteSpace + LineTerminator de ECMAScript), y
+    // `[[:space:]]` de Postgres cubre 21. Los cuatro que deja fuera son los «no separables»
+    // —U+00A0, U+2007, U+202F y U+FEFF—, y yo había añadido tres a mano. Con la equivalencia
+    // derivada, el cuarto no se pierde y una versión futura del lenguaje tampoco.
+    const recortaJS: number[] = [];
+    for (let cp = 0; cp <= 0x10ffff; cp++) {
+      if (cp >= 0xd800 && cp <= 0xdfff) continue; // sustitutos: no son caracteres
+      if (String.fromCodePoint(cp).trim() === '') recortaJS.push(cp);
+    }
+    expect(recortaJS.length).toBeGreaterThan(20);
+    const [base] = await sqlAdmin()`
+      select coalesce(array_agg(i order by i), '{}') as cps
+      from generate_series(1, 1114111) i
+      where i not between 55296 and 57343 and texto_recortado(chr(i)) = ''`;
+    expect(base!.cps).toEqual(recortaJS);
+
+    // Y ninguno de ellos entra como referencia: miden más de cero y no dicen nada.
+    for (const cp of recortaJS) {
+      const blanco = String.fromCodePoint(cp).repeat(3);
+      // Los saltos de línea los para el otro CHECK, con su propio motivo; el resto, éste.
       await expect(
         sqlAdmin()`insert into acuerdo_disposicion
           (workspace_id, modalidad, base, efectivo_desde, acordado_por, version, acordado_rol)
           values (${ws}, 'archivo', ${blanco}, ${EFECTIVO_PASADO}, ${adminId}, 2,
                   'admin-cliente')`,
-        `una referencia hecha solo de ${nombre} entró como si dijera algo`,
+        `una referencia hecha solo de U+${cp.toString(16).toUpperCase().padStart(4, '0')} entró como si dijera algo`,
       ).rejects.toThrow(/base_check/i);
     }
 

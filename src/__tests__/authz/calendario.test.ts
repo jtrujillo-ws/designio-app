@@ -48,6 +48,34 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * (medido: `' NOW '::date` y `'NOW'::date` son la misma lectura), así que aquí igual.
    */
   const ESPECIAL_TEMPORAL = /^\s*(?:now|today|tomorrow|yesterday)\s*$/i;
+  /**
+   * Lo que un literal con prefijo `E` VALE, no cómo se teclea. `E'\\x6eow'` es la cadena
+   * `now` —medido, igual que `E'\\156ow'` y `E'\\u006eow'`—, así que `E'\\x6eow'::date` es
+   * exactamente `'now'::date`, o sea `current_date` escrito de la tercera manera. Sin
+   * deshacer los escapes, el contenido no casaba con la lista de cadenas que Postgres evalúa,
+   * el vaciado se lo llevaba y la función quedaba limpia.
+   *
+   * Es la misma lección que la plantilla de TypeScript, en el otro dialecto: preguntar por la
+   * ortografía en vez de por el valor.
+   */
+  const SIN_ESCAPES_E = (t: string): string =>
+    t.replace(
+      /\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|([0-7]{1,3})|(.))/g,
+      (_todo, hex?: string, u4?: string, u8?: string, octal?: string, otro?: string) => {
+        const codigo =
+          hex !== undefined
+            ? parseInt(hex, 16)
+            : u4 !== undefined
+              ? parseInt(u4, 16)
+              : u8 !== undefined
+                ? parseInt(u8, 16)
+                : octal !== undefined
+                  ? parseInt(octal, 8)
+                  : null;
+        if (codigo !== null) return String.fromCodePoint(codigo);
+        return { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' }[otro ?? ''] ?? (otro ?? '');
+      },
+    );
   /*
    * Y el nombre de un tipo tal como lo ESCRIBE el catálogo, que es la otra mitad de esa misma
    * lección: `format_type` devuelve `timestamp without time zone`, no `timestamp`, y la
@@ -184,6 +212,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * El tipo se saca del catálogo, como todo lo demás aquí: nada de listas a mano.
    */
   let RELOJ_ESCRITO_EN_COLUMNA: (texto: string) => boolean = () => false;
+  /** El reloj entregado por `USING` a un marcador que el SQL dinámico colapsa a un día. */
+  let RELOJ_EN_PARAMETRO_DINAMICO: (texto: string) => boolean = () => false;
 
   beforeAll(async () => {
     /*
@@ -1362,14 +1392,29 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
             'gi',
           ),
         ),
-        ...texto.matchAll(
-          new RegExp(
-            String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?(?:${cualquiera})(?![\w"])`,
-            'gi',
-          ),
-        ),
       ].map((m) => m[1]!);
-      const derechas = [...inicializadas, ...asignaciones];
+      /*
+       * El `select … into` con VARIAS columnas asigna por posición: `select 1, now() into n, d`
+       * entrega el reloj a `d`, no a la lista entera. Medido: 2026-09-05 en Pacific/Kiritimati
+       * contra 2026-09-04 en Etc/GMT+12.
+       *
+       * Antes se exigía que una variable vigilada fuera justo la SIGUIENTE al `into`, y se
+       * entregaba toda la lista de selección como una sola hoja: con una variable sola acertaba
+       * por casualidad —la lista era la expresión— y con varias no acertaba nunca. Ahora se
+       * parten las dos listas y se emparejan, que es lo que hace plpgsql.
+       */
+      const entradas = [
+        ...texto.matchAll(
+          new RegExp(String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`, 'gi'),
+        ),
+      ].flatMap((m) => {
+        const destinos = argumentosDe(m[2]!).map((d) => sinComillas(d.trim()));
+        const valores = argumentosDe(m[1]!);
+        return destinos
+          .map((d, i) => (nombres.includes(d) ? valores[i] : undefined))
+          .filter((v): v is string => v !== undefined);
+      });
+      const derechas = [...inicializadas, ...asignaciones, ...entradas];
       return derechas.some((d) => hojasDelValor(d).some((hoja) => RELOJ_A_SECAS.test(hoja)));
     };
 
@@ -1403,9 +1448,32 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       COLUMNAS_EN_ORDEN.set(f.tabla.toLowerCase(), ya);
     }
 
-    /** El nombre tal cual lo escribe Postgres: desnudo se pliega a minúsculas, citado no. */
+    /**
+     * El nombre tal cual lo escribe Postgres: desnudo se pliega a minúsculas, citado no.
+     *
+     * Y con la forma `U&"…"`, que es un identificador escrito por PUNTOS DE CÓDIGO:
+     * `U&"\\0064"` es la columna `d` —medido, y con `UESCAPE '!'` la barra la sustituye el
+     * carácter que se declare—. Sin deshacerlo, la clave que se busca en el catálogo era la
+     * ortografía y no el nombre, así que no casaba con ninguna columna y la escritura salía
+     * limpia. Tercera vez que el mismo error aparece en otro dialecto: preguntar cómo está
+     * escrito algo en vez de qué es.
+     */
     const nombreCanonico = (t: string): string => {
       const n = t.trim();
+      const uni = /^[Uu]&"((?:[^"]|"")*)"(?:\s+uescape\s+'(.)')?$/is.exec(n);
+      if (uni) {
+        const marca = uni[2] ?? '\\';
+        const escapa = marca.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return uni[1]!
+          .replace(/""/g, '"')
+          .replace(
+            new RegExp(`${escapa}(?:\\+([0-9A-Fa-f]{6})|([0-9A-Fa-f]{4})|(${escapa}))`, 'g'),
+            (_todo, seis?: string, cuatro?: string, propia?: string) =>
+              propia !== undefined
+                ? marca
+                : String.fromCodePoint(parseInt((seis ?? cuatro)!, 16)),
+          );
+      }
       return n.startsWith('"') ? n.slice(1, -1).replace(/""/g, '"') : n.toLowerCase();
     };
     /** Lo que hay entre el paréntesis que empieza en `desde` y el que lo cierra. */
@@ -1473,6 +1541,34 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         String.raw`(?:\s+(?:as\s+)?(?!set\b)${NOMBRE_SQL})?\s+set\s+([^;]*)`,
       'gi',
     );
+    /*
+     * `execute <consulta> [into …] using <expr>, <expr>`. La consulta puede venir en un
+     * literal simple o entrecomillada por dólar; en las dos, lo que se busca es un marcador
+     * `$n` colapsado a un tipo sin huso —`$1::date` o `cast($1 as date)`—, y entonces la
+     * n-ésima expresión del `using` es la que se entrega a ese tipo.
+     *
+     * LÍMITE DECLARADO, el de siempre: si la consulta está en una variable no se puede leer.
+     */
+    const EJECUTA_CON_USING =
+      /\bexecute\s+(?:'((?:[^']|'')*)'|\$([A-Za-z_]\w*)?\$([\s\S]*?)\$\2\$)[\s\S]*?\busing\s+([^;]*)/gi;
+    RELOJ_EN_PARAMETRO_DINAMICO = (texto: string): boolean => {
+      for (const m of texto.matchAll(EJECUTA_CON_USING)) {
+        const consulta = (m[1] ?? m[3] ?? '').replace(/''/g, "'");
+        const argumentos = argumentosDe(m[4]!);
+        const marcadores = new RegExp(
+          String.raw`\$(\d+)\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO})|cast\s*\(\s*\$(\d+)\s+as\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})`,
+          'gi',
+        );
+        for (const p of consulta.matchAll(marcadores)) {
+          const numero = Number(p[1] ?? p[2]);
+          const arg = argumentos[numero - 1];
+          if (arg !== undefined && hojasDelValor(arg).some((h) => RELOJ_A_SECAS.test(h)))
+            return true;
+        }
+      }
+      return false;
+    };
+
     RELOJ_ESCRITO_EN_COLUMNA = (texto: string): boolean => {
       const entrega = (tabla: string, columna: string, expr: string): boolean => {
         const tipo = TIPO_DE_COLUMNA.get(`${tabla}.${columna}`);
@@ -1638,6 +1734,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         RELOJ_ENTREGADO(sinLiterales)) ||
       RELOJ_ASIGNADO_A_VARIABLE(sinLiterales) ||
       RELOJ_ESCRITO_EN_COLUMNA(sinLiterales) ||
+      /*
+       * Y el parámetro de un `EXECUTE … USING`, que es otro destino tipado con el tipo escrito
+       * en OTRO sitio: `execute 'select $1::date' into d using now()` entrega el instante al
+       * marcador y el SQL dinámico lo colapsa con el huso de quien llama —medido, 2026-09-05
+       * en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12—. La consulta se analiza sola y
+       * ahí `$1::date` no es ningún reloj; el reloj está fuera, en el `using`, donde no hay
+       * cast que mirar. Se emparejan por número, que es como los empareja Postgres.
+       */
+      RELOJ_EN_PARAMETRO_DINAMICO(conLiterales) ||
       /*
        * Y el SQL DINÁMICO: `execute 'select now()::date'` guarda la operación DENTRO de un
        * literal, que el vaciado se lleva por delante. La función depende del huso de quien la
@@ -1863,6 +1968,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         return;
       }
       if (n.kind === ts.SyntaxKind.StringLiteral) {
+        /*
+         * Una cadena que se le pasa a `unsafe` NO es un dato: es SQL, dicho por el nombre de
+         * la función. Vaciarla es dejar de mirar justo donde la aplicación escribe la consulta
+         * sin la protección de la plantilla — y este repositorio ya usa `tx.unsafe`, hoy con
+         * comillas invertidas (que sí se leen); cambiar una a comillas normales, o añadir otra
+         * así, bastaba para sacar la operación del censo.
+         *
+         * Se conserva SIEMPRE, también al vaciar literales, que es lo mismo que se hace con
+         * las cuatro cadenas que Postgres evalúa: la excepción existe porque ahí el contenido
+         * es código.
+         */
+        const esSqlCrudo =
+          n.parent !== undefined &&
+          ts.isCallExpression(n.parent) &&
+          n.parent.arguments.some((a) => a === n) &&
+          /(^|\.)unsafe$/.test(n.parent.expression.getText(arbol).trim());
+        if (esSqlCrudo) {
+          piezas.push({ inicio, fin, texto: crudo });
+          return;
+        }
         const comilla = crudo[0] ?? "'";
         // Cocinado también aquí, por lo mismo, y con la comilla vuelta a escapar para que el
         // literal siga teniendo los bordes donde los tenía.
@@ -2101,10 +2226,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * manera. Se conserva SOLO ese contenido, así que la función que devuelve la cadena
          * `'current_date'` —el falso positivo que motivó el vaciado— se sigue vaciando.
          */
+        /*
+         * Y con prefijo `E` se pregunta por el VALOR: los escapes se deshacen antes de decidir
+         * si es una de las cadenas que Postgres evalúa, y lo que se copia es el literal ya
+         * cocinado, para que los patrones que lo leen vean `'now'` y no `E'\\x6eow'`.
+         */
+        const contenido = texto.slice(desde + 1, i - 1);
+        const cocido = prefijoE ? SIN_ESCAPES_E(contenido) : contenido;
         salida +=
-          vaciarLiterales && !ESPECIAL_TEMPORAL.test(texto.slice(desde + 1, i - 1))
+          vaciarLiterales && !ESPECIAL_TEMPORAL.test(cocido)
             ? `${c}${c}`
-            : texto.slice(desde, i);
+            : prefijoE
+              ? `${c}${cocido}${c}`
+              : texto.slice(desde, i);
         continue;
       }
       /*
@@ -3239,6 +3373,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * que es, y no enrojece por llevar barras.
      */
     expect(culpable('const q = sql`select \\x6eow()::date`;', 'ts')).toBe(true);
+    /*
+     * Y la cadena que se le pasa a `unsafe` es SQL, no un dato: lo dice el nombre de la
+     * función. Este repositorio ya la usa —hoy con comillas invertidas, que sí se leen—, así
+     * que pasar una de esas consultas a comillas normales bastaba para sacarla del censo.
+     *
+     * Con su mitad segura, que es la que impide leer como SQL cualquier cadena suelta: la
+     * misma consulta escrita en una variable que nadie ejecuta se sigue vaciando.
+     */
+    expect(culpable("await tx.unsafe('select now()::date');", 'ts')).toBe(true);
+    expect(culpable("const t = 'select now()::date';", 'ts')).toBe(false);
     expect(culpable('const q = sql`select \\x64ato from t`;', 'ts')).toBe(false);
     // Y la interpolación se sigue reconociendo detrás de un dólar literal: si no, el
     // comentario de dentro volvería a anidar como SQL.
@@ -3587,6 +3731,53 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
           ' select 2, now() from generate_series(1, 1); end $c$',
       ],
+      /*
+       * Cuatro formas más, las cuatro medidas 2026-09-05 en Pacific/Kiritimati contra
+       * 2026-09-04 en Etc/GMT+12 y las cuatro guardadas verbatim en el catálogo.
+       *
+       * Tres son la MISMA lección en tres dialectos: preguntar cómo está escrito algo en vez
+       * de qué vale. `E'\\x6eow'` es la cadena `now`; `U&"\\0064"` es la columna `d`; y el
+       * `$1` de un `EXECUTE` lleva su tipo escrito en la consulta mientras el reloj viaja
+       * aparte, en el `using`.
+       *
+       * La cuarta es el `select … into` con varias columnas, que asigna por posición: antes se
+       * entregaba la lista entera como una sola hoja, y con una variable sola eso acertaba por
+       * casualidad.
+       */
+      [
+        'censo_probe_escape_e_date',
+        "returns date language plpgsql as $c$ begin return E'\\x6eow'::date; end $c$",
+      ],
+      [
+        'censo_probe_identificador_unicode_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into censo_probe_escritura(k, U&"\\0064") values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_using_date',
+        "returns date language plpgsql as $c$ declare d date;" +
+          " begin execute 'select $1::date' into d using now(); return d; end $c$",
+      ],
+      [
+        'censo_probe_into_dos_columnas_date',
+        'returns date language plpgsql as $c$ declare n int; d date;' +
+          ' begin select 1, now() into n, d; return d; end $c$',
+      ],
+      /*
+       * Y sus seguras: el mismo `using` entregado a un marcador CON huso conserva el instante,
+       * y el mismo `into` de dos columnas con el reloj cayendo en la que lleva huso tampoco
+       * elige calendario. Las dos fijan que lo que se empareja es la POSICIÓN y no la lista.
+       */
+      [
+        'censo_probe_ok_using_instante',
+        "returns timestamptz language plpgsql as $c$ declare d timestamptz;" +
+          " begin execute 'select $1::timestamptz' into d using now(); return d; end $c$",
+      ],
+      [
+        'censo_probe_ok_into_dos_columnas',
+        'returns date language plpgsql as $c$ declare t timestamptz; d date;' +
+          " begin select now(), timezone('UTC', now())::date into t, d; return d; end $c$",
+      ],
       [
         'censo_probe_ok_insert_select_where',
         "returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)" +
@@ -3817,6 +4008,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_merge_date',
           'censo_probe_set_fila_date',
           'censo_probe_insert_select_date',
+          'censo_probe_escape_e_date',
+          'censo_probe_identificador_unicode_date',
+          'censo_probe_using_date',
+          'censo_probe_into_dos_columnas_date',
         ].sort(),
       );
     } finally {
@@ -3870,6 +4065,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_merge_date',
         'censo_probe_set_fila_date',
         'censo_probe_insert_select_date',
+        'censo_probe_escape_e_date',
+        'censo_probe_identificador_unicode_date',
+        'censo_probe_using_date',
+        'censo_probe_into_dos_columnas_date',
+        'censo_probe_ok_using_instante',
+        'censo_probe_ok_into_dos_columnas',
         'censo_probe_ok_insert_select_where',
         'censo_probe_ok_set_fila_instante',
         'censo_probe_ok_compara_igual',

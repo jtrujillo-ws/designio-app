@@ -54,18 +54,9 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
 export const CAPACIDADES_ACTIVAS = ['CI', 'C0'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
-export const ETIQUETA_CAPACIDAD: Record<CapacidadActiva, string> = {
-  CI: 'Extracción de importación → evidencia',
-  C0: 'Borrador de reto → criterio de éxito',
-};
-
 export const DestinoSchema = z.enum(['evidencia', 'criterio-exito']);
 export type Destino = z.infer<typeof DestinoSchema>;
 
-export const DESTINO_DE_CAPACIDAD: Record<CapacidadActiva, Destino> = {
-  CI: 'evidencia',
-  C0: 'criterio-exito',
-};
 
 /**
  * CI — candidato a evidencia extraído de un item de la bandeja (§12).
@@ -194,6 +185,139 @@ export type ContenidoCriterio = z.infer<typeof ContenidoCriterioSchema>;
  * panel, el servicio y la corrección hablan del mismo objeto sin castings. */
 export type ContenidoPropuesta = ContenidoExtraccion | ContenidoCriterio;
 
+/**
+ * Cuántos criterios se le piden a C0 de una vez: la revisión es por elemento, así que el lote
+ * es pequeño a propósito — un lote grande no se revisa, se acepta entero.
+ *
+ * Vive con el resto del contrato de la capacidad y no con el prompt: es lo que el servicio
+ * exige al validar la salida, y tenerlo en `ai.prompts` obligaba a que el registro importara
+ * del módulo que lo importa a él.
+ */
+export const MAX_CRITERIOS_POR_LOTE = 4;
+
+/**
+ * El ANCLA de una capacidad: el objeto del que cuelga su alcance de contexto, y todo lo que
+ * hay que decir sobre él.
+ *
+ * Está aquí y no repartido porque el ancla es lo que MÁS varía entre capacidades y lo que
+ * más veces se pregunta: con dos capacidades, `capacidad === 'CI' ? item : reto` funciona;
+ * con diez, cada uno de esos ternarios es un sitio donde la tercera capacidad se comporta
+ * como la segunda sin que nadie lo note. Un ternario binario no puede expresar tres casos,
+ * y su forma de fallar es elegir el `else` en silencio.
+ */
+export type AnclaCapacidad = {
+  /** La columna donde cuelga en `reserva_ai`, `llamada_ai` y `propuesta_ai`. */
+  columna: 'item_id' | 'reto_id';
+  /** El título del selector en la pantalla. */
+  etiqueta: string;
+  /** Cómo se nombra en prosa, en minúscula, dentro de una frase. */
+  enProsa: string;
+  /** El texto de ayuda del buscador. */
+  buscar: string;
+  /** Qué decir cuando la cola está vacía. */
+  vacia: string;
+  /** Qué decir cuando hay más anclas de las que caben, con las que sí caben. */
+  hayMas: (mostradas: number) => string;
+  /** El error cuando el ancla ya tiene una generación en vuelo. */
+  enCurso: string;
+  /** El error cuando el ancla ya tiene trabajo esperando revisión. */
+  pendiente: string;
+};
+
+/**
+ * Qué produce una llamada: UNA propuesta o un LOTE de varias.
+ *
+ * `null` es «una», y no es lo mismo que un lote de uno: una extracción devuelve el objeto
+ * en la raíz de la respuesta, y un lote lo devuelve dentro de un campo con nombre. El techo
+ * existe porque la revisión es por elemento — un lote grande no se revisa, se acepta entero.
+ */
+export type LoteCapacidad = { campo: string; maximo: number } | null;
+
+/**
+ * TODO lo que varía de una capacidad, en un solo sitio.
+ *
+ * Antes esto vivía en tres mapas y unos treinta ternarios repartidos por cuatro ficheros.
+ * Añadir la tercera capacidad no era escribir una entrada: era encontrar los treinta sitios
+ * —y el modo de fallo de no encontrarlos era que la capacidad nueva se comportara como C0
+ * sin decir nada—. La comprobación que acompaña a este registro exige que cada capacidad
+ * declarada tenga TODAS sus piezas, así que una a medias enrojece en vez de callar.
+ */
+export type DefinicionCapacidad = {
+  /** Cómo se lee en el selector de capacidad. */
+  etiqueta: string;
+  /** Qué objeto del dominio materializa una propuesta aceptada. */
+  destino: Destino;
+  ancla: AnclaCapacidad;
+  /**
+   * El contrato de la salida del modelo para UNA propuesta. La entrada se tipa `unknown` a
+   * propósito: lo que llega es JSON del proveedor, y un esquema con `default()` tiene un
+   * tipo de ENTRADA distinto del de salida — pedirle que coincidan rechazaría justo a los
+   * que traen valores por omisión.
+   */
+  contenido: z.ZodType<ContenidoPropuesta, z.ZodTypeDef, unknown>;
+  lote: LoteCapacidad;
+  /**
+   * Si el material del ancla puede ser de personas y hace falta consentimiento vigente
+   * antes de procesarlo fuera (RF-09.5). No es un detalle de la pantalla: decide si la
+   * generación toma el candado del consentimiento antes que el del presupuesto.
+   */
+  exigeConsentimiento: boolean;
+  /**
+   * SYS-20: los hallazgos de esta capacidad son SIMULACIÓN y la marca es imborrable. Hoy
+   * ninguna lo es; C4 (revisores AI por arquetipo) lo será, y entonces esta bandera tiene
+   * que llegar hasta `propuesta_ai.es_simulacion` sin que nadie se acuerde de ponerla.
+   */
+  esSimulacion: boolean;
+};
+
+export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
+  CI: {
+    etiqueta: 'Extracción de importación → evidencia',
+    destino: 'evidencia',
+    ancla: {
+      columna: 'item_id',
+      etiqueta: 'Item de la bandeja',
+      enProsa: 'item pendiente',
+      buscar: 'Buscar por título…',
+      vacia: 'No hay items pendientes sin propuesta en la bandeja.',
+      hayMas: (n) =>
+        `Hay más items pendientes de los que caben aquí: se listan los ${n} más antiguos. ` +
+        'Decide o cura estos y los siguientes aparecerán; para uno concreto, búscalo por su título.',
+      enCurso:
+        'Ese item ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente: 'Ese item ya tiene una propuesta pendiente: revísala antes de pedir otra',
+    },
+    contenido: ContenidoExtraccionSchema,
+    lote: null,
+    exigeConsentimiento: true,
+    esSimulacion: false,
+  },
+  C0: {
+    etiqueta: 'Borrador de reto → criterio de éxito',
+    destino: 'criterio-exito',
+    ancla: {
+      columna: 'reto_id',
+      etiqueta: 'Reto con criterios abiertos',
+      enProsa: 'reto con criterios abiertos',
+      buscar: 'Buscar por código o título…',
+      vacia: 'No hay retos con criterios abiertos (un G0 aprobado los congela).',
+      hayMas: (n) =>
+        `Hay más retos con criterios abiertos de los que caben aquí: se listan los ${n} primeros ` +
+        'por código. Un reto sale de la lista mientras sus criterios propuestos esperan revisión; ' +
+        'para uno concreto, búscalo por su código o su título.',
+      enCurso:
+        'Ese reto ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese reto ya tiene criterios propuestos esperando revisión: decídelos antes de pedir otros',
+    },
+    contenido: ContenidoCriterioSchema,
+    lote: { campo: 'criterios', maximo: MAX_CRITERIOS_POR_LOTE },
+    exigeConsentimiento: false,
+    esSimulacion: false,
+  },
+};
+
+
 /** Valida el contenido según la capacidad (el mismo esquema para la salida del modelo y
  * para la corrección humana: corregir no puede producir algo que generar no podría, ni
  * cambiar la forma que la capacidad declara). */
@@ -201,9 +325,7 @@ export function parsearContenido(
   capacidad: CapacidadActiva,
   valor: unknown,
 ): ContenidoPropuesta {
-  return capacidad === 'CI'
-    ? ContenidoExtraccionSchema.parse(valor)
-    : ContenidoCriterioSchema.parse(valor);
+  return CAPACIDADES[capacidad].contenido.parse(valor);
 }
 
 export const GenerarPropuestasSchema = z.object({

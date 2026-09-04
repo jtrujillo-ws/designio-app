@@ -26,6 +26,7 @@ import {
   registrarConsentimiento,
 } from '@/lib/ai/ai.servicio';
 import type { IntentoProveedor, ResultadoProveedor } from '@/lib/ai/proveedor.server';
+import { CAPACIDADES, CAPACIDADES_ACTIVAS } from '@/lib/ai/ai.schemas';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -4625,5 +4626,33 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     } finally {
       await admin`update usuario set estado = 'activo' where id = ${leadId}`;
     }
+  });
+  /*
+   * El ancla que cada capacidad DECLARA tiene que existir en las tres tablas del pipeline.
+   *
+   * Es la misma inversión que el registro: la lista de columnas válidas no se escribe aquí,
+   * se le pregunta al catálogo. Una capacidad futura que cuelgue de un objeto nuevo —un
+   * journey, una design version— necesita su columna en las tres, y este caso lo dice ANTES
+   * de que el primer `insert` lo descubra en caliente, con la llamada al proveedor ya pagada.
+   */
+  it('cada capacidad declara un ancla que existe en reserva_ai, llamada_ai y propuesta_ai', async () => {
+    const admin = sqlAdmin();
+    const filas = await admin`
+      select table_name as tabla, column_name as columna
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name in ('reserva_ai', 'llamada_ai', 'propuesta_ai')`;
+    // Que esté mirando algo: con cero filas, todo lo de abajo pasaría sin comprobar nada.
+    expect(filas.length).toBeGreaterThan(20);
+    const columnas = new Set(filas.map((f) => `${f.tabla as string}.${f.columna as string}`));
+
+    const faltan: string[] = [];
+    for (const capacidad of CAPACIDADES_ACTIVAS) {
+      const { columna } = CAPACIDADES[capacidad].ancla;
+      for (const tabla of ['reserva_ai', 'llamada_ai', 'propuesta_ai']) {
+        if (!columnas.has(`${tabla}.${columna}`)) faltan.push(`${capacidad}: ${tabla}.${columna}`);
+      }
+    }
+    expect(faltan).toEqual([]);
   });
 });

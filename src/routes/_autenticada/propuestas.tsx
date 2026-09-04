@@ -19,7 +19,7 @@ import {
 } from '@/lib/ai/ai.functions';
 import {
   CAPACIDADES_ACTIVAS,
-  ETIQUETA_CAPACIDAD,
+  CAPACIDADES,
   type CandidatoAncla,
   type CapacidadActiva,
   type ConsentimientoDeItem,
@@ -476,8 +476,13 @@ function FormularioGeneracion({
     setBusquedaVista(busqueda);
     setTexto(busqueda);
   }
-  const anclas = capacidad === 'CI' ? items : retos;
-  const hayMas = capacidad === 'CI' ? hayMasItems : hayMasRetos;
+  /*
+    El ancla la declara la capacidad, no la elige un ternario. Con dos capacidades
+    `capacidad === 'CI' ? items : retos` funciona; con la tercera, el `else` la trata como C0
+    en silencio — y ése es el modo de fallo de un ternario binario: no se equivoca, elige. */
+  const ancla = CAPACIDADES[capacidad].ancla;
+  const anclas = ancla.columna === 'item_id' ? items : retos;
+  const hayMas = ancla.columna === 'item_id' ? hayMasItems : hayMasRetos;
   const elegida = anclas.find((a) => a.id === anclaId);
   // RF-09.5: si el material es de personas y el consentimiento vigente no cubre el
   // procesamiento externo, el paso que toca no es generar — es registrarlo. La pantalla lo
@@ -546,14 +551,14 @@ function FormularioGeneracion({
             >
               {CAPACIDADES_ACTIVAS.map((c) => (
                 <option key={c} value={c}>
-                  {c} · {ETIQUETA_CAPACIDAD[c]}
+                  {c} · {CAPACIDADES[c].etiqueta}
                 </option>
               ))}
             </Select>
           </label>
           <label style={campo}>
             <span style={etiqueta}>
-              {capacidad === 'CI' ? 'Item de la bandeja' : 'Reto con criterios abiertos'}
+              {ancla.etiqueta}
             </span>
             {/* Buscar VIAJA al servidor (la búsqueda vive en la URL): filtrar en el cliente
                 solo tocaría las anclas que ya bajaron, que es exactamente el conjunto del
@@ -562,7 +567,7 @@ function FormularioGeneracion({
               <Input
                 value={texto}
                 maxLength={100}
-                placeholder={capacidad === 'CI' ? 'Buscar por título…' : 'Buscar por código o título…'}
+                placeholder={ancla.buscar}
                 onChange={(e) => setTexto(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
@@ -607,9 +612,7 @@ function FormularioGeneracion({
         </div>
         {anclas.length === 0 && (
           <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-faint)' }}>
-            {capacidad === 'CI'
-              ? 'No hay items pendientes sin propuesta en la bandeja.'
-              : 'No hay retos con criterios abiertos (un G0 aprobado los congela).'}
+            {ancla.vacia}
           </span>
         )}
         {/* El recorte de la lista se dice: es la ÚNICA puerta a la generación, así que
@@ -617,14 +620,12 @@ function FormularioGeneracion({
             salida: buscar por nombre alcanza cualquier ancla, caiga donde caiga el corte. */}
         {hayMas && (
           <Aviso>
-            {capacidad === 'CI'
-              ? `Hay más items pendientes de los que caben aquí: se listan los ${anclas.length} más antiguos. Decide o cura estos y los siguientes aparecerán; para uno concreto, búscalo por su título.`
-              : `Hay más retos con criterios abiertos de los que caben aquí: se listan los ${anclas.length} primeros por código. Un reto sale de la lista mientras sus criterios propuestos esperan revisión; para uno concreto, búscalo por su código o su título.`}
+            {ancla.hayMas(anclas.length)}
           </Aviso>
         )}
         {busqueda && anclas.length === 0 && (
           <Aviso>
-            Ningún {capacidad === 'CI' ? 'item pendiente' : 'reto con criterios abiertos'} coincide
+            Ningún {ancla.enProsa} coincide
             con «{busqueda}». Vacía la búsqueda para volver a la cola completa.
           </Aviso>
         )}

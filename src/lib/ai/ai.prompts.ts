@@ -1,3 +1,4 @@
+import { MAX_CRITERIOS_POR_LOTE } from './ai.schemas';
 import type { CapacidadActiva } from './ai.schemas';
 
 /**
@@ -224,7 +225,13 @@ export function promptCriterios(reto: {
  * prueba que ata los dos lados insertando exactamente este máximo y uno más. El vínculo es
  * el test, no la esperanza de que nadie toque uno de los dos.
  */
-export const MAX_CRITERIOS_POR_LOTE = 4;
+/*
+ * El techo del lote se mudó a `ai.schemas`, con el resto del contrato de la capacidad: es lo
+ * que el servicio exige al validar la salida, y tenerlo aquí obligaba al registro de
+ * capacidades a importar del módulo que lo importa a él. Se reexporta para no mover a los
+ * llamantes, que lo piden por el prompt.
+ */
+export { MAX_CRITERIOS_POR_LOTE } from './ai.schemas';
 
 /** Esquemas de salida estructurada (`output_config.format`). Espejo del Zod de la
  * capacidad: el modelo responde con esta forma y Zod sigue siendo la última palabra. */

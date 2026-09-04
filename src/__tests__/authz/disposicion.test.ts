@@ -1696,7 +1696,28 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        */
       /** Ayudantes ya en la pila, para no caer en un ciclo si dos se llaman entre sí. */
       const enCurso = new Set<TS.Node>();
-      const analizar = (nodo: TS.Node): { sentencias: number; escribe: boolean } => {
+      /**
+       * El nombre del primer parámetro de una función: el identificador con el que SU cuerpo
+       * llama a la transacción. Se sigue el símbolo y no el texto `tx`, porque
+       * `conUsuario(actorId, async (db) => …)` es el mismo código con otro nombre y con la
+       * cadena fija no se contaba ni una de sus consultas: renombrar el parámetro dejaba el
+       * censo en verde sin cambiar nada de la semántica.
+       */
+      const primerParametro = (fn: TS.Node): string | undefined => {
+        if (
+          !ts.isArrowFunction(fn) &&
+          !ts.isFunctionExpression(fn) &&
+          !ts.isFunctionDeclaration(fn)
+        ) {
+          return undefined;
+        }
+        const p0 = fn.parameters[0];
+        return p0 && ts.isIdentifier(p0.name) ? p0.name.text : undefined;
+      };
+      const analizar = (
+        nodo: TS.Node,
+        tx: string,
+      ): { sentencias: number; escribe: boolean } => {
         let sentencias = 0;
         let escribe = false;
         /*
@@ -1718,24 +1739,31 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           sentencias++;
         };
         const visitar = (n: TS.Node) => {
-          if (
-            ts.isTaggedTemplateExpression(n) &&
-            ts.isIdentifier(n.tag) &&
-            n.tag.text === 'tx'
-          ) {
+          if (ts.isTaggedTemplateExpression(n) && ts.isIdentifier(n.tag) && n.tag.text === tx) {
             contar(n);
+          }
+          /*
+           * Un `conUsuario` ANIDADO abre su propia transacción: sus sentencias no son de
+           * ésta. Se corta aquí y se analiza por separado, como una proyección más.
+           */
+          if (
+            ts.isCallExpression(n) &&
+            ts.isIdentifier(n.expression) &&
+            n.expression.text === 'conUsuario'
+          ) {
+            return;
           }
           if (ts.isCallExpression(n)) {
             const f = n.expression;
             const esUnsafe =
               ts.isPropertyAccessExpression(f) &&
               ts.isIdentifier(f.expression) &&
-              f.expression.text === 'tx' &&
+              f.expression.text === tx &&
               f.name.text === 'unsafe';
             const primeroEsTx =
               n.arguments.length > 0 &&
               ts.isIdentifier(n.arguments[0]!) &&
-              (n.arguments[0] as TS.Identifier).text === 'tx';
+              (n.arguments[0] as TS.Identifier).text === tx;
             if (esUnsafe) contar(n);
             else if (primeroEsTx) {
               /*
@@ -1746,9 +1774,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
                * hay cuerpo que mirar y se cuenta como una, que es el suelo conservador.
                */
               const destino = ts.isIdentifier(f) ? porNombre.get(f.text) : undefined;
-              if (destino && !enCurso.has(destino)) {
+              // El ayudante llama a la transacción como quiera: se lee de SU declaración.
+              const txDelAyudante = destino ? primerParametro(destino) : undefined;
+              if (destino && txDelAyudante && !enCurso.has(destino)) {
                 enCurso.add(destino);
-                const sub = analizar(destino);
+                const sub = analizar(destino, txDelAyudante);
                 enCurso.delete(destino);
                 escribe ||= sub.escribe;
                 // Las del ayudante heredan el destino del valor de ESTA llamada: si aquí se
@@ -1784,6 +1814,28 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        * del orden: la cláusula de exportación puede ir antes que la declaración.
        */
       const exportadas = new Set<string>();
+      /**
+       * Lo que envuelve a un valor sin cambiarlo: `(f) satisfies T`, `f as T`, `(f)`, `f!`.
+       * Sin desenvolver, `export const p = (async (…) => conUsuario(…)) satisfies Proyeccion`
+       * tiene un `SatisfiesExpression` por inicializador, no una flecha, y la rama de abajo lo
+       * descartaba: TypeScript perfectamente válido que se caía del censo entero.
+       */
+      const desenvolver = (n: TS.Expression): TS.Expression => {
+        let e = n;
+        for (;;) {
+          if (
+            ts.isParenthesizedExpression(e) ||
+            ts.isAsExpression(e) ||
+            ts.isSatisfiesExpression(e) ||
+            ts.isNonNullExpression(e) ||
+            ts.isTypeAssertionExpression(e)
+          ) {
+            e = e.expression;
+            continue;
+          }
+          return e;
+        }
+      };
       const llevaExport = (n: TS.Node) =>
         ts.canHaveModifiers(n) &&
         (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
@@ -1805,10 +1857,9 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         if (ts.isVariableStatement(st)) {
           for (const d of st.declarationList.declarations) {
             if (!ts.isIdentifier(d.name) || !d.initializer) continue;
-            if (!ts.isArrowFunction(d.initializer) && !ts.isFunctionExpression(d.initializer)) {
-              continue;
-            }
-            porNombre.set(d.name.text, d.initializer);
+            const valor = desenvolver(d.initializer);
+            if (!ts.isArrowFunction(valor) && !ts.isFunctionExpression(valor)) continue;
+            porNombre.set(d.name.text, valor);
             if (llevaExport(st)) exportadas.add(d.name.text);
           }
         }
@@ -1830,12 +1881,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         }
         // `export default p`, y `export default async (…) => …` sin nombre por el que buscar.
         if (ts.isExportAssignment(st) && !st.isExportEquals) {
-          if (ts.isIdentifier(st.expression)) exportadas.add(st.expression.text);
-          else if (
-            ts.isArrowFunction(st.expression) ||
-            ts.isFunctionExpression(st.expression)
-          ) {
-            porNombre.set('default', st.expression);
+          const valor = desenvolver(st.expression);
+          if (ts.isIdentifier(valor)) exportadas.add(valor.text);
+          else if (ts.isArrowFunction(valor) || ts.isFunctionExpression(valor)) {
+            porNombre.set('default', valor);
             exportadas.add('default');
           }
         }
@@ -1844,46 +1893,61 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       for (const nombre of exportadas) {
         const nodo = porNombre.get(nombre);
         if (!nodo) continue;
-        // La llamada a `conUsuario` de ESTA función, con su tercer argumento.
-        let llamada: TS.CallExpression | undefined;
+        /*
+         * TODAS las llamadas a `conUsuario` de esta función, no la primera. Cada una abre su
+         * PROPIA transacción, y la escritura y el aislamiento son suyos, no de la función:
+         * `abrirOutcomeReview` escribe en la primera y abre una SEGUNDA de solo lectura en el
+         * `catch` —cuatro consultas cuyo resultado forma el mensaje—, y con un indicador
+         * global el `insert into` de la primera dejaba a la segunda fuera del censo.
+         */
+        const llamadas: TS.CallExpression[] = [];
         const buscar = (n: TS.Node) => {
           if (
             ts.isCallExpression(n) &&
             ts.isIdentifier(n.expression) &&
             n.expression.text === 'conUsuario'
           ) {
-            llamada ??= n;
+            llamadas.push(n);
           }
           ts.forEachChild(n, buscar);
         };
         ts.forEachChild(nodo, buscar);
-        if (!llamada) continue;
 
-        // El aislamiento se lee del TERCER ARGUMENTO real, no de la palabra suelta.
-        /*
-         * La opción se lee del AST, no del texto del argumento: `conUsuario(…, { /* …
-         * aislamiento: pendiente … *\/ })` es TypeScript válido, no fija nada, y con una
-         * comprobación textual daba por declarada la proyección. Tiene que ser una PROPIEDAD
-         * llamada `aislamiento` con el valor que se espera.
-         */
-        const opciones = llamada.arguments[2];
-        const fijaAislamiento =
-          Boolean(opciones) &&
-          ts.isObjectLiteralExpression(opciones!) &&
-          opciones!.properties.some(
-            (prop) =>
-              ts.isPropertyAssignment(prop) &&
-              ((ts.isIdentifier(prop.name) && prop.name.text === 'aislamiento') ||
-                (ts.isStringLiteral(prop.name) && prop.name.text === 'aislamiento')) &&
-              ts.isStringLiteral(prop.initializer) &&
-              prop.initializer.text === 'repeatable read',
-          );
+        llamadas.forEach((llamada, i) => {
+          const callback = llamada.arguments[1];
+          if (!callback) return;
+          const tx = primerParametro(callback);
+          if (!tx) return;
 
-        const { sentencias, escribe } = analizar(nodo);
+          // El aislamiento se lee del TERCER ARGUMENTO real, no de la palabra suelta.
+          /*
+           * La opción se lee del AST, no del texto del argumento: `conUsuario(…, { /* …
+           * aislamiento: pendiente … *\/ })` es TypeScript válido, no fija nada, y con una
+           * comprobación textual daba por declarada la proyección. Tiene que ser una PROPIEDAD
+           * llamada `aislamiento` con el valor que se espera.
+           */
+          const opciones = llamada.arguments[2];
+          const fijaAislamiento =
+            Boolean(opciones) &&
+            ts.isObjectLiteralExpression(opciones!) &&
+            opciones!.properties.some(
+              (prop) =>
+                ts.isPropertyAssignment(prop) &&
+                ((ts.isIdentifier(prop.name) && prop.name.text === 'aislamiento') ||
+                  (ts.isStringLiteral(prop.name) && prop.name.text === 'aislamiento')) &&
+                ts.isStringLiteral(prop.initializer) &&
+                prop.initializer.text === 'repeatable read',
+            );
 
-        if (sentencias >= 2 && !escribe && !fijaAislamiento) {
-          nombradas.push(`${ruta}:${nombre}`);
-        }
+          const { sentencias, escribe } = analizar(callback, tx);
+
+          if (sentencias >= 2 && !escribe && !fijaAislamiento) {
+            // Con varias transacciones en la misma función hace falta decir CUÁL.
+            nombradas.push(
+              llamadas.length > 1 ? `${ruta}:${nombre}#${i + 1}` : `${ruta}:${nombre}`,
+            );
+          }
+        });
       }
       return nombradas;
     };
@@ -1935,6 +1999,39 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a };
         });
       export { sondaOkUna };
+      // La transacción no se llama siempre \`tx\`: el símbolo sale del parámetro del
+      // callback. Con la cadena fija, renombrarlo no contaba NI UNA consulta.
+      export const sondaRenombrada2 = async (actorId: string) =>
+        conUsuario(actorId, async (db) => {
+          const [a] = await db\`select 1 as x\`;
+          const [b] = await db\`select 2 as y\`;
+          return { a, b };
+        });
+      // Un valor envuelto sigue siendo una función: \`satisfies\`, \`as\` y los paréntesis no
+      // cambian nada y la descartaban entera.
+      export const sondaSatisfies = (async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        })) satisfies (actorId: string) => Promise<unknown>;
+      // DOS transacciones en la misma función: la primera escribe, la segunda solo lee. Con
+      // un indicador global, el \`insert\` de la primera tapaba a la segunda.
+      export const sondaDosTx = async (actorId: string) => {
+        try {
+          return await conUsuario(actorId, async (tx) => {
+            const [a] = await tx\`insert into t (x) values (1) returning x\`;
+            const [b] = await tx\`select 2 as y\`;
+            return { a, b };
+          });
+        } catch {
+          return conUsuario(actorId, async (tx) => {
+            const [a] = await tx\`select 3 as x\`;
+            const [b] = await tx\`select 4 as y\`;
+            return { a, b };
+          });
+        }
+      };
     `;
     /*
      * La `default` ANÓNIMA va en su propia fuente: solo cabe un `export default` por módulo.
@@ -1960,6 +2057,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         // `propertyName` y no `name`. Buscando `name` no se encuentra ningún cuerpo.
         'sonda.ts:sondaInterna',
         'sonda.ts:sondaDefecto',
+        'sonda.ts:sondaRenombrada2',
+        'sonda.ts:sondaSatisfies',
+        // La SEGUNDA de las dos transacciones: la primera escribe y queda fuera, como debe.
+        // El sufijo dice cuál, que con varias en la misma función hace falta.
+        'sonda.ts:sondaDosTx#2',
       ].sort(),
     );
 

@@ -509,10 +509,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * as date` sin paréntesis es un ALIAS de columna, no un cast, y ahí la vuelta sí es
      * terminal y la expresión sí es correcta.
      *
-     * LÍMITE DECLARADO: una cadena más larga —volver a texto y de ahí a fecha— no la cubre.
+     * Y lo que descalifica a la vuelta es CUALQUIER casto detrás, no solo uno a un tipo sin
+     * huso. Escrita con esa lista, `now()::text::timestamptz::text::date` se escapaba —el
+     * paso intermedio por texto no era «un tipo sin huso», así que la vuelta seguía pareciendo
+     * terminal— y elige día igual que las demás (medido: 2026-09-05 en Kiritimati y
+     * 2026-09-04 en Etc/GMT+12). Era el LÍMITE que esta misma nota declaraba, y mirar qué lo
+     * sostenía costó una condición más corta, no una más larga: la vuelta salva si el valor se
+     * queda ahí, y no si se le sigue haciendo cosas.
+     *
+     * Se marca de más un `now()::text::timestamptz::timestamptz`, que no cambia nada y que
+     * nadie escribe. Un falso positivo se ve; el hueco que cerraba no.
      */
-    const CASTO_SIN_HUSO = String.raw`::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO})|as\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*\)`;
-    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})|as\s+${ESQUEMA}(?:${TIPO_CON_HUSO})\s*\))(?!(?:\s*\))*\s*(?:${CASTO_SIN_HUSO})))`;
+    const OTRO_CASTO = String.raw`::|as\s+${ESQUEMA}(?:"[^"]*"|\w+)${PRECISION}\s*\)`;
+    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})|as\s+${ESQUEMA}(?:${TIPO_CON_HUSO})\s*\))(?!(?:\s*\))*\s*(?:${OTRO_CASTO})))`;
     const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:${TIPO_TEXTUAL})${VUELTA_CON_HUSO}`;
 
     /*
@@ -1307,6 +1316,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // con huso solo salva si es TERMINAL, y aquí no lo es. Medido: 2026-09-05 y 2026-09-04.
       'cast(now()::text::timestamptz as date)',
       'cast(now()::text::"timestamptz" as "date")',
+      // Y la cadena LARGA, que era el límite declarado de esa misma guardia: volver a texto y
+      // de ahí a fecha. El paso intermedio no es «un tipo sin huso» y la vuelta pasaba por
+      // terminal. Medido: 2026-09-05 y 2026-09-04, las dos.
+      'now()::text::timestamptz::text::date',
+      'left(now()::text::timestamptz::text, 10)',
+      'cast(cast(now()::text as timestamptz) as text)',
       'current_date',
       'CURRENT_DATE',
       'select localtimestamp',

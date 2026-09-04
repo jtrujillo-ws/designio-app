@@ -1436,6 +1436,34 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         String.raw`(?:\s+(?:as\s+)?(?!values\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?values\s*\(`,
       'gi',
     );
+    /*
+     * El `insert … select`, que era límite declarado y ya no hace falta que lo sea: la lista
+     * de selección se reparte por posición contra las columnas igual que una tupla de
+     * `values`. Medido: `insert into t(k, d) select 2, now()` guarda 2026-09-05 en
+     * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+     *
+     * Lo que NO se sigue es el `where`, por lo de siempre: ahí el reloj filtra, no se guarda.
+     * Y el corte tiene que hacerse: la sonda lleva un `from` a propósito, porque sin él el
+     * último valor de la lista sería ya un reloj a secas y el caso pasaría con corte y sin
+     * él — probando el emparejamiento, sí, pero no el límite.
+     */
+    const INSERTA_SELECT = new RegExp(
+      String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
+        String.raw`(?:\s+(?:as\s+)?(?!select\b|values\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?select\s+([^;]*)`,
+      'gi',
+    );
+    /*
+     * Y el `MERGE`, que es un `update` y un `insert` con otra sintaxis y sin repetir la tabla
+     * en cada rama. Medido: `merge … when matched then update set d = now()` guarda
+     * 2026-09-05 contra 2026-09-04. Está en Postgres desde la 15, que es la de este CI.
+     */
+    const FUSIONA = new RegExp(
+      String.raw`\bmerge\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
+        String.raw`(?:\s+(?:as\s+)?(?!using\b)${NOMBRE_SQL})?\s+using\b([^;]*)`,
+      'gi',
+    );
+    const RAMA_ACTUALIZA = /\bthen\s+update\s+set\s+([\s\S]*?)(?=\bwhen\b|$)/gi;
+    const RAMA_INSERTA = /\bthen\s+insert\s*(?:\(([^)]*)\)\s*)?values\s*\(([\s\S]*?)\)(?=\s*(?:\bwhen\b|$))/gi;
     const ACTUALIZA = new RegExp(
       // El destino puede llevar ALIAS —`update t as x set …`, con `as` o sin él—, y el tipo
       // de la columna se sigue consultando por la tabla de verdad, no por el alias. Medido:
@@ -1474,14 +1502,30 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         }
         return t;
       };
-      /** Una cláusula `set`: `col = expr` separados por comas de primer nivel. */
+      /**
+       * Una cláusula `set`. Cada pieza es `col = expr`, y también la forma de FILA
+       * —`set (a, b) = (e1, e2)`—, que reparte por posición y ya no es un límite declarado:
+       * medido, `update t set (d, ts) = (now(), now())` guarda 2026-09-05 en
+       * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+       */
       const asignacionCulpable = (tabla: string, clausulaCruda: string): boolean =>
         argumentosDe(hastaLaClausula(clausulaCruda)).some((pieza) => {
           const corte = pieza.indexOf('=');
-          return (
-            corte >= 0 && entrega(tabla, nombreCanonico(pieza.slice(0, corte)), pieza.slice(corte + 1))
-          );
+          if (corte < 0) return false;
+          const izquierda = pieza.slice(0, corte).trim();
+          const derecha = pieza.slice(corte + 1).trim();
+          if (izquierda.startsWith('(') && derecha.startsWith('(')) {
+            const columnas = argumentosDe(izquierda.slice(1, -1)).map(nombreCanonico);
+            const valores = argumentosDe(derecha.slice(1, -1));
+            return columnas.some(
+              (c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!),
+            );
+          }
+          return entrega(tabla, nombreCanonico(izquierda), derecha);
         });
+      /** Una lista de valores emparejada por POSICIÓN con una lista de columnas. */
+      const porPosicion = (tabla: string, destinos: string[], valores: string[]): boolean =>
+        destinos.some((c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!));
       for (const m of texto.matchAll(INSERTA)) {
         const tabla = nombreCanonico(m[1]!);
         /*
@@ -1507,15 +1551,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           m[2] === undefined
             ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
             : argumentosDe(m[2]).map(nombreCanonico);
-        if (
-          tuplas.some((t) => {
-            const valores = argumentosDe(t);
-            return destinos.some(
-              (c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!),
-            );
-          })
-        )
-          return true;
+        if (tuplas.some((t) => porPosicion(tabla, destinos, argumentosDe(t)))) return true;
         /*
          * Y el `ON CONFLICT … DO UPDATE SET`, que es un `update` con la tabla escrita arriba:
          * el propio `update` no lleva nombre detrás, así que el reconocedor de `UPDATE` no lo
@@ -1536,6 +1572,28 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       for (const m of texto.matchAll(ACTUALIZA)) {
         if (asignacionCulpable(nombreCanonico(m[1]!), m[2]!)) return true;
+      }
+      for (const m of texto.matchAll(INSERTA_SELECT)) {
+        const tabla = nombreCanonico(m[1]!);
+        const destinos =
+          m[2] === undefined
+            ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
+            : argumentosDe(m[2]).map(nombreCanonico);
+        if (porPosicion(tabla, destinos, argumentosDe(hastaLaClausula(m[3]!)))) return true;
+      }
+      for (const m of texto.matchAll(FUSIONA)) {
+        const tabla = nombreCanonico(m[1]!);
+        const cuerpo = m[2]!;
+        for (const r of cuerpo.matchAll(RAMA_ACTUALIZA)) {
+          if (asignacionCulpable(tabla, r[1]!)) return true;
+        }
+        for (const r of cuerpo.matchAll(RAMA_INSERTA)) {
+          const destinos =
+            r[1] === undefined
+              ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
+              : argumentosDe(r[1]).map(nombreCanonico);
+          if (porPosicion(tabla, destinos, argumentosDe(r[2]!))) return true;
+        }
       }
       return false;
     };
@@ -3500,6 +3558,45 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns void language plpgsql as $c$ begin' +
           ' insert into censo_probe_escritura as x(k, d) values (1, now()); end $c$',
       ],
+      /*
+       * Y las tres formas que hasta ahora eran límite declarado o directamente no existían en
+       * el reconocedor. Las tres medidas: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04
+       * en Etc/GMT+12.
+       *
+       * `MERGE` merece la mención: es un `update` y un `insert` con otra sintaxis y sin
+       * repetir la tabla en cada rama, así que ninguno de los dos reconocedores podía verlo.
+       * Está en Postgres desde la 15, que es la de este CI.
+       *
+       * Y sus dos seguras, que fijan lo mismo que fija el resto: en el `insert … select` el
+       * `where` filtra y no guarda, y la forma de fila sobre columnas CON huso conserva el
+       * instante.
+       */
+      [
+        'censo_probe_merge_date',
+        'returns void language plpgsql as $c$ begin merge into censo_probe_escritura t' +
+          ' using (select 1 as k) s on t.k = s.k' +
+          ' when matched then update set d = now(); end $c$',
+      ],
+      [
+        'censo_probe_set_fila_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' update censo_probe_escritura set (d, ts) = (now(), now()); end $c$',
+      ],
+      [
+        'censo_probe_insert_select_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' select 2, now() from generate_series(1, 1); end $c$',
+      ],
+      [
+        'censo_probe_ok_insert_select_where',
+        "returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)" +
+          " select 3, d from censo_probe_escritura where ts < now(); end $c$",
+      ],
+      [
+        'censo_probe_ok_set_fila_instante',
+        'returns void language plpgsql as $c$ begin' +
+          ' update censo_probe_escritura set (k, ts) = (1, now()); end $c$',
+      ],
       [
         'censo_probe_ok_compara_igual',
         'returns date language plpgsql as $c$ declare d date; begin' +
@@ -3717,6 +3814,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_return_next_date',
           'censo_probe_set_subconsulta_date',
           'censo_probe_insert_alias_date',
+          'censo_probe_merge_date',
+          'censo_probe_set_fila_date',
+          'censo_probe_insert_select_date',
         ].sort(),
       );
     } finally {
@@ -3767,6 +3867,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_return_next_date',
         'censo_probe_set_subconsulta_date',
         'censo_probe_insert_alias_date',
+        'censo_probe_merge_date',
+        'censo_probe_set_fila_date',
+        'censo_probe_insert_select_date',
+        'censo_probe_ok_insert_select_where',
+        'censo_probe_ok_set_fila_instante',
         'censo_probe_ok_compara_igual',
         'censo_probe_ok_conflicto_instante',
         'censo_probe_ok_conflicto_otra_tabla',

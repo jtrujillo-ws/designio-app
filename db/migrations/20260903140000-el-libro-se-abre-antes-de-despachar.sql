@@ -5,21 +5,13 @@
 -- forma transitoria, el `catch` descartaba la única copia del intento y la limpieza soltaba
 -- la reserva. El gasto desaparecía del coste Y del tope diario, y el usuario podía
 -- reintentar. La promesa «el libro registra TODA invocación» dependía de que una transacción
--- POSTERIOR a la llamada saliera bien, que es exactamente al revés de como se sostiene una
--- promesa.
+-- POSTERIOR a la llamada saliera bien, que es al revés de como se sostiene una promesa.
 --
 -- Se invierte el orden: cada intento abre su línea antes de salir, con el estado nuevo
 -- `despachada`, y al volver se CIERRA con su desenlace. Si el apunte previo falla, no hay
--- despacho — no se gasta lo que no se puede anotar. Y si falla el cierre, la fila se queda
--- en `despachada`: sigue contando para el tope y conserva ancla, modelo, credencial y
--- consentimiento; lo único que se pierde es el detalle del desenlace.
+-- despacho — no se gasta lo que no se puede anotar.
 
 -- ── El estado nuevo ──
---
--- `despachada` es el estado con el que NACE toda fila. Una que se queda ahí significa
--- exactamente lo que dice —salió, y su desenlace no consta— y CUENTA para el tope, porque el
--- contador de atendidas excluye solo `sin-respuesta`. Es la dirección segura: ante la duda de
--- si el proveedor cobró, se asume que sí.
 alter table llamada_ai drop constraint llamada_ai_resultado_check;
 alter table llamada_ai add constraint llamada_ai_resultado_check
   check (resultado in
@@ -32,27 +24,53 @@ alter table llamada_ai drop constraint llamada_ai_check4;
 alter table llamada_ai add constraint llamada_ai_motivo_del_desenlace_check
   check (resultado in ('salida-valida', 'despachada') or length(btrim(motivo)) > 0);
 
+-- ── Dos relojes, porque ahora son dos momentos distintos ──
+--
+-- `creado_en` pasa a ser la hora del DESPACHO: la fila nace antes de llamar. Eso rompe en
+-- silencio a quien lo leía como «cuándo se supo el desenlace», que es lo que hacía la señal
+-- de salud del panel: entre dos llamadas concurrentes, la que salió primero puede ser la
+-- última en volver, y ordenar por `creado_en` elegiría la equivocada. Peor aún, la antigüedad
+-- de una caída salía inflada por todo el timeout.
+--
+-- `cerrado_en` es el otro momento: cuándo se OBSERVÓ el desenlace. Lo estampa el guard con
+-- `clock_timestamp()` y queda FUERA del grant — es un hecho de la base, no una anotación de
+-- la aplicación, y con él dentro del grant una llamada podría fechar su propia observación.
+alter table llamada_ai add column cerrado_en timestamptz;
+
+comment on column llamada_ai.cerrado_en is
+  'Cuándo se observó el desenlace de esta llamada. NULL mientras sigue despachada. Lo estampa '
+  'el guard, no la aplicación: es el reloj con el que se decide si el proveedor responde.';
+
 -- ── Cerrar la línea es el ÚNICO update, y va en un solo sentido ──
 --
--- `using` fija el ORIGEN (solo se puede tocar una fila despachada) y `with check` fija el
--- DESTINO (no puede quedarse despachada). Juntos: de `despachada` a un desenlace, una vez y
--- nunca al revés. Así la garantía vieja —lo que costó una llamada cerrada no se reescribe—
--- sigue en pie, que era la razón de que esta tabla no tuviera UPDATE ninguno.
+-- `using` fija el ORIGEN (solo se puede tocar una fila despachada) y `with check` el DESTINO
+-- (no puede quedarse despachada). Juntos: de `despachada` a un desenlace, una vez y nunca al
+-- revés, así que la garantía vieja —lo que costó una llamada cerrada no se reescribe— sigue
+-- en pie.
+--
+-- Y `creado_por = app_user_id()` en los dos lados, igual que en `llamada_insert`. Sin ese
+-- anclaje, cualquier curador del workspace podía cerrar la línea que abrió OTRO: escribirle
+-- un desenlace y un coste inventados que el libro atribuiría a quien la abrió, y de paso
+-- dejar que el cierre legítimo no encontrara ya su fila. Una política de escritura que no
+-- fija al autor no es la misma política que la de inserción, y aquí tenían que serlo.
 create policy llamada_completar on llamada_ai
   for update
   using (
     resultado = 'despachada'
+    and creado_por = app_user_id()
     and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
   )
   with check (
     resultado <> 'despachada'
+    and creado_por = app_user_id()
     and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
   );
 
 -- Solo las seis columnas del desenlace. `creado_en` sigue fuera por el mismo motivo que en el
--- insert —es el reloj con el que se cuenta el tope diario—, y también quedan fuera el ancla,
--- el modelo, la credencial y el consentimiento: son lo que la línea ya afirmó al abrirse, y
--- poder reescribirlos convertiría el apunte previo en una promesa vacía.
+-- insert —es el reloj con el que se cuenta el tope diario—, y `cerrado_en` también, porque lo
+-- estampa el guard. Quedan fuera además el ancla, el modelo, la credencial y el
+-- consentimiento: son lo que la línea ya afirmó al abrirse, y poder reescribirlos convertiría
+-- el apunte previo en una promesa vacía.
 grant update (resultado, motivo, tokens_entrada, tokens_salida, costo_usd, latencia_ms)
   on llamada_ai to designio_app;
 
@@ -60,7 +78,8 @@ grant update (resultado, motivo, tokens_entrada, tokens_salida, costo_usd, laten
 --
 -- Objetos que redefine esta migración, listados porque `create or replace` reemplaza la
 -- función ENTERA: `llamada_ai_registro_guard` (cuerpo copiado del árbol migrado con
--- `pg_get_functiondef`, con el bloque del evento como único cambio) y el trigger
+-- `pg_get_functiondef`; cambios: el bloque de consentimiento pasa a correr solo en INSERT, se
+-- añade el sello de `cerrado_en`, y el evento se emite por las dos vías) y el trigger
 -- `llamada_ai_registro`, que pasa de `before insert` a `before insert or update`.
 
 CREATE OR REPLACE FUNCTION public.llamada_ai_registro_guard()
@@ -92,43 +111,65 @@ begin
     return new;
   end if;
 
-  -- La OTRA mitad de la ligadura del consentimiento, la que ninguna FK puede expresar
-  -- porque depende del `tipo_fuente` del item: citar una versión es obligatorio cuando el
-  -- material es de personas, y está prohibido cuando no lo es. Sin las dos direcciones, un
-  -- `null` sería ambiguo entre «no aplicaba» y «no lo escribí», y la remediación de RF-09.4
-  -- no puede distinguir esas dos cosas leyendo el libro — que es para lo único que sirve.
-  if new.item_id is not null then
-    if exists (select 1 from item_importacion i
-      where i.id = new.item_id and i.workspace_id = new.workspace_id
-        and tipo_fuente_exige_consentimiento(i.tipo_fuente))
-    then
-      if new.consentimiento_version is null then
-        raise exception 'una llamada sobre material de personas anota bajo qué consentimiento salió: falta consentimiento_version (RF-09.4/09.5)';
+  -- Este bloque solo tiene sentido en el INSERT: `item_id` y `consentimiento_version` están
+  -- FUERA del grant de update, así que en el cierre son byte a byte los que ya se validaron
+  -- al abrir la línea. Volver a consultarlos por cada intento, dentro de la transacción que
+  -- sostiene los candados de la fila, es trabajo que no puede cambiar ninguna respuesta.
+  if tg_op = 'INSERT' then
+    -- La OTRA mitad de la ligadura del consentimiento, la que ninguna FK puede expresar
+    -- porque depende del `tipo_fuente` del item: citar una versión es obligatorio cuando el
+    -- material es de personas, y está prohibido cuando no lo es. Sin las dos direcciones, un
+    -- `null` sería ambiguo entre «no aplicaba» y «no lo escribí», y la remediación de RF-09.4
+    -- no puede distinguir esas dos cosas leyendo el libro — que es para lo único que sirve.
+    if new.item_id is not null then
+      if exists (select 1 from item_importacion i
+        where i.id = new.item_id and i.workspace_id = new.workspace_id
+          and tipo_fuente_exige_consentimiento(i.tipo_fuente))
+      then
+        if new.consentimiento_version is null then
+          raise exception 'una llamada sobre material de personas anota bajo qué consentimiento salió: falta consentimiento_version (RF-09.4/09.5)';
+        end if;
+      elsif new.consentimiento_version is not null then
+        raise exception 'ese material no exige consentimiento: la llamada no puede citar uno, porque la ausencia es lo que significa «no aplicaba»';
       end if;
-    elsif new.consentimiento_version is not null then
-      raise exception 'ese material no exige consentimiento: la llamada no puede citar uno, porque la ausencia es lo que significa «no aplicaba»';
     end if;
   end if;
+
+  -- El sello del cierre: lo pone la BASE, no la aplicación, y por eso `cerrado_en` está
+  -- fuera del grant. Es el reloj de cuándo se OBSERVÓ el desenlace, que no es el mismo que
+  -- `creado_en` —ahora la hora del despacho— y es el que necesita la señal de salud: entre
+  -- dos llamadas, la observación más reciente puede venir de la que salió primero.
+  --
+  -- `clock_timestamp()` y no `now()`: dos intentos de una misma generación se cierran en la
+  -- misma transacción, y `now()` les daría el mismo instante — justo el empate que el puesto
+  -- del intento tuvo que venir a deshacer.
+  if tg_op = 'UPDATE' and old.resultado = 'despachada' and new.resultado <> 'despachada' then
+    new.cerrado_en := clock_timestamp();
+  end if;
+
   -- Y el evento sigue siendo cosa de miembros, como en el resto de guards: una escritura
   -- privilegiada no tiene rol de workspace que anotar, y el `actor_rol` quedaría vacío.
   if not is_workspace_member(app_user_id(), new.workspace_id) then
     return new;
   end if;
 
-  -- ── El evento se emite al CERRAR la línea, no al abrirla ──
+  -- ── «Llamada sin propuesta», por las DOS vías por las que puede llegar ──
   --
-  -- Antes se emitía en el INSERT, mirando `new.resultado`. Con el apunte previo ese INSERT
-  -- es SIEMPRE `despachada`, así que ahí el desenlace todavía no se conoce: emitir entonces
-  -- anotaría «llamada sin propuesta» en toda llamada, incluidas las que acaban bien. El
-  -- desenlace se conoce exactamente en el UPDATE que cierra, y ahí es donde va.
+  -- Con el libro anticipado, el camino normal es: nace `despachada` y luego se cierra. Ahí el
+  -- desenlace se conoce en el UPDATE, y emitir en el INSERT anotaría «sin propuesta» en TODA
+  -- llamada, incluidas las que acaban bien.
   --
-  -- La condición mira el TRÁNSITO (`old` → `new`) y no solo el estado nuevo: así el evento
-  -- se emite UNA vez por línea, cuando deja de estar despachada, y no cada vez que alguien
-  -- toque la fila. La política de completar ya impide el segundo cierre, pero un evento de
-  -- auditoría no puede depender de que otra regla lo esté cubriendo.
-  if tg_op = 'UPDATE'
-     and old.resultado = 'despachada'
-     and new.resultado <> 'salida-valida' then
+  -- Pero el INSERT sigue admitiendo un desenlace directo —el grant de insert incluye
+  -- `resultado`, y una escritura cruda puede nacer ya en `sin-respuesta`—, y la migración
+  -- base puso este evento DENTRO del guard precisamente para que el SQL crudo lo produjera
+  -- igual. Mover el evento al UPDATE a secas habría retirado ese suelo sin decirlo. Las dos
+  -- vías, entonces: nacer con desenlace, o pasar a tenerlo.
+  --
+  -- La del UPDATE mira el TRÁNSITO y no solo el estado nuevo, para que el evento salga una
+  -- vez por línea y no cada vez que alguien toque la fila.
+  if (tg_op = 'INSERT' and new.resultado not in ('salida-valida', 'despachada'))
+     or (tg_op = 'UPDATE' and old.resultado = 'despachada'
+         and new.resultado not in ('salida-valida', 'despachada')) then
     insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (new.workspace_id, 'LlamadaAISinPropuesta',
       jsonb_build_object('llamadaId', new.id, 'capacidad', new.capacidad,

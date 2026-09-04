@@ -276,6 +276,8 @@ export async function generarConProveedor(entrada: {
   anotarDespacho: (
     modelo: string,
     consentimientoVersion: number | null,
+    /** El puesto del intento en la operación: 0 primario, 1 respaldo. Lo sabe este bucle. */
+    puesto: number,
   ) => Promise<ApunteDespacho>;
 }): Promise<ResultadoProveedor> {
   // Cada intento se anota antes de decidir si hay otro: una degradación de modelo son DOS
@@ -289,7 +291,7 @@ export async function generarConProveedor(entrada: {
     // Primero el apunte, después la llamada. Si el libro no admite la línea, este intento no
     // ocurre: los anteriores viajan anotados y el motivo llega a la pantalla como cualquier
     // otro (SYS-21: aquí no se lanza nunca).
-    const apunte = await entrada.anotarDespacho(modelo, consentimientoVersion);
+    const apunte = await entrada.anotarDespacho(modelo, consentimientoVersion, indice);
     if (!apunte.ok) return { ok: false, motivo: apunte.motivo, intentos };
     const registroId = apunte.registroId;
     const inicio = Date.now();

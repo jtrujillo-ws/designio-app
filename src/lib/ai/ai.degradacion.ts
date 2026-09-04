@@ -88,6 +88,13 @@ export const TARIFA_USD_POR_MTOK: Record<string, { entrada: number; salida: numb
  * `salida-valida` es «contenido que pasó el esquema de la capacidad»; los otros tres son
  * intentos de los que no puede nacer nada, y se distinguen porque son gastos y problemas
  * distintos: una negativa se revisa, un formato roto se investiga, un timeout se reintenta.
+ *
+ * Son los DESENLACES, y desde el libro anticipado el CHECK de `llamada_ai` admite uno más:
+ * `despachada`, el estado con el que la línea nace antes de salir. Deliberadamente NO está en
+ * esta lista, porque no es algo que un intento pueda devolver —el adaptador nunca lo produce—
+ * y meterlo aquí obligaría a todo consumidor de `ResultadoIntento` a tratar un caso imposible.
+ * Lo que sí hay que saber al leer `llamada_ai.resultado` es que su dominio es esta lista MÁS
+ * `despachada`, y eso lo dice `ESTADOS_LLAMADA`.
  */
 export const RESULTADOS_INTENTO = [
   'salida-valida',
@@ -96,6 +103,16 @@ export const RESULTADOS_INTENTO = [
   'sin-respuesta',
 ] as const;
 export type ResultadoIntento = (typeof RESULTADOS_INTENTO)[number];
+
+/**
+ * El dominio COMPLETO de `llamada_ai.resultado`: los cuatro desenlaces más `despachada`, que
+ * es el estado en el que una línea espera su cierre. Es lo que hay que recorrer para pintar o
+ * clasificar filas leídas de la tabla; `RESULTADOS_INTENTO` es lo que puede devolver un
+ * intento, que es un conjunto más pequeño. Separarlos evita las dos mitades del error:
+ * olvidar las líneas en vuelo al leer, y tener que tratar un caso imposible al escribir.
+ */
+export const ESTADOS_LLAMADA = ['despachada', ...RESULTADOS_INTENTO] as const;
+export type EstadoLlamada = (typeof ESTADOS_LLAMADA)[number];
 
 /** Uso de UNA llamada tal como lo devuelve el proveedor. */
 export type UsoTokens = {

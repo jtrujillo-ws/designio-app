@@ -254,7 +254,8 @@ function PantallaPropuestas() {
                 Se muestran {datos.pendientes.length} de {datos.totalPendientes} pendientes, las de
                 MENOR confianza declarada primero: tu revisión rinde más ahí. Las{' '}
                 {datos.totalPendientes - datos.pendientes.length} que quedan detrás son las que el
-                modelo dio por más fiables — siguen pendientes, no revisadas. Decide estas y
+                modelo dio por más fiables, y al final las que no declararon confianza —que no es
+                lo mismo que declararla alta—. Siguen pendientes, no revisadas: decide estas y
                 aparecerán.
               </Aviso>
             )}

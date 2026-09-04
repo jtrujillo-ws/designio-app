@@ -245,7 +245,13 @@ export async function ejecutarDisposicion(
 
     let constanciaId: string;
     try {
-      const [r] = await tx`select ejecutar_disposicion(${entrada.workspaceId}) as c`;
+      // La versión confirmada viaja hasta la FUNCIÓN, y no se queda en la comparación de
+      // arriba: `ejecutar_disposicion` está concedida al rol de aplicación, así que quien
+      // entre por SQL crudo pasa por debajo de este servicio. La comprobación de aquí sigue
+      // existiendo para redactar el mensaje con las dos etiquetas delante; la que MANDA es la
+      // de la base.
+      const [r] = await tx`select ejecutar_disposicion(
+        ${entrada.workspaceId}, ${entrada.acuerdoVersionEsperada}) as c`;
       constanciaId = (r!.c as { id: string }).id;
     } catch (e) {
       const err = e as { code?: string; message?: string };

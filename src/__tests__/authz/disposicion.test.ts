@@ -827,6 +827,138 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     ).rejects.toMatchObject({ code: '23514' });
   });
 
+  it('la versión confirmada la exige la FUNCIÓN, no solo el servicio', async () => {
+    /*
+     * `ejecutar_disposicion` está concedida a `designio_app`, así que la comparación del
+     * servicio la rodea cualquiera con SQL crudo y el rol adecuado. Si la otra parte registra
+     * y exporta un acuerdo nuevo entre que la pantalla se pintó y la llamada llega, la función
+     * elegía el ÚLTIMO —el que quien ejecuta nunca vio— y lo ejecutaba: otra base contractual,
+     * otra retención, y en el peor caso un borrado. Es el mismo defecto que ya se cobró el
+     * candado del registro, una promesa sostenida en el servicio que el grant permite rodear.
+     */
+    const ws = await nuevoWorkspace('version-en-la-funcion');
+    await acordarYExportar(ws, 'archivo', adminId);
+    // La otra parte cambia de idea: acuerdo #2, y ahora es un BORRADO.
+    await registrarAcuerdo(leadId, {
+      workspaceId: ws,
+      modalidad: 'borrado',
+      base: 'Acuerdo 2: mejor borrar',
+      efectivoDesde: new Date().toISOString().slice(0, 10),
+    });
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+
+    // Por SQL crudo, confirmando el #1 que sí se vio: la base lo rechaza.
+    await expect(
+      conUsuario(adminId, (tx) => tx`select ejecutar_disposicion(${ws}, 1)`),
+    ).rejects.toMatchObject({ code: 'DS002' });
+
+    // Y la firma de un solo argumento —la que no obliga a confirmar nada— ya no existe.
+    await expect(
+      conUsuario(adminId, (tx) => tx`select ejecutar_disposicion(${ws})`),
+    ).rejects.toMatchObject({ code: '42883' });
+
+    // El workspace sigue entero: no se ejecutó ni el acuerdo viejo ni el nuevo.
+    const [seg] = await sqlAdmin()`select count(*)::int as n from segmento
+      where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(1);
+  });
+
+  it('bajo REPEATABLE READ la disposición se niega a decidir: esperar sin releer es esperar para nada', async () => {
+    /*
+     * El peor caso que ha dado este PR, reproducido antes de arreglarlo: con el acuerdo
+     * vigente ya sustituido por un «archivo», una transacción REPEATABLE READ cuya instantánea
+     * es anterior ejecutaba el «borrado» viejo y DESTRUÍA el workspace.
+     *
+     * El candado hace esperar, pero fuera de READ COMMITTED esperar no sirve de nada: la
+     * sentencia siguiente no abre instantánea nueva, así que se relee la misma foto que había
+     * antes de esperar. Y la derivación del aislamiento (20260902330000) no lo atrapa por dos
+     * caminos distintos —el borrado apaga los triggers con `session_replication_role =
+     * replica`, y el archivo solo escribe en tablas que la derivación excluye—, así que la
+     * exigencia tiene que ser explícita y anterior a la primera lectura.
+     */
+    const ws = await nuevoWorkspace('repeatable-read');
+    await acordarYExportar(ws, 'borrado', adminId);
+
+    let instantaneaFijada!: () => void;
+    const fijada = new Promise<void>((r) => {
+      instantaneaFijada = r;
+    });
+    let sigue!: () => void;
+    const cambioHecho = new Promise<void>((r) => {
+      sigue = r;
+    });
+
+    const ejecucion = conUsuario(
+      leadId,
+      async (tx) => {
+        // Una lectura cualquiera fija la instantánea de la transacción.
+        await tx`select count(*) from segmento where workspace_id = ${ws}`;
+        instantaneaFijada();
+        await cambioHecho;
+        return tx`select ejecutar_disposicion(${ws}, 1)`;
+      },
+      { aislamiento: 'repeatable read' },
+    );
+
+    await fijada;
+    // Las dos partes cambian de idea DESPUÉS de esa instantánea: mejor archivar.
+    await registrarAcuerdo(leadId, {
+      workspaceId: ws,
+      modalidad: 'archivo',
+      base: 'Acuerdo 2: mejor archivar',
+      efectivoDesde: new Date().toISOString().slice(0, 10),
+    });
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    sigue();
+
+    await expect(ejecucion).rejects.toMatchObject({ code: 'IS001' });
+    // Y el workspace sigue en pie: el borrado que la foto vieja autorizaba no ocurrió.
+    const [seg] = await sqlAdmin()`select count(*)::int as n from segmento
+      where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(1);
+    const [ac] = await sqlAdmin()`select modalidad from acuerdo_disposicion
+      where workspace_id = ${ws} order by version desc limit 1`;
+    expect(ac!.modalidad).toBe('archivo');
+  });
+
+  it('los conteos de un archivo cuadran tabla a tabla con lo que queda, y la única diferencia está declarada', async () => {
+    /*
+     * El recibo de un archivo dice cuántas filas quedan CONSERVADAS, y la disposición escribe
+     * su propio `WorkspaceDispuesto` DESPUÉS de contarlas: `evento_dominio` acaba con una fila
+     * más de la que el sello declara. Es una diferencia de exactamente uno y no se puede
+     * quitar —el payload del evento lleva el id y el sello de la constancia, así que no puede
+     * emitirse antes de que exista—, pero sí se puede DECIR, y el alcance sellado la dice.
+     *
+     * Esto lo comprueba derivado del catálogo, no contra una copia: si mañana la disposición
+     * escribiera un segundo evento, o escribiera en otra tabla, el cotejo dejaría de cuadrar y
+     * este test lo dice en vez de dejar que la constancia se quede corta en silencio.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('conteos-archivo');
+    await acordarYExportar(ws, 'archivo', leadId);
+    const c = await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'archivo',
+      acuerdoVersionEsperada: 1,
+    });
+
+    const desajustes: string[] = [];
+    for (const f of await admin`select tabla from tablas_alcanzadas_por_borrado()`) {
+      const tabla = f.tabla as string;
+      const [n] = await admin.unsafe(
+        `select count(*)::int as n from "${tabla}" where workspace_id = $1`,
+        [ws],
+      );
+      const vivas = n!.n as number;
+      const declaradas = c.conteos[tabla] ?? 0;
+      const esperado = tabla === 'evento_dominio' ? declaradas + 1 : declaradas;
+      if (vivas !== esperado) desajustes.push(`${tabla}: vivas ${vivas} ≠ ${esperado}`);
+    }
+    expect(desajustes).toEqual([]);
+    // Y la diferencia está DECLARADA dentro del sello, no solo aquí.
+    expect(c.alcance).toContain('una fila más');
+  });
+
   it('un workspace con solo llamadas C0 declara su remediación aunque no toque ningún ítem', async () => {
     /*
      * La invariante en la que se apoya la pantalla, comprobada aquí para que no se caiga en

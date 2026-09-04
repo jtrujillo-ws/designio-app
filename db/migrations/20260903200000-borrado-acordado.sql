@@ -117,7 +117,7 @@ create function alcance_de_constancia(p_modalidad text) returns text
 language sql immutable parallel safe as $$
   select case p_modalidad
     when 'borrado' then 'Alcance (whitespace-constancia/1, borrado): se destruyó TODA fila del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. SOBREVIVEN, y cada excepción es una decisión: (1) las cuentas de usuario, identidad de plataforma que puede pertenecer a otros workspaces, así que su borrado es otra operación con su propio acuerdo; (2) el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor, porque los bytes enviados no se des-envían; (3) el acuerdo que autoriza este borrado y esta misma constancia («acuerdo_disposicion» y «constancia_disposicion», con esos nombres en los conteos), que son lo que lo acredita y no pueden destruirse a sí mismas —por eso el acuerdo viaja aquí entero y sellado—; (4) la fila del propio workspace, vaciada de contenido (nombre sustituido por una lápida y cupo de llamadas AI anulado) y conservada solo como el identificador del que cuelga esta constancia; y (5) el único evento de auditoría que escribe esta misma disposición, que es lo que queda en el libro tras el vaciado.'
-    when 'archivo' then 'Alcance (whitespace-constancia/1, archivo): NO se destruyó ninguna fila. Los conteos dicen cuántas quedan CONSERVADAS del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. Quedan además CONGELADAS —ni altas, ni cambios, ni bajas— todas MENOS cuatro, y las cuatro son decisiones: la auditoría («evento_dominio») y el registro de exportaciones («exportacion_registro») siguen aceptando escrituras, porque un archivo tiene que poder seguir diciendo quién lo consulta y quién lo re-exporta; el acuerdo («acuerdo_disposicion») tampoco se congela, porque registrar uno nuevo es exactamente lo que revierte un archivo; y esta misma constancia («constancia_disposicion») queda fuera por lo mismo, aunque nadie pueda escribirla —no existe permiso de alta, cambio ni baja sobre ella para ninguna parte—. La fila del propio workspace (su nombre y su cupo de llamadas AI) ni se cuenta ni se congela: no pertenece al conjunto derivado. Fuera de alcance quedan, igual que en un borrado, las cuentas de usuario —identidad de plataforma que puede pertenecer a otros workspaces— y el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor.'
+    when 'archivo' then 'Alcance (whitespace-constancia/1, archivo): NO se destruyó ninguna fila. Los conteos dicen cuántas quedan CONSERVADAS del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. Quedan además CONGELADAS —ni altas, ni cambios, ni bajas— todas MENOS cuatro, y las cuatro son decisiones: la auditoría («evento_dominio») y el registro de exportaciones («exportacion_registro») siguen aceptando escrituras, porque un archivo tiene que poder seguir diciendo quién lo consulta y quién lo re-exporta; el acuerdo («acuerdo_disposicion») tampoco se congela, porque registrar uno nuevo es exactamente lo que revierte un archivo; y esta misma constancia («constancia_disposicion») queda fuera por lo mismo, aunque nadie pueda escribirla —no existe permiso de alta, cambio ni baja sobre ella para ninguna parte—. La fila del propio workspace (su nombre y su cupo de llamadas AI) ni se cuenta ni se congela: no pertenece al conjunto derivado. Fuera de alcance quedan, igual que en un borrado, las cuentas de usuario —identidad de plataforma que puede pertenecer a otros workspaces— y el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor. Y los conteos son el estado EN EL INSTANTE de certificar, que es el comparable con el manifiesto de la exportación: esta misma disposición escribe DESPUÉS su propio evento de auditoría, así que al cotejar se encontrará en «evento_dominio» exactamente una fila más que la que aquí figura, y ninguna diferencia en ninguna otra tabla.'
   end
 $$;
 
@@ -813,7 +813,65 @@ end $$;
  * borrado; el recuento atrapa la tabla olvidada, punto. Que es exactamente la promesa de
  * RF-09.4.
  */
-create function ejecutar_disposicion(p_ws uuid) returns jsonb
+/*
+ * ── El predicado del aislamiento, en UNA función y no repetido ──
+ * `20260902330000` lo dejó dicho dentro del trigger que lo impone. Aquí hace falta el MISMO
+ * juicio fuera de un trigger —`ejecutar_disposicion` serializa con candado y vuelve a leer,
+ * igual que los guards, pero sus escrituras caen en tablas que la derivación no cubre— y
+ * copiar la condición sería tener dos criterios que pueden discrepar. Se extrae, y el trigger
+ * pasa a invocarla: misma regla, mismo mensaje, un solo sitio donde cambiarla.
+ */
+create function exigir_read_committed(p_operacion text) returns void
+language plpgsql as $$
+declare
+  v_nivel text := current_setting('transaction_isolation');
+begin
+  -- `read uncommitted` pasa porque Postgres lo trata exactamente como `read committed`.
+  -- `serializable` NO pasa, y se dice por qué en vez de suponerlo: es muy probable que SSI
+  -- aborte por sí solo las dependencias rw que RR ignora, pero este repositorio no lo usa
+  -- en ninguna parte y no se ha medido. Fallar cerrado; abrirlo después es una línea y su
+  -- test.
+  if v_nivel not in ('read committed', 'read uncommitted') then
+    raise exception '% exige aislamiento READ COMMITTED y la transacción está en «%». Aquí se serializa con candado y se vuelve a leer, y fuera de READ COMMITTED una sentencia posterior no toma instantánea nueva: la relectura vería una foto anterior al cambio que está esperando ver, y la decisión se tomaría sobre ella. Abre la transacción en read committed, o usa un aislamiento más fuerte solo para LEER (así lo hace la exportación)', p_operacion, v_nivel
+      using errcode = 'IS001';
+  end if;
+end $$;
+revoke execute on function exigir_read_committed(text) from public;
+-- Y se concede al rol de aplicación, que es quien la ejecuta de hecho: el trigger de
+-- aislamiento NO es SECURITY DEFINER —tiene que ver el nivel de la transacción de QUIEN
+-- escribe— así que corre como el invocante, y sin este grant toda escritura sobre una tabla
+-- cubierta moría con un 42501 que el servicio traduce a un mensaje de rol equivocado. No hay
+-- nada que proteger aquí: la función solo mira el aislamiento de la transacción que la llama.
+grant execute on function exigir_read_committed(text) to designio_app;
+
+create or replace function exigir_aislamiento_de_escritura() returns trigger
+language plpgsql as $$
+begin
+  perform exigir_read_committed('esta escritura');
+  return null;
+end $$;
+
+/*
+ * ── Por qué la versión esperada viaja hasta AQUÍ ──
+ * El servicio ya la comparaba, y no bastaba: `ejecutar_disposicion` está concedida a
+ * `designio_app`, así que un lead o un admin con SQL crudo entra por debajo de esa
+ * comparación. Si la otra parte registra y exporta un acuerdo nuevo entre que la pantalla se
+ * pintó y la llamada llega, la función elegía el ÚLTIMO —el que quien ejecuta nunca vio— y lo
+ * ejecutaba: otra base contractual, otra retención, y en el peor caso un borrado. Es el mismo
+ * defecto que ya se cobró el candado del registro: una promesa sostenida en el servicio,
+ * que el grant permite rodear. Ahora la condición vive donde vive el permiso.
+ *
+ * ── Y por qué se rechaza REPEATABLE READ ──
+ * Reproducido, y es el peor caso que ha dado este PR: con el acuerdo vigente ya sustituido por
+ * un «archivo», una transacción REPEATABLE READ cuya instantánea es anterior ejecutó el
+ * «borrado» viejo y destruyó el workspace. El candado hace esperar, pero fuera de READ
+ * COMMITTED esperar no sirve de nada: la sentencia siguiente no abre instantánea nueva, así
+ * que se relee la misma foto que había antes de esperar. La derivación del aislamiento no lo
+ * atrapa por dos caminos distintos —el borrado apaga los triggers con
+ * `session_replication_role = replica`, y el archivo solo escribe en tablas que la derivación
+ * excluye—, así que la exigencia va explícita y ANTES de la primera lectura.
+ */
+create function ejecutar_disposicion(p_ws uuid, p_version_esperada integer) returns jsonb
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_actor uuid := app_user_id();
@@ -831,7 +889,11 @@ declare
   v_n bigint;
   r record;
 begin
-  -- Anti-oráculo antes que nada: a quien no es miembro se le responde lo mismo que a quien
+  -- Lo PRIMERO, antes de leer nada: si la instantánea ya está fijada, esperar el candado no
+  -- vuelve a mirar, y todo lo que sigue decidiría sobre una foto vieja.
+  perform exigir_read_committed('la disposición acordada');
+
+  -- Anti-oráculo: a quien no es miembro se le responde lo mismo que a quien
   -- pregunta por un workspace que no existe.
   if session_user = 'designio_app'
      and not is_workspace_member(v_actor, p_ws) then
@@ -863,6 +925,16 @@ begin
   -- referencia se resuelve contra el record sin asignar y revienta en tiempo de ejecución.
   -- `completado_en` y no `creado_en`: lo que RF-01.9 pide es que la entrega haya TERMINADO
   -- antes, y una fila sin completar es una exportación que se autorizó y se abandonó.
+  -- La versión que quien ejecuta CONFIRMÓ, comprobada aquí y no solo en el servicio. Va
+  -- después del candado a propósito: comprobarla antes sería compararla con una foto que el
+  -- candado todavía no ha dejado quieta. Y basta la versión, sin la modalidad: `unique
+  -- (workspace_id, version)` hace que una versión identifique una fila y solo una, así que si
+  -- la versión coincide, todo lo demás coincide por construcción.
+  if v_ac.version <> p_version_esperada then
+    raise exception 'el acuerdo vigente es el #% («%») y se confirmó el #%: no se ejecuta lo que no se vio. Vuelve a mirarlo y confírmalo',
+      v_ac.version, v_ac.modalidad, p_version_esperada using errcode = 'DS002';
+  end if;
+
   select max(xp.completado_en) into v_export from exportacion_registro xp
     where xp.workspace_id = p_ws and xp.ambito = 'archivo'
       and xp.completado_en is not null;
@@ -1043,11 +1115,11 @@ revoke execute on function
   tablas_congelables(),
   disposicion_vigente(uuid),
   disposicion_motivo_no_ejecutable(uuid),
-  ejecutar_disposicion(uuid)
+  ejecutar_disposicion(uuid, integer)
 from public;
 grant execute on function
   confirmar_exportacion(uuid, text),
   disposicion_vigente(uuid),
   disposicion_motivo_no_ejecutable(uuid),
-  ejecutar_disposicion(uuid)
+  ejecutar_disposicion(uuid, integer)
 to designio_app;

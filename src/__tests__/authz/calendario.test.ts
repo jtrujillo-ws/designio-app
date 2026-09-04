@@ -1210,6 +1210,32 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(culpable(tras('const q = sql`select ${/* current_date */ v} from t`;', 'ts'))).toBe(
       false,
     );
+    /*
+     * Y las cuatro formas de desalinear la cuenta de llaves que abre este mismo arreglo: una
+     * plantilla ANIDADA dentro de la interpolación, una llave dentro de una cadena, una
+     * dentro de un comentario y un literal de objeto. En las cuatro tiene que seguir viéndose
+     * el reloj que va DESPUÉS.
+     *
+     * DICHO CLARO, PORQUE VERDE NO ES PRUEBA: estas cuatro NO se mueven al retirar el
+     * arreglo, ni al romper el conteo de llaves. Medido, no supuesto. Y la razón es
+     * estructural: salirse de la interpolación ANTES de tiempo devuelve el recorrido a `sql`,
+     * que es el modo que INSPECCIONA, así que un desajuste en esa dirección no puede cegar
+     * nada; y al revés no hay forma de llegar, porque las cadenas y los comentarios se
+     * consumen antes de que sus llaves se cuenten. El conteo es higiene, no guardián.
+     *
+     * Se quedan como PINS de regresión —si alguien hace que `${` se trague hasta el final de
+     * la plantilla, estas cuatro lo cazan—, no como prueba de nada de hoy. Que es lo que ya
+     * me obligó a retirar una sonda del doble paréntesis y a reescribir la del apóstrofo:
+     * una sonda que pasa por otro motivo no prueba nada, y disfrazada de cobertura es peor
+     * que no estar.
+     */
+    expect(
+      culpable(tras('const q = sql`a ${c ? sql`b ${x} c` : d}, now()::date`;', 'ts')),
+    ).toBe(true);
+    expect(culpable(tras('const q = sql`a ${o["}"]}, now()::date`;', 'ts'))).toBe(true);
+    expect(culpable(tras('const q = sql`a ${/* } */ v}, now()::date`;', 'ts'))).toBe(true);
+    // Y un literal de objeto, que abre y cierra llaves de verdad dentro de la interpolación.
+    expect(culpable(tras('const q = sql`a ${{ k: 1 }.k}, now()::date`;', 'ts'))).toBe(true);
   });
 
   it('ninguna función lee el reloj de pared de quien la llama', async () => {

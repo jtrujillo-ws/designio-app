@@ -2207,15 +2207,20 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // Y lo que de verdad importa: el ACTO. Que el panel coincida no serviría de nada si la
     // ejecución siguiera midiendo con el huso de quien la pide, así que se intenta el
     // borrado desde el huso más adelantado y se exige que haga lo mismo que dice UTC.
-    const desdeElHusoAdelantado = await conUsuario(leadId, async (tx) => {
-      await tx.unsafe(`set local time zone 'Pacific/Kiritimati'`);
-      try {
-        await tx`select ejecutar_disposicion(${ws}, 1)`;
-        return null;
-      } catch (e) {
-        return (e as Error).message;
-      }
-    });
+    /*
+     * El `try` va FUERA de `conUsuario`, y esto costó un fallo real: `sql.begin()` de
+     * postgres.js RELANZA el error de la consulta aunque el callback lo capture —comprobado
+     * con `select 1/0`: capturado dentro, y aun así escapa—, porque la transacción queda
+     * abortada y el driver lo propaga al cerrar. Con el `try` dentro, la rama de rechazo de
+     * este caso no podía pasar NUNCA.
+     */
+    const ejecutarDesde = (workspace: string, huso: string) =>
+      conUsuario(leadId, async (tx) => {
+        await tx.unsafe(`set local time zone '${huso}'`);
+        await tx`select ejecutar_disposicion(${workspace}, 1)`;
+        return null as string | null;
+      }).catch((e) => (e as Error).message);
+    const desdeElHusoAdelantado = await ejecutarDesde(ws, 'Pacific/Kiritimati');
     if (veredictos['UTC'] === null) {
       expect(desdeElHusoAdelantado).toBeNull();
     } else {
@@ -2225,6 +2230,36 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         where workspace_id = ${ws}`;
       expect(quedan!.n).toBe(1);
     }
+
+    /*
+     * Y la mitad que faltaba, que es el motivo de que un fallo real viviera aquí meses sin
+     * que nada lo dijera: CUÁL de las dos ramas de arriba corre DEPENDE DE LA HORA.
+     *
+     * El huso más adelantado (UTC+14) solo va un día por delante de UTC a partir de las 10:00
+     * UTC; antes de esa hora ningún huso del mundo tiene una fecha mayor que la de UTC —el
+     * este se acaba en +14—. Así que antes de las 10:00 este caso ejercitaba la rama de
+     * ÉXITO y después la de RECHAZO, y la de rechazo estaba rota: nunca corrió en CI.
+     *
+     * La afirmación de arriba sigue siendo la correcta —el acto tiene que coincidir con lo
+     * que dice UTC, sea lo que sea—, pero la cobertura no puede depender de a qué hora se
+     * lance el suite. Así que el rechazo se ejercita también con una fecha que NINGÚN huso
+     * ha alcanzado: un día más allá del más adelantado. Ahí el veredicto es «falta» a todas
+     * horas y en todos los husos, y el borrado tiene que negarse siempre.
+     */
+    const masAllaDeTodos = new Date(tardia);
+    masAllaDeTodos.setUTCDate(masAllaDeTodos.getUTCDate() + 1);
+    const ws2 = await nuevoWorkspace('husos-futuro');
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws2,
+      modalidad: 'borrado',
+      base: 'Retención que no ha vencido en ningún huso',
+      efectivoDesde: fecha(masAllaDeTodos),
+    });
+    await exportarWorkspace(leadId, { workspaceId: ws2, ambito: 'archivo' });
+    expect(await ejecutarDesde(ws2, 'Pacific/Kiritimati')).toMatch(/retención/i);
+    const [quedanFuturo] = await sqlAdmin()`select count(*)::int as n from segmento
+      where workspace_id = ${ws2}`;
+    expect(quedanFuturo!.n).toBe(1);
   });
 
   it('el límite de la referencia contractual acota lo que se GUARDA, no su versión recortada', async () => {

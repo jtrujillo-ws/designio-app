@@ -319,7 +319,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * escribían sin admitir el punto. Va en un solo sitio y lo usan TODOS los sitios donde se
      * consume un nombre de tipo, que es la lección de esta ronda.
      */
-    const ESQUEMA = String.raw`(?:\w+\s*\.\s*)?`;
+    // Y el esquema, entrecomillado o no: `now()::"pg_catalog".date` es el mismo cast
+    // (medido). Un identificador entre comillas dobles es un NOMBRE, no un dato.
+    const ESQUEMA = String.raw`(?:(?:\w+|"\w+")\s*\.\s*)?`;
     const CASTOS = String.raw`(?:\s*::\s*${ESQUEMA}(?:${TIPO_DE_TIEMPO}))*`;
     const entreParentesis = (x: string) => String.raw`(?:${x}|\(\s*(?:${x})\s*\))`;
     /*
@@ -422,7 +424,25 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * Se queda porque el nombre de un tipo la incluye, y una gramática a medias es la que
      * hace que la próxima vez nadie sepa por qué falta. Medido, no supuesto.)
      */
-    const TIPO_SIN_HUSO = String.raw`(?!(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)(?:date|time|timestamp)\b${PRECISION}`;
+    /*
+     * Y el nombre del tipo puede ir ENTRECOMILLADO. `now()::"date"` es el mismo cast que
+     * `now()::date` —medido, y elige el mismo día distinto en husos opuestos—, y también
+     * `pg_catalog."date"`. Sin admitirlo, escribir el tipo entre comillas sacaba la
+     * expresión del censo entero, que es la peor forma de fallar: en silencio.
+     *
+     * La rama entrecomillada NO lleva la guardia de `with time zone`, y no es un descuido:
+     * medido, `now()::"timestamp" with time zone` y `cast(now() as "timestamp" with time
+     * zone)` son errores de SINTAXIS. Un nombre entrecomillado es un identificador completo;
+     * detrás no cabe el resto de la sintaxis del estándar. Por eso tampoco se entrecomillan
+     * los nombres de varias palabras: `"character varying"` y `"timestamp with time zone"`
+     * no existen como tipos (medido, los dos).
+     *
+     * Va envuelto en su propio grupo porque hay sitios donde se concatena algo detrás
+     * —el operando lo sigue de un literal—, y una alternativa suelta se llevaría el
+     * resto de la expresión con ella.
+     */
+    const SIN_HUSO = String.raw`date|time|timestamp`;
+    const TIPO_SIN_HUSO = String.raw`(?:"(?:${SIN_HUSO})"${PRECISION}|(?!(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)(?:${SIN_HUSO})\b${PRECISION})`;
     /*
      * El destino de los CASTS incluye además el TEXTO. Serializar un reloj es elegir día igual
      * que `to_char`: medido, `now()::text` da «2026-09-05 00:08…+14» y «2026-09-03 22:08…-12»,
@@ -446,12 +466,16 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // basta, porque el motor RETROCEDE. Con `character varying::timestamptz`, la alternativa
     // larga la rechaza el lookahead de la vuelta, y entonces el motor prueba la corta —hay
     // frontera de palabra antes del espacio— que ya no ve el cast de vuelta y la marca.
-    const TIPO_TEXTUAL = String.raw`character\s+varying\b${PRECISION}|character\b(?!\s+varying)${PRECISION}|varchar\b${PRECISION}|bpchar\b${PRECISION}|text\b`;
+    const TIPO_TEXTUAL = String.raw`(?:"(?:text|varchar|bpchar)"${PRECISION}|character\s+varying\b${PRECISION}|character\b(?!\s+varying)${PRECISION}|varchar\b${PRECISION}|bpchar\b${PRECISION}|text\b)`;
     // Con un `)` opcional en medio: Postgres deparsea `now()::text::timestamptz` como
     // `((now())::text)::timestamp with time zone`, o sea que el cast de vuelta NO va pegado al
     // nombre del tipo sino detrás del paréntesis que cierra. Sin admitirlo, la forma del
     // CATÁLOGO —la única que las sondas pueden ejercitar— salía marcada igual.
-    const TIPO_CON_HUSO = String.raw`timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b`;
+    // Entrecomillados también, por lo mismo — y aquí el efecto es el CONTRARIO: sin ellos,
+    // `now()::text::"timestamptz"` salía marcada siendo una ida y vuelta que recupera el
+    // instante (medido por epoch: idéntico en Kiritimati y en Etc/GMT+12). Un falso positivo
+    // sobre código correcto.
+    const TIPO_CON_HUSO = String.raw`(?:"(?:timestamptz|timetz)"|timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)`;
     /*
      * Y la vuelta se escribe de DOS maneras. `now()::text::timestamptz` la introduce un `::`;
      * `cast(now()::text as timestamptz)` la introduce el `as` del cast exterior, y esa mitad
@@ -473,11 +497,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * texto para llegar al destino final, así que la expresión entera se escapaba.
      *
      * Ahora la excepción lleva su propia condición: la vuelta con huso NO salva si detrás hay
-     * otro casto a un tipo sin huso.
+     * otro casto a un tipo sin huso — y ese casto se escribe con las MISMAS dos sintaxis que
+     * la vuelta, así que la condición las mira las dos. Escrita solo con `::`,
+     * `cast(now()::text::timestamptz as date)` se escapaba entera: el `as date` no se veía, la
+     * vuelta pasaba por terminal y la expresión quedaba exenta — y elige día con el huso de la
+     * sesión igual que las demás (medido: 2026-09-05 en Kiritimati y 2026-09-04 en
+     * Etc/GMT+12). El mismo hueco que ya se había tapado en la mitad de arriba, abierto en la
+     * de abajo: un criterio repetido aprende en un sitio y se queda viejo en el otro.
+     *
+     * El `as` exige aquí también su `)` de cierre, y por lo mismo: `now()::text::timestamptz
+     * as date` sin paréntesis es un ALIAS de columna, no un cast, y ahí la vuelta sí es
+     * terminal y la expresión sí es correcta.
      *
      * LÍMITE DECLARADO: una cadena más larga —volver a texto y de ahí a fecha— no la cubre.
      */
-    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})|as\s+${ESQUEMA}(?:${TIPO_CON_HUSO})\s*\))(?!(?:\s*\))*\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO})))`;
+    const CASTO_SIN_HUSO = String.raw`::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO})|as\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*\)`;
+    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})|as\s+${ESQUEMA}(?:${TIPO_CON_HUSO})\s*\))(?!(?:\s*\))*\s*(?:${CASTO_SIN_HUSO})))`;
     const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:${TIPO_TEXTUAL})${VUELTA_CON_HUSO}`;
 
     /*
@@ -1260,6 +1295,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * ejercitaba nada.
      */
     const PELIGROSAS = [
+      // El nombre del tipo ENTRECOMILLADO, y el del esquema. Las tres medidas: 2026-09-05 en
+      // Kiritimati y 2026-09-04 en Etc/GMT+12, igual que sin comillas. El catálogo tampoco
+      // produce esta forma —deparsea el nombre desnudo—, así que solo el reconocedor la cubre.
+      'now()::"date"',
+      'now()::pg_catalog."date"',
+      'now()::"pg_catalog".date',
+      'now()::"timestamp"',
+      'now()::"text"',
+      // Y la ida y vuelta cuya SALIDA vuelve a elegir día, escrita con `cast … as`: la vuelta
+      // con huso solo salva si es TERMINAL, y aquí no lo es. Medido: 2026-09-05 y 2026-09-04.
+      'cast(now()::text::timestamptz as date)',
+      'cast(now()::text::"timestamptz" as "date")',
       'current_date',
       'CURRENT_DATE',
       'select localtimestamp',
@@ -1520,6 +1567,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // La ida y vuelta escrita con CAST … AS, en sus dos mitades. El catálogo NUNCA produce
       // esta forma —la deparsea con `::`—, así que ninguna sonda de objeto real la cubre.
       'cast(now()::text as timestamptz)',
+      // Y con el tipo de la vuelta ENTRECOMILLADO, que sigue recuperando el instante (medido
+      // por epoch: 1788530625 en los dos husos). Sin reconocerlo, el censo marcaba correcto.
+      'now()::text::"timestamptz"',
+      'cast(now()::text as "timestamptz")',
+      // Un ALIAS de columna llamado como un tipo NO es un casto: la vuelta sigue siendo
+      // terminal y la expresión sigue siendo correcta. Es lo que separa a la guardia nueva de
+      // marcar cualquier `as` que venga detrás.
+      'select now()::text::timestamptz as date from t',
       'cast(cast(now() as text) as timestamptz)',
       'cast(now()::text as timestamp with time zone)',
     ];

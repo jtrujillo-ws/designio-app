@@ -1344,6 +1344,18 @@ begin
   -- mismo candado en compartido (`congelacion_por_disposicion_guard`), así que mientras esta
   -- transacción lo tiene, ni hay escritura en vuelo ni puede empezar ninguna.
   --
+  -- Con UNA salvedad, y se nombra en vez de dejar la frase dicha de más: la BAJA de un miembro
+  -- queda fuera del guard —en `miembro` el trigger cubre insert y update, no delete—, y con
+  -- ella el UPDATE que suelta la propiedad de un KPI, que la excepción de arriba deja pasar
+  -- antes de pedir el candado. Esas dos escrituras sí pueden colarse entre el inventario y el
+  -- vaciado.
+  --
+  -- Y es coherente, no un olvido: son exactamente las escrituras que este esquema declara
+  -- posibles SIEMPRE, incluso años después de archivar, porque congelarlas convertiría el
+  -- archivo en un permiso perpetuo. Exigirlas dentro del inventario contradiría su propia razón
+  -- de ser. Hoy además el rol de aplicación no tiene grant de DELETE sobre `miembro`, así que
+  -- la carrera necesita el camino administrativo.
+  --
   -- Y la condición entra en el WHERE en vez de comprobarse después: así `v_export` —lo que la
   -- constancia sella como `exportado_en`— nombra la exportación que de verdad la sostiene, y
   -- no la última que hubo.

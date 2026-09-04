@@ -289,6 +289,7 @@ create function confirmar_exportacion(p_ws uuid, p_ambito text) returns void
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_n integer;
+  v_ver integer;
 begin
   -- Se identifica por `xmin`, que es qué transacción escribió la fila, y no por su reloj:
   -- comparar `creado_en` contra `now()` —el inicio de la transacción— casaría también con
@@ -300,16 +301,25 @@ begin
   -- fila que este update busca, y `ejecutado_rol` lo guarda. Repetirlo sería dar por buena la
   -- respuesta de `workspace_role` AHORA para una fila autorizada ANTES; con la fila delante,
   -- la autorización ya está acreditada.
+  -- Bajo REPEATABLE READ —como corre la exportación— toda la transacción comparte
+  -- instantánea, así que este `max` es literalmente «el último acuerdo que este archivo pudo
+  -- ver», se lea antes o después del volcado.
+  select max(a.version) into v_ver from acuerdo_disposicion a where a.workspace_id = p_ws;
   update exportacion_registro
      set completado_en = clock_timestamp(),
-         -- Bajo REPEATABLE READ —como corre la exportación— toda la transacción comparte
-         -- instantánea, así que este `max` es literalmente «el último acuerdo que este
-         -- archivo pudo ver», se lea antes o después del volcado.
-         acuerdo_version_visto = (select max(a.version) from acuerdo_disposicion a
-                                  where a.workspace_id = p_ws),
-         -- Bajo esa misma instantánea, y por eso el inventario dice qué se ENTREGÓ y no qué
-         -- hay ahora. Solo para el archivo completo: es el único que acredita una disposición.
-         inventario = case when p_ambito = 'archivo' then inventario_del_workspace(p_ws) end
+         acuerdo_version_visto = v_ver,
+         /*
+          * El inventario, bajo esa misma instantánea: dice qué se ENTREGÓ y no qué hay ahora.
+          *
+          * Y solo cuando puede llegar a servir para algo. Leer el workspace entero —adjuntos
+          * en `bytea` incluidos, que hay que destoastar— no es gratis, y una exportación sin
+          * ningún acuerdo registrado NUNCA podrá sostener una disposición: la comprobación
+          * exige `acuerdo_version_visto = <la versión que se ejecuta>`, y un nulo no es igual a
+          * ninguna. Así que la exportación rutinaria —que es la mayoría— no paga por una prueba
+          * que no puede usar. El `entregable` queda fuera por lo mismo: no acredita nada.
+          */
+         inventario = case when p_ambito = 'archivo' and v_ver is not null
+                           then inventario_del_workspace(p_ws) end
    where workspace_id = p_ws and ambito = p_ambito
      and completado_en is null
      and xmin = pg_current_xact_id()::xid;

@@ -489,7 +489,21 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // ventana no viajó en el archivo y un borrado se lo lleva por delante.
     const admin = sqlAdmin();
     const ws = await nuevoWorkspace('deriva');
+
+    // Una exportación ANTERIOR a cualquier acuerdo no anota inventario, y no es un descuido:
+    // no puede sostener ninguna disposición —la comprobación exige que el archivo haya VISTO
+    // el acuerdo que se ejecuta, y un nulo no es igual a ninguna versión—, así que leer el
+    // workspace entero para ella sería pagar por una prueba que no se puede usar.
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    const ultimoRegistro = async () =>
+      (
+        await admin`select inventario from exportacion_registro
+          where workspace_id = ${ws} order by completado_en desc limit 1`
+      )[0]!.inventario;
+    expect(await ultimoRegistro()).toBeNull();
+
     await acordarYExportar(ws, 'borrado', adminId);
+    expect(await ultimoRegistro()).not.toBeNull();
 
     const ejecutar = () =>
       ejecutarDisposicion(leadId, {

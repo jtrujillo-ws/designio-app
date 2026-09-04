@@ -10,7 +10,7 @@ import {
   registrarAcuerdo,
   selloRecomputado,
 } from '@/lib/disposicion/disposicion.servicio';
-import { describeAuthz } from './helpers';
+import { describeAuthz, enVuelo, sigueEsperando } from './helpers';
 
 /**
  * SPEC-01 RF-01.9 — la disposición acordada: archivo o borrado posterior a la exportación,
@@ -406,6 +406,98 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const [n] = await sqlAdmin()`select count(*)::int as n from acuerdo_disposicion
       where workspace_id = ${ws}`;
     expect(n!.n).toBe(5);
+  });
+
+  it('de un workspace congelado no se puede SACAR una fila moviéndola a otro', async () => {
+    // La congelación mira el workspace de la fila, y en un UPDATE hay DOS: de dónde sale y a
+    // dónde va. Mirando solo el destino, un miembro de los dos podía mover una fila desde un
+    // workspace archivado a uno vivo — el guard comprobaba el activo, lo daba por bueno, y la
+    // promesa «se conserva para consulta y no admite escrituras» se rompía por extracción en
+    // vez de por escritura. `segmento` es la superficie exacta: su grant de UPDATE incluye
+    // `workspace_id` y su política es solo de membresía.
+    const admin = sqlAdmin();
+    const congelado = await nuevoWorkspace('origen-congelado');
+    const vivo = await nuevoWorkspace('destino-vivo');
+    const [seg] = await admin`select id from segmento where workspace_id = ${congelado}`;
+
+    await acordarYExportar(congelado, 'archivo', leadId);
+    await ejecutarDisposicion(leadId, { workspaceId: congelado, modalidadEsperada: 'archivo' });
+
+    // Quien lo intenta es miembro de los dos, así que la RLS no lo detiene: lo único que puede
+    // detenerlo es el guard, mirando también de dónde SALE la fila.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update segmento set workspace_id = ${vivo}
+        where id = ${seg!.id as string}`),
+    ).rejects.toMatchObject({ code: 'DS001' });
+
+    // Y sigue donde estaba.
+    const [donde] = await admin`select workspace_id from segmento where id = ${seg!.id as string}`;
+    expect(donde!.workspace_id).toBe(congelado);
+  });
+
+  it('tras el borrado, la constancia le queda a LAS DOS partes que firmaron', async () => {
+    // La doble firma reparte los papeles: en un borrado, una parte registra y la OTRA ejecuta.
+    // Y el caso más común es el que peor salía — el cliente pacta el borrado, la boutique lo
+    // ejecuta— porque la respuesta inmediata con el documento llega a quien ejecuta, y en
+    // cuanto el borrado destruye las membresías el firmante se queda sin nada. Justamente la
+    // parte que más necesita el recibo.
+    const ws = await nuevoWorkspace('dos-partes');
+    await acordarYExportar(ws, 'borrado', adminId);
+    const entregada = await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'borrado',
+    });
+
+    // Ya no queda membresía para nadie: es la situación real después de un borrado.
+    const [m] = await sqlAdmin()`select count(*)::int as n from miembro where workspace_id = ${ws}`;
+    expect(m!.n).toBe(0);
+
+    // Quien ejecutó la sigue viendo…
+    expect((await panelDisposicion(leadId, ws)).constanciaVigente?.sello).toBe(entregada.sello);
+    // …y quien la FIRMÓ también, con el mismo sello y el mismo acuerdo detrás.
+    const delFirmante = await panelDisposicion(adminId, ws);
+    expect(delFirmante.constanciaVigente?.sello).toBe(entregada.sello);
+    expect(delFirmante.acuerdoVigente?.modalidad).toBe('borrado');
+
+    // Y a nadie más: firmar una disposición no abre una ventana a workspaces ajenos.
+    const admin = sqlAdmin();
+    const [ajeno] = await admin`insert into usuario (email, nombre, estado)
+      values (${`${marca}-ajeno@test.demo`}, 'ajeno', 'activo') returning id`;
+    const filas = await conUsuario(ajeno!.id as string, (tx) => tx`select 1 as x
+      from constancia_disposicion where workspace_id = ${ws}`);
+    expect(filas.length).toBe(0);
+  });
+
+  it('registrar un acuerdo espera si hay una disposición ejecutándose', async () => {
+    // El caso destructivo del mismo candado, y el que no cubre el de los cinco registros a la
+    // vez: si la ejecución ya leyó «archivo» y comprobó la modalidad esperada, un `borrado`
+    // que commitea entre esa lectura y la del guard haría que `ejecutar_disposicion` releyera
+    // el acuerdo NUEVO —cada sentencia abre instantánea propia bajo READ COMMITTED— y borrara
+    // el workspace pese a que lo comprobado fue un archivo. Con el registro tomando el mismo
+    // candado exclusivo, no puede colarse ahí: espera a que la ejecución termine.
+    const ws = await nuevoWorkspace('registro-espera');
+    await acordarYExportar(ws, 'archivo', leadId);
+
+    // Una ejecución EN VUELO: tiene el candado tomado y no ha commiteado.
+    const enCurso = await enVuelo(async (tx) => {
+      await tx`select set_config('app.user_id', ${leadId}, true)`;
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:workspace:' || ${ws}::text, 42))`;
+    });
+    try {
+      const registro = registrarAcuerdo(adminId, {
+        workspaceId: ws,
+        modalidad: 'borrado',
+        base: 'Intento de colarse a media ejecución',
+        efectivoDesde: new Date().toISOString().slice(0, 10),
+      });
+      expect(await sigueEsperando(registro)).toBe(true);
+      await enCurso.cerrar();
+      // Y cuando la de delante suelta, entra: esperar no es fallar.
+      expect((await registro).version).toBe(2);
+    } finally {
+      await enCurso.cerrar().catch(() => {});
+    }
   });
 
   it('la carga canónica reproduce jsonb::text de Postgres, clave a clave', async () => {

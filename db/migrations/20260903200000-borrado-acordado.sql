@@ -237,6 +237,21 @@ language sql stable as $$
   where t.tabla not in ('acuerdo_disposicion', 'constancia_disposicion', 'evento_dominio')
 $$;
 
+-- ── Quién firmó el acuerdo que una constancia ejecutó ─────────────────────────────────
+-- SECURITY DEFINER, y no por comodidad: las dos políticas se necesitan mutuamente —la del
+-- acuerdo mira la constancia para no cerrarle la puerta a quien la ejecutó, y la de la
+-- constancia mira el acuerdo para no cerrársela a quien lo firmó— y una RLS que consulta la
+-- tabla cuya RLS la consulta a ella es recursión infinita, que Postgres detecta y rechaza.
+-- Corriendo como el dueño, esta lectura no vuelve a entrar en la política y el ciclo se corta
+-- por un solo lado. Es el mismo recurso con el que `is_workspace_member` sostiene el resto.
+create function firmo_esta_disposicion(p_ws uuid, p_version integer, p_usuario uuid)
+  returns boolean
+language sql stable security definer set search_path = public, pg_temp as $$
+  select exists (
+    select 1 from acuerdo_disposicion a
+    where a.workspace_id = p_ws and a.version = p_version and a.acordado_por = p_usuario)
+$$;
+
 -- ── La disposición vigente, en UN sitio ───────────────────────────────────────────────
 -- Devuelve la fila entera y no solo la modalidad porque quien la consulta necesita
 -- explicar POR QUÉ y DESDE CUÁNDO. Que la devuelva entera es lo que evita que el guard de
@@ -281,33 +296,57 @@ $$;
 create function congelacion_por_disposicion_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
-  v_ws uuid := case tg_op when 'DELETE' then old.workspace_id else new.workspace_id end;
+  -- LOS DOS workspaces de la operación, no uno. En un UPDATE hay origen y destino, y mirar
+  -- solo el destino deja abierta la puerta de atrás: quien sea miembro de los dos puede MOVER
+  -- una fila fuera de un workspace archivado a uno vivo, el guard comprueba el activo y lo da
+  -- por bueno. La promesa «se conserva para consulta y no admite escrituras» se rompería por
+  -- EXTRACCIÓN en vez de por escritura, que es la misma pérdida por otra puerta. `segmento` es
+  -- la superficie exacta: su grant de UPDATE incluye `workspace_id` y su política es solo de
+  -- membresía. Y el otro caso que cierra: una actualización concurrente que saca filas de un
+  -- workspace mientras se está borrando, sin competir nunca por su candado.
+  --
+  -- Ordenados, que no es cosmética: al tomar DOS candados hace falta un orden total o dos
+  -- movimientos en sentidos opuestos se abrazan. Se ordena por el uuid, que es el mismo orden
+  -- para todo el mundo.
+  v_wss uuid[] := case tg_op
+    when 'INSERT' then array[new.workspace_id]
+    when 'DELETE' then array[old.workspace_id]
+    else case when new.workspace_id is distinct from old.workspace_id
+           then array(select unnest(array[old.workspace_id, new.workspace_id]) order by 1)
+           else array[new.workspace_id] end
+  end;
+  v_ws uuid;
   v_disp constancia_disposicion;
 begin
-  -- Anti-oráculo. En un INSERT los triggers BEFORE corren ANTES del WITH CHECK de la
-  -- política, así que sin esto un no-miembro que intentara escribir en un workspace ajeno
-  -- aprendería si está archivado o borrado —la política lo rechazaría igual, pero lo que
-  -- se filtra no es la fila, es la respuesta—. Se distingue al llamante por `session_user`
-  -- y no por `current_user`, que bajo SECURITY DEFINER es siempre el dueño: la escritura
-  -- privilegiada sí recibe la regla, que es el suelo del SQL directo.
-  if session_user = 'designio_app'
-     and not is_workspace_member(app_user_id(), v_ws) then
-    return case tg_op when 'DELETE' then old else new end;
-  end if;
-
-  perform pg_advisory_xact_lock_shared(hashtextextended('designio:workspace:' || v_ws, 42));
-  v_disp := disposicion_vigente(v_ws);
-  if v_disp.id is not null then
-    -- Cada causa con su mensaje y con su salida: un archivo se puede volver a disponer
-    -- registrando un acuerdo nuevo; un borrado no tiene vuelta y decirle a alguien que
-    -- «registre otro acuerdo» sería mandarlo a un trámite que no desbloquea nada.
-    if v_disp.modalidad = 'archivo' then
-      raise exception 'este workspace está archivado por acuerdo desde el % : se conserva para consulta y no admite escrituras. Cambiar su disposición exige registrar un acuerdo nuevo',
-        to_char(v_disp.ejecutado_en, 'YYYY-MM-DD') using errcode = 'DS001';
+  foreach v_ws in array v_wss loop
+    -- Anti-oráculo, y por workspace. En un INSERT los triggers BEFORE corren ANTES del WITH
+    -- CHECK de la política, así que sin esto un no-miembro que intentara escribir en un
+    -- workspace ajeno aprendería si está archivado o borrado —la política lo rechazaría igual,
+    -- pero lo que se filtra no es la fila, es la respuesta—. Se distingue al llamante por
+    -- `session_user` y no por `current_user`, que bajo SECURITY DEFINER es siempre el dueño: la
+    -- escritura privilegiada sí recibe la regla, que es el suelo del SQL directo.
+    --
+    -- `continue` y no `return`: en un movimiento entre dos workspaces, no ser miembro de uno no
+    -- puede callar la regla del otro.
+    if session_user = 'designio_app'
+       and not is_workspace_member(app_user_id(), v_ws) then
+      continue;
     end if;
-    raise exception 'este workspace se borró por acuerdo el % : solo queda su constancia (sello %)',
-      to_char(v_disp.ejecutado_en, 'YYYY-MM-DD'), v_disp.sello using errcode = 'DS001';
-  end if;
+
+    perform pg_advisory_xact_lock_shared(hashtextextended('designio:workspace:' || v_ws, 42));
+    v_disp := disposicion_vigente(v_ws);
+    if v_disp.id is not null then
+      -- Cada causa con su mensaje y con su salida: un archivo se puede volver a disponer
+      -- registrando un acuerdo nuevo; un borrado no tiene vuelta y decirle a alguien que
+      -- «registre otro acuerdo» sería mandarlo a un trámite que no desbloquea nada.
+      if v_disp.modalidad = 'archivo' then
+        raise exception 'este workspace está archivado por acuerdo desde el % : se conserva para consulta y no admite escrituras. Cambiar su disposición exige registrar un acuerdo nuevo',
+          to_char(v_disp.ejecutado_en, 'YYYY-MM-DD') using errcode = 'DS001';
+      end if;
+      raise exception 'este workspace se borró por acuerdo el % : solo queda su constancia (sello %)',
+        to_char(v_disp.ejecutado_en, 'YYYY-MM-DD'), v_disp.sello using errcode = 'DS001';
+    end if;
+  end loop;
   return case tg_op when 'DELETE' then old else new end;
 end $$;
 
@@ -668,6 +707,11 @@ alter table constancia_disposicion enable row level security;
 create policy acuerdo_select on acuerdo_disposicion
   for select using (
     is_workspace_member(app_user_id(), workspace_id)
+    -- Quien FIRMÓ un acuerdo lo sigue leyendo, haya membresía o no. Un contrato nombra a
+    -- quien lo firma, y el borrado destruye las membresías: sin esto, la parte que pactó la
+    -- disposición perdería el papel que acredita lo que pactó, que es al revés de para qué
+    -- se registra.
+    or acordado_por = app_user_id()
     or exists (select 1 from constancia_disposicion c
                where c.workspace_id = acuerdo_disposicion.workspace_id
                  and c.ejecutado_por = app_user_id())
@@ -682,16 +726,25 @@ create policy acuerdo_insert on acuerdo_disposicion
 -- ── Por qué la lectura no es SOLO por membresía ──
 -- Tras un borrado se destruyen los `miembro`, así que `is_workspace_member` es falso para
 -- todo el mundo: una RLS por membresía sobre una tabla en la que ya nadie puede ser miembro
--- sería una promesa que nadie puede ejercer. Hay dos copias de la constancia y cada una
--- tiene su camino: la del CLIENTE es el documento sellado que el guard devuelve en el acto
--- de ejecutarla (verificable fuera de esta base recomputando su sha256, que es lo que la
--- hace útil cuando ya no tiene acceso), y la de la BOUTIQUE es esta fila, que sigue siendo
--- legible para quien la ejecutó. No se le abre a nadie más: quien no firmó la disposición
--- no gana con ella una ventana a un workspace del que ya no es miembro.
+-- sería una promesa que nadie puede ejercer. El documento sellado que el guard DEVUELVE en el
+-- acto es verificable fuera de esta base recomputando su sha256, y eso es lo que lo hace útil
+-- cuando ya no queda acceso; esta fila es la copia consultable.
+--
+-- Y la conservan LAS DOS PARTES que firmaron, no solo quien ejecutó. Decir «el cliente ya
+-- tiene su copia porque la recibe al ejecutar» sería cierto en un archivo, pero se contradice
+-- con la propia regla de la doble firma: un BORRADO lo registra una parte y lo ejecuta la
+-- OTRA, así que en el caso más común —el cliente pacta el borrado, la boutique lo ejecuta— la
+-- respuesta inmediata llega a la boutique y el cliente se queda sin nada en cuanto se
+-- destruyen las membresías. Justamente la parte que más necesita el recibo.
+--
+-- Se ata al acuerdo CONCRETO que esta constancia ejecutó, y no a haber firmado alguno: quien
+-- pactó una disposición anterior que no llegó a ejecutarse no gana con ella una ventana a lo
+-- que pasó después.
 create policy constancia_select on constancia_disposicion
   for select using (
     is_workspace_member(app_user_id(), workspace_id)
     or ejecutado_por = app_user_id()
+    or firmo_esta_disposicion(workspace_id, acuerdo_version, app_user_id())
   );
 
 -- ── Grants mínimos ────────────────────────────────────────────────────────────────────
@@ -704,6 +757,7 @@ grant insert (workspace_id, modalidad, base, efectivo_desde, acordado_por)
 grant select on constancia_disposicion to designio_app;
 
 revoke execute on function
+  firmo_esta_disposicion(uuid, integer, uuid),
   sello_constancia(text),
   alcance_de_constancia(),
   tablas_del_workspace(),
@@ -714,6 +768,7 @@ revoke execute on function
   ejecutar_disposicion(uuid)
 from public;
 grant execute on function
+  firmo_esta_disposicion(uuid, integer, uuid),
   disposicion_vigente(uuid),
   disposicion_motivo_no_ejecutable(uuid),
   ejecutar_disposicion(uuid)

@@ -1167,8 +1167,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * entrega— y no tiene nada que ver.
      */
     const dentroDelCorchete = (e: string): string | null => {
-      const m = /^array\s*\[/i.exec(e);
+      /*
+       * Sin la palabra `array` también: los niveles INTERIORES de un array de más de una
+       * dimensión no la llevan. `array[[now()]]` entrega `[now()]`, y ahí se paraba — la hoja
+       * era `[now()]`, que no es ningún reloj. Un `[` que abre la expresión entera solo puede
+       * ser eso, un nivel de array; un subíndice va detrás de un nombre, nunca delante.
+       */
+      const m = /^(?:array\s*)?\[/i.exec(e.trim());
       if (!m) return null;
+      e = e.trim();
       const abre = m[0].length - 1;
       let nivel = 0;
       for (let i = abre; i < e.length; i++) {
@@ -1676,7 +1683,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     RELOJ_ASIGNADO_A_VARIABLE = (texto: string, conLiterales: string): boolean => {
       const declaradas = [...texto.matchAll(DECLARADAS_SIN_HUSO)];
-      const nombres = declaradas.map((m) => sinComillas(m.groups!.nombre!));
+      /*
+       * Los nombres se canonicalizan con la MISMA regla a los dos lados —desnudo se pliega a
+       * minúsculas, citado no—, que es la de Postgres. Plegar los citados y no los desnudos, o
+       * al revés, hace que la comparación falle en un lado: medido, `declare "D" date; begin
+       * for "D" in select now() loop …` escribe 2026-09-05 en Pacific/Kiritimati y 2026-09-04
+       * en Etc/GMT+12, y comparando `d` contra `D` salía limpia.
+       */
+      const nombres = declaradas.map((m) => nombreCanonico(m.groups!.nombre!));
       if (nombres.length === 0) return false;
       // Lo que la propia declaración le pone dentro, que no es ninguna sentencia y por eso no
       // lo encontraba la búsqueda de asignaciones.
@@ -1769,7 +1783,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * pegada al `into`— y se perdió al reescribirlo para emparejar varias columnas. Ninguna
          * sonda la cubría, porque las dos que había del `into` no llevan `from`. La nueva sí.
          */
-        const destinos = argumentosDe(hastaLaClausula(m[2]!)).map((d) => sinComillas(d.trim()));
+        const destinos = argumentosDe(hastaLaClausula(m[2]!)).map((d) => nombreCanonico(d));
         const valores = argumentosDe(hastaLaClausula(m[1]!)).map(sinAlias);
         return destinos
           .map((d, i) => (nombres.includes(d) ? valores[i] : undefined))
@@ -1806,7 +1820,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       };
       /** `<destinos>` de un `into` o de un `for`, en minúsculas y sin comillas. */
       const listaDeDestinos = (t: string): string[] =>
-        argumentosDe(hastaLaClausula(t)).map((x) => sinComillas(x.trim()).toLowerCase());
+        argumentosDe(hastaLaClausula(t)).map((x) => nombreCanonico(x.trim()));
       const porPosicionDeNombre = (destinos: string[], valores: string[]): string[] =>
         destinos
           .map((n, i) => (nombres.includes(n) ? valores[i] : undefined))
@@ -1834,10 +1848,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * Medido: `declare d date; begin foreach d in array array[now()] loop … end loop; end`
        * escribe 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12. El array se
        * entrega entero porque `hojasDelValor` ya baja por los corchetes.
+       *
+       * Con su modificador `SLICE <n>`, que va ENTRE el destino y el `in array` y sin apartarlo
+       * dejaba el destino como `d slice 1`, que no casa con ninguna variable. Medido sobre
+       * `foreach d slice 1 in array array[[now()]]` con `d date[]`: el mismo par de fechas.
        */
       const recorridos = [
         ...conLiterales.matchAll(
-          /\bforeach\s+([^;]*?)\s+in\s+array\s+([\s\S]*?)\s+loop\b/gi,
+          /\bforeach\s+([^;]*?)(?:\s+slice\s+\d+)?\s+in\s+array\s+([\s\S]*?)\s+loop\b/gi,
         ),
       ].flatMap((m) =>
         listaDeDestinos(m[1]!).some((n) => nombres.includes(n)) ? [m[2]!] : [],
@@ -4834,6 +4852,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns date language plpgsql as $c$ declare d date; begin' +
           ' execute $q$select now()$q$ into d; return d; end $c$',
       ],
+      /*
+       * Y las dos que salieron de revisar lo de arriba, medidas con el mismo par de fechas:
+       * el destino ENTRECOMILLADO con mayúsculas —que hay que canonicalizar igual a los dos
+       * lados— y el modificador `SLICE <n>` del `FOREACH`, que va entre el destino y el array.
+       */
+      [
+        'censo_probe_destino_citado_mayus_date',
+        'returns void language plpgsql as $c$ declare "D" date; begin' +
+          ' for "D" in select now() loop' +
+          ' insert into censo_probe_escritura(k, d) values (1, "D"); end loop; end $c$',
+      ],
+      [
+        'censo_probe_foreach_slice_date',
+        'returns void language plpgsql as $c$ declare d date[]; begin' +
+          ' foreach d slice 1 in array array[[now()]] loop' +
+          ' insert into censo_probe_escritura(k, d) values (2, d[1]); end loop; end $c$',
+      ],
       [
         'censo_probe_foreach_date',
         'returns void language plpgsql as $c$ declare d date; begin' +
@@ -5348,6 +5383,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_tabla_unicode_date',
           'censo_probe_returning_into_date',
           'censo_probe_execute_dolar_into_date',
+          'censo_probe_destino_citado_mayus_date',
+          'censo_probe_foreach_slice_date',
           'censo_probe_foreach_date',
           'censo_probe_particionada_date',
           'censo_probe_bucle_for_date',
@@ -5476,6 +5513,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_alias_fecha_fija',
         'censo_probe_returning_into_date',
         'censo_probe_execute_dolar_into_date',
+        'censo_probe_destino_citado_mayus_date',
+        'censo_probe_foreach_slice_date',
         'censo_probe_foreach_date',
         'censo_probe_particionada_date',
         'censo_probe_bucle_for_date',

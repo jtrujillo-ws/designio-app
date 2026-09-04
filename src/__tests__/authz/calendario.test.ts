@@ -1103,8 +1103,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * marca; queda dicho aquí en vez de descubrirse. Y las variables de un bloque ANIDADO se
      * mezclan con las de fuera, que es de más y no de menos.
      */
+    /*
+     * Y una variable no se declara solo en el `declare`: las columnas de salida de un
+     * `RETURNS TABLE(d date)` son variables plpgsql con todas las letras, y ahí el tipo lo
+     * sigue un `)` o una coma en vez de un `;`. Medido: `returns table(d date)` con
+     * `d := now();` da 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+     *
+     * Y es esta mitad la que tiene que cazarlo, no la del tipo declarado, por una razón que
+     * conviene medir antes que suponer: con UNA columna de salida `prorettype` sí es `date`
+     * —Postgres solo pone `record` a partir de DOS, medidos los dos casos— pero el valor no
+     * llega por un `return`, llega por la ASIGNACIÓN, así que el reconocedor del destino no lo
+     * ve pase lo que pase con el tipo de vuelta. Los parámetros `IN` de tipo fecha entran por
+     * el mismo camino, y también es correcto: asignarles un reloj colapsa igual.
+     */
     const DECLARADAS_SIN_HUSO = new RegExp(
-      String.raw`\b(\w+)\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*(?::=|;|:)`,
+      String.raw`\b(\w+)\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*(?::=|;|:|,|\))`,
       'gi',
     );
     /*
@@ -1311,7 +1324,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    *    como comentario; queda dicho, y no existe ninguno en el esquema.
    */
   /** Lo que puede ir DELANTE de una barra que abre una expresión regular. */
-  const ABRE_REGEX = /[([{,;:=!&|?+\-*%<>~^]/;
+  /*
+   * El `}` entra por la misma puerta que los demás: tras cerrar un BLOQUE empieza otra
+   * sentencia, y una sentencia puede empezar por una regex. Lo que no entra en ningún lado es
+   * su contrario —dividir un objeto, una función o un bloque no significa nada en JavaScript—,
+   * así que una barra pegada a un `}` no es una división en ningún código que compile.
+   */
+  const ABRE_REGEX = /[([{},;:=!&|?+\-*%<>~^]/;
   /**
    * Las palabras tras las que puede empezar una EXPRESIÓN, que es el criterio: no una lista de
    * casos vistos. `throw /re/` y `export default /re/` faltaban y las dos son código válido
@@ -2496,6 +2515,22 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(
       culpable('if (activo) /[/*]/.test(x); const q = sql`select now()::date`;', 'ts'),
     ).toBe(true);
+    /*
+     * Y tras CERRAR un bloque empieza otra sentencia, así que también puede empezar una regex:
+     * `if (activo) {} /re/.test(x)`. Con el `}` fuera de los abridores, la barra se leía como
+     * división y el `/*` de la clase abría un comentario sin cierre que se llevaba la consulta
+     * de después — el censo en verde por no estar mirando, que es su peor forma de fallar.
+     *
+     * Y no hay caso legítimo del otro lado que perder: dividir un objeto, una función o un
+     * bloque no significa nada en JavaScript, así que una barra pegada a un `}` no es una
+     * división en ningún código que compile.
+     */
+    expect(
+      culpable('if (activo) {} /[/*]/.test(x); const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    expect(culpable('function f() {} /[/*]/.test(x); const q = sql`select now()::date`;', 'ts')).toBe(
+      true,
+    );
     // Y las dos posiciones que faltaban tras una PALABRA: lo que sigue a `throw` y a un
     // `export default` es una expresión, y puede ser una regex.
     expect(
@@ -2841,6 +2876,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns date language plpgsql as $c$ declare d date;' +
           ' begin select coalesce(now(), now()) into d; return d; end $c$',
       ],
+      // Y las columnas de salida de un RETURNS TABLE, que son variables con otro sitio donde
+      // declararse. Con una columna y con dos —`prorettype` dice `date` en el primer caso y
+      // `record` en el segundo, medido—, porque lo que las caza es la declaración y no el
+      // tipo de vuelta.
+      [
+        'censo_probe_tabla_date',
+        'returns table(d date) language plpgsql as $c$ begin d := now(); return next; end $c$',
+      ],
+      [
+        'censo_probe_tabla_dos_date',
+        'returns table(d date, n int) language plpgsql as $c$' +
+          ' begin d := now(); n := 1; return next; end $c$',
+      ],
+      // Y su pareja segura, que es la que acota: la misma columna de salida CON huso conserva
+      // el instante y no puede enrojecer.
+      [
+        'censo_probe_tabla_instante',
+        'returns table(d timestamptz) language plpgsql as $c$' +
+          ' begin d := now(); return next; end $c$',
+      ],
       // Y su pareja segura: la misma envoltura sobre una variable CON huso conserva el
       // instante, así que seguir el valor no puede enrojecerla.
       [
@@ -2911,6 +2966,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_coalesce_sql_date',
           'censo_probe_variable_coalesce_date',
           'censo_probe_into_coalesce_date',
+          'censo_probe_tabla_date',
+          'censo_probe_tabla_dos_date',
         ].sort(),
       );
     } finally {
@@ -2936,6 +2993,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_variable_coalesce_date',
         'censo_probe_into_coalesce_date',
         'censo_probe_variable_coalesce_instante',
+        'censo_probe_tabla_date',
+        'censo_probe_tabla_dos_date',
+        'censo_probe_tabla_instante',
         'censo_probe_ok_huso_fijo_date',
         'censo_probe_ok_subconsulta_date',
       ]) {

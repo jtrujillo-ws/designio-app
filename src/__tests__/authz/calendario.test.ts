@@ -1441,6 +1441,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           while (b >= 0 && /[A-Za-z_$]/.test(salida[b]!)) b--;
           return salida.slice(b + 1, a + 1);
         };
+        /** Dónde EMPIEZA esa palabra, para poder seguir mirando hacia atrás desde antes de ella. */
+        const antesDeLaPalabra = (fin: number) => {
+          let a = fin;
+          while (a >= 0 && /\s/.test(salida[a]!)) a--;
+          let b = a;
+          while (b >= 0 && /[A-Za-z_$]/.test(salida[b]!)) b--;
+          return b;
+        };
         const palabra = palabraAnteA(k);
         /*
          * El `)` es el caso que no se puede decidir mirando un solo carácter: cierra tanto un
@@ -1463,7 +1471,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
               if (profundidad === 0) break;
             }
           }
-          trasControl = m >= 0 && PALABRAS_DE_CONTROL.has(palabraAnteA(m - 1));
+          /*
+           * Y el modificador `await` de un bucle asíncrono se ATRAVIESA: en `for await (…)` la
+           * palabra pegada al paréntesis es `await`, no `for`, y sin cruzarla la sentencia de
+           * después dejaba de poder empezar por una regex.
+           *
+           * Atravesarlo y no meterlo en la lista de control, que sería lo corto y sería falso:
+           * `await (f()) / 2` es una división legítima, y darle rango de control convertiría su
+           * barra en el principio de una regex que se comería hasta el salto de línea lo que
+           * viniera detrás. El `for` de delante es lo que hace de aquello un bucle.
+           */
+          let dondeMirar = m - 1;
+          if (palabraAnteA(dondeMirar) === 'await') dondeMirar = antesDeLaPalabra(dondeMirar);
+          trasControl = m >= 0 && PALABRAS_DE_CONTROL.has(palabraAnteA(dondeMirar));
         }
         if (
           anterior === '' ||
@@ -2534,6 +2554,25 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     expect(
       culpable('if (activo) {} /[/*]/.test(x); const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y el `for await` de un bucle asíncrono: la palabra pegada al paréntesis es `await`, no
+     * `for`, así que la condición de control no se reconocía y la barra de después volvía a
+     * leerse como división.
+     *
+     * La segunda sonda es la que impide el arreglo perezoso: meter `await` en la lista de
+     * control taparía el caso y rompería `await (f()) / 2`, que es una división legítima y
+     * bien formada —y entonces la «regex» se comería hasta el salto de línea la consulta que
+     * viene detrás—. Lo que hay que hacer es ATRAVESAR el modificador, no darle rango propio.
+     */
+    expect(
+      culpable(
+        'async function f() { for await (const x of xs) /[/*]/.test(x); }\nconst q = sql`select now()::date`;',
+        'ts',
+      ),
+    ).toBe(true);
+    expect(
+      culpable('const n = await (f()) / 2; const q = sql`select now()::date`;', 'ts'),
     ).toBe(true);
     expect(culpable('function f() {} /[/*]/.test(x); const q = sql`select now()::date`;', 'ts')).toBe(
       true,

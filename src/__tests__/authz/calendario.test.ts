@@ -334,7 +334,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * Y el multiplicador admite un grupo entre paréntesis: `interval '1 day' * (2)` es
      * TypeScript y SQL válidos y dependía del huso igual (medido).
      */
-    const OPERANDO_ARITMETICO = String.raw`(?!\s*(?:${RELOJES}))(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*(?:${GRUPO}|[\w.]+)(?:\s*::\s*[\w ]+)?)*`;
+    /*
+     * Y el reloj excluido no es solo `now()`: entre PARENTESIS es el mismo reloj. Con
+     * `(now() - (now()))::text` el lookahead solo veía el `(` de apertura, no reconocía un
+     * reloj, y la alternativa del GRUPO se tragaba el operando entero: la resta —que sigue
+     * siendo el intervalo cero, medido `00:00:00` en Kiritimati y en Etc/GMT+12— salía
+     * MARCADA. Un falso positivo sobre una plantilla correcta, que es lo que acaba con el
+     * censo desactivado.
+     *
+     * Se excluye el reloj con su envoltura y sus casts: `now()`, `(now())`, `((now()))`,
+     * `now()::timestamptz` y `(now()::timestamptz)`.
+     *
+     * LÍMITE DECLARADO: un reloj YA AJUSTADO dentro del paréntesis —`(now() - (now() +
+     * interval '1 day'))::text`— sigue saliendo marcado. También es un intervalo y también es
+     * un falso positivo; cubrirlo pide que el operando se defina en términos de sí mismo, que
+     * no es cosa de una expresión regular. Queda dicho aquí en vez de descubrirse.
+     */
+    const RELOJ_COMO_OPERANDO = entreParentesis(entreParentesis(RELOJES) + CASTOS);
+    const OPERANDO_ARITMETICO = String.raw`(?!\s*(?:${RELOJ_COMO_OPERANDO}))(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*(?:${GRUPO}|[\w.]+)(?:\s*::\s*[\w ]+)?)*`;
     const ARITMETICA = String.raw`(?:\s*[-+]\s*${OPERANDO_ARITMETICO})*`;
     const NUCLEO = entreParentesis(RELOJES) + CASTOS + ARITMETICA;
     const RELOJ = entreParentesis(entreParentesis(NUCLEO)) + CASTOS;
@@ -396,7 +413,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // `((now())::text)::timestamp with time zone`, o sea que el cast de vuelta NO va pegado al
     // nombre del tipo sino detrás del paréntesis que cierra. Sin admitirlo, la forma del
     // CATÁLOGO —la única que las sondas pueden ejercitar— salía marcada igual.
-    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*::\s*(?:timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b))`;
+    const TIPO_CON_HUSO = String.raw`timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b`;
+    /*
+     * Y la vuelta se escribe de DOS maneras. `now()::text::timestamptz` la introduce un `::`;
+     * `cast(now()::text as timestamptz)` la introduce el `as` del cast exterior, y esa mitad
+     * ninguna sonda del catálogo puede cubrirla porque Postgres deparsea las dos con `::`.
+     * Sin contemplarla, el patrón casaba `now()::text`, no veía vuelta y declaraba culpable
+     * una ida y vuelta que recupera el mismo instante —medido por epoch: idéntico en
+     * Kiritimati y en Etc/GMT+12, en las dos formas—.
+     *
+     * El `as` exige su `)` de cierre, que es lo que lo separa de un ALIAS de columna: en
+     * `select now()::text as timestamptz` no hay cast, hay un nombre, y eso sigue marcado.
+     * LÍMITE DECLARADO: ese mismo alias dentro de un paréntesis —`(select now()::text as
+     * timestamptz)`— se leería como cast y se escaparía.
+     */
+    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*(?:${TIPO_CON_HUSO})|as\s+(?:${TIPO_CON_HUSO})\s*\)))`;
     const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:${TIPO_TEXTUAL})${VUELTA_CON_HUSO}`;
 
     /*
@@ -530,11 +561,48 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   const sinComentarios = (texto: string, dialecto: 'sql' | 'ts' = 'sql'): string => {
     let salida = '';
     let i = 0;
-    const modos: ('sql' | 'ts')[] = [dialecto];
+    /*
+     * La pila no lleva solo el DIALECTO: lleva también si el marco es una INTERPOLACIÓN y
+     * cuántas llaves van abiertas dentro, que es lo único que dice dónde termina.
+     */
+    const pila: { modo: 'sql' | 'ts'; interpolacion: boolean; llaves: number }[] = [
+      { modo: dialecto, interpolacion: false, llaves: 0 },
+    ];
     while (i < texto.length) {
-      const modo = modos[modos.length - 1]!;
+      const marco = pila[pila.length - 1]!;
+      const modo = marco.modo;
       const c = texto[i]!;
       const d = texto[i + 1];
+      /*
+       * `${` DENTRO de una plantilla vuelve a TypeScript, y `}` a su altura la cierra.
+       *
+       * Sin esta transición el interior de la interpolación se leía como SQL, y ahí SÍ anidan
+       * los comentarios: con `${/* uno /* dos *` + `/ v}` el segundo `/*` subía la cuenta a
+       * dos, el cierre la dejaba en uno, y el recorrido seguía comiéndose la consulta de
+       * después hasta otro cierre o el final del fichero. Lo mismo por el otro carácter: una
+       * comilla simple dentro de una cadena de comillas dobles —un apóstrofo— abría un literal
+       * de SQL que se tragaba el resto.
+       *
+       * Es la MISMA clase que el `/*` anidado de TypeScript, una capa más adentro: el
+       * guardián dejando de mirar sin que nada se ponga rojo.
+       *
+       * Solo cuenta dentro de una plantilla (`pila.length > 1`): en un cuerpo del catálogo,
+       * `${` no abre nada.
+       */
+      if (modo === 'sql' && pila.length > 1 && c === '$' && d === '{') {
+        pila.push({ modo: 'ts', interpolacion: true, llaves: 0 });
+        salida += '${';
+        i += 2;
+        continue;
+      }
+      if (marco.interpolacion && (c === '{' || c === '}')) {
+        if (c === '{') marco.llaves++;
+        else if (marco.llaves === 0) pila.pop();
+        else marco.llaves--;
+        salida += c;
+        i++;
+        continue;
+      }
       // Comentario de bloque, igual en los dos dialectos.
       if (c === '/' && d === '*') {
         /*
@@ -606,8 +674,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       // Las comillas invertidas abren y cierran SQL dentro de TypeScript.
       if (c === '`') {
-        if (modo === 'ts') modos.push('sql');
-        else if (modos.length > 1) modos.pop();
+        if (modo === 'ts') pila.push({ modo: 'sql', interpolacion: false, llaves: 0 });
+        else if (pila.length > 1) pila.pop();
         salida += c;
         i++;
         continue;
@@ -893,6 +961,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'date(now())',
       "to_char(now(), 'YYYY-MM-DD')",
       "to_char(now(), 'YYYY-MM-DD'::text)",
+      // El `as` del cast solo salva si el destino LLEVA huso: a un tipo sin huso sigue
+      // eligiendo calendario.
+      "cast(now()::text as date)",
+      // Y un ALIAS no es un cast, aunque se llame como el tipo: sin `)` de cierre no hay
+      // vuelta que valga. Con sufijo, la frontera de palabra lo separa igual.
+      'select now()::text as timestamptz',
+      'select now()::text as timestamptz_pactado',
       'statement_timestamp()::date',
       '(statement_timestamp())::date',
       'transaction_timestamp()::date',
@@ -1058,6 +1133,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'mi_current_timestamp::date',
       'select mi_localtimestamp::date from t',
       'tabla.current_date_previo::date',
+      // …y el reloj restado entre PARÉNTESIS es el mismo reloj: sigue siendo el intervalo
+      // cero (medido `00:00:00` en los dos husos). Las dos formas que la exclusión ancha
+      // recupera; con DOBLE paréntesis no hay sonda porque no la había marcado nadie —el
+      // GRUPO solo anida un nivel—, y una sonda que pasa por otro motivo no prueba nada.
+      '(now() - (now()))::text',
+      '(now() - (now()::timestamptz))::text',
+      // La ida y vuelta escrita con CAST … AS, en sus dos mitades. El catálogo NUNCA produce
+      // esta forma —la deparsea con `::`—, así que ninguna sonda de objeto real la cubre.
+      'cast(now()::text as timestamptz)',
+      'cast(cast(now() as text) as timestamptz)',
+      'cast(now()::text as timestamp with time zone)',
     ];
     expect(PELIGROSAS.filter((f) => !culpable(f))).toEqual([]);
     expect(SEGURAS.filter((f) => culpable(f))).toEqual([]);
@@ -1092,6 +1178,36 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       false,
     );
     expect(culpable(tras('// antes usaba current_date; ahora fecha_de_la_base()', 'ts'))).toBe(
+      false,
+    );
+    /*
+     * Y DENTRO DE UNA INTERPOLACIÓN se vuelve a TypeScript. Una plantilla SQL es SQL, pero lo
+     * que va entre las llaves es código, y ahí no anidan los comentarios ni las comillas
+     * dobles son un carácter cualquiera. Sin esa transición, un comentario escrito dentro de
+     * la interpolación dejaba la cuenta abierta y el recorrido se comía la consulta que venía
+     * detrás: el censo de la aplicación en verde sin haber mirado.
+     */
+    expect(
+      culpable(tras('const q = sql`select ${/* uno /* dos */ v}, now()::date`;', 'ts')),
+    ).toBe(true);
+    /*
+     * La misma transición por el otro carácter, y el daño es el CONTRARIO: una comilla simple
+     * dentro de una cadena de comillas dobles es un apóstrofo, y leída como SQL abría un
+     * literal que se tragaba el resto del fichero. Tragárselo NO deja ciego al censo —los
+     * literales se copian tal cual, a propósito—, pero sí deja sin borrar los comentarios de
+     * después: un `current_date` mencionado en uno pasa a ser hallazgo. Falso positivo, no
+     * hueco.
+     *
+     * (Lo escribí primero al revés, esperando que cegara, y la sonda pasaba en verde con el
+     * arreglo retirado. Una sonda que pasa por otro motivo no prueba nada.)
+     */
+    expect(
+      culpable(
+        tras('const q = sql`select ${x ? "it\'s" : \'\'} from t`; // usaba current_date', 'ts'),
+      ),
+    ).toBe(false);
+    // Y la otra mitad: un comentario de verdad dentro de la interpolación sigue borrándose.
+    expect(culpable(tras('const q = sql`select ${/* current_date */ v} from t`;', 'ts'))).toBe(
       false,
     );
   });

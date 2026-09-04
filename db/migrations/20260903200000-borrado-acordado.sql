@@ -284,9 +284,16 @@ create table acuerdo_disposicion (
   -- dejaría el documento sellado ambiguo —la misma carga podría leerse como dos juegos de
   -- campos distintos— y permitiría dibujar dentro del recibo campos que no se pactaron. Una
   -- referencia contractual («cláusula 4.2 del MSA 2026-114») no necesita renglones.
+  --
+  -- Y con U+2028 y U+2029 dentro, que no son controles C0 ni C1 y por eso los deja pasar
+  -- `texto_importado_limpio`: SON separadores de línea Unicode, así que un `<pre>` los pinta
+  -- como un salto. Sin ellos, la referencia dibujaba en pantalla lo que parecían campos de
+  -- más mientras el sello seguía verificando sobre los mismos bytes — la invariante de un
+  -- campo por renglón rota por la VISTA y no por la carga, que para un documento que una
+  -- persona LEE es exactamente igual de grave.
   base text not null check (
     length(btrim(base)) between 1 and 300 and texto_importado_limpio(base)
-    and base !~ '[\n\r]'),
+    and base !~ '[\n\r\u2028\u2029]'),
   -- El rol de la parte que lo registró, sellado AQUÍ y no reconstruido después: los roles
   -- cambian, y un acuerdo dice quién era quién CUANDO se acordó. Es la mitad que hace
   -- comprobable la doble firma del borrado. Lo escribe el guard y está fuera del grant.
@@ -333,7 +340,8 @@ create table constancia_disposicion (
    * propia destrucción no es un recibo.
    */
   acuerdo_base text not null check (
-    length(btrim(acuerdo_base)) between 1 and 300 and acuerdo_base !~ '[\n\r]'),
+    length(btrim(acuerdo_base)) between 1 and 300
+    and acuerdo_base !~ '[\n\r\u2028\u2029]'),
   -- La fecha efectiva viaja como TEXTO en ISO, y no como `date`, por la misma razón que los
   -- dos instantes: lo que entra en el sello tiene que ser BYTES fijos. `date::text` y
   -- `to_char(date, …)` son STABLE —dependen de `DateStyle`, que es de sesión—, así que
@@ -381,7 +389,8 @@ create table constancia_disposicion (
   -- habiendo —esto es un recibo, no un anexo— y una sola línea, que es lo que mantiene
   -- inequívoca la carga sellada: cada campo ocupa exactamente un renglón.
   alcance text not null check (
-    length(btrim(alcance)) between 1 and 2000 and alcance !~ '[\n\r]'),
+    length(btrim(alcance)) between 1 and 2000
+    and alcance !~ '[\n\r\u2028\u2029]'),
   -- ── El sello ──
   -- Columna GENERADA y no un trigger, y la diferencia es operativa, no estética: el
   -- borrado corre con `session_replication_role = replica` (ver abajo), así que un trigger
@@ -769,17 +778,40 @@ begin
   -- Alias `xp` y no `r`: `ejecutar_disposicion` declara una variable `record r` para recorrer
   -- las tablas, y en plpgsql la variable GANA al alias de la consulta. Con `r` aquí, la
   -- referencia se resuelve contra el record sin asignar y revienta en tiempo de ejecución.
-  -- `completado_en` y no `creado_en`: lo que RF-01.9 pide es que la entrega haya TERMINADO
-  -- antes, y una fila sin completar es una exportación que se autorizó y se abandonó.
+  --
+  -- ── Una exportación vale como prueba si cumple LAS DOS cosas ──
+  -- Haber TERMINADO —lo que RF-01.9 pide es la entrega, y una fila sin completar es una
+  -- exportación autorizada y abandonada— y haber EMPEZADO después del acuerdo.
+  --
+  -- Lo segundo no es redundante, y mirar solo el final era un agujero: la exportación corre
+  -- en REPEATABLE READ y NO toma el candado del workspace, así que puede arrancar antes de
+  -- que se registre el acuerdo y terminar después. Su instantánea es entonces anterior a lo
+  -- pactado —no contiene ni el acuerdo ni nada posterior— y aun así `completado_en` caía del
+  -- lado bueno de la comparación. Con eso, un borrado irreversible se apoyaba en un archivo
+  -- que no refleja lo que se acordó disponer, que es justo lo que esta condición impide.
+  -- `creado_en` es el `now()` de la transacción de la exportación —su arranque—, y por tanto
+  -- no es posterior a su instantánea.
+  --
+  -- Queda una ventana que esto NO cierra, y se dice en vez de callarse: entre que el guard
+  -- del acuerdo fija `acordado_en` con `clock_timestamp()` y que esa transacción COMMITEA,
+  -- una exportación que arranque ahí tiene `creado_en > acordado_en` y todavía no ve la fila
+  -- del acuerdo. Dura lo que dure ese commit y no alcanza a ningún dato del workspace —un
+  -- acuerdo no escribe nada más—, así que lo que puede faltar en el archivo es la propia
+  -- fila del acuerdo, y nada más.
   select max(xp.completado_en) into v_export from exportacion_registro xp
     where xp.workspace_id = p_ws and xp.ambito = 'archivo'
-      and xp.completado_en is not null;
+      and xp.completado_en is not null
+      and xp.creado_en > v_ac.acordado_en;
   if v_export is null then
+    -- Se distingue «no hay ninguna» de «la que hay no sirve»: el remedio es el mismo, pero
+    -- quien ya exportó merece saber por qué no le vale.
+    if exists (select 1 from exportacion_registro xp
+               where xp.workspace_id = p_ws and xp.ambito = 'archivo'
+                 and xp.completado_en is not null) then
+      return format('La última exportación completa del archivo EMPEZÓ antes del acuerdo vigente (registrado el %s), así que no refleja lo que se acordó disponer: vuelve a exportar el archivo completo y ejecútalo después',
+        to_char(v_ac.acordado_en, 'YYYY-MM-DD HH24:MI'));
+    end if;
     return 'Falta la exportación previa: el archivo completo del workspace se entrega ANTES de disponer de él (RF-01.8/01.9)';
-  end if;
-  if v_export < v_ac.acordado_en then
-    return format('La última exportación (%s) es anterior al acuerdo vigente: vuelve a exportar el archivo completo antes de ejecutarlo',
-      to_char(v_export, 'YYYY-MM-DD HH24:MI'));
   end if;
   return null;
 end $$;
@@ -923,8 +955,6 @@ begin
   -- Alias `xp` y no `r`: `ejecutar_disposicion` declara una variable `record r` para recorrer
   -- las tablas, y en plpgsql la variable GANA al alias de la consulta. Con `r` aquí, la
   -- referencia se resuelve contra el record sin asignar y revienta en tiempo de ejecución.
-  -- `completado_en` y no `creado_en`: lo que RF-01.9 pide es que la entrega haya TERMINADO
-  -- antes, y una fila sin completar es una exportación que se autorizó y se abandonó.
   -- La versión que quien ejecuta CONFIRMÓ, comprobada aquí y no solo en el servicio. Va
   -- después del candado a propósito: comprobarla antes sería compararla con una foto que el
   -- candado todavía no ha dejado quieta. Y basta la versión, sin la modalidad: `unique
@@ -937,7 +967,8 @@ begin
 
   select max(xp.completado_en) into v_export from exportacion_registro xp
     where xp.workspace_id = p_ws and xp.ambito = 'archivo'
-      and xp.completado_en is not null;
+      and xp.completado_en is not null
+      and xp.creado_en > v_ac.acordado_en;
 
   -- Remediación ANTES de tocar nada: lo que ya salió hacia un proveedor no lo alcanza este
   -- borrado, y el libro que lo sabe es de los que se vacían.

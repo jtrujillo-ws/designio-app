@@ -809,15 +809,27 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
      * firmante— sin tocar el sello, porque los bytes serían los mismos.
      */
     const ws = await nuevoWorkspace('base-multilinea');
+    // Y no solo con LF/CR: U+2028 y U+2029 SON separadores de línea Unicode, no son
+    // controles C0 ni C1 —así que `texto_importado_limpio` los deja pasar— y un `<pre>` los
+    // pinta como un salto. Con ellos dentro, la referencia dibujaba en pantalla lo que
+    // parecían campos de más mientras el sello seguía verificando sobre los mismos bytes.
+    for (const salto of ['\n', '\r', '\u2028', '\u2029']) {
+      const inyectado = `Cláusula 1${salto}2030-01-01${salto}${leadId}${salto}lead-boutique`;
+      await expect(
+        registrarAcuerdo(adminId, {
+          workspaceId: ws,
+          modalidad: 'archivo',
+          base: inyectado,
+          efectivoDesde: new Date().toISOString().slice(0, 10),
+        }),
+      ).rejects.toThrow();
+      await expect(
+        conUsuario(adminId, (tx) => tx`insert into acuerdo_disposicion
+          (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+          values (${ws}, 'archivo', ${inyectado}, current_date, ${adminId})`),
+      ).rejects.toMatchObject({ code: '23514' });
+    }
     const inyectado = `Cláusula 1\n2030-01-01\n${leadId}\nlead-boutique`;
-    await expect(
-      registrarAcuerdo(adminId, {
-        workspaceId: ws,
-        modalidad: 'archivo',
-        base: inyectado,
-        efectivoDesde: new Date().toISOString().slice(0, 10),
-      }),
-    ).rejects.toThrow();
     // Ni por SQL crudo con el grant de la aplicación: el CHECK está en la base, no solo en
     // el esquema de entrada.
     await expect(
@@ -825,6 +837,75 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         (workspace_id, modalidad, base, efectivo_desde, acordado_por)
         values (${ws}, 'archivo', ${inyectado}, current_date, ${adminId})`),
     ).rejects.toMatchObject({ code: '23514' });
+  });
+
+  it('una exportación que EMPEZÓ antes del acuerdo no lo acredita, aunque termine después', async () => {
+    /*
+     * La exportación corre en REPEATABLE READ y NO toma el candado del workspace, así que
+     * puede arrancar antes de que se registre el acuerdo y terminar después. Su instantánea es
+     * entonces anterior a lo pactado —no contiene ni el acuerdo ni nada posterior— y aun así
+     * su `completado_en` caía del lado bueno de la comparación. Con eso, un borrado
+     * irreversible se apoyaba en un archivo que no refleja lo que se acordó disponer.
+     *
+     * Se reproduce con las MISMAS dos funciones que usa la exportación real, en una
+     * transacción REPEATABLE READ, con el acuerdo colándose entre las dos.
+     */
+    const ws = await nuevoWorkspace('export-antes-del-acuerdo');
+
+    let arrancada!: () => void;
+    const empezo = new Promise<void>((r) => {
+      arrancada = r;
+    });
+    let sigue!: () => void;
+    const acuerdoHecho = new Promise<void>((r) => {
+      sigue = r;
+    });
+
+    const exportacion = conUsuario(
+      leadId,
+      async (tx) => {
+        await tx`select registrar_exportacion(${ws}, 'archivo')`;
+        arrancada();
+        await acuerdoHecho;
+        await tx`select confirmar_exportacion(${ws}, 'archivo')`;
+      },
+      { aislamiento: 'repeatable read' },
+    );
+
+    await empezo;
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws,
+      modalidad: 'borrado',
+      base: 'Acuerdo posterior al arranque de la exportación',
+      efectivoDesde: new Date().toISOString().slice(0, 10),
+    });
+    sigue();
+    await exportacion;
+
+    // La fila está COMPLETA y su `completado_en` es posterior al acuerdo…
+    const [reg] = await sqlAdmin()`select creado_en < a.acordado_en as empezo_antes,
+        completado_en > a.acordado_en as termino_despues
+      from exportacion_registro r, acuerdo_disposicion a
+      where r.workspace_id = ${ws} and a.workspace_id = ${ws}`;
+    expect(reg!.empezo_antes).toBe(true);
+    expect(reg!.termino_despues).toBe(true);
+
+    // …y aun así no acredita nada, porque su foto es anterior a lo pactado.
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(/EMPEZÓ antes/);
+    await expect(
+      ejecutarDisposicion(leadId, {
+        workspaceId: ws,
+        modalidadEsperada: 'borrado',
+        acuerdoVersionEsperada: 1,
+      }),
+    ).rejects.toThrow(/EMPEZÓ antes/);
+    const [seg] = await sqlAdmin()`select count(*)::int as n from segmento
+      where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(1);
+
+    // Exportando de nuevo —ahora sí, entera y después del acuerdo— se desbloquea.
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toBeNull();
   });
 
   it('la versión confirmada la exige la FUNCIÓN, no solo el servicio', async () => {

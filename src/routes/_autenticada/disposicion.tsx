@@ -83,20 +83,33 @@ function PantallaDisposicion() {
     (membresiaActiva?.rol ?? '') as (typeof ROLES_DISPOSICION)[number],
   );
 
+  /*
+   * Si la lectura falla, el panel se VACÍA. Conservar el anterior dejaba la pantalla
+   * ofreciendo acciones calculadas sobre una foto vieja —un `motivoNoEjecutable` en null de
+   * hace un rato deja habilitado el botón de ejecutar— junto a un mensaje de error, que es
+   * exactamente lo que esta pantalla existe para no hacer: no ofrecer lo que la base va a
+   * rechazar. Sin estado es mejor que con estado equivocado cuando lo que se ofrece destruye
+   * un workspace.
+   */
   const recargar = useCallback(async () => {
     if (!workspaceId) {
+      setPanel(null);
+      setError(null);
       setCargando(false);
       return;
     }
     setCargando(true);
     try {
       const r = await panelDisposicionFn({ data: { workspaceId } });
-      if (!r.ok) setError(r.error);
-      else {
+      if (!r.ok) {
+        setPanel(null);
+        setError(r.error);
+      } else {
         setPanel(r.panel);
         setError(null);
       }
     } catch {
+      setPanel(null);
       setError('No se pudo leer el estado de la disposición');
     } finally {
       setCargando(false);

@@ -41,10 +41,18 @@ export const RegistrarAcuerdoSchema = z.object({
      * canónica de la constancia, que es un campo por renglón, así que un salto de línea
      * dejaría el documento sellado ambiguo —los mismos bytes leídos como dos juegos de campos
      * distintos— y permitiría dibujar dentro del recibo una fecha efectiva u otro firmante
-     * que nadie pactó. La base lo impone con un CHECK; esto solo hace que el rechazo llegue
-     * antes y con palabras, que es lo mismo que hace el tope de 300.
+     * que nadie pactó.
+     *
+     * Incluye U+2028 y U+2029, que no son controles y por eso pasan el saneado de texto
+     * importado: SON separadores de línea Unicode, así que un `<pre>` los pinta como un salto
+     * y dibujan en pantalla lo que parecen campos de más mientras el sello sigue verificando
+     * sobre los mismos bytes. La invariante rota por la VISTA es igual de grave en un
+     * documento que una persona lee.
+     *
+     * La base lo impone con un CHECK; esto solo hace que el rechazo llegue antes y con
+     * palabras, que es lo mismo que hace el tope de 300.
      */
-    .refine((v) => !/[\n\r]/.test(v), {
+    .refine((v) => !/[\n\r\u2028\u2029]/.test(v), {
       message:
         'La referencia del acuerdo va en una sola línea: viaja dentro del documento sellado, que lleva un campo por renglón',
     }),

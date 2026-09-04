@@ -249,7 +249,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
     await sqlAdmin().unsafe(
-      'create table censo_probe_escritura (k int primary key, d date, ts timestamptz)',
+      /*
+       * `censo_fecha` existe para la comparación implícita, que necesita un nombre de columna
+       * SIN HUSO y sin ambigüedad: `d` es ambigua a propósito —significa `date` aquí y
+       * `timestamptz` en la otra tabla— y por eso queda fuera del conjunto que resuelve por
+       * nombre, que es justo lo que la haría inservible como sonda. Va la ÚLTIMA para no mover
+       * las posiciones que empareja el `insert` sin lista de columnas.
+       */
+      'create table censo_probe_escritura (k int primary key, d date, ts timestamptz,' +
+        ' censo_fecha date)',
     );
     /*
      * Y una SEGUNDA tabla con una columna que se llama igual y tiene otro tipo. Existe para
@@ -1387,7 +1395,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * paréntesis.
      *
      * Vive en el ámbito compartido porque hacen falta tres cortes iguales: la cláusula `set`,
-     * la lista de selección de un `insert … select`, y los destinos de un `select … into`.
+     * la lista de selección de un `insert … select`, y los destinos de un `into`.
      */
     const CLAUSULA_SIGUIENTE = /\s(?:from|where|using|group|order|limit|offset|returning)\b/gi;
     const hastaLaClausula = (t: string): string => {
@@ -1415,6 +1423,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       return t;
     };
+    /*
+     * Las DOS cláusulas que entregan valores a variables por posición. El `select … into` ya
+     * estaba; el `returning … into` no, y hace exactamente la misma coerción: medido,
+     * `declare d date; begin update t set k = k returning now() into d; return d; end`
+     * devuelve 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+     *
+     * Va por la CLÁUSULA y no por la sentencia, así que vale para las tres que admiten
+     * `RETURNING` —`insert`, `update`, `delete`— sin escribir ninguna: medido también sobre
+     * `insert … values (…) returning now() into d`, con el mismo par de fechas.
+     */
+    const PARES_INTO =
+      String.raw`\b(?:select|returning)\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`;
 
     /** Un nombre listo para meterse en una expresión regular sin significar otra cosa. */
     const escapado = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1474,7 +1494,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       const cualquiera = nombres.flatMap(formasDelNombre).join('|');
       if (cualquiera === '') return false;
       // Las tres formas de que a una de esas variables le caiga un valor: en su propia
-      // declaración, por una asignación posterior, y por un `select … into`.
+      // declaración, por una asignación posterior, y por un `into` —el del `select` y el del
+      // `returning`, que son la misma entrega por posición—.
       const asignaciones = [
         ...texto.matchAll(
           new RegExp(String.raw`(?<![\w"])(?:${cualquiera})\s*:=\s*([^;]*)`, 'gi'),
@@ -1505,9 +1526,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * parten las dos listas y se emparejan, que es lo que hace plpgsql.
        */
       const entradas = [
-        ...texto.matchAll(
-          new RegExp(String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`, 'gi'),
-        ),
+        ...texto.matchAll(new RegExp(PARES_INTO, 'gi')),
       ].flatMap((m) => {
         /*
          * Los destinos se cortan donde empiezan las cláusulas del `select`. Sin eso,
@@ -1626,9 +1645,39 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       const CALIFICADOR = String.raw`(?:(?:"[^"]+"|\w+)\s*\.\s*)?`;
       const COLUMNA =
         String.raw`(?<![\w.])${CALIFICADOR}${CITADO(`(?:${alternativa})`)}(?![\w])`;
+      /*
+       * Y el `BETWEEN`, que es TERNARIO y no lo cubría ningún comparador: `vence_en between
+       * current_timestamp and current_timestamp + interval '1 day'`, con `vence_en date`,
+       * promueve la columna con el huso de la sesión igual que un `<`. Medido sobre tres
+       * fechas seguidas: la promovida sale `2026-09-05 00:00:00+14` en Pacific/Kiritimati y
+       * `2026-09-05 00:00:00-12` en Etc/GMT+12, y el resultado cambia de fila —`2026-09-06`
+       * cae dentro en el primer huso y `2026-09-05` en el segundo—.
+       *
+       * Cuatro patrones porque hay dos límites y dos órdenes: el reloj puede ser cualquiera de
+       * los dos extremos, y también puede ser el término de la IZQUIERDA con la columna de
+       * límite —`now() between vence_en and timestamptz '2030-01-01'`, medido con el mismo
+       * vuelco de fila—. El `not` y el `symmetric` van opcionales, y el `not` se escribe UNA
+       * vez, en `ENTRE`, para que las dos formas del ternario no puedan discrepar.
+       *
+       * Los cuatro se comprueban de uno en uno y cada sonda está escrita para que solo la coja
+       * SU patrón. No es celo: escribiéndolas de la forma natural —el reloj a los dos lados
+       * del `and`— las cazaba a todas el patrón del límite superior, y quitar el del inferior
+       * no movía ninguna. Cuatro sondas que en realidad probaban una.
+       *
+       * El hueco entre límites no cruza un `and`, por lo mismo que en el censo de plantillas:
+       * con `[^;]*?` el patrón alcanzaría el `and` de la condición de al lado y marcaría por
+       * lo que no es.
+       */
+      const ENTRE = String.raw`\s+(?:not\s+)?between`;
+      const LIMITES = String.raw`${ENTRE}\s+(?:a?symmetric\s+)?`;
+      const HASTA_EL_AND = String.raw`${ENTRE}\b(?:(?!\band\b)[^;])*?\band\s+`;
       const COMPARA_CON_RELOJ = new RegExp(
         String.raw`${COLUMNA}\s*${COMPARADOR}\s*(?:${RELOJ})` +
-          String.raw`|(?:${RELOJ})\s*${COMPARADOR}\s*${COLUMNA}`,
+          String.raw`|(?:${RELOJ})\s*${COMPARADOR}\s*${COLUMNA}` +
+          String.raw`|${COLUMNA}${LIMITES}(?:${RELOJ})` +
+          String.raw`|${COLUMNA}${HASTA_EL_AND}(?:${RELOJ})` +
+          String.raw`|(?:${RELOJ})${LIMITES}${COLUMNA}` +
+          String.raw`|(?:${RELOJ})${HASTA_EL_AND}${COLUMNA}`,
         'i',
       );
       RELOJ_COMPARADO_CON_COLUMNA = (texto: string): boolean => COMPARA_CON_RELOJ.test(texto);
@@ -1683,7 +1732,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // 2026-09-04. El `(?!values\b)` evita que un `insert into t values (…)` tome `values`
       // por alias.
       String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
-        String.raw`(?:\s+(?:as\s+)?(?!values\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?values\s*\(`,
+        String.raw`(?:\s+(?:as\s+)?(?!values\b|with\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?` +
+        String.raw`(?:values\s*\(|(with)\s+)`,
       'gi',
     );
     /*
@@ -1699,9 +1749,42 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     const INSERTA_SELECT = new RegExp(
       String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
-        String.raw`(?:\s+(?:as\s+)?(?!select\b|values\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?select\s+([^;]*)`,
+        String.raw`(?:\s+(?:as\s+)?(?!select\b|values\b|with\b)${NOMBRE_SQL})?\s*(?:\(([^)]*)\)\s*)?` +
+        String.raw`(?:select\s+([^;]*)|(with)\s+)`,
       'gi',
     );
+    /*
+     * Entre la lista de columnas de un `insert` y el `select`/`values` que le entrega las filas
+     * cabe una lista de CTEs: `insert into t(k, d) with x as (select 1) select 1, now()`.
+     * Medido, y también con `values` en vez de `select` y con el CTE llevando su propia lista
+     * de columnas —`with x (a) as (…)`—: las tres guardan 2026-09-05 en Pacific/Kiritimati y
+     * 2026-09-04 en Etc/GMT+12.
+     *
+     * El salto NO se hace con una expresión regular, y no por gusto: el cuerpo de un CTE anida
+     * paréntesis y lleva dentro su propio `select`, así que saltar «hasta el primer `select`»
+     * se queda con el del CTE y empareja la lista equivocada. Se recorre la gramática —
+     * `nombre [(columnas)] as [not] [materialized] (cuerpo)`, separados por comas— y se
+     * devuelve dónde acaba la lista, o `null` si eso no es una lista de CTEs.
+     */
+    const CABEZA_CTE = new RegExp(
+      String.raw`^\s*${NOMBRE_SQL}\s*(?:\([^)]*\)\s*)?as\s+(?:not\s+)?(?:materialized\s+)?\(`,
+      'i',
+    );
+    const finDeLosCTEs = (texto: string, desde: number): number | null => {
+      const recursivo = /^\s*recursive\b/i.exec(texto.slice(desde));
+      let i = desde + (recursivo?.[0].length ?? 0);
+      for (;;) {
+        const cabeza = CABEZA_CTE.exec(texto.slice(i));
+        if (cabeza === null) return null;
+        const abre = i + cabeza[0].length - 1;
+        const dentro = parejaDeParentesis(texto, abre);
+        if (dentro === null) return null;
+        i = abre + dentro.length + 2;
+        const coma = /^\s*,/.exec(texto.slice(i));
+        if (coma === null) return i;
+        i += coma[0].length;
+      }
+    };
     /*
      * Y el `MERGE`, que es un `update` y un `insert` con otra sintaxis y sin repetir la tabla
      * en cada rama. Medido: `merge … when matched then update set d = now()` guarda
@@ -1876,12 +1959,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * `declare v t.d%type; begin select now() into v; …` da 2026-09-05 en
          * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
          */
-        for (const a of texto.matchAll(
-          new RegExp(
-            String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`,
-            'gi',
-          ),
-        )) {
+        for (const a of texto.matchAll(new RegExp(PARES_INTO, 'gi'))) {
           const destinos = argumentosDe(hastaLaClausula(a[2]!)).map((d) =>
             sinComillas(d.trim()).toLowerCase(),
           );
@@ -1901,6 +1979,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * que suele ser inocente.
          */
         let cursor = m.index + m[0].length - 1;
+        // Con CTEs por medio, el `(` de la primera tupla está detrás de ellos y no aquí.
+        if (m[3] !== undefined) {
+          const fin = finDeLosCTEs(texto, m.index + m[0].length);
+          if (fin === null) continue;
+          const abre = /^\s*values\s*\(/i.exec(texto.slice(fin));
+          if (abre === null) continue;
+          cursor = fin + abre[0].length - 1;
+        }
         const tuplas: string[] = [];
         for (;;) {
           const dentro = parejaDeParentesis(texto, cursor);
@@ -1940,11 +2026,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       for (const m of texto.matchAll(INSERTA_SELECT)) {
         const tabla = nombreCanonico(m[1]!);
+        let lista = m[3];
+        if (lista === undefined) {
+          const fin = finDeLosCTEs(texto, m.index + m[0].length);
+          if (fin === null) continue;
+          const sel = /^\s*select\s+([^;]*)/i.exec(texto.slice(fin));
+          if (sel === null) continue;
+          lista = sel[1]!;
+        }
         const destinos =
           m[2] === undefined
             ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
             : argumentosDe(m[2]).map(nombreCanonico);
-        if (porPosicion(tabla, destinos, argumentosDe(hastaLaClausula(m[3]!)))) return true;
+        if (porPosicion(tabla, destinos, argumentosDe(hastaLaClausula(lista)))) return true;
       }
       for (const m of texto.matchAll(FUSIONA)) {
         const tabla = nombreCanonico(m[1]!);
@@ -4230,6 +4324,116 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         '(p timestamptz default now()) returns timestamptz language sql immutable' +
           ' as $c$ select p $c$',
       ],
+      /*
+       * Tres formas más, medidas las tres 2026-09-05 en Pacific/Kiritimati contra 2026-09-04
+       * en Etc/GMT+12, y las tres eran hueco:
+       *
+       *   returning … into    la otra cláusula que entrega por posición, además del `select`
+       *   between             el ternario, que no cubre ningún comparador binario
+       *   with … select       una lista de CTEs entre la lista de columnas y el `select`
+       *
+       * El `between` se mide distinto que los demás porque no guarda nada: lo que cambia con
+       * el huso es la promoción de la columna. Sobre `2026-09-04`, `2026-09-05` y `2026-09-06`
+       * a la vez, la promovida sale `+14` en Pacific/Kiritimati y `-12` en Etc/GMT+12, y la
+       * respuesta se mueve de fila: cae dentro `2026-09-06` en el primer huso y `2026-09-05`
+       * en el segundo.
+       */
+      [
+        'censo_probe_returning_into_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          ' update censo_probe_otra set k = k returning now() into d; return d; end $c$',
+      ],
+      /*
+       * El ternario son CUATRO patrones —dos límites por dos órdenes— y cada sonda está
+       * escrita para que solo la coja el suyo: la que lleva el reloj ABAJO pone una fecha fija
+       * arriba, y al revés. Escribirlas de otro modo las cazaba todas el mismo brazo y las
+       * demás pasaban por sondas sin serlo — medido: quitando el brazo del límite inferior no
+       * se movía ninguna.
+       *
+       * Las cinco medidas sobre las mismas tres fechas seguidas, y las cinco cambian de fila
+       * entre Pacific/Kiritimati y Etc/GMT+12.
+       */
+      [
+        'censo_probe_between_date',
+        "returns boolean language sql stable as $c$ select censo_fecha between now() and" +
+          " date '2026-12-31' from censo_probe_escritura limit 1 $c$",
+      ],
+      [
+        'censo_probe_between_superior_date',
+        "returns boolean language sql stable as $c$ select censo_fecha between date" +
+          " '2026-01-01' and current_timestamp from censo_probe_escritura limit 1 $c$",
+      ],
+      [
+        'censo_probe_between_reloj_izquierdo_date',
+        "returns boolean language sql stable as $c$ select now() between censo_fecha and" +
+          " timestamptz '2030-01-01' from censo_probe_escritura limit 1 $c$",
+      ],
+      /* Ésta lleva además el `not`, que es la única pieza que comparten los cuatro. */
+      [
+        'censo_probe_between_superior_columna_date',
+        "returns boolean language sql stable as $c$ select now() not between timestamptz" +
+          " '2000-01-01Z' and censo_fecha from censo_probe_escritura limit 1 $c$",
+      ],
+      /* Y el `symmetric`, con la fecha fija arriba para que el otro brazo no la alcance. */
+      [
+        'censo_probe_between_symmetric_date',
+        'returns boolean language sql stable as $c$ select censo_fecha between symmetric' +
+          " now() and date '2026-01-01' from censo_probe_escritura limit 1 $c$",
+      ],
+      [
+        'censo_probe_insert_cte_select_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with x as (select 1) select 1, now(); end $c$',
+      ],
+      [
+        'censo_probe_insert_cte_values_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with x as (select 1) values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_insert_cte_columnas_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with x (a) as (select 1) select 1, now(); end $c$',
+      ],
+      /*
+       * Y las dos piezas restantes de la gramática, para que ninguna quede sin sonda: la lista
+       * con VARIOS CTEs separados por comas y el `RECURSIVE`. Medidas las dos con el mismo par
+       * de fechas.
+       */
+      [
+        'censo_probe_insert_cte_dos_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with x as (select 1), y as (select 2) select 1, now(); end $c$',
+      ],
+      [
+        'censo_probe_insert_cte_recursive_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with recursive x (a) as (select 1) select 1, now(); end $c$',
+      ],
+      /*
+       * Y sus seguras, que son las que fijan que el salto de los CTEs no se convirtió en «lo
+       * que venga detrás de un `with` es culpable»: la misma forma sobre una columna CON huso
+       * conserva el instante, y un reloj que se queda DENTRO del cuerpo del CTE no llega a
+       * ninguna columna sin huso —lo que se escribe ahí es una fecha fija—.
+       *
+       * La segunda es además la que distingue este salto de saltar «hasta el primer `select`»:
+       * el cuerpo del CTE lleva uno, y quedarse con él emparejaría la lista equivocada.
+       */
+      [
+        'censo_probe_ok_insert_cte_instante',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, ts)' +
+          ' with x as (select 1) select 1, now(); end $c$',
+      ],
+      [
+        'censo_probe_ok_insert_cte_reloj_dentro',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          " with x as (select now() as n) select 1, date '2026-01-01' from x; end $c$",
+      ],
+      [
+        'censo_probe_ok_between_instante',
+        'returns boolean language sql stable as $c$ select ts between current_timestamp' +
+          " and current_timestamp + interval '1 day' from censo_probe_escritura limit 1 $c$",
+      ],
       [
         'censo_probe_ok_compara_columna_ambigua',
         'returns boolean language sql stable as $c$ select now() < d from censo_probe_otra $c$',
@@ -4516,6 +4720,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_pct_type_into_date',
           'censo_probe_parametro_default_date',
           'censo_probe_tabla_unicode_date',
+          'censo_probe_returning_into_date',
+          'censo_probe_between_date',
+          'censo_probe_between_reloj_izquierdo_date',
+          'censo_probe_between_superior_date',
+          'censo_probe_between_superior_columna_date',
+          'censo_probe_between_symmetric_date',
+          'censo_probe_insert_cte_select_date',
+          'censo_probe_insert_cte_values_date',
+          'censo_probe_insert_cte_columnas_date',
+          'censo_probe_insert_cte_dos_date',
+          'censo_probe_insert_cte_recursive_date',
         ].sort(),
       );
     } finally {
@@ -4590,6 +4805,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_pct_type_into_date',
         'censo_probe_parametro_default_date',
         'censo_probe_ok_parametro_default_instante',
+        'censo_probe_returning_into_date',
+        'censo_probe_between_date',
+        'censo_probe_between_reloj_izquierdo_date',
+        'censo_probe_between_superior_date',
+        'censo_probe_between_superior_columna_date',
+        'censo_probe_between_symmetric_date',
+        'censo_probe_insert_cte_select_date',
+        'censo_probe_insert_cte_values_date',
+        'censo_probe_insert_cte_columnas_date',
+        'censo_probe_insert_cte_dos_date',
+        'censo_probe_insert_cte_recursive_date',
+        'censo_probe_ok_insert_cte_instante',
+        'censo_probe_ok_insert_cte_reloj_dentro',
+        'censo_probe_ok_between_instante',
         'censo_probe_tabla_unicode_date',
         'censo_probe_ok_compara_columna_ambigua',
         'censo_probe_ok_rowtype_instante',

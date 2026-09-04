@@ -1598,4 +1598,134 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // Y el sello sigue verificando con un `remediacion` no vacío y un contador en cero.
     expect(selloRecomputado(c)).toBe(c.sello);
   });
+  it('la retención se mide con un calendario FIJO, y no con el huso que elige quien llama', async () => {
+    /*
+     * `current_date` no es una fecha: es una fecha EN EL HUSO DE LA SESIÓN, y el huso lo pone
+     * quien llama con `SET LOCAL TIME ZONE`. La puerta de la retención está dentro del
+     * `GRANT EXECUTE` a `designio_app`, y `SECURITY DEFINER` presta los privilegios del
+     * dueño pero NO le devuelve los parámetros de sesión al valor del servidor: solo lo que
+     * la función fija en su propio `SET` (aquí, `search_path`) queda a salvo. Así que la
+     * espera pactada —lo único que separa un borrado irreversible de un clic— se medía
+     * contra un calendario que el que ejecuta elige.
+     *
+     * El caso se construye sin depender de la hora a la que corra: el mundo abarca a la vez
+     * dos fechas del calendario —de UTC-12 a UTC+14 hay 26 horas—, así que la fecha del huso
+     * más adelantado SIEMPRE es un día mayor que la del más atrasado. Se pacta la retención
+     * en la fecha del huso adelantado, y entonces, sin fijar el calendario, la misma fila da
+     * dos veredictos opuestos: para el huso atrasado la espera no ha vencido, y para el
+     * adelantado sí — y con ella se destruye el workspace un día antes.
+     */
+    const ws = await nuevoWorkspace('husos');
+    const [{ temprana, tardia }] = await conUsuario(leadId, async (tx) => {
+      await tx.unsafe(`set local time zone 'Etc/GMT+12'`);
+      const [a] = await tx`select current_date as d`;
+      await tx.unsafe(`set local time zone 'Pacific/Kiritimati'`);
+      const [b] = await tx`select current_date as d`;
+      return [{ temprana: a!.d as Date, tardia: b!.d as Date }];
+    });
+    const fecha = (d: Date) => d.toISOString().slice(0, 10);
+    // El supuesto sobre el que se apoya el caso, comprobado y no asumido.
+    expect(fecha(tardia) > fecha(temprana)).toBe(true);
+
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws,
+      modalidad: 'borrado',
+      base: 'Retención hasta el día pactado',
+      efectivoDesde: fecha(tardia),
+    });
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+
+    // La misma pregunta, la misma fila, desde los dos extremos del calendario mundial.
+    const veredictos: Record<string, string | null> = {};
+    for (const huso of ['Etc/GMT+12', 'UTC', 'Pacific/Kiritimati']) {
+      veredictos[huso] = await conUsuario(leadId, async (tx) => {
+        await tx.unsafe(`set local time zone '${huso}'`);
+        const [f] = await tx`select disposicion_motivo_no_ejecutable(${ws}) as motivo`;
+        return f!.motivo as string | null;
+      });
+    }
+    expect(veredictos['Etc/GMT+12']).toBe(veredictos['Pacific/Kiritimati']);
+    expect(veredictos['UTC']).toBe(veredictos['Pacific/Kiritimati']);
+
+    // Y lo que de verdad importa: el ACTO. Que el panel coincida no serviría de nada si la
+    // ejecución siguiera midiendo con el huso de quien la pide, así que se intenta el
+    // borrado desde el huso más adelantado y se exige que haga lo mismo que dice UTC.
+    const desdeElHusoAdelantado = await conUsuario(leadId, async (tx) => {
+      await tx.unsafe(`set local time zone 'Pacific/Kiritimati'`);
+      try {
+        await tx`select ejecutar_disposicion(${ws}, 1)`;
+        return null;
+      } catch (e) {
+        return (e as Error).message;
+      }
+    });
+    if (veredictos['UTC'] === null) {
+      expect(desdeElHusoAdelantado).toBeNull();
+    } else {
+      expect(desdeElHusoAdelantado).toMatch(/retención/i);
+      // El workspace sigue en pie: la espera pactada no se saltó cambiando de huso.
+      const [quedan] = await sqlAdmin()`select count(*)::int as n from segmento
+        where workspace_id = ${ws}`;
+      expect(quedan!.n).toBe(1);
+    }
+  });
+
+  it('el límite de la referencia contractual acota lo que se GUARDA, no su versión recortada', async () => {
+    /*
+     * `length(btrim(base)) between 1 and 300` medía el valor recortado y dejaba pasar el
+     * entero: `'x' || repeat(' ', 100000)` mide 1 y pesa cien mil (medido). `designio_app`
+     * tiene INSERT por columna sobre `base`, así que el camino crudo no pasa por el `.trim()`
+     * del esquema Zod.
+     *
+     * Y ese valor sin techo no se quedaba quieto: el guard lo COPIA al evento de dominio, y
+     * `ejecutar_disposicion` lo copia otra vez a `constancia_disposicion.acuerdo_base`, que
+     * entra en la carga canónica que se SELLA y viaja en la exportación. Un recibo que una
+     * persona tiene que poder leer cuando ya no es miembro de nada no puede pesar lo que
+     * quiera quien firmó el acuerdo.
+     *
+     * Se comprueban las dos mitades de la corrección por separado, porque se sostienen solas:
+     * el guard NORMALIZA lo que entra, y el `CHECK` ACOTA lo que queda escrito por cualquier
+     * otro camino —el guard es `before insert`, así que un `update` no lo cruza.
+     */
+    const ws = await nuevoWorkspace('base-larga');
+    const cola = ' '.repeat(100_000);
+    const ref = 'Cláusula 4.2 del MSA 2026-114';
+
+    // (1) Por el camino que el hallazgo señala —SQL crudo con el rol de la aplicación, que
+    // tiene INSERT por columna sobre `base` y no pasa por el `.trim()` del esquema— lo que
+    // se guarda es la referencia normalizada: la cola no llega a la fila.
+    await conUsuario(adminId, async (tx) => {
+      await tx`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por)
+        values (${ws}, 'archivo', ${ref + cola}, ${EFECTIVO_PASADO}, ${adminId})`;
+    });
+    const [g] = await sqlAdmin()`select base from acuerdo_disposicion
+      where workspace_id = ${ws}`;
+    expect(g!.base).toBe(ref);
+
+    // Y el evento que el guard emitió repite EXACTAMENTE lo guardado, no lo que se envió:
+    // es la copia que sobrevive al borrado, así que el techo tiene que alcanzarla.
+    const [ev] = await sqlAdmin()`select payload->>'base' as base from evento_dominio
+      where workspace_id = ${ws} and tipo = 'DisposicionAcordada'`;
+    expect(ev!.base).toBe(ref);
+
+    // (2) Y donde el guard NO normaliza —se retira ante quien no es miembro, que es el
+    // camino de administración— el techo lo pone la columna, que ahora mide lo almacenado.
+    await expect(
+      sqlAdmin()`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por, version, acordado_rol)
+        values (${ws}, 'archivo', ${ref + cola}, ${EFECTIVO_PASADO}, ${adminId}, 2,
+                'admin-cliente')`,
+    ).rejects.toThrow(/base_check/i);
+
+    // Y el techo no puede haberse comido la otra mitad de lo que el `btrim` daba: una
+    // referencia EN BLANCO mide cinco y está «entre 1 y 300», así que acotar solo la longitud
+    // del valor almacenado la habría dejado entrar por este mismo camino.
+    await expect(
+      sqlAdmin()`insert into acuerdo_disposicion
+        (workspace_id, modalidad, base, efectivo_desde, acordado_por, version, acordado_rol)
+        values (${ws}, 'archivo', '     ', ${EFECTIVO_PASADO}, ${adminId}, 2,
+                'admin-cliente')`,
+    ).rejects.toThrow(/base_check/i);
+  });
 });

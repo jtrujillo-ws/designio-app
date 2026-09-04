@@ -339,8 +339,24 @@ create table acuerdo_disposicion (
   -- más mientras el sello seguía verificando sobre los mismos bytes — la invariante de un
   -- campo por renglón rota por la VISTA y no por la carga, que para un documento que una
   -- persona LEE es exactamente igual de grave.
+  -- El tope se mide sobre lo que se GUARDA, no sobre su versión recortada. Con
+  -- `length(btrim(base))` el `CHECK` medía una cosa y la columna conservaba otra:
+  -- `'x' || repeat(' ', 100000000)` mide 1 y pesa cien millones (medido), y `designio_app`
+  -- tiene INSERT por columna sobre `base`, así que ese camino no pasa por el `.trim()` del
+  -- esquema. Un valor sin techo aquí no se queda quieto: el guard lo COPIA al evento de
+  -- dominio y `ejecutar_disposicion` lo copia otra vez a `constancia_disposicion`, que es lo
+  -- que se sella y lo que viaja en la exportación. El recibo que a alguien le queda cuando
+  -- ya no es miembro de nada no puede pesar lo que quiera quien firmó el acuerdo. El guard
+  -- normaliza antes (`btrim`), así que por el camino normal esto no cambia nada; es el techo
+  -- honesto de la columna para cualquier otro camino.
+  --
+  -- Las DOS mitades, y no una: `length` acota lo almacenado, y `btrim(...) <> ''` conserva lo
+  -- que el `btrim` de antes daba de propina —que la referencia diga algo—. Medir solo la
+  -- longitud del valor guardado dejaba pasar cinco espacios por el camino que no cruza el
+  -- guard: miden 5, están «entre 1 y 300», y una referencia contractual en blanco es
+  -- exactamente lo que este límite existe para impedir (medido).
   base text not null check (
-    length(btrim(base)) between 1 and 300 and texto_importado_limpio(base)
+    length(base) between 1 and 300 and btrim(base) <> '' and texto_importado_limpio(base)
     and base !~ '[\n\r\u2028\u2029]'),
   -- El rol de la parte que lo registró, sellado AQUÍ y no reconstruido después: los roles
   -- cambian, y un acuerdo dice quién era quién CUANDO se acordó. Es la mitad que hace
@@ -388,7 +404,7 @@ create table constancia_disposicion (
    * propia destrucción no es un recibo.
    */
   acuerdo_base text not null check (
-    length(btrim(acuerdo_base)) between 1 and 300
+    length(acuerdo_base) between 1 and 300 and btrim(acuerdo_base) <> ''
     and acuerdo_base !~ '[\n\r\u2028\u2029]'),
   -- La fecha efectiva viaja como TEXTO en ISO, y no como `date`, por la misma razón que los
   -- dos instantes: lo que entra en el sello tiene que ser BYTES fijos. `date::text` y
@@ -444,7 +460,7 @@ create table constancia_disposicion (
   -- habiendo —esto es un recibo, no un anexo— y una sola línea, que es lo que mantiene
   -- inequívoca la carga sellada: cada campo ocupa exactamente un renglón.
   alcance text not null check (
-    length(btrim(alcance)) between 1 and 2000
+    length(alcance) between 1 and 2000 and btrim(alcance) <> ''
     and alcance !~ '[\n\r\u2028\u2029]'),
   -- ── El sello ──
   -- Columna GENERADA y no un trigger, y la diferencia es operativa, no estética: el
@@ -657,7 +673,7 @@ begin
     v_disp := workspace_borrado(v_ws);
     if v_disp.id is not null then
       raise exception 'este workspace se borró por acuerdo el % : solo queda su constancia (sello %)',
-        to_char(v_disp.ejecutado_en, 'YYYY-MM-DD'), v_disp.sello using errcode = 'DS001';
+        to_char(timezone('UTC', v_disp.ejecutado_en), 'YYYY-MM-DD'), v_disp.sello using errcode = 'DS001';
     end if;
     -- Y después lo que sí: un archivo rige mientras su acuerdo siga siendo el vigente. En
     -- cuanto se registra uno nuevo, la congelación se levanta — que es la reversibilidad que
@@ -665,7 +681,7 @@ begin
     v_disp := disposicion_vigente(v_ws);
     if v_disp.id is not null and v_disp.modalidad = 'archivo' then
       raise exception 'este workspace está archivado por acuerdo desde el % : se conserva para consulta y no admite escrituras. Cambiar su disposición exige registrar un acuerdo nuevo',
-        to_char(v_disp.ejecutado_en, 'YYYY-MM-DD') using errcode = 'DS001';
+        to_char(timezone('UTC', v_disp.ejecutado_en), 'YYYY-MM-DD') using errcode = 'DS001';
     end if;
   end loop;
   return case tg_op when 'DELETE' then old else new end;
@@ -745,6 +761,12 @@ begin
   -- acuerdo» la aceptaría: se dispondría sin haber exportado el estado que se acordó disponer.
   -- El reloj del acto, no el de la puerta.
   new.acordado_en := clock_timestamp();
+  -- La referencia se normaliza ANTES de guardarla, y no al leerla. El esquema Zod ya
+  -- recorta, pero el INSERT por columna sobre `base` está concedido a `designio_app`: por
+  -- ese camino entraba el valor tal cual. Y lo que se guarda aquí es lo que se copia al
+  -- evento de abajo y, más tarde, a la constancia sellada — tres sitios donde el mismo dato
+  -- tiene que ser el MISMO. Normalizar en un solo punto es lo que lo garantiza.
+  new.base := btrim(new.base);
   new.acordado_rol := workspace_role(app_user_id(), new.workspace_id);
   new.version := coalesce(
     (select max(a.version) + 1 from acuerdo_disposicion a
@@ -847,7 +869,7 @@ begin
   v_disp := workspace_borrado(p_ws);
   if v_disp.id is not null then
     return format('Este workspace se borró por acuerdo el %s: no queda nada de lo que disponer',
-      to_char(v_disp.ejecutado_en, 'YYYY-MM-DD'));
+      to_char(timezone('UTC', v_disp.ejecutado_en), 'YYYY-MM-DD'));
   end if;
 
   select * into v_ac from acuerdo_disposicion a
@@ -859,7 +881,21 @@ begin
              where c.workspace_id = p_ws and c.acuerdo_version = v_ac.version) then
     return 'El acuerdo vigente ya se ejecutó: disponer otra vez exige registrar un acuerdo nuevo';
   end if;
-  if v_ac.efectivo_desde > current_date then
+  -- El calendario se FIJA en UTC y no se lee de la sesión. `current_date` no es una fecha:
+  -- es la fecha EN EL HUSO DE QUIEN LLAMA, y esta función está dentro del `GRANT EXECUTE` a
+  -- `designio_app`. `SECURITY DEFINER` presta los privilegios del dueño, pero NO devuelve los
+  -- parámetros de sesión al valor del servidor: solo lo que la función fija en su propio
+  -- `SET` —aquí, `search_path`— queda fuera del alcance de quien la invoca. Así que con
+  -- `current_date` bastaba un `SET LOCAL TIME ZONE 'Pacific/Kiritimati'` antes de ejecutar
+  -- para adelantar el día: el mundo abarca a la vez 26 horas de calendario —de UTC-12 a
+  -- UTC+14—, y durante buena parte del día anterior el huso más adelantado YA está en la
+  -- fecha pactada. Lo que se saltaba así es el último día de la retención, que es justo el
+  -- día en el que la retención significa algo, y lo que quedaba al otro lado es un borrado
+  -- irreversible. `timezone('UTC', now())` devuelve un `timestamp` SIN huso, así que el
+  -- `::date` ya no tiene de dónde moverse (medido). `now()` y no `clock_timestamp()`: es lo
+  -- que `current_date` medía —el inicio de la transacción— y esta corrección fija el
+  -- calendario, no cambia el instante.
+  if v_ac.efectivo_desde > timezone('UTC', now())::date then
     return format('El acuerdo vigente es efectivo a partir del %s: la retención acordada todavía no se ha cumplido',
       to_char(v_ac.efectivo_desde, 'YYYY-MM-DD'));
   end if;

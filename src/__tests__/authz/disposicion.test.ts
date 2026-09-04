@@ -653,6 +653,85 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect(invocadas).toEqual(['is_workspace_member']);
   });
 
+  it('un archivo SÍ se revierte registrando un acuerdo nuevo, que es lo que la modalidad promete', async () => {
+    /*
+     * `disposicion_vigente` devolvía la ÚLTIMA constancia sin mirar si su acuerdo seguía
+     * siendo el vigente, así que tras archivar, registrar otro acuerdo dejaba la constancia
+     * vieja gobernando: los guards seguían rechazando toda escritura con DS001 —y con un
+     * mensaje que mandaba a registrar un acuerdo nuevo, que es exactamente lo que la persona
+     * acababa de hacer—. Ejecutar el acuerdo nuevo solo añadía otra constancia congelada: la
+     * única salida real era borrar. La promesa de la primera página de la migración —que un
+     * archivo es reversible— no se cumplía.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('archivo-reversible');
+    await acordarYExportar(ws, 'archivo', leadId);
+    await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'archivo',
+      acuerdoVersionEsperada: 1,
+      confirmacion: '',
+    });
+
+    // Congelado: la escritura se rechaza y el mensaje dice qué hacer.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into segmento (workspace_id, nombre, definicion)
+        values (${ws}, 'nuevo', 'x')`),
+    ).rejects.toMatchObject({ code: 'DS001' });
+
+    // Se hace exactamente lo que el mensaje indica.
+    await registrarAcuerdo(leadId, {
+      workspaceId: ws,
+      modalidad: 'archivo',
+      base: 'Acuerdo 2: se reanuda el trabajo',
+      efectivoDesde: new Date().toISOString().slice(0, 10),
+    });
+
+    // Y el workspace vuelve a admitir escrituras: eso es «reversible».
+    await conUsuario(leadId, (tx) => tx`insert into segmento (workspace_id, nombre, definicion)
+      values (${ws}, ${marca + ' descongelado'}, 'x')`);
+    const [seg] = await admin`select count(*)::int as n from segmento where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(2);
+  });
+
+  it('un BORRADO no se revierte registrando papel encima', async () => {
+    // El otro lado de la misma moneda, y por eso la pregunta se parte en dos: atar la
+    // congelación al acuerdo vigente a secas dejaría levantar la de un borrado registrando un
+    // acuerdo nuevo, y entonces se podría repoblar un workspace cuya constancia certifica que
+    // quedó vacío — el recibo pasaría a mentir.
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('borrado-irreversible');
+    await acordarYExportar(ws, 'borrado', adminId);
+    await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'borrado',
+      acuerdoVersionEsperada: 1,
+      confirmacion: 'BORRAR',
+    });
+
+    // La membresía se destruyó con todo lo demás, así que el acuerdo nuevo solo se puede
+    // colar por la puerta de admin. Se cuela: la tabla del acuerdo no está congelada.
+    await admin`insert into acuerdo_disposicion
+      (workspace_id, version, modalidad, base, acordado_rol, efectivo_desde, acordado_por)
+      values (${ws}, 2, 'archivo', 'Intento de resucitar', 'lead-boutique',
+              current_date, ${leadId})`;
+
+    // Y aun así el guard sigue cerrado. Se comprueba por la conexión de admin porque es la
+    // única que llega hasta él: al rol de aplicación le responde antes la RLS —sin membresía,
+    // el workspace no existe para él— y ese es el anti-oráculo funcionando, no un hueco.
+    await expect(
+      admin`insert into segmento (workspace_id, nombre, definicion)
+        values (${ws}, 'resucitado', 'x')`,
+    ).rejects.toMatchObject({ code: 'DS001' });
+    // Ni devolviéndole la membresía a alguien: `miembro` también está congelada.
+    await expect(
+      admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${ws}, ${leadId}, 'x', ${marca + '-resucita@test.demo'}, 'lead-boutique')`,
+    ).rejects.toMatchObject({ code: 'DS001' });
+    const [seg] = await admin`select count(*)::int as n from segmento where workspace_id = ${ws}`;
+    expect(seg!.n).toBe(0);
+  });
+
   it('el alcance sellado no declara más de lo que la disposición hizo', async () => {
     /*
      * El texto del alcance viaja DENTRO del sello, así que si sobredeclara, sobredeclara con
@@ -684,6 +763,20 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // Y nombra lo que sobrevive SIN ser una tabla del conjunto: la fila del propio workspace.
     expect(cb.alcance).toContain('cupo de llamadas AI anulado');
 
+    /*
+     * Las supervivientes se NOMBRAN en el alcance y NO figuran en los conteos —lo que el
+     * borrado no alcanza no se cuenta—. Las dos mitades importan: una versión del texto
+     * afirmaba que aparecían «con esos nombres en los conteos», que es falso y viajaba dentro
+     * del sello. La prosa de un documento no se puede comprobar entera desde un test, pero sí
+     * el HECHO que describe, y es lo que se fija aquí: las claves del inventario son
+     * exactamente el conjunto que el borrado alcanza, ni una más.
+     */
+    for (const f of sobreviven) expect(cb.conteos[f.tabla as string]).toBeUndefined();
+    const alcanzadas = (await admin`select tabla from tablas_alcanzadas_por_borrado()`).map(
+      (f) => f.tabla as string,
+    );
+    for (const tabla of Object.keys(cb.conteos)) expect(alcanzadas).toContain(tabla);
+
     const noCongeladas = await admin`select tabla from tablas_alcanzadas_por_borrado()
       except select tabla from tablas_congelables()`;
     expect(noCongeladas.length).toBeGreaterThan(0);
@@ -697,6 +790,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       confirmacion: '',
     });
     for (const f of noCongeladas) expect(ca.alcance).toContain(f.tabla as string);
+    // Lo mismo por el lado del archivo: el acuerdo y la constancia se nombran y no se cuentan.
+    for (const f of sobreviven) expect(ca.conteos[f.tabla as string]).toBeUndefined();
 
     // Los dos textos son DISTINTOS: un archivo no destruye nada y congela un conjunto más
     // pequeño que el que cuenta, así que un texto único no puede ser exacto para los dos.

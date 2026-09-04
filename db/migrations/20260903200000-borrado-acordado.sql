@@ -116,8 +116,8 @@ comment on function sello_constancia(text) is
 create function alcance_de_constancia(p_modalidad text) returns text
 language sql immutable parallel safe as $$
   select case p_modalidad
-    when 'borrado' then 'Alcance (whitespace-constancia/1, borrado): se destruyó TODA fila del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. SOBREVIVEN, y cada excepción es una decisión: (1) las cuentas de usuario, identidad de plataforma que puede pertenecer a otros workspaces, así que su borrado es otra operación con su propio acuerdo; (2) el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor, porque los bytes enviados no se des-envían; (3) el acuerdo que autoriza este borrado y esta misma constancia («acuerdo_disposicion» y «constancia_disposicion», con esos nombres en los conteos), que son lo que lo acredita y no pueden destruirse a sí mismas —por eso el acuerdo viaja aquí entero y sellado—; (4) la fila del propio workspace, vaciada de contenido (nombre sustituido por una lápida y cupo de llamadas AI anulado) y conservada solo como el identificador del que cuelga esta constancia; y (5) el único evento de auditoría que escribe esta misma disposición, que es lo que queda en el libro tras el vaciado.'
-    when 'archivo' then 'Alcance (whitespace-constancia/1, archivo): NO se destruyó ninguna fila. Los conteos dicen cuántas quedan CONSERVADAS del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. Quedan además CONGELADAS —ni altas, ni cambios, ni bajas— todas MENOS cuatro, y las cuatro son decisiones: la auditoría («evento_dominio») y el registro de exportaciones («exportacion_registro») siguen aceptando escrituras, porque un archivo tiene que poder seguir diciendo quién lo consulta y quién lo re-exporta; el acuerdo («acuerdo_disposicion») tampoco se congela, porque registrar uno nuevo es exactamente lo que revierte un archivo; y esta misma constancia («constancia_disposicion») queda fuera por lo mismo, aunque nadie pueda escribirla —no existe permiso de alta, cambio ni baja sobre ella para ninguna parte—. La fila del propio workspace (su nombre y su cupo de llamadas AI) ni se cuenta ni se congela: no pertenece al conjunto derivado. Fuera de alcance quedan, igual que en un borrado, las cuentas de usuario —identidad de plataforma que puede pertenecer a otros workspaces— y el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor. Y los conteos son el estado EN EL INSTANTE de certificar, que es el comparable con el manifiesto de la exportación: esta misma disposición escribe DESPUÉS su propio evento de auditoría, así que al cotejar se encontrará en «evento_dominio» exactamente una fila más que la que aquí figura, y ninguna diferencia en ninguna otra tabla.'
+    when 'borrado' then 'Alcance (whitespace-constancia/1, borrado): se destruyó TODA fila del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. SOBREVIVEN, y cada excepción es una decisión: (1) las cuentas de usuario, identidad de plataforma que puede pertenecer a otros workspaces, así que su borrado es otra operación con su propio acuerdo; (2) el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor, porque los bytes enviados no se des-envían; (3) el acuerdo que autoriza este borrado y esta misma constancia —las tablas «acuerdo_disposicion» y «constancia_disposicion», que por eso mismo NO figuran en los conteos: lo que el borrado no alcanza no se cuenta—, que son lo que lo acredita y no pueden destruirse a sí mismas —por eso el acuerdo viaja aquí entero y sellado—; (4) la fila del propio workspace, vaciada de contenido (nombre sustituido por una lápida y cupo de llamadas AI anulado) y conservada solo como el identificador del que cuelga esta constancia; y (5) el único evento de auditoría que escribe esta misma disposición, que es lo que queda en el libro tras el vaciado.'
+    when 'archivo' then 'Alcance (whitespace-constancia/1, archivo): NO se destruyó ninguna fila. Los conteos dicen cuántas quedan CONSERVADAS del workspace nombrado —sus objetos, sus objetos derivados (propuestas AI, insights, journeys, design versions, mediciones) y su auditoría—, sobre el conjunto derivado del catálogo vivo de la base y no de una lista escrita a mano. El acuerdo («acuerdo_disposicion») y esta constancia («constancia_disposicion») quedan fuera de esos conteos, porque el conjunto que se cuenta es el mismo que un borrado alcanzaría y a ellas no las alcanza. Quedan además CONGELADAS —ni altas, ni cambios, ni bajas— todas MENOS cuatro, y las cuatro son decisiones: la auditoría («evento_dominio») y el registro de exportaciones («exportacion_registro») siguen aceptando escrituras, porque un archivo tiene que poder seguir diciendo quién lo consulta y quién lo re-exporta; el acuerdo («acuerdo_disposicion») tampoco se congela, porque registrar uno nuevo es exactamente lo que revierte un archivo; y esta misma constancia («constancia_disposicion») queda fuera por lo mismo, aunque nadie pueda escribirla —no existe permiso de alta, cambio ni baja sobre ella para ninguna parte—. La fila del propio workspace (su nombre y su cupo de llamadas AI) ni se cuenta ni se congela: no pertenece al conjunto derivado. Fuera de alcance quedan, igual que en un borrado, las cuentas de usuario —identidad de plataforma que puede pertenecer a otros workspaces— y el material ya despachado a proveedores externos, que figura en «remediacion» y solo se retira pidiéndoselo al proveedor. Y los conteos son el estado EN EL INSTANTE de certificar, que es el comparable con el manifiesto de la exportación: esta misma disposición escribe DESPUÉS su propio evento de auditoría, así que al cotejar se encontrará en «evento_dominio» exactamente una fila más que la que aquí figura, y ninguna diferencia en ninguna otra tabla.'
   end
 $$;
 
@@ -532,7 +532,31 @@ create function disposicion_vigente(p_ws uuid) returns constancia_disposicion
 language sql stable as $$
   select c.* from constancia_disposicion c
   where c.workspace_id = p_ws
-  order by c.acuerdo_version desc limit 1
+    and c.acuerdo_version = (select max(a.version) from acuerdo_disposicion a
+                             where a.workspace_id = p_ws)
+$$;
+
+/*
+ * ── Y por qué eso no basta: un borrado no se deshace registrando papel ──
+ * `disposicion_vigente` devolvía la ÚLTIMA constancia sin mirar si su acuerdo seguía siendo
+ * el vigente, y eso rompía la promesa que esta migración escribe en su primera página: que un
+ * `archivo` es reversible registrando un acuerdo nuevo. No lo era. Tras archivar, registrar
+ * otro acuerdo dejaba la constancia vieja gobernando, así que los guards seguían rechazando
+ * toda escritura con DS001 —y con un mensaje que mandaba a registrar un acuerdo nuevo, que es
+ * exactamente lo que la persona acababa de hacer—. Ejecutar el acuerdo nuevo solo añadía otra
+ * constancia congelada: la única salida real era borrar.
+ *
+ * Atarla al acuerdo vigente lo arregla, y abre un agujero por el otro lado si se hace a
+ * secas: un BORRADO sí es definitivo, así que su congelación no puede levantarse registrando
+ * papel encima. Por eso la pregunta se parte en dos, que son dos preguntas distintas:
+ *  · «¿rige ahora una disposición?» → la constancia del acuerdo vigente;
+ *  · «¿este workspace se borró alguna vez?» → esto, que no caduca nunca.
+ */
+create function workspace_borrado(p_ws uuid) returns constancia_disposicion
+language sql stable as $$
+  select c.* from constancia_disposicion c
+  where c.workspace_id = p_ws and c.modalidad = 'borrado'
+  order by c.ejecutado_en limit 1
 $$;
 
 -- ── Congelación: lo que el acuerdo decide tiene efecto observable ─────────────────────
@@ -606,17 +630,23 @@ begin
     end if;
 
     perform pg_advisory_xact_lock_shared(hashtextextended('designio:workspace:' || v_ws, 42));
-    v_disp := disposicion_vigente(v_ws);
+    -- Primero lo que no caduca. Un borrado es definitivo, así que su congelación NO se
+    -- levanta registrando un acuerdo encima; si se preguntara solo por el acuerdo vigente,
+    -- bastaría con registrar papel para poder repoblar un workspace cuya constancia certifica
+    -- que quedó vacío — y entonces el recibo pasaría a mentir, que es lo que la congelación
+    -- existe para impedir.
+    v_disp := workspace_borrado(v_ws);
     if v_disp.id is not null then
-      -- Cada causa con su mensaje y con su salida: un archivo se puede volver a disponer
-      -- registrando un acuerdo nuevo; un borrado no tiene vuelta y decirle a alguien que
-      -- «registre otro acuerdo» sería mandarlo a un trámite que no desbloquea nada.
-      if v_disp.modalidad = 'archivo' then
-        raise exception 'este workspace está archivado por acuerdo desde el % : se conserva para consulta y no admite escrituras. Cambiar su disposición exige registrar un acuerdo nuevo',
-          to_char(v_disp.ejecutado_en, 'YYYY-MM-DD') using errcode = 'DS001';
-      end if;
       raise exception 'este workspace se borró por acuerdo el % : solo queda su constancia (sello %)',
         to_char(v_disp.ejecutado_en, 'YYYY-MM-DD'), v_disp.sello using errcode = 'DS001';
+    end if;
+    -- Y después lo que sí: un archivo rige mientras su acuerdo siga siendo el vigente. En
+    -- cuanto se registra uno nuevo, la congelación se levanta — que es la reversibilidad que
+    -- la modalidad promete, y el mensaje de abajo indica.
+    v_disp := disposicion_vigente(v_ws);
+    if v_disp.id is not null and v_disp.modalidad = 'archivo' then
+      raise exception 'este workspace está archivado por acuerdo desde el % : se conserva para consulta y no admite escrituras. Cambiar su disposición exige registrar un acuerdo nuevo',
+        to_char(v_disp.ejecutado_en, 'YYYY-MM-DD') using errcode = 'DS001';
     end if;
   end loop;
   return case tg_op when 'DELETE' then old else new end;
@@ -781,8 +811,11 @@ begin
     return 'Tu cuenta no está activa: una disposición acordada la ejecuta una persona en activo';
   end if;
 
-  v_disp := disposicion_vigente(p_ws);
-  if v_disp.modalidad = 'borrado' then
+  -- Lo irreversible se pregunta a la función que no caduca, y no al acuerdo vigente: si no,
+  -- registrar un acuerdo nuevo sobre un workspace ya borrado haría desaparecer este motivo y
+  -- dejaría ejecutar una segunda disposición sobre una lápida.
+  v_disp := workspace_borrado(p_ws);
+  if v_disp.id is not null then
     return format('Este workspace se borró por acuerdo el %s: no queda nada de lo que disponer',
       to_char(v_disp.ejecutado_en, 'YYYY-MM-DD'));
   end if;
@@ -1227,12 +1260,14 @@ revoke execute on function
   tablas_alcanzadas_por_borrado(),
   tablas_congelables(),
   disposicion_vigente(uuid),
+  workspace_borrado(uuid),
   disposicion_motivo_no_ejecutable(uuid),
   ejecutar_disposicion(uuid, integer)
 from public;
 grant execute on function
   confirmar_exportacion(uuid, text),
   disposicion_vigente(uuid),
+  workspace_borrado(uuid),
   disposicion_motivo_no_ejecutable(uuid),
   ejecutar_disposicion(uuid, integer)
 to designio_app;

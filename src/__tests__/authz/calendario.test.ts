@@ -157,7 +157,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * Y los dos que NO se pueden decidir mirando la expresión, porque lo decisivo está FUERA de
    * ella: el TIPO del destino. Van aparte por eso, y no porque sean otra clase de reloj.
    */
-  let RELOJ_ENTREGADO: RegExp[] = [];
+  let RELOJ_ENTREGADO: (texto: string) => boolean = () => false;
   let RELOJ_ASIGNADO_A_VARIABLE: (texto: string) => boolean = () => false;
 
   beforeAll(async () => {
@@ -969,15 +969,123 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * salida, y la asimetría es a propósito: ahí el destino es la variable, y de eso se ocupa
      * el reconocedor de al lado.
      */
-    const FIN_DE_EXPRESION = String.raw`(?=\s*(?:;|\$|$)|\s+from\b)`;
-    RELOJ_ENTREGADO = [
-      new RegExp(
-        String.raw`\breturn\s+(?:query\s+select\s+)?(?:${RELOJ})${FIN_DE_EXPRESION}`,
-        'i',
-      ),
-      new RegExp(String.raw`\bselect\s+(?:${RELOJ})${FIN_DE_EXPRESION}`, 'i'),
-      new RegExp(String.raw`^\s*(?:${RELOJ})\s*$`, 'i'),
+    /*
+     * Y el reloj ENTREGADO no tiene por qué ser toda la expresión. Una función `returns date`
+     * con `return coalesce(now(), now());` colapsa un `timestamptz` a día con el huso de quien
+     * llama —medido: 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12— y lo mismo
+     * `greatest(now(), now())` y `case when … then now() else now() end`, las tres medidas.
+     * Exigir el reloj pegado al `return` las dejaba pasar las tres: el reconocedor se paraba
+     * ante el `coalesce(`.
+     *
+     * Y no vale con buscar un reloj DENTRO, que es la tentación: `return timezone('UTC',
+     * now())::date;` también lo contiene y es el arreglo canónico de este PR —medido 2026-09-04
+     * en los dos husos—, y `return (select f from t where creado_en < now());` devuelve una
+     * columna `date` con el reloj solo en el `where`. Marcar cualquiera de las dos es el falso
+     * positivo que desactiva un censo.
+     *
+     * Lo que hay que seguir es el VALOR. Así que la expresión entregada se descompone en las
+     * ramas que pueden ser su valor —las envolturas transparentes, que devuelven el tipo de sus
+     * argumentos, y los brazos de un `case`— y se pregunta si alguna hoja es un reloj a secas.
+     * `timezone(…)` no está en la lista porque NO es transparente: fija el huso, que es
+     * exactamente lo contrario. Y el `select` de una subconsulta no se abre: su valor es la
+     * columna, no lo que haya en el `where`.
+     *
+     * LÍMITE DECLARADO: la lista de envolturas transparentes se escribe a mano —`coalesce`,
+     * `nullif`, `greatest`, `least`— y no se deriva del catálogo. Derivarla pediría resolver
+     * tipos polimórficos, que no es cosa de este censo; lo que sí es cosa suya es que la lista
+     * esté aquí, a la vista, y no repartida por los patrones.
+     */
+    const ENVOLTURA_TRANSPARENTE = /^(?:coalesce|nullif|greatest|least)$/i;
+    const RELOJ_A_SECAS = new RegExp(String.raw`^\s*(?:${RELOJ})\s*$`, 'i');
+
+    /** Lo que hay dentro de la llamada o del paréntesis, si el cierre es el ÚLTIMO carácter. */
+    const dentroDelParentesis = (e: string): string | null => {
+      const abre = e.indexOf('(');
+      if (abre < 0) return null;
+      let nivel = 0;
+      for (let i = abre; i < e.length; i++) {
+        if (e[i] === '(') nivel++;
+        else if (e[i] === ')' && --nivel === 0) return i === e.length - 1 ? e.slice(abre + 1, i) : null;
+      }
+      return null;
+    };
+
+    /** Los argumentos de PRIMER nivel: una coma dentro de un paréntesis no separa. */
+    const argumentosDe = (dentro: string): string[] => {
+      const partes: string[] = [];
+      let nivel = 0;
+      let desde = 0;
+      for (let i = 0; i < dentro.length; i++) {
+        if (dentro[i] === '(') nivel++;
+        else if (dentro[i] === ')') nivel--;
+        else if (dentro[i] === ',' && nivel === 0) {
+          partes.push(dentro.slice(desde, i));
+          desde = i + 1;
+        }
+      }
+      partes.push(dentro.slice(desde));
+      return partes;
+    };
+
+    /*
+     * Los brazos de un `case`: lo que sigue a cada `then` y al `else`. Se recogen TODOS los que
+     * estén fuera de paréntesis, sin llevar la cuenta de `case` anidados, y eso es a propósito:
+     * el brazo de un `case` de dentro también es un valor que sube, así que recoger de más aquí
+     * es recoger bien. Lo que no se cruza es un paréntesis, que sí cambia de expresión.
+     */
+    const brazosDelCase = (e: string): string[] | null => {
+      if (!/^case\b/i.test(e)) return null;
+      const brazos: string[] = [];
+      let nivel = 0;
+      let desde = -1;
+      const token = /[()]|\b(?:case|when|then|else|end)\b/gi;
+      let m: RegExpExecArray | null;
+      while ((m = token.exec(e)) !== null) {
+        const t = m[0].toLowerCase();
+        if (t === '(') nivel++;
+        else if (t === ')') nivel--;
+        else if (nivel === 0) {
+          if (desde >= 0) {
+            brazos.push(e.slice(desde, m.index));
+            desde = -1;
+          }
+          if (t === 'then' || t === 'else') desde = m.index + m[0].length;
+        }
+      }
+      if (desde >= 0) brazos.push(e.slice(desde));
+      return brazos.length > 0 ? brazos : null;
+    };
+
+    /** Las hojas cuyo valor PUEDE ser el de la expresión entera. */
+    const hojasDelValor = (expr: string, hondura = 0): string[] => {
+      const e = expr.trim();
+      if (hondura >= 8 || e === '') return [e];
+      const brazos = brazosDelCase(e);
+      if (brazos) return brazos.flatMap((b) => hojasDelValor(b, hondura + 1));
+      const dentro = dentroDelParentesis(e);
+      if (dentro !== null) {
+        const nombre = e.slice(0, e.indexOf('(')).trim();
+        // Sin nombre delante son los paréntesis propios de la expresión, que no cambian nada.
+        if (nombre === '') return hojasDelValor(dentro, hondura + 1);
+        if (ENVOLTURA_TRANSPARENTE.test(nombre))
+          return argumentosDe(dentro).flatMap((a) => hojasDelValor(a, hondura + 1));
+      }
+      return [e];
+    };
+
+    /*
+     * De dónde se saca la expresión entregada. Tres sitios, los mismos tres de antes: el
+     * `return` de plpgsql, el `select` de un cuerpo SQL —que termina también en su `from`— y
+     * el texto ENTERO, que es como llega un `default`.
+     */
+    const ENTREGAS = [
+      /\breturn\s+(?:query\s+select\s+)?([^;]*?)(?=;|\s*\$|\s*$)/gi,
+      /\bselect\s+([^;]*?)(?=;|\s+from\b|\s*\$|\s*$)/gi,
     ];
+    RELOJ_ENTREGADO = (texto: string): boolean =>
+      [texto, ...ENTREGAS.flatMap((r) => [...texto.matchAll(r)].map((m) => m[1]!))].some((e) =>
+        hojasDelValor(e).some((hoja) => RELOJ_A_SECAS.test(hoja)),
+      );
 
     /*
      * El segundo no necesita que nadie le pase el tipo, porque lo declara el propio texto: una
@@ -1049,7 +1157,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       RELOJ_LEYENDO_LITERAL.some((r) => r.test(conLiterales)) ||
       (tipoDeclarado !== undefined &&
         SIN_HUSO_DECLARADO.test(tipoDeclarado) &&
-        RELOJ_ENTREGADO.some((r) => r.test(sinLiterales))) ||
+        RELOJ_ENTREGADO(sinLiterales)) ||
       RELOJ_ASIGNADO_A_VARIABLE(sinLiterales) ||
       /*
        * Y el SQL DINÁMICO: `execute 'select now()::date'` guarda la operación DENTRO de un
@@ -2687,6 +2795,38 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_variable_instante',
         'returns timestamptz language plpgsql as $c$ declare d timestamptz; begin d := now(); return d; end $c$',
       ],
+      // Y el reloj ENVUELTO en algo que no cambia su tipo, que es como llega de verdad una
+      // expresión escrita por una persona. Las cuatro medidas: 2026-09-05 en
+      // Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
+      [
+        'censo_probe_coalesce_date',
+        'returns date language plpgsql as $c$ begin return coalesce(now(), now()); end $c$',
+      ],
+      [
+        'censo_probe_greatest_date',
+        'returns date language plpgsql as $c$ begin return greatest(now(), now()); end $c$',
+      ],
+      [
+        'censo_probe_case_date',
+        'returns date language plpgsql as $c$ begin return case when true then now() else now() end; end $c$',
+      ],
+      [
+        'censo_probe_coalesce_sql_date',
+        'returns date language sql stable as $c$ select coalesce(now(), now()) $c$',
+      ],
+      // Y las dos que impiden el atajo de «hay un reloj dentro»: las dos LO TIENEN y las dos
+      // dan lo mismo en husos opuestos (2026-09-04 y 2026-01-01, medidas). La primera es el
+      // arreglo canónico de este PR; la segunda devuelve una columna y usa el reloj solo para
+      // filtrar. Sin ellas, seguir el valor y buscar dentro se verían igual de verdes.
+      [
+        'censo_probe_ok_huso_fijo_date',
+        "returns date language plpgsql as $c$ begin return timezone('UTC', now())::date; end $c$",
+      ],
+      [
+        'censo_probe_ok_subconsulta_date',
+        "returns date language sql stable as $c$ select d from (values (date '2026-01-01')) v(d)" +
+          " where now() > timestamptz '2000-01-01' $c$",
+      ],
     ] as const) {
       await admin.unsafe(`create function ${nombre}() ${sql}`);
     }
@@ -2735,6 +2875,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_cuerpo_viejo_date',
           'censo_probe_cuerpo_from_date',
           'censo_probe_cuerpo_nuevo_date',
+          'censo_probe_coalesce_date',
+          'censo_probe_greatest_date',
+          'censo_probe_case_date',
+          'censo_probe_coalesce_sql_date',
         ].sort(),
       );
     } finally {
@@ -2753,6 +2897,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_cuerpo_nuevo_date',
         'censo_probe_devuelve_instante',
         'censo_probe_variable_instante',
+        'censo_probe_coalesce_date',
+        'censo_probe_greatest_date',
+        'censo_probe_case_date',
+        'censo_probe_coalesce_sql_date',
+        'censo_probe_ok_huso_fijo_date',
+        'censo_probe_ok_subconsulta_date',
       ]) {
         await admin.unsafe(`drop function ${nombre}()`);
       }

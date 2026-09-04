@@ -2093,17 +2093,42 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
            * correcta y no un descuido del censo.
            */
           const opciones = llamada.arguments[arg + 1];
-          const fijaAislamiento =
-            Boolean(opciones) &&
-            ts.isObjectLiteralExpression(opciones!) &&
-            opciones!.properties.some(
-              (prop) =>
-                ts.isPropertyAssignment(prop) &&
-                ((ts.isIdentifier(prop.name) && prop.name.text === 'aislamiento') ||
-                  (ts.isStringLiteral(prop.name) && prop.name.text === 'aislamiento')) &&
-                ts.isStringLiteral(prop.initializer) &&
-                prop.initializer.text === 'repeatable read',
-            );
+          /*
+           * El valor EFECTIVO, recorriendo las propiedades EN ORDEN, no un `some` que se
+           * conforma con encontrar el literal en cualquier sitio.
+           *
+           * `{ aislamiento: 'repeatable read', ...opciones }` con
+           * `opciones = { aislamiento: undefined }` es TypeScript válido —comprobado, compila
+           * en modo estricto— y el spread SOBRESCRIBE: `conUsuario` recibe `undefined` y abre
+           * en READ COMMITTED. Con el `some`, el censo veía el literal, daba la transacción
+           * por declarada y la saltaba. La proyección volvía a mezclar instantáneas y aquí no
+           * se enteraba nadie.
+           *
+           * Un spread posterior deja el valor DESCONOCIDO, no fijado: no se puede resolver
+           * qué trae, así que no puede sostener una garantía. Uno ANTERIOR no estorba, porque
+           * la asignación explícita que venga después gana.
+           */
+          type Aislamiento = 'fijado' | 'sin fijar' | 'desconocido';
+          const nombreDe = (prop: TS.ObjectLiteralElementLike) =>
+            prop.name && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name))
+              ? prop.name.text
+              : undefined;
+          let efectivo: Aislamiento = 'sin fijar';
+          if (opciones && ts.isObjectLiteralExpression(opciones)) {
+            for (const prop of opciones.properties) {
+              if (ts.isSpreadAssignment(prop)) {
+                efectivo = 'desconocido';
+              } else if (nombreDe(prop) === 'aislamiento') {
+                efectivo =
+                  ts.isPropertyAssignment(prop) &&
+                  ts.isStringLiteral(prop.initializer) &&
+                  prop.initializer.text === 'repeatable read'
+                    ? 'fijado'
+                    : 'desconocido';
+              }
+            }
+          }
+          const fijaAislamiento = efectivo === 'fijado';
           if (fijaAislamiento) return;
 
           const bruto = llamada.arguments[arg];
@@ -2218,6 +2243,29 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       // Fallar cerrado vale cuando no se sabe si hay problema, no cuando consta que no lo hay.
       export const sondaOkImportadaAislada = async (actorId: string) =>
         conUsuario(actorId, leerDeOtroModulo, { aislamiento: 'repeatable read' });
+      // El SPREAD que sobrescribe: el literal está, pero lo que llega a \`conUsuario\` es lo que
+      // traiga el spread. Un \`some\` veía la palabra y daba la transacción por declarada.
+      export const sondaSpread = async (actorId: string, opciones: { aislamiento?: 'repeatable read' }) =>
+        conUsuario(
+          actorId,
+          async (tx) => {
+            const [a] = await tx\`select 1 as x\`;
+            const [b] = await tx\`select 2 as y\`;
+            return { a, b };
+          },
+          { aislamiento: 'repeatable read', ...opciones },
+        );
+      // Y la forma que SÍ vale: el spread va ANTES, así que la asignación explícita gana.
+      export const sondaOkSpreadAntes = async (actorId: string, opciones: { aislamiento?: 'repeatable read' }) =>
+        conUsuario(
+          actorId,
+          async (tx) => {
+            const [a] = await tx\`select 1 as x\`;
+            const [b] = await tx\`select 2 as y\`;
+            return { a, b };
+          },
+          { ...opciones, aislamiento: 'repeatable read' },
+        );
       // La transacción no se llama siempre \`tx\`: el símbolo sale del parámetro del
       // callback. Con la cadena fija, renombrarlo no contaba NI UNA consulta.
       export const sondaRenombrada2 = async (actorId: string) =>
@@ -2285,6 +2333,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaPorNombre',
         'sonda.ts:sondaEnvuelta',
         'sonda.ts:sondaImportada (callback sin resolver)',
+        'sonda.ts:sondaSpread',
       ].sort(),
     );
 

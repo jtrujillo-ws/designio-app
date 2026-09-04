@@ -2046,7 +2046,19 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
               n.arguments.length > 0 &&
               ts.isIdentifier(n.arguments[0]!) &&
               (n.arguments[0] as TS.Identifier).text === tx;
-            if (esUnsafe) contar(n);
+            if (esUnsafe) {
+              contar(n);
+              for (const a of n.arguments) {
+                /*
+                 * El VALOR de la cadena, no su texto fuente: las comillas son de TypeScript y
+                 * `sqlEjecutable` las leería como literal o identificador de SQL y vaciaría el
+                 * contenido — que es justo el SQL que hay que mirar. Lo descubrí porque la
+                 * sonda de una escritora por `unsafe` seguía saliendo nombrada.
+                 */
+                const crudo = ts.isStringLiteralLike(a) ? a.text : a.getText();
+                if (ESCRITURA.test(sqlEjecutable(crudo))) escribe = true;
+              }
+            }
             else if (primeroEsTx) {
               /*
                * Un ayudante que recibe `tx` ejecuta SUS consultas en esta transacción, así que
@@ -2091,10 +2103,26 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
               }
             }
           }
-          // El SQL, para saber si ESCRIBE — y lo que decide es lo que SE EJECUTA, no lo que
-          // está escrito. `select 1 -- insert into t` no escribe nada, y darlo por escritor
-          // EXIME la transacción de fijar el aislamiento: el hueco va en esa dirección.
-          if (ts.isTemplateLiteral(n) && ESCRITURA.test(sqlEjecutable(n.getText()))) {
+          /*
+           * El SQL, para saber si ESCRIBE — y lo que decide es lo que SE EJECUTA, no lo que
+           * está escrito. `select 1 -- insert into t` no escribe nada, y darlo por escritor
+           * EXIME la transacción de fijar el aislamiento: el hueco va en esa dirección.
+           *
+           * Por eso NO vale cualquier plantilla: solo las que de verdad van a la base. Una
+           * plantilla suelta —un mensaje de error que mencione `insert into ${'${tabla}'}`— no la
+           * ejecuta nadie, y bastaba para eximir la transacción. Ahora tiene que estar
+           * ETIQUETADA con la transacción.
+           *
+           * Y al mirarlo apareció el fallo contrario: `tx.unsafe("insert into …")` recibe una
+           * CADENA, no una plantilla, así que no se veía y una escritora de verdad salía
+           * nombrada. Las dos direcciones del mismo error de sitio.
+           */
+          if (
+            ts.isTaggedTemplateExpression(n) &&
+            ts.isIdentifier(n.tag) &&
+            n.tag.text === tx &&
+            ESCRITURA.test(sqlEjecutable(n.template.getText()))
+          ) {
             escribe = true;
           }
           ts.forEachChild(n, visitar);
@@ -2694,6 +2722,23 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       // Y uno cuyo módulo no se puede leer: ahí SÍ falla cerrado, con el motivo en el nombre.
       export const sondaAyudanteIlegible = async (actorId: string) =>
         conUsuario(actorId, async (tx) => leerDeModuloAusente(tx));
+      // Una plantilla NORMAL —un mensaje de error— que menciona una escritura. No la ejecuta
+      // nadie, así que no puede eximir a la transacción de fijar el aislamiento.
+      export const sondaMensajeEscritura = async (actorId: string, tabla: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          if (!a) throw new Error(\`No se pudo hacer insert into \${tabla}\`);
+          return { a, b };
+        });
+      // Y la escritura por \`unsafe\`, que SÍ se ejecuta y sí exime.
+      const sondaOkUnsafe = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx.unsafe("insert into t (x) values (1) returning x");
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      export { sondaOkUnsafe };
       // La llamada por PROPIEDAD, que es como queda conUsuario con un import de espacio.
       export const sondaPropiedad = async (actorId: string) =>
         db.conUsuario(actorId, async (tx) => {
@@ -2828,6 +2873,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaPropiedad',
         'sonda.ts:sondaIndirecta',
         'sonda.ts:sondaAyudanteAjeno',
+        'sonda.ts:sondaMensajeEscritura',
         'sonda.ts:sondaAyudanteIlegible (ayudante sin resolver)',
         // Las dos que el censo no sabe leer: las caza el cierre por ALCANCE, no la lista de
         // puertas. Se nombran por posición porque de algo ilegible no se puede decir más.

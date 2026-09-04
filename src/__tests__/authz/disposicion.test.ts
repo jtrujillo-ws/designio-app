@@ -1805,6 +1805,65 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         const p0 = fn.parameters[0];
         return p0 && ts.isIdentifier(p0.name) ? p0.name.text : undefined;
       };
+    const ESCRITURA = /insert\s+into|update\s+\w+(\s+\w+)?\s+set|delete\s+from/i;
+    /*
+     * El SQL que de verdad se EJECUTA: sin comentarios y con los literales vaciados.
+     *
+     * Al revés que el barrido del otro censo, aquí el contenido del literal SÍ se tira, y a
+     * propósito: allí hay patrones que LEEN el literal —`date_trunc('day', …)`— y vaciarlo
+     * rompía tres a la vez; aquí solo se busca una palabra clave de sintaxis, que dentro de
+     * un literal es un dato. `where nombre = 'insert into t'` no escribe nada.
+     *
+     * Los bloques ANIDAN, que es como los cuenta Postgres.
+     *
+     * LÍMITE DECLARADO: una interpolación cuyo valor en tiempo de ejecución sea una sentencia
+     * de escritura no se puede ver desde el texto. Queda dicho aquí en vez de descubrirse.
+     */
+    const sqlEjecutable = (texto: string): string => {
+      let fuera = '';
+      let i = 0;
+      while (i < texto.length) {
+        const c = texto[i]!;
+        const d = texto[i + 1];
+        if (c === '-' && d === '-') {
+          const fin = texto.indexOf('\n', i);
+          i = fin === -1 ? texto.length : fin;
+          fuera += ' ';
+          continue;
+        }
+        if (c === '/' && d === '*') {
+          let hondura = 1;
+          i += 2;
+          while (i < texto.length && hondura > 0) {
+            if (texto[i] === '/' && texto[i + 1] === '*') {
+              hondura++;
+              i += 2;
+            } else if (texto[i] === '*' && texto[i + 1] === '/') {
+              hondura--;
+              i += 2;
+            } else i++;
+          }
+          fuera += ' ';
+          continue;
+        }
+        if (c === "'") {
+          i++;
+          while (i < texto.length) {
+            if (texto[i] === "'" && texto[i + 1] === "'") i += 2;
+            else if (texto[i] === "'") {
+              i++;
+              break;
+            } else i++;
+          }
+          fuera += " '' ";
+          continue;
+        }
+        fuera += c;
+        i++;
+      }
+      return fuera;
+    };
+
       const analizar = (
         nodo: TS.Node,
         tx: string,
@@ -1880,11 +1939,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
               }
             }
           }
-          // El SQL, para saber si ESCRIBE.
-          if (
-            ts.isTemplateLiteral(n) &&
-            /insert\s+into|update\s+\w+(\s+\w+)?\s+set|delete\s+from/i.test(n.getText())
-          ) {
+          // El SQL, para saber si ESCRIBE — y lo que decide es lo que SE EJECUTA, no lo que
+          // está escrito. `select 1 -- insert into t` no escribe nada, y darlo por escritor
+          // EXIME la transacción de fijar el aislamiento: el hueco va en esa dirección.
+          if (ts.isTemplateLiteral(n) && ESCRITURA.test(sqlEjecutable(n.getText()))) {
             escribe = true;
           }
           ts.forEachChild(n, visitar);
@@ -2109,16 +2167,37 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
            * la asignación explícita que venga después gana.
            */
           type Aislamiento = 'fijado' | 'sin fijar' | 'desconocido';
-          const nombreDe = (prop: TS.ObjectLiteralElementLike) =>
-            prop.name && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name))
-              ? prop.name.text
-              : undefined;
+          const nombreDe = (prop: TS.ObjectLiteralElementLike): string | undefined => {
+            if (!prop.name) return undefined;
+            if (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) return prop.name.text;
+            // Un nombre COMPUTADO se resuelve solo si es un literal de cadena: `['aislamiento']`
+            // es la misma clave escrita de otra forma, y ahí consta lo que dice.
+            if (ts.isComputedPropertyName(prop.name) && ts.isStringLiteralLike(prop.name.expression))
+              return prop.name.expression.text;
+            return undefined;
+          };
           let efectivo: Aislamiento = 'sin fijar';
           if (opciones && ts.isObjectLiteralExpression(opciones)) {
             for (const prop of opciones.properties) {
+              /*
+               * Un nombre que NO se resuelve invalida igual que un spread, y por el mismo
+               * motivo: `{ aislamiento: 'repeatable read', ['aisla' + 'miento']: undefined }`
+               * es TypeScript válido y deja la clave en `undefined`, o sea READ COMMITTED.
+               * Mirando solo identificadores y cadenas, esa segunda propiedad no existía y la
+               * transacción se daba por declarada.
+               *
+               * Es la MISMA lección por cuarta vez en este censo: preguntar si algo APARECE no
+               * es preguntar qué VALE. Aquí la forma que faltaba era que la clave se escribiera
+               * de una manera que el censo no sabía leer.
+               */
               if (ts.isSpreadAssignment(prop)) {
                 efectivo = 'desconocido';
-              } else if (nombreDe(prop) === 'aislamiento') {
+                continue;
+              }
+              const nombre = nombreDe(prop);
+              if (nombre === undefined) {
+                efectivo = 'desconocido';
+              } else if (nombre === 'aislamiento') {
                 efectivo =
                   ts.isPropertyAssignment(prop) &&
                   ts.isStringLiteral(prop.initializer) &&
@@ -2266,6 +2345,46 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           },
           { ...opciones, aislamiento: 'repeatable read' },
         );
+      // Un nombre COMPUTADO detrás del literal. \`['aisla' + 'miento']\` es la misma clave y
+      // la deja en \`undefined\`, pero mirando solo identificadores y cadenas no se ve: el
+      // censo daba la transacción por declarada y la saltaba entera.
+      export const sondaComputada = async (actorId: string) =>
+        conUsuario(
+          actorId,
+          async (tx) => {
+            const [a] = await tx\`select 1 as x\`;
+            const [b] = await tx\`select 2 as y\`;
+            return { a, b };
+          },
+          { aislamiento: 'repeatable read', ['aisla' + 'miento']: undefined },
+        );
+      // Y la computada que SÍ se resuelve: un literal de cadena es la misma clave escrita de
+      // otra forma, y fallar cerrado no vale cuando consta lo que dice.
+      export const sondaOkComputadaLiteral = async (actorId: string) =>
+        conUsuario(
+          actorId,
+          async (tx) => {
+            const [a] = await tx\`select 1 as x\`;
+            const [b] = await tx\`select 2 as y\`;
+            return { a, b };
+          },
+          { ['aislamiento']: 'repeatable read' },
+        );
+      // Una proyección de SOLO LECTURA con la palabra de escritura dentro de un COMENTARIO.
+      // Postgres solo ejecuta el select; el censo la daba por escritora y la eximía.
+      export const sondaComentarioEscritura = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x -- insert into temporal\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      // Y lo mismo dentro de un LITERAL, que tampoco se ejecuta.
+      export const sondaLiteralEscritura = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x where nombre = 'insert into temporal'\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
       // La transacción no se llama siempre \`tx\`: el símbolo sale del parámetro del
       // callback. Con la cadena fija, renombrarlo no contaba NI UNA consulta.
       export const sondaRenombrada2 = async (actorId: string) =>
@@ -2334,6 +2453,9 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaEnvuelta',
         'sonda.ts:sondaImportada (callback sin resolver)',
         'sonda.ts:sondaSpread',
+        'sonda.ts:sondaComputada',
+        'sonda.ts:sondaComentarioEscritura',
+        'sonda.ts:sondaLiteralEscritura',
       ].sort(),
     );
 

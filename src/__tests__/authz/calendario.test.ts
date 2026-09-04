@@ -4003,6 +4003,50 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns void language plpgsql as $c$ begin' +
           ' insert into U&"\\0063enso_probe_escritura"(k, d) values (1, now()); end $c$',
       ],
+      /*
+       * Y más cruces, buscados a propósito siguiendo la veta que abrió la revisión. Los cuatro
+       * medidos 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12, y los cuatro
+       * SALEN YA MARCADOS: esta vez las piezas compusieron solas y no hubo nada que arreglar.
+       *
+       * Lo que cada sonda vale, medido y no supuesto, porque dos de las cuatro valen menos de
+       * lo que parece:
+       *
+       *  · `merge_insert` y `using_dolar` cargan peso PROPIO. Cubren la rama `then insert` del
+       *    `MERGE` y la consulta entrecomillada por dólar de un `EXECUTE … USING`, y ninguna
+       *    de las dos tenía sonda: el `MERGE` solo se probaba por su rama `update`, y el
+       *    `USING` solo con la consulta en literal simple.
+       *  · `conflicto_fila` y `rowtype_campo_unicode` NO añaden cobertura: se mueven con la
+       *    misma neutralización que `set_fila` y que `tabla_unicode`, y con ninguna otra.
+       *    Documentan que la composición funciona, que no es poco, pero no son un guardián
+       *    más. Queda dicho en vez de contarlas dos veces.
+       *
+       * Y uno que NO es hueco, medido para que nadie lo persiga: un `%TYPE` cuyo nombre de
+       * tabla va en la forma `U&"…"` es un ERROR DE SINTAXIS en plpgsql —«syntax error at or
+       * near "%"»—, así que ahí no hay nada que cerrar. Igual que pasar un `timestamptz` a una
+       * función de parámetro `date`: la forma no existe.
+       */
+      [
+        'censo_probe_rowtype_campo_unicode_date',
+        'returns date language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
+          ' begin r.U&"\\0064" := now(); return r.d; end $c$',
+      ],
+      [
+        'censo_probe_using_dolar_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin execute $q$select $1::date$q$ into d using now(); return d; end $c$',
+      ],
+      [
+        'censo_probe_merge_insert_date',
+        'returns void language plpgsql as $c$ begin merge into censo_probe_escritura t' +
+          ' using (select 9 as k) s on t.k = s.k' +
+          ' when not matched then insert (k, d) values (9, now()); end $c$',
+      ],
+      [
+        'censo_probe_conflicto_fila_date',
+        'returns void language plpgsql as $c$ begin' +
+          " insert into censo_probe_escritura(k, d) values (1, date '2020-01-01')" +
+          ' on conflict (k) do update set (d, ts) = (now(), now()); end $c$',
+      ],
       [
         'censo_probe_ok_compara_columna_ambigua',
         'returns boolean language sql stable as $c$ select now() < d from censo_probe_otra $c$',
@@ -4272,6 +4316,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_pct_type_inicializada_date',
           'censo_probe_pct_type_igual_date',
           'censo_probe_rowtype_igual_date',
+          'censo_probe_rowtype_campo_unicode_date',
+          'censo_probe_using_dolar_date',
+          'censo_probe_merge_insert_date',
+          'censo_probe_conflicto_fila_date',
           'censo_probe_tabla_unicode_date',
         ].sort(),
       );
@@ -4336,6 +4384,10 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_pct_type_inicializada_date',
         'censo_probe_pct_type_igual_date',
         'censo_probe_rowtype_igual_date',
+        'censo_probe_rowtype_campo_unicode_date',
+        'censo_probe_using_dolar_date',
+        'censo_probe_merge_insert_date',
+        'censo_probe_conflicto_fila_date',
         'censo_probe_tabla_unicode_date',
         'censo_probe_ok_compara_columna_ambigua',
         'censo_probe_ok_rowtype_instante',

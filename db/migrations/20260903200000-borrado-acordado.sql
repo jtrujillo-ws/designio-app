@@ -672,6 +672,24 @@ begin
                                            jsonb_build_object('n', v_n, 'h', v_h::text));
     end if;
   end loop;
+  /*
+   * Y la fila RAÍZ, que el conjunto derivado no alcanza: `workspace` no tiene `workspace_id`,
+   * su clave es `id`, así que `tablas_del_workspace()` —que es quien deriva todo lo demás— no
+   * la ve. Pero SÍ viaja en el archivo (el volcado la saca aparte, con su nombre y su cupo de
+   * llamadas AI) y SÍ la sobrescribe la lápida del borrado. Sin anotarla, cambiar el nombre o
+   * el cupo entre exportar y disponer pasaba la comparación y el borrado destruía dos valores
+   * que no estaban en el archivo entregado — el mismo defecto que el inventario vino a cerrar,
+   * en la única fila que se derivaba por otra columna.
+   *
+   * Se anota con la misma forma que las demás para que el mapa siga siendo uno solo, y el
+   * mensaje de la disposición la nombre igual que a cualquier tabla.
+   */
+  select count(*), coalesce(sum(hashtextextended(w::text, 42)), 0) into v_n, v_h
+    from workspace w where w.id = p_ws;
+  if v_n > 0 then
+    v_inv := v_inv || jsonb_build_object('workspace',
+                                         jsonb_build_object('n', v_n, 'h', v_h::text));
+  end if;
   return v_inv;
 end $$;
 

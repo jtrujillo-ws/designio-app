@@ -540,6 +540,23 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         confirmacion: 'BORRAR',
       });
 
+    /*
+     * ── La fila RAÍZ, primero y SOLA ──
+     * `workspace` no tiene `workspace_id` —su clave es `id`—, así que la derivación del
+     * catálogo, que es de donde sale todo lo demás, no la alcanza. Pero viaja en el archivo con
+     * su nombre y su cupo de llamadas AI, y la lápida del borrado sobrescribe los dos: sin
+     * anotarla, renombrar el workspace después de exportar pasaba la comparación y se destruía
+     * un dato que no se entregó.
+     *
+     * Va antes que los demás cambios y se DESHACE después, porque si no, no probaría nada: con
+     * un `segmento` ya tocado la disposición se detendría igual y el caso pasaría en verde con
+     * el arreglo retirado.
+     */
+    const [original] = await admin`select nombre from workspace where id = ${ws}`;
+    await admin`update workspace set nombre = ${marca + ' renombrado'} where id = ${ws}`;
+    await expect(ejecutar()).rejects.toThrow(/«workspace»/);
+    await admin`update workspace set nombre = ${original!.nombre as string} where id = ${ws}`;
+
     // ── Primero lo que un CONTEO no ve ──
     // Se edita una fila que sí viajó en el archivo. Hay las mismas filas que había, así que un
     // inventario que solo contase daría el visto bueno — y el archivo se habría quedado con la

@@ -141,6 +141,14 @@ export async function registrarAcuerdo(
 ): Promise<AcuerdoDisposicion> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    // Serializar el registro es trabajo de esta capa, y la migración lo da por hecho al
+    // declarar el único de `(workspace_id, version)`: «el servicio las serializa con el
+    // candado del workspace; esto es lo que pasa si alguien llega por otro camino». Sin él,
+    // dos partes registrando a la vez leen el mismo máximo bajo READ COMMITTED, el guard les
+    // asigna la misma posición y una se estrella contra el índice con un 23505 que no le dice
+    // nada a quien lo recibe. El único es el SUELO —lo que impide que la bitácora mienta si
+    // alguien entra por SQL crudo—, no el mecanismo.
+    await bloquearWorkspace(tx, entrada.workspaceId);
     try {
       const [fila] = await tx`insert into acuerdo_disposicion
           (workspace_id, modalidad, base, efectivo_desde, acordado_por)

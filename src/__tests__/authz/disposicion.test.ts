@@ -373,6 +373,41 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     ).rejects.toMatchObject({ code: '42501' });
   });
 
+  it('dos partes registrando a la vez no chocan: la bitácora se serializa, no revienta', async () => {
+    // La versión la asigna el guard como `max(version) + 1`, y hay `unique (workspace_id,
+    // version)` debajo. Bajo READ COMMITTED dos registros concurrentes leen el mismo máximo,
+    // calculan la misma posición y uno se estrella contra el único — con un 23505 que no dice
+    // nada útil a quien lo recibe.
+    //
+    // El índice único es el SUELO, no el mecanismo: la migración lo dice al declararlo («el
+    // servicio las serializa con el candado del workspace; esto es lo que pasa si alguien
+    // llega por otro camino»). Serializar es trabajo de esta capa, y aquí se comprueba que lo
+    // hace: dos acuerdos a la vez salen los dos, con posiciones distintas y en orden.
+    //
+    // Van CINCO a la vez y no dos: con dos, la colisión depende de cómo se solapen las dos
+    // transacciones y el caso pasa en verde la mayoría de las veces —medido: falla una de cada
+    // tres—. Un test que solo delata el fallo a veces no es un test, es un aviso ocasional.
+    const ws = await nuevoWorkspace('concurrentes');
+    const hoy = new Date().toISOString().slice(0, 10);
+    const partes = [adminId, leadId, adminId, leadId, adminId];
+    const acuerdos = await Promise.all(
+      partes.map((quien, i) =>
+        registrarAcuerdo(quien, {
+          workspaceId: ws,
+          modalidad: i % 2 === 0 ? 'archivo' : 'borrado',
+          base: `Acuerdo simultáneo ${i}`,
+          efectivoDesde: hoy,
+        }),
+      ),
+    );
+    // Los cinco salen, con posiciones distintas y consecutivas: la bitácora no pierde ninguno
+    // ni deja huecos, que es lo que la hace legible como historia.
+    expect(acuerdos.map((a) => a.version).sort((x, y) => x - y)).toEqual([1, 2, 3, 4, 5]);
+    const [n] = await sqlAdmin()`select count(*)::int as n from acuerdo_disposicion
+      where workspace_id = ${ws}`;
+    expect(n!.n).toBe(5);
+  });
+
   it('la carga canónica reproduce jsonb::text de Postgres, clave a clave', async () => {
     // El sello se calcula sobre `conteos::text` y `remediacion::text`, así que la app tiene que
     // imprimir jsonb EXACTAMENTE como Postgres o la constancia no verifica en manos de nadie.

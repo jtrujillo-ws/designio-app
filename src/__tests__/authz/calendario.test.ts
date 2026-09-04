@@ -1234,7 +1234,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         if (nombre === '') {
           const proyecta = listaDeSeleccion(dentro);
           if (proyecta !== null)
-            return argumentosDe(proyecta).flatMap((a) => hojasDelValor(a, hondura + 1));
+            return argumentosDe(proyecta)
+              .map(sinAlias)
+              .flatMap((a) => hojasDelValor(a, hondura + 1));
           return hojasDelValor(dentro, hondura + 1);
         }
         if (ENVOLTURA_TRANSPARENTE.test(nombre))
@@ -1254,7 +1256,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         if (/^array$/i.test(nombre)) {
           const proyecta = listaDeSeleccion(dentro);
           if (proyecta !== null)
-            return argumentosDe(proyecta).flatMap((a) => hojasDelValor(a, hondura + 1));
+            return argumentosDe(proyecta)
+              .map(sinAlias)
+              .flatMap((a) => hojasDelValor(a, hondura + 1));
         }
       }
       /*
@@ -1659,7 +1663,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * sonda la cubría, porque las dos que había del `into` no llevan `from`. La nueva sí.
          */
         const destinos = argumentosDe(hastaLaClausula(m[2]!)).map((d) => sinComillas(d.trim()));
-        const valores = argumentosDe(m[1]!);
+        const valores = argumentosDe(m[1]!).map(sinAlias);
         return destinos
           .map((d, i) => (nombres.includes(d) ? valores[i] : undefined))
           .filter((v): v is string => v !== undefined);
@@ -1981,7 +1985,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       });
       const cuerpo = CUERPO_SELECT.exec(texto.slice(firma.index + firma[0].length));
       if (cuerpo === null) return false;
-      const valores = argumentosDe(hastaLaClausula(cuerpo[1]!));
+      const valores = argumentosDe(hastaLaClausula(cuerpo[1]!)).map(sinAlias);
       return tipos.some(
         (t, i) =>
           SIN_HUSO_DECLARADO.test(t) &&
@@ -2084,7 +2088,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           const destinos = argumentosDe(hastaLaClausula(a[2]!)).map((d) =>
             sinComillas(d.trim()).toLowerCase(),
           );
-          const valores = argumentosDe(a[1]!);
+          const valores = argumentosDe(a[1]!).map(sinAlias);
           const i = destinos.indexOf(sinComillas(m[1]!.trim()).toLowerCase());
           if (i >= 0 && valores[i] !== undefined && entrega(tabla, columna, valores[i]!))
             return true;
@@ -2159,7 +2163,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           m[2] === undefined
             ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
             : argumentosDe(m[2]).map(nombreCanonico);
-        if (porPosicion(tabla, destinos, argumentosDe(hastaLaClausula(lista)))) return true;
+        if (porPosicion(tabla, destinos, argumentosDe(hastaLaClausula(lista)).map(sinAlias)))
+          return true;
       }
       for (const m of texto.matchAll(FUSIONA)) {
         const tabla = nombreCanonico(m[1]!);
@@ -4475,6 +4480,50 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_alias_desnudo_date',
         'returns date language sql stable as $c$ select now() d $c$',
       ],
+      /*
+       * Y el alias en las OTRAS listas de selección, que son cinco sitios más y no uno: quitarlo
+       * solo donde lo dijo el hallazgo habría dejado el mismo hueco en todos ellos. Las seis
+       * medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   insert into t(k, d) select 2, now() as f …    empareja por posición
+       *   select now() as x into d                      variable de tipo escrito
+       *   select now() as q into v  (v t.d%type)        variable de tipo del catálogo
+       *   returns table(d date) as $$ select now() as q $$
+       *   select array(select now() as q)               y la subconsulta escalar de al lado
+       */
+      [
+        'censo_probe_insert_select_alias_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' select 2, now() as f from generate_series(1, 1); end $c$',
+      ],
+      [
+        'censo_probe_into_alias_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin select now() as x into d; return d; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_into_alias_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
+          ' begin select now() as q into v; return v; end $c$',
+      ],
+      /*
+       * La del `RETURNS TABLE` lleva DOS columnas a propósito: con una sola, `prorettype` es
+       * `date` —Postgres solo pone `record` a partir de dos, medido— y quien la caza es el
+       * reconocedor del tipo de retorno, no éste. Con dos, el único que puede verla es el que
+       * empareja la lista con las columnas declaradas, que es donde está el alias.
+       */
+      [
+        'censo_probe_tabla_alias_date',
+        'returns table(d date, n int) language sql stable as $c$ select now() as q, 1 $c$',
+      ],
+      [
+        'censo_probe_arreglo_alias_date',
+        'returns date[] language sql stable as $c$ select array(select now() as q) $c$',
+      ],
+      [
+        'censo_probe_subconsulta_alias_date',
+        'returns date language sql stable as $c$ select (select now() as q) $c$',
+      ],
       [
         'censo_probe_union_date',
         'returns date language sql stable as $c$ select now()' +
@@ -4894,6 +4943,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_returning_into_date',
           'censo_probe_alias_date',
           'censo_probe_alias_desnudo_date',
+          'censo_probe_insert_select_alias_date',
+          'censo_probe_into_alias_date',
+          'censo_probe_pct_type_into_alias_date',
+          'censo_probe_tabla_alias_date',
+          'censo_probe_arreglo_alias_date',
+          'censo_probe_subconsulta_alias_date',
           'censo_probe_union_date',
           'censo_probe_union_segunda_rama_date',
           'censo_probe_derivada_date',
@@ -4983,6 +5038,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_parametro_default_instante',
         'censo_probe_alias_date',
         'censo_probe_alias_desnudo_date',
+        'censo_probe_insert_select_alias_date',
+        'censo_probe_into_alias_date',
+        'censo_probe_pct_type_into_alias_date',
+        'censo_probe_tabla_alias_date',
+        'censo_probe_arreglo_alias_date',
+        'censo_probe_subconsulta_alias_date',
         'censo_probe_union_date',
         'censo_probe_union_segunda_rama_date',
         'censo_probe_derivada_date',

@@ -2548,7 +2548,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         return { a, b };
       });`;
     const FUENTE_SONDA = `
-      import { leerDosAjenas, leerUnaAjena } from '@/lib/sonda/ayudante';
+      import { leerDosAjenas, leerUnaAjena, ajenoQueAnidaYEscribe } from '@/lib/sonda/ayudante';
       import { leerDeModuloAusente } from '@/lib/sonda/no-existe';
       ${cuerpo('sondaModificador').replace('const sondaModificador', 'export const sondaModificador')}
       ${cuerpo('sondaClausula')}
@@ -2741,6 +2741,19 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a, b };
         });
       export { sondaOkUnsafe };
+      // Cruzar modulo Y anidar a la vez, la combinacion que no tenia sonda. El ayudante ajeno
+      // abre SU transaccion y escribe en ella, y su callback llama tx a la suya igual que el de
+      // fuera: por eso no se pueden distinguir por el nombre de la etiqueta y el CORTE es lo
+      // unico que las separa.
+      //
+      // El valor del ayudante se USA a proposito: una sentencia cuyo valor se tira es una
+      // puerta y no cuenta. Escrita sin usarlo, la sonda pasaba en verde sin probar nada.
+      export const sondaAjenoQueAnida = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const c = await ajenoQueAnidaYEscribe(tx);
+          return { a, c };
+        });
       // Una transacción ANIDADA abierta por una forma que no es el nombre desnudo. Sus
       // consultas no son de la exterior, y su escritura no puede eximir a la exterior.
       export const sondaAnidadaPorPropiedad = async (actorId: string) =>
@@ -2850,6 +2863,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        export const leerUnaAjena = async (tx: TransactionSql) => {
          const [a] = await tx\`select 1 as x\`;
          return a;
+       };
+       export const ajenoQueAnidaYEscribe = async (tx: TransactionSql) => {
+         const [a] = await tx\`select 1 as x\`;
+         await conUsuario('otro', async (tx) => tx\`insert into t (x) values (1)\`);
+         return a;
        };`,
     );
 
@@ -2885,6 +2903,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaIndirecta',
         'sonda.ts:sondaAyudanteAjeno',
         'sonda.ts:sondaMensajeEscritura',
+        'sonda.ts:sondaAjenoQueAnida',
         // Con el corte puesto, la anidada cuenta como transacción PROPIA: por eso la exterior
         // lleva sufijo. La interior escribe y no sale, que es lo correcto.
         'sonda.ts:sondaAnidadaPorPropiedad#1',

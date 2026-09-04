@@ -109,6 +109,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   /** Se rellena en el primer caso: los relojes que el CATÁLOGO declara, para no listarlos. */
   let RELOJES = '';
   let RELOJ_COLAPSADO_A_DIA: RegExp[] = [];
+  /** Los dos patrones que LEEN el literal: van contra el texto SIN vaciar. */
+  let RELOJ_LEYENDO_LITERAL: RegExp[] = [];
   let DEL_HUSO_DE_LA_SESION: RegExp;
 
   beforeAll(async () => {
@@ -132,7 +134,18 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           -- vive dentro de una template literal y las terminaría.)
           or p.proname = 'timeofday')
       order by 1`;
-    const funciones = filas.map((f) => `${f.nombre as string}\\s*\\(\\s*\\)`);
+    /*
+     * Y el nombre puede ir ENTRECOMILLADO: `pg_catalog."now"()` es la misma función y elige
+     * día igual —medido: 2026-09-05 en Kiritimati y 2026-09-03 en Etc/GMT+12—, pero con la
+     * frontera de palabra sola no casaba, porque entre el nombre y el `(` va una comilla.
+     *
+     * Las PALABRAS del reloj no llevan esta variante y es a propósito: `current_date` es una
+     * palabra clave, y `"current_date"` entrecomillado ya no lo es — sería el nombre de una
+     * columna, que no lee ningún reloj.
+     */
+    const funciones = filas.map(
+      (f) => String.raw`(?:\b${f.nombre as string}|"${f.nombre as string}")\s*\(\s*\)`,
+    );
     expect(funciones.length).toBeGreaterThanOrEqual(5);
 
     /*
@@ -220,9 +233,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     CAMPOS_SEGUROS = campos.join('|');
     UNIDADES_SEGURAS = unidades.join('|');
     RELOJES = [
-      // Las funciones llevan su frontera IZQUIERDA: sin ella, `mi_now()` salía marcado. A la
-      // derecha no hace falta ninguna, porque el `\)` del nombre ya cierra.
-      ...funciones.map((f) => String.raw`\b${f}`),
+      // Las funciones llevan su frontera IZQUIERDA —sin ella, `mi_now()` salía marcado— o la
+      // comilla de apertura, que separa igual. A la derecha no hace falta, porque el `(` cierra.
+      ...funciones,
       // Y TODAS las palabras: colapsar cualquiera de ellas a un día es peligroso, aunque la
       // palabra desnuda no lo sea.
       ...PALABRAS_DEL_RELOJ.map(patronDe),
@@ -446,13 +459,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     const COMPARADOR = String.raw`(?:<=|>=|<>|!=|<|>|=)`;
 
     RELOJ_COLAPSADO_A_DIA = [
-      // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
-      // que lleva cast: `date_trunc('day', timeofday()::timestamptz)`, obligada porque ese
-      // reloj devuelve texto. Marca CUALQUIER unidad que no esté en la lista medida.
-      new RegExp(
-        String.raw`date_trunc\s*\(\s*'(?!(?:${UNIDADES_SEGURAS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})\s*\)`,
-        'i',
-      ),
       // El cast al tipo sin huso, en sus cuatro formas de una sola vez: `now()::date` tal como
       // se escribe, `(now())::date` tal como Postgres la devuelve —y a la que reduce también
       // `cast(now() as date)`—, `now()::timestamp::date` con salto intermedio, y
@@ -476,12 +482,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // extrae UN campo del calendario, y el campo cambia con el huso igual.
       new RegExp(
         String.raw`extract\s*\(\s*(?!(?:${CAMPOS_SEGUROS})\b)\w+\s+from\s+(${RELOJ})`,
-        'i',
-      ),
-      // `date_part('dow', now())`, que es la misma operación con la otra sintaxis, y su forma
-      // deparseada `date_part('dow'::text, now())`.
-      new RegExp(
-        String.raw`date_part\s*\(\s*'(?!(?:${CAMPOS_SEGUROS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})`,
         'i',
       ),
       /*
@@ -523,11 +523,47 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'i',
       ),
     ];
+    /*
+     * Y aparte los DOS que LEEN el literal, porque tienen que mirar el texto con los literales
+     * dentro y los demás no. Separarlos no es estética: es lo que permite vaciar los literales
+     * para todo lo demás sin romper `date_trunc('milliseconds', now())`.
+     */
+    RELOJ_LEYENDO_LITERAL = [
+      // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
+      // que lleva cast: `date_trunc('day', timeofday()::timestamptz)`, obligada porque ese
+      // reloj devuelve texto. Marca CUALQUIER unidad que no esté en la lista medida.
+      new RegExp(
+        String.raw`date_trunc\s*\(\s*'(?!(?:${UNIDADES_SEGURAS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})\s*\)`,
+        'i',
+      ),
+      // `date_part('dow', now())`, que es la misma operación con la otra sintaxis, y su forma
+      // deparseada `date_part('dow'::text, now())`.
+      new RegExp(
+        String.raw`date_part\s*\(\s*'(?!(?:${CAMPOS_SEGUROS})')[^']*'(::\w+)?\s*,\s*(${RELOJ})`,
+        'i',
+      ),
+    ];
   });
 
   /** Lo que hace culpable a un cuerpo: la palabra clave o cualquiera de las operaciones. */
-  const culpable = (cuerpo: string) =>
-    DEL_HUSO_DE_LA_SESION.test(cuerpo) || RELOJ_COLAPSADO_A_DIA.some((r) => r.test(cuerpo));
+  /**
+   * Recibe el texto CRUDO y hace él mismo el barrido, en sus dos formas. Antes lo hacía cada
+   * llamante y dos no lo hacían: el guardián no llegaba a limpiar lo que iba a mirar. Que la
+   * limpieza no se pueda olvidar vale más que la flexibilidad de elegirla.
+   *
+   * Los patrones que LEEN el literal van contra el texto con los literales dentro; todo lo
+   * demás, contra el texto con los literales vacíos, porque una palabra del reloj dentro de un
+   * literal es un dato y no una lectura del calendario.
+   */
+  const culpable = (crudo: string, dialecto: 'sql' | 'ts' = 'sql') => {
+    const conLiterales = sinComentarios(crudo, dialecto);
+    const sinLiterales = sinComentarios(crudo, dialecto, true);
+    return (
+      DEL_HUSO_DE_LA_SESION.test(sinLiterales) ||
+      RELOJ_COLAPSADO_A_DIA.some((r) => r.test(sinLiterales)) ||
+      RELOJ_LEYENDO_LITERAL.some((r) => r.test(conLiterales))
+    );
+  };
 
   /**
    * Las excepciones se declaran AQUÍ, con su motivo, o no existen. Vacío es el estado
@@ -558,7 +594,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    *    viene a evitar. El precio es que un literal por dólar que contuviera `--` se leería
    *    como comentario; queda dicho, y no existe ninguno en el esquema.
    */
-  const sinComentarios = (texto: string, dialecto: 'sql' | 'ts' = 'sql'): string => {
+  const sinComentarios = (
+    texto: string,
+    dialecto: 'sql' | 'ts' = 'sql',
+    vaciarLiterales = false,
+  ): string => {
     let salida = '';
     let i = 0;
     /*
@@ -568,6 +608,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     const pila: { modo: 'sql' | 'ts'; interpolacion: boolean; llaves: number }[] = [
       { modo: dialecto, interpolacion: false, llaves: 0 },
     ];
+    /** La etiqueta del cuerpo por dólar que está abierto, o `null` si no hay ninguno. */
+    let cuerpoPorDolar: string | null = null;
+    const DOLAR = /^\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/;
     while (i < texto.length) {
       const marco = pila[pila.length - 1]!;
       const modo = marco.modo;
@@ -621,7 +664,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          */
         let hondura = 1;
         i += 2;
-        while (i < texto.length && hondura > 0) {
+        while (i < texto.length && hondura > 0 && !(pila.length > 1 && texto[i] === '`')) {
           // Solo SQL anida. En TypeScript un `/*` dentro de un comentario es texto normal y
           // cierra el PRIMER `*/` —comprobado compilando un fichero con uno dentro de otro: no
           // da error, o sea que lo de después es código—. Contando profundidad también aquí,
@@ -643,8 +686,29 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       }
       // Comentario de línea: `--` en SQL, `//` en TypeScript.
       if (modo === 'sql' ? c === '-' && d === '-' : c === '/' && d === '/') {
-        const fin = texto.indexOf('\n', i);
-        i = fin === -1 ? texto.length : fin;
+        /*
+         * Y un comentario NO SALE DE SU PLANTILLA. Toda plantilla de TypeScript se lee como
+         * SQL —ahí es donde vive el SQL que este censo busca—, así que una plantilla AJENA
+         * bastaba para cegarlo: en `const ayuda = \`--x\`; const q = sql\`select now()::date\`;`
+         * el `--` de la primera se llevaba el resto de la línea, consulta peligrosa incluida.
+         *
+         * El arreglo NO es reconocer qué plantillas son SQL por su etiqueta: eso sería una
+         * lista escrita a mano —la forma que ya me ha fallado— y dejaría fuera el SQL de una
+         * plantilla sin etiquetar, que es un HUECO. Acotar el comentario es estrictamente más
+         * seguro: nunca se come nada de fuera de la plantilla donde empieza.
+         *
+         * LÍMITE DECLARADO: una plantilla ajena que mencione una palabra del reloj en PROSA
+         * sigue saliendo marcada. Es un falso positivo, o sea visible, y hoy no hay ninguno.
+         */
+        const salto = texto.indexOf('\n', i);
+        const cierre = pila.length > 1 ? texto.indexOf('`', i) : -1;
+        const fin =
+          cierre !== -1 && (salto === -1 || cierre < salto)
+            ? cierre
+            : salto === -1
+              ? texto.length
+              : salto;
+        i = fin;
         salida += ' ';
         continue;
       }
@@ -669,8 +733,54 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * Lo cazó su propia sonda segura, que para eso está. Aquí el recorrido solo sirve para
          * NO confundir un `--` de dentro de un literal con un comentario.
          */
-        salida += texto.slice(desde, i);
+        /*
+         * Con `vaciarLiterales`, el CONTENIDO se va y quedan solo las comillas. Las dos formas
+         * hacen falta y por eso conviven: los patrones que LEEN el literal —`date_trunc` y
+         * `date_part`— necesitan el texto tal cual; los demás no, y con él dentro una función
+         * que devuelva la cadena 'current_date' salía marcada sin leer ningún reloj.
+         */
+        salida += vaciarLiterales ? `${c}${c}` : texto.slice(desde, i);
         continue;
+      }
+      /*
+       * El entrecomillado por DÓLAR: el delimitador del CUERPO se atraviesa, y cualquier otro
+       * es un literal.
+       *
+       * `pg_get_functiondef` envuelve el cuerpo plpgsql en `$function$ … $function$` y hay que
+       * ATRAVESARLO, o el censo dejaría de mirar el cuerpo de cada función. Pero dentro del
+       * cuerpo puede haber literales por dólar de verdad —`perform $q$--$q$; perform
+       * now()::date;`— y leerlos como código hacía que su `--` se comiera la consulta de
+       * después. El catálogo los conserva verbatim: comprobado sobre una función real.
+       *
+       * La regla es la anidación: la primera etiqueta abre el cuerpo; una etiqueta DISTINTA
+       * estando dentro es un literal; la MISMA lo cierra.
+       *
+       * LÍMITE DECLARADO: un cuerpo anidado escrito con otra etiqueta —una función que crea
+       * otra— se leería como literal, así que sus comentarios no se quitarían. Eso da falsos
+       * positivos, que se ven, no huecos.
+       */
+      if (modo === 'sql' && c === '$') {
+        const m = DOLAR.exec(texto.slice(i));
+        if (m) {
+          const etiqueta = m[0];
+          if (cuerpoPorDolar === null) {
+            cuerpoPorDolar = etiqueta;
+            salida += etiqueta;
+            i += etiqueta.length;
+            continue;
+          }
+          if (etiqueta === cuerpoPorDolar) {
+            cuerpoPorDolar = null;
+            salida += etiqueta;
+            i += etiqueta.length;
+            continue;
+          }
+          const cierra = texto.indexOf(etiqueta, i + etiqueta.length);
+          const hasta = cierra === -1 ? texto.length : cierra + etiqueta.length;
+          salida += vaciarLiterales ? `${etiqueta}${etiqueta}` : texto.slice(i, hasta);
+          i = hasta;
+          continue;
+        }
       }
       // Las comillas invertidas abren y cierran SQL dentro de TypeScript.
       if (c === '`') {
@@ -968,6 +1078,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // vuelta que valga. Con sufijo, la frontera de palabra lo separa igual.
       'select now()::text as timestamptz',
       'select now()::text as timestamptz_pactado',
+      // El nombre del reloj ENTRE COMILLAS: `pg_catalog."now"()` es la misma función y el día
+      // cambia igual (medido: 2026-09-05 en Kiritimati y 2026-09-03 en Etc/GMT+12).
+      'pg_catalog."now"()::date',
       'statement_timestamp()::date',
       '(statement_timestamp())::date',
       'transaction_timestamp()::date',
@@ -1157,27 +1270,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * cuenta abierta en el primer cierre y se lleva por delante la consulta real hasta el
      * siguiente cierre o el final del fichero.
      */
-    const tras = (t: string, d: 'sql' | 'ts') => sinComentarios(t, d);
     // Un `--` DENTRO de un literal no abre comentario.
-    expect(culpable(tras("select '--', now()::date", 'sql'))).toBe(true);
+    expect(culpable("select '--', now()::date", 'sql')).toBe(true);
     // Ni un `//` dentro de una cadena de TypeScript.
     expect(
-      culpable(tras("const u = 'https://host'; const q = sql`select now()::date`;", 'ts')),
+      culpable("const u = 'https://host'; const q = sql`select now()::date`;", 'ts'),
     ).toBe(true);
     // SQL ANIDA: el cierre interior no termina el comentario, así que el `--` de después sigue
     // comentado y no puede comerse el código que viene tras el cierre exterior.
     expect(
-      culpable(tras('/* fuera /* dentro */ -- sigue fuera */ select now()::date', 'sql')),
+      culpable('/* fuera /* dentro */ -- sigue fuera */ select now()::date', 'sql'),
     ).toBe(true);
     // TypeScript NO anida: el primer cierre termina el comentario y lo de después es código.
     expect(
-      culpable(tras('/* explica /* de SQL */ const q = sql`select now()::date`;', 'ts')),
+      culpable('/* explica /* de SQL */ const q = sql`select now()::date`;', 'ts'),
     ).toBe(true);
     // Y la otra mitad: un comentario de verdad no se convierte en hallazgo.
-    expect(culpable(tras('-- antes usaba current_date; ahora fecha_de_la_base()', 'sql'))).toBe(
+    expect(culpable('-- antes usaba current_date; ahora fecha_de_la_base()', 'sql')).toBe(
       false,
     );
-    expect(culpable(tras('// antes usaba current_date; ahora fecha_de_la_base()', 'ts'))).toBe(
+    expect(culpable('// antes usaba current_date; ahora fecha_de_la_base()', 'ts')).toBe(
       false,
     );
     /*
@@ -1188,7 +1300,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * detrás: el censo de la aplicación en verde sin haber mirado.
      */
     expect(
-      culpable(tras('const q = sql`select ${/* uno /* dos */ v}, now()::date`;', 'ts')),
+      culpable('const q = sql`select ${/* uno /* dos */ v}, now()::date`;', 'ts'),
     ).toBe(true);
     /*
      * La misma transición por el otro carácter, y el daño es el CONTRARIO: una comilla simple
@@ -1202,12 +1314,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * arreglo retirado. Una sonda que pasa por otro motivo no prueba nada.)
      */
     expect(
-      culpable(
-        tras('const q = sql`select ${x ? "it\'s" : \'\'} from t`; // usaba current_date', 'ts'),
+      culpable('const q = sql`select ${x ? "it\'s" : \'\'} from t`; // usaba current_date', 'ts',
       ),
     ).toBe(false);
     // Y la otra mitad: un comentario de verdad dentro de la interpolación sigue borrándose.
-    expect(culpable(tras('const q = sql`select ${/* current_date */ v} from t`;', 'ts'))).toBe(
+    expect(culpable('const q = sql`select ${/* current_date */ v} from t`;', 'ts')).toBe(
       false,
     );
     /*
@@ -1230,12 +1341,54 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * que no estar.
      */
     expect(
-      culpable(tras('const q = sql`a ${c ? sql`b ${x} c` : d}, now()::date`;', 'ts')),
+      culpable('const q = sql`a ${c ? sql`b ${x} c` : d}, now()::date`;', 'ts'),
     ).toBe(true);
-    expect(culpable(tras('const q = sql`a ${o["}"]}, now()::date`;', 'ts'))).toBe(true);
-    expect(culpable(tras('const q = sql`a ${/* } */ v}, now()::date`;', 'ts'))).toBe(true);
+    expect(culpable('const q = sql`a ${o["}"]}, now()::date`;', 'ts')).toBe(true);
+    expect(culpable('const q = sql`a ${/* } */ v}, now()::date`;', 'ts')).toBe(true);
     // Y un literal de objeto, que abre y cierra llaves de verdad dentro de la interpolación.
-    expect(culpable(tras('const q = sql`a ${{ k: 1 }.k}, now()::date`;', 'ts'))).toBe(true);
+    expect(culpable('const q = sql`a ${{ k: 1 }.k}, now()::date`;', 'ts')).toBe(true);
+    /*
+     * Un literal POR DÓLAR dentro de un cuerpo plpgsql. El delimitador del cuerpo hay que
+     * atravesarlo —si no, el censo deja de mirar el cuerpo de cada función—, pero el literal
+     * de dentro es un dato: leerlo como código hacía que su `--` se comiera la consulta de
+     * después. `pg_get_functiondef` los conserva verbatim, comprobado sobre una función real.
+     */
+    expect(
+      culpable(
+        'create function f() returns void language plpgsql as $function$ begin perform $q$--$q$; perform now()::date; end $function$',
+        'sql',
+      ),
+    ).toBe(true);
+    // Y el cuerpo entero sigue mirándose: el delimitador se atraviesa, no se salta.
+    expect(
+      culpable(
+        'create function f() returns void language plpgsql as $function$ begin perform now()::date; end $function$',
+        'sql',
+      ),
+    ).toBe(true);
+    // Una plantilla AJENA no puede tapar la consulta que viene después: su comentario acaba
+    // donde acaba la plantilla.
+    expect(
+      culpable('const ayuda = `--opcion`; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y con un bloque sin cerrar, que es la misma puerta por el otro comentario.
+    expect(
+      culpable('const ayuda = `/*x`; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y la otra dirección: una palabra del reloj DENTRO de un literal es un dato, no una
+     * lectura del calendario. Vale para el literal de SQL y para un mensaje de TypeScript.
+     */
+    expect(
+      culpable(
+        "create function f() returns text language sql as $$ select 'current_date' $$",
+        'sql',
+      ),
+    ).toBe(false);
+    expect(culpable("const aviso = 'current_date ya no se usa';", 'ts')).toBe(false);
+    // Pero vaciar el literal NO puede romper a los dos patrones que lo LEEN.
+    expect(culpable("date_trunc('milliseconds', now())")).toBe(false);
+    expect(culpable("date_trunc('day', now())")).toBe(true);
   });
 
   it('ninguna función lee el reloj de pared de quien la llama', async () => {
@@ -1301,7 +1454,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       expect(funciones.find((f) => f.nombre === 'censo_probe_castop')!.prosrc).toBe('');
 
       const culpables = funciones
-        .filter((f) => culpable(sinComentarios(f.cuerpo as string)))
+        .filter((f) => culpable(f.cuerpo as string))
         .map((f) => f.nombre as string)
         .filter((n) => !(n in DECLARADAS));
       // Exactamente las peligrosas y ninguna más: si un patrón se rompe, su sonda desaparece
@@ -1484,8 +1637,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     for (const f of ficheros) {
       // Sin comentarios: un `current_date` que EXPLICA por qué ya no se usa no es un
       // hallazgo, y sin esto el censo se volvería contra quien documenta el arreglo.
-      const codigo = sinComentarios(await readFile(f, 'utf8'), 'ts');
-      if (culpable(codigo)) culpables.push(f.slice(raiz.length + 1));
+      const codigo = await readFile(f, 'utf8');
+      if (culpable(codigo, 'ts')) culpables.push(f.slice(raiz.length + 1));
     }
     expect(culpables.filter((c) => !(c in DECLARADAS))).toEqual([]);
   });

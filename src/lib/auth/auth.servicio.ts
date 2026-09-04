@@ -69,6 +69,17 @@ export async function autenticar(email: string, password: string): Promise<Usuar
 }
 
 /** Perfil + membresías del usuario autenticado (bajo su propio contexto RLS). */
+  /*
+   * REPEATABLE READ: es una proyección de SOLO LECTURA con varias sentencias, y desde que
+   * existe la disposición acordada los datos de un workspace pueden desaparecer entre una y
+   * otra. Bajo READ COMMITTED cada sentencia toma su instantánea, así que la respuesta podía
+   * mezclar dos momentos —y con la membresía ya borrada, la mitad tardía vuelve VACÍA por RLS,
+   * no corta—. Lo que llega a la pantalla no es entonces un estado incompleto: es uno que no
+   * ha existido nunca.
+   *
+   * No choca con la doctrina de aislamiento del esquema, que exige READ COMMITTED a las
+   * transacciones que ESCRIBEN y releen tras un candado: aquí no se escribe nada.
+   */
 export async function usuarioConMembresias(
   usuarioId: string,
 ): Promise<(UsuarioSesion & { membresias: MembresiaUsuario[] }) | null> {
@@ -92,7 +103,7 @@ export async function usuarioConMembresias(
         rol: f.rol as string,
       })),
     };
-  });
+  }, { aislamiento: 'repeatable read' });
 }
 
 export type ResultadoInvitacion = {

@@ -12,6 +12,7 @@ import { cerrarSesion } from '@/lib/auth/auth.functions';
 import type { ArbolWorkspace } from '@/lib/arbol/arbol.schemas';
 import { LOOP_BANCO_ANDINO, type JourneyLoop } from '@/lib/loop/loop-data';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
+import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
 /** Pantalla Loop J1–J7 — recreación de la referencia hifi del design system (ui_kits/designio). */
 
@@ -421,6 +422,26 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
       </Link>
       <Link to="/exportacion" style={{ ...item, textDecoration: 'none' }}>
         <span>Exportación del workspace</span>
+      </Link>
+      {/* Esta puerta NO se condiciona al rol, y el camino hasta aquí explica por qué.
+          Primero estaba cerrada salvo para las dos partes del contrato (RF-01.9), lo cual
+          tiene sentido para DISPONER; pero detrás también están las constancias que cada
+          quien conserva, y ésas no dependen de ninguna membresía —un borrado las destruye
+          todas y `misConstancias` no pide workspace—. Se abrió entonces para `rol === ''`… y
+          seguía cerrada en el caso multi-workspace: quien firmó o ejecutó un borrado puede
+          conservar otra membresía como `disenador` o `stakeholder`, y entonces el rol no está
+          vacío ni es de disposición, así que el enlace desaparecía otra vez y su constancia
+          solo se alcanzaba tecleando la ruta a mano.
+
+          Dos intentos de acertar el predicado son la señal de que el predicado sobra: lo que
+          hay detrás es de todo el mundo, y lo que NO se puede hacer lo dice la pantalla con el
+          motivo que da la propia base. El rótulo nombra lo que cada quien encuentra. */}
+      <Link to="/disposicion" style={{ ...item, textDecoration: 'none' }}>
+        <span>
+          {(ROLES_DISPOSICION as readonly string[]).includes(rol)
+            ? 'Disposición del workspace'
+            : 'Constancias que conservas'}
+        </span>
       </Link>
       {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para
           los demás roles y, si lo teclean, la RLS de evento_dominio no les da filas. */}

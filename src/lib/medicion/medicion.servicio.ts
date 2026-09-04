@@ -1054,13 +1054,26 @@ export async function abrirOutcomeReview(
     if (code === '23505') throw new ErrorMedicion('Este reto ya tiene su outcome review');
     if (code === '23503') throw new ErrorMedicion('El reto no existe en este workspace');
     if (!esRechazoDePolitica(e)) throw e;
-    // Transacción NUEVA de solo lectura: la anterior quedó abortada por el rechazo, y
-    // «cuánto falta para el post-mortem» es justo lo que el usuario necesita saber.
+    /*
+     * Transacción NUEVA de solo lectura: la anterior quedó abortada por el rechazo, y
+     * «cuánto falta para el post-mortem» es justo lo que el usuario necesita saber.
+     *
+     * REPEATABLE READ porque `diagnosticoDeReview` compone su respuesta con CUATRO lecturas
+     * —reto, registry, criterios y ventanas— y este slice puede cruzarlas borrando el
+     * workspace: bajo READ COMMITTED las tardías vuelven vacías por RLS, no cortan, y el
+     * mensaje sale describiendo un estado que no ha existido nunca («el reto no tiene Metric
+     * Registry» cuando lo que ya no hay es workspace). Es la misma clase que el panel y la
+     * auditoría, en la transacción que el censo no veía por mirar la función entera.
+     */
     throw new ErrorMedicion(
-      await conUsuario(actorId, async (tx) => {
-        await exigirCuentaActiva(tx, actorId);
-        return diagnosticoDeReview(tx, entrada.workspaceId, entrada.retoId);
-      }),
+      await conUsuario(
+        actorId,
+        async (tx) => {
+          await exigirCuentaActiva(tx, actorId);
+          return diagnosticoDeReview(tx, entrada.workspaceId, entrada.retoId);
+        },
+        { aislamiento: 'repeatable read' },
+      ),
     );
   }
 }

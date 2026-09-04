@@ -27,7 +27,28 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * descubrí retirando la migración y viendo que estos tres casos NO enrojecían.
    * `_` cuenta como carácter de palabra, así que un `current_date_de_algo` no se marca.
    */
-  const DEL_HUSO_DE_LA_SESION = /\b(current_date|current_time|localtime|localtimestamp)\b/i;
+  const DEL_HUSO_DE_LA_SESION =
+    /\b(current_date|current_time|localtime|localtimestamp)\b/i;
+
+  /**
+   * La otra forma de leer el huso de la sesión, que no es una palabra clave sino una
+   * OPERACIÓN: colapsar un `timestamptz` a un día. `date_trunc('day', now())` da dos días
+   * distintos entre UTC-12 y UTC+14 (medido), igual que `now()::date`.
+   *
+   * Se marcan solo las formas en que el reloj entra CRUDO, porque las seguras siempre llevan
+   * `timezone('UTC', …)` en medio: `timezone('UTC', now())::date` no case con la segunda —el
+   * `::date` no sigue a `now()` sino al paréntesis de `timezone`— y `date_trunc('day',
+   * timezone('UTC', now()))` no case con la primera, porque su segundo argumento empieza por
+   * `timezone`. Comprobado contra las dos formas.
+   */
+  const RELOJ_COLAPSADO_A_DIA = [
+    /date_trunc\s*\(\s*'[^']*'\s*,\s*(now\s*\(\s*\)|current_timestamp|transaction_timestamp\s*\(\s*\)|clock_timestamp\s*\(\s*\))\s*\)/i,
+    /\b(now\s*\(\s*\)|current_timestamp|transaction_timestamp\s*\(\s*\)|clock_timestamp\s*\(\s*\))\s*::\s*(date|time)\b/i,
+  ];
+
+  /** Lo que hace culpable a un cuerpo: cualquiera de las dos vías. */
+  const culpable = (cuerpo: string) =>
+    DEL_HUSO_DE_LA_SESION.test(cuerpo) || RELOJ_COLAPSADO_A_DIA.some((r) => r.test(cuerpo));
 
   /**
    * Las excepciones se declaran AQUÍ, con su motivo, o no existen. Vacío es el estado
@@ -42,22 +63,44 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
 
   it('ninguna función lee el reloj de pared de quien la llama', async () => {
+    // `pg_get_functiondef` y no `prosrc`: una función con cuerpo SQL estándar
+    // (`LANGUAGE SQL … RETURN …` o `BEGIN ATOMIC`) guarda el árbol analizado en `prosqlbody`
+    // y deja `prosrc` VACÍO (medido). Leyendo `prosrc`, esa función contaba para el mínimo de
+    // la categoría y su cuerpo no llegaba nunca al filtro: el censo la habría dado por
+    // limpia sin haberla mirado. `prokind = 'f'` porque `pg_get_functiondef` no acepta
+    // agregados ni funciones de ventana.
     const funciones = await sqlAdmin()`
-      select p.proname as nombre, p.prosrc as cuerpo
+      select p.proname as nombre, pg_get_functiondef(p.oid) as cuerpo
       from pg_proc p
       join pg_namespace n on n.oid = p.pronamespace
       join pg_language l on l.oid = p.prolang
       where n.nspname = 'public' and l.lanname not in ('internal', 'c')
+        and p.prokind = 'f'
       order by 1`;
     // El censo tiene que estar mirando algo: sin esto, un cambio en la consulta que devuelva
     // cero filas dejaría el test en verde para siempre sin comprobar nada.
     expect(funciones.length).toBeGreaterThan(50);
 
     const culpables = funciones
-      .filter((f) => DEL_HUSO_DE_LA_SESION.test(sinComentarios(f.cuerpo as string)))
+      .filter((f) => culpable(sinComentarios(f.cuerpo as string)))
       .map((f) => f.nombre as string)
       .filter((n) => !(n in DECLARADAS));
     expect(culpables).toEqual([]);
+
+    // Y la vía que `prosrc` no veía se comprueba fabricando una culpable con cuerpo SQL
+    // estándar: sin esto, cambiar la consulta de vuelta a `prosrc` dejaría el censo en verde.
+    const admin = sqlAdmin();
+    await admin`create function censo_probe_sqlbody() returns date
+      language sql stable return current_date`;
+    try {
+      const [probe] = await admin`select pg_get_functiondef(p.oid) as cuerpo, p.prosrc
+        from pg_proc p where p.proname = 'censo_probe_sqlbody'`;
+      // La premisa del hallazgo, comprobada aquí y no supuesta: `prosrc` viene vacío.
+      expect(probe!.prosrc).toBe('');
+      expect(culpable(sinComentarios(probe!.cuerpo as string))).toBe(true);
+    } finally {
+      await admin`drop function censo_probe_sqlbody()`;
+    }
   });
 
   it('ninguna política RLS lo lee tampoco', async () => {
@@ -71,7 +114,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     expect(politicas.length).toBeGreaterThan(50);
 
     const culpables = politicas
-      .filter((p) => DEL_HUSO_DE_LA_SESION.test(p.cuerpo as string))
+      .filter((p) => culpable(p.cuerpo as string))
       .map((p) => p.nombre as string)
       .filter((n) => !(n in DECLARADAS));
     expect(culpables).toEqual([]);
@@ -131,7 +174,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         MINIMO[nombre as keyof typeof categorias],
       );
       const culpables = filas
-        .filter((o) => DEL_HUSO_DE_LA_SESION.test(o.cuerpo as string))
+        .filter((o) => culpable(o.cuerpo as string))
         .map((o) => `${nombre} ${o.nombre as string}`)
         .filter((n) => !(n in DECLARADAS));
       expect(culpables).toEqual([]);
@@ -144,7 +187,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       const vistas = await admin`select matviewname as nombre, definition as cuerpo
         from pg_matviews where schemaname = 'public'`;
       const pilladas = vistas
-        .filter((o) => DEL_HUSO_DE_LA_SESION.test(o.cuerpo as string))
+        .filter((o) => culpable(o.cuerpo as string))
         .map((o) => o.nombre as string);
       expect(pilladas).toEqual(['censo_tmp_matview']);
     } finally {
@@ -188,7 +231,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       const codigo = (await readFile(f, 'utf8'))
         .replace(/\/\*[\s\S]*?\*\//g, '')
         .replace(/\/\/[^\n]*/g, '');
-      if (DEL_HUSO_DE_LA_SESION.test(codigo)) culpables.push(f.slice(raiz.length));
+      if (culpable(codigo)) culpables.push(f.slice(raiz.length));
     }
     expect(culpables.filter((c) => !(c in DECLARADAS))).toEqual([]);
   });

@@ -62,6 +62,23 @@ comment on function fecha_de_la_base() is
   'El día de calendario contra el que juzga la base: UTC, fijo, nunca el huso de la sesión. Lo leen las reglas y también los espejos que las diagnostican, para que no puedan discrepar.';
 grant execute on function fecha_de_la_base() to designio_app;
 
+-- Y el mismo calendario como INSTANTE, para lo que no compara días sino marcas de tiempo.
+-- `date_trunc('day', now())` es la otra forma de colapsar el reloj a un día, y se mueve igual:
+-- medido, entre UTC-12 y UTC+14 da dos días distintos. La usa el cupo diario de IA para
+-- decidir qué llamadas cuentan, así que sin fijarla se reinicia el presupuesto cambiando de
+-- huso. Aquí el día empieza donde lo dice `fecha_de_la_base()` y no donde diga la sesión.
+--
+-- Devuelve `timestamptz` —un instante absoluto— y no un `timestamp` naíf: comparado contra
+-- `creado_en`, que también es `timestamptz`, no hay conversión implícita que reintroduzca el
+-- huso por la puerta de atrás. (Un `date` sí la tendría: al compararlo con un `timestamptz`,
+-- Postgres lo promociona usando el huso de la sesión, que es justo lo que se quiere evitar.)
+create function inicio_del_dia_de_la_base() returns timestamptz
+language sql stable parallel safe as
+$$ select timezone('UTC', fecha_de_la_base()::timestamp) $$;
+comment on function inicio_del_dia_de_la_base() is
+  'El instante en que empieza el día de la base (medianoche UTC del día en curso). Para lo que compara marcas de tiempo en vez de fechas, como el cupo diario.';
+grant execute on function inicio_del_dia_de_la_base() to designio_app;
+
 -- ── 1. Los derechos vigentes ──
 create or replace function derechos_vigentes(p_evidencia uuid, p_ws uuid, p_ambito text)
 returns boolean language sql stable security definer set search_path = public, pg_temp as $$

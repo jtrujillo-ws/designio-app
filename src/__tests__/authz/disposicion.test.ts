@@ -2027,14 +2027,16 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           /*
            * Un `conUsuario` ANIDADO abre su propia transacción: sus sentencias no son de
            * ésta. Se corta aquí y se analiza por separado, como una proyección más.
+           *
+           * Y el corte usa el MISMO predicado que localiza las transacciones. Antes exigía el
+           * identificador desnudo, así que una anidada abierta por alias o por propiedad no
+           * cortaba: si los dos callbacks llamaban `tx` a su transacción, las consultas de la
+           * interior se atribuían a la exterior y —peor— un `insert` de la interior ponía
+           * `escribe` y EXIMÍA a la exterior. Lo abrí yo al ampliar `esApertura` en un sitio y
+           * no en el otro: dos recorridos que discrepan es la forma en que esto falla callado,
+           * y lo escribí como riesgo una vuelta antes de cometerlo.
            */
-          if (
-            ts.isCallExpression(n) &&
-            ts.isIdentifier(n.expression) &&
-            n.expression.text === 'conUsuario'
-          ) {
-            return;
-          }
+          if (ts.isCallExpression(n) && esApertura(n)) return;
           if (ts.isCallExpression(n)) {
             const f = n.expression;
             const esUnsafe =
@@ -2739,6 +2741,15 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a, b };
         });
       export { sondaOkUnsafe };
+      // Una transacción ANIDADA abierta por una forma que no es el nombre desnudo. Sus
+      // consultas no son de la exterior, y su escritura no puede eximir a la exterior.
+      export const sondaAnidadaPorPropiedad = async (actorId: string) =>
+        conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          await db.conUsuario(actorId, async (tx) => tx\`insert into t (x) values (1)\`);
+          return { a, b };
+        });
       // La llamada por PROPIEDAD, que es como queda conUsuario con un import de espacio.
       export const sondaPropiedad = async (actorId: string) =>
         db.conUsuario(actorId, async (tx) => {
@@ -2874,6 +2885,9 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaIndirecta',
         'sonda.ts:sondaAyudanteAjeno',
         'sonda.ts:sondaMensajeEscritura',
+        // Con el corte puesto, la anidada cuenta como transacción PROPIA: por eso la exterior
+        // lleva sufijo. La interior escribe y no sale, que es lo correcto.
+        'sonda.ts:sondaAnidadaPorPropiedad#1',
         'sonda.ts:sondaAyudanteIlegible (ayudante sin resolver)',
         // Las dos que el censo no sabe leer: las caza el cierre por ALCANCE, no la lista de
         // puertas. Se nombran por posición porque de algo ilegible no se puede decir más.

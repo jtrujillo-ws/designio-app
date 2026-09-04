@@ -333,6 +333,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * no la cubre, porque contar paréntesis no es cosa de una expresión regular. Queda dicho
      * aquí en vez de descubrirse.
      */
+    /*
+     * La gramática de un LITERAL de SQL, en un solo sitio. Había cuatro reconocedores de «lo
+     * seguro» —la unidad, el campo de `extract`, el formato de `to_char` y el huso fijo— y
+     * cada uno aprendía por su cuenta: solo el del campo sabía de prefijos, así que
+     * `date_trunc(E'second', …)`, `to_char(now(), 'US'::text)` y `date_trunc(…, E'UTC')`
+     * —los tres estables, medidos por epoch— salían marcados.
+     *
+     * Es la misma lección que el predicado de las transacciones en el otro censo: si el
+     * criterio vive en cuatro sitios, aprende en uno y se queda viejo en tres.
+     *
+     * El prefijo se admite y NO relaja nada: el contenido tiene que seguir siendo el nombre
+     * seguro tal cual, así que un `E'seco\x6ed'` —que vale «second»— no se declara seguro y
+     * se marca. De más, no de menos.
+     */
+    const PREFIJO = String.raw`[A-Za-z_]*&?`;
+    const CASTO = String.raw`(?:\s*::\s*[\w. ]+)?`;
+    const literalDe = (contenido: string) => String.raw`${PREFIJO}'(?:${contenido})'${CASTO}`;
+    const envuelto = (x: string) => String.raw`(?:\(\s*)?(?:${x})(?:\s*\))?`;
     // Un grupo entre paréntesis con UN nivel de anidamiento dentro, porque así llega del
     // deparseador: `interval '1 day' * 2` se guarda como
     // `('1 day'::interval * (2)::double precision)`, con el número casteado dentro de su
@@ -364,7 +382,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * no es cosa de una expresión regular. Queda dicho aquí en vez de descubrirse.
      */
     const RELOJ_COMO_OPERANDO = entreParentesis(entreParentesis(RELOJES) + CASTOS);
-    const OPERANDO_ARITMETICO = String.raw`(?!\s*(?:${RELOJ_COMO_OPERANDO}))(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*(?:${GRUPO}|[\w.]+)(?:\s*::\s*[\w ]+)?)*`;
+    const OPERANDO_ARITMETICO = String.raw`(?!\s*(?:${RELOJ_COMO_OPERANDO}))(?:interval\s*'[^']*'|'[^']*'\s*::\s*interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*(?:${GRUPO}|[\w.]+)${CASTO})*`;
     const ARITMETICA = String.raw`(?:\s*[-+]\s*${OPERANDO_ARITMETICO})*`;
     const NUCLEO = entreParentesis(RELOJES) + CASTOS + ARITMETICA;
     const RELOJ = entreParentesis(entreParentesis(NUCLEO)) + CASTOS;
@@ -483,24 +501,6 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       envuelto(
         String.raw`${literalDe(lista)}|cast\s*\(\s*${PREFIJO}'(?:${lista})'\s+as\s+[\w. ]+\s*\)`,
       );
-    /*
-     * La gramática de un LITERAL de SQL, en un solo sitio. Había cuatro reconocedores de «lo
-     * seguro» —la unidad, el campo de `extract`, el formato de `to_char` y el huso fijo— y
-     * cada uno aprendía por su cuenta: solo el del campo sabía de prefijos, así que
-     * `date_trunc(E'second', …)`, `to_char(now(), 'US'::text)` y `date_trunc(…, E'UTC')`
-     * —los tres estables, medidos por epoch— salían marcados.
-     *
-     * Es la misma lección que el predicado de las transacciones en el otro censo: si el
-     * criterio vive en cuatro sitios, aprende en uno y se queda viejo en tres.
-     *
-     * El prefijo se admite y NO relaja nada: el contenido tiene que seguir siendo el nombre
-     * seguro tal cual, así que un `E'seco\x6ed'` —que vale «second»— no se declara seguro y
-     * se marca. De más, no de menos.
-     */
-    const PREFIJO = String.raw`[A-Za-z_]*&?`;
-    const CASTO = String.raw`(?:\s*::\s*[\w. ]+)?`;
-    const literalDe = (contenido: string) => String.raw`${PREFIJO}'(?:${contenido})'${CASTO}`;
-    const envuelto = (x: string) => String.raw`(?:\(\s*)?(?:${x})(?:\s*\))?`;
     const PRIMER_ARGUMENTO = String.raw`(?:[^,()]|\([^()]*\))*`;
     /*
      * `date_trunc` tiene una sobrecarga de TRES argumentos, y el tercero es el huso. Con un
@@ -1206,6 +1206,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "extract(E'dow' from now())",
       // El prefijo no vuelve segura una unidad peligrosa, ni un contenido escapado la iguala.
       "date_trunc(E'day', now())",
+      "(now() + interval '1 day' * (2)::pg_catalog.float8)::date",
       "to_char(now(), E'YYYY'::text)",
       // El formato de `to_char` que SÍ lee el calendario, y `SSSS` —segundos desde
       // medianoche— que sin la guardia de frontera se leería como dos `SS` seguros.

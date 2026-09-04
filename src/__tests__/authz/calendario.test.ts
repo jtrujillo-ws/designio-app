@@ -215,6 +215,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
   /** El reloj entregado por `USING` a un marcador que el SQL dinámico colapsa a un día. */
   let RELOJ_EN_PARAMETRO_DINAMICO: (texto: string) => boolean = () => false;
   /*
+   * Y el reloj PROYECTADO a las columnas de un `RETURNS TABLE` desde un cuerpo SQL. Aquí el
+   * tipo sí está escrito —en la propia firma— pero no llega por ninguna de las vías que ya se
+   * miran: `prorettype` dice `record`, y un cuerpo SQL no tiene asignaciones que buscar, así
+   * que el reconocedor de las columnas como variables no encuentra nada. Medido:
+   * `returns table(d date, n int) language sql as $$ select now(), 1 $$` devuelve 2026-09-05
+   * en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+   */
+  let RELOJ_PROYECTADO_A_TABLA: (texto: string) => boolean = () => false;
+  /*
    * Y la COMPARACIÓN implícita: `vence_en > current_timestamp` con `vence_en date` promociona
    * la fecha a `timestamptz` por la medianoche del huso de la SESIÓN, así que quien llama
    * decide el resultado. Medido, y no de canto: la misma fila da `f` en Pacific/Kiritimati y
@@ -1185,6 +1194,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       return brazos.length > 0 ? brazos : null;
     };
 
+    /**
+     * Lo que una subconsulta PROYECTA, o `null` si no lo es. Se para donde empiezan las
+     * cláusulas: el `where` filtra, no entrega.
+     */
+    const listaDeSeleccion = (dentro: string): string | null => {
+      const m = /^\s*select\s+([\s\S]*)$/i.exec(dentro);
+      return m === null ? null : hastaLaClausula(m[1]!);
+    };
+
     /** Las hojas cuyo valor PUEDE ser el de la expresión entera. */
     const hojasDelValor = (expr: string, hondura = 0): string[] => {
       const e = expr.trim();
@@ -1194,8 +1212,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       const dentro = dentroDelParentesis(e);
       if (dentro !== null) {
         const nombre = e.slice(0, e.indexOf('(')).trim();
-        // Sin nombre delante son los paréntesis propios de la expresión, que no cambian nada.
-        if (nombre === '') return hojasDelValor(dentro, hondura + 1);
+        /*
+         * Sin nombre delante son los paréntesis propios de la expresión, que no cambian nada
+         * — salvo que dentro haya una SUBCONSULTA, y entonces su valor es lo que PROYECTA.
+         * `return (select now());` con `returns date` da 2026-09-05 en Pacific/Kiritimati y
+         * 2026-09-04 en Etc/GMT+12, y `update t set d = (select now())` guarda lo mismo.
+         *
+         * Es exactamente el medio-razonamiento que ya tuve que corregir en `array(select …)`:
+         * escribí que una subconsulta no se abre «porque su valor es la columna, no lo que
+         * haya en el where», y la primera mitad es la que importa — la columna que proyecta
+         * SÍ es el valor. Lo dejé escrito bien allí y no lo trasladé aquí.
+         */
+        if (nombre === '') {
+          const proyecta = listaDeSeleccion(dentro);
+          if (proyecta !== null)
+            return argumentosDe(proyecta).flatMap((a) => hojasDelValor(a, hondura + 1));
+          return hojasDelValor(dentro, hondura + 1);
+        }
         if (ENVOLTURA_TRANSPARENTE.test(nombre))
           return argumentosDe(dentro).flatMap((a) => hojasDelValor(a, hondura + 1));
         /*
@@ -1211,8 +1244,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
          * … < now())` proyecta `d` y usa el reloj solo para filtrar.
          */
         if (/^array$/i.test(nombre)) {
-          const lista = /^\s*select\s+([\s\S]*?)(?=\s+from\b|\s+where\b|$)/i.exec(dentro);
-          if (lista) return argumentosDe(lista[1]!).flatMap((a) => hojasDelValor(a, hondura + 1));
+          const proyecta = listaDeSeleccion(dentro);
+          if (proyecta !== null)
+            return argumentosDe(proyecta).flatMap((a) => hojasDelValor(a, hondura + 1));
         }
       }
       /*
@@ -1553,7 +1587,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      */
     if (NOMBRES_SIN_HUSO.size > 0) {
       const alternativa = [...NOMBRES_SIN_HUSO].map(escapado).join('|');
-      const COLUMNA = String.raw`(?<![\w."])(?:\w+\s*\.\s*)?(?:${alternativa})(?![\w"])`;
+      /*
+       * El nombre puede ir ENTRECOMILLADO, y su calificador también: medido,
+       * `select "vence_en" > current_timestamp` hace la misma promoción —`false` en
+       * Pacific/Kiritimati y `true` en Etc/GMT+12— y el patrón solo admitía la forma desnuda.
+       * Peor: excluía explícitamente las comillas de al lado, así que la forma citada no es
+       * que se le escapara, es que la descartaba.
+       */
+      const CITADO = (t: string): string => String.raw`(?:"${t}"|${t})`;
+      const CALIFICADOR = String.raw`(?:(?:"[^"]+"|\w+)\s*\.\s*)?`;
+      const COLUMNA =
+        String.raw`(?<![\w.])${CALIFICADOR}${CITADO(`(?:${alternativa})`)}(?![\w])`;
       const COMPARA_CON_RELOJ = new RegExp(
         String.raw`${COLUMNA}\s*${COMPARADOR}\s*(?:${RELOJ})` +
           String.raw`|(?:${RELOJ})\s*${COMPARADOR}\s*${COLUMNA}`,
@@ -1686,7 +1730,34 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * LÍMITE DECLARADO, el de siempre: si la consulta está en una variable no se puede leer.
      */
     const EJECUTA_CON_USING =
-      /\bexecute\s+(?:'((?:[^']|'')*)'|\$([A-Za-z_]\w*)?\$([\s\S]*?)\$\2\$)[\s\S]*?\busing\s+([^;]*)/gi;
+      /\bexecute\s+(?:[A-Za-z_]*&?'((?:[^']|'')*)'|\$([A-Za-z_]\w*)?\$([\s\S]*?)\$\2\$)[\s\S]*?\busing\s+([^;]*)/gi;
+    /*
+     * `returns table(col tipo, …)` y, si el cuerpo es un `select`, su lista de selección
+     * emparejada por POSICIÓN con las columnas cuyo tipo declarado no lleva huso. El tipo se
+     * lee de la firma, no del catálogo, porque ahí está escrito.
+     */
+    const TABLA_DEVUELTA =
+      /\breturns\s+(?:setof\s+)?table\s*\(([\s\S]*?)\)\s*(?:language|as|return|stable|immutable|volatile|window|strict|security|parallel|cost|rows|support|set\b)/i;
+    const CUERPO_SELECT = /\bselect\s+([\s\S]*)$/i;
+    RELOJ_PROYECTADO_A_TABLA = (texto: string): boolean => {
+      const firma = TABLA_DEVUELTA.exec(texto);
+      if (firma === null) return false;
+      const tipos = argumentosDe(firma[1]!).map((c) => {
+        const t = c.trim();
+        const corte = t.search(/\s/);
+        return corte < 0 ? '' : t.slice(corte + 1).trim();
+      });
+      const cuerpo = CUERPO_SELECT.exec(texto.slice(firma.index + firma[0].length));
+      if (cuerpo === null) return false;
+      const valores = argumentosDe(hastaLaClausula(cuerpo[1]!));
+      return tipos.some(
+        (t, i) =>
+          SIN_HUSO_DECLARADO.test(t) &&
+          valores[i] !== undefined &&
+          hojasDelValor(valores[i]!).some((h) => RELOJ_A_SECAS.test(h)),
+      );
+    };
+
     RELOJ_EN_PARAMETRO_DINAMICO = (texto: string): boolean => {
       for (const m of texto.matchAll(EJECUTA_CON_USING)) {
         const consulta = (m[1] ?? m[3] ?? '').replace(/''/g, "'");
@@ -1770,6 +1841,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         if (inicial !== undefined && entrega(tabla, columna, inicial)) return true;
         for (const a of texto.matchAll(ASIGNA_DESPUES(variable))) {
           if (entrega(tabla, columna, a[1] ?? a[2]!)) return true;
+        }
+        /*
+         * Y el `select … into`, que es la tercera forma de que a una variable le caiga un
+         * valor y la que faltaba aquí: las de tipo escrito ya la miraban. Medido:
+         * `declare v t.d%type; begin select now() into v; …` da 2026-09-05 en
+         * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+         */
+        for (const a of texto.matchAll(
+          new RegExp(
+            String.raw`\bselect\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`,
+            'gi',
+          ),
+        )) {
+          const destinos = argumentosDe(hastaLaClausula(a[2]!)).map((d) =>
+            sinComillas(d.trim()).toLowerCase(),
+          );
+          const valores = argumentosDe(a[1]!);
+          const i = destinos.indexOf(sinComillas(m[1]!.trim()).toLowerCase());
+          if (i >= 0 && valores[i] !== undefined && entrega(tabla, columna, valores[i]!))
+            return true;
         }
       }
       for (const m of texto.matchAll(INSERTA)) {
@@ -1893,6 +1984,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * cast que mirar. Se emparejan por número, que es como los empareja Postgres.
        */
       RELOJ_EN_PARAMETRO_DINAMICO(conLiterales) ||
+      RELOJ_PROYECTADO_A_TABLA(sinLiterales) ||
       RELOJ_COMPARADO_CON_COLUMNA(sinLiterales) ||
       /*
        * Y el SQL DINÁMICO: `execute 'select now()::date'` guarda la operación DENTRO de un
@@ -2779,6 +2871,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // Medido, y no de canto: la misma fila da `f` en Pacific/Kiritimati y `t` en Etc/GMT+12.
       // Estaba como límite declarado, con esta misma línea del lado seguro.
       'vence_en > current_timestamp',
+      // Y con el nombre ENTRECOMILLADO, que es la misma promoción escrita de otra manera
+      // —medido: `false` en Pacific/Kiritimati y `true` en Etc/GMT+12—. El patrón no es que se
+      // la dejara: EXCLUÍA las comillas de al lado, así que la descartaba a propósito.
+      // (Va como sonda de texto y no de catálogo porque en las tablas sonda el nombre `d` es
+      // ambiguo a propósito, y los ambiguos se omiten: allí el caso no se puede escribir.)
+      '"vence_en" > current_timestamp',
       // La coerción IMPLÍCITA a texto, que renderiza igual sin nombrar ningún formato. Las
       // cuatro medidas: cadena distinta en husos opuestos.
       'concat(now())',
@@ -4047,6 +4145,45 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           " insert into censo_probe_escritura(k, d) values (1, date '2020-01-01')" +
           ' on conflict (k) do update set (d, ts) = (now(), now()); end $c$',
       ],
+      /*
+       * Otra tanda de cruces, los cinco de aquí medidos 2026-09-05 en Pacific/Kiritimati contra
+       * 2026-09-04 en Etc/GMT+12 —salvo el de la columna citada, que da `false` y `true`, o
+       * sea que la comparación se da la vuelta entera—:
+       *
+       *   execute E'select $1::date' … using now()        el prefijo E en el USING
+       *   returns table(d date, n int) … select now(), 1  la proyección a las columnas
+       *   return (select now())                           la subconsulta escalar
+       *   update t set d = (select now())                 la misma, del lado de la escritura
+       *   (la columna citada va de sonda de TEXTO, ver más arriba)
+       *   declare v t.d%type; select now() into v         el `into` para variable de catálogo
+       *
+       * Y otro que NO es hueco: `declare U&"\\0076" t.d%type` es un ERROR DE SINTAXIS —plpgsql
+       * no admite esa ortografía para el nombre de una variable—. Cuarto caso de la serie que
+       * resulta ser una no-forma, y va escrito para no volver a buscarlo.
+       */
+      [
+        'censo_probe_using_prefijo_e_date',
+        "returns date language plpgsql as $c$ declare d date;" +
+          " begin execute E'select $1::date' into d using now(); return d; end $c$",
+      ],
+      [
+        'censo_probe_tabla_proyectada_date',
+        'returns table(d date, n int) language sql stable as $c$ select now(), 1 $c$',
+      ],
+      [
+        'censo_probe_subconsulta_escalar_date',
+        'returns date language plpgsql as $c$ begin return (select now()); end $c$',
+      ],
+      [
+        'censo_probe_subconsulta_escritura_date',
+        'returns void language plpgsql as $c$' +
+          ' begin update censo_probe_escritura set d = (select now()); end $c$',
+      ],
+      [
+        'censo_probe_pct_type_into_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
+          ' begin select now() into v; return v; end $c$',
+      ],
       [
         'censo_probe_ok_compara_columna_ambigua',
         'returns boolean language sql stable as $c$ select now() < d from censo_probe_otra $c$',
@@ -4320,6 +4457,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_using_dolar_date',
           'censo_probe_merge_insert_date',
           'censo_probe_conflicto_fila_date',
+          'censo_probe_using_prefijo_e_date',
+          'censo_probe_tabla_proyectada_date',
+          'censo_probe_subconsulta_escalar_date',
+          'censo_probe_subconsulta_escritura_date',
+          'censo_probe_pct_type_into_date',
           'censo_probe_tabla_unicode_date',
         ].sort(),
       );
@@ -4388,6 +4530,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_using_dolar_date',
         'censo_probe_merge_insert_date',
         'censo_probe_conflicto_fila_date',
+        'censo_probe_using_prefijo_e_date',
+        'censo_probe_tabla_proyectada_date',
+        'censo_probe_subconsulta_escalar_date',
+        'censo_probe_subconsulta_escritura_date',
+        'censo_probe_pct_type_into_date',
         'censo_probe_tabla_unicode_date',
         'censo_probe_ok_compara_columna_ambigua',
         'censo_probe_ok_rowtype_instante',

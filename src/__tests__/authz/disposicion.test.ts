@@ -2039,6 +2039,30 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        */
       const alcanzadas = new Set<TS.CallExpression>();
       /**
+       * Y QUÉ CUENTA COMO ABRIR UNA TRANSACCIÓN, en un solo sitio, para que el recorrido que
+       * las RECOGE y el que las ANALIZA no puedan discrepar: el cierre por alcance compara
+       * nodos por identidad, así que una forma que solo uno de los dos reconociera quedaría
+       * fuera de las DOS listas y nadie la echaría de menos.
+       *
+       * Cubre el nombre desnudo, un alias suyo —`const abrir = conUsuario;`, siguiendo la
+       * cadena— y la llamada por PROPIEDAD, `db.conUsuario(…)`, que es como queda con un
+       * `import * as`. Las dos últimas las encontré probando, después de escribir que eran el
+       * hueco que le quedaba al cierre.
+       */
+      const abreTransaccion = (nombre: string) => {
+        const vistos = new Set<string>();
+        let actual: string | undefined = nombre;
+        while (actual !== undefined && !vistos.has(actual)) {
+          if (actual === 'conUsuario') return true;
+          vistos.add(actual);
+          actual = alias.get(actual);
+        }
+        return false;
+      };
+      const esApertura = (n: TS.CallExpression) =>
+        (ts.isIdentifier(n.expression) && abreTransaccion(n.expression.text)) ||
+        (ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === 'conUsuario');
+      /**
        * Lo que envuelve a un valor sin cambiarlo: `(f) satisfies T`, `f as T`, `(f)`, `f!`.
        * Sin desenvolver, `export const p = (async (…) => conUsuario(…)) satisfies Proyeccion`
        * tiene un `SatisfiesExpression` por inicializador, no una flecha, y la rama de abajo lo
@@ -2179,11 +2203,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           let reenvia: number | undefined;
           let nodoInterior: TS.CallExpression | undefined;
           const mirar = (x: TS.Node) => {
-            if (
-              ts.isCallExpression(x) &&
-              ts.isIdentifier(x.expression) &&
-              x.expression.text === 'conUsuario'
-            ) {
+            if (ts.isCallExpression(x) && esApertura(x)) {
               const a1 = x.arguments[1];
               if (a1 && ts.isIdentifier(a1)) {
                 const k = params.indexOf(a1.text);
@@ -2212,10 +2232,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
          */
         const vistos = new Set<TS.Node>([nodo]);
         const buscar = (n: TS.Node) => {
-          if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) {
+          if (ts.isCallExpression(n) && esApertura(n)) {
+            llamadas.push({ nodo: n, arg: 1, abre: n });
+          } else if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) {
             const envuelve = envoltorios.get(n.expression.text);
-            if (n.expression.text === 'conUsuario') llamadas.push({ nodo: n, arg: 1, abre: n });
-            else if (envuelve !== undefined)
+            if (envuelve !== undefined)
               llamadas.push({ nodo: n, arg: envuelve.arg, abre: envuelve.nodo });
             else {
               const destino = porNombre.get(n.expression.text);
@@ -2354,9 +2375,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
        */
       const todas: TS.CallExpression[] = [];
       const recogerLlamadas = (n: TS.Node) => {
-        if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'conUsuario') {
-          todas.push(n);
-        }
+        if (ts.isCallExpression(n) && esApertura(n)) todas.push(n);
         ts.forEachChild(n, recogerLlamadas);
       };
       ts.forEachChild(fuente, recogerLlamadas);
@@ -2552,6 +2571,21 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
           return { a, b };
         });
       export const { sondaDesestructurada } = { sondaDesestructurada: leerPanelDes };
+      // La llamada por PROPIEDAD, que es como queda conUsuario con un import de espacio.
+      export const sondaPropiedad = async (actorId: string) =>
+        db.conUsuario(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
+      // Y la propia función guardada en otro nombre.
+      const abrir = conUsuario;
+      export const sondaIndirecta = async (actorId: string) =>
+        abrir(actorId, async (tx) => {
+          const [a] = await tx\`select 1 as x\`;
+          const [b] = await tx\`select 2 as y\`;
+          return { a, b };
+        });
       // Un identificador ENTRE COMILLAS DOBLES: en SQL es un NOMBRE, no un dato, pero tampoco
       // es una sentencia de escritura.
       export const sondaIdentificador = async (actorId: string) =>
@@ -2650,6 +2684,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         'sonda.ts:sondaCadenaE',
         'sonda.ts:sondaAlias',
         'sonda.ts:sondaAliasDoble',
+        'sonda.ts:sondaPropiedad',
+        'sonda.ts:sondaIndirecta',
         // Las dos que el censo no sabe leer: las caza el cierre por ALCANCE, no la lista de
         // puertas. Se nombran por posición porque de algo ilegible no se puede decir más.
         'sonda.ts:conUsuario#21 (sin alcanzar)',

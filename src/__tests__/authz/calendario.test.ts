@@ -1293,10 +1293,131 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       /\breturn\s+(?:query\s+select\s+|next\s+)?([^;]*?)(?=;|\s*\$|\s*$)/gi,
       /\bselect\s+([^;]*?)(?=;|\s+from\b|\s*\$|\s*$)/gi,
     ];
-    RELOJ_ENTREGADO = (texto: string): boolean =>
-      [texto, ...ENTREGAS.flatMap((r) => [...texto.matchAll(r)].map((m) => m[1]!))].some((e) =>
-        hojasDelValor(e).some((hoja) => RELOJ_A_SECAS.test(hoja)),
-      );
+    /*
+     * Un ALIAS de nivel superior no cambia el valor entregado: `returns date … as $$ select
+     * now() as d $$` colapsa igual —medido, 2026-09-05 en Pacific/Kiritimati contra 2026-09-04
+     * en Etc/GMT+12— y lo que llegaba a mirarse era la hoja `now() as d`, que no es ningún
+     * reloj a secas. Se quita, en las dos ortografías que admite Postgres —con `as` y sin él—.
+     *
+     * A PROFUNDIDAD CERO, que es lo que lo hace seguro: el `as` de un `cast(now() as date)` va
+     * dentro de paréntesis y ahí no se toca. Y solo si queda algo delante, para que
+     * `select current_date` no se convierta en la cadena vacía.
+     */
+    const NOMBRE_LLANO = String.raw`(?:"(?:[^"]|"")+"|[A-Za-z_]\w*)`;
+    const CON_ALIAS = new RegExp(String.raw`^([\s\S]*?\S)\s+(?:as\s+)?(${NOMBRE_LLANO})$`, 'i');
+    const profundidad = (t: string): number => {
+      let nivel = 0;
+      for (const c of t) {
+        if (c === '(' || c === '[') nivel++;
+        else if (c === ')' || c === ']') nivel--;
+      }
+      return nivel;
+    };
+    const aNivelCero = (t: string): boolean => profundidad(t) === 0;
+    const sinAlias = (e: string): string => {
+      const m = CON_ALIAS.exec(e.trim());
+      return m !== null && aNivelCero(m[1]!) ? m[1]! : e;
+    };
+    /** El nombre con el que sale una expresión proyectada: su alias, o ella misma si es uno. */
+    const nombreProyectado = (e: string): string | null => {
+      const t = e.trim();
+      const m = CON_ALIAS.exec(t);
+      if (m !== null && aNivelCero(m[1]!)) return sinComillas(m[2]!).toLowerCase();
+      return new RegExp(String.raw`^${NOMBRE_LLANO}$`).test(t)
+        ? sinComillas(t).toLowerCase()
+        : null;
+    };
+    /*
+     * Las ramas de una OPERACIÓN DE CONJUNTOS, a profundidad cero. `returns date … as $$ select
+     * now() union all select now() where false $$` entrega el reloj —medido, con el mismo par
+     * de fechas— y la captura se llevaba la consulta compuesta entera como una sola hoja: la
+     * expresión regular no para en el `union`, y su `?` perezoso llega hasta el final porque no
+     * hay `from` ni `;` que lo corten. Ninguno de los dos `now()` quedaba terminal.
+     */
+    const RAMA_SIGUIENTE = /\b(?:union|intersect|except)\b(?:\s+(?:all|distinct))?/gi;
+    const ramasDeConjunto = (t: string): string[] => {
+      const ramas: string[] = [];
+      let desde = 0;
+      RAMA_SIGUIENTE.lastIndex = 0;
+      for (let m = RAMA_SIGUIENTE.exec(t); m !== null; m = RAMA_SIGUIENTE.exec(t)) {
+        if (!aNivelCero(t.slice(0, m.index))) continue;
+        ramas.push(t.slice(desde, m.index));
+        desde = m.index + m[0].length;
+      }
+      ramas.push(t.slice(desde));
+      return ramas;
+    };
+    /**
+     * Lo que proyecta una rama: sin su `select`, cortada donde empiezan sus cláusulas y sin
+     * su alias.
+     *
+     * NO se parte por comas, y la omisión es deliberada: quien llama aquí solo lo hace cuando
+     * el destino es un tipo escalar sin huso, y ahí Postgres no acepta una lista de más de una
+     * columna, así que no hay ninguna forma válida que lo necesite. Lo intenté al revés
+     * —partiendo— y no había sonda que lo moviera, mientras que sí había dos seguras que se
+     * volvían culpables: `select now(), timezone('UTC', now())::date into t, d`, donde el reloj
+     * va a la variable CON huso, y la subconsulta del `from` de aquí abajo.
+     */
+    const proyectadas = (t: string): string[] => {
+      const m = /^\s*select\s+(?:all\s+|distinct\s+(?:on\s*\([^)]*\)\s*)?)?([\s\S]*)$/i.exec(t);
+      return [sinAlias(hastaLaClausula(m === null ? t : m[1]!))];
+    };
+    /*
+     * Y la columna que llega por una SUBCONSULTA DEL `FROM`: `returns date … as $$ select d
+     * from (select now() d) s $$` devuelve el reloj a través de la columna derivada —medido—.
+     * Ninguna de las dos capturas lo veía: la de fuera aporta la hoja `d`, y la de dentro
+     * empieza en el segundo `select` y se lleva `now() d) s`, que tampoco es un reloj a secas.
+     *
+     * Se resuelve el NOMBRE contra la lista de la subconsulta, que es lo único que hace falta y
+     * lo que además no inventa culpa: solo se sustituye la columna que de verdad se proyecta,
+     * así que un `select k from (select now() d, 1 k) s` sigue saliendo limpio —su sonda está
+     * abajo—. El calificador se descarta porque el alias de la subconsulta es uno solo.
+     */
+    const DESDE_SUBCONSULTA = /\bselect\s+([\s\S]*?)\s+from\s*\(/gi;
+    const columnasDerivadas = (texto: string): string[] => {
+      const salida: string[] = [];
+      for (const m of texto.matchAll(DESDE_SUBCONSULTA)) {
+        const dentro = parejaDeParentesis(texto, m.index + m[0].length - 1);
+        if (dentro === null) continue;
+        const interior = listaDeSeleccion(dentro);
+        if (interior === null) continue;
+        const porNombre = new Map<string, string>();
+        for (const e of argumentosDe(interior)) {
+          const n = nombreProyectado(e);
+          if (n !== null) porNombre.set(n, sinAlias(e));
+        }
+        for (const e of proyectadas(`select ${m[1]!}`)) {
+          const n = nombreProyectado(e);
+          const sin = n === null ? null : (porNombre.get(n.split('.').pop()!) ?? null);
+          if (sin !== undefined && sin !== null) salida.push(sin);
+        }
+      }
+      return salida;
+    };
+    RELOJ_ENTREGADO = (texto: string): boolean => {
+      const entregadas = [
+        texto,
+        ...[...texto.matchAll(ENTREGAS[0]!)].map((m) => m[1]!),
+        /*
+         * Solo los `select` que empiezan a PROFUNDIDAD CERO. Uno que empieza dentro de un
+         * paréntesis es una subconsulta, y que su proyección se entregue o no lo deciden otros
+         * dos sitios que sí saben mirarlo: la subconsulta del `from` —aquí abajo— y la escalar,
+         * que abre `hojasDelValor`.
+         *
+         * Y aquí va dicho lo que no se ve: HOY ninguna sonda mueve este filtro, ni el nivel
+         * cero que exigen `sinAlias` y `ramasDeConjunto`. Los tres se tapan entre sí —quitando
+         * cualquiera de ellos, los otros dos siguen dejando limpias las tres sondas seguras de
+         * subconsulta— y el sitio donde sí se veía la diferencia era el corte por comas, que ya
+         * no está. Se quedan porque son la condición correcta y no un remiendo del caso que la
+         * descubrió; se dice en vez de dejar creer que hay una medida detrás de cada uno.
+         */
+        ...[...texto.matchAll(ENTREGAS[1]!)]
+          .filter((m) => profundidad(texto.slice(0, m.index)) === 0)
+          .flatMap((m) => ramasDeConjunto(m[1]!).flatMap(proyectadas)),
+        ...columnasDerivadas(texto),
+      ];
+      return entregadas.some((e) => hojasDelValor(e).some((hoja) => RELOJ_A_SECAS.test(hoja)));
+    };
 
     /*
      * El segundo no necesita que nadie le pase el tipo, porque lo declara el propio texto: una
@@ -4338,6 +4459,56 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * respuesta se mueve de fila: cae dentro `2026-09-06` en el primer huso y `2026-09-05`
        * en el segundo.
        */
+      /*
+       * Tres formas de ENTREGAR el valor que la captura de la lista de selección no veía. Las
+       * tres medidas: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
+       *
+       *   select now() as d                         el alias tapaba el reloj
+       *   select now() union all select …           la consulta compuesta entera, una hoja
+       *   select d from (select now() d) s          la columna llega derivada de la subconsulta
+       */
+      [
+        'censo_probe_alias_date',
+        'returns date language sql stable as $c$ select now() as d $c$',
+      ],
+      [
+        'censo_probe_alias_desnudo_date',
+        'returns date language sql stable as $c$ select now() d $c$',
+      ],
+      [
+        'censo_probe_union_date',
+        'returns date language sql stable as $c$ select now()' +
+          ' union all select now() where false $c$',
+      ],
+      [
+        'censo_probe_union_segunda_rama_date',
+        "returns date language sql stable as $c$ select date '2026-01-01'" +
+          ' union all select now() where false $c$',
+      ],
+      [
+        'censo_probe_derivada_date',
+        'returns date language sql stable as $c$ select d from (select now() d) s $c$',
+      ],
+      /*
+       * Y sus seguras. La de la subconsulta es la que fija que esto no marca por vecindad: el
+       * reloj está DENTRO de la subconsulta, pero en una columna que no es la que se proyecta,
+       * así que la función sigue devolviendo la fecha fija. Y la del alias fija que quitarlo no
+       * se lleva por delante una expresión de un solo término.
+       */
+      [
+        'censo_probe_ok_subconsulta_no_proyectada',
+        "returns date language sql stable as $c$ select date '2026-01-01'" +
+          ' from (select now() d) s $c$',
+      ],
+      [
+        'censo_probe_ok_derivada_otra_columna',
+        "returns date language sql stable as $c$ select f from (select now() d," +
+          " date '2026-01-01' f) s $c$",
+      ],
+      [
+        'censo_probe_ok_alias_fecha_fija',
+        "returns date language sql stable as $c$ select date '2026-01-01' as now $c$",
+      ],
       [
         'censo_probe_returning_into_date',
         'returns date language plpgsql as $c$ declare d date; begin' +
@@ -4721,6 +4892,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_parametro_default_date',
           'censo_probe_tabla_unicode_date',
           'censo_probe_returning_into_date',
+          'censo_probe_alias_date',
+          'censo_probe_alias_desnudo_date',
+          'censo_probe_union_date',
+          'censo_probe_union_segunda_rama_date',
+          'censo_probe_derivada_date',
           'censo_probe_between_date',
           'censo_probe_between_reloj_izquierdo_date',
           'censo_probe_between_superior_date',
@@ -4805,6 +4981,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_pct_type_into_date',
         'censo_probe_parametro_default_date',
         'censo_probe_ok_parametro_default_instante',
+        'censo_probe_alias_date',
+        'censo_probe_alias_desnudo_date',
+        'censo_probe_union_date',
+        'censo_probe_union_segunda_rama_date',
+        'censo_probe_derivada_date',
+        'censo_probe_ok_subconsulta_no_proyectada',
+        'censo_probe_ok_derivada_otra_columna',
+        'censo_probe_ok_alias_fecha_fija',
         'censo_probe_returning_into_date',
         'censo_probe_between_date',
         'censo_probe_between_reloj_izquierdo_date',

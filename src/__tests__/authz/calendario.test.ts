@@ -53,8 +53,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * reloj es independiente del huso si su tipo LLEVA huso— escrita aquí sobre el nombre en vez
    * de sobre la palabra.
    */
+  /*
+   * Y el sufijo de ARRAY, que no cambia la pregunta: Postgres coerciona elemento a elemento,
+   * así que lo que decide es el tipo del ELEMENTO. Medido: `returns date[]` con
+   * `return array[now()]` da `{2026-09-05}` en Pacific/Kiritimati y `{2026-09-04}` en
+   * Etc/GMT+12, exactamente igual que su versión escalar. Sin admitirlo, escribir un par de
+   * corchetes en el tipo de vuelta sacaba a la función de esta familia entera.
+   *
+   * Las dimensiones se aceptan todas y los tamaños se ignoran, porque a Postgres tampoco le
+   * importan: `date[3]` y `date[][]` son el mismo tipo que `date[]` (comprobado en el
+   * catálogo, que los imprime los tres como `date[]`).
+   */
   const SIN_HUSO_DECLARADO =
-    /^\s*(?:date|(?:timestamp|time)(?:\s*\(\s*\d+\s*\))?(?:\s+without\s+time\s+zone)?)\s*$/i;
+    /^\s*(?:date|(?:timestamp|time)(?:\s*\(\s*\d+\s*\))?(?:\s+without\s+time\s+zone)?)(?:\s*\[\s*\d*\s*\])*\s*$/i;
   const PALABRAS_DEL_RELOJ = [
     // De más larga a más corta: con `current_time` delante, la alternación la casaba dentro
     // de `current_timestamp` y el resto quedaba suelto. (Con la frontera derecha puesta ya no
@@ -1011,14 +1022,38 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       return null;
     };
 
-    /** Los argumentos de PRIMER nivel: una coma dentro de un paréntesis no separa. */
+    /*
+     * Lo de dentro de un `array[…]`, cuando los corchetes cierran la expresión entera. Se
+     * exige el nombre delante: un `x[1]` es un SUBÍNDICE —que saca un elemento, no lo
+     * entrega— y no tiene nada que ver.
+     */
+    const dentroDelCorchete = (e: string): string | null => {
+      const m = /^array\s*\[/i.exec(e);
+      if (!m) return null;
+      const abre = m[0].length - 1;
+      let nivel = 0;
+      for (let i = abre; i < e.length; i++) {
+        if (e[i] === '[') nivel++;
+        else if (e[i] === ']' && --nivel === 0)
+          return i === e.length - 1 ? e.slice(abre + 1, i) : null;
+      }
+      return null;
+    };
+
+    /**
+     * Los argumentos de PRIMER nivel: una coma dentro de un paréntesis no separa. Ni dentro de
+     * un CORCHETE, desde que se desciende por los constructores de array: en
+     * `coalesce(array[a, b], c)` los argumentos son dos, y contando solo paréntesis salían
+     * tres, partidos por la mitad. Contar también los corchetes solo puede unir trozos que
+     * estaban mal partidos; no puede partir un argumento que estaba bien.
+     */
     const argumentosDe = (dentro: string): string[] => {
       const partes: string[] = [];
       let nivel = 0;
       let desde = 0;
       for (let i = 0; i < dentro.length; i++) {
-        if (dentro[i] === '(') nivel++;
-        else if (dentro[i] === ')') nivel--;
+        if (dentro[i] === '(' || dentro[i] === '[') nivel++;
+        else if (dentro[i] === ')' || dentro[i] === ']') nivel--;
         else if (dentro[i] === ',' && nivel === 0) {
           partes.push(dentro.slice(desde, i));
           desde = i + 1;
@@ -1071,6 +1106,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         if (ENVOLTURA_TRANSPARENTE.test(nombre))
           return argumentosDe(dentro).flatMap((a) => hojasDelValor(a, hondura + 1));
       }
+      /*
+       * Y el CONSTRUCTOR de array, que no es una llamada y por eso no entraba por arriba.
+       * `array[a, b]` no devuelve el valor de sus elementos —devuelve el array— pero para lo
+       * único que se pregunta aquí da igual: el tipo declarado se reparte elemento a elemento,
+       * así que cada elemento se entrega a `date` con la misma fuerza que si fuera toda la
+       * expresión. Medido: `returns date[]` con `return array[now()]`, 2026-09-05 contra
+       * 2026-09-04 en husos opuestos.
+       *
+       * `array(select …)` NO entra, y es la misma asimetría que ya rige para las subconsultas:
+       * su valor es la columna que devuelve el select, no lo que se escriba en el `where`. Va
+       * por la rama de los paréntesis de arriba, donde el nombre `array` no está en la lista de
+       * envolturas transparentes, así que se queda como hoja. (`array(select now()::date)` sí
+       * depende de quien llama —medido—, pero por el `::date` que lleva escrito, y de eso ya se
+       * ocupan los patrones del cast.)
+       */
+      const enCorchetes = dentroDelCorchete(e);
+      if (enCorchetes !== null)
+        return argumentosDe(enCorchetes).flatMap((a) => hojasDelValor(a, hondura + 1));
       return [e];
     };
 
@@ -2880,6 +2933,48 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns table(d timestamptz) language plpgsql as $c$' +
           ' begin d := now(); return next; end $c$',
       ],
+      /*
+       * Y el destino tipado a través de un CONSTRUCTOR de array. Postgres coerciona
+       * ELEMENTO A ELEMENTO: `returns date[]` con `return array[now()]` da
+       * `{2026-09-05}` en Pacific/Kiritimati y `{2026-09-04}` en Etc/GMT+12 —medido—, y en
+       * el catálogo no hay más que un `now()` desnudo, igual que en toda esta familia. Lo
+       * que cambia es la SINTAXIS del envoltorio: `array[…]` no es una llamada, así que no
+       * lo veía ni el seguimiento del valor ni la lista de tipos sin huso, que estaba
+       * anclada al tipo escalar.
+       *
+       * El arreglo son DOS piezas y ninguna basta sola —admitir el sufijo en la lista de
+       * tipos sin huso, y descender por el corchete—: retirando cualquiera de las dos se
+       * mueve esta misma sonda y ninguna otra.
+       *
+       * Y sus dos parejas seguras, dicho lo que cada una vale de verdad, que no es lo que
+       * parece:
+       *
+       * - `censo_probe_arreglo_instante` (elemento CON huso, que conserva el instante) SÍ
+       *   carga peso: relajando el tipo del elemento para que acepte `with time zone`,
+       *   enrojece. Pero enrojece junto a `censo_probe_devuelve_instante`, o sea que lo que
+       *   añade no es el guardián —ése ya estaba— sino que el sufijo nuevo no se lo llevó
+       *   por delante al pasar por encima.
+       * - `censo_probe_ok_arreglo_huso_fijo` (el huso ya fijado DENTRO del corchete) NO
+       *   añade cobertura, y se queda escrito como tal en vez de venderse: se mueve con
+       *   exactamente la misma neutralización que `censo_probe_ok_huso_fijo_date` —quitarle
+       *   el anclaje a `RELOJ_A_SECAS`— y con ninguna otra. Es la misma guarda de siempre
+       *   redicha en forma de array. Lo que NO la sostiene, comprobado: meter `timezone` en
+       *   las envolturas transparentes deja la suite entera en verde, porque ahí el
+       *   descenso ni siquiera llega —el `)` no cierra la expresión, que sigue con `::date`—.
+       */
+      [
+        'censo_probe_arreglo_date',
+        'returns date[] language plpgsql as $c$ begin return array[now()]; end $c$',
+      ],
+      [
+        'censo_probe_arreglo_instante',
+        'returns timestamptz[] language plpgsql as $c$ begin return array[now()]; end $c$',
+      ],
+      [
+        'censo_probe_ok_arreglo_huso_fijo',
+        "returns date[] language plpgsql as $c$" +
+          " begin return array[timezone('UTC', now())::date]; end $c$",
+      ],
       // Y su pareja segura: la misma envoltura sobre una variable CON huso conserva el
       // instante, así que seguir el valor no puede enrojecerla.
       [
@@ -2952,6 +3047,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_into_coalesce_date',
           'censo_probe_tabla_date',
           'censo_probe_tabla_dos_date',
+          'censo_probe_arreglo_date',
         ].sort(),
       );
     } finally {
@@ -2980,6 +3076,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_tabla_date',
         'censo_probe_tabla_dos_date',
         'censo_probe_tabla_instante',
+        'censo_probe_arreglo_date',
+        'censo_probe_arreglo_instante',
+        'censo_probe_ok_arreglo_huso_fijo',
         'censo_probe_ok_huso_fijo_date',
         'censo_probe_ok_subconsulta_date',
       ]) {

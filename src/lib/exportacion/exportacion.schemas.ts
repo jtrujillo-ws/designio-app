@@ -296,6 +296,26 @@ export const CATALOGO_EXPORT = [
   // de poda de este ámbito no sabe recorrer, así que meterlo delataría justo lo que la
   // poda quita. La aplicación solo puede LEERLA: no hay grant ni política de escritura.
   { tabla: 'sembrado_registro', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  // Disposición acordada (SPEC-01 · RF-01.9): la bitácora de lo que se pactó hacer con este
+  // workspace al terminar —archivo o borrado, con su base contractual y su retención— y la
+  // constancia de lo que se ejecutó. Las dos llevan `workspace_id`, así que SYS-04 las manda
+  // al ARCHIVO del propietario, y ahí es donde más falta hacen: son el documento que acredita
+  // qué se acordó y qué se destruyó, y el archivo es la copia que le queda a quien lo pidió.
+  //
+  // Que la constancia viaje aquí NO duplica nada. El cliente recibe la suya en el acto, del
+  // valor que devuelve `ejecutar_disposicion`, porque tras un borrado se destruyen los
+  // `miembro` y RLS deja de mostrarle hasta la lápida: ese documento es suyo y se verifica
+  // fuera de esta base recomputando su `sello`. Esta es la copia de la BOUTIQUE, y en una
+  // exportación anterior al borrado es sencillamente el estado del acuerdo vigente.
+  //
+  // En el ENTREGABLE las dos quedan `fuera`, y no por comodidad: ninguna tiene `evidencia_id`,
+  // así que el eje de poda de este ámbito —derechos de uso sobre material de terceros— no las
+  // alcanza siquiera. Y el contrato del paquete es «material citable con sus derechos», no el
+  // expediente de la relación comercial: `acuerdo_disposicion.base` cita cláusula, contrato o
+  // acta, que es lo más lejano al material que hay en todo el esquema. Mismo criterio con el
+  // que ya están fuera el método, la medición y el post mortem.
+  { tabla: 'acuerdo_disposicion', orden: 'version, id', poda: { modo: 'fuera' } },
+  { tabla: 'constancia_disposicion', orden: 'acuerdo_version, id', poda: { modo: 'fuera' } },
 ] as const satisfies readonly EntradaCatalogo[];
 
 /** Tablas que viajan en un paquete `entregable`. DERIVADA del catálogo, no una lista

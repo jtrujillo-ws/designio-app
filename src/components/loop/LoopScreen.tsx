@@ -12,6 +12,7 @@ import { cerrarSesion } from '@/lib/auth/auth.functions';
 import type { ArbolWorkspace } from '@/lib/arbol/arbol.schemas';
 import { LOOP_BANCO_ANDINO, type JourneyLoop } from '@/lib/loop/loop-data';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
+import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
 /** Pantalla Loop J1–J7 — recreación de la referencia hifi del design system (ui_kits/designio). */
 
@@ -422,6 +423,14 @@ function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) 
       <Link to="/exportacion" style={{ ...item, textDecoration: 'none' }}>
         <span>Exportación del workspace</span>
       </Link>
+      {/* La disposición la acuerdan y la ejecutan las dos partes del contrato (RF-01.9): el
+          enlace no aparece para los demás roles y, si lo teclean, la pantalla les dirá el
+          motivo que da la propia base en vez de ofrecerles un botón que va a rechazar. */}
+      {(ROLES_DISPOSICION as readonly string[]).includes(rol) && (
+        <Link to="/disposicion" style={{ ...item, textDecoration: 'none' }}>
+          <span>Disposición del workspace</span>
+        </Link>
+      )}
       {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para
           los demás roles y, si lo teclean, la RLS de evento_dominio no les da filas. */}
       {(ROLES_AUDITORIA as readonly string[]).includes(rol) && (

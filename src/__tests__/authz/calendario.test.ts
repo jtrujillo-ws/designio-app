@@ -693,8 +693,15 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * llama igual que si estuviera escrita fuera. Se extrae y se analiza por su cuenta,
        * deshaciendo la duplicación de comillas; cada nivel quita una capa, así que la
        * recursión termina.
+       *
+       * Y el literal puede ir ENVUELTO: `execute format('select now()::date')` es la forma
+       * normal de componer SQL dinámico en plpgsql, y el catálogo la conserva —comprobado—.
+       * Se admiten las llamadas envolventes que haya delante.
+       *
+       * LÍMITE DECLARADO: `execute v_sql`, con la consulta en una variable, no se puede leer
+       * desde el texto; y un `format` con marcadores mete trozos que aquí no están.
        */
-      [...conLiterales.matchAll(/\bexecute\s+[A-Za-z_]*&?'((?:[^']|'')*)'/gi)].some((m) =>
+      [...conLiterales.matchAll(/\bexecute\s+(?:\w+\s*\(\s*)*[A-Za-z_]*&?'((?:[^']|'')*)'/gi)].some((m) =>
         culpable(m[1]!.replace(/''/g, "'"), 'sql'),
       )
     );
@@ -1302,6 +1309,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "(now() at time zone current_setting('TimeZone'))::date",
       // Y el SQL dentro de un EXECUTE, que el vaciado de literales se llevaba.
       "execute 'select now()::date'",
+      "execute format('select now()::date')",
       '(((now())::text)::timestamp with time zone)::date',
       "to_char(now(), E'YYYY'::text)",
       // El formato de `to_char` que SÍ lee el calendario, y `SSSS` —segundos desde
@@ -1489,6 +1497,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "(now() at time zone 'UTC')::date",
       // Ni un EXECUTE cuyo SQL no lee el calendario.
       "execute 'select 1'",
+      "execute format('select 1')",
       // Y los formatos que NO leen el calendario: texto entrecomillado y campos por debajo
       // del minuto (ningún huso tiene desfase con segundos — medido sobre los 499).
       "to_char(now(), '\"fijo\"')",

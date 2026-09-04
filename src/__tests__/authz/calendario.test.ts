@@ -33,6 +33,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
 
   afterAll(async () => {
     await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
+    await sqlAdmin().unsafe('drop table if exists censo_probe_particionada cascade');
     await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
     await cerrarPools();
   }, PACIENCIA);
@@ -280,6 +281,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * dos tablas donde el mismo nombre de columna signifique cosas distintas, ese caso no se
      * puede escribir.
      */
+    /*
+     * Y una PARTICIONADA, que no es `relkind = 'r'` y por eso no entraba en el inventario. El
+     * cuerpo guardado escribe contra el nombre del PADRE, no contra la partición, así que sin
+     * ella el tipo de `censo_probe_particionada.d` no existe y la coerción no se ve.
+     */
+    await sqlAdmin().unsafe('drop table if exists censo_probe_particionada cascade');
+    await sqlAdmin().unsafe(
+      'create table censo_probe_particionada (k int, d date) partition by range (k)',
+    );
+    await sqlAdmin().unsafe(
+      'create table censo_probe_particionada_p0 partition of censo_probe_particionada' +
+        ' for values from (0) to (1000)',
+    );
     await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
     await sqlAdmin().unsafe(
       'create table censo_probe_otra (k int primary key, d timestamptz)',
@@ -1780,11 +1794,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        */
       const proyeccionDe = (consulta: string): string[] => {
         const t = consulta.trim();
+        const dolar = /^execute\s+\$([A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$([\s\S]*?)\$\1\$/i.exec(t);
         const dinamico = /^execute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'))/i.exec(t);
         const sql =
-          dinamico === null
-            ? t
-            : dinamico[1]!.replace(/^[A-Za-z_]*&?'/, '').replace(/'$/, '').replace(/''/g, "'");
+          dolar !== null
+            ? dolar[2]!
+            : dinamico === null
+              ? t
+              : dinamico[1]!.replace(/^[A-Za-z_]*&?'/, '').replace(/'$/, '').replace(/''/g, "'");
         return /^\s*select\b/i.test(sql) ? proyectadas(sql) : [];
       };
       /** `<destinos>` de un `into` o de un `for`, en minúsculas y sin comillas. */
@@ -1798,11 +1815,32 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         ...conLiterales.matchAll(/\bfor\s+([^;]*?)\s+in\s+([\s\S]*?)\s+loop\b/gi),
       ].flatMap((m) => porPosicionDeNombre(listaDeDestinos(m[1]!), proyeccionDe(m[2]!)));
       const dinamicas = [
+        /*
+         * En las DOS ortografías del literal. La de dólar la lee el recorrido de SQL dinámico
+         * desde hace tiempo, pero ahí se analiza sin el tipo del destino y `select now()` por
+         * su cuenta es seguro; el tipo está en el `into` de fuera, y hasta aquí solo llegaba la
+         * de comillas simples. Medido: `execute $q$select now()$q$ into d` con `d date` da
+         * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+         */
         ...conLiterales.matchAll(
-          /\bexecute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'))\s+into\s+(?:strict\s+)?([^;]*)/gi,
+          /\bexecute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'|\$(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$[\s\S]*?\$(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$))\s+into\s+(?:strict\s+)?([^;]*)/gi,
         ),
       ].flatMap((m) =>
         porPosicionDeNombre(listaDeDestinos(m[2]!), proyeccionDe(`execute ${m[1]!}`)),
+      );
+      /*
+       * Y el `FOREACH … IN ARRAY`, que asigna ELEMENTO a elemento y por eso no es un `for` de
+       * consulta: lo que llega al destino es cada elemento del array, con la misma coerción.
+       * Medido: `declare d date; begin foreach d in array array[now()] loop … end loop; end`
+       * escribe 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12. El array se
+       * entrega entero porque `hojasDelValor` ya baja por los corchetes.
+       */
+      const recorridos = [
+        ...conLiterales.matchAll(
+          /\bforeach\s+([^;]*?)\s+in\s+array\s+([\s\S]*?)\s+loop\b/gi,
+        ),
+      ].flatMap((m) =>
+        listaDeDestinos(m[1]!).some((n) => nombres.includes(n)) ? [m[2]!] : [],
       );
       /*
        * El cursor trae su consulta de donde se declaró —o de su `open … for`—, así que el
@@ -1830,6 +1868,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         ...entradas,
         ...bucles,
         ...dinamicas,
+        ...recorridos,
         ...cursores,
       ];
       return derechas.some((d) => hojasDelValor(d).some((hoja) => RELOJ_A_SECAS.test(hoja)));
@@ -1844,13 +1883,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * sabe leer; `information_schema` dice `ARRAY` para lo tercero y habría hecho falta un
      * segundo vocabulario para lo mismo.
      */
+    /*
+     * `relkind in ('r', 'p')`: una tabla PARTICIONADA no es `'r'`, y el cuerpo guardado escribe
+     * contra el nombre del PADRE, no contra la partición. Sin ella en el inventario, `padre.d`
+     * no tiene tipo y la coerción no se ve. Medido: `insert into padre(k, d) values (1, now())`
+     * sobre un padre con `d date` guarda 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en
+     * Etc/GMT+12.
+     */
     const columnas = await sqlAdmin()`
       select c.relname as tabla, a.attname as columna, a.attnum as posicion,
              format_type(a.atttypid, a.atttypmod) as tipo
       from pg_attribute a
       join pg_class c on c.oid = a.attrelid
       join pg_namespace n on n.oid = c.relnamespace
-      where n.nspname = 'public' and c.relkind = 'r' and a.attnum > 0 and not a.attisdropped
+      where n.nspname = 'public' and c.relkind in ('r', 'p')
+        and a.attnum > 0 and not a.attisdropped
       order by c.relname, a.attnum`;
     const TIPO_DE_COLUMNA = new Map<string, string>();
     const COLUMNAS_EN_ORDEN = new Map<string, string[]>();
@@ -4774,6 +4821,30 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        *   fetch c into d   con `c cursor for …`   el cursor trae su consulta de otro sitio
        *   execute 'select now()' into d           el tipo que coerciona está FUERA del literal
        */
+      /*
+       * Tres formas más, medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12:
+       *
+       *   execute $q$select now()$q$ into d    la otra ortografía del literal
+       *   foreach d in array array[now()]      el bucle de arrays asigna elemento a elemento
+       *   insert into <particionada>(…)        el padre no estaba en el inventario
+       */
+      [
+        'censo_probe_execute_dolar_into_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          ' execute $q$select now()$q$ into d; return d; end $c$',
+      ],
+      [
+        'censo_probe_foreach_date',
+        'returns void language plpgsql as $c$ declare d date; begin' +
+          ' foreach d in array array[now()] loop' +
+          ' insert into censo_probe_escritura(k, d) values (1, d); end loop; end $c$',
+      ],
+      [
+        'censo_probe_particionada_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into censo_probe_particionada(k, d) values (1, now()); end $c$',
+      ],
       [
         'censo_probe_bucle_for_date',
         'returns date language plpgsql as $c$ declare d date; begin' +
@@ -5276,6 +5347,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_parametro_default_date',
           'censo_probe_tabla_unicode_date',
           'censo_probe_returning_into_date',
+          'censo_probe_execute_dolar_into_date',
+          'censo_probe_foreach_date',
+          'censo_probe_particionada_date',
           'censo_probe_bucle_for_date',
           'censo_probe_bucle_for_execute_date',
           'censo_probe_fetch_date',
@@ -5401,6 +5475,9 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_ok_derivada_otra_columna',
         'censo_probe_ok_alias_fecha_fija',
         'censo_probe_returning_into_date',
+        'censo_probe_execute_dolar_into_date',
+        'censo_probe_foreach_date',
+        'censo_probe_particionada_date',
         'censo_probe_bucle_for_date',
         'censo_probe_bucle_for_execute_date',
         'censo_probe_fetch_date',

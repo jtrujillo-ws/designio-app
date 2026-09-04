@@ -1355,6 +1355,69 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
   });
 
+  it('perder el rol con la llamada EN VUELO no borra su coste: el cierre es un hecho consumado', async () => {
+    // El otro extremo del mismo reloj. Antes del apunte, perder el rol impide despachar — eso
+    // es autorizar. Después del apunte el material YA salió y el proveedor YA cobró, y lo
+    // único que queda es anotar lo que pasó. Son dos preguntas distintas, y `cerrarLlamadas`
+    // ya lo tenía dicho: se salta `exigirCuentaActiva` a propósito porque aquí no se actúa.
+    //
+    // La política de completar no lo tenía. Exigía rol curador, así que una degradación con la
+    // llamada en vuelo escondía la fila del UPDATE —filtra, no rechaza— y la línea se quedaba
+    // en `despachada` para siempre: sin desenlace, sin tokens, sin coste y sin su evento. Una
+    // llamada pagada perdiendo su rastro es exactamente lo que este slice existe para impedir.
+    const admin = sqlAdmin();
+    const itemId = await nuevoItem('Entrevista de quien se degrada a media llamada', 'entrevista');
+    await registrarConsentimiento(leadId, {
+      workspaceId: ws,
+      itemId,
+      alcance: 'Autoriza el procesamiento por el proveedor AI',
+      procesamientoExterno: true,
+    });
+    const [miembro] = await admin`select id, rol from miembro
+      where usuario_id = ${disenadorId} and workspace_id = ${ws}`;
+    try {
+      await conProveedor(RESPUESTA_CI, async () => {
+        // La degradación ocurre con la línea ya abierta y el material en el aire.
+        proveedor.duranteLlamada = async () => {
+          await admin`update miembro set rol = 'stakeholder' where id = ${miembro!.id as string}`;
+        };
+        try {
+          // La generación NO llega a término, y eso es lo correcto: persistir el lote sí es
+          // una escritura de dominio —nacen `propuesta_ai`— y quien ya no es curador no puede
+          // hacerla. Lo que este caso exige es que el GASTO no se pierda por el camino.
+          await expect(
+            generarPropuestas(disenadorId, {
+              workspaceId: ws,
+              capacidad: 'CI',
+              anclaId: itemId,
+            }),
+          ).rejects.toThrow();
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+
+      // La línea se cerró con su desenlace y su coste: el gasto no se pierde.
+      const [linea] = await admin`select resultado, costo_usd, tokens_entrada, cerrado_en
+        from llamada_ai where workspace_id = ${ws} and item_id = ${itemId}`;
+      expect(linea!.resultado).toBe('salida-valida');
+      expect(linea!.costo_usd).not.toBeNull();
+      expect(linea!.tokens_entrada).not.toBeNull();
+      expect(linea!.cerrado_en).not.toBeNull();
+      // Y ninguna propuesta nació: el dominio no cambia por una llamada que nadie podía pedir.
+      const propuestas = await admin`select 1 as x from propuesta_ai where item_id = ${itemId}`;
+      expect(propuestas.length).toBe(0);
+    } finally {
+      await admin`update miembro set rol = ${miembro!.rol as string}
+        where id = ${miembro!.id as string}`;
+      await admin`delete from propuesta_ai where item_id = ${itemId}`;
+      await admin`delete from reserva_ai where item_id = ${itemId}`;
+      await admin`delete from llamada_ai where item_id = ${itemId}`;
+      await admin`delete from consentimiento_item where item_id = ${itemId}`;
+      await admin`delete from item_importacion where id = ${itemId}`;
+    }
+  });
+
   it('revocar mientras el material viaja: la llamada ya salió, pero ninguna propuesta nace', async () => {
     const itemId = await nuevoItem('Entrevista revocada a media llamada', 'entrevista');
     await registrarConsentimiento(leadId, {

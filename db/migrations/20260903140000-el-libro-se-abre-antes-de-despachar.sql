@@ -103,17 +103,34 @@ comment on column llamada_ai.cerrado_en is
 -- un desenlace y un coste inventados que el libro atribuiría a quien la abrió, y de paso
 -- dejar que el cierre legítimo no encontrara ya su fila. Una política de escritura que no
 -- fija al autor no es la misma política que la de inserción, y aquí tenían que serlo.
+--
+-- ── Membresía sí, ROL no, y la diferencia es la del slice entero ──
+-- Cerrar no autoriza nada: anota lo que YA pasó, en una línea que quien cierra abrió él
+-- mismo y que el proveedor ya cobró. Es la misma razón por la que `cerrarLlamadas` se salta
+-- `exigirCuentaActiva` a propósito — «anotar lo que pasó y autorizar lo que viene son dos
+-- preguntas distintas»—, y aquí faltaba la otra mitad de ese razonamiento.
+--
+-- Con el rol dentro, una degradación a stakeholder con la llamada EN VUELO escondía la fila
+-- del UPDATE —la política filtra, no rechaza— y la línea se quedaba en `despachada` para
+-- siempre: sin desenlace, sin tokens, sin coste y sin su evento, y la salida buena tirada.
+-- Una llamada pagada perdiendo su rastro es exactamente lo que este slice existe para
+-- impedir, y aquí lo causaba el propio candado.
+--
+-- Se conserva la MEMBRESÍA porque es el suelo de tenencia de toda la base: a un workspace
+-- del que ya no formas parte no se le escribe, y ahí el modo degradado que este cambio
+-- declara —la línea consta con menos detalle, sigue contando para el tope y conserva ancla,
+-- modelo, credencial y consentimiento— es la respuesta correcta y no una pérdida.
 create policy llamada_completar on llamada_ai
   for update
   using (
     resultado = 'despachada'
     and creado_por = app_user_id()
-    and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and is_workspace_member(app_user_id(), workspace_id)
   )
   with check (
     resultado <> 'despachada'
     and creado_por = app_user_id()
-    and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and is_workspace_member(app_user_id(), workspace_id)
   );
 
 -- Solo las seis columnas del desenlace. `creado_en` sigue fuera por el mismo motivo que en el

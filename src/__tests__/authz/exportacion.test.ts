@@ -539,6 +539,40 @@ describeAuthz('exportación del workspace: completitud, derechos y aislamiento',
     expect(porDefecto.despues).toBe(porDefecto.antes + 1);
   });
 
+  it('el archivo entregado lleva DENTRO su propio registro de exportación, y completo', async () => {
+    /*
+     * `registrar_exportacion` crea la fila incompleta al autorizar y `confirmar_exportacion`
+     * la completa. Con la confirmación al FINAL, el catálogo volcaba `exportacion_registro`
+     * antes de llegar a ella y —como la transacción ve sus propias escrituras— el paquete se
+     * llevaba su propio registro con `completado_en` en nulo: en la primera exportación de un
+     * workspace, un archivo sin ninguna prueba completa dentro, justo el documento que
+     * después hay que cotejar contra la constancia. La confirmación va ahora antes del
+     * volcado; lo que garantiza que la fila acredite una exportación COMPLETA no es dónde se
+     * llame sino la transacción, que se lleva la fila entera si el volcado revienta.
+     */
+    const admin = sqlAdmin();
+    const wsNuevo = (await admin`insert into workspace (nombre)
+      values (${marca + ' registro-dentro'}) returning id`)[0]!.id as string;
+    try {
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsNuevo}, ${leadId}, 'x', ${marca + '-dentro@test.demo'}, 'lead-boutique')`;
+
+      const { datos } = await exportarWorkspace(leadId, {
+        workspaceId: wsNuevo,
+        ambito: 'archivo',
+      });
+      const registros = datos.exportacion_registro ?? [];
+      expect(registros.length).toBe(1);
+      expect(registros[0]!.completado_en).not.toBeNull();
+      expect(registros[0]!.ambito).toBe('archivo');
+    } finally {
+      await admin`delete from evento_dominio where workspace_id = ${wsNuevo}`;
+      await admin`delete from exportacion_registro where workspace_id = ${wsNuevo}`;
+      await admin`delete from miembro where workspace_id = ${wsNuevo}`;
+      await admin`delete from workspace where id = ${wsNuevo}`;
+    }
+  });
+
   it('una cuenta desactivada con sesión viva no exporta (re-check de estado)', async () => {
     const admin = sqlAdmin();
     await admin`update usuario set estado = 'inactivo' where id = ${leadId}`;

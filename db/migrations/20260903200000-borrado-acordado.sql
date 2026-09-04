@@ -377,7 +377,14 @@ create table constancia_disposicion (
   remediacion_con_consentimiento integer not null check (remediacion_con_consentimiento >= 0),
   ejecutado_por uuid not null references usuario(id),
   ejecutado_rol text not null,
-  ejecutado_en timestamptz not null default now(),
+  -- `clock_timestamp()` y no `now()`, que es el inicio de la TRANSACCIÓN. Bajo READ
+  -- COMMITTED —que esta disposición exige— cada sentencia abre instantánea nueva, así que una
+  -- transacción que arranca mientras una exportación válida está en vuelo ve su confirmación
+  -- posterior y ejecuta correctamente… y sellaba un `ejecutado_en` ANTERIOR a su propio
+  -- `exportado_en`. El documento se contradecía a sí mismo: certificaba haberse ejecutado
+  -- antes de la exportación que declara previa. El instante que se sella tiene que ser el de
+  -- escribir la fila, no el de abrir la transacción que la escribe.
+  ejecutado_en timestamptz not null default clock_timestamp(),
   -- QUÉ cubre esta constancia y qué NO, dicho dentro del documento sellado y no en una
   -- página de ayuda que nadie conserva. Se almacena por fila —aunque hoy sea constante— y
   -- viaja dentro del sello porque una constancia emitida bajo este contrato tiene que
@@ -960,7 +967,17 @@ begin
   -- candado todavía no ha dejado quieta. Y basta la versión, sin la modalidad: `unique
   -- (workspace_id, version)` hace que una versión identifique una fila y solo una, así que si
   -- la versión coincide, todo lo demás coincide por construcción.
-  if v_ac.version <> p_version_esperada then
+  --
+  -- `is distinct from` y no `<>`, y un rechazo explícito del nulo antes: con `<>`, un
+  -- `ejecutar_disposicion(ws, NULL)` producía NULL, que plpgsql no toma por verdadero, así
+  -- que el `if` no disparaba y la función seguía adelante ejecutando el acuerdo vigente —la
+  -- garantía entera eludida pasando nada—. El nulo se rechaza aparte porque merece su propio
+  -- mensaje: no es «confirmaste otra versión», es «no confirmaste ninguna».
+  if p_version_esperada is null then
+    raise exception 'la disposición se ejecuta confirmando QUÉ acuerdo se vio: falta la versión esperada'
+      using errcode = 'DS002';
+  end if;
+  if v_ac.version is distinct from p_version_esperada then
     raise exception 'el acuerdo vigente es el #% («%») y se confirmó el #%: no se ejecuta lo que no se vio. Vuelve a mirarlo y confírmalo',
       v_ac.version, v_ac.modalidad, p_version_esperada using errcode = 'DS002';
   end if;

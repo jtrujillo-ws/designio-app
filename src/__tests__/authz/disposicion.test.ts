@@ -938,6 +938,13 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       conUsuario(adminId, (tx) => tx`select ejecutar_disposicion(${ws})`),
     ).rejects.toMatchObject({ code: '42883' });
 
+    // Ni pasando NULL, que es la puerta que deja abierta un `<>`: en SQL el resultado sería
+    // NULL, plpgsql no lo toma por verdadero, el `if` no dispara y la función seguiría
+    // ejecutando el acuerdo vigente. La garantía entera eludida pasando nada.
+    await expect(
+      conUsuario(adminId, (tx) => tx`select ejecutar_disposicion(${ws}, null)`),
+    ).rejects.toMatchObject({ code: 'DS002' });
+
     // El workspace sigue entero: no se ejecutó ni el acuerdo viejo ni el nuevo.
     const [seg] = await sqlAdmin()`select count(*)::int as n from segmento
       where workspace_id = ${ws}`;
@@ -1000,6 +1007,57 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const [ac] = await sqlAdmin()`select modalidad from acuerdo_disposicion
       where workspace_id = ${ws} order by version desc limit 1`;
     expect(ac!.modalidad).toBe('archivo');
+  });
+
+  it('la constancia se sella con el instante REAL de ejecutarla, no con el inicio de su transacción', async () => {
+    /*
+     * `ejecutado_en` valía `now()`, que es el inicio de la TRANSACCIÓN. Bajo READ COMMITTED
+     * —que esta disposición exige— cada sentencia abre instantánea nueva, así que una
+     * transacción que arranca mientras una exportación válida está en vuelo ve su
+     * confirmación posterior y ejecuta correctamente… sellando un `ejecutado_en` ANTERIOR a
+     * su propio `exportado_en`. El documento se contradecía a sí mismo: certificaba haberse
+     * ejecutado antes de la exportación que declara previa.
+     */
+    const ws = await nuevoWorkspace('instante-real');
+    await registrarAcuerdo(adminId, {
+      workspaceId: ws,
+      modalidad: 'borrado',
+      base: 'Acuerdo con exportación en vuelo',
+      efectivoDesde: new Date().toISOString().slice(0, 10),
+    });
+
+    let abierta!: () => void;
+    const arrancada = new Promise<void>((r) => {
+      abierta = r;
+    });
+    let exportado!: () => void;
+    const yaExportado = new Promise<void>((r) => {
+      exportado = r;
+    });
+
+    // La transacción de la disposición ABRE aquí: su `now()` queda fijado antes de que la
+    // exportación exista.
+    const disposicion = conUsuario(leadId, async (tx) => {
+      await tx`select 1`;
+      abierta();
+      await yaExportado;
+      const [r] = await tx`select ejecutar_disposicion(${ws}, 1) as c`;
+      return r!.c as Record<string, unknown>;
+    });
+
+    await arrancada;
+    await exportarWorkspace(leadId, { workspaceId: ws, ambito: 'archivo' });
+    exportado();
+    const c = await disposicion;
+
+    // Ejecutó —la instantánea nueva de READ COMMITTED sí ve la exportación— y el sello no se
+    // contradice: el instante de ejecutar es POSTERIOR al de exportar.
+    const [f] = await sqlAdmin()`select ejecutado_en > exportado_en as coherente,
+        ejecutado_en > (select acordado_en from acuerdo_disposicion
+                        where workspace_id = ${ws}) as tras_el_acuerdo
+      from constancia_disposicion where id = ${c.id as string}`;
+    expect(f!.coherente).toBe(true);
+    expect(f!.tras_el_acuerdo).toBe(true);
   });
 
   it('los conteos de un archivo cuadran tabla a tabla con lo que queda, y la única diferencia está declarada', async () => {

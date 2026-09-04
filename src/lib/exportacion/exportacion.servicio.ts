@@ -87,6 +87,24 @@ export async function exportarWorkspace(
     // RLS: un workspace ajeno simplemente no existe para esta sesión.
     if (!ws) throw new ErrorExportacion('El workspace no existe o no eres miembro');
 
+    /*
+     * El sello del registro, y va ANTES del volcado del catálogo a propósito.
+     *
+     * Estuvo al final, con el argumento de que «el registro tiene que acreditar una
+     * exportación completa». El argumento era falso: lo que garantiza eso NO es la posición
+     * de la llamada sino la TRANSACCIÓN — si el volcado revienta, el rollback se lleva la
+     * fila entera, esté confirmada o no. Y ponerla al final tenía un coste real: el catálogo
+     * vuelca `exportacion_registro`, la transacción ve sus propias escrituras, y el archivo
+     * entregado se llevaba su propio registro con `completado_en` en nulo. En la PRIMERA
+     * exportación de un workspace eso significa un paquete sin ninguna prueba completa
+     * dentro, justo el documento que después hay que cotejar contra la constancia.
+     *
+     * Lo que sí distingue el par autorizar/confirmar sigue en pie, porque no depende de
+     * dónde se llame: una llamada suelta a `registrar_exportacion` por SQL crudo deja la fila
+     * SIN completar, y una fila sin completar no desbloquea ninguna disposición.
+     */
+    await tx`select confirmar_exportacion(${entrada.workspaceId}, ${entrada.ambito})`;
+
     // Qué puede viajar en un entregable lo decide la VISTA de la base, no un where de la
     // app, y el predicado se aplica dentro de cada consulta: nada del séquito de una
     // evidencia bloqueada llega a materializarse.
@@ -142,12 +160,6 @@ export async function exportarWorkspace(
     const bytesIncluidos = archivos
       .filter((a) => a.contenidoBase64 !== null)
       .reduce((suma, a) => suma + a.bytes, 0);
-
-    // El sello de que esta exportación llegó al final. Va AQUÍ y no al principio: el registro
-    // que desbloquea una disposición tiene que acreditar una exportación COMPLETA, no una que
-    // se autorizó y se abandonó. La base exige que esta misma transacción haya pasado por
-    // `registrar_exportacion`, así que las dos mitades no se pueden separar.
-    await tx`select confirmar_exportacion(${entrada.workspaceId}, ${entrada.ambito})`;
 
     return {
       manifiesto: {

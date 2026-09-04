@@ -564,7 +564,20 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       envuelto(
         String.raw`${literalDe(lista)}|cast\s*\(\s*${PREFIJO}'(?:${lista})'\s+as\s+[\w. ]+\s*\)`,
       );
-    const PRIMER_ARGUMENTO = String.raw`(?:[^,()]|\([^()]*\))*`;
+    /*
+     * El PRIMER argumento de una llamada, hasta su coma de primer nivel. Dos niveles de
+     * paréntesis y no uno: con uno solo, `timezone((current_setting('TimeZone')), now())` no
+     * se podía consumir —el grupo exterior contiene los paréntesis de `current_setting`—, el
+     * patrón no casaba y la expresión pasaba entera, eligiendo día con el huso de la sesión
+     * (medido: 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12). Las dos alternativas
+     * empiezan por caracteres distintos en cada nivel, así que no hay ambigüedad que hacer
+     * retroceder al motor.
+     *
+     * LÍMITE DECLARADO: un tercer nivel de envoltura vuelve a escaparse. Una expresión regular
+     * no cuenta paréntesis; lo que se puede hacer es subir el techo cuando aparezca una forma
+     * real que lo pida.
+     */
+    const PRIMER_ARGUMENTO = String.raw`(?:[^,()]|\((?:[^()]|\([^()]*\))*\))*`;
     /*
      * `date_trunc` tiene una sobrecarga de TRES argumentos, y el tercero es el huso. Con un
      * literal fijo —`date_trunc('day', now(), 'UTC')`— el resultado es el mismo instante en
@@ -626,10 +639,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * `\s+` por medio el motor lo devuelve a cero y la aserción deja de guardar.
        */
       new RegExp(
-        String.raw`timezone\s*\((?!\s*${HUSO_LITERAL}\s*,)\s*${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*\)`,
+        String.raw`timezone\s*\((?!\s*${envuelto(HUSO_LITERAL)}\s*,)\s*${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*\)`,
         'i',
       ),
-      new RegExp(String.raw`(${RELOJ})\s*at\s+time\s+zone(?!\s+${HUSO_LITERAL})\s+`, 'i'),
+      new RegExp(
+        String.raw`(${RELOJ})\s*at\s+time\s+zone(?!\s+${envuelto(HUSO_LITERAL)})\s+`,
+        'i',
+      ),
       new RegExp(String.raw`(${RELOJ})\s*::\s*${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
       new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
@@ -762,8 +778,27 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
        * LÍMITE DECLARADO: `execute v_sql`, con la consulta en una variable, no se puede leer
        * desde el texto; y un `format` con marcadores mete trozos que aquí no están.
        */
-      [...conLiterales.matchAll(/\bexecute\s+(?:\w+\s*\(\s*)*[A-Za-z_]*&?'((?:[^']|'')*)'/gi)].some((m) =>
-        culpable(m[1]!.replace(/''/g, "'"), 'sql'),
+      [
+        ...conLiterales.matchAll(
+          /\bexecute\s+(?:\w+\s*\(\s*)*((?:[A-Za-z_]*&?'(?:[^']|'')*'\s*(?:\|\|\s*)?)+)/gi,
+        ),
+      ].some((m) =>
+        /*
+         * La cadena ENTERA, no el primer literal. `execute 'select now()' || '::date'` ejecuta
+         * una consulta que depende del huso, y leyendo solo el primer trozo se leía
+         * `select now()` —seguro— y la función pasaba limpia. El SQL que se ejecuta es la
+         * concatenación, así que es la concatenación lo que se analiza.
+         *
+         * LÍMITE DECLARADO, el mismo de siempre y ahora con una forma más: si en medio de la
+         * concatenación hay una VARIABLE, sus trozos no están en el texto. La cadena se corta
+         * ahí, igual que `execute v_sql` no se puede leer.
+         */
+        culpable(
+          [...m[1]!.matchAll(/[A-Za-z_]*&?'((?:[^']|'')*)'/g)]
+            .map((l) => l[1]!.replace(/''/g, "'"))
+            .join(''),
+          'sql',
+        ),
       )
     );
   };
@@ -797,6 +832,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    *    viene a evitar. El precio es que un literal por dólar que contuviera `--` se leería
    *    como comentario; queda dicho, y no existe ninguno en el esquema.
    */
+  /** Lo que puede ir DELANTE de una barra que abre una expresión regular. */
+  const ABRE_REGEX = /[([{,;:=!&|?+\-*%<>~^]/;
+  const PALABRAS_ANTES_DE_REGEX = new Set([
+    'return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'instanceof', 'do',
+    'else', 'yield', 'await',
+  ]);
   const sinComentarios = (
     texto: string,
     dialecto: 'sql' | 'ts' = 'sql',
@@ -848,6 +889,65 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         salida += c;
         i++;
         continue;
+      }
+      /*
+       * Un literal de EXPRESIÓN REGULAR de TypeScript, que empieza por la misma barra que un
+       * comentario. `const sep = /[/*]/;` es código válido —dentro de una clase de caracteres
+       * la barra no se escapa—, y el recorrido tomaba ese `/*` por el principio de un
+       * comentario de bloque: sin cierre por delante se comía el resto del fichero, consulta
+       * peligrosa incluida. Es la misma clase que el `--` dentro de un identificador
+       * entrecomillado: el guardián dejando de mirar sin que nada se ponga rojo.
+       *
+       * QUÉ barra abre una expresión regular es el problema clásico de leer JavaScript, y aquí
+       * se resuelve por el lado seguro: solo se toma por regex cuando lo ANTERIOR no puede
+       * cerrar un valor. Con una lista de lo que SÍ la abre —puntuación de operador o una
+       * palabra clave— en vez de una lista de lo que no: equivocarse hacia «es una división»
+       * deja el comportamiento de antes, y equivocarse hacia «es una regex» se comería código
+       * hasta la siguiente barra, que es justo el fallo que esto viene a cerrar. Por eso `}`
+       * queda fuera: cierra tanto un bloque como un objeto, y en la duda, división.
+       *
+       * `//` y `/*` nunca abren una regex —una regex vacía se escribe `/(?:)/` y un `*` inicial
+       * no tiene qué repetir—, así que esas dos formas se dejan a los comentarios de abajo y
+       * no hay ambigüedad que resolver.
+       *
+       * El contenido se sustituye por un espacio, y esa es la otra mitad: una regex NO es SQL
+       * ni puede llegar a ejecutarse como tal, así que copiarla solo servía para que una que
+       * mencione `current_date` saliera marcada.
+       */
+      if (modo === 'ts' && c === '/' && d !== '/' && d !== '*') {
+        let k = salida.length - 1;
+        while (k >= 0 && /\s/.test(salida[k]!)) k--;
+        const anterior = k >= 0 ? salida[k]! : '';
+        let j = k;
+        while (j >= 0 && /[A-Za-z_$]/.test(salida[j]!)) j--;
+        const palabra = salida.slice(j + 1, k + 1);
+        if (anterior === '' || ABRE_REGEX.test(anterior) || PALABRAS_ANTES_DE_REGEX.has(palabra)) {
+          i++;
+          let enClase = false;
+          while (i < texto.length) {
+            const ch = texto[i]!;
+            // Una regex no cruza el renglón: si se llega al salto, no era una regex y lo mejor
+            // que se puede hacer es soltarla ahí en vez de comerse el resto del fichero.
+            if (ch === '\n') break;
+            if (ch === '\\') {
+              i += 2;
+              continue;
+            }
+            if (enClase) {
+              if (ch === ']') enClase = false;
+              i++;
+              continue;
+            }
+            if (ch === '[') enClase = true;
+            else if (ch === '/') {
+              i++;
+              break;
+            }
+            i++;
+          }
+          salida += ' ';
+          continue;
+        }
       }
       // Comentario de bloque, igual en los dos dialectos.
       if (c === '/' && d === '*') {
@@ -1331,6 +1431,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * ejercitaba nada.
      */
     const PELIGROSAS = [
+      // El huso dinámico ENVUELTO: el paréntesis de más impedía consumir el argumento y el
+      // patrón no casaba. Medido: 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12.
+      "timezone((current_setting('TimeZone')), now())::date",
+      // Y el SQL de un EXECUTE compuesto por concatenación, en sus dos cortes.
+      "execute 'select now()' || '::date'",
+      "execute 'select ' || 'now()::date'",
       // La edad contra HOY, sin ningún reloj escrito: la forma de un solo argumento basta.
       'age(vence_en)',
       "select age(t.creado_en) > interval '30 days' from t",
@@ -1588,6 +1694,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // El huso FIJO sigue siendo el arreglo canónico y no se marca, en las dos sintaxis.
       "timezone('UTC', now())::date",
       "(now() at time zone 'UTC')::date",
+      // Y sigue siendo fijo con un paréntesis de más, que es la otra mitad de admitir la
+      // envoltura: sin ella, subir el techo de anidamiento habría marcado código correcto.
+      // Medido: 2026-09-04 en los dos husos.
+      "timezone(('UTC'), now())::date",
+      "(now() at time zone ('UTC'))::date",
       // Ni un EXECUTE cuyo SQL no lee el calendario.
       "execute 'select 1'",
       "execute format('select 1')",
@@ -1641,6 +1752,37 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * cuenta abierta en el primer cierre y se lleva por delante la consulta real hasta el
      * siguiente cierre o el final del fichero.
      */
+    /*
+     * Y la BARRA de una expresión regular, que es la misma con la que empieza un comentario.
+     * Dentro de una clase de caracteres no se escapa, así que `/[/*]/` lleva un `/*` que el
+     * recorrido tomaba por comentario de bloque y, sin cierre por delante, se comía el resto
+     * del fichero con la consulta peligrosa dentro.
+     */
+    expect(culpable('const sep = /[/*]/; const q = sql`select now()::date`;', 'ts')).toBe(true);
+    // Y con la otra forma dentro de la clase, que se llevaba solo hasta el fin de renglón.
+    expect(culpable('const sep = /[//]/;\nconst q = sql`select now()::date`;', 'ts')).toBe(true);
+    /*
+     * La otra mitad, y la que decide que la heurística vaya por el lado seguro: una DIVISIÓN
+     * no puede tomarse por regex. Si se tomara, el recorrido se comería desde ahí hasta la
+     * siguiente barra —la consulta de después incluida— y el censo daría verde sin mirar. Aquí
+     * hay dos divisiones y una consulta peligrosa en medio.
+     */
+    expect(
+      culpable('const a = b / c; const q = sql`select now()::date`; const d = e / f;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y la CLASE de caracteres tiene que consumirse entera, no hasta la primera barra de
+     * dentro: cortar ahí devuelve al recorrido el resto de la regex como si fuera código, y
+     * ese resto puede llevar una barra que abra otra «regex» que sí se coma la consulta. Aquí
+     * la clase esconde una barra y el cuerpo lleva `\/\*` escapado, que es lo que al cortar
+     * pronto deja un `*` delante de la barra siguiente.
+     */
+    expect(
+      culpable('const r = /[/]|\\/\\*/; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y una regex que MENCIONA una palabra del reloj es un dato, no una lectura: no se ejecuta
+    // como SQL nunca. Copiarla tal cual la marcaba.
+    expect(culpable('const r = /current_date/; const q = sql`select 1`;', 'ts')).toBe(false);
     // Un `--` DENTRO de un literal no abre comentario.
     expect(culpable("select '--', now()::date", 'sql')).toBe(true);
     // Ni un `//` dentro de una cadena de TypeScript.

@@ -139,27 +139,49 @@ create policy exportacion_registro_select on exportacion_registro
   for select using (is_workspace_member(app_user_id(), workspace_id));
 grant select on exportacion_registro to designio_app;
 
--- La misma función que ya autorizaba y auditaba, ahora dejando además el sello. Cuerpo copiado
--- del árbol migrado con `pg_get_functiondef`; el insert de abajo es el único cambio.
-create or replace function registrar_exportacion(p_ws uuid, p_ambito text) returns text
+-- `registrar_exportacion` NO cambia: sigue autorizando y auditando al PRINCIPIO, que es donde
+-- tiene que estar el permiso. El sello lo deja otra función, al final.
+--
+-- ── Qué acredita este registro, exactamente ──
+-- Acredita que una exportación autorizada llegó hasta el final EN UNA SOLA TRANSACCIÓN. No
+-- acredita que los bytes se entregaran, y ninguna función de esta base puede acreditarlo: la
+-- entrega ocurre fuera, y quien la haría es el mismo rol que llamaría aquí. Se dice en vez de
+-- fingirlo.
+--
+-- Lo que sí se cierra es que la fila nazca de una llamada suelta: `confirmar_exportacion` exige
+-- que ESTA MISMA transacción haya pasado por `registrar_exportacion` —comprobado contra el
+-- evento que aquélla escribe, cuyo `creado_en` es el `now()` de la transacción—, así que una
+-- exportación abandonada a medias no deja registro, y fabricar uno exige dos llamadas
+-- deliberadas en vez de una. Para lo que queda —un recibo de ENTREGA firmado por quien
+-- recibe— haría falta la firma que la constancia todavía no tiene; queda anotado junto a ella.
+create function confirmar_exportacion(p_ws uuid, p_ambito text) returns void
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_rol text;
 begin
-  if p_ambito not in ('archivo', 'entregable') then
-    raise exception 'ámbito de exportación desconocido: %', p_ambito;
-  end if;
   v_rol := workspace_role(app_user_id(), p_ws);
   if coalesce(v_rol, '') not in ('lead-boutique', 'admin-cliente') then
     raise exception 'solo lead-boutique o admin-cliente ejecutan la exportación del workspace'
       using errcode = 'insufficient_privilege';
   end if;
-  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-  values (p_ws, 'WorkspaceExportado', jsonb_build_object('ambito', p_ambito),
-          app_user_id(), v_rol);
+  -- Se identifica por `xmin`, que es qué transacción escribió la fila, y no por su reloj:
+  -- `evento_dominio.creado_en` usa `clock_timestamp()`, así que comparar contra `now()` —el
+  -- inicio de la transacción— no casa nunca, y comparar con `>=` dejaría entrar el evento de
+  -- otra transacción concurrente. `xmin` responde exactamente la pregunta que hay que hacer.
+  -- Vale porque `conUsuario` abre UNA transacción y nadie usa savepoints: con ellos `xmin`
+  -- sería el subxid y esto dejaría de casar.
+  if not exists (
+    select 1 from evento_dominio e
+    where e.workspace_id = p_ws and e.tipo = 'WorkspaceExportado'
+      and e.payload->>'ambito' = p_ambito
+      and e.actor_id = app_user_id()
+      and e.xmin = pg_current_xact_id()::xid)
+  then
+    raise exception 'no se puede sellar una exportación que no se autorizó en esta misma transacción: el registro acredita una exportación completa, no una llamada suelta'
+      using errcode = 'DS004';
+  end if;
   insert into exportacion_registro (workspace_id, ambito, ejecutado_por, ejecutado_rol)
   values (p_ws, p_ambito, app_user_id(), v_rol);
-  return v_rol;
 end $$;
 
 -- ── Y NO se migran los eventos viejos ─────────────────────────────────────────────────
@@ -501,7 +523,13 @@ begin
   -- `(workspace_id, version)` solo atrapaba a posteriori: leer el máximo y sumar uno es seguro
   -- porque nadie más está leyéndolo a la vez.
   perform pg_advisory_xact_lock(hashtextextended('designio:workspace:' || new.workspace_id, 42));
-  new.acordado_en := now();
+  -- `clock_timestamp()` y no `now()`: `now()` es el inicio de la TRANSACCIÓN, y entre ese
+  -- instante y este insert cabe una espera —la del candado de arriba, o la comprobación de la
+  -- cuenta— durante la cual una exportación puede confirmar. Con `now()` el acuerdo quedaría
+  -- fechado ANTES de esa exportación, y la comprobación de «la exportación es posterior al
+  -- acuerdo» la aceptaría: se dispondría sin haber exportado el estado que se acordó disponer.
+  -- El reloj del acto, no el de la puerta.
+  new.acordado_en := clock_timestamp();
   new.acordado_rol := workspace_role(app_user_id(), new.workspace_id);
   new.version := coalesce(
     (select max(a.version) + 1 from acuerdo_disposicion a
@@ -890,6 +918,7 @@ grant insert (workspace_id, modalidad, base, efectivo_desde, acordado_por)
 grant select on constancia_disposicion to designio_app;
 
 revoke execute on function
+  confirmar_exportacion(uuid, text),
   firmo_esta_disposicion(uuid, integer),
   sello_constancia(text),
   alcance_de_constancia(),
@@ -901,6 +930,7 @@ revoke execute on function
   ejecutar_disposicion(uuid)
 from public;
 grant execute on function
+  confirmar_exportacion(uuid, text),
   firmo_esta_disposicion(uuid, integer),
   disposicion_vigente(uuid),
   disposicion_motivo_no_ejecutable(uuid),

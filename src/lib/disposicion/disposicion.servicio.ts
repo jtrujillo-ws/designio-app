@@ -217,18 +217,21 @@ export async function ejecutarDisposicion(
     // la modalidad que se comprueba sea la que se va a ejecutar y no una foto anterior.
     await bloquearWorkspace(tx, entrada.workspaceId);
 
-    const [ac] = await tx`select modalidad from acuerdo_disposicion
+    const [ac] = await tx`select modalidad, version from acuerdo_disposicion
       where workspace_id = ${entrada.workspaceId} order by version desc limit 1`;
     if (!ac) {
       throw new ErrorDisposicion(
         'No hay acuerdo de disposición registrado: el acuerdo se registra antes de ejecutarlo, y es él quien dice si corresponde archivo o borrado (RF-01.9)',
       );
     }
-    // La pantalla mostró una modalidad; si el acuerdo vigente ya no es ésa, no se ejecuta. Un
-    // borrado irreversible no se dispara desde una pantalla que decía «archivo».
-    if (ac.modalidad !== entrada.modalidadEsperada) {
+    // La pantalla mostró UN acuerdo concreto; si el vigente ya no es ése, no se ejecuta. Se
+    // compara la VERSIÓN y no solo la modalidad: con dos borrados seguidos la etiqueta
+    // coincide y se destruiría el workspace conforme a una base contractual y una retención
+    // que quien ejecuta nunca vio.
+    const version = Number(ac.version);
+    if (ac.modalidad !== entrada.modalidadEsperada || version !== entrada.acuerdoVersionEsperada) {
       throw new ErrorDisposicion(
-        `El acuerdo vigente pasó a ser «${ac.modalidad}» mientras mirabas la pantalla, así que no se ejecuta lo que creías estar ejecutando («${entrada.modalidadEsperada}»). Vuelve a mirarlo y confírmalo.`,
+        `El acuerdo vigente pasó a ser el #${version} («${ac.modalidad}») mientras mirabas la pantalla, y tú confirmaste el #${entrada.acuerdoVersionEsperada} («${entrada.modalidadEsperada}»). No se ejecuta lo que no viste: vuelve a mirarlo y confírmalo.`,
       );
     }
 

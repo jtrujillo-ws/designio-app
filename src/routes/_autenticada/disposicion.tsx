@@ -12,6 +12,7 @@ import {
   panelDisposicionFn,
   registrarAcuerdoFn,
 } from '@/lib/disposicion/disposicion.functions';
+import { hoyCalendario } from '@/lib/fecha-calendario';
 import {
   cargaCanonicaConstancia,
   ROLES_DISPOSICION,
@@ -66,7 +67,10 @@ function PantallaDisposicion() {
   const [cargando, setCargando] = useState(true);
   const [modalidad, setModalidad] = useState<ModalidadDisposicion>('archivo');
   const [base, setBase] = useState('');
-  const [efectivoDesde, setEfectivoDesde] = useState(new Date().toISOString().slice(0, 10));
+  // `hoyCalendario` y no `toISOString().slice(0, 10)`: aquél recorta en UTC, así que en husos
+  // al oeste propone AYER y al este MAÑANA. En una retención eso desplaza un día el momento en
+  // que la disposición se puede ejecutar, sin que nadie lo note.
+  const [efectivoDesde, setEfectivoDesde] = useState(hoyCalendario());
   const [confirmacion, setConfirmacion] = useState('');
   const [trabajando, setTrabajando] = useState(false);
   const [constancia, setConstancia] = useState<ConstanciaDisposicion | null>(null);
@@ -143,7 +147,11 @@ function PantallaDisposicion() {
     setConstancia(null);
     try {
       const r = await ejecutarDisposicionFn({
-        data: { workspaceId, modalidadEsperada: panel.acuerdoVigente.modalidad },
+        data: {
+          workspaceId,
+          modalidadEsperada: panel.acuerdoVigente.modalidad,
+          acuerdoVersionEsperada: panel.acuerdoVigente.version,
+        },
       });
       if (!r.ok) setError(r.error);
       else {
@@ -407,9 +415,12 @@ function Constancia({ c, reciente }: { c: ConstanciaDisposicion; reciente: boole
           Cómo comprobar este sello por tu cuenta
         </summary>
         <p style={{ ...parrafo, color: 'var(--text-muted)', marginTop: 8 }}>
-          El sello es el sha256 del texto de abajo, en UTF-8 y sin salto final. Guárdalo y
-          ejecuta <code>printf &apos;%s&apos; &quot;$(cat constancia.txt)&quot; | sha256sum</code>:
-          tiene que dar el mismo valor. Si difiere, la copia que tienes no es la que se emitió.
+          El sello es el sha256 del texto de abajo, en UTF-8 y <strong>sin salto de línea
+          final</strong>. Guárdalo tal cual y ejecuta <code>sha256sum constancia.txt</code>:
+          tiene que dar el mismo valor. Si difiere, la copia que tienes no es la que se emitió —
+          y ojo, un salto final que añada el editor ya la cambia, que es justo lo que este
+          método detecta y lo que una sustitución de shell como <code>$(cat …)</code> se
+          comería sin avisar.
         </p>
         <p style={{ ...parrafo, color: 'var(--text-muted)', marginTop: 8 }}>
           Conviene saber hasta dónde llega: es un hash <strong>sin clave</strong>, así que

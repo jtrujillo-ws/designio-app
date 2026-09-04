@@ -143,6 +143,12 @@ export async function exportarWorkspace(
       .filter((a) => a.contenidoBase64 !== null)
       .reduce((suma, a) => suma + a.bytes, 0);
 
+    // El sello de que esta exportación llegó al final. Va AQUÍ y no al principio: el registro
+    // que desbloquea una disposición tiene que acreditar una exportación COMPLETA, no una que
+    // se autorizó y se abandonó. La base exige que esta misma transacción haya pasado por
+    // `registrar_exportacion`, así que las dos mitades no se pueden separar.
+    await tx`select confirmar_exportacion(${entrada.workspaceId}, ${entrada.ambito})`;
+
     return {
       manifiesto: {
         formato: 'whitespace-export/1',

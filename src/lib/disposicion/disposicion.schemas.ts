@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 
 /**
  * CTX-01 Disposición acordada — RF-01.9 (borrado o archivo posterior a la exportación, según
@@ -31,18 +32,31 @@ export const RegistrarAcuerdoSchema = z.object({
    * El mismo límite que la base, para que el rechazo llegue antes y con palabras.
    */
   base: z.string().trim().min(1).max(300),
-  /** La retención de RF-09.4: antes de esta fecha la disposición no se ejecuta. Es lo que
-   * impide que un borrado irreversible sea un clic. */
-  efectivoDesde: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'La fecha va en formato AAAA-MM-DD'),
+  /**
+   * La retención de RF-09.4: antes de esta fecha la disposición no se ejecuta. Es lo que
+   * impide que un borrado irreversible sea un clic.
+   *
+   * `FechaCalendarioSchema` y no una expresión regular de forma: `2026-02-31` tiene la forma
+   * correcta y no existe, así que pasaba el esquema y reventaba después en el `::date` con un
+   * 22008 que nadie traduce — un 500 en vez de un mensaje. El repositorio ya tenía el
+   * validador que mira el calendario de verdad.
+   */
+  efectivoDesde: FechaCalendarioSchema,
 });
 export type RegistrarAcuerdo = z.infer<typeof RegistrarAcuerdoSchema>;
 
 export const EjecutarDisposicionSchema = z.object({
   workspaceId: z.string().uuid(),
-  /** La modalidad que la persona CREE estar ejecutando. No decide nada —manda el acuerdo
-   * vigente— pero si no coincide se rechaza: un borrado irreversible no se dispara desde una
-   * pantalla que mostraba otra cosa porque alguien registró un acuerdo nuevo entre medias. */
+  /** La modalidad que la persona CREE estar ejecutando. */
   modalidadEsperada: ModalidadDisposicionSchema,
+  /**
+   * Y la VERSIÓN del acuerdo que tenía delante. La modalidad sola no basta: si la pantalla
+   * muestra el borrado v1 y la otra parte registra y exporta un v2 que también es borrado, la
+   * modalidad sigue coincidiendo y se destruiría el workspace conforme a una base contractual
+   * y una retención que quien ejecuta nunca vio. Lo que hay que confirmar es el acuerdo, no su
+   * etiqueta.
+   */
+  acuerdoVersionEsperada: z.number().int().min(1),
 });
 export type EjecutarDisposicion = z.infer<typeof EjecutarDisposicionSchema>;
 

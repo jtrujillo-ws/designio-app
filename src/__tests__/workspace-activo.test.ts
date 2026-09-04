@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { membresiaActivaDe, wsDeBusqueda } from '@/lib/auth/workspace-activo';
+import {
+  elWorkspacePedidoNoEsElActivo,
+  membresiaActivaDe,
+  wsDeBusqueda,
+} from '@/lib/auth/workspace-activo';
 
 /**
  * Resolución del workspace activo de navegación: `ws` elige, lo malformado se ignora
@@ -45,5 +49,30 @@ describe('workspace activo (navegación multi-membresía)', () => {
     expect(membresiaActivaDe([a, b], b.workspaceId)?.workspaceId).not.toBe(
       membresiaActivaDe([a, b], a.workspaceId)?.workspaceId,
     );
+  });
+
+  /*
+   * Y saber que la caída OCURRIÓ, que es lo que la pantalla de la disposición necesita para no
+   * callárselo. La caída está bien para navegar; lo que no puede es ser invisible delante de un
+   * botón que destruye.
+   */
+  it('la sustitución silenciosa se puede preguntar', () => {
+    const OTRO = '33333333-3333-4333-8333-333333333333';
+    expect(elWorkspacePedidoNoEsElActivo([a, b], OTRO)).toBe(true);
+  });
+
+  it('pedir uno que SÍ es tuyo no es una sustitución, aunque no sea el primero', () => {
+    // La mitad que acota: sin ella bastaría con «hay un ws en la dirección» y la pantalla
+    // gritaría en el caso normal de cambiar de workspace a propósito.
+    expect(elWorkspacePedidoNoEsElActivo([a, b], a.workspaceId)).toBe(false);
+    expect(elWorkspacePedidoNoEsElActivo([a, b], b.workspaceId)).toBe(false);
+  });
+
+  it('ni entrar sin pedir nada, ni no tener ninguna membresía', () => {
+    // Sin `ws` no hay nada que sustituir: la primera es la elección por omisión, no un
+    // reemplazo. Y con cero membresías no se cayó a ninguna parte — de eso habla la pantalla
+    // por su cuenta, y avisar aquí sería avisar de algo que no pasó.
+    expect(elWorkspacePedidoNoEsElActivo([a, b], undefined)).toBe(false);
+    expect(elWorkspacePedidoNoEsElActivo([], '33333333-3333-4333-8333-333333333333')).toBe(false);
   });
 });

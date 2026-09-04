@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { createFileRoute, useNavigate, useSearch } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Input } from '@/components/ui/Input';
@@ -13,6 +13,7 @@ import {
   registrarAcuerdoFn,
 } from '@/lib/disposicion/disposicion.functions';
 import { hoyCalendario } from '@/lib/fecha-calendario';
+import { elWorkspacePedidoNoEsElActivo, wsDeBusqueda } from '@/lib/auth/workspace-activo';
 import {
   CONFIRMACION_BORRADO,
   cargaCanonicaConstancia,
@@ -71,9 +72,26 @@ function instanteUTC(iso: string): string {
 }
 
 function PantallaDisposicion() {
-  const { membresiaActiva } = Route.useRouteContext();
+  const { membresiaActiva, usuario } = Route.useRouteContext();
   const navigate = useNavigate();
   const workspaceId = membresiaActiva?.workspaceId;
+  /*
+   * QUÉ workspace se va a disponer, dicho en la pantalla y no solo sabido por ella.
+   *
+   * `membresiaActivaDe` cae a la primera membresía cuando el `ws` de la dirección no es
+   * ninguna de las tuyas — y eso está bien para navegar: entrar por un enlace viejo no debería
+   * dejarte en una pantalla vacía. Pero es SILENCIOSO, y aquí el silencio no vale: recargar
+   * después de borrar el workspace que iba en la URL te deja en OTRO, con el mismo aspecto y
+   * los mismos botones, y uno de esos botones destruye. Quien mire puede creer que sigue en el
+   * anterior y acabar borrando el que no era.
+   *
+   * Así que el nombre acompaña a la cabecera y a cada acción, y la sustitución se dice cuando
+   * ocurre. El predicado vive en el módulo del workspace activo, junto a la caída que avisa,
+   * para poder comprobarlo sin montar React.
+   */
+  const nombreWs = membresiaActiva?.workspaceNombre ?? '';
+  const wsPedido = wsDeBusqueda((useSearch({ strict: false }) as { ws?: unknown }).ws);
+  const sustituido = elWorkspacePedidoNoEsElActivo(usuario.membresias, wsPedido);
 
   const [panel, setPanel] = useState<PanelDisposicion | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -214,13 +232,21 @@ function PantallaDisposicion() {
           confirmacion,
         },
       });
-      if (!r.ok) setError(r.error);
-      else {
+      if (r.ok) {
         setConstancia(r.constancia);
         setConfirmacion('');
       }
       await recargar();
       await recargarMias();
+      /*
+       * El rechazo se fija DESPUÉS de recargar, y el orden es el arreglo entero: `recargar()`
+       * limpia el error cuando el panel vuelve bien —tiene que hacerlo, o un panel sano
+       * arrastraría el error de antes— así que fijarlo primero lo borraba justo en el caso que
+       * más importa. El del inventario cambiado es el ejemplo: esa comprobación solo corre al
+       * ejecutar, así que el panel vuelve con `motivoNoEjecutable` en null, el botón queda
+       * habilitado y quien mira no se entera de que tiene que volver a exportar.
+       */
+      if (!r.ok) setError(r.error);
     } catch {
       setError('No se pudo ejecutar la disposición');
     } finally {
@@ -265,6 +291,11 @@ function PantallaDisposicion() {
           <span style={{ font: '600 13px var(--font-sans)', color: 'var(--text-body)' }}>
             Disposición del workspace
           </span>
+          {nombreWs !== '' && (
+            <span style={{ font: '400 13px var(--font-sans)', color: 'var(--text-muted)' }}>
+              · {nombreWs}
+            </span>
+          )}
         </div>
         <Button variant="ghost" size="sm" onClick={() => navigate({ to: '/app' })}>
           ← Volver al loop
@@ -291,6 +322,16 @@ function PantallaDisposicion() {
               {mias.length > 0
                 ? 'Ya no perteneces a ningún workspace activo. Las constancias que conservas siguen aquí abajo: cada una se verifica por su cuenta con su sello.'
                 : 'Aún no perteneces a ningún workspace.'}
+            </p>
+          </Card>
+        )}
+
+        {sustituido && (
+          <Card style={{ padding: 18, borderColor: 'var(--danger)' }}>
+            <p style={{ ...parrafo, color: 'var(--danger)' }}>
+              La dirección pedía otro workspace y ése no es tuyo —o ha dejado de serlo—. Lo que
+              ves aquí, y lo que se dispondría, es <strong>{nombreWs}</strong>. Compruébalo
+              antes de acordar o ejecutar nada.
             </p>
           </Card>
         )}
@@ -342,7 +383,7 @@ function PantallaDisposicion() {
 
             {puedeAcordar && (
               <Card style={{ padding: 22, display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <span style={etiqueta}>Registrar un acuerdo</span>
+                <span style={etiqueta}>Registrar un acuerdo · {nombreWs}</span>
                 <p style={{ ...parrafo, color: 'var(--text-muted)' }}>
                   Cambiar de opinión es un registro <strong>nuevo</strong>, nunca una
                   corrección del anterior: la bitácora cuenta la historia entera y manda el
@@ -389,8 +430,8 @@ function PantallaDisposicion() {
                 <>
                   <p style={parrafo}>
                     {esBorrado
-                      ? 'Se destruirá todo el contenido de este workspace, incluidos los objetos derivados —propuestas AI, insights, journeys, mediciones— y su auditoría. No tiene vuelta.'
-                      : 'El workspace se conservará para consulta y dejará de admitir escrituras. Cambiar esa disposición exige registrar un acuerdo nuevo.'}
+                      ? `Se destruirá todo el contenido de «${nombreWs}», incluidos los objetos derivados —propuestas AI, insights, journeys, mediciones— y su auditoría. No tiene vuelta.`
+                      : `«${nombreWs}» se conservará para consulta y dejará de admitir escrituras. Cambiar esa disposición exige registrar un acuerdo nuevo.`}
                   </p>
                   <p style={{ ...parrafo, color: 'var(--text-muted)' }}>
                     Recibirás una constancia sellada. Consérvala: tras un borrado dejas de ser
@@ -400,7 +441,8 @@ function PantallaDisposicion() {
                   {esBorrado && (
                     <>
                       <p style={parrafo}>
-                        Escribe <strong>{CONFIRMACION_BORRADO}</strong> para confirmar.
+                        Escribe <strong>{CONFIRMACION_BORRADO}</strong> para confirmar el
+                        borrado de <strong>{nombreWs}</strong>.
                       </p>
                       <Input
                         value={confirmacion}

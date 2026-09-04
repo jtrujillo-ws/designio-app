@@ -3991,6 +3991,13 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
           ' begin v = now(); return v; end $c$',
       ],
+      // Y el mismo `=` sobre un campo de `%rowtype`, que tenía el hueco por el mismo motivo
+      // aunque no lo señalara nadie. Medido: 2026-09-05 contra 2026-09-04.
+      [
+        'censo_probe_rowtype_igual_date',
+        'returns date language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
+          ' begin r.d = now(); return r.d; end $c$',
+      ],
       [
         'censo_probe_tabla_unicode_date',
         'returns void language plpgsql as $c$ begin' +
@@ -4264,6 +4271,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           'censo_probe_into_con_from_date',
           'censo_probe_pct_type_inicializada_date',
           'censo_probe_pct_type_igual_date',
+          'censo_probe_rowtype_igual_date',
           'censo_probe_tabla_unicode_date',
         ].sort(),
       );
@@ -4327,6 +4335,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         'censo_probe_into_con_from_date',
         'censo_probe_pct_type_inicializada_date',
         'censo_probe_pct_type_igual_date',
+        'censo_probe_rowtype_igual_date',
         'censo_probe_tabla_unicode_date',
         'censo_probe_ok_compara_columna_ambigua',
         'censo_probe_ok_rowtype_instante',

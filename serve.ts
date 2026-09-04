@@ -32,7 +32,22 @@ async function appDbLista(): Promise<boolean> {
     console.error('healthz: falta DATABASE_URL_APP');
     return false;
   }
-  const sql = postgres(url, { max: 1, connect_timeout: 5, onnotice: () => {} });
+  /*
+   * La creación del pool va DENTRO del guardián, y esto costó media hora de diagnóstico en el
+   * primer despliegue: `postgres()` valida la URL y LANZA cuando no parsea —medido:
+   * `postgres('postgres.railway.internal / 5432')` responde «cannot be parsed as a URL»—. Con
+   * la llamada fuera del `try`, esa excepción se escapaba de aquí y del `fetch` entero, así
+   * que `/healthz` devolvía un 500 opaco del runtime en vez del 503 que este guardián existe
+   * para dar. O sea: el único caso en que la configuración está tan mal que hay MÁS que
+   * explicar era justo el que se quedaba sin explicación.
+   */
+  let sql: ReturnType<typeof postgres>;
+  try {
+    sql = postgres(url, { max: 1, connect_timeout: 5, onnotice: () => {} });
+  } catch (e) {
+    console.error('healthz: DATABASE_URL_APP no es una URL de conexión válida', e);
+    return false;
+  }
   try {
     const [quien] = await sql`
       select current_user as usuario,

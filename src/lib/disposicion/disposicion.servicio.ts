@@ -137,9 +137,15 @@ export async function panelDisposicion(
       from acuerdo_disposicion where workspace_id = ${workspaceId}
       order by version desc limit 1`;
 
+    // La constancia VIGENTE la decide `disposicion_vigente`, invocada y no reproducida. Aquí
+    // había un `order by acuerdo_version desc limit 1`, que es la definición VIEJA: seguía
+    // devolviendo la constancia del archivo #1 después de registrar el #2 que lo revierte, así
+    // que la pantalla enseñaba «archivado» junto al acuerdo que acababa de descongelarlo. Es
+    // el espejo escrito a mano que este repositorio lleva evitando en todas partes: se quedó
+    // corto en cuanto se tocó la función.
     const [co] = await tx.unsafe(
-      `select ${COLUMNAS_CONSTANCIA} from constancia_disposicion
-       where workspace_id = $1 order by acuerdo_version desc limit 1`,
+      `select ${COLUMNAS_CONSTANCIA} from constancia_disposicion c
+       where c.id = (select (disposicion_vigente($1)).id)`,
       [workspaceId],
     );
 

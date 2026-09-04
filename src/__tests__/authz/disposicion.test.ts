@@ -691,6 +691,10 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         values (${ws}, 'nuevo', 'x')`),
     ).rejects.toMatchObject({ code: 'DS001' });
 
+    // Mientras rige, el panel la enseña.
+    const antes = await panelDisposicion(leadId, ws);
+    expect(antes.constanciaVigente?.acuerdoVersion).toBe(1);
+
     // Se hace exactamente lo que el mensaje indica.
     await registrarAcuerdo(leadId, {
       workspaceId: ws,
@@ -698,6 +702,14 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       base: 'Acuerdo 2: se reanuda el trabajo',
       efectivoDesde: new Date().toISOString().slice(0, 10),
     });
+
+    // Y el panel deja de enseñarla, porque ya no rige. Aquí había un `order by
+    // acuerdo_version desc limit 1` escrito a mano —la definición VIEJA de «vigente»— que
+    // seguía devolviendo la constancia del #1 junto al acuerdo #2 que acababa de
+    // descongelarlo: la pantalla decía «archivado» sobre un workspace que ya no lo estaba.
+    const despues = await panelDisposicion(leadId, ws);
+    expect(despues.constanciaVigente).toBeNull();
+    expect(despues.acuerdoVigente?.version).toBe(2);
 
     // Y el workspace vuelve a admitir escrituras: eso es «reversible».
     await conUsuario(leadId, (tx) => tx`insert into segmento (workspace_id, nombre, definicion)
@@ -1331,8 +1343,13 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       if (vivas !== esperado) desajustes.push(`${tabla}: vivas ${vivas} ≠ ${esperado}`);
     }
     expect(desajustes).toEqual([]);
-    // Y la diferencia está DECLARADA dentro del sello, no solo aquí.
-    expect(c.alcance).toContain('una fila más');
+    // Y la diferencia está DECLARADA dentro del sello, no solo aquí — junto con la otra que
+    // el recuento no puede incluir: una exportación de este workspace que estuviera EN VUELO
+    // confirma su evento y su registro después de contar, y el alcance lo dice.
+    expect(c.alcance).toContain('escribe su evento de auditoría');
+    expect(c.alcance).toContain('EN VUELO');
+    // Y la excepción de la baja de miembros, que la congelación deja fuera a propósito.
+    expect(c.alcance).toContain('la BAJA');
   });
 
   it('un workspace con solo llamadas C0 declara su remediación aunque no toque ningún ítem', async () => {

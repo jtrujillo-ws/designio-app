@@ -126,6 +126,23 @@ function PantallaDisposicion() {
     void recargarMias();
   }, [recargar, recargarMias]);
 
+  /*
+   * La palabra escrita vale para EL acuerdo que se tenía delante, así que si el vigente cambia
+   * mientras la pantalla está abierta, se borra.
+   *
+   * El caso concreto: se teclea BORRAR mirando el acuerdo #1, la otra parte registra un #2, la
+   * petición se rechaza por versión —eso sí lo para el servidor— y la recarga inmediata trae
+   * el #2. Sin esto, la confirmación seguía escrita, el botón seguía habilitado, y el segundo
+   * clic ejecutaba conforme a un acuerdo que nadie confirmó: otra base contractual y otra
+   * retención, con la ceremonia hecha sobre otra cosa. Que el servidor compruebe la versión no
+   * lo cubre —la segunda petición ya lleva la del #2—: lo que hay que invalidar es el ACTO
+   * humano, y eso solo se puede hacer aquí.
+   */
+  const versionVigente = panel?.acuerdoVigente?.version;
+  useEffect(() => {
+    setConfirmacion('');
+  }, [versionVigente]);
+
   async function acordar() {
     if (!workspaceId) return;
     setTrabajando(true);

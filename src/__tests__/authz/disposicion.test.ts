@@ -284,11 +284,18 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       values (${ws}, ${reto!.id}, 'KPI', 30, ${leadId}) returning id`;
     const [reg] = await admin`insert into metric_registry (workspace_id, reto_id, estado, creado_por)
       values (${ws}, ${reto!.id}, 'borrador', ${leadId}) returning id`;
-    await admin`insert into entrada_kpi (workspace_id, registry_id, criterio_id, nombre,
-        definicion, fuente, dimensiones, propietario_miembro_id, frecuencia, dashboard_url,
-        creado_por)
-      values (${ws}, ${reg!.id}, ${cri!.id}, 'KPI', 'def', 'fuente', 'dim', ${m!.id},
-        'mensual', 'https://x', ${leadId})`;
+    const [mLead] = await admin`select id from miembro
+      where workspace_id = ${ws} and usuario_id = ${leadId}`;
+    for (const [nom, dueno] of [
+      ['KPI del que se va', m!.id],
+      ['KPI del que se queda', mLead!.id],
+    ] as const) {
+      await admin`insert into entrada_kpi (workspace_id, registry_id, criterio_id, nombre,
+          definicion, fuente, dimensiones, propietario_miembro_id, frecuencia, dashboard_url,
+          creado_por)
+        values (${ws}, ${reg!.id}, ${cri!.id}, ${nom}, 'def', 'fuente', 'dim', ${dueno},
+          'mensual', 'https://x', ${leadId})`;
+    }
 
     await acordarYExportar(ws, 'archivo', leadId);
     await ejecutarDisposicion(leadId, {
@@ -304,7 +311,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     expect(quedan!.n).toBe(0);
     // Y la entrada de KPI sigue ahí, sin dueño: el archivo se conserva, el acceso no.
     const [ek] = await admin`select propietario_miembro_id, workspace_id from entrada_kpi
-      where workspace_id = ${ws}`;
+      where workspace_id = ${ws} and nombre = 'KPI del que se va'`;
     expect(ek!.propietario_miembro_id).toBeNull();
     // El `set null` va con LISTA DE COLUMNAS: sin ella nula también `workspace_id` —medido— y
     // la fila se saldría del workspace cuyo archivo la conserva.
@@ -316,6 +323,24 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
      * retenga. Se exige que NINGUNA bloquee el borrado —`a` es NO ACTION y `r` es RESTRICT—,
      * así que la próxima nace con su acción referencial decidida o sale por aquí.
      */
+    /*
+     * Y la excepción está ATADA a la baja, no a la FORMA del update. La SEGUNDA entrada sigue
+     * teniendo dueño —el lead, que no se ha ido— y ponerla a NULL es escribir en contenido
+     * archivado: la congelación tiene que negarlo. Sin esta mitad, cualquiera con permiso de
+     * edición podía tocar un workspace archivado mientras el update tuviera esa pinta.
+     *
+     * Va con el dueño VIVO a propósito, y no reaprovechando la primera entrada: después de la
+     * baja aquélla ya está a NULL, así que el caso no se podría montar y la comprobación se
+     * saltaría en silencio. Me pasó al escribirla.
+     */
+    await expect(
+      admin`update entrada_kpi set propietario_miembro_id = null
+        where workspace_id = ${ws} and propietario_miembro_id is not null`,
+    ).rejects.toMatchObject({ code: 'DS001' });
+    const [conDueno] = await admin`select count(*)::int as n from entrada_kpi
+      where workspace_id = ${ws} and propietario_miembro_id is not null`;
+    expect(conDueno!.n).toBe(1);
+
     const retienen = await admin`
       select c.conrelid::regclass::text as tabla, pg_get_constraintdef(c.oid) as fk
       from pg_constraint c
@@ -2051,6 +2076,36 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         llamadas.forEach(({ nodo: llamada, arg }, i) => {
           const clave =
             llamadas.length > 1 ? `${ruta}:${nombre}#${i + 1}` : `${ruta}:${nombre}`;
+          /*
+           * El AISLAMIENTO se lee ANTES de intentar resolver el callback, y el orden importa:
+           * `conUsuario(actorId, callbackImportado, { aislamiento: 'repeatable read' })` es
+           * coherente —el tercer argumento garantiza una sola instantánea, lea lo que lea el
+           * callback— y fallar cerrado sobre ella era un FALSO POSITIVO. Como toda entrada sin
+           * declarar rompe el caso, sacar un callback correcto a otro módulo bastaba para
+           * dejar el suite en rojo.
+           *
+           * Fallar cerrado está bien cuando no se sabe si hay problema; no cuando ya consta
+           * que no lo hay.
+           *
+           * Las opciones van justo detrás del callback, sea cual sea su posición: en
+           * `conUsuario` es la tercera, y en un envoltorio que no las reenvía no hay ninguna
+           * — y entonces esa proyección NO puede fijar el aislamiento, que es la respuesta
+           * correcta y no un descuido del censo.
+           */
+          const opciones = llamada.arguments[arg + 1];
+          const fijaAislamiento =
+            Boolean(opciones) &&
+            ts.isObjectLiteralExpression(opciones!) &&
+            opciones!.properties.some(
+              (prop) =>
+                ts.isPropertyAssignment(prop) &&
+                ((ts.isIdentifier(prop.name) && prop.name.text === 'aislamiento') ||
+                  (ts.isStringLiteral(prop.name) && prop.name.text === 'aislamiento')) &&
+                ts.isStringLiteral(prop.initializer) &&
+                prop.initializer.text === 'repeatable read',
+            );
+          if (fijaAislamiento) return;
+
           const bruto = llamada.arguments[arg];
           const callback = bruto ? resolverFuncion(bruto) : undefined;
           const tx = callback ? primerParametro(callback) : undefined;
@@ -2069,34 +2124,13 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
             return;
           }
 
-          // El aislamiento se lee del TERCER ARGUMENTO real, no de la palabra suelta.
-          /*
-           * La opción se lee del AST, no del texto del argumento: `conUsuario(…, { /* …
-           * aislamiento: pendiente … *\/ })` es TypeScript válido, no fija nada, y con una
-           * comprobación textual daba por declarada la proyección. Tiene que ser una PROPIEDAD
-           * llamada `aislamiento` con el valor que se espera.
-           */
-          // Las opciones van justo detrás del callback, sea cual sea su posición: en
-          // `conUsuario` es la tercera, y en un envoltorio que no las reenvía no hay ninguna
-          // — y entonces esa proyección NO puede fijar el aislamiento, que es la respuesta
-          // correcta y no un descuido del censo.
-          const opciones = llamada.arguments[arg + 1];
-          const fijaAislamiento =
-            Boolean(opciones) &&
-            ts.isObjectLiteralExpression(opciones!) &&
-            opciones!.properties.some(
-              (prop) =>
-                ts.isPropertyAssignment(prop) &&
-                ((ts.isIdentifier(prop.name) && prop.name.text === 'aislamiento') ||
-                  (ts.isStringLiteral(prop.name) && prop.name.text === 'aislamiento')) &&
-                ts.isStringLiteral(prop.initializer) &&
-                prop.initializer.text === 'repeatable read',
-            );
-
           const { sentencias, escribe } = analizar(callback, tx);
 
-          // Con varias transacciones en la misma función, la clave dice CUÁL.
-          if (sentencias >= 2 && !escribe && !fijaAislamiento) nombradas.push(clave);
+          // Con varias transacciones en la misma función, la clave dice CUÁL. El aislamiento
+          // ya se comprobó arriba: si estuviera fijado, no se llegaría hasta aquí — y dejarlo
+          // en esta condición sería una comprobación que no puede ser falsa, o sea ruido que
+          // el día de mañana hace creer que aquí se decide algo.
+          if (sentencias >= 2 && !escribe) nombradas.push(clave);
         });
       }
       return nombradas;
@@ -2179,6 +2213,11 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       // el censo falle cerrado, y sin esta sonda esa rama no la ejercitaba nada.
       export const sondaImportada = async (actorId: string) =>
         conUsuario(actorId, leerDeOtroModulo);
+      // Y el MISMO callback irresoluble, pero con el aislamiento fijado: el tercer argumento
+      // garantiza una sola instantánea lea lo que lea, así que NO puede salir nombrada.
+      // Fallar cerrado vale cuando no se sabe si hay problema, no cuando consta que no lo hay.
+      export const sondaOkImportadaAislada = async (actorId: string) =>
+        conUsuario(actorId, leerDeOtroModulo, { aislamiento: 'repeatable read' });
       // La transacción no se llama siempre \`tx\`: el símbolo sale del parámetro del
       // callback. Con la cadena fija, renombrarlo no contaba NI UNA consulta.
       export const sondaRenombrada2 = async (actorId: string) =>

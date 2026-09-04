@@ -698,11 +698,26 @@ begin
   -- 50 tablas congelables, y plpgsql resuelve el campo aunque la tabla no lo tenga —«record
   -- new has no field», medido, rompiendo 38 casos de golpe—. `to_jsonb(new)` vale para
   -- cualquier fila.
+  --
+  -- Y ATADA A LA BAJA, que es lo que la justifica. La forma del UPDATE no basta: cualquiera
+  -- con permiso de edición podía poner el propietario a NULL dejando el resto igual, sin que
+  -- se diera de baja a nadie, y entonces se estaría escribiendo en contenido archivado y la
+  -- constancia dejaría de describir un estado congelado.
+  --
+  -- La condición que la ata es que el miembro YA NO EXISTA. Medido: en el UPDATE que dispara
+  -- la acción referencial, la fila padre está ya borrada —la consulta devuelve cero— y en un
+  -- UPDATE normal de usuario sigue ahí. O sea que la excepción solo se abre cuando la
+  -- referencia se está soltando PORQUE el miembro se ha ido, que es el caso que la
+  -- congelación no puede impedir sin volverse un permiso perpetuo.
   if tg_table_name = 'entrada_kpi'
      and tg_op = 'UPDATE'
      and to_jsonb(new) ->> 'propietario_miembro_id' is null
      and to_jsonb(old) ->> 'propietario_miembro_id' is not null
      and to_jsonb(new) - 'propietario_miembro_id' = to_jsonb(old) - 'propietario_miembro_id'
+     and not exists (
+       select 1 from miembro m
+       where m.id = (to_jsonb(old) ->> 'propietario_miembro_id')::uuid
+     )
   then
     return new;
   end if;

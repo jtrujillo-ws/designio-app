@@ -5,6 +5,7 @@ import type * as TS from 'typescript';
 import { createHash } from 'node:crypto';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { exportarWorkspace } from '@/lib/exportacion/exportacion.servicio';
+import { PRESUPUESTO_ADJUNTOS_BYTES } from '@/lib/exportacion/exportacion.schemas';
 import {
   RegistrarAcuerdoSchema,
   cargaCanonicaConstancia,
@@ -1424,6 +1425,95 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       await enCurso.cerrar().catch(() => {});
       await admin`update usuario set estado = 'activo' where id = ${adminId}`;
     }
+  });
+
+  it('un borrado no destruye los adjuntos que el archivo no pudo llevarse', async () => {
+    /*
+     * El paquete de exportación se arma en memoria y viaja por HTTP, así que los adjuntos van
+     * sujetos a un presupuesto: lo que no cabe sale del paquete con su `sha256` y un motivo, y
+     * se descarga aparte desde la bandeja. Como ENTREGA está bien.
+     *
+     * Como PRUEBA de un borrado no lo estaba: `confirmar_exportacion` completaba el registro
+     * igual, y con él se destruía `archivo_importado` entero — bytes que nunca salieron del
+     * sistema y que el hash del inventario no permite reconstruir. RF-01.9 promete disponer
+     * DESPUÉS de entregar, y de lo omitido no hubo entrega. Pérdida irreversible de material de
+     * terceros, que es exactamente lo que este slice existe para no hacer.
+     *
+     * Seis adjuntos de 5 MB: el CHECK de la tabla topa cada uno en 5 MB, así que pasar del
+     * presupuesto de 25 MB necesita seis. La comprobación se DERIVA del peso actual y no de lo
+     * que declare quien exporta, y eso vale porque el inventario ya exige que el workspace sea
+     * el mismo que se exportó: los adjuntos de ahora son los de entonces.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('adjuntos-que-no-caben');
+    const [item] = await admin`insert into item_importacion
+      (workspace_id, titulo, contenido, tipo_fuente, creado_por)
+      values (${ws}, 'material pesado', 'texto', 'nota', ${leadId}) returning id`;
+    await admin.unsafe(
+      `insert into archivo_importado
+         (workspace_id, item_id, nombre, tipo_mime, contenido, creado_por)
+       select $1, $2, 'adjunto-' || n || '.pdf', 'application/pdf',
+              repeat('x', 5242880)::bytea, $3
+       from generate_series(1, 6) n`,
+      [ws, item!.id as string, leadId],
+    );
+
+    await acordarYExportar(ws, 'borrado', adminId);
+
+    // El intento DESTRUCTIVO va primero, y el orden es deliberado: retirando la guardia, lo
+    // que se lee aquí es la promesa resolviéndose —el borrado consumado— y no un mensaje que
+    // falta. Un caso que enrojece por el texto del motivo no enseña el daño que evita.
+    await expect(
+      ejecutarDisposicion(leadId, {
+        workspaceId: ws,
+        modalidadEsperada: 'borrado',
+        acuerdoVersionEsperada: 1,
+        confirmacion: 'BORRAR',
+      }),
+    ).rejects.toThrow(/adjuntos/i);
+    const [quedan] = await admin`select count(*)::int as n from archivo_importado
+      where workspace_id = ${ws}`;
+    expect(quedan!.n).toBe(6);
+    // Y por SQL crudo, que es por donde se rodea el servicio.
+    await expect(
+      conUsuario(leadId, (tx) => tx`select ejecutar_disposicion(${ws}, 1)`),
+    ).rejects.toMatchObject({ code: 'DS002' });
+    // El panel lo dice ANTES de ofrecer el botón, que es donde tiene que decirse: el motivo
+    // lo da la misma función que rechaza, así que no puede quedarse corto.
+    expect((await panelDisposicion(leadId, ws)).motivoNoEjecutable).toMatch(
+      /no puede llevarse todos los adjuntos/i,
+    );
+
+    /*
+     * Y la otra mitad, que es la que impide que esto se convierta en «ningún workspace grande
+     * se puede disponer»: el ARCHIVO sí. No destruye nada —congela— y lo congelado se sigue
+     * pudiendo descargar desde la bandeja, así que exigirle la entrega completa sería un
+     * trámite sin riesgo detrás. Mismo workspace, mismos 30 MB, otro acuerdo.
+     */
+    await acordarYExportar(ws, 'archivo', adminId);
+    const constancia = await ejecutarDisposicion(leadId, {
+      workspaceId: ws,
+      modalidadEsperada: 'archivo',
+      acuerdoVersionEsperada: 2,
+      confirmacion: '',
+    });
+    expect(constancia.modalidad).toBe('archivo');
+    const [tras] = await admin`select count(*)::int as n from archivo_importado
+      where workspace_id = ${ws}`;
+    expect(tras!.n).toBe(6);
+  });
+
+  it('el presupuesto de adjuntos es UN número, y lo dicen los dos lados igual', async () => {
+    /*
+     * La aplicación decide con él QUÉ mete en el paquete; la base decide con él si el paquete
+     * pudo llevárselo todo. Si divergen, el desacuerdo no se ve: con el de la base más alto se
+     * autorizan borrados sobre archivos incompletos, y con el más bajo se bloquean workspaces
+     * que sí caben. Ninguno de los dos lados puede leer la constante del otro en tiempo de
+     * ejecución —una es un módulo de TypeScript y la otra una función SQL—, así que lo que
+     * impide que se separen es este caso.
+     */
+    const [b] = await sqlAdmin()`select presupuesto_adjuntos_bytes() as n`;
+    expect(Number(b!.n)).toBe(PRESUPUESTO_ADJUNTOS_BYTES);
   });
 
   it('quien ejecutó conserva la lectura de SU acuerdo, no una ventana a los futuros', async () => {

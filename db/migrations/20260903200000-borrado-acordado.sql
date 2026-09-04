@@ -1027,6 +1027,25 @@ end $$;
 
 revoke execute on function acuerdo_disposicion_registro_guard() from public;
 
+-- ── El presupuesto de adjuntos, dicho por la BASE ─────────────────────────────────────
+/*
+ * El paquete de exportación se arma en memoria y viaja por HTTP, así que los adjuntos van
+ * sujetos a un presupuesto: lo que no cabe sale del paquete con su `sha256` y un motivo, y se
+ * descarga aparte desde la bandeja. Eso está bien para una ENTREGA — pero no para lo que la
+ * entrega tiene que sostener después.
+ *
+ * El número vive AQUÍ y no solo en la aplicación porque de él depende una decisión de la base:
+ * si lo que pesan los adjuntos supera el presupuesto, el archivo NO pudo llevárselos todos, y
+ * un borrado destruiría bytes que nunca se entregaron. Un test ata la constante de la
+ * aplicación a ésta para que no puedan divergir; la del servicio decide qué se mete en el
+ * paquete, la de aquí decide qué se puede destruir después.
+ */
+create function presupuesto_adjuntos_bytes() returns bigint
+language sql immutable as $$ select (25 * 1024 * 1024)::bigint $$;
+revoke execute on function presupuesto_adjuntos_bytes() from public;
+comment on function presupuesto_adjuntos_bytes() is
+'Los bytes de adjuntos que caben en UNA exportación. La aplicación arma el paquete con este mismo número (atado por un test) y la disposición lo usa para saber si el archivo pudo llevárselos todos.';
+
 -- ── El predicado ÚNICO: por qué NO se puede ejecutar ──────────────────────────────────
 /*
  * Devuelve el motivo, o null si se puede. Existe una sola vez porque lo INVOCAN los dos
@@ -1042,6 +1061,7 @@ revoke execute on function acuerdo_disposicion_registro_guard() from public;
 create function disposicion_motivo_no_ejecutable(p_ws uuid) returns text
 language plpgsql stable security definer set search_path = public, pg_temp as $$
 declare
+  v_bytes bigint;
   v_rol text;
   v_ac acuerdo_disposicion;
   v_disp constancia_disposicion;
@@ -1160,6 +1180,31 @@ begin
         v_ac.version);
     end if;
     return 'Falta la exportación previa: el archivo completo del workspace se entrega ANTES de disponer de él (RF-01.8/01.9)';
+  end if;
+
+  -- ── Y que el archivo se haya llevado los BYTES, no solo sus nombres ──
+  -- La exportación deja fuera del paquete los adjuntos que no caben en el presupuesto: viajan
+  -- como metadato y `sha256`, con el motivo escrito, para descargarlos aparte desde la bandeja.
+  -- Como entrega es correcto. Como PRUEBA de un borrado no lo es: `exportacion_registro` se
+  -- completa igual, y con ella se destruía `archivo_importado` entero — bytes que nunca
+  -- salieron del sistema y que el hash del inventario no permite reconstruir. Lo que RF-01.9
+  -- promete es disponer DESPUÉS de entregar, y de lo omitido no hubo entrega.
+  --
+  -- Se DERIVA del peso actual en vez de anotarlo al exportar, y no es un atajo: la comprobación
+  -- del inventario que hay más abajo exige que el workspace sea el mismo que se exportó, así
+  -- que los adjuntos de ahora SON los de entonces. Derivarlo aquí tiene además la propiedad que
+  -- un parámetro no tendría: no hay nada que quien llame pueda declarar de menos.
+  --
+  -- Y solo para el BORRADO. El archivo no destruye nada: congela, y lo congelado se sigue
+  -- pudiendo descargar desde la bandeja, así que exigirle esto sería un trámite sin riesgo
+  -- detrás — el mismo argumento con el que no se le exige la doble firma.
+  if v_ac.modalidad = 'borrado' then
+    select coalesce(sum(octet_length(a.contenido)), 0) into v_bytes
+      from archivo_importado a where a.workspace_id = p_ws;
+    if v_bytes > presupuesto_adjuntos_bytes() then
+      return format('El archivo completo no puede llevarse todos los adjuntos: pesan %s MB y el paquete admite %s MB por exportación, así que al menos uno quedó fuera con solo su sha256 dentro. Un borrado destruiría bytes que no se entregaron. Descárgalos desde la bandeja y retíralos del workspace hasta bajar del presupuesto —habrá que exportar de nuevo—, o acuerda un archivo en vez de un borrado: el archivo no destruye nada',
+        round(v_bytes / 1048576.0, 1), presupuesto_adjuntos_bytes() / 1048576);
+    end if;
   end if;
   return null;
 end $$;

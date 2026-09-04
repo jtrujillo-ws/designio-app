@@ -50,6 +50,33 @@ describe('el registro de capacidades', () => {
   });
 
   /**
+   * La marca de SIMULACIÓN tiene que LLEGAR a la base.
+   *
+   * `propuesta_ai.es_simulacion` tiene `default false`, así que omitirla en el insert no
+   * dejaba un hueco visible: dejaba un `false`. Declarar `esSimulacion: true` en una
+   * capacidad futura habría PARECIDO suficiente, y sus hallazgos habrían llegado a la
+   * revisión sin la etiqueta que SYS-20 exige imborrable — presentables como propuestas
+   * ordinarias. Un valor declarado que no llega a ninguna parte es peor que no declararlo:
+   * parece que está puesto.
+   *
+   * Se comprueba el ACOPLAMIENTO y no el dato, y por una razón medida: hoy las dos
+   * capacidades activas declaran `false`, así que una fila leída de vuelta valdría `false`
+   * con la columna puesta y sin ella. La prueba que distinguiría las dos llega con C4, que
+   * es la primera que declara `true`; hasta entonces, lo único que se puede sujetar es que
+   * el insert la nombre y que el valor salga del registro.
+   */
+  it('lleva la marca de simulación declarada hasta el insert de propuesta_ai', async () => {
+    const raiz = new URL('../../../../', import.meta.url).pathname.replace(/\/$/, '');
+    const codigo = await readFile(`${raiz}/src/lib/ai/ai.servicio.ts`, 'utf8');
+    const insert = codigo.slice(codigo.indexOf('insert into propuesta_ai'));
+    // Que esté mirando el insert de verdad y no una cadena vacía por un renombrado.
+    expect(insert.length).toBeGreaterThan(200);
+    const sentencia = insert.slice(0, insert.indexOf('returning id'));
+    expect(sentencia).toContain('es_simulacion');
+    expect(sentencia).toContain('CAPACIDADES[entrada.capacidad].esSimulacion');
+  });
+
+  /**
    * Y el guardián de la costura: ninguna comparación de una capacidad contra un LITERAL puede
    * sobrevivir en el pipeline. Se decide con el parser de TypeScript y no con una expresión
    * regular, por lo mismo que el censo del calendario: un comentario que hable del idioma

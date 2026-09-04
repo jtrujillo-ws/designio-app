@@ -993,58 +993,8 @@ async function comprobarDespacho(
     // (es el suelo, y sigue estando), pero un 42501 llega aquí sin nada que decirle a la
     // persona salvo «vuelve a intentarlo», que además es falso: reintentar no devuelve un rol.
     await rolCurador(tx, actorId, entrada.workspaceId);
-    if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
-      await bloquearConsentimiento(tx, entrada.anclaId);
-      const [item] = await tx`select
-          estado <> 'pendiente' as ya_decidido,
-          tipo_fuente_exige_consentimiento(tipo_fuente)
-            and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
-          case when tipo_fuente_exige_consentimiento(tipo_fuente) then
-            (select c.version from consentimiento_item c
-              where c.item_id = item_importacion.id
-                and c.workspace_id = item_importacion.workspace_id
-              order by c.version desc limit 1)
-          end as version_vigente
-        from item_importacion
-        where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
-      if (item?.falta_consentimiento) {
-        throw new ErrorAI(
-          'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
-        );
-      }
-      // Otro curador pudo decidir el item a mano mientras tanto: su material ya no espera
-      // nada de la AI y la propuesta nacería obsoleta. Gastar la llamada para eso es tirar
-      // dinero, y es el mismo caso que el consentimiento — algo que `prepararAlcance` vio
-      // cierto y dejó de serlo al commitear.
-      if (!item || item.ya_decidido) {
-        throw new ErrorAI(
-          'Ese item de la bandeja ya fue curado mientras se preparaba la llamada: no se llamó al proveedor',
-        );
-      }
-      // La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción
-      // que la aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un
-      // hecho consultable y no una reconstrucción por fechas.
-      //
-      // `null` EXACTAMENTE cuando el tipo de fuente no exige consentimiento, que es lo que
-      // la base impone en los dos sentidos: con material de personas es obligatorio citar
-      // uno, sin él está prohibido. Si se leyera «la última versión que haya», un item de
-      // tipo `nota` con un consentimiento registrado por si acaso citaría uno y el guard lo
-      // rechazaría — y con razón, porque ese `null` es el que significa «no aplicaba».
-      versionConsentimiento =
-        item.version_vigente === null || item.version_vigente === undefined
-          ? null
-          : Number(item.version_vigente);
-    } else {
-      const [reto] = await tx`select
-          reto_admite_criterios(id, workspace_id) as admite,
-          reto_criterios_congelados(id, workspace_id) as congelado
-        from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
-      if (!reto || !reto.admite || reto.congelado) {
-        throw new ErrorAI(
-          'Ese reto dejó de admitir criterios mientras se preparaba la llamada (G0 aprobado, registry firmado o reto cerrado): no se llamó al proveedor',
-        );
-      }
-    }
+    versionConsentimiento = await REVALIDAR[entrada.capacidad](tx, entrada);
+
     // El token de despacho: la reserva sigue existiendo y NO ha caducado. Una revocación la
     // retira, y una caducada dejó de contar para admitir a los demás — despachar con ella
     // sería gastar un hueco que otro ya tiene.
@@ -1274,6 +1224,81 @@ function anclaEnColumna(
 ): string | null {
   return CAPACIDADES[entrada.capacidad].ancla.columna === columna ? entrada.anclaId : null;
 }
+
+/**
+ * Lo que cada capacidad vuelve a comprobar JUSTO ANTES de despachar, bajo el candado y en la
+ * misma transacción que aprueba la llamada. Devuelve la versión de consentimiento que ampara
+ * la salida, o `null` cuando no aplica.
+ *
+ * Esto era un `if/else` sobre `exigeConsentimiento`, y eso es la misma rama binaria de antes
+ * con otro sombrero: toda capacidad que exigiera consentimiento se buscaba como
+ * `item_importacion` y toda la que no, como `reto` — con sus reglas de congelado encima. Una
+ * capacidad nueva podía declararse entera en `CAPACIDADES` y en `PREPARAR` y aun así ver su
+ * llamada rechazada aquí, porque su ancla se buscaba en la tabla equivocada. Lo encontró una
+ * revisión sobre este mismo PR, y es justo el defecto que el PR viene a quitar: quitar la
+ * SINTAXIS de la rama binaria no basta si su SEMÁNTICA sobrevive en un booleano.
+ *
+ * `Record<CapacidadActiva, …>` hace que el compilador exija la entrada de toda capacidad
+ * nueva, que es la diferencia entre declarar y ramificar.
+ */
+const REVALIDAR: Record<
+  CapacidadActiva,
+  (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<number | null>
+> = {
+  CI: async (tx, entrada) => {
+    await bloquearConsentimiento(tx, entrada.anclaId);
+    const [item] = await tx`select
+        estado <> 'pendiente' as ya_decidido,
+        tipo_fuente_exige_consentimiento(tipo_fuente)
+          and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
+        case when tipo_fuente_exige_consentimiento(tipo_fuente) then
+          (select c.version from consentimiento_item c
+            where c.item_id = item_importacion.id
+              and c.workspace_id = item_importacion.workspace_id
+            order by c.version desc limit 1)
+        end as version_vigente
+      from item_importacion
+      where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+    if (item?.falta_consentimiento) {
+      throw new ErrorAI(
+        'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
+      );
+    }
+    // Otro curador pudo decidir el item a mano mientras tanto: su material ya no espera
+    // nada de la AI y la propuesta nacería obsoleta. Gastar la llamada para eso es tirar
+    // dinero, y es el mismo caso que el consentimiento — algo que `prepararAlcance` vio
+    // cierto y dejó de serlo al commitear.
+    if (!item || item.ya_decidido) {
+      throw new ErrorAI(
+        'Ese item de la bandeja ya fue curado mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+    // La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción
+    // que la aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un
+    // hecho consultable y no una reconstrucción por fechas.
+    //
+    // `null` EXACTAMENTE cuando el tipo de fuente no exige consentimiento, que es lo que
+    // la base impone en los dos sentidos: con material de personas es obligatorio citar
+    // uno, sin él está prohibido. Si se leyera «la última versión que haya», un item de
+    // tipo `nota` con un consentimiento registrado por si acaso citaría uno y el guard lo
+    // rechazaría — y con razón, porque ese `null` es el que significa «no aplicaba».
+    return item.version_vigente === null || item.version_vigente === undefined
+      ? null
+      : Number(item.version_vigente);
+  },
+  C0: async (tx, entrada) => {
+    const [reto] = await tx`select
+        reto_admite_criterios(id, workspace_id) as admite,
+        reto_criterios_congelados(id, workspace_id) as congelado
+      from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+    if (!reto || !reto.admite || reto.congelado) {
+      throw new ErrorAI(
+        'Ese reto dejó de admitir criterios mientras se preparaba la llamada (G0 aprobado, registry firmado o reto cerrado): no se llamó al proveedor',
+      );
+    }
+    return null;
+  },
+};
 
 /**
  * Cómo prepara cada capacidad su generación: lee su ancla, comprueba lo que impide gastar
@@ -1531,7 +1556,7 @@ async function persistirPropuestas(
       insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
          confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, orden,
-         creado_por)
+         es_simulacion, creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino},
              ${anclaEnColumna(entrada, 'item_id')},
              ${anclaEnColumna(entrada, 'reto_id')},
@@ -1553,6 +1578,16 @@ async function persistirPropuestas(
              -- es una propiedad de la fila dentro de su propio lote, así que el índice
              -- único puede imponer el techo sin preguntar cuántas hay ya.
              (c.puesto - 1)::smallint,
+             /*
+              * SYS-20: la marca de SIMULACIÓN sale del registro y viaja al insert. La columna tiene
+              * «default false», así que omitirla no dejaba un hueco visible: dejaba un false.
+              * O sea que declarar esSimulacion: true en una capacidad futura habría PARECIDO
+              * suficiente y sus hallazgos habrían llegado a la revisión sin la etiqueta que SYS-20
+              * exige imborrable, presentables como propuestas ordinarias. Un valor declarado que no
+              * llega a ninguna parte es peor que no declararlo: parece que está puesto.
+              * (Sin comillas invertidas: esto vive en una template literal y las terminaría.)
+              */
+             ${CAPACIDADES[entrada.capacidad].esSimulacion},
              ${actorId}
       from jsonb_array_elements(${tx.json(contenidos)}) with ordinality as c(contenido, puesto)
       returning id`;

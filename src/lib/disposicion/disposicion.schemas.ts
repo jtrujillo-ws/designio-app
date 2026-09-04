@@ -194,6 +194,28 @@ export function laConstanciaSigueSiendoDeEsteAcuerdo(
   return antes === undefined || ahora === undefined || antes === ahora;
 }
 
+/**
+ * ¿Lo que la pantalla no puede leer es el workspace que ella misma acaba de borrar?
+ *
+ * Tras ejecutar un BORRADO, la lectura del panel falla POR DISEÑO: la ejecución destruye la
+ * membresía y desde ese instante RLS le niega al cliente hasta la lápida. Pintar eso como un
+ * error de acceso —encima del recibo de una operación irreversible, y al lado de un formulario
+ * para «registrar un acuerdo» calculado sobre la membresía que ya no existe— le dice a quien
+ * mira que algo salió mal justo cuando salió exactamente como lo pidió.
+ *
+ * Lo que hace falta saber es de dónde viene el hueco: si el panel no está porque el workspace
+ * se acaba de ir, la pantalla lo explica; si no está por cualquier otro motivo, sigue siendo
+ * un error y se dice como tal. Un ARCHIVO no entra: conserva la membresía y el panel vuelve.
+ *
+ * Vive aquí, como su vecina, para poder comprobarla: la suite corre en `node` y no monta React.
+ */
+export function elWorkspaceSeFueConLaEjecucion(
+  modalidadRecienEjecutada: ModalidadDisposicion | null,
+  hayPanel: boolean,
+): boolean {
+  return modalidadRecienEjecutada === 'borrado' && !hayPanel;
+}
+
 export const CONTRATO_CONSTANCIA = 'whitespace-constancia/1';
 
 /**

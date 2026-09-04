@@ -273,8 +273,10 @@ begin
   -- `workspace_role` le sigue respondiendo. La exportación es la puerta que desbloquea una
   -- disposición, así que aquí también.
   if not cuenta_activa() then
+    -- DS005 y no 42501: el rechazo por CUENTA no es el rechazo por ROL, y colapsarlos
+    -- hacía que la pantalla explicara lo contrario de lo que pasaba. Ver `cuenta_activa()`.
     raise exception 'la cuenta que ejecuta la exportación no está activa'
-      using errcode = 'insufficient_privilege';
+      using errcode = 'DS005';
   end if;
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
   values (p_ws, 'WorkspaceExportado', jsonb_build_object('ambito', p_ambito),
@@ -941,8 +943,10 @@ begin
   -- La membresía no necesita su propia relectura: `workspace_role` se lee también después del
   -- candado y una membresía revocada devuelve null, que el CHECK de `acordado_rol` rechaza.
   if not cuenta_activa() then
+    -- DS005, por lo mismo que en la exportación: aquí el rechazo llega a un admin-cliente
+    -- que SÍ tiene el rol, y con 42501 el servicio le contestaba que le falta.
     raise exception 'la cuenta que registra el acuerdo de disposición no está activa'
-      using errcode = 'insufficient_privilege';
+      using errcode = 'DS005';
   end if;
 
   -- `clock_timestamp()` y no `now()`: `now()` es el inicio de la TRANSACCIÓN, y entre ese
@@ -1223,6 +1227,24 @@ end $$;
  * El grant, además, no hacía falta: las cuatro puertas que la invocan son SECURITY DEFINER y
  * corren como el dueño. Se concedía por inercia, copiando el de `exigir_read_committed`, que
  * sí lo necesita porque a aquélla la llama un trigger que NO es definer.
+ *
+ * ── Y su rechazo tiene código propio: DS005 ──
+ * Las tres puertas rechazaban con `insufficient_privilege`, que es el mismo 42501 con el que
+ * rechazan el ROL. Y el servicio, que solo ve el código, traducía los dos al mismo mensaje:
+ * «solo el admin del cliente o el lead de la boutique registran el acuerdo». Se lo decía a un
+ * admin-cliente que SÍ tiene ese rol, así que la única explicación que llegaba a la pantalla
+ * decía lo contrario de lo que había pasado y mandaba a quien la leía a mirar un permiso que
+ * tenía. El caso no es de laboratorio: la comprobación de la cuenta vive DESPUÉS del candado
+ * —tiene que estar ahí, y esta misma migración explica por qué— así que se dispara justo
+ * cuando la desactivación llega durante la espera, que es cuando menos se entiende.
+ *
+ * Distinguir la cuenta del rol no es un oráculo: le dice a quien llama algo sobre SU PROPIA
+ * cuenta, que es exactamente lo que `cuenta_activa()` está diseñada para poder contestar. Lo
+ * que sería un oráculo —preguntar por cuentas ajenas— lo cierra la firma sin parámetro.
+ *
+ * El código va con el mensaje ya redactado para una persona, como DS002 y DS003, y los tres
+ * servicios lo dejan pasar tal cual en vez de sustituirlo. Un código por motivo, y el motivo
+ * escrito una sola vez.
  */
 create function cuenta_activa() returns boolean
 language sql stable security definer set search_path = public, pg_temp as $$
@@ -1310,8 +1332,9 @@ begin
   -- está concedida al rol de aplicación: una cuenta desactivada a mitad de sesión que conserve
   -- su membresía pasaba `is_workspace_member` sin más y llegaba hasta el borrado.
   if not cuenta_activa() then
+    -- DS005: el motivo es la cuenta, no el rol ni la membresía. Ver `cuenta_activa()`.
     raise exception 'la cuenta que ejecuta la disposición no está activa'
-      using errcode = 'insufficient_privilege';
+      using errcode = 'DS005';
   end if;
 
   -- Anti-oráculo: a quien no es miembro se le responde lo mismo que a quien

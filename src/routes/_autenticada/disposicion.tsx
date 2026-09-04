@@ -16,6 +16,7 @@ import { hoyCalendario } from '@/lib/fecha-calendario';
 import {
   CONFIRMACION_BORRADO,
   cargaCanonicaConstancia,
+  elWorkspaceSeFueConLaEjecucion,
   laConstanciaSigueSiendoDeEsteAcuerdo,
   ROLES_DISPOSICION,
   type ConstanciaDisposicion,
@@ -229,6 +230,19 @@ function PantallaDisposicion() {
 
   const vigente = panel?.acuerdoVigente ?? null;
   const esBorrado = vigente?.modalidad === 'borrado';
+  /*
+   * Lo que se pinta se decide por el PANEL cargado, no por `workspaceId`.
+   *
+   * Y la diferencia entre los dos no es teórica: tras un borrado, la membresía se destruye en
+   * la base pero el contexto de la ruta sigue trayendo el workspace de antes, así que
+   * `workspaceId` seguía siendo cierto con el panel ya vacío. La pantalla enseñaba a la vez el
+   * recibo de la operación irreversible, un error de acceso, y —calculados sobre una membresía
+   * que ya no existe— un «No hay acuerdo registrado», el formulario de «Registrar un acuerdo»
+   * y el texto del archivo. Tres cosas que se contradicen, en la única pantalla que le queda a
+   * quien acaba de perder su workspace.
+   */
+  const modalidadRecien = constancia?.modalidad ?? null;
+  const seFueConLaEjecucion = elWorkspaceSeFueConLaEjecucion(modalidadRecien, panel !== null);
   const puedeEjecutar =
     Boolean(vigente) &&
     panel?.motivoNoEjecutable === null &&
@@ -281,13 +295,23 @@ function PantallaDisposicion() {
           </Card>
         )}
 
-        {error && (
+        {seFueConLaEjecucion && (
+          <Card style={{ padding: 24 }}>
+            <p style={parrafo}>
+              El borrado se ejecutó y el workspace ya no existe: con él desapareció tu
+              membresía, así que esta pantalla no puede leer nada más de él. Tu constancia está
+              aquí abajo, y se verifica por su cuenta con su sello.
+            </p>
+          </Card>
+        )}
+
+        {error && !seFueConLaEjecucion && (
           <Card style={{ padding: 18, borderColor: 'var(--danger)' }}>
             <p style={{ ...parrafo, color: 'var(--danger)' }}>{error}</p>
           </Card>
         )}
 
-        {workspaceId && !cargando && (
+        {panel && !cargando && (
           <>
             <Card style={{ padding: 22, display: 'flex', flexDirection: 'column', gap: 12 }}>
               <span style={etiqueta}>Qué se acordó</span>
@@ -398,10 +422,17 @@ function PantallaDisposicion() {
               )}
             </Card>
 
-            {(constancia ?? panel?.constanciaVigente) && (
-              <Constancia c={(constancia ?? panel!.constanciaVigente)!} reciente={Boolean(constancia)} />
-            )}
           </>
+        )}
+
+        {/* El recibo va FUERA del bloque de arriba, y ésa es la otra mitad del arreglo: el
+            momento en que más importa enseñarlo es justo aquel en el que el panel ya no se
+            puede leer. */}
+        {(constancia ?? panel?.constanciaVigente) && (
+          <Constancia
+            c={(constancia ?? panel!.constanciaVigente)!}
+            reciente={Boolean(constancia)}
+          />
         )}
 
         {mias.length > 0 && (

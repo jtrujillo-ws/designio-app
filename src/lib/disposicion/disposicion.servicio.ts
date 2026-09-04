@@ -213,7 +213,15 @@ export async function registrarAcuerdo(
           to_char(efectivo_desde, 'YYYY-MM-DD') as efectivo_desde, acordado_por, acordado_en`;
       return acuerdoDeFila(fila!);
     } catch (e) {
-      const err = e as { code?: string };
+      const err = e as { code?: string; message?: string };
+      // DS005 ANTES que 42501, y ése es todo el arreglo: la puerta de la base rechaza por la
+      // CUENTA con su propio código y su propio mensaje, y colapsarlo en el de rol le decía a
+      // un admin-cliente que le falta un rol que tiene. La comprobación de arriba no lo cubre:
+      // pasa con la cuenta viva, y la desactivación puede llegar mientras el insert espera el
+      // candado del workspace — que es justo el caso por el que la base la comprueba después.
+      if (err.code === 'DS005' && err.message) {
+        throw new ErrorDisposicion(err.message);
+      }
       if (err.code === '42501') {
         throw new ErrorDisposicion(
           'Solo el admin del cliente o el lead de la boutique registran el acuerdo de disposición',
@@ -291,7 +299,12 @@ export async function ejecutarDisposicion(
       // DS002 es el motivo del predicado único, ya redactado para que lo lea una persona;
       // DS003 es la dependencia de runtime (el dueño de las funciones tiene que ser
       // superusuario para apagar los triggers durante el vaciado).
-      if ((err.code === 'DS002' || err.code === 'DS003') && err.message) {
+      // DS005 es la cuenta inactiva, que la base comprueba después del candado y que sin su
+      // propio código salía por el 42501 de abajo como «no eres miembro».
+      if (
+        (err.code === 'DS002' || err.code === 'DS003' || err.code === 'DS005') &&
+        err.message
+      ) {
         throw new ErrorDisposicion(err.message);
       }
       if (err.code === '42501') {

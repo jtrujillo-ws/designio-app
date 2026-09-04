@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { laConstanciaSigueSiendoDeEsteAcuerdo } from '@/lib/disposicion/disposicion.schemas';
+import {
+  elWorkspaceSeFueConLaEjecucion,
+  laConstanciaSigueSiendoDeEsteAcuerdo,
+} from '@/lib/disposicion/disposicion.schemas';
 
 /**
  * Cuándo la pantalla de disposición tiene que soltar la constancia que enseña.
@@ -26,5 +29,34 @@ describe('la constancia en pantalla y el acuerdo al que pertenece', () => {
     expect(laConstanciaSigueSiendoDeEsteAcuerdo(undefined, 1)).toBe(true);
     expect(laConstanciaSigueSiendoDeEsteAcuerdo(1, 1)).toBe(true);
     expect(laConstanciaSigueSiendoDeEsteAcuerdo(undefined, undefined)).toBe(true);
+  });
+});
+
+/**
+ * Y de dónde viene el hueco cuando el panel no se puede leer.
+ *
+ * Tras un BORRADO la lectura falla por diseño: la ejecución destruye la membresía y RLS deja
+ * de responder. El contexto de la ruta, en cambio, sigue trayendo el workspace de antes, así
+ * que preguntar por `workspaceId` daba «sí» con el panel ya vacío y la pantalla enseñaba a la
+ * vez el recibo, un error de acceso y un formulario para acordar sobre lo que se acaba de
+ * borrar. Lo que distingue un caso del otro es QUÉ se acaba de ejecutar aquí.
+ */
+describe('el panel que ya no se puede leer', () => {
+  it('tras un borrado no es un error: es lo que se acaba de pedir', () => {
+    expect(elWorkspaceSeFueConLaEjecucion('borrado', false)).toBe(true);
+  });
+
+  it('un ARCHIVO no lo es: conserva la membresía y el panel vuelve', () => {
+    // La mitad que hace que la otra sirva: sin ella bastaría con «se ejecutó algo» y un fallo
+    // de lectura tras un archivo —que sí es un error— se pintaría como un adiós.
+    expect(elWorkspaceSeFueConLaEjecucion('archivo', false)).toBe(false);
+  });
+
+  it('ni lo es un fallo de lectura cualquiera, sin ejecución de por medio', () => {
+    expect(elWorkspaceSeFueConLaEjecucion(null, false)).toBe(false);
+  });
+
+  it('ni cuando el panel SÍ está, que es el borrado de otro workspace o una recarga que volvió', () => {
+    expect(elWorkspaceSeFueConLaEjecucion('borrado', true)).toBe(false);
   });
 });

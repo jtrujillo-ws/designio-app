@@ -13,6 +13,11 @@ import { z } from 'zod';
 
 function motivo(e: unknown): string | null {
   if (e instanceof ErrorDisposicion || e instanceof ErrorAutorizacion) return e.message;
+  const err = e as { code?: string; message?: string };
+  // La cuenta inactiva llega aquí ya traducida por el servicio, pero el código también se
+  // mira: este `motivo` cubre TODO lo que sube por esta puerta, y el criterio de arriba no
+  // puede quedarse viejo en uno de sus cuatro sitios.
+  if (err.code === 'DS005' && err.message) return err.message;
   if ((e as { code?: string }).code === '42501') {
     return 'No tienes permiso para disponer de este workspace';
   }

@@ -68,7 +68,14 @@ export async function exportarWorkspace(
       rol = fila!.rol as string;
       generadoEn = (fila!.instante as Date).toISOString();
     } catch (e) {
-      if ((e as { code?: string }).code === '42501') {
+      const err = e as { code?: string; message?: string };
+      // La cuenta inactiva trae su propio código y su propio motivo: la puerta la comprueba
+      // después de la del rol, así que quien lo recibe TIENE el rol y el mensaje de rol le
+      // manda a mirar donde no es.
+      if (err.code === 'DS005' && err.message) {
+        throw new ErrorExportacion(err.message);
+      }
+      if (err.code === '42501') {
         throw new ErrorExportacion(
           'Solo lead-boutique o admin-cliente ejecutan la exportación del workspace',
         );

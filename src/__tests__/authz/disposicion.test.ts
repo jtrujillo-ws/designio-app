@@ -1370,7 +1370,7 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
       expect(await sigueEsperando(registro)).toBe(true);
       await admin`update usuario set estado = 'inactivo' where id = ${adminId}`;
       await enCurso.cerrar();
-      await expect(registro).rejects.toMatchObject({ code: '42501' });
+      await expect(registro).rejects.toMatchObject({ code: 'DS005' });
     } finally {
       await enCurso.cerrar().catch(() => {});
       await admin`update usuario set estado = 'activo' where id = ${adminId}`;
@@ -1379,6 +1379,51 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const [n] = await admin`select count(*)::int as n from acuerdo_disposicion
       where workspace_id = ${ws}`;
     expect(n!.n).toBe(0);
+  });
+
+  it('y lo que llega a la pantalla es el motivo de verdad, no un rol que sí se tiene', async () => {
+    /*
+     * La otra mitad del caso de arriba, y la que se ve desde fuera. La puerta de la base
+     * rechaza por la CUENTA, pero el servicio traducía todo rechazo de autorización al mismo
+     * mensaje de rol — y quien lo recibe es un admin-cliente que SÍ tiene ese rol. O sea que
+     * la única explicación que llega dice justo lo contrario de lo que pasó, y quien la lee se
+     * queda mirando un permiso que tiene.
+     *
+     * La comprobación previa del servicio no cubre esto: pasa con la cuenta viva, y la
+     * desactivación ocurre mientras el insert espera el candado. Es el mismo hueco que hizo
+     * mover la comprobación de la base al otro lado del candado, ahora en el camino del
+     * mensaje.
+     */
+    const admin = sqlAdmin();
+    const ws = await nuevoWorkspace('motivo-de-la-cuenta');
+
+    const enCurso = await enVuelo(async (tx) => {
+      await tx`select set_config('app.user_id', ${leadId}, true)`;
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:workspace:' || ${ws}::text, 42))`;
+    });
+    try {
+      const registro = registrarAcuerdo(adminId, {
+        workspaceId: ws,
+        modalidad: 'archivo',
+        base: 'Con la cuenta apagándose por el camino',
+        efectivoDesde: EFECTIVO_PASADO,
+      });
+      expect(await sigueEsperando(registro)).toBe(true);
+      await admin`update usuario set estado = 'inactivo' where id = ${adminId}`;
+      await enCurso.cerrar();
+      const error = await registro.then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+      expect(error).toBeInstanceOf(ErrorDisposicion);
+      expect(error!.message).toMatch(/cuenta/i);
+      // Y las dos mitades, porque decir la verdad y además decir la mentira no sirve de nada.
+      expect(error!.message).not.toMatch(/admin del cliente/i);
+    } finally {
+      await enCurso.cerrar().catch(() => {});
+      await admin`update usuario set estado = 'activo' where id = ${adminId}`;
+    }
   });
 
   it('quien ejecutó conserva la lectura de SU acuerdo, no una ventana a los futuros', async () => {
@@ -1495,17 +1540,30 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
         }),
       ).rejects.toThrow();
 
-      // Y por SQL crudo, que es la puerta que estaba abierta: las tres.
+      // Y por SQL crudo, que es la puerta que estaba abierta: las tres. Con DS005 y no con
+      // 42501, y la diferencia no es cosmética: este lead TIENE el rol, así que el código de
+      // permiso hacía que el servicio le contestara que le falta. Un código por motivo.
       await expect(
         conUsuario(leadId, (tx) => tx`select ejecutar_disposicion(${ws}, 1)`),
-      ).rejects.toMatchObject({ code: '42501' });
+      ).rejects.toMatchObject({ code: 'DS005' });
       await expect(
         conUsuario(leadId, (tx) => tx`select registrar_exportacion(${ws}, 'archivo')`),
-      ).rejects.toMatchObject({ code: '42501' });
+      ).rejects.toMatchObject({ code: 'DS005' });
       await expect(
         conUsuario(leadId, (tx) => tx`insert into acuerdo_disposicion
           (workspace_id, modalidad, base, efectivo_desde, acordado_por)
           values (${ws}, 'archivo', 'Acuerdo de una cuenta apagada', current_date, ${leadId})`),
+      ).rejects.toMatchObject({ code: 'DS005' });
+      // Y el rechazo por ROL sigue siendo 42501, que es lo que hace que separarlos sirva: sin
+      // esta mitad, cambiar el código de la cuenta podría habérselo llevado todo por delante y
+      // el test seguiría en verde. Una cuenta VIVA y sin membresía, para que lo que falle sea
+      // el rol y solo el rol.
+      const [sinRol] = await admin`insert into usuario (email, nombre, estado)
+        values (${`${marca}-sin-rol@test.demo`}, 'sin-rol', 'activo') returning id`;
+      await expect(
+        conUsuario(sinRol!.id as string, (tx) =>
+          tx`select registrar_exportacion(${ws}, 'archivo')`,
+        ),
       ).rejects.toMatchObject({ code: '42501' });
 
       // Y el panel lo explica en vez de callarse.

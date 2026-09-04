@@ -533,7 +533,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
      * —donde no hay literal— y pasa. Una aserción negativa detrás de algo opcional no asegura
      * nada; ya lo tenía escrito de otra vuelta y volví a hacerlo.
      */
-    const HUSO_FIJO = String.raw`${literalDe(String.raw`[^']*`)}\s*\)`;
+    const HUSO_LITERAL = literalDe(String.raw`[^']*`);
+    const HUSO_FIJO = String.raw`${HUSO_LITERAL}\s*\)`;
     /*
      * Y el FORMATO de `to_char`, que hasta ahora no se miraba: se marcaba cualquier `to_char`
      * con un reloj delante, y hay formatos que no leen el calendario —`'"fijo"'` devuelve
@@ -568,6 +569,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       //
       // NO marca `(timezone('UTC'::text, now()))::date`: ahí el paréntesis que precede al
       // `::` es el de `timezone`, y `timezone` no es un reloj — el reloj va envuelto.
+      /*
+       * La conversión de huso con un huso DINÁMICO. `timezone('UTC', now())` es el ARREGLO
+       * canónico de este PR y por eso el censo lo deja pasar; con
+       * `timezone(current_setting('TimeZone'), now())` vuelve a decidir quien llama —medido:
+       * 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12— y la excepción lo tapaba.
+       *
+       * Se marca cuando el huso NO es un literal fijo. En las dos sintaxis, que son la misma
+       * operación escrita distinto.
+       *
+       * La guardia va pegada a la palabra y no detrás del espacio, por lo de siempre: con el
+       * `\s+` por medio el motor lo devuelve a cero y la aserción deja de guardar.
+       */
+      new RegExp(
+        String.raw`timezone\s*\((?!\s*${HUSO_LITERAL}\s*,)\s*${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*\)`,
+        'i',
+      ),
+      new RegExp(String.raw`(${RELOJ})\s*at\s+time\s+zone(?!\s+${HUSO_LITERAL})\s+`, 'i'),
       new RegExp(String.raw`(${RELOJ})\s*::\s*${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
       // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
       new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
@@ -662,13 +680,23 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * demás, contra el texto con los literales vacíos, porque una palabra del reloj dentro de un
    * literal es un dato y no una lectura del calendario.
    */
-  const culpable = (crudo: string, dialecto: 'sql' | 'ts' = 'sql') => {
+  const culpable = (crudo: string, dialecto: 'sql' | 'ts' = 'sql'): boolean => {
     const conLiterales = sinComentarios(crudo, dialecto);
     const sinLiterales = sinComentarios(crudo, dialecto, true);
     return (
       DEL_HUSO_DE_LA_SESION.test(sinLiterales) ||
       RELOJ_COLAPSADO_A_DIA.some((r) => r.test(sinLiterales)) ||
-      RELOJ_LEYENDO_LITERAL.some((r) => r.test(conLiterales))
+      RELOJ_LEYENDO_LITERAL.some((r) => r.test(conLiterales)) ||
+      /*
+       * Y el SQL DINÁMICO: `execute 'select now()::date'` guarda la operación DENTRO de un
+       * literal, que el vaciado se lleva por delante. La función depende del huso de quien la
+       * llama igual que si estuviera escrita fuera. Se extrae y se analiza por su cuenta,
+       * deshaciendo la duplicación de comillas; cada nivel quita una capa, así que la
+       * recursión termina.
+       */
+      [...conLiterales.matchAll(/\bexecute\s+[A-Za-z_]*&?'((?:[^']|'')*)'/gi)].some((m) =>
+        culpable(m[1]!.replace(/''/g, "'"), 'sql'),
+      )
     );
   };
 
@@ -819,6 +847,32 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
         salida += ' ';
         continue;
       }
+      /*
+       * Un identificador entre comillas dobles es SQL válido y puede contener CUALQUIER cosa:
+       * `declare "--" int;` en una función de una línea hacía que el barrido tomara esos
+       * guiones por un comentario y se comiera la operación de después. Se consume entero,
+       * con su escape por duplicación.
+       *
+       * Y se copia TAL CUAL incluso al vaciar literales, a diferencia de un dato: los nombres
+       * SÍ los leen los patrones —`pg_catalog."now"()` es un reloj—, así que vaciarlos abriría
+       * el hueco que el reconocimiento del nombre entrecomillado vino a cerrar.
+       *
+       * LÍMITE DECLARADO: un identificador que se llame exactamente como una palabra del reloj
+       * —`select 1 as "current_date"`— saldrá marcado. Es un falso positivo, o sea visible.
+       */
+      if (modo === 'sql' && c === '"') {
+        const desde = i;
+        i++;
+        while (i < texto.length) {
+          if (texto[i] === '"' && texto[i + 1] === '"') i += 2;
+          else if (texto[i] === '"') {
+            i++;
+            break;
+          } else i++;
+        }
+        salida += texto.slice(desde, i);
+        continue;
+      }
       // Literal de comillas simples: dato en los dos dialectos. En SQL se escapa
       // duplicándolo; en TypeScript, con barra invertida.
       if (c === "'" || (modo === 'ts' && c === '"')) {
@@ -911,6 +965,17 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           i = hasta;
           continue;
         }
+      }
+      /*
+       * Dentro de una plantilla, la BARRA escapa el carácter siguiente. Sin esto, un backtick
+       * escapado —`` `texto \` // ejemplo` ``, TypeScript válido— cerraba el marco antes de
+       * tiempo, y el `//` que en realidad es contenido de la plantilla se llevaba por delante
+       * el resto de la línea, consulta peligrosa incluida.
+       */
+      if (modo === 'sql' && pila.length > 1 && c === '\\') {
+        salida += c + (d ?? '');
+        i += 2;
+        continue;
       }
       // Las comillas invertidas abren y cierran SQL dentro de TypeScript.
       if (c === '`') {
@@ -1232,6 +1297,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       // La ida y vuelta que NO termina ahí: recupera el instante y vuelve a elegir día.
       // En su forma fuente y en la que devuelve el catálogo.
       'now()::text::timestamptz::date',
+      // El huso DINÁMICO en las dos sintaxis: vuelve a decidir quien llama.
+      "timezone(current_setting('TimeZone'), now())::date",
+      "(now() at time zone current_setting('TimeZone'))::date",
+      // Y el SQL dentro de un EXECUTE, que el vaciado de literales se llevaba.
+      "execute 'select now()::date'",
       '(((now())::text)::timestamp with time zone)::date',
       "to_char(now(), E'YYYY'::text)",
       // El formato de `to_char` que SÍ lee el calendario, y `SSSS` —segundos desde
@@ -1414,6 +1484,11 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       "date_trunc('day', now(), E'UTC')",
       "to_char(now(), 'US'::text)",
       'now()::text::pg_catalog.timestamptz',
+      // El huso FIJO sigue siendo el arreglo canónico y no se marca, en las dos sintaxis.
+      "timezone('UTC', now())::date",
+      "(now() at time zone 'UTC')::date",
+      // Ni un EXECUTE cuyo SQL no lee el calendario.
+      "execute 'select 1'",
       // Y los formatos que NO leen el calendario: texto entrecomillado y campos por debajo
       // del minuto (ningún huso tiene desfase con segundos — medido sobre los 499).
       "to_char(now(), '\"fijo\"')",
@@ -1570,6 +1645,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // Pero vaciar el literal NO puede romper a los dos patrones que lo LEEN.
     expect(culpable("date_trunc('milliseconds', now())")).toBe(false);
     expect(culpable("date_trunc('day', now())")).toBe(true);
+    // Un identificador entrecomillado con guiones no abre comentario: el catálogo devuelve la
+    // función en una línea y el barrido se comía la operación de después.
+    expect(
+      culpable(
+        'create function f() returns date language plpgsql as $function$ declare "--" int; begin return now()::date; end $function$',
+        'sql',
+      ),
+    ).toBe(true);
+    // Y un backtick ESCAPADO no cierra la plantilla: si la cierra, el `//` que es contenido
+    // pasa a ser comentario y se lleva la consulta de después.
+    expect(
+      culpable('const ayuda = `texto \\` // ejemplo`; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
     /*
      * Y la cadena con prefijo E dentro de un cuerpo plpgsql: la comilla escapada con BARRA no
      * termina el literal, así que el `--` de dentro sigue siendo dato y no se come la

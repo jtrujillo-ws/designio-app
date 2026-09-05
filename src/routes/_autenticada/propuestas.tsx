@@ -22,6 +22,7 @@ import {
   MAX_FUENTE_KPI,
   MAX_NOMBRE_KPI,
 } from '@/lib/medicion/medicion.schemas';
+import { MAX_PREGUNTA, MAX_RAZON } from '@/lib/servicio/oportunidad.schemas';
 import { formatearCosteUsd } from '@/lib/ai/ai.degradacion';
 import {
   aceptarPropuestaAI,
@@ -40,6 +41,7 @@ import {
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoEntradaKpi,
+  type ContenidoOportunidad,
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoRemediacionJourney,
@@ -1093,6 +1095,14 @@ const PRESENTACION_POR_CAPACIDAD: Record<
     // C6 SÍ materializa —nace una entrada del registry— así que no tiene nada que decir aquí.
     sinAccion: null,
   },
+  C3: {
+    rotulo: 'Oportunidad HMW propuesta',
+    ficha: (c, etiquetas) => (
+      <FichaOportunidad contenido={c as ContenidoOportunidad} etiquetas={etiquetas} />
+    ),
+    // C3 SÍ materializa —nace una oportunidad en el portafolio— así que tampoco dice nada aquí.
+    sinAccion: null,
+  },
 };
 
 /**
@@ -1218,6 +1228,20 @@ const MATERIALIZACION: Record<
     formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
       <FormularioEntradaKpi
         inicial={inicial as ContenidoEntradaKpi}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  oportunidad: {
+    // Tampoco: lo que la HMW necesita para nacer —la pregunta, su prioridad y su razón— lo
+    // trae entero la propuesta, y el VEREDICTO lo pone una persona después, en el portafolio,
+    // con su propia puerta. Ese reparto es el mismo del criterio y el de la entrada KPI.
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioOportunidad
+        inicial={inicial as ContenidoOportunidad}
         ocupado={ocupado}
         onEnviar={onEnviar}
         onCancelar={onCancelar}
@@ -2051,6 +2075,143 @@ function FichaEntradaKpi({
         una persona del cliente y se completa en el registry antes de firmarlo.
       </span>
     </div>
+  );
+}
+
+/**
+ * La ficha de una HMW propuesta.
+ *
+ * Enseña la TRAZA con el título de cada insight y no con su uuid, por lo mismo que la de C6
+ * enseña el KPI del criterio: quien revisa tiene que poder decir si esta pregunta se sostiene
+ * en ESAS conclusiones, y para eso hay que leerlas. Y las citas van agrupadas debajo de su
+ * insight, no en una lista aparte, porque en C3 la cita ES la traza — separarlas sugeriría que
+ * son dos cosas que pueden discrepar.
+ */
+function FichaOportunidad({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoOportunidad;
+  etiquetas: Record<string, string>;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="Pregunta" valor={contenido.pregunta} />
+      <Dato rotulo="Prioridad" valor={String(contenido.prioridad)} />
+      <Dato rotulo="Por qué esa prioridad" valor={contenido.prioridadRazon} />
+      {contenido.citas.map((c, i) => (
+        <Dato
+          key={String(i)}
+          // El insight en el rótulo y no dentro del valor: es de quién se copia, no parte de
+          // lo copiado. Y si ya no está, se dice con su id — que es lo único que queda.
+          rotulo={`Se apoya en «${etiquetas[c.insightId] ?? `insight ${c.insightId} (ya no está)`}»`}
+          valor={`«${c.fragmento}» · ${c.localizacion}`}
+        />
+      ))}
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        Aceptarla la mete en el portafolio POR DECIDIR: aprobarla o descartarla es un acto
+        aparte, y descartarla exige una razón.
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Y su corrección: la pregunta, la prioridad y su razón.
+ *
+ * Las CITAS no están, y esa ausencia es la regla de la capacidad: los insights citados son la
+ * traza, así que reapuntarlos conservando el texto sería quedarse con el sostén de unos para
+ * afirmar sobre otros. Si el modelo se apoyó en el insight equivocado, la salida es rechazar.
+ */
+function FormularioOportunidad({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoOportunidad;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoOportunidad) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [pregunta, setPregunta] = useState(inicial.pregunta);
+  const [prioridad, setPrioridad] = useState(String(inicial.prioridad));
+  const [prioridadRazon, setPrioridadRazon] = useState(inicial.prioridadRazon);
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          pregunta,
+          // El campo es texto y el contrato pide un entero del rango: se acota ANTES de salir,
+          // como hace la pantalla del portafolio. Un valor que el servidor rechaza llega como
+          // «vuelve a intentarlo», que no dice lo único que hay que saber.
+          prioridad: Math.min(1000, Math.max(0, Math.round(Number(prioridad) || 0))),
+          prioridadRazon,
+          // Mismo criterio que el resto: lo que el modelo afirmó —sus citas y su confianza— no
+          // lo reescribe quien corrige. Y aquí las citas son además la traza.
+          confianzaPropuesta: inicial.confianzaPropuesta,
+          citas: inicial.citas,
+        });
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        Corregir antes de aceptar (la propuesta original se conserva)
+      </span>
+      <label style={campo}>
+        <span style={etiqueta}>Pregunta</span>
+        <Textarea
+          required
+          rows={2}
+          maxLength={MAX_PREGUNTA}
+          value={pregunta}
+          onChange={(e) => setPregunta(e.target.value)}
+        />
+      </label>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 3fr', gap: 12 }}>
+        <label style={campo}>
+          <span style={etiqueta}>Prioridad</span>
+          <Input
+            required
+            type="number"
+            min={0}
+            max={1000}
+            step={1}
+            value={prioridad}
+            onChange={(e) => setPrioridad(e.target.value)}
+          />
+        </label>
+        <label style={campo}>
+          <span style={etiqueta}>Por qué esa prioridad</span>
+          <Textarea
+            required
+            rows={2}
+            maxLength={MAX_RAZON}
+            value={prioridadRazon}
+            onChange={(e) => setPrioridadRazon(e.target.value)}
+          />
+        </label>
+      </div>
+      <div style={{ display: 'flex', gap: 10 }}>
+        <Button type="submit" size="sm" disabled={ocupado}>
+          {ocupado ? 'Aceptando…' : 'Aceptar con estas correcciones'}
+        </Button>
+        <Button size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
   );
 }
 

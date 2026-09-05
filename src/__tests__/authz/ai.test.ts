@@ -22,6 +22,7 @@ import {
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoInsight,
+  type ContenidoOportunidad,
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
@@ -126,6 +127,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   let gateId = '';
   let requisitoIds: string[] = [];
   let evidenciaDelRetoId = '';
+  let insightValidadoDelRetoId = '';
   let registryId = '';
   let criterioDelRegistryId = '';
 
@@ -230,6 +232,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     get C6() {
       return CONTENIDO_C6(criterioDelRegistryId);
     },
+    /* Igual que los tres anteriores: se resuelve tarde porque el insight se crea en el
+     * `beforeAll`, y su id tiene que ser REAL — la traza se materializa desde las citas, así
+     * que un id inventado no llega ni a insertar el enlace. */
+    get C3() {
+      return CONTENIDO_C3(insightValidadoDelRetoId);
+    },
   };
 
   /**
@@ -308,6 +316,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       },
     ],
     contradicciones: [],
+    confianzaPropuesta: 'media',
+  });
+  const CONTENIDO_C3 = (insightId: string): ContenidoOportunidad => ({
+    pregunta: '¿Cómo podríamos verificar sin pedir un documento que no está a mano?',
+    prioridad: 700,
+    prioridadRazon:
+      'Mueve el criterio del tiempo de verificación: es donde se pierde la mayoría.',
+    citas: [
+      { insightId, fragmento: 'Quien no lleva el documento encima', localizacion: 'resumen' },
+    ],
     confianzaPropuesta: 'media',
   });
   /**
@@ -832,6 +850,31 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     registryId = mr!.id as string;
     await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
       values (${ws}, ${arq!.id as string}, ${evidenciaDelRetoId})`;
+    /*
+     * Un insight VALIDADO del reto, que es el material de C3.
+     *
+     * «Del reto» no es una columna: un insight pertenece a un reto si alguna de sus
+     * afirmaciones cita evidencia que cuelga de un arquetipo suyo. Por eso el fixture tiene
+     * que montar la cadena entera —afirmación → cita → esa evidencia— y no basta con crear un
+     * insight en el workspace: `insights_validados_del_reto` lo recorrería y no lo
+     * encontraría, y las propuestas de C3 del fixture nacerían con un id que el guard rechaza.
+     */
+    const [ins] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'La verificación excluye a quien no tiene el documento a mano',
+              'Quien no lleva el documento encima abandona y no vuelve.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    insightValidadoDelRetoId = ins!.id as string;
+    const [af] = await admin`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${ws}, ${insightValidadoDelRetoId}, 0,
+              'El abandono se concentra en la carga del documento', false)
+      returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${ws}, ${af!.id as string}, ${evidenciaDelRetoId},
+              'El 71% de los abandonos', 'resumen', ${leadId})`;
   });
 
   afterAll(async () => {
@@ -5352,6 +5395,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                        -- ninguna; nulo la deja inerte, que es la respuesta correcta para una
                        -- fila sintética que no representa a ninguna propuesta.
                        null::uuid[] as alcance_evidencia,
+                       -- Y el de C3, por lo mismo: su motivo mira si el reto tiene insights
+                       -- validados fuera del alcance. Nulo por la misma razón — lo que este
+                       -- censo mide es el ENRUTADO, no la completitud de ninguna propuesta.
+                       null::uuid[] as alcance_insights,
             null::uuid as entrada_kpi_id,
                        ${ws}::uuid as workspace_id) p
           ${proyeccion.joins}`;
@@ -5362,8 +5409,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // null como 'ancla-ausente', que solo admite rechazar. Antes respondía con el motivo del
       // vecino — primero el del reto por caer en su rama, después el de quien compartiera
       // columna.
-      expect(await motivoDe('C3', { reto_id: retoId })).toBeNull();
-      expect(await motivoDe('C3', { item_id: item })).toBeNull();
+      // C1 y C7 hacen aquí el papel que hacían C3 y C4 antes de activarse: una capacidad del
+      // catálogo que este panel todavía no pinta. Cuando les toque, el sustituto será otra —y
+      // el día que no quede ninguna inactiva, este caso se retira en vez de fingirse.
+      expect(await motivoDe('C1', { reto_id: retoId })).toBeNull();
+      expect(await motivoDe('C1', { item_id: item })).toBeNull();
       expect(await motivoDe('C4', {})).toBeNull();
       // Y una capacidad desconocida sobre el ancla NUEVA tampoco hereda la de CT.
       expect(await motivoDe('C7', { gate_id: gateId })).toBeNull();
@@ -5374,6 +5424,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const DE_CI = ['disponible', 'item-curado', 'consentimiento-revocado'];
       const DE_C0 = ['disponible', 'reto-no-admite', 'registry-firmado', 'criterios-congelados'];
       const DE_CT = ['disponible', 'gate-decidido', 'checklist-avanzado'];
+      const DE_C3 = [
+        'disponible',
+        'portafolio-cerrado',
+        'insight-no-validado',
+        'alcance-incompleto',
+      ];
       expect(DE_CI).toContain(await motivoDe('CI', { item_id: item }));
       expect(DE_C0).toContain(await motivoDe('C0', { reto_id: retoId }));
       expect(DE_CT).toContain(await motivoDe('CT', { gate_id: gateId }));
@@ -5385,6 +5441,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         await motivoDe('CT', { gate_id: gateId }),
       );
       expect(DE_CT.slice(1)).not.toContain(await motivoDe('C0', { reto_id: retoId }));
+      /*
+       * Y C3, que es el caso que este censo existe para vigilar: comparte la columna del ancla
+       * con C0 —y con C2—, así que es exactamente donde una rama escrita «para el reto» en vez
+       * de «para esta capacidad» se cruzaría. Se mide en los dos sentidos.
+       */
+      expect(DE_C3).toContain(await motivoDe('C3', { reto_id: retoId }));
+      expect(DE_C3.slice(1)).not.toContain(await motivoDe('C0', { reto_id: retoId }));
+      expect(DE_C0.slice(1)).not.toContain(await motivoDe('C3', { reto_id: retoId }));
 
       /*
        * Y el motivo que distingue un informe VIVO de uno que ya no describe el gate: con el

@@ -715,6 +715,28 @@ begin
     then
       raise exception 'las citas de una propuesta AI no se corrigen: son el rastro de lo que el modelo dijo haber leído';
     end if;
+    -- Y LAS CONTRADICCIONES TAMPOCO, por lo mismo y por una razón propia.
+    --
+    -- Por lo mismo: son testimonio del modelo sobre evidencia que ha leído, igual que una
+    -- cita, y señalan un documento por su id — o sea, es la otra mitad de su salida que se
+    -- puede contrastar contra algo.
+    --
+    -- Y por lo suyo: una contradicción es la evidencia que va EN CONTRA del insight. I4 pide
+    -- señalarla precisamente porque esconderla es la manera más limpia de vender una
+    -- conclusión, así que dejar que quien revisa la reescriba o la borre al «corregir» sería
+    -- devolverle esa manera con otro nombre. Se lee y se decide con ella delante; si no se
+    -- sostiene, la salida es rechazar el insight entero.
+    --
+    -- La comprobación tenía además un agujero de alcance: este guard salía por aquí antes de
+    -- llegar al barrido de evidencia ajena de abajo, así que una corrección podía cambiar el
+    -- `evidenciaId` de una contradicción por CUALQUIER evidencia del workspace —`contradiccion`
+    -- solo tiene la FK del tenant— y la aceptación la materializaba. Prohibir el cambio cierra
+    -- las dos cosas con una sola regla, en vez de repetir el barrido.
+    if new.contenido -> 'contradicciones'
+       is distinct from new.contenido_original -> 'contradicciones'
+    then
+      raise exception 'las contradicciones de un insight no se corrigen: son la evidencia que va en contra, y esconderla es la manera más limpia de vender una conclusión';
+    end if;
     return new;
   end if;
 

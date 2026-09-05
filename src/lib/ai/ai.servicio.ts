@@ -52,7 +52,13 @@ import {
   type RegistrarConsentimiento,
   type RevisarPropuesta,
 } from './ai.schemas';
-import { CITAS_DEL_CONTENIDO, ESQUEMA_DE_CONTENIDO, parsearContenido } from './ai.contenido';
+import {
+  CITAS_DEL_CONTENIDO,
+  ESQUEMA_DE_CONTENIDO,
+  parsearContenido,
+  TESTIMONIO_ADICIONAL,
+  type CitaDelContenido,
+} from './ai.contenido';
 import {
   credencialesAI,
   generarConProveedor,
@@ -356,11 +362,20 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
       r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica,
       case when p.capacidad = 'C2' then
         (select coalesce(json_agg(json_build_object(
-                  'id', e.id, 'titulo', e.titulo, 'resumen', e.resumen) order by e.titulo), '[]'::json)
-         from arquetipo a
-         join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
-         join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
-         where a.reto_id = r.id and a.workspace_id = r.workspace_id)
+                  'id', x.id, 'titulo', x.titulo, 'resumen', x.resumen)
+                  order by x.titulo, x.id), '[]'::json)
+         from (
+           -- DISTINCT, y el mismo orden que arma el prompt. La misma evidencia puede colgar de
+           -- DOS arquetipos del mismo reto —la clave de arquetipo_evidencia es
+           -- (arquetipo_id, evidencia_id), así que nada lo impide y es lo normal cuando dos
+           -- arquetipos comparten una entrevista—, y el join la devolvía repetida: el documento
+           -- salía dos veces en el material, el recuento del alcance mentía, y el presupuesto de
+           -- caracteres se gastaba en copias hasta truncar evidencia que sí era única.
+           select distinct e.id, e.titulo, e.resumen
+           from arquetipo a
+           join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+           join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+           where a.reto_id = r.id and a.workspace_id = r.workspace_id) x)
       else '[]'::json end as reto_evidencia`,
   },
   gate_id: {
@@ -415,6 +430,23 @@ type CapacidadEnElPanel = {
    * texto crudo de la base. Una sola definición, dos usos.
    */
   material: (f: Record<string, unknown>) => string;
+  /**
+   * Y contra QUÉ TROZO de ese material se mide una cita concreta, para las capacidades cuyo
+   * material son varios documentos.
+   *
+   * CI, C0 y CT citan contra uno solo —el item, el reto, el checklist—, así que «aparece en
+   * el material» es la pregunta entera y no declaran esto. C2 cita contra la evidencia de un
+   * reto, que son varios, y cada cita nombra el suyo: midiendo contra todos juntos, una cita
+   * que dice «esto está en la evidencia B» sale PRESENTE porque su texto está en la A. Y no
+   * es un verde cualquiera: la presencia literal es la única señal contrastable que tiene
+   * quien revisa, así que un verde prestado le dice que confíe en una cita que le manda a
+   * otro documento.
+   *
+   * Devuelve `null` cuando la cita nombra algo que no está en el material — que es distinto
+   * de «no aparece» y se resuelve igual (ausente), porque una cita a un documento que el
+   * modelo no vio no está sostenida por nada.
+   */
+  pajarDeLaCita?: (f: Record<string, unknown>, cita: CitaDelContenido) => string | null;
   /** Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad. */
   candidatas: (
     tx: TransactionSql,
@@ -602,6 +634,33 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         evidencia: (f.reto_evidencia as EvidenciaDelReto | null) ?? [],
       }).texto,
     /*
+     * Una cita de C2 se mide contra LA EVIDENCIA QUE NOMBRA, no contra todas juntas.
+     *
+     * El material de C2 son varios documentos y cada cita dice de cuál sale. Con el pajar
+     * completo, «el 71% de los abandonos, en la evidencia B» salía presente porque ese texto
+     * está en la A: un verde que le dice a quien revisa que confíe en una cita que le manda a
+     * otro documento, y la presencia literal es justo lo único que puede contrastar.
+     *
+     * Se compone con la MISMA función que arma el prompt, sobre esa sola evidencia: lo que se
+     * compara tiene que ser el texto que el modelo leyó de ella, con su ficha y su delimitador
+     * neutralizado, no el crudo de la base.
+     *
+     * Y si la cita nombra una evidencia que no está en el material, `null`: no es lo mismo que
+     * «no aparece», pero se resuelve igual —ausente—, porque una cita a un documento que el
+     * modelo no vio no la sostiene nada.
+     */
+    pajarDeLaCita: (f, cita) => {
+      const evidencia = (f.reto_evidencia as EvidenciaDelReto | null) ?? [];
+      const suya = evidencia.find((e) => e.id === cita.alcanceId);
+      if (!suya) return null;
+      return materialDeInsights({
+        codigo: (f.reto_codigo as string | null) ?? '',
+        titulo: (f.reto_titulo as string | null) ?? '',
+        descripcion: (f.reto_descripcion as string | null) ?? '',
+        evidencia: [suya],
+      }).texto;
+    },
+    /*
      * Retos CON EVIDENCIA y sin insights esperando revisión. Lo primero no es un filtro de
      * comodidad: sin evidencia, la única salida que cumple el contrato —afirmaciones con
      * citas literales— sale de la formulación del reto, o sea inventada. Es el mismo caso que
@@ -715,8 +774,30 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   // Por CAPACIDAD, no por la forma del objeto: las de C2 viven dentro de cada afirmación, y
   // con `'citas' in original` su grounding se habría medido sobre una lista vacía — o sea, no
   // se habría medido, que es el peor resultado posible para una medida de grounding.
-  const citas = CITAS_DEL_CONTENIDO[f.capacidad as CapacidadActiva](original);
-  const presencias = presenciaLiteralPorCita(material, citas);
+  /*
+   * Y degradando si la capacidad no está en el registro. `f.capacidad` son las diez de
+   * SPEC-08 y el registro cubre las ACTIVAS, así que la indexación puede devolver `undefined`
+   * de verdad: una fila escrita por una versión más nueva del servidor, o una capacidad que
+   * vuelve a apagarse dejando propuestas pendientes. Llamar a `undefined` aquí no degradaba la
+   * fila, tiraba el panel entero — y con él las filas de todas las demás capacidades.
+   *
+   * Sin citas es lo correcto y no un apaño: si nadie sabe dónde las guarda esa capacidad, no
+   * hay nada que medir, y decir «cero citas» es más honesto que inventarse dónde buscarlas.
+   */
+  const definicion = CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva] as
+    | CapacidadEnElPanel
+    | undefined;
+  const citas = CITAS_DEL_CONTENIDO[f.capacidad as CapacidadActiva]?.(original) ?? [];
+  /*
+   * La presencia, CITA A CITA, contra el trozo de material que cada una nombra cuando su
+   * capacidad lo declara. Antes se resolvía de una vez para toda la fila porque «el pajar es
+   * el mismo para todas sus citas», y eso dejó de ser cierto con C2: su material son varios
+   * documentos y cada cita dice de cuál sale.
+   */
+  const presencias = citas.map((c) => {
+    const pajar = definicion?.pajarDeLaCita?.(f, c) ?? material;
+    return presenciaLiteralPorCita(pajar ?? '', [c])[0]!;
+  });
   return {
     id: f.id as string,
     capacidad: f.capacidad as PropuestaEnPanel['capacidad'],
@@ -731,6 +812,9 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     citas: citas.map((c, i) => ({
       fragmento: c.fragmento,
       localizacion: c.localizacion,
+      // A qué documento dice señalar, cuando su capacidad lo dice. Sin esto, quien revisa ve
+      // el fragmento y su verde pero no CONTRA QUÉ se midió, que es la mitad de la señal.
+      alcanceId: c.alcanceId ?? null,
       presenteLiteral: presencias[i]!,
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
@@ -1862,14 +1946,17 @@ const PREPARAR: Record<
      * La evidencia del reto, por el ÚNICO camino que este esquema tiene: `evidencia` no cuelga
      * de un reto, cuelga del workspace, y lo que la ata a uno son sus ARQUETIPOS. La misma
      * consulta que proyecta el panel, para que el material contra el que se mide la presencia
-     * literal sea el que el modelo leyó.
+     * literal sea el que el modelo leyó. «La misma» incluye el DISTINCT y el desempate del
+     * orden: una evidencia puede colgar de dos arquetipos del mismo reto, y si una de las dos
+     * consultas la trae repetida y la otra no, el pajar contra el que se mide una cita deja de
+     * ser el texto que el modelo tuvo delante.
      */
-    const evidencia = await tx`select e.id, e.titulo, e.resumen
+    const evidencia = await tx`select distinct e.id, e.titulo, e.resumen
       from arquetipo a
       join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
       join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
       where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
-      order by e.titulo asc`;
+      order by e.titulo asc, e.id asc`;
     /*
      * Sin evidencia no se llama. El contrato de C2 obliga a que cada afirmación cite un
      * fragmento literal, y sin evidencia la única salida que lo cumple sale de la formulación
@@ -2468,6 +2555,24 @@ async function aceptarPropuestaEnTransaccion(
         throw new ErrorAI(
           'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',
         );
+      }
+      /*
+       * Y lo que cada capacidad declare intocable ADEMÁS de sus citas, por registro y no por
+       * un `if` sobre la capacidad: el guardián de ramas binarias de este pipeline existe
+       * justo para eso, y lo cazó cuando esto era un `if`.
+       *
+       * Hoy solo C2, con sus contradicciones; el motivo lo escribe la capacidad, porque quien
+       * lo lee necesita saber QUÉ no se toca y no «algo». Cerraba además un agujero de
+       * alcance: `parsearContenido` admite cambiarlas y nada comprobaba que la evidencia nueva
+       * fuera del reto —`contradiccion` solo lleva la FK del tenant—, así que una corrección
+       * podía apuntar a cualquiera del workspace y la aceptación la materializaba.
+       */
+      const adicional = TESTIMONIO_ADICIONAL[p.capacidad];
+      if (
+        adicional &&
+        canonico(adicional.parte(contenido)) !== canonico(adicional.parte(p.contenidoOriginal))
+      ) {
+        throw new ErrorAI(adicional.motivo);
       }
     }
     /*

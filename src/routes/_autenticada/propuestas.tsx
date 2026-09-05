@@ -1501,8 +1501,7 @@ function FormularioInsight({
             />
           </label>
           <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <input
-              type="checkbox"
+            <Checkbox
               checked={a.esHipotesis}
               onChange={(e) => cambiar(i, { esHipotesis: e.target.checked })}
             />
@@ -1518,6 +1517,31 @@ function FormularioInsight({
           ))}
         </div>
       ))}
+      {/*
+        Las CONTRADICCIONES y la CONFIANZA, a la vista y sin editar.
+
+        El comentario de arriba decía que no se corrigen, y era verdad — pero el formulario no
+        las enseñaba, así que quien corregía decidía entre aceptar y rechazar sin ver la
+        evidencia que va EN CONTRA de lo que está a punto de aceptar. Decir «esto no se toca»
+        y a la vez ocultarlo son dos cosas distintas: la primera protege la señal, la segunda
+        se la quita a quien tiene que usarla. Se pintan igual que las citas.
+      */}
+      {inicial.contradicciones.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <span style={etiqueta}>Contradicciones señaladas (no editables)</span>
+          {inicial.contradicciones.map((c, i) => (
+            <span
+              key={String(i)}
+              style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--warn)' }}
+            >
+              «{c.descripcion}» · evidencia {c.evidenciaId}
+            </span>
+          ))}
+        </div>
+      )}
+      <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-faint)' }}>
+        Confianza declarada por el modelo (no editable): {inicial.confianzaPropuesta}
+      </span>
       <div style={{ display: 'flex', gap: 10 }}>
         <Button size="sm" type="submit" disabled={ocupado}>
           Corregir y aceptar

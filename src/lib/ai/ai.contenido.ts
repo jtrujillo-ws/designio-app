@@ -208,7 +208,22 @@ export const ContenidoInsightSchema = z
           descripcion: z.string().trim().min(1).max(1000),
         }),
       )
-      .max(4),
+      .max(4)
+      /*
+       * UNA por evidencia. No es una preferencia de estilo: `contradiccion` tiene
+       * `unique (insight_id, evidencia_id)`, así que un contenido con dos contradicciones
+       * sobre el mismo documento se persiste, se enseña, se revisa… y su aceptación falla
+       * SIEMPRE, en el segundo insert. Quien revisa se queda con una propuesta que solo
+       * puede rechazar y sin manera de saber por qué —el formulario no edita las
+       * contradicciones—, y la llamada ya está pagada.
+       *
+       * Se corta en el contrato, que es donde se puede decir el motivo: una respuesta que
+       * no se puede aceptar se descarta al parsearla, como cualquier otra fuera de forma.
+       */
+      .refine(
+        (xs) => new Set(xs.map((x) => x.evidenciaId)).size === xs.length,
+        'dos contradicciones no pueden señalar la misma evidencia: el insight solo admite una por documento',
+      ),
     confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
   })
   .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
@@ -269,7 +284,27 @@ export const ESQUEMA_DE_CONTENIDO: Record<
  * `Record<CapacidadActiva, …>` para que una capacidad nueva tenga que decir dónde están las
  * suyas en vez de heredar una suposición.
  */
-export type CitaDelContenido = { fragmento: string; localizacion: string };
+export type CitaDelContenido = {
+  fragmento: string;
+  localizacion: string;
+  /**
+   * A QUÉ trozo del material señala esta cita, cuando su capacidad lo dice.
+   *
+   * Las tres primeras capacidades citan contra UN material —el item, el reto, el checklist—,
+   * así que «dónde aparece el fragmento» y «dónde dice la cita que aparece» son la misma
+   * pregunta. C2 cita contra la evidencia de un reto, que son VARIOS documentos, y cada cita
+   * nombra el suyo: sin esto, la presencia literal se mediría contra todos juntos y una cita
+   * que dice «esto está en la evidencia B» saldría PRESENTE porque su texto está en la A.
+   *
+   * Eso no es un falso positivo cualquiera: la presencia literal es la única señal
+   * contrastable que tiene quien revisa —el fragmento y la localización son texto—, y un
+   * verde prestado le dice que puede confiar en una cita que manda a otro documento.
+   *
+   * `undefined` en las capacidades que citan contra un material único, que es su respuesta
+   * correcta y no una omisión.
+   */
+  alcanceId?: string;
+};
 export const CITAS_DEL_CONTENIDO: Record<
   CapacidadActiva,
   (contenido: ContenidoPropuesta) => CitaDelContenido[]
@@ -277,7 +312,45 @@ export const CITAS_DEL_CONTENIDO: Record<
   CI: (c) => (c as ContenidoExtraccion).citas,
   C0: (c) => (c as ContenidoCriterio).citas,
   CT: (c) => (c as ContenidoAsistenteGate).citas,
-  C2: (c) => (c as ContenidoInsight).afirmaciones.flatMap((a) => a.citas),
+  C2: (c) =>
+    (c as ContenidoInsight).afirmaciones.flatMap((a) =>
+      a.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId })),
+    ),
+};
+
+/**
+ * Qué MÁS, aparte de las citas, es testimonio del modelo y por tanto no se corrige.
+ *
+ * Las citas las cubre `CITAS_DEL_CONTENIDO` para todas; esto es lo que cada capacidad añade
+ * por su cuenta. Hoy solo C2: sus CONTRADICCIONES.
+ *
+ * Y está en un registro y no en un `if (capacidad === 'C2')` porque este repositorio ya paga
+ * esa lección con nombre propio —hay un guardián que barre el pipeline buscando ramas
+ * binarias por capacidad, y lo encontró—. Con el `if`, la segunda capacidad que tuviera algo
+ * intocable se habría comportado como la primera sin que faltara ninguna entrada.
+ *
+ * `null` es «nada más», y es una respuesta, no un hueco: el compilador exige la entrada de
+ * toda capacidad activa, así que una nueva tiene que decidirlo en vez de heredarlo.
+ */
+export const TESTIMONIO_ADICIONAL: Record<
+  CapacidadActiva,
+  { parte: (contenido: ContenidoPropuesta) => unknown; motivo: string } | null
+> = {
+  CI: null,
+  C0: null,
+  CT: null,
+  C2: {
+    parte: (c) => (c as ContenidoInsight).contradicciones,
+    /*
+     * Una contradicción es la evidencia que va EN CONTRA del insight. I4 pide señalarla
+     * precisamente porque esconderla es la manera más limpia de vender una conclusión, así
+     * que dejar que quien revisa la reescriba al «corregir» sería devolverle esa manera con
+     * otro nombre. Y señala un documento por su id, o sea que es —con las citas— la parte
+     * contrastable de la salida de C2.
+     */
+    motivo:
+      'Las contradicciones de un insight no se corrigen: son la evidencia que va en contra de lo que propone, y esconderla es la manera más limpia de vender una conclusión. Corrige el resto, o rechaza el insight.',
+  },
 };
 
 /**

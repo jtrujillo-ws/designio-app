@@ -5781,7 +5781,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       }),
     ).resolves.toMatchObject({ estado: 'corregida' });
 
-    // Cambiar el FRAGMENTO de una cita, no.
+    // Cambiar el FRAGMENTO de una cita, no. Se pide la SALIDA además del asunto, por lo mismo
+    // que en las contradicciones: las dos capas dicen «no se corrigen» y la clase tampoco las
+    // separa (todo P0001 sale como `ErrorAI`), pero solo el servicio puede decir qué hacer con
+    // la propuesta. El suelo tiene su sonda más abajo.
     const otra = await nuevaPropuesta(leadId, { capacidad: 'C2', anclas: { reto_id: retoId } });
     await expect(
       aceptarPropuesta(leadId, {
@@ -5802,7 +5805,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           ],
         },
       }),
-    ).rejects.toThrow(/no se corrigen/i);
+    ).rejects.toThrow(/no se corrigen[^]*rechaza la propuesta/i);
 
     // Y REORDENAR las afirmaciones tampoco: la comparación es posicional a propósito, porque
     // `afirmacion` tiene único `(insight_id, orden)` y mover una afirmación mueve su sitio en
@@ -6078,5 +6081,224 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         `el destino «${d}» no entra en la cuenta del objeto materializado: aceptarlo sería imposible`,
       ).toContain(COLUMNA_DE_DESTINO[d]);
     }
+  });
+
+  /**
+   * Una cita se mide contra LA EVIDENCIA QUE NOMBRA, no contra todas juntas.
+   *
+   * El material de C2 son varios documentos y cada cita dice de cuál sale. Midiendo contra el
+   * pajar completo, «esto está en la evidencia B» salía PRESENTE porque su texto estaba en la
+   * A — y eso no es un verde cualquiera: la presencia literal es la única señal contrastable
+   * que tiene quien revisa (el fragmento y la localización son texto), así que un verde
+   * prestado le dice que confíe en una cita que le manda a otro documento.
+   *
+   * Las dos mitades en el mismo caso: la cita bien puesta sale presente, y la que nombra el
+   * documento equivocado —con un fragmento que SÍ existe, pero en el otro— sale ausente.
+   */
+  it('la presencia literal de una cita se mide contra la evidencia que nombra', async () => {
+    await enWorkspaceLimpio('c2-cita-por-evidencia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const a = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const b = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Encuesta de salida',
+        resumen: 'Quien abandona dice que no sabía qué documento subir.',
+      });
+
+      const contenido: ContenidoInsight = {
+        titulo: 'Dónde se pierde la gente',
+        resumen: 'El abandono se concentra en la carga del documento.',
+        afirmaciones: [
+          {
+            texto: 'La mayoría abandona al cargar el documento',
+            esHipotesis: false,
+            citas: [
+              // Bien puesta: el fragmento es de A y la cita nombra a A.
+              { evidenciaId: a, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' },
+              // Mal puesta: el fragmento existe —está en A— pero la cita dice que es de B.
+              // Con el pajar completo esto salía en verde, que es el defecto.
+              { evidenciaId: b, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' },
+              // Y una que nombra evidencia que el modelo no vio se resuelve igual: ausente.
+              // (Va con el id de la propia B para no chocar con el guard de evidencia ajena;
+              //  lo que la hace ausente es su fragmento, que no está en ningún documento.)
+              { evidenciaId: b, fragmento: 'esto no está en ninguna parte', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        contradicciones: [],
+        confianzaPropuesta: 'media',
+      };
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: { insights: [contenido] },
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      expect(p.citas.map((c) => c.presenteLiteral)).toEqual([true, false, false]);
+      // Y la proyección dice CONTRA QUÉ se midió cada una: sin eso, quien revisa ve el verde
+      // pero no de qué documento habla, que es la mitad de la señal.
+      expect(p.citas.map((c) => c.alcanceId)).toEqual([a, b, b]);
+    });
+  });
+
+  /**
+   * La misma evidencia enlazada por DOS arquetipos del mismo reto se cuenta una vez.
+   *
+   * La clave de `arquetipo_evidencia` es `(arquetipo_id, evidencia_id)`, así que nada impide
+   * que dos arquetipos del mismo reto compartan una entrevista — y es lo normal. El join la
+   * devolvía repetida: el documento salía dos veces en el material que ve el modelo, el
+   * recuento del alcance mentía, y el presupuesto de caracteres se gastaba en copias hasta
+   * truncar evidencia que sí era única.
+   */
+  it('la evidencia que cuelga de dos arquetipos del mismo reto no se duplica', async () => {
+    await enWorkspaceLimpio('c2-evidencia-duplicada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Entrevista compartida',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      // Un segundo arquetipo del MISMO reto que enlaza LA MISMA evidencia.
+      const [otro] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, 'Segundo arquetipo', 'Definición', ${curadorId}) returning id`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${otro!.id as string}, ${ev})`;
+
+      const contenido: ContenidoInsight = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId: ev, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones: [],
+        confianzaPropuesta: 'media',
+      };
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+
+      const [p] = await conUsuario(curadorId, (tx) => tx`
+        select alcance_resumen from propuesta_ai
+        where workspace_id = ${wsC} and capacidad = 'C2'`);
+      // El resumen del alcance es lo que queda escrito de lo que se le mandó al modelo: si
+      // dijera «2 evidencias» estaría contando el mismo documento dos veces.
+      expect(p!.alcance_resumen as string).toContain('1 evidencias');
+    });
+  });
+
+  /**
+   * Dos contradicciones sobre la MISMA evidencia se rechazan al parsear.
+   *
+   * `contradiccion` tiene `unique (insight_id, evidencia_id)`, así que ese contenido se
+   * persistía, se enseñaba, se revisaba… y su aceptación fallaba SIEMPRE en el segundo insert.
+   * Quien revisa se quedaba con una propuesta que solo podía rechazar y sin manera de saber
+   * por qué —el formulario no edita las contradicciones—, con la llamada ya pagada. Se corta
+   * en el contrato, que es donde se puede decir el motivo.
+   */
+  it('un insight con dos contradicciones sobre la misma evidencia no llega a nacer', async () => {
+    await enWorkspaceLimpio('c2-contradicciones-repetidas', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId: ev, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones: [
+          { evidenciaId: ev, descripcion: 'Va en contra por un lado' },
+          { evidenciaId: ev, descripcion: 'Y también por otro' },
+        ],
+        confianzaPropuesta: 'media',
+      };
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+          ).rejects.toThrow(/no cumplió el esquema/);
+        },
+      );
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai where workspace_id = ${wsC}`);
+      expect(quedan[0]!.n).toBe(0);
+    });
+  });
+
+  /**
+   * Y las CONTRADICCIONES no se corrigen, por lo mismo que las citas y por una razón propia.
+   *
+   * Son la otra mitad contrastable de la salida de C2 —señalan un documento por su id— y son,
+   * además, la evidencia que va EN CONTRA. I4 pide señalarla precisamente porque esconderla es
+   * la manera más limpia de vender una conclusión, así que dejar que quien revisa la reescriba
+   * al «corregir» sería devolverle esa manera con otro nombre.
+   *
+   * Y cerraba un agujero de alcance: nada comprobaba que la evidencia nueva fuera del reto
+   * —`contradiccion` solo lleva la FK del tenant—, así que una corrección podía apuntar a
+   * cualquiera del workspace y la aceptación la materializaba.
+   */
+  it('las contradicciones de un insight no se corrigen', async () => {
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C2',
+      anclas: { reto_id: retoId },
+      contenido: {
+        ...CONTENIDO_C2(evidenciaDelRetoId),
+        contradicciones: [
+          { evidenciaId: evidenciaDelRetoId, descripcion: 'La encuesta apunta a otra cosa' },
+        ],
+      },
+    });
+    const original = {
+      ...CONTENIDO_C2(evidenciaDelRetoId),
+      contradicciones: [
+        { evidenciaId: evidenciaDelRetoId, descripcion: 'La encuesta apunta a otra cosa' },
+      ],
+    };
+    /*
+     * Por su SALIDA, no solo por el asunto. La regla vive en dos capas —el servicio y el guard
+     * de la base— y las dos dicen lo mismo, así que una sonda que mire «contradicciones … no
+     * se corrigen» pasa con cualquiera de las dos apagada. La clase tampoco separa: medido,
+     * `aceptarPropuesta` traduce CUALQUIER P0001 a `ErrorAI`, así que el rechazo del suelo
+     * también llega como error de dominio (lo cual es correcto y es lo que esa traducción
+     * existe para dar).
+     *
+     * Lo que sí las separa es la SALIDA que ofrece el mensaje: la del servicio dice qué hacer
+     * con la propuesta, y la del guard no puede —una restricción de la base no sabe que hay
+     * una pantalla de revisión al otro lado—. El suelo tiene su propia sonda más abajo.
+     */
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...original, contradicciones: [] },
+      }),
+    ).rejects.toThrow(/no se corrigen[^]*rechaza el insight/i);
+
+    // Y el suelo, con la conexión de administración por lo mismo que el de las citas: el rol
+    // de aplicación no llega a este guard —su política de UPDATE exige estado decidido,
+    // revisor y fecha—, así que lo que este caso puede afirmar es que el trigger está debajo.
+    const admin = sqlAdmin();
+    await expect(
+      admin`update propuesta_ai
+        set contenido = ${admin.json({ ...original, contradicciones: [] })}
+        where id = ${propuestaId} and workspace_id = ${ws}`,
+    ).rejects.toThrow(/contradicciones .* no se corrigen/i);
   });
 });

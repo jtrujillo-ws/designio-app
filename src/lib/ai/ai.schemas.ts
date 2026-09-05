@@ -499,6 +499,14 @@ export type CitaConPresencia = {
   fragmento: string;
   localizacion: string;
   /**
+   * A qué trozo del material dice señalar esta cita, cuando su capacidad cita contra varios.
+   *
+   * `null` en las que citan contra un material único, que es su respuesta correcta. Viaja al
+   * panel porque el verde de `presenteLiteral` no significa lo mismo sin él: con varios
+   * documentos, «aparece» tiene que decir DÓNDE, y sin eso quien revisa ve media señal.
+   */
+  alcanceId: string | null;
+  /**
    * true si el fragmento aparece LITERAL en el material del alcance. Es una subcadena, y el
    * nombre lo dice porque el control no establece nada más: una cita puede estar presente
    * palabra por palabra y no sostener la afirmación que acompaña —basta con que el modelo

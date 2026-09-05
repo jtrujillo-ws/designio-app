@@ -15,6 +15,11 @@ import {
 import { costoDeUso, MODELO_PRIMARIO } from '../src/lib/ai/ai.degradacion';
 import { PROMPT_VERSION } from '../src/lib/ai/ai.prompts';
 import { CONFIANZA_PROPUESTA_NUMERICA, type ContenidoExtraccion } from '../src/lib/ai/ai.schemas';
+import {
+  LoginSchema,
+  PASSWORD_MAX_BYTES,
+  ROLES_QUE_INVITAN,
+} from '../src/lib/auth/auth.schemas';
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error('Falta DATABASE_URL (conexión admin; ver .env.local.example)');
@@ -1150,11 +1155,226 @@ async function sembrarPropuestaAI(
  * un servicio, sin retos aún. Idempotente por MEMBRESÍA de Lucía + nombre: el nombre
  * de workspace no es único y uno homónimo ajeno no debe saltarse el seed. Devuelve si
  * lo creó en esta corrida. */
-async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Promise<boolean> {
-  const existe = await tx`select 1 from workspace w
+/**
+ * Devuelve el ID del segundo workspace y si lo acaba de crear.
+ *
+ * El ID, y no solo un booleano, porque quien concede accesos no puede volver a buscarlo por
+ * nombre: `workspace.nombre` no es único y una base de desarrollo puede tener otro
+ * «Clínica del Valle» de un cliente distinto. El único id fiable es el que sale de aquí.
+ */
+/**
+ * Las claves con las que el seed sella EN `sembrado_registro` los workspaces que crea.
+ *
+ * Por qué ahí y no en `evento_dominio`: la política `evento_insert` autoriza a CUALQUIER
+ * miembro a escribir eventos con cualquier tipo y cualquier payload, así que un evento
+ * `WorkspaceCreado` con `origen: 'seed'` es una afirmación falsificable — la misma que
+ * `…300000-la-procedencia-del-sembrado-no-la-escribe-la-app.sql` declaró insuficiente y
+ * sustituyó por esta tabla. Lo intenté con el evento en la ronda anterior y una revisión lo
+ * cazó: un miembro de un «Banco Andino» ajeno podía fabricar la marca y esperar a la
+ * siguiente corrida.
+ *
+ * `sembrado_registro` no tiene política ni grant de INSERT para el rol de aplicación: solo
+ * escribe ahí el propietario, que es quien corre este fichero. La ausencia de otra mano es
+ * estructural, no una cuestión de confiar en nadie.
+ */
+const CLAVE_WS_PRIMARIO = 'workspace:banco-andino';
+const CLAVE_WS_SEGUNDO = 'workspace:clinica-del-valle';
+
+/** El nombre que lleva cada workspace sembrado, por su clave de sello. */
+const NOMBRE_POR_CLAVE: Record<string, string> = {
+  [CLAVE_WS_PRIMARIO]: 'Banco Andino',
+  [CLAVE_WS_SEGUNDO]: 'Clínica del Valle',
+};
+
+/**
+ * El camino de SUBIDA para una base sembrada antes de que existieran los sellos.
+ *
+ * Sin él, encender `SEED_ADMIN_EMAIL` en una base así crea la cuenta y la deja sin las dos
+ * membresías que el runbook promete — y ése no es un caso raro: es el camino normal de
+ * cualquier entorno que ya estuviera desplegado, incluido el nuestro. Lo señaló una revisión.
+ *
+ * Y no se resuelve adoptando por forma. Sellar «el único Banco Andino que tenga a Lucía» sería
+ * meter una INFERENCIA en el sitio infalsificable, que es justo lo que
+ * `…300000-la-procedencia-del-sembrado-no-la-escribe-la-app.sql` se negó a hacer al no migrar
+ * el marcador viejo. Con dos homónimos la inferencia además elige, y elige mal la mitad de las
+ * veces.
+ *
+ * Lo resuelve quien SÍ sabe: la persona que opera el despliegue enumera los ids en
+ * `SEED_SELLAR_WORKSPACES`. No afloja nada — esa persona ya tiene el DSN administrativo, así
+ * que su palabra vale exactamente lo que vale la del propio seed—, y a cambio la afirmación
+ * queda escrita donde la aplicación no escribe.
+ *
+ * Lo que el seed sí comprueba antes de sellar, porque puede: que el workspace exista, que se
+ * llame como el que dice ser, y que no haya ya un sello de esa clave apuntando a otro. Un
+ * error de dedo en la variable falla ruidosamente en vez de sellar el tenant equivocado.
+ */
+async function sellarWorkspacesIndicados(cliente: typeof sql): Promise<string[]> {
+  const crudo = process.env.SEED_SELLAR_WORKSPACES?.trim();
+  if (!crudo) return [];
+  const ids = crudo.split(',').map((x) => x.trim()).filter((x) => x.length > 0);
+  /*
+   * TODO en una transacción, y aquí no es prolijidad: los sellos se escribían en autocommit y
+   * la comprobación de completitud iba al final. Con un id bueno seguido de uno malo —un
+   * uuid inexistente, un dedazo—, el primero quedaba SELLADO Y CONFIRMADO y el segundo tiraba
+   * el seed. El operador, con el despliegue caído, quita la variable para desbloquearlo… y el
+   * despliegue siguiente se fía de ese sello a medias: `sembrarAdminPropio` concede sobre el
+   * único workspace sellado y la comprobación de «los dos» ya no corre, porque sin variable no
+   * hay nada que sellar. La instalación queda con la mitad de las membresías y con aspecto de
+   * completa, que es justo lo que esa comprobación existía para impedir.
+   *
+   * Con la transacción, un id malo revierte también los sellos que le precedían: el estado
+   * después de un fallo es el mismo de antes de intentarlo, y el operador arregla la variable
+   * en vez de heredar medio sello.
+   */
+  return cliente.begin(async (tx) => sellarDentroDeTransaccion(tx, ids));
+}
+
+async function sellarDentroDeTransaccion(
+  cliente: TransactionSql,
+  ids: string[],
+): Promise<string[]> {
+  const dichos: string[] = [];
+  /** Los que se nombraron y resultaron estar borrados por acuerdo: no se sellan y NO cuentan
+   * como «sin sellar» en la comprobación final — no van a volver. */
+  const dispuestos = new Set<string>();
+  for (const id of ids) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      throw new Error(`SEED_SELLAR_WORKSPACES: «${id}» no es un uuid`);
+    }
+    /*
+     * ¿Ya está sellado ESTE id? Se pregunta PRIMERO, y por el id — antes que nada sobre su
+     * nombre. La variable se queda puesta entre despliegues (el runbook dice que se puede
+     * quitar, no que haya que hacerlo), y el nombre de un workspace NO es estable: la
+     * disposición acordada lo reescribe a «Workspace borrado por acuerdo». Validando el nombre
+     * primero, el despliegue siguiente a una disposición rechazaba un id que ya estaba
+     * sellado, el seed salía con error y —con `set -e` en el entrypoint— la aplicación no
+     * arrancaba. Un sello que ya existe no necesita que nada se compruebe: no hay nada que
+     * escribir.
+     */
+    const [yaEsteId] = await cliente`select clave from sembrado_registro
+      where workspace_id = ${id} and clave like 'workspace:%'`;
+    if (yaEsteId) {
+      dichos.push(`${NOMBRE_POR_CLAVE[yaEsteId.clave as string] ?? (yaEsteId.clave as string)}: ya sellado`);
+      continue;
+    }
+    const [ws] = await cliente`select w.nombre,
+        exists (select 1 from constancia_disposicion c where c.workspace_id = w.id) as dispuesto
+      from workspace w where w.id = ${id}`;
+    if (!ws) throw new Error(`SEED_SELLAR_WORKSPACES: no existe el workspace ${id}`);
+    /*
+     * Un workspace DISPUESTO por acuerdo no se sella, y sobre todo no tumba el despliegue.
+     *
+     * El borrado acordado se lleva su sello por delante —`sembrado_registro` tiene
+     * `workspace_id`, así que `tablas_alcanzadas_por_borrado()` la incluye— y deja la fila
+     * del workspace con el nombre lápida. Con la variable puesta (el runbook permite
+     * dejarla), el arranque siguiente no encontraba sello, leía «Workspace borrado por
+     * acuerdo», no lo reconocía como ninguno de los demo, lanzaba, y con `set -e` en el
+     * entrypoint la aplicación no arrancaba. Un borrado que el cliente pidió dejaba el
+     * despliegue caído.
+     *
+     * Se pregunta por la CONSTANCIA y no por el nombre. El nombre es una cadena que alguien
+     * puede escribir; la constancia es la prueba del borrado y no se borra —está en la lista
+     * de exclusiones de `tablas_alcanzadas_por_borrado()` junto al acuerdo que la sostiene—.
+     * Comparar cadenas para clasificar es el vicio que este repositorio ya pagó en el censo
+     * del calendario.
+     */
+    if (ws.dispuesto as boolean) {
+      dichos.push(`${id}: dispuesto por acuerdo, no se sella`);
+      dispuestos.add(id);
+      continue;
+    }
+    const nombre = ws.nombre as string;
+    const clave = Object.keys(NOMBRE_POR_CLAVE).find((k) => NOMBRE_POR_CLAVE[k] === nombre);
+    if (!clave) {
+      throw new Error(
+        `SEED_SELLAR_WORKSPACES: el workspace ${id} se llama «${nombre}», que no es ninguno de los que siembra este seed`,
+      );
+    }
+    const yaSellado = await workspaceSellado(cliente, clave);
+    if (yaSellado) {
+      throw new Error(
+        `SEED_SELLAR_WORKSPACES: «${nombre}» ya está sellado y apunta a ${yaSellado}; sellar ${id} encima cambiaría de tenant en silencio`,
+      );
+    }
+    await cliente`insert into sembrado_registro (workspace_id, clave, payload)
+      values (${id}, ${clave}, ${cliente.json({ nombre, origen: 'SEED_SELLAR_WORKSPACES' })})
+      on conflict (workspace_id, clave) do nothing`;
+    dichos.push(`${nombre}: sellado`);
+  }
+
+  /*
+   * Y al terminar, los DOS tienen que estar sellados. Con un solo uuid en la variable —o con
+   * un valor inútil como «,», que parsea a cero ids— esto salía «bien» habiendo sellado uno o
+   * ninguno, y `sembrarAdminPropio` concedía sobre lo que hubiera: una instalación a medias con
+   * aspecto de completa, mientras el runbook promete las dos membresías.
+   *
+   * Se comprueba el ESTADO FINAL y no cuántos ids se listaron, que es lo que hace correcta la
+   * segunda pasada: si uno ya estaba sellado de antes, basta con nombrar el que falta.
+   */
+  const sinSellar: string[] = [];
+  for (const [clave, nombre] of Object.entries(NOMBRE_POR_CLAVE)) {
+    if (!(await workspaceSellado(cliente, clave))) sinSellar.push(nombre);
+  }
+  /*
+   * Si alguno de los nombrados estaba DISPUESTO, no se aborta: se dice y se sigue.
+   *
+   * La comprobación de completitud existe para atrapar una VARIABLE a medias —un solo uuid,
+   * un valor inútil como «,»—, no un borrado que el cliente pidió. Con un workspace dispuesto
+   * el conjunto no puede estar completo por definición, y tumbar el despliegue por eso sería
+   * castigar el ejercicio de un derecho.
+   *
+   * Y lo que pasa después está comprobado contra la base, porque el mensaje prometía menos de
+   * lo que ocurre: el seed sigue, no encuentra un «Clínica del Valle» vivo —el dispuesto lleva
+   * la lápida por nombre—, crea uno nuevo y lo SELLA al crearlo. Estado final medido: los dos
+   * sellos apuntando a workspaces vivos y la lápida aparte. Así que esto no anuncia una
+   * instalación coja: anuncia que el sello de ESE id no se escribe, y por qué.
+   */
+  if (dispuestos.size > 0 && sinSellar.length > 0) {
+    dichos.push(
+      `No se sella ${dispuestos.size} workspace(s) nombrado(s) en la variable: están borrados ` +
+        `por acuerdo. Falta el sello de ${sinSellar.join(' y ')}; si el seed crea su reemplazo ` +
+        'a continuación, lo sellará al crearlo.',
+    );
+    return dichos;
+  }
+  if (sinSellar.length > 0) {
+    throw new Error(
+      `SEED_SELLAR_WORKSPACES: al terminar siguen sin sellar ${sinSellar.join(' y ')}. ` +
+        'La variable tiene que traer los ids de LOS DOS workspaces demo (los que ya estuvieran ' +
+        'sellados no hace falta repetirlos); sellar solo uno dejaría la cuenta con la mitad de ' +
+        'las membresías que el runbook promete.',
+    );
+  }
+  return dichos;
+}
+
+/** El workspace que ESTE seed creó bajo esa clave, o null si no consta. */
+async function workspaceSellado(
+  cliente: typeof sql | TransactionSql,
+  clave: string,
+): Promise<string | null> {
+  const [fila] = await cliente`select workspace_id from sembrado_registro
+    where clave = ${clave} order by creado_en asc, workspace_id asc limit 1`;
+  return (fila?.workspace_id as string | undefined) ?? null;
+}
+
+async function sembrarSegundoWorkspace(
+  tx: TransactionSql,
+  luciaId: string,
+): Promise<{ id: string; creado: boolean; sellado: boolean }> {
+  // El SELLO primero: es el único id que acredita que este workspace salió de aquí. El
+  // nombre acotado por la membresía de Lucía no vale para eso —esa cuenta demo puede estar
+  // invitada a un homónimo ajeno, y entonces las dos condiciones se cumplen a la vez—, así
+  // que se queda solo como respuesta a «¿hace falta crearlo?» en bases sembradas por una
+  // versión anterior, que no tienen sello. `sellado` dice cuál de las dos cosas pasó, y quien
+  // concede accesos solo mira las selladas.
+  const yaSellado = await workspaceSellado(tx, CLAVE_WS_SEGUNDO);
+  if (yaSellado) return { id: yaSellado, creado: false, sellado: true };
+  const [existe] = await tx`select w.id from workspace w
     join miembro m on m.workspace_id = w.id
-    where w.nombre = 'Clínica del Valle' and m.usuario_id = ${luciaId}`;
-  if (existe.length > 0) return false;
+    where w.nombre = 'Clínica del Valle' and m.usuario_id = ${luciaId}
+    order by w.creado_en asc, w.id asc`;
+  if (existe) return { id: existe.id as string, creado: false, sellado: false };
   const [ws2] = await tx`insert into workspace (nombre) values ('Clínica del Valle') returning id`;
   const ws2Id = ws2!.id as string;
   await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
@@ -1163,13 +1383,415 @@ async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Pro
     values (${ws2Id}, 'Agendamiento de citas', 'Reserva y confirmación de citas médicas', ${luciaId})`;
   await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
     (${ws2Id}, 'WorkspaceCreado', ${tx.json({ nombre: 'Clínica del Valle', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
-  return true;
+  // Y el SELLO, donde la aplicación no escribe.
+  await tx`insert into sembrado_registro (workspace_id, clave, payload)
+    values (${ws2Id}, ${CLAVE_WS_SEGUNDO}, ${tx.json({ nombre: 'Clínica del Valle' })})
+    on conflict (workspace_id, clave) do nothing`;
+  return { id: ws2Id, creado: true, sellado: true };
+}
+
+/**
+ * La cuenta PROPIA de quien despliega, por variable de entorno y no escrita aquí.
+ *
+ * Por qué no va en `PERSONAS`: una dirección real metida en el seed queda en el historial
+ * del repositorio para siempre y se la lleva cualquiera que clone. Las tres de arriba son
+ * de dominios `.demo` inexistentes a propósito; una de verdad no lo es.
+ *
+ * Idempotente y con la MISMA regla que las demo: si la cuenta ya existe, solo se le pone
+ * contraseña cuando no tiene ninguna. Un seed que reescribiera la contraseña en cada
+ * arranque convertiría una variable de entorno vieja en una puerta abierta — y este seed
+ * corre en CADA despliegue con `SEED_ON_START=true`.
+ *
+ * Entra como `lead-boutique` en los dos workspaces sembrados, que es lo que hace útil la
+ * cuenta: uno solo no ejercita el selector.
+ */
+type AdminPropio = { email: string; clave: string; nombre: string };
+
+/**
+ * Lee y VALIDA la configuración de la cuenta propia, sin tocar la base.
+ *
+ * Va aparte de la siembra porque el orden importa: `sembrarAdminPropio` corre al final, y
+ * comprobar allí las variables significaba que un despliegue limpio con el correo mal escrito
+ * creaba los dos workspaces y las tres cuentas demo enteros y DESPUÉS salía con error. El
+ * mensaje decía «no se crea nada» y la base decía otra cosa. Esto se llama antes de la
+ * primera escritura, así que la promesa se cumple: o la configuración vale, o no se escribe.
+ *
+ * Devuelve `null` cuando no hay cuenta que sembrar; lanza cuando la hay y está mal.
+ */
+function leerAdminPropio(): AdminPropio | null {
+  const crudo = process.env.SEED_ADMIN_EMAIL?.trim();
+  if (!crudo) return null;
+  const clave = process.env.SEED_ADMIN_PASSWORD ?? '';
+
+  /*
+   * Las dos condiciones que deciden si esta cuenta podrá ENTRAR se comprueban con el mismo
+   * contrato que gobierna la puerta, no con una regla escrita aquí. Un seed que crea una
+   * cuenta privilegiada y declara «asegurada» sobre algo que el login va a rechazar es peor
+   * que un seed que no la crea: nadie va a mirar otra vez.
+   *
+   * El correo, con el campo de `LoginSchema` —que además normaliza (trim + minúsculas), así
+   * que la normalización a mano de antes desaparece con él—. Una errata en la variable creaba
+   * la cuenta, la base la aceptaba y el login la rechazaba por formato.
+   *
+   * La clave, en BYTES y no en caracteres. Medido: 50 caracteres acentuados son 100 bytes;
+   * pasaban el `clave.length < 12` de antes, bcrypt los truncaba a 72 en silencio y
+   * `autenticar` los rechaza de entrada por pasar de `PASSWORD_MAX_BYTES` — una cuenta
+   * imposible de usar, anunciada como lista. El suelo de 12 CARACTERES es propio del seed y
+   * más estricto que el del producto (10): una credencial privilegiada que sale en una
+   * variable de entorno merece más, no menos.
+   */
+  const correo = LoginSchema.shape.email.safeParse(crudo);
+  if (!correo.success) {
+    throw new Error(
+      `SEED_ADMIN_EMAIL no es un correo válido (${crudo}): el login lo rechazaría, así que la cuenta nacería inutilizable`,
+    );
+  }
+  const email = correo.data;
+
+  const SEED_PASSWORD_MIN = 12;
+  const bytes = new TextEncoder().encode(clave).length;
+  if (clave.length < SEED_PASSWORD_MIN) {
+    throw new Error(
+      `SEED_ADMIN_EMAIL está puesta pero SEED_ADMIN_PASSWORD falta o tiene menos de ${SEED_PASSWORD_MIN} caracteres`,
+    );
+  }
+  if (bytes > PASSWORD_MAX_BYTES) {
+    throw new Error(
+      `SEED_ADMIN_PASSWORD ocupa ${bytes} bytes y el máximo es ${PASSWORD_MAX_BYTES} (límite de bcrypt): bcrypt la truncaría y el login la rechazaría, así que la cuenta nacería inutilizable`,
+    );
+  }
+  const nombre = process.env.SEED_ADMIN_NOMBRE?.trim() || email.split('@')[0]!;
+  return { email, clave, nombre };
+}
+
+/**
+ * La cuenta PROPIA de quien despliega, ya validada, en los workspaces que el seed acaba de
+ * resolver. Los IDs llegan de fuera: buscarlos por nombre no vale ni acotando por la
+ * membresía de Lucía —`workspace.nombre` no es único y esa cuenta demo puede estar invitada a
+ * otro workspace que se llame igual—, y conceder `lead-boutique` de una persona REAL sobre el
+ * tenant de otro cliente es el fallo que no se puede permitir.
+ */
+async function sembrarAdminPropio(
+  cliente: typeof sql,
+  admin: AdminPropio | null,
+  workspaces: string[],
+): Promise<string | null> {
+  if (!admin) return null;
+  const { email, clave, nombre } = admin;
+
+  // El hash se calcula aquí y no al validar: cuesta CPU y solo hace falta si se va a escribir.
+  const hash = await bcrypt.hash(clave, 10);
+
+  /*
+   * TODO en UNA transacción, y esto no es prolijidad: sin ella, la cuenta y la primera
+   * membresía ya estaban COMMITEADAS cuando una sentencia posterior fallara —por ejemplo un
+   * `DS001` al tocar una demo archivada—. El entrypoint corta con `set -e` y el despliegue no
+   * arranca, así que nadie ve el fallo; pero apagar el seed en el siguiente despliegue deja
+   * viva una cuenta privilegiada a medio crear. Un seed que concede accesos tiene que
+   * conceder todo o nada.
+   */
+  return cliente.begin(async (tx) => {
+    /*
+     * El alta va con `ON CONFLICT` y relectura. Dos instancias del mismo despliegue arrancan a
+     * la vez: las dos pueden ver que el usuario no existe y las dos intentar crearlo. El
+     * índice único sobre `lower(email)` rechaza a una, y con `set -e` esa instancia no arranca
+     * — por una cuenta que la otra ya había creado bien.
+     *
+     * Y tiene que ser `ON CONFLICT` y no un `where not exists`: escribí primero lo segundo y
+     * NO arregla nada. Un `where not exists` es el mismo «mirar y luego insertar» metido en
+     * una sentencia — bajo READ COMMITTED las dos transacciones pueden pasar la comprobación
+     * antes de que ninguna haya escrito, y la violación de unicidad ocurre igual. Solo el
+     * índice, que es quien arbitra de verdad, puede resolver la carrera.
+     *
+     * `on conflict (lower(email))` sobre el índice de EXPRESIÓN, comprobado contra el real:
+     * la segunda inserción con otra caja de letras devuelve `INSERT 0 0` en vez de un error.
+     */
+    await tx`insert into usuario (email, nombre, password_hash, estado)
+      values (${email}, ${nombre}, ${hash}, 'activo')
+      on conflict (lower(email)) do nothing`;
+    /*
+     * `for update`, y el candado es el arreglo — no un adorno de la lectura.
+     *
+     * Sin él, entre este `select` y todo lo que se decide con lo leído cabe una
+     * DESACTIVACIÓN ajena. Reproducido contra la base real, con la cuenta invitada de una
+     * persona: A leyó «invitado», B ejecutó `update usuario set estado = 'inactivo'` y
+     * CONFIRMÓ, y el `update` de abajo —cuyo `where` solo mira `password_hash is null`, que
+     * seguía siendo cierto— la devolvió a «activo». Estado final: `activo`. Un despliegue
+     * deshacía en silencio una decisión de producto, y acto seguido le concedía membresías
+     * `lead-boutique`.
+     *
+     * Meter `and estado <> 'inactivo'` en aquel `update` tapaba la mitad visible y dejaba la
+     * peor: cero filas ya significa «ya tenía contraseña», que es el caso NORMAL, así que la
+     * carrera se volvía indistinguible del camino bueno y las concesiones seguían adelante
+     * igual. Lo que hay que serializar no es una sentencia, es la DECISIÓN entera.
+     *
+     * El candado dura hasta el commit, así que cubre la guarda, la contraseña y las dos
+     * membresías. Los dos órdenes quedan bien y ambos están comprobados: si B llega primero,
+     * este `select` espera y —bajo READ COMMITTED `for update` RELEE la última versión
+     * confirmada— ve «inactivo» y la guarda de abajo corta; si llegamos primero, B espera a
+     * que terminemos y la desactivación se aplica después, sobre una cuenta ya sembrada, que
+     * es exactamente lo que quería quien la desactivó.
+     */
+    const [u] = await tx`select id, estado from usuario
+      where lower(email) = ${email} for update`;
+    const id = u!.id as string;
+    /*
+     * Una cuenta DESACTIVADA no recibe accesos, igual que en el flujo de invitación —que la
+     * rechaza explícitamente («la cuenta de ese correo está desactivada; no puede recibir
+     * invitaciones»)—. Sin esta guarda, el seed le concedía membresías privilegiadas y, si
+     * además no tenía contraseña, el `update` de abajo la devolvía a `activo`: un despliegue
+     * posterior deshacía una desactivación deliberada, que es una decisión de producto y no
+     * un detalle de arranque.
+     *
+     * Se falla en vez de saltárselo. Quien pone `SEED_ADMIN_EMAIL` apuntando a una cuenta
+     * desactivada tiene un problema que quiere ver.
+     */
+    if ((u!.estado as string) === 'inactivo') {
+      throw new Error(
+        `SEED_ADMIN_EMAIL apunta a ${email}, que es una cuenta DESACTIVADA: el seed no la reactiva ni le concede accesos`,
+      );
+    }
+    /*
+     * La contraseña solo se escribe si NO había ninguna —este seed corre en cada despliegue, y
+     * reescribirla convertiría una variable de entorno vieja en una puerta abierta— y la
+     * condición va DENTRO del `update`, no en un `if` sobre lo que se leyó antes.
+     *
+     * Entre el `select` y el `update` cabe una activación: si esa dirección es una cuenta
+     * invitada y la persona está eligiendo su contraseña justo ahora,
+     * `activar_usuario_con_token` la confirma en medio y el `update` se la pisaba con el
+     * secreto del seed. Leer y decidir por separado deja un hueco; el `where` lo cierra
+     * porque la comprobación y la escritura pasan a ser la misma sentencia.
+     */
+    /*
+     * La invitación se consume ENTERA, `invitacion_origen_ws` incluido.
+     *
+     * Faltaba, y eso dejaba la identidad en un estado que el flujo normal no produce:
+     * `activar_usuario_con_token` pone a null el token, la caducidad Y el origen, los tres
+     * juntos. Con el origen puesto sobre una cuenta ya activa, la fila dice para siempre que
+     * pertenece a una invitación que ya no existe.
+     *
+     * Y la CTE no es adorno: hace falta para poder anularlo SIN perder el evento. Medido —el
+     * `RETURNING` de un `UPDATE` devuelve el valor NUEVO, no el viejo:
+     *
+     *   update … set origen = null … returning origen   →  null
+     *   with previo as (select origen … for update) …    →  43
+     *
+     * O sea que añadir `invitacion_origen_ws = null` a secas habría apagado en silencio el
+     * evento de activación —la condición de abajo nunca se cumpliría— y el historial del
+     * workspace que invitó se quedaría exactamente igual de roto que antes, pero ahora sin
+     * que nada lo delate. La CTE lee el valor bajo candado antes de escribir, y el `update`
+     * sigue viendo su `password_hash is null` en la MISMA sentencia, que es lo que cierra la
+     * carrera con una activación concurrente.
+     */
+    const [activada] = await tx`
+      with previo as (
+        select id, invitacion_origen_ws from usuario where id = ${id} for update
+      )
+      update usuario u
+      set password_hash = ${hash}, estado = 'activo',
+          invitacion_token_hash = null, invitacion_expira = null,
+          invitacion_origen_ws = null, actualizado_en = now()
+      from previo p
+      where u.id = p.id and u.password_hash is null
+      returning p.invitacion_origen_ws`;
+    /*
+     * Y si lo que se acaba de activar era una INVITACIÓN pendiente, su evento, como lo emite
+     * `activar_usuario_con_token`. Este `update` consume la invitación —limpia el token, su
+     * caducidad y su origen— así que sin el evento el historial del workspace que invitó se
+     * queda con una invitación pendiente para siempre y una identidad activa que nada explica.
+     * La condición es el origen LEÍDO ANTES: sin él no había invitación que consumir y no hay
+     * a qué workspace contárselo.
+     */
+    if (activada?.invitacion_origen_ws) {
+      await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        values (${activada.invitacion_origen_ws as string}, 'UsuarioActivado',
+                ${tx.json({ email, origen: 'seed:SEED_ADMIN_EMAIL' })}, ${id},
+                (select rol from miembro
+                  where workspace_id = ${activada.invitacion_origen_ws as string}
+                    and usuario_id = ${id}))`;
+    }
+
+    /*
+     * Los DOS workspaces se resuelven aquí y por la FIRMA DEL SEED —tener a Lucía de miembro—,
+     * sin fiarse de ningún id de fuera. `workspace` no tiene unicidad por nombre (comprobado:
+     * su única restricción es la clave primaria), y el `select … where nombre = 'Banco Andino'`
+     * de `main()` no está calificado. Recibir ese id habría dado acceso `lead-boutique` de una
+     * persona REAL al workspace de otro cliente que se llamara igual.
+     *
+     * Una función que concede accesos no puede confiar en que su llamante haya acotado bien.
+     */
+    /*
+     * Sin workspaces sellados no hay nada que consultar, y se sale ANTES de consultarlo — pero
+     * AQUÍ, no antes de la transacción: la cuenta ya está creada y activa a estas alturas, y
+     * eso es deliberado. En una base sin sellos quien despliega quiere poder ENTRAR aunque no
+     * tenga workspaces; salir antes de crearla le dejaría sin cuenta y sin explicación.
+     *
+     * Una revisión avisó de que con la lista vacía el `in` quedaría inválido y el seed
+     * reventaría —y con `set -e` en el entrypoint, el despliegue no arrancaría—. Medido, en
+     * esta versión del driver no es así: `sql([])` se expande a `in (null)`, SQL válido que
+     * devuelve cero filas, así que el camino ya terminaba en el mensaje de abajo; lo comprobé
+     * de punta a punta borrando los sellos. Aun así el corte se pone, y no por si acaso: que un
+     * despliegue arranque o no dependía de un detalle de expansión del driver que nadie ha
+     * prometido. Un `return` explícito dice lo que pasa y no se apoya en eso.
+     */
+    if (workspaces.length === 0) {
+      return `${email} (cuenta lista, SIN membresías: no hay workspaces sellados por este seed en esta base; una base sembrada antes del sello no acredita cuáles son suyos)`;
+    }
+
+    /*
+     * Y Lucía tiene que estar ACTIVA, no solo ser miembro.
+     *
+     * Esta consulta corre por la conexión de DUEÑO, que se salta la RLS de `miembro`, así que
+     * es el único sitio donde puede comprobarse. El flujo normal de invitación lo hace antes
+     * de mirar siquiera el rol (`exigirCuentaActiva`, y luego el rol), y por una razón que
+     * aquí pesa igual: una cuenta desactivada no da altas. Sin esto, el seed le atribuía a una
+     * Lucía desactivada la concesión de un acceso privilegiado —y ese evento es el único
+     * registro que explica de dónde salió ese miembro—.
+     *
+     * Se filtra en vez de fallar, como las otras dos ramas de este bucle: una demo con la
+     * cuenta desactivada no es una emergencia que deba tumbar el despliegue, es un dato. El
+     * workspace se queda sin conceder y la comprobación de completitud de arriba es la que
+     * dice, con su propio mensaje, que la instalación quedó a medias.
+     */
+    const destinos = await tx`select w.id, w.nombre, m.usuario_id as lucia_id, m.rol as lucia_rol
+      from workspace w
+      join miembro m on m.workspace_id = w.id
+      join usuario u2 on u2.id = m.usuario_id
+      where w.id in ${tx(workspaces)}
+        and lower(u2.email) = 'lucia@whitespace.demo'
+        and u2.estado = 'activo'`;
+
+    const dichos: string[] = [];
+    for (const w of destinos) {
+      const wsId = w.id as string;
+      const luciaRol = w.lucia_rol as string;
+
+      /*
+       * El rol de Lucía se LEE; no se afirma. El evento de más abajo escribía
+       * `actor_rol = 'lead-boutique'` sin haberlo mirado, así que si su membresía se hubiera
+       * cambiado antes de encender `SEED_ADMIN_EMAIL`, la auditoría de una concesión
+       * privilegiada quedaba materialmente falsa — y es el único registro que explica de dónde
+       * salió ese miembro.
+       *
+       * Y si el rol que tiene no es de los que dan de alta, no se concede: atribuirle a alguien
+       * un alta que su rol no le permite hacer es la misma mentira, escrita entera. Se salta
+       * ese workspace con su motivo en vez de abortar el despliegue —igual que la rama de «ya
+       * era otro rol»—: una demo con la membresía cambiada no es una emergencia, es un dato.
+       *
+       * `ROLES_QUE_INVITAN` es el mismo que aplica el servicio de invitación y el espejo de la
+       * política `miembro_insert`, que es quien lo impone de verdad.
+       */
+      if (!(ROLES_QUE_INVITAN as readonly string[]).includes(luciaRol)) {
+        dichos.push(
+          `${w.nombre as string}: SIN TOCAR, la cuenta del seed (Lucía) es ${luciaRol} y ese rol no da de alta miembros`,
+        );
+        continue;
+      }
+      /*
+       * Se MIRA antes de escribir, y el `on conflict` se queda de todas formas.
+       *
+       * El `on conflict` cubre la carrera y no cubre esto: `miembro` tiene un trigger BEFORE
+       * INSERT (`a_congelacion_por_disposicion`) que corre ANTES de que Postgres compruebe el
+       * conflicto, y sobre un workspace ya dispuesto levanta `DS001`. Medido: con un trigger
+       * BEFORE que lanza, `insert … on conflict do nothing` sale por el trigger. O sea que un
+       * redespliegue sobre una demo archivada abortaba el seed por una membresía que YA
+       * existía y que no hacía falta escribir.
+       */
+      const [ya] = await tx`select rol from miembro
+        where workspace_id = ${wsId} and usuario_id = ${id}`;
+      if (ya) {
+        // Y si ya estaba con OTRO rol, se dice. Antes el `on conflict do nothing` se lo tragaba
+        // y el registro afirmaba «asegurada como lead-boutique» sobre una cuenta que seguía
+        // siendo stakeholder: un mensaje que miente es peor que no tener mensaje. No se
+        // reescribe el rol — cambiar la membresía de alguien que ya estaba es una decisión de
+        // producto, no una comodidad del seed.
+        dichos.push(
+          ya.rol === 'lead-boutique'
+            ? `${w.nombre as string}: ya`
+            : `${w.nombre as string}: SIN TOCAR, ya era ${ya.rol as string}`,
+        );
+        continue;
+      }
+      /*
+       * `returning` para saber si esta transacción fue la que insertó. Dos procesos del mismo
+       * despliegue pueden ver los dos que no hay membresía: uno inserta y al otro su
+       * `on conflict do nothing` le afecta CERO filas — pero los dos emitían el evento y los
+       * dos decían «lead-boutique». Eso duplica la auditoría, y si el que ganó el conflicto
+       * fue otro flujo con otro rol, además la miente.
+       */
+      const [creada] = await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsId}, ${id}, ${nombre}, ${email}, 'lead-boutique')
+        on conflict do nothing
+        returning rol`;
+      if (!creada) {
+        // Otro la creó entre nuestro `select` y este `insert`: se relee al ganador en vez de
+        // afirmar lo que quisimos escribir.
+        const [gano] = await tx`select rol from miembro
+          where workspace_id = ${wsId} and usuario_id = ${id}`;
+        dichos.push(`${w.nombre as string}: la creó otro arranque como ${gano?.rol ?? '¿?'}`);
+        continue;
+      }
+      /*
+       * Y su EVENTO, en la misma transacción que la concesión, como hace el flujo de
+       * invitación. RF-01.6 exige que toda escritura quede auditada, y una membresía
+       * privilegiada que aparece sin rastro es exactamente lo que una auditoría no puede
+       * explicar — ni la exportación del workspace, que lee de aquí.
+       *
+       * El actor es Lucía, que es la identidad con la que este seed escribe todo lo demás, CON
+       * EL ROL QUE DE VERDAD TIENE, y el payload dice que vino del seed y por qué variable:
+       * quien lo lea sabrá que no fue una invitación, sino un despliegue con
+       * `SEED_ADMIN_EMAIL` puesta.
+       */
+      await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        values (${wsId}, 'MiembroInvitado',
+                ${tx.json({ email, rol: 'lead-boutique', requiereActivacion: false, origen: 'seed:SEED_ADMIN_EMAIL' })},
+                ${w.lucia_id as string}, ${luciaRol})`;
+      dichos.push(`${w.nombre as string}: lead-boutique`);
+    }
+    if (dichos.length > 0) return `${email} (${dichos.join('; ')})`;
+    // Y se DICE por qué no se concedió nada, que si no parece que sí. El caso normal es una
+    // base sembrada por una versión anterior al sello: la cuenta existe y puede entrar, pero
+    // no tiene workspaces — y el camino es resembrar en limpio, no aflojar la comprobación.
+    return `${email} (cuenta lista, SIN membresías: no hay workspaces sellados por este seed en esta base; una base sembrada antes del sello no acredita cuáles son suyos)`;
+  });
 }
 
 async function main() {
+  // ANTES de la primera escritura. Si `SEED_ADMIN_EMAIL` está puesta y su configuración no
+  // vale, esto lanza aquí y la base queda intacta — que es lo que el runbook promete.
+  // Validado al final, un despliegue limpio con el correo mal escrito creaba los dos
+  // workspaces y las tres cuentas demo enteros y salía con error después.
+  const admin = leerAdminPropio();
+  // Y el camino de subida, antes de resolver nada: una base sembrada sin sellos los recibe
+  // aquí, de quien opera el despliegue, para que el resto de la corrida ya los encuentre.
+  const sellados = await sellarWorkspacesIndicados(sql);
   const hash = await bcrypt.hash(PASSWORD_DEMO, 10);
 
-  const existentes = await sql`select id from workspace where nombre = 'Banco Andino'`;
+  /*
+   * El workspace PRIMARIO se resuelve por su SELLO en `sembrado_registro`, que es el único
+   * id que acredita que salió de aquí. `workspace.nombre` no tiene unicidad (comprobado: su
+   * única restricción es la clave primaria), así que un «Banco Andino» de otro cliente en una
+   * base de desarrollo entraba por el `select … where nombre = …` — y ese id gobierna toda la
+   * siembra de upgrade y, desde que existe la cuenta propia, una concesión de `lead-boutique`
+   * a una persona real.
+   *
+   * Probé antes con un evento `WorkspaceCreado` de `origen: 'seed'` y una revisión lo cazó:
+   * `evento_insert` autoriza a cualquier miembro a escribir eventos con cualquier tipo y
+   * payload, así que ese marcador es FALSIFICABLE — exactamente lo que la migración
+   * `…300000-la-procedencia-del-sembrado-no-la-escribe-la-app.sql` declaró insuficiente.
+   *
+   * El nombre se queda como segunda pregunta y solo para una cosa: decidir si hace falta
+   * crear el workspace en una base sembrada por una versión anterior, que no tiene sello. Lo
+   * que NO se hace es sellarlo entonces: sellar lo que se encontró por nombre metería en el
+   * sitio infalsificable justo el dato que se declaró falsificable, que es lo que esa misma
+   * migración se negó a hacer al no migrar el marcador viejo. Y lo que tampoco se hace es
+   * conceder sobre él: sin sello no hay concesión (ver `sembrarAdminPropio`).
+   */
+  const primarioSellado = await workspaceSellado(sql, CLAVE_WS_PRIMARIO);
+  const existentes = primarioSellado
+    ? [{ id: primarioSellado }]
+    : await sql`select w.id from workspace w where w.nombre = 'Banco Andino'
+        order by w.creado_en asc, w.id asc`;
   if (existentes.length > 0) {
     const wsId = existentes[0]!.id as string;
     const actualizados = await sql`update usuario
@@ -1216,8 +1838,11 @@ async function main() {
     // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía
     // (la función se auto-guarda por membresía+nombre, sin chequeo duplicado aquí).
     let segundoSembrado = false;
+    let segundoSellado: string | null = null;
     if (lucia) {
-      segundoSembrado = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
+      const segundo = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
+      segundoSembrado = segundo.creado;
+      if (segundo.sellado) segundoSellado = segundo.id;
     }
     // Upgrade de bases sembradas antes de los derechos de uso (SPEC-03 profunda) y del
     // pipeline AI (SPEC-08): cada función se auto-guarda por la presencia de su propio
@@ -1231,8 +1856,19 @@ async function main() {
       );
       propuestaSembrada = await sql.begin((tx) => sembrarPropuestaAI(tx, wsId, lucia.id as string));
     }
+    // Solo los SELLADOS. Un workspace que este seed encontró por nombre —porque la base
+    // viene de una versión sin sello— no acredita ser suyo, y conceder `lead-boutique` de una
+    // persona real sobre algo que no acredita ser suyo es el fallo que no se puede permitir.
+    // Fallar cerrado también cuando el que falla cerrado es el upgrade.
+    const adminPropio = await sembrarAdminPropio(
+      sql,
+      admin,
+      [primarioSellado, segundoSellado].filter((x): x is string => x !== null),
+    );
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
+        (sellados.length > 0 ? `; sellos: ${sellados.join(', ')}` : '') +
+        (adminPropio ? `; cuenta propia ${adminPropio}` : '') +
         (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
         (metodoSembrado ? '; método de P-01 sembrado' : '') +
         (journeySembrado ? '; journey as-is sembrado' : '') +
@@ -1271,9 +1907,14 @@ async function main() {
     await sembrarEvidenciaProfunda(tx, wsId, luciaId);
     await sembrarCadena(tx, wsId, luciaId);
     await sembrarJourney(tx, wsId, luciaId);
-    await sembrarSegundoWorkspace(tx, luciaId);
+    const segundo = await sembrarSegundoWorkspace(tx, luciaId);
     await sembrarPropuestaAI(tx, wsId, luciaId);
-    return { wsId, luciaId };
+    // El SELLO del primario, en la misma transacción que lo crea: si algo de arriba falla, no
+    // queda un sello sin workspace ni un workspace sin sello.
+    await tx`insert into sembrado_registro (workspace_id, clave, payload)
+      values (${wsId}, ${CLAVE_WS_PRIMARIO}, ${tx.json({ nombre: 'Banco Andino' })})
+      on conflict (workspace_id, clave) do nothing`;
+    return { wsId, luciaId, segundoId: segundo.id };
   });
 
   // La entrega va FUERA de esa transacción porque necesita varias: la design version nace en
@@ -1281,6 +1922,9 @@ async function main() {
   // borrador y su aprobación cayeran en el mismo commit, que es justo el estado que el
   // producto no puede producir y que el guard diferido rechaza.
   await sembrarEntrega(sql, creado.wsId, creado.luciaId);
+  const adminPropio = await sembrarAdminPropio(sql, admin, [creado.wsId, creado.segundoId]);
+  if (sellados.length > 0) console.log(`seed: sellos: ${sellados.join(', ')}`);
+  if (adminPropio) console.log(`seed: cuenta propia ${adminPropio}`);
   console.log(
     `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1, item de bandeja con propuesta AI pendiente) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );

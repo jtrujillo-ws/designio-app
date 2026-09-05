@@ -48,6 +48,30 @@ El patrón de datos usa **dos conexiones** (diseño técnico · Multi-tenancy): 
 | `DATABASE_URL_APP` | `postgresql://designio_app:${{APP_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` | Se compone con referencias; si la referencia a la variable propia no resuelve en tu plan, usar una *shared variable* del environment (`${{shared.APP_DB_PASSWORD}}`) para ambas |
 | `JWT_SECRET` | secret generado (`openssl rand -hex 32`), distinto por environment | Sesiones y tokens de capacidad (cuando llegue auth) |
 | `SEED_ON_START` | `true` solo en `dev` | Crea el workspace demo Banco Andino; en `stg`/`production` va `false` |
+| `SEED_ADMIN_EMAIL` | tu correo real, opcional | Con `SEED_ON_START=true`, siembra **tu** cuenta como `lead-boutique` en los dos workspaces demo. Va por variable y no en el seed del repo a propósito: una dirección real escrita en el código queda en el historial para siempre. Se valida con el **mismo contrato que el login**: una errata hace fallar el seed en vez de crear una cuenta que nunca podría entrar |
+| `SEED_ADMIN_PASSWORD` | secret, **12 caracteres mínimo y 72 bytes máximo** | Obligatoria si pones la anterior: el seed **falla** en vez de inventar una clave. El techo va en BYTES porque es el de bcrypt, y el login rechaza de entrada cualquier clave que lo pase — sin ese corte, una clave con acentos o emoji creaba una cuenta imposible de usar y anunciada como lista. Solo se aplica cuando la cuenta no tiene contraseña todavía, así que una variable vieja no reabre el acceso en el siguiente arranque |
+| `SEED_ADMIN_NOMBRE` | opcional | Por omisión, la parte del correo antes de la arroba |
+| `SEED_SELLAR_WORKSPACES` | uuids separados por coma, **solo una vez** | **Únicamente si la base ya estaba sembrada antes de que existieran los sellos.** Ver abajo |
+
+### Si tu base ya estaba desplegada antes de los sellos
+
+El seed solo concede membresías sobre los workspaces que él mismo creó, y lo acredita con un sello en `sembrado_registro` —una tabla donde el rol de aplicación **no puede escribir**—. Una base sembrada por una versión anterior no tiene ese sello, así que `SEED_ADMIN_EMAIL` te creará la cuenta y te dejará **sin membresías**, diciéndolo.
+
+No se resuelve solo, y a propósito: adoptar «el único Banco Andino que tenga a Lucía» sería meter una inferencia en el sitio infalsificable, y con dos workspaces del mismo nombre la inferencia elegiría mal la mitad de las veces. Lo resuelve quien sí sabe cuáles son los suyos — tú, que tienes el DSN administrativo.
+
+```sql
+-- 1. saca los dos ids de TU base
+select id, nombre from workspace where nombre in ('Banco Andino', 'Clínica del Valle');
+```
+
+```
+# 2. ponlos en la variable, redespliega UNA vez, y quítala
+SEED_SELLAR_WORKSPACES=<uuid-banco-andino>,<uuid-clinica-del-valle>
+```
+
+El seed comprueba lo que puede antes de sellar: que el workspace exista, que se llame como el que dice ser, y que no haya ya un sello de esa clave apuntando a otro sitio. Un error de dedo **falla ruidosamente** en vez de sellar el tenant equivocado. Repetirlo es inocuo (dice «ya sellado»).
+
+Quitar la variable después no es obligatorio, pero sí ordenado: su trabajo es de una sola vez.
 | `ANTHROPIC_API_KEY` | secret | Solo cuando llegue la capa AI (PR del pipeline PropuestaAI) |
 | `CRON_SECRET` | secret generado | Solo cuando lleguen los hooks de jobs |
 
@@ -65,6 +89,8 @@ El patrón de datos usa **dos conexiones** (diseño técnico · Multi-tenancy): 
 La migración `00-init.sql` intenta `create extension vector` de forma **tolerante**: si la imagen del plugin no la trae, avisa y continúa (la búsqueda semántica llegará en un PR posterior). Si el plugin estándar no incluye pgvector, desplegar la plantilla de Postgres con pgvector de Railway y apuntar las variables a ese servicio.
 
 ## 5. Verificación post-deploy (cada environment)
+
+Las tres cuentas demo que siembra `SEED_ON_START` son `lucia@whitespace.demo` (lead-boutique, en los dos workspaces), `maria@bancoandino.demo` (sponsor) y `canales@bancoandino.demo` (stakeholder), todas con la contraseña `designio.demo`. Son de dominios inexistentes a propósito y **no sirven fuera de `dev`**.
 
 ```bash
 # 1. Salud

@@ -1222,16 +1222,23 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
     await tx`insert into usuario (email, nombre, password_hash, estado)
       values (${email}, ${nombre}, ${hash}, 'activo')
       on conflict (lower(email)) do nothing`;
-    const [u] = await tx`select id, password_hash from usuario where lower(email) = ${email}`;
+    const [u] = await tx`select id from usuario where lower(email) = ${email}`;
     const id = u!.id as string;
-    // La contraseña solo se escribe si NO había ninguna: este seed corre en cada despliegue,
-    // y reescribirla convertiría una variable de entorno vieja en una puerta abierta.
-    if (u!.password_hash === null) {
-      await tx`update usuario
-        set password_hash = ${hash}, estado = 'activo',
-            invitacion_token_hash = null, invitacion_expira = null, actualizado_en = now()
-        where id = ${id}`;
-    }
+    /*
+     * La contraseña solo se escribe si NO había ninguna —este seed corre en cada despliegue, y
+     * reescribirla convertiría una variable de entorno vieja en una puerta abierta— y la
+     * condición va DENTRO del `update`, no en un `if` sobre lo que se leyó antes.
+     *
+     * Entre el `select` y el `update` cabe una activación: si esa dirección es una cuenta
+     * invitada y la persona está eligiendo su contraseña justo ahora,
+     * `activar_usuario_con_token` la confirma en medio y el `update` se la pisaba con el
+     * secreto del seed. Leer y decidir por separado deja un hueco; el `where` lo cierra
+     * porque la comprobación y la escritura pasan a ser la misma sentencia.
+     */
+    await tx`update usuario
+      set password_hash = ${hash}, estado = 'activo',
+          invitacion_token_hash = null, invitacion_expira = null, actualizado_en = now()
+      where id = ${id} and password_hash is null`;
 
     /*
      * Los DOS workspaces se resuelven aquí y por la FIRMA DEL SEED —tener a Lucía de miembro—,

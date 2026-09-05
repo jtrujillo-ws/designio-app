@@ -825,6 +825,160 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
   });
 
   /**
+   * Y una reapertura reabre algo que estaba CERRADO: el estado final no es la transición.
+   *
+   * El guard comprobaba que la etapa quedara `en-curso`, que es el efecto, y no que hubiera
+   * SALIDO de 'completada', que es el acto. Con la puerta de gobernanza —que lista todas las
+   * etapas— eso se alcanzaba sin SQL directo: eligiendo una etapa que ya estaba en curso, o una
+   * que nunca se cerró, el registro pasaba, las decisiones de aguas abajo se movían a
+   * «en-revisión» y el archivo recibía un `EtapaReabierta` de algo que no ocurrió.
+   *
+   * Se cierra por los dos lados, cada uno donde está su información:
+   *   · el guard de la reapertura exige que la etapa la haya ESCRITO esta transacción —si ya
+   *     estaba en curso y nadie la toca, no hay reapertura que registrar—;
+   *   · y la puerta de la etapa, que sí ve el estado anterior, rechaza entrar en 'en-curso'
+   *     desde algo que no era 'completada' cuando hay un registro de esta transacción.
+   */
+  it('una reapertura solo reabre lo que estaba cerrado', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio de la transición', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo,
+       creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-TRA', 'Reto de la transición', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${r!.id as string}, 'P-TRA', 'Proyecto', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const proyectoT = p!.id as string;
+    // La etapa 4 nace PENDIENTE —nunca se cerró— y la 3 en curso, ya reabierta antes.
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoT}, 3, 'Conceptualización', 'en-curso'),
+             (${ws}, ${proyectoT}, 4, 'Exploración de soluciones', 'pendiente')`;
+
+    const registrar = (etapa: number) =>
+      conUsuario(leadId, async (tx) => {
+        await tx`insert into reapertura_etapa
+          (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+           reabierto_por)
+          values (${ws}, ${proyectoT}, ${etapa}, 'Motivo', 'etapa-completa', 0, ${leadId})`;
+        await tx`update etapa_instancia set estado = 'en-curso'
+          where proyecto_id = ${proyectoT} and workspace_id = ${ws} and numero = ${etapa}`;
+      });
+
+    // La que YA estaba en curso: no hay nada que reabrir. La puerta de la etapa lo ve porque
+    // el update sí ocurre —de 'en-curso' a 'en-curso'— y ella mira de dónde viene.
+    await expect(registrar(3)).rejects.toThrow(/no estaba cerrada/i);
+    // Y el mismo caso SIN tocar la etapa, que es el que solo ve el guard de la reapertura: sin
+    // update no hay puerta que se dispare, y lo único que queda por preguntar es si esta
+    // transacción escribió la etapa.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into reapertura_etapa
+        (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+         reabierto_por)
+        values (${ws}, ${proyectoT}, 3, 'Motivo', 'etapa-completa', 0, ${leadId})`),
+    ).rejects.toThrow(/no salió de completada en esta transacción/);
+    // Y la que nunca se cerró: empezar una etapa no es reabrirla.
+    await expect(registrar(4)).rejects.toThrow(/no estaba cerrada/i);
+    const eventos = await admin`select 1 from evento_dominio
+      where workspace_id = ${ws} and tipo = 'EtapaReabierta'
+        and payload->>'proyectoId' = ${proyectoT}`;
+    expect(eventos.length, 'el archivo recibió una reapertura que no ocurrió').toBe(0);
+
+    // Y una etapa que sí estaba cerrada se reabre igual: no se tapia el camino bueno.
+    await admin`update etapa_instancia set estado = 'completada'
+      where proyecto_id = ${proyectoT} and workspace_id = ${ws} and numero = 4`;
+    await registrar(4);
+    const [abierta] = await admin`select estado from etapa_instancia
+      where proyecto_id = ${proyectoT} and workspace_id = ${ws} and numero = 4`;
+    expect(abierta!.estado as string).toBe('en-curso');
+  });
+
+  /**
+   * Y el ALCANCE de una reapertura no crece después de ocurrida.
+   *
+   * Todo lo que comprueba la reapertura —el alcance, la propagación, el número, el evento— vive
+   * en un constraint trigger que corre al INSERTAR la fila. Después de ese commit, el mismo
+   * lead podía añadirle un `reapertura_insight` por la superficie concedida: el guard de autor
+   * lo permitía —es su reapertura— y ninguna de las comprobaciones volvía a correr. Con eso una
+   * reapertura de etapa completa adquiría insights declarados —justo lo que la ronda anterior
+   * cerró en el nacimiento— y una declarada ensanchaba su alcance sin marcar las decisiones que
+   * el alcance nuevo alcanza. La fila y el evento, que es inmutable, dejaban de decir lo mismo.
+   *
+   * La regla es que el alcance NACE con su reapertura: `reapertura_insight` solo se escribe en
+   * la transacción que escribió su fila padre. No es una restricción nueva sobre el producto
+   * —`reabrirEtapa` los escribe juntos en una sentencia—, es la que ya se cumplía sin estar
+   * dicha.
+   */
+  it('el alcance declarado nace con su reapertura y no crece después', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio del alcance tardío', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo,
+       creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-TAR', 'Reto del alcance tardío', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${r!.id as string}, 'P-TAR', 'Proyecto', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const proyectoT = p!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoT}, 3, 'Conceptualización', 'completada')`;
+
+    // Una reapertura LEGÍTIMA y completa, sin nada declarado: la de verdad, por su puerta.
+    const { decisionesMarcadas } = await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoT,
+      etapaNumero: 3,
+      motivo: 'Llegó evidencia que cambia el concepto',
+      insightIds: [],
+    });
+    expect(decisionesMarcadas).toBe(0);
+    const [fila] = await admin`select id, alcance from reapertura_etapa
+      where proyecto_id = ${proyectoT} and workspace_id = ${ws}`;
+    expect(fila!.alcance as string).toBe('etapa-completa');
+
+    // Y DESPUÉS, en otra transacción, se le cuelga un insight declarado.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into reapertura_insight
+        (workspace_id, reapertura_id, insight_id)
+        values (${ws}, ${fila!.id as string}, ${insightValidado})`),
+    ).rejects.toThrow(/se declara al reabrir/i);
+    const declarados = await admin`select 1 from reapertura_insight
+      where reapertura_id = ${fila!.id as string}`;
+    expect(declarados.length, 'el alcance creció después del evento que lo archivó').toBe(0);
+  });
+
+  /**
+   * Y la pregunta se compara NORMALIZADA, o el duplicado entra con un espacio.
+   *
+   * `unique (reto_id, pregunta)` sobre el texto crudo distingue «¿Cómo podríamos avisar?» de
+   * « ¿Cómo podríamos avisar? », y las dos pasan el CHECK de no-vacío. El servicio recorta, y
+   * por eso desde la pantalla no se nota; la superficie SQL concedida es la que esta migración
+   * protege en todo lo demás, y por ahí entraban las dos. Un portafolio con la misma HMW dos
+   * veces reparte el mismo voto dos veces, que es justo lo que el único existe para impedir.
+   *
+   * `titulo_normalizado` y no `btrim`: es la función que este esquema ya usa para lo mismo en
+   * `elemento_cambio`, y colapsa además los espacios de dentro, el caso y los acentos.
+   */
+  it('la misma pregunta con otros espacios no entra dos veces', async () => {
+    const proponer = (pregunta: string) =>
+      conUsuario(leadId, (tx) => tx`insert into oportunidad
+        (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+        values (${ws}, ${retoId}, ${pregunta}, 1, 'Razón', ${leadId})`);
+    await proponer('¿Cómo podríamos avisar del corte?');
+    await expect(proponer('  ¿Cómo   podríamos avisar del corte?  ')).rejects.toThrow(
+      /duplicate key|unique/i,
+    );
+    // Y una pregunta DISTINTA sigue entrando: el normalizador no puede colapsarlo todo.
+    await proponer('¿Cómo podríamos avisar del corte por SMS?');
+  });
+
+  /**
    * Y el portafolio se REVALIDA en el instante en que se congela para medir.
    *
    * G3 certifica el portafolio y la ventana se cierra con él, pero una reapertura legítima de

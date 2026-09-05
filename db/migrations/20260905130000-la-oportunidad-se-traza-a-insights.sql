@@ -79,7 +79,6 @@ create table oportunidad (
   creado_por uuid not null references usuario(id),
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
-  unique (reto_id, pregunta),
   foreign key (reto_id, workspace_id) references reto (id, workspace_id),
   -- Descartar exige razón. Aprobar no: la razón de una HMW aprobada son sus insights, que
   -- están enlazados y se pueden leer; la de una descartada no la guarda nadie más.
@@ -88,6 +87,21 @@ create table oportunidad (
   check ((estado = 'propuesta') = (decidido_por is null)),
   check ((decidido_por is null) = (decidido_en is null))
 );
+-- Y la unicidad de la pregunta, NORMALIZADA.
+--
+-- Escrita como `unique (reto_id, pregunta)` sobre el texto crudo distinguía «¿Cómo podríamos
+-- avisar?» de « ¿Cómo  podríamos avisar? », y las dos pasan el CHECK de no-vacío. El servicio
+-- recorta, así que desde la pantalla no se notaba; la superficie SQL concedida —que es la que
+-- esta migración protege en todo lo demás— admitía las dos. Un portafolio con la misma HMW dos
+-- veces reparte el mismo voto dos veces, que es exactamente lo que este único existe para
+-- impedir.
+--
+-- `titulo_normalizado` y no `btrim`: es la función que este esquema ya usa para lo mismo en
+-- `elemento_cambio`, y además de recortar colapsa los espacios de dentro, el caso y los
+-- acentos. Repetir aquí media normalización sería tener dos ideas distintas de «la misma
+-- pregunta» en el mismo esquema.
+create unique index oportunidad_pregunta_unica
+  on oportunidad (reto_id, titulo_normalizado(pregunta));
 create index oportunidad_reto_idx on oportunidad (workspace_id, reto_id, prioridad desc, creado_en);
 
 -- La traza. Sin `creado_por`: quién enlazó un insight a una HMW no es una decisión firmada
@@ -232,6 +246,24 @@ begin
     end if;
   end if;
 
+  -- ── ENTRAR en 'en-curso' DESDE OTRO SITIO: eso no es una reapertura ──
+  -- La rama de arriba vigila la salida de 'completada' y es la que impide reabrir a
+  -- escondidas. Le faltaba el reverso: un registro de reapertura acompañando a una etapa que
+  -- no venía de 'completada'. Con la pantalla de gobernanza, que lista TODAS las etapas, eso
+  -- se alcanza eligiendo una que ya estaba en curso o una que nunca se cerró — y entonces la
+  -- fila, la propagación y el evento describen una reapertura que no ocurrió.
+  --
+  -- Aquí y no en el guard de la reapertura porque aquí está el dato: `old.estado`. Aquél sabe
+  -- que la etapa se escribió en esta transacción (su `xmin`), pero no de dónde venía.
+  if new.estado = 'en-curso' and old.estado <> 'completada' and exists (
+    select 1 from reapertura_etapa r
+     where r.workspace_id = new.workspace_id
+       and r.proyecto_id = new.proyecto_id
+       and r.etapa_numero = new.numero
+       and r.reabierto_en = now()) then
+    raise exception 'esa etapa no estaba cerrada: solo se reabre lo que se cerró, y registrar una reapertura de una etapa en curso —o de una que nunca se completó— archivaría un acto que no ocurrió';
+  end if;
+
   -- ── ENTRAR en 'completada': la firma de su gate ──
   -- Vigilar solo la salida deja el rodeo entero por el otro lado, y se midió: reabierta la
   -- etapa 3 POR LA PUERTA —registro y todo—, el lead añade una oportunidad sin traza y cierra
@@ -332,12 +364,24 @@ begin
   -- Sin esto, un registro con su propagación hecha y SIN el update de la etapa pasaba: la
   -- etapa se quedaba 'completada' y el archivo recibía un `EtapaReabierta` de una reapertura
   -- que no ocurrió. El guard comprobaba los efectos de al lado y no el suyo.
+  -- Y que la haya escrito ESTA transacción, no que esté en curso desde antes. Comprobar solo
+  -- el estado final medía el EFECTO y no el ACTO: con la etapa ya `en-curso` —reabierta hace
+  -- semanas— el registro pasaba sin que nadie tocara nada, movía las decisiones de aguas abajo
+  -- y dejaba un `EtapaReabierta` de algo que no ocurrió. Y se alcanzaba desde la pantalla de
+  -- gobernanza, que lista todas las etapas: no hacía falta SQL directo.
+  --
+  -- `xmin` y no `= now()` sobre una fecha de la etapa: `etapa_instancia` no tiene columna de
+  -- actualización, y añadirla para esto sería inventar un dato para poder preguntarlo. Lo que
+  -- hace falta saber es «esta transacción escribió esta fila», que es literalmente lo que
+  -- `xmin` dice. Que la escribiera VINIENDO de 'completada' lo comprueba la puerta de la etapa,
+  -- que es la que ve el estado anterior; entre las dos queda cerrado el par.
   if not exists (
     select 1 from etapa_instancia e
     where e.proyecto_id = new.proyecto_id and e.workspace_id = new.workspace_id
       and e.numero = new.etapa_numero and e.estado = 'en-curso'
+      and e.xmin = pg_current_xact_id()::xid
   ) then
-    raise exception 'esa reapertura no abre nada: la etapa % del proyecto sigue sin estar en curso, así que el registro y su evento dirían que ocurrió algo que no ocurrió', new.etapa_numero;
+    raise exception 'esa reapertura no abre nada: la etapa % del proyecto no salió de completada en esta transacción, así que el registro y su evento dirían que ocurrió algo que no ocurrió', new.etapa_numero;
   end if;
 
   -- ── Y UN ALCANCE 'declarado' DECLARA ALGO ──
@@ -1386,3 +1430,46 @@ revoke execute on function decision_sin_cambios_no_se_escribe() from public;
 create trigger b_decision_sin_cambios
   before update on decision
   for each row execute function decision_sin_cambios_no_se_escribe();
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- EL ALCANCE DECLARADO NACE CON SU REAPERTURA
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- Todo lo que comprueba una reapertura —el alcance, la propagación, el número y el evento—
+-- vive en un constraint trigger que corre al INSERTAR la fila. Después de ese commit, el mismo
+-- lead podía colgarle un `reapertura_insight` por la superficie concedida: el guard de autor lo
+-- permite —es su reapertura— y ninguna de aquellas comprobaciones vuelve a correr.
+--
+-- Con eso, una reapertura de `etapa-completa` adquiría insights declarados —justo la
+-- contradicción que se acaba de cerrar en el nacimiento— y una `declarado` ensanchaba su
+-- alcance sin marcar las decisiones que el alcance nuevo alcanza. La fila y el evento, que es
+-- inmutable, dejaban de decir lo mismo.
+--
+-- La regla es que el alcance NACE con su reapertura. No es una restricción nueva sobre el
+-- producto: `reabrirEtapa` escribe las dos cosas en la misma sentencia, así que es la que ya se
+-- cumplía sin estar dicha. Y es más simple que volver a correr las comprobaciones: éstas miran
+-- lo que la transacción movió (`xmin`), y en una transacción posterior no hay nada que mirar.
+create function reapertura_insight_nace_con_su_reapertura_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+begin
+  if not is_workspace_member(app_user_id(), new.workspace_id) then return null; end if;
+  if not exists (
+    select 1 from reapertura_etapa r
+    where r.id = new.reapertura_id and r.workspace_id = new.workspace_id
+      and r.xmin = pg_current_xact_id()::xid) then
+    raise exception 'el alcance de una reapertura se declara al reabrir: añadirle insights después cambia lo que la pantalla enseña sin volver a comprobar nada, y el evento que ya se archivó dice otra cosa (RF-04.9)';
+  end if;
+  return null;
+end;
+$fn$;
+
+revoke execute on function reapertura_insight_nace_con_su_reapertura_guard() from public;
+
+-- `z_`, por detrás de `a_congelacion_por_disposicion` y del guard de autor, que dice lo suyo
+-- —«solo se declaran cambios en la propia reapertura»— y es el motivo más específico de los
+-- dos cuando los dos aplican.
+create constraint trigger z_reapertura_insight_nace_con_su_reapertura
+  after insert on reapertura_insight
+  deferrable initially deferred
+  for each row execute function reapertura_insight_nace_con_su_reapertura_guard();

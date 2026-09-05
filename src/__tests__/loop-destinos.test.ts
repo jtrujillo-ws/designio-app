@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { LOOP_BANCO_ANDINO, destinoDeJourney, etiquetaDeDestino } from '@/lib/loop/loop-data';
+import { LOOP_BANCO_ANDINO, destinoDeJourney } from '@/lib/loop/loop-data';
+import { etiquetaDeDestino } from '@/lib/destinos';
 
 /**
  * Las tarjetas del loop nacieron como `div` sin enlace: nada de lo que se veía permitía

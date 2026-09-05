@@ -1,5 +1,6 @@
 import type { EstadoChip } from '@/components/ui/Chip';
 import type { JourneyN } from '@/components/ui/JourneyBadge';
+import type { Destino } from '@/lib/destinos';
 
 /**
  * Datos estáticos del ejemplo Banco Andino (prediseño §19) para la pantalla Loop.
@@ -21,30 +22,6 @@ export type JourneyLoop = {
  * delante: ver `destinoDeJourney`.
  */
 export type PantallaDeJourney = 'importacion' | 'proyecto' | 'insights' | 'design-versions';
-
-/** Un destino navegable de la app, listo para `Link` o `navigate`. */
-export type Destino =
-  | { to: '/importacion' }
-  | { to: '/insights' }
-  | { to: '/journeys' }
-  | { to: '/design-versions' }
-  | { to: '/proyecto/$proyectoId'; params: { proyectoId: string } };
-
-/** Etiqueta corta de a dónde lleva un destino, para decirlo en la tarjeta antes de hacer clic. */
-export function etiquetaDeDestino(destino: Destino, proyectoCodigo?: string): string {
-  switch (destino.to) {
-    case '/importacion':
-      return 'Bandeja de importación';
-    case '/insights':
-      return 'Insights y citas';
-    case '/journeys':
-      return 'Journeys y blueprints';
-    case '/design-versions':
-      return 'Design versions y releases';
-    case '/proyecto/$proyectoId':
-      return proyectoCodigo ? `Proyecto ${proyectoCodigo}` : 'Proyecto';
-  }
-}
 
 /**
  * A qué pantalla abre la tarjeta de un journey. Devuelve null cuando la pantalla es la del

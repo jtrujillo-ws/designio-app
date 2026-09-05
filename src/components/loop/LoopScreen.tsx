@@ -1,22 +1,18 @@
-import type { CSSProperties, ReactNode } from 'react';
+import type { CSSProperties } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
-import { Input } from '@/components/ui/Input';
 import { JourneyBadge } from '@/components/ui/JourneyBadge';
 import { Tabs } from '@/components/ui/Tabs';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { cerrarSesion } from '@/lib/auth/auth.functions';
 import type { ArbolWorkspace, ProyectoArbol, RetoArbol } from '@/lib/arbol/arbol.schemas';
-import {
-  LOOP_BANCO_ANDINO,
-  destinoDeJourney,
-  etiquetaDeDestino,
-  type Destino,
-  type JourneyLoop,
-} from '@/lib/loop/loop-data';
+import { LOOP_BANCO_ANDINO, destinoDeJourney, type JourneyLoop } from '@/lib/loop/loop-data';
+import { etiquetaDeDestino, type Destino } from '@/lib/destinos';
+import { EnlaceA, navegarA } from '@/components/ui/EnlaceA';
+import { Buscador } from '@/components/loop/Buscador';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
@@ -157,37 +153,6 @@ export function LoopScreen({
         </main>
       </div>
     </div>
-  );
-}
-
-/** Un `navigate` tipado por destino: el `to` con parámetros no se puede pasar a ciegas. */
-function navegarA(navigate: ReturnType<typeof useNavigate>, destino: Destino) {
-  // `ws` viaja solo (retainSearchParams en /_autenticada), como en los Links del árbol.
-  return destino.to === '/proyecto/$proyectoId'
-    ? navigate({ to: destino.to, params: destino.params })
-    : navigate({ to: destino.to });
-}
-
-/** El `Link` que corresponde a un destino, con el mismo reparto que `navegarA`. */
-function EnlaceA({
-  destino,
-  style,
-  children,
-  ...resto
-}: {
-  destino: Destino;
-  style?: CSSProperties;
-  children: ReactNode;
-  'aria-label'?: string;
-}) {
-  return destino.to === '/proyecto/$proyectoId' ? (
-    <Link to={destino.to} params={destino.params} style={style} {...resto}>
-      {children}
-    </Link>
-  ) : (
-    <Link to={destino.to} style={style} {...resto}>
-      {children}
-    </Link>
   );
 }
 
@@ -380,7 +345,7 @@ function Topbar({
         )}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-        <Input placeholder="Buscar en el workspace…  /" style={{ background: 'var(--bg-app)', border: '1px solid var(--border)', width: 280 }} />
+        <Buscador workspaceId={membresia?.workspaceId ?? null} />
         <span
           style={{
             width: 32,

@@ -1,6 +1,7 @@
-import type { InputHTMLAttributes } from 'react';
+import type { ComponentProps } from 'react';
 
-export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
+/** `ComponentProps<'input'>` y no `InputHTMLAttributes`: incluye `ref`, que el buscador necesita para enfocar. */
+export function Input(props: ComponentProps<'input'>) {
   return (
     <input
       {...props}

@@ -130,7 +130,32 @@ describe('el registro de capacidades', () => {
     const hallazgos: string[] = [];
     for (const f of ficheros) {
       const codigo = await readFile(f, 'utf8');
-      const arbol = ts.createSourceFile(f, codigo, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+      /*
+       * La gramática, por la EXTENSIÓN. Forzar TSX sobre un `.ts` no es un detalle: en TSX,
+       * `<T>(x: T) => x` se lee como JSX y se traga el resto del fichero. Medido sobre un `.ts`
+       * con una flecha genérica y una aserción de tipo, con dos llamadas detrás:
+       * TSX ve 0, TS ve 2.
+       *
+       * Y aquí el fallo cae del lado MALO: lo que no se visita no se denuncia, así que este
+       * guardián pasaría en verde sin haber leído `ai.servicio.ts` — el día que alguien meta
+       * una flecha genérica ahí, todas las ramas binarias por capacidad dejarían de verse.
+       * (En el censo del calendario TSX sí es lo correcto y está razonado allí: un fichero mal
+       * parseado hace que sus literales dejen de reconocerse como tales, así que mira de MÁS.
+       * Lo que decide es la dirección del fallo.)
+       */
+      const arbol = ts.createSourceFile(
+        f,
+        codigo,
+        ts.ScriptTarget.Latest,
+        true,
+        f.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+      );
+      // Y lo que no parsea limpio no se da por barrido: elegir bien la gramática cierra el
+      // caso conocido; esto convierte cualquier caso futuro en rojo en vez de un verde vacío.
+      const diagnosticos = (arbol as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics;
+      expect(diagnosticos ?? [], `${f} no parsea limpio: el barrido no lo ha leído`).toHaveLength(
+        0,
+      );
       const recorrer = (n: ts.Node): void => {
         if (ts.isBinaryExpression(n)) {
           const op = n.operatorToken.kind;

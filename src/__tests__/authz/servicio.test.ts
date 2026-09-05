@@ -144,14 +144,22 @@ describeAuthz('alta de servicio (política + aislamiento)', () => {
         values (${wsA}, ${marca + ' firmado por otro'}, ${adminCliente})`,
       ),
     ).rejects.toThrow(/policy|permiso/i);
-    // Y tampoco nace archivado: solo se abre 'activo'.
+    // Y tampoco nace archivado: `estado` no está ni en el grant, así que ni se intenta.
     await expect(
       conUsuario(
         lead,
         (tx) => tx`insert into servicio (workspace_id, nombre, estado, creado_por)
         values (${wsA}, ${marca + ' archivado'}, 'archivado', ${lead})`,
       ),
-    ).rejects.toThrow(/policy|permiso/i);
+    ).rejects.toThrow(/permission denied|permiso/i);
+    // Ni fechado en el pasado: `creado_en` lo pone la base (el árbol ordena por esa fecha).
+    await expect(
+      conUsuario(
+        lead,
+        (tx) => tx`insert into servicio (workspace_id, nombre, creado_por, creado_en)
+        values (${wsA}, ${marca + ' antiguo'}, ${lead}, '2020-01-01')`,
+      ),
+    ).rejects.toThrow(/permission denied|permiso/i);
   });
 
   it('update y delete siguen sin superficie para el rol de aplicación', async () => {

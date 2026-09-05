@@ -19,4 +19,8 @@ create policy servicio_insert on servicio
     and estado = 'activo'
   );
 
-grant insert on servicio to designio_app;
+-- Solo las columnas que la app escribe: `id` y `creado_en` los pone la base, y con el grant a
+-- nivel de tabla un lead podía fechar un servicio en el pasado —y el árbol ordena por esa
+-- fecha—. `estado` tampoco entra: la política ya exige 'activo', y así ni siquiera se puede
+-- intentar otra cosa.
+grant insert (workspace_id, nombre, descripcion, creado_por) on servicio to designio_app;

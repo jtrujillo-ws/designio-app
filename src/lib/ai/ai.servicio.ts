@@ -1862,6 +1862,8 @@ type Alcance = {
   unidades: number;
   /** La huella del material que `PREPARAR` le enseñó al modelo. Ver `Preparacion`. */
   huellaMaterial?: string;
+  /** La huella de lo que el registry ya medía entonces (C6). NO se persiste. Ver `Preparacion`. */
+  huellaEntradas?: string;
   /** Los ids de la evidencia de ese material. Ver `Preparacion`. */
   evidenciaDelMaterial?: string[];
 };
@@ -1907,7 +1909,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const consentimiento = exigeConsentimiento
       ? await leerConsentimientoBajoCandado(tx, entrada)
       : null;
-    const { sistema, prompt, huellaMaterial, evidenciaDelMaterial } =
+    const { sistema, prompt, huellaMaterial, huellaEntradas, evidenciaDelMaterial } =
       await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
       throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
@@ -2003,6 +2005,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       reservaId: reserva!.id as string,
       unidades,
       huellaMaterial,
+      huellaEntradas,
       evidenciaDelMaterial,
     };
   });
@@ -2279,7 +2282,7 @@ async function comprobarDespacho(
     if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
       versionConsentimiento = await exigirConsentimientoVigente(tx, entrada, 'antes-de-despachar');
     }
-    await REVALIDAR[entrada.capacidad](tx, entrada, alcance.huellaMaterial);
+    await REVALIDAR[entrada.capacidad](tx, entrada, alcance.huellaMaterial, alcance.huellaEntradas);
 
     // El token de despacho: la reserva sigue existiendo y NO ha caducado. Una revocación la
     // retira, y una caducada dejó de contar para admitir a los demás — despachar con ella
@@ -2738,12 +2741,63 @@ export async function huellaDelMaterialDelRegistry(
   return { huella: huellaDelMaterial(materialDeRegistry(registry).texto), registry };
 }
 
+/**
+ * Lo que el registry mide AHORA, y su huella. Un lector, tres puertas.
+ *
+ * C6 manda dos cosas al modelo y son de naturaleza distinta: el MATERIAL —el reto y sus
+ * criterios, aquello CONTRA lo que se propone y lo que las citas copian— y el estado del
+ * CONTRATO —lo que ya se mide, para no repetirlo—. La huella del material ya se vigilaba; ésta
+ * vigila la otra mitad, y hace falta porque entre `PREPARAR` y el despacho, y entre el despacho
+ * y el guardado, cabe que alguien añada o edite una `entrada_kpi`. El lote nacería sabiendo
+ * otra cosa de lo que ya existe y podría proponer eso mismo con otro nombre — el duplicado
+ * sinónimo, el único que `nombre-ocupado` no detecta.
+ *
+ * Va SEPARADA de `huella_material` y, sobre todo, **no se persiste**, que es lo que la hace
+ * segura. Al aceptar una propuesta de C6 se inserta una entrada, así que las entradas cambian
+ * fila a fila: una huella de entradas guardada y comprobada al aceptar dejaría a la segunda
+ * fila del lote sin poder aceptarse en cuanto se acepta la primera. Viviendo solo en memoria
+ * durante UNA generación, esa comprobación no puede existir al aceptar aunque alguien la
+ * escriba por descuido: no hay dónde leerla.
+ *
+ * Se llama SIEMPRE después de `huellaDelMaterialDelRegistry`, que es quien toma los candados
+ * en el orden del protocolo (workspace → reto → registry).
+ */
+async function huellaDeLasEntradasDelRegistry(
+  tx: TransactionSql,
+  workspaceId: string,
+  registryId: string,
+): Promise<string> {
+  const entradas = await entradasDelRegistry(tx, workspaceId, registryId);
+  // Separador que no puede aparecer dentro de un texto de la base: sin él, «a: b» y «a», «: b»
+  // darían la misma huella y un renombrado se colaría por la juntura.
+  return huellaDelMaterial(
+    entradas.map((e) => `${e.nombre}\u0000${e.definicion}`).join('\u0001'),
+  );
+}
+
+/** Las entradas del registry, con el MISMO orden y las mismas columnas que compusieron el
+ * prompt: dos consultas para el mismo conjunto es cómo empiezan las discrepancias. */
+async function entradasDelRegistry(
+  tx: TransactionSql,
+  workspaceId: string,
+  registryId: string,
+): Promise<{ nombre: string; definicion: string }[]> {
+  const filas = await tx`select nombre, definicion from entrada_kpi
+    where registry_id = ${registryId} and workspace_id = ${workspaceId}
+    order by nombre asc`;
+  return filas.map((e) => ({ nombre: e.nombre as string, definicion: e.definicion as string }));
+}
+
+const MOTIVO_ENTRADAS_MOVIDAS =
+  'Las entradas de ese Metric Registry cambiaron mientras se preparaba la llamada —se añadió una, se editó o se quitó—, así que el lote se armaría sin saber lo que ya se mide y podría proponerlo otra vez con otro nombre';
+
 const REVALIDAR: Record<
   CapacidadActiva,
   (
     tx: TransactionSql,
     entrada: GenerarPropuestas,
     huellaMaterial: string | undefined,
+    huellaEntradas?: string,
   ) => Promise<void>
 > = {
   CI: async (tx, entrada) => {
@@ -2822,9 +2876,9 @@ const REVALIDAR: Record<
       );
     }
   },
-  C6: async (tx, entrada, huellaMaterial) => {
+  C6: async (tx, entrada, huellaMaterial, huellaEntradas) => {
     /*
-     * Dos preguntas, las dos bajo los candados de `huellaDelMaterialDelRegistry`:
+     * Tres preguntas, las tres bajo los candados de `huellaDelMaterialDelRegistry`:
      *
      * 1. Que el registry SIGA admitiendo entradas. Firmarlo es un acto humano que ocurre
      *    justo en el rato que va de preparar a despachar —es lo que G6 hace—, y una entrada
@@ -2832,6 +2886,9 @@ const REVALIDAR: Record<
      * 2. Que el MATERIAL siga siendo el que se armó, no «que quede algún criterio». Un
      *    criterio editado o añadido cambia el texto que el prompt YA LLEVA DENTRO, y la
      *    pregunta por el conjunto entero es la que corresponde a lo que se va a mandar.
+     * 3. Y que las ENTRADAS del registry sigan siendo las que el prompt nombra. Es la otra
+     *    mitad de lo que se manda —el estado del contrato, para no repetirlo— y caduca igual:
+     *    una entrada añadida en este rato deja al lote proponiéndola otra vez con otro nombre.
      */
     const { huella, registry } = await huellaDelMaterialDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
     if (!registry) {
@@ -2843,6 +2900,14 @@ const REVALIDAR: Record<
       throw new ErrorAI(
         'Los criterios de ese reto cambiaron mientras se preparaba la llamada —se añadió uno, o se editó—, así que el material ya no es el que se iba a mandar: no se llamó al proveedor. Vuelve a pedirlo.',
       );
+    }
+    const entradasAhora = await huellaDeLasEntradasDelRegistry(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (entradasAhora !== (huellaEntradas ?? '')) {
+      throw new ErrorAI(`${MOTIVO_ENTRADAS_MOVIDAS}: no se llamó al proveedor. Vuelve a pedirlo.`);
     }
   },
   C5: async (tx, entrada, huellaMaterial) => {
@@ -2916,6 +2981,16 @@ type Preparacion = {
    * revocó sea justo una de las que ya están dentro del prompt construido.
    */
   huellaMaterial?: string;
+  /**
+   * Y la huella de lo que el registry YA MEDÍA cuando se armó el prompt (solo C6).
+   *
+   * Sale aparte de `huellaMaterial` porque es otra pregunta: aquélla vigila el material contra
+   * el que se propone, ésta el estado del contrato que el prompt lleva para no repetirse. Y
+   * viaja SOLO por aquí —nunca a `propuesta_ai`—, que es lo que impide que llegue a la
+   * aceptación: aceptar una fila del lote crea una entrada, así que comprobar esto al aceptar
+   * dejaría a las demás filas sin poder aceptarse. Ver `huellaDeLasEntradasDelRegistry`.
+   */
+  huellaEntradas?: string;
   /**
    * Los ids de la evidencia que compuso ese material, para las capacidades que la tienen.
    *
@@ -3186,15 +3261,10 @@ const PREPARAR: Record<
      * registry, y las filas en `for share`): esta lectura va DESPUÉS, que es el orden del
      * protocolo, y ve el registry que el resto de la preparación vio.
      */
-    const entradas = await tx`select nombre, definicion from entrada_kpi
-      where registry_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-      order by nombre asc`;
+    const entradas = await entradasDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
     const prompt = promptRegistry({
       ...registry,
-      entradas: entradas.map((e) => ({
-        nombre: e.nombre as string,
-        definicion: e.definicion as string,
-      })),
+      entradas,
       cuantas: MAX_ENTRADAS_KPI_POR_LOTE,
     });
     /*
@@ -3225,6 +3295,17 @@ const PREPARAR: Record<
        * y el bloque está armado y saldría igual hacia el proveedor.
        */
       huellaMaterial: huellaDelMaterial(materialDeRegistry(registry).texto),
+      /*
+       * Y la huella de lo que el registry medía en este instante, para las dos puertas que
+       * quedan antes de que el lote exista: antes de despachar y antes de guardar. NO se
+       * persiste —ver `huellaDeLasEntradasDelRegistry`—, porque al aceptar una fila del lote
+       * las entradas cambian por definición y comprobarla allí tumbaría a las demás.
+       */
+      huellaEntradas: await huellaDeLasEntradasDelRegistry(
+        tx,
+        entrada.workspaceId,
+        entrada.anclaId,
+      ),
     };
   },
   C5: async (tx, entrada) => {
@@ -3329,6 +3410,7 @@ const COMPROBAR: Record<
     entrada: GenerarPropuestas,
     contenidos: ContenidoPropuesta[],
     huellaMaterial: string | undefined,
+    huellaEntradas?: string,
   ) => Promise<void>
 > = {
   // El contenido de CI se sujeta entero con su esquema y con los CHECK de `evidencia`: no hay
@@ -3388,7 +3470,7 @@ const COMPROBAR: Record<
    * de dejar que lo descubra quien acepta la segunda: media respuesta no es revisable, y el
    * suelo no puede decir cuál de las dos sobra.
    */
-  C6: async (tx, entrada, contenidos, huellaMaterial) => {
+  C6: async (tx, entrada, contenidos, huellaMaterial, huellaEntradas) => {
     const { huella, registry } = await huellaDelMaterialDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
     if (!registry) {
       throw new ErrorAI(
@@ -3398,6 +3480,20 @@ const COMPROBAR: Record<
     if (huella !== (huellaMaterial ?? '')) {
       throw new ErrorAI(
         'Los criterios de ese reto cambiaron mientras el proveedor respondía —se añadió uno, o se editó—, así que estas entradas se armaron sin verlos: la propuesta no se guarda. Vuelve a pedirla.',
+      );
+    }
+    // Y lo mismo con lo que el registry ya medía, por la misma razón que antes del despacho:
+    // el rato que dura la llamada también cabe. Se descarta el lote ENTERO y no las filas que
+    // choquen, como con los nombres repetidos de abajo: media respuesta no es revisable, y
+    // cuál de ellas repite a la entrada nueva no lo puede decidir esta función.
+    const entradasAhora = await huellaDeLasEntradasDelRegistry(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (entradasAhora !== (huellaEntradas ?? '')) {
+      throw new ErrorAI(
+        `${MOTIVO_ENTRADAS_MOVIDAS}: la propuesta no se guarda. Vuelve a pedirla.`,
       );
     }
     const nombres = (contenidos as ContenidoEntradaKpi[]).map((c) => c.nombre);
@@ -3613,7 +3709,7 @@ export async function generarPropuestas(
      */
     try {
       await conUsuario(actorId, (tx) =>
-        COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial),
+        COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial, alcance.huellaEntradas),
       );
     } catch (e) {
       if (!(e instanceof ErrorAI)) throw e;
@@ -3678,7 +3774,7 @@ async function persistirPropuestas(
      * se escribe. Va delante del candado del presupuesto porque no lo necesita y porque
      * fallar aquí no debe tener a nadie esperando.
      */
-    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial);
+    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial, alcance.huellaEntradas);
     await bloquearPresupuesto(tx, entrada.workspaceId);
 
     // Retirar la reserva ya no «devuelve» presupuesto: desde que el tope cuenta llamadas

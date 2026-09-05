@@ -680,6 +680,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // se rompe soltando el sello y borrando la propuesta primero; el insight se va después,
       // con su descendencia, de la hoja a la raíz.
       await admin`update insight set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      // Y `entrada_kpi`, que es el CUARTO destino y llegó con C6. Faltaba porque hasta ahora
+      // ninguna sonda de este arnés había aceptado una propuesta de C6 dentro de un workspace
+      // efímero: sin esta línea la limpieza muere en la FK del sello, y el fallo aparece como
+      // un `miembro_usuario_id_fkey` al final, que no dice nada de dónde está.
+      await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -7990,6 +7995,116 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(filas.length).toBe(0);
     });
   }, 20000);
+
+  /**
+   * Y lo que el registry YA MEDÍA también caduca en vuelo, por las dos puertas.
+   *
+   * El prompt de C6 lleva dos cosas de naturaleza distinta: el MATERIAL —el reto y sus
+   * criterios, aquello contra lo que se propone— y el estado del CONTRATO —lo que ya se mide,
+   * para no repetirlo—. La huella del material ya se comprobaba antes de despachar y antes de
+   * guardar; la otra mitad no se comprobaba en ninguna de las dos, así que una `entrada_kpi`
+   * añadida en ese rato dejaba al lote proponiéndola otra vez. Y ese duplicado, si es un
+   * SINÓNIMO y no el mismo nombre, no lo detecta nadie: `nombre-ocupado` compara nombres.
+   *
+   * La huella de las entradas va APARTE de `huella_material` y, sobre todo, NO se persiste —y
+   * eso no es una omisión, es lo que la hace segura—. Aceptar una fila del lote inserta una
+   * entrada, así que las entradas cambian fila a fila: una huella guardada y comprobada al
+   * aceptar dejaría a la segunda fila sin poder aceptarse en cuanto se acepta la primera. La
+   * tercera mitad de esta sonda es justamente ésa.
+   */
+  it('C6: una entrada añadida en vuelo para el lote, y aceptar una fila no tumba a su hermana', async () => {
+    await enWorkspaceLimpio('c6-entradas-en-vuelo', async ({ ws: wsV, curadorId, retoId: retoV }) => {
+      const admin = sqlAdmin();
+      const [crit] = await admin`insert into criterio_exito
+        (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan,
+         creado_por)
+        values (${wsV}, ${retoV}, 'Tiempo de verificación', 'Definición', 'Objetivo', 30, 'Plan',
+                ${curadorId}) returning id`;
+      const criterioV = crit!.id as string;
+      const [mr] = await admin`insert into metric_registry (workspace_id, reto_id, creado_por)
+        values (${wsV}, ${retoV}, ${curadorId}) returning id`;
+      const registryV = mr!.id as string;
+
+      // Una entrada que el prompt SÍ verá: el lote nace sabiendo que existe.
+      const entrar = (nombre: string) => admin`insert into entrada_kpi
+        (workspace_id, registry_id, criterio_id, nombre, definicion, frecuencia, creado_por)
+        values (${wsV}, ${registryV}, ${criterioV}, ${nombre}, 'Definición previa', 'mensual',
+                ${curadorId})`;
+      await entrar('Minutos de verificación');
+
+      const RESPUESTA_C6 = {
+        ok: true as const,
+        datos: {
+          entradas: [
+            { ...CONTENIDO_C6(criterioV), nombre: 'Tasa en móvil' },
+            { ...CONTENIDO_C6(criterioV), nombre: 'Tasa en tableta' },
+          ],
+        },
+        intentos: [intento({ modelo: MODELO_PRIMARIO, latenciaMs: 12, uso: null })],
+      };
+      const pedirLote = () =>
+        generarPropuestas(curadorId, { workspaceId: wsV, capacidad: 'C6', anclaId: registryV });
+
+      // ── 1. Añadida ANTES del despacho: no se llama al proveedor ──
+      let despachos = 0;
+      await conProveedor(RESPUESTA_C6, async () => {
+        proveedor.antesDelApunte = async () => {
+          await entrar('Abandono en la carga');
+        };
+        proveedor.duranteLlamada = async () => {
+          despachos += 1;
+        };
+        try {
+          await expect(pedirLote()).rejects.toThrow(/entradas de ese Metric Registry cambiaron/i);
+        } finally {
+          proveedor.antesDelApunte = null;
+          proveedor.duranteLlamada = null;
+        }
+      });
+      expect(despachos, 'el material salió hacia el proveedor con el contrato ya movido').toBe(0);
+      expect(
+        (await admin`select 1 as x from llamada_ai where workspace_id = ${wsV}`).length,
+        'se abrió línea de gasto para una llamada que no ocurrió',
+      ).toBe(0);
+
+      // ── 2. Añadida EN VUELO: la llamada se paga, pero el lote no se guarda ──
+      await conProveedor(RESPUESTA_C6, async () => {
+        proveedor.duranteLlamada = async () => {
+          await entrar('Reintentos por expediente');
+        };
+        try {
+          await expect(pedirLote()).rejects.toThrow(/entradas de ese Metric Registry cambiaron/i);
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+      expect(
+        (await admin`select 1 as x from propuesta_ai where workspace_id = ${wsV}`).length,
+        'se guardó un lote armado sin saber lo que el registry ya medía',
+      ).toBe(0);
+
+      // ── 3. Y la mitad que sostiene la decisión de no persistir esa huella ──
+      // Sin nada moviéndose, el lote nace; y ACEPTAR la primera fila —que crea una entrada, o
+      // sea que mueve las entradas— tiene que dejar aceptable a la segunda. Sin esto, todo lo
+      // de arriba podría estar escrito comprobando la huella también al aceptar, y el lote
+      // sería irrevisable a partir de la primera fila.
+      await conProveedor(RESPUESTA_C6, pedirLote);
+      const pendientes = await admin`select id from propuesta_ai
+        where workspace_id = ${wsV} and estado = 'propuesta' order by creado_en asc, id asc`;
+      expect(pendientes.length).toBe(2);
+      for (const fila of pendientes) {
+        const r = await aceptarPropuesta(curadorId, {
+          workspaceId: wsV,
+          propuestaId: fila.id as string,
+        });
+        expect(r.estado).toBe('aceptada');
+      }
+      const nombres = await admin`select nombre from entrada_kpi
+        where workspace_id = ${wsV} and registry_id = ${registryV} order by nombre asc`;
+      expect(nombres.map((n) => n.nombre as string)).toContain('Tasa en móvil');
+      expect(nombres.map((n) => n.nombre as string)).toContain('Tasa en tableta');
+    });
+  }, 30000);
 
   /**
    * Y el archivado en vuelo también ordena una propuesta de C6, cuyo reto vive DETRÁS del

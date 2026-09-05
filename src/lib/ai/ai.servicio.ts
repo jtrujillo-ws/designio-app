@@ -1360,8 +1360,20 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      * `=== false` y no `!== true`, como en C5: no saber —sin huella, u otro render del
      * prompt— no puede volverse una alarma.
      */
-    estadoDeLaFila: (f) =>
-      materialDelPanelEsElDelModelo(f) === false ? 'criterios-cambiados' : null,
+    estadoDeLaFila: (f) => {
+      const comparable = materialDelPanelEsElDelModelo(f);
+      if (comparable === false) return 'criterios-cambiados';
+      /*
+       * Y «no se sabe» tiene su PROPIO motivo, que no es el de arriba. Decir «los criterios
+       * cambiaron» cuando lo que pasó es que se desplegó otro render del prompt sería
+       * inventarse una alarma —el defecto contra el que nació este `null`—, y la persona que
+       * revisa se pondría a buscar una edición que nadie hizo. La salida es la misma
+       * —rechazar y pedir otro lote—, pero el motivo que se enseña tiene que ser el que
+       * ocurrió.
+       */
+      if (comparable === null) return 'material-no-comparable';
+      return null;
+    },
     /** El KPI de cada criterio, para que una cita diga a QUÉ promesa responde. */
     etiquetasDelContenido: (f) =>
       Object.fromEntries(
@@ -2086,7 +2098,8 @@ async function liberarReserva(
  *  | C0 · criterios no congelados  | `criterios-congelados`¹⁶     | sí, al insertar¹¹           | política de `criterio_exito` |
  *  | C0 · reto admite criterios    | `reto-no-admite`             | sí (`materializarCriterio`) | guard de materialización¹⁰   |
  *  | C6 · registry admite entradas | `registry-cerrado`           | sí (mismo predicado)        | guard de materialización¹⁰   |
- *  | C6 · material de los criterios| `criterios-cambiados`        | sí (`materializarEntradaKpi`)| NO LO HAY — ver ¹⁷           |
+ *  | C6 · material de los criterios| `criterios-cambiados` /      | sí (`materializarEntradaKpi`)| NO LO HAY — ver ¹⁷           |
+ *  |                               | `material-no-comparable`¹⁸   |                             |                              |
  *
  * ¹⁷ La única fila de esta tabla sin suelo en la base, y con su motivo: el material es el
  * TEXTO YA COMPUESTO —la formulación del reto más sus criterios, recortada a `MAX_MATERIAL`—,
@@ -2096,6 +2109,13 @@ async function liberarReserva(
  * salta cualquier cliente que hable con la server function—, y por eso está también en el
  * materializador. Y se compara contra el MISMO render (`prompt_version`), o un despliegue del
  * prompt bloquearía a la vez todas las propuestas vivas culpando a los criterios.
+ *
+ * ¹⁸ Dos valores y UNA precondición, como la nota ¹⁶ — pero al revés que allí: aquí las dos
+ * salidas son la misma (rechazar y pedir otro lote) y lo que se separa es el HECHO. «Los
+ * criterios cambiaron» es una afirmación; cuando el render del prompt se movió no se sabe si
+ * cambiaron, y decirlo igual mandaría a quien revisa a buscar una edición que nadie hizo. El
+ * desconocimiento se resuelve como NO PERMISO en la aceptación —lo que se firma es un contrato
+ * permanente— y como «no lo sé» en la pantalla, que son cosas distintas y las dos ciertas.
  *
  * ¹⁶ Dos valores, no uno: el congelado tiene dos causas con salidas distintas —el G0, que
  * la reapertura de la etapa 0 revierte, y el registry firmado, que no se revierte— así que
@@ -4473,13 +4493,33 @@ async function materializarEntradaKpi(
     );
   }
   /*
-   * Y solo se compara CONTRA EL MISMO RENDER. La huella es del texto ya compuesto, así que un
-   * despliegue que cambie el prompt la mueve sin que nadie haya tocado un criterio: sin esta
-   * condición, el día de ese despliegue toda propuesta de C6 viva habría dejado de poder
-   * aceptarse a la vez, culpando a los criterios de un cambio del renderizador. Es la misma
-   * pareja de condiciones que `materialDelPanelEsElDelModelo` usa para el panel.
+   * La comparación es CONTRA EL MISMO RENDER, y cuando no lo es se rechaza igual.
+   *
+   * La huella es del texto ya compuesto, así que un despliegue que cambie el prompt la mueve
+   * sin que nadie haya tocado un criterio: compararla entre versiones distintas culparía a los
+   * criterios de un cambio del renderizador. Pero saltarse la comprobación tampoco vale, y ahí
+   * estuvo mi error de la ronda anterior: una propuesta que sobrevive a un despliegue quedaba
+   * sin NINGUNA comprobación del material, y a partir de ahí editar el criterio y aceptar
+   * volvía a materializar un KPI contra otra promesa.
+   *
+   * El mismo desconocimiento se resuelve de tres formas distintas, y las tres están escritas
+   * donde toca: en la presencia literal no puede volverse un veredicto, en el estado de la fila
+   * de C5 no puede volverse una alarma —C5 no materializa nada—, y aquí NO PUEDE VOLVERSE UN
+   * PERMISO, porque lo que se firma es un contrato de medición permanente y atado a su
+   * criterio.
+   *
+   * Lo que esto cuesta, dicho para que nadie lo descubra: un despliegue del prompt deja sin
+   * poder aceptarse toda propuesta de C6 viva, y hay que rechazarlas y pedir otro lote. Se
+   * paga porque la alternativa es firmar sin poder comprobar. Lo que lo evitaría de verdad es
+   * guardar una huella de los DATOS del material además de la del render —independiente del
+   * prompt—, y eso es una columna nueva: queda dicho aquí para quien lo retome.
    */
-  if (p.promptVersion === PROMPT_VERSION && huella !== p.huellaMaterial) {
+  if (p.promptVersion !== PROMPT_VERSION || p.huellaMaterial === null) {
+    throw new ErrorAI(
+      'No se puede comprobar que los criterios sigan siendo los que el modelo leyó: esta propuesta se generó con otra versión del prompt, así que su huella del material no es comparable con la de ahora. Recházala y pide un lote nuevo',
+    );
+  }
+  if (huella !== p.huellaMaterial) {
     throw new ErrorAI(
       'Los criterios de éxito de ese reto cambiaron después de que el modelo los leyera: esta entrada se escribió contra una definición, un objetivo o una ventana que ya no son los vigentes, así que no se puede aceptar. Recházala y pide un lote nuevo',
     );

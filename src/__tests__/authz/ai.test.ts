@@ -11007,6 +11007,58 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y un despliegue del PROMPT no apaga la comprobación: la deja en «no se sabe», y eso no
+   * es permiso.
+   *
+   * La huella es del texto YA COMPUESTO, así que un cambio del renderizador la mueve sin que
+   * nadie haya tocado un criterio; por eso la comparación se hace solo contra el mismo
+   * `prompt_version`. Pero «no se puede comparar» no puede resolverse aceptando: una propuesta
+   * de C6 que sobreviva a un despliegue quedaba sin ninguna comprobación del material, y a
+   * partir de ahí editar el criterio y aceptar volvía a materializar un KPI contra una promesa
+   * distinta — el mismo daño de la ronda anterior, por la puerta que abrió su mitigación.
+   *
+   * El MISMO desconocimiento se resuelve de tres formas distintas, y las tres están dichas
+   * donde toca: en la presencia literal no puede volverse un veredicto (verde ni rojo), en el
+   * estado de la fila de C5 no puede volverse una alarma —C5 no materializa nada—, y aquí no
+   * puede volverse un permiso, porque lo que se firma es un contrato de medición permanente.
+   *
+   * Y el panel lo dice con su propio motivo: `criterios-cambiados` afirma que se movieron, y
+   * eso aquí sería inventarse una alarma. La salida es la misma —rechazar y pedir otro lote—,
+   * pero el motivo que se enseña tiene que ser el que ocurrió.
+   */
+  it('C6: una propuesta de otro render del prompt no se acepta, y el panel dice por qué', async () => {
+    const admin = sqlAdmin();
+    const contenido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en caja',
+    };
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido,
+      }),
+    );
+    // El despliegue: la fila se queda con la versión con la que nació y el código avanza. Se
+    // simula moviendo la de la FILA, que es lo mismo visto desde la comparación.
+    await admin`update propuesta_ai set prompt_version = 'ai-2000-01-01.1'
+      where id = ${propuestaId}`;
+
+    const enPanel = (await panelPropuestas(leadId, ws)).pendientes.find(
+      (x) => x.id === propuestaId,
+    );
+    expect(enPanel!.anclaEstado).toBe('material-no-comparable');
+    await expect(
+      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
+    ).rejects.toThrow(/no se puede comprobar/i);
+
+    // Y rechazar sigue abierto, como en todas las filas de la tabla de precondiciones.
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [fin] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(fin!.estado).toBe('rechazada');
+  });
+
+  /**
    * Y la entrada materializada tiene que haber NACIDO en esa aceptación.
    *
    * `xmin` dice «esta transacción escribió esta versión de la fila» y no distingue insertar de

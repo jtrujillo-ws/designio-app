@@ -630,6 +630,7 @@ export const ESTADOS_ANCLA = [
   'criterio-ausente',
   'nombre-ocupado',
   'criterios-cambiados',
+  'material-no-comparable',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

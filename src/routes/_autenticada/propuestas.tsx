@@ -124,6 +124,8 @@ const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
   // El material se movió por debajo: corregir el texto de la propuesta no devuelve el
   // criterio a lo que el modelo leyó, así que la única salida es rechazar y pedir otro lote.
   'criterios-cambiados': false,
+  // Y tampoco: lo que falta no es texto de la propuesta, es poder comparar su material.
+  'material-no-comparable': false,
   'reto-no-admite': false,
   'gate-decidido': false,
   'checklist-avanzado': false,
@@ -165,6 +167,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
   'criterios-cambiados':
     'Los criterios de éxito de ese reto cambiaron desde que el modelo los leyó: esta entrada se escribió contra una definición, un objetivo o una ventana que ya no son los vigentes. Recházala y pide un lote nuevo.',
+  'material-no-comparable':
+    'Esta propuesta se generó con otra versión del prompt, así que no se puede comprobar si los criterios siguen siendo los que el modelo leyó. No es que hayan cambiado: es que no se sabe. Recházala y pide un lote nuevo.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 

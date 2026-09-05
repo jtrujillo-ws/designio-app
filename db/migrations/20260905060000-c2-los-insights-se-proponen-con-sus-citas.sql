@@ -1209,3 +1209,70 @@ create unique index reserva_ai_journey_idx on reserva_ai (workspace_id, capacida
 create unique index propuesta_ai_journey_pendiente_idx
   on propuesta_ai (workspace_id, capacidad, journey_id)
   where journey_id is not null and estado = 'propuesta';
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- EL MATERIAL DE UN RETO CAMBIA POR FILAS QUE TODAVÍA NO EXISTEN
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- `REVALIDAR.C2` recompone la huella del material antes de despachar y dice cubrir con eso
+-- «una evidencia desenlazada, otra NUEVA, un resumen editado». Las dos primeras mitades son
+-- ciertas; la de la evidencia nueva no lo era bajo concurrencia, y el motivo es de fondo:
+-- «for share» bloquea FILAS QUE EXISTEN. Un `insert into arquetipo_evidencia` sin commitear
+-- no está en ninguna de las filas leídas, así que la lectura no lo ve y NO ESPERA. La llamada
+-- sale con el material viejo, el enlace commitea detrás, y la propuesta se armó sin una
+-- evidencia que en ese momento ya sostenía al reto — que en C2 puede ser justo la que
+-- contradice el insight, es decir la que I4 existe para no dejar esconder.
+--
+-- Y el fantasma tiene DOS formas: un enlace nuevo sobre un arquetipo que ya existía, y un
+-- arquetipo nuevo con su enlace (dos transacciones que caben enteras en la ventana). Bloquear
+-- las filas de `arquetipo` solo cubriría la primera. Lo que cubre las dos es un candado por
+-- CLAVE y no por fila: el mismo `designio:reto:` que toma `gate_aprobar_suficiencia_guard`
+-- cuando decide sobre filas de otras tablas.
+--
+-- Va en un TRIGGER y no solo en el servicio, por el mismo motivo que aquél lo razona: quien
+-- escribe por SQL directo no coopera con ningún protocolo del servicio, y la superficie
+-- concedida al rol de aplicación incluye el insert de `arquetipo_evidencia`.
+--
+-- ── El ORDEN, que aquí es lo delicado ──
+-- El guard de congelación toma `designio:workspace:<ws>` en modo COMPARTIDO y corre primero
+-- (su prefijo `a_` lo garantiza), así que toda escritura que pase por él pide workspace y
+-- DESPUÉS reto. La revalidación del despacho tiene que pedirlos en ese mismo orden, y por eso
+-- toma también el del workspace aunque no lo necesite para nada: sin esa línea, el despacho
+-- pediría reto → workspace (el segundo se lo pide su propio insert en `llamada_ai`) mientras
+-- una disposición en curso —única que toma el del workspace en EXCLUSIVA, y que borra
+-- `arquetipo`, con lo que pasa por este trigger— pediría workspace → reto. Dos órdenes sobre
+-- el mismo par: abrazo mortal esperando a que coincidan.
+create function arquetipo_candado_del_reto_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+declare
+  v_reto uuid;
+  v_fila record;
+begin
+  v_fila := coalesce(new, old);
+  if tg_table_name = 'arquetipo' then
+    v_reto := v_fila.reto_id;
+  else
+    select a.reto_id into v_reto
+      from arquetipo a
+      where a.id = v_fila.arquetipo_id and a.workspace_id = v_fila.workspace_id;
+  end if;
+  if v_reto is not null then
+    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+  end if;
+  return v_fila;
+end;
+$fn$;
+
+revoke execute on function arquetipo_candado_del_reto_guard() from public;
+
+-- `b_` y no `a_`: `a_congelacion_por_disposicion` tiene que seguir siendo el PRIMER trigger de
+-- fila —hay un censo que lo comprueba— y este va justo detrás. Ninguno de los otros guards de
+-- estas dos tablas toma candados, así que entre uno y otro no se cuela ningún candado de fila
+-- que invierta el orden.
+create trigger b_candado_del_reto
+  before insert or update or delete on arquetipo
+  for each row execute function arquetipo_candado_del_reto_guard();
+create trigger b_candado_del_reto
+  before insert or update or delete on arquetipo_evidencia
+  for each row execute function arquetipo_candado_del_reto_guard();

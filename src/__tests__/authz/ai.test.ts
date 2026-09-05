@@ -7959,6 +7959,170 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   }, 20000);
 
   /**
+   * Y el ENLACE NUEVO en vuelo: el fantasma que los candados de fila no cubren.
+   *
+   * `REVALIDAR.C2` recompone la huella del material y dice, en su propio comentario, que así
+   * cubre «una evidencia desenlazada, otra NUEVA, un resumen editado». Las dos primeras
+   * mitades son ciertas; la tercera no lo era bajo concurrencia. `for share` bloquea FILAS
+   * QUE EXISTEN: un `insert into arquetipo_evidencia` que todavía no ha commiteado no está en
+   * ninguna de ellas, así que la lectura no lo ve y no espera. La llamada sale con el
+   * material viejo, el enlace commitea detrás, y la propuesta que vuelve se armó sin una
+   * evidencia que en ese momento ya sostenía al reto — que en C2 puede ser justo la que
+   * contradice el insight.
+   *
+   * Y no basta con bloquear los arquetipos existentes: un arquetipo NUEVO con su enlace son
+   * dos transacciones que caben enteras en la ventana, y su fila tampoco existía al leer. Lo
+   * que cubre las dos formas del fantasma es el candado por CLAVE, no por fila: el mismo
+   * `designio:reto:` que toma `gate_aprobar_suficiencia_guard` cuando decide sobre filas de
+   * otras tablas, y por el mismo motivo que aquél lo toma en el GUARD y no solo en el
+   * servicio — quien escribe por SQL directo no coopera con ningún protocolo.
+   */
+  it('un enlace de evidencia en vuelo no deja que se despache material viejo', async () => {
+    await enWorkspaceLimpio('c2-enlace-en-vuelo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      // La SEGUNDA evidencia queda preparada pero SIN enlazar: enlazarla es lo que ocurre en
+      // vuelo. Su arquetipo es nuevo, así que la sonda cubre la forma difícil del fantasma
+      // —fila que no existía al leer— y no solo la de un enlace sobre un arquetipo ya visto.
+      const [arqNuevo] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, 'Arquetipo tardío', 'Definición', ${curadorId}) returning id`;
+      const [fte] = await admin`insert into fuente
+        (workspace_id, tipo, titulo, referencia, creado_por)
+        values (${wsC}, 'documento', 'La contradicción', 'ref', ${curadorId}) returning id`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, 'La contradicción',
+                'En cambio el 12% dice que el documento nunca fue el problema.', '{}'::jsonb,
+                ${curadorId}) returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev2!.id as string}, 'concedido', 'cliente', 'Consentimiento',
+                ${curadorId}, now(), ${curadorId})`;
+
+      let despachos = 0;
+      proveedor.duranteLlamada = async () => {
+        despachos += 1;
+      };
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+
+      let soltar: () => void = () => {};
+      const enVuelo = new Promise<void>((r) => {
+        soltar = r;
+      });
+      const enlace = admin.begin(async (tx) => {
+        await tx`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+          values (${wsC}, ${arqNuevo!.id as string}, ${ev2!.id as string})`;
+        await enVuelo;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      try {
+        const generacion = conProveedor(
+          { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+          () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+        );
+        const veredicto = generacion.then(
+          () => 'generó',
+          (e: Error) => `rechazó: ${e.message}`,
+        );
+        await new Promise((r) => setTimeout(r, 1500));
+        soltar();
+        await enlace;
+        expect(await veredicto).toMatch(/cambió mientras se preparaba/);
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      expect(despachos, 'se despachó material sin la evidencia que ya sostenía al reto').toBe(0);
+      const [tras] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(tras!.n).toBe(antes!.n);
+    });
+  }, 20000);
+
+  /**
+   * Y el ORDEN de los dos candados por clave, que es lo que costó el candado del reto.
+   *
+   * El guard de congelación toma `designio:workspace:` en COMPARTIDO y corre el primero en
+   * toda escritura, así que el orden del sistema es workspace → reto. Si el despacho pidiera
+   * solo el del reto, lo pediría al revés: reto primero y workspace después, porque el del
+   * workspace se lo acaba pidiendo su propio insert en `llamada_ai`. Enfrente hay una
+   * transacción que los pide en el orden bueno y en EXCLUSIVA: `ejecutar_disposicion` toma el
+   * del workspace y después borra `arquetipo`, con lo que pasa por el trigger nuevo y pide el
+   * del reto. Dos órdenes sobre el mismo par es un abrazo mortal esperando a que coincidan.
+   *
+   * La ventana es ESTRECHA y por eso la sonda usa `antesDelApunte`: la transacción de
+   * `prepararAlcance` también escribe (la reserva) y también pide el del workspace, así que
+   * una sonda que tomara el candado antes de empezar bloquearía ahí —sin haber tomado nada— y
+   * no mediría nada. Se comprobó: esa primera versión seguía en verde con el arreglo quitado.
+   * El hueco bueno es el de justo antes del apunte, con la preparación ya commiteada.
+   */
+  it('el despacho pide el candado del workspace antes que el del reto', async () => {
+    await enWorkspaceLimpio('c2-orden-de-candados', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+
+      let otra: Promise<unknown> = Promise.resolve();
+      let loTiene: () => void = () => {};
+      const yaLoTiene = new Promise<void>((r) => {
+        loTiene = r;
+      });
+      // El mismo par y en el mismo orden que `ejecutar_disposicion`: el del workspace en
+      // exclusiva, y después el del reto (que allí llega por el borrado de `arquetipo`).
+      proveedor.antesDelApunte = async () => {
+        otra = admin.begin(async (tx) => {
+          await tx`select pg_advisory_xact_lock(
+            hashtextextended('designio:workspace:' || ${wsC}::text, 42))`;
+          loTiene();
+          // Tiempo para que el apunte llegue a pedir sus candados: con el orden bueno se
+          // queda esperando el del workspace sin haber tomado nada; con el malo ya tiene el
+          // del reto y espera el del workspace.
+          await new Promise((r) => setTimeout(r, 800));
+          await tx`select pg_advisory_xact_lock(
+            hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        });
+        await yaLoTiene;
+      };
+
+      let resultado: string;
+      let laOtraTermino: string;
+      try {
+        const generacion = conProveedor(
+          { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+          () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+        );
+        resultado = await generacion.then(
+          () => 'generó',
+          (e: Error) => `rechazó: ${e.message}`,
+        );
+        laOtraTermino = await otra.then(
+          () => 'commiteó',
+          (e: Error) => `abortó: ${e.message}`,
+        );
+      } finally {
+        proveedor.antesDelApunte = null;
+      }
+
+      // Un interbloqueo aborta a UNA de las dos, y cuál es no lo elige nadie: por eso se
+      // miran las dos. Del lado del despacho no llega la palabra «deadlock» —el servicio
+      // traduce el fallo del apunte a su mensaje de dominio—, así que lo que se afirma es lo
+      // que de verdad se quiere: las dos terminan. Medido con el candado del workspace
+      // quitado: «rechazó: No se pudo abrir la línea del libro de costos para esta llamada».
+      const veredictos = { despacho: resultado, disposicion: laOtraTermino };
+      expect(veredictos, 'el despacho y la disposición se pidieron los candados en órdenes distintos')
+        .toEqual({ despacho: 'generó', disposicion: 'commiteó' });
+    });
+  }, 20000);
+
+  /**
    * Un uuid en mayúscula es el MISMO uuid, también en el suelo.
    *
    * El guard del INSERT normaliza con `lower(...)` —lo hace explícitamente— y el guard diferido

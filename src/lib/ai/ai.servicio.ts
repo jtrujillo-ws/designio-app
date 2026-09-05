@@ -2411,6 +2411,29 @@ const REVALIDAR: Record<
      * diferido de la aceptación y el que encabeza `bloquearReto` en el servicio, para que dos
      * transacciones los pidan siempre en la misma secuencia.
      */
+    /*
+     * Y ANTES de eso, los dos candados por CLAVE, en el orden en que los pide todo lo demás.
+     *
+     * El del RETO cubre lo que ningún candado de fila puede cubrir: una evidencia que se
+     * enlaza al reto MIENTRAS se prepara la llamada. `for share` bloquea filas que existen, y
+     * un `insert into arquetipo_evidencia` sin commitear no está en ninguna — la lectura no lo
+     * ve, no espera, y el material sale viejo. Peor con un arquetipo nuevo: ahí ni siquiera
+     * existía la fila padre. Por eso el candado es por clave (`designio:reto:`), el mismo que
+     * toma `gate_aprobar_suficiencia_guard` cuando decide sobre filas de otras tablas, y el
+     * que este PR pone en un trigger de `arquetipo` y `arquetipo_evidencia` para que lo tome
+     * también quien escribe por SQL directo.
+     *
+     * El del WORKSPACE no hace falta para nada aquí, y aun así va delante: el guard de
+     * congelación lo toma —en modo compartido— antes que ningún otro en toda escritura, así
+     * que el orden del sistema es workspace → reto. Sin esta línea, el despacho pediría reto y
+     * después workspace (se lo pide su propio insert en `llamada_ai`), mientras una
+     * disposición en curso —la única que lo toma en EXCLUSIVA, y que borra `arquetipo`— los
+     * pediría al revés. Dos órdenes sobre el mismo par es un abrazo mortal esperando.
+     */
+    await tx`select pg_advisory_xact_lock_shared(
+      hashtextextended('designio:workspace:' || ${entrada.workspaceId}, 42))`;
+    await tx`select pg_advisory_xact_lock(
+      hashtextextended('designio:reto:' || ${entrada.anclaId}, 42))`;
     await tx`select 1 from reto
       where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
       for share`;

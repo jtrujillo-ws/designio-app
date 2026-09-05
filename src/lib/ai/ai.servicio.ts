@@ -859,6 +859,13 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     await rolCurador(tx, actorId, entrada.workspaceId);
 
     const { keyWorkspace, keyEntorno } = credencialesAI();
+    // La puerta del consentimiento la abre la DECLARACIÓN, no la entrada de cada capacidad.
+    // Va antes de `PREPARAR` —el prompt se construye con el material, así que comprobar
+    // después sería comprobar tarde— y antes del candado del presupuesto, que es el orden de
+    // candados de la casa.
+    if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
+      await exigirConsentimientoVigente(tx, entrada, 'antes-de-preparar');
+    }
     const { sistema, prompt } = await PREPARAR[entrada.capacidad](tx, entrada);
 
     // ── Reserva del hueco, bajo candado del workspace ──
@@ -1196,7 +1203,10 @@ async function comprobarDespacho(
     // (es el suelo, y sigue estando), pero un 42501 llega aquí sin nada que decirle a la
     // persona salvo «vuelve a intentarlo», que además es falso: reintentar no devuelve un rol.
     await rolCurador(tx, actorId, entrada.workspaceId);
-    versionConsentimiento = await REVALIDAR[entrada.capacidad](tx, entrada);
+    if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
+      versionConsentimiento = await exigirConsentimientoVigente(tx, entrada, 'antes-de-despachar');
+    }
+    await REVALIDAR[entrada.capacidad](tx, entrada);
 
     // El token de despacho: la reserva sigue existiendo y NO ha caducado. Una revocación la
     // retira, y una caducada dejó de contar para admitir a los demás — despachar con ella
@@ -1474,27 +1484,15 @@ function anclasDelInsert(
  */
 const REVALIDAR: Record<
   CapacidadActiva,
-  (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<number | null>
+  (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<void>
 > = {
   CI: async (tx, entrada) => {
-    await bloquearConsentimiento(tx, entrada.anclaId);
-    const [item] = await tx`select
-        estado <> 'pendiente' as ya_decidido,
-        tipo_fuente_exige_consentimiento(tipo_fuente)
-          and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
-        case when tipo_fuente_exige_consentimiento(tipo_fuente) then
-          (select c.version from consentimiento_item c
-            where c.item_id = item_importacion.id
-              and c.workspace_id = item_importacion.workspace_id
-            order by c.version desc limit 1)
-        end as version_vigente
+    // El consentimiento NO se comprueba aquí: lo hace `exigirConsentimientoVigente`, que corre
+    // justo antes gobernado por `exigeConsentimiento`. Estaba escrito a mano en esta entrada,
+    // y por eso la bandera no servía para nada.
+    const [item] = await tx`select estado <> 'pendiente' as ya_decidido
       from item_importacion
       where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
-    if (item?.falta_consentimiento) {
-      throw new ErrorAI(
-        'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
-      );
-    }
     // Otro curador pudo decidir el item a mano mientras tanto: su material ya no espera
     // nada de la AI y la propuesta nacería obsoleta. Gastar la llamada para eso es tirar
     // dinero, y es el mismo caso que el consentimiento — algo que `prepararAlcance` vio
@@ -1504,18 +1502,6 @@ const REVALIDAR: Record<
         'Ese item de la bandeja ya fue curado mientras se preparaba la llamada: no se llamó al proveedor',
       );
     }
-    // La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción
-    // que la aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un
-    // hecho consultable y no una reconstrucción por fechas.
-    //
-    // `null` EXACTAMENTE cuando el tipo de fuente no exige consentimiento, que es lo que
-    // la base impone en los dos sentidos: con material de personas es obligatorio citar
-    // uno, sin él está prohibido. Si se leyera «la última versión que haya», un item de
-    // tipo `nota` con un consentimiento registrado por si acaso citaría uno y el guard lo
-    // rechazaría — y con razón, porque ese `null` es el que significa «no aplicaba».
-    return item.version_vigente === null || item.version_vigente === undefined
-      ? null
-      : Number(item.version_vigente);
   },
   C0: async (tx, entrada) => {
     const [reto] = await tx`select
@@ -1527,7 +1513,6 @@ const REVALIDAR: Record<
         'Ese reto dejó de admitir criterios mientras se preparaba la llamada (G0 aprobado, registry firmado o reto cerrado): no se llamó al proveedor',
       );
     }
-    return null;
   },
 };
 
@@ -1550,28 +1535,16 @@ const PREPARAR: Record<
   (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<Preparacion>
 > = {
   CI: async (tx, entrada) => {
-    // Candado por item ANTES de leer el consentimiento: leerlo y apartar la reserva tienen
-    // que ser atómicos respecto a `registrarConsentimiento`, o una revocación podría
-    // colarse entre ambos y quedarse sin nada que retirar. Orden de candados en toda la
-    // casa: consentimiento (por item) y DESPUÉS presupuesto (por workspace) — este es el
-    // único camino que toma los dos, así que no hay ciclo posible.
-    await bloquearConsentimiento(tx, entrada.anclaId);
+    // El consentimiento ya está comprobado —y su candado tomado— por
+    // `exigirConsentimientoVigente`, que corre justo antes gobernado por la declaración de la
+    // capacidad. Estaba escrito a mano AQUÍ, y por eso `exigeConsentimiento` no servía para
+    // nada: una capacidad futura podía declararlo y mandar material de personas sin puerta.
     const [item] = await tx`select titulo, tipo_fuente, referencia, contenido,
-        tipo_fuente_exige_consentimiento(tipo_fuente)
-          and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
         item_tiene_material_extraible(contenido) as tiene_material
       from item_importacion
       where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
         and estado = 'pendiente'`;
     if (!item) throw new ErrorAI('El item no existe en este workspace o ya fue curado');
-    // RF-09.5: ANTES de construir el prompt, no al aceptar la propuesta. Aquí es donde
-    // se evita de verdad que el material de una persona salga hacia el proveedor; el
-    // guard de `propuesta_ai` es el suelo que impide que exista una propuesta así.
-    if (item.falta_consentimiento as boolean) {
-      throw new ErrorAI(
-        'Ese material es de personas: registra el consentimiento para procesarlo con un proveedor externo antes de pedir una propuesta (RF-09.5)',
-      );
-    }
     // Un item importado SOLO con la referencia al original no tiene nada que citar, y el
     // contrato de CI obliga al modelo a devolver una evidencia fechada con al menos una
     // cita literal. Sin cuerpo, la única salida que cumple el contrato es inventada a
@@ -1857,6 +1830,74 @@ async function persistirPropuestas(
  * leyendo la máxima actual, y una consulta es un predicado sobre un snapshot — dos
  * curadores registrando a la vez leerían el mismo máximo. El índice único de la bitácora es
  * el suelo (uno de los dos fallaría); esto es lo que hace que ninguno tenga que fallar. */
+/**
+ * La puerta del CONSENTIMIENTO, gobernada por lo que la capacidad DECLARA.
+ *
+ * `exigeConsentimiento` estaba declarado y no lo leía nadie: el candado y la comprobación
+ * vivían escritos a mano dentro de las entradas de CI en `PREPARAR` y `REVALIDAR`. Una
+ * capacidad futura podía declarar `true` y mandar material de personas al proveedor sin
+ * candado ni comprobación — el compilador no echaría nada de menos, porque no faltaba
+ * ninguna entrada: faltaba que la bandera SIRVIERA para algo. Es el mismo defecto que este PR
+ * quita en todos lados, y aquí con la peor consecuencia posible (RF-09.5).
+ *
+ * Ahora declararla ES encender la puerta. Y el orden de candados de la casa se conserva:
+ * consentimiento (por item) primero, presupuesto (por workspace) después — este sigue siendo
+ * el único camino que toma los dos, así que no hay ciclo posible.
+ *
+ * Devuelve la versión VIGENTE del consentimiento, que es lo que se anota en la llamada: el
+ * dato es de la puerta, no de la capacidad, así que sale de aquí y no de `REVALIDAR`.
+ *
+ * PRECONDICIÓN, y la sujeta una prueba: una capacidad que exige consentimiento ancla en
+ * `item_id`. El consentimiento es de material de PERSONAS y ese material vive en
+ * `item_importacion` —allí están `tipo_fuente` y `consentimiento_item`—, así que la puerta
+ * pregunta ahí. Si algún día el consentimiento alcanza a otra ancla, esa prueba enrojece en
+ * vez de dejar la puerta abierta en silencio.
+ */
+async function exigirConsentimientoVigente(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+  momento: 'antes-de-preparar' | 'antes-de-despachar',
+): Promise<number | null> {
+  // Candado por item ANTES de leer: leer el consentimiento y apartar la reserva tienen que ser
+  // atómicos respecto a `registrarConsentimiento`, o una revocación podría colarse entre ambos
+  // y quedarse sin nada que retirar.
+  await bloquearConsentimiento(tx, entrada.anclaId);
+  const [item] = await tx`select
+      tipo_fuente_exige_consentimiento(tipo_fuente)
+        and not consentimiento_externo_vigente(id, workspace_id) as falta,
+      case when tipo_fuente_exige_consentimiento(tipo_fuente) then
+        (select c.version from consentimiento_item c
+          where c.item_id = item_importacion.id
+            and c.workspace_id = item_importacion.workspace_id
+          order by c.version desc limit 1)
+      end as version_vigente
+    from item_importacion
+    where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+  if (item?.falta) {
+    // El momento cambia lo que hay que decir, y no es cosmético: antes de preparar el camino
+    // es registrar el consentimiento; al despachar, lo que importa es que el material NO salió.
+    throw new ErrorAI(
+      momento === 'antes-de-preparar'
+        ? 'Ese material es de personas: registra el consentimiento para procesarlo con un proveedor externo antes de pedir una propuesta (RF-09.5)'
+        : 'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
+    );
+  }
+  /*
+   * La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción que la
+   * aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un hecho
+   * consultable y no una reconstrucción por fechas.
+   *
+   * `null` EXACTAMENTE cuando el tipo de fuente no exige consentimiento, que es lo que la base
+   * impone en los dos sentidos: con material de personas es obligatorio citar uno, sin él está
+   * prohibido. Si se leyera «la última versión que haya», un item de tipo `nota` con un
+   * consentimiento registrado por si acaso citaría uno y el guard lo rechazaría — y con razón,
+   * porque ese `null` es el que significa «no aplicaba».
+   */
+  return item?.version_vigente === null || item?.version_vigente === undefined
+    ? null
+    : Number(item.version_vigente);
+}
+
 async function bloquearConsentimiento(tx: TransactionSql, itemId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(
     hashtextextended('designio:consentimiento:' || ${itemId}, 42))`;

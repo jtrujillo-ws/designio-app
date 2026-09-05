@@ -249,6 +249,56 @@ describe('el registro de capacidades', () => {
   });
 
   /**
+   * La bandera del consentimiento ENCIENDE la puerta; no la describe.
+   *
+   * `exigeConsentimiento` estaba declarado y no lo leía nadie: el candado y la comprobación
+   * vivían escritos a mano dentro de la entrada de CI en `PREPARAR` y en `REVALIDAR`. Una
+   * capacidad futura podía declarar `true` y mandar material de personas al proveedor sin
+   * puerta — y el compilador no habría echado nada de menos, porque no faltaba ninguna
+   * entrada: faltaba que la bandera sirviera para algo. Es el defecto de esta serie con la
+   * peor consecuencia posible (RF-09.5).
+   */
+  it('gobierna la puerta del consentimiento desde la declaración, no desde cada capacidad', async () => {
+    const codigo = await readFile(`${RAIZ}/src/lib/ai/ai.servicio.ts`, 'utf8');
+
+    // 1. Los DOS despachos consultan la bandera. Si alguien vuelve a meter la puerta dentro de
+    //    una capacidad, la bandera deja de decidir y esto lo dice.
+    const consultas = codigo.match(/CAPACIDADES\[entrada\.capacidad\]\.exigeConsentimiento/g) ?? [];
+    expect(consultas.length, 'la bandera tiene que gobernar preparación y despacho').toBe(2);
+
+    // 2. Y ninguna entrada de PREPARAR/REVALIDAR la escribe a mano. Se miran los dos registros
+    //    acotados, no el fichero entero: la puerta compartida SÍ tiene que nombrar esas cosas.
+    for (const registro of ['const PREPARAR', 'const REVALIDAR']) {
+      const desde = codigo.indexOf(registro);
+      expect(desde, `no se encontró ${registro}`).toBeGreaterThan(0);
+      const cuerpo = codigo.slice(desde, codigo.indexOf('\n};', desde));
+      expect(cuerpo.length).toBeGreaterThan(200);
+      for (const aMano of ['bloquearConsentimiento', 'consentimiento_externo_vigente']) {
+        expect(cuerpo, `${registro} vuelve a comprobar el consentimiento a mano`).not.toContain(
+          aMano,
+        );
+      }
+    }
+  });
+
+  /**
+   * Y la precondición de esa puerta: quien exige consentimiento ancla en `item_id`.
+   *
+   * El consentimiento es de material de PERSONAS, y ese material vive en `item_importacion`
+   * —allí están `tipo_fuente` y `consentimiento_item`—, así que la puerta pregunta ahí. El día
+   * que una capacidad exija consentimiento anclando en otra cosa, esto enrojece en vez de
+   * dejar la puerta preguntando por una fila que no existe: `item?.falta` sería `undefined`,
+   * que NO es verdadero, y el material saldría hacia el proveedor sin permiso.
+   */
+  it('quien exige consentimiento ancla donde vive el consentimiento', () => {
+    for (const c of CAPACIDADES_ACTIVAS) {
+      const d = CAPACIDADES[c];
+      if (!d.exigeConsentimiento) continue;
+      expect(d.ancla.columna, `${c} exige consentimiento y no ancla en un item`).toBe('item_id');
+    }
+  });
+
+  /**
    * Y el enlace del objeto materializado se escribe EN la columna que el destino nombra.
    *
    * El sello elegía con dos ternarios —`COLUMNA_DE_DESTINO[destino] === 'evidencia_id' ? …`—,

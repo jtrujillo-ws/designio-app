@@ -162,7 +162,29 @@ export type LoteCapacidad = { campo: string; maximo: number } | null;
 export type DefinicionCapacidad = {
   /** Cómo se lee en el selector de capacidad. */
   etiqueta: string;
-  /** Qué objeto del dominio materializa una propuesta aceptada. */
+  /**
+   * Qué objeto del dominio materializa una propuesta aceptada.
+   *
+   * OBLIGATORIO, y hoy eso deja fuera a las capacidades INFORMATIVAS. RF-08.4 dice que CT
+   * «carece de acción aprobar»: reporta huecos citando objetos y no escribe nada. Con este
+   * campo obligatorio, CT tendría que elegir un destino materializable, y la revisión llamaría
+   * a `MATERIALIZAR` y guardaría un id que no significa nada.
+   *
+   * No se hace nullable AQUÍ, y conviene decir por qué en vez de dejarlo raro: el suelo de
+   * esta costura es la base, y `propuesta_ai` no admite hoy una propuesta informativa —
+   * `destino` es `not null`, seis CHECK atan destino con ancla y con objeto, y
+   * `check ((estado in ('aceptada','corregida')) = (coalesce(evidencia_id, criterio_id) is not null))`
+   * exige objeto para toda decisión que no sea rechazo. Un `Destino | null` en TypeScript sin
+   * esa migración detrás sería exactamente la clase de declaración decorativa que este
+   * registro existe para quitar: un valor que se puede escribir y que no llega a ninguna parte.
+   *
+   * Y no es un caso aparte: `reserva_ai`, `llamada_ai` y `propuesta_ai` restringen
+   * `capacidad in ('C0','CI')`, así que TODA capacidad nueva trae su migración. La de CT es la
+   * que además hace `destino` anulable, rehace esos CHECK para admitir «sin objeto» y decide
+   * qué significa decidir una propuesta que no se materializa (rechazar y poco más). Ese
+   * trabajo va con CT, donde hay algo que lo ejercite; aquí solo queda dicho para que quien
+   * la escriba no lo descubra a mitad.
+   */
   destino: Destino;
   ancla: AnclaCapacidad;
   /*

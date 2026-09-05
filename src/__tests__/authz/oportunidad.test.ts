@@ -565,6 +565,14 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
       conUsuario(leadId, (tx) => tx`update etapa_instancia set estado = 'en-curso'
         where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`),
     ).rejects.toThrow(/solo se reabre por la puerta/);
+
+    // Y el atajo EN DOS PASOS, que es por donde se colaba el primer arreglo: bajar a
+    // 'pendiente' y subir desde ahí no toca la transición vigilada ni una sola vez. Por eso
+    // la puerta se mide sobre SALIR de 'completada' y no sobre entrar en 'en-curso'.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update etapa_instancia set estado = 'pendiente'
+        where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`),
+    ).rejects.toThrow(/una etapa completada no vuelve a pendiente/);
     const [sinTocar] = await admin`select estado from etapa_instancia
       where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`;
     expect(sinTocar!.estado as string).toBe('completada');

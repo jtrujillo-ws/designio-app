@@ -10,6 +10,7 @@ import {
   priorizarOportunidad,
 } from '@/lib/servicio/oportunidad.servicio';
 import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
+import { abrirMedicion } from '@/lib/medicion/medicion.servicio';
 import { describeAuthz } from './helpers';
 
 /**
@@ -108,6 +109,8 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     await admin`delete from reapertura_insight where workspace_id = ${ws}`;
     await admin`delete from reapertura_etapa where workspace_id = ${ws}`;
     await admin`delete from proyecto where workspace_id = ${ws}`;
+    // El registry cuelga del reto: sin esta línea la limpieza muere en el `delete from reto`.
+    await admin`delete from metric_registry where workspace_id = ${ws}`;
     await admin`delete from cita where workspace_id = ${ws}`;
     await admin`delete from afirmacion where workspace_id = ${ws}`;
     await admin`delete from insight where workspace_id = ${ws}`;
@@ -742,6 +745,90 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
   });
 
   /**
+   * Y el portafolio se REVALIDA en el instante en que se congela para medir.
+   *
+   * G3 certifica el portafolio y la ventana se cierra con él, pero una reapertura legítima de
+   * la etapa 3 la vuelve a abrir —para eso existe— y ahí caben oportunidades nuevas. Lo que no
+   * había era nada que volviera a mirar el portafolio antes de congelarlo del otro lado: el
+   * proyecto sigue su método hasta G7, `abrirMedicion` mueve el reto a 'en-medicion' y a partir
+   * de ese momento `reto_admite_portafolio` es falso otra vez. Medido: una HMW viva sin traza
+   * entraba por la ventana reabierta y quedaba congelada dentro, con G3 firmado diciendo lo
+   * contrario y sin ninguna puerta por la que arreglarla — y `outcome_review_completar_guard`
+   * cierra el reto en ese estado.
+   *
+   * Se revalida SYS-15 y solo SYS-15, que es lo que la reapertura pudo cambiar: el conjunto de
+   * oportunidades vivas. El eje TIEMPO del razonamiento —que G3 sí mira— no se vuelve a
+   * preguntar aquí a propósito: un derecho revocado entre G3 y la medición no desmiente la
+   * traza de la HMW, y exigirlo convertiría cada revocación en un reto que no puede medir.
+   *
+   * Se mide por las dos mitades: con la HMW huérfana no se abre, y arreglada —trazándola— sí.
+   */
+  it('abrir la medición vuelve a comprobar el portafolio que va a congelar', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio de la congelación', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo,
+       creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-CON', 'Reto de la congelación', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoC = r!.id as string;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${retoC}, 'P-CON', 'Proyecto', 'activo', 'rapido', ${leadId}) returning id`;
+    const proyectoC = p!.id as string;
+
+    // El estado «listo para medir» se monta con la mano de la base y con las réplicas
+    // desactivadas: lo que esta prueba mide es la puerta de `abrirMedicion`, no el camino de
+    // ocho gates que lleva hasta ella —que tienen sus propias pruebas—.
+    await admin.begin(async (tx) => {
+      await tx`set local session_replication_role = replica`;
+      await tx`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+        values (${ws}, ${proyectoC}, 3, 'Conceptualización', 'completada')`;
+      await tx`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+        values (${ws}, ${proyectoC}, 3, 'sponsor', 'aprobado', ${leadId}, now()),
+               (${ws}, ${proyectoC}, 7, 'lead-boutique', 'aprobado', ${leadId}, now())`;
+      await tx`insert into metric_registry
+        (workspace_id, reto_id, estado, firmado_por, firmado_en, creado_por)
+        values (${ws}, ${retoC}, 'firmado', ${leadId}, now(), ${leadId})`;
+      await tx`update proyecto set estado = 'en-implementacion' where id = ${proyectoC}`;
+    });
+
+    // La reapertura legítima, por su puerta: es la que vuelve a abrir la ventana.
+    await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoC,
+      etapaNumero: 3,
+      motivo: 'Llegó evidencia que cambia el portafolio',
+      insightIds: [],
+    });
+    // Y por esa ventana entra una HMW sin traza, que es legal mientras nadie la apruebe: SYS-15
+    // se exige al aprobarla y en G3, no al proponerla.
+    const [huerfana] = await conUsuario(leadId, (tx) => tx`insert into oportunidad
+      (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+      values (${ws}, ${retoC}, '¿Cómo podríamos medir sin apoyo?', 1, 'Sin apoyo', ${leadId})
+      returning id`);
+
+    await expect(abrirMedicion(leadId, { workspaceId: ws, retoId: retoC })).rejects.toThrow(
+      /no traza a ningún insight/,
+    );
+    const [quieto] = await admin`select estado from reto where id = ${retoC}`;
+    expect(quieto!.estado as string, 'el reto congeló un portafolio en falta').toBe('activo');
+
+    // Y arreglado se abre, que es la otra mitad: sin ella, tapiar la transición entera pasaría
+    // igual. La ventana sigue abierta —la etapa 3 está reabierta—, así que se puede trazar.
+    await enlazarInsight(leadId, {
+      workspaceId: ws,
+      oportunidadId: huerfana!.id as string,
+      insightId: insightValidado,
+    });
+    await abrirMedicion(leadId, { workspaceId: ws, retoId: retoC });
+    const [midiendo] = await admin`select estado from reto where id = ${retoC}`;
+    expect(midiendo!.estado as string).toBe('en-medicion');
+  });
+
+  /**
    * Y el ALCANCE de una reapertura acota en las dos direcciones.
    *
    * El guard de arriba miraba en una sola: que no quedara nada del alcance sin marcar. Por el
@@ -898,8 +985,28 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
                 'Ninguna', ${leadId}) returning id`;
       return r!.id as string;
     };
+    /**
+     * La ventana según la BASE, y —en la misma llamada— la que la pantalla va a pintar.
+     *
+     * `portafolioDelWorkspace` trae `admitePortafolio` porque la pantalla no lo puede deducir:
+     * sin él ofrecía «Nueva HMW», el enlace de insights, la repriorización y el veredicto sobre
+     * un portafolio congelado, y cada intento rebotaba contra la política. Un formulario que se
+     * rellena y no se puede guardar es peor que no ofrecerlo.
+     *
+     * Se comprueba aquí, dentro del helper, para que la afirmación se haga en TODAS las ramas
+     * que esta sonda ya recorre —abierta, archivada, reabierta y cerrada— en vez de en una
+     * elegida a mano: lo que hay que sostener es que las dos lecturas no se separan nunca, y
+     * eso solo se mide comparándolas en cada estado.
+     */
     const ventana = async (retoDestino: string) => {
       const [f] = await admin`select reto_admite_portafolio(${retoDestino}, ${ws}) as v`;
+      const enLaPantalla = (await portafolioDelWorkspace(leadId, ws)).find(
+        (r) => r.retoId === retoDestino,
+      );
+      expect(
+        enLaPantalla!.admitePortafolio,
+        'la pantalla y la política dicen cosas distintas sobre la misma ventana',
+      ).toBe(f!.v as boolean);
       return f!.v as boolean;
     };
     const proponer = (retoDestino: string) =>

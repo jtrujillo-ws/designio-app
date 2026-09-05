@@ -104,6 +104,17 @@ export const RetoConPortafolioSchema = z.object({
   codigo: z.string(),
   titulo: z.string(),
   oportunidades: z.array(OportunidadDelPortafolioSchema),
+  /**
+   * Si la VENTANA de escritura del portafolio está abierta ahora mismo.
+   *
+   * Es el mismo `reto_admite_portafolio` que miran las cuatro políticas, traído a la
+   * proyección porque la pantalla no lo puede deducir: depende de si G3 está firmado, de si
+   * la etapa 3 está reabierta y del estado del reto, y ninguna de las tres cosas viaja en el
+   * portafolio. Sin él la pantalla ofrecía enlazar, repriorizar y decidir sobre un
+   * portafolio congelado, y cada intento rebotaba contra la política — un formulario que se
+   * puede rellenar y no se puede guardar.
+   */
+  admitePortafolio: z.boolean(),
 });
 export type RetoConPortafolio = z.infer<typeof RetoConPortafolioSchema>;
 

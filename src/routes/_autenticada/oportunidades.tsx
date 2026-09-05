@@ -145,7 +145,7 @@ function PantallaOportunidades() {
               <span style={{ font: '700 15px var(--font-sans)', color: 'var(--ink)' }}>
                 {reto.codigo} · {reto.titulo}
               </span>
-              {puedeCurar && (
+              {puedeCurar && reto.admitePortafolio && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -161,6 +161,24 @@ function PantallaOportunidades() {
                 </Button>
               )}
             </div>
+
+            {/*
+              Y cuando la ventana está cerrada se DICE, en vez de dejar la pantalla igual con
+              los botones fuera. Quien cura tiene que poder distinguir «aquí no se escribe» de
+              «aquí no hay nada que hacer», y sobre todo saber qué lo reabre: la etapa 3 se
+              reabre por su puerta —con su motivo y su alcance—, y eso es una decisión de
+              método, no un permiso que se pide.
+
+              Solo para quien podría escribir: al resto del workspace la ausencia de botones no
+              le dice nada que no supiera ya.
+            */}
+            {puedeCurar && !reto.admitePortafolio && (
+              <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+                El portafolio de este reto está cerrado: su G3 quedó firmado sobre lo que hay y
+                la etapa 3 no está reabierta, o el reto ya no admite trabajo de método. Para
+                volver a tocarlo hay que reabrir la etapa 3 desde la gobernanza del proyecto.
+              </span>
+            )}
 
             {retoAbierto === reto.retoId && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -291,7 +309,7 @@ function PantallaOportunidades() {
                       >
                         <Tag>{i.titulo}</Tag>
                       </EnlaceA>
-                      {puedeCurar && o.estado === 'propuesta' && (
+                      {puedeCurar && reto.admitePortafolio && o.estado === 'propuesta' && (
                         <Button
                           variant="ghost"
                           size="sm"
@@ -318,7 +336,7 @@ function PantallaOportunidades() {
                   ))}
                 </div>
 
-                {puedeCurar && o.estado === 'propuesta' && (
+                {puedeCurar && reto.admitePortafolio && o.estado === 'propuesta' && (
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
                     <Select
                       value={insightElegido[o.id] ?? ''}

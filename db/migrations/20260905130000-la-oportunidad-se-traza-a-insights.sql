@@ -1241,3 +1241,83 @@ create trigger oportunidad_auditoria
 create trigger oportunidad_auditoria
   after insert or delete on oportunidad_insight
   for each row execute function oportunidad_auditoria();
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Y EL PORTAFOLIO SE REVALIDA EN EL INSTANTE EN QUE SE CONGELA
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- ⚠ CUIDADO AL INTEGRAR: esto REEMPLAZA el cuerpo vivo de `reto_estado_transicion_guard`,
+-- definido en `…110000-medicion.sql`. Si otra rama le añade una transición o una condición en
+-- una migración anterior, ésta la borra en silencio. El cuerpo va copiado de allí con sus
+-- comentarios; lo único nuevo es la rama de SYS-15, comentada en su sitio.
+
+create or replace function reto_estado_transicion_guard() returns trigger
+language plpgsql as $$
+begin
+  if new.estado = old.estado then
+    return new;
+  end if;
+  if (old.estado, new.estado) not in (
+    ('candidato', 'activo'),
+    ('candidato', 'archivado'),
+    ('activo', 'en-medicion'),
+    ('en-medicion', 'cerrado'),
+    ('cerrado', 'archivado')
+  ) then
+    raise exception 'transición de reto ilegal: % → %', old.estado, new.estado;
+  end if;
+  -- SYS-22: no se mide sin contrato firmado. Sin esto, «en medición» sería una etiqueta
+  -- y los snapshots entrarían sin dueño del dato ni frecuencia comprometidos.
+  if new.estado = 'en-medicion' and not exists (select 1 from metric_registry r
+    where r.reto_id = new.id and r.workspace_id = new.workspace_id and r.estado = 'firmado') then
+    raise exception 'abrir la medición exige el Metric Registry firmado en G6 (SYS-22)';
+  end if;
+  -- §5.2: y exige el G7 APROBADO, que es el gate al que el ciclo canónico le asigna este
+  -- paso («releases conciliados contra la design version; effective state constatado;
+  -- medición operando. El proyecto y el reto pasan a en medición»). G6 solo acuerda el
+  -- plan y firma el contrato de medición: abrir ahí admitiría snapshots de una
+  -- implementación aún sin conciliar y se saltaría el último gate del método.
+  if new.estado = 'en-medicion' and not exists (select 1 from gate_instancia g
+    join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+    where p.reto_id = new.id and p.workspace_id = new.workspace_id
+      and g.numero = 7 and g.estado = 'aprobado') then
+    raise exception 'abrir la medición exige el G7 aprobado: releases conciliados y effective state constatado (§5.2)';
+  end if;
+  -- SYS-15, OTRA VEZ, en el instante en que el portafolio se CONGELA.
+  --
+  -- G3 lo certifica y la ventana se cierra con él, pero una reapertura legítima de la etapa 3
+  -- la vuelve a abrir —para eso existe— y por ahí entran oportunidades nuevas. Del otro lado no
+  -- había nada: el proyecto sigue hasta G7, esto mueve el reto a 'en-medicion' y a partir de
+  -- ahí `reto_admite_portafolio` vuelve a ser falso. Medido: una HMW viva sin traza quedaba
+  -- congelada dentro, con la firma de G3 diciendo lo contrario y sin puerta por la que
+  -- arreglarla — y `outcome_review_completar_guard` cierra el reto en ese estado, o sea que lo
+  -- que queda para siempre en el archivo incumple SYS-15.
+  --
+  -- Es LA MISMA condición que `gate_faltas_para_aprobar` exige en G3, y aquí va escrita otra
+  -- vez en vez de llamarla: aquella recibe un GATE y esto tiene un reto, y la puerta de G3 mira
+  -- además el eje TIEMPO del razonamiento, que aquí NO se vuelve a preguntar a propósito. Un
+  -- derecho revocado entre G3 y la medición no desmiente la traza de la HMW —desmiente que se
+  -- pueda enseñar al cliente, que es otra cosa—, y exigirlo aquí convertiría cada revocación en
+  -- un reto que no puede medir. Lo que la reapertura pudo cambiar es el CONJUNTO de
+  -- oportunidades vivas, y eso es exactamente lo que se vuelve a mirar.
+  if new.estado = 'en-medicion' and exists (select 1 from oportunidad o
+    where o.reto_id = new.id and o.workspace_id = new.workspace_id
+      and o.estado <> 'descartada'
+      and not exists (select 1 from oportunidad_insight oi
+        where oi.oportunidad_id = o.id and oi.workspace_id = o.workspace_id)) then
+    raise exception 'no se puede abrir la medición: hay una oportunidad del portafolio que no traza a ningún insight (SYS-15). Trázala o descártala antes de congelar el portafolio: al pasar a medición la ventana se cierra y ya no hay por dónde arreglarlo';
+  end if;
+  -- SYS-24: el reto cierra CON veredicto. La columna no tiene grant para el rol de app:
+  -- la única mano que la escribe es el guard del outcome review, así que exigirla aquí
+  -- ata el cierre al post-mortem también para el SQL directo.
+  if new.estado = 'cerrado' and new.veredicto is null then
+    raise exception 'cerrar un reto exige el veredicto del outcome review (SYS-24)';
+  end if;
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id, 'RetoTransicionado',
+      jsonb_strip_nulls(jsonb_build_object('retoId', new.id, 'de', old.estado,
+                                           'a', new.estado, 'veredicto', new.veredicto)),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  return new;
+end $$;

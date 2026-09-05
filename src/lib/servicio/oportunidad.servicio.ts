@@ -201,6 +201,10 @@ export async function portafolioDelWorkspace(
     await exigirCuentaActiva(tx, actorId);
     const filas = await tx`
       select r.id, r.codigo, r.titulo,
+             -- La ventana, por la MISMA función que miran las políticas. Calcularla otra vez
+             -- aquí —«G3 aprobado y la etapa 3 no reabierta»— sería una segunda redacción de
+             -- la regla, que es exactamente lo que esa función existe para no tener.
+             reto_admite_portafolio(r.id, r.workspace_id) as admite_portafolio,
              coalesce((
                select jsonb_agg(jsonb_build_object(
                  'id', o.id, 'retoId', o.reto_id, 'pregunta', o.pregunta,
@@ -226,6 +230,7 @@ export async function portafolioDelWorkspace(
       codigo: f.codigo as string,
       titulo: f.titulo as string,
       oportunidades: f.oportunidades as OportunidadDelPortafolio[],
+      admitePortafolio: f.admite_portafolio as boolean,
     }));
   });
 }

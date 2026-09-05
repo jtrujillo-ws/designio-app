@@ -7,8 +7,8 @@ import { describeAuthz } from './helpers';
 /**
  * SPEC-02 — la proyección del árbol respeta RLS (SYS-01/02), el servicio ancla no se
  * duplica con la relación «afecta», las superficies de escritura sin función siguen
- * cerradas (servicio, contenido por columnas, deletes — reto/proyecto ganaron sus
- * políticas con SPEC-04), y las FKs compuestas impiden colgar nodos de otro workspace
+ * cerradas (contenido por columnas, deletes — reto/proyecto ganaron sus políticas con
+ * SPEC-04 y servicio su alta), y las FKs compuestas impiden colgar nodos de otro workspace
  * incluso desde código admin.
  */
 describeAuthz('árbol de navegación (proyección + aislamiento)', () => {
@@ -118,23 +118,26 @@ describeAuthz('árbol de navegación (proyección + aislamiento)', () => {
   it('un miembro de A no ve el árbol de B, ni siquiera preguntando directo', async () => {
     const arbolB = await conUsuario(userA, (tx) => construirArbol(tx, wsB, 'B'));
     expect(arbolB.servicios).toHaveLength(0);
-    const retosB = await conUsuario(userA, (tx) => tx`select id from reto where workspace_id = ${wsB}`);
+    const retosB = await conUsuario(
+      userA,
+      (tx) => tx`select id from reto where workspace_id = ${wsB}`,
+    );
     expect(retosB.length).toBe(0);
   });
 
-  it('las escrituras del árbol sin función siguen cerradas: servicio sin grant, contenido inmutable, sin deletes', async () => {
-    // servicio: sus funciones no llegaron aún — sin grant no hay superficie (userA es lead).
-    await expect(
-      conUsuario(userA, (tx) => tx`insert into servicio (workspace_id, nombre, creado_por)
-        values (${wsA}, 'intruso', ${userA})`),
-    ).rejects.toThrow(/permission denied|permiso/i);
+  it('las escrituras del árbol sin función siguen cerradas: contenido inmutable, sin deletes', async () => {
+    // servicio ganó INSERT con su política (ver servicio.test.ts); update y delete siguen
+    // sin superficie, y eso se comprueba allí con el resto del alta.
     // reto/proyecto ganaron INSERT y UPDATE(estado) con SPEC-04, pero el CONTENIDO es
     // inmutable por grant de columnas y no existe delete para nadie del rol de app.
     await expect(
       conUsuario(userA, (tx) => tx`update reto set titulo = 'alterado' where id = ${retoA}`),
     ).rejects.toThrow(/permission denied|permiso/i);
     await expect(
-      conUsuario(userA, (tx) => tx`update proyecto set titulo = 'alterado' where reto_id = ${retoA}`),
+      conUsuario(
+        userA,
+        (tx) => tx`update proyecto set titulo = 'alterado' where reto_id = ${retoA}`,
+      ),
     ).rejects.toThrow(/permission denied|permiso/i);
     await expect(
       conUsuario(userA, (tx) => tx`delete from servicio where id = ${svcA1}`),

@@ -586,29 +586,40 @@ function FilaNodo({
     onError(null);
     try {
       /*
-       * El orden se valida con el MISMO campo que el servidor exige, y no se trocea con
-       * `parseInt`. Medido, con lo que un `<input type="number">` deja escribir:
+       * El orden se valida con el MISMO campo que el servidor exige, y en DOS pasos: primero
+       * que el texto denote un entero, después que ese entero cumpla el contrato.
        *
-       *   «1e3»    → parseInt: 1      · Number: 1000   ← pide el puesto 1000 y le dan el 1
-       *   «3.7»    → parseInt: 3      · Number: 3.7    ← se trunca sin decirlo
-       *   «9999.9» → parseInt: 9999   · Number: 9999.9 ← igual
-       *   «»       → parseInt: NaN                     ← caía en `?? nodo.orden`
+       * El primer paso no sobra, y esto lo encontró una revisión de la ronda anterior —donde
+       * yo solo hacía el segundo—. `Number` no falla ante un texto que no es un entero: lo
+       * ACERCA a uno, y si el resultado cae dentro del contrato, el esquema lo aprueba siendo
+       * otro número. Medido:
        *
-       * El primero es el que duele: 1 es un orden perfectamente válido, así que el nodo se
-       * movía al principio en silencio y nadie tenía nada que mirar. Los otros dos hacían lo
-       * que `z.number().int()` rechaza —y por eso el servidor nunca llegaba a rechazarlos: el
-       * recorte pasaba antes—. Y el vacío se sustituía por el orden actual, así que borrar el
-       * campo y guardar no cambiaba nada sin decir por qué.
+       *   «9998.9999999999999» → 9999   (isInteger: true)   ← el esquema lo aprueba
+       *   «1e-324»             → 0      (isInteger: true)   ← el esquema lo aprueba
+       *   «1e3»                → 1000   (isInteger: true)
+       *   «3.7»                → 3.7                        ← lo caza el esquema
        *
-       * Ahora el número se lee entero y se mide contra el contrato: si no lo cumple, se dice y
-       * no se envía. Un valor que el servidor rechazaría no se convierte aquí en otro que sí
-       * acepta.
+       * Los dos primeros son el defecto entero con otra cara: quien escribe
+       * `9998.9999999999999` no pide el puesto 9999, y 9999 es un orden válido, así que no
+       * queda nada que mirar. Lo mismo que hacía `parseInt`, por otro camino.
+       *
+       * Por eso la sintaxis se comprueba sobre el TEXTO, antes de convertirlo: cifras, con
+       * signo opcional y nada más. Con eso la conversión ya no puede perder nada —cuatro
+       * cifras caben de sobra en un double—. Y sí, eso rechaza también `1e3`, que valdría
+       * 1000: escribir un ordinal en notación científica no es un caso real, y rechazarlo
+       * DICIÉNDOLO es preferible a aceptar una notación cuyo borde silencioso acabamos de
+       * medir. Rechazar no es lo que había: lo que había era cambiar el número sin avisar.
        */
-      const medido = EditarNodoSchema.shape.orden.safeParse(orden.trim() === '' ? NaN : Number(orden));
-      if (!medido.success) {
-        onError(
-          `El orden tiene que ser un número entero entre 0 y 9999 (se recibió «${orden}»)`,
-        );
+      const texto = orden.trim();
+      const SINTAXIS_ENTERA = /^[+-]?\d+$/;
+      const medido = SINTAXIS_ENTERA.test(texto)
+        ? EditarNodoSchema.shape.orden.safeParse(Number(texto))
+        : null;
+      if (!medido?.success) {
+        // El motivo lo pone el CONTRATO cuando es él quien rechaza; el rango no se repite aquí
+        // para que no pueda quedarse viejo si el contrato cambia.
+        const motivo = medido?.error.issues[0]?.message ?? 'tiene que ser un número entero en cifras';
+        onError(`El orden no vale: ${motivo} (se recibió «${orden}»)`);
         return; // el `finally` de abajo suelta el ocupado
       }
       const r = await editarNodoDelJourney({

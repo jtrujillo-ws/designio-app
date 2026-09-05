@@ -70,20 +70,55 @@ describe('los números que entran por un formulario', () => {
 
   /**
    * Y el contrato que sustituye al troceo es el del SERVIDOR, no una copia. Lo que aquí se
-   * sujeta es su conducta ante los cuatro valores medidos: si alguien relaja el campo, el
-   * formulario deja de rechazarlos sin que nadie lo note.
+   * sujeta es su conducta ante los valores medidos: si alguien relaja el campo, el formulario
+   * deja de rechazarlos sin que nadie lo note.
    */
-  it('el campo del orden rechaza lo que el troceo dejaba pasar', () => {
+  it('el campo del orden rechaza los números que el troceo dejaba pasar', () => {
     const orden = EditarNodoSchema.shape.orden;
-    // Lo que `parseInt` convertía en un número válido y distinto del que se pidió.
     expect(orden.safeParse(3.7).success).toBe(false);
     expect(orden.safeParse(9999.9).success).toBe(false);
-    expect(orden.safeParse(Number('12abc')).success).toBe(false); // NaN
-    expect(orden.safeParse(Number('')).success).toBe(true); // '' es 0, y 0 es un orden real
-    // Y `1e3` es MIL, que es lo que quien lo escribió pidió: dentro del contrato.
-    expect(orden.safeParse(Number('1e3'))).toEqual({ success: true, data: 1000 });
-    // El techo sigue siendo el techo.
+    // `NaN` es lo que sale de un texto que no es un número, y el campo lo rechaza. Se pasa
+    // literal y no como `Number('12abc')`: escrito así, la aserción decía qué se le pide al
+    // CAMPO sin depender de cómo llegó hasta él.
+    expect(orden.safeParse(Number.NaN).success).toBe(false);
+    // Y 0 SÍ es un orden real —el primer puesto—, así que el campo lo acepta. (Antes esto
+    // estaba escrito como `Number('')`, que vale 0: la aserción parecía cubrir «campo vacío» y
+    // en realidad solo probaba el cero. El vacío lo decide la PANTALLA, y lo rechaza; se
+    // comprueba abajo, donde vive esa decisión.)
+    expect(orden.safeParse(0).success).toBe(true);
+    // El techo y el suelo siguen siendo los suyos.
     expect(orden.safeParse(10000).success).toBe(false);
     expect(orden.safeParse(-1).success).toBe(false);
+  });
+
+  /**
+   * Y lo que el CAMPO no puede ver: un texto que no denota un entero pero que `Number` acerca
+   * a uno que sí cumple el contrato.
+   *
+   * Es el mismo defecto que `parseInt`, por otro camino, y lo encontró una revisión sobre el
+   * primer arreglo —donde yo solo comprobaba el número resultante—. Por eso la pantalla mira
+   * la SINTAXIS del texto antes de convertirlo, y esto sujeta esa regla.
+   */
+  it('la sintaxis del texto se comprueba antes de convertirlo', () => {
+    const SINTAXIS_ENTERA = /^[+-]?\d+$/;
+    const orden = EditarNodoSchema.shape.orden;
+    // Los dos que el contrato aprobaría siendo OTRO número del que se escribió.
+    for (const texto of ['9998.9999999999999', '1e-324']) {
+      expect(orden.safeParse(Number(texto)).success, `${texto}: el contrato no lo ve`).toBe(true);
+      expect(SINTAXIS_ENTERA.test(texto), `${texto}: la sintaxis sí`).toBe(false);
+    }
+    // El vacío tampoco pasa: `Number('')` es 0, así que sin este corte borrar el campo y
+    // guardar mandaba el nodo al primer puesto en vez de decir que falta el dato.
+    expect(SINTAXIS_ENTERA.test('')).toBe(false);
+    // Y lo que una persona escribe de verdad, sí.
+    for (const texto of ['0', '12', '0012', '9999']) {
+      expect(SINTAXIS_ENTERA.test(texto), `${texto} debería valer`).toBe(true);
+      expect(orden.safeParse(Number(texto)).success).toBe(true);
+    }
+    // La regla vive en la pantalla; que sea ESTA se comprueba contra su fuente.
+    const raiz = new URL('../../', import.meta.url).pathname.replace(/\/$/, '');
+    return readFile(`${raiz}/src/routes/_autenticada/journey.$journeyId.tsx`, 'utf8').then((c) => {
+      expect(c).toContain(String(SINTAXIS_ENTERA));
+    });
   });
 });

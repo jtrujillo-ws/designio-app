@@ -123,7 +123,11 @@ export const JOURNEYS_DEL_LOOP: JourneyLoop[] = [
   },
 ];
 
+/** Por su número, no por posición: el catálogo cubre los siete, pero no depende de su orden. */
+const POR_NUMERO = new Map(JOURNEYS_DEL_LOOP.map((jl) => [jl.j, jl]));
+
 export function journeyDelLoop(j: JourneyN): JourneyLoop {
-  // El catálogo cubre los siete: indexar por j-1 es total.
-  return JOURNEYS_DEL_LOOP[j - 1]!;
+  const jl = POR_NUMERO.get(j);
+  if (!jl) throw new Error(`El catálogo del loop no tiene el journey J${j}`);
+  return jl;
 }

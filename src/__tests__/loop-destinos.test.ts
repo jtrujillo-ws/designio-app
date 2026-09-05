@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { JOURNEYS_DEL_LOOP, destinoDeJourney } from '@/lib/loop/loop-data';
+import { JOURNEYS_DEL_LOOP, destinoDeJourney, journeyDelLoop } from '@/lib/loop/loop-data';
 import { etiquetaDeDestino } from '@/lib/destinos';
 
 /**
@@ -18,6 +18,11 @@ describe('a dónde abre cada tarjeta del loop', () => {
       'design-versions',
       'proyecto',
     ]);
+  });
+
+  it('el catálogo se resuelve por número, no por posición', () => {
+    for (const jl of JOURNEYS_DEL_LOOP) expect(journeyDelLoop(jl.j)).toBe(jl);
+    expect(journeyDelLoop(6).titulo).toBe('Implementación y medición');
   });
 
   it('las pantallas sin parámetros abren siempre, haya o no proyecto', () => {

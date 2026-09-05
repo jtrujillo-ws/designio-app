@@ -1155,6 +1155,7 @@ function CabeceraDeArco({
           gridTemplateColumns: 'repeat(7, 1fr)',
           gap: 6,
         }}
+        role="group"
         aria-label="Barra del arco"
       >
         {JOURNEYS.map((j) => {

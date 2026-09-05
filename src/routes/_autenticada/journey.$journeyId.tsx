@@ -33,6 +33,7 @@ import {
   ETIQUETA_TIPO_ARISTA,
   ETIQUETA_TIPO_NODO,
   EXTREMOS_ARISTA,
+  EditarNodoSchema,
   TIPOS_ARISTA,
   TIPOS_NODO,
   type AristaDeJourney,
@@ -584,7 +585,43 @@ function FilaNodo({
     setOcupado(true);
     onError(null);
     try {
-      const numero = Number.parseInt(orden, 10);
+      /*
+       * El orden se valida con el MISMO campo que el servidor exige, y en DOS pasos: primero
+       * que el texto denote un entero, después que ese entero cumpla el contrato.
+       *
+       * El primer paso no sobra, y esto lo encontró una revisión de la ronda anterior —donde
+       * yo solo hacía el segundo—. `Number` no falla ante un texto que no es un entero: lo
+       * ACERCA a uno, y si el resultado cae dentro del contrato, el esquema lo aprueba siendo
+       * otro número. Medido:
+       *
+       *   «9998.9999999999999» → 9999   (isInteger: true)   ← el esquema lo aprueba
+       *   «1e-324»             → 0      (isInteger: true)   ← el esquema lo aprueba
+       *   «1e3»                → 1000   (isInteger: true)
+       *   «3.7»                → 3.7                        ← lo caza el esquema
+       *
+       * Los dos primeros son el defecto entero con otra cara: quien escribe
+       * `9998.9999999999999` no pide el puesto 9999, y 9999 es un orden válido, así que no
+       * queda nada que mirar. Lo mismo que hacía `parseInt`, por otro camino.
+       *
+       * Por eso la sintaxis se comprueba sobre el TEXTO, antes de convertirlo: cifras, con
+       * signo opcional y nada más. Con eso la conversión ya no puede perder nada —cuatro
+       * cifras caben de sobra en un double—. Y sí, eso rechaza también `1e3`, que valdría
+       * 1000: escribir un ordinal en notación científica no es un caso real, y rechazarlo
+       * DICIÉNDOLO es preferible a aceptar una notación cuyo borde silencioso acabamos de
+       * medir. Rechazar no es lo que había: lo que había era cambiar el número sin avisar.
+       */
+      const texto = orden.trim();
+      const SINTAXIS_ENTERA = /^[+-]?\d+$/;
+      const medido = SINTAXIS_ENTERA.test(texto)
+        ? EditarNodoSchema.shape.orden.safeParse(Number(texto))
+        : null;
+      if (!medido?.success) {
+        // El motivo lo pone el CONTRATO cuando es él quien rechaza; el rango no se repite aquí
+        // para que no pueda quedarse viejo si el contrato cambia.
+        const motivo = medido?.error.issues[0]?.message ?? 'tiene que ser un número entero en cifras';
+        onError(`El orden no vale: ${motivo} (se recibió «${orden}»)`);
+        return; // el `finally` de abajo suelta el ocupado
+      }
       const r = await editarNodoDelJourney({
         data: {
           workspaceId,
@@ -593,7 +630,7 @@ function FilaNodo({
           detalle,
           responsable,
           faseId: nodo.tipo === 'fase' || faseId === '' ? null : faseId,
-          orden: Number.isNaN(numero) ? nodo.orden : numero,
+          orden: medido.data,
         },
       });
       if (r.ok) {

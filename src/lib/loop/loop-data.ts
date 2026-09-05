@@ -26,7 +26,12 @@ export type JourneyLoop = {
  * porque la que necesita un id (el proyecto) solo se resuelve con el árbol del workspace
  * delante: ver `destinoDeJourney`.
  */
-export type PantallaDeJourney = 'importacion' | 'proyecto' | 'insights' | 'design-versions';
+export type PantallaDeJourney =
+  | 'importacion'
+  | 'proyecto'
+  | 'insights'
+  | 'oportunidades'
+  | 'design-versions';
 
 /**
  * A qué pantalla abre la tarjeta de un journey. Devuelve null cuando la pantalla es la del
@@ -43,6 +48,8 @@ export function destinoDeJourney(
       return { to: '/importacion' };
     case 'insights':
       return { to: '/insights' };
+    case 'oportunidades':
+      return { to: '/oportunidades' };
     case 'design-versions':
       return { to: '/design-versions' };
     case 'proyecto':
@@ -89,7 +96,12 @@ export const JOURNEYS_DEL_LOOP: JourneyLoop[] = [
     descripcion:
       'De los insights salen preguntas, conceptos y pruebas. Las decisiones quedan enlazadas a lo que las fundamenta.',
     rol: 'Sponsor + equipo',
-    pantalla: 'proyecto',
+    // Abre al PORTAFOLIO de oportunidades y no al proyecto: «de los insights salen
+    // preguntas» es la etapa 3, y hasta hoy esa mitad de J4 no tenía dónde abrirse —el
+    // objeto no existía—. Los conceptos (etapa 4) todavía no están modelados, así que
+    // apuntar al proyecto era apuntar a la checklist del gate, no al trabajo. El proyecto
+    // sigue a un clic desde el árbol y desde J2 y J7.
+    pantalla: 'oportunidades',
   },
   {
     j: 5,

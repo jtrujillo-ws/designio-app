@@ -13,7 +13,7 @@ describe('a dónde abre cada tarjeta del loop', () => {
       'importacion',
       'proyecto',
       'insights',
-      'proyecto',
+      'oportunidades',
       'design-versions',
       'design-versions',
       'proyecto',
@@ -28,6 +28,7 @@ describe('a dónde abre cada tarjeta del loop', () => {
   it('las pantallas sin parámetros abren siempre, haya o no proyecto', () => {
     expect(destinoDeJourney('importacion', null)).toEqual({ to: '/importacion' });
     expect(destinoDeJourney('insights', null)).toEqual({ to: '/insights' });
+    expect(destinoDeJourney('oportunidades', null)).toEqual({ to: '/oportunidades' });
     expect(destinoDeJourney('design-versions', null)).toEqual({ to: '/design-versions' });
   });
 

@@ -3684,10 +3684,12 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'old.vence_en y un to_char(new.vence_en, YYYY-MM-DD) para el evento. Ese to_char está ' +
       'medido y no depende del huso: 2026-03-08 en Pacific/Kiritimati y en Etc/GMT+12 — es la ' +
       'sobrecarga sobre date, que Postgres promueve a timestamp SIN huso.',
-    'funcion gate_aprobar_suficiencia_guard':
-      'el reloj es «new.aprobado_en := now()» y gate_instancia.aprobado_en es timestamp with ' +
-      'time zone. Obligan fecha, fecha_objetivo y linea_base_fecha, que se leen setenta líneas ' +
-      'más abajo para comprobar la suficiencia del gate y nunca se cruzan con el instante.',
+    // `gate_aprobar_suficiencia_guard` estuvo aquí —el reloj «new.aprobado_en := now()» y,
+    // setenta líneas más abajo, linea_base_fecha y fecha_objetivo— y se ha ido con
+    // 20260905120000: las comprobaciones de suficiencia salieron a `gate_faltas_para_aprobar`,
+    // que no tiene reloj, y el guard se quedó con el sello y sin ningún nombre sin huso. El
+    // censo ya no lo nombra, y una certificación que no se consume tapa la regresión que
+    // existe para detectar (ver la exigencia de abajo).
     'funcion outcome_review_completar_guard':
       'el reloj es «new.completado_en := now()» y outcome_review.completado_en es timestamp ' +
       'with time zone. Obligan ventana_inicio (date) y ventana_de_medicion_abierta (que la ' +

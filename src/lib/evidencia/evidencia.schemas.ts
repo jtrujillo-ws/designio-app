@@ -168,6 +168,12 @@ export const ItemInputSchema = z.object({
   itemId: z.string().uuid(),
 });
 
+/** Una evidencia concreta: la que se vino a ver con `destacar` y no cabe en la primera página. */
+export const EvidenciaInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  evidenciaId: z.string().uuid(),
+});
+
 /** Fila de la bandeja tal como la ve la UI (el contenido viaja como extracto acotado). */
 export type ItemBandeja = {
   id: string;

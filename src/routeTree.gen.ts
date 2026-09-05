@@ -13,6 +13,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as AutenticadaRouteImport } from './routes/_autenticada'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AutenticadaAppRouteImport } from './routes/_autenticada/app'
+import { Route as AutenticadaAprobacionesRouteImport } from './routes/_autenticada/aprobaciones'
 import { Route as AutenticadaAuditoriaRouteImport } from './routes/_autenticada/auditoria'
 import { Route as AutenticadaBibliotecaRouteImport } from './routes/_autenticada/biblioteca'
 import { Route as AutenticadaDesignVersionsRouteImport } from './routes/_autenticada/design-versions'
@@ -47,6 +48,11 @@ const LoginRoute = LoginRouteImport.update({
 const AutenticadaAppRoute = AutenticadaAppRouteImport.update({
   id: '/app',
   path: '/app',
+  getParentRoute: () => AutenticadaRoute,
+} as any)
+const AutenticadaAprobacionesRoute = AutenticadaAprobacionesRouteImport.update({
+  id: '/aprobaciones',
+  path: '/aprobaciones',
   getParentRoute: () => AutenticadaRoute,
 } as any)
 const AutenticadaAuditoriaRoute = AutenticadaAuditoriaRouteImport.update({
@@ -138,6 +144,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/app': typeof AutenticadaAppRoute
+  '/aprobaciones': typeof AutenticadaAprobacionesRoute
   '/auditoria': typeof AutenticadaAuditoriaRoute
   '/biblioteca': typeof AutenticadaBibliotecaRoute
   '/design-versions': typeof AutenticadaDesignVersionsRoute
@@ -159,6 +166,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/app': typeof AutenticadaAppRoute
+  '/aprobaciones': typeof AutenticadaAprobacionesRoute
   '/auditoria': typeof AutenticadaAuditoriaRoute
   '/biblioteca': typeof AutenticadaBibliotecaRoute
   '/design-versions': typeof AutenticadaDesignVersionsRoute
@@ -182,6 +190,7 @@ export interface FileRoutesById {
   '/_autenticada': typeof AutenticadaRouteWithChildren
   '/login': typeof LoginRoute
   '/_autenticada/app': typeof AutenticadaAppRoute
+  '/_autenticada/aprobaciones': typeof AutenticadaAprobacionesRoute
   '/_autenticada/auditoria': typeof AutenticadaAuditoriaRoute
   '/_autenticada/biblioteca': typeof AutenticadaBibliotecaRoute
   '/_autenticada/design-versions': typeof AutenticadaDesignVersionsRoute
@@ -205,6 +214,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/app'
+    | '/aprobaciones'
     | '/auditoria'
     | '/biblioteca'
     | '/design-versions'
@@ -226,6 +236,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/app'
+    | '/aprobaciones'
     | '/auditoria'
     | '/biblioteca'
     | '/design-versions'
@@ -248,6 +259,7 @@ export interface FileRouteTypes {
     | '/_autenticada'
     | '/login'
     | '/_autenticada/app'
+    | '/_autenticada/aprobaciones'
     | '/_autenticada/auditoria'
     | '/_autenticada/biblioteca'
     | '/_autenticada/design-versions'
@@ -301,6 +313,13 @@ declare module '@tanstack/react-router' {
       path: '/app'
       fullPath: '/app'
       preLoaderRoute: typeof AutenticadaAppRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
+    '/_autenticada/aprobaciones': {
+      id: '/_autenticada/aprobaciones'
+      path: '/aprobaciones'
+      fullPath: '/aprobaciones'
+      preLoaderRoute: typeof AutenticadaAprobacionesRouteImport
       parentRoute: typeof AutenticadaRoute
     }
     '/_autenticada/auditoria': {
@@ -420,6 +439,7 @@ declare module '@tanstack/react-router' {
 
 interface AutenticadaRouteChildren {
   AutenticadaAppRoute: typeof AutenticadaAppRoute
+  AutenticadaAprobacionesRoute: typeof AutenticadaAprobacionesRoute
   AutenticadaAuditoriaRoute: typeof AutenticadaAuditoriaRoute
   AutenticadaBibliotecaRoute: typeof AutenticadaBibliotecaRoute
   AutenticadaDesignVersionsRoute: typeof AutenticadaDesignVersionsRoute
@@ -439,6 +459,7 @@ interface AutenticadaRouteChildren {
 
 const AutenticadaRouteChildren: AutenticadaRouteChildren = {
   AutenticadaAppRoute: AutenticadaAppRoute,
+  AutenticadaAprobacionesRoute: AutenticadaAprobacionesRoute,
   AutenticadaAuditoriaRoute: AutenticadaAuditoriaRoute,
   AutenticadaBibliotecaRoute: AutenticadaBibliotecaRoute,
   AutenticadaDesignVersionsRoute: AutenticadaDesignVersionsRoute,

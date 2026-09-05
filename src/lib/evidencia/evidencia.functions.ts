@@ -8,6 +8,7 @@ import {
   BandejaInputSchema,
   CrearItemImportacionSchema,
   DecidirDerechosSchema,
+  EvidenciaInputSchema,
   ItemInputSchema,
   RechazarItemSchema,
 } from './evidencia.schemas';
@@ -20,6 +21,7 @@ import {
   decidirDerechos,
   eliminarArchivo,
   ErrorCuraduria,
+  evidenciaConDerechosPorId,
   listarBandeja,
   listarEvidencias,
   listarEvidenciaConDerechos,
@@ -168,6 +170,21 @@ export const evidenciaConDerechos = createServerFn({ method: 'GET' })
     try {
       const datos = await listarEvidenciaConDerechos(usuarioId, data.workspaceId, data.antesDe);
       return { workspaceId: data.workspaceId, ...datos };
+    } catch (e) {
+      if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
+  });
+
+/** UNA evidencia con sus derechos, por id: para la que se vino a ver con `destacar` y no
+ * está en la primera página. null si no existe, no es visible o la cuenta dejó de estar
+ * activa: la pantalla trata los tres igual (el aviso de destacado ausente). */
+export const evidenciaConDerechosDeUna = createServerFn({ method: 'GET' })
+  .inputValidator(EvidenciaInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await evidenciaConDerechosPorId(usuarioId, data.workspaceId, data.evidenciaId);
     } catch (e) {
       if (e instanceof ErrorAutorizacion) return null;
       throw e;

@@ -52,6 +52,12 @@ export const ValidarInsightSchema = z.object({
   insightId: z.string().uuid(),
 });
 
+/** Un insight concreto: el que se vino a ver con `destacar` y no cabe en la primera página. */
+export const InsightInputSchema = z.object({
+  workspaceId: z.string().uuid(),
+  insightId: z.string().uuid(),
+});
+
 export const InsightsInputSchema = z.object({
   workspaceId: z.string().uuid(),
   /** Keyset: el par (creado_en, id) de la última fila mostrada. Sin él, primera página. */

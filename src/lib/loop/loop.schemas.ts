@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { ConteoDePendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
 
 /**
  * Contratos de la pantalla Loop (la vista de aterrizaje de un servicio). Módulo compartido
@@ -108,6 +109,11 @@ export type ResumenDelLoop = {
   /** TODOS los proyectos del workspace: el árbol pinta con esto el journey de cada reto. */
   proyectos: GatesDeProyecto[];
   aprobaciones: AprobacionPendiente[];
+  /** Cuánto puede decidir AHORA el rol de quien mira, en todo el workspace: gates propios,
+   * derechos de uso, insights propuestos y design versions en borrador. Es el contador de
+   * la fila «Aprobaciones» del lateral; las filas las lista /aprobaciones con la misma
+   * fuente (módulo de aprobaciones). */
+  pendientesDelRol: ConteoDePendientes;
   /** Del servicio actual. */
   release: ReleaseDelServicio | null;
   /** Del reto del proyecto actual del servicio. */

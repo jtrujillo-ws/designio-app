@@ -847,6 +847,9 @@ function ServicioDelArbol({
         className="loop-fila"
         aria-expanded={abierto}
         aria-current={actual ? 'true' : undefined}
+        // En el riel el nombre visible se oculta y la abreviatura es decorativa: el nombre
+        // accesible va explícito para que el botón no se quede mudo (o diga solo «J3»).
+        aria-label={servicio.nombre}
         onClick={onPulsar}
         title={actual ? servicio.nombre : `${servicio.nombre} · seleccionar`}
         style={{
@@ -1688,8 +1691,9 @@ function JourneyCard({
 }) {
   const enCurso = estado === 'en curso';
   const pendiente = estado === 'próximo';
-  // J7 «próximo» está cerrado por G7 o por la medición abierta; el motivo lo dice.
-  const cerradoPorGate = jl.j === 7 && pendiente;
+  // J7 «próximo» con proyecto está cerrado por G7 o por la medición abierta, y el motivo lo
+  // dice; sin proyecto no está «cerrado» por nada: simplemente no hay proyecto, como en J2.
+  const cerradoPorGate = jl.j === 7 && pendiente && proyecto !== null;
   const destino = cerradoPorGate ? null : destinoDeJourney(jl.pantalla, proyecto?.id ?? null);
   const j = jl.j;
   const tarjeta = (

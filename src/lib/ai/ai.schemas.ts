@@ -15,6 +15,7 @@ export type {
   ContenidoCriterio,
   ContenidoExtraccion,
   ContenidoPropuesta,
+  ContenidoRemediacionJourney,
 } from './ai.contenido';
 
 /** CTX-08 Capacidades AI — el pipeline único PropuestaAI (ADR-0012, SPEC-08). */
@@ -74,7 +75,7 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
  * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
  * carece de acción «aprobar».
  */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT'] as const;
+export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C5'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
 export const DestinoSchema = z.enum(['evidencia', 'criterio-exito']);
@@ -132,7 +133,7 @@ export const MAX_CRITERIOS_POR_LOTE = 4;
  */
 export type AnclaCapacidad = {
   /** La columna donde cuelga en `reserva_ai`, `llamada_ai` y `propuesta_ai`. */
-  columna: 'item_id' | 'reto_id' | 'gate_id';
+  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id';
   /** El título del selector en la pantalla. */
   etiqueta: string;
   /** Cómo se nombra en prosa, en minúscula, dentro de una frase. */
@@ -239,6 +240,7 @@ const ANCLA_DECLARADA: Record<AnclaCapacidad['columna'], true> = {
   item_id: true,
   reto_id: true,
   gate_id: true,
+  journey_id: true,
 };
 export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad['columna'][];
 
@@ -336,6 +338,45 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     exigeConsentimiento: false,
     esSimulacion: false,
   },
+  C5: {
+    etiqueta: 'Remediación del grafo → cómo cerrar lo que la validación señala',
+    /*
+     * INFORMATIVA, la segunda. No toca el grafo: propone qué hacer y lo hace una persona.
+     *
+     * Y hay una razón de fondo por la que C5 no puede ser otra cosa, aunque SPEC-08 la
+     * nombre «validación del grafo»: esa validación YA EXISTE y es DETERMINISTA
+     * (`validarJourney`, RF-05.6, con sus nueve códigos de señal). Pedirle a un modelo que
+     * la repita cambiaría una respuesta exacta por una probable —lo que §21 prohíbe
+     * vender— y dejaría dos listas de señales discrepando sin criterio para decir cuál
+     * vale. Lo que el modelo sí añade es lo que el código no puede: dada una señal REAL,
+     * qué hacer con ella EN ESTE grafo.
+     */
+    destino: null,
+    ancla: {
+      columna: 'journey_id',
+      etiqueta: 'Journey con señales abiertas',
+      enProsa: 'journey con señales abiertas',
+      buscar: 'Buscar por nombre del journey o del servicio…',
+      vacia: 'No hay journeys con señales de validación abiertas.',
+      hayMas: (n) =>
+        `Hay más journeys con señales abiertas de los que caben aquí: se listan los ${n} más ` +
+        'recientes. Un journey sale de la lista mientras su informe espera lectura; para uno ' +
+        'concreto, búscalo por su nombre o el de su servicio.',
+      enCurso:
+        'Ese journey ya tiene una remediación AI en curso: espera a que termine antes de pedir otra',
+      pendiente: 'Ese journey ya tiene un informe sin leer: léelo antes de pedir otro',
+    },
+    /*
+     * Sin lote. Las remediaciones viajan DENTRO del contenido, como los huecos de CT, y por
+     * la misma razón: se leen juntas —«qué le falta a este grafo» es una respuesta— y
+     * ninguna se acepta por separado, así que no hay revisión por elemento que proteger.
+     */
+    lote: null,
+    /* El material es el GRAFO: etiquetas de nodos, fases y transiciones. No hay material de
+     * personas por ningún lado — eso entra por `item_importacion`, que es otra ancla. */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+  },
 };
 
 
@@ -425,6 +466,7 @@ export const ESTADOS_ANCLA = [
   'registry-firmado',
   'reto-no-admite',
   'gate-decidido',
+  'journey-congelado',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

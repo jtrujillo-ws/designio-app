@@ -24,9 +24,12 @@ import {
   PROMPT_VERSION,
   promptAsistenteGate,
   promptCriterios,
+  promptRemediacionJourney,
   promptExtraccion,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
+  SISTEMA_REMEDIACION_JOURNEY,
+  type GrafoDelJourney,
   SISTEMA_EXTRACCION,
 } from '../ai.prompts';
 
@@ -432,8 +435,48 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * haya cambiado: lo que se amplió es la medida, no lo que se le dice al modelo. Por eso
    * `PROMPT_VERSION` NO se toca aquí — subirla habría partido en dos poblaciones que salieron
    * del mismo contrato, que es exactamente el daño que esta prueba existe para evitar. */
-  const VERSION_ANOTADA = 'ai-2026-09-05.1';
-  const HUELLA_ANOTADA = 'ef7459e532fa8c79eaeb1e3313e966f16d7d54a08775a5baa64949ba458c2781';
+  /** Un grafo mínimo con UNA señal: lo justo para que las ramas de C5 rindan un render
+   * estable y distinto entre sí. No sale de `validarJourney` —esto mide el PROMPT, no la
+   * validación— así que la señal se escribe a mano con la forma que la función produce. */
+  const GRAFO_DE_PRUEBA: GrafoDelJourney = {
+    nodos: [
+      {
+        id: 'b1000000-0000-4000-8000-000000000001',
+        tipo: 'paso',
+        etiqueta: 'Recibir documento',
+        fase: 'Alta',
+        responsable: 'Front',
+        evidencias: 1,
+      },
+      {
+        id: 'b1000000-0000-4000-8000-000000000002',
+        tipo: 'paso',
+        etiqueta: 'Verificar identidad',
+        fase: 'Alta',
+        responsable: '',
+        evidencias: 0,
+      },
+    ],
+    aristas: [
+      {
+        origen: 'b1000000-0000-4000-8000-000000000001',
+        destino: 'b1000000-0000-4000-8000-000000000002',
+        tipo: 'transicion',
+        condicion: '',
+      },
+    ],
+    senales: [
+      {
+        codigo: 'paso-sin-salida',
+        severidad: 'media',
+        nodoId: 'b1000000-0000-4000-8000-000000000002',
+        mensaje: 'El paso «Verificar identidad» no tiene ninguna transición de salida',
+      },
+    ],
+  };
+
+  const VERSION_ANOTADA = 'ai-2026-09-05.2';
+  const HUELLA_ANOTADA = '3a7910c382d86983497e8d911fae6367a8f5b3e1a803997e41e4fb43d85aaa20';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -568,6 +611,47 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
         { id: 'a1b2c3d4-0000-4000-8000-000000000001', texto: CON_DELIMITADOR, estado: 'pendiente', conObjeto: false },
       ],
     }),
+    // ── C5 ──
+    // El grafo es el cuerpo, y sus SEÑALES van dentro: lo que distingue a C5 de una
+    // capacidad que adivina es que la lista de defectos viene dada. Que ese bloque cambie de
+    // forma es un cambio de contrato tan real como cambiar el sistema.
+    journeyLlano: promptRemediacionJourney({
+      nombre: 'Alta de cuenta',
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: GRAFO_DE_PRUEBA,
+    }),
+    // Sin señales, el encargo es OTRO: se le pide confirmar que no hay nada, no remediar.
+    journeySinSenales: promptRemediacionJourney({
+      nombre: 'Alta de cuenta',
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: { ...GRAFO_DE_PRUEBA, senales: [] },
+    }),
+    journeyTruncado: promptRemediacionJourney({
+      nombre: 'Alta de cuenta',
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: {
+        ...GRAFO_DE_PRUEBA,
+        nodos: [{ ...GRAFO_DE_PRUEBA.nodos[0]!, etiqueta: CUERPO_LARGO }],
+      },
+    }),
+    journeyFichaVacia: promptRemediacionJourney({
+      nombre: '',
+      servicio: '',
+      tipo: '',
+      grafo: GRAFO_DE_PRUEBA,
+    }),
+    journeyConDelimitador: promptRemediacionJourney({
+      nombre: CON_DELIMITADOR,
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: {
+        ...GRAFO_DE_PRUEBA,
+        nodos: [{ ...GRAFO_DE_PRUEBA.nodos[0]!, etiqueta: CON_DELIMITADOR }],
+      },
+    }),
   };
 
   /** Los prompts se renderizan con entradas FIJAS, así que la huella cubre el esqueleto de
@@ -577,6 +661,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       sistemaExtraccion: SISTEMA_EXTRACCION,
       sistemaCriterios: SISTEMA_CRITERIOS,
       sistemaAsistenteGates: SISTEMA_ASISTENTE_GATES,
+      sistemaRemediacionJourney: SISTEMA_REMEDIACION_JOURNEY,
       esquemaSalida: ESQUEMA_SALIDA,
       maxMaterial: MAX_MATERIAL,
       maxCampoFicha: MAX_CAMPO_FICHA,
@@ -620,6 +705,19 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.gateTruncado.usuario).toContain('se truncó');
     expect(RAMAS.gateFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.gateConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
+
+    // C5: el id del nodo y el código de la señal llegan al material —son lo que la respuesta
+    // tiene que copiar—, el encargo cambia cuando no hay señales, el truncado avisa y la
+    // ficha vacía emite su «(sin dato)».
+    expect(RAMAS.journeyLlano.usuario).toContain('[b1000000-0000-4000-8000-000000000002]');
+    expect(RAMAS.journeyLlano.usuario).toContain('paso-sin-salida');
+    expect(RAMAS.journeyLlano.usuario).toContain('cerrar cada una de las 1 señales');
+    expect(RAMAS.journeySinSenales.usuario).toContain('no emitió ninguna señal');
+    expect(RAMAS.journeySinSenales.usuario).not.toContain('cerrar cada una');
+    expect(RAMAS.journeyTruncado.usuario).toContain('se truncó');
+    expect(RAMAS.journeyLlano.usuario).not.toContain('se truncó');
+    expect(RAMAS.journeyFichaVacia.usuario).toContain('(sin dato)');
+    expect(RAMAS.journeyConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
 
     // Y ninguna rama produce el mismo render que otra: dos entradas con la misma salida
     // serían una sola rama cubierta dos veces, y el hash no lo diría.

@@ -1,4 +1,5 @@
 import '@/lib/server-only';
+import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { TIPOS_CON_CATALOGO } from './journey.schemas';
@@ -457,6 +458,28 @@ export async function journeyCompleto(
 ): Promise<JourneyCompleto | null> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    return leerJourneyCompleto(tx, workspaceId, journeyId);
+  });
+}
+
+/**
+ * El grafo entero, DENTRO de una transacción que ya está abierta.
+ *
+ * Se separa de `journeyCompleto` porque el pipeline de AI necesita leer el mismo grafo sin
+ * abrir su propia conexión: C5 propone cómo cerrar las señales que `validarJourney` emite
+ * sobre ÉL, y esas señales tienen que salir del mismo grafo que se le enseñó al modelo. Con
+ * dos lecturas distintas —una para el prompt, otra para comprobar la respuesta— bastaría una
+ * edición en medio para que las dos discreparan, y la comprobación empezaría a rechazar
+ * remediaciones legítimas o a admitir las de un grafo que ya no existe.
+ *
+ * Una definición, dos usos: la RLS la sigue poniendo la conexión de quien llama.
+ */
+export async function leerJourneyCompleto(
+  tx: TransactionSql,
+  workspaceId: string,
+  journeyId: string,
+): Promise<JourneyCompleto | null> {
+  {
     const [fila] = await tx`
       select j.id, j.servicio_id, s.nombre as servicio_nombre, j.reto_id, j.proyecto_id,
         j.tipo, j.nombre, j.descripcion,
@@ -525,7 +548,7 @@ export async function journeyCompleto(
       snapshots: fila.snapshots as JourneyCompleto['snapshots'],
       arquetipos: fila.arquetipos as JourneyCompleto['arquetipos'],
     };
-  });
+  }
 }
 
 /** Página de la lista de journeys. El corte duro dejaba fuera para siempre a los más

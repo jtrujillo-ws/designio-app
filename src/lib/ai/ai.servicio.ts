@@ -9,6 +9,9 @@ import {
   INTENTOS_POR_GENERACION,
   LIMITE_LLAMADAS_DIA,
 } from './ai.degradacion';
+import { validarJourney } from '@/lib/journey/journey.mermaid';
+import type { JourneyCompleto } from '@/lib/journey/journey.schemas';
+import { leerJourneyCompleto } from '@/lib/journey/journey.servicio';
 import {
   presenciaLiteralPorCita,
   materialDeGate,
@@ -19,10 +22,14 @@ import {
   promptAsistenteGate,
   promptCriterios,
   promptExtraccion,
+  materialDeJourney,
+  promptRemediacionJourney,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
   SISTEMA_EXTRACCION,
+  SISTEMA_REMEDIACION_JOURNEY,
   type ChecklistDelGate,
+  type GrafoDelJourney,
 } from './ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
@@ -36,6 +43,7 @@ import {
   type CapacidadActiva,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
   type EstadoAncla,
   type GenerarPropuestas,
@@ -298,6 +306,47 @@ async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Pro
 
 
 /**
+ * El grafo tal como lo ve el modelo, con sus señales YA calculadas.
+ *
+ * Una definición y tres usos: la arma `PREPARAR.C5` para el prompt, la vuelve a armar el
+ * panel para medir la presencia literal de las citas, y de ella salen las señales contra las
+ * que el servicio comprueba las remediaciones que devuelve el modelo. Si esos tres tuvieran
+ * cada uno su copia, bastaría una diferencia de orden para que la medición del grounding
+ * marcara como ausentes citas que están, o para que una remediación legítima se rechazara
+ * por señalar una señal que la otra copia no emitió.
+ *
+ * Las señales las pone `validarJourney`, que es DETERMINISTA (RF-05.6). No se le pide al
+ * modelo que las encuentre: se le dan hechas y se le pide qué hacer con ellas.
+ */
+function grafoParaElModelo(journey: JourneyCompleto): GrafoDelJourney {
+  const fase = new Map(
+    journey.nodos.filter((n) => n.tipo === 'fase').map((n) => [n.id, n.etiqueta]),
+  );
+  return {
+    nodos: journey.nodos.map((n) => ({
+      id: n.id,
+      tipo: n.tipo,
+      etiqueta: n.etiqueta,
+      fase: n.faseId ? (fase.get(n.faseId) ?? '') : '',
+      responsable: n.responsable ?? '',
+      evidencias: n.evidencias.length,
+    })),
+    aristas: journey.aristas.map((a) => ({
+      origen: a.origenId,
+      destino: a.destinoId,
+      tipo: a.tipo,
+      condicion: a.condicion ?? '',
+    })),
+    senales: validarJourney(journey).map((x) => ({
+      codigo: x.codigo,
+      severidad: x.severidad,
+      nodoId: x.nodoId,
+      mensaje: x.mensaje,
+    })),
+  };
+}
+
+/**
  * Lo que el panel sabe de una columna de ancla: de dónde sale la fila y cómo se titula.
  *
  * Esto va POR COLUMNA porque es lo único que de verdad depende de ella: el join es a la
@@ -368,7 +417,67 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
        from checklist_item c
        where c.gate_id = g.id and c.workspace_id = g.workspace_id) as gate_checklist`,
   },
+  journey_id: {
+    join: (tx) => tx`left join journey jr
+        on jr.id = p.journey_id and jr.workspace_id = p.workspace_id
+      left join servicio sjr on sjr.id = jr.servicio_id and sjr.workspace_id = jr.workspace_id`,
+    titulo: (tx) => tx`jr.nombre`,
+    /*
+     * El GRAFO entero, con la forma que `JourneyCompleto` declara. Pesa, y no hay otra: las
+     * señales de la validación no son una tabla —son una función pura del grafo— así que el
+     * único modo de recomponer el material que el modelo leyó es traer los nodos y las
+     * aristas y volver a evaluar la misma función. Traer un resumen dejaría la medición de la
+     * presencia literal midiendo otro texto.
+     */
+    columnas: (tx) => tx`jr.nombre as journey_nombre, jr.tipo as journey_tipo,
+      sjr.nombre as journey_servicio,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'id', n.id, 'tipo', n.tipo, 'etiqueta', n.etiqueta, 'faseId', n.fase_id,
+          'orden', n.orden, 'responsable', n.responsable,
+          'arquetipoEstado', (select a.estado from arquetipo a
+            where a.id = n.arquetipo_id and a.workspace_id = n.workspace_id),
+          'evidencias', coalesce((
+            select jsonb_agg(jsonb_build_object('id', e.id))
+            from journey_nodo_evidencia ne
+            join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
+            where ne.nodo_id = n.id and ne.workspace_id = n.workspace_id), '[]'::jsonb))
+          order by n.tipo, n.orden)
+        from journey_nodo n
+        where n.journey_id = jr.id and n.workspace_id = jr.workspace_id), '[]'::jsonb)
+        as journey_nodos,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'id', a.id, 'origenId', a.origen_id, 'destinoId', a.destino_id,
+          'tipo', a.tipo, 'condicion', a.condicion) order by a.creado_en)
+        from journey_arista a
+        where a.journey_id = jr.id and a.workspace_id = jr.workspace_id), '[]'::jsonb)
+        as journey_aristas`,
+  },
 };
+
+/**
+ * Un `JourneyCompleto` mínimo desde las columnas que proyectó el panel: lo justo que
+ * `validarJourney` y `grafoParaElModelo` leen, que está comprobado y son los nodos y las
+ * aristas. Los campos que ninguno de los dos mira se rellenan con lo neutro en vez de
+ * proyectarse: traerlos costaría y no cambiaría ni una señal.
+ */
+function journeyDesdeElPanel(f: Record<string, unknown>): JourneyCompleto {
+  return {
+    id: '',
+    servicioId: '',
+    servicioNombre: (f.journey_servicio as string | null) ?? '',
+    retoId: null,
+    proyectoId: null,
+    tipo: (f.journey_tipo as JourneyCompleto['tipo'] | null) ?? 'as-is',
+    nombre: (f.journey_nombre as string | null) ?? '',
+    descripcion: '',
+    nodos: (f.journey_nodos as JourneyCompleto['nodos'] | null) ?? [],
+    aristas: (f.journey_aristas as JourneyCompleto['aristas'] | null) ?? [],
+    snapshots: [],
+    arquetipos: [],
+  };
+}
 
 /**
  * Y lo que el panel sabe de una CAPACIDAD: qué la deja obsoleta, contra qué material se mide
@@ -546,6 +655,49 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         order by g.creado_en asc, g.id asc
         limit ${limite}`;
       return filas.map((g) => ({ id: g.id as string, titulo: g.titulo as string }));
+    },
+  },
+  C5: {
+    /*
+     * Lo que deja obsoleto un informe de remediación es que el grafo se CONGELE: un snapshot
+     * fija el grafo aprobado y lo que el informe propone cambiar deja de poder cambiarse ahí.
+     * Mientras no lo haya, el grafo se edita y las remediaciones siguen siendo accionables
+     * —aunque alguna ya se haya aplicado, que es una lectura que hace la persona, no el
+     * panel—.
+     */
+    estado: (tx) => tx`case
+        when exists (select 1 from journey_snapshot sn
+          where sn.journey_id = p.journey_id and sn.workspace_id = p.workspace_id)
+          then 'journey-congelado'
+        else 'disponible'
+      end`,
+    material: (f) => materialDeJourney({
+      nombre: (f.journey_nombre as string | null) ?? '',
+      servicio: (f.journey_servicio as string | null) ?? '',
+      tipo: (f.journey_tipo as string | null) ?? '',
+      grafo: grafoParaElModelo(journeyDesdeElPanel(f)),
+    }).texto,
+    /*
+     * Journeys sin snapshot y sin informe sin leer. No se filtra por «tiene señales»: eso
+     * exigiría evaluar `validarJourney` sobre cada grafo del workspace para pintar un
+     * selector, y además un informe sobre un grafo limpio es un resultado legítimo —el
+     * contrato admite la lista de remediaciones vacía— y saberlo tiene valor.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select jr.id, jr.nombre || ' · ' || s.nombre as titulo
+        from journey jr
+        join servicio s on s.id = jr.servicio_id and s.workspace_id = jr.workspace_id
+        where jr.workspace_id = ${workspaceId}
+          and not exists (select 1 from journey_snapshot sn
+            where sn.journey_id = jr.id and sn.workspace_id = jr.workspace_id)
+          and not exists (select 1 from propuesta_ai p
+            where p.journey_id = jr.id and p.workspace_id = jr.workspace_id
+              and p.estado = 'propuesta')
+          and (${patron}::text is null or jr.nombre ilike ${patron} or s.nombre ilike ${patron})
+        order by jr.creado_en desc, jr.id asc
+        limit ${limite}`;
+      return filas.map((j) => ({ id: j.id as string, titulo: j.titulo as string }));
     },
   },
 };
@@ -1625,6 +1777,20 @@ const REVALIDAR: Record<
       );
     }
   },
+  C5: async (tx, entrada) => {
+    // El grafo pudo congelarse mientras se preparaba la llamada. Un snapshot fija lo
+    // aprobado, y lo que el informe propone cambiar deja de poder cambiarse ahí: la
+    // remediación nacería describiendo un grafo que ya no se edita.
+    const [congelado] = await tx`select exists (
+        select 1 from journey_snapshot
+        where journey_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+      ) as si`;
+    if (congelado?.si) {
+      throw new ErrorAI(
+        'Ese journey se congeló en un snapshot mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+  },
 };
 
 /**
@@ -1756,6 +1922,97 @@ const PREPARAR: Record<
       }),
     };
   },
+  C5: async (tx, entrada) => {
+    // El MISMO lector que usa la pantalla del journey, no una consulta paralela: lo que se
+    // le enseña al modelo y lo que la validación evalúa tienen que salir de la misma
+    // lectura, o las señales del prompt y las de la comprobación pueden discrepar.
+    const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
+    if (!journey) throw new ErrorAI('El journey no existe en este workspace');
+    const [congelado] = await tx`select exists (
+        select 1 from journey_snapshot
+        where journey_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+      ) as si`;
+    if (congelado?.si) {
+      throw new ErrorAI(
+        'Ese journey ya tiene un snapshot congelado: su grafo es lo aprobado y no admite remediación',
+      );
+    }
+    const grafo = grafoParaElModelo(journey);
+    /*
+     * Un grafo SIN señales no se manda al proveedor, y no por ahorrar: la respuesta ya se
+     * sabe. `validarJourney` es determinista y acaba de decir que no hay nada que cerrar;
+     * pagar una llamada para que un modelo lo repita es comprar una opinión sobre un hecho.
+     *
+     * Es la misma regla que niega CI sobre un item sin material: cuando la única salida que
+     * cumple el contrato es la que ya tenemos, la respuesta correcta es no llamar.
+     */
+    if (grafo.senales.length === 0) {
+      throw new ErrorAI(
+        'La validación de ese journey no encontró ninguna señal abierta: no hay nada que remediar. (Eso ya lo dice la validación del grafo, que es exacta; no hace falta preguntárselo a la AI.)',
+      );
+    }
+    return {
+      sistema: SISTEMA_REMEDIACION_JOURNEY,
+      prompt: promptRemediacionJourney({
+        nombre: journey.nombre,
+        servicio: journey.servicioNombre,
+        tipo: journey.tipo,
+        grafo,
+      }),
+    };
+  },
+};
+
+/**
+ * Lo que cada capacidad comprueba de la salida DEL MODELO contra el estado del workspace,
+ * ya dentro de la transacción que la va a persistir.
+ *
+ * No es lo mismo que el esquema de contenido —que es forma— ni que `REVALIDAR` —que mira el
+ * ancla ANTES de gastar—: esto mira lo que el modelo DIJO, y solo se puede hacer con la fila
+ * delante. Hoy lo necesita una sola capacidad, y por eso conviene decir por qué no vive en la
+ * base como el guard de los huecos de CT: los ids de un checklist son una TABLA, y un trigger
+ * puede consultarlos; las señales de un grafo son una FUNCIÓN PURA de sus nodos y aristas, y
+ * no hay SQL que las recalcule. Se comprueban donde se pueden calcular.
+ *
+ * `Record<CapacidadActiva, …>` para que una capacidad nueva tenga que decir explícitamente
+ * que no comprueba nada, en vez de heredarlo por omisión.
+ */
+const COMPROBAR: Record<
+  CapacidadActiva,
+  (tx: TransactionSql, entrada: GenerarPropuestas, contenidos: ContenidoPropuesta[]) => Promise<void>
+> = {
+  // El contenido de CI se sujeta entero con su esquema y con los CHECK de `evidencia`: no hay
+  // nada que contrastar contra el workspace que no esté ya contrastado.
+  CI: async () => {},
+  C0: async () => {},
+  // Los huecos de CT los comprueba un trigger, que es un suelo más bajo que éste.
+  CT: async () => {},
+  C5: async (tx, entrada, contenidos) => {
+    const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
+    if (!journey) throw new ErrorAI('El journey dejó de existir mientras se generaba el informe');
+    const reales = new Set(
+      validarJourney(journey).map((x) => `${x.nodoId}\u0000${x.codigo}`),
+    );
+    const inventadas = contenidos
+      .flatMap((c) => (c as ContenidoRemediacionJourney).remediaciones)
+      .filter((r) => !reales.has(`${r.nodoId}\u0000${r.codigo}`));
+    /*
+     * Una remediación que señala una señal que la validación NO emitió es una avería
+     * inventada, y de las caras: manda a alguien a arreglar un grafo que estaba bien. Es lo
+     * único que esta capacidad puede falsificar —el resto de su salida es prosa sobre
+     * señales ciertas—, así que es lo único que hay que comprobar, y se comprueba contra la
+     * MISMA función que las produjo.
+     *
+     * Se descarta el informe entero y no las remediaciones sobrantes: recortar la salida de
+     * un modelo y guardar el resto deja una propuesta que nadie escribió, con su
+     * `contenido_original` diciendo otra cosa (SYS-17). Media respuesta no es revisable.
+     */
+    if (inventadas.length > 0) {
+      throw new ErrorAI(
+        `El informe señala ${inventadas.length} señal(es) que la validación de este journey no emitió: se descarta. Si el grafo cambió mientras se generaba, vuelve a pedirlo.`,
+      );
+    }
+  },
 };
 
 /**
@@ -1849,6 +2106,13 @@ async function persistirPropuestas(
 ): Promise<{ generadas: number }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    /*
+     * Lo que la capacidad comprueba de la salida del modelo, AQUÍ y no antes: hace falta la
+     * transacción que va a escribir, para que lo comprobado sea el mismo estado sobre el que
+     * se escribe. Va delante del candado del presupuesto porque no lo necesita y porque
+     * fallar aquí no debe tener a nadie esperando.
+     */
+    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos);
     await bloquearPresupuesto(tx, entrada.workspaceId);
 
     // Retirar la reserva ya no «devuelve» presupuesto: desde que el tope cuenta llamadas

@@ -15,6 +15,7 @@ import {
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { parsearContenido } from '@/lib/ai/ai.contenido';
@@ -37,6 +38,8 @@ import {
   type Destino,
 } from '@/lib/ai/ai.schemas';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
+import { validarJourney } from '@/lib/journey/journey.mermaid';
+import { leerJourneyCompleto } from '@/lib/journey/journey.servicio';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -178,6 +181,19 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     get CT() {
       return CONTENIDO_CT(requisitoIds[0]!);
     },
+    /*
+     * C5 no tiene un contenido de fixture útil por omisión: cada remediación tiene que
+     * señalar una señal que `validarJourney` emitió sobre SU journey, y eso depende del grafo
+     * concreto. Quien lo necesite lo compone con `remediacionDe(journey)`; esta entrada
+     * existe para que el registro esté completo y para que una propuesta de C5 sin contenido
+     * explícito falle en voz alta en vez de nacer señalando una señal ajena.
+     */
+    C5: {
+      resumen: 'Fixture sin señales: compón el contenido con remediacionDe(journey).',
+      remediaciones: [],
+      citas: [{ fragmento: 'NODOS', localizacion: 'cabecera del grafo' }],
+      confianzaPropuesta: 'baja',
+    } satisfies ContenidoRemediacionJourney,
   };
 
   /**
@@ -237,6 +253,82 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       returning id`;
     const requisitos = req.map((c) => c.id as string);
     return { gateId: gid, requisitos, contenido: CONTENIDO_CT(requisitos[0]!) };
+  }
+
+  /**
+   * Un journey mínimo con SEÑALES de verdad: dos pasos encadenados dentro de una fase.
+   *
+   * Se construye para que `validarJourney` emita algo —el segundo paso no tiene salida, y
+   * ninguno de los dos tiene evidencia enlazada— y NO se le escriben las señales a mano: lo
+   * que C5 comprueba es que las remediaciones señalen señales que esa función produce, así
+   * que el fixture tiene que producirlas de verdad o la prueba mediría su propia copia.
+   *
+   * `conSalida` cierra el ciclo para el caso contrario: un grafo del que la validación no
+   * tiene nada que decir. Ése es el que prueba que no se llama al proveedor por gusto.
+   */
+  let siguienteJourney = 1;
+  async function nuevoJourney(
+    ctx: { ws: string; actorId: string; servicioId: string; retoId: string },
+    opciones: { limpio?: boolean } = {},
+  ): Promise<{ journeyId: string; nodos: { fase: string; uno: string; dos: string } }> {
+    const admin = sqlAdmin();
+    const { ws, actorId: leadId, servicioId: svcId, retoId } = ctx;
+    const n = siguienteJourney++;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, reto_id, tipo, nombre, descripcion, creado_por)
+      values (${ws}, ${svcId}, ${retoId}, 'as-is', ${`Alta de cuenta ${n}`}, '', ${leadId})
+      returning id`;
+    const journeyId = j!.id as string;
+    const [fase] = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+      values (${ws}, ${journeyId}, 'fase', 'Alta', '', 0, '', ${leadId}) returning id`;
+    const pasos = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, detalle, fase_id, orden, responsable, creado_por)
+      values (${ws}, ${journeyId}, 'paso', 'Recibir documento', '', ${fase!.id as string}, 0,
+              'Front', ${leadId}),
+             (${ws}, ${journeyId}, 'paso', 'Verificar identidad', '', ${fase!.id as string}, 1,
+              'Back', ${leadId})
+      returning id`;
+    const [uno, dos] = pasos.map((x) => x.id as string);
+    await admin`insert into journey_arista
+      (workspace_id, journey_id, origen_id, destino_id, tipo, condicion, creado_por)
+      values (${ws}, ${journeyId}, ${uno!}, ${dos!}, 'transicion', '', ${leadId})`;
+    if (opciones.limpio) {
+      /*
+       * Para que la validación no tenga NADA que decir hacen falta las dos cosas: que el
+       * último paso tenga salida —se añade un tercero y se cierra— y que todos los pasos
+       * lleven evidencia. Se pregunta por el resultado (cero señales) en la propia prueba, no
+       * se da por hecho aquí.
+       */
+      const [tres] = await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, detalle, fase_id, orden, responsable, creado_por)
+        values (${ws}, ${journeyId}, 'paso', 'Entregar cuenta', '', ${fase!.id as string}, 2,
+                'Front', ${leadId}) returning id`;
+      await admin`insert into journey_arista
+        (workspace_id, journey_id, origen_id, destino_id, tipo, condicion, creado_por)
+        values (${ws}, ${journeyId}, ${dos!}, ${tres!.id as string}, 'transicion', '', ${leadId})`;
+      /*
+       * Una evidencia PROPIA, con su fuente y su registro de derechos (SPEC-03, trigger
+       * diferido). No se reutiliza «la primera del workspace»: en un workspace efímero no hay
+       * ninguna, y el `if (ev)` que lo cubría dejaba el journey sin enlazar y el fixture
+       * mentía — salía con tres señales `paso-sin-evidencia` diciéndose limpio.
+       */
+      const [fuente] = await admin`insert into fuente
+        (workspace_id, tipo, titulo, referencia, creado_por)
+        values (${ws}, 'documento', 'Fuente del journey', 'ref', ${leadId}) returning id`;
+      const [ev] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${ws}, ${fuente!.id as string}, 'Evidencia del journey', '', '{}'::jsonb,
+                ${leadId}) returning id`;
+      await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+        values (${ws}, ${ev!.id as string}, ${leadId})`;
+      for (const nodo of [uno!, dos!, tres!.id as string]) {
+        await admin`insert into journey_nodo_evidencia
+          (workspace_id, nodo_id, evidencia_id, creado_por)
+          values (${ws}, ${nodo}, ${ev!.id as string}, ${leadId})`;
+      }
+    }
+    return { journeyId, nodos: { fase: fase!.id as string, uno: uno!, dos: dos! } };
   }
 
   /** Item de bandeja pendiente (setup con la conexión admin, como el resto de la suite).
@@ -463,6 +555,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from metric_registry where workspace_id = ${wsL}`;
       await admin`delete from derecho_uso where workspace_id = ${wsL}`;
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
+      // El journey cuelga del reto por FK compuesta, así que va antes que él. Y su grafo
+      // antes que él: nodos, aristas y los enlaces a evidencia.
+      await admin`delete from journey_nodo_evidencia where workspace_id = ${wsL}`;
+      await admin`delete from journey_arista where workspace_id = ${wsL}`;
+      await admin`delete from journey_nodo where workspace_id = ${wsL}`;
+      await admin`delete from journey where workspace_id = ${wsL}`;
+      // La evidencia y su fuente van DESPUÉS del grafo: el journey «limpio» del fixture las
+      // enlaza a sus pasos, y `journey_nodo_evidencia` las sujeta por FK.
+      await admin`delete from evidencia where workspace_id = ${wsL}`;
+      await admin`delete from fuente where workspace_id = ${wsL}`;
       await admin`delete from checklist_item where workspace_id = ${wsL}`;
       await admin`delete from gate_instancia where workspace_id = ${wsL}`;
       await admin`delete from etapa_instancia where workspace_id = ${wsL}`;
@@ -470,6 +572,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from reto where workspace_id = ${wsL}`;
       await admin`delete from servicio where workspace_id = ${wsL}`;
       await admin`delete from miembro where workspace_id = ${wsL}`;
+      // Otra vez los eventos, y no es redundante: los escriben TRIGGERS, así que los borrados
+      // de arriba dejan los suyos. El primer barrido limpia lo que la prueba produjo; éste,
+      // lo que produjo la limpieza.
+      await admin`delete from evento_dominio where workspace_id = ${wsL}`;
       await admin`delete from workspace where id = ${wsL}`;
       await admin`delete from usuario where id = ${curadorId}`;
     }
@@ -545,6 +651,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from derecho_uso where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
+      await admin`delete from journey_nodo_evidencia where workspace_id = ${ws}`;
+      await admin`delete from journey_arista where workspace_id = ${ws}`;
+      await admin`delete from journey_nodo where workspace_id = ${ws}`;
+      await admin`delete from journey where workspace_id = ${ws}`;
       await admin`delete from checklist_item where workspace_id = ${ws}`;
       await admin`delete from gate_instancia where workspace_id = ${ws}`;
       await admin`delete from etapa_instancia where workspace_id = ${ws}`;
@@ -5059,6 +5169,173 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(informe!.citas.every((c) => c.presenteLiteral)).toBe(true);
 
       await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: informe!.id });
+    });
+  });
+
+  /**
+   * C5 no VALIDA: remedia. Y esa distinción es la capacidad entera.
+   *
+   * La validación de RF-05.6 ya existe y es determinista (`validarJourney`). Lo que se le
+   * pide al modelo es qué hacer con las señales que esa función emitió, y lo que el servicio
+   * comprueba es que cada remediación señale una señal REAL — el único campo de su salida que
+   * se puede contrastar contra algo.
+   *
+   * Estos tres casos cubren las tres mitades de eso: que el camino real funcione y cuelgue
+   * del journey, que un grafo sin señales NO se mande al proveedor, y que una señal inventada
+   * tire el informe entero.
+   */
+  it('C5 genera su remediación por el camino real: cuelga del journey y nace sin destino', async () => {
+    await enWorkspaceLimpio('c5-camino-real', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+
+      /*
+       * Las señales se PIDEN a la misma función que las produce en producción, no se escriben
+       * a mano: lo que hay que comprobar es que el servicio acepte una remediación de una
+       * señal real, y con una escrita a mano la prueba mediría su propia copia.
+       */
+      const senales = await conUsuario(curadorId, async (tx) => {
+        const grafo = await leerJourneyCompleto(tx, wsC, j.journeyId);
+        return validarJourney(grafo!);
+      });
+      expect(senales.length, 'el fixture tiene que producir señales de verdad').toBeGreaterThan(0);
+
+      const contenido: ContenidoRemediacionJourney = {
+        resumen: 'Al grafo le faltan salidas y evidencia enlazada.',
+        remediaciones: senales.slice(0, 3).map((x) => ({
+          nodoId: x.nodoId,
+          codigo: x.codigo,
+          comoCerrarlo: 'Encadena el paso con el siguiente de su fase',
+        })),
+        // La cita es un fragmento literal del material que arma `materialDeJourney`.
+        citas: [{ fragmento: 'Recibir documento', localizacion: 'nodos del grafo' }],
+        confianzaPropuesta: 'media',
+      };
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: contenido as unknown as Record<string, unknown>,
+          intentos: [intento({ modelo: 'modelo-de-prueba', latenciaMs: 210, uso: null })],
+        },
+        async () => {
+          const lote = await generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C5',
+            anclaId: j.journeyId,
+          });
+          expect(lote.generadas).toBe(1);
+        },
+      );
+
+      const [nacida] = await conUsuario(curadorId, (tx) => tx`
+        select p.estado, p.destino, p.journey_id, p.item_id, p.reto_id, p.gate_id,
+               l.capacidad as llamada_capacidad, l.journey_id as llamada_journey
+        from propuesta_ai p
+        join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
+        where p.workspace_id = ${wsC} and p.journey_id = ${j.journeyId}`);
+      expect(nacida!.estado).toBe('propuesta');
+      expect(nacida!.destino).toBeNull();
+      expect(nacida!.journey_id).toBe(j.journeyId);
+      expect(nacida!.item_id).toBeNull();
+      expect(nacida!.reto_id).toBeNull();
+      expect(nacida!.gate_id).toBeNull();
+      expect(nacida!.llamada_journey).toBe(j.journeyId);
+      expect(nacida!.llamada_capacidad).toBe('C5');
+
+      // Y la presencia literal contra el material que el modelo leyó: si la proyección del
+      // panel dejara de traer el grafo —o lo trajera con otra forma—, esto saldría false.
+      const panel = await panelPropuestas(curadorId, wsC);
+      const informe = panel.pendientes.find((x) => x.capacidad === 'C5');
+      expect(informe, 'la remediación no llegó al panel').toBeDefined();
+      expect(informe!.destino).toBeNull();
+      expect(informe!.citas.every((c) => c.presenteLiteral)).toBe(true);
+      // Y la cola de C5 son journeys: el suyo sale de la lista mientras el informe espera.
+      expect(panel.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(false);
+      await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: informe!.id });
+      const tras = await panelPropuestas(curadorId, wsC);
+      expect(tras.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(true);
+    });
+  });
+
+  /**
+   * Un grafo SIN señales no se manda al proveedor.
+   *
+   * No es una optimización: la respuesta ya se sabe. `validarJourney` acaba de decir que no
+   * hay nada que cerrar, y pagar una llamada para que un modelo lo repita es comprar una
+   * opinión sobre un hecho — la misma regla que niega CI sobre un item sin material.
+   *
+   * Se comprueba que el proveedor NO se llamó, no solo que la llamada falló: fallar después
+   * de pagar sería el mismo defecto con mejor cara.
+   */
+  it('un journey sin señales no llega al proveedor: la respuesta ya la da la validación', async () => {
+    await enWorkspaceLimpio('c5-sin-senales', async (ctx) => {
+    const { ws, curadorId: leadId } = ctx;
+    const limpio = await nuevoJourney({ ...ctx, actorId: leadId }, { limpio: true });
+    const sinSenales = await conUsuario(leadId, async (tx) => {
+      const grafo = await leerJourneyCompleto(tx, ws, limpio.journeyId);
+      return validarJourney(grafo!);
+    });
+    expect(sinSenales, 'el fixture «limpio» tiene que salir sin señales').toEqual([]);
+
+    const llamadasAntes = await conUsuario(leadId, (tx) => tx`
+      select count(*)::int as n from llamada_ai where workspace_id = ${ws}`);
+    await conProveedor(
+      { ok: true, datos: {}, intentos: [intento({ uso: null })] },
+      async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'C5', anclaId: limpio.journeyId }),
+        ).rejects.toThrow(/ninguna señal abierta/);
+      },
+    );
+    const llamadasDespues = await conUsuario(leadId, (tx) => tx`
+      select count(*)::int as n from llamada_ai where workspace_id = ${ws}`);
+    expect(llamadasDespues[0]!.n, 'se abrió una línea en el libro: hubo despacho').toBe(
+      llamadasAntes[0]!.n,
+    );
+    });
+  });
+
+  /**
+   * Una remediación que señala una señal que la validación NO emitió tira el informe entero.
+   *
+   * Es lo único que esta capacidad puede falsificar —el resto de su salida es prosa sobre
+   * señales ciertas— y es de lo más caro: manda a alguien a arreglar un grafo que estaba
+   * bien. Se descarta el informe COMPLETO y no las remediaciones sobrantes: recortar la
+   * salida de un modelo y guardar el resto deja una propuesta que nadie escribió, con su
+   * `contenido_original` diciendo otra cosa (SYS-17).
+   */
+  it('una remediación de una señal inexistente descarta el informe entero', async () => {
+    await enWorkspaceLimpio('c5-senal-inventada', async (ctx) => {
+    const { ws, curadorId: leadId } = ctx;
+    const j = await nuevoJourney({ ...ctx, actorId: leadId });
+    const contenido: ContenidoRemediacionJourney = {
+      resumen: 'Informe con una avería inventada.',
+      remediaciones: [
+        // El nodo existe; la señal sobre ÉL no. Un nodo inventado también fallaría, pero
+        // probaría menos: bastaría con comprobar que el id está en el grafo.
+        { nodoId: j.nodos.uno, codigo: 'arquetipo-refutado', comoCerrarlo: 'Algo' },
+      ],
+      citas: [{ fragmento: 'Recibir documento', localizacion: 'nodos del grafo' }],
+      confianzaPropuesta: 'alta',
+    };
+    await conProveedor(
+      {
+        ok: true,
+        datos: contenido as unknown as Record<string, unknown>,
+        intentos: [intento({ uso: null })],
+      },
+      async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'C5', anclaId: j.journeyId }),
+        ).rejects.toThrow(/la validación de este journey no emitió/);
+      },
+    );
+    // Y no quedó propuesta ninguna: media respuesta no es revisable.
+    const quedan = await conUsuario(leadId, (tx) => tx`
+      select count(*)::int as n from propuesta_ai
+      where workspace_id = ${ws} and journey_id = ${j.journeyId}`);
+    expect(quedan[0]!.n).toBe(0);
     });
   });
 

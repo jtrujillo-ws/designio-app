@@ -27,6 +27,7 @@ import {
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
   type Destino,
   type PropuestaEnPanel,
@@ -99,6 +100,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'gate-decidido':
     'Ese gate ya se decidió: este informe describe un estado que ya pasó. Puedes leerlo, pero lo que dice que falta ya no aplica.',
+  'journey-congelado':
+    'Ese journey ya tiene un snapshot congelado: su grafo es lo aprobado y estas remediaciones ya no se pueden aplicar sobre él. Puedes leerlas, pero apuntan a un grafo que dejó de editarse.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 
@@ -910,26 +913,59 @@ function FormularioConsentimiento({
  * casting de `contenido` se queda dentro de cada entrada, que es donde el destino ya está
  * fijado y el CHECK de la tabla lo garantiza.
  */
-const PRESENTACION: Record<
-  Destino | 'informativa',
+/**
+ * Cómo se PRESENTA cada capacidad: su rótulo y su ficha.
+ *
+ * Por CAPACIDAD y no por destino, y eso lo cobró la segunda capacidad informativa. Con CT
+ * sola, indexar por `destino ?? 'informativa'` funcionaba porque solo había una entrada sin
+ * destino; en cuanto llegó C5 —también sin destino, pero con un contenido completamente
+ * distinto— las dos caían en la misma entrada y el informe de un journey se pintaba con la
+ * ficha de un gate: campos que no son los suyos, y ninguno de los dos registros faltando una
+ * entrada que el compilador echara de menos.
+ *
+ * Es exactamente el mismo error que el panel del servicio ya había cometido indexando por
+ * COLUMNA de ancla lo que variaba por capacidad. Lo que se presenta es el CONTENIDO, y el
+ * contenido lo declara la capacidad.
+ */
+const PRESENTACION_POR_CAPACIDAD: Record<
+  CapacidadActiva,
+  { rotulo: string; ficha: (contenido: ContenidoPropuesta) => ReactNode }
+> = {
+  CI: {
+    rotulo: 'Evidencia propuesta',
+    ficha: (c) => <FichaExtraccion contenido={c as ContenidoExtraccion} />,
+  },
+  C0: {
+    rotulo: 'Criterio de éxito propuesto',
+    ficha: (c) => <FichaCriterio contenido={c as ContenidoCriterio} />,
+  },
+  CT: {
+    rotulo: 'Informe de gate (no se aprueba desde aquí)',
+    ficha: (c) => <FichaAsistenteGate contenido={c as ContenidoAsistenteGate} />,
+  },
+  C5: {
+    rotulo: 'Remediación del grafo (no se aplica desde aquí)',
+    ficha: (c) => <FichaRemediacionJourney contenido={c as ContenidoRemediacionJourney} />,
+  },
+};
+
+/**
+ * Y lo que solo tiene sentido si la propuesta MATERIALIZA algo, por DESTINO — que es quien
+ * decide qué objeto nace. `null` cuando no materializa nada.
+ *
+ * Se consulta como `destino === null ? null : MATERIALIZACION[destino]`, y ese `null` apaga
+ * los dos botones de aceptación. No hay bandera `aceptable` aparte: sin materialización no
+ * hay formulario que pintar ni bloqueo que calcular, así que la ausencia ES la decisión — y
+ * una bandera habría sido la lección de la costura otra vez, un valor declarado que alguien
+ * tiene que acordarse de consultar en dos sitios.
+ *
+ * Que una capacidad no materialice es su contrato, no una falta: RF-08.4 dice que CT «reporta
+ * huecos citando objetos; carece de acción aprobar», y C5 no edita el grafo porque quien lo
+ * edita es una persona.
+ */
+const MATERIALIZACION: Record<
+  Destino,
   {
-    rotulo: string;
-    ficha: (contenido: ContenidoPropuesta) => ReactNode;
-    /**
-     * Todo lo que solo tiene sentido si la propuesta MATERIALIZA algo — y `null` cuando no
-     * materializa nada.
-     *
-     * Van juntos y anulables a la vez porque son la misma pregunta con dos caras: si no hay
-     * objeto que crear, no hay nada que aceptar y por tanto tampoco nada que corregir
-     * (corregir es «editar y aceptar»). CT es así por contrato, no por falta: RF-08.4 dice
-     * que «reporta huecos citando objetos; carece de acción aprobar».
-     *
-     * Y son ESTO lo que apaga los dos botones, no una bandera aparte. Una bandera
-     * `aceptable: boolean` habría sido la lección de la costura otra vez: un valor declarado
-     * que alguien tiene que acordarse de consultar en dos sitios. Aquí no hay nada que
-     * consultar — sin materialización no hay formulario que pintar ni bloqueo que calcular.
-     */
-    materializacion: {
       /**
        * Lo que impide materializar ESTA propuesta por lo que dice su contenido, y no por su
        * ancla: `null` si nada. Se declara por destino porque cada uno tiene los suyos, y
@@ -941,19 +977,15 @@ const PRESENTACION: Record<
        * arregla; un botón apagado sin explicación manda a adivinar.
        */
       bloqueoPropio: (contenido: ContenidoPropuesta) => string | null;
-      formulario: (props: {
-        inicial: ContenidoPropuesta;
-        ocupado: boolean;
-        onEnviar: (c: ContenidoPropuesta) => Promise<void>;
-        onCancelar: () => void;
-      }) => ReactNode;
-    } | null;
+    formulario: (props: {
+      inicial: ContenidoPropuesta;
+      ocupado: boolean;
+      onEnviar: (c: ContenidoPropuesta) => Promise<void>;
+      onCancelar: () => void;
+    }) => ReactNode;
   }
 > = {
   evidencia: {
-    rotulo: 'Evidencia propuesta',
-    ficha: (c) => <FichaExtraccion contenido={c as ContenidoExtraccion} />,
-    materializacion: {
     /*
      * `evidencia.fecha_recoleccion` es NOT NULL: una extracción sin fecha del material no se
      * materializa. Y no es un defecto de la propuesta —al modelo se le permite decir que el
@@ -975,36 +1007,20 @@ const PRESENTACION: Record<
         onCancelar={onCancelar}
       />
     ),
-    },
   },
   'criterio-exito': {
-    rotulo: 'Criterio de éxito propuesto',
-    ficha: (c) => <FichaCriterio contenido={c as ContenidoCriterio} />,
-    materializacion: {
-      // Un criterio no tiene ninguna precondición de contenido: su esquema ya exige todo lo
-      // que la tabla pide, y la línea base la pone un humano DESPUÉS, editando el criterio
-      // (§21).
-      bloqueoPropio: () => null,
-      formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
-        <FormularioCriterio
-          inicial={inicial as ContenidoCriterio}
-          ocupado={ocupado}
-          onEnviar={onEnviar}
-          onCancelar={onCancelar}
-        />
-      ),
-    },
-  },
-  /*
-   * La entrada de las capacidades INFORMATIVAS, con `destino` nulo. Se indexa por una clave
-   * propia y no por `undefined` porque un `Record` con una clave que falta se lee como
-   * `undefined` en silencio, y lo que hay que conseguir es que el compilador PIDA esta
-   * entrada — que es lo que hizo cuando `destino` se volvió anulable.
-   */
-  informativa: {
-    rotulo: 'Informe de gate (no se aprueba desde aquí)',
-    ficha: (c) => <FichaAsistenteGate contenido={c as ContenidoAsistenteGate} />,
-    materializacion: null,
+    // Un criterio no tiene ninguna precondición de contenido: su esquema ya exige todo lo
+    // que la tabla pide, y la línea base la pone un humano DESPUÉS, editando el criterio
+    // (§21).
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioCriterio
+        inicial={inicial as ContenidoCriterio}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
   },
 };
 
@@ -1023,8 +1039,8 @@ function TarjetaPropuesta({
 }) {
   const [corrigiendo, setCorrigiendo] = useState(false);
   const [ocupado, setOcupado] = useState(false);
-  const presentacion = PRESENTACION[propuesta.destino ?? 'informativa'];
-  const materializacion = presentacion.materializacion;
+  const presentacion = PRESENTACION_POR_CAPACIDAD[propuesta.capacidad as CapacidadActiva];
+  const materializacion = propuesta.destino === null ? null : MATERIALIZACION[propuesta.destino];
   const anclaDisponible = propuesta.anclaEstado === 'disponible';
   // La otra precondición que la base impone SIEMPRE y que no es del ancla, sino del contenido.
   // Va aparte de `anclaDisponible` porque no caduca con el tiempo —nació así— y su salida es
@@ -1350,6 +1366,54 @@ function FichaAsistenteGate({ contenido }: { contenido: ContenidoAsistenteGate }
         ))
       )}
       <Dato rotulo="Confianza del diagnóstico" valor={contenido.confianzaPropuesta} />
+    </div>
+  );
+}
+
+/**
+ * La remediación de un journey: su resumen y qué hacer con cada señal.
+ *
+ * Se pinta el CÓDIGO de la señal y no el id del nodo, por lo mismo que en la ficha del gate:
+ * el uuid no le dice nada a quien lee, y el par `(nodoId, código)` está ahí para que el
+ * servicio pueda comprobar que la señal existe de verdad. Lo que el revisor necesita es qué
+ * señal es y qué hacer con ella.
+ *
+ * La lista vacía se dice con palabras: un informe sin remediaciones y un informe que no se
+ * pintó se ven igual, y son cosas muy distintas.
+ */
+function FichaRemediacionJourney({ contenido }: { contenido: ContenidoRemediacionJourney }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="Resumen" valor={contenido.resumen} />
+      {contenido.remediaciones.length === 0 ? (
+        <Dato rotulo="Remediaciones" valor="Ninguna: el asistente no propuso nada que cerrar." />
+      ) : (
+        contenido.remediaciones.map((r, i) => (
+          <div
+            key={r.nodoId + r.codigo + String(i)}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 2,
+              paddingTop: 8,
+              borderTop: '1px solid var(--border-faint)',
+            }}
+          >
+            <Dato rotulo={`Señal ${i + 1}`} valor={r.codigo} />
+            <Dato rotulo="Cómo cerrarla" valor={r.comoCerrarlo} />
+          </div>
+        ))
+      )}
+      <Dato rotulo="Confianza de la propuesta" valor={contenido.confianzaPropuesta} />
     </div>
   );
 }

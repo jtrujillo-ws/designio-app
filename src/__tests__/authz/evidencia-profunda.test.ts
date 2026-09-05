@@ -2450,14 +2450,211 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(compartida).toContain('for share');
     expect(compartida).toContain('razonamiento_sin_respaldo');
     expect(predicado).toContain("i.estado <> 'validado'");
-    expect(predicado).toContain('evidencia_usable');
-    expect(predicado).toContain('evidencia_motivo_bloqueo');
+    /*
+     * Y lo consulta por la REGLA, no por la regla más la puerta. Esta aserción decía
+     * `evidencia_usable` y `evidencia_motivo_bloqueo`, que es justo lo que estaba mal: son
+     * las versiones CON la puerta de membresía, y el crudo lo llama un guard que corre como
+     * propietario y muchas veces sin `app.user_id`. Ver el caso de aquí abajo.
+     */
+    expect(predicado).toContain('derechos_vigentes');
+    expect(predicado).toContain('evidencia_motivo_bloqueo_crudo');
+    expect(predicado).not.toMatch(/evidencia_usable\(/);
 
     // Y las proyecciones de los pickers lo INVOCAN, no lo reproducen: si alguna vuelve a
     // escribir el predicado por su cuenta, volverá a espejar media regla.
     const [dv] = await admin`select pg_get_functiondef(p.oid) as def from pg_proc p
       where p.proname = 'razonamiento_sin_respaldo'`;
     expect(dv).toBeTruthy();
+  });
+
+  it('los G5 heredados quedan nombrados por el protocolo ENTERO, no solo por los derechos', async () => {
+    /*
+     * `20260902320000` nombró los G5 que certificaban sobre razonamiento muerto y acotó su
+     * censo por escrito: solo la comprobación de las afirmaciones. Las otras tres llegaron a
+     * la ruta de G5 en `20260902340000` y su censo «le corresponde a esa migración». Nunca se
+     * escribió, así que un G5 aprobado ANTES de la regla —trazado a un insight sin validar, o
+     * apoyado en una decisión en revisión— se quedaba sin nombrar aunque el guard vivo lo
+     * rechace.
+     *
+     * El G5 heredado se fabrica INSERTANDO la fila ya aprobada: el guard es `before update`,
+     * así que un gate nacido aprobado no pasa por él — que es exactamente la forma que tiene
+     * un gate anterior a la regla.
+     */
+    const admin = sqlAdmin();
+    const sufijo = String(Math.floor(Math.random() * 900000) + 100000);
+    const [svc] = await admin`insert into servicio (workspace_id, nombre, creado_por)
+      values (${ws}, ${'Servicio heredado ' + sufijo}, ${leadId}) returning id`;
+    // El guard de la design version exige que el reto del proyecto afecte a ese servicio.
+    await admin`insert into reto_servicio_afectado
+      (reto_id, servicio_id, workspace_id, creado_por)
+      values (${retoId}, ${svc!.id as string}, ${ws}, ${leadId}) on conflict do nothing`;
+    const [proy] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, ${'P-H' + sufijo.slice(-4)}, 'Proyecto heredado', ${leadId})
+      returning id`;
+    const proyectoId = proy!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre)
+      values (${ws}, ${proyectoId}, 5, 'Detalle de solución')`;
+    const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+      values (${ws}, ${proyectoId}, 5, 'sponsor', 'aprobado', ${leadId}, now())
+      returning id`;
+    const gateId = gate!.id as string;
+
+    const [jr] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, creado_por)
+      values (${ws}, ${svc!.id as string}, 'to-be', 'To-be heredado', ${leadId}) returning id`;
+    const [dv] = await admin`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, journey_id, codigo, titulo, estado, creado_por)
+      values (${ws}, ${proyectoId}, ${svc!.id as string}, ${jr!.id as string},
+        ${'DV-H' + sufijo}, 'Diseño heredado', 'borrador', ${leadId}) returning id`;
+    const [elem] = await admin`insert into elemento_cambio
+      (workspace_id, design_version_id, tipo, operacion, titulo, creado_por)
+      values (${ws}, ${dv!.id as string}, 'paso', 'agrega', 'Paso heredado', ${leadId})
+      returning id`;
+
+    // El razonamiento roto por la vía que NADIE censaba: una decisión trazada a un insight
+    // que nunca pasó la validación.
+    const insSinValidar = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'Insight heredado sin validar ' + sufijo,
+      resumen: 'nunca pasó por la validación',
+    });
+    const [dec] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, decidido_por)
+      values (${ws}, ${proyectoId}, ${gateId}, 'diseno', 'Decisión heredada',
+        'la sostiene el razonamiento enlazado', ${leadId}) returning id`;
+    const decId = dec!.id as string;
+    await admin`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${decId}, ${insSinValidar.insightId}, ${ws})`;
+    await admin`insert into elemento_decision (elemento_id, decision_id, workspace_id, creado_por)
+      values (${elem!.id as string}, ${decId}, ${ws}, ${leadId})`;
+    await admin.begin(async (tx) => {
+      const [snap] = await tx`insert into journey_snapshot
+        (workspace_id, journey_id, grafo, congelado_por)
+        values (${ws}, ${jr!.id as string}, '{}'::jsonb, ${leadId}) returning id`;
+      await tx`update design_version set estado = 'aprobada', aprobada_por = ${leadId},
+          aprobada_en = now(), snapshot_id = ${snap!.id as string}
+        where id = ${dv!.id as string}`;
+    });
+
+    // El censo lo nombra, y con su motivo. Se invoca la MISMA función que llama la
+    // migración: si se comprobara con una copia de su consulta, el test no diría nada del
+    // censo que corrió de verdad.
+    const nombrados = await admin`select gate_id, motivo from g5_sin_razonamiento_usable()
+      where gate_id = ${gateId}`;
+    expect(nombrados).toHaveLength(1);
+    expect(nombrados[0]!.motivo).toContain('insight que no está validado');
+
+    // Y no nombra lo sano, que es lo que impide que este censo sea «marcarlo todo». El
+    // control es el MISMO gate con su razonamiento reparado: se traza a un insight validado
+    // con una cita cuyos derechos están vigentes.
+    const insSano = await crearInsight(leadId, {
+      workspaceId: ws,
+      titulo: 'Insight heredado validado ' + sufijo,
+      resumen: 'este sí pasó la validación',
+    });
+    const afSano = await agregarAfirmacion(leadId, {
+      workspaceId: ws,
+      insightId: insSano.insightId,
+      texto: 'La verificación concentra el abandono ' + sufijo,
+      esHipotesis: false,
+    });
+    await agregarCita(leadId, {
+      workspaceId: ws,
+      afirmacionId: afSano.afirmacionId,
+      evidenciaId: evConDerechos,
+      fragmento: 'el 62% se detiene',
+      localizacion: 'p. 14',
+    });
+    await validarInsight(leadId, ws, insSano.insightId);
+    await admin`delete from decision_insight
+      where decision_id = ${decId} and workspace_id = ${ws}`;
+    await admin`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${decId}, ${insSano.insightId}, ${ws})`;
+
+    const trasReparar = await admin`select gate_id from g5_sin_razonamiento_usable()
+      where gate_id = ${gateId}`;
+    expect(trasReparar).toHaveLength(0);
+
+    /*
+     * Y el andamiaje se retira por el PROYECTO, que cascadea: la limpieza de la suite borra
+     * `decision` antes que `proyecto`, y `elemento_decision` la bloquearía. Retirar el enlace
+     * a mano no vale — la design version ya está aprobada y el guard de SYS-05 impide editar
+     * sus elementos, con razón: lo que se congeló no se toca.
+     */
+    // Se desmonta el fixture con el mismo idioma que el caso de al lado: `set local
+    // session_replication_role = 'replica'` dentro de la transacción, porque la design
+    // version está aprobada y SYS-05 prohíbe tocar sus elementos —correctamente—. Aquí no se
+    // edita un diseño: se desmonta un andamiaje. Es LOCAL, así que no se ve desde otras
+    // sesiones; `alter table … disable trigger` sería global.
+    await admin.begin(async (tx) => {
+      await tx`set local session_replication_role = 'replica'`;
+      await tx`delete from elemento_decision where elemento_id = ${elem!.id as string}`;
+      await tx`delete from decision_insight where decision_id = ${decId}`;
+      await tx`delete from elemento_cambio where id = ${elem!.id as string}`;
+      await tx`delete from design_version where id = ${dv!.id as string}`;
+      await tx`delete from journey_snapshot where journey_id = ${jr!.id as string}`;
+      await tx`delete from journey where id = ${jr!.id as string}`;
+      await tx`delete from decision where id = ${decId}`;
+      await tx`delete from gate_instancia where id = ${gateId}`;
+      await tx`delete from etapa_instancia where proyecto_id = ${proyectoId}`;
+      await tx`delete from proyecto where id = ${proyectoId}`;
+      await tx`delete from reto_servicio_afectado where servicio_id = ${svc!.id as string}`;
+      await tx`delete from servicio where id = ${svc!.id as string}`;
+    });
+  });
+
+  it('el predicado crudo lee la REGLA, no la regla más la puerta de membresía', async () => {
+    /*
+     * `20260902360000` dejó dicho el reparto —la regla abajo sin grant, la puerta arriba— y
+     * dejó dicha la trampa: «la puerta NO puede ir en la función que llama el guard, porque
+     * el guard corre como propietario y muchas veces sin `app.user_id`». El predicado del
+     * razonamiento se quedó del lado equivocado, y el síntoma es lo que lo hacía peligroso:
+     * un rechazo perfectamente plausible que NOMBRA los derechos cuando los derechos están
+     * vivos. Falla cerrado, así que no rompió nada — hasta que un guard nuevo lo consultara.
+     *
+     * Se comprueba como se descubrió: como propietario y SIN `app.user_id` fijado, que es la
+     * situación de un backfill o de un guard que no lo pone.
+     */
+    const admin = sqlAdmin();
+    const [previo] = await admin`select app_user_id() as quien,
+      derechos_vigentes(${evConDerechos}::uuid, ${ws}::uuid, 'cliente') as regla,
+      evidencia_usable(${evConDerechos}::uuid, ${ws}::uuid, 'cliente') as con_puerta`;
+    // El supuesto del caso, comprobado y no asumido: sin identidad la puerta dice que no
+    // aunque la regla diga que sí. Si algún día dejara de ser así, este caso no probaría
+    // nada y hay que enterarse.
+    expect(previo!.quien).toBeNull();
+    expect(previo!.regla).toBe(true);
+    expect(previo!.con_puerta).toBe(false);
+
+    // Y aun así el predicado NO inventa una falta de derechos.
+    const [sano] = await admin`select razonamiento_sin_respaldo(${ws}::uuid,
+      array[]::uuid[], array[]::uuid[], array[${evConDerechos}]::uuid[]) as motivo`;
+    expect(sano!.motivo).toBeNull();
+
+    // Y sigue diciendo la VERDAD cuando de verdad faltan: sin esto, lo de arriba se
+    // cumpliría con un predicado que no mirara nada.
+    const [roto] = await admin`select razonamiento_sin_respaldo(${ws}::uuid,
+      array[]::uuid[], array[]::uuid[], array[${evSinDerechos}]::uuid[]) as motivo`;
+    expect(roto!.motivo).toContain('sin derechos vigentes');
+    expect(roto!.motivo).toContain('derechos pendientes');
+
+    // La puerta anti-oráculo sigue donde tiene que estar: en el envoltorio público. Para
+    // quien no es miembro, `null` — indistinguible de «se puede consumir».
+    const [tapado] = await admin`select
+      evidencia_motivo_bloqueo(${evSinDerechos}::uuid, ${ws}::uuid, 'cliente') as motivo`;
+    expect(tapado!.motivo).toBeNull();
+
+    // Y la nueva cruda del motivo tampoco es ejecutable por el rol de aplicación: si lo
+    // fuera, la puerta del envoltorio sería decorativa otra vez.
+    await expect(
+      conUsuario(
+        leadId,
+        (tx) => tx`select evidencia_motivo_bloqueo_crudo(${evSinDerechos}::uuid,
+          ${ws}::uuid, 'cliente')`,
+      ),
+    ).rejects.toMatchObject({ code: '42501' });
   });
 
   it('G5 certifica VIGENCIA, no existencia: no se certifica un diseño cuyo razonamiento perdió los derechos', async () => {
@@ -2593,11 +2790,15 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       return snap!.id as string;
     });
 
-    // Aprobar declarando el actor: el guard consulta `evidencia_usable`, que lleva delante
-    // la puerta anti-oráculo (`is_workspace_member(app_user_id(), …)`), y la conexión de
-    // propietario no tiene `app.user_id`. Sin declararlo, la puerta sale falsa y el guard
-    // rechazaría SIEMPRE — el test pasaría por la razón equivocada. Es la misma disciplina
-    // que el seed aplica con `declararActor`.
+    // Aprobar declarando el actor, que es la disciplina del seed con `declararActor`.
+    //
+    // Aquí vivía una razón que YA NO ES CIERTA, y conviene dejar dicho por qué: decía que
+    // sin declararlo el guard rechazaría siempre, porque consultaba `evidencia_usable` con
+    // la puerta `is_workspace_member(app_user_id(), …)` delante y la conexión de propietario
+    // no tiene `app.user_id`. Esa era la deuda §3.2 del handoff, y ese comentario era su
+    // síntoma escrito: la prueba se había acomodado al defecto. El predicado crudo lee ahora
+    // la REGLA, así que el guard ya no depende de la identidad para juzgar derechos. Se sigue
+    // declarando el actor porque la aprobación lo atribuye, no para que la puerta abra.
     const aprobarG5 = () =>
       admin.begin(async (tx) => {
         await tx`select set_config('app.user_id', ${leadId}, true)`;

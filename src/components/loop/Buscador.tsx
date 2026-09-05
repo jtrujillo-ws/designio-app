@@ -83,10 +83,14 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
     }
     setCargando(true);
     setEstado((previo) => (previo.fase === 'listo' ? previo : { fase: 'buscando' }));
+    // Una petición ya lanzada no se puede cancelar al desmontar (salir de /app, cambiar de
+    // workspace), pero sí invalidar: con `vigente` en false su respuesta se descarta entera,
+    // Enter anotado incluido, en vez de navegar desde una instancia que ya no existe.
+    let vigente = true;
     const temporizador = setTimeout(async () => {
       try {
         const r = await buscarEnElWorkspace({ data: { workspaceId, texto: limpio } });
-        if (numero !== consulta.current) return;
+        if (!vigente || numero !== consulta.current) return;
         setEstado({ fase: 'listo', resultados: r.resultados, hayMas: r.hayMas, texto: limpio });
         setActivo(0);
         if (enterPendiente.current) {
@@ -101,22 +105,18 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
           }
         }
       } catch (e) {
-        if (numero !== consulta.current) return;
+        if (!vigente || numero !== consulta.current) return;
         setEstado({
           fase: 'error',
           mensaje: e instanceof Error ? e.message : 'No se pudo buscar en este momento.',
         });
       } finally {
-        if (numero === consulta.current) setCargando(false);
+        if (vigente && numero === consulta.current) setCargando(false);
       }
     }, ESPERA_MS);
     return () => {
       clearTimeout(temporizador);
-      // Al desmontar (salir de /app, cambiar de workspace) una petición ya lanzada no se
-      // puede cancelar, pero sí invalidar: con el número avanzado su respuesta se descarta y
-      // el Enter anotado no navega desde una instancia que ya no existe.
-      consulta.current++;
-      enterPendiente.current = false;
+      vigente = false;
     };
   }, [texto, workspaceId, navigate]);
 

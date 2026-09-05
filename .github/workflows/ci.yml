@@ -60,6 +60,19 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run db:migrate
       - run: bun run db:seed
+      # La suite de autorización provoca cientos de errores ESPERADOS (RLS, guards): son el
+      # resultado que se afirma. Al terminar el job, el runner vuelca el log del contenedor de
+      # Postgres —cada error con su sentencia entera—, y ese volcado sepulta la salida de vitest
+      # miles de líneas más arriba: cuando la CI se pone roja, el fallo real no hay cómo leerlo.
+      # El error sigue viajando al cliente con su DETAIL, y vitest lo imprime, así que callar el
+      # log del SERVIDOR no pierde diagnóstico: lo devuelve.
+      - name: Callar el log de errores del servidor (su volcado sepulta la salida de vitest)
+        # Comodidad de diagnóstico, no requisito: si el runner no trae psql, la CI sigue.
+        continue-on-error: true
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "alter system set log_min_messages = 'log'" \
+            -c "select pg_reload_conf()"
       # Incluye la suite de autorización (RLS activo) contra el Postgres real del service.
       - run: bun run test
 

@@ -7557,6 +7557,119 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * El `xmin` no distingue INSERTAR de ACTUALIZAR, y esa era la grieta del sello.
+   *
+   * La procedencia se apoyaba en «esta fila nació en esta misma transacción», comprobado con
+   * `i.xmin = pg_current_xact_id()`. Pero Postgres le pone a la tupla ACTUALIZADA el id de la
+   * transacción que la actualiza, así que una cabecera vieja a la que esta misma transacción le
+   * hace un UPDATE permitido pasa la comprobación como si acabara de nacer.
+   *
+   * Medido: un insight escrito a mano en otra transacción, con la cabecera que la propuesta
+   * dice —para que la paridad de contenido no lo pare antes—, más sus afirmaciones y citas
+   * creadas aquí, más el UPDATE de validación (que es legítimo), se sellaba con la procedencia
+   * de la propuesta. SYS-19 dice justo lo contrario.
+   *
+   * Se cierra exigiendo que el insight siga `propuesto`. Por qué eso basta está medido en el
+   * caso de abajo y no citado de memoria: no existe UPDATE concedido que refresque el `xmin`
+   * dejando la fila en `propuesto`.
+   */
+  it('una propuesta no puede sellar un insight que ya existía', async () => {
+    await enWorkspaceLimpio('c2-xmin-preexistente', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido = CONTENIDO_C2(ev);
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+
+      // Un insight VIEJO, de otra transacción, con la cabecera que la propuesta dice.
+      const [viejo] = await conUsuario(curadorId, (tx) => tx`insert into insight
+        (workspace_id, titulo, resumen, estado, creado_por)
+        values (${wsC}, ${contenido.titulo}, ${contenido.resumen}, 'propuesto', ${curadorId})
+        returning id`);
+      const insightViejo = viejo!.id as string;
+
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [af] = await tx`insert into afirmacion
+            (workspace_id, insight_id, orden, texto, es_hipotesis)
+            values (${wsC}, ${insightViejo}, 0, ${contenido.afirmaciones[0]!.texto}, false)
+            returning id`;
+          await tx`insert into cita
+            (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+            values (${wsC}, ${af!.id as string}, ${ev},
+                    ${contenido.afirmaciones[0]!.citas[0]!.fragmento},
+                    ${contenido.afirmaciones[0]!.citas[0]!.localizacion}, ${curadorId})`;
+          // El UPDATE permitido, que es lo que refresca el xmin de la cabecera vieja.
+          await tx`update insight
+            set estado = 'validado', validado_por = ${curadorId}, validado_en = now()
+            where id = ${insightViejo} and workspace_id = ${wsC}`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${curadorId}, insight_id = ${insightViejo}
+            where id = ${p.id} and workspace_id = ${wsC}`;
+        }),
+        'una propuesta se apropió de un insight que ya existía (SYS-19)',
+      ).rejects.toThrow(/creado esta misma aceptación/);
+
+      // Y la aceptación legítima sigue funcionando: nace `propuesto` y validar es un acto
+      // humano POSTERIOR, en otra transacción, así que la condición no le estorba.
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p.id,
+      });
+      expect(objetoId).not.toBe(insightViejo);
+      const [nuevo] = await admin`select estado, propuesta_ai_id from insight
+        where id = ${objetoId} and workspace_id = ${wsC}`;
+      expect(nuevo!.estado as string).toBe('propuesto');
+      expect(nuevo!.propuesta_ai_id).toBe(p.id);
+    });
+  });
+
+  /**
+   * Y por qué basta con exigir `propuesto`: NO HAY UPDATE que refresque el xmin sin sacarlo.
+   *
+   * El arreglo de arriba se apoya en un invariante de otro sitio, y en este PR eso ha salido
+   * mal cinco veces —un `grant` de tabla que cubría columnas futuras, un índice único que no
+   * cerraba lo que su comentario decía, un recuento que solo significa algo sin repetidas—.
+   * Así que este no se cita: se mide contra el catálogo y contra la base.
+   *
+   * La superficie de UPDATE del rol de aplicación sobre `insight` es (estado, validado_por,
+   * validado_en) y su única política de UPDATE exige, en el `with check`, que la fila quede
+   * `validado`. Si alguien amplía eso, este caso se pone rojo y no hay que acordarse de nada.
+   */
+  it('el rol de aplicación no puede refrescar un insight dejándolo propuesto', async () => {
+    await enWorkspaceLimpio('c2-superficie-de-update', async ({ ws: wsC, curadorId }) => {
+      const admin = sqlAdmin();
+      // Las columnas concedidas, del catálogo: si aparece una más, hay que volver a pensar.
+      const columnas = await admin`
+        select column_name from information_schema.column_privileges
+        where grantee = 'designio_app' and table_name = 'insight' and privilege_type = 'UPDATE'
+        order by column_name`;
+      expect(
+        columnas.map((c) => c.column_name as string),
+        'la superficie de UPDATE sobre insight creció: el sello de procedencia se apoya en ella',
+      ).toEqual(['estado', 'validado_en', 'validado_por']);
+
+      const [ins] = await conUsuario(curadorId, (tx) => tx`insert into insight
+        (workspace_id, titulo, resumen, estado, creado_por)
+        values (${wsC}, 'T', 'R', 'propuesto', ${curadorId}) returning id`);
+
+      // Y el intento de refrescar la fila DEJÁNDOLA propuesta no pasa la política.
+      await expect(
+        conUsuario(curadorId, (tx) => tx`update insight
+          set estado = 'propuesto'
+          where id = ${ins!.id as string} and workspace_id = ${wsC}`),
+      ).rejects.toThrow();
+    });
+  });
+
+  /**
    * Y la contradicción repetida, por lo mismo y con el mismo agujero.
    *
    * El `unique (insight_id, evidencia_id)` de `contradiccion` NO lo cierra, y esa era la

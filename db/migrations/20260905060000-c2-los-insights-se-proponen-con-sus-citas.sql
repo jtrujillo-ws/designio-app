@@ -509,11 +509,29 @@ begin
   -- cabecera recién creada con las afirmaciones de otro sitio diría lo mismo por dentro y
   -- constaría igual de materializada. Se exige que TODA la descendencia haya nacido en esta
   -- misma transacción.
+  -- El `xmin` NO distingue insertar de actualizar: Postgres le pone al tupla actualizada el
+  -- id de la transacción que la actualiza, así que una cabecera VIEJA a la que esta misma
+  -- transacción le hace un UPDATE permitido pasa esta comprobación como si acabara de nacer.
+  -- Medido: un insight escrito a mano en otra transacción, con la cabecera que la propuesta
+  -- dice, más sus afirmaciones y citas creadas aquí, más el UPDATE de validación —que es
+  -- legítimo—, se sellaba con la procedencia de la propuesta.
+  --
+  -- Se cierra exigiendo ADEMÁS que siga `propuesto`, y eso funciona por un motivo que hay que
+  -- dejar escrito porque el arreglo entero se apoya en él: el rol de aplicación tiene UPDATE
+  -- solo sobre (estado, validado_por, validado_en) y su única política de UPDATE es
+  -- `insight_validar`, cuyo `with check` EXIGE que la fila quede en `validado`. O sea que no
+  -- existe ningún UPDATE concedido que refresque el `xmin` dejando `propuesto`: el único que
+  -- hay obliga a salir de ese estado. Una prueba lo fija contra el catálogo, para que si
+  -- alguien amplía esa superficie no se entere por este comentario sino por un caso en rojo.
+  --
+  -- Y la materialización legítima nace `propuesto` —validar es un acto humano POSTERIOR, en
+  -- otra transacción—, así que la condición no le estorba.
   if new.destino = 'insight' and not exists (
     select 1 from insight i
     where i.id = new.insight_id and i.workspace_id = new.workspace_id
-      and i.xmin = pg_current_xact_id()::xid) then
-    raise exception 'el insight materializado tiene que haberlo creado esta misma aceptación: una propuesta no puede apropiarse de un insight que ya existía (SYS-19)';
+      and i.xmin = pg_current_xact_id()::xid
+      and i.estado = 'propuesto') then
+    raise exception 'el insight materializado tiene que haberlo creado esta misma aceptación y seguir propuesto: una propuesta no puede apropiarse de un insight que ya existía (SYS-19)';
   end if;
   if new.destino = 'insight' and exists (
     select 1 from afirmacion a

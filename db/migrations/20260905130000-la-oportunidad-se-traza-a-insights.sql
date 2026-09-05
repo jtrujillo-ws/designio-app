@@ -659,6 +659,33 @@ begin
     return new;
   end if;
 
+  -- ── Y UN VEREDICTO NO ES ADEMÁS UNA REPRIORIZACIÓN ──
+  -- El grant por columnas deja escribir `estado` y `prioridad` en el MISMO update, y la
+  -- auditoría clasifica por lo que cambió, en cascada: «¿se movió el estado? entonces es un
+  -- veredicto». Con las dos cosas movidas a la vez la rama de la repriorización no se alcanza
+  -- nunca, así que el archivo —que es append-only y ya no se corrige— pierde una
+  -- repriorización de verdad. Medido: el update mezclado deja `OportunidadDecidida` y nada más.
+  --
+  -- Y lo que queda no es solo incompleto, es engañoso: el evento del veredicto lleva dentro
+  -- `prioridad` y `prioridadRazon`, así que la razón de la subida queda archivada explicando
+  -- una DECISIÓN que no la causó, con la prioridad nueva presentada como si siempre hubiera
+  -- sido esa. Contar repriorizaciones sobre ese archivo cuenta de menos, y leer esa fila
+  -- entiende mal lo que pasó.
+  --
+  -- Se rechaza la mezcla en vez de emitir los dos eventos, que es la otra salida posible, y es
+  -- la misma decisión que tomó el guard de la razón del veredicto tres párrafos abajo: la
+  -- salida no es enseñarle a la auditoría a describir un acto raro, es que ese acto no ocurra.
+  -- Un evento por escritura es lo que hace que el archivo se pueda contar.
+  --
+  -- No cierra ningún camino: la política de UPDATE exige `estado = 'propuesta'`, así que la
+  -- prioridad solo se mueve ANTES del veredicto de todas formas. Repriorizar y luego decidir
+  -- son dos escrituras que ya funcionan —es lo que hace el servicio, `priorizarOportunidad` y
+  -- `decidirOportunidad` por separado— y dejan sus dos rastros.
+  if new.prioridad is distinct from old.prioridad
+     or new.prioridad_razon is distinct from old.prioridad_razon then
+    raise exception 'decidir y repriorizar son dos actos y no caben en una sola escritura: el archivo clasifica por lo que cambió, así que guardaría el veredicto y perdería la repriorización, con su razón archivada explicando una decisión que no la causó (RF-01.6). Repriorízala primero y decídela después.';
+  end if;
+
   -- La firma la pone la BASE, no quien llama: un update directo no puede atribuir el
   -- veredicto a otro ni fecharlo fuera de su momento. Mismo criterio que el sello de
   -- `gate_aprobar_suficiencia_guard`.
@@ -1294,6 +1321,10 @@ begin
     elsif tg_op = 'DELETE' then
       v_tipo := 'OportunidadBorrada';
     elsif old.estado is distinct from new.estado then
+      -- Y esta rama tapa la de abajo sin perder nada, porque `oportunidad_veredicto_guard`
+      -- rechaza el update que mueve el estado Y la prioridad a la vez. La cascada es
+      -- exclusiva por construcción, no porque el orden de los `elsif` la ordene: si esa
+      -- puerta se quitara, un solo update volvería a producir un solo evento para dos actos.
       v_tipo := 'OportunidadDecidida';
     elsif old.prioridad is distinct from new.prioridad
        or old.prioridad_razon is distinct from new.prioridad_razon then

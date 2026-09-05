@@ -550,6 +550,88 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
   });
 
   /**
+   * Un veredicto no es ADEMÁS una repriorización, y por eso el archivo puede contar.
+   *
+   * `oportunidad_auditoria` clasifica en cascada: primero pregunta si se movió el estado, y solo
+   * si no, si se movió la prioridad. El grant deja escribir las dos cosas en el MISMO update, y
+   * entonces la segunda rama no se alcanza nunca: el archivo guarda `OportunidadDecidida` y la
+   * repriorización desaparece.
+   *
+   * Lo que queda no es solo incompleto: el evento del veredicto lleva dentro `prioridad` y
+   * `prioridadRazon`, así que la razón de la subida acaba archivada explicando una decisión que
+   * no la causó, con la prioridad nueva presentada como si siempre hubiera sido esa.
+   *
+   * La salida es la misma que con la razón del veredicto: no enseñarle a la auditoría a
+   * describir un acto raro, sino que ese acto no ocurra. No cierra ningún camino —la prioridad
+   * solo se mueve mientras la fila está 'propuesta', así que repriorizar y decidir ya eran dos
+   * escrituras—, y esa mitad va comprobada abajo.
+   */
+  it('decidir y repriorizar no caben en la misma escritura, y por separado dejan sus dos rastros', async () => {
+    const admin = sqlAdmin();
+    const { oportunidadId } = await crearOportunidad(leadId, {
+      workspaceId: ws,
+      retoId,
+      pregunta: '¿Cómo podríamos contar lo que pasó de verdad?',
+      prioridad: 2,
+      prioridadRazon: 'Nace en dos',
+    });
+
+    // El número y la razón, cada uno por su lado: el guard mira los dos con un `or`, y con una
+    // sola de las dos mitades comprobada la otra podría caerse sin que nada se pusiera en rojo.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update oportunidad
+        set estado = 'descartada', veredicto_razon = 'no la vamos a perseguir',
+            prioridad = 9, prioridad_razon = 'y de paso sube'
+        where id = ${oportunidadId} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/dos actos/);
+
+    await expect(
+      conUsuario(leadId, (tx) => tx`update oportunidad
+        set estado = 'descartada', veredicto_razon = 'no la vamos a perseguir',
+            prioridad_razon = 'solo la razón'
+        where id = ${oportunidadId} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/dos actos/);
+
+    // Ni la fila ni el archivo se movieron.
+    const [sinTocar] = await admin`select estado, prioridad, prioridad_razon, veredicto_razon
+      from oportunidad where id = ${oportunidadId}`;
+    expect(sinTocar!.estado).toBe('propuesta');
+    expect(sinTocar!.prioridad).toBe(2);
+    expect(sinTocar!.prioridad_razon).toBe('Nace en dos');
+    expect(sinTocar!.veredicto_razon).toBe('');
+    const nada = await admin`select tipo from evento_dominio
+      where workspace_id = ${ws} and payload->>'oportunidadId' = ${oportunidadId}
+        and tipo <> 'OportunidadPropuesta'`;
+    expect(nada.length, 'la escritura rechazada dejó rastro').toBe(0);
+
+    // Y las dos por separado sí pasan, en su orden y con sus dos eventos. Sin esta mitad,
+    // tapiar la puerta entera —prohibir tocar la prioridad en cualquier update— pasaría igual.
+    await priorizarOportunidad(leadId, {
+      workspaceId: ws,
+      oportunidadId,
+      prioridad: 9,
+      prioridadRazon: 'y de paso sube',
+    });
+    await decidirOportunidad(leadId, {
+      workspaceId: ws,
+      oportunidadId,
+      estado: 'descartada',
+      veredictoRazon: 'no la vamos a perseguir',
+    });
+    const rastro = await admin`select tipo, payload->>'prioridad' as prioridad
+      from evento_dominio
+      where workspace_id = ${ws} and payload->>'oportunidadId' = ${oportunidadId}
+      order by creado_en asc, id asc`;
+    expect(rastro.map((e) => e.tipo)).toEqual([
+      'OportunidadPropuesta',
+      'OportunidadRepriorizada',
+      'OportunidadDecidida',
+    ]);
+    // Y la repriorización quedó archivada con SU número, no absorbida por el veredicto.
+    expect(rastro[1]!.prioridad).toBe('9');
+  });
+
+  /**
    * Y esa reapertura tiene que ser DE VERDAD: el 'en-curso' no se pone a mano.
    *
    * La ventana del portafolio se abre cuando la etapa 3 está `en-curso`, y esa lectura la hacen

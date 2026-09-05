@@ -25,8 +25,11 @@ export const arbolDelWorkspace = createServerFn({ method: 'GET' })
 function mensajeDe(e: unknown): string | null {
   if (e instanceof ErrorArbol) return e.message;
   if (e instanceof ErrorAutorizacion) return e.message;
-  const err = e as { code?: string };
+  const err = e as { code?: string; message?: string };
   if (err.code === '42501') return 'Sin permiso para dar de alta servicios en este workspace';
+  // Workspace archivado o borrado por disposición acordada: la base lo rechaza con DS001 y
+  // un mensaje que ya dice qué pasó y cuándo; se entrega tal cual en vez de inventar otro.
+  if (err.code === 'DS001' && err.message) return err.message;
   return null;
 }
 

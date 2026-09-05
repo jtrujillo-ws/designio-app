@@ -177,7 +177,27 @@ export type AnclaCapacidad = {
  * en la raíz de la respuesta, y un lote lo devuelve dentro de un campo con nombre. El techo
  * existe porque la revisión es por elemento — un lote grande no se revisa, se acepta entero.
  */
-export type LoteCapacidad = { campo: string; maximo: number } | null;
+export type LoteCapacidad = {
+  campo: string;
+  /**
+   * Cuántas propuestas TIENE que traer el lote, que no siempre es una.
+   *
+   * Estaba escrito `min(1)` en los dos sitios que gobiernan el mismo sobre —el esquema que se
+   * le pide al proveedor y el que valida la respuesta—, y para C5 es correcto y está razonado:
+   * como se niega a llamar con cero señales, no queda ninguna petición real cuya respuesta
+   * correcta sea la lista vacía. Ese es el criterio, y C2 lo falla: su prompt dice «hasta N» y
+   * le prohíbe expresamente proponer lo que la evidencia no sostenga, así que una evidencia
+   * que no sostiene ningún insight responsable tiene por respuesta correcta NINGUNO — y con el
+   * mínimo en uno el modelo o se inventa uno o su respuesta, ya pagada, se descarta como fuera
+   * de contrato, culpándolo de haber obedecido.
+   *
+   * Se declara por capacidad porque la pregunta es de cada una, y las dos mitades lo leen de
+   * aquí por lo mismo que ya leían de aquí el campo y el techo: gobiernan el mismo sobre y no
+   * pueden discrepar si solo hay una declaración.
+   */
+  minimo: number;
+  maximo: number;
+} | null;
 
 /**
  * TODO lo que varía de una capacidad, en un solo sitio.
@@ -317,7 +337,9 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
       pendiente:
         'Ese reto ya tiene criterios propuestos esperando revisión: decídelos antes de pedir otros',
     },
-    lote: { campo: 'criterios', maximo: MAX_CRITERIOS_POR_LOTE },
+    // Uno como mínimo, que es lo que C0 hacía y este PR no revisa: el registro solo hace
+    // que la pregunta se pueda contestar por capacidad en vez de estar escrita para todas.
+    lote: { campo: 'criterios', minimo: 1, maximo: MAX_CRITERIOS_POR_LOTE },
     exigeConsentimiento: false,
     esSimulacion: false,
   },
@@ -392,7 +414,9 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      * (SPEC-08 §3), así que cada uno se acepta o se descarta por separado. El techo es
      * pequeño a propósito — un lote grande no se revisa, se acepta entero.
      */
-    lote: { campo: 'insights', maximo: MAX_INSIGHTS_POR_LOTE },
+    // CERO es una respuesta legítima: la evidencia de un reto puede no sostener ningún
+    // insight, y el prompt pide expresamente que no se proponga lo que no se sostiene.
+    lote: { campo: 'insights', minimo: 0, maximo: MAX_INSIGHTS_POR_LOTE },
     /*
      * El material de C2 es EVIDENCIA, y la evidencia sale de material de personas: entrevistas,
      * sesiones, documentos que alguien entregó. Pero el consentimiento en este esquema se

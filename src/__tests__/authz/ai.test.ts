@@ -6957,6 +6957,48 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * «Ningún insight» es una RESPUESTA, y hasta ahora no era representable.
+   *
+   * El prompt de C2 dice «hasta N» y le prohíbe expresamente proponer lo que la evidencia no
+   * sostenga; el sobre del lote exigía uno como mínimo a los dos lados —el esquema que se le
+   * pide al proveedor y el que valida su respuesta—. Con esos dos a la vez, una evidencia que
+   * no sostiene ningún insight responsable no tiene salida legal: el modelo se inventa uno, o
+   * su respuesta ya pagada se descarta como `fuera-de-contrato` por haber obedecido.
+   *
+   * Medido antes de arreglarlo: `generarPropuestas` lanzaba «La respuesta del proveedor AI no
+   * cumplió el esquema de la capacidad y se descartó», y el intento quedaba reetiquetado.
+   *
+   * El suelo se declara ahora por capacidad, que es donde vive la pregunta: C5 mantiene el uno
+   * —se niega a llamar con cero señales, así que ninguna petición real tiene la lista vacía por
+   * respuesta— y C2 baja a cero. La llamada se cierra como `salida-valida`, porque es lo que
+   * describe: el proveedor contestó lo que se le pidió.
+   */
+  it('un lote vacío de C2 es una respuesta válida, no una salida fuera de contrato', async () => {
+    await enWorkspaceLimpio('c2-lote-vacio', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Acta de una reunión interna',
+        resumen: 'Se acordó volver a mirarlo el mes que viene.',
+      });
+      const r = await conProveedor(
+        { ok: true, datos: { insights: [] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      expect(r.generadas).toBe(0);
+
+      const [l] = await conUsuario(curadorId, (tx) => tx`
+        select resultado from llamada_ai
+        where workspace_id = ${wsC} and capacidad = 'C2'`);
+      // El libro describe lo que devolvió el PROVEEDOR, y devolvió lo que se le pidió.
+      expect(l!.resultado as string).toBe('salida-valida');
+
+      // Y no nace ninguna fila: cero propuestas es cero, no una vacía.
+      const filas = await conUsuario(curadorId, (tx) => tx`
+        select 1 from propuesta_ai where workspace_id = ${wsC} and capacidad = 'C2'`);
+      expect(filas.length).toBe(0);
+    });
+  });
+
+  /**
    * Y una cita cuyo documento ya no está en el material NO se mide contra los demás.
    *
    * `pajarDeLaCita` devuelve `null` para eso, y quien lo lee tenía escrito
@@ -7559,6 +7601,86 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             where id = ${prop!.id as string} and workspace_id = ${wsC}`;
         }),
       ).rejects.toThrow(/contradicciones del insight materializado/);
+    });
+  });
+
+  /**
+   * Un reto ARCHIVADO tampoco admite que se materialice lo que ya tenía propuesto.
+   *
+   * Al nacer la propuesta esto ya se exige, y por separado de la puerta de los criterios: es
+   * lo único de aquella condición que habla del RETO y no de los criterios. Entre nacer y
+   * aceptarse caben días, y el ciclo de vida del reto avanza solo —`candidato → archivado` es
+   * una transición legal—, así que el guard DIFERIDO tiene que volver a exigirlo. No lo hacía:
+   * `reto_admite_criterios` excluye `archivado`, de modo que C0 lo tenía de rebote y C2 no lo
+   * tenía en absoluto.
+   *
+   * Las dos mitades, y son distintas. El SERVICIO ya lo rechazaba por su nombre —lee el estado
+   * del ancla y lo dice—, así que la pantalla nunca ofreció esto; lo que faltaba era el SUELO,
+   * y ahí el hueco era real: con los grants que la aplicación tiene, quien escriba por SQL
+   * montaba el insight entero y sellaba la propuesta como aceptada. Medido antes de arreglarlo:
+   * `servicio=rechazó`, `suelo=ACEPTÓ`.
+   *
+   * Y el arreglo va por ANCLA, no por destino. La regla habla del reto, no de lo que la
+   * propuesta materializa; escrita como «si el destino es insight» se queda corta ante la
+   * próxima capacidad que ancle en el reto, que es exactamente el error que la puerta de los
+   * criterios ya costó una vez en este mismo PR.
+   */
+  it('un reto archivado no admite que se materialice su propuesta pendiente', async () => {
+    await enWorkspaceLimpio('c2-reto-archivado', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido = CONTENIDO_C2(ev);
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      // Antes de archivar es aceptable: sin esto, el caso podría estar midiendo un fixture que
+      // nunca lo fue.
+      expect(p.anclaEstado).toBe('disponible');
+
+      await admin`update reto set estado = 'archivado'
+        where id = ${retoC} and workspace_id = ${wsC}`;
+
+      // El servicio, por su nombre.
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p.id }),
+      ).rejects.toThrow(/archiv/i);
+
+      // Y el SUELO, por el camino que el hueco permitía: el insight entero montado a mano y la
+      // propuesta sellada en la misma transacción, que es lo que los grants dejan hacer.
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [ins] = await tx`insert into insight
+            (workspace_id, titulo, resumen, estado, creado_por)
+            values (${wsC}, ${contenido.titulo}, ${contenido.resumen}, 'propuesto', ${curadorId})
+            returning id`;
+          const [af] = await tx`insert into afirmacion
+            (workspace_id, insight_id, orden, texto, es_hipotesis)
+            values (${wsC}, ${ins!.id as string}, 0, ${contenido.afirmaciones[0]!.texto}, false)
+            returning id`;
+          await tx`insert into cita
+            (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+            values (${wsC}, ${af!.id as string}, ${ev},
+                    ${contenido.afirmaciones[0]!.citas[0]!.fragmento},
+                    ${contenido.afirmaciones[0]!.citas[0]!.localizacion}, ${curadorId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${curadorId}, insight_id = ${ins!.id as string}
+            where id = ${p.id} and workspace_id = ${wsC}`;
+        }),
+        'la superficie SQL sella un insight atribuido a un reto ya cerrado',
+      ).rejects.toThrow(/archivado/);
+
+      // Y RECHAZAR sigue abierto: bloquear también esa salida dejaría la fila muerta y su
+      // ancla retenida para siempre.
+      await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p.id });
+      const [cerrada] = await admin`select estado from propuesta_ai
+        where id = ${p.id} and workspace_id = ${wsC}`;
+      expect(cerrada!.estado as string).toBe('rechazada');
     });
   });
 

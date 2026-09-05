@@ -201,7 +201,16 @@ function PantallaPropuestas() {
                   })
                 }
                 onGenerado={async (n) => {
-                  avisar(`${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`);
+                  // Cero es un desenlace, no un fallo: hay capacidades cuya respuesta correcta
+                  // puede ser «nada» —C2 tiene prohibido proponer lo que la evidencia no
+                  // sostenga—, y la llamada se pagó igual. «0 propuestas en espera de revisión»
+                  // es cierto y no dice nada; quien lo lee necesita saber que el modelo miró y
+                  // no encontró, para no volver a pedirlo esperando otra cosa.
+                  avisar(
+                    n === 0
+                      ? 'El modelo no encontró nada que proponer con ese material y no dejó ninguna propuesta. La llamada queda anotada en el libro de costos.'
+                      : `${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`,
+                  );
                   await refrescar();
                 }}
                 onConsentimiento={async (r) => {

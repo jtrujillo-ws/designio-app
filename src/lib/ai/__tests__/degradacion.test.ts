@@ -523,7 +523,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
   /*
    * C5 y C2 salieron en paralelo y cada una movió el contrato por su lado, así que las dos
    * ramas subieron la versión a la vez sobre la misma base. C5 entró antes y se quedó con la
-   * `.9`; C2 sube a la `.10` al integrarse, en vez de conservar la que traía.
+   * `.9`; C2 subió a la `.10` al integrarse, y a la `.11` al admitir el lote vacío —que cambia
+   * el `minItems` del sobre y la instrucción del prompt, o sea el contrato por sus dos lados.
    *
    * La versión es una ETIQUETA opaca que se guarda en el lineage, no un contador: saltar un
    * número no cuesta nada y compartirlo sí — dos contratos distintos con la misma etiqueta son
@@ -533,8 +534,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
    * del material guardado con el de hoy solo vale entre propuestas del mismo render.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-05.10';
-  const HUELLA_ANOTADA = '970a5f9178099ce0b0192ed0aeba729b26ebdbc670ac88c908d5605f325db567';
+  const VERSION_ANOTADA = 'ai-2026-09-05.11';
+  const HUELLA_ANOTADA = '1d866f9513752e0be85ebbf1bb5ba3dcf4a58ba96fb4a21ffcea5fd6de8ece25';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y

@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.10';
+export const PROMPT_VERSION = 'ai-2026-09-05.11';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -571,6 +571,9 @@ export function promptInsights(reto: {
       `Propón hasta ${reto.cuantos} insights sobre el reto descrito en el material, a partir de su evidencia.`,
       material.bloque,
       'Prefiere menos insights bien citados a muchos flojos: cada afirmación tiene que poder señalar el fragmento que la sostiene.',
+      // Y decirlo, no solo permitirlo en el esquema: sin esta frase, «hasta N» con la lista
+      // vacía admitida sigue leyéndose como que se espera al menos uno, y el modelo rellena.
+      'Si esta evidencia no sostiene ningún insight, devuelve la lista vacía: es una respuesta correcta y preferible a proponer algo flojo.',
       material.truncado
         ? `(La evidencia se truncó a ${MAX_MATERIAL} caracteres: no afirmes nada sobre lo que no ves.)`
         : '',
@@ -997,7 +1000,10 @@ export function esquemaDeSalida(c: CapacidadActiva): Record<string, unknown> {
     properties: {
       [lote.campo]: {
         type: 'array',
-        minItems: 1,
+        // Los dos extremos salen del registro, no escritos aquí: es el mismo sobre que el
+        // servicio va a leer, y un mínimo distinto en cada lado descarta por «fuera de
+        // contrato» una respuesta ya pagada.
+        minItems: lote.minimo,
         maxItems: lote.maximo,
         items: ESQUEMA_DE_UNA_PROPUESTA[c],
       },

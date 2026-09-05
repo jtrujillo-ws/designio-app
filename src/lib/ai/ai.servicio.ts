@@ -2062,7 +2062,7 @@ function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): Contenid
   // es lo mismo que un lote de uno, y por eso se declara en vez de deducirse de la forma.
   if (lote === null) return [contenido.parse(datos)];
   const sobre = (datos ?? {}) as Record<string, unknown>;
-  return contenido.array().min(1).max(lote.maximo).parse(sobre[lote.campo]);
+  return contenido.array().min(lote.minimo).max(lote.maximo).parse(sobre[lote.campo]);
 }
 
 /**

@@ -568,6 +568,28 @@ begin
      and not reto_admite_criterios(new.reto_id, new.workspace_id) then
     raise exception 'ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo';
   end if;
+  -- Y el RETO ARCHIVADO, que es la otra mitad y no la cubre la de arriba.
+  --
+  -- Al nacer la propuesta esto se exige por separado —«un reto archivado no admite propuestas
+  -- de NINGUNA clase»— justo porque es lo único de aquella condición que hablaba del reto y no
+  -- de los criterios. Aquí se quedó sin sacar: `reto_admite_criterios` excluye `archivado`,
+  -- así que C0 lo tenía de rebote y C2 no lo tenía en absoluto. Medido: con la propuesta de
+  -- C2 pendiente y el reto archivado, el servicio la rechaza por su nombre y la superficie SQL
+  -- concedida sella el insight igual — un objeto nuevo atribuido a un trabajo que esta misma
+  -- migración declara cerrado.
+  --
+  -- Va por ANCLA y no por destino, que es la corrección que la puerta de los criterios ya
+  -- costó una vez: la regla habla del reto, no de lo que la propuesta materializa, y escrita
+  -- como `destino = 'insight'` se queda corta ante la próxima capacidad que ancle ahí. Para
+  -- C0 es redundante hoy y esa redundancia es el punto: deja de depender de que el predicado
+  -- de los criterios siga excluyendo el archivo.
+  if new.reto_id is not null and exists (
+    select 1 from reto r
+    where r.id = new.reto_id and r.workspace_id = new.workspace_id
+      and r.estado = 'archivado'
+  ) then
+    raise exception 'ese reto está archivado: su trabajo se cerró, así que esta propuesta ya no puede materializarse';
+  end if;
   -- Sin fecha no hay proveniencia que escribir, así que una extracción sin fechar no se
   -- materializa: el modelo tiene permitido decir «el material no la trae» —para eso existe
   -- el par fecha/motivo— y ponerla es entonces trabajo del humano al corregir (I4). El

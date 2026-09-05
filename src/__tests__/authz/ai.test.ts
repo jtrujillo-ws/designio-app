@@ -12,6 +12,7 @@ import {
 import { MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
+  type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoPropuesta,
@@ -27,7 +28,15 @@ import {
   registrarConsentimiento,
 } from '@/lib/ai/ai.servicio';
 import type { IntentoProveedor, ResultadoProveedor } from '@/lib/ai/proveedor.server';
-import { CAPACIDADES, CAPACIDADES_ACTIVAS } from '@/lib/ai/ai.schemas';
+import {
+  CAPACIDADES,
+  CAPACIDADES_ACTIVAS,
+  COLUMNAS_DE_ANCLA,
+  type AnclaCapacidad,
+  type CapacidadActiva,
+  type Destino,
+} from '@/lib/ai/ai.schemas';
+import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -98,6 +107,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   let agenteId = '';
   let svcId = '';
   let retoId = '';
+  let proyectoId = '';
+  let gateId = '';
+  let requisitoIds: string[] = [];
 
   const MATERIAL = 'El 71% de los abandonos ocurre en la carga del documento de identidad.';
 
@@ -131,6 +143,101 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // el título, que `materialDeReto` mete en la ficha del bloque, así que es literal.
     citas: [{ fragmento: 'Reto', localizacion: 'título del reto' }],
   };
+
+  /**
+   * CT — un informe de gate. Cita el TEXTO de un requisito, que es lo que `materialDeGate`
+   * mete en el cuerpo del bloque, así que la cita es literal por el mismo camino que en las
+   * otras dos. El id del hueco se rellena en cada caso: depende del gate.
+   */
+  const CONTENIDO_CT = (requisitoId: string): ContenidoAsistenteGate => ({
+    resumen: 'Faltan evidencias en dos requisitos del gate.',
+    huecos: [
+      {
+        checklistItemId: requisitoId,
+        queFalta: 'No hay evidencia adjunta que muestre la validación con usuarios',
+        comoCerrarlo: 'Adjunta la evidencia de la sesión de validación',
+      },
+    ],
+    confianzaPropuesta: 'media',
+    citas: [{ fragmento: 'El journey está validado', localizacion: 'requisito 1' }],
+  });
+
+  /**
+   * El contenido de prueba de cada capacidad, por su nombre.
+   *
+   * `Record<CapacidadActiva, …>` y no un ternario: los fixtures escribían
+   * `capacidad === 'CI' ? CONTENIDO_CI : CONTENIDO_C0`, que es el mismo idioma binario que
+   * todo este slice vino a quitar — con una tercera capacidad, sus propuestas de prueba
+   * habrían nacido con el contenido de C0 y los casos habrían medido otra cosa.
+   */
+  const CONTENIDO_POR_CAPACIDAD: Record<CapacidadActiva, ContenidoPropuesta> = {
+    CI: CONTENIDO_CI,
+    C0: CONTENIDO_C0,
+    // Se resuelve tarde porque `requisitoIds` se llena en el `beforeAll`; quien necesite el
+    // hueco apuntando a otro requisito pasa su propio contenido.
+    get CT() {
+      return CONTENIDO_CT(requisitoIds[0]!);
+    },
+  };
+
+  /**
+   * Las columnas de ancla y sus valores, DERIVADOS del registro.
+   *
+   * Los fixtures escribían `item_id, reto_id` a mano en los dos inserts, que es la misma
+   * pareja fija que el servicio dejó de escribir. Con una tercera ancla, las propuestas de
+   * prueba nacían sin su enlace y los casos que las usaran medirían un pipeline distinto del
+   * que corre.
+   */
+  function anclasDeFixture(
+    tx: TransactionSql,
+    anclas: Partial<Record<AnclaCapacidad['columna'], string>> = {},
+  ): { columnas: PendingQuery<Row[]>; valores: PendingQuery<Row[]> } {
+    const unir = (partes: PendingQuery<Row[]>[]) => partes.reduce((a, b) => tx`${a}, ${b}`);
+    return {
+      columnas: unir(COLUMNAS_DE_ANCLA.map((c) => tx`${tx(c)}`)),
+      valores: unir(COLUMNAS_DE_ANCLA.map((c) => tx`${anclas[c] ?? null}`)),
+    };
+  }
+
+  /**
+   * Un gate PENDIENTE nuevo con su checklist. Cada caso de CT necesita el suyo: el índice
+   * parcial `propuesta_ai_gate_pendiente_idx` no deja dos informes sin leer sobre el mismo
+   * gate, que es justamente lo que ese índice existe para impedir.
+   *
+   * Con su PROYECTO propio, y eso no es aspaviento: `gate_instancia` exige `(proyecto_id,
+   * numero)` único y acota el número a 0..7, así que un proyecto da para ocho gates y el del
+   * fixture ya gasta uno. Un proyecto por caso quita el techo y además aísla: dos casos no
+   * comparten el contador ni el orden en que corrieron.
+   *
+   * El gate es siempre el 3 porque su rol aprobador lo fija un CHECK por número —0, 3, 5 y 6
+   * los aprueba el sponsor— y con proyecto propio no hace falta variarlo.
+   *
+   * Devuelve también el CONTENIDO de un informe suyo: el hueco tiene que señalar un requisito
+   * DE ESTE gate o el guard lo rechaza, así que dejar que cada caso lo componga a mano era
+   * una trampa puesta a propósito para uno mismo.
+   */
+  let siguienteProyecto = 81;
+  async function nuevoGate(): Promise<{
+    gateId: string;
+    requisitos: string[];
+    contenido: ContenidoAsistenteGate;
+  }> {
+    const admin = sqlAdmin();
+    const codigo = `P-${siguienteProyecto++}`;
+    const [proy] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, ${codigo}, ${`Proyecto ${codigo}`}, ${leadId}) returning id`;
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proy!.id as string}, 3, 'sponsor') returning id`;
+    const gid = g!.id as string;
+    const req = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gid}, 1, 'El journey está validado con usuarios reales'),
+             (${ws}, ${gid}, 2, 'El blueprint declara sus puntos de fallo')
+      returning id`;
+    const requisitos = req.map((c) => c.id as string);
+    return { gateId: gid, requisitos, contenido: CONTENIDO_CT(requisitos[0]!) };
+  }
 
   /** Item de bandeja pendiente (setup con la conexión admin, como el resto de la suite).
    * `tipoFuente` decide si su material es de personas: 'entrevista' exige consentimiento
@@ -207,15 +314,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * SIEMPRE como el lead —es andamiaje— para que cada aserción siga hablando de la política
    * de `propuesta_ai` y no de la de `llamada_ai`. */
   async function nuevaLlamada(campos: {
-    capacidad: 'CI' | 'C0';
-    itemId?: string | null;
-    retoId?: string | null;
+    capacidad: CapacidadActiva;
+    anclas: Partial<Record<AnclaCapacidad['columna'], string>>;
   }): Promise<string> {
-    const [l] = await conUsuario(leadId, (tx) => tx`
-      insert into llamada_ai (workspace_id, capacidad, item_id, reto_id, modelo, origen_key,
+    const [l] = await conUsuario(
+      leadId,
+      (tx) => tx`
+      insert into llamada_ai (workspace_id, capacidad, ${anclasDeFixture(tx).columnas},
+                              modelo, origen_key,
                               resultado, tokens_entrada, tokens_salida, costo_usd,
                               latencia_ms, consentimiento_version, creado_por)
-      values (${ws}, ${campos.capacidad}, ${campos.itemId ?? null}, ${campos.retoId ?? null},
+      values (${ws}, ${campos.capacidad}, ${anclasDeFixture(tx, campos.anclas).valores},
               ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', 1200, 300,
               ${costoDeUso(MODELO_PRIMARIO, USO_CI)}, 900,
               -- La misma regla que aplica el servicio, y que la base exige en las dos
@@ -227,7 +336,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                                where c.item_id = i.id and c.workspace_id = i.workspace_id)
                       end
                  from item_importacion i
-                where i.id = ${campos.itemId ?? null} and i.workspace_id = ${ws}),
+                where i.id = ${campos.anclas.item_id ?? null} and i.workspace_id = ${ws}),
               ${leadId})
       returning id`);
     return l!.id as string;
@@ -278,25 +387,28 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   async function nuevaPropuesta(
     actorId: string,
     campos: {
-      capacidad: 'CI' | 'C0';
-      destino: 'evidencia' | 'criterio-exito';
-      itemId?: string | null;
-      retoId?: string | null;
+      capacidad: CapacidadActiva;
+      anclas: Partial<Record<AnclaCapacidad['columna'], string>>;
+      /** Solo para forzar un estado que el registro NO declara (probar un CHECK de la base).
+       * En el uso normal se omite y sale de `CAPACIDADES`, que es lo que hace el servicio. */
+      destino?: Destino | null;
       contenido?: ContenidoPropuesta;
     },
   ): Promise<string> {
-    const contenido = campos.contenido ?? (campos.capacidad === 'CI' ? CONTENIDO_CI : CONTENIDO_C0);
-    const llamadaId = await nuevaLlamada({
-      capacidad: campos.capacidad,
-      itemId: campos.itemId,
-      retoId: campos.retoId,
-    });
-    const [p] = await conUsuario(actorId, (tx) => tx`
+    const contenido = campos.contenido ?? CONTENIDO_POR_CAPACIDAD[campos.capacidad];
+    const destino =
+      campos.destino === undefined ? CAPACIDADES[campos.capacidad].destino : campos.destino;
+    const llamadaId = await nuevaLlamada({ capacidad: campos.capacidad, anclas: campos.anclas });
+    const [p] = await conUsuario(
+      actorId,
+      (tx) => tx`
       insert into propuesta_ai
-        (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
+        (workspace_id, capacidad, destino, ${anclasDeFixture(tx).columnas},
+         contenido, contenido_original,
          confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
-      values (${ws}, ${campos.capacidad}, ${campos.destino}, ${campos.itemId ?? null},
-              ${campos.retoId ?? null}, ${tx.json(contenido)}, ${tx.json(contenido)},
+      values (${ws}, ${campos.capacidad}, ${destino},
+              ${anclasDeFixture(tx, campos.anclas).valores},
+              ${tx.json(contenido)}, ${tx.json(contenido)},
               0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'alcance de prueba',
               'entorno', ${llamadaId}, ${actorId})
       returning id`);
@@ -396,6 +508,23 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       values (${ws}, ${svcId}, 'R-80', 'Reto AI', 'candidato', 'peticion-cliente', ${leadId})
       returning id`;
     retoId = r!.id as string;
+    // Un proyecto con un gate PENDIENTE y su checklist: el ancla de CT. Los dos requisitos
+    // están en estados distintos a propósito —uno pendiente y sin objeto, otro cumplido con
+    // evidencia sería otro fixture— para que el material que ve el modelo tenga las dos
+    // formas de línea.
+    const [proy] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${ws}, ${retoId}, 'P-80', 'Proyecto AI', ${leadId}) returning id`;
+    proyectoId = proy!.id as string;
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoId}, 3, 'sponsor') returning id`;
+    gateId = g!.id as string;
+    const req = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${ws}, ${gateId}, 1, 'El journey está validado con usuarios reales'),
+             (${ws}, ${gateId}, 2, 'El blueprint declara sus puntos de fallo')
+      returning id`;
+    requisitoIds = req.map((c) => c.id as string);
   });
 
   afterAll(async () => {
@@ -433,8 +562,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Notas de funnel');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
     const [fila] = await conUsuario(leadId, (tx) => tx`
       select estado, creado_por, revisada_por, evidencia_id, contenido = contenido_original as igual
@@ -455,17 +583,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
     // Un stakeholder no pide propuestas: la política solo alcanza a los curadores.
     await expect(
-      nuevaPropuesta(stakeId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+      nuevaPropuesta(stakeId, { capacidad: 'CI', anclas: { item_id: itemId } }),
     ).rejects.toThrow(/row-level security/);
     // Y el rol `agente-ai` tampoco: no es un actor que proponga por su cuenta (SYS-18).
     await expect(
-      nuevaPropuesta(agenteId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+      nuevaPropuesta(agenteId, { capacidad: 'CI', anclas: { item_id: itemId } }),
     ).rejects.toThrow(/row-level security/);
   });
 
   it('una propuesta no puede nacer ya decidida ni con un «original» distinto de lo propuesto', async () => {
     const itemId = await nuevoItem('Item para altas forzadas');
-    const llamadaId = await nuevaLlamada({ capacidad: 'CI', itemId });
+    const llamadaId = await nuevaLlamada({ capacidad: 'CI', anclas: { item_id: itemId } });
     // Nacer aceptada saltaría la firma humana, y ahora se corta una capa ANTES de la
     // política: `estado` y `revisada_por` no están en el grant de INSERT —solo en el de
     // UPDATE—, así que la aplicación ni siquiera tiene superficie para nombrarlos al dar de
@@ -532,8 +660,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item con derechos por decidir');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
     const { objetoId } = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
     try {
@@ -571,8 +698,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item que se acepta');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
 
     // Antes de aceptar, el dominio está intacto: ni fuente ni evidencia.
@@ -631,8 +757,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item que se corrige');
     const propuestaId = await nuevaPropuesta(disenadorId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
     const r = await aceptarPropuesta(disenadorId, {
       workspaceId: ws,
@@ -658,8 +783,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const otroItem = await nuevoItem('Item con corrección vacía');
     const otra = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId: otroItem,
+      anclas: { item_id: otroItem },
     });
     const r2 = await aceptarPropuesta(leadId, {
       workspaceId: ws,
@@ -673,8 +797,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item con citas que alguien quiere arreglar');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
 
     // La cita inventada de CONTENIDO_CI cambiada por una literal del material: la propuesta
@@ -734,7 +857,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item con llamadas cruzadas');
     // Una llamada de OTRA capacidad y otra ancla: la FK la aceptaba (existe y es del
     // workspace) y el panel le habría atribuido su coste y su latencia a esta propuesta.
-    const llamadaC0 = await nuevaLlamada({ capacidad: 'C0', retoId });
+    const llamadaC0 = await nuevaLlamada({ capacidad: 'C0', anclas: { reto_id: retoId } });
     await expect(
       conUsuario(leadId, (tx) => tx`insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
@@ -764,7 +887,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // Con la llamada correcta —misma capacidad, misma ancla, mismo modelo, misma
     // credencial y con salida válida— la propuesta nace sin problema.
     await expect(
-      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+      nuevaPropuesta(leadId, { capacidad: 'CI', anclas: { item_id: itemId } }),
     ).resolves.toBeTruthy();
   });
 
@@ -772,8 +895,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item que se rechaza');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
     await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
 
@@ -792,8 +914,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   it('C0: aceptar crea el criterio bajo el reto, firmado por el humano y SIN línea base inventada', async () => {
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'C0',
-      destino: 'criterio-exito',
-      retoId,
+      anclas: { reto_id: retoId },
     });
     const r = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
     expect(r.estado).toBe('aceptada');
@@ -823,8 +944,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item de escrituras crudas');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
 
     // Aceptar sin materializar nada: el CHECK de la tabla lo impide (SYS-19).
@@ -837,17 +957,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // antes de que hable ningún guard. Un objeto materializado cuelga de una sola propuesta,
     // porque si colgara de dos una de las dos estaría mintiendo sobre quién lo produjo.
     const otroItem = await nuevoItem('Item ya curado a mano');
-    const ajena = await aceptarPropuesta(
-      leadId,
-      {
-        workspaceId: ws,
-        propuestaId: await nuevaPropuesta(leadId, {
-          capacidad: 'CI',
-          destino: 'evidencia',
-          itemId: otroItem,
-        }),
-      },
-    );
+    const ajena = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId: await nuevaPropuesta(leadId, {
+        capacidad: 'CI',
+        anclas: { item_id: otroItem },
+      }),
+    });
     await expect(
       conUsuario(leadId, (tx) => tx`update propuesta_ai
         set estado = 'aceptada', revisada_por = ${leadId}, evidencia_id = ${ajena.objetoId}
@@ -905,8 +1021,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item con la AI apagada');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
 
     const previa = process.env.ANTHROPIC_API_KEY;
@@ -1009,8 +1124,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       returning id`;
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId: item!.id as string,
+      anclas: { item_id: item!.id as string },
       contenido: {
         ...CONTENIDO_CI,
         citas: [
@@ -1071,7 +1185,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
     // Y el suelo es la base: ni por SQL crudo puede EXISTIR una propuesta de ese material.
     await expect(
-      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+      nuevaPropuesta(leadId, { capacidad: 'CI', anclas: { item_id: itemId } }),
     ).rejects.toThrow(/consentimiento/i);
     // Un item que no es de personas no exige nada: la regla no se derrama sobre el resto.
     const nota = await nuevoItem('Nota sin personas dentro');
@@ -1216,7 +1330,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // También en la base: el guard lee lo mismo que el servicio, no «si existe algún
     // registro» — que con la revocación seguiría diciendo que sí.
     await expect(
-      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+      nuevaPropuesta(leadId, { capacidad: 'CI', anclas: { item_id: itemId } }),
     ).rejects.toThrow(/consentimiento/i);
 
     // Los tres hechos siguen ahí, en orden y con su autor: la bitácora no pierde historia
@@ -1700,7 +1814,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(llamadas.length).toBe(1);
     // Y el suelo es el guard: ni por SQL crudo nace una propuesta sobre un item decidido.
     await expect(
-      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+      nuevaPropuesta(leadId, { capacidad: 'CI', anclas: { item_id: itemId } }),
     ).rejects.toThrow(/ya fue decidido/i);
   });
 
@@ -2781,8 +2895,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item curado a mano antes de aceptar');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
 
     // El ataque exacto: el curador aprueba el item POR SU CUENTA, con una evidencia hecha a
@@ -2866,13 +2979,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // atribución de SPEC-08 se repartiría entre una propuesta real y una prestada.
     const p1 = await nuevaPropuesta(leadId, {
       capacidad: 'C0',
-      destino: 'criterio-exito',
-      retoId,
+      anclas: { reto_id: retoId },
     });
     const p2 = await nuevaPropuesta(leadId, {
       capacidad: 'C0',
-      destino: 'criterio-exito',
-      retoId,
+      anclas: { reto_id: retoId },
     });
     await expect(
       conUsuario(leadId, async (tx) => {
@@ -2905,8 +3016,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
 
     // Se materializa a mano —o sea SIN el candado por item que toma el servicio—, que es
@@ -3006,7 +3116,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // El suelo es la base: ni por SQL crudo puede EXISTIR una extracción de un item del que
     // no hay nada que extraer — la cita literal que el contrato exige sería inventada.
     await expect(
-      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId: soloRef }),
+      nuevaPropuesta(leadId, { capacidad: 'CI', anclas: { item_id: soloRef } }),
     ).rejects.toThrow(/material que citar/i);
 
     // Un cuerpo de dos letras es lo mismo que ninguno: el suelo es «hay algo que citar».
@@ -3302,7 +3412,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
     // El suelo es el índice único parcial: ni por SQL crudo caben dos pendientes.
     await expect(
-      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+      nuevaPropuesta(leadId, { capacidad: 'CI', anclas: { item_id: itemId } }),
     ).rejects.toThrow(/duplicate key|unique/i);
 
     // Decidida la primera, el hueco se libera: el índice solo cubre las pendientes.
@@ -3310,7 +3420,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       where workspace_id = ${ws} and item_id = ${itemId} and estado = 'propuesta'`);
     await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: p!.id as string });
     await expect(
-      nuevaPropuesta(leadId, { capacidad: 'CI', destino: 'evidencia', itemId }),
+      nuevaPropuesta(leadId, { capacidad: 'CI', anclas: { item_id: itemId } }),
     ).resolves.toBeTruthy();
   });
 
@@ -3911,8 +4021,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item de la procedencia');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
       contenido: CONTENIDO_CI,
     });
 
@@ -4013,8 +4122,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const otroItem = await nuevoItem('Otro item de la procedencia');
     const otraPropuesta = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId: otroItem,
+      anclas: { item_id: otroItem },
       contenido: CONTENIDO_CI,
     });
     await expect(
@@ -4035,8 +4143,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item que se corrige antes de aceptar');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
       contenido: CONTENIDO_CI,
     });
     const r = await aceptarPropuesta(leadId, {
@@ -4061,8 +4168,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // día decide qué snapshots entran.
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'C0',
-      destino: 'criterio-exito',
-      retoId,
+      anclas: { reto_id: retoId },
       contenido: CONTENIDO_C0,
     });
     await expect(
@@ -4099,8 +4205,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     };
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
       contenido: sinFecha,
     });
 
@@ -4320,7 +4425,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (workspace_id, capacidad, item_id, unidades, creado_por, creado_en)
         values (${ws}, 'CI', ${itemId}, 1, ${leadId}, ${new Date(Date.now() + 9e8)})`),
     ).rejects.toThrow(/permission denied/i);
-    const llamadaId = await nuevaLlamada({ capacidad: 'CI', itemId });
+    const llamadaId = await nuevaLlamada({ capacidad: 'CI', anclas: { item_id: itemId } });
     await expect(
       conUsuario(leadId, (tx) => tx`insert into propuesta_ai
         (workspace_id, capacidad, destino, item_id, contenido, contenido_original, modelo,
@@ -4407,7 +4512,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // pagada. Este test recorre exactamente ese camino.
     const admin = sqlAdmin();
     const itemId = await nuevoItem('Item de una sola llamada');
-    const llamadaId = await nuevaLlamada({ capacidad: 'CI', itemId });
+    const llamadaId = await nuevaLlamada({ capacidad: 'CI', anclas: { item_id: itemId } });
     const insertar = () =>
       conUsuario(leadId, (tx) => tx`
         insert into propuesta_ai
@@ -4427,8 +4532,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
       // Control: con SU PROPIA llamada, la segunda propuesta entra. Lo que la rechazaba era
       // compartir la llamada, no nada del item ni del estado.
-      const otraLlamada = await nuevaLlamada({ capacidad: 'CI', itemId });
-      const [segunda] = await conUsuario(leadId, (tx) => tx`
+      const otraLlamada = await nuevaLlamada({ capacidad: 'CI', anclas: { item_id: itemId } });
+      const [segunda] = await conUsuario(
+        leadId,
+        (tx) => tx`
         insert into propuesta_ai
           (workspace_id, capacidad, destino, item_id, contenido, contenido_original,
            modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
@@ -4459,7 +4566,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // ya» —la pregunta sobre el conjunto que dos transacciones responden a la vez sobre
     // snapshots distintos, y que ningún guard puede cerrar—.
     const admin = sqlAdmin();
-    const llamadaId = await nuevaLlamada({ capacidad: 'C0', retoId });
+    const llamadaId = await nuevaLlamada({ capacidad: 'C0', anclas: { reto_id: retoId } });
     const insertar = (orden: number) =>
       conUsuario(leadId, (tx) => tx`
         insert into propuesta_ai
@@ -4492,7 +4599,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // CI, en cambio, queda fijada al puesto 0 por CHECK: una extracción es un lote de uno,
       // y por eso el índice GENERAL sustituye al parcial sin perder lo que aquél garantizaba.
       const itemCI = await nuevoItem('Item que intenta un puesto que no le toca');
-      const llamadaCI = await nuevaLlamada({ capacidad: 'CI', itemId: itemCI });
+      const llamadaCI = await nuevaLlamada({ capacidad: 'CI', anclas: { item_id: itemCI } });
       await expect(
         conUsuario(leadId, (tx) => tx`
           insert into propuesta_ai
@@ -4520,8 +4627,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item del asiento sin grant');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
     try {
       await expect(
@@ -4554,8 +4660,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item del asiento');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
     try {
       // Un uuid inventado ya no entra.
@@ -4619,8 +4724,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item privado');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
     const [wsX] = await admin`insert into workspace (nombre) values (${marca + '-X'}) returning id`;
     const [ux] = await admin`insert into usuario (email, nombre, estado)
@@ -4645,8 +4749,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Item con cuenta caída');
     const propuestaId = await nuevaPropuesta(leadId, {
       capacidad: 'CI',
-      destino: 'evidencia',
-      itemId,
+      anclas: { item_id: itemId },
     });
     await admin`update usuario set estado = 'inactivo' where id = ${leadId}`;
     try {
@@ -4688,6 +4791,43 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       }
     }
     expect(faltan).toEqual([]);
+  });
+
+  /**
+   * Toda ancla declarada entra en la comprobación de LINAJE de la llamada.
+   *
+   * `propuesta_ai_revision_guard` exige que una propuesta cuelgue de la llamada que la
+   * produjo, y compara el ancla ENUMERANDO columnas. Con una capacidad cuya ancla no está en
+   * esa lista, todas sus filas tienen null en las comparadas y la condición pasa siempre: una
+   * llamada válida de esa capacidad para el objeto A se puede colgar de una propuesta del
+   * objeto B, y la atribución de coste queda corrompida sin que nada chille.
+   *
+   * La comparación se añade por capacidad —cada migración trae la de su ancla, aditiva como
+   * sus CHECK— porque reescribir aquel guard obliga a copiar sus casi doscientas líneas en
+   * cada migración, y la siguiente que las copie sin la línea ajena la revoca en silencio.
+   * Eso es exactamente lo que costó el vocabulario de capacidades, y esto es lo que impide
+   * que vuelva a pasar: se pregunta al catálogo por el texto de TODOS los guards de la tabla
+   * y se exige que cada columna declarada aparezca comparada en alguno.
+   */
+  it('cada columna de ancla se compara contra la llamada en algún guard de propuesta_ai', async () => {
+    const admin = sqlAdmin();
+    const filas = await admin`
+      select pg_get_functiondef(p.oid) as fuente
+      from pg_trigger t
+      join pg_proc p on p.oid = t.tgfoid
+      where t.tgrelid = 'propuesta_ai'::regclass and not t.tgisinternal`;
+    // Que esté mirando algo: sin triggers, todo lo de abajo pasaría sin comprobar nada.
+    expect(filas.length).toBeGreaterThan(0);
+    const fuente = filas.map((f) => (f.fuente as string).replace(/\s+/g, ' ')).join('\n');
+
+    const sinComparar = COLUMNAS_DE_ANCLA.filter(
+      (c) => !fuente.includes(`l.${c} is not distinct from new.${c}`),
+    );
+    expect(
+      sinComparar,
+      'un ancla declarada que ningún guard compara contra la llamada: una llamada de ese ' +
+        'objeto se puede colgar de la propuesta de otro',
+    ).toEqual([]);
   });
 
   /*
@@ -4790,16 +4930,40 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const item = await nuevoItem('Item para medir el motivo de la capacidad');
     await conUsuario(leadId, async (tx) => {
       const proyeccion = proyeccionDelPanel(tx);
-      // Un `p` sintético con las columnas que el CASE mira, y los joins que el panel hace.
+      /*
+       * Un `p` sintético con las columnas que el CASE mira, y los joins que el panel hace.
+       *
+       * Las columnas salen de `COLUMNAS_DE_ANCLA`, no escritas a mano. Estaban escritas —dos
+       * castings fijos, `item_id` y `reto_id`— y este mismo caso lo cobró en cuanto llegó la
+       * tercera: el CASE real empezó a mirar `p.gate_id` y la fila sintética no lo tenía, así
+       * que la prueba reventaba con «column p.gate_id does not exist». Reventar es el buen
+       * desenlace y por eso se arregla generalizando y no añadiendo un tercer casting: la
+       * lista que recorre el panel y la que monta esta fila tienen que ser LA MISMA, o la
+       * próxima ancla vuelve a encontrarse con una fila a la que le falta su columna.
+       */
       const motivoDe = async (
         capacidad: string,
-        i: string | null,
-        r: string | null,
+        anclas: Partial<Record<AnclaCapacidad['columna'], string>>,
+        /* Solo lo que el CASE del panel mira del contenido: los huecos de CT y su id. Se
+         * tipa por lo que ES y no como `unknown` —que `tx.json` no acepta— ni como un
+         * `Record` suelto: lo que esta fila sintética trae tiene que poder leerse igual que
+         * lo que trae la de verdad. */
+        contenido: { huecos?: { checklistItemId: string }[] } = {},
       ): Promise<string | null> => {
+        const columnas = COLUMNAS_DE_ANCLA.map(
+          (c) => tx`${anclas[c] ?? null}::uuid as ${tx(c)}`,
+        ).reduce((a, b) => tx`${a}, ${b}`);
+        /*
+         * `contenido` también viaja en la fila sintética. Lo cobró la misma clase de cambio
+         * que las columnas de ancla: el motivo de CT pasó a mirar los huecos del informe para
+         * saber si un requisito señalado ya se cerró, y esta fila no lo tenía —«column
+         * p.contenido does not exist»—. Lo que el CASE lee, la fila lo trae.
+         */
         const [f] = await tx`
           select case ${proyeccion.motivo} else null end as estado
-          from (select ${capacidad}::text as capacidad, ${i}::uuid as item_id,
-                       ${r}::uuid as reto_id, ${ws}::uuid as workspace_id) p
+          from (select ${capacidad}::text as capacidad, ${columnas},
+                       ${tx.json(contenido)}::jsonb as contenido,
+                       ${ws}::uuid as workspace_id) p
           ${proyeccion.joins}`;
         return (f!.estado as string | null) ?? null;
       };
@@ -4808,19 +4972,50 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // null como 'ancla-ausente', que solo admite rechazar. Antes respondía con el motivo del
       // vecino — primero el del reto por caer en su rama, después el de quien compartiera
       // columna.
-      expect(await motivoDe('C3', null, retoId)).toBeNull();
-      expect(await motivoDe('C3', item, null)).toBeNull();
-      expect(await motivoDe('C4', null, null)).toBeNull();
+      expect(await motivoDe('C3', { reto_id: retoId })).toBeNull();
+      expect(await motivoDe('C3', { item_id: item })).toBeNull();
+      expect(await motivoDe('C4', {})).toBeNull();
+      // Y una capacidad desconocida sobre el ancla NUEVA tampoco hereda la de CT.
+      expect(await motivoDe('C7', { gate_id: gateId })).toBeNull();
 
       // Y cada capacidad responde SOLO con motivos suyos: se comprueban los conjuntos, no un
       // valor concreto, porque lo que se sujeta es que las ramas no se crucen y no en qué
       // estado dejó el fixture a cada fila.
       const DE_CI = ['disponible', 'item-curado', 'consentimiento-revocado'];
       const DE_C0 = ['disponible', 'reto-no-admite', 'registry-firmado', 'criterios-congelados'];
-      expect(DE_CI).toContain(await motivoDe('CI', item, null));
-      expect(DE_C0).toContain(await motivoDe('C0', null, retoId));
+      const DE_CT = ['disponible', 'gate-decidido', 'checklist-avanzado'];
+      expect(DE_CI).toContain(await motivoDe('CI', { item_id: item }));
+      expect(DE_C0).toContain(await motivoDe('C0', { reto_id: retoId }));
+      expect(DE_CT).toContain(await motivoDe('CT', { gate_id: gateId }));
       // El de CI no puede ser NUNCA uno exclusivo de C0 (que es lo que pasaba).
-      expect(DE_C0.slice(1)).not.toContain(await motivoDe('CI', item, null));
+      expect(DE_C0.slice(1)).not.toContain(await motivoDe('CI', { item_id: item }));
+      // Ni el de CT uno de los otros dos: el ancla nueva entró por el mismo sitio por donde
+      // se cruzaban las dos primeras, así que se mide igual.
+      expect([...DE_CI.slice(1), ...DE_C0.slice(1)]).not.toContain(
+        await motivoDe('CT', { gate_id: gateId }),
+      );
+      expect(DE_CT.slice(1)).not.toContain(await motivoDe('C0', { reto_id: retoId }));
+
+      /*
+       * Y el motivo que distingue un informe VIVO de uno que ya no describe el gate: con el
+       * mismo gate pendiente, un informe cuyo hueco señala un requisito CERRADO sale
+       * «checklist-avanzado», y el mismo informe sobre uno pendiente sale «disponible». Es el
+       * par que prueba que mira el contenido y no el gate.
+       */
+      const conRequisitoAbierto = { huecos: [{ checklistItemId: requisitoIds[0]! }] };
+      expect(await motivoDe('CT', { gate_id: gateId }, conRequisitoAbierto)).toBe('disponible');
+      await sqlAdmin()`update checklist_item
+        set estado = 'na', na_justificacion = 'no aplica', na_aprobado_por = ${leadId}
+        where id = ${requisitoIds[0]!} and workspace_id = ${ws}`;
+      try {
+        expect(await motivoDe('CT', { gate_id: gateId }, conRequisitoAbierto)).toBe(
+          'checklist-avanzado',
+        );
+      } finally {
+        await sqlAdmin()`update checklist_item
+          set estado = 'pendiente', na_justificacion = '', na_aprobado_por = null
+          where id = ${requisitoIds[0]!} and workspace_id = ${ws}`;
+      }
     });
   });
 
@@ -4841,5 +5036,335 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // La cola de CI son items: ninguno de sus ids puede ser un reto, y al revés.
     expect(panel.candidatas.C0.lista.some((c) => c.id === item)).toBe(false);
     expect(panel.candidatas.CI.lista.some((c) => c.id === retoId)).toBe(false);
+    // Y la de CT son gates pendientes, que no son ni lo uno ni lo otro.
+    expect(panel.candidatas.CT.lista.some((c) => c.id === gateId)).toBe(true);
+    expect(panel.candidatas.CT.lista.some((c) => c.id === item || c.id === retoId)).toBe(false);
+    expect(panel.candidatas.CI.lista.some((c) => c.id === gateId)).toBe(false);
+    expect(panel.candidatas.C0.lista.some((c) => c.id === gateId)).toBe(false);
+  });
+
+  /**
+   * El camino REAL de CT, de punta a punta: se prepara, se llama y nace el informe.
+   *
+   * Lo que este caso sujeta y ninguno de los otros: que la generación pase por `PREPARAR.CT`
+   * —que lee el gate y su checklist—, que la propuesta nazca colgada de `gate_id` y SIN
+   * destino, y que las citas del informe se midan contra el material que el modelo leyó de
+   * verdad. Eso último es lo que se rompe en silencio si la proyección del panel y la
+   * consulta del prompt dejan de coincidir: las citas empezarían a salir ausentes sin que
+   * nada fallara.
+   */
+  it('CT genera su informe por el camino real: cuelga del gate y nace sin destino', async () => {
+    // En workspace propio: el tope diario de llamadas es POR WORKSPACE, y en el compartido lo
+    // que dejaron los casos anteriores lo agota. Aquí se mide la generación, no el vecindario.
+    await enWorkspaceLimpio('ct-camino-real', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const [proy] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${wsC}, ${retoC}, 'P-CT', 'Proyecto CT', ${curadorId}) returning id`;
+      const [gate] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${wsC}, ${proy!.id as string}, 3, 'sponsor') returning id`;
+      const req = await admin`insert into checklist_item (workspace_id, gate_id, orden, texto)
+      values (${wsC}, ${gate!.id as string}, 1, 'El journey está validado con usuarios reales'),
+             (${wsC}, ${gate!.id as string}, 2, 'El blueprint declara sus puntos de fallo')
+      returning id`;
+      const g = {
+        gateId: gate!.id as string,
+        contenido: CONTENIDO_CT(req[0]!.id as string),
+      };
+      await conProveedor(
+        {
+          ok: true,
+          datos: g.contenido as unknown as Record<string, unknown>,
+          intentos: [intento({ modelo: 'modelo-de-prueba', latenciaMs: 321, uso: null })],
+        },
+        async () => {
+          const lote = await generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'CT',
+            anclaId: g.gateId,
+          });
+          // Sin lote: una llamada de CT produce UN informe, no una lista.
+          expect(lote.generadas).toBe(1);
+        },
+      );
+
+      const [nacida] = await conUsuario(
+        curadorId,
+        (tx) => tx`
+      select p.estado, p.destino, p.gate_id, p.item_id, p.reto_id, p.es_simulacion,
+             l.capacidad as llamada_capacidad, l.gate_id as llamada_gate,
+             l.consentimiento_version
+      from propuesta_ai p
+      join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
+      where p.workspace_id = ${wsC} and p.gate_id = ${g.gateId}`,
+      );
+      expect(nacida!.estado).toBe('propuesta');
+      // Informativa: sin destino y sin ancla en las otras dos columnas.
+      expect(nacida!.destino).toBeNull();
+      expect(nacida!.gate_id).toBe(g.gateId);
+      expect(nacida!.item_id).toBeNull();
+      expect(nacida!.reto_id).toBeNull();
+      expect(nacida!.es_simulacion).toBe(false);
+      // El libro de costos anotó la misma ancla: el gasto por capacidad y por objeto se lee de
+      // ahí, y una llamada sin ancla no diría sobre qué se gastó.
+      expect(nacida!.llamada_gate).toBe(g.gateId);
+      expect(nacida!.llamada_capacidad).toBe('CT');
+      // CT no procesa material de personas, así que no cita ningún consentimiento — y la base
+      // lo exige en las dos direcciones.
+      expect(nacida!.consentimiento_version).toBeNull();
+
+      /*
+       * Y la presencia literal, que es donde se nota si el material del panel y el del prompt
+       * dejaron de ser el mismo texto. La cita del fixture es un fragmento del TEXTO de un
+       * requisito, que viaja en el cuerpo del bloque; si la proyección del panel dejara de
+       * traer el checklist —o lo trajera en otro orden, o filtrado—, esto saldría `false` sin
+       * que ninguna otra prueba lo dijera.
+       */
+      const panel = await panelPropuestas(curadorId, wsC);
+      const informe = panel.pendientes.find((x) => x.capacidad === 'CT');
+      expect(informe, 'el informe de CT no llegó al panel').toBeDefined();
+      expect(informe!.destino).toBeNull();
+      expect(informe!.anclaEstado).toBe('disponible');
+      expect(informe!.citas.every((c) => c.presenteLiteral)).toBe(true);
+
+      await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: informe!.id });
+    });
+  });
+
+  /**
+   * CT no se aprueba, y NO porque la pantalla no pinte el botón (RF-08.4).
+   *
+   * «Carece de acción aprobar» tiene que ser una imposibilidad y no una convención de una
+   * pantalla, porque la server function la puede llamar cualquier cliente. Se comprueba en
+   * los DOS suelos, de fuera adentro:
+   *
+   *  · el servicio corta con un motivo que se puede leer, y
+   *  · la base no admite el estado ni aunque alguien llegue por SQL directo — el CHECK
+   *    `(estado in ('aceptada','corregida')) = (coalesce(evidencia_id, criterio_id) is not null)`
+   *    ya estaba y no hubo que tocarlo: sin destino no hay objeto que enlazar.
+   *
+   * Y se comprueba que la propuesta SIGUE viva después del intento: un corte que dejara la
+   * fila a medio sellar sería peor que no cortar.
+   */
+  it('una propuesta informativa no se acepta: ni por el servicio ni por la base', async () => {
+    const g = await nuevoGate();
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CT',
+      anclas: { gate_id: g.gateId },
+      contenido: g.contenido,
+    });
+    await expect(aceptarPropuesta(leadId, { workspaceId: ws, propuestaId })).rejects.toThrow(
+      /INFORMATIVA/,
+    );
+
+    // Nada se movió: sigue pendiente, sin revisor y sin objeto.
+    const [tras] = await conUsuario(
+      leadId,
+      (tx) => tx`
+      select estado, destino, revisada_por, evidencia_id, criterio_id
+      from propuesta_ai where id = ${propuestaId} and workspace_id = ${ws}`,
+    );
+    expect(tras!.estado).toBe('propuesta');
+    expect(tras!.destino).toBeNull();
+    expect(tras!.revisada_por).toBeNull();
+
+    /*
+     * Y el suelo, medido con la conexión de DUEÑO: es la que se salta RLS y los grants por
+     * columna, así que lo único que le queda delante es el CHECK — que es lo que aquí se
+     * quiere medir. Con la conexión de la aplicación el intento muere antes, en el grant, y
+     * la prueba diría «no tiene permiso» en vez de «ese estado no existe para esta fila».
+     * Las dos cosas son ciertas y hacen falta las dos; ésta es la de más abajo.
+     */
+    await expect(
+      sqlAdmin()`update propuesta_ai
+        set estado = 'aceptada', revisada_por = ${leadId}, revisada_en = now()
+        where id = ${propuestaId} and workspace_id = ${ws}`,
+    ).rejects.toThrow(/check constraint/);
+  });
+
+  /** Lo que SÍ admite: leerla y descartarla. Es la única decisión de su ciclo, y sigue
+   * exigiendo revisor y fecha — descartar un informe es una decisión, no un olvido. */
+  it('una propuesta informativa sí se rechaza, y eso la cierra', async () => {
+    const g = await nuevoGate();
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CT',
+      anclas: { gate_id: g.gateId },
+      contenido: g.contenido,
+    });
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [tras] = await conUsuario(
+      leadId,
+      (tx) => tx`
+      select estado, revisada_por, revisada_en
+      from propuesta_ai where id = ${propuestaId} and workspace_id = ${ws}`,
+    );
+    expect(tras!.estado).toBe('rechazada');
+    expect(tras!.revisada_por).toBe(leadId);
+    expect(tras!.revisada_en).not.toBeNull();
+  });
+
+  /**
+   * La gramática de `destino` en la base, ahora que admite la ausencia.
+   *
+   * Volver una columna anulable vuelve sospechoso todo CHECK que la compare con un literal:
+   * en SQL una comparación con `null` da `null`, y un CHECK que da `null` PASA. Lo que estos
+   * casos sujetan es que el conjunto siga cerrado por los dos lados, y se afirma POR NOMBRE
+   * de restricción: decir solo «falla» dejaría pasar el día en que falle por otra cosa —que
+   * es justo lo que me pasó midiendo esto y por lo que la migración cambió de explicación—.
+   */
+  it('el destino y su ausencia están atados en la base, en las dos direcciones', async () => {
+    /*
+     * Una CI SIN destino. La rechazan DOS restricciones a la vez —`destino_ci` («una CI va a
+     * evidencia») y `destino_informativo` («sin destino, el ancla es la del gate»)— y
+     * Postgres informa de la que evalúa primero, que no es un orden que este repositorio
+     * fije. Así que se afirma el conjunto: cae por una de las dos, no por otra cosa.
+     */
+    const itemId = await nuevoItem('Item para medir el destino ausente');
+    await expect(
+      nuevaPropuesta(leadId, { capacidad: 'CI', anclas: { item_id: itemId }, destino: null }),
+    ).rejects.toThrow(/propuesta_ai_destino_(ci|informativo)/);
+
+    // Y una CT CON destino: su CHECK propio lo prohíbe, así que la ausencia no es un
+    // descuido que se pueda rellenar.
+    const g = await nuevoGate();
+    await expect(
+      nuevaPropuesta(leadId, {
+        capacidad: 'CT',
+        anclas: { gate_id: g.gateId },
+        contenido: g.contenido,
+        destino: 'evidencia',
+      }),
+    ).rejects.toThrow(/propuesta_ai_destino_(ct|informativo)/);
+
+    /*
+     * Y el corte que de verdad sostiene RF-08.4, con la fila que lo pone a prueba: una
+     * propuesta INFORMATIVA sellada como aceptada, con revisor y con un `evidencia_id`.
+     *
+     * Ésa cumple todo lo demás —incluido el CHECK que ata «aceptada» con tener objeto, que
+     * lo cumple porque objeto TIENE—, así que lo único que la para es que el objeto sea de un
+     * destino que no existe. Medido: con el CHECK escrito como `destino = 'evidencia'`, la
+     * tabla la aceptaba. Va por el DUEÑO, que es quien se salta RLS y los grants por columna:
+     * lo que aquí se mide es el suelo, no el permiso.
+     */
+    const sellada = await nuevoGate();
+    const informe = await nuevaPropuesta(leadId, {
+      capacidad: 'CT',
+      anclas: { gate_id: sellada.gateId },
+      contenido: sellada.contenido,
+    });
+    const [ev] = await sqlAdmin()`select id from evidencia where workspace_id = ${ws} limit 1`;
+    expect(ev, 'hace falta una evidencia real: con un id inventado moriría en la FK').toBeDefined();
+    await expect(
+      sqlAdmin()`update propuesta_ai
+        set estado = 'aceptada', revisada_por = ${leadId}, revisada_en = now(),
+            evidencia_id = ${ev!.id as string}
+        where id = ${informe} and workspace_id = ${ws}`,
+    ).rejects.toThrow(/propuesta_ai_objeto_evidencia/);
+  });
+
+  /**
+   * Un hueco señala un requisito DE ESTE GATE, o la propuesta no entra.
+   *
+   * Es el único campo verificable que tiene un hueco: `queFalta` y `comoCerrarlo` son prosa y
+   * no se contrastan contra nada. Un id inventado —o el de otro gate— manda a quien lee el
+   * informe a buscar un requisito que ahí no está, que es peor que no decir nada.
+   *
+   * Lo impone un trigger y no el servicio, por lo mismo que el resto de guards de este
+   * esquema: el camino de la aplicación no es el único.
+   */
+  it('un hueco que señala un requisito ajeno al gate no entra', async () => {
+    // DOS gates con su checklist: el id ajeno existe y es de este workspace, así que lo
+    // único que lo hace ajeno es el gate. Un uuid inventado también fallaría, pero probaría
+    // menos — un `exists` sobre la tabla entera lo habría atrapado igual.
+    const propio = await nuevoGate();
+    const otro = await nuevoGate();
+
+    await expect(
+      nuevaPropuesta(leadId, {
+        capacidad: 'CT',
+        anclas: { gate_id: propio.gateId },
+        contenido: {
+          ...CONTENIDO_CT(propio.requisitos[0]!),
+          huecos: [
+            { checklistItemId: otro.requisitos[0]!, queFalta: 'Algo', comoCerrarlo: 'Algo' },
+          ],
+        },
+      }),
+    ).rejects.toThrow(/no pertenece a este gate/);
+
+    // Y el mismo informe con un requisito PROPIO entra sin más: lo que se rechaza es el
+    // señalamiento ajeno, no la forma del contenido.
+    const buena = await nuevaPropuesta(leadId, {
+      capacidad: 'CT',
+      anclas: { gate_id: propio.gateId },
+      contenido: CONTENIDO_CT(propio.requisitos[1]!),
+    });
+    expect(buena).toMatch(/^[0-9a-f-]{36}$/);
+
+    // Un informe SIN huecos —«no falta nada»— también entra: es el resultado bueno, y el
+    // guard no puede confundir «ningún hueco» con «un hueco sin requisito».
+    const vacia = await nuevaPropuesta(leadId, {
+      capacidad: 'CT',
+      anclas: { gate_id: otro.gateId },
+      contenido: { ...otro.contenido, huecos: [] },
+    });
+    expect(vacia).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  /**
+   * Un hueco SIN `checklistItemId` tampoco entra, y ése es el que se colaba.
+   *
+   * Con `select … into ajeno` a secas, el hueco malformado SÍ lo seleccionaba el `not exists`
+   * —nada casa con `lower(null)`— pero `ajeno` recibía null, así que el `if ajeno is not null`
+   * no disparaba: el trigger admitía exactamente lo que existe para rechazar. El esquema de
+   * Zod lo tapa por el camino de la aplicación; esto es el SUELO, y se prueba por donde el
+   * esquema no pasa, o sea escribiendo el jsonb a mano.
+   */
+  it('un hueco sin checklistItemId no entra: el guard distingue «no hay» de «es null»', async () => {
+    const admin = sqlAdmin();
+    const g = await nuevoGate();
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CT',
+      anclas: { gate_id: g.gateId },
+      contenido: g.contenido,
+    });
+    // Por el DUEÑO y con `update`: la aplicación no puede escribir esto —su esquema lo
+    // rechaza— y lo que se mide es que la base tampoco lo admita.
+    for (const malo of ['{"queFalta":"x","comoCerrarlo":"y"}', '{"checklistItemId":null}']) {
+      await expect(
+        sqlAdmin()`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{huecos}', ${admin.json([JSON.parse(malo)])}::jsonb)
+          where id = ${propuestaId} and workspace_id = ${ws}`,
+      ).rejects.toThrow(/no pertenece a este gate/);
+    }
+  });
+
+  /**
+   * Un gate decidido MIENTRAS la llamada estaba en vuelo no admite el informe que llega.
+   *
+   * `REVALIDAR.CT` lo comprueba antes de despachar, y entre esa transacción y la que
+   * persiste cabe la aprobación. Sin este corte nacía un informe ya obsoleto que además
+   * ocupaba el hueco del gate por el índice parcial: solo se podía marcar como leído.
+   */
+  it('un gate aprobado mientras se generaba no admite el informe', async () => {
+    const admin = sqlAdmin();
+    const g = await nuevoGate();
+    // Un gate no se aprueba con el checklist pendiente —lo impone la base, y es correcto—,
+    // así que sus requisitos se cierran como N/A con su justificación y su aprobador. La
+    // prueba mide el guard del informe, no el del gate.
+    await admin`update checklist_item
+      set estado = 'na', na_justificacion = 'no aplica a esta demo', na_aprobado_por = ${leadId}
+      where gate_id = ${g.gateId} and workspace_id = ${ws}`;
+    await admin`update gate_instancia
+      set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
+      where id = ${g.gateId} and workspace_id = ${ws}`;
+    await expect(
+      nuevaPropuesta(leadId, {
+        capacidad: 'CT',
+        anclas: { gate_id: g.gateId },
+        contenido: g.contenido,
+      }),
+    ).rejects.toThrow(/ya se decidió/);
   });
 });

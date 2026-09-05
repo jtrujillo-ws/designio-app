@@ -2,6 +2,12 @@ import { z } from 'zod';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
 import {
+  MAX_DEFINICION_KPI,
+  MAX_DIMENSIONES_KPI,
+  MAX_FUENTE_KPI,
+  MAX_NOMBRE_KPI,
+} from '@/lib/medicion/medicion.schemas';
+import {
   CONFIANZA_PROPUESTA,
   MAX_REMEDIACIONES,
   type CapacidadActiva,
@@ -332,7 +338,8 @@ export type ContenidoPropuesta =
   | ContenidoCriterio
   | ContenidoAsistenteGate
   | ContenidoInsight
-  | ContenidoRemediacionJourney;
+  | ContenidoRemediacionJourney
+  | ContenidoEntradaKpi;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -354,6 +361,68 @@ export type ContenidoPropuesta =
  * con `default()` tiene un tipo de entrada distinto del de salida — pedirle que coincidan
  * rechazaría justo a los que traen valores por omisión.
  */
+/**
+ * C6 — una entrada del Metric Registry: qué se va a medir para saber si el reto se logró
+ * (SPEC-07 RF-07.1, ADR-0007).
+ *
+ * `criterioId` es el campo que hace de esto una propuesta y no una ocurrencia: cada entrada
+ * responde a UN criterio de éxito REAL del reto, y un KPI que no responde a ninguno es
+ * telemetría, no medición de impacto. El id se copia del material y un guard comprueba
+ * después que sea un criterio de ese reto — la misma verificación que C2 hace con la
+ * evidencia de sus citas.
+ *
+ * Y las CITAS son del texto de ese criterio. Aquí no son adorno ni copia del `criterioId`:
+ * son lo que distingue «este KPI mide la promesa que dice» de «este KPI suena a esa promesa».
+ * El criterio trae KPI, definición, objetivo, ventana y plan de línea base, y el fragmento
+ * citado tiene que aparecer LITERAL en alguno — es la señal de grounding que el panel mide
+ * (I3), y sin ella la única prueba de que el modelo leyó el criterio sería que copió su id.
+ *
+ * LO QUE NO ESTÁ, y no por olvido: el dueño del dato, la línea base, el inicio de la ventana,
+ * el dashboard y la fecha del post mortem. Los tres primeros son COMPROMISOS —una persona del
+ * cliente se obliga a aportar un dato— y los otros son datos que constan o no constan.
+ * Proponerlos es inventarlos, y aceptarlos los firmaría. La entrada nace incompleta a
+ * propósito: `entrada_kpi` admite entradas incompletas porque el registry se redacta
+ * iterando, y la completitud la exige la FIRMA.
+ */
+/*
+ * Los TOPES de los cuatro campos de texto salen del editor del registry, no de aquí.
+ *
+ * Escritos a mano coincidían en dos y eran más anchos en los otros dos, y esa diferencia no
+ * era inofensiva: una entrada materializada con 400 caracteres de `fuente` pasaba este
+ * esquema y después el editor —que hidrata su formulario con esos valores— rechazaba TODA
+ * guarda hasta acortarla. Como el editor es por donde se rellenan el dueño del dato, la línea
+ * base y la ventana, la entrada quedaba bloqueando la firma de su propio contrato.
+ *
+ * Un límite propio solo tendría sentido si dijera algo que el editor no dice; aquí decía lo
+ * mismo con otro número.
+ */
+export const ContenidoEntradaKpiSchema = z
+  .object({
+    /* El criterio de éxito al que responde, POR SU ID: copiado del material, no inventado. */
+    criterioId: IdCopiadoDelMaterial,
+    /*
+     * El nombre es la CLAVE de la entrada dentro del registry (`unique (registry_id, nombre)`),
+     * así que dos propuestas del mismo lote con el mismo nombre no pueden materializarse las
+     * dos. Rechazarlo aquí no está en manos de este esquema —valida una entrada, no el lote—;
+     * lo hace el servicio al comprobar el lote, que es quien las ve juntas.
+     */
+    nombre: z.string().trim().min(1).max(MAX_NOMBRE_KPI),
+    /* Qué mide exactamente y cómo se calcula: sin esto un KPI es un rótulo. */
+    definicion: z.string().trim().min(1).max(MAX_DEFINICION_KPI),
+    /* De dónde sale el dato. Texto, no una URL: el dashboard es otra columna y la pone quien
+     * lo tiene. */
+    fuente: z.string().trim().min(1).max(MAX_FUENTE_KPI),
+    /* Cortes del KPI. Puede venir vacío: no todo indicador se desagrega. */
+    dimensiones: z.string().trim().max(MAX_DIMENSIONES_KPI).default(''),
+    /* El vocabulario es el de la columna, no uno propio: `entrada_kpi.frecuencia` tiene su
+     * CHECK y una lista distinta aquí produciría propuestas que el suelo rechaza. */
+    frecuencia: z.enum(['semanal', 'mensual', 'trimestral', 'unica']),
+    citas: CitasSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoEntradaKpi = z.infer<typeof ContenidoEntradaKpiSchema>;
+
 export const ESQUEMA_DE_CONTENIDO: Record<
   CapacidadActiva,
   z.ZodType<ContenidoPropuesta, z.ZodTypeDef, unknown>
@@ -363,6 +432,7 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   CT: ContenidoAsistenteGateSchema,
   C2: ContenidoInsightSchema,
   C5: ContenidoRemediacionJourneySchema,
+  C6: ContenidoEntradaKpiSchema,
 };
 
 /**
@@ -417,6 +487,18 @@ export const CITAS_DEL_CONTENIDO: Record<
   // C5 las guarda arriba, como las tres primeras: sus remediaciones no son el sujeto de las
   // citas —lo es el grafo entero—, así que no hay nada que anidar.
   C5: (c) => (c as ContenidoRemediacionJourney).citas,
+  /*
+   * C6 cita contra los CRITERIOS del reto, que son varios documentos como la evidencia de
+   * C2 — así que el trozo del material contra el que se mide la presencia literal tiene que
+   * decirse, o el fragmento saldría PRESENTE por estar en el criterio de al lado. Y no hace
+   * falta preguntarlo por cita: la entrada entera responde a UN criterio, así que el suyo es
+   * el de la propuesta. Preguntarlo dos veces abriría la posibilidad de que discreparan.
+   */
+  C6: (c) =>
+    (c as ContenidoEntradaKpi).citas.map((x) => ({
+      ...x,
+      alcanceId: (c as ContenidoEntradaKpi).criterioId,
+    })),
 };
 
 /**
@@ -455,6 +537,33 @@ export const TESTIMONIO_ADICIONAL: Record<
   // C5 no guarda nada aparte de sus citas: sus remediaciones son el consejo, y ése SÍ se
   // corrige —para eso está la revisión humana—.
   C5: null,
+  C6: {
+    parte: (c) => (c as ContenidoEntradaKpi).criterioId,
+    /*
+     * El `criterioId` de C6, y aquí hubo una contradicción mía que conviene dejar escrita
+     * porque la resolución no es obvia.
+     *
+     * Lo puse en `null` razonando que elegir el criterio equivocado es el error que más se
+     * corrige al revisar, y que `editarEntrada` existe justamente porque el dominio ya decidió
+     * que ese campo se repara. Y a la vez `CITAS_DEL_CONTENIDO.C6` deriva de él el `alcanceId`
+     * de cada cita, que la comparación de arriba SÍ compara: las dos reglas decían cosas
+     * opuestas, y la que ganaba —el rechazo— lo hacía por accidente y con el mensaje
+     * equivocado («las citas no se corrigen» sobre una corrección que no las tocaba).
+     *
+     * Gana el blindaje, y no por resolver el empate hacia el lado estricto: `criterioId` es la
+     * mitad CONTRASTABLE de lo que el modelo dijo. Los fragmentos se copiaron de UN criterio,
+     * y reapuntarlos a otro conservándolos es quedarse con el sostén de A para afirmar sobre
+     * B — el mismo «verde prestado» que el pajar por cita existe para impedir. Es exactamente
+     * lo que C2 hace con el `evidenciaId` de sus citas, y por eso esto deja de ser un caso
+     * especial: la parte que se puede contrastar no la reescribe quien revisa.
+     *
+     * Lo de `editarEntrada` sigue siendo cierto y no se pierde: DESPUÉS de aceptar, la entrada
+     * es un objeto de dominio y su criterio se repara mientras el registry sea borrador. Lo
+     * que no se puede es reapuntarla ANTES, cuando lo que se está sellando es el testimonio.
+     */
+    motivo:
+      'El criterio al que responde una entrada KPI no se corrige: los fragmentos citados se copiaron de ESE criterio, y reapuntarlos a otro conservando las citas es quedarse con el sostén de uno para afirmar sobre otro. Rechaza la propuesta, o acéptala y reapunta la entrada después (el registry lo admite mientras sea borrador).',
+  },
 };
 
 /**

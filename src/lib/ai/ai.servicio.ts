@@ -38,10 +38,17 @@ import {
   SISTEMA_REMEDIACION_JOURNEY,
   type ChecklistDelGate,
   materialDeUnaEvidencia,
+  criteriosQueLlegaronAlModelo,
+  materialDeRegistry,
+  materialDeUnCriterio,
+  promptRegistry,
+  SISTEMA_REGISTRY,
+  type CriteriosDelReto,
   type GrafoDelJourney,
 } from './ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
+  MAX_ENTRADAS_KPI_POR_LOTE,
   MAX_INSIGHTS_POR_LOTE,
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
@@ -53,6 +60,7 @@ import {
   type Destino,
   type CapacidadActiva,
   type ContenidoCriterio,
+  type ContenidoEntradaKpi,
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoRemediacionJourney,
@@ -555,6 +563,25 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
            join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
            where a.reto_id = r.id and a.workspace_id = r.workspace_id) y)
       else '[]'::json end as reto_evidencia_nombres`,
+  },
+  registry_id: {
+    // DOS joins, como el gate: el registry y su RETO. El reto no es adorno — el material de
+    // C6 son sus criterios, y el título del panel sale de él porque un uuid de registry no le
+    // dice nada a quien revisa.
+    join: (tx) => tx`left join metric_registry mr
+        on mr.id = p.registry_id and mr.workspace_id = p.workspace_id
+      left join reto rr on rr.id = mr.reto_id and rr.workspace_id = mr.workspace_id`,
+    titulo: (tx) => tx`rr.codigo || ' ' || rr.titulo`,
+    columnas: (tx) => tx`mr.estado as registry_estado,
+      rr.codigo as registry_reto_codigo, rr.titulo as registry_reto_titulo,
+      rr.descripcion as registry_reto_descripcion, rr.estado as registry_reto_estado,
+      (select coalesce(json_agg(json_build_object(
+                'id', c.id, 'kpi', c.kpi, 'definicion', c.definicion,
+                'objetivo', c.objetivo, 'ventanaDias', c.ventana_dias,
+                'lineaBasePlan', c.linea_base_plan)
+                order by c.kpi, c.id), '[]'::json)
+       from criterio_exito c
+       where c.reto_id = rr.id and c.workspace_id = rr.workspace_id) as registry_criterios`,
   },
   gate_id: {
     // DOS joins: el gate y su proyecto. El proyecto no es adorno — es lo que distingue
@@ -1263,6 +1290,138 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
       };
     },
   },
+  C6: {
+    /*
+     * Lo que deja obsoleta una entrada propuesta es que su registry se FIRME —ahí el contrato
+     * de medición se congela y no admite entradas nuevas— o que el trabajo del reto se cierre.
+     * Las dos preguntas están en «registry_admite_entradas», que es la MISMA función que miran
+     * el guard del insert y el guard diferido: escribir aquí el predicado a mano habría dejado
+     * tres redacciones del mismo juicio, y este repositorio ya ha pagado por dos.
+     */
+    estado: (tx) => tx`case
+        when not registry_admite_entradas(p.registry_id, p.workspace_id)
+          then 'registry-cerrado'
+        /*
+         * Y que el criterio al que responde SIGA existiendo. «criterio_exito» no tiene
+         * borrado por la app, pero sí lo tiene el reto entero por cascada de administración,
+         * y —lo que de verdad pasa— el criterio pudo no existir nunca: el contenido lo dice
+         * por id y el suelo lo comprueba al aceptar. Sin esta rama el panel decía disponible
+         * y aceptar fallaba siempre, que es la tarjeta aceptable que no se deja aceptar.
+         *
+         * Por texto y no casteando a uuid, como C2 y CT: el contenido es jsonb y un id que no
+         * parsee reventaría la consulta del panel ENTERO en vez de marcar una fila.
+         */
+        when not exists (
+          select 1 from criterio_exito c
+          where c.id::text = lower(p.contenido ->> 'criterioId')
+            and c.workspace_id = p.workspace_id
+            and c.reto_id = (select mr2.reto_id from metric_registry mr2
+                             where mr2.id = p.registry_id and mr2.workspace_id = p.workspace_id))
+          then 'criterio-ausente'
+        /*
+         * Y que el registry no tenga ya una entrada con ese NOMBRE. «unique (registry_id, nombre)» es el suelo, y sin esta rama la colisión se descubría al aceptar —con un
+         * 23505 traducido— después de que quien revisa hubiera leído la tarjeta entera. Pasa
+         * solo: la entrada se escribe a mano mientras el lote espera, o dos propuestas del
+         * mismo lote traen el mismo nombre y se acepta la primera.
+         */
+        when exists (
+          select 1 from entrada_kpi e
+          where e.registry_id = p.registry_id and e.workspace_id = p.workspace_id
+            and e.nombre = p.contenido ->> 'nombre'
+            and e.id is distinct from p.entrada_kpi_id)
+          then 'nombre-ocupado'
+        else 'disponible'
+      end`,
+    material: (f) =>
+      materialDeRegistry({
+        codigo: (f.registry_reto_codigo as string | null) ?? '',
+        titulo: (f.registry_reto_titulo as string | null) ?? '',
+        descripcion: (f.registry_reto_descripcion as string | null) ?? '',
+        criterios: (f.registry_criterios as CriteriosDelReto | null) ?? [],
+      }).texto,
+    /* La huella se guarda al nacer (el CHECK de la tabla la exige para C6), así que el panel
+     * puede decir si el texto que recompone hoy es el que el modelo leyó. Un criterio editado
+     * o añadido mueve el recorte global igual que una evidencia en C2, y entonces el verde de
+     * la presencia literal mentiría en las dos direcciones. */
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
+    /*
+     * Y la misma comparación, leída como ESTADO: un material que ya no es el que el modelo
+     * leyó no solo hace incomprobables las citas — deja la entrada respondiendo a una promesa
+     * que pudo cambiar de definición, de objetivo o de ventana. `editarCriterio` existe
+     * mientras G0 no los congele, y un registry en borrador se abre antes de G0.
+     *
+     * La señal es GRUESA y conviene decirlo aquí en vez de descubrirlo: la huella es del
+     * material entero, así que un criterio AÑADIDO en el otro extremo del reto también la
+     * mueve, aunque el criterio de esta entrada esté intacto. Se acepta ese lado —de más—
+     * porque el otro es peor: lo que se materializa es un contrato de MEDICIÓN, permanente y
+     * atado a su criterio, y el rechazo sigue abierto (regenerar el lote cuesta una llamada;
+     * un KPI que mide una promesa que ya no existe cuesta la medición entera).
+     *
+     * `=== false` y no `!== true`, como en C5: no saber —sin huella, u otro render del
+     * prompt— no puede volverse una alarma.
+     */
+    estadoDeLaFila: (f) => {
+      const comparable = materialDelPanelEsElDelModelo(f);
+      if (comparable === false) return 'criterios-cambiados';
+      /*
+       * Y «no se sabe» tiene su PROPIO motivo, que no es el de arriba. Decir «los criterios
+       * cambiaron» cuando lo que pasó es que se desplegó otro render del prompt sería
+       * inventarse una alarma —el defecto contra el que nació este `null`—, y la persona que
+       * revisa se pondría a buscar una edición que nadie hizo. La salida es la misma
+       * —rechazar y pedir otro lote—, pero el motivo que se enseña tiene que ser el que
+       * ocurrió.
+       */
+      if (comparable === null) return 'material-no-comparable';
+      return null;
+    },
+    /** El KPI de cada criterio, para que una cita diga a QUÉ promesa responde. */
+    etiquetasDelContenido: (f) =>
+      Object.fromEntries(
+        ((f.registry_criterios as CriteriosDelReto | null) ?? []).map((c) => [c.id, c.kpi]),
+      ),
+    /* Una cita de C6 se mide contra EL CRITERIO QUE LA ENTRADA NOMBRA, no contra todos juntos:
+     * mismo argumento que en C2, con criterios en vez de documentos. Un objetivo copiado del
+     * criterio de al lado saldría presente y el verde le diría a quien revisa que confíe. */
+    pajarDeLaCita: (f, cita) => {
+      if (cita.alcanceId === undefined) return null;
+      const tramo = materialDeUnCriterio(
+        {
+          codigo: (f.registry_reto_codigo as string | null) ?? '',
+          titulo: (f.registry_reto_titulo as string | null) ?? '',
+          descripcion: (f.registry_reto_descripcion as string | null) ?? '',
+          criterios: (f.registry_criterios as CriteriosDelReto | null) ?? [],
+        },
+        cita.alcanceId,
+      );
+      return tramo === '' ? null : tramo;
+    },
+    /*
+     * Registries EN BORRADOR, de retos que siguen admitiendo trabajo, CON criterios y sin
+     * entradas esperando revisión. Lo de los criterios no es comodidad: sin ellos la única
+     * salida que cumple el contrato —una entrada que responde a un criterio por su id— sale
+     * de la nada. Mismo caso que el item con solo su referencia, misma respuesta.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select mr.id, rr.codigo || ' ' || rr.titulo as titulo
+        from metric_registry mr
+        join reto rr on rr.id = mr.reto_id and rr.workspace_id = mr.workspace_id
+        where mr.workspace_id = ${workspaceId}
+          and registry_admite_entradas(mr.id, mr.workspace_id)
+          and exists (select 1 from criterio_exito c
+            where c.reto_id = rr.id and c.workspace_id = rr.workspace_id)
+          and not exists (select 1 from propuesta_ai p
+            where p.registry_id = mr.id and p.workspace_id = mr.workspace_id
+              and p.capacidad = 'C6' and p.estado = 'propuesta')
+          and (${patron}::text is null or rr.codigo || ' ' || rr.titulo ilike ${patron})
+        order by rr.codigo asc, mr.id asc
+        limit ${limite}`;
+      return {
+        lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
+        hayMas: false,
+      };
+    },
+  },
 };
 
 /**
@@ -1703,6 +1862,8 @@ type Alcance = {
   unidades: number;
   /** La huella del material que `PREPARAR` le enseñó al modelo. Ver `Preparacion`. */
   huellaMaterial?: string;
+  /** La huella de lo que el registry ya medía entonces (C6). NO se persiste. Ver `Preparacion`. */
+  huellaEntradas?: string;
   /** Los ids de la evidencia de ese material. Ver `Preparacion`. */
   evidenciaDelMaterial?: string[];
 };
@@ -1748,7 +1909,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const consentimiento = exigeConsentimiento
       ? await leerConsentimientoBajoCandado(tx, entrada)
       : null;
-    const { sistema, prompt, huellaMaterial, evidenciaDelMaterial } =
+    const { sistema, prompt, huellaMaterial, huellaEntradas, evidenciaDelMaterial } =
       await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
       throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
@@ -1844,6 +2005,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       reservaId: reserva!.id as string,
       unidades,
       huellaMaterial,
+      huellaEntradas,
       evidenciaDelMaterial,
     };
   });
@@ -1938,6 +2100,25 @@ async function liberarReserva(
  *  | CI · citas intactas           | no aplica: es la corrección  | sí, contra el original      | guard de revisión            |
  *  | C0 · criterios no congelados  | `criterios-congelados`¹⁶     | sí, al insertar¹¹           | política de `criterio_exito` |
  *  | C0 · reto admite criterios    | `reto-no-admite`             | sí (`materializarCriterio`) | guard de materialización¹⁰   |
+ *  | C6 · registry admite entradas | `registry-cerrado`           | sí (mismo predicado)        | guard de materialización¹⁰   |
+ *  | C6 · material de los criterios| `criterios-cambiados` /      | sí (`materializarEntradaKpi`)| NO LO HAY — ver ¹⁷           |
+ *  |                               | `material-no-comparable`¹⁸   |                             |                              |
+ *
+ * ¹⁷ La única fila de esta tabla sin suelo en la base, y con su motivo: el material es el
+ * TEXTO YA COMPUESTO —la formulación del reto más sus criterios, recortada a `MAX_MATERIAL`—,
+ * así que no hay SQL que lo recalcule para compararlo con la huella. Es el mismo límite que
+ * `COMPROBAR.C5` documenta para sus señales, y se resuelve igual: la comprobación vive donde
+ * se puede calcular. Lo que sí exige es que no viva SOLO en el panel — un aviso de pantalla lo
+ * salta cualquier cliente que hable con la server function—, y por eso está también en el
+ * materializador. Y se compara contra el MISMO render (`prompt_version`), o un despliegue del
+ * prompt bloquearía a la vez todas las propuestas vivas culpando a los criterios.
+ *
+ * ¹⁸ Dos valores y UNA precondición, como la nota ¹⁶ — pero al revés que allí: aquí las dos
+ * salidas son la misma (rechazar y pedir otro lote) y lo que se separa es el HECHO. «Los
+ * criterios cambiaron» es una afirmación; cuando el render del prompt se movió no se sabe si
+ * cambiaron, y decirlo igual mandaría a quien revisa a buscar una edición que nadie hizo. El
+ * desconocimiento se resuelve como NO PERMISO en la aceptación —lo que se firma es un contrato
+ * permanente— y como «no lo sé» en la pantalla, que son cosas distintas y las dos ciertas.
  *
  * ¹⁶ Dos valores, no uno: el congelado tiene dos causas con salidas distintas —el G0, que
  * la reapertura de la etapa 0 revierte, y el registry firmado, que no se revierte— así que
@@ -2101,7 +2282,7 @@ async function comprobarDespacho(
     if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
       versionConsentimiento = await exigirConsentimientoVigente(tx, entrada, 'antes-de-despachar');
     }
-    await REVALIDAR[entrada.capacidad](tx, entrada, alcance.huellaMaterial);
+    await REVALIDAR[entrada.capacidad](tx, entrada, alcance.huellaMaterial, alcance.huellaEntradas);
 
     // El token de despacho: la reserva sigue existiendo y NO ha caducado. Una revocación la
     // retira, y una caducada dejó de contar para admitir a los demás — despachar con ella
@@ -2477,12 +2658,146 @@ async function huellaDelMaterialDeInsights(
   };
 }
 
+/**
+ * El material de C6, leído y resumido en su huella, con los CANDADOS que hacen de eso una
+ * garantía y no una foto. Una sola redacción porque la miran TRES sitios —preparar, revalidar
+ * antes de despachar y comprobar antes de persistir—, que es la lección que su hermano de C2
+ * dejó pagada.
+ *
+ * Los candados, en el orden del sistema y con el registry AÑADIDO al final:
+ *   · `designio:workspace:` en compartido, el que toma el guard de congelación en toda
+ *     escritura y por tanto el primero del par.
+ *   · `designio:reto:` por CLAVE, que es lo que toma `agregarCriterio`: un criterio nuevo es un
+ *     FANTASMA —`for share` bloquea filas que existen, y una fila sin commitear no está en
+ *     ninguna—, y un criterio nuevo cambia el material.
+ *   · `designio:registry:` por clave, que es lo que toma `firmarRegistry`. Va DETRÁS del reto,
+ *     y ese orden es el mismo que toma el guard diferido de la materialización: dos órdenes
+ *     distintos para el mismo par de claves es un abrazo mortal esperando contención, que es
+ *     como se manifestó la última vez en este mismo pipeline.
+ *   · `for share` sobre las dos filas, que ordena las transiciones ya commiteadas.
+ *
+ * `metric_registry.reto_id` es inmutable —1:1 por unique, y sin grant de UPDATE—, así que
+ * leerlo antes de tomar la clave del reto no abre carrera: es el mismo argumento por el que
+ * `reabrirEtapa` lee `proyecto.reto_id` antes de su candado.
+ */
+/**
+ * Exportada para las PRUEBAS, y esa es toda la razón: los fixtures escriben propuestas a mano
+ * y desde que la huella bloquea la aceptación tienen que poder escribir la de verdad. Copiar
+ * la composición en el fixture sería fijar allí el prompt que se está probando; llamar a la
+ * misma función no.
+ */
+export async function huellaDelMaterialDelRegistry(
+  tx: TransactionSql,
+  workspaceId: string,
+  anclaId: string,
+): Promise<{
+  huella: string;
+  registry: {
+    codigo: string;
+    titulo: string;
+    descripcion: string;
+    criterios: CriteriosDelReto;
+  } | null;
+}> {
+  await tx`select pg_advisory_xact_lock_shared(
+    hashtextextended('designio:workspace:' || ${workspaceId}, 42))`;
+  const [dueno] = await tx`select reto_id from metric_registry
+    where id = ${anclaId} and workspace_id = ${workspaceId}`;
+  if (!dueno) return { huella: '', registry: null };
+  const retoId = dueno.reto_id as string;
+  await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+  await tx`select pg_advisory_xact_lock(
+    hashtextextended('designio:registry:' || ${anclaId}, 42))`;
+  await tx`select 1 from reto where id = ${retoId} and workspace_id = ${workspaceId}
+    for share`;
+  await tx`select 1 from metric_registry
+    where id = ${anclaId} and workspace_id = ${workspaceId} for share`;
+  const [fila] = await tx`select
+      registry_admite_entradas(${anclaId}, ${workspaceId}) as admite,
+      r.codigo, r.titulo, r.descripcion
+    from reto r where r.id = ${retoId} and r.workspace_id = ${workspaceId}`;
+  if (!fila || !(fila.admite as boolean)) return { huella: '', registry: null };
+  // Los criterios, con el MISMO orden y las mismas columnas que proyecta el panel: el material
+  // contra el que se mide la presencia literal tiene que ser el que el modelo leyó, y dos
+  // consultas para el mismo conjunto es cómo empiezan las discrepancias.
+  const criterios = await tx`select c.id, c.kpi, c.definicion, c.objetivo,
+      c.ventana_dias, c.linea_base_plan
+    from criterio_exito c
+    where c.reto_id = ${retoId} and c.workspace_id = ${workspaceId}
+    order by c.kpi asc, c.id asc`;
+  const registry = {
+    codigo: fila.codigo as string,
+    titulo: fila.titulo as string,
+    descripcion: fila.descripcion as string,
+    criterios: criterios.map((c) => ({
+      id: c.id as string,
+      kpi: c.kpi as string,
+      definicion: c.definicion as string,
+      objetivo: c.objetivo as string,
+      ventanaDias: c.ventana_dias as number | null,
+      lineaBasePlan: c.linea_base_plan as string,
+    })),
+  };
+  return { huella: huellaDelMaterial(materialDeRegistry(registry).texto), registry };
+}
+
+/**
+ * Lo que el registry mide AHORA, y su huella. Un lector, tres puertas.
+ *
+ * C6 manda dos cosas al modelo y son de naturaleza distinta: el MATERIAL —el reto y sus
+ * criterios, aquello CONTRA lo que se propone y lo que las citas copian— y el estado del
+ * CONTRATO —lo que ya se mide, para no repetirlo—. La huella del material ya se vigilaba; ésta
+ * vigila la otra mitad, y hace falta porque entre `PREPARAR` y el despacho, y entre el despacho
+ * y el guardado, cabe que alguien añada o edite una `entrada_kpi`. El lote nacería sabiendo
+ * otra cosa de lo que ya existe y podría proponer eso mismo con otro nombre — el duplicado
+ * sinónimo, el único que `nombre-ocupado` no detecta.
+ *
+ * Va SEPARADA de `huella_material` y, sobre todo, **no se persiste**, que es lo que la hace
+ * segura. Al aceptar una propuesta de C6 se inserta una entrada, así que las entradas cambian
+ * fila a fila: una huella de entradas guardada y comprobada al aceptar dejaría a la segunda
+ * fila del lote sin poder aceptarse en cuanto se acepta la primera. Viviendo solo en memoria
+ * durante UNA generación, esa comprobación no puede existir al aceptar aunque alguien la
+ * escriba por descuido: no hay dónde leerla.
+ *
+ * Se llama SIEMPRE después de `huellaDelMaterialDelRegistry`, que es quien toma los candados
+ * en el orden del protocolo (workspace → reto → registry).
+ */
+async function huellaDeLasEntradasDelRegistry(
+  tx: TransactionSql,
+  workspaceId: string,
+  registryId: string,
+): Promise<string> {
+  const entradas = await entradasDelRegistry(tx, workspaceId, registryId);
+  // Separador que no puede aparecer dentro de un texto de la base: sin él, «a: b» y «a», «: b»
+  // darían la misma huella y un renombrado se colaría por la juntura.
+  return huellaDelMaterial(
+    entradas.map((e) => `${e.nombre}\u0000${e.definicion}`).join('\u0001'),
+  );
+}
+
+/** Las entradas del registry, con el MISMO orden y las mismas columnas que compusieron el
+ * prompt: dos consultas para el mismo conjunto es cómo empiezan las discrepancias. */
+async function entradasDelRegistry(
+  tx: TransactionSql,
+  workspaceId: string,
+  registryId: string,
+): Promise<{ nombre: string; definicion: string }[]> {
+  const filas = await tx`select nombre, definicion from entrada_kpi
+    where registry_id = ${registryId} and workspace_id = ${workspaceId}
+    order by nombre asc`;
+  return filas.map((e) => ({ nombre: e.nombre as string, definicion: e.definicion as string }));
+}
+
+const MOTIVO_ENTRADAS_MOVIDAS =
+  'Las entradas de ese Metric Registry cambiaron mientras se preparaba la llamada —se añadió una, se editó o se quitó—, así que el lote se armaría sin saber lo que ya se mide y podría proponerlo otra vez con otro nombre';
+
 const REVALIDAR: Record<
   CapacidadActiva,
   (
     tx: TransactionSql,
     entrada: GenerarPropuestas,
     huellaMaterial: string | undefined,
+    huellaEntradas?: string,
   ) => Promise<void>
 > = {
   CI: async (tx, entrada) => {
@@ -2561,6 +2876,40 @@ const REVALIDAR: Record<
       );
     }
   },
+  C6: async (tx, entrada, huellaMaterial, huellaEntradas) => {
+    /*
+     * Tres preguntas, las tres bajo los candados de `huellaDelMaterialDelRegistry`:
+     *
+     * 1. Que el registry SIGA admitiendo entradas. Firmarlo es un acto humano que ocurre
+     *    justo en el rato que va de preparar a despachar —es lo que G6 hace—, y una entrada
+     *    propuesta contra un contrato ya firmado solo se puede tirar, con la llamada pagada.
+     * 2. Que el MATERIAL siga siendo el que se armó, no «que quede algún criterio». Un
+     *    criterio editado o añadido cambia el texto que el prompt YA LLEVA DENTRO, y la
+     *    pregunta por el conjunto entero es la que corresponde a lo que se va a mandar.
+     * 3. Y que las ENTRADAS del registry sigan siendo las que el prompt nombra. Es la otra
+     *    mitad de lo que se manda —el estado del contrato, para no repetirlo— y caduca igual:
+     *    una entrada añadida en este rato deja al lote proponiéndola otra vez con otro nombre.
+     */
+    const { huella, registry } = await huellaDelMaterialDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
+    if (!registry) {
+      throw new ErrorAI(
+        'Ese Metric Registry dejó de admitir entradas mientras se preparaba la llamada —se firmó, o el trabajo de su reto se cerró—: no se llamó al proveedor',
+      );
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'Los criterios de ese reto cambiaron mientras se preparaba la llamada —se añadió uno, o se editó—, así que el material ya no es el que se iba a mandar: no se llamó al proveedor. Vuelve a pedirlo.',
+      );
+    }
+    const entradasAhora = await huellaDeLasEntradasDelRegistry(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (entradasAhora !== (huellaEntradas ?? '')) {
+      throw new ErrorAI(`${MOTIVO_ENTRADAS_MOVIDAS}: no se llamó al proveedor. Vuelve a pedirlo.`);
+    }
+  },
   C5: async (tx, entrada, huellaMaterial) => {
     /*
      * Lo que puede haber pasado mientras se preparaba la llamada es que ALGUIEN CIERRE las
@@ -2632,6 +2981,16 @@ type Preparacion = {
    * revocó sea justo una de las que ya están dentro del prompt construido.
    */
   huellaMaterial?: string;
+  /**
+   * Y la huella de lo que el registry YA MEDÍA cuando se armó el prompt (solo C6).
+   *
+   * Sale aparte de `huellaMaterial` porque es otra pregunta: aquélla vigila el material contra
+   * el que se propone, ésta el estado del contrato que el prompt lleva para no repetirse. Y
+   * viaja SOLO por aquí —nunca a `propuesta_ai`—, que es lo que impide que llegue a la
+   * aceptación: aceptar una fila del lote crea una entrada, así que comprobar esto al aceptar
+   * dejaría a las demás filas sin poder aceptarse. Ver `huellaDeLasEntradasDelRegistry`.
+   */
+  huellaEntradas?: string;
   /**
    * Los ids de la evidencia que compuso ese material, para las capacidades que la tienen.
    *
@@ -2846,6 +3205,109 @@ const PREPARAR: Record<
       evidenciaDelMaterial: llegado.ids,
     };
   },
+  C6: async (tx, entrada) => {
+    // El MISMO lector que la revalidación, no una consulta paralela: el material que se manda
+    // y el que se vuelve a mirar antes de despachar tienen que salir de la misma lectura, o la
+    // huella compara dos textos que nadie compuso igual.
+    const { registry } = await huellaDelMaterialDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
+    if (!registry) {
+      throw new ErrorAI(
+        'Ese Metric Registry no existe aquí, ya está firmado, o el trabajo de su reto se cerró: no admite entradas nuevas',
+      );
+    }
+    /*
+     * Sin criterios no se llama. El contrato de C6 obliga a que cada entrada responda a un
+     * criterio del material POR SU ID, y sin criterios la única salida que lo cumple es un id
+     * inventado. Es el mismo caso que el item importado solo con su referencia y que el reto
+     * sin evidencia de C2, y la respuesta es la misma: no ofrecerlo y decir dónde se arregla.
+     */
+    if (registry.criterios.length === 0) {
+      throw new ErrorAI(
+        'Ese reto no tiene criterios de éxito: no hay ninguna promesa a la que un KPI pueda responder. Los criterios se definen en la etapa 0 y los congela el G0 (SYS-22) — defínelos y vuelve a pedirlo.',
+      );
+    }
+    /*
+     * Y «tener criterios» no es lo mismo que «que llegue alguno». El cuerpo es la
+     * concatenación de la formulación del reto y de todos los criterios, y se recorta ENTERO a
+     * `MAX_MATERIAL`: con una descripción larga por delante, la cola se queda fuera —el
+     * criterio donde cae el corte, a medias; los siguientes, del todo—. Si NINGUNO llega
+     * completo, la única salida que cumple el contrato —una entrada que responde a un criterio
+     * por su id, citando un fragmento literal suyo— sale de un criterio que el modelo no vio
+     * entero: o sea inventada, con aspecto de fundamentada y pagada.
+     *
+     * Es la misma regla que niega CI sobre un item sin material y C2 sobre un reto sin
+     * evidencia citable, con el recorte como causa en vez de la ausencia. Y el mensaje dice
+     * qué hacer, que es lo único que puede hacer quien lo lee.
+     */
+    const llegados = criteriosQueLlegaronAlModelo(registry);
+    if (llegados.ids.length === 0) {
+      throw new ErrorAI(
+        `Ninguno de los ${registry.criterios.length} criterios de ese reto cabe entero en el material (el techo son ${MAX_MATERIAL} caracteres, y la formulación del reto va delante): no se llamó al proveedor, porque cualquier entrada saldría de un criterio que el modelo no habría visto completo. Acorta la descripción del reto o la definición de sus criterios y vuelve a pedirlo.`,
+      );
+    }
+    /*
+     * Y lo que el registry YA mide. Se lee AQUÍ y no dentro de `huellaDelMaterialDelRegistry`,
+     * y esa separación es toda la decisión de esta ronda: ese lector compone el MATERIAL —lo
+     * que las citas copian, lo que la huella vigila y lo que el recorte mide—, y las entradas
+     * existentes no son eso. Son el estado del contrato, contexto para no repetirse.
+     *
+     * Metidas en el material moverían la huella cada vez que se acepta una entrada, y como C6
+     * es un LOTE que se revisa fila a fila, aceptar la primera dejaría a las demás sin poder
+     * aceptarse: la comprobación de la ronda 3 —que el material no se movió— volviéndose
+     * contra su propio caso de uso. Van, por eso, en un bloque aparte del prompt y fuera de la
+     * huella.
+     *
+     * Bajo los candados que `huellaDelMaterialDelRegistry` acaba de tomar (workspace → reto →
+     * registry, y las filas en `for share`): esta lectura va DESPUÉS, que es el orden del
+     * protocolo, y ve el registry que el resto de la preparación vio.
+     */
+    const entradas = await entradasDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
+    const prompt = promptRegistry({
+      ...registry,
+      entradas,
+      cuantas: MAX_ENTRADAS_KPI_POR_LOTE,
+    });
+    /*
+     * Y el suelo del bloque de entradas: si ni los NOMBRES de lo que ya se mide caben en el
+     * material, ese bloque no puede hacer su trabajo. El modelo no vería parte del contrato y
+     * cualquier lote podría repetirla con otro nombre —el duplicado sinónimo, que es justo lo
+     * que el panel no detecta— con la llamada ya pagada.
+     *
+     * Es el mismo modo de fallo que la negativa de arriba, con el recorte como causa en vez de
+     * la ausencia, y la misma respuesta: no ofrecerlo y decir dónde se arregla. La diferencia
+     * es que aquí NO se niega por que se recorte una definición: el nombre es la identidad de
+     * la entrada y llega entero; la definición es la ayuda para reconocer un sinónimo, y perder
+     * ayuda degrada la propuesta mientras que perder una entrada la ciega. Ese reparto lo hace
+     * `bloqueDeEntradas`; aquí solo se lee su veredicto.
+     */
+    if (!prompt.nombresDeEntradasCompletos) {
+      throw new ErrorAI(
+        `Ese Metric Registry ya tiene ${entradas.length} entradas y ni sus nombres caben en el material (el techo son ${MAX_MATERIAL} caracteres): no se llamó al proveedor, porque el modelo no vería parte de lo que ya se mide y el lote podría repetirla con otro nombre. Un registry de ese tamaño se completa a mano.`,
+      );
+    }
+    return {
+      sistema: SISTEMA_REGISTRY,
+      prompt,
+      /*
+       * La huella de ESTE material, para volver a mirarla justo antes de despachar. Entre esta
+       * transacción y aquella hay un commit, y lo que puede pasar en medio no es solo que el
+       * registry se firme: que a UNO de los criterios que el prompt ya lleva dentro lo editen,
+       * y el bloque está armado y saldría igual hacia el proveedor.
+       */
+      huellaMaterial: huellaDelMaterial(materialDeRegistry(registry).texto),
+      /*
+       * Y la huella de lo que el registry medía en este instante, para las dos puertas que
+       * quedan antes de que el lote exista: antes de despachar y antes de guardar. NO se
+       * persiste —ver `huellaDeLasEntradasDelRegistry`—, porque al aceptar una fila del lote
+       * las entradas cambian por definición y comprobarla allí tumbaría a las demás.
+       */
+      huellaEntradas: await huellaDeLasEntradasDelRegistry(
+        tx,
+        entrada.workspaceId,
+        entrada.anclaId,
+      ),
+    };
+  },
   C5: async (tx, entrada) => {
     // El MISMO lector que usa la pantalla del journey, no una consulta paralela: lo que se
     // le enseña al modelo y lo que la validación evalúa tienen que salir de la misma
@@ -2948,6 +3410,7 @@ const COMPROBAR: Record<
     entrada: GenerarPropuestas,
     contenidos: ContenidoPropuesta[],
     huellaMaterial: string | undefined,
+    huellaEntradas?: string,
   ) => Promise<void>
 > = {
   // El contenido de CI se sujeta entero con su esquema y con los CHECK de `evidencia`: no hay
@@ -2991,6 +3454,77 @@ const COMPROBAR: Record<
     if (huella !== (huellaMaterial ?? '')) {
       throw new ErrorAI(
         'La evidencia de ese reto cambió mientras el proveedor respondía —se enlazó, se desenlazó, se revocaron derechos o se editó—, así que estos insights se armaron sin verla: la propuesta no se guarda. Vuelve a pedirla.',
+      );
+    }
+  },
+  /*
+   * C6, por lo mismo que C2 y con su material: la llamada al proveedor ocurre fuera de toda
+   * transacción y el candado previo al despacho se suelta al commitear el apunte. En ese hueco
+   * caben las dos cosas que invalidan estas entradas —firmar el registry, y añadir o editar un
+   * criterio—, y las dos dejan una propuesta que solo se puede tirar después de que alguien la
+   * haya leído entera.
+   *
+   * Y una tercera que es de C6 y de nadie más: el NOMBRE es la clave de la entrada dentro del
+   * registry (`unique (registry_id, nombre)`), así que un lote con dos entradas homónimas trae
+   * una que no se va a poder materializar nunca. Se descarta el lote entero al persistir en vez
+   * de dejar que lo descubra quien acepta la segunda: media respuesta no es revisable, y el
+   * suelo no puede decir cuál de las dos sobra.
+   */
+  C6: async (tx, entrada, contenidos, huellaMaterial, huellaEntradas) => {
+    const { huella, registry } = await huellaDelMaterialDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
+    if (!registry) {
+      throw new ErrorAI(
+        'Ese Metric Registry dejó de admitir entradas mientras el proveedor respondía —se firmó, o el trabajo de su reto se cerró—: la propuesta no se guarda',
+      );
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'Los criterios de ese reto cambiaron mientras el proveedor respondía —se añadió uno, o se editó—, así que estas entradas se armaron sin verlos: la propuesta no se guarda. Vuelve a pedirla.',
+      );
+    }
+    // Y lo mismo con lo que el registry ya medía, por la misma razón que antes del despacho:
+    // el rato que dura la llamada también cabe. Se descarta el lote ENTERO y no las filas que
+    // choquen, como con los nombres repetidos de abajo: media respuesta no es revisable, y
+    // cuál de ellas repite a la entrada nueva no lo puede decidir esta función.
+    const entradasAhora = await huellaDeLasEntradasDelRegistry(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (entradasAhora !== (huellaEntradas ?? '')) {
+      throw new ErrorAI(
+        `${MOTIVO_ENTRADAS_MOVIDAS}: la propuesta no se guarda. Vuelve a pedirla.`,
+      );
+    }
+    const nombres = (contenidos as ContenidoEntradaKpi[]).map((c) => c.nombre);
+    if (new Set(nombres).size !== nombres.length) {
+      throw new ErrorContratoAI(
+        'El lote trae dos entradas con el mismo nombre, y el registry no admite nombres repetidos: se descarta entero. Vuelve a pedirlo.',
+      );
+    }
+    /*
+     * Y cada entrada responde a un criterio que el modelo VIO ENTERO, que no es lo mismo que
+     * uno que exista. La huella de arriba dice que el material no cambió; esto dice otra cosa:
+     * que lo que la respuesta señala estaba DENTRO de lo que se mandó. Un `criterioId` de un
+     * criterio recortado a medias —o del todo— pasa el suelo de la base, porque ahí lo que se
+     * comprueba es que el criterio sea del reto del registry, y eso sigue siendo cierto.
+     *
+     * Lo que no es cierto es que el KPI mida esa promesa: de ese criterio el modelo pudo no
+     * ver el objetivo, o la ventana, o nada. Y sus citas saldrían AUSENTES en el panel contra
+     * un tramo vacío, que es la señal correcta pero llega tarde — con la llamada pagada y la
+     * propuesta en la bandeja de alguien.
+     *
+     * Vive AQUÍ y no en la base por lo mismo que las señales de C5: «qué llegó entero» es una
+     * función del recorte del texto, no una tabla, y no hay SQL que lo recalcule. Se descarta
+     * el lote entero, como C5: media respuesta no es revisable.
+     */
+    const visibles = new Set(criteriosQueLlegaronAlModelo(registry).ids);
+    const fuera = (contenidos as ContenidoEntradaKpi[])
+      .map((c) => c.criterioId)
+      .filter((id) => !visibles.has(id));
+    if (fuera.length > 0) {
+      throw new ErrorContratoAI(
+        `El lote responde a ${fuera.length} criterio(s) que no llegaron enteros al material —el recorte los dejó a medias o fuera—, así que esas entradas no pudieron leer la promesa que dicen medir: se descarta entero. Acorta la descripción del reto o la definición de sus criterios y vuelve a pedirlo.`,
       );
     }
   },
@@ -3175,7 +3709,7 @@ export async function generarPropuestas(
      */
     try {
       await conUsuario(actorId, (tx) =>
-        COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial),
+        COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial, alcance.huellaEntradas),
       );
     } catch (e) {
       if (!(e instanceof ErrorAI)) throw e;
@@ -3240,7 +3774,7 @@ async function persistirPropuestas(
      * se escribe. Va delante del candado del presupuesto porque no lo necesita y porque
      * fallar aquí no debe tener a nadie esperando.
      */
-    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial);
+    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial, alcance.huellaEntradas);
     await bloquearPresupuesto(tx, entrada.workspaceId);
 
     // Retirar la reserva ya no «devuelve» presupuesto: desde que el tope cuenta llamadas
@@ -3591,6 +4125,16 @@ type PropuestaEnRevision = {
   contenidoOriginal: ContenidoPropuesta;
   modelo: string;
   promptVersion: string;
+  /**
+   * La huella del material con el que se compuso el prompt, para volver a preguntarla al
+   * materializar.
+   *
+   * `string | null` porque el CHECK solo la exige a las capacidades que la declaran; para
+   * las que no, nadie la lee. Quien la compara tiene que decir además contra qué versión de
+   * prompt: la huella es del TEXTO RENDERIZADO, así que un despliegue que cambie el render la
+   * mueve sin que nadie haya tocado el material.
+   */
+  huellaMaterial: string | null;
 };
 
 async function leerParaRevisar(
@@ -3604,7 +4148,7 @@ async function leerParaRevisar(
     (a, b) => tx`${a}, ${b}`,
   );
   const [p] = await tx`select capacidad, destino, ${columnasDeAncla}, contenido,
-      contenido_original, modelo, prompt_version, estado
+      contenido_original, modelo, prompt_version, huella_material, estado
     from propuesta_ai where id = ${propuestaId} and workspace_id = ${workspaceId}`;
   if (!p) throw new ErrorAI('La propuesta no existe en este workspace');
   if ((p.estado as string) !== 'propuesta') {
@@ -3630,6 +4174,7 @@ async function leerParaRevisar(
     contenidoOriginal: p.contenido_original as ContenidoPropuesta,
     modelo: p.modelo as string,
     promptVersion: p.prompt_version as string,
+    huellaMaterial: (p.huella_material ?? null) as string | null,
   };
 }
 
@@ -3790,6 +4335,14 @@ async function aceptarPropuestaEnTransaccion(
         materializarCriterio(tx, actorId, entrada.workspaceId, p, contenido as ContenidoCriterio),
       insight: () =>
         materializarInsight(tx, actorId, entrada.workspaceId, p, contenido as ContenidoInsight),
+      'entrada-kpi': () =>
+        materializarEntradaKpi(
+          tx,
+          actorId,
+          entrada.workspaceId,
+          p,
+          contenido as ContenidoEntradaKpi,
+        ),
     };
     const objetoId = await MATERIALIZAR[p.destino]();
 
@@ -4035,6 +4588,116 @@ async function materializarInsight(
               ${actorId})`;
   }
   return insightId;
+}
+
+/**
+ * Materializa una entrada del Metric Registry: UNA fila, y solo los seis campos que la
+ * propuesta dicta.
+ *
+ * El resto de columnas nace vacío A PROPÓSITO —el dueño del dato, la línea base, el inicio de
+ * la ventana, el dashboard y la fecha del post mortem—, y eso no deja la entrada rota: la
+ * tabla admite entradas incompletas porque el registry se redacta iterando, y la completitud
+ * la exige la FIRMA. Lo que sí quedaría roto es lo contrario: rellenar un compromiso que nadie
+ * adquirió y que aceptar la propuesta firmaría.
+ *
+ * `creado_en` no se escribe, y esa ausencia es una prueba, no un descuido: la pone la base, no
+ * está en el grant de columnas, y el guard diferido exige `creado_en = now()` para distinguir
+ * «nació en esta aceptación» de «alguien la actualizó aquí» —que es lo que `xmin` solo no
+ * distingue—.
+ */
+async function materializarEntradaKpi(
+  tx: TransactionSql,
+  actorId: string,
+  workspaceId: string,
+  p: PropuestaEnRevision,
+  c: ContenidoEntradaKpi,
+): Promise<string> {
+  /*
+   * Las dos preguntas que caducan entre generar y aceptar, por la MISMA función que las hace
+   * antes de llamar al proveedor — y con ella los candados en el orden del protocolo
+   * (workspace compartido → clave del reto → clave del registry → filas). Escrito aquí a mano
+   * eran el candado del registry PRIMERO y el del reto después, que es el par invertido que
+   * este fichero ya pagó una vez en forma de abrazo mortal.
+   *
+   * 1. Que el registry SIGA admitiendo entradas. El guard diferido lo vuelve a preguntar en el
+   *    commit —ése es el suelo—; esto es para que el motivo llegue con nombre a quien revisa.
+   * 2. Que el MATERIAL siga siendo el que el modelo leyó. Ésta no la puede hacer la base: el
+   *    texto se compone en TypeScript, con su recorte, así que no hay SQL que lo recalcule —el
+   *    mismo motivo por el que la comprobación de C5 vive donde se puede calcular—. Aquí es
+   *    donde tiene suelo, y por eso no basta con pintarlo en el panel: cualquier cliente que
+   *    hable con la server function se saltaría un aviso que solo viva en la pantalla.
+   */
+  const { huella, registry } = await huellaDelMaterialDelRegistry(tx, workspaceId, p.anclaId);
+  if (!registry) {
+    throw new ErrorAI(
+      'Ese Metric Registry ya no admite entradas: o se firmó —y firmarlo congela el contrato—, o el trabajo de su reto se cerró. Esta propuesta quedó obsoleta y solo puede rechazarse',
+    );
+  }
+  /*
+   * La comparación es CONTRA EL MISMO RENDER, y cuando no lo es se rechaza igual.
+   *
+   * La huella es del texto ya compuesto, así que un despliegue que cambie el prompt la mueve
+   * sin que nadie haya tocado un criterio: compararla entre versiones distintas culparía a los
+   * criterios de un cambio del renderizador. Pero saltarse la comprobación tampoco vale, y ahí
+   * estuvo mi error de la ronda anterior: una propuesta que sobrevive a un despliegue quedaba
+   * sin NINGUNA comprobación del material, y a partir de ahí editar el criterio y aceptar
+   * volvía a materializar un KPI contra otra promesa.
+   *
+   * El mismo desconocimiento se resuelve de tres formas distintas, y las tres están escritas
+   * donde toca: en la presencia literal no puede volverse un veredicto, en el estado de la fila
+   * de C5 no puede volverse una alarma —C5 no materializa nada—, y aquí NO PUEDE VOLVERSE UN
+   * PERMISO, porque lo que se firma es un contrato de medición permanente y atado a su
+   * criterio.
+   *
+   * Lo que esto cuesta, dicho para que nadie lo descubra: un despliegue del prompt deja sin
+   * poder aceptarse toda propuesta de C6 viva, y hay que rechazarlas y pedir otro lote. Se
+   * paga porque la alternativa es firmar sin poder comprobar. Lo que lo evitaría de verdad es
+   * guardar una huella de los DATOS del material además de la del render —independiente del
+   * prompt—, y eso es una columna nueva: queda dicho aquí para quien lo retome.
+   */
+  if (p.promptVersion !== PROMPT_VERSION || p.huellaMaterial === null) {
+    throw new ErrorAI(
+      'No se puede comprobar que los criterios sigan siendo los que el modelo leyó: esta propuesta se generó con otra versión del prompt, así que su huella del material no es comparable con la de ahora. Recházala y pide un lote nuevo',
+    );
+  }
+  if (huella !== p.huellaMaterial) {
+    throw new ErrorAI(
+      'Los criterios de éxito de ese reto cambiaron después de que el modelo los leyera: esta entrada se escribió contra una definición, un objetivo o una ventana que ya no son los vigentes, así que no se puede aceptar. Recházala y pide un lote nuevo',
+    );
+  }
+  try {
+    const [entrada] = await tx`insert into entrada_kpi
+      (workspace_id, registry_id, criterio_id, nombre, definicion, fuente, dimensiones,
+       propietario_miembro_id, frecuencia, dashboard_url, linea_base_valor, linea_base_fecha,
+       ventana_inicio, fecha_post_mortem, creado_por)
+      values (${workspaceId}, ${p.anclaId}, ${c.criterioId}, ${c.nombre}, ${c.definicion},
+              ${c.fuente}, ${c.dimensiones}, null, ${c.frecuencia}, '', null, null, null, null,
+              ${actorId})
+      returning id`;
+    return entrada!.id as string;
+  } catch (e) {
+    const err = e as { code?: string; message?: string };
+    // Cada causa con su salida, como en `materializarCriterio`: el nombre ocupado se arregla
+    // corrigiendo la propuesta y el criterio ajeno reapuntándola, mientras que el registry
+    // firmado no se arregla — solo se rechaza.
+    if (err.code === '23505') {
+      throw new ErrorAI(
+        'Ya hay una entrada con ese nombre en el registry: corrige el nombre de la propuesta antes de aceptarla',
+      );
+    }
+    if (err.code === '23503') {
+      throw new ErrorAI(
+        'El criterio al que responde esta entrada ya no existe en este workspace: la propuesta quedó obsoleta y solo puede rechazarse',
+      );
+    }
+    if (err.code === '42501') {
+      throw new ErrorAI(
+        'El registry está firmado, o el criterio al que responde esta entrada no es de su reto: la propuesta no se puede materializar',
+      );
+    }
+    if (err.code === 'P0001' && err.message) throw new ErrorAI(err.message);
+    throw e;
+  }
 }
 
 async function materializarCriterio(

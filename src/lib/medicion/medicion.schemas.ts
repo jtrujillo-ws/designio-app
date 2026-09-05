@@ -131,12 +131,35 @@ export const SeguimientoInputSchema = z.object({
 
 /** Campos de la entrada KPI (RF-07.1). Se aceptan INCOMPLETOS mientras el registry es
  * borrador: la completitud la exige la firma (SYS-22), igual que G0 con los criterios. */
+/**
+ * Los topes de los campos de TEXTO de una entrada KPI, con nombre porque los mira algo más
+ * que este formulario.
+ *
+ * C6 propone cuatro de ellos y su esquema de contenido tenía los suyos, escritos a mano y más
+ * anchos en dos: una entrada materializada con 400 caracteres de `fuente` pasaba el pipeline
+ * de la AI y después el EDITOR del registry —que hidrata su formulario con esos valores— se
+ * negaba a guardar hasta acortarla. Y ese editor es por donde se rellenan el dueño del dato,
+ * la línea base y la ventana, o sea justo lo que hace falta para FIRMAR: la entrada quedaba
+ * bloqueando su propio contrato hasta que alguien adivinara qué campo sobraba.
+ *
+ * Exportados y no repetidos, que es la diferencia: un número copiado a mano deja de coincidir
+ * el día que alguien mueve el original, y no se entera nadie.
+ */
+export const MAX_NOMBRE_KPI = 200;
+export const MAX_DEFINICION_KPI = 2000;
+export const MAX_FUENTE_KPI = 300;
+export const MAX_DIMENSIONES_KPI = 300;
+
 export const CamposEntradaSchema = z.object({
   workspaceId: z.string().uuid(),
-  nombre: z.string().trim().min(1, 'El nombre del KPI es obligatorio').max(200),
-  definicion: z.string().trim().max(2000).default(''),
-  fuente: z.string().trim().max(300).default(''),
-  dimensiones: z.string().trim().max(300).default(''),
+  nombre: z
+    .string()
+    .trim()
+    .min(1, 'El nombre del KPI es obligatorio')
+    .max(MAX_NOMBRE_KPI),
+  definicion: z.string().trim().max(MAX_DEFINICION_KPI).default(''),
+  fuente: z.string().trim().max(MAX_FUENTE_KPI).default(''),
+  dimensiones: z.string().trim().max(MAX_DIMENSIONES_KPI).default(''),
   propietarioMiembroId: z.string().uuid().nullable().default(null),
   frecuencia: z.enum(FRECUENCIAS),
   dashboardUrl: z

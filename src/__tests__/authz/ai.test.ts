@@ -7557,6 +7557,81 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y la contradicción repetida, por lo mismo y con el mismo agujero.
+   *
+   * El `unique (insight_id, evidencia_id)` de `contradiccion` NO lo cierra, y esa era la
+   * suposición que el propio comentario del guard dejaba escrita: las dos filas materializadas
+   * pueden ser de evidencias DISTINTAS —la revisada y una colada—, así que el índice ni se
+   * entera. Lo que falla es lo de siempre: con la misma contradicción propuesta dos veces, el
+   * recuento cuadra y las dos entradas repetidas encuentran la misma fila. Medido:
+   * `entra = ENTRÓ`, `sella = SELLÓ`, con una contradicción que nadie propuso dentro del
+   * insight aceptado — y las contradicciones son justo la parte que más tienta manipular,
+   * porque son la evidencia que va en contra.
+   *
+   * Se corta por `evidenciaId`, que es la clave que ya usan el índice y el contrato: dos
+   * contradicciones sobre el mismo documento no son dos, son una escrita dos veces.
+   */
+  it('una contradicción repetida no entra tampoco por la superficie SQL', async () => {
+    await enWorkspaceLimpio('c2-contradiccion-repetida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const a = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const b = await evidenciaDelReto(wsC, retoC, curadorId, { titulo: 'B', resumen: 'Contra.' });
+      const c = await evidenciaDelReto(wsC, retoC, curadorId, { titulo: 'C', resumen: 'Otra.' });
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const conContradicciones = (contradicciones: unknown[]) => ({
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId: a, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones,
+        confianzaPropuesta: 'media',
+      });
+      const escribir = (contenido: unknown) =>
+        conUsuario(curadorId, (tx) => tx`
+          insert into propuesta_ai
+            (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             llamada_id, creado_por)
+          values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
+                  ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                  'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})
+          returning id`);
+
+      await expect(
+        escribir(
+          conContradicciones([
+            { evidenciaId: b, descripcion: 'Va en contra' },
+            { evidenciaId: b, descripcion: 'Va en contra' },
+          ]),
+        ),
+        'la superficie SQL admite un recuento de contradicciones que ya no significa nada',
+      ).rejects.toThrow(/repite una contradicción/);
+
+      // Y dos contradicciones sobre documentos DISTINTOS sí entran: lo que se corta es la
+      // repetición, no la pluralidad.
+      await expect(
+        escribir(
+          conContradicciones([
+            { evidenciaId: b, descripcion: 'Va en contra' },
+            { evidenciaId: c, descripcion: 'Y esta también' },
+          ]),
+        ),
+      ).resolves.toBeDefined();
+    });
+  });
+
+  /**
    * La cita repetida también la corta la BASE, no solo el contrato.
    *
    * `ContenidoInsightSchema` ya la rechaza, y eso cubre el camino de la aplicación. La

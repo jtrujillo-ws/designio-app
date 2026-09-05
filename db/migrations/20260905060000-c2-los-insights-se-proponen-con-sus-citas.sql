@@ -760,8 +760,11 @@ begin
   -- procedencia rompe la garantía por el sitio en que más importa.
   --
   -- Se comprueba en los dos sentidos: que no falte ninguna de las propuestas y que no sobre
-  -- ninguna. `contradiccion` tiene único (insight_id, evidencia_id), así que el recuento basta
-  -- para el segundo sentido.
+  -- ninguna. Para el segundo basta el RECUENTO, pero solo porque el guard del INSERT ya rechaza
+  -- la contradicción repetida: con repetidas, el recuento cuadra y las dos entradas iguales
+  -- encuentran la misma fila, de modo que otra distinta entra sin revisar. El
+  -- `unique (insight_id, evidencia_id)` no lo cierra, porque las dos filas materializadas
+  -- pueden ser de evidencias distintas.
   if new.destino = 'insight' and (
     (select count(*) from contradiccion co
       where co.insight_id = new.insight_id and co.workspace_id = new.workspace_id)
@@ -1045,6 +1048,30 @@ begin
     raise exception
       'una afirmación del insight repite la misma cita: no añade sostén y rompe la comprobación de que lo materializado es lo propuesto (afirmación: %)',
       senalada;
+  end if;
+
+  -- Y NINGUNA CONTRADICCIÓN REPETIDA, por lo mismo y con el mismo agujero.
+  --
+  -- El `unique (insight_id, evidencia_id)` de `contradiccion` NO lo cierra: las dos filas
+  -- materializadas pueden ser de evidencias DISTINTAS —la revisada y una colada—, así que el
+  -- índice no se entera. Lo que falla es lo mismo que en las citas: con la misma contradicción
+  -- propuesta dos veces, el recuento cuadra y las dos entradas repetidas encuentran la misma
+  -- fila, de modo que la otra entra sin revisar. Medido: entraba y sellaba.
+  --
+  -- Se corta por `evidenciaId`, que es la clave que ya usan el índice y el contrato: dos
+  -- contradicciones sobre el mismo documento no son dos, son una escrita dos veces.
+  if (
+    select count(*) from jsonb_array_elements(
+           case when jsonb_typeof(new.contenido->'contradicciones') = 'array'
+                then new.contenido->'contradicciones' else '[]'::jsonb end) as t(co)
+  ) <> (
+    select count(distinct lower(t.co->>'evidenciaId'))
+    from jsonb_array_elements(
+           case when jsonb_typeof(new.contenido->'contradicciones') = 'array'
+                then new.contenido->'contradicciones' else '[]'::jsonb end) as t(co)
+  ) then
+    raise exception
+      'el insight repite una contradicción sobre la misma evidencia: no añade nada y rompe la comprobación de que lo materializado es lo propuesto';
   end if;
   return new;
 end $$;

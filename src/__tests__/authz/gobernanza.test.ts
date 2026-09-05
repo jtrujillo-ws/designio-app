@@ -159,6 +159,24 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     await cerrarPools();
   });
 
+  /**
+   * Cierra una etapa por la mano de la base, para poder REABRIRLA.
+   *
+   * Estos casos miden el alcance de la marca, la ventana del arquetipo o la suficiencia del
+   * gate; ninguno mide el camino que cierra una etapa, y montarlo entero —ocho gates con su
+   * checklist— por cada uno los volvería sobre otra cosa. Lo que sí hace falta es partir del
+   * estado en el que una reapertura tiene sentido: desde que reabrir exige que la etapa SALGA
+   * de 'completada', una etapa que nunca se cerró no se reabre —y eso es lo correcto: no hay
+   * nada que reabrir, y registrarlo archivaría un acto que no ocurrió—.
+   *
+   * Con `sqlAdmin`, que la puerta de la etapa deja pasar por su salida anti-oráculo: quien
+   * administra la base responde por lo que escribe, y aquí escribe el estado de partida.
+   */
+  const cerrarEtapa = async (numero: number) => {
+    await sqlAdmin()`update etapa_instancia set estado = 'completada'
+      where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = ${numero}`;
+  };
+
   it('la decisión exige al menos un insight REAL: uno inventado revierte todo', async () => {
     await expect(
       registrarDecision(leadId, {
@@ -334,6 +352,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     });
 
     // Sin declarar insights: la reapertura dice que se movió el suelo entero.
+    await cerrarEtapa(1);
     const r = await reabrirEtapa(leadId, {
       workspaceId: ws,
       proyectoId,
@@ -410,6 +429,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
       await revalidarDecision(leadId, ws, d.id);
     }
 
+    await cerrarEtapa(1);
     const r = await reabrirEtapa(leadId, {
       workspaceId: ws,
       proyectoId,
@@ -428,6 +448,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     expect(ultima.insights.map((i) => i.id)).toEqual([otro.insightId]);
 
     // Declarar un insight que no existe revierte la reapertura entera.
+    await cerrarEtapa(1);
     await expect(
       reabrirEtapa(leadId, {
         workspaceId: ws,
@@ -502,6 +523,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
     ).rejects.toThrow(ErrorGobernanza);
 
     // La vía existe y queda trazada: reabrir la etapa 2.
+    await cerrarEtapa(2);
     await reabrirEtapa(leadId, {
       workspaceId: ws,
       proyectoId,
@@ -565,6 +587,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
 
     // Una reapertura de la etapa 3 pone esa decisión en revisión. El ítem sigue
     // 'cumplido' —no se tira el trabajo— pero deja de contar como suficiencia.
+    await cerrarEtapa(3);
     await reabrirEtapa(leadId, {
       workspaceId: ws,
       proyectoId,
@@ -600,6 +623,7 @@ describeAuthz('gobernanza: decisiones, arquetipos y reaperturas', () => {
       }),
     ).rejects.toThrow();
 
+    await cerrarEtapa(0);
     await reabrirEtapa(leadId, {
       workspaceId: ws,
       proyectoId,

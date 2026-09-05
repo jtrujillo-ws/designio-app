@@ -9,6 +9,19 @@ import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
+/*
+ * Los topes de los campos de una entrada KPI, de donde salen también los de los dos esquemas
+ * que este formulario tiene que satisfacer. Escritos aquí a mano eran una TERCERA copia, y la
+ * que se quedó atrás cuando las otras dos se unificaron: el navegador dejaba escribir 500 y el
+ * servidor rechazaba a los 300, con lo que la corrección que esta pantalla ofrece —y que ante
+ * un nombre ocupado es la única salida— quedaba inservible hasta adivinar el límite.
+ */
+import {
+  MAX_DEFINICION_KPI,
+  MAX_DIMENSIONES_KPI,
+  MAX_FUENTE_KPI,
+  MAX_NOMBRE_KPI,
+} from '@/lib/medicion/medicion.schemas';
 import { formatearCosteUsd } from '@/lib/ai/ai.degradacion';
 import {
   aceptarPropuestaAI,
@@ -26,6 +39,7 @@ import {
   type EstadoAncla,
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
+  type ContenidoEntradaKpi,
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoRemediacionJourney,
@@ -88,6 +102,53 @@ const COLOR_ESTADO: Record<PropuestaEnPanel['estado'], string> = {
  * registry FIRMADO es otro motivo y no una redacción del mismo: ahí no hay reapertura que
  * valga, así que ofrecer esa salida sería mandar al lead a un trámite que no desbloquea
  * nada. */
+/**
+ * Y cuáles de esos motivos dejan abierta la CORRECCIÓN.
+ *
+ * La pantalla trataba todo estado distinto de `disponible` como «esta propuesta ya solo se
+ * rechaza», y eso era exacto mientras todos los motivos hablaran del ancla: si el item se curó,
+ * si el reto se archivó o si el registry se firmó, corregir el texto no arregla nada — lo que
+ * cambió está fuera de la propuesta.
+ *
+ * `nombre-ocupado` rompe esa equivalencia y por eso hace falta este registro. No es un motivo
+ * del ancla: es una COLISIÓN DEL CONTENIDO con lo que hay en el registry, el servidor acepta la
+ * corrección que la arregla, y el propio mensaje le dice a quien revisa que corrija el nombre.
+ * Con el botón apagado, la pantalla decía una cosa y ofrecía la contraria.
+ *
+ * `Record<EstadoAncla, boolean>` y no una lista de excepciones: un estado nuevo tiene que
+ * decidir a cuál de los dos grupos pertenece, que es justo lo que este caso demuestra que no se
+ * puede heredar. «Aceptar tal cual» sigue apagado en los dos: eso lo gobierna `anclaDisponible`.
+ */
+const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
+  // `disponible` no pasa por aquí —el botón ya está activo—, pero la entrada existe porque el
+  // registro es exhaustivo y una respuesta es más clara que una ausencia.
+  disponible: true,
+  'item-curado': false,
+  'consentimiento-revocado': false,
+  'criterios-congelados': false,
+  'registry-firmado': false,
+  'registry-cerrado': false,
+  // El criterio al que la entrada responde ya no está, y ese campo es TESTIMONIO: no se
+  // corrige. Sin criterio al que apuntar, la única salida es rechazar.
+  'criterio-ausente': false,
+  // La única que SÍ: el nombre es del contenido, se corrige, y corregirlo es exactamente lo
+  // que el mensaje pide.
+  'nombre-ocupado': true,
+  // El material se movió por debajo: corregir el texto de la propuesta no devuelve el
+  // criterio a lo que el modelo leyó, así que la única salida es rechazar y pedir otro lote.
+  'criterios-cambiados': false,
+  // Y tampoco: lo que falta no es texto de la propuesta, es poder comparar su material.
+  'material-no-comparable': false,
+  'reto-no-admite': false,
+  'gate-decidido': false,
+  'checklist-avanzado': false,
+  'reto-archivado': false,
+  'evidencia-no-citable': false,
+  'alcance-incompleto': false,
+  'journey-cambiado': false,
+  'ancla-ausente': false,
+};
+
 const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
   disponible: '',
   'item-curado': 'El item ya se curó a mano: esta propuesta quedó obsoleta y solo puede rechazarse.',
@@ -97,6 +158,12 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse. Reabrir la etapa 0 los descongela.',
   'registry-firmado':
     'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y la firma no se deshace (SYS-22). Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'registry-cerrado':
+    'El Metric Registry de ese reto ya no admite entradas: o se firmó —y firmarlo congela el contrato de medición (SYS-22)— o el trabajo de su reto se cerró. Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'criterio-ausente':
+    'El criterio de éxito al que responde esta entrada ya no está entre los del reto de su registry: sin la promesa que dice medir, el KPI no se puede aceptar. La propuesta solo puede rechazarse.',
+  'nombre-ocupado':
+    'Ya hay una entrada con ese nombre en el registry, y el nombre es su clave: corrígelo antes de aceptar, o rechaza la propuesta.',
   'reto-no-admite':
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'gate-decidido':
@@ -111,6 +178,10 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'El grafo de ese journey cambió desde que se generó el informe: alguna de las señales que remedia ya no está abierta, o el grafo que describe ya no es el que hay. Puedes leerlo, pero comprueba contra el journey antes de aplicar nada.',
   'checklist-avanzado':
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
+  'criterios-cambiados':
+    'Los criterios de éxito de ese reto cambiaron desde que el modelo los leyó: esta entrada se escribió contra una definición, un objetivo o una ventana que ya no son los vigentes. Recházala y pide un lote nuevo.',
+  'material-no-comparable':
+    'Esta propuesta se generó con otra versión del prompt, así que no se puede comprobar si los criterios siguen siendo los que el modelo leyó. No es que hayan cambiado: es que no se sabe. Recházala y pide un lote nuevo.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 
@@ -1014,6 +1085,14 @@ const PRESENTACION_POR_CAPACIDAD: Record<
       'Este informe no cambia el grafo y no se aprueba: se lee y se descarta. Las ' +
       'remediaciones las aplica una persona editando el journey.',
   },
+  C6: {
+    rotulo: 'Entrada del Metric Registry propuesta',
+    ficha: (c, etiquetas) => (
+      <FichaEntradaKpi contenido={c as ContenidoEntradaKpi} etiquetas={etiquetas} />
+    ),
+    // C6 SÍ materializa —nace una entrada del registry— así que no tiene nada que decir aquí.
+    sinAccion: null,
+  },
 };
 
 /**
@@ -1124,6 +1203,21 @@ const MATERIALIZACION: Record<
     formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
       <FormularioCriterio
         inicial={inicial as ContenidoCriterio}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  'entrada-kpi': {
+    // Una entrada tampoco: su esquema exige los seis campos que la tabla necesita para nacer,
+    // y los que quedan vacíos —el dueño del dato, la línea base, la ventana, el dashboard— los
+    // pone una persona DESPUÉS editando la entrada, que es exactamente el mismo reparto que
+    // el criterio y por la misma razón: son compromisos, no redacción.
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioEntradaKpi
+        inicial={inicial as ContenidoEntradaKpi}
         ocupado={ocupado}
         onEnviar={onEnviar}
         onCancelar={onCancelar}
@@ -1356,7 +1450,9 @@ function TarjetaPropuesta({
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={ocupado || !anclaDisponible}
+                disabled={
+                  ocupado || (!anclaDisponible && !CORREGIR_SIGUE_ABIERTO[propuesta.anclaEstado])
+                }
                 onClick={() => setCorrigiendo(true)}
               >
                 Corregir y aceptar
@@ -1908,6 +2004,157 @@ function FormularioExtraccion({
           {ocupado ? 'Aceptando…' : 'Aceptar con estas correcciones'}
         </Button>
         <Button size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function FichaEntradaKpi({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoEntradaKpi;
+  etiquetas: Record<string, string>;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="KPI" valor={contenido.nombre} />
+      <Dato
+        rotulo="Responde al criterio"
+        // El KPI del criterio, no su uuid: quien revisa tiene que poder decir si este
+        // indicador mide ESA promesa, y para eso hay que leer la promesa.
+        valor={
+          etiquetas[contenido.criterioId] ??
+          `criterio ${contenido.criterioId} (ya no está)`
+        }
+      />
+      <Dato rotulo="Definición del cálculo" valor={contenido.definicion} />
+      <Dato rotulo="Fuente del dato" valor={contenido.fuente} />
+      {contenido.dimensiones && <Dato rotulo="Dimensiones" valor={contenido.dimensiones} />}
+      <Dato rotulo="Frecuencia" valor={contenido.frecuencia} />
+      {contenido.citas.map((c, i) => (
+        <Dato key={String(i)} rotulo="Cita" valor={`«${c.fragmento}» · ${c.localizacion}`} />
+      ))}
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        La entrada nace sin dueño del dato, sin línea base y sin fecha de inicio: eso lo acuerda
+        una persona del cliente y se completa en el registry antes de firmarlo.
+      </span>
+    </div>
+  );
+}
+
+function FormularioEntradaKpi({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoEntradaKpi;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoEntradaKpi) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [nombre, setNombre] = useState(inicial.nombre);
+  const [definicion, setDefinicion] = useState(inicial.definicion);
+  const [fuente, setFuente] = useState(inicial.fuente);
+  const [dimensiones, setDimensiones] = useState(inicial.dimensiones);
+  const [frecuencia, setFrecuencia] = useState(inicial.frecuencia);
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          criterioId: inicial.criterioId,
+          nombre,
+          definicion,
+          fuente,
+          dimensiones,
+          frecuencia,
+          // Mismo criterio que en CI y en C0: lo que el modelo afirmó —sus citas y su
+          // confianza— no lo reescribe quien corrige.
+          confianzaPropuesta: inicial.confianzaPropuesta,
+          citas: inicial.citas,
+        });
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        Corregir antes de aceptar (la propuesta original se conserva)
+      </span>
+      <label style={campo}>
+        <span style={etiqueta}>Nombre del KPI</span>
+        <Input
+          required
+          maxLength={MAX_NOMBRE_KPI}
+          value={nombre}
+          onChange={(e) => setNombre(e.target.value)}
+        />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Definición del cálculo</span>
+        <Textarea
+          required
+          rows={2}
+          maxLength={MAX_DEFINICION_KPI}
+          value={definicion}
+          onChange={(e) => setDefinicion(e.target.value)}
+        />
+      </label>
+      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12 }}>
+        <label style={campo}>
+          <span style={etiqueta}>Fuente del dato</span>
+          <Input
+            required
+            maxLength={MAX_FUENTE_KPI}
+            value={fuente}
+            onChange={(e) => setFuente(e.target.value)}
+          />
+        </label>
+        <label style={campo}>
+          <span style={etiqueta}>Frecuencia</span>
+          <select
+            required
+            value={frecuencia}
+            onChange={(e) => setFrecuencia(e.target.value as ContenidoEntradaKpi['frecuencia'])}
+            style={{ font: '400 13px var(--font-sans)', padding: '6px 8px' }}
+          >
+            <option value="semanal">semanal</option>
+            <option value="mensual">mensual</option>
+            <option value="trimestral">trimestral</option>
+            <option value="unica">única</option>
+          </select>
+        </label>
+      </div>
+      <label style={campo}>
+        <span style={etiqueta}>Dimensiones (opcional)</span>
+        <Input
+          maxLength={MAX_DIMENSIONES_KPI}
+          value={dimensiones}
+          onChange={(e) => setDimensiones(e.target.value)}
+        />
+      </label>
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        El criterio al que responde no se cambia aquí: si es el equivocado, rechaza la propuesta
+        —o acéptala y reapúntala editando la entrada, que es el camino que el registry tiene
+        mientras sea borrador.
+      </span>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <Button type="submit" size="sm" disabled={ocupado}>
+          Aceptar corregida
+        </Button>
+        <Button type="button" size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
           Cancelar
         </Button>
       </div>

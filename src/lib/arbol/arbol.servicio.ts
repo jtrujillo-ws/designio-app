@@ -30,7 +30,7 @@ export async function crearServicio(
     // que no pudiera crearlo dejaría la regla sin dueño; el candado gobierna lo que la app
     // crea desde hoy, que es exactamente lo que esta función promete.
     await tx`select pg_advisory_xact_lock(
-      hashtext(${entrada.workspaceId}::text || ':' || lower(${entrada.nombre})))`;
+      hashtextextended('designio:servicio-nombre:' || ${entrada.workspaceId} || ':' || lower(${entrada.nombre}), 42))`;
     const [repetido] = await tx`select 1 from servicio
       where workspace_id = ${entrada.workspaceId} and lower(nombre) = lower(${entrada.nombre})
       limit 1`;

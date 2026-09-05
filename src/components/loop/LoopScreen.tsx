@@ -239,8 +239,8 @@ function idDeTarjeta(j: JourneyN): string {
 
 /**
  * Por qué J7 sigue cerrado, en las dos longitudes que la pantalla usa. Con un gate abierto
- * falta aprobar G7; con los ocho aprobados lo que sigue abierta es la medición (alguna
- * ventana de KPI), y hasta que cierre la última el outcome review no se puede abrir.
+ * falta aprobar G7; con los ocho aprobados falta que la medición se abra y termine (que
+ * cierre su última ventana de KPI): hasta entonces el outcome review no se puede abrir.
  */
 function porQueJ7Cerrado(loop: EstadoDelLoop): { corto: string; largo: string } {
   if (loop.gateAbierto !== null) {
@@ -250,9 +250,9 @@ function porQueJ7Cerrado(loop: EstadoDelLoop): { corto: string; largo: string } 
     };
   }
   return {
-    corto: 'Se abre al cerrar la medición',
+    corto: 'Se abre al terminar la medición',
     largo:
-      'G7 está aprobado y la medición sigue abierta: el post mortem se abre cuando cierre la última ventana de KPI',
+      'G7 está aprobado: el post mortem se abre cuando la medición esté abierta y cierre su última ventana de KPI',
   };
 }
 
@@ -1530,7 +1530,7 @@ function TeTocaATi({
         texto:
           loop.gateAbierto !== null
             ? `J7 se abre cuando G7 quede aprobado (hoy el gate abierto es G${loop.gateAbierto})`
-            : 'J7 se abre cuando cierre la última ventana de medición (G7 ya está aprobado)',
+            : 'J7 se abre cuando termine la medición (G7 ya está aprobado)',
         destino: null,
         titulo: `Informativa: ${motivo.largo}`,
       });

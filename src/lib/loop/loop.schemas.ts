@@ -29,9 +29,10 @@ export type GatesDeProyecto = {
   servicioId: string;
   /** Números de gate (0–7) ya aprobados. La base exige que sean un prefijo 0..n. */
   aprobados: number[];
-  /** El reto mide y alguna ventana sigue abierta: el post mortem no puede abrirse todavía
-   * (mismo predicado que la política del outcome review), así que J6 sigue en curso. */
-  medicionAbierta: boolean;
+  /** El post mortem se puede abrir (o ya está abierto): reto en medición, registry firmado y
+   * ninguna ventana de KPI abierta —el predicado de `review_insert`—. Hasta entonces J6 sigue
+   * en curso: ni con G7 aprobado y la medición sin abrir, ni con ventanas abiertas. */
+  postMortemAbrible: boolean;
   /** El outcome review del reto está completado con veredicto (J7 hecho). */
   reviewCompletado: boolean;
 };

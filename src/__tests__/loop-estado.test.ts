@@ -16,7 +16,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const loop = estadoDelLoop({
       hayEvidencia: false,
       hayServicio: true,
-      medicionAbierta: false,
+      postMortemAbrible: true,
       gatesAprobados: [],
       reviewCompletado: false,
     });
@@ -31,7 +31,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const loop = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
-      medicionAbierta: false,
+      postMortemAbrible: true,
       gatesAprobados: [],
       reviewCompletado: false,
     });
@@ -46,7 +46,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const conG1 = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
-      medicionAbierta: false,
+      postMortemAbrible: true,
       gatesAprobados: [0, 1],
       reviewCompletado: false,
     });
@@ -55,7 +55,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const conG2 = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
-      medicionAbierta: false,
+      postMortemAbrible: true,
       gatesAprobados: [0, 1, 2],
       reviewCompletado: false,
     });
@@ -68,7 +68,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const midiendo = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
-      medicionAbierta: false,
+      postMortemAbrible: true,
       gatesAprobados: [0, 1, 2, 3, 4, 5, 6, 7],
       reviewCompletado: false,
     });
@@ -81,7 +81,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const cerrado = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
-      medicionAbierta: false,
+      postMortemAbrible: true,
       gatesAprobados: [0, 1, 2, 3, 4, 5, 6, 7],
       reviewCompletado: true,
     });
@@ -90,11 +90,11 @@ describe('el estado del loop se deriva de los gates', () => {
     expect(Object.values(cerrado.journeys).every((e) => e === 'hecho')).toBe(true);
   });
 
-  it('con G7 aprobado pero la medición abierta, J6 sigue en curso: el post mortem no se puede abrir', () => {
+  it('con G7 aprobado pero el post mortem aún no abrible (medición sin abrir o con ventanas abiertas), J6 sigue en curso', () => {
     const midiendo = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
-      medicionAbierta: true,
+      postMortemAbrible: false,
       gatesAprobados: [0, 1, 2, 3, 4, 5, 6, 7],
       reviewCompletado: false,
     });
@@ -111,7 +111,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const loop = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
-      medicionAbierta: false,
+      postMortemAbrible: true,
       gatesAprobados: [7],
       reviewCompletado: false,
     });
@@ -126,7 +126,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const loop = estadoDelLoop({
       hayEvidencia: false,
       hayServicio: true,
-      medicionAbierta: false,
+      postMortemAbrible: true,
       gatesAprobados: [0, 1, 2, 3, 4],
       reviewCompletado: false,
     });
@@ -160,7 +160,7 @@ describe('la marca de un reto en el árbol', () => {
         retoEstado: 'activo',
         servicioId: 's-1',
         aprobados: [0, 1, 2, 3, 4, 5, 6],
-        medicionAbierta: false,
+        postMortemAbrible: true,
         reviewCompletado: false,
       },
     ],
@@ -174,7 +174,7 @@ describe('la marca de un reto en el árbol', () => {
         retoEstado: 'cerrado',
         servicioId: 's-1',
         aprobados: [0, 1, 2, 3, 4, 5, 6, 7],
-        medicionAbierta: false,
+        postMortemAbrible: true,
         reviewCompletado: true,
       },
     ],

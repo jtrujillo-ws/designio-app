@@ -54,13 +54,21 @@ export async function resumenParaUsuario(
           r.servicio_ancla_id as servicio_id,
           coalesce(array_agg(g.numero order by g.numero) filter (where g.numero is not null),
             '{}'::int[]) as aprobados,
-          -- Mide y alguna ventana sigue abierta: el mismo predicado con el que la política
-          -- del outcome review (review_insert) rechaza abrirlo todavía.
-          (r.estado = 'en-medicion' and exists (select 1 from entrada_kpi e
-            join metric_registry mr on mr.id = e.registry_id and mr.workspace_id = e.workspace_id
-            join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
-            where mr.reto_id = r.id and mr.workspace_id = r.workspace_id
-              and ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias))) as medicion_abierta,
+          -- El post mortem se puede abrir, o ya está abierto: es el predicado de review_insert
+          -- (reto en medición, registry firmado, ninguna ventana de KPI abierta). Entre G7 y
+          -- abrirMedicion el reto aún no mide, y con ventanas abiertas tampoco: en los dos
+          -- casos J6 sigue en curso.
+          (exists (select 1 from outcome_review o
+             where o.reto_id = r.id and o.workspace_id = r.workspace_id)
+           or (r.estado = 'en-medicion'
+             and exists (select 1 from metric_registry mr
+               where mr.reto_id = r.id and mr.workspace_id = r.workspace_id
+                 and mr.estado = 'firmado')
+             and not exists (select 1 from entrada_kpi e
+               join metric_registry mr on mr.id = e.registry_id and mr.workspace_id = e.workspace_id
+               join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
+               where mr.reto_id = r.id and mr.workspace_id = r.workspace_id
+                 and ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias)))) as post_mortem_abrible,
           exists (select 1 from outcome_review o
             where o.reto_id = r.id and o.workspace_id = r.workspace_id
               and o.estado = 'completado') as review_completado
@@ -79,7 +87,7 @@ export async function resumenParaUsuario(
         retoEstado: f.reto_estado as string,
         servicioId: f.servicio_id as string,
         aprobados: f.aprobados as number[],
-        medicionAbierta: f.medicion_abierta as boolean,
+        postMortemAbrible: f.post_mortem_abrible as boolean,
         reviewCompletado: f.review_completado as boolean,
       }));
 

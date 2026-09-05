@@ -120,7 +120,7 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
     expect(p.servicioId).toBe(svcA1);
     expect(p.aprobados).toEqual([0]);
     expect(p.retoEstado).toBe('activo');
-    expect(p.medicionAbierta).toBe(false);
+    expect(p.postMortemAbrible).toBe(false);
     expect(p.reviewCompletado).toBe(false);
 
     // Solo G1: es el gate ABIERTO y su checklist está decidido. G2 tiene trabajo pendiente y

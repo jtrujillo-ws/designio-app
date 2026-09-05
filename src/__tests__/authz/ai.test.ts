@@ -4944,7 +4944,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const motivoDe = async (
         capacidad: string,
         anclas: Partial<Record<AnclaCapacidad['columna'], string>>,
-        contenido: unknown = {},
+        /* Solo lo que el CASE del panel mira del contenido: los huecos de CT y su id. Se
+         * tipa por lo que ES y no como `unknown` —que `tx.json` no acepta— ni como un
+         * `Record` suelto: lo que esta fila sintética trae tiene que poder leerse igual que
+         * lo que trae la de verdad. */
+        contenido: { huecos?: { checklistItemId: string }[] } = {},
       ): Promise<string | null> => {
         const columnas = COLUMNAS_DE_ANCLA.map(
           (c) => tx`${anclas[c] ?? null}::uuid as ${tx(c)}`,

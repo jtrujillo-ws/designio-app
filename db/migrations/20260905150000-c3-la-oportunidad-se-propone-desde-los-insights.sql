@@ -57,6 +57,25 @@ alter table propuesta_ai add constraint propuesta_ai_oportunidad_id_workspace_id
 create unique index propuesta_ai_oportunidad_idx
   on propuesta_ai (workspace_id, oportunidad_id) where oportunidad_id is not null;
 
+-- ── LA MITAD PERMANENTE DE SYS-19: de qué propuesta viene esta oportunidad ──
+--
+-- Se instala igual que en `evidencia`, `criterio_exito`, `insight` y `entrada_kpi`, y con la
+-- misma precaución que cobró el penúltimo: el `grant insert` de TABLA cubre las columnas
+-- futuras, así que añadir ésta se la regalaría al llamante y el vínculo dejaría de ser
+-- vínculo — una procedencia falsificable y, de paso, la plaza única del índice ocupada por
+-- una HMW escrita a mano. Aquí el grant de la oportunidad ya era POR COLUMNAS, así que no hay
+-- que retirar nada; queda dicho porque la próxima tabla puede no tenerlo.
+--
+-- Su falta la cazó una sonda antes de que existiera ninguna: el guard de procedencia despacha
+-- por destino y su `else` NOMBRA al que nadie sella en vez de elegir una rama en silencio, así
+-- que 'oportunidad' abortó con su propio nombre. Es exactamente para lo que ese `else` se
+-- escribió cuando C2 fue el tercer destino.
+alter table oportunidad add column propuesta_ai_id uuid;
+alter table oportunidad add
+  foreign key (propuesta_ai_id, workspace_id) references propuesta_ai (id, workspace_id);
+create unique index oportunidad_propuesta_ai_idx on oportunidad (propuesta_ai_id)
+  where propuesta_ai_id is not null;
+
 -- ── El alcance leído, hermano exacto de `alcance_evidencia` ──
 -- Lo que se sella tiene que haberse LEÍDO. `alcance_evidencia` guarda la evidencia que llegó
 -- entera al modelo —no la que se consultó— para que el guard diferido pueda negarse a sellar
@@ -1180,6 +1199,11 @@ begin
   elsif new.destino = 'entrada-kpi' then
     update entrada_kpi set propuesta_ai_id = new.id
       where id = new.entrada_kpi_id and workspace_id = new.workspace_id
+        and propuesta_ai_id is null;
+    get diagnostics v_filas = row_count;
+  elsif new.destino = 'oportunidad' then
+    update oportunidad set propuesta_ai_id = new.id
+      where id = new.oportunidad_id and workspace_id = new.workspace_id
         and propuesta_ai_id is null;
     get diagnostics v_filas = row_count;
   else

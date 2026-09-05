@@ -571,7 +571,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (workspace_id, capacidad, destino, ${anclasDeFixture(tx).columnas},
          contenido, contenido_original,
          confianza, modelo, prompt_version, alcance_resumen, huella_material,
-         alcance_evidencia, origen_key,
+         alcance_evidencia, alcance_insights, origen_key,
          llamada_id, creado_por)
       values (${ws}, ${campos.capacidad}, ${destino},
               ${anclasDeFixture(tx, campos.anclas).valores},
@@ -587,6 +587,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               -- a mano fijaría en el fixture justo lo que el suelo compara contra la base.
               -- Para las demás capacidades no aplica y va nulo, como el CHECK permite.
               ${campos.anclas.reto_id ? ALCANCE_DEL_RETO(tx, ws, campos.anclas.reto_id) : null},
+              -- Y el alcance de INSIGHTS, que C3 declara igual. Sale de la misma función que
+              -- usan el guard y el panel —no de una lista escrita aquí— por lo mismo que el de
+              -- evidencia: una copia en el fixture fijaría justo lo que el suelo compara.
+              -- Solo para C3: el CHECK deja nulo a las demás.
+              ${
+                campos.capacidad === 'C3' && campos.anclas.reto_id
+                  ? tx`array(select v.id from insights_validados_del_reto(
+                        ${campos.anclas.reto_id}, ${ws}) as v(id))`
+                  : null
+              },
               'entorno', ${llamadaId}, ${actorId})
       returning id`);
     return p!.id as string;
@@ -703,6 +713,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // efímero: sin esta línea la limpieza muere en la FK del sello, y el fallo aparece como
       // un `miembro_usuario_id_fkey` al final, que no dice nada de dónde está.
       await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -884,6 +895,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from reserva_ai where workspace_id = ${ws}`;
       await admin`update evidencia set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`update criterio_exito set propuesta_ai_id = null where workspace_id = ${ws}`;
+      // Y la oportunidad, que es el QUINTO destino con sello. Cada uno que llega añade su
+      // línea aquí, y olvidarla no falla donde está: la limpieza muere en la FK y el error
+      // sale al final nombrando otra tabla.
+      await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
       // Ver la nota de `enWorkspaceLimpio`: el sello va de la propuesta al insight y del
       // insight a la propuesta, así que se suelta antes de borrar ninguno de los dos.
       await admin`update insight set propuesta_ai_id = null where workspace_id = ${ws}`;
@@ -11070,6 +11085,141 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     } finally {
       await admin`update metric_registry set estado = 'borrador', firmado_por = null,
         firmado_en = null where id = ${registryId}`;
+    }
+  });
+
+  /**
+   * C3 — LA TRAZA ES LA CITA, comprobado en los dos sentidos.
+   *
+   * `oportunidad_insight` se materializa desde los `insightId` distintos de las citas: no hay
+   * una segunda lista que declare el apoyo. Por la superficie SQL concedida se puede escribir
+   * la oportunidad y sus enlaces a mano, así que el guard diferido tiene que comprobar que
+   * sean EXACTAMENTE los citados — ni uno más ni uno menos.
+   *
+   * Los dos sentidos importan por razones distintas y por eso se miden por separado:
+   *   · uno de MÁS es apoyo que nadie citó, o sea inventado, y el evento lo archiva como si la
+   *     AI lo hubiera propuesto;
+   *   · uno de MENOS deja la HMW apoyada en menos de lo que su propio texto dice, y ahí lo que
+   *     se pierde es la traza que G3 certifica.
+   */
+  it('C3: la traza de una oportunidad es exactamente lo que citó, ni de más ni de menos', async () => {
+    const admin = sqlAdmin();
+    // Un segundo insight validado del reto, para poder enlazar «de más».
+    const [otro] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'El aviso llega tarde', 'El recordatorio sale cuando ya se fue.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const otroInsight = otro!.id as string;
+    const [af] = await admin`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${ws}, ${otroInsight}, 0, 'El recordatorio sale tarde', false) returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${ws}, ${af!.id as string}, ${evidenciaDelRetoId}, 'El 71% de los abandonos',
+              'resumen', ${leadId})`;
+
+    // Se sella a mano, por la superficie concedida: lo que se mide es el SUELO, no que el
+    // servicio se porte bien. `enlaces` decide qué traza se escribe.
+    const sellarConTraza = async (enlaces: string[]) => {
+      const propuestaId = await nuevaPropuesta(leadId, {
+        capacidad: 'C3',
+        anclas: { reto_id: retoId },
+      });
+      try {
+        await conUsuario(leadId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${`HMW ${crypto.randomUUID().slice(0, 8)}`}, 0, '',
+                    ${leadId})
+            returning id`;
+          for (const insightId of enlaces) {
+            await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+              values (${ws}, ${o!.id as string}, ${insightId})`;
+          }
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        });
+        return 'selló';
+      } catch (e) {
+        return `rechazó: ${(e as Error).message.slice(0, 80)}`;
+      } finally {
+        // El orden lo imponen las dos FK, que apuntan en sentidos opuestos: la propuesta a la
+        // oportunidad (el objeto materializado) y la oportunidad a la propuesta (el sello de
+        // procedencia). Se suelta el sello, se borra la propuesta —que es quien apunta al
+        // objeto— y después el objeto. Soltar `oportunidad_id` a secas no vale: el CHECK
+        // «decidida ⇒ exactamente un objeto» lo rechaza mientras el estado siga aceptada.
+        await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
+        await admin`delete from propuesta_ai where id = ${propuestaId}`;
+        await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+        await admin`delete from oportunidad where workspace_id = ${ws}`;
+      }
+    };
+
+    // El contenido del fixture cita SOLO a `insightValidadoDelRetoId`.
+    expect(await sellarConTraza([insightValidadoDelRetoId, otroInsight])).toMatch(/no es la de sus citas/);
+    expect(await sellarConTraza([])).toMatch(/al menos un insight|no es la de sus citas/);
+    // Y la buena: exactamente el citado. Sin esta mitad, un guard que rechazara SIEMPRE
+    // pasaría las dos de arriba.
+    expect(await sellarConTraza([insightValidadoDelRetoId])).toBe('selló');
+
+    await admin`delete from cita where afirmacion_id = ${af!.id as string}`;
+    await admin`delete from afirmacion where id = ${af!.id as string}`;
+    await admin`delete from insight where id = ${otroInsight}`;
+  });
+
+  /**
+   * Y la PROCEDENCIA: la oportunidad y su traza nacen en la aceptación.
+   *
+   * `xmin` dice «esta transacción escribió esta versión» y NO distingue insertar de
+   * actualizar, y `oportunidad` sí admite un UPDATE que conserva el estado —repriorizar—. Por
+   * eso el guard exige además `creado_en = now()`, que la base pone y ningún grant mueve: sin
+   * él, repriorizar una HMW vieja dentro de la aceptación la sellaría como recién nacida, y lo
+   * que quedaría mal atribuido es que una pregunta escrita A MANO conste como propuesta por la
+   * AI — que es de lo que viven la tasa de corrección y el rastro de quién produjo qué.
+   */
+  it('C3: una oportunidad que ya existía no se puede sellar, ni repriorizándola aquí', async () => {
+    const admin = sqlAdmin();
+    const [vieja] = await admin`insert into oportunidad
+      (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+      values (${ws}, ${retoId}, '¿Cómo podríamos hacer esto a mano?', 3, 'la escribió una
+              persona', ${leadId})
+      returning id`;
+    const viejaId = vieja!.id as string;
+    await admin`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+      values (${ws}, ${viejaId}, ${insightValidadoDelRetoId})`;
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C3',
+      anclas: { reto_id: retoId },
+    });
+    try {
+      // Apropiársela tal cual.
+      await expect(
+        conUsuario(leadId, (tx) => tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${leadId},
+              oportunidad_id = ${viejaId}
+          where id = ${propuestaId} and workspace_id = ${ws}`),
+      ).rejects.toThrow(/haber NACIDO en esta misma aceptación/);
+      // Y tocándola en la misma transacción, que es lo que `xmin` solo no distingue.
+      await expect(
+        conUsuario(leadId, async (tx) => {
+          await tx`update oportunidad set prioridad = 9
+            where id = ${viejaId} and workspace_id = ${ws}`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${viejaId}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        }),
+      ).rejects.toThrow(/haber NACIDO en esta misma aceptación/);
+      // Y la propuesta sigue por revisar: la transacción entera se fue.
+      const [sigue] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+      expect(sigue!.estado as string).toBe('propuesta');
+    } finally {
+      await admin`delete from propuesta_ai where id = ${propuestaId}`;
+      await admin`delete from oportunidad_insight where oportunidad_id = ${viejaId}`;
+      await admin`delete from oportunidad where id = ${viejaId}`;
     }
   });
 

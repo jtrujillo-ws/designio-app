@@ -28,6 +28,7 @@ import {
   CargarCsvSchema,
   ETIQUETA_ESTADO_SNAPSHOT,
   ETIQUETA_FRECUENCIA,
+  COLOR_VEREDICTO,
   ETIQUETA_VEREDICTO,
   etiquetaVentana,
   FRECUENCIAS,
@@ -88,13 +89,6 @@ const COLOR_ESTADO: Record<EstadoSnapshot, string> = {
   recibido: 'var(--ok)',
   vencido: 'var(--danger)',
   cerrado: 'var(--accent)',
-};
-
-const COLOR_VEREDICTO: Record<VeredictoSlug, string> = {
-  logrado: 'var(--ok)',
-  'parcialmente-logrado': 'var(--warn)',
-  'no-logrado': 'var(--danger)',
-  'no-concluyente': 'var(--text-muted)',
 };
 
 type Comunes = {

@@ -101,6 +101,15 @@ export const ETIQUETA_VEREDICTO: Record<VeredictoSlug, string> = {
   'no-concluyente': 'No concluyente',
 };
 
+/** El color de cada veredicto, UNO para toda pantalla que lo pinte: «no logrado» y «no
+ * concluyente» no pueden salir en verde en ningún sitio, y con un mapa por pantalla salía. */
+export const COLOR_VEREDICTO: Record<VeredictoSlug, string> = {
+  logrado: 'var(--ok)',
+  'parcialmente-logrado': 'var(--warn)',
+  'no-logrado': 'var(--danger)',
+  'no-concluyente': 'var(--text-muted)',
+};
+
 /** Valor de un KPI: viaja como TEXTO y se almacena numeric. No es un `number` de JS
  * porque el binario flotante redondea (0.1 + 0.2) y aquí se compara contra la línea
  * base de un contrato firmado; la base hace la aritmética exacta. */

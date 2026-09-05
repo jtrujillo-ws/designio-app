@@ -1,14 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   agruparArquetiposPorSegmento,
-  conteo,
   destinoDeLaDecision,
   destinoDelArquetipo,
   destinoDelInsight,
   destinoDelRetoCerrado,
   memoriaVacia,
   MemoriaInputSchema,
+  notaDeRecorte,
   resumenDeArquetipos,
+  TOPE_POR_SECCION,
   type ArquetipoEnMemoria,
   type MemoriaDelWorkspace,
   type SegmentoEnMemoria,
@@ -41,6 +42,7 @@ const memoria = (parcial: Partial<MemoriaDelWorkspace> = {}): MemoriaDelWorkspac
   decisiones: [],
   retosCerrados: [],
   retosCandidatos: [],
+  totales: { arquetipos: 0, insights: 0, decisiones: 0, retosCerrados: 0, retosCandidatos: 0 },
   ...parcial,
 });
 
@@ -136,6 +138,7 @@ describe('a dónde abre cada pieza de la memoria', () => {
       id: 'r',
       codigo: 'R-02',
       titulo: 'Cerrado',
+      estado: 'cerrado' as const,
       veredicto: null,
       contribucion: '',
       aprendizajes: '',
@@ -170,24 +173,38 @@ describe('a dónde abre cada pieza de la memoria', () => {
   });
 });
 
-describe('la memoria vacía y los conteos', () => {
-  it('está vacía solo cuando ninguna sección tiene nada (los segmentos no cuentan)', () => {
+describe('la memoria vacía y el recorte', () => {
+  it('está vacía solo cuando ningún total es mayor que cero (los segmentos no cuentan)', () => {
     expect(memoriaVacia(memoria({ segmentos: [segmento('s1', 'independientes')] }))).toBe(true);
+    // Los TOTALES mandan, no las listas: una sección recortada a cero filas seguiría contando.
     expect(
       memoriaVacia(
         memoria({
-          retosCandidatos: [
-            { id: 'r', codigo: 'R-03', titulo: 'x', descripcion: '', metricaObjetivo: '' },
-          ],
+          totales: {
+            arquetipos: 0,
+            insights: 0,
+            decisiones: 0,
+            retosCerrados: 0,
+            retosCandidatos: 3,
+          },
         }),
       ),
     ).toBe(false);
   });
 
-  it('el conteo concuerda en número', () => {
-    expect(conteo(1, 'insight validado', 'insights validados')).toBe('1 insight validado');
-    expect(conteo(0, 'insight validado', 'insights validados')).toBe('0 insights validados');
-    expect(conteo(3, 'decisión vigente', 'decisiones vigentes')).toBe('3 decisiones vigentes');
+  it('la nota de recorte solo existe cuando el total supera lo mostrado, y dice dónde está el resto', () => {
+    expect(notaDeRecorte(3, 3, 'Insights y citas')).toBeNull();
+    expect(notaDeRecorte(0, 0, 'Insights y citas')).toBeNull();
+    expect(notaDeRecorte(TOPE_POR_SECCION, 120, 'Insights y citas')).toBe(
+      `Se muestran los ${TOPE_POR_SECCION} más recientes de 120; la lista completa está en Insights y citas.`,
+    );
+    expect(notaDeRecorte(1, 2, 'el árbol del loop')).toBe(
+      'Se muestran el más reciente de 2; la lista completa está en el árbol del loop.',
+    );
+  });
+
+  it('el tope por sección es el mismo con el que pagina la pantalla de insights', () => {
+    expect(TOPE_POR_SECCION).toBe(50);
   });
 
   it('la entrada exige un workspace uuid', () => {

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
 import { construirMemoria, memoriaParaUsuario } from '@/lib/memoria/memoria.queries';
+import { TOPE_POR_SECCION } from '@/lib/memoria/memoria.schemas';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { describeAuthz } from './helpers';
 
@@ -9,7 +10,8 @@ import { describeAuthz } from './helpers';
  * (SYS-01/02): un miembro de A lee su memoria entera y no una fila de B, ni siquiera
  * preguntando directo; sin contexto de usuario no hay filas; y la cuenta desactivada con
  * sesión viva no lee (capa 2). Además fija QUÉ es memoria: solo insights validados, solo
- * decisiones vigentes, solo candidatos nacidos del post mortem.
+ * decisiones vigentes, solo candidatos nacidos del post mortem, y los retos archivados
+ * solo si dejaron veredicto — y que cada sección se recorta al tope con el total real.
  */
 describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)', () => {
   const marca = `mem-${crypto.randomUUID().slice(0, 8)}`;
@@ -21,6 +23,7 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
   let retoA = '';
   let proyectoA = '';
   let retoCerradoA = '';
+  let retoArchivadoA = '';
   let arqConfirmado = '';
   let arqHipotesis = '';
   let insightValidado = '';
@@ -79,6 +82,13 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     insightValidado = iv!.id as string;
     await admin`insert into insight (workspace_id, titulo, creado_por)
       values (${wsA}, 'Insight propuesto', ${userA})`;
+    // Y más validados que el tope, todos MÁS ANTIGUOS que el de arriba: la sección tiene que
+    // recortar y el que se enseña primero tiene que ser el más reciente.
+    await admin`insert into insight
+      (workspace_id, titulo, estado, validado_por, validado_en, creado_por)
+      select ${wsA}, 'Insight antiguo ' || n, 'validado', ${userA},
+             now() - make_interval(days => n), ${userA}
+      from generate_series(1, ${TOPE_POR_SECCION + 2}) as n`;
 
     // Una decisión vigente (memoria) y una en revisión (cuestionada: no).
     const [g1] =
@@ -110,6 +120,16 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
       values (${wsA}, ${retoCerradoA}, 'completado', 'parcialmente-logrado',
               'El abandono bajó a la mitad del objetivo', 'La sucursal no era el problema',
               ${userA}, now(), ${userA})`;
+    // Un reto ARCHIVADO que conserva su veredicto (memoria) y otro archivado que nunca
+    // midió nada (no lo es).
+    const [ra] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, estado, veredicto, creado_por)
+      values (${wsA}, ${svcA}, 'R-M4', 'Reto archivado con veredicto', 'archivado', 'no-logrado',
+              ${userA}) returning id`;
+    retoArchivadoA = ra!.id as string;
+    await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, estado, creado_por)
+      values (${wsA}, ${svcA}, 'R-M5', 'Candidato archivado sin medir', 'archivado', ${userA})`;
     await admin`insert into reto
       (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
       values (${wsA}, ${svcA}, 'R-M2', 'Candidato del post mortem', 'candidato', 'post-mortem',
@@ -168,7 +188,9 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     expect(m!.workspaceNombre).toBe(marca + '-A');
     expect(m!.segmentos.map((s) => s.nombre)).toEqual(['independientes', 'pymes']);
 
-    expect(m!.arquetipos.map((a) => a.id)).toEqual([arqConfirmado, arqHipotesis]);
+    // De más reciente a más antiguo: la hipótesis se dio de alta después.
+    expect(m!.arquetipos.map((a) => a.id)).toEqual([arqHipotesis, arqConfirmado]);
+    expect(m!.totales.arquetipos).toBe(2);
     const confirmado = m!.arquetipos.find((a) => a.id === arqConfirmado)!;
     expect(confirmado.estado).toBe('confirmado');
     expect(confirmado.veredictoRazon).toBe('Tres de seis entrevistas encajan');
@@ -184,12 +206,16 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     expect(hipotesis.estado).toBe('hipotesis');
     expect(hipotesis.segmentoIds).toEqual([]);
 
-    // Solo el validado; el propuesto no es memoria.
-    expect(m!.insights.map((i) => i.id)).toEqual([insightValidado]);
+    // Solo validados (el propuesto no es memoria), recortados al tope con el más reciente
+    // primero y el total REAL al lado: la pantalla dice «50 de 53», no finge la lista entera.
+    expect(m!.insights).toHaveLength(TOPE_POR_SECCION);
+    expect(m!.insights[0]!.id).toBe(insightValidado);
     expect(m!.insights[0]!.validadoEn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(m!.totales.insights).toBe(TOPE_POR_SECCION + 3);
 
     // Solo la vigente; la que está en revisión, no.
     expect(m!.decisiones.map((d) => d.id)).toEqual([decisionVigente]);
+    expect(m!.totales.decisiones).toBe(1);
     expect(m!.decisiones[0]!.gateNumero).toBe(1);
     expect(m!.decisiones[0]!.proyecto).toEqual({
       id: proyectoA,
@@ -197,10 +223,19 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
       titulo: 'Proyecto con memoria',
     });
 
-    // El reto cerrado trae el veredicto del outcome review y su narrativa.
-    expect(m!.retosCerrados).toHaveLength(1);
+    // El reto cerrado trae el veredicto del outcome review y su narrativa; el archivado
+    // con veredicto también es memoria (y se dice que está archivado); el archivado que
+    // nunca midió nada, no.
+    expect(m!.retosCerrados.map((r) => r.codigo)).toEqual(['R-M0', 'R-M4']);
+    expect(m!.totales.retosCerrados).toBe(2);
+    const archivado = m!.retosCerrados[1]!;
+    expect(archivado.id).toBe(retoArchivadoA);
+    expect(archivado.estado).toBe('archivado');
+    expect(archivado.veredicto).toBe('no-logrado');
+    expect(archivado.cerradoEn).toBeNull();
     const cerrado = m!.retosCerrados[0]!;
     expect(cerrado.id).toBe(retoCerradoA);
+    expect(cerrado.estado).toBe('cerrado');
     expect(cerrado.veredicto).toBe('parcialmente-logrado');
     expect(cerrado.contribucion).toBe('El abandono bajó a la mitad del objetivo');
     expect(cerrado.aprendizajes).toBe('La sucursal no era el problema');
@@ -209,6 +244,7 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
 
     // Solo el candidato del post mortem: el pedido por el cliente es pipeline, no memoria.
     expect(m!.retosCandidatos.map((r) => r.codigo)).toEqual(['R-M2']);
+    expect(m!.totales.retosCandidatos).toBe(1);
   });
 
   it('memoriaParaUsuario aplica la capa 2: cuenta activa lee, desactivada con sesión viva no', async () => {
@@ -241,5 +277,13 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     expect(m.decisiones).toHaveLength(0);
     expect(m.retosCerrados).toHaveLength(0);
     expect(m.retosCandidatos).toHaveLength(0);
+    // Y los totales tampoco filtran nada: count bajo la misma RLS.
+    expect(m.totales).toEqual({
+      arquetipos: 0,
+      insights: 0,
+      decisiones: 0,
+      retosCerrados: 0,
+      retosCandidatos: 0,
+    });
   });
 });

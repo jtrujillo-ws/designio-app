@@ -20,6 +20,14 @@ import type { EstadoArquetipo, TipoDecision } from '@/lib/metodo/gobernanza.sche
 
 export const MemoriaInputSchema = z.object({ workspaceId: z.string().uuid() });
 
+/**
+ * Cuántas filas trae cada sección, de la más reciente a la más antigua. La biblioteca
+ * ORIENTA: sin tope, la carga y el SSR de la pantalla crecían con la vida entera del
+ * workspace (la ruta de insights pagina a 50 por lo mismo). La lista completa vive en la
+ * pantalla dueña de cada pieza, y la sección dice cuántas hay en total y dónde verlas.
+ */
+export const TOPE_POR_SECCION = 50;
+
 export type SegmentoEnMemoria = { id: string; nombre: string; definicion: string };
 
 /** Un arquetipo tal como la biblioteca lo conserva: con su veredicto y con el reto que lo hizo nacer. */
@@ -59,6 +67,12 @@ export type RetoCerradoEnMemoria = {
   codigo: string;
   titulo: string;
   /**
+   * `cerrado → archivado` es una transición legal y el veredicto viaja con el reto
+   * archivado (`reto_veredicto_solo_cerrado` lo admite en ambos): archivar ordena el
+   * árbol, no borra lo que se aprendió. Se dice cuál es para que el lector lo sepa.
+   */
+  estado: 'cerrado' | 'archivado';
+  /**
    * El veredicto del outcome review. Null en los retos cerrados antes de que existiera el
    * post mortem (la migración de medición NO les inventa uno): la biblioteca lo dice tal
    * cual, porque «sin veredicto» es un dato y «no concluyente» sería una fabricación.
@@ -88,15 +102,24 @@ export type MemoriaDelWorkspace = {
   insights: InsightEnMemoria[];
   /** Solo `vigente`: una decisión en revisión está cuestionada y no debe citarse como sabida. */
   decisiones: DecisionEnMemoria[];
+  /** Cerrados con veredicto, y archivados que lo tuvieron: ver `RetoCerradoEnMemoria.estado`. */
   retosCerrados: RetoCerradoEnMemoria[];
   /** Candidatos con origen `post-mortem`: los que el ciclo anterior dejó propuestos. */
   retosCandidatos: RetoCandidatoEnMemoria[];
+  /**
+   * Cuántas hay DE VERDAD por sección (count en la misma foto), tengan o no sitio en la
+   * lista: cada lista trae como mucho TOPE_POR_SECCION y el total es lo que la pantalla
+   * dice cuando recortó.
+   */
+  totales: TotalesDeMemoria;
 };
 
-export const ETIQUETA_ESTADO_ARQUETIPO: Record<EstadoArquetipo, string> = {
-  hipotesis: 'Hipótesis',
-  confirmado: 'Confirmado',
-  refutado: 'Refutado',
+export type TotalesDeMemoria = {
+  arquetipos: number;
+  insights: number;
+  decisiones: number;
+  retosCerrados: number;
+  retosCandidatos: number;
 };
 
 /**
@@ -170,16 +193,21 @@ export function destinoDelRetoCerrado(r: RetoCerradoEnMemoria): Destino | null {
 
 /** La memoria está vacía cuando ninguna sección tiene nada: el workspace todavía no ha cerrado un ciclo. */
 export function memoriaVacia(m: MemoriaDelWorkspace): boolean {
+  const t = m.totales;
   return (
-    m.arquetipos.length === 0 &&
-    m.insights.length === 0 &&
-    m.decisiones.length === 0 &&
-    m.retosCerrados.length === 0 &&
-    m.retosCandidatos.length === 0
+    t.arquetipos === 0 &&
+    t.insights === 0 &&
+    t.decisiones === 0 &&
+    t.retosCerrados === 0 &&
+    t.retosCandidatos === 0
   );
 }
 
-/** «1 insight», «3 insights»: el conteo de cabecera de cada sección, sin plural roto. */
-export function conteo(n: number, singular: string, plural: string): string {
-  return `${n} ${n === 1 ? singular : plural}`;
+/**
+ * Lo que la sección dice cuando el tope la recortó, o null si enseña todo. Nombra la
+ * pantalla donde está la lista completa: un «hay más» sin a dónde ir es un callejón.
+ */
+export function notaDeRecorte(mostrados: number, total: number, donde: string): string | null {
+  if (total <= mostrados) return null;
+  return `Se muestran ${mostrados === 1 ? 'el más reciente' : `los ${mostrados} más recientes`} de ${total}; la lista completa está en ${donde}.`;
 }

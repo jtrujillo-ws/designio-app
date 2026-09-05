@@ -6,22 +6,25 @@ import { Chip } from '@/components/ui/Chip';
 import { EnlaceA } from '@/components/ui/EnlaceA';
 import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
-import { ETIQUETA_VEREDICTO } from '@/lib/medicion/medicion.schemas';
+import { COLOR_VEREDICTO, ETIQUETA_VEREDICTO } from '@/lib/medicion/medicion.schemas';
 import { memoriaDelWorkspace } from '@/lib/memoria/memoria.functions';
 import {
   agruparArquetiposPorSegmento,
-  conteo,
   destinoDeLaDecision,
   destinoDelArquetipo,
   destinoDelInsight,
   destinoDelRetoCerrado,
-  ETIQUETA_ESTADO_ARQUETIPO,
   memoriaVacia,
+  notaDeRecorte,
   resumenDeArquetipos,
   type ArquetipoEnMemoria,
   type GrupoDeSegmento,
 } from '@/lib/memoria/memoria.schemas';
-import { ETIQUETA_TIPO_DECISION, type EstadoArquetipo } from '@/lib/metodo/gobernanza.schemas';
+import {
+  COLOR_ARQUETIPO,
+  ETIQUETA_ESTADO_ARQUETIPO,
+  ETIQUETA_TIPO_DECISION,
+} from '@/lib/metodo/gobernanza.schemas';
 
 /**
  * Biblioteca del cliente (CTX-01, §4.1 y §11 del prediseño): la memoria del workspace
@@ -64,13 +67,6 @@ const enlace: CSSProperties = {
   textDecoration: 'none',
 };
 const separador: CSSProperties = { borderTop: '1px solid var(--border)', paddingTop: 12 };
-
-/** Los mismos colores con que el proyecto pinta el estado del arquetipo: el vocabulario visual es uno. */
-const COLOR_ARQUETIPO: Record<EstadoArquetipo, string> = {
-  hipotesis: 'var(--warn)',
-  confirmado: 'var(--accent)',
-  refutado: 'var(--text-faint)',
-};
 
 function PantallaBiblioteca() {
   const datos = Route.useLoaderData();
@@ -151,11 +147,17 @@ function PantallaBiblioteca() {
             <SeccionArquetipos
               grupos={agruparArquetiposPorSegmento(datos.segmentos, datos.arquetipos)}
               arquetipos={datos.arquetipos}
+              total={datos.totales.arquetipos}
             />
 
             <Seccion
               titulo="Insights validados"
-              cabecera={conteo(datos.insights.length, 'insight validado', 'insights validados')}
+              cabecera={`${datos.totales.insights} ${datos.totales.insights === 1 ? 'insight validado' : 'insights validados'}`}
+              recorte={notaDeRecorte(
+                datos.insights.length,
+                datos.totales.insights,
+                'Insights y citas',
+              )}
               vacio="Todavía no hay insights validados: un insight propuesto no es memoria hasta que alguien lo valida con sus citas."
               items={datos.insights}
               render={(i) => (
@@ -174,7 +176,12 @@ function PantallaBiblioteca() {
 
             <Seccion
               titulo="Decisiones vigentes"
-              cabecera={conteo(datos.decisiones.length, 'decisión vigente', 'decisiones vigentes')}
+              cabecera={`${datos.totales.decisiones} ${datos.totales.decisiones === 1 ? 'decisión vigente' : 'decisiones vigentes'}`}
+              recorte={notaDeRecorte(
+                datos.decisiones.length,
+                datos.totales.decisiones,
+                'el proyecto de cada decisión',
+              )}
               vacio="Todavía no hay decisiones vigentes. Las que estén en revisión por una reapertura no se listan: hasta que se revaliden son una pregunta, no memoria."
               items={datos.decisiones}
               render={(d) => (
@@ -197,7 +204,12 @@ function PantallaBiblioteca() {
 
             <Seccion
               titulo="Retos cerrados y su veredicto"
-              cabecera={conteo(datos.retosCerrados.length, 'reto cerrado', 'retos cerrados')}
+              cabecera={`${datos.totales.retosCerrados} ${datos.totales.retosCerrados === 1 ? 'reto cerrado' : 'retos cerrados'}`}
+              recorte={notaDeRecorte(
+                datos.retosCerrados.length,
+                datos.totales.retosCerrados,
+                'el árbol del loop',
+              )}
               vacio="Todavía no hay retos cerrados: el veredicto lo dicta el outcome review al final de la ventana de medición."
               items={datos.retosCerrados}
               render={(r) => (
@@ -205,8 +217,17 @@ function PantallaBiblioteca() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                     <Tag>{r.codigo}</Tag>
                     <span style={{ ...titulo, flex: 1, minWidth: 200 }}>{r.titulo}</span>
+                    {r.estado === 'archivado' && <Tag mono={false}>archivado</Tag>}
                     {r.veredicto ? (
-                      <Chip estado="hecho">{ETIQUETA_VEREDICTO[r.veredicto]}</Chip>
+                      // El color es el del proyecto (COLOR_VEREDICTO): «no logrado» no sale en verde.
+                      <span
+                        style={{
+                          font: '700 12.5px var(--font-sans)',
+                          color: COLOR_VEREDICTO[r.veredicto],
+                        }}
+                      >
+                        {ETIQUETA_VEREDICTO[r.veredicto]}
+                      </span>
                     ) : (
                       // Cerrado antes de que existiera el post mortem: no se le inventa veredicto.
                       <span
@@ -241,7 +262,12 @@ function PantallaBiblioteca() {
 
             <Seccion
               titulo="Retos candidatos nacidos del post mortem"
-              cabecera={conteo(datos.retosCandidatos.length, 'reto candidato', 'retos candidatos')}
+              cabecera={`${datos.totales.retosCandidatos} ${datos.totales.retosCandidatos === 1 ? 'reto candidato' : 'retos candidatos'}`}
+              recorte={notaDeRecorte(
+                datos.retosCandidatos.length,
+                datos.totales.retosCandidatos,
+                'el árbol del loop',
+              )}
               vacio="Ningún post mortem ha dejado retos candidatos todavía."
               items={datos.retosCandidatos}
               render={(r) => (
@@ -273,12 +299,15 @@ function PantallaBiblioteca() {
 function Seccion<T extends { id: string }>({
   titulo: rotulo,
   cabecera,
+  recorte,
   vacio,
   items,
   render,
 }: {
   titulo: string;
   cabecera: string;
+  /** La nota de recorte (ver notaDeRecorte), o null si la lista es entera. */
+  recorte: string | null;
   vacio: string;
   items: T[];
   render: (item: T) => ReactNode;
@@ -289,6 +318,7 @@ function Seccion<T extends { id: string }>({
         <span style={{ font: '700 15px var(--font-sans)', color: 'var(--ink)' }}>{rotulo}</span>
         <span style={micro}>{cabecera}</span>
       </div>
+      {recorte && <NotaDeRecorte>{recorte}</NotaDeRecorte>}
       {items.length === 0 ? (
         <Card pending style={{ padding: 18 }}>
           <span style={{ font: '400 13px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}>
@@ -313,15 +343,21 @@ function Seccion<T extends { id: string }>({
 function SeccionArquetipos({
   grupos,
   arquetipos,
+  total,
 }: {
   grupos: GrupoDeSegmento[];
   arquetipos: ArquetipoEnMemoria[];
+  /** Cuántos hay en el workspace; `arquetipos` trae como mucho el tope. */
+  total: number;
 }) {
+  // El desglose por estado es de los que se ENSEÑAN: los que el tope dejó fuera no se
+  // pueden contar por estado sin traerlos, y la nota de recorte ya dice que faltan.
   const resumen = resumenDeArquetipos(arquetipos);
   const cabecera =
-    arquetipos.length === 0
+    total === 0
       ? '0 arquetipos'
-      : `${conteo(arquetipos.length, 'arquetipo', 'arquetipos')} · ${conteo(resumen.confirmado, 'confirmado', 'confirmados')} · ${resumen.hipotesis} hipótesis · ${conteo(resumen.refutado, 'refutado', 'refutados')}`;
+      : `${total} ${total === 1 ? 'arquetipo' : 'arquetipos'} · ${resumen.confirmado} ${resumen.confirmado === 1 ? 'confirmado' : 'confirmados'} · ${resumen.hipotesis} hipótesis · ${resumen.refutado} ${resumen.refutado === 1 ? 'refutado' : 'refutados'}`;
+  const recorte = notaDeRecorte(arquetipos.length, total, 'el proyecto de cada reto');
   return (
     <section
       aria-label="Arquetipos por segmento"
@@ -333,6 +369,7 @@ function SeccionArquetipos({
         </span>
         <span style={micro}>{cabecera}</span>
       </div>
+      {recorte && <NotaDeRecorte>{recorte}</NotaDeRecorte>}
       {grupos.length === 0 && (
         <Card pending style={{ padding: 18 }}>
           <span style={{ font: '400 13px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}>
@@ -405,6 +442,15 @@ function SeccionArquetipos({
         </Card>
       ))}
     </section>
+  );
+}
+
+/** La sección recortó por el tope: se dice antes de la lista, no al final donde nadie llega. */
+function NotaDeRecorte({ children }: { children: ReactNode }) {
+  return (
+    <span role="status" style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+      {children}
+    </span>
   );
 }
 

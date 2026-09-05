@@ -297,15 +297,22 @@ create function portafolio_candado_del_reto_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $fn$
 declare
   v_reto uuid;
+  v_oportunidad uuid;
   v_fila record;
 begin
   v_fila := coalesce(new, old);
   if tg_table_name = 'oportunidad' then
     v_reto := v_fila.reto_id;
   else
+    -- El id se guarda en una VARIABLE y no se vuelve a leer del record más abajo: plpgsql
+    -- resuelve los campos de un `record` al planificar cada sentencia, así que nombrar
+    -- `v_fila.oportunidad_id` dentro de una condición compuesta revienta también cuando la
+    -- fila es de `oportunidad`, donde ese campo no existe — aunque la otra mitad de la
+    -- condición diga que esa rama no aplica.
+    v_oportunidad := v_fila.oportunidad_id;
     select o.reto_id into v_reto
       from oportunidad o
-      where o.id = v_fila.oportunidad_id and o.workspace_id = v_fila.workspace_id;
+      where o.id = v_oportunidad and o.workspace_id = v_fila.workspace_id;
   end if;
   if v_reto is not null then
     perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
@@ -321,9 +328,24 @@ begin
     -- El propietario no pasa por políticas y tampoco por esta comprobación —seed, migraciones
     -- y backfills administran la base y responden por lo que escriben—, que es la misma
     -- exención que tienen `oportunidad_veredicto_guard` y el resto de guards del esquema.
-    if session_user = 'designio_app'
-       and not reto_admite_portafolio(v_reto, v_fila.workspace_id) then
-      raise exception 'el G3 de ese reto está aprobado: su portafolio no se toca sin reabrir la etapa 3';
+    if session_user = 'designio_app' then
+      if not reto_admite_portafolio(v_reto, v_fila.workspace_id) then
+        raise exception 'el G3 de ese reto está aprobado: su portafolio no se toca sin reabrir la etapa 3';
+      end if;
+      -- Y el ESTADO de la oportunidad, que es la otra condición que miró la política del
+      -- enlace. Releer una y dejar la hermana con la foto vieja es el mismo error una capa
+      -- más adentro: el borrado califica con la oportunidad todavía «propuesta», espera
+      -- detrás de una APROBACIÓN de esa misma oportunidad —que toma este mismo candado— y al
+      -- soltarse la ventana de G3 sigue abierta, porque G3 no tiene nada que ver aquí. Queda
+      -- una oportunidad aprobada sin traza: lo que SYS-15 prohíbe, alcanzado por otra puerta.
+      --
+      -- Si hay que releer, se relee TODO lo que la política miró.
+      if v_oportunidad is not null and not exists (
+        select 1 from oportunidad o
+         where o.id = v_oportunidad and o.workspace_id = v_fila.workspace_id
+           and o.estado = 'propuesta') then
+        raise exception 'esa oportunidad ya se decidió: su traza no se toca';
+      end if;
     end if;
   end if;
   return v_fila;

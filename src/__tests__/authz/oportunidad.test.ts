@@ -681,4 +681,72 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
       await admin`delete from workspace where id = ${wsAjeno}`;
     }
   });
+
+  /**
+   * Y la relectura tenía que mirar TAMBIÉN el estado de la oportunidad, no solo la ventana.
+   *
+   * La ronda anterior enseñó que esperar el candado no es volver a preguntar. La primera
+   * versión de la relectura volvía a preguntar solo por G3 — y el estado de la oportunidad,
+   * que es la OTRA condición de la política del enlace, se quedaba con la instantánea del
+   * inicio de la sentencia. Así: el borrado califica con la oportunidad todavía `propuesta`,
+   * espera detrás de una APROBACIÓN de esa misma oportunidad (que toma el mismo candado del
+   * reto), y al soltarse la ventana de G3 sigue abierta —G3 no tiene nada que ver aquí— así
+   * que pasa. Queda una oportunidad aprobada sin traza, que es lo mismo que SYS-15 prohíbe,
+   * alcanzado por otra puerta.
+   *
+   * Arreglar una condición y dejar la hermana con la foto vieja es el mismo error una capa más
+   * adentro: si hay que releer, se relee todo lo que la política miró.
+   */
+  it('un borrado que esperó al candado se encuentra la oportunidad ya aprobada y no pasa', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio relectura 2', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-REL2', 'Reto de la relectura 2', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoR = r!.id as string;
+    const o = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId: retoR, pregunta: 'HMW de la relectura 2', prioridad: 0, prioridadRazon: '',
+    });
+    await enlazarInsight(leadId, {
+      workspaceId: ws, oportunidadId: o.oportunidadId, insightId: insightValidado,
+    });
+
+    // La APROBACIÓN de la oportunidad toma el candado del reto (por su trigger) y se queda
+    // abierta. Aquí G3 no entra en nada: la condición que cambia es el estado de la fila.
+    let soltar: () => void = () => {};
+    const enVuelo = new Promise<void>((r2) => {
+      soltar = r2;
+    });
+    const aprobacion = conUsuario(leadId, async (tx) => {
+      await tx`update oportunidad
+        set estado = 'aprobada', veredicto_razon = ''
+        where id = ${o.oportunidadId} and workspace_id = ${ws}`;
+      await enVuelo;
+    });
+    await new Promise((r2) => setTimeout(r2, 300));
+
+    // El borrado califica AHORA, con la oportunidad todavía `propuesta` para su instantánea.
+    const borrado = conUsuario(leadId, (tx) => tx`
+      delete from oportunidad_insight
+      where oportunidad_id = ${o.oportunidadId} and insight_id = ${insightValidado}
+        and workspace_id = ${ws}`);
+    const veredicto = borrado.then(
+      () => 'borró',
+      (e: Error) => `rechazó: ${e.message}`,
+    );
+
+    await new Promise((r2) => setTimeout(r2, 1500));
+    soltar();
+    await aprobacion;
+
+    expect(
+      await veredicto,
+      'el borrado se coló detrás de una aprobación que ya había commiteado',
+    ).toMatch(/ya se decidió|no se toca/);
+    const enlaces = await admin`select 1 from oportunidad_insight
+      where oportunidad_id = ${o.oportunidadId}`;
+    expect(enlaces.length, 'la oportunidad aprobada se quedó sin traza').toBe(1);
+  }, 20000);
 });

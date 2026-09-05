@@ -578,6 +578,21 @@ export type CandidatoAncla = {
    * hay nada que citar y la extracción produciría una evidencia inventada a partir de la
    * ficha. Se marca en vez de esconderse: el item sigue curándose a mano en la bandeja. */
   sinMaterial?: boolean;
+  /**
+   * Por qué esta ancla NO se puede generar ahora mismo, con lo que hay que hacer. `undefined`
+   * cuando se puede.
+   *
+   * Existe por lo mismo que los dos de arriba —«se marca en vez de esconderse»— pero sin un
+   * campo por motivo: los de arriba son de una capacidad concreta y llevan su propio trato en
+   * la pantalla (el formulario de consentimiento, el camino de la bandeja), y esto es el caso
+   * general, donde lo único que hay que hacer es DECIRLO.
+   *
+   * Y hace falta porque esconderlas era peor que no ofrecerlas: el selector se quedaba vacío
+   * y la pantalla afirmaba «no hay journeys con señales abiertas» sobre un workspace lleno de
+   * ellos, mientras el motivo accionable —cierra a mano las más claras— vivía en un mensaje de
+   * `PREPARAR` que ningún camino del producto podía alcanzar.
+   */
+  bloqueo?: string;
 };
 
 export type PanelPropuestas = {

@@ -332,6 +332,22 @@ async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Pro
  * sería inventarse una alarma. Para la presencia literal, no saber se resuelve como vigente,
  * que es exactamente lo que hacían todas las capacidades cuando ninguna guardaba huella.
  */
+/*
+ * Los dos techos de C5, redactados UNA vez y leídos por los dos lados: el selector, que marca
+ * el journey como no generable, y la admisión, que lo rechaza si alguien lo fuerza igual.
+ *
+ * Escribirlos dos veces era la manera de que divergieran, y esconder el journey en vez de
+ * marcarlo dejaba el mensaje —lo único que dice QUÉ hacer— sin ningún camino del producto que
+ * llegara a él.
+ */
+function motivoDemasiadasSenales(cuantas: number): string {
+  return `Ese journey tiene ${cuantas} señales abiertas y un informe puede llevar ${MAX_REMEDIACIONES}: cierra las más claras a mano y vuelve a pedirlo. (La validación las lista todas, y es exacta.)`;
+}
+
+function motivoConectividadQueNoCabe(caracteres: number): string {
+  return `Las señales de ese journey y su grafo de transiciones ocupan ${caracteres} caracteres y al modelo le caben ${MAX_MATERIAL}: tendría que responder sin ver la conectividad que se le pide remediar. Cierra a mano las señales de los tramos más cargados, o parte el journey, y vuelve a pedirlo.`;
+}
+
 function grafoDelPanelEsElDelModelo(f: Record<string, unknown>): boolean | null {
   const guardada = f.huella_material as string | null;
   if (!guardada) return null;
@@ -838,7 +854,7 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      * haber mirado es la única respuesta que no se puede dar.
      */
     candidatas: async (tx, workspaceId, patron, limite) => {
-      const conSenales: { id: string; titulo: string }[] = [];
+      const conSenales: CandidatoAncla[] = [];
       let vistos = 0;
       let agotado = false;
       while (conSenales.length < limite && vistos < TOPE_DE_BARRIDO_C5 && !agotado) {
@@ -877,16 +893,28 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           const journey = grafos.get(j.id as string);
           if (!journey) continue;
           const senales = validarJourney(journey);
-          // Y las que NO caben tampoco se ofrecen: pedir un informe que el contrato no puede
-          // llevar es pagar una llamada cuya respuesta se descarta. `PREPARAR.C5` lo dice con
-          // su motivo; aquí simplemente no se ofrece.
-          if (senales.length === 0 || senales.length > MAX_REMEDIACIONES) continue;
-          // Ni las que no caben en el material. Es el mismo criterio que el techo de arriba
-          // —no ofrecer lo que la admisión va a rechazar—, y se mide sobre el NÚCLEO y no
-          // sobre el material entero: lo acotan las señales, no el grafo, así que el barrido
-          // no se convierte en armar el prompt de trescientos journeys.
-          if (!nucleoDeRemediacion(grafoParaElModelo(journey)).cabe) continue;
-          conSenales.push({ id: j.id as string, titulo: j.titulo as string });
+          // Un journey LIMPIO no se ofrece, y ésa es la promesa del rótulo: no le falta nada
+          // que remediar. No es lo mismo que los dos de abajo, a los que sí les falta algo.
+          if (senales.length === 0) continue;
+          /*
+           * Y los que no se pueden generar se MARCAN, no se esconden. Esconderlos era peor que
+           * no ofrecerlos: el selector se quedaba vacío y la pantalla afirmaba «no hay journeys
+           * con señales abiertas» sobre un workspace lleno de ellos, mientras el motivo
+           * accionable vivía en un mensaje de `PREPARAR.C5` que ningún camino del producto
+           * podía alcanzar. Es lo que la casa ya hace con los items sin consentimiento y sin
+           * material: se marca en vez de esconderse.
+           *
+           * El núcleo se mide sobre las señales y sus transiciones, no sobre el material
+           * entero: así el barrido no se convierte en armar el prompt de trescientos journeys.
+           */
+          const nucleo = nucleoDeRemediacion(grafoParaElModelo(journey));
+          const bloqueo =
+            senales.length > MAX_REMEDIACIONES
+              ? motivoDemasiadasSenales(senales.length)
+              : !nucleo.cabe
+                ? motivoConectividadQueNoCabe(nucleo.texto.length)
+                : undefined;
+          conSenales.push({ id: j.id as string, titulo: j.titulo as string, bloqueo });
         }
       }
       // Hay más por ofrecer si se llenaron las plazas, o si el barrido se cortó por el tope
@@ -2226,9 +2254,7 @@ const PREPARAR: Record<
      * y se dice qué hacer, que es lo que puede hacer quien lo lee.
      */
     if (grafo.senales.length > MAX_REMEDIACIONES) {
-      throw new ErrorAI(
-        `Ese journey tiene ${grafo.senales.length} señales abiertas y un informe puede llevar ${MAX_REMEDIACIONES}: cierra las más claras a mano y vuelve a pedirlo. (La validación las lista todas, y es exacta.)`,
-      );
+      throw new ErrorAI(motivoDemasiadasSenales(grafo.senales.length));
     }
     const prompt = promptRemediacionJourney({
       nombre: journey.nombre,
@@ -2251,9 +2277,7 @@ const PREPARAR: Record<
      * por un nodo— no tienen respuesta fiable.
      */
     if (!prompt.nucleo.cabe) {
-      throw new ErrorAI(
-        `Las señales de ese journey y su grafo de transiciones ocupan ${prompt.nucleo.caracteres} caracteres y al modelo le caben ${MAX_MATERIAL}: no se llamó al proveedor, porque tendría que responder sin ver la conectividad que se le pide remediar. Cierra a mano las señales de los tramos más cargados, o parte el journey, y vuelve a pedirlo.`,
-      );
+      throw new ErrorAI(motivoConectividadQueNoCabe(prompt.nucleo.caracteres));
     }
     return {
       sistema: SISTEMA_REMEDIACION_JOURNEY,
@@ -2443,6 +2467,44 @@ export async function generarPropuestas(
       );
       await cerrarSinTaparElMotivo(actorId, entrada, intentos);
       throw new ErrorAI(motivo);
+    }
+
+    /*
+     * LA COMPROBACIÓN SEMÁNTICA, ANTES DE CERRAR LA LÍNEA.
+     *
+     * El esquema ya se comprobó arriba, y su fallo reetiqueta el intento como
+     * `fuera-de-contrato`. Lo que el esquema no puede ver —que un informe de C5 cubra cada
+     * señal exactamente una vez, y que hable del grafo que el modelo tuvo delante— se
+     * comprobaba solo DENTRO de la transacción que persiste, o sea después de que
+     * `cerrarLlamadas` hubiera anotado la línea como `salida-valida`. El resultado: el libro
+     * decía que esa llamada produjo una salida válida, no nacía ninguna propuesta, y el evento
+     * `LlamadaAISinPropuesta` no salía —su trigger mira el tránsito DESDE `despachada`—. Las
+     * respuestas de C5 fuera de contrato quedaban sistemáticamente sin contar.
+     *
+     * Y no se puede arreglar después: la política `llamada_completar` lleva
+     * `using (resultado = 'despachada')`, así que una línea cerrada no la puede tocar la
+     * aplicación — a propósito, es lo que la hace un hecho consumado. La única manera de que
+     * el libro diga la verdad es preguntar antes de cerrar.
+     *
+     * La comprobación se queda TAMBIÉN dentro de la transacción que persiste, y no sobra:
+     * entre esta lectura y la escritura cabe la edición de otro curador, y solo la de dentro
+     * es atómica con la fila. Lo que queda sin cubrir es exactamente esa ventana —una edición
+     * ajena entre las dos—, y ahí el desenlace no es «fuera de contrato» sino «el mundo se
+     * movió», que es otra cosa y no tiene valor propio en el vocabulario.
+     */
+    try {
+      await conUsuario(actorId, (tx) =>
+        COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial),
+      );
+    } catch (e) {
+      if (!(e instanceof ErrorAI)) throw e;
+      const intentos = respuesta.intentos.map((i, indice) =>
+        indice === respuesta.intentos.length - 1
+          ? { ...i, resultado: 'fuera-de-contrato' as const, motivo: e.message }
+          : i,
+      );
+      await cerrarSinTaparElMotivo(actorId, entrada, intentos);
+      throw e;
     }
 
     const { idSalidaValida } = await cerrarLlamadas(actorId, respuesta.intentos);

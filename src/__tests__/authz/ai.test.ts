@@ -5992,6 +5992,33 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         select count(*)::int as n from propuesta_ai
         where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
       expect(quedan[0]!.n).toBe(0);
+
+      /*
+       * Y EL LIBRO LO DICE. La comprobación semántica corría dentro de la transacción que
+       * persiste, o sea DESPUÉS de que la línea se cerrara como `salida-valida`: el libro
+       * afirmaba que esa llamada produjo una salida válida, no nacía propuesta, y el evento
+       * `LlamadaAISinPropuesta` no salía —su trigger mira el tránsito desde `despachada`—.
+       * Las respuestas de C5 fuera de contrato quedaban sistemáticamente sin contar.
+       *
+       * Y no se puede arreglar después: `llamada_completar` lleva
+       * `using (resultado = 'despachada')`, así que una línea cerrada no la toca la
+       * aplicación. La única manera de que el libro diga la verdad es preguntar antes.
+       */
+      const lineas = await sqlAdmin()`select resultado, motivo from llamada_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}
+        order by creado_en desc, id desc`;
+      expect(lineas.length).toBeGreaterThan(0);
+      expect(
+        lineas.map((l) => l.resultado as string),
+        'el libro anota como salida válida una respuesta que se descartó',
+      ).toEqual(lineas.map(() => 'fuera-de-contrato'));
+      expect(lineas[0]!.motivo as string).toMatch(/dos remediaciones para la misma señal/);
+
+      const eventos = await sqlAdmin()`select count(*)::int as n from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'LlamadaAISinPropuesta'`;
+      expect(eventos[0]!.n, 'nadie registra que esa llamada no dejó propuesta').toBe(
+        lineas.length,
+      );
     });
   });
 
@@ -6086,11 +6113,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const senales = await senalesDe(curadorId, wsC, j.journeyId);
       expect(senales.length).toBeGreaterThan(MAX_REMEDIACIONES);
 
-      // No se ofrece…
+      // Se ofrece MARCADO, no escondido: esconderlo dejaba el selector vacío y la pantalla
+      // afirmando «no hay journeys con señales abiertas» sobre uno que las tiene de sobra,
+      // mientras el único texto que dice qué hacer vivía en un mensaje inalcanzable.
       const panel = await panelPropuestas(curadorId, wsC);
-      expect(panel.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(false);
+      const ofrecido = panel.candidatas.C5.lista.find((c) => c.id === j.journeyId);
+      expect(ofrecido, 'el journey se esconde en vez de decir por qué no se puede').toBeDefined();
+      expect(ofrecido!.bloqueo).toMatch(/cierra las más claras a mano/);
 
-      // …y forzarlo tampoco gasta.
+      // …y forzarlo tampoco gasta, con EL MISMO texto: una sola redacción, dos caminos.
       const [antes] = await admin`select count(*)::int as n from llamada_ai
         where workspace_id = ${wsC}`;
       await conProveedor(
@@ -6098,7 +6129,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         async () => {
           await expect(
             generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
-          ).rejects.toThrow(/cierra las más claras a mano/);
+          ).rejects.toThrow(ofrecido!.bloqueo!);
         },
       );
       const [despues] = await admin`select count(*)::int as n from llamada_ai
@@ -6205,11 +6236,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         where id = ${senales[0]!.nodoId} and workspace_id = ${wsC}`;
       expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
 
-      // No se ofrece…
+      // Se ofrece MARCADO, no escondido, por lo mismo que el techo de señales.
       const panel = await panelPropuestas(curadorId, wsC);
-      expect(panel.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(false);
+      const ofrecido = panel.candidatas.C5.lista.find((c) => c.id === j.journeyId);
+      expect(ofrecido, 'el journey se esconde en vez de decir por qué no se puede').toBeDefined();
+      expect(ofrecido!.bloqueo).toMatch(/sin ver la conectividad que se le pide remediar/);
 
-      // …y forzarlo tampoco gasta.
+      // …y forzarlo tampoco gasta, con EL MISMO texto.
       const [antes] = await admin`select count(*)::int as n from llamada_ai
         where workspace_id = ${wsC}`;
       await conProveedor(
@@ -6217,7 +6250,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         async () => {
           await expect(
             generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
-          ).rejects.toThrow(/sin ver la conectividad que se le pide remediar/);
+          ).rejects.toThrow(ofrecido!.bloqueo!);
         },
       );
       const [despues] = await admin`select count(*)::int as n from llamada_ai

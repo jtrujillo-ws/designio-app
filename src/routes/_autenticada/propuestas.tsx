@@ -502,6 +502,10 @@ function FormularioGeneracion({
   // se apaga con su explicación, porque aquí no hay nada que arreglar (el contenido de un
   // item importado es inmutable) — el camino es la bandeja.
   const sinMaterial = Boolean(elegida?.sinMaterial);
+  // El caso general de «se marca en vez de esconderse»: el ancla está en la lista y no se
+  // puede generar, con su motivo. Lo redacta el servidor porque es él quien lo va a rechazar
+  // si alguien lo fuerza igual, así que el texto es exactamente el mismo por los dos caminos.
+  const bloqueo = elegida?.bloqueo ?? null;
 
   // El ancla elegida dejó de estar entre las opciones: pasa al BUSCAR algo que la excluye —la
   // búsqueda viaja al servidor y devuelve otra lista—, así que el id guardado sobrevive a la
@@ -615,6 +619,7 @@ function FormularioGeneracion({
                   {a.titulo}
                   {a.consentimientoPendiente ? ' · falta consentimiento' : ''}
                   {a.sinMaterial ? ' · sin material que citar' : ''}
+                  {a.bloqueo ? ' · no se puede generar' : ''}
                 </option>
               ))}
             </Select>
@@ -653,12 +658,22 @@ function FormularioGeneracion({
             de importación, o vuelve a importarlo con el contenido pegado.
           </span>
         )}
+        {bloqueo && (
+          <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+            {bloqueo}
+          </span>
+        )}
         {!faltaConsentimiento && (
           <div>
             <Button
               type="submit"
               disabled={
-                enviando || !habilitada || anclas.length === 0 || sinMaterial || anclaPerdida
+                enviando ||
+                !habilitada ||
+                anclas.length === 0 ||
+                sinMaterial ||
+                anclaPerdida ||
+                bloqueo !== null
               }
             >
               {enviando ? 'Proponiendo…' : 'Proponer con AI'}

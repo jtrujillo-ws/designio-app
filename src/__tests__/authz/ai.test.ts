@@ -7557,6 +7557,160 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * La cita repetida también la corta la BASE, no solo el contrato.
+   *
+   * `ContenidoInsightSchema` ya la rechaza, y eso cubre el camino de la aplicación. La
+   * superficie SQL concedida no pasa por ahí, y el guard diferido compara las citas por
+   * EXISTENCIA más el recuento: con la misma cita propuesta dos veces, materializar una que
+   * coincide y otra que NADIE propuso cuadra el recuento —dos y dos— y las dos entradas
+   * repetidas encuentran la misma fila. Medido antes del arreglo: `entra=ENTRÓ`, `sella=SELLÓ`.
+   * Un insight aceptado con una cita que ningún humano revisó.
+   *
+   * Se corta donde el recuento vuelve a significar lo que dice: sin repetidas, «tantas como
+   * dice la propuesta» más «cada una existe» ES la igualdad de conjuntos. Y va en el guard del
+   * INSERT y no en el diferido, porque así la propuesta mala no llega ni a nacer.
+   */
+  it('una cita repetida no entra tampoco por la superficie SQL', async () => {
+    await enWorkspaceLimpio('c2-cita-repetida-suelo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento. Y el 12% en el alta.',
+      });
+      const cita = { evidenciaId: ev, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' };
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const escribir = (contenido: unknown) =>
+        conUsuario(curadorId, (tx) => tx`
+          insert into propuesta_ai
+            (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             llamada_id, creado_por)
+          values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
+                  ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                  'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})
+          returning id`);
+
+      await expect(
+        escribir({
+          titulo: 'T',
+          resumen: 'R',
+          afirmaciones: [{ texto: 'A', esHipotesis: false, citas: [cita, cita] }],
+          contradicciones: [],
+          confianzaPropuesta: 'media',
+        }),
+        'la superficie SQL admite una propuesta cuyo recuento de citas ya no significa nada',
+      ).rejects.toThrow(/repite la misma cita/);
+
+      // Y el MISMO documento con OTRO fragmento sí entra: citar dos veces la misma evidencia
+      // es legítimo, y por eso esto no puede ser un índice único.
+      await expect(
+        escribir({
+          titulo: 'T',
+          resumen: 'R',
+          afirmaciones: [
+            {
+              texto: 'A',
+              esHipotesis: false,
+              citas: [cita, { ...cita, fragmento: 'Y el 12% en el alta' }],
+            },
+          ],
+          contradicciones: [],
+          confianzaPropuesta: 'media',
+        }),
+      ).resolves.toBeDefined();
+    });
+  });
+
+  /**
+   * Y el derecho de CITA no se le exige a una contradicción, que no cita.
+   *
+   * El barrido que rechaza una cita a evidencia ajena o no citable recorría las dos ramas
+   * —citas y contradicciones— aplicándoles las DOS reglas. La proveniencia sí vale para las
+   * dos: una contradicción a evidencia de otro reto está tan mal como una cita, y ahí
+   * `contradiccion` solo lleva la FK del tenant, así que este barrido es lo único que lo mira.
+   * El derecho de cita no: `evidencia_citable_guard` cuelga de `cita` y NO de `contradiccion`,
+   * a propósito, y la aceptación materializa la contradicción sin pedirlo.
+   *
+   * Así que rechazar la propuesta entera por ahí era descartar trabajo bueno POR EL RELOJ: si
+   * la revocación llega durante la llamada, la propuesta muere con el gasto ya hecho; si llega
+   * un segundo después de persistir, la misma propuesta es perfectamente aceptable. Medido:
+   * `persiste=rechazó`, y el mensaje además llamaba «cita» a una contradicción.
+   *
+   * Las dos mitades: la contradicción a evidencia sin derechos entra, y la contradicción a
+   * evidencia AJENA sigue sin entrar — que es la regla que había que conservar.
+   */
+  it('una contradicción no necesita el derecho de cita, pero sí ser del reto', async () => {
+    await enWorkspaceLimpio('c2-contradiccion-derechos', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const a = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const b = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La que se revoca',
+        resumen: 'Aquí dicen que el problema es el precio.',
+      });
+      // A la evidencia SOLO contradicha se le retiran los derechos antes de persistir, que es
+      // lo que pasa cuando la revocación cae durante la llamada al proveedor.
+      await admin`update derecho_uso
+        set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+            decidido_por = ${curadorId}, decidido_en = now()
+        where evidencia_id = ${b} and workspace_id = ${wsC}`;
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const conContradiccionA = (evidenciaId: string) => ({
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId: a, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones: [{ evidenciaId, descripcion: 'Va en contra' }],
+        confianzaPropuesta: 'media',
+      });
+      const escribir = (contenido: unknown) =>
+        conUsuario(curadorId, (tx) => tx`
+          insert into propuesta_ai
+            (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             llamada_id, creado_por)
+          values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
+                  ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                  'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})
+          returning id`);
+
+      // Entra: la contradicción no reproduce nada, así que no pide permiso de publicación.
+      await expect(
+        escribir(conContradiccionA(b)),
+        'se descarta una propuesta pagada por una condición que la aceptación no exige',
+      ).resolves.toBeDefined();
+
+      // Y la proveniencia sigue en pie para la misma rama: una evidencia de OTRO reto no.
+      const [otroReto] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+        select ${wsC}, servicio_ancla_id, 'R-99', 'Otro reto', 'candidato', 'peticion-cliente',
+               ${curadorId}
+        from reto where id = ${retoC} returning id`;
+      const ajena = await evidenciaDelReto(wsC, otroReto!.id as string, curadorId, {
+        titulo: 'De otro reto',
+        resumen: 'Nada que ver.',
+      });
+      await expect(
+        escribir(conContradiccionA(ajena)),
+        'una contradicción puede señalar evidencia que no es de este reto',
+      ).rejects.toThrow(/no es de este reto/);
+    });
+  });
+
+  /**
    * El NOMBRE de un documento no lo gobiernan los derechos de cita.
    *
    * Las etiquetas del contenido salían de la lista del MATERIAL, que está filtrada por

@@ -837,6 +837,7 @@ create or replace function propuesta_ai_c2_citas_guard() returns trigger
 language plpgsql as $$
 declare
   senalada text;
+  rama_senalada text;
   motivo text;
 begin
   if new.capacidad <> 'C2' then
@@ -922,8 +923,21 @@ begin
   -- que hacía `hallada`: una cita sin `evidenciaId` la selecciona el `not exists` y deja el
   -- valor en null, así que preguntar por el valor no dispararía — admitiendo justo lo que se
   -- rechaza. `motivo` solo es null cuando no hubo fila.
-  select
-    coalesce(citas.x, '(sin evidenciaId)'),
+  -- Y las dos NO se aplican al mismo conjunto, que es lo que este barrido tenía mal.
+  --
+  -- La proveniencia vale para las dos ramas: una contradicción a evidencia de otro reto está
+  -- tan mal como una cita, y ahí `contradiccion` solo lleva la FK del tenant, así que este
+  -- barrido es lo único que lo mira. El derecho de CITA, en cambio, es de las citas y de nadie
+  -- más: `evidencia_citable_guard` cuelga de «cita» y NO de «contradiccion», a propósito —una
+  -- cita reproduce un fragmento para el cliente y una contradicción solo señala que ese
+  -- documento va en contra—. Aplicárselo a las dos rechazaba la propuesta entera, con la
+  -- llamada ya pagada, por una condición que la aceptación no exige: medido, una contradicción
+  -- a evidencia cuyos derechos se retiran durante la llamada moría aquí… y la misma propuesta
+  -- es perfectamente aceptable si la revocación llega un segundo después. Se descartaba
+  -- trabajo bueno por el reloj, y el mensaje además llamaba «cita» a una contradicción.
+  --
+  -- Así que la rama viaja con el id y cada regla se aplica a lo suyo.
+  select coalesce(citas.x, '(sin evidenciaId)'), citas.rama,
     case
       when not exists (
         select 1
@@ -934,13 +948,13 @@ begin
       then 'ajena'
       else 'no-citable'
     end
-  into senalada, motivo
+  into senalada, rama_senalada, motivo
   from (
-    select h->>'evidenciaId' as x
+    select h->>'evidenciaId' as x, 'cita' as rama
     from jsonb_path_query(
            new.contenido, '$.afirmaciones[*].citas[*]') h
     union all
-    select h->>'evidenciaId'
+    select h->>'evidenciaId', 'contradiccion'
     from jsonb_array_elements(
            case when jsonb_typeof(new.contenido->'contradicciones') = 'array'
                 then new.contenido->'contradicciones' else '[]'::jsonb end) h
@@ -951,17 +965,52 @@ begin
     join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
     where a.reto_id = new.reto_id and a.workspace_id = new.workspace_id
       and ae.evidencia_id::text = lower(citas.x))
-     or not exists (
+     or (citas.rama = 'cita' and not exists (
     select 1 from evidencia e
     where e.id::text = lower(citas.x) and e.workspace_id = new.workspace_id
-      and evidencia_usable(e.id, e.workspace_id, 'cliente'))
+      and evidencia_usable(e.id, e.workspace_id, 'cliente')))
   limit 1;
   if motivo = 'ajena' then
     raise exception
-      'una cita del insight señala evidencia que no es de este reto: %', senalada;
+      'una % del insight señala evidencia que no es de este reto: %', rama_senalada, senalada;
   elsif motivo = 'no-citable' then
     raise exception
       'una cita del insight señala evidencia que ya no se puede citar al cliente (su derecho de uso se retiró, caducó o el documento ya no está): %. La propuesta se descarta; si el derecho vuelve, vuelve a pedirla.',
+      senalada;
+  end if;
+
+  -- Y NINGUNA CITA REPETIDA, que es el suelo de una regla que solo estaba arriba.
+  --
+  -- `ContenidoInsightSchema` ya rechaza la cita duplicada dentro de una afirmación, y eso cubre
+  -- el camino de la aplicación. La superficie SQL concedida no pasa por ahí, y el guard
+  -- diferido de materialización compara las citas por EXISTENCIA más el recuento: con la misma
+  -- cita propuesta dos veces, materializar una que coincide y otra que nadie propuso cuadra el
+  -- recuento (dos y dos) y las dos entradas repetidas encuentran la misma fila. Medido: se
+  -- sellaba un insight con una cita que ningún humano revisó.
+  --
+  -- Se corta donde el recuento vuelve a significar lo que dice: sin repetidas, «tantas como
+  -- dice la propuesta» más «cada una existe» ES la igualdad de conjuntos. Es la misma regla
+  -- que el `unique (insight_id, evidencia_id)` de las contradicciones, escrita para las citas,
+  -- que no la pueden tener como índice porque el mismo documento se cita legítimamente varias
+  -- veces con fragmentos distintos.
+  select af->>'texto' into senalada
+  from jsonb_array_elements(
+         case when jsonb_typeof(new.contenido->'afirmaciones') = 'array'
+              then new.contenido->'afirmaciones' else '[]'::jsonb end) as p(af)
+  where (
+    select count(*) from jsonb_array_elements(
+           case when jsonb_typeof(p.af->'citas') = 'array' then p.af->'citas'
+                else '[]'::jsonb end) as q(ci)
+  ) <> (
+    select count(distinct (lower(q.ci->>'evidenciaId'), q.ci->>'fragmento', q.ci->>'localizacion'))
+    from jsonb_array_elements(
+           case when jsonb_typeof(p.af->'citas') = 'array' then p.af->'citas'
+                else '[]'::jsonb end) as q(ci)
+  )
+  limit 1;
+  if senalada is not null then
+    raise exception
+      'una afirmación del insight repite la misma cita: no añade sostén y rompe la comprobación de que lo materializado es lo propuesto (afirmación: %)',
       senalada;
   end if;
   return new;

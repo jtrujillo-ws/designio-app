@@ -1,5 +1,6 @@
 import './server-only';
 import postgres, { type Sql, type TransactionSql } from 'postgres';
+import { ErrorConfiguracion } from './configuracion.server';
 
 /**
  * Acceso a datos de Designio.
@@ -17,12 +18,32 @@ import postgres, { type Sql, type TransactionSql } from 'postgres';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
-  if (!value) throw new Error(`Falta la variable de entorno ${name} (ver .env.local.example)`);
+  if (!value) {
+    throw new ErrorConfiguracion(`Falta la variable de entorno ${name} (ver .env.local.example)`);
+  }
   return value;
 }
 
-function pool(url: string): Sql {
-  return postgres(url, { max: 10, idle_timeout: 20, connect_timeout: 10 });
+/*
+ * Que la variable EXISTA no la hace una cadena de conexión. Medido con el valor que un
+ * despliegue real llegó a tener —«postgres.railway.internal / 5432», el host y el puerto en
+ * vez de la URL—: `postgres()` lanza un `TypeError` al construir el pool, antes de la primera
+ * consulta. Sin este envoltorio ese TypeError salía tal cual por la server function de login y
+ * la pantalla lo presentaba como «intenta de nuevo», que es un reintento que no puede
+ * funcionar nunca.
+ *
+ * El nombre de la variable entra en el mensaje y el valor NO: un DSN lleva la contraseña
+ * dentro, y este mensaje acaba en el registro del servidor.
+ */
+function pool(nombre: string, url: string): Sql {
+  try {
+    return postgres(url, { max: 10, idle_timeout: 20, connect_timeout: 10 });
+  } catch (e) {
+    throw new ErrorConfiguracion(
+      `${nombre} no es una cadena de conexión válida (se espera postgres://usuario:clave@host:puerto/base)`,
+      { cause: e },
+    );
+  }
 }
 
 let appSql: Sql | undefined;
@@ -30,13 +51,13 @@ let adminSql: Sql | undefined;
 
 /** Conexión de la aplicación (rol no privilegiado, RLS activo). */
 export function sql(): Sql {
-  appSql ??= pool(requireEnv('DATABASE_URL_APP'));
+  appSql ??= pool('DATABASE_URL_APP', requireEnv('DATABASE_URL_APP'));
   return appSql;
 }
 
 /** Conexión administrativa. Solo migraciones, seed, jobs de sistema y export. */
 export function sqlAdmin(): Sql {
-  adminSql ??= pool(requireEnv('DATABASE_URL'));
+  adminSql ??= pool('DATABASE_URL', requireEnv('DATABASE_URL'));
   return adminSql;
 }
 

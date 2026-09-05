@@ -1,5 +1,6 @@
 import '@/lib/server-only';
 import { jwtVerify, SignJWT } from 'jose';
+import { ErrorConfiguracion } from '@/lib/configuracion.server';
 
 /**
  * Sesión = JWT HS256 en cookie httpOnly (auth nativa del diseño técnico; sin estado en DB).
@@ -25,7 +26,7 @@ function secreto(): Uint8Array {
     // Ojo: Vite inlinea NODE_ENV=production al compilar, así que el build de producción
     // SIEMPRE exige JWT_SECRET; el fallback solo existe para vite dev y los tests.
     if (process.env.NODE_ENV === 'production') {
-      throw new Error('Falta JWT_SECRET: en producción las sesiones no pueden firmarse con la clave de desarrollo');
+      throw new ErrorConfiguracion('Falta JWT_SECRET: en producción las sesiones no pueden firmarse con la clave de desarrollo');
     }
     if (!avisoDevDado) {
       console.warn('JWT_SECRET no definido: usando la clave de DESARROLLO para firmar sesiones');

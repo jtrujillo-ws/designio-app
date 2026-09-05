@@ -144,6 +144,62 @@ $fn$;
 revoke execute on function reto_admite_portafolio(uuid, uuid) from public;
 grant execute on function reto_admite_portafolio(uuid, uuid) to designio_app;
 
+-- ── Y una etapa cerrada solo se reabre POR LA PUERTA ──
+-- La función de arriba toma `etapa_instancia.estado = 'en-curso'` por «hay una reapertura
+-- viva». No se lo inventa: es la lectura que hacen también las ventanas de insight/decisión, de
+-- medición y de la capa AI — seis sitios en cinco migraciones anteriores escriben
+-- `e.estado <> 'en-curso'`. Ninguno comprobaba que ese 'en-curso' VINIERA de una reapertura
+-- registrada, y la superficie SQL concedida no lo impide: `grant update (estado) on
+-- etapa_instancia` y la política `etapa_update` dejan que un lead o un diseñador pongan la
+-- etapa en curso a mano.
+--
+-- Medido antes de escribir esto: con G3 aprobado y la etapa cerrada, `reto_admite_portafolio`
+-- decía `false`; después de un `update etapa_instancia set estado = 'en-curso'` hecho por el
+-- propio lead decía `true`, con CERO filas en `reapertura_etapa` y CERO eventos
+-- `EtapaReabierta`. El congelado lo abría sin dejar rastro exactamente el rol al que congela, y
+-- volver a cerrar la etapa después deja el gate firmado sin que el guard de G3 vuelva a correr.
+--
+-- Se arregla en la TRANSICIÓN y no en el predicado de esta migración: endurecer solo
+-- `reto_admite_portafolio` dejaría las otras cinco ventanas igual de falsificables y ésta
+-- distinta de sus hermanas sin ningún motivo que se pueda leer.
+--
+-- Diferido porque `reabrirEtapa` escribe la etapa y su registro en la MISMA sentencia (un CTE),
+-- y un guard inmediato dependería del orden en que se materializan sus ramas. Al commit las dos
+-- están escritas.
+--
+-- `reabierto_en = now()` significa «en esta transacción»: `now()` es la hora de INICIO de la
+-- transacción y es el default de la columna, así que solo casan las filas escritas aquí. Una
+-- reapertura vieja —de un ciclo anterior, ya vuelto a cerrar— no sirve de coartada.
+--
+-- Se calla ante el propietario por `session_user`, como el resto de la casa: migraciones, seed
+-- y fixtures montan estados a mano a propósito, y quien tiene el rol dueño no necesita esta
+-- puerta para nada.
+create function etapa_reabre_con_su_registro_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+begin
+  if session_user <> 'designio_app' then return null; end if;
+  if old.estado = 'completada' and new.estado = 'en-curso'
+     and not exists (
+       select 1 from reapertura_etapa r
+        where r.workspace_id = new.workspace_id
+          and r.proyecto_id = new.proyecto_id
+          and r.etapa_numero = new.numero
+          and r.reabierto_en = now()) then
+    raise exception 'esa etapa está cerrada y solo se reabre por la puerta: la reapertura tiene que quedar registrada —motivo, alcance y quién— en la misma transacción que la abre';
+  end if;
+  return null;
+end;
+$fn$;
+
+revoke execute on function etapa_reabre_con_su_registro_guard() from public;
+
+-- `z_` para que quede por detrás de `a_congelacion_por_disposicion`, que es la que abre en toda
+-- tabla de workspace y tiene su propio censo.
+create constraint trigger z_etapa_reabre_con_su_registro
+  after update on etapa_instancia
+  deferrable initially deferred
+  for each row execute function etapa_reabre_con_su_registro_guard();
+
 -- Verla es de todo miembro: el portal existe para que el cliente vea el razonamiento, y una
 -- oportunidad es exactamente el razonamiento que se le enseña en la etapa 3.
 create policy oportunidad_select on oportunidad
@@ -273,6 +329,35 @@ $fn$;
 -- verde, y no una precaución de más: un trigger no necesita EXECUTE público para dispararse.
 revoke execute on function oportunidad_veredicto_guard() from public;
 
+-- ── Y una repriorización tiene que ser una repriorización ──
+-- El grant por columnas deja tocar `veredicto_razon`, y la política de UPDATE solo exige que la
+-- fila siga en 'propuesta'. Así que un `update oportunidad set veredicto_razon = …` que no
+-- cambia el estado pasaba — y la auditoría, que clasifica por «no cambió el estado ⇒ se
+-- repriorizó», lo apuntaba como `OportunidadRepriorizada`. Un archivo que describe una acción
+-- que no ocurrió es peor que uno incompleto: se puede contar, y cuenta mal.
+--
+-- La salida no es inventarle un tipo de evento a eso, es que eso no ocurra. La razón de un
+-- veredicto es el porqué de una decisión: cambiarla sin cambiar la decisión reescribe el
+-- archivo, que es justo lo que el append-only existe para impedir. Con esta puerta cerrada, la
+-- rama `else` de `oportunidad_auditoria` es verdad POR CONSTRUCCIÓN y no por confianza — el
+-- grant no deja tocar `pregunta` ni el ancla, el CHECK de la tabla no deja firmar sin decidir,
+-- y lo único que queda es la prioridad y su razón.
+--
+-- Se calla ante el propietario por `session_user`, como el resto de guards: seed y backfills
+-- montan estados a mano y no pasan por esta puerta.
+create function oportunidad_razon_del_veredicto_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+begin
+  if session_user = 'designio_app'
+     and new.veredicto_razon is distinct from old.veredicto_razon then
+    raise exception 'la razón del veredicto no se reescribe sin veredicto: esa razón explica una decisión, y aquí no se está decidiendo nada';
+  end if;
+  return new;
+end;
+$fn$;
+
+revoke execute on function oportunidad_razon_del_veredicto_guard() from public;
+
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Y EL CANDADO DEL RETO, QUE ES LA CLAVE QUE USA LA APROBACIÓN DE G3
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -365,6 +450,13 @@ create trigger oportunidad_veredicto_guard
   before update on oportunidad
   for each row when (old.estado = 'propuesta' and new.estado <> 'propuesta')
   execute function oportunidad_veredicto_guard();
+
+-- El complementario del de arriba: aquel corre cuando el estado CAMBIA, éste cuando no. Entre
+-- los dos cubren todo UPDATE de la tabla.
+create trigger c_razon_del_veredicto
+  before update on oportunidad
+  for each row when (old.estado = new.estado)
+  execute function oportunidad_razon_del_veredicto_guard();
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- G3
@@ -839,8 +931,11 @@ begin
     elsif old.estado is distinct from new.estado then
       v_tipo := 'OportunidadDecidida';
     else
-      -- Lo único que queda es la repriorización: el grant no deja tocar `pregunta` ni el
-      -- ancla, así que un UPDATE que no cambia el estado cambió la prioridad o su razón.
+      -- Lo único que queda es la repriorización, y eso es verdad por construcción y no por
+      -- confianza: el grant no deja tocar `pregunta` ni el ancla, el CHECK de la tabla no deja
+      -- firmar sin decidir, y `oportunidad_razon_del_veredicto_guard` cierra la última rendija
+      -- —tocar `veredicto_razon` sin veredicto—, que era la que hacía que este `else` apuntara
+      -- como repriorización algo que no lo era.
       v_tipo := 'OportunidadRepriorizada';
     end if;
     v_payload := jsonb_strip_nulls(jsonb_build_object(

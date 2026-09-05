@@ -101,6 +101,8 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     await admin`delete from checklist_item where workspace_id = ${ws}`;
     await admin`delete from gate_instancia where workspace_id = ${ws}`;
     await admin`delete from etapa_instancia where workspace_id = ${ws}`;
+    await admin`delete from reapertura_insight where workspace_id = ${ws}`;
+    await admin`delete from reapertura_etapa where workspace_id = ${ws}`;
     await admin`delete from proyecto where workspace_id = ${ws}`;
     await admin`delete from cita where workspace_id = ${ws}`;
     await admin`delete from afirmacion where workspace_id = ${ws}`;
@@ -475,6 +477,112 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     });
     const [tras] = await admin`select prioridad from oportunidad where id = ${viva.oportunidadId}`;
     expect(tras!.prioridad).toBe(9);
+  });
+
+  /**
+   * La razón de un veredicto no se reescribe sin veredicto — y por eso el archivo puede contar.
+   *
+   * `oportunidad_auditoria` clasifica por descarte: si el UPDATE no cambió el estado, se
+   * repriorizó. El grant, sin embargo, deja tocar `veredicto_razon`, y la política solo exige
+   * que la fila siga en 'propuesta'. Así que un `update … set veredicto_razon = …` entraba y
+   * quedaba apuntado como `OportunidadRepriorizada`: el archivo describía una acción que no
+   * ocurrió, y contar repriorizaciones daba un número inventado.
+   *
+   * La salida no es un tipo de evento nuevo, es que no ocurra: esa razón explica una decisión, y
+   * cambiarla sin decidir nada reescribe el archivo. Cerrada la rendija, el `else` de la
+   * auditoría es verdad por construcción.
+   */
+  it('la razón del veredicto no se toca sin veredicto, y el archivo no inventa repriorizaciones', async () => {
+    const admin = sqlAdmin();
+    const { oportunidadId } = await crearOportunidad(leadId, {
+      workspaceId: ws,
+      retoId,
+      pregunta: '¿Cómo podríamos no reescribir el archivo?',
+      prioridad: 1,
+      prioridadRazon: 'Nace priorizada',
+    });
+
+    await expect(
+      conUsuario(leadId, (tx) => tx`update oportunidad
+        set veredicto_razon = 'esto no lo decidió nadie'
+        where id = ${oportunidadId} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/no se reescribe sin veredicto/);
+
+    // Ni la fila ni el archivo se movieron.
+    const [sinTocar] = await admin`select veredicto_razon from oportunidad
+      where id = ${oportunidadId}`;
+    expect(sinTocar!.veredicto_razon).toBe('');
+    const repriorizaciones = await admin`select 1 from evento_dominio
+      where workspace_id = ${ws} and tipo = 'OportunidadRepriorizada'
+        and payload->>'oportunidadId' = ${oportunidadId}`;
+    expect(repriorizaciones.length, 'se apuntó una repriorización que no ocurrió').toBe(0);
+
+    // Y repriorizar de verdad sí deja su rastro, que es la otra mitad.
+    await priorizarOportunidad(leadId, {
+      workspaceId: ws,
+      oportunidadId,
+      prioridad: 7,
+      prioridadRazon: 'Toca el criterio de tiempo',
+    });
+    const tras = await admin`select 1 from evento_dominio
+      where workspace_id = ${ws} and tipo = 'OportunidadRepriorizada'
+        and payload->>'oportunidadId' = ${oportunidadId}`;
+    expect(tras.length).toBe(1);
+  });
+
+  /**
+   * Y esa reapertura tiene que ser DE VERDAD: el 'en-curso' no se pone a mano.
+   *
+   * La ventana del portafolio se abre cuando la etapa 3 está `en-curso`, y esa lectura la hacen
+   * también las ventanas de insight/decisión, de medición y de la capa AI. Pero `grant update
+   * (estado) on etapa_instancia` y la política `etapa_update` dejan que el propio lead ponga la
+   * etapa en curso por SQL, sin registrar nada: el congelado lo abría, sin dejar rastro,
+   * exactamente el rol al que congela — y volver a cerrarla después deja G3 firmado sin que su
+   * guard vuelva a correr.
+   *
+   * Se mide por las dos mitades, que es lo que distingue cerrar la puerta de tapiarla: el
+   * atajo se rechaza, y la reapertura registrada sigue abriendo la ventana.
+   */
+  it('la etapa cerrada no se pone en curso a mano, y la reapertura registrada sí la abre', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio reapertura', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-REA', 'Reto de la reapertura', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoR = r!.id as string;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${retoR}, 'P-REA', 'Proyecto de la reapertura', 'activo', 'rapido',
+              ${leadId}) returning id`;
+    const proyectoR = p!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoR}, 3, 'Conceptualización', 'completada')`;
+
+    // El atajo: el mismo lead, por SQL, sin registrar nada.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update etapa_instancia set estado = 'en-curso'
+        where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`),
+    ).rejects.toThrow(/solo se reabre por la puerta/);
+    const [sinTocar] = await admin`select estado from etapa_instancia
+      where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`;
+    expect(sinTocar!.estado as string).toBe('completada');
+
+    // Y la puerta: el registro y la etapa, en la misma transacción. No se tapia el camino
+    // bueno — si esto se pusiera rojo, el arreglo habría dejado el método sin reaperturas.
+    await conUsuario(leadId, async (tx) => {
+      await tx`insert into reapertura_etapa
+        (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+         reabierto_por)
+        values (${ws}, ${proyectoR}, 3, 'Llegó evidencia que cambia el portafolio',
+                'etapa-completa', 0, ${leadId})`;
+      await tx`update etapa_instancia set estado = 'en-curso'
+        where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`;
+    });
+    const [abierta] = await admin`select estado from etapa_instancia
+      where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`;
+    expect(abierta!.estado as string).toBe('en-curso');
   });
 
   /**

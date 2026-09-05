@@ -15,10 +15,21 @@ import { z } from 'zod';
 export const EstadoOportunidadSchema = z.enum(['propuesta', 'aprobada', 'descartada']);
 export type EstadoOportunidad = z.infer<typeof EstadoOportunidadSchema>;
 
+/**
+ * El techo de la pregunta, EXPORTADO porque el formulario tiene que llevar el mismo.
+ *
+ * Con el techo solo aquí, pegar una pregunta más larga dejaba el botón activo, el validador la
+ * rechazaba en la frontera —antes de que el handler pudiera devolver su error de dominio— y la
+ * pantalla enseñaba el mensaje genérico de reintento: quien escribe no llegaba a enterarse de
+ * que lo que hay que hacer es acortarla. Un número escrito dos veces es un número que se
+ * separa, así que va uno solo y lo leen los dos lados.
+ */
+export const MAX_PREGUNTA = 500;
+
 /** El texto de la pregunta. No se valida que empiece por «HMW» ni por «cómo podríamos»:
  * imponer el prefijo sería imponer un idioma, y una regla que se rodea escribiendo el
  * prefijo delante no es una regla. */
-const PreguntaSchema = z.string().trim().min(1).max(500);
+const PreguntaSchema = z.string().trim().min(1).max(MAX_PREGUNTA);
 
 export const CrearOportunidadSchema = z.object({
   workspaceId: z.string().uuid(),

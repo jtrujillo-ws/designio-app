@@ -17,6 +17,7 @@ import {
   repriorizarOportunidad,
   trazarInsight,
 } from '@/lib/servicio/oportunidad.functions';
+import { MAX_PREGUNTA } from '@/lib/servicio/oportunidad.schemas';
 import type { OportunidadDelPortafolio } from '@/lib/servicio/oportunidad.schemas';
 
 /**
@@ -162,8 +163,12 @@ function PantallaOportunidades() {
 
             {retoAbierto === reto.retoId && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {/* El MISMO techo que el validador: sin él, pegar una pregunta más larga
+                    dejaba el botón activo y el rechazo llegaba como «vuelve a intentarlo»,
+                    que no dice lo único que hay que saber — que se acorte. */}
                 <Input
                   placeholder="¿Cómo podríamos…?"
+                  maxLength={MAX_PREGUNTA}
                   value={pregunta}
                   onChange={(e) => setPregunta(e.currentTarget.value)}
                 />

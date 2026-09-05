@@ -453,7 +453,7 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
       }),
       // El mensaje lo pone ahora el guard y no la política: un trigger BEFORE corre antes
       // del WITH CHECK, así que llega primero — y dice mejor qué pasa y cuál es la salida.
-    ).rejects.toThrow(/su portafolio no se toca sin reabrir la etapa 3/);
+    ).rejects.toThrow(/su G3 está aprobado sin la etapa 3 reabierta/);
     await expect(
       priorizarOportunidad(leadId, {
         workspaceId: ws, oportunidadId: viva.oportunidadId, prioridad: 9, prioridadRazon: '',
@@ -623,6 +623,104 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
   });
 
   /**
+   * Y la ventana se cierra cuando el RETO deja de admitir trabajo de método.
+   *
+   * Escrita solo con la puerta de G3, medía una etapa y daba por hecho el resto del método. Eso
+   * dejó de ser cierto en este mismo PR: desde que una etapa reabierta no se puede cerrar a
+   * mano, la reapertura de la 3 la deja `en-curso` para siempre —no hay ceremonia de recierre— y
+   * el reto sigue avanzando por su lado. `outcome_review_completar_guard` cierra el reto y el
+   * proyecto sin tocar sus etapas, así que la ventana quedaba abierta DESPUÉS del cierre: medido,
+   * con los dos en 'cerrado' un lead insertaba una oportunidad y la repriorizaba. Un portafolio
+   * que crece bajo un reto terminado es lo que SYS-08 dice que no existe.
+   *
+   * Se mide por las dos mitades, como toda puerta de esta suite: el reto que sigue vivo abre, y
+   * el que ya terminó —o el que se archivó sin llegar a empezar— cierra.
+   */
+  it('la ventana del portafolio se cierra cuando el reto ya no admite trabajo de método', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio del ciclo', 'activo', ${leadId}) returning id`;
+    const servicioId = srv!.id as string;
+
+    const retoEn = async (codigo: string, estado: string) => {
+      const [r] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo,
+         creado_por)
+        values (${ws}, ${servicioId}, ${codigo}, 'Reto del ciclo', 'Descripción', ${estado},
+                'Ninguna', ${leadId}) returning id`;
+      return r!.id as string;
+    };
+    const ventana = async (retoDestino: string) => {
+      const [f] = await admin`select reto_admite_portafolio(${retoDestino}, ${ws}) as v`;
+      return f!.v as boolean;
+    };
+    const proponer = (retoDestino: string) =>
+      conUsuario(leadId, (tx) => tx`insert into oportunidad
+        (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+        values (${ws}, ${retoDestino}, '¿Cómo podríamos medir el ciclo?', 1, 'Razón', ${leadId})`);
+
+    // 1. Vivo: la ventana abre, que es la mitad que no se puede tapiar.
+    const vivo = await retoEn('R-VIVO', 'activo');
+    expect(await ventana(vivo)).toBe(true);
+    await proponer(vivo);
+
+    // 2. ARCHIVADO, que es el camino más barato a un reto sin trabajo —'candidato' →
+    //    'archivado', sin gates de por medio— y estaba entero fuera: sin proyecto, la puerta de
+    //    G3 pasa en vacío y la ventana decía que sí.
+    const archivado = await retoEn('R-ARCH', 'candidato');
+    await conUsuario(leadId, (tx) => tx`update reto set estado = 'archivado'
+      where id = ${archivado} and workspace_id = ${ws}`);
+    expect(await ventana(archivado), 'un reto archivado seguía admitiendo portafolio').toBe(false);
+    await expect(proponer(archivado)).rejects.toThrow(/ya no admite trabajo de método/);
+
+    // 3. Y el caso que lo motivó: el reto CERRADO con su etapa 3 reabierta.
+    const cerrado = await retoEn('R-CERR', 'activo');
+    const [pr] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${cerrado}, 'P-CERR', 'Proyecto', 'activo', 'rapido', ${leadId}) returning id`;
+    const proyectoC = pr!.id as string;
+    // La etapa nace 'pendiente': aprobar el gate CIERRA su etapa homóloga —es efecto
+    // inseparable de la transición— y ponerla ya en curso aquí sería fijar a mano lo que la
+    // aprobación deshace.
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoC}, 3, 'Conceptualización', 'pendiente')`;
+    const [gC] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoC}, 3, 'sponsor') returning id`;
+    await admin`insert into checklist_item
+      (workspace_id, gate_id, orden, texto, estado, insight_id)
+      values (${ws}, ${gC!.id as string}, 0, 'Portafolio razonado', 'cumplido', ${insightValidado})`;
+    await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+      aprobado_en = now() where id = ${gC!.id as string}`;
+    // Y la reapertura POR LA PUERTA: registro y etapa en la misma transacción.
+    await conUsuario(leadId, async (tx) => {
+      await tx`insert into reapertura_etapa
+        (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+         reabierto_por)
+        values (${ws}, ${proyectoC}, 3, 'Llegó evidencia que cambia el portafolio',
+                'etapa-completa', 0, ${leadId})`;
+      await tx`update etapa_instancia set estado = 'en-curso'
+        where proyecto_id = ${proyectoC} and workspace_id = ${ws} and numero = 3`;
+    });
+    // Con G3 firmado y la etapa 3 reabierta la ventana sigue abierta: es la excepción I1.
+    expect(await ventana(cerrado)).toBe(true);
+
+    // El cierre se monta con los triggers en silencio y dentro de UNA transacción: lo que esta
+    // sonda afirma es la VENTANA, no el camino hasta el cierre. Que ese camino existe se lee en
+    // los guards —la orden de los gates mira `gate_instancia.estado` y nunca `etapa_instancia`,
+    // así que G4..G7 se firman con la 3 abierta, y el cierre del outcome review no toca las
+    // etapas—; montarlo entero aquí pediría ocho gates, una design version con elementos y un
+    // registry firmado para afirmar algo que no es de este módulo.
+    await admin.begin(async (tx) => {
+      await tx`set local session_replication_role = replica`;
+      await tx`update reto set estado = 'cerrado', veredicto = 'logrado' where id = ${cerrado}`;
+      await tx`update proyecto set estado = 'cerrado' where id = ${proyectoC}`;
+    });
+    expect(await ventana(cerrado), 'la ventana seguía abierta con el reto cerrado').toBe(false);
+    await expect(proponer(cerrado)).rejects.toThrow(/ya no admite trabajo de método/);
+  });
+
+  /**
    * Y la CLAVE del candado tiene que ser la misma que la de la aprobación del gate.
    *
    * La primera versión de este módulo tomaba un candado por oportunidad. Con esa clave, borrar
@@ -756,7 +854,7 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     expect(
       await veredicto,
       'el borrado se coló detrás de una aprobación de G3 que ya había commiteado',
-    ).toMatch(/no se toca sin reabrir la etapa 3/);
+    ).toMatch(/su G3 está aprobado sin la etapa 3 reabierta/);
     // Y la traza que el gate certificó sigue ahí.
     const enlaces = await admin`select 1 from oportunidad_insight
       where oportunidad_id = ${o.oportunidadId}`;

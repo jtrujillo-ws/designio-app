@@ -131,6 +131,28 @@ language sql stable security definer set search_path = public, pg_temp as $fn$
   select case
     when session_user = 'designio_app' and not is_workspace_member(app_user_id(), p_ws)
       then false
+    -- ── PRIMERO, EL CICLO DE VIDA DEL RETO ──
+    -- Escrita solo con la puerta de G3, esta ventana medía una etapa y daba por hecho el
+    -- resto del método, y eso dejó de ser cierto EN ESTE MISMO PR: desde que una etapa
+    -- reabierta ya no se puede cerrar a mano, la reapertura de la 3 la deja `en-curso` para
+    -- siempre —hoy no hay ceremonia de recierre— y el reto sigue avanzando por su lado.
+    -- `outcome_review_completar_guard` cierra el reto y el proyecto sin tocar sus etapas, así
+    -- que la ventana se quedaba abierta DESPUÉS del cierre.
+    --
+    -- Medido, con el reto y el proyecto en 'cerrado' y la etapa 3 reabierta:
+    --   ventana = true; un lead INSERTA una oportunidad y la REPRIORIZA, las dos pasan.
+    -- Un portafolio que crece bajo un reto terminado es exactamente lo que SYS-08 dice que
+    -- no existe: lo posterior al cierre es un reto NUEVO.
+    --
+    -- La condición es la misma que ya usa `reto_admite_criterios` —candidato o activo— y no
+    -- una lista propia: son la misma pregunta («¿este reto admite todavía trabajo de
+    -- método?») y dos redacciones se separan. Cubre de paso el ARCHIVADO, que tampoco
+    -- estaba: un reto archivado sin proyecto pasaba la puerta de G3 en vacío.
+    when not exists (
+      select 1 from reto r
+      where r.id = p_reto and r.workspace_id = p_ws
+        and r.estado in ('candidato', 'activo'))
+      then false
     else not exists (
       select 1 from gate_instancia g
         join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
@@ -447,6 +469,20 @@ begin
   end if;
   if v_reto is not null then
     perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+    -- Y la FILA del reto, detrás de la clave, que es el orden del sistema.
+    --
+    -- La clave sola serializa contra quien la pide, y `completarOutcomeReview` la pide
+    -- (`bloquearReto`). Pero este guard existe justamente para quien NO pasa por el
+    -- servicio: un `update reto set estado = 'cerrado'` por SQL directo no toma ninguna
+    -- clave, así que la relectura de abajo lo adelantaría leyendo la instantánea anterior
+    -- —el reto todavía activo— y el portafolio crecería bajo un cierre ya commiteado.
+    --
+    -- `for share` es lo que lo ordena sin inventar un protocolo nuevo: quien cierra hace un
+    -- UPDATE, que toma FOR NO KEY UPDATE sobre esa misma fila, y los dos modos chocan. Y
+    -- entre dos escrituras del portafolio no hay espera: las dos piden compartido.
+    perform 1 from reto r
+     where r.id = v_reto and r.workspace_id = v_fila.workspace_id
+     for share;
     -- Y VOLVER A PREGUNTAR, que es la mitad que faltaba. Esperar no basta: cuando este
     -- trigger corre, la fila YA está calificada —la política de RLS se evaluó con la
     -- instantánea del inicio de la sentencia, antes de que existiera este candado—, y
@@ -461,7 +497,7 @@ begin
     -- exención que tienen `oportunidad_veredicto_guard` y el resto de guards del esquema.
     if session_user = 'designio_app' then
       if not reto_admite_portafolio(v_reto, v_fila.workspace_id) then
-        raise exception 'el G3 de ese reto está aprobado: su portafolio no se toca sin reabrir la etapa 3';
+        raise exception 'el portafolio de ese reto está cerrado: o su G3 está aprobado sin la etapa 3 reabierta, o el reto ya no admite trabajo de método';
       end if;
       -- Y el ESTADO de la oportunidad, que es la otra condición que miró la política del
       -- enlace. Releer una y dejar la hermana con la foto vieja es el mismo error una capa

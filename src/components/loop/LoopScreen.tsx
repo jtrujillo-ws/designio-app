@@ -305,7 +305,8 @@ const filaLateral: CSSProperties = {
   textDecoration: 'none',
   color: claro(0.72),
   font: '500 13px var(--font-sans)',
-  background: 'transparent',
+  // Sin `background` en línea: el fondo base y el hover los pinta `.loop-fila` en la hoja
+  // de estilos; un valor aquí anularía el hover. Los estados activos sí lo fijan en línea.
   border: 'none',
   width: '100%',
   textAlign: 'left',
@@ -790,7 +791,7 @@ function ServicioDelArbol({
         style={{
           ...filaLateral,
           padding: '9px 10px',
-          background: actual ? claro(0.11) : 'transparent',
+          background: actual ? claro(0.11) : undefined,
           color: actual ? '#fff' : claro(0.68),
           fontWeight: actual ? 700 : 500,
         }}
@@ -939,7 +940,7 @@ function RetoDelArbol({
   const estilo: CSSProperties = {
     ...filaLateral,
     paddingLeft: 26,
-    background: activo ? claro(0.07) : 'transparent',
+    background: activo ? claro(0.07) : undefined,
     color: activo ? '#fff' : claro(atenuado ? 0.45 : 0.68),
     font: `${activo ? 600 : 500} 12.5px var(--font-sans)`,
     cursor: proyecto ? 'pointer' : 'default',
@@ -1165,6 +1166,7 @@ function CabeceraDeArco({
               key={j}
               type="button"
               className="loop-tramo"
+              data-estado={estado}
               onClick={() => onTramo(j)}
               title={`J${j} · ${jl.titulo} · ${estado}: ir a la tarjeta`}
               style={{
@@ -1190,15 +1192,9 @@ function CabeceraDeArco({
                   boxShadow: enCursoAqui ? '0 0 0 3px rgba(255,255,255,.35)' : undefined,
                 }}
               />
-              <span
-                style={{
-                  fontFamily: 'var(--font-mono)',
-                  fontWeight: enCursoAqui ? 700 : estado === 'próximo' ? 500 : 600,
-                  fontSize: 11,
-                  color: enCursoAqui ? '#fff' : claro(estado === 'próximo' ? 0.5 : 0.9),
-                  transition: 'color 150ms ease-out',
-                }}
-              >
+              {/* Peso y color según `data-estado`, y el hover, viven en la hoja de estilos:
+                  en línea anularían el hover. */}
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
                 J{j} · {enCursoAqui ? 'en curso' : jl.corto}
               </span>
             </button>

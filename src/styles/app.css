@@ -33,6 +33,7 @@ a:hover {
    Lo que los estilos en línea no pueden decir: hover, foco y el comportamiento por debajo
    de ~1200px, donde el lateral se recoge a un riel y el arco de siete tarjetas se desplaza. */
 .loop-fila {
+  background: transparent;
   transition:
     background 150ms ease-out,
     color 150ms ease-out;
@@ -53,7 +54,21 @@ a:hover {
 .loop-tramo {
   transition: opacity 150ms ease-out;
 }
-.loop-tramo:hover > span {
+/* La etiqueta del tramo: peso y color por estado, y el hover la sube a blanco. */
+.loop-tramo > span:last-child {
+  font-weight: 600;
+  color: rgba(247, 247, 249, 0.9);
+  transition: color 150ms ease-out;
+}
+.loop-tramo[data-estado='en curso'] > span:last-child {
+  font-weight: 700;
+  color: #fff;
+}
+.loop-tramo[data-estado='próximo'] > span:last-child {
+  font-weight: 500;
+  color: rgba(247, 247, 249, 0.5);
+}
+.loop-tramo:hover > span:last-child {
   color: #fff;
 }
 .loop-tarjeta {

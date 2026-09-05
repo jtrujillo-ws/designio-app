@@ -4886,6 +4886,49 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y NINGÚN sello de procedencia lo puede escribir la aplicación. Se le pregunta al catálogo.
+   *
+   * `propuesta_ai_id` es lo que hace que un objeto materializado diga de qué propuesta viene
+   * (SYS-19). Lo estampa el guard de revisión, que es `security definer` y el único sitio que
+   * sabe que la materialización fue legítima; si el llamante puede escribirlo, la proveniencia
+   * es una declaración voluntaria y deja de sostener nada.
+   *
+   * Esto se ha roto DOS veces por la misma vía, y la vía no es olvidarse del `revoke`: es que
+   * un `grant insert` de TABLA cubre también las columnas futuras. Añadir la columna se la
+   * regala al llamante sin que nadie escriba una línea, y no hay compilador ni tipo que lo eche
+   * de menos — solo el catálogo lo sabe. Por eso se pregunta aquí y no se enumera a mano: la
+   * próxima capacidad que materialice un objeto nuevo trae su tabla, y esta prueba la incluye
+   * sola.
+   */
+  it('ninguna tabla deja que la aplicación escriba su sello de procedencia', async () => {
+    const admin = sqlAdmin();
+    const selladas = await admin`select table_name as tabla
+      from information_schema.columns
+      where table_schema = 'public' and column_name = 'propuesta_ai_id'
+      order by table_name`;
+    // Que esté mirando algo: con cero tablas selladas, lo de abajo pasaría sin comprobar nada.
+    // Se nombran las que hay para que se vea QUÉ cubre, y se comprueba por contención y no por
+    // igualdad: una capacidad nueva trae su tabla sellada y no tiene que tocar esta lista — la
+    // comprobación de abajo la incluye sola, que es el punto entero de preguntarle al catálogo.
+    const tablas = selladas.map((f) => f.tabla as string);
+    expect(tablas).toEqual(
+      expect.arrayContaining(['criterio_exito', 'evidencia', 'insight', 'reto_servicio_afectado']),
+    );
+
+    // `column_privileges` incluye lo que llega POR el grant de tabla, que es justo la vía por
+    // la que se cuela: preguntarlo aquí cubre las dos rutas con una sola consulta.
+    const escribibles = await admin`select table_name as tabla, privilege_type as privilegio
+      from information_schema.column_privileges
+      where table_schema = 'public' and grantee = 'designio_app'
+        and column_name = 'propuesta_ai_id' and privilege_type in ('INSERT', 'UPDATE')
+      order by table_name, privilege_type`;
+    expect(
+      escribibles.map((f) => `${f.tabla as string}.${f.privilegio as string}`),
+      'la aplicación puede firmar una procedencia que no ocurrió',
+    ).toEqual([]);
+  });
+
+  /**
    * Toda ancla declarada entra en la comprobación de LINAJE de la llamada.
    *
    * `propuesta_ai_revision_guard` exige que una propuesta cuelgue de la llamada que la
@@ -6736,6 +6779,64 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [usable] = await conUsuario(curadorId, (tx) => tx`
         select evidencia_usable(${a}::uuid, ${wsC}::uuid, 'cliente') as x`);
       expect(usable!.x).toBe(true);
+    });
+  });
+
+  /**
+   * El SELLO de procedencia no se puede escribir desde la aplicación.
+   *
+   * `insight.propuesta_ai_id` es lo que hace que un insight diga de qué propuesta viene
+   * (SYS-19), y el comentario de la migración decía que la columna estaba «fuera de todo
+   * grant». No lo estaba: `insight` tenía un `grant insert` DE TABLA, y un grant de tabla
+   * cubre también las columnas futuras — así que añadir la columna se la regalaba al llamante.
+   * Medido antes de arreglarlo: `designio_app` bajo un curador insertaba un insight escrito a
+   * mano sellado contra una propuesta PENDIENTE, incluso de otra capacidad, y se quedaba con
+   * dos cosas que no eran suyas: la proveniencia y la plaza única del índice, de modo que la
+   * aceptación legítima posterior fallaba con «ese objeto ya cuelga de otra propuesta».
+   *
+   * Es exactamente lo que ya se hizo con `evidencia` y `criterio_exito` cuando les llegó su
+   * sello, y el argumento estaba escrito en la misma migración, una tabla más arriba.
+   *
+   * Las tres mitades se comprueban juntas porque separadas no dicen nada: que el sello se
+   * rechace, que el insight SIN sello siga entrando —lo que se cierra es la columna, no la
+   * tabla— y que la aceptación legítima siga sellando, que es lo que el guard hace y este
+   * grant no puede estorbar.
+   */
+  it('un insight escrito a mano no puede sellarse con la procedencia de una propuesta', async () => {
+    await enWorkspaceLimpio('c2-sello-fuera-del-grant', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia del sello',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+
+      await expect(
+        conUsuario(curadorId, (tx) => tx`insert into insight
+          (workspace_id, titulo, resumen, estado, creado_por, propuesta_ai_id)
+          values (${wsC}, 'Insight escrito a mano', '', 'propuesto', ${curadorId}, ${p.id})`),
+        'la aplicación puede firmar una procedencia que no ocurrió',
+      ).rejects.toThrow(/permission denied/i);
+
+      // Sin la columna sí entra: un insight a mano es una cosa legítima, lo que no lo es es
+      // que diga venir de una propuesta.
+      await conUsuario(curadorId, (tx) => tx`insert into insight
+        (workspace_id, titulo, resumen, estado, creado_por)
+        values (${wsC}, 'Insight escrito a mano', '', 'propuesto', ${curadorId})`);
+
+      // Y la aceptación legítima sella igual: el guard es `security definer` y el grant del
+      // llamante no le quita nada.
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p.id,
+      });
+      const [sellado] = await sqlAdmin()`select propuesta_ai_id from insight
+        where id = ${objetoId} and workspace_id = ${wsC}`;
+      expect(sellado!.propuesta_ai_id).toBe(p.id);
     });
   });
 

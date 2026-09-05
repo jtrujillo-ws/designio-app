@@ -367,6 +367,26 @@ alter table insight add
 -- Un insight cuelga de UNA propuesta como mucho. El índice parcial es lo que convierte el
 -- sello en irrepetible: el `update … where propuesta_ai_id is null` del guard no pisa un
 -- sello previo y el conteo de filas lo rechaza.
+
+-- Y EL GRANT PASA A SER POR COLUMNA, por lo mismo que ya se hizo con `evidencia` y
+-- `criterio_exito` cuando les llegó su sello: un `grant insert` de TABLA cubre también las
+-- columnas futuras, así que añadir esta columna se la acaba de regalar al llamante y el
+-- vínculo dejaría de ser vínculo. Medido contra la base antes de escribir esto: con el grant
+-- de tabla puesto, `designio_app` bajo un curador inserta un insight escrito a mano con
+-- `propuesta_ai_id` apuntando a CUALQUIER propuesta viva de su workspace —una pendiente,
+-- incluso de otra capacidad—, y se queda con dos cosas que no son suyas: una proveniencia
+-- falsa (SYS-19 dice que ese objeto lo materializó esa propuesta) y la plaza única del índice
+-- de arriba, de modo que la aceptación legítima que venga después falla con «ese objeto ya
+-- cuelga de otra propuesta».
+--
+-- Un `revoke` por columna no sirve mientras exista el de tabla, así que se retira el de tabla
+-- y se vuelve a conceder la lista exacta de antes. `propuesta_ai_id` no está en ella: lo
+-- escribe el guard de revisión, que es `security definer` y el único sitio que sabe que la
+-- materialización es legítima.
+revoke insert on insight from designio_app;
+grant insert (id, workspace_id, titulo, resumen, estado, validado_por, validado_en,
+              creado_por, creado_en)
+  on insight to designio_app;
 create unique index insight_propuesta_ai_idx on insight (propuesta_ai_id)
   where propuesta_ai_id is not null;
 -- Sin GRANT: la aplicación no escribe esta columna por ningún camino, igual que las otras dos.

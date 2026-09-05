@@ -11,15 +11,30 @@ import './server-only';
  * censo del calendario: un guardián de forma sujeta la SINTAXIS; la semántica la sujeta el
  * TIPO.
  *
- * Quien la lanza dice QUÉ falta, con detalle, para el registro del servidor. Quien la
- * atiende NO reenvía ese detalle al navegador: la pantalla de login es pública y el detalle
- * nombra variables de entorno —y a veces lleva dentro una cadena de conexión con su
- * contraseña—. Al visitante se le dice que no es culpa suya y que reintentar no sirve; el
- * porqué se queda en el log, que es donde lo puede leer quien puede arreglarlo.
+ * Quien la lanza dice QUÉ falta —el nombre de la variable, nunca su valor— y ese mensaje es
+ * lo único que se registra. Quien la atiende tampoco lo reenvía al navegador: la pantalla de
+ * login es pública. Al visitante se le dice que no es culpa suya y que reintentar no sirve.
+ *
+ * NO lleva `cause`, y eso es una decisión medida, no una omisión. La causa de un DSN que no
+ * parsea es el error del propio parser, y ese error PUEDE llevar dentro la cadena de conexión
+ * entera. Medido con varias formas rotas de la misma cadena:
+ *
+ *   postgres://usuario:CLAVE@${…} / 5432/base   →  «<redacted> cannot be parsed as a URL.»
+ *   host=interno user=usuario password=CLAVE    →  «"host=interno user=usuario password=CLAVE"
+ *                                                    cannot be parsed as a URL.»
+ *
+ * La primera la redacta el runtime porque reconoce la forma de una URL con credenciales; la
+ * segunda —un DSN de libpq, que es de lo más plausible que alguien pegue en la variable— sale
+ * ENTERA. Confiar en esa heurística sería apostar la contraseña de la base a que el valor mal
+ * puesto se parezca a una URL. `serve.ts` ya suprime este mismo error por lo mismo; sin este
+ * corte, el registro del despliegue habría publicado lo que aquel se calla.
+ *
+ * El precio es no saber por qué no parseaba. Es barato: el mensaje ya dice qué variable es y
+ * qué forma se espera, que es lo que necesita quien va a arreglarla.
  */
 export class ErrorConfiguracion extends Error {
-  constructor(mensaje: string, opciones?: { cause?: unknown }) {
-    super(mensaje, opciones);
+  constructor(mensaje: string) {
+    super(mensaje);
     this.name = 'ErrorConfiguracion';
   }
 }
@@ -66,14 +81,17 @@ export function respuestaDeConfiguracion(donde: string, e: unknown): FalloDeEntr
 }
 
 /**
- * Deja el motivo REAL en el registro del servidor, que es donde sirve.
+ * Deja el motivo en el registro del servidor, que es donde sirve — y SOLO el motivo.
  *
- * `console.error` y no el mensaje de vuelta, por lo dicho arriba. El detalle se imprime
- * entero —incluida la causa— porque el log del servidor ya es un sitio de confianza: es el
- * mismo criterio con el que `serve.ts` decide qué puede escribir y qué no.
+ * Se imprime el mensaje del `ErrorConfiguracion` y nada más: ni su `cause` (no lo lleva, por
+ * lo dicho arriba) ni la traza, que arrastraría el mismo valor. Un error de otra clase se
+ * anota por su nombre, sin mensaje: no hay forma de saber si el suyo lleva un secreto dentro,
+ * y un registro de despliegue es persistente.
  */
 export function anotarFalloDeConfiguracion(donde: string, e: unknown): void {
-  const detalle = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+  const detalle =
+    e instanceof ErrorConfiguracion
+      ? e.message
+      : `error de clase ${e instanceof Error ? e.name : typeof e} (mensaje no registrado: podría llevar el valor mal puesto)`;
   console.error(`[configuración] ${donde}: ${detalle}`);
-  if (e instanceof Error && e.cause) console.error('[configuración] causa:', e.cause);
 }

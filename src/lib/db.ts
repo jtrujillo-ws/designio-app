@@ -33,15 +33,16 @@ function requireEnv(name: string): string {
  * funcionar nunca.
  *
  * El nombre de la variable entra en el mensaje y el valor NO: un DSN lleva la contraseña
- * dentro, y este mensaje acaba en el registro del servidor.
+ * dentro, y este mensaje acaba en el registro del servidor. Y el error del parser tampoco se
+ * adjunta como `cause`: medido, ante un DSN de libpq —«host=… password=…»— ese error sale con
+ * la cadena ENTERA en su mensaje. `serve.ts` ya suprime este mismo error por lo mismo.
  */
 function pool(nombre: string, url: string): Sql {
   try {
     return postgres(url, { max: 10, idle_timeout: 20, connect_timeout: 10 });
-  } catch (e) {
+  } catch {
     throw new ErrorConfiguracion(
       `${nombre} no es una cadena de conexión válida (se espera postgres://usuario:clave@host:puerto/base)`,
-      { cause: e },
     );
   }
 }

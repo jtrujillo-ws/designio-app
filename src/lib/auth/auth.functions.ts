@@ -24,7 +24,13 @@ import { COOKIE_SESION, DURACION_SESION_S, firmarSesion } from './sesion.server'
 
 const ERROR_LIMITE = 'Demasiados intentos; espera unos minutos e intenta de nuevo';
 
-/**
+/*
+ * ── El tercer desenlace de entrar ──────────────────────────────────────────────────────
+ *
+ * (Comentario de MÓDULO, no JSDoc: describe el flujo de estas server functions, no la
+ * función que viene justo debajo. Escrito como JSDoc quedaba colgado de `fijarCookieSesion`,
+ * que no documenta nada de esto.)
+ *
  * Entrar tiene TRES desenlaces, no dos, y la pantalla los trataba como dos.
  *
  * Los dos que ya estaban son del visitante: entró, o sus credenciales no valen (o gastó el

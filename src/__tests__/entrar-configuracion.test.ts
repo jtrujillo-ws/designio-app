@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  anotarFalloDeConfiguracion,
   ERROR_CONFIGURACION_VISIBLE,
   ErrorConfiguracion,
   falloDeDominio,
@@ -69,13 +70,30 @@ describe('el tercer desenlace de entrar: el despliegue, no el visitante', () => 
   });
 
   /**
-   * El mensaje que ve el visitante no lleva el detalle. La pantalla de login es pública, y el
-   * detalle nombra variables de entorno —y a veces lleva dentro un DSN con su contraseña—.
+   * La contraseña de la base no sale NI al visitante NI al registro.
+   *
+   * Al visitante, por lo obvio: la pantalla de login es pública. Al registro, por lo que una
+   * revisión encontró y que yo tenía al revés —la primera versión de esta prueba EXIGÍA que el
+   * detalle apareciera en el log, tratándolo como un sitio de confianza—. Un registro de
+   * despliegue es persistente y lo lee más gente que la base.
+   *
+   * Y el riesgo no es teórico. Medido con la misma cadena rota de varias formas:
+   *
+   *   postgres://usuario:CLAVE@${…} / 5432/base  →  «<redacted> cannot be parsed as a URL.»
+   *   host=interno user=usuario password=CLAVE   →  la cadena ENTERA en el mensaje
+   *
+   * La primera la redacta el runtime porque reconoce una URL con credenciales; la segunda —un
+   * DSN de libpq, de lo más plausible que alguien pegue en la variable— sale entera. Por eso el
+   * error del parser no se adjunta ni se imprime: la garantía no puede depender de que el valor
+   * mal puesto se parezca a una URL.
    */
-  it('no le enseña al visitante ni la variable ni el DSN', async () => {
+  it('no enseña la contraseña de la base ni al visitante ni al registro', async () => {
     await cerrarPools();
-    const dsn = 'postgres://usuario:CLAVE-SECRETA@interno.ejemplo:5432/base';
-    process.env.DATABASE_URL_APP = 'no-es-una-url';
+    // El caso medido que SÍ filtra: un DSN de libpq no parsea, y su error lleva la clave.
+    process.env.DATABASE_URL_APP = 'host=interno user=usuario password=CLAVE-SECRETA';
+
+    const anotado: unknown[] = [];
+    const espia = vi.spyOn(console, 'error').mockImplementation((...a) => void anotado.push(a));
     const error = (() => {
       try {
         sql();
@@ -85,17 +103,31 @@ describe('el tercer desenlace de entrar: el despliegue, no el visitante', () => 
       }
     })();
     expect(error).toBeInstanceOf(ErrorConfiguracion);
-
-    const anotado: unknown[] = [];
-    const espia = vi.spyOn(console, 'error').mockImplementation((...a) => void anotado.push(a));
-    const r = respuestaDeConfiguracion('login', new ErrorConfiguracion(`DSN roto: ${dsn}`));
+    const r = respuestaDeConfiguracion('login', error);
     espia.mockRestore();
 
     expect(r).toEqual({ ok: false, error: ERROR_CONFIGURACION_VISIBLE, reintentable: false });
     expect(r!.error).not.toContain('CLAVE-SECRETA');
     expect(r!.error).not.toContain('DATABASE_URL_APP');
-    // Y el detalle SÍ queda donde sirve: en el registro del servidor.
-    expect(JSON.stringify(anotado)).toContain('CLAVE-SECRETA');
+    // Ni en el registro, ni escondida en un `cause` que cualquier manejador genérico imprima.
+    expect(JSON.stringify(anotado)).not.toContain('CLAVE-SECRETA');
+    expect(JSON.stringify(error)).not.toContain('CLAVE-SECRETA');
+    expect((error as Error).cause).toBeUndefined();
+    // Y lo que sí queda anotado es lo que le sirve a quien lo arregla: la variable.
+    expect(JSON.stringify(anotado)).toContain('DATABASE_URL_APP');
+  });
+
+  /**
+   * Un error de OTRA clase tampoco se imprime: no hay forma de saber si su mensaje lleva un
+   * secreto dentro, y aquí no se llega con nada clasificado.
+   */
+  it('no imprime el mensaje de un error que nadie ha clasificado', () => {
+    const anotado: unknown[] = [];
+    const espia = vi.spyOn(console, 'error').mockImplementation((...a) => void anotado.push(a));
+    anotarFalloDeConfiguracion('login', new TypeError('DSN=postgres://u:CLAVE-SECRETA@h/b'));
+    espia.mockRestore();
+    expect(JSON.stringify(anotado)).not.toContain('CLAVE-SECRETA');
+    expect(JSON.stringify(anotado)).toContain('TypeError');
   });
 
   /**

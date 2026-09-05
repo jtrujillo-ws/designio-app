@@ -20,7 +20,7 @@ import {
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { parsearContenido } from '@/lib/ai/ai.contenido';
-import { MAX_MATERIAL } from '@/lib/ai/ai.prompts';
+import { evidenciaQueLlegoAlModelo, MAX_MATERIAL } from '@/lib/ai/ai.prompts';
 import {
   aceptarPropuesta,
   ErrorAI,
@@ -546,6 +546,70 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               'entorno', ${llamadaId}, ${actorId})
       returning id`);
     return p!.id as string;
+  }
+
+  /**
+   * Una transacción que escribe, SE QUEDA CON EL CANDADO y no commitea hasta que se la suelta
+   * — y, con ella, la espera DETERMINISTA a que otra transacción se pare detrás.
+   *
+   * Cada una de estas sondas eran antes dos plazos fijos: 150 ms para dar por hecho que el
+   * candado ya estaba tomado, y 1500 ms para dar por hecho que la contendiente ya estaba
+   * esperándolo. El segundo se rompió en la CI, que corre las 730 en cuatro procesos contra un
+   * Postgres compartido: si la contendiente no llega a PEDIR el candado dentro del plazo, se
+   * suelta antes de que nadie lo pida y lo que la sonda mide deja de ser la espera. Y entonces
+   * la prueba no falla por lo suyo — falla porque el rechazo entra por otra puerta, la lectura
+   * SIN candado que hay antes, y trae otro mensaje.
+   *
+   * `pg_blocking_pids` cambia el plazo por una pregunta que contesta la base: ¿hay alguien
+   * esperando por ESTE backend? Vale igual para los candados de fila —donde se espera por el
+   * xid— que para los de aviso. La sonda pasa así a afirmar lo que su prosa dice: que la otra
+   * transacción ESPERÓ. El presupuesto solo acota el caso patológico; agotado, se sigue como
+   * antes y es la aserción de la sonda la que cuenta qué pasó.
+   */
+  async function esperaAQueAlguienEspere(pid: number, presupuestoMs = 10_000): Promise<void> {
+    const admin = sqlAdmin();
+    const limite = Date.now() + presupuestoMs;
+    for (;;) {
+      const [f] = await admin`select count(*)::int as n from pg_stat_activity
+        where ${pid} = any (pg_blocking_pids(pid))`;
+      if ((f!.n as number) > 0 || Date.now() > limite) return;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  async function candadoEnVuelo(escribir: (tx: TransactionSql) => Promise<unknown>) {
+    const admin = sqlAdmin();
+    let soltar: () => void = () => {};
+    const enVuelo = new Promise<void>((r) => {
+      soltar = r;
+    });
+    let anunciar: (pid: number) => void = () => {};
+    const tomado = new Promise<number>((r) => {
+      anunciar = r;
+    });
+    const terminado = admin.begin(async (tx) => {
+      const [p] = await tx`select pg_backend_pid()::int as pid`;
+      await escribir(tx);
+      anunciar(p!.pid as number);
+      await enVuelo;
+    });
+    const guardia = terminado.then(
+      () => {
+        throw new Error('el candado en vuelo se soltó antes de llegar a tomarse');
+      },
+      (e: Error) => {
+        throw new Error(`la escritura del candado en vuelo falló: ${e.message}`);
+      },
+    );
+    guardia.catch(() => {}); // gana `tomado`: no dejar suelto el rechazo del perdedor
+    // No se vuelve hasta que la escritura SALIÓ. Esto es lo que sustituye al plazo de 150 ms.
+    const pid = await Promise.race([tomado, guardia]);
+    return {
+      terminado,
+      soltar,
+      esperaAQueAlguienEspere: (presupuestoMs?: number) =>
+        esperaAQueAlguienEspere(pid, presupuestoMs),
+    };
   }
 
   /** Un workspace propio para lo que se mide POR LISTA: cortes, orden y marcado. En el
@@ -5880,7 +5944,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     wsC: string,
     retoC: string,
     actorId: string,
-    campos: { titulo: string; resumen: string },
+    campos: {
+      titulo: string;
+      resumen: string;
+      /** Enlazada al reto pero SIN derechos de cliente: no entra en el material, así que el
+       * modelo no la ve y el alcance no la nombra — y es justo la que mira la completitud. */
+      sinDerechos?: boolean;
+    },
   ): Promise<string> {
     const admin = sqlAdmin();
     const [arq] = await admin`insert into arquetipo
@@ -5900,8 +5970,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     // defecto nace `pendiente`/`interno`. Ver la nota del fixture compartido.
     await admin`insert into derecho_uso
       (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
-      values (${wsC}, ${evId}, 'concedido', 'cliente', 'Consentimiento del participante',
-              ${actorId}, now(), ${actorId})`;
+      values (${wsC}, ${evId},
+              ${campos.sinDerechos ? 'pendiente' : 'concedido'},
+              ${campos.sinDerechos ? 'interno' : 'cliente'},
+              ${campos.sinDerechos ? '' : 'Consentimiento del participante'},
+              ${campos.sinDerechos ? null : actorId},
+              ${campos.sinDerechos ? null : admin`now()`},
+              ${actorId})`;
     await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
       values (${wsC}, ${arq!.id as string}, ${evId})`;
     return evId;
@@ -7700,18 +7775,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
                 ${curadorId}) returning id`;
 
-      let soltar: () => void = () => {};
-      const enVuelo = new Promise<void>((r) => {
-        soltar = r;
-      });
-      const revocacion = admin.begin(async (tx) => {
-        await tx`update derecho_uso
+      const revocacion = await candadoEnVuelo((tx) => tx`update derecho_uso
           set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
               decidido_por = ${curadorId}, decidido_en = now()
-          where evidencia_id = ${ev} and workspace_id = ${wsC}`;
-        await enVuelo;
-      });
-      await new Promise((r) => setTimeout(r, 150));
+          where evidencia_id = ${ev} and workspace_id = ${wsC}`);
 
       const persistencia = conUsuario(curadorId, (tx) => tx`
         insert into propuesta_ai
@@ -7728,9 +7795,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (e: Error) => `rechazó: ${e.message}`,
       );
 
-      await new Promise((r) => setTimeout(r, 1500));
-      soltar();
-      await revocacion;
+      await revocacion.esperaAQueAlguienEspere();
+      revocacion.soltar();
+      await revocacion.terminado;
 
       expect(
         await veredicto,
@@ -7770,16 +7837,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
                 ${curadorId}) returning id`;
 
-      let soltar: () => void = () => {};
-      const enVuelo = new Promise<void>((r) => {
-        soltar = r;
-      });
-      const archivado = admin.begin(async (tx) => {
-        await tx`update reto set estado = 'archivado'
-          where id = ${retoC} and workspace_id = ${wsC}`;
-        await enVuelo;
-      });
-      await new Promise((r) => setTimeout(r, 150));
+      const archivado = await candadoEnVuelo((tx) => tx`update reto set estado = 'archivado'
+          where id = ${retoC} and workspace_id = ${wsC}`);
 
       const persistencia = conUsuario(curadorId, (tx) => tx`
         insert into propuesta_ai
@@ -7796,9 +7855,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (e: Error) => `rechazó: ${e.message}`,
       );
 
-      await new Promise((r) => setTimeout(r, 1500));
-      soltar();
-      await archivado;
+      await archivado.esperaAQueAlguienEspere();
+      archivado.soltar();
+      await archivado.terminado;
 
       expect(
         await veredicto,
@@ -7834,16 +7893,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         values (${wsD}, 'C0', ${retoD}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
                 ${curadorId}) returning id`;
 
-      let soltar: () => void = () => {};
-      const enVuelo = new Promise<void>((r) => {
-        soltar = r;
-      });
-      const archivado = admin.begin(async (tx) => {
-        await tx`update reto set estado = 'archivado'
-          where id = ${retoD} and workspace_id = ${wsD}`;
-        await enVuelo;
-      });
-      await new Promise((r) => setTimeout(r, 150));
+      const archivado = await candadoEnVuelo((tx) => tx`update reto set estado = 'archivado'
+          where id = ${retoD} and workspace_id = ${wsD}`);
 
       const persistencia = conUsuario(curadorId, (tx) => tx`
         insert into propuesta_ai
@@ -7857,9 +7908,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (e: Error) => `rechazó: ${e.message}`,
       );
 
-      await new Promise((r) => setTimeout(r, 1500));
-      soltar();
-      await archivado;
+      await archivado.esperaAQueAlguienEspere();
+      archivado.soltar();
+      await archivado.terminado;
 
       expect(
         await veredicto,
@@ -7971,18 +8022,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [antes] = await admin`select count(*)::int as n from llamada_ai
         where workspace_id = ${wsC}`;
 
-      let soltar: () => void = () => {};
-      const enVuelo = new Promise<void>((r) => {
-        soltar = r;
-      });
-      const revocacion = admin.begin(async (tx) => {
-        await tx`update derecho_uso
+      const revocacion = await candadoEnVuelo((tx) => tx`update derecho_uso
           set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
               decidido_por = ${curadorId}, decidido_en = now()
-          where evidencia_id = ${ev} and workspace_id = ${wsC}`;
-        await enVuelo;
-      });
-      await new Promise((r) => setTimeout(r, 150));
+          where evidencia_id = ${ev} and workspace_id = ${wsC}`);
 
       try {
         const generacion = conProveedor(
@@ -7993,9 +8036,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           () => 'generó',
           (e: Error) => `rechazó: ${e.message}`,
         );
-        await new Promise((r) => setTimeout(r, 1500));
-        soltar();
-        await revocacion;
+        await revocacion.esperaAQueAlguienEspere();
+        revocacion.soltar();
+        await revocacion.terminado;
         expect(await veredicto).toMatch(/cambió mientras se preparaba|no se llamó al proveedor/);
       } finally {
         proveedor.duranteLlamada = null;
@@ -8046,16 +8089,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [antes] = await admin`select count(*)::int as n from llamada_ai
         where workspace_id = ${wsC}`;
 
-      let soltar: () => void = () => {};
-      const enVuelo = new Promise<void>((r) => {
-        soltar = r;
-      });
-      const archivado = admin.begin(async (tx) => {
-        await tx`update reto set estado = 'archivado'
-          where id = ${retoC} and workspace_id = ${wsC}`;
-        await enVuelo;
-      });
-      await new Promise((r) => setTimeout(r, 150));
+      const archivado = await candadoEnVuelo((tx) => tx`update reto set estado = 'archivado'
+          where id = ${retoC} and workspace_id = ${wsC}`);
 
       try {
         const generacion = conProveedor(
@@ -8066,9 +8101,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           () => 'generó',
           (e: Error) => `rechazó: ${e.message}`,
         );
-        await new Promise((r) => setTimeout(r, 1500));
-        soltar();
-        await archivado;
+        await archivado.esperaAQueAlguienEspere();
+        archivado.soltar();
+        await archivado.terminado;
         expect(await veredicto).toMatch(/se archivó mientras se preparaba/);
       } finally {
         proveedor.duranteLlamada = null;
@@ -8133,16 +8168,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [antes] = await admin`select count(*)::int as n from llamada_ai
         where workspace_id = ${wsC}`;
 
-      let soltar: () => void = () => {};
-      const enVuelo = new Promise<void>((r) => {
-        soltar = r;
-      });
-      const enlace = admin.begin(async (tx) => {
-        await tx`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
-          values (${wsC}, ${arqNuevo!.id as string}, ${ev2!.id as string})`;
-        await enVuelo;
-      });
-      await new Promise((r) => setTimeout(r, 150));
+      const enlace = await candadoEnVuelo((tx) => tx`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+          values (${wsC}, ${arqNuevo!.id as string}, ${ev2!.id as string})`);
 
       try {
         const generacion = conProveedor(
@@ -8153,9 +8180,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           () => 'generó',
           (e: Error) => `rechazó: ${e.message}`,
         );
-        await new Promise((r) => setTimeout(r, 1500));
-        soltar();
-        await enlace;
+        await enlace.esperaAQueAlguienEspere();
+        enlace.soltar();
+        await enlace.terminado;
         expect(await veredicto).toMatch(/cambió mientras se preparaba/);
       } finally {
         proveedor.duranteLlamada = null;
@@ -8202,13 +8229,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // exclusiva, y después el del reto (que allí llega por el borrado de `arquetipo`).
       proveedor.antesDelApunte = async () => {
         otra = admin.begin(async (tx) => {
+          const [p] = await tx`select pg_backend_pid()::int as pid`;
           await tx`select pg_advisory_xact_lock(
             hashtextextended('designio:workspace:' || ${wsC}::text, 42))`;
           loTiene();
-          // Tiempo para que el apunte llegue a pedir sus candados: con el orden bueno se
+          // Hasta que el apunte esté PARADO detrás de este candado: con el orden bueno se
           // queda esperando el del workspace sin haber tomado nada; con el malo ya tiene el
-          // del reto y espera el del workspace.
-          await new Promise((r) => setTimeout(r, 800));
+          // del reto y espera el del workspace. Era un plazo de 800 ms, y un plazo aquí se
+          // agota bajo carga antes de que el apunte llegue a pedir nada — dejando la sonda
+          // midiendo un adelantamiento que no ocurrió.
+          await esperaAQueAlguienEspere(p!.pid as number);
           await tx`select pg_advisory_xact_lock(
             hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
         });
@@ -8770,7 +8800,6 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    */
   it('un archivado en vuelo ordena la aceptación en vez de colarse detrás', async () => {
     await enWorkspaceLimpio('c2-archivado-en-vuelo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
-      const admin = sqlAdmin();
       const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
         titulo: 'La evidencia',
         resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
@@ -8783,16 +8812,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const panel = await panelPropuestas(curadorId, wsC);
       const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
 
-      let soltar: () => void = () => {};
-      const enVuelo = new Promise<void>((r) => {
-        soltar = r;
-      });
-      const archivado = admin.begin(async (tx) => {
-        await tx`update reto set estado = 'archivado'
-          where id = ${retoC} and workspace_id = ${wsC}`;
-        await enVuelo;
-      });
-      await new Promise((r) => setTimeout(r, 150));
+      const archivado = await candadoEnVuelo((tx) => tx`update reto set estado = 'archivado'
+          where id = ${retoC} and workspace_id = ${wsC}`);
 
       const aceptacion = conUsuario(curadorId, async (tx) => {
         const [ins] = await tx`insert into insight
@@ -8817,9 +8838,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (e: Error) => `rechazó: ${e.message}`,
       );
 
-      await new Promise((r) => setTimeout(r, 1500));
-      soltar();
-      await archivado;
+      await archivado.esperaAQueAlguienEspere();
+      archivado.soltar();
+      await archivado.terminado;
 
       expect(
         await veredicto,
@@ -8863,19 +8884,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
 
       // La revocación toma su candado de fila y se queda ABIERTA.
-      let soltar: () => void = () => {};
-      const enVuelo = new Promise<void>((r) => {
-        soltar = r;
-      });
-      const revocacion = admin.begin(async (tx) => {
-        await tx`update derecho_uso
+      const revocacion = await candadoEnVuelo((tx) => tx`update derecho_uso
           set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
               decidido_por = ${curadorId}, decidido_en = now()
-          where evidencia_id = ${ev} and workspace_id = ${wsC}`;
-        await enVuelo;
-      });
-      // Que el UPDATE haya llegado a tomar el candado antes de empezar la aceptación.
-      await new Promise((r) => setTimeout(r, 150));
+          where evidencia_id = ${ev} and workspace_id = ${wsC}`);
 
       const aceptacion = conUsuario(curadorId, async (tx) => {
         const [ins] = await tx`insert into insight
@@ -8900,11 +8912,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (e: Error) => `rechazó: ${e.message}`,
       );
 
-      // Margen amplio y unilateral: sin candado la aceptación commitea en decenas de
-      // milisegundos, mucho antes de esto, y la sonda lo caza. Con candado espera aquí.
-      await new Promise((r) => setTimeout(r, 1500));
-      soltar();
-      await revocacion;
+      await revocacion.esperaAQueAlguienEspere();
+      revocacion.soltar();
+      await revocacion.terminado;
 
       expect(
         await veredicto,
@@ -8915,6 +8925,93 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         where id = ${p.id} and workspace_id = ${wsC}`;
       expect(tras!.estado as string).toBe('propuesta');
     });
+  }, 20000);
+
+  /**
+   * Y el candado cubre los derechos de TODA la evidencia del reto, no solo la que el insight cita.
+   *
+   * Las dos comprobaciones de las citas miran lo que el insight nombra; la de completitud mira
+   * lo que el reto tiene ENLAZADO y el insight no vio. Con el «for share» puesto solo sobre el
+   * subconjunto citado, una CONCESIÓN en vuelo sobre un documento enlazado y no citado no
+   * ordenaba nada: la completitud lo leía inutilizable —la concesión no ha commiteado—, pasaba,
+   * y el sello caía justo antes de que ese documento pasara a ser citable. Quedaban sellados
+   * unos insights que no vieron una evidencia que el reto ya tenía, que es exactamente lo que
+   * esta comprobación existe para impedir.
+   *
+   * Con el candado sobre la unión de los dos conjuntos hay un ORDEN: o la concesión commitea
+   * primero y esta lectura la ve, o espera a que la aceptación termine. Sin él no espera:
+   * commitea antes, y esta sonda se pone roja.
+   */
+  it('una concesión en vuelo sobre evidencia enlazada y no citada ordena la aceptación', async () => {
+    await enWorkspaceLimpio(
+      'c2-concesion-en-vuelo',
+      async ({ ws: wsC, curadorId, retoId: retoC }) => {
+        const admin = sqlAdmin();
+        const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+          titulo: 'La evidencia citada',
+          resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+        });
+        const dormida = await evidenciaDelReto(wsC, retoC, curadorId, {
+          titulo: 'La que todavía no se puede citar',
+          resumen: 'Otro participante cuenta justo lo contrario.',
+          sinDerechos: true,
+        });
+        const contenido = CONTENIDO_C2(ev);
+        await conProveedor(
+          { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+          () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+        );
+        const p = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+          (x) => x.capacidad === 'C2',
+        )!;
+        // El alcance no la nombra: no era citable cuando se armó el material.
+        const [guardada] = await admin`select alcance_evidencia from propuesta_ai
+          where id = ${p.id} and workspace_id = ${wsC}`;
+        expect(guardada!.alcance_evidencia).toEqual([ev]);
+
+        // La concesión toma su candado de fila y se queda ABIERTA.
+        const concesion = await candadoEnVuelo((tx) => tx`update derecho_uso
+            set estado = 'concedido', ambito = 'cliente', base = 'El participante dio el permiso',
+                decidido_por = ${curadorId}, decidido_en = now()
+            where evidencia_id = ${dormida} and workspace_id = ${wsC}`);
+
+        const aceptacion = conUsuario(curadorId, async (tx) => {
+          const [ins] = await tx`insert into insight
+            (workspace_id, titulo, resumen, estado, creado_por)
+            values (${wsC}, ${contenido.titulo}, ${contenido.resumen}, 'propuesto', ${curadorId})
+            returning id`;
+          const [af] = await tx`insert into afirmacion
+            (workspace_id, insight_id, orden, texto, es_hipotesis)
+            values (${wsC}, ${ins!.id as string}, 0, ${contenido.afirmaciones[0]!.texto}, false)
+            returning id`;
+          await tx`insert into cita
+            (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+            values (${wsC}, ${af!.id as string}, ${ev},
+                    ${contenido.afirmaciones[0]!.citas[0]!.fragmento},
+                    ${contenido.afirmaciones[0]!.citas[0]!.localizacion}, ${curadorId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${curadorId}, insight_id = ${ins!.id as string}
+            where id = ${p.id} and workspace_id = ${wsC}`;
+        });
+        const veredicto = aceptacion.then(
+          () => 'commiteó',
+          (e: Error) => `rechazó: ${e.message}`,
+        );
+
+        await concesion.esperaAQueAlguienEspere();
+        concesion.soltar();
+        await concesion.terminado;
+
+        expect(
+          await veredicto,
+          'la aceptación se coló por delante de una concesión que ya estaba en vuelo',
+        ).toMatch(/no llegaron a ver/);
+
+        const [tras] = await admin`select estado from propuesta_ai
+          where id = ${p.id} and workspace_id = ${wsC}`;
+        expect(tras!.estado as string).toBe('propuesta');
+      },
+    );
   }, 20000);
 
   /**
@@ -9706,6 +9803,86 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(sellado!.propuesta_ai_id).toBe(p.id);
     });
   });
+  /**
+   * El alcance que se sella dice lo que el modelo LEYÓ, no lo que se consultó para él.
+   *
+   * El cuerpo de C2 es la concatenación de todos los documentos del reto y se recorta ENTERO a
+   * `MAX_MATERIAL`: pasado ese punto, la cola se queda fuera —el documento en el que cae el
+   * corte, a medias; los siguientes, del todo—. Y media evidencia no es una evidencia leída: la
+   * contradicción que el análisis tenía que encontrar puede estar justo en el trozo cortado.
+   */
+  it('el alcance del material solo apunta la evidencia que llegó entera', () => {
+    const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const llegado = evidenciaQueLlegoAlModelo({
+      codigo: 'R-01',
+      titulo: 'Reto',
+      descripcion: 'Formulación del reto',
+      evidencia: [
+        { id: id(1), titulo: 'A', resumen: 'a'.repeat(100) },
+        // En ésta cae el corte: llega a medias, y a medias no cuenta.
+        { id: id(2), titulo: 'B', resumen: 'b'.repeat(MAX_MATERIAL) },
+        // Y ésta no llega en absoluto.
+        { id: id(3), titulo: 'C', resumen: 'c'.repeat(100) },
+      ],
+    });
+    expect(llegado.ids).toEqual([id(1)]);
+    expect(llegado.fuera).toBe(2);
+    expect(llegado.caracteres).toBeGreaterThan(MAX_MATERIAL);
+  });
+
+  /**
+   * Y el alcance que se GUARDA deja fuera lo que el recorte no dejó llegar, así que el sello
+   * no se puede dar.
+   *
+   * El recorte no es un error —el prompt se lo dice al modelo y el panel mide cada cita contra
+   * el trozo que sobrevivió—, así que la propuesta se genera y se revisa igual. Lo que no puede
+   * pasar es que el alcance MIENTA: apuntando todo lo consultado, el guard diferido comparaba
+   * la evidencia de hoy con una lista que decía haberla visto entera, y sellaba unos insights
+   * que no pudieron encontrar la contradicción que estaba en el trozo cortado. Con el alcance
+   * honesto, quien intenta aceptarlos se topa con el suelo — que es donde tenía que pararse.
+   */
+  it('el alcance guardado excluye la evidencia que el recorte dejó fuera, y sin ella no se sella', async () => {
+    await enWorkspaceLimpio(
+      'c2-alcance-tras-el-recorte',
+      async ({ ws: wsC, curadorId, retoId: retoC }) => {
+        const admin = sqlAdmin();
+        const cabe = await evidenciaDelReto(wsC, retoC, curadorId, {
+          titulo: 'AAA la que sí cabe',
+          resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+        });
+        // Ordena DESPUÉS —el material va por título— y se lleva el cuerpo por delante del
+        // techo, así que es ella la que el recorte se come.
+        const noCabe = await evidenciaDelReto(wsC, retoC, curadorId, {
+          titulo: 'ZZZ la que se queda fuera',
+          resumen: 'Relato del participante sin parar. '.repeat(700),
+        });
+
+        await conProveedor(
+          {
+            ok: true,
+            datos: { insights: [CONTENIDO_C2(cabe)] },
+            intentos: [intento({ uso: null })],
+          },
+          () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+        );
+
+        const [guardada] = await admin`select id, alcance_evidencia from propuesta_ai
+          where workspace_id = ${wsC} and capacidad = 'C2'`;
+        expect(guardada, 'no se generó la propuesta').toBeDefined();
+        expect(
+          guardada!.alcance_evidencia,
+          'el alcance apuntó un documento que el recorte no dejó llegar',
+        ).toEqual([cabe]);
+        expect(guardada!.alcance_evidencia).not.toContain(noCabe);
+
+        // Y el suelo no la sella mientras el reto siga teniendo esa evidencia sin ver.
+        await expect(
+          aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: guardada!.id as string }),
+        ).rejects.toThrow(/no llegaron a ver/);
+      },
+    );
+  });
+
   /**
    * Un journey cuya TOPOLOGÍA A REMEDIAR no cabe en el material no se ofrece ni se despacha.
    *

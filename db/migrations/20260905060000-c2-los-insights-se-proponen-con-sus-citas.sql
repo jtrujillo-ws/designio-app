@@ -788,6 +788,20 @@ begin
   -- «derecho_uso» de toda la evidencia que este snapshot va a fijar, ordenadas por su id para
   -- que dos transacciones las pidan en el mismo orden. Va DESPUÉS del candado del reto, que es
   -- el orden que ya encabeza el del servicio.
+  --
+  -- «Toda la que este snapshot va a fijar» son DOS conjuntos, y durante una ronda esto solo
+  -- cubrió el primero. La que el insight CITA la miran las dos comprobaciones de aquí abajo; la
+  -- que el reto tiene ENLAZADA y el insight no cita la mira la comprobación de completitud del
+  -- final, que pregunta `evidencia_usable` por cada una. Con el candado sobre el subconjunto
+  -- citado, una CONCESIÓN en vuelo sobre un documento enlazado y no citado no ordenaba nada:
+  -- esta lectura lo veía inutilizable —la concesión aún no ha commiteado—, la completitud
+  -- pasaba, y el sello caía justo antes de que el documento pasara a ser citable. Los insights
+  -- quedaban sellados sin haber visto una evidencia que el reto ya tenía.
+  --
+  -- Van en UNA sola sentencia y no en dos: dos «for share» sobre conjuntos que se solapan sin
+  -- que uno contenga al otro se piden en órdenes distintos según qué cite cada propuesta, y eso
+  -- es un interbloqueo esperando a que dos aceptaciones coincidan. Una sentencia sobre la unión
+  -- tiene un orden y solo uno.
   perform du.evidencia_id
     from derecho_uso du
    where du.workspace_id = new.workspace_id
@@ -795,7 +809,12 @@ begin
        select c.evidencia_id
          from afirmacion a
          join cita c on c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
-        where a.insight_id = new.insight_id and a.workspace_id = new.workspace_id)
+        where a.insight_id = new.insight_id and a.workspace_id = new.workspace_id
+        union
+       select ae.evidencia_id
+         from arquetipo a
+         join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+        where a.reto_id = new.reto_id and a.workspace_id = new.workspace_id)
    order by du.evidencia_id
      for share;
   if new.insight_id is not null and exists (

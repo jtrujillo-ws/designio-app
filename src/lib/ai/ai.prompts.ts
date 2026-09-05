@@ -250,6 +250,35 @@ function cuerpoDeInsights(reto: RetoConEvidencia): {
 }
 
 /**
+ * Qué evidencia llegó ENTERA al modelo, cuánta se quedó fuera y cuánto ocupaba todo.
+ *
+ * `alcance_evidencia` dice qué documentos tuvo delante quien escribió los insights, y el suelo
+ * lo compara con los que el reto tiene hoy para no sellar unos insights que no llegaron a ver
+ * algo. Apuntar ahí todo lo CONSULTADO da por visto lo que el recorte se comió: el cuerpo es la
+ * concatenación de todos los documentos y se corta ENTERO a `MAX_MATERIAL`, así que pasado
+ * cierto punto la cola se queda fuera —a medias o del todo—.
+ *
+ * Y cuenta como visto solo lo que llegó COMPLETO. Media evidencia no es una evidencia leída: la
+ * contradicción que el análisis tenía que encontrar puede estar justo en el trozo que se cortó,
+ * y el sello diría que se miró.
+ */
+export function evidenciaQueLlegoAlModelo(reto: RetoConEvidencia): {
+  ids: string[];
+  fuera: number;
+  caracteres: number;
+} {
+  const { texto, tramos } = cuerpoDeInsights(reto);
+  const visto = materialQueVeElModelo(texto);
+  const ids = reto.evidencia
+    .filter((e) => {
+      const tramo = tramos.get(e.id);
+      return tramo !== undefined && visto.slice(tramo[0], tramo[1]).length === tramo[1] - tramo[0];
+    })
+    .map((e) => e.id);
+  return { ids, fuera: reto.evidencia.length - ids.length, caracteres: texto.length };
+}
+
+/**
  * El texto de UNA evidencia tal como el modelo lo vio, para medir contra él las citas que la
  * nombran — y SOLO él.
  *

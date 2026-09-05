@@ -17,6 +17,7 @@ import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journe
 import {
   presenciaLiteralPorCita,
   materialDeGate,
+  evidenciaQueLlegoAlModelo,
   materialDeInsights,
   promptInsights,
   SISTEMA_INSIGHTS,
@@ -2750,6 +2751,22 @@ const PREPARAR: Record<
         resumen: e.resumen as string,
       })),
     };
+    /*
+     * Y qué evidencia LLEGÓ, que no es la misma pregunta que cuál se consultó para armarla. El
+     * cuerpo es la concatenación de todos los documentos y se recorta ENTERO a `MAX_MATERIAL`,
+     * así que con bastante evidencia enlazada la cola se queda fuera —el documento donde cae el
+     * corte, a medias; los siguientes, del todo—.
+     *
+     * El recorte NO es un error: el prompt se lo dice al modelo («no afirmes nada sobre lo que
+     * no ves») y el panel mide cada cita contra el trozo que sobrevivió. Lo que no puede pasar
+     * es que el ALCANCE mienta: `alcance_evidencia` es lo que el guard diferido compara al
+     * aceptar con la evidencia que el reto tiene, y apuntar ahí todo lo consultado da por
+     * vistos documentos que nadie enseñó — sellando unos insights que no pudieron encontrar la
+     * contradicción que estaba justo en el trozo cortado. Con el alcance honesto, la propuesta
+     * se genera y se revisa igual, y lo que el suelo impide es SELLARLA mientras el reto siga
+     * teniendo evidencia que ella no vio.
+     */
+    const llegado = evidenciaQueLlegoAlModelo(material);
     return {
       sistema: SISTEMA_INSIGHTS,
       prompt: promptInsights({ ...material, cuantos: MAX_INSIGHTS_POR_LOTE }),
@@ -2760,10 +2777,10 @@ const PREPARAR: Record<
        * los derechos, y el bloque está armado y saldría igual hacia el proveedor.
        */
       huellaMaterial: huellaDelMaterial(materialDeInsights(material).texto),
-      // El mismo conjunto, tal cual, para que el suelo pueda volver a preguntarlo. Sale de
+      // Lo que el modelo tuvo delante, para que el suelo pueda volver a preguntarlo. Sale de
       // `material` y no de otra lectura: dos consultas para el mismo conjunto es cómo
       // empiezan las discrepancias que este PR ya ha corregido varias veces.
-      evidenciaDelMaterial: material.evidencia.map((e) => e.id),
+      evidenciaDelMaterial: llegado.ids,
     };
   },
   C5: async (tx, entrada) => {

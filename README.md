@@ -2,6 +2,7 @@
 
 Plataforma B2B AI-native de service design para el contexto de una boutique: sistema de registro del método (etapas 0–7 con gates de suficiencia), grafo de dominio con trazabilidad completa **evidencia → insight → decisión → design version → release → effective state → outcome review**, y medición temporal de impacto con Metric Registry y post mortem.
 
+- **Documento consolidado** (qué es Designio y qué incluye, con estado por capacidad): [`docs/DESIGNIO-COMPLETE.md`](docs/DESIGNIO-COMPLETE.md)
 - **Documento fuente**: [`docs/00-fuente/prediseno-producto-v0.2.md`](docs/00-fuente/prediseno-producto-v0.2.md)
 - **Paquete de diseño** (DDD, ADRs, invariantes, journeys, specs, diseño técnico, mockups): [`docs/README.md`](docs/README.md)
 - **Design system** ("El arco del loop"): [`.claude/skills/designio-design/`](.claude/skills/designio-design/README.md) — tokens en `src/styles/tokens/` (fuente de verdad en la app)

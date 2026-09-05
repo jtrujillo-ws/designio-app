@@ -1,5 +1,5 @@
 import '@/lib/server-only';
-import type { TransactionSql } from 'postgres';
+import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { DimensionesEvidenciaSchema, ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
@@ -13,7 +13,6 @@ import {
   presenciaLiteralPorCita,
   materialDeItem,
   materialDeReto,
-  MAX_CRITERIOS_POR_LOTE,
   MAX_MATERIAL,
   PROMPT_VERSION,
   promptCriterios,
@@ -23,10 +22,13 @@ import {
 } from './ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
-  ContenidoCriterioSchema,
-  ContenidoExtraccionSchema,
-  DESTINO_DE_CAPACIDAD,
-  parsearContenido,
+  CAPACIDADES,
+  CAPACIDADES_ACTIVAS,
+  COLUMNAS_DE_ANCLA,
+  COLUMNA_DE_DESTINO,
+  type AnclaCapacidad,
+  type CandidatoAncla,
+  type Destino,
   type CapacidadActiva,
   type ContenidoCriterio,
   type ContenidoExtraccion,
@@ -39,6 +41,7 @@ import {
   type RegistrarConsentimiento,
   type RevisarPropuesta,
 } from './ai.schemas';
+import { ESQUEMA_DE_CONTENIDO, parsearContenido } from './ai.contenido';
 import {
   credencialesAI,
   generarConProveedor,
@@ -289,34 +292,263 @@ async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Pro
     hashtextextended('designio:presupuesto-ai:' || ${workspaceId}, 42))`;
 }
 
+
+/**
+ * Lo que el panel sabe de una columna de ancla: de dónde sale la fila y cómo se titula.
+ *
+ * Esto va POR COLUMNA porque es lo único que de verdad depende de ella: el join es a la
+ * tabla del ancla y el título es de esa fila, con capacidad o sin ella. Todo lo demás —qué
+ * bloquea la propuesta, qué material leyó el modelo, qué anclas se ofrecen— NO depende de la
+ * columna sino de la CAPACIDAD, y está abajo.
+ *
+ * La distinción la trajo una revisión y corrige un arreglo mío anterior: había puesto aquí
+ * también el motivo y el material, y eso hacía el registro exhaustivo por COLUMNA. Dos
+ * capacidades pueden anclar en el mismo sitio —C2 y C3 cuelgan del reto igual que C0— y no
+ * comparten ni sus puertas ni su material: C0 se congela con el G0 (SYS-22) y cita la
+ * formulación del reto; una capacidad posterior puede generarse después del G0 y citar la
+ * evidencia codificada. Indexado por columna, la capacidad nueva heredaba las reglas de C0
+ * sin que nada lo pidiera, y sin que faltara ninguna entrada que el compilador echara de
+ * menos. La costura tiene que exigir lo que varía DONDE varía.
+ */
+type AnclaEnElPanel = {
+  /** De dónde sale la fila del ancla. */
+  join: (tx: TransactionSql) => PendingQuery<Row[]>;
+  /** Cómo se titula en el panel. */
+  titulo: (tx: TransactionSql) => PendingQuery<Row[]>;
+  /**
+   * Las columnas de esa fila que el panel proyecta. Es el repertorio COMPLETO de esa tabla,
+   * no el de una capacidad: varias pueden anclar aquí y componer su material con partes
+   * distintas, así que se proyecta una vez y cada una toma lo suyo.
+   */
+  columnas: (tx: TransactionSql) => PendingQuery<Row[]>;
+};
+
+const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
+  item_id: {
+    join: (tx) => tx`left join item_importacion i
+      on i.id = p.item_id and i.workspace_id = p.workspace_id`,
+    titulo: (tx) => tx`i.titulo`,
+    columnas: (tx) => tx`i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
+      i.referencia as item_referencia, i.estado as item_estado,
+      left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`,
+  },
+  reto_id: {
+    join: (tx) => tx`left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`,
+    titulo: (tx) => tx`r.codigo || ' ' || r.titulo`,
+    columnas: (tx) => tx`r.codigo as reto_codigo, r.titulo as reto_titulo,
+      r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica`,
+  },
+};
+
+/**
+ * Y lo que el panel sabe de una CAPACIDAD: qué la deja obsoleta, contra qué material se mide
+ * el grounding de sus citas, y qué anclas se le ofrecen a la generación.
+ *
+ * Las tres varían con la capacidad y no con la columna donde cuelga, y las tres tienen su
+ * modo de fallar en silencio si se indexan mal: el motivo manda al revisor a un trámite que
+ * no desbloquea nada, el material equivocado marca como ausentes citas que están, y la lista
+ * de candidatas esconde el ancla de una generación perfectamente válida.
+ */
+type CapacidadEnElPanel = {
+  /**
+   * Qué deja la propuesta obsoleta, DADO que su capacidad es esta. Sin `case … end`: el CASE
+   * exterior lo cierra con `else null`, que es lo que dice «este panel no sabe juzgar esto».
+   */
+  estado: (tx: TransactionSql) => PendingQuery<Row[]>;
+  /**
+   * El material que el modelo leyó, recompuesto desde las columnas que proyectó su ancla. Se
+   * compone IGUAL que al construir el prompt —ficha incluida y con el delimitador
+   * neutralizado—: la presencia literal se mide contra lo que el modelo leyó, no contra el
+   * texto crudo de la base. Una sola definición, dos usos.
+   */
+  material: (f: Record<string, unknown>) => string;
+  /** Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad. */
+  candidatas: (
+    tx: TransactionSql,
+    workspaceId: string,
+    patron: string | null,
+    limite: number,
+  ) => Promise<CandidatoAncla[]>;
+};
+
+const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
+  CI: {
+    estado: (tx) => tx`case
+        when i.estado is distinct from 'pendiente' then 'item-curado'
+        when tipo_fuente_exige_consentimiento(i.tipo_fuente)
+          and not consentimiento_externo_vigente(i.id, i.workspace_id)
+          then 'consentimiento-revocado'
+        else 'disponible'
+      end`,
+    material: (f) =>
+      materialDeItem({
+        titulo: (f.item_titulo as string | null) ?? '',
+        tipoFuente: (f.item_tipo_fuente as string | null) ?? '',
+        referencia: (f.item_referencia as string | null) ?? '',
+        contenido: (f.item_contenido as string | null) ?? '',
+      }).texto,
+    /*
+     * Los items que exigen consentimiento o no traen material se ofrecen igual, MARCADOS: la
+     * pantalla explica qué falta, que es más útil que esconderlos sin decir por qué.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select i.id, i.titulo,
+               tipo_fuente_exige_consentimiento(i.tipo_fuente)
+                 and not consentimiento_externo_vigente(i.id, i.workspace_id)
+                 as consentimiento_pendiente,
+               not item_tiene_material_extraible(i.contenido) as sin_material
+        from item_importacion i
+        where i.workspace_id = ${workspaceId} and i.estado = 'pendiente'
+          and not exists (select 1 from propuesta_ai p
+            where p.item_id = i.id and p.workspace_id = i.workspace_id and p.estado = 'propuesta')
+          and (${patron}::text is null or i.titulo ilike ${patron})
+        order by i.creado_en asc, i.id asc
+        limit ${limite}`;
+      return filas.map((i) => ({
+        id: i.id as string,
+        titulo: i.titulo as string,
+        consentimientoPendiente: i.consentimiento_pendiente as boolean,
+        sinMaterial: i.sin_material as boolean,
+      }));
+    },
+  },
+  C0: {
+    /*
+     * El ORDEN de los TRES motivos importa cuando se cumplen varios a la vez, que es lo
+     * normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó Y firmó su registry). Se
+     * ordenan de la puerta más cerrada a la menos: primero el ciclo de vida del reto, que no
+     * se revierte nunca; después el registry firmado, que tampoco (la firma es de ida); y
+     * solo al final el G0, que es el ÚNICO con salida real —reabrir la etapa 0 (RF-04.9)
+     * descongela—. Sugerirle esa salida a quien tiene el reto archivado o el contrato firmado
+     * sería mandarlo a un trámite que no va a desbloquear nada. Entre motivos ciertos gana
+     * siempre el que describe la puerta que ya no se abre.
+     *
+     * Es el mismo orden con el que `criterio_g0_pendiente_guard` elige su `raise`, y por la
+     * misma razón: quien fuerza la escritura por SQL directo lee el motivo que le sirve.
+     */
+    estado: (tx) => tx`case
+        when not reto_admite_criterios(p.reto_id, p.workspace_id) then 'reto-no-admite'
+        when reto_registry_firmado(p.reto_id, p.workspace_id) then 'registry-firmado'
+        when reto_g0_congela_criterios(p.reto_id, p.workspace_id) then 'criterios-congelados'
+        else 'disponible'
+      end`,
+    /*
+     * C0 cita la formulación del reto igual que CI cita el material del item, así que la
+     * presencia se mide con la misma regla. Cuando C0 no citaba, sus propuestas no salían mal
+     * en la medición de grounding (RF-09.10): salían excluidas, que es peor — una capacidad
+     * que no puede salir mal es la que más falta hace medir.
+     */
+    material: (f) =>
+      materialDeReto({
+        codigo: (f.reto_codigo as string | null) ?? '',
+        titulo: (f.reto_titulo as string | null) ?? '',
+        descripcion: (f.reto_descripcion as string | null) ?? '',
+        metricaObjetivo: (f.reto_metrica as string | null) ?? '',
+      }).texto,
+    /*
+     * Retos con criterios aún abiertos, que son DOS condiciones y no una: que el ciclo de vida
+     * del reto siga admitiéndolos (RF-04.12) y que nada los haya congelado (SYS-22: ni un G0
+     * aprobado ni un registry de medición firmado). Las dos las impone el guard del INSERT de
+     * propuestas, así que ofrecer un reto al que le falte cualquiera sería ofrecer una acción
+     * que la base va a rechazar — y las dos se preguntan por la MISMA función que la impone.
+     * Aquí basta el predicado COMPUESTO porque la lista solo decide si el reto se ofrece;
+     * distinguir la causa es cosa del panel, que sí tiene que explicarla.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
+        where r.workspace_id = ${workspaceId}
+          and reto_admite_criterios(r.id, r.workspace_id)
+          and not reto_criterios_congelados(r.id, r.workspace_id)
+          and not exists (select 1 from propuesta_ai p
+            where p.reto_id = r.id and p.workspace_id = r.workspace_id and p.estado = 'propuesta')
+          and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
+        order by r.codigo asc, r.id asc
+        limit ${limite}`;
+      return filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string }));
+    },
+  },
+};
+
+/**
+ * La proyección del panel, compuesta desde los DOS registros: lo que depende del ancla, por
+ * columna; lo que depende de la capacidad, por capacidad.
+ *
+ * Se exporta porque la prueba que la sujeta tiene que medir ESTA composición y no una copia
+ * suya: lo que hay que demostrar es que ninguna capacidad hereda el juicio de otra, y eso
+ * solo lo demuestra evaluar el mismo CASE que corre en producción.
+ */
+export function proyeccionDelPanel(tx: TransactionSql): {
+  /** `p.<columna>` por cada ancla declarada. */
+  columnas: PendingQuery<Row[]>;
+  /** Los títulos de cada ancla, para un `coalesce`. */
+  titulos: PendingQuery<Row[]>;
+  /** El repertorio de columnas de cada tabla de ancla, del que cada capacidad toma lo suyo. */
+  materiales: PendingQuery<Row[]>;
+  /**
+   * Las ramas del CASE, una POR CAPACIDAD y preguntando por su nombre. Sin `case … end`:
+   * quien lo usa cierra con `else null`, que es lo que dice «este panel no sabe juzgar esta
+   * propuesta» —y `filaDePanel` lo lee como «ancla-ausente», que es solo rechazable—.
+   *
+   * Por capacidad y no por columna, que es la corrección de fondo de esta ronda: preguntando
+   * `when p.reto_id is not null`, la segunda capacidad anclada en un reto habría recibido las
+   * puertas de C0 —el congelado del G0 entre ellas— sin que faltara ninguna entrada que el
+   * compilador echara de menos.
+   */
+  motivo: PendingQuery<Row[]>;
+  joins: PendingQuery<Row[]>;
+} {
+  const conComas = (fs: PendingQuery<Row[]>[]) => fs.reduce((a, b) => tx`${a}, ${b}`);
+  const anclas = COLUMNAS_DE_ANCLA.map((c) => ({ c, a: ANCLA_EN_EL_PANEL[c] }));
+  const capacidades = CAPACIDADES_ACTIVAS.map((k) => ({ k, d: CAPACIDAD_EN_EL_PANEL[k] }));
+  return {
+    columnas: conComas(anclas.map(({ c }) => tx`p.${tx(c)}`)),
+    titulos: conComas(anclas.map(({ a }) => a.titulo(tx))),
+    materiales: conComas(anclas.map(({ a }) => a.columnas(tx))),
+    motivo: capacidades
+      .map(({ k, d }) => tx`when p.capacidad = ${k} then ${d.estado(tx)}`)
+      .reduce((a, b) => tx`${a} ${b}`),
+    joins: anclas.map(({ a }) => a.join(tx)).reduce((a, b) => tx`${a} ${b}`),
+  };
+}
+
+/**
+ * La definición de la capacidad de ESTA fila, o `undefined` si el panel no la conoce.
+ *
+ * `propuesta_ai.capacidad` admite las diez del catálogo y solo dos están activas, así que una
+ * fila puede nombrar una capacidad que este código no sabe pintar. No se esconde —una
+ * propuesta invisible es una que nadie puede rechazar— pero tampoco se le presta el juicio de
+ * otra: sale sin material y sin motivo, y `filaDePanel` lee eso como «ancla-ausente», que es
+ * solo rechazable.
+ */
+function definicionDeFila(f: Record<string, unknown>): CapacidadEnElPanel | undefined {
+  return CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva];
+}
+
+/**
+ * La columna por la que cuelga ESTA fila.
+ *
+ * Sale de lo que la CAPACIDAD declara —no de buscar cuál de las columnas trae valor—, porque
+ * eso es lo que dice de dónde cuelga de verdad; el barrido queda de reserva para una fila
+ * cuya capacidad este panel no conoce, donde adivinar por el valor es lo único que hay.
+ */
+function columnaDelAncla(f: Record<string, unknown>): AnclaCapacidad['columna'] | undefined {
+  const declarada = CAPACIDADES[f.capacidad as CapacidadActiva]?.ancla.columna;
+  if (declarada) return declarada;
+  return COLUMNAS_DE_ANCLA.find((c) => f[c] != null);
+}
+
 function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   const contenido = f.contenido as ContenidoPropuesta;
   const original = f.contenido_original as ContenidoPropuesta;
-  // El material se compone IGUAL que al construir el prompt —ficha incluida y con el
-  // delimitador neutralizado—: la presencia literal se mide contra lo que el modelo leyó, no
-  // contra el texto crudo de la base. Una sola definición, dos usos.
-  //
-  // Y se compone para las DOS capacidades: C0 cita la formulación del reto igual que CI cita
-  // el material del item, así que la presencia se mide con la misma función. Cuando C0 no
-  // citaba, sus propuestas no salían mal en la medición de grounding (RF-09.10): salían
-  // excluidas, que es peor — una capacidad que no puede salir mal es la que más falta hace
-  // medir.
-  const material =
-    f.item_id !== null
-      ? materialDeItem({
-          titulo: (f.item_titulo as string | null) ?? '',
-          tipoFuente: (f.item_tipo_fuente as string | null) ?? '',
-          referencia: (f.item_referencia as string | null) ?? '',
-          contenido: (f.item_contenido as string | null) ?? '',
-        }).texto
-      : f.reto_codigo
-        ? materialDeReto({
-            codigo: f.reto_codigo as string,
-            titulo: (f.reto_titulo as string | null) ?? '',
-            descripcion: (f.reto_descripcion as string | null) ?? '',
-            metricaObjetivo: (f.reto_metrica as string | null) ?? '',
-          }).texto
-        : '';
+  // El material lo recompone la CAPACIDAD, que es lo que decide qué leyó el modelo. Con la
+  // columna del ancla no bastaba: dos capacidades pueden colgar del mismo reto y citar cosas
+  // distintas —C0 la formulación, una posterior la evidencia codificada—, así que indexarlo
+  // por columna le habría dado a la segunda el pajar de la primera y sus citas habrían salido
+  // ausentes estando presentes.
+  const material = definicionDeFila(f)?.material(f) ?? '';
+  const columna = columnaDelAncla(f);
   // Las presencias se resuelven de una vez para toda la fila: el pajar es el mismo para
   // todas sus citas, y normalizarlo por cita multiplicaba el trabajo por seis sin cambiar
   // ninguna respuesta.
@@ -343,9 +575,19 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
       presenteLiteral: presencias[i]!,
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
-    anclaId: ((f.item_id ?? f.reto_id) as string | null) ?? '',
+    /*
+     * El ancla sale de TODAS las columnas declaradas, no de una pareja escrita aquí. Con
+     * `f.item_id ?? f.reto_id`, una capacidad anclada en otra cosa aparecía en el panel con
+     * el ancla vacía — y por tanto como no disponible, así que nadie podía aceptarla.
+     * `COLUMNAS_DE_ANCLA` es exhaustiva por el tipo: ampliar el ancla rompe la compilación
+     * donde se declara, no aquí en silencio.
+     */
+    anclaId: columna ? (f[columna] as string) : '',
     // Si no se pudo determinar, se trata como NO disponible: habilitar dos botones que la
-    // base va a rechazar es peor que pedir un refresco.
+    // base va a rechazar es peor que pedir un refresco. Y el SQL devuelve NULL justamente
+    // cuando ninguna columna declarada trae el ancla, en vez de dejar que la fila caiga en
+    // la rama de otra: un motivo prestado es peor que ninguno, porque propone una salida
+    // que no existe.
     anclaEstado: (f.ancla_estado as EstadoAncla | null) ?? 'ancla-ausente',
     modelo: f.modelo as string,
     promptVersion: f.prompt_version as string,
@@ -406,52 +648,29 @@ export async function panelPropuestas(
     // Cada motivo pregunta por la MISMA función que lo impone al aceptar: el día que el
     // predicado cambie, el panel no se queda con la versión vieja (que es exactamente cómo
     // nació `reto_criterios_congelados`).
+    // (El orden de los motivos de cada ancla vive con el ancla, en `ANCLA_EN_EL_PANEL`.)
     //
-    // El ORDEN de los TRES motivos de C0 importa cuando se cumplen varios a la vez, que es
-    // lo normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó Y firmó su registry).
-    // Se ordenan de la puerta más cerrada a la menos: primero el ciclo de vida del reto, que
-    // no se revierte nunca; después el registry firmado, que tampoco (la firma es de ida); y
-    // solo al final el G0, que es el ÚNICO con salida real —reabrir la etapa 0 (RF-04.9)
-    // descongela—. Sugerirle esa salida a quien tiene el reto archivado o el contrato
-    // firmado sería mandarlo a un trámite que no va a desbloquear nada. Entre motivos
-    // ciertos gana siempre el que describe la puerta que ya no se abre.
-    //
-    // Es el mismo orden con el que `criterio_g0_pendiente_guard` elige su `raise`, y por la
-    // misma razón: quien fuerza la escritura por SQL directo lee el motivo que le sirve.
+    // Y las cuatro piezas que dependen del TIPO de ancla —la columna proyectada, el join, el
+    // título y el motivo— se escriben desde `ANCLA_EN_EL_PANEL`, una entrada por columna
+    // declarada. Antes estaban tecleadas para item y reto, y el CASE terminaba en las ramas
+    // del reto sin preguntar por `p.reto_id`: cualquier ancla que no fuese un item heredaba
+    // su motivo. Ahora cada rama declara de QUÉ columna habla y el fondo del CASE es NULL,
+    // que `filaDePanel` lee como «ancla-ausente» — no aceptable, que es la única respuesta
+    // honesta cuando el panel no sabe juzgar el ancla.
+    const proyeccion = proyeccionDelPanel(tx);
+
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
-             p.contenido, p.contenido_original, p.item_id, p.reto_id,
+             p.contenido, p.contenido_original, ${proyeccion.columnas},
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
-             coalesce(i.titulo, r.codigo || ' ' || r.titulo) as ancla_titulo,
-             r.codigo as reto_codigo, r.titulo as reto_titulo,
-             r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica,
-             case
-               when p.item_id is not null then
-                 case
-                   when i.estado is distinct from 'pendiente' then 'item-curado'
-                   when tipo_fuente_exige_consentimiento(i.tipo_fuente)
-                     and not consentimiento_externo_vigente(i.id, i.workspace_id)
-                     then 'consentimiento-revocado'
-                   else 'disponible'
-                 end
-               when not reto_admite_criterios(p.reto_id, p.workspace_id)
-                 then 'reto-no-admite'
-               when reto_registry_firmado(p.reto_id, p.workspace_id)
-                 then 'registry-firmado'
-               when reto_g0_congela_criterios(p.reto_id, p.workspace_id)
-                 then 'criterios-congelados'
-               else 'disponible'
-             end as ancla_estado,
-             i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
-             i.referencia as item_referencia,
-             left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`;
+             coalesce(${proyeccion.titulos}) as ancla_titulo,
+             case ${proyeccion.motivo} else null end as ancla_estado,
+             ${proyeccion.materiales}`;
     // La llamada que pagó cada propuesta: el uso, el coste y la latencia viven allí (una
     // fila por llamada, aunque devuelva un lote), no repetidos en cada propuesta.
     const origen = tx`from propuesta_ai p
       join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
-      left join item_importacion i
-        on i.id = p.item_id and i.workspace_id = p.workspace_id
-      left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`;
+      ${proyeccion.joins}`;
 
     // Se pide una fila de más para saber si el corte dejó algo fuera (mismo truco que la
     // bandeja): el panel lo dice en vez de fingir que eso es todo.
@@ -531,19 +750,31 @@ export async function panelPropuestas(
     // la búsqueda por texto es lo que vuelve la promesa incondicional: cualquier ancla se
     // alcanza por su nombre sin depender de dónde caiga el corte.
     const patron = busqueda ? `%${busqueda.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
-    const items = await tx`
-      select i.id, i.titulo,
-             tipo_fuente_exige_consentimiento(i.tipo_fuente)
-               and not consentimiento_externo_vigente(i.id, i.workspace_id)
-               as consentimiento_pendiente,
-             not item_tiene_material_extraible(i.contenido) as sin_material
-      from item_importacion i
-      where i.workspace_id = ${workspaceId} and i.estado = 'pendiente'
-        and not exists (select 1 from propuesta_ai p
-          where p.item_id = i.id and p.workspace_id = i.workspace_id and p.estado = 'propuesta')
-        and (${patron}::text is null or i.titulo ilike ${patron})
-      order by i.creado_en asc, i.id asc
-      limit ${PAGINA_ANCLAS + 1}`;
+
+    // Y las candidatas las pide CADA CAPACIDAD con SU consulta de elegibilidad, no la columna
+    // donde cuelgan. Indexado por columna, una segunda capacidad anclada en un reto recibía la
+    // lista de C0 —que excluye los retos con criterios congelados—, así que una generación
+    // suya perfectamente válida después del G0 se quedaba sin ancla que ofrecer, y sin que
+    // faltara ninguna entrada que el compilador echara de menos.
+    //
+    // Se pide una fila de más para saber si el corte dejó algo fuera, y el corte se DICE.
+    const candidatas = Object.fromEntries(
+      await Promise.all(
+        CAPACIDADES_ACTIVAS.map(async (k) => {
+          const filas = await CAPACIDAD_EN_EL_PANEL[k].candidatas(
+            tx,
+            workspaceId,
+            patron,
+            PAGINA_ANCLAS + 1,
+          );
+          return [
+            k,
+            { lista: filas.slice(0, PAGINA_ANCLAS), hayMas: filas.length > PAGINA_ANCLAS },
+          ] as const;
+        }),
+      ),
+    ) as PanelPropuestas['candidatas'];
+
     // Material de personas del workspace, con el estado de su consentimiento VIGENTE. Es
     // una lista aparte de las anclas ofrecibles a propósito: el consentimiento no es un
     // paso de la generación sino un hecho de la investigación que se registra cuando
@@ -563,25 +794,6 @@ export async function panelPropuestas(
         and (${patron}::text is null or i.titulo ilike ${patron})
       order by i.creado_en asc, i.id asc
       limit ${PAGINA_ANCLAS + 1}`;
-    // Retos con criterios aún abiertos, que son DOS condiciones y no una: que el ciclo de
-    // vida del reto siga admitiéndolos (RF-04.12) y que nada los haya congelado (SYS-22:
-    // ni un G0 aprobado ni un registry de medición firmado). Las dos las impone el guard del
-    // INSERT de propuestas, así que ofrecer un reto al que le falte cualquiera de ellas sería
-    // ofrecer una acción que la base va a rechazar — y las dos se preguntan por la MISMA
-    // función que la impone, para que no vuelvan a divergir. Aquí basta el predicado
-    // COMPUESTO porque la lista solo decide si el reto se ofrece; distinguir la causa es
-    // cosa del panel, que sí tiene que explicarla.
-    const retos = await tx`
-      select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
-      where r.workspace_id = ${workspaceId}
-        and reto_admite_criterios(r.id, r.workspace_id)
-        and not reto_criterios_congelados(r.id, r.workspace_id)
-        and not exists (select 1 from propuesta_ai p
-          where p.reto_id = r.id and p.workspace_id = r.workspace_id and p.estado = 'propuesta')
-        and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
-      order by r.codigo asc, r.id asc
-      limit ${PAGINA_ANCLAS + 1}`;
-
     return {
       workspaceId,
       ai: {
@@ -603,17 +815,7 @@ export async function panelPropuestas(
         rechazadas: (respaldo?.rechazadas ?? 0) as number,
       },
       hayMasDecididas: decididas.length > DECIDIDAS_RECIENTES,
-      itemsPendientes: items.slice(0, PAGINA_ANCLAS).map((i) => ({
-        id: i.id as string,
-        titulo: i.titulo as string,
-        consentimientoPendiente: i.consentimiento_pendiente as boolean,
-        sinMaterial: i.sin_material as boolean,
-      })),
-      retosAbiertos: retos
-        .slice(0, PAGINA_ANCLAS)
-        .map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
-      hayMasItems: items.length > PAGINA_ANCLAS,
-      hayMasRetos: retos.length > PAGINA_ANCLAS,
+      candidatas,
       materialDePersonas: personas.slice(0, PAGINA_ANCLAS).map((p) => ({
         id: p.id as string,
         titulo: p.titulo as string,
@@ -657,81 +859,32 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     await rolCurador(tx, actorId, entrada.workspaceId);
 
     const { keyWorkspace, keyEntorno } = credencialesAI();
-    let sistema: string;
-    let prompt: { usuario: string; alcanceResumen: string };
-
-    if (entrada.capacidad === 'CI') {
-      // Candado por item ANTES de leer el consentimiento: leerlo y apartar la reserva tienen
-      // que ser atómicos respecto a `registrarConsentimiento`, o una revocación podría
-      // colarse entre ambos y quedarse sin nada que retirar. Orden de candados en toda la
-      // casa: consentimiento (por item) y DESPUÉS presupuesto (por workspace) — este es el
-      // único camino que toma los dos, así que no hay ciclo posible.
-      await bloquearConsentimiento(tx, entrada.anclaId);
-      const [item] = await tx`select titulo, tipo_fuente, referencia, contenido,
-          tipo_fuente_exige_consentimiento(tipo_fuente)
-            and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
-          item_tiene_material_extraible(contenido) as tiene_material
-        from item_importacion
-        where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-          and estado = 'pendiente'`;
-      if (!item) throw new ErrorAI('El item no existe en este workspace o ya fue curado');
-      // RF-09.5: ANTES de construir el prompt, no al aceptar la propuesta. Aquí es donde
-      // se evita de verdad que el material de una persona salga hacia el proveedor; el
-      // guard de `propuesta_ai` es el suelo que impide que exista una propuesta así.
-      if (item.falta_consentimiento as boolean) {
-        throw new ErrorAI(
-          'Ese material es de personas: registra el consentimiento para procesarlo con un proveedor externo antes de pedir una propuesta (RF-09.5)',
-        );
-      }
-      // Un item importado SOLO con la referencia al original no tiene nada que citar, y el
-      // contrato de CI obliga al modelo a devolver una evidencia fechada con al menos una
-      // cita literal. Sin cuerpo, la única salida que cumple el contrato es inventada a
-      // partir de la ficha: una propuesta con apariencia de fundamentada, pagada, que
-      // además contamina la métrica de presencia literal. Y no hay recuperación posible — no hay
-      // herramienta que lea la fuente referenciada — así que la respuesta correcta es no
-      // ofrecer la generación, no intentarla peor.
-      if (!(item.tiene_material as boolean)) {
-        throw new ErrorAI(
-          'Ese item se importó solo con la referencia al original: no hay material que citar, así que no se puede extraer evidencia de él. Cúralo a mano en la bandeja o vuelve a importarlo con el texto pegado.',
-        );
-      }
-      sistema = SISTEMA_EXTRACCION;
-      prompt = promptExtraccion({
-        titulo: item.titulo as string,
-        tipoFuente: item.tipo_fuente as string,
-        referencia: item.referencia as string,
-        contenido: item.contenido as string,
-      });
-    } else {
-      const [reto] = await tx`select codigo, titulo, descripcion, metrica_objetivo
-        from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-          and reto_admite_criterios(id, workspace_id)`;
-      if (!reto) throw new ErrorAI('El reto no existe en este workspace o ya no admite criterios');
-      // El congelado de criterios lo impone la política de criterio_exito; anticiparlo aquí
-      // evita quemar presupuesto en una propuesta que nadie podría aceptar. Los DOS
-      // predicados del reto —admite criterios, y no están congelados— se preguntan por la
-      // función que los impone, nunca copiados a mano: es lo que hace que ampliar uno llegue
-      // de golpe a las políticas, a los guards, al panel y a estas lecturas, en vez de
-      // dejar la versión vieja escondida en la que nadie tocó.
-      const [congelado] = await tx`select
-        reto_registry_firmado(${entrada.anclaId}, ${entrada.workspaceId}) as registry,
-        reto_g0_congela_criterios(${entrada.anclaId}, ${entrada.workspaceId}) as g0`;
-      if (congelado?.registry) {
-        throw new ErrorAI(
-          'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y no admiten cambios (SYS-22)',
-        );
-      }
-      if (congelado?.g0) {
-        throw new ErrorAI('El G0 de ese reto ya fue aprobado: sus criterios están congelados');
-      }
-      sistema = SISTEMA_CRITERIOS;
-      prompt = promptCriterios({
-        codigo: reto.codigo as string,
-        titulo: reto.titulo as string,
-        descripcion: reto.descripcion as string,
-        metricaObjetivo: reto.metrica_objetivo as string,
-        cuantos: CRITERIOS_POR_GENERACION,
-      });
+    /*
+     * La puerta del consentimiento la abre la DECLARACIÓN, no la entrada de cada capacidad. Y
+     * se parte en dos porque el orden de los CANDADOS y el orden de los MENSAJES responden a
+     * preguntas distintas:
+     *
+     * - El CANDADO va primero, siempre. Leer el consentimiento y apartar la reserva tienen que
+     *   ser atómicos respecto a `registrarConsentimiento`, o una revocación se cuela entre
+     *   ambos. Y antes del candado del presupuesto, que es el orden de la casa.
+     * - El MENSAJE va donde el usuario pueda ACTUAR. Con la comprobación delante de `PREPARAR`
+     *   —como la puse al centralizar la puerta—, una petición rancia contra un item ya curado
+     *   recibía «registra el consentimiento»: una instrucción que no lleva a ninguna parte,
+     *   porque después de registrarlo el item sigue curado y la generación falla igual. Lo
+     *   cazó una revisión. La elegibilidad del ancla es lo primero que hay que poder arreglar,
+     *   así que habla primero.
+     *
+     * Lo que NO cambia: el material no sale hacia el proveedor. `prepararAlcance` solo
+     * construye el prompt en memoria dentro de esta transacción, y si el consentimiento falta
+     * se aborta antes de que exista una reserva, una llamada o una propuesta.
+     */
+    const exigeConsentimiento = CAPACIDADES[entrada.capacidad].exigeConsentimiento;
+    const consentimiento = exigeConsentimiento
+      ? await leerConsentimientoBajoCandado(tx, entrada)
+      : null;
+    const { sistema, prompt } = await PREPARAR[entrada.capacidad](tx, entrada);
+    if (consentimiento?.falta) {
+      throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
     }
 
     // ── Reserva del hueco, bajo candado del workspace ──
@@ -748,19 +901,10 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     // sobre el mismo reto: se pagaba dos veces y quedaban dos lotes pendientes sobre un
     // ancla que la pantalla ofrece una sola vez. Los dos caminos toman el MISMO candado
     // (el del presupuesto del workspace) antes de mirar, que es lo que hace que mirar sirva.
-    const [enCurso] =
-      entrada.capacidad === 'CI'
-        ? await tx`select 1 as hay from reserva_ai
-            where workspace_id = ${entrada.workspaceId} and item_id = ${entrada.anclaId}`
-        : await tx`select 1 as hay from reserva_ai
-            where workspace_id = ${entrada.workspaceId} and reto_id = ${entrada.anclaId}`;
-    if (enCurso) {
-      throw new ErrorAI(
-        entrada.capacidad === 'CI'
-          ? 'Ese item ya tiene una generación AI en curso: espera a que termine antes de pedir otra'
-          : 'Ese reto ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
-      );
-    }
+    const ancla = CAPACIDADES[entrada.capacidad].ancla;
+    const [enCurso] = await tx`select 1 as hay from reserva_ai
+      where workspace_id = ${entrada.workspaceId} and ${tx(ancla.columna)} = ${entrada.anclaId}`;
+    if (enCurso) throw new ErrorAI(ancla.enCurso);
 
     // «Este ancla ya tiene trabajo esperando revisión» se pregunta AQUÍ, bajo el mismo
     // candado, y no antes de tomarlo. Fuera del candado la respuesta caduca al instante: la
@@ -771,21 +915,10 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     // Para CI el índice único parcial de `propuesta_ai` es además el suelo; para C0 no puede
     // haberlo (un lote son varias propuestas pendientes del mismo reto), así que aquí es
     // donde se decide.
-    const [pendiente] =
-      entrada.capacidad === 'CI'
-        ? await tx`select 1 as hay from propuesta_ai
-            where item_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-              and estado = 'propuesta' limit 1`
-        : await tx`select 1 as hay from propuesta_ai
-            where reto_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-              and estado = 'propuesta' limit 1`;
-    if (pendiente) {
-      throw new ErrorAI(
-        entrada.capacidad === 'CI'
-          ? 'Ese item ya tiene una propuesta pendiente: revísala antes de pedir otra'
-          : 'Ese reto ya tiene criterios propuestos esperando revisión: decídelos antes de pedir otros',
-      );
-    }
+    const [pendiente] = await tx`select 1 as hay from propuesta_ai
+      where ${tx(ancla.columna)} = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+        and estado = 'propuesta' limit 1`;
+    if (pendiente) throw new ErrorAI(ancla.pendiente);
 
     const { atendidas, reservadas, limiteDiario, ultimaCaidaHaceMs } = await presupuestoDeHoy(
       tx,
@@ -809,12 +942,11 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const key = (ai.origenKey === 'workspace' ? keyWorkspace : keyEntorno)!;
 
     let reserva;
+    const anclas = anclasDelInsert(tx, entrada);
     try {
       [reserva] = await tx`insert into reserva_ai
-        (workspace_id, capacidad, item_id, reto_id, unidades, creado_por)
-        values (${entrada.workspaceId}, ${entrada.capacidad},
-                ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
-                ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
+        (workspace_id, capacidad, ${anclas.columnas}, unidades, creado_por)
+        values (${entrada.workspaceId}, ${entrada.capacidad}, ${anclas.valores},
                 ${unidades}, ${actorId})
         returning id`;
     } catch (e) {
@@ -1090,58 +1222,11 @@ async function comprobarDespacho(
     // (es el suelo, y sigue estando), pero un 42501 llega aquí sin nada que decirle a la
     // persona salvo «vuelve a intentarlo», que además es falso: reintentar no devuelve un rol.
     await rolCurador(tx, actorId, entrada.workspaceId);
-    if (entrada.capacidad === 'CI') {
-      await bloquearConsentimiento(tx, entrada.anclaId);
-      const [item] = await tx`select
-          estado <> 'pendiente' as ya_decidido,
-          tipo_fuente_exige_consentimiento(tipo_fuente)
-            and not consentimiento_externo_vigente(id, workspace_id) as falta_consentimiento,
-          case when tipo_fuente_exige_consentimiento(tipo_fuente) then
-            (select c.version from consentimiento_item c
-              where c.item_id = item_importacion.id
-                and c.workspace_id = item_importacion.workspace_id
-              order by c.version desc limit 1)
-          end as version_vigente
-        from item_importacion
-        where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
-      if (item?.falta_consentimiento) {
-        throw new ErrorAI(
-          'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
-        );
-      }
-      // Otro curador pudo decidir el item a mano mientras tanto: su material ya no espera
-      // nada de la AI y la propuesta nacería obsoleta. Gastar la llamada para eso es tirar
-      // dinero, y es el mismo caso que el consentimiento — algo que `prepararAlcance` vio
-      // cierto y dejó de serlo al commitear.
-      if (!item || item.ya_decidido) {
-        throw new ErrorAI(
-          'Ese item de la bandeja ya fue curado mientras se preparaba la llamada: no se llamó al proveedor',
-        );
-      }
-      // La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción
-      // que la aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un
-      // hecho consultable y no una reconstrucción por fechas.
-      //
-      // `null` EXACTAMENTE cuando el tipo de fuente no exige consentimiento, que es lo que
-      // la base impone en los dos sentidos: con material de personas es obligatorio citar
-      // uno, sin él está prohibido. Si se leyera «la última versión que haya», un item de
-      // tipo `nota` con un consentimiento registrado por si acaso citaría uno y el guard lo
-      // rechazaría — y con razón, porque ese `null` es el que significa «no aplicaba».
-      versionConsentimiento =
-        item.version_vigente === null || item.version_vigente === undefined
-          ? null
-          : Number(item.version_vigente);
-    } else {
-      const [reto] = await tx`select
-          reto_admite_criterios(id, workspace_id) as admite,
-          reto_criterios_congelados(id, workspace_id) as congelado
-        from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
-      if (!reto || !reto.admite || reto.congelado) {
-        throw new ErrorAI(
-          'Ese reto dejó de admitir criterios mientras se preparaba la llamada (G0 aprobado, registry firmado o reto cerrado): no se llamó al proveedor',
-        );
-      }
+    if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
+      versionConsentimiento = await exigirConsentimientoVigente(tx, entrada, 'antes-de-despachar');
     }
+    await REVALIDAR[entrada.capacidad](tx, entrada);
+
     // El token de despacho: la reserva sigue existiendo y NO ha caducado. Una revocación la
     // retira, y una caducada dejó de contar para admitir a los demás — despachar con ella
     // sería gastar un hueco que otro ya tiene.
@@ -1182,9 +1267,13 @@ function canonico(valor: unknown): string {
 /** Valida la salida cruda del proveedor contra el esquema de la capacidad. Una salida
  * fuera de contrato se descarta ENTERA: media propuesta no es revisable. */
 function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): ContenidoPropuesta[] {
-  if (capacidad === 'CI') return [ContenidoExtraccionSchema.parse(datos)];
-  const lote = (datos ?? {}) as { criterios?: unknown };
-  return ContenidoCriterioSchema.array().min(1).max(MAX_CRITERIOS_POR_LOTE).parse(lote.criterios);
+  const contenido = ESQUEMA_DE_CONTENIDO[capacidad];
+  const { lote } = CAPACIDADES[capacidad];
+  // Sin lote, el objeto viene en la RAÍZ de la respuesta; con lote, dentro de su campo. No
+  // es lo mismo que un lote de uno, y por eso se declara en vez de deducirse de la forma.
+  if (lote === null) return [contenido.parse(datos)];
+  const sobre = (datos ?? {}) as Record<string, unknown>;
+  return contenido.array().min(1).max(lote.maximo).parse(sobre[lote.campo]);
 }
 
 /**
@@ -1207,12 +1296,11 @@ async function abrirLlamada(
       // que se acaba de leer bajo el candado, no una que llegó de fuera: entre leerla y
       // escribirla no hay commit por medio en el que pueda dejar de ser la vigente.
       const consentimientoVersion = await comprobarDespacho(tx, actorId, entrada, alcance);
+      const anclas = anclasDelInsert(tx, entrada);
       return tx`insert into llamada_ai
-        (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado,
+        (workspace_id, capacidad, ${anclas.columnas}, modelo, origen_key, resultado,
          consentimiento_version, reserva_id, intento, creado_por)
-        values (${entrada.workspaceId}, ${entrada.capacidad},
-                ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
-                ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
+        values (${entrada.workspaceId}, ${entrada.capacidad}, ${anclas.valores},
                 ${modelo}, ${alcance.origenKey}, 'despachada',
                 ${consentimientoVersion}, ${alcance.reservaId}, ${puesto}, ${actorId})
         returning id`;
@@ -1354,6 +1442,186 @@ async function cerrarSinTaparElMotivo(
 }
 
 /**
+ * El ancla de esta generación, o `null`, para la columna que se está escribiendo.
+ *
+ * Las tres tablas del pipeline —`reserva_ai`, `llamada_ai` y `propuesta_ai`— guardan el
+ * ancla en una columna POR TIPO de ancla, así que cada insert escribe una y anula la otra.
+ * Escrito a mano eso eran ocho ternarios sobre el nombre de la capacidad, y cada uno de
+ * ellos una oportunidad de que la tercera capacidad colgara del sitio equivocado. Aquí se
+ * pregunta por la columna que el registro DECLARA.
+ */
+function anclaEnColumna(
+  entrada: GenerarPropuestas,
+  columna: AnclaCapacidad['columna'],
+): string | null {
+  return CAPACIDADES[entrada.capacidad].ancla.columna === columna ? entrada.anclaId : null;
+}
+
+/**
+ * Las columnas de ancla de los tres inserts del pipeline —`reserva_ai`, `llamada_ai` y
+ * `propuesta_ai`— y sus valores, EN EL MISMO ORDEN, generados desde `COLUMNAS_DE_ANCLA`.
+ *
+ * Aquí hubo un guardián que no guardaba. Los tres inserts nombraban `item_id, reto_id` a
+ * mano, y para que una tercera columna no se quedara fuera se declaró un
+ * `Record<AnclaCapacidad['columna'], 'escrita'>`… derivado de `COLUMNAS_DE_ANCLA` con un
+ * `Object.fromEntries`. Un Record construido a partir de las claves del propio tipo lo
+ * satisface SIEMPRE: ampliar el ancla seguía compilando, el guardián seguía verde y los tres
+ * inserts seguían escribiendo dos columnas de tres. Costaba una línea de tipo y no sujetaba
+ * nada — un testigo que firma lo que sea.
+ *
+ * Un guardián sobre una sentencia escrita a mano solo puede avisar; la sentencia GENERADA no
+ * necesita aviso porque no puede quedarse atrás. Añadir una columna al ancla la mete en los
+ * tres inserts sin tocarlos, que es lo que el guardián pedía por favor.
+ */
+function anclasDelInsert(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+): { columnas: PendingQuery<Row[]>; valores: PendingQuery<Row[]> } {
+  return {
+    columnas: COLUMNAS_DE_ANCLA.map((c) => tx`${tx(c)}`).reduce((a, b) => tx`${a}, ${b}`),
+    valores: COLUMNAS_DE_ANCLA.map((c) => tx`${anclaEnColumna(entrada, c)}`).reduce(
+      (a, b) => tx`${a}, ${b}`,
+    ),
+  };
+}
+
+/**
+ * Lo que cada capacidad vuelve a comprobar JUSTO ANTES de despachar, bajo el candado y en la
+ * misma transacción que aprueba la llamada. Devuelve la versión de consentimiento que ampara
+ * la salida, o `null` cuando no aplica.
+ *
+ * Esto era un `if/else` sobre `exigeConsentimiento`, y eso es la misma rama binaria de antes
+ * con otro sombrero: toda capacidad que exigiera consentimiento se buscaba como
+ * `item_importacion` y toda la que no, como `reto` — con sus reglas de congelado encima. Una
+ * capacidad nueva podía declararse entera en `CAPACIDADES` y en `PREPARAR` y aun así ver su
+ * llamada rechazada aquí, porque su ancla se buscaba en la tabla equivocada. Lo encontró una
+ * revisión sobre este mismo PR, y es justo el defecto que el PR viene a quitar: quitar la
+ * SINTAXIS de la rama binaria no basta si su SEMÁNTICA sobrevive en un booleano.
+ *
+ * `Record<CapacidadActiva, …>` hace que el compilador exija la entrada de toda capacidad
+ * nueva, que es la diferencia entre declarar y ramificar.
+ */
+const REVALIDAR: Record<
+  CapacidadActiva,
+  (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<void>
+> = {
+  CI: async (tx, entrada) => {
+    // El consentimiento NO se comprueba aquí: lo hace `exigirConsentimientoVigente`, que corre
+    // justo antes gobernado por `exigeConsentimiento`. Estaba escrito a mano en esta entrada,
+    // y por eso la bandera no servía para nada.
+    const [item] = await tx`select estado <> 'pendiente' as ya_decidido
+      from item_importacion
+      where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+    // Otro curador pudo decidir el item a mano mientras tanto: su material ya no espera
+    // nada de la AI y la propuesta nacería obsoleta. Gastar la llamada para eso es tirar
+    // dinero, y es el mismo caso que el consentimiento — algo que `prepararAlcance` vio
+    // cierto y dejó de serlo al commitear.
+    if (!item || item.ya_decidido) {
+      throw new ErrorAI(
+        'Ese item de la bandeja ya fue curado mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+  },
+  C0: async (tx, entrada) => {
+    const [reto] = await tx`select
+        reto_admite_criterios(id, workspace_id) as admite,
+        reto_criterios_congelados(id, workspace_id) as congelado
+      from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+    if (!reto || !reto.admite || reto.congelado) {
+      throw new ErrorAI(
+        'Ese reto dejó de admitir criterios mientras se preparaba la llamada (G0 aprobado, registry firmado o reto cerrado): no se llamó al proveedor',
+      );
+    }
+  },
+};
+
+/**
+ * Cómo prepara cada capacidad su generación: lee su ancla, comprueba lo que impide gastar
+ * presupuesto en algo que nadie podría aceptar, y arma el prompt.
+ *
+ * Es lo más específico que tiene una capacidad y por eso vivía en un `if/else`. Con dos
+ * ramas un `else` es «la otra»; con diez, «la otra» es una capacidad concreta elegida por
+ * orden de escritura. Aquí cada una se declara por su nombre, y `Record<CapacidadActiva, …>`
+ * hace que el compilador exija la entrada de toda capacidad que alguien añada al catálogo.
+ *
+ * Vive en el servicio y no en el registro de `ai.schemas` a propósito: necesita la
+ * transacción y los prompts, y el registro lo importa la PANTALLA — meterlo allí arrastraría
+ * los prompts al bundle del cliente, que es justo lo que `check:bundle` vigila.
+ */
+type Preparacion = { sistema: string; prompt: { usuario: string; alcanceResumen: string } };
+const PREPARAR: Record<
+  CapacidadActiva,
+  (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<Preparacion>
+> = {
+  CI: async (tx, entrada) => {
+    // El consentimiento ya está comprobado —y su candado tomado— por
+    // `exigirConsentimientoVigente`, que corre justo antes gobernado por la declaración de la
+    // capacidad. Estaba escrito a mano AQUÍ, y por eso `exigeConsentimiento` no servía para
+    // nada: una capacidad futura podía declararlo y mandar material de personas sin puerta.
+    const [item] = await tx`select titulo, tipo_fuente, referencia, contenido,
+        item_tiene_material_extraible(contenido) as tiene_material
+      from item_importacion
+      where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+        and estado = 'pendiente'`;
+    if (!item) throw new ErrorAI('El item no existe en este workspace o ya fue curado');
+    // Un item importado SOLO con la referencia al original no tiene nada que citar, y el
+    // contrato de CI obliga al modelo a devolver una evidencia fechada con al menos una
+    // cita literal. Sin cuerpo, la única salida que cumple el contrato es inventada a
+    // partir de la ficha: una propuesta con apariencia de fundamentada, pagada, que
+    // además contamina la métrica de presencia literal. Y no hay recuperación posible — no hay
+    // herramienta que lea la fuente referenciada — así que la respuesta correcta es no
+    // ofrecer la generación, no intentarla peor.
+    if (!(item.tiene_material as boolean)) {
+      throw new ErrorAI(
+        'Ese item se importó solo con la referencia al original: no hay material que citar, así que no se puede extraer evidencia de él. Cúralo a mano en la bandeja o vuelve a importarlo con el texto pegado.',
+      );
+    }
+    return {
+      sistema: SISTEMA_EXTRACCION,
+      prompt: promptExtraccion({
+      titulo: item.titulo as string,
+      tipoFuente: item.tipo_fuente as string,
+      referencia: item.referencia as string,
+        contenido: item.contenido as string,
+      }),
+    };
+  },
+  C0: async (tx, entrada) => {
+    const [reto] = await tx`select codigo, titulo, descripcion, metrica_objetivo
+      from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+        and reto_admite_criterios(id, workspace_id)`;
+    if (!reto) throw new ErrorAI('El reto no existe en este workspace o ya no admite criterios');
+    // El congelado de criterios lo impone la política de criterio_exito; anticiparlo aquí
+    // evita quemar presupuesto en una propuesta que nadie podría aceptar. Los DOS
+    // predicados del reto —admite criterios, y no están congelados— se preguntan por la
+    // función que los impone, nunca copiados a mano: es lo que hace que ampliar uno llegue
+    // de golpe a las políticas, a los guards, al panel y a estas lecturas, en vez de
+    // dejar la versión vieja escondida en la que nadie tocó.
+    const [congelado] = await tx`select
+      reto_registry_firmado(${entrada.anclaId}, ${entrada.workspaceId}) as registry,
+      reto_g0_congela_criterios(${entrada.anclaId}, ${entrada.workspaceId}) as g0`;
+    if (congelado?.registry) {
+      throw new ErrorAI(
+        'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y no admiten cambios (SYS-22)',
+      );
+    }
+    if (congelado?.g0) {
+      throw new ErrorAI('El G0 de ese reto ya fue aprobado: sus criterios están congelados');
+    }
+    return {
+      sistema: SISTEMA_CRITERIOS,
+      prompt: promptCriterios({
+      codigo: reto.codigo as string,
+      titulo: reto.titulo as string,
+      descripcion: reto.descripcion as string,
+      metricaObjetivo: reto.metrica_objetivo as string,
+        cuantos: CRITERIOS_POR_GENERACION,
+      }),
+    };
+  },
+};
+
+/**
  * Genera propuestas para un ancla (RF-08.1). Nada del dominio cambia aquí: solo nacen
  * filas de `propuesta_ai` en estado `propuesta`, con su lineage completo (SYS-19).
  * Devuelve cuántas quedaron pendientes de revisión humana.
@@ -1484,9 +1752,9 @@ async function persistirPropuestas(
       const [causa] = await tx`select
         exists (select 1 from reserva_ai
           where id = ${alcance.reservaId} and workspace_id = ${entrada.workspaceId}) as sigue,
-        ${entrada.capacidad === 'CI' ? entrada.anclaId : null}::uuid is not null
+        ${anclaEnColumna(entrada, 'item_id')}::uuid is not null
           and exists (select 1 from item_importacion i
-            where i.id = ${entrada.capacidad === 'CI' ? entrada.anclaId : null}::uuid
+            where i.id = ${anclaEnColumna(entrada, 'item_id')}::uuid
               and i.workspace_id = ${entrada.workspaceId}
               and tipo_fuente_exige_consentimiento(i.tipo_fuente)
               and not consentimiento_externo_vigente(i.id, i.workspace_id)) as sin_consentimiento`;
@@ -1502,19 +1770,18 @@ async function persistirPropuestas(
       );
     }
 
-    const destino = DESTINO_DE_CAPACIDAD[entrada.capacidad];
+    const destino = CAPACIDADES[entrada.capacidad].destino;
+    const anclas = anclasDelInsert(tx, entrada);
     // UNA sentencia para el lote entero: el evento PropuestaAIGenerada de cada fila lo
     // emite el guard DENTRO de este insert, así que el rol auditado es exactamente el que
     // autorizó la escritura (mismo snapshot).
     try {
       const filas = await tx`
       insert into propuesta_ai
-        (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
+        (workspace_id, capacidad, destino, ${anclas.columnas}, contenido, contenido_original,
          confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, orden,
-         creado_por)
-      select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino},
-             ${entrada.capacidad === 'CI' ? entrada.anclaId : null},
-             ${entrada.capacidad === 'C0' ? entrada.anclaId : null},
+         es_simulacion, creado_por)
+      select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino}, ${anclas.valores},
              c.contenido, c.contenido,
              -- La confianza que el modelo declara sobre CADA propuesta, traducida a la escala
              -- de la columna por una sola tabla. La columna existía y NADIE la escribía:
@@ -1533,6 +1800,16 @@ async function persistirPropuestas(
              -- es una propiedad de la fila dentro de su propio lote, así que el índice
              -- único puede imponer el techo sin preguntar cuántas hay ya.
              (c.puesto - 1)::smallint,
+             /*
+              * SYS-20: la marca de SIMULACIÓN sale del registro y viaja al insert. La columna tiene
+              * «default false», así que omitirla no dejaba un hueco visible: dejaba un false.
+              * O sea que declarar esSimulacion: true en una capacidad futura habría PARECIDO
+              * suficiente y sus hallazgos habrían llegado a la revisión sin la etiqueta que SYS-20
+              * exige imborrable, presentables como propuestas ordinarias. Un valor declarado que no
+              * llega a ninguna parte es peor que no declararlo: parece que está puesto.
+              * (Sin comillas invertidas: esto vive en una template literal y las terminaría.)
+              */
+             ${CAPACIDADES[entrada.capacidad].esSimulacion},
              ${actorId}
       from jsonb_array_elements(${tx.json(contenidos)}) with ordinality as c(contenido, puesto)
       returning id`;
@@ -1572,6 +1849,98 @@ async function persistirPropuestas(
  * leyendo la máxima actual, y una consulta es un predicado sobre un snapshot — dos
  * curadores registrando a la vez leerían el mismo máximo. El índice único de la bitácora es
  * el suelo (uno de los dos fallaría); esto es lo que hace que ninguno tenga que fallar. */
+/**
+ * La puerta del CONSENTIMIENTO, gobernada por lo que la capacidad DECLARA.
+ *
+ * `exigeConsentimiento` estaba declarado y no lo leía nadie: el candado y la comprobación
+ * vivían escritos a mano dentro de las entradas de CI en `PREPARAR` y `REVALIDAR`. Una
+ * capacidad futura podía declarar `true` y mandar material de personas al proveedor sin
+ * candado ni comprobación — el compilador no echaría nada de menos, porque no faltaba
+ * ninguna entrada: faltaba que la bandera SIRVIERA para algo. Es el mismo defecto que este PR
+ * quita en todos lados, y aquí con la peor consecuencia posible (RF-09.5).
+ *
+ * Ahora declararla ES encender la puerta. Y el orden de candados de la casa se conserva:
+ * consentimiento (por item) primero, presupuesto (por workspace) después — este sigue siendo
+ * el único camino que toma los dos, así que no hay ciclo posible.
+ *
+ * Devuelve la versión VIGENTE del consentimiento, que es lo que se anota en la llamada: el
+ * dato es de la puerta, no de la capacidad, así que sale de aquí y no de `REVALIDAR`.
+ *
+ * PRECONDICIÓN, y la sujeta una prueba: una capacidad que exige consentimiento ancla en
+ * `item_id`. El consentimiento es de material de PERSONAS y ese material vive en
+ * `item_importacion` —allí están `tipo_fuente` y `consentimiento_item`—, así que la puerta
+ * pregunta ahí. Si algún día el consentimiento alcanza a otra ancla, esa prueba enrojece en
+ * vez de dejar la puerta abierta en silencio.
+ */
+async function exigirConsentimientoVigente(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+  momento: 'antes-de-preparar' | 'antes-de-despachar',
+): Promise<number | null> {
+  const estado = await leerConsentimientoBajoCandado(tx, entrada);
+  if (estado.falta) throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO[momento]);
+  return estado.version;
+}
+
+/** Los dos mensajes, que dependen del momento y no son cosméticos: antes de preparar, el
+ * camino es registrar el consentimiento; al despachar, lo que importa es que el material NO
+ * salió. */
+const MOTIVO_SIN_CONSENTIMIENTO: Record<'antes-de-preparar' | 'antes-de-despachar', string> = {
+  'antes-de-preparar':
+    'Ese material es de personas: registra el consentimiento para procesarlo con un proveedor externo antes de pedir una propuesta (RF-09.5)',
+  'antes-de-despachar':
+    'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
+};
+
+/**
+ * Toma el candado y LEE; no decide.
+ *
+ * La separación la pidió una revisión y corrige una precedencia que rompí al centralizar la
+ * puerta: con la comprobación delante de `PREPARAR`, una petición rancia contra un item YA
+ * CURADO recibía «registra el consentimiento» — una instrucción que no lleva a ninguna parte,
+ * porque después de registrarlo el item sigue curado y la generación falla igual. El orden de
+ * los CANDADOS y el orden de los MENSAJES no son la misma pregunta: el candado va primero
+ * porque leer y reservar tienen que ser atómicos; el mensaje va donde el usuario pueda actuar.
+ */
+async function leerConsentimientoBajoCandado(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+): Promise<{ falta: boolean; version: number | null }> {
+  // Candado por item ANTES de leer: leer el consentimiento y apartar la reserva tienen que ser
+  // atómicos respecto a `registrarConsentimiento`, o una revocación podría colarse entre ambos
+  // y quedarse sin nada que retirar.
+  await bloquearConsentimiento(tx, entrada.anclaId);
+  const [item] = await tx`select
+      tipo_fuente_exige_consentimiento(tipo_fuente)
+        and not consentimiento_externo_vigente(id, workspace_id) as falta,
+      case when tipo_fuente_exige_consentimiento(tipo_fuente) then
+        (select c.version from consentimiento_item c
+          where c.item_id = item_importacion.id
+            and c.workspace_id = item_importacion.workspace_id
+          order by c.version desc limit 1)
+      end as version_vigente
+    from item_importacion
+    where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+  /*
+   * La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción que la
+   * aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un hecho
+   * consultable y no una reconstrucción por fechas.
+   *
+   * `null` EXACTAMENTE cuando el tipo de fuente no exige consentimiento, que es lo que la base
+   * impone en los dos sentidos: con material de personas es obligatorio citar uno, sin él está
+   * prohibido. Si se leyera «la última versión que haya», un item de tipo `nota` con un
+   * consentimiento registrado por si acaso citaría uno y el guard lo rechazaría — y con razón,
+   * porque ese `null` es el que significa «no aplicaba».
+   */
+  return {
+    falta: Boolean(item?.falta),
+    version:
+      item?.version_vigente === null || item?.version_vigente === undefined
+        ? null
+        : Number(item.version_vigente),
+  };
+}
+
 async function bloquearConsentimiento(tx: TransactionSql, itemId: string): Promise<void> {
   await tx`select pg_advisory_xact_lock(
     hashtextextended('designio:consentimiento:' || ${itemId}, 42))`;
@@ -1652,8 +2021,19 @@ export async function registrarConsentimiento(
 type PropuestaEnRevision = {
   capacidad: CapacidadActiva;
   destino: 'evidencia' | 'criterio-exito';
-  itemId: string | null;
-  retoId: string | null;
+  /**
+   * El id del ancla, el de la columna que SU capacidad declara.
+   *
+   * Aquí había `itemId` y `retoId`, y los materializadores tomaban el suyo con un `!`. Eso
+   * dejaba fuera del alcance a toda ancla nueva: la proyección seleccionaba dos columnas, así
+   * que un materializador de un ancla distinta no recibía ningún id —y uno de los de ahora,
+   * si le tocaba una fila con el ancla en otra columna, recibía `null` y reventaba contra su
+   * FK—. Preguntando por la columna declarada no hay `!` que justificar ni columna que
+   * adivinar: la propuesta cuelga de donde su capacidad dice.
+   */
+  anclaId: string;
+  /** Y todas las declaradas, tal cual vienen, para quien necesite mirar más de una. */
+  anclas: Record<AnclaCapacidad['columna'], string | null>;
   contenido: ContenidoPropuesta;
   /** Lo que dijo el modelo, intacto (SYS-17). Es contra esto —y no contra el contenido
    * vigente— contra lo que se comprueba que una corrección no toque las citas. */
@@ -1667,18 +2047,34 @@ async function leerParaRevisar(
   workspaceId: string,
   propuestaId: string,
 ): Promise<PropuestaEnRevision> {
-  const [p] = await tx`select capacidad, destino, item_id, reto_id, contenido,
+  // Las columnas de ancla salen del registro, como en los tres inserts: escritas a mano,
+  // esta proyección se quedaba en dos y el materializador de la tercera no recibía su id.
+  const columnasDeAncla = COLUMNAS_DE_ANCLA.map((c) => tx`${tx(c)}`).reduce(
+    (a, b) => tx`${a}, ${b}`,
+  );
+  const [p] = await tx`select capacidad, destino, ${columnasDeAncla}, contenido,
       contenido_original, modelo, prompt_version, estado
     from propuesta_ai where id = ${propuestaId} and workspace_id = ${workspaceId}`;
   if (!p) throw new ErrorAI('La propuesta no existe en este workspace');
   if ((p.estado as string) !== 'propuesta') {
     throw new ErrorAI('Esa propuesta ya fue revisada: las decisiones son inmutables');
   }
+  const capacidad = p.capacidad as CapacidadActiva;
+  const anclas = Object.fromEntries(
+    COLUMNAS_DE_ANCLA.map((c) => [c, (p[c] ?? null) as string | null]),
+  ) as PropuestaEnRevision['anclas'];
+  const anclaId = anclas[CAPACIDADES[capacidad].ancla.columna];
+  // El CHECK de `propuesta_ai` ata destino y ancla, así que llegar aquí sin ella significa que
+  // alguien escribió por SQL directo saltándose la restricción. Se dice en vez de seguir con
+  // un `null` que reventaría más adelante contra una FK, sin decir por qué.
+  if (!anclaId) {
+    throw new ErrorAI('Esa propuesta no tiene ancla en la columna que su capacidad declara');
+  }
   return {
-    capacidad: p.capacidad as CapacidadActiva,
+    capacidad,
     destino: p.destino as PropuestaEnRevision['destino'],
-    itemId: p.item_id as string | null,
-    retoId: p.reto_id as string | null,
+    anclaId,
+    anclas,
     contenido: p.contenido as ContenidoPropuesta,
     contenidoOriginal: p.contenido_original as ContenidoPropuesta,
     modelo: p.modelo as string,
@@ -1740,7 +2136,10 @@ async function aceptarPropuestaEnTransaccion(
     const p = await leerParaRevisar(tx, entrada.workspaceId, entrada.propuestaId);
 
     let contenido = p.contenido;
-    if (entrada.correccion) {
+    // PRESENTE, no verdadera: la frontera transporta la corrección sin juzgarla (`unknown`),
+    // así que un `null` enviado como corrección es una corrección con forma inválida —y muere
+    // abajo con su mensaje—, no una aceptación de lo propuesto.
+    if (entrada.correccion !== undefined) {
       try {
         contenido = parsearContenido(p.capacidad, entrada.correccion);
       } catch {
@@ -1776,22 +2175,29 @@ async function aceptarPropuestaEnTransaccion(
     }
     // El destino y la forma del contenido van atados por el CHECK de la tabla y por el
     // esquema de la capacidad; el narrowing lo hace explícito para el compilador.
-    const objetoId =
-      p.destino === 'evidencia'
-        ? await materializarEvidencia(
-            tx,
-            actorId,
-            entrada.workspaceId,
-            p,
-            contenido as ContenidoExtraccion,
-          )
-        : await materializarCriterio(
-            tx,
-            actorId,
-            entrada.workspaceId,
-            p,
-            contenido as ContenidoCriterio,
-          );
+    /*
+     * La materialización se despacha por el DESTINO declarado, no con un ternario. Con
+     * `p.destino === 'evidencia' ? … : …`, todo destino que no fuera evidencia caía en
+     * `materializarCriterio` — así que un destino nuevo se materializaba como criterio y
+     * fallaba contra su propio guard, en vez de usar su objeto de dominio.
+     * `Record<Destino, …>` hace que el compilador exija la entrada de cada uno.
+     */
+    const MATERIALIZAR: Record<
+      Destino,
+      () => Promise<string>
+    > = {
+      evidencia: () =>
+        materializarEvidencia(
+          tx,
+          actorId,
+          entrada.workspaceId,
+          p,
+          contenido as ContenidoExtraccion,
+        ),
+      'criterio-exito': () =>
+        materializarCriterio(tx, actorId, entrada.workspaceId, p, contenido as ContenidoCriterio),
+    };
+    const objetoId = await MATERIALIZAR[p.destino]();
 
     // Corregida o aceptada lo decide la BASE comparando jsonb con jsonb: normaliza claves
     // y espacios, así que un reordenamiento del round-trip por Zod no se contabiliza como
@@ -1802,8 +2208,25 @@ async function aceptarPropuestaEnTransaccion(
                         then 'corregida' else 'aceptada' end,
           contenido = ${tx.json(contenido)}::jsonb,
           revisada_por = ${actorId},
-          evidencia_id = ${p.destino === 'evidencia' ? objetoId : null},
-          criterio_id = ${p.destino === 'criterio-exito' ? objetoId : null}
+          -- El enlace se escribe EN la columna que el destino nombra: el nombre viaja como
+          -- identificador, no como una etiqueta contra la que comparar.
+          --
+          -- (Sin comillas invertidas: esto vive en una template literal y las terminaría.)
+          --
+          -- Antes esto eran dos asignaciones fijas gobernadas por dos ternarios sobre
+          -- «COLUMNA_DE_DESTINO». Consultar el mapa parecía cerrar el caso y no cerraba nada:
+          -- lo que decidía dónde iba el id seguían siendo los dos nombres escritos en el SQL,
+          -- así que un destino nuevo hacía fallar los dos ternarios, dejaba las dos columnas
+          -- en null y sellaba una propuesta aceptada sin objeto. Preguntarle el nombre a un
+          -- mapa y luego no usarlo para nada es exactamente el binario de antes con un
+          -- testigo delante.
+          --
+          -- Las demás columnas de destino no se tocan porque no hay nada que borrar: solo se
+          -- llega aquí con «estado = 'propuesta'» (el WHERE lo exige) y solo este UPDATE las
+          -- escribe, así que están todas en null. El CHECK de «propuesta_ai» que ata
+          -- «estado in (aceptada, corregida)» a tener enlace es el respaldo en la base: un
+          -- destino cuya columna nueva no entre en ese CHECK no se sella a medias, revienta.
+          ${tx(COLUMNA_DE_DESTINO[p.destino])} = ${objetoId}
       where id = ${entrada.propuestaId} and workspace_id = ${entrada.workspaceId}
         and estado = 'propuesta'
       returning estado`;
@@ -1830,12 +2253,12 @@ async function materializarEvidencia(
   // revocación que commitea justo después entra por la rendija — el guard diferido la para en
   // el commit, pero con un error del suelo en vez del que dice cómo salir. El candado no es lo
   // que cierra la ventana: es lo que hace que el orden sea determinista y el mensaje, el bueno.
-  await bloquearConsentimiento(tx, p.itemId!);
+  await bloquearConsentimiento(tx, p.anclaId);
   const [item] = await tx`select titulo, tipo_fuente, referencia,
       tipo_fuente_exige_consentimiento(tipo_fuente)
         and not consentimiento_externo_vigente(id, workspace_id) as consentimiento_retirado
     from item_importacion
-    where id = ${p.itemId} and workspace_id = ${workspaceId} and estado = 'pendiente'`;
+    where id = ${p.anclaId} and workspace_id = ${workspaceId} and estado = 'pendiente'`;
   if (!item) throw new ErrorAI('El item de la bandeja ya fue curado o no existe');
   // La otra mitad del permiso, y una ventana distinta de la del despacho: la propuesta se
   // generó con consentimiento vigente y la persona lo retiró DESPUÉS. Aceptar crearía un
@@ -1854,7 +2277,7 @@ async function materializarEvidencia(
   // es la que decide si el material puede salir, y se hace sobre el registro vigente donde
   // toca, antes de construir el prompt y en el guard de la propuesta.
   const [consentimiento] = await tx`select 1 as hay from consentimiento_item
-    where item_id = ${p.itemId} and workspace_id = ${workspaceId} limit 1`;
+    where item_id = ${p.anclaId} and workspace_id = ${workspaceId} limit 1`;
 
   // Sin fecha no hay proveniencia, y la proveniencia es obligatoria en una evidencia
   // (`DimensionesEvidenciaSchema` la exige, y con razón: una evidencia sin fecha no se puede
@@ -1923,12 +2346,12 @@ async function materializarEvidencia(
   const selladas = await tx`update item_importacion
     set estado = 'aprobado', decidido_por = ${actorId}, decidido_en = now(),
         evidencia_id = ${evidenciaId}
-    where id = ${p.itemId} and workspace_id = ${workspaceId} and estado = 'pendiente'
+    where id = ${p.anclaId} and workspace_id = ${workspaceId} and estado = 'pendiente'
     returning workspace_role(${actorId}, ${workspaceId}) as rol`;
   if (selladas.length === 0) throw new ErrorAI('El item ya fue decidido por otra persona');
   await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (${workspaceId}, 'EvidenciaCurada',
-      ${tx.json({ itemId: p.itemId, evidenciaId, origen: 'propuesta-ai' })},
+      ${tx.json({ itemId: p.anclaId, evidenciaId, origen: 'propuesta-ai' })},
       ${actorId}, ${selladas[0]!.rol as string})`;
   return evidenciaId;
 }
@@ -1944,7 +2367,7 @@ async function materializarCriterio(
 ): Promise<string> {
   // Mismo candado que agregarCriterio: mutar criterios y decidir un G0 no pueden
   // entrecruzarse (contrato documentado en metodo.servicio.ts).
-  await bloquearReto(tx, p.retoId!);
+  await bloquearReto(tx, p.anclaId);
   // El reto tiene que SEGUIR admitiendo criterios, y eso no lo cubre el congelado por G0:
   // son dos predicados distintos. La generación exigió los dos y el guard del INSERT
   // también, pero entre generar y aceptar hay una segunda vida entera y el ciclo de vida del
@@ -1956,7 +2379,7 @@ async function materializarCriterio(
   // aquí lo que nace no es una propuesta, es el criterio. Se lee DENTRO de `bloquearReto`,
   // el mismo candado que toma la aprobación del G0.
   const [reto] = await tx`select
-    reto_admite_criterios(${p.retoId}::uuid, ${workspaceId}::uuid) as admite`;
+    reto_admite_criterios(${p.anclaId}::uuid, ${workspaceId}::uuid) as admite`;
   if (!reto?.admite) {
     throw new ErrorAI(
       'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo. Esta propuesta quedó obsoleta y solo puede rechazarse',
@@ -1966,7 +2389,7 @@ async function materializarCriterio(
     const [criterio] = await tx`insert into criterio_exito
       (workspace_id, reto_id, kpi, definicion, linea_base_valor, linea_base_fecha,
        linea_base_plan, objetivo, ventana_dias, fecha_post_mortem, creado_por)
-      values (${workspaceId}, ${p.retoId}, ${c.kpi}, ${c.definicion}, null, null,
+      values (${workspaceId}, ${p.anclaId}, ${c.kpi}, ${c.definicion}, null, null,
               ${c.lineaBasePlan}, ${c.objetivo}, ${c.ventanaDias}, null, ${actorId})
       returning id`;
     return criterio!.id as string;

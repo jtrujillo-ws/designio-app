@@ -24,6 +24,7 @@ import {
   type PanelPropuestas,
   type ConsentimientoDeItem,
   type EstadoAncla,
+  type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoPropuesta,
@@ -96,6 +97,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y la firma no se deshace (SYS-22). Esta propuesta quedó obsoleta y solo puede rechazarse.',
   'reto-no-admite':
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
+  'gate-decidido':
+    'Ese gate ya se decidió: este informe describe un estado que ya pasó. Puedes leerlo, pero lo que dice que falta ya no aplica.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 
@@ -908,32 +911,49 @@ function FormularioConsentimiento({
  * fijado y el CHECK de la tabla lo garantiza.
  */
 const PRESENTACION: Record<
-  Destino,
+  Destino | 'informativa',
   {
     rotulo: string;
     ficha: (contenido: ContenidoPropuesta) => ReactNode;
     /**
-     * Lo que impide materializar ESTA propuesta por lo que dice su contenido, y no por su
-     * ancla: `null` si nada. Se declara por destino porque cada uno tiene los suyos, y porque
-     * escrito como `destino === 'evidencia' && …` un destino nuevo no habría tenido ninguno —
-     * la pantalla habría ofrecido «Aceptar tal cual» sobre algo que la base rechaza, que es
-     * exactamente lo que este aviso existe para evitar.
+     * Todo lo que solo tiene sentido si la propuesta MATERIALIZA algo — y `null` cuando no
+     * materializa nada.
      *
-     * Devuelve el TEXTO y no un booleano: el aviso tiene que decir qué falta y por dónde se
-     * arregla; un botón apagado sin explicación manda a adivinar.
+     * Van juntos y anulables a la vez porque son la misma pregunta con dos caras: si no hay
+     * objeto que crear, no hay nada que aceptar y por tanto tampoco nada que corregir
+     * (corregir es «editar y aceptar»). CT es así por contrato, no por falta: RF-08.4 dice
+     * que «reporta huecos citando objetos; carece de acción aprobar».
+     *
+     * Y son ESTO lo que apaga los dos botones, no una bandera aparte. Una bandera
+     * `aceptable: boolean` habría sido la lección de la costura otra vez: un valor declarado
+     * que alguien tiene que acordarse de consultar en dos sitios. Aquí no hay nada que
+     * consultar — sin materialización no hay formulario que pintar ni bloqueo que calcular.
      */
-    bloqueoPropio: (contenido: ContenidoPropuesta) => string | null;
-    formulario: (props: {
-      inicial: ContenidoPropuesta;
-      ocupado: boolean;
-      onEnviar: (c: ContenidoPropuesta) => Promise<void>;
-      onCancelar: () => void;
-    }) => ReactNode;
+    materializacion: {
+      /**
+       * Lo que impide materializar ESTA propuesta por lo que dice su contenido, y no por su
+       * ancla: `null` si nada. Se declara por destino porque cada uno tiene los suyos, y
+       * porque escrito como `destino === 'evidencia' && …` un destino nuevo no habría tenido
+       * ninguno — la pantalla habría ofrecido «Aceptar tal cual» sobre algo que la base
+       * rechaza, que es exactamente lo que este aviso existe para evitar.
+       *
+       * Devuelve el TEXTO y no un booleano: el aviso tiene que decir qué falta y por dónde se
+       * arregla; un botón apagado sin explicación manda a adivinar.
+       */
+      bloqueoPropio: (contenido: ContenidoPropuesta) => string | null;
+      formulario: (props: {
+        inicial: ContenidoPropuesta;
+        ocupado: boolean;
+        onEnviar: (c: ContenidoPropuesta) => Promise<void>;
+        onCancelar: () => void;
+      }) => ReactNode;
+    } | null;
   }
 > = {
   evidencia: {
     rotulo: 'Evidencia propuesta',
     ficha: (c) => <FichaExtraccion contenido={c as ContenidoExtraccion} />,
+    materializacion: {
     /*
      * `evidencia.fecha_recoleccion` es NOT NULL: una extracción sin fecha del material no se
      * materializa. Y no es un defecto de la propuesta —al modelo se le permite decir que el
@@ -955,21 +975,36 @@ const PRESENTACION: Record<
         onCancelar={onCancelar}
       />
     ),
+    },
   },
   'criterio-exito': {
     rotulo: 'Criterio de éxito propuesto',
     ficha: (c) => <FichaCriterio contenido={c as ContenidoCriterio} />,
-    // Un criterio no tiene ninguna precondición de contenido: su esquema ya exige todo lo que
-    // la tabla pide, y la línea base la pone un humano DESPUÉS, editando el criterio (§21).
-    bloqueoPropio: () => null,
-    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
-      <FormularioCriterio
-        inicial={inicial as ContenidoCriterio}
-        ocupado={ocupado}
-        onEnviar={onEnviar}
-        onCancelar={onCancelar}
-      />
-    ),
+    materializacion: {
+      // Un criterio no tiene ninguna precondición de contenido: su esquema ya exige todo lo
+      // que la tabla pide, y la línea base la pone un humano DESPUÉS, editando el criterio
+      // (§21).
+      bloqueoPropio: () => null,
+      formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+        <FormularioCriterio
+          inicial={inicial as ContenidoCriterio}
+          ocupado={ocupado}
+          onEnviar={onEnviar}
+          onCancelar={onCancelar}
+        />
+      ),
+    },
+  },
+  /*
+   * La entrada de las capacidades INFORMATIVAS, con `destino` nulo. Se indexa por una clave
+   * propia y no por `undefined` porque un `Record` con una clave que falta se lee como
+   * `undefined` en silencio, y lo que hay que conseguir es que el compilador PIDA esta
+   * entrada — que es lo que hizo cuando `destino` se volvió anulable.
+   */
+  informativa: {
+    rotulo: 'Informe de gate (no se aprueba desde aquí)',
+    ficha: (c) => <FichaAsistenteGate contenido={c as ContenidoAsistenteGate} />,
+    materializacion: null,
   },
 };
 
@@ -988,12 +1023,13 @@ function TarjetaPropuesta({
 }) {
   const [corrigiendo, setCorrigiendo] = useState(false);
   const [ocupado, setOcupado] = useState(false);
-  const presentacion = PRESENTACION[propuesta.destino];
+  const presentacion = PRESENTACION[propuesta.destino ?? 'informativa'];
+  const materializacion = presentacion.materializacion;
   const anclaDisponible = propuesta.anclaEstado === 'disponible';
   // La otra precondición que la base impone SIEMPRE y que no es del ancla, sino del contenido.
   // Va aparte de `anclaDisponible` porque no caduca con el tiempo —nació así— y su salida es
   // distinta: no es rechazar, es corregir. Y la declara el DESTINO, no un ternario.
-  const bloqueoPropio = presentacion.bloqueoPropio(propuesta.contenido);
+  const bloqueoPropio = materializacion?.bloqueoPropio(propuesta.contenido) ?? null;
   const citasPresentes = propuesta.citas.filter((c) => c.presenteLiteral).length;
 
   async function decidir(correccion?: ContenidoPropuesta) {
@@ -1142,32 +1178,50 @@ function TarjetaPropuesta({
           {bloqueoPropio}
         </span>
       )}
+      {/* Una propuesta que no materializa nada se DICE, en vez de dejar dos botones ausentes
+          que parezcan un permiso que falta. Quien lee un informe de gate tiene que saber que
+          no le falta un rol: es que ahí no hay nada que aprobar (RF-08.4), y el gate lo
+          aprueba una persona con el suyo desde el método (SYS-18). */}
+      {propuesta.estado === 'propuesta' && puedeRevisar && materializacion === null && (
+        <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
+          Este informe no crea nada y no se aprueba: se lee y se descarta. Quien decide sobre
+          el gate es la persona con el rol que le corresponde, desde el método.
+        </span>
+      )}
       {propuesta.estado === 'propuesta' && puedeRevisar && !corrigiendo && (
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          <Button
-            size="sm"
-            disabled={ocupado || !anclaDisponible || bloqueoPropio !== null}
-            onClick={() => void decidir()}
-          >
-            Aceptar tal cual
-          </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={ocupado || !anclaDisponible}
-            onClick={() => setCorrigiendo(true)}
-          >
-            Corregir y aceptar
-          </Button>
+          {/* Los dos botones de aceptación los pinta la MATERIALIZACIÓN, no una bandera:
+              sin objeto que crear no hay nada que aceptar ni que corregir. «Rechazar» se
+              queda siempre — para un informe es «leído y descartado», que es la única
+              decisión que su ciclo admite y la que cierra la fila. */}
+          {materializacion !== null && (
+            <>
+              <Button
+                size="sm"
+                disabled={ocupado || !anclaDisponible || bloqueoPropio !== null}
+                onClick={() => void decidir()}
+              >
+                Aceptar tal cual
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={ocupado || !anclaDisponible}
+                onClick={() => setCorrigiendo(true)}
+              >
+                Corregir y aceptar
+              </Button>
+            </>
+          )}
           <Button size="sm" variant="ghost" disabled={ocupado} onClick={() => void rechazar()}>
-            Rechazar
+            {materializacion === null ? 'Marcar como leído' : 'Rechazar'}
           </Button>
         </div>
       )}
       {propuesta.estado === 'propuesta' &&
         puedeRevisar &&
         corrigiendo &&
-        presentacion.formulario({
+        materializacion?.formulario({
           inicial: propuesta.contenido,
           ocupado,
           onEnviar: decidir,
@@ -1247,6 +1301,55 @@ function FichaCriterio({ contenido }: { contenido: ContenidoCriterio }) {
       <Dato rotulo="Plan de línea base" valor={contenido.lineaBasePlan} />
       {contenido.razonamiento && <Dato rotulo="Razonamiento" valor={contenido.razonamiento} />}
       <Dato rotulo="Confianza de la propuesta" valor={contenido.confianzaPropuesta} />
+    </div>
+  );
+}
+
+/**
+ * El informe de un gate: su resumen y sus huecos.
+ *
+ * NO se pinta el `checklistItemId`. Un uuid en pantalla no le dice nada a quien lee, y el
+ * campo no está ahí para eso: está para que el servicio pueda comprobar que cada hueco
+ * señala un requisito que EXISTE en este gate —lo rechaza si no— y para que una pantalla
+ * futura pueda enlazar al requisito. Lo que el revisor necesita leer es qué falta y cómo se
+ * cierra, y eso lo dicen las dos frases.
+ *
+ * La lista vacía se dice con palabras y no se omite: un informe sin huecos y un informe que
+ * no se pintó se ven igual, y son cosas muy distintas.
+ */
+function FichaAsistenteGate({ contenido }: { contenido: ContenidoAsistenteGate }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="Resumen" valor={contenido.resumen} />
+      {contenido.huecos.length === 0 ? (
+        <Dato rotulo="Huecos" valor="Ninguno: el asistente no encontró nada pendiente." />
+      ) : (
+        contenido.huecos.map((h, i) => (
+          <div
+            key={h.checklistItemId + String(i)}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 2,
+              paddingTop: 8,
+              borderTop: '1px solid var(--border-faint)',
+            }}
+          >
+            <Dato rotulo={`Falta ${i + 1}`} valor={h.queFalta} />
+            <Dato rotulo="Cómo cerrarlo" valor={h.comoCerrarlo} />
+          </div>
+        ))
+      )}
+      <Dato rotulo="Confianza del diagnóstico" valor={contenido.confianzaPropuesta} />
     </div>
   );
 }

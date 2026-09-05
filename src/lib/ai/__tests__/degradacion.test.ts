@@ -22,8 +22,10 @@ import {
   MAX_CAMPO_FICHA,
   MAX_MATERIAL,
   PROMPT_VERSION,
+  promptAsistenteGate,
   promptCriterios,
   promptExtraccion,
+  SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
   SISTEMA_EXTRACCION,
 } from '../ai.prompts';
@@ -430,8 +432,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * haya cambiado: lo que se amplió es la medida, no lo que se le dice al modelo. Por eso
    * `PROMPT_VERSION` NO se toca aquí — subirla habría partido en dos poblaciones que salieron
    * del mismo contrato, que es exactamente el daño que esta prueba existe para evitar. */
-  const VERSION_ANOTADA = 'ai-2026-09-03.1';
-  const HUELLA_ANOTADA = '0a42397060d73f0fbe431faa628d825890f68f2b0b691a6332750bad28e2ee82';
+  const VERSION_ANOTADA = 'ai-2026-09-05.1';
+  const HUELLA_ANOTADA = 'ef7459e532fa8c79eaeb1e3313e966f16d7d54a08775a5baa64949ba458c2781';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -527,6 +529,45 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       metricaObjetivo: 'M',
       cuantos: 3,
     }),
+    // ── CT ──
+    // El checklist es el CUERPO del material, así que sus ramas son las mismas que las de
+    // los otros dos con otra forma: el cuerpo entero, el cuerpo truncado y la ficha vacía.
+    // El id de cada requisito viaja en el cuerpo y es lo que el modelo tiene que copiar,
+    // así que el esqueleto de esa línea es contrato y entra en la huella.
+    gateLlano: promptAsistenteGate({
+      proyecto: 'P',
+      numero: 3,
+      rolAprobador: 'sponsor',
+      checklist: [
+        { id: 'a1b2c3d4-0000-4000-8000-000000000001', texto: 'T1', estado: 'pendiente', conObjeto: false },
+        { id: 'a1b2c3d4-0000-4000-8000-000000000002', texto: 'T2', estado: 'cumplido', conObjeto: true },
+      ],
+    }),
+    // El checklist no cabe: aparece el aviso de truncado, que es texto que el modelo lee.
+    gateTruncado: promptAsistenteGate({
+      proyecto: 'P',
+      numero: 3,
+      rolAprobador: 'sponsor',
+      checklist: [
+        { id: 'a1b2c3d4-0000-4000-8000-000000000001', texto: CUERPO_LARGO, estado: 'pendiente', conObjeto: false },
+      ],
+    }),
+    gateFichaVacia: promptAsistenteGate({
+      proyecto: '',
+      numero: 0,
+      rolAprobador: '',
+      checklist: [
+        { id: 'a1b2c3d4-0000-4000-8000-000000000001', texto: 'T1', estado: 'na', conObjeto: false },
+      ],
+    }),
+    gateConDelimitador: promptAsistenteGate({
+      proyecto: CON_DELIMITADOR,
+      numero: 3,
+      rolAprobador: 'sponsor',
+      checklist: [
+        { id: 'a1b2c3d4-0000-4000-8000-000000000001', texto: CON_DELIMITADOR, estado: 'pendiente', conObjeto: false },
+      ],
+    }),
   };
 
   /** Los prompts se renderizan con entradas FIJAS, así que la huella cubre el esqueleto de
@@ -535,6 +576,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     const fijo = {
       sistemaExtraccion: SISTEMA_EXTRACCION,
       sistemaCriterios: SISTEMA_CRITERIOS,
+      sistemaAsistenteGates: SISTEMA_ASISTENTE_GATES,
       esquemaSalida: ESQUEMA_SALIDA,
       maxMaterial: MAX_MATERIAL,
       maxCampoFicha: MAX_CAMPO_FICHA,
@@ -567,6 +609,17 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.criteriosSinMetrica.usuario).not.toContain('Métrica objetivo declarada:');
     expect(RAMAS.criteriosFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.criteriosConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
+
+    // CT: el id de cada requisito llega al material —es lo que el modelo tiene que copiar—,
+    // el truncado avisa, y la ficha vacía emite su «(sin dato)». Sin esto, las cuatro
+    // entradas de arriba serían una intención: cuatro llamadas que recorren la misma ruta.
+    expect(RAMAS.gateLlano.usuario).toContain('[a1b2c3d4-0000-4000-8000-000000000002]');
+    expect(RAMAS.gateLlano.usuario).toContain('con objeto adjunto');
+    expect(RAMAS.gateLlano.usuario).toContain('sin objeto adjunto');
+    expect(RAMAS.gateLlano.usuario).not.toContain('se truncó');
+    expect(RAMAS.gateTruncado.usuario).toContain('se truncó');
+    expect(RAMAS.gateFichaVacia.usuario).toContain('(sin dato)');
+    expect(RAMAS.gateConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
 
     // Y ninguna rama produce el mismo render que otra: dos entradas con la misma salida
     // serían una sola rama cubierta dos veces, y el hash no lo diría.

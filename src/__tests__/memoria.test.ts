@@ -217,15 +217,29 @@ describe('a dónde abre cada pieza de la memoria', () => {
 });
 
 describe('el respaldo de lo validado y lo vigente', () => {
-  it('cuenta aparte lo que sigue con respaldo y lo que lo perdió', () => {
-    expect(
-      resumenDeRespaldo([
-        { sinRespaldo: null },
-        { sinRespaldo: 'la afirmación «x» cita evidencia sin derechos vigentes' },
-        { sinRespaldo: null },
-      ]),
-    ).toEqual({ conRespaldo: 2, sinRespaldo: 1 });
-    expect(resumenDeRespaldo([])).toEqual({ conRespaldo: 0, sinRespaldo: 0 });
+  const vivo = { sinRespaldo: null };
+  const roto = { sinRespaldo: 'la afirmación «x» cita evidencia sin derechos vigentes' };
+
+  it('sin recorte, cuenta aparte lo que sigue con respaldo y lo que lo perdió', () => {
+    expect(resumenDeRespaldo([vivo, roto, vivo], 3, 'insight validado', 'insights validados')).toBe(
+      '3 insights validados · 2 con respaldo · 1 sin respaldo vivo',
+    );
+    expect(resumenDeRespaldo([vivo], 1, 'decisión vigente', 'decisiones vigentes')).toBe(
+      '1 decisión vigente · 1 con respaldo · 0 sin respaldo vivo',
+    );
+    expect(resumenDeRespaldo([], 0, 'insight validado', 'insights validados')).toBe(
+      '0 insights validados',
+    );
+  });
+
+  it('con recorte, dice que el desglose es de los mostrados: no se evalúa lo que el tope dejó fuera', () => {
+    const mostrados = Array.from({ length: TOPE_POR_SECCION }, (_, i) => (i < 2 ? roto : vivo));
+    expect(resumenDeRespaldo(mostrados, 53, 'insight validado', 'insights validados')).toBe(
+      `53 insights validados · de los ${TOPE_POR_SECCION} mostrados: 48 con respaldo · 2 sin respaldo vivo`,
+    );
+    expect(resumenDeRespaldo([roto], 2, 'decisión vigente', 'decisiones vigentes')).toBe(
+      '2 decisiones vigentes · del mostrado: 0 con respaldo · 1 sin respaldo vivo',
+    );
   });
 });
 

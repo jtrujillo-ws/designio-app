@@ -244,17 +244,32 @@ export function memoriaVacia(m: MemoriaDelWorkspace): boolean {
 }
 
 /**
- * Cuántos de los enseñados siguen con respaldo vivo y cuántos no: la cabecera de insights y
- * decisiones cuenta las dos cosas por separado, porque un insight cuya evidencia perdió los
- * derechos no es memoria UTILIZABLE aunque siga validado. Es de los que se enseñan, como el
- * desglose de arquetipos: el predicado corre por fila y no se evalúa sobre lo recortado.
+ * La cabecera de insights y decisiones: el total real y, de los ENSEÑADOS, cuántos siguen
+ * con respaldo vivo y cuántos no — porque un insight cuya evidencia perdió los derechos no
+ * es memoria UTILIZABLE aunque siga validado.
+ *
+ * El desglose es de los mostrados y solo de ellos: el predicado (`razonamiento_sin_respaldo
+ * _visible`) corre por fila, y evaluarlo sobre el workspace entero es justo el coste que el
+ * tope evita. Por eso, cuando el tope recortó, la cabecera lo DICE —«de los 50 mostrados:
+ * …»— en vez de poner un desglose de 50 filas al lado de un total de 53 como si fueran del
+ * mismo conjunto. Sin recorte, mostrados y total coinciden y no hace falta aclararlo.
  */
-export function resumenDeRespaldo(items: { sinRespaldo: string | null }[]): {
-  conRespaldo: number;
-  sinRespaldo: number;
-} {
+export function resumenDeRespaldo(
+  items: { sinRespaldo: string | null }[],
+  total: number,
+  singular: string,
+  plural: string,
+): string {
+  if (total === 0) return `0 ${plural}`;
   const sinRespaldo = items.filter((i) => i.sinRespaldo !== null).length;
-  return { conRespaldo: items.length - sinRespaldo, sinRespaldo };
+  const desglose = `${items.length - sinRespaldo} con respaldo · ${sinRespaldo} sin respaldo vivo`;
+  const ambito =
+    total > items.length
+      ? items.length === 1
+        ? 'del mostrado: '
+        : `de los ${items.length} mostrados: `
+      : '';
+  return `${total} ${total === 1 ? singular : plural} · ${ambito}${desglose}`;
 }
 
 /**

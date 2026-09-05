@@ -159,11 +159,11 @@ function PantallaBiblioteca() {
 
             <Seccion
               titulo="Insights validados"
-              cabecera={cabeceraConRespaldo(
+              cabecera={resumenDeRespaldo(
+                datos.insights,
                 datos.totales.insights,
                 'insight validado',
                 'insights validados',
-                resumenDeRespaldo(datos.insights),
               )}
               recorte={notaDeRecorte(
                 datos.insights.length,
@@ -191,11 +191,11 @@ function PantallaBiblioteca() {
 
             <Seccion
               titulo="Decisiones vigentes"
-              cabecera={cabeceraConRespaldo(
+              cabecera={resumenDeRespaldo(
+                datos.decisiones,
                 datos.totales.decisiones,
                 'decisión vigente',
                 'decisiones vigentes',
-                resumenDeRespaldo(datos.decisiones),
               )}
               recorte={notaDeRecorte(
                 datos.decisiones.length,
@@ -472,21 +472,6 @@ function SeccionArquetipos({
       ))}
     </section>
   );
-}
-
-/**
- * La cabecera de insights y decisiones: el total, y de los enseñados cuántos siguen con
- * respaldo y cuántos no. Un insight validado cuya evidencia perdió los derechos se enseña
- * —es memoria— pero no se cuenta como utilizable.
- */
-function cabeceraConRespaldo(
-  total: number,
-  singular: string,
-  plural: string,
-  r: { conRespaldo: number; sinRespaldo: number },
-): string {
-  if (total === 0) return `0 ${plural}`;
-  return `${total} ${total === 1 ? singular : plural} · ${r.conRespaldo} con respaldo · ${r.sinRespaldo} sin respaldo vivo`;
 }
 
 /**

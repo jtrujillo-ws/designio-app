@@ -3,6 +3,7 @@ import type { CSSProperties, ReactNode } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Tabs } from '@/components/ui/Tabs';
+import { Wordmark } from '@/components/ui/Wordmark';
 import type { JourneyN } from '@/components/ui/JourneyBadge';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { cerrarSesion } from '@/lib/auth/auth.functions';
@@ -46,6 +47,7 @@ import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 /** Lo que la pantalla necesita del usuario autenticado (lo publica el guard de /_autenticada). */
 export type MembresiaLoop = { workspaceId: string; workspaceNombre: string; rol: string };
 export type UsuarioLoop = {
+  id: string;
   nombre: string;
   membresias: MembresiaLoop[];
 };
@@ -181,10 +183,7 @@ export function LoopScreen({
             resumen={resumen}
             onTramo={irAJourney}
           />
-          <div
-            className="loop-cabecera-fila"
-            style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: 16 }}
-          >
+          <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: 16 }}>
             <Spotlight
               loop={loop}
               proyecto={proyecto}
@@ -328,10 +327,11 @@ function Lateral({
   const servicioActual = servicios[0] ?? null;
 
   // Qué servicios están desplegados. El actual nace abierto; el resto se recuerda por
-  // usuario y workspace en el navegador, que es donde vive una preferencia de lectura. Se
-  // lee en un efecto, no en el inicializador: el servidor no tiene localStorage y el primer
+  // usuario y workspace en el navegador, que es donde vive una preferencia de lectura (la
+  // clave lleva al usuario: dos cuentas en el mismo navegador no se pisan la suya). Se lee
+  // en un efecto, no en el inicializador: el servidor no tiene localStorage y el primer
   // fotograma tiene que coincidir con el que él pintó.
-  const claveExpansion = `designio.loop.expandidos.${arbol?.workspaceId ?? ''}`;
+  const claveExpansion = `designio.loop.expandidos.${usuario.id}.${arbol?.workspaceId ?? ''}`;
   const [expandidos, setExpandidos] = useState<Set<string>>(
     () => new Set(servicioActual ? [servicioActual.id] : []),
   );
@@ -407,15 +407,11 @@ function Lateral({
         }}
       >
         <Link to="/app" aria-label="designio · loop del método" style={{ textDecoration: 'none' }}>
-          <span className="loop-ancho" style={{ font: '800 21px var(--font-sans)', color: '#fff' }}>
-            designio
-            <PuntoDeMarca />
+          <span className="loop-ancho">
+            <Wordmark color="#fff" />
           </span>
-          <span
-            className="loop-estrecho"
-            style={{ font: '800 21px var(--font-sans)', color: '#fff' }}
-          >
-            d<PuntoDeMarca />
+          <span className="loop-estrecho">
+            <Wordmark color="#fff" corto />
           </span>
         </Link>
         <span
@@ -658,21 +654,6 @@ function Lateral({
   );
 }
 
-function PuntoDeMarca() {
-  return (
-    <span
-      style={{
-        background: 'var(--grad-arco)',
-        WebkitBackgroundClip: 'text',
-        backgroundClip: 'text',
-        color: 'transparent',
-      }}
-    >
-      .
-    </span>
-  );
-}
-
 function Contador({
   color,
   titulo,
@@ -852,11 +833,13 @@ function ServicioDelArbol({
               Sin retos aún
             </span>
           )}
-          {servicio.retos.map((reto, i) => (
+          {servicio.retos.map((reto) => (
             <RetoDelArbol
               key={reto.id}
               reto={reto}
-              activo={actual && i === 0}
+              // El reto activo es el del proyecto actual —el que gobiernan cabecera, spotlight
+              // y pestañas—, no el primero de la lista: pueden no ser el mismo.
+              activo={actual && reto.proyectos.some((p) => p.id === proyectoActual?.id)}
               marca={marcaDeReto(reto, proyectos, hayEvidencia)}
             />
           ))}
@@ -959,16 +942,42 @@ function RetoDelArbol({
       </div>
     );
   }
+  // El esquema no limita un reto a un proyecto. La fila del reto abre el primero (el que el
+  // resto de la pantalla toma como actual); los demás no pueden quedarse sin entrada, así
+  // que cuelgan debajo como subfilas, cada una con su propio enlace.
+  const otros = reto.proyectos.slice(1);
   return (
-    <Link
-      className="loop-fila"
-      to="/proyecto/$proyectoId"
-      params={{ proyectoId: proyecto.id }}
-      title={`${titulo} · abrir ${proyecto.codigo}`}
-      style={estilo}
-    >
-      {contenido}
-    </Link>
+    <>
+      <Link
+        className="loop-fila"
+        to="/proyecto/$proyectoId"
+        params={{ proyectoId: proyecto.id }}
+        title={`${titulo} · abrir ${proyecto.codigo}`}
+        style={estilo}
+      >
+        {contenido}
+      </Link>
+      {otros.map((p) => (
+        <Link
+          key={p.id}
+          className="loop-fila"
+          to="/proyecto/$proyectoId"
+          params={{ proyectoId: p.id }}
+          title={`${p.codigo} ${p.titulo} · otro proyecto de ${reto.codigo}`}
+          style={{
+            ...filaLateral,
+            paddingLeft: 41,
+            color: claro(0.55),
+            font: '500 12px var(--font-sans)',
+          }}
+        >
+          <span style={{ font: '500 10.5px var(--font-mono)', color: claro(0.5), flex: 'none' }}>
+            {p.codigo}
+          </span>
+          <span style={{ flex: 1, ...truncado }}>{p.titulo}</span>
+        </Link>
+      ))}
+    </>
   );
 }
 
@@ -996,7 +1005,7 @@ function CabeceraDeArco({
       ? `De la importación al post mortem. ${servicio.nombre} aún no tiene un proyecto: el método empieza con un reto activado y su G0.`
       : loop.enCurso === null
         ? `De la importación al post mortem. ${reto?.codigo ?? 'El reto'} cerró el ciclo entero con veredicto; los candidatos del post mortem esperan en el backlog.`
-        : `De la importación al post mortem. El arco marca la posición de cada journey; ${reto?.codigo ?? proyecto.codigo} va por ${enCurso?.titulo.toLowerCase()} y su gate abierto es G${loop.gateAbierto ?? 7}.`;
+        : `De la importación al post mortem. El arco marca la posición de cada journey; ${reto?.codigo ?? proyecto.codigo} va por ${enCurso?.titulo.toLowerCase()} y ${loop.gateAbierto === null ? 'los ocho gates ya están aprobados' : `su gate abierto es G${loop.gateAbierto}`}.`;
   const metrica = resumen?.metricas?.primaria ?? null;
 
   return (
@@ -1072,7 +1081,7 @@ function CabeceraDeArco({
           <Cifra etiqueta="Journeys cerrados" valor={String(loop.cerrados)} sufijo="/7" />
           <Cifra
             etiqueta="Gate abierto"
-            valor={loop.gateAbierto === null ? '—' : `G${loop.gateAbierto}`}
+            valor={!proyecto || loop.gateAbierto === null ? '—' : `G${loop.gateAbierto}`}
             titulo={
               !proyecto
                 ? 'Sin proyecto: no hay gates que abrir'
@@ -1105,7 +1114,6 @@ function CabeceraDeArco({
           gridTemplateColumns: 'repeat(7, 1fr)',
           gap: 6,
         }}
-        role="list"
         aria-label="Barra del arco"
       >
         {JOURNEYS.map((j) => {
@@ -1116,7 +1124,6 @@ function CabeceraDeArco({
             <button
               key={j}
               type="button"
-              role="listitem"
               className="loop-tramo"
               onClick={() => onTramo(j)}
               title={`J${j} · ${jl.titulo} · ${estado}: ir a la tarjeta`}
@@ -1689,9 +1696,8 @@ export function LoopSkeleton() {
             boxSizing: 'border-box',
           }}
         >
-          <span style={{ font: '800 21px var(--font-sans)', color: '#fff', padding: '0 8px' }}>
-            designio
-            <PuntoDeMarca />
+          <span style={{ padding: '0 8px' }}>
+            <Wordmark color="#fff" />
           </span>
         </aside>
         <main

@@ -9,7 +9,8 @@ import type { GatesDeProyecto } from './loop.schemas';
  * en una función pura que un test puede recorrer entera.
  *
  * Cada journey cubre gates concretos:
- *   J1 arranque en frío       → no tiene gate: está hecho cuando hay evidencia curada.
+ *   J1 arranque en frío       → no tiene gate: está hecho cuando hay evidencia curada
+ *                                (o cuando algún gate ya se aprobó: sin arranque no hay G0).
  *   J2 formulación del reto   → G0
  *   J3 investigación          → G1 G2
  *   J4 conceptualización      → G3 G4
@@ -51,7 +52,10 @@ export type EntradaDelLoop = {
 export function estadoDelLoop(entrada: EntradaDelLoop): EstadoDelLoop {
   const aprobados = new Set(entrada.gatesAprobados);
   const hecho = (j: JourneyN): boolean => {
-    if (j === 1) return entrada.hayEvidencia;
+    // El arranque en frío está hecho cuando hay evidencia curada… o cuando algún gate ya se
+    // aprobó: nadie pasa G0 sin haber arrancado, y un workspace cuyo checklist se decidió
+    // entero por N/A no puede quedarse en «J1 en curso» con G5 abierto al lado.
+    if (j === 1) return entrada.hayEvidencia || aprobados.size > 0;
     if (j === 7) return entrada.reviewCompletado;
     return GATES_POR_JOURNEY[j].every((g) => aprobados.has(g));
   };

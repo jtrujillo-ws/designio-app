@@ -83,6 +83,20 @@ describe('el estado del loop se deriva de los gates', () => {
     expect(loop.gateAbierto).toBe(0);
   });
 
+  it('sin evidencia pero con gates aprobados, el arranque se da por hecho: sin él no hay G0', () => {
+    // Checklists decididos enteros por N/A, o un proyecto heredado: no hay `evidencia` y sin
+    // esta regla la pantalla decía «J1 en curso» con «gate abierto G5» al lado.
+    const loop = estadoDelLoop({
+      hayEvidencia: false,
+      gatesAprobados: [0, 1, 2, 3, 4],
+      reviewCompletado: false,
+    });
+    expect(loop.journeys[1]).toBe('hecho');
+    expect(loop.journeys[5]).toBe('en curso');
+    expect(loop.gateAbierto).toBe(5);
+    expect(loop.cerrados).toBe(4);
+  });
+
   it('un servicio sin proyecto solo puede tener J1 hecho', () => {
     expect(loopDeProyecto(null, true).enCurso).toBe(2);
     expect(loopDeProyecto(null, false).enCurso).toBe(1);

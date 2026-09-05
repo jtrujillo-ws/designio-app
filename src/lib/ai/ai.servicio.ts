@@ -1226,6 +1226,27 @@ function anclaEnColumna(
 }
 
 /**
+ * Las columnas de ancla que los tres inserts de este módulo escriben, EXHAUSTIVAS por el tipo.
+ *
+ * Los inserts nombran sus columnas una a una —`item_id`, `reto_id`— porque son sentencias
+ * escritas, no generadas. Eso deja un hueco que una revisión encontró: ampliar
+ * `AnclaCapacidad['columna']` con una tercera y añadirla a las tres tablas dejaba los inserts
+ * escribiendo solo las dos viejas, así que `anclaEnColumna` devolvía `null` en las dos y la
+ * capacidad nueva perdía su enlace o rompía su restricción — después de pasar la comprobación
+ * del catálogo, que solo mira que la columna EXISTA.
+ *
+ * Esta constante no la lee nadie en tiempo de ejecución: existe para que el COMPILADOR se
+ * niegue. Al ser `Record<AnclaCapacidad['columna'], …>`, añadir un valor al tipo rompe la
+ * compilación aquí, y el comentario dice dónde hay que ir. Es el mismo aprendizaje de la
+ * ronda anterior: un guardián de forma sujeta la sintaxis; la semántica la sujeta el tipo.
+ */
+const ANCLA_EN_LOS_INSERTS: Record<AnclaCapacidad['columna'], 'escrita'> = {
+  item_id: 'escrita',
+  reto_id: 'escrita',
+};
+void ANCLA_EN_LOS_INSERTS;
+
+/**
  * Lo que cada capacidad vuelve a comprobar JUSTO ANTES de despachar, bajo el candado y en la
  * misma transacción que aprueba la llamada. Devuelve la versión de consentimiento que ampara
  * la salida, o `null` cuando no aplica.

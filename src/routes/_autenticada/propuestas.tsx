@@ -20,6 +20,7 @@ import {
 import {
   CAPACIDADES_ACTIVAS,
   CAPACIDADES,
+  type AnclaCapacidad,
   type CandidatoAncla,
   type CapacidadActiva,
   type ConsentimientoDeItem,
@@ -481,8 +482,23 @@ function FormularioGeneracion({
     `capacidad === 'CI' ? items : retos` funciona; con la tercera, el `else` la trata como C0
     en silencio — y ése es el modo de fallo de un ternario binario: no se equivoca, elige. */
   const ancla = CAPACIDADES[capacidad].ancla;
-  const anclas = ancla.columna === 'item_id' ? items : retos;
-  const hayMas = ancla.columna === 'item_id' ? hayMasItems : hayMasRetos;
+  /*
+   * Las candidatas POR TIPO DE ANCLA, exhaustivas por el tipo y no por un ternario.
+   *
+   * Aquí ponía `ancla.columna === 'item_id' ? items : retos`, y eso es la misma rama binaria
+   * una capa más afuera: una capacidad que anclara en cualquier otra cosa habría enseñado la
+   * cola de RETOS en el selector, y enviar uno habría fallado contra su propia tabla. Con un
+   * `Record<AnclaCapacidad['columna'], …>`, ampliar el tipo de ancla no compila hasta que
+   * alguien diga de dónde salen sus candidatas — que es lo que un ternario no puede exigir.
+   */
+  const CANDIDATAS: Record<
+    AnclaCapacidad['columna'],
+    { lista: CandidatoAncla[]; hayMas: boolean }
+  > = {
+    item_id: { lista: items, hayMas: hayMasItems },
+    reto_id: { lista: retos, hayMas: hayMasRetos },
+  };
+  const { lista: anclas, hayMas } = CANDIDATAS[ancla.columna];
   const elegida = anclas.find((a) => a.id === anclaId);
   // RF-09.5: si el material es de personas y el consentimiento vigente no cubre el
   // procesamiento externo, el paso que toca no es generar — es registrarlo. La pantalla lo

@@ -5969,7 +5969,126 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       );
       const [despues] = await admin`select count(*)::int as n from llamada_ai
         where workspace_id = ${wsC}`;
-      expect(despues!.n, 'se abrió una línea en el libro: hubo despacho').toBe(antes!.n);
+      expect(despues!.n, 'no se abrió ninguna línea: la llamada no se despachó').toBe(antes!.n);
+    });
+  });
+
+  /**
+   * Un grafo editado ENTRE preparar y despachar no llega al proveedor.
+   *
+   * Esta comparación existía —en `COMPROBAR.C5`—, y allí llega tarde: para entonces la llamada
+   * ya salió, ya se pagó y ya está en el libro. Lo único que miraba antes de despachar era que
+   * al journey le quedara alguna señal abierta, y eso no dice nada del grafo: renombrar un
+   * nodo o mover una transición lo cambia entero dejando las señales idénticas. El resultado
+   * era determinista, no una carrera improbable: cualquiera que editara el grafo en ese hueco
+   * hacía pagar una llamada cuyo informe se iba a descartar a continuación.
+   *
+   * Se mide por el LIBRO. El mensaje solo diría que ALGO se rechazó, y las dos versiones lo
+   * rechazan; lo que separa la de antes de la de ahora es si se abrió una línea de gasto.
+   *
+   * Y se renombra un nodo, no se añade uno: las señales quedan EXACTAMENTE iguales —se
+   * comprueba abajo—, de modo que la puerta que ya existía no puede ser la que rechaza.
+   */
+  it('un grafo editado entre preparar y despachar no llega al proveedor', async () => {
+    await enWorkspaceLimpio('c5-editado-antes-de-despachar', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+
+      // El hueco ANTES del apunte: la autorización ya está leída y ni un byte en el aire.
+      proveedor.antesDelApunte = async () => {
+        await admin`update journey_nodo set etiqueta = 'Comprobar quién eres'
+          where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C5',
+                anclaId: j.journeyId,
+              }),
+            ).rejects.toThrow(/cambió mientras se preparaba/);
+          },
+        );
+      } finally {
+        proveedor.antesDelApunte = null;
+      }
+
+      const [despues] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(despues!.n, 'no se abrió ninguna línea: la llamada no se despachó').toBe(antes!.n);
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
+      expect(quedan[0]!.n).toBe(0);
+      // Las señales son las MISMAS: sin esto, el caso podría estar pasando por la puerta que
+      // ya existía —«se cerraron las señales»— y no probaría nada nuevo.
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+    });
+  });
+
+  /**
+   * Un journey cuya TOPOLOGÍA A REMEDIAR no cabe en el material no se ofrece ni se despacha.
+   *
+   * Que las señales sobrevivan al recorte fue media corrección. El encargo es «di cómo cerrar
+   * cada una de estas N señales», y eso es irrespondible sin el nodo de cada señal y sin ver
+   * por dónde se entra y se sale de él: en un grafo grande, el modelo recibía «el paso X no
+   * tiene salida» sin el paso X y sin una sola transición. El contrato le exige una
+   * remediación por señal igual, así que la única salida que le quedaba era inventarla — y
+   * `COMPROBAR.C5` la acepta, porque cubre exactamente la señal que se le pidió.
+   *
+   * `nucleoDeRemediacion` pone ese núcleo delante, así que sobrevive salvo que él SOLO ya no
+   * quepa. Ese caso —el que aquí se fabrica poniendo el cuerpo largo en el nodo señalado— se
+   * dice antes de gastar y no se ofrece en la cola, que es el mismo criterio que el techo de
+   * señales de arriba: no ofrecer lo que la admisión va a rechazar.
+   */
+  it('un journey cuya topología a remediar no cabe no se ofrece ni llega al proveedor', async () => {
+    await enWorkspaceLimpio('c5-nucleo-que-no-cabe', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(0);
+
+      // Antes de engordarlo, el journey SÍ se ofrece: es lo que hace que la comprobación de
+      // abajo mida el techo del material y no que el fixture nunca estuviera en la cola.
+      const cola = await panelPropuestas(curadorId, wsC);
+      expect(cola.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(true);
+
+      // El nodo que una señal nombra se lleva el cuerpo largo: el núcleo pasa del techo sin
+      // que cambie ni el número de señales ni el de nodos.
+      await admin`update journey_nodo set etiqueta = ${'Paso descrito sin parar. '.repeat(1200)}
+        where id = ${senales[0]!.nodoId} and workspace_id = ${wsC}`;
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+
+      // No se ofrece…
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(panel.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(false);
+
+      // …y forzarlo tampoco gasta.
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      await conProveedor(
+        { ok: true, datos: {}, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+          ).rejects.toThrow(/sin ver los nodos que se le pide remediar/);
+        },
+      );
+      const [despues] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(despues!.n, 'no se abrió ninguna línea: la llamada no se despachó').toBe(antes!.n);
     });
   });
 

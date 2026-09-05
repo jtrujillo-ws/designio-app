@@ -25,6 +25,7 @@ import {
   promptCriterios,
   promptExtraccion,
   materialDeJourney,
+  nucleoDeRemediacion,
   promptRemediacionJourney,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
@@ -832,6 +833,11 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           // llevar es pagar una llamada cuya respuesta se descarta. `PREPARAR.C5` lo dice con
           // su motivo; aquí simplemente no se ofrece.
           if (senales.length === 0 || senales.length > MAX_REMEDIACIONES) continue;
+          // Ni las que no caben en el material. Es el mismo criterio que el techo de arriba
+          // —no ofrecer lo que la admisión va a rechazar—, y se mide sobre el NÚCLEO y no
+          // sobre el material entero: lo acotan las señales, no el grafo, así que el barrido
+          // no se convierte en armar el prompt de trescientos journeys.
+          if (!nucleoDeRemediacion(grafoParaElModelo(journey)).cabe) continue;
           conSenales.push({ id: j.id as string, titulo: j.titulo as string });
         }
       }
@@ -1618,7 +1624,7 @@ async function comprobarDespacho(
     if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
       versionConsentimiento = await exigirConsentimientoVigente(tx, entrada, 'antes-de-despachar');
     }
-    await REVALIDAR[entrada.capacidad](tx, entrada);
+    await REVALIDAR[entrada.capacidad](tx, entrada, alcance.huellaMaterial);
 
     // El token de despacho: la reserva sigue existiendo y NO ha caducado. Una revocación la
     // retira, y una caducada dejó de contar para admitir a los demás — despachar con ella
@@ -1896,7 +1902,11 @@ function anclasDelInsert(
  */
 const REVALIDAR: Record<
   CapacidadActiva,
-  (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<void>
+  (
+    tx: TransactionSql,
+    entrada: GenerarPropuestas,
+    huellaMaterial: string | undefined,
+  ) => Promise<void>
 > = {
   CI: async (tx, entrada) => {
     // El consentimiento NO se comprueba aquí: lo hace `exigirConsentimientoVigente`, que corre
@@ -1939,7 +1949,7 @@ const REVALIDAR: Record<
       );
     }
   },
-  C5: async (tx, entrada) => {
+  C5: async (tx, entrada, huellaMaterial) => {
     /*
      * Lo que puede haber pasado mientras se preparaba la llamada es que ALGUIEN CIERRE las
      * señales — que es el desenlace bueno, y precisamente por eso no hay que pagar por
@@ -1956,6 +1966,24 @@ const REVALIDAR: Record<
     if (validarJourney(journey).length === 0) {
       throw new ErrorAI(
         'Las señales de ese journey se cerraron mientras se preparaba la llamada: no había nada que remediar y no se llamó al proveedor',
+      );
+    }
+    /*
+     * Y que el grafo siga siendo EL QUE SE ARMÓ EN EL PROMPT, no solo que le queden señales.
+     *
+     * Esta misma comparación existía en `COMPROBAR.C5`, y allí llega tarde: para entonces la
+     * llamada ya salió, ya se pagó y ya está en el libro. Una edición ajena en el hueco entre
+     * preparar y despachar —renombrar un nodo, mover una transición— dejaba pasar el despacho
+     * mientras quedara alguna señal abierta, y el informe se descartaba después, con el coste
+     * hecho. Es determinista, no una carrera improbable: basta con que alguien edite el grafo.
+     *
+     * Se compara aquí, que es el último punto donde no cuesta nada, y sigue comparándose allí,
+     * que es el único donde se puede afirmar sobre lo que el modelo YA dijo. Las dos no sobran:
+     * entre este chequeo y la escritura sigue pasando la llamada entera.
+     */
+    if (huellaDelGrafo(grafoParaElModelo(journey)) !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'El grafo de ese journey cambió mientras se preparaba la llamada: lo que se iba a enviar ya no lo describe, así que no se llamó al proveedor. Vuelve a pedirlo.',
       );
     }
   },
@@ -2142,14 +2170,31 @@ const PREPARAR: Record<
         `Ese journey tiene ${grafo.senales.length} señales abiertas y un informe puede llevar ${MAX_REMEDIACIONES}: cierra las más claras a mano y vuelve a pedirlo. (La validación las lista todas, y es exacta.)`,
       );
     }
+    const prompt = promptRemediacionJourney({
+      nombre: journey.nombre,
+      servicio: journey.servicioNombre,
+      tipo: journey.tipo,
+      grafo,
+    });
+    /*
+     * Y el otro techo, el del MATERIAL. El cuerpo se recorta a `MAX_MATERIAL`, y aunque las
+     * señales van delante —y por eso ya no se pierden—, en un grafo grande lo que caía fuera
+     * era su TOPOLOGÍA: el modelo leía «el paso X no tiene salida» sin ver el paso X ni una
+     * sola transición. Y el contrato le exige una remediación por señal igual, así que la
+     * única salida que le quedaba era inventarla — y `COMPROBAR.C5` no la puede distinguir de
+     * una buena, porque cubre exactamente la señal que se le pidió.
+     *
+     * `nucleoDeRemediacion` pone ese núcleo delante, así que sobrevive al recorte salvo que él
+     * SOLO ya no quepa. Ese caso se dice aquí, antes de gastar, y se dice qué hacer.
+     */
+    if (!prompt.nucleo.cabe) {
+      throw new ErrorAI(
+        `El grafo alrededor de las señales de ese journey ocupa ${prompt.nucleo.caracteres} caracteres y al modelo le caben ${MAX_MATERIAL}: no se llamó al proveedor, porque tendría que responder sin ver los nodos que se le pide remediar. Cierra a mano las señales de los tramos más cargados y vuelve a pedirlo.`,
+      );
+    }
     return {
       sistema: SISTEMA_REMEDIACION_JOURNEY,
-      prompt: promptRemediacionJourney({
-        nombre: journey.nombre,
-        servicio: journey.servicioNombre,
-        tipo: journey.tipo,
-        grafo,
-      }),
+      prompt,
       /*
        * Lo que el modelo TUVO DELANTE, para volver a mirarlo cuando haya que escribir. Sin
        * esto, `COMPROBAR` solo podía comparar contra una lectura NUEVA del grafo, y entre las

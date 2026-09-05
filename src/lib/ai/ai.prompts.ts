@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.6';
+export const PROMPT_VERSION = 'ai-2026-09-05.7';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -217,47 +217,109 @@ export type GrafoDelJourney = {
   senales: { codigo: string; severidad: string; nodoId: string; mensaje: string }[];
 };
 
+export type MaterialDeJourney = MaterialDelimitado & {
+  /** Cuánto ocupa el NÚCLEO A REMEDIAR y si sobrevive entero al techo del cuerpo. Lo lee
+   * quien decide si se paga la llamada: ver `nucleoDeRemediacion`. */
+  nucleo: { caracteres: number; cabe: boolean };
+};
+
+/**
+ * El NÚCLEO de un encargo de remediación —las señales, los nodos que nombran, los vecinos a
+ * los que llegan sus transiciones y esas transiciones— y, aparte, EL RESTO del grafo.
+ *
+ * La partición existe porque el cuerpo se recorta a `MAX_MATERIAL` y no todo el grafo vale lo
+ * mismo. El encargo de C5 es «di cómo cerrar CADA una de estas N señales», y eso no se puede
+ * responder sin ver el nodo de cada señal y por dónde se entra y se sale de él; el resto del
+ * grafo ayuda, pero su ausencia no impide responder.
+ *
+ * Poner las señales delante —que fue el arreglo anterior— dejó de perderlas a ELLAS, y seguía
+ * perdiendo su topología: en un grafo de cuatrocientos nodos, el material que llegaba al
+ * modelo decía «el paso X no tiene salida» sin contener el paso X ni una sola transición. Y el
+ * contrato le exige una remediación por señal igual, así que la única salida que le queda es
+ * inventarla; `COMPROBAR.C5` no puede distinguir un consejo inventado de uno bueno —cubre
+ * exactamente la señal que se le pidió—, de modo que se acepta, se paga y se lee como si
+ * alguien hubiera mirado el grafo.
+ *
+ * El tamaño del núcleo lo acota el número de señales (`MAX_REMEDIACIONES`) y no el del grafo,
+ * que es lo que hace que quepa casi siempre. Casi: cuando no cabe, quien va a pagar lo mira
+ * antes y no llama.
+ */
+export function nucleoDeRemediacion(grafo: GrafoDelJourney): {
+  texto: string;
+  resto: string;
+  cabe: boolean;
+} {
+  const { nodos, aristas, senales } = grafo;
+  const senalados = new Set(senales.map((s) => s.nodoId));
+  const incidente = (a: GrafoDelJourney['aristas'][number]) =>
+    senalados.has(a.origen) || senalados.has(a.destino);
+  /*
+   * Los VECINOS entran con sus aristas: «este paso no tiene salida» no se puede remediar
+   * viendo solo el paso —hace falta saber quién entra en él y a dónde iba lo que sale—, y
+   * añadirlos no cambia el orden de magnitud, porque los acotan las mismas aristas incidentes
+   * que ya están dentro.
+   */
+  const delNucleo = new Set(senalados);
+  for (const a of aristas) {
+    if (incidente(a)) {
+      delNucleo.add(a.origen);
+      delNucleo.add(a.destino);
+    }
+  }
+  const texto = [
+    'SEÑALES DE LA VALIDACIÓN (ya calculadas: no busques otras)',
+    ...senales.map(
+      (s) => `[${s.codigo}] severidad ${s.severidad} · nodo [${s.nodoId}]\n${s.mensaje}`,
+    ),
+    '',
+    'NODOS Y TRANSICIONES DE LAS SEÑALES (lo que hay que remediar)',
+    ...nodos.filter((n) => delNucleo.has(n.id)).map(lineaDeNodo),
+    ...aristas.filter(incidente).map(lineaDeArista),
+  ].join('\n');
+  const resto = [
+    '',
+    'RESTO DEL GRAFO (contexto)',
+    'NODOS',
+    ...nodos.filter((n) => !delNucleo.has(n.id)).map(lineaDeNodo),
+    '',
+    'TRANSICIONES Y ENLACES',
+    ...aristas.filter((a) => !incidente(a)).map(lineaDeArista),
+  ].join('\n');
+  return { texto, resto, cabe: texto.length <= MAX_MATERIAL };
+}
+
+function lineaDeNodo(n: GrafoDelJourney['nodos'][number]): string {
+  return `[${n.id}] ${n.tipo} · fase: ${n.fase || '(sin fase)'} · responsable: ${n.responsable || '(sin responsable)'} · evidencias: ${n.evidencias}\n${n.etiqueta}`;
+}
+
+function lineaDeArista(a: GrafoDelJourney['aristas'][number]): string {
+  return `${a.origen} --${a.tipo}${a.condicion ? ` (${a.condicion})` : ''}--> ${a.destino}`;
+}
+
+/**
+ * El material de un journey: su ficha y su grafo, con el núcleo a remediar DELANTE.
+ *
+ * El orden no es estilo: `bloqueConFicha` recorta el cuerpo a `MAX_MATERIAL`, así que lo que
+ * se escriba al final es lo primero que desaparece. Delante va lo que el encargo necesita para
+ * poder responderse —las señales y su topología—, y detrás el contexto, que es de lo único que
+ * el prompt puede avisar honestamente que falta.
+ */
 export function materialDeJourney(journey: {
   nombre: string;
   servicio: string;
   tipo: string;
   grafo: GrafoDelJourney;
-}): MaterialDelimitado {
-  const { nodos, aristas, senales } = journey.grafo;
-  /*
-   * Las SEÑALES van primero, y no por estilo: `bloqueConFicha` recorta el cuerpo a
-   * `MAX_MATERIAL`, así que lo que se escriba al final es lo primero que desaparece. Con las
-   * señales detrás de todos los nodos y todas las aristas, un grafo grande las perdía —enteras
-   * o a medias— mientras el prompt seguía pidiendo remediar «las N señales»: el modelo no
-   * podía verlas y la única salida posible era inventarlas.
-   *
-   * Puestas delante, lo que se pierde por el recorte es la cola del grafo, y de eso el prompt
-   * ya avisa («no afirmes nada sobre los nodos que no ves»). Es la ordenación correcta por lo
-   * mismo que las señales son la tarea: lo que no se puede recortar es el enunciado.
-   */
-  const cuerpo = [
-    'SEÑALES DE LA VALIDACIÓN (ya calculadas: no busques otras)',
-    ...senales.map((s) => `[${s.codigo}] severidad ${s.severidad} · nodo [${s.nodoId}]\n${s.mensaje}`),
-    '',
-    'NODOS',
-    ...nodos.map(
-      (n) =>
-        `[${n.id}] ${n.tipo} · fase: ${n.fase || '(sin fase)'} · responsable: ${n.responsable || '(sin responsable)'} · evidencias: ${n.evidencias}\n${n.etiqueta}`,
-    ),
-    '',
-    'TRANSICIONES Y ENLACES',
-    ...aristas.map(
-      (a) => `${a.origen} --${a.tipo}${a.condicion ? ` (${a.condicion})` : ''}--> ${a.destino}`,
-    ),
-  ].join('\n');
-  return bloqueConFicha(
+}): MaterialDeJourney {
+  const nucleo = nucleoDeRemediacion(journey.grafo);
+  const material = bloqueConFicha(
     [
       ['Journey', journey.nombre],
       ['Servicio', journey.servicio],
       ['Tipo de grafo', journey.tipo],
     ],
-    cuerpo,
+    [nucleo.texto, nucleo.resto].join('\n'),
   );
+  return { ...material, nucleo: { caracteres: nucleo.texto.length, cabe: nucleo.cabe } };
 }
 
 const REGLAS_COMUNES = [
@@ -378,7 +440,7 @@ export function promptRemediacionJourney(journey: {
   servicio: string;
   tipo: string;
   grafo: GrafoDelJourney;
-}): { usuario: string; alcanceResumen: string } {
+}): { usuario: string; alcanceResumen: string; nucleo: MaterialDeJourney['nucleo'] } {
   const material = materialDeJourney(journey);
   const cuantas = journey.grafo.senales.length;
   return {
@@ -387,13 +449,20 @@ export function promptRemediacionJourney(journey: {
         ? 'La validación de este journey no emitió ninguna señal. Confírmalo y devuelve la lista de remediaciones vacía.'
         : `Di cómo cerrar cada una de las ${cuantas} señales de validación del journey descrito en el material.`,
       material.bloque,
+      // Lo que el aviso puede prometer sin mentir es el ORDEN, que se cumple siempre: delante
+      // el núcleo a remediar, detrás el contexto. Que además quepa entero es lo que mira quien
+      // paga la llamada, y si no cabe no se llega hasta aquí.
       material.truncado
-        ? `(El grafo se truncó a ${MAX_MATERIAL} caracteres: no afirmes nada sobre los nodos que no ves.)`
+        ? `(El grafo se truncó a ${MAX_MATERIAL} caracteres: primero van las señales y la topología que hay que remediar, y lo que falta es el contexto de alrededor. No afirmes nada sobre los nodos que no ves.)`
         : '',
     ]
       .filter(Boolean)
       .join('\n\n'),
-    alcanceResumen: `journey «${journey.nombre}» · ${journey.grafo.nodos.length} nodos, ${journey.grafo.aristas.length} enlaces, ${cuantas} señales (${material.usados} caracteres)`,
+    // El «truncado» también en el resumen, y no solo dentro del prompt: `alcanceResumen` se
+    // persiste como lineage y se lee para auditar QUÉ vio el modelo. Sin él, el registro
+    // afirmaba un alcance —«N nodos, M enlaces»— que el modelo no llegó a leer entero.
+    alcanceResumen: `journey «${journey.nombre}» · ${journey.grafo.nodos.length} nodos, ${journey.grafo.aristas.length} enlaces, ${cuantas} señales (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+    nucleo: material.nucleo,
   };
 }
 

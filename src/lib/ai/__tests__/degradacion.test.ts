@@ -438,6 +438,38 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
   /** Un grafo mínimo con UNA señal: lo justo para que las ramas de C5 rindan un render
    * estable y distinto entre sí. No sale de `validarJourney` —esto mide el PROMPT, no la
    * validación— así que la señal se escribe a mano con la forma que la función produce. */
+  /** Cuatrocientos nodos encadenados y la señal en el último: el grafo entero pasa de
+   * `MAX_MATERIAL` con holgura, así que lo que sobrevive al recorte es exactamente lo que el
+   * cuerpo escriba primero. */
+  const GRAFO_GRANDE: GrafoDelJourney = (() => {
+    const id = (n: number) => `b1000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const nodos = Array.from({ length: 400 }, (_, i) => ({
+      id: id(i),
+      tipo: 'paso',
+      etiqueta: `Paso ${i} — ${'descripción larga del paso '.repeat(3)}`,
+      fase: 'Alta',
+      responsable: 'Front',
+      evidencias: 0,
+    }));
+    return {
+      nodos,
+      aristas: nodos.slice(0, -1).map((n, i) => ({
+        origen: n.id,
+        destino: id(i + 1),
+        tipo: 'transicion',
+        condicion: '',
+      })),
+      senales: [
+        {
+          codigo: 'paso-sin-salida',
+          severidad: 'media',
+          nodoId: id(399),
+          mensaje: 'El último paso no tiene salida.',
+        },
+      ],
+    };
+  })();
+
   const GRAFO_DE_PRUEBA: GrafoDelJourney = {
     nodos: [
       {
@@ -484,8 +516,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * «todavía no la usa nadie» es exactamente el que hay que no aceptar, porque es cierto
    * hasta el commit en que deja de serlo.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-05.6';
-  const HUELLA_ANOTADA = '3f90d310ad74149d57f0270c13f80e928d9fba2c8cc3d1764f28b073672cf032';
+  const VERSION_ANOTADA = 'ai-2026-09-05.7';
+  const HUELLA_ANOTADA = '6a8cb00526b6906024822424ef274cedc6ad96f7efeaf54a0f81660560e619fe';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -646,6 +678,17 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
         nodos: [{ ...GRAFO_DE_PRUEBA.nodos[0]!, etiqueta: CUERPO_LARGO }],
       },
     }),
+    /*
+     * Un grafo GRANDE, que es donde el orden del cuerpo deja de ser una preferencia. La señal
+     * nombra un nodo del final: con el grafo escrito en orden, ni ese nodo ni ninguna
+     * transición sobrevivían al recorte, y el modelo tenía que remediar a ciegas.
+     */
+    journeyGrande: promptRemediacionJourney({
+      nombre: 'Alta de cuenta',
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: GRAFO_GRANDE,
+    }),
     journeyFichaVacia: promptRemediacionJourney({
       nombre: '',
       servicio: '',
@@ -742,6 +785,35 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     // Y el recorte se llevó lo que tenía que llevarse: la cola del grafo, de la que el propio
     // prompt avisa. Sin esta mitad, poner las señales delante y NO truncar nada pasaría igual.
     expect(RAMAS.journeyTruncado.usuario).not.toContain(CUERPO_LARGO);
+    /*
+     * Y CON ELLAS SU TOPOLOGÍA, que es la mitad que faltaba.
+     *
+     * Que las señales sobrevivan no basta para poder responder: «el paso X no tiene salida» es
+     * irremediable sin el paso X y sin ver por dónde se entra en él. Con el grafo escrito en
+     * orden, un journey de cuatrocientos nodos entregaba las señales y NADA más —ni su nodo ni
+     * una sola transición—, y el contrato exige una remediación por señal igual: la única
+     * salida que le quedaba al modelo era inventarla, y `COMPROBAR.C5` la acepta porque cubre
+     * exactamente la señal que se pidió.
+     *
+     * El núcleo lo acota el número de señales y no el del grafo, así que en este caso cabe: lo
+     * que se pierde es el contexto, que es de lo único que el prompt avisa.
+     */
+    // La ENTRADA del nodo, no su id a secas: el id a secas también aparece en la línea de la
+    // señal —«· nodo [b1…399]»—, así que buscarlo solo pasaría sin que el nodo esté.
+    const NODO_SENALADO = '[b1000000-0000-4000-8000-000000000399] paso ·';
+    const ARISTA_INCIDENTE =
+      'b1000000-0000-4000-8000-000000000398 --transicion--> b1000000-0000-4000-8000-000000000399';
+    expect(RAMAS.journeyGrande.usuario).toContain('se truncó');
+    expect(RAMAS.journeyGrande.nucleo.cabe).toBe(true);
+    expect(RAMAS.journeyGrande.usuario).toContain(NODO_SENALADO);
+    expect(RAMAS.journeyGrande.usuario).toContain(ARISTA_INCIDENTE);
+    // Y el contexto es lo que se fue: sin esta mitad, un núcleo que sobrevive porque NADA se
+    // recortó pasaría igual.
+    expect(RAMAS.journeyGrande.usuario).not.toContain('[b1000000-0000-4000-8000-000000000200]');
+    // El otro lado del techo: cuando el núcleo SOLO ya no cabe, se dice, y `PREPARAR.C5` no
+    // llama. Aquí el nodo señalado arrastra al vecino que le entra, y ese lleva el cuerpo largo.
+    expect(RAMAS.journeyTruncado.nucleo.cabe).toBe(false);
+    expect(RAMAS.journeyLlano.nucleo.cabe).toBe(true);
     expect(RAMAS.journeyFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.journeyConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
 

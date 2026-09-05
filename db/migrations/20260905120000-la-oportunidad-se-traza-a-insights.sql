@@ -101,6 +101,29 @@ alter table oportunidad_insight enable row level security;
 -- QUIÉN ESCRIBE QUÉ
 -- ═══════════════════════════════════════════════════════════════════════════
 
+-- La VENTANA en la que el portafolio se puede tocar, escrita UNA vez porque la miran cuatro
+-- políticas. G3 certifica un portafolio; lo que certificó no se cambia por debajo sin reabrir
+-- la etapa 3, que es la misma regla que `arquetipo_insert` aplica a G2 y la misma que I1
+-- pide para todo lo que un gate dejó firmado.
+--
+-- Escribirla solo en el INSERT —que es como nació— dejaba abierto justo lo que más importa:
+-- con G3 aprobado, se podía BORRAR el último enlace de una oportunidad viva y dejar el gate
+-- firmado incumpliendo SYS-15, sin que nadie reabriera nada. El guard del gate no lo ve
+-- porque solo corre al aprobar.
+create function reto_admite_portafolio(p_reto uuid, p_ws uuid) returns boolean
+language sql stable security definer set search_path = public, pg_temp as $fn$
+  select not exists (
+    select 1 from gate_instancia g
+      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+      join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+        and e.numero = 3
+    where p.reto_id = p_reto and p.workspace_id = p_ws
+      and g.numero = 3 and g.estado = 'aprobado' and e.estado <> 'en-curso');
+$fn$;
+
+revoke execute on function reto_admite_portafolio(uuid, uuid) from public;
+grant execute on function reto_admite_portafolio(uuid, uuid) to designio_app;
+
 -- Verla es de todo miembro: el portal existe para que el cliente vea el razonamiento, y una
 -- oportunidad es exactamente el razonamiento que se le enseña en la etapa 3.
 create policy oportunidad_select on oportunidad
@@ -116,13 +139,7 @@ create policy oportunidad_insert on oportunidad
     and creado_por = app_user_id()
     and estado = 'propuesta'
     and decidido_por is null
-    and not exists (
-      select 1 from gate_instancia g
-        join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
-        join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
-          and e.numero = 3
-      where p.reto_id = oportunidad.reto_id and p.workspace_id = oportunidad.workspace_id
-        and g.numero = 3 and g.estado = 'aprobado' and e.estado <> 'en-curso')
+    and reto_admite_portafolio(oportunidad.reto_id, oportunidad.workspace_id)
   );
 
 -- UNA sola política de UPDATE, y esto es una decisión, no un descuido. Las dos escrituras
@@ -144,8 +161,10 @@ create policy oportunidad_actualizar on oportunidad
   for update using (
     estado = 'propuesta'
     and workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and reto_admite_portafolio(reto_id, workspace_id)
   ) with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
+    and reto_admite_portafolio(reto_id, workspace_id)
   );
 
 create policy oportunidad_insight_select on oportunidad_insight
@@ -165,18 +184,22 @@ create policy oportunidad_insight_insert on oportunidad_insight
     and exists (select 1 from oportunidad o
       where o.id = oportunidad_insight.oportunidad_id
         and o.workspace_id = oportunidad_insight.workspace_id
-        and o.estado = 'propuesta')
+        and o.estado = 'propuesta'
+        and reto_admite_portafolio(o.reto_id, o.workspace_id))
   );
 
 -- Desenlazar mientras está por decidir: corregir la traza es parte de armarla. Después del
--- veredicto no, por lo mismo que arriba.
+-- veredicto no, por lo mismo que arriba — y tampoco con G3 firmado, que es el caso serio:
+-- borrar el último enlace de una oportunidad viva deja el gate certificando un portafolio
+-- que ya no cumple SYS-15, y el guard del gate no vuelve a correr para desmentirlo.
 create policy oportunidad_insight_delete on oportunidad_insight
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and exists (select 1 from oportunidad o
       where o.id = oportunidad_insight.oportunidad_id
         and o.workspace_id = oportunidad_insight.workspace_id
-        and o.estado = 'propuesta')
+        and o.estado = 'propuesta'
+        and reto_admite_portafolio(o.reto_id, o.workspace_id))
   );
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -229,6 +252,56 @@ $fn$;
 -- El esquema tiene un censo que lo comprueba tabla por tabla; esto es lo que lo mantiene en
 -- verde, y no una precaución de más: un trigger no necesita EXECUTE público para dispararse.
 revoke execute on function oportunidad_veredicto_guard() from public;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Y EL CANDADO DEL RETO, QUE ES LA CLAVE QUE USA LA APROBACIÓN DE G3
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- Todo lo de arriba decide sobre el portafolio; `gate_aprobar_suficiencia_guard` decide sobre
+-- el MISMO portafolio al firmar G3. Sin una clave común, las dos transacciones tocan filas
+-- distintas y no se ven: el gate lee el enlace mientras el borrado lee una oportunidad
+-- `propuesta`, las dos comprobaciones pasan, y las dos commitean. Resultado: G3 firmado sobre
+-- una oportunidad viva sin traza — exactamente lo que SYS-15 prohíbe, alcanzado sin que
+-- ninguna de las dos reglas fallara.
+--
+-- La clave es `designio:reto:`, la que ya toma el guard del gate. Va en un TRIGGER y no solo
+-- en el servicio por lo de siempre: quien escribe por SQL directo no coopera con ningún
+-- protocolo del servicio, y el insert del enlace está en la superficie concedida.
+--
+-- ── El ORDEN ──
+-- `a_congelacion_por_disposicion` toma `designio:workspace:` en COMPARTIDO y corre el primero
+-- (su prefijo lo garantiza), así que el orden del sistema es workspace → reto. El prefijo `b_`
+-- pone éste justo detrás y delante de `oportunidad_veredicto_guard`, que así encuentra el
+-- candado ya tomado antes de leer nada.
+create function portafolio_candado_del_reto_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+declare
+  v_reto uuid;
+  v_fila record;
+begin
+  v_fila := coalesce(new, old);
+  if tg_table_name = 'oportunidad' then
+    v_reto := v_fila.reto_id;
+  else
+    select o.reto_id into v_reto
+      from oportunidad o
+      where o.id = v_fila.oportunidad_id and o.workspace_id = v_fila.workspace_id;
+  end if;
+  if v_reto is not null then
+    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+  end if;
+  return v_fila;
+end;
+$fn$;
+
+revoke execute on function portafolio_candado_del_reto_guard() from public;
+
+create trigger b_candado_del_reto
+  before insert or update or delete on oportunidad
+  for each row execute function portafolio_candado_del_reto_guard();
+create trigger b_candado_del_reto
+  before insert or delete on oportunidad_insight
+  for each row execute function portafolio_candado_del_reto_guard();
 
 create trigger oportunidad_veredicto_guard
   before update on oportunidad

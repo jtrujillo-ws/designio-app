@@ -390,4 +390,145 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
         where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
     }
   });
+
+  /**
+   * Lo que G3 certificó no se cambia por debajo. La ventana estaba solo en el INSERT.
+   *
+   * Nació escrita únicamente en `oportunidad_insert`, y ahí dejaba abierto justo lo que más
+   * importa: con G3 aprobado se podía BORRAR el último enlace de una oportunidad viva y dejar
+   * el gate firmado incumpliendo SYS-15, sin que nadie reabriera nada. El guard del gate no lo
+   * desmiente porque solo corre al aprobar.
+   *
+   * Ahora la ventana la miran las CUATRO políticas del portafolio, y por eso está escrita una
+   * sola vez (`reto_admite_portafolio`): cuatro copias de la misma condición es cómo empezó
+   * esto — con una.
+   */
+  it('con G3 aprobado, el portafolio no se toca: ni se añade, ni se enlaza, ni se desenlaza', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio ventana', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-VEN', 'Reto de la ventana', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoV = r!.id as string;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${retoV}, 'P-VEN', 'Proyecto de la ventana', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const proyectoV = p!.id as string;
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoV}, 3, 'sponsor') returning id`;
+    const gateV = g!.id as string;
+    await admin`insert into checklist_item
+      (workspace_id, gate_id, orden, texto, estado, insight_id)
+      values (${ws}, ${gateV}, 0, 'El portafolio está razonado', 'cumplido', ${insightValidado})`;
+    // La etapa 3 instanciada y COMPLETADA: reabrirla («en-curso») es lo que vuelve a abrir la ventana.
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoV}, 3, 'Conceptualización', 'completada')`;
+
+    // Antes de firmar: una viva y trazada, y otra que se quedará por decidir.
+    const viva = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId: retoV, pregunta: 'HMW de la ventana', prioridad: 0, prioridadRazon: '',
+    });
+    await enlazarInsight(leadId, {
+      workspaceId: ws, oportunidadId: viva.oportunidadId, insightId: insightValidado,
+    });
+    await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+      aprobado_en = now() where id = ${gateV}`;
+
+    // Y a partir de aquí, nada. El desenlace es el caso serio: dejaría G3 firmado sobre una
+    // oportunidad viva sin traza.
+    await expect(
+      desenlazarInsight(leadId, {
+        workspaceId: ws, oportunidadId: viva.oportunidadId, insightId: insightValidado,
+      }),
+    ).rejects.toThrow(ErrorOportunidad);
+    await expect(
+      crearOportunidad(leadId, {
+        workspaceId: ws, retoId: retoV, pregunta: 'HMW tardía', prioridad: 0, prioridadRazon: '',
+      }),
+    ).rejects.toThrow(/G3 ya está aprobado/);
+    await expect(
+      priorizarOportunidad(leadId, {
+        workspaceId: ws, oportunidadId: viva.oportunidadId, prioridad: 9, prioridadRazon: '',
+      }),
+    ).rejects.toThrow(ErrorOportunidad);
+    await expect(
+      decidirOportunidad(leadId, {
+        workspaceId: ws, oportunidadId: viva.oportunidadId, estado: 'aprobada', veredictoRazon: '',
+      }),
+    ).rejects.toThrow(ErrorOportunidad);
+    // El enlace sigue donde estaba: la afirmación del gate se mantiene.
+    const enlaces = await admin`select 1 from oportunidad_insight
+      where oportunidad_id = ${viva.oportunidadId}`;
+    expect(enlaces.length).toBe(1);
+
+    // Y REABRIR la etapa 3 vuelve a abrir la ventana, que es la salida que I1 prevé.
+    await admin`update etapa_instancia set estado = 'en-curso'
+      where proyecto_id = ${proyectoV} and numero = 3`;
+    await priorizarOportunidad(leadId, {
+      workspaceId: ws, oportunidadId: viva.oportunidadId, prioridad: 9, prioridadRazon: 'Reabierta',
+    });
+    const [tras] = await admin`select prioridad from oportunidad where id = ${viva.oportunidadId}`;
+    expect(tras!.prioridad).toBe(9);
+  });
+
+  /**
+   * Y la CLAVE del candado tiene que ser la misma que la de la aprobación del gate.
+   *
+   * La primera versión de este módulo tomaba un candado por oportunidad. Con esa clave, borrar
+   * un enlace y firmar G3 no se ven: cada uno bloquea lo suyo, tocan filas distintas, las dos
+   * comprobaciones pasan sobre fotos que ya no valen y las dos commitean. Queda G3 firmado
+   * sobre una oportunidad viva sin traza, sin que ninguna regla fallara.
+   *
+   * La sonda usa el candado directamente, sin pasar por el servicio: lo que se afirma es que
+   * la ESCRITURA queda serializada contra `designio:reto:` —la clave del guard del gate— venga
+   * de donde venga, y eso es una propiedad del trigger, no del servicio.
+   */
+  it('tocar el portafolio espera al candado del reto, que es el de la aprobación del gate', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio candado', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-CAN', 'Reto del candado', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoC = r!.id as string;
+    const o = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId: retoC, pregunta: 'HMW del candado', prioridad: 0, prioridadRazon: '',
+    });
+
+    let soltar: () => void = () => {};
+    const enVuelo = new Promise<void>((r2) => {
+      soltar = r2;
+    });
+    // Quien firma G3 toma esta clave antes de mirar el portafolio.
+    const comoElGate = admin.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+      await enVuelo;
+    });
+    await new Promise((r2) => setTimeout(r2, 150));
+
+    const enlace = enlazarInsight(leadId, {
+      workspaceId: ws, oportunidadId: o.oportunidadId, insightId: insightValidado,
+    });
+    const veredicto = enlace.then(
+      () => 'enlazó',
+      (e: Error) => `rechazó: ${e.message}`,
+    );
+    // Con el candado bien puesto, el enlace NO puede haber terminado: está esperando.
+    await new Promise((r2) => setTimeout(r2, 1500));
+    const termino = await Promise.race([
+      veredicto.then(() => true),
+      new Promise<boolean>((r2) => setTimeout(() => r2(false), 50)),
+    ]);
+    expect(termino, 'el enlace no esperó al candado que toma la aprobación del gate').toBe(false);
+
+    soltar();
+    await comoElGate;
+    expect(await veredicto).toBe('enlazó');
+  }, 20000);
 });

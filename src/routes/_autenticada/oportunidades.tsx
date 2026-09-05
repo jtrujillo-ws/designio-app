@@ -167,6 +167,7 @@ function PantallaOportunidades() {
                     type="number"
                     min={0}
                     max={1000}
+                    step={1}
                     style={{ width: 110 }}
                     value={prioridad}
                     onChange={(e) => setPrioridad(e.currentTarget.value)}
@@ -191,7 +192,7 @@ function PantallaOportunidades() {
                               workspaceId: datos.workspaceId,
                               retoId: reto.retoId,
                               pregunta: pregunta.trim(),
-                              prioridad: Number(prioridad) || 0,
+                              prioridad: Math.min(1000, Math.max(0, Math.round(Number(prioridad) || 0))),
                               prioridadRazon: prioridadRazon.trim(),
                             },
                           }),
@@ -208,7 +209,9 @@ function PantallaOportunidades() {
 
             {reto.oportunidades.length === 0 && (
               <span style={{ font: '400 13px var(--font-sans)', color: 'var(--text-muted)' }}>
-                Sin portafolio todavía. G3 no se aprueba sin al menos una HMW aprobada.
+                Sin portafolio todavía. G3 no exige que lo haya —eso lo pide el checklist de
+                la etapa, si su perfil lo pide—; lo que exige es que toda HMW viva se apoye en
+                al menos un insight.
               </span>
             )}
 
@@ -326,11 +329,23 @@ function PantallaOportunidades() {
                       type="number"
                       min={0}
                       max={1000}
+                      step={1}
                       style={{ width: 100 }}
                       defaultValue={String(o.prioridad)}
                       aria-label={`Prioridad de ${o.pregunta}`}
                       onBlur={(e) => {
-                        const valor = Number(e.currentTarget.value);
+                        // Un `type="number"` vacío, o con «e» o «-» dentro, da `NaN` o un
+                        // decimal: mandarlo sería estrellarse contra el validador con un
+                        // mensaje que no dice nada. Se recorta al rango del contrato y, si no
+                        // hay número, se repone el valor que había — que es lo que el usuario
+                        // ve y lo que evita dejar el campo mintiendo.
+                        const crudo = Number(e.currentTarget.value);
+                        if (!Number.isFinite(crudo)) {
+                          e.currentTarget.value = String(o.prioridad);
+                          return;
+                        }
+                        const valor = Math.min(1000, Math.max(0, Math.round(crudo)));
+                        e.currentTarget.value = String(valor);
                         if (valor === o.prioridad) return;
                         void ejecutar(
                           () =>

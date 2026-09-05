@@ -1,5 +1,4 @@
 import '@/lib/server-only';
-import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import type {
@@ -37,14 +36,17 @@ function comoErrorDeDominio(e: unknown): never {
   throw e;
 }
 
-/** Candado por oportunidad: serializa enlazar/desenlazar contra decidir. Sin él un enlace
- * puede entrar mientras otra transacción aprueba —las dos ven 'propuesta' commiteado y tocan
- * filas distintas— y queda una HMW aprobada sobre una traza que su guard nunca miró. Mismo
- * espacio de nombres que los demás candados del método. */
-async function candadoDeOportunidad(tx: TransactionSql, oportunidadId: string): Promise<void> {
-  await tx`select pg_advisory_xact_lock(hashtextextended('designio:oportunidad:' || ${oportunidadId}, 42))`;
-}
-
+/**
+ * NO hay candado en este módulo, y es deliberado. Toda escritura del portafolio pasa por
+ * `b_candado_del_reto`, que toma `designio:reto:` —la misma clave que toma
+ * `gate_aprobar_suficiencia_guard` al firmar G3— antes de que corra ningún guard de fila.
+ * Un candado aquí, además, tendría que ser el MISMO o crearía un segundo orden: la primera
+ * versión de este módulo tomaba uno por oportunidad, y con esa clave el borrado de un enlace
+ * y la aprobación de G3 no se veían — cada uno bloqueaba lo suyo, los dos pasaban su
+ * comprobación y los dos commiteaban, dejando G3 firmado sobre una oportunidad viva sin
+ * traza. Serializar en la base cubre además a quien escribe por SQL directo, que es el
+ * escritor que esto existe para cerrar.
+ */
 export async function crearOportunidad(
   actorId: string,
   entrada: CrearOportunidad,
@@ -100,7 +102,6 @@ export async function crearOportunidad(
 export async function enlazarInsight(actorId: string, entrada: EnlazarInsight): Promise<void> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    await candadoDeOportunidad(tx, entrada.oportunidadId);
     try {
       const filas = await tx`
         insert into oportunidad_insight (oportunidad_id, insight_id, workspace_id)
@@ -131,7 +132,6 @@ export async function enlazarInsight(actorId: string, entrada: EnlazarInsight): 
 export async function desenlazarInsight(actorId: string, entrada: EnlazarInsight): Promise<void> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    await candadoDeOportunidad(tx, entrada.oportunidadId);
     const filas = await tx`
       delete from oportunidad_insight
       where oportunidad_id = ${entrada.oportunidadId}
@@ -174,7 +174,6 @@ export async function decidirOportunidad(
 ): Promise<void> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    await candadoDeOportunidad(tx, entrada.oportunidadId);
     let fila;
     try {
       // `decidido_por` y `decidido_en` NO se escriben aquí aunque el grant los incluya: los

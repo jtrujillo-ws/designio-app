@@ -363,13 +363,63 @@ begin
     raise exception 'esa reapertura deja decisiones aguas abajo en pie: reabrir una etapa pone «en-revisión» las decisiones que se apoyaban en lo reabierto, y un registro sin esa propagación abre la ventana sin cuestionar nada (RF-04.9)';
   end if;
 
+  -- ── Y NINGUNA DECISIÓN SE MARCA FUERA DE ALGÚN ALCANCE ──
+  -- La comprobación de arriba mira en una sola dirección —que no quede nada del alcance sin
+  -- marcar— y por el otro lado no miraba nada: declarando UN insight se podían mover a
+  -- «en-revisión» TODAS las decisiones aguas abajo. Las que sobran desaparecen de lo vigente
+  -- sin que nadie las cuestionara, y el evento las presenta como consecuencia de una
+  -- reapertura que no las nombra.
+  --
+  -- Se pregunta por «alguna reapertura de ESTA transacción» y no por «ésta»: dos reaperturas
+  -- legítimas en la misma transacción marcan cada una lo suyo, y exigir que todo caiga bajo la
+  -- fila que se está comprobando rechazaría la segunda. `xmin` y no `reabierto_en = now()`
+  -- para identificarlas: la superficie concedida deja escribir esa columna, y aquí la
+  -- pertenencia se usa para PERMITIR.
+  if exists (
+    select 1 from decision d
+      join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id
+    where d.proyecto_id = new.proyecto_id and d.workspace_id = new.workspace_id
+      and d.estado = 'en-revision'
+      and d.xmin = pg_current_xact_id()::xid
+      and not exists (
+        select 1 from reapertura_etapa r
+        where r.proyecto_id = d.proyecto_id and r.workspace_id = d.workspace_id
+          and r.xmin = pg_current_xact_id()::xid
+          and g.numero >= r.etapa_numero
+          and (r.alcance = 'etapa-completa'
+            or exists (select 1 from decision_insight di
+                 join reapertura_insight ri on ri.insight_id = di.insight_id
+                   and ri.workspace_id = di.workspace_id
+                 where di.decision_id = d.id and di.workspace_id = d.workspace_id
+                   and ri.reapertura_id = r.id)))
+  ) then
+    raise exception 'esa reapertura pone en revisión decisiones que su alcance no cubre: declarar unos insights y marcar todo lo de aguas abajo retira de lo vigente decisiones que nadie cuestionó, y el rastro las presenta como consecuencia de esta reapertura (RF-04.9)';
+  end if;
+
+  -- El número, contado DENTRO DEL ALCANCE de esta reapertura y no de la transacción entera.
+  -- Escrito solo con `xmin` decía «lo que esta transacción movió aguas abajo», que no es lo
+  -- mismo por dos lados: en una reapertura DECLARADA metía en la cuenta decisiones que su
+  -- alcance no nombra, y con dos reaperturas en la misma transacción cada una veía también lo
+  -- de la otra.
+  --
+  -- Lo que queda es una regla que sí se puede recontar: «las decisiones del alcance de ESTA
+  -- fila que esta transacción movió». Con alcances que se solapan —dos etapas completas— una
+  -- decisión cuenta para las dos, y eso es correcto: está en los dos alcances. Atribuir cada
+  -- decisión a UNA reapertura pediría una tabla de enlace que no existe, y fingirla con `xmin`
+  -- es justo lo que se está quitando.
   select count(*)::int into v_marcadas
     from decision d
     join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id
    where d.proyecto_id = new.proyecto_id and d.workspace_id = new.workspace_id
      and g.numero >= new.etapa_numero
      and d.estado = 'en-revision'
-     and d.xmin = pg_current_xact_id()::xid;
+     and d.xmin = pg_current_xact_id()::xid
+     and (new.alcance = 'etapa-completa'
+       or exists (select 1 from decision_insight di
+            join reapertura_insight ri on ri.insight_id = di.insight_id
+              and ri.workspace_id = di.workspace_id
+            where di.decision_id = d.id and di.workspace_id = d.workspace_id
+              and ri.reapertura_id = new.id));
 
   -- ── Y EL NÚMERO QUE LA FILA DECLARA ES EL QUE SE PUEDE CONTAR ──
   -- Aquí lo dejé a medias a propósito y estaba mal: el evento llevaba el número contado y la

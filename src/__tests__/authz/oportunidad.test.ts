@@ -742,6 +742,135 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
   });
 
   /**
+   * Y el ALCANCE de una reapertura acota en las dos direcciones.
+   *
+   * El guard de arriba miraba en una sola: que no quedara nada del alcance sin marcar. Por el
+   * otro lado no miraba nada, y el conteo se hacía con `xmin` a secas —«lo que esta transacción
+   * movió aguas abajo»—, que no es lo mismo que «lo de esta reapertura». Los dos agujeros que
+   * eso deja, medidos contra la base:
+   *
+   *   · Declarando UN insight se movían a «en-revisión» TODAS las decisiones de aguas abajo. Las
+   *     que sobran salen de lo vigente sin que nadie las cuestionara, y el evento las presenta
+   *     como consecuencia de una reapertura que no las nombra.
+   *   · Y con dos reaperturas legítimas en la misma transacción, cada una veía también lo de la
+   *     otra: el número honesto —lo que cada una marcó— se RECHAZABA, y el que la base exigía
+   *     era el inflado. La columna que la pantalla pinta pedía mentir para pasar.
+   *
+   * Las tres formas de abajo aíslan cada mitad: la primera solo la arregla el rechazo por
+   * alcance, y las dos de la transacción doble solo el conteo acotado.
+   */
+  it('una reapertura marca lo de su alcance, y con otra al lado cada una cuenta lo suyo', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio del alcance', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo,
+       creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-ALC', 'Reto del alcance', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${r!.id as string}, 'P-ALC', 'Proyecto', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const proyectoA = p!.id as string;
+
+    // Dos etapas cerradas con su gate, y dos insights: el alcance de cada reapertura.
+    for (const [numero, nombre, rol] of [
+      [3, 'Conceptualización', 'sponsor'],
+      [4, 'Exploración de soluciones', 'lead-boutique'],
+    ] as const) {
+      await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+        values (${ws}, ${proyectoA}, ${numero}, ${nombre}, 'completada')`;
+      await admin`insert into gate_instancia (workspace_id, proyecto_id, numero, rol_aprobador)
+        values (${ws}, ${proyectoA}, ${numero}, ${rol})`;
+    }
+    const insightDe = async (titulo: string) => {
+      const [i] = await admin`insert into insight (workspace_id, titulo, resumen, creado_por)
+        values (${ws}, ${titulo}, 'Resumen', ${leadId}) returning id`;
+      return i!.id as string;
+    };
+    const insightA = await insightDe('Insight del alcance A');
+    const insightB = await insightDe('Insight del alcance B');
+    const decisionDe = async (etapa: number, titulo: string, insightId: string) => {
+      const [g] = await admin`select id from gate_instancia
+        where proyecto_id = ${proyectoA} and workspace_id = ${ws} and numero = ${etapa}`;
+      const [d] = await admin`insert into decision
+        (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, estado, decidido_por)
+        values (${ws}, ${proyectoA}, ${g!.id as string}, 'diseno', ${titulo}, 'Fundamento',
+                'vigente', ${leadId}) returning id`;
+      const id = d!.id as string;
+      await admin`insert into decision_insight (workspace_id, decision_id, insight_id)
+        values (${ws}, ${id}, ${insightId})`;
+      return id;
+    };
+    const deA = await decisionDe(3, 'Se elige el flujo corto', insightA);
+    const deB = await decisionDe(4, 'Se descarta la pasarela propia', insightB);
+    // La ajena: aguas abajo de la etapa 3 y FUERA del alcance de las dos reaperturas —cuelga
+    // de B, y la que declara B es la de la etapa 4, que no la alcanza—. Es la que sobraba.
+    const ajena = await decisionDe(3, 'Se acuerda el tono de los avisos', insightB);
+
+    const reabrirPor = (
+      filas: { etapa: number; insight: string; marcadas: number }[],
+      decisiones: string[],
+    ) =>
+      conUsuario(leadId, async (tx) => {
+        for (const f of filas) {
+          const [re] = await tx`insert into reapertura_etapa
+            (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+             reabierto_por)
+            values (${ws}, ${proyectoA}, ${f.etapa}, ${`Motivo de la ${f.etapa}`}, 'declarado',
+                    ${f.marcadas}, ${leadId}) returning id`;
+          await tx`insert into reapertura_insight (workspace_id, reapertura_id, insight_id)
+            values (${ws}, ${re!.id as string}, ${f.insight})`;
+        }
+        await tx`update decision set estado = 'en-revision'
+          where id in ${tx(decisiones)} and workspace_id = ${ws}`;
+        await tx`update etapa_instancia set estado = 'en-curso'
+          where proyecto_id = ${proyectoA} and workspace_id = ${ws}
+            and numero in ${tx(filas.map((f) => f.etapa))}`;
+      });
+
+    // 1. Un insight declarado y TODO lo de aguas abajo marcado. El número que declara es el
+    //    honesto —una— y aun así sobra una decisión: `ajena` sale de lo vigente sin que esta
+    //    reapertura la nombre. Es el caso que solo el rechazo por alcance ve.
+    await expect(
+      reabrirPor([{ etapa: 3, insight: insightA, marcadas: 1 }], [deA, ajena]),
+    ).rejects.toThrow(/su alcance no cubre/);
+
+    // 2. Dos reaperturas, y la primera declara lo que movió la TRANSACCIÓN entera. Contra la
+    //    base era el único número que pasaba; ahora es el que no cuadra.
+    await expect(
+      reabrirPor(
+        [
+          { etapa: 3, insight: insightA, marcadas: 2 },
+          { etapa: 4, insight: insightB, marcadas: 1 },
+        ],
+        [deA, deB],
+      ),
+    ).rejects.toThrow(/dice haber marcado 2/);
+
+    // 3. Y las dos honestas, cada una con lo suyo: la mitad buena de las dos correcciones.
+    await reabrirPor(
+      [
+        { etapa: 3, insight: insightA, marcadas: 1 },
+        { etapa: 4, insight: insightB, marcadas: 1 },
+      ],
+      [deA, deB],
+    );
+    const [quieta] = await admin`select estado from decision where id = ${ajena}`;
+    expect(quieta!.estado as string, 'la de fuera del alcance no se movió').toBe('vigente');
+    const eventos = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'EtapaReabierta'
+        and payload->>'proyectoId' = ${proyectoA}
+      order by payload->>'etapa'`;
+    expect(eventos.map((e) => (e.payload as Record<string, unknown>).etapa)).toEqual([3, 4]);
+    expect(
+      eventos.map((e) => (e.payload as Record<string, unknown>).decisionesMarcadas),
+      'cada reapertura responde por lo suyo, no por lo de la transacción',
+    ).toEqual([1, 1]);
+  });
+
+  /**
    * Y la ventana se cierra cuando el RETO deja de admitir trabajo de método.
    *
    * Escrita solo con la puerta de G3, medía una etapa y daba por hecho el resto del método. Eso

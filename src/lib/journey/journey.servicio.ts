@@ -1,4 +1,5 @@
 import '@/lib/server-only';
+import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { TIPOS_CON_CATALOGO } from './journey.schemas';
@@ -457,7 +458,39 @@ export async function journeyCompleto(
 ): Promise<JourneyCompleto | null> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const [fila] = await tx`
+    return leerJourneyCompleto(tx, workspaceId, journeyId);
+  });
+}
+
+/**
+ * El grafo entero, DENTRO de una transacción que ya está abierta.
+ *
+ * Se separa de `journeyCompleto` porque el pipeline de AI necesita leer el mismo grafo sin
+ * abrir su propia conexión: C5 propone cómo cerrar las señales que `validarJourney` emite
+ * sobre ÉL, y esas señales tienen que salir del mismo grafo que se le enseñó al modelo. Con
+ * dos lecturas distintas —una para el prompt, otra para comprobar la respuesta— bastaría una
+ * edición en medio para que las dos discreparan, y la comprobación empezaría a rechazar
+ * remediaciones legítimas o a admitir las de un grafo que ya no existe.
+ *
+ * Una definición, dos usos: la RLS la sigue poniendo la conexión de quien llama.
+ */
+/**
+ * El MISMO lector para uno y para muchos.
+ *
+ * Existe en plural porque el barrido de candidatos de C5 lee un grafo por journey mirado, y
+ * eso es hasta trescientas idas y vueltas antes de que la pantalla de propuestas pinte nada.
+ * Y existe UNA sola vez, en vez de una consulta por cada forma, porque de esta proyección sale
+ * la HUELLA del material de C5: dos copias que se desincronicen en una coma de `order by`
+ * declararían obsoleto un informe que está al día.
+ */
+export async function leerJourneysCompletos(
+  tx: TransactionSql,
+  workspaceId: string,
+  journeyIds: string[],
+): Promise<JourneyCompleto[]> {
+  if (journeyIds.length === 0) return [];
+  {
+    const filas = await tx`
       select j.id, j.servicio_id, s.nombre as servicio_nombre, j.reto_id, j.proyecto_id,
         j.tipo, j.nombre, j.descripcion,
         coalesce((
@@ -472,12 +505,19 @@ export async function journeyCompleto(
               where a.id = n.arquetipo_id and a.workspace_id = n.workspace_id),
             'evidencias', coalesce((
               select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo)
-                order by e.titulo)
+                order by e.titulo, e.id)
               from journey_nodo_evidencia ne
               join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
               where ne.nodo_id = n.id and ne.workspace_id = n.workspace_id
             ), '[]'::jsonb))
-            order by n.tipo, n.orden)
+            -- Orden TOTAL, el mismo que el del snapshot y por la misma razón dicha allí: sin
+            -- desempate, dos filas con el mismo (tipo, orden) —y nada lo impide: no hay único
+            -- sobre ellos— pueden salir en distinto orden en dos lecturas del mismo grafo.
+            -- Aquí eso cuesta más que una forma inestable: de esta proyección sale la HUELLA
+            -- del material de C5, y una huella que cambia sin que cambie el grafo no es una
+            -- huella — declararía obsoleto un informe que está al día, y rechazaría una
+            -- respuesta pagada por un cambio que no hubo.
+            order by n.tipo, n.orden, n.id)
           from journey_nodo n
           where n.journey_id = j.id and n.workspace_id = j.workspace_id
         ), '[]'::jsonb) as nodos,
@@ -485,7 +525,9 @@ export async function journeyCompleto(
           select jsonb_agg(jsonb_build_object(
             'id', a.id, 'origenId', a.origen_id, 'destinoId', a.destino_id,
             'tipo', a.tipo, 'condicion', a.condicion)
-            order by a.creado_en)
+            -- Con desempate por lo mismo: creado_en empata entre aristas creadas en la
+            -- misma transacción, que es lo normal al montar un grafo de una vez.
+            order by a.creado_en, a.id)
           from journey_arista a
           where a.journey_id = j.id and a.workspace_id = j.workspace_id
         ), '[]'::jsonb) as aristas,
@@ -509,9 +551,8 @@ export async function journeyCompleto(
         ), '[]'::jsonb) as arquetipos
       from journey j
       join servicio s on s.id = j.servicio_id and s.workspace_id = j.workspace_id
-      where j.id = ${journeyId} and j.workspace_id = ${workspaceId}`;
-    if (!fila) return null;
-    return {
+      where j.id = any(${journeyIds}::uuid[]) and j.workspace_id = ${workspaceId}`;
+    return filas.map((fila) => ({
       id: fila.id as string,
       servicioId: fila.servicio_id as string,
       servicioNombre: fila.servicio_nombre as string,
@@ -524,8 +565,18 @@ export async function journeyCompleto(
       aristas: fila.aristas as JourneyCompleto['aristas'],
       snapshots: fila.snapshots as JourneyCompleto['snapshots'],
       arquetipos: fila.arquetipos as JourneyCompleto['arquetipos'],
-    };
-  });
+    }));
+  }
+}
+
+/** Un journey, por el lector de arriba: una definición de la proyección, dos formas de
+ * pedirla. */
+export async function leerJourneyCompleto(
+  tx: TransactionSql,
+  workspaceId: string,
+  journeyId: string,
+): Promise<JourneyCompleto | null> {
+  return (await leerJourneysCompletos(tx, workspaceId, [journeyId]))[0] ?? null;
 }
 
 /** Página de la lista de journeys. El corte duro dejaba fuera para siempre a los más

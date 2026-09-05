@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
-import { CONFIANZA_PROPUESTA, type CapacidadActiva } from './ai.schemas';
+import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
+import {
+  CONFIANZA_PROPUESTA,
+  MAX_REMEDIACIONES,
+  type CapacidadActiva,
+} from './ai.schemas';
 
 /**
  * La marca con la que `check:bundle` sabe si estos validadores llegaron al navegador.
@@ -118,13 +123,14 @@ export type ContenidoCriterio = z.infer<typeof ContenidoCriterioSchema>;
  * Un identificador que el modelo COPIA del material, en la forma en que lo escribe la base.
  *
  * `z.string().uuid()` admite los hexadecimales en mayúscula, y Postgres almacena el uuid en su
- * forma canónica —minúscula—. Así que un id válido copiado en mayúscula pasaba la validación,
- * pasaba el guard del insert (que compara con `lower(...)` en su alcance) y luego NO encontraba
- * nada: el guard diferido de materialización compara el id propuesto contra el almacenado tal
- * cual, así que cada intento de aceptar esa propuesta —por lo demás perfectamente válida— se
- * deshacía entero. Y del lado de la aplicación pasa lo mismo sin ruido: el mapa de etiquetas y
- * el pajar de cada cita se indexan por el id que devuelve la base, y una clave en mayúscula no
- * acierta ninguno.
+ * forma canónica —minúscula—. Así que un id válido copiado en mayúscula pasaba la validación y
+ * luego NO acertaba ninguna comparación, y el síntoma cambia con la capacidad: en C2, el guard
+ * diferido de materialización compara el id propuesto contra el almacenado tal cual, así que
+ * cada intento de aceptar esa propuesta —por lo demás perfecta— se deshacía entero; en C5, la
+ * comprobación de que una señal remediada es de las que la validación emitió descarta el
+ * informe completo —después de pagarlo— por «señal inventada». Y en las dos, del lado de la
+ * pantalla, el mapa de etiquetas se indexa por el id que devuelve la base y una clave en
+ * mayúscula no acierta ninguna.
  *
  * Se normaliza AL PARSEAR, que es el único sitio donde se arregla una vez para todos los
  * lectores: lo que se persiste es canónico y las comparaciones —SQL y TypeScript— vuelven a ser
@@ -269,13 +275,64 @@ export const ContenidoInsightSchema = z
   .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
 export type ContenidoInsight = z.infer<typeof ContenidoInsightSchema>;
 
+/**
+ * C5 — cómo CERRAR cada señal que la validación del grafo emitió (SPEC-08 §30, RF-05.6).
+ *
+ * INFORMATIVO, como CT. Y con una asimetría deliberada respecto a las otras capacidades: aquí
+ * el modelo NO dice qué está mal. Eso ya lo dice `validarJourney`, que es determinista y no se
+ * equivoca; pedirle al modelo que lo repita sería cambiar una respuesta exacta por una
+ * probable. Lo que se le pide es lo otro: dada una señal REAL, qué hacer con ella en ESTE
+ * grafo — y eso hay que leerlo entero para decirlo.
+ *
+ * Por eso cada remediación se identifica por `(nodoId, codigo)`: es el par que nombra una
+ * señal ya emitida, y el servicio comprueba que esté entre las que produjo la MISMA lectura
+ * del grafo con la que se armó el prompt. Una remediación de una señal inexistente es una
+ * avería inventada, y de las caras: manda a alguien a arreglar un grafo que estaba bien.
+ *
+ * `remediaciones` PUEDE venir vacío: un grafo sin señales es un resultado legítimo, y además
+ * el bueno.
+ */
+export const ContenidoRemediacionJourneySchema = z
+  .object({
+    resumen: z.string().trim().min(1).max(2000),
+    remediaciones: z
+      .array(
+        z.object({
+          /* El nodo que la señal nombra, por su id, copiado del material. */
+          nodoId: IdCopiadoDelMaterial,
+          /* Y el código de la señal, del catálogo de `validarJourney`. Derivado de él, no
+           * copiado: un código nuevo entra aquí el día que la validación lo emita. */
+          codigo: z.enum(CODIGOS_SENAL),
+          comoCerrarlo: z.string().trim().min(1).max(1000),
+        }),
+      )
+      /*
+       * Al menos UNA, y como mucho `MAX_REMEDIACIONES`. El mínimo no estaba y hacía falta: un
+       * informe de cero remediaciones sobre un grafo CON señales es una llamada pagada que no
+       * dice nada, y el servicio ya se niega a pedir uno sobre un grafo limpio — así que la
+       * lista vacía no describe ningún caso legítimo.
+       *
+       * El techo lleva nombre porque lo leen los dos lados de la misma regla: éste y la
+       * negativa a generar cuando el grafo tiene más señales de las que este contrato puede
+       * llevar. Con el número en un solo sitio no puede haber un grafo que se acepte para
+       * pedir y cuya respuesta se descarte DESPUÉS de pagarla por venir corta.
+       */
+      .min(1)
+      .max(MAX_REMEDIACIONES),
+    citas: CitasSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoRemediacionJourney = z.infer<typeof ContenidoRemediacionJourneySchema>;
+
 /** Contenido de una propuesta: una de las formas tipadas, nunca un jsonb libre — así el
  * panel, el servicio y la corrección hablan del mismo objeto sin castings. */
 export type ContenidoPropuesta =
   | ContenidoExtraccion
   | ContenidoCriterio
   | ContenidoAsistenteGate
-  | ContenidoInsight;
+  | ContenidoInsight
+  | ContenidoRemediacionJourney;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -305,6 +362,7 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   C0: ContenidoCriterioSchema,
   CT: ContenidoAsistenteGateSchema,
   C2: ContenidoInsightSchema,
+  C5: ContenidoRemediacionJourneySchema,
 };
 
 /**
@@ -356,6 +414,9 @@ export const CITAS_DEL_CONTENIDO: Record<
     (c as ContenidoInsight).afirmaciones.flatMap((a) =>
       a.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId })),
     ),
+  // C5 las guarda arriba, como las tres primeras: sus remediaciones no son el sujeto de las
+  // citas —lo es el grafo entero—, así que no hay nada que anidar.
+  C5: (c) => (c as ContenidoRemediacionJourney).citas,
 };
 
 /**
@@ -391,6 +452,9 @@ export const TESTIMONIO_ADICIONAL: Record<
     motivo:
       'Las contradicciones de un insight no se corrigen: son la evidencia que va en contra de lo que propone, y esconderla es la manera más limpia de vender una conclusión. Corrige el resto, o rechaza el insight.',
   },
+  // C5 no guarda nada aparte de sus citas: sus remediaciones son el consejo, y ése SÍ se
+  // corrige —para eso está la revisión humana—.
+  C5: null,
 };
 
 /**

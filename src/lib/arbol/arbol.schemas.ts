@@ -6,9 +6,21 @@ import { z } from 'zod';
  * Módulo compartido client/server: solo tipos y contratos, sin datos.
  */
 
-export const ArbolInputSchema = z
-  .object({ workspaceId: z.string().uuid().optional() })
-  .optional();
+export const ArbolInputSchema = z.object({ workspaceId: z.string().uuid().optional() }).optional();
+
+/**
+ * Quiénes dan de alta un servicio: los que arrancan el engagement (J1 «arranque en frío»:
+ * lead + admin cliente). Compartido entre la UI, que solo ofrece la fila a estos roles, y el
+ * re-check del servicio; la autoridad es la política `servicio_insert` de la base.
+ */
+export const ROLES_ALTA_SERVICIO = ['lead-boutique', 'admin-cliente'] as const;
+
+export const CrearServicioSchema = z.object({
+  workspaceId: z.string().uuid(),
+  nombre: z.string().trim().min(1, 'El nombre es obligatorio').max(200, 'Máximo 200 caracteres'),
+  descripcion: z.string().trim().max(2000, 'Máximo 2000 caracteres').default(''),
+});
+export type CrearServicio = z.infer<typeof CrearServicioSchema>;
 
 export type ProyectoArbol = {
   id: string;

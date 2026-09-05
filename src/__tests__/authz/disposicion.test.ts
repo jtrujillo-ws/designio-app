@@ -2095,6 +2095,8 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     const DECLARADAS: Record<string, string> = {
       'disposicion/disposicion.servicio.ts:ejecutarDisposicion':
         'ESCRIBE: invoca `ejecutar_disposicion`, que toma el candado del workspace y relee. La doctrina de aislamiento del esquema le exige READ COMMITTED, y la función lo comprueba y se niega bajo REPEATABLE READ.',
+      'ai/ai.servicio.ts:generarPropuestas#4 (ayudante sin resolver)':
+        'NO ES UNA PROYECCIÓN: es la comprobación semántica de la salida del modelo, y su única salida es lanzar o no. El censo no puede resolverla porque el ayudante se elige por registro (`COMPROBAR[capacidad]`), que es la forma de toda esta rebanada. Corre aquí para que el LIBRO pueda decir la verdad —una línea cerrada como `salida-valida` no se puede reetiquetar después: `llamada_completar` lleva `using (resultado = \'despachada\')`— y se vuelve a hacer DENTRO de la transacción que persiste, que es la que sí es atómica con la fila. Lo que esta lectura decide no se le enseña a nadie.',
     };
     /*
      * `exportarWorkspace` estuvo aquí y se ha ido, y el motivo es el hallazgo: ya fija

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LOOP_BANCO_ANDINO, destinoDeJourney } from '@/lib/loop/loop-data';
+import { JOURNEYS_DEL_LOOP, destinoDeJourney, journeyDelLoop } from '@/lib/loop/loop-data';
 import { etiquetaDeDestino } from '@/lib/destinos';
 
 /**
@@ -9,7 +9,7 @@ import { etiquetaDeDestino } from '@/lib/destinos';
  */
 describe('a dónde abre cada tarjeta del loop', () => {
   it('todos los journeys declaran una pantalla', () => {
-    expect(LOOP_BANCO_ANDINO.map((jl) => jl.pantalla)).toEqual([
+    expect(JOURNEYS_DEL_LOOP.map((jl) => jl.pantalla)).toEqual([
       'importacion',
       'proyecto',
       'insights',
@@ -18,6 +18,11 @@ describe('a dónde abre cada tarjeta del loop', () => {
       'design-versions',
       'proyecto',
     ]);
+  });
+
+  it('el catálogo se resuelve por número, no por posición', () => {
+    for (const jl of JOURNEYS_DEL_LOOP) expect(journeyDelLoop(jl.j)).toBe(jl);
+    expect(journeyDelLoop(6).titulo).toBe('Implementación y medición');
   });
 
   it('las pantallas sin parámetros abren siempre, haya o no proyecto', () => {

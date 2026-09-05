@@ -24,10 +24,13 @@ import {
   PROMPT_VERSION,
   promptAsistenteGate,
   promptCriterios,
+  promptRemediacionJourney,
   promptExtraccion,
   promptInsights,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
+  SISTEMA_REMEDIACION_JOURNEY,
+  type GrafoDelJourney,
   SISTEMA_EXTRACCION,
   SISTEMA_INSIGHTS,
 } from '../ai.prompts';
@@ -435,16 +438,103 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * `PROMPT_VERSION` NO se toca aquí — subirla habría partido en dos poblaciones que salieron
    * del mismo contrato, que es exactamente el daño que esta prueba existe para evitar.
    *
-   * C2 SÍ la sube, porque añade un sistema y un esquema de salida: es contrato nuevo. Y se
-   * salta la `.3` a propósito: esa la lleva C5, que va por delante en su propia rama. Saltar
-   * un número no cuesta nada —la versión es una ETIQUETA opaca que se guarda en el lineage,
-   * no un contador—, mientras que reutilizar la de otro sí: dos contratos distintos con la
-   * misma etiqueta son dos poblaciones que ya no se pueden separar, y no hay forma de
-   * deshacerlo después. La línea de `PROMPT_VERSION` colisiona en el merge entre las dos
-   * ramas, así que nadie la cruza en silencio; la que llegue segunda recalcula su huella,
-   * que en todo caso cambia porque `ESQUEMA_SALIDA` lleva las dos capacidades. */
-  const VERSION_ANOTADA = 'ai-2026-09-05.4';
-  const HUELLA_ANOTADA = 'e3ea0c0ba3cf46c1eb299e3a0e4948f8e017929170704108214860473446e3d0';
+   * C2 y C5 SÍ la suben, porque cada una añade un sistema y un esquema de salida: es contrato
+   * nuevo. Cada rama tomó su número y el MERGE toma otro, y saltar números no cuesta nada —la
+   * versión es una ETIQUETA opaca que se guarda en el lineage, no un contador— mientras que
+   * reutilizar el de otra sí: dos contratos distintos con la misma etiqueta son dos
+   * poblaciones que ya no se pueden separar, y no hay forma de deshacerlo después. La línea de
+   * `PROMPT_VERSION` colisiona en el merge a propósito, así que nadie la cruza en silencio; y
+   * la huella cambia de todos modos, porque `ESQUEMA_SALIDA` lleva ahora las dos. */
+  /** Un grafo mínimo con UNA señal: lo justo para que las ramas de C5 rindan un render
+   * estable y distinto entre sí. No sale de `validarJourney` —esto mide el PROMPT, no la
+   * validación— así que la señal se escribe a mano con la forma que la función produce. */
+  /** Cien nodos encadenados con etiquetas largas y la señal en el último. El cuerpo entero
+   * pasa de `MAX_MATERIAL` con holgura y sus transiciones caben: es el reparto que importa
+   * —la conectividad sobrevive, las etiquetas de los nodos que nadie señala no—. */
+  const GRAFO_GRANDE: GrafoDelJourney = (() => {
+    const id = (n: number) => `b1000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const nodos = Array.from({ length: 100 }, (_, i) => ({
+      id: id(i),
+      tipo: 'paso',
+      etiqueta: `Paso ${i} — ${'descripción larga del paso '.repeat(8)}`,
+      fase: 'Alta',
+      faseId: 'b1000000-0000-4000-8000-0000000000fa',
+      responsable: 'Front',
+      evidencias: 0,
+    }));
+    return {
+      nodos,
+      aristas: nodos.slice(0, -1).map((n, i) => ({
+        origen: n.id,
+        destino: id(i + 1),
+        tipo: 'transicion',
+        condicion: '',
+      })),
+      senales: [
+        {
+          codigo: 'paso-sin-salida',
+          severidad: 'media',
+          nodoId: id(99),
+          mensaje: 'El último paso no tiene salida.',
+        },
+      ],
+    };
+  })();
+
+  const GRAFO_DE_PRUEBA: GrafoDelJourney = {
+    nodos: [
+      {
+        id: 'b1000000-0000-4000-8000-000000000001',
+        tipo: 'paso',
+        etiqueta: 'Recibir documento',
+        fase: 'Alta',
+        faseId: 'b1000000-0000-4000-8000-0000000000fa',
+        responsable: 'Front',
+        evidencias: 1,
+      },
+      {
+        id: 'b1000000-0000-4000-8000-000000000002',
+        tipo: 'paso',
+        etiqueta: 'Verificar identidad',
+        fase: 'Alta',
+        faseId: 'b1000000-0000-4000-8000-0000000000fa',
+        responsable: '',
+        evidencias: 0,
+      },
+    ],
+    aristas: [
+      {
+        origen: 'b1000000-0000-4000-8000-000000000001',
+        destino: 'b1000000-0000-4000-8000-000000000002',
+        tipo: 'transicion',
+        condicion: '',
+      },
+    ],
+    senales: [
+      {
+        codigo: 'paso-sin-salida',
+        severidad: 'media',
+        nodoId: 'b1000000-0000-4000-8000-000000000002',
+        mensaje: 'El paso «Verificar identidad» no tiene ninguna transición de salida',
+      },
+    ],
+  };
+
+  /*
+   * C5 y C2 salieron en paralelo y cada una movió el contrato por su lado, así que las dos
+   * ramas subieron la versión a la vez sobre la misma base. C5 entró antes y se quedó con la
+   * `.9`; C2 sube a la `.10` al integrarse, en vez de conservar la que traía.
+   *
+   * La versión es una ETIQUETA opaca que se guarda en el lineage, no un contador: saltar un
+   * número no cuesta nada y compartirlo sí — dos contratos distintos con la misma etiqueta son
+   * dos poblaciones que ya no se pueden separar, y eso no se deshace después. Y sube al
+   * integrar aunque ninguna de las dos etiquetas haya salido todavía de su rama: el argumento
+   * «todavía no la usa nadie» es exactamente el que hay que no aceptar, porque es cierto hasta
+   * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
+   * del material guardado con el de hoy solo vale entre propuestas del mismo render.
+   */
+  const VERSION_ANOTADA = 'ai-2026-09-05.10';
+  const HUELLA_ANOTADA = '970a5f9178099ce0b0192ed0aeba729b26ebdbc670ac88c908d5605f325db567';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -624,6 +714,58 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       ],
       cuantos: 3,
     }),
+    // ── C5 ──
+    // El grafo es el cuerpo, y sus SEÑALES van dentro: lo que distingue a C5 de una
+    // capacidad que adivina es que la lista de defectos viene dada. Que ese bloque cambie de
+    // forma es un cambio de contrato tan real como cambiar el sistema.
+    journeyLlano: promptRemediacionJourney({
+      nombre: 'Alta de cuenta',
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: GRAFO_DE_PRUEBA,
+    }),
+    // Sin señales, el encargo es OTRO: se le pide confirmar que no hay nada, no remediar.
+    journeySinSenales: promptRemediacionJourney({
+      nombre: 'Alta de cuenta',
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: { ...GRAFO_DE_PRUEBA, senales: [] },
+    }),
+    journeyTruncado: promptRemediacionJourney({
+      nombre: 'Alta de cuenta',
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: {
+        ...GRAFO_DE_PRUEBA,
+        nodos: [{ ...GRAFO_DE_PRUEBA.nodos[0]!, etiqueta: CUERPO_LARGO }],
+      },
+    }),
+    /*
+     * Un grafo GRANDE, que es donde el orden del cuerpo deja de ser una preferencia. La señal
+     * nombra un nodo del final: con el grafo escrito en orden, ni ese nodo ni ninguna
+     * transición sobrevivían al recorte, y el modelo tenía que remediar a ciegas.
+     */
+    journeyGrande: promptRemediacionJourney({
+      nombre: 'Alta de cuenta',
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: GRAFO_GRANDE,
+    }),
+    journeyFichaVacia: promptRemediacionJourney({
+      nombre: '',
+      servicio: '',
+      tipo: '',
+      grafo: GRAFO_DE_PRUEBA,
+    }),
+    journeyConDelimitador: promptRemediacionJourney({
+      nombre: CON_DELIMITADOR,
+      servicio: 'Banca',
+      tipo: 'as-is',
+      grafo: {
+        ...GRAFO_DE_PRUEBA,
+        nodos: [{ ...GRAFO_DE_PRUEBA.nodos[0]!, etiqueta: CON_DELIMITADOR }],
+      },
+    }),
   };
 
   /** Los prompts se renderizan con entradas FIJAS, así que la huella cubre el esqueleto de
@@ -634,6 +776,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       sistemaCriterios: SISTEMA_CRITERIOS,
       sistemaAsistenteGates: SISTEMA_ASISTENTE_GATES,
       sistemaInsights: SISTEMA_INSIGHTS,
+      sistemaRemediacionJourney: SISTEMA_REMEDIACION_JOURNEY,
       esquemaSalida: ESQUEMA_SALIDA,
       maxMaterial: MAX_MATERIAL,
       maxCampoFicha: MAX_CAMPO_FICHA,
@@ -689,6 +832,70 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.insightsTruncado.alcanceResumen).toContain('truncado');
     expect(RAMAS.insightsFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.insightsConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
+    // C5: el id del nodo y el código de la señal llegan al material —son lo que la respuesta
+    // tiene que copiar—, el encargo cambia cuando no hay señales, el truncado avisa y la
+    // ficha vacía emite su «(sin dato)».
+    expect(RAMAS.journeyLlano.usuario).toContain('[b1000000-0000-4000-8000-000000000002]');
+    expect(RAMAS.journeyLlano.usuario).toContain('paso-sin-salida');
+    expect(RAMAS.journeyLlano.usuario).toContain('cerrar cada una de las 1 señales');
+    expect(RAMAS.journeySinSenales.usuario).toContain('no emitió ninguna señal');
+    expect(RAMAS.journeySinSenales.usuario).not.toContain('cerrar cada una');
+    expect(RAMAS.journeyTruncado.usuario).toContain('se truncó');
+    expect(RAMAS.journeyLlano.usuario).not.toContain('se truncó');
+    /*
+     * Y LAS SEÑALES SOBREVIVEN AL RECORTE, que es lo que hace utilizable un prompt truncado.
+     *
+     * El cuerpo se recorta a `MAX_MATERIAL`, así que lo que se escriba al final es lo primero
+     * que desaparece. Con las señales detrás de todos los nodos y todas las aristas, un grafo
+     * grande las perdía —enteras o a medias— mientras el prompt seguía pidiendo remediar «las
+     * N señales»: el modelo no podía verlas y la única salida posible era inventarlas, que es
+     * justo lo que `COMPROBAR.C5` descarta después de haberlo pagado.
+     *
+     * Que el render CAMBIÓ ya lo dice la huella. Lo que dice este caso es que cambió a lo
+     * correcto, y es lo que hay que releer si alguien reordena el cuerpo otra vez.
+     */
+    expect(RAMAS.journeyTruncado.usuario).toContain('paso-sin-salida');
+    expect(RAMAS.journeyTruncado.usuario).toContain('[b1000000-0000-4000-8000-000000000002]');
+    // Y el recorte se llevó lo que tenía que llevarse: la cola del grafo, de la que el propio
+    // prompt avisa. Sin esta mitad, poner las señales delante y NO truncar nada pasaría igual.
+    expect(RAMAS.journeyTruncado.usuario).not.toContain(CUERPO_LARGO);
+    /*
+     * Y CON ELLAS SU TOPOLOGÍA, que es la mitad que faltaba.
+     *
+     * Que las señales sobrevivan no basta para poder responder: «el paso X no tiene salida» es
+     * irremediable sin el paso X y sin ver por dónde se entra en él. Con el grafo escrito en
+     * orden, un journey de cuatrocientos nodos entregaba las señales y NADA más —ni su nodo ni
+     * una sola transición—, y el contrato exige una remediación por señal igual: la única
+     * salida que le quedaba al modelo era inventarla, y `COMPROBAR.C5` la acepta porque cubre
+     * exactamente la señal que se pidió.
+     *
+     * El núcleo lo acota el número de señales y no el del grafo, así que en este caso cabe: lo
+     * que se pierde es el contexto, que es de lo único que el prompt avisa.
+     */
+    // La ENTRADA del nodo, no su id a secas: el id a secas también aparece en la línea de la
+    // señal —«· nodo [b1…099]»—, así que buscarlo solo pasaría sin que el nodo esté.
+    const NODO_SENALADO = '[b1000000-0000-4000-8000-000000000099] paso ·';
+    const ARISTA_INCIDENTE =
+      'b1000000-0000-4000-8000-000000000098 --transicion--> b1000000-0000-4000-8000-000000000099';
+    // Y una arista del OTRO extremo del grafo, que ninguna señal toca: es lo que separa
+    // «entra la vecindad de la señal» de «entra la conectividad entera», y sin ella el
+    // primer arreglo —el de un solo salto— pasaría este caso igual.
+    const ARISTA_LEJANA =
+      'b1000000-0000-4000-8000-000000000000 --transicion--> b1000000-0000-4000-8000-000000000001';
+    expect(RAMAS.journeyGrande.usuario).toContain('se truncó');
+    expect(RAMAS.journeyGrande.nucleo.cabe).toBe(true);
+    expect(RAMAS.journeyGrande.usuario).toContain(NODO_SENALADO);
+    expect(RAMAS.journeyGrande.usuario).toContain(ARISTA_INCIDENTE);
+    expect(RAMAS.journeyGrande.usuario).toContain(ARISTA_LEJANA);
+    // Y las etiquetas son lo que se fue: sin esta mitad, un núcleo que sobrevive porque NADA
+    // se recortó pasaría igual.
+    expect(RAMAS.journeyGrande.usuario).not.toContain('Paso 50 — ');
+    // El otro lado del techo: cuando el núcleo SOLO ya no cabe, se dice, y `PREPARAR.C5` no
+    // llama. Aquí el nodo señalado arrastra al vecino que le entra, y ese lleva el cuerpo largo.
+    expect(RAMAS.journeyTruncado.nucleo.cabe).toBe(false);
+    expect(RAMAS.journeyLlano.nucleo.cabe).toBe(true);
+    expect(RAMAS.journeyFichaVacia.usuario).toContain('(sin dato)');
+    expect(RAMAS.journeyConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
 
     // Y ninguna rama produce el mismo render que otra: dos entradas con la misma salida
     // serían una sola rama cubierta dos veces, y el hash no lo diría.

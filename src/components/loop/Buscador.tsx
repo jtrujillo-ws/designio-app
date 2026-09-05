@@ -48,17 +48,22 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
   const enterPendiente = useRef(false);
 
   // «/» enfoca el buscador desde cualquier sitio de la pantalla, salvo cuando ya se escribe
-  // en otro campo: ahí la barra es un carácter más.
+  // en otro campo: ahí la barra es un carácter más. «⌘K» (Ctrl+K fuera de Mac) también lo
+  // enfoca, desde cualquier sitio: es el atajo que el lateral anuncia junto a la marca, y
+  // hoy la paleta de comandos ES el buscador — no se anuncia nada que no exista.
   useEffect(() => {
     function alTeclear(e: globalThis.KeyboardEvent) {
-      if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
-      const objetivo = e.target as HTMLElement | null;
-      const escribiendo =
-        objetivo instanceof HTMLInputElement ||
-        objetivo instanceof HTMLTextAreaElement ||
-        objetivo instanceof HTMLSelectElement ||
-        objetivo?.isContentEditable === true;
-      if (escribiendo) return;
+      const paleta = (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k';
+      if (!paleta) {
+        if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+        const objetivo = e.target as HTMLElement | null;
+        const escribiendo =
+          objetivo instanceof HTMLInputElement ||
+          objetivo instanceof HTMLTextAreaElement ||
+          objetivo instanceof HTMLSelectElement ||
+          objetivo?.isContentEditable === true;
+        if (escribiendo) return;
+      }
       e.preventDefault();
       input.current?.focus();
       input.current?.select();
@@ -196,7 +201,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
   }
 
   return (
-    <div style={{ position: 'relative', width: 280 }} onBlur={alPerderFoco}>
+    <div style={{ position: 'relative', width: 260 }} onBlur={alPerderFoco}>
       <Input
         ref={input}
         type="search"
@@ -212,7 +217,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
         maxLength={MAX_CARACTERES}
         placeholder={workspaceId ? 'Buscar en el workspace…  /' : 'Sin workspace donde buscar'}
         disabled={!workspaceId}
-        title={workspaceId ? 'Atajo: /' : 'Únete a un workspace para buscar en él'}
+        title={workspaceId ? 'Atajos: / y ⌘K (Ctrl+K)' : 'Únete a un workspace para buscar en él'}
         value={texto}
         onChange={(e) => {
           setTexto(e.target.value);

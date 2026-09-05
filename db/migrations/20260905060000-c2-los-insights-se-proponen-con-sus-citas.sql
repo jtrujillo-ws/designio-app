@@ -79,6 +79,35 @@ alter table propuesta_ai add constraint propuesta_ai_ancla_item check ((item_id 
 alter table propuesta_ai add constraint propuesta_ai_ancla_reto check ((reto_id is not null) = (capacidad in ('C0', 'C2')));
 alter table propuesta_ai add constraint propuesta_ai_ancla_gate check ((gate_id is not null) = (capacidad in ('CT')));
 
+-- Y la cuarta columna, que llegó por la otra rama de la Fase 1 mientras esta se escribía. C5
+-- —remediación del grafo— ancla en `journey_id` y su migración la sujetó con la forma vieja:
+--
+--   check ((capacidad = 'C5') = (journey_id is not null))   -- *_ancla_c5
+--
+-- Es cierta, y hoy no rechaza nada que debiera pasar: journey tiene una sola dueña, igual que
+-- item y gate. Pero es la MISMA equivalencia «una capacidad ⇔ una columna» que esto viene a
+-- quitar, y dejarla puesta es dejar la trampa armada para la segunda capacidad que ancle en
+-- el journey. El nombre, además, dice la capacidad y no la columna: quien lo lea buscando qué
+-- sujeta `journey_id` no lo encuentra donde busca, y la prueba que compara la base contra
+-- `CAPACIDADES[c].ancla.columna` tampoco. Se convierte igual que las otras tres.
+alter table reserva_ai drop constraint reserva_ai_ancla_c5;
+alter table llamada_ai drop constraint llamada_ai_ancla_c5;
+alter table propuesta_ai drop constraint propuesta_ai_ancla_c5;
+alter table reserva_ai add constraint reserva_ai_ancla_journey check ((journey_id is not null) = (capacidad in ('C5')));
+alter table llamada_ai add constraint llamada_ai_ancla_journey check ((journey_id is not null) = (capacidad in ('C5')));
+alter table propuesta_ai add constraint propuesta_ai_ancla_journey check ((journey_id is not null) = (capacidad in ('C5')));
+
+-- Y la huella del material, que también llegó por la rama de C5 con una lista de una sola
+-- capacidad. C2 la guarda —la revalidación previa al despacho la necesitó, y el panel la
+-- vuelve a leer para saber si la señal de grounding sigue midiendo lo que el modelo vio—, así
+-- que para C2 tampoco hay fila legítima sin ella: la capacidad y la columna llegan en el mismo
+-- par de migraciones y no hay filas anteriores que perdonar. Se rehace con las dos, por el
+-- mismo motivo que el ancla de arriba y con el mismo modo de fallo si se deja corta: una
+-- propuesta sin huella no se marca obsoleta nunca, y ese silencio se lee como «al día».
+alter table propuesta_ai drop constraint propuesta_ai_huella_c5;
+alter table propuesta_ai add constraint propuesta_ai_huella_del_material
+  check (capacidad not in ('C5', 'C2') or huella_material is not null);
+
 -- Y `propuesta_ai`, que hasta ahora ataba la capacidad a su ancla POR EL CAMINO LARGO —de la
 -- capacidad al destino con un CHECK por capacidad, y del destino al ancla con otro—, la ata
 -- ahora también en directo. El camino largo sigue siendo cierto y se queda: dice otra cosa
@@ -939,3 +968,16 @@ create unique index propuesta_ai_item_pendiente_idx
 create unique index propuesta_ai_gate_pendiente_idx
   on propuesta_ai (workspace_id, capacidad, gate_id)
   where gate_id is not null and estado = 'propuesta';
+
+-- Y los del journey, por lo mismo. Llegaron por la rama de C5 con la forma vieja —(workspace,
+-- journey), sin capacidad— y hoy tampoco excluyen de más, porque C5 es su única dueña. Se
+-- convierten aquí y no en su migración porque es aquí donde la exclusión pasa a ser por
+-- (capacidad, ancla): dejar una columna fuera de esa regla es dejar la trampa en cuatro
+-- sitios en vez de en tres.
+drop index reserva_ai_journey_idx;
+drop index propuesta_ai_journey_pendiente_idx;
+create unique index reserva_ai_journey_idx on reserva_ai (workspace_id, capacidad, journey_id)
+  where journey_id is not null;
+create unique index propuesta_ai_journey_pendiente_idx
+  on propuesta_ai (workspace_id, capacidad, journey_id)
+  where journey_id is not null and estado = 'propuesta';

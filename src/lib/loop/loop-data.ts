@@ -1,17 +1,22 @@
-import type { EstadoChip } from '@/components/ui/Chip';
 import type { JourneyN } from '@/components/ui/JourneyBadge';
 import type { Destino } from '@/lib/destinos';
 
 /**
- * Datos estáticos del ejemplo Banco Andino (prediseño §19) para la pantalla Loop.
- * En producción este estado se deriva de los gates G0–G7 del reto activo (SPEC-04).
+ * El catálogo de los siete journeys del método (prediseño §19): qué es cada uno, qué
+ * etapas y gates cubre, quién responde y dónde se trabaja en la plataforma. Es texto fijo
+ * del método, no estado: el estado (hecho / en curso / próximo) se DERIVA de los gates del
+ * proyecto en `loop-estado`.
  */
 export type JourneyLoop = {
   j: JourneyN;
   titulo: string;
+  /** Título de una palabra para la tarjeta estrecha y la barra del arco. */
+  corto: string;
+  /** Etapas y gates que cubre, en mono: «Etapa 7 · G7». */
   meta: string;
+  /** Qué ocurre en este journey, para el spotlight cuando está en curso. */
+  descripcion: string;
   rol: string;
-  estado: EstadoChip;
   /** Dónde se HACE este journey hoy en la plataforma: la tarjeta abre esa pantalla. */
   pantalla: PantallaDeJourney;
 };
@@ -45,61 +50,84 @@ export function destinoDeJourney(
   }
 }
 
-export const LOOP_BANCO_ANDINO: JourneyLoop[] = [
+export const JOURNEYS_DEL_LOOP: JourneyLoop[] = [
   {
     j: 1,
     titulo: 'Arranque en frío',
-    meta: 'Importación y curaduría · servicio con estado actual',
+    corto: 'arranque',
+    meta: 'Importación · curaduría',
+    descripcion:
+      'El material del cliente entra por la bandeja y alguien lo cura: nada es evidencia hasta que una persona lo aprueba con sus cinco dimensiones.',
     rol: 'Lead + admin cliente',
-    estado: 'hecho',
     pantalla: 'importacion',
   },
   {
     j: 2,
     titulo: 'Formulación del reto',
-    meta: 'Etapa 0 · criterios con ventanas · G0',
+    corto: 'reto',
+    meta: 'Etapa 0 · G0',
+    descripcion:
+      'El reto se formula con criterios de éxito medibles, línea base y ventana. G0 los congela: a partir de ahí se mide contra ellos.',
     rol: 'Sponsor aprueba',
-    estado: 'hecho',
     pantalla: 'proyecto',
   },
   {
     j: 3,
     titulo: 'Investigación y entendimiento',
-    meta: 'Etapas 1–2 · evidencia, insights · G1 G2',
+    corto: 'investigación',
+    meta: 'Etapas 1–2 · G1 G2',
+    descripcion:
+      'Se investiga y se sostienen insights con citas verificables sobre evidencia con derechos vigentes. G2 certifica que hay entendimiento suficiente.',
     rol: 'Diseñadores + stakeholders',
-    estado: 'hecho',
     pantalla: 'insights',
   },
   {
     j: 4,
     titulo: 'Conceptualización y exploración',
-    meta: 'Etapas 3–4 · HMW, conceptos, tests · G3 G4',
+    corto: 'conceptos',
+    meta: 'Etapas 3–4 · G3 G4',
+    descripcion:
+      'De los insights salen preguntas, conceptos y pruebas. Las decisiones quedan enlazadas a lo que las fundamenta.',
     rol: 'Sponsor + equipo',
-    estado: 'hecho',
     pantalla: 'proyecto',
   },
   {
     j: 5,
     titulo: 'Detalle y plan',
-    meta: 'Etapas 5–6 · design version, diff · G5 G6',
+    corto: 'detalle',
+    meta: 'Etapas 5–6 · G5 G6',
+    descripcion:
+      'La design version detalla el cambio y el diff contra el estado actual; el plan firma el Metric Registry en G6 antes de tocar nada.',
     rol: 'Sponsor + dueño del dato',
-    estado: 'hecho',
     pantalla: 'design-versions',
   },
   {
     j: 6,
     titulo: 'Implementación y medición',
-    meta: 'Etapa 7 · releases, effective state · G7',
+    corto: 'implementación',
+    meta: 'Etapa 7 · G7',
+    descripcion:
+      'Los releases salen y se constata qué quedó funcionando de verdad: el effective state del servicio. G7 no pasa con elementos en estado desconocido.',
     rol: 'Equipo cliente + dueño del dato',
-    estado: 'en curso',
     pantalla: 'design-versions',
   },
   {
     j: 7,
     titulo: 'Post mortem y continuidad',
-    meta: 'Outcome review · veredicto · suscripción',
+    corto: 'post mortem',
+    meta: 'Veredicto · suscripción',
+    descripcion:
+      'Con la serie de métricas leída, el outcome review dicta veredicto y deja los retos candidatos del siguiente ciclo.',
     rol: 'Sponsor decide',
-    estado: 'próximo',
     pantalla: 'proyecto',
   },
 ];
+
+/** Por su número, no por posición: el catálogo cubre los siete, pero no depende de su orden. */
+const POR_NUMERO = new Map(JOURNEYS_DEL_LOOP.map((jl) => [jl.j, jl]));
+
+export function journeyDelLoop(j: JourneyN): JourneyLoop {
+  const jl = POR_NUMERO.get(j);
+  if (!jl) throw new Error(`El catálogo del loop no tiene el journey J${j}`);
+  return jl;
+}

@@ -11,6 +11,9 @@ import {
   INTENTOS_POR_GENERACION,
   LIMITE_LLAMADAS_DIA,
 } from './ai.degradacion';
+import { validarJourney } from '@/lib/journey/journey.mermaid';
+import type { JourneyCompleto } from '@/lib/journey/journey.schemas';
+import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
 import {
   presenciaLiteralPorCita,
   materialDeGate,
@@ -25,11 +28,16 @@ import {
   promptAsistenteGate,
   promptCriterios,
   promptExtraccion,
+  materialDeJourney,
+  nucleoDeRemediacion,
+  promptRemediacionJourney,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
   SISTEMA_EXTRACCION,
+  SISTEMA_REMEDIACION_JOURNEY,
   type ChecklistDelGate,
   materialDeUnaEvidencia,
+  type GrafoDelJourney,
 } from './ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
@@ -37,6 +45,7 @@ import {
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
+  MAX_REMEDIACIONES,
   COLUMNA_DE_DESTINO,
   type AnclaCapacidad,
   type CandidatoAncla,
@@ -45,6 +54,7 @@ import {
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoInsight,
+  type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
   type EstadoAncla,
   type GenerarPropuestas,
@@ -83,6 +93,21 @@ import {
  */
 
 export class ErrorAI extends Error {}
+
+/**
+ * Lo que el modelo DIJO no cumple el contrato de su capacidad.
+ *
+ * Se distingue del resto de `ErrorAI` por lo que hay que anotar en el libro. `resultado`
+ * describe LO QUE DEVOLVIÓ EL PROVEEDOR, así que solo esto se reetiqueta como
+ * `fuera-de-contrato`: un informe que se salta una señal o repite otra es culpa suya.
+ *
+ * Lo que NO es esto: que el mundo se moviera entre preparar y escribir —el journey borrado, el
+ * grafo editado por otro curador—. Ahí el proveedor devolvió lo que se le pidió y la respuesta
+ * se descarta por algo que pasó fuera; anotarlo como fuera de contrato corrompería la medida
+ * de calidad del proveedor y emitiría `LlamadaAISinPropuesta` culpando al modelo de algo que
+ * hizo bien.
+ */
+export class ErrorContratoAI extends ErrorAI {}
 
 const PAGINA_PENDIENTES = 100;
 const DECIDIDAS_RECIENTES = 50;
@@ -218,7 +243,7 @@ async function presupuestoDeHoy(
       -- que es un problema del material y no de la disponibilidad.
       (select case when u.resultado = 'sin-respuesta'
                 then (extract(epoch from (now() - coalesce(u.cerrado_en, u.creado_en)))
-                        * 1000)::bigint end
+                       * 1000)::bigint end
          from llamada_ai u
         where u.workspace_id = ${workspaceId} and u.resultado <> 'despachada'
         order by coalesce(u.cerrado_en, u.creado_en) desc, u.intento desc, u.id desc
@@ -311,6 +336,115 @@ async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Pro
     hashtextextended('designio:presupuesto-ai:' || ${workspaceId}, 42))`;
 }
 
+
+/**
+ * El grafo tal como lo ve el modelo, con sus señales YA calculadas.
+ *
+ * Una definición y tres usos: la arma `PREPARAR.C5` para el prompt, la vuelve a armar el
+ * panel para medir la presencia literal de las citas, y de ella salen las señales contra las
+ * que el servicio comprueba las remediaciones que devuelve el modelo. Si esos tres tuvieran
+ * cada uno su copia, bastaría una diferencia de orden para que la medición del grounding
+ * marcara como ausentes citas que están, o para que una remediación legítima se rechazara
+ * por señalar una señal que la otra copia no emitió.
+ *
+ * Las señales las pone `validarJourney`, que es DETERMINISTA (RF-05.6). No se le pide al
+ * modelo que las encuentre: se le dan hechas y se le pide qué hacer con ellas.
+ */
+/**
+ * Si el grafo que el panel puede leer HOY es el que el modelo tuvo delante, según la huella
+ * que la propuesta guardó al nacer.
+ *
+ * `null` cuando no se puede saber —una propuesta anterior a la columna—, y no se resuelve a
+ * ninguno de los dos lados aquí: quien lo lee decide qué hacer con no saber, y las dos
+ * respuestas son distintas. Para el ESTADO de la fila, no saber no puede volverse «cambiado»:
+ * sería inventarse una alarma. Para la presencia literal, no saber se resuelve como vigente,
+ * que es exactamente lo que hacían todas las capacidades cuando ninguna guardaba huella.
+ */
+/*
+ * Los dos techos de C5, redactados UNA vez y leídos por los dos lados: el selector, que marca
+ * el journey como no generable, y la admisión, que lo rechaza si alguien lo fuerza igual.
+ *
+ * Escribirlos dos veces era la manera de que divergieran, y esconder el journey en vez de
+ * marcarlo dejaba el mensaje —lo único que dice QUÉ hacer— sin ningún camino del producto que
+ * llegara a él.
+ */
+function motivoDemasiadasSenales(cuantas: number): string {
+  return `Ese journey tiene ${cuantas} señales abiertas y un informe puede llevar ${MAX_REMEDIACIONES}: cierra las más claras a mano y vuelve a pedirlo. (La validación las lista todas, y es exacta.)`;
+}
+
+function motivoConectividadQueNoCabe(caracteres: number): string {
+  return `Las señales de ese journey y su grafo de transiciones ocupan ${caracteres} caracteres y al modelo le caben ${MAX_MATERIAL}: tendría que responder sin ver la conectividad que se le pide remediar. Cierra a mano las señales de los tramos más cargados, o parte el journey, y vuelve a pedirlo.`;
+}
+
+/**
+ * Si el material que el panel puede recomponer HOY es el que el modelo tuvo delante, según la
+ * huella que la propuesta guardó al nacer.
+ *
+ * `null` cuando NO SE PUEDE SABER, y no se resuelve a ninguno de los dos lados aquí: quien lo
+ * lee decide qué hacer con no saber, y las dos respuestas son distintas. Para el ESTADO de la
+ * fila, no saber no puede volverse «cambiado»: sería inventarse una alarma. Para la presencia
+ * literal, no saber se resuelve como vigente, que es lo que hacían todas las capacidades
+ * cuando ninguna guardaba huella.
+ *
+ * Y son DOS los casos en que no se sabe. El primero es no tener huella: una propuesta anterior
+ * a la columna. El segundo es tenerla de OTRO RENDER: desde que la huella se calcula sobre el
+ * material —el texto ya recortado, no el grafo crudo—, un cambio del prompt la mueve sin que
+ * el grafo se haya tocado, y `prompt_version` es justo el dato que dice si son comparables.
+ * Sin esta segunda mitad, el día de un despliegue toda propuesta viva de C5 se habría marcado
+ * «journey cambiado» a la vez, culpando al grafo de un cambio del renderizador.
+ */
+function materialDelPanelEsElDelModelo(f: Record<string, unknown>): boolean | null {
+  const guardada = f.huella_material as string | null;
+  if (!guardada) return null;
+  if ((f.prompt_version as string | null) !== PROMPT_VERSION) return null;
+  /*
+   * Contra el material de SU capacidad, no contra el de una escrita aquí. Esto nació mirando
+   * el journey de C5 porque C5 era la única que guardaba huella; C2 guarda la suya desde que
+   * la revalidación previa al despacho la necesitó, y con la comparación escrita para C5 su
+   * huella se habría contrastado contra un grafo inexistente —`journeyDesdeElPanel` sobre una
+   * fila de C2 devuelve un journey vacío— y toda propuesta de C2 se habría leído como material
+   * cambiado. Es la misma trampa que las anclas y los destinos: la parte que varía indexada
+   * por lo que varía.
+   *
+   * `material(f)` es exactamente el texto que se hasheó al preparar la llamada, porque las dos
+   * mitades salen de la misma función por capacidad. Una capacidad que guarde huella y no
+   * declare `material` no existe: `material` es obligatorio en el registro.
+   */
+  const definicion = CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva];
+  if (!definicion) return null;
+  return huellaDelMaterial(definicion.material(f)) === guardada;
+}
+
+function grafoParaElModelo(journey: JourneyCompleto): GrafoDelJourney {
+  const fase = new Map(
+    journey.nodos.filter((n) => n.tipo === 'fase').map((n) => [n.id, n.etiqueta]),
+  );
+  return {
+    nodos: journey.nodos.map((n) => ({
+      id: n.id,
+      tipo: n.tipo,
+      etiqueta: n.etiqueta,
+      fase: n.faseId ? (fase.get(n.faseId) ?? '') : '',
+      // El id de la fase, además del rótulo: dos fases pueden llamarse igual, y entonces ni el
+      // modelo puede decir a cuál mover un nodo ni la huella distingue un traslado entre ellas.
+      faseId: n.faseId ?? '',
+      responsable: n.responsable ?? '',
+      evidencias: n.evidencias.length,
+    })),
+    aristas: journey.aristas.map((a) => ({
+      origen: a.origenId,
+      destino: a.destinoId,
+      tipo: a.tipo,
+      condicion: a.condicion ?? '',
+    })),
+    senales: validarJourney(journey).map((x) => ({
+      codigo: x.codigo,
+      severidad: x.severidad,
+      nodoId: x.nodoId,
+      mensaje: x.mensaje,
+    })),
+  };
+}
 
 /**
  * Lo que el panel sabe de una columna de ancla: de dónde sale la fila y cómo se titula.
@@ -409,7 +543,71 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
          where c.gate_id = g.id and c.workspace_id = g.workspace_id)
       end as gate_checklist`,
   },
+  journey_id: {
+    join: (tx) => tx`left join journey jr
+        on jr.id = p.journey_id and jr.workspace_id = p.workspace_id
+      left join servicio sjr on sjr.id = jr.servicio_id and sjr.workspace_id = jr.workspace_id`,
+    titulo: (tx) => tx`jr.nombre`,
+    /*
+     * El GRAFO entero, con la forma que `JourneyCompleto` declara. Pesa, y no hay otra: las
+     * señales de la validación no son una tabla —son una función pura del grafo— así que el
+     * único modo de recomponer el material que el modelo leyó es traer los nodos y las
+     * aristas y volver a evaluar la misma función. Traer un resumen dejaría la medición de la
+     * presencia literal midiendo otro texto.
+     */
+    columnas: (tx) => tx`jr.nombre as journey_nombre, jr.tipo as journey_tipo,
+      sjr.nombre as journey_servicio,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'id', n.id, 'tipo', n.tipo, 'etiqueta', n.etiqueta, 'faseId', n.fase_id,
+          'orden', n.orden, 'responsable', n.responsable,
+          'arquetipoEstado', (select a.estado from arquetipo a
+            where a.id = n.arquetipo_id and a.workspace_id = n.workspace_id),
+          'evidencias', coalesce((
+            select jsonb_agg(jsonb_build_object('id', e.id) order by e.id)
+            from journey_nodo_evidencia ne
+            join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
+            where ne.nodo_id = n.id and ne.workspace_id = n.workspace_id), '[]'::jsonb))
+          -- El MISMO orden total que leerJourneyCompleto, y eso es el requisito entero: las
+          -- dos proyecciones alimentan huellaDelGrafo, así que si ordenan distinto la huella
+          -- guardada al generar y la recalculada al pintar difieren sobre un grafo idéntico —y
+          -- el panel declararía obsoleto un informe que está al día.
+          order by n.tipo, n.orden, n.id)
+        from journey_nodo n
+        where n.journey_id = jr.id and n.workspace_id = jr.workspace_id), '[]'::jsonb)
+        as journey_nodos,
+      coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'id', a.id, 'origenId', a.origen_id, 'destinoId', a.destino_id,
+          'tipo', a.tipo, 'condicion', a.condicion) order by a.creado_en, a.id)
+        from journey_arista a
+        where a.journey_id = jr.id and a.workspace_id = jr.workspace_id), '[]'::jsonb)
+        as journey_aristas`,
+  },
 };
+
+/**
+ * Un `JourneyCompleto` mínimo desde las columnas que proyectó el panel: lo justo que
+ * `validarJourney` y `grafoParaElModelo` leen, que está comprobado y son los nodos y las
+ * aristas. Los campos que ninguno de los dos mira se rellenan con lo neutro en vez de
+ * proyectarse: traerlos costaría y no cambiaría ni una señal.
+ */
+function journeyDesdeElPanel(f: Record<string, unknown>): JourneyCompleto {
+  return {
+    id: '',
+    servicioId: '',
+    servicioNombre: (f.journey_servicio as string | null) ?? '',
+    retoId: null,
+    proyectoId: null,
+    tipo: (f.journey_tipo as JourneyCompleto['tipo'] | null) ?? 'as-is',
+    nombre: (f.journey_nombre as string | null) ?? '',
+    descripcion: '',
+    nodos: (f.journey_nodos as JourneyCompleto['nodos'] | null) ?? [],
+    aristas: (f.journey_aristas as JourneyCompleto['aristas'] | null) ?? [],
+    snapshots: [],
+    arquetipos: [],
+  };
+}
 
 /**
  * Y lo que el panel sabe de una CAPACIDAD: qué la deja obsoleta, contra qué material se mide
@@ -426,6 +624,38 @@ type CapacidadEnElPanel = {
    * exterior lo cierra con `else null`, que es lo que dice «este panel no sabe juzgar esto».
    */
   estado: (tx: TransactionSql) => PendingQuery<Row[]>;
+  /**
+   * Y el estado que el SQL NO puede calcular, sobre la fila ya proyectada.
+   *
+   * Existe por C5: lo que deja obsoleto un informe de remediación es que sus señales dejen de
+   * estar abiertas, y las señales son una función pura de los nodos y las aristas, no una
+   * tabla. Con solo el CASE, la única respuesta honesta para C5 era «disponible» siempre — o
+   * sea, la pantalla no avisaba nunca de que un informe había dejado de describir el grafo,
+   * mientras CT sí avisa de su equivalente. Que la comprobación exista al ESCRIBIR no cubre
+   * esto: entre escribir y revisar cabe la edición, y es justo cuando conviene avisar.
+   *
+   * Devuelve `null` para dejar el veredicto del CASE, que es lo que hacen las tres que sí se
+   * pueden juzgar en SQL. Se evalúa sobre `f`, la misma fila que ya trae el grafo entero: no
+   * abre ninguna consulta nueva.
+   */
+  estadoDeLaFila?: (f: Record<string, unknown>) => EstadoAncla | null;
+  /**
+   * Cómo se llaman, en cristiano, los ids que el contenido nombra.
+   *
+   * El modelo copia ids del material —es lo único verificable, por eso se le piden así— y la
+   * pantalla los recibe tal cual. Un uuid no le dice nada a quien revisa: en C5 varias
+   * remediaciones pueden traer el MISMO código de señal sobre nodos distintos (media docena de
+   * `paso-sin-evidencia` es lo normal), y sin el nombre del nodo las tarjetas son
+   * indistinguibles — `comoCerrarlo` no está obligado a repetirlo.
+   * pantalla los recibe tal cual. Un uuid no le dice nada a quien revisa, y las dos
+   * capacidades que nombran ids lo necesitan por motivos distintos: en C2 una cita declara de
+   * qué evidencia sale, y sin el nombre del documento la señal de grounding queda a medias —se
+   * ve el verde, no contra qué—; en C5 varias remediaciones pueden traer el MISMO código sobre
+   * nodos distintos, y sin el nombre del nodo las tarjetas son indistinguibles.
+   *
+   * Sale de la MISMA fila que ya trae el material proyectado: no abre ninguna consulta nueva.
+   */
+  etiquetasDelContenido?: (f: Record<string, unknown>) => Record<string, string>;
   /**
    * El material que el modelo leyó, recompuesto desde las columnas que proyectó su ancla. Se
    * compone IGUAL que al construir el prompt —ficha incluida y con el delimitador
@@ -451,23 +681,50 @@ type CapacidadEnElPanel = {
    */
   pajarDeLaCita?: (f: Record<string, unknown>, cita: CitaDelContenido) => string | null;
   /**
-   * Cómo se llaman, en cristiano, los ids que el contenido nombra.
+   * Si el material que `material` recompone es TODAVÍA el que vio el modelo.
    *
-   * El modelo copia ids del material —es lo único verificable, por eso se le piden así— y la
-   * pantalla los recibe tal cual. Un uuid no le dice nada a quien revisa: en C2, una cita
-   * declara de qué evidencia sale, y sin el nombre del documento la señal de grounding queda a
-   * medias (se ve el verde, no contra qué). Sale de la MISMA fila que ya trae la evidencia
-   * proyectada: no abre ninguna consulta nueva.
+   * El panel lo rearma a partir del estado de HOY, y contra ese texto se mide la presencia
+   * literal de las citas. Mientras nada cambie es el mismo texto; después de una edición
+   * ajena no lo es, y entonces el veredicto no es ni «aparece» ni «no aparece» — un fragmento
+   * que la edición acaba de añadir saldría en verde y una cita legítima que la edición borró
+   * saldría en rojo.
+   *
+   * Solo lo puede contestar quien GUARDÓ algo con qué comparar, y por eso es opcional: sin
+   * entrada se asume vigente, que es lo que hoy hacen todas —es la respuesta que ya daban en
+   * silencio— y lo que la capacidad que guarde una huella puede mejorar. C5 la guarda.
    */
-  etiquetasDelContenido?: (f: Record<string, unknown>) => Record<string, string>;
-  /** Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad. */
+  materialVigente?: (f: Record<string, unknown>) => boolean;
+  /**
+   * Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad, y SI
+   * DEJÓ ALGO FUERA.
+   *
+   * Lo segundo lo devuelve la cola y no lo deduce quien llama, que es lo que hacía: pedía una
+   * fila de más y miraba si venía. Eso vale mientras el corte lo haga el `limit` del SQL, y
+   * deja de valer en cuanto la cola filtra por algo que el SQL no sabe —C5 filtra por «tiene
+   * señales abiertas», que es una función pura del grafo—: ahí una lista corta puede
+   * significar «no hay más» o «no he llegado a mirar», y la primera es una respuesta que no se
+   * puede dar sin haber mirado. La cola es la única que sabe cuál de las dos es.
+   */
   candidatas: (
     tx: TransactionSql,
     workspaceId: string,
     patron: string | null,
     limite: number,
-  ) => Promise<CandidatoAncla[]>;
+  ) => Promise<{ lista: CandidatoAncla[]; hayMas: boolean }>;
 };
+
+/**
+ * Cómo se barre la cola de C5, que no se puede resolver entera en SQL: «tiene señales
+ * abiertas» es una función pura del grafo, así que el SQL trae candidatos baratos y el bucle
+ * descarta los que vienen limpios.
+ *
+ * `LOTE` es cuántos se piden por vuelta y `TOPE` cuántos se llegan a mirar como mucho. El tope
+ * existe para que un workspace enorme no convierta cada pintado del selector en una lectura de
+ * todos sus grafos; y cuando se alcanza, la cola lo DICE en vez de devolver «no hay», que es
+ * la única respuesta que no se puede dar sin haber mirado.
+ */
+const LOTE_DE_BARRIDO_C5 = 60;
+const TOPE_DE_BARRIDO_C5 = 300;
 
 const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
   CI: {
@@ -503,12 +760,15 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           and (${patron}::text is null or i.titulo ilike ${patron})
         order by i.creado_en asc, i.id asc
         limit ${limite}`;
-      return filas.map((i) => ({
-        id: i.id as string,
-        titulo: i.titulo as string,
-        consentimientoPendiente: i.consentimiento_pendiente as boolean,
-        sinMaterial: i.sin_material as boolean,
-      }));
+      return {
+        lista: filas.map((i) => ({
+          id: i.id as string,
+          titulo: i.titulo as string,
+          consentimientoPendiente: i.consentimiento_pendiente as boolean,
+          sinMaterial: i.sin_material as boolean,
+        })),
+        hayMas: false,
+      };
     },
   },
   C0: {
@@ -570,7 +830,7 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
         order by r.codigo asc, r.id asc
         limit ${limite}`;
-      return filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string }));
+      return { lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })), hayMas: false };
     },
   },
   CT: {
@@ -628,7 +888,155 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
                or pr.titulo ilike ${patron})
         order by g.creado_en asc, g.id asc
         limit ${limite}`;
-      return filas.map((g) => ({ id: g.id as string, titulo: g.titulo as string }));
+      return { lista: filas.map((g) => ({ id: g.id as string, titulo: g.titulo as string })), hayMas: false };
+    },
+  },
+  C5: {
+    /*
+     * NADA en SQL cierra un journey, y ese es el dato. Aquí había un `journey-congelado` para
+     * los que tienen snapshot, y era un error de lectura de RF-05.8: lo inmutable es CADA
+     * SNAPSHOT, no el journey. Su migración lo dice con todas las letras —«el journey de
+     * trabajo sigue editable para el ciclo siguiente», «el grafo de trabajo no se cierra
+     * nunca»—, así que aquel predicado sacaba para siempre de C5 a todo journey que hubiera
+     * pasado una design version: justo los que llevan más ciclos y más señales acumulan.
+     *
+     * Lo que SÍ deja obsoleto un informe es que sus señales dejen de estar abiertas —porque
+     * alguien las cerró, que es el desenlace bueno—, y eso no se puede preguntar en SQL: las
+     * señales son una función pura de los nodos y las aristas. Se comprueba donde se puede
+     * calcular, en `COMPROBAR.C5`, contra las que el modelo tuvo delante.
+     */
+    estado: (tx) => tx`'disponible'`,
+    /*
+     * Lo que sí deja obsoleto un informe, calculado donde se puede: que las señales que
+     * remedia ya no sean las del grafo. Si alguien las cerró —que es el desenlace bueno— o
+     * editó el grafo por su cuenta, lo que el informe dice ya no describe lo que hay, y quien
+     * lo lee tiene que saberlo antes de aplicarlo.
+     *
+     * Se compara contra el ORIGINAL, no contra el contenido vigente: es el testimonio del
+     * modelo, y para un informe los dos son el mismo mientras no se corrija (C5 no se acepta,
+     * así que nunca se corrige).
+     */
+    /** El nombre de cada nodo, para que una remediación diga a CUÁL aplica. */
+    etiquetasDelContenido: (f) =>
+      Object.fromEntries(
+        journeyDesdeElPanel(f).nodos.map((n) => [n.id, n.etiqueta || '(sin etiqueta)']),
+      ),
+    estadoDeLaFila: (f) => {
+      /*
+       * Contra la HUELLA guardada, no contra las claves de las señales que remedia.
+       *
+       * Comparar las claves era la mitad —y la misma mitad que ya se corrigió del otro lado,
+       * en la comprobación de la escritura—: renombrar un nodo, cambiar la condición de una
+       * transición o rehacer la topología de alrededor deja las señales iguales y cambia todo
+       * lo que el consejo describe. El material es lo que hay que comparar, y por eso se
+       * guardó al nacer la propuesta.
+       *
+       * Sin huella —una propuesta anterior a la columna— no se afirma nada: `null` deja el
+       * veredicto del CASE. Decir «cambiado» sin poder saberlo sería inventarse una alarma,
+       * y decir «al día» sería inventarse una tranquilidad.
+       */
+      return materialDelPanelEsElDelModelo(f) === false ? 'journey-cambiado' : null;
+    },
+    // La misma comparación, leída para lo otro que depende de ella: sin huella no se sabe, y
+    // no saber se resuelve como vigente —es lo que hacían todas las capacidades antes de que
+    // ninguna guardara nada—, mientras que no saber NO se resuelve como «cambiado», que sería
+    // inventarse una alarma.
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) !== false,
+    material: (f) => materialDeJourney({
+      nombre: (f.journey_nombre as string | null) ?? '',
+      servicio: (f.journey_servicio as string | null) ?? '',
+      tipo: (f.journey_tipo as string | null) ?? '',
+      grafo: grafoParaElModelo(journeyDesdeElPanel(f)),
+    }).texto,
+    /*
+     * El selector promete «journeys con señales abiertas», y ahora lo cumple.
+     *
+     * Antes no filtraba por señales —«exigiría evaluar `validarJourney` sobre cada grafo»— y
+     * ofrecía journeys que `PREPARAR.C5` rechazaba a continuación por no tener ninguna: una
+     * opción que no puede llevar a ninguna parte, con un rótulo que decía lo contrario. Lo
+     * señalaron las dos revisiones, y las dos tienen razón: la promesa del rótulo y lo que la
+     * cola devuelve tienen que ser lo mismo, o el rótulo es una decoración.
+     *
+     * El coste es real y por eso está acotado, pero el corte NO puede ser un `limit` fijo: con
+     * uno, un workspace cuyos journeys recientes estén todos limpios devolvía la lista vacía y
+     * el panel decía «no hay journeys con señales abiertas» —con `hayMas` en falso— aunque
+     * hubiera uno más viejo que sí. Se PAGINA el prefiltro hasta llenar las plazas o agotar la
+     * fuente, con un tope de barrido para que un workspace enorme no convierta el selector en
+     * una lectura de todos sus grafos.
+     *
+     * Y cuando el tope se alcanza sin agotar la fuente, la lista se devuelve con una plaza de
+     * más aunque no la haya: es lo que hace que `hayMas` salga cierto, que es la verdad —hay
+     * más journeys sin mirar— y le dice a quien busca que use el buscador. Decir «no hay» sin
+     * haber mirado es la única respuesta que no se puede dar.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const conSenales: CandidatoAncla[] = [];
+      let vistos = 0;
+      let agotado = false;
+      while (conSenales.length < limite && vistos < TOPE_DE_BARRIDO_C5 && !agotado) {
+        const lote = await tx`
+          select jr.id, jr.nombre || ' · ' || s.nombre as titulo
+          from journey jr
+          join servicio s on s.id = jr.servicio_id and s.workspace_id = jr.workspace_id
+          where jr.workspace_id = ${workspaceId}
+            and not exists (select 1 from propuesta_ai p
+              where p.journey_id = jr.id and p.workspace_id = jr.workspace_id
+                and p.estado = 'propuesta')
+            and (${patron}::text is null or jr.nombre ilike ${patron} or s.nombre ilike ${patron})
+          order by jr.creado_en desc, jr.id asc
+          limit ${LOTE_DE_BARRIDO_C5} offset ${vistos}`;
+        agotado = lote.length < LOTE_DE_BARRIDO_C5;
+        vistos += lote.length;
+        /*
+         * Los grafos del lote se leen DE UNA VEZ, no uno por journey mirado.
+         *
+         * `validarJourney` es una función pura del grafo, así que el barrido tiene que leerlos
+         * todos; lo que no tiene que hacer es una ida y vuelta por cada uno. Con el tope de
+         * barrido puesto en trescientos, un workspace con muchos journeys limpios convertía
+         * cada carga de la pantalla de propuestas en trescientas consultas —cada una con sus
+         * agregados anidados de nodos y aristas— antes de pintar nada.
+         *
+         * El orden del lote manda, no el que devuelva la base: el `order by` de la lista es lo
+         * que hace que dos cargas ofrezcan lo mismo, y un `any(...)` no promete ninguno.
+         */
+        const grafos = new Map(
+          (await leerJourneysCompletos(tx, workspaceId, lote.map((j) => j.id as string))).map(
+            (g) => [g.id, g],
+          ),
+        );
+        for (const j of lote) {
+          if (conSenales.length >= limite) break;
+          const journey = grafos.get(j.id as string);
+          if (!journey) continue;
+          const senales = validarJourney(journey);
+          // Un journey LIMPIO no se ofrece, y ésa es la promesa del rótulo: no le falta nada
+          // que remediar. No es lo mismo que los dos de abajo, a los que sí les falta algo.
+          if (senales.length === 0) continue;
+          /*
+           * Y los que no se pueden generar se MARCAN, no se esconden. Esconderlos era peor que
+           * no ofrecerlos: el selector se quedaba vacío y la pantalla afirmaba «no hay journeys
+           * con señales abiertas» sobre un workspace lleno de ellos, mientras el motivo
+           * accionable vivía en un mensaje de `PREPARAR.C5` que ningún camino del producto
+           * podía alcanzar. Es lo que la casa ya hace con los items sin consentimiento y sin
+           * material: se marca en vez de esconderse.
+           *
+           * El núcleo se mide sobre las señales y sus transiciones, no sobre el material
+           * entero: así el barrido no se convierte en armar el prompt de trescientos journeys.
+           */
+          const nucleo = nucleoDeRemediacion(grafoParaElModelo(journey));
+          const bloqueo =
+            senales.length > MAX_REMEDIACIONES
+              ? motivoDemasiadasSenales(senales.length)
+              : !nucleo.cabe
+                ? motivoConectividadQueNoCabe(nucleo.texto.length)
+                : undefined;
+          conSenales.push({ id: j.id as string, titulo: j.titulo as string, bloqueo });
+        }
+      }
+      // Hay más por ofrecer si se llenaron las plazas, o si el barrido se cortó por el tope
+      // sin agotar la fuente. Lo segundo es lo que el `limit` fijo no podía decir: la lista
+      // sale corta y NO es porque no haya, es porque no se ha mirado.
+      return { lista: conSenales, hayMas: conSenales.length >= limite || !agotado };
     },
   },
   C2: {
@@ -681,6 +1089,25 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         evidencia: (f.reto_evidencia as EvidenciaDelReto | null) ?? [],
       }).texto,
     /*
+     * Y si ese material sigue siendo el que vio el modelo, contra la huella que la propuesta
+     * guardó al nacer. C2 la guarda desde que la revalidación previa al despacho la necesitó,
+     * y aquí sirve para lo otro que depende de ella.
+     *
+     * Lo que se rompe sin esto no es la aceptación —las citas siguen apuntando a evidencia
+     * real y el guard las valida—, es la SEÑAL DE GROUNDING, que es lo único contrastable que
+     * tiene quien revisa. El material de C2 son varios documentos concatenados y el recorte de
+     * `MAX_MATERIAL` es global y depende del orden: basta con que a un documento NO CITADO que
+     * ordenaba antes le caduquen los derechos, o con que se enlace uno nuevo que ordena antes,
+     * para que el trozo del documento citado que el panel recompone hoy no sea el que el
+     * modelo leyó. Y entonces el verde miente en los dos sentidos: un fragmento que el recorte
+     * de hoy acaba de dejar visible sale PRESENTE aunque el modelo no lo tuviera delante, y
+     * una cita legítima cuyo trozo el recorte de hoy esconde sale AUSENTE.
+     *
+     * No saber se resuelve como vigente, igual que en C5 y por lo mismo: es la respuesta que
+     * daban todas las capacidades antes de que ninguna guardara huella.
+     */
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) !== false,
+    /*
      * Una cita de C2 se mide contra LA EVIDENCIA QUE NOMBRA, no contra todas juntas.
      *
      * El material de C2 son varios documentos y cada cita dice de cuál sale. Con el pajar
@@ -708,7 +1135,7 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
       // dos mitades importan y las dos costaron una ronda: componerlo con `materialDeInsights`
       // metía delante la formulación del reto, y recomponer la línea aparte reiniciaba el
       // presupuesto de caracteres y devolvía texto que el modelo nunca vio.
-      return materialDeUnaEvidencia(
+      const tramo = materialDeUnaEvidencia(
         {
           codigo: (f.reto_codigo as string | null) ?? '',
           titulo: (f.reto_titulo as string | null) ?? '',
@@ -717,6 +1144,12 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         },
         cita.alcanceId,
       );
+      // Tramo vacío es «esa evidencia no está en el material» —le retiraron los derechos, se
+      // desenlazó, o el recorte no llegó a ella—, y eso es `null` y no `''`: son las dos
+      // respuestas que este contrato distingue, y quien lo lee las trata distinto. Devolver
+      // `''` funcionaba por accidente —buscar en la cadena vacía da ausente— y dejaba viva la
+      // única forma de perderlo: que alguien resuelva el `null` con el material entero.
+      return tramo === '' ? null : tramo;
     },
     /*
      * Retos CON EVIDENCIA y sin insights esperando revisión. Lo primero no es un filtro de
@@ -741,7 +1174,10 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
         order by r.codigo asc, r.id asc
         limit ${limite}`;
-      return filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string }));
+      return {
+        lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
+        hayMas: false,
+      };
     },
   },
 };
@@ -824,10 +1260,6 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   // ausentes estando presentes.
   const material = definicionDeFila(f)?.material(f) ?? '';
   const columna = columnaDelAncla(f);
-  // Las presencias se resuelven de una vez para toda la fila: el pajar es el mismo para
-  // todas sus citas, y normalizarlo por cita multiplicaba el trabajo por seis sin cambiar
-  // ninguna respuesta.
-  //
   // Las citas se leen del ORIGINAL: son el testimonio del modelo sobre lo que leyó, no del
   // humano que corrige. Hoy son siempre las mismas —corregirlas está prohibido en el
   // servicio y en el guard— y leerlas de aquí lo deja dicho en la proyección también.
@@ -854,9 +1286,35 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
    * el mismo para todas sus citas», y eso dejó de ser cierto con C2: su material son varios
    * documentos y cada cita dice de cuál sale.
    */
+  /*
+   * Y si el material que se acaba de recomponer YA NO es el que vio el modelo, no hay
+   * veredicto que dar. Medir contra el estado de hoy pinta en verde un fragmento que una
+   * edición ajena acaba de añadir y en rojo una cita legítima que esa edición borró: las dos
+   * mentiras caben en un booleano, y la única respuesta honesta es que no se puede comprobar.
+   *
+   * Lo contesta la CAPACIDAD, porque solo ella sabe si guardó algo con qué comparar. Las que
+   * no lo declaran siguen midiendo como siempre.
+   */
+  const vigente = definicion?.materialVigente?.(f) ?? true;
+  /*
+   * La presencia, CITA A CITA, contra el trozo de material que cada una nombra cuando su
+   * capacidad lo declara. Antes se resolvía de una vez para toda la fila porque «el pajar es
+   * el mismo para todas sus citas», y eso dejó de ser cierto con C2: su material son varios
+   * documentos y cada cita dice de cuál sale.
+   */
   const presencias = citas.map((c) => {
-    const pajar = definicion?.pajarDeLaCita?.(f, c) ?? material;
-    return presenciaLiteralPorCita(pajar ?? '', [c])[0]!;
+    if (!vigente) return null;
+    /*
+     * `undefined` y `null` NO son lo mismo aquí, y colapsarlos con un `??` devolvía el verde
+     * prestado que `pajarDeLaCita` existe para quitar. `undefined` es «esta capacidad no
+     * declara pajar», y su respuesta es el material entero —CI, C0 y CT citan contra uno
+     * solo—. `null` es «la cita nombra un trozo que no está en el material», y su respuesta
+     * es la cadena vacía: ausente. Con `?? material`, esa cita a un documento que el modelo
+     * no vio se medía contra TODOS los demás y salía presente si el texto estaba en
+     * cualquiera de ellos.
+     */
+    if (!definicion?.pajarDeLaCita) return presenciaLiteralPorCita(material ?? '', [c])[0]!;
+    return presenciaLiteralPorCita(definicion.pajarDeLaCita(f, c) ?? '', [c])[0]!;
   });
   return {
     id: f.id as string,
@@ -879,7 +1337,7 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
     // Cómo se llaman los ids que el contenido nombra, cuando su capacidad lo sabe. Vacío es la
-    // respuesta de las que no nombran ninguno, no un hueco.
+    // respuesta correcta de las que no nombran ninguno, no un hueco.
     etiquetas: definicion?.etiquetasDelContenido?.(f) ?? {},
     /*
      * El ancla sale de TODAS las columnas declaradas, no de una pareja escrita aquí. Con
@@ -894,7 +1352,17 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     // cuando ninguna columna declarada trae el ancla, en vez de dejar que la fila caiga en
     // la rama de otra: un motivo prestado es peor que ninguno, porque propone una salida
     // que no existe.
-    anclaEstado: (f.ancla_estado as EstadoAncla | null) ?? 'ancla-ausente',
+    /*
+     * El veredicto de la capacidad va POR DELANTE del CASE cuando lo hay, y no al revés: el
+     * CASE dice lo que el SQL puede juzgar, y `estadoDeLaFila` lo que solo se puede calcular
+     * fuera. Hoy solo C5 lo declara, y su CASE es la constante «disponible», así que el orden
+     * no cambia ninguna respuesta viva — pero lo correcto es que la respuesta más informada
+     * gane, no la que llegó antes.
+     */
+    anclaEstado:
+      CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva]?.estadoDeLaFila?.(f) ??
+      (f.ancla_estado as EstadoAncla | null) ??
+      'ancla-ausente',
     modelo: f.modelo as string,
     promptVersion: f.prompt_version as string,
     origenKey: f.origen_key as OrigenKey,
@@ -967,7 +1435,7 @@ export async function panelPropuestas(
 
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, ${proyeccion.columnas},
-             p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
+             p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen, p.huella_material,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
              coalesce(${proyeccion.titulos}) as ancla_titulo,
              case ${proyeccion.motivo} else null end as ancla_estado,
@@ -1063,11 +1531,13 @@ export async function panelPropuestas(
     // suya perfectamente válida después del G0 se quedaba sin ancla que ofrecer, y sin que
     // faltara ninguna entrada que el compilador echara de menos.
     //
-    // Se pide una fila de más para saber si el corte dejó algo fuera, y el corte se DICE.
+    // Se pide una plaza de más para saber si el corte dejó algo fuera, y el corte se DICE. La
+    // cola puede además decirlo ELLA —C5 lo hace, porque filtra por algo que su `limit` no
+    // sabe—, así que los dos se suman: la de más que sobra, o el aviso de la cola.
     const candidatas = Object.fromEntries(
       await Promise.all(
         CAPACIDADES_ACTIVAS.map(async (k) => {
-          const filas = await CAPACIDAD_EN_EL_PANEL[k].candidatas(
+          const { lista, hayMas } = await CAPACIDAD_EN_EL_PANEL[k].candidatas(
             tx,
             workspaceId,
             patron,
@@ -1075,7 +1545,10 @@ export async function panelPropuestas(
           );
           return [
             k,
-            { lista: filas.slice(0, PAGINA_ANCLAS), hayMas: filas.length > PAGINA_ANCLAS },
+            {
+              lista: lista.slice(0, PAGINA_ANCLAS),
+              hayMas: hayMas || lista.length > PAGINA_ANCLAS,
+            },
           ] as const;
         }),
       ),
@@ -1912,6 +2385,44 @@ const REVALIDAR: Record<
       );
     }
   },
+  C5: async (tx, entrada, huellaMaterial) => {
+    /*
+     * Lo que puede haber pasado mientras se preparaba la llamada es que ALGUIEN CIERRE las
+     * señales — que es el desenlace bueno, y precisamente por eso no hay que pagar por
+     * remediarlas. Un grafo que llega aquí ya sin nada abierto no se despacha.
+     *
+     * Aquí había un corte por SNAPSHOT, y estaba mal leído: lo inmutable es cada snapshot, no
+     * el journey («el grafo de trabajo no se cierra nunca», RF-05.8). Un journey que ha pasado
+     * una design version se sigue editando, y era justo el que más señales acumula.
+     */
+    const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
+    if (!journey) {
+      throw new ErrorAI('Ese journey dejó de existir mientras se preparaba la llamada');
+    }
+    if (validarJourney(journey).length === 0) {
+      throw new ErrorAI(
+        'Las señales de ese journey se cerraron mientras se preparaba la llamada: no había nada que remediar y no se llamó al proveedor',
+      );
+    }
+    /*
+     * Y que el grafo siga siendo EL QUE SE ARMÓ EN EL PROMPT, no solo que le queden señales.
+     *
+     * Esta misma comparación existía en `COMPROBAR.C5`, y allí llega tarde: para entonces la
+     * llamada ya salió, ya se pagó y ya está en el libro. Una edición ajena en el hueco entre
+     * preparar y despachar —renombrar un nodo, mover una transición— dejaba pasar el despacho
+     * mientras quedara alguna señal abierta, y el informe se descartaba después, con el coste
+     * hecho. Es determinista, no una carrera improbable: basta con que alguien edite el grafo.
+     *
+     * Se compara aquí, que es el último punto donde no cuesta nada, y sigue comparándose allí,
+     * que es el único donde se puede afirmar sobre lo que el modelo YA dijo. Las dos no sobran:
+     * entre este chequeo y la escritura sigue pasando la llamada entera.
+     */
+    if (huellaDelMaterialDeC5(journey) !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'El grafo de ese journey cambió mientras se preparaba la llamada: lo que se iba a enviar ya no lo describe, así que no se llamó al proveedor. Vuelve a pedirlo.',
+      );
+    }
+  },
 };
 
 /**
@@ -1933,13 +2444,16 @@ type Preparacion = {
   /**
    * La HUELLA del material que se le enseñó al modelo, para las capacidades que la declaran.
    *
-   * Existe porque entre PREPARAR y el despacho hay un commit: `prepararAlcance` arma el prompt
-   * y cierra su transacción, y `comprobarDespacho` corre en otra. Lo que se comprueba allí
-   * tiene que ser que el material SIGA SIENDO EL QUE SE ARMÓ, y eso no lo dice ningún
-   * `exists`: preguntar «¿queda alguna evidencia utilizable?» pasa aunque la que se revocó sea
-   * justo una de las que el prompt ya lleva dentro.
+   * Lo que sostiene, y no es poco: la llamada al proveedor pasa FUERA de toda transacción, así
+   * que entre preparar y persistir el workspace puede haber cambiado. Comparar contra una
+   * lectura nueva dice si algo cambió DESDE ESA LECTURA; comparar contra esto dice si el
+   * contenido habla del estado que el modelo tuvo delante, que es otra pregunta y la que
+   * importa.
    *
-   * `undefined` en las capacidades que no la declaran, que es su respuesta y no un hueco.
+   * Y ya antes del despacho: entre `PREPARAR` y `comprobarDespacho` hay un commit, y lo que
+   * hay que comprobar allí es que el material SIGA SIENDO EL QUE SE ARMÓ. Eso no lo dice
+   * ningún `exists`: preguntar «¿queda alguna evidencia utilizable?» pasa aunque la que se
+   * revocó sea justo una de las que ya están dentro del prompt construido.
    */
   huellaMaterial?: string;
 };
@@ -2125,6 +2639,78 @@ const PREPARAR: Record<
       huellaMaterial: huellaDelMaterial(materialDeInsights(material).texto),
     };
   },
+  C5: async (tx, entrada) => {
+    // El MISMO lector que usa la pantalla del journey, no una consulta paralela: lo que se
+    // le enseña al modelo y lo que la validación evalúa tienen que salir de la misma
+    // lectura, o las señales del prompt y las de la comprobación pueden discrepar.
+    const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
+    if (!journey) throw new ErrorAI('El journey no existe en este workspace');
+    const grafo = grafoParaElModelo(journey);
+    /*
+     * Un grafo SIN señales no se manda al proveedor, y no por ahorrar: la respuesta ya se
+     * sabe. `validarJourney` es determinista y acaba de decir que no hay nada que cerrar;
+     * pagar una llamada para que un modelo lo repita es comprar una opinión sobre un hecho.
+     *
+     * Es la misma regla que niega CI sobre un item sin material: cuando la única salida que
+     * cumple el contrato es la que ya tenemos, la respuesta correcta es no llamar.
+     */
+    if (grafo.senales.length === 0) {
+      throw new ErrorAI(
+        'La validación de ese journey no encontró ninguna señal abierta: no hay nada que remediar. (Eso ya lo dice la validación del grafo, que es exacta; no hace falta preguntárselo a la AI.)',
+      );
+    }
+    /*
+     * Y por arriba, el techo del contrato. El esquema admite `MAX_REMEDIACIONES`, así que a un
+     * grafo con más señales se le estaría pidiendo algo que su respuesta no puede llevar: o
+     * viene corta —y la comprobación de abajo la descarta, DESPUÉS de pagarla— o viene
+     * recortada por el propio modelo, eligiendo él qué señales callar. Se dice antes de gastar
+     * y se dice qué hacer, que es lo que puede hacer quien lo lee.
+     */
+    if (grafo.senales.length > MAX_REMEDIACIONES) {
+      throw new ErrorAI(motivoDemasiadasSenales(grafo.senales.length));
+    }
+    const prompt = promptRemediacionJourney({
+      nombre: journey.nombre,
+      servicio: journey.servicioNombre,
+      tipo: journey.tipo,
+      grafo,
+    });
+    /*
+     * Y el otro techo, el del MATERIAL. El cuerpo se recorta a `MAX_MATERIAL`, y aunque las
+     * señales van delante —y por eso ya no se pierden—, en un grafo grande lo que caía fuera
+     * era su TOPOLOGÍA: el modelo leía «el paso X no tiene salida» sin ver el paso X ni una
+     * sola transición. Y el contrato le exige una remediación por señal igual, así que la
+     * única salida que le quedaba era inventarla — y `COMPROBAR.C5` no la puede distinguir de
+     * una buena, porque cubre exactamente la señal que se le pidió.
+     *
+     * `nucleoDeRemediacion` pone delante las señales, sus nodos y el grafo ENTERO de
+     * transiciones, así que todo eso sobrevive al recorte salvo que ello solo ya no quepa. Ese
+     * caso se dice aquí, antes de gastar, y se dice qué hacer: sin la conectividad completa,
+     * media docena de los códigos que emite la validación —los que preguntan por el grafo y no
+     * por un nodo— no tienen respuesta fiable.
+     */
+    if (!prompt.nucleo.cabe) {
+      throw new ErrorAI(motivoConectividadQueNoCabe(prompt.nucleo.caracteres));
+    }
+    return {
+      sistema: SISTEMA_REMEDIACION_JOURNEY,
+      prompt,
+      /*
+       * Lo que el modelo TUVO DELANTE, para volver a mirarlo cuando haya que escribir. Sin
+       * esto, `COMPROBAR` solo podía comparar contra una lectura NUEVA del grafo, y entre las
+       * dos cabe la llamada entera: otro curador edita el journey, la señal que el informe
+       * remedia sigue existiendo por casualidad, y el consejo —que nombra nodos que ya no
+       * están— se acepta como si fuera de este grafo.
+       *
+       * Y es el GRAFO ENTERO, no solo sus señales. Guardar las claves `(nodoId, codigo)` era
+       * la mitad: renombrar un nodo, cambiar la condición de una transición o rehacer la
+       * topología de alrededor deja las mismas señales y cambia todo lo que el consejo
+       * describe. Lo que hay que fijar es el material, y el material son los nodos, las
+       * aristas y las señales juntos.
+       */
+      huellaMaterial: huellaDelMaterialDeC5(journey),
+    };
+  },
 };
 
 /** La huella de un material, para comparar si sigue siendo el mismo entre dos transacciones.
@@ -2132,6 +2718,139 @@ const PREPARAR: Record<
  * generación— pero sale gratis y ahorra razonar sobre colisiones. */
 function huellaDelMaterial(texto: string): string {
   return createHash('sha256').update(texto).digest('hex');
+}
+
+/**
+ * Lo que cada capacidad comprueba de la salida DEL MODELO contra el estado del workspace,
+ * ya dentro de la transacción que la va a persistir.
+ *
+ * No es lo mismo que el esquema de contenido —que es forma— ni que `REVALIDAR` —que mira el
+ * ancla ANTES de gastar—: esto mira lo que el modelo DIJO, y solo se puede hacer con la fila
+ * delante. Hoy lo necesita una sola capacidad, y por eso conviene decir por qué no vive en la
+ * base como el guard de los huecos de CT: los ids de un checklist son una TABLA, y un trigger
+ * puede consultarlos; las señales de un grafo son una FUNCIÓN PURA de sus nodos y aristas, y
+ * no hay SQL que las recalcule. Se comprueban donde se pueden calcular.
+ *
+ * `Record<CapacidadActiva, …>` para que una capacidad nueva tenga que decir explícitamente
+ * que no comprueba nada, en vez de heredarlo por omisión.
+ */
+const COMPROBAR: Record<
+  CapacidadActiva,
+  (
+    tx: TransactionSql,
+    entrada: GenerarPropuestas,
+    contenidos: ContenidoPropuesta[],
+    huellaMaterial: string | undefined,
+  ) => Promise<void>
+> = {
+  // El contenido de CI se sujeta entero con su esquema y con los CHECK de `evidencia`: no hay
+  // nada que contrastar contra el workspace que no esté ya contrastado.
+  CI: async () => {},
+  C0: async () => {},
+  // Los huecos de CT los comprueba un trigger, que es un suelo más bajo que éste.
+  CT: async () => {},
+  /*
+   * C2 tampoco: su contenido lo sujetan el esquema y los guards de la base —la evidencia
+   * citada es del reto, sus derechos siguen vigentes, y la materialización compara la
+   * descendencia entera contra lo propuesto—. No hay nada que contrastar aquí que no esté ya
+   * contrastado donde puede hacerse de verdad, que es dentro de la transacción que escribe.
+   */
+  C2: async () => {},
+  C5: async (tx, entrada, contenidos, huellaMaterial) => {
+    const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
+    if (!journey) throw new ErrorAI('El journey dejó de existir mientras se generaba el informe');
+    const grafoAhora = grafoParaElModelo(journey);
+    const ahora = clavesDeSenales(grafoAhora.senales);
+    const huellaMostrada = huellaMaterial ?? '';
+
+    /*
+     * ── Primero: que el grafo siga siendo EL QUE VIO EL MODELO ──
+     *
+     * La llamada al proveedor ocurre fuera de toda transacción —a propósito: un tercero lento
+     * no retiene una conexión—, así que entre armar el prompt y escribir la fila cabe la
+     * edición de otro curador. Comparar solo contra una lectura nueva no bastaba: si la señal
+     * que el informe remedia sobrevive al cambio, el consejo se acepta aunque nombre nodos que
+     * ya no existen. Se compara contra la HUELLA del grafo que el modelo tuvo delante, que es
+     * lo único que hace de ese informe un informe sobre ESTE grafo — y es el grafo ENTERO y no
+     * sus señales, porque renombrar un nodo o cambiar una transición las deja iguales y cambia
+     * todo lo que el consejo describe.
+     *
+     * Y se descarta ENTERO, no la parte afectada: media respuesta no es revisable.
+     */
+    if (huellaDelMaterialDeC5(journey) !== huellaMostrada) {
+      // `ErrorAI` a secas, no de contrato: el proveedor devolvió lo que se le pidió y lo que
+      // cambió fue el grafo. Ver `ErrorContratoAI`.
+      throw new ErrorAI(
+        'El grafo de ese journey cambió mientras se generaba el informe: lo que dice ya no describe el grafo que hay, así que se descarta. Vuelve a pedirlo.',
+      );
+    }
+
+    /*
+     * ── Y después: UNA remediación por señal, ni de más ni de menos ──
+     *
+     * El prompt pide cómo cerrar CADA señal, así que el informe completo es el que las cubre
+     * todas exactamente una vez. Comprobar solo que ninguna sea inventada dejaba pasar tres
+     * cosas distintas, y las tres se pagan igual: la lista vacía, la que se salta señales
+     * —quien la lee cree que el grafo tiene menos averías de las que tiene— y la que repite
+     * una señal con dos consejos, que es una contradicción sin criterio para resolverla.
+     *
+     * Una señal inventada sigue siendo lo más grave —manda a alguien a arreglar un grafo que
+     * estaba bien— y se nombra aparte, porque el motivo cambia lo que hay que hacer.
+     */
+    const propuestas = clavesDeSenales(
+      contenidos.flatMap((c) => (c as ContenidoRemediacionJourney).remediaciones),
+    );
+    const reales = new Set(ahora);
+    const inventadas = propuestas.filter((c) => !reales.has(c));
+    if (inventadas.length > 0) {
+      throw new ErrorContratoAI(
+        `El informe señala ${inventadas.length} señal(es) que la validación de este journey no emitió: se descarta. Si el grafo cambió mientras se generaba, vuelve a pedirlo.`,
+      );
+    }
+    if (propuestas.join('\n') !== ahora.join('\n')) {
+      const faltan = reales.size - new Set(propuestas).size;
+      throw new ErrorContratoAI(
+        faltan > 0
+          ? `El informe deja ${faltan} señal(es) sin remediar y el contrato pide una por señal: se descarta, porque leerlo haría creer que el grafo tiene menos averías de las que tiene. Vuelve a pedirlo.`
+          : 'El informe propone dos remediaciones para la misma señal: se descarta, porque no hay criterio para elegir entre ellas. Vuelve a pedirlo.',
+      );
+    }
+  },
+};
+
+/**
+ * La huella del MATERIAL que se le enseñó al modelo. El texto exacto, no el grafo del que
+ * salió.
+ *
+ * La diferencia empieza a importar en cuanto el cuerpo se recorta. Sobre el grafo crudo, un
+ * journey grande cuya conectividad cabe pero cuyas etiquetas de cola no —el caso normal en
+ * cuanto crece— cambiaba de huella al editar la etiqueta de un nodo que el modelo NUNCA vio:
+ * el prompt era idéntico byte a byte y la respuesta pagada se descartaba igual, y un informe
+ * ya escrito se marcaba «journey cambiado» por una edición que no le afectaba.
+ *
+ * Se calcula sobre `materialDeJourney(...).texto`, que es la ficha y el cuerpo YA recortados y
+ * neutralizados: exactamente lo que viajó dentro del delimitador. Es la misma definición que
+ * usa C2 con su material, y por la misma razón.
+ *
+ * No hace falta que sea criptográfica —nadie la ataca, solo se compara consigo misma—, pero
+ * sale gratis y ahorra razonar sobre colisiones.
+ */
+function huellaDelMaterialDeC5(journey: JourneyCompleto): string {
+  return huellaDelMaterial(
+    materialDeJourney({
+      nombre: journey.nombre,
+      servicio: journey.servicioNombre,
+      tipo: journey.tipo,
+      grafo: grafoParaElModelo(journey),
+    }).texto,
+  );
+}
+
+/** La clave de una señal —su nodo y su código— en orden estable, para poder comparar dos
+ * listas por igualdad. El `\u0000` separa porque no puede aparecer en un uuid ni en un
+ * código: concatenar sin separador dejaría pares distintos con la misma clave. */
+function clavesDeSenales(xs: { nodoId: string; codigo: string }[]): string[] {
+  return xs.map((x) => `${x.nodoId}\u0000${x.codigo}`).sort();
 }
 
 /**
@@ -2193,6 +2912,58 @@ export async function generarPropuestas(
       throw new ErrorAI(motivo);
     }
 
+    /*
+     * LA COMPROBACIÓN SEMÁNTICA, ANTES DE CERRAR LA LÍNEA.
+     *
+     * El esquema ya se comprobó arriba, y su fallo reetiqueta el intento como
+     * `fuera-de-contrato`. Lo que el esquema no puede ver —que un informe de C5 cubra cada
+     * señal exactamente una vez, y que hable del grafo que el modelo tuvo delante— se
+     * comprobaba solo DENTRO de la transacción que persiste, o sea después de que
+     * `cerrarLlamadas` hubiera anotado la línea como `salida-valida`. El resultado: el libro
+     * decía que esa llamada produjo una salida válida, no nacía ninguna propuesta, y el evento
+     * `LlamadaAISinPropuesta` no salía —su trigger mira el tránsito DESDE `despachada`—. Las
+     * respuestas de C5 fuera de contrato quedaban sistemáticamente sin contar.
+     *
+     * Y no se puede arreglar después: la política `llamada_completar` lleva
+     * `using (resultado = 'despachada')`, así que una línea cerrada no la puede tocar la
+     * aplicación — a propósito, es lo que la hace un hecho consumado. La única manera de que
+     * el libro diga la verdad es preguntar antes de cerrar.
+     *
+     * La comprobación se queda TAMBIÉN dentro de la transacción que persiste, y no sobra:
+     * entre esta lectura y la escritura cabe la edición de otro curador, y solo la de dentro
+     * es atómica con la fila. Lo que queda sin cubrir es exactamente esa ventana —una edición
+     * ajena entre las dos—, y ahí el desenlace no es «fuera de contrato» sino «el mundo se
+     * movió», que es otra cosa y no tiene valor propio en el vocabulario.
+     */
+    try {
+      await conUsuario(actorId, (tx) =>
+        COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial),
+      );
+    } catch (e) {
+      if (!(e instanceof ErrorAI)) throw e;
+      /*
+       * Se reetiqueta SOLO lo que es culpa del modelo. `resultado` describe lo que devolvió el
+       * proveedor, así que un informe que se salta una señal o repite otra es
+       * `fuera-de-contrato`; un journey borrado o editado por otro curador NO lo es —el
+       * proveedor devolvió lo que se le pidió— y anotarlo así corrompería la medida de calidad
+       * y emitiría `LlamadaAISinPropuesta` culpando al modelo de algo que hizo bien.
+       *
+       * En los dos casos la línea SE CIERRA antes de relanzar: dejarla en `despachada` la deja
+       * contando para el tope, sin desenlace y sin coste anotado, que es peor que cualquiera
+       * de las dos etiquetas.
+       */
+      const intentos =
+        e instanceof ErrorContratoAI
+          ? respuesta.intentos.map((i, indice) =>
+              indice === respuesta.intentos.length - 1
+                ? { ...i, resultado: 'fuera-de-contrato' as const, motivo: e.message }
+                : i,
+            )
+          : respuesta.intentos;
+      await cerrarSinTaparElMotivo(actorId, entrada, intentos);
+      throw e;
+    }
+
     const { idSalidaValida } = await cerrarLlamadas(actorId, respuesta.intentos);
     const exitoso = respuesta.intentos[respuesta.intentos.length - 1]!;
     // Sin línea de gasto no hay propuesta: la FK lo impone y aquí se dice con un mensaje
@@ -2225,6 +2996,13 @@ async function persistirPropuestas(
 ): Promise<{ generadas: number }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
+    /*
+     * Lo que la capacidad comprueba de la salida del modelo, AQUÍ y no antes: hace falta la
+     * transacción que va a escribir, para que lo comprobado sea el mismo estado sobre el que
+     * se escribe. Va delante del candado del presupuesto porque no lo necesita y porque
+     * fallar aquí no debe tener a nadie esperando.
+     */
+    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial);
     await bloquearPresupuesto(tx, entrada.workspaceId);
 
     // Retirar la reserva ya no «devuelve» presupuesto: desde que el tope cuenta llamadas
@@ -2292,8 +3070,8 @@ async function persistirPropuestas(
       const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, ${anclas.columnas}, contenido, contenido_original,
-         confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, orden,
-         es_simulacion, creado_por)
+         confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+         llamada_id, orden, es_simulacion, creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino}, ${anclas.valores},
              c.contenido, c.contenido,
              -- La confianza que el modelo declara sobre CADA propuesta, traducida a la escala
@@ -2305,6 +3083,10 @@ async function persistirPropuestas(
              -- maquillar sin que se vea.
              (${tx.json(CONFIANZA_PROPUESTA_NUMERICA)}::jsonb ->> (c.contenido ->> 'confianzaPropuesta'))::numeric,
              ${llamada.modelo}, ${PROMPT_VERSION}, ${alcance.alcanceResumen},
+             -- La huella del material que el modelo tuvo delante, para las capacidades que la
+             -- declaran. Se escribe al nacer y no se toca: un valor reescribible después no
+             -- diría nada sobre lo que se leyó.
+             ${alcance.huellaMaterial ?? null},
              ${alcance.origenKey}, ${llamada.id},
              -- El puesto en el lote sale de la MISMA sentencia que inserta (with
              -- ordinality, que numera desde 1, de ahi el -1) y no de un contador aparte

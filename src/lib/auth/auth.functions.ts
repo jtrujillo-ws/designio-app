@@ -16,12 +16,47 @@ import {
   listarMiembros,
   usuarioConMembresias,
 } from './auth.servicio';
+import { falloDeDominio, respuestaDeConfiguracion } from '@/lib/configuracion.server';
 import { descontarIntento, permitirIntento, registrarExito } from './limitador.server';
 import { COOKIE_SESION, DURACION_SESION_S, firmarSesion } from './sesion.server';
 
 /** Server functions de auth. Convención dura: este módulo solo exporta server functions. */
 
 const ERROR_LIMITE = 'Demasiados intentos; espera unos minutos e intenta de nuevo';
+
+/*
+ * ── El tercer desenlace de entrar ──────────────────────────────────────────────────────
+ *
+ * (Comentario de MÓDULO, no JSDoc: describe el flujo de estas server functions, no la
+ * función que viene justo debajo. Escrito como JSDoc quedaba colgado de `fijarCookieSesion`,
+ * que no documenta nada de esto.)
+ *
+ * Entrar tiene TRES desenlaces, no dos, y la pantalla los trataba como dos.
+ *
+ * Los dos que ya estaban son del visitante: entró, o sus credenciales no valen (o gastó el
+ * cupo). El tercero no es suyo: el despliegue no puede completar un login —falta una
+ * variable, el DSN no parsea, no hay clave de firma— y eso salía como EXCEPCIÓN, que el
+ * `catch` de la pantalla convertía en «No se pudo iniciar sesión; intenta de nuevo».
+ *
+ * Ese mensaje es una instrucción, y era una que no podía funcionar nunca: quien lo lee
+ * reintenta, revisa su contraseña, la cambia. Pasó de verdad en el despliegue de Railway con
+ * `DATABASE_URL_APP` puesta al valor «host / puerto» en vez de a una URL —medido:
+ * `postgres()` lanza un `TypeError` al construir el pool—, y se perdió un buen rato buscando
+ * el fallo en el sitio equivocado.
+ *
+ * Así que el desenlace se DICE, con un campo que la pantalla puede leer:
+ * `reintentable: false` significa que volver a pulsar no cambia nada. Y se decide por el TIPO
+ * del error (`ErrorConfiguracion`), no por su texto: los tres sitios que lo lanzan tienen tres
+ * redacciones distintas y habrá un cuarto.
+ *
+ * Lo que NO viaja al navegador es el detalle: esta pantalla es pública y el detalle nombra
+ * variables de entorno —y a veces lleva un DSN con su contraseña—. El detalle va al registro
+ * del servidor, que es donde lo lee quien puede arreglarlo.
+ *
+ * Las dos piezas —`falloDeDominio` y `respuestaDeConfiguracion`— viven en
+ * `configuracion.server` y no aquí: este módulo solo exporta server functions (convención
+ * dura), y la clasificación tenía que quedar donde una prueba pudiera llamarla.
+ */
 
 async function fijarCookieSesion(usuarioId: string): Promise<void> {
   setCookie(COOKIE_SESION, await firmarSesion(usuarioId), {
@@ -48,20 +83,32 @@ export const iniciarSesion = createServerFn({ method: 'POST' })
     const permitidoEmail = permitirIntento(clavePorEmail, 10);
     const permitidoIp = permitirIntento(clavePorIp, 30);
     if (!permitidoEmail || !permitidoIp) {
-      return { ok: false as const, error: ERROR_LIMITE };
+      return falloDeDominio(ERROR_LIMITE);
     }
-    const usuario = await autenticar(data.email, data.password);
-    if (!usuario) {
-      // Fallo de dominio, no de transporte: mismo mensaje exista o no la cuenta.
-      return { ok: false as const, error: 'Correo o contraseña incorrectos' };
+    try {
+      const usuario = await autenticar(data.email, data.password);
+      if (!usuario) {
+        // Fallo de dominio, no de transporte: mismo mensaje exista o no la cuenta.
+        return falloDeDominio('Correo o contraseña incorrectos');
+      }
+      // El éxito limpia la ventana de la cuenta y se descuenta del cupo de la IP:
+      // una oficina tras un NAT con muchos logins válidos jamás se bloquea, pero un
+      // atacante no puede lavar sus fallos acumulados con un login propio.
+      registrarExito(clavePorEmail);
+      descontarIntento(clavePorIp);
+      // Firmar la sesión entra en el try a propósito: es el otro sitio donde un despliegue
+      // sin configurar se cae, y encima DESPUÉS de haber comprobado que la contraseña era
+      // buena — el caso donde «revísala» miente más.
+      await fijarCookieSesion(usuario.id);
+      return { ok: true as const, usuario };
+    } catch (e) {
+      // Solo se traduce lo que es de configuración. Cualquier otra cosa se relanza: un fallo
+      // que nadie ha clasificado tiene que verse como lo que es, no disfrazarse del tercer
+      // desenlace — que es el vicio contrario al que este cambio corrige.
+      const fallo = respuestaDeConfiguracion('login', e);
+      if (fallo) return fallo;
+      throw e;
     }
-    // El éxito limpia la ventana de la cuenta y se descuenta del cupo de la IP:
-    // una oficina tras un NAT con muchos logins válidos jamás se bloquea, pero un
-    // atacante no puede lavar sus fallos acumulados con un login propio.
-    registrarExito(clavePorEmail);
-    descontarIntento(clavePorIp);
-    await fijarCookieSesion(usuario.id);
-    return { ok: true as const, usuario };
   });
 
 export const cerrarSesion = createServerFn({ method: 'POST' }).handler(async () => {
@@ -82,16 +129,26 @@ export const establecerPassword = createServerFn({ method: 'POST' })
     // El token es aleatorio de 256 bits; el límite aquí evita gasto de CPU (bcrypt) al azar.
     const clavePorIp = `activar:ip:${ipDelRequest()}`;
     if (!permitirIntento(clavePorIp, 30)) {
-      return { ok: false as const, error: ERROR_LIMITE };
+      return falloDeDominio(ERROR_LIMITE);
     }
-    const usuario = await activarConToken(data.token, data.password);
-    if (!usuario) {
-      return { ok: false as const, error: 'La invitación no es válida o ya expiró' };
+    // La activación cuenta el mismo tercer desenlace que el login, y por los mismos dos
+    // sitios: la conexión de aplicación y la firma de la sesión. Quien estrena su invitación
+    // contra un despliegue mal configurado leía «la invitación no es válida o ya expiró»… no,
+    // leía el `catch` de la pantalla; lo mismo da: le decíamos que el problema era suyo.
+    try {
+      const usuario = await activarConToken(data.token, data.password);
+      if (!usuario) {
+        return falloDeDominio('La invitación no es válida o ya expiró');
+      }
+      // Las activaciones válidas no consumen cupo (misma lógica que el login).
+      descontarIntento(clavePorIp);
+      await fijarCookieSesion(usuario.id);
+      return { ok: true as const, usuario };
+    } catch (e) {
+      const fallo = respuestaDeConfiguracion('activación de invitación', e);
+      if (fallo) return fallo;
+      throw e;
     }
-    // Las activaciones válidas no consumen cupo (misma lógica que el login).
-    descontarIntento(clavePorIp);
-    await fijarCookieSesion(usuario.id);
-    return { ok: true as const, usuario };
   });
 
 /** Miembros del workspace para la pantalla Personas (el loader pasa el workspace del guard). */

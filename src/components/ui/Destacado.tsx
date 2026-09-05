@@ -17,7 +17,12 @@ export function Destacado({
 }) {
   const [encendido, setEncendido] = useState(destacado);
   useEffect(() => {
-    if (!destacado) return;
+    // Al dejar de ser el destacado (cambia `destacar` antes de que venza el tiempo) se apaga
+    // aquí mismo: el cleanup solo cancela el temporizador, no apaga nada.
+    if (!destacado) {
+      setEncendido(false);
+      return;
+    }
     setEncendido(true);
     document.getElementById(idDeDestacado(id))?.scrollIntoView({ block: 'center' });
     const t = setTimeout(() => setEncendido(false), 4000);

@@ -1,3 +1,4 @@
+import { CAPACIDADES, CAPACIDADES_ACTIVAS } from './ai.schemas';
 import type { CapacidadActiva } from './ai.schemas';
 
 /**
@@ -224,11 +225,31 @@ export function promptCriterios(reto: {
  * prueba que ata los dos lados insertando exactamente este máximo y uno más. El vínculo es
  * el test, no la esperanza de que nadie toque uno de los dos.
  */
-export const MAX_CRITERIOS_POR_LOTE = 4;
+/*
+ * El techo del lote se mudó a `ai.schemas`, con el resto del contrato de la capacidad: es lo
+ * que el servicio exige al validar la salida, y tenerlo aquí obligaba al registro de
+ * capacidades a importar del módulo que lo importa a él. Se reexporta para no mover a los
+ * llamantes, que lo piden por el prompt.
+ */
+export { MAX_CRITERIOS_POR_LOTE } from './ai.schemas';
 
 /** Esquemas de salida estructurada (`output_config.format`). Espejo del Zod de la
  * capacidad: el modelo responde con esta forma y Zod sigue siendo la última palabra. */
-export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = {
+/**
+ * El esquema JSON de UNA propuesta, por capacidad. El SOBRE del lote no se escribe aquí.
+ *
+ * Lo estaba, y esa era la grieta: `ESQUEMA_SALIDA.C0` declaraba a mano el campo `criterios` y
+ * su techo, mientras `CAPACIDADES.C0.lote` declaraba los suyos por su cuenta. Las dos mitades
+ * gobiernan el MISMO sobre —una le dice al proveedor qué devolver, la otra le dice al servicio
+ * qué leer— y nada las ataba: la comprobación de la costura solo miraba que las dos listas
+ * tuvieran las mismas claves. Con un campo distinto en cada sitio, el proveedor devuelve el
+ * sobre correcto según SU esquema y el servicio lee otra propiedad, así que descarta por
+ * «fuera de contrato» una respuesta ya pagada; con un techo distinto, la descarta por tamaño.
+ *
+ * Ahora el sobre lo pone `esquemaDeSalida` desde `CAPACIDADES[c].lote`, que es la misma
+ * declaración que lee el servicio. No pueden discrepar porque solo hay una.
+ */
+const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>> = {
   CI: {
     type: 'object',
     additionalProperties: false,
@@ -294,62 +315,79 @@ export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> = 
     },
   },
   C0: {
-    type: 'object',
-    additionalProperties: false,
-    required: ['criterios'],
-    properties: {
-      criterios: {
-        type: 'array',
-        minItems: 1,
-        maxItems: MAX_CRITERIOS_POR_LOTE,
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: [
-            'kpi',
-            'definicion',
-            'objetivo',
-            'ventanaDias',
-            'lineaBasePlan',
-            'razonamiento',
-            'confianzaPropuesta',
-            'citas',
-          ],
-          properties: {
-            kpi: { type: 'string' },
-            definicion: { type: 'string', description: 'Cómo se calcula exactamente' },
-            objetivo: { type: 'string', description: 'Valor objetivo, con unidad' },
-            ventanaDias: { type: 'integer', minimum: 1, maximum: 3650 },
-            lineaBasePlan: { type: 'string', description: 'Cómo obtener la línea base' },
-            razonamiento: { type: 'string', description: 'Por qué este criterio sirve al reto' },
-            confianzaPropuesta: {
-              type: 'string',
-              enum: ['alta', 'media', 'baja'],
-              description: 'Cómo de seguro estás de ESTE criterio',
-            },
-            citas: {
-              type: 'array',
-              minItems: 1,
-              maxItems: 6,
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['fragmento', 'localizacion'],
-                properties: {
-                  fragmento: {
-                    type: 'string',
-                    description: 'Fragmento LITERAL de la formulación del reto que sostiene el criterio',
-                  },
-                  localizacion: { type: 'string', description: 'Qué parte del material es' },
-                },
+      type: 'object',
+      additionalProperties: false,
+      required: [
+        'kpi',
+        'definicion',
+        'objetivo',
+        'ventanaDias',
+        'lineaBasePlan',
+        'razonamiento',
+        'confianzaPropuesta',
+        'citas',
+      ],
+      properties: {
+        kpi: { type: 'string' },
+        definicion: { type: 'string', description: 'Cómo se calcula exactamente' },
+        objetivo: { type: 'string', description: 'Valor objetivo, con unidad' },
+        ventanaDias: { type: 'integer', minimum: 1, maximum: 3650 },
+        lineaBasePlan: { type: 'string', description: 'Cómo obtener la línea base' },
+        razonamiento: { type: 'string', description: 'Por qué este criterio sirve al reto' },
+        confianzaPropuesta: {
+          type: 'string',
+          enum: ['alta', 'media', 'baja'],
+          description: 'Cómo de seguro estás de ESTE criterio',
+        },
+        citas: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 6,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['fragmento', 'localizacion'],
+            properties: {
+              fragmento: {
+                type: 'string',
+                description: 'Fragmento LITERAL de la formulación del reto que sostiene el criterio',
               },
+              localizacion: { type: 'string', description: 'Qué parte del material es' },
             },
           },
         },
       },
-    },
   },
 };
+
+/**
+ * El esquema que se le pide al proveedor: el de UNA propuesta, o el SOBRE del lote alrededor
+ * de él — con el campo y el techo que la capacidad declara en `CAPACIDADES[c].lote`, que es
+ * exactamente lo que el servicio va a leer de vuelta.
+ */
+export function esquemaDeSalida(c: CapacidadActiva): Record<string, unknown> {
+  const { lote } = CAPACIDADES[c];
+  if (lote === null) return ESQUEMA_DE_UNA_PROPUESTA[c];
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: [lote.campo],
+    properties: {
+      [lote.campo]: {
+        type: 'array',
+        minItems: 1,
+        maxItems: lote.maximo,
+        items: ESQUEMA_DE_UNA_PROPUESTA[c],
+      },
+    },
+  };
+}
+
+/** El mismo, por capacidad, para quien lo quiera de una vez (el adaptador del proveedor). */
+export const ESQUEMA_SALIDA: Record<CapacidadActiva, Record<string, unknown>> =
+  Object.fromEntries(
+    CAPACIDADES_ACTIVAS.map((c) => [c, esquemaDeSalida(c)]),
+  ) as Record<CapacidadActiva, Record<string, unknown>>;
 
 /**
  * PRESENCIA LITERAL de las citas (SYS-17 / RF-08.7): qué fragmentos aparecen, tal cual, en

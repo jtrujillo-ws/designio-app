@@ -1,22 +1,47 @@
-import type { CSSProperties } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
-import { Card } from '@/components/ui/Card';
-import { Chip } from '@/components/ui/Chip';
-import { JourneyBadge } from '@/components/ui/JourneyBadge';
 import { Tabs } from '@/components/ui/Tabs';
-import { Wordmark } from '@/components/ui/Wordmark';
+import type { JourneyN } from '@/components/ui/JourneyBadge';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { cerrarSesion } from '@/lib/auth/auth.functions';
-import type { ArbolWorkspace, ProyectoArbol, RetoArbol } from '@/lib/arbol/arbol.schemas';
-import { LOOP_BANCO_ANDINO, destinoDeJourney, type JourneyLoop } from '@/lib/loop/loop-data';
+import type {
+  ArbolWorkspace,
+  ProyectoArbol,
+  RetoArbol,
+  ServicioArbol,
+} from '@/lib/arbol/arbol.schemas';
+import {
+  JOURNEYS_DEL_LOOP,
+  destinoDeJourney,
+  journeyDelLoop,
+  type JourneyLoop,
+} from '@/lib/loop/loop-data';
+import {
+  JOURNEYS,
+  loopDeProyecto,
+  marcaDeReto,
+  type EstadoDelLoop,
+  type EstadoJourney,
+} from '@/lib/loop/loop-estado';
+import type { GatesDeProyecto, ResumenDelLoop } from '@/lib/loop/loop.schemas';
 import { etiquetaDeDestino, type Destino } from '@/lib/destinos';
 import { EnlaceA, navegarA } from '@/components/ui/EnlaceA';
 import { Buscador } from '@/components/loop/Buscador';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
+import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 
-/** Pantalla Loop J1–J7 — recreación de la referencia hifi del design system (ui_kits/designio). */
+/**
+ * Pantalla Loop J1–J7 — dirección 3a del handoff «Loop · impacto visual»: lateral en negro
+ * violeta que navega el árbol cliente → servicios → retos, y el loop narrado solo en el
+ * contenido (cabecera de arco, spotlight del journey en curso, «Te toca a ti», los siete
+ * recorridos).
+ *
+ * Regla de propiedad del chrome: el lateral posee marca, cliente y usuario; la topbar no
+ * repite ninguno de los tres, y la ruta se imprime solo en el main.
+ */
 
 /** Lo que la pantalla necesita del usuario autenticado (lo publica el guard de /_autenticada). */
 export type MembresiaLoop = { workspaceId: string; workspaceNombre: string; rol: string };
@@ -26,6 +51,9 @@ export type UsuarioLoop = {
 };
 
 const TAB_LOOP = 'Loop J1–J7';
+
+/** Blanco de la tinta inversa, a las opacidades que fija el sistema sobre `--brand-ink`. */
+const claro = (a: number) => `rgba(247,247,249,${a})`;
 
 /**
  * Las vistas del servicio, cada una con la pantalla real a la que lleva. La referencia hifi
@@ -52,7 +80,7 @@ function vistasDelServicio(
   ];
 }
 
-const micro: CSSProperties = {
+const mono: CSSProperties = {
   fontFamily: 'var(--font-mono)',
   fontWeight: 500,
   fontSize: 11,
@@ -60,167 +88,1419 @@ const micro: CSSProperties = {
   textTransform: 'uppercase',
 };
 
+/** Etiqueta de sección del main: mono 10.5px, tracking .1em, `--text-faint`. */
+const etiquetaSeccion: CSSProperties = {
+  ...mono,
+  fontSize: 10.5,
+  letterSpacing: '.1em',
+  color: 'var(--text-faint)',
+};
+
 export function LoopScreen({
   usuario,
   membresiaActiva,
   arbol,
+  resumen,
 }: {
   usuario: UsuarioLoop;
   membresiaActiva: MembresiaLoop | undefined;
   arbol: ArbolWorkspace | null;
+  resumen: ResumenDelLoop | null;
 }) {
+  const navigate = useNavigate();
+  const membresia = membresiaActiva ?? usuario.membresias[0];
   const servicio = arbol?.servicios[0] ?? null;
   // El proyecto «actual» del servicio, con el mismo criterio que el servicio actual: el
   // primero. Es lo que abren la pestaña de proyecto y las tarjetas de los journeys que
-  // viven en la pantalla del método (etapas y gates).
+  // viven en la pantalla del método (etapas y gates), y el que da su estado al loop.
   const proyecto = servicio?.retos.flatMap((r) => r.proyectos)[0] ?? null;
+  const proyectos = new Map<string, GatesDeProyecto>(
+    (resumen?.proyectos ?? []).map((p) => [p.proyectoId, p]),
+  );
+  const hayEvidencia = resumen?.hayEvidencia ?? false;
+  const loop = loopDeProyecto(proyecto ? (proyectos.get(proyecto.id) ?? null) : null, hayEvidencia);
   const vistas = vistasDelServicio(proyecto);
-  const navigate = useNavigate();
+
+  // Un tramo de la barra del arco ancla a la tarjeta de su journey y la resalta 1,2 s.
+  const [destacado, setDestacado] = useState<JourneyN | null>(null);
+  const temporizador = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (temporizador.current) clearTimeout(temporizador.current);
+    },
+    [],
+  );
+  function irAJourney(j: JourneyN) {
+    document
+      .getElementById(idDeTarjeta(j))
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    setDestacado(j);
+    if (temporizador.current) clearTimeout(temporizador.current);
+    temporizador.current = setTimeout(() => setDestacado(null), 1200);
+  }
+
   return (
-    <div>
-      <Topbar usuario={usuario} membresiaActiva={membresiaActiva} />
-      <div style={{ display: 'flex', minHeight: 780 }}>
-        <Sidebar arbol={arbol} rol={membresiaActiva?.rol ?? ''} />
-        <main style={{ flex: 1, padding: '28px 32px', minWidth: 0 }}>
-          <div style={{ ...micro, color: 'var(--text-muted)' }}>
-            {arbol?.workspaceNombre ?? '—'} / Servicios /{' '}
+    <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
+      <Topbar workspaceId={membresia?.workspaceId ?? null} />
+      <div className="loop-cuerpo" style={{ display: 'flex', minHeight: 820 }}>
+        <Lateral
+          usuario={usuario}
+          membresia={membresia}
+          arbol={arbol}
+          resumen={resumen}
+          proyectos={proyectos}
+          hayEvidencia={hayEvidencia}
+        />
+        <main
+          style={{
+            flex: 1,
+            minWidth: 0,
+            padding: '24px 30px 34px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 22,
+          }}
+        >
+          <div style={{ ...mono, color: 'var(--text-muted)' }}>
+            {arbol?.workspaceNombre ?? membresia?.workspaceNombre ?? '—'} / Servicios /{' '}
             <span style={{ color: 'var(--ink)' }}>{servicio?.nombre ?? 'Sin servicios aún'}</span>
           </div>
-          <div style={{ margin: '16px 0 24px' }}>
-            <Tabs
-              items={vistas.map((v) => v.etiqueta)}
-              value={TAB_LOOP}
-              label="Vistas del servicio"
-              onChange={(etiqueta) => {
-                const destino = vistas.find((v) => v.etiqueta === etiqueta)?.destino;
-                if (destino) void navegarA(navigate, destino);
-              }}
+          <Tabs
+            items={vistas.map((v) => v.etiqueta)}
+            value={TAB_LOOP}
+            label="Vistas del servicio"
+            onChange={(etiqueta) => {
+              const destino = vistas.find((v) => v.etiqueta === etiqueta)?.destino;
+              if (destino) void navegarA(navigate, destino);
+            }}
+          />
+          <CabeceraDeArco
+            loop={loop}
+            servicio={servicio}
+            proyecto={proyecto}
+            resumen={resumen}
+            onTramo={irAJourney}
+          />
+          <div
+            className="loop-cabecera-fila"
+            style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: 16 }}
+          >
+            <Spotlight
+              loop={loop}
+              proyecto={proyecto}
+              resumen={resumen}
+              hayServicio={servicio !== null}
             />
+            <TeTocaATi loop={loop} servicio={servicio} resumen={resumen} proyecto={proyecto} />
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 6 }}>
-            <h1 style={{ font: '800 30px/1.12 var(--font-sans)', margin: 0 }}>
-              El loop del método · journeys J1–J7
-            </h1>
-            <span
-              style={{
-                font: '700 11px var(--font-sans)',
-                color: 'var(--accent)',
-                background: 'var(--accent-soft)',
-                borderRadius: 'var(--r-pill)',
-                padding: '4px 12px',
-              }}
-            >
-              vista de recorrido
-            </span>
-          </div>
-          <p style={{ font: '400 14px/1.5 var(--font-sans)', color: 'var(--text-muted)', maxWidth: 760, margin: '0 0 24px' }}>
-            Los siete recorridos de la plataforma, de la importación al post mortem, con su estado en el
-            ejemplo Banco Andino. El arco de color marca la posición de cada journey en el método.
-          </p>
-          <div style={{ height: 6, borderRadius: 'var(--r-pill)', background: 'var(--grad-arco)', marginBottom: 16 }} />
-          <div style={{ overflowX: 'auto', marginBottom: 24 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(158px, 1fr))', gap: 12, minWidth: 1178 }}>
-              {LOOP_BANCO_ANDINO.map((jl) => (
-                <JourneyCard key={jl.j} jl={jl} proyecto={proyecto} />
-              ))}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <span style={etiquetaSeccion}>Los siete recorridos</span>
+            <div className="loop-recorridos">
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(7, minmax(0, 1fr))',
+                  gap: 10,
+                }}
+              >
+                {JOURNEYS_DEL_LOOP.map((jl) => (
+                  <JourneyCard
+                    key={jl.j}
+                    jl={jl}
+                    estado={loop.journeys[jl.j]}
+                    proyecto={proyecto}
+                    destacada={destacado === jl.j}
+                  />
+                ))}
+              </div>
             </div>
           </div>
-          <Card style={{ padding: '16px 20px', borderRadius: 14 }}>
-            <span style={{ font: '400 13.5px/1.55 var(--font-sans)', color: 'var(--text-body)' }}>
-              <strong>El loop cierra:</strong> los retos candidatos del post mortem (J7) pre-pueblan la etapa 0
-              del siguiente reto (J2) con la memoria del propio workspace
-              {(() => {
-                // La narrativa es J7→J2 sobre el servicio ACTUAL (el del breadcrumb):
-                // solo candidatos de este servicio nacidos del post mortem.
-                const candidatos =
-                  servicio?.retos.filter((r) => r.estado === 'candidato' && r.origen === 'post-mortem') ?? [];
-                if (candidatos.length === 0) return ' — el backlog del servicio espera su primer candidato.';
-                return (
-                  <>
-                    {' — '}
-                    {candidatos.map((r, i) => (
-                      <span key={r.id}>
-                        {i > 0 && (i === candidatos.length - 1 ? ' y ' : ', ')}
-                        <CodigoDeReto reto={r} />
-                      </span>
-                    ))}
-                    {candidatos.length === 1 ? ' ya espera' : ' ya esperan'} en el backlog del servicio.
-                  </>
-                );
-              })()}
-            </span>
-          </Card>
         </main>
       </div>
     </div>
   );
 }
 
+function idDeTarjeta(j: JourneyN): string {
+  return `journey-j${j}`;
+}
+
+// ── Topbar ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * La tarjeta de un journey es un enlace a la pantalla donde ese journey se trabaja, y lo
- * dice en su pie. Cuando no hay a dónde ir (journey del proyecto sin proyecto todavía) la
- * tarjeta se queda sin enlace y el pie explica por qué: marcado, no escondido.
+ * La barra superior ya no lleva marca, cliente ni usuario: los tres viven en el lateral.
+ * Queda el buscador y la acción principal del workspace, invitar al cliente, que abre la
+ * pantalla de personas donde de verdad se invita.
  */
-function JourneyCard({ jl, proyecto }: { jl: JourneyLoop; proyecto: ProyectoArbol | null }) {
-  const active = jl.estado === 'en curso';
-  const pending = jl.estado === 'próximo';
-  const destino = destinoDeJourney(jl.pantalla, proyecto?.id ?? null);
-  const tarjeta = (
-    <Card
-      j={jl.j}
-      active={active}
-      pending={pending}
+function Topbar({ workspaceId }: { workspaceId: string | null }) {
+  const navigate = useNavigate();
+  return (
+    <div
       style={{
-        minWidth: 0,
-        height: '100%',
-        boxSizing: 'border-box',
         display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
-        padding: active ? 15 : '16px 16px 13px',
+        alignItems: 'center',
+        justifyContent: 'flex-end',
+        gap: 14,
+        padding: '14px 28px',
+        background: 'var(--surface)',
+        borderBottom: '1px solid var(--border)',
       }}
     >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <JourneyBadge j={jl.j} />
-        <Chip estado={jl.estado} />
-      </div>
-      <div style={{ font: '700 14.5px/1.25 var(--font-sans)', color: 'var(--ink)' }}>
-        {jl.titulo}
-      </div>
-      <div style={{ font: '400 11.5px/1.5 var(--font-mono)', color: 'var(--text-muted)' }}>
-        {jl.meta}
-      </div>
-      <div
-        style={{ font: '600 12px var(--font-sans)', color: 'var(--text-body)', marginTop: 'auto' }}
+      <Buscador workspaceId={workspaceId} />
+      <Button
+        onClick={() => navigate({ to: '/personas' })}
+        style={{
+          background: 'var(--brand-ink)',
+          color: '#fff',
+          fontSize: 12.5,
+          padding: '9px 16px',
+          whiteSpace: 'nowrap',
+        }}
       >
-        {jl.rol}
+        Invitar al cliente
+      </Button>
+    </div>
+  );
+}
+
+// ── Lateral ─────────────────────────────────────────────────────────────────────────────
+
+function inicialesDe(nombre: string): string {
+  const partes = nombre.trim().split(/\s+/);
+  return (
+    partes
+      .slice(0, 2)
+      .map((p) => (p[0] ?? '').toUpperCase())
+      .join('') || '?'
+  );
+}
+
+const etiquetaLateral: CSSProperties = {
+  ...mono,
+  fontSize: 10,
+  letterSpacing: '.1em',
+  color: claro(0.45),
+  padding: '0 8px 8px',
+};
+
+const filaLateral: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '8px 10px',
+  borderRadius: 9,
+  minHeight: 32,
+  boxSizing: 'border-box',
+  textDecoration: 'none',
+  color: claro(0.72),
+  font: '500 13px var(--font-sans)',
+  background: 'transparent',
+  border: 'none',
+  width: '100%',
+  textAlign: 'left',
+  cursor: 'pointer',
+};
+
+const truncado: CSSProperties = {
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+};
+
+function Lateral({
+  usuario,
+  membresia,
+  arbol,
+  resumen,
+  proyectos,
+  hayEvidencia,
+}: {
+  usuario: UsuarioLoop;
+  membresia: MembresiaLoop | undefined;
+  arbol: ArbolWorkspace | null;
+  resumen: ResumenDelLoop | null;
+  proyectos: ReadonlyMap<string, GatesDeProyecto>;
+  hayEvidencia: boolean;
+}) {
+  const navigate = useNavigate();
+  const rol = membresia?.rol ?? '';
+  const servicios = arbol?.servicios ?? [];
+  const servicioActual = servicios[0] ?? null;
+
+  // Qué servicios están desplegados. El actual nace abierto; el resto se recuerda por
+  // usuario y workspace en el navegador, que es donde vive una preferencia de lectura. Se
+  // lee en un efecto, no en el inicializador: el servidor no tiene localStorage y el primer
+  // fotograma tiene que coincidir con el que él pintó.
+  const claveExpansion = `designio.loop.expandidos.${arbol?.workspaceId ?? ''}`;
+  const [expandidos, setExpandidos] = useState<Set<string>>(
+    () => new Set(servicioActual ? [servicioActual.id] : []),
+  );
+  useEffect(() => {
+    try {
+      const guardado = window.localStorage.getItem(claveExpansion);
+      if (guardado) {
+        const ids = JSON.parse(guardado) as unknown;
+        if (Array.isArray(ids)) {
+          setExtra(new Set(ids.filter((x): x is string => typeof x === 'string')));
+        }
+      }
+    } catch {
+      // Sin almacenamiento (modo privado, política del navegador): se queda el estado inicial.
+    }
+  }, [claveExpansion]);
+  // Lo recordado se aplica ENCIMA del estado inicial, nunca lo sustituye: un servicio actual
+  // recién elegido no se cierra porque una visita anterior lo tuviera cerrado.
+  const [extra, setExtra] = useState<Set<string>>(new Set());
+  const estaAbierto = (id: string) => expandidos.has(id) || extra.has(id);
+  function alternar(id: string) {
+    const abierto = estaAbierto(id);
+    const siguiente = new Set([...expandidos, ...extra]);
+    if (abierto) siguiente.delete(id);
+    else siguiente.add(id);
+    setExpandidos(siguiente);
+    setExtra(new Set());
+    try {
+      window.localStorage.setItem(claveExpansion, JSON.stringify([...siguiente]));
+    } catch {
+      // Igual que arriba: recordar es una comodidad, no un contrato.
+    }
+  }
+
+  async function salir() {
+    await cerrarSesion();
+    await navigate({ to: '/login' });
+  }
+
+  function cambiarWorkspace(ws: string) {
+    // `ws` viaja pegado a la navegación (retainSearchParams): basta con fijarlo aquí
+    // y los loaders de la pantalla actual reaccionan (loaderDeps sobre ws).
+    void navigate({ to: '.', search: (prev) => ({ ...prev, ws }) });
+  }
+
+  const nombreCliente = arbol?.workspaceNombre ?? membresia?.workspaceNombre ?? 'Sin workspace';
+  const aprobaciones = resumen?.aprobaciones ?? [];
+  const primeraAprobacion = aprobaciones[0];
+  const esBoutique = (ROLES_CURADORES as readonly string[]).includes(rol);
+
+  return (
+    <aside
+      className="loop-aside"
+      style={{
+        width: 290,
+        flex: 'none',
+        background: 'var(--brand-ink)',
+        borderRight: '1px solid var(--brand-ink-lift)',
+        padding: '20px 16px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+        boxSizing: 'border-box',
+      }}
+    >
+      {/* 1. Marca — el lateral es su único dueño en la pantalla. */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '0 8px 16px',
+        }}
+      >
+        <Link to="/app" aria-label="designio · loop del método" style={{ textDecoration: 'none' }}>
+          <span className="loop-ancho" style={{ font: '800 21px var(--font-sans)', color: '#fff' }}>
+            designio
+            <PuntoDeMarca />
+          </span>
+          <span
+            className="loop-estrecho"
+            style={{ font: '800 21px var(--font-sans)', color: '#fff' }}
+          >
+            d<PuntoDeMarca />
+          </span>
+        </Link>
+        <span
+          className="loop-ancho"
+          title="Enfoca el buscador"
+          style={{ font: '400 13px var(--font-sans)', color: claro(0.5) }}
+        >
+          ⌘K
+        </span>
+      </div>
+
+      {/* 2. Organización cliente — el único conmutador de cliente de la pantalla. */}
+      <div
+        style={{
+          position: 'relative',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          padding: 10,
+          borderRadius: 11,
+          background: claro(0.09),
+          marginBottom: 16,
+        }}
+      >
+        <span
+          aria-hidden
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: 8,
+            background: 'var(--grad-arco)',
+            color: '#fff',
+            font: '800 11px/28px var(--font-sans)',
+            textAlign: 'center',
+            flex: 'none',
+          }}
+        >
+          {inicialesDe(nombreCliente)}
+        </span>
+        <div
+          className="loop-ancho"
+          style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}
+        >
+          <span style={{ font: '700 13px var(--font-sans)', color: '#fff', ...truncado }}>
+            {nombreCliente}
+          </span>
+          <span style={{ font: '400 11px var(--font-sans)', color: claro(0.55), ...truncado }}>
+            {servicioActual?.nombre ?? 'Sin servicios aún'}
+          </span>
+        </div>
+        {usuario.membresias.length > 1 ? (
+          <>
+            <span
+              className="loop-ancho"
+              aria-hidden
+              style={{ font: '400 12px var(--font-sans)', color: claro(0.5) }}
+            >
+              ▾
+            </span>
+            {/* El selector nativo cubre la tarjeta entera: la tarjeta ES el conmutador. */}
+            <select
+              aria-label="Cliente activo"
+              value={membresia?.workspaceId ?? ''}
+              onChange={(e) => cambiarWorkspace(e.target.value)}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                opacity: 0,
+                cursor: 'pointer',
+              }}
+            >
+              {usuario.membresias.map((m) => (
+                <option key={m.workspaceId} value={m.workspaceId}>
+                  {m.workspaceNombre}
+                </option>
+              ))}
+            </select>
+          </>
+        ) : null}
+      </div>
+
+      {/* 3. Servicios y retos — la función principal del lateral. */}
+      <span className="loop-ancho" style={etiquetaLateral}>
+        Servicios y retos
+      </span>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingBottom: 4 }}>
+        {servicios.length === 0 && (
+          <span
+            className="loop-ancho"
+            style={{ font: '400 12.5px var(--font-sans)', color: claro(0.45), padding: '6px 10px' }}
+          >
+            Sin servicios aún
+          </span>
+        )}
+        {servicios.map((s, indice) => (
+          <ServicioDelArbol
+            key={s.id}
+            servicio={s}
+            actual={indice === 0}
+            abierto={estaAbierto(s.id)}
+            onAlternar={() => alternar(s.id)}
+            proyectos={proyectos}
+            hayEvidencia={hayEvidencia}
+          />
+        ))}
+      </div>
+
+      {/* 4. Workspace — destinos reales, con los pendientes que existen. */}
+      <span className="loop-ancho" style={{ ...etiquetaLateral, padding: '12px 8px 8px' }}>
+        Workspace
+      </span>
+      <DestinoDelWorkspace to="/importacion" etiqueta="Bandeja de importación">
+        {resumen && resumen.importacionPendientes > 0 && (
+          <Contador color="var(--accent)" titulo={`${resumen.importacionPendientes} sin curar`}>
+            {resumen.importacionPendientes}
+          </Contador>
+        )}
+      </DestinoDelWorkspace>
+      {primeraAprobacion && (
+        // No hay pantalla de aprobaciones: la fila abre el proyecto del gate que espera.
+        <Link
+          className="loop-fila"
+          to="/proyecto/$proyectoId"
+          params={{ proyectoId: primeraAprobacion.proyectoId }}
+          title={`Abrir ${primeraAprobacion.proyectoCodigo} · gate G${primeraAprobacion.numero} esperando al ${ETIQUETA_ROL[primeraAprobacion.rolAprobador]?.toLowerCase() ?? primeraAprobacion.rolAprobador}`}
+          style={filaLateral}
+        >
+          <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
+            Aprobaciones
+          </span>
+          <Contador
+            color="var(--warn)"
+            titulo={`${aprobaciones.length} gate(s) esperando aprobación`}
+          >
+            {aprobaciones.length}
+          </Contador>
+        </Link>
+      )}
+      <DestinoDelWorkspace to="/evidencia" etiqueta="Evidencia y derechos de uso" />
+      <DestinoDelWorkspace to="/insights" etiqueta="Insights y citas" />
+      <DestinoDelWorkspace to="/journeys" etiqueta="Journeys y blueprints" />
+      <DestinoDelWorkspace to="/design-versions" etiqueta="Versions y releases" />
+      <DestinoDelWorkspace to="/propuestas" etiqueta="Propuestas AI" />
+      <DestinoDelWorkspace to="/personas" etiqueta="Personas y permisos" />
+      <DestinoDelWorkspace to="/exportacion" etiqueta="Exportación del workspace" />
+      {/* Esta puerta NO se condiciona al rol: detrás están las constancias que cada quien
+          conserva, y ésas no dependen de ninguna membresía. El rótulo nombra lo que cada
+          quien encuentra (ver la historia completa en el commit que la abrió). */}
+      <DestinoDelWorkspace
+        to="/disposicion"
+        etiqueta={
+          (ROLES_DISPOSICION as readonly string[]).includes(rol)
+            ? 'Disposición del workspace'
+            : 'Constancias que conservas'
+        }
+      />
+      {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para
+          los demás roles y, si lo teclean, la RLS de evento_dominio no les da filas. */}
+      {(ROLES_AUDITORIA as readonly string[]).includes(rol) && (
+        <DestinoDelWorkspace to="/auditoria" etiqueta="Auditoría" />
+      )}
+
+      {/* 5. Pie de usuario. */}
+      <div
+        style={{
+          marginTop: 'auto',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 9,
+          padding: '12px 8px 0',
+          borderTop: `1px solid ${claro(0.14)}`,
+        }}
+      >
+        <span
+          aria-hidden
+          style={{
+            width: 30,
+            height: 30,
+            borderRadius: '50%',
+            background: 'var(--grad-arco)',
+            color: '#fff',
+            font: '700 11px/30px var(--font-sans)',
+            textAlign: 'center',
+            flex: 'none',
+          }}
+        >
+          {inicialesDe(usuario.nombre)}
+        </span>
+        <div
+          className="loop-ancho"
+          style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}
+        >
+          <span style={{ font: '600 12.5px var(--font-sans)', color: '#fff', ...truncado }}>
+            {usuario.nombre}
+          </span>
+          <span style={{ font: '400 11px var(--font-sans)', color: claro(0.55), ...truncado }}>
+            {membresia
+              ? `${ETIQUETA_ROL[membresia.rol] ?? membresia.rol} · ${esBoutique ? 'autorizada' : 'propietaria'}`
+              : 'Sin workspace'}
+          </span>
+        </div>
+        <button
+          type="button"
+          className="loop-ancho loop-fila"
+          onClick={salir}
+          style={{
+            ...filaLateral,
+            width: 'auto',
+            padding: '6px 8px',
+            font: '600 11.5px var(--font-sans)',
+            color: claro(0.68),
+          }}
+        >
+          Salir
+        </button>
+      </div>
+      {/* En el riel estrecho el pie no cabe entero: queda el avatar y, debajo, salir. */}
+      <button
+        type="button"
+        className="loop-estrecho loop-fila"
+        onClick={salir}
+        title="Salir"
+        aria-label="Salir"
+        style={{
+          ...filaLateral,
+          // Sin `display` en línea: lo gobierna la clase (oculto en ancho, visible en el riel).
+          display: undefined,
+          justifyContent: 'center',
+          marginTop: 6,
+          padding: '6px 8px',
+          font: '600 11.5px var(--font-sans)',
+          color: claro(0.68),
+        }}
+      >
+        Salir
+      </button>
+    </aside>
+  );
+}
+
+function PuntoDeMarca() {
+  return (
+    <span
+      style={{
+        background: 'var(--grad-arco)',
+        WebkitBackgroundClip: 'text',
+        backgroundClip: 'text',
+        color: 'transparent',
+      }}
+    >
+      .
+    </span>
+  );
+}
+
+function Contador({
+  color,
+  titulo,
+  children,
+}: {
+  color: string;
+  titulo: string;
+  children: ReactNode;
+}) {
+  return (
+    <span
+      title={titulo}
+      style={{
+        minWidth: 18,
+        height: 18,
+        borderRadius: 'var(--r-pill)',
+        background: color,
+        color: '#fff',
+        font: '700 10px/18px var(--font-mono)',
+        textAlign: 'center',
+        padding: '0 5px',
+        boxSizing: 'border-box',
+        flex: 'none',
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+type RutaSinParametros =
+  | '/importacion'
+  | '/evidencia'
+  | '/insights'
+  | '/journeys'
+  | '/design-versions'
+  | '/propuestas'
+  | '/personas'
+  | '/exportacion'
+  | '/disposicion'
+  | '/auditoria';
+
+function DestinoDelWorkspace({
+  to,
+  etiqueta,
+  children,
+}: {
+  to: RutaSinParametros;
+  etiqueta: string;
+  children?: ReactNode;
+}) {
+  return (
+    <Link className="loop-fila" to={to} title={etiqueta} style={filaLateral}>
+      <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
+        {etiqueta}
+      </span>
+      {children}
+    </Link>
+  );
+}
+
+/**
+ * Un servicio del árbol: su fila alterna expandir/colapsar y, abierta, enseña sus retos con
+ * el color del journey donde está cada uno. El chip de journey de la fila del servicio es
+ * solo indicador (el destino del loop es esta misma pantalla).
+ */
+function ServicioDelArbol({
+  servicio,
+  actual,
+  abierto,
+  onAlternar,
+  proyectos,
+  hayEvidencia,
+}: {
+  servicio: ServicioArbol;
+  actual: boolean;
+  abierto: boolean;
+  onAlternar: () => void;
+  proyectos: ReadonlyMap<string, GatesDeProyecto>;
+  hayEvidencia: boolean;
+}) {
+  const proyectoActual = servicio.retos.flatMap((r) => r.proyectos)[0];
+  const loop = proyectoActual
+    ? loopDeProyecto(proyectos.get(proyectoActual.id) ?? null, hayEvidencia)
+    : null;
+  const nRetos = servicio.retos.length;
+  return (
+    <div>
+      <button
+        type="button"
+        className="loop-fila"
+        aria-expanded={abierto}
+        onClick={onAlternar}
+        title={servicio.nombre}
+        style={{
+          ...filaLateral,
+          padding: '9px 10px',
+          background: actual ? claro(0.11) : 'transparent',
+          color: actual ? '#fff' : claro(0.68),
+          fontWeight: actual ? 700 : 500,
+        }}
+      >
+        <span
+          aria-hidden
+          style={{
+            font: '400 10px var(--font-mono)',
+            color: claro(actual ? 0.5 : 0.4),
+            flex: 'none',
+          }}
+        >
+          {abierto ? '▾' : '▸'}
+        </span>
+        <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
+          {servicio.nombre}
+        </span>
+        {loop?.enCurso ? (
+          <span
+            title={`Journey en curso: J${loop.enCurso}`}
+            style={{
+              font: '600 10px var(--font-mono)',
+              color: '#fff',
+              background: `var(--j${loop.enCurso})`,
+              borderRadius: 4,
+              padding: '2px 5px',
+              flex: 'none',
+            }}
+          >
+            J{loop.enCurso}
+          </span>
+        ) : !abierto ? (
+          <span
+            className="loop-ancho"
+            style={{ font: '600 10.5px var(--font-mono)', color: claro(0.4), flex: 'none' }}
+          >
+            {nRetos === 0 ? 'sin retos' : nRetos === 1 ? '1 reto' : `${nRetos} retos`}
+          </span>
+        ) : null}
+      </button>
+      {abierto && (
+        <div
+          className="loop-ancho"
+          style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 2 }}
+        >
+          {/* Lo que el servicio hace HOY (RF-06.10): es del SERVICIO, no de un reto. */}
+          {servicio.estadoEfectivo && (
+            <div
+              title={`Estado efectivo vigente · ${servicio.estadoEfectivo.designVersionCodigo} · ${servicio.estadoEfectivo.constatadoEn}`}
+              style={{
+                display: 'flex',
+                gap: 6,
+                alignItems: 'baseline',
+                padding: '2px 10px 6px 26px',
+                font: '400 11px var(--font-sans)',
+                color: claro(0.45),
+              }}
+            >
+              <span
+                style={{ font: '500 10.5px var(--font-mono)', color: claro(0.75), flexShrink: 0 }}
+              >
+                {servicio.estadoEfectivo.codigo}
+              </span>
+              <span style={truncado}>
+                {servicio.estadoEfectivo.resumen !== ''
+                  ? servicio.estadoEfectivo.resumen
+                  : `constatado el ${servicio.estadoEfectivo.constatadoEn}`}
+              </span>
+            </div>
+          )}
+          {servicio.retos.length === 0 && (
+            <span
+              style={{
+                font: '400 12.5px var(--font-sans)',
+                color: claro(0.45),
+                padding: '6px 10px 6px 26px',
+              }}
+            >
+              Sin retos aún
+            </span>
+          )}
+          {servicio.retos.map((reto, i) => (
+            <RetoDelArbol
+              key={reto.id}
+              reto={reto}
+              activo={actual && i === 0}
+              marca={marcaDeReto(reto, proyectos, hayEvidencia)}
+            />
+          ))}
+          {servicio.retosQueAfectan.map((reto) => (
+            <div
+              key={reto.id}
+              title={`${reto.codigo} ${reto.titulo} · anclado en otro servicio, afecta a este`}
+              style={{
+                ...filaLateral,
+                cursor: 'default',
+                paddingLeft: 26,
+                color: claro(0.45),
+                font: '500 12.5px var(--font-sans)',
+              }}
+            >
+              <span
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: '50%',
+                  border: `1.5px solid ${claro(0.35)}`,
+                  flex: 'none',
+                }}
+              />
+              <span style={{ flex: 1, ...truncado }}>
+                {reto.codigo} {reto.titulo}
+              </span>
+              <span
+                style={{ font: '600 9.5px var(--font-mono)', color: claro(0.35), flex: 'none' }}
+              >
+                afecta
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Un reto: punto con el color del journey donde está, código y título, y a la derecha su
+ * métrica objetivo (si la tiene) o el journey. Con proyecto es un enlace al proyecto, que
+ * es la pantalla del reto hoy; sin proyecto no finge un enlace.
+ */
+function RetoDelArbol({
+  reto,
+  activo,
+  marca,
+}: {
+  reto: RetoArbol;
+  activo: boolean;
+  marca: ReturnType<typeof marcaDeReto>;
+}) {
+  const proyecto = reto.proyectos[0];
+  const atenuado = marca.punteado;
+  const estilo: CSSProperties = {
+    ...filaLateral,
+    paddingLeft: 26,
+    background: activo ? claro(0.07) : 'transparent',
+    color: activo ? '#fff' : claro(atenuado ? 0.45 : 0.68),
+    font: `${activo ? 600 : 500} 12.5px var(--font-sans)`,
+    cursor: proyecto ? 'pointer' : 'default',
+  };
+  const contenido = (
+    <>
+      <span
+        aria-hidden
+        style={{
+          width: 7,
+          height: 7,
+          borderRadius: '50%',
+          background: marca.punteado ? 'transparent' : `var(--j${marca.j})`,
+          border: marca.punteado ? `1.5px dashed var(--j${marca.j})` : 'none',
+          boxSizing: 'border-box',
+          flex: 'none',
+        }}
+      />
+      <span style={{ flex: 1, ...truncado }}>
+        {reto.codigo} {reto.titulo}
+      </span>
+      <span
+        style={{
+          font: '600 10.5px var(--font-mono)',
+          color: claro(activo ? 0.75 : atenuado ? 0.35 : 0.45),
+          flex: 'none',
+        }}
+      >
+        {reto.metricaObjetivo || marca.sufijo}
+      </span>
+    </>
+  );
+  const titulo = `${reto.codigo} ${reto.titulo} · ${
+    marca.punteado ? 'candidato del post mortem, sin proyecto aún' : `en J${marca.j}`
+  }`;
+  if (!proyecto) {
+    return (
+      <div title={`${titulo}${marca.punteado ? '' : ' · sin proyecto aún'}`} style={estilo}>
+        {contenido}
+      </div>
+    );
+  }
+  return (
+    <Link
+      className="loop-fila"
+      to="/proyecto/$proyectoId"
+      params={{ proyectoId: proyecto.id }}
+      title={`${titulo} · abrir ${proyecto.codigo}`}
+      style={estilo}
+    >
+      {contenido}
+    </Link>
+  );
+}
+
+// ── Cabecera de arco ────────────────────────────────────────────────────────────────────
+
+/** El bloque de firma: el único sitio donde el gradiente profundo es fondo. */
+function CabeceraDeArco({
+  loop,
+  servicio,
+  proyecto,
+  resumen,
+  onTramo,
+}: {
+  loop: EstadoDelLoop;
+  servicio: ServicioArbol | null;
+  proyecto: ProyectoArbol | null;
+  resumen: ResumenDelLoop | null;
+  onTramo: (j: JourneyN) => void;
+}) {
+  const reto = servicio?.retos.find((r) => r.proyectos.some((p) => p.id === proyecto?.id));
+  const enCurso = loop.enCurso ? journeyDelLoop(loop.enCurso) : null;
+  const bajada = !servicio
+    ? 'De la importación al post mortem. Este workspace todavía no tiene servicios: el loop arranca cuando exista el primero y entre su material.'
+    : !proyecto
+      ? `De la importación al post mortem. ${servicio.nombre} aún no tiene un proyecto: el método empieza con un reto activado y su G0.`
+      : loop.enCurso === null
+        ? `De la importación al post mortem. ${reto?.codigo ?? 'El reto'} cerró el ciclo entero con veredicto; los candidatos del post mortem esperan en el backlog.`
+        : `De la importación al post mortem. El arco marca la posición de cada journey; ${reto?.codigo ?? proyecto.codigo} va por ${enCurso?.titulo.toLowerCase()} y su gate abierto es G${loop.gateAbierto ?? 7}.`;
+  const metrica = resumen?.metricas?.primaria ?? null;
+
+  return (
+    <div
+      style={{
+        position: 'relative',
+        overflow: 'hidden',
+        borderRadius: 20,
+        background: 'var(--grad-arco-deep)',
+        color: 'var(--text-inverse)',
+        padding: '32px 34px 26px',
+      }}
+    >
+      <div
+        aria-hidden
+        style={{
+          position: 'absolute',
+          inset: 0,
+          background:
+            'radial-gradient(120% 90% at 88% -20%, rgba(255,255,255,.22), transparent 60%)',
+          pointerEvents: 'none',
+        }}
+      />
+      <div
+        className="loop-cabecera-fila"
+        style={{
+          position: 'relative',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-start',
+          gap: 40,
+        }}
+      >
+        <div
+          style={{ maxWidth: 640, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 12 }}
+        >
+          <span style={{ ...mono, letterSpacing: '.14em', color: claro(0.65) }}>
+            Método · {loop.enCurso === null && proyecto ? 'loop cerrado' : 'loop activo'}
+          </span>
+          <h1
+            style={{
+              font: '800 46px/1.06 var(--font-sans)',
+              letterSpacing: '-.015em',
+              margin: 0,
+              color: 'var(--text-inverse)',
+            }}
+          >
+            El loop del método
+            <br />
+            journeys J1–J7
+          </h1>
+          <p
+            style={{
+              font: '400 14.5px/1.55 var(--font-sans)',
+              color: claro(0.78),
+              margin: 0,
+              textWrap: 'pretty',
+            }}
+          >
+            {bajada}
+          </p>
+        </div>
+        <div
+          className="loop-cifras"
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(3, auto)',
+            gap: 34,
+            paddingTop: 6,
+            flex: 'none',
+          }}
+        >
+          <Cifra etiqueta="Journeys cerrados" valor={String(loop.cerrados)} sufijo="/7" />
+          <Cifra
+            etiqueta="Gate abierto"
+            valor={loop.gateAbierto === null ? '—' : `G${loop.gateAbierto}`}
+            titulo={
+              !proyecto
+                ? 'Sin proyecto: no hay gates que abrir'
+                : loop.gateAbierto === null
+                  ? 'Los ocho gates están aprobados'
+                  : undefined
+            }
+          />
+          <Cifra
+            etiqueta={metrica ? metrica.nombre : `Métrica${reto ? ` · ${reto.codigo}` : ''}`}
+            valor={resumen === null ? '—' : (metrica?.actual ?? metrica?.lineaBase ?? '—')}
+            sufijo={metrica ? ` → ${metrica.objetivo}` : undefined}
+            titulo={
+              resumen === null
+                ? 'No se pudieron leer las métricas'
+                : !metrica
+                  ? 'Sin Metric Registry todavía: la cifra llega con el plan de medición (G6)'
+                  : metrica.actual
+                    ? `Último snapshot · línea base ${metrica.lineaBase ?? '—'} · objetivo ${metrica.objetivo}`
+                    : `Sin snapshots aún: se enseña la línea base · objetivo ${metrica.objetivo}`
+            }
+          />
+        </div>
       </div>
       <div
         style={{
-          font: '600 11.5px var(--font-sans)',
-          color: destino ? 'var(--accent)' : 'var(--text-faint)',
+          position: 'relative',
+          marginTop: 30,
+          display: 'grid',
+          gridTemplateColumns: 'repeat(7, 1fr)',
+          gap: 6,
+        }}
+        role="list"
+        aria-label="Barra del arco"
+      >
+        {JOURNEYS.map((j) => {
+          const estado = loop.journeys[j];
+          const jl = journeyDelLoop(j);
+          const enCursoAqui = estado === 'en curso';
+          return (
+            <button
+              key={j}
+              type="button"
+              role="listitem"
+              className="loop-tramo"
+              onClick={() => onTramo(j)}
+              title={`J${j} · ${jl.titulo} · ${estado}: ir a la tarjeta`}
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 7,
+                background: 'transparent',
+                border: 'none',
+                padding: 0,
+                cursor: 'pointer',
+                textAlign: 'left',
+                color: 'inherit',
+                borderRadius: 6,
+              }}
+            >
+              <span
+                aria-hidden
+                style={{
+                  display: 'block',
+                  height: 8,
+                  borderRadius: 'var(--r-pill)',
+                  background: estado === 'próximo' ? claro(0.22) : `var(--j${j})`,
+                  boxShadow: enCursoAqui ? '0 0 0 3px rgba(255,255,255,.35)' : undefined,
+                }}
+              />
+              <span
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontWeight: enCursoAqui ? 700 : estado === 'próximo' ? 500 : 600,
+                  fontSize: 11,
+                  color: enCursoAqui ? '#fff' : claro(estado === 'próximo' ? 0.5 : 0.9),
+                  transition: 'color 150ms ease-out',
+                }}
+              >
+                J{j} · {enCursoAqui ? 'en curso' : jl.corto}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Cifra({
+  etiqueta,
+  valor,
+  sufijo,
+  titulo,
+}: {
+  etiqueta: string;
+  valor: string;
+  sufijo?: string;
+  titulo?: string;
+}) {
+  return (
+    <div title={titulo} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <span
+        style={{
+          ...mono,
+          fontSize: 10.5,
+          letterSpacing: '.1em',
+          color: claro(0.6),
+          ...truncado,
+          maxWidth: 220,
         }}
       >
-        {destino
-          ? `Abrir ${etiquetaDeDestino(destino, proyecto?.codigo)} →`
-          : 'Sin proyecto aún en este servicio'}
-      </div>
-    </Card>
+        {etiqueta}
+      </span>
+      <span style={{ font: '800 38px/1 var(--font-sans)', whiteSpace: 'nowrap' }}>
+        {valor}
+        {sufijo && (
+          <span style={{ font: '600 18px var(--font-sans)', color: claro(0.6) }}>{sufijo}</span>
+        )}
+      </span>
+    </div>
   );
-  if (!destino) return tarjeta;
+}
+
+// ── Spotlight del journey en curso ──────────────────────────────────────────────────────
+
+function Spotlight({
+  loop,
+  proyecto,
+  resumen,
+  hayServicio,
+}: {
+  loop: EstadoDelLoop;
+  proyecto: ProyectoArbol | null;
+  resumen: ResumenDelLoop | null;
+  hayServicio: boolean;
+}) {
+  // Con el loop cerrado el spotlight enseña J7 hecho: el ciclo terminó y lo dice.
+  const j: JourneyN = loop.enCurso ?? 7;
+  const jl = journeyDelLoop(j);
+  const estado = loop.journeys[j];
+  const destino = destinoDeJourney(jl.pantalla, proyecto?.id ?? null);
+  const release = resumen?.release ?? null;
+  const metricas = resumen?.metricas ?? null;
   return (
-    <EnlaceA
-      destino={destino}
-      aria-label={`J${jl.j} ${jl.titulo}: abrir ${etiquetaDeDestino(destino, proyecto?.codigo)}`}
+    <section
+      aria-label={`Journey ${estado}`}
       style={{
-        textDecoration: 'none',
-        color: 'inherit',
-        display: 'block',
+        border: '2px solid transparent',
+        borderRadius: 16,
+        padding: '22px 24px',
+        background:
+          'linear-gradient(var(--surface), var(--surface)) padding-box, var(--grad-arco) border-box',
+        boxShadow: 'var(--shadow-arco)',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
         minWidth: 0,
-        borderRadius: 14,
       }}
     >
-      {tarjeta}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <span
+          style={{
+            font: '600 12px var(--font-mono)',
+            color: '#fff',
+            background: `var(--j${j})`,
+            borderRadius: 6,
+            padding: '3px 8px',
+          }}
+        >
+          J{j}
+        </span>
+        <span
+          style={{
+            font: '700 11px var(--font-sans)',
+            color: estado === 'en curso' ? '#fff' : 'var(--ok)',
+            background: estado === 'en curso' ? 'var(--grad-arco)' : 'var(--ok-soft)',
+            borderRadius: 'var(--r-pill)',
+            padding: '4px 11px',
+          }}
+        >
+          {estado === 'en curso' ? 'En curso' : 'Hecho'}
+        </span>
+        <span style={{ ...mono, color: 'var(--text-faint)', marginLeft: 'auto' }}>
+          {jl.meta}
+          {proyecto ? ` · ${proyecto.codigo}` : ''}
+        </span>
+      </div>
+      <h2 style={{ font: '800 24px/1.15 var(--font-sans)', color: 'var(--ink)', margin: 0 }}>
+        {jl.titulo}
+      </h2>
+      <p
+        style={{
+          font: '400 13.5px/1.55 var(--font-sans)',
+          color: 'var(--text-muted)',
+          maxWidth: 520,
+          margin: 0,
+          textWrap: 'pretty',
+        }}
+      >
+        {jl.descripcion}
+      </p>
+      <div
+        style={{
+          display: 'flex',
+          gap: 26,
+          marginTop: 4,
+          paddingTop: 14,
+          borderTop: '1px solid var(--border)',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+        }}
+      >
+        <Par etiqueta="Responsable" valor={jl.rol} />
+        <Par
+          etiqueta="Release"
+          valor={
+            release
+              ? release.estado === 'planificado'
+                ? `${release.codigo} · planificado`
+                : `${release.codigo} · ${release.diasVivo ?? 0} ${release.diasVivo === 1 ? 'día vivo' : 'días vivos'}`
+              : 'Sin release aún'
+          }
+          titulo={release ? `${release.titulo} · ${release.designVersionCodigo}` : undefined}
+        />
+        <Par
+          etiqueta="Métricas listas"
+          valor={
+            metricas
+              ? `${metricas.listas} de ${metricas.total}${metricas.registryFirmado ? '' : ' · registry sin firmar'}`
+              : 'Sin registry aún'
+          }
+        />
+        {destino ? (
+          <EnlaceA
+            destino={destino}
+            aria-label={`Abrir journey J${j}: ${etiquetaDeDestino(destino, proyecto?.codigo)}`}
+            style={{
+              marginLeft: 'auto',
+              font: '700 13px var(--font-sans)',
+              color: '#fff',
+              background: 'var(--brand-ink)',
+              borderRadius: 'var(--r-sm)',
+              padding: '10px 18px',
+              textDecoration: 'none',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            Abrir journey J{j}
+          </EnlaceA>
+        ) : (
+          <span
+            style={{
+              marginLeft: 'auto',
+              font: '600 12px var(--font-sans)',
+              color: 'var(--text-faint)',
+            }}
+          >
+            {hayServicio ? 'Sin proyecto aún en este servicio' : 'Sin servicio aún'}
+          </span>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function Par({ etiqueta, valor, titulo }: { etiqueta: string; valor: string; titulo?: string }) {
+  return (
+    <div title={titulo} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+      <span style={{ ...mono, fontSize: 10.5, color: 'var(--text-faint)' }}>{etiqueta}</span>
+      <span style={{ font: '600 13px var(--font-sans)', color: 'var(--ink)' }}>{valor}</span>
+    </div>
+  );
+}
+
+// ── Te toca a ti ────────────────────────────────────────────────────────────────────────
+
+type Pendiente = { color: string; texto: string; destino: Destino | null; titulo?: string };
+
+/**
+ * Lo que espera a alguien, con su origen: cada fila navega a donde se resuelve. Es la misma
+ * respuesta que alimenta los contadores del lateral, no otra consulta.
+ */
+function TeTocaATi({
+  loop,
+  servicio,
+  resumen,
+  proyecto,
+}: {
+  loop: EstadoDelLoop;
+  servicio: ServicioArbol | null;
+  resumen: ResumenDelLoop | null;
+  proyecto: ProyectoArbol | null;
+}) {
+  const filas: Pendiente[] = [];
+  if (resumen === null) {
+    filas.push({
+      color: 'var(--danger)',
+      texto: 'No se pudieron leer los pendientes ni las métricas de este workspace',
+      destino: null,
+    });
+  } else {
+    for (const a of resumen.aprobaciones) {
+      filas.push({
+        color: 'var(--warn)',
+        texto: `Aprobación G${a.numero} de ${a.proyectoCodigo} esperando al ${ETIQUETA_ROL[a.rolAprobador]?.toLowerCase() ?? a.rolAprobador}`,
+        destino: { to: '/proyecto/$proyectoId', params: { proyectoId: a.proyectoId } },
+      });
+    }
+    if (resumen.importacionPendientes > 0) {
+      const n = resumen.importacionPendientes;
+      filas.push({
+        color: 'var(--accent)',
+        texto: `${n} ${n === 1 ? 'item' : 'items'} en la bandeja de importación sin curar`,
+        destino: { to: '/importacion' },
+      });
+    }
+    const m = resumen.metricas;
+    if (m && m.registryFirmado && m.listas < m.total && proyecto) {
+      const faltan = m.total - m.listas;
+      filas.push({
+        color: 'var(--j7)',
+        texto: `${faltan} de ${m.total} ${faltan === 1 ? 'métrica sigue' : 'métricas siguen'} sin snapshot`,
+        destino: { to: '/proyecto/$proyectoId', params: { proyectoId: proyecto.id } },
+      });
+    } else if (loop.journeys[7] === 'próximo' && proyecto) {
+      filas.push({
+        color: 'var(--j7)',
+        texto: `J7 se abre cuando G7 quede aprobado (hoy el gate abierto es G${loop.gateAbierto ?? 7})`,
+        destino: null,
+        titulo: 'Informativa: el post mortem no se puede abrir con el gate cerrado',
+      });
+    }
+  }
+  const candidatos =
+    servicio?.retos.filter((r) => r.estado === 'candidato' && r.origen === 'post-mortem') ?? [];
+
+  return (
+    <section
+      aria-label="Te toca a ti"
+      style={{
+        background: 'var(--surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 16,
+        padding: '20px 22px',
+        boxShadow: 'var(--shadow-sm)',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+        minWidth: 0,
+      }}
+    >
+      <span style={etiquetaSeccion}>Te toca a ti</span>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {filas.length === 0 && (
+          <span style={{ font: '500 13px/1.45 var(--font-sans)', color: 'var(--text-muted)' }}>
+            Nada espera por ti ahora mismo.
+          </span>
+        )}
+        {filas.map((f, i) => (
+          <FilaPendiente key={i} fila={f} />
+        ))}
+      </div>
+      <span
+        style={{
+          marginTop: 'auto',
+          font: '400 12px/1.5 var(--font-sans)',
+          color: 'var(--text-faint)',
+        }}
+      >
+        {candidatos.length === 0 ? (
+          'El post mortem pre-puebla la etapa 0 del siguiente reto; el backlog del servicio espera su primer candidato.'
+        ) : (
+          <>
+            El post mortem pre-puebla la etapa 0 de{' '}
+            {candidatos.map((r, i) => (
+              <span key={r.id}>
+                {i > 0 && (i === candidatos.length - 1 ? ' y ' : ', ')}
+                <CodigoDeReto reto={r} />
+              </span>
+            ))}
+            .
+          </>
+        )}
+      </span>
+    </section>
+  );
+}
+
+function FilaPendiente({ fila }: { fila: Pendiente }) {
+  const cuerpo = (
+    <>
+      <span
+        aria-hidden
+        style={{
+          width: 6,
+          height: 6,
+          borderRadius: '50%',
+          background: fila.color,
+          marginTop: 6,
+          flex: 'none',
+        }}
+      />
+      <span style={{ font: '500 13px/1.45 var(--font-sans)', color: 'var(--text-body)' }}>
+        {fila.texto}
+      </span>
+    </>
+  );
+  if (!fila.destino) {
+    return (
+      <div title={fila.titulo} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+        {cuerpo}
+      </div>
+    );
+  }
+  return (
+    <EnlaceA
+      destino={fila.destino}
+      title={`Abrir ${etiquetaDeDestino(fila.destino)}`}
+      style={{
+        display: 'flex',
+        gap: 10,
+        alignItems: 'flex-start',
+        textDecoration: 'none',
+        color: 'inherit',
+      }}
+    >
+      {cuerpo}
     </EnlaceA>
   );
 }
@@ -235,7 +1515,7 @@ function CodigoDeReto({ reto }: { reto: RetoArbol }) {
     return (
       <span
         title={`${reto.codigo} ${reto.titulo} · sin proyecto aún`}
-        style={{ font: '500 13px var(--font-mono)', color: 'var(--ink)' }}
+        style={{ font: '500 12px var(--font-mono)', color: 'var(--ink)' }}
       >
         {reto.codigo}
       </span>
@@ -252,315 +1532,227 @@ function CodigoDeReto({ reto }: { reto: RetoArbol }) {
   );
 }
 
-function inicialesDe(nombre: string): string {
-  const partes = nombre.trim().split(/\s+/);
-  return (
-    partes
-      .slice(0, 2)
-      .map((p) => (p[0] ?? '').toUpperCase())
-      .join('') || '?'
-  );
-}
+// ── Los siete recorridos ────────────────────────────────────────────────────────────────
 
-function Topbar({
-  usuario,
-  membresiaActiva,
-}: {
-  usuario: UsuarioLoop;
-  membresiaActiva: MembresiaLoop | undefined;
-}) {
-  const navigate = useNavigate();
-  const membresia = membresiaActiva ?? usuario.membresias[0];
-
-  async function salir() {
-    await cerrarSesion();
-    await navigate({ to: '/login' });
-  }
-
-  function cambiarWorkspace(ws: string) {
-    // `ws` viaja pegado a la navegación (retainSearchParams): basta con fijarlo aquí
-    // y los loaders de la pantalla actual reaccionan (loaderDeps sobre ws).
-    void navigate({ to: '.', search: (prev) => ({ ...prev, ws }) });
-  }
-
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        padding: '14px 28px',
-        background: 'var(--surface)',
-        borderBottom: '1px solid var(--border)',
-      }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-        <Wordmark />
-        {usuario.membresias.length > 1 ? (
-          <label
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 6,
-              font: '600 13px var(--font-sans)',
-              border: '1px solid var(--border-strong)',
-              borderRadius: 'var(--r-pill)',
-              padding: '5px 14px',
-            }}
-          >
-            <span aria-hidden>●</span>
-            <span style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>
-              Workspace activo
-            </span>
-            <select
-              value={membresia?.workspaceId ?? ''}
-              onChange={(e) => cambiarWorkspace(e.target.value)}
-              style={{
-                font: 'inherit',
-                border: 'none',
-                background: 'transparent',
-                color: 'inherit',
-                cursor: 'pointer',
-                outlineOffset: 4,
-              }}
-            >
-              {usuario.membresias.map((m) => (
-                <option key={m.workspaceId} value={m.workspaceId}>
-                  {m.workspaceNombre}
-                </option>
-              ))}
-            </select>
-          </label>
-        ) : (
-          <span
-            style={{
-              font: '600 13px var(--font-sans)',
-              border: '1px solid var(--border-strong)',
-              borderRadius: 'var(--r-pill)',
-              padding: '5px 14px',
-            }}
-          >
-            ● {membresia?.workspaceNombre ?? 'Sin workspace'}
-          </span>
-        )}
-      </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-        <Buscador workspaceId={membresia?.workspaceId ?? null} />
-        <span
-          style={{
-            width: 32,
-            height: 32,
-            borderRadius: '50%',
-            background: 'var(--grad-arco)',
-            color: '#fff',
-            font: '700 12px/32px var(--font-sans)',
-            textAlign: 'center',
-          }}
-        >
-          {inicialesDe(usuario.nombre)}
-        </span>
-        <span style={{ font: '500 12.5px var(--font-sans)', color: 'var(--text-muted)' }}>
-          {usuario.nombre}
-          {membresia ? ` · ${ETIQUETA_ROL[membresia.rol] ?? membresia.rol}` : ''}
-        </span>
-        <Button variant="ghost" size="sm" onClick={salir}>
-          Salir
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-const filaArbol: CSSProperties = {
-  font: '400 12.5px var(--font-sans)',
-  color: 'var(--text-muted)',
-  padding: '5px 10px 5px 34px',
-  display: 'flex',
-  justifyContent: 'space-between',
-  gap: 8,
+const ETIQUETA_ESTADO: Record<EstadoJourney, string> = {
+  hecho: 'Hecho',
+  'en curso': 'En curso',
+  próximo: 'Próximo',
 };
 
-const truncado: CSSProperties = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
-
-function Sidebar({ arbol, rol }: { arbol: ArbolWorkspace | null; rol: string }) {
-  const item: CSSProperties = {
-    font: '500 13px var(--font-sans)',
-    color: 'var(--text-body)',
-    padding: '7px 10px',
-    borderRadius: 'var(--r-sm)',
-    display: 'flex',
-    justifyContent: 'space-between',
-  };
-  return (
-    <aside
+/**
+ * La tarjeta de un journey es un enlace a la pantalla donde ese journey se trabaja. Cuando
+ * no hay a dónde ir (journey del proyecto sin proyecto todavía) la tarjeta se queda sin
+ * enlace y lo dice. J7 además se deshabilita mientras G7 siga cerrado: el post mortem no se
+ * puede abrir, y el tooltip explica la condición.
+ */
+function JourneyCard({
+  jl,
+  estado,
+  proyecto,
+  destacada,
+}: {
+  jl: JourneyLoop;
+  estado: EstadoJourney;
+  proyecto: ProyectoArbol | null;
+  destacada: boolean;
+}) {
+  const enCurso = estado === 'en curso';
+  const pendiente = estado === 'próximo';
+  const cerradoPorGate = jl.j === 7 && pendiente;
+  const destino = cerradoPorGate ? null : destinoDeJourney(jl.pantalla, proyecto?.id ?? null);
+  const j = jl.j;
+  const tarjeta = (
+    <div
+      id={idDeTarjeta(j)}
+      className="loop-tarjeta"
+      data-enlace={destino ? 'true' : 'false'}
       style={{
-        width: 250,
-        background: 'var(--surface)',
-        borderRight: '1px solid var(--border)',
-        padding: '20px 16px',
+        background: enCurso ? `var(--j${j}-soft)` : pendiente ? 'var(--bg-app)' : 'var(--surface)',
+        border: pendiente
+          ? '1px dashed var(--border-strong)'
+          : `1px solid ${enCurso ? `var(--j${j})` : 'var(--border)'}`,
+        borderLeft: pendiente ? undefined : `3px solid var(--j${j})`,
+        borderRadius: 12,
+        padding: '13px 14px',
         display: 'flex',
         flexDirection: 'column',
-        gap: 4,
+        gap: 6,
+        opacity: pendiente ? 0.6 : 1,
+        height: '100%',
+        boxSizing: 'border-box',
+        minWidth: 0,
+        boxShadow: destacada ? '0 0 0 3px var(--accent-soft), 0 0 0 5px var(--accent)' : undefined,
       }}
     >
-      <div style={{ ...micro, fontSize: 10, color: 'var(--text-faint)', padding: '0 10px 6px' }}>Cliente</div>
-      <div style={{ font: '700 13.5px var(--font-sans)', padding: '7px 10px' }}>
-        {arbol?.workspaceNombre ?? '—'}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ font: '600 11px var(--font-mono)', color: `var(--j${j})` }}>J{j}</span>
+        <span
+          style={{
+            font: '700 10px var(--font-sans)',
+            color: enCurso ? `var(--j${j})` : pendiente ? 'var(--text-muted)' : 'var(--ok)',
+          }}
+        >
+          {ETIQUETA_ESTADO[estado]}
+        </span>
       </div>
-      {(arbol?.servicios.length ?? 0) === 0 && (
-        <div style={{ font: '400 12.5px var(--font-sans)', color: 'var(--text-faint)', padding: '5px 10px 5px 22px' }}>
-          Sin servicios aún
-        </div>
-      )}
-      {arbol?.servicios.map((servicio, indice) => (
-        <div key={servicio.id}>
+      <span style={{ font: '700 13.5px/1.25 var(--font-sans)', color: 'var(--ink)' }}>
+        {jl.titulo}
+      </span>
+      <span
+        style={{
+          font: '400 11px/1.45 var(--font-mono)',
+          color: enCurso ? 'var(--text-muted)' : 'var(--text-faint)',
+        }}
+      >
+        {jl.meta}
+      </span>
+      <span
+        style={{
+          marginTop: 'auto',
+          font: '600 11px var(--font-sans)',
+          color: destino ? 'var(--accent)' : 'var(--text-faint)',
+        }}
+      >
+        {destino
+          ? `Abrir ${etiquetaDeDestino(destino, proyecto?.codigo)} →`
+          : cerradoPorGate
+            ? 'Se abre al aprobar G7'
+            : 'Sin proyecto aún en este servicio'}
+      </span>
+    </div>
+  );
+  if (!destino) {
+    return (
+      <div
+        title={
+          cerradoPorGate
+            ? 'El post mortem se abre cuando G7 quede aprobado: hasta entonces no hay veredicto que dictar'
+            : `J${j} ${jl.titulo}: sin proyecto aún en este servicio`
+        }
+        style={{ minWidth: 0 }}
+      >
+        {tarjeta}
+      </div>
+    );
+  }
+  return (
+    <EnlaceA
+      destino={destino}
+      aria-label={`J${j} ${jl.titulo}: abrir ${etiquetaDeDestino(destino, proyecto?.codigo)}`}
+      style={{
+        textDecoration: 'none',
+        color: 'inherit',
+        display: 'block',
+        minWidth: 0,
+        borderRadius: 12,
+      }}
+    >
+      {tarjeta}
+    </EnlaceA>
+  );
+}
+
+// ── Estado de carga ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Skeleton de la pantalla mientras cargan el árbol y el resumen: la cabecera de arco
+ * mantiene su alto con las tres cifras como barras, las siete tarjetas son cajas hundidas y
+ * el lateral ya está pintado en su color (es ruta: carga primero).
+ */
+export function LoopSkeleton() {
+  const barra = (ancho: number | string, alto = 12): CSSProperties => ({
+    width: ancho,
+    height: alto,
+    borderRadius: 'var(--r-pill)',
+    background: 'rgba(247,247,249,.25)',
+  });
+  return (
+    <div aria-busy style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
+      <div
+        style={{
+          height: 57,
+          background: 'var(--surface)',
+          borderBottom: '1px solid var(--border)',
+          boxSizing: 'border-box',
+        }}
+      />
+      <div style={{ display: 'flex', minHeight: 820 }}>
+        <aside
+          className="loop-aside"
+          style={{
+            width: 290,
+            flex: 'none',
+            background: 'var(--brand-ink)',
+            borderRight: '1px solid var(--brand-ink-lift)',
+            padding: '20px 16px',
+            boxSizing: 'border-box',
+          }}
+        >
+          <span style={{ font: '800 21px var(--font-sans)', color: '#fff', padding: '0 8px' }}>
+            designio
+            <PuntoDeMarca />
+          </span>
+        </aside>
+        <main
+          style={{
+            flex: 1,
+            minWidth: 0,
+            padding: '24px 30px 34px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 22,
+          }}
+        >
+          <div style={{ ...barra(260), background: 'var(--surface-sunken)' }} />
           <div
             style={{
-              font: '600 13px var(--font-sans)',
-              color: 'var(--text-body)',
-              padding: '6px 10px 6px 22px',
-              // Resaltado solo el servicio "actual" (el primero, el que muestra el
-              // breadcrumb); el selector de servicio llegará con más de uno.
-              background: indice === 0 ? 'var(--accent-soft)' : undefined,
-              borderRadius: 'var(--r-sm)',
-              ...truncado,
+              borderRadius: 20,
+              background: 'var(--grad-arco-deep)',
+              padding: '32px 34px 26px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 30,
             }}
           >
-            {servicio.nombre}
-          </div>
-          {/* Lo que el servicio hace HOY (RF-06.10). Va bajo su nombre y no dentro de un
-              reto porque el estado efectivo es del SERVICIO: lo dejan ahí los releases
-              verificados de cualquiera de sus design versions, sea cual sea el proyecto que
-              las llevó. Sin esto, el dato que este árbol existe para ubicar solo se veía
-              entrando en una design version concreta — o sea, sabiendo ya la respuesta. */}
-          {servicio.estadoEfectivo && (
-            <div
-              style={{
-                font: '400 11px var(--font-sans)',
-                color: 'var(--text-faint)',
-                padding: '0 10px 5px 22px',
-                display: 'flex',
-                gap: 6,
-                alignItems: 'baseline',
-              }}
-            >
-              <span style={{ font: '500 10.5px var(--font-mono)', color: 'var(--accent)', flexShrink: 0 }}>
-                {servicio.estadoEfectivo.codigo}
-              </span>
-              <span style={truncado}>
-                {servicio.estadoEfectivo.resumen !== ''
-                  ? servicio.estadoEfectivo.resumen
-                  : `constatado el ${servicio.estadoEfectivo.constatadoEn} sobre ${servicio.estadoEfectivo.designVersionCodigo}`}
-              </span>
-            </div>
-          )}
-          {servicio.retos.map((reto) => (
-            <div key={reto.id}>
-              <div style={filaArbol}>
-                <span style={truncado}>
-                  {reto.codigo} {reto.titulo}
-                </span>
-                {reto.metricaObjetivo && (
-                  <span style={{ font: '500 10.5px var(--font-mono)', color: 'var(--accent)', flexShrink: 0 }}>
-                    {reto.metricaObjetivo}
-                  </span>
-                )}
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 40 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div style={barra(120, 10)} />
+                <div style={barra(420, 40)} />
+                <div style={barra(360, 40)} />
+                <div style={barra(520, 14)} />
               </div>
-              {reto.proyectos.map((proyecto) => (
-                <Link
-                  key={proyecto.id}
-                  to="/proyecto/$proyectoId"
-                  params={{ proyectoId: proyecto.id }}
-                  style={{ ...filaArbol, paddingLeft: 46, textDecoration: 'none' }}
-                >
-                  <span style={truncado}>
-                    {proyecto.codigo} {proyecto.titulo}
-                  </span>
-                </Link>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, auto)', gap: 34 }}>
+                {[0, 1, 2].map((i) => (
+                  <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div style={barra(90, 9)} />
+                    <div style={barra(70, 36)} />
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 6 }}>
+              {[...Array(7)].map((_, i) => (
+                <div key={i} style={barra('100%', 8)} />
               ))}
             </div>
-          ))}
-          {servicio.retosQueAfectan.map((reto) => (
-            <div key={reto.id} style={filaArbol}>
-              <span style={truncado}>
-                {reto.codigo} {reto.titulo}
-              </span>
-              <span style={{ font: '500 9.5px var(--font-mono)', color: 'var(--text-faint)', flexShrink: 0 }}>
-                afecta
-              </span>
-            </div>
-          ))}
-        </div>
-      ))}
-
-      <div style={{ ...micro, fontSize: 10, color: 'var(--text-faint)', padding: '18px 10px 6px' }}>Workspace</div>
-      <div style={{ ...item, font: '700 13px var(--font-sans)', color: 'var(--ink)', background: 'var(--surface-sunken)' }}>
-        <span>Loop del método (J1–J7)</span>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: 16 }}>
+            <div style={{ height: 210, borderRadius: 16, background: 'var(--surface-sunken)' }} />
+            <div style={{ height: 210, borderRadius: 16, background: 'var(--surface-sunken)' }} />
+          </div>
+          <div
+            style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(0, 1fr))', gap: 10 }}
+          >
+            {[...Array(7)].map((_, i) => (
+              <div
+                key={i}
+                style={{ height: 110, borderRadius: 12, background: 'var(--surface-sunken)' }}
+              />
+            ))}
+          </div>
+        </main>
       </div>
-      <Link to="/importacion" style={{ ...item, textDecoration: 'none' }}>
-        <span>Bandeja de importación</span>
-      </Link>
-      <Link to="/evidencia" style={{ ...item, textDecoration: 'none' }}>
-        <span>Evidencia y derechos de uso</span>
-      </Link>
-      <Link to="/insights" style={{ ...item, textDecoration: 'none' }}>
-        <span>Insights y citas</span>
-      </Link>
-      <Link to="/journeys" style={{ ...item, textDecoration: 'none' }}>
-        <span>Journeys y blueprints</span>
-      </Link>
-      <Link to="/design-versions" style={{ ...item, textDecoration: 'none' }}>
-        <span>Design versions y releases</span>
-      </Link>
-      <Link to="/propuestas" style={{ ...item, textDecoration: 'none' }}>
-        <span>Propuestas AI</span>
-      </Link>
-      <div style={item}>
-        <span>Aprobaciones pendientes</span>
-        <span style={{ font: '600 11px var(--font-mono)', color: 'var(--warn)' }}>1</span>
-      </div>
-      <div style={item}>
-        <span>Biblioteca del cliente</span>
-      </div>
-      <div style={item}>
-        <span>Segmentos</span>
-      </div>
-      <Link to="/personas" style={{ ...item, textDecoration: 'none' }}>
-        <span>Personas y permisos</span>
-      </Link>
-      <Link to="/exportacion" style={{ ...item, textDecoration: 'none' }}>
-        <span>Exportación del workspace</span>
-      </Link>
-      {/* Esta puerta NO se condiciona al rol, y el camino hasta aquí explica por qué.
-          Primero estaba cerrada salvo para las dos partes del contrato (RF-01.9), lo cual
-          tiene sentido para DISPONER; pero detrás también están las constancias que cada
-          quien conserva, y ésas no dependen de ninguna membresía —un borrado las destruye
-          todas y `misConstancias` no pide workspace—. Se abrió entonces para `rol === ''`… y
-          seguía cerrada en el caso multi-workspace: quien firmó o ejecutó un borrado puede
-          conservar otra membresía como `disenador` o `stakeholder`, y entonces el rol no está
-          vacío ni es de disposición, así que el enlace desaparecía otra vez y su constancia
-          solo se alcanzaba tecleando la ruta a mano.
-
-          Dos intentos de acertar el predicado son la señal de que el predicado sobra: lo que
-          hay detrás es de todo el mundo, y lo que NO se puede hacer lo dice la pantalla con el
-          motivo que da la propia base. El rótulo nombra lo que cada quien encuentra. */}
-      <Link to="/disposicion" style={{ ...item, textDecoration: 'none' }}>
-        <span>
-          {(ROLES_DISPOSICION as readonly string[]).includes(rol)
-            ? 'Disposición del workspace'
-            : 'Constancias que conservas'}
-        </span>
-      </Link>
-      {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para
-          los demás roles y, si lo teclean, la RLS de evento_dominio no les da filas. */}
-      {(ROLES_AUDITORIA as readonly string[]).includes(rol) && (
-        <Link to="/auditoria" style={{ ...item, textDecoration: 'none' }}>
-          <span>Auditoría</span>
-        </Link>
-      )}
-      <div style={{ marginTop: 'auto', font: '400 11.5px/1.5 var(--font-sans)', color: 'var(--text-faint)', padding: 10 }}>
-        La organización cliente es propietaria del workspace; la boutique opera como autorizada.
-      </div>
-    </aside>
+    </div>
   );
 }

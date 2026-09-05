@@ -21,6 +21,8 @@ Arco J1–J7 (oklch): j1 0.58/0.11/190 · j2 0.58/0.11/215 · j3 0.58/0.11/240 �
 
 Acento (interacción/focus/links): oklch(0.5 0.12 265) + accent-soft oklch(0.95 0.03 265).
 
+Marca (negro violeta, hue J5–J6 con croma mínima): brand-ink oklch(0.22 0.045 305) · brand-ink-lift oklch(0.28 0.055 305). Es la tinta del wordmark, del lateral oscuro del workspace (dirección 3a de la pantalla Loop) y de los botones primarios; sobre ella el texto va en #fff (activo) o rgba(247,247,249,.68/.55/.45) (inactivo/secundario/etiquetas).
+
 Semánticos: ok oklch(0.55 0.11 150) · warn oklch(0.6 0.12 70) · danger oklch(0.55 0.17 25), cada uno con -soft (L 0.94–0.95).
 
 Tipografía: Figtree (Google Fonts; display 800 30px/1.12, h2 700 22px/1.2, h3 700 16.5px/1.3, body 400 14px/1.5, small 12.5px) + IBM Plex Mono (datos/códigos 13px; micro-labels 11px 500 uppercase tracking .08em). Sin serif.

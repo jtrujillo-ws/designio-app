@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LOOP_BANCO_ANDINO, destinoDeJourney } from '@/lib/loop/loop-data';
+import { JOURNEYS_DEL_LOOP, destinoDeJourney } from '@/lib/loop/loop-data';
 import { etiquetaDeDestino } from '@/lib/destinos';
 
 /**
@@ -9,7 +9,7 @@ import { etiquetaDeDestino } from '@/lib/destinos';
  */
 describe('a dónde abre cada tarjeta del loop', () => {
   it('todos los journeys declaran una pantalla', () => {
-    expect(LOOP_BANCO_ANDINO.map((jl) => jl.pantalla)).toEqual([
+    expect(JOURNEYS_DEL_LOOP.map((jl) => jl.pantalla)).toEqual([
       'importacion',
       'proyecto',
       'insights',

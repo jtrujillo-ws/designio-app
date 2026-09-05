@@ -147,7 +147,7 @@ proyecto en curso; nunca se declara a mano.
 
 | Journey | Etapas | Gates | Rol decisivo | Qué se produce | Pantalla donde se trabaja |
 |---|---|---|---|---|---|
-| **J1** Arranque en frío | pre-0 | Curaduría humana | Lead + admin cliente | Evidencia curada con cinco dimensiones; servicio creado | Bandeja de importación |
+| **J1** Arranque en frío | pre-0 | Curaduría humana | Lead y diseñador curan; lead o admin del cliente crean el servicio y conceden derechos | Evidencia curada con cinco dimensiones; servicio creado | Bandeja de importación |
 | **J2** Formulación del reto | 0 | **G0** | Sponsor | Reto con criterios de éxito, línea base y ventana por criterio; perfil del proyecto | Proyecto |
 | **J3** Investigación y entendimiento | 1–2 | **G1 G2** | Diseñadores + stakeholders | Evidencia, insights con citas, arquetipos, journey as-is | Insights |
 | **J4** Conceptualización y exploración | 3–4 | **G3 G4** | Sponsor + equipo | Oportunidades HMW trazables, conceptos, tests, decisiones pasa/muere | Oportunidades |
@@ -1004,8 +1004,11 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
 4. **Generación**: prompt versionado (`PROMPT_VERSION`, atado por huella del contrato), material
    delimitado como datos no confiables y acotado (`MAX_MATERIAL`), salida estructurada validada por
    Zod contra el esquema de la capacidad, ids copiados del material normalizados.
-5. **Revisión** en el panel: **aceptar**, **corregir y aceptar** (las citas y las contradicciones no
-   se corrigen: son testimonio del modelo; el resto sí) o **rechazar**. El **contenido original se
+5. **Revisión** en el panel. Para las capacidades que **materializan** (CI, C0, C2, C6): **aceptar**,
+   **corregir y aceptar** (las citas y las contradicciones no se corrigen: son testimonio del modelo;
+   el resto sí) o **rechazar**. Para las **informativas** (CT, C5) no hay nada que aceptar ni
+   corregir: el informe se lee y se **marca como leído**; `aceptarPropuesta` las rechaza a
+   propósito. El **contenido original se
    conserva** siempre (SYS-17). La **presencia literal** de cada cita en el material que vio el
    modelo se mide y se muestra; es una señal de contraste, no un juicio de fidelidad.
 6. **Materialización**: solo al aceptar, en la misma transacción y firmado por quien acepta, nace el
@@ -1084,7 +1087,9 @@ comentan.
 
 **Ruta**: `/auditoria`. El flujo **append-only** de `evento_dominio` con actor, rol, tipo y payload,
 filtrable por tipo y paginado por keyset. Cada guard de la base emite su evento **dentro de la
-transacción que decide**, así que el SQL crudo produce la misma acta que la aplicación. La consultan
+transacción que decide**, así que el SQL crudo produce la misma acta que la aplicación; la
+excepción conocida son los **segmentos**, cuyo evento lo escribe el servicio en la misma sentencia y
+no un trigger (ver el Definition of Done en `23`). La consultan
 admin del cliente, lead y diseñador. Para los demás roles el lateral **no muestra** el destino
 (`ROLES_AUDITORIA`) y, si llegan a la ruta por URL, la política RLS de `evento_dominio` les devuelve
 cero filas: el enlace oculto es comodidad; el aislamiento lo da la base.
@@ -1472,7 +1477,7 @@ tasa de corrección humana ya se puede derivar de `contenido` vs `contenido_orig
 | Evals de grounding con línea base | **Diseñado** |
 | Escaneo y validación en la bandeja | **Parcial**: validación de formato, saneado y presupuesto de bytes; sin escaneo de malware |
 | Export/borrado completo verificado contra manifiesto | **Construido** (catálogo contrastado contra FKs vivas; constancia sellada) |
-| Auditoría cubriendo el catálogo de acciones | **Construido** (eventos en guards; censo en pruebas) |
+| Auditoría cubriendo el catálogo de acciones | **Parcial**: la mayoría de los efectos se emiten desde guards de la base, así que el SQL directo deja acta; el alta y la edición de segmentos emiten su evento desde el servicio en la misma sentencia, sin trigger de tabla, y no hay un censo automático que contraste el catálogo de acciones con los eventos |
 | Secretos en secret manager; cifrado | **Parcial**: variables/secrets de Railway por environment; TLS y cifrado at-rest del Postgres gestionado; BYOAI espera al secret manager |
 | Condiciones de proveedores AI registradas | **Diseñado** (documento operativo pendiente) |
 

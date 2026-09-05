@@ -572,7 +572,7 @@ existe pero **no se cita en un gate ni sale en un entregable** (SYS-14).
 
 | Eje | Campos registrados |
 |---|---|
-| Proveniencia | Tipo de fuente, fecha calendárica (o su ausencia declarada), localización |
+| Proveniencia | Tipo de fuente, **fecha calendárica obligatoria** (`DimensionesEvidenciaSchema` y el formulario de curaduría la exigen), localización. Solo el **borrador de CI** puede traer la fecha ausente con el motivo de no haberla encontrado en el material; aceptarlo exige que el revisor la complete al corregir, así que ninguna evidencia curada persiste una ausencia de fecha |
 | Método | Método de recolección, directa o derivada, segmentos cubiertos |
 | Calidad | Confianza (alta, media, baja), evidencias que la corroboran, evidencias que la contradicen |
 | Derechos | Consentimiento, confidencialidad (interna, cliente, restringida) y el registro `derecho_uso` |
@@ -631,8 +631,12 @@ a evidencia, y con las **contradicciones** a la vista, igual de grandes que el a
 
 ## Qué impone la base
 
-- No se valida un insight sin al menos una cita **con derechos vigentes** para el ámbito
-  (`insight_validar_guard`, `validar mira derechos vivos`).
+- No se valida un insight sin afirmaciones, ni con una afirmación **no marcada como hipótesis**
+  que carezca de cita **con derechos vigentes** para el ámbito (`insight_validar_guard`, `validar
+  mira derechos vivos`). **Excepción declarada**: la exigencia es por afirmación, así que un insight
+  cuyas afirmaciones son todas hipótesis se valida sin ninguna cita; la pantalla habilita «Validar»
+  con la misma regla. SYS-15 («insight validado con ≥1 cita») queda por tanto **parcial** (apéndice
+  92).
 - Solo un insight **validado** puede enlazarse a una decisión, a una oportunidad o cumplir un
   checklist; un insight propuesto "bien citado" no atraviesa el gate.
 - El insight es inmutable en su texto tras validarse; su **respaldo** no lo es: si los derechos de
@@ -1003,7 +1007,7 @@ generar se desactivan y revisar lo ya propuesto sigue disponible (SYS-21).
 
 | Código | Etapa | Qué propone | Ancla | Destino al aceptar | Estado |
 |---|---|---|---|---|---|
-| **CI** | Importación | Candidatos a evidencia desde un ítem de la bandeja: título, resumen, recolección, fecha con localización o su ausencia razonada, confianza, confidencialidad, estado actual, citas | Ítem de la bandeja | Evidencia (con su registro de derechos pendiente) | Construido |
+| **CI** | Importación | Candidatos a evidencia desde un ítem de la bandeja: título, resumen, recolección, fecha con localización o su ausencia razonada (una propuesta sin fecha no se acepta hasta que el revisor la ponga al corregir), confianza, confidencialidad, estado actual, citas | Ítem de la bandeja | Evidencia (con su registro de derechos pendiente) | Construido |
 | **C0** | 0 | Un lote pequeño de criterios de éxito medibles con ventana (3 por generación, techo 4), plan para obtener la línea base y citas a la formulación del reto; nunca un valor de línea base inventado | Reto | Criterio de éxito | Construido |
 | **C1** | 1 | Transcripción, diarización y codificación con citas exactas | — | — | Diseñado (requiere STT) |
 | **C2** | 2 | Hasta 4 insights con afirmaciones (marcando hipótesis), citas por afirmación a la evidencia del reto por id, y contradicciones señaladas (una por evidencia) | Reto | Insight propuesto con afirmaciones, citas y contradicciones | Construido |
@@ -1191,7 +1195,9 @@ Fuente: SPEC-01 (RF-01.7). PR [#40](https://github.com/jtrujillo-ws/designio-app
   misma cuenta pendiente desde **otro** workspace no emite enlace ni toca el token vigente (la
   activación sigue perteneciendo al workspace de origen). **Sin correo saliente en el MVP**, el enlace de activación se muestra en pantalla para
   compartirlo. El aterrizaje fija la contraseña y entra directo al workspace.
-- Estados de usuario: `invitado`, `activo`, `inactivo`.
+- Estados de usuario: `invitado`, `activo`, `inactivo`. La aplicación solo ejerce `invitado` →
+  `activo` (activar la invitación); desactivar una cuenta es hoy SQL administrativo, sin pantalla ni
+  reactivación, y una cuenta inactiva no entra ni puede ser re-invitada.
 - **Sin baja de miembros desde la app**: revocar la membresía de alguien (RF-01.4) no tiene
   política de DELETE, grant ni pantalla; hoy solo se hace por la conexión administrativa.
 - Un mismo usuario puede tener membresías en varios workspaces; la navegación lleva el workspace
@@ -1421,7 +1427,7 @@ alcanzado del catálogo de Postgres.
 | Ítem de importación | `pendiente` → `aprobado` · `rechazado` |
 | Propuesta AI | `propuesta` → `aceptada` · `corregida` (aceptada con correcciones) · `rechazada`; las tres son terminales |
 | Llamada AI | `despachada` → `salida-valida` · `rechazo-proveedor` · `fuera-de-contrato` · `sin-respuesta` |
-| Usuario | `invitado` → `activo` ↔ `inactivo` |
+| Usuario | `invitado` → `activo` al activar la invitación (única transición que ejerce la aplicación: el rol de app solo tiene `SELECT` sobre `usuario` y no hay server function ni pantalla de estado de cuenta). `inactivo` es un valor del CHECK que solo asigna la conexión administrativa, sin guard de transición ni flujo de reactivación; el login y la re-invitación rechazan una cuenta inactiva |
 | Oportunidad | `propuesta` → `aprobada` · `descartada` |
 
 ## Seed de desarrollo
@@ -1821,7 +1827,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 | I2 / SYS-12 | Gate pasa solo con checklist completo y rol correcto | `gate_aprobar_suficiencia_guard`, `rol_aprobador` por CHECK, `gate_faltas_para_aprobar` | Construido |
 | I2 / SYS-13 | G4 exige evidencia de test por concepto | Checklist de G4; sin objeto concepto ni umbral | **Parcial (diseñado)** |
 | I3 / SYS-14 | Cinco dimensiones; derechos restringen aguas abajo | `dimensiones` jsonb validado; `evidencia_citable` en toda superficie; `derecho_uso` | Construido |
-| I3 / SYS-15 | Insight validado con ≥1 cita; arquetipo con evidencia en G2; oportunidad con ≥1 insight en G3 | `insight_validar_guard`; `arquetipo_evidencia` + G2; G3 sobre `oportunidad_insight`; en C3 la traza se deriva de las citas (≥1 cita ⇒ ≥1 insight) | Construido |
+| I3 / SYS-15 | Insight validado con ≥1 cita; arquetipo con evidencia en G2; oportunidad con ≥1 insight en G3 | `insight_validar_guard` exige cita por cada afirmación **no hipótesis**, así que un insight solo de hipótesis se valida sin citas; `arquetipo_evidencia` + G2; G3 sobre `oportunidad_insight`; en C3 la traza se deriva de las citas (≥1 cita ⇒ ≥1 insight) | **Parcial** (insight): la regla es por afirmación, no por insight |
 | I3 / SYS-16 | Nada entra al grafo sin curaduría | `item_update_curaduria`; la extracción CI produce propuestas, no evidencia | Construido |
 | I3 / SYS-17 | Grounding medido; propuesta original conservada | `contenido_original`; presencia literal; evals periódicas pendientes | **Parcial** |
 | I4 / SYS-18 | `agente-ai` sin aprobar ni publicar | Rol no invitable, ausente de todo predicado de escritura; CT sin destino | Construido |

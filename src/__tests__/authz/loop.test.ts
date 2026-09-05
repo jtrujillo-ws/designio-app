@@ -15,6 +15,7 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
   let wsA = '';
   let wsB = '';
   let userA = '';
+  let sponsorA = '';
   let svcA1 = '';
   let svcA2 = '';
   let proyectoA = '';
@@ -32,6 +33,11 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
     userA = ua!.id as string;
     await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
       values (${wsA}, ${userA}, 'Usuario Loop', ${marca + '@a.test'}, 'lead-boutique')`;
+    const [us] = await admin`insert into usuario (email, nombre, estado)
+      values (${marca + '@sponsor.test'}, 'Sponsor Loop', 'activo') returning id`;
+    sponsorA = us!.id as string;
+    await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      values (${wsA}, ${sponsorA}, 'Sponsor Loop', ${marca + '@sponsor.test'}, 'sponsor')`;
 
     // Dos servicios en A, en este orden de creación: el primero es «el actual».
     const [s1] = await admin`insert into servicio (workspace_id, nombre, creado_por)
@@ -97,7 +103,8 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
       await admin`delete from miembro where workspace_id in ${admin(wss)}`;
       await admin`delete from workspace where id in ${admin(wss)}`;
     }
-    if (userA) await admin`delete from usuario where id = ${userA}`;
+    const usuarios = [userA, sponsorA].filter((id) => id !== '');
+    if (usuarios.length > 0) await admin`delete from usuario where id in ${admin(usuarios)}`;
     await cerrarPools();
   });
 
@@ -116,9 +123,12 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
 
     // Solo G1: es el gate ABIERTO y su checklist está decidido. G2 tiene trabajo pendiente y
     // G3–G7 ni son el abierto ni tienen checklist.
-    expect(resumen.aprobaciones.map((a) => [a.numero, a.rolAprobador, a.proyectoCodigo])).toEqual([
-      [1, 'lead-boutique', 'P-L1'],
-    ]);
+    expect(
+      resumen.aprobaciones.map((a) => [a.numero, a.rolAprobador, a.proyectoCodigo, a.esMia]),
+    ).toEqual([[1, 'lead-boutique', 'P-L1', true]]);
+    // El sponsor ve la misma aprobación (espera al lead), pero no como suya.
+    const delSponsor = await resumenParaUsuario(sponsorA, wsA);
+    expect(delSponsor.aprobaciones.map((a) => [a.numero, a.esMia])).toEqual([[1, false]]);
     // Sin design versions ni registry, no hay release ni métricas que decir.
     expect(resumen.release).toBeNull();
     expect(resumen.metricas).toBeNull();

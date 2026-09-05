@@ -41,6 +41,8 @@ export type AprobacionPendiente = {
   gateId: string;
   numero: number;
   rolAprobador: 'sponsor' | 'lead-boutique';
+  /** El rol aprobador es el de quien mira: es SU aprobación, no una que espera a otro. */
+  esMia: boolean;
   proyectoId: string;
   proyectoCodigo: string;
   retoCodigo: string;

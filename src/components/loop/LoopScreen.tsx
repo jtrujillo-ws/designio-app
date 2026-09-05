@@ -378,7 +378,9 @@ function Lateral({
   }
 
   const nombreCliente = arbol?.workspaceNombre ?? membresia?.workspaceNombre ?? 'Sin workspace';
-  const aprobaciones = resumen?.aprobaciones ?? [];
+  // El lateral cuenta las aprobaciones que le tocan a QUIEN MIRA: una que espera al sponsor
+  // no es una tarea del lead, aunque «Te toca a ti» la nombre para que sepa a quién espera.
+  const aprobaciones = (resumen?.aprobaciones ?? []).filter((a) => a.esMia);
   const primeraAprobacion = aprobaciones[0];
   const esBoutique = (ROLES_CURADORES as readonly string[]).includes(rol);
 
@@ -525,7 +527,7 @@ function Lateral({
       <span className="loop-ancho" style={{ ...etiquetaLateral, padding: '12px 8px 8px' }}>
         Workspace
       </span>
-      <DestinoDelWorkspace to="/importacion" etiqueta="Bandeja de importación">
+      <DestinoDelWorkspace to="/importacion" etiqueta="Bandeja de importación" abrev="IMP">
         {resumen && resumen.importacionPendientes > 0 && (
           <Contador color="var(--accent)" titulo={`${resumen.importacionPendientes} sin curar`}>
             {resumen.importacionPendientes}
@@ -538,27 +540,29 @@ function Lateral({
           className="loop-fila"
           to="/proyecto/$proyectoId"
           params={{ proyectoId: primeraAprobacion.proyectoId }}
-          title={`Abrir ${primeraAprobacion.proyectoCodigo} · gate G${primeraAprobacion.numero} esperando al ${ETIQUETA_ROL[primeraAprobacion.rolAprobador]?.toLowerCase() ?? primeraAprobacion.rolAprobador}`}
+          title={`Abrir ${primeraAprobacion.proyectoCodigo} · gate G${primeraAprobacion.numero} espera tu aprobación`}
+          aria-label="Aprobaciones"
           style={filaLateral}
         >
           <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
             Aprobaciones
           </span>
+          <Abreviatura>APR</Abreviatura>
           <Contador
             color="var(--warn)"
-            titulo={`${aprobaciones.length} gate(s) esperando aprobación`}
+            titulo={`${aprobaciones.length} gate(s) esperando tu aprobación`}
           >
             {aprobaciones.length}
           </Contador>
         </Link>
       )}
-      <DestinoDelWorkspace to="/evidencia" etiqueta="Evidencia y derechos de uso" />
-      <DestinoDelWorkspace to="/insights" etiqueta="Insights y citas" />
-      <DestinoDelWorkspace to="/journeys" etiqueta="Journeys y blueprints" />
-      <DestinoDelWorkspace to="/design-versions" etiqueta="Versions y releases" />
-      <DestinoDelWorkspace to="/propuestas" etiqueta="Propuestas AI" />
-      <DestinoDelWorkspace to="/personas" etiqueta="Personas y permisos" />
-      <DestinoDelWorkspace to="/exportacion" etiqueta="Exportación del workspace" />
+      <DestinoDelWorkspace to="/evidencia" etiqueta="Evidencia y derechos de uso" abrev="EVI" />
+      <DestinoDelWorkspace to="/insights" etiqueta="Insights y citas" abrev="INS" />
+      <DestinoDelWorkspace to="/journeys" etiqueta="Journeys y blueprints" abrev="JOU" />
+      <DestinoDelWorkspace to="/design-versions" etiqueta="Versions y releases" abrev="DVR" />
+      <DestinoDelWorkspace to="/propuestas" etiqueta="Propuestas AI" abrev="AI" />
+      <DestinoDelWorkspace to="/personas" etiqueta="Personas y permisos" abrev="PER" />
+      <DestinoDelWorkspace to="/exportacion" etiqueta="Exportación del workspace" abrev="EXP" />
       {/* Esta puerta NO se condiciona al rol: detrás están las constancias que cada quien
           conserva, y ésas no dependen de ninguna membresía. El rótulo nombra lo que cada
           quien encuentra (ver la historia completa en el commit que la abrió). */}
@@ -569,11 +573,12 @@ function Lateral({
             ? 'Disposición del workspace'
             : 'Constancias que conservas'
         }
+        abrev="DIS"
       />
       {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para
           los demás roles y, si lo teclean, la RLS de evento_dominio no les da filas. */}
       {(ROLES_AUDITORIA as readonly string[]).includes(rol) && (
-        <DestinoDelWorkspace to="/auditoria" etiqueta="Auditoría" />
+        <DestinoDelWorkspace to="/auditoria" etiqueta="Auditoría" abrev="AUD" />
       )}
 
       {/* 5. Pie de usuario. */}
@@ -696,22 +701,43 @@ type RutaSinParametros =
   | '/disposicion'
   | '/auditoria';
 
+/**
+ * Un destino del workspace. En el riel estrecho (<1200px) el texto no cabe y la fila no puede
+ * quedarse en blanco: lleva una etiqueta mono de tres letras, que es lo que el design system
+ * usa en su riel (dirección 2a) mientras no haya set de iconos en el codebase.
+ */
 function DestinoDelWorkspace({
   to,
   etiqueta,
+  abrev,
   children,
 }: {
   to: RutaSinParametros;
   etiqueta: string;
+  abrev: string;
   children?: ReactNode;
 }) {
   return (
-    <Link className="loop-fila" to={to} title={etiqueta} style={filaLateral}>
+    <Link className="loop-fila" to={to} title={etiqueta} aria-label={etiqueta} style={filaLateral}>
       <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
         {etiqueta}
       </span>
+      <Abreviatura>{abrev}</Abreviatura>
       {children}
     </Link>
+  );
+}
+
+/** La etiqueta de tres letras del riel estrecho: solo se ve por debajo de 1200px. */
+function Abreviatura({ children }: { children: ReactNode }) {
+  return (
+    <span
+      className="loop-estrecho"
+      aria-hidden
+      style={{ font: '600 10px var(--font-mono)', letterSpacing: '.06em', color: claro(0.72) }}
+    >
+      {children}
+    </span>
   );
 }
 
@@ -769,6 +795,7 @@ function ServicioDelArbol({
         <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
           {servicio.nombre}
         </span>
+        <Abreviatura>{inicialesDe(servicio.nombre)}</Abreviatura>
         {loop?.enCurso ? (
           <span
             title={`Journey en curso: J${loop.enCurso}`}
@@ -1382,10 +1409,16 @@ function TeTocaATi({
       destino: null,
     });
   } else {
-    for (const a of resumen.aprobaciones) {
+    // Las mías primero y en ámbar; las que esperan a otro rol también se nombran (el lead
+    // necesita saber que G5 espera al sponsor), pero como aviso, no como tarea propia.
+    const ordenadas = [...resumen.aprobaciones].sort((a, b) => Number(b.esMia) - Number(a.esMia));
+    for (const a of ordenadas) {
+      const rol = ETIQUETA_ROL[a.rolAprobador]?.toLowerCase() ?? a.rolAprobador;
       filas.push({
-        color: 'var(--warn)',
-        texto: `Aprobación G${a.numero} de ${a.proyectoCodigo} esperando al ${ETIQUETA_ROL[a.rolAprobador]?.toLowerCase() ?? a.rolAprobador}`,
+        color: a.esMia ? 'var(--warn)' : 'var(--text-faint)',
+        texto: a.esMia
+          ? `Aprobación G${a.numero} de ${a.proyectoCodigo}: te toca aprobarla`
+          : `Aprobación G${a.numero} de ${a.proyectoCodigo} esperando al ${rol}`,
         destino: { to: '/proyecto/$proyectoId', params: { proyectoId: a.proyectoId } },
       });
     }

@@ -73,10 +73,14 @@ export async function resumenParaUsuario(
 
       // Gate ABIERTO (el primero pendiente de su proyecto) con el checklist entero decidido y
       // no vacío: dejó de ser trabajo y espera a su aprobador. Un checklist vacío no es
-      // suficiencia (mismo criterio que el guard de la base), así que no cuenta.
+      // suficiencia (mismo criterio que el guard de la base), así que no cuenta. Cada fila
+      // dice además si el aprobador es QUIEN MIRA: la pantalla del proyecto solo deja aprobar
+      // cuando el rol coincide, y «Te toca a ti» no puede contar como propia una aprobación
+      // que espera al sponsor.
       const filasAprobaciones = await tx`
         select g.id, g.numero, g.rol_aprobador, p.id as proyecto_id, p.codigo as proyecto_codigo,
-          r.codigo as reto_codigo
+          r.codigo as reto_codigo,
+          g.rol_aprobador = workspace_role(${actorId}, ${workspaceId}) as es_mia
         from gate_instancia g
         join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
         join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id
@@ -95,6 +99,7 @@ export async function resumenParaUsuario(
         gateId: f.id as string,
         numero: f.numero as number,
         rolAprobador: f.rol_aprobador as AprobacionPendiente['rolAprobador'],
+        esMia: (f.es_mia as boolean | null) === true,
         proyectoId: f.proyecto_id as string,
         proyectoCodigo: f.proyecto_codigo as string,
         retoCodigo: f.reto_codigo as string,

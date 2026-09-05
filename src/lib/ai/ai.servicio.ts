@@ -23,7 +23,10 @@ import {
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   CAPACIDADES,
+  COLUMNAS_DE_ANCLA,
+  COLUMNA_DE_DESTINO,
   type AnclaCapacidad,
+  type Destino,
   parsearContenido,
   type CapacidadActiva,
   type ContenidoCriterio,
@@ -341,7 +344,17 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
       presenteLiteral: presencias[i]!,
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
-    anclaId: ((f.item_id ?? f.reto_id) as string | null) ?? '',
+    /*
+     * El ancla sale de TODAS las columnas declaradas, no de una pareja escrita aquí. Con
+     * `f.item_id ?? f.reto_id`, una capacidad anclada en otra cosa aparecía en el panel con
+     * el ancla vacía — y por tanto como no disponible, así que nadie podía aceptarla.
+     * `COLUMNAS_DE_ANCLA` es exhaustiva por el tipo: ampliar el ancla rompe la compilación
+     * donde se declara, no aquí en silencio.
+     */
+    anclaId:
+      (COLUMNAS_DE_ANCLA.map((c) => f[c] as string | null).find((v) => v != null) as
+        | string
+        | undefined) ?? '',
     // Si no se pudo determinar, se trata como NO disponible: habilitar dos botones que la
     // base va a rechazar es peor que pedir un refresco.
     anclaEstado: (f.ancla_estado as EstadoAncla | null) ?? 'ancla-ausente',
@@ -1240,10 +1253,9 @@ function anclaEnColumna(
  * compilación aquí, y el comentario dice dónde hay que ir. Es el mismo aprendizaje de la
  * ronda anterior: un guardián de forma sujeta la sintaxis; la semántica la sujeta el tipo.
  */
-const ANCLA_EN_LOS_INSERTS: Record<AnclaCapacidad['columna'], 'escrita'> = {
-  item_id: 'escrita',
-  reto_id: 'escrita',
-};
+const ANCLA_EN_LOS_INSERTS: Record<AnclaCapacidad['columna'], 'escrita'> = Object.fromEntries(
+  COLUMNAS_DE_ANCLA.map((c) => [c, 'escrita' as const]),
+) as Record<AnclaCapacidad['columna'], 'escrita'>;
 void ANCLA_EN_LOS_INSERTS;
 
 /**
@@ -1852,22 +1864,29 @@ async function aceptarPropuestaEnTransaccion(
     }
     // El destino y la forma del contenido van atados por el CHECK de la tabla y por el
     // esquema de la capacidad; el narrowing lo hace explícito para el compilador.
-    const objetoId =
-      p.destino === 'evidencia'
-        ? await materializarEvidencia(
-            tx,
-            actorId,
-            entrada.workspaceId,
-            p,
-            contenido as ContenidoExtraccion,
-          )
-        : await materializarCriterio(
-            tx,
-            actorId,
-            entrada.workspaceId,
-            p,
-            contenido as ContenidoCriterio,
-          );
+    /*
+     * La materialización se despacha por el DESTINO declarado, no con un ternario. Con
+     * `p.destino === 'evidencia' ? … : …`, todo destino que no fuera evidencia caía en
+     * `materializarCriterio` — así que un destino nuevo se materializaba como criterio y
+     * fallaba contra su propio guard, en vez de usar su objeto de dominio.
+     * `Record<Destino, …>` hace que el compilador exija la entrada de cada uno.
+     */
+    const MATERIALIZAR: Record<
+      Destino,
+      () => Promise<string>
+    > = {
+      evidencia: () =>
+        materializarEvidencia(
+          tx,
+          actorId,
+          entrada.workspaceId,
+          p,
+          contenido as ContenidoExtraccion,
+        ),
+      'criterio-exito': () =>
+        materializarCriterio(tx, actorId, entrada.workspaceId, p, contenido as ContenidoCriterio),
+    };
+    const objetoId = await MATERIALIZAR[p.destino]();
 
     // Corregida o aceptada lo decide la BASE comparando jsonb con jsonb: normaliza claves
     // y espacios, así que un reordenamiento del round-trip por Zod no se contabiliza como
@@ -1878,8 +1897,10 @@ async function aceptarPropuestaEnTransaccion(
                         then 'corregida' else 'aceptada' end,
           contenido = ${tx.json(contenido)}::jsonb,
           revisada_por = ${actorId},
-          evidencia_id = ${p.destino === 'evidencia' ? objetoId : null},
-          criterio_id = ${p.destino === 'criterio-exito' ? objetoId : null}
+          -- El enlace va a la columna que el destino DECLARA. Escrito como dos ternarios,
+          -- un destino nuevo dejaba las dos en null y la propuesta aceptada sin objeto.
+          evidencia_id = ${COLUMNA_DE_DESTINO[p.destino] === 'evidencia_id' ? objetoId : null},
+          criterio_id = ${COLUMNA_DE_DESTINO[p.destino] === 'criterio_id' ? objetoId : null}
       where id = ${entrada.propuestaId} and workspace_id = ${entrada.workspaceId}
         and estado = 'propuesta'
       returning estado`;

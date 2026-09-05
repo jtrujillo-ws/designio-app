@@ -270,6 +270,32 @@ export type DefinicionCapacidad = {
   esSimulacion: boolean;
 };
 
+/**
+ * Las columnas de ancla que el esquema tiene, EXHAUSTIVAS por el tipo.
+ *
+ * Existe para que el compilador se niegue: ampliar `AnclaCapacidad['columna']` rompe aquí, y
+ * de aquí sale la lista que recorren los sitios que las escriben o las leen una a una —los
+ * inserts del pipeline y la proyección del panel—. Sin ella, cada uno de esos sitios era una
+ * pareja fija que una capacidad nueva no habría tocado: pasaría la comprobación del catálogo
+ * (que solo mira que la columna exista) y luego perdería su enlace, o aparecería en el panel
+ * con el ancla vacía y por tanto no aceptable.
+ */
+const ANCLA_DECLARADA: Record<AnclaCapacidad['columna'], true> = {
+  item_id: true,
+  reto_id: true,
+};
+export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad['columna'][];
+
+/**
+ * Y lo mismo para el DESTINO: qué columna de `propuesta_ai` enlaza el objeto materializado.
+ * Un destino nuevo rompe la compilación aquí en vez de escribir `null` en las dos y fallar
+ * contra el guard de materialización.
+ */
+export const COLUMNA_DE_DESTINO: Record<Destino, 'evidencia_id' | 'criterio_id'> = {
+  evidencia: 'evidencia_id',
+  'criterio-exito': 'criterio_id',
+};
+
 export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   CI: {
     etiqueta: 'Extracción de importación → evidencia',
@@ -342,7 +368,24 @@ export const RevisarPropuestaSchema = z.object({
   /** Presente ⇒ corrección humana: se valida contra el esquema de la capacidad de la
    * propuesta (el servicio la re-parsea) y, si cambia algo, queda `corregida` conservando
    * el original (SYS-17). */
-  correccion: z.union([ContenidoExtraccionSchema, ContenidoCriterioSchema]).optional(),
+  /*
+   * Y los esquemas admitidos salen del REGISTRO, no de una unión escrita a mano. Aquí ponía
+   * `z.union([ContenidoExtraccionSchema, ContenidoCriterioSchema])`, y eso rechazaba en la
+   * frontera de la server function una corrección perfectamente válida para una capacidad
+   * nueva —antes de que `parsearContenido`, que sí sabe de qué capacidad se trata, llegara a
+   * mirarla—. La validación de verdad sigue siendo la del servicio, contra el esquema de SU
+   * capacidad; esto es solo la puerta, y la puerta tiene que admitir todo lo que dentro se
+   * sabe validar.
+   */
+  correccion: z
+    .union(
+      Object.values(CAPACIDADES).map((c) => c.contenido) as unknown as [
+        z.ZodTypeAny,
+        z.ZodTypeAny,
+        ...z.ZodTypeAny[],
+      ],
+    )
+    .optional(),
 });
 export type RevisarPropuesta = z.infer<typeof RevisarPropuestaSchema>;
 

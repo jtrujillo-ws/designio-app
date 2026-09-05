@@ -33,6 +33,7 @@ import {
   ETIQUETA_TIPO_ARISTA,
   ETIQUETA_TIPO_NODO,
   EXTREMOS_ARISTA,
+  EditarNodoSchema,
   TIPOS_ARISTA,
   TIPOS_NODO,
   type AristaDeJourney,
@@ -584,7 +585,32 @@ function FilaNodo({
     setOcupado(true);
     onError(null);
     try {
-      const numero = Number.parseInt(orden, 10);
+      /*
+       * El orden se valida con el MISMO campo que el servidor exige, y no se trocea con
+       * `parseInt`. Medido, con lo que un `<input type="number">` deja escribir:
+       *
+       *   «1e3»    → parseInt: 1      · Number: 1000   ← pide el puesto 1000 y le dan el 1
+       *   «3.7»    → parseInt: 3      · Number: 3.7    ← se trunca sin decirlo
+       *   «9999.9» → parseInt: 9999   · Number: 9999.9 ← igual
+       *   «»       → parseInt: NaN                     ← caía en `?? nodo.orden`
+       *
+       * El primero es el que duele: 1 es un orden perfectamente válido, así que el nodo se
+       * movía al principio en silencio y nadie tenía nada que mirar. Los otros dos hacían lo
+       * que `z.number().int()` rechaza —y por eso el servidor nunca llegaba a rechazarlos: el
+       * recorte pasaba antes—. Y el vacío se sustituía por el orden actual, así que borrar el
+       * campo y guardar no cambiaba nada sin decir por qué.
+       *
+       * Ahora el número se lee entero y se mide contra el contrato: si no lo cumple, se dice y
+       * no se envía. Un valor que el servidor rechazaría no se convierte aquí en otro que sí
+       * acepta.
+       */
+      const medido = EditarNodoSchema.shape.orden.safeParse(orden.trim() === '' ? NaN : Number(orden));
+      if (!medido.success) {
+        onError(
+          `El orden tiene que ser un número entero entre 0 y 9999 (se recibió «${orden}»)`,
+        );
+        return; // el `finally` de abajo suelta el ocupado
+      }
       const r = await editarNodoDelJourney({
         data: {
           workspaceId,
@@ -593,7 +619,7 @@ function FilaNodo({
           detalle,
           responsable,
           faseId: nodo.tipo === 'fase' || faseId === '' ? null : faseId,
-          orden: Number.isNaN(numero) ? nodo.orden : numero,
+          orden: medido.data,
         },
       });
       if (r.ok) {

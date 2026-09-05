@@ -51,7 +51,8 @@ export async function resumenParaUsuario(
       // El orden es el del árbol (reto por código, proyecto por código) para que «el primer
       // proyecto del servicio» sea el mismo aquí y allí.
       const filasProyectos = await tx`
-        select p.id, p.codigo, r.id as reto_id, r.codigo as reto_codigo, r.estado as reto_estado,
+        select p.id, p.codigo, p.estado as proyecto_estado, r.id as reto_id, r.codigo as reto_codigo,
+          r.estado as reto_estado,
           r.servicio_ancla_id as servicio_id,
           coalesce(array_agg(g.numero order by g.numero) filter (where g.numero is not null),
             '{}'::int[]) as aprobados,
@@ -78,7 +79,8 @@ export async function resumenParaUsuario(
         left join gate_instancia g
           on g.proyecto_id = p.id and g.workspace_id = p.workspace_id and g.estado = 'aprobado'
         where p.workspace_id = ${workspaceId}
-        group by p.id, p.codigo, r.id, r.codigo, r.estado, r.servicio_ancla_id, r.workspace_id
+        group by p.id, p.codigo, p.estado, r.id, r.codigo, r.estado, r.servicio_ancla_id,
+          r.workspace_id
         order by r.codigo, r.id, p.codigo, p.id`;
       const proyectos: GatesDeProyecto[] = filasProyectos.map((f) => ({
         proyectoId: f.id as string,
@@ -86,6 +88,7 @@ export async function resumenParaUsuario(
         retoId: f.reto_id as string,
         retoCodigo: f.reto_codigo as string,
         retoEstado: f.reto_estado as string,
+        proyectoEstado: f.proyecto_estado as string,
         servicioId: f.servicio_id as string,
         aprobados: f.aprobados as number[],
         postMortemAbrible: f.post_mortem_abrible as boolean,

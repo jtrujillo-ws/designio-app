@@ -120,6 +120,7 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
     expect(p.servicioId).toBe(svcA1);
     expect(p.aprobados).toEqual([0]);
     expect(p.retoEstado).toBe('activo');
+    expect(p.proyectoEstado).toBe('activo');
     expect(p.postMortemAbrible).toBe(false);
     expect(p.reviewCompletado).toBe(false);
 

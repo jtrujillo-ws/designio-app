@@ -260,7 +260,9 @@ function porQueJ7Cerrado(loop: EstadoDelLoop): { corto: string; largo: string } 
 function proyectoActual(servicio: ServicioArbol): ProyectoArbol | null {
   return (
     proyectoActualDe(
-      servicio.retos.flatMap((r) => r.proyectos.map((p) => ({ retoEstado: r.estado, p }))),
+      servicio.retos.flatMap((r) =>
+        r.proyectos.map((p) => ({ retoEstado: r.estado, proyectoEstado: p.estado, p })),
+      ),
     )?.p ?? null
   );
 }
@@ -373,6 +375,8 @@ function Lateral({
 }) {
   const navigate = useNavigate();
   const rol = membresia?.rol ?? '';
+  // La bandeja la curan la boutique (RF-03.4): su contador es tarea solo para ellos.
+  const esCurador = (ROLES_CURADORES as readonly string[]).includes(rol);
   const servicios = arbol?.servicios ?? [];
   // Seleccionar un servicio es navegar: queda en `?servicio=` y los loaders reaccionan.
   function seleccionar(id: string) {
@@ -599,7 +603,7 @@ function Lateral({
         Workspace
       </span>
       <DestinoDelWorkspace to="/importacion" etiqueta="Bandeja de importación" abrev="IMP">
-        {resumen && resumen.importacionPendientes > 0 && (
+        {esCurador && resumen && resumen.importacionPendientes > 0 && (
           <Contador color="var(--accent)" titulo={`${resumen.importacionPendientes} sin curar`}>
             {resumen.importacionPendientes}
           </Contador>

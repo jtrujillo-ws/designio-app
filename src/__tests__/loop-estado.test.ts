@@ -158,6 +158,7 @@ describe('la marca de un reto en el árbol', () => {
         retoId: 'r-1',
         retoCodigo: 'R-01',
         retoEstado: 'activo',
+        proyectoEstado: 'activo',
         servicioId: 's-1',
         aprobados: [0, 1, 2, 3, 4, 5, 6],
         postMortemAbrible: true,
@@ -172,6 +173,7 @@ describe('la marca de un reto en el árbol', () => {
         retoId: 'r-9',
         retoCodigo: 'R-09',
         retoEstado: 'cerrado',
+        proyectoEstado: 'cerrado',
         servicioId: 's-1',
         aprobados: [0, 1, 2, 3, 4, 5, 6, 7],
         postMortemAbrible: true,
@@ -248,15 +250,32 @@ describe('la marca de un reto en el árbol', () => {
 describe('el proyecto actual de un servicio', () => {
   it('es el del primer reto activo o en medición, no el primero por código', () => {
     const candidatos = [
-      { id: 'p-01', retoEstado: 'cerrado' },
-      { id: 'p-02', retoEstado: 'en-medicion' },
-      { id: 'p-03', retoEstado: 'activo' },
+      { id: 'p-01', retoEstado: 'cerrado', proyectoEstado: 'cerrado' },
+      { id: 'p-02', retoEstado: 'en-medicion', proyectoEstado: 'en-medicion' },
+      { id: 'p-03', retoEstado: 'activo', proyectoEstado: 'activo' },
     ];
     expect(proyectoActualDe(candidatos)?.id).toBe('p-02');
   });
 
+  it('entre los proyectos de un reto vivo, primero el que también está vivo, no el pausado', () => {
+    const candidatos = [
+      { id: 'p-01', retoEstado: 'activo', proyectoEstado: 'pausado' },
+      { id: 'p-02', retoEstado: 'activo', proyectoEstado: 'en-implementacion' },
+    ];
+    expect(proyectoActualDe(candidatos)?.id).toBe('p-02');
+    // Con todos pausados, el primero del reto vivo sigue siendo el actual.
+    expect(
+      proyectoActualDe([
+        { id: 'p-01', retoEstado: 'activo', proyectoEstado: 'pausado' },
+        { id: 'p-02', retoEstado: 'candidato', proyectoEstado: 'activo' },
+      ])?.id,
+    ).toBe('p-01');
+  });
+
   it('sin retos vivos se cae al primero que exista, y sin ninguno a null', () => {
-    expect(proyectoActualDe([{ id: 'p-01', retoEstado: 'cerrado' }])?.id).toBe('p-01');
+    expect(
+      proyectoActualDe([{ id: 'p-01', retoEstado: 'cerrado', proyectoEstado: 'cerrado' }])?.id,
+    ).toBe('p-01');
     expect(proyectoActualDe([])).toBeNull();
   });
 });

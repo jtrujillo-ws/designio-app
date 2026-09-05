@@ -24,8 +24,10 @@ export type GatesDeProyecto = {
   proyectoCodigo: string;
   retoId: string;
   retoCodigo: string;
-  /** Estado del reto: decide cuál es el proyecto ACTUAL de un servicio (ver proyectoActualDe). */
+  /** Estado del reto y del proyecto: deciden cuál es el proyecto ACTUAL de un servicio (ver
+   * proyectoActualDe). */
   retoEstado: string;
+  proyectoEstado: string;
   servicioId: string;
   /** Números de gate (0–7) ya aprobados. La base exige que sean un prefijo 0..n. */
   aprobados: number[];

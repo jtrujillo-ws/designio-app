@@ -146,11 +146,17 @@ export function marcaDeReto(
  * de cerrado su ciclo mientras R-02 trabajaba: el árbol ordena por código, no por vida. La
  * pantalla y la proyección eligen con ESTA función, sobre los datos que cada una tiene.
  */
-export function proyectoActualDe<T extends { retoEstado: string }>(
+export function proyectoActualDe<T extends { retoEstado: string; proyectoEstado: string }>(
   candidatos: readonly T[],
 ): T | null {
+  const retoVivo = (c: T) => c.retoEstado === 'activo' || c.retoEstado === 'en-medicion';
+  // Un reto puede llevar varios proyectos y la medición los mueve y cierra juntos: entre
+  // los del reto vivo, primero el que también está vivo (ni pausado ni cerrado), para no
+  // clavar la cabecera en un proyecto parado teniendo al lado su hermano en marcha.
+  const proyectoVivo = (c: T) => c.proyectoEstado !== 'pausado' && c.proyectoEstado !== 'cerrado';
   return (
-    candidatos.find((c) => c.retoEstado === 'activo' || c.retoEstado === 'en-medicion') ??
+    candidatos.find((c) => retoVivo(c) && proyectoVivo(c)) ??
+    candidatos.find(retoVivo) ??
     candidatos[0] ??
     null
   );

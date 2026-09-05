@@ -733,8 +733,12 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     // dónde va. Mirando solo el destino, un miembro de los dos podía mover una fila desde un
     // workspace archivado a uno vivo — el guard comprobaba el activo, lo daba por bueno, y la
     // promesa «se conserva para consulta y no admite escrituras» se rompía por extracción en
-    // vez de por escritura. `segmento` es la superficie exacta: su grant de UPDATE incluye
-    // `workspace_id` y su política es solo de membresía.
+    // vez de por escritura. `segmento` FUE la superficie exacta: su grant de UPDATE incluía
+    // `workspace_id` y su política era solo de membresía. Desde 20260905110000 ese grant es
+    // solo (nombre, definicion), y con él se cerró la última tabla donde el rol de aplicación
+    // podía escribir `workspace_id`: hoy la puerta la cierra el grant, un piso antes del
+    // guard. Se comprueba así, y el 42501 es el cierre MÁS fuerte de la misma superficie:
+    // ya ni siquiera hay sentencia que llegue al trigger.
     const admin = sqlAdmin();
     const congelado = await nuevoWorkspace('origen-congelado');
     const vivo = await nuevoWorkspace('destino-vivo');
@@ -743,11 +747,19 @@ describeAuthz('disposición acordada: archivo, borrado y constancia verificable'
     await acordarYExportar(congelado, 'archivo', leadId);
     await ejecutarDisposicion(leadId, { workspaceId: congelado, modalidadEsperada: 'archivo', acuerdoVersionEsperada: 1, confirmacion: '' });
 
-    // Quien lo intenta es miembro de los dos, así que la RLS no lo detiene: lo único que puede
-    // detenerlo es el guard, mirando también de dónde SALE la fila.
+    // Quien lo intenta es miembro de los dos, así que la RLS no lo detiene: lo detiene el
+    // grant de columnas (permission denied), antes de que el guard tenga que mirar nada.
     await expect(
       conUsuario(leadId, (tx) => tx`update segmento set workspace_id = ${vivo}
         where id = ${seg!.id as string}`),
+    ).rejects.toMatchObject({ code: '42501' });
+
+    // El guard sigue detrás, y se comprueba por la única vía que aún alcanza la sentencia:
+    // la conexión administrativa (el trigger dispara para todo el mundo). Es la garantía que
+    // queda si un día un grant vuelve a abrir `workspace_id` en alguna tabla: mirar también
+    // de dónde SALE la fila.
+    await expect(
+      admin`update segmento set workspace_id = ${vivo} where id = ${seg!.id as string}`,
     ).rejects.toMatchObject({ code: 'DS001' });
 
     // Y sigue donde estaba.

@@ -38,8 +38,10 @@ create policy segmento_update on segmento
 
 -- Solo las columnas que la app escribe: `id` y `creado_en` los pone la base (la pantalla
 -- ordena por esa fecha), y `workspace_id` no se toca nunca después del alta —moverlo era la
--- puerta de extracción que la congelación por disposición tuvo que cerrar a mano—. Al
--- editar solo entran nombre y definición: la identidad es el id, y de él cuelgan las citas.
+-- puerta de extracción que la congelación por disposición (20260903200000) tuvo que cerrar a
+-- mano, y `segmento` era la última tabla donde el rol de aplicación podía escribirlo: con
+-- este grant la puerta se cierra un piso antes, y aquel guard queda detrás como garantía—.
+-- Al editar solo entran nombre y definición: la identidad es el id, y de él cuelgan las citas.
 revoke insert, update, delete on segmento from designio_app;
 grant insert (workspace_id, nombre, definicion) on segmento to designio_app;
 grant update (nombre, definicion) on segmento to designio_app;

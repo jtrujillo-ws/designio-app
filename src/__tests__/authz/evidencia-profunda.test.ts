@@ -2500,10 +2500,13 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const [pr] = await admin`select pg_get_functiondef('razonamiento_sin_respaldo'::regproc) as def`;
     const predicado = pr!.def as string;
 
-    // Las dos rutas —checklist y G5— llaman a la misma función. Ni una más ni una menos:
-    // una tercera llamada sería una ruta nueva que hay que mirar; ninguna, un guard que
-    // volvió a decidir por su cuenta.
-    expect((guard.match(/razonamiento_usable_guard\(/g) ?? []).length).toBe(2);
+    // Las TRES rutas que consumen razonamiento llaman a la misma función: el checklist, G5
+    // y —desde 20260905120000— el portafolio de oportunidades de G3. Ni una más ni una
+    // menos: una llamada nueva es una ruta nueva que hay que mirar (se miró: G3 certifica
+    // «dónde jugamos» sobre HMW trazadas a insights, así que consume razonamiento igual que
+    // las otras dos y entra por el mismo protocolo), y ninguna sería un guard que volvió a
+    // decidir por su cuenta.
+    expect((guard.match(/razonamiento_usable_guard\(/g) ?? []).length).toBe(3);
 
     // Y el guard ya no recorre ni decide sobre razonamiento: ni sigue `decision_insight`
     // —el eslabón por el que se llega a los insights de una decisión— ni bloquea decisiones

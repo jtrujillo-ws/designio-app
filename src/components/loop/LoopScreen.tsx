@@ -790,6 +790,7 @@ type RutaSinParametros =
   | '/importacion'
   | '/evidencia'
   | '/insights'
+  | '/oportunidades'
   | '/journeys'
   | '/design-versions'
   | '/propuestas'

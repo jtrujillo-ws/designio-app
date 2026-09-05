@@ -1,0 +1,393 @@
+import { afterAll, beforeAll, expect, it } from 'vitest';
+import { conUsuario, sqlAdmin } from '@/lib/db';
+import {
+  crearOportunidad,
+  decidirOportunidad,
+  desenlazarInsight,
+  enlazarInsight,
+  ErrorOportunidad,
+  portafolioDelWorkspace,
+  priorizarOportunidad,
+} from '@/lib/servicio/oportunidad.servicio';
+import { describeAuthz } from './helpers';
+
+/**
+ * CTX-04 / SYS-15 — la oportunidad (HMW) se traza a insights, y eso lo dice la BASE.
+ *
+ * La etapa 3 era la única del método sin su objeto: G3 se aprobaba sin nada que mirar
+ * porque no había nada que mirar, y «una oportunidad referencia ≥1 insight» vivía solo en
+ * un documento. Estas pruebas cubren las cuatro puertas: quién propone, qué se puede
+ * enlazar, qué exige aprobar, y qué exige G3.
+ */
+describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
+  const marca = `opo-${crypto.randomUUID().slice(0, 8)}`;
+  let ws = '';
+  let leadId = '';
+  let disenadorId = '';
+  let stakeId = '';
+  let retoId = '';
+  let insightValidado = '';
+  let insightPropuesto = '';
+  let evidenciaId = '';
+
+  beforeAll(async () => {
+    const admin = sqlAdmin();
+    const [w] = await admin`insert into workspace (nombre) values (${marca}) returning id`;
+    ws = w!.id as string;
+
+    for (const [alias, rol] of [
+      ['lead', 'lead-boutique'],
+      ['dis', 'disenador'],
+      ['stake', 'stakeholder'],
+    ] as const) {
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${`${marca}-${alias}@test.demo`}, ${alias}, 'activo') returning id`;
+      const id = u!.id as string;
+      if (alias === 'lead') leadId = id;
+      else if (alias === 'dis') disenadorId = id;
+      else stakeId = id;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${ws}, ${id}, ${alias}, ${`${marca}-${alias}@test.demo`}, ${rol})`;
+    }
+
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio de prueba', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-01', 'Reto de prueba', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    retoId = r!.id as string;
+
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${ws}, 'nota', 'Fuente', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${ws}, ${fuente!.id as string}, 'Entrevistas', '{}'::jsonb, ${leadId}) returning id`;
+    evidenciaId = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaId}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${leadId}, now(), ${leadId})`;
+
+    // Un insight VALIDADO con su afirmación citada, y otro que se queda en 'propuesto'.
+    // La diferencia entre los dos es el objeto de la mitad de estas pruebas.
+    const crearInsightCitado = async (titulo: string, validar: boolean) => {
+      const [i] = await admin`insert into insight (workspace_id, titulo, resumen, creado_por)
+        values (${ws}, ${titulo}, 'Resumen', ${leadId}) returning id`;
+      const id = i!.id as string;
+      const [a] = await admin`insert into afirmacion
+        (workspace_id, insight_id, orden, texto, es_hipotesis)
+        values (${ws}, ${id}, 0, 'La verificación pide documentos que no están a mano', false)
+        returning id`;
+      await admin`insert into cita
+        (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+        values (${ws}, ${a!.id as string}, ${evidenciaId}, 'no los tengo aquí', 'min 4:20', ${leadId})`;
+      if (validar) {
+        await admin`update insight set estado = 'validado', validado_por = ${leadId},
+          validado_en = now() where id = ${id}`;
+      }
+      return id;
+    };
+    insightValidado = await crearInsightCitado('La verificación excluye en el móvil', true);
+    insightPropuesto = await crearInsightCitado('Todavía sin validar', false);
+  });
+
+  afterAll(async () => {
+    const admin = sqlAdmin();
+    if (!ws) return;
+    await admin`delete from evento_dominio where workspace_id = ${ws}`;
+    await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+    await admin`delete from oportunidad where workspace_id = ${ws}`;
+    await admin`delete from checklist_item where workspace_id = ${ws}`;
+    await admin`delete from gate_instancia where workspace_id = ${ws}`;
+    await admin`delete from etapa_instancia where workspace_id = ${ws}`;
+    await admin`delete from proyecto where workspace_id = ${ws}`;
+    await admin`delete from cita where workspace_id = ${ws}`;
+    await admin`delete from afirmacion where workspace_id = ${ws}`;
+    await admin`delete from insight where workspace_id = ${ws}`;
+    await admin`delete from derecho_uso where workspace_id = ${ws}`;
+    await admin`delete from evidencia where workspace_id = ${ws}`;
+    await admin`delete from fuente where workspace_id = ${ws}`;
+    await admin`delete from reto where workspace_id = ${ws}`;
+    await admin`delete from servicio where workspace_id = ${ws}`;
+    await admin`delete from miembro where workspace_id = ${ws}`;
+    await admin`delete from workspace where id = ${ws}`;
+  });
+
+  it('el diseñador propone una HMW y nace por decidir, firmada y sin veredicto', async () => {
+    const { oportunidadId } = await crearOportunidad(disenadorId, {
+      workspaceId: ws,
+      retoId,
+      pregunta: '¿Cómo podríamos verificar sin pedir documentos en el móvil?',
+      prioridad: 10,
+      prioridadRazon: 'Toca el criterio de tiempo a cuenta activa',
+    });
+    const admin = sqlAdmin();
+    const [o] = await admin`select estado, creado_por, decidido_por, decidido_en, prioridad
+      from oportunidad where id = ${oportunidadId}`;
+    expect(o!.estado).toBe('propuesta');
+    expect(o!.creado_por).toBe(disenadorId);
+    expect(o!.decidido_por).toBeNull();
+    expect(o!.decidido_en).toBeNull();
+    expect(o!.prioridad).toBe(10);
+
+    // Y deja el evento que CTX-04 declara.
+    const [e] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'OportunidadPropuesta'
+        and payload->>'oportunidadId' = ${oportunidadId}`;
+    expect((e!.payload as { retoId: string }).retoId).toBe(retoId);
+  });
+
+  it('un stakeholder no propone oportunidades', async () => {
+    await expect(
+      crearOportunidad(stakeId, { workspaceId: ws, retoId, pregunta: 'HMW del stakeholder', prioridad: 0, prioridadRazon: '' }),
+    ).rejects.toThrow(ErrorOportunidad);
+  });
+
+  it('la misma pregunta dos veces en el mismo reto no entra: priorizar un duplicado reparte el mismo voto dos veces', async () => {
+    const pregunta = '¿Cómo podríamos avisar antes del corte?';
+    await crearOportunidad(leadId, { workspaceId: ws, retoId, pregunta, prioridad: 0, prioridadRazon: '' });
+    await expect(
+      crearOportunidad(leadId, { workspaceId: ws, retoId, pregunta, prioridad: 0, prioridadRazon: '' }),
+    ).rejects.toThrow(/ya tiene una oportunidad con esa misma pregunta/);
+  });
+
+  /**
+   * La regla que 20260902260000 tuvo que añadir a `decision_insight` después de comprobar
+   * sobre una base viva que un insight `propuesto` atravesaba entero el guard del gate.
+   * Aquí nace ya puesta, y en la POLÍTICA: el escritor que hay que cerrar es el rol de
+   * aplicación escribiendo SQL directo, no el servicio.
+   */
+  it('la traza se hace de insights validados: uno propuesto no se enlaza', async () => {
+    const { oportunidadId } = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId, pregunta: 'HMW de la traza', prioridad: 0, prioridadRazon: '',
+    });
+    await expect(
+      enlazarInsight(leadId, { workspaceId: ws, oportunidadId, insightId: insightPropuesto }),
+    ).rejects.toThrow(/validado/);
+    // …y por SQL directo tampoco, que es lo que de verdad se está afirmando.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into oportunidad_insight
+        (oportunidad_id, insight_id, workspace_id)
+        values (${oportunidadId}, ${insightPropuesto}, ${ws})`),
+    ).rejects.toThrow(/row-level security/);
+    // El validado sí.
+    await enlazarInsight(leadId, { workspaceId: ws, oportunidadId, insightId: insightValidado });
+    const admin = sqlAdmin();
+    const filas = await admin`select 1 from oportunidad_insight
+      where oportunidad_id = ${oportunidadId}`;
+    expect(filas.length).toBe(1);
+  });
+
+  it('aprobar sin traza es lo que SYS-15 prohíbe, y lo dice el guard', async () => {
+    const { oportunidadId } = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId, pregunta: 'HMW sin insights', prioridad: 0, prioridadRazon: '',
+    });
+    await expect(
+      decidirOportunidad(leadId, { workspaceId: ws, oportunidadId, estado: 'aprobada', veredictoRazon: '' }),
+    ).rejects.toThrow(/no traza a ningún insight/);
+    // Descartarla sí se puede sin traza: lo que se tira no sostiene nada. Con razón, eso sí.
+    await decidirOportunidad(leadId, {
+      workspaceId: ws, oportunidadId, estado: 'descartada', veredictoRazon: 'Ya resuelta por otra vía',
+    });
+    const admin = sqlAdmin();
+    const [o] = await admin`select estado, decidido_por, decidido_en from oportunidad where id = ${oportunidadId}`;
+    expect(o!.estado).toBe('descartada');
+    // La firma la pone la BASE, no quien llama.
+    expect(o!.decidido_por).toBe(leadId);
+    expect(o!.decidido_en).not.toBeNull();
+  });
+
+  it('el veredicto es irreversible por esta superficie: ni se repisa ni se reprioriza después', async () => {
+    const { oportunidadId } = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId, pregunta: 'HMW ya decidida', prioridad: 0, prioridadRazon: '',
+    });
+    await enlazarInsight(leadId, { workspaceId: ws, oportunidadId, insightId: insightValidado });
+    await decidirOportunidad(leadId, { workspaceId: ws, oportunidadId, estado: 'aprobada', veredictoRazon: '' });
+
+    await expect(
+      decidirOportunidad(leadId, { workspaceId: ws, oportunidadId, estado: 'descartada', veredictoRazon: 'Me arrepentí' }),
+    ).rejects.toThrow(/ya se decidió/);
+    await expect(
+      priorizarOportunidad(leadId, { workspaceId: ws, oportunidadId, prioridad: 99, prioridadRazon: '' }),
+    ).rejects.toThrow(/ya se decidió/);
+    // Y la traza tampoco se toca después: cambiarla sería reescribir en qué se apoyó una
+    // aprobación que ya está firmada.
+    await expect(
+      desenlazarInsight(leadId, { workspaceId: ws, oportunidadId, insightId: insightValidado }),
+    ).rejects.toThrow(/ya se decidió/);
+  });
+
+  /**
+   * EJE TIEMPO: entre enlazar y aprobar caben semanas, y en ese hueco se revocan derechos.
+   * `oportunidad_veredicto_guard` vuelve a preguntar por el protocolo compartido
+   * (`razonamiento_usable_guard`), que es el mismo que miran G2 y G5 — no una comprobación
+   * propia que nacería divergiendo.
+   */
+  it('una HMW cuyo insight perdió los derechos ya no se aprueba', async () => {
+    const admin = sqlAdmin();
+    const { oportunidadId } = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId, pregunta: 'HMW con derechos revocados', prioridad: 0, prioridadRazon: '',
+    });
+    await enlazarInsight(leadId, { workspaceId: ws, oportunidadId, insightId: insightValidado });
+    await admin`update derecho_uso set estado = 'denegado', ambito = 'interno',
+      base = 'El participante retiró el permiso', decidido_por = ${leadId}, decidido_en = now()
+      where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
+    try {
+      await expect(
+        decidirOportunidad(leadId, { workspaceId: ws, oportunidadId, estado: 'aprobada', veredictoRazon: '' }),
+      ).rejects.toThrow(/derechos vigentes/);
+    } finally {
+      await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente',
+        base = 'Contrato de prueba', decidido_por = ${leadId}, decidido_en = now()
+        where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
+    }
+  });
+
+  it('el portafolio se lee agrupado por reto, con su traza dentro y ordenado por prioridad', async () => {
+    const retos = await portafolioDelWorkspace(leadId, ws);
+    const mio = retos.find((r) => r.retoId === retoId);
+    expect(mio!.codigo).toBe('R-01');
+    expect(mio!.oportunidades.length).toBeGreaterThan(0);
+    const prioridades = mio!.oportunidades.map((o) => o.prioridad);
+    expect([...prioridades].sort((a, b) => b - a)).toEqual(prioridades);
+    const conTraza = mio!.oportunidades.find((o) => o.insights.length > 0);
+    expect(conTraza!.insights[0]!.titulo).toBe('La verificación excluye en el móvil');
+    // Un reto SIN oportunidades sale igualmente, con la lista vacía: la pantalla tiene que
+    // poder decir «este reto no tiene portafolio todavía», que es información.
+    expect(retos.every((r) => Array.isArray(r.oportunidades))).toBe(true);
+  });
+
+  /**
+   * G3. Se monta un proyecto con UN SOLO gate, el 3: la comprobación de «los gates
+   * anteriores deben aprobarse primero» recorre `numero < new.numero`, así que sin gates
+   * anteriores pasa vacía y se llega a la rama que se quiere medir. Es el mismo truco que
+   * usa la suite del método para alcanzar ramas del guard sin montar las ocho etapas.
+   */
+  it('G3 exige SYS-15 sobre el portafolio, y es vacuamente cierto sin oportunidades', async () => {
+    const admin = sqlAdmin();
+    const [srv2] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio G3', 'activo', ${leadId}) returning id`;
+    const [r2] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv2!.id as string}, 'R-G3', 'Reto de G3', 'Descripción', 'activo',
+              'Ninguna', ${leadId}) returning id`;
+    const retoG3 = r2!.id as string;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${retoG3}, 'P-G3', 'Proyecto de G3', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${p!.id as string}, 3, 'sponsor') returning id`;
+    const gateId = g!.id as string;
+    // Un ítem `cumplido` exige referenciar exactamente UN objeto (evidencia, insight o
+    // decisión): un ítem cumplido que no cita nada es un visto bueno sin sostén, y el
+    // esquema no lo admite.
+    await admin`insert into checklist_item
+      (workspace_id, gate_id, orden, texto, estado, insight_id)
+      values (${ws}, ${gateId}, 0, 'El portafolio está razonado', 'cumplido', ${insightValidado})`;
+
+    const aprobar = () => admin`update gate_instancia
+      set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
+      where id = ${gateId}`;
+    const volverAPendiente = () => admin`update gate_instancia
+      set estado = 'pendiente', aprobado_por = null, aprobado_en = null where id = ${gateId}`;
+
+    // 1. SIN portafolio, G3 pasa. Es deliberado: SYS-15 es una regla sobre las
+    //    oportunidades, no una regla que las exija — y exigirlas aquí dejaría sin poder
+    //    firmar G3 a todo proyecto anterior a esta tabla. «Portafolio aprobado» es
+    //    expectativa del método y va en el checklist de la etapa.
+    await aprobar();
+    const [g1] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(g1!.estado).toBe('aprobado');
+    await volverAPendiente();
+
+    // 2. Una PROPUESTA sin traza ya lo bloquea: no hace falta que esté aprobada. Si solo
+    //    contaran las aprobadas, bastaría con no decidir una HMW sin apoyo para colarla.
+    const sinTraza = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId: retoG3, pregunta: 'HMW sin apoyo', prioridad: 0, prioridadRazon: '',
+    });
+    await expect(aprobar()).rejects.toThrow(/no traza a ningún insight \(SYS-15\)/);
+
+    // 3. Descartarla la saca del conjunto: lo que se tiró no sostiene nada.
+    await decidirOportunidad(leadId, {
+      workspaceId: ws, oportunidadId: sinTraza.oportunidadId, estado: 'descartada',
+      veredictoRazon: 'Fuera del alcance del reto',
+    });
+    await aprobar();
+    await volverAPendiente();
+
+    // 4. Con una aprobada y trazada, G3 sigue pasando…
+    const aprobada = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId: retoG3, pregunta: 'HMW aprobada de G3', prioridad: 5, prioridadRazon: '',
+    });
+    await enlazarInsight(leadId, {
+      workspaceId: ws, oportunidadId: aprobada.oportunidadId, insightId: insightValidado,
+    });
+    await decidirOportunidad(leadId, {
+      workspaceId: ws, oportunidadId: aprobada.oportunidadId, estado: 'aprobada', veredictoRazon: '',
+    });
+    await aprobar();
+    await volverAPendiente();
+
+    // 5. …y deja de pasar si le quitan el enlace por debajo. Ese borrado va como owner a
+    //    propósito: es el escritor que NO pasa por la política del enlace, y por eso el
+    //    guard del gate vuelve a mirar lo que el guard de la fila ya miró al aprobar.
+    await admin`delete from oportunidad_insight
+      where oportunidad_id = ${aprobada.oportunidadId} and workspace_id = ${ws}`;
+    await expect(aprobar()).rejects.toThrow(/no traza a ningún insight \(SYS-15\)/);
+  });
+
+  /**
+   * EJE TIEMPO en el gate, que es distinto del eje tiempo de la fila: al aprobar la
+   * oportunidad los derechos estaban vivos, y entre aquel momento y la firma de G3 —con el
+   * sponsor delante— pueden revocarse. Sin esta rama, G3 certifica «dónde jugamos» sobre una
+   * HMW cuyo único apoyo ya no se puede enseñar al cliente.
+   */
+  it('G3 no se firma si el razonamiento del portafolio dejó de sostenerse', async () => {
+    const admin = sqlAdmin();
+    const [srv3] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio G3 tiempo', 'activo', ${leadId}) returning id`;
+    const [r3] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv3!.id as string}, 'R-G3T', 'Reto de G3 en el tiempo', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoT = r3!.id as string;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${retoT}, 'P-G3T', 'Proyecto de G3 en el tiempo', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${p!.id as string}, 3, 'sponsor') returning id`;
+    const gateId = g!.id as string;
+    // El ítem del checklist cita la EVIDENCIA y no el insight: si citara el insight, el
+    // protocolo lo alcanzaría por el ítem y no sabríamos si lo que rechaza es el portafolio.
+    await admin`insert into checklist_item
+      (workspace_id, gate_id, orden, texto, estado, evidencia_id)
+      values (${ws}, ${gateId}, 0, 'Hay evidencia del reto', 'cumplido', ${evidenciaId})`;
+
+    const o = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId: retoT, pregunta: 'HMW del eje tiempo', prioridad: 0, prioridadRazon: '',
+    });
+    await enlazarInsight(leadId, { workspaceId: ws, oportunidadId: o.oportunidadId, insightId: insightValidado });
+    await decidirOportunidad(leadId, {
+      workspaceId: ws, oportunidadId: o.oportunidadId, estado: 'aprobada', veredictoRazon: '',
+    });
+
+    await admin`update derecho_uso set estado = 'denegado', ambito = 'interno',
+      base = 'El participante retiró el permiso', decidido_por = ${leadId}, decidido_en = now()
+      where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
+    try {
+      await expect(
+        admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+          aprobado_en = now() where id = ${gateId}`,
+      ).rejects.toThrow(/derechos vigentes/);
+    } finally {
+      await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente',
+        base = 'Contrato de prueba', decidido_por = ${leadId}, decidido_en = now()
+        where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
+    }
+  });
+});

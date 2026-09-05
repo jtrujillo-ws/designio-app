@@ -48,6 +48,14 @@ export const EstablecerPasswordSchema = z.object({
   password: PasswordNuevaSchema,
 });
 
+/**
+ * Quién puede dar de alta a un miembro (RF-01.2/01.4). Espejo de la política
+ * `miembro_insert`, que es quien lo IMPONE en la base; aquí sirve a los caminos que lo
+ * anticipan —el servicio de invitación y el seed— para no acabar con tres redacciones de la
+ * misma regla. `agente-ai` queda fuera del alta por invitación: es un actor de plataforma.
+ */
+export const ROLES_QUE_INVITAN = ['lead-boutique', 'admin-cliente'] as const;
+
 export const InvitarMiembroSchema = z.object({
   workspaceId: z.string().uuid(),
   email: z.string().trim().toLowerCase().email('Correo inválido'),

@@ -115,6 +115,11 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
 
   const resultados = estado.fase === 'listo' ? estado.resultados : [];
   const desplegado = abierto && texto.trim() !== '' && workspaceId !== null;
+  // La lista es de la consulta ACTUAL solo cuando no hay nada en vuelo y su texto es el del
+  // campo. Mientras tanto se sigue viendo (evita el parpadeo), pero no se puede abrir: ni con
+  // Enter, ni con clic, ni tabulando hasta ella. Abrir algo de la consulta anterior con el
+  // campo diciendo otra cosa es el error que este guardia cierra en los tres caminos.
+  const frescos = estado.fase === 'listo' && !cargando && estado.texto === texto.trim();
 
   function cerrar() {
     setAbierto(false);
@@ -158,7 +163,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
     if (e.key === 'Enter') {
       e.preventDefault();
       // La lista en pantalla puede ser la de la consulta anterior mientras llega la nueva.
-      if (cargando || estado.fase !== 'listo' || estado.texto !== texto.trim()) {
+      if (!frescos) {
         enterPendiente.current = texto.trim().length >= MIN_CARACTERES;
         return;
       }
@@ -180,7 +185,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
         aria-controls={idLista}
         aria-autocomplete="list"
         aria-activedescendant={
-          desplegado && resultados[activo] ? idDeOpcion(resultados[activo]) : undefined
+          desplegado && frescos && resultados[activo] ? idDeOpcion(resultados[activo]) : undefined
         }
         autoComplete="off"
         maxLength={MAX_CARACTERES}
@@ -202,6 +207,10 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
           role="listbox"
           aria-label="Resultados de la búsqueda"
           aria-busy={cargando}
+          // Un clic dentro del panel no le quita el foco al campo: así una fila en espera no
+          // cierra la lista al pulsarla, y el enlace de una fila viva sigue navegando (el clic
+          // llega igual; lo que se evita es el blur).
+          onMouseDown={(e) => e.preventDefault()}
           style={{ ...panel, opacity: cargando ? 0.7 : 1 }}
         >
           {estado.fase === 'corto' && <Aviso>Escribe al menos {MIN_CARACTERES} caracteres.</Aviso>}
@@ -227,39 +236,32 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
                       {ETIQUETA_CLASE[r.clase]}
                     </div>
                   )}
-                  <EnlaceA
-                    destino={r.destino}
-                    id={idDeOpcion(r)}
-                    role="option"
-                    aria-selected={i === activo}
-                    onMouseEnter={() => setActivo(i)}
-                    title={`Abrir ${pantalla}`}
-                    style={{
-                      ...opcion,
-                      background: i === activo ? 'var(--accent-soft)' : undefined,
-                    }}
-                  >
-                    <span
+                  {frescos ? (
+                    <EnlaceA
+                      destino={r.destino}
+                      id={idDeOpcion(r)}
+                      role="option"
+                      aria-selected={i === activo}
+                      onMouseEnter={() => setActivo(i)}
+                      title={`Abrir ${pantalla}`}
                       style={{
-                        font: '600 13px var(--font-sans)',
-                        color: 'var(--ink)',
-                        ...truncado,
+                        ...opcion,
+                        background: i === activo ? 'var(--accent-soft)' : undefined,
                       }}
                     >
-                      {r.codigo ? `${r.codigo} ` : ''}
-                      {r.titulo}
-                    </span>
-                    <span
-                      style={{
-                        font: '400 11px var(--font-sans)',
-                        color: 'var(--text-muted)',
-                        ...truncado,
-                      }}
+                      <ContenidoDeFila r={r} pantalla={pantalla} />
+                    </EnlaceA>
+                  ) : (
+                    <div
+                      id={idDeOpcion(r)}
+                      role="option"
+                      aria-selected={false}
+                      aria-disabled
+                      style={{ ...opcion, cursor: 'progress' }}
                     >
-                      {r.detalle ? `${r.detalle} · ` : ''}
-                      {pantalla}
-                    </span>
-                  </EnlaceA>
+                      <ContenidoDeFila r={r} pantalla={pantalla} />
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -309,6 +311,22 @@ const opcion: CSSProperties = {
   textDecoration: 'none',
   color: 'inherit',
 };
+
+/** Lo que se lee en una fila, sea enlace vivo o fila en espera. */
+function ContenidoDeFila({ r, pantalla }: { r: ResultadoBusqueda; pantalla: string }) {
+  return (
+    <>
+      <span style={{ font: '600 13px var(--font-sans)', color: 'var(--ink)', ...truncado }}>
+        {r.codigo ? `${r.codigo} ` : ''}
+        {r.titulo}
+      </span>
+      <span style={{ font: '400 11px var(--font-sans)', color: 'var(--text-muted)', ...truncado }}>
+        {r.detalle ? `${r.detalle} · ` : ''}
+        {pantalla}
+      </span>
+    </>
+  );
+}
 
 const truncado: CSSProperties = {
   overflow: 'hidden',

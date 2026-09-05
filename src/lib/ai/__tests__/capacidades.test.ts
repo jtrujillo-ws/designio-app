@@ -6,10 +6,10 @@ import {
   CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
   COLUMNA_DE_DESTINO,
-  parsearContenido,
   RevisarPropuestaSchema,
   type ContenidoExtraccion,
 } from '../ai.schemas';
+import { ESQUEMA_DE_CONTENIDO, parsearContenido } from '../ai.contenido';
 import { ESQUEMA_SALIDA } from '../ai.prompts';
 
 const RAIZ = new URL('../../../../', import.meta.url).pathname.replace(/\/$/, '');
@@ -51,7 +51,7 @@ describe('el registro de capacidades', () => {
       const d = CAPACIDADES[c];
       expect(d.etiqueta.length, `${c} sin etiqueta`).toBeGreaterThan(0);
       expect(d.destino, `${c} sin destino`).toBeTruthy();
-      expect(d.contenido, `${c} sin esquema de contenido`).toBeTruthy();
+      expect(ESQUEMA_DE_CONTENIDO[c], `${c} sin esquema de contenido`).toBeTruthy();
       // El ancla es lo que más varía y lo que más veces se pregunta: si a una capacidad le
       // falta una de estas piezas, la pantalla enseñaría `undefined` a un curador.
       for (const pieza of ['etiqueta', 'enProsa', 'buscar', 'vacia', 'enCurso', 'pendiente'] as const) {

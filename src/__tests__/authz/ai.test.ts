@@ -12,11 +12,11 @@ import {
 import { MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
-  parsearContenido,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
+import { parsearContenido } from '@/lib/ai/ai.contenido';
 import {
   aceptarPropuesta,
   ErrorAI,

@@ -29,7 +29,6 @@ import {
   type AnclaCapacidad,
   type CandidatoAncla,
   type Destino,
-  parsearContenido,
   type CapacidadActiva,
   type ContenidoCriterio,
   type ContenidoExtraccion,
@@ -42,6 +41,7 @@ import {
   type RegistrarConsentimiento,
   type RevisarPropuesta,
 } from './ai.schemas';
+import { ESQUEMA_DE_CONTENIDO, parsearContenido } from './ai.contenido';
 import {
   credencialesAI,
   generarConProveedor,
@@ -1238,7 +1238,8 @@ function canonico(valor: unknown): string {
 /** Valida la salida cruda del proveedor contra el esquema de la capacidad. Una salida
  * fuera de contrato se descarta ENTERA: media propuesta no es revisable. */
 function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): ContenidoPropuesta[] {
-  const { contenido, lote } = CAPACIDADES[capacidad];
+  const contenido = ESQUEMA_DE_CONTENIDO[capacidad];
+  const { lote } = CAPACIDADES[capacidad];
   // Sin lote, el objeto viene en la RAÍZ de la respuesta; con lote, dentro de su campo. No
   // es lo mismo que un lote de uno, y por eso se declara en vez de deducirse de la forma.
   if (lote === null) return [contenido.parse(datos)];

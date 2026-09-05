@@ -1,5 +1,20 @@
 import { z } from 'zod';
-import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
+
+/*
+ * Los contratos de CONTENIDO viven en `ai.contenido.ts` y aquí solo se reexportan sus TIPOS,
+ * que se borran al compilar. No es orden: es dónde cae la frontera. Este módulo lo importa la
+ * pantalla, y Rollup no puede podar una construcción de Zod de nivel superior —no sabe
+ * demostrar que no tiene efectos—, así que basta con que la pantalla importe UNA cosa de aquí
+ * para que TODOS los esquemas declarados en este fichero viajen al navegador. Medido: los dos
+ * validadores de contenido estaban en el chunk de `/propuestas` desde antes de esta rama, sin
+ * que nadie los llamara allí. Un reexport de tipos no crea esa arista.
+ */
+import type { ContenidoPropuesta } from './ai.contenido';
+export type {
+  ContenidoCriterio,
+  ContenidoExtraccion,
+  ContenidoPropuesta,
+} from './ai.contenido';
 
 /** CTX-08 Capacidades AI — el pipeline único PropuestaAI (ADR-0012, SPEC-08). */
 
@@ -85,105 +100,7 @@ export const CONFIANZA_PROPUESTA = ['alta', 'media', 'baja'] as const;
 export const CONFIANZA_PROPUESTA_NUMERICA: Record<(typeof CONFIANZA_PROPUESTA)[number], number> =
   { alta: 0.9, media: 0.6, baja: 0.3 };
 
-const CitasSchema = z
-  .array(
-    z.object({
-      fragmento: z.string().trim().min(1).max(600),
-      localizacion: z.string().trim().min(1).max(200),
-    }),
-  )
-  .min(1)
-  .max(6);
 
-export const ContenidoExtraccionSchema = z
-  .object({
-    titulo: z.string().trim().min(1).max(300),
-    resumen: z.string().trim().max(2000).default(''),
-    recoleccion: z.string().trim().min(1).max(300),
-    /**
-     * La fecha del material, o la razón de que no la haya — EXACTAMENTE una de las dos.
-     *
-     * Era obligatoria, y eso convertía el contrato en una contradicción: `item_importacion`
-     * guarda título, contenido, tipo de fuente y referencia, y NADA garantiza que ese
-     * material traiga una fecha calendárica. El prompt prohíbe inventar fechas y el esquema
-     * exigía una, así que al modelo solo le quedaban dos salidas: fabricarla —y se
-     * persistía como `proveniencia`, que es de las claves que este slice blinda contra la
-     * falsificación— o devolver algo que se descarta. Blindar el transporte de un dato que
-     * el propio contrato obliga a inventar no protege nada.
-     *
-     * La forma es la que este repo ya usa en `resultado_criterio`: o apunta al dato, o
-     * escribe por qué no lo hay, y el XOR lo impone. Así la ausencia es representable y
-     * significa «no consta», no «no lo escribí» — la misma distinción que sostiene el
-     * `null` de `llamada_ai.consentimiento_version`.
-     *
-     * Con fecha hay que decir DÓNDE se leyó, por lo mismo que las citas llevan localización:
-     * una fecha sin sitio en el material es indistinguible de una inventada.
-     */
-    fecha: FechaCalendarioSchema.nullable(),
-    fechaLocalizacion: z.string().trim().max(200).default(''),
-    fechaSinDatoMotivo: z.string().trim().max(300).default(''),
-    derivada: z.boolean(),
-    confianza: z.enum(['alta', 'media', 'baja']),
-    confidencialidad: z.enum(['interna', 'cliente', 'restringida']),
-    esEstadoActual: z.boolean(),
-    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
-    citas: CitasSchema,
-  })
-  .superRefine((c, ctx) => {
-    if ((c.fecha !== null) === (c.fechaSinDatoMotivo !== '')) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['fecha'],
-        message:
-          'La fecha del material o consta con su localización, o falta con su motivo: exactamente una de las dos',
-      });
-    }
-    if (c.fecha !== null && c.fechaLocalizacion === '') {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['fechaLocalizacion'],
-        message: 'Una fecha extraída dice dónde se leyó en el material',
-      });
-    }
-  });
-export type ContenidoExtraccion = z.infer<typeof ContenidoExtraccionSchema>;
-
-/**
- * C0 — un criterio de éxito medible con su ventana (SYS-22), por propuesta: la revisión
- * es POR ELEMENTO (SPEC-08 §3), así que una generación produce varias propuestas y cada
- * una se acepta o se descarta por separado.
- *
- * El modelo propone el PLAN para obtener la línea base, nunca un valor ni una fecha: una
- * medición inventada es exactamente lo que §21 prohíbe vender. El valor real lo registra
- * un humano editando el criterio antes de G0.
- */
-export const ContenidoCriterioSchema = z.object({
-  kpi: z.string().trim().min(1).max(200),
-  definicion: z.string().trim().min(1).max(2000),
-  objetivo: z.string().trim().min(1).max(200),
-  ventanaDias: z.number().int().positive().max(3650),
-  lineaBasePlan: z.string().trim().min(1).max(1000),
-  razonamiento: z.string().trim().max(1000).default(''),
-  /**
-   * Y CITA, como CI. C0 proponía solo con `razonamiento`, y eso la dejaba fuera del marco
-   * por dos sitios: I4 dice «la AI propone Y CITA; el humano aprueba», y un criterio que se
-   * acepta sin ver qué parte del reto lo sostiene es justo lo que G0 tendrá que certificar
-   * después. Peor todavía, RF-09.10 exige una suite de grounding con línea base y
-   * regresión: una capacidad con cero citas no sale MAL en esa medición, sale EXCLUIDA en
-   * silencio — y la que no puede salir mal es la que más falta hace medir.
-   *
-   * El material del alcance de C0 es la formulación del reto (código, título, descripción y
-   * métrica objetivo declarada), delimitado igual que el de CI, así que la presencia se mide
-   * exactamente con la misma regla y la misma función.
-   */
-  citas: CitasSchema,
-  confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
-});
-export type ContenidoCriterio = z.infer<typeof ContenidoCriterioSchema>;
-
-/** Contenido de una propuesta: una de las formas tipadas, nunca un jsonb libre — así el
- * panel, el servicio y la corrección hablan del mismo objeto sin castings. */
-export type ContenidoPropuesta = ContenidoExtraccion | ContenidoCriterio;
 
 /**
  * Cuántos criterios se le piden a C0 de una vez: la revisión es por elemento, así que el lote
@@ -248,13 +165,20 @@ export type DefinicionCapacidad = {
   /** Qué objeto del dominio materializa una propuesta aceptada. */
   destino: Destino;
   ancla: AnclaCapacidad;
-  /**
-   * El contrato de la salida del modelo para UNA propuesta. La entrada se tipa `unknown` a
-   * propósito: lo que llega es JSON del proveedor, y un esquema con `default()` tiene un
-   * tipo de ENTRADA distinto del de salida — pedirle que coincidan rechazaría justo a los
-   * que traen valores por omisión.
+  /*
+   * El contrato de la salida del modelo NO vive aquí, y esa ausencia es deliberada. Este
+   * registro lo importa la PANTALLA —de él salen la etiqueta, los seis textos del ancla y sus
+   * dos errores—, así que todo lo que ponga aquí viaja al navegador. Un esquema de Zod
+   * colgado del registro no se puede podar: Rollup ve la referencia y se lleva el validador
+   * entero al chunk de la ruta, donde nadie lo llama —desde que la frontera de la corrección
+   * es `unknown`, la única validación de contenido ocurre en el servidor—. Medido: 859 bytes
+   * de código muerto en el chunk de `/propuestas`.
+   *
+   * Vive en `ESQUEMA_DE_CONTENIDO` (`ai.contenido.ts`), que es otro
+   * `Record<CapacidadActiva, …>`: sigue habiendo UN sitio por cada cosa que varía y el
+   * compilador sigue exigiendo la entrada de cada capacidad en los dos. Lo que cambia es de
+   * qué lado de la frontera cae cada uno.
    */
-  contenido: z.ZodType<ContenidoPropuesta, z.ZodTypeDef, unknown>;
   lote: LoteCapacidad;
   /**
    * Si el material del ancla puede ser de personas y hace falta consentimiento vigente
@@ -313,7 +237,6 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
         'Ese item ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
       pendiente: 'Ese item ya tiene una propuesta pendiente: revísala antes de pedir otra',
     },
-    contenido: ContenidoExtraccionSchema,
     lote: null,
     exigeConsentimiento: true,
     esSimulacion: false,
@@ -336,23 +259,12 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
       pendiente:
         'Ese reto ya tiene criterios propuestos esperando revisión: decídelos antes de pedir otros',
     },
-    contenido: ContenidoCriterioSchema,
     lote: { campo: 'criterios', maximo: MAX_CRITERIOS_POR_LOTE },
     exigeConsentimiento: false,
     esSimulacion: false,
   },
 };
 
-
-/** Valida el contenido según la capacidad (el mismo esquema para la salida del modelo y
- * para la corrección humana: corregir no puede producir algo que generar no podría, ni
- * cambiar la forma que la capacidad declara). */
-export function parsearContenido(
-  capacidad: CapacidadActiva,
-  valor: unknown,
-): ContenidoPropuesta {
-  return CAPACIDADES[capacidad].contenido.parse(valor);
-}
 
 export const GenerarPropuestasSchema = z.object({
   workspaceId: z.string().uuid(),

@@ -136,3 +136,12 @@ create unique index propuesta_ai_llamada_c5_idx on propuesta_ai (workspace_id, l
 -- reescribir después no diría nada sobre lo que el modelo leyó.
 alter table propuesta_ai add column huella_material text;
 grant insert (huella_material) on propuesta_ai to designio_app;
+
+-- Y C5 la exige. La columna es anulable porque las demás capacidades no la declaran, pero
+-- para C5 no hay fila legítima sin ella: la capacidad y la columna llegan en el mismo par de
+-- migraciones, así que no existen filas anteriores que perdonar. Sin el CHECK, una propuesta
+-- de C5 escrita por SQL directo omitiendo la huella se queda sin el aviso de obsoleta para
+-- siempre —`estadoDeLaFila` no puede afirmar nada sin ella, y con razón—: el hueco no sería
+-- ruidoso, sería una fila que se dice al día pase lo que pase.
+alter table propuesta_ai add constraint propuesta_ai_huella_c5
+  check (capacidad <> 'C5' or huella_material is not null);

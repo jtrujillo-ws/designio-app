@@ -6142,4 +6142,96 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       ).toContain(conSenales.journeyId);
     });
   });
+
+  /**
+   * Las DOS proyecciones del grafo ordenan igual, y por eso la huella es una huella.
+   *
+   * `leerJourneyCompleto` (que arma el prompt) y la del panel (que lo recompone para saber si
+   * el informe sigue al día) alimentan las dos `huellaDelGrafo`. Si ordenan distinto, la huella
+   * guardada al generar y la recalculada al pintar difieren sobre un grafo IDÉNTICO: el panel
+   * declararía obsoleto un informe que está al día, y la comprobación de escritura rechazaría
+   * una respuesta ya pagada por un cambio que no hubo.
+   *
+   * Ordenar por `(tipo, orden)` no es un orden total: nada impide dos nodos del mismo tipo con
+   * el mismo orden —no hay único sobre ellos— y ahí Postgres puede devolverlos en cualquier
+   * orden, distinto entre dos lecturas. El fixture crea el empate a propósito; sin él, este
+   * caso pasaría con o sin desempate y no mediría nada.
+   */
+  it('las dos lecturas del grafo producen la MISMA huella, incluso con órdenes empatados', async () => {
+    await enWorkspaceLimpio('c5-huella-estable', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      // Dos pasos más con el MISMO orden que los que ya hay: el empate que el orden por
+      // (tipo, orden) no puede deshacer.
+      await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+        values (${wsC}, ${j.journeyId}, 'paso', 'Empatado A', '', 0, 'Front', ${curadorId}),
+               (${wsC}, ${j.journeyId}, 'paso', 'Empatado B', '', 0, 'Back', ${curadorId})`;
+
+      const leerDosVeces = () =>
+        conUsuario(curadorId, async (tx) => {
+          const g = await leerJourneyCompleto(tx, wsC, j.journeyId);
+          return JSON.stringify({ nodos: g!.nodos, aristas: g!.aristas });
+        });
+      const delPrompt = await leerDosVeces();
+      // Y la del panel, por el camino real: se genera y se lee la fila proyectada.
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const informe = panel.pendientes.find((x) => x.capacidad === 'C5')!;
+
+      // Si las dos proyecciones no ordenaran igual, el panel diría «cambiado» sobre un grafo
+      // que nadie tocó entre las dos lecturas.
+      expect(
+        informe.anclaEstado,
+        'el panel declara obsoleto un informe sobre un grafo que no cambió',
+      ).toBe('disponible');
+      // Y la lectura del prompt sigue siendo determinista entre dos llamadas seguidas.
+      expect(await leerDosVeces()).toBe(delPrompt);
+    });
+  });
+
+  /**
+   * Una propuesta de C5 sin su huella no puede existir.
+   *
+   * La columna es anulable porque las demás capacidades no la declaran, pero para C5 no hay
+   * fila legítima sin ella: la capacidad y la columna llegan en el mismo par de migraciones,
+   * así que no hay filas anteriores que perdonar. Sin el CHECK, una escritura directa que la
+   * omitiera dejaba un informe que se dice al día PASE LO QUE PASE — `estadoDeLaFila` no puede
+   * afirmar nada sin huella, y con razón. Un hueco así no es ruidoso: es silencioso.
+   */
+  it('una propuesta de C5 sin huella del material la rechaza la base', async () => {
+    await enWorkspaceLimpio('c5-sin-huella', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const admin = sqlAdmin();
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, journey_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C5', ${j.journeyId}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const contenido = informeCompleto(senales);
+      const escribir = (huella: string | null) =>
+        conUsuario(curadorId, (tx) => tx`
+          insert into propuesta_ai
+            (workspace_id, capacidad, destino, journey_id, contenido, contenido_original,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             llamada_id, creado_por)
+          values (${wsC}, 'C5', null, ${j.journeyId}, ${tx.json(contenido)},
+                  ${tx.json(contenido)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'alcance',
+                  ${huella}, 'entorno', ${l!.id as string}, ${curadorId})
+          returning id`);
+      await expect(escribir(null)).rejects.toThrow(/propuesta_ai_huella_c5/);
+      // Y con huella entra: sin esta mitad, un CHECK que rechazara todo pasaría igual.
+      await expect(escribir('una huella cualquiera')).resolves.toBeDefined();
+    });
+  });
 });

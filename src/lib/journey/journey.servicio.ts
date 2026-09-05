@@ -495,12 +495,19 @@ export async function leerJourneyCompleto(
               where a.id = n.arquetipo_id and a.workspace_id = n.workspace_id),
             'evidencias', coalesce((
               select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo)
-                order by e.titulo)
+                order by e.titulo, e.id)
               from journey_nodo_evidencia ne
               join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
               where ne.nodo_id = n.id and ne.workspace_id = n.workspace_id
             ), '[]'::jsonb))
-            order by n.tipo, n.orden)
+            -- Orden TOTAL, el mismo que el del snapshot y por la misma razón dicha allí: sin
+            -- desempate, dos filas con el mismo (tipo, orden) —y nada lo impide: no hay único
+            -- sobre ellos— pueden salir en distinto orden en dos lecturas del mismo grafo.
+            -- Aquí eso cuesta más que una forma inestable: de esta proyección sale la HUELLA
+            -- del material de C5, y una huella que cambia sin que cambie el grafo no es una
+            -- huella — declararía obsoleto un informe que está al día, y rechazaría una
+            -- respuesta pagada por un cambio que no hubo.
+            order by n.tipo, n.orden, n.id)
           from journey_nodo n
           where n.journey_id = j.id and n.workspace_id = j.workspace_id
         ), '[]'::jsonb) as nodos,
@@ -508,7 +515,9 @@ export async function leerJourneyCompleto(
           select jsonb_agg(jsonb_build_object(
             'id', a.id, 'origenId', a.origen_id, 'destinoId', a.destino_id,
             'tipo', a.tipo, 'condicion', a.condicion)
-            order by a.creado_en)
+            -- Con desempate por lo mismo: creado_en empata entre aristas creadas en la
+            -- misma transacción, que es lo normal al montar un grafo de una vez.
+            order by a.creado_en, a.id)
           from journey_arista a
           where a.journey_id = j.id and a.workspace_id = j.workspace_id
         ), '[]'::jsonb) as aristas,

@@ -443,18 +443,22 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
           'arquetipoEstado', (select a.estado from arquetipo a
             where a.id = n.arquetipo_id and a.workspace_id = n.workspace_id),
           'evidencias', coalesce((
-            select jsonb_agg(jsonb_build_object('id', e.id))
+            select jsonb_agg(jsonb_build_object('id', e.id) order by e.id)
             from journey_nodo_evidencia ne
             join evidencia e on e.id = ne.evidencia_id and e.workspace_id = ne.workspace_id
             where ne.nodo_id = n.id and ne.workspace_id = n.workspace_id), '[]'::jsonb))
-          order by n.tipo, n.orden)
+          -- El MISMO orden total que leerJourneyCompleto, y eso es el requisito entero: las
+          -- dos proyecciones alimentan huellaDelGrafo, así que si ordenan distinto la huella
+          -- guardada al generar y la recalculada al pintar difieren sobre un grafo idéntico —y
+          -- el panel declararía obsoleto un informe que está al día.
+          order by n.tipo, n.orden, n.id)
         from journey_nodo n
         where n.journey_id = jr.id and n.workspace_id = jr.workspace_id), '[]'::jsonb)
         as journey_nodos,
       coalesce((
         select jsonb_agg(jsonb_build_object(
           'id', a.id, 'origenId', a.origen_id, 'destinoId', a.destino_id,
-          'tipo', a.tipo, 'condicion', a.condicion) order by a.creado_en)
+          'tipo', a.tipo, 'condicion', a.condicion) order by a.creado_en, a.id)
         from journey_arista a
         where a.journey_id = jr.id and a.workspace_id = jr.workspace_id), '[]'::jsonb)
         as journey_aristas`,

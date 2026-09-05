@@ -50,6 +50,7 @@ import {
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
 import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
+import { borrarEntrada } from '@/lib/medicion/medicion.servicio';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -10806,6 +10807,116 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`update metric_registry set estado = 'borrador', firmado_por = null,
         firmado_en = null where id = ${registryId}`;
     }
+  });
+
+  /**
+   * Y la entrada que salió de una propuesta SIGUE pudiendo quitarse del borrador.
+   *
+   * `entrada_kpi` es el primero de los cuatro destinos cuyo objeto tiene un camino de BORRADO
+   * en el producto: `borrarEntrada` existe porque una entrada que sobra —o que se pactó y
+   * después no— bloquearía la firma del contrato, y firmar es lo que hace G6. Los otros tres
+   * no se borran nunca, así que el enlace del sello nunca había chocado con nada.
+   *
+   * Con el sello puesto sí choca, y hacia el lado peor: la salida que existe para no bloquear
+   * la firma se cierra JUSTO para las entradas que propuso la AI, y el mensaje que llega es una
+   * violación de clave ajena. La forma de la regla queda dicha por sus dos mitades: la entrada
+   * se va, y la propuesta se queda —aceptada, con su rastro—.
+   */
+  it('C6: una entrada del registry se puede quitar del borrador aunque la haya propuesto la AI', async () => {
+    const admin = sqlAdmin();
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+    });
+    // Con nombre propio: el registry del fixture es uno solo —`metric_registry` es único por
+    // reto— y `unique (registry_id, nombre)` no admite dos entradas iguales.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: {
+        ...CONTENIDO_C6(criterioDelRegistryId),
+        nombre: 'Tasa de verificación completada en tableta',
+      },
+    });
+
+    await borrarEntrada(leadId, { workspaceId: ws, entradaId: r.objetoId });
+    const quedan = await admin`select id from entrada_kpi where id = ${r.objetoId}`;
+    expect(quedan.length, 'la salida que existe para no bloquear la firma').toBe(0);
+
+    // Y la propuesta se queda: quitar la entrada no borra que se aceptó, ni quién la aceptó.
+    // El puntero se va con el objeto —no queda a qué apuntar—, y el hecho vive donde tiene que
+    // vivir: en el evento, que es append-only y sí conserva el id.
+    const [tras] = await admin`select estado, revisada_por, entrada_kpi_id from propuesta_ai
+      where id = ${propuestaId}`;
+    expect(tras!.estado).toBe('corregida');
+    expect(tras!.revisada_por).toBe(leadId);
+    expect(tras!.entrada_kpi_id).toBeNull();
+    const [evento] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'PropuestaAICorregida'
+        and payload->>'propuestaId' = ${propuestaId}`;
+    expect(
+      (evento!.payload as Record<string, unknown>).entradaKpiId,
+      'el rastro de qué objeto creó esta propuesta no se borra con el objeto',
+    ).toBe(r.objetoId);
+  });
+
+  /**
+   * Y el criterio tampoco se reapunta por SQL DIRECTO, que es donde la regla tenía que estar.
+   *
+   * La ronda anterior blindó `criterioId` en `TESTIMONIO_ADICIONAL.C6` y eso cierra el
+   * formulario. Pero el guard de la base comparaba contra `contenido_original` solo las citas
+   * de primer nivel y la confianza, y `criterioId` no es ninguna de las dos: por la superficie
+   * SQL concedida, una «corrección» podía reapuntar la entrada a otro criterio CONSERVANDO las
+   * citas, y el resto del suelo no lo veía —el criterio nuevo es del reto del registry, y la
+   * proyección compara contra `contenido`, que es el ya corregido—. La entrada quedaba sellada
+   * respondiendo a una promesa cuyos fragmentos nunca se leyeron.
+   *
+   * La comparación se añade SIN condicionar al destino, como la de las citas y por lo mismo:
+   * para las capacidades cuyo contenido no lleva `criterioId` los dos lados son nulos y la
+   * regla no dice nada, así que atarla a C6 solo la dejaría corta ante la siguiente.
+   */
+  it('C6: reapuntar el criterio por SQL directo tampoco sella la entrada', async () => {
+    const admin = sqlAdmin();
+    const [otro] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Criterio de al lado', 'Definición', 'Objetivo', 30, 'Plan',
+              ${leadId}) returning id`;
+    const otroId = otro!.id as string;
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+    });
+    // El contenido con el criterio cambiado y las citas INTACTAS: es la forma que el guard de
+    // las citas no ve, porque no toca ninguna cita.
+    const corregido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      criterioId: otroId,
+      nombre: 'Tasa de verificación completada en quiosco',
+    };
+
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [entrada] = await tx`insert into entrada_kpi
+          (workspace_id, registry_id, criterio_id, nombre, definicion, fuente, dimensiones,
+           frecuencia, dashboard_url, creado_por)
+          values (${ws}, ${registryId}, ${otroId}, ${corregido.nombre}, ${corregido.definicion},
+                  ${corregido.fuente}, ${corregido.dimensiones}, ${corregido.frecuencia}, '',
+                  ${leadId}) returning id`;
+        await tx`update propuesta_ai
+          set estado = 'corregida', revisada_por = ${leadId},
+              contenido = ${tx.json(corregido)}::jsonb,
+              entrada_kpi_id = ${entrada!.id as string}
+          where id = ${propuestaId} and workspace_id = ${ws}`;
+      }),
+    ).rejects.toThrow(/no se corrige|no se reapunta/i);
+
+    // Y la propuesta sigue pendiente: la transacción entera se fue, entrada incluida.
+    const [tras] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(tras!.estado).toBe('propuesta');
+    const restos = await admin`select id from entrada_kpi
+      where registry_id = ${registryId} and criterio_id = ${otroId}`;
+    expect(restos.length).toBe(0);
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
   });
 
   /**

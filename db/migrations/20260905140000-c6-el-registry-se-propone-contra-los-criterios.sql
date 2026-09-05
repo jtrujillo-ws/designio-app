@@ -131,10 +131,37 @@ grant update (entrada_kpi_id) on propuesta_ai to designio_app;
 -- Y «aceptada ⇔ hay objeto», con el cuarto en la cuenta. Igual que la vez anterior: la
 -- enumeración corta rechazaba la aceptación de la capacidad nueva con la mitad izquierda
 -- cierta y la derecha falsa.
+-- Y «aceptada ⇔ hay objeto», que con el cuarto destino deja de poder ser una equivalencia.
+--
+-- La enumeración corta era lo de siempre —rechazaba la aceptación de la capacidad nueva con la
+-- mitad izquierda cierta y la derecha falsa—, pero aquí hay además algo que los tres destinos
+-- anteriores no tenían: `entrada_kpi` es el primero cuyo objeto se puede BORRAR. `borrarEntrada`
+-- existe porque una entrada que sobra bloquearía la firma del contrato, y firmar es lo que hace
+-- G6; `evidencia`, `criterio_exito` e `insight` no se borran nunca, así que la equivalencia
+-- nunca había chocado con nada.
+--
+-- Con ella escrita como equivalencia, quitar una entrada propuesta por la AI era imposible: la
+-- clave ajena la retenía, y aunque se soltara el puntero la propuesta quedaba «aceptada sin
+-- objeto» y el CHECK la rechazaba. O sea que la salida que existe para no bloquear la firma se
+-- cerraba JUSTO para las entradas de la AI.
+--
+-- Tres ramas explícitas en vez de una equivalencia, para que cada una diga lo suyo:
+--   · sin decidir  ⇒ NINGÚN objeto (lo que la mitad de siempre protege: un objeto colgando de
+--     una propuesta que nadie revisó sería una materialización sin revisión);
+--   · decidida con un destino cuyo objeto se QUITA ⇒ como mucho uno, porque puede haberse ido;
+--   · decidida en cualquier otro destino ⇒ exactamente uno, igual que antes.
+-- Que una propuesta de C6 se acepte SIN entrada no lo permite esta relajación: lo cierra
+-- `propuesta_ai_materializacion_guard`, que exige la fila y su procedencia. El CHECK deja de ser
+-- el que lo dice, y eso es lo que se está pagando aquí — dicho, en vez de disimulado.
 alter table propuesta_ai drop constraint propuesta_ai_objeto_materializado;
 alter table propuesta_ai add constraint propuesta_ai_objeto_materializado
-  check ((estado in ('aceptada', 'corregida'))
-         = (num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id) = 1));
+  check (case
+    when estado not in ('aceptada', 'corregida')
+      then num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id) = 0
+    when destino = 'entrada-kpi'
+      then num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id) <= 1
+    else num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id) = 1
+  end);
 
 -- Y capacidad ⇒ destino, aditiva como las de C0/C2/C5.
 alter table propuesta_ai add constraint propuesta_ai_destino_c6
@@ -475,6 +502,22 @@ begin
         is distinct from new.contenido_original -> 'confianzaPropuesta' then
     raise exception 'las citas y la confianza declarada de una propuesta AI no se corrigen: son el rastro de lo que el modelo dijo y con lo que se ordena la revisión';
   end if;
+  -- Y el CRITERIO al que una entrada KPI responde, que es testimonio por el mismo motivo que
+  -- las citas y no se veía desde aquí: no está DENTRO de `citas`, es un campo de primer nivel.
+  -- El servicio ya lo blinda —`TESTIMONIO_ADICIONAL.C6`— y eso cierra el formulario; el resto
+  -- del suelo no lo veía: el criterio nuevo es del reto del registry, que es lo único que la
+  -- materialización comprueba, y su proyección compara contra `contenido`, que es el ya
+  -- corregido. Por la superficie SQL concedida, entonces, una «corrección» reapuntaba la
+  -- entrada a otro criterio CONSERVANDO las citas — que es quedarse con el sostén de uno para
+  -- afirmar sobre otro, exactamente lo que la regla de las citas existe para impedir.
+  --
+  -- Sin condicionar al destino, como la de arriba y por lo mismo: para un contenido que no
+  -- lleva `criterioId` los dos lados son nulos y esto no dice nada, así que atarla a C6 solo la
+  -- dejaría corta ante la siguiente capacidad que responda a un criterio.
+  if new.contenido -> 'criterioId'
+     is distinct from new.contenido_original -> 'criterioId' then
+    raise exception 'el criterio al que responde una entrada KPI no se corrige: los fragmentos citados se copiaron de ESE criterio, así que reapuntarla a otro conservando las citas es quedarse con el sostén de uno para afirmar sobre otro (SYS-17)';
+  end if;
 
   -- RF-09.4/09.5 en la ACEPTACIÓN, que es la otra mitad del permiso. Generar ya exigía
   -- consentimiento vigente, pero entre generar y revisar la persona puede retirarlo: la
@@ -525,6 +568,22 @@ begin
     return null;
   end if;
   if new.estado not in ('aceptada', 'corregida') then
+    return null;
+  end if;
+  -- Y una fila que YA estaba decidida y que esta transacción solo TOCA no vuelve a
+  -- materializar nada: lo que este guard comprueba es el acto de decidir, y ese acto ocurrió
+  -- —y se comprobó— cuando el estado se movió.
+  --
+  -- Hace falta desde que quitar una entrada del borrador suelta el puntero de su propuesta
+  -- (el trigger de abajo): ese UPDATE deja `estado` donde estaba y volvía a disparar este
+  -- guard, que entonces exigía la entrada recién borrada y hacía imposible el borrado.
+  --
+  -- No abre nada por el lado del rol de aplicación: su única política de UPDATE
+  -- —`propuesta_revisar`— exige `estado = 'propuesta'` en el `using`, así que el único UPDATE
+  -- concedido sobre esta tabla es justamente el que mueve el estado. Y aceptar y borrar la
+  -- entrada en la MISMA transacción sigue rechazado: el evento diferido de la aceptación se
+  -- guardó con su `entrada_kpi_id`, y en el commit esa fila ya no existe.
+  if new.estado is not distinct from old.estado then
     return null;
   end if;
 
@@ -1165,3 +1224,48 @@ begin
       app_user_id(), workspace_role(app_user_id(), (fila->>'workspace_id')::uuid));
   return null;
 end $$;
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- QUITAR UNA ENTRADA DEL BORRADOR NO BORRA QUE LA AI LA PROPUSO
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- `borrarEntrada` existe por RF-07: una entrada que sobra —o que se pactó y después no— no
+-- puede bloquear la FIRMA del contrato, que es lo que hace G6. Con el enlace del sello puesto,
+-- esa salida se cerraba justo para las entradas que propuso la AI, y lo que llegaba a quien
+-- revisa era una violación de clave ajena.
+--
+-- El puntero se va con el objeto porque ya no hay a qué apuntar. Lo que NO se va es el hecho:
+-- «esta propuesta se aceptó y creó una entrada» vive en `evento_dominio` —el evento de la
+-- revisión lleva `entradaKpiId` desde la ronda anterior—, que es append-only y no lo toca
+-- nadie. La columna es el enlace VIVO; el archivo es el registro.
+--
+-- Un trigger y no `on delete set null (entrada_kpi_id)`: la clave ajena es compuesta
+-- —`(entrada_kpi_id, workspace_id)`— y anular la pareja entera es imposible, `workspace_id` es
+-- NOT NULL. La forma con lista de columnas existe, pero es de PostgreSQL 15 en adelante y este
+-- repositorio corre 16 en local y 15 en CI: no hay dónde comprobarla antes de empujarla, y una
+-- garantía que solo se puede verificar en el servidor de integración no es una garantía.
+--
+-- `security definer` porque la política de UPDATE de `propuesta_ai` exige `estado =
+-- 'propuesta'` en su `using`: una propuesta ya decidida es intocable para el rol de
+-- aplicación, y esto tiene que poder soltarla igualmente.
+create function entrada_kpi_suelta_su_propuesta() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+begin
+  update propuesta_ai set entrada_kpi_id = null
+   where entrada_kpi_id = old.id and workspace_id = old.workspace_id;
+  return old;
+end;
+$fn$;
+
+revoke execute on function entrada_kpi_suelta_su_propuesta() from public;
+
+-- `b_`, por detrás de `a_congelacion_por_disposicion`: el orden de esa primera es el invariante
+-- que el censo de triggers vigila, y esto no tiene ninguna razón para adelantarla — con el
+-- workspace dispuesto, aquí no se borra nada.
+--
+-- BEFORE y no AFTER: la comprobación de la clave ajena corre al final de la sentencia, así que
+-- para entonces el puntero ya está suelto. Con AFTER llegaría tarde.
+create trigger b_entrada_kpi_suelta_su_propuesta
+  before delete on entrada_kpi
+  for each row execute function entrada_kpi_suelta_su_propuesta();

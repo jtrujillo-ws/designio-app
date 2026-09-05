@@ -384,10 +384,20 @@ function PantallaOportunidades() {
                           size="sm"
                           disabled={ocupado}
                           onClick={async () => {
-                            // Un `type="number"` vacío, o con «e» dentro, da `NaN`: mandarlo
-                            // sería estrellarse contra el validador con un mensaje que no
-                            // dice nada. Se acota al rango del contrato antes de salir.
-                            const crudo = Number(repriorizando[o.id]!.prioridad);
+                            // El campo VACÍO va primero, y esto es una corrección de la
+                            // ronda anterior: `Number('')` no da `NaN` —da 0, que es
+                            // finito—, así que borrar la prioridad y guardar mandaba un 0
+                            // silencioso en vez de conservar la que había. La rama de
+                            // reposición existía y no se llegaba a ella nunca por el caso
+                            // que la motivó.
+                            //
+                            // Lo que sí da `NaN` es el resto de lo que un `type="number"`
+                            // deja escribir sin ser número («e», «-», «1e»), y para eso
+                            // sigue el `isFinite`. Las dos mitades reponen lo que había:
+                            // dejar el campo mostrando algo que el servidor no aceptó es la
+                            // mitad fea del mismo problema.
+                            const texto = repriorizando[o.id]!.prioridad.trim();
+                            const crudo = texto === '' ? Number.NaN : Number(texto);
                             const valor = Number.isFinite(crudo)
                               ? Math.min(1000, Math.max(0, Math.round(crudo)))
                               : o.prioridad;

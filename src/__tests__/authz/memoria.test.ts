@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
 import { construirMemoria, memoriaParaUsuario } from '@/lib/memoria/memoria.queries';
-import { TOPE_POR_SECCION } from '@/lib/memoria/memoria.schemas';
+import { agruparArquetiposPorSegmento, TOPE_POR_SECCION } from '@/lib/memoria/memoria.schemas';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { describeAuthz } from './helpers';
 
@@ -369,6 +369,22 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
       expect(m!.segmentos.some((s) => s.id === segIndep || s.id === segPymes)).toBe(false);
       expect(m!.segmentos.every((s) => s.totalArquetipos === 0)).toBe(true);
       expect(m!.totales.arquetipos).toBe(2);
+      // El arquetipo mapeado a los segmentos antiguos trae su mapeo ENTERO —la base no lo
+      // recorta— y por eso NO cae en «sin segmento»: va al grupo de los segmentos que no se
+      // muestran. «Sin segmento» sigue siendo solo el que de verdad no declaró ninguno.
+      const confirmado = m!.arquetipos.find((a) => a.id === arqConfirmado)!;
+      expect(confirmado.segmentoIds).toEqual([segIndep, segPymes]);
+      expect(m!.totales.arquetiposSinSegmento).toBe(1);
+      const grupos = agruparArquetiposPorSegmento(
+        m!.segmentos,
+        m!.arquetipos,
+        m!.totales.arquetiposSinSegmento,
+      );
+      const fuera = grupos.find((g) => g.clase === 'fuera-de-los-mostrados')!;
+      expect(fuera.arquetipos.map((a) => a.id)).toEqual([arqConfirmado]);
+      const sinSegmento = grupos.find((g) => g.clase === 'sin-segmento')!;
+      expect(sinSegmento.arquetipos.map((a) => a.id)).toEqual([arqHipotesis]);
+      expect(sinSegmento.total).toBe(1);
     } finally {
       await admin`delete from segmento where workspace_id = ${wsA} and nombre like 'Segmento reciente %'`;
     }

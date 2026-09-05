@@ -21,6 +21,7 @@ import {
   resumenDeRespaldo,
   TOPE_POR_SECCION,
   type ArquetipoEnMemoria,
+  type ClaseDeGrupo,
   type GrupoDeSegmento,
 } from '@/lib/memoria/memoria.schemas';
 import {
@@ -386,7 +387,7 @@ function SeccionArquetipos({
   // Los grupos de abajo son los segmentos MOSTRADOS: un segmento fuera del tope no tiene
   // tarjeta aquí, y decirlo con el enlace a la lista entera es lo que evita que parezca que
   // no existe.
-  const mostrados = grupos.filter((g) => g.segmento !== null).length;
+  const mostrados = grupos.filter((g) => g.clase === 'segmento').length;
   const recorteSegmentos = notaDeRecorte(mostrados, totalSegmentos, 'la pantalla de segmentos');
   return (
     <section
@@ -418,21 +419,29 @@ function SeccionArquetipos({
       )}
       {grupos.map((g) => (
         <Card
-          key={g.segmento?.id ?? 'sin-segmento'}
+          key={g.segmento?.id ?? g.clase}
           pending={g.total === 0}
           style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 12 }}
         >
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
-              <span style={titulo}>
-                {g.segmento ? g.segmento.nombre : 'Sin segmento declarado'}
-              </span>
+              <span style={titulo}>{TITULO_DE_GRUPO[g.clase](g)}</span>
               {/* El total es el del count, no el de la lista: nunca «sin arquetipos» cuando los hay. */}
               <span style={micro}>{cabeceraDeGrupo(g)}</span>
             </div>
             {g.segmento?.definicion && (
               <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
                 {g.segmento.definicion}
+              </span>
+            )}
+            {g.clase === 'fuera-de-los-mostrados' && (
+              // Tienen segmento; solo que el suyo no cupo entre los mostrados. Decir «sin
+              // segmento» aquí sería falso, y la lista entera de segmentos está a un clic.
+              <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
+                Su segmento es más antiguo que los {TOPE_POR_SECCION} mostrados arriba.{' '}
+                <Link to="/segmentos" style={enlace}>
+                  Abrir Segmentos →
+                </Link>
               </span>
             )}
           </div>
@@ -503,6 +512,13 @@ function SinRespaldo({ children }: { children: ReactNode }) {
     </span>
   );
 }
+
+/** Cómo se titula cada clase de grupo: el nombre del segmento, o lo que el grupo es. */
+const TITULO_DE_GRUPO: Record<ClaseDeGrupo, (g: GrupoDeSegmento) => string> = {
+  segmento: (g) => g.segmento?.nombre ?? '',
+  'fuera-de-los-mostrados': () => 'En segmentos fuera de los mostrados',
+  'sin-segmento': () => 'Sin segmento declarado',
+};
 
 /** La sección recortó por el tope: se dice antes de la lista, no al final donde nadie llega. */
 function NotaDeRecorte({ children }: { children: ReactNode }) {

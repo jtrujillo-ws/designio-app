@@ -80,19 +80,39 @@ describe('los arquetipos agrupados por segmento', () => {
     expect(grupos[1]!.arquetipos.map((a) => a.id)).toEqual(['a1']);
   });
 
-  it('los arquetipos sin segmento van en un grupo final, que solo existe si hay alguno', () => {
+  it('tres casos: en un segmento mostrado, solo en segmentos no mostrados, y sin segmento alguno', () => {
+    // `segmentos` viene recortada al tope: «s-antiguo» existe en el workspace pero no cupo.
+    // El arquetipo mapeado solo a él TIENE segmento, y no puede acabar en «sin segmento».
+    const grupos = agruparArquetiposPorSegmento(
+      [independientes],
+      [
+        arquetipo({ id: 'a1', nombre: 'Con segmento', segmentoIds: ['s1'] }),
+        arquetipo({ id: 'a2', nombre: 'Suelto' }),
+        arquetipo({ id: 'a3', nombre: 'De un segmento no mostrado', segmentoIds: ['s-antiguo'] }),
+        // Mapeado a uno mostrado y a uno no mostrado: va con el mostrado, no aparte.
+        arquetipo({ id: 'a4', nombre: 'Mixto', segmentoIds: ['s-antiguo', 's1'] }),
+      ],
+      1,
+    );
+    expect(grupos.map((g) => [g.clase, g.arquetipos.map((a) => a.id), g.total])).toEqual([
+      ['segmento', ['a1', 'a4'], 2],
+      ['fuera-de-los-mostrados', ['a3'], 1],
+      ['sin-segmento', ['a2'], 1],
+    ]);
+    expect(grupos[1]!.segmento).toBeNull();
+    expect(grupos[2]!.segmento).toBeNull();
+  });
+
+  it('los grupos «fuera de los mostrados» y «sin segmento» solo existen si hay alguno', () => {
     const conSueltos = agruparArquetiposPorSegmento(
       [independientes],
       [
         arquetipo({ id: 'a1', nombre: 'Con segmento', segmentoIds: ['s1'] }),
         arquetipo({ id: 'a2', nombre: 'Suelto' }),
-        // Un id de segmento que el workspace ya no reconoce tampoco se pierde.
-        arquetipo({ id: 'a3', nombre: 'Huérfano', segmentoIds: ['s-borrado'] }),
       ],
     );
-    expect(conSueltos).toHaveLength(2);
-    expect(conSueltos[1]!.segmento).toBeNull();
-    expect(conSueltos[1]!.arquetipos.map((a) => a.id)).toEqual(['a3', 'a2']);
+    expect(conSueltos.map((g) => g.clase)).toEqual(['segmento', 'sin-segmento']);
+    expect(conSueltos[1]!.arquetipos.map((a) => a.id)).toEqual(['a2']);
 
     const sinSueltos = agruparArquetiposPorSegmento(
       [independientes],
@@ -122,11 +142,13 @@ describe('los arquetipos agrupados por segmento', () => {
       [arquetipo({ id: 'a1', nombre: 'Visible', segmentoIds: ['s1'] })],
       2,
     );
-    expect(grupos.map((g) => [g.segmento?.nombre ?? null, g.arquetipos.length, g.total])).toEqual([
+    expect(
+      grupos.map((g) => [g.segmento?.nombre ?? g.clase, g.arquetipos.length, g.total]),
+    ).toEqual([
       ['independientes', 1, 2],
       ['pymes', 0, 3],
       ['nuevos', 0, 0],
-      [null, 0, 2],
+      ['sin-segmento', 0, 2],
     ]);
     expect(cabeceraDeGrupo(grupos[0]!)).toBe('se muestran 1 de 2 (los más recientes)');
     expect(cabeceraDeGrupo(grupos[1]!)).toBe('se muestran 0 de 3 (los más recientes)');

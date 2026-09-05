@@ -28,11 +28,16 @@ function PantallaInvitacion() {
   const [password, setPassword] = useState('');
   const [confirmar, setConfirmar] = useState('');
   const [error, setError] = useState<string | null>(null);
+  /** Igual que en el login: si volver a pulsar puede cambiar algo. Un despliegue sin
+   * configurar no se arregla reintentando, y quien estrena su invitación contra uno leía
+   * «intenta de nuevo» —o peor, se quedaba pensando que su enlace había caducado—. */
+  const [reintentable, setReintentable] = useState(true);
   const [enviando, setEnviando] = useState(false);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
+    setReintentable(true);
     const politica = PasswordNuevaSchema.safeParse(password);
     if (!politica.success) {
       setError(politica.error.issues[0]?.message ?? 'Contraseña inválida');
@@ -50,7 +55,10 @@ function PantallaInvitacion() {
         return;
       }
       setError(r.error);
+      setReintentable(r.reintentable);
     } catch {
+      // Lo que llega aquí ya no es de configuración: es la red o el servidor caído, y ahí
+      // reintentar sí es lo que hay que hacer.
       setError('No se pudo activar la cuenta; intenta de nuevo');
     } finally {
       setEnviando(false);
@@ -98,7 +106,11 @@ function PantallaInvitacion() {
               {error}
             </span>
           )}
-          <Button type="submit" disabled={enviando} style={{ justifyContent: 'center' }}>
+          <Button
+            type="submit"
+            disabled={enviando || !reintentable}
+            style={{ justifyContent: 'center' }}
+          >
             {enviando ? 'Activando…' : 'Activar y entrar'}
           </Button>
         </form>

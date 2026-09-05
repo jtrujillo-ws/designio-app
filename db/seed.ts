@@ -1181,7 +1181,7 @@ async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Pro
  * Entra como `lead-boutique` en los dos workspaces sembrados, que es lo que hace útil la
  * cuenta: uno solo no ejercita el selector.
  */
-async function sembrarAdminPropio(cliente: typeof sql, wsId: string): Promise<string | null> {
+async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
   const email = process.env.SEED_ADMIN_EMAIL?.trim().toLowerCase();
   if (!email) return null;
   const clave = process.env.SEED_ADMIN_PASSWORD ?? '';
@@ -1210,29 +1210,62 @@ async function sembrarAdminPropio(cliente: typeof sql, wsId: string): Promise<st
       values (${email}, ${nombre}, ${hash}, 'activo') returning id`;
     id = u!.id as string;
   }
+
   /*
-   * El segundo workspace se busca por la FIRMA DEL SEED —tener a Lucía de miembro— y no solo
-   * por su nombre. `workspace` no tiene unicidad por nombre (comprobado: su única restricción
-   * es la clave primaria por `id`), así que un tenant real llamado «Clínica del Valle» habría
-   * recibido una membresía `lead-boutique` de una persona de verdad. Eso no es un seed
-   * escribiendo de más: es escalada de privilegios entre tenants.
+   * Los DOS workspaces se resuelven aquí y por la FIRMA DEL SEED —tener a Lucía de miembro—,
+   * sin fiarse del id que llegue de fuera.
    *
-   * Es el idioma que el propio seed ya usa en `sembrarSegundoWorkspace` para decidir si tiene
-   * que crearlo. Yo copié la intención y perdí el calificador; lo cazó la revisión.
+   * `workspace` no tiene unicidad por nombre (comprobado: su única restricción es la clave
+   * primaria por `id`), y el `select … where nombre = 'Banco Andino'` de `main()` no está
+   * calificado. Recibir ese id y conceder sobre él habría dado acceso `lead-boutique` de una
+   * persona REAL al workspace de otro cliente que se llamara igual. Arreglar solo el segundo
+   * workspace no bastaba: el primero entraba por el parámetro, que es la puerta de al lado.
+   *
+   * Una función que concede accesos no puede confiar en que su llamante haya acotado bien.
    */
-  const [ws2] = await cliente`select w.id from workspace w
+  const workspaces = await cliente`select w.id, w.nombre from workspace w
     join miembro m on m.workspace_id = w.id
     join usuario u on u.id = m.usuario_id
-    where w.nombre = 'Clínica del Valle' and lower(u.email) = 'lucia@whitespace.demo'`;
-  // La membresía va por workspace y se salta la que ya esté: `on conflict do nothing` y no
-  // un `select` previo, porque entre mirar y escribir cabe otro arranque del mismo deploy.
-  for (const w of [wsId, ws2?.id as string | undefined]) {
-    if (!w) continue;
+    where w.nombre in ('Banco Andino', 'Clínica del Valle')
+      and lower(u.email) = 'lucia@whitespace.demo'`;
+
+  const dichos: string[] = [];
+  for (const w of workspaces) {
+    const wsId = w.id as string;
+    /*
+     * Se MIRA antes de escribir, y el `on conflict` se queda de todas formas.
+     *
+     * Escribí que mirar antes sobraba porque `on conflict do nothing` cubre la carrera. Cubre
+     * la carrera y no cubre esto: `miembro` tiene un trigger BEFORE INSERT
+     * (`a_congelacion_por_disposicion`) que corre ANTES de que Postgres compruebe el
+     * conflicto, y sobre un workspace ya dispuesto levanta `DS001`. O sea que un redespliegue
+     * sobre una demo archivada abortaba el seed —y con `set -e` en el entrypoint, el servidor
+     * no arrancaba— por una membresía que YA existía y que no hacía falta escribir.
+     *
+     * Mirar evita el trigger en el caso normal; el `on conflict` sigue cubriendo la carrera
+     * entre dos arranques del mismo despliegue. Los dos hacen falta y ninguno sustituye al otro.
+     */
+    const [ya] = await cliente`select rol from miembro
+      where workspace_id = ${wsId} and usuario_id = ${id}`;
+    if (ya) {
+      // Y si ya estaba con OTRO rol, se dice. Antes el `on conflict do nothing` se lo tragaba
+      // y el registro afirmaba «asegurada como lead-boutique» sobre una cuenta que seguía
+      // siendo stakeholder: un mensaje que miente es peor que no tener mensaje. No se
+      // reescribe el rol — cambiar la membresía de alguien que ya estaba es una decisión de
+      // producto, no una comodidad del seed.
+      dichos.push(
+        ya.rol === 'lead-boutique'
+          ? `${w.nombre as string}: ya`
+          : `${w.nombre as string}: SIN TOCAR, ya era ${ya.rol as string}`,
+      );
+      continue;
+    }
     await cliente`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
-      values (${w}, ${id}, ${nombre}, ${email}, 'lead-boutique')
+      values (${wsId}, ${id}, ${nombre}, ${email}, 'lead-boutique')
       on conflict do nothing`;
+    dichos.push(`${w.nombre as string}: lead-boutique`);
   }
-  return email;
+  return dichos.length > 0 ? `${email} (${dichos.join('; ')})` : `${email} (sin workspaces demo)`;
 }
 
 async function main() {
@@ -1300,10 +1333,10 @@ async function main() {
       );
       propuestaSembrada = await sql.begin((tx) => sembrarPropuestaAI(tx, wsId, lucia.id as string));
     }
-    const adminPropio = await sembrarAdminPropio(sql, wsId);
+    const adminPropio = await sembrarAdminPropio(sql);
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
-        (adminPropio ? `; cuenta propia ${adminPropio} asegurada como lead-boutique` : '') +
+        (adminPropio ? `; cuenta propia ${adminPropio}` : '') +
         (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
         (metodoSembrado ? '; método de P-01 sembrado' : '') +
         (journeySembrado ? '; journey as-is sembrado' : '') +
@@ -1352,8 +1385,8 @@ async function main() {
   // borrador y su aprobación cayeran en el mismo commit, que es justo el estado que el
   // producto no puede producir y que el guard diferido rechaza.
   await sembrarEntrega(sql, creado.wsId, creado.luciaId);
-  const adminPropio = await sembrarAdminPropio(sql, creado.wsId);
-  if (adminPropio) console.log(`seed: cuenta propia ${adminPropio} creada como lead-boutique`);
+  const adminPropio = await sembrarAdminPropio(sql);
+  if (adminPropio) console.log(`seed: cuenta propia ${adminPropio}`);
   console.log(
     `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1, item de bandeja con propuesta AI pendiente) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,
   );

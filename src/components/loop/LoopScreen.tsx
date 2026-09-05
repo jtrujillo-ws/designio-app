@@ -32,6 +32,8 @@ import type { GatesDeProyecto, ResumenDelLoop } from '@/lib/loop/loop.schemas';
 import { etiquetaDeDestino, type Destino } from '@/lib/destinos';
 import { EnlaceA, navegarA } from '@/components/ui/EnlaceA';
 import { Buscador } from '@/components/loop/Buscador';
+import { NuevoServicio } from '@/components/loop/NuevoServicio';
+import { ROLES_ALTA_SERVICIO } from '@/lib/arbol/arbol.schemas';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
@@ -376,6 +378,7 @@ function Lateral({
 }) {
   const navigate = useNavigate();
   const rol = membresia?.rol ?? '';
+  const puedeCrearServicio = (ROLES_ALTA_SERVICIO as readonly string[]).includes(rol);
   // La bandeja la curan la boutique (RF-03.4): su contador es tarea solo para ellos.
   const esCurador = (ROLES_CURADORES as readonly string[]).includes(rol);
   const servicios = arbol?.servicios ?? [];
@@ -412,11 +415,7 @@ function Lateral({
   // recién elegido no se cierra porque una visita anterior lo tuviera cerrado.
   const [extra, setExtra] = useState<Set<string>>(new Set());
   const estaAbierto = (id: string) => expandidos.has(id) || extra.has(id);
-  function alternar(id: string) {
-    const abierto = estaAbierto(id);
-    const siguiente = new Set([...expandidos, ...extra]);
-    if (abierto) siguiente.delete(id);
-    else siguiente.add(id);
+  function fijar(siguiente: Set<string>) {
     setExpandidos(siguiente);
     setExtra(new Set());
     try {
@@ -424,6 +423,16 @@ function Lateral({
     } catch {
       // Igual que arriba: recordar es una comodidad, no un contrato.
     }
+  }
+  function alternar(id: string) {
+    const siguiente = new Set([...expandidos, ...extra]);
+    if (estaAbierto(id)) siguiente.delete(id);
+    else siguiente.add(id);
+    fijar(siguiente);
+  }
+  /** Desplegar sin alternar: lo que hace un servicio recién creado. */
+  function abrir(id: string) {
+    fijar(new Set([...expandidos, ...extra, id]));
   }
 
   async function salir() {
@@ -597,6 +606,18 @@ function Lateral({
             />
           );
         })}
+        {/* Solo para quien puede dar de alta (lead y admin del cliente): a los demás no se
+            les ofrece una fila que la base rechazaría. Al crear, el servicio nuevo pasa a ser
+            el seleccionado (la ruta cambia y los loaders recargan el árbol) y nace desplegado. */}
+        {puedeCrearServicio && membresia && (
+          <NuevoServicio
+            workspaceId={membresia.workspaceId}
+            onCreado={(servicioId) => {
+              abrir(servicioId);
+              seleccionar(servicioId);
+            }}
+          />
+        )}
       </div>
 
       {/* 4. Workspace — destinos reales, con los pendientes que existen. */}

@@ -4690,6 +4690,67 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(faltan).toEqual([]);
   });
 
+  /*
+   * El VOCABULARIO de capacidades es uno, y las tres tablas del pipeline lo dicen igual.
+   *
+   * `propuesta_ai` declaraba las diez de SPEC-08 §30 —C0..C7, CT, CI, el alcance MVP cerrado
+   * que RF-08.1 nombra una por una— y `reserva_ai` y `llamada_ai` declaraban dos. Que la
+   * tabla de SALIDA fuera la permisiva y las de entrada las estrictas ya iba al revés; lo que
+   * lo vuelve urgente es que la Fase 1 entra por CUATRO ramas a la vez.
+   *
+   * Con el vocabulario enumerado tabla por tabla, cada rama escribe su «suelta la restricción
+   * y vuélvela a poner con la mía dentro» sin saber de las otras. Medido contra la base real,
+   * aplicando dos de esas migraciones en el orden en que se fusionarían:
+   *
+   *   tras fusionar CT:  check (capacidad in ('C0','CI','CT'))
+   *   tras fusionar C2:  check (capacidad in ('C0','CI','C2'))
+   *
+   * CT desaparece, y desaparece EN VERDE: las dos aplican sin error, git no ve conflicto
+   * porque son ficheros distintos, y la capacidad queda revocada hasta que alguien intente
+   * generar con ella. Este caso es lo que lo convierte en rojo el día que pase.
+   *
+   * Comprueba las dos mitades: que los tres conjuntos sean el MISMO —cualquier migración que
+   * toque uno y se olvide de los otros cae aquí—, y que ese conjunto contenga todo lo que la
+   * aplicación declara activo, que es la dirección por la que se rompe de verdad: una
+   * capacidad viva en `CAPACIDADES_ACTIVAS` que la base rechaza al reservar.
+   */
+  it('las tres tablas del pipeline declaran el MISMO vocabulario de capacidades', async () => {
+    const admin = sqlAdmin();
+    const filas = await admin`
+      select conrelid::regclass::text as tabla, pg_get_constraintdef(oid) as definicion
+      from pg_constraint
+      where conrelid in ('reserva_ai'::regclass, 'llamada_ai'::regclass, 'propuesta_ai'::regclass)
+        and conname like '%_capacidad_check'`;
+    // Las tres, ni una menos: si una migración futura BORRA su restricción en vez de
+    // rehacerla, el vocabulario deja de estar sujeto ahí y este caso pasaría sin verlo.
+    expect(filas.map((f) => f.tabla as string).sort()).toEqual([
+      'llamada_ai',
+      'propuesta_ai',
+      'reserva_ai',
+    ]);
+
+    // Los literales de la definición. Es texto del catálogo, no de nadie de fuera.
+    const vocabularios = new Map(
+      filas.map((f) => [
+        f.tabla as string,
+        [...(f.definicion as string).matchAll(/'([^']+)'/g)].map((m) => m[1]).sort(),
+      ]),
+    );
+    const dePropuesta = vocabularios.get('propuesta_ai')!;
+    // Y que haya leído algo: una definición de la que no se saca ningún literal dejaría tres
+    // listas vacías, iguales entre sí, y el caso pasaría en verde sin haber comparado nada.
+    expect(dePropuesta.length).toBeGreaterThan(1);
+    expect(vocabularios.get('reserva_ai')).toEqual(dePropuesta);
+    expect(vocabularios.get('llamada_ai')).toEqual(dePropuesta);
+
+    const desconocidas = CAPACIDADES_ACTIVAS.filter((c) => !dePropuesta.includes(c));
+    expect(
+      desconocidas,
+      'una capacidad activa en la aplicación que el vocabulario de la base no admite: ' +
+        'su primera reserva la rechaza',
+    ).toEqual([]);
+  });
+
   /**
    * Ninguna CAPACIDAD hereda el juicio de otra, y la que el panel no sabe juzgar no se acepta.
    *

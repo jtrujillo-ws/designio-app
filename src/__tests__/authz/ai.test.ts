@@ -5790,6 +5790,54 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * está acotado; el de no filtrarlo lo paga quien pulsa.
    */
   /**
+   * Un nodoId en MAYÚSCULA es el mismo nodo, y el informe tiene que valer igual.
+   *
+   * `z.string().uuid()` admite el hexadecimal en mayúscula y Postgres almacena la forma
+   * canónica. Un id válido copiado así del material pasaba la validación y luego no acertaba
+   * ninguna comparación: `COMPROBAR.C5` empareja las señales remediadas con las que la
+   * validación emitió, y una clave en mayúscula no está entre ellas — el informe se descartaba
+   * entero por «señal inventada», DESPUÉS de pagarlo, y el mensaje culpaba al modelo de algo
+   * que había hecho bien. Del lado de la pantalla, el mapa de etiquetas se indexa por el id que
+   * devuelve la base, así que la remediación tampoco decía a qué nodo aplica.
+   *
+   * Es el mismo defecto que la revisión encontró en las citas de C2 (#35), en el otro
+   * identificador que el modelo copia del material.
+   */
+  it('un nodoId en mayúscula no descarta el informe: el id se normaliza al parsear', async () => {
+    await enWorkspaceLimpio('c5-uuid-en-mayuscula', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(0);
+
+      const gritado = informeCompleto(
+        senales.map((s) => ({ ...s, nodoId: s.nodoId.toUpperCase() })),
+      );
+      // El fixture tiene que ser el caso: si el uuid no tuviera letras, esto no probaría nada.
+      expect(senales.some((s) => s.nodoId.toUpperCase() !== s.nodoId)).toBe(true);
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: gritado as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C5')!;
+      // Guardado en canónico, no como vino…
+      const remediaciones = (p.contenido as ContenidoRemediacionJourney).remediaciones;
+      expect(remediaciones.map((r) => r.nodoId).sort()).toEqual(
+        senales.map((s) => s.nodoId).sort(),
+      );
+      // …y por eso la pantalla sabe a qué nodo aplica cada remediación.
+      expect(p.etiquetas[senales[0]!.nodoId]).toBeTruthy();
+    });
+  });
+
+  /**
    * Y cuando el grafo cambia, la presencia literal de las citas deja de tener veredicto.
    *
    * El panel recompone el pajar a partir del grafo de HOY, y contra ese texto mide si cada

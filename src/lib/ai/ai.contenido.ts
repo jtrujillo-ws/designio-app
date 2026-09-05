@@ -120,6 +120,26 @@ export const ContenidoCriterioSchema = z.object({
 export type ContenidoCriterio = z.infer<typeof ContenidoCriterioSchema>;
 
 /**
+ * Un identificador que el modelo COPIA del material, en la forma en que lo escribe la base.
+ *
+ * `z.string().uuid()` admite los hexadecimales en mayúscula, y Postgres almacena el uuid en su
+ * forma canónica —minúscula—. Así que un id válido copiado en mayúscula pasaba la validación y
+ * luego NO acertaba ninguna comparación: la que decide si una señal remediada es de las que la
+ * validación emitió descarta el informe entero —después de pagarlo— por «señal inventada», y
+ * del lado de la pantalla el mapa de etiquetas, que se indexa por el id que devuelve la base,
+ * deja la remediación sin decir a qué nodo aplica.
+ *
+ * Se normaliza AL PARSEAR, que es el único sitio donde se arregla una vez para todos los
+ * lectores: lo que se persiste es canónico y las comparaciones —SQL y TypeScript— vuelven a ser
+ * la misma pregunta. Los `lower(...)` de los guards se quedan: son el suelo de la base, y el
+ * suelo no depende de que la aplicación haya hecho bien su parte.
+ */
+const IdCopiadoDelMaterial = z
+  .string()
+  .uuid()
+  .transform((s) => s.toLowerCase());
+
+/**
  * CT — qué falta para un gate, con los huecos citados (RF-08.4, SPEC-08 §30).
  *
  * INFORMATIVO: aquí no hay ningún campo que describa un objeto a crear, y esa ausencia es
@@ -145,7 +165,7 @@ export const ContenidoAsistenteGateSchema = z
            * contrastar contra nada, y un hueco que señala un requisito que no existe manda a
            * quien lo lee a buscar algo que no está.
            */
-          checklistItemId: z.string().uuid(),
+          checklistItemId: IdCopiadoDelMaterial,
           queFalta: z.string().trim().min(1).max(1000),
           comoCerrarlo: z.string().trim().min(1).max(1000),
         }),
@@ -181,7 +201,7 @@ export const ContenidoRemediacionJourneySchema = z
       .array(
         z.object({
           /* El nodo que la señal nombra, por su id, copiado del material. */
-          nodoId: z.string().uuid(),
+          nodoId: IdCopiadoDelMaterial,
           /* Y el código de la señal, del catálogo de `validarJourney`. Derivado de él, no
            * copiado: un código nuevo entra aquí el día que la validación lo emita. */
           codigo: z.enum(CODIGOS_SENAL),

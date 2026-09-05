@@ -1,7 +1,7 @@
 import '@/lib/server-only';
 import type { TransactionSql } from 'postgres';
 import { conUsuario, sql } from '@/lib/db';
-import { PASSWORD_MAX_BYTES, type InvitarMiembro } from './auth.schemas';
+import { PASSWORD_MAX_BYTES, ROLES_QUE_INVITAN, type InvitarMiembro } from './auth.schemas';
 import {
   generarTokenInvitacion,
   hashPassword,
@@ -36,8 +36,6 @@ export async function exigirCuentaActiva(tx: TransactionSql, actorId: string): P
     throw new ErrorAutorizacion('Tu cuenta no está activa');
   }
 }
-
-const ROLES_QUE_INVITAN = ['lead-boutique', 'admin-cliente'];
 
 // Rama "usuario no existe / sin password": comparar contra un hash real de costo idéntico
 // para no filtrar existencia de cuentas por timing.
@@ -162,7 +160,7 @@ export async function crearInvitacion(
     await exigirCuentaActiva(tx, actorId);
     const [actor] = await tx`select workspace_role(${actorId}, ${entrada.workspaceId}) as rol`;
     const rolActor = (actor?.rol ?? null) as string | null;
-    if (!rolActor || !ROLES_QUE_INVITAN.includes(rolActor)) {
+    if (!rolActor || !(ROLES_QUE_INVITAN as readonly string[]).includes(rolActor)) {
       throw new ErrorAutorizacion('Solo lead-boutique o admin-cliente pueden invitar miembros');
     }
 

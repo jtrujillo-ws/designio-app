@@ -475,8 +475,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     ],
   };
 
-  const VERSION_ANOTADA = 'ai-2026-09-05.2';
-  const HUELLA_ANOTADA = '3a7910c382d86983497e8d911fae6367a8f5b3e1a803997e41e4fb43d85aaa20';
+  const VERSION_ANOTADA = 'ai-2026-09-05.3';
+  const HUELLA_ANOTADA = 'ed54cf375cfc10663ce79fa856b0aaaa342b32093510babdea60cdf9ed9b055a';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y

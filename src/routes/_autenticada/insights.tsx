@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react';
 import { createFileRoute, useNavigate, useRouter } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
+import { AvisoDeDestacadoAusente, Destacado } from '@/components/ui/Destacado';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
@@ -32,6 +33,10 @@ import type { InsightCompleto } from '@/lib/insight/insight.schemas';
  * exactamente el sesgo que el grounding existe para combatir.
  */
 export const Route = createFileRoute('/_autenticada/insights')({
+  // `destacar`: el id del insight al que se vino (desde el buscador). Solo orienta la
+  // pantalla; el loader no lo mira, la lista sigue siendo la misma.
+  validateSearch: (search: Record<string, unknown>): { destacar?: string } =>
+    typeof search.destacar === 'string' && search.destacar !== '' ? { destacar: search.destacar } : {},
   loaderDeps: ({ search }) => ({ ws: search.ws }),
   loader: async ({ context }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
@@ -234,6 +239,8 @@ function ListaDeInsights({
   );
   const [cargando, setCargando] = useState(false);
   const listados = [...datos.insights, ...masPaginas];
+  const { destacar } = Route.useSearch();
+  const destacadoCargado = destacar !== undefined && listados.some((i) => i.id === destacar);
 
   async function cargarMas() {
     if (!cursor) return;
@@ -259,17 +266,19 @@ function ListaDeInsights({
           </span>
         </Card>
       )}
+      {destacar !== undefined && !destacadoCargado && <AvisoDeDestacadoAusente que="El insight" />}
       {listados.map((insight) => (
-        <FichaInsight
-          key={insight.id}
-          workspaceId={datos.workspaceId}
-          insight={insight}
-          evidencias={datos.evidencias}
-          hayMasEvidencias={datos.hayMasEvidencias}
-          puedeCurar={puedeCurar}
-          onCambio={onCambio}
-          onError={onError}
-        />
+        <Destacado key={insight.id} id={insight.id} destacado={insight.id === destacar}>
+          <FichaInsight
+            workspaceId={datos.workspaceId}
+            insight={insight}
+            evidencias={datos.evidencias}
+            hayMasEvidencias={datos.hayMasEvidencias}
+            puedeCurar={puedeCurar}
+            onCambio={onCambio}
+            onError={onError}
+          />
+        </Destacado>
       ))}
       {cursor && (
         <div>

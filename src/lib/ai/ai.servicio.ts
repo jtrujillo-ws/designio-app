@@ -2,6 +2,7 @@ import '@/lib/server-only';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { patronDeBusqueda } from '@/lib/busqueda/busqueda.schemas';
 import { DimensionesEvidenciaSchema, ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { bloquearReto } from '@/lib/metodo/metodo.servicio';
 import {
@@ -410,12 +411,14 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
      */
     columnas: (tx) => tx`g.numero as gate_numero, g.rol_aprobador as gate_rol,
       g.estado as gate_estado, pr.titulo as gate_proyecto,
-      (select coalesce(json_agg(json_build_object(
-                'id', c.id, 'texto', c.texto, 'estado', c.estado,
-                'conObjeto', num_nonnulls(c.evidencia_id, c.insight_id, c.decision_id) = 1)
-              order by c.orden), '[]'::json)
-       from checklist_item c
-       where c.gate_id = g.id and c.workspace_id = g.workspace_id) as gate_checklist`,
+      case when p.gate_id is null then '[]'::json else
+        (select coalesce(json_agg(json_build_object(
+                  'id', c.id, 'texto', c.texto, 'estado', c.estado,
+                  'conObjeto', num_nonnulls(c.evidencia_id, c.insight_id, c.decision_id) = 1)
+                order by c.orden), '[]'::json)
+         from checklist_item c
+         where c.gate_id = g.id and c.workspace_id = g.workspace_id)
+      end as gate_checklist`,
   },
   journey_id: {
     join: (tx) => tx`left join journey jr
@@ -622,6 +625,15 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      */
     estado: (tx) => tx`case
         when g.estado is distinct from 'pendiente' then 'gate-decidido'
+        when exists (
+          select 1
+          from jsonb_array_elements(
+                 case when jsonb_typeof(p.contenido->'huecos') = 'array'
+                      then p.contenido->'huecos' else '[]'::jsonb end) h
+          join checklist_item c
+            on c.id::text = lower(h->>'checklistItemId') and c.workspace_id = p.workspace_id
+          where c.estado <> 'pendiente')
+          then 'checklist-avanzado'
         else 'disponible'
       end`,
     /*
@@ -980,7 +992,7 @@ export async function panelPropuestas(
     // forma de alcanzarlos. Y como ningún orden alcanza cuando hay más anclas que ventana,
     // la búsqueda por texto es lo que vuelve la promesa incondicional: cualquier ancla se
     // alcanza por su nombre sin depender de dónde caiga el corte.
-    const patron = busqueda ? `%${busqueda.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
+    const patron = busqueda ? patronDeBusqueda(busqueda) : null;
 
     // Y las candidatas las pide CADA CAPACIDAD con SU consulta de elegibilidad, no la columna
     // donde cuelgan. Indexado por columna, una segunda capacidad anclada en un reto recibía la

@@ -102,6 +102,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese gate ya se decidió: este informe describe un estado que ya pasó. Puedes leerlo, pero lo que dice que falta ya no aplica.',
   'journey-congelado':
     'Ese journey ya tiene un snapshot congelado: su grafo es lo aprobado y estas remediaciones ya no se pueden aplicar sobre él. Puedes leerlas, pero apuntan a un grafo que dejó de editarse.',
+  'checklist-avanzado':
+    'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 

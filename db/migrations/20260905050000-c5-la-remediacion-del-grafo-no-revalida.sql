@@ -68,3 +68,51 @@ alter table propuesta_ai add constraint propuesta_ai_destino_c5
 grant insert (journey_id) on reserva_ai   to designio_app;
 grant insert (journey_id) on llamada_ai   to designio_app;
 grant insert (journey_id) on propuesta_ai to designio_app;
+
+-- ── El suelo de C5: linaje por su ancla, y el grafo todavía editable ──
+--
+-- `propuesta_ai_revision_guard` compara el ancla ENUMERANDO columnas, y las que enumera son
+-- null en toda fila de C5: una llamada válida de C5 para el journey A se podía colgar de un
+-- informe del journey B, con la FK compuesta conforme y la atribución de coste corrompida.
+-- Cada ancla trae su comparación, aditiva como sus CHECK — reescribir aquel guard obligaría a
+-- copiar sus casi doscientas líneas aquí, y la siguiente migración que las copiara sin esta
+-- línea la revocaría en silencio. Que ninguna se quede sin ella lo sujeta la prueba que
+-- compara `COLUMNAS_DE_ANCLA` contra el texto de todos los guards de la tabla: sin esto sale
+-- roja nombrando «journey_id», y así es como se descubrió este hueco.
+--
+-- Y el grafo tiene que seguir EDITABLE al escribir. `REVALIDAR.C5` lo comprueba antes de
+-- despachar, y entre esa transacción y ésta cabe el snapshot: sin el corte nacía una
+-- remediación sobre un grafo ya congelado —que no se puede aplicar— ocupando además el hueco
+-- del journey por el índice parcial.
+create or replace function propuesta_ai_c5_linaje_guard() returns trigger
+language plpgsql as $$
+begin
+  if new.capacidad <> 'C5' then
+    return new;
+  end if;
+  if exists (
+    select 1 from journey_snapshot sn
+    where sn.journey_id = new.journey_id and sn.workspace_id = new.workspace_id
+  ) then
+    raise exception 'ese journey ya está congelado en un snapshot: no admite remediaciones nuevas';
+  end if;
+  if not exists (
+    select 1 from llamada_ai l
+    where l.id = new.llamada_id and l.workspace_id = new.workspace_id
+      and l.journey_id is not distinct from new.journey_id
+  ) then
+    raise exception 'la propuesta debe colgar de la llamada que la produjo: mismo journey';
+  end if;
+  return new;
+end $$;
+
+revoke execute on function propuesta_ai_c5_linaje_guard() from public;
+
+create trigger a_propuesta_ai_c5_linaje
+  before insert on propuesta_ai
+  for each row execute function propuesta_ai_c5_linaje_guard();
+
+-- Un informe por llamada, como CI y CT: C5 tampoco es un lote. Índice propio, para que dos
+-- ramas no se pisen el mismo.
+create unique index propuesta_ai_llamada_c5_idx on propuesta_ai (workspace_id, llamada_id)
+  where capacidad = 'C5';

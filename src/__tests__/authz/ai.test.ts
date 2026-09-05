@@ -557,6 +557,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
       // El journey cuelga del reto por FK compuesta, así que va antes que él. Y su grafo
       // antes que él: nodos, aristas y los enlaces a evidencia.
+      // El snapshot cuelga del journey por FK compuesta: va antes que el grafo.
+      await admin`delete from journey_snapshot where workspace_id = ${wsL}`;
       await admin`delete from journey_nodo_evidencia where workspace_id = ${wsL}`;
       await admin`delete from journey_arista where workspace_id = ${wsL}`;
       await admin`delete from journey_nodo where workspace_id = ${wsL}`;
@@ -651,6 +653,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from derecho_uso where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
+      await admin`delete from journey_snapshot where workspace_id = ${ws}`;
       await admin`delete from journey_nodo_evidencia where workspace_id = ${ws}`;
       await admin`delete from journey_arista where workspace_id = ${ws}`;
       await admin`delete from journey_nodo where workspace_id = ${ws}`;
@@ -662,6 +665,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from reto where workspace_id = ${ws}`;
       await admin`delete from servicio where workspace_id = ${ws}`;
       await admin`delete from miembro where workspace_id = ${ws}`;
+      // Otra vez los eventos: los escriben TRIGGERS, así que los borrados de arriba —el del
+      // journey, entre otros— dejan los suyos después del primer barrido.
+      await admin`delete from evento_dominio where workspace_id = ${ws}`;
       await admin`delete from workspace where id = ${ws}`;
     }
     await admin`delete from usuario where email like ${marca + '-%@test.demo'}`;
@@ -4903,6 +4909,43 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(faltan).toEqual([]);
   });
 
+  /**
+   * Toda ancla declarada entra en la comprobación de LINAJE de la llamada.
+   *
+   * `propuesta_ai_revision_guard` exige que una propuesta cuelgue de la llamada que la
+   * produjo, y compara el ancla ENUMERANDO columnas. Con una capacidad cuya ancla no está en
+   * esa lista, todas sus filas tienen null en las comparadas y la condición pasa siempre: una
+   * llamada válida de esa capacidad para el objeto A se puede colgar de una propuesta del
+   * objeto B, y la atribución de coste queda corrompida sin que nada chille.
+   *
+   * La comparación se añade por capacidad —cada migración trae la de su ancla, aditiva como
+   * sus CHECK— porque reescribir aquel guard obliga a copiar sus casi doscientas líneas en
+   * cada migración, y la siguiente que las copie sin la línea ajena la revoca en silencio.
+   * Eso es exactamente lo que costó el vocabulario de capacidades, y esto es lo que impide
+   * que vuelva a pasar: se pregunta al catálogo por el texto de TODOS los guards de la tabla
+   * y se exige que cada columna declarada aparezca comparada en alguno.
+   */
+  it('cada columna de ancla se compara contra la llamada en algún guard de propuesta_ai', async () => {
+    const admin = sqlAdmin();
+    const filas = await admin`
+      select pg_get_functiondef(p.oid) as fuente
+      from pg_trigger t
+      join pg_proc p on p.oid = t.tgfoid
+      where t.tgrelid = 'propuesta_ai'::regclass and not t.tgisinternal`;
+    // Que esté mirando algo: sin triggers, todo lo de abajo pasaría sin comprobar nada.
+    expect(filas.length).toBeGreaterThan(0);
+    const fuente = filas.map((f) => (f.fuente as string).replace(/\s+/g, ' ')).join('\n');
+
+    const sinComparar = COLUMNAS_DE_ANCLA.filter(
+      (c) => !fuente.includes(`l.${c} is not distinct from new.${c}`),
+    );
+    expect(
+      sinComparar,
+      'un ancla declarada que ningún guard compara contra la llamada: una llamada de ese ' +
+        'objeto se puede colgar de la propuesta de otro',
+    ).toEqual([]);
+  });
+
   /*
    * El VOCABULARIO de capacidades es uno, y las tres tablas del pipeline lo dicen igual.
    *
@@ -5017,13 +5060,25 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const motivoDe = async (
         capacidad: string,
         anclas: Partial<Record<AnclaCapacidad['columna'], string>>,
+        /* Solo lo que el CASE del panel mira del contenido: los huecos de CT y su id. Se
+         * tipa por lo que ES y no como `unknown` —que `tx.json` no acepta— ni como un
+         * `Record` suelto: lo que esta fila sintética trae tiene que poder leerse igual que
+         * lo que trae la de verdad. */
+        contenido: { huecos?: { checklistItemId: string }[] } = {},
       ): Promise<string | null> => {
         const columnas = COLUMNAS_DE_ANCLA.map(
           (c) => tx`${anclas[c] ?? null}::uuid as ${tx(c)}`,
         ).reduce((a, b) => tx`${a}, ${b}`);
+        /*
+         * `contenido` también viaja en la fila sintética. Lo cobró la misma clase de cambio
+         * que las columnas de ancla: el motivo de CT pasó a mirar los huecos del informe para
+         * saber si un requisito señalado ya se cerró, y esta fila no lo tenía —«column
+         * p.contenido does not exist»—. Lo que el CASE lee, la fila lo trae.
+         */
         const [f] = await tx`
           select case ${proyeccion.motivo} else null end as estado
           from (select ${capacidad}::text as capacidad, ${columnas},
+                       ${tx.json(contenido)}::jsonb as contenido,
                        ${ws}::uuid as workspace_id) p
           ${proyeccion.joins}`;
         return (f!.estado as string | null) ?? null;
@@ -5044,7 +5099,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // estado dejó el fixture a cada fila.
       const DE_CI = ['disponible', 'item-curado', 'consentimiento-revocado'];
       const DE_C0 = ['disponible', 'reto-no-admite', 'registry-firmado', 'criterios-congelados'];
-      const DE_CT = ['disponible', 'gate-decidido'];
+      const DE_CT = ['disponible', 'gate-decidido', 'checklist-avanzado'];
       expect(DE_CI).toContain(await motivoDe('CI', { item_id: item }));
       expect(DE_C0).toContain(await motivoDe('C0', { reto_id: retoId }));
       expect(DE_CT).toContain(await motivoDe('CT', { gate_id: gateId }));
@@ -5056,6 +5111,27 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         await motivoDe('CT', { gate_id: gateId }),
       );
       expect(DE_CT.slice(1)).not.toContain(await motivoDe('C0', { reto_id: retoId }));
+
+      /*
+       * Y el motivo que distingue un informe VIVO de uno que ya no describe el gate: con el
+       * mismo gate pendiente, un informe cuyo hueco señala un requisito CERRADO sale
+       * «checklist-avanzado», y el mismo informe sobre uno pendiente sale «disponible». Es el
+       * par que prueba que mira el contenido y no el gate.
+       */
+      const conRequisitoAbierto = { huecos: [{ checklistItemId: requisitoIds[0]! }] };
+      expect(await motivoDe('CT', { gate_id: gateId }, conRequisitoAbierto)).toBe('disponible');
+      await sqlAdmin()`update checklist_item
+        set estado = 'na', na_justificacion = 'no aplica', na_aprobado_por = ${leadId}
+        where id = ${requisitoIds[0]!} and workspace_id = ${ws}`;
+      try {
+        expect(await motivoDe('CT', { gate_id: gateId }, conRequisitoAbierto)).toBe(
+          'checklist-avanzado',
+        );
+      } finally {
+        await sqlAdmin()`update checklist_item
+          set estado = 'pendiente', na_justificacion = '', na_aprobado_por = null
+          where id = ${requisitoIds[0]!} and workspace_id = ${ws}`;
+      }
     });
   });
 
@@ -5297,6 +5373,45 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Un journey CONGELADO mientras la llamada estaba en vuelo no admite la remediación.
+   *
+   * `REVALIDAR.C5` lo comprueba antes de despachar, y entre esa transacción y la que persiste
+   * cabe el snapshot. Sin el corte nacía una remediación sobre un grafo que ya no se edita
+   * —o sea inaplicable— ocupando además el hueco del journey por el índice parcial. Es el
+   * mismo suelo que CT pone para el gate decidido.
+   */
+  it('un journey congelado mientras se generaba no admite la remediación', async () => {
+    // En el workspace COMPARTIDO: los fixtures de propuesta escriben la llamada contra él, y
+    // aquí no se llama al proveedor —se escribe la fila directamente—, así que el tope diario
+    // no entra en juego.
+    const j = await nuevoJourney({ ws, actorId: leadId, servicioId: svcId, retoId });
+    const senales = await conUsuario(leadId, async (tx) => {
+      const grafo = await leerJourneyCompleto(tx, ws, j.journeyId);
+      return validarJourney(grafo!);
+    });
+    expect(senales.length).toBeGreaterThan(0);
+    await sqlAdmin()`insert into journey_snapshot
+      (workspace_id, journey_id, motivo, grafo, congelado_por)
+      values (${ws}, ${j.journeyId}, 'G3 aprobado', '{}'::jsonb, ${leadId})`;
+    await expect(
+      nuevaPropuesta(leadId, {
+        capacidad: 'C5',
+        anclas: { journey_id: j.journeyId },
+        contenido: {
+          resumen: 'Informe sobre un grafo ya congelado.',
+          remediaciones: senales.slice(0, 1).map((x) => ({
+            nodoId: x.nodoId,
+            codigo: x.codigo,
+            comoCerrarlo: 'Encadena el paso',
+          })),
+          citas: [{ fragmento: 'Recibir documento', localizacion: 'nodos del grafo' }],
+          confianzaPropuesta: 'media',
+        },
+      }),
+    ).rejects.toThrow(/ya está congelado/);
+  });
+
+  /**
    * Una remediación que señala una señal que la validación NO emitió tira el informe entero.
    *
    * Es lo único que esta capacidad puede falsificar —el resto de su salida es prosa sobre
@@ -5517,5 +5632,61 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       contenido: { ...otro.contenido, huecos: [] },
     });
     expect(vacia).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  /**
+   * Un hueco SIN `checklistItemId` tampoco entra, y ése es el que se colaba.
+   *
+   * Con `select … into ajeno` a secas, el hueco malformado SÍ lo seleccionaba el `not exists`
+   * —nada casa con `lower(null)`— pero `ajeno` recibía null, así que el `if ajeno is not null`
+   * no disparaba: el trigger admitía exactamente lo que existe para rechazar. El esquema de
+   * Zod lo tapa por el camino de la aplicación; esto es el SUELO, y se prueba por donde el
+   * esquema no pasa, o sea escribiendo el jsonb a mano.
+   */
+  it('un hueco sin checklistItemId no entra: el guard distingue «no hay» de «es null»', async () => {
+    const admin = sqlAdmin();
+    const g = await nuevoGate();
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CT',
+      anclas: { gate_id: g.gateId },
+      contenido: g.contenido,
+    });
+    // Por el DUEÑO y con `update`: la aplicación no puede escribir esto —su esquema lo
+    // rechaza— y lo que se mide es que la base tampoco lo admita.
+    for (const malo of ['{"queFalta":"x","comoCerrarlo":"y"}', '{"checklistItemId":null}']) {
+      await expect(
+        sqlAdmin()`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{huecos}', ${admin.json([JSON.parse(malo)])}::jsonb)
+          where id = ${propuestaId} and workspace_id = ${ws}`,
+      ).rejects.toThrow(/no pertenece a este gate/);
+    }
+  });
+
+  /**
+   * Un gate decidido MIENTRAS la llamada estaba en vuelo no admite el informe que llega.
+   *
+   * `REVALIDAR.CT` lo comprueba antes de despachar, y entre esa transacción y la que
+   * persiste cabe la aprobación. Sin este corte nacía un informe ya obsoleto que además
+   * ocupaba el hueco del gate por el índice parcial: solo se podía marcar como leído.
+   */
+  it('un gate aprobado mientras se generaba no admite el informe', async () => {
+    const admin = sqlAdmin();
+    const g = await nuevoGate();
+    // Un gate no se aprueba con el checklist pendiente —lo impone la base, y es correcto—,
+    // así que sus requisitos se cierran como N/A con su justificación y su aprobador. La
+    // prueba mide el guard del informe, no el del gate.
+    await admin`update checklist_item
+      set estado = 'na', na_justificacion = 'no aplica a esta demo', na_aprobado_por = ${leadId}
+      where gate_id = ${g.gateId} and workspace_id = ${ws}`;
+    await admin`update gate_instancia
+      set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
+      where id = ${g.gateId} and workspace_id = ${ws}`;
+    await expect(
+      nuevaPropuesta(leadId, {
+        capacidad: 'CT',
+        anclas: { gate_id: g.gateId },
+        contenido: g.contenido,
+      }),
+    ).rejects.toThrow(/ya se decidió/);
   });
 });

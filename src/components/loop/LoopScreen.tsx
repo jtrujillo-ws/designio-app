@@ -3,14 +3,16 @@ import { Link, useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
-import { Input } from '@/components/ui/Input';
 import { JourneyBadge } from '@/components/ui/JourneyBadge';
 import { Tabs } from '@/components/ui/Tabs';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import { cerrarSesion } from '@/lib/auth/auth.functions';
-import type { ArbolWorkspace } from '@/lib/arbol/arbol.schemas';
-import { LOOP_BANCO_ANDINO, type JourneyLoop } from '@/lib/loop/loop-data';
+import type { ArbolWorkspace, ProyectoArbol, RetoArbol } from '@/lib/arbol/arbol.schemas';
+import { LOOP_BANCO_ANDINO, destinoDeJourney, type JourneyLoop } from '@/lib/loop/loop-data';
+import { etiquetaDeDestino, type Destino } from '@/lib/destinos';
+import { EnlaceA, navegarA } from '@/components/ui/EnlaceA';
+import { Buscador } from '@/components/loop/Buscador';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
@@ -23,15 +25,32 @@ export type UsuarioLoop = {
   membresias: MembresiaLoop[];
 };
 
-const TABS = [
-  'Loop J1–J7',
-  'Servicio',
-  'Reto R-01',
-  'Proyecto P-01',
-  'Journey / Blueprint',
-  'Portal · Aprobación G5',
-  'Importación',
-];
+const TAB_LOOP = 'Loop J1–J7';
+
+/**
+ * Las vistas del servicio, cada una con la pantalla real a la que lleva. La referencia hifi
+ * traía además «Servicio» y «Reto R-01»: no existen como pantalla, y una pestaña que no abre
+ * nada es justo la queja que trajo este cambio, así que no se pintan hasta que existan. La
+ * pestaña del proyecto solo aparece cuando el servicio tiene uno, y con su código real.
+ */
+function vistasDelServicio(
+  proyecto: ProyectoArbol | null,
+): { etiqueta: string; destino: Destino | null }[] {
+  return [
+    { etiqueta: TAB_LOOP, destino: null },
+    ...(proyecto
+      ? [
+          {
+            etiqueta: `Proyecto ${proyecto.codigo}`,
+            destino: destinoDeJourney('proyecto', proyecto.id),
+          },
+        ]
+      : []),
+    { etiqueta: 'Journey / Blueprint', destino: { to: '/journeys' } },
+    { etiqueta: 'Portal · Aprobación G5', destino: { to: '/design-versions' } },
+    { etiqueta: 'Importación', destino: { to: '/importacion' } },
+  ];
+}
 
 const micro: CSSProperties = {
   fontFamily: 'var(--font-mono)',
@@ -51,6 +70,12 @@ export function LoopScreen({
   arbol: ArbolWorkspace | null;
 }) {
   const servicio = arbol?.servicios[0] ?? null;
+  // El proyecto «actual» del servicio, con el mismo criterio que el servicio actual: el
+  // primero. Es lo que abren la pestaña de proyecto y las tarjetas de los journeys que
+  // viven en la pantalla del método (etapas y gates).
+  const proyecto = servicio?.retos.flatMap((r) => r.proyectos)[0] ?? null;
+  const vistas = vistasDelServicio(proyecto);
+  const navigate = useNavigate();
   return (
     <div>
       <Topbar usuario={usuario} membresiaActiva={membresiaActiva} />
@@ -62,7 +87,15 @@ export function LoopScreen({
             <span style={{ color: 'var(--ink)' }}>{servicio?.nombre ?? 'Sin servicios aún'}</span>
           </div>
           <div style={{ margin: '16px 0 24px' }}>
-            <Tabs items={TABS} value="Loop J1–J7" label="Vistas del servicio" />
+            <Tabs
+              items={vistas.map((v) => v.etiqueta)}
+              value={TAB_LOOP}
+              label="Vistas del servicio"
+              onChange={(etiqueta) => {
+                const destino = vistas.find((v) => v.etiqueta === etiqueta)?.destino;
+                if (destino) void navegarA(navigate, destino);
+              }}
+            />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 6 }}>
             <h1 style={{ font: '800 30px/1.12 var(--font-sans)', margin: 0 }}>
@@ -88,7 +121,7 @@ export function LoopScreen({
           <div style={{ overflowX: 'auto', marginBottom: 24 }}>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(158px, 1fr))', gap: 12, minWidth: 1178 }}>
               {LOOP_BANCO_ANDINO.map((jl) => (
-                <JourneyCard key={jl.j} jl={jl} />
+                <JourneyCard key={jl.j} jl={jl} proyecto={proyecto} />
               ))}
             </div>
           </div>
@@ -108,7 +141,7 @@ export function LoopScreen({
                     {candidatos.map((r, i) => (
                       <span key={r.id}>
                         {i > 0 && (i === candidatos.length - 1 ? ' y ' : ', ')}
-                        <a href="#retos">{r.codigo}</a>
+                        <CodigoDeReto reto={r} />
                       </span>
                     ))}
                     {candidatos.length === 1 ? ' ya espera' : ' ya esperan'} en el backlog del servicio.
@@ -123,24 +156,99 @@ export function LoopScreen({
   );
 }
 
-function JourneyCard({ jl }: { jl: JourneyLoop }) {
+/**
+ * La tarjeta de un journey es un enlace a la pantalla donde ese journey se trabaja, y lo
+ * dice en su pie. Cuando no hay a dónde ir (journey del proyecto sin proyecto todavía) la
+ * tarjeta se queda sin enlace y el pie explica por qué: marcado, no escondido.
+ */
+function JourneyCard({ jl, proyecto }: { jl: JourneyLoop; proyecto: ProyectoArbol | null }) {
   const active = jl.estado === 'en curso';
   const pending = jl.estado === 'próximo';
-  return (
+  const destino = destinoDeJourney(jl.pantalla, proyecto?.id ?? null);
+  const tarjeta = (
     <Card
       j={jl.j}
       active={active}
       pending={pending}
-      style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 8, padding: active ? 15 : '16px 16px 13px' }}
+      style={{
+        minWidth: 0,
+        height: '100%',
+        boxSizing: 'border-box',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: active ? 15 : '16px 16px 13px',
+      }}
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <JourneyBadge j={jl.j} />
         <Chip estado={jl.estado} />
       </div>
-      <div style={{ font: '700 14.5px/1.25 var(--font-sans)', color: 'var(--ink)' }}>{jl.titulo}</div>
-      <div style={{ font: '400 11.5px/1.5 var(--font-mono)', color: 'var(--text-muted)' }}>{jl.meta}</div>
-      <div style={{ font: '600 12px var(--font-sans)', color: 'var(--text-body)', marginTop: 'auto' }}>{jl.rol}</div>
+      <div style={{ font: '700 14.5px/1.25 var(--font-sans)', color: 'var(--ink)' }}>
+        {jl.titulo}
+      </div>
+      <div style={{ font: '400 11.5px/1.5 var(--font-mono)', color: 'var(--text-muted)' }}>
+        {jl.meta}
+      </div>
+      <div
+        style={{ font: '600 12px var(--font-sans)', color: 'var(--text-body)', marginTop: 'auto' }}
+      >
+        {jl.rol}
+      </div>
+      <div
+        style={{
+          font: '600 11.5px var(--font-sans)',
+          color: destino ? 'var(--accent)' : 'var(--text-faint)',
+        }}
+      >
+        {destino
+          ? `Abrir ${etiquetaDeDestino(destino, proyecto?.codigo)} →`
+          : 'Sin proyecto aún en este servicio'}
+      </div>
     </Card>
+  );
+  if (!destino) return tarjeta;
+  return (
+    <EnlaceA
+      destino={destino}
+      aria-label={`J${jl.j} ${jl.titulo}: abrir ${etiquetaDeDestino(destino, proyecto?.codigo)}`}
+      style={{
+        textDecoration: 'none',
+        color: 'inherit',
+        display: 'block',
+        minWidth: 0,
+        borderRadius: 14,
+      }}
+    >
+      {tarjeta}
+    </EnlaceA>
+  );
+}
+
+/**
+ * Un reto candidato no tiene pantalla propia todavía: si ya tiene proyecto se abre este; si
+ * no, el código se muestra como texto y no como un enlace a un ancla que no existe.
+ */
+function CodigoDeReto({ reto }: { reto: RetoArbol }) {
+  const proyecto = reto.proyectos[0];
+  if (!proyecto) {
+    return (
+      <span
+        title={`${reto.codigo} ${reto.titulo} · sin proyecto aún`}
+        style={{ font: '500 13px var(--font-mono)', color: 'var(--ink)' }}
+      >
+        {reto.codigo}
+      </span>
+    );
+  }
+  return (
+    <Link
+      to="/proyecto/$proyectoId"
+      params={{ proyectoId: proyecto.id }}
+      title={`${reto.codigo} ${reto.titulo} · abrir ${proyecto.codigo}`}
+    >
+      {reto.codigo}
+    </Link>
   );
 }
 
@@ -237,7 +345,7 @@ function Topbar({
         )}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-        <Input placeholder="Buscar en el workspace…  /" style={{ background: 'var(--bg-app)', border: '1px solid var(--border)', width: 280 }} />
+        <Buscador workspaceId={membresia?.workspaceId ?? null} />
         <span
           style={{
             width: 32,

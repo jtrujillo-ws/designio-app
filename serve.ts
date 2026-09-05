@@ -32,7 +32,42 @@ async function appDbLista(): Promise<boolean> {
     console.error('healthz: falta DATABASE_URL_APP');
     return false;
   }
-  const sql = postgres(url, { max: 1, connect_timeout: 5, onnotice: () => {} });
+  /*
+   * La creación del pool va DENTRO del guardián, y esto costó media hora de diagnóstico en el
+   * primer despliegue: `postgres()` valida la URL y LANZA cuando no parsea —medido:
+   * `postgres('postgres.railway.internal / 5432')` responde «cannot be parsed as a URL»—. Con
+   * la llamada fuera del `try`, esa excepción se escapaba de aquí y del `fetch` entero, así
+   * que `/healthz` devolvía un 500 opaco del runtime en vez del 503 que este guardián existe
+   * para dar. O sea: el único caso en que la configuración está tan mal que hay MÁS que
+   * explicar era justo el que se quedaba sin explicación.
+   */
+  let sql: ReturnType<typeof postgres>;
+  try {
+    sql = postgres(url, { max: 1, connect_timeout: 5, onnotice: () => {} });
+  } catch {
+    /*
+     * El error NO se imprime, y esto lo encontró la revisión de este mismo arreglo: el
+     * mensaje de `postgres()` lleva dentro la cadena que no pudo parsear. La libreria la
+     * redacta cuando RECONOCE un DSN —«<redacted> cannot be parsed as a URL»—, pero cuando la
+     * cadena no parece una URL en absoluto la imprime verbatim, y ese es justo el caso que
+     * llega aqui. Medido:
+     *
+     *   'postgresql://usuario:CLAVE@host / 5432/db'          -> <redacted>, no filtra
+     *   '{{Postgres.DATABASE_URL}} usuario:CLAVE'            -> la imprime ENTERA
+     *
+     * La segunda forma es la realista en un despliegue: una referencia sin resolver pegada a
+     * otra cosa. Los registros de la plataforma se conservan, asi que habria dejado la
+     * contrasena del rol de aplicacion escrita ahi para siempre — y por un log que anadi
+     * para EXPLICAR el fallo.
+     *
+     * No se pierde diagnostico: la causa ya esta dicha entera. Que la variable no parsea es
+     * todo lo que hay que saber, y quien opera sabe cual es su valor sin que se lo repitan.
+     */
+    console.error(
+      'healthz: DATABASE_URL_APP no es una URL de conexión válida (se omite el valor: llevaría la contraseña del rol)',
+    );
+    return false;
+  }
   try {
     const [quien] = await sql`
       select current_user as usuario,

@@ -829,6 +829,44 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
   });
 
   /**
+   * Y la PRIORIDAD vive dentro de su rango, y eso lo dice la base.
+   *
+   * `CrearOportunidadSchema` y `PriorizarOportunidadSchema` acotan a 0..1000, y los dos
+   * controles de la pantalla también. Pero la superficie SQL concedida al rol de aplicación
+   * incluye `prioridad`, así que por ahí entraba un negativo o un número arbitrariamente
+   * grande: un estado que la API no puede producir, en la columna con la que se ORDENA el
+   * portafolio —`oportunidad_reto_idx` es (workspace, reto, prioridad desc, creado_en)—, o
+   * sea una HMW que se pone la primera o la última de todas sin pasar por la priorización.
+   *
+   * Va en un CHECK y no en la política por lo mismo que el vocabulario del estado: es una
+   * propiedad del VALOR, no de quién escribe ni de cuándo.
+   */
+  it('la prioridad no sale de su rango, tampoco por SQL directo', async () => {
+    const admin = sqlAdmin();
+    const proponerCon = (prioridad: number) =>
+      conUsuario(leadId, (tx) => tx`insert into oportunidad
+        (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+        values (${ws}, ${retoId}, ${`¿Cómo podríamos ordenar con ${prioridad}?`}, ${prioridad},
+                'Razón', ${leadId})`);
+
+    await expect(proponerCon(-1)).rejects.toThrow(/prioridad/i);
+    await expect(proponerCon(1001)).rejects.toThrow(/prioridad/i);
+    // Los dos EXTREMOS sí entran: un rango que no admite sus bordes está mal escrito, y sin
+    // esta mitad un CHECK que rechazara todo pasaría igual.
+    await proponerCon(0);
+    await proponerCon(1000);
+
+    // Y tampoco se sale repriorizando, que es la otra puerta: `prioridad` está en el grant de
+    // UPDATE y la política no mira su valor.
+    const [o] = await admin`select id from oportunidad
+      where reto_id = ${retoId} and prioridad = 1000`;
+    await expect(
+      conUsuario(leadId, (tx) => tx`update oportunidad set prioridad = 5000
+        where id = ${o!.id as string} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/prioridad/i);
+  });
+
+  /**
    * Y el ALCANCE de una reapertura acota en las dos direcciones.
    *
    * El guard de arriba miraba en una sola: que no quedara nada del alcance sin marcar. Por el
@@ -897,7 +935,7 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     const ajena = await decisionDe(3, 'Se acuerda el tono de los avisos', insightB);
 
     const reabrirPor = (
-      filas: { etapa: number; insight: string; marcadas: number }[],
+      filas: { etapa: number; insight: string; marcadas: number; alcance?: string }[],
       decisiones: string[],
     ) =>
       conUsuario(leadId, async (tx) => {
@@ -905,8 +943,8 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
           const [re] = await tx`insert into reapertura_etapa
             (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
              reabierto_por)
-            values (${ws}, ${proyectoA}, ${f.etapa}, ${`Motivo de la ${f.etapa}`}, 'declarado',
-                    ${f.marcadas}, ${leadId}) returning id`;
+            values (${ws}, ${proyectoA}, ${f.etapa}, ${`Motivo de la ${f.etapa}`},
+                    ${f.alcance ?? 'declarado'}, ${f.marcadas}, ${leadId}) returning id`;
           await tx`insert into reapertura_insight (workspace_id, reapertura_id, insight_id)
             values (${ws}, ${re!.id as string}, ${f.insight})`;
         }
@@ -936,7 +974,21 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
       ),
     ).rejects.toThrow(/dice haber marcado 2/);
 
-    // 3. Y las dos honestas, cada una con lo suyo: la mitad buena de las dos correcciones.
+    // 3. Y la forma que se CONTRADICE a sí misma: `etapa-completa` con insights declarados.
+    //    La comprobación del alcance vacío miraba en una sola dirección —«declarado» sin
+    //    declarar nada— y por la otra dejaba pasar una fila que dice las dos cosas: que se
+    //    reabre la etapa entera, y que el alcance son estos insights. El registro es lo que la
+    //    pantalla pinta y lo que el evento archiva, así que quien lo lea después no puede
+    //    saber qué se reabrió. Aquí la reapertura es de verdad —marca las tres decisiones de
+    //    aguas abajo y declara el número correcto—: lo único malo es lo que DICE de sí misma.
+    await expect(
+      reabrirPor(
+        [{ etapa: 3, insight: insightA, marcadas: 3, alcance: 'etapa-completa' }],
+        [deA, deB, ajena],
+      ),
+    ).rejects.toThrow(/reabre la etapa entera y a la vez declara/);
+
+    // 4. Y las dos honestas, cada una con lo suyo: la mitad buena de las dos correcciones.
     await reabrirPor(
       [
         { etapa: 3, insight: insightA, marcadas: 1 },

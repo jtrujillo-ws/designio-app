@@ -58,7 +58,18 @@ create table oportunidad (
   pregunta text not null check (btrim(pregunta) <> ''),
   -- La priorización RAZONADA (SPEC-08 C3, prediseño §3: «priorización contra criterios del
   -- reto»). El número ordena; el texto dice por qué, que es la mitad que se pierde siempre.
-  prioridad integer not null default 0,
+  --
+  -- Y el rango va aquí y no solo en el esquema Zod, porque `prioridad` está en el grant de
+  -- INSERT y en el de UPDATE del rol de aplicación: por SQL directo entraba un negativo o un
+  -- número arbitrariamente grande, o sea un estado que la API no puede producir en la columna
+  -- con la que se ORDENA el portafolio —el índice de abajo es (workspace, reto, prioridad
+  -- desc, creado_en)—. Una HMW que se pone la primera de todas sin pasar por la priorización
+  -- es exactamente lo que la priorización razonada existe para impedir.
+  --
+  -- Los mismos límites que `CrearOportunidadSchema` y `PriorizarOportunidadSchema`, y en un
+  -- CHECK y no en la política por lo mismo que el vocabulario del estado: es una propiedad del
+  -- VALOR, no de quién escribe ni de cuándo.
+  prioridad integer not null default 0 check (prioridad between 0 and 1000),
   prioridad_razon text not null default '',
   estado text not null default 'propuesta'
     check (estado in ('propuesta', 'aprobada', 'descartada')),
@@ -345,6 +356,18 @@ begin
    where ri.reapertura_id = new.id and ri.workspace_id = new.workspace_id;
   if new.alcance = 'declarado' and v_declarados = 0 then
     raise exception 'esa reapertura dice tener alcance declarado y no declara ningún insight: un alcance vacío no acota nada, deja fuera todas las decisiones y abre la etapa sin cuestionar ninguna (RF-04.9)';
+  end if;
+  -- Y POR EL OTRO LADO, que es la mitad que faltaba: `etapa-completa` no declara insights.
+  --
+  -- La comprobación de arriba mira una sola dirección, así que una fila podía decir las DOS
+  -- cosas a la vez: que se reabre la etapa entera, y que el alcance son estos insights. No es
+  -- una contradicción inofensiva — el registro es lo que `SeccionGobernanza` pinta y lo que el
+  -- evento archiva, y `EtapaReabierta` lleva `alcance` e `insightsDeclarados` juntos: quien lo
+  -- lea después no puede saber qué se reabrió. Y el guard mismo trata las dos cosas de forma
+  -- distinta (la rama de `etapa-completa` ignora los insights declarados), así que la fila
+  -- sobrevive diciendo algo que ni ella misma usa.
+  if new.alcance = 'etapa-completa' and v_declarados > 0 then
+    raise exception 'esa reapertura se reabre la etapa entera y a la vez declara % insights: son dos alcances distintos y el registro tiene que decir UNO, porque es el que la pantalla enseña y el que queda en el archivo (RF-04.9)', v_declarados;
   end if;
 
   if exists (

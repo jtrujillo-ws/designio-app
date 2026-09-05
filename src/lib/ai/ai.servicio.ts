@@ -755,16 +755,24 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         journeyDesdeElPanel(f).nodos.map((n) => [n.id, n.etiqueta || '(sin etiqueta)']),
       ),
     estadoDeLaFila: (f) => {
-      const contenido = f.contenido_original as ContenidoRemediacionJourney | null;
-      if (!contenido) return null;
-      const ahora = new Set(
-        clavesDeSenales(validarJourney(journeyDesdeElPanel(f))),
-      );
-      const remedia = contenido.remediaciones ?? [];
-      const cambio =
-        remedia.length !== ahora.size ||
-        remedia.some((r) => !ahora.has(`${r.nodoId}\u0000${r.codigo}`));
-      return cambio ? 'journey-cambiado' : null;
+      /*
+       * Contra la HUELLA guardada, no contra las claves de las señales que remedia.
+       *
+       * Comparar las claves era la mitad —y la misma mitad que ya se corrigió del otro lado,
+       * en la comprobación de la escritura—: renombrar un nodo, cambiar la condición de una
+       * transición o rehacer la topología de alrededor deja las señales iguales y cambia todo
+       * lo que el consejo describe. El material es lo que hay que comparar, y por eso se
+       * guardó al nacer la propuesta.
+       *
+       * Sin huella —una propuesta anterior a la columna— no se afirma nada: `null` deja el
+       * veredicto del CASE. Decir «cambiado» sin poder saberlo sería inventarse una alarma,
+       * y decir «al día» sería inventarse una tranquilidad.
+       */
+      const guardada = f.huella_material as string | null;
+      if (!guardada) return null;
+      return huellaDelGrafo(grafoParaElModelo(journeyDesdeElPanel(f))) === guardada
+        ? null
+        : 'journey-cambiado';
     },
     material: (f) => materialDeJourney({
       nombre: (f.journey_nombre as string | null) ?? '',
@@ -1034,7 +1042,7 @@ export async function panelPropuestas(
 
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, ${proyeccion.columnas},
-             p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
+             p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen, p.huella_material,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
              coalesce(${proyeccion.titulos}) as ancla_titulo,
              case ${proyeccion.motivo} else null end as ancla_estado,
@@ -1217,8 +1225,8 @@ type Alcance = {
    * libera si la generación no llega a nacer. */
   reservaId: string;
   unidades: number;
-  /** Lo que `PREPARAR` le enseñó al modelo, para que `COMPROBAR` lo mire. Ver `Preparacion`. */
-  visto?: unknown;
+  /** La huella del material que `PREPARAR` le enseñó al modelo. Ver `Preparacion`. */
+  huellaMaterial?: string;
 };
 
 /**
@@ -1262,7 +1270,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const consentimiento = exigeConsentimiento
       ? await leerConsentimientoBajoCandado(tx, entrada)
       : null;
-    const { sistema, prompt, visto } = await PREPARAR[entrada.capacidad](tx, entrada);
+    const { sistema, prompt, huellaMaterial } = await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
       throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
     }
@@ -1349,7 +1357,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       key,
       reservaId: reserva!.id as string,
       unidades,
-      visto,
+      huellaMaterial,
     };
   });
 }
@@ -1966,19 +1974,22 @@ type Preparacion = {
   sistema: string;
   prompt: { usuario: string; alcanceResumen: string };
   /**
-   * Lo que la capacidad le ENSEÑÓ al modelo y quiere volver a mirar cuando toque escribir.
-   *
-   * Va sin tipar por la misma razón que el contenido: lo que hay que recordar cambia con la
-   * capacidad, y el único sitio que sabe qué es —y por tanto el único que puede leerlo— es su
-   * entrada en `COMPROBAR`. Un tipo común aquí sería la unión de todo lo que cualquiera pueda
-   * necesitar, que es otra manera de no decir nada.
+   * La HUELLA del material que se le enseñó al modelo, para las capacidades que la declaran.
    *
    * Lo que sostiene, y no es poco: la llamada al proveedor pasa FUERA de toda transacción, así
    * que entre preparar y persistir el workspace puede haber cambiado. Comparar contra una
-   * lectura nueva dice si algo cambió; comparar contra ESTO dice si el informe habla del
-   * estado que tuvo delante, que es otra pregunta y la que importa.
+   * lectura nueva dice si algo cambió DESDE ESA LECTURA; comparar contra esto dice si el
+   * contenido habla del estado que el modelo tuvo delante, que es otra pregunta y la que
+   * importa.
+   *
+   * Es una cadena y no un objeto porque eso es lo que resultó ser, y porque así se puede
+   * GUARDAR: una vez escrita en `propuesta_ai.huella_material`, la misma comparación sirve
+   * meses después para decirle a quien revisa que el material cambió desde que se pidió.
+   *
+   * `undefined` en las capacidades que no la declaran: hoy, todas menos C5. Y no es un hueco
+   * —es que su material no se puede recomponer barato en cada pintada del panel—.
    */
-  visto?: unknown;
+  huellaMaterial?: string;
 };
 const PREPARAR: Record<
   CapacidadActiva,
@@ -2148,7 +2159,7 @@ const PREPARAR: Record<
        * describe. Lo que hay que fijar es el material, y el material son los nodos, las
        * aristas y las señales juntos.
        */
-      visto: { grafo: huellaDelGrafo(grafo) },
+      huellaMaterial: huellaDelGrafo(grafo),
     };
   },
 };
@@ -2173,7 +2184,7 @@ const COMPROBAR: Record<
     tx: TransactionSql,
     entrada: GenerarPropuestas,
     contenidos: ContenidoPropuesta[],
-    visto: unknown,
+    huellaMaterial: string | undefined,
   ) => Promise<void>
 > = {
   // El contenido de CI se sujeta entero con su esquema y con los CHECK de `evidencia`: no hay
@@ -2182,12 +2193,12 @@ const COMPROBAR: Record<
   C0: async () => {},
   // Los huecos de CT los comprueba un trigger, que es un suelo más bajo que éste.
   CT: async () => {},
-  C5: async (tx, entrada, contenidos, visto) => {
+  C5: async (tx, entrada, contenidos, huellaMaterial) => {
     const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
     if (!journey) throw new ErrorAI('El journey dejó de existir mientras se generaba el informe');
     const grafoAhora = grafoParaElModelo(journey);
     const ahora = clavesDeSenales(grafoAhora.senales);
-    const huellaMostrada = (visto as { grafo: string } | undefined)?.grafo ?? '';
+    const huellaMostrada = huellaMaterial ?? '';
 
     /*
      * ── Primero: que el grafo siga siendo EL QUE VIO EL MODELO ──
@@ -2360,7 +2371,7 @@ async function persistirPropuestas(
      * se escribe. Va delante del candado del presupuesto porque no lo necesita y porque
      * fallar aquí no debe tener a nadie esperando.
      */
-    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.visto);
+    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.huellaMaterial);
     await bloquearPresupuesto(tx, entrada.workspaceId);
 
     // Retirar la reserva ya no «devuelve» presupuesto: desde que el tope cuenta llamadas
@@ -2428,8 +2439,8 @@ async function persistirPropuestas(
       const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, ${anclas.columnas}, contenido, contenido_original,
-         confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, orden,
-         es_simulacion, creado_por)
+         confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+         llamada_id, orden, es_simulacion, creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino}, ${anclas.valores},
              c.contenido, c.contenido,
              -- La confianza que el modelo declara sobre CADA propuesta, traducida a la escala
@@ -2441,6 +2452,10 @@ async function persistirPropuestas(
              -- maquillar sin que se vea.
              (${tx.json(CONFIANZA_PROPUESTA_NUMERICA)}::jsonb ->> (c.contenido ->> 'confianzaPropuesta'))::numeric,
              ${llamada.modelo}, ${PROMPT_VERSION}, ${alcance.alcanceResumen},
+             -- La huella del material que el modelo tuvo delante, para las capacidades que la
+             -- declaran. Se escribe al nacer y no se toca: un valor reescribible después no
+             -- diría nada sobre lo que se leyó.
+             ${alcance.huellaMaterial ?? null},
              ${alcance.origenKey}, ${llamada.id},
              -- El puesto en el lote sale de la MISMA sentencia que inserta (with
              -- ordinality, que numera desde 1, de ahi el -1) y no de un contador aparte

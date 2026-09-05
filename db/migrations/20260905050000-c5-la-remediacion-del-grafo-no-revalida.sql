@@ -116,3 +116,23 @@ create trigger a_propuesta_ai_c5_linaje
 -- ramas no se pisen el mismo.
 create unique index propuesta_ai_llamada_c5_idx on propuesta_ai (workspace_id, llamada_id)
   where capacidad = 'C5';
+
+-- ── La huella del MATERIAL, guardada con la propuesta ──
+--
+-- Qué material tuvo delante el modelo es un hecho de la generación, y hasta ahora solo vivía
+-- en memoria: `COMPROBAR` lo comparaba al escribir y después se perdía. Entre escribir y
+-- revisar cabe la vida entera del objeto —para C5, que alguien arregle el grafo, que es el
+-- desenlace bueno— y sin este dato la pantalla no puede decir que el informe dejó de
+-- describir lo que hay. Lo intentó comparando las claves de las señales que remedia, y eso es
+-- la mitad: renombrar un nodo o cambiar una transición las deja iguales.
+--
+-- Es una columna general y no un campo de C5 porque la pregunta lo es —«¿sigue siendo este el
+-- material que se le enseñó?»— y porque su respuesta es la misma para cualquier capacidad que
+-- pueda recomponer su material. Hoy la declara C5; las demás la dejan en null, que es su
+-- respuesta y no un hueco: recomponer el material de un item o de un checklist en cada pintada
+-- del panel para responder algo que sus propios estados de ancla ya responden no lo paga nadie.
+--
+-- Sin GRANT de UPDATE: se escribe al nacer la propuesta y no se toca. Un valor que se pudiera
+-- reescribir después no diría nada sobre lo que el modelo leyó.
+alter table propuesta_ai add column huella_material text;
+grant insert (huella_material) on propuesta_ai to designio_app;

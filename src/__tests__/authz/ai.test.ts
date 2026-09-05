@@ -6072,6 +6072,49 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y también cuando el grafo cambia SIN que cambien sus señales.
+   *
+   * La primera versión de este aviso comparaba las claves `(nodoId, codigo)` de lo que el
+   * informe remedia, y eso es la mitad —la misma mitad que ya se corrigió del otro lado, en la
+   * comprobación de la escritura—: renombrar un nodo, cambiar la condición de una transición o
+   * rehacer la topología de alrededor las deja idénticas y cambia todo lo que el consejo
+   * describe. Quien lee una remediación sobre «Verificar identidad» no tiene manera de saber
+   * que ese nodo se llama otra cosa.
+   *
+   * Se compara contra la HUELLA guardada al nacer la propuesta, que es lo que hace la pregunta
+   * respondible meses después. Y se comprueba que las señales siguen siendo las mismas: sin
+   * eso, este caso podría estar pasando por el camino del anterior.
+   */
+  it('un informe se marca obsoleto si el grafo cambió aunque sus señales sigan iguales', async () => {
+    await enWorkspaceLimpio('c5-obsoleto-por-renombre', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      expect(antes.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado).toBe('disponible');
+
+      await sqlAdmin()`update journey_nodo set etiqueta = 'Comprobar quién eres'
+        where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      // Las señales, idénticas: lo único que cambió es lo que el consejo describe.
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+
+      const despues = await panelPropuestas(curadorId, wsC);
+      expect(
+        despues.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado,
+        'el informe se dice al día sobre un grafo que se renombró bajo sus pies',
+      ).toBe('journey-cambiado');
+    });
+  });
+
+  /**
    * La cola sigue buscando por debajo de los journeys limpios.
    *
    * Filtrar por señales fuera del SQL obliga a paginar el prefiltro: con un `limit` fijo, un

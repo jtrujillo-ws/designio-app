@@ -15,6 +15,11 @@ import {
 import { costoDeUso, MODELO_PRIMARIO } from '../src/lib/ai/ai.degradacion';
 import { PROMPT_VERSION } from '../src/lib/ai/ai.prompts';
 import { CONFIANZA_PROPUESTA_NUMERICA, type ContenidoExtraccion } from '../src/lib/ai/ai.schemas';
+import {
+  LoginSchema,
+  PASSWORD_MAX_BYTES,
+  ROLES_QUE_INVITAN,
+} from '../src/lib/auth/auth.schemas';
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error('Falta DATABASE_URL (conexión admin; ver .env.local.example)');
@@ -1182,14 +1187,45 @@ async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Pro
  * cuenta: uno solo no ejercita el selector.
  */
 async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
-  const email = process.env.SEED_ADMIN_EMAIL?.trim().toLowerCase();
-  if (!email) return null;
+  const crudo = process.env.SEED_ADMIN_EMAIL?.trim();
+  if (!crudo) return null;
   const clave = process.env.SEED_ADMIN_PASSWORD ?? '';
-  // Se falla en vez de inventar una contraseña: una cuenta con acceso de lead-boutique y
-  // una clave que nadie eligió es peor que no tener cuenta.
-  if (clave.length < 12) {
+
+  /*
+   * Las dos condiciones que deciden si esta cuenta podrá ENTRAR se comprueban con el mismo
+   * contrato que gobierna la puerta, no con una regla escrita aquí. Un seed que crea una
+   * cuenta privilegiada y declara «asegurada» sobre algo que el login va a rechazar es peor
+   * que un seed que no la crea: nadie va a mirar otra vez.
+   *
+   * El correo, con el campo de `LoginSchema` —que además normaliza (trim + minúsculas), así
+   * que la normalización a mano de antes desaparece con él—. Una errata en la variable creaba
+   * la cuenta, la base la aceptaba y el login la rechazaba por formato.
+   *
+   * La clave, en BYTES y no en caracteres. Medido: 50 caracteres acentuados son 100 bytes;
+   * pasaban el `clave.length < 12` de antes, bcrypt los truncaba a 72 en silencio y
+   * `autenticar` los rechaza de entrada por pasar de `PASSWORD_MAX_BYTES` — una cuenta
+   * imposible de usar, anunciada como lista. El suelo de 12 CARACTERES es propio del seed y
+   * más estricto que el del producto (10): una credencial privilegiada que sale en una
+   * variable de entorno merece más, no menos.
+   */
+  const correo = LoginSchema.shape.email.safeParse(crudo);
+  if (!correo.success) {
     throw new Error(
-      'SEED_ADMIN_EMAIL está puesta pero SEED_ADMIN_PASSWORD falta o tiene menos de 12 caracteres',
+      `SEED_ADMIN_EMAIL no es un correo válido (${crudo}): el login lo rechazaría, así que la cuenta nacería inutilizable`,
+    );
+  }
+  const email = correo.data;
+
+  const SEED_PASSWORD_MIN = 12;
+  const bytes = new TextEncoder().encode(clave).length;
+  if (clave.length < SEED_PASSWORD_MIN) {
+    throw new Error(
+      `SEED_ADMIN_EMAIL está puesta pero SEED_ADMIN_PASSWORD falta o tiene menos de ${SEED_PASSWORD_MIN} caracteres`,
+    );
+  }
+  if (bytes > PASSWORD_MAX_BYTES) {
+    throw new Error(
+      `SEED_ADMIN_PASSWORD ocupa ${bytes} bytes y el máximo es ${PASSWORD_MAX_BYTES} (límite de bcrypt): bcrypt la truncaría y el login la rechazaría, así que la cuenta nacería inutilizable`,
     );
   }
   const nombre = process.env.SEED_ADMIN_NOMBRE?.trim() || email.split('@')[0]!;
@@ -1282,7 +1318,7 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
      *
      * Una función que concede accesos no puede confiar en que su llamante haya acotado bien.
      */
-    const workspaces = await tx`select w.id, w.nombre, m.usuario_id as lucia_id
+    const workspaces = await tx`select w.id, w.nombre, m.usuario_id as lucia_id, m.rol as lucia_rol
       from workspace w
       join miembro m on m.workspace_id = w.id
       join usuario u2 on u2.id = m.usuario_id
@@ -1292,6 +1328,29 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
     const dichos: string[] = [];
     for (const w of workspaces) {
       const wsId = w.id as string;
+      const luciaRol = w.lucia_rol as string;
+
+      /*
+       * El rol de Lucía se LEE; no se afirma. El evento de más abajo escribía
+       * `actor_rol = 'lead-boutique'` sin haberlo mirado, así que si su membresía se hubiera
+       * cambiado antes de encender `SEED_ADMIN_EMAIL`, la auditoría de una concesión
+       * privilegiada quedaba materialmente falsa — y es el único registro que explica de dónde
+       * salió ese miembro.
+       *
+       * Y si el rol que tiene no es de los que dan de alta, no se concede: atribuirle a alguien
+       * un alta que su rol no le permite hacer es la misma mentira, escrita entera. Se salta
+       * ese workspace con su motivo en vez de abortar el despliegue —igual que la rama de «ya
+       * era otro rol»—: una demo con la membresía cambiada no es una emergencia, es un dato.
+       *
+       * `ROLES_QUE_INVITAN` es el mismo que aplica el servicio de invitación y el espejo de la
+       * política `miembro_insert`, que es quien lo impone de verdad.
+       */
+      if (!(ROLES_QUE_INVITAN as readonly string[]).includes(luciaRol)) {
+        dichos.push(
+          `${w.nombre as string}: SIN TOCAR, la cuenta del seed (Lucía) es ${luciaRol} y ese rol no da de alta miembros`,
+        );
+        continue;
+      }
       /*
        * Se MIRA antes de escribir, y el `on conflict` se queda de todas formas.
        *
@@ -1342,14 +1401,15 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
        * privilegiada que aparece sin rastro es exactamente lo que una auditoría no puede
        * explicar — ni la exportación del workspace, que lee de aquí.
        *
-       * El actor es Lucía, que es la identidad con la que este seed escribe todo lo demás, y
-       * el payload dice que vino del seed y por qué variable: quien lo lea sabrá que no fue
-       * una invitación, sino un despliegue con `SEED_ADMIN_EMAIL` puesta.
+       * El actor es Lucía, que es la identidad con la que este seed escribe todo lo demás, CON
+       * EL ROL QUE DE VERDAD TIENE, y el payload dice que vino del seed y por qué variable:
+       * quien lo lea sabrá que no fue una invitación, sino un despliegue con
+       * `SEED_ADMIN_EMAIL` puesta.
        */
       await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
         values (${wsId}, 'MiembroInvitado',
                 ${tx.json({ email, rol: 'lead-boutique', requiereActivacion: false, origen: 'seed:SEED_ADMIN_EMAIL' })},
-                ${w.lucia_id as string}, 'lead-boutique')`;
+                ${w.lucia_id as string}, ${luciaRol})`;
       dichos.push(`${w.nombre as string}: lead-boutique`);
     }
     return dichos.length > 0 ? `${email} (${dichos.join('; ')})` : `${email} (sin workspaces demo)`;

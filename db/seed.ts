@@ -1310,6 +1310,7 @@ async function sembrarAdminPropio(
 ): Promise<string | null> {
   if (!admin) return null;
   const { email, clave, nombre } = admin;
+
   // El hash se calcula aquí y no al validar: cuesta CPU y solo hace falta si se va a escribir.
   const hash = await bcrypt.hash(clave, 10);
 
@@ -1400,6 +1401,24 @@ async function sembrarAdminPropio(
      *
      * Una función que concede accesos no puede confiar en que su llamante haya acotado bien.
      */
+    /*
+     * Sin workspaces sellados no hay nada que consultar, y se sale ANTES de consultarlo — pero
+     * AQUÍ, no antes de la transacción: la cuenta ya está creada y activa a estas alturas, y
+     * eso es deliberado. En una base sin sellos quien despliega quiere poder ENTRAR aunque no
+     * tenga workspaces; salir antes de crearla le dejaría sin cuenta y sin explicación.
+     *
+     * Una revisión avisó de que con la lista vacía el `in` quedaría inválido y el seed
+     * reventaría —y con `set -e` en el entrypoint, el despliegue no arrancaría—. Medido, en
+     * esta versión del driver no es así: `sql([])` se expande a `in (null)`, SQL válido que
+     * devuelve cero filas, así que el camino ya terminaba en el mensaje de abajo; lo comprobé
+     * de punta a punta borrando los sellos. Aun así el corte se pone, y no por si acaso: que un
+     * despliegue arranque o no dependía de un detalle de expansión del driver que nadie ha
+     * prometido. Un `return` explícito dice lo que pasa y no se apoya en eso.
+     */
+    if (workspaces.length === 0) {
+      return `${email} (cuenta lista, SIN membresías: no hay workspaces sellados por este seed en esta base; una base sembrada antes del sello no acredita cuáles son suyos)`;
+    }
+
     const destinos = await tx`select w.id, w.nombre, m.usuario_id as lucia_id, m.rol as lucia_rol
       from workspace w
       join miembro m on m.workspace_id = w.id

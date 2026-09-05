@@ -84,8 +84,20 @@ a:hover {
 }
 @media (max-width: 1200px) {
   .loop-aside {
+    position: relative;
     width: 68px !important;
     padding: 20px 10px !important;
+  }
+  /* El formulario de alta no cabe en el riel: se abre como panel flotante a su derecha, a la
+     altura de la fila que lo abrió (posición estática), sobre el mismo fondo oscuro. */
+  .loop-aside .loop-nuevo-servicio {
+    position: absolute;
+    left: 62px;
+    /* El ancho en línea de la fila (100%) es el del riel: aquí manda el panel. */
+    width: 260px !important;
+    z-index: 30;
+    background: var(--brand-ink);
+    box-shadow: var(--shadow-md);
   }
   .loop-aside .loop-ancho {
     display: none !important;

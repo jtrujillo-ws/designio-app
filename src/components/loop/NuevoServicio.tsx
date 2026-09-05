@@ -73,6 +73,7 @@ export function NuevoServicio({
         type="button"
         className="loop-fila"
         onClick={() => setAbierto(true)}
+        aria-label="Nuevo servicio"
         title="Dar de alta un servicio de la organización cliente"
         style={{
           ...filaPunteada,
@@ -91,7 +92,9 @@ export function NuevoServicio({
     <form
       onSubmit={enviar}
       aria-label="Nuevo servicio"
-      className="loop-ancho"
+      // En el riel estrecho no se oculta: se abre como panel flotante a la derecha del
+      // riel (ver app.css), para que pulsar «+» no deje al usuario sin formulario.
+      className="loop-nuevo-servicio"
       style={{
         ...filaPunteada,
         marginTop: 6,

@@ -559,8 +559,14 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         where r.workspace_id = ${workspaceId}
           and reto_admite_criterios(r.id, r.workspace_id)
           and not reto_criterios_congelados(r.id, r.workspace_id)
+          -- Y el trabajo pendiente que excluye a un reto es EL DE C0, no cualquiera. C2
+          -- cuelga del mismo reto y es otro pipeline: la admisión ya lo scopea por capacidad
+          -- —eso se corrigió del otro lado—, así que sin este filtro la independencia valía
+          -- en una sola dirección: con un insight esperando revisión, pedir criterios habría
+          -- funcionado si se enviaba a mano, pero el reto desaparecía del selector de C0.
           and not exists (select 1 from propuesta_ai p
-            where p.reto_id = r.id and p.workspace_id = r.workspace_id and p.estado = 'propuesta')
+            where p.reto_id = r.id and p.workspace_id = r.workspace_id
+              and p.capacidad = 'C0' and p.estado = 'propuesta')
           and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
         order by r.codigo asc, r.id asc
         limit ${limite}`;

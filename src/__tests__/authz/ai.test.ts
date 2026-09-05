@@ -6626,6 +6626,62 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           ).rejects.toThrow(/insights/i);
         },
       );
+
+      // Y con el criterio de C0 decidido, lo único pendiente sobre el reto es el insight: ahí
+      // se ve la otra dirección de la independencia, y va abajo en su propio caso.
+    });
+  });
+
+  /**
+   * Y LA INDEPENDENCIA VALE EN LAS DOS DIRECCIONES.
+   *
+   * La admisión ya scopeaba por capacidad y la cola de C2 también; la de C0 seguía excluyendo
+   * el reto en cuanto hubiera CUALQUIER propuesta pendiente. Con un insight de C2 esperando
+   * revisión, pedir criterios habría funcionado si se enviaba a mano y el reto desaparecía del
+   * selector de C0: una independencia que solo se cumplía en un sentido, y que en el otro se
+   * manifiesta como una opción que se esfuma sin motivo que nadie pueda leer.
+   *
+   * Las dos mitades, otra vez: con el insight pendiente C0 se ofrece, y con un criterio de C0
+   * pendiente no —que es la regla que sí hay que conservar—.
+   */
+  it('un insight de C2 pendiente no esconde el reto de la cola de C0', async () => {
+    await enWorkspaceLimpio('c0-junto-a-c2', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      // Antes de nada, el reto SÍ está en la cola de C0: sin esto, lo de abajo podría estar
+      // midiendo un reto que nunca estuvo.
+      const limpio = await panelPropuestas(curadorId, wsC);
+      expect(limpio.candidatas.C0.lista.some((r) => r.id === retoC)).toBe(true);
+
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+
+      const conInsight = await panelPropuestas(curadorId, wsC);
+      expect(conInsight.pendientes.some((x) => x.capacidad === 'C2')).toBe(true);
+      expect(
+        conInsight.candidatas.C0.lista.some((r) => r.id === retoC),
+        'un insight pendiente esconde el reto de la cola de C0',
+      ).toBe(true);
+
+      // Y lo que sí lo esconde es lo SUYO: un criterio de C0 esperando revisión.
+      const admin = sqlAdmin();
+      const [l0] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C0', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      await conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+        values (${wsC}, 'C0', 'criterio-exito', ${retoC}, ${tx.json(CONTENIDO_C0)},
+                ${tx.json(CONTENIDO_C0)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance', 'entorno', ${l0!.id as string}, ${curadorId})`);
+      const conCriterio = await panelPropuestas(curadorId, wsC);
+      expect(conCriterio.candidatas.C0.lista.some((r) => r.id === retoC)).toBe(false);
     });
   });
 

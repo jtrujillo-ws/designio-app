@@ -7622,6 +7622,199 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   }, 20000);
 
   /**
+   * Y el ARCHIVO en vuelo tampoco deja nacer la propuesta. Quinto sitio de la misma familia.
+   *
+   * El guard del INSERT ya preguntaba por el archivo del reto —eso cierra la ventana ancha—,
+   * y lo preguntaba con un `exists` a secas. Un archivado EN VUELO no lo ve ese snapshot: la
+   * lectura devuelve la versión activa anterior sin esperar, y la clave ajena de la propuesta
+   * NO ordena nada, porque `estado` no es columna de clave y el UPDATE que archiva solo toma
+   * `for no key update`. La propuesta commitea después del archivo y nace ya
+   * `reto-archivado`: visible en el panel, imposible de aceptar, con la llamada pagada.
+   *
+   * El candado va además ANTES que el de `derecho_uso`, y eso no es cosmético: el trigger de
+   * las citas de C2 dispara primero (`a_propuesta_ai_c2_citas` ordena antes que
+   * `propuesta_ai_revision`) y ya tomaba los derechos, así que sin el reto por delante esta
+   * ruta pedía los dos candados al revés que todas las demás.
+   */
+  it('un archivado en vuelo impide que nazca una propuesta sobre un reto cerrado', async () => {
+    await enWorkspaceLimpio('c2-archivado-al-persistir', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+
+      let soltar: () => void = () => {};
+      const enVuelo = new Promise<void>((r) => {
+        soltar = r;
+      });
+      const archivado = admin.begin(async (tx) => {
+        await tx`update reto set estado = 'archivado'
+          where id = ${retoC} and workspace_id = ${wsC}`;
+        await enVuelo;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      const persistencia = conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           llamada_id, creado_por)
+        values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(CONTENIDO_C2(ev) as never)},
+                ${tx.json(CONTENIDO_C2(ev) as never)}, 0.6, ${MODELO_PRIMARIO},
+                ${PROMPT_VERSION}, 'alcance', 'huella', 'entorno', ${l!.id as string},
+                ${curadorId})`);
+      const veredicto = persistencia.then(
+        () => 'nació',
+        (e: Error) => `rechazó: ${e.message}`,
+      );
+
+      await new Promise((r) => setTimeout(r, 1500));
+      soltar();
+      await archivado;
+
+      expect(
+        await veredicto,
+        'nació una propuesta sobre un reto que se estaba archivando',
+      ).toMatch(/archivado/);
+
+      const filas = await admin`select 1 from propuesta_ai
+        where workspace_id = ${wsC} and capacidad = 'C2'`;
+      expect(filas.length).toBe(0);
+    });
+  }, 20000);
+
+  /**
+   * Y no es solo cosa de C2: la misma carrera con C0, que es la que MIDE el candado del guard
+   * del INSERT.
+   *
+   * Medido, y conviene dejarlo escrito porque cambia lo que demuestra cada sonda: con una
+   * propuesta de C2, quitar CUALQUIERA de los dos candados por separado deja la prueba en
+   * verde — el guard de las citas de C2 dispara antes y toma el mismo `for share` sobre la
+   * misma fila, así que se tapan el uno al otro. Solo quitando los dos a la vez nace la
+   * propuesta. Es decir: la sonda de C2 mide «hay candado en esta ruta», no cuál.
+   *
+   * `propuesta_ai_c2_citas_guard` se va por la puerta de atrás en cuanto la capacidad no es
+   * C2 (`if new.capacidad <> 'C2' then return new`), y C0 y CT también cuelgan del reto. Para
+   * ellas el único candado es el del guard del INSERT, así que esta es la sonda que se apaga
+   * sola en rojo cuando se le quita.
+   */
+  it('el archivado en vuelo también ordena una propuesta de C0, que no pasa por el guard de citas', async () => {
+    await enWorkspaceLimpio('c0-archivado-al-persistir', async ({ ws: wsD, curadorId, retoId: retoD }) => {
+      const admin = sqlAdmin();
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsD}, 'C0', ${retoD}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+
+      let soltar: () => void = () => {};
+      const enVuelo = new Promise<void>((r) => {
+        soltar = r;
+      });
+      const archivado = admin.begin(async (tx) => {
+        await tx`update reto set estado = 'archivado'
+          where id = ${retoD} and workspace_id = ${wsD}`;
+        await enVuelo;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      const persistencia = conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+        values (${wsD}, 'C0', 'criterio-exito', ${retoD}, ${tx.json(CONTENIDO_C0)},
+                ${tx.json(CONTENIDO_C0)}, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance', 'entorno', ${l!.id as string}, ${curadorId})`);
+      const veredicto = persistencia.then(
+        () => 'nació',
+        (e: Error) => `rechazó: ${e.message}`,
+      );
+
+      await new Promise((r) => setTimeout(r, 1500));
+      soltar();
+      await archivado;
+
+      expect(
+        await veredicto,
+        'nació una propuesta de C0 sobre un reto que se estaba archivando',
+      ).toMatch(/archivado/);
+
+      const filas = await admin`select 1 from propuesta_ai
+        where workspace_id = ${wsD} and capacidad = 'C0'`;
+      expect(filas.length).toBe(0);
+    });
+  }, 20000);
+
+  /**
+   * Y el ORDEN de los dos candados, leído del catálogo.
+   *
+   * Que el reto se bloquee en algún sitio no basta: donde el conjunto de `derecho_uso` que se
+   * bloquea SE DERIVA del reto, el reto tiene que bloquearse ANTES. Es el mismo argumento por
+   * el que `razonamiento_usable_guard` bloquea las decisiones antes que los derechos que salen
+   * de ellas —bloquear el resultado sin bloquear la fuente deja el fantasma abierto— y es
+   * además lo que mantiene UN solo orden: el guard de las citas de C2 dispara antes que el del
+   * INSERT (`a_propuesta_ai_c2_citas` ordena por nombre delante de `propuesta_ai_revision`), así
+   * que sin su propio candado del reto esa ruta pedía los dos al revés que el guard diferido,
+   * que la revalidación previa al despacho y que `bloquearReto`. Dos órdenes distintos sobre el
+   * mismo par de tablas es la definición de un abrazo mortal esperando a que coincidan.
+   *
+   * No se prueba provocando el interbloqueo —una prueba cuyo verde dependa de ganar una carrera
+   * no prueba nada—, sino leyendo el cuerpo de cada función de `pg_proc`, que es lo que de
+   * verdad corre y no lo que dice el fichero de la migración.
+   *
+   * El candado del reto vale en sus DOS formas, porque las dos existen en este esquema: la fila
+   * (`from reto … for share`) y el advisory por clave (`designio:reto:…`, que es el que toma
+   * `gate_aprobar_suficiencia_guard`). Exigir solo la primera daría rojo sobre una función que
+   * respeta el protocolo, y eso enseña a ignorar la prueba.
+   */
+  it('donde los derechos bloqueados salen del reto, el reto se bloquea primero', async () => {
+    const admin = sqlAdmin();
+    const funciones = await admin<{ proname: string; prosrc: string }[]>`
+      select p.proname, p.prosrc
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'public' and p.prosrc like '%for share%'
+       order by p.proname`;
+
+    const bloqueDerechos = (src: string) => /\bfrom\s+derecho_uso\b[\s\S]*?for share/.exec(src);
+    const candadoDelReto = (src: string) => {
+      const fila = /\bfrom\s+reto\b[\s\S]*?for share/.exec(src);
+      const advisory = /pg_advisory_xact_lock\([^)]*designio:reto:/.exec(src);
+      const posiciones = [fila?.index, advisory?.index].filter((x): x is number => x !== undefined);
+      return posiciones.length ? Math.min(...posiciones) : -1;
+    };
+
+    const derivadasDelReto: string[] = [];
+    const sinCandadoDelReto: string[] = [];
+    const invertidas: string[] = [];
+    for (const f of funciones) {
+      const derechos = bloqueDerechos(f.prosrc);
+      if (!derechos) continue;
+      const reto = candadoDelReto(f.prosrc);
+      // Que el conjunto de derechos se derive del reto se ve en el propio bloque: es su
+      // subconsulta la que lo nombra.
+      if (/reto_id/.test(derechos[0])) {
+        derivadasDelReto.push(f.proname);
+        if (reto < 0) sinCandadoDelReto.push(f.proname);
+      }
+      if (reto >= 0 && reto > derechos.index) invertidas.push(f.proname);
+    }
+
+    // Anti-vacío: si el reconocedor deja de ver los bloques —porque cambie la forma de
+    // escribirlos— esta prueba pasaría en verde sin mirar nada, que es el modo de fallo que
+    // hay que evitar. Hoy son `propuesta_ai_c2_citas_guard` y `gate_aprobar_suficiencia_guard`.
+    expect(derivadasDelReto.length, 'el reconocedor no encontró ninguna función que derive derechos del reto')
+      .toBeGreaterThanOrEqual(2);
+    expect(sinCandadoDelReto, 'estas funciones bloquean derechos derivados del reto sin bloquear el reto')
+      .toEqual([]);
+    expect(invertidas, 'estas funciones piden derecho_uso antes que el reto').toEqual([]);
+  });
+
+  /**
    * Una revocación EN VUELO no deja que el material salga hacia el proveedor.
    *
    * `REVALIDAR.C2` recompone la huella del material justo antes de despachar, y eso cierra la

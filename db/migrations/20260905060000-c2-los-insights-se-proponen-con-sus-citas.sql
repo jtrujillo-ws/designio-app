@@ -222,6 +222,20 @@ begin
     -- Va por delante y por separado de la puerta de los criterios porque es lo único de
     -- aquella condición que hablaba del RETO y no de los criterios; sin sacarlo aquí, C2 se
     -- quedaba sin este suelo al salir de ella.
+    --
+    -- Y BAJO CANDADO, que es la quinta vez que hace falta la misma frase en este PR. Un
+    -- archivado EN VUELO no lo ve este snapshot: el `exists` a secas lee la versión activa
+    -- anterior sin esperar, la clave ajena de la propuesta no choca con un UPDATE de
+    -- `estado` —que no es columna de clave—, y la propuesta commitea después del archivo.
+    -- Nace ya «reto-archivado»: visible en el panel, imposible de aceptar, con la llamada
+    -- pagada. `for share` sobre la fila del reto es lo que la ordena detrás o delante, y va
+    -- ANTES de cualquier candado sobre `derecho_uso` — el orden del protocolo, el mismo que
+    -- toman el guard diferido, la revalidación previa al despacho y `bloquearReto`.
+    if new.reto_id is not null then
+      perform 1 from reto r
+       where r.id = new.reto_id and r.workspace_id = new.workspace_id
+       for share;
+    end if;
     if new.reto_id is not null and exists (
       select 1 from reto r
       where r.id = new.reto_id and r.workspace_id = new.workspace_id
@@ -1005,6 +1019,23 @@ begin
   --
   -- Sobre las filas de «derecho_uso» de toda la evidencia del reto, ordenadas por id, que es
   -- el protocolo de «candados-compartidos».
+  --
+  -- Y el RETO primero, que es la otra mitad de ese protocolo y aquí faltaba. Dos motivos, y
+  -- el segundo es el que lo hace obligatorio:
+  --
+  --   · El conjunto de derechos de abajo se DERIVA de la fila del reto (por sus arquetipos).
+  --     Bloquear el resultado sin bloquear la fuente deja el fantasma abierto — es el mismo
+  --     argumento por el que «razonamiento_usable_guard» bloquea las decisiones antes que
+  --     los derechos que se derivan de ellas.
+  --   · Y el ORDEN. Este trigger dispara ANTES que «propuesta_ai_revision» (los nombres los
+  --     ordenan: «a_propuesta_ai_c2_citas» va primero), así que sin esta línea el INSERT
+  --     tomaría «derecho_uso» y DESPUÉS el reto, al revés que el guard diferido, que la
+  --     revalidación previa al despacho y que «bloquearReto». Un solo orden en todo el
+  --     sistema es lo que hace que dos transacciones no se esperen en círculo.
+  perform 1 from reto r
+   where r.id = new.reto_id and r.workspace_id = new.workspace_id
+   for share;
+
   perform du.evidencia_id
     from derecho_uso du
    where du.workspace_id = new.workspace_id

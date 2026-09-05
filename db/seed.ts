@@ -1155,11 +1155,21 @@ async function sembrarPropuestaAI(
  * un servicio, sin retos aún. Idempotente por MEMBRESÍA de Lucía + nombre: el nombre
  * de workspace no es único y uno homónimo ajeno no debe saltarse el seed. Devuelve si
  * lo creó en esta corrida. */
-async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Promise<boolean> {
-  const existe = await tx`select 1 from workspace w
+/**
+ * Devuelve el ID del segundo workspace y si lo acaba de crear.
+ *
+ * El ID, y no solo un booleano, porque quien concede accesos no puede volver a buscarlo por
+ * nombre: `workspace.nombre` no es único y una base de desarrollo puede tener otro
+ * «Clínica del Valle» de un cliente distinto. El único id fiable es el que sale de aquí.
+ */
+async function sembrarSegundoWorkspace(
+  tx: TransactionSql,
+  luciaId: string,
+): Promise<{ id: string; creado: boolean }> {
+  const [existe] = await tx`select w.id from workspace w
     join miembro m on m.workspace_id = w.id
     where w.nombre = 'Clínica del Valle' and m.usuario_id = ${luciaId}`;
-  if (existe.length > 0) return false;
+  if (existe) return { id: existe.id as string, creado: false };
   const [ws2] = await tx`insert into workspace (nombre) values ('Clínica del Valle') returning id`;
   const ws2Id = ws2!.id as string;
   await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
@@ -1168,7 +1178,7 @@ async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Pro
     values (${ws2Id}, 'Agendamiento de citas', 'Reserva y confirmación de citas médicas', ${luciaId})`;
   await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
     (${ws2Id}, 'WorkspaceCreado', ${tx.json({ nombre: 'Clínica del Valle', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
-  return true;
+  return { id: ws2Id, creado: true };
 }
 
 /**
@@ -1186,7 +1196,20 @@ async function sembrarSegundoWorkspace(tx: TransactionSql, luciaId: string): Pro
  * Entra como `lead-boutique` en los dos workspaces sembrados, que es lo que hace útil la
  * cuenta: uno solo no ejercita el selector.
  */
-async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
+type AdminPropio = { email: string; clave: string; nombre: string };
+
+/**
+ * Lee y VALIDA la configuración de la cuenta propia, sin tocar la base.
+ *
+ * Va aparte de la siembra porque el orden importa: `sembrarAdminPropio` corre al final, y
+ * comprobar allí las variables significaba que un despliegue limpio con el correo mal escrito
+ * creaba los dos workspaces y las tres cuentas demo enteros y DESPUÉS salía con error. El
+ * mensaje decía «no se crea nada» y la base decía otra cosa. Esto se llama antes de la
+ * primera escritura, así que la promesa se cumple: o la configuración vale, o no se escribe.
+ *
+ * Devuelve `null` cuando no hay cuenta que sembrar; lanza cuando la hay y está mal.
+ */
+function leerAdminPropio(): AdminPropio | null {
   const crudo = process.env.SEED_ADMIN_EMAIL?.trim();
   if (!crudo) return null;
   const clave = process.env.SEED_ADMIN_PASSWORD ?? '';
@@ -1229,6 +1252,24 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
     );
   }
   const nombre = process.env.SEED_ADMIN_NOMBRE?.trim() || email.split('@')[0]!;
+  return { email, clave, nombre };
+}
+
+/**
+ * La cuenta PROPIA de quien despliega, ya validada, en los workspaces que el seed acaba de
+ * resolver. Los IDs llegan de fuera: buscarlos por nombre no vale ni acotando por la
+ * membresía de Lucía —`workspace.nombre` no es único y esa cuenta demo puede estar invitada a
+ * otro workspace que se llame igual—, y conceder `lead-boutique` de una persona REAL sobre el
+ * tenant de otro cliente es el fallo que no se puede permitir.
+ */
+async function sembrarAdminPropio(
+  cliente: typeof sql,
+  admin: AdminPropio | null,
+  workspaces: string[],
+): Promise<string | null> {
+  if (!admin) return null;
+  const { email, clave, nombre } = admin;
+  // El hash se calcula aquí y no al validar: cuesta CPU y solo hace falta si se va a escribir.
   const hash = await bcrypt.hash(clave, 10);
 
   /*
@@ -1318,15 +1359,15 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
      *
      * Una función que concede accesos no puede confiar en que su llamante haya acotado bien.
      */
-    const workspaces = await tx`select w.id, w.nombre, m.usuario_id as lucia_id, m.rol as lucia_rol
+    const destinos = await tx`select w.id, w.nombre, m.usuario_id as lucia_id, m.rol as lucia_rol
       from workspace w
       join miembro m on m.workspace_id = w.id
       join usuario u2 on u2.id = m.usuario_id
-      where w.nombre in ('Banco Andino', 'Clínica del Valle')
+      where w.id in ${tx(workspaces)}
         and lower(u2.email) = 'lucia@whitespace.demo'`;
 
     const dichos: string[] = [];
-    for (const w of workspaces) {
+    for (const w of destinos) {
       const wsId = w.id as string;
       const luciaRol = w.lucia_rol as string;
 
@@ -1417,9 +1458,32 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
 }
 
 async function main() {
+  // ANTES de la primera escritura. Si `SEED_ADMIN_EMAIL` está puesta y su configuración no
+  // vale, esto lanza aquí y la base queda intacta — que es lo que el runbook promete.
+  // Validado al final, un despliegue limpio con el correo mal escrito creaba los dos
+  // workspaces y las tres cuentas demo enteros y salía con error después.
+  const admin = leerAdminPropio();
   const hash = await bcrypt.hash(PASSWORD_DEMO, 10);
 
-  const existentes = await sql`select id from workspace where nombre = 'Banco Andino'`;
+  /*
+   * El workspace PRIMARIO se resuelve por la marca que este seed deja al crearlo, no por su
+   * nombre a secas. `workspace.nombre` no tiene unicidad (comprobado: su única restricción es
+   * la clave primaria), así que en una base de desarrollo con un «Banco Andino» de otro
+   * cliente el `select … where nombre = …` devolvía el que Postgres tuviera a mano — y ese id
+   * gobierna después TODA la siembra de upgrade y, desde que existe la cuenta propia, una
+   * concesión de `lead-boutique` a una persona real.
+   *
+   * La marca es el evento `WorkspaceCreado` con `origen: 'seed'`, que escribe este mismo
+   * fichero al crear el workspace: un tenant que no salió de aquí no la tiene. Acotar por la
+   * membresía de Lucía no bastaba —esa cuenta demo puede estar invitada a un workspace ajeno
+   * que se llame igual, y entonces las dos condiciones se cumplen a la vez—.
+   */
+  const existentes = await sql`select w.id from workspace w
+    where w.nombre = 'Banco Andino'
+      and exists (select 1 from evento_dominio e
+        where e.workspace_id = w.id and e.tipo = 'WorkspaceCreado'
+          and e.payload->>'origen' = 'seed')
+    order by w.creado_en asc, w.id asc`;
   if (existentes.length > 0) {
     const wsId = existentes[0]!.id as string;
     const actualizados = await sql`update usuario
@@ -1466,8 +1530,11 @@ async function main() {
     // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía
     // (la función se auto-guarda por membresía+nombre, sin chequeo duplicado aquí).
     let segundoSembrado = false;
+    let segundoId: string | null = null;
     if (lucia) {
-      segundoSembrado = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
+      const segundo = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
+      segundoSembrado = segundo.creado;
+      segundoId = segundo.id;
     }
     // Upgrade de bases sembradas antes de los derechos de uso (SPEC-03 profunda) y del
     // pipeline AI (SPEC-08): cada función se auto-guarda por la presencia de su propio
@@ -1481,7 +1548,12 @@ async function main() {
       );
       propuestaSembrada = await sql.begin((tx) => sembrarPropuestaAI(tx, wsId, lucia.id as string));
     }
-    const adminPropio = await sembrarAdminPropio(sql);
+    // Los IDs EXACTOS que este seed acaba de resolver, no los que respondan a un nombre.
+    const adminPropio = await sembrarAdminPropio(
+      sql,
+      admin,
+      [wsId, segundoId].filter((x): x is string => x !== null),
+    );
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
         (adminPropio ? `; cuenta propia ${adminPropio}` : '') +
@@ -1523,9 +1595,9 @@ async function main() {
     await sembrarEvidenciaProfunda(tx, wsId, luciaId);
     await sembrarCadena(tx, wsId, luciaId);
     await sembrarJourney(tx, wsId, luciaId);
-    await sembrarSegundoWorkspace(tx, luciaId);
+    const segundo = await sembrarSegundoWorkspace(tx, luciaId);
     await sembrarPropuestaAI(tx, wsId, luciaId);
-    return { wsId, luciaId };
+    return { wsId, luciaId, segundoId: segundo.id };
   });
 
   // La entrega va FUERA de esa transacción porque necesita varias: la design version nace en
@@ -1533,7 +1605,7 @@ async function main() {
   // borrador y su aprobación cayeran en el mismo commit, que es justo el estado que el
   // producto no puede producir y que el guard diferido rechaza.
   await sembrarEntrega(sql, creado.wsId, creado.luciaId);
-  const adminPropio = await sembrarAdminPropio(sql);
+  const adminPropio = await sembrarAdminPropio(sql, admin, [creado.wsId, creado.segundoId]);
   if (adminPropio) console.log(`seed: cuenta propia ${adminPropio}`);
   console.log(
     `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1, item de bandeja con propuesta AI pendiente) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,

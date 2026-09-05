@@ -100,28 +100,22 @@ returns boolean language sql stable security definer set search_path = public, p
 $$;
 
 -- ── 2. El motivo que se pinta ──
-create or replace function evidencia_motivo_bloqueo(p_evidencia uuid, p_ws uuid, p_ambito text)
-returns text language sql stable security definer set search_path = public, pg_temp as $$
-  select case
-    when not is_workspace_member(app_user_id(), p_ws) then null
-    when evidencia_usable(p_evidencia, p_ws, p_ambito) then null
-    when d.evidencia_id is null then
-      'la evidencia no existe en este workspace o no tiene registro de derechos'
-    when d.estado = 'pendiente' then
-      'derechos pendientes: nadie ha registrado la base (consentimiento o cláusula) que autoriza este uso'
-    when d.estado = 'denegado' then
-      'derechos denegados: ' || d.base
-    when d.vence_en is not null and d.vence_en < fecha_de_la_base() then
-      -- `to_char` sobre un `date` no depende del huso (medido): la fecha que se imprime ya
-      -- era estable, y ahora también lo es la comparación que decide imprimirla.
-      'los derechos vencieron el ' || to_char(d.vence_en, 'YYYY-MM-DD')
-    else
-      'los derechos concedidos alcanzan solo el ámbito «' || d.ambito ||
-      '» y este uso exige «' || p_ambito || '»'
-  end
-  from (select p_evidencia as ev) param
-  left join derecho_uso d on d.evidencia_id = param.ev and d.workspace_id = p_ws
-$$;
+--
+-- Esta migración YA NO redefine `evidencia_motivo_bloqueo`, y quitarlo es el arreglo, no una
+-- omisión. Lo redefinía para cambiarle `current_date` por el calendario de la base; después,
+-- `20260904200000-la-puerta-de-membresia-fuera-del-predicado.sql` la partió en dos —la puerta
+-- de membresía por fuera y `evidencia_motivo_bloqueo_crudo` con la regla— y esa versión YA
+-- lleva el calendario correcto.
+--
+-- Dejarlo aquí no era redundante: era destructivo, y de una manera que no se ve en una base
+-- nueva. El migrador ordena por NOMBRE y se salta lo ya aplicado, así que en una base al día
+-- —dev, sin ir más lejos— este fichero corre DESPUÉS de `04200000` y su `create or replace`
+-- devolvía la función a una copia independiente de la regla. Resultado: una base nueva
+-- terminaba con el wrapper que delega y una base actualizada con la copia, y una corrección
+-- futura del predicado crudo no habría llegado igual a las dos. Reproducido antes de creerlo.
+--
+-- Por lo mismo, el nombre de este fichero pasó a ser posterior a las migraciones ya
+-- publicadas: que el orden aplicado coincida con el orden pensado en TODOS los entornos.
 
 -- ── 3. La ventana de medición ──
 create or replace function ventana_de_medicion_abierta(p_inicio date, p_dias integer)

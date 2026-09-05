@@ -1234,6 +1234,9 @@ async function sellarDentroDeTransaccion(
   ids: string[],
 ): Promise<string[]> {
   const dichos: string[] = [];
+  /** Los que se nombraron y resultaron estar borrados por acuerdo: no se sellan y NO cuentan
+   * como «sin sellar» en la comprobación final — no van a volver. */
+  const dispuestos = new Set<string>();
   for (const id of ids) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
       throw new Error(`SEED_SELLAR_WORKSPACES: «${id}» no es un uuid`);
@@ -1254,8 +1257,32 @@ async function sellarDentroDeTransaccion(
       dichos.push(`${NOMBRE_POR_CLAVE[yaEsteId.clave as string] ?? (yaEsteId.clave as string)}: ya sellado`);
       continue;
     }
-    const [ws] = await cliente`select nombre from workspace where id = ${id}`;
+    const [ws] = await cliente`select w.nombre,
+        exists (select 1 from constancia_disposicion c where c.workspace_id = w.id) as dispuesto
+      from workspace w where w.id = ${id}`;
     if (!ws) throw new Error(`SEED_SELLAR_WORKSPACES: no existe el workspace ${id}`);
+    /*
+     * Un workspace DISPUESTO por acuerdo no se sella, y sobre todo no tumba el despliegue.
+     *
+     * El borrado acordado se lleva su sello por delante —`sembrado_registro` tiene
+     * `workspace_id`, así que `tablas_alcanzadas_por_borrado()` la incluye— y deja la fila
+     * del workspace con el nombre lápida. Con la variable puesta (el runbook permite
+     * dejarla), el arranque siguiente no encontraba sello, leía «Workspace borrado por
+     * acuerdo», no lo reconocía como ninguno de los demo, lanzaba, y con `set -e` en el
+     * entrypoint la aplicación no arrancaba. Un borrado que el cliente pidió dejaba el
+     * despliegue caído.
+     *
+     * Se pregunta por la CONSTANCIA y no por el nombre. El nombre es una cadena que alguien
+     * puede escribir; la constancia es la prueba del borrado y no se borra —está en la lista
+     * de exclusiones de `tablas_alcanzadas_por_borrado()` junto al acuerdo que la sostiene—.
+     * Comparar cadenas para clasificar es el vicio que este repositorio ya pagó en el censo
+     * del calendario.
+     */
+    if (ws.dispuesto as boolean) {
+      dichos.push(`${id}: dispuesto por acuerdo, no se sella`);
+      dispuestos.add(id);
+      continue;
+    }
     const nombre = ws.nombre as string;
     const clave = Object.keys(NOMBRE_POR_CLAVE).find((k) => NOMBRE_POR_CLAVE[k] === nombre);
     if (!clave) {
@@ -1287,6 +1314,28 @@ async function sellarDentroDeTransaccion(
   const sinSellar: string[] = [];
   for (const [clave, nombre] of Object.entries(NOMBRE_POR_CLAVE)) {
     if (!(await workspaceSellado(cliente, clave))) sinSellar.push(nombre);
+  }
+  /*
+   * Si alguno de los nombrados estaba DISPUESTO, no se aborta: se dice y se sigue.
+   *
+   * La comprobación de completitud existe para atrapar una VARIABLE a medias —un solo uuid,
+   * un valor inútil como «,»—, no un borrado que el cliente pidió. Con un workspace dispuesto
+   * el conjunto no puede estar completo por definición, y tumbar el despliegue por eso sería
+   * castigar el ejercicio de un derecho.
+   *
+   * Y lo que pasa después está comprobado contra la base, porque el mensaje prometía menos de
+   * lo que ocurre: el seed sigue, no encuentra un «Clínica del Valle» vivo —el dispuesto lleva
+   * la lápida por nombre—, crea uno nuevo y lo SELLA al crearlo. Estado final medido: los dos
+   * sellos apuntando a workspaces vivos y la lápida aparte. Así que esto no anuncia una
+   * instalación coja: anuncia que el sello de ESE id no se escribe, y por qué.
+   */
+  if (dispuestos.size > 0 && sinSellar.length > 0) {
+    dichos.push(
+      `No se sella ${dispuestos.size} workspace(s) nombrado(s) en la variable: están borrados ` +
+        `por acuerdo. Falta el sello de ${sinSellar.join(' y ')}; si el seed crea su reemplazo ` +
+        'a continuación, lo sellará al crearlo.',
+    );
+    return dichos;
   }
   if (sinSellar.length > 0) {
     throw new Error(

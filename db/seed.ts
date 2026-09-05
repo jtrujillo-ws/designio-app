@@ -1212,6 +1212,27 @@ async function sellarWorkspacesIndicados(cliente: typeof sql): Promise<string[]>
   const crudo = process.env.SEED_SELLAR_WORKSPACES?.trim();
   if (!crudo) return [];
   const ids = crudo.split(',').map((x) => x.trim()).filter((x) => x.length > 0);
+  /*
+   * TODO en una transacción, y aquí no es prolijidad: los sellos se escribían en autocommit y
+   * la comprobación de completitud iba al final. Con un id bueno seguido de uno malo —un
+   * uuid inexistente, un dedazo—, el primero quedaba SELLADO Y CONFIRMADO y el segundo tiraba
+   * el seed. El operador, con el despliegue caído, quita la variable para desbloquearlo… y el
+   * despliegue siguiente se fía de ese sello a medias: `sembrarAdminPropio` concede sobre el
+   * único workspace sellado y la comprobación de «los dos» ya no corre, porque sin variable no
+   * hay nada que sellar. La instalación queda con la mitad de las membresías y con aspecto de
+   * completa, que es justo lo que esa comprobación existía para impedir.
+   *
+   * Con la transacción, un id malo revierte también los sellos que le precedían: el estado
+   * después de un fallo es el mismo de antes de intentarlo, y el operador arregla la variable
+   * en vez de heredar medio sello.
+   */
+  return cliente.begin(async (tx) => sellarDentroDeTransaccion(tx, ids));
+}
+
+async function sellarDentroDeTransaccion(
+  cliente: TransactionSql,
+  ids: string[],
+): Promise<string[]> {
   const dichos: string[] = [];
   for (const id of ids) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
@@ -1492,18 +1513,45 @@ async function sembrarAdminPropio(
      * secreto del seed. Leer y decidir por separado deja un hueco; el `where` lo cierra
      * porque la comprobación y la escritura pasan a ser la misma sentencia.
      */
-    const [activada] = await tx`update usuario
+    /*
+     * La invitación se consume ENTERA, `invitacion_origen_ws` incluido.
+     *
+     * Faltaba, y eso dejaba la identidad en un estado que el flujo normal no produce:
+     * `activar_usuario_con_token` pone a null el token, la caducidad Y el origen, los tres
+     * juntos. Con el origen puesto sobre una cuenta ya activa, la fila dice para siempre que
+     * pertenece a una invitación que ya no existe.
+     *
+     * Y la CTE no es adorno: hace falta para poder anularlo SIN perder el evento. Medido —el
+     * `RETURNING` de un `UPDATE` devuelve el valor NUEVO, no el viejo:
+     *
+     *   update … set origen = null … returning origen   →  null
+     *   with previo as (select origen … for update) …    →  43
+     *
+     * O sea que añadir `invitacion_origen_ws = null` a secas habría apagado en silencio el
+     * evento de activación —la condición de abajo nunca se cumpliría— y el historial del
+     * workspace que invitó se quedaría exactamente igual de roto que antes, pero ahora sin
+     * que nada lo delate. La CTE lee el valor bajo candado antes de escribir, y el `update`
+     * sigue viendo su `password_hash is null` en la MISMA sentencia, que es lo que cierra la
+     * carrera con una activación concurrente.
+     */
+    const [activada] = await tx`
+      with previo as (
+        select id, invitacion_origen_ws from usuario where id = ${id} for update
+      )
+      update usuario u
       set password_hash = ${hash}, estado = 'activo',
-          invitacion_token_hash = null, invitacion_expira = null, actualizado_en = now()
-      where id = ${id} and password_hash is null
-      returning invitacion_origen_ws`;
+          invitacion_token_hash = null, invitacion_expira = null,
+          invitacion_origen_ws = null, actualizado_en = now()
+      from previo p
+      where u.id = p.id and u.password_hash is null
+      returning p.invitacion_origen_ws`;
     /*
      * Y si lo que se acaba de activar era una INVITACIÓN pendiente, su evento, como lo emite
-     * `activar_usuario_con_token`. Este `update` consume la invitación —limpia el token y su
-     * caducidad— así que sin el evento el historial del workspace que invitó se queda con una
-     * invitación pendiente para siempre y una identidad activa que nada explica. La condición
-     * es `invitacion_origen_ws`: sin él no había invitación que consumir y no hay a qué
-     * workspace contárselo.
+     * `activar_usuario_con_token`. Este `update` consume la invitación —limpia el token, su
+     * caducidad y su origen— así que sin el evento el historial del workspace que invitó se
+     * queda con una invitación pendiente para siempre y una identidad activa que nada explica.
+     * La condición es el origen LEÍDO ANTES: sin él no había invitación que consumir y no hay
+     * a qué workspace contárselo.
      */
     if (activada?.invitacion_origen_ws) {
       await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
@@ -1541,12 +1589,28 @@ async function sembrarAdminPropio(
       return `${email} (cuenta lista, SIN membresías: no hay workspaces sellados por este seed en esta base; una base sembrada antes del sello no acredita cuáles son suyos)`;
     }
 
+    /*
+     * Y Lucía tiene que estar ACTIVA, no solo ser miembro.
+     *
+     * Esta consulta corre por la conexión de DUEÑO, que se salta la RLS de `miembro`, así que
+     * es el único sitio donde puede comprobarse. El flujo normal de invitación lo hace antes
+     * de mirar siquiera el rol (`exigirCuentaActiva`, y luego el rol), y por una razón que
+     * aquí pesa igual: una cuenta desactivada no da altas. Sin esto, el seed le atribuía a una
+     * Lucía desactivada la concesión de un acceso privilegiado —y ese evento es el único
+     * registro que explica de dónde salió ese miembro—.
+     *
+     * Se filtra en vez de fallar, como las otras dos ramas de este bucle: una demo con la
+     * cuenta desactivada no es una emergencia que deba tumbar el despliegue, es un dato. El
+     * workspace se queda sin conceder y la comprobación de completitud de arriba es la que
+     * dice, con su propio mensaje, que la instalación quedó a medias.
+     */
     const destinos = await tx`select w.id, w.nombre, m.usuario_id as lucia_id, m.rol as lucia_rol
       from workspace w
       join miembro m on m.workspace_id = w.id
       join usuario u2 on u2.id = m.usuario_id
       where w.id in ${tx(workspaces)}
-        and lower(u2.email) = 'lucia@whitespace.demo'`;
+        and lower(u2.email) = 'lucia@whitespace.demo'
+        and u2.estado = 'activo'`;
 
     const dichos: string[] = [];
     for (const w of destinos) {

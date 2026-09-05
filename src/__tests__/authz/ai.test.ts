@@ -4819,11 +4819,27 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    */
   it('las tres tablas del pipeline declaran el MISMO vocabulario de capacidades', async () => {
     const admin = sqlAdmin();
+    /*
+     * Por NOMBRE exacto y por tipo, no con un `like '%_capacidad_check'`. Una revisión lo
+     * señaló y tiene razón en el mecanismo: en `LIKE`, el guion bajo es un comodín de UN
+     * carácter, no un guion bajo. Medido: «xxYcapacidadZcheck» casa con ese patrón. Hoy no
+     * hay ninguna restricción que se cuele por ahí —y `conrelid in (…)` ya acotaba a las tres
+     * tablas—, pero un patrón que casa de más en una prueba cuyo trabajo es COMPARAR
+     * conjuntos es exactamente la clase de laxitud que la vuelve verde por accidente.
+     *
+     * Nombrarlas es además lo mismo que hace su migración al soltarlas: si alguien renombra
+     * una, las dos fallan a la vez y en voz alta, en vez de encontrar «cero coincidencias» y
+     * seguir. Y `contype = 'c'` porque lo que se compara son CHECK: un índice o una FK que
+     * llegara a llamarse igual no tiene `pg_get_constraintdef` comparable.
+     */
     const filas = await admin`
       select conrelid::regclass::text as tabla, pg_get_constraintdef(oid) as definicion
       from pg_constraint
-      where conrelid in ('reserva_ai'::regclass, 'llamada_ai'::regclass, 'propuesta_ai'::regclass)
-        and conname like '%_capacidad_check'`;
+      where contype = 'c'
+        and conname in ('reserva_ai_capacidad_check', 'llamada_ai_capacidad_check',
+                        'propuesta_ai_capacidad_check')
+        and conrelid in ('reserva_ai'::regclass, 'llamada_ai'::regclass,
+                         'propuesta_ai'::regclass)`;
     // Las tres, ni una menos: si una migración futura BORRA su restricción en vez de
     // rehacerla, el vocabulario deja de estar sujeto ahí y este caso pasaría sin verlo.
     expect(filas.map((f) => f.tabla as string).sort()).toEqual([

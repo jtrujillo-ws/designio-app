@@ -9,6 +9,19 @@ import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
+/*
+ * Los topes de los campos de una entrada KPI, de donde salen también los de los dos esquemas
+ * que este formulario tiene que satisfacer. Escritos aquí a mano eran una TERCERA copia, y la
+ * que se quedó atrás cuando las otras dos se unificaron: el navegador dejaba escribir 500 y el
+ * servidor rechazaba a los 300, con lo que la corrección que esta pantalla ofrece —y que ante
+ * un nombre ocupado es la única salida— quedaba inservible hasta adivinar el límite.
+ */
+import {
+  MAX_DEFINICION_KPI,
+  MAX_DIMENSIONES_KPI,
+  MAX_FUENTE_KPI,
+  MAX_NOMBRE_KPI,
+} from '@/lib/medicion/medicion.schemas';
 import { formatearCosteUsd } from '@/lib/ai/ai.degradacion';
 import {
   aceptarPropuestaAI,
@@ -2082,14 +2095,19 @@ function FormularioEntradaKpi({
       </span>
       <label style={campo}>
         <span style={etiqueta}>Nombre del KPI</span>
-        <Input required maxLength={200} value={nombre} onChange={(e) => setNombre(e.target.value)} />
+        <Input
+          required
+          maxLength={MAX_NOMBRE_KPI}
+          value={nombre}
+          onChange={(e) => setNombre(e.target.value)}
+        />
       </label>
       <label style={campo}>
         <span style={etiqueta}>Definición del cálculo</span>
         <Textarea
           required
           rows={2}
-          maxLength={2000}
+          maxLength={MAX_DEFINICION_KPI}
           value={definicion}
           onChange={(e) => setDefinicion(e.target.value)}
         />
@@ -2097,7 +2115,12 @@ function FormularioEntradaKpi({
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12 }}>
         <label style={campo}>
           <span style={etiqueta}>Fuente del dato</span>
-          <Input required maxLength={500} value={fuente} onChange={(e) => setFuente(e.target.value)} />
+          <Input
+            required
+            maxLength={MAX_FUENTE_KPI}
+            value={fuente}
+            onChange={(e) => setFuente(e.target.value)}
+          />
         </label>
         <label style={campo}>
           <span style={etiqueta}>Frecuencia</span>
@@ -2117,7 +2140,7 @@ function FormularioEntradaKpi({
       <label style={campo}>
         <span style={etiqueta}>Dimensiones (opcional)</span>
         <Input
-          maxLength={500}
+          maxLength={MAX_DIMENSIONES_KPI}
           value={dimensiones}
           onChange={(e) => setDimensiones(e.target.value)}
         />

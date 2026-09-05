@@ -115,6 +115,28 @@ export const ContenidoCriterioSchema = z.object({
 export type ContenidoCriterio = z.infer<typeof ContenidoCriterioSchema>;
 
 /**
+ * Un identificador que el modelo COPIA del material, en la forma en que lo escribe la base.
+ *
+ * `z.string().uuid()` admite los hexadecimales en mayúscula, y Postgres almacena el uuid en su
+ * forma canónica —minúscula—. Así que un id válido copiado en mayúscula pasaba la validación,
+ * pasaba el guard del insert (que compara con `lower(...)` en su alcance) y luego NO encontraba
+ * nada: el guard diferido de materialización compara el id propuesto contra el almacenado tal
+ * cual, así que cada intento de aceptar esa propuesta —por lo demás perfectamente válida— se
+ * deshacía entero. Y del lado de la aplicación pasa lo mismo sin ruido: el mapa de etiquetas y
+ * el pajar de cada cita se indexan por el id que devuelve la base, y una clave en mayúscula no
+ * acierta ninguno.
+ *
+ * Se normaliza AL PARSEAR, que es el único sitio donde se arregla una vez para todos los
+ * lectores: lo que se persiste es canónico y las comparaciones —SQL y TypeScript— vuelven a ser
+ * la misma pregunta. Los `lower(...)` de los guards se quedan: son el suelo de la base, y el
+ * suelo no depende de que la aplicación haya hecho bien su parte.
+ */
+const IdCopiadoDelMaterial = z
+  .string()
+  .uuid()
+  .transform((s) => s.toLowerCase());
+
+/**
  * CT — qué falta para un gate, con los huecos citados (RF-08.4, SPEC-08 §30).
  *
  * INFORMATIVO: aquí no hay ningún campo que describa un objeto a crear, y esa ausencia es
@@ -140,7 +162,7 @@ export const ContenidoAsistenteGateSchema = z
            * contrastar contra nada, y un hueco que señala un requisito que no existe manda a
            * quien lo lee a buscar algo que no está.
            */
-          checklistItemId: z.string().uuid(),
+          checklistItemId: IdCopiadoDelMaterial,
           queFalta: z.string().trim().min(1).max(1000),
           comoCerrarlo: z.string().trim().min(1).max(1000),
         }),
@@ -173,7 +195,7 @@ export type ContenidoAsistenteGate = z.infer<typeof ContenidoAsistenteGateSchema
  */
 const CitaDeAfirmacionSchema = z.object({
   /* La evidencia de la que sale, POR SU ID: copiado del material, no inventado. */
-  evidenciaId: z.string().uuid(),
+  evidenciaId: IdCopiadoDelMaterial,
   fragmento: z.string().trim().min(1).max(600),
   localizacion: z.string().trim().min(1).max(200),
 });
@@ -222,7 +244,7 @@ export const ContenidoInsightSchema = z
     contradicciones: z
       .array(
         z.object({
-          evidenciaId: z.string().uuid(),
+          evidenciaId: IdCopiadoDelMaterial,
           descripcion: z.string().trim().min(1).max(1000),
         }),
       )

@@ -6783,6 +6783,53 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Un uuid en MAYÚSCULA es el mismo uuid, y aceptarlo tiene que funcionar igual.
+   *
+   * `z.string().uuid()` admite el hexadecimal en mayúscula y Postgres almacena la forma
+   * canónica —minúscula—. Un id válido copiado así pasaba la validación, pasaba el guard del
+   * insert (que compara con `lower(...)` en su alcance) y luego no encontraba nada: el guard
+   * diferido compara el id propuesto contra el almacenado tal cual, así que CADA intento de
+   * aceptar esa propuesta —por lo demás perfecta— se deshacía entero, y quien revisa se
+   * encontraba una tarjeta que no se deja aceptar sin ninguna razón visible.
+   *
+   * Se comprueba el camino completo hasta el objeto materializado, y de paso el otro lado
+   * silencioso del mismo defecto: el mapa de etiquetas del panel se indexa por el id que
+   * devuelve la base, así que una clave en mayúscula tampoco acertaba ninguna.
+   */
+  it('un evidenciaId en mayúscula se acepta igual: el id se normaliza al parsear', async () => {
+    await enWorkspaceLimpio('c2-uuid-en-mayuscula', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia en mayúscula',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const gritado = ev.toUpperCase();
+      // El fixture tiene que ser el caso: si el uuid no tuviera letras, esto no probaría nada.
+      expect(gritado).not.toBe(ev);
+
+      const contenido = CONTENIDO_C2(gritado);
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      // Guardado en canónico, no como vino.
+      expect((p.contenido as ContenidoInsight).afirmaciones[0]!.citas[0]!.evidenciaId).toBe(ev);
+      // Y el panel sabe de qué documento habla la cita, que es el otro lado del mismo defecto.
+      expect(p.etiquetas[ev]).toBe('La evidencia en mayúscula');
+
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p.id,
+      });
+      const [cita] = await sqlAdmin()`select c.evidencia_id from cita c
+        join afirmacion a on a.id = c.afirmacion_id and a.workspace_id = c.workspace_id
+        where a.insight_id = ${objetoId} and a.workspace_id = ${wsC}`;
+      expect(cita!.evidencia_id).toBe(ev);
+    });
+  });
+
+  /**
    * El SELLO de procedencia no se puede escribir desde la aplicación.
    *
    * `insight.propuesta_ai_id` es lo que hace que un insight diga de qué propuesta viene

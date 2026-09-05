@@ -105,6 +105,32 @@ describeAuthz('alta de servicio (política + aislamiento)', () => {
     ).rejects.toThrow(ErrorArbol);
   });
 
+  it('dos altas simultáneas del mismo nombre dejan UN servicio: el candado serializa la comprobación', async () => {
+    const nombre = `${marca} Alta de empresa`;
+    const resultados = await Promise.allSettled([
+      crearServicio(lead, { workspaceId: wsA, nombre, descripcion: '' }),
+      crearServicio(adminCliente, {
+        workspaceId: wsA,
+        nombre: nombre.toUpperCase(),
+        descripcion: '',
+      }),
+      crearServicio(lead, { workspaceId: wsA, nombre, descripcion: 'otra vez' }),
+    ]);
+    const creados = resultados.filter((r) => r.status === 'fulfilled');
+    const rechazados = resultados.filter(
+      (r): r is PromiseRejectedResult => r.status === 'rejected',
+    );
+    expect(creados).toHaveLength(1);
+    expect(rechazados).toHaveLength(2);
+    for (const r of rechazados) expect(r.reason).toBeInstanceOf(ErrorArbol);
+    const filas = await sqlAdmin()`select id from servicio
+      where workspace_id = ${wsA} and lower(nombre) = lower(${nombre})`;
+    expect(filas).toHaveLength(1);
+    const eventos = await sqlAdmin()`select 1 from evento_dominio
+      where workspace_id = ${wsA} and tipo = 'ServicioCreado' and payload->>'nombre' ilike ${nombre}`;
+    expect(eventos).toHaveLength(1);
+  });
+
   it('un miembro de A no crea en B, y nadie firma por otro', async () => {
     await expect(
       crearServicio(lead, { workspaceId: wsB, nombre: `${marca} ajeno`, descripcion: '' }),

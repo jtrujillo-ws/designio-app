@@ -22,8 +22,18 @@ export async function crearServicio(
     // iguales: nadie sabe cuál abrir. La base no lo prohíbe (podría haber datos así de
     // antes), pero la app no fabrica uno más. La comparación ignora mayúsculas porque
     // «Apertura de cuenta» y «apertura de cuenta» tampoco se distinguen al leer.
+    //
+    // La comprobación va detrás de un candado por (workspace, nombre normalizado) que dura la
+    // transacción: sin él, dos altas simultáneas del mismo nombre pasan las dos el SELECT
+    // antes de que ninguna inserte, y nacen dos servicios y dos eventos. No es un índice
+    // único porque la historia puede traer duplicados de antes de esta regla y una migración
+    // que no pudiera crearlo dejaría la regla sin dueño; el candado gobierna lo que la app
+    // crea desde hoy, que es exactamente lo que esta función promete.
+    await tx`select pg_advisory_xact_lock(
+      hashtext(${entrada.workspaceId}::text || ':' || lower(${entrada.nombre})))`;
     const [repetido] = await tx`select 1 from servicio
-      where workspace_id = ${entrada.workspaceId} and lower(nombre) = lower(${entrada.nombre})`;
+      where workspace_id = ${entrada.workspaceId} and lower(nombre) = lower(${entrada.nombre})
+      limit 1`;
     if (repetido) throw new ErrorArbol('Ya hay un servicio con ese nombre en este workspace');
 
     // UNA sentencia: servicio + evento comparten snapshot, y el rol auditado es el que

@@ -2,9 +2,13 @@ import '@/lib/server-only';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import {
+  gatesQueEsperanAprobador,
+  otrosPendientesDelRol,
+} from '@/lib/aprobaciones/aprobaciones.queries';
+import { contarPendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
 import { proyectoActualDe } from './loop-estado';
 import type {
-  AprobacionPendiente,
   EntregaPendiente,
   GatesDeProyecto,
   MetricasDelReto,
@@ -95,39 +99,17 @@ export async function resumenParaUsuario(
         reviewCompletado: f.review_completado as boolean,
       }));
 
-      // Gate ABIERTO (el primero pendiente de su proyecto) con el checklist entero decidido y
-      // no vacío: dejó de ser trabajo y espera a su aprobador. Un checklist vacío no es
-      // suficiencia (mismo criterio que el guard de la base), así que no cuenta. Cada fila
-      // dice además si el aprobador es QUIEN MIRA: la pantalla del proyecto solo deja aprobar
-      // cuando el rol coincide, y «Te toca a ti» no puede contar como propia una aprobación
-      // que espera al sponsor.
-      const filasAprobaciones = await tx`
-        select g.id, g.numero, g.rol_aprobador, p.id as proyecto_id, p.codigo as proyecto_codigo,
-          r.codigo as reto_codigo,
-          g.rol_aprobador = workspace_role(${actorId}, ${workspaceId}) as es_mia
-        from gate_instancia g
-        join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
-        join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id
-        where g.workspace_id = ${workspaceId}
-          and g.estado = 'pendiente'
-          and g.numero = (select min(g2.numero) from gate_instancia g2
-            where g2.proyecto_id = g.proyecto_id and g2.workspace_id = g.workspace_id
-              and g2.estado = 'pendiente')
-          and exists (select 1 from checklist_item ci
-            where ci.gate_id = g.id and ci.workspace_id = g.workspace_id)
-          and not exists (select 1 from checklist_item ci
-            where ci.gate_id = g.id and ci.workspace_id = g.workspace_id
-              and ci.estado = 'pendiente')
-        order by r.codigo, r.id, p.codigo, p.id, g.numero`;
-      const aprobaciones: AprobacionPendiente[] = filasAprobaciones.map((f) => ({
-        gateId: f.id as string,
-        numero: f.numero as number,
-        rolAprobador: f.rol_aprobador as AprobacionPendiente['rolAprobador'],
-        esMia: (f.es_mia as boolean | null) === true,
-        proyectoId: f.proyecto_id as string,
-        proyectoCodigo: f.proyecto_codigo as string,
-        retoCodigo: f.reto_codigo as string,
-      }));
+      // Gates abiertos con el checklist decidido: TODOS, con la marca de si esperan a quien
+      // mira («Te toca a ti» nombra también los que esperan a otro rol). La consulta vive en
+      // el módulo de aprobaciones, que es su otro lector: una sola redacción del predicado.
+      const aprobaciones = await gatesQueEsperanAprobador(tx, actorId, workspaceId);
+      // Y el conteo de TODO lo que el rol de quien mira puede decidir ahora (gates propios,
+      // derechos, insights, design versions): el contador del lateral bebe de aquí, la
+      // pantalla de aprobaciones lee las filas con la misma fuente.
+      const pendientesDelRol = contarPendientes({
+        gates: aprobaciones.filter((a) => a.esMia),
+        ...(await otrosPendientesDelRol(tx, actorId, workspaceId)),
+      });
 
       // El release más avanzado del servicio: uno que ya salió antes que uno planificado, y
       // entre los que salieron, el último. Los días vivos los cuenta el calendario de la
@@ -256,6 +238,7 @@ export async function resumenParaUsuario(
         importacionPendientes: base!.importacion_pendientes as number,
         proyectos,
         aprobaciones,
+        pendientesDelRol,
         release,
         metricas,
         entregas,

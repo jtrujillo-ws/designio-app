@@ -1180,6 +1180,70 @@ async function sembrarPropuestaAI(
 const CLAVE_WS_PRIMARIO = 'workspace:banco-andino';
 const CLAVE_WS_SEGUNDO = 'workspace:clinica-del-valle';
 
+/** El nombre que lleva cada workspace sembrado, por su clave de sello. */
+const NOMBRE_POR_CLAVE: Record<string, string> = {
+  [CLAVE_WS_PRIMARIO]: 'Banco Andino',
+  [CLAVE_WS_SEGUNDO]: 'Clínica del Valle',
+};
+
+/**
+ * El camino de SUBIDA para una base sembrada antes de que existieran los sellos.
+ *
+ * Sin él, encender `SEED_ADMIN_EMAIL` en una base así crea la cuenta y la deja sin las dos
+ * membresías que el runbook promete — y ése no es un caso raro: es el camino normal de
+ * cualquier entorno que ya estuviera desplegado, incluido el nuestro. Lo señaló una revisión.
+ *
+ * Y no se resuelve adoptando por forma. Sellar «el único Banco Andino que tenga a Lucía» sería
+ * meter una INFERENCIA en el sitio infalsificable, que es justo lo que
+ * `…300000-la-procedencia-del-sembrado-no-la-escribe-la-app.sql` se negó a hacer al no migrar
+ * el marcador viejo. Con dos homónimos la inferencia además elige, y elige mal la mitad de las
+ * veces.
+ *
+ * Lo resuelve quien SÍ sabe: la persona que opera el despliegue enumera los ids en
+ * `SEED_SELLAR_WORKSPACES`. No afloja nada — esa persona ya tiene el DSN administrativo, así
+ * que su palabra vale exactamente lo que vale la del propio seed—, y a cambio la afirmación
+ * queda escrita donde la aplicación no escribe.
+ *
+ * Lo que el seed sí comprueba antes de sellar, porque puede: que el workspace exista, que se
+ * llame como el que dice ser, y que no haya ya un sello de esa clave apuntando a otro. Un
+ * error de dedo en la variable falla ruidosamente en vez de sellar el tenant equivocado.
+ */
+async function sellarWorkspacesIndicados(cliente: typeof sql): Promise<string[]> {
+  const crudo = process.env.SEED_SELLAR_WORKSPACES?.trim();
+  if (!crudo) return [];
+  const ids = crudo.split(',').map((x) => x.trim()).filter((x) => x.length > 0);
+  const dichos: string[] = [];
+  for (const id of ids) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      throw new Error(`SEED_SELLAR_WORKSPACES: «${id}» no es un uuid`);
+    }
+    const [ws] = await cliente`select nombre from workspace where id = ${id}`;
+    if (!ws) throw new Error(`SEED_SELLAR_WORKSPACES: no existe el workspace ${id}`);
+    const nombre = ws.nombre as string;
+    const clave = Object.keys(NOMBRE_POR_CLAVE).find((k) => NOMBRE_POR_CLAVE[k] === nombre);
+    if (!clave) {
+      throw new Error(
+        `SEED_SELLAR_WORKSPACES: el workspace ${id} se llama «${nombre}», que no es ninguno de los que siembra este seed`,
+      );
+    }
+    const yaSellado = await workspaceSellado(cliente, clave);
+    if (yaSellado && yaSellado !== id) {
+      throw new Error(
+        `SEED_SELLAR_WORKSPACES: «${nombre}» ya está sellado y apunta a ${yaSellado}; sellar ${id} encima cambiaría de tenant en silencio`,
+      );
+    }
+    if (yaSellado === id) {
+      dichos.push(`${nombre}: ya sellado`);
+      continue;
+    }
+    await cliente`insert into sembrado_registro (workspace_id, clave, payload)
+      values (${id}, ${clave}, ${cliente.json({ nombre, origen: 'SEED_SELLAR_WORKSPACES' })})
+      on conflict (workspace_id, clave) do nothing`;
+    dichos.push(`${nombre}: sellado`);
+  }
+  return dichos;
+}
+
 /** El workspace que ESTE seed creó bajo esa clave, o null si no consta. */
 async function workspaceSellado(
   cliente: typeof sql | TransactionSql,
@@ -1527,6 +1591,9 @@ async function main() {
   // Validado al final, un despliegue limpio con el correo mal escrito creaba los dos
   // workspaces y las tres cuentas demo enteros y salía con error después.
   const admin = leerAdminPropio();
+  // Y el camino de subida, antes de resolver nada: una base sembrada sin sellos los recibe
+  // aquí, de quien opera el despliegue, para que el resto de la corrida ya los encuentre.
+  const sellados = await sellarWorkspacesIndicados(sql);
   const hash = await bcrypt.hash(PASSWORD_DEMO, 10);
 
   /*
@@ -1629,6 +1696,7 @@ async function main() {
     );
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
+        (sellados.length > 0 ? `; sellos: ${sellados.join(', ')}` : '') +
         (adminPropio ? `; cuenta propia ${adminPropio}` : '') +
         (arbolSembrado ? '; árbol R-01/R-02/R-03 + P-01 sembrado' : '') +
         (metodoSembrado ? '; método de P-01 sembrado' : '') +
@@ -1684,6 +1752,7 @@ async function main() {
   // producto no puede producir y que el guard diferido rechaza.
   await sembrarEntrega(sql, creado.wsId, creado.luciaId);
   const adminPropio = await sembrarAdminPropio(sql, admin, [creado.wsId, creado.segundoId]);
+  if (sellados.length > 0) console.log(`seed: sellos: ${sellados.join(', ')}`);
   if (adminPropio) console.log(`seed: cuenta propia ${adminPropio}`);
   console.log(
     `seed: workspace Banco Andino creado (3 usuarios activos, 3 segmentos, árbol R-01/R-02/R-03 + P-01, método G0-G7, 3 evidencias curadas con derechos —una sin consentimiento, bloqueada a propósito—, journey as-is y to-be, DV-1 con RL-1/RL-2 y ES-1, item de bandeja con propuesta AI pendiente) + Clínica del Valle para el selector — login demo: lucia@whitespace.demo / ${PASSWORD_DEMO}`,

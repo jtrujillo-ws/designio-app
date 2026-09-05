@@ -527,7 +527,33 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
            join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
            where a.reto_id = r.id and a.workspace_id = r.workspace_id
              and evidencia_usable(e.id, e.workspace_id, 'cliente')) x)
-      else '[]'::json end as reto_evidencia`,
+      else '[]'::json end as reto_evidencia,
+      -- Y los NOMBRES, que son otra pregunta y no admiten el mismo filtro.
+      --
+      -- Las etiquetas salían de la lista de arriba, que es la del MATERIAL y por eso está
+      -- filtrada por «evidencia_usable(…, 'cliente')». Para las citas cuadra de casualidad;
+      -- para las CONTRADICCIONES no, y ahí decía algo falso: «evidencia_citable_guard» cuelga
+      -- de «cita» y no de «contradiccion» —a propósito, porque una cita REPRODUCE un fragmento
+      -- para el cliente y una contradicción solo señala que ese documento va en contra—, así
+      -- que a una evidencia contradicha se le pueden retirar los derechos de cita y la
+      -- contradicción se sigue pudiendo materializar. Medido: la propuesta seguía
+      -- «disponible», aceptar FUNCIONABA, y la pantalla decía «ya no está» del documento que
+      -- quien revisa tenía delante y estaba a punto de sellar.
+      --
+      -- Identidad y permiso de cita son cosas distintas, así que se preguntan por separado. El
+      -- alcance sigue siendo el mismo —la evidencia de ESTE reto por sus arquetipos, dentro del
+      -- workspace y bajo las mismas políticas—: lo único que se cae es el filtro de derechos,
+      -- que aquí no pinta nada.
+      case when p.capacidad = 'C2' then
+        (select coalesce(json_agg(json_build_object('id', y.id, 'titulo', y.titulo)
+                  order by y.titulo, y.id), '[]'::json)
+         from (
+           select distinct e.id, e.titulo
+           from arquetipo a
+           join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+           join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+           where a.reto_id = r.id and a.workspace_id = r.workspace_id) y)
+      else '[]'::json end as reto_evidencia_nombres`,
   },
   gate_id: {
     // DOS joins: el gate y su proyecto. El proyecto no es adorno — es lo que distingue
@@ -1150,10 +1176,17 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      * «no aparece», pero se resuelve igual —ausente—, porque una cita a un documento que el
      * modelo no vio no la sostiene nada.
      */
-    /** El título de cada evidencia, para que una cita diga de QUÉ documento sale. */
+    /**
+     * El título de cada evidencia, para que una cita —o una contradicción— diga de QUÉ
+     * documento habla. Sale de la lista de NOMBRES, no de la del material: los derechos de
+     * cita no gobiernan la identidad de un documento, y una contradicción no los necesita.
+     */
     etiquetasDelContenido: (f) =>
       Object.fromEntries(
-        ((f.reto_evidencia as EvidenciaDelReto | null) ?? []).map((e) => [e.id, e.titulo]),
+        ((f.reto_evidencia_nombres as { id: string; titulo: string }[] | null) ?? []).map((e) => [
+          e.id,
+          e.titulo,
+        ]),
       ),
     pajarDeLaCita: (f, cita) => {
       const evidencia = (f.reto_evidencia as EvidenciaDelReto | null) ?? [];

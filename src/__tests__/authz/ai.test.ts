@@ -7557,6 +7557,86 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * El NOMBRE de un documento no lo gobiernan los derechos de cita.
+   *
+   * Las etiquetas del contenido salían de la lista del MATERIAL, que está filtrada por
+   * `evidencia_usable(…, 'cliente')` porque es lo que viaja al modelo. Para las citas cuadra
+   * de casualidad. Para las CONTRADICCIONES no, y ahí la pantalla decía algo falso.
+   *
+   * El suelo lo dice claro: `evidencia_citable_guard` cuelga de `cita` y NO de
+   * `contradiccion`, y es a propósito — una cita reproduce un fragmento para el cliente y una
+   * contradicción solo señala que ese documento va en contra, así que no piden el mismo
+   * permiso. Medido sobre una evidencia solo contradicha a la que se le retiran los derechos:
+   * la propuesta sigue `disponible`, aceptar FUNCIONA y materializa la contradicción… y la
+   * etiqueta venía AUSENTE, así que quien revisa leía «ya no está» del documento que tenía
+   * delante y estaba a punto de sellar. Justo en el momento de decidir.
+   *
+   * Identidad y permiso de cita son preguntas distintas y ahora se hacen por separado. El
+   * alcance no se toca —la evidencia de ESTE reto por sus arquetipos, bajo las mismas
+   * políticas—: lo único que se cae es el filtro de derechos, que en una etiqueta no pinta
+   * nada. De paso mejora también el caso de la cita: cuando a un documento citado se le
+   * retiran los derechos, quien revisa ve QUÉ documento perdió el permiso en vez de un id.
+   */
+  it('la etiqueta de una evidencia contradicha sobrevive a la pérdida de derechos', async () => {
+    await enWorkspaceLimpio('c2-etiqueta-contradiccion', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const a = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const b = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Encuesta que dice lo contrario',
+        resumen: 'Quien contesta dice que el problema es el precio.',
+      });
+      const contenido: ContenidoInsight = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId: a, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones: [{ evidenciaId: b, descripcion: 'Esta va en contra' }],
+        confianzaPropuesta: 'media',
+      };
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      // Recién nacida, las dos etiquetas están: sin esto, el caso podría estar pasando porque
+      // el fixture nunca las tuvo.
+      const recien = await panelPropuestas(curadorId, wsC);
+      expect(recien.pendientes.find((x) => x.capacidad === 'C2')!.etiquetas[b]).toBe(
+        'Encuesta que dice lo contrario',
+      );
+
+      // A la evidencia SOLO contradicha —no citada— se le retiran los derechos de cita.
+      await admin`update derecho_uso
+        set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+            decidido_por = ${curadorId}, decidido_en = now()
+        where evidencia_id = ${b} and workspace_id = ${wsC}`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      expect(
+        p.etiquetas[b],
+        'la pantalla dice «ya no está» de un documento que existe y se va a sellar',
+      ).toBe('Encuesta que dice lo contrario');
+      // Y la propuesta sigue siendo aceptable, que es lo que hace que la etiqueta importe: la
+      // cita apunta a `a`, que conserva sus derechos, y la contradicción no los necesita.
+      expect(p.anclaEstado).toBe('disponible');
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p.id,
+      });
+      const [c] = await admin`select evidencia_id from contradiccion where insight_id = ${objetoId}`;
+      expect(c!.evidencia_id).toBe(b);
+    });
+  });
+
+  /**
    * Y el derecho de uso se vuelve a preguntar en el COMMIT, no solo al insertar la cita.
    *
    * `evidencia_citable_guard` lo exige al insertar cada cita, y ahí lo lee en el snapshot de SU

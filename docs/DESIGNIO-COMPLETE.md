@@ -188,8 +188,11 @@ flowchart LR
   class DE,DV,OR frozen
 ```
 
-Toda arista de esa cadena existe hoy en la base como tabla o columna, y cada eslabón está protegido
-por una política RLS y un guard: un insight solo se valida con citas a evidencia con **derechos
+Las aristas de esa cadena hasta el effective state existen hoy en la base como tablas o columnas
+con FK; el tramo effective state → snapshots **no** es una FK: los snapshots cuelgan de la entrada
+KPI y, a través de ella, del criterio de éxito, y su relación con los releases es temporal (por
+fechas), todavía sin marcas de release sobre la serie (ver `09`). Cada eslabón está protegido por
+una política RLS y un guard: un insight solo se valida con citas a evidencia con **derechos
 vigentes**; una decisión solo enlaza insights **validados**; una design version se **congela** al
 aprobarse junto al snapshot de su journey; un release declara **exactamente** qué elementos
 incluye; una desviación exige **razón**; G7 no pasa con elementos en estado desconocido; y el
@@ -680,8 +683,9 @@ módulo aparte (ADR-0007).
   que el botón no se ofrece cuando la base lo va a rechazar, y no se esconde cuando sí procedía.
 - **G5 certifica vigencia, no existencia**: si un derecho venció entre enlazar y aprobar, G5 no pasa.
 - **G6** exige el Metric Registry firmado (o el flag explícito `aprobado_sin_registry`) y pasa el
-  proyecto a `en-implementacion`. **G7** pasa reto y proyecto a `en-medicion` y exige conciliación
-  completa. Los gates de un proyecto que ya firmó G6 o G7 no se reevalúan: el ciclo siguiente va en
+  proyecto a `en-implementacion`. **G7** exige conciliación
+  completa; aprobarlo cierra el gate y su etapa, y es un acto posterior del lead, **abrir la
+  medición** (ver `09`), el que pasa reto y proyectos a `en-medicion` y exige G7 aprobado. Los gates de un proyecto que ya firmó G6 o G7 no se reevalúan: el ciclo siguiente va en
   otro proyecto.
 - El **asistente de gates (CT)** informa qué falta citando los ítems del checklist por su id; es
   informativo y **no puede aprobar** (RF-08.4, SYS-18).
@@ -699,7 +703,8 @@ módulo aparte (ADR-0007).
 
 ## Portal en el proyecto
 
-Cada gate, decisión y el propio proyecto admiten **hilos de comentarios** (ver `12`).
+El proyecto y cada gate admiten **hilos de comentarios** (ver `12`); las decisiones no son ancla de
+hilos, ni en el modelo ni en la pantalla.
 
 ## Medición dentro del proyecto
 
@@ -1350,7 +1355,7 @@ alcanzado del catálogo de Postgres.
 | Objeto | Estados |
 |---|---|
 | Reto | `candidato` → `activo` → `en-medicion` → `cerrado` (con veredicto) · `archivado` |
-| Proyecto | `activo` ↔ `pausado` → `en-implementacion` (G6) → `en-medicion` (G7) → `cerrado` |
+| Proyecto | `activo` ↔ `pausado` → `en-implementacion` (al aprobar G6) → `en-medicion` (al abrir la medición, que exige G7) → `cerrado` (al completar el outcome review) |
 | Design version | `borrador` → `aprobada` → `superada` |
 | Release | `planificado` → `desplegado` → `verificado` |
 | Insight | `propuesto` → `validado` (sin estado de descarte) |
@@ -1662,8 +1667,11 @@ clustering avanzado; modelos estadísticos de atribución; simulaciones masivas 
 | `exportacion` | — | `exportarWorkspaceFn` |
 | `disposicion` | `panelDisposicionFn`, `misConstanciasFn` | `registrarAcuerdoFn`, `ejecutarDisposicionFn` |
 
-Todas exigen sesión; las mutaciones devuelven `{ ok: true, … }` o `{ ok: false, error }` con el
-motivo traducido de la base.
+Todas exigen sesión salvo las cuatro públicas del acceso, que por definición corren sin ella:
+`iniciarSesion` (autentica credenciales), `establecerPassword` (activa un token de invitación),
+`cerrarSesion` (borra la cookie aunque no exista) y `usuarioActual` (devuelve `null` sin sesión).
+Las mutaciones devuelven `{ ok: true, … }` o `{ ok: false, error }` con el motivo traducido de la
+base.
 
 ---
 

@@ -6,6 +6,7 @@ import {
   conteoPorEstado,
   destinoDeArquetipo,
   nombreYaUsado,
+  plural,
   puedeEditarSegmentos,
   resumenDeCobertura,
   type ArquetipoDeSegmento,
@@ -55,6 +56,26 @@ describe('lo que el alta y la edición aceptan', () => {
     ).toBe(false);
   });
 
+  it('rechaza controles bidireccionales y caracteres de control: dos nombres que se pintan igual no son dos', () => {
+    for (const nombre of [
+      'pymes\u202E',
+      '\u200Fpymes',
+      'py\u0000mes',
+      'pymes\u001F',
+      'pym\u0085es',
+    ]) {
+      const r = CrearSegmentoSchema.safeParse({ workspaceId: ws, nombre });
+      expect(r.success).toBe(false);
+      if (!r.success) {
+        expect(r.error.issues[0]!.message).toMatch(/caracteres de control/);
+      }
+    }
+    // Los acentos, la ñ y los espacios interiores son texto normal: entran.
+    expect(
+      CrearSegmentoSchema.safeParse({ workspaceId: ws, nombre: 'pequeñas empresas' }).success,
+    ).toBe(true);
+  });
+
   it('editar exige el id del segmento además de los mismos campos', () => {
     expect(EditarSegmentoSchema.safeParse({ workspaceId: ws, nombre: 'pymes' }).success).toBe(
       false,
@@ -62,6 +83,14 @@ describe('lo que el alta y la edición aceptan', () => {
     expect(
       EditarSegmentoSchema.safeParse({ workspaceId: ws, segmentoId: seg, nombre: 'pymes' }).success,
     ).toBe(true);
+  });
+});
+
+describe('el plural', () => {
+  it('concuerda el sustantivo con el número', () => {
+    expect(plural(0, 'segmento', 'segmentos')).toBe('0 segmentos');
+    expect(plural(1, 'segmento', 'segmentos')).toBe('1 segmento');
+    expect(plural(2, 'segmento', 'segmentos')).toBe('2 segmentos');
   });
 });
 

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { Destino } from '@/lib/destinos';
+import { tieneBidiOControles } from '@/lib/evidencia/sanitizacion';
 
 /**
  * Segmentos transversales del cliente (RF-01.7, prediseño §4.1): la clasificación ESTABLE
@@ -11,11 +12,11 @@ import type { Destino } from '@/lib/destinos';
 
 /**
  * Quiénes definen y editan segmentos: el lead de la boutique, que opera el workspace, y el
- * admin del cliente, que es dueño de su taxonomía. La política `segmento_todo` de la base
- * deja escribir a CUALQUIER miembro (es de las primeras del esquema, anterior a los roles
- * finos), así que la restricción de negocio vive en el servicio como capa 2 — igual que en
- * curaduría, donde la pantalla solo ofrece el control y el servidor lo re-valida. Un
- * diseñador o un sponsor pueden leerlos y referenciarlos, no reescribir la taxonomía con
+ * admin del cliente, que es dueño de su taxonomía. La AUTORIDAD son las políticas
+ * `segmento_insert` / `segmento_update` de la base (migración 20260905110000); esta lista es
+ * su espejo, compartido entre la pantalla —que solo ofrece el control a estos roles— y el
+ * re-check del servicio, que da un mensaje claro antes de que la política rechace en seco.
+ * Un diseñador o un sponsor pueden leerlos y referenciarlos, no reescribir la taxonomía con
  * la que el cliente mide.
  */
 export const ROLES_EDITAN_SEGMENTOS = ['lead-boutique', 'admin-cliente'] as const;
@@ -28,11 +29,18 @@ export function puedeEditarSegmentos(rol: string): boolean {
 export const SegmentosInputSchema = z.object({ workspaceId: z.string().uuid() });
 
 // Los mismos límites que un servicio: un nombre es un rótulo, una definición es un párrafo.
+// Sin controles bidireccionales ni caracteres de control: con un override BIDI dos
+// segmentos distintos se pintan iguales y la unicidad por `lower()` no los distingue, y un
+// nombre que se lee distinto de lo guardado es exactamente lo que un eje de medición no
+// puede ser. Mismo predicado que rechaza el material importado.
 const NombreSchema = z
   .string()
   .trim()
   .min(1, 'El nombre es obligatorio')
-  .max(120, 'Máximo 120 caracteres');
+  .max(120, 'Máximo 120 caracteres')
+  .refine((n) => !tieneBidiOControles(n), {
+    message: 'El nombre no puede llevar caracteres de control ni controles bidireccionales',
+  });
 const DefinicionSchema = z.string().trim().max(2000, 'Máximo 2000 caracteres').default('');
 
 export const CrearSegmentoSchema = z.object({
@@ -75,6 +83,7 @@ export type SegmentoConCobertura = {
   id: string;
   nombre: string;
   definicion: string;
+  /** Fecha de alta (YYYY-MM-DD): la lista va en este orden, y la fecha lo hace visible. */
   creadoEn: string;
   arquetipos: ArquetipoDeSegmento[];
   evidencias: number;
@@ -89,7 +98,8 @@ export function conteoPorEstado(
   return conteo;
 }
 
-function plural(n: number, singular: string, plural: string): string {
+/** «1 segmento», «2 segmentos»: el número y su sustantivo, concordados. */
+export function plural(n: number, singular: string, plural: string): string {
   return `${n} ${n === 1 ? singular : plural}`;
 }
 

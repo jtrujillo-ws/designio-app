@@ -3,15 +3,17 @@ import { cerrarPools, conUsuario, sql, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { listarSegmentos, segmentosParaUsuario } from '@/lib/segmento/segmento.queries';
 import { crearSegmento, editarSegmento, ErrorSegmento } from '@/lib/segmento/segmento.servicio';
-import { describeAuthz } from './helpers';
+import { describeAuthz, enVuelo, sigueEsperando } from './helpers';
 
 /**
  * RF-01.7 — los segmentos se listan con su cobertura (arquetipos por estado, con el
  * proyecto de su reto, y evidencias que los citan) respetando RLS (SYS-01/02); la capa 2
  * excluye a la cuenta desactivada; un miembro de A no ve ni escribe en B; solo el lead o el
- * admin del cliente crean y editan (la política de la base deja a cualquier miembro: la
- * regla vive en el servicio); el nombre no se repite en el workspace; y cada escritura deja
- * su evento con el rol que la autorizó.
+ * admin del cliente crean y editan —la autoridad son las políticas `segmento_insert` /
+ * `segmento_update`, y el servicio solo pone el mensaje—; nadie del rol de aplicación borra
+ * ni mueve un segmento de workspace; el nombre no se repite en el workspace; dos ediciones
+ * concurrentes dejan la auditoría encadenada; y cada escritura deja su evento con el rol que
+ * la autorizó.
  */
 describeAuthz('segmentos (cobertura + aislamiento + quién edita)', () => {
   const marca = `seg-${crypto.randomUUID().slice(0, 8)}`;
@@ -261,8 +263,7 @@ describeAuthz('segmentos (cobertura + aislamiento + quién edita)', () => {
     expect(filas).toHaveLength(1);
   });
 
-  it('el diseñador lee, pero no crea ni edita: la regla vive en el servicio, no en la política', async () => {
-    // La política `segmento_todo` dejaría pasar el insert directo de cualquier miembro…
+  it('el diseñador lee, pero no crea ni edita: el servicio lo dice claro y la política lo impide', async () => {
     const [n0] =
       await sqlAdmin()`select count(*)::int as n from segmento where workspace_id = ${wsA}`;
     await expect(
@@ -280,7 +281,7 @@ describeAuthz('segmentos (cobertura + aislamiento + quién edita)', () => {
         definicion: '',
       }),
     ).rejects.toThrow(ErrorSegmento);
-    // …y por eso el servicio corta ANTES de tocar nada: ni fila ni evento.
+    // El servicio corta ANTES de tocar nada: ni fila ni evento.
     const [n1] =
       await sqlAdmin()`select count(*)::int as n from segmento where workspace_id = ${wsA}`;
     expect(n1!.n).toBe(n0!.n);
@@ -289,6 +290,82 @@ describeAuthz('segmentos (cobertura + aislamiento + quién edita)', () => {
     const eventos = await sqlAdmin()`select 1 from evento_dominio
       where workspace_id = ${wsA} and actor_id = ${disenador}`;
     expect(eventos).toHaveLength(0);
+  });
+
+  it('y por SQL directo bajo su contexto RLS tampoco: la autoridad es la política, no el TypeScript', async () => {
+    // Insert: la política `segmento_insert` lo rechaza (42501, «policy»).
+    await expect(
+      conUsuario(
+        disenador,
+        (tx) =>
+          tx`insert into segmento (workspace_id, nombre) values (${wsA}, ${marca + ' por SQL'})`,
+      ),
+    ).rejects.toThrow(/policy|permiso/i);
+    // Update: el USING de `segmento_update` no le enseña filas que actualizar (0 filas, sin
+    // filtrar existencia).
+    const upd = await conUsuario(
+      disenador,
+      (tx) =>
+        tx`update segmento set nombre = ${marca + ' alterado por SQL'} where id = ${segPymes}`,
+    );
+    expect(upd.count).toBe(0);
+    // Delete: nadie del rol de aplicación tiene DELETE, ni siquiera el lead.
+    for (const quien of [disenador, lead]) {
+      await expect(
+        conUsuario(quien, (tx) => tx`delete from segmento where id = ${segPymes}`),
+      ).rejects.toThrow(/permission denied|permiso/i);
+    }
+    // Y el lead, que sí edita, no puede MOVER un segmento a otro workspace ni fecharlo:
+    // `workspace_id` y `creado_en` no están en el grant de UPDATE.
+    await expect(
+      conUsuario(
+        lead,
+        (tx) => tx`update segmento set workspace_id = ${wsB} where id = ${segPymes}`,
+      ),
+    ).rejects.toThrow(/permission denied|permiso/i);
+    await expect(
+      conUsuario(
+        lead,
+        (tx) => tx`update segmento set creado_en = '2020-01-01' where id = ${segPymes}`,
+      ),
+    ).rejects.toThrow(/permission denied|permiso/i);
+    const [fila] =
+      await sqlAdmin()`select nombre, workspace_id from segmento where id = ${segPymes}`;
+    expect(fila!.nombre).not.toBe(`${marca} alterado por SQL`);
+    expect(fila!.workspace_id).toBe(wsA);
+  });
+
+  it('dos ediciones concurrentes del mismo segmento dejan la auditoría encadenada: old => n1 | n1 => n2', async () => {
+    // La primera edición está EN VUELO (tiene la fila bloqueada, aún sin confirmar) cuando
+    // llega la segunda. Sin `for update` en la lectura del nombre anterior, la segunda leería
+    // el nombre viejo y lo registraría como «anterior» de un cambio que en realidad partió
+    // de n1: la cadena quedaría old => n1 | old => n2.
+    const [antes] = await sqlAdmin()`select nombre from segmento where id = ${segPymes}`;
+    const old = antes!.nombre as string;
+    const n1 = `${marca} pymes (primera edición)`;
+    const n2 = `${marca} pymes (segunda edición)`;
+
+    const primera = await enVuelo(async (tx) => {
+      await tx`update segmento set nombre = ${n1} where id = ${segPymes}`;
+    });
+    const segunda = editarSegmento(lead, {
+      workspaceId: wsA,
+      segmentoId: segPymes,
+      nombre: n2,
+      definicion: 'tras la primera',
+    });
+    expect(await sigueEsperando(segunda)).toBe(true);
+
+    await primera.cerrar();
+    await segunda;
+
+    const [fila] = await sqlAdmin()`select nombre from segmento where id = ${segPymes}`;
+    expect(fila!.nombre).toBe(n2);
+    const eventos = await sqlAdmin()`select payload from evento_dominio
+      where workspace_id = ${wsA} and tipo = 'SegmentoEditado' and payload->>'nombre' = ${n2}`;
+    expect(eventos).toHaveLength(1);
+    expect(eventos[0]!.payload).toEqual({ segmentoId: segPymes, nombre: n2, nombreAnterior: n1 });
+    expect((eventos[0]!.payload as { nombreAnterior: string }).nombreAnterior).not.toBe(old);
   });
 
   it('editar un segmento que no existe en el workspace falla con mensaje, sin evento', async () => {

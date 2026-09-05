@@ -17,6 +17,7 @@ import {
   ETIQUETA_ESTADO_ARQUETIPO,
   destinoDeArquetipo,
   nombreYaUsado,
+  plural,
   puedeEditarSegmentos,
   resumenDeCobertura,
   type ArquetipoDeSegmento,
@@ -135,7 +136,7 @@ function PantallaSegmentos() {
               </span>
             )}
             <div style={{ ...etiqueta, paddingTop: 6 }}>
-              {datos.segmentos.length} segmentos del workspace
+              {plural(datos.segmentos.length, 'segmento', 'segmentos')} del workspace
             </div>
             {datos.segmentos.length === 0 && (
               <Card pending style={{ padding: 24 }}>
@@ -228,6 +229,10 @@ function TarjetaSegmento({
         }}
       >
         {segmento.definicion || 'Sin definición todavía'}
+      </span>
+      {/* La lista va en orden de alta; la fecha es lo que hace visible ese orden. */}
+      <span style={{ font: '500 11px var(--font-mono)', color: 'var(--text-faint)' }}>
+        definido el {segmento.creadoEn}
       </span>
       {segmento.arquetipos.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 4 }}>

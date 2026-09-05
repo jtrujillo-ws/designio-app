@@ -8,20 +8,25 @@ import { puedeEditarSegmentos, type CrearSegmento, type EditarSegmento } from '.
  * Escrituras sobre la taxonomía del cliente (RF-01.7): dar de alta un segmento y editar su
  * nombre o definición.
  *
- * Capa 1: la política `segmento_todo` — membresía, nada más. Capa 2, y aquí vive la regla
- * de negocio: estado de cuenta, el ROL que puede reescribir la taxonomía (lead o admin del
- * cliente; ver ROLES_EDITAN_SEGMENTOS), y el nombre único por workspace. Cada escritura deja
+ * Capa 1: las políticas `segmento_insert` / `segmento_update` de la base — solo el lead o el
+ * admin del cliente escriben, y solo nombre y definición (migración 20260905110000). Capa 2:
+ * estado de cuenta, el mismo ROL re-comprobado aquí para dar un mensaje claro en vez de un
+ * 42501 seco, y el nombre único por workspace, que la base no impone. Cada escritura deja
  * su evento en `evento_dominio` en LA MISMA sentencia, con el rol que la autorizó.
  *
- * No hay borrado: un segmento lo citan evidencia congelada y arquetipos con veredicto, y las
- * FKs compuestas lo impiden a propósito (ver la migración de evidencia). Renombrar sí se
- * permite —el nombre es un rótulo, la identidad es el id—, y la evidencia conserva en su
- * jsonb el snapshot con el que se curó.
+ * No hay borrado: un segmento lo citan evidencia congelada y arquetipos con veredicto, y el
+ * rol de aplicación no tiene DELETE sobre la tabla. Renombrar sí se permite —el nombre es un
+ * rótulo, la identidad es el id—, y la evidencia conserva en su jsonb el snapshot con el que
+ * se curó.
  */
 
 export class ErrorSegmento extends Error {}
 
-/** El rol del actor en el workspace, si puede editar la taxonomía; si no, error claro. */
+/**
+ * El rol del actor en el workspace, si puede editar la taxonomía; si no, error claro. Es el
+ * re-check de capa 2: la política de la base rechazaría igual, pero con un 42501 que no dice
+ * quién sí puede.
+ */
 async function rolQueEdita(
   tx: TransactionSql,
   actorId: string,
@@ -72,7 +77,8 @@ export async function crearSegmento(
     const rol = await rolQueEdita(tx, actorId, entrada.workspaceId);
     await exigirNombreLibre(tx, entrada.workspaceId, entrada.nombre);
     // UNA sentencia: segmento + evento comparten snapshot, y el rol auditado es el que pasó
-    // la comprobación de arriba en esta misma transacción.
+    // la comprobación de arriba en esta misma transacción. Bajo RLS el insert devuelve su
+    // fila o lanza (42501 si la política no lo deja): no hay «cero filas» que contemplar.
     const [fila] = await tx`
       with nuevo as (
         insert into segmento (workspace_id, nombre, definicion)
@@ -87,8 +93,7 @@ export async function crearSegmento(
         from nuevo
       )
       select nuevo.id from nuevo`;
-    if (!fila) throw new ErrorSegmento('No puedes definir segmentos en este workspace');
-    return { segmentoId: fila.id as string };
+    return { segmentoId: fila!.id as string };
   });
 }
 
@@ -99,10 +104,18 @@ export async function editarSegmento(actorId: string, entrada: EditarSegmento): 
     await exigirNombreLibre(tx, entrada.workspaceId, entrada.nombre, entrada.segmentoId);
     // El nombre anterior viaja en el evento: renombrar un eje de medición es un cambio que
     // quien lea la auditoría tiene que poder seguir sin reconstruir la historia a mano.
+    //
+    // `for update` en esa lectura, y no es cosmética: dos ediciones concurrentes del mismo
+    // segmento pasan las dos el candado de nombre (son nombres distintos) y, sin el candado
+    // de fila, la segunda leería el nombre viejo y lo registraría como «anterior» de un
+    // cambio que en realidad partió del que dejó la primera: la cadena de la auditoría
+    // quedaría rota. Con él, la segunda espera a que la primera confirme y, bajo READ
+    // COMMITTED, relee la versión que acaba de quedar: old => n1 | n1 => n2.
     const filas = await tx`
       with anterior as (
         select id, nombre from segmento
         where id = ${entrada.segmentoId} and workspace_id = ${entrada.workspaceId}
+        for update
       ),
       upd as (
         update segmento s set nombre = ${entrada.nombre}, definicion = ${entrada.definicion}

@@ -65,6 +65,16 @@ const CONTROLES = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/;
 
 const PROHIBIDOS = new RegExp(`${CONTROLES.source}|${BIDI.source}`);
 
+/**
+ * ¿El texto lleva un control bidireccional o un carácter de control? Es el mismo predicado
+ * que rechaza el material importado, expuesto para los NOMBRES cortos que otras pantallas
+ * comparan a ojo (un segmento, por ejemplo): con un override BIDI dos nombres distintos se
+ * pintan iguales, y la unicidad por `lower()` no los distingue.
+ */
+export function tieneBidiOControles(texto: string): boolean {
+  return PROHIBIDOS.test(texto);
+}
+
 export type Veredicto = { ok: true } | { ok: false; motivo: string };
 
 /** Valida texto importado. No lo modifica: o entra tal cual, o no entra. */

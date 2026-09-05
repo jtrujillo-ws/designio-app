@@ -133,3 +133,36 @@ a:hover {
     min-width: 1166px;
   }
 }
+
+/* ── Lateral 4a: estantes, «Te espera» y gobierno plegado ── */
+/* «Te espera» aparece y desaparece según contadores: entra con la transición de la casa
+   para no empujar el árbol de golpe. */
+@keyframes loop-aparece {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.loop-te-espera {
+  animation: loop-aparece 150ms ease-out;
+}
+/* El caret de «Gobierno del workspace» gira ▸→▾ en vez de cambiar de glifo. */
+.loop-caret-gira {
+  display: inline-block;
+  transition: transform 150ms ease-out;
+}
+.loop-caret-gira[data-abierto='true'] {
+  transform: rotate(90deg);
+}
+@media (max-width: 1200px) {
+  /* En el riel las etiquetas de estante se ocultan (loop-ancho): los separa un hairline. */
+  .loop-aside .loop-estante {
+    border-top: 1px solid rgba(247, 247, 249, 0.14);
+    margin-top: 8px !important;
+    padding-top: 8px;
+  }
+}

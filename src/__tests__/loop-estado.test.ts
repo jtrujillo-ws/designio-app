@@ -181,7 +181,7 @@ describe('la marca de un reto en el árbol', () => {
       },
     ],
   ]);
-  const proyecto = (id: string) => ({ id, codigo: 'P', titulo: 'p', estado: 'activo' });
+  const proyecto = (id: string, estado = 'activo') => ({ id, codigo: 'P', titulo: 'p', estado });
 
   it('un reto con proyecto está donde está su proyecto', () => {
     expect(
@@ -195,6 +195,21 @@ describe('la marca de un reto en el árbol', () => {
       punteado: false,
       sufijo: 'J6',
     });
+  });
+
+  it('con varios proyectos, la marca sale del proyecto actual del reto, no del primero', () => {
+    // p-cerrado va primero por código pero está cerrado; p-6 es el vivo: la marca es J6.
+    expect(
+      marcaDeReto(
+        {
+          estado: 'activo',
+          origen: null,
+          proyectos: [proyecto('p-cerrado', 'cerrado'), proyecto('p-6')],
+        },
+        proyectos,
+        true,
+      ),
+    ).toEqual({ j: 6, punteado: false, sufijo: 'J6' });
   });
 
   it('un reto cuyo ciclo cerró lo dice, con el color del post mortem', () => {

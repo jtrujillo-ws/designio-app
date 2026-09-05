@@ -1,5 +1,5 @@
 import type { JourneyN } from '@/components/ui/JourneyBadge';
-import type { RetoArbol } from '@/lib/arbol/arbol.schemas';
+import type { ProyectoArbol, RetoArbol } from '@/lib/arbol/arbol.schemas';
 import type { GatesDeProyecto } from './loop.schemas';
 
 /**
@@ -126,7 +126,8 @@ export function marcaDeReto(
   proyectos: ReadonlyMap<string, GatesDeProyecto>,
   hayEvidencia: boolean,
 ): MarcaDeReto {
-  const proyecto = reto.proyectos[0] ? proyectos.get(reto.proyectos[0].id) : undefined;
+  const actual = proyectoActualDelReto(reto);
+  const proyecto = actual ? proyectos.get(actual.id) : undefined;
   if (proyecto) {
     // Un reto siempre cuelga de un servicio: el arranque, por ese lado, está.
     const loop = loopDeProyecto(proyecto, { hayEvidencia, hayServicio: true });
@@ -159,5 +160,20 @@ export function proyectoActualDe<T extends { retoEstado: string; proyectoEstado:
     candidatos.find(retoVivo) ??
     candidatos[0] ??
     null
+  );
+}
+
+/**
+ * El proyecto actual de UN reto, con la misma regla que el del servicio: entre los suyos,
+ * el que sigue vivo antes que uno pausado o cerrado. Lo usan la marca del reto en el árbol
+ * y la fila que lo abre, para que apunten al mismo proyecto que la cabecera.
+ */
+export function proyectoActualDelReto(
+  reto: Pick<RetoArbol, 'estado' | 'proyectos'>,
+): ProyectoArbol | null {
+  return (
+    proyectoActualDe(
+      reto.proyectos.map((p) => ({ retoEstado: reto.estado, proyectoEstado: p.estado, p })),
+    )?.p ?? null
   );
 }

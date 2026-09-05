@@ -24,6 +24,7 @@ import {
   loopDeProyecto,
   marcaDeReto,
   proyectoActualDe,
+  proyectoActualDelReto,
   type EstadoDelLoop,
   type EstadoJourney,
 } from '@/lib/loop/loop-estado';
@@ -1004,7 +1005,9 @@ function RetoDelArbol({
   activo: boolean;
   marca: ReturnType<typeof marcaDeReto>;
 }) {
-  const proyecto = reto.proyectos[0];
+  // La fila abre el proyecto ACTUAL del reto (el vivo antes que el pausado o cerrado), el
+  // mismo del que sale su marca y, si es el reto actual, la cabecera.
+  const proyecto = proyectoActualDelReto(reto);
   const atenuado = marca.punteado;
   const estilo: CSSProperties = {
     ...filaLateral,
@@ -1055,7 +1058,7 @@ function RetoDelArbol({
   // El esquema no limita un reto a un proyecto. La fila del reto abre el primero (el que el
   // resto de la pantalla toma como actual); los demás no pueden quedarse sin entrada, así
   // que cuelgan debajo como subfilas, cada una con su propio enlace.
-  const otros = reto.proyectos.slice(1);
+  const otros = reto.proyectos.filter((p) => p.id !== proyecto?.id);
   return (
     <>
       <Link
@@ -1646,7 +1649,7 @@ function FilaPendiente({ fila }: { fila: Pendiente }) {
  * no, el código se muestra como texto y no como un enlace a un ancla que no existe.
  */
 function CodigoDeReto({ reto }: { reto: RetoArbol }) {
-  const proyecto = reto.proyectos[0];
+  const proyecto = proyectoActualDelReto(reto);
   if (!proyecto) {
     return (
       <span

@@ -116,7 +116,12 @@ export type RetoCandidatoEnMemoria = {
 export type MemoriaDelWorkspace = {
   workspaceId: string;
   workspaceNombre: string;
-  /** Todos los segmentos del workspace, tengan o no arquetipos: un segmento sin memoria también se dice. */
+  /**
+   * Los segmentos del workspace, tengan o no arquetipos —un segmento sin memoria también
+   * se dice—, recortados al tope como todo lo demás (una tarjeta por segmento en el SSR
+   * crecía sin límite); `totales.segmentos` dice cuántos hay y la lista entera vive en
+   * /segmentos.
+   */
   segmentos: SegmentoEnMemoria[];
   arquetipos: ArquetipoEnMemoria[];
   /** Solo `validado`: un insight propuesto todavía no es memoria, es una conversación. */
@@ -136,6 +141,8 @@ export type MemoriaDelWorkspace = {
 };
 
 export type TotalesDeMemoria = {
+  /** Cuántos segmentos hay; `segmentos` trae como mucho el tope. */
+  segmentos: number;
   arquetipos: number;
   /** Los que no declararon segmento: el total del grupo «sin segmento», por la misma razón. */
   arquetiposSinSegmento: number;
@@ -231,7 +238,8 @@ export function destinoDelRetoCerrado(r: RetoCerradoEnMemoria): Destino | null {
   return r.proyecto ? { to: '/proyecto/$proyectoId', params: { proyectoId: r.proyecto.id } } : null;
 }
 
-/** La memoria está vacía cuando ninguna sección tiene nada: el workspace todavía no ha cerrado un ciclo. */
+/** La memoria está vacía cuando ninguna sección tiene nada: el workspace todavía no ha cerrado un ciclo.
+ * Los segmentos no cuentan —son taxonomía, no lo aprendido—, así que su total no se mira. */
 export function memoriaVacia(m: MemoriaDelWorkspace): boolean {
   const t = m.totales;
   return (

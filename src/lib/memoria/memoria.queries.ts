@@ -75,7 +75,9 @@ export async function construirMemoria(
     await Promise.all([
       // Con el conteo REAL de arquetipos de cada segmento: la lista de arquetipos de abajo
       // viene recortada al tope y un segmento antiguo puede quedarse sin ninguno de los
-      // suyos en ella; sin este número la tarjeta del segmento mentiría.
+      // suyos en ella; sin este número la tarjeta del segmento mentiría. Y recortada al
+      // tope también ella, del más reciente al más antiguo: es una tarjeta por segmento y
+      // un count por tarjeta, y sin cota el SSR crecía con la taxonomía entera.
       tx<SegmentoEnMemoria[]>`
         select s.id, s.nombre, s.definicion,
                (select count(*)::int from arquetipo_segmento asg
@@ -83,7 +85,8 @@ export async function construirMemoria(
                  as "totalArquetipos"
         from segmento s
         where s.workspace_id = ${workspaceId}
-        order by s.nombre, s.id`,
+        order by s.creado_en desc, s.id
+        limit ${TOPE_POR_SECCION}`,
 
       // El arquetipo con el reto donde nació y el primer proyecto de ese reto (el mismo
       // criterio que el buscador: por código, con desempate por id). Un reto sin proyecto —
@@ -189,6 +192,8 @@ export async function construirMemoria(
       // la pantalla diría «50 de N» con una N que no es la de esa lista.
       tx<TotalesDeMemoria[]>`
         select
+          (select count(*)::int from segmento s where s.workspace_id = ${workspaceId})
+            as segmentos,
           (select count(*)::int from arquetipo a where a.workspace_id = ${workspaceId})
             as arquetipos,
           (select count(*)::int from arquetipo a
@@ -223,6 +228,7 @@ export async function construirMemoria(
     retosCandidatos: [...retosCandidatos],
     // La fila de totales existe siempre (son subselects escalares); el `??` es para el tipo.
     totales: totales[0] ?? {
+      segmentos: 0,
       arquetipos: 0,
       arquetiposSinSegmento: 0,
       insights: 0,

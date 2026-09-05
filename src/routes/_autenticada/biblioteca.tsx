@@ -1,5 +1,5 @@
 import type { CSSProperties, ReactNode } from 'react';
-import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
@@ -155,6 +155,7 @@ function PantallaBiblioteca() {
               )}
               arquetipos={datos.arquetipos}
               total={datos.totales.arquetipos}
+              totalSegmentos={datos.totales.segmentos}
             />
 
             <Seccion
@@ -365,11 +366,14 @@ function SeccionArquetipos({
   grupos,
   arquetipos,
   total,
+  totalSegmentos,
 }: {
   grupos: GrupoDeSegmento[];
   arquetipos: ArquetipoEnMemoria[];
   /** Cuántos hay en el workspace; `arquetipos` trae como mucho el tope. */
   total: number;
+  /** Cuántos segmentos hay; los grupos son como mucho el tope, y el resto está en /segmentos. */
+  totalSegmentos: number;
 }) {
   // El desglose por estado es de los que se ENSEÑAN: los que el tope dejó fuera no se
   // pueden contar por estado sin traerlos, y la nota de recorte ya dice que faltan.
@@ -379,6 +383,11 @@ function SeccionArquetipos({
       ? '0 arquetipos'
       : `${total} ${total === 1 ? 'arquetipo' : 'arquetipos'} · ${resumen.confirmado} ${resumen.confirmado === 1 ? 'confirmado' : 'confirmados'} · ${resumen.hipotesis} hipótesis · ${resumen.refutado} ${resumen.refutado === 1 ? 'refutado' : 'refutados'}`;
   const recorte = notaDeRecorte(arquetipos.length, total, 'el proyecto de cada reto');
+  // Los grupos de abajo son los segmentos MOSTRADOS: un segmento fuera del tope no tiene
+  // tarjeta aquí, y decirlo con el enlace a la lista entera es lo que evita que parezca que
+  // no existe.
+  const mostrados = grupos.filter((g) => g.segmento !== null).length;
+  const recorteSegmentos = notaDeRecorte(mostrados, totalSegmentos, 'la pantalla de segmentos');
   return (
     <section
       aria-label="Arquetipos por segmento"
@@ -391,6 +400,14 @@ function SeccionArquetipos({
         <span style={micro}>{cabecera}</span>
       </div>
       {recorte && <NotaDeRecorte>{recorte}</NotaDeRecorte>}
+      {recorteSegmentos && (
+        <NotaDeRecorte>
+          {recorteSegmentos}{' '}
+          <Link to="/segmentos" style={enlace}>
+            Abrir Segmentos →
+          </Link>
+        </NotaDeRecorte>
+      )}
       {grupos.length === 0 && (
         <Card pending style={{ padding: 18 }}>
           <span style={{ font: '400 13px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}>

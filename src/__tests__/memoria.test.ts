@@ -46,6 +46,7 @@ const memoria = (parcial: Partial<MemoriaDelWorkspace> = {}): MemoriaDelWorkspac
   retosCerrados: [],
   retosCandidatos: [],
   totales: {
+    segmentos: 0,
     arquetipos: 0,
     arquetiposSinSegmento: 0,
     insights: 0,
@@ -246,11 +247,28 @@ describe('el respaldo de lo validado y lo vigente', () => {
 describe('la memoria vacía y el recorte', () => {
   it('está vacía solo cuando ningún total es mayor que cero (los segmentos no cuentan)', () => {
     expect(memoriaVacia(memoria({ segmentos: [segmento('s1', 'independientes')] }))).toBe(true);
+    // Ni aunque haya más segmentos de los que se enseñan: son taxonomía, no lo aprendido.
+    expect(
+      memoriaVacia(
+        memoria({
+          totales: {
+            segmentos: 80,
+            arquetipos: 0,
+            arquetiposSinSegmento: 0,
+            insights: 0,
+            decisiones: 0,
+            retosCerrados: 0,
+            retosCandidatos: 0,
+          },
+        }),
+      ),
+    ).toBe(true);
     // Los TOTALES mandan, no las listas: una sección recortada a cero filas seguiría contando.
     expect(
       memoriaVacia(
         memoria({
           totales: {
+            segmentos: 0,
             arquetipos: 0,
             arquetiposSinSegmento: 0,
             insights: 0,

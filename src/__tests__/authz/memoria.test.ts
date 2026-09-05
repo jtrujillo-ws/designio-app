@@ -216,10 +216,12 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     const m = await memoriaParaUsuario(userA, wsA);
     expect(m).not.toBeNull();
     expect(m!.workspaceNombre).toBe(marca + '-A');
+    // Del más reciente al más antiguo, como todo lo demás.
     expect(m!.segmentos.map((s) => [s.nombre, s.totalArquetipos])).toEqual([
-      ['independientes', 1],
       ['pymes', 1],
+      ['independientes', 1],
     ]);
+    expect(m!.totales.segmentos).toBe(2);
     expect(m!.totales.arquetiposSinSegmento).toBe(1);
 
     // De más reciente a más antiguo: la hipótesis se dio de alta después.
@@ -339,15 +341,36 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
       );
       // …pero sus segmentos saben cuántos tienen, y el grupo sin segmento también.
       expect(m!.segmentos.map((s) => [s.nombre, s.totalArquetipos])).toEqual([
-        ['independientes', 1],
-        ['pymes', 1],
         ['recientes', TOPE_POR_SECCION + 1],
+        ['pymes', 1],
+        ['independientes', 1],
       ]);
+      expect(m!.totales.segmentos).toBe(3);
       expect(m!.totales.arquetiposSinSegmento).toBe(1);
     } finally {
       await admin`delete from arquetipo_segmento where segmento_id = ${segRecientes}`;
       await admin`delete from arquetipo where workspace_id = ${wsA} and nombre like 'Arquetipo reciente %'`;
       await admin`delete from segmento where id = ${segRecientes}`;
+    }
+  });
+
+  it('los segmentos también se recortan al tope, con el total real al lado', async () => {
+    // Una tarjeta por segmento y un count por tarjeta: sin cota el SSR crecía con la
+    // taxonomía entera. Más segmentos que el tope, todos más recientes que los dos del setup.
+    const admin = sqlAdmin();
+    await admin`insert into segmento (workspace_id, nombre, creado_en)
+      select ${wsA}, 'Segmento reciente ' || n, now() + make_interval(mins => n)
+      from generate_series(1, ${TOPE_POR_SECCION + 1}) as n`;
+    try {
+      const m = await memoriaParaUsuario(userA, wsA);
+      expect(m!.segmentos).toHaveLength(TOPE_POR_SECCION);
+      expect(m!.totales.segmentos).toBe(TOPE_POR_SECCION + 3);
+      // Los antiguos quedan fuera de la lista; su arquetipo sigue contando en el total.
+      expect(m!.segmentos.some((s) => s.id === segIndep || s.id === segPymes)).toBe(false);
+      expect(m!.segmentos.every((s) => s.totalArquetipos === 0)).toBe(true);
+      expect(m!.totales.arquetipos).toBe(2);
+    } finally {
+      await admin`delete from segmento where workspace_id = ${wsA} and nombre like 'Segmento reciente %'`;
     }
   });
 
@@ -383,6 +406,7 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     expect(m.retosCandidatos).toHaveLength(0);
     // Y los totales tampoco filtran nada: count bajo la misma RLS.
     expect(m.totales).toEqual({
+      segmentos: 0,
       arquetipos: 0,
       arquetiposSinSegmento: 0,
       insights: 0,

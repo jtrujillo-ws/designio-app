@@ -399,7 +399,11 @@ async function filasDeInsights(
         , i.creado_en
       from insight i
       where i.workspace_id = ${workspaceId}
-        ${filtro.soloId ? tx`and i.id = ${filtro.soloId}` : tx``}
+        -- El filtro por id va DENTRO de la única sentencia, como el cursor, y no como un
+        -- fragmento condicional: la ficha se lee en un solo momento, y el censo de
+        -- proyecciones de solo lectura (disposicion.test) cuenta cada plantilla como una
+        -- sentencia más, así que un fragmento la haría pasar por lectura de varios momentos.
+        and (${filtro.soloId ?? null}::uuid is null or i.id = ${filtro.soloId ?? null}::uuid)
         and (${cursor?.creadoEn ?? null}::timestamptz is null
              or (i.creado_en, i.id) < (${cursor?.creadoEn ?? null}::timestamptz,
                                        ${cursor?.id ?? null}::uuid))

@@ -617,8 +617,9 @@ a evidencia, y con las **contradicciones** a la vista, igual de grandes que el a
   párrafo u offset temporal).
 - **Anotar contradicciones**: evidencia que va en contra del insight, con descripción; una por
   evidencia.
-- **Validar** el insight propuesto (lead o diseñador): pasa de `propuesto` a `validado`. También se
-  puede `descartar`.
+- **Validar** el insight propuesto (lead o diseñador): pasa de `propuesto` a `validado`. No existe
+  un estado de descarte: un insight que no se sostiene simplemente no se valida y queda como
+  propuesto (el CHECK de `insight.estado` admite solo esos dos valores).
 
 ## Qué impone la base
 
@@ -1002,7 +1003,11 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
 - Cupo diario **por workspace** (`workspace.limite_llamadas_ai_dia`, mínimo 2), con respaldo de 60
   cuando no hay uno pactado. La unidad es la **llamada atendida** por el proveedor (lo que se paga),
   contada sobre el mismo libro que suma costos.
-- Corte **suave**: al agotarse se pausan las capacidades AI, nunca un flujo de negocio.
+- Corte **suave**: al agotarse se pausan las capacidades AI, no los flujos de negocio. **Una
+  excepción conocida**: mientras la pantalla de J2 no exista (ver `05`), los criterios de éxito solo
+  entran desde la app aceptando propuestas de C0, así que sin AI un reto nuevo no puede llegar a
+  G0 desde la interfaz; la paridad manual que exige SYS-21 está en el servidor pero no en la
+  pantalla.
 - Política de modelos en código: primario `claude-sonnet-5`, respaldo `claude-sonnet-4-6` solo ante
   404 o 5xx (no ante timeout), una degradación por operación; timeout duro de 25 s; sin reintentos
   del SDK. Tarifas por millón de tokens junto a la política; el costo se persiste con la llamada.
@@ -1053,8 +1058,10 @@ contadores del lateral. Fuente: SPEC-01 (portal), SPEC-04. PR [#41](https://gith
 
 ## Hilos de comentarios (portal)
 
-Todo objeto presentable admite **hilos** con comentarios: `reto`, `proyecto`, `gate_instancia`,
-`evidencia` y `design_version`. Un hilo se abre con su primer comentario, se **resuelve** y se
+La base admite **hilos** con comentarios sobre cinco anclas (`reto`, `proyecto`, `gate_instancia`,
+`evidencia`, `design_version`); la interfaz expone hoy tres: el proyecto y sus gates (pantalla del
+proyecto) y la design version. Los hilos sobre un reto o una evidencia existen en el modelo y en
+las server functions, pero ninguna pantalla los abre todavía. Un hilo se abre con su primer comentario, se **resuelve** y se
 **reabre**; nadie comenta en un hilo resuelto. Los hilos viven junto al objeto (panel de hilos en el
 proyecto y en la design version) y dejan eventos de dominio. Miembros del workspace abren y
 comentan.
@@ -1127,6 +1134,8 @@ Fuente: SPEC-01 (RF-01.7). PR [#40](https://github.com/jtrujillo-ws/designio-app
   el anterior. **Sin correo saliente en el MVP**, el enlace de activación se muestra en pantalla para
   compartirlo. El aterrizaje fija la contraseña y entra directo al workspace.
 - Estados de usuario: `invitado`, `activo`, `inactivo`.
+- **Sin baja de miembros desde la app**: revocar la membresía de alguien (RF-01.4) no tiene
+  política de DELETE, grant ni pantalla; hoy solo se hace por la conexión administrativa.
 - Un mismo usuario puede tener membresías en varios workspaces; la navegación lleva el workspace
   activo en `?ws=`.
 
@@ -1194,8 +1203,10 @@ ejecutarlo, para que un borrado irreversible no pueda ser un clic.
   hereden (#39 lo copia). Con **excepciones deliberadas**: `evento_dominio` y
   `exportacion_registro` siguen aceptando escrituras (un archivo tiene que poder decir quién lo
   consulta y quién lo re-exporta); `acuerdo_disposicion` y `constancia_disposicion` quedan fuera
-  (registrar un acuerdo nuevo es lo que revierte un archivo); y en `miembro` se congelan alta y
-  cambio pero **no la baja**, para que revocar un acceso siempre sea posible.
+  (registrar un acuerdo nuevo es lo que revierte un archivo); y en `miembro` el trigger cubre alta y
+  cambio pero **no la baja**, pensado para que revocar un acceso siempre sea posible. Esa baja, sin
+  embargo, hoy solo es ejecutable por la **conexión administrativa**: `miembro` no tiene política
+  ni grant de DELETE para el rol de aplicación y ninguna server function ni pantalla la ofrece.
 
 ## Permisos
 
@@ -1342,7 +1353,7 @@ alcanzado del catálogo de Postgres.
 | Proyecto | `activo` ↔ `pausado` → `en-implementacion` (G6) → `en-medicion` (G7) → `cerrado` |
 | Design version | `borrador` → `aprobada` → `superada` |
 | Release | `planificado` → `desplegado` → `verificado` |
-| Insight | `propuesto` → `validado` · `descartado` |
+| Insight | `propuesto` → `validado` (sin estado de descarte) |
 | Arquetipo | `hipotesis` → `confirmado` · `refutado` |
 | Derecho de uso | `pendiente` → `concedido` → `denegado` (revocación) · `pendiente` → `denegado`; nunca vuelve a `pendiente` |
 | Ítem de importación | `pendiente` → `aprobado` · `rechazado` |
@@ -1553,7 +1564,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | Spec | Pendiente | Referencia |
 |---|---|---|
-| SPEC-01 Workspace, roles, portal | Correo saliente (invitaciones, avisos del portal), notificaciones básicas por email; recovery de contraseña por correo | RF-01.5, diseño técnico · Correo |
+| SPEC-01 Workspace, roles, portal | Baja de miembros desde la app (política y grant de DELETE, server function y pantalla); hilos del portal sobre retos y evidencias en la interfaz (el modelo ya los admite); correo saliente (invitaciones, avisos del portal), notificaciones básicas por email; recovery de contraseña por correo | RF-01.4, RF-01.5, diseño técnico · Correo |
 | SPEC-02 Árbol y grafo | Servicios **afectados** adicionales de un reto en la UI (la tabla `reto_servicio_afectado` existe y la lectura de journeys ya la usa); consultas de trazabilidad predefinidas como pantalla propia (a–f); `AlcanceDeContexto` explícito para la AI (hoy el alcance es por ancla y se resume en `alcance_resumen`) | RF-02.3, RF-02.6, RF-02.7 |
 | SPEC-03 Evidencia e importación | Transcripción y diarización (C1, requiere proveedor STT); escaneo de malware; object storage S3-compatible con proxy de bytes (hoy `bytea` en Postgres); preview y OCR de artefactos; codificación asistida por segmento y tema | RF-03.2, RF-03.7, RF-03.8 |
 | SPEC-04 Método | **Pantalla de J2** para crear el reto, definir y editar criterios a mano y activarlo con perfil (las server functions existen; ninguna ruta las llama); **conceptos y resultados de test** de la etapa 4 (G4 hoy se sostiene en el checklist, sin objeto propio ni umbral por concepto); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
@@ -1742,7 +1753,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 | I4 / SYS-18 | `agente-ai` sin aprobar ni publicar | Rol no invitable, ausente de todo predicado de escritura; CT sin destino | Construido |
 | I4 / SYS-19 | Toda escritura AI pasa por PropuestaAI con lineage | `propuesta_ai` + guard de materialización diferido; `propuesta_ai_id` en destinos | Construido |
 | I4 / SYS-20 | Revisores AI etiquetados, no evidencia, no cuentan en G4/G5 | CHECK «simulación no es evidencia» preparado; C4 sin construir | **Parcial (diseñado)** |
-| I4 / SYS-21 | Sin AI todo flujo manual; límites por workspace | `evaluarCapacidadAI` nunca lanza; cupo `limite_llamadas_ai_dia`; pantallas con AI apagada | Construido (E2E «AI off» pendiente) |
+| I4 / SYS-21 | Sin AI todo flujo manual; límites por workspace | `evaluarCapacidadAI` nunca lanza; cupo `limite_llamadas_ai_dia`; pantallas con AI apagada | **Parcial**: la definición manual de criterios (J2) no tiene pantalla, así que sin AI un reto nuevo no llega a G0 desde la interfaz; E2E «AI off» pendiente |
 | I5 / SYS-22 | Ventana por criterio en G0; registry firmado en G6 | `criterio_g0_pendiente_guard`, `registry_firmar_guard`, `aprobado_sin_registry` explícito | Construido |
 | I5 / SYS-23 | Snapshots solo formulario/CSV, append-only | `snapshot_insert` con contrato firmado y ventana abierta; `snapshot_carga_no_corrige_guard` | Construido |
 | I5 / SYS-24 | Sin causalidad automática; veredicto cerrado | `outcome_review_completar_guard`; catálogo de cuatro veredictos; estructura de contribución y factores | Construido |
@@ -1834,6 +1845,7 @@ fuente o a un ADR de sucesión.
 | 16 | `docs/README.md` | Estados del paquete «borrador» | El código ya materializa la mayoría de las specs | Añadir columna de estado de implementación (o enlazar este documento) |
 | 17 | Journeys J2 (`docs/04-journeys/`) / SPEC-04 RF-04.1–04.3 | El lead formula el reto y define criterios en la plataforma | Las server functions existen pero ninguna pantalla las expone: el reto y sus criterios manuales nacen del seed o de C0 | Construir la pantalla de J2 (alta de reto, criterios, activación) |
 | 18 | Journeys J7 / prediseño §13.2 | El sponsor «recibe el post mortem» y decide continuidad; la tabla de journeys lo pone como rol decisivo | El veredicto lo dicta el lead (`review_completar`); no hay aprobación del sponsor sobre el review | Decidir si el sponsor debe firmar el outcome review (ADR) o dejar el rol como está y ajustar el journey |
+| 19 | SPEC-01 RF-01.4 | El admin del cliente gestiona los accesos de su organización | Alta por invitación sí; la baja de una membresía no tiene camino en la app (solo conexión administrativa) | Añadir política, grant y pantalla de baja |
 
 ---
 

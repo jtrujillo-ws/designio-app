@@ -859,14 +859,33 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     await rolCurador(tx, actorId, entrada.workspaceId);
 
     const { keyWorkspace, keyEntorno } = credencialesAI();
-    // La puerta del consentimiento la abre la DECLARACIÓN, no la entrada de cada capacidad.
-    // Va antes de `PREPARAR` —el prompt se construye con el material, así que comprobar
-    // después sería comprobar tarde— y antes del candado del presupuesto, que es el orden de
-    // candados de la casa.
-    if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
-      await exigirConsentimientoVigente(tx, entrada, 'antes-de-preparar');
-    }
+    /*
+     * La puerta del consentimiento la abre la DECLARACIÓN, no la entrada de cada capacidad. Y
+     * se parte en dos porque el orden de los CANDADOS y el orden de los MENSAJES responden a
+     * preguntas distintas:
+     *
+     * - El CANDADO va primero, siempre. Leer el consentimiento y apartar la reserva tienen que
+     *   ser atómicos respecto a `registrarConsentimiento`, o una revocación se cuela entre
+     *   ambos. Y antes del candado del presupuesto, que es el orden de la casa.
+     * - El MENSAJE va donde el usuario pueda ACTUAR. Con la comprobación delante de `PREPARAR`
+     *   —como la puse al centralizar la puerta—, una petición rancia contra un item ya curado
+     *   recibía «registra el consentimiento»: una instrucción que no lleva a ninguna parte,
+     *   porque después de registrarlo el item sigue curado y la generación falla igual. Lo
+     *   cazó una revisión. La elegibilidad del ancla es lo primero que hay que poder arreglar,
+     *   así que habla primero.
+     *
+     * Lo que NO cambia: el material no sale hacia el proveedor. `prepararAlcance` solo
+     * construye el prompt en memoria dentro de esta transacción, y si el consentimiento falta
+     * se aborta antes de que exista una reserva, una llamada o una propuesta.
+     */
+    const exigeConsentimiento = CAPACIDADES[entrada.capacidad].exigeConsentimiento;
+    const consentimiento = exigeConsentimiento
+      ? await leerConsentimientoBajoCandado(tx, entrada)
+      : null;
     const { sistema, prompt } = await PREPARAR[entrada.capacidad](tx, entrada);
+    if (consentimiento?.falta) {
+      throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
+    }
 
     // ── Reserva del hueco, bajo candado del workspace ──
     await bloquearPresupuesto(tx, entrada.workspaceId);
@@ -1858,6 +1877,35 @@ async function exigirConsentimientoVigente(
   entrada: GenerarPropuestas,
   momento: 'antes-de-preparar' | 'antes-de-despachar',
 ): Promise<number | null> {
+  const estado = await leerConsentimientoBajoCandado(tx, entrada);
+  if (estado.falta) throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO[momento]);
+  return estado.version;
+}
+
+/** Los dos mensajes, que dependen del momento y no son cosméticos: antes de preparar, el
+ * camino es registrar el consentimiento; al despachar, lo que importa es que el material NO
+ * salió. */
+const MOTIVO_SIN_CONSENTIMIENTO: Record<'antes-de-preparar' | 'antes-de-despachar', string> = {
+  'antes-de-preparar':
+    'Ese material es de personas: registra el consentimiento para procesarlo con un proveedor externo antes de pedir una propuesta (RF-09.5)',
+  'antes-de-despachar':
+    'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
+};
+
+/**
+ * Toma el candado y LEE; no decide.
+ *
+ * La separación la pidió una revisión y corrige una precedencia que rompí al centralizar la
+ * puerta: con la comprobación delante de `PREPARAR`, una petición rancia contra un item YA
+ * CURADO recibía «registra el consentimiento» — una instrucción que no lleva a ninguna parte,
+ * porque después de registrarlo el item sigue curado y la generación falla igual. El orden de
+ * los CANDADOS y el orden de los MENSAJES no son la misma pregunta: el candado va primero
+ * porque leer y reservar tienen que ser atómicos; el mensaje va donde el usuario pueda actuar.
+ */
+async function leerConsentimientoBajoCandado(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+): Promise<{ falta: boolean; version: number | null }> {
   // Candado por item ANTES de leer: leer el consentimiento y apartar la reserva tienen que ser
   // atómicos respecto a `registrarConsentimiento`, o una revocación podría colarse entre ambos
   // y quedarse sin nada que retirar.
@@ -1873,15 +1921,6 @@ async function exigirConsentimientoVigente(
       end as version_vigente
     from item_importacion
     where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
-  if (item?.falta) {
-    // El momento cambia lo que hay que decir, y no es cosmético: antes de preparar el camino
-    // es registrar el consentimiento; al despachar, lo que importa es que el material NO salió.
-    throw new ErrorAI(
-      momento === 'antes-de-preparar'
-        ? 'Ese material es de personas: registra el consentimiento para procesarlo con un proveedor externo antes de pedir una propuesta (RF-09.5)'
-        : 'El consentimiento de ese material dejó de autorizar el procesamiento externo antes de despachar la llamada: el material no salió hacia el proveedor (RF-09.5)',
-    );
-  }
   /*
    * La versión que ampara ESTA salida, leída bajo el candado y en la misma transacción que la
    * aprueba. Viaja al libro de llamadas para que «bajo qué permiso salió» sea un hecho
@@ -1893,9 +1932,13 @@ async function exigirConsentimientoVigente(
    * consentimiento registrado por si acaso citaría uno y el guard lo rechazaría — y con razón,
    * porque ese `null` es el que significa «no aplicaba».
    */
-  return item?.version_vigente === null || item?.version_vigente === undefined
-    ? null
-    : Number(item.version_vigente);
+  return {
+    falta: Boolean(item?.falta),
+    version:
+      item?.version_vigente === null || item?.version_vigente === undefined
+        ? null
+        : Number(item.version_vigente),
+  };
 }
 
 async function bloquearConsentimiento(tx: TransactionSql, itemId: string): Promise<void> {

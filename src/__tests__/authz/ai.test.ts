@@ -1028,6 +1028,39 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
   // ── RF-09.5: consentimiento ANTES de que el material salga hacia el proveedor ──
 
+  /**
+   * Y el mensaje va donde la persona pueda ACTUAR.
+   *
+   * El candado del consentimiento se toma primero —leerlo y apartar la reserva tienen que ser
+   * atómicos—, pero eso no decide qué se dice. Con la comprobación delante de la preparación,
+   * una petición rancia contra un item YA CURADO recibía «registra el consentimiento»: una
+   * instrucción que no lleva a ninguna parte, porque después de registrarlo el item sigue
+   * curado y la generación falla igual. Lo cazó una revisión sobre el arreglo anterior.
+   *
+   * Lo que se sujeta es la PRECEDENCIA: primero lo que hay que arreglar primero.
+   */
+  it('a un item ya curado le dice que está curado, no que registre el consentimiento', async () => {
+    const itemId = await nuevoItem('Entrevista ya curada', 'entrevista');
+    // Se cura a mano, y sin consentimiento: las dos cosas mal a la vez.
+    // Un item decidido lleva quién y cuándo: el CHECK de la tabla lo exige, y esta prueba
+    // tiene que montar un estado que la base admita para medir algo real.
+    await sqlAdmin()`update item_importacion
+      set estado = 'rechazado', decidido_por = ${leadId}, decidido_en = now()
+      where id = ${itemId} and workspace_id = ${ws}`;
+    await conProveedor(RESPUESTA_CI, async () => {
+      await expect(
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+      ).rejects.toThrow(/ya fue curado/i);
+    });
+    // Y cuando el item SÍ está disponible, el consentimiento vuelve a ser lo que falta.
+    const pendiente = await nuevoItem('Entrevista pendiente sin consentimiento', 'entrevista');
+    await conProveedor(RESPUESTA_CI, async () => {
+      await expect(
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: pendiente }),
+      ).rejects.toThrow(/consentimiento/i);
+    });
+  });
+
   it('material de personas sin consentimiento: no se genera, y la base tampoco lo admite', async () => {
     const itemId = await nuevoItem('Entrevista sin consentimiento', 'entrevista');
     await conProveedor(RESPUESTA_CI, async () => {

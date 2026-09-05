@@ -47,7 +47,37 @@ describe('los números que entran por un formulario', () => {
     const hallazgos: string[] = [];
     for (const f of ficheros) {
       const codigo = await readFile(f, 'utf8');
-      const arbol = ts.createSourceFile(f, codigo, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+      /*
+       * La gramática, por la EXTENSIÓN. Forzar TSX sobre un `.ts` no es un detalle: en TSX,
+       * `<T>(x: T) => x` se lee como JSX y se traga el resto del fichero. Medido sobre un `.ts`
+       * con una flecha genérica y una aserción de tipo, y dos llamadas después:
+       *
+       *   TSX → ve 0 llamadas        TS → ve 2
+       *
+       * Y aquí el fallo cae del lado MALO: lo que no se visita no se denuncia, así que el
+       * guardián pasaría en verde sin haber mirado nada — el modo de fallo que este
+       * repositorio ya pagó una vez en el censo del calendario. (Allí TSX sí es la elección
+       * correcta y está razonada: un fichero mal parseado hace que sus literales dejen de
+       * reconocerse como literales, así que el censo mira de MÁS. La dirección del fallo es lo
+       * que decide, no la comodidad de un solo `ScriptKind`.)
+       */
+      const arbol = ts.createSourceFile(
+        f,
+        codigo,
+        ts.ScriptTarget.Latest,
+        true,
+        f.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+      );
+      /*
+       * Y por si la extensión alguna vez no bastara: un fichero que no parsea LIMPIO no se
+       * puede dar por barrido. Elegir bien la gramática arregla el caso conocido; esto
+       * convierte cualquier caso futuro en rojo en vez de en un verde vacío, que es la
+       * diferencia entre un censo y una lista de lo que a alguien se le ocurrió mirar.
+       */
+      const diagnosticos = (arbol as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics;
+      expect(diagnosticos ?? [], `${f} no parsea limpio: el barrido no lo ha leído`).toHaveLength(
+        0,
+      );
       const recorrer = (n: ts.Node): void => {
         if (ts.isCallExpression(n)) {
           // `parseInt(x)` y `Number.parseInt(x)` cuentan igual: es la misma función.

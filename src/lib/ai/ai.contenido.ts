@@ -7,6 +7,10 @@ import {
   MAX_FUENTE_KPI,
   MAX_NOMBRE_KPI,
 } from '@/lib/medicion/medicion.schemas';
+// Los topes de la HMW salen del contrato de `oportunidad`, no de aquí: escribirlos a mano es
+// cómo se separan, y con una pregunta más larga la propuesta pasaría este esquema para morir
+// en el CHECK de la tabla con la llamada ya pagada.
+import { MAX_PREGUNTA, MAX_RAZON } from '@/lib/servicio/oportunidad.schemas';
 import {
   CONFIANZA_PROPUESTA,
   MAX_REMEDIACIONES,
@@ -147,6 +151,29 @@ const IdCopiadoDelMaterial = z
   .string()
   .uuid()
   .transform((s) => s.toLowerCase());
+
+/**
+ * Las citas de C3, cada una con el insight del que copia.
+ *
+ * No reusa `CitasSchema` porque su forma es distinta —lleva un id— y no lo envuelve con un
+ * `.and()` porque el id es de la cita, no un añadido: leerlo como «citas + algo» invitaría a
+ * tratarlo como opcional el día que se toque.
+ *
+ * El techo son SEIS, como el resto: un fragmento por insight y margen para dos por uno de
+ * ellos. Y el mínimo es UNO, que es lo que hace que SYS-15 salga de la forma del contenido —
+ * una HMW sin citas no puede existir, así que tampoco una sin traza.
+ */
+const CitasConInsightSchema = z
+  .array(
+    z.object({
+      /* El insight del que se copia el fragmento, POR SU ID: del material, no inventado. */
+      insightId: IdCopiadoDelMaterial,
+      fragmento: z.string().trim().min(1).max(600),
+      localizacion: z.string().trim().min(1).max(200),
+    }),
+  )
+  .min(1)
+  .max(6);
 
 /**
  * CT — qué falta para un gate, con los huecos citados (RF-08.4, SPEC-08 §30).
@@ -339,7 +366,8 @@ export type ContenidoPropuesta =
   | ContenidoAsistenteGate
   | ContenidoInsight
   | ContenidoRemediacionJourney
-  | ContenidoEntradaKpi;
+  | ContenidoEntradaKpi
+  | ContenidoOportunidad;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -423,6 +451,62 @@ export const ContenidoEntradaKpiSchema = z
   .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
 export type ContenidoEntradaKpi = z.infer<typeof ContenidoEntradaKpiSchema>;
 
+/**
+ * C3 — una oportunidad HMW: la pregunta que abre la etapa 4 y los insights que la sostienen
+ * (CTX-04, SYS-15).
+ *
+ * ── LA TRAZA ES LA CITA ──
+ *
+ * Este contenido NO lleva una lista de `insightIds` junto a las citas, y esa ausencia es la
+ * decisión de diseño de la capacidad. Serían dos fuentes de verdad para el mismo hecho —«en
+ * qué se apoya esta pregunta»— y se separan a la primera propuesta que declare tres insights
+ * y cite dos. La traza se DERIVA de las citas: `oportunidad_insight` se materializa con los
+ * `insightId` distintos que aparecen aquí, y el guard diferido lo comprueba en los dos
+ * sentidos.
+ *
+ * Lo que eso compra: SYS-15 sale de la forma del contenido en vez de ser una regla aparte
+ * —≥1 cita ⇒ ≥1 insight—, no se puede declarar apoyo en un insight del que no se copió nada,
+ * y la traza hereda la inmutabilidad de las citas (SYS-17).
+ *
+ * ── LA PRIORIDAD VIENE CON SU RAZÓN, Y CONTRA QUÉ ──
+ *
+ * `prioridad` sin `prioridadRazon` sería un número que nadie puede discutir. La columna existe
+ * en `oportunidad` precisamente porque un portafolio priorizado sin motivos es una lista
+ * ordenada por quien la escribió último. Y el prompt pide que la razón hable de los CRITERIOS
+ * DE ÉXITO del reto, que es lo que ata la etapa 3 a la promesa de la 0.
+ *
+ * ── LO QUE NO ESTÁ ──
+ *
+ * El VEREDICTO. Aceptar una propuesta de C3 mete la HMW en el portafolio `propuesta`, por
+ * decidir; aprobarla o descartarla es un acto humano con su propia puerta —que re-comprueba
+ * el razonamiento vivo— y su propia razón. Proponer el veredicto y aceptarlo lo firmaría.
+ */
+export const ContenidoOportunidadSchema = z
+  .object({
+    /*
+     * La pregunta. El techo sale del contrato de `oportunidad` y no de aquí: escribirlo a
+     * mano es cómo los dos números se separan, y con una pregunta de 600 caracteres la
+     * propuesta pasaría este esquema para morir en el CHECK de la tabla con la llamada ya
+     * pagada. Es la misma lección que los cuatro topes de C6.
+     *
+     * Que empiece por «¿Cómo podríamos…?» lo pide el prompt y NO lo comprueba nadie: la base
+     * tampoco lo hace, y por el mismo motivo — exigir el prefijo impondría un idioma a un
+     * producto que se usa en español y en inglés, y una regla que se rodea escribiendo el
+     * prefijo delante no es una regla.
+     */
+    pregunta: z.string().trim().min(1).max(MAX_PREGUNTA),
+    /* El rango es el de la columna, no uno propio: `oportunidad.prioridad` tiene su CHECK. */
+    prioridad: z.number().int().min(0).max(1000),
+    /* Y su porqué, obligatorio aunque la columna admita vacío: el vacío existe para las HMW
+     * que escribe una persona sin priorizar todavía, no para las que propone un modelo — que
+     * está proponiendo justamente un orden. */
+    prioridadRazon: z.string().trim().min(1).max(MAX_RAZON),
+    citas: CitasConInsightSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoOportunidad = z.infer<typeof ContenidoOportunidadSchema>;
+
 export const ESQUEMA_DE_CONTENIDO: Record<
   CapacidadActiva,
   z.ZodType<ContenidoPropuesta, z.ZodTypeDef, unknown>
@@ -433,6 +517,7 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   C2: ContenidoInsightSchema,
   C5: ContenidoRemediacionJourneySchema,
   C6: ContenidoEntradaKpiSchema,
+  C3: ContenidoOportunidadSchema,
 };
 
 /**
@@ -499,6 +584,19 @@ export const CITAS_DEL_CONTENIDO: Record<
       ...x,
       alcanceId: (c as ContenidoEntradaKpi).criterioId,
     })),
+  /*
+   * C3 cita contra los INSIGHTS validados del reto, que son varios documentos. Y aquí el
+   * `alcanceId` se pregunta POR CITA y no una vez por propuesta, al revés que en C6: una
+   * entrada KPI responde a UN criterio, pero una HMW puede nacer del cruce de dos o tres
+   * insights —es justo lo que hace buena a una pregunta de la etapa 3—, así que cada cita
+   * nombra el suyo.
+   *
+   * Y esa lista es además la TRAZA: los `insightId` distintos de aquí son los enlaces que la
+   * aceptación materializa. Por eso no hay riesgo de que dos redacciones discrepen — solo hay
+   * una.
+   */
+  C3: (c) =>
+    (c as ContenidoOportunidad).citas.map((x) => ({ ...x, alcanceId: x.insightId })),
 };
 
 /**
@@ -522,6 +620,16 @@ export const TESTIMONIO_ADICIONAL: Record<
   CI: null,
   C0: null,
   CT: null,
+  /*
+   * C3 no añade nada, y eso es una respuesta y no un hueco: lo único que en esta capacidad es
+   * testimonio del modelo —a qué insights se apoya— vive DENTRO de las citas, que ya son
+   * intocables por `CITAS_DEL_CONTENIDO`. Justo por eso la traza no es un campo aparte.
+   *
+   * Y lo que queda fuera sí se corrige, que es la otra mitad: la pregunta se reescribe, la
+   * prioridad se mueve y su razón también. Es lo que quien revisa está para hacer — una HMW
+   * bien fundada pero mal formulada se arregla, no se tira.
+   */
+  C3: null,
   C2: {
     parte: (c) => (c as ContenidoInsight).contradicciones,
     /*

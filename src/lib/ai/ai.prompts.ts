@@ -307,6 +307,108 @@ export function materialDeUnaEvidencia(reto: RetoConEvidencia, evidenciaId: stri
 }
 
 /**
+ * Material de C3: los INSIGHTS VALIDADOS del reto, cada uno con su id delante, y detrás los
+ * CRITERIOS DE ÉXITO como segundo bloque.
+ *
+ * SPEC-08 pone las dos cosas en la fila de C3 —«insights validados + criterios del reto»— y
+ * cada una hace un trabajo distinto, que es la razón de que vayan separadas:
+ *
+ *   · los INSIGHTS son el material CONTRA el que se propone: de ahí se copian las citas, y de
+ *     ahí sale la traza. Llevan tramos, como la evidencia de C2 y los criterios de C6, porque
+ *     la presencia literal de una cita se mide contra EL insight que nombra y no contra el
+ *     material entero — si no, un fragmento del insight de al lado saldría PRESENTE;
+ *   · los CRITERIOS no se citan: son contra lo que la razón de la prioridad tiene que
+ *     argumentar. Una HMW se prioriza por lo que promete mover, y esa promesa está en G0.
+ *
+ * Van en el mismo cuerpo delimitado y no en dos bloques: los dos son material del reto, los
+ * dos se recortan con el mismo presupuesto, y separarlos daría dos techos que hay que repartir
+ * a mano. Los criterios van DETRÁS a propósito — si el recorte muerde, que muerda lo que no se
+ * cita, no lo que sostiene las citas.
+ */
+export type InsightsDelReto = { id: string; titulo: string; resumen: string }[];
+
+type RetoConInsights = {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  insights: InsightsDelReto;
+  criterios: CriteriosDelReto;
+};
+
+export function materialDeOportunidades(reto: RetoConInsights): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Código del reto', reto.codigo],
+      ['Título del reto', reto.titulo],
+    ],
+    cuerpoDeOportunidades(reto).texto,
+  );
+}
+
+/** El cuerpo del material de C3 y dónde queda cada insight dentro de él. Hermano exacto de
+ * `cuerpoDeInsights`, con el mismo motivo escrito allí: el pajar de una cita es el documento
+ * que nombra, y hay que sacarlo de AQUÍ y no recomponerlo aparte —recomponerlo reinicia el
+ * presupuesto y devuelve un texto que el modelo nunca vio—. */
+function cuerpoDeOportunidades(reto: RetoConInsights): {
+  texto: string;
+  tramos: Map<string, [number, number]>;
+} {
+  const partes = [reto.descripcion, '', 'INSIGHTS VALIDADOS DEL RETO'];
+  const tramos = new Map<string, [number, number]>();
+  let largo = partes.join('\n').length;
+  for (const i of reto.insights) {
+    const linea = `[${i.id}] ${i.titulo}\n${i.resumen}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramos.set(i.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
+  }
+  // Los criterios, detrás y sin tramos: no se citan, así que no hay pajar que acotar. Se
+  // enseñan enteros —KPI, definición y objetivo— porque la razón de la prioridad tiene que
+  // poder nombrarlos, y una lista de KPIs a secas no da para argumentar contra nada.
+  partes.push('', 'CRITERIOS DE ÉXITO DEL RETO (contra los que se prioriza; no se citan)');
+  for (const c of reto.criterios) {
+    partes.push(`${c.kpi}: ${c.definicion} · objetivo: ${c.objetivo}`);
+  }
+  return { texto: partes.join('\n'), tramos };
+}
+
+/**
+ * Qué insights llegaron ENTEROS al modelo, cuántos se quedaron fuera y cuánto ocupaba todo.
+ *
+ * Hermano de `evidenciaQueLlegoAlModelo`, y con la misma razón de contar solo los COMPLETOS:
+ * `alcance_insights` dice qué tuvo delante quien escribió las preguntas, y el suelo lo compara
+ * con lo que el reto sabe hoy. Medio insight no es un insight leído — la parte que habría
+ * cambiado la pregunta puede ser justo la que se cortó, y el sello diría que se miró.
+ */
+export function insightsQueLlegaronAlModelo(reto: RetoConInsights): {
+  ids: string[];
+  fuera: number;
+  caracteres: number;
+} {
+  const { texto, tramos } = cuerpoDeOportunidades(reto);
+  const visto = materialQueVeElModelo(texto);
+  const ids = reto.insights
+    .filter((i) => {
+      const tramo = tramos.get(i.id);
+      return tramo !== undefined && visto.slice(tramo[0], tramo[1]).length === tramo[1] - tramo[0];
+    })
+    .map((i) => i.id);
+  return { ids, fuera: reto.insights.length - ids.length, caracteres: texto.length };
+}
+
+/** El texto de UN insight tal como el modelo lo vio, para medir contra él las citas que lo
+ * nombran — y SOLO él. Mismo orden de operaciones que su hermano de C2: se recorta primero y
+ * se corta el tramo después, porque la neutralización del delimitador cambia un carácter por
+ * otro y no mueve las posiciones. */
+export function materialDeUnInsight(reto: RetoConInsights, insightId: string): string {
+  const { texto, tramos } = cuerpoDeOportunidades(reto);
+  const tramo = tramos.get(insightId);
+  if (!tramo) return '';
+  return materialQueVeElModelo(texto).slice(tramo[0], tramo[1]);
+}
+
+/**
  * Material de C6: los CRITERIOS DE ÉXITO del reto, cada uno con su id delante.
  *
  * Mismo patrón que el material de C2 y por el mismo motivo: la cita de una entrada KPI señala
@@ -622,6 +724,36 @@ export const SISTEMA_INSIGHTS = [
 ].join('\n');
 
 /**
+ * C3 propone PREGUNTAS, y su sistema tiene que decir tres cosas que un modelo no adivina.
+ *
+ * 1. Una HMW no es una solución disfrazada. «¿Cómo podríamos añadir un chatbot?» ya decidió
+ *    qué se va a hacer y deja a la etapa 4 sin nada que explorar; la etapa 3 existe para
+ *    abrir el espacio, no para cerrarlo. Es el error más fácil de cometer y el más difícil de
+ *    ver después, porque una solución bien redactada suena a pregunta.
+ * 2. La traza ES la cita. No se le pide una lista de insights aparte: los que cita son en los
+ *    que se apoya, y por eso citar de más o de menos no es un detalle de estilo.
+ * 3. La prioridad se argumenta contra los CRITERIOS DE ÉXITO del reto, que van en el material
+ *    justo por eso. Un número sin ese anclaje es una opinión ordenada.
+ *
+ * Y el prefijo «¿Cómo podríamos…?» se PIDE aquí y no se comprueba en ningún sitio: exigirlo
+ * por CHECK impondría un idioma a un producto que se usa en español y en inglés, y una regla
+ * que se rodea escribiendo el prefijo delante no es una regla. Es la misma decisión que tomó
+ * la tabla.
+ */
+export const SISTEMA_OPORTUNIDADES = [
+  'Eres una capacidad de síntesis de una plataforma de service design. Propones; una persona decide.',
+  'Propones OPORTUNIDADES en forma de pregunta «¿Cómo podríamos…?» (HMW) a partir de los insights validados de un reto.',
+  'Una HMW ABRE el espacio de solución, no lo cierra. Si tu pregunta ya nombra la solución —una app, un chatbot, un formulario nuevo—, no es una oportunidad: es una decisión disfrazada de pregunta. Pregunta por el CAMBIO que hace falta, no por el artefacto.',
+  'Cada oportunidad trae al menos una cita: un fragmento LITERAL del insight en el que se apoya (copiado carácter a carácter, sin parafrasear), con el id EXACTO del insight entre corchetes y su localización. No inventes ids.',
+  'Los insights que citas SON aquellos en los que la pregunta se apoya: no hay otra lista. Cita todos los que la sostienen y ninguno más — citar de adorno inventa un apoyo que nadie escribió.',
+  'La RAZÓN de la prioridad argumenta contra los CRITERIOS DE ÉXITO del reto, que van al final del material: qué criterio movería esta pregunta si se resolviera. Un número sin ese argumento es una opinión ordenada.',
+  'La prioridad va de 0 a 1000, y sirve para ORDENAR: no repartas números parecidos a todo.',
+  'No propongas preguntas que los insights no sostengan, aunque suenen bien: prefiere menos y mejor citadas.',
+  'NO decidas la oportunidad. Tu propuesta entra al portafolio por decidir; aprobarla o descartarla es de las personas, y descartarla exige una razón que tú no puedes escribir.',
+  REGLAS_COMUNES,
+].join('\n');
+
+/**
  * C6 redacta un CONTRATO, y por eso su sistema empieza diciendo lo que NO redacta.
  *
  * El Metric Registry es lo que el cliente se compromete a aportar y contra lo que se lee el
@@ -865,6 +997,41 @@ export function promptRegistry(reto: {
     // declara «10 entradas» cuando el bloque llevaba nueve nombres y siete definiciones a
     // medias es un archivo que sobredeclara lo que el modelo tuvo delante.
     alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.criterios.length} criterios, ${reto.entradas.length} entradas ya en el registry${yaMedido.definicionesRecortadas ? ' (definiciones recortadas)' : ''} (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+  };
+}
+
+/**
+ * Prompt de C3: los insights validados y los criterios del reto, delimitados como dato.
+ *
+ * `alcanceResumen` cuenta las dos cosas por separado porque son dos papeles distintos —de lo
+ * que se cita y de aquello contra lo que se prioriza— y un archivo que las sumara no diría
+ * cuál faltó cuando el recorte muerda.
+ */
+export function promptOportunidades(reto: {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  insights: InsightsDelReto;
+  criterios: CriteriosDelReto;
+  cuantas: number;
+}): { usuario: string; alcanceResumen: string } {
+  const material = materialDeOportunidades(reto);
+  return {
+    usuario: [
+      `Propón hasta ${reto.cuantas} oportunidades HMW para el reto descrito en el material: qué preguntas abre lo que ya se sabe.`,
+      material.bloque,
+      'Cada oportunidad cita al menos un insight del material, por su id EXACTO entre corchetes, con un fragmento LITERAL suyo. Los insights que cites son en los que la pregunta se apoya: no hay otra lista.',
+      'La razón de la prioridad dice contra qué CRITERIO DE ÉXITO del reto juega esta pregunta. Los criterios están al final del material y no se citan: son para argumentar, no para copiar.',
+      // Lo que no se pide, dicho: el veredicto es de las personas y tiene su propia puerta.
+      'NO decidas la oportunidad ni escribas por qué se descartaría: tu propuesta entra al portafolio por decidir.',
+      'Si estos insights no dan para ninguna pregunta que valga la pena explorar, devuelve la lista vacía: es una respuesta correcta y preferible a rellenar el portafolio con preguntas que alguien tendrá que descartar una a una.',
+      material.truncado
+        ? `(El material se truncó a ${MAX_MATERIAL} caracteres: no cites nada de un insight que no ves entero.)`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.insights.length} insights validados, ${reto.criterios.length} criterios (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 
@@ -1335,6 +1502,62 @@ const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>>
         type: 'string',
         enum: ['alta', 'media', 'baja'],
         description: 'Cómo de seguro estás de que ESTE KPI mide lo que el criterio promete',
+      },
+    },
+  },
+  C3: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['pregunta', 'prioridad', 'prioridadRazon', 'citas', 'confianzaPropuesta'],
+    properties: {
+      pregunta: {
+        type: 'string',
+        description:
+          'La oportunidad en forma de pregunta «¿Cómo podríamos…?». Pregunta por el CAMBIO que hace falta, no por el artefacto: si nombra la solución, ya cerró el espacio que la etapa 4 tiene que explorar',
+      },
+      prioridad: {
+        type: 'integer',
+        minimum: 0,
+        maximum: 1000,
+        description:
+          'Para ORDENAR el portafolio, de 0 a 1000. Reparte: números parecidos para todo no ordenan nada',
+      },
+      prioridadRazon: {
+        type: 'string',
+        description:
+          'Por qué esa prioridad, argumentado contra los CRITERIOS DE ÉXITO del reto (al final del material): qué criterio movería esta pregunta si se resolviera',
+      },
+      citas: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['insightId', 'fragmento', 'localizacion'],
+          properties: {
+            insightId: {
+              type: 'string',
+              description:
+                'El id EXACTO del insight del que copias, de entre corchetes en el material. Los insights que cites SON en los que la pregunta se apoya: no hay otra lista, así que no cites de adorno',
+            },
+            fragmento: {
+              type: 'string',
+              description:
+                'Fragmento LITERAL de ESE insight: la parte que hace que esta pregunta tenga sentido',
+            },
+            localizacion: {
+              type: 'string',
+              description: 'Qué parte del insight es (su título, su resumen…)',
+            },
+          },
+        },
+      },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description:
+          'Cómo de seguro estás de que esta pregunta se sostiene en lo que citas, y de que abre en vez de cerrar',
       },
     },
   },

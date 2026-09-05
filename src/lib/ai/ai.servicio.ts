@@ -19,6 +19,12 @@ import {
   materialDeGate,
   evidenciaQueLlegoAlModelo,
   materialDeInsights,
+  materialDeOportunidades,
+  materialDeUnInsight,
+  insightsQueLlegaronAlModelo,
+  promptOportunidades,
+  SISTEMA_OPORTUNIDADES,
+  type InsightsDelReto,
   promptInsights,
   SISTEMA_INSIGHTS,
   type EvidenciaDelReto,
@@ -49,6 +55,7 @@ import {
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   MAX_ENTRADAS_KPI_POR_LOTE,
+  MAX_OPORTUNIDADES_POR_LOTE,
   MAX_INSIGHTS_POR_LOTE,
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
@@ -61,6 +68,7 @@ import {
   type CapacidadActiva,
   type ContenidoCriterio,
   type ContenidoEntradaKpi,
+  type ContenidoOportunidad,
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoRemediacionJourney,
@@ -562,7 +570,37 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
            join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
            join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
            where a.reto_id = r.id and a.workspace_id = r.workspace_id) y)
-      else '[]'::json end as reto_evidencia_nombres`,
+      else '[]'::json end as reto_evidencia_nombres,
+      -- Y lo de C3: los INSIGHTS VALIDADOS del reto y sus CRITERIOS.
+      --
+      -- Los insights salen de «insights_validados_del_reto», que es la MISMA función que usa
+      -- el guard diferido para decidir si la propuesta vio todo lo que el reto sabe. Escribir
+      -- aquí el join a mano habría dejado dos redacciones del mismo conjunto, y la
+      -- discrepancia sería de las que no se ven: el panel compone un material y el suelo
+      -- cuenta otro, así que ninguna propuesta se podría aceptar nunca sin que nadie sepa por
+      -- qué. Es la tercera vez en este pipeline que ese argumento decide algo.
+      --
+      -- El orden es el que arma el prompt (título, id) y el «distinct» no hace falta: la
+      -- función devuelve ids únicos.
+      case when p.capacidad = 'C3' then
+        (select coalesce(json_agg(json_build_object(
+                  'id', i.id, 'titulo', i.titulo, 'resumen', i.resumen)
+                  order by i.titulo, i.id), '[]'::json)
+         from insights_validados_del_reto(r.id, r.workspace_id) as v(id)
+         join insight i on i.id = v.id and i.workspace_id = r.workspace_id)
+      else '[]'::json end as reto_insights,
+      -- Los criterios, que en C3 NO se citan: son contra lo que la razón de la prioridad
+      -- argumenta. Misma proyección que la de C6 salvo el filtro por capacidad — allí el
+      -- material los cita, aquí los usa para justificar un orden.
+      case when p.capacidad = 'C3' then
+        (select coalesce(json_agg(json_build_object(
+                  'id', c.id, 'kpi', c.kpi, 'definicion', c.definicion,
+                  'objetivo', c.objetivo, 'ventanaDias', c.ventana_dias,
+                  'lineaBasePlan', c.linea_base_plan)
+                  order by c.kpi, c.id), '[]'::json)
+         from criterio_exito c
+         where c.reto_id = r.id and c.workspace_id = r.workspace_id)
+      else '[]'::json end as reto_criterios`,
   },
   registry_id: {
     // DOS joins, como el gate: el registry y su RETO. El reto no es adorno — el material de
@@ -1290,6 +1328,125 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
       };
     },
   },
+  C3: {
+    /*
+     * Lo que deja obsoleta una HMW propuesta es que la VENTANA DEL PORTAFOLIO se cierre: se
+     * firma su G3 —que certifica el portafolio tal como está—, se abre la medición, o el reto
+     * se cierra o se archiva. Las cuatro preguntas están en `reto_admite_portafolio`, que es
+     * la MISMA función que miran las cuatro políticas de «oportunidad», el guard del insert y
+     * el guard diferido. Escribir aquí el predicado a mano habría dejado una cuarta redacción
+     * del mismo juicio, y este repositorio ya ha pagado por dos.
+     *
+     * Y NADA de lo que congela a C0 o bloquea a C2 aplica aquí, que es justo lo que el
+     * registro por capacidad existe para permitir: las tres cuelgan del MISMO reto y no
+     * comparten ni una puerta.
+     */
+    estado: (tx) => tx`case
+        when not reto_admite_portafolio(p.reto_id, p.workspace_id) then 'portafolio-cerrado'
+        /*
+         * Y que los insights que la HMW cita SIGAN validados y existiendo.
+         *
+         * «insight» no se borra por la aplicación, pero sí se puede DESVALIDAR —volver a
+         * 'propuesto'— y la política de «oportunidad_insight» solo admite validados: sin esta
+         * rama el panel decía disponible y aceptar fallaba siempre, que es la tarjeta
+         * aceptable que no se deja aceptar. Es el hermano del «evidencia-no-citable» de C2 y
+         * del «criterio-ausente» de C6.
+         *
+         * Se pregunta por la AUSENCIA de un insight validado y no por la presencia de uno
+         * desvalidado: así el insight borrado por administración cae en la misma rama en vez
+         * de pasar por disponible. Y por TEXTO, no casteando a uuid, como las otras dos: el
+         * contenido es jsonb y un id que no parsee reventaría la consulta del panel ENTERO.
+         */
+        when exists (
+          select 1 from jsonb_path_query(p.contenido, '$.citas[*].insightId') c
+          where not exists (
+            select 1 from insight i
+            where i.id::text = lower(c #>> '{}') and i.workspace_id = p.workspace_id
+              and i.estado = 'validado'))
+          then 'insight-no-validado'
+        /*
+         * Y que el reto no haya ganado insights validados que estas preguntas no vieron.
+         *
+         * La condición es LA MISMA que la del guard diferido, escrita con la misma función,
+         * porque una discrepancia entre las dos devuelve exactamente el problema que esta
+         * rama quita: un botón que siempre vuelve.
+         */
+        when p.alcance_insights is not null and exists (
+          select 1 from insights_validados_del_reto(p.reto_id, p.workspace_id) as v(id)
+          where not (v.id = any (p.alcance_insights)))
+          then 'alcance-incompleto'
+        else 'disponible'
+      end`,
+    material: (f) =>
+      materialDeOportunidades({
+        codigo: (f.reto_codigo as string | null) ?? '',
+        titulo: (f.reto_titulo as string | null) ?? '',
+        descripcion: (f.reto_descripcion as string | null) ?? '',
+        insights: (f.reto_insights as InsightsDelReto | null) ?? [],
+        criterios: (f.reto_criterios as CriteriosDelReto | null) ?? [],
+      }).texto,
+    // Y si ese material sigue siendo el que vio el modelo. Mismo argumento que en C2 y C6: el
+    // material son varios documentos concatenados y el recorte es global, así que validar un
+    // insight nuevo que ordena antes mueve el trozo del citado y el verde de la presencia
+    // literal pasa a mentir en los dos sentidos. No saber NO se resuelve como vigente.
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
+    /** El título de cada insight, para que una cita diga de QUÉ conclusión habla. */
+    etiquetasDelContenido: (f) =>
+      Object.fromEntries(
+        ((f.reto_insights as InsightsDelReto | null) ?? []).map((i) => [i.id, i.titulo]),
+      ),
+    /*
+     * Una cita de C3 se mide contra EL INSIGHT QUE NOMBRA, no contra el material entero. Es el
+     * hermano exacto del de C2, con la misma trampa evitada: se compone con la función que
+     * arma el prompt y se corta el tramo del cuerpo YA recortado, porque recomponer la línea
+     * aparte reinicia el presupuesto y devuelve texto que el modelo nunca vio.
+     */
+    pajarDeLaCita: (f, cita) => {
+      if (cita.alcanceId === undefined) return null;
+      const tramo = materialDeUnInsight(
+        {
+          codigo: (f.reto_codigo as string | null) ?? '',
+          titulo: (f.reto_titulo as string | null) ?? '',
+          descripcion: (f.reto_descripcion as string | null) ?? '',
+          insights: (f.reto_insights as InsightsDelReto | null) ?? [],
+          criterios: (f.reto_criterios as CriteriosDelReto | null) ?? [],
+        },
+        cita.alcanceId,
+      );
+      // Tramo vacío es «ese insight no está en el material» —se desvalidó, o el recorte no
+      // llegó a él—, y eso es `null` y no `''`: son dos respuestas que este contrato
+      // distingue. Devolver `''` funcionaría por accidente y dejaría viva la única forma de
+      // perderlo, que es resolver el `null` con el material entero.
+      return tramo === '' ? null : tramo;
+    },
+    /*
+     * Retos con INSIGHTS VALIDADOS y con el portafolio ABIERTO, sin HMW esperando revisión.
+     *
+     * Lo primero no es comodidad: sin insights validados, la única salida que cumple el
+     * contrato —una pregunta con citas literales de un insight— saldría de la formulación del
+     * reto, o sea inventada. Es el mismo caso que C2 sin evidencia y C6 sin criterios.
+     *
+     * Y lo segundo tampoco: ofrecer un reto cuyo portafolio está cerrado es ofrecer una
+     * llamada que el guard del insert va a rechazar DESPUÉS de pagarla.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
+        where r.workspace_id = ${workspaceId}
+          and reto_admite_portafolio(r.id, r.workspace_id)
+          and exists (select 1 from insights_validados_del_reto(r.id, r.workspace_id))
+          and not exists (select 1 from propuesta_ai p
+            where p.reto_id = r.id and p.workspace_id = r.workspace_id
+              and p.capacidad = 'C3' and p.estado = 'propuesta')
+          and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
+        order by r.codigo asc, r.id asc
+        limit ${limite}`;
+      return {
+        lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
+        hayMas: false,
+      };
+    },
+  },
   C6: {
     /*
      * Lo que deja obsoleta una entrada propuesta es que su registry se FIRME —ahí el contrato
@@ -1866,6 +2023,11 @@ type Alcance = {
   huellaEntradas?: string;
   /** Los ids de la evidencia de ese material. Ver `Preparacion`. */
   evidenciaDelMaterial?: string[];
+  /** Y los ids de los INSIGHTS que llegaron enteros al modelo (C3). Es la misma pregunta que
+   * la de arriba con otro sustantivo —lo que se sella tiene que haberse leído— y se resuelve
+   * igual: la huella es de un TEXTO y no hay SQL que lo reconstruya; el conjunto de ids sí, y
+   * es lo único que la base puede volver a preguntarse en el último instante. */
+  insightsDelMaterial?: string[];
 };
 
 /**
@@ -1909,8 +2071,14 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const consentimiento = exigeConsentimiento
       ? await leerConsentimientoBajoCandado(tx, entrada)
       : null;
-    const { sistema, prompt, huellaMaterial, huellaEntradas, evidenciaDelMaterial } =
-      await PREPARAR[entrada.capacidad](tx, entrada);
+    const {
+      sistema,
+      prompt,
+      huellaMaterial,
+      huellaEntradas,
+      evidenciaDelMaterial,
+      insightsDelMaterial,
+    } = await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
       throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
     }
@@ -2007,6 +2175,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       huellaMaterial,
       huellaEntradas,
       evidenciaDelMaterial,
+      insightsDelMaterial,
     };
   });
 }
@@ -2573,6 +2742,78 @@ function anclasDelInsert(
  *   · `for share` sobre la fila del reto y sobre los `derecho_uso` de su evidencia, que es lo
  *     que ordena las revocaciones y los archivados ya commiteados.
  */
+/**
+ * El material de C3 y su huella, con los candados del protocolo tomados en su orden.
+ *
+ * Hermano de `huellaDelMaterialDeInsights`, y comparte con él el motivo de existir: lo que se
+ * manda al modelo y lo que se vuelve a mirar antes de despachar tienen que salir de la MISMA
+ * lectura, o la huella compara dos textos que nadie compuso igual.
+ *
+ * Los insights salen de `insightsValidadosDelReto`, que llama a la función SQL que también usa
+ * el guard diferido: una tercera redacción del conjunto sería un guard que cuenta uno más que
+ * el prompt, y ninguna propuesta aceptable nunca.
+ *
+ * `null` en `reto` significa «este reto ya no admite HMW» —archivado, cerrado, o con el
+ * portafolio congelado por su G3—, que es lo que la ventana decide; quien llama traduce eso a
+ * su mensaje, que no es el mismo antes de despachar que al persistir.
+ */
+async function huellaDelMaterialDeOportunidades(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+): Promise<{
+  huella: string;
+  reto:
+    | {
+        codigo: string;
+        titulo: string;
+        descripcion: string;
+        insights: InsightsDelReto;
+        criterios: CriteriosDelReto;
+      }
+    | null;
+}> {
+  await tx`select pg_advisory_xact_lock_shared(
+    hashtextextended('designio:workspace:' || ${entrada.workspaceId}, 42))`;
+  await tx`select pg_advisory_xact_lock(
+    hashtextextended('designio:reto:' || ${entrada.anclaId}, 42))`;
+  await tx`select 1 from reto
+    where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+    for share`;
+  const [fila] = await tx`select
+      reto_admite_portafolio(${entrada.anclaId}, ${entrada.workspaceId}) as admite,
+      codigo, titulo, descripcion
+    from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+  if (!fila || !(fila.admite as boolean)) return { huella: '', reto: null };
+  const insights = await tx`select i.id, i.titulo, i.resumen
+    from insights_validados_del_reto(${entrada.anclaId}, ${entrada.workspaceId}) as v(id)
+    join insight i on i.id = v.id and i.workspace_id = ${entrada.workspaceId}
+    order by i.titulo asc, i.id asc`;
+  const criterios = await tx`select c.id, c.kpi, c.definicion, c.objetivo,
+      c.ventana_dias, c.linea_base_plan
+    from criterio_exito c
+    where c.reto_id = ${entrada.anclaId} and c.workspace_id = ${entrada.workspaceId}
+    order by c.kpi asc, c.id asc`;
+  const reto = {
+    codigo: fila.codigo as string,
+    titulo: fila.titulo as string,
+    descripcion: fila.descripcion as string,
+    insights: insights.map((i) => ({
+      id: i.id as string,
+      titulo: i.titulo as string,
+      resumen: i.resumen as string,
+    })),
+    criterios: criterios.map((c) => ({
+      id: c.id as string,
+      kpi: c.kpi as string,
+      definicion: c.definicion as string,
+      objetivo: c.objetivo as string,
+      ventanaDias: c.ventana_dias as number | null,
+      lineaBasePlan: c.linea_base_plan as string,
+    })),
+  };
+  return { huella: huellaDelMaterial(materialDeOportunidades(reto).texto), reto };
+}
+
 async function huellaDelMaterialDeInsights(
   tx: TransactionSql,
   entrada: GenerarPropuestas,
@@ -2910,6 +3151,31 @@ const REVALIDAR: Record<
       throw new ErrorAI(`${MOTIVO_ENTRADAS_MOVIDAS}: no se llamó al proveedor. Vuelve a pedirlo.`);
     }
   },
+  C3: async (tx, entrada, huellaMaterial) => {
+    /*
+     * Dos preguntas, las dos bajo los candados de `huellaDelMaterialDeOportunidades`:
+     *
+     * 1. Que el portafolio SIGA abierto. Firmar el G3 es un acto humano que ocurre justo en el
+     *    rato que va de preparar a despachar —es lo que la etapa 3 hace al terminar—, y una
+     *    HMW propuesta contra un portafolio ya certificado solo se puede tirar, con la llamada
+     *    pagada.
+     * 2. Que el MATERIAL siga siendo el que se armó, no «que quede algún insight». Un insight
+     *    VALIDADO en este rato cambia el texto que el prompt ya lleva dentro —y es justo el
+     *    que podría haber cambiado la pregunta—, así que la pregunta por el conjunto entero es
+     *    la que corresponde a lo que se va a mandar.
+     */
+    const { huella, reto } = await huellaDelMaterialDeOportunidades(tx, entrada);
+    if (!reto) {
+      throw new ErrorAI(
+        'El portafolio de ese reto se cerró mientras se preparaba la llamada —se firmó su G3, se abrió la medición o el reto se cerró—: no se llamó al proveedor',
+      );
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'Los insights validados de ese reto cambiaron mientras se preparaba la llamada —se validó uno, o se editó—, así que el material ya no es el que se iba a mandar: no se llamó al proveedor. Vuelve a pedirlo.',
+      );
+    }
+  },
   C5: async (tx, entrada, huellaMaterial) => {
     /*
      * Lo que puede haber pasado mientras se preparaba la llamada es que ALGUIEN CIERRE las
@@ -3002,6 +3268,11 @@ type Preparacion = {
    * y se guarda: el guard diferido no puede llamar a TypeScript.
    */
   evidenciaDelMaterial?: string[];
+  /** Y los ids de los INSIGHTS que llegaron enteros al modelo (C3). Es la misma pregunta que
+   * la de arriba con otro sustantivo —lo que se sella tiene que haberse leído— y se resuelve
+   * igual: la huella es de un TEXTO y no hay SQL que lo reconstruya; el conjunto de ids sí, y
+   * es lo único que la base puede volver a preguntarse en el último instante. */
+  insightsDelMaterial?: string[];
 };
 const PREPARAR: Record<
   CapacidadActiva,
@@ -3308,6 +3579,63 @@ const PREPARAR: Record<
       ),
     };
   },
+  C3: async (tx, entrada) => {
+    // El MISMO lector que la revalidación, no una consulta paralela: el material que se manda
+    // y el que se vuelve a mirar antes de despachar tienen que salir de la misma lectura, o la
+    // huella compara dos textos que nadie compuso igual.
+    const { reto } = await huellaDelMaterialDeOportunidades(tx, entrada);
+    if (!reto) {
+      throw new ErrorAI(
+        'El portafolio de ese reto está cerrado: su G3 quedó firmado sobre lo que había y la etapa 3 no está reabierta, o el reto ya no admite trabajo de método',
+      );
+    }
+    /*
+     * Sin insights validados no se llama. El contrato de C3 obliga a que cada HMW cite un
+     * insight del material POR SU ID, y sin insights la única salida que lo cumple es un id
+     * inventado. Es el mismo caso que el item importado solo con su referencia, que el reto
+     * sin evidencia de C2 y que el reto sin criterios de C6, y la respuesta es la misma: no
+     * ofrecerlo y decir dónde se arregla.
+     */
+    if (reto.insights.length === 0) {
+      throw new ErrorAI(
+        'Ese reto no tiene insights validados: una HMW se apoya en lo que ya se sabe, y aquí no hay nada validado en lo que apoyarse. Los insights se validan en la etapa 2 — valídalos y vuelve a pedirlo.',
+      );
+    }
+    /*
+     * Y «tener insights» no es lo mismo que «que llegue alguno». El cuerpo es la formulación
+     * del reto más todos los insights más los criterios, y se recorta ENTERO a `MAX_MATERIAL`:
+     * con una descripción larga por delante, la cola se queda fuera —el insight donde cae el
+     * corte, a medias; los siguientes, del todo—. Si NINGUNO llega completo, la única salida
+     * que cumple el contrato —una pregunta que cita un fragmento literal de un insight— sale
+     * de uno que el modelo no vio entero: o sea inventada, con aspecto de fundamentada y
+     * pagada.
+     *
+     * Es la misma regla que la de C6 con sus criterios, con la misma causa: el recorte.
+     */
+    const llegados = insightsQueLlegaronAlModelo(reto);
+    if (llegados.ids.length === 0) {
+      throw new ErrorAI(
+        `Ninguno de los ${reto.insights.length} insights validados de ese reto cabe entero en el material (el techo son ${MAX_MATERIAL} caracteres, y la formulación del reto va delante): no se llamó al proveedor, porque cualquier pregunta saldría de un insight que el modelo no habría visto completo. Acorta la descripción del reto o los resúmenes de sus insights y vuelve a pedirlo.`,
+      );
+    }
+    return {
+      sistema: SISTEMA_OPORTUNIDADES,
+      prompt: promptOportunidades({ ...reto, cuantas: MAX_OPORTUNIDADES_POR_LOTE }),
+      /*
+       * La huella de ESTE material, para volver a mirarla justo antes de despachar. Entre esta
+       * transacción y aquella hay un commit, y lo que puede pasar en medio no es solo que se
+       * firme el G3: que VALIDEN un insight, y el bloque está armado y saldría igual.
+       */
+      huellaMaterial: huellaDelMaterial(materialDeOportunidades(reto).texto),
+      /*
+       * Y qué insights llegaron ENTEROS, que es lo que la base puede volver a preguntarse en
+       * el último instante. La huella es de un texto —con su formato y su recorte— y no hay
+       * SQL que lo reconstruya; el conjunto de ids sí. Sale de `llegados` y no de otra lectura:
+       * dos consultas para el mismo conjunto es cómo empiezan las discrepancias.
+       */
+      insightsDelMaterial: llegados.ids,
+    };
+  },
   C5: async (tx, entrada) => {
     // El MISMO lector que usa la pantalla del journey, no una consulta paralela: lo que se
     // le enseña al modelo y lo que la validación evalúa tienen que salir de la misma
@@ -3470,6 +3798,42 @@ const COMPROBAR: Record<
    * de dejar que lo descubra quien acepta la segunda: media respuesta no es revisable, y el
    * suelo no puede decir cuál de las dos sobra.
    */
+  C3: async (tx, entrada, contenidos, huellaMaterial) => {
+    const { huella, reto } = await huellaDelMaterialDeOportunidades(tx, entrada);
+    if (!reto) {
+      throw new ErrorAI(
+        'El portafolio de ese reto se cerró mientras el proveedor respondía —se firmó su G3, se abrió la medición o el reto se cerró—: la propuesta no se guarda',
+      );
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'Los insights validados de ese reto cambiaron mientras el proveedor respondía —se validó uno, o se editó—, así que estas preguntas se escribieron sin verlos: la propuesta no se guarda. Vuelve a pedirla.',
+      );
+    }
+    /*
+     * Y cada cita señala un insight que el modelo VIO ENTERO, que no es lo mismo que uno que
+     * exista. La huella de arriba dice que el material no cambió; esto dice otra cosa: que lo
+     * que la respuesta señala estaba DENTRO de lo que se mandó.
+     *
+     * Un `insightId` de un insight recortado pasa el suelo de la base —es un insight validado
+     * del reto, y eso sigue siendo cierto— y sin embargo la pregunta no pudo leer aquello en
+     * lo que dice apoyarse. Sus citas saldrían AUSENTES en el panel contra un tramo vacío: la
+     * señal correcta, pero llegando tarde, con la llamada pagada y el lote en la bandeja de
+     * alguien.
+     *
+     * Se descarta el LOTE ENTERO y no las filas que fallen, como con C5 y con los nombres
+     * repetidos de C6: media respuesta no es revisable.
+     */
+    const llegados = new Set(insightsQueLlegaronAlModelo(reto).ids);
+    const fuera = (contenidos as ContenidoOportunidad[]).flatMap((c) =>
+      c.citas.filter((x) => !llegados.has(x.insightId)).map((x) => x.insightId),
+    );
+    if (fuera.length > 0) {
+      throw new ErrorContratoAI(
+        'Alguna pregunta cita un insight que no llegó entero al material —el recorte lo dejó fuera—, así que se apoya en algo que el modelo no vio completo: se descarta el lote. Acorta la descripción del reto o los resúmenes de sus insights y vuelve a pedirlo.',
+      );
+    }
+  },
   C6: async (tx, entrada, contenidos, huellaMaterial, huellaEntradas) => {
     const { huella, registry } = await huellaDelMaterialDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
     if (!registry) {
@@ -3843,7 +4207,7 @@ async function persistirPropuestas(
       insert into propuesta_ai
         (workspace_id, capacidad, destino, ${anclas.columnas}, contenido, contenido_original,
          confianza, modelo, prompt_version, alcance_resumen, huella_material,
-         alcance_evidencia, origen_key,
+         alcance_evidencia, alcance_insights, origen_key,
          llamada_id, orden, es_simulacion, creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino}, ${anclas.valores},
              c.contenido, c.contenido,
@@ -3864,6 +4228,7 @@ async function persistirPropuestas(
              -- de una forma que el suelo puede volver a hacerse: la huella es de un texto
              -- con formato y recorte, y no hay SQL que lo reconstruya. Ver «Preparacion».
              ${alcance.evidenciaDelMaterial ?? null},
+             ${alcance.insightsDelMaterial ?? null},
              ${alcance.origenKey}, ${llamada.id},
              -- El puesto en el lote sale de la MISMA sentencia que inserta (with
              -- ordinality, que numera desde 1, de ahi el -1) y no de un contador aparte
@@ -4335,6 +4700,14 @@ async function aceptarPropuestaEnTransaccion(
         materializarCriterio(tx, actorId, entrada.workspaceId, p, contenido as ContenidoCriterio),
       insight: () =>
         materializarInsight(tx, actorId, entrada.workspaceId, p, contenido as ContenidoInsight),
+      oportunidad: () =>
+        materializarOportunidad(
+          tx,
+          actorId,
+          entrada.workspaceId,
+          p,
+          contenido as ContenidoOportunidad,
+        ),
       'entrada-kpi': () =>
         materializarEntradaKpi(
           tx,
@@ -4693,6 +5066,99 @@ async function materializarEntradaKpi(
     if (err.code === '42501') {
       throw new ErrorAI(
         'El registry está firmado, o el criterio al que responde esta entrada no es de su reto: la propuesta no se puede materializar',
+      );
+    }
+    if (err.code === 'P0001' && err.message) throw new ErrorAI(err.message);
+    throw e;
+  }
+}
+
+/**
+ * Aceptar una HMW: la fila del portafolio y su traza, en la misma transacción.
+ *
+ * La traza son los `insightId` DISTINTOS de las citas — no hay otra lista, y el guard diferido
+ * comprueba que sean exactamente ésos. `Set` para no insertar dos veces el mismo insight
+ * cuando una pregunta lo cita dos veces, que es legítimo: dos fragmentos del mismo insight
+ * sostienen la pregunta igual, y `oportunidad_insight` tiene su clave única.
+ *
+ * Nace `propuesta`, por decidir: aceptar la propuesta de la AI mete la pregunta en el
+ * portafolio, no la aprueba. El veredicto es un acto humano con su propia puerta —que
+ * re-comprueba el razonamiento vivo— y su propia razón.
+ */
+async function materializarOportunidad(
+  tx: TransactionSql,
+  actorId: string,
+  workspaceId: string,
+  p: PropuestaEnRevision,
+  c: ContenidoOportunidad,
+): Promise<string> {
+  /*
+   * Las dos preguntas que caducan entre generar y aceptar, por la MISMA función que las hace
+   * antes de llamar al proveedor — y con ella los candados en el orden del protocolo
+   * (workspace compartido → clave del reto → fila del reto).
+   *
+   * 1. Que el portafolio SIGA abierto. El guard diferido lo vuelve a preguntar en el commit
+   *    —ése es el suelo—; esto es para que el motivo llegue con nombre a quien revisa.
+   * 2. Que el MATERIAL siga siendo el que el modelo leyó. Ésta no la puede hacer la base: el
+   *    texto se compone en TypeScript, con su recorte, así que no hay SQL que lo recalcule.
+   */
+  const { huella, reto } = await huellaDelMaterialDeOportunidades(tx, {
+    workspaceId,
+    capacidad: 'C3',
+    anclaId: p.anclaId,
+  });
+  if (!reto) {
+    throw new ErrorAI(
+      'El portafolio de ese reto está cerrado: su G3 quedó firmado sobre lo que había, se abrió la medición, o el trabajo del reto se cerró. Esta propuesta quedó obsoleta y solo puede rechazarse',
+    );
+  }
+  /*
+   * La comparación es CONTRA EL MISMO RENDER, y cuando no lo es se rechaza igual — con la
+   * misma pareja de condiciones que C6 y por la misma razón escrita allí: saltarse la
+   * comprobación deja sin ninguna a toda propuesta que sobreviva a un despliegue del prompt, y
+   * aquí «no sé» no puede volverse un permiso, porque lo que entra al portafolio lo certifica
+   * después un gate.
+   */
+  if (p.promptVersion !== PROMPT_VERSION || p.huellaMaterial === null) {
+    throw new ErrorAI(
+      'No se puede comprobar que los insights sigan siendo los que el modelo leyó: esta propuesta se generó con otra versión del prompt, así que su huella del material no es comparable con la de ahora. Recházala y pide un lote nuevo',
+    );
+  }
+  if (huella !== p.huellaMaterial) {
+    throw new ErrorAI(
+      'Los insights validados de ese reto cambiaron después de que el modelo los leyera: esta pregunta se escribió sin conocer parte de lo que el reto ya sabe, así que no se puede aceptar. Recházala y pide un lote nuevo',
+    );
+  }
+  try {
+    const [fila] = await tx`insert into oportunidad
+      (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+      values (${workspaceId}, ${p.anclaId}, ${c.pregunta}, ${c.prioridad}, ${c.prioridadRazon},
+              ${actorId})
+      returning id`;
+    const oportunidadId = fila!.id as string;
+    for (const insightId of new Set(c.citas.map((x) => x.insightId))) {
+      await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+        values (${workspaceId}, ${oportunidadId}, ${insightId})`;
+    }
+    return oportunidadId;
+  } catch (e) {
+    const err = e as { code?: string; message?: string };
+    // Cada causa con su salida. La pregunta repetida se arregla corrigiéndola —el único es por
+    // `titulo_normalizado`, así que cambiarle los espacios no basta y el mensaje lo dice—; el
+    // insight que ya no está validado no se arregla desde aquí.
+    if (err.code === '23505') {
+      throw new ErrorAI(
+        'Ese reto ya tiene una oportunidad con esa misma pregunta: corrígela antes de aceptarla (dos preguntas que solo se diferencian en espacios, mayúsculas o acentos cuentan como la misma)',
+      );
+    }
+    if (err.code === '23503') {
+      throw new ErrorAI(
+        'Alguno de los insights que esta pregunta cita ya no existe en este workspace: la propuesta quedó obsoleta y solo puede rechazarse',
+      );
+    }
+    if (err.code === '42501') {
+      throw new ErrorAI(
+        'El portafolio de ese reto está cerrado, o alguno de los insights que cita ya no está validado: la propuesta no se puede materializar',
       );
     }
     if (err.code === 'P0001' && err.message) throw new ErrorAI(err.message);

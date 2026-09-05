@@ -64,7 +64,18 @@ create table oportunidad (
   --
   -- La misma función con la que se decide si dos preguntas son la misma, unas líneas más
   -- abajo: tener dos ideas distintas de «vacío» en la misma columna es cómo se separan.
-  pregunta text not null check (titulo_normalizado(pregunta) <> ''),
+  --
+  -- Y con TECHO, los mismos 500 de `PreguntaSchema`. Lo dejé fuera una ronda con el argumento
+  -- de que este esquema no acota por longitud ningún otro texto libre, y eso era FALSO: lo
+  -- hacen `comentario.cuerpo` (5000), `consentimiento_item.alcance` (1000),
+  -- `acuerdo_disposicion.base` (300), `llamada_ai.motivo` (500) y `archivo_importado.nombre`
+  -- (200). Acotar aquí es seguir la convención, no escribir una regla en una esquina.
+  --
+  -- Y lo que se evita no es solo «una fila rara»: la pregunta se copia en el evento de
+  -- dominio, que es append-only, y viaja entera en cada carga del portafolio. Un texto que la
+  -- API no puede crear y que la base sí guarda acaba en los dos sitios donde ya no se corrige.
+  pregunta text not null check (
+    titulo_normalizado(pregunta) <> '' and length(pregunta) <= 500),
   -- La priorización RAZONADA (SPEC-08 C3, prediseño §3: «priorización contra criterios del
   -- reto»). El número ordena; el texto dice por qué, que es la mitad que se pierde siempre.
   --
@@ -79,10 +90,12 @@ create table oportunidad (
   -- CHECK y no en la política por lo mismo que el vocabulario del estado: es una propiedad del
   -- VALOR, no de quién escribe ni de cuándo.
   prioridad integer not null default 0 check (prioridad between 0 and 1000),
-  prioridad_razon text not null default '',
+  -- Las dos razones, con el techo de `MAX_RAZON`, por lo mismo que la pregunta: las dos se
+  -- copian al evento y las dos las pinta la pantalla.
+  prioridad_razon text not null default '' check (length(prioridad_razon) <= 2000),
   estado text not null default 'propuesta'
     check (estado in ('propuesta', 'aprobada', 'descartada')),
-  veredicto_razon text not null default '',
+  veredicto_razon text not null default '' check (length(veredicto_razon) <= 2000),
   decidido_por uuid references usuario(id),
   decidido_en timestamptz,
   creado_por uuid not null references usuario(id),

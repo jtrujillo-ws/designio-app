@@ -1014,6 +1014,30 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
           where id = ${o!.id as string} and workspace_id = ${ws}`),
       ).rejects.toThrow();
     }
+    // Y el TECHO de los tres textos, que es la otra mitad de «lo que la API puede crear».
+    //
+    // Lo dejé fuera una ronda con el argumento de que este esquema no acota por longitud
+    // ningún otro texto libre, y era falso: lo hacen `comentario.cuerpo`,
+    // `consentimiento_item.alcance`, `acuerdo_disposicion.base`, `llamada_ai.motivo` y
+    // `archivo_importado.nombre`. Y lo que entra por aquí no se queda en la fila: la pregunta
+    // y las razones se copian al evento de dominio —append-only— y viajan enteras en cada
+    // carga del portafolio.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into oportunidad
+        (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+        values (${ws}, ${retoId}, ${'¿' + 'x'.repeat(500)}, 1, 'Razón', ${leadId})`),
+    ).rejects.toThrow();
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into oportunidad
+        (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+        values (${ws}, ${retoId}, '¿Cómo podríamos razonar de más?', 1, ${'x'.repeat(2001)},
+                ${leadId})`),
+    ).rejects.toThrow();
+    // Y justo en el techo entran: un límite que no admite su borde está mal escrito.
+    await conUsuario(leadId, (tx) => tx`insert into oportunidad
+      (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+      values (${ws}, ${retoId}, ${'x'.repeat(500)}, 1, ${'y'.repeat(2000)}, ${leadId})`);
+
     // Y una razón DE VERDAD descarta, que es la mitad sin la cual tapiar la puerta pasaría
     // igual.
     await conUsuario(leadId, (tx) => tx`update oportunidad

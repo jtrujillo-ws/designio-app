@@ -651,6 +651,7 @@ function Lateral({
       <DestinoDelWorkspace to="/design-versions" etiqueta="Versions y releases" abrev="DVR" />
       <DestinoDelWorkspace to="/propuestas" etiqueta="Propuestas AI" abrev="AI" />
       <DestinoDelWorkspace to="/personas" etiqueta="Personas y permisos" abrev="PER" />
+      <DestinoDelWorkspace to="/segmentos" etiqueta="Segmentos" abrev="SEG" />
       <DestinoDelWorkspace to="/exportacion" etiqueta="Exportación del workspace" abrev="EXP" />
       {/* Esta puerta NO se condiciona al rol: detrás están las constancias que cada quien
           conserva, y ésas no dependen de ninguna membresía. El rótulo nombra lo que cada
@@ -787,6 +788,7 @@ type RutaSinParametros =
   | '/design-versions'
   | '/propuestas'
   | '/personas'
+  | '/segmentos'
   | '/exportacion'
   | '/disposicion'
   | '/auditoria';

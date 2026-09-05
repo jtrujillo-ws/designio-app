@@ -3427,6 +3427,26 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * `timestamp` sin huso.
    */
   const CIERRA_LA_ENVOLTURA = /^\s*(?:\(\s*\))?\s*\)/;
+  /*
+   * Y la envoltura NO certifica un reloj de PARED. `timezone('UTC', …)` fija al huso del
+   * servidor un INSTANTE; aplicado a algo que ya leyó la hora local no deshace nada — la
+   * reinterpreta como si fuera UTC y la desplaza otra vez en el mismo sentido. Medido:
+   *
+   *   timezone('UTC', localtimestamp)::date
+   *     Pacific/Kiritimati -> 2026-09-06     Etc/GMT+12 -> 2026-09-04
+   *
+   * DOS días de diferencia, no uno: es peor que el `current_date` desnudo del que va todo
+   * este PR, y con aspecto de arreglo canónico.
+   *
+   * `current_timestamp` no está en la lista y es a propósito: devuelve un `timestamptz`, o
+   * sea un instante, y envolverlo sí lo fija. Los cuatro que están son los que leen la hora
+   * de pared.
+   *
+   * Estos cuatro ya los prohíbe la comprobación léxica, así que en un árbol verde no llegan
+   * aquí. La razón de que este certificado los rechace igual es que un guardián no puede
+   * apoyarse en otro: el día que aquél se rompa, éste no puede estar dándolos por buenos.
+   */
+  const RELOJ_DE_PARED = /^(?:current_date|current_time|localtime|localtimestamp)$/i;
 
   /**
    * El veredicto, del revés: devuelve el certificado si lo hay, o `null` si no se puede
@@ -3458,6 +3478,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     if (relojes.length === 0) return { certificado: 'sin instante' };
     // «ENVUELTO EN UTC»: todos los instantes del objeto están fijados al huso del servidor.
     const envuelto = (r: RegExpMatchArray): boolean => {
+      if (RELOJ_DE_PARED.test(r[0])) return false;
       const detras = dondeBuscar.slice(r.index! + r[0].length, r.index! + r[0].length + 40);
       return (
         (ENVUELTO_ANTES.test(dondeBuscar.slice(Math.max(0, r.index! - 60), r.index!)) &&
@@ -3720,6 +3741,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     'funcion censo_cert_indirecta',
     'funcion censo_cert_aritmetica',
     'funcion censo_cert_recibido',
+    'funcion censo_cert_pared_envuelta',
   ];
 
   /**
@@ -6567,6 +6589,21 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'create function censo_cert_recibido(p_instante timestamptz) returns date ' +
         'language sql as $c$ select p_instante $c$',
     );
+    /*
+     * Y el RELOJ DE PARED ENVUELTO, que tiene el aspecto exacto del arreglo canónico de este
+     * PR y es peor que el defecto que arregla: `timezone('UTC', localtimestamp)` no deshace
+     * nada, reinterpreta una hora local como si fuera UTC y la desplaza otra vez en el mismo
+     * sentido. Medido: 2026-09-06 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12 — DOS
+     * días, cuando el `current_date` desnudo del que va todo esto solo daba uno.
+     *
+     * La comprobación léxica ya lo prohíbe, así que en un árbol verde no llega a la
+     * certificación. Está aquí porque un guardián no puede apoyarse en otro: el día que aquél
+     * se rompa, éste no puede estar dándolo por bueno.
+     */
+    await admin.unsafe(
+      'create function censo_cert_pared_envuelta() returns date language sql as ' +
+        "$c$ select timezone('UTC', localtimestamp)::date $c$",
+    );
     await admin`create table censo_cert_agenda (censo_cert_dia date, censo_cert_hito timestamptz)`;
     await admin.unsafe(`create function censo_cert_por_nombre() returns void language plpgsql as $c$
       begin insert into censo_cert_agenda (censo_cert_dia) select censo_cert_dia
@@ -6722,6 +6759,7 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       await admin`drop function censo_cert_por_nombre()`;
       await admin`drop function censo_cert_indirecta()`;
       await admin`drop function censo_cert_aritmetica()`;
+      await admin`drop function censo_cert_pared_envuelta()`;
       await admin.unsafe('drop function censo_cert_recibido(timestamptz)');
       await admin.unsafe('drop function censo_cert_momento(boolean)');
       await admin`drop function censo_cert_por_nombre_ok()`;

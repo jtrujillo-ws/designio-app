@@ -13,6 +13,7 @@ import type { ContenidoPropuesta } from './ai.contenido';
 export type {
   ContenidoAsistenteGate,
   ContenidoCriterio,
+  ContenidoEntradaKpi,
   ContenidoExtraccion,
   ContenidoInsight,
   ContenidoPropuesta,
@@ -76,10 +77,10 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
  * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
  * carece de acción «aprobar».
  */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5'] as const;
+export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5', 'C6'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
-export const DestinoSchema = z.enum(['evidencia', 'criterio-exito', 'insight']);
+export const DestinoSchema = z.enum(['evidencia', 'criterio-exito', 'insight', 'entrada-kpi']);
 export type Destino = z.infer<typeof DestinoSchema>;
 
 
@@ -131,6 +132,17 @@ export const MAX_CRITERIOS_POR_LOTE = 4;
 export const MAX_INSIGHTS_POR_LOTE = 4;
 
 /**
+ * Cuántas entradas KPI se le piden a C6 de una vez.
+ *
+ * El techo lo pone aquí el DOMINIO y no la comodidad de la revisión: una entrada del registry
+ * responde a UN criterio de éxito del reto (ADR-0007), y G0 congela como mucho unos pocos
+ * criterios por reto. Pedir más entradas que criterios hay solo puede producir dos entradas
+ * para la misma promesa, que es lo que `unique (registry_id, nombre)` acaba rechazando después
+ * de haber pagado la llamada. Seis deja margen para un reto ancho sin invitar a inventar.
+ */
+export const MAX_ENTRADAS_KPI_POR_LOTE = 6;
+
+/**
  * Cuántas remediaciones puede llevar UN informe de C5 — que es lo mismo que decir cuántas
  * señales abiertas admite un journey para poder pedirlo.
  *
@@ -153,7 +165,7 @@ export const MAX_REMEDIACIONES = 20;
  */
 export type AnclaCapacidad = {
   /** La columna donde cuelga en `reserva_ai`, `llamada_ai` y `propuesta_ai`. */
-  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id';
+  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id' | 'registry_id';
   /** El título del selector en la pantalla. */
   etiqueta: string;
   /** Cómo se nombra en prosa, en minúscula, dentro de una frase. */
@@ -281,6 +293,7 @@ const ANCLA_DECLARADA: Record<AnclaCapacidad['columna'], true> = {
   reto_id: true,
   gate_id: true,
   journey_id: true,
+  registry_id: true,
 };
 export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad['columna'][];
 
@@ -291,11 +304,12 @@ export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad[
  */
 export const COLUMNA_DE_DESTINO: Record<
   Destino,
-  'evidencia_id' | 'criterio_id' | 'insight_id'
+  'evidencia_id' | 'criterio_id' | 'insight_id' | 'entrada_kpi_id'
 > = {
   evidencia: 'evidencia_id',
   'criterio-exito': 'criterio_id',
   insight: 'insight_id',
+  'entrada-kpi': 'entrada_kpi_id',
 };
 
 export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
@@ -476,6 +490,48 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     exigeConsentimiento: false,
     esSimulacion: false,
   },
+  C6: {
+    etiqueta: 'Borrador del Metric Registry → entrada KPI',
+    destino: 'entrada-kpi',
+    /*
+     * El REGISTRY, y no el reto, aunque el material salga del reto. `entrada_kpi.registry_id`
+     * es NOT NULL, así que una propuesta anclada en el reto no sabría en qué registry
+     * materializarse mientras el reto no tenga uno — y el registry es 1:1 con el reto pero
+     * puede no existir todavía. El ancla es el objeto del que se deriva el prompt Y aquel
+     * sobre el que se escribe: aquí es el mismo, y sus criterios se leen por `registry → reto`.
+     */
+    ancla: {
+      columna: 'registry_id',
+      etiqueta: 'Metric Registry en borrador',
+      enProsa: 'registry en borrador',
+      buscar: 'Buscar por código o título del reto…',
+      vacia:
+        'No hay Metric Registries en borrador. El contrato de medición se abre desde el proyecto, y hasta entonces no hay dónde proponer KPIs.',
+      hayMas: (n) =>
+        `Hay más registries en borrador de los que caben aquí: se listan los ${n} primeros por ` +
+        'código de reto. Uno sale de la lista mientras sus entradas propuestas esperan ' +
+        'revisión; para uno concreto, búscalo por el código o el título de su reto.',
+      enCurso:
+        'Ese registry ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese registry ya tiene entradas KPI propuestas esperando revisión: decídelas antes de pedir otras',
+    },
+    /*
+     * LOTE, como C0 y C2: una llamada propone varias entradas y cada una se acepta o se
+     * descarta por separado (SPEC-08 §3). CERO es legítimo — un reto cuyos criterios no dan
+     * para un KPI medible es una respuesta, y el prompt pide expresamente que no se proponga
+     * lo que no se sostiene.
+     */
+    lote: { campo: 'entradas', minimo: 0, maximo: MAX_ENTRADAS_KPI_POR_LOTE },
+    /*
+     * El material son los CRITERIOS DE ÉXITO del reto: KPI, definición, objetivo, ventana y
+     * plan de línea base. Frases del método, no material de personas — eso entra por
+     * `item_importacion`, que es otra ancla, y el registro lo sujeta por el otro lado: quien
+     * exige consentimiento tiene que anclar en `item_id`.
+     */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+  },
 };
 
 
@@ -570,6 +626,9 @@ export const ESTADOS_ANCLA = [
   'evidencia-no-citable',
   'alcance-incompleto',
   'journey-cambiado',
+  'registry-cerrado',
+  'criterio-ausente',
+  'nombre-ocupado',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

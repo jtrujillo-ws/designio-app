@@ -13,6 +13,7 @@ import { materialDeJourney, MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   type ContenidoAsistenteGate,
+  type ContenidoEntradaKpi,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoInsight,
@@ -118,6 +119,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   let gateId = '';
   let requisitoIds: string[] = [];
   let evidenciaDelRetoId = '';
+  let registryId = '';
+  let criterioDelRegistryId = '';
 
   const MATERIAL = 'El 71% de los abandonos ocurre en la carga del documento de identidad.';
 
@@ -170,6 +173,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     citas: [{ fragmento: 'El journey está validado', localizacion: 'requisito 1' }],
   });
 
+  const CONTENIDO_C6 = (criterioId: string): ContenidoEntradaKpi => ({
+    criterioId,
+    nombre: 'Tasa de verificación completada en móvil',
+    definicion: 'Verificaciones completadas / verificaciones iniciadas, solo en app móvil',
+    fuente: 'Eventos de la app, tablero de onboarding',
+    dimensiones: 'canal, segmento',
+    frecuencia: 'mensual',
+    confianzaPropuesta: 'media',
+    citas: [{ fragmento: 'Tiempo de verificación', localizacion: 'KPI del criterio' }],
+  });
+
   /**
    * El contenido de prueba de cada capacidad, por su nombre.
    *
@@ -204,6 +218,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       citas: [{ fragmento: 'NODOS', localizacion: 'cabecera del grafo' }],
       confianzaPropuesta: 'baja',
     } satisfies ContenidoRemediacionJourney,
+    /* Igual que CT y C2: se resuelve tarde porque el criterio se crea en el `beforeAll`, y su
+     * id tiene que ser REAL — el guard exige que el criterio sea del reto del registry. */
+    get C6() {
+      return CONTENIDO_C6(criterioDelRegistryId);
+    },
   };
 
   /**
@@ -782,6 +801,23 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
       values (${ws}, ${evidenciaDelRetoId}, 'concedido', 'cliente',
               'Consentimiento del participante', ${leadId}, now(), ${leadId})`;
+
+    /*
+     * Y el ancla de C6: el contrato de medición del reto, en borrador, con un criterio real al
+     * que una entrada KPI pueda responder. El criterio tiene que existir de verdad porque el
+     * guard de la materialización exige que sea del reto DEL REGISTRY, y la cita se mide contra
+     * su texto.
+     */
+    const [crit] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Tiempo de verificación',
+              'Minutos medianos desde iniciar hasta completar la verificación',
+              'Bajar de 8 a 4 minutos', 90, 'Medir dos semanas antes del release', ${leadId})
+      returning id`;
+    criterioDelRegistryId = crit!.id as string;
+    const [mr] = await admin`insert into metric_registry (workspace_id, reto_id, creado_por)
+      values (${ws}, ${retoId}, ${leadId}) returning id`;
+    registryId = mr!.id as string;
     await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
       values (${ws}, ${arq!.id as string}, ${evidenciaDelRetoId})`;
   });
@@ -796,10 +832,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // Ver la nota de `enWorkspaceLimpio`: el sello va de la propuesta al insight y del
       // insight a la propuesta, así que se suelta antes de borrar ninguno de los dos.
       await admin`update insight set propuesta_ai_id = null where workspace_id = ${ws}`;
+      // Y lo mismo con la entrada KPI, que es el cuarto objeto sellado. El sello va en los dos
+      // sentidos —`propuesta_ai.entrada_kpi_id` y `entrada_kpi.propuesta_ai_id`—, así que hay
+      // que soltarlo antes de borrar cualquiera de los dos extremos.
+      await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where workspace_id = ${ws}`;
       await admin`delete from llamada_ai where workspace_id = ${ws}`;
       await admin`delete from consentimiento_item where workspace_id = ${ws}`;
       await admin`delete from item_importacion where workspace_id = ${ws}`;
+      // El contrato de medición, por delante de los criterios: `entrada_kpi` referencia a los
+      // dos, y el registry al reto.
+      await admin`delete from entrada_kpi where workspace_id = ${ws}`;
+      await admin`delete from metric_registry where workspace_id = ${ws}`;
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
       await admin`delete from cita where workspace_id = ${ws}`;
       await admin`delete from contradiccion where workspace_id = ${ws}`;
@@ -5296,6 +5340,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                        -- ninguna; nulo la deja inerte, que es la respuesta correcta para una
                        -- fila sintética que no representa a ninguna propuesta.
                        null::uuid[] as alcance_evidencia,
+            null::uuid as entrada_kpi_id,
                        ${ws}::uuid as workspace_id) p
           ${proyeccion.joins}`;
         return (f!.estado as string | null) ?? null;
@@ -10546,4 +10591,127 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await expect(escribir('una huella cualquiera')).resolves.toBeDefined();
     });
   });
+
+  /**
+   * C6 — el borrador del Metric Registry, propuesto contra los criterios que promete medir.
+   *
+   * Cinco puertas, y cada una es una regla que la capacidad no comparte con sus hermanas:
+   * dónde cuelga, contra qué se mide una cita, qué exige materializar, qué la deja obsoleta y
+   * qué NO propone.
+   */
+  it('C6: la entrada del registry nace del criterio que cita, y se sella con su procedencia', async () => {
+    const admin = sqlAdmin();
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+    });
+
+    // 1. El ANCLA es el registry, no el reto: la fila cuelga de la columna que su capacidad
+    //    declara, y de ninguna otra. Es lo que `propuesta_ai_un_ancla` impone y lo que el
+    //    insert generado desde `COLUMNAS_DE_ANCLA` escribe sin que nadie lo enumere.
+    const [fila] = await admin`select registry_id, reto_id, item_id, gate_id, journey_id, destino
+      from propuesta_ai where id = ${propuestaId}`;
+    expect(fila!.registry_id).toBe(registryId);
+    expect([fila!.reto_id, fila!.item_id, fila!.gate_id, fila!.journey_id]).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+    expect(fila!.destino).toBe('entrada-kpi');
+
+    // 2. Aceptarla crea la entrada, con los seis campos copiados TAL CUAL y los demás
+    //    vacíos: el dueño del dato, la línea base y la ventana no los propone la AI.
+    const r = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [entrada] = await admin`select * from entrada_kpi where id = ${r.objetoId}`;
+    expect(entrada!.registry_id).toBe(registryId);
+    expect(entrada!.criterio_id).toBe(criterioDelRegistryId);
+    expect(entrada!.nombre).toBe('Tasa de verificación completada en móvil');
+    expect(entrada!.frecuencia).toBe('mensual');
+    expect(
+      [
+        entrada!.propietario_miembro_id,
+        entrada!.linea_base_valor,
+        entrada!.linea_base_fecha,
+        entrada!.ventana_inicio,
+        entrada!.fecha_post_mortem,
+      ],
+      'la AI rellenó un compromiso que nadie adquirió',
+    ).toEqual([null, null, null, null, null]);
+    // 3. Y el SELLO de procedencia, que es la mitad permanente de SYS-19: de qué propuesta
+    //    salió esta fila. Lo escribe el guard, no la aplicación — la columna no está en el
+    //    grant.
+    expect(entrada!.propuesta_ai_id).toBe(propuestaId);
+    const [sellada] = await admin`select estado, entrada_kpi_id from propuesta_ai
+      where id = ${propuestaId}`;
+    expect(sellada!.estado).toBe('aceptada');
+    expect(sellada!.entrada_kpi_id).toBe(r.objetoId);
+  });
+
+  /**
+   * Y el registry FIRMADO cierra la puerta en los dos momentos que importan: al proponer y al
+   * aceptar. Son dos escrituras distintas y entre ellas cabe la firma entera, que es el acto
+   * de G6 — una entrada colada en un contrato ya firmado es un KPI que nadie acordó dentro de
+   * lo que sí se acordó.
+   */
+  it('C6: un registry firmado no admite propuestas nuevas ni deja aceptar las pendientes', async () => {
+    const admin = sqlAdmin();
+    // Una propuesta que nace ANTES de la firma, para medir la segunda mitad.
+    const pendiente = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+    });
+
+    await admin`update metric_registry set estado = 'firmado', firmado_por = ${leadId},
+      firmado_en = now() where id = ${registryId}`;
+    try {
+      // Al PROPONER: el guard del insert lo rechaza aunque la fila venga por SQL directo.
+      await expect(
+        nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+      ).rejects.toThrow(/ya no admite entradas/);
+
+      // Y al ACEPTAR: la propuesta que ya existía queda obsoleta y solo se puede rechazar.
+      await expect(
+        aceptarPropuesta(leadId, { workspaceId: ws, propuestaId: pendiente }),
+      ).rejects.toThrow(/ya no admite entradas/);
+
+      // Rechazar SÍ sigue abierto: bloquear también esa salida dejaría la fila muerta y su
+      // ancla retenida para siempre.
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: pendiente });
+      const [tras] = await admin`select estado from propuesta_ai where id = ${pendiente}`;
+      expect(tras!.estado).toBe('rechazada');
+    } finally {
+      await admin`update metric_registry set estado = 'borrador', firmado_por = null,
+        firmado_en = null where id = ${registryId}`;
+    }
+  });
+
+  /**
+   * Y la entrada materializada tiene que haber NACIDO en esa aceptación.
+   *
+   * `xmin` dice «esta transacción escribió esta versión de la fila» y no distingue insertar de
+   * actualizar, así que una entrada vieja EDITADA aquí pasaría como recién nacida — y con ella
+   * quedaría atribuido a la AI un KPI escrito a mano. El insight cerró ese hueco con «y sigue
+   * propuesto»; `entrada_kpi` no tiene estado con el que decirlo, así que lo dice su fecha:
+   * `creado_en` la pone la base y está fuera del grant, de modo que ningún UPDATE concedido la
+   * mueve.
+   *
+   * Se mide por lo que de verdad lo sostiene: que la columna NO se pueda escribir.
+   */
+  it('C6: `creado_en` de una entrada KPI no está al alcance del rol de aplicación', async () => {
+    const admin = sqlAdmin();
+    const [grant] = await admin`select bool_or(privilege_type = 'INSERT') as puede
+      from information_schema.column_privileges
+      where table_name = 'entrada_kpi' and column_name = 'creado_en'
+        and grantee = 'designio_app'`;
+    expect(
+      grant?.puede ?? false,
+      'con creado_en en el grant, «nació en esta aceptación» deja de ser comprobable',
+    ).toBe(false);
+    const [gid] = await admin`select bool_or(privilege_type = 'INSERT') as puede
+      from information_schema.column_privileges
+      where table_name = 'entrada_kpi' and column_name = 'id' and grantee = 'designio_app'`;
+    expect(gid?.puede ?? false).toBe(false);
+  });
+
 });

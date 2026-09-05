@@ -25,10 +25,12 @@ import {
   promptAsistenteGate,
   promptCriterios,
   promptRemediacionJourney,
+  promptRegistry,
   promptExtraccion,
   promptInsights,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
+  SISTEMA_REGISTRY,
   SISTEMA_REMEDIACION_JOURNEY,
   type GrafoDelJourney,
   SISTEMA_EXTRACCION,
@@ -534,8 +536,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
    * del material guardado con el de hoy solo vale entre propuestas del mismo render.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-05.11';
-  const HUELLA_ANOTADA = '1d866f9513752e0be85ebbf1bb5ba3dcf4a58ba96fb4a21ffcea5fd6de8ece25';
+  const VERSION_ANOTADA = 'ai-2026-09-05.12';
+  const HUELLA_ANOTADA = '480f5bbd38e8402604f42f9ca9dfce3b2675084924bce2c0d4b1403230244da3';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -715,6 +717,85 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       ],
       cuantos: 3,
     }),
+    // ── C6 ──
+    // Los criterios son el cuerpo, y su VENTANA va dentro: es lo que decide si una frecuencia
+    // da una serie o un solo punto, así que su forma es contrato igual que el resto.
+    // NO hay rama «sin criterios»: C6 se niega a llamar al proveedor con cero, así que una
+    // entrada así no sería una rama del render sino una que nadie alcanza.
+    registryLlano: promptRegistry({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D',
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: 'Tiempo de verificación',
+          definicion: 'Minutos medianos de la verificación',
+          objetivo: 'Bajar de 8 a 4',
+          ventanaDias: 90,
+          lineaBasePlan: 'Medir dos semanas antes',
+        },
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000002',
+          kpi: 'Abandono en carga',
+          definicion: 'Abandonos / inicios en el paso de carga',
+          objetivo: 'Bajar del 71% al 30%',
+          ventanaDias: null,
+          lineaBasePlan: '',
+        },
+      ],
+      cuantas: 3,
+    }),
+    // Los criterios no caben: aparece el aviso de truncado y el «truncado» del resumen de
+    // alcance, que es lo que le dice al modelo que no proponga contra lo que no ve entero.
+    registryTruncado: promptRegistry({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: CUERPO_LARGO,
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: 'Tiempo de verificación',
+          definicion: 'Minutos medianos de la verificación',
+          objetivo: 'Bajar de 8 a 4',
+          ventanaDias: 90,
+          lineaBasePlan: 'Medir dos semanas antes',
+        },
+      ],
+      cuantas: 3,
+    }),
+    registryFichaVacia: promptRegistry({
+      codigo: '',
+      titulo: '',
+      descripcion: 'D',
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: 'Tiempo de verificación',
+          definicion: 'Minutos medianos de la verificación',
+          objetivo: 'Bajar de 8 a 4',
+          ventanaDias: 90,
+          lineaBasePlan: 'Medir dos semanas antes',
+        },
+      ],
+      cuantas: 1,
+    }),
+    registryConDelimitador: promptRegistry({
+      codigo: 'R-01',
+      titulo: CON_DELIMITADOR,
+      descripcion: CON_DELIMITADOR,
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: CON_DELIMITADOR,
+          definicion: CON_DELIMITADOR,
+          objetivo: CON_DELIMITADOR,
+          ventanaDias: 90,
+          lineaBasePlan: CON_DELIMITADOR,
+        },
+      ],
+      cuantas: 3,
+    }),
     // ── C5 ──
     // El grafo es el cuerpo, y sus SEÑALES van dentro: lo que distingue a C5 de una
     // capacidad que adivina es que la lista de defectos viene dada. Que ese bloque cambie de
@@ -778,6 +859,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       sistemaAsistenteGates: SISTEMA_ASISTENTE_GATES,
       sistemaInsights: SISTEMA_INSIGHTS,
       sistemaRemediacionJourney: SISTEMA_REMEDIACION_JOURNEY,
+      sistemaRegistry: SISTEMA_REGISTRY,
       esquemaSalida: ESQUEMA_SALIDA,
       maxMaterial: MAX_MATERIAL,
       maxCampoFicha: MAX_CAMPO_FICHA,
@@ -833,6 +915,22 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.insightsTruncado.alcanceResumen).toContain('truncado');
     expect(RAMAS.insightsFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.insightsConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
+    // C6: el id de cada criterio llega al material —es lo que cada entrada tiene que copiar—,
+    // la VENTANA va dentro y dice cuando no la hay, el truncado avisa por partida doble
+    // (cuerpo y resumen de alcance) y la ficha vacía emite su «(sin dato)».
+    expect(RAMAS.registryLlano.usuario).toContain('[c3d4e5f6-0000-4000-8000-000000000002]');
+    expect(RAMAS.registryLlano.usuario).toContain('CRITERIOS DE ÉXITO DEL RETO');
+    expect(RAMAS.registryLlano.usuario).toContain('Ventana: 90 días');
+    // La ventana ausente se ESCRIBE, no se omite: omitirla se lee como que no importa, y es
+    // justo lo que decide si la frecuencia propuesta da una serie o un punto.
+    expect(RAMAS.registryLlano.usuario).toContain('Ventana: sin ventana declarada');
+    expect(RAMAS.registryLlano.usuario).not.toContain('se truncó');
+    expect(RAMAS.registryLlano.alcanceResumen).toContain('2 criterios');
+    expect(RAMAS.registryTruncado.usuario).toContain('se truncaron');
+    expect(RAMAS.registryTruncado.alcanceResumen).toContain('truncado');
+    expect(RAMAS.registryFichaVacia.usuario).toContain('(sin dato)');
+    expect(RAMAS.registryConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
+
     // C5: el id del nodo y el código de la señal llegan al material —son lo que la respuesta
     // tiene que copiar—, el encargo cambia cuando no hay señales, el truncado avisa y la
     // ficha vacía emite su «(sin dato)».

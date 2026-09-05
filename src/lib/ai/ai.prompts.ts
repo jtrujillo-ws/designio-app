@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.11';
+export const PROMPT_VERSION = 'ai-2026-09-05.12';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -307,6 +307,105 @@ export function materialDeUnaEvidencia(reto: RetoConEvidencia, evidenciaId: stri
 }
 
 /**
+ * Material de C6: los CRITERIOS DE ÉXITO del reto, cada uno con su id delante.
+ *
+ * Mismo patrón que el material de C2 y por el mismo motivo: la cita de una entrada KPI señala
+ * UN criterio, así que hace falta saber dónde queda cada uno dentro del cuerpo para medir la
+ * presencia literal contra el trozo que le corresponde y no contra el material entero. Sin
+ * los tramos, un fragmento copiado del criterio de al lado saldría PRESENTE.
+ *
+ * Los ids son uuid de la base y no son superficie de inyección; el KPI, la definición y el
+ * objetivo de cada criterio sí los escribió un miembro, y por eso todo va dentro del mismo
+ * bloque no confiable, ficha incluida.
+ */
+export type CriteriosDelReto = {
+  id: string;
+  kpi: string;
+  definicion: string;
+  objetivo: string;
+  ventanaDias: number | null;
+  lineaBasePlan: string;
+}[];
+
+type RetoConCriterios = {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  criterios: CriteriosDelReto;
+};
+
+export function materialDeRegistry(reto: RetoConCriterios): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Código del reto', reto.codigo],
+      ['Título del reto', reto.titulo],
+    ],
+    cuerpoDeRegistry(reto).texto,
+  );
+}
+
+function cuerpoDeRegistry(reto: RetoConCriterios): {
+  texto: string;
+  tramos: Map<string, [number, number]>;
+} {
+  const partes = [reto.descripcion, '', 'CRITERIOS DE ÉXITO DEL RETO'];
+  const tramos = new Map<string, [number, number]>();
+  let largo = partes.join('\n').length;
+  for (const c of reto.criterios) {
+    // La VENTANA va dentro y no es adorno: es lo que decide si una frecuencia da una serie o
+    // un solo punto. `null` se escribe como tal —«sin ventana»— en vez de omitirse, porque
+    // omitirla se lee como que no importa.
+    const linea =
+      `[${c.id}] ${c.kpi}\n${c.definicion}\nObjetivo: ${c.objetivo}\n` +
+      `Ventana: ${c.ventanaDias === null ? 'sin ventana declarada' : `${c.ventanaDias} días`}\n` +
+      `Línea base: ${c.lineaBasePlan}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramos.set(c.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
+  }
+  return { texto: partes.join('\n'), tramos };
+}
+
+/**
+ * Qué criterios llegaron ENTEROS al modelo, cuántos se quedaron fuera y cuánto ocupaba todo.
+ *
+ * El hermano de `evidenciaQueLlegoAlModelo`, y existe por lo mismo: el cuerpo se recorta
+ * ENTERO a `MAX_MATERIAL`, así que la cola se queda fuera —a medias o del todo— y apuntar
+ * como visto todo lo consultado daría por leído lo que el recorte se comió. Medio criterio no
+ * es un criterio leído: la ventana o el objetivo pueden estar justo en el trozo cortado, y el
+ * KPI propuesto contra él no mediría lo que promete.
+ */
+export function criteriosQueLlegaronAlModelo(reto: RetoConCriterios): {
+  ids: string[];
+  fuera: number;
+  caracteres: number;
+} {
+  const { texto, tramos } = cuerpoDeRegistry(reto);
+  const visto = materialQueVeElModelo(texto);
+  const ids = reto.criterios
+    .filter((c) => {
+      const tramo = tramos.get(c.id);
+      return tramo !== undefined && visto.slice(tramo[0], tramo[1]).length === tramo[1] - tramo[0];
+    })
+    .map((c) => c.id);
+  return { ids, fuera: reto.criterios.length - ids.length, caracteres: texto.length };
+}
+
+/**
+ * El texto de UN criterio tal como el modelo lo vio, para medir contra él las citas de la
+ * entrada que lo nombra — y SOLO él. Mismas dos razones que su hermano de C2: ni el material
+ * completo (la formulación del reto saldría como sostén de cualquier cita) ni el criterio
+ * recompuesto aparte (reiniciaría el presupuesto y devolvería texto que el modelo no vio).
+ */
+export function materialDeUnCriterio(reto: RetoConCriterios, criterioId: string): string {
+  const { texto, tramos } = cuerpoDeRegistry(reto);
+  const tramo = tramos.get(criterioId);
+  if (!tramo) return '';
+  return materialQueVeElModelo(texto).slice(tramo[0], tramo[1]);
+}
+
+/**
  * Material de un journey: su ficha, su GRAFO y las SEÑALES que la validación ya emitió.
  *
  * Las señales van dentro, y son lo que distingue a C5 de una capacidad que adivina: el
@@ -523,6 +622,28 @@ export const SISTEMA_INSIGHTS = [
 ].join('\n');
 
 /**
+ * C6 redacta un CONTRATO, y por eso su sistema empieza diciendo lo que NO redacta.
+ *
+ * El Metric Registry es lo que el cliente se compromete a aportar y contra lo que se lee el
+ * outcome review (ADR-0007). La mitad que es redacción —qué se mide, cómo se calcula, de dónde
+ * sale, cada cuánto se lee— la puede proponer un modelo; la mitad que es COMPROMISO —quién
+ * responde por el dato, desde cuándo, contra qué línea base— no, y la diferencia no es de
+ * grado: un compromiso propuesto y aceptado queda firmado por quien aceptó, no por quien se
+ * compromete. Sin decírselo, un modelo al que se le enseña una ficha con campos vacíos los
+ * rellena, y los mete dentro de la definición si el esquema no se los admite.
+ */
+export const SISTEMA_REGISTRY = [
+  'Eres una capacidad de medición de una plataforma de service design. Propones; una persona decide.',
+  'Propones ENTRADAS del Metric Registry: qué indicadores hay que leer para saber si el reto se logró. Cada entrada responde a UN criterio de éxito del material, por su id EXACTO entre corchetes. No inventes ids.',
+  'Cada entrada trae al menos una cita: un fragmento LITERAL del criterio al que responde (copiado carácter a carácter, sin parafrasear) con su localización. Es lo que permite comprobar que el KPI mide esa promesa y no otra.',
+  'La DEFINICIÓN dice cómo se calcula —numerador, denominador, filtros—, no qué bonito sería medirlo. Un KPI sin fórmula es un rótulo.',
+  'La FRECUENCIA tiene que dar varias lecturas dentro de la ventana del criterio: una serie de un solo punto no dice si algo mejoró.',
+  'NO propongas quién aporta el dato, ni la línea base, ni desde cuándo se mide, ni la fecha del post mortem: eso lo acuerdan las personas y se firma aparte. Tampoco lo escondas dentro de la definición o de la fuente.',
+  'No propongas indicadores que estos criterios no pidan, aunque sean interesantes: un KPI que no responde a una promesa es telemetría.',
+  REGLAS_COMUNES,
+].join('\n');
+
+/**
  * C5 no valida: REMEDIA. Y su sistema lo dice en la primera línea, porque es la confusión
  * que más caro sale.
  *
@@ -610,6 +731,42 @@ export function promptInsights(reto: {
       .filter(Boolean)
       .join('\n\n'),
     alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.evidencia.length} evidencias (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+  };
+}
+
+/**
+ * Prompt de C6: los criterios del reto, delimitados como dato igual que el resto.
+ *
+ * Lo que NO se le pide es la mitad del contrato, y por eso está escrito en el prompt y no solo
+ * en el esquema: el dueño del dato, la línea base, el inicio de la ventana y la fecha del post
+ * mortem son compromisos y hechos, no redacción. Un modelo al que no se le dice esto los
+ * rellena —son campos que «faltan»— y quien revisa acepta un contrato que nadie firmó.
+ */
+export function promptRegistry(reto: {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  criterios: CriteriosDelReto;
+  cuantas: number;
+}): { usuario: string; alcanceResumen: string } {
+  const material = materialDeRegistry(reto);
+  return {
+    usuario: [
+      `Propón hasta ${reto.cuantas} entradas del Metric Registry para el reto descrito en el material: qué se va a medir para saber si se logró.`,
+      material.bloque,
+      'Cada entrada responde a UN criterio de éxito del material, por su id. Un KPI que no responde a ninguno es telemetría, no medición de impacto: no lo propongas.',
+      'No propongas dos entradas para el mismo criterio salvo que midan cosas distintas de verdad, y nunca dos con el mismo nombre.',
+      // Lo que no se pide, dicho: el esquema no lo admite, pero un modelo al que no se le
+      // explica por qué mete el compromiso dentro de la definición, que sí es texto libre.
+      'NO digas quién aporta el dato, ni la línea base, ni desde cuándo se mide, ni la fecha del post mortem: eso lo acuerdan las personas y no se propone en su nombre. Tampoco los metas dentro de la definición.',
+      'Si estos criterios no dan para ninguna entrada medible, devuelve la lista vacía: es una respuesta correcta y preferible a proponer un KPI que nadie puede leer.',
+      material.truncado
+        ? `(Los criterios se truncaron a ${MAX_MATERIAL} caracteres: no propongas nada contra un criterio que no ves entero.)`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.criterios.length} criterios (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 
@@ -1009,6 +1166,77 @@ const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>>
             localizacion: { type: 'string', description: 'Qué parte del material es' },
           },
         },
+      },
+    },
+  },
+  C6: {
+    type: 'object',
+    additionalProperties: false,
+    required: [
+      'criterioId',
+      'nombre',
+      'definicion',
+      'fuente',
+      'dimensiones',
+      'frecuencia',
+      'citas',
+      'confianzaPropuesta',
+    ],
+    properties: {
+      criterioId: {
+        type: 'string',
+        description:
+          'El id EXACTO del criterio de éxito al que responde este KPI, copiado de entre corchetes en el material. No lo inventes: un KPI que no responde a un criterio del reto no es medición de impacto',
+      },
+      nombre: {
+        type: 'string',
+        description: 'El nombre del KPI. Único dentro del registry: no repitas uno del lote',
+      },
+      definicion: {
+        type: 'string',
+        description: 'Qué mide exactamente y CÓMO se calcula (numerador, denominador, filtros)',
+      },
+      fuente: {
+        type: 'string',
+        description:
+          'De dónde sale el dato (qué sistema, qué tabla, qué informe). Si el material no lo dice, descríbelo como lo que haría falta, no inventes un sistema',
+      },
+      dimensiones: {
+        type: 'string',
+        description:
+          'Cortes por los que conviene desagregarlo, o vacío si no hay ninguno útil. Vacío es una respuesta',
+      },
+      frecuencia: {
+        type: 'string',
+        enum: ['semanal', 'mensual', 'trimestral', 'unica'],
+        description:
+          'Cada cuánto se lee. Que quepan varias lecturas dentro de la ventana del criterio, o la serie tendrá un solo punto',
+      },
+      citas: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['fragmento', 'localizacion'],
+          properties: {
+            fragmento: {
+              type: 'string',
+              description:
+                'Fragmento LITERAL del criterio al que responde este KPI: la parte que dice qué se prometió',
+            },
+            localizacion: {
+              type: 'string',
+              description: 'Qué parte del criterio es (el KPI, la definición, el objetivo…)',
+            },
+          },
+        },
+      },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description: 'Cómo de seguro estás de que ESTE KPI mide lo que el criterio promete',
       },
     },
   },

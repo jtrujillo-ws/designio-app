@@ -26,6 +26,7 @@ import {
   type EstadoAncla,
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
+  type ContenidoEntradaKpi,
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoRemediacionJourney,
@@ -97,6 +98,12 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse. Reabrir la etapa 0 los descongela.',
   'registry-firmado':
     'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y la firma no se deshace (SYS-22). Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'registry-cerrado':
+    'El Metric Registry de ese reto ya no admite entradas: o se firmó —y firmarlo congela el contrato de medición (SYS-22)— o el trabajo de su reto se cerró. Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'criterio-ausente':
+    'El criterio de éxito al que responde esta entrada ya no está entre los del reto de su registry: sin la promesa que dice medir, el KPI no se puede aceptar. La propuesta solo puede rechazarse.',
+  'nombre-ocupado':
+    'Ya hay una entrada con ese nombre en el registry, y el nombre es su clave: corrígelo antes de aceptar, o rechaza la propuesta.',
   'reto-no-admite':
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'gate-decidido':
@@ -1014,6 +1021,14 @@ const PRESENTACION_POR_CAPACIDAD: Record<
       'Este informe no cambia el grafo y no se aprueba: se lee y se descarta. Las ' +
       'remediaciones las aplica una persona editando el journey.',
   },
+  C6: {
+    rotulo: 'Entrada del Metric Registry propuesta',
+    ficha: (c, etiquetas) => (
+      <FichaEntradaKpi contenido={c as ContenidoEntradaKpi} etiquetas={etiquetas} />
+    ),
+    // C6 SÍ materializa —nace una entrada del registry— así que no tiene nada que decir aquí.
+    sinAccion: null,
+  },
 };
 
 /**
@@ -1124,6 +1139,21 @@ const MATERIALIZACION: Record<
     formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
       <FormularioCriterio
         inicial={inicial as ContenidoCriterio}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  'entrada-kpi': {
+    // Una entrada tampoco: su esquema exige los seis campos que la tabla necesita para nacer,
+    // y los que quedan vacíos —el dueño del dato, la línea base, la ventana, el dashboard— los
+    // pone una persona DESPUÉS editando la entrada, que es exactamente el mismo reparto que
+    // el criterio y por la misma razón: son compromisos, no redacción.
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioEntradaKpi
+        inicial={inicial as ContenidoEntradaKpi}
         ocupado={ocupado}
         onEnviar={onEnviar}
         onCancelar={onCancelar}
@@ -1908,6 +1938,147 @@ function FormularioExtraccion({
           {ocupado ? 'Aceptando…' : 'Aceptar con estas correcciones'}
         </Button>
         <Button size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function FichaEntradaKpi({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoEntradaKpi;
+  etiquetas: Record<string, string>;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="KPI" valor={contenido.nombre} />
+      <Dato
+        rotulo="Responde al criterio"
+        // El KPI del criterio, no su uuid: quien revisa tiene que poder decir si este
+        // indicador mide ESA promesa, y para eso hay que leer la promesa.
+        valor={
+          etiquetas[contenido.criterioId] ??
+          `criterio ${contenido.criterioId} (ya no está)`
+        }
+      />
+      <Dato rotulo="Definición del cálculo" valor={contenido.definicion} />
+      <Dato rotulo="Fuente del dato" valor={contenido.fuente} />
+      {contenido.dimensiones && <Dato rotulo="Dimensiones" valor={contenido.dimensiones} />}
+      <Dato rotulo="Frecuencia" valor={contenido.frecuencia} />
+      {contenido.citas.map((c, i) => (
+        <Dato key={String(i)} rotulo="Cita" valor={`«${c.fragmento}» · ${c.localizacion}`} />
+      ))}
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        La entrada nace sin dueño del dato, sin línea base y sin fecha de inicio: eso lo acuerda
+        una persona del cliente y se completa en el registry antes de firmarlo.
+      </span>
+    </div>
+  );
+}
+
+function FormularioEntradaKpi({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoEntradaKpi;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoEntradaKpi) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [nombre, setNombre] = useState(inicial.nombre);
+  const [definicion, setDefinicion] = useState(inicial.definicion);
+  const [fuente, setFuente] = useState(inicial.fuente);
+  const [dimensiones, setDimensiones] = useState(inicial.dimensiones);
+  const [frecuencia, setFrecuencia] = useState(inicial.frecuencia);
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          criterioId: inicial.criterioId,
+          nombre,
+          definicion,
+          fuente,
+          dimensiones,
+          frecuencia,
+          // Mismo criterio que en CI y en C0: lo que el modelo afirmó —sus citas y su
+          // confianza— no lo reescribe quien corrige.
+          confianzaPropuesta: inicial.confianzaPropuesta,
+          citas: inicial.citas,
+        });
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        Corregir antes de aceptar (la propuesta original se conserva)
+      </span>
+      <label style={campo}>
+        <span style={etiqueta}>Nombre del KPI</span>
+        <Input required maxLength={200} value={nombre} onChange={(e) => setNombre(e.target.value)} />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Definición del cálculo</span>
+        <Textarea
+          required
+          rows={2}
+          maxLength={2000}
+          value={definicion}
+          onChange={(e) => setDefinicion(e.target.value)}
+        />
+      </label>
+      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12 }}>
+        <label style={campo}>
+          <span style={etiqueta}>Fuente del dato</span>
+          <Input required maxLength={500} value={fuente} onChange={(e) => setFuente(e.target.value)} />
+        </label>
+        <label style={campo}>
+          <span style={etiqueta}>Frecuencia</span>
+          <select
+            required
+            value={frecuencia}
+            onChange={(e) => setFrecuencia(e.target.value as ContenidoEntradaKpi['frecuencia'])}
+            style={{ font: '400 13px var(--font-sans)', padding: '6px 8px' }}
+          >
+            <option value="semanal">semanal</option>
+            <option value="mensual">mensual</option>
+            <option value="trimestral">trimestral</option>
+            <option value="unica">única</option>
+          </select>
+        </label>
+      </div>
+      <label style={campo}>
+        <span style={etiqueta}>Dimensiones (opcional)</span>
+        <Input
+          maxLength={500}
+          value={dimensiones}
+          onChange={(e) => setDimensiones(e.target.value)}
+        />
+      </label>
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        El criterio al que responde no se cambia aquí: si es el equivocado, rechaza la propuesta
+        —o acéptala y reapúntala editando la entrada, que es el camino que el registry tiene
+        mientras sea borrador.
+      </span>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <Button type="submit" size="sm" disabled={ocupado}>
+          Aceptar corregida
+        </Button>
+        <Button type="button" size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
           Cancelar
         </Button>
       </div>

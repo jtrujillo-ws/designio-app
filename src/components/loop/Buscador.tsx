@@ -132,6 +132,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
     setAbierto(false);
     setTexto('');
     setEstado({ fase: 'inactivo' });
+    enterPendiente.current = false;
   }
 
   async function abrir(resultado: ResultadoBusqueda) {
@@ -144,7 +145,11 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
   // así un clic lento sobre un resultado no lo desmonta antes de completarse, y tabular
   // hacia los resultados no los hace desaparecer bajo el foco.
   function alPerderFoco(e: FocusEvent<HTMLDivElement>) {
-    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setAbierto(false);
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setAbierto(false);
+    // Irse del buscador (clic fuera, Tab) con un Enter anotado lo cancela: el usuario ya
+    // está en otra cosa y la respuesta que llegue no debe cambiarle de página.
+    enterPendiente.current = false;
   }
 
   function alTeclearEnElCampo(e: KeyboardEvent<HTMLInputElement>) {

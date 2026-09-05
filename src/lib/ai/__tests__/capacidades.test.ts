@@ -1,8 +1,35 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import * as ts from 'typescript';
-import { CAPACIDADES, CAPACIDADES_ACTIVAS } from '../ai.schemas';
+import {
+  CAPACIDADES,
+  CAPACIDADES_ACTIVAS,
+  COLUMNAS_DE_ANCLA,
+  COLUMNA_DE_DESTINO,
+  parsearContenido,
+  RevisarPropuestaSchema,
+  type ContenidoExtraccion,
+} from '../ai.schemas';
 import { ESQUEMA_SALIDA } from '../ai.prompts';
+
+const RAIZ = new URL('../../../../', import.meta.url).pathname.replace(/\/$/, '');
+
+/** Una extracción válida para CI: sirve para comprobar que la frontera tampoco recorta lo
+ * que SÍ encaja en una capacidad. */
+const CONTENIDO_CI: ContenidoExtraccion = {
+  titulo: 'Abandono en verificación',
+  resumen: '',
+  recoleccion: 'Análisis de funnel',
+  fecha: '2026-07-20',
+  fechaLocalizacion: 'párrafo 1',
+  fechaSinDatoMotivo: '',
+  derivada: true,
+  confianza: 'media',
+  confidencialidad: 'cliente',
+  esEstadoActual: true,
+  confianzaPropuesta: 'alta',
+  citas: [{ fragmento: 'El 71% de los abandonos', localizacion: 'párrafo 1' }],
+};
 
 /**
  * La costura por la que entra una capacidad nueva.
@@ -121,5 +148,121 @@ describe('el registro de capacidades', () => {
       recorrer(arbol);
     }
     expect(hallazgos).toEqual([]);
+  });
+
+  /**
+   * La frontera de la corrección TRANSPORTA; no juzga.
+   *
+   * `RevisarPropuestaSchema` recibe un `propuestaId`, no una capacidad: cuál es se lee de la
+   * fila, dentro de la transacción, varias llamadas después. Aquí hubo una `z.union` —primero
+   * escrita a mano, luego derivada del registro— y las dos compartían el defecto: una unión
+   * PARSEA. Elige la primera rama que encaje, aplica sus `default()` y RECORTA lo que esa
+   * rama no declara. Como la rama elegida no era la de la propuesta sino la primera que
+   * tolerase el payload, al servicio llegaba una corrección ya recortada a la forma de otra
+   * capacidad — y se guardaba así, con campos de menos y sin que nadie viera un error.
+   *
+   * Lo que se sujeta es la propiedad, no la escritura: lo que entra por la puerta sale
+   * IDÉNTICO. Si alguien vuelve a poner un esquema aquí, esto enrojece.
+   */
+  it('deja pasar la corrección sin tocarla: la capacidad la juzga el servicio', () => {
+    const base = { workspaceId: crypto.randomUUID(), propuestaId: crypto.randomUUID() };
+
+    // 1. Un contenido que hoy NINGUNA capacidad declara —el de la capacidad que viene—
+    //    cruza la frontera entero. La unión lo rechazaba antes de que `parsearContenido`,
+    //    que sí sabría contra qué medirlo, llegara a verlo.
+    const ajeno = { campoQueNadieDeclara: 'x', anidado: { lista: [1, 2, 3] }, n: 0 };
+    expect(RevisarPropuestaSchema.parse({ ...base, correccion: ajeno }).correccion).toEqual(ajeno);
+
+    // 2. Y un contenido que SÍ encaja en una capacidad tampoco se recorta al pasar: los
+    //    campos de más siguen ahí para que los examine el esquema de SU capacidad.
+    const conDeMas = { ...CONTENIDO_CI, campoDeMas: 'sobrevive' };
+    expect(RevisarPropuestaSchema.parse({ ...base, correccion: conDeMas }).correccion).toEqual(
+      conDeMas,
+    );
+
+    // 3. AUSENTE y PRESENTE no son lo mismo: ausente es aceptar lo propuesto; un `null`
+    //    presente es una corrección con forma inválida, y muere en `parsearContenido` con su
+    //    mensaje. Por eso el servicio pregunta por `undefined` y no por la verdad del valor.
+    expect('correccion' in RevisarPropuestaSchema.parse(base)).toBe(false);
+    const conNull = RevisarPropuestaSchema.parse({ ...base, correccion: null });
+    expect('correccion' in conNull).toBe(true);
+    expect(conNull.correccion).toBeNull();
+    expect(() => parsearContenido('CI', null)).toThrow();
+  });
+
+  /**
+   * Las sentencias del pipeline no nombran a mano ninguna columna de ancla.
+   *
+   * Los tres inserts —`reserva_ai`, `llamada_ai`, `propuesta_ai`— escribían
+   * `item_id, reto_id` tecleados, y para que una tercera no se quedara fuera se declaró un
+   * `Record<AnclaCapacidad['columna'], …>`… construido con un `Object.fromEntries` sobre las
+   * claves de ese mismo tipo. Un Record derivado del tipo que dice vigilar lo satisface
+   * SIEMPRE: ampliar el ancla compilaba, el guardián seguía verde y los inserts seguían
+   * escribiendo dos columnas de tres. Un testigo que firma lo que sea.
+   *
+   * La salida no fue un guardián mejor sino quitarle el trabajo: las listas se GENERAN desde
+   * `COLUMNAS_DE_ANCLA`. Esto vigila que sigan generándose — que es lo único que aquí puede
+   * volver atrás, porque una lista escrita a mano compila igual de bien.
+   */
+  it('no teclea ninguna columna de ancla en las sentencias del pipeline', async () => {
+    const codigo = await readFile(`${RAIZ}/src/lib/ai/ai.servicio.ts`, 'utf8');
+
+    // Las TRES tablas del pipeline, que son las que llevan una columna POR TIPO de ancla.
+    // Fuera de ellas, `item_id` y `reto_id` son la clave ajena propia de otra tabla
+    // —`consentimiento_item` cuelga de un item, `criterio_exito` de un reto— y ahí nombrarlas
+    // es lo correcto: no hay ningún hueco por tipo de ancla que se pueda quedar sin llenar.
+    const DEL_PIPELINE = ['reserva_ai', 'llamada_ai', 'propuesta_ai'];
+
+    // La lista de columnas de un `insert into <tabla> (…)`: desde el paréntesis que sigue al
+    // nombre de la tabla hasta el que lo cierra.
+    const listas: { tabla: string; columnas: string }[] = [];
+    for (const m of codigo.matchAll(/insert into\s+(\w+)\s*\n?\s*\(/g)) {
+      let nivel = 1;
+      let i = m.index! + m[0].length;
+      while (i < codigo.length && nivel > 0) {
+        if (codigo[i] === '(') nivel += 1;
+        else if (codigo[i] === ')') nivel -= 1;
+        i += 1;
+      }
+      listas.push({ tabla: m[1]!, columnas: codigo.slice(m.index! + m[0].length, i - 1) });
+    }
+    // Que esté mirando las tres de verdad: con cero listas esto pasaría sin leer nada.
+    for (const t of DEL_PIPELINE) {
+      expect(listas.map((l) => l.tabla), `no se encontró el insert de ${t}`).toContain(t);
+    }
+
+    const tecleadas: string[] = [];
+    for (const { tabla, columnas } of listas.filter((l) => DEL_PIPELINE.includes(l.tabla))) {
+      for (const c of COLUMNAS_DE_ANCLA) {
+        if (new RegExp(`\\b${c}\\b`).test(columnas)) tecleadas.push(`${tabla} nombra ${c}`);
+      }
+    }
+    expect(tecleadas).toEqual([]);
+  });
+
+  /**
+   * Y el enlace del objeto materializado se escribe EN la columna que el destino nombra.
+   *
+   * El sello elegía con dos ternarios —`COLUMNA_DE_DESTINO[destino] === 'evidencia_id' ? …`—,
+   * así que consultaba el mapa y luego no usaba su valor para nada: lo que decidía dónde iba
+   * el id seguían siendo los dos nombres escritos en el SQL. Un destino nuevo hacía fallar
+   * los dos ternarios y sellaba una propuesta aceptada sin objeto, contra SYS-19.
+   */
+  it('no teclea ninguna columna de destino en el sello de la propuesta', async () => {
+    const codigo = await readFile(`${RAIZ}/src/lib/ai/ai.servicio.ts`, 'utf8');
+    const desde = codigo.indexOf('update propuesta_ai');
+    expect(desde, 'no se encontró el UPDATE que sella la propuesta').toBeGreaterThan(0);
+    const sello = codigo.slice(desde, codigo.indexOf('returning estado', desde));
+    expect(sello.length).toBeGreaterThan(200);
+
+    // Se mira la sentencia SIN sus comentarios: el porqué del cambio nombra las columnas
+    // viejas a propósito, y hablar del idioma viejo no es escribirlo.
+    const sinComentarios = sello.replace(/^\s*--.*$/gm, '');
+    const tecleadas = Object.values(COLUMNA_DE_DESTINO).filter((c) =>
+      new RegExp(`\\b${c}\\b`).test(sinComentarios),
+    );
+    expect(tecleadas).toEqual([]);
+    // Y la asignación sale del mapa.
+    expect(sinComentarios).toContain('COLUMNA_DE_DESTINO[p.destino]');
   });
 });

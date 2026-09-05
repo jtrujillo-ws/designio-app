@@ -1,5 +1,5 @@
 import '@/lib/server-only';
-import type { TransactionSql } from 'postgres';
+import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { DimensionesEvidenciaSchema, ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
@@ -290,6 +290,144 @@ async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Pro
     hashtextextended('designio:presupuesto-ai:' || ${workspaceId}, 42))`;
 }
 
+
+/**
+ * TODO lo que el panel necesita saber de una columna de ancla, POR COLUMNA.
+ *
+ * El panel lee propuestas de cualquier capacidad, y de cada una tiene que resolver cuatro
+ * cosas que dependen del TIPO de ancla y de nada más: de qué tabla cuelga (el join), cómo se
+ * titula en pantalla, qué la bloquea —con su motivo— y qué material leyó el modelo, para
+ * medir contra él la presencia literal de las citas.
+ *
+ * Estaba escrito para dos anclas: dos joins, un `coalesce` de dos títulos, un CASE cuya
+ * última rama era la del reto y dos bloques de columnas de material. Se generalizó el
+ * mapeador de filas y una revisión encontró lo que eso dejaba: generalizar quien LEE la fila
+ * no sirve de nada si quien la PRODUCE sigue proyectando dos columnas. Un ancla nueva salía
+ * del SQL sin su columna, sin su título y —lo peor— con el motivo del RETO, porque la última
+ * rama del CASE no preguntaba por `reto_id`: se comía todo lo que no fuera un item. Medido:
+ * con las dos columnas en null el CASE responde «reto-no-admite», que además de falso manda
+ * al revisor a un trámite (reabrir la etapa 0) que no desbloquea nada.
+ *
+ * Al ser un `Record<AnclaCapacidad['columna'], …>` sobre el tipo, ampliar el ancla no
+ * compila hasta que su join, su título, su motivo y su material estén escritos. No es un
+ * guardián que avisa: es la firma de la consulta.
+ */
+type AnclaEnElPanel = {
+  /** Las piezas SQL, construidas con el `tx` de la consulta. */
+  consulta: (tx: TransactionSql) => {
+    /** De dónde sale la fila del ancla. */
+    join: PendingQuery<Row[]>;
+    /** Cómo se titula en el panel. */
+    titulo: PendingQuery<Row[]>;
+    /** El motivo, dado que ESTA columna es la que trae el ancla. */
+    estado: PendingQuery<Row[]>;
+    /** Las columnas con las que se recompone el material. */
+    material: PendingQuery<Row[]>;
+  };
+  /** El material que el modelo leyó, recompuesto desde esas columnas. */
+  material: (f: Record<string, unknown>) => string;
+};
+
+const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
+  item_id: {
+    consulta: (tx) => ({
+      join: tx`left join item_importacion i
+        on i.id = p.item_id and i.workspace_id = p.workspace_id`,
+      titulo: tx`i.titulo`,
+      estado: tx`case
+          when i.estado is distinct from 'pendiente' then 'item-curado'
+          when tipo_fuente_exige_consentimiento(i.tipo_fuente)
+            and not consentimiento_externo_vigente(i.id, i.workspace_id)
+            then 'consentimiento-revocado'
+          else 'disponible'
+        end`,
+      material: tx`i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
+        i.referencia as item_referencia,
+        left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`,
+    }),
+    material: (f) =>
+      materialDeItem({
+        titulo: (f.item_titulo as string | null) ?? '',
+        tipoFuente: (f.item_tipo_fuente as string | null) ?? '',
+        referencia: (f.item_referencia as string | null) ?? '',
+        contenido: (f.item_contenido as string | null) ?? '',
+      }).texto,
+  },
+  reto_id: {
+    consulta: (tx) => ({
+      join: tx`left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`,
+      titulo: tx`r.codigo || ' ' || r.titulo`,
+      /*
+       * El ORDEN de los TRES motivos del reto importa cuando se cumplen varios a la vez, que
+       * es lo normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó Y firmó su
+       * registry). Se ordenan de la puerta más cerrada a la menos: primero el ciclo de vida
+       * del reto, que no se revierte nunca; después el registry firmado, que tampoco (la
+       * firma es de ida); y solo al final el G0, que es el ÚNICO con salida real —reabrir la
+       * etapa 0 (RF-04.9) descongela—. Sugerirle esa salida a quien tiene el reto archivado o
+       * el contrato firmado sería mandarlo a un trámite que no va a desbloquear nada. Entre
+       * motivos ciertos gana siempre el que describe la puerta que ya no se abre.
+       *
+       * Es el mismo orden con el que `criterio_g0_pendiente_guard` elige su `raise`, y por la
+       * misma razón: quien fuerza la escritura por SQL directo lee el motivo que le sirve.
+       */
+      estado: tx`case
+          when not reto_admite_criterios(p.reto_id, p.workspace_id) then 'reto-no-admite'
+          when reto_registry_firmado(p.reto_id, p.workspace_id) then 'registry-firmado'
+          when reto_g0_congela_criterios(p.reto_id, p.workspace_id) then 'criterios-congelados'
+          else 'disponible'
+        end`,
+      material: tx`r.codigo as reto_codigo, r.titulo as reto_titulo,
+        r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica`,
+    }),
+    material: (f) =>
+      materialDeReto({
+        codigo: (f.reto_codigo as string | null) ?? '',
+        titulo: (f.reto_titulo as string | null) ?? '',
+        descripcion: (f.reto_descripcion as string | null) ?? '',
+        metricaObjetivo: (f.reto_metrica as string | null) ?? '',
+      }).texto,
+  },
+};
+
+/**
+ * La proyección del panel que depende del ancla, compuesta desde el registro: una entrada
+ * por columna declarada, en el mismo orden, para las cinco piezas.
+ *
+ * Se exporta porque la prueba que la sujeta tiene que medir ESTA composición y no una copia
+ * suya: lo que había que demostrar es que el motivo de un ancla no se le presta a otra, y
+ * eso solo lo demuestra evaluar el mismo CASE que corre en producción.
+ */
+export function proyeccionDeAnclas(tx: TransactionSql): {
+  columnas: PendingQuery<Row[]>;
+  titulos: PendingQuery<Row[]>;
+  materiales: PendingQuery<Row[]>;
+  /** Las ramas del CASE, cada una preguntando por SU columna. Sin `case … end`: quien lo
+   * usa cierra con `else null`, que es lo que dice «este panel no sabe juzgar esta ancla». */
+  motivo: PendingQuery<Row[]>;
+  joins: PendingQuery<Row[]>;
+} {
+  const anclas = COLUMNAS_DE_ANCLA.map((c) => ({ c, q: ANCLA_EN_EL_PANEL[c].consulta(tx) }));
+  const conComas = (fs: PendingQuery<Row[]>[]) => fs.reduce((a, b) => tx`${a}, ${b}`);
+  return {
+    columnas: conComas(anclas.map(({ c }) => tx`p.${tx(c)}`)),
+    titulos: conComas(anclas.map(({ q }) => q.titulo)),
+    materiales: conComas(anclas.map(({ q }) => q.material)),
+    motivo: anclas
+      .map(({ c, q }) => tx`when p.${tx(c)} is not null then ${q.estado}`)
+      .reduce((a, b) => tx`${a} ${b}`),
+    joins: anclas.map(({ q }) => q.join).reduce((a, b) => tx`${a} ${b}`),
+  };
+}
+
+/**
+ * La columna por la que cuelga ESTA fila, o `undefined` si ninguna declarada la trae.
+ * Una sola respuesta para las tres preguntas que dependen de ella (id, material y si el
+ * ancla se pudo resolver siquiera), para que no puedan discrepar entre sí.
+ */
+function columnaDelAncla(f: Record<string, unknown>): AnclaCapacidad['columna'] | undefined {
+  return COLUMNAS_DE_ANCLA.find((c) => f[c] != null);
+}
+
 function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   const contenido = f.contenido as ContenidoPropuesta;
   const original = f.contenido_original as ContenidoPropuesta;
@@ -297,27 +435,15 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   // delimitador neutralizado—: la presencia literal se mide contra lo que el modelo leyó, no
   // contra el texto crudo de la base. Una sola definición, dos usos.
   //
-  // Y se compone para las DOS capacidades: C0 cita la formulación del reto igual que CI cita
-  // el material del item, así que la presencia se mide con la misma función. Cuando C0 no
-  // citaba, sus propuestas no salían mal en la medición de grounding (RF-09.10): salían
-  // excluidas, que es peor — una capacidad que no puede salir mal es la que más falta hace
-  // medir.
-  const material =
-    f.item_id !== null
-      ? materialDeItem({
-          titulo: (f.item_titulo as string | null) ?? '',
-          tipoFuente: (f.item_tipo_fuente as string | null) ?? '',
-          referencia: (f.item_referencia as string | null) ?? '',
-          contenido: (f.item_contenido as string | null) ?? '',
-        }).texto
-      : f.reto_codigo
-        ? materialDeReto({
-            codigo: f.reto_codigo as string,
-            titulo: (f.reto_titulo as string | null) ?? '',
-            descripcion: (f.reto_descripcion as string | null) ?? '',
-            metricaObjetivo: (f.reto_metrica as string | null) ?? '',
-          }).texto
-        : '';
+  // Y se compone para TODA capacidad: C0 cita la formulación del reto igual que CI cita el
+  // material del item, así que la presencia se mide con la misma regla. Cuando C0 no citaba,
+  // sus propuestas no salían mal en la medición de grounding (RF-09.10): salían excluidas,
+  // que es peor — una capacidad que no puede salir mal es la que más falta hace medir. Cuál
+  // recomponer lo dice la columna que trae el ancla, no un ternario sobre dos nombres: con
+  // `f.item_id ? … : f.reto_codigo ? … : ''`, un ancla nueva medía sus citas contra la
+  // cadena vacía y todas salían ausentes.
+  const columna = columnaDelAncla(f);
+  const material = columna ? ANCLA_EN_EL_PANEL[columna].material(f) : '';
   // Las presencias se resuelven de una vez para toda la fila: el pajar es el mismo para
   // todas sus citas, y normalizarlo por cita multiplicaba el trabajo por seis sin cambiar
   // ninguna respuesta.
@@ -351,12 +477,12 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
      * `COLUMNAS_DE_ANCLA` es exhaustiva por el tipo: ampliar el ancla rompe la compilación
      * donde se declara, no aquí en silencio.
      */
-    anclaId:
-      (COLUMNAS_DE_ANCLA.map((c) => f[c] as string | null).find((v) => v != null) as
-        | string
-        | undefined) ?? '',
+    anclaId: columna ? (f[columna] as string) : '',
     // Si no se pudo determinar, se trata como NO disponible: habilitar dos botones que la
-    // base va a rechazar es peor que pedir un refresco.
+    // base va a rechazar es peor que pedir un refresco. Y el SQL devuelve NULL justamente
+    // cuando ninguna columna declarada trae el ancla, en vez de dejar que la fila caiga en
+    // la rama de otra: un motivo prestado es peor que ninguno, porque propone una salida
+    // que no existe.
     anclaEstado: (f.ancla_estado as EstadoAncla | null) ?? 'ancla-ausente',
     modelo: f.modelo as string,
     promptVersion: f.prompt_version as string,
@@ -417,52 +543,29 @@ export async function panelPropuestas(
     // Cada motivo pregunta por la MISMA función que lo impone al aceptar: el día que el
     // predicado cambie, el panel no se queda con la versión vieja (que es exactamente cómo
     // nació `reto_criterios_congelados`).
+    // (El orden de los motivos de cada ancla vive con el ancla, en `ANCLA_EN_EL_PANEL`.)
     //
-    // El ORDEN de los TRES motivos de C0 importa cuando se cumplen varios a la vez, que es
-    // lo normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó Y firmó su registry).
-    // Se ordenan de la puerta más cerrada a la menos: primero el ciclo de vida del reto, que
-    // no se revierte nunca; después el registry firmado, que tampoco (la firma es de ida); y
-    // solo al final el G0, que es el ÚNICO con salida real —reabrir la etapa 0 (RF-04.9)
-    // descongela—. Sugerirle esa salida a quien tiene el reto archivado o el contrato
-    // firmado sería mandarlo a un trámite que no va a desbloquear nada. Entre motivos
-    // ciertos gana siempre el que describe la puerta que ya no se abre.
-    //
-    // Es el mismo orden con el que `criterio_g0_pendiente_guard` elige su `raise`, y por la
-    // misma razón: quien fuerza la escritura por SQL directo lee el motivo que le sirve.
+    // Y las cuatro piezas que dependen del TIPO de ancla —la columna proyectada, el join, el
+    // título y el motivo— se escriben desde `ANCLA_EN_EL_PANEL`, una entrada por columna
+    // declarada. Antes estaban tecleadas para item y reto, y el CASE terminaba en las ramas
+    // del reto sin preguntar por `p.reto_id`: cualquier ancla que no fuese un item heredaba
+    // su motivo. Ahora cada rama declara de QUÉ columna habla y el fondo del CASE es NULL,
+    // que `filaDePanel` lee como «ancla-ausente» — no aceptable, que es la única respuesta
+    // honesta cuando el panel no sabe juzgar el ancla.
+    const anclas = proyeccionDeAnclas(tx);
+
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
-             p.contenido, p.contenido_original, p.item_id, p.reto_id,
+             p.contenido, p.contenido_original, ${anclas.columnas},
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
-             coalesce(i.titulo, r.codigo || ' ' || r.titulo) as ancla_titulo,
-             r.codigo as reto_codigo, r.titulo as reto_titulo,
-             r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica,
-             case
-               when p.item_id is not null then
-                 case
-                   when i.estado is distinct from 'pendiente' then 'item-curado'
-                   when tipo_fuente_exige_consentimiento(i.tipo_fuente)
-                     and not consentimiento_externo_vigente(i.id, i.workspace_id)
-                     then 'consentimiento-revocado'
-                   else 'disponible'
-                 end
-               when not reto_admite_criterios(p.reto_id, p.workspace_id)
-                 then 'reto-no-admite'
-               when reto_registry_firmado(p.reto_id, p.workspace_id)
-                 then 'registry-firmado'
-               when reto_g0_congela_criterios(p.reto_id, p.workspace_id)
-                 then 'criterios-congelados'
-               else 'disponible'
-             end as ancla_estado,
-             i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
-             i.referencia as item_referencia,
-             left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`;
+             coalesce(${anclas.titulos}) as ancla_titulo,
+             case ${anclas.motivo} else null end as ancla_estado,
+             ${anclas.materiales}`;
     // La llamada que pagó cada propuesta: el uso, el coste y la latencia viven allí (una
     // fila por llamada, aunque devuelva un lote), no repetidos en cada propuesta.
     const origen = tx`from propuesta_ai p
       join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
-      left join item_importacion i
-        on i.id = p.item_id and i.workspace_id = p.workspace_id
-      left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`;
+      ${anclas.joins}`;
 
     // Se pide una fila de más para saber si el corte dejó algo fuera (mismo truco que la
     // bandeja): el panel lo dice en vez de fingir que eso es todo.
@@ -725,12 +828,11 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const key = (ai.origenKey === 'workspace' ? keyWorkspace : keyEntorno)!;
 
     let reserva;
+    const anclas = anclasDelInsert(tx, entrada);
     try {
       [reserva] = await tx`insert into reserva_ai
-        (workspace_id, capacidad, item_id, reto_id, unidades, creado_por)
-        values (${entrada.workspaceId}, ${entrada.capacidad},
-                ${anclaEnColumna(entrada, 'item_id')},
-                ${anclaEnColumna(entrada, 'reto_id')},
+        (workspace_id, capacidad, ${anclas.columnas}, unidades, creado_por)
+        values (${entrada.workspaceId}, ${entrada.capacidad}, ${anclas.valores},
                 ${unidades}, ${actorId})
         returning id`;
     } catch (e) {
@@ -1076,12 +1178,11 @@ async function abrirLlamada(
       // que se acaba de leer bajo el candado, no una que llegó de fuera: entre leerla y
       // escribirla no hay commit por medio en el que pueda dejar de ser la vigente.
       const consentimientoVersion = await comprobarDespacho(tx, actorId, entrada, alcance);
+      const anclas = anclasDelInsert(tx, entrada);
       return tx`insert into llamada_ai
-        (workspace_id, capacidad, item_id, reto_id, modelo, origen_key, resultado,
+        (workspace_id, capacidad, ${anclas.columnas}, modelo, origen_key, resultado,
          consentimiento_version, reserva_id, intento, creado_por)
-        values (${entrada.workspaceId}, ${entrada.capacidad},
-                ${anclaEnColumna(entrada, 'item_id')},
-                ${anclaEnColumna(entrada, 'reto_id')},
+        values (${entrada.workspaceId}, ${entrada.capacidad}, ${anclas.valores},
                 ${modelo}, ${alcance.origenKey}, 'despachada',
                 ${consentimientoVersion}, ${alcance.reservaId}, ${puesto}, ${actorId})
         returning id`;
@@ -1239,24 +1340,32 @@ function anclaEnColumna(
 }
 
 /**
- * Las columnas de ancla que los tres inserts de este módulo escriben, EXHAUSTIVAS por el tipo.
+ * Las columnas de ancla de los tres inserts del pipeline —`reserva_ai`, `llamada_ai` y
+ * `propuesta_ai`— y sus valores, EN EL MISMO ORDEN, generados desde `COLUMNAS_DE_ANCLA`.
  *
- * Los inserts nombran sus columnas una a una —`item_id`, `reto_id`— porque son sentencias
- * escritas, no generadas. Eso deja un hueco que una revisión encontró: ampliar
- * `AnclaCapacidad['columna']` con una tercera y añadirla a las tres tablas dejaba los inserts
- * escribiendo solo las dos viejas, así que `anclaEnColumna` devolvía `null` en las dos y la
- * capacidad nueva perdía su enlace o rompía su restricción — después de pasar la comprobación
- * del catálogo, que solo mira que la columna EXISTA.
+ * Aquí hubo un guardián que no guardaba. Los tres inserts nombraban `item_id, reto_id` a
+ * mano, y para que una tercera columna no se quedara fuera se declaró un
+ * `Record<AnclaCapacidad['columna'], 'escrita'>`… derivado de `COLUMNAS_DE_ANCLA` con un
+ * `Object.fromEntries`. Un Record construido a partir de las claves del propio tipo lo
+ * satisface SIEMPRE: ampliar el ancla seguía compilando, el guardián seguía verde y los tres
+ * inserts seguían escribiendo dos columnas de tres. Costaba una línea de tipo y no sujetaba
+ * nada — un testigo que firma lo que sea.
  *
- * Esta constante no la lee nadie en tiempo de ejecución: existe para que el COMPILADOR se
- * niegue. Al ser `Record<AnclaCapacidad['columna'], …>`, añadir un valor al tipo rompe la
- * compilación aquí, y el comentario dice dónde hay que ir. Es el mismo aprendizaje de la
- * ronda anterior: un guardián de forma sujeta la sintaxis; la semántica la sujeta el tipo.
+ * Un guardián sobre una sentencia escrita a mano solo puede avisar; la sentencia GENERADA no
+ * necesita aviso porque no puede quedarse atrás. Añadir una columna al ancla la mete en los
+ * tres inserts sin tocarlos, que es lo que el guardián pedía por favor.
  */
-const ANCLA_EN_LOS_INSERTS: Record<AnclaCapacidad['columna'], 'escrita'> = Object.fromEntries(
-  COLUMNAS_DE_ANCLA.map((c) => [c, 'escrita' as const]),
-) as Record<AnclaCapacidad['columna'], 'escrita'>;
-void ANCLA_EN_LOS_INSERTS;
+function anclasDelInsert(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+): { columnas: PendingQuery<Row[]>; valores: PendingQuery<Row[]> } {
+  return {
+    columnas: COLUMNAS_DE_ANCLA.map((c) => tx`${tx(c)}`).reduce((a, b) => tx`${a}, ${b}`),
+    valores: COLUMNAS_DE_ANCLA.map((c) => tx`${anclaEnColumna(entrada, c)}`).reduce(
+      (a, b) => tx`${a}, ${b}`,
+    ),
+  };
+}
 
 /**
  * Lo que cada capacidad vuelve a comprobar JUSTO ANTES de despachar, bajo el candado y en la
@@ -1581,18 +1690,17 @@ async function persistirPropuestas(
     }
 
     const destino = CAPACIDADES[entrada.capacidad].destino;
+    const anclas = anclasDelInsert(tx, entrada);
     // UNA sentencia para el lote entero: el evento PropuestaAIGenerada de cada fila lo
     // emite el guard DENTRO de este insert, así que el rol auditado es exactamente el que
     // autorizó la escritura (mismo snapshot).
     try {
       const filas = await tx`
       insert into propuesta_ai
-        (workspace_id, capacidad, destino, item_id, reto_id, contenido, contenido_original,
+        (workspace_id, capacidad, destino, ${anclas.columnas}, contenido, contenido_original,
          confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, orden,
          es_simulacion, creado_por)
-      select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino},
-             ${anclaEnColumna(entrada, 'item_id')},
-             ${anclaEnColumna(entrada, 'reto_id')},
+      select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino}, ${anclas.valores},
              c.contenido, c.contenido,
              -- La confianza que el modelo declara sobre CADA propuesta, traducida a la escala
              -- de la columna por una sola tabla. La columna existía y NADIE la escribía:
@@ -1828,7 +1936,10 @@ async function aceptarPropuestaEnTransaccion(
     const p = await leerParaRevisar(tx, entrada.workspaceId, entrada.propuestaId);
 
     let contenido = p.contenido;
-    if (entrada.correccion) {
+    // PRESENTE, no verdadera: la frontera transporta la corrección sin juzgarla (`unknown`),
+    // así que un `null` enviado como corrección es una corrección con forma inválida —y muere
+    // abajo con su mensaje—, no una aceptación de lo propuesto.
+    if (entrada.correccion !== undefined) {
       try {
         contenido = parsearContenido(p.capacidad, entrada.correccion);
       } catch {
@@ -1897,10 +2008,25 @@ async function aceptarPropuestaEnTransaccion(
                         then 'corregida' else 'aceptada' end,
           contenido = ${tx.json(contenido)}::jsonb,
           revisada_por = ${actorId},
-          -- El enlace va a la columna que el destino DECLARA. Escrito como dos ternarios,
-          -- un destino nuevo dejaba las dos en null y la propuesta aceptada sin objeto.
-          evidencia_id = ${COLUMNA_DE_DESTINO[p.destino] === 'evidencia_id' ? objetoId : null},
-          criterio_id = ${COLUMNA_DE_DESTINO[p.destino] === 'criterio_id' ? objetoId : null}
+          -- El enlace se escribe EN la columna que el destino nombra: el nombre viaja como
+          -- identificador, no como una etiqueta contra la que comparar.
+          --
+          -- (Sin comillas invertidas: esto vive en una template literal y las terminaría.)
+          --
+          -- Antes esto eran dos asignaciones fijas gobernadas por dos ternarios sobre
+          -- «COLUMNA_DE_DESTINO». Consultar el mapa parecía cerrar el caso y no cerraba nada:
+          -- lo que decidía dónde iba el id seguían siendo los dos nombres escritos en el SQL,
+          -- así que un destino nuevo hacía fallar los dos ternarios, dejaba las dos columnas
+          -- en null y sellaba una propuesta aceptada sin objeto. Preguntarle el nombre a un
+          -- mapa y luego no usarlo para nada es exactamente el binario de antes con un
+          -- testigo delante.
+          --
+          -- Las demás columnas de destino no se tocan porque no hay nada que borrar: solo se
+          -- llega aquí con «estado = 'propuesta'» (el WHERE lo exige) y solo este UPDATE las
+          -- escribe, así que están todas en null. El CHECK de «propuesta_ai» que ata
+          -- «estado in (aceptada, corregida)» a tener enlace es el respaldo en la base: un
+          -- destino cuya columna nueva no entre en ese CHECK no se sella a medias, revienta.
+          ${tx(COLUMNA_DE_DESTINO[p.destino])} = ${objetoId}
       where id = ${entrada.propuestaId} and workspace_id = ${entrada.workspaceId}
         and estado = 'propuesta'
       returning estado`;

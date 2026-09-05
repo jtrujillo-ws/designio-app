@@ -22,6 +22,7 @@ import {
   ErrorAI,
   generarPropuestas,
   panelPropuestas,
+  proyeccionDeAnclas,
   rechazarPropuesta,
   registrarConsentimiento,
 } from '@/lib/ai/ai.servicio';
@@ -4654,5 +4655,52 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       }
     }
     expect(faltan).toEqual([]);
+  });
+
+  /**
+   * Ningún ancla hereda el motivo de otra, y la que el panel no sabe juzgar no se puede
+   * aceptar.
+   *
+   * El CASE de `ancla_estado` decidía así: `when p.item_id is not null then <lo del item>`
+   * y a continuación, SIN preguntar por `p.reto_id`, las tres ramas del reto. Todo lo que no
+   * fuera un item caía en ellas. Medido contra la base con las dos columnas en null, la
+   * respuesta era «reto-no-admite»: un motivo falso, y de los que llevan al revisor a un
+   * trámite —reabrir la etapa 0— que no desbloquea nada. Con una tercera columna de ancla,
+   * cada propuesta suya habría llegado a la pantalla con la excusa del reto.
+   *
+   * No se puede montar la fila en `propuesta_ai` —sus CHECK atan destino y ancla, que es
+   * justo lo que se quiere—, así que se evalúa el CASE REAL, el que compone
+   * `proyeccionDeAnclas`, sobre un `p` sintético. Es la misma expresión que corre en el
+   * panel: si alguien vuelve a dejar una rama sin dueño, esto lo dice.
+   */
+  it('no le presta a un ancla el motivo de otra, y la desconocida no es aceptable', async () => {
+    const item = await nuevoItem('Item para medir el motivo del ancla');
+    await conUsuario(leadId, async (tx) => {
+      const ancla = proyeccionDeAnclas(tx);
+      // Un `p` sintético con las columnas que el CASE mira, y los joins que el panel hace.
+      const motivoDe = async (i: string | null, r: string | null): Promise<string | null> => {
+        const [f] = await tx`
+          select case ${ancla.motivo} else null end as estado
+          from (select ${i}::uuid as item_id, ${r}::uuid as reto_id,
+                       ${ws}::uuid as workspace_id) p
+          ${ancla.joins}`;
+        return (f!.estado as string | null) ?? null;
+      };
+
+      // Ninguna columna declarada la trae: el panel NO sabe juzgarla, y lo dice callando.
+      // `filaDePanel` lee ese null como 'ancla-ausente', que solo admite rechazar. Antes
+      // respondía 'reto-no-admite' — el motivo del vecino.
+      expect(await motivoDe(null, null)).toBeNull();
+
+      // Y cada ancla conocida responde SOLO con motivos de los suyos: se comprueban los
+      // conjuntos, no un valor concreto, porque lo que se sujeta es que las ramas no se
+      // crucen y no en qué estado dejó el fixture a cada fila.
+      const DEL_ITEM = ['disponible', 'item-curado', 'consentimiento-revocado'];
+      const DEL_RETO = ['disponible', 'reto-no-admite', 'registry-firmado', 'criterios-congelados'];
+      expect(DEL_ITEM).toContain(await motivoDe(item, null));
+      expect(DEL_RETO).toContain(await motivoDe(null, retoId));
+      // El del item no puede ser NUNCA uno exclusivo del reto (que es lo que pasaba).
+      expect(DEL_RETO.slice(1)).not.toContain(await motivoDe(item, null));
+    });
   });
 });

@@ -365,27 +365,34 @@ export type GenerarPropuestas = z.infer<typeof GenerarPropuestasSchema>;
 export const RevisarPropuestaSchema = z.object({
   workspaceId: z.string().uuid(),
   propuestaId: z.string().uuid(),
-  /** Presente ⇒ corrección humana: se valida contra el esquema de la capacidad de la
+  /**
+   * Presente ⇒ corrección humana: se valida contra el esquema de la capacidad de la
    * propuesta (el servicio la re-parsea) y, si cambia algo, queda `corregida` conservando
-   * el original (SYS-17). */
-  /*
-   * Y los esquemas admitidos salen del REGISTRO, no de una unión escrita a mano. Aquí ponía
-   * `z.union([ContenidoExtraccionSchema, ContenidoCriterioSchema])`, y eso rechazaba en la
-   * frontera de la server function una corrección perfectamente válida para una capacidad
-   * nueva —antes de que `parsearContenido`, que sí sabe de qué capacidad se trata, llegara a
-   * mirarla—. La validación de verdad sigue siendo la del servicio, contra el esquema de SU
-   * capacidad; esto es solo la puerta, y la puerta tiene que admitir todo lo que dentro se
-   * sabe validar.
+   * el original (SYS-17).
+   *
+   * Y llega SIN TOCAR: `unknown` es el tipo de lo que todavía no se puede juzgar.
+   *
+   * Aquí hubo primero una unión escrita a mano y después una derivada del registro. Las dos
+   * compartían el defecto de fondo, y la segunda lo escondía mejor: una unión no solo
+   * ACEPTA, PARSEA —aplica los `default()`, recorta las claves que su rama no declara y
+   * devuelve otro objeto—, y elige rama por la PRIMERA que encaje. Esta frontera no sabe de
+   * qué capacidad es la propuesta: la capacidad se lee de la fila, dentro de la transacción,
+   * varias llamadas después. Así que la rama que encajaba no era la de la propuesta sino la
+   * primera que tolerase el payload, y lo que llegaba al servicio ya venía recortado a la
+   * forma de OTRA capacidad. El modo de fallo no era un rechazo —eso se ve— sino una
+   * corrección que se guarda con campos de menos.
+   *
+   * Validar exige saber contra qué, y aquí no se sabe. La puerta transporta; la única
+   * verificación es `parsearContenido`, que sí conoce la capacidad de la fila y rechaza con
+   * su mensaje. Nada se pierde por el camino: lo que el revisor escribió es exactamente lo
+   * que ese esquema examina.
+   *
+   * `.optional()` no es decorativo: distingue AUSENTE (aceptar lo propuesto) de PRESENTE,
+   * incluido un `null` presente —que es una corrección con forma inválida y muere en
+   * `parsearContenido`, no una aceptación silenciosa—. Por eso el servicio pregunta por
+   * `undefined` y no por la verdad del valor.
    */
-  correccion: z
-    .union(
-      Object.values(CAPACIDADES).map((c) => c.contenido) as unknown as [
-        z.ZodTypeAny,
-        z.ZodTypeAny,
-        ...z.ZodTypeAny[],
-      ],
-    )
-    .optional(),
+  correccion: z.unknown().optional(),
 });
 export type RevisarPropuesta = z.infer<typeof RevisarPropuestaSchema>;
 

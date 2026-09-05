@@ -469,6 +469,24 @@ begin
   if new.estado not in ('aceptada', 'corregida') then
     return null;
   end if;
+
+  -- ── EL CANDADO POR CLAVE VA PRIMERO, ANTES QUE NINGÚN CANDADO DE FILA ──
+  -- Este guard toma después `for share` sobre el reto, sobre las citas y sobre `derecho_uso`.
+  -- El candado por clave del reto tiene que ir DELANTE de todos ellos, porque ése es el orden
+  -- del resto del sistema: la revalidación previa al despacho y el trigger de
+  -- `arquetipo_evidencia` piden primero la clave y después las filas.
+  --
+  -- Pedirlo al final —que es como nació— invierte el par y abre un abrazo mortal de tres:
+  -- esta transacción retiene el `for share` del reto y espera la clave; un archivado quiere
+  -- la fila en modo exclusivo y espera a esta; y la que despacha tiene la clave y espera la
+  -- fila, detrás del archivado en la cola del candado. Nadie avanza. No se ve en una máquina
+  -- rápida y sí en cuanto hay contención, que es como se manifestó.
+  --
+  -- Va aquí y no dentro de la comprobación del alcance porque el orden es una propiedad de la
+  -- transacción entera, no de la regla que lo necesitaba.
+  if new.reto_id is not null then
+    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || new.reto_id, 42));
+  end if;
   if new.destino = 'evidencia' and not exists (
     select 1 from item_importacion i
     where i.id = new.item_id and i.workspace_id = new.workspace_id
@@ -801,7 +819,6 @@ begin
   -- leída, así que un candado de fila no lo ve. `designio:reto:` es la misma clave que toman
   -- el trigger de «arquetipo_evidencia» y la revalidación previa al despacho.
   if new.reto_id is not null and new.alcance_evidencia is not null then
-    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || new.reto_id, 42));
     if exists (
       select 1
         from arquetipo a

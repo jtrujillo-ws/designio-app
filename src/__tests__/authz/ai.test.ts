@@ -30,6 +30,7 @@ import { evidenciaQueLlegoAlModelo, MAX_MATERIAL } from '@/lib/ai/ai.prompts';
 import {
   aceptarPropuesta,
   ErrorAI,
+  huellaDelMaterialDelRegistry,
   generarPropuestas,
   panelPropuestas,
   proyeccionDelPanel,
@@ -10605,12 +10606,32 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * dónde cuelga, contra qué se mide una cita, qué exige materializar, qué la deja obsoleta y
    * qué NO propone.
    */
+  /**
+   * La huella REAL del material de un registry, escrita sobre una propuesta del fixture.
+   *
+   * `nuevaPropuesta` escribe `'huella-del-material'` a propósito —componer el material a mano
+   * sería fijar en el fixture el prompt que se está probando—, y eso valía mientras la huella
+   * solo apagara el verde de la presencia literal. Desde que además BLOQUEA la aceptación de
+   * C6, una propuesta con huella falsa no se puede aceptar y las sondas del pipeline medirían
+   * el bloqueo en vez de lo suyo.
+   *
+   * Se compone llamando a la MISMA función que usa el servicio, no copiándola: lo que el
+   * fixture no puede hacer es inventarse el texto, y esto no se lo inventa.
+   */
+  const conHuellaReal = async (propuestaId: string) => {
+    const { huella } = await conUsuario(leadId, (tx) =>
+      huellaDelMaterialDelRegistry(tx, ws, registryId),
+    );
+    await sqlAdmin()`update propuesta_ai set huella_material = ${huella}
+      where id = ${propuestaId}`;
+    return propuestaId;
+  };
+
   it('C6: la entrada del registry nace del criterio que cita, y se sella con su procedencia', async () => {
     const admin = sqlAdmin();
-    const propuestaId = await nuevaPropuesta(leadId, {
-      capacidad: 'C6',
-      anclas: { registry_id: registryId },
-    });
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+    );
 
     // 1. El ANCLA es el registry, no el reto: la fila cuelga de la columna que su capacidad
     //    declara, y de ninguna otra. Es lo que `propuesta_ai_un_ancla` impone y lo que el
@@ -10681,11 +10702,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       ...CONTENIDO_C6(criterioDelRegistryId),
       nombre: 'Tasa de verificación completada en escritorio',
     };
-    const propuestaId = await nuevaPropuesta(leadId, {
-      capacidad: 'C6',
-      anclas: { registry_id: registryId },
-      contenido: inicial,
-    });
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido: inicial,
+      }),
+    );
 
     await expect(
       aceptarPropuesta(leadId, {
@@ -10824,10 +10847,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    */
   it('C6: una entrada del registry se puede quitar del borrador aunque la haya propuesto la AI', async () => {
     const admin = sqlAdmin();
-    const propuestaId = await nuevaPropuesta(leadId, {
-      capacidad: 'C6',
-      anclas: { registry_id: registryId },
-    });
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+    );
     // Con nombre propio: el registry del fixture es uno solo —`metric_registry` es único por
     // reto— y `unique (registry_id, nombre)` no admite dos entradas iguales.
     const r = await aceptarPropuesta(leadId, {
@@ -10917,6 +10939,71 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       where registry_id = ${registryId} and criterio_id = ${otroId}`;
     expect(restos.length).toBe(0);
     await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+  });
+
+  /**
+   * Y un criterio que se MUEVE después de la llamada cierra la aceptación.
+   *
+   * La huella del material se guardaba y solo la leía el panel, para apagar el verde de la
+   * presencia literal. Pero un registry en borrador se abre ANTES de G0, y hasta G0 los
+   * criterios se editan: entre generar el lote y revisarlo, `editarCriterio` puede cambiar la
+   * definición, el objetivo o la ventana del criterio al que la entrada responde. Medido: la
+   * propuesta seguía `disponible` y la aceptación materializaba el KPI — un contrato de
+   * medición, permanente y atado a ese criterio, escrito contra una promesa que ya no existe.
+   *
+   * Se cierra en los DOS sitios donde se puede: el panel lo dice con su motivo, y el
+   * materializador lo rechaza. En la base no tiene suelo, y eso va escrito en la tabla de
+   * precondiciones: el material es el texto ya compuesto y recortado, así que no hay SQL que
+   * lo recalcule. Por eso no basta con el panel — un aviso de pantalla lo salta cualquier
+   * cliente que hable con la server function.
+   */
+  it('C6: si los criterios se mueven después de la llamada, la entrada ya no se acepta', async () => {
+    const admin = sqlAdmin();
+    // Nombre propio, como las demás: el registry del fixture es uno solo y los casos de
+    // arriba ya dejaron entradas materializadas dentro.
+    const contenido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en tótem',
+    };
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido,
+      }),
+    );
+    // Con el material intacto, la propuesta está disponible: sin esta mitad, un panel que
+    // dijera siempre «cambiado» pasaría igual.
+    const antes = (await panelPropuestas(leadId, ws)).pendientes.find((x) => x.id === propuestaId);
+    expect(antes!.anclaEstado).toBe('disponible');
+
+    // El criterio se mueve. Es el acto legítimo que abre el hueco: hasta G0 se editan, y el
+    // registry en borrador existe antes de G0.
+    await admin`update criterio_exito set objetivo = 'Bajar de 8 a 3 minutos'
+      where id = ${criterioDelRegistryId}`;
+
+    const tras = (await panelPropuestas(leadId, ws)).pendientes.find((x) => x.id === propuestaId);
+    expect(tras!.anclaEstado, 'el panel seguía diciendo disponible').toBe('criterios-cambiados');
+    // Y el verde de la presencia literal se apaga: contra un material que el modelo no leyó,
+    // «aparece» o «no aparece» son las dos respuestas equivocadas.
+    expect(tras!.citas.map((c) => c.presenteLiteral)).toEqual(tras!.citas.map(() => null));
+    await expect(
+      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
+    ).rejects.toThrow(/cambiaron después de que el modelo los leyera/);
+    // Y corregir el texto tampoco la salva: lo que se movió está fuera de la propuesta.
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...contenido, definicion: 'Otra definición del mismo KPI' },
+      }),
+    ).rejects.toThrow(/cambiaron después de que el modelo los leyera/);
+
+    // RECHAZAR sigue abierto, que es la asimetría que sostiene la tabla entera: si el bloqueo
+    // alcanzara al rechazo, la fila quedaría muerta reteniendo su ancla.
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [fin] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(fin!.estado).toBe('rechazada');
   });
 
   /**

@@ -121,6 +121,9 @@ const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
   // La única que SÍ: el nombre es del contenido, se corrige, y corregirlo es exactamente lo
   // que el mensaje pide.
   'nombre-ocupado': true,
+  // El material se movió por debajo: corregir el texto de la propuesta no devuelve el
+  // criterio a lo que el modelo leyó, así que la única salida es rechazar y pedir otro lote.
+  'criterios-cambiados': false,
   'reto-no-admite': false,
   'gate-decidido': false,
   'checklist-avanzado': false,
@@ -160,6 +163,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'El grafo de ese journey cambió desde que se generó el informe: alguna de las señales que remedia ya no está abierta, o el grafo que describe ya no es el que hay. Puedes leerlo, pero comprueba contra el journey antes de aplicar nada.',
   'checklist-avanzado':
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
+  'criterios-cambiados':
+    'Los criterios de éxito de ese reto cambiaron desde que el modelo los leyó: esta entrada se escribió contra una definición, un objetivo o una ventana que ya no son los vigentes. Recházala y pide un lote nuevo.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 

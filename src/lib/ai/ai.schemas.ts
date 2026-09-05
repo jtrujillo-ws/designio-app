@@ -629,6 +629,7 @@ export const ESTADOS_ANCLA = [
   'registry-cerrado',
   'criterio-ausente',
   'nombre-ocupado',
+  'criterios-cambiados',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

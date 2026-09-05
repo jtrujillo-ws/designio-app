@@ -28,12 +28,20 @@ function PantallaLogin() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Si volver a pulsar puede cambiar algo. Un fallo de configuración del despliegue no se
+   * arregla reintentando, y decir «intenta de nuevo» ahí no es un mensaje impreciso: es una
+   * INSTRUCCIÓN que no puede funcionar. Quien la lee reintenta, revisa su contraseña y la
+   * cambia buscando una culpa que no tiene — pasó, y costó un buen rato.
+   */
+  const [reintentable, setReintentable] = useState(true);
   const [enviando, setEnviando] = useState(false);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     setEnviando(true);
     setError(null);
+    setReintentable(true);
     try {
       const r = await iniciarSesion({ data: { email, password } });
       if (r.ok) {
@@ -41,7 +49,11 @@ function PantallaLogin() {
         return;
       }
       setError(r.error);
+      setReintentable(r.reintentable);
     } catch {
+      // Lo que llega aquí ya no es un fallo de configuración —el servidor los devuelve como
+      // respuesta, no como excepción—: es la red, o el servidor caído. Ahí reintentar sí es
+      // lo que hay que hacer, así que el mensaje se queda.
       setError('No se pudo iniciar sesión; intenta de nuevo');
     } finally {
       setEnviando(false);
@@ -87,7 +99,14 @@ function PantallaLogin() {
               {error}
             </span>
           )}
-          <Button type="submit" disabled={enviando} style={{ justifyContent: 'center' }}>
+          {/* El botón se apaga cuando reintentar no puede servir: ofrecerlo sería repetir la
+              misma instrucción imposible con otro gesto. Se recupera al recargar, que es lo
+              que hay que hacer cuando alguien arregle la configuración. */}
+          <Button
+            type="submit"
+            disabled={enviando || !reintentable}
+            style={{ justifyContent: 'center' }}
+          >
             {enviando ? 'Entrando…' : 'Entrar'}
           </Button>
           <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-faint)' }}>

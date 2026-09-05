@@ -93,10 +93,17 @@ a:hover {
   .loop-aside .loop-estrecho {
     display: flex;
   }
+  /* En el riel una fila no cabe en horizontal (abreviatura + contador, o iniciales + chip
+     de journey): lo que quede visible se apila en columna, centrado, sin el caret. */
   .loop-aside .loop-fila {
+    flex-direction: column;
     justify-content: center;
-    padding-left: 8px !important;
-    padding-right: 8px !important;
+    gap: 3px;
+    padding: 6px 4px !important;
+    min-height: 32px;
+  }
+  .loop-aside .loop-fila > .loop-caret {
+    display: none;
   }
   .loop-cabecera-fila {
     flex-wrap: wrap;

@@ -838,6 +838,7 @@ function ServicioDelArbol({
         }}
       >
         <span
+          className="loop-caret"
           aria-hidden
           style={{
             font: '400 10px var(--font-mono)',

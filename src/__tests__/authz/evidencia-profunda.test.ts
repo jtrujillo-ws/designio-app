@@ -371,6 +371,72 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     });
   });
 
+  it('un derecho vencido no revive cambiando de huso: la caducidad la mide la base', async () => {
+    /*
+     * `current_date` no es una fecha: es la fecha EN EL HUSO DE LA SESIÓN. El caso de arriba
+     * ya rodeaba el problema —pide el «ayer» a Postgres en vez de calcularlo en el proceso—,
+     * pero rodearlo no es cerrarlo: quien llama puede declarar el huso que quiera un renglón
+     * antes de preguntar, y `SECURITY DEFINER` no lo impide (presta privilegios, no devuelve
+     * los parámetros de sesión al valor del servidor).
+     *
+     * Sin fijar el calendario, un derecho VENCIDO volvía a estar vigente atrasando el huso, y
+     * con él la evidencia volvía a ser citable, congelable y validable: la garantía de
+     * SPEC-03 medida con el reloj de quien la quiere esquivar.
+     *
+     * El caso no depende de la hora a la que corra: el mundo abarca a la vez 26 horas de
+     * calendario (UTC-12 a UTC+14), así que la fecha del huso más adelantado es SIEMPRE un día
+     * mayor que la del más atrasado. Con el derecho venciendo en la fecha del más atrasado,
+     * los dos extremos daban respuestas opuestas sobre la misma fila.
+     */
+    const admin = sqlAdmin();
+    const [dias] = await admin`select (timezone('Etc/GMT+12', now()))::date as temprana,
+                                      (timezone('Pacific/Kiritimati', now()))::date as tardia`;
+    const temprana = (dias!.temprana as Date).toISOString().slice(0, 10);
+    const tardia = (dias!.tardia as Date).toISOString().slice(0, 10);
+    // El supuesto sobre el que se apoya el caso, comprobado y no asumido.
+    expect(tardia > temprana).toBe(true);
+
+    await decidirDerechos(leadId, {
+      workspaceId: ws,
+      evidenciaId: evConDerechos,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Consentimiento con vigencia hasta el día pactado',
+      venceEn: temprana,
+    });
+
+    const usable: Record<string, boolean> = {};
+    const motivo: Record<string, string | null> = {};
+    for (const huso of ['Etc/GMT+12', 'UTC', 'Pacific/Kiritimati']) {
+      const r = await conUsuario(leadId, async (tx) => {
+        await tx.unsafe(`set local time zone '${huso}'`);
+        const [f] = await tx`select
+          evidencia_usable(${evConDerechos}, ${ws}, 'cliente') as usable,
+          evidencia_motivo_bloqueo(${evConDerechos}, ${ws}, 'cliente') as motivo`;
+        return f!;
+      });
+      usable[huso] = r.usable as boolean;
+      motivo[huso] = r.motivo as string | null;
+    }
+    // La fila es la misma y la respuesta también, la declare quien la declare.
+    expect(usable['Etc/GMT+12']).toBe(usable['Pacific/Kiritimati']);
+    expect(usable['UTC']).toBe(usable['Pacific/Kiritimati']);
+    // Y el MOTIVO que se pinta va con ella: decir «vencieron» sobre un derecho vivo, o callar
+    // sobre uno muerto, es lo único que una persona llega a leer sobre por qué no puede citar.
+    expect(motivo['Etc/GMT+12']).toBe(motivo['Pacific/Kiritimati']);
+    expect(motivo['UTC']).toBe(motivo['Pacific/Kiritimati']);
+
+    // Se restablece para el resto de la suite.
+    await decidirDerechos(leadId, {
+      workspaceId: ws,
+      evidenciaId: evConDerechos,
+      decision: 'concedido',
+      ambito: 'cliente',
+      base: 'Cláusula 7 del contrato de servicios',
+      venceEn: null,
+    });
+  });
+
   it('revocar es un camino real (el consentimiento se retira) y deja evento con el previo', async () => {
     const admin = sqlAdmin();
     await decidirDerechos(adminClienteId, {

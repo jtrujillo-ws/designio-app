@@ -89,7 +89,9 @@ function esRechazoDePolitica(e: unknown): boolean {
  * midiendo y cuál es su ventana FIRMADA. La ventana no se puede mover una vez firmado el
  * registry (ni la entrada ni el criterio tienen política de update entonces), así que
  * leerla antes del candado no abre carrera; y `hoy` sale de la misma transacción que
- * evaluará la política, así que ambos ven el mismo `current_date`. */
+ * evaluará la política, LEYENDO la misma función que ella, así que ambos ven el mismo día.
+ * Con `current_date` a los dos lados el acuerdo dependía de que nadie tocara el huso de la
+ * sesión; ahora depende de una sola definición, que es lo que un acuerdo debería ser. */
 type ContextoEntrada = {
   retoId: string;
   /** Registry firmado y reto en medición: las condiciones que hacen del dato un dato. */
@@ -109,7 +111,7 @@ async function contextoDeEntrada(
       (r.estado = 'firmado' and rt.estado = 'en-medicion') as midiendo,
       e.ventana_inicio::text as ventana_inicio,
       (e.ventana_inicio + c.ventana_dias)::text as ventana_fin,
-      current_date::text as hoy
+      fecha_de_la_base()::text as hoy
     from entrada_kpi e
     join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
     join reto rt on rt.id = r.reto_id and rt.workspace_id = r.workspace_id
@@ -1097,7 +1099,7 @@ async function diagnosticoDeReview(
   // que no coincidiera con quien autoriza dejaría al lead con un rechazo y un «no falta
   // nada» — precisamente el día del corte, que es cuando importa.
   const abiertas = await tx`
-    select e.nombre, (e.ventana_inicio + c.ventana_dias) - current_date as faltan
+    select e.nombre, (e.ventana_inicio + c.ventana_dias) - fecha_de_la_base() as faltan
     from entrada_kpi e
     join metric_registry r on r.id = e.registry_id and r.workspace_id = e.workspace_id
     join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
@@ -1257,13 +1259,13 @@ export async function seguimientoDeImpacto(
         -- existiera, y esa distinción es la que decide si queda reparación por ofrecer.
         r.medicion_sin_registry,
         -- El día de calendario de la BASE, que es quien juzga. snapshot_insert acota la
-        -- fecha con current_date y contextoDeEntrada diagnostica con el mismo, así que
-        -- el máximo del selector tiene que salir de aquí y no de un new Date() del
+        -- fecha con fecha_de_la_base() y contextoDeEntrada diagnostica con la misma
+        -- función, así que el máximo del selector sale de aquí y no de un new Date() del
         -- navegador: no hay huso por petición, de modo que un hoy calculado en el cliente
         -- discrepa del que decide — al este de UTC ofrecía un día que el servicio rechaza
         -- por futuro, y en el borde inverso escondía uno que la base sí acepta. El espejo
         -- LEE la regla; no la reproduce.
-        current_date::text as hoy,
+        fecha_de_la_base()::text as hoy,
         -- El G7 del proyecto que se mira: lo necesita el espejo del botón de RETOMAR, cuya
         -- precondición en el guard es exactamente esa (a medición se entra por G7). Sin él
         -- el botón se ofrecería para que la base lo negara.
@@ -1293,13 +1295,13 @@ export async function seguimientoDeImpacto(
             'ventanaInicio', e.ventana_inicio::text,
             'ventanaFin', (e.ventana_inicio + c.ventana_dias)::text,
             'fechaPostMortem', e.fecha_post_mortem::text,
-            'diasRestantes', (e.ventana_inicio + c.ventana_dias) - current_date,
+            'diasRestantes', (e.ventana_inicio + c.ventana_dias) - fecha_de_la_base(),
             'ultimaFecha', ult.fecha::text,
             -- RF-07.4 sobre el DATO: el estado sale de la cadencia comprometida y de la
             -- última recepción, no de una marca que alguien pone a mano. La cadencia corre
             -- contra hoy solo MIENTRAS la ventana está abierta: una vez cerrada nadie puede
             -- aportar nada (la política del snapshot rechaza cualquier fecha posterior) y
-            -- el review completado es inmutable, así que seguir avanzando con current_date
+            -- el review completado es inmutable, así que seguir avanzando con el día de hoy
             -- convertiría en «vencido» —por el mero paso del tiempo, y para siempre— todo
             -- KPI recurrente que cumplió. Cerrada la ventana el estado es TERMINAL y se
             -- juzga contra su último día.
@@ -1336,7 +1338,7 @@ export async function seguimientoDeImpacto(
               -- terminado, así que la entrega que vence HOY aún puede llegar — es el mismo
               -- corte inclusivo de la ventana, visto contra el calendario.
               when cadencia_incumplida(e.id, e.workspace_id, e.ventana_inicio,
-                     e.frecuencia, current_date - 1) then 'vencido'
+                     e.frecuencia, fecha_de_la_base() - 1) then 'vencido'
               -- Sin cadencia ('unica') no hay vencimientos que generar, así que estas dos
               -- ramas la cubren sin un caso aparte: lo que hay es lo que se dice.
               when ult.fecha is not null then 'recibido'

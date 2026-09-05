@@ -1488,22 +1488,48 @@ end $$;
 -- `estado` —así que para él las dos formulaciones coinciden—, pero este trigger corre también
 -- para quien administra, y una regla escrita sobre una columna deja de decir lo que dice el
 -- día que la superficie crece.
-create function decision_sin_cambios_no_se_escribe() returns trigger
+--
+-- ── Y UNA SOLA ESCRITURA POR TRANSACCIÓN, QUE ES LO QUE HACE EXACTA A LA DE ARRIBA ──
+--
+-- La comprobación del roce mira `old`, y `old` es la tupla INMEDIATAMENTE anterior, no la que
+-- había al empezar la transacción. Con eso, el roce se rehacía en DOS pasos: sobre una
+-- decisión que ya venía «en-revisión» de una reapertura anterior, `→ vigente` y `→ en-revisión`
+-- difieren cada uno de su predecesor, así que los dos pasaban; la tupla final queda con el
+-- `xmin` de la transacción y el guard de la reapertura la contaba. Medido: declarando 2, PASÓ,
+-- y `EtapaReabierta` archivó «2 decisiones marcadas» habiendo movido una.
+--
+-- El estado COMPROMETIDO no se puede leer desde dentro —cualquier `select` ve nuestras propias
+-- escrituras—, así que la regla no es «compara contra el estado previo», es que no haya nada
+-- contra lo que comparar: si esta transacción ya escribió esta decisión, `old` deja de ser el
+-- estado anterior y la comprobación del roce pierde su suelo. Cerrando la SEGUNDA escritura,
+-- `old` vuelve a ser siempre lo comprometido y las dos reglas juntas dicen lo que la base
+-- necesita: lo que esta transacción hizo con esta decisión es UNA transición de verdad.
+--
+-- No cierra ningún camino: `reabrirEtapa` mueve cada decisión una vez —su UPDATE filtra por
+-- `estado = 'vigente'`, así que dos reaperturas en la misma transacción no se pisan— y
+-- `revalidarDecision` va en la suya. Es la misma forma que «una transición es una sola
+-- reapertura»: el archivo cuenta ACTOS, no reescrituras de tupla.
+--
+-- Se calla ante el propietario por `session_user`, como el resto de guards: seed, migraciones
+-- y backfills montan estados a mano y no responden a esta gramática.
+create function decision_una_transicion_por_transaccion() returns trigger
 language plpgsql as $fn$
 begin
   if new is not distinct from old then return null; end if;
+  if session_user = 'designio_app' and old.xmin = pg_current_xact_id()::xid then
+    raise exception 'esa decisión ya la movió esta transacción: una decisión se mueve UNA vez, porque lo que se cuenta y se archiva es la transición y no cuántas veces se reescribió la fila — ir y volver deja la decisión donde estaba y la haría constar como marcada (RF-04.9)';
+  end if;
   return new;
 end;
 $fn$;
 
-revoke execute on function decision_sin_cambios_no_se_escribe() from public;
+revoke execute on function decision_una_transicion_por_transaccion() from public;
 
 -- `b_`, por detrás de `a_congelacion_por_disposicion`: con el workspace dispuesto, el rechazo
--- de aquélla tiene que llegar antes que este silencio — que no se escriba nada no es lo mismo
--- que que no se pueda escribir, y quien lo intenta merece el motivo.
-create trigger b_decision_sin_cambios
+-- de aquélla tiene que llegar antes que éste — el motivo correcto es el de la disposición.
+create trigger b_decision_una_transicion
   before update on decision
-  for each row execute function decision_sin_cambios_no_se_escribe();
+  for each row execute function decision_una_transicion_por_transaccion();
 
 
 -- ═══════════════════════════════════════════════════════════════════════════

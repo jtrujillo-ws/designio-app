@@ -904,6 +904,39 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     // Y el roce no dejó rastro: la vieja sigue siendo la misma versión de fila que era.
     const [sigue] = await admin`select estado from decision where id = ${vieja}`;
     expect(sigue!.estado as string).toBe('en-revision');
+
+    /*
+     * Y el mismo roce en DOS PASOS tampoco cuela.
+     *
+     * La comprobación de arriba mira `old`, que es la tupla inmediatamente anterior y no la
+     * que había al empezar la transacción: `→ vigente` y `→ en-revisión` difieren cada uno de
+     * su predecesor, así que los dos pasaban y la tupla final quedaba con el `xmin` de la
+     * transacción. Medido: declarando 2 PASÓ, y el archivo recibió «2 marcadas».
+     *
+     * Se cierra en la SEGUNDA escritura y no contando mejor: el estado comprometido no se
+     * puede leer desde dentro de la transacción, así que lo que se garantiza es que `old`
+     * siga siendo ese estado.
+     */
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        await tx`insert into reapertura_etapa
+          (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+           reabierto_por)
+          values (${ws}, ${proyectoR}, 3, 'Y otra vez', 'etapa-completa', 1, ${leadId})`;
+        await tx`update decision set estado = 'vigente'
+          where id = ${vieja} and workspace_id = ${ws}`;
+        await tx`update decision set estado = 'en-revision'
+          where id = ${vieja} and workspace_id = ${ws}`;
+      }),
+    ).rejects.toThrow(/ya la movió esta transacción/);
+
+    // Y una decisión que se mueve UNA vez sigue pasando, que es la otra mitad: sin ella,
+    // tapiar toda escritura sobre `decision` pasaría igual. `nueva` ya está en revisión de
+    // la reapertura de arriba, así que aquí vuelve a lo vigente y se cuenta sola.
+    await conUsuario(leadId, (tx) => tx`update decision set estado = 'vigente'
+      where id = ${nueva} and workspace_id = ${ws}`);
+    const [revalidada] = await admin`select estado from decision where id = ${nueva}`;
+    expect(revalidada!.estado as string).toBe('vigente');
   });
 
   /**

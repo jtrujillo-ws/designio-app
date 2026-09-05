@@ -180,7 +180,19 @@ function PantallaOportunidades() {
               </span>
             )}
 
-            {retoAbierto === reto.retoId && (
+            {/*
+              El formulario se gobierna por LO MISMO que el botón que lo abre, y no solo por el
+              estado local. Entre abrirlo y enviarlo cabe una recarga del loader —otro aprueba
+              G3, o alguien abre la medición—, y entonces `retoAbierto` seguía apuntando a este
+              reto: el formulario quedaba a la vista con «Proponer» activo, y cada envío rebotaba
+              en la base. Ofrecer una puerta que ya no abre es peor que no ofrecerla, que es la
+              misma razón por la que el botón mira la ventana.
+
+              No se limpia el borrador: si la ventana vuelve a abrirse, lo escrito sigue ahí. Lo
+              que hay que quitar es la puerta, no el trabajo de quien la estaba cruzando — y en
+              su sitio queda el mensaje de arriba, que dice qué pasó y qué la reabre.
+            */}
+            {puedeCurar && reto.admitePortafolio && retoAbierto === reto.retoId && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {/* El MISMO techo que el validador: sin él, pegar una pregunta más larga
                     dejaba el botón activo y el rechazo llegaba como «vuelve a intentarlo»,

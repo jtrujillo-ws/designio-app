@@ -534,8 +534,9 @@ evidencia hasta que una persona lo aprueba** con sus cinco dimensiones (SYS-16).
   *overrides* bidireccionales (`texto_importado_limpio`, `sin_overrides_bidi`); lo heredado sucio
   tiene salida de saneado.
 - Un ítem aprobado o rechazado **se sella**: no se le adjuntan ni retiran archivos después.
-- La evidencia nace con derechos **pendientes** salvo que quien cura los conceda: no se fabrica
-  consentimiento a partir de metadatos.
+- La evidencia nace **siempre** con derechos `pendiente`: la curaduría no concede nada y no se
+  fabrica consentimiento a partir de metadatos. Conceder o denegar es un acto aparte, de lead o admin
+  del cliente, en la pantalla de evidencia.
 - El escaneo de malware y el object storage (RF-09.8, diseño técnico) están **diseñados** y no
   construidos: hoy el adjunto vive en Postgres y no se escanea.
 
@@ -685,8 +686,10 @@ módulo aparte (ADR-0007).
   conciliación incompleta en G7…). La pantalla **invoca** ese predicado en lugar de reproducirlo, así
   que el botón no se ofrece cuando la base lo va a rechazar, y no se esconde cuando sí procedía.
 - **G5 certifica vigencia, no existencia**: si un derecho venció entre enlazar y aprobar, G5 no pasa.
-- **G6** exige el Metric Registry firmado (o el flag explícito `aprobado_sin_registry`) y pasa el
-  proyecto a `en-implementacion`. **G7** exige conciliación
+- **G6** exige el Metric Registry firmado y pasa el proyecto a `en-implementacion`. La columna
+  `aprobado_sin_registry` es solo una **marca de compatibilidad** para los G6 que ya estaban
+  aprobados cuando llegó la exigencia: los gates nuevos nacen con ella en falso y el rol de
+  aplicación no puede cambiarla. **G7** exige conciliación
   completa; aprobarlo cierra el gate y su etapa, y es un acto posterior del lead, **abrir la
   medición** (ver `09`), el que pasa reto y proyectos a `en-medicion` y exige G7 aprobado. Los gates de un proyecto que ya firmó G6 o G7 no se reevalúan: el ciclo siguiente va en
   otro proyecto.
@@ -903,8 +906,9 @@ veredicto honesto (ADR-0007).
   contra los criterios de éxito del reto; una entrada propuesta nace incompleta a propósito (sin
   propietario del dato, línea base, ventana ni dashboard, que son compromisos y datos, no
   redacción) y la completitud la exige la firma.
-  Firmado, queda congelado. G6 puede aprobarse sin registry solo con el flag explícito
-  `aprobado_sin_registry`, que la base recuerda.
+  Firmado, queda congelado. Un G6 actual **no** se aprueba sin registry firmado;
+  `aprobado_sin_registry` y `medicion_sin_registry` son marcas históricas de los gates y retos que
+  pasaron por ahí antes de la exigencia, no un atajo disponible.
 - La base explica **por qué no se puede firmar** (`reparos_de_firma`): entradas sin propietario,
   criterios sin entrada, etc.
 
@@ -925,7 +929,9 @@ veredicto honesto (ADR-0007).
 
 ## Outcome review (post mortem)
 
-- Se **abre** cuando no queda ninguna ventana abierta (o si el reto midió sin registry). El borrador
+- Se **abre** cuando el registry está **firmado** y no queda ninguna ventana abierta; un reto heredado
+  marcado `medicion_sin_registry` tiene que reparar y firmar su registry antes (`review_insert` lo
+  exige y la pantalla lo refleja). El borrador
   se guarda por partes; por criterio se registra el **resultado** (valor final o el motivo de que no
   haya) y la narrativa distingue contribución, factores externos, hipótesis y aprendizajes.
 - **Completar** dicta el **veredicto** del catálogo cerrado: `logrado`, `parcialmente-logrado`,
@@ -1773,7 +1779,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 | I4 / SYS-19 | Toda escritura AI pasa por PropuestaAI con lineage | `propuesta_ai` + guard de materialización diferido; `propuesta_ai_id` en destinos | Construido |
 | I4 / SYS-20 | Revisores AI etiquetados, no evidencia, no cuentan en G4/G5 | CHECK «simulación no es evidencia» preparado; C4 sin construir | **Parcial (diseñado)** |
 | I4 / SYS-21 | Sin AI todo flujo manual; límites por workspace | `evaluarCapacidadAI` nunca lanza; cupo `limite_llamadas_ai_dia`; pantallas con AI apagada | **Parcial**: la definición manual de criterios (J2) no tiene pantalla, así que sin AI un reto nuevo no llega a G0 desde la interfaz; E2E «AI off» pendiente |
-| I5 / SYS-22 | Ventana por criterio en G0; registry firmado en G6 | `criterio_g0_pendiente_guard`, `registry_firmar_guard`, `aprobado_sin_registry` explícito | Construido |
+| I5 / SYS-22 | Ventana por criterio en G0; registry firmado en G6 | `criterio_g0_pendiente_guard`, `registry_firmar_guard`, `aprobado_sin_registry` solo como marca histórica | Construido |
 | I5 / SYS-23 | Snapshots solo formulario/CSV, append-only | `snapshot_insert` con contrato firmado y ventana abierta; `snapshot_carga_no_corrige_guard` | Construido |
 | I5 / SYS-24 | Sin causalidad automática; veredicto cerrado | `outcome_review_completar_guard`; catálogo de cuatro veredictos; estructura de contribución y factores | Construido |
 | I6 / SYS-01 | `workspace_id` en la identidad de todo objeto | FKs compuestas; RLS en toda tabla; rol sin bypass | Construido |

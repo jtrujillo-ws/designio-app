@@ -4793,6 +4793,43 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(faltan).toEqual([]);
   });
 
+  /**
+   * Toda ancla declarada entra en la comprobación de LINAJE de la llamada.
+   *
+   * `propuesta_ai_revision_guard` exige que una propuesta cuelgue de la llamada que la
+   * produjo, y compara el ancla ENUMERANDO columnas. Con una capacidad cuya ancla no está en
+   * esa lista, todas sus filas tienen null en las comparadas y la condición pasa siempre: una
+   * llamada válida de esa capacidad para el objeto A se puede colgar de una propuesta del
+   * objeto B, y la atribución de coste queda corrompida sin que nada chille.
+   *
+   * La comparación se añade por capacidad —cada migración trae la de su ancla, aditiva como
+   * sus CHECK— porque reescribir aquel guard obliga a copiar sus casi doscientas líneas en
+   * cada migración, y la siguiente que las copie sin la línea ajena la revoca en silencio.
+   * Eso es exactamente lo que costó el vocabulario de capacidades, y esto es lo que impide
+   * que vuelva a pasar: se pregunta al catálogo por el texto de TODOS los guards de la tabla
+   * y se exige que cada columna declarada aparezca comparada en alguno.
+   */
+  it('cada columna de ancla se compara contra la llamada en algún guard de propuesta_ai', async () => {
+    const admin = sqlAdmin();
+    const filas = await admin`
+      select pg_get_functiondef(p.oid) as fuente
+      from pg_trigger t
+      join pg_proc p on p.oid = t.tgfoid
+      where t.tgrelid = 'propuesta_ai'::regclass and not t.tgisinternal`;
+    // Que esté mirando algo: sin triggers, todo lo de abajo pasaría sin comprobar nada.
+    expect(filas.length).toBeGreaterThan(0);
+    const fuente = filas.map((f) => (f.fuente as string).replace(/\s+/g, ' ')).join('\n');
+
+    const sinComparar = COLUMNAS_DE_ANCLA.filter(
+      (c) => !fuente.includes(`l.${c} is not distinct from new.${c}`),
+    );
+    expect(
+      sinComparar,
+      'un ancla declarada que ningún guard compara contra la llamada: una llamada de ese ' +
+        'objeto se puede colgar de la propuesta de otro',
+    ).toEqual([]);
+  });
+
   /*
    * El VOCABULARIO de capacidades es uno, y las tres tablas del pipeline lo dicen igual.
    *
@@ -5240,5 +5277,61 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       contenido: { ...otro.contenido, huecos: [] },
     });
     expect(vacia).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  /**
+   * Un hueco SIN `checklistItemId` tampoco entra, y ése es el que se colaba.
+   *
+   * Con `select … into ajeno` a secas, el hueco malformado SÍ lo seleccionaba el `not exists`
+   * —nada casa con `lower(null)`— pero `ajeno` recibía null, así que el `if ajeno is not null`
+   * no disparaba: el trigger admitía exactamente lo que existe para rechazar. El esquema de
+   * Zod lo tapa por el camino de la aplicación; esto es el SUELO, y se prueba por donde el
+   * esquema no pasa, o sea escribiendo el jsonb a mano.
+   */
+  it('un hueco sin checklistItemId no entra: el guard distingue «no hay» de «es null»', async () => {
+    const admin = sqlAdmin();
+    const g = await nuevoGate();
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'CT',
+      anclas: { gate_id: g.gateId },
+      contenido: g.contenido,
+    });
+    // Por el DUEÑO y con `update`: la aplicación no puede escribir esto —su esquema lo
+    // rechaza— y lo que se mide es que la base tampoco lo admita.
+    for (const malo of ['{"queFalta":"x","comoCerrarlo":"y"}', '{"checklistItemId":null}']) {
+      await expect(
+        sqlAdmin()`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{huecos}', ${admin.json([JSON.parse(malo)])}::jsonb)
+          where id = ${propuestaId} and workspace_id = ${ws}`,
+      ).rejects.toThrow(/no pertenece a este gate/);
+    }
+  });
+
+  /**
+   * Un gate decidido MIENTRAS la llamada estaba en vuelo no admite el informe que llega.
+   *
+   * `REVALIDAR.CT` lo comprueba antes de despachar, y entre esa transacción y la que
+   * persiste cabe la aprobación. Sin este corte nacía un informe ya obsoleto que además
+   * ocupaba el hueco del gate por el índice parcial: solo se podía marcar como leído.
+   */
+  it('un gate aprobado mientras se generaba no admite el informe', async () => {
+    const admin = sqlAdmin();
+    const g = await nuevoGate();
+    // Un gate no se aprueba con el checklist pendiente —lo impone la base, y es correcto—,
+    // así que sus requisitos se cierran como N/A con su justificación y su aprobador. La
+    // prueba mide el guard del informe, no el del gate.
+    await admin`update checklist_item
+      set estado = 'na', na_justificacion = 'no aplica a esta demo', na_aprobado_por = ${leadId}
+      where gate_id = ${g.gateId} and workspace_id = ${ws}`;
+    await admin`update gate_instancia
+      set estado = 'aprobado', aprobado_por = ${leadId}, aprobado_en = now()
+      where id = ${g.gateId} and workspace_id = ${ws}`;
+    await expect(
+      nuevaPropuesta(leadId, {
+        capacidad: 'CT',
+        anclas: { gate_id: g.gateId },
+        contenido: g.contenido,
+      }),
+    ).rejects.toThrow(/ya se decidió/);
   });
 });

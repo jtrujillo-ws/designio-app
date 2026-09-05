@@ -25,7 +25,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.1';
+export const PROMPT_VERSION = 'ai-2026-09-05.2';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -299,7 +299,10 @@ export function promptAsistenteGate(gate: {
     ]
       .filter(Boolean)
       .join('\n\n'),
-    alcanceResumen: `gate G${gate.numero} de «${gate.proyecto}» · ${gate.checklist.length} requisitos del checklist (${material.usados} caracteres)`,
+    // El «(truncado)» también aquí, como en `promptExtraccion`: `alcanceResumen` se persiste
+    // como lineage y se lee para auditar QUÉ vio el modelo. Decirlo solo dentro del prompt
+    // dejaba el registro afirmando un alcance que el modelo no llegó a leer entero.
+    alcanceResumen: `gate G${gate.numero} de «${gate.proyecto}» · ${gate.checklist.length} requisitos del checklist (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 

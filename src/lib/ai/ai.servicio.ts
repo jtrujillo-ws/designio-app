@@ -361,12 +361,14 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
      */
     columnas: (tx) => tx`g.numero as gate_numero, g.rol_aprobador as gate_rol,
       g.estado as gate_estado, pr.titulo as gate_proyecto,
-      (select coalesce(json_agg(json_build_object(
-                'id', c.id, 'texto', c.texto, 'estado', c.estado,
-                'conObjeto', num_nonnulls(c.evidencia_id, c.insight_id, c.decision_id) = 1)
-              order by c.orden), '[]'::json)
-       from checklist_item c
-       where c.gate_id = g.id and c.workspace_id = g.workspace_id) as gate_checklist`,
+      case when p.gate_id is null then '[]'::json else
+        (select coalesce(json_agg(json_build_object(
+                  'id', c.id, 'texto', c.texto, 'estado', c.estado,
+                  'conObjeto', num_nonnulls(c.evidencia_id, c.insight_id, c.decision_id) = 1)
+                order by c.orden), '[]'::json)
+         from checklist_item c
+         where c.gate_id = g.id and c.workspace_id = g.workspace_id)
+      end as gate_checklist`,
   },
 };
 

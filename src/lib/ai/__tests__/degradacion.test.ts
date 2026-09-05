@@ -432,8 +432,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * haya cambiado: lo que se amplió es la medida, no lo que se le dice al modelo. Por eso
    * `PROMPT_VERSION` NO se toca aquí — subirla habría partido en dos poblaciones que salieron
    * del mismo contrato, que es exactamente el daño que esta prueba existe para evitar. */
-  const VERSION_ANOTADA = 'ai-2026-09-05.1';
-  const HUELLA_ANOTADA = 'ef7459e532fa8c79eaeb1e3313e966f16d7d54a08775a5baa64949ba458c2781';
+  const VERSION_ANOTADA = 'ai-2026-09-05.2';
+  const HUELLA_ANOTADA = 'dbac21d2cfe79b8a4b20139dda37a14e73d7ad5c98438063ca60ee8127725638';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y

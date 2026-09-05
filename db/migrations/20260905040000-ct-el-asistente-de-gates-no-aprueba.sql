@@ -194,11 +194,33 @@ create or replace function propuesta_ai_ct_huecos_guard() returns trigger
 language plpgsql as $$
 declare
   ajeno text;
+  hallado boolean;
 begin
   if new.capacidad <> 'CT' then
     return new;
   end if;
-  select h->>'checklistItemId' into ajeno
+  /*
+   * El gate tiene que seguir PENDIENTE al escribir. `REVALIDAR.CT` lo comprobó antes de
+   * llamar al proveedor, y entre esa transacción y ésta cabe la aprobación: sin este corte
+   * nacía un informe ya obsoleto —pendiente en el panel, ocupando el hueco del gate por el
+   * índice parcial— que solo se podía marcar como leído. Es el mismo suelo que
+   * `propuesta_ai_revision_guard` ya pone para el item curado y el reto congelado.
+   */
+  if not exists (
+    select 1 from gate_instancia g
+    where g.id = new.gate_id and g.workspace_id = new.workspace_id and g.estado = 'pendiente'
+  ) then
+    raise exception 'ese gate ya se decidió: no admite informes nuevos';
+  end if;
+  /*
+   * `hallado` va aparte del valor, y no es ceremonia: con `select … into ajeno` a secas, un
+   * hueco SIN `checklistItemId` —o con JSON null— hacía que el `not exists` lo seleccionara
+   * (nada casa con `lower(null)`) y que `ajeno` recibiera null, así que el `if ajeno is not
+   * null` NO disparaba y el trigger admitía exactamente el hueco malformado que existe para
+   * rechazar. El esquema de Zod lo tapa por el camino de la aplicación; esto es el suelo, y
+   * el suelo tiene que valer también para el SQL directo.
+   */
+  select true, h->>'checklistItemId' into hallado, ajeno
   from jsonb_array_elements(
          case when jsonb_typeof(new.contenido->'huecos') = 'array'
               then new.contenido->'huecos' else '[]'::jsonb end) h
@@ -208,9 +230,33 @@ begin
       and c.gate_id = new.gate_id
       and c.workspace_id = new.workspace_id)
   limit 1;
-  if ajeno is not null then
+  if hallado then
     raise exception
-      'un hueco del informe señala un requisito que no pertenece a este gate: %', ajeno;
+      'un hueco del informe señala un requisito que no pertenece a este gate: %',
+      coalesce(ajeno, '(sin checklistItemId)');
+  end if;
+  /*
+   * Y el LINAJE por el ancla nueva. `propuesta_ai_revision_guard` exige que la propuesta
+   * cuelgue de la llamada que la produjo comparando capacidad, modelo, credencial y ancla
+   * —pero el ancla la compara enumerando `item_id` y `reto_id`, que son null en TODA fila de
+   * CT—. Así que una llamada válida de CT para el gate A podía colgarse de un informe del
+   * gate B: la FK compuesta pasa (los dos son del tenant) y la atribución de coste queda
+   * corrompida sin que nada chille.
+   *
+   * Se añade aquí y no reescribiendo aquel guard, y la razón no es pereza: es que
+   * reescribirlo obliga a copiar sus 187 líneas en cada migración de capacidad, y la
+   * siguiente que lo copie sin esta línea la revoca en silencio — exactamente lo que acaba de
+   * costar el vocabulario de capacidades. Cada ancla trae su comparación, aditiva como sus
+   * CHECK. Que ninguna se quede sin ella lo sujeta una prueba que compara las columnas de
+   * ancla DECLARADAS contra el texto de los guards.
+   */
+  if not exists (
+    select 1 from llamada_ai l
+    where l.id = new.llamada_id and l.workspace_id = new.workspace_id
+      and l.gate_id is not distinct from new.gate_id
+  ) then
+    raise exception
+      'la propuesta debe colgar de la llamada que la produjo: mismo gate';
   end if;
   return new;
 end $$;
@@ -223,3 +269,21 @@ revoke execute on function propuesta_ai_ct_huecos_guard() from public;
 create trigger a_propuesta_ai_ct_huecos
   before insert or update of contenido on propuesta_ai
   for each row execute function propuesta_ai_ct_huecos_guard();
+
+
+-- ── Un informe por llamada, también para CT ──
+--
+-- `propuesta_ai_llamada_ci_idx` sujeta «una propuesta por llamada» solo para CI, y la
+-- asimetría estaba razonada: C0 persiste un LOTE y sus filas hermanas violarían el índice.
+-- CT no es un lote —lo declara `CAPACIDADES.CT.lote = null`— así que le toca el mismo
+-- invariante, y sin él quedaba abierto un hueco concreto: marcado como leído el primer
+-- informe, el índice parcial del gate se libera, y por SQL directo se puede colgar un
+-- segundo informe de la MISMA llamada ya pagada, con otro `orden`. Dos filas reclamando una
+-- respuesta, y el gasto por capacidad dejando de cuadrar.
+--
+-- Índice PROPIO y no una lista `capacidad in ('CI','CT')` sobre el de CI: dos ramas que
+-- rehacen el mismo índice se pisan en silencio —la última fusionada gana y revoca lo de la
+-- otra—, que es justo lo que el vocabulario de capacidades acaba de costar. Una capacidad
+-- sin lote añade el suyo y no toca los ajenos.
+create unique index propuesta_ai_llamada_ct_idx on propuesta_ai (workspace_id, llamada_id)
+  where capacidad = 'CT';

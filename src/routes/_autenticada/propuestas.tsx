@@ -2079,6 +2079,25 @@ function FichaEntradaKpi({
 }
 
 /**
+ * Las citas de una HMW, agrupadas por el insight en el que se apoyan.
+ *
+ * El orden es el de PRIMERA APARICIÓN, y los grupos salen de los `insightId` DISTINTOS: es
+ * exactamente el conjunto que `oportunidad_insight` materializa al aceptar, así que la ficha
+ * enseña tantos apoyos como filas de traza se van a escribir. Pintadas en plano —una fila por
+ * cita— dos citas al mismo insight enseñaban dos apoyos donde la traza tendrá uno, y quien
+ * revisa contaba mal justo lo que el guard comprueba.
+ */
+function citasPorInsight(citas: ContenidoOportunidad['citas']) {
+  const grupos = new Map<string, ContenidoOportunidad['citas']>();
+  for (const c of citas) {
+    const suyas = grupos.get(c.insightId);
+    if (suyas) suyas.push(c);
+    else grupos.set(c.insightId, [c]);
+  }
+  return [...grupos].map(([insightId, suyas]) => ({ insightId, citas: suyas }));
+}
+
+/**
  * La ficha de una HMW propuesta.
  *
  * Enseña la TRAZA con el título de cada insight y no con su uuid, por lo mismo que la de C6
@@ -2108,14 +2127,28 @@ function FichaOportunidad({
       <Dato rotulo="Pregunta" valor={contenido.pregunta} />
       <Dato rotulo="Prioridad" valor={String(contenido.prioridad)} />
       <Dato rotulo="Por qué esa prioridad" valor={contenido.prioridadRazon} />
-      {contenido.citas.map((c, i) => (
-        <Dato
-          key={String(i)}
-          // El insight en el rótulo y no dentro del valor: es de quién se copia, no parte de
-          // lo copiado. Y si ya no está, se dice con su id — que es lo único que queda.
-          rotulo={`Se apoya en «${etiquetas[c.insightId] ?? `insight ${c.insightId} (ya no está)`}»`}
-          valor={`«${c.fragmento}» · ${c.localizacion}`}
-        />
+      {citasPorInsight(contenido.citas).map((g) => (
+        <div
+          key={g.insightId}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+            paddingTop: 8,
+            borderTop: '1px solid var(--border-faint)',
+          }}
+        >
+          <Dato
+            // El insight ENCABEZA el grupo y no va dentro del valor de cada cita: es de quién
+            // se copia, no parte de lo copiado. Y si ya no está, se dice con su id — que es lo
+            // único que queda.
+            rotulo="Se apoya en"
+            valor={etiquetas[g.insightId] ?? `insight ${g.insightId} (ya no está)`}
+          />
+          {g.citas.map((c, j) => (
+            <Dato key={String(j)} rotulo="Cita" valor={`«${c.fragmento}» · ${c.localizacion}`} />
+          ))}
+        </div>
       ))}
       <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
         Aceptarla la mete en el portafolio POR DECIDIR: aprobarla o descartarla es un acto

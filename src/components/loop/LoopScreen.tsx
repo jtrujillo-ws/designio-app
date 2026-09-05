@@ -221,6 +221,7 @@ export function LoopScreen({
                     estado={loop.journeys[jl.j]}
                     proyecto={proyecto}
                     destacada={destacado === jl.j}
+                    motivoJ7={porQueJ7Cerrado(loop)}
                   />
                 ))}
               </div>
@@ -234,6 +235,25 @@ export function LoopScreen({
 
 function idDeTarjeta(j: JourneyN): string {
   return `journey-j${j}`;
+}
+
+/**
+ * Por qué J7 sigue cerrado, en las dos longitudes que la pantalla usa. Con un gate abierto
+ * falta aprobar G7; con los ocho aprobados lo que sigue abierta es la medición (alguna
+ * ventana de KPI), y hasta que cierre la última el outcome review no se puede abrir.
+ */
+function porQueJ7Cerrado(loop: EstadoDelLoop): { corto: string; largo: string } {
+  if (loop.gateAbierto !== null) {
+    return {
+      corto: 'Se abre al aprobar G7',
+      largo: `El post mortem se abre cuando G7 quede aprobado (hoy el gate abierto es G${loop.gateAbierto}): hasta entonces no hay veredicto que dictar`,
+    };
+  }
+  return {
+    corto: 'Se abre al cerrar la medición',
+    largo:
+      'G7 está aprobado y la medición sigue abierta: el post mortem se abre cuando cierre la última ventana de KPI',
+  };
 }
 
 /** El proyecto actual de un servicio del árbol, con la regla compartida con la proyección. */
@@ -1501,11 +1521,15 @@ function TeTocaATi({
         destino: { to: '/proyecto/$proyectoId', params: { proyectoId: proyecto.id } },
       });
     } else if (loop.journeys[7] === 'próximo' && proyecto) {
+      const motivo = porQueJ7Cerrado(loop);
       filas.push({
         color: 'var(--j7)',
-        texto: `J7 se abre cuando G7 quede aprobado (hoy el gate abierto es G${loop.gateAbierto ?? 7})`,
+        texto:
+          loop.gateAbierto !== null
+            ? `J7 se abre cuando G7 quede aprobado (hoy el gate abierto es G${loop.gateAbierto})`
+            : 'J7 se abre cuando cierre la última ventana de medición (G7 ya está aprobado)',
         destino: null,
-        titulo: 'Informativa: el post mortem no se puede abrir con el gate cerrado',
+        titulo: `Informativa: ${motivo.largo}`,
       });
     }
   }
@@ -1653,14 +1677,18 @@ function JourneyCard({
   estado,
   proyecto,
   destacada,
+  motivoJ7,
 }: {
   jl: JourneyLoop;
   estado: EstadoJourney;
   proyecto: ProyectoArbol | null;
   destacada: boolean;
+  /** Por qué J7 sigue cerrado (gate o medición): la tarjeta lo dice con la misma regla. */
+  motivoJ7: { corto: string; largo: string };
 }) {
   const enCurso = estado === 'en curso';
   const pendiente = estado === 'próximo';
+  // J7 «próximo» está cerrado por G7 o por la medición abierta; el motivo lo dice.
   const cerradoPorGate = jl.j === 7 && pendiente;
   const destino = cerradoPorGate ? null : destinoDeJourney(jl.pantalla, proyecto?.id ?? null);
   const j = jl.j;
@@ -1719,7 +1747,7 @@ function JourneyCard({
         {destino
           ? `Abrir ${etiquetaDeDestino(destino, proyecto?.codigo)} →`
           : cerradoPorGate
-            ? 'Se abre al aprobar G7'
+            ? motivoJ7.corto
             : 'Sin proyecto aún en este servicio'}
       </span>
     </div>
@@ -1728,9 +1756,7 @@ function JourneyCard({
     return (
       <div
         title={
-          cerradoPorGate
-            ? 'El post mortem se abre cuando G7 quede aprobado: hasta entonces no hay veredicto que dictar'
-            : `J${j} ${jl.titulo}: sin proyecto aún en este servicio`
+          cerradoPorGate ? motivoJ7.largo : `J${j} ${jl.titulo}: sin proyecto aún en este servicio`
         }
         style={{ minWidth: 0 }}
       >

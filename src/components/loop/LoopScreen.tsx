@@ -1452,12 +1452,13 @@ function TeTocaATi({
       });
     }
     const m = resumen.metricas;
-    // Solo las entradas que quien mira puede cargar (curador o propietario del dato).
-    if (m && m.registryFirmado && m.sinSnapshotMias > 0 && proyecto) {
-      const faltan = m.sinSnapshotMias;
+    // Solo las entregas que quien mira puede cargar (curador o propietario del dato), con el
+    // reto en medición y según su cadencia: lo decide la proyección con la regla de la base.
+    if (m && m.entregasPendientesMias > 0 && proyecto) {
+      const faltan = m.entregasPendientesMias;
       filas.push({
         color: 'var(--j7)',
-        texto: `${faltan} ${faltan === 1 ? 'métrica tuya sigue' : 'métricas tuyas siguen'} sin snapshot`,
+        texto: `${faltan} ${faltan === 1 ? 'métrica tuya espera' : 'métricas tuyas esperan'} su snapshot`,
         destino: { to: '/proyecto/$proyectoId', params: { proyectoId: proyecto.id } },
       });
     } else if (loop.journeys[7] === 'próximo' && proyecto) {

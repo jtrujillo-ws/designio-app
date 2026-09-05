@@ -148,17 +148,34 @@ export async function resumenParaUsuario(
               where e.registry_id = mr.id and e.workspace_id = mr.workspace_id
                 and exists (select 1 from snapshot s
                   where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id)) as listas,
-            -- Las que faltan Y puede cargar quien mira: la política del snapshot exige ser
-            -- curador o el propietario del dato de ESA entrada (medicion.servicio), así que
-            -- una entrada de otro propietario no es tarea suya.
+            -- Las entregas que ESPERAN a quien mira: entradas cuyo snapshot está pendiente o
+            -- vencido según su cadencia, y que él puede cargar (curador o propietario del
+            -- dato de esa entrada: el predicado de la política del snapshot). Solo con el reto
+            -- en medición y la ventana abierta —fuera de eso la política rechaza la carga—, y
+            -- con el MISMO juicio por entrada que hace la pantalla del proyecto (estadoSnapshot
+            -- en medicion.servicio): «nunca tuvo snapshot» no es la pregunta, porque un KPI
+            -- semanal con una lectura puede llevar tres entregas de retraso.
             (select count(*)::int from entrada_kpi e
+              join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
+              join reto r on r.id = mr.reto_id and r.workspace_id = mr.workspace_id
               left join miembro m
                 on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
+              left join lateral (select max(s.fecha) as fecha from snapshot s
+                where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id) ult on true
               where e.registry_id = mr.id and e.workspace_id = mr.workspace_id
-                and not exists (select 1 from snapshot s
-                  where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id)
+                and mr.estado = 'firmado' and r.estado = 'en-medicion'
                 and (workspace_role(${actorId}, ${workspaceId}) = any(${[...ROLES_CURADORES]})
-                  or m.usuario_id = ${actorId})) as sin_snapshot_mias,
+                  or m.usuario_id = ${actorId})
+                and case
+                  -- Sin ventana no hay cadencia que juzgar: espera mientras no llegue nada.
+                  when e.ventana_inicio is null or c.ventana_dias is null then ult.fecha is null
+                  -- Ventana cerrada: estado terminal, ya nadie puede aportar.
+                  when not ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias) then false
+                  -- Abierta: vencida si falta alguna entrega prometida hasta ayer…
+                  when cadencia_incumplida(e.id, e.workspace_id, e.ventana_inicio,
+                         e.frecuencia, fecha_de_la_base() - 1) then true
+                  -- …recibida si ya hay dato, y esperada si todavía no.
+                  else ult.fecha is null end) as entregas_pendientes_mias,
             (select jsonb_build_object(
                 'nombre', e.nombre,
                 'lineaBase', e.linea_base_valor::text,
@@ -178,7 +195,7 @@ export async function resumenParaUsuario(
             registryFirmado: met.estado === 'firmado',
             listas: met.listas as number,
             total: met.total as number,
-            sinSnapshotMias: met.sin_snapshot_mias as number,
+            entregasPendientesMias: met.entregas_pendientes_mias as number,
             primaria: (met.primaria as MetricasDelReto['primaria']) ?? null,
           }
         : null;

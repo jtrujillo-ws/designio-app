@@ -655,6 +655,7 @@ function Lateral({
       )}
       <DestinoDelWorkspace to="/evidencia" etiqueta="Evidencia y derechos de uso" abrev="EVI" />
       <DestinoDelWorkspace to="/insights" etiqueta="Insights y citas" abrev="INS" />
+      <DestinoDelWorkspace to="/biblioteca" etiqueta="Biblioteca del cliente" abrev="BIB" />
       <DestinoDelWorkspace to="/journeys" etiqueta="Journeys y blueprints" abrev="JOU" />
       <DestinoDelWorkspace to="/design-versions" etiqueta="Versions y releases" abrev="DVR" />
       <DestinoDelWorkspace to="/propuestas" etiqueta="Propuestas AI" abrev="AI" />
@@ -790,6 +791,7 @@ type RutaSinParametros =
   | '/importacion'
   | '/evidencia'
   | '/insights'
+  | '/biblioteca'
   | '/journeys'
   | '/design-versions'
   | '/propuestas'

@@ -15,3 +15,9 @@ coverage/
 # Binarios sueltos de una compilación de una sola vez: `git add -A` los barre.
 a.out
 *.o
+
+# Guiones de medición de los agentes. Van DENTRO del repo por necesidad —`bun` no resuelve
+# `@/lib/db` desde fuera— y por eso hacen falta aquí: un `git add -A` los barrería igual que
+# barrió una vez un enlace a `node_modules`, y eso costó cinco checks en rojo a la vez.
+.scratch/
+.scratch*/

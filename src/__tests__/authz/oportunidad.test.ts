@@ -979,6 +979,113 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
   });
 
   /**
+   * Y «no vacío» tiene que decirlo de TODOS los blancos, no solo del espacio.
+   *
+   * `btrim(x)` con un solo argumento recorta ESPACIOS y nada más: un tabulador, un salto de
+   * línea o un espacio duro pasan el CHECK enteros. Con eso entraba una HMW cuya pregunta es
+   * un tabulador —y G3 la certifica igual, porque SYS-15 habla de su traza, no de su texto— y
+   * se descartaba una oportunidad con una razón que no dice nada, que es justo lo que exigir
+   * la razón venía a impedir. Los dos esquemas Zod lo prohíben con `.trim().min(1)`, que sí
+   * conoce todos los blancos; la superficie SQL concedida no.
+   *
+   * Se comprueba con `titulo_normalizado`, que es la misma función con la que este esquema
+   * decide si dos preguntas son la misma: si normalizada queda vacía, es que no había texto.
+   * Tener dos ideas distintas de «vacío» en la misma columna es cómo se separan.
+   */
+  it('un texto de solo blancos no pasa por escrito: ni la pregunta ni la razón del descarte', async () => {
+    const admin = sqlAdmin();
+    const BLANCOS = ['\t', '\n', '\u00a0'];
+    for (const blanco of BLANCOS) {
+      await expect(
+        conUsuario(leadId, (tx) => tx`insert into oportunidad
+          (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+          values (${ws}, ${retoId}, ${blanco}, 1, 'Razón', ${leadId})`),
+      ).rejects.toThrow();
+    }
+    // Y la razón del descarte, por la otra puerta: la de UPDATE.
+    const [o] = await conUsuario(leadId, (tx) => tx`insert into oportunidad
+      (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+      values (${ws}, ${retoId}, '¿Cómo podríamos descartar con un tabulador?', 1, 'Razón',
+              ${leadId}) returning id`);
+    for (const blanco of BLANCOS) {
+      await expect(
+        conUsuario(leadId, (tx) => tx`update oportunidad
+          set estado = 'descartada', veredicto_razon = ${blanco}
+          where id = ${o!.id as string} and workspace_id = ${ws}`),
+      ).rejects.toThrow();
+    }
+    // Y una razón DE VERDAD descarta, que es la mitad sin la cual tapiar la puerta pasaría
+    // igual.
+    await conUsuario(leadId, (tx) => tx`update oportunidad
+      set estado = 'descartada', veredicto_razon = 'Se solapa con la HMW del flujo corto'
+      where id = ${o!.id as string} and workspace_id = ${ws}`);
+    const [tras] = await admin`select estado from oportunidad where id = ${o!.id as string}`;
+    expect(tras!.estado as string).toBe('descartada');
+  });
+
+  /**
+   * Y UNA transición de etapa es UNA reapertura.
+   *
+   * El guard exige que la etapa la haya escrito esta transacción, y eso lo cumple igual de bien
+   * una fila que dos: dos registros de la misma etapa en la misma transacción se apoyaban en el
+   * MISMO update, pasaban los dos y emitían cada uno su `EtapaReabierta`. El archivo es
+   * append-only, así que quedaban dos reaperturas —con motivos y alcances distintos, si quien
+   * escribe quiere— de un solo acto, y ninguna forma de saber después cuál ocurrió.
+   *
+   * La regla que faltaba es de cardinalidad y va donde ya se cuenta lo demás: un registro por
+   * transición. No un único sobre (proyecto, etapa), que prohibiría reabrir la misma etapa dos
+   * veces en su vida — hoy no hay ceremonia de recierre, pero eso es un hueco del método, no
+   * una regla que convenga congelar en un índice.
+   */
+  it('una transición de etapa deja UNA reapertura, no dos', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio del doble registro', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo,
+       creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-DOS', 'Reto del doble registro', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${r!.id as string}, 'P-DOS', 'Proyecto', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const proyectoD = p!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoD}, 3, 'Conceptualización', 'completada')`;
+
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        for (const motivo of ['Primera razón', 'Segunda razón']) {
+          await tx`insert into reapertura_etapa
+            (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+             reabierto_por)
+            values (${ws}, ${proyectoD}, 3, ${motivo}, 'etapa-completa', 0, ${leadId})`;
+        }
+        await tx`update etapa_instancia set estado = 'en-curso'
+          where proyecto_id = ${proyectoD} and workspace_id = ${ws} and numero = 3`;
+      }),
+    ).rejects.toThrow(/una sola reapertura|dos registros/i);
+    const eventos = await admin`select 1 from evento_dominio
+      where workspace_id = ${ws} and tipo = 'EtapaReabierta'
+        and payload->>'proyectoId' = ${proyectoD}`;
+    expect(eventos.length, 'dos reaperturas archivadas de un solo acto').toBe(0);
+
+    // Y una sola sigue pasando: lo que se prohíbe es el par, no la reapertura.
+    await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoD,
+      etapaNumero: 3,
+      motivo: 'La razón de verdad',
+      insightIds: [],
+    });
+    const unico = await admin`select 1 from evento_dominio
+      where workspace_id = ${ws} and tipo = 'EtapaReabierta'
+        and payload->>'proyectoId' = ${proyectoD}`;
+    expect(unico.length).toBe(1);
+  });
+
+  /**
    * Y el portafolio se REVALIDA en el instante en que se congela para medir.
    *
    * G3 certifica el portafolio y la ventana se cierra con él, pero una reapertura legítima de

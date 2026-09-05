@@ -55,7 +55,16 @@ create table oportunidad (
   reto_id uuid not null,
   -- La pregunta. `unique (reto_id, pregunta)` para que el portafolio no acumule la misma
   -- HMW escrita dos veces: priorizar un duplicado es repartir el mismo voto dos veces.
-  pregunta text not null check (btrim(pregunta) <> ''),
+  --
+  -- Y «no vacía» se comprueba con `titulo_normalizado` y no con `btrim`: el `btrim` de un solo
+  -- argumento recorta ESPACIOS y nada más, así que un tabulador, un salto de línea o un
+  -- espacio duro pasaban enteros. Con eso entraba una HMW cuya pregunta es un tabulador, y G3
+  -- la certificaba igual —SYS-15 habla de su traza, no de su texto—. Los esquemas Zod lo
+  -- prohíben con `.trim().min(1)`, que sí conoce todos los blancos; esta columna no.
+  --
+  -- La misma función con la que se decide si dos preguntas son la misma, unas líneas más
+  -- abajo: tener dos ideas distintas de «vacío» en la misma columna es cómo se separan.
+  pregunta text not null check (titulo_normalizado(pregunta) <> ''),
   -- La priorización RAZONADA (SPEC-08 C3, prediseño §3: «priorización contra criterios del
   -- reto»). El número ordena; el texto dice por qué, que es la mitad que se pierde siempre.
   --
@@ -82,7 +91,9 @@ create table oportunidad (
   foreign key (reto_id, workspace_id) references reto (id, workspace_id),
   -- Descartar exige razón. Aprobar no: la razón de una HMW aprobada son sus insights, que
   -- están enlazados y se pueden leer; la de una descartada no la guarda nadie más.
-  check (estado <> 'descartada' or btrim(veredicto_razon) <> ''),
+  -- Por la misma razón que la pregunta: `btrim` a secas no ve el tabulador, así que se
+  -- descartaba con una razón que no dice nada — justo lo que exigirla venía a impedir.
+  check (estado <> 'descartada' or titulo_normalizado(veredicto_razon) <> ''),
   -- Y todo veredicto lleva firma y fecha, como el resto del esquema.
   check ((estado = 'propuesta') = (decidido_por is null)),
   check ((decidido_por is null) = (decidido_en is null))
@@ -382,6 +393,25 @@ begin
       and e.xmin = pg_current_xact_id()::xid
   ) then
     raise exception 'esa reapertura no abre nada: la etapa % del proyecto no salió de completada en esta transacción, así que el registro y su evento dirían que ocurrió algo que no ocurrió', new.etapa_numero;
+  end if;
+
+  -- ── Y UNA TRANSICIÓN ES UNA REAPERTURA ──
+  -- La comprobación de arriba exige que la etapa la haya escrito esta transacción, y eso lo
+  -- cumple igual de bien una fila que dos: dos registros de la misma etapa en la misma
+  -- transacción se apoyan en el MISMO update, pasan los dos y emiten cada uno su
+  -- `EtapaReabierta`. El archivo es append-only, así que quedaban dos reaperturas —con motivos
+  -- y alcances distintos si quien escribe quiere— de un solo acto, y ninguna forma de saber
+  -- después cuál ocurrió.
+  --
+  -- La regla es de cardinalidad y va aquí, donde ya se cuenta lo demás. NO un único sobre
+  -- (proyecto, etapa): eso prohibiría reabrir la misma etapa dos veces en su vida, y aunque hoy
+  -- no haya ceremonia de recierre —así que de hecho no ocurre— eso es un hueco del método, no
+  -- una regla que convenga congelar en un índice.
+  if (select count(*) from reapertura_etapa r
+      where r.proyecto_id = new.proyecto_id and r.workspace_id = new.workspace_id
+        and r.etapa_numero = new.etapa_numero
+        and r.xmin = pg_current_xact_id()::xid) > 1 then
+    raise exception 'esa etapa se abrió una vez y lleva dos registros: una transición es una sola reapertura, con un motivo y un alcance, porque es lo que queda en el archivo y ya no se corrige (RF-04.9)';
   end if;
 
   -- ── Y UN ALCANCE 'declarado' DECLARA ALGO ──

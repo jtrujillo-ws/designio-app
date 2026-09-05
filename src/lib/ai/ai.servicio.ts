@@ -515,6 +515,15 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      */
     estado: (tx) => tx`case
         when g.estado is distinct from 'pendiente' then 'gate-decidido'
+        when exists (
+          select 1
+          from jsonb_array_elements(
+                 case when jsonb_typeof(p.contenido->'huecos') = 'array'
+                      then p.contenido->'huecos' else '[]'::jsonb end) h
+          join checklist_item c
+            on c.id::text = lower(h->>'checklistItemId') and c.workspace_id = p.workspace_id
+          where c.estado <> 'pendiente')
+          then 'checklist-avanzado'
         else 'disponible'
       end`,
     /*

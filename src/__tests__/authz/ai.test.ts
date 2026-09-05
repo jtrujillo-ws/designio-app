@@ -4944,13 +4944,21 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const motivoDe = async (
         capacidad: string,
         anclas: Partial<Record<AnclaCapacidad['columna'], string>>,
+        contenido: unknown = {},
       ): Promise<string | null> => {
         const columnas = COLUMNAS_DE_ANCLA.map(
           (c) => tx`${anclas[c] ?? null}::uuid as ${tx(c)}`,
         ).reduce((a, b) => tx`${a}, ${b}`);
+        /*
+         * `contenido` también viaja en la fila sintética. Lo cobró la misma clase de cambio
+         * que las columnas de ancla: el motivo de CT pasó a mirar los huecos del informe para
+         * saber si un requisito señalado ya se cerró, y esta fila no lo tenía —«column
+         * p.contenido does not exist»—. Lo que el CASE lee, la fila lo trae.
+         */
         const [f] = await tx`
           select case ${proyeccion.motivo} else null end as estado
           from (select ${capacidad}::text as capacidad, ${columnas},
+                       ${tx.json(contenido)}::jsonb as contenido,
                        ${ws}::uuid as workspace_id) p
           ${proyeccion.joins}`;
         return (f!.estado as string | null) ?? null;
@@ -4971,7 +4979,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // estado dejó el fixture a cada fila.
       const DE_CI = ['disponible', 'item-curado', 'consentimiento-revocado'];
       const DE_C0 = ['disponible', 'reto-no-admite', 'registry-firmado', 'criterios-congelados'];
-      const DE_CT = ['disponible', 'gate-decidido'];
+      const DE_CT = ['disponible', 'gate-decidido', 'checklist-avanzado'];
       expect(DE_CI).toContain(await motivoDe('CI', { item_id: item }));
       expect(DE_C0).toContain(await motivoDe('C0', { reto_id: retoId }));
       expect(DE_CT).toContain(await motivoDe('CT', { gate_id: gateId }));
@@ -4983,6 +4991,27 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         await motivoDe('CT', { gate_id: gateId }),
       );
       expect(DE_CT.slice(1)).not.toContain(await motivoDe('C0', { reto_id: retoId }));
+
+      /*
+       * Y el motivo que distingue un informe VIVO de uno que ya no describe el gate: con el
+       * mismo gate pendiente, un informe cuyo hueco señala un requisito CERRADO sale
+       * «checklist-avanzado», y el mismo informe sobre uno pendiente sale «disponible». Es el
+       * par que prueba que mira el contenido y no el gate.
+       */
+      const conRequisitoAbierto = { huecos: [{ checklistItemId: requisitoIds[0]! }] };
+      expect(await motivoDe('CT', { gate_id: gateId }, conRequisitoAbierto)).toBe('disponible');
+      await sqlAdmin()`update checklist_item
+        set estado = 'na', na_justificacion = 'no aplica', na_aprobado_por = ${leadId}
+        where id = ${requisitoIds[0]!} and workspace_id = ${ws}`;
+      try {
+        expect(await motivoDe('CT', { gate_id: gateId }, conRequisitoAbierto)).toBe(
+          'checklist-avanzado',
+        );
+      } finally {
+        await sqlAdmin()`update checklist_item
+          set estado = 'pendiente', na_justificacion = '', na_aprobado_por = null
+          where id = ${requisitoIds[0]!} and workspace_id = ${ws}`;
+      }
     });
   });
 

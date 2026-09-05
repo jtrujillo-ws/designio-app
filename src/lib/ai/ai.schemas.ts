@@ -425,6 +425,7 @@ export const ESTADOS_ANCLA = [
   'registry-firmado',
   'reto-no-admite',
   'gate-decidido',
+  'checklist-avanzado',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

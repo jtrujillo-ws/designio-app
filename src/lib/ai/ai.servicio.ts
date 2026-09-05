@@ -13,6 +13,10 @@ import {
 import {
   presenciaLiteralPorCita,
   materialDeGate,
+  materialDeInsights,
+  promptInsights,
+  SISTEMA_INSIGHTS,
+  type EvidenciaDelReto,
   materialDeItem,
   materialDeReto,
   MAX_MATERIAL,
@@ -27,6 +31,7 @@ import {
 } from './ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
+  MAX_INSIGHTS_POR_LOTE,
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
@@ -37,6 +42,7 @@ import {
   type CapacidadActiva,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoInsight,
   type ContenidoPropuesta,
   type EstadoAncla,
   type GenerarPropuestas,
@@ -46,7 +52,7 @@ import {
   type RegistrarConsentimiento,
   type RevisarPropuesta,
 } from './ai.schemas';
-import { ESQUEMA_DE_CONTENIDO, parsearContenido } from './ai.contenido';
+import { CITAS_DEL_CONTENIDO, ESQUEMA_DE_CONTENIDO, parsearContenido } from './ai.contenido';
 import {
   credencialesAI,
   generarConProveedor,
@@ -340,8 +346,22 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
   reto_id: {
     join: (tx) => tx`left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`,
     titulo: (tx) => tx`r.codigo || ' ' || r.titulo`,
+    /*
+     * El repertorio COMPLETO del ancla, no el de una capacidad: C0 compone su material con la
+     * formulación y C2 con la formulación MÁS la evidencia. La evidencia llega al reto por sus
+     * ARQUETIPOS, que es el único camino que este esquema tiene —`evidencia` no cuelga de un
+     * reto— y por eso la consulta va por ahí y no por el workspace.
+     */
     columnas: (tx) => tx`r.codigo as reto_codigo, r.titulo as reto_titulo,
-      r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica`,
+      r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica,
+      case when p.capacidad = 'C2' then
+        (select coalesce(json_agg(json_build_object(
+                  'id', e.id, 'titulo', e.titulo, 'resumen', e.resumen) order by e.titulo), '[]'::json)
+         from arquetipo a
+         join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+         join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+         where a.reto_id = r.id and a.workspace_id = r.workspace_id)
+      else '[]'::json end as reto_evidencia`,
   },
   gate_id: {
     // DOS joins: el gate y su proyecto. El proyecto no es adorno — es lo que distingue
@@ -560,6 +580,51 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
       return filas.map((g) => ({ id: g.id as string, titulo: g.titulo as string }));
     },
   },
+  C2: {
+    /*
+     * Lo que deja obsoleto un insight propuesto es que su reto se ARCHIVE: ahí el trabajo se
+     * cerró y proponerle insights nuevos no lleva a ninguna parte.
+     *
+     * Y NADA de lo que congela a C0 aplica aquí, que es justamente lo que este registro
+     * existe para permitir: C0 y C2 cuelgan del MISMO reto y no comparten sus puertas. Un G0
+     * aprobado congela los criterios (SYS-22) y no tiene nada que decir sobre los insights;
+     * indexado por columna de ancla, C2 habría heredado sus tres motivos y su cola.
+     */
+    estado: (tx) => tx`case
+        when r.estado = 'archivado' then 'reto-archivado'
+        else 'disponible'
+      end`,
+    material: (f) =>
+      materialDeInsights({
+        codigo: (f.reto_codigo as string | null) ?? '',
+        titulo: (f.reto_titulo as string | null) ?? '',
+        descripcion: (f.reto_descripcion as string | null) ?? '',
+        evidencia: (f.reto_evidencia as EvidenciaDelReto | null) ?? [],
+      }).texto,
+    /*
+     * Retos CON EVIDENCIA y sin insights esperando revisión. Lo primero no es un filtro de
+     * comodidad: sin evidencia, la única salida que cumple el contrato —afirmaciones con
+     * citas literales— sale de la formulación del reto, o sea inventada. Es el mismo caso que
+     * el item importado solo con su referencia, y la respuesta es la misma: no ofrecerlo.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
+        where r.workspace_id = ${workspaceId}
+          and r.estado <> 'archivado'
+          and exists (
+            select 1 from arquetipo a
+            join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+            where a.reto_id = r.id and a.workspace_id = r.workspace_id)
+          and not exists (select 1 from propuesta_ai p
+            where p.reto_id = r.id and p.workspace_id = r.workspace_id
+              and p.capacidad = 'C2' and p.estado = 'propuesta')
+          and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
+        order by r.codigo asc, r.id asc
+        limit ${limite}`;
+      return filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string }));
+    },
+  },
 };
 
 /**
@@ -647,7 +712,10 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   // Las citas se leen del ORIGINAL: son el testimonio del modelo sobre lo que leyó, no del
   // humano que corrige. Hoy son siempre las mismas —corregirlas está prohibido en el
   // servicio y en el guard— y leerlas de aquí lo deja dicho en la proyección también.
-  const citas = 'citas' in original ? original.citas : [];
+  // Por CAPACIDAD, no por la forma del objeto: las de C2 viven dentro de cada afirmación, y
+  // con `'citas' in original` su grounding se habría medido sobre una lista vacía — o sea, no
+  // se habría medido, que es el peor resultado posible para una medida de grounding.
+  const citas = CITAS_DEL_CONTENIDO[f.capacidad as CapacidadActiva](original);
   const presencias = presenciaLiteralPorCita(material, citas);
   return {
     id: f.id as string,
@@ -1637,6 +1705,21 @@ const REVALIDAR: Record<
       );
     }
   },
+  C2: async (tx, entrada) => {
+    // El reto pudo archivarse mientras se preparaba la llamada, y entonces el insight nacería
+    // sobre un trabajo cerrado. Y la evidencia pudo desenlazarse de sus arquetipos: sin ella
+    // no hay nada que citar, que es lo mismo que le pasa a CI con un item sin material.
+    const [reto] = await tx`select r.estado = 'archivado' as archivado,
+        exists (select 1 from arquetipo a
+          join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+          where a.reto_id = r.id and a.workspace_id = r.workspace_id) as con_evidencia
+      from reto r where r.id = ${entrada.anclaId} and r.workspace_id = ${entrada.workspaceId}`;
+    if (!reto || (reto.archivado as boolean) || !(reto.con_evidencia as boolean)) {
+      throw new ErrorAI(
+        'Ese reto se archivó o se quedó sin evidencia enlazada mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+  },
 };
 
 /**
@@ -1765,6 +1848,54 @@ const PREPARAR: Record<
           estado: c.estado as string,
           conObjeto: c.con_objeto as boolean,
         })),
+      }),
+    };
+  },
+  C2: async (tx, entrada) => {
+    const [reto] = await tx`select codigo, titulo, descripcion, estado
+      from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+    if (!reto) throw new ErrorAI('El reto no existe en este workspace');
+    if ((reto.estado as string) === 'archivado') {
+      throw new ErrorAI('Ese reto está archivado: su trabajo se cerró y no admite insights nuevos');
+    }
+    /*
+     * La evidencia del reto, por el ÚNICO camino que este esquema tiene: `evidencia` no cuelga
+     * de un reto, cuelga del workspace, y lo que la ata a uno son sus ARQUETIPOS. La misma
+     * consulta que proyecta el panel, para que el material contra el que se mide la presencia
+     * literal sea el que el modelo leyó.
+     */
+    const evidencia = await tx`select e.id, e.titulo, e.resumen
+      from arquetipo a
+      join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+      join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+      where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
+      order by e.titulo asc`;
+    /*
+     * Sin evidencia no se llama. El contrato de C2 obliga a que cada afirmación cite un
+     * fragmento literal, y sin evidencia la única salida que lo cumple sale de la formulación
+     * del reto —o sea inventada, con aspecto de fundamentada y pagada—. Es el mismo caso que
+     * el item importado solo con su referencia, y la respuesta es la misma.
+     *
+     * Y el mensaje dice DÓNDE se enlaza, porque el camino no es obvio: la evidencia llega a un
+     * reto por sus arquetipos, no directamente.
+     */
+    if (evidencia.length === 0) {
+      throw new ErrorAI(
+        'Ese reto no tiene evidencia enlazada: no hay nada que citar. La evidencia llega a un reto por sus ARQUETIPOS — enlázala allí y vuelve a pedirlo.',
+      );
+    }
+    return {
+      sistema: SISTEMA_INSIGHTS,
+      prompt: promptInsights({
+        codigo: reto.codigo as string,
+        titulo: reto.titulo as string,
+        descripcion: reto.descripcion as string,
+        evidencia: evidencia.map((e) => ({
+          id: e.id as string,
+          titulo: e.titulo as string,
+          resumen: e.resumen as string,
+        })),
+        cuantos: MAX_INSIGHTS_POR_LOTE,
       }),
     };
   },
@@ -2326,9 +2457,13 @@ async function aceptarPropuestaEnTransaccion(
       // tercera que ordene distinto —`pagina`, por ejemplo— toda corrección se rechazaría con
       // «las citas no se corrigen» aunque fueran idénticas. El guard de la base compara
       // `jsonb`, que es insensible al orden, así que el suelo y el servicio discreparían.
+      // DÓNDE están las citas lo dice la capacidad, no la forma del objeto. Leerlas como
+      // `contenido.citas` funcionaba con tres capacidades que las tenían al final; con las de
+      // C2 dentro de cada afirmación, esa lectura habría dado `undefined` en los dos lados y
+      // la regla habría pasado EN VACÍO, dejando editables justo las citas que no se tocan.
       if (
-        canonico((contenido as ContenidoPropuesta).citas) !==
-        canonico((p.contenidoOriginal as ContenidoPropuesta).citas)
+        canonico(CITAS_DEL_CONTENIDO[p.capacidad](contenido)) !==
+        canonico(CITAS_DEL_CONTENIDO[p.capacidad](p.contenidoOriginal))
       ) {
         throw new ErrorAI(
           'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',
@@ -2377,6 +2512,8 @@ async function aceptarPropuestaEnTransaccion(
         ),
       'criterio-exito': () =>
         materializarCriterio(tx, actorId, entrada.workspaceId, p, contenido as ContenidoCriterio),
+      insight: () =>
+        materializarInsight(tx, actorId, entrada.workspaceId, p, contenido as ContenidoInsight),
     };
     const objetoId = await MATERIALIZAR[p.destino]();
 
@@ -2539,6 +2676,91 @@ async function materializarEvidencia(
 
 /** C0: el criterio nace bajo el reto de la propuesta, firmado por quien acepta y SIN
  * línea base inventada (solo el plan para obtenerla — SYS-22 exige valor+fecha o plan). */
+/**
+ * C2: la aceptación crea el insight ENTERO — sus afirmaciones y las citas de cada una, y las
+ * contradicciones si las señaló.
+ *
+ * Es el primer objeto COMPUESTO que materializa el pipeline, y por eso el orden importa: las
+ * políticas de `afirmacion` y `cita` exigen que su insight esté en `propuesto`, así que se
+ * crea primero y todo cuelga dentro de la MISMA transacción. Si algo falla —una evidencia
+ * citada que ya no está, por ejemplo— no queda un insight a medias: no queda nada.
+ *
+ * El `orden` de cada afirmación sale de su posición en el contenido, que es el que el modelo
+ * propuso y el revisor leyó. No se reordena por nada: `afirmacion` tiene único
+ * `(insight_id, orden)` y lo que se acepta es LO QUE SE VIO.
+ *
+ * Las citas apuntan a la EVIDENCIA por su id. Que ese id sea de una evidencia real y del
+ * tenant lo sujeta su FK compuesta; que sea de las que se le enseñaron al modelo lo sujeta el
+ * trigger de la migración de C2. Aquí no se vuelve a comprobar: repetir una regla en un
+ * tercer sitio es cómo las tres empiezan a divergir.
+ */
+async function materializarInsight(
+  tx: TransactionSql,
+  actorId: string,
+  workspaceId: string,
+  p: PropuestaEnRevision,
+  c: ContenidoInsight,
+): Promise<string> {
+  // El reto tiene que SEGUIR sin archivar. Entre generar y aceptar hay una segunda vida
+  // entera y el ciclo de vida del reto avanza solo; aceptar después colgaría un insight de un
+  // trabajo ya cerrado. Mismo razonamiento que `materializarCriterio`, con su propio
+  // predicado: lo que congela criterios (G0, registry) no dice nada sobre insights.
+  await bloquearReto(tx, p.anclaId);
+  const [reto] = await tx`select estado from reto
+    where id = ${p.anclaId} and workspace_id = ${workspaceId}`;
+  if ((reto?.estado as string | undefined) === 'archivado') {
+    throw new ErrorAI(
+      'Ese reto se archivó: su trabajo se cerró y esta propuesta quedó obsoleta, así que solo puede rechazarse',
+    );
+  }
+  const [insight] = await tx`insert into insight
+    (workspace_id, titulo, resumen, estado, creado_por)
+    values (${workspaceId}, ${c.titulo}, ${c.resumen}, 'propuesto', ${actorId})
+    returning id`;
+  const insightId = insight!.id as string;
+  for (const [orden, a] of c.afirmaciones.entries()) {
+    const [afirmacion] = await tx`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${workspaceId}, ${insightId}, ${orden}, ${a.texto}, ${a.esHipotesis})
+      returning id`;
+    for (const cita of a.citas) {
+      try {
+        await tx`insert into cita
+          (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+          values (${workspaceId}, ${afirmacion!.id as string}, ${cita.evidenciaId},
+                  ${cita.fragmento}, ${cita.localizacion}, ${actorId})`;
+      } catch (e) {
+        /*
+         * DR001 es el código de los DERECHOS: citar una evidencia exige que siga siendo
+         * usable (SPEC-03/SYS-14), y entre generar y aceptar cabe una revocación entera —es
+         * el mismo hueco que el consentimiento retirado, con otro registro—. Sin traducirlo,
+         * el rechazo sale como error crudo del driver a una pantalla de revisión, y quien
+         * revisa no puede saber que lo que falta son derechos ni de qué evidencia.
+         *
+         * El motivo del guard ya nombra la evidencia y la causa; se antepone lo que hay que
+         * hacer con la propuesta, que es lo que el guard no puede saber. Ninguna otra causa
+         * se disfraza: cualquier otro error se relanza tal cual.
+         */
+        const err = e as { code?: string; message?: string };
+        if (err.code === 'DR001') {
+          throw new ErrorAI(
+            `Este insight cita evidencia que ya no se puede citar. ${err.message ?? ''} ` +
+              'Los derechos no los propone la AI: repón los de esa evidencia, o rechaza la propuesta.',
+          );
+        }
+        throw e;
+      }
+    }
+  }
+  for (const contra of c.contradicciones) {
+    await tx`insert into contradiccion
+      (workspace_id, insight_id, evidencia_id, descripcion, creado_por)
+      values (${workspaceId}, ${insightId}, ${contra.evidenciaId}, ${contra.descripcion},
+              ${actorId})`;
+  }
+  return insightId;
+}
+
 async function materializarCriterio(
   tx: TransactionSql,
   actorId: string,

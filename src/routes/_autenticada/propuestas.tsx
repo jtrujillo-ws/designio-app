@@ -27,6 +27,7 @@ import {
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoInsight,
   type ContenidoPropuesta,
   type Destino,
   type PropuestaEnPanel,
@@ -101,6 +102,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese gate ya se decidió: este informe describe un estado que ya pasó. Puedes leerlo, pero lo que dice que falta ya no aplica.',
   'checklist-avanzado':
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
+  'reto-archivado':
+    'Ese reto está archivado: su trabajo se cerró y esta propuesta quedó obsoleta, así que solo puede rechazarse.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 
@@ -997,6 +1000,24 @@ const PRESENTACION: Record<
       ),
     },
   },
+  insight: {
+    rotulo: 'Insight propuesto',
+    ficha: (c) => <FichaInsight contenido={c as ContenidoInsight} />,
+    materializacion: {
+      // Un insight no tiene precondición de contenido: su esquema ya exige lo que las tablas
+      // piden —al menos una afirmación, y cada una con al menos una cita— y el resto lo
+      // sujetan las FK de `cita` y `contradiccion` contra la evidencia.
+      bloqueoPropio: () => null,
+      formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+        <FormularioInsight
+          inicial={inicial as ContenidoInsight}
+          ocupado={ocupado}
+          onEnviar={onEnviar}
+          onCancelar={onCancelar}
+        />
+      ),
+    },
+  },
   /*
    * La entrada de las capacidades INFORMATIVAS, con `destino` nulo. Se indexa por una clave
    * propia y no por `undefined` porque un `Record` con una clave que falta se lee como
@@ -1353,6 +1374,159 @@ function FichaAsistenteGate({ contenido }: { contenido: ContenidoAsistenteGate }
       )}
       <Dato rotulo="Confianza del diagnóstico" valor={contenido.confianzaPropuesta} />
     </div>
+  );
+}
+
+/**
+ * El insight propuesto: su resumen, sus afirmaciones y las citas de cada una.
+ *
+ * Las citas se pintan CON su fragmento, que es lo que hace revisable un insight: quien
+ * aprueba tiene que poder leer de dónde sale cada afirmación sin salir de la tarjeta. Y las
+ * hipótesis se marcan, porque una extrapolación bien escrita suena igual que una observación
+ * (RF-08.2) — esconder esa distinción es exactamente lo que la marca existe para impedir.
+ *
+ * Las contradicciones se pintan aparte y con su nombre: un insight que solo enseña lo que lo
+ * confirma no sirve para decidir (I4).
+ */
+function FichaInsight({ contenido }: { contenido: ContenidoInsight }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="Insight" valor={contenido.titulo} />
+      {contenido.resumen && <Dato rotulo="Resumen" valor={contenido.resumen} />}
+      {contenido.afirmaciones.map((a, i) => (
+        <div
+          key={String(i)}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+            paddingTop: 8,
+            borderTop: '1px solid var(--border-faint)',
+          }}
+        >
+          <Dato
+            rotulo={a.esHipotesis ? `Hipótesis ${i + 1}` : `Afirmación ${i + 1}`}
+            valor={a.texto}
+          />
+          {a.citas.map((c, j) => (
+            <Dato key={String(j)} rotulo="Cita" valor={`«${c.fragmento}» · ${c.localizacion}`} />
+          ))}
+        </div>
+      ))}
+      {contenido.contradicciones.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 8, borderTop: '1px solid var(--border-faint)' }}>
+          {contenido.contradicciones.map((c, i) => (
+            <Dato key={String(i)} rotulo={`Contradicción ${i + 1}`} valor={c.descripcion} />
+          ))}
+        </div>
+      )}
+      <Dato rotulo="Confianza de la propuesta" valor={contenido.confianzaPropuesta} />
+    </div>
+  );
+}
+
+/**
+ * Corregir un insight: su título, su resumen y el texto y la marca de hipótesis de cada
+ * afirmación. Las CITAS no se editan y por eso se pintan como lo que son —el rastro de lo que
+ * el modelo dijo haber leído— en vez de esconderse: quien corrige tiene que verlas para
+ * decidir si la afirmación se sostiene, y si no se sostiene lo que toca es rechazar, no
+ * reescribir la cita.
+ *
+ * Tampoco se editan las contradicciones ni la confianza declarada, por lo mismo.
+ */
+function FormularioInsight({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoInsight;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoInsight) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [titulo, setTitulo] = useState(inicial.titulo);
+  const [resumen, setResumen] = useState(inicial.resumen);
+  const [afirmaciones, setAfirmaciones] = useState(inicial.afirmaciones);
+
+  const cambiar = (i: number, cambio: Partial<ContenidoInsight['afirmaciones'][number]>) =>
+    setAfirmaciones((previas) => previas.map((a, j) => (j === i ? { ...a, ...cambio } : a)));
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          titulo,
+          resumen,
+          afirmaciones,
+          // Lo que el modelo afirmó —sus contradicciones y su confianza— no lo reescribe quien
+          // corrige, igual que sus citas.
+          contradicciones: inicial.contradicciones,
+          confianzaPropuesta: inicial.confianzaPropuesta,
+        });
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        Corregir antes de aceptar (la propuesta original se conserva)
+      </span>
+      <label style={campo}>
+        <span style={etiqueta}>Insight</span>
+        <Input required maxLength={300} value={titulo} onChange={(e) => setTitulo(e.target.value)} />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Resumen</span>
+        <Textarea maxLength={2000} rows={2} value={resumen} onChange={(e) => setResumen(e.target.value)} />
+      </label>
+      {afirmaciones.map((a, i) => (
+        <div key={String(i)} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <label style={campo}>
+            <span style={etiqueta}>Afirmación {i + 1}</span>
+            <Textarea
+              required
+              maxLength={1000}
+              rows={2}
+              value={a.texto}
+              onChange={(e) => cambiar(i, { texto: e.target.value })}
+            />
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={a.esHipotesis}
+              onChange={(e) => cambiar(i, { esHipotesis: e.target.checked })}
+            />
+            <span style={etiqueta}>Es una hipótesis (extrapola más allá de la evidencia)</span>
+          </label>
+          {a.citas.map((c, j) => (
+            <span
+              key={String(j)}
+              style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-faint)' }}
+            >
+              Cita (no editable): «{c.fragmento}» · {c.localizacion}
+            </span>
+          ))}
+        </div>
+      ))}
+      <div style={{ display: 'flex', gap: 10 }}>
+        <Button size="sm" type="submit" disabled={ocupado}>
+          Corregir y aceptar
+        </Button>
+        <Button size="sm" variant="ghost" type="button" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
   );
 }
 

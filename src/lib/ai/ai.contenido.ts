@@ -152,9 +152,75 @@ export const ContenidoAsistenteGateSchema = z
   .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
 export type ContenidoAsistenteGate = z.infer<typeof ContenidoAsistenteGateSchema>;
 
+/**
+ * C2 — un insight con sus afirmaciones, y cada afirmación con las citas que la sostienen
+ * (SPEC-08 §30, I4: «la AI propone Y CITA; el humano aprueba»).
+ *
+ * Es el primer contenido COMPUESTO del pipeline: un insight no es una fila, es un `insight`
+ * con sus `afirmacion` y las `cita` de cada una. Por eso las citas viven DENTRO de la
+ * afirmación y no en una lista suelta al final: una cita es el sostén de UNA afirmación
+ * concreta, y aplanarlas perdería justo lo que las hace verificables — cuál sostiene a cuál.
+ *
+ * Cada cita nombra su EVIDENCIA por id, copiado del material. Es el único campo contrastable
+ * que tiene —el fragmento y la localización son texto—, y un trigger comprueba que cada id
+ * esté entre las evidencias del reto: una cita a una evidencia ajena manda a quien revisa a
+ * buscar un sostén que no está donde dice.
+ *
+ * `esHipotesis` no es decoración: SPEC-08 §RF-08.2 exige que las extrapolaciones se marquen
+ * como hipótesis, y `afirmacion.es_hipotesis` es donde eso vive. Que lo diga el modelo y que
+ * el humano pueda corregirlo es la diferencia entre una afirmación sostenida y una que suena
+ * igual de bien.
+ */
+const CitaDeAfirmacionSchema = z.object({
+  /* La evidencia de la que sale, POR SU ID: copiado del material, no inventado. */
+  evidenciaId: z.string().uuid(),
+  fragmento: z.string().trim().min(1).max(600),
+  localizacion: z.string().trim().min(1).max(200),
+});
+
+export const ContenidoInsightSchema = z
+  .object({
+    titulo: z.string().trim().min(1).max(300),
+    resumen: z.string().trim().max(2000).default(''),
+    afirmaciones: z
+      .array(
+        z.object({
+          texto: z.string().trim().min(1).max(1000),
+          /* SYS-20 / RF-08.2: lo que se extrapola se marca, no se disimula. */
+          esHipotesis: z.boolean(),
+          /* Al menos UNA: una afirmación sin cita es una opinión, y este pipeline no las
+           * propone. El techo existe por lo mismo que el del lote: seis citas ya son más de
+           * lo que alguien contrasta de una sentada. */
+          citas: z.array(CitaDeAfirmacionSchema).min(1).max(6),
+        }),
+      )
+      .min(1)
+      .max(6),
+    /*
+     * Las contradicciones se SEÑALAN, no se resuelven. I4 pide que la evidencia que
+     * contradice al insight aparezca, y esconderla es la manera más limpia de vender una
+     * conclusión. Puede venir vacío: no toda evidencia se contradice.
+     */
+    contradicciones: z
+      .array(
+        z.object({
+          evidenciaId: z.string().uuid(),
+          descripcion: z.string().trim().min(1).max(1000),
+        }),
+      )
+      .max(4),
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoInsight = z.infer<typeof ContenidoInsightSchema>;
+
 /** Contenido de una propuesta: una de las formas tipadas, nunca un jsonb libre — así el
  * panel, el servicio y la corrección hablan del mismo objeto sin castings. */
-export type ContenidoPropuesta = ContenidoExtraccion | ContenidoCriterio | ContenidoAsistenteGate;
+export type ContenidoPropuesta =
+  | ContenidoExtraccion
+  | ContenidoCriterio
+  | ContenidoAsistenteGate
+  | ContenidoInsight;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -183,6 +249,35 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   CI: ContenidoExtraccionSchema,
   C0: ContenidoCriterioSchema,
   CT: ContenidoAsistenteGateSchema,
+  C2: ContenidoInsightSchema,
+};
+
+/**
+ * DÓNDE guarda sus citas cada capacidad.
+ *
+ * Existe porque C2 lo cobró. Dos reglas centrales leían `contenido.citas` a pelo —la medida
+ * de presencia literal del panel y la prohibición de corregir las citas— y eso funcionaba
+ * porque las tres primeras capacidades las tenían en una lista al final. Las de C2 viven
+ * DENTRO de cada afirmación, que es donde deben estar: una cita sostiene UNA afirmación
+ * concreta y aplanarlas perdería cuál sostiene a cuál.
+ *
+ * Con el acceso a pelo, C2 no habría roto nada: `contenido.citas` sería `undefined` en los
+ * dos lados de la comparación, la regla habría pasado en vacío y las citas de C2 serían
+ * EDITABLES — borrando justo la señal que la corrección no puede tocar. Y su grounding se
+ * habría medido sobre una lista vacía, o sea no se habría medido.
+ *
+ * `Record<CapacidadActiva, …>` para que una capacidad nueva tenga que decir dónde están las
+ * suyas en vez de heredar una suposición.
+ */
+export type CitaDelContenido = { fragmento: string; localizacion: string };
+export const CITAS_DEL_CONTENIDO: Record<
+  CapacidadActiva,
+  (contenido: ContenidoPropuesta) => CitaDelContenido[]
+> = {
+  CI: (c) => (c as ContenidoExtraccion).citas,
+  C0: (c) => (c as ContenidoCriterio).citas,
+  CT: (c) => (c as ContenidoAsistenteGate).citas,
+  C2: (c) => (c as ContenidoInsight).afirmaciones.flatMap((a) => a.citas),
 };
 
 /**

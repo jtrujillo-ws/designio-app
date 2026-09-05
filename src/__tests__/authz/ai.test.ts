@@ -15,6 +15,7 @@ import {
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoInsight,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { parsearContenido } from '@/lib/ai/ai.contenido';
@@ -31,6 +32,7 @@ import type { IntentoProveedor, ResultadoProveedor } from '@/lib/ai/proveedor.se
 import {
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
+  COLUMNA_DE_DESTINO,
   COLUMNAS_DE_ANCLA,
   type AnclaCapacidad,
   type CapacidadActiva,
@@ -110,6 +112,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   let proyectoId = '';
   let gateId = '';
   let requisitoIds: string[] = [];
+  let evidenciaDelRetoId = '';
 
   const MATERIAL = 'El 71% de los abandonos ocurre en la carga del documento de identidad.';
 
@@ -178,6 +181,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     get CT() {
       return CONTENIDO_CT(requisitoIds[0]!);
     },
+    /* Igual que CT: se resuelve tarde porque la evidencia se crea en el `beforeAll`, y su id
+     * tiene que ser REAL — el guard exige que sea del reto. */
+    get C2() {
+      return CONTENIDO_C2(evidenciaDelRetoId);
+    },
   };
 
   /**
@@ -238,6 +246,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const requisitos = req.map((c) => c.id as string);
     return { gateId: gid, requisitos, contenido: CONTENIDO_CT(requisitos[0]!) };
   }
+
+  /**
+   * C2 — un insight con su afirmación y la cita que la sostiene.
+   *
+   * El fragmento es LITERAL del resumen de la evidencia, que es lo que `materialDeInsights`
+   * mete en el cuerpo del bloque: así la presencia se mide de verdad y no por casualidad.
+   */
+  const CONTENIDO_C2 = (evidenciaId: string): ContenidoInsight => ({
+    titulo: 'La verificación documental es donde se pierde la gente',
+    resumen: 'El abandono se concentra en la carga del documento, no en el alta.',
+    afirmaciones: [
+      {
+        texto: 'La mayoría de los abandonos ocurre al cargar el documento',
+        esHipotesis: false,
+        citas: [{ evidenciaId, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+      },
+    ],
+    contradicciones: [],
+    confianzaPropuesta: 'media',
+  });
 
   /** Item de bandeja pendiente (setup con la conexión admin, como el resto de la suite).
    * `tipoFuente` decide si su material es de personas: 'entrevista' exige consentimiento
@@ -452,6 +480,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // aplicación: solo una conexión de administración puede deshacer el vínculo.
       await admin`update evidencia set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`update criterio_exito set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      // `insight` y `propuesta_ai` se referencian en los DOS sentidos —la propuesta apunta al
+      // objeto que materializó y el objeto lleva el sello de su procedencia—, así que el ciclo
+      // se rompe soltando el sello y borrando la propuesta primero; el insight se va después,
+      // con su descendencia, de la hoja a la raíz.
+      await admin`update insight set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -463,6 +496,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from metric_registry where workspace_id = ${wsL}`;
       await admin`delete from derecho_uso where workspace_id = ${wsL}`;
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
+      await admin`delete from cita where workspace_id = ${wsL}`;
+      await admin`delete from contradiccion where workspace_id = ${wsL}`;
+      await admin`delete from afirmacion where workspace_id = ${wsL}`;
+      await admin`delete from insight where workspace_id = ${wsL}`;
+      // El enlace reto→arquetipo→evidencia por delante de sus dos extremos, y el arquetipo
+      // por delante del reto.
+      await admin`delete from arquetipo_evidencia where workspace_id = ${wsL}`;
+      await admin`delete from evidencia where workspace_id = ${wsL}`;
+      await admin`delete from fuente where workspace_id = ${wsL}`;
+      await admin`delete from arquetipo where workspace_id = ${wsL}`;
       await admin`delete from checklist_item where workspace_id = ${wsL}`;
       await admin`delete from gate_instancia where workspace_id = ${wsL}`;
       await admin`delete from etapa_instancia where workspace_id = ${wsL}`;
@@ -525,6 +568,38 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
              (${ws}, ${gateId}, 2, 'El blueprint declara sus puntos de fallo')
       returning id`;
     requisitoIds = req.map((c) => c.id as string);
+    /*
+     * La evidencia del reto, por el ÚNICO camino que hay: `evidencia` no cuelga de un reto,
+     * cuelga del workspace, y lo que la ata a uno son sus ARQUETIPOS. Sin este enlace, C2 no
+     * ofrecería el reto y su generación se negaría — que es correcto, y por eso el fixture lo
+     * monta en vez de darlo por hecho.
+     */
+    const [arq] = await admin`insert into arquetipo
+      (workspace_id, reto_id, nombre, definicion, creado_por)
+      values (${ws}, ${retoId}, 'Titular primerizo', 'Abre su primera cuenta', ${leadId})
+      returning id`;
+    const [fte] = await admin`insert into fuente
+      (workspace_id, tipo, titulo, referencia, creado_por)
+      values (${ws}, 'documento', 'Funnel de verificación', 'ref-funnel', ${leadId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+      values (${ws}, ${fte!.id as string}, 'Abandono en verificación',
+              'El 71% de los abandonos ocurre al cargar el documento.', '{}'::jsonb, ${leadId})
+      returning id`;
+    evidenciaDelRetoId = ev!.id as string;
+    /*
+     * Con derechos CONCEDIDOS y de ámbito cliente, no con el `derecho_uso` por defecto: citar
+     * una evidencia exige que sea usable (SPEC-03/SYS-14, `evidencia_citable_guard`), y el
+     * registro nace `pendiente`/`interno`, que no lo es. Materializar un insight es escribir
+     * `cita`, así que sin esto la aceptación de C2 muere en el guard de derechos — que es la
+     * conducta correcta y tiene su propio caso; aquí lo que se mide es otra cosa.
+     */
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${ws}, ${evidenciaDelRetoId}, 'concedido', 'cliente',
+              'Consentimiento del participante', ${leadId}, now(), ${leadId})`;
+    await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+      values (${ws}, ${arq!.id as string}, ${evidenciaDelRetoId})`;
   });
 
   afterAll(async () => {
@@ -534,17 +609,29 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from reserva_ai where workspace_id = ${ws}`;
       await admin`update evidencia set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`update criterio_exito set propuesta_ai_id = null where workspace_id = ${ws}`;
+      // Ver la nota de `enWorkspaceLimpio`: el sello va de la propuesta al insight y del
+      // insight a la propuesta, así que se suelta antes de borrar ninguno de los dos.
+      await admin`update insight set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where workspace_id = ${ws}`;
       await admin`delete from llamada_ai where workspace_id = ${ws}`;
       await admin`delete from consentimiento_item where workspace_id = ${ws}`;
       await admin`delete from item_importacion where workspace_id = ${ws}`;
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
+      await admin`delete from cita where workspace_id = ${ws}`;
+      await admin`delete from contradiccion where workspace_id = ${ws}`;
+      await admin`delete from afirmacion where workspace_id = ${ws}`;
+      await admin`delete from insight where workspace_id = ${ws}`;
       // El registro de derechos de SPEC-03 cuelga de la evidencia por FK: sin esta línea la
       // limpieza muere al borrarla. Va aquí y no antes porque toda evidencia que este
       // fichero crea nace ya con el suyo, que es justo lo que exige el trigger diferido.
       await admin`delete from derecho_uso where workspace_id = ${ws}`;
+      // El enlace reto→arquetipo→evidencia que monta el fixture de C2 va por delante de sus
+      // dos extremos: `arquetipo_evidencia` referencia la evidencia (y el arquetipo, el reto),
+      // así que sin estas dos líneas la limpieza muere en la FK y deja el workspace en pie.
+      await admin`delete from arquetipo_evidencia where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
+      await admin`delete from arquetipo where workspace_id = ${ws}`;
       await admin`delete from checklist_item where workspace_id = ${ws}`;
       await admin`delete from gate_instancia where workspace_id = ${ws}`;
       await admin`delete from etapa_instancia where workspace_id = ${ws}`;
@@ -701,9 +788,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       anclas: { item_id: itemId },
     });
 
-    // Antes de aceptar, el dominio está intacto: ni fuente ni evidencia.
+    // Antes de aceptar, la propuesta no ha materializado NADA. La sonda pregunta por esta
+    // propuesta y no por «el workspace no tiene evidencia», que medía otra cosa: aquel conteo
+    // solo daba cero mientras el fixture no creara evidencia por su cuenta, y desde que C2
+    // ancla en el reto —y la evidencia solo llega a un reto por sus arquetipos— el workspace
+    // nace con la suya. Preguntar por el vínculo es lo que la prueba quería decir.
     const antes = await conUsuario(leadId, (tx) => tx`
-      select 1 as x from evidencia where workspace_id = ${ws}`);
+      select 1 as x from evidencia where propuesta_ai_id = ${propuestaId}`);
     expect(antes.length).toBe(0);
 
     const r = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
@@ -5366,5 +5457,626 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         contenido: g.contenido,
       }),
     ).rejects.toThrow(/ya se decidió/);
+  });
+
+  /* ══════════════════════ C2 — insights propuestos con sus citas ══════════════════════ */
+
+  /**
+   * Enlaza evidencia a un reto por el ÚNICO camino que este esquema tiene y devuelve su id.
+   *
+   * No es azúcar: `evidencia` cuelga del workspace, no del reto, y lo que la ata a uno son sus
+   * ARQUETIPOS. Un fixture que se saltara ese camino —creando evidencia del workspace y ya—
+   * dejaría a C2 sin material, y la generación se negaría con razón; escribirlo aquí una vez
+   * es lo que evita que cada caso lo dé por hecho de una manera distinta.
+   */
+  async function evidenciaDelReto(
+    wsC: string,
+    retoC: string,
+    actorId: string,
+    campos: { titulo: string; resumen: string },
+  ): Promise<string> {
+    const admin = sqlAdmin();
+    const [arq] = await admin`insert into arquetipo
+      (workspace_id, reto_id, nombre, definicion, creado_por)
+      values (${wsC}, ${retoC}, ${'Arquetipo de ' + campos.titulo}, 'Definición', ${actorId})
+      returning id`;
+    const [fte] = await admin`insert into fuente
+      (workspace_id, tipo, titulo, referencia, creado_por)
+      values (${wsC}, 'documento', ${campos.titulo}, 'ref', ${actorId}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+      values (${wsC}, ${fte!.id as string}, ${campos.titulo}, ${campos.resumen}, '{}'::jsonb,
+              ${actorId})
+      returning id`;
+    const evId = ev!.id as string;
+    // Concedidos y de ámbito cliente: citar exige evidencia usable, y el registro por
+    // defecto nace `pendiente`/`interno`. Ver la nota del fixture compartido.
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${wsC}, ${evId}, 'concedido', 'cliente', 'Consentimiento del participante',
+              ${actorId}, now(), ${actorId})`;
+    await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+      values (${wsC}, ${arq!.id as string}, ${evId})`;
+    return evId;
+  }
+
+  /**
+   * El camino REAL de C2, de punta a punta, y hasta el objeto materializado.
+   *
+   * Es el caso que hacía falta escribir antes que ningún otro, porque C2 es la primera
+   * capacidad que COMPARTE columna de ancla (el reto, con C0) y la primera que materializa un
+   * objeto COMPUESTO. Las dos cosas rompían el suelo en sitios que ninguna prueba tocaba y que
+   * el compilador no podía echar de menos —enumeraciones de SQL escritas cuando el conjunto
+   * era más pequeño—. Medido contra la base, esto fallaba en CINCO puntos distintos antes de
+   * las correcciones de su migración:
+   *
+   *   1. `llamada_ai_check1`  — (capacidad='C0') = (reto_id is not null): la llamada no entra.
+   *   2. `reserva_ai_check1`  — lo mismo al reservar el presupuesto.
+   *   3. `propuesta_ai_destino_check` — el vocabulario de destinos no conocía 'insight'.
+   *   4. `propuesta_ai_check9` — «aceptada ⇔ hay objeto» contaba evidencia y criterio y no el
+   *      insight, así que aceptar era imposible.
+   *   5. El `else` del guard de materialización sellaba `criterio_exito` para todo lo que no
+   *      fuera evidencia, y el insight caía ahí.
+   *
+   * Ninguno se veía desde TypeScript y ninguno lo habría dicho una prueba de unidad: hay que
+   * recorrer el camino entero contra la base real.
+   */
+  it('C2 genera insights por el camino real y aceptar materializa el objeto entero', async () => {
+    await enWorkspaceLimpio('c2-camino-real', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const evId = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Abandono en verificación',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+      });
+      const otraId = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Encuesta de salida',
+        resumen: 'Quien abandona dice que no sabía qué documento subir.',
+      });
+
+      const propuesto = {
+        titulo: 'La verificación documental es donde se pierde la gente',
+        resumen: 'El abandono se concentra en la carga del documento, no en el alta.',
+        afirmaciones: [
+          {
+            texto: 'La mayoría de los abandonos ocurre al cargar el documento',
+            esHipotesis: false,
+            citas: [
+              // Literal del resumen de la evidencia: es lo que `materialDeInsights` mete en
+              // el cuerpo del bloque, así que la presencia se mide de verdad…
+              {
+                evidenciaId: evId,
+                fragmento: 'El 71% de los abandonos',
+                localizacion: 'resumen',
+              },
+              // …y una inventada, para que el panel las distinga.
+              { evidenciaId: evId, fragmento: 'esto no está en la evidencia', localizacion: 'resumen' },
+            ],
+          },
+          {
+            texto: 'Bastaría con decir antes qué documento sirve',
+            esHipotesis: true,
+            citas: [
+              { evidenciaId: otraId, fragmento: 'no sabía qué documento subir', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        contradicciones: [
+          { evidenciaId: otraId, descripcion: 'La encuesta apunta a información, no a fricción técnica' },
+        ],
+        confianzaPropuesta: 'media' as const,
+      };
+
+      const generadas = await conProveedor(
+        {
+          ok: true,
+          datos: { insights: [propuesto] },
+          intentos: [intento({ modelo: 'modelo-de-prueba', latenciaMs: 210, uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      expect(generadas.generadas).toBe(1);
+
+      const [nacida] = await conUsuario(
+        curadorId,
+        (tx) => tx`
+        select p.estado, p.destino, p.reto_id, p.item_id, p.gate_id, p.insight_id,
+               l.capacidad as llamada_capacidad, l.reto_id as llamada_reto
+        from propuesta_ai p
+        join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
+        where p.workspace_id = ${wsC} and p.capacidad = 'C2'`,
+      );
+      expect(nacida!.estado).toBe('propuesta');
+      expect(nacida!.destino).toBe('insight');
+      expect(nacida!.reto_id).toBe(retoC);
+      expect(nacida!.item_id).toBeNull();
+      expect(nacida!.gate_id).toBeNull();
+      // Pendiente todavía no tiene objeto: el insight nace al aceptar, no al proponer.
+      expect(nacida!.insight_id).toBeNull();
+      // Y el libro de costos anotó la misma ancla, que es de donde sale el gasto por objeto.
+      expect(nacida!.llamada_capacidad).toBe('C2');
+      expect(nacida!.llamada_reto).toBe(retoC);
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2');
+      expect(p, 'la propuesta de C2 no llegó al panel').toBeDefined();
+      expect(p!.destino).toBe('insight');
+      expect(p!.anclaEstado).toBe('disponible');
+      /*
+       * Las TRES citas, en su orden y con su medida. Es lo que se rompe en silencio si el
+       * material del panel y el del prompt dejan de ser el mismo texto — y además comprueba
+       * que las citas de C2 se leen DONDE ESTÁN: viven dentro de cada afirmación, no en
+       * `contenido.citas`, así que un lector escrito para las otras tres capacidades habría
+       * devuelto una lista vacía y esto pasaría en verde sin medir nada.
+       */
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true, false, true]);
+
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p!.id,
+      });
+
+      // El insight ENTERO: cabecera, afirmaciones en orden con su marca de hipótesis, las
+      // citas de cada una y la contradicción señalada. Aceptar una propuesta de C2 no escribe
+      // una fila, escribe un árbol, y un árbol a medias no es el objeto que se revisó.
+      const [ins] = await conUsuario(curadorId, (tx) => tx`
+        select titulo, resumen, estado, creado_por, propuesta_ai_id, validado_por
+        from insight where id = ${objetoId}`);
+      expect(ins!.titulo).toBe(propuesto.titulo);
+      expect(ins!.resumen).toBe(propuesto.resumen);
+      // Nace PROPUESTO, no validado: validar es otra decisión humana, con su propio guard de
+      // derechos (SPEC-05). Aceptar la propuesta AI no la anticipa.
+      expect(ins!.estado).toBe('propuesto');
+      expect(ins!.validado_por).toBeNull();
+      // El autor es el humano que aceptó, no la AI (I4/SYS-18)…
+      expect(ins!.creado_por).toBe(curadorId);
+      // …y el sello de procedencia dice de qué propuesta viene (SYS-19). Lo escribe el guard:
+      // la columna está fuera de todo grant, así que ningún camino de la aplicación lo toca.
+      expect(ins!.propuesta_ai_id).toBe(p!.id);
+
+      const afs = await conUsuario(curadorId, (tx) => tx`
+        select id, orden, texto, es_hipotesis from afirmacion
+        where insight_id = ${objetoId} order by orden`);
+      expect(afs.map((a) => [a.orden, a.texto, a.es_hipotesis])).toEqual(
+        propuesto.afirmaciones.map((a, i) => [i, a.texto, a.esHipotesis]),
+      );
+      const citas = await conUsuario(curadorId, (tx) => tx`
+        select c.evidencia_id, c.fragmento, c.localizacion, c.creado_por, a.orden
+        from cita c join afirmacion a on a.id = c.afirmacion_id
+        where a.insight_id = ${objetoId} order by a.orden, c.fragmento`);
+      expect(citas.length).toBe(3);
+      expect(citas.every((c) => c.creado_por === curadorId)).toBe(true);
+      expect(citas.map((c) => c.evidencia_id)).toEqual([evId, evId, otraId]);
+      const contras = await conUsuario(curadorId, (tx) => tx`
+        select evidencia_id, descripcion from contradiccion where insight_id = ${objetoId}`);
+      expect(contras.map((c) => [c.evidencia_id, c.descripcion])).toEqual([
+        [otraId, propuesto.contradicciones[0]!.descripcion],
+      ]);
+
+      const [decidida] = await conUsuario(curadorId, (tx) => tx`
+        select estado, revisada_por, insight_id from propuesta_ai where id = ${p!.id}`);
+      expect(decidida!.estado).toBe('aceptada');
+      expect(decidida!.revisada_por).toBe(curadorId);
+      expect(decidida!.insight_id).toBe(objetoId);
+    });
+  });
+
+  /**
+   * Una cita a evidencia que NO es del reto no entra, y da igual que exista y sea del tenant.
+   *
+   * La FK compuesta ya comprueba las dos cosas; lo que falta es el ALCANCE. Una cita a
+   * evidencia ajena manda a quien revisa a buscar el sostén donde no está, y es lo único de
+   * la salida de C2 que se puede contrastar contra algo — el fragmento y la localización son
+   * texto, y del texto solo se mide si aparece.
+   */
+  it('una cita del insight no puede señalar evidencia que no es del reto', async () => {
+    await enWorkspaceLimpio('c2-evidencia-ajena', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const propia = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La del reto',
+        resumen: 'Un dato del reto.',
+      });
+      // Del MISMO workspace, sin arquetipo que la ate a este reto: existe, es del tenant y no
+      // está en el material que el modelo leyó.
+      const [otroReto] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+        select ${wsC}, servicio_ancla_id, 'R-99', 'Otro reto', 'candidato', 'peticion-cliente',
+               ${curadorId}
+        from reto where id = ${retoC} returning id`;
+      const ajena = await evidenciaDelReto(wsC, otroReto!.id as string, curadorId, {
+        titulo: 'La de otro reto',
+        resumen: 'Un dato que no es de este reto.',
+      });
+
+      const conCita = (evidenciaId: string): ContenidoInsight => ({
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId, fragmento: 'Un dato', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones: [],
+        confianzaPropuesta: 'media',
+      });
+
+      // La de su reto entra…
+      const llamada = await conUsuario(curadorId, (tx) => tx`
+        insert into llamada_ai (workspace_id, capacidad, reto_id, modelo, origen_key,
+                                resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId})
+        returning id`);
+      const escribir = (contenido: ContenidoInsight) =>
+        conUsuario(curadorId, (tx) => tx`
+          insert into propuesta_ai
+            (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+             confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id,
+             creado_por)
+          values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido)},
+                  ${tx.json(contenido)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                  'alcance', 'entorno', ${llamada[0]!.id as string}, ${curadorId})
+          returning id`);
+      await expect(escribir(conCita(propia))).resolves.toBeDefined();
+      // …y la ajena no.
+      await expect(escribir(conCita(ajena))).rejects.toThrow(/no es de este reto/);
+
+      // Y una cita SIN `evidenciaId` tampoco pasa por el hueco: sin la bandera aparte del
+      // valor, el `select … into` la habría seleccionado dejando el motivo en null y el `if`
+      // no habría disparado.
+      const sinId = {
+        ...conCita(propia),
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ fragmento: 'Un dato', localizacion: 'resumen' }],
+          },
+        ],
+      } as unknown as ContenidoInsight;
+      await expect(escribir(sinId)).rejects.toThrow(/no es de este reto/);
+    });
+  });
+
+  /**
+   * Las citas de C2 tampoco se corrigen — y esta es la que menos se podía dar por hecha.
+   *
+   * La regla del guard de revisión comparaba `contenido -> 'citas'`, que es donde las guardan
+   * CI, C0 y CT. Las de C2 viven DENTRO de cada afirmación, así que esa comparación daba null
+   * contra null —iguales— y la regla pasaba EN VACÍO: las citas de C2 habrían sido editables
+   * el mismo día que existieron, borrando justo la señal que la corrección no puede tocar.
+   *
+   * Una regla escrita contra una ruta fija del contenido no protege a quien lo guarda en otro
+   * sitio, y no lo dice: pasa.
+   */
+  it('las citas de C2 no se corrigen aunque vivan dentro de las afirmaciones', async () => {
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C2',
+      anclas: { reto_id: retoId },
+    });
+    const original = CONTENIDO_C2(evidenciaDelRetoId);
+    // Cada afirmación lleva al menos una cita: el contrato lo exige y sin ella el esquema
+    // rechazaría la corrección antes de que hablara ninguna regla de citas.
+    const segunda = {
+      texto: 'Segunda afirmación',
+      esHipotesis: true,
+      citas: [
+        {
+          evidenciaId: evidenciaDelRetoId,
+          fragmento: 'la carga del documento',
+          localizacion: 'resumen',
+        },
+      ],
+    };
+
+    // Corregir el TEXTO de una afirmación sí se puede: eso es corregir.
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: {
+          ...original,
+          afirmaciones: [{ ...original.afirmaciones[0]!, texto: 'Reescrito por quien revisa' }],
+        },
+      }),
+    ).resolves.toMatchObject({ estado: 'corregida' });
+
+    // Cambiar el FRAGMENTO de una cita, no.
+    const otra = await nuevaPropuesta(leadId, { capacidad: 'C2', anclas: { reto_id: retoId } });
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId: otra,
+        correccion: {
+          ...original,
+          afirmaciones: [
+            {
+              ...original.afirmaciones[0]!,
+              citas: [
+                {
+                  ...original.afirmaciones[0]!.citas[0]!,
+                  fragmento: 'un fragmento que el modelo no dijo',
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    ).rejects.toThrow(/no se corrigen/i);
+
+    // Y REORDENAR las afirmaciones tampoco: la comparación es posicional a propósito, porque
+    // `afirmacion` tiene único `(insight_id, orden)` y mover una afirmación mueve su sitio en
+    // el objeto que se materializa.
+    const tercera = await nuevaPropuesta(leadId, {
+      capacidad: 'C2',
+      anclas: { reto_id: retoId },
+      contenido: {
+        ...original,
+        afirmaciones: [original.afirmaciones[0]!, segunda],
+      },
+    });
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId: tercera,
+        correccion: {
+          ...original,
+          afirmaciones: [segunda, original.afirmaciones[0]!],
+        },
+      }),
+    ).rejects.toThrow(/no se corrigen/i);
+
+    /*
+     * Y EL SUELO, por separado — con lo que de verdad demuestra y sin pedirle más.
+     *
+     * Los tres casos de arriba entran por `aceptarPropuesta`, así que la que habla es la regla
+     * del SERVICIO. Medido neutralizando cada una por su lado: con `CITAS_DEL_CONTENIDO.C2`
+     * leyendo `contenido.citas` —lista vacía en los dos lados— la comparación del servicio
+     * pasa y rechaza el guard de la base; con el guard mirando `contenido -> 'citas'` rechaza
+     * el servicio. Cada uno tapa al otro, y ninguno de esos casos dice cuál de los dos existe.
+     *
+     * Se escribe DIRECTAMENTE contra la tabla, y con la conexión de administración, que es lo
+     * que este caso puede afirmar de verdad: el ROL DE APLICACIÓN no llega a este guard ni
+     * queriendo —medido: su política de UPDATE exige estado decidido, revisor y fecha, así que
+     * una escritura de solo `contenido` la rechaza la RLS antes—, y una corrección completa
+     * por SQL crudo tropieza antes con el CHECK del objeto materializado. Lo que queda debajo
+     * de todo eso es este trigger, y es quien responde por el seed, los backfills, las
+     * migraciones y cualquier grant futuro que abra la puerta que hoy está cerrada. El guard
+     * de revisión no estorba: para quien no es miembro sale por su pre-chequeo anti-oráculo,
+     * y éste no tiene ninguno, a propósito.
+     */
+    const suelo = await nuevaPropuesta(leadId, { capacidad: 'C2', anclas: { reto_id: retoId } });
+    const admin = sqlAdmin();
+    const conCitaCambiada = {
+      ...original,
+      afirmaciones: [
+        {
+          ...original.afirmaciones[0]!,
+          citas: [{ ...original.afirmaciones[0]!.citas[0]!, fragmento: 'otro fragmento' }],
+        },
+      ],
+    };
+    await expect(
+      admin`update propuesta_ai set contenido = ${admin.json(conCitaCambiada)}
+        where id = ${suelo} and workspace_id = ${ws}`,
+    ).rejects.toThrow(/no se corrigen/i);
+    // Y lo que NO es una cita sí se puede reescribir por ahí: sin esto, un guard que
+    // rechazara toda escritura de `contenido` pasaría este caso sin haber distinguido nada.
+    await expect(
+      admin`update propuesta_ai
+        set contenido = ${admin.json({ ...original, titulo: 'Otro título' })}
+        where id = ${suelo} and workspace_id = ${ws}`,
+    ).resolves.toBeDefined();
+  });
+
+  /**
+   * Un G0 aprobado congela los CRITERIOS, no los insights.
+   *
+   * El guard de revisión cerraba con `if new.reto_id is not null and (congelados or no
+   * admite)`, que era exacto mientras colgar del reto fuera ser C0. Con C2 en el mismo reto
+   * pasaba a prohibir insights por una puerta que no es la suya — y no en el panel, donde
+   * `ELEGIBILIDAD.C2` sí distingue, sino en el INSERT: después de haber pagado la llamada.
+   *
+   * Se mide con las dos mitades, que es lo que demuestra que la puerta cambió de llave y no
+   * simplemente se abrió: en el MISMO reto congelado, C2 entra y C0 sigue rechazada.
+   */
+  it('un reto con sus criterios congelados sigue admitiendo insights, y no criterios', async () => {
+    await enWorkspaceLimpio('c2-g0-congelado', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const evId = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Dato del reto',
+        resumen: 'Un dato del reto.',
+      });
+      /*
+       * El reto firma su contrato de medición, que es lo que congela sus criterios (SYS-22).
+       * El insert directo del registry ya firmado es el atajo que este fichero ya usa —el
+       * camino real pasa por G6—, y el efecto sobre los criterios es el mismo.
+       *
+       * Se congela por aquí y no llevando el reto a `en-medicion` porque ese estado no se
+       * alcanza a mano: `candidato → en-medicion` no es una transición legal y el camino
+       * canónico exige el registry firmado en G6 y el G7 aprobado. La puerta que se está
+       * midiendo es la misma —`reto_criterios_congelados` y `reto_admite_criterios` entran
+       * las dos en la misma condición—, y ésta se monta con una fila.
+       */
+      await admin`insert into metric_registry
+        (workspace_id, reto_id, estado, firmado_por, firmado_en, creado_por)
+        values (${wsC}, ${retoC}, 'firmado', ${curadorId}, now(), ${curadorId})`;
+      expect(
+        (await admin`select reto_criterios_congelados(${retoC}::uuid, ${wsC}::uuid) as x`)[0]!.x,
+      ).toBe(true);
+
+      const generadas = await conProveedor(
+        {
+          ok: true,
+          datos: {
+            insights: [
+              {
+                titulo: 'T',
+                resumen: 'R',
+                afirmaciones: [
+                  {
+                    texto: 'A',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evId, fragmento: 'Un dato', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                contradicciones: [],
+                confianzaPropuesta: 'media',
+              },
+            ],
+          },
+          intentos: [intento({ latenciaMs: 55, uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      expect(generadas.generadas).toBe(1);
+
+      // Y la otra mitad: C0 sobre ESE MISMO reto sigue cerrada. Si la corrección hubiera
+      // quitado la puerta en vez de cambiarle la llave, esto pasaría y nadie lo diría.
+      await expect(
+        generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C0', anclaId: retoC }),
+      ).rejects.toThrow(ErrorAI);
+    });
+  });
+
+  /**
+   * Sin evidencia enlazada no se llama al proveedor, y el mensaje dice DÓNDE se enlaza.
+   *
+   * El contrato de C2 obliga a que cada afirmación cite un fragmento literal. Sin evidencia,
+   * la única salida que lo cumple sale de la formulación del reto —o sea inventada, con
+   * aspecto de fundamentada y pagada—. Es el mismo caso que el item importado solo con su
+   * referencia, y la respuesta es la misma. La negativa se comprueba por el LIBRO: sin ella
+   * aparecería una línea de coste, que es la forma en que esto costaría dinero.
+   */
+  it('un reto sin evidencia enlazada no se ofrece a C2 y su generación se niega', async () => {
+    await enWorkspaceLimpio('c2-sin-evidencia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(panel.candidatas.C2.lista.some((c) => c.id === retoC)).toBe(false);
+      // Y C0, que cuelga del MISMO reto, sí lo ofrece: lo que falta es evidencia, no reto.
+      expect(panel.candidatas.C0.lista.some((c) => c.id === retoC)).toBe(true);
+
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      await conProveedor(
+        {
+          ok: true,
+          datos: { insights: [] },
+          intentos: [intento({ latenciaMs: 10, uso: null })],
+        },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+          ).rejects.toThrow(/ARQUETIPOS/);
+        },
+      );
+      const [tras] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(tras!.n).toBe(antes!.n);
+    });
+  });
+
+  /**
+   * Cada COLUMNA de ancla enumera en la base las capacidades que la declaran — las tres tablas.
+   *
+   * La hermana de «las tres tablas declaran el mismo vocabulario», para el otro eje. Las
+   * restricciones de ancla estaban escritas como equivalencias «una capacidad ⇔ una columna»,
+   * que es exacto mientras cada columna tenga una sola dueña. C2 es la primera que comparte
+   * una —cuelga del reto, igual que C0— y ahí la equivalencia pasa a MENTIR: medido contra la
+   * base, `llamada_ai_check1` rechazaba toda llamada de C2 antes de que existiera este caso.
+   *
+   * Ahora la restricción es por columna y lleva la lista. El modo de fallo que queda es que la
+   * lista se quede corta, y es exactamente el que esta prueba cierra: la lista de la base se
+   * compara contra la que declara la aplicación en `CAPACIDADES[c].ancla.columna`, que es de
+   * donde salen los inserts. Una capacidad nueva que no se añada a su migración enrojece aquí
+   * en vez de descubrirse cuando su primera reserva la rechace.
+   */
+  it('cada columna de ancla enumera en la base las capacidades que la declaran', async () => {
+    const admin = sqlAdmin();
+    const TABLAS = ['reserva_ai', 'llamada_ai', 'propuesta_ai'];
+    // Por nombre exacto, igual que la prueba del vocabulario y por la misma razón: en `LIKE`
+    // el guion bajo casa con cualquier carácter, y un patrón que casa de más en una prueba
+    // que COMPARA conjuntos es lo que la vuelve verde por accidente.
+    const nombres = TABLAS.flatMap((t) => COLUMNAS_DE_ANCLA.map((c) => `${t}_ancla_${c.replace(/_id$/, '')}`));
+    const filas = await admin`
+      select conrelid::regclass::text as tabla, conname, pg_get_constraintdef(oid) as definicion
+      from pg_constraint
+      where contype = 'c' and conname in ${admin(nombres)}`;
+    // Una por tabla y por columna, ni una menos: una migración que BORRE la suya en vez de
+    // rehacerla dejaría el ancla sin sujetar y este caso pasaría sin verlo.
+    expect(filas.map((f) => f.conname as string).sort()).toEqual([...nombres].sort());
+
+    for (const columna of COLUMNAS_DE_ANCLA) {
+      const declaran = CAPACIDADES_ACTIVAS.filter(
+        (c) => CAPACIDADES[c].ancla.columna === columna,
+      ).sort();
+      for (const tabla of TABLAS) {
+        const fila = filas.find((f) => f.conname === `${tabla}_ancla_${columna.replace(/_id$/, '')}`)!;
+        const definicion = fila.definicion as string;
+        // Los literales de la definición, que son texto del catálogo y no de nadie de fuera.
+        // Se cruzan con el vocabulario activo: una capacidad del alcance MVP que la base ya
+        // liste y la aplicación todavía no active no es un defecto, y afirmar sobre ella sería
+        // afirmar lo que esta prueba no puede saber.
+        const enLaBase = [...definicion.matchAll(/'([^']+)'/g)]
+          .map((m) => m[1] as string)
+          .filter((c) => (CAPACIDADES_ACTIVAS as readonly string[]).includes(c))
+          .sort();
+        expect(
+          enLaBase,
+          `${tabla}.${columna}: la base y la aplicación no declaran las mismas capacidades ` +
+            'ancladas ahí — la que falte no puede escribir su fila, y la que sobre puede ' +
+            'colgar de un ancla que no declara',
+        ).toEqual(declaran);
+      }
+    }
+  });
+
+  /**
+   * Y el VOCABULARIO DE DESTINOS, por lo mismo y en el otro extremo del pipeline.
+   *
+   * `propuesta_ai.destino` traía `check (destino in ('evidencia','criterio-exito'))` desde la
+   * migración original. CT no lo rozó —su destino es NULL y un `in (…)` sobre null da null,
+   * que pasa—, así que la enumeración corta llegó viva hasta la primera capacidad que
+   * materializa un objeto nuevo. Medido: sin la corrección, TODA propuesta de C2 la rechazaba
+   * ese CHECK.
+   */
+  it('el vocabulario de destinos de la base cubre lo que declara la aplicación', async () => {
+    const admin = sqlAdmin();
+    const [fila] = await admin`
+      select pg_get_constraintdef(oid) as definicion from pg_constraint
+      where contype = 'c' and conname = 'propuesta_ai_destino_vocabulario'
+        and conrelid = 'propuesta_ai'::regclass`;
+    expect(fila, 'la restricción del vocabulario de destinos no existe').toBeDefined();
+    const enLaBase = [...(fila!.definicion as string).matchAll(/'([^']+)'/g)].map((m) => m[1]);
+    expect(enLaBase.length).toBeGreaterThan(1);
+    const declarados = [
+      ...new Set(
+        CAPACIDADES_ACTIVAS.map((c) => CAPACIDADES[c].destino).filter(
+          (d): d is Destino => d !== null,
+        ),
+      ),
+    ];
+    const desconocidos = declarados.filter((d) => !enLaBase.includes(d));
+    expect(
+      desconocidos,
+      'un destino que la aplicación declara y la base no admite: su primera propuesta lo rechaza',
+    ).toEqual([]);
+
+    // Y la columna del objeto materializado, que enumeraba lo mismo por su lado: «aceptada ⇔
+    // hay objeto» contaba dos columnas y no la tercera, así que una propuesta de C2 aceptada
+    // era imposible. Se comprueba que las TRES estén nombradas, que es lo que faltaba.
+    const [objeto] = await admin`
+      select pg_get_constraintdef(oid) as definicion from pg_constraint
+      where contype = 'c' and conname = 'propuesta_ai_objeto_materializado'
+        and conrelid = 'propuesta_ai'::regclass`;
+    expect(objeto, 'la restricción del objeto materializado no existe').toBeDefined();
+    for (const d of declarados) {
+      expect(
+        objeto!.definicion as string,
+        `el destino «${d}» no entra en la cuenta del objeto materializado: aceptarlo sería imposible`,
+      ).toContain(COLUMNA_DE_DESTINO[d]);
+    }
   });
 });

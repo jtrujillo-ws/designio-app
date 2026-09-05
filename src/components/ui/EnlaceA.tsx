@@ -31,6 +31,8 @@ type PropsDeEnlace = {
   'aria-label'?: string;
   title?: string;
   onMouseEnter?: () => void;
+  /** Se ejecuta además de la navegación del propio Link (que no se impide). */
+  onClick?: () => void;
 };
 
 /** El `Link` que corresponde a un destino, con el mismo reparto que `navegarA`. */

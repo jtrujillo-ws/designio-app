@@ -243,6 +243,13 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
                       role="option"
                       aria-selected={i === activo}
                       onMouseEnter={() => setActivo(i)}
+                      // El enlace navega solo; esto cierra y suelta el campo también cuando el
+                      // destino es esta misma ruta (/app), donde el Buscador sigue montado y,
+                      // sin esto, la lista se quedaba abierta con el texto puesto.
+                      onClick={() => {
+                        cerrar();
+                        input.current?.blur();
+                      }}
                       title={`Abrir ${pantalla}`}
                       style={{
                         ...opcion,

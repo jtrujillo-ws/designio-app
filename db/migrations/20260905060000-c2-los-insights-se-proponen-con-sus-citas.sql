@@ -807,3 +807,44 @@ revoke execute on function propuesta_ai_c2_citas_guard() from public;
 create trigger a_propuesta_ai_c2_citas
   before insert or update of contenido on propuesta_ai
   for each row execute function propuesta_ai_c2_citas_guard();
+
+-- ── La EXCLUSIÓN por ancla también era «una capacidad por columna» ──
+--
+-- Los índices que impiden dos trabajos a la vez sobre el mismo objeto están por COLUMNA:
+--
+--   unique (workspace_id, reto_id) where reto_id is not null   -- reserva_ai
+--
+-- Con una capacidad por columna eso decía «no se paga dos veces por el mismo objeto», que es
+-- lo que se quería. Con C2 colgando del mismo reto que C0 pasa a decir otra cosa: que pedir
+-- insights y pedir criterios sobre el mismo reto son el MISMO trabajo y no pueden convivir.
+-- Medido: con una generación de C0 en vuelo, la reserva de C2 muere en este índice; y con un
+-- criterio de C0 esperando revisión, la admisión de C2 la rechaza con el mensaje de C2 («ese
+-- reto ya tiene insights propuestos»), que además es falso.
+--
+-- Son pipelines independientes: lo que C0 tenga pendiente no dice nada sobre si C2 puede
+-- proponer. La exclusión pasa a ser por (capacidad, ancla), que es la unidad de trabajo real.
+--
+-- Se hace en las TRES columnas y no solo en el reto, aunque item y gate tengan hoy una sola
+-- capacidad cada uno: la trampa no es del reto, es de escribir la exclusión por columna, y
+-- dejar dos así es dejarla puesta para la próxima capacidad que ancle ahí.
+drop index reserva_ai_item_idx;
+drop index reserva_ai_reto_idx;
+drop index reserva_ai_gate_idx;
+create unique index reserva_ai_item_idx on reserva_ai (workspace_id, capacidad, item_id)
+  where item_id is not null;
+create unique index reserva_ai_reto_idx on reserva_ai (workspace_id, capacidad, reto_id)
+  where reto_id is not null;
+create unique index reserva_ai_gate_idx on reserva_ai (workspace_id, capacidad, gate_id)
+  where gate_id is not null;
+
+-- Y lo mismo con «un ancla no admite otra propuesta mientras la suya espera revisión». No hay
+-- índice de reto —C0 es un lote, y un lote son varias filas pendientes del mismo reto—, así
+-- que ahí la regla vive en la admisión; los de item y gate se reescriben por lo dicho arriba.
+drop index propuesta_ai_item_pendiente_idx;
+drop index propuesta_ai_gate_pendiente_idx;
+create unique index propuesta_ai_item_pendiente_idx
+  on propuesta_ai (workspace_id, capacidad, item_id)
+  where item_id is not null and estado = 'propuesta';
+create unique index propuesta_ai_gate_pendiente_idx
+  on propuesta_ai (workspace_id, capacidad, gate_id)
+  where gate_id is not null and estado = 'propuesta';

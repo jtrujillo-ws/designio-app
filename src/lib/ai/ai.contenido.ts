@@ -191,7 +191,25 @@ export const ContenidoInsightSchema = z
           /* Al menos UNA: una afirmación sin cita es una opinión, y este pipeline no las
            * propone. El techo existe por lo mismo que el del lote: seis citas ya son más de
            * lo que alguien contrasta de una sentada. */
-          citas: z.array(CitaDeAfirmacionSchema).min(1).max(6),
+          citas: z
+            .array(CitaDeAfirmacionSchema)
+            .min(1)
+            .max(6)
+            /*
+             * Y SIN REPETIR. Una cita idéntica dos veces no añade sostén —es el mismo
+             * fragmento del mismo documento— y sí rompe una garantía: el guard de
+             * materialización comprueba que cada cita propuesta exista entre las
+             * materializadas, y con duplicados el conteo cuadra mientras las dos entradas
+             * repetidas encuentran la misma fila. Queda un hueco para colar una cita que
+             * nadie revisó. Comparar multiconjuntos en SQL lo cerraría también; rechazar el
+             * duplicado lo cierra antes y dice por qué.
+             */
+            .refine(
+              (xs) =>
+                new Set(xs.map((c) => `${c.evidenciaId}\u0000${c.fragmento}\u0000${c.localizacion}`))
+                  .size === xs.length,
+              'una afirmación no repite la misma cita: no añade sostén y deja sin comprobar lo que se materializa',
+            ),
         }),
       )
       .min(1)

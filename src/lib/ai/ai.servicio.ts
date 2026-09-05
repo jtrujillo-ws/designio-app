@@ -668,13 +668,20 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
       ),
     pajarDeLaCita: (f, cita) => {
       const evidencia = (f.reto_evidencia as EvidenciaDelReto | null) ?? [];
-      const suya = evidencia.find((e) => e.id === cita.alcanceId);
-      if (!suya) return null;
-      // SOLO ese documento. Componerlo con `materialDeInsights` seguía metiendo delante la
-      // ficha del reto y su descripción, así que una cita que decía «esto está en la evidencia
-      // B» y en realidad copiaba la FORMULACIÓN DEL RETO salía presente contra cualquiera de
-      // ellas — el mismo falso verde que este arreglo venía a quitar, una capa más adentro.
-      return materialDeUnaEvidencia(suya);
+      if (cita.alcanceId === undefined) return null;
+      // SOLO ese documento, y el trozo de él que SOBREVIVIÓ al recorte del cuerpo entero. Las
+      // dos mitades importan y las dos costaron una ronda: componerlo con `materialDeInsights`
+      // metía delante la formulación del reto, y recomponer la línea aparte reiniciaba el
+      // presupuesto de caracteres y devolvía texto que el modelo nunca vio.
+      return materialDeUnaEvidencia(
+        {
+          codigo: (f.reto_codigo as string | null) ?? '',
+          titulo: (f.reto_titulo as string | null) ?? '',
+          descripcion: (f.reto_descripcion as string | null) ?? '',
+          evidencia,
+        },
+        cita.alcanceId,
+      );
     },
     /*
      * Retos CON EVIDENCIA y sin insights esperando revisión. Lo primero no es un filtro de
@@ -1159,15 +1166,22 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       where workspace_id = ${entrada.workspaceId}
         and creado_en <= now() - reserva_ai_ventana()`;
 
-    // Exclusión por ANCLA, no solo por item: dos curadores no pueden tener a la vez una
-    // generación en vuelo sobre el mismo objeto. Para C0 esto faltaba —la reserva no
-    // guardaba el reto, así que no excluía nada— y dos lotes podían despacharse a la vez
-    // sobre el mismo reto: se pagaba dos veces y quedaban dos lotes pendientes sobre un
-    // ancla que la pantalla ofrece una sola vez. Los dos caminos toman el MISMO candado
-    // (el del presupuesto del workspace) antes de mirar, que es lo que hace que mirar sirva.
+    // Exclusión por (CAPACIDAD, ANCLA): dos curadores no pueden tener a la vez una generación
+    // en vuelo sobre el mismo trabajo. Para C0 esto faltaba —la reserva no guardaba el reto,
+    // así que no excluía nada— y dos lotes podían despacharse a la vez sobre el mismo reto: se
+    // pagaba dos veces y quedaban dos lotes pendientes sobre un ancla que la pantalla ofrece
+    // una sola vez. Los dos caminos toman el MISMO candado (el del presupuesto del workspace)
+    // antes de mirar, que es lo que hace que mirar sirva.
+    //
+    // Y la capacidad entra en la clave desde que dos de ellas comparten el reto: sin ella, una
+    // generación de C0 en vuelo impedía pedir insights del mismo reto —y al revés—, que es
+    // decir que pedir criterios y pedir insights son el mismo trabajo. No lo son: son
+    // pipelines independientes con sus propias puertas, y la cola del panel ya los ofrece por
+    // separado. La misma corrección va en los índices que lo imponen.
     const ancla = CAPACIDADES[entrada.capacidad].ancla;
     const [enCurso] = await tx`select 1 as hay from reserva_ai
-      where workspace_id = ${entrada.workspaceId} and ${tx(ancla.columna)} = ${entrada.anclaId}`;
+      where workspace_id = ${entrada.workspaceId} and capacidad = ${entrada.capacidad}
+        and ${tx(ancla.columna)} = ${entrada.anclaId}`;
     if (enCurso) throw new ErrorAI(ancla.enCurso);
 
     // «Este ancla ya tiene trabajo esperando revisión» se pregunta AQUÍ, bajo el mismo
@@ -1181,7 +1195,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     // donde se decide.
     const [pendiente] = await tx`select 1 as hay from propuesta_ai
       where ${tx(ancla.columna)} = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-        and estado = 'propuesta' limit 1`;
+        and capacidad = ${entrada.capacidad} and estado = 'propuesta' limit 1`;
     if (pendiente) throw new ErrorAI(ancla.pendiente);
 
     const { atendidas, reservadas, limiteDiario, ultimaCaidaHaceMs } = await presupuestoDeHoy(

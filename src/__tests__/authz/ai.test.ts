@@ -19,6 +19,7 @@ import {
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { parsearContenido } from '@/lib/ai/ai.contenido';
+import { MAX_MATERIAL } from '@/lib/ai/ai.prompts';
 import {
   aceptarPropuesta,
   ErrorAI,
@@ -6500,6 +6501,168 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             where id = ${prop!.id as string} and workspace_id = ${wsC}`;
         }),
       ).rejects.toThrow(/contradicciones del insight materializado/);
+    });
+  });
+
+  /**
+   * C0 y C2 cuelgan del mismo reto y NO se estorban.
+   *
+   * La exclusión «un ancla no admite dos trabajos a la vez» estaba escrita por COLUMNA —en la
+   * admisión y en el índice único de `reserva_ai`—, y con una capacidad por columna decía lo
+   * que se quería. Con las dos en el reto pasa a decir que pedir criterios y pedir insights
+   * son el mismo trabajo: medido, un criterio de C0 esperando revisión hacía que la admisión
+   * de C2 lo rechazara con el mensaje de C2 («ese reto ya tiene insights propuestos»), que
+   * además es falso.
+   *
+   * Las dos mitades: con la propuesta de C0 pendiente, C2 entra; y una segunda de C2 sobre el
+   * mismo reto sigue rechazada, que es la regla que sí hay que conservar.
+   */
+  it('un criterio de C0 pendiente no impide proponer insights del mismo reto', async () => {
+    await enWorkspaceLimpio('c2-junto-a-c0', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const admin = sqlAdmin();
+      // Un criterio de C0 esperando revisión sobre ESE reto, por el camino de la base.
+      const [l0] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C0', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      await conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+        values (${wsC}, 'C0', 'criterio-exito', ${retoC}, ${tx.json(CONTENIDO_C0)},
+                ${tx.json(CONTENIDO_C0)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance', 'entorno', ${l0!.id as string}, ${curadorId})`);
+
+      const contenido: ContenidoInsight = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId: ev, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones: [],
+        confianzaPropuesta: 'media',
+      };
+      const generadas = await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      expect(generadas.generadas).toBe(1);
+
+      // Y la regla que sí vale: con SU propia propuesta pendiente, C2 no vuelve a entrar.
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+          ).rejects.toThrow(/insights/i);
+        },
+      );
+    });
+  });
+
+  /**
+   * Una afirmación no repite la misma cita.
+   *
+   * No añade sostén —es el mismo fragmento del mismo documento— y rompe una garantía: el guard
+   * de materialización comprueba que cada cita propuesta exista entre las materializadas, y
+   * con duplicados el conteo cuadra mientras las dos entradas repetidas encuentran la misma
+   * fila. Queda sitio para colar una cita que nadie revisó.
+   */
+  it('un insight con la misma cita repetida no llega a nacer', async () => {
+    await enWorkspaceLimpio('c2-cita-repetida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const cita = { evidenciaId: ev, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' };
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            insights: [
+              {
+                titulo: 'T',
+                resumen: 'R',
+                afirmaciones: [{ texto: 'A', esHipotesis: false, citas: [cita, { ...cita }] }],
+                contradicciones: [],
+                confianzaPropuesta: 'media',
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+          ).rejects.toThrow(/no cumplió el esquema/);
+        },
+      );
+    });
+  });
+
+  /**
+   * Lo que el RECORTE se llevó no cuenta como presente.
+   *
+   * El cuerpo del material se trunca ENTERO a `MAX_MATERIAL`, así que de una evidencia puede
+   * haber llegado al modelo un trozo, o nada. La primera versión del pajar por evidencia
+   * recomponía la línea del documento aparte, y eso reinicia el presupuesto desde cero: un
+   * fragmento de la parte cortada —texto que el modelo NUNCA VIO— salía en verde, que es
+   * exactamente lo contrario de lo que la presencia literal existe para decir.
+   *
+   * Se monta una evidencia larga que agota el presupuesto y una segunda que queda entera
+   * fuera. Las dos mitades: lo que sí llegó sale presente, y lo que se cortó no.
+   */
+  it('un fragmento que el recorte dejó fuera del prompt no sale como presente', async () => {
+    await enWorkspaceLimpio('c2-recorte', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const COLA = 'esta frase queda al final del documento largo';
+      const primera = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'AAA documento largo',
+        resumen: `${'x'.repeat(MAX_MATERIAL)} ${COLA}`,
+      });
+      const segunda = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'BBB documento que no cabe',
+        resumen: 'este documento entero queda fuera del recorte',
+      });
+
+      const contenido: ContenidoInsight = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [
+              // Del principio de la primera: sí llegó.
+              { evidenciaId: primera, fragmento: 'xxxxxxxxxx', localizacion: 'resumen' },
+              // Del final de la primera: el recorte se lo llevó.
+              { evidenciaId: primera, fragmento: COLA, localizacion: 'resumen' },
+              // Y la segunda no llegó en absoluto.
+              {
+                evidenciaId: segunda,
+                fragmento: 'este documento entero queda fuera',
+                localizacion: 'resumen',
+              },
+            ],
+          },
+        ],
+        contradicciones: [],
+        confianzaPropuesta: 'media',
+      };
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      expect(p.citas.map((c) => c.presenteLiteral)).toEqual([true, false, false]);
     });
   });
 });

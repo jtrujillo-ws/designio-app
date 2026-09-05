@@ -205,44 +205,75 @@ export function materialDeGate(gate: {
  */
 export type EvidenciaDelReto = { id: string; titulo: string; resumen: string }[];
 
-export function materialDeInsights(reto: {
+type RetoConEvidencia = {
   codigo: string;
   titulo: string;
   descripcion: string;
   evidencia: EvidenciaDelReto;
-}): MaterialDelimitado {
+};
+
+export function materialDeInsights(reto: RetoConEvidencia): MaterialDelimitado {
   return bloqueConFicha(
     [
       ['Código del reto', reto.codigo],
       ['Título del reto', reto.titulo],
     ],
-    [reto.descripcion, '', 'EVIDENCIA DEL RETO', ...reto.evidencia.map(lineaDeEvidencia)].join(
-      '\n',
-    ),
+    cuerpoDeInsights(reto).texto,
   );
 }
 
-/** Cómo aparece UNA evidencia dentro del cuerpo. Su id delante, que es lo que cada cita tiene
- * que copiar para poder contrastarse contra el documento correcto. */
-function lineaDeEvidencia(e: EvidenciaDelReto[number]): string {
-  return `[${e.id}] ${e.titulo}\n${e.resumen}`;
+/**
+ * El cuerpo del material de C2 y DÓNDE queda cada evidencia dentro de él.
+ *
+ * Los tramos existen porque el pajar de una cita es el documento que nombra, y ese documento
+ * hay que sacarlo de AQUÍ y no volver a componerlo aparte: el cuerpo se recorta ENTERO a
+ * `MAX_MATERIAL`, así que una evidencia puede haber llegado al modelo a medias, o no haber
+ * llegado. Recomponerla por su cuenta reinicia el presupuesto desde cero y devuelve un texto
+ * que el modelo nunca vio — con el que un fragmento inventado saldría PRESENTE.
+ */
+function cuerpoDeInsights(reto: RetoConEvidencia): {
+  texto: string;
+  tramos: Map<string, [number, number]>;
+} {
+  const partes = [reto.descripcion, '', 'EVIDENCIA DEL RETO'];
+  const tramos = new Map<string, [number, number]>();
+  let largo = partes.join('\n').length;
+  for (const e of reto.evidencia) {
+    const linea = `[${e.id}] ${e.titulo}\n${e.resumen}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramos.set(e.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
+  }
+  return { texto: partes.join('\n'), tramos };
 }
 
 /**
  * El texto de UNA evidencia tal como el modelo lo vio, para medir contra él las citas que la
  * nombran — y SOLO él.
  *
- * No sirve reutilizar `materialDeInsights` con una sola evidencia: ese material lleva delante
- * la ficha del reto y su descripción, así que una cita que dice «esto está en la evidencia B»
- * y en realidad copia la FORMULACIÓN DEL RETO salía presente contra cualquier evidencia. El
- * pajar de una cita es el documento que nombra, y nada más.
+ * Dos cosas que parecen detalles y son el caso entero:
  *
- * Pasa por la misma neutralización que el bloque entero: si no, un documento que contenga el
- * delimitador produciría «no aparece» sobre citas que sí son literales de lo que el modelo
- * leyó — que es el defecto que `materialQueVeElModelo` existe para no tener.
+ * 1. NO es `materialDeInsights` con una sola evidencia. Ese material lleva delante la ficha
+ *    del reto y su descripción, así que una cita que dice «esto está en la evidencia B» y en
+ *    realidad copia la FORMULACIÓN DEL RETO salía presente contra cualquier evidencia.
+ * 2. NO es la línea de la evidencia recompuesta aparte. El cuerpo se recorta entero a
+ *    `MAX_MATERIAL`, así que lo que llegó al modelo de un documento puede ser un trozo, o
+ *    nada; recomponerlo suelto reinicia el presupuesto desde cero y devuelve texto que el
+ *    modelo NUNCA VIO, con el que un fragmento de la parte cortada saldría presente. Se
+ *    recorta el cuerpo completo y se toma el tramo que sobrevivió.
+ *
+ * `''` cuando el recorte se la comió entera: correcto, y es lo mismo que «no aparece» — una
+ * cita a un documento que el modelo no llegó a leer no la sostiene nada.
  */
-export function materialDeUnaEvidencia(e: EvidenciaDelReto[number]): string {
-  return materialQueVeElModelo(lineaDeEvidencia(e));
+export function materialDeUnaEvidencia(reto: RetoConEvidencia, evidenciaId: string): string {
+  const { texto, tramos } = cuerpoDeInsights(reto);
+  const tramo = tramos.get(evidenciaId);
+  if (!tramo) return '';
+  // Se recorta ANTES de cortar el tramo, y en ese orden: `materialQueVeElModelo` trunca a
+  // `MAX_MATERIAL` y después neutraliza el delimitador sustituyendo un carácter por otro, así
+  // que las posiciones del cuerpo original siguen valiendo sobre el resultado.
+  return materialQueVeElModelo(texto).slice(tramo[0], tramo[1]);
 }
 
 const REGLAS_COMUNES = [

@@ -1217,6 +1217,22 @@ async function sellarWorkspacesIndicados(cliente: typeof sql): Promise<string[]>
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
       throw new Error(`SEED_SELLAR_WORKSPACES: «${id}» no es un uuid`);
     }
+    /*
+     * ¿Ya está sellado ESTE id? Se pregunta PRIMERO, y por el id — antes que nada sobre su
+     * nombre. La variable se queda puesta entre despliegues (el runbook dice que se puede
+     * quitar, no que haya que hacerlo), y el nombre de un workspace NO es estable: la
+     * disposición acordada lo reescribe a «Workspace borrado por acuerdo». Validando el nombre
+     * primero, el despliegue siguiente a una disposición rechazaba un id que ya estaba
+     * sellado, el seed salía con error y —con `set -e` en el entrypoint— la aplicación no
+     * arrancaba. Un sello que ya existe no necesita que nada se compruebe: no hay nada que
+     * escribir.
+     */
+    const [yaEsteId] = await cliente`select clave from sembrado_registro
+      where workspace_id = ${id} and clave like 'workspace:%'`;
+    if (yaEsteId) {
+      dichos.push(`${NOMBRE_POR_CLAVE[yaEsteId.clave as string] ?? (yaEsteId.clave as string)}: ya sellado`);
+      continue;
+    }
     const [ws] = await cliente`select nombre from workspace where id = ${id}`;
     if (!ws) throw new Error(`SEED_SELLAR_WORKSPACES: no existe el workspace ${id}`);
     const nombre = ws.nombre as string;
@@ -1227,19 +1243,37 @@ async function sellarWorkspacesIndicados(cliente: typeof sql): Promise<string[]>
       );
     }
     const yaSellado = await workspaceSellado(cliente, clave);
-    if (yaSellado && yaSellado !== id) {
+    if (yaSellado) {
       throw new Error(
         `SEED_SELLAR_WORKSPACES: «${nombre}» ya está sellado y apunta a ${yaSellado}; sellar ${id} encima cambiaría de tenant en silencio`,
       );
-    }
-    if (yaSellado === id) {
-      dichos.push(`${nombre}: ya sellado`);
-      continue;
     }
     await cliente`insert into sembrado_registro (workspace_id, clave, payload)
       values (${id}, ${clave}, ${cliente.json({ nombre, origen: 'SEED_SELLAR_WORKSPACES' })})
       on conflict (workspace_id, clave) do nothing`;
     dichos.push(`${nombre}: sellado`);
+  }
+
+  /*
+   * Y al terminar, los DOS tienen que estar sellados. Con un solo uuid en la variable —o con
+   * un valor inútil como «,», que parsea a cero ids— esto salía «bien» habiendo sellado uno o
+   * ninguno, y `sembrarAdminPropio` concedía sobre lo que hubiera: una instalación a medias con
+   * aspecto de completa, mientras el runbook promete las dos membresías.
+   *
+   * Se comprueba el ESTADO FINAL y no cuántos ids se listaron, que es lo que hace correcta la
+   * segunda pasada: si uno ya estaba sellado de antes, basta con nombrar el que falta.
+   */
+  const sinSellar: string[] = [];
+  for (const [clave, nombre] of Object.entries(NOMBRE_POR_CLAVE)) {
+    if (!(await workspaceSellado(cliente, clave))) sinSellar.push(nombre);
+  }
+  if (sinSellar.length > 0) {
+    throw new Error(
+      `SEED_SELLAR_WORKSPACES: al terminar siguen sin sellar ${sinSellar.join(' y ')}. ` +
+        'La variable tiene que traer los ids de LOS DOS workspaces demo (los que ya estuvieran ' +
+        'sellados no hace falta repetirlos); sellar solo uno dejaría la cuenta con la mitad de ' +
+        'las membresías que el runbook promete.',
+    );
   }
   return dichos;
 }

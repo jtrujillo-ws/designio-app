@@ -100,8 +100,6 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'gate-decidido':
     'Ese gate ya se decidió: este informe describe un estado que ya pasó. Puedes leerlo, pero lo que dice que falta ya no aplica.',
-  'journey-congelado':
-    'Ese journey ya tiene un snapshot congelado: su grafo es lo aprobado y estas remediaciones ya no se pueden aplicar sobre él. Puedes leerlas, pero apuntan a un grafo que dejó de editarse.',
   'checklist-avanzado':
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
@@ -931,25 +929,76 @@ function FormularioConsentimiento({
  */
 const PRESENTACION_POR_CAPACIDAD: Record<
   CapacidadActiva,
-  { rotulo: string; ficha: (contenido: ContenidoPropuesta) => ReactNode }
+  {
+    rotulo: string;
+    ficha: (contenido: ContenidoPropuesta) => ReactNode;
+    /**
+     * Qué se le dice a quien lee un informe que NO materializa nada, y por qué está aquí y no
+     * escrito una vez junto al botón que falta.
+     *
+     * Estaba allí, y hablaba de «el gate» porque CT era la única capacidad informativa. Con la
+     * segunda, un informe de journey se explicaba con las palabras de un gate y mandaba a
+     * quien lo lee a buscar un rol que ahí no pinta nada. Es el mismo error que ya se corrigió
+     * un piso más abajo —indexar por destino lo que varía por capacidad—, y su forma de fallar
+     * es la misma: no falta ninguna entrada que el compilador eche de menos.
+     *
+     * `null` en las que sí materializan: ahí este texto no se pinta nunca.
+     */
+    sinAccion: string | null;
+  }
 > = {
   CI: {
     rotulo: 'Evidencia propuesta',
     ficha: (c) => <FichaExtraccion contenido={c as ContenidoExtraccion} />,
+    sinAccion: null,
   },
   C0: {
     rotulo: 'Criterio de éxito propuesto',
     ficha: (c) => <FichaCriterio contenido={c as ContenidoCriterio} />,
+    sinAccion: null,
   },
   CT: {
     rotulo: 'Informe de gate (no se aprueba desde aquí)',
     ficha: (c) => <FichaAsistenteGate contenido={c as ContenidoAsistenteGate} />,
+    sinAccion:
+      'Este informe no crea nada y no se aprueba: se lee y se descarta. Quien decide sobre ' +
+      'el gate es la persona con el rol que le corresponde, desde el método.',
   },
   C5: {
     rotulo: 'Remediación del grafo (no se aplica desde aquí)',
     ficha: (c) => <FichaRemediacionJourney contenido={c as ContenidoRemediacionJourney} />,
+    sinAccion:
+      'Este informe no cambia el grafo y no se aprueba: se lee y se descarta. Las ' +
+      'remediaciones las aplica una persona editando el journey.',
   },
 };
+
+/**
+ * Lo que se pinta cuando la propuesta viene de una capacidad que esta versión de la pantalla
+ * NO conoce.
+ *
+ * No es defensa por si acaso: `propuesta.capacidad` es `CapacidadAI` —las diez de SPEC-08— y
+ * el registro solo cubre las ACTIVAS, así que la indexación puede devolver `undefined` de
+ * verdad. Pasa en cuanto el catálogo va por delante de la pantalla: una fila escrita por una
+ * versión más nueva del servidor, o una capacidad que vuelve a apagarse dejando sus propuestas
+ * pendientes. Sin esto, leer `presentacion.rotulo` tiraba la tarjeta entera y con ella el
+ * panel — y lo que se pierde no es una tarjeta bonita, es la única acción que esa fila admite:
+ * poder descartarla.
+ *
+ * Así que se degrada a lo que siempre es cierto: se nombra la capacidad, se dice que esta
+ * pantalla no sabe presentarla, y queda «Rechazar» — que para un informe es «leído y
+ * descartado» y es lo que cierra la fila.
+ */
+const PRESENTACION_DESCONOCIDA = (capacidad: string) => ({
+  rotulo: `Propuesta de la capacidad ${capacidad}`,
+  ficha: () => (
+    <span style={{ font: '400 12.5px/1.6 var(--font-sans)', color: 'var(--text-muted)' }}>
+      Esta pantalla no sabe presentar el contenido de esta capacidad. Puedes descartarla; para
+      leerla, actualiza la aplicación.
+    </span>
+  ),
+  sinAccion: null as string | null,
+});
 
 /**
  * Y lo que solo tiene sentido si la propuesta MATERIALIZA algo, por DESTINO — que es quien
@@ -1041,7 +1090,9 @@ function TarjetaPropuesta({
 }) {
   const [corrigiendo, setCorrigiendo] = useState(false);
   const [ocupado, setOcupado] = useState(false);
-  const presentacion = PRESENTACION_POR_CAPACIDAD[propuesta.capacidad as CapacidadActiva];
+  const presentacion =
+    PRESENTACION_POR_CAPACIDAD[propuesta.capacidad as CapacidadActiva] ??
+    PRESENTACION_DESCONOCIDA(propuesta.capacidad);
   const materializacion = propuesta.destino === null ? null : MATERIALIZACION[propuesta.destino];
   const anclaDisponible = propuesta.anclaEstado === 'disponible';
   // La otra precondición que la base impone SIEMPRE y que no es del ancla, sino del contenido.
@@ -1197,15 +1248,16 @@ function TarjetaPropuesta({
         </span>
       )}
       {/* Una propuesta que no materializa nada se DICE, en vez de dejar dos botones ausentes
-          que parezcan un permiso que falta. Quien lee un informe de gate tiene que saber que
-          no le falta un rol: es que ahí no hay nada que aprobar (RF-08.4), y el gate lo
-          aprueba una persona con el suyo desde el método (SYS-18). */}
-      {propuesta.estado === 'propuesta' && puedeRevisar && materializacion === null && (
-        <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
-          Este informe no crea nada y no se aprueba: se lee y se descarta. Quien decide sobre
-          el gate es la persona con el rol que le corresponde, desde el método.
-        </span>
-      )}
+          que parezcan un permiso que falta: quien la lee tiene que saber que no le falta un
+          rol, es que ahí no hay nada que aprobar (RF-08.4) y lo hace una persona desde el
+          método (SYS-18). CON LAS PALABRAS DE SU CAPACIDAD, que las de un gate no describen un
+          journey. */}
+      {propuesta.estado === 'propuesta' && puedeRevisar && materializacion === null &&
+        presentacion.sinAccion && (
+          <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
+            {presentacion.sinAccion}
+          </span>
+        )}
       {propuesta.estado === 'propuesta' && puedeRevisar && !corrigiendo && (
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
           {/* Los dos botones de aceptación los pinta la MATERIALIZACIÓN, no una bandera:

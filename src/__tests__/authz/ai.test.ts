@@ -33,6 +33,7 @@ import {
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
+  MAX_REMEDIACIONES,
   type AnclaCapacidad,
   type CapacidadActiva,
   type Destino,
@@ -5373,42 +5374,58 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
-   * Un journey CONGELADO mientras la llamada estaba en vuelo no admite la remediación.
+   * Un journey cuyas señales SE CIERRAN mientras la llamada está en vuelo no admite el informe.
    *
-   * `REVALIDAR.C5` lo comprueba antes de despachar, y entre esa transacción y la que persiste
-   * cabe el snapshot. Sin el corte nacía una remediación sobre un grafo que ya no se edita
-   * —o sea inaplicable— ocupando además el hueco del journey por el índice parcial. Es el
-   * mismo suelo que CT pone para el gate decidido.
+   * Aquí este caso probaba otra cosa: que un SNAPSHOT tomado a mitad de la generación cerrara
+   * el journey. Estaba mal planteado de raíz —lo inmutable es la foto, no el grafo (RF-05.8),
+   * y su propia migración lo dice—, así que probaba un corte que no debía existir. Lo tiene su
+   * caso propio ahora, del otro lado: con snapshot, C5 sigue disponible.
+   *
+   * Lo que SÍ deja obsoleto un informe es que alguien cierre las señales por su cuenta, que
+   * además es el desenlace bueno. `REVALIDAR.C5` lo comprueba antes de despachar; entre esa
+   * transacción y la que persiste cabe la edición, y ahí es donde se para. Es el mismo suelo
+   * que CT pone para el gate decidido, con el predicado que le toca a esta capacidad.
    */
-  it('un journey congelado mientras se generaba no admite la remediación', async () => {
-    // En el workspace COMPARTIDO: los fixtures de propuesta escriben la llamada contra él, y
-    // aquí no se llama al proveedor —se escribe la fila directamente—, así que el tope diario
-    // no entra en juego.
-    const j = await nuevoJourney({ ws, actorId: leadId, servicioId: svcId, retoId });
-    const senales = await conUsuario(leadId, async (tx) => {
-      const grafo = await leerJourneyCompleto(tx, ws, j.journeyId);
-      return validarJourney(grafo!);
+  it('un journey cuyas señales se cerraron mientras se generaba no admite el informe', async () => {
+    await enWorkspaceLimpio('c5-senales-cerradas', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(0);
+      const admin = sqlAdmin();
+
+      proveedor.duranteLlamada = async () => {
+        // Alguien arregla el grafo a mano: se borran los pasos y con ellos sus señales. Es lo
+        // que C5 quería conseguir, solo que sin C5 y mientras C5 estaba en vuelo.
+        await admin`delete from journey_arista where journey_id = ${j.journeyId}`;
+        await admin`delete from journey_nodo where journey_id = ${j.journeyId}`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C5',
+                anclaId: j.journeyId,
+              }),
+            ).rejects.toThrow(/cambió mientras se generaba/);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
+      expect(quedan[0]!.n).toBe(0);
     });
-    expect(senales.length).toBeGreaterThan(0);
-    await sqlAdmin()`insert into journey_snapshot
-      (workspace_id, journey_id, motivo, grafo, congelado_por)
-      values (${ws}, ${j.journeyId}, 'G3 aprobado', '{}'::jsonb, ${leadId})`;
-    await expect(
-      nuevaPropuesta(leadId, {
-        capacidad: 'C5',
-        anclas: { journey_id: j.journeyId },
-        contenido: {
-          resumen: 'Informe sobre un grafo ya congelado.',
-          remediaciones: senales.slice(0, 1).map((x) => ({
-            nodoId: x.nodoId,
-            codigo: x.codigo,
-            comoCerrarlo: 'Encadena el paso',
-          })),
-          citas: [{ fragmento: 'Recibir documento', localizacion: 'nodos del grafo' }],
-          confianzaPropuesta: 'media',
-        },
-      }),
-    ).rejects.toThrow(/ya está congelado/);
   });
 
   /**
@@ -5688,5 +5705,271 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         contenido: g.contenido,
       }),
     ).rejects.toThrow(/ya se decidió/);
+  });
+
+  /** Las señales que la validación produce sobre un journey, pedidas a la MISMA función que
+   * las produce en producción. Se usa para armar informes completos sin copiar el catálogo. */
+  async function senalesDe(
+    actorId: string,
+    wsId: string,
+    journeyId: string,
+  ): Promise<{ nodoId: string; codigo: string }[]> {
+    return conUsuario(actorId, async (tx) => {
+      const g = await leerJourneyCompleto(tx, wsId, journeyId);
+      return validarJourney(g!).map((x) => ({ nodoId: x.nodoId, codigo: x.codigo }));
+    });
+  }
+
+  /** Un informe COMPLETO: una remediación por cada señal abierta, que es lo que el contrato
+   * pide. Se deriva de las señales reales, nunca de una lista escrita a mano. */
+  function informeCompleto(
+    senales: { nodoId: string; codigo: string }[],
+  ): ContenidoRemediacionJourney {
+    return {
+      resumen: 'Cómo cerrar lo que la validación señala.',
+      remediaciones: senales.map((s) => ({
+        nodoId: s.nodoId,
+        codigo: s.codigo as ContenidoRemediacionJourney['remediaciones'][number]['codigo'],
+        comoCerrarlo: 'Encadénalo con el paso siguiente de su fase.',
+      })),
+      citas: [{ fragmento: 'Recibir documento', localizacion: 'nodos del grafo' }],
+      confianzaPropuesta: 'alta',
+    };
+  }
+
+  /**
+   * Un journey con SNAPSHOT sigue admitiendo remediación, y eso es lo que RF-05.8 dice.
+   *
+   * Aquí había un corte por snapshot —en la cola, en el estado del ancla, en `PREPARAR` y en
+   * `REVALIDAR`— con el argumento de que «un snapshot fija el grafo aprobado». Es un error de
+   * lectura, y su migración lo dice con todas las letras: «el journey de trabajo sigue
+   * editable para el ciclo siguiente», «el grafo de trabajo no se cierra nunca; lo que queda
+   * fijo es cada snapshot». Lo inmutable es la FOTO, no el modelo.
+   *
+   * El efecto era permanente y silencioso: en cuanto un journey pasaba su primera design
+   * version, desaparecía de C5 para siempre — justo el que más ciclos lleva y más señales
+   * acumula. Y no habría fallado nunca: la cola simplemente no lo ofrecía.
+   */
+  it('un journey con snapshot sigue ofreciéndose a C5: lo inmutable es la foto, no el grafo', async () => {
+    await enWorkspaceLimpio('c5-con-snapshot', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      await admin`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${wsC}, ${j.journeyId}, 'design version aprobada', '{}'::jsonb, ${curadorId})`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(
+        panel.candidatas.C5.lista.some((c) => c.id === j.journeyId),
+        'el journey con snapshot desapareció de la cola de C5',
+      ).toBe(true);
+
+      // Y la generación tampoco lo rechaza: el camino entero sigue abierto.
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(0);
+      const generadas = await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+      expect(generadas.generadas).toBe(1);
+    });
+  });
+
+  /**
+   * Y un journey LIMPIO no se ofrece, que es lo que su rótulo prometía.
+   *
+   * El selector dice «Journey con señales abiertas» y su cola vacía dice «no hay journeys con
+   * señales de validación abiertas», pero no filtraba por señales: ofrecía cualquiera y
+   * `PREPARAR.C5` lo rechazaba después. Una opción que no puede llevar a ninguna parte, con un
+   * rótulo que decía lo contrario. El coste de filtrarlo es leer los grafos del prefiltro, y
+   * está acotado; el de no filtrarlo lo paga quien pulsa.
+   */
+  it('la cola de C5 solo ofrece journeys con señales abiertas, como dice su rótulo', async () => {
+    await enWorkspaceLimpio('c5-cola-honesta', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const sucio = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const limpio = await nuevoJourney({ ...ctx, actorId: curadorId }, { limpio: true });
+      // El fixture tiene que cumplir lo que promete, y se le pregunta a la función.
+      expect(await senalesDe(curadorId, wsC, limpio.journeyId)).toEqual([]);
+      expect((await senalesDe(curadorId, wsC, sucio.journeyId)).length).toBeGreaterThan(0);
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const cola = panel.candidatas.C5.lista.map((c) => c.id);
+      expect(cola).toContain(sucio.journeyId);
+      expect(cola, 'un journey sin señales se ofrece y luego se rechaza').not.toContain(
+        limpio.journeyId,
+      );
+    });
+  });
+
+  /**
+   * Un informe que deja señales SIN remediar se descarta entero.
+   *
+   * La comprobación miraba que ninguna remediación fuera inventada, y eso deja pasar tres
+   * cosas distintas que se pagan igual: la lista vacía, la que se salta señales y la que
+   * repite una con dos consejos. La segunda es la peor de leer, porque no parece rota: quien
+   * la lee cree que el grafo tiene menos averías de las que tiene, y el informe se ve
+   * completo. El contrato pide una por señal, así que se comprueba la igualdad.
+   */
+  it('un informe que no cubre todas las señales se descarta, y se dice cuántas faltan', async () => {
+    await enWorkspaceLimpio('c5-informe-corto', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(1);
+
+      // Le falta la última: el informe se ve entero y no lo está.
+      const corto = informeCompleto(senales.slice(0, -1));
+      await conProveedor(
+        {
+          ok: true,
+          datos: corto as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+          ).rejects.toThrow(/sin remediar/);
+        },
+      );
+
+      // Y el que REPITE una señal también: dos consejos para la misma avería es una
+      // contradicción sin criterio para elegir.
+      const repetido = informeCompleto([...senales, senales[0]!]);
+      await conProveedor(
+        {
+          ok: true,
+          datos: repetido as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+          ).rejects.toThrow(/dos remediaciones para la misma señal/);
+        },
+      );
+
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
+      expect(quedan[0]!.n).toBe(0);
+    });
+  });
+
+  /**
+   * Y un informe sobre un grafo que YA NO ES EL QUE VIO el modelo se descarta también.
+   *
+   * La llamada al proveedor ocurre fuera de toda transacción —a propósito—, así que entre
+   * armar el prompt y escribir la fila cabe la edición de otro curador. Comparar la respuesta
+   * solo contra una lectura NUEVA del grafo no basta: mientras las señales sobrevivan al
+   * cambio, el consejo se acepta aunque hable de nodos que ya no están.
+   *
+   * Se comprueba en el hueco real: `duranteLlamada` es el instante en que el material está en
+   * vuelo, con la línea del libro ya abierta. Y se comprueba que la llamada SÍ se pagó y que
+   * la propuesta NO nació — el informe se descarta, que es lo correcto, y el gasto queda
+   * anotado, que es lo honesto.
+   */
+  it('un informe sobre un grafo que cambió mientras se generaba se descarta', async () => {
+    await enWorkspaceLimpio('c5-grafo-cambiado', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+
+      proveedor.duranteLlamada = async () => {
+        // Otro curador añade un paso suelto: aparece una señal nueva y el informe en vuelo
+        // deja de describir este grafo. El id del paso no hace falta: lo que cambia es el
+        // conjunto de señales.
+        await admin`insert into journey_nodo
+          (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+          values (${wsC}, ${j.journeyId}, 'paso', 'Paso añadido a mitad', '', 9, 'Front',
+                  ${curadorId})`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C5',
+                anclaId: j.journeyId,
+              }),
+            ).rejects.toThrow(/cambió mientras se generaba/);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
+      expect(quedan[0]!.n).toBe(0);
+      // La llamada se despachó y su línea quedó: el gasto ocurrido se anota aunque su salida
+      // se tire. Registrar lo que se pagó no puede depender de que el resultado nos guste.
+      const [despues] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(despues!.n).toBeGreaterThan(antes!.n);
+    });
+  });
+
+  /**
+   * Un grafo con MÁS señales de las que el informe puede llevar no se manda al proveedor.
+   *
+   * El contrato admite `MAX_REMEDIACIONES`, así que a un grafo con más se le estaría pidiendo
+   * algo que su respuesta no puede contener: o vuelve corta —y la comprobación de arriba la
+   * descarta, después de pagarla— o el propio modelo elige qué señales callar, que es peor
+   * porque no se nota. Se dice antes de gastar, con lo que hay que hacer.
+   *
+   * Se comprueba por el LIBRO, no solo por el mensaje: negarse después de pagar sería el mismo
+   * defecto con mejor cara.
+   */
+  it('un journey con más señales de las que caben en un informe no llega al proveedor', async () => {
+    await enWorkspaceLimpio('c5-demasiadas-senales', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      // Pasos sueltos: cada uno trae sus señales (sin entrada, sin salida, sin evidencia).
+      // Se añaden hasta pasar el techo, y el número se comprueba con la función, no se supone.
+      for (let i = 0; i < MAX_REMEDIACIONES; i++) {
+        await admin`insert into journey_nodo
+          (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+          values (${wsC}, ${j.journeyId}, 'paso', ${`Paso suelto ${i}`}, '', ${100 + i}, 'Front',
+                  ${curadorId})`;
+      }
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(MAX_REMEDIACIONES);
+
+      // No se ofrece…
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(panel.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(false);
+
+      // …y forzarlo tampoco gasta.
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      await conProveedor(
+        { ok: true, datos: {}, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+          ).rejects.toThrow(/cierra las más claras a mano/);
+        },
+      );
+      const [despues] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(despues!.n, 'se abrió una línea en el libro: hubo despacho').toBe(antes!.n);
+    });
   });
 });

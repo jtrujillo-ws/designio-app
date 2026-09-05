@@ -1,7 +1,11 @@
 import { z } from 'zod';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
-import { CONFIANZA_PROPUESTA, type CapacidadActiva } from './ai.schemas';
+import {
+  CONFIANZA_PROPUESTA,
+  MAX_REMEDIACIONES,
+  type CapacidadActiva,
+} from './ai.schemas';
 
 /**
  * La marca con la que `check:bundle` sabe si estos validadores llegaron al navegador.
@@ -184,7 +188,19 @@ export const ContenidoRemediacionJourneySchema = z
           comoCerrarlo: z.string().trim().min(1).max(1000),
         }),
       )
-      .max(20),
+      /*
+       * Al menos UNA, y como mucho `MAX_REMEDIACIONES`. El mínimo no estaba y hacía falta: un
+       * informe de cero remediaciones sobre un grafo CON señales es una llamada pagada que no
+       * dice nada, y el servicio ya se niega a pedir uno sobre un grafo limpio — así que la
+       * lista vacía no describe ningún caso legítimo.
+       *
+       * El techo lleva nombre porque lo leen los dos lados de la misma regla: éste y la
+       * negativa a generar cuando el grafo tiene más señales de las que este contrato puede
+       * llevar. Con el número en un solo sitio no puede haber un grafo que se acepte para
+       * pedir y cuya respuesta se descarte DESPUÉS de pagarla por venir corta.
+       */
+      .min(1)
+      .max(MAX_REMEDIACIONES),
     citas: CitasSchema,
     confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
   })

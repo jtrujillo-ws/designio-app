@@ -475,8 +475,17 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     ],
   };
 
-  const VERSION_ANOTADA = 'ai-2026-09-05.3';
-  const HUELLA_ANOTADA = 'ed54cf375cfc10663ce79fa856b0aaaa342b32093510babdea60cdf9ed9b055a';
+  /*
+   * La `.4` la lleva C2 en su rama, así que C5 pasa de la `.3` a la `.5` en vez de reusarla.
+   * La versión es una ETIQUETA opaca que se guarda en el lineage, no un contador: saltar un
+   * número no cuesta nada y compartirlo sí — dos contratos distintos con la misma etiqueta
+   * son dos poblaciones que ya no se pueden separar, y eso no se deshace después. Y sube
+   * ahora y no se queda en la `.3` aunque esa nunca haya salido de esta rama: el argumento
+   * «todavía no la usa nadie» es exactamente el que hay que no aceptar, porque es cierto
+   * hasta el commit en que deja de serlo.
+   */
+  const VERSION_ANOTADA = 'ai-2026-09-05.5';
+  const HUELLA_ANOTADA = '9983af3f727d3c9b4c694fbb317ea8d11b88264c26c5c023d85297e8ec7cf305';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -716,6 +725,23 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.journeySinSenales.usuario).not.toContain('cerrar cada una');
     expect(RAMAS.journeyTruncado.usuario).toContain('se truncó');
     expect(RAMAS.journeyLlano.usuario).not.toContain('se truncó');
+    /*
+     * Y LAS SEÑALES SOBREVIVEN AL RECORTE, que es lo que hace utilizable un prompt truncado.
+     *
+     * El cuerpo se recorta a `MAX_MATERIAL`, así que lo que se escriba al final es lo primero
+     * que desaparece. Con las señales detrás de todos los nodos y todas las aristas, un grafo
+     * grande las perdía —enteras o a medias— mientras el prompt seguía pidiendo remediar «las
+     * N señales»: el modelo no podía verlas y la única salida posible era inventarlas, que es
+     * justo lo que `COMPROBAR.C5` descarta después de haberlo pagado.
+     *
+     * Que el render CAMBIÓ ya lo dice la huella. Lo que dice este caso es que cambió a lo
+     * correcto, y es lo que hay que releer si alguien reordena el cuerpo otra vez.
+     */
+    expect(RAMAS.journeyTruncado.usuario).toContain('paso-sin-salida');
+    expect(RAMAS.journeyTruncado.usuario).toContain('[b1000000-0000-4000-8000-000000000002]');
+    // Y el recorte se llevó lo que tenía que llevarse: la cola del grafo, de la que el propio
+    // prompt avisa. Sin esta mitad, poner las señales delante y NO truncar nada pasaría igual.
+    expect(RAMAS.journeyTruncado.usuario).not.toContain(CUERPO_LARGO);
     expect(RAMAS.journeyFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.journeyConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
 

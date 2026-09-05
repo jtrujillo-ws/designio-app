@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.3';
+export const PROMPT_VERSION = 'ai-2026-09-05.5';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -224,7 +224,21 @@ export function materialDeJourney(journey: {
   grafo: GrafoDelJourney;
 }): MaterialDelimitado {
   const { nodos, aristas, senales } = journey.grafo;
+  /*
+   * Las SEÑALES van primero, y no por estilo: `bloqueConFicha` recorta el cuerpo a
+   * `MAX_MATERIAL`, así que lo que se escriba al final es lo primero que desaparece. Con las
+   * señales detrás de todos los nodos y todas las aristas, un grafo grande las perdía —enteras
+   * o a medias— mientras el prompt seguía pidiendo remediar «las N señales»: el modelo no
+   * podía verlas y la única salida posible era inventarlas.
+   *
+   * Puestas delante, lo que se pierde por el recorte es la cola del grafo, y de eso el prompt
+   * ya avisa («no afirmes nada sobre los nodos que no ves»). Es la ordenación correcta por lo
+   * mismo que las señales son la tarea: lo que no se puede recortar es el enunciado.
+   */
   const cuerpo = [
+    'SEÑALES DE LA VALIDACIÓN (ya calculadas: no busques otras)',
+    ...senales.map((s) => `[${s.codigo}] severidad ${s.severidad} · nodo [${s.nodoId}]\n${s.mensaje}`),
+    '',
     'NODOS',
     ...nodos.map(
       (n) =>
@@ -235,9 +249,6 @@ export function materialDeJourney(journey: {
     ...aristas.map(
       (a) => `${a.origen} --${a.tipo}${a.condicion ? ` (${a.condicion})` : ''}--> ${a.destino}`,
     ),
-    '',
-    'SEÑALES DE LA VALIDACIÓN (ya calculadas: no busques otras)',
-    ...senales.map((s) => `[${s.codigo}] severidad ${s.severidad} · nodo [${s.nodoId}]\n${s.mensaje}`),
   ].join('\n');
   return bloqueConFicha(
     [

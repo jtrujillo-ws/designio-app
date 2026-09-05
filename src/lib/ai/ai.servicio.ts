@@ -37,6 +37,7 @@ import {
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
+  MAX_REMEDIACIONES,
   COLUMNA_DE_DESTINO,
   type AnclaCapacidad,
   type CandidatoAncla,
@@ -513,6 +514,17 @@ type CapacidadEnElPanel = {
   ) => Promise<CandidatoAncla[]>;
 };
 
+/**
+ * Cuántos journeys se leen del prefiltro por cada plaza del selector de C5.
+ *
+ * La cola de C5 no se puede resolver entera en SQL —«tiene señales abiertas» es una función
+ * pura del grafo—, así que el SQL trae candidatos baratos y el bucle descarta los limpios. El
+ * factor es la holgura para no quedarse corto cuando varios vienen limpios, y a la vez el
+ * techo del barrido: sin él, un workspace con muchos journeys sanos convertiría cada pintado
+ * del selector en una lectura de todos sus grafos.
+ */
+const FACTOR_DE_HOLGURA_C5 = 4;
+
 const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
   CI: {
     estado: (tx) => tx`case
@@ -671,18 +683,19 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
   },
   C5: {
     /*
-     * Lo que deja obsoleto un informe de remediación es que el grafo se CONGELE: un snapshot
-     * fija el grafo aprobado y lo que el informe propone cambiar deja de poder cambiarse ahí.
-     * Mientras no lo haya, el grafo se edita y las remediaciones siguen siendo accionables
-     * —aunque alguna ya se haya aplicado, que es una lectura que hace la persona, no el
-     * panel—.
+     * NADA en SQL cierra un journey, y ese es el dato. Aquí había un `journey-congelado` para
+     * los que tienen snapshot, y era un error de lectura de RF-05.8: lo inmutable es CADA
+     * SNAPSHOT, no el journey. Su migración lo dice con todas las letras —«el journey de
+     * trabajo sigue editable para el ciclo siguiente», «el grafo de trabajo no se cierra
+     * nunca»—, así que aquel predicado sacaba para siempre de C5 a todo journey que hubiera
+     * pasado una design version: justo los que llevan más ciclos y más señales acumulan.
+     *
+     * Lo que SÍ deja obsoleto un informe es que sus señales dejen de estar abiertas —porque
+     * alguien las cerró, que es el desenlace bueno—, y eso no se puede preguntar en SQL: las
+     * señales son una función pura de los nodos y las aristas. Se comprueba donde se puede
+     * calcular, en `COMPROBAR.C5`, contra las que el modelo tuvo delante.
      */
-    estado: (tx) => tx`case
-        when exists (select 1 from journey_snapshot sn
-          where sn.journey_id = p.journey_id and sn.workspace_id = p.workspace_id)
-          then 'journey-congelado'
-        else 'disponible'
-      end`,
+    estado: (tx) => tx`'disponible'`,
     material: (f) => materialDeJourney({
       nombre: (f.journey_nombre as string | null) ?? '',
       servicio: (f.journey_servicio as string | null) ?? '',
@@ -690,10 +703,19 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
       grafo: grafoParaElModelo(journeyDesdeElPanel(f)),
     }).texto,
     /*
-     * Journeys sin snapshot y sin informe sin leer. No se filtra por «tiene señales»: eso
-     * exigiría evaluar `validarJourney` sobre cada grafo del workspace para pintar un
-     * selector, y además un informe sobre un grafo limpio es un resultado legítimo —el
-     * contrato admite la lista de remediaciones vacía— y saberlo tiene valor.
+     * El selector promete «journeys con señales abiertas», y ahora lo cumple.
+     *
+     * Antes no filtraba por señales —«exigiría evaluar `validarJourney` sobre cada grafo»— y
+     * ofrecía journeys que `PREPARAR.C5` rechazaba a continuación por no tener ninguna: una
+     * opción que no puede llevar a ninguna parte, con un rótulo que decía lo contrario. Lo
+     * señalaron las dos revisiones, y las dos tienen razón: la promesa del rótulo y lo que la
+     * cola devuelve tienen que ser lo mismo, o el rótulo es una decoración.
+     *
+     * El coste es real y por eso está acotado: el SQL hace el prefiltro barato —journeys sin
+     * informe pendiente, por nombre— y solo de ESOS se lee el grafo para validarlo, parando
+     * en cuanto se llenan las `limite` plazas. Se piden con holgura porque una parte se caerá
+     * por venir limpia; el tope duro evita que un workspace con muchos journeys limpios
+     * convierta el selector en un barrido.
      */
     candidatas: async (tx, workspaceId, patron, limite) => {
       const filas = await tx`
@@ -701,15 +723,25 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         from journey jr
         join servicio s on s.id = jr.servicio_id and s.workspace_id = jr.workspace_id
         where jr.workspace_id = ${workspaceId}
-          and not exists (select 1 from journey_snapshot sn
-            where sn.journey_id = jr.id and sn.workspace_id = jr.workspace_id)
           and not exists (select 1 from propuesta_ai p
             where p.journey_id = jr.id and p.workspace_id = jr.workspace_id
               and p.estado = 'propuesta')
           and (${patron}::text is null or jr.nombre ilike ${patron} or s.nombre ilike ${patron})
         order by jr.creado_en desc, jr.id asc
-        limit ${limite}`;
-      return filas.map((j) => ({ id: j.id as string, titulo: j.titulo as string }));
+        limit ${limite * FACTOR_DE_HOLGURA_C5}`;
+      const conSenales: { id: string; titulo: string }[] = [];
+      for (const j of filas) {
+        if (conSenales.length >= limite) break;
+        const journey = await leerJourneyCompleto(tx, workspaceId, j.id as string);
+        if (!journey) continue;
+        const senales = validarJourney(journey);
+        // Y las que NO caben tampoco se ofrecen: pedir un informe que el contrato no puede
+        // llevar es pagar una llamada cuya respuesta se descarta. `PREPARAR.C5` lo dice con
+        // su motivo; aquí simplemente no se ofrece.
+        if (senales.length === 0 || senales.length > MAX_REMEDIACIONES) continue;
+        conSenales.push({ id: j.id as string, titulo: j.titulo as string });
+      }
+      return conSenales;
     },
   },
 };
@@ -1082,6 +1114,8 @@ type Alcance = {
    * libera si la generación no llega a nacer. */
   reservaId: string;
   unidades: number;
+  /** Lo que `PREPARAR` le enseñó al modelo, para que `COMPROBAR` lo mire. Ver `Preparacion`. */
+  visto?: unknown;
 };
 
 /**
@@ -1125,7 +1159,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const consentimiento = exigeConsentimiento
       ? await leerConsentimientoBajoCandado(tx, entrada)
       : null;
-    const { sistema, prompt } = await PREPARAR[entrada.capacidad](tx, entrada);
+    const { sistema, prompt, visto } = await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
       throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
     }
@@ -1212,6 +1246,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       key,
       reservaId: reserva!.id as string,
       unidades,
+      visto,
     };
   });
 }
@@ -1790,16 +1825,22 @@ const REVALIDAR: Record<
     }
   },
   C5: async (tx, entrada) => {
-    // El grafo pudo congelarse mientras se preparaba la llamada. Un snapshot fija lo
-    // aprobado, y lo que el informe propone cambiar deja de poder cambiarse ahí: la
-    // remediación nacería describiendo un grafo que ya no se edita.
-    const [congelado] = await tx`select exists (
-        select 1 from journey_snapshot
-        where journey_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-      ) as si`;
-    if (congelado?.si) {
+    /*
+     * Lo que puede haber pasado mientras se preparaba la llamada es que ALGUIEN CIERRE las
+     * señales — que es el desenlace bueno, y precisamente por eso no hay que pagar por
+     * remediarlas. Un grafo que llega aquí ya sin nada abierto no se despacha.
+     *
+     * Aquí había un corte por SNAPSHOT, y estaba mal leído: lo inmutable es cada snapshot, no
+     * el journey («el grafo de trabajo no se cierra nunca», RF-05.8). Un journey que ha pasado
+     * una design version se sigue editando, y era justo el que más señales acumula.
+     */
+    const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
+    if (!journey) {
+      throw new ErrorAI('Ese journey dejó de existir mientras se preparaba la llamada');
+    }
+    if (validarJourney(journey).length === 0) {
       throw new ErrorAI(
-        'Ese journey se congeló en un snapshot mientras se preparaba la llamada: no se llamó al proveedor',
+        'Las señales de ese journey se cerraron mientras se preparaba la llamada: no había nada que remediar y no se llamó al proveedor',
       );
     }
   },
@@ -1818,7 +1859,24 @@ const REVALIDAR: Record<
  * transacción y los prompts, y el registro lo importa la PANTALLA — meterlo allí arrastraría
  * los prompts al bundle del cliente, que es justo lo que `check:bundle` vigila.
  */
-type Preparacion = { sistema: string; prompt: { usuario: string; alcanceResumen: string } };
+type Preparacion = {
+  sistema: string;
+  prompt: { usuario: string; alcanceResumen: string };
+  /**
+   * Lo que la capacidad le ENSEÑÓ al modelo y quiere volver a mirar cuando toque escribir.
+   *
+   * Va sin tipar por la misma razón que el contenido: lo que hay que recordar cambia con la
+   * capacidad, y el único sitio que sabe qué es —y por tanto el único que puede leerlo— es su
+   * entrada en `COMPROBAR`. Un tipo común aquí sería la unión de todo lo que cualquiera pueda
+   * necesitar, que es otra manera de no decir nada.
+   *
+   * Lo que sostiene, y no es poco: la llamada al proveedor pasa FUERA de toda transacción, así
+   * que entre preparar y persistir el workspace puede haber cambiado. Comparar contra una
+   * lectura nueva dice si algo cambió; comparar contra ESTO dice si el informe habla del
+   * estado que tuvo delante, que es otra pregunta y la que importa.
+   */
+  visto?: unknown;
+};
 const PREPARAR: Record<
   CapacidadActiva,
   (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<Preparacion>
@@ -1940,15 +1998,6 @@ const PREPARAR: Record<
     // lectura, o las señales del prompt y las de la comprobación pueden discrepar.
     const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
     if (!journey) throw new ErrorAI('El journey no existe en este workspace');
-    const [congelado] = await tx`select exists (
-        select 1 from journey_snapshot
-        where journey_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-      ) as si`;
-    if (congelado?.si) {
-      throw new ErrorAI(
-        'Ese journey ya tiene un snapshot congelado: su grafo es lo aprobado y no admite remediación',
-      );
-    }
     const grafo = grafoParaElModelo(journey);
     /*
      * Un grafo SIN señales no se manda al proveedor, y no por ahorrar: la respuesta ya se
@@ -1963,6 +2012,18 @@ const PREPARAR: Record<
         'La validación de ese journey no encontró ninguna señal abierta: no hay nada que remediar. (Eso ya lo dice la validación del grafo, que es exacta; no hace falta preguntárselo a la AI.)',
       );
     }
+    /*
+     * Y por arriba, el techo del contrato. El esquema admite `MAX_REMEDIACIONES`, así que a un
+     * grafo con más señales se le estaría pidiendo algo que su respuesta no puede llevar: o
+     * viene corta —y la comprobación de abajo la descarta, DESPUÉS de pagarla— o viene
+     * recortada por el propio modelo, eligiendo él qué señales callar. Se dice antes de gastar
+     * y se dice qué hacer, que es lo que puede hacer quien lo lee.
+     */
+    if (grafo.senales.length > MAX_REMEDIACIONES) {
+      throw new ErrorAI(
+        `Ese journey tiene ${grafo.senales.length} señales abiertas y un informe puede llevar ${MAX_REMEDIACIONES}: cierra las más claras a mano y vuelve a pedirlo. (La validación las lista todas, y es exacta.)`,
+      );
+    }
     return {
       sistema: SISTEMA_REMEDIACION_JOURNEY,
       prompt: promptRemediacionJourney({
@@ -1971,6 +2032,14 @@ const PREPARAR: Record<
         tipo: journey.tipo,
         grafo,
       }),
+      /*
+       * Lo que el modelo TUVO DELANTE, para volver a mirarlo cuando haya que escribir. Sin
+       * esto, `COMPROBAR` solo podía comparar contra una lectura NUEVA del grafo, y entre las
+       * dos cabe la llamada entera: otro curador edita el journey, la señal que el informe
+       * remedia sigue existiendo por casualidad, y el consejo —que nombra nodos que ya no
+       * están— se acepta como si fuera de este grafo.
+       */
+      visto: { senales: clavesDeSenales(grafo.senales) },
     };
   },
 };
@@ -1991,7 +2060,12 @@ const PREPARAR: Record<
  */
 const COMPROBAR: Record<
   CapacidadActiva,
-  (tx: TransactionSql, entrada: GenerarPropuestas, contenidos: ContenidoPropuesta[]) => Promise<void>
+  (
+    tx: TransactionSql,
+    entrada: GenerarPropuestas,
+    contenidos: ContenidoPropuesta[],
+    visto: unknown,
+  ) => Promise<void>
 > = {
   // El contenido de CI se sujeta entero con su esquema y con los CHECK de `evidencia`: no hay
   // nada que contrastar contra el workspace que no esté ya contrastado.
@@ -1999,33 +2073,69 @@ const COMPROBAR: Record<
   C0: async () => {},
   // Los huecos de CT los comprueba un trigger, que es un suelo más bajo que éste.
   CT: async () => {},
-  C5: async (tx, entrada, contenidos) => {
+  C5: async (tx, entrada, contenidos, visto) => {
     const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
     if (!journey) throw new ErrorAI('El journey dejó de existir mientras se generaba el informe');
-    const reales = new Set(
-      validarJourney(journey).map((x) => `${x.nodoId}\u0000${x.codigo}`),
-    );
-    const inventadas = contenidos
-      .flatMap((c) => (c as ContenidoRemediacionJourney).remediaciones)
-      .filter((r) => !reales.has(`${r.nodoId}\u0000${r.codigo}`));
+    const ahora = clavesDeSenales(validarJourney(journey));
+    const mostradas = (visto as { senales: string[] } | undefined)?.senales ?? [];
+
     /*
-     * Una remediación que señala una señal que la validación NO emitió es una avería
-     * inventada, y de las caras: manda a alguien a arreglar un grafo que estaba bien. Es lo
-     * único que esta capacidad puede falsificar —el resto de su salida es prosa sobre
-     * señales ciertas—, así que es lo único que hay que comprobar, y se comprueba contra la
-     * MISMA función que las produjo.
+     * ── Primero: que el grafo siga siendo EL QUE VIO EL MODELO ──
      *
-     * Se descarta el informe entero y no las remediaciones sobrantes: recortar la salida de
-     * un modelo y guardar el resto deja una propuesta que nadie escribió, con su
-     * `contenido_original` diciendo otra cosa (SYS-17). Media respuesta no es revisable.
+     * La llamada al proveedor ocurre fuera de toda transacción —a propósito: un tercero lento
+     * no retiene una conexión—, así que entre armar el prompt y escribir la fila cabe la
+     * edición de otro curador. Comparar solo contra una lectura nueva no bastaba: si la señal
+     * que el informe remedia sobrevive al cambio, el consejo se acepta aunque nombre nodos que
+     * ya no existen. Se compara contra las señales que el modelo TUVO DELANTE, que es lo único
+     * que hace de ese informe un informe sobre ESTE grafo.
+     *
+     * Y se descarta ENTERO, no la parte afectada: media respuesta no es revisable.
      */
+    if (ahora.join('\n') !== mostradas.join('\n')) {
+      throw new ErrorAI(
+        'El grafo de ese journey cambió mientras se generaba el informe: lo que dice ya no describe el grafo que hay, así que se descarta. Vuelve a pedirlo.',
+      );
+    }
+
+    /*
+     * ── Y después: UNA remediación por señal, ni de más ni de menos ──
+     *
+     * El prompt pide cómo cerrar CADA señal, así que el informe completo es el que las cubre
+     * todas exactamente una vez. Comprobar solo que ninguna sea inventada dejaba pasar tres
+     * cosas distintas, y las tres se pagan igual: la lista vacía, la que se salta señales
+     * —quien la lee cree que el grafo tiene menos averías de las que tiene— y la que repite
+     * una señal con dos consejos, que es una contradicción sin criterio para resolverla.
+     *
+     * Una señal inventada sigue siendo lo más grave —manda a alguien a arreglar un grafo que
+     * estaba bien— y se nombra aparte, porque el motivo cambia lo que hay que hacer.
+     */
+    const propuestas = clavesDeSenales(
+      contenidos.flatMap((c) => (c as ContenidoRemediacionJourney).remediaciones),
+    );
+    const reales = new Set(ahora);
+    const inventadas = propuestas.filter((c) => !reales.has(c));
     if (inventadas.length > 0) {
       throw new ErrorAI(
         `El informe señala ${inventadas.length} señal(es) que la validación de este journey no emitió: se descarta. Si el grafo cambió mientras se generaba, vuelve a pedirlo.`,
       );
     }
+    if (propuestas.join('\n') !== ahora.join('\n')) {
+      const faltan = reales.size - new Set(propuestas).size;
+      throw new ErrorAI(
+        faltan > 0
+          ? `El informe deja ${faltan} señal(es) sin remediar y el contrato pide una por señal: se descarta, porque leerlo haría creer que el grafo tiene menos averías de las que tiene. Vuelve a pedirlo.`
+          : 'El informe propone dos remediaciones para la misma señal: se descarta, porque no hay criterio para elegir entre ellas. Vuelve a pedirlo.',
+      );
+    }
   },
 };
+
+/** La clave de una señal —su nodo y su código— en orden estable, para poder comparar dos
+ * listas por igualdad. El `\u0000` separa porque no puede aparecer en un uuid ni en un
+ * código: concatenar sin separador dejaría pares distintos con la misma clave. */
+function clavesDeSenales(xs: { nodoId: string; codigo: string }[]): string[] {
+  return xs.map((x) => `${x.nodoId}\u0000${x.codigo}`).sort();
+}
 
 /**
  * Genera propuestas para un ancla (RF-08.1). Nada del dominio cambia aquí: solo nacen
@@ -2124,7 +2234,7 @@ async function persistirPropuestas(
      * se escribe. Va delante del candado del presupuesto porque no lo necesita y porque
      * fallar aquí no debe tener a nadie esperando.
      */
-    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos);
+    await COMPROBAR[entrada.capacidad](tx, entrada, contenidos, alcance.visto);
     await bloquearPresupuesto(tx, entrada.workspaceId);
 
     // Retirar la reserva ya no «devuelve» presupuesto: desde que el tope cuenta llamadas

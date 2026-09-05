@@ -122,6 +122,17 @@ export const CONFIANZA_PROPUESTA_NUMERICA: Record<(typeof CONFIANZA_PROPUESTA)[n
 export const MAX_CRITERIOS_POR_LOTE = 4;
 
 /**
+ * Cuántas remediaciones puede llevar UN informe de C5 — que es lo mismo que decir cuántas
+ * señales abiertas admite un journey para poder pedirlo.
+ *
+ * Está aquí y no solo dentro del esquema de Zod porque lo leen los DOS lados de la misma
+ * regla: el contrato de la salida y la negativa a generar cuando el grafo trae más señales de
+ * las que ese contrato puede llevar. Con el número escrito en un solo sitio no puede haber un
+ * grafo que se acepte para pedir y cuya respuesta se descarte por larga después de pagarla.
+ */
+export const MAX_REMEDIACIONES = 20;
+
+/**
  * El ANCLA de una capacidad: el objeto del que cuelga su alcance de contexto, y todo lo que
  * hay que decir sobre él.
  *
@@ -466,7 +477,6 @@ export const ESTADOS_ANCLA = [
   'registry-firmado',
   'reto-no-admite',
   'gate-decidido',
-  'journey-congelado',
   'checklist-avanzado',
   'ancla-ausente',
 ] as const;

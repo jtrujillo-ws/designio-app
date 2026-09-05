@@ -80,21 +80,21 @@ grant insert (journey_id) on propuesta_ai to designio_app;
 -- compara `COLUMNAS_DE_ANCLA` contra el texto de todos los guards de la tabla: sin esto sale
 -- roja nombrando «journey_id», y así es como se descubrió este hueco.
 --
--- Y el grafo tiene que seguir EDITABLE al escribir. `REVALIDAR.C5` lo comprueba antes de
--- despachar, y entre esa transacción y ésta cabe el snapshot: sin el corte nacía una
--- remediación sobre un grafo ya congelado —que no se puede aplicar— ocupando además el hueco
--- del journey por el índice parcial.
+-- Lo que este guard NO comprueba, y por qué: si el grafo sigue siendo el que vio el modelo.
+-- Aquí hubo un corte por SNAPSHOT, con el argumento de que un snapshot congela el grafo, y era
+-- un error de lectura: `…100000-journey.sql` dice que lo inmutable es CADA SNAPSHOT y que «el
+-- grafo de trabajo no se cierra nunca» (RF-05.8). Con aquel corte, un journey que hubiera
+-- pasado una design version no admitía remediaciones nunca más — justo el que más ciclos lleva.
+--
+-- Y lo que de verdad hay que comprobar tampoco se puede comprobar aquí: que las señales del
+-- informe sigan siendo las del grafo. Las señales son una FUNCIÓN PURA de nodos y aristas, no
+-- una tabla, y no hay SQL que las recalcule. Vive en `COMPROBAR.C5`, dentro de la misma
+-- transacción que escribe, comparando contra las que el modelo tuvo delante.
 create or replace function propuesta_ai_c5_linaje_guard() returns trigger
 language plpgsql as $$
 begin
   if new.capacidad <> 'C5' then
     return new;
-  end if;
-  if exists (
-    select 1 from journey_snapshot sn
-    where sn.journey_id = new.journey_id and sn.workspace_id = new.workspace_id
-  ) then
-    raise exception 'ese journey ya está congelado en un snapshot: no admite remediaciones nuevas';
   end if;
   if not exists (
     select 1 from llamada_ai l

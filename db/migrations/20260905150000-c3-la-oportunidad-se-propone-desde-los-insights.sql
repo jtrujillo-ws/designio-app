@@ -1107,6 +1107,26 @@ begin
        where not (v.id = any (new.alcance_insights))) then
       raise exception 'ese reto tiene insights validados que estas oportunidades no llegaron a ver: se validaron después de generarlas, así que la propuesta quedó obsoleta y solo puede rechazarse. Vuelve a pedirla para que los tenga en cuenta';
     end if;
+    -- Y EL OTRO SENTIDO: lo citado tiene que caber DENTRO del alcance.
+    --
+    -- La comprobación de arriba dice «no falta ninguno», y esa mitad sola no afirma nada sobre
+    -- lo que la propuesta cita. La política de `oportunidad_insight` admite cualquier insight
+    -- VALIDADO DEL WORKSPACE —no del reto—, así que por la superficie concedida se podía citar
+    -- uno ajeno, enlazarlo, entregar un `alcance_insights` completo (lo es: contiene todos los
+    -- del reto) y sellar. Medido: sellaba. La HMW quedaba atribuida a material que el modelo
+    -- nunca recibió, con la traza y el alcance diciendo cada uno una verdad distinta.
+    --
+    -- Se mira la CITA y no la traza porque la cita es el original: la traza se deriva de ella
+    -- —eso lo comprueba el bloque de «la traza es la cita»— así que acotar aquí acota las dos,
+    -- y hacerlo al revés dejaría el orden de las comprobaciones decidiendo qué se protege.
+    --
+    -- `lower`, igual que en el resto de este guard: un uuid en mayúscula es el MISMO uuid y la
+    -- superficie SQL no pasa por el parser, que es quien lo normaliza.
+    if exists (
+      select 1 from jsonb_array_elements(new.contenido -> 'citas') as c(cita)
+      where not (lower(c.cita ->> 'insightId')::uuid = any (new.alcance_insights))) then
+      raise exception 'esa oportunidad cita insights que no entraron en el material que se le mandó al modelo: una HMW solo puede apoyarse en lo que leyó, y el alcance sellado dice qué fue (SYS-19)';
+    end if;
   end if;
   -- Y las CONTRADICCIONES, que son parte del insight y no un adorno.
   --

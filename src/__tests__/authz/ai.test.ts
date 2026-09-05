@@ -11879,6 +11879,67 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
 
   /**
+   * Y lo CITADO tiene que caber dentro del alcance sellado.
+   *
+   * El alcance se comprobaba en un solo sentido —que estuvieran TODOS los validados del reto—
+   * y esa mitad sola no dice nada de lo que la propuesta cita. La política de
+   * `oportunidad_insight` admite cualquier insight VALIDADO DEL WORKSPACE, no del reto, así
+   * que por la superficie concedida se podía citar uno ajeno, enlazarlo, entregar un
+   * `alcance_insights` completo —lo es: contiene todos los del reto— y sellar. La HMW quedaba
+   * atribuida a material que el modelo nunca recibió, con la traza y el alcance diciendo cada
+   * uno una verdad distinta.
+   *
+   * El caso se monta con un insight validado que no cuelga de NINGÚN reto —sin afirmación ni
+   * cita, `insights_validados_del_reto` no lo devuelve para ninguno—, que es la forma más
+   * limpia de «ajeno» y la que la política sí deja enlazar.
+   */
+  it('C3: una HMW no puede citar un insight que no entró en su alcance', async () => {
+    const admin = sqlAdmin();
+    const [aj] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'Un insight de otro sitio', 'No cuelga de ningún reto.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const ajenoId = aj!.id as string;
+    const contenido = CONTENIDO_C3(ajenoId);
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C3',
+      anclas: { reto_id: retoId },
+      contenido,
+    });
+    try {
+      // El alcance que se guardó es COMPLETO —tiene todos los validados del reto—, así que la
+      // comprobación de «no falta ninguno» pasa: lo único que puede parar esto es la otra
+      // mitad.
+      const [p] = await admin`select alcance_insights from propuesta_ai where id = ${propuestaId}`;
+      expect(p!.alcance_insights as string[]).toContain(insightValidadoDelRetoId);
+      expect(p!.alcance_insights as string[]).not.toContain(ajenoId);
+
+      await expect(
+        conUsuario(leadId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${contenido.pregunta}, ${contenido.prioridad},
+                    ${contenido.prioridadRazon}, ${leadId})
+            returning id`;
+          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+            values (${ws}, ${o!.id as string}, ${ajenoId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        }),
+      ).rejects.toThrow(/cita insights que no entraron en el material/);
+    } finally {
+      await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
+      await admin`delete from propuesta_ai where id = ${propuestaId}`;
+      await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+      await admin`delete from oportunidad where workspace_id = ${ws}`;
+      await admin`delete from insight where id = ${ajenoId}`;
+    }
+  });
+
+  /**
    * Y la entrada que salió de una propuesta SIGUE pudiendo quitarse del borrador.
    *
    * `entrada_kpi` es el primero de los cuatro destinos cuyo objeto tiene un camino de BORRADO

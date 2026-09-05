@@ -5790,6 +5790,112 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * está acotado; el de no filtrarlo lo paga quien pulsa.
    */
   /**
+   * La huella es del MATERIAL, no del grafo crudo: lo que el modelo no vio no la mueve.
+   *
+   * En cuanto el cuerpo se recorta, las dos cosas dejan de ser la misma. Con la huella sobre
+   * el grafo, un journey grande cuya conectividad cabe pero cuyas etiquetas de cola no
+   * cambiaba de huella al editar la etiqueta de un nodo que el modelo NUNCA vio: el prompt era
+   * idéntico byte a byte, la respuesta pagada se descartaba igual, y un informe ya escrito se
+   * marcaba «journey cambiado» por una edición que no le afectaba.
+   *
+   * Va por el camino REAL —se genera el informe y se lee el panel—, porque medir el texto del
+   * material solo probaría la premisa: lo que hay que sujetar es que la huella salga de él.
+   *
+   * El relleno son `emocion` DENTRO de la fase del fixture, no pasos: aportan bulto sin emitir
+   * ni una señal —no son transitables, no exigen responsable, y con fase no quedan huérfanos—,
+   * así que el techo de `MAX_REMEDIACIONES` no se toca y el caso mide lo que dice medir.
+   */
+  it('editar un nodo que el recorte dejó fuera no marca el informe como obsoleto', async () => {
+    await enWorkspaceLimpio('c5-huella-del-material', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      const relleno: string[] = [];
+      for (let i = 0; i < 40; i++) {
+        const [n] = await admin`insert into journey_nodo
+          (workspace_id, journey_id, tipo, etiqueta, detalle, fase_id, orden, responsable,
+           creado_por)
+          values (${wsC}, ${j.journeyId}, 'emocion',
+                  ${`Emoción de relleno ${i} — ${'texto largo de relleno '.repeat(30)}`}, '',
+                  ${j.nodos.fase}, ${200 + i}, '', ${curadorId})
+          returning id`;
+        relleno.push(n!.id as string);
+      }
+
+      // El fixture tiene que ser el caso por los dos lados: el cuerpo se recorta, y las
+      // señales siguen siendo las mismas que sin relleno.
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const material = await conUsuario(curadorId, async (tx) => {
+        const g = await leerJourneyCompleto(tx, wsC, j.journeyId);
+        return materialDeJourney({
+          nombre: g!.nombre,
+          servicio: g!.servicioNombre,
+          tipo: g!.tipo,
+          grafo: {
+            nodos: g!.nodos.map((n) => ({
+              id: n.id,
+              tipo: n.tipo,
+              etiqueta: n.etiqueta,
+              fase: '',
+              faseId: n.faseId ?? '',
+              responsable: n.responsable ?? '',
+              evidencias: n.evidencias.length,
+            })),
+            aristas: [],
+            senales: [],
+          },
+        });
+      });
+      expect(material.truncado, 'el cuerpo no llega al techo: el caso no existe').toBe(true);
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+      const recien = await panelPropuestas(curadorId, wsC);
+      expect(recien.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado).toBe('disponible');
+
+      // El ÚLTIMO relleno quedó fuera del recorte: el resto se escribe detrás del núcleo y el
+      // recorte cae a mitad de las emociones, así que la última no llega.
+      const invisible = relleno[relleno.length - 1]!;
+      expect(material.texto).not.toContain(`[${invisible}] emocion ·`);
+      await admin`update journey_nodo set etiqueta = 'Renombrado donde nadie lo ve'
+        where id = ${invisible} and workspace_id = ${wsC}`;
+      const tras = await panelPropuestas(curadorId, wsC);
+      expect(
+        tras.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado,
+        'una edición que el modelo no vio marca el informe como obsoleto',
+      ).toBe('disponible');
+
+      // Y la otra mitad: editar lo que SÍ se ve sí lo marca.
+      await admin`update journey_nodo set etiqueta = 'Comprobar quién eres'
+        where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      const visible = await panelPropuestas(curadorId, wsC);
+      const informe = visible.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(informe.anclaEstado).toBe('journey-cambiado');
+
+      /*
+       * Y UNA HUELLA DE OTRO RENDER NO ES COMPARABLE. Desde que se calcula sobre el material
+       * —el texto ya recortado— un cambio del prompt la mueve sin que el grafo se haya tocado.
+       * Sin mirar `prompt_version`, el día de un despliegue toda propuesta viva de C5 se
+       * marcaría «journey cambiado» a la vez, culpando al grafo de un cambio del renderizador.
+       * No saber no puede volverse una alarma.
+       */
+      await admin`update propuesta_ai set prompt_version = 'ai-de-otro-despliegue'
+        where id = ${informe.id} and workspace_id = ${wsC}`;
+      const otroRender = await panelPropuestas(curadorId, wsC);
+      expect(
+        otroRender.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado,
+        'una huella de otro render se lee como si el grafo hubiera cambiado',
+      ).toBe('disponible');
+    });
+  });
+
+  /**
    * Dos fases con el MISMO NOMBRE no son la misma fase.
    *
    * El grafo que ve el modelo sustituía `faseId` por la ETIQUETA de la fase, y nada impide dos

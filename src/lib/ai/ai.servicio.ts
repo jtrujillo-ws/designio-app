@@ -363,10 +363,28 @@ function motivoConectividadQueNoCabe(caracteres: number): string {
   return `Las señales de ese journey y su grafo de transiciones ocupan ${caracteres} caracteres y al modelo le caben ${MAX_MATERIAL}: tendría que responder sin ver la conectividad que se le pide remediar. Cierra a mano las señales de los tramos más cargados, o parte el journey, y vuelve a pedirlo.`;
 }
 
-function grafoDelPanelEsElDelModelo(f: Record<string, unknown>): boolean | null {
+/**
+ * Si el material que el panel puede recomponer HOY es el que el modelo tuvo delante, según la
+ * huella que la propuesta guardó al nacer.
+ *
+ * `null` cuando NO SE PUEDE SABER, y no se resuelve a ninguno de los dos lados aquí: quien lo
+ * lee decide qué hacer con no saber, y las dos respuestas son distintas. Para el ESTADO de la
+ * fila, no saber no puede volverse «cambiado»: sería inventarse una alarma. Para la presencia
+ * literal, no saber se resuelve como vigente, que es lo que hacían todas las capacidades
+ * cuando ninguna guardaba huella.
+ *
+ * Y son DOS los casos en que no se sabe. El primero es no tener huella: una propuesta anterior
+ * a la columna. El segundo es tenerla de OTRO RENDER: desde que la huella se calcula sobre el
+ * material —el texto ya recortado, no el grafo crudo—, un cambio del prompt la mueve sin que
+ * el grafo se haya tocado, y `prompt_version` es justo el dato que dice si son comparables.
+ * Sin esta segunda mitad, el día de un despliegue toda propuesta viva de C5 se habría marcado
+ * «journey cambiado» a la vez, culpando al grafo de un cambio del renderizador.
+ */
+function materialDelPanelEsElDelModelo(f: Record<string, unknown>): boolean | null {
   const guardada = f.huella_material as string | null;
   if (!guardada) return null;
-  return huellaDelGrafo(grafoParaElModelo(journeyDesdeElPanel(f))) === guardada;
+  if ((f.prompt_version as string | null) !== PROMPT_VERSION) return null;
+  return huellaDelMaterialDeC5(journeyDesdeElPanel(f)) === guardada;
 }
 
 function grafoParaElModelo(journey: JourneyCompleto): GrafoDelJourney {
@@ -837,13 +855,13 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
        * veredicto del CASE. Decir «cambiado» sin poder saberlo sería inventarse una alarma,
        * y decir «al día» sería inventarse una tranquilidad.
        */
-      return grafoDelPanelEsElDelModelo(f) === false ? 'journey-cambiado' : null;
+      return materialDelPanelEsElDelModelo(f) === false ? 'journey-cambiado' : null;
     },
     // La misma comparación, leída para lo otro que depende de ella: sin huella no se sabe, y
     // no saber se resuelve como vigente —es lo que hacían todas las capacidades antes de que
     // ninguna guardara nada—, mientras que no saber NO se resuelve como «cambiado», que sería
     // inventarse una alarma.
-    materialVigente: (f) => grafoDelPanelEsElDelModelo(f) !== false,
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) !== false,
     material: (f) => materialDeJourney({
       nombre: (f.journey_nombre as string | null) ?? '',
       servicio: (f.journey_servicio as string | null) ?? '',
@@ -2087,7 +2105,7 @@ const REVALIDAR: Record<
      * que es el único donde se puede afirmar sobre lo que el modelo YA dijo. Las dos no sobran:
      * entre este chequeo y la escritura sigue pasando la llamada entera.
      */
-    if (huellaDelGrafo(grafoParaElModelo(journey)) !== (huellaMaterial ?? '')) {
+    if (huellaDelMaterialDeC5(journey) !== (huellaMaterial ?? '')) {
       throw new ErrorAI(
         'El grafo de ese journey cambió mientras se preparaba la llamada: lo que se iba a enviar ya no lo describe, así que no se llamó al proveedor. Vuelve a pedirlo.',
       );
@@ -2313,7 +2331,7 @@ const PREPARAR: Record<
        * describe. Lo que hay que fijar es el material, y el material son los nodos, las
        * aristas y las señales juntos.
        */
-      huellaMaterial: huellaDelGrafo(grafo),
+      huellaMaterial: huellaDelMaterialDeC5(journey),
     };
   },
 };
@@ -2368,7 +2386,7 @@ const COMPROBAR: Record<
      *
      * Y se descarta ENTERO, no la parte afectada: media respuesta no es revisable.
      */
-    if (huellaDelGrafo(grafoAhora) !== huellaMostrada) {
+    if (huellaDelMaterialDeC5(journey) !== huellaMostrada) {
       // `ErrorAI` a secas, no de contrato: el proveedor devolvió lo que se le pidió y lo que
       // cambió fue el grafo. Ver `ErrorContratoAI`.
       throw new ErrorAI(
@@ -2410,17 +2428,30 @@ const COMPROBAR: Record<
 };
 
 /**
- * La huella del grafo que se le enseña al modelo: nodos, aristas y señales.
+ * La huella del MATERIAL que se le enseñó al modelo. El texto exacto, no el grafo del que
+ * salió.
  *
- * Se calcula sobre `GrafoDelJourney` —la forma que ve el prompt— y no sobre las filas de la
- * base, porque lo que hay que fijar es el MATERIAL: si dos lecturas producen el mismo
- * material, el informe sigue describiendo lo que se ve; si producen otro, no.
+ * La diferencia empieza a importar en cuanto el cuerpo se recorta. Sobre el grafo crudo, un
+ * journey grande cuya conectividad cabe pero cuyas etiquetas de cola no —el caso normal en
+ * cuanto crece— cambiaba de huella al editar la etiqueta de un nodo que el modelo NUNCA vio:
+ * el prompt era idéntico byte a byte y la respuesta pagada se descartaba igual, y un informe
+ * ya escrito se marcaba «journey cambiado» por una edición que no le afectaba.
  *
- * No hace falta que sea criptográfica —aquí nadie ataca la huella, solo se compara consigo
- * misma dentro de una generación—, pero sale gratis y ahorra razonar sobre colisiones.
+ * Se calcula sobre `materialDeJourney(...).texto`, que es la ficha y el cuerpo YA recortados y
+ * neutralizados: exactamente lo que viajó dentro del delimitador. Es la misma definición que
+ * usa C2 con su material, y por la misma razón.
+ *
+ * No hace falta que sea criptográfica —nadie la ataca, solo se compara consigo misma—, pero
+ * sale gratis y ahorra razonar sobre colisiones.
  */
-function huellaDelGrafo(grafo: GrafoDelJourney): string {
-  return createHash('sha256').update(JSON.stringify(grafo)).digest('hex');
+function huellaDelMaterialDeC5(journey: JourneyCompleto): string {
+  const material = materialDeJourney({
+    nombre: journey.nombre,
+    servicio: journey.servicioNombre,
+    tipo: journey.tipo,
+    grafo: grafoParaElModelo(journey),
+  });
+  return createHash('sha256').update(material.texto).digest('hex');
 }
 
 /** La clave de una señal —su nodo y su código— en orden estable, para poder comparar dos

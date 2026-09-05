@@ -3,6 +3,7 @@ import type { CSSProperties, FormEvent } from 'react';
 import { createFileRoute, useNavigate, useRouter } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
+import { AvisoDeDestacadoAusente, Destacado } from '@/components/ui/Destacado';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
@@ -27,6 +28,10 @@ import {
  * acto ocurre — y donde el bloqueo se explica en lugar de esconderse.
  */
 export const Route = createFileRoute('/_autenticada/evidencia')({
+  // `destacar`: el id de la evidencia a la que se vino (desde el buscador). Solo orienta la
+  // pantalla; el loader no lo mira, la lista sigue siendo la misma.
+  validateSearch: (search: Record<string, unknown>): { destacar?: string } =>
+    typeof search.destacar === 'string' && search.destacar !== '' ? { destacar: search.destacar } : {},
   loaderDeps: ({ search }) => ({ ws: search.ws }),
   loader: ({ context }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
@@ -61,6 +66,7 @@ function PantallaEvidencia() {
   // RLS es la capa 1: aquí solo se evita ofrecer un control que sería rechazado.
   const puedeDecidir = (ROLES_DERECHOS as readonly string[]).includes(rol);
   const [error, setError] = useState<string | null>(null);
+  const { destacar } = Route.useSearch();
   // Páginas siguientes cargadas bajo demanda (el loader trae la primera).
   const [masEvidencias, setMasEvidencias] = useState<EvidenciaConDerechos[]>([]);
   const [hayMasLocal, setHayMasLocal] = useState<boolean | null>(null);
@@ -181,15 +187,19 @@ function PantallaEvidencia() {
                 : `${evidencias.length}${hayMas ? '+' : ''} evidencias · ${evidencias.filter((e) => e.citable).length} citables`}
             </div>
 
+            {destacar !== undefined && !evidencias.some((e) => e.id === destacar) && (
+              <AvisoDeDestacadoAusente que="La evidencia" />
+            )}
             {evidencias.map((ev) => (
-              <TarjetaEvidencia
-                key={ev.id}
-                evidencia={ev}
-                workspaceId={datos.workspaceId}
-                puedeDecidir={puedeDecidir}
-                onCambio={refrescar}
-                onError={setError}
-              />
+              <Destacado key={ev.id} id={ev.id} destacado={ev.id === destacar}>
+                <TarjetaEvidencia
+                  evidencia={ev}
+                  workspaceId={datos.workspaceId}
+                  puedeDecidir={puedeDecidir}
+                  onCambio={refrescar}
+                  onError={setError}
+                />
+              </Destacado>
             ))}
 
             {/* Sin esto la evidencia más antigua no tiene camino: sus derechos no se

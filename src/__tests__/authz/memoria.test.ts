@@ -28,6 +28,7 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
   let arqHipotesis = '';
   let insightValidado = '';
   let decisionVigente = '';
+  let evidenciaA = '';
 
   beforeAll(async () => {
     const admin = sqlAdmin();
@@ -74,12 +75,32 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
       values (${wsA}, ${retoA}, 'Pyme con contador externo', ${userA}) returning id`;
     arqHipotesis = ah!.id as string;
 
-    // Un insight validado (memoria) y uno propuesto (todavía no).
+    // Un insight validado (memoria) y uno propuesto (todavía no). El validado cita una
+    // evidencia CON derechos concedidos: su respaldo está vivo… hasta que un test los
+    // deniega para ver que la biblioteca lo marca.
+    const [fuente] = await admin`insert into fuente (workspace_id, tipo, titulo, creado_por)
+      values (${wsA}, 'nota', 'Fuente memoria', ${userA}) returning id`;
+    const [ev] = await admin`insert into evidencia
+      (workspace_id, fuente_id, titulo, dimensiones, creado_por)
+      values (${wsA}, ${fuente!.id as string}, 'Entrevistas de apertura', '{}'::jsonb, ${userA})
+      returning id`;
+    evidenciaA = ev!.id as string;
+    await admin`insert into derecho_uso
+      (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+      values (${wsA}, ${evidenciaA}, 'concedido', 'cliente', 'Contrato de prueba',
+              ${userA}, now(), ${userA})`;
     const [iv] = await admin`insert into insight
       (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
       values (${wsA}, 'Fricción documental', 'El abandono se concentra al subir documentos',
               'validado', ${userA}, now(), ${userA}) returning id`;
     insightValidado = iv!.id as string;
+    const [af] = await admin`insert into afirmacion (workspace_id, insight_id, orden, texto)
+      values (${wsA}, ${insightValidado}, 1, 'La carga de documentos concentra el abandono')
+      returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${wsA}, ${af!.id as string}, ${evidenciaA}, 'Ocho de diez abandonan al subir',
+              'sesión 3', ${userA})`;
     await admin`insert into insight (workspace_id, titulo, creado_por)
       values (${wsA}, 'Insight propuesto', ${userA})`;
     // Y más validados que el tope, todos MÁS ANTIGUOS que el de arriba: la sección tiene que
@@ -100,6 +121,9 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
       values (${wsA}, ${proyectoA}, ${gateA}, 'diseno', 'Atacar la verificación digital',
               'El insight validado concentra el abandono ahí', ${userA}) returning id`;
     decisionVigente = dv!.id as string;
+    // La decisión se apoya en ese insight: si él pierde el respaldo, ella también.
+    await admin`insert into decision_insight (decision_id, insight_id, workspace_id)
+      values (${decisionVigente}, ${insightValidado}, ${wsA})`;
     await admin`insert into decision
       (workspace_id, proyecto_id, gate_id, tipo, titulo, estado, decidido_por)
       values (${wsA}, ${proyectoA}, ${gateA}, 'alcance', 'Decisión cuestionada', 'en-revision',
@@ -166,11 +190,17 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     if (wss.length > 0) {
       await admin`delete from evento_dominio where workspace_id in ${admin(wss)}`;
       await admin`delete from outcome_review where workspace_id in ${admin(wss)}`;
+      await admin`delete from decision_insight where workspace_id in ${admin(wss)}`;
       await admin`delete from decision where workspace_id in ${admin(wss)}`;
       await admin`delete from gate_instancia where workspace_id in ${admin(wss)}`;
       await admin`delete from arquetipo_segmento where workspace_id in ${admin(wss)}`;
       await admin`delete from arquetipo where workspace_id in ${admin(wss)}`;
+      await admin`delete from cita where workspace_id in ${admin(wss)}`;
+      await admin`delete from afirmacion where workspace_id in ${admin(wss)}`;
       await admin`delete from insight where workspace_id in ${admin(wss)}`;
+      await admin`delete from derecho_uso where workspace_id in ${admin(wss)}`;
+      await admin`delete from evidencia where workspace_id in ${admin(wss)}`;
+      await admin`delete from fuente where workspace_id in ${admin(wss)}`;
       await admin`delete from proyecto where workspace_id in ${admin(wss)}`;
       await admin`delete from reto where workspace_id in ${admin(wss)}`;
       await admin`delete from servicio where workspace_id in ${admin(wss)}`;
@@ -186,7 +216,11 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     const m = await memoriaParaUsuario(userA, wsA);
     expect(m).not.toBeNull();
     expect(m!.workspaceNombre).toBe(marca + '-A');
-    expect(m!.segmentos.map((s) => s.nombre)).toEqual(['independientes', 'pymes']);
+    expect(m!.segmentos.map((s) => [s.nombre, s.totalArquetipos])).toEqual([
+      ['independientes', 1],
+      ['pymes', 1],
+    ]);
+    expect(m!.totales.arquetiposSinSegmento).toBe(1);
 
     // De más reciente a más antiguo: la hipótesis se dio de alta después.
     expect(m!.arquetipos.map((a) => a.id)).toEqual([arqHipotesis, arqConfirmado]);
@@ -211,10 +245,13 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     expect(m!.insights).toHaveLength(TOPE_POR_SECCION);
     expect(m!.insights[0]!.id).toBe(insightValidado);
     expect(m!.insights[0]!.validadoEn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    // Con los derechos concedidos, el respaldo está vivo.
+    expect(m!.insights[0]!.sinRespaldo).toBeNull();
     expect(m!.totales.insights).toBe(TOPE_POR_SECCION + 3);
 
     // Solo la vigente; la que está en revisión, no.
     expect(m!.decisiones.map((d) => d.id)).toEqual([decisionVigente]);
+    expect(m!.decisiones[0]!.sinRespaldo).toBeNull();
     expect(m!.totales.decisiones).toBe(1);
     expect(m!.decisiones[0]!.gateNumero).toBe(1);
     expect(m!.decisiones[0]!.proyecto).toEqual({
@@ -245,6 +282,73 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     // Solo el candidato del post mortem: el pedido por el cliente es pipeline, no memoria.
     expect(m!.retosCandidatos.map((r) => r.codigo)).toEqual(['R-M2']);
     expect(m!.totales.retosCandidatos).toBe(1);
+  });
+
+  it('el insight validado y la decisión vigente cuya evidencia pierde los derechos llegan marcados, no escondidos', async () => {
+    // `validado` y `vigente` son inmutables; los derechos de la evidencia citada no. Al
+    // denegarlos, la biblioteca sigue enseñando las dos piezas —el cliente llegó a saberlo—
+    // pero con el motivo de la base y fuera del conteo utilizable.
+    const admin = sqlAdmin();
+    // Denegar deja el ámbito en «interno» y sin vencimiento: lo exige el CHECK de la tabla.
+    await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+      where evidencia_id = ${evidenciaA}`;
+    try {
+      const m = await memoriaParaUsuario(userA, wsA);
+      const insight = m!.insights.find((i) => i.id === insightValidado)!;
+      expect(insight.sinRespaldo).toEqual(expect.any(String));
+      expect(insight.sinRespaldo).toMatch(/derechos|respaldo|cita/i);
+      const decision = m!.decisiones.find((d) => d.id === decisionVigente)!;
+      expect(decision.sinRespaldo).toEqual(expect.any(String));
+      // Siguen contando en el total de la sección (son memoria), no como utilizables.
+      expect(m!.totales.decisiones).toBe(1);
+      expect(m!.decisiones.filter((d) => d.sinRespaldo === null)).toHaveLength(0);
+      expect(m!.insights.filter((i) => i.sinRespaldo !== null).map((i) => i.id)).toEqual([
+        insightValidado,
+      ]);
+    } finally {
+      await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente'
+        where evidencia_id = ${evidenciaA}`;
+    }
+  });
+
+  it('un segmento cuyos arquetipos quedan fuera del tope sigue enseñando su total', async () => {
+    // Más arquetipos que el tope, todos MÁS RECIENTES que los dos del setup y mapeados a un
+    // segmento nuevo: los antiguos («independientes», «pymes» y el que no tiene segmento) se
+    // quedan fuera de la lista, y sus conteos tienen que seguir diciendo que existen.
+    const admin = sqlAdmin();
+    const [sr] = await admin`insert into segmento (workspace_id, nombre)
+      values (${wsA}, 'recientes') returning id`;
+    const segRecientes = sr!.id as string;
+    await admin`with nuevos as (
+        insert into arquetipo (workspace_id, reto_id, nombre, creado_en, creado_por)
+        select ${wsA}, ${retoA}, 'Arquetipo reciente ' || n, now() + make_interval(mins => n),
+               ${userA}
+        from generate_series(1, ${TOPE_POR_SECCION + 1}) as n
+        returning id
+      )
+      insert into arquetipo_segmento (arquetipo_id, segmento_id, workspace_id)
+      select id, ${segRecientes}, ${wsA} from nuevos`;
+    try {
+      const m = await memoriaParaUsuario(userA, wsA);
+      expect(m!.arquetipos).toHaveLength(TOPE_POR_SECCION);
+      expect(m!.arquetipos.every((a) => a.segmentoIds.includes(segRecientes))).toBe(true);
+      expect(m!.totales.arquetipos).toBe(TOPE_POR_SECCION + 3);
+      // Los antiguos no están en la lista…
+      expect(m!.arquetipos.some((a) => a.id === arqConfirmado || a.id === arqHipotesis)).toBe(
+        false,
+      );
+      // …pero sus segmentos saben cuántos tienen, y el grupo sin segmento también.
+      expect(m!.segmentos.map((s) => [s.nombre, s.totalArquetipos])).toEqual([
+        ['independientes', 1],
+        ['pymes', 1],
+        ['recientes', TOPE_POR_SECCION + 1],
+      ]);
+      expect(m!.totales.arquetiposSinSegmento).toBe(1);
+    } finally {
+      await admin`delete from arquetipo_segmento where segmento_id = ${segRecientes}`;
+      await admin`delete from arquetipo where workspace_id = ${wsA} and nombre like 'Arquetipo reciente %'`;
+      await admin`delete from segmento where id = ${segRecientes}`;
+    }
   });
 
   it('memoriaParaUsuario aplica la capa 2: cuenta activa lee, desactivada con sesión viva no', async () => {
@@ -280,6 +384,7 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     // Y los totales tampoco filtran nada: count bajo la misma RLS.
     expect(m.totales).toEqual({
       arquetipos: 0,
+      arquetiposSinSegmento: 0,
       insights: 0,
       decisiones: 0,
       retosCerrados: 0,

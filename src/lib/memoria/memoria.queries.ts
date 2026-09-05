@@ -73,11 +73,17 @@ export async function construirMemoria(
 ): Promise<MemoriaDelWorkspace> {
   const [segmentos, arquetipos, insights, decisiones, retosCerrados, retosCandidatos, totales] =
     await Promise.all([
+      // Con el conteo REAL de arquetipos de cada segmento: la lista de arquetipos de abajo
+      // viene recortada al tope y un segmento antiguo puede quedarse sin ninguno de los
+      // suyos en ella; sin este número la tarjeta del segmento mentiría.
       tx<SegmentoEnMemoria[]>`
-        select id, nombre, definicion
-        from segmento
-        where workspace_id = ${workspaceId}
-        order by nombre, id`,
+        select s.id, s.nombre, s.definicion,
+               (select count(*)::int from arquetipo_segmento asg
+                 where asg.segmento_id = s.id and asg.workspace_id = s.workspace_id)
+                 as "totalArquetipos"
+        from segmento s
+        where s.workspace_id = ${workspaceId}
+        order by s.nombre, s.id`,
 
       // El arquetipo con el reto donde nació y el primer proyecto de ese reto (el mismo
       // criterio que el buscador: por código, con desempate por id). Un reto sin proyecto —
@@ -107,19 +113,30 @@ export async function construirMemoria(
 
       // Solo validados: es el mismo filtro que exige registrarDecision para enlazar un
       // insight. Un insight propuesto no ha pasado por nadie y no puede pre-poblar nada.
+      //
+      // Y con su respaldo VIVO: `validado` es inmutable, los derechos de la evidencia citada
+      // no. El predicado no se reproduce aquí —se INVOCA `razonamiento_sin_respaldo_visible`,
+      // la misma función que consulta el guard de suficiencia y que usa el picker de
+      // insights— y el motivo llega ya redactado, nombrando la afirmación exacta.
       tx<InsightEnMemoria[]>`
-        select id, titulo, resumen, to_char(validado_en, 'YYYY-MM-DD') as "validadoEn"
-        from insight
-        where workspace_id = ${workspaceId} and estado = 'validado'
-        order by validado_en desc, id
+        select i.id, i.titulo, i.resumen, to_char(i.validado_en, 'YYYY-MM-DD') as "validadoEn",
+               razonamiento_sin_respaldo_visible(i.workspace_id, array[i.id], array[]::uuid[],
+                                                 array[]::uuid[]) as "sinRespaldo"
+        from insight i
+        where i.workspace_id = ${workspaceId} and i.estado = 'validado'
+        order by i.validado_en desc, i.id
         limit ${TOPE_POR_SECCION}`,
 
       // Solo vigentes: una decisión `en-revision` fue cuestionada por una reapertura (SYS-10)
-      // y hasta que el lead la revalide no es memoria, es una pregunta abierta.
+      // y hasta que el lead la revalide no es memoria, es una pregunta abierta. Y `vigente`
+      // tampoco garantiza la cadena: su insight puede haber perdido el respaldo. Misma
+      // función que la proyección de gobernanza, con la decisión en su argumento.
       tx<DecisionEnMemoria[]>`
         select d.id, d.tipo, d.titulo, d.fundamento, g.numero as "gateNumero",
                to_char(d.decidido_en, 'YYYY-MM-DD') as "decididoEn",
-               json_build_object('id', p.id, 'codigo', p.codigo, 'titulo', p.titulo) as proyecto
+               json_build_object('id', p.id, 'codigo', p.codigo, 'titulo', p.titulo) as proyecto,
+               razonamiento_sin_respaldo_visible(d.workspace_id, array[]::uuid[], array[d.id],
+                                                 array[]::uuid[]) as "sinRespaldo"
         from decision d
         join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id
         join proyecto p on p.id = d.proyecto_id and p.workspace_id = d.workspace_id
@@ -174,6 +191,11 @@ export async function construirMemoria(
         select
           (select count(*)::int from arquetipo a where a.workspace_id = ${workspaceId})
             as arquetipos,
+          (select count(*)::int from arquetipo a
+            where a.workspace_id = ${workspaceId}
+              and not exists (select 1 from arquetipo_segmento asg
+                where asg.arquetipo_id = a.id and asg.workspace_id = a.workspace_id))
+            as "arquetiposSinSegmento",
           (select count(*)::int from insight i
             where i.workspace_id = ${workspaceId} and i.estado = 'validado') as insights,
           (select count(*)::int from decision d
@@ -202,6 +224,7 @@ export async function construirMemoria(
     // La fila de totales existe siempre (son subselects escalares); el `??` es para el tipo.
     totales: totales[0] ?? {
       arquetipos: 0,
+      arquetiposSinSegmento: 0,
       insights: 0,
       decisiones: 0,
       retosCerrados: 0,

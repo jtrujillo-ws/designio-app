@@ -10,6 +10,7 @@ import { COLOR_VEREDICTO, ETIQUETA_VEREDICTO } from '@/lib/medicion/medicion.sch
 import { memoriaDelWorkspace } from '@/lib/memoria/memoria.functions';
 import {
   agruparArquetiposPorSegmento,
+  cabeceraDeGrupo,
   destinoDeLaDecision,
   destinoDelArquetipo,
   destinoDelInsight,
@@ -17,6 +18,8 @@ import {
   memoriaVacia,
   notaDeRecorte,
   resumenDeArquetipos,
+  resumenDeRespaldo,
+  TOPE_POR_SECCION,
   type ArquetipoEnMemoria,
   type GrupoDeSegmento,
 } from '@/lib/memoria/memoria.schemas';
@@ -145,14 +148,23 @@ function PantallaBiblioteca() {
             </Card>
 
             <SeccionArquetipos
-              grupos={agruparArquetiposPorSegmento(datos.segmentos, datos.arquetipos)}
+              grupos={agruparArquetiposPorSegmento(
+                datos.segmentos,
+                datos.arquetipos,
+                datos.totales.arquetiposSinSegmento,
+              )}
               arquetipos={datos.arquetipos}
               total={datos.totales.arquetipos}
             />
 
             <Seccion
               titulo="Insights validados"
-              cabecera={`${datos.totales.insights} ${datos.totales.insights === 1 ? 'insight validado' : 'insights validados'}`}
+              cabecera={cabeceraConRespaldo(
+                datos.totales.insights,
+                'insight validado',
+                'insights validados',
+                resumenDeRespaldo(datos.insights),
+              )}
               recorte={notaDeRecorte(
                 datos.insights.length,
                 datos.totales.insights,
@@ -164,6 +176,9 @@ function PantallaBiblioteca() {
                 <>
                   <span style={titulo}>{i.titulo}</span>
                   {i.resumen && <p style={cuerpo}>{i.resumen}</p>}
+                  {i.sinRespaldo && (
+                    <SinRespaldo>Respaldo caducado o revocado: {i.sinRespaldo}</SinRespaldo>
+                  )}
                   <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
                     <span style={pie}>Validado el {i.validadoEn}</span>
                     <EnlaceA destino={destinoDelInsight(i)} style={enlace}>
@@ -176,7 +191,12 @@ function PantallaBiblioteca() {
 
             <Seccion
               titulo="Decisiones vigentes"
-              cabecera={`${datos.totales.decisiones} ${datos.totales.decisiones === 1 ? 'decisión vigente' : 'decisiones vigentes'}`}
+              cabecera={cabeceraConRespaldo(
+                datos.totales.decisiones,
+                'decisión vigente',
+                'decisiones vigentes',
+                resumenDeRespaldo(datos.decisiones),
+              )}
               recorte={notaDeRecorte(
                 datos.decisiones.length,
                 datos.totales.decisiones,
@@ -192,6 +212,7 @@ function PantallaBiblioteca() {
                     <span style={{ ...titulo, flex: 1, minWidth: 200 }}>{d.titulo}</span>
                   </div>
                   {d.fundamento && <p style={cuerpo}>{d.fundamento}</p>}
+                  {d.sinRespaldo && <SinRespaldo>Sin respaldo vivo: {d.sinRespaldo}</SinRespaldo>}
                   <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
                     <span style={pie}>Decidida el {d.decididoEn}</span>
                     <EnlaceA destino={destinoDeLaDecision(d)} style={enlace}>
@@ -381,11 +402,17 @@ function SeccionArquetipos({
       {grupos.map((g) => (
         <Card
           key={g.segmento?.id ?? 'sin-segmento'}
-          pending={g.arquetipos.length === 0}
+          pending={g.total === 0}
           style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 12 }}
         >
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span style={titulo}>{g.segmento ? g.segmento.nombre : 'Sin segmento declarado'}</span>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+              <span style={titulo}>
+                {g.segmento ? g.segmento.nombre : 'Sin segmento declarado'}
+              </span>
+              {/* El total es el del count, no el de la lista: nunca «sin arquetipos» cuando los hay. */}
+              <span style={micro}>{cabeceraDeGrupo(g)}</span>
+            </div>
             {g.segmento?.definicion && (
               <span style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-muted)' }}>
                 {g.segmento.definicion}
@@ -394,7 +421,9 @@ function SeccionArquetipos({
           </div>
           {g.arquetipos.length === 0 ? (
             <span style={{ font: '400 13px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}>
-              Sin arquetipos en este segmento todavía.
+              {g.total === 0
+                ? 'Sin arquetipos en este segmento todavía.'
+                : `Sus ${g.total === 1 ? 'arquetipo es más antiguo' : `${g.total} arquetipos son más antiguos`} que los ${TOPE_POR_SECCION} más recientes del workspace: se leen en el proyecto de su reto.`}
             </span>
           ) : (
             g.arquetipos.map((a) => (
@@ -442,6 +471,34 @@ function SeccionArquetipos({
         </Card>
       ))}
     </section>
+  );
+}
+
+/**
+ * La cabecera de insights y decisiones: el total, y de los enseñados cuántos siguen con
+ * respaldo y cuántos no. Un insight validado cuya evidencia perdió los derechos se enseña
+ * —es memoria— pero no se cuenta como utilizable.
+ */
+function cabeceraConRespaldo(
+  total: number,
+  singular: string,
+  plural: string,
+  r: { conRespaldo: number; sinRespaldo: number },
+): string {
+  if (total === 0) return `0 ${plural}`;
+  return `${total} ${total === 1 ? singular : plural} · ${r.conRespaldo} con respaldo · ${r.sinRespaldo} sin respaldo vivo`;
+}
+
+/**
+ * El motivo por el que una pieza validada o vigente ya no se puede citar, tal como lo
+ * redacta la base. Se marca, no se esconde: esconderla haría creer que el cliente no llegó
+ * a saberlo; contarla como utilizable haría creer que hoy puede apoyarse en ello.
+ */
+function SinRespaldo({ children }: { children: ReactNode }) {
+  return (
+    <span role="status" style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
+      {children}
+    </span>
   );
 }
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   agruparArquetiposPorSegmento,
+  cabeceraDeGrupo,
   destinoDeLaDecision,
   destinoDelArquetipo,
   destinoDelInsight,
@@ -9,16 +10,18 @@ import {
   MemoriaInputSchema,
   notaDeRecorte,
   resumenDeArquetipos,
+  resumenDeRespaldo,
   TOPE_POR_SECCION,
   type ArquetipoEnMemoria,
   type MemoriaDelWorkspace,
   type SegmentoEnMemoria,
 } from '@/lib/memoria/memoria.schemas';
 
-const segmento = (id: string, nombre: string): SegmentoEnMemoria => ({
+const segmento = (id: string, nombre: string, totalArquetipos = 0): SegmentoEnMemoria => ({
   id,
   nombre,
   definicion: '',
+  totalArquetipos,
 });
 
 const arquetipo = (
@@ -42,7 +45,14 @@ const memoria = (parcial: Partial<MemoriaDelWorkspace> = {}): MemoriaDelWorkspac
   decisiones: [],
   retosCerrados: [],
   retosCandidatos: [],
-  totales: { arquetipos: 0, insights: 0, decisiones: 0, retosCerrados: 0, retosCandidatos: 0 },
+  totales: {
+    arquetipos: 0,
+    arquetiposSinSegmento: 0,
+    insights: 0,
+    decisiones: 0,
+    retosCerrados: 0,
+    retosCandidatos: 0,
+  },
   ...parcial,
 });
 
@@ -103,6 +113,32 @@ describe('los arquetipos agrupados por segmento', () => {
     expect(grupo!.arquetipos.map((a) => a.nombre)).toEqual(['Omega', 'Alfa', 'Beta', 'Zeta']);
   });
 
+  it('cada grupo lleva el total del count, no el de la lista recortada', () => {
+    // «pymes» tiene 3 arquetipos de verdad pero ninguno sobrevivió al tope global; y hay 2
+    // sin segmento de los que tampoco se enseña ninguno. Ni un grupo dice «sin arquetipos».
+    const grupos = agruparArquetiposPorSegmento(
+      [segmento('s1', 'independientes', 2), segmento('s2', 'pymes', 3), segmento('s3', 'nuevos')],
+      [arquetipo({ id: 'a1', nombre: 'Visible', segmentoIds: ['s1'] })],
+      2,
+    );
+    expect(grupos.map((g) => [g.segmento?.nombre ?? null, g.arquetipos.length, g.total])).toEqual([
+      ['independientes', 1, 2],
+      ['pymes', 0, 3],
+      ['nuevos', 0, 0],
+      [null, 0, 2],
+    ]);
+    expect(cabeceraDeGrupo(grupos[0]!)).toBe('se muestran 1 de 2 (los más recientes)');
+    expect(cabeceraDeGrupo(grupos[1]!)).toBe('se muestran 0 de 3 (los más recientes)');
+    expect(cabeceraDeGrupo(grupos[2]!)).toBe('sin arquetipos todavía');
+    expect(cabeceraDeGrupo(grupos[3]!)).toBe('se muestran 0 de 2 (los más recientes)');
+    // Sin recorte, la cabecera cuenta a secas.
+    const [entero] = agruparArquetiposPorSegmento(
+      [segmento('s1', 'independientes', 1)],
+      [arquetipo({ id: 'a1', nombre: 'Visible', segmentoIds: ['s1'] })],
+    );
+    expect(cabeceraDeGrupo(entero!)).toBe('1 arquetipo');
+  });
+
   it('no muta la lista que recibe', () => {
     const lista = [
       arquetipo({ id: 'a1', nombre: 'B', estado: 'refutado' }),
@@ -154,7 +190,13 @@ describe('a dónde abre cada pieza de la memoria', () => {
 
   it('el insight abre la lista con él destacado; la decisión, su proyecto', () => {
     expect(
-      destinoDelInsight({ id: 'i1', titulo: 'x', resumen: '', validadoEn: '2026-09-01' }),
+      destinoDelInsight({
+        id: 'i1',
+        titulo: 'x',
+        resumen: '',
+        validadoEn: '2026-09-01',
+        sinRespaldo: null,
+      }),
     ).toEqual({
       to: '/insights',
       search: { destacar: 'i1' },
@@ -168,8 +210,22 @@ describe('a dónde abre cada pieza de la memoria', () => {
         gateNumero: 1,
         decididoEn: '2026-09-01',
         proyecto: { id: 'p1', codigo: 'P-01', titulo: 'Proyecto' },
+        sinRespaldo: null,
       }),
     ).toEqual({ to: '/proyecto/$proyectoId', params: { proyectoId: 'p1' } });
+  });
+});
+
+describe('el respaldo de lo validado y lo vigente', () => {
+  it('cuenta aparte lo que sigue con respaldo y lo que lo perdió', () => {
+    expect(
+      resumenDeRespaldo([
+        { sinRespaldo: null },
+        { sinRespaldo: 'la afirmación «x» cita evidencia sin derechos vigentes' },
+        { sinRespaldo: null },
+      ]),
+    ).toEqual({ conRespaldo: 2, sinRespaldo: 1 });
+    expect(resumenDeRespaldo([])).toEqual({ conRespaldo: 0, sinRespaldo: 0 });
   });
 });
 
@@ -182,6 +238,7 @@ describe('la memoria vacía y el recorte', () => {
         memoria({
           totales: {
             arquetipos: 0,
+            arquetiposSinSegmento: 0,
             insights: 0,
             decisiones: 0,
             retosCerrados: 0,

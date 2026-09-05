@@ -28,7 +28,18 @@ export const MemoriaInputSchema = z.object({ workspaceId: z.string().uuid() });
  */
 export const TOPE_POR_SECCION = 50;
 
-export type SegmentoEnMemoria = { id: string; nombre: string; definicion: string };
+export type SegmentoEnMemoria = {
+  id: string;
+  nombre: string;
+  definicion: string;
+  /**
+   * Cuántos arquetipos tiene DE VERDAD (count sobre el mapeo, en la misma foto). La lista
+   * de arquetipos viene recortada al tope global, así que un segmento antiguo puede llegar
+   * sin ninguno de los suyos: con este número la tarjeta dice «se muestran 0 de 3» en vez
+   * de mentir con «sin arquetipos».
+   */
+  totalArquetipos: number;
+};
 
 /** Un arquetipo tal como la biblioteca lo conserva: con su veredicto y con el reto que lo hizo nacer. */
 export type ArquetipoEnMemoria = {
@@ -45,11 +56,19 @@ export type ArquetipoEnMemoria = {
   segmentoIds: string[];
 };
 
+/**
+ * Un insight validado es inmutable, pero su RESPALDO no: los derechos de la evidencia que
+ * cita se revocan y caducan. `sinRespaldo` es el motivo, ya redactado por la base con la
+ * misma función que consulta el guard de suficiencia (`razonamiento_sin_respaldo_visible`),
+ * o null si se puede seguir citando. La biblioteca lo enseña marcado, no lo esconde: que
+ * el cliente sepa que lo supo y que hoy no puede apoyarse en ello es memoria también.
+ */
 export type InsightEnMemoria = {
   id: string;
   titulo: string;
   resumen: string;
   validadoEn: string;
+  sinRespaldo: string | null;
 };
 
 export type DecisionEnMemoria = {
@@ -60,6 +79,8 @@ export type DecisionEnMemoria = {
   gateNumero: number;
   decididoEn: string;
   proyecto: { id: string; codigo: string; titulo: string };
+  /** Igual que en el insight: `vigente` habla de reaperturas, no de si su cadena sigue viva. */
+  sinRespaldo: string | null;
 };
 
 export type RetoCerradoEnMemoria = {
@@ -116,6 +137,8 @@ export type MemoriaDelWorkspace = {
 
 export type TotalesDeMemoria = {
   arquetipos: number;
+  /** Los que no declararon segmento: el total del grupo «sin segmento», por la misma razón. */
+  arquetiposSinSegmento: number;
   insights: number;
   decisiones: number;
   retosCerrados: number;
@@ -132,7 +155,10 @@ const ORDEN_ESTADO: Record<EstadoArquetipo, number> = { confirmado: 0, hipotesis
 export type GrupoDeSegmento = {
   /** Null para los arquetipos que no declararon segmento: se enseñan aparte, no se pierden. */
   segmento: SegmentoEnMemoria | null;
+  /** Los que se ENSEÑAN: los que sobrevivieron al tope global y son de este segmento. */
   arquetipos: ArquetipoEnMemoria[];
+  /** Los que HAY: si es mayor que los mostrados, el tope dejó fuera alguno de este grupo. */
+  total: number;
 };
 
 /**
@@ -142,10 +168,16 @@ export type GrupoDeSegmento = {
  * fila, no una copia, y quien mira el segmento «pymes» tiene que encontrarlo ahí aunque
  * también sea de «independientes». Los segmentos sin arquetipos se conservan (vacíos) y los
  * arquetipos sin segmento van en un grupo final que solo existe si hay alguno.
+ *
+ * Cada grupo lleva su TOTAL real, que no se deriva de la lista: `arquetipos` ya viene
+ * recortada al tope global, así que un segmento cuyos arquetipos son todos más antiguos que
+ * los 50 más recientes llega aquí sin ninguno y, sin el total, la pantalla diría que no
+ * tiene. `sinSegmento` es el total de los que no declararon segmento, por lo mismo.
  */
 export function agruparArquetiposPorSegmento(
   segmentos: SegmentoEnMemoria[],
   arquetipos: ArquetipoEnMemoria[],
+  sinSegmento = 0,
 ): GrupoDeSegmento[] {
   const ordenados = [...arquetipos].sort(
     (a, b) =>
@@ -153,15 +185,23 @@ export function agruparArquetiposPorSegmento(
       a.nombre.localeCompare(b.nombre, 'es') ||
       a.id.localeCompare(b.id),
   );
-  const grupos: GrupoDeSegmento[] = segmentos.map((segmento) => ({
-    segmento,
-    arquetipos: ordenados.filter((a) => a.segmentoIds.includes(segmento.id)),
-  }));
+  const grupos: GrupoDeSegmento[] = segmentos.map((segmento) => {
+    const propios = ordenados.filter((a) => a.segmentoIds.includes(segmento.id));
+    // El count manda; el máximo es solo la red por si llegara una lista más larga que él.
+    return {
+      segmento,
+      arquetipos: propios,
+      total: Math.max(segmento.totalArquetipos, propios.length),
+    };
+  });
   // Sin segmento «conocido»: incluye el caso de un id que ya no corresponde a ningún
   // segmento del workspace, que de otro modo desaparecería de la pantalla en silencio.
   const conocidos = new Set(segmentos.map((s) => s.id));
   const sueltos = ordenados.filter((a) => !a.segmentoIds.some((id) => conocidos.has(id)));
-  if (sueltos.length > 0) grupos.push({ segmento: null, arquetipos: sueltos });
+  const totalSueltos = Math.max(sinSegmento, sueltos.length);
+  // El grupo existe si HAY alguno, se enseñe o no: los sin segmento que el tope dejó fuera
+  // también son memoria y hay que decir que están.
+  if (totalSueltos > 0) grupos.push({ segmento: null, arquetipos: sueltos, total: totalSueltos });
   return grupos;
 }
 
@@ -201,6 +241,32 @@ export function memoriaVacia(m: MemoriaDelWorkspace): boolean {
     t.retosCerrados === 0 &&
     t.retosCandidatos === 0
   );
+}
+
+/**
+ * Cuántos de los enseñados siguen con respaldo vivo y cuántos no: la cabecera de insights y
+ * decisiones cuenta las dos cosas por separado, porque un insight cuya evidencia perdió los
+ * derechos no es memoria UTILIZABLE aunque siga validado. Es de los que se enseñan, como el
+ * desglose de arquetipos: el predicado corre por fila y no se evalúa sobre lo recortado.
+ */
+export function resumenDeRespaldo(items: { sinRespaldo: string | null }[]): {
+  conRespaldo: number;
+  sinRespaldo: number;
+} {
+  const sinRespaldo = items.filter((i) => i.sinRespaldo !== null).length;
+  return { conRespaldo: items.length - sinRespaldo, sinRespaldo };
+}
+
+/**
+ * La cabecera de un grupo de segmento: cuántos se enseñan de cuántos hay. Nunca dice «sin
+ * arquetipos» cuando los hay y el tope los dejó fuera.
+ */
+export function cabeceraDeGrupo(g: GrupoDeSegmento): string {
+  if (g.total === 0) return 'sin arquetipos todavía';
+  if (g.total > g.arquetipos.length) {
+    return `se muestran ${g.arquetipos.length} de ${g.total} (los más recientes)`;
+  }
+  return `${g.total} ${g.total === 1 ? 'arquetipo' : 'arquetipos'}`;
 }
 
 /**

@@ -3414,6 +3414,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
    * mirar: con `'UTC'` escrito de primer argumento, lo que sale ya no depende de la sesion.
    */
   const ENVUELTO_ES_LA_ENVOLTURA = /^\s*\(\s*'utc'(?:\s*::\s*[a-z_"]+)?\s*,/i;
+  /*
+   * Y el instante tiene que ser el argumento DIRECTO, no el principio de una cuenta. Con solo
+   * mirar lo de delante, `timezone('UTC', now() + interval '2 days')` se certificaba como
+   * envuelto — y no lo está: sumarle días a un instante YA depende del huso alrededor de un
+   * cambio de hora (medido en este mismo fichero: 11:00Z en America/New_York contra 12:00Z en
+   * UTC), y convertir DESPUÉS a UTC no deshace esa diferencia, porque convierte un resultado
+   * que ya salió distinto.
+   *
+   * Así que detrás de la ocurrencia solo puede venir su propio `()` y el cierre de la
+   * envoltura. Lo que haya más allá —un `::date`, lo que sea— da igual: eso ya opera sobre un
+   * `timestamp` sin huso.
+   */
+  const CIERRA_LA_ENVOLTURA = /^\s*(?:\(\s*\))?\s*\)/;
 
   /**
    * El veredicto, del revés: devuelve el certificado si lo hay, o `null` si no se puede
@@ -3447,7 +3460,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     const envuelto = (r: RegExpMatchArray): boolean => {
       const detras = dondeBuscar.slice(r.index! + r[0].length, r.index! + r[0].length + 40);
       return (
-        ENVUELTO_ANTES.test(dondeBuscar.slice(Math.max(0, r.index! - 60), r.index!)) ||
+        (ENVUELTO_ANTES.test(dondeBuscar.slice(Math.max(0, r.index! - 60), r.index!)) &&
+          CIERRA_LA_ENVOLTURA.test(detras)) ||
         ENVUELTO_DESPUES.test(detras) ||
         ENVUELTO_ES_LA_ENVOLTURA.test(detras)
       );
@@ -3516,10 +3530,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
          where n.nspname in ('public', 'pg_catalog') and p.prokind = 'f'
         union all
-        select p.proname::text, format_type(t.oid, null)
+        -- El nombre del PARÁMETRO, no el de su función. Aquí ponía p.proname, y con eso una
+        -- función que reciba un instante y lo devuelva colapsado —«f(p timestamptz) returns
+        -- date as select p»— se certificaba sin mirar nada: su cuerpo nombra «p», que no
+        -- estaba en ningún conjunto. «with ordinality» para indexar proargnames.
+        -- LÍMITE DECLARADO: la referencia POSICIONAL de un cuerpo SQL ($1) no se cubre —
+        -- meterla marcaría todo cuerpo que use $1 para cualquier cosa. Medido: este esquema
+        -- no tiene ninguna función con parámetros sin nombre.
+        select p.proargnames[i]::text, format_type(t.oid, null)
           from pg_proc p join pg_namespace n on n.oid = p.pronamespace,
-               unnest(coalesce(p.proallargtypes, p.proargtypes::oid[])) t(oid)
+               unnest(coalesce(p.proallargtypes, p.proargtypes::oid[]))
+                 with ordinality as t(oid, i)
          where n.nspname = 'public' and p.prokind in ('f', 'p')
+           and p.proargnames is not null and p.proargnames[i] is not null
         union all
         select t.typname::text, format_type(t.typbasetype, t.typtypmod)
           from pg_type t join pg_namespace n on n.oid = t.typnamespace
@@ -3587,10 +3610,19 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
          where n.nspname in ('public', 'pg_catalog') and p.prokind = 'f'
         union all
-        select p.proname::text, format_type(t.oid, null)
+        -- El nombre del PARÁMETRO, no el de su función. Aquí ponía p.proname, y con eso una
+        -- función que reciba un instante y lo devuelva colapsado —«f(p timestamptz) returns
+        -- date as select p»— se certificaba sin mirar nada: su cuerpo nombra «p», que no
+        -- estaba en ningún conjunto. «with ordinality» para indexar proargnames.
+        -- LÍMITE DECLARADO: la referencia POSICIONAL de un cuerpo SQL ($1) no se cubre —
+        -- meterla marcaría todo cuerpo que use $1 para cualquier cosa. Medido: este esquema
+        -- no tiene ninguna función con parámetros sin nombre.
+        select p.proargnames[i]::text, format_type(t.oid, null)
           from pg_proc p join pg_namespace n on n.oid = p.pronamespace,
-               unnest(coalesce(p.proallargtypes, p.proargtypes::oid[])) t(oid)
+               unnest(coalesce(p.proallargtypes, p.proargtypes::oid[]))
+                 with ordinality as t(oid, i)
          where n.nspname = 'public' and p.prokind in ('f', 'p')
+           and p.proargnames is not null and p.proargnames[i] is not null
         union all
         select t.typname::text, format_type(t.typbasetype, t.typtypmod)
           from pg_type t join pg_namespace n on n.oid = t.typnamespace
@@ -3686,6 +3718,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     'funcion censo_cert_opaca',
     'funcion censo_cert_por_nombre',
     'funcion censo_cert_indirecta',
+    'funcion censo_cert_aritmetica',
+    'funcion censo_cert_recibido',
   ];
 
   /**
@@ -6515,6 +6549,24 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       'create function censo_cert_indirecta() returns date language sql as ' +
         '$c$ select censo_cert_momento(true) $c$',
     );
+    /*
+     * Y las dos sondas de la ronda catorce, que atacan la ENVOLTURA y el PARÁMETRO — las dos
+     * mitades por donde un instante entra sin que ningún nombre lo delate:
+     *
+     *   · `timezone('UTC', now() + interval '2 days')` parecía envuelto y no lo está: sumar
+     *     días a un instante YA depende del huso en un cambio de hora, y convertir después a
+     *     UTC no deshace esa diferencia — convierte un resultado que ya salió distinto.
+     *   · una función que RECIBE un instante y lo devuelve colapsado no nombra ningún reloj:
+     *     el instante entra por la firma, y su parámetro solo está en el catálogo.
+     */
+    await admin.unsafe(
+      'create function censo_cert_aritmetica() returns date language sql as ' +
+        "$c$ select timezone('UTC', now() + interval '2 days')::date $c$",
+    );
+    await admin.unsafe(
+      'create function censo_cert_recibido(p_instante timestamptz) returns date ' +
+        'language sql as $c$ select p_instante $c$',
+    );
     await admin`create table censo_cert_agenda (censo_cert_dia date, censo_cert_hito timestamptz)`;
     await admin.unsafe(`create function censo_cert_por_nombre() returns void language plpgsql as $c$
       begin insert into censo_cert_agenda (censo_cert_dia) select censo_cert_dia
@@ -6669,6 +6721,8 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
       await admin`drop function censo_cert_instante()`;
       await admin`drop function censo_cert_por_nombre()`;
       await admin`drop function censo_cert_indirecta()`;
+      await admin`drop function censo_cert_aritmetica()`;
+      await admin.unsafe('drop function censo_cert_recibido(timestamptz)');
       await admin.unsafe('drop function censo_cert_momento(boolean)');
       await admin`drop function censo_cert_por_nombre_ok()`;
       await admin`drop table censo_cert_sello`;

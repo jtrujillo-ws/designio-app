@@ -557,17 +557,24 @@ export type PanelPropuestas = {
    * distingue «esto es todo» de «esto es lo que cabe». */
   totalPendientes: number;
   hayMasDecididas: boolean;
-  /** Anclas ofrecibles a la generación: items de bandeja pendientes y retos abiertos. El
-   * selector del formulario es la ÚNICA puerta a la generación, así que estas listas se
+  /**
+   * Anclas ofrecibles a la generación, POR CAPACIDAD.
+   *
+   * El selector del formulario es la ÚNICA puerta a la generación, así que estas listas se
    * ordenan por antigüedad (FIFO): el recorte cae sobre lo recién llegado —que vuelve a
    * aparecer en la siguiente pasada— y nunca sobre lo que más lleva esperando, que si no
-   * jamás alcanzaría la ventana. */
-  itemsPendientes: CandidatoAncla[];
-  retosAbiertos: CandidatoAncla[];
-  /** Y el recorte se DICE, como en las listas de propuestas: callarlo hacía creer que no
-   * había más anclas que ofrecer. */
-  hayMasItems: boolean;
-  hayMasRetos: boolean;
+   * jamás alcanzaría la ventana. Y el recorte se DICE, como en las listas de propuestas:
+   * callarlo hacía creer que no había más anclas que ofrecer.
+   *
+   * Aquí había dos listas fijas —`itemsPendientes` y `retosAbiertos`— y la pantalla elegía
+   * por la COLUMNA del ancla. La elegibilidad no es de la columna: es de la capacidad. Dos
+   * pueden colgar del mismo reto y no admitir los mismos —C0 excluye los de criterios
+   * congelados; una capacidad posterior al G0 no tendría por qué—, así que la segunda recibía
+   * la cola de la primera y sus anclas válidas no aparecían en el selector. Con un
+   * `Record<CapacidadActiva, …>`, una capacidad nueva no compila hasta que alguien diga de
+   * dónde salen las suyas.
+   */
+  candidatas: Record<CapacidadActiva, { lista: CandidatoAncla[]; hayMas: boolean }>;
   /**
    * Items cuyo material es de personas, con su consentimiento VIGENTE. Lista propia y no
    * derivada del selector de generación: registrar un consentimiento —o revocarlo— es un

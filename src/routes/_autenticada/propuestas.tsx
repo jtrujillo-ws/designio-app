@@ -20,14 +20,14 @@ import {
 import {
   CAPACIDADES_ACTIVAS,
   CAPACIDADES,
-  type AnclaCapacidad,
-  type CandidatoAncla,
   type CapacidadActiva,
+  type PanelPropuestas,
   type ConsentimientoDeItem,
   type EstadoAncla,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoPropuesta,
+  type Destino,
   type PropuestaEnPanel,
 } from '@/lib/ai/ai.schemas';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
@@ -179,10 +179,7 @@ function PantallaPropuestas() {
               <FormularioGeneracion
                 workspaceId={datos.workspaceId}
                 habilitada={datos.ai.disponible}
-                items={datos.itemsPendientes}
-                retos={datos.retosAbiertos}
-                hayMasItems={datos.hayMasItems}
-                hayMasRetos={datos.hayMasRetos}
+                candidatas={datos.candidatas}
                 busqueda={datos.busqueda}
                 onBuscar={(texto) =>
                   navigate({
@@ -435,10 +432,7 @@ function RespaldoHumano({
 function FormularioGeneracion({
   workspaceId,
   habilitada,
-  items,
-  retos,
-  hayMasItems,
-  hayMasRetos,
+  candidatas,
   busqueda,
   onBuscar,
   onGenerado,
@@ -447,10 +441,7 @@ function FormularioGeneracion({
 }: {
   workspaceId: string;
   habilitada: boolean;
-  items: CandidatoAncla[];
-  retos: CandidatoAncla[];
-  hayMasItems: boolean;
-  hayMasRetos: boolean;
+  candidatas: PanelPropuestas['candidatas'];
   busqueda: string;
   onBuscar: (texto: string) => void;
   onGenerado: (generadas: number) => Promise<void>;
@@ -483,22 +474,17 @@ function FormularioGeneracion({
     en silencio — y ése es el modo de fallo de un ternario binario: no se equivoca, elige. */
   const ancla = CAPACIDADES[capacidad].ancla;
   /*
-   * Las candidatas POR TIPO DE ANCLA, exhaustivas por el tipo y no por un ternario.
+   * Las candidatas POR CAPACIDAD, que es de quien son.
    *
-   * Aquí ponía `ancla.columna === 'item_id' ? items : retos`, y eso es la misma rama binaria
-   * una capa más afuera: una capacidad que anclara en cualquier otra cosa habría enseñado la
-   * cola de RETOS en el selector, y enviar uno habría fallado contra su propia tabla. Con un
-   * `Record<AnclaCapacidad['columna'], …>`, ampliar el tipo de ancla no compila hasta que
-   * alguien diga de dónde salen sus candidatas — que es lo que un ternario no puede exigir.
+   * Aquí hubo primero `ancla.columna === 'item_id' ? items : retos` y después un
+   * `Record<AnclaCapacidad['columna'], …>`. El Record arregló el ternario y dejó el error de
+   * fondo: la elegibilidad no es de la COLUMNA. Dos capacidades pueden colgar del mismo reto
+   * y no admitir los mismos —la cola de C0 excluye los de criterios congelados—, así que la
+   * segunda recibía la lista de la primera y sus anclas válidas no salían en el selector, sin
+   * que faltara ninguna entrada. Ahora el servidor las resuelve por capacidad y aquí solo se
+   * leen.
    */
-  const CANDIDATAS: Record<
-    AnclaCapacidad['columna'],
-    { lista: CandidatoAncla[]; hayMas: boolean }
-  > = {
-    item_id: { lista: items, hayMas: hayMasItems },
-    reto_id: { lista: retos, hayMas: hayMasRetos },
-  };
-  const { lista: anclas, hayMas } = CANDIDATAS[ancla.columna];
+  const { lista: anclas, hayMas } = candidatas[capacidad];
   const elegida = anclas.find((a) => a.id === anclaId);
   // RF-09.5: si el material es de personas y el consentimiento vigente no cubre el
   // procesamiento externo, el paso que toca no es generar — es registrarlo. La pantalla lo
@@ -908,6 +894,85 @@ function FormularioConsentimiento({
   );
 }
 
+/**
+ * Cómo se PRESENTA y cómo se CORRIGE cada destino, exhaustivo por el tipo.
+ *
+ * La tarjeta decía `destino === 'evidencia' ? … : …` en tres sitios: el rótulo, la ficha y el
+ * formulario de corrección. Los tres con el mismo modo de fallo: un destino nuevo se pintaba
+ * como criterio de éxito, con campos que no son los suyos, y lo que el revisor escribiera en
+ * ese formulario lo rechazaba después el esquema de su capacidad. Presentar mal una propuesta
+ * es peor que no presentarla: el revisor decide sobre lo que ve.
+ *
+ * `Record<Destino, …>` hace que el compilador pida las tres piezas de cada destino nuevo. El
+ * casting de `contenido` se queda dentro de cada entrada, que es donde el destino ya está
+ * fijado y el CHECK de la tabla lo garantiza.
+ */
+const PRESENTACION: Record<
+  Destino,
+  {
+    rotulo: string;
+    ficha: (contenido: ContenidoPropuesta) => ReactNode;
+    /**
+     * Lo que impide materializar ESTA propuesta por lo que dice su contenido, y no por su
+     * ancla: `null` si nada. Se declara por destino porque cada uno tiene los suyos, y porque
+     * escrito como `destino === 'evidencia' && …` un destino nuevo no habría tenido ninguno —
+     * la pantalla habría ofrecido «Aceptar tal cual» sobre algo que la base rechaza, que es
+     * exactamente lo que este aviso existe para evitar.
+     *
+     * Devuelve el TEXTO y no un booleano: el aviso tiene que decir qué falta y por dónde se
+     * arregla; un botón apagado sin explicación manda a adivinar.
+     */
+    bloqueoPropio: (contenido: ContenidoPropuesta) => string | null;
+    formulario: (props: {
+      inicial: ContenidoPropuesta;
+      ocupado: boolean;
+      onEnviar: (c: ContenidoPropuesta) => Promise<void>;
+      onCancelar: () => void;
+    }) => ReactNode;
+  }
+> = {
+  evidencia: {
+    rotulo: 'Evidencia propuesta',
+    ficha: (c) => <FichaExtraccion contenido={c as ContenidoExtraccion} />,
+    /*
+     * `evidencia.fecha_recoleccion` es NOT NULL: una extracción sin fecha del material no se
+     * materializa. Y no es un defecto de la propuesta —al modelo se le permite decir que el
+     * material no la trae, para eso existe el par fecha/motivo—: ponerla es trabajo del humano
+     * al corregir. Así que el botón no se ofrece, y el camino que SÍ existe queda dicho con
+     * esas palabras en vez de deducido de un botón apagado.
+     */
+    bloqueoPropio: (c) => {
+      const e = c as ContenidoExtraccion;
+      if (e.fecha !== null) return null;
+      const porque = e.fechaSinDatoMotivo ? ` (${e.fechaSinDatoMotivo})` : '';
+      return `Esta propuesta no trae fecha del material${porque}: féchala en «Corregir y aceptar» para poder materializarla.`;
+    },
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioExtraccion
+        inicial={inicial as ContenidoExtraccion}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  'criterio-exito': {
+    rotulo: 'Criterio de éxito propuesto',
+    ficha: (c) => <FichaCriterio contenido={c as ContenidoCriterio} />,
+    // Un criterio no tiene ninguna precondición de contenido: su esquema ya exige todo lo que
+    // la tabla pide, y la línea base la pone un humano DESPUÉS, editando el criterio (§21).
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioCriterio
+        inicial={inicial as ContenidoCriterio}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+};
+
 function TarjetaPropuesta({
   propuesta,
   workspaceId,
@@ -923,14 +988,12 @@ function TarjetaPropuesta({
 }) {
   const [corrigiendo, setCorrigiendo] = useState(false);
   const [ocupado, setOcupado] = useState(false);
-  const esExtraccion = propuesta.destino === 'evidencia';
+  const presentacion = PRESENTACION[propuesta.destino];
   const anclaDisponible = propuesta.anclaEstado === 'disponible';
-  // La otra precondición que la base impone SIEMPRE y que no es del ancla: una extracción
-  // sin fecha no se materializa. Va aparte de `anclaDisponible` porque no caduca con el
-  // tiempo —nació así— y su salida es distinta: no es rechazar, es corregir.
-  const faltaFecha =
-    propuesta.destino === 'evidencia' &&
-    (propuesta.contenido as ContenidoExtraccion).fecha === null;
+  // La otra precondición que la base impone SIEMPRE y que no es del ancla, sino del contenido.
+  // Va aparte de `anclaDisponible` porque no caduca con el tiempo —nació así— y su salida es
+  // distinta: no es rechazar, es corregir. Y la declara el DESTINO, no un ternario.
+  const bloqueoPropio = presentacion.bloqueoPropio(propuesta.contenido);
   const citasPresentes = propuesta.citas.filter((c) => c.presenteLiteral).length;
 
   async function decidir(correccion?: ContenidoPropuesta) {
@@ -977,7 +1040,7 @@ function TarjetaPropuesta({
             minWidth: 200,
           }}
         >
-          {esExtraccion ? 'Evidencia propuesta' : 'Criterio de éxito propuesto'}
+          {presentacion.rotulo}
         </span>
         {propuesta.esSimulacion && <Tag mono={false}>simulación AI</Tag>}
         <span style={{ font: '600 11.5px var(--font-sans)', color: COLOR_ESTADO[propuesta.estado] }}>
@@ -988,11 +1051,7 @@ function TarjetaPropuesta({
         Alcance: {propuesta.anclaTitulo}
       </span>
 
-      {esExtraccion ? (
-        <FichaExtraccion contenido={propuesta.contenido as ContenidoExtraccion} />
-      ) : (
-        <FichaCriterio contenido={propuesta.contenido as ContenidoCriterio} />
-      )}
+      {presentacion.ficha(propuesta.contenido)}
 
       {propuesta.citas.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -1074,26 +1133,20 @@ function TarjetaPropuesta({
           {MOTIVO_ANCLA[propuesta.anclaEstado]}
         </span>
       )}
-      {/* Una extracción SIN fecha no se puede materializar tal cual: `materializarEvidencia`
-          la rechaza siempre, porque una evidencia se sitúa en el tiempo. El modelo tiene
-          permitido decir que el material no la trae —para eso existe el par fecha/motivo— y
-          ponerla es entonces trabajo del humano al corregir. Así que el botón no se ofrece:
-          lo que la base rechaza, la pantalla no lo enseña; y el camino que SÍ existe queda
-          dicho con esas palabras, no deducido de un botón apagado. */}
-      {propuesta.estado === 'propuesta' && puedeRevisar && anclaDisponible && faltaFecha && (
+      {/* Y lo que impide materializarla por su CONTENIDO, que cada destino declara en
+          `PRESENTACION.bloqueoPropio` (el porqué de cada uno está allí). Lo que la base
+          rechaza, la pantalla no lo enseña; y el camino que SÍ existe queda dicho con
+          palabras, no deducido de un botón apagado. */}
+      {propuesta.estado === 'propuesta' && puedeRevisar && anclaDisponible && bloqueoPropio && (
         <span style={{ font: '500 12.5px/1.5 var(--font-sans)', color: 'var(--warn)' }}>
-          Esta propuesta no trae fecha del material
-          {(propuesta.contenido as ContenidoExtraccion).fechaSinDatoMotivo
-            ? ` (${(propuesta.contenido as ContenidoExtraccion).fechaSinDatoMotivo})`
-            : ''}
-          : féchala en «Corregir y aceptar» para poder materializarla.
+          {bloqueoPropio}
         </span>
       )}
       {propuesta.estado === 'propuesta' && puedeRevisar && !corrigiendo && (
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
           <Button
             size="sm"
-            disabled={ocupado || !anclaDisponible || faltaFecha}
+            disabled={ocupado || !anclaDisponible || bloqueoPropio !== null}
             onClick={() => void decidir()}
           >
             Aceptar tal cual
@@ -1111,22 +1164,15 @@ function TarjetaPropuesta({
           </Button>
         </div>
       )}
-      {propuesta.estado === 'propuesta' && puedeRevisar && corrigiendo && esExtraccion && (
-        <FormularioExtraccion
-          inicial={propuesta.contenido as ContenidoExtraccion}
-          ocupado={ocupado}
-          onEnviar={decidir}
-          onCancelar={() => setCorrigiendo(false)}
-        />
-      )}
-      {propuesta.estado === 'propuesta' && puedeRevisar && corrigiendo && !esExtraccion && (
-        <FormularioCriterio
-          inicial={propuesta.contenido as ContenidoCriterio}
-          ocupado={ocupado}
-          onEnviar={decidir}
-          onCancelar={() => setCorrigiendo(false)}
-        />
-      )}
+      {propuesta.estado === 'propuesta' &&
+        puedeRevisar &&
+        corrigiendo &&
+        presentacion.formulario({
+          inicial: propuesta.contenido,
+          ocupado,
+          onEnviar: decidir,
+          onCancelar: () => setCorrigiendo(false),
+        })}
     </Card>
   );
 }

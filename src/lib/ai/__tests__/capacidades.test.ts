@@ -120,7 +120,13 @@ describe('el registro de capacidades', () => {
     // en verde sin haber leído una sola línea — el modo de fallo de todo censo.
     expect(ficheros.length).toBeGreaterThan(4);
 
+    // Y el DESTINO cuenta igual. `destino === 'evidencia' ? ficha : otraFicha` tiene el mismo
+    // modo de fallo con otro nombre: la tarjeta pintaba todo destino nuevo como criterio de
+    // éxito, con campos que no son los suyos y un formulario cuya corrección rechaza después
+    // el esquema de su capacidad. Presentar mal una propuesta es peor que no presentarla,
+    // porque el revisor decide sobre lo que ve.
     const CAPACIDADES_LITERALES = new Set<string>(CAPACIDADES_ACTIVAS);
+    const DESTINOS_LITERALES = new Set<string>(Object.keys(COLUMNA_DE_DESTINO));
     const hallazgos: string[] = [];
     for (const f of ficheros) {
       const codigo = await readFile(f, 'utf8');
@@ -134,10 +140,12 @@ describe('el registro de capacidades', () => {
           // El nombre `capacidad` a cualquiera de los dos lados, contra un literal que sea el
           // de una capacidad: `entrada.capacidad === 'CI'` y `'CI' === capacidad` cuentan igual.
           const nombra = (x: ts.Node): boolean =>
-            (ts.isIdentifier(x) && x.text === 'capacidad') ||
-            (ts.isPropertyAccessExpression(x) && x.name.text === 'capacidad');
+            (ts.isIdentifier(x) && (x.text === 'capacidad' || x.text === 'destino')) ||
+            (ts.isPropertyAccessExpression(x) &&
+              (x.name.text === 'capacidad' || x.name.text === 'destino'));
           const literal = (x: ts.Node): boolean =>
-            ts.isStringLiteral(x) && CAPACIDADES_LITERALES.has(x.text);
+            ts.isStringLiteral(x) &&
+            (CAPACIDADES_LITERALES.has(x.text) || DESTINOS_LITERALES.has(x.text));
           if (comparacion && ((nombra(n.left) && literal(n.right)) || (literal(n.left) && nombra(n.right)))) {
             const { line } = arbol.getLineAndCharacterOfPosition(n.getStart(arbol));
             hallazgos.push(`${f.slice(raiz.length + 1)}:${line + 1} — ${n.getText(arbol)}`);
@@ -264,5 +272,58 @@ describe('el registro de capacidades', () => {
     expect(tecleadas).toEqual([]);
     // Y la asignación sale del mapa.
     expect(sinComentarios).toContain('COLUMNA_DE_DESTINO[p.destino]');
+  });
+
+  /**
+   * Ni en la proyección que lee la propuesta que se va a revisar.
+   *
+   * Nombraba `item_id, reto_id` a mano y los materializadores tomaban el suyo con un `!`. Un
+   * ancla nueva no llegaba a su materializador —y uno de los de ahora, ante una fila anclada
+   * en otra columna, recibía `null` y reventaba contra su clave ajena—.
+   */
+  it('no teclea ninguna columna de ancla en la lectura para revisar', async () => {
+    const codigo = await readFile(`${RAIZ}/src/lib/ai/ai.servicio.ts`, 'utf8');
+    const desde = codigo.indexOf('async function leerParaRevisar');
+    expect(desde, 'no se encontró leerParaRevisar').toBeGreaterThan(0);
+    const cuerpo = codigo.slice(desde, codigo.indexOf('\n}', desde));
+    expect(cuerpo.length).toBeGreaterThan(300);
+    const seleccion = cuerpo.slice(cuerpo.indexOf('select'), cuerpo.indexOf('from propuesta_ai'));
+    const tecleadas = COLUMNAS_DE_ANCLA.filter((c) => new RegExp(`\\b${c}\\b`).test(seleccion));
+    expect(tecleadas).toEqual([]);
+    expect(seleccion).toContain('columnasDeAncla');
+  });
+
+  /**
+   * El sobre del lote y el esquema que se le pide al proveedor son EL MISMO.
+   *
+   * Eran dos: `CAPACIDADES[c].lote` decía qué campo lee el servicio y con qué techo, y
+   * `ESQUEMA_SALIDA` declaraba a mano el campo y el `maxItems` que se le piden al proveedor.
+   * Gobiernan el mismo sobre y nada las ataba —la comprobación de la costura solo miraba que
+   * las dos listas tuvieran las mismas claves—. Con un campo distinto en cada sitio, el
+   * proveedor devuelve exactamente lo que su esquema pide y el servicio lee otra propiedad:
+   * descarta por «fuera de contrato» una llamada YA PAGADA. Con un techo distinto, la descarta
+   * por tamaño.
+   */
+  it('le pide al proveedor el mismo sobre que el servicio va a leer', () => {
+    for (const c of CAPACIDADES_ACTIVAS) {
+      const { lote } = CAPACIDADES[c];
+      const esquema = ESQUEMA_SALIDA[c] as {
+        type: string;
+        required: string[];
+        properties: Record<string, { type: string; minItems?: number; maxItems?: number }>;
+      };
+      if (lote === null) {
+        // Sin lote, el objeto viene en la RAÍZ. Que no haya sobre es la mitad que importa:
+        // un sobre de más y el servicio buscaría el objeto donde no está.
+        expect(esquema.properties[c], `${c} no debería declarar sobre`).toBeUndefined();
+        continue;
+      }
+      expect(esquema.required, `${c}: el sobre pedido no es el que se lee`).toEqual([lote.campo]);
+      const sobre = esquema.properties[lote.campo];
+      expect(sobre, `${c}: el esquema no declara ${lote.campo}`).toBeDefined();
+      expect(sobre!.type).toBe('array');
+      expect(sobre!.maxItems, `${c}: el techo pedido no es el que se valida`).toBe(lote.maximo);
+      expect(sobre!.minItems).toBe(1);
+    }
   });
 });

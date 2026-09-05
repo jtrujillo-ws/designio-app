@@ -23,9 +23,11 @@ import {
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   CAPACIDADES,
+  CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
   COLUMNA_DE_DESTINO,
   type AnclaCapacidad,
+  type CandidatoAncla,
   type Destino,
   parsearContenido,
   type CapacidadActiva,
@@ -292,59 +294,92 @@ async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Pro
 
 
 /**
- * TODO lo que el panel necesita saber de una columna de ancla, POR COLUMNA.
+ * Lo que el panel sabe de una columna de ancla: de dónde sale la fila y cómo se titula.
  *
- * El panel lee propuestas de cualquier capacidad, y de cada una tiene que resolver cuatro
- * cosas que dependen del TIPO de ancla y de nada más: de qué tabla cuelga (el join), cómo se
- * titula en pantalla, qué la bloquea —con su motivo— y qué material leyó el modelo, para
- * medir contra él la presencia literal de las citas.
+ * Esto va POR COLUMNA porque es lo único que de verdad depende de ella: el join es a la
+ * tabla del ancla y el título es de esa fila, con capacidad o sin ella. Todo lo demás —qué
+ * bloquea la propuesta, qué material leyó el modelo, qué anclas se ofrecen— NO depende de la
+ * columna sino de la CAPACIDAD, y está abajo.
  *
- * Estaba escrito para dos anclas: dos joins, un `coalesce` de dos títulos, un CASE cuya
- * última rama era la del reto y dos bloques de columnas de material. Se generalizó el
- * mapeador de filas y una revisión encontró lo que eso dejaba: generalizar quien LEE la fila
- * no sirve de nada si quien la PRODUCE sigue proyectando dos columnas. Un ancla nueva salía
- * del SQL sin su columna, sin su título y —lo peor— con el motivo del RETO, porque la última
- * rama del CASE no preguntaba por `reto_id`: se comía todo lo que no fuera un item. Medido:
- * con las dos columnas en null el CASE responde «reto-no-admite», que además de falso manda
- * al revisor a un trámite (reabrir la etapa 0) que no desbloquea nada.
- *
- * Al ser un `Record<AnclaCapacidad['columna'], …>` sobre el tipo, ampliar el ancla no
- * compila hasta que su join, su título, su motivo y su material estén escritos. No es un
- * guardián que avisa: es la firma de la consulta.
+ * La distinción la trajo una revisión y corrige un arreglo mío anterior: había puesto aquí
+ * también el motivo y el material, y eso hacía el registro exhaustivo por COLUMNA. Dos
+ * capacidades pueden anclar en el mismo sitio —C2 y C3 cuelgan del reto igual que C0— y no
+ * comparten ni sus puertas ni su material: C0 se congela con el G0 (SYS-22) y cita la
+ * formulación del reto; una capacidad posterior puede generarse después del G0 y citar la
+ * evidencia codificada. Indexado por columna, la capacidad nueva heredaba las reglas de C0
+ * sin que nada lo pidiera, y sin que faltara ninguna entrada que el compilador echara de
+ * menos. La costura tiene que exigir lo que varía DONDE varía.
  */
 type AnclaEnElPanel = {
-  /** Las piezas SQL, construidas con el `tx` de la consulta. */
-  consulta: (tx: TransactionSql) => {
-    /** De dónde sale la fila del ancla. */
-    join: PendingQuery<Row[]>;
-    /** Cómo se titula en el panel. */
-    titulo: PendingQuery<Row[]>;
-    /** El motivo, dado que ESTA columna es la que trae el ancla. */
-    estado: PendingQuery<Row[]>;
-    /** Las columnas con las que se recompone el material. */
-    material: PendingQuery<Row[]>;
-  };
-  /** El material que el modelo leyó, recompuesto desde esas columnas. */
-  material: (f: Record<string, unknown>) => string;
+  /** De dónde sale la fila del ancla. */
+  join: (tx: TransactionSql) => PendingQuery<Row[]>;
+  /** Cómo se titula en el panel. */
+  titulo: (tx: TransactionSql) => PendingQuery<Row[]>;
+  /**
+   * Las columnas de esa fila que el panel proyecta. Es el repertorio COMPLETO de esa tabla,
+   * no el de una capacidad: varias pueden anclar aquí y componer su material con partes
+   * distintas, así que se proyecta una vez y cada una toma lo suyo.
+   */
+  columnas: (tx: TransactionSql) => PendingQuery<Row[]>;
 };
 
 const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
   item_id: {
-    consulta: (tx) => ({
-      join: tx`left join item_importacion i
-        on i.id = p.item_id and i.workspace_id = p.workspace_id`,
-      titulo: tx`i.titulo`,
-      estado: tx`case
-          when i.estado is distinct from 'pendiente' then 'item-curado'
-          when tipo_fuente_exige_consentimiento(i.tipo_fuente)
-            and not consentimiento_externo_vigente(i.id, i.workspace_id)
-            then 'consentimiento-revocado'
-          else 'disponible'
-        end`,
-      material: tx`i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
-        i.referencia as item_referencia,
-        left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`,
-    }),
+    join: (tx) => tx`left join item_importacion i
+      on i.id = p.item_id and i.workspace_id = p.workspace_id`,
+    titulo: (tx) => tx`i.titulo`,
+    columnas: (tx) => tx`i.titulo as item_titulo, i.tipo_fuente as item_tipo_fuente,
+      i.referencia as item_referencia, i.estado as item_estado,
+      left(coalesce(i.contenido, ''), ${MAX_MATERIAL}) as item_contenido`,
+  },
+  reto_id: {
+    join: (tx) => tx`left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`,
+    titulo: (tx) => tx`r.codigo || ' ' || r.titulo`,
+    columnas: (tx) => tx`r.codigo as reto_codigo, r.titulo as reto_titulo,
+      r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica`,
+  },
+};
+
+/**
+ * Y lo que el panel sabe de una CAPACIDAD: qué la deja obsoleta, contra qué material se mide
+ * el grounding de sus citas, y qué anclas se le ofrecen a la generación.
+ *
+ * Las tres varían con la capacidad y no con la columna donde cuelga, y las tres tienen su
+ * modo de fallar en silencio si se indexan mal: el motivo manda al revisor a un trámite que
+ * no desbloquea nada, el material equivocado marca como ausentes citas que están, y la lista
+ * de candidatas esconde el ancla de una generación perfectamente válida.
+ */
+type CapacidadEnElPanel = {
+  /**
+   * Qué deja la propuesta obsoleta, DADO que su capacidad es esta. Sin `case … end`: el CASE
+   * exterior lo cierra con `else null`, que es lo que dice «este panel no sabe juzgar esto».
+   */
+  estado: (tx: TransactionSql) => PendingQuery<Row[]>;
+  /**
+   * El material que el modelo leyó, recompuesto desde las columnas que proyectó su ancla. Se
+   * compone IGUAL que al construir el prompt —ficha incluida y con el delimitador
+   * neutralizado—: la presencia literal se mide contra lo que el modelo leyó, no contra el
+   * texto crudo de la base. Una sola definición, dos usos.
+   */
+  material: (f: Record<string, unknown>) => string;
+  /** Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad. */
+  candidatas: (
+    tx: TransactionSql,
+    workspaceId: string,
+    patron: string | null,
+    limite: number,
+  ) => Promise<CandidatoAncla[]>;
+};
+
+const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
+  CI: {
+    estado: (tx) => tx`case
+        when i.estado is distinct from 'pendiente' then 'item-curado'
+        when tipo_fuente_exige_consentimiento(i.tipo_fuente)
+          and not consentimiento_externo_vigente(i.id, i.workspace_id)
+          then 'consentimiento-revocado'
+        else 'disponible'
+      end`,
     material: (f) =>
       materialDeItem({
         titulo: (f.item_titulo as string | null) ?? '',
@@ -352,33 +387,58 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
         referencia: (f.item_referencia as string | null) ?? '',
         contenido: (f.item_contenido as string | null) ?? '',
       }).texto,
+    /*
+     * Los items que exigen consentimiento o no traen material se ofrecen igual, MARCADOS: la
+     * pantalla explica qué falta, que es más útil que esconderlos sin decir por qué.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select i.id, i.titulo,
+               tipo_fuente_exige_consentimiento(i.tipo_fuente)
+                 and not consentimiento_externo_vigente(i.id, i.workspace_id)
+                 as consentimiento_pendiente,
+               not item_tiene_material_extraible(i.contenido) as sin_material
+        from item_importacion i
+        where i.workspace_id = ${workspaceId} and i.estado = 'pendiente'
+          and not exists (select 1 from propuesta_ai p
+            where p.item_id = i.id and p.workspace_id = i.workspace_id and p.estado = 'propuesta')
+          and (${patron}::text is null or i.titulo ilike ${patron})
+        order by i.creado_en asc, i.id asc
+        limit ${limite}`;
+      return filas.map((i) => ({
+        id: i.id as string,
+        titulo: i.titulo as string,
+        consentimientoPendiente: i.consentimiento_pendiente as boolean,
+        sinMaterial: i.sin_material as boolean,
+      }));
+    },
   },
-  reto_id: {
-    consulta: (tx) => ({
-      join: tx`left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`,
-      titulo: tx`r.codigo || ' ' || r.titulo`,
-      /*
-       * El ORDEN de los TRES motivos del reto importa cuando se cumplen varios a la vez, que
-       * es lo normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó Y firmó su
-       * registry). Se ordenan de la puerta más cerrada a la menos: primero el ciclo de vida
-       * del reto, que no se revierte nunca; después el registry firmado, que tampoco (la
-       * firma es de ida); y solo al final el G0, que es el ÚNICO con salida real —reabrir la
-       * etapa 0 (RF-04.9) descongela—. Sugerirle esa salida a quien tiene el reto archivado o
-       * el contrato firmado sería mandarlo a un trámite que no va a desbloquear nada. Entre
-       * motivos ciertos gana siempre el que describe la puerta que ya no se abre.
-       *
-       * Es el mismo orden con el que `criterio_g0_pendiente_guard` elige su `raise`, y por la
-       * misma razón: quien fuerza la escritura por SQL directo lee el motivo que le sirve.
-       */
-      estado: tx`case
-          when not reto_admite_criterios(p.reto_id, p.workspace_id) then 'reto-no-admite'
-          when reto_registry_firmado(p.reto_id, p.workspace_id) then 'registry-firmado'
-          when reto_g0_congela_criterios(p.reto_id, p.workspace_id) then 'criterios-congelados'
-          else 'disponible'
-        end`,
-      material: tx`r.codigo as reto_codigo, r.titulo as reto_titulo,
-        r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica`,
-    }),
+  C0: {
+    /*
+     * El ORDEN de los TRES motivos importa cuando se cumplen varios a la vez, que es lo
+     * normal en un reto cerrado (avanzó de etapa Y su G0 se aprobó Y firmó su registry). Se
+     * ordenan de la puerta más cerrada a la menos: primero el ciclo de vida del reto, que no
+     * se revierte nunca; después el registry firmado, que tampoco (la firma es de ida); y
+     * solo al final el G0, que es el ÚNICO con salida real —reabrir la etapa 0 (RF-04.9)
+     * descongela—. Sugerirle esa salida a quien tiene el reto archivado o el contrato firmado
+     * sería mandarlo a un trámite que no va a desbloquear nada. Entre motivos ciertos gana
+     * siempre el que describe la puerta que ya no se abre.
+     *
+     * Es el mismo orden con el que `criterio_g0_pendiente_guard` elige su `raise`, y por la
+     * misma razón: quien fuerza la escritura por SQL directo lee el motivo que le sirve.
+     */
+    estado: (tx) => tx`case
+        when not reto_admite_criterios(p.reto_id, p.workspace_id) then 'reto-no-admite'
+        when reto_registry_firmado(p.reto_id, p.workspace_id) then 'registry-firmado'
+        when reto_g0_congela_criterios(p.reto_id, p.workspace_id) then 'criterios-congelados'
+        else 'disponible'
+      end`,
+    /*
+     * C0 cita la formulación del reto igual que CI cita el material del item, así que la
+     * presencia se mide con la misma regla. Cuando C0 no citaba, sus propuestas no salían mal
+     * en la medición de grounding (RF-09.10): salían excluidas, que es peor — una capacidad
+     * que no puede salir mal es la que más falta hace medir.
+     */
     material: (f) =>
       materialDeReto({
         codigo: (f.reto_codigo as string | null) ?? '',
@@ -386,64 +446,109 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
         descripcion: (f.reto_descripcion as string | null) ?? '',
         metricaObjetivo: (f.reto_metrica as string | null) ?? '',
       }).texto,
+    /*
+     * Retos con criterios aún abiertos, que son DOS condiciones y no una: que el ciclo de vida
+     * del reto siga admitiéndolos (RF-04.12) y que nada los haya congelado (SYS-22: ni un G0
+     * aprobado ni un registry de medición firmado). Las dos las impone el guard del INSERT de
+     * propuestas, así que ofrecer un reto al que le falte cualquiera sería ofrecer una acción
+     * que la base va a rechazar — y las dos se preguntan por la MISMA función que la impone.
+     * Aquí basta el predicado COMPUESTO porque la lista solo decide si el reto se ofrece;
+     * distinguir la causa es cosa del panel, que sí tiene que explicarla.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
+        where r.workspace_id = ${workspaceId}
+          and reto_admite_criterios(r.id, r.workspace_id)
+          and not reto_criterios_congelados(r.id, r.workspace_id)
+          and not exists (select 1 from propuesta_ai p
+            where p.reto_id = r.id and p.workspace_id = r.workspace_id and p.estado = 'propuesta')
+          and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
+        order by r.codigo asc, r.id asc
+        limit ${limite}`;
+      return filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string }));
+    },
   },
 };
 
 /**
- * La proyección del panel que depende del ancla, compuesta desde el registro: una entrada
- * por columna declarada, en el mismo orden, para las cinco piezas.
+ * La proyección del panel, compuesta desde los DOS registros: lo que depende del ancla, por
+ * columna; lo que depende de la capacidad, por capacidad.
  *
  * Se exporta porque la prueba que la sujeta tiene que medir ESTA composición y no una copia
- * suya: lo que había que demostrar es que el motivo de un ancla no se le presta a otra, y
- * eso solo lo demuestra evaluar el mismo CASE que corre en producción.
+ * suya: lo que hay que demostrar es que ninguna capacidad hereda el juicio de otra, y eso
+ * solo lo demuestra evaluar el mismo CASE que corre en producción.
  */
-export function proyeccionDeAnclas(tx: TransactionSql): {
+export function proyeccionDelPanel(tx: TransactionSql): {
+  /** `p.<columna>` por cada ancla declarada. */
   columnas: PendingQuery<Row[]>;
+  /** Los títulos de cada ancla, para un `coalesce`. */
   titulos: PendingQuery<Row[]>;
+  /** El repertorio de columnas de cada tabla de ancla, del que cada capacidad toma lo suyo. */
   materiales: PendingQuery<Row[]>;
-  /** Las ramas del CASE, cada una preguntando por SU columna. Sin `case … end`: quien lo
-   * usa cierra con `else null`, que es lo que dice «este panel no sabe juzgar esta ancla». */
+  /**
+   * Las ramas del CASE, una POR CAPACIDAD y preguntando por su nombre. Sin `case … end`:
+   * quien lo usa cierra con `else null`, que es lo que dice «este panel no sabe juzgar esta
+   * propuesta» —y `filaDePanel` lo lee como «ancla-ausente», que es solo rechazable—.
+   *
+   * Por capacidad y no por columna, que es la corrección de fondo de esta ronda: preguntando
+   * `when p.reto_id is not null`, la segunda capacidad anclada en un reto habría recibido las
+   * puertas de C0 —el congelado del G0 entre ellas— sin que faltara ninguna entrada que el
+   * compilador echara de menos.
+   */
   motivo: PendingQuery<Row[]>;
   joins: PendingQuery<Row[]>;
 } {
-  const anclas = COLUMNAS_DE_ANCLA.map((c) => ({ c, q: ANCLA_EN_EL_PANEL[c].consulta(tx) }));
   const conComas = (fs: PendingQuery<Row[]>[]) => fs.reduce((a, b) => tx`${a}, ${b}`);
+  const anclas = COLUMNAS_DE_ANCLA.map((c) => ({ c, a: ANCLA_EN_EL_PANEL[c] }));
+  const capacidades = CAPACIDADES_ACTIVAS.map((k) => ({ k, d: CAPACIDAD_EN_EL_PANEL[k] }));
   return {
     columnas: conComas(anclas.map(({ c }) => tx`p.${tx(c)}`)),
-    titulos: conComas(anclas.map(({ q }) => q.titulo)),
-    materiales: conComas(anclas.map(({ q }) => q.material)),
-    motivo: anclas
-      .map(({ c, q }) => tx`when p.${tx(c)} is not null then ${q.estado}`)
+    titulos: conComas(anclas.map(({ a }) => a.titulo(tx))),
+    materiales: conComas(anclas.map(({ a }) => a.columnas(tx))),
+    motivo: capacidades
+      .map(({ k, d }) => tx`when p.capacidad = ${k} then ${d.estado(tx)}`)
       .reduce((a, b) => tx`${a} ${b}`),
-    joins: anclas.map(({ q }) => q.join).reduce((a, b) => tx`${a} ${b}`),
+    joins: anclas.map(({ a }) => a.join(tx)).reduce((a, b) => tx`${a} ${b}`),
   };
 }
 
 /**
- * La columna por la que cuelga ESTA fila, o `undefined` si ninguna declarada la trae.
- * Una sola respuesta para las tres preguntas que dependen de ella (id, material y si el
- * ancla se pudo resolver siquiera), para que no puedan discrepar entre sí.
+ * La definición de la capacidad de ESTA fila, o `undefined` si el panel no la conoce.
+ *
+ * `propuesta_ai.capacidad` admite las diez del catálogo y solo dos están activas, así que una
+ * fila puede nombrar una capacidad que este código no sabe pintar. No se esconde —una
+ * propuesta invisible es una que nadie puede rechazar— pero tampoco se le presta el juicio de
+ * otra: sale sin material y sin motivo, y `filaDePanel` lee eso como «ancla-ausente», que es
+ * solo rechazable.
+ */
+function definicionDeFila(f: Record<string, unknown>): CapacidadEnElPanel | undefined {
+  return CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva];
+}
+
+/**
+ * La columna por la que cuelga ESTA fila.
+ *
+ * Sale de lo que la CAPACIDAD declara —no de buscar cuál de las columnas trae valor—, porque
+ * eso es lo que dice de dónde cuelga de verdad; el barrido queda de reserva para una fila
+ * cuya capacidad este panel no conoce, donde adivinar por el valor es lo único que hay.
  */
 function columnaDelAncla(f: Record<string, unknown>): AnclaCapacidad['columna'] | undefined {
+  const declarada = CAPACIDADES[f.capacidad as CapacidadActiva]?.ancla.columna;
+  if (declarada) return declarada;
   return COLUMNAS_DE_ANCLA.find((c) => f[c] != null);
 }
 
 function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   const contenido = f.contenido as ContenidoPropuesta;
   const original = f.contenido_original as ContenidoPropuesta;
-  // El material se compone IGUAL que al construir el prompt —ficha incluida y con el
-  // delimitador neutralizado—: la presencia literal se mide contra lo que el modelo leyó, no
-  // contra el texto crudo de la base. Una sola definición, dos usos.
-  //
-  // Y se compone para TODA capacidad: C0 cita la formulación del reto igual que CI cita el
-  // material del item, así que la presencia se mide con la misma regla. Cuando C0 no citaba,
-  // sus propuestas no salían mal en la medición de grounding (RF-09.10): salían excluidas,
-  // que es peor — una capacidad que no puede salir mal es la que más falta hace medir. Cuál
-  // recomponer lo dice la columna que trae el ancla, no un ternario sobre dos nombres: con
-  // `f.item_id ? … : f.reto_codigo ? … : ''`, un ancla nueva medía sus citas contra la
-  // cadena vacía y todas salían ausentes.
+  // El material lo recompone la CAPACIDAD, que es lo que decide qué leyó el modelo. Con la
+  // columna del ancla no bastaba: dos capacidades pueden colgar del mismo reto y citar cosas
+  // distintas —C0 la formulación, una posterior la evidencia codificada—, así que indexarlo
+  // por columna le habría dado a la segunda el pajar de la primera y sus citas habrían salido
+  // ausentes estando presentes.
+  const material = definicionDeFila(f)?.material(f) ?? '';
   const columna = columnaDelAncla(f);
-  const material = columna ? ANCLA_EN_EL_PANEL[columna].material(f) : '';
   // Las presencias se resuelven de una vez para toda la fila: el pajar es el mismo para
   // todas sus citas, y normalizarlo por cita multiplicaba el trabajo por seis sin cambiar
   // ninguna respuesta.
@@ -552,20 +657,20 @@ export async function panelPropuestas(
     // su motivo. Ahora cada rama declara de QUÉ columna habla y el fondo del CASE es NULL,
     // que `filaDePanel` lee como «ancla-ausente» — no aceptable, que es la única respuesta
     // honesta cuando el panel no sabe juzgar el ancla.
-    const anclas = proyeccionDeAnclas(tx);
+    const proyeccion = proyeccionDelPanel(tx);
 
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
-             p.contenido, p.contenido_original, ${anclas.columnas},
+             p.contenido, p.contenido_original, ${proyeccion.columnas},
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
-             coalesce(${anclas.titulos}) as ancla_titulo,
-             case ${anclas.motivo} else null end as ancla_estado,
-             ${anclas.materiales}`;
+             coalesce(${proyeccion.titulos}) as ancla_titulo,
+             case ${proyeccion.motivo} else null end as ancla_estado,
+             ${proyeccion.materiales}`;
     // La llamada que pagó cada propuesta: el uso, el coste y la latencia viven allí (una
     // fila por llamada, aunque devuelva un lote), no repetidos en cada propuesta.
     const origen = tx`from propuesta_ai p
       join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
-      ${anclas.joins}`;
+      ${proyeccion.joins}`;
 
     // Se pide una fila de más para saber si el corte dejó algo fuera (mismo truco que la
     // bandeja): el panel lo dice en vez de fingir que eso es todo.
@@ -645,19 +750,31 @@ export async function panelPropuestas(
     // la búsqueda por texto es lo que vuelve la promesa incondicional: cualquier ancla se
     // alcanza por su nombre sin depender de dónde caiga el corte.
     const patron = busqueda ? `%${busqueda.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
-    const items = await tx`
-      select i.id, i.titulo,
-             tipo_fuente_exige_consentimiento(i.tipo_fuente)
-               and not consentimiento_externo_vigente(i.id, i.workspace_id)
-               as consentimiento_pendiente,
-             not item_tiene_material_extraible(i.contenido) as sin_material
-      from item_importacion i
-      where i.workspace_id = ${workspaceId} and i.estado = 'pendiente'
-        and not exists (select 1 from propuesta_ai p
-          where p.item_id = i.id and p.workspace_id = i.workspace_id and p.estado = 'propuesta')
-        and (${patron}::text is null or i.titulo ilike ${patron})
-      order by i.creado_en asc, i.id asc
-      limit ${PAGINA_ANCLAS + 1}`;
+
+    // Y las candidatas las pide CADA CAPACIDAD con SU consulta de elegibilidad, no la columna
+    // donde cuelgan. Indexado por columna, una segunda capacidad anclada en un reto recibía la
+    // lista de C0 —que excluye los retos con criterios congelados—, así que una generación
+    // suya perfectamente válida después del G0 se quedaba sin ancla que ofrecer, y sin que
+    // faltara ninguna entrada que el compilador echara de menos.
+    //
+    // Se pide una fila de más para saber si el corte dejó algo fuera, y el corte se DICE.
+    const candidatas = Object.fromEntries(
+      await Promise.all(
+        CAPACIDADES_ACTIVAS.map(async (k) => {
+          const filas = await CAPACIDAD_EN_EL_PANEL[k].candidatas(
+            tx,
+            workspaceId,
+            patron,
+            PAGINA_ANCLAS + 1,
+          );
+          return [
+            k,
+            { lista: filas.slice(0, PAGINA_ANCLAS), hayMas: filas.length > PAGINA_ANCLAS },
+          ] as const;
+        }),
+      ),
+    ) as PanelPropuestas['candidatas'];
+
     // Material de personas del workspace, con el estado de su consentimiento VIGENTE. Es
     // una lista aparte de las anclas ofrecibles a propósito: el consentimiento no es un
     // paso de la generación sino un hecho de la investigación que se registra cuando
@@ -677,25 +794,6 @@ export async function panelPropuestas(
         and (${patron}::text is null or i.titulo ilike ${patron})
       order by i.creado_en asc, i.id asc
       limit ${PAGINA_ANCLAS + 1}`;
-    // Retos con criterios aún abiertos, que son DOS condiciones y no una: que el ciclo de
-    // vida del reto siga admitiéndolos (RF-04.12) y que nada los haya congelado (SYS-22:
-    // ni un G0 aprobado ni un registry de medición firmado). Las dos las impone el guard del
-    // INSERT de propuestas, así que ofrecer un reto al que le falte cualquiera de ellas sería
-    // ofrecer una acción que la base va a rechazar — y las dos se preguntan por la MISMA
-    // función que la impone, para que no vuelvan a divergir. Aquí basta el predicado
-    // COMPUESTO porque la lista solo decide si el reto se ofrece; distinguir la causa es
-    // cosa del panel, que sí tiene que explicarla.
-    const retos = await tx`
-      select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
-      where r.workspace_id = ${workspaceId}
-        and reto_admite_criterios(r.id, r.workspace_id)
-        and not reto_criterios_congelados(r.id, r.workspace_id)
-        and not exists (select 1 from propuesta_ai p
-          where p.reto_id = r.id and p.workspace_id = r.workspace_id and p.estado = 'propuesta')
-        and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
-      order by r.codigo asc, r.id asc
-      limit ${PAGINA_ANCLAS + 1}`;
-
     return {
       workspaceId,
       ai: {
@@ -717,17 +815,7 @@ export async function panelPropuestas(
         rechazadas: (respaldo?.rechazadas ?? 0) as number,
       },
       hayMasDecididas: decididas.length > DECIDIDAS_RECIENTES,
-      itemsPendientes: items.slice(0, PAGINA_ANCLAS).map((i) => ({
-        id: i.id as string,
-        titulo: i.titulo as string,
-        consentimientoPendiente: i.consentimiento_pendiente as boolean,
-        sinMaterial: i.sin_material as boolean,
-      })),
-      retosAbiertos: retos
-        .slice(0, PAGINA_ANCLAS)
-        .map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
-      hayMasItems: items.length > PAGINA_ANCLAS,
-      hayMasRetos: retos.length > PAGINA_ANCLAS,
+      candidatas,
       materialDePersonas: personas.slice(0, PAGINA_ANCLAS).map((p) => ({
         id: p.id as string,
         titulo: p.titulo as string,
@@ -1848,8 +1936,19 @@ export async function registrarConsentimiento(
 type PropuestaEnRevision = {
   capacidad: CapacidadActiva;
   destino: 'evidencia' | 'criterio-exito';
-  itemId: string | null;
-  retoId: string | null;
+  /**
+   * El id del ancla, el de la columna que SU capacidad declara.
+   *
+   * Aquí había `itemId` y `retoId`, y los materializadores tomaban el suyo con un `!`. Eso
+   * dejaba fuera del alcance a toda ancla nueva: la proyección seleccionaba dos columnas, así
+   * que un materializador de un ancla distinta no recibía ningún id —y uno de los de ahora,
+   * si le tocaba una fila con el ancla en otra columna, recibía `null` y reventaba contra su
+   * FK—. Preguntando por la columna declarada no hay `!` que justificar ni columna que
+   * adivinar: la propuesta cuelga de donde su capacidad dice.
+   */
+  anclaId: string;
+  /** Y todas las declaradas, tal cual vienen, para quien necesite mirar más de una. */
+  anclas: Record<AnclaCapacidad['columna'], string | null>;
   contenido: ContenidoPropuesta;
   /** Lo que dijo el modelo, intacto (SYS-17). Es contra esto —y no contra el contenido
    * vigente— contra lo que se comprueba que una corrección no toque las citas. */
@@ -1863,18 +1962,34 @@ async function leerParaRevisar(
   workspaceId: string,
   propuestaId: string,
 ): Promise<PropuestaEnRevision> {
-  const [p] = await tx`select capacidad, destino, item_id, reto_id, contenido,
+  // Las columnas de ancla salen del registro, como en los tres inserts: escritas a mano,
+  // esta proyección se quedaba en dos y el materializador de la tercera no recibía su id.
+  const columnasDeAncla = COLUMNAS_DE_ANCLA.map((c) => tx`${tx(c)}`).reduce(
+    (a, b) => tx`${a}, ${b}`,
+  );
+  const [p] = await tx`select capacidad, destino, ${columnasDeAncla}, contenido,
       contenido_original, modelo, prompt_version, estado
     from propuesta_ai where id = ${propuestaId} and workspace_id = ${workspaceId}`;
   if (!p) throw new ErrorAI('La propuesta no existe en este workspace');
   if ((p.estado as string) !== 'propuesta') {
     throw new ErrorAI('Esa propuesta ya fue revisada: las decisiones son inmutables');
   }
+  const capacidad = p.capacidad as CapacidadActiva;
+  const anclas = Object.fromEntries(
+    COLUMNAS_DE_ANCLA.map((c) => [c, (p[c] ?? null) as string | null]),
+  ) as PropuestaEnRevision['anclas'];
+  const anclaId = anclas[CAPACIDADES[capacidad].ancla.columna];
+  // El CHECK de `propuesta_ai` ata destino y ancla, así que llegar aquí sin ella significa que
+  // alguien escribió por SQL directo saltándose la restricción. Se dice en vez de seguir con
+  // un `null` que reventaría más adelante contra una FK, sin decir por qué.
+  if (!anclaId) {
+    throw new ErrorAI('Esa propuesta no tiene ancla en la columna que su capacidad declara');
+  }
   return {
-    capacidad: p.capacidad as CapacidadActiva,
+    capacidad,
     destino: p.destino as PropuestaEnRevision['destino'],
-    itemId: p.item_id as string | null,
-    retoId: p.reto_id as string | null,
+    anclaId,
+    anclas,
     contenido: p.contenido as ContenidoPropuesta,
     contenidoOriginal: p.contenido_original as ContenidoPropuesta,
     modelo: p.modelo as string,
@@ -2053,12 +2168,12 @@ async function materializarEvidencia(
   // revocación que commitea justo después entra por la rendija — el guard diferido la para en
   // el commit, pero con un error del suelo en vez del que dice cómo salir. El candado no es lo
   // que cierra la ventana: es lo que hace que el orden sea determinista y el mensaje, el bueno.
-  await bloquearConsentimiento(tx, p.itemId!);
+  await bloquearConsentimiento(tx, p.anclaId);
   const [item] = await tx`select titulo, tipo_fuente, referencia,
       tipo_fuente_exige_consentimiento(tipo_fuente)
         and not consentimiento_externo_vigente(id, workspace_id) as consentimiento_retirado
     from item_importacion
-    where id = ${p.itemId} and workspace_id = ${workspaceId} and estado = 'pendiente'`;
+    where id = ${p.anclaId} and workspace_id = ${workspaceId} and estado = 'pendiente'`;
   if (!item) throw new ErrorAI('El item de la bandeja ya fue curado o no existe');
   // La otra mitad del permiso, y una ventana distinta de la del despacho: la propuesta se
   // generó con consentimiento vigente y la persona lo retiró DESPUÉS. Aceptar crearía un
@@ -2077,7 +2192,7 @@ async function materializarEvidencia(
   // es la que decide si el material puede salir, y se hace sobre el registro vigente donde
   // toca, antes de construir el prompt y en el guard de la propuesta.
   const [consentimiento] = await tx`select 1 as hay from consentimiento_item
-    where item_id = ${p.itemId} and workspace_id = ${workspaceId} limit 1`;
+    where item_id = ${p.anclaId} and workspace_id = ${workspaceId} limit 1`;
 
   // Sin fecha no hay proveniencia, y la proveniencia es obligatoria en una evidencia
   // (`DimensionesEvidenciaSchema` la exige, y con razón: una evidencia sin fecha no se puede
@@ -2146,12 +2261,12 @@ async function materializarEvidencia(
   const selladas = await tx`update item_importacion
     set estado = 'aprobado', decidido_por = ${actorId}, decidido_en = now(),
         evidencia_id = ${evidenciaId}
-    where id = ${p.itemId} and workspace_id = ${workspaceId} and estado = 'pendiente'
+    where id = ${p.anclaId} and workspace_id = ${workspaceId} and estado = 'pendiente'
     returning workspace_role(${actorId}, ${workspaceId}) as rol`;
   if (selladas.length === 0) throw new ErrorAI('El item ya fue decidido por otra persona');
   await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (${workspaceId}, 'EvidenciaCurada',
-      ${tx.json({ itemId: p.itemId, evidenciaId, origen: 'propuesta-ai' })},
+      ${tx.json({ itemId: p.anclaId, evidenciaId, origen: 'propuesta-ai' })},
       ${actorId}, ${selladas[0]!.rol as string})`;
   return evidenciaId;
 }
@@ -2167,7 +2282,7 @@ async function materializarCriterio(
 ): Promise<string> {
   // Mismo candado que agregarCriterio: mutar criterios y decidir un G0 no pueden
   // entrecruzarse (contrato documentado en metodo.servicio.ts).
-  await bloquearReto(tx, p.retoId!);
+  await bloquearReto(tx, p.anclaId);
   // El reto tiene que SEGUIR admitiendo criterios, y eso no lo cubre el congelado por G0:
   // son dos predicados distintos. La generación exigió los dos y el guard del INSERT
   // también, pero entre generar y aceptar hay una segunda vida entera y el ciclo de vida del
@@ -2179,7 +2294,7 @@ async function materializarCriterio(
   // aquí lo que nace no es una propuesta, es el criterio. Se lee DENTRO de `bloquearReto`,
   // el mismo candado que toma la aprobación del G0.
   const [reto] = await tx`select
-    reto_admite_criterios(${p.retoId}::uuid, ${workspaceId}::uuid) as admite`;
+    reto_admite_criterios(${p.anclaId}::uuid, ${workspaceId}::uuid) as admite`;
   if (!reto?.admite) {
     throw new ErrorAI(
       'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo. Esta propuesta quedó obsoleta y solo puede rechazarse',
@@ -2189,7 +2304,7 @@ async function materializarCriterio(
     const [criterio] = await tx`insert into criterio_exito
       (workspace_id, reto_id, kpi, definicion, linea_base_valor, linea_base_fecha,
        linea_base_plan, objetivo, ventana_dias, fecha_post_mortem, creado_por)
-      values (${workspaceId}, ${p.retoId}, ${c.kpi}, ${c.definicion}, null, null,
+      values (${workspaceId}, ${p.anclaId}, ${c.kpi}, ${c.definicion}, null, null,
               ${c.lineaBasePlan}, ${c.objetivo}, ${c.ventanaDias}, null, ${actorId})
       returning id`;
     return criterio!.id as string;

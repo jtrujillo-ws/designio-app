@@ -173,8 +173,13 @@ export type GrupoDeSegmento = {
   segmento: SegmentoEnMemoria | null;
   /** Los que se ENSEÑAN: los que sobrevivieron al tope global y son de este segmento. */
   arquetipos: ArquetipoEnMemoria[];
-  /** Los que HAY: si es mayor que los mostrados, el tope dejó fuera alguno de este grupo. */
-  total: number;
+  /**
+   * Los que HAY: si es mayor que los mostrados, el tope dejó fuera alguno de este grupo.
+   * Null cuando NO se sabe: el grupo «fuera de los mostrados» solo conoce los que cupieron
+   * entre los 50 más recientes, y contar los demás costaría lo que el tope ahorra. La
+   * cabecera lo dice en vez de presentar lo mostrado como cifra exacta.
+   */
+  total: number | null;
 };
 
 /**
@@ -229,7 +234,7 @@ export function agruparArquetiposPorSegmento(
       clase: 'fuera-de-los-mostrados',
       segmento: null,
       arquetipos: fuera,
-      total: fuera.length,
+      total: null,
     });
   }
   // Sin mapeo alguno: los únicos «sin segmento declarado». El grupo existe si HAY alguno,
@@ -247,13 +252,25 @@ export function agruparArquetiposPorSegmento(
   return grupos;
 }
 
-/** Cuántos arquetipos hay en cada estado: el resumen de cabecera de la sección. */
-export function resumenDeArquetipos(
-  arquetipos: ArquetipoEnMemoria[],
-): Record<EstadoArquetipo, number> {
-  const resumen: Record<EstadoArquetipo, number> = { hipotesis: 0, confirmado: 0, refutado: 0 };
-  for (const a of arquetipos) resumen[a.estado] += 1;
-  return resumen;
+/**
+ * La cabecera de la sección de arquetipos: el total real del workspace y el desglose por
+ * estado de los ENSEÑADOS. Como en `resumenDeRespaldo`, cuando el tope recortó se dice de
+ * qué conjunto es el desglose —«de los 50 mostrados: …»— en vez de poner cifras de 50
+ * filas al lado de un total de 80 como si fueran del mismo conjunto; contar por estado lo
+ * que el tope dejó fuera obligaría a traerlo. Sin recorte, coinciden y no hace falta.
+ */
+export function resumenDeArquetipos(arquetipos: ArquetipoEnMemoria[], total: number): string {
+  if (total === 0) return '0 arquetipos';
+  const r: Record<EstadoArquetipo, number> = { hipotesis: 0, confirmado: 0, refutado: 0 };
+  for (const a of arquetipos) r[a.estado] += 1;
+  const desglose = `${r.confirmado} ${r.confirmado === 1 ? 'confirmado' : 'confirmados'} · ${r.hipotesis} hipótesis · ${r.refutado} ${r.refutado === 1 ? 'refutado' : 'refutados'}`;
+  const ambito =
+    total > arquetipos.length
+      ? arquetipos.length === 1
+        ? 'del mostrado: '
+        : `de los ${arquetipos.length} mostrados: `
+      : '';
+  return `${total} ${total === 1 ? 'arquetipo' : 'arquetipos'} · ${ambito}${desglose}`;
 }
 
 /** A dónde abre un arquetipo: al proyecto de su reto, que es donde vive su gobernanza. Sin proyecto no hay pantalla. */
@@ -320,6 +337,10 @@ export function resumenDeRespaldo(
  * arquetipos» cuando los hay y el tope los dejó fuera.
  */
 export function cabeceraDeGrupo(g: GrupoDeSegmento): string {
+  if (g.total === null) {
+    const n = g.arquetipos.length;
+    return `${n} ${n === 1 ? 'mostrado' : 'mostrados'} (puede haber más entre los arquetipos más antiguos)`;
+  }
   if (g.total === 0) return 'sin arquetipos todavía';
   if (g.total > g.arquetipos.length) {
     return `se muestran ${g.arquetipos.length} de ${g.total} (los más recientes)`;

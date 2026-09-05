@@ -376,13 +376,8 @@ function SeccionArquetipos({
   /** Cuántos segmentos hay; los grupos son como mucho el tope, y el resto está en /segmentos. */
   totalSegmentos: number;
 }) {
-  // El desglose por estado es de los que se ENSEÑAN: los que el tope dejó fuera no se
-  // pueden contar por estado sin traerlos, y la nota de recorte ya dice que faltan.
-  const resumen = resumenDeArquetipos(arquetipos);
-  const cabecera =
-    total === 0
-      ? '0 arquetipos'
-      : `${total} ${total === 1 ? 'arquetipo' : 'arquetipos'} · ${resumen.confirmado} ${resumen.confirmado === 1 ? 'confirmado' : 'confirmados'} · ${resumen.hipotesis} hipótesis · ${resumen.refutado} ${resumen.refutado === 1 ? 'refutado' : 'refutados'}`;
+  // El desglose por estado es de los que se ENSEÑAN, y la cabecera lo dice cuando hay recorte.
+  const cabecera = resumenDeArquetipos(arquetipos, total);
   const recorte = notaDeRecorte(arquetipos.length, total, 'el proyecto de cada reto');
   // Los grupos de abajo son los segmentos MOSTRADOS: un segmento fuera del tope no tiene
   // tarjeta aquí, y decirlo con el enlace a la lista entera es lo que evita que parezca que

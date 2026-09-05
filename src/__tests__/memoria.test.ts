@@ -96,11 +96,24 @@ describe('los arquetipos agrupados por segmento', () => {
     );
     expect(grupos.map((g) => [g.clase, g.arquetipos.map((a) => a.id), g.total])).toEqual([
       ['segmento', ['a1', 'a4'], 2],
-      ['fuera-de-los-mostrados', ['a3'], 1],
+      // Total desconocido: solo se sabe de los que cupieron entre los mostrados.
+      ['fuera-de-los-mostrados', ['a3'], null],
       ['sin-segmento', ['a2'], 1],
     ]);
     expect(grupos[1]!.segmento).toBeNull();
     expect(grupos[2]!.segmento).toBeNull();
+    // Y su cabecera no presenta lo mostrado como cifra exacta.
+    expect(cabeceraDeGrupo(grupos[1]!)).toBe(
+      '1 mostrado (puede haber más entre los arquetipos más antiguos)',
+    );
+    expect(
+      cabeceraDeGrupo({
+        clase: 'fuera-de-los-mostrados',
+        segmento: null,
+        arquetipos: [],
+        total: null,
+      }),
+    ).toBe('0 mostrados (puede haber más entre los arquetipos más antiguos)');
   });
 
   it('los grupos «fuera de los mostrados» y «sin segmento» solo existen si hay alguno', () => {
@@ -173,15 +186,26 @@ describe('los arquetipos agrupados por segmento', () => {
 });
 
 describe('el resumen de arquetipos', () => {
-  it('cuenta por estado y dice cero donde no hay', () => {
-    expect(
-      resumenDeArquetipos([
-        arquetipo({ id: 'a1', nombre: 'A', estado: 'confirmado' }),
-        arquetipo({ id: 'a2', nombre: 'B', estado: 'hipotesis' }),
-        arquetipo({ id: 'a3', nombre: 'C', estado: 'hipotesis' }),
-      ]),
-    ).toEqual({ confirmado: 1, hipotesis: 2, refutado: 0 });
-    expect(resumenDeArquetipos([])).toEqual({ confirmado: 0, hipotesis: 0, refutado: 0 });
+  const tres = [
+    arquetipo({ id: 'a1', nombre: 'A', estado: 'confirmado' }),
+    arquetipo({ id: 'a2', nombre: 'B', estado: 'hipotesis' }),
+    arquetipo({ id: 'a3', nombre: 'C', estado: 'hipotesis' }),
+  ];
+
+  it('sin recorte, cuenta por estado y dice cero donde no hay', () => {
+    expect(resumenDeArquetipos(tres, 3)).toBe(
+      '3 arquetipos · 1 confirmado · 2 hipótesis · 0 refutados',
+    );
+    expect(resumenDeArquetipos([], 0)).toBe('0 arquetipos');
+  });
+
+  it('con recorte, dice que el desglose es de los mostrados: lo que el tope dejó fuera no se cuenta por estado', () => {
+    expect(resumenDeArquetipos(tres, 80)).toBe(
+      '80 arquetipos · de los 3 mostrados: 1 confirmado · 2 hipótesis · 0 refutados',
+    );
+    expect(resumenDeArquetipos([tres[0]!], 2)).toBe(
+      '2 arquetipos · del mostrado: 1 confirmado · 0 hipótesis · 0 refutados',
+    );
   });
 });
 

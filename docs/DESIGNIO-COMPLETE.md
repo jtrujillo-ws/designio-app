@@ -579,7 +579,8 @@ existe pero **no se cita en un gate ni sale en un entregable** (SYS-14).
 ## Derechos de uso
 
 - Estados: `pendiente` → `concedido` o `denegado`. Un derecho concedido se puede **revocar** (pasa
-  a `denegado`, con su base documental); lo que no existe es la vuelta a `pendiente`, que significa
+  a `denegado`, con su base documental) y uno denegado se puede **volver a conceder**: los derechos
+  no son de sentido único. Lo que no existe es la vuelta a `pendiente`, que significa
   «nadie ha decidido todavía» y solo se nace en él.
 - Ámbitos: `interno`, `cliente`, `publico`. Cada uso aguas abajo pregunta por el ámbito que necesita.
 - **Vigencia temporal**: los derechos pueden vencer, y todo predicado de uso mira la fecha **de la
@@ -1094,7 +1095,9 @@ La **memoria del workspace**, tal como la define el prediseño (§4.1, §11): un
 lectura sobre lo que el workspace ya sabe, **no un almacén aparte**. Conserva los **arquetipos
 históricos por segmento** como hipótesis a confirmar o refutar en retos nuevos, y junto a ellos los
 **insights validados**, las **decisiones vigentes** y los **retos cerrados con su veredicto**: es lo
-que pre-puebla la etapa 0 del siguiente reto (J7 → J2). Cada sección trae hasta 50 filas, dice
+que el método quiere que pre-pueble la etapa 0 del siguiente reto (J7 → J2). Hoy la biblioteca solo se
+**consulta**: ninguna server function de retos lee esta proyección, y la creación de un reto candidato
+pre-poblado desde la memoria está pendiente (ver `30`). Cada sección trae hasta 50 filas, dice
 cuántas hay en total y enlaza a la pantalla dueña.
 
 No confundir con la **biblioteca general** de la boutique (CTX-07, conocimiento metodológico sin
@@ -1137,8 +1140,10 @@ Fuente: SPEC-01 (RF-01.7). PR [#40](https://github.com/jtrujillo-ws/designio-app
 
 - Invitan lead y admin del cliente, con exactamente un rol invitable (`sponsor`, `stakeholder`,
   `admin-cliente`, `lead-boutique`, `disenador`). `agente-ai` no es invitable.
-- La invitación emite un **token de un solo uso** con expiración; re-invitar al mismo correo invalida
-  el anterior. **Sin correo saliente en el MVP**, el enlace de activación se muestra en pantalla para
+- La invitación emite un **token de un solo uso** con expiración; re-invitar al mismo correo **desde el
+  workspace que originó la invitación** rota el token e invalida el anterior; una invitación a esa
+  misma cuenta pendiente desde **otro** workspace no emite enlace ni toca el token vigente (la
+  activación sigue perteneciendo al workspace de origen). **Sin correo saliente en el MVP**, el enlace de activación se muestra en pantalla para
   compartirlo. El aterrizaje fija la contraseña y entra directo al workspace.
 - Estados de usuario: `invitado`, `activo`, `inactivo`.
 - **Sin baja de miembros desde la app**: revocar la membresía de alguien (RF-01.4) no tiene
@@ -1366,7 +1371,7 @@ alcanzado del catálogo de Postgres.
 | Release | `planificado` → `desplegado` → `verificado` |
 | Insight | `propuesto` → `validado` (sin estado de descarte) |
 | Arquetipo | `hipotesis` → `confirmado` · `refutado` |
-| Derecho de uso | `pendiente` → `concedido` → `denegado` (revocación) · `pendiente` → `denegado`; nunca vuelve a `pendiente` |
+| Derecho de uso | `pendiente` → `concedido` · `denegado`; `concedido` ↔ `denegado` (revocar y volver a conceder, siempre con base documental); nunca vuelve a `pendiente` |
 | Ítem de importación | `pendiente` → `aprobado` · `rechazado` |
 | Propuesta AI | `propuesta` → `aceptada` · `corregida` (aceptada con correcciones) · `rechazada`; las tres son terminales |
 | Llamada AI | `despachada` → `salida-valida` · `rechazo-proveedor` · `fuera-de-contrato` · `sin-respuesta` |

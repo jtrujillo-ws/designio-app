@@ -43,6 +43,9 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
   // actual. Se avanza en TODOS los caminos, también cuando el texto se queda corto o vacío:
   // si no, la respuesta de «ab» aterrizaba sobre un campo que ya decía «a».
   const consulta = useRef(0);
+  // Enter con una consulta en vuelo no elige nada de la lista anterior: se anota y se abre
+  // el primer resultado de la consulta ACTUAL cuando llegue. Teclear otra letra lo olvida.
+  const enterPendiente = useRef(false);
 
   // «/» enfoca el buscador desde cualquier sitio de la pantalla, salvo cuando ya se escribe
   // en otro campo: ahí la barra es un carácter más.
@@ -66,6 +69,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
 
   useEffect(() => {
     const numero = ++consulta.current;
+    enterPendiente.current = false;
     const limpio = texto.trim();
     if (!workspaceId || limpio === '') {
       setEstado({ fase: 'inactivo' });
@@ -85,6 +89,17 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
         if (numero !== consulta.current) return;
         setEstado({ fase: 'listo', resultados: r.resultados, hayMas: r.hayMas, texto: limpio });
         setActivo(0);
+        if (enterPendiente.current) {
+          enterPendiente.current = false;
+          const primero = r.resultados[0];
+          if (primero) {
+            setAbierto(false);
+            setTexto('');
+            setEstado({ fase: 'inactivo' });
+            input.current?.blur();
+            void navegarA(navigate, primero.destino);
+          }
+        }
       } catch (e) {
         if (numero !== consulta.current) return;
         setEstado({
@@ -96,7 +111,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
       }
     }, ESPERA_MS);
     return () => clearTimeout(temporizador);
-  }, [texto, workspaceId]);
+  }, [texto, workspaceId, navigate]);
 
   const resultados = estado.fase === 'listo' ? estado.resultados : [];
   const desplegado = abierto && texto.trim() !== '' && workspaceId !== null;
@@ -142,6 +157,11 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
     }
     if (e.key === 'Enter') {
       e.preventDefault();
+      // La lista en pantalla puede ser la de la consulta anterior mientras llega la nueva.
+      if (cargando || estado.fase !== 'listo' || estado.texto !== texto.trim()) {
+        enterPendiente.current = texto.trim().length >= MIN_CARACTERES;
+        return;
+      }
       const elegido = resultados[activo] ?? resultados[0];
       if (elegido) void abrir(elegido);
     }

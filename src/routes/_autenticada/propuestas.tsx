@@ -89,6 +89,48 @@ const COLOR_ESTADO: Record<PropuestaEnPanel['estado'], string> = {
  * registry FIRMADO es otro motivo y no una redacción del mismo: ahí no hay reapertura que
  * valga, así que ofrecer esa salida sería mandar al lead a un trámite que no desbloquea
  * nada. */
+/**
+ * Y cuáles de esos motivos dejan abierta la CORRECCIÓN.
+ *
+ * La pantalla trataba todo estado distinto de `disponible` como «esta propuesta ya solo se
+ * rechaza», y eso era exacto mientras todos los motivos hablaran del ancla: si el item se curó,
+ * si el reto se archivó o si el registry se firmó, corregir el texto no arregla nada — lo que
+ * cambió está fuera de la propuesta.
+ *
+ * `nombre-ocupado` rompe esa equivalencia y por eso hace falta este registro. No es un motivo
+ * del ancla: es una COLISIÓN DEL CONTENIDO con lo que hay en el registry, el servidor acepta la
+ * corrección que la arregla, y el propio mensaje le dice a quien revisa que corrija el nombre.
+ * Con el botón apagado, la pantalla decía una cosa y ofrecía la contraria.
+ *
+ * `Record<EstadoAncla, boolean>` y no una lista de excepciones: un estado nuevo tiene que
+ * decidir a cuál de los dos grupos pertenece, que es justo lo que este caso demuestra que no se
+ * puede heredar. «Aceptar tal cual» sigue apagado en los dos: eso lo gobierna `anclaDisponible`.
+ */
+const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
+  // `disponible` no pasa por aquí —el botón ya está activo—, pero la entrada existe porque el
+  // registro es exhaustivo y una respuesta es más clara que una ausencia.
+  disponible: true,
+  'item-curado': false,
+  'consentimiento-revocado': false,
+  'criterios-congelados': false,
+  'registry-firmado': false,
+  'registry-cerrado': false,
+  // El criterio al que la entrada responde ya no está, y ese campo es TESTIMONIO: no se
+  // corrige. Sin criterio al que apuntar, la única salida es rechazar.
+  'criterio-ausente': false,
+  // La única que SÍ: el nombre es del contenido, se corrige, y corregirlo es exactamente lo
+  // que el mensaje pide.
+  'nombre-ocupado': true,
+  'reto-no-admite': false,
+  'gate-decidido': false,
+  'checklist-avanzado': false,
+  'reto-archivado': false,
+  'evidencia-no-citable': false,
+  'alcance-incompleto': false,
+  'journey-cambiado': false,
+  'ancla-ausente': false,
+};
+
 const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
   disponible: '',
   'item-curado': 'El item ya se curó a mano: esta propuesta quedó obsoleta y solo puede rechazarse.',
@@ -1386,7 +1428,9 @@ function TarjetaPropuesta({
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={ocupado || !anclaDisponible}
+                disabled={
+                  ocupado || (!anclaDisponible && !CORREGIR_SIGUE_ABIERTO[propuesta.anclaEstado])
+                }
                 onClick={() => setCorrigiendo(true)}
               >
                 Corregir y aceptar

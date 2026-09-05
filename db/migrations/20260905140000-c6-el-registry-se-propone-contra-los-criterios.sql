@@ -1059,3 +1059,109 @@ begin
 
   return null;
 end $function$;
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- EL SELLO NO ES UNA EDICIÓN
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- ⚠ CUIDADO AL INTEGRAR: esto REEMPLAZA el cuerpo vivo de `medicion_auditoria`, definido en
+-- `…110000-medicion.sql`. Mismo aviso que los dos guards de arriba y por el mismo motivo: si
+-- otra rama le añade una tabla a este guard en una migración anterior, ésta la borra en
+-- silencio. El cuerpo va copiado de allí con sus comentarios; lo único nuevo es la salida
+-- temprana de la rama de `entrada_kpi`, comentada en su sitio.
+
+create or replace function medicion_auditoria() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  -- En un DELETE no hay `new`, y nombrarlo aquí reventaría el trigger: la fila auditada es
+  -- `old`. Se asigna en el cuerpo y no en la declaración justamente por eso.
+  fila jsonb;
+  previa jsonb;
+  cuerpo jsonb;
+  evento text;
+begin
+  if tg_op = 'DELETE' then
+    fila := to_jsonb(old);
+  else
+    fila := to_jsonb(new);
+    if tg_op = 'UPDATE' then previa := to_jsonb(old); end if;
+  end if;
+  -- Guard compartido entre tablas con columnas distintas: se trabaja sobre jsonb porque
+  -- plpgsql resuelve TODAS las referencias de campo aunque su rama no se ejecute.
+  if tg_table_name = 'metric_registry' then
+    evento := 'MetricRegistryAbierto';
+    cuerpo := jsonb_build_object('registryId', fila->'id', 'retoId', fila->'reto_id');
+  elsif tg_table_name = 'entrada_kpi' then
+    evento := case tg_op
+      when 'INSERT' then 'EntradaKpiAgregada'
+      when 'DELETE' then 'EntradaKpiBorrada'
+      else 'EntradaKpiEditada' end;
+    -- Y un UPDATE que no mueve NINGÚN campo auditado no se apunta. La rama existía para las
+    -- ediciones de verdad y desde C6 la dispara también el SELLO: la aceptación inserta la
+    -- entrada —`EntradaKpiAgregada`, correcto— y el guard diferido le escribe después su
+    -- `propuesta_ai_id`, que no es un campo del contrato y no está en `entrada_kpi_contenido`.
+    -- Medido: cada aceptación de C6 dejaba un `EntradaKpiEditada` con el «antes» idéntico al
+    -- «después», o sea una edición que nadie hizo, en la única tabla cuyo rastro sirve para
+    -- decir quién movió el contrato de medición.
+    --
+    -- Se compara el CONTENIDO y no la lista de columnas tocadas, que es la diferencia que
+    -- importa: así cubre también el otro caso —una edición humana que devuelve los campos a su
+    -- valor anterior— sin tener que enumerar qué columnas son «de procedencia».
+    if tg_op = 'UPDATE'
+       and entrada_kpi_contenido(previa) = entrada_kpi_contenido(fila) then
+      return null;
+    end if;
+    cuerpo := jsonb_build_object('entradaId', fila->'id', 'registryId', fila->'registry_id')
+      || entrada_kpi_contenido(fila);
+    -- El «antes» es lo que hace auditable una EDICIÓN: sin él, el rastro dice que alguien
+    -- tocó la entrada pero no qué movió — y aquí lo que se mueve es el contrato.
+    if previa is not null then
+      cuerpo := cuerpo || jsonb_build_object('antes', entrada_kpi_contenido(previa));
+    end if;
+  elsif tg_table_name = 'snapshot' then
+    evento := 'SnapshotRegistrado';
+    cuerpo := jsonb_build_object('snapshotId', fila->'id', 'entradaId', fila->'entrada_kpi_id',
+      'valor', fila->'valor', 'fecha', fila->'fecha', 'origen', fila->'origen');
+  elsif tg_table_name = 'outcome_review' then
+    -- La TRANSICIÓN —completar— ya tiene su evento en el guard del cierre, con el veredicto,
+    -- la narrativa que congela y su `antes`; emitir otro aquí sería dos eventos para una
+    -- sola escritura. Lo que faltaba es el UPDATE que NO es transición: el borrador que se
+    -- redacta y se vuelve a redactar, que la política `review_completar` admite en su WITH
+    -- CHECK (`estado = 'borrador'`) y el grant por columna permite. Sin este rastro, el post
+    -- mortem —la pieza de la que sale el veredicto de un reto— era lo único del slice que
+    -- se podía reescribir sin que nadie pudiera decir quién lo cambió ni qué reemplazó.
+    if tg_op = 'UPDATE' and fila->>'estado' <> 'borrador' then
+      return null;
+    end if;
+    evento := case tg_op when 'INSERT' then 'OutcomeReviewAbierto'
+                         else 'OutcomeReviewEditado' end;
+    cuerpo := jsonb_build_object('reviewId', fila->'id', 'retoId', fila->'reto_id')
+      || outcome_review_narrativa(fila);
+    if previa is not null then
+      cuerpo := cuerpo || jsonb_build_object('antes', outcome_review_narrativa(previa));
+    end if;
+  else
+    evento := case tg_op when 'INSERT' then 'ResultadoCriterioRegistrado'
+                         else 'ResultadoCriterioEditado' end;
+    cuerpo := jsonb_build_object('resultadoId', fila->'id', 'reviewId', fila->'review_id',
+      'criterioId', fila->'criterio_id', 'snapshotFinalId', fila->'snapshot_final_id',
+      'lectura', fila->'lectura', 'sinDatosMotivo', fila->'sin_datos_motivo');
+    if previa is not null then
+      cuerpo := cuerpo || jsonb_build_object('antes', jsonb_build_object(
+        'snapshotFinalId', previa->'snapshot_final_id',
+        'sinDatosMotivo', previa->'sin_datos_motivo', 'lectura', previa->'lectura'));
+    end if;
+  end if;
+  -- Sin `jsonb_strip_nulls`: aquí un nulo es información, no un hueco. `resultado_criterio`
+  -- lleva por CHECK exactamente uno de los dos —snapshot final o motivo de la falta—, así
+  -- que quitar la clave nula borraría de qué tipo de resultado se trataba; y en `antes`
+  -- convertiría «este campo estaba vacío y ahora tiene valor» en «este campo no se
+  -- audita». El rastro dice lo que había, incluido que no había nada.
+  -- El workspace sale de `fila`, que es `new` u `old` según la operación: en un DELETE no hay
+  -- `new` que nombrar, y el rastro de una fila borrada es tan escritura como los demás.
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values ((fila->>'workspace_id')::uuid, evento, cuerpo,
+      app_user_id(), workspace_role(app_user_id(), (fila->>'workspace_id')::uuid));
+  return null;
+end $$;

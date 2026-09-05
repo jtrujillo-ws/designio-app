@@ -10714,6 +10714,20 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       where workspace_id = ${ws} and tipo = 'PropuestaAICorregida'
         and payload->>'propuestaId' = ${propuestaId}`;
     expect((evento!.payload as Record<string, unknown>).entradaKpiId).toBe(r.objetoId);
+
+    // Y el SELLO no es una edición. La aceptación inserta la entrada —`EntradaKpiAgregada`,
+    // correcto— y el guard diferido le escribe después su `propuesta_ai_id`, que dispara la
+    // rama de UPDATE del mismo trigger de auditoría. Medido antes de arreglarlo: cada
+    // aceptación de C6 dejaba un `EntradaKpiEditada` con el «antes» idéntico al «después», o
+    // sea una edición que nadie hizo, en la única tabla cuyo rastro sirve para decir quién
+    // movió el contrato de medición.
+    const rastro = await admin`select tipo from evento_dominio
+      where workspace_id = ${ws} and payload->>'entradaId' = ${r.objetoId}
+      order by creado_en`;
+    expect(
+      rastro.map((f) => f.tipo),
+      'el sello de procedencia se apuntó como una edición del contrato',
+    ).toEqual(['EntradaKpiAgregada']);
   });
 
   /**

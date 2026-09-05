@@ -110,7 +110,14 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
         if (numero === consulta.current) setCargando(false);
       }
     }, ESPERA_MS);
-    return () => clearTimeout(temporizador);
+    return () => {
+      clearTimeout(temporizador);
+      // Al desmontar (salir de /app, cambiar de workspace) una petición ya lanzada no se
+      // puede cancelar, pero sí invalidar: con el número avanzado su respuesta se descarta y
+      // el Enter anotado no navega desde una instancia que ya no existe.
+      consulta.current++;
+      enterPendiente.current = false;
+    };
   }, [texto, workspaceId, navigate]);
 
   const resultados = estado.fase === 'listo' ? estado.resultados : [];

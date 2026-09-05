@@ -7557,6 +7557,92 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Un uuid en mayúscula es el MISMO uuid, también en el suelo.
+   *
+   * El guard del INSERT normaliza con `lower(...)` —lo hace explícitamente— y el guard diferido
+   * de materialización comparaba verbatim contra el texto del uuid, que Postgres guarda siempre
+   * en minúscula. Las dos mitades del suelo discrepaban, y el resultado no era un rechazo
+   * ruidoso: era una propuesta que ENTRA y que después no se puede aceptar nunca.
+   *
+   * Una ronda anterior cerró esto para la salida del proveedor normalizando al parsear
+   * (`IdCopiadoDelMaterial`). La superficie SQL concedida no pasa por el parser, así que allí
+   * seguía vivo — y es el mismo modo de fallo que ya obligó a mover la regla de las citas al
+   * suelo: lo que solo está en el contrato no protege a quien escribe por debajo.
+   *
+   * Medido antes del arreglo: `entra = ENTRÓ`, `acepta = rechazó` («las afirmaciones y las
+   * citas del insight materializado no dicen lo que dice la propuesta»), sobre una propuesta
+   * cuyo único pecado era escribir el uuid en mayúscula.
+   */
+  it('un uuid en mayúscula por la superficie SQL no deja la propuesta muerta', async () => {
+    await enWorkspaceLimpio('c2-uuid-mayuscula-suelo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [
+              {
+                evidenciaId: ev.toUpperCase(),
+                fragmento: 'El 71% de los abandonos',
+                localizacion: 'resumen',
+              },
+            ],
+          },
+        ],
+        contradicciones: [{ evidenciaId: ev.toUpperCase(), descripcion: 'Va en contra' }],
+        confianzaPropuesta: 'media',
+      };
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const [pr] = await conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           llamada_id, creado_por)
+        values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
+                ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})
+        returning id`);
+      const propuestaId = pr!.id as string;
+
+      // Y se puede aceptar: las dos mitades del suelo dicen ahora lo mismo. Sin el `lower` del
+      // guard diferido, esto muere con «no dicen lo que dice la propuesta» y la propuesta se
+      // queda sin ninguna salida salvo rechazarla.
+      await conUsuario(curadorId, async (tx) => {
+        const [ins] = await tx`insert into insight
+          (workspace_id, titulo, resumen, estado, creado_por)
+          values (${wsC}, 'T', 'R', 'propuesto', ${curadorId}) returning id`;
+        const [af] = await tx`insert into afirmacion
+          (workspace_id, insight_id, orden, texto, es_hipotesis)
+          values (${wsC}, ${ins!.id as string}, 0, 'A', false) returning id`;
+        await tx`insert into cita
+          (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+          values (${wsC}, ${af!.id as string}, ${ev}, 'El 71% de los abandonos', 'resumen',
+                  ${curadorId})`;
+        await tx`insert into contradiccion
+          (workspace_id, insight_id, evidencia_id, descripcion, creado_por)
+          values (${wsC}, ${ins!.id as string}, ${ev}, 'Va en contra', ${curadorId})`;
+        await tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${curadorId}, insight_id = ${ins!.id as string}
+          where id = ${propuestaId} and workspace_id = ${wsC}`;
+      });
+
+      const [sellada] = await admin`select estado from propuesta_ai
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+      expect(sellada!.estado as string).toBe('aceptada');
+    });
+  });
+
+  /**
    * El `xmin` no distingue INSERTAR de ACTUALIZAR, y esa era la grieta del sello.
    *
    * La procedencia se apoyaba en «esta fila nació en esta misma transacción», comprobado con

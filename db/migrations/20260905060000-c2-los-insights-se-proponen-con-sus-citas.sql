@@ -720,7 +720,12 @@ begin
             where not exists (
               select 1 from cita c
               where c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
-                and c.evidencia_id::text = q.ci->>'evidenciaId'
+                -- `lower`, igual que el guard del INSERT: un uuid en mayúscula es el MISMO
+                -- uuid, y Postgres lo guarda siempre en minúscula. Comparado verbatim, una
+                -- propuesta que el guard del insert admitió —porque él sí normaliza— no se
+                -- podía aceptar NUNCA. El parser normaliza la salida del proveedor, pero la
+                -- superficie SQL no pasa por él: la propuesta nacía muerta.
+                and c.evidencia_id::text = lower(q.ci->>'evidenciaId')
                 and c.fragmento = q.ci->>'fragmento'
                 and c.localizacion = q.ci->>'localizacion'))))) then
     raise exception 'las afirmaciones y las citas del insight materializado no dicen lo que dice la propuesta: se copian tal cual de la propuesta aceptada (SYS-19)';
@@ -795,7 +800,8 @@ begin
       where not exists (
         select 1 from contradiccion c
         where c.insight_id = new.insight_id and c.workspace_id = new.workspace_id
-          and c.evidencia_id::text = p.co->>'evidenciaId'
+          -- `lower`, por lo mismo que en las citas.
+          and c.evidencia_id::text = lower(p.co->>'evidenciaId')
           and c.descripcion = p.co->>'descripcion'))) then
     raise exception 'las contradicciones del insight materializado no son las de la propuesta: se copian tal cual, y son la evidencia que va en contra (SYS-19)';
   end if;

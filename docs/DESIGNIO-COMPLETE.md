@@ -641,7 +641,10 @@ a evidencia, y con las **contradicciones** a la vista, igual de grandes que el a
 
 ## Permisos
 
-Miembros leen. Proponen, afirman, citan y validan lead y diseñador.
+Miembros leen y **cualquier miembro registra contradicciones**, también contra un insight ya
+validado: la política `contradiccion_insert` solo exige membresía y la pantalla ofrece «Registrar
+contradicción» sin mirar el rol (RF-03.9: el descubrimiento incómodo llega tarde por definición y
+nunca se oculta ni bloquea). Proponen, afirman, citan y validan lead y diseñador.
 
 ## Fuente
 
@@ -880,7 +883,11 @@ una sola sentencia** para que no puedan discrepar entre sí.
 ## Releases
 
 - Se **planifican** desde una design version aprobada (`RL-n`, fecha objetivo, responsable) y se les
-  **asignan elementos**; cada elemento pertenece a exactamente un release (parcialidad explícita).
+  **asignan elementos**. Un elemento está **a lo sumo** en un release (clave primaria de
+  `release_elemento`); mientras G6 está pendiente el borrador del plan admite asignar, mover y
+  **quitar**, y un elemento puede quedar sin release. **Aprobar G6 exige que todo elemento de la design
+  version tenga release** (RF-06.4), y desde entonces un elemento cubierto solo se **mueve** de un
+  release a otro: dejarlo sin ninguno lo rechaza el constraint de cobertura.
 - **Desplegar** registra la fecha real y **fija el alcance**: después de desplegado no se mueven
   elementos.
 - **Constatar** crea el effective state `ES-n`: por cada elemento, `como-aprobado`, `desviado` (con
@@ -1109,10 +1116,15 @@ comentan.
 ## Auditoría
 
 **Ruta**: `/auditoria`. El flujo **append-only** de `evento_dominio` con actor, rol, tipo y payload,
-filtrable por tipo y paginado por keyset. Cada guard de la base emite su evento **dentro de la
-transacción que decide**, así que el SQL crudo produce la misma acta que la aplicación; la
-excepción conocida son los **segmentos**, cuyo evento lo escribe el servicio en la misma sentencia y
-no un trigger (ver el Definition of Done en `23`). La consultan
+filtrable por tipo y paginado por keyset. La cobertura es **mixta**: las **transiciones y
+decisiones** (gates, derechos, validaciones, aprobaciones de design version, releases, effective
+state, registry, review, propuestas AI, disposición, exportación…) las emite el guard de la base
+**dentro de la transacción que decide**, así que ahí el SQL crudo deja la misma acta que la
+aplicación; las **altas y parte de la curaduría** (ítem importado o rechazado, evidencia curada,
+adjuntos, insight propuesto, contradicción, reto y servicio creados, reto activado, journey creado y
+su snapshot, arquetipo, decisión aprobada o revalidada, segmentos, invitación reemitida, carga de
+snapshots) las escribe el **servicio** en la misma transacción y sin trigger de tabla, de modo que
+un INSERT directo de esas filas no deja evento (ver el Definition of Done en `23`). La consultan
 admin del cliente, lead y diseñador. Para los demás roles el lateral **no muestra** el destino
 (`ROLES_AUDITORIA`) y, si llegan a la ruta por URL, la política RLS de `evento_dominio` les devuelve
 cero filas: el enlace oculto es comodidad; el aislamiento lo da la base.
@@ -1383,7 +1395,7 @@ alcanzado del catálogo de Postgres.
 |---|---|
 | Aislamiento entre tenants | **RLS activa en toda tabla**; rol `designio_app` sin `bypassrls`; políticas resuelven membresía con `is_workspace_member` y `workspace_role` (`SECURITY DEFINER`); sin contexto, cero filas |
 | Escritura con transición exigida | `WITH CHECK` en cada política de UPDATE; una política permisiva por operación (dos se unirían por OR) |
-| Efectos dentro del guard que decide | Los triggers emiten `evento_dominio` con `app_user_id()` y rol; el SQL crudo produce la misma acta |
+| Efectos dentro del guard que decide | Los triggers de transición emiten `evento_dominio` con `app_user_id()` y rol, así que para esas operaciones el SQL crudo produce la misma acta; los eventos de alta los escribe el servicio (ver `12` y el DoD abajo) |
 | Inmutabilidad por sucesión | Índice único parcial «una DV aprobada vigente por servicio»; `design_version_sucesion_uniq`; snapshot con `xmin` de la misma transición |
 | Append-only | `evento_dominio`, `snapshot`, `acuerdo_disposicion`, `consentimiento_item`, `exportacion_registro` |
 | Códigos de serie | `asignar_codigo_de_serie` para DV-n, RL-n, ES-n |
@@ -1504,7 +1516,7 @@ tasa de corrección humana ya se puede derivar de `contenido` vs `contenido_orig
 | Evals de grounding con línea base | **Diseñado** |
 | Escaneo y validación en la bandeja | **Parcial**: validación de formato, saneado y presupuesto de bytes; sin escaneo de malware |
 | Export/borrado completo verificado contra manifiesto | **Construido** (catálogo contrastado contra FKs vivas; constancia sellada) |
-| Auditoría cubriendo el catálogo de acciones | **Parcial**: la mayoría de los efectos se emiten desde guards de la base, así que el SQL directo deja acta; el alta y la edición de segmentos emiten su evento desde el servicio en la misma sentencia, sin trigger de tabla, y no hay un censo automático que contraste el catálogo de acciones con los eventos |
+| Auditoría cubriendo el catálogo de acciones | **Parcial**: las transiciones y decisiones se emiten desde guards de la base, así que el SQL directo deja acta; las altas y parte de la curaduría (ítems, evidencia curada, adjuntos, insights propuestos, contradicciones, retos, servicios, journeys, arquetipos, decisiones, segmentos, invitaciones) emiten su evento desde el servicio en la misma transacción, sin trigger de tabla, y no hay un censo automático que contraste el catálogo de acciones con los eventos |
 | Secretos en secret manager; cifrado | **Parcial**: variables/secrets de Railway por environment; TLS y cifrado at-rest del Postgres gestionado; BYOAI espera al secret manager |
 | Condiciones de proveedores AI registradas | **Diseñado** (documento operativo pendiente) |
 

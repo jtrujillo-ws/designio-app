@@ -1513,17 +1513,20 @@ function TeTocaATi({
         destino: { to: '/importacion' },
       });
     }
-    const m = resumen.metricas;
     // Solo las entregas que quien mira puede cargar (curador o propietario del dato), con el
     // reto en medición y según su cadencia: lo decide la proyección con la regla de la base.
-    if (m && m.entregasPendientesMias > 0 && proyecto) {
-      const faltan = m.entregasPendientesMias;
+    // Una fila por reto en medición con entregas que esperan a quien mira; cada una abre el
+    // proyecto donde se cargan (el actual o no: dos retos pueden estar vivos a la vez).
+    for (const e of resumen.entregas) {
       filas.push({
         color: 'var(--j7)',
-        texto: `${faltan} ${faltan === 1 ? 'métrica tuya espera' : 'métricas tuyas esperan'} su snapshot`,
-        destino: { to: '/proyecto/$proyectoId', params: { proyectoId: proyecto.id } },
+        texto: `${e.cuantas} ${e.cuantas === 1 ? 'métrica tuya' : 'métricas tuyas'} de ${e.retoCodigo} ${e.cuantas === 1 ? 'espera' : 'esperan'} su snapshot`,
+        destino: e.proyectoId
+          ? { to: '/proyecto/$proyectoId', params: { proyectoId: e.proyectoId } }
+          : null,
       });
-    } else if (loop.journeys[7] === 'próximo' && proyecto) {
+    }
+    if (loop.journeys[7] === 'próximo' && proyecto) {
       const motivo = porQueJ7Cerrado(loop);
       filas.push({
         color: 'var(--j7)',

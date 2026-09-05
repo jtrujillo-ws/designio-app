@@ -5,6 +5,7 @@ import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { proyectoActualDe } from './loop-estado';
 import type {
   AprobacionPendiente,
+  EntregaPendiente,
   GatesDeProyecto,
   MetricasDelReto,
   ReleaseDelServicio,
@@ -169,37 +170,6 @@ export async function resumenParaUsuario(
               where e.registry_id = mr.id and e.workspace_id = mr.workspace_id
                 and exists (select 1 from snapshot s
                   where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id)) as listas,
-            -- Las entregas que ESPERAN a quien mira: entradas cuyo snapshot está pendiente o
-            -- vencido según su cadencia, y que él puede cargar (curador o propietario del
-            -- dato de esa entrada: el predicado de la política del snapshot). Solo con el reto
-            -- en medición y la ventana abierta —fuera de eso la política rechaza la carga—, y
-            -- con el MISMO juicio por entrada que hace la pantalla del proyecto (estadoSnapshot
-            -- en medicion.servicio): «nunca tuvo snapshot» no es la pregunta, porque un KPI
-            -- semanal con una lectura puede llevar tres entregas de retraso.
-            (select count(*)::int from entrada_kpi e
-              join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
-              join reto r on r.id = mr.reto_id and r.workspace_id = mr.workspace_id
-              left join miembro m
-                on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
-              left join lateral (select max(s.fecha) as fecha from snapshot s
-                where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id) ult on true
-              where e.registry_id = mr.id and e.workspace_id = mr.workspace_id
-                and mr.estado = 'firmado' and r.estado = 'en-medicion'
-                and (workspace_role(${actorId}, ${workspaceId}) = any(${[...ROLES_CURADORES]})
-                  or m.usuario_id = ${actorId})
-                and case
-                  -- Sin ventana no hay cadencia que juzgar: espera mientras no llegue nada.
-                  when e.ventana_inicio is null or c.ventana_dias is null then ult.fecha is null
-                  -- Ventana que aún no empezó: la política del snapshot exige fecha >= inicio
-                  -- y <= hoy, así que no hay fecha válida que cargar. Todavía no es tarea.
-                  when e.ventana_inicio > fecha_de_la_base() then false
-                  -- Ventana cerrada: estado terminal, ya nadie puede aportar.
-                  when not ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias) then false
-                  -- Abierta: vencida si falta alguna entrega prometida hasta ayer…
-                  when cadencia_incumplida(e.id, e.workspace_id, e.ventana_inicio,
-                         e.frecuencia, fecha_de_la_base() - 1) then true
-                  -- …recibida si ya hay dato, y esperada si todavía no.
-                  else ult.fecha is null end) as entregas_pendientes_mias,
             (select jsonb_build_object(
                 'nombre', e.nombre,
                 'lineaBase', e.linea_base_valor::text,
@@ -214,12 +184,64 @@ export async function resumenParaUsuario(
           from metric_registry mr
           where mr.reto_id = ${proyectoActual.retoId} and mr.workspace_id = ${workspaceId}`
         : [];
+      // Las entregas que ESPERAN a quien mira, en TODOS los retos en medición del servicio (no
+      // solo el proyecto actual: dos retos pueden estar vivos a la vez, uno activo y otro
+      // midiendo). Entradas cuyo snapshot está pendiente o vencido según su cadencia, y que él
+      // puede cargar (curador o propietario del dato: el predicado de la política del
+      // snapshot). Solo con registry firmado, reto en medición y ventana abierta —fuera de eso
+      // la política rechaza la carga—, y con el MISMO juicio por entrada que hace la pantalla
+      // del proyecto (estadoSnapshot en medicion.servicio): «nunca tuvo snapshot» no es la
+      // pregunta, porque un KPI semanal con una lectura puede llevar tres entregas de retraso.
+      // Cada reto va con su primer proyecto, que es la pantalla donde se carga.
+      const filasEntregas = sid
+        ? await tx`
+          select r.codigo as reto_codigo, p.id as proyecto_id, p.codigo as proyecto_codigo,
+            count(*)::int as cuantas
+          from entrada_kpi e
+          join metric_registry mr
+            on mr.id = e.registry_id and mr.workspace_id = e.workspace_id and mr.estado = 'firmado'
+          join reto r
+            on r.id = mr.reto_id and r.workspace_id = mr.workspace_id
+              and r.estado = 'en-medicion' and r.servicio_ancla_id = ${sid}
+          join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
+          left join miembro m
+            on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
+          left join lateral (select max(s.fecha) as fecha from snapshot s
+            where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id) ult on true
+          left join lateral (select p2.id, p2.codigo from proyecto p2
+            where p2.reto_id = r.id and p2.workspace_id = r.workspace_id
+            order by p2.codigo, p2.id limit 1) p on true
+          where e.workspace_id = ${workspaceId}
+            and (workspace_role(${actorId}, ${workspaceId}) = any(${[...ROLES_CURADORES]})
+              or m.usuario_id = ${actorId})
+            and case
+              -- Sin ventana no hay cadencia que juzgar: espera mientras no llegue nada.
+              when e.ventana_inicio is null or c.ventana_dias is null then ult.fecha is null
+              -- Ventana que aún no empezó: la política del snapshot exige fecha >= inicio
+              -- y <= hoy, así que no hay fecha válida que cargar. Todavía no es tarea.
+              when e.ventana_inicio > fecha_de_la_base() then false
+              -- Ventana cerrada: estado terminal, ya nadie puede aportar.
+              when not ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias) then false
+              -- Abierta: vencida si falta alguna entrega prometida hasta ayer…
+              when cadencia_incumplida(e.id, e.workspace_id, e.ventana_inicio,
+                     e.frecuencia, fecha_de_la_base() - 1) then true
+              -- …recibida si ya hay dato, y esperada si todavía no.
+              else ult.fecha is null end
+          group by r.codigo, r.id, p.id, p.codigo
+          order by r.codigo, r.id`
+        : [];
+      const entregas: EntregaPendiente[] = filasEntregas.map((f) => ({
+        retoCodigo: f.reto_codigo as string,
+        proyectoId: (f.proyecto_id as string | null) ?? null,
+        proyectoCodigo: (f.proyecto_codigo as string | null) ?? null,
+        cuantas: f.cuantas as number,
+      }));
+
       const metricas: MetricasDelReto | null = met
         ? {
             registryFirmado: met.estado === 'firmado',
             listas: met.listas as number,
             total: met.total as number,
-            entregasPendientesMias: met.entregas_pendientes_mias as number,
             primaria: (met.primaria as MetricasDelReto['primaria']) ?? null,
           }
         : null;
@@ -233,6 +255,7 @@ export async function resumenParaUsuario(
         aprobaciones,
         release,
         metricas,
+        entregas,
       };
     },
     { aislamiento: 'repeatable read' },

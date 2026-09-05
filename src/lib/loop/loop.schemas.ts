@@ -72,10 +72,6 @@ export type MetricasDelReto = {
   /** Entradas KPI con al menos un snapshot recibido. */
   listas: number;
   total: number;
-  /** Entradas con una entrega PENDIENTE o VENCIDA según su cadencia —con el reto en medición
-   * y la ventana abierta— que QUIEN MIRA puede cargar: curador, o propietario del dato de esa
-   * entrada. Es el mismo juicio que la pantalla del proyecto hace por entrada. */
-  entregasPendientesMias: number;
   /** La primera entrada del registry: es la cifra que la cabecera enseña. */
   primaria: {
     nombre: string;
@@ -84,6 +80,18 @@ export type MetricasDelReto = {
     /** Último snapshot de la serie; null mientras no llegue ninguno. */
     actual: string | null;
   } | null;
+};
+
+/**
+ * Entregas de métricas que ESPERAN a quien mira en un reto en medición del servicio:
+ * entradas con snapshot pendiente o vencido por cadencia (con la ventana abierta) que él
+ * puede cargar (curador o propietario del dato). Con el proyecto donde se cargan.
+ */
+export type EntregaPendiente = {
+  retoCodigo: string;
+  proyectoId: string | null;
+  proyectoCodigo: string | null;
+  cuantas: number;
 };
 
 export type ResumenDelLoop = {
@@ -102,4 +110,6 @@ export type ResumenDelLoop = {
   release: ReleaseDelServicio | null;
   /** Del reto del proyecto actual del servicio. */
   metricas: MetricasDelReto | null;
+  /** De TODOS los retos en medición del servicio: dos pueden estar vivos a la vez. */
+  entregas: EntregaPendiente[];
 };

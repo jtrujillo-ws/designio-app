@@ -131,9 +131,10 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
     // El sponsor ve la misma aprobación (espera al lead), pero no como suya.
     const delSponsor = await resumenParaUsuario(sponsorA, wsA);
     expect(delSponsor.aprobaciones.map((a) => [a.numero, a.esMia])).toEqual([[1, false]]);
-    // Sin design versions ni registry, no hay release ni métricas que decir.
+    // Sin design versions ni registry, no hay release, métricas ni entregas que decir.
     expect(resumen.release).toBeNull();
     expect(resumen.metricas).toBeNull();
+    expect(resumen.entregas).toEqual([]);
   });
 
   it('con un servicio pedido habla de ese servicio, y con uno ajeno se cae al primero', async () => {

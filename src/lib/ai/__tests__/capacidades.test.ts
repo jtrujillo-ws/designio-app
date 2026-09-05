@@ -9,6 +9,7 @@ import {
   DestinoSchema,
   RevisarPropuestaSchema,
   type ContenidoExtraccion,
+  MAX_REMEDIACIONES,
 } from '../ai.schemas';
 import { ESQUEMA_DE_CONTENIDO, parsearContenido } from '../ai.contenido';
 import { ESQUEMA_SALIDA } from '../ai.prompts';
@@ -413,5 +414,32 @@ describe('el registro de capacidades', () => {
       expect(sobre!.maxItems, `${c}: el techo pedido no es el que se valida`).toBe(lote.maximo);
       expect(sobre!.minItems).toBe(1);
     }
+  });
+
+  /**
+   * Y las listas de DENTRO del contenido también: lo que se le pide al proveedor y lo que se
+   * valida al parsear tienen que decir lo mismo.
+   *
+   * El caso de arriba mira el SOBRE del lote; esto mira las listas que viajan dentro de un
+   * contenido. C5 lleva la suya —`remediaciones`— y su esquema de proveedor no pedía mínimo,
+   * con el argumento de que un grafo limpio no tiene nada que remediar. Ese argumento murió
+   * cuando C5 pasó a negarse a llamar con cero señales: desde entonces no había ninguna
+   * petición real cuya respuesta correcta fuera la lista vacía, y dejarla abierta solo
+   * significaba aceptar del proveedor algo que `contenidosValidos` iba a descartar DESPUÉS de
+   * pagarlo.
+   *
+   * Los dos números salen de `MAX_REMEDIACIONES`, así que lo que esto sujeta es que el
+   * esquema del proveedor no se quede atrás cuando ese techo cambie.
+   */
+  it('las listas dentro del contenido piden lo mismo que se valida', () => {
+    const c5 = ESQUEMA_SALIDA.C5 as {
+      properties: { remediaciones?: { minItems?: number; maxItems?: number } };
+    };
+    expect(c5.properties.remediaciones, 'C5 no declara sus remediaciones').toBeDefined();
+    expect(
+      c5.properties.remediaciones!.minItems,
+      'el proveedor puede devolver un informe vacío que el contrato rechaza después de pagarlo',
+    ).toBe(1);
+    expect(c5.properties.remediaciones!.maxItems).toBe(MAX_REMEDIACIONES);
   });
 });

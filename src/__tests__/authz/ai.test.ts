@@ -9,12 +9,13 @@ import {
   MODELO_PRIMARIO,
   VENTANA_SALUD_PROVEEDOR_MS,
 } from '@/lib/ai/ai.degradacion';
-import { MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
+import { materialDeJourney, MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { parsearContenido } from '@/lib/ai/ai.contenido';
@@ -32,11 +33,14 @@ import {
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
+  MAX_REMEDIACIONES,
   type AnclaCapacidad,
   type CapacidadActiva,
   type Destino,
 } from '@/lib/ai/ai.schemas';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
+import { validarJourney } from '@/lib/journey/journey.mermaid';
+import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -178,6 +182,19 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     get CT() {
       return CONTENIDO_CT(requisitoIds[0]!);
     },
+    /*
+     * C5 no tiene un contenido de fixture útil por omisión: cada remediación tiene que
+     * señalar una señal que `validarJourney` emitió sobre SU journey, y eso depende del grafo
+     * concreto. Quien lo necesite lo compone con `remediacionDe(journey)`; esta entrada
+     * existe para que el registro esté completo y para que una propuesta de C5 sin contenido
+     * explícito falle en voz alta en vez de nacer señalando una señal ajena.
+     */
+    C5: {
+      resumen: 'Fixture sin señales: compón el contenido con remediacionDe(journey).',
+      remediaciones: [],
+      citas: [{ fragmento: 'NODOS', localizacion: 'cabecera del grafo' }],
+      confianzaPropuesta: 'baja',
+    } satisfies ContenidoRemediacionJourney,
   };
 
   /**
@@ -237,6 +254,82 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       returning id`;
     const requisitos = req.map((c) => c.id as string);
     return { gateId: gid, requisitos, contenido: CONTENIDO_CT(requisitos[0]!) };
+  }
+
+  /**
+   * Un journey mínimo con SEÑALES de verdad: dos pasos encadenados dentro de una fase.
+   *
+   * Se construye para que `validarJourney` emita algo —el segundo paso no tiene salida, y
+   * ninguno de los dos tiene evidencia enlazada— y NO se le escriben las señales a mano: lo
+   * que C5 comprueba es que las remediaciones señalen señales que esa función produce, así
+   * que el fixture tiene que producirlas de verdad o la prueba mediría su propia copia.
+   *
+   * `conSalida` cierra el ciclo para el caso contrario: un grafo del que la validación no
+   * tiene nada que decir. Ése es el que prueba que no se llama al proveedor por gusto.
+   */
+  let siguienteJourney = 1;
+  async function nuevoJourney(
+    ctx: { ws: string; actorId: string; servicioId: string; retoId: string },
+    opciones: { limpio?: boolean } = {},
+  ): Promise<{ journeyId: string; nodos: { fase: string; uno: string; dos: string } }> {
+    const admin = sqlAdmin();
+    const { ws, actorId: leadId, servicioId: svcId, retoId } = ctx;
+    const n = siguienteJourney++;
+    const [j] = await admin`insert into journey
+      (workspace_id, servicio_id, reto_id, tipo, nombre, descripcion, creado_por)
+      values (${ws}, ${svcId}, ${retoId}, 'as-is', ${`Alta de cuenta ${n}`}, '', ${leadId})
+      returning id`;
+    const journeyId = j!.id as string;
+    const [fase] = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+      values (${ws}, ${journeyId}, 'fase', 'Alta', '', 0, '', ${leadId}) returning id`;
+    const pasos = await admin`insert into journey_nodo
+      (workspace_id, journey_id, tipo, etiqueta, detalle, fase_id, orden, responsable, creado_por)
+      values (${ws}, ${journeyId}, 'paso', 'Recibir documento', '', ${fase!.id as string}, 0,
+              'Front', ${leadId}),
+             (${ws}, ${journeyId}, 'paso', 'Verificar identidad', '', ${fase!.id as string}, 1,
+              'Back', ${leadId})
+      returning id`;
+    const [uno, dos] = pasos.map((x) => x.id as string);
+    await admin`insert into journey_arista
+      (workspace_id, journey_id, origen_id, destino_id, tipo, condicion, creado_por)
+      values (${ws}, ${journeyId}, ${uno!}, ${dos!}, 'transicion', '', ${leadId})`;
+    if (opciones.limpio) {
+      /*
+       * Para que la validación no tenga NADA que decir hacen falta las dos cosas: que el
+       * último paso tenga salida —se añade un tercero y se cierra— y que todos los pasos
+       * lleven evidencia. Se pregunta por el resultado (cero señales) en la propia prueba, no
+       * se da por hecho aquí.
+       */
+      const [tres] = await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, detalle, fase_id, orden, responsable, creado_por)
+        values (${ws}, ${journeyId}, 'paso', 'Entregar cuenta', '', ${fase!.id as string}, 2,
+                'Front', ${leadId}) returning id`;
+      await admin`insert into journey_arista
+        (workspace_id, journey_id, origen_id, destino_id, tipo, condicion, creado_por)
+        values (${ws}, ${journeyId}, ${dos!}, ${tres!.id as string}, 'transicion', '', ${leadId})`;
+      /*
+       * Una evidencia PROPIA, con su fuente y su registro de derechos (SPEC-03, trigger
+       * diferido). No se reutiliza «la primera del workspace»: en un workspace efímero no hay
+       * ninguna, y el `if (ev)` que lo cubría dejaba el journey sin enlazar y el fixture
+       * mentía — salía con tres señales `paso-sin-evidencia` diciéndose limpio.
+       */
+      const [fuente] = await admin`insert into fuente
+        (workspace_id, tipo, titulo, referencia, creado_por)
+        values (${ws}, 'documento', 'Fuente del journey', 'ref', ${leadId}) returning id`;
+      const [ev] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${ws}, ${fuente!.id as string}, 'Evidencia del journey', '', '{}'::jsonb,
+                ${leadId}) returning id`;
+      await admin`insert into derecho_uso (workspace_id, evidencia_id, creado_por)
+        values (${ws}, ${ev!.id as string}, ${leadId})`;
+      for (const nodo of [uno!, dos!, tres!.id as string]) {
+        await admin`insert into journey_nodo_evidencia
+          (workspace_id, nodo_id, evidencia_id, creado_por)
+          values (${ws}, ${nodo}, ${ev!.id as string}, ${leadId})`;
+      }
+    }
+    return { journeyId, nodos: { fase: fase!.id as string, uno: uno!, dos: dos! } };
   }
 
   /** Item de bandeja pendiente (setup con la conexión admin, como el resto de la suite).
@@ -463,6 +556,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from metric_registry where workspace_id = ${wsL}`;
       await admin`delete from derecho_uso where workspace_id = ${wsL}`;
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
+      // El journey cuelga del reto por FK compuesta, así que va antes que él. Y su grafo
+      // antes que él: nodos, aristas y los enlaces a evidencia.
+      // El snapshot cuelga del journey por FK compuesta: va antes que el grafo.
+      await admin`delete from journey_snapshot where workspace_id = ${wsL}`;
+      await admin`delete from journey_nodo_evidencia where workspace_id = ${wsL}`;
+      await admin`delete from journey_arista where workspace_id = ${wsL}`;
+      await admin`delete from journey_nodo where workspace_id = ${wsL}`;
+      await admin`delete from journey where workspace_id = ${wsL}`;
+      // La evidencia y su fuente van DESPUÉS del grafo: el journey «limpio» del fixture las
+      // enlaza a sus pasos, y `journey_nodo_evidencia` las sujeta por FK.
+      await admin`delete from evidencia where workspace_id = ${wsL}`;
+      await admin`delete from fuente where workspace_id = ${wsL}`;
       await admin`delete from checklist_item where workspace_id = ${wsL}`;
       await admin`delete from gate_instancia where workspace_id = ${wsL}`;
       await admin`delete from etapa_instancia where workspace_id = ${wsL}`;
@@ -470,6 +575,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from reto where workspace_id = ${wsL}`;
       await admin`delete from servicio where workspace_id = ${wsL}`;
       await admin`delete from miembro where workspace_id = ${wsL}`;
+      // Otra vez los eventos, y no es redundante: los escriben TRIGGERS, así que los borrados
+      // de arriba dejan los suyos. El primer barrido limpia lo que la prueba produjo; éste,
+      // lo que produjo la limpieza.
+      await admin`delete from evento_dominio where workspace_id = ${wsL}`;
       await admin`delete from workspace where id = ${wsL}`;
       await admin`delete from usuario where id = ${curadorId}`;
     }
@@ -545,6 +654,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from derecho_uso where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
+      await admin`delete from journey_snapshot where workspace_id = ${ws}`;
+      await admin`delete from journey_nodo_evidencia where workspace_id = ${ws}`;
+      await admin`delete from journey_arista where workspace_id = ${ws}`;
+      await admin`delete from journey_nodo where workspace_id = ${ws}`;
+      await admin`delete from journey where workspace_id = ${ws}`;
       await admin`delete from checklist_item where workspace_id = ${ws}`;
       await admin`delete from gate_instancia where workspace_id = ${ws}`;
       await admin`delete from etapa_instancia where workspace_id = ${ws}`;
@@ -552,6 +666,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from reto where workspace_id = ${ws}`;
       await admin`delete from servicio where workspace_id = ${ws}`;
       await admin`delete from miembro where workspace_id = ${ws}`;
+      // Otra vez los eventos: los escriben TRIGGERS, así que los borrados de arriba —el del
+      // journey, entre otros— dejan los suyos después del primer barrido.
+      await admin`delete from evento_dominio where workspace_id = ${ws}`;
       await admin`delete from workspace where id = ${ws}`;
     }
     await admin`delete from usuario where email like ${marca + '-%@test.demo'}`;
@@ -5133,6 +5250,228 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * C5 no VALIDA: remedia. Y esa distinción es la capacidad entera.
+   *
+   * La validación de RF-05.6 ya existe y es determinista (`validarJourney`). Lo que se le
+   * pide al modelo es qué hacer con las señales que esa función emitió, y lo que el servicio
+   * comprueba es que cada remediación señale una señal REAL — el único campo de su salida que
+   * se puede contrastar contra algo.
+   *
+   * Estos tres casos cubren las tres mitades de eso: que el camino real funcione y cuelgue
+   * del journey, que un grafo sin señales NO se mande al proveedor, y que una señal inventada
+   * tire el informe entero.
+   */
+  it('C5 genera su remediación por el camino real: cuelga del journey y nace sin destino', async () => {
+    await enWorkspaceLimpio('c5-camino-real', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+
+      /*
+       * Las señales se PIDEN a la misma función que las produce en producción, no se escriben
+       * a mano: lo que hay que comprobar es que el servicio acepte una remediación de una
+       * señal real, y con una escrita a mano la prueba mediría su propia copia.
+       */
+      const senales = await conUsuario(curadorId, async (tx) => {
+        const grafo = await leerJourneyCompleto(tx, wsC, j.journeyId);
+        return validarJourney(grafo!);
+      });
+      expect(senales.length, 'el fixture tiene que producir señales de verdad').toBeGreaterThan(0);
+
+      const contenido: ContenidoRemediacionJourney = {
+        resumen: 'Al grafo le faltan salidas y evidencia enlazada.',
+        remediaciones: senales.slice(0, 3).map((x) => ({
+          nodoId: x.nodoId,
+          codigo: x.codigo,
+          comoCerrarlo: 'Encadena el paso con el siguiente de su fase',
+        })),
+        // La cita es un fragmento literal del material que arma `materialDeJourney`.
+        citas: [{ fragmento: 'Recibir documento', localizacion: 'nodos del grafo' }],
+        confianzaPropuesta: 'media',
+      };
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: contenido as unknown as Record<string, unknown>,
+          intentos: [intento({ modelo: 'modelo-de-prueba', latenciaMs: 210, uso: null })],
+        },
+        async () => {
+          const lote = await generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C5',
+            anclaId: j.journeyId,
+          });
+          expect(lote.generadas).toBe(1);
+        },
+      );
+
+      const [nacida] = await conUsuario(curadorId, (tx) => tx`
+        select p.estado, p.destino, p.journey_id, p.item_id, p.reto_id, p.gate_id,
+               l.capacidad as llamada_capacidad, l.journey_id as llamada_journey
+        from propuesta_ai p
+        join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
+        where p.workspace_id = ${wsC} and p.journey_id = ${j.journeyId}`);
+      expect(nacida!.estado).toBe('propuesta');
+      expect(nacida!.destino).toBeNull();
+      expect(nacida!.journey_id).toBe(j.journeyId);
+      expect(nacida!.item_id).toBeNull();
+      expect(nacida!.reto_id).toBeNull();
+      expect(nacida!.gate_id).toBeNull();
+      expect(nacida!.llamada_journey).toBe(j.journeyId);
+      expect(nacida!.llamada_capacidad).toBe('C5');
+
+      // Y la presencia literal contra el material que el modelo leyó: si la proyección del
+      // panel dejara de traer el grafo —o lo trajera con otra forma—, esto saldría false.
+      const panel = await panelPropuestas(curadorId, wsC);
+      const informe = panel.pendientes.find((x) => x.capacidad === 'C5');
+      expect(informe, 'la remediación no llegó al panel').toBeDefined();
+      expect(informe!.destino).toBeNull();
+      expect(informe!.citas.every((c) => c.presenteLiteral)).toBe(true);
+      // Y la cola de C5 son journeys: el suyo sale de la lista mientras el informe espera.
+      expect(panel.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(false);
+      await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: informe!.id });
+      const tras = await panelPropuestas(curadorId, wsC);
+      expect(tras.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(true);
+    });
+  });
+
+  /**
+   * Un grafo SIN señales no se manda al proveedor.
+   *
+   * No es una optimización: la respuesta ya se sabe. `validarJourney` acaba de decir que no
+   * hay nada que cerrar, y pagar una llamada para que un modelo lo repita es comprar una
+   * opinión sobre un hecho — la misma regla que niega CI sobre un item sin material.
+   *
+   * Se comprueba que el proveedor NO se llamó, no solo que la llamada falló: fallar después
+   * de pagar sería el mismo defecto con mejor cara.
+   */
+  it('un journey sin señales no llega al proveedor: la respuesta ya la da la validación', async () => {
+    await enWorkspaceLimpio('c5-sin-senales', async (ctx) => {
+    const { ws, curadorId: leadId } = ctx;
+    const limpio = await nuevoJourney({ ...ctx, actorId: leadId }, { limpio: true });
+    const sinSenales = await conUsuario(leadId, async (tx) => {
+      const grafo = await leerJourneyCompleto(tx, ws, limpio.journeyId);
+      return validarJourney(grafo!);
+    });
+    expect(sinSenales, 'el fixture «limpio» tiene que salir sin señales').toEqual([]);
+
+    const llamadasAntes = await conUsuario(leadId, (tx) => tx`
+      select count(*)::int as n from llamada_ai where workspace_id = ${ws}`);
+    await conProveedor(
+      { ok: true, datos: {}, intentos: [intento({ uso: null })] },
+      async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'C5', anclaId: limpio.journeyId }),
+        ).rejects.toThrow(/ninguna señal abierta/);
+      },
+    );
+    const llamadasDespues = await conUsuario(leadId, (tx) => tx`
+      select count(*)::int as n from llamada_ai where workspace_id = ${ws}`);
+    expect(llamadasDespues[0]!.n, 'se abrió una línea en el libro: hubo despacho').toBe(
+      llamadasAntes[0]!.n,
+    );
+    });
+  });
+
+  /**
+   * Un journey cuyas señales SE CIERRAN mientras la llamada está en vuelo no admite el informe.
+   *
+   * Aquí este caso probaba otra cosa: que un SNAPSHOT tomado a mitad de la generación cerrara
+   * el journey. Estaba mal planteado de raíz —lo inmutable es la foto, no el grafo (RF-05.8),
+   * y su propia migración lo dice—, así que probaba un corte que no debía existir. Lo tiene su
+   * caso propio ahora, del otro lado: con snapshot, C5 sigue disponible.
+   *
+   * Lo que SÍ deja obsoleto un informe es que alguien cierre las señales por su cuenta, que
+   * además es el desenlace bueno. `REVALIDAR.C5` lo comprueba antes de despachar; entre esa
+   * transacción y la que persiste cabe la edición, y ahí es donde se para. Es el mismo suelo
+   * que CT pone para el gate decidido, con el predicado que le toca a esta capacidad.
+   */
+  it('un journey cuyas señales se cerraron mientras se generaba no admite el informe', async () => {
+    await enWorkspaceLimpio('c5-senales-cerradas', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(0);
+      const admin = sqlAdmin();
+
+      proveedor.duranteLlamada = async () => {
+        // Alguien arregla el grafo a mano: se borran los pasos y con ellos sus señales. Es lo
+        // que C5 quería conseguir, solo que sin C5 y mientras C5 estaba en vuelo.
+        await admin`delete from journey_arista where journey_id = ${j.journeyId}`;
+        await admin`delete from journey_nodo where journey_id = ${j.journeyId}`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C5',
+                anclaId: j.journeyId,
+              }),
+            ).rejects.toThrow(/cambió mientras se generaba/);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
+      expect(quedan[0]!.n).toBe(0);
+    });
+  });
+
+  /**
+   * Una remediación que señala una señal que la validación NO emitió tira el informe entero.
+   *
+   * Es lo único que esta capacidad puede falsificar —el resto de su salida es prosa sobre
+   * señales ciertas— y es de lo más caro: manda a alguien a arreglar un grafo que estaba
+   * bien. Se descarta el informe COMPLETO y no las remediaciones sobrantes: recortar la
+   * salida de un modelo y guardar el resto deja una propuesta que nadie escribió, con su
+   * `contenido_original` diciendo otra cosa (SYS-17).
+   */
+  it('una remediación de una señal inexistente descarta el informe entero', async () => {
+    await enWorkspaceLimpio('c5-senal-inventada', async (ctx) => {
+    const { ws, curadorId: leadId } = ctx;
+    const j = await nuevoJourney({ ...ctx, actorId: leadId });
+    const contenido: ContenidoRemediacionJourney = {
+      resumen: 'Informe con una avería inventada.',
+      remediaciones: [
+        // El nodo existe; la señal sobre ÉL no. Un nodo inventado también fallaría, pero
+        // probaría menos: bastaría con comprobar que el id está en el grafo.
+        { nodoId: j.nodos.uno, codigo: 'arquetipo-refutado', comoCerrarlo: 'Algo' },
+      ],
+      citas: [{ fragmento: 'Recibir documento', localizacion: 'nodos del grafo' }],
+      confianzaPropuesta: 'alta',
+    };
+    await conProveedor(
+      {
+        ok: true,
+        datos: contenido as unknown as Record<string, unknown>,
+        intentos: [intento({ uso: null })],
+      },
+      async () => {
+        await expect(
+          generarPropuestas(leadId, { workspaceId: ws, capacidad: 'C5', anclaId: j.journeyId }),
+        ).rejects.toThrow(/la validación de este journey no emitió/);
+      },
+    );
+    // Y no quedó propuesta ninguna: media respuesta no es revisable.
+    const quedan = await conUsuario(leadId, (tx) => tx`
+      select count(*)::int as n from propuesta_ai
+      where workspace_id = ${ws} and journey_id = ${j.journeyId}`);
+    expect(quedan[0]!.n).toBe(0);
+    });
+  });
+
+  /**
    * CT no se aprueba, y NO porque la pantalla no pinte el botón (RF-08.4).
    *
    * «Carece de acción aprobar» tiene que ser una imposibilidad y no una convención de una
@@ -5366,5 +5705,1008 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         contenido: g.contenido,
       }),
     ).rejects.toThrow(/ya se decidió/);
+  });
+
+  /** Las señales que la validación produce sobre un journey, pedidas a la MISMA función que
+   * las produce en producción. Se usa para armar informes completos sin copiar el catálogo. */
+  async function senalesDe(
+    actorId: string,
+    wsId: string,
+    journeyId: string,
+  ): Promise<{ nodoId: string; codigo: string }[]> {
+    return conUsuario(actorId, async (tx) => {
+      const g = await leerJourneyCompleto(tx, wsId, journeyId);
+      return validarJourney(g!).map((x) => ({ nodoId: x.nodoId, codigo: x.codigo }));
+    });
+  }
+
+  /** Un informe COMPLETO: una remediación por cada señal abierta, que es lo que el contrato
+   * pide. Se deriva de las señales reales, nunca de una lista escrita a mano. */
+  function informeCompleto(
+    senales: { nodoId: string; codigo: string }[],
+  ): ContenidoRemediacionJourney {
+    return {
+      resumen: 'Cómo cerrar lo que la validación señala.',
+      remediaciones: senales.map((s) => ({
+        nodoId: s.nodoId,
+        codigo: s.codigo as ContenidoRemediacionJourney['remediaciones'][number]['codigo'],
+        comoCerrarlo: 'Encadénalo con el paso siguiente de su fase.',
+      })),
+      citas: [{ fragmento: 'Recibir documento', localizacion: 'nodos del grafo' }],
+      confianzaPropuesta: 'alta',
+    };
+  }
+
+  /**
+   * Un journey con SNAPSHOT sigue admitiendo remediación, y eso es lo que RF-05.8 dice.
+   *
+   * Aquí había un corte por snapshot —en la cola, en el estado del ancla, en `PREPARAR` y en
+   * `REVALIDAR`— con el argumento de que «un snapshot fija el grafo aprobado». Es un error de
+   * lectura, y su migración lo dice con todas las letras: «el journey de trabajo sigue
+   * editable para el ciclo siguiente», «el grafo de trabajo no se cierra nunca; lo que queda
+   * fijo es cada snapshot». Lo inmutable es la FOTO, no el modelo.
+   *
+   * El efecto era permanente y silencioso: en cuanto un journey pasaba su primera design
+   * version, desaparecía de C5 para siempre — justo el que más ciclos lleva y más señales
+   * acumula. Y no habría fallado nunca: la cola simplemente no lo ofrecía.
+   */
+  it('un journey con snapshot sigue ofreciéndose a C5: lo inmutable es la foto, no el grafo', async () => {
+    await enWorkspaceLimpio('c5-con-snapshot', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      await admin`insert into journey_snapshot
+        (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${wsC}, ${j.journeyId}, 'design version aprobada', '{}'::jsonb, ${curadorId})`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(
+        panel.candidatas.C5.lista.some((c) => c.id === j.journeyId),
+        'el journey con snapshot desapareció de la cola de C5',
+      ).toBe(true);
+
+      // Y la generación tampoco lo rechaza: el camino entero sigue abierto.
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(0);
+      const generadas = await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+      expect(generadas.generadas).toBe(1);
+    });
+  });
+
+  /**
+   * Y un journey LIMPIO no se ofrece, que es lo que su rótulo prometía.
+   *
+   * El selector dice «Journey con señales abiertas» y su cola vacía dice «no hay journeys con
+   * señales de validación abiertas», pero no filtraba por señales: ofrecía cualquiera y
+   * `PREPARAR.C5` lo rechazaba después. Una opción que no puede llevar a ninguna parte, con un
+   * rótulo que decía lo contrario. El coste de filtrarlo es leer los grafos del prefiltro, y
+   * está acotado; el de no filtrarlo lo paga quien pulsa.
+   */
+  /**
+   * La huella es del MATERIAL, no del grafo crudo: lo que el modelo no vio no la mueve.
+   *
+   * En cuanto el cuerpo se recorta, las dos cosas dejan de ser la misma. Con la huella sobre
+   * el grafo, un journey grande cuya conectividad cabe pero cuyas etiquetas de cola no
+   * cambiaba de huella al editar la etiqueta de un nodo que el modelo NUNCA vio: el prompt era
+   * idéntico byte a byte, la respuesta pagada se descartaba igual, y un informe ya escrito se
+   * marcaba «journey cambiado» por una edición que no le afectaba.
+   *
+   * Va por el camino REAL —se genera el informe y se lee el panel—, porque medir el texto del
+   * material solo probaría la premisa: lo que hay que sujetar es que la huella salga de él.
+   *
+   * El relleno son `emocion` DENTRO de la fase del fixture, no pasos: aportan bulto sin emitir
+   * ni una señal —no son transitables, no exigen responsable, y con fase no quedan huérfanos—,
+   * así que el techo de `MAX_REMEDIACIONES` no se toca y el caso mide lo que dice medir.
+   */
+  it('editar un nodo que el recorte dejó fuera no marca el informe como obsoleto', async () => {
+    await enWorkspaceLimpio('c5-huella-del-material', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      const relleno: string[] = [];
+      for (let i = 0; i < 40; i++) {
+        const [n] = await admin`insert into journey_nodo
+          (workspace_id, journey_id, tipo, etiqueta, detalle, fase_id, orden, responsable,
+           creado_por)
+          values (${wsC}, ${j.journeyId}, 'emocion',
+                  ${`Emoción de relleno ${i} — ${'texto largo de relleno '.repeat(30)}`}, '',
+                  ${j.nodos.fase}, ${200 + i}, '', ${curadorId})
+          returning id`;
+        relleno.push(n!.id as string);
+      }
+
+      // El fixture tiene que ser el caso por los dos lados: el cuerpo se recorta, y las
+      // señales siguen siendo las mismas que sin relleno.
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const material = await conUsuario(curadorId, async (tx) => {
+        const g = await leerJourneyCompleto(tx, wsC, j.journeyId);
+        return materialDeJourney({
+          nombre: g!.nombre,
+          servicio: g!.servicioNombre,
+          tipo: g!.tipo,
+          grafo: {
+            nodos: g!.nodos.map((n) => ({
+              id: n.id,
+              tipo: n.tipo,
+              etiqueta: n.etiqueta,
+              fase: '',
+              faseId: n.faseId ?? '',
+              responsable: n.responsable ?? '',
+              evidencias: n.evidencias.length,
+            })),
+            aristas: [],
+            senales: [],
+          },
+        });
+      });
+      expect(material.truncado, 'el cuerpo no llega al techo: el caso no existe').toBe(true);
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+      const recien = await panelPropuestas(curadorId, wsC);
+      expect(recien.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado).toBe('disponible');
+
+      // El ÚLTIMO relleno quedó fuera del recorte: el resto se escribe detrás del núcleo y el
+      // recorte cae a mitad de las emociones, así que la última no llega.
+      const invisible = relleno[relleno.length - 1]!;
+      expect(material.texto).not.toContain(`[${invisible}] emocion ·`);
+      await admin`update journey_nodo set etiqueta = 'Renombrado donde nadie lo ve'
+        where id = ${invisible} and workspace_id = ${wsC}`;
+      const tras = await panelPropuestas(curadorId, wsC);
+      expect(
+        tras.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado,
+        'una edición que el modelo no vio marca el informe como obsoleto',
+      ).toBe('disponible');
+
+      // Y la otra mitad: editar lo que SÍ se ve sí lo marca.
+      await admin`update journey_nodo set etiqueta = 'Comprobar quién eres'
+        where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      const visible = await panelPropuestas(curadorId, wsC);
+      const informe = visible.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(informe.anclaEstado).toBe('journey-cambiado');
+
+      /*
+       * Y UNA HUELLA DE OTRO RENDER NO ES COMPARABLE. Desde que se calcula sobre el material
+       * —el texto ya recortado— un cambio del prompt la mueve sin que el grafo se haya tocado.
+       * Sin mirar `prompt_version`, el día de un despliegue toda propuesta viva de C5 se
+       * marcaría «journey cambiado» a la vez, culpando al grafo de un cambio del renderizador.
+       * No saber no puede volverse una alarma.
+       */
+      await admin`update propuesta_ai set prompt_version = 'ai-de-otro-despliegue'
+        where id = ${informe.id} and workspace_id = ${wsC}`;
+      const otroRender = await panelPropuestas(curadorId, wsC);
+      expect(
+        otroRender.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado,
+        'una huella de otro render se lee como si el grafo hubiera cambiado',
+      ).toBe('disponible');
+    });
+  });
+
+  /**
+   * Dos fases con el MISMO NOMBRE no son la misma fase.
+   *
+   * El grafo que ve el modelo sustituía `faseId` por la ETIQUETA de la fase, y nada impide dos
+   * fases llamadas igual. Con solo el rótulo, sus hijos son indistinguibles: «muévelo a la fase
+   * Alta» no dice a cuál. Y la huella tampoco los distinguía, así que mover un nodo señalado de
+   * una «Alta» a la otra dejaba el material idéntico —un informe que ya no describe la
+   * agrupación seguía saliendo al día en el panel—.
+   *
+   * Se mide por la HUELLA, que es lo que gobierna la obsolescencia: el traslado tiene que
+   * cambiarla. Y las señales se comprueban idénticas antes y después, para que el caso no pase
+   * por la puerta de «cambiaron las señales», que es otra regla.
+   */
+  it('mover un nodo entre dos fases del mismo nombre cambia el material que ve el modelo', async () => {
+    await enWorkspaceLimpio('c5-dos-fases-igual', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      // Una segunda fase con EXACTAMENTE el mismo rótulo que la del fixture.
+      const [otra] = await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+        values (${wsC}, ${j.journeyId}, 'fase', 'Alta', '', 5, '', ${curadorId})
+        returning id`;
+
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const material = async () =>
+        conUsuario(curadorId, async (tx) => {
+          const g = await leerJourneyCompleto(tx, wsC, j.journeyId);
+          return materialDeJourney({
+            nombre: g!.nombre,
+            servicio: g!.servicioNombre,
+            tipo: g!.tipo,
+            grafo: {
+              nodos: g!.nodos.map((n) => ({
+                id: n.id,
+                tipo: n.tipo,
+                etiqueta: n.etiqueta,
+                fase: 'Alta',
+                faseId: n.faseId ?? '',
+                responsable: n.responsable ?? '',
+                evidencias: n.evidencias.length,
+              })),
+              aristas: g!.aristas.map((a) => ({
+                origen: a.origenId,
+                destino: a.destinoId,
+                tipo: a.tipo,
+                condicion: a.condicion ?? '',
+              })),
+              senales: [],
+            },
+          }).texto;
+        });
+
+      const antes = await material();
+      await admin`update journey_nodo set fase_id = ${otra!.id as string}
+        where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      const despues = await material();
+
+      // Las señales son las MISMAS: sin esto, el caso podría estar pasando por otra regla.
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+      expect(despues, 'el traslado entre dos fases homónimas no se ve en el material').not.toBe(
+        antes,
+      );
+    });
+  });
+
+  /**
+   * Un nodoId en MAYÚSCULA es el mismo nodo, y el informe tiene que valer igual.
+   *
+   * `z.string().uuid()` admite el hexadecimal en mayúscula y Postgres almacena la forma
+   * canónica. Un id válido copiado así del material pasaba la validación y luego no acertaba
+   * ninguna comparación: `COMPROBAR.C5` empareja las señales remediadas con las que la
+   * validación emitió, y una clave en mayúscula no está entre ellas — el informe se descartaba
+   * entero por «señal inventada», DESPUÉS de pagarlo, y el mensaje culpaba al modelo de algo
+   * que había hecho bien. Del lado de la pantalla, el mapa de etiquetas se indexa por el id que
+   * devuelve la base, así que la remediación tampoco decía a qué nodo aplica.
+   *
+   * Es el mismo defecto que la revisión encontró en las citas de C2 (#35), en el otro
+   * identificador que el modelo copia del material.
+   */
+  it('un nodoId en mayúscula no descarta el informe: el id se normaliza al parsear', async () => {
+    await enWorkspaceLimpio('c5-uuid-en-mayuscula', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(0);
+
+      const gritado = informeCompleto(
+        senales.map((s) => ({ ...s, nodoId: s.nodoId.toUpperCase() })),
+      );
+      // El fixture tiene que ser el caso: si el uuid no tuviera letras, esto no probaría nada.
+      expect(senales.some((s) => s.nodoId.toUpperCase() !== s.nodoId)).toBe(true);
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: gritado as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C5')!;
+      // Guardado en canónico, no como vino…
+      const remediaciones = (p.contenido as ContenidoRemediacionJourney).remediaciones;
+      expect(remediaciones.map((r) => r.nodoId).sort()).toEqual(
+        senales.map((s) => s.nodoId).sort(),
+      );
+      // …y por eso la pantalla sabe a qué nodo aplica cada remediación.
+      expect(p.etiquetas[senales[0]!.nodoId]).toBeTruthy();
+    });
+  });
+
+  /**
+   * Y cuando el grafo cambia, la presencia literal de las citas deja de tener veredicto.
+   *
+   * El panel recompone el pajar a partir del grafo de HOY, y contra ese texto mide si cada
+   * cita aparece literal. Después de una edición ajena ese texto ya no es el que vio el
+   * modelo: un fragmento que la edición acaba de añadir sale en VERDE —el reviewer lee que la
+   * cita está respaldada por un texto que el modelo nunca tuvo delante— y una cita legítima
+   * cuyo nodo la edición borró sale en ROJO. Las dos mentiras caben en un booleano.
+   *
+   * `null` es la tercera respuesta, y es la única honesta. La huella que C5 guarda al nacer es
+   * lo que permite darla: sin ella, la capacidad no puede saber si su material sigue siendo el
+   * suyo — y las que no lo declaran siguen midiendo como siempre.
+   */
+  it('la presencia literal de una cita de C5 no se afirma si el grafo cambió', async () => {
+    await enWorkspaceLimpio('c5-presencia-sin-veredicto', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+
+      // Recién nacido, el pajar ES el del modelo y la cita tiene veredicto: sin esto, el caso
+      // podría estar midiendo una propuesta que nunca lo tuvo.
+      const antes = await panelPropuestas(curadorId, wsC);
+      const recien = antes.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(recien.citas.length).toBeGreaterThan(0);
+      expect(recien.citas.every((c) => c.presenteLiteral !== null)).toBe(true);
+
+      // Alguien edita el grafo. La cita no cambió —no se pueden corregir— pero su pajar sí.
+      await sqlAdmin()`update journey_nodo set etiqueta = 'Comprobar quién eres'
+        where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(
+        p.citas.map((c) => c.presenteLiteral),
+        'el panel afirma sobre un material que el modelo no vio',
+      ).toEqual(p.citas.map(() => null));
+      // Y la fila sigue diciendo POR QUÉ, que es la otra mitad de lo mismo.
+      expect(p.anclaEstado).toBe('journey-cambiado');
+    });
+  });
+
+  /**
+   * Leer los grafos EN LOTE tiene que dar exactamente la misma proyección.
+   *
+   * El barrido de candidatos leía un grafo por journey mirado, y con el tope en trescientos
+   * eso son hasta trescientas idas y vueltas —cada una con sus agregados anidados— antes de
+   * que la pantalla de propuestas pinte nada. Pasa a leer el lote de una vez.
+   *
+   * Y por eso hay UNA sola definición de la proyección, con la forma en singular delegando en
+   * la de plural: de aquí sale la HUELLA del material de C5, así que dos consultas que se
+   * desincronizaran en una coma de `order by` declararían obsoleto un informe que está al día
+   * y rechazarían una respuesta ya pagada. Esta prueba es lo que sujeta esa igualdad.
+   */
+  it('leer los grafos en lote da la misma proyección que leerlos de uno en uno', async () => {
+    await enWorkspaceLimpio('c5-lectura-en-lote', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const a = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const b = await nuevoJourney({ ...ctx, actorId: curadorId }, { limpio: true });
+
+      const sueltos = await conUsuario(curadorId, async (tx) => ({
+        a: await leerJourneyCompleto(tx, wsC, a.journeyId),
+        b: await leerJourneyCompleto(tx, wsC, b.journeyId),
+      }));
+      const lote = await conUsuario(curadorId, (tx) =>
+        leerJourneysCompletos(tx, wsC, [a.journeyId, b.journeyId]),
+      );
+
+      expect(lote.length).toBe(2);
+      const porId = new Map(lote.map((g) => [g.id, g]));
+      // Igualdad ESTRUCTURAL, no por id: un orden distinto en los nodos o en las aristas es
+      // una huella distinta, y `toEqual` sobre el objeto entero es lo que lo dice.
+      expect(porId.get(a.journeyId)).toEqual(sueltos.a);
+      expect(porId.get(b.journeyId)).toEqual(sueltos.b);
+      // Y la huella que de verdad se compara sale igual: es el uso, no la forma.
+      expect(sueltos.a!.nodos.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('la cola de C5 solo ofrece journeys con señales abiertas, como dice su rótulo', async () => {
+    await enWorkspaceLimpio('c5-cola-honesta', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const sucio = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const limpio = await nuevoJourney({ ...ctx, actorId: curadorId }, { limpio: true });
+      // El fixture tiene que cumplir lo que promete, y se le pregunta a la función.
+      expect(await senalesDe(curadorId, wsC, limpio.journeyId)).toEqual([]);
+      expect((await senalesDe(curadorId, wsC, sucio.journeyId)).length).toBeGreaterThan(0);
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const cola = panel.candidatas.C5.lista.map((c) => c.id);
+      expect(cola).toContain(sucio.journeyId);
+      expect(cola, 'un journey sin señales se ofrece y luego se rechaza').not.toContain(
+        limpio.journeyId,
+      );
+    });
+  });
+
+  /**
+   * Un informe que deja señales SIN remediar se descarta entero.
+   *
+   * La comprobación miraba que ninguna remediación fuera inventada, y eso deja pasar tres
+   * cosas distintas que se pagan igual: la lista vacía, la que se salta señales y la que
+   * repite una con dos consejos. La segunda es la peor de leer, porque no parece rota: quien
+   * la lee cree que el grafo tiene menos averías de las que tiene, y el informe se ve
+   * completo. El contrato pide una por señal, así que se comprueba la igualdad.
+   */
+  it('un informe que no cubre todas las señales se descarta, y se dice cuántas faltan', async () => {
+    await enWorkspaceLimpio('c5-informe-corto', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(1);
+
+      // Le falta la última: el informe se ve entero y no lo está.
+      const corto = informeCompleto(senales.slice(0, -1));
+      await conProveedor(
+        {
+          ok: true,
+          datos: corto as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+          ).rejects.toThrow(/sin remediar/);
+        },
+      );
+
+      // Y el que REPITE una señal también: dos consejos para la misma avería es una
+      // contradicción sin criterio para elegir.
+      const repetido = informeCompleto([...senales, senales[0]!]);
+      await conProveedor(
+        {
+          ok: true,
+          datos: repetido as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+          ).rejects.toThrow(/dos remediaciones para la misma señal/);
+        },
+      );
+
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
+      expect(quedan[0]!.n).toBe(0);
+
+      /*
+       * Y EL LIBRO LO DICE. La comprobación semántica corría dentro de la transacción que
+       * persiste, o sea DESPUÉS de que la línea se cerrara como `salida-valida`: el libro
+       * afirmaba que esa llamada produjo una salida válida, no nacía propuesta, y el evento
+       * `LlamadaAISinPropuesta` no salía —su trigger mira el tránsito desde `despachada`—.
+       * Las respuestas de C5 fuera de contrato quedaban sistemáticamente sin contar.
+       *
+       * Y no se puede arreglar después: `llamada_completar` lleva
+       * `using (resultado = 'despachada')`, así que una línea cerrada no la toca la
+       * aplicación. La única manera de que el libro diga la verdad es preguntar antes.
+       */
+      const lineas = await sqlAdmin()`select resultado, motivo from llamada_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}
+        order by creado_en desc, id desc`;
+      expect(lineas.length).toBeGreaterThan(0);
+      expect(
+        lineas.map((l) => l.resultado as string),
+        'el libro anota como salida válida una respuesta que se descartó',
+      ).toEqual(lineas.map(() => 'fuera-de-contrato'));
+      expect(lineas[0]!.motivo as string).toMatch(/dos remediaciones para la misma señal/);
+
+      const eventos = await sqlAdmin()`select count(*)::int as n from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'LlamadaAISinPropuesta'`;
+      expect(eventos[0]!.n, 'nadie registra que esa llamada no dejó propuesta').toBe(
+        lineas.length,
+      );
+    });
+  });
+
+  /**
+   * Y un informe sobre un grafo que YA NO ES EL QUE VIO el modelo se descarta también.
+   *
+   * La llamada al proveedor ocurre fuera de toda transacción —a propósito—, así que entre
+   * armar el prompt y escribir la fila cabe la edición de otro curador. Comparar la respuesta
+   * solo contra una lectura NUEVA del grafo no basta: mientras las señales sobrevivan al
+   * cambio, el consejo se acepta aunque hable de nodos que ya no están.
+   *
+   * Se comprueba en el hueco real: `duranteLlamada` es el instante en que el material está en
+   * vuelo, con la línea del libro ya abierta. Y se comprueba que la llamada SÍ se pagó y que
+   * la propuesta NO nació — el informe se descarta, que es lo correcto, y el gasto queda
+   * anotado, que es lo honesto.
+   */
+  it('un informe sobre un grafo que cambió mientras se generaba se descarta', async () => {
+    await enWorkspaceLimpio('c5-grafo-cambiado', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+
+      proveedor.duranteLlamada = async () => {
+        // Otro curador añade un paso suelto: aparece una señal nueva y el informe en vuelo
+        // deja de describir este grafo. El id del paso no hace falta: lo que cambia es el
+        // conjunto de señales.
+        await admin`insert into journey_nodo
+          (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+          values (${wsC}, ${j.journeyId}, 'paso', 'Paso añadido a mitad', '', 9, 'Front',
+                  ${curadorId})`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C5',
+                anclaId: j.journeyId,
+              }),
+            ).rejects.toThrow(/cambió mientras se generaba/);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
+      expect(quedan[0]!.n).toBe(0);
+      // La llamada se despachó y su línea quedó: el gasto ocurrido se anota aunque su salida
+      // se tire. Registrar lo que se pagó no puede depender de que el resultado nos guste.
+      const [despues] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(despues!.n).toBeGreaterThan(antes!.n);
+
+      /*
+       * Y el libro NO culpa al modelo. `resultado` describe lo que devolvió el proveedor, y
+       * aquí devolvió lo que se le pidió: lo que cambió fue el grafo, por debajo. Reetiquetar
+       * esto como `fuera-de-contrato` —que es lo que hacía el primer arreglo de la ronda
+       * anterior, sin distinguir los dos motivos— corrompe la medida de calidad del proveedor
+       * y emite `LlamadaAISinPropuesta` por algo que el modelo hizo bien.
+       *
+       * Se cierra igual, eso sí: dejar la línea en `despachada` la deja contando para el tope,
+       * sin desenlace y sin coste, que es peor que cualquiera de las dos etiquetas.
+       */
+      const lineas = await admin`select resultado from llamada_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`;
+      expect(
+        lineas.map((l) => l.resultado as string),
+        'el libro culpa al modelo de un cambio del grafo',
+      ).toEqual(lineas.map(() => 'salida-valida'));
+    });
+  });
+
+  /**
+   * Un grafo con MÁS señales de las que el informe puede llevar no se manda al proveedor.
+   *
+   * El contrato admite `MAX_REMEDIACIONES`, así que a un grafo con más se le estaría pidiendo
+   * algo que su respuesta no puede contener: o vuelve corta —y la comprobación de arriba la
+   * descarta, después de pagarla— o el propio modelo elige qué señales callar, que es peor
+   * porque no se nota. Se dice antes de gastar, con lo que hay que hacer.
+   *
+   * Se comprueba por el LIBRO, no solo por el mensaje: negarse después de pagar sería el mismo
+   * defecto con mejor cara.
+   */
+  it('un journey con más señales de las que caben en un informe no llega al proveedor', async () => {
+    await enWorkspaceLimpio('c5-demasiadas-senales', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      // Pasos sueltos: cada uno trae sus señales (sin entrada, sin salida, sin evidencia).
+      // Se añaden hasta pasar el techo, y el número se comprueba con la función, no se supone.
+      for (let i = 0; i < MAX_REMEDIACIONES; i++) {
+        await admin`insert into journey_nodo
+          (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+          values (${wsC}, ${j.journeyId}, 'paso', ${`Paso suelto ${i}`}, '', ${100 + i}, 'Front',
+                  ${curadorId})`;
+      }
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(MAX_REMEDIACIONES);
+
+      // Se ofrece MARCADO, no escondido: esconderlo dejaba el selector vacío y la pantalla
+      // afirmando «no hay journeys con señales abiertas» sobre uno que las tiene de sobra,
+      // mientras el único texto que dice qué hacer vivía en un mensaje inalcanzable.
+      const panel = await panelPropuestas(curadorId, wsC);
+      const ofrecido = panel.candidatas.C5.lista.find((c) => c.id === j.journeyId);
+      expect(ofrecido, 'el journey se esconde en vez de decir por qué no se puede').toBeDefined();
+      expect(ofrecido!.bloqueo).toMatch(/cierra las más claras a mano/);
+
+      // …y forzarlo tampoco gasta, con EL MISMO texto: una sola redacción, dos caminos.
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      await conProveedor(
+        { ok: true, datos: {}, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+          ).rejects.toThrow(ofrecido!.bloqueo!);
+        },
+      );
+      const [despues] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(despues!.n, 'no se abrió ninguna línea: la llamada no se despachó').toBe(antes!.n);
+    });
+  });
+
+  /**
+   * Un grafo editado ENTRE preparar y despachar no llega al proveedor.
+   *
+   * Esta comparación existía —en `COMPROBAR.C5`—, y allí llega tarde: para entonces la llamada
+   * ya salió, ya se pagó y ya está en el libro. Lo único que miraba antes de despachar era que
+   * al journey le quedara alguna señal abierta, y eso no dice nada del grafo: renombrar un
+   * nodo o mover una transición lo cambia entero dejando las señales idénticas. El resultado
+   * era determinista, no una carrera improbable: cualquiera que editara el grafo en ese hueco
+   * hacía pagar una llamada cuyo informe se iba a descartar a continuación.
+   *
+   * Se mide por el LIBRO. El mensaje solo diría que ALGO se rechazó, y las dos versiones lo
+   * rechazan; lo que separa la de antes de la de ahora es si se abrió una línea de gasto.
+   *
+   * Y se renombra un nodo, no se añade uno: las señales quedan EXACTAMENTE iguales —se
+   * comprueba abajo—, de modo que la puerta que ya existía no puede ser la que rechaza.
+   */
+  it('un grafo editado entre preparar y despachar no llega al proveedor', async () => {
+    await enWorkspaceLimpio('c5-editado-antes-de-despachar', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+
+      // El hueco ANTES del apunte: la autorización ya está leída y ni un byte en el aire.
+      proveedor.antesDelApunte = async () => {
+        await admin`update journey_nodo set etiqueta = 'Comprobar quién eres'
+          where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C5',
+                anclaId: j.journeyId,
+              }),
+            ).rejects.toThrow(/cambió mientras se preparaba/);
+          },
+        );
+      } finally {
+        proveedor.antesDelApunte = null;
+      }
+
+      const [despues] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(despues!.n, 'no se abrió ninguna línea: la llamada no se despachó').toBe(antes!.n);
+      const quedan = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from propuesta_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`);
+      expect(quedan[0]!.n).toBe(0);
+      // Las señales son las MISMAS: sin esto, el caso podría estar pasando por la puerta que
+      // ya existía —«se cerraron las señales»— y no probaría nada nuevo.
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+    });
+  });
+
+  /**
+   * Un journey cuya TOPOLOGÍA A REMEDIAR no cabe en el material no se ofrece ni se despacha.
+   *
+   * Que las señales sobrevivan al recorte fue media corrección. El encargo es «di cómo cerrar
+   * cada una de estas N señales», y eso es irrespondible sin el nodo de cada señal y sin ver
+   * por dónde se entra y se sale de él: en un grafo grande, el modelo recibía «el paso X no
+   * tiene salida» sin el paso X y sin una sola transición. El contrato le exige una
+   * remediación por señal igual, así que la única salida que le quedaba era inventarla — y
+   * `COMPROBAR.C5` la acepta, porque cubre exactamente la señal que se le pidió.
+   *
+   * `nucleoDeRemediacion` pone ese núcleo delante, así que sobrevive salvo que él SOLO ya no
+   * quepa. Ese caso —el que aquí se fabrica poniendo el cuerpo largo en el nodo señalado— se
+   * dice antes de gastar y no se ofrece en la cola, que es el mismo criterio que el techo de
+   * señales de arriba: no ofrecer lo que la admisión va a rechazar.
+   */
+  it('un journey cuya topología a remediar no cabe no se ofrece ni llega al proveedor', async () => {
+    await enWorkspaceLimpio('c5-nucleo-que-no-cabe', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      expect(senales.length).toBeGreaterThan(0);
+
+      // Antes de engordarlo, el journey SÍ se ofrece: es lo que hace que la comprobación de
+      // abajo mida el techo del material y no que el fixture nunca estuviera en la cola.
+      const cola = await panelPropuestas(curadorId, wsC);
+      expect(cola.candidatas.C5.lista.some((c) => c.id === j.journeyId)).toBe(true);
+
+      // El nodo que una señal nombra se lleva el cuerpo largo: el núcleo pasa del techo sin
+      // que cambie ni el número de señales ni el de nodos.
+      await admin`update journey_nodo set etiqueta = ${'Paso descrito sin parar. '.repeat(1200)}
+        where id = ${senales[0]!.nodoId} and workspace_id = ${wsC}`;
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+
+      // Se ofrece MARCADO, no escondido, por lo mismo que el techo de señales.
+      const panel = await panelPropuestas(curadorId, wsC);
+      const ofrecido = panel.candidatas.C5.lista.find((c) => c.id === j.journeyId);
+      expect(ofrecido, 'el journey se esconde en vez de decir por qué no se puede').toBeDefined();
+      expect(ofrecido!.bloqueo).toMatch(/sin ver la conectividad que se le pide remediar/);
+
+      // …y forzarlo tampoco gasta, con EL MISMO texto.
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      await conProveedor(
+        { ok: true, datos: {}, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+          ).rejects.toThrow(ofrecido!.bloqueo!);
+        },
+      );
+      const [despues] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(despues!.n, 'no se abrió ninguna línea: la llamada no se despachó').toBe(antes!.n);
+    });
+  });
+
+  /**
+   * El grafo puede cambiar SIN que cambien sus señales, y el informe deja de describirlo.
+   *
+   * La huella cubría solo las claves `(nodoId, codigo)`, y eso es la mitad: renombrar un nodo,
+   * cambiar la condición de una transición o rehacer la topología de alrededor deja las mismas
+   * señales y cambia todo lo que el consejo describe. Quien lee entonces una remediación que
+   * habla de «Verificar identidad» sobre un nodo que ahora se llama otra cosa no tiene manera
+   * de saber que está leyendo sobre un grafo que ya no existe.
+   *
+   * Se renombra un nodo a mitad de la llamada: las señales quedan idénticas —se comprueba— y
+   * el informe se descarta igual.
+   */
+  it('un informe se descarta si el grafo cambió aunque sus señales sean las mismas', async () => {
+    await enWorkspaceLimpio('c5-grafo-renombrado', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const admin = sqlAdmin();
+
+      proveedor.duranteLlamada = async () => {
+        await admin`update journey_nodo set etiqueta = 'Comprobar quién eres'
+          where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C5',
+                anclaId: j.journeyId,
+              }),
+            ).rejects.toThrow(/cambió mientras se generaba/);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      // Y las señales eran EXACTAMENTE las mismas: sin esto, el caso podría estar pasando por
+      // el mismo camino que el de «las señales se cerraron» y no probaría nada nuevo.
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+    });
+  });
+
+  /**
+   * Un informe ya escrito se marca OBSOLETO cuando alguien cierra sus señales después.
+   *
+   * `COMPROBAR.C5` solo corre al escribir, y entre escribir y revisar cabe la vida entera del
+   * grafo —incluido el desenlace bueno, que alguien arregle lo que el informe señalaba—. El
+   * estado del ancla de C5 era la constante «disponible», así que la pantalla no avisaba
+   * nunca, mientras CT sí avisa de su equivalente: quien revisa podía aplicar un consejo que
+   * ya no describe el journey.
+   *
+   * No se puede preguntar en SQL —las señales son una función pura del grafo—, así que se
+   * calcula sobre la misma fila que el panel ya trae, sin abrir ninguna consulta más.
+   */
+  it('un informe cuyas señales se cerraron después se marca obsoleto en el panel', async () => {
+    await enWorkspaceLimpio('c5-informe-obsoleto', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+
+      // Recién nacido, el informe describe el grafo que hay.
+      const antes = await panelPropuestas(curadorId, wsC);
+      const informe = antes.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(informe.anclaEstado).toBe('disponible');
+      // Y ya dice a QUÉ nodo aplica cada remediación: sin esto, media docena de tarjetas con
+      // el mismo código de señal son indistinguibles.
+      expect(informe.etiquetas[j.nodos.dos]).toBe('Verificar identidad');
+
+      // Alguien arregla el grafo a mano — que es lo que el informe pedía.
+      const admin = sqlAdmin();
+      await admin`delete from journey_arista where journey_id = ${j.journeyId}`;
+      await admin`delete from journey_nodo where journey_id = ${j.journeyId}`;
+
+      const despues = await panelPropuestas(curadorId, wsC);
+      const obsoleto = despues.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(
+        obsoleto.anclaEstado,
+        'el informe sigue diciéndose al día sobre un grafo que ya no es el suyo',
+      ).toBe('journey-cambiado');
+    });
+  });
+
+  /**
+   * Y también cuando el grafo cambia SIN que cambien sus señales.
+   *
+   * La primera versión de este aviso comparaba las claves `(nodoId, codigo)` de lo que el
+   * informe remedia, y eso es la mitad —la misma mitad que ya se corrigió del otro lado, en la
+   * comprobación de la escritura—: renombrar un nodo, cambiar la condición de una transición o
+   * rehacer la topología de alrededor las deja idénticas y cambia todo lo que el consejo
+   * describe. Quien lee una remediación sobre «Verificar identidad» no tiene manera de saber
+   * que ese nodo se llama otra cosa.
+   *
+   * Se compara contra la HUELLA guardada al nacer la propuesta, que es lo que hace la pregunta
+   * respondible meses después. Y se comprueba que las señales siguen siendo las mismas: sin
+   * eso, este caso podría estar pasando por el camino del anterior.
+   */
+  it('un informe se marca obsoleto si el grafo cambió aunque sus señales sigan iguales', async () => {
+    await enWorkspaceLimpio('c5-obsoleto-por-renombre', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      expect(antes.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado).toBe('disponible');
+
+      await sqlAdmin()`update journey_nodo set etiqueta = 'Comprobar quién eres'
+        where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      // Las señales, idénticas: lo único que cambió es lo que el consejo describe.
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+
+      const despues = await panelPropuestas(curadorId, wsC);
+      expect(
+        despues.pendientes.find((x) => x.capacidad === 'C5')!.anclaEstado,
+        'el informe se dice al día sobre un grafo que se renombró bajo sus pies',
+      ).toBe('journey-cambiado');
+    });
+  });
+
+  /**
+   * La cola sigue buscando por debajo de los journeys limpios.
+   *
+   * Filtrar por señales fuera del SQL obliga a paginar el prefiltro: con un `limit` fijo, un
+   * workspace cuyos journeys RECIENTES estén todos limpios devolvía la lista vacía y el panel
+   * decía «no hay journeys con señales abiertas» —con el aviso de «hay más» en falso— aunque
+   * hubiera uno más viejo que sí. Decir «no hay» sin haber mirado es la única respuesta que no
+   * se puede dar.
+   *
+   * El orden de la cola es por fecha descendente, así que el journey con señales se crea
+   * PRIMERO y los limpios después: así queda debajo de todos ellos, que es el caso.
+   */
+  it('la cola encuentra un journey con señales por debajo de varios limpios', async () => {
+    await enWorkspaceLimpio('c5-cola-profunda', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const conSenales = await nuevoJourney({ ...ctx, actorId: curadorId });
+      for (let i = 0; i < 3; i++) {
+        await nuevoJourney({ ...ctx, actorId: curadorId }, { limpio: true });
+      }
+      expect((await senalesDe(curadorId, wsC, conSenales.journeyId)).length).toBeGreaterThan(0);
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(
+        panel.candidatas.C5.lista.map((c) => c.id),
+        'la cola se paró en los limpios y no llegó al que sí tiene señales',
+      ).toContain(conSenales.journeyId);
+    });
+  });
+
+  /**
+   * Las DOS proyecciones del grafo ordenan igual, y por eso la huella es una huella.
+   *
+   * `leerJourneyCompleto` (que arma el prompt) y la del panel (que lo recompone para saber si
+   * el informe sigue al día) alimentan las dos `huellaDelGrafo`. Si ordenan distinto, la huella
+   * guardada al generar y la recalculada al pintar difieren sobre un grafo IDÉNTICO: el panel
+   * declararía obsoleto un informe que está al día, y la comprobación de escritura rechazaría
+   * una respuesta ya pagada por un cambio que no hubo.
+   *
+   * Ordenar por `(tipo, orden)` no es un orden total: nada impide dos nodos del mismo tipo con
+   * el mismo orden —no hay único sobre ellos— y ahí Postgres puede devolverlos en cualquier
+   * orden, distinto entre dos lecturas. El fixture crea el empate a propósito; sin él, este
+   * caso pasaría con o sin desempate y no mediría nada.
+   */
+  it('las dos lecturas del grafo producen la MISMA huella, incluso con órdenes empatados', async () => {
+    await enWorkspaceLimpio('c5-huella-estable', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      // Dos pasos más con el MISMO orden que los que ya hay: el empate que el orden por
+      // (tipo, orden) no puede deshacer.
+      await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+        values (${wsC}, ${j.journeyId}, 'paso', 'Empatado A', '', 0, 'Front', ${curadorId}),
+               (${wsC}, ${j.journeyId}, 'paso', 'Empatado B', '', 0, 'Back', ${curadorId})`;
+
+      const leerDosVeces = () =>
+        conUsuario(curadorId, async (tx) => {
+          const g = await leerJourneyCompleto(tx, wsC, j.journeyId);
+          return JSON.stringify({ nodos: g!.nodos, aristas: g!.aristas });
+        });
+      const delPrompt = await leerDosVeces();
+      // Y la del panel, por el camino real: se genera y se lee la fila proyectada.
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const informe = panel.pendientes.find((x) => x.capacidad === 'C5')!;
+
+      // Si las dos proyecciones no ordenaran igual, el panel diría «cambiado» sobre un grafo
+      // que nadie tocó entre las dos lecturas.
+      expect(
+        informe.anclaEstado,
+        'el panel declara obsoleto un informe sobre un grafo que no cambió',
+      ).toBe('disponible');
+      // Y la lectura del prompt sigue siendo determinista entre dos llamadas seguidas.
+      expect(await leerDosVeces()).toBe(delPrompt);
+    });
+  });
+
+  /**
+   * Una propuesta de C5 sin su huella no puede existir.
+   *
+   * La columna es anulable porque las demás capacidades no la declaran, pero para C5 no hay
+   * fila legítima sin ella: la capacidad y la columna llegan en el mismo par de migraciones,
+   * así que no hay filas anteriores que perdonar. Sin el CHECK, una escritura directa que la
+   * omitiera dejaba un informe que se dice al día PASE LO QUE PASE — `estadoDeLaFila` no puede
+   * afirmar nada sin huella, y con razón. Un hueco así no es ruidoso: es silencioso.
+   */
+  it('una propuesta de C5 sin huella del material la rechaza la base', async () => {
+    await enWorkspaceLimpio('c5-sin-huella', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const admin = sqlAdmin();
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, journey_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C5', ${j.journeyId}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const contenido = informeCompleto(senales);
+      const escribir = (huella: string | null) =>
+        conUsuario(curadorId, (tx) => tx`
+          insert into propuesta_ai
+            (workspace_id, capacidad, destino, journey_id, contenido, contenido_original,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             llamada_id, creado_por)
+          values (${wsC}, 'C5', null, ${j.journeyId}, ${tx.json(contenido)},
+                  ${tx.json(contenido)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'alcance',
+                  ${huella}, 'entorno', ${l!.id as string}, ${curadorId})
+          returning id`);
+      await expect(escribir(null)).rejects.toThrow(/propuesta_ai_huella_c5/);
+      // Y con huella entra: sin esta mitad, un CHECK que rechazara todo pasaría igual.
+      await expect(escribir('una huella cualquiera')).resolves.toBeDefined();
+    });
   });
 });

@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
-import { CONFIANZA_PROPUESTA, type CapacidadActiva } from './ai.schemas';
+import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
+import {
+  CONFIANZA_PROPUESTA,
+  MAX_REMEDIACIONES,
+  type CapacidadActiva,
+} from './ai.schemas';
 
 /**
  * La marca con la que `check:bundle` sabe si estos validadores llegaron al navegador.
@@ -115,6 +120,26 @@ export const ContenidoCriterioSchema = z.object({
 export type ContenidoCriterio = z.infer<typeof ContenidoCriterioSchema>;
 
 /**
+ * Un identificador que el modelo COPIA del material, en la forma en que lo escribe la base.
+ *
+ * `z.string().uuid()` admite los hexadecimales en mayúscula, y Postgres almacena el uuid en su
+ * forma canónica —minúscula—. Así que un id válido copiado en mayúscula pasaba la validación y
+ * luego NO acertaba ninguna comparación: la que decide si una señal remediada es de las que la
+ * validación emitió descarta el informe entero —después de pagarlo— por «señal inventada», y
+ * del lado de la pantalla el mapa de etiquetas, que se indexa por el id que devuelve la base,
+ * deja la remediación sin decir a qué nodo aplica.
+ *
+ * Se normaliza AL PARSEAR, que es el único sitio donde se arregla una vez para todos los
+ * lectores: lo que se persiste es canónico y las comparaciones —SQL y TypeScript— vuelven a ser
+ * la misma pregunta. Los `lower(...)` de los guards se quedan: son el suelo de la base, y el
+ * suelo no depende de que la aplicación haya hecho bien su parte.
+ */
+const IdCopiadoDelMaterial = z
+  .string()
+  .uuid()
+  .transform((s) => s.toLowerCase());
+
+/**
  * CT — qué falta para un gate, con los huecos citados (RF-08.4, SPEC-08 §30).
  *
  * INFORMATIVO: aquí no hay ningún campo que describa un objeto a crear, y esa ausencia es
@@ -140,7 +165,7 @@ export const ContenidoAsistenteGateSchema = z
            * contrastar contra nada, y un hueco que señala un requisito que no existe manda a
            * quien lo lee a buscar algo que no está.
            */
-          checklistItemId: z.string().uuid(),
+          checklistItemId: IdCopiadoDelMaterial,
           queFalta: z.string().trim().min(1).max(1000),
           comoCerrarlo: z.string().trim().min(1).max(1000),
         }),
@@ -152,9 +177,63 @@ export const ContenidoAsistenteGateSchema = z
   .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
 export type ContenidoAsistenteGate = z.infer<typeof ContenidoAsistenteGateSchema>;
 
+/**
+ * C5 — cómo CERRAR cada señal que la validación del grafo emitió (SPEC-08 §30, RF-05.6).
+ *
+ * INFORMATIVO, como CT. Y con una asimetría deliberada respecto a las otras capacidades: aquí
+ * el modelo NO dice qué está mal. Eso ya lo dice `validarJourney`, que es determinista y no se
+ * equivoca; pedirle al modelo que lo repita sería cambiar una respuesta exacta por una
+ * probable. Lo que se le pide es lo otro: dada una señal REAL, qué hacer con ella en ESTE
+ * grafo — y eso hay que leerlo entero para decirlo.
+ *
+ * Por eso cada remediación se identifica por `(nodoId, codigo)`: es el par que nombra una
+ * señal ya emitida, y el servicio comprueba que esté entre las que produjo la MISMA lectura
+ * del grafo con la que se armó el prompt. Una remediación de una señal inexistente es una
+ * avería inventada, y de las caras: manda a alguien a arreglar un grafo que estaba bien.
+ *
+ * `remediaciones` PUEDE venir vacío: un grafo sin señales es un resultado legítimo, y además
+ * el bueno.
+ */
+export const ContenidoRemediacionJourneySchema = z
+  .object({
+    resumen: z.string().trim().min(1).max(2000),
+    remediaciones: z
+      .array(
+        z.object({
+          /* El nodo que la señal nombra, por su id, copiado del material. */
+          nodoId: IdCopiadoDelMaterial,
+          /* Y el código de la señal, del catálogo de `validarJourney`. Derivado de él, no
+           * copiado: un código nuevo entra aquí el día que la validación lo emita. */
+          codigo: z.enum(CODIGOS_SENAL),
+          comoCerrarlo: z.string().trim().min(1).max(1000),
+        }),
+      )
+      /*
+       * Al menos UNA, y como mucho `MAX_REMEDIACIONES`. El mínimo no estaba y hacía falta: un
+       * informe de cero remediaciones sobre un grafo CON señales es una llamada pagada que no
+       * dice nada, y el servicio ya se niega a pedir uno sobre un grafo limpio — así que la
+       * lista vacía no describe ningún caso legítimo.
+       *
+       * El techo lleva nombre porque lo leen los dos lados de la misma regla: éste y la
+       * negativa a generar cuando el grafo tiene más señales de las que este contrato puede
+       * llevar. Con el número en un solo sitio no puede haber un grafo que se acepte para
+       * pedir y cuya respuesta se descarte DESPUÉS de pagarla por venir corta.
+       */
+      .min(1)
+      .max(MAX_REMEDIACIONES),
+    citas: CitasSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoRemediacionJourney = z.infer<typeof ContenidoRemediacionJourneySchema>;
+
 /** Contenido de una propuesta: una de las formas tipadas, nunca un jsonb libre — así el
  * panel, el servicio y la corrección hablan del mismo objeto sin castings. */
-export type ContenidoPropuesta = ContenidoExtraccion | ContenidoCriterio | ContenidoAsistenteGate;
+export type ContenidoPropuesta =
+  | ContenidoExtraccion
+  | ContenidoCriterio
+  | ContenidoAsistenteGate
+  | ContenidoRemediacionJourney;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -183,6 +262,7 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   CI: ContenidoExtraccionSchema,
   C0: ContenidoCriterioSchema,
   CT: ContenidoAsistenteGateSchema,
+  C5: ContenidoRemediacionJourneySchema,
 };
 
 /**

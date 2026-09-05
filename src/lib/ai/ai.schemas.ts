@@ -15,6 +15,7 @@ export type {
   ContenidoCriterio,
   ContenidoExtraccion,
   ContenidoPropuesta,
+  ContenidoRemediacionJourney,
 } from './ai.contenido';
 
 /** CTX-08 Capacidades AI — el pipeline único PropuestaAI (ADR-0012, SPEC-08). */
@@ -74,7 +75,7 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
  * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
  * carece de acción «aprobar».
  */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT'] as const;
+export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C5'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
 export const DestinoSchema = z.enum(['evidencia', 'criterio-exito']);
@@ -121,6 +122,17 @@ export const CONFIANZA_PROPUESTA_NUMERICA: Record<(typeof CONFIANZA_PROPUESTA)[n
 export const MAX_CRITERIOS_POR_LOTE = 4;
 
 /**
+ * Cuántas remediaciones puede llevar UN informe de C5 — que es lo mismo que decir cuántas
+ * señales abiertas admite un journey para poder pedirlo.
+ *
+ * Está aquí y no solo dentro del esquema de Zod porque lo leen los DOS lados de la misma
+ * regla: el contrato de la salida y la negativa a generar cuando el grafo trae más señales de
+ * las que ese contrato puede llevar. Con el número escrito en un solo sitio no puede haber un
+ * grafo que se acepte para pedir y cuya respuesta se descarte por larga después de pagarla.
+ */
+export const MAX_REMEDIACIONES = 20;
+
+/**
  * El ANCLA de una capacidad: el objeto del que cuelga su alcance de contexto, y todo lo que
  * hay que decir sobre él.
  *
@@ -132,7 +144,7 @@ export const MAX_CRITERIOS_POR_LOTE = 4;
  */
 export type AnclaCapacidad = {
   /** La columna donde cuelga en `reserva_ai`, `llamada_ai` y `propuesta_ai`. */
-  columna: 'item_id' | 'reto_id' | 'gate_id';
+  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id';
   /** El título del selector en la pantalla. */
   etiqueta: string;
   /** Cómo se nombra en prosa, en minúscula, dentro de una frase. */
@@ -239,6 +251,7 @@ const ANCLA_DECLARADA: Record<AnclaCapacidad['columna'], true> = {
   item_id: true,
   reto_id: true,
   gate_id: true,
+  journey_id: true,
 };
 export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad['columna'][];
 
@@ -336,6 +349,45 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     exigeConsentimiento: false,
     esSimulacion: false,
   },
+  C5: {
+    etiqueta: 'Remediación del grafo → cómo cerrar lo que la validación señala',
+    /*
+     * INFORMATIVA, la segunda. No toca el grafo: propone qué hacer y lo hace una persona.
+     *
+     * Y hay una razón de fondo por la que C5 no puede ser otra cosa, aunque SPEC-08 la
+     * nombre «validación del grafo»: esa validación YA EXISTE y es DETERMINISTA
+     * (`validarJourney`, RF-05.6, con sus nueve códigos de señal). Pedirle a un modelo que
+     * la repita cambiaría una respuesta exacta por una probable —lo que §21 prohíbe
+     * vender— y dejaría dos listas de señales discrepando sin criterio para decir cuál
+     * vale. Lo que el modelo sí añade es lo que el código no puede: dada una señal REAL,
+     * qué hacer con ella EN ESTE grafo.
+     */
+    destino: null,
+    ancla: {
+      columna: 'journey_id',
+      etiqueta: 'Journey con señales abiertas',
+      enProsa: 'journey con señales abiertas',
+      buscar: 'Buscar por nombre del journey o del servicio…',
+      vacia: 'No hay journeys con señales de validación abiertas.',
+      hayMas: (n) =>
+        `Hay más journeys con señales abiertas de los que caben aquí: se listan los ${n} más ` +
+        'recientes. Un journey sale de la lista mientras su informe espera lectura; para uno ' +
+        'concreto, búscalo por su nombre o el de su servicio.',
+      enCurso:
+        'Ese journey ya tiene una remediación AI en curso: espera a que termine antes de pedir otra',
+      pendiente: 'Ese journey ya tiene un informe sin leer: léelo antes de pedir otro',
+    },
+    /*
+     * Sin lote. Las remediaciones viajan DENTRO del contenido, como los huecos de CT, y por
+     * la misma razón: se leen juntas —«qué le falta a este grafo» es una respuesta— y
+     * ninguna se acepta por separado, así que no hay revisión por elemento que proteger.
+     */
+    lote: null,
+    /* El material es el GRAFO: etiquetas de nodos, fases y transiciones. No hay material de
+     * personas por ningún lado — eso entra por `item_importacion`, que es otra ancla. */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+  },
 };
 
 
@@ -426,6 +478,7 @@ export const ESTADOS_ANCLA = [
   'reto-no-admite',
   'gate-decidido',
   'checklist-avanzado',
+  'journey-cambiado',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];
@@ -441,9 +494,16 @@ export type CitaConPresencia = {
    * un sostén que aquí nadie ata; quien lo ata es la persona que acepta (SYS-19).
    *
    * `false` es la señal de alarma y la UI la pinta; `true` no es un visto bueno, es la
-   * ausencia de una alarma concreta.
+   * ausencia de esa alarma.
+   *
+   * Y `null` es NO COMPROBABLE, que no es ninguna de las dos. El panel recompone el material
+   * a partir del estado de HOY, y para las capacidades que saben si su material sigue siendo
+   * el que vio el modelo —C5 lo sabe: guarda su huella— la respuesta después de una edición
+   * ajena no es ni sí ni no. Con un booleano, un fragmento que la edición acaba de añadir
+   * salía en verde y una cita legítima que la edición borró salía en rojo: las dos mentiras
+   * caben en un booleano y ninguna en un `null`.
    */
-  presenteLiteral: boolean;
+  presenteLiteral: boolean | null;
 };
 
 export type PropuestaEnPanel = {
@@ -463,6 +523,16 @@ export type PropuestaEnPanel = {
    * original nunca se pierde de vista. */
   contenidoOriginal: ContenidoPropuesta | null;
   citas: CitaConPresencia[];
+  /**
+   * Cómo se llaman los ids que el contenido nombra: `{ id → etiqueta }`.
+   *
+   * El modelo copia ids del material porque es lo único verificable, y la pantalla los recibe
+   * tal cual. Un uuid no le dice nada a quien revisa, y en C5 varias remediaciones pueden
+   * traer el mismo código de señal sobre nodos distintos: sin esto, sus tarjetas son
+   * indistinguibles. Vacío en las capacidades que no nombran ids, que es su respuesta y no un
+   * hueco.
+   */
+  etiquetas: Record<string, string>;
   /** Título del objeto del que se derivó (item de bandeja o reto), para dar contexto. */
   anclaTitulo: string;
   anclaId: string;
@@ -508,6 +578,21 @@ export type CandidatoAncla = {
    * hay nada que citar y la extracción produciría una evidencia inventada a partir de la
    * ficha. Se marca en vez de esconderse: el item sigue curándose a mano en la bandeja. */
   sinMaterial?: boolean;
+  /**
+   * Por qué esta ancla NO se puede generar ahora mismo, con lo que hay que hacer. `undefined`
+   * cuando se puede.
+   *
+   * Existe por lo mismo que los dos de arriba —«se marca en vez de esconderse»— pero sin un
+   * campo por motivo: los de arriba son de una capacidad concreta y llevan su propio trato en
+   * la pantalla (el formulario de consentimiento, el camino de la bandeja), y esto es el caso
+   * general, donde lo único que hay que hacer es DECIRLO.
+   *
+   * Y hace falta porque esconderlas era peor que no ofrecerlas: el selector se quedaba vacío
+   * y la pantalla afirmaba «no hay journeys con señales abiertas» sobre un workspace lleno de
+   * ellos, mientras el motivo accionable —cierra a mano las más claras— vivía en un mensaje de
+   * `PREPARAR` que ningún camino del producto podía alcanzar.
+   */
+  bloqueo?: string;
 };
 
 export type PanelPropuestas = {

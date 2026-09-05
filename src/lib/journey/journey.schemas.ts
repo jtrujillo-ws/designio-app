@@ -257,17 +257,29 @@ export type ResumenJourney = {
  * conviene resolver. Ninguna bloquea por sí sola — el gate decide (I2). */
 export type SeveridadSenal = 'alta' | 'media';
 
+/**
+ * Los códigos de señal, como LISTA y no solo como unión de tipos.
+ *
+ * La unión se borra al compilar, y hay quien necesita los nueve en tiempo de ejecución: la
+ * capacidad C5 propone cómo cerrar cada señal, y su contrato tiene que aceptar exactamente
+ * estos códigos y ningún otro. Derivando el tipo de la lista, las dos mitades no pueden
+ * discrepar — un código nuevo entra en el contrato de C5 el mismo día que lo emite
+ * `validarJourney`, sin que nadie se acuerde de copiarlo.
+ */
+export const CODIGOS_SENAL = [
+  'paso-sin-evidencia',
+  'paso-inalcanzable',
+  'paso-sin-salida',
+  'frontstage-sin-soporte',
+  'sin-responsable',
+  'huerfano-de-fase',
+  'arquetipo-refutado',
+  'sin-entrada',
+  'sin-final',
+] as const;
+
 export type SenalValidacion = {
-  codigo:
-    | 'paso-sin-evidencia'
-    | 'paso-inalcanzable'
-    | 'paso-sin-salida'
-    | 'frontstage-sin-soporte'
-    | 'sin-responsable'
-    | 'huerfano-de-fase'
-    | 'arquetipo-refutado'
-    | 'sin-entrada'
-    | 'sin-final';
+  codigo: (typeof CODIGOS_SENAL)[number];
   severidad: SeveridadSenal;
   nodoId: string;
   etiqueta: string;

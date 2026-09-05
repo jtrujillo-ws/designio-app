@@ -1680,6 +1680,8 @@ type Alcance = {
   unidades: number;
   /** La huella del material que `PREPARAR` le enseñó al modelo. Ver `Preparacion`. */
   huellaMaterial?: string;
+  /** Los ids de la evidencia de ese material. Ver `Preparacion`. */
+  evidenciaDelMaterial?: string[];
 };
 
 /**
@@ -1723,7 +1725,8 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const consentimiento = exigeConsentimiento
       ? await leerConsentimientoBajoCandado(tx, entrada)
       : null;
-    const { sistema, prompt, huellaMaterial } = await PREPARAR[entrada.capacidad](tx, entrada);
+    const { sistema, prompt, huellaMaterial, evidenciaDelMaterial } =
+      await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
       throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
     }
@@ -1818,6 +1821,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       reservaId: reserva!.id as string,
       unidades,
       huellaMaterial,
+      evidenciaDelMaterial,
     };
   });
 }
@@ -2564,6 +2568,17 @@ type Preparacion = {
    * revocó sea justo una de las que ya están dentro del prompt construido.
    */
   huellaMaterial?: string;
+  /**
+   * Los ids de la evidencia que compuso ese material, para las capacidades que la tienen.
+   *
+   * Es la MISMA pregunta que la huella, escrita de una forma que la BASE puede volver a
+   * hacerse. La huella es de un texto —con su formato y su recorte— y no hay SQL que lo
+   * reconstruya; el conjunto de ids sí, y es justo lo que hace falta en el último instante:
+   * si al aceptar hay evidencia del reto que NO estaba aquí, el insight se selló sin haberla
+   * visto, y en C2 esa evidencia puede ser la que lo contradice. Por eso viaja hasta la fila
+   * y se guarda: el guard diferido no puede llamar a TypeScript.
+   */
+  evidenciaDelMaterial?: string[];
 };
 const PREPARAR: Record<
   CapacidadActiva,
@@ -2745,6 +2760,10 @@ const PREPARAR: Record<
        * los derechos, y el bloque está armado y saldría igual hacia el proveedor.
        */
       huellaMaterial: huellaDelMaterial(materialDeInsights(material).texto),
+      // El mismo conjunto, tal cual, para que el suelo pueda volver a preguntarlo. Sale de
+      // `material` y no de otra lectura: dos consultas para el mismo conjunto es cómo
+      // empiezan las discrepancias que este PR ya ha corregido varias veces.
+      evidenciaDelMaterial: material.evidencia.map((e) => e.id),
     };
   },
   C5: async (tx, entrada) => {
@@ -3204,7 +3223,8 @@ async function persistirPropuestas(
       const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, ${anclas.columnas}, contenido, contenido_original,
-         confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+         confianza, modelo, prompt_version, alcance_resumen, huella_material,
+         alcance_evidencia, origen_key,
          llamada_id, orden, es_simulacion, creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino}, ${anclas.valores},
              c.contenido, c.contenido,
@@ -3221,6 +3241,10 @@ async function persistirPropuestas(
              -- declaran. Se escribe al nacer y no se toca: un valor reescribible después no
              -- diría nada sobre lo que se leyó.
              ${alcance.huellaMaterial ?? null},
+             -- Y el CONJUNTO de evidencia de ese material, que es la misma pregunta escrita
+             -- de una forma que el suelo puede volver a hacerse: la huella es de un texto
+             -- con formato y recorte, y no hay SQL que lo reconstruya. Ver «Preparacion».
+             ${alcance.evidenciaDelMaterial ?? null},
              ${alcance.origenKey}, ${llamada.id},
              -- El puesto en el lote sale de la MISMA sentencia que inserta (with
              -- ordinality, que numera desde 1, de ahi el -1) y no de un contador aparte

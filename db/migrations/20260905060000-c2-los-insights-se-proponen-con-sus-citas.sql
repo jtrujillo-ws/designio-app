@@ -788,6 +788,30 @@ begin
       and not evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente')) then
     raise exception 'DR001: alguna de las evidencias que este insight cita dejó de poder citarse al cliente mientras se aceptaba (se retiró el derecho de uso, caducó, o el documento ya no está)';
   end if;
+  -- Y que el insight haya VISTO toda la evidencia que el reto tiene ahora.
+  --
+  -- Las dos comprobaciones de arriba miran la evidencia que el insight SÍ cita. Esta mira la
+  -- que no cita porque no existía para él: entre que la propuesta se guardó y este commit se
+  -- pudo enlazar un documento nuevo al reto, y sellar aquí es sellar un insight que nunca lo
+  -- leyó — en C2, posiblemente el que lo contradice. Quien revisa no puede compensarlo: las
+  -- contradicciones son inmutables, que es la decisión de arriba mirada desde el otro lado.
+  --
+  -- El candado por CLAVE va primero, y no basta con el «for share» sobre la fila del reto que
+  -- ya se tomó: un «insert into arquetipo_evidencia» sin commitear no está en ninguna fila
+  -- leída, así que un candado de fila no lo ve. `designio:reto:` es la misma clave que toman
+  -- el trigger de «arquetipo_evidencia» y la revalidación previa al despacho.
+  if new.reto_id is not null and new.alcance_evidencia is not null then
+    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || new.reto_id, 42));
+    if exists (
+      select 1
+        from arquetipo a
+        join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+       where a.reto_id = new.reto_id and a.workspace_id = new.workspace_id
+         and evidencia_usable(ae.evidencia_id, ae.workspace_id, 'cliente')
+         and not (ae.evidencia_id = any (new.alcance_evidencia))) then
+      raise exception 'ese reto tiene evidencia que estos insights no llegaron a ver: se enlazó después de generarlos, así que la propuesta quedó obsoleta y solo puede rechazarse. Vuelve a pedirla para que la tenga en cuenta';
+    end if;
+  end if;
   -- Y las CONTRADICCIONES, que son parte del insight y no un adorno.
   --
   -- La comprobación de arriba cubría la cabecera, las afirmaciones y sus citas, y dejaba fuera
@@ -1276,3 +1300,39 @@ create trigger b_candado_del_reto
 create trigger b_candado_del_reto
   before insert or update or delete on arquetipo_evidencia
   for each row execute function arquetipo_candado_del_reto_guard();
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- LO QUE SE SELLA TIENE QUE HABER VISTO TODA LA EVIDENCIA DEL RETO
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- Tercer punto de la misma línea de tiempo, y el último: despachar, persistir y ACEPTAR. Entre
+-- que la propuesta se guarda y que alguien la acepta pasan horas o días, y en ese hueco se
+-- enlaza evidencia nueva al reto. La pantalla ya lo dice —la presencia literal pasa a «no se
+-- puede comprobar»—, pero la propuesta sigue `disponible` y la aceptación la sella igual: un
+-- insight que nunca vio ese documento, que en C2 puede ser justo el que lo CONTRADICE.
+--
+-- Y quien revisa NO puede compensarlo: las contradicciones son inmutables desde una ronda
+-- anterior de este mismo PR, precisamente para que nadie pueda quitarlas al corregir. Esa
+-- decisión, que protege la señal, quita aquí la salida de añadir a mano la que falta.
+--
+-- ── POR QUÉ UN CONJUNTO DE IDS Y NO LA HUELLA ──
+-- `huella_material` es el sha del TEXTO que el modelo tuvo delante, con su formato y su
+-- recorte por presupuesto de caracteres. No hay SQL que lo reconstruya, y escribirlo dos veces
+-- —una en TypeScript y otra en plpgsql— es exactamente la divergencia entre redacciones
+-- hermanas que este PR ha corregido cuatro veces. El CONJUNTO de evidencia sí es computable a
+-- los dos lados, y es lo que responde a la pregunta que importa: ¿había, al sellar, evidencia
+-- del reto que el insight no llegó a ver?
+--
+-- Lo que esto NO cubre, dicho sin adornos: un resumen EDITADO no cambia el conjunto de ids, así
+-- que este suelo no lo ve. Lo ve `COMPROBAR.C2` antes de persistir, y la pantalla lo dice al
+-- revisar; aquí se cubre el caso con daño —una evidencia que aparece— y no el que solo
+-- desactualiza.
+alter table propuesta_ai add column alcance_evidencia uuid[];
+
+-- Igual que la huella: C2 la declara, así que una fila de C2 sin ella es una fila que no se
+-- puede comprobar, y eso no puede ser un estado alcanzable.
+alter table propuesta_ai add constraint propuesta_ai_alcance_evidencia_c2
+  check (capacidad <> 'C2' or alcance_evidencia is not null);
+
+grant insert (alcance_evidencia) on propuesta_ai to designio_app;

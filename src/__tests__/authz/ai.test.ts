@@ -526,7 +526,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       insert into propuesta_ai
         (workspace_id, capacidad, destino, ${anclasDeFixture(tx).columnas},
          contenido, contenido_original,
-         confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+         confianza, modelo, prompt_version, alcance_resumen, huella_material,
+         alcance_evidencia, origen_key,
          llamada_id, creado_por)
       values (${ws}, ${campos.capacidad}, ${destino},
               ${anclasDeFixture(tx, campos.anclas).valores},
@@ -537,6 +538,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               -- se está probando. Las que la leen dirán «material cambiado», que es lo que
               -- corresponde a una fila escrita a mano sin pasar por la generación.
               'huella-del-material',
+              -- Y el alcance de evidencia, que C2 declara igual que la huella. Sale de la
+              -- consulta real cuando la propuesta cuelga de un reto: escribir aquí una lista
+              -- a mano fijaría en el fixture justo lo que el suelo compara contra la base.
+              -- Para las demás capacidades no aplica y va nulo, como el CHECK permite.
+              ${campos.anclas.reto_id ? ALCANCE_DEL_RETO(tx, ws, campos.anclas.reto_id) : null},
               'entorno', ${llamadaId}, ${actorId})
       returning id`);
     return p!.id as string;
@@ -5856,6 +5862,20 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * dejaría a C2 sin material, y la generación se negaría con razón; escribirlo aquí una vez
    * es lo que evita que cada caso lo dé por hecho de una manera distinta.
    */
+  /**
+   * El alcance de evidencia de un reto, como fragmento SQL para los inserts DIRECTOS.
+   *
+   * `propuesta_ai.alcance_evidencia` la escribe el servicio con el conjunto que compuso el
+   * material; una prueba que pasa por la superficie SQL tiene que escribirla también, y
+   * escribirla A MANO sería fijar en la prueba una lista que el suelo compara contra la
+   * consulta real. Sale de la misma consulta, evaluada por la base en la misma sentencia.
+   */
+  const ALCANCE_DEL_RETO = (tx: TransactionSql, wsId: string, retoId: string) => tx`array(
+    select distinct ae.evidencia_id
+      from arquetipo a
+      join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+     where a.reto_id = ${retoId} and a.workspace_id = ${wsId})`;
+
   async function evidenciaDelReto(
     wsC: string,
     retoC: string,
@@ -6170,11 +6190,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         conUsuario(curadorId, (tx) => tx`
           insert into propuesta_ai
             (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key, llamada_id,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key, llamada_id,
              creado_por)
           values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido)},
                   ${tx.json(contenido)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
-                  'alcance', 'huella-del-material', 'entorno', ${llamada[0]!.id as string}, ${curadorId})
+                  'alcance', 'huella-del-material', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno', ${llamada[0]!.id as string}, ${curadorId})
           returning id`);
       await expect(escribir(conCita(propia))).resolves.toBeDefined();
       // …y la ajena no.
@@ -7524,9 +7545,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [prop] = await conUsuario(curadorId, (tx) => tx`
         insert into propuesta_ai
           (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key, llamada_id, creado_por)
+           confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key, llamada_id, creado_por)
         values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido)}, ${tx.json(contenido)},
-                0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'alcance', 'huella-del-material', 'entorno',
+                0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'alcance', 'huella-del-material', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno',
                 ${otra!.id as string}, ${curadorId})
         returning id`);
       await expect(
@@ -7553,6 +7575,105 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             where id = ${prop!.id as string} and workspace_id = ${wsC}`;
         }),
       ).rejects.toThrow(/contradicciones del insight materializado/);
+    });
+  });
+
+  /**
+   * Y el ÚLTIMO instante: aceptar. Tercer punto de la misma línea de tiempo.
+   *
+   * Entre que la propuesta se guarda y que alguien la acepta pasan horas o días, y en ese
+   * hueco se enlaza evidencia nueva al reto. La pantalla ya lo dice —la presencia literal pasa
+   * a «no se puede comprobar»—, pero la propuesta sigue `disponible` y la aceptación sella
+   * igual: un insight que nunca vio ese documento, que en C2 puede ser justo el que lo
+   * CONTRADICE.
+   *
+   * Y quien revisa NO puede compensarlo. Las contradicciones son inmutables desde una ronda
+   * anterior de este mismo PR —para que nadie pueda quitarlas al corregir—, y esa decisión,
+   * que protege la señal, quita aquí la salida de añadir a mano la que falta. Por eso el
+   * desenlace correcto es rechazar la propuesta y volver a pedirla, no dejar que se selle.
+   *
+   * Se comprueba por el CONJUNTO de ids y no por la huella: la huella es de un texto con
+   * formato y recorte, y no hay SQL que lo reconstruya —escribirlo dos veces sería la
+   * divergencia entre redacciones hermanas que este PR ya corrigió varias veces—. El conjunto
+   * sí, y responde a la pregunta que importa: ¿había, al sellar, evidencia del reto que el
+   * insight no llegó a ver?
+   *
+   * La sonda va por SQL DIRECTO en las dos mitades: escribe la propuesta y la acepta por la
+   * superficie concedida. Lo que se afirma es que el SUELO aguanta, no que el servicio se
+   * porte bien.
+   */
+  it('una evidencia enlazada tras generar impide sellar el insight', async () => {
+    await enWorkspaceLimpio('c2-enlace-antes-de-aceptar', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido = CONTENIDO_C2(ev);
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const [pr] = await conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key,
+           llamada_id, creado_por)
+        values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
+                ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance', 'huella', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno',
+                ${l!.id as string}, ${curadorId})
+        returning id`);
+      const propuestaId = pr!.id as string;
+
+      // …y AHORA se enlaza al reto un documento que la propuesta no pudo ver.
+      const [arqNuevo] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, 'Arquetipo tardío', 'Definición', ${curadorId}) returning id`;
+      const [fte] = await admin`insert into fuente
+        (workspace_id, tipo, titulo, referencia, creado_por)
+        values (${wsC}, 'documento', 'La contradicción', 'ref', ${curadorId}) returning id`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, 'La contradicción',
+                'En cambio el 12% dice que el documento nunca fue el problema.', '{}'::jsonb,
+                ${curadorId}) returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev2!.id as string}, 'concedido', 'cliente', 'Consentimiento',
+                ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${arqNuevo!.id as string}, ${ev2!.id as string})`;
+
+      // Sellar por la superficie SQL concedida, que es el escritor que este suelo cierra.
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [ins] = await tx`insert into insight
+            (workspace_id, titulo, resumen, estado, creado_por)
+            values (${wsC}, ${contenido.titulo}, ${contenido.resumen}, 'propuesto', ${curadorId})
+            returning id`;
+          const [af] = await tx`insert into afirmacion
+            (workspace_id, insight_id, orden, texto, es_hipotesis)
+            values (${wsC}, ${ins!.id as string}, 0, ${contenido.afirmaciones[0]!.texto}, false)
+            returning id`;
+          await tx`insert into cita
+            (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+            values (${wsC}, ${af!.id as string}, ${ev},
+                    ${contenido.afirmaciones[0]!.citas[0]!.fragmento},
+                    ${contenido.afirmaciones[0]!.citas[0]!.localizacion}, ${curadorId})`;
+          // `CONTENIDO_C2` no declara contradicciones, así que no se insertan: el guard las
+          // compara en los dos sentidos y una de más lo pararía por otra regla — que es
+          // exactamente el error de medición que hay que evitar aquí.
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${curadorId}, insight_id = ${ins!.id as string}
+            where id = ${propuestaId} and workspace_id = ${wsC}`;
+        }),
+      ).rejects.toThrow(/no llegaron a ver/);
+
+      // Y la propuesta sigue donde estaba: viva, para rechazarla o rehacerla.
+      const [p] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+      expect(p!.estado).toBe('propuesta');
     });
   });
 
@@ -7595,11 +7716,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const persistencia = conUsuario(curadorId, (tx) => tx`
         insert into propuesta_ai
           (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key,
            llamada_id, creado_por)
         values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(CONTENIDO_C2(ev) as never)},
                 ${tx.json(CONTENIDO_C2(ev) as never)}, 0.6, ${MODELO_PRIMARIO},
-                ${PROMPT_VERSION}, 'alcance', 'huella', 'entorno', ${l!.id as string},
+                ${PROMPT_VERSION}, 'alcance', 'huella', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno', ${l!.id as string},
                 ${curadorId})`);
       const veredicto = persistencia.then(
         () => 'nació',
@@ -7662,11 +7784,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const persistencia = conUsuario(curadorId, (tx) => tx`
         insert into propuesta_ai
           (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key,
            llamada_id, creado_por)
         values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(CONTENIDO_C2(ev) as never)},
                 ${tx.json(CONTENIDO_C2(ev) as never)}, 0.6, ${MODELO_PRIMARIO},
-                ${PROMPT_VERSION}, 'alcance', 'huella', 'entorno', ${l!.id as string},
+                ${PROMPT_VERSION}, 'alcance', 'huella', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno', ${l!.id as string},
                 ${curadorId})`);
       const veredicto = persistencia.then(
         () => 'nació',
@@ -8172,11 +8295,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [pr] = await conUsuario(curadorId, (tx) => tx`
         insert into propuesta_ai
           (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key,
            llamada_id, creado_por)
         values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
                 ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
-                'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})
+                'alcance', 'huella', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno', ${l!.id as string}, ${curadorId})
         returning id`);
       const propuestaId = pr!.id as string;
 
@@ -8366,11 +8490,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         conUsuario(curadorId, (tx) => tx`
           insert into propuesta_ai
             (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key,
              llamada_id, creado_por)
           values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
                   ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
-                  'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})
+                  'alcance', 'huella', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno', ${l!.id as string}, ${curadorId})
           returning id`);
 
       await expect(
@@ -8426,11 +8551,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         conUsuario(curadorId, (tx) => tx`
           insert into propuesta_ai
             (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key,
              llamada_id, creado_por)
           values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
                   ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
-                  'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})
+                  'alcance', 'huella', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno', ${l!.id as string}, ${curadorId})
           returning id`);
 
       await expect(
@@ -8520,11 +8646,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         conUsuario(curadorId, (tx) => tx`
           insert into propuesta_ai
             (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
-             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key,
              llamada_id, creado_por)
           values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido as never)},
                   ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
-                  'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})
+                  'alcance', 'huella', ${ALCANCE_DEL_RETO(tx, wsC, retoC)}, 'entorno', ${l!.id as string}, ${curadorId})
           returning id`);
 
       // Entra: la contradicción no reproduce nada, así que no pide permiso de publicación.
@@ -10132,11 +10259,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         conUsuario(curadorId, (tx) => tx`
           insert into propuesta_ai
             (workspace_id, capacidad, destino, journey_id, contenido, contenido_original,
-             confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+             confianza, modelo, prompt_version, alcance_resumen, huella_material,
+           alcance_evidencia, origen_key,
              llamada_id, creado_por)
           values (${wsC}, 'C5', null, ${j.journeyId}, ${tx.json(contenido)},
                   ${tx.json(contenido)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'alcance',
-                  ${huella}, 'entorno', ${l!.id as string}, ${curadorId})
+                  ${huella}, null, 'entorno', ${l!.id as string}, ${curadorId})
           returning id`);
       await expect(escribir(null)).rejects.toThrow(/propuesta_ai_huella_del_material/);
       // Y con huella entra: sin esta mitad, un CHECK que rechazara todo pasaría igual.

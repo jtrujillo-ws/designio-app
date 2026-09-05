@@ -2,12 +2,7 @@ import '@/lib/server-only';
 import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
-import {
-  criteriosCompletos,
-  faltaParaAprobarGate,
-  type CriterioDeReto,
-  type GateDeProyecto,
-} from '@/lib/metodo/metodo.schemas';
+import type { AprobacionPendiente } from '@/lib/loop/loop.schemas';
 import {
   clasesDelRol,
   type ClasePendiente,
@@ -44,17 +39,15 @@ export async function rolEnWorkspace(
 }
 
 /**
- * El gate ABIERTO (primero pendiente) de cada proyecto del workspace, con su checklist y
- * con las entradas que `faltaParaAprobarGate` pide: es el MISMO predicado que decide el
- * botón en la pantalla del proyecto, con los mismos datos que ella le da (checklist con
- * decisiones en revisión, gates anteriores, criterios del reto para G0, registry del reto
- * para G6, arquetipos en hipótesis para G2, estado del proyecto). Un predicado propio aquí
- * —«checklist decidido» a secas— listaba gates que la base iba a rechazar.
- *
- * Trae TODOS los abiertos, sean de quien sean: el resumen del loop nombra también los que
- * esperan a otro rol («G5 espera al sponsor»). Quien mira se queda los suyos por `esMia`.
- * Son pocas filas —una por proyecto con gates pendientes—, y las proyecciones de checklist
- * y criterios copian la forma de `proyectoDelMetodo` para que el predicado reciba lo mismo.
+ * El gate ABIERTO (primero pendiente) de cada proyecto del workspace. Trae TODOS, sean de
+ * quien sean: el resumen del loop nombra también los que esperan a otro rol («G5 espera al
+ * sponsor»), y para eso lleva `checklistDecidido`. Y para los de QUIEN MIRA, lo que les
+ * falta según `gate_faltas_para_aprobar` (por su envoltorio `_visible`, que es el que el
+ * rol de la app puede ejecutar): la MISMA función que el guard de la base invoca al
+ * aprobar, así que lo que aquí sale vacío es lo que la base va a aceptar. Un espejo del
+ * guard en TypeScript —«checklist decidido» a secas, o cinco reglas de siete— listaba
+ * gates que la base rechazaba; por eso la pregunta se le hace a ella y solo a ella. Son
+ * pocas filas: una por proyecto con gates pendientes.
  */
 export async function gatesAbiertos(
   tx: TransactionSql,
@@ -62,42 +55,16 @@ export async function gatesAbiertos(
   workspaceId: string,
 ): Promise<GateAbierto[]> {
   const filas = await tx`
-    select g.id, g.numero, g.rol_aprobador, g.estado, g.aprobado_en::text as aprobado_en,
-      p.id as proyecto_id, p.codigo as proyecto_codigo, p.estado as proyecto_estado,
+    select g.id, g.numero, g.rol_aprobador, p.id as proyecto_id, p.codigo as proyecto_codigo,
       r.codigo as reto_codigo,
-      coalesce((select jsonb_agg(jsonb_build_object(
-          'id', ci.id, 'orden', ci.orden, 'texto', ci.texto, 'estado', ci.estado,
-          'objetoClase', case
-            when ci.evidencia_id is not null then 'evidencia'
-            when ci.insight_id is not null then 'insight'
-            when ci.decision_id is not null then 'decision' end,
-          'objetoId', coalesce(ci.evidencia_id, ci.insight_id, ci.decision_id),
-          'objetoTitulo', coalesce(ev.titulo, ins.titulo, dec.titulo),
-          'decisionEnRevision', (dec.id is not null and dec.estado <> 'vigente'),
-          'naJustificacion', ci.na_justificacion)
-          order by ci.orden)
-        from checklist_item ci
-        left join evidencia ev on ev.id = ci.evidencia_id and ev.workspace_id = ci.workspace_id
-        left join insight ins on ins.id = ci.insight_id and ins.workspace_id = ci.workspace_id
-        left join decision dec on dec.id = ci.decision_id and dec.workspace_id = ci.workspace_id
-        where ci.gate_id = g.id and ci.workspace_id = g.workspace_id), '[]'::jsonb) as items,
-      not exists (select 1 from gate_instancia g2
-        where g2.proyecto_id = g.proyecto_id and g2.workspace_id = g.workspace_id
-          and g2.numero < g.numero and g2.estado <> 'aprobado') as anteriores_aprobados,
-      coalesce((select jsonb_agg(jsonb_build_object(
-          'id', c.id, 'kpi', c.kpi, 'definicion', c.definicion,
-          'lineaBaseValor', c.linea_base_valor, 'lineaBaseFecha', c.linea_base_fecha::text,
-          'lineaBasePlan', c.linea_base_plan, 'objetivo', c.objetivo,
-          'ventanaDias', c.ventana_dias, 'fechaPostMortem', c.fecha_post_mortem::text)
-          order by c.creado_en, c.id)
-        from criterio_exito c
-        where c.reto_id = r.id and c.workspace_id = r.workspace_id), '[]'::jsonb) as criterios,
-      exists (select 1 from metric_registry mr
-        where mr.reto_id = r.id and mr.workspace_id = r.workspace_id
-          and mr.estado = 'firmado') as registry_firmado,
-      (select count(*)::int from arquetipo a
-        where a.reto_id = r.id and a.workspace_id = r.workspace_id
-          and a.estado = 'hipotesis') as arquetipos_sin_veredicto
+      (exists (select 1 from checklist_item ci
+          where ci.gate_id = g.id and ci.workspace_id = g.workspace_id)
+        and not exists (select 1 from checklist_item ci
+          where ci.gate_id = g.id and ci.workspace_id = g.workspace_id
+            and ci.estado = 'pendiente')) as checklist_decidido,
+      case when g.rol_aprobador = ${rol}
+        then array(select f.motivo from gate_faltas_para_aprobar_visible(g.id, g.workspace_id) f)
+        else null end as faltas
     from gate_instancia g
     join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
     join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id
@@ -108,40 +75,30 @@ export async function gatesAbiertos(
           and g2.estado = 'pendiente')
     order by r.codigo, r.id, p.codigo, p.id, g.numero`;
   return filas.map((f) => ({
-    gate: {
-      id: f.id as string,
-      numero: f.numero as number,
-      rolAprobador: f.rol_aprobador as GateDeProyecto['rolAprobador'],
-      estado: f.estado as GateDeProyecto['estado'],
-      aprobadoEn: (f.aprobado_en as string | null) ?? null,
-      items: f.items as GateDeProyecto['items'],
-    },
+    gateId: f.id as string,
+    numero: f.numero as number,
+    rolAprobador: f.rol_aprobador as AprobacionPendiente['rolAprobador'],
     esMia: (f.rol_aprobador as string) === rol,
     proyectoId: f.proyecto_id as string,
     proyectoCodigo: f.proyecto_codigo as string,
     retoCodigo: f.reto_codigo as string,
-    contexto: {
-      anterioresAprobados: f.anteriores_aprobados as boolean,
-      criteriosListosG0: criteriosCompletos(f.criterios as CriterioDeReto[]),
-      registryFirmadoG6: f.registry_firmado as boolean,
-      arquetiposSinVeredicto: f.arquetipos_sin_veredicto as number,
-      proyectoEstado: f.proyecto_estado as string,
-    },
+    checklistDecidido: f.checklist_decidido as boolean,
+    falta: (f.faltas as string[] | null) ?? null,
   }));
 }
 
-/** Los gates abiertos que esperan a QUIEN MIRA, con lo que les falta según el predicado. */
+/** Los gates abiertos que esperan a QUIEN MIRA, con lo que les falta según la base. */
 export function gatesDelRol(abiertos: GateAbierto[]): GatePendiente[] {
   return abiertos
     .filter((g) => g.esMia)
     .map((g) => ({
-      gateId: g.gate.id,
-      numero: g.gate.numero,
-      rolAprobador: g.gate.rolAprobador,
+      gateId: g.gateId,
+      numero: g.numero,
+      rolAprobador: g.rolAprobador,
       proyectoId: g.proyectoId,
       proyectoCodigo: g.proyectoCodigo,
       retoCodigo: g.retoCodigo,
-      falta: faltaParaAprobarGate(g.gate, g.contexto),
+      falta: g.falta ?? [],
     }));
 }
 

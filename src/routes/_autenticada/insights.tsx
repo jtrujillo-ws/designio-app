@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
+import { wsDeBusqueda } from '@/lib/auth/workspace-activo';
 import { evidenciasDelWorkspace } from '@/lib/evidencia/evidencia.functions';
 import {
   etiquetaObjetoBloqueado,
@@ -39,8 +40,12 @@ export const Route = createFileRoute('/_autenticada/insights')({
   // —keyset de los más recientes, y lo que más espera validación es lo más antiguo— el
   // loader lo trae aparte y la pantalla lo fija arriba: un enlace que aterriza en «no está
   // entre lo cargado» no es un enlace.
-  validateSearch: (search: Record<string, unknown>): { destacar?: string } =>
-    typeof search.destacar === 'string' && search.destacar !== '' ? { destacar: search.destacar } : {},
+  // Solo cuenta un uuid bien formado (misma regla que `ws` y `servicio`): el loader lo pide
+  // por id con un schema uuid, y un `?destacar=foo` tecleado a mano no debe tumbar la ruta.
+  validateSearch: (search: Record<string, unknown>): { destacar?: string } => {
+    const destacar = wsDeBusqueda(search.destacar);
+    return destacar ? { destacar } : {};
+  },
   loaderDeps: ({ search }) => ({ ws: search.ws, destacar: search.destacar }),
   loader: async ({ context, deps }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;

@@ -263,25 +263,3 @@ export function faltaParaAprobarGate(
   }
   return falta;
 }
-
-/**
- * Espejo cliente del predicado SYS-22 de aprobarGate: los criterios del reto están
- * completos, y por tanto G0 puede aprobarse por ese lado. Solo informa —la exigencia real
- * vive en el servidor y en la política—, pero es la entrada `criteriosListosG0` de
- * `faltaParaAprobarGate`, y por eso vive junto a él y no dentro de la pantalla del
- * proyecto: la bandeja de aprobaciones le hace la misma pregunta con los mismos datos.
- */
-export function criteriosCompletos(criterios: CriterioDeReto[]): boolean {
-  return (
-    criterios.length > 0 &&
-    criterios.every(
-      (c) =>
-        c.kpi.trim() !== '' &&
-        c.definicion.trim() !== '' &&
-        c.objetivo.trim() !== '' &&
-        c.ventanaDias !== null &&
-        (((c.lineaBaseValor ?? '').trim() !== '' && c.lineaBaseFecha !== null) ||
-          c.lineaBasePlan.trim() !== ''),
-    )
-  );
-}

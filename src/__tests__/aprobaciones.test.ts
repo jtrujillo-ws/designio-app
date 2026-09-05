@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   CLASES_PENDIENTES,
   ROLES_POR_CLASE,
-  checklistDecidido,
   clasesDelRol,
   comoAprobacionPendiente,
   contarPendientes,
@@ -11,6 +10,7 @@ import {
   destinoDeGate,
   destinoDeInsight,
   etiquetaDePendientes,
+  motivoSinPreambulo,
   type DerechoPendiente,
   type DesignVersionPendiente,
   type GateAbierto,
@@ -19,7 +19,6 @@ import {
 } from '@/lib/aprobaciones/aprobaciones.schemas';
 import { ROLES_DERECHOS } from '@/lib/evidencia/evidencia.schemas';
 import { etiquetaDeDestino } from '@/lib/destinos';
-import type { ItemDeGate } from '@/lib/metodo/metodo.schemas';
 
 /**
  * La pantalla de aprobaciones decide qué clases enseñar SIN consultar nada: por rol. Y el
@@ -54,54 +53,18 @@ describe('qué clases decide cada rol', () => {
   });
 });
 
-function item(estado: ItemDeGate['estado'], decisionEnRevision = false): ItemDeGate {
-  return {
-    id: `i-${estado}`,
-    orden: 0,
-    texto: 'Ítem',
-    estado,
-    objetoClase: null,
-    objetoId: null,
-    objetoTitulo: null,
-    decisionEnRevision,
-    naJustificacion: '',
-  };
-}
-
-describe('el checklist decidido (lo que «Te toca a ti» llama aprobación pendiente)', () => {
-  const base = {
-    id: 'g1',
-    numero: 1,
-    rolAprobador: 'lead-boutique',
-    estado: 'pendiente',
-    aprobadoEn: null,
-  } as const;
-
-  it('cuenta con todo decidido: cumplidos o N/A, nada pendiente', () => {
-    expect(checklistDecidido({ ...base, items: [item('cumplido'), item('na')] })).toBe(true);
-  });
-
-  it('no cuenta con un ítem pendiente, ni con el checklist vacío (no es suficiencia)', () => {
-    expect(checklistDecidido({ ...base, items: [item('cumplido'), item('pendiente')] })).toBe(
-      false,
-    );
-    expect(checklistDecidido({ ...base, items: [] })).toBe(false);
-  });
-
-  it('se proyecta a la fila del resumen del loop con la marca de si es de quien mira', () => {
+describe('el gate abierto y lo que la base dice que le falta', () => {
+  it('se proyecta a la fila del resumen del loop sin la parte que solo mira la bandeja', () => {
     const abierto: GateAbierto = {
-      gate: { ...base, items: [item('cumplido')] },
+      gateId: 'g1',
+      numero: 1,
+      rolAprobador: 'lead-boutique',
       esMia: false,
       proyectoId: 'p1',
       proyectoCodigo: 'P-01',
       retoCodigo: 'R-01',
-      contexto: {
-        anterioresAprobados: true,
-        criteriosListosG0: true,
-        registryFirmadoG6: true,
-        arquetiposSinVeredicto: 0,
-        proyectoEstado: 'activo',
-      },
+      checklistDecidido: true,
+      falta: null,
     };
     expect(comoAprobacionPendiente(abierto)).toEqual({
       gateId: 'g1',
@@ -112,6 +75,22 @@ describe('el checklist decidido (lo que «Te toca a ti» llama aprobación pendi
       proyectoCodigo: 'P-01',
       retoCodigo: 'R-01',
     });
+  });
+
+  it('en la fila, el motivo del guard pierde su arranque de excepción y nada más', () => {
+    expect(motivoSinPreambulo('no se puede aprobar: checklist con pendientes')).toBe(
+      'checklist con pendientes',
+    );
+    expect(motivoSinPreambulo('no se puede aprobar G0: criterios incompletos (SYS-22)')).toBe(
+      'criterios incompletos (SYS-22)',
+    );
+    expect(
+      motivoSinPreambulo(
+        'no se puede aprobar G6 con el proyecto parado: retómalo antes, porque aprobar el plan lo pone en implementación (§7)',
+      ),
+    ).toBe('retómalo antes, porque aprobar el plan lo pone en implementación (§7)');
+    // Un motivo que no lleve el preámbulo se queda como está.
+    expect(motivoSinPreambulo('hay elementos sin release')).toBe('hay elementos sin release');
   });
 });
 
@@ -161,7 +140,10 @@ describe('el conteo de la cabecera', () => {
 
   it('un gate al que le falta algo se lista pero NO cuenta: no es decidible ahora', () => {
     const conteo = contarPendientes({
-      gates: [gate, { ...gate, gateId: 'g2', falta: ['2 pendientes'] }],
+      gates: [
+        gate,
+        { ...gate, gateId: 'g2', falta: ['no se puede aprobar: checklist con pendientes'] },
+      ],
       derechos: [],
       insights: [],
       designVersions: [],

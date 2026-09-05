@@ -2,7 +2,6 @@ import { z } from 'zod';
 import type { Destino } from '@/lib/destinos';
 import { ROLES_DERECHOS } from '@/lib/evidencia/evidencia.schemas';
 import type { AprobacionPendiente } from '@/lib/loop/loop.schemas';
-import type { GateDeProyecto } from '@/lib/metodo/metodo.schemas';
 
 /**
  * Aprobaciones pendientes: lo que el rol de quien mira puede aprobar o decidir AHORA en el
@@ -65,46 +64,27 @@ export function clasesDelRol(rol: string): ClasePendiente[] {
 }
 
 /**
- * El gate ABIERTO de un proyecto (el primero pendiente), tal como sale de la base, con todo
- * lo que hace falta para preguntarle a `faltaParaAprobarGate` —el predicado de la pantalla
- * del proyecto— si se puede aprobar ya. Es UNA fila por proyecto con gates pendientes, sea
- * de quien sea el gate: el resumen del loop necesita también los que esperan a otro rol.
+ * El gate ABIERTO de un proyecto (el primero pendiente), tal como sale de la base. Es UNA
+ * fila por proyecto con gates pendientes, sea de quien sea el gate: el resumen del loop
+ * necesita también los que esperan a otro rol («G5 espera al sponsor»).
  */
-export type GateAbierto = {
-  gate: GateDeProyecto;
-  /** El rol aprobador es el de quien mira: es SU aprobación, no una que espera a otro. */
-  esMia: boolean;
-  proyectoId: string;
-  proyectoCodigo: string;
-  retoCodigo: string;
-  /** Las entradas de `faltaParaAprobarGate` que no están en el gate mismo. */
-  contexto: {
-    anterioresAprobados: boolean;
-    criteriosListosG0: boolean;
-    registryFirmadoG6: boolean;
-    arquetiposSinVeredicto: number;
-    proyectoEstado: string;
-  };
+export type GateAbierto = AprobacionPendiente & {
+  /** El checklist está entero decidido y no vacío: dejó de ser trabajo y espera a su
+   * aprobador. Es lo que «Te toca a ti» llama «aprobación pendiente» (un checklist vacío no
+   * es suficiencia, mismo criterio que el guard). La suficiencia COMPLETA es `falta`. */
+  checklistDecidido: boolean;
+  /** Lo que le falta para aprobarse según `gate_faltas_para_aprobar` —la función que el
+   * guard de la base invoca al aprobar—, o null si el gate no espera a quien mira (no se
+   * le pregunta por lo que no es suyo). */
+  falta: string[] | null;
 };
 
-/**
- * El checklist del gate está entero decidido y no vacío: dejó de ser trabajo y espera a su
- * aprobador. Es lo que «Te toca a ti» llama «aprobación pendiente» —el mismo criterio que
- * tenía la consulta del resumen del loop antes de que existiera esta pantalla—. Un
- * checklist vacío no es suficiencia (mismo criterio que el guard de la base). La
- * suficiencia COMPLETA la dice `faltaParaAprobarGate`; esto es solo la parte del gate que
- * es trabajo de otros.
- */
-export function checklistDecidido(gate: GateDeProyecto): boolean {
-  return gate.items.length > 0 && gate.items.every((i) => i.estado !== 'pendiente');
-}
-
-/** La fila del resumen del loop que un gate abierto produce cuando su checklist está decidido. */
+/** La fila del resumen del loop que un gate abierto produce. */
 export function comoAprobacionPendiente(g: GateAbierto): AprobacionPendiente {
   return {
-    gateId: g.gate.id,
-    numero: g.gate.numero,
-    rolAprobador: g.gate.rolAprobador,
+    gateId: g.gateId,
+    numero: g.numero,
+    rolAprobador: g.rolAprobador,
     esMia: g.esMia,
     proyectoId: g.proyectoId,
     proyectoCodigo: g.proyectoCodigo,
@@ -113,12 +93,21 @@ export function comoAprobacionPendiente(g: GateAbierto): AprobacionPendiente {
 }
 
 /**
- * Un gate que espera a QUIEN MIRA. `falta` es la respuesta de `faltaParaAprobarGate` —la
- * MISMA que apaga el botón en la pantalla del proyecto—: vacía, el gate se puede aprobar
- * ahora y cuenta; con motivos, se lista para que el aprobador sepa qué espera, pero no es
- * una decisión que pueda tomar todavía y no cuenta.
+ * Un gate que espera a QUIEN MIRA. `falta` es lo que la BASE contesta —los mismos motivos,
+ * carácter a carácter, con los que el guard rechazaría la aprobación—: vacía, el gate se
+ * puede aprobar ahora y cuenta; con motivos, se lista para que el aprobador sepa qué
+ * espera, pero no es una decisión que pueda tomar todavía y no cuenta.
  */
 export type GatePendiente = Omit<AprobacionPendiente, 'esMia'> & { falta: string[] };
+
+/**
+ * Los motivos del guard empiezan por «no se puede aprobar G5: …» o «no se puede aprobar:
+ * …»: es su forma de excepción. En la fila, detrás de «Falta para poder aprobarlo:», ese
+ * arranque sobra; el resto se deja intacto, que es lo que dice qué reparar.
+ */
+export function motivoSinPreambulo(motivo: string): string {
+  return motivo.replace(/^no se puede aprobar(?: G\d)?(?: con [^:]+)?:\s*/i, '');
+}
 
 /** Un derecho de uso sin decidir: la evidencia existe pero no se cita ni sale en entregables. */
 export type DerechoPendiente = {

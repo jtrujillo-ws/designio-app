@@ -8,11 +8,7 @@ import {
   gatesDelRol,
   rolEnWorkspace,
 } from '@/lib/aprobaciones/aprobaciones.queries';
-import {
-  checklistDecidido,
-  clasesDelRol,
-  comoAprobacionPendiente,
-} from '@/lib/aprobaciones/aprobaciones.schemas';
+import { clasesDelRol, comoAprobacionPendiente } from '@/lib/aprobaciones/aprobaciones.schemas';
 import { proyectoActualDe } from './loop-estado';
 import type {
   EntregaPendiente,
@@ -112,12 +108,10 @@ export async function resumenParaUsuario(
       // El gate abierto de cada proyecto (la consulta vive en el módulo de aprobaciones, su
       // otro lector). De ahí salen dos cosas: las «aprobaciones» que «Te toca a ti» nombra
       // —TODAS las que tienen el checklist decidido, esperen a quien esperen— y, para el
-      // contador del lateral, las que quien mira puede aprobar YA según el mismo predicado
-      // que la pantalla del proyecto (`faltaParaAprobarGate`).
+      // contador del lateral, las que quien mira puede aprobar YA según la base
+      // (`gate_faltas_para_aprobar`, la misma función que invoca el guard).
       const abiertos = await gatesAbiertos(tx, rol, workspaceId);
-      const aprobaciones = abiertos
-        .filter((g) => checklistDecidido(g.gate))
-        .map(comoAprobacionPendiente);
+      const aprobaciones = abiertos.filter((g) => g.checklistDecidido).map(comoAprobacionPendiente);
       // Y el conteo de TODO lo que el rol puede decidir ahora (gates propios, derechos,
       // insights, design versions): solo escalares, sin materializar las filas que la
       // pantalla de aprobaciones lee con la misma fuente.

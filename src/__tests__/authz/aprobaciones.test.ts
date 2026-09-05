@@ -32,6 +32,7 @@ describeAuthz('aprobaciones pendientes (proyección por rol + aislamiento)', () 
   let gateG1 = '';
   let gateG2 = '';
   let gateG0P2 = '';
+  let gateG5P4 = '';
   let evidenciaA = '';
   let insightA = '';
   let dvConJourney = '';
@@ -184,6 +185,16 @@ describeAuthz('aprobaciones pendientes (proyección por rol + aislamiento)', () 
       (workspace_id, proyecto_id, servicio_id, journey_id, codigo, titulo, creado_por)
       values (${wsA}, ${a3.proyectoId}, ${a3.servicioId}, ${a3.journeyId}, 'DV-3',
         'Borrador de un proyecto certificado', ${leadA})`;
+    // Proyecto 4 de A: G0–G4 aprobados y G5 abierto con el checklist decidido, pero SIN
+    // design version aprobada que certificar. El checklist no lo sabe; la base sí.
+    const a4 = await arbol(wsA, leadA, 'A4');
+    for (const numero of [0, 1, 2, 3, 4]) {
+      await admin`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+        values (${wsA}, ${a4.proyectoId}, ${numero},
+          ${[0, 3].includes(numero) ? 'sponsor' : 'lead-boutique'}, 'aprobado', ${leadA}, now())`;
+    }
+    gateG5P4 = await gateDecidido(wsA, a4.proyectoId, 5, leadA);
 
     // B tiene de todo pendiente, y ninguno de los de A es miembro.
     const b1 = await arbol(wsB, leadA, 'B1');
@@ -261,12 +272,32 @@ describeAuthz('aprobaciones pendientes (proyección por rol + aislamiento)', () 
 
   it('el gate cuya aprobación la base rechazaría se lista con lo que le falta y no cuenta', async () => {
     const sponsor = await pendientesParaUsuario(sponsorA, wsA);
-    // G0 de P-A2 tiene el checklist decidido pero el reto no tiene criterios: es el mismo
-    // motivo que apaga el botón en la pantalla del proyecto.
+    // Los motivos son los de la BASE, carácter a carácter (`gate_faltas_para_aprobar`, la
+    // función que el guard invoca): G0 de P-A2 tiene el checklist decidido pero el reto no
+    // tiene criterios; G5 de P-A4 lo tiene decidido pero no hay diseño congelado que
+    // certificar —lo que el espejo en TypeScript no sabía y la bandeja contaba—.
     expect(sponsor.gates.map((g) => [g.gateId, g.numero, g.proyectoCodigo, g.falta])).toEqual([
-      [gateG0P2, 0, 'P-A2', ['Faltan criterios completos (SYS-22)']],
+      [gateG0P2, 0, 'P-A2', ['no se puede aprobar G0: sin criterios de éxito (SYS-22)']],
+      [
+        gateG5P4,
+        5,
+        'P-A4',
+        [
+          'no se puede aprobar G5: el proyecto no tiene ninguna design version aprobada con elementos que certificar (RF-06.3)',
+        ],
+      ],
     ]);
     expect(contarPendientes(sponsor).porClase.gate).toBe(0);
+    // Y el guard sigue rechazando con el MISMO texto: la bandeja y la base dicen lo mismo
+    // porque preguntan lo mismo.
+    await expect(
+      conUsuario(
+        sponsorA,
+        (tx) => tx`update gate_instancia
+          set estado = 'aprobado', aprobado_por = ${sponsorA}, aprobado_en = now()
+          where id = ${gateG5P4} and workspace_id = ${wsA}`,
+      ),
+    ).rejects.toThrow(/ninguna design version aprobada con elementos que certificar/);
     // Y cuando el checklist tiene trabajo, el motivo es ese: G2 de P-A1 pasa a ser el
     // abierto en cuanto G1 se aprueba.
     const admin = sqlAdmin();
@@ -274,7 +305,9 @@ describeAuthz('aprobaciones pendientes (proyección por rol + aislamiento)', () 
       where id = ${gateG1}`;
     try {
       const lead = await pendientesParaUsuario(leadA, wsA);
-      expect(lead.gates.map((g) => [g.gateId, g.falta])).toEqual([[gateG2, ['1 pendientes']]]);
+      expect(lead.gates.map((g) => [g.gateId, g.falta])).toEqual([
+        [gateG2, ['no se puede aprobar: checklist con pendientes']],
+      ]);
       expect(contarPendientes(lead).porClase.gate).toBe(0);
     } finally {
       await admin`update gate_instancia set estado = 'pendiente', aprobado_por = null, aprobado_en = null
@@ -284,7 +317,7 @@ describeAuthz('aprobaciones pendientes (proyección por rol + aislamiento)', () 
 
   it('cada rol recibe solo su clase: el sponsor su gate, el admin los derechos, el stakeholder nada', async () => {
     const sponsor = await pendientesParaUsuario(sponsorA, wsA);
-    expect(sponsor.gates.map((g) => g.gateId)).toEqual([gateG0P2]);
+    expect(sponsor.gates.map((g) => g.gateId)).toEqual([gateG0P2, gateG5P4]);
     expect(sponsor.derechos).toEqual([]);
     expect(sponsor.insights).toEqual([]);
     expect(sponsor.designVersions).toEqual([]);
@@ -313,9 +346,11 @@ describeAuthz('aprobaciones pendientes (proyección por rol + aislamiento)', () 
     }
     // Y el resumen sigue nombrando TODOS los gates con checklist decidido, propios o no.
     const delLead = await resumenParaUsuario(leadA, wsA);
+    // G5 de P-A4 también: tiene el checklist decidido aunque la base no lo deje aprobar aún.
     expect(delLead.aprobaciones.map((a) => [a.numero, a.esMia]).sort()).toEqual([
       [0, false],
       [1, true],
+      [5, false],
     ]);
   });
 

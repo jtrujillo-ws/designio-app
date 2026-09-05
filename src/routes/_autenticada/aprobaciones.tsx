@@ -18,6 +18,7 @@ import {
   destinoDeGate,
   destinoDeInsight,
   etiquetaDePendientes,
+  motivoSinPreambulo,
   type ClasePendiente,
   type PendientesDelRol,
 } from '@/lib/aprobaciones/aprobaciones.schemas';
@@ -252,9 +253,13 @@ function filasDeClase(clase: ClasePendiente, datos: PendientesDelRol): ReactNode
               ? `Reto ${g.retoCodigo} · se puede aprobar ahora`
               : `Reto ${g.retoCodigo} · gate abierto, todavía no se puede aprobar`
           }
-          // El mismo predicado que apaga el botón en el proyecto (`faltaParaAprobarGate`):
-          // lo que diga aquí es lo que dirá allí, y por eso no cuenta como decisión.
-          aviso={g.falta.length > 0 ? `Falta para poder aprobarlo: ${g.falta.join(' · ')}` : null}
+          // Los motivos son los de la BASE (`gate_faltas_para_aprobar`, la misma función
+          // que invoca el guard al aprobar): lo que diga aquí es lo que rechazaría allí.
+          aviso={
+            g.falta.length > 0
+              ? `Falta para poder aprobarlo: ${g.falta.map(motivoSinPreambulo).join(' · ')}`
+              : null
+          }
         />
       ));
     case 'derecho':

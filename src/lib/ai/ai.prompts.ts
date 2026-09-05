@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.9';
+export const PROMPT_VERSION = 'ai-2026-09-05.11';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -190,6 +190,120 @@ export function materialDeGate(gate: {
       )
       .join('\n\n'),
   );
+}
+
+/**
+ * Material de C2: la formulación del reto Y su evidencia.
+ *
+ * Cada evidencia viaja con su ID, y ése es el punto: las citas que C2 devuelve nombran su
+ * evidencia por id, y el servicio comprueba que cada uno esté entre los que se mandaron. Sin
+ * el id en el material, el modelo no tendría qué copiar y la cita señalaría un sostén que
+ * nadie puede localizar.
+ *
+ * Los ids son uuid de la base —no los escribe ningún miembro—, así que no son la superficie
+ * de inyección; el título y el resumen de cada evidencia sí, y por eso todo esto va dentro
+ * del mismo bloque no confiable, ficha incluida.
+ */
+export type EvidenciaDelReto = { id: string; titulo: string; resumen: string }[];
+
+type RetoConEvidencia = {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  evidencia: EvidenciaDelReto;
+};
+
+export function materialDeInsights(reto: RetoConEvidencia): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Código del reto', reto.codigo],
+      ['Título del reto', reto.titulo],
+    ],
+    cuerpoDeInsights(reto).texto,
+  );
+}
+
+/**
+ * El cuerpo del material de C2 y DÓNDE queda cada evidencia dentro de él.
+ *
+ * Los tramos existen porque el pajar de una cita es el documento que nombra, y ese documento
+ * hay que sacarlo de AQUÍ y no volver a componerlo aparte: el cuerpo se recorta ENTERO a
+ * `MAX_MATERIAL`, así que una evidencia puede haber llegado al modelo a medias, o no haber
+ * llegado. Recomponerla por su cuenta reinicia el presupuesto desde cero y devuelve un texto
+ * que el modelo nunca vio — con el que un fragmento inventado saldría PRESENTE.
+ */
+function cuerpoDeInsights(reto: RetoConEvidencia): {
+  texto: string;
+  tramos: Map<string, [number, number]>;
+} {
+  const partes = [reto.descripcion, '', 'EVIDENCIA DEL RETO'];
+  const tramos = new Map<string, [number, number]>();
+  let largo = partes.join('\n').length;
+  for (const e of reto.evidencia) {
+    const linea = `[${e.id}] ${e.titulo}\n${e.resumen}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramos.set(e.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
+  }
+  return { texto: partes.join('\n'), tramos };
+}
+
+/**
+ * Qué evidencia llegó ENTERA al modelo, cuánta se quedó fuera y cuánto ocupaba todo.
+ *
+ * `alcance_evidencia` dice qué documentos tuvo delante quien escribió los insights, y el suelo
+ * lo compara con los que el reto tiene hoy para no sellar unos insights que no llegaron a ver
+ * algo. Apuntar ahí todo lo CONSULTADO da por visto lo que el recorte se comió: el cuerpo es la
+ * concatenación de todos los documentos y se corta ENTERO a `MAX_MATERIAL`, así que pasado
+ * cierto punto la cola se queda fuera —a medias o del todo—.
+ *
+ * Y cuenta como visto solo lo que llegó COMPLETO. Media evidencia no es una evidencia leída: la
+ * contradicción que el análisis tenía que encontrar puede estar justo en el trozo que se cortó,
+ * y el sello diría que se miró.
+ */
+export function evidenciaQueLlegoAlModelo(reto: RetoConEvidencia): {
+  ids: string[];
+  fuera: number;
+  caracteres: number;
+} {
+  const { texto, tramos } = cuerpoDeInsights(reto);
+  const visto = materialQueVeElModelo(texto);
+  const ids = reto.evidencia
+    .filter((e) => {
+      const tramo = tramos.get(e.id);
+      return tramo !== undefined && visto.slice(tramo[0], tramo[1]).length === tramo[1] - tramo[0];
+    })
+    .map((e) => e.id);
+  return { ids, fuera: reto.evidencia.length - ids.length, caracteres: texto.length };
+}
+
+/**
+ * El texto de UNA evidencia tal como el modelo lo vio, para medir contra él las citas que la
+ * nombran — y SOLO él.
+ *
+ * Dos cosas que parecen detalles y son el caso entero:
+ *
+ * 1. NO es `materialDeInsights` con una sola evidencia. Ese material lleva delante la ficha
+ *    del reto y su descripción, así que una cita que dice «esto está en la evidencia B» y en
+ *    realidad copia la FORMULACIÓN DEL RETO salía presente contra cualquier evidencia.
+ * 2. NO es la línea de la evidencia recompuesta aparte. El cuerpo se recorta entero a
+ *    `MAX_MATERIAL`, así que lo que llegó al modelo de un documento puede ser un trozo, o
+ *    nada; recomponerlo suelto reinicia el presupuesto desde cero y devuelve texto que el
+ *    modelo NUNCA VIO, con el que un fragmento de la parte cortada saldría presente. Se
+ *    recorta el cuerpo completo y se toma el tramo que sobrevivió.
+ *
+ * `''` cuando el recorte se la comió entera: correcto, y es lo mismo que «no aparece» — una
+ * cita a un documento que el modelo no llegó a leer no la sostiene nada.
+ */
+export function materialDeUnaEvidencia(reto: RetoConEvidencia, evidenciaId: string): string {
+  const { texto, tramos } = cuerpoDeInsights(reto);
+  const tramo = tramos.get(evidenciaId);
+  if (!tramo) return '';
+  // Se recorta ANTES de cortar el tramo, y en ese orden: `materialQueVeElModelo` trunca a
+  // `MAX_MATERIAL` y después neutraliza el delimitador sustituyendo un carácter por otro, así
+  // que las posiciones del cuerpo original siguen valiendo sobre el resultado.
+  return materialQueVeElModelo(texto).slice(tramo[0], tramo[1]);
 }
 
 /**
@@ -387,6 +501,28 @@ export const SISTEMA_ASISTENTE_GATES = [
 ].join('\n');
 
 /**
+ * C2 propone insights, y un insight sin cita no es un insight: es una opinión.
+ *
+ * Por eso el sistema pide la cita ANTES que la afirmación, y por eso pide marcar lo que se
+ * extrapola. RF-08.2 lo exige para los revisores AI y la razón vale igual aquí: una
+ * extrapolación bien escrita suena igual que una observación, y el que revisa no puede
+ * distinguirlas si nadie se lo dice.
+ *
+ * Y las contradicciones se SEÑALAN. I4 las pide, y esconderlas es la manera más limpia de
+ * vender una conclusión: un insight que solo trae la evidencia que lo confirma es exactamente
+ * lo que este pipeline existe para no producir.
+ */
+export const SISTEMA_INSIGHTS = [
+  'Eres una capacidad de análisis de una plataforma de service design. Propones; una persona decide.',
+  'Propones INSIGHTS sobre un reto a partir de su evidencia: cada insight con sus afirmaciones, y CADA afirmación con al menos una cita.',
+  'Una cita es un fragmento LITERAL de la evidencia (copiado carácter a carácter, sin parafrasear), con el id EXACTO de la evidencia entre corchetes y su localización. No inventes ids.',
+  'Marca como hipótesis (`esHipotesis: true`) toda afirmación que EXTRAPOLE más allá de lo que la evidencia dice. Una extrapolación bien escrita suena igual que una observación: distinguirlas es tu trabajo, no el de quien revisa.',
+  'SEÑALA las contradicciones: si alguna evidencia va en contra del insight, dilo con su id y en qué consiste. Un insight que solo trae lo que lo confirma no sirve para decidir.',
+  'No propongas insights que la evidencia no sostenga, aunque sean plausibles: prefiere menos y mejor citados.',
+  REGLAS_COMUNES,
+].join('\n');
+
+/**
  * C5 no valida: REMEDIA. Y su sistema lo dice en la primera línea, porque es la confusión
  * que más caro sale.
  *
@@ -447,6 +583,33 @@ export function promptCriterios(reto: {
       'Cada criterio debe poder medirse con datos que el cliente pueda obtener; si la métrica objetivo declarada ya existe, cúbrela con el primero.',
     ].join('\n\n'),
     alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · formulación y métrica objetivo (${material.usados} caracteres)`,
+  };
+}
+
+/** Prompt de C2: el reto y su evidencia, delimitados como dato igual que el resto. */
+export function promptInsights(reto: {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  evidencia: EvidenciaDelReto;
+  cuantos: number;
+}): { usuario: string; alcanceResumen: string } {
+  const material = materialDeInsights(reto);
+  return {
+    usuario: [
+      `Propón hasta ${reto.cuantos} insights sobre el reto descrito en el material, a partir de su evidencia.`,
+      material.bloque,
+      'Prefiere menos insights bien citados a muchos flojos: cada afirmación tiene que poder señalar el fragmento que la sostiene.',
+      // Y decirlo, no solo permitirlo en el esquema: sin esta frase, «hasta N» con la lista
+      // vacía admitida sigue leyéndose como que se espera al menos uno, y el modelo rellena.
+      'Si esta evidencia no sostiene ningún insight, devuelve la lista vacía: es una respuesta correcta y preferible a proponer algo flojo.',
+      material.truncado
+        ? `(La evidencia se truncó a ${MAX_MATERIAL} caracteres: no afirmes nada sobre lo que no ves.)`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.evidencia.length} evidencias (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 
@@ -708,6 +871,77 @@ const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>>
       },
     },
   },
+  C2: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['titulo', 'resumen', 'afirmaciones', 'contradicciones', 'confianzaPropuesta'],
+    properties: {
+      titulo: { type: 'string', description: 'El insight, en una frase' },
+      resumen: { type: 'string', description: 'Qué aporta y a quién le sirve' },
+      afirmaciones: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['texto', 'esHipotesis', 'citas'],
+          properties: {
+            texto: { type: 'string', description: 'Lo que se afirma, en una frase' },
+            esHipotesis: {
+              type: 'boolean',
+              description:
+                'true si EXTRAPOLA más allá de lo que la evidencia dice. Una extrapolación bien escrita suena igual que una observación',
+            },
+            citas: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 6,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['evidenciaId', 'fragmento', 'localizacion'],
+                properties: {
+                  evidenciaId: {
+                    type: 'string',
+                    description:
+                      'El id EXACTO de la evidencia, copiado de entre corchetes en el material. No lo inventes',
+                  },
+                  fragmento: {
+                    type: 'string',
+                    description: 'Fragmento LITERAL de esa evidencia que sostiene la afirmación',
+                  },
+                  localizacion: { type: 'string', description: 'Qué parte de la evidencia es' },
+                },
+              },
+            },
+          },
+        },
+      },
+      contradicciones: {
+        type: 'array',
+        // Sin `minItems`: no toda evidencia se contradice, y pedir una obligaría a inventarla.
+        maxItems: 4,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['evidenciaId', 'descripcion'],
+          properties: {
+            evidenciaId: {
+              type: 'string',
+              description: 'El id EXACTO de la evidencia que va en contra del insight',
+            },
+            descripcion: { type: 'string', description: 'En qué consiste la contradicción' },
+          },
+        },
+      },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description: 'Cómo de seguro estás de ESTE insight',
+      },
+    },
+  },
   C5: {
     type: 'object',
     additionalProperties: false,
@@ -795,7 +1029,10 @@ export function esquemaDeSalida(c: CapacidadActiva): Record<string, unknown> {
     properties: {
       [lote.campo]: {
         type: 'array',
-        minItems: 1,
+        // Los dos extremos salen del registro, no escritos aquí: es el mismo sobre que el
+        // servicio va a leer, y un mínimo distinto en cada lado descarta por «fuera de
+        // contrato» una respuesta ya pagada.
+        minItems: lote.minimo,
         maxItems: lote.maximo,
         items: ESQUEMA_DE_UNA_PROPUESTA[c],
       },

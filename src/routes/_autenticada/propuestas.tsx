@@ -27,6 +27,7 @@ import {
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoInsight,
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
   type Destino,
@@ -100,6 +101,12 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'gate-decidido':
     'Ese gate ya se decidió: este informe describe un estado que ya pasó. Puedes leerlo, pero lo que dice que falta ya no aplica.',
+  'reto-archivado':
+    'Ese reto está archivado: su trabajo se cerró y esta propuesta quedó obsoleta, así que solo puede rechazarse.',
+  'evidencia-no-citable':
+    'Alguna de las evidencias que este insight cita ya no se puede citar al cliente: su derecho de uso se retiró, caducó o el documento ya no está. Aceptarlo fallaría al escribir la cita (DR001), así que por ahora solo puede rechazarse. Si el derecho vuelve, la propuesta vuelve a poder aceptarse sin hacer nada.',
+  'alcance-incompleto':
+    'Ese reto tiene evidencia que estos insights no llegaron a ver: se enlazó después de generarlos, o no cabía en el material que se le mandó al modelo. Aceptarlos sellaría un análisis que no la miró, así que por ahora solo pueden rechazarse. Vuelve a pedirlos para que la tenga en cuenta.',
   'journey-cambiado':
     'El grafo de ese journey cambió desde que se generó el informe: alguna de las señales que remedia ya no está abierta, o el grafo que describe ya no es el que hay. Puedes leerlo, pero comprueba contra el journey antes de aplicar nada.',
   'checklist-avanzado':
@@ -196,7 +203,16 @@ function PantallaPropuestas() {
                   })
                 }
                 onGenerado={async (n) => {
-                  avisar(`${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`);
+                  // Cero es un desenlace, no un fallo: hay capacidades cuya respuesta correcta
+                  // puede ser «nada» —C2 tiene prohibido proponer lo que la evidencia no
+                  // sostenga—, y la llamada se pagó igual. «0 propuestas en espera de revisión»
+                  // es cierto y no dice nada; quien lo lee necesita saber que el modelo miró y
+                  // no encontró, para no volver a pedirlo esperando otra cosa.
+                  avisar(
+                    n === 0
+                      ? 'El modelo no encontró nada que proponer con ese material y no dejó ninguna propuesta. La llamada queda anotada en el libro de costos.'
+                      : `${n} propuesta${n === 1 ? '' : 's'} en espera de revisión humana`,
+                  );
                   await refrescar();
                 }}
                 onConsentimiento={async (r) => {
@@ -981,6 +997,14 @@ const PRESENTACION_POR_CAPACIDAD: Record<
       'Este informe no crea nada y no se aprueba: se lee y se descarta. Quien decide sobre ' +
       'el gate es la persona con el rol que le corresponde, desde el método.',
   },
+  C2: {
+    rotulo: 'Insight propuesto',
+    ficha: (c, etiquetas) => (
+      <FichaInsight contenido={c as ContenidoInsight} etiquetas={etiquetas} />
+    ),
+    // C2 SÍ materializa —nace un insight— así que no tiene nada que decir aquí.
+    sinAccion: null,
+  },
   C5: {
     rotulo: 'Remediación del grafo (no se aplica desde aquí)',
     ficha: (c, etiquetas) => (
@@ -1072,6 +1096,20 @@ const MATERIALIZACION: Record<
     formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
       <FormularioExtraccion
         inicial={inicial as ContenidoExtraccion}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  insight: {
+    // Un insight tampoco: su esquema ya exige lo que las tablas piden —al menos una
+    // afirmación, y cada una con al menos una cita— y el resto lo sujetan las FK de `cita` y
+    // `contradiccion` contra la evidencia del reto.
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioInsight
+        inicial={inicial as ContenidoInsight}
         ocupado={ocupado}
         onEnviar={onEnviar}
         onCancelar={onCancelar}
@@ -1340,6 +1378,201 @@ function TarjetaPropuesta({
           onCancelar: () => setCorrigiendo(false),
         })}
     </Card>
+  );
+}
+
+/**
+ * El insight propuesto: su resumen, sus afirmaciones y las citas de cada una.
+ *
+ * Las citas se pintan CON su fragmento, que es lo que hace revisable un insight: quien
+ * aprueba tiene que poder leer de dónde sale cada afirmación sin salir de la tarjeta. Y las
+ * hipótesis se marcan, porque una extrapolación bien escrita suena igual que una observación
+ * (RF-08.2) — esconder esa distinción es exactamente lo que la marca existe para impedir.
+ *
+ * Las contradicciones se pintan aparte y con su nombre: un insight que solo enseña lo que lo
+ * confirma no sirve para decidir (I4).
+ */
+function FichaInsight({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoInsight;
+  etiquetas: Record<string, string>;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="Insight" valor={contenido.titulo} />
+      {contenido.resumen && <Dato rotulo="Resumen" valor={contenido.resumen} />}
+      {contenido.afirmaciones.map((a, i) => (
+        <div
+          key={String(i)}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+            paddingTop: 8,
+            borderTop: '1px solid var(--border-faint)',
+          }}
+        >
+          <Dato
+            rotulo={a.esHipotesis ? `Hipótesis ${i + 1}` : `Afirmación ${i + 1}`}
+            valor={a.texto}
+          />
+          {a.citas.map((c, j) => (
+            <Dato
+              key={String(j)}
+              rotulo="Cita"
+              valor={`«${c.fragmento}» · ${c.localizacion} · ${
+                etiquetas[c.evidenciaId] ?? `evidencia ${c.evidenciaId} (ya no está)`
+              }`}
+            />
+          ))}
+        </div>
+      ))}
+      {contenido.contradicciones.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 8, borderTop: '1px solid var(--border-faint)' }}>
+          {contenido.contradicciones.map((c, i) => (
+            <Dato
+              key={String(i)}
+              rotulo={`Contradicción ${i + 1}`}
+              valor={`${c.descripcion} · ${
+                etiquetas[c.evidenciaId] ?? `evidencia ${c.evidenciaId} (ya no está)`
+              }`}
+            />
+          ))}
+        </div>
+      )}
+      <Dato rotulo="Confianza de la propuesta" valor={contenido.confianzaPropuesta} />
+    </div>
+  );
+}
+
+/**
+ * Corregir un insight: su título, su resumen y el texto y la marca de hipótesis de cada
+ * afirmación. Las CITAS no se editan y por eso se pintan como lo que son —el rastro de lo que
+ * el modelo dijo haber leído— en vez de esconderse: quien corrige tiene que verlas para
+ * decidir si la afirmación se sostiene, y si no se sostiene lo que toca es rechazar, no
+ * reescribir la cita.
+ *
+ * Tampoco se editan las contradicciones ni la confianza declarada, por lo mismo.
+ */
+function FormularioInsight({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoInsight;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoInsight) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [titulo, setTitulo] = useState(inicial.titulo);
+  const [resumen, setResumen] = useState(inicial.resumen);
+  const [afirmaciones, setAfirmaciones] = useState(inicial.afirmaciones);
+
+  const cambiar = (i: number, cambio: Partial<ContenidoInsight['afirmaciones'][number]>) =>
+    setAfirmaciones((previas) => previas.map((a, j) => (j === i ? { ...a, ...cambio } : a)));
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          titulo,
+          resumen,
+          afirmaciones,
+          // Lo que el modelo afirmó —sus contradicciones y su confianza— no lo reescribe quien
+          // corrige, igual que sus citas.
+          contradicciones: inicial.contradicciones,
+          confianzaPropuesta: inicial.confianzaPropuesta,
+        });
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        Corregir antes de aceptar (la propuesta original se conserva)
+      </span>
+      <label style={campo}>
+        <span style={etiqueta}>Insight</span>
+        <Input required maxLength={300} value={titulo} onChange={(e) => setTitulo(e.target.value)} />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Resumen</span>
+        <Textarea maxLength={2000} rows={2} value={resumen} onChange={(e) => setResumen(e.target.value)} />
+      </label>
+      {afirmaciones.map((a, i) => (
+        <div key={String(i)} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <label style={campo}>
+            <span style={etiqueta}>Afirmación {i + 1}</span>
+            <Textarea
+              required
+              maxLength={1000}
+              rows={2}
+              value={a.texto}
+              onChange={(e) => cambiar(i, { texto: e.target.value })}
+            />
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Checkbox
+              checked={a.esHipotesis}
+              onChange={(e) => cambiar(i, { esHipotesis: e.target.checked })}
+            />
+            <span style={etiqueta}>Es una hipótesis (extrapola más allá de la evidencia)</span>
+          </label>
+          {a.citas.map((c, j) => (
+            <span
+              key={String(j)}
+              style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-faint)' }}
+            >
+              Cita (no editable): «{c.fragmento}» · {c.localizacion}
+            </span>
+          ))}
+        </div>
+      ))}
+      {/*
+        Las CONTRADICCIONES y la CONFIANZA, a la vista y sin editar.
+
+        El comentario de arriba decía que no se corrigen, y era verdad — pero el formulario no
+        las enseñaba, así que quien corregía decidía entre aceptar y rechazar sin ver la
+        evidencia que va EN CONTRA de lo que está a punto de aceptar. Decir «esto no se toca»
+        y a la vez ocultarlo son dos cosas distintas: la primera protege la señal, la segunda
+        se la quita a quien tiene que usarla. Se pintan igual que las citas.
+      */}
+      {inicial.contradicciones.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <span style={etiqueta}>Contradicciones señaladas (no editables)</span>
+          {inicial.contradicciones.map((c, i) => (
+            <span
+              key={String(i)}
+              style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--warn)' }}
+            >
+              «{c.descripcion}» · evidencia {c.evidenciaId}
+            </span>
+          ))}
+        </div>
+      )}
+      <span style={{ font: '400 12px/1.5 var(--font-sans)', color: 'var(--text-faint)' }}>
+        Confianza declarada por el modelo (no editable): {inicial.confianzaPropuesta}
+      </span>
+      <div style={{ display: 'flex', gap: 10 }}>
+        <Button size="sm" type="submit" disabled={ocupado}>
+          Corregir y aceptar
+        </Button>
+        <Button size="sm" variant="ghost" type="button" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
   );
 }
 

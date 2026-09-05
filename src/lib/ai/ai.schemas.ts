@@ -14,6 +14,7 @@ export type {
   ContenidoAsistenteGate,
   ContenidoCriterio,
   ContenidoExtraccion,
+  ContenidoInsight,
   ContenidoPropuesta,
   ContenidoRemediacionJourney,
 } from './ai.contenido';
@@ -75,10 +76,10 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
  * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
  * carece de acción «aprobar».
  */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C5'] as const;
+export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
-export const DestinoSchema = z.enum(['evidencia', 'criterio-exito']);
+export const DestinoSchema = z.enum(['evidencia', 'criterio-exito', 'insight']);
 export type Destino = z.infer<typeof DestinoSchema>;
 
 
@@ -120,6 +121,14 @@ export const CONFIANZA_PROPUESTA_NUMERICA: Record<(typeof CONFIANZA_PROPUESTA)[n
  * del módulo que lo importa a él.
  */
 export const MAX_CRITERIOS_POR_LOTE = 4;
+
+/**
+ * Y cuántos insights de una vez. Mismo criterio y mismo tamaño que los criterios: la revisión
+ * es por elemento, así que el lote es pequeño a propósito — uno grande no se revisa, se acepta
+ * entero. Un insight además arrastra sus afirmaciones y las citas de cada una, así que un lote
+ * de cuatro ya es una pantalla larga de revisar con atención.
+ */
+export const MAX_INSIGHTS_POR_LOTE = 4;
 
 /**
  * Cuántas remediaciones puede llevar UN informe de C5 — que es lo mismo que decir cuántas
@@ -168,7 +177,27 @@ export type AnclaCapacidad = {
  * en la raíz de la respuesta, y un lote lo devuelve dentro de un campo con nombre. El techo
  * existe porque la revisión es por elemento — un lote grande no se revisa, se acepta entero.
  */
-export type LoteCapacidad = { campo: string; maximo: number } | null;
+export type LoteCapacidad = {
+  campo: string;
+  /**
+   * Cuántas propuestas TIENE que traer el lote, que no siempre es una.
+   *
+   * Estaba escrito `min(1)` en los dos sitios que gobiernan el mismo sobre —el esquema que se
+   * le pide al proveedor y el que valida la respuesta—, y para C5 es correcto y está razonado:
+   * como se niega a llamar con cero señales, no queda ninguna petición real cuya respuesta
+   * correcta sea la lista vacía. Ese es el criterio, y C2 lo falla: su prompt dice «hasta N» y
+   * le prohíbe expresamente proponer lo que la evidencia no sostenga, así que una evidencia
+   * que no sostiene ningún insight responsable tiene por respuesta correcta NINGUNO — y con el
+   * mínimo en uno el modelo o se inventa uno o su respuesta, ya pagada, se descarta como fuera
+   * de contrato, culpándolo de haber obedecido.
+   *
+   * Se declara por capacidad porque la pregunta es de cada una, y las dos mitades lo leen de
+   * aquí por lo mismo que ya leían de aquí el campo y el techo: gobiernan el mismo sobre y no
+   * pueden discrepar si solo hay una declaración.
+   */
+  minimo: number;
+  maximo: number;
+} | null;
 
 /**
  * TODO lo que varía de una capacidad, en un solo sitio.
@@ -260,9 +289,13 @@ export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad[
  * Un destino nuevo rompe la compilación aquí en vez de escribir `null` en las dos y fallar
  * contra el guard de materialización.
  */
-export const COLUMNA_DE_DESTINO: Record<Destino, 'evidencia_id' | 'criterio_id'> = {
+export const COLUMNA_DE_DESTINO: Record<
+  Destino,
+  'evidencia_id' | 'criterio_id' | 'insight_id'
+> = {
   evidencia: 'evidencia_id',
   'criterio-exito': 'criterio_id',
+  insight: 'insight_id',
 };
 
 export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
@@ -304,7 +337,9 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
       pendiente:
         'Ese reto ya tiene criterios propuestos esperando revisión: decídelos antes de pedir otros',
     },
-    lote: { campo: 'criterios', maximo: MAX_CRITERIOS_POR_LOTE },
+    // Uno como mínimo, que es lo que C0 hacía y este PR no revisa: el registro solo hace
+    // que la pregunta se pueda contestar por capacidad en vez de estar escrita para todas.
+    lote: { campo: 'criterios', minimo: 1, maximo: MAX_CRITERIOS_POR_LOTE },
     exigeConsentimiento: false,
     esSimulacion: false,
   },
@@ -345,6 +380,59 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      *
      * Y la comprobación que acompaña al registro lo sujeta por el otro lado: quien exige
      * consentimiento tiene que anclar en `item_id`, que es donde el consentimiento vive.
+     */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+  },
+  C2: {
+    etiqueta: 'Insights del reto → insight con afirmaciones citadas',
+    destino: 'insight',
+    /*
+     * El RETO, la misma columna que C0. C2 es la primera capacidad que COMPARTE ancla, y eso
+     * es lo que el registro anticipaba: dos capacidades pueden colgar del mismo objeto y no
+     * comparten ni sus puertas ni su material. C0 se congela con el G0 (SYS-22) y cita la
+     * formulación del reto; C2 no se congela con nada de eso y cita la EVIDENCIA.
+     */
+    ancla: {
+      columna: 'reto_id',
+      etiqueta: 'Reto con evidencia',
+      enProsa: 'reto con evidencia',
+      buscar: 'Buscar por código o título…',
+      vacia:
+        'No hay retos con evidencia enlazada. La evidencia llega a un reto por sus arquetipos: enlázala allí y el reto aparecerá aquí.',
+      hayMas: (n) =>
+        `Hay más retos con evidencia de los que caben aquí: se listan los ${n} primeros por ` +
+        'código. Un reto sale de la lista mientras sus insights propuestos esperan revisión; ' +
+        'para uno concreto, búscalo por su código o su título.',
+      enCurso:
+        'Ese reto ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese reto ya tiene insights propuestos esperando revisión: decídelos antes de pedir otros',
+    },
+    /*
+     * LOTE, como C0: una llamada propone varios insights y la revisión es POR ELEMENTO
+     * (SPEC-08 §3), así que cada uno se acepta o se descarta por separado. El techo es
+     * pequeño a propósito — un lote grande no se revisa, se acepta entero.
+     */
+    // CERO es una respuesta legítima: la evidencia de un reto puede no sostener ningún
+    // insight, y el prompt pide expresamente que no se proponga lo que no se sostiene.
+    lote: { campo: 'insights', minimo: 0, maximo: MAX_INSIGHTS_POR_LOTE },
+    /*
+     * El material de C2 es EVIDENCIA, y la evidencia sale de material de personas: entrevistas,
+     * sesiones, documentos que alguien entregó. Pero el consentimiento en este esquema se
+     * registra sobre `item_importacion`, que es por donde ese material ENTRA, y se comprueba
+     * cuando se procesa allí — CI no puede extraer evidencia de un item sin permiso vigente.
+     *
+     * O sea: la evidencia que C2 lee ya pasó por esa puerta, y la comprobación que este
+     * registro sabe hacer —`exigirConsentimientoVigente` sobre el ancla— pide un `item_id`
+     * que C2 no tiene. Declararlo `true` con un ancla de reto haría que la generación buscara
+     * un consentimiento inexistente y se negara siempre; declararlo `false` dice la verdad de
+     * lo que este pipeline comprueba hoy, que es dónde se comprueba y no que no se comprueba.
+     *
+     * Lo que queda pendiente, dicho para que se decida y no se descubra: una revocación
+     * POSTERIOR sobre el item de origen no retira la evidencia ya materializada, así que C2
+     * puede leerla. Eso es una regla de retención sobre `evidencia`, no una puerta de esta
+     * capacidad, y arreglarla aquí sería taparla en un solo sitio.
      */
     exigeConsentimiento: false,
     esSimulacion: false,
@@ -478,6 +566,9 @@ export const ESTADOS_ANCLA = [
   'reto-no-admite',
   'gate-decidido',
   'checklist-avanzado',
+  'reto-archivado',
+  'evidencia-no-citable',
+  'alcance-incompleto',
   'journey-cambiado',
   'ancla-ausente',
 ] as const;
@@ -486,6 +577,14 @@ export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];
 export type CitaConPresencia = {
   fragmento: string;
   localizacion: string;
+  /**
+   * A qué trozo del material dice señalar esta cita, cuando su capacidad cita contra varios.
+   *
+   * `null` en las que citan contra un material único, que es su respuesta correcta. Viaja al
+   * panel porque el verde de `presenteLiteral` no significa lo mismo sin él: con varios
+   * documentos, «aparece» tiene que decir DÓNDE, y sin eso quien revisa ve media señal.
+   */
+  alcanceId: string | null;
   /**
    * true si el fragmento aparece LITERAL en el material del alcance. Es una subcadena, y el
    * nombre lo dice porque el control no establece nada más: una cita puede estar presente
@@ -527,10 +626,11 @@ export type PropuestaEnPanel = {
    * Cómo se llaman los ids que el contenido nombra: `{ id → etiqueta }`.
    *
    * El modelo copia ids del material porque es lo único verificable, y la pantalla los recibe
-   * tal cual. Un uuid no le dice nada a quien revisa, y en C5 varias remediaciones pueden
-   * traer el mismo código de señal sobre nodos distintos: sin esto, sus tarjetas son
-   * indistinguibles. Vacío en las capacidades que no nombran ids, que es su respuesta y no un
-   * hueco.
+   * tal cual. Un uuid no le dice nada a quien revisa, y las dos capacidades que nombran ids lo
+   * necesitan por motivos distintos: sin él una cita de C2 enseña su verde sin decir CONTRA QUÉ
+   * documento se midió —que es la mitad de la señal—, y en C5 varias remediaciones pueden traer
+   * el mismo código sobre nodos distintos, así que sus tarjetas son indistinguibles. Vacío en
+   * las capacidades que no nombran ids, que es su respuesta y no un hueco.
    */
   etiquetas: Record<string, string>;
   /** Título del objeto del que se derivó (item de bandeja o reto), para dar contexto. */

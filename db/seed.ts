@@ -1162,14 +1162,51 @@ async function sembrarPropuestaAI(
  * nombre: `workspace.nombre` no es único y una base de desarrollo puede tener otro
  * «Clínica del Valle» de un cliente distinto. El único id fiable es el que sale de aquí.
  */
+/**
+ * Las claves con las que el seed sella EN `sembrado_registro` los workspaces que crea.
+ *
+ * Por qué ahí y no en `evento_dominio`: la política `evento_insert` autoriza a CUALQUIER
+ * miembro a escribir eventos con cualquier tipo y cualquier payload, así que un evento
+ * `WorkspaceCreado` con `origen: 'seed'` es una afirmación falsificable — la misma que
+ * `…300000-la-procedencia-del-sembrado-no-la-escribe-la-app.sql` declaró insuficiente y
+ * sustituyó por esta tabla. Lo intenté con el evento en la ronda anterior y una revisión lo
+ * cazó: un miembro de un «Banco Andino» ajeno podía fabricar la marca y esperar a la
+ * siguiente corrida.
+ *
+ * `sembrado_registro` no tiene política ni grant de INSERT para el rol de aplicación: solo
+ * escribe ahí el propietario, que es quien corre este fichero. La ausencia de otra mano es
+ * estructural, no una cuestión de confiar en nadie.
+ */
+const CLAVE_WS_PRIMARIO = 'workspace:banco-andino';
+const CLAVE_WS_SEGUNDO = 'workspace:clinica-del-valle';
+
+/** El workspace que ESTE seed creó bajo esa clave, o null si no consta. */
+async function workspaceSellado(
+  cliente: typeof sql | TransactionSql,
+  clave: string,
+): Promise<string | null> {
+  const [fila] = await cliente`select workspace_id from sembrado_registro
+    where clave = ${clave} order by creado_en asc, workspace_id asc limit 1`;
+  return (fila?.workspace_id as string | undefined) ?? null;
+}
+
 async function sembrarSegundoWorkspace(
   tx: TransactionSql,
   luciaId: string,
-): Promise<{ id: string; creado: boolean }> {
+): Promise<{ id: string; creado: boolean; sellado: boolean }> {
+  // El SELLO primero: es el único id que acredita que este workspace salió de aquí. El
+  // nombre acotado por la membresía de Lucía no vale para eso —esa cuenta demo puede estar
+  // invitada a un homónimo ajeno, y entonces las dos condiciones se cumplen a la vez—, así
+  // que se queda solo como respuesta a «¿hace falta crearlo?» en bases sembradas por una
+  // versión anterior, que no tienen sello. `sellado` dice cuál de las dos cosas pasó, y quien
+  // concede accesos solo mira las selladas.
+  const yaSellado = await workspaceSellado(tx, CLAVE_WS_SEGUNDO);
+  if (yaSellado) return { id: yaSellado, creado: false, sellado: true };
   const [existe] = await tx`select w.id from workspace w
     join miembro m on m.workspace_id = w.id
-    where w.nombre = 'Clínica del Valle' and m.usuario_id = ${luciaId}`;
-  if (existe) return { id: existe.id as string, creado: false };
+    where w.nombre = 'Clínica del Valle' and m.usuario_id = ${luciaId}
+    order by w.creado_en asc, w.id asc`;
+  if (existe) return { id: existe.id as string, creado: false, sellado: false };
   const [ws2] = await tx`insert into workspace (nombre) values ('Clínica del Valle') returning id`;
   const ws2Id = ws2!.id as string;
   await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
@@ -1178,7 +1215,11 @@ async function sembrarSegundoWorkspace(
     values (${ws2Id}, 'Agendamiento de citas', 'Reserva y confirmación de citas médicas', ${luciaId})`;
   await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol) values
     (${ws2Id}, 'WorkspaceCreado', ${tx.json({ nombre: 'Clínica del Valle', origen: 'seed' })}, ${luciaId}, 'lead-boutique')`;
-  return { id: ws2Id, creado: true };
+  // Y el SELLO, donde la aplicación no escribe.
+  await tx`insert into sembrado_registro (workspace_id, clave, payload)
+    values (${ws2Id}, ${CLAVE_WS_SEGUNDO}, ${tx.json({ nombre: 'Clínica del Valle' })})
+    on conflict (workspace_id, clave) do nothing`;
+  return { id: ws2Id, creado: true, sellado: true };
 }
 
 /**
@@ -1453,7 +1494,11 @@ async function sembrarAdminPropio(
                 ${w.lucia_id as string}, ${luciaRol})`;
       dichos.push(`${w.nombre as string}: lead-boutique`);
     }
-    return dichos.length > 0 ? `${email} (${dichos.join('; ')})` : `${email} (sin workspaces demo)`;
+    if (dichos.length > 0) return `${email} (${dichos.join('; ')})`;
+    // Y se DICE por qué no se concedió nada, que si no parece que sí. El caso normal es una
+    // base sembrada por una versión anterior al sello: la cuenta existe y puede entrar, pero
+    // no tiene workspaces — y el camino es resembrar en limpio, no aflojar la comprobación.
+    return `${email} (cuenta lista, SIN membresías: no hay workspaces sellados por este seed en esta base; una base sembrada antes del sello no acredita cuáles son suyos)`;
   });
 }
 
@@ -1466,24 +1511,30 @@ async function main() {
   const hash = await bcrypt.hash(PASSWORD_DEMO, 10);
 
   /*
-   * El workspace PRIMARIO se resuelve por la marca que este seed deja al crearlo, no por su
-   * nombre a secas. `workspace.nombre` no tiene unicidad (comprobado: su única restricción es
-   * la clave primaria), así que en una base de desarrollo con un «Banco Andino» de otro
-   * cliente el `select … where nombre = …` devolvía el que Postgres tuviera a mano — y ese id
-   * gobierna después TODA la siembra de upgrade y, desde que existe la cuenta propia, una
-   * concesión de `lead-boutique` a una persona real.
+   * El workspace PRIMARIO se resuelve por su SELLO en `sembrado_registro`, que es el único
+   * id que acredita que salió de aquí. `workspace.nombre` no tiene unicidad (comprobado: su
+   * única restricción es la clave primaria), así que un «Banco Andino» de otro cliente en una
+   * base de desarrollo entraba por el `select … where nombre = …` — y ese id gobierna toda la
+   * siembra de upgrade y, desde que existe la cuenta propia, una concesión de `lead-boutique`
+   * a una persona real.
    *
-   * La marca es el evento `WorkspaceCreado` con `origen: 'seed'`, que escribe este mismo
-   * fichero al crear el workspace: un tenant que no salió de aquí no la tiene. Acotar por la
-   * membresía de Lucía no bastaba —esa cuenta demo puede estar invitada a un workspace ajeno
-   * que se llame igual, y entonces las dos condiciones se cumplen a la vez—.
+   * Probé antes con un evento `WorkspaceCreado` de `origen: 'seed'` y una revisión lo cazó:
+   * `evento_insert` autoriza a cualquier miembro a escribir eventos con cualquier tipo y
+   * payload, así que ese marcador es FALSIFICABLE — exactamente lo que la migración
+   * `…300000-la-procedencia-del-sembrado-no-la-escribe-la-app.sql` declaró insuficiente.
+   *
+   * El nombre se queda como segunda pregunta y solo para una cosa: decidir si hace falta
+   * crear el workspace en una base sembrada por una versión anterior, que no tiene sello. Lo
+   * que NO se hace es sellarlo entonces: sellar lo que se encontró por nombre metería en el
+   * sitio infalsificable justo el dato que se declaró falsificable, que es lo que esa misma
+   * migración se negó a hacer al no migrar el marcador viejo. Y lo que tampoco se hace es
+   * conceder sobre él: sin sello no hay concesión (ver `sembrarAdminPropio`).
    */
-  const existentes = await sql`select w.id from workspace w
-    where w.nombre = 'Banco Andino'
-      and exists (select 1 from evento_dominio e
-        where e.workspace_id = w.id and e.tipo = 'WorkspaceCreado'
-          and e.payload->>'origen' = 'seed')
-    order by w.creado_en asc, w.id asc`;
+  const primarioSellado = await workspaceSellado(sql, CLAVE_WS_PRIMARIO);
+  const existentes = primarioSellado
+    ? [{ id: primarioSellado }]
+    : await sql`select w.id from workspace w where w.nombre = 'Banco Andino'
+        order by w.creado_en asc, w.id asc`;
   if (existentes.length > 0) {
     const wsId = existentes[0]!.id as string;
     const actualizados = await sql`update usuario
@@ -1530,11 +1581,11 @@ async function main() {
     // Upgrade de bases sembradas antes del selector: el segundo workspace de Lucía
     // (la función se auto-guarda por membresía+nombre, sin chequeo duplicado aquí).
     let segundoSembrado = false;
-    let segundoId: string | null = null;
+    let segundoSellado: string | null = null;
     if (lucia) {
       const segundo = await sql.begin((tx) => sembrarSegundoWorkspace(tx, lucia.id as string));
       segundoSembrado = segundo.creado;
-      segundoId = segundo.id;
+      if (segundo.sellado) segundoSellado = segundo.id;
     }
     // Upgrade de bases sembradas antes de los derechos de uso (SPEC-03 profunda) y del
     // pipeline AI (SPEC-08): cada función se auto-guarda por la presencia de su propio
@@ -1548,11 +1599,14 @@ async function main() {
       );
       propuestaSembrada = await sql.begin((tx) => sembrarPropuestaAI(tx, wsId, lucia.id as string));
     }
-    // Los IDs EXACTOS que este seed acaba de resolver, no los que respondan a un nombre.
+    // Solo los SELLADOS. Un workspace que este seed encontró por nombre —porque la base
+    // viene de una versión sin sello— no acredita ser suyo, y conceder `lead-boutique` de una
+    // persona real sobre algo que no acredita ser suyo es el fallo que no se puede permitir.
+    // Fallar cerrado también cuando el que falla cerrado es el upgrade.
     const adminPropio = await sembrarAdminPropio(
       sql,
       admin,
-      [wsId, segundoId].filter((x): x is string => x !== null),
+      [primarioSellado, segundoSellado].filter((x): x is string => x !== null),
     );
     console.log(
       `seed: el workspace Banco Andino ya existe; credenciales demo aseguradas (${actualizados.count} activadas)` +
@@ -1597,6 +1651,11 @@ async function main() {
     await sembrarJourney(tx, wsId, luciaId);
     const segundo = await sembrarSegundoWorkspace(tx, luciaId);
     await sembrarPropuestaAI(tx, wsId, luciaId);
+    // El SELLO del primario, en la misma transacción que lo crea: si algo de arriba falla, no
+    // queda un sello sin workspace ni un workspace sin sello.
+    await tx`insert into sembrado_registro (workspace_id, clave, payload)
+      values (${wsId}, ${CLAVE_WS_PRIMARIO}, ${tx.json({ nombre: 'Banco Andino' })})
+      on conflict (workspace_id, clave) do nothing`;
     return { wsId, luciaId, segundoId: segundo.id };
   });
 

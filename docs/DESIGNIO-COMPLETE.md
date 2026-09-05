@@ -541,7 +541,9 @@ evidencia hasta que una persona lo aprueba** con sus cinco dimensiones (SYS-16).
 
 ## Permisos
 
-Registran y curan los **roles curadores**: lead de la boutique y diseñador. La ruta la abre
+**Registrar** un ítem lo puede hacer cualquier miembro del workspace (la política `item_insert`
+admite todo rol salvo `agente-ai`, y el formulario se muestra a todos); **curar** (aprobar o
+rechazar) solo los **roles curadores**: lead de la boutique y diseñador. La ruta la abre
 cualquier miembro, pero las **filas** de la bandeja las filtra RLS (`item_select`): un miembro ve
 los ítems que él mismo registró y los que ya tienen evidencia cuyo material puede ver
 (`material_evidencia_visible`); un sponsor o stakeholder no ve, por tanto, la cola pendiente del
@@ -1269,9 +1271,13 @@ y ejecuta `serve.ts`. No hay worker, cola ni cron construidos.
    aplica RLS y guards (capa 1). Las **proyecciones de solo lectura** que consultan varias tablas y
    deben devolver una foto coherente (exportación, panel de disposición, auditoría, árbol, resumen
    del loop, aprobaciones, memoria, segmentos, evidencia con derechos, panel de propuestas AI,
-   lectura de medición, membresías) abren la transacción en `repeatable read`; las **escrituras**
+   lectura de medición, membresías) abren la transacción en `repeatable read`; las **escrituras** de dominio
    van en `read committed`, y la base **rechaza** escribir fuera de ese nivel en las tablas cuyos
-   guards serializan con candado y releen (`IS001`).
+   guards serializan con candado y releen (`IS001`). La **exportación** es la excepción
+   deliberada: escribe su permiso y su auditoría (`registrar_exportacion`,
+   `confirmar_exportacion`) dentro de la misma transacción `repeatable read` que lee el
+   catálogo, para que el recibo comparta foto con lo que emite; puede hacerlo porque
+   `evento_dominio` y `exportacion_registro` son append-only y no tienen guards que serialicen.
 5. Los errores de Postgres se traducen al contrato del módulo (`42501` sin permiso, `23503`
    referencia inexistente, `23514` regla del pipeline, códigos propios `DR001`, `DS003`, `IS001`).
 
@@ -1355,7 +1361,7 @@ alcanzado del catálogo de Postgres.
 | Objeto | Estados |
 |---|---|
 | Reto | `candidato` → `activo` → `en-medicion` → `cerrado` (con veredicto) · `archivado` |
-| Proyecto | `activo` ↔ `pausado` → `en-implementacion` (al aprobar G6) → `en-medicion` (al abrir la medición, que exige G7) → `cerrado` (al completar el outcome review) |
+| Proyecto | `activo` → `en-implementacion` (al aprobar G6); `activo` ↔ `pausado` y `en-implementacion` ↔ `pausado` (pausar y retomar antes de medir); `pausado` → `en-medicion`; `en-implementacion` → `en-medicion` (al abrir la medición, que exige G7); `en-medicion` → `cerrado` (al completar el outcome review) |
 | Design version | `borrador` → `aprobada` → `superada` |
 | Release | `planificado` → `desplegado` → `verificado` |
 | Insight | `propuesto` → `validado` (sin estado de descarte) |

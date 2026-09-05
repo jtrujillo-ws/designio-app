@@ -511,9 +511,10 @@ evidencia hasta que una persona lo aprueba** con sus cinco dimensiones (SYS-16).
 
 - **Registrar un ítem**: pegar texto (hasta 100.000 caracteres) o una referencia, con título y tipo
   de fuente (`documento`, `entrevista`, `observacion`, `dataset`, `enlace`, `nota`).
-- **Adjuntar el original**: un archivo por ítem, guardado en la base con nombre saneado y extensión
-  coherente con su tipo MIME, bajo un presupuesto de bytes por workspace; descarga con proxy de bytes
-  desde la app, nunca por URL pública.
+- **Adjuntar los originales**: hasta 10 archivos por ítem, de 5 MiB cada uno, guardados en la base
+  con nombre saneado y extensión coherente con su tipo MIME; descarga con proxy de bytes desde la
+  app, nunca por URL pública. (El tope de 25 MiB es otro: es lo que cabe en un paquete de
+  exportación, ver `16`.)
 - **Registrar consentimiento** de las personas cuando el tipo de fuente lo exige (entrevista,
   observación): versionado, con la marca de si autoriza el procesamiento externo por AI. Sin ese
   consentimiento no se puede pedir la extracción AI del ítem (RF-09.5).
@@ -1124,7 +1125,7 @@ Dos ámbitos con dos reglas distintas, ambas correctas:
 
 | Ámbito | Qué lleva | Para qué |
 |---|---|---|
-| **archivo** | **Todo** el catálogo de objetos del workspace (tablas del dominio, auditoría, adjuntos), verificado contra un manifiesto | La copia del propietario (SYS-04, RF-01.8) |
+| **archivo** | **Todo** el catálogo de objetos del workspace (tablas del dominio, auditoría, adjuntos), verificado contra un manifiesto. Los adjuntos viajan embebidos hasta un presupuesto de **25 MiB por paquete**; los que no caben quedan listados con sus metadatos, su `sha256` y el motivo de omisión, y se descargan aparte desde la bandeja | La copia del propietario (SYS-04, RF-01.8) |
 | **entregable** | Solo la evidencia con **derechos vigentes** para ámbito cliente y sus derivados; lo excluido sale **listado con el motivo** | El paquete que se entrega al cliente (RF-03.10) |
 
 - Exportar es una acción explícita (POST) que **deja auditoría**; la base registra permiso y evento
@@ -1169,9 +1170,13 @@ ejecutarlo, para que un borrado irreversible no pueda ser un clic.
   verificable fuera de la base) con el inventario.
 - La fila `workspace` queda como **lápida** (ancla de la constancia); el nombre de la organización
   no sobrevive en ella, solo en el texto del acuerdo.
-- **Congelación por disposición**: un trigger sobre toda tabla con `workspace_id` impide escribir en
+- **Congelación por disposición**: un trigger sobre las tablas con `workspace_id` impide escribir en
   un workspace ya dispuesto; el bucle que lo instala es idempotente para que las tablas nuevas lo
-  hereden (#39 lo copia).
+  hereden (#39 lo copia). Con **excepciones deliberadas**: `evento_dominio` y
+  `exportacion_registro` siguen aceptando escrituras (un archivo tiene que poder decir quién lo
+  consulta y quién lo re-exporta); `acuerdo_disposicion` y `constancia_disposicion` quedan fuera
+  (registrar un acuerdo nuevo es lo que revierte un archivo); y en `miembro` se congelan alta y
+  cambio pero **no la baja**, para que revocar un acceso siempre sea posible.
 
 ## Permisos
 
@@ -1322,7 +1327,7 @@ alcanzado del catálogo de Postgres.
 | Arquetipo | `hipotesis` → `confirmado` · `refutado` |
 | Derecho de uso | `pendiente` → `concedido` → `denegado` (revocación) · `pendiente` → `denegado`; nunca vuelve a `pendiente` |
 | Ítem de importación | `pendiente` → `aprobado` · `rechazado` |
-| Propuesta AI | `propuesta` → `corregida` → `aceptada` · `rechazada` |
+| Propuesta AI | `propuesta` → `aceptada` · `corregida` (aceptada con correcciones) · `rechazada`; las tres son terminales |
 | Llamada AI | `despachada` → `salida-valida` · `rechazo-proveedor` · `fuera-de-contrato` · `sin-respuesta` |
 | Usuario | `invitado` → `activo` ↔ `inactivo` |
 | Oportunidad | `propuesta` → `aprobada` · `descartada` |

@@ -745,6 +745,86 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
   });
 
   /**
+   * Y una decisión que YA estaba en revisión no se cuenta otra vez.
+   *
+   * El conteo del guard dice «las decisiones del alcance que ESTA transacción movió», y lo
+   * pregunta por `xmin`. Pero Postgres reescribe la tupla también cuando el UPDATE no cambia
+   * nada: `update decision set estado = 'en-revision'` sobre una que ya estaba así le pone el
+   * `xmin` de esta transacción igual, así que entraba en la cuenta. Medido: una reapertura
+   * declaraba dos decisiones marcadas habiendo movido una, y el `EtapaReabierta` lo archivaba
+   * — trabajo que no ocurrió, en el número que la pantalla enseña.
+   *
+   * Y por el otro lado también molestaba: el rechazo por alcance mira las decisiones con el
+   * `xmin` de la transacción, así que un roce sin efecto sobre una decisión de FUERA del
+   * alcance tumbaba una reapertura legítima.
+   *
+   * Se cierra en la escritura y no en el conteo: un UPDATE que deja la fila idéntica no se
+   * escribe. Es la misma forma que ya tienen `oportunidad_auditoria` —que no apunta una
+   * repriorización que no movió nada— y la rama de `entrada_kpi`, y aquí es además lo único
+   * que arregla los dos lados a la vez. `is not distinct from` sobre la fila ENTERA, no sobre
+   * `estado`: así no puede tapar un cambio de verdad en ninguna otra columna.
+   */
+  it('rozar una decisión que ya estaba en revisión no la vuelve a contar', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio del roce', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo,
+       creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-ROCE', 'Reto del roce', 'Descripción', 'activo',
+              'Ninguna', ${leadId}) returning id`;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${r!.id as string}, 'P-ROCE', 'Proyecto', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const proyectoR = p!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoR}, 3, 'Conceptualización', 'completada')`;
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoR}, 3, 'sponsor') returning id`;
+    const decisionEn = async (titulo: string, estado: string) => {
+      const [d] = await admin`insert into decision
+        (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, estado, decidido_por)
+        values (${ws}, ${proyectoR}, ${g!.id as string}, 'diseno', ${titulo}, 'Fundamento',
+                ${estado}, ${leadId}) returning id`;
+      return d!.id as string;
+    };
+    // Una que YA venía en revisión —de una reapertura anterior— y otra viva.
+    const vieja = await decisionEn('Se revisó ya en su día', 'en-revision');
+    const nueva = await decisionEn('Se elige el flujo corto', 'vigente');
+
+    const reabrirDeclarando = (marcadas: number) =>
+      conUsuario(leadId, async (tx) => {
+        await tx`insert into reapertura_etapa
+          (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+           reabierto_por)
+          values (${ws}, ${proyectoR}, 3, 'Llegó evidencia nueva', 'etapa-completa',
+                  ${marcadas}, ${leadId})`;
+        // Las DOS, como hace el SQL directo que no mira estados: la vieja es el roce.
+        await tx`update decision set estado = 'en-revision'
+          where id in (${vieja}, ${nueva}) and workspace_id = ${ws}`;
+        await tx`update etapa_instancia set estado = 'en-curso'
+          where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`;
+      });
+
+    // Declarar DOS es lo que contaba la base: la vieja no se movió, solo se rozó.
+    await expect(reabrirDeclarando(2)).rejects.toThrow(/dice haber marcado 2/);
+    // Y declarar UNA —lo que de verdad ocurrió— pasa.
+    await reabrirDeclarando(1);
+    const [evento] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'EtapaReabierta'
+        and payload->>'proyectoId' = ${proyectoR}`;
+    expect(
+      (evento!.payload as Record<string, unknown>).decisionesMarcadas,
+      'el archivo declara trabajo que no ocurrió',
+    ).toBe(1);
+    // Y el roce no dejó rastro: la vieja sigue siendo la misma versión de fila que era.
+    const [sigue] = await admin`select estado from decision where id = ${vieja}`;
+    expect(sigue!.estado as string).toBe('en-revision');
+  });
+
+  /**
    * Y el portafolio se REVALIDA en el instante en que se congela para medir.
    *
    * G3 certifica el portafolio y la ventana se cierra con él, pero una reapertura legítima de

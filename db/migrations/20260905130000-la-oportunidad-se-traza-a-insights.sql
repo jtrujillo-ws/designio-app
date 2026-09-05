@@ -1344,3 +1344,45 @@ begin
       app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   return new;
 end $$;
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- UN UPDATE QUE NO MUEVE LA DECISIÓN NO SE ESCRIBE
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- Postgres reescribe la tupla también cuando el UPDATE no cambia nada, y la nueva versión
+-- lleva el `xmin` de la transacción que la tocó. Eso rompía por los dos lados el guard de la
+-- reapertura, que pregunta por `xmin` para saber «qué movió ESTA transacción»:
+--
+--   · el CONTEO sumaba las decisiones que ya estaban «en-revisión» y solo se rozaron, así que
+--     una reapertura declaraba dos habiendo movido una — y `EtapaReabierta` lo archivaba. El
+--     número que la pantalla enseña pasaba a incluir trabajo que no ocurrió;
+--   · y el rechazo POR ALCANCE tumbaba una reapertura legítima: un roce sin efecto sobre una
+--     decisión de fuera del alcance la ponía en la lista de «marcadas que nadie cubre».
+--
+-- Se cierra en la ESCRITURA y no en el conteo, que es lo que arregla los dos lados a la vez y
+-- lo que además deja de mentir: una fila que no cambió no tiene por qué constar como escrita
+-- en esta transacción. Es la misma forma que ya tienen la rama `else` de `oportunidad_auditoria`
+-- —una repriorización que repite los mismos valores no se apunta— y la de `entrada_kpi`.
+--
+-- `is not distinct from` sobre la fila ENTERA y no sobre `estado`: así no puede tapar un
+-- cambio de verdad en ninguna otra columna. Hoy el rol de aplicación solo tiene UPDATE sobre
+-- `estado` —así que para él las dos formulaciones coinciden—, pero este trigger corre también
+-- para quien administra, y una regla escrita sobre una columna deja de decir lo que dice el
+-- día que la superficie crece.
+create function decision_sin_cambios_no_se_escribe() returns trigger
+language plpgsql as $fn$
+begin
+  if new is not distinct from old then return null; end if;
+  return new;
+end;
+$fn$;
+
+revoke execute on function decision_sin_cambios_no_se_escribe() from public;
+
+-- `b_`, por detrás de `a_congelacion_por_disposicion`: con el workspace dispuesto, el rechazo
+-- de aquélla tiene que llegar antes que este silencio — que no se escriba nada no es lo mismo
+-- que que no se pueda escribir, y quien lo intenta merece el motivo.
+create trigger b_decision_sin_cambios
+  before update on decision
+  for each row execute function decision_sin_cambios_no_se_escribe();

@@ -519,15 +519,33 @@ export const TESTIMONIO_ADICIONAL: Record<
   // C5 no guarda nada aparte de sus citas: sus remediaciones son el consejo, y ése SÍ se
   // corrige —para eso está la revisión humana—.
   C5: null,
-  /*
-   * C6 tampoco. Su `criterioId` parece candidato —es contrastable, como los ids de las citas
-   * de C2— y NO lo es: elegir el criterio equivocado es el error que más se corrige al
-   * revisar, y `editarEntrada` existe justamente porque el dominio ya decidió que ese campo
-   * se repara. Blindarlo aquí obligaría a rechazar la propuesta entera para reapuntarla, que
-   * es la mitad del trabajo tirada por un campo. Lo que sí queda intocable son sus CITAS, y
-   * de eso se encarga `CITAS_DEL_CONTENIDO` para todas.
-   */
-  C6: null,
+  C6: {
+    parte: (c) => (c as ContenidoEntradaKpi).criterioId,
+    /*
+     * El `criterioId` de C6, y aquí hubo una contradicción mía que conviene dejar escrita
+     * porque la resolución no es obvia.
+     *
+     * Lo puse en `null` razonando que elegir el criterio equivocado es el error que más se
+     * corrige al revisar, y que `editarEntrada` existe justamente porque el dominio ya decidió
+     * que ese campo se repara. Y a la vez `CITAS_DEL_CONTENIDO.C6` deriva de él el `alcanceId`
+     * de cada cita, que la comparación de arriba SÍ compara: las dos reglas decían cosas
+     * opuestas, y la que ganaba —el rechazo— lo hacía por accidente y con el mensaje
+     * equivocado («las citas no se corrigen» sobre una corrección que no las tocaba).
+     *
+     * Gana el blindaje, y no por resolver el empate hacia el lado estricto: `criterioId` es la
+     * mitad CONTRASTABLE de lo que el modelo dijo. Los fragmentos se copiaron de UN criterio,
+     * y reapuntarlos a otro conservándolos es quedarse con el sostén de A para afirmar sobre
+     * B — el mismo «verde prestado» que el pajar por cita existe para impedir. Es exactamente
+     * lo que C2 hace con el `evidenciaId` de sus citas, y por eso esto deja de ser un caso
+     * especial: la parte que se puede contrastar no la reescribe quien revisa.
+     *
+     * Lo de `editarEntrada` sigue siendo cierto y no se pierde: DESPUÉS de aceptar, la entrada
+     * es un objeto de dominio y su criterio se repara mientras el registry sea borrador. Lo
+     * que no se puede es reapuntarla ANTES, cuando lo que se está sellando es el testimonio.
+     */
+    motivo:
+      'El criterio al que responde una entrada KPI no se corrige: los fragmentos citados se copiaron de ESE criterio, y reapuntarlos a otro conservando las citas es quedarse con el sostén de uno para afirmar sobre otro. Rechaza la propuesta, o acéptala y reapunta la entrada después (el registry lo admite mientras sea borrador).',
+  },
 };
 
 /**

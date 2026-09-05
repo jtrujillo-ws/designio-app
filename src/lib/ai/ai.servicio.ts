@@ -38,6 +38,7 @@ import {
   SISTEMA_REMEDIACION_JOURNEY,
   type ChecklistDelGate,
   materialDeUnaEvidencia,
+  criteriosQueLlegaronAlModelo,
   materialDeRegistry,
   materialDeUnCriterio,
   promptRegistry,
@@ -3094,6 +3095,25 @@ const PREPARAR: Record<
         'Ese reto no tiene criterios de éxito: no hay ninguna promesa a la que un KPI pueda responder. Los criterios se definen en la etapa 0 y los congela el G0 (SYS-22) — defínelos y vuelve a pedirlo.',
       );
     }
+    /*
+     * Y «tener criterios» no es lo mismo que «que llegue alguno». El cuerpo es la
+     * concatenación de la formulación del reto y de todos los criterios, y se recorta ENTERO a
+     * `MAX_MATERIAL`: con una descripción larga por delante, la cola se queda fuera —el
+     * criterio donde cae el corte, a medias; los siguientes, del todo—. Si NINGUNO llega
+     * completo, la única salida que cumple el contrato —una entrada que responde a un criterio
+     * por su id, citando un fragmento literal suyo— sale de un criterio que el modelo no vio
+     * entero: o sea inventada, con aspecto de fundamentada y pagada.
+     *
+     * Es la misma regla que niega CI sobre un item sin material y C2 sobre un reto sin
+     * evidencia citable, con el recorte como causa en vez de la ausencia. Y el mensaje dice
+     * qué hacer, que es lo único que puede hacer quien lo lee.
+     */
+    const llegados = criteriosQueLlegaronAlModelo(registry);
+    if (llegados.ids.length === 0) {
+      throw new ErrorAI(
+        `Ninguno de los ${registry.criterios.length} criterios de ese reto cabe entero en el material (el techo son ${MAX_MATERIAL} caracteres, y la formulación del reto va delante): no se llamó al proveedor, porque cualquier entrada saldría de un criterio que el modelo no habría visto completo. Acorta la descripción del reto o la definición de sus criterios y vuelve a pedirlo.`,
+      );
+    }
     return {
       sistema: SISTEMA_REGISTRY,
       prompt: promptRegistry({ ...registry, cuantas: MAX_ENTRADAS_KPI_POR_LOTE }),
@@ -3283,6 +3303,31 @@ const COMPROBAR: Record<
     if (new Set(nombres).size !== nombres.length) {
       throw new ErrorContratoAI(
         'El lote trae dos entradas con el mismo nombre, y el registry no admite nombres repetidos: se descarta entero. Vuelve a pedirlo.',
+      );
+    }
+    /*
+     * Y cada entrada responde a un criterio que el modelo VIO ENTERO, que no es lo mismo que
+     * uno que exista. La huella de arriba dice que el material no cambió; esto dice otra cosa:
+     * que lo que la respuesta señala estaba DENTRO de lo que se mandó. Un `criterioId` de un
+     * criterio recortado a medias —o del todo— pasa el suelo de la base, porque ahí lo que se
+     * comprueba es que el criterio sea del reto del registry, y eso sigue siendo cierto.
+     *
+     * Lo que no es cierto es que el KPI mida esa promesa: de ese criterio el modelo pudo no
+     * ver el objetivo, o la ventana, o nada. Y sus citas saldrían AUSENTES en el panel contra
+     * un tramo vacío, que es la señal correcta pero llega tarde — con la llamada pagada y la
+     * propuesta en la bandeja de alguien.
+     *
+     * Vive AQUÍ y no en la base por lo mismo que las señales de C5: «qué llegó entero» es una
+     * función del recorte del texto, no una tabla, y no hay SQL que lo recalcule. Se descarta
+     * el lote entero, como C5: media respuesta no es revisable.
+     */
+    const visibles = new Set(criteriosQueLlegaronAlModelo(registry).ids);
+    const fuera = (contenidos as ContenidoEntradaKpi[])
+      .map((c) => c.criterioId)
+      .filter((id) => !visibles.has(id));
+    if (fuera.length > 0) {
+      throw new ErrorContratoAI(
+        `El lote responde a ${fuera.length} criterio(s) que no llegaron enteros al material —el recorte los dejó a medias o fuera—, así que esas entradas no pudieron leer la promesa que dicen medir: se descarta entero. Acorta la descripción del reto o la definición de sus criterios y vuelve a pedirlo.`,
       );
     }
   },

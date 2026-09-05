@@ -9,7 +9,12 @@ import {
   MODELO_PRIMARIO,
   VENTANA_SALUD_PROVEEDOR_MS,
 } from '@/lib/ai/ai.degradacion';
-import { materialDeJourney, MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
+import {
+  criteriosQueLlegaronAlModelo,
+  materialDeJourney,
+  MAX_CRITERIOS_POR_LOTE,
+  PROMPT_VERSION,
+} from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   type ContenidoAsistenteGate,
@@ -10646,6 +10651,109 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       where id = ${propuestaId}`;
     expect(sellada!.estado).toBe('aceptada');
     expect(sellada!.entrada_kpi_id).toBe(r.objetoId);
+  });
+
+  /**
+   * Y el criterio al que responde una entrada NO se corrige.
+   *
+   * Aquí hubo una contradicción mía: `TESTIMONIO_ADICIONAL.C6` decía `null` —«elegir el
+   * criterio equivocado es el error que más se corrige»— y a la vez `CITAS_DEL_CONTENIDO.C6`
+   * deriva de ese campo el `alcanceId` de cada cita, que la comparación de la corrección SÍ
+   * compara. Las dos reglas decían cosas opuestas y la que ganaba lo hacía por accidente, con
+   * el mensaje equivocado: «las citas no se corrigen» sobre una corrección que no las tocaba.
+   *
+   * Gana el blindaje, y no por resolver el empate hacia el lado estricto: los fragmentos se
+   * copiaron de UN criterio, y reapuntarlos a otro conservándolos es quedarse con el sostén de
+   * A para afirmar sobre B. Es lo mismo que C2 hace con el `evidenciaId` de sus citas.
+   */
+  it('C6: el criterio de una entrada no se reapunta al corregir, y el resto sí', async () => {
+    const admin = sqlAdmin();
+    // Un segundo criterio REAL del mismo reto: el destino al que un revisor querría reapuntar.
+    const [otro] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Otro criterio', 'Definición', 'Objetivo', 30, 'Plan', ${leadId})
+      returning id`;
+    // Con nombre propio: `unique (registry_id, nombre)` es real, y el caso de arriba ya dejó
+    // materializada una entrada con el del fixture. Compartir registry entre casos es lo que
+    // hace que esa colisión sea una conducta de verdad y no una molestia del arnés.
+    const inicial = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en escritorio',
+    };
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+      contenido: inicial,
+    });
+
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...inicial, criterioId: otro!.id as string },
+      }),
+    ).rejects.toThrow(/no se corrige/i);
+
+    // Y lo que SÍ es redacción se corrige, que es la otra mitad: sin ella, este caso pasaría
+    // igual con la corrección entera tapiada.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: { ...inicial, definicion: 'Verificaciones completas / iniciadas, en móvil' },
+    });
+    expect(r.estado).toBe('corregida');
+    const [entrada] = await admin`select definicion, criterio_id from entrada_kpi
+      where id = ${r.objetoId}`;
+    expect(entrada!.definicion).toBe('Verificaciones completas / iniciadas, en móvil');
+    expect(entrada!.criterio_id).toBe(criterioDelRegistryId);
+
+    // Y el evento de la revisión NOMBRA el objeto creado. La lista de columnas del payload se
+    // quedó corta cuando llegó C2 y se volvió a quedar corta con esta: `jsonb_strip_nulls` se
+    // lleva las nulas, así que un objeto sin su clave es un registro que no documenta nada.
+    const [evento] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'PropuestaAICorregida'
+        and payload->>'propuestaId' = ${propuestaId}`;
+    expect((evento!.payload as Record<string, unknown>).entradaKpiId).toBe(r.objetoId);
+  });
+
+  /**
+   * Y una entrada no puede responder a un criterio que el modelo no llegó a ver ENTERO.
+   *
+   * El cuerpo es la formulación del reto más todos los criterios, y se recorta ENTERO a
+   * `MAX_MATERIAL`: con una descripción larga por delante, la cola se queda fuera —el criterio
+   * donde cae el corte, a medias; los siguientes, del todo—. Un `criterioId` de uno de ésos
+   * pasa el suelo de la base —el criterio ES del reto del registry, y eso sigue siendo cierto—
+   * y sin embargo el KPI no pudo leer la promesa que dice medir.
+   *
+   * Se mide sobre la función que lo decide y sobre las dos puertas que la consumen.
+   */
+  it('C6: el recorte del material decide qué criterios se pueden responder', async () => {
+    const largo = 'x'.repeat(MAX_MATERIAL);
+    const conRecorte = {
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: largo,
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-00000000000a',
+          kpi: 'K',
+          definicion: 'D',
+          objetivo: 'O',
+          ventanaDias: 30,
+          lineaBasePlan: 'P',
+        },
+      ],
+    };
+    // Con la descripción ocupando el presupuesto entero, NINGÚN criterio llega: la lista de
+    // los que se pueden responder está vacía y el conteo de los que se quedaron fuera es 1.
+    const recortado = criteriosQueLlegaronAlModelo(conRecorte);
+    expect(recortado.ids).toEqual([]);
+    expect(recortado.fuera).toBe(1);
+    // Y sin recorte llegan enteros, que es la otra mitad: sin ella, una función que devolviera
+    // siempre la lista vacía pasaría igual.
+    const llano = criteriosQueLlegaronAlModelo({ ...conRecorte, descripcion: 'D' });
+    expect(llano.ids).toEqual(['c3d4e5f6-0000-4000-8000-00000000000a']);
+    expect(llano.fuera).toBe(0);
   });
 
   /**

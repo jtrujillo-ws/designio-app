@@ -55,7 +55,15 @@
 -- STABLE y no IMMUTABLE: depende del reloj, no de la sesión. Concedida a `designio_app`
 -- porque el servicio la NECESITA: sus consultas de diagnóstico tienen que juzgar con el
 -- mismo día que la política que autoriza, o el lead ve «no falta nada» junto a un rechazo.
-create function fecha_de_la_base() returns date
+-- `create OR REPLACE` en los dos ayudantes, y no por gusto: este fichero se llamó antes
+-- `20260904100000…`, así que una base que corrió aquel nombre —cualquiera donde se probara la
+-- rama— guarda su fila en el ledger Y las dos funciones. El migrador ve este nombre como
+-- nuevo y lo ejecuta; con un `create function` a secas fallaba con «already exists» y
+-- bloqueaba el arranque antes de aplicar el resto de la corrección. Reproducido.
+--
+-- Y es mejor así aunque el renombrado no hubiera existido: una migración que no puede
+-- reejecutarse sobre una base que ya vio parte de ella es frágil por su cuenta.
+create or replace function fecha_de_la_base() returns date
 language sql stable parallel safe as
 $$ select timezone('UTC', now())::date $$;
 comment on function fecha_de_la_base() is
@@ -72,7 +80,7 @@ grant execute on function fecha_de_la_base() to designio_app;
 -- `creado_en`, que también es `timestamptz`, no hay conversión implícita que reintroduzca el
 -- huso por la puerta de atrás. (Un `date` sí la tendría: al compararlo con un `timestamptz`,
 -- Postgres lo promociona usando el huso de la sesión, que es justo lo que se quiere evitar.)
-create function inicio_del_dia_de_la_base() returns timestamptz
+create or replace function inicio_del_dia_de_la_base() returns timestamptz
 language sql stable parallel safe as
 $$ select timezone('UTC', fecha_de_la_base()::timestamp) $$;
 comment on function inicio_del_dia_de_la_base() is

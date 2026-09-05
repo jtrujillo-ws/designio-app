@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.13';
+export const PROMPT_VERSION = 'ai-2026-09-05.14';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -756,16 +756,73 @@ export type EntradasDelRegistry = { nombre: string; definicion: string }[];
  *
  * Delimitado igual que el resto: el nombre y la definición de una entrada los escribe un
  * miembro, así que son dato, no instrucciones.
+ *
+ * ── EL PRESUPUESTO SE REPARTE POR ENTRADA, Y LO QUE CEDE ES LA DEFINICIÓN ──
+ *
+ * La primera versión componía la lista entera y la pasaba por el delimitador, que recorta a
+ * `MAX_MATERIAL` y devuelve un `truncado` que aquí se tiraba. Con diez entradas de definición
+ * casi al tope —lo que el editor del registry admite— la lista pasa de 22.000 caracteres:
+ * medido, la cabecera decía «ya tiene 10 entradas» y llegaban NUEVE nombres, en silencio. Un
+ * bloque que se anuncia completo y no lo está es peor que no tenerlo: el modelo cree que ya
+ * comprobó contra todo, y la entrada que se quedó fuera del corte es exactamente la que puede
+ * volver a proponer con otro nombre.
+ *
+ * Así que el techo se reparte a partes iguales y **el nombre siempre llega entero**: es la
+ * IDENTIDAD de la entrada —lo que el panel compara para decir `nombre-ocupado`, y lo que un
+ * sinónimo imita—, mientras que la definición es la ayuda para reconocer que dos redacciones
+ * miden lo mismo. Perder ayuda degrada; perder una entrada ciega. Y cuando alguna definición
+ * cede, el bloque LO DICE, para que una definición a medias no se lea como la entera.
+ *
+ * Queda un suelo, y es el que devuelve `nombresCompletos`: con tantas entradas que ni sus
+ * nombres caben (a 200 caracteres de nombre, unas noventa y nueve), el bloque ya no puede
+ * hacer su trabajo y quien decide qué hacer es `PREPARAR.C6`, que es donde se niegan las
+ * llamadas — esta función es pura y solo informa.
  */
-function bloqueDeEntradas(entradas: EntradasDelRegistry): string {
+function bloqueDeEntradas(entradas: EntradasDelRegistry): {
+  bloque: string;
+  /** Si TODOS los nombres llegaron enteros: si no, el bloque no puede evitar el duplicado. */
+  nombresCompletos: boolean;
+  /** Si alguna definición cedió para que cupieran todas las entradas. */
+  definicionesRecortadas: boolean;
+} {
   if (entradas.length === 0) {
-    return 'Este Metric Registry todavía no tiene ninguna entrada: propón el contrato desde cero.';
+    return {
+      bloque:
+        'Este Metric Registry todavía no tiene ninguna entrada: propón el contrato desde cero.',
+      nombresCompletos: true,
+      definicionesRecortadas: false,
+    };
   }
-  const lista = entradas.map((e) => `- ${e.nombre}: ${e.definicion}`).join('\n');
-  return [
-    `Este Metric Registry ya tiene ${entradas.length} ${entradas.length === 1 ? 'entrada' : 'entradas'}. NO vuelvas a proponer lo que ya mide, ni con otro nombre:`,
-    delimitarMaterialNoConfiable(lista).bloque,
-  ].join('\n\n');
+  // Menos uno por el salto de línea que une cada par: así la suma cabe en el techo sin que
+  // haya que volver a medirla después, que es la comprobación que se olvida.
+  const porEntrada = Math.floor(MAX_MATERIAL / entradas.length) - 1;
+  let nombresCompletos = true;
+  let definicionesRecortadas = false;
+  const lineas = entradas.map((e) => {
+    const cabeza = `- ${e.nombre}`;
+    if (cabeza.length > porEntrada) {
+      nombresCompletos = false;
+      return cabeza.slice(0, Math.max(0, porEntrada));
+    }
+    // Lo que queda para la definición, descontando el «: » que la separa del nombre.
+    const cabe = porEntrada - cabeza.length - 2;
+    if (e.definicion.length > Math.max(0, cabe)) definicionesRecortadas = true;
+    const definicion = cabe > 0 ? e.definicion.slice(0, cabe) : '';
+    return definicion ? `${cabeza}: ${definicion}` : cabeza;
+  });
+  return {
+    bloque: [
+      `Este Metric Registry ya tiene ${entradas.length} ${entradas.length === 1 ? 'entrada' : 'entradas'}. NO vuelvas a proponer lo que ya mide, ni con otro nombre:`,
+      delimitarMaterialNoConfiable(lineas.join('\n')).bloque,
+      definicionesRecortadas
+        ? '(Las definiciones de arriba van recortadas para que quepan TODAS las entradas: el nombre está entero, la definición puede quedarse a medias. Si no puedes descartar que tu propuesta repita una de ellas, no la propongas.)'
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    nombresCompletos,
+    definicionesRecortadas,
+  };
 }
 
 /**
@@ -783,13 +840,15 @@ export function promptRegistry(reto: {
   criterios: CriteriosDelReto;
   entradas: EntradasDelRegistry;
   cuantas: number;
-}): { usuario: string; alcanceResumen: string } {
+}): { usuario: string; alcanceResumen: string; nombresDeEntradasCompletos: boolean } {
   const material = materialDeRegistry(reto);
+  const yaMedido = bloqueDeEntradas(reto.entradas);
   return {
+    nombresDeEntradasCompletos: yaMedido.nombresCompletos,
     usuario: [
       `Propón hasta ${reto.cuantas} entradas del Metric Registry para el reto descrito en el material: qué se va a medir para saber si se logró.`,
       material.bloque,
-      bloqueDeEntradas(reto.entradas),
+      yaMedido.bloque,
       'Cada entrada responde a UN criterio de éxito del material, por su id. Un KPI que no responde a ninguno es telemetría, no medición de impacto: no lo propongas.',
       'No propongas dos entradas para el mismo criterio salvo que midan cosas distintas de verdad, y nunca dos con el mismo nombre.',
       // Lo que no se pide, dicho: el esquema no lo admite, pero un modelo al que no se le
@@ -802,7 +861,10 @@ export function promptRegistry(reto: {
     ]
       .filter(Boolean)
       .join('\n\n'),
-    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.criterios.length} criterios, ${reto.entradas.length} entradas ya en el registry (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+    // El resumen dice si esas entradas llegaron ENTERAS, y no solo cuántas hay: un alcance que
+    // declara «10 entradas» cuando el bloque llevaba nueve nombres y siete definiciones a
+    // medias es un archivo que sobredeclara lo que el modelo tuvo delante.
+    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.criterios.length} criterios, ${reto.entradas.length} entradas ya en el registry${yaMedido.definicionesRecortadas ? ' (definiciones recortadas)' : ''} (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 

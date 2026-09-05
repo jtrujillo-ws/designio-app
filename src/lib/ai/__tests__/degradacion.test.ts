@@ -441,6 +441,76 @@ describe('lo que el registry ya mide viaja en el prompt de C6 (RF-07.1)', () => 
     expect(texto).toContain('Hoy la verificación tarda ocho minutos.');
   });
 
+  /*
+   * El presupuesto se reparte POR ENTRADA, y lo que cede es la definición.
+   *
+   * La primera versión componía la lista entera y la pasaba por el delimitador, que recorta a
+   * `MAX_MATERIAL` y devuelve un `truncado` que se tiraba. Medido con diez entradas de
+   * definición al tope del editor —22.049 caracteres—: la cabecera decía «ya tiene 10
+   * entradas» y llegaban NUEVE nombres, sin que nada lo dijera. Un bloque que se anuncia
+   * completo y no lo está es peor que no tenerlo.
+   */
+  it('con el registry casi lleno llegan TODOS los nombres, y el bloque dice que las definiciones ceden', () => {
+    const entradas = Array.from({ length: 10 }, (_, i) => ({
+      nombre: `KPI numero ${i}`,
+      definicion: `definicion ${i} `.padEnd(2000, 'y'),
+    }));
+    // La premisa de la sonda: sin reparto, esta lista NO cabe. Si un día cupiera, la sonda
+    // dejaría de medir lo que cree y hay que subir el tamaño, no borrarla.
+    expect(entradas.map((e) => `- ${e.nombre}: ${e.definicion}`).join('\n').length).toBeGreaterThan(
+      MAX_MATERIAL,
+    );
+
+    const { usuario, alcanceResumen, nombresDeEntradasCompletos } = promptRegistry({
+      ...RETO,
+      entradas,
+    });
+    for (const e of entradas) expect(usuario, `se perdió ${e.nombre}`).toContain(e.nombre);
+    expect(nombresDeEntradasCompletos).toBe(true);
+    // El recorte se declara en el bloque y en el alcance: un archivo que dice «10 entradas»
+    // sin decir que iban a medias sobredeclara lo que el modelo tuvo delante.
+    expect(usuario).toContain('van recortadas');
+    expect(alcanceResumen).toContain('definiciones recortadas');
+    // Y sigue cabiendo: el reparto no sirve de nada si el resultado se recorta después. Se
+    // mide lo que el modelo lee DENTRO del bloque, que es lo que el techo acota.
+    const apertura = '<material-no-confiable>';
+    const dentro = usuario
+      .slice(
+        usuario.lastIndexOf(apertura) + apertura.length,
+        usuario.lastIndexOf('</material-no-confiable>'),
+      )
+      .trim();
+    expect(dentro.length).toBeLessThanOrEqual(MAX_MATERIAL);
+  });
+
+  it('con pocas entradas las definiciones llegan enteras y nadie avisa de nada', () => {
+    const { usuario, alcanceResumen } = promptRegistry({
+      ...RETO,
+      entradas: [{ nombre: 'Minutos de verificación', definicion: 'Mediana por expediente' }],
+    });
+    expect(usuario).toContain('Mediana por expediente');
+    expect(usuario).not.toContain('van recortadas');
+    expect(alcanceResumen).not.toContain('definiciones recortadas');
+  });
+
+  /*
+   * Y el suelo: con tantas entradas que ni los nombres caben, el bloque no puede evitar el
+   * duplicado y lo dice. Quien decide qué hacer con eso es `PREPARAR.C6`, que niega la llamada
+   * — aquí solo se comprueba que la señal sale, que es lo único que esta función pura decide.
+   */
+  it('si ni los nombres caben, lo dice en vez de fingir que el bloque sirve', () => {
+    const { nombresDeEntradasCompletos, usuario } = promptRegistry({
+      ...RETO,
+      entradas: Array.from({ length: 200 }, (_, i) => ({
+        nombre: `KPI numero ${i}`.padEnd(200, 'x'),
+        definicion: 'da igual',
+      })),
+    });
+    expect(nombresDeEntradasCompletos).toBe(false);
+    // Y el primer nombre tampoco llega entero, que es lo que la señal está diciendo.
+    expect(usuario).not.toContain(`KPI numero 0`.padEnd(200, 'x'));
+  });
+
   it('el nombre y la definición de una entrada son material no confiable', () => {
     const { usuario } = promptRegistry({
       ...RETO,
@@ -622,8 +692,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
    * del material guardado con el de hoy solo vale entre propuestas del mismo render.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-05.13';
-  const HUELLA_ANOTADA = 'e75d01ac1dd627cdfb44b71c7477d4ffead03427be0ee554efbcbcef034f05a2';
+  const VERSION_ANOTADA = 'ai-2026-09-05.14';
+  const HUELLA_ANOTADA = '0c96649c53322f05cf712f71cd03c7c6a623b48243667d190bc069699d1549c8';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -910,6 +980,29 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
         { nombre: 'Minutos de verificación', definicion: 'Mediana por expediente' },
         { nombre: 'Abandono en carga', definicion: 'Abandonos sobre inicios' },
       ],
+      cuantas: 3,
+    }),
+    // Y la tercera forma del bloque: las definiciones ceden para que quepan TODAS las
+    // entradas, y el bloque lo dice. Diez definiciones al tope del editor pasan de 22.000
+    // caracteres, así que esta rama es el registry casi lleno, no un caso de laboratorio.
+    registryConEntradasRecortadas: promptRegistry({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D',
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: 'Tiempo de verificación',
+          definicion: 'Minutos medianos de la verificación',
+          objetivo: 'Bajar de 8 a 4',
+          ventanaDias: 90,
+          lineaBasePlan: 'Medir dos semanas antes',
+        },
+      ],
+      entradas: Array.from({ length: 10 }, (_, i) => ({
+        nombre: `KPI numero ${i}`,
+        definicion: `definicion ${i} `.padEnd(2000, 'y'),
+      })),
       cuantas: 3,
     }),
     // ── C5 ──

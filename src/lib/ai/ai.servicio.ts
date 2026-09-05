@@ -3189,16 +3189,35 @@ const PREPARAR: Record<
     const entradas = await tx`select nombre, definicion from entrada_kpi
       where registry_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
       order by nombre asc`;
+    const prompt = promptRegistry({
+      ...registry,
+      entradas: entradas.map((e) => ({
+        nombre: e.nombre as string,
+        definicion: e.definicion as string,
+      })),
+      cuantas: MAX_ENTRADAS_KPI_POR_LOTE,
+    });
+    /*
+     * Y el suelo del bloque de entradas: si ni los NOMBRES de lo que ya se mide caben en el
+     * material, ese bloque no puede hacer su trabajo. El modelo no vería parte del contrato y
+     * cualquier lote podría repetirla con otro nombre —el duplicado sinónimo, que es justo lo
+     * que el panel no detecta— con la llamada ya pagada.
+     *
+     * Es el mismo modo de fallo que la negativa de arriba, con el recorte como causa en vez de
+     * la ausencia, y la misma respuesta: no ofrecerlo y decir dónde se arregla. La diferencia
+     * es que aquí NO se niega por que se recorte una definición: el nombre es la identidad de
+     * la entrada y llega entero; la definición es la ayuda para reconocer un sinónimo, y perder
+     * ayuda degrada la propuesta mientras que perder una entrada la ciega. Ese reparto lo hace
+     * `bloqueDeEntradas`; aquí solo se lee su veredicto.
+     */
+    if (!prompt.nombresDeEntradasCompletos) {
+      throw new ErrorAI(
+        `Ese Metric Registry ya tiene ${entradas.length} entradas y ni sus nombres caben en el material (el techo son ${MAX_MATERIAL} caracteres): no se llamó al proveedor, porque el modelo no vería parte de lo que ya se mide y el lote podría repetirla con otro nombre. Un registry de ese tamaño se completa a mano.`,
+      );
+    }
     return {
       sistema: SISTEMA_REGISTRY,
-      prompt: promptRegistry({
-        ...registry,
-        entradas: entradas.map((e) => ({
-          nombre: e.nombre as string,
-          definicion: e.definicion as string,
-        })),
-        cuantas: MAX_ENTRADAS_KPI_POR_LOTE,
-      }),
+      prompt,
       /*
        * La huella de ESTE material, para volver a mirarla justo antes de despachar. Entre esta
        * transacción y aquella hay un commit, y lo que puede pasar en medio no es solo que el

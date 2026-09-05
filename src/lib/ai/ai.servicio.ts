@@ -28,6 +28,7 @@ import {
   SISTEMA_CRITERIOS,
   SISTEMA_EXTRACCION,
   type ChecklistDelGate,
+  materialDeUnaEvidencia,
 } from './ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
@@ -375,7 +376,8 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
            from arquetipo a
            join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
            join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
-           where a.reto_id = r.id and a.workspace_id = r.workspace_id) x)
+           where a.reto_id = r.id and a.workspace_id = r.workspace_id
+             and evidencia_usable(e.id, e.workspace_id, 'cliente')) x)
       else '[]'::json end as reto_evidencia`,
   },
   gate_id: {
@@ -447,6 +449,16 @@ type CapacidadEnElPanel = {
    * modelo no vio no está sostenida por nada.
    */
   pajarDeLaCita?: (f: Record<string, unknown>, cita: CitaDelContenido) => string | null;
+  /**
+   * Cómo se llaman, en cristiano, los ids que el contenido nombra.
+   *
+   * El modelo copia ids del material —es lo único verificable, por eso se le piden así— y la
+   * pantalla los recibe tal cual. Un uuid no le dice nada a quien revisa: en C2, una cita
+   * declara de qué evidencia sale, y sin el nombre del documento la señal de grounding queda a
+   * medias (se ve el verde, no contra qué). Sale de la MISMA fila que ya trae la evidencia
+   * proyectada: no abre ninguna consulta nueva.
+   */
+  etiquetasDelContenido?: (f: Record<string, unknown>) => Record<string, string>;
   /** Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad. */
   candidatas: (
     tx: TransactionSql,
@@ -649,16 +661,20 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      * «no aparece», pero se resuelve igual —ausente—, porque una cita a un documento que el
      * modelo no vio no la sostiene nada.
      */
+    /** El título de cada evidencia, para que una cita diga de QUÉ documento sale. */
+    etiquetasDelContenido: (f) =>
+      Object.fromEntries(
+        ((f.reto_evidencia as EvidenciaDelReto | null) ?? []).map((e) => [e.id, e.titulo]),
+      ),
     pajarDeLaCita: (f, cita) => {
       const evidencia = (f.reto_evidencia as EvidenciaDelReto | null) ?? [];
       const suya = evidencia.find((e) => e.id === cita.alcanceId);
       if (!suya) return null;
-      return materialDeInsights({
-        codigo: (f.reto_codigo as string | null) ?? '',
-        titulo: (f.reto_titulo as string | null) ?? '',
-        descripcion: (f.reto_descripcion as string | null) ?? '',
-        evidencia: [suya],
-      }).texto;
+      // SOLO ese documento. Componerlo con `materialDeInsights` seguía metiendo delante la
+      // ficha del reto y su descripción, así que una cita que decía «esto está en la evidencia
+      // B» y en realidad copiaba la FORMULACIÓN DEL RETO salía presente contra cualquiera de
+      // ellas — el mismo falso verde que este arreglo venía a quitar, una capa más adentro.
+      return materialDeUnaEvidencia(suya);
     },
     /*
      * Retos CON EVIDENCIA y sin insights esperando revisión. Lo primero no es un filtro de
@@ -674,7 +690,9 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           and exists (
             select 1 from arquetipo a
             join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
-            where a.reto_id = r.id and a.workspace_id = r.workspace_id)
+            join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+            where a.reto_id = r.id and a.workspace_id = r.workspace_id
+              and evidencia_usable(e.id, e.workspace_id, 'cliente'))
           and not exists (select 1 from propuesta_ai p
             where p.reto_id = r.id and p.workspace_id = r.workspace_id
               and p.capacidad = 'C2' and p.estado = 'propuesta')
@@ -818,6 +836,9 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
       presenteLiteral: presencias[i]!,
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
+    // Cómo se llaman los ids que el contenido nombra, cuando su capacidad lo sabe. Vacío es la
+    // respuesta de las que no nombran ninguno, no un hueco.
+    etiquetas: definicion?.etiquetasDelContenido?.(f) ?? {},
     /*
      * El ancla sale de TODAS las columnas declaradas, no de una pareja escrita aquí. Con
      * `f.item_id ?? f.reto_id`, una capacidad anclada en otra cosa aparecía en el panel con
@@ -1796,7 +1817,9 @@ const REVALIDAR: Record<
     const [reto] = await tx`select r.estado = 'archivado' as archivado,
         exists (select 1 from arquetipo a
           join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
-          where a.reto_id = r.id and a.workspace_id = r.workspace_id) as con_evidencia
+          join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+          where a.reto_id = r.id and a.workspace_id = r.workspace_id
+            and evidencia_usable(e.id, e.workspace_id, 'cliente')) as con_evidencia
       from reto r where r.id = ${entrada.anclaId} and r.workspace_id = ${entrada.workspaceId}`;
     if (!reto || (reto.archivado as boolean) || !(reto.con_evidencia as boolean)) {
       throw new ErrorAI(
@@ -1944,8 +1967,16 @@ const PREPARAR: Record<
     }
     /*
      * La evidencia del reto, por el ÚNICO camino que este esquema tiene: `evidencia` no cuelga
-     * de un reto, cuelga del workspace, y lo que la ata a uno son sus ARQUETIPOS. La misma
-     * consulta que proyecta el panel, para que el material contra el que se mide la presencia
+     * de un reto, cuelga del workspace, y lo que la ata a uno son sus ARQUETIPOS. Y solo la
+     * CITABLE: `evidencia_citable_guard` exige derechos vigentes de ámbito cliente para
+     * escribir una `cita`, así que enseñarle al modelo un documento sin ellos es pedirle que
+     * cite lo que la aceptación va a rechazar — después de pagar la llamada Y de que alguien
+     * la revise, dejando una propuesta que solo se puede tirar. El mismo predicado que impone
+     * la escritura, aplicado antes de gastar. Va en los CUATRO sitios que miran esa evidencia
+     * (la cola, la revalidación, este prompt y la proyección del panel), porque una lista que
+     * discrepe de otra es exactamente lo que reabre el hueco.
+     *
+     * La misma consulta que proyecta el panel, para que el material contra el que se mide la presencia
      * literal sea el que el modelo leyó. «La misma» incluye el DISTINCT y el desempate del
      * orden: una evidencia puede colgar de dos arquetipos del mismo reto, y si una de las dos
      * consultas la trae repetida y la otra no, el pajar contra el que se mide una cita deja de
@@ -1956,6 +1987,7 @@ const PREPARAR: Record<
       join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
       join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
       where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
+        and evidencia_usable(e.id, e.workspace_id, 'cliente')
       order by e.titulo asc, e.id asc`;
     /*
      * Sin evidencia no se llama. El contrato de C2 obliga a que cada afirmación cite un
@@ -1968,7 +2000,7 @@ const PREPARAR: Record<
      */
     if (evidencia.length === 0) {
       throw new ErrorAI(
-        'Ese reto no tiene evidencia enlazada: no hay nada que citar. La evidencia llega a un reto por sus ARQUETIPOS — enlázala allí y vuelve a pedirlo.',
+        'Ese reto no tiene evidencia CITABLE: no hay nada que citar. La evidencia llega a un reto por sus ARQUETIPOS, y además tiene que tener derechos de uso vigentes para ámbito cliente (SPEC-03) — comprueba las dos cosas y vuelve a pedirlo.',
       );
     }
     return {

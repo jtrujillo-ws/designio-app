@@ -6301,4 +6301,205 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         where id = ${propuestaId} and workspace_id = ${ws}`,
     ).rejects.toThrow(/contradicciones .* no se corrigen/i);
   });
+
+  /**
+   * Evidencia sin derechos vigentes NO llega al prompt, ni ofrece el reto, ni se cita.
+   *
+   * `evidencia_citable_guard` exige derechos concedidos de ámbito cliente para escribir una
+   * `cita` (SPEC-03/SYS-14). Enseñarle al modelo un documento sin ellos es pedirle que cite lo
+   * que la aceptación va a rechazar — y no al pedirlo: después de pagar la llamada Y de que
+   * alguien revise el insight, dejando una propuesta que solo se puede tirar.
+   *
+   * El mismo predicado que impone la escritura, aplicado antes de gastar, en los cuatro sitios
+   * que miran esa evidencia. Aquí se comprueban los dos extremos: con el reto SOLO con
+   * evidencia bloqueada no se ofrece ni se genera, y desbloqueándola vuelve entera.
+   */
+  it('la evidencia sin derechos vigentes no se ofrece a C2 ni entra en su material', async () => {
+    await enWorkspaceLimpio('c2-sin-derechos', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Entrevista sin permiso',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await admin`update derecho_uso set estado = 'pendiente', ambito = 'interno', base = '',
+          decidido_por = null, decidido_en = null
+        where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+      expect(
+        (await admin`select evidencia_usable(${ev}::uuid, ${wsC}::uuid, 'cliente') as x`)[0]!.x,
+      ).toBe(false);
+
+      // Ni se ofrece…
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(panel.candidatas.C2.lista.some((c) => c.id === retoC)).toBe(false);
+
+      // …ni se gasta forzándolo. Se mide por el LIBRO: negarse después de pagar sería el mismo
+      // defecto con mejor cara.
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      await conProveedor(
+        { ok: true, datos: { insights: [] }, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+          ).rejects.toThrow(/derechos de uso vigentes/);
+        },
+      );
+      const [tras] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(tras!.n).toBe(antes!.n);
+
+      // Y con los derechos repuestos vuelve entera: lo que cierra la puerta son los derechos,
+      // no el enlace — sin esta mitad, un filtro que dejara el reto fuera para siempre pasaría.
+      await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente',
+          base = 'Consentimiento renovado', decidido_por = ${curadorId}, decidido_en = now()
+        where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+      const repuesto = await panelPropuestas(curadorId, wsC);
+      expect(repuesto.candidatas.C2.lista.some((c) => c.id === retoC)).toBe(true);
+    });
+  });
+
+  /**
+   * El pajar de una cita es SU documento y nada más — ni la formulación del reto.
+   *
+   * La primera versión de este arreglo componía el pajar por evidencia con `materialDeInsights`,
+   * que lleva delante la ficha del reto y su descripción. Así, una cita que decía «esto está en
+   * la evidencia B» y en realidad copiaba la DESCRIPCIÓN DEL RETO salía presente contra
+   * cualquier evidencia: el mismo falso verde, una capa más adentro. El pajar es el documento
+   * que la cita nombra.
+   */
+  it('una cita que copia la formulación del reto no cuenta como presente en una evidencia', async () => {
+    await enWorkspaceLimpio('c2-pajar-estricto', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      await admin`update reto
+        set descripcion = 'Los clientes abandonan la verificación de identidad antes de terminarla.'
+        where id = ${retoC}`;
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+
+      const contenido: ContenidoInsight = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [
+              // De la evidencia: presente.
+              { evidenciaId: ev, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' },
+              // De la DESCRIPCIÓN DEL RETO, atribuida a la evidencia: ausente. El fragmento
+              // existe en el material del prompt —por eso el caso mide algo— pero no en el
+              // documento que la cita nombra.
+              {
+                evidenciaId: ev,
+                fragmento: 'abandonan la verificación de identidad',
+                localizacion: 'resumen',
+              },
+            ],
+          },
+        ],
+        contradicciones: [],
+        confianzaPropuesta: 'media',
+      };
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      expect(p.citas.map((c) => c.presenteLiteral)).toEqual([true, false]);
+      // Y el panel dice cómo se llama el documento contra el que se midió, no solo su uuid.
+      expect(p.etiquetas[ev]).toBe('Analítica del funnel');
+    });
+  });
+
+  /**
+   * La aceptación no puede omitir ni cambiar las CONTRADICCIONES.
+   *
+   * El guard de materialización comprobaba la cabecera, las afirmaciones y sus citas, y dejaba
+   * fuera las contradicciones: con los grants que la aplicación tiene, quien escriba por SQL
+   * podía omitirlas y sellar la propuesta como aceptada igual. Y son justo la parte que más
+   * tienta omitir —la evidencia que va EN CONTRA—, así que el hueco estaba donde más importa.
+   *
+   * Se prueba por el camino que el hueco permitía: aceptar de verdad y borrar las
+   * contradicciones DENTRO de la misma transacción es imposible desde el servicio, así que se
+   * mide el guard sobre la fila ya materializada — borrar una contradicción y volver a sellar.
+   */
+  it('un insight materializado sin sus contradicciones no se puede sellar', async () => {
+    await enWorkspaceLimpio('c2-contradicciones-selladas', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido: ContenidoInsight = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId: ev, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones: [{ evidenciaId: ev, descripcion: 'Va en contra por esto' }],
+        confianzaPropuesta: 'media',
+      };
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p.id,
+      });
+      // La aceptación buena las materializó: sin esto, el caso de abajo podría estar pasando
+      // porque no hay contradicciones que comprobar.
+      const [hay] = await admin`select count(*)::int as n from contradiccion
+        where insight_id = ${objetoId}`;
+      expect(hay!.n).toBe(1);
+
+      // Y ahora el guard, sobre una segunda propuesta a la que le falta la contradicción que
+      // dice tener. Se fuerza el sello por SQL, que es lo que el hueco permitía.
+      const [otra] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const [prop] = await conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, origen_key, llamada_id, creado_por)
+        values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(contenido)}, ${tx.json(contenido)},
+                0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'alcance', 'entorno',
+                ${otra!.id as string}, ${curadorId})
+        returning id`);
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          // La cabecera coincide con el contenido CORREGIDO: si no, el guard se para antes en
+          // la paridad del título y este caso mediría esa regla en vez de la de abajo.
+          const [ins] = await tx`insert into insight
+            (workspace_id, titulo, resumen, estado, creado_por)
+            values (${wsC}, 'T corregido', 'R', 'propuesto', ${curadorId}) returning id`;
+          const [af] = await tx`insert into afirmacion
+            (workspace_id, insight_id, orden, texto, es_hipotesis)
+            values (${wsC}, ${ins!.id as string}, 0, 'A', false) returning id`;
+          await tx`insert into cita
+            (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+            values (${wsC}, ${af!.id as string}, ${ev}, 'El 71% de los abandonos', 'resumen',
+                    ${curadorId})`;
+          // …y NINGUNA contradicción, aunque el contenido declara una.
+          // Sin `revisada_en`: no hay grant para esa columna —la escribe el guard de revisión—
+          // y escribirla muere antes con «permission denied», que mediría otra cosa.
+          await tx`update propuesta_ai
+            set estado = 'corregida', revisada_por = ${curadorId},
+                insight_id = ${ins!.id as string},
+                contenido = ${tx.json({ ...contenido, titulo: 'T corregido' })}
+            where id = ${prop!.id as string} and workspace_id = ${wsC}`;
+        }),
+      ).rejects.toThrow(/contradicciones del insight materializado/);
+    });
+  });
 });

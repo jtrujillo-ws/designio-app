@@ -919,7 +919,7 @@ const PRESENTACION: Record<
   Destino | 'informativa',
   {
     rotulo: string;
-    ficha: (contenido: ContenidoPropuesta) => ReactNode;
+    ficha: (contenido: ContenidoPropuesta, etiquetas: Record<string, string>) => ReactNode;
     /**
      * Todo lo que solo tiene sentido si la propuesta MATERIALIZA algo — y `null` cuando no
      * materializa nada.
@@ -1002,7 +1002,7 @@ const PRESENTACION: Record<
   },
   insight: {
     rotulo: 'Insight propuesto',
-    ficha: (c) => <FichaInsight contenido={c as ContenidoInsight} />,
+    ficha: (c, etiquetas) => <FichaInsight contenido={c as ContenidoInsight} etiquetas={etiquetas} />,
     materializacion: {
       // Un insight no tiene precondición de contenido: su esquema ya exige lo que las tablas
       // piden —al menos una afirmación, y cada una con al menos una cita— y el resto lo
@@ -1110,7 +1110,7 @@ function TarjetaPropuesta({
         Alcance: {propuesta.anclaTitulo}
       </span>
 
-      {presentacion.ficha(propuesta.contenido)}
+      {presentacion.ficha(propuesta.contenido, propuesta.etiquetas)}
 
       {propuesta.citas.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -1140,7 +1140,15 @@ function TarjetaPropuesta({
               }}
             >
               {c.presenteLiteral ? '· ' : '⚠ '}«{c.fragmento}» — {c.localizacion}
-              {!c.presenteLiteral && ' (no aparece literal en el material)'}
+              {/*
+                Y CONTRA QUÉ se midió, cuando la cita lo dice. Sin esto, una capacidad que cita
+                contra varios documentos —C2 lo hace— enseña su verde sin decir de cuál habla,
+                y quien revisa no puede contrastar lo único contrastable que tiene. El id se
+                enseña si no hay nombre: que el documento ya no esté también es información.
+              */}
+              {c.alcanceId !== null &&
+                ` [${propuesta.etiquetas[c.alcanceId] ?? `${c.alcanceId} (ya no está)`}]`}
+              {!c.presenteLiteral && ' (no aparece literal en ese material)'}
             </div>
           ))}
         </div>
@@ -1388,7 +1396,13 @@ function FichaAsistenteGate({ contenido }: { contenido: ContenidoAsistenteGate }
  * Las contradicciones se pintan aparte y con su nombre: un insight que solo enseña lo que lo
  * confirma no sirve para decidir (I4).
  */
-function FichaInsight({ contenido }: { contenido: ContenidoInsight }) {
+function FichaInsight({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoInsight;
+  etiquetas: Record<string, string>;
+}) {
   return (
     <div
       style={{
@@ -1418,14 +1432,26 @@ function FichaInsight({ contenido }: { contenido: ContenidoInsight }) {
             valor={a.texto}
           />
           {a.citas.map((c, j) => (
-            <Dato key={String(j)} rotulo="Cita" valor={`«${c.fragmento}» · ${c.localizacion}`} />
+            <Dato
+              key={String(j)}
+              rotulo="Cita"
+              valor={`«${c.fragmento}» · ${c.localizacion} · ${
+                etiquetas[c.evidenciaId] ?? `evidencia ${c.evidenciaId} (ya no está)`
+              }`}
+            />
           ))}
         </div>
       ))}
       {contenido.contradicciones.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 8, borderTop: '1px solid var(--border-faint)' }}>
           {contenido.contradicciones.map((c, i) => (
-            <Dato key={String(i)} rotulo={`Contradicción ${i + 1}`} valor={c.descripcion} />
+            <Dato
+              key={String(i)}
+              rotulo={`Contradicción ${i + 1}`}
+              valor={`${c.descripcion} · ${
+                etiquetas[c.evidenciaId] ?? `evidencia ${c.evidenciaId} (ya no está)`
+              }`}
+            />
           ))}
         </div>
       )}

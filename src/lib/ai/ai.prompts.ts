@@ -216,13 +216,33 @@ export function materialDeInsights(reto: {
       ['Código del reto', reto.codigo],
       ['Título del reto', reto.titulo],
     ],
-    [
-      reto.descripcion,
-      '',
-      'EVIDENCIA DEL RETO',
-      ...reto.evidencia.map((e) => `[${e.id}] ${e.titulo}\n${e.resumen}`),
-    ].join('\n'),
+    [reto.descripcion, '', 'EVIDENCIA DEL RETO', ...reto.evidencia.map(lineaDeEvidencia)].join(
+      '\n',
+    ),
   );
+}
+
+/** Cómo aparece UNA evidencia dentro del cuerpo. Su id delante, que es lo que cada cita tiene
+ * que copiar para poder contrastarse contra el documento correcto. */
+function lineaDeEvidencia(e: EvidenciaDelReto[number]): string {
+  return `[${e.id}] ${e.titulo}\n${e.resumen}`;
+}
+
+/**
+ * El texto de UNA evidencia tal como el modelo lo vio, para medir contra él las citas que la
+ * nombran — y SOLO él.
+ *
+ * No sirve reutilizar `materialDeInsights` con una sola evidencia: ese material lleva delante
+ * la ficha del reto y su descripción, así que una cita que dice «esto está en la evidencia B»
+ * y en realidad copia la FORMULACIÓN DEL RETO salía presente contra cualquier evidencia. El
+ * pajar de una cita es el documento que nombra, y nada más.
+ *
+ * Pasa por la misma neutralización que el bloque entero: si no, un documento que contenga el
+ * delimitador produciría «no aparece» sobre citas que sí son literales de lo que el modelo
+ * leyó — que es el defecto que `materialQueVeElModelo` existe para no tener.
+ */
+export function materialDeUnaEvidencia(e: EvidenciaDelReto[number]): string {
+  return materialQueVeElModelo(lineaDeEvidencia(e));
 }
 
 const REGLAS_COMUNES = [

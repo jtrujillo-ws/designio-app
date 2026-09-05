@@ -469,6 +469,12 @@ begin
             and c.xmin <> pg_current_xact_id()::xid))) then
     raise exception 'las afirmaciones y las citas del insight materializado tienen que haber nacido en esta misma aceptación (SYS-19)';
   end if;
+  if new.destino = 'insight' and exists (
+    select 1 from contradiccion c
+    where c.insight_id = new.insight_id and c.workspace_id = new.workspace_id
+      and c.xmin <> pg_current_xact_id()::xid) then
+    raise exception 'las contradicciones del insight materializado tienen que haber nacido en esta misma aceptación (SYS-19)';
+  end if;
 
 
   -- ── El consentimiento, en el ÚLTIMO instante ──
@@ -611,6 +617,33 @@ begin
                 and c.fragmento = q.ci->>'fragmento'
                 and c.localizacion = q.ci->>'localizacion'))))) then
     raise exception 'las afirmaciones y las citas del insight materializado no dicen lo que dice la propuesta: se copian tal cual de la propuesta aceptada (SYS-19)';
+  end if;
+  -- Y las CONTRADICCIONES, que son parte del insight y no un adorno.
+  --
+  -- La comprobación de arriba cubría la cabecera, las afirmaciones y sus citas, y dejaba fuera
+  -- las contradicciones: con los grants que la aplicación tiene, quien escriba por SQL podía
+  -- omitirlas o cambiarlas y sellar la propuesta como aceptada igual. Y son justamente la
+  -- parte que más tienta omitir —es la evidencia que va EN CONTRA—, así que dejarla sin
+  -- procedencia rompe la garantía por el sitio en que más importa.
+  --
+  -- Se comprueba en los dos sentidos: que no falte ninguna de las propuestas y que no sobre
+  -- ninguna. `contradiccion` tiene único (insight_id, evidencia_id), así que el recuento basta
+  -- para el segundo sentido.
+  if new.destino = 'insight' and (
+    (select count(*) from contradiccion co
+      where co.insight_id = new.insight_id and co.workspace_id = new.workspace_id)
+    <> coalesce(jsonb_array_length(new.contenido->'contradicciones'), 0)
+    or exists (
+      select 1
+      from jsonb_array_elements(
+             case when jsonb_typeof(new.contenido->'contradicciones') = 'array'
+                  then new.contenido->'contradicciones' else '[]'::jsonb end) as p(co)
+      where not exists (
+        select 1 from contradiccion c
+        where c.insight_id = new.insight_id and c.workspace_id = new.workspace_id
+          and c.evidencia_id::text = p.co->>'evidenciaId'
+          and c.descripcion = p.co->>'descripcion'))) then
+    raise exception 'las contradicciones del insight materializado no son las de la propuesta: se copian tal cual, y son la evidencia que va en contra (SYS-19)';
   end if;
   if new.destino = 'criterio-exito' and not exists (
     select 1 from criterio_exito c

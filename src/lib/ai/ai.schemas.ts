@@ -536,6 +536,15 @@ export type PropuestaEnPanel = {
    * original nunca se pierde de vista. */
   contenidoOriginal: ContenidoPropuesta | null;
   citas: CitaConPresencia[];
+  /**
+   * Cómo se llaman los ids que el contenido nombra: `{ id → etiqueta }`.
+   *
+   * El modelo copia ids del material porque es lo único verificable, y la pantalla los recibe
+   * tal cual. Un uuid no le dice nada a quien revisa, y sin él una cita de C2 enseña su verde
+   * sin decir CONTRA QUÉ documento se midió — que es la mitad de la señal. Vacío en las
+   * capacidades que no nombran ids, que es su respuesta y no un hueco.
+   */
+  etiquetas: Record<string, string>;
   /** Título del objeto del que se derivó (item de bandeja o reto), para dar contexto. */
   anclaTitulo: string;
   anclaId: string;

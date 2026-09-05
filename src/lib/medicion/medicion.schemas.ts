@@ -337,7 +337,7 @@ export type SeguimientoDeImpacto = {
   retoId: string;
   retoCodigo: string;
   /** El día de calendario de la BASE, que es quien juzga si un snapshot es válido
-   * (`snapshot_insert` lo acota con `current_date`). La pantalla lo espeja en vez de
+   * (`snapshot_insert` lo acota con `fecha_de_la_base()`). La pantalla lo espeja en vez de
    * calcularlo: no hay huso por petición, así que un «hoy» del navegador es un segundo
    * calendario y discrepa del que decide. */
   hoy: string;

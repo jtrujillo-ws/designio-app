@@ -785,6 +785,7 @@ type RutaSinParametros =
   | '/aprobaciones'
   | '/evidencia'
   | '/insights'
+  | '/oportunidades'
   | '/biblioteca'
   | '/journeys'
   | '/design-versions'

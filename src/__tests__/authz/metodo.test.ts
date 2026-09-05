@@ -243,6 +243,15 @@ describeAuthz('método: etapas, gates y checklists', () => {
 
     // La edición dejó rastro (lo emite el guard de la transición, con el actor real).
     const admin = sqlAdmin();
+    // Y la etapa homóloga se cerró. Se afirma aquí, en el único camino de producto que
+    // cierra una etapa, porque `z_etapa_cruza_completada_por_la_puerta` exige la firma del
+    // gate en la MISMA transacción: sin esta línea, endurecer esa puerta hasta tapiar el
+    // cierre entero dejaría la suite igual de verde.
+    const [homologa] = await admin`select estado from etapa_instancia
+      where proyecto_id = ${proyectoId} and workspace_id = ${ws} and numero = 0`;
+    expect(homologa!.estado as string, 'aprobar el gate ya no cierra su etapa').toBe(
+      'completada',
+    );
     const [edicion] = await admin`select actor_id from evento_dominio
       where workspace_id = ${ws} and tipo = 'CriterioEditado'
       order by creado_en desc limit 1`;

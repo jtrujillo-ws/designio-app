@@ -5779,6 +5779,24 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         ],
       } as unknown as ContenidoInsight;
       await expect(escribir(sinId)).rejects.toThrow(/no es de este reto/);
+
+      /*
+       * Y EL SUELO: sin afirmaciones, o con una afirmación sin citas, tampoco.
+       *
+       * El esquema de la aplicación ya lo exige, y eso es exactamente por lo que hace falta en
+       * la base: por esta misma superficie SQL, un curador podía escribir `afirmaciones: []`
+       * —o una afirmación con `citas: []`— y entonces el barrido de arriba no tenía nada que
+       * mirar y el guard de materialización comparaba cero contra cero y daba la paridad por
+       * buena. Quedaba sellado un insight ATRIBUIDO A LA AI sin una sola cita, que es lo que
+       * esta rebanada existe para impedir.
+       */
+      const sinAfirmaciones = { ...conCita(propia), afirmaciones: [] } as ContenidoInsight;
+      await expect(escribir(sinAfirmaciones)).rejects.toThrow(/al menos una afirmación/);
+      const sinCitas = {
+        ...conCita(propia),
+        afirmaciones: [{ texto: 'A', esHipotesis: false, citas: [] }],
+      } as ContenidoInsight;
+      await expect(escribir(sinCitas)).rejects.toThrow(/al menos una cita/);
     });
   });
 

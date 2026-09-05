@@ -768,6 +768,31 @@ begin
   if new.capacidad <> 'C2' then
     return new;
   end if;
+
+  -- EL SUELO, y va antes de la rama del UPDATE porque vale para las dos: un insight propuesto
+  -- por la AI tiene al menos una afirmación, y cada afirmación al menos una cita.
+  --
+  -- El esquema de la aplicación ya lo exige (`.min(1)` en las dos), y eso es exactamente por
+  -- lo que hace falta aquí: el suelo de la base no puede depender de que el contenido haya
+  -- pasado por él. Por la superficie SQL concedida, un curador podía escribir `afirmaciones:
+  -- []` —o una afirmación con `citas: []`— y entonces este guard no tenía nada que barrer y el
+  -- de materialización comparaba cero contra cero y daba por buena la paridad: quedaba sellado
+  -- un insight ATRIBUIDO A LA AI sin una sola cita, que es justo lo que esta rebanada existe
+  -- para impedir. Una afirmación sin cita es una opinión, y este pipeline no las propone.
+  --
+  -- Solo los mínimos: los techos (seis citas, seis afirmaciones) son del contrato del prompt
+  -- —cuánto puede contrastar una persona de una sentada— y no una cuestión de integridad.
+  if jsonb_typeof(new.contenido -> 'afirmaciones') is distinct from 'array'
+     or jsonb_array_length(new.contenido -> 'afirmaciones') = 0
+     or exists (
+       select 1
+       from jsonb_array_elements(new.contenido -> 'afirmaciones') a
+       where jsonb_typeof(a -> 'citas') is distinct from 'array'
+          or jsonb_array_length(a -> 'citas') = 0)
+  then
+    raise exception 'un insight propuesto por la AI tiene al menos una afirmación y cada afirmación al menos una cita: una afirmación sin cita es una opinión, y este pipeline no las propone';
+  end if;
+
   if tg_op = 'UPDATE' then
     if jsonb_path_query_array(new.contenido, '$.afirmaciones[*].citas')
        is distinct from jsonb_path_query_array(new.contenido_original, '$.afirmaciones[*].citas')

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { estadoDelLoop, loopDeProyecto, marcaDeReto } from '@/lib/loop/loop-estado';
+import {
+  estadoDelLoop,
+  loopDeProyecto,
+  marcaDeReto,
+  proyectoActualDe,
+} from '@/lib/loop/loop-estado';
 import type { GatesDeProyecto } from '@/lib/loop/loop.schemas';
 
 /**
@@ -11,6 +16,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const loop = estadoDelLoop({
       hayEvidencia: false,
       hayServicio: true,
+      medicionAbierta: false,
       gatesAprobados: [],
       reviewCompletado: false,
     });
@@ -25,6 +31,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const loop = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
+      medicionAbierta: false,
       gatesAprobados: [],
       reviewCompletado: false,
     });
@@ -39,6 +46,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const conG1 = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
+      medicionAbierta: false,
       gatesAprobados: [0, 1],
       reviewCompletado: false,
     });
@@ -47,6 +55,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const conG2 = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
+      medicionAbierta: false,
       gatesAprobados: [0, 1, 2],
       reviewCompletado: false,
     });
@@ -59,6 +68,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const midiendo = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
+      medicionAbierta: false,
       gatesAprobados: [0, 1, 2, 3, 4, 5, 6, 7],
       reviewCompletado: false,
     });
@@ -71,12 +81,27 @@ describe('el estado del loop se deriva de los gates', () => {
     const cerrado = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
+      medicionAbierta: false,
       gatesAprobados: [0, 1, 2, 3, 4, 5, 6, 7],
       reviewCompletado: true,
     });
     expect(cerrado.enCurso).toBeNull();
     expect(cerrado.cerrados).toBe(7);
     expect(Object.values(cerrado.journeys).every((e) => e === 'hecho')).toBe(true);
+  });
+
+  it('con G7 aprobado pero la medición abierta, J6 sigue en curso: el post mortem no se puede abrir', () => {
+    const midiendo = estadoDelLoop({
+      hayEvidencia: true,
+      hayServicio: true,
+      medicionAbierta: true,
+      gatesAprobados: [0, 1, 2, 3, 4, 5, 6, 7],
+      reviewCompletado: false,
+    });
+    expect(midiendo.journeys[6]).toBe('en curso');
+    expect(midiendo.journeys[7]).toBe('próximo');
+    expect(midiendo.enCurso).toBe(6);
+    expect(midiendo.gateAbierto).toBeNull();
   });
 
   it('un journey no se da por hecho por delante de otro sin hacer: el primer hueco manda', () => {
@@ -86,6 +111,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const loop = estadoDelLoop({
       hayEvidencia: true,
       hayServicio: true,
+      medicionAbierta: false,
       gatesAprobados: [7],
       reviewCompletado: false,
     });
@@ -100,6 +126,7 @@ describe('el estado del loop se deriva de los gates', () => {
     const loop = estadoDelLoop({
       hayEvidencia: false,
       hayServicio: true,
+      medicionAbierta: false,
       gatesAprobados: [0, 1, 2, 3, 4],
       reviewCompletado: false,
     });
@@ -130,8 +157,10 @@ describe('la marca de un reto en el árbol', () => {
         proyectoCodigo: 'P-01',
         retoId: 'r-1',
         retoCodigo: 'R-01',
+        retoEstado: 'activo',
         servicioId: 's-1',
         aprobados: [0, 1, 2, 3, 4, 5, 6],
+        medicionAbierta: false,
         reviewCompletado: false,
       },
     ],
@@ -142,8 +171,10 @@ describe('la marca de un reto en el árbol', () => {
         proyectoCodigo: 'P-09',
         retoId: 'r-9',
         retoCodigo: 'R-09',
+        retoEstado: 'cerrado',
         servicioId: 's-1',
         aprobados: [0, 1, 2, 3, 4, 5, 6, 7],
+        medicionAbierta: false,
         reviewCompletado: true,
       },
     ],
@@ -211,5 +242,21 @@ describe('la marca de un reto en el árbol', () => {
         true,
       ).j,
     ).toBe(2);
+  });
+});
+
+describe('el proyecto actual de un servicio', () => {
+  it('es el del primer reto activo o en medición, no el primero por código', () => {
+    const candidatos = [
+      { id: 'p-01', retoEstado: 'cerrado' },
+      { id: 'p-02', retoEstado: 'en-medicion' },
+      { id: 'p-03', retoEstado: 'activo' },
+    ];
+    expect(proyectoActualDe(candidatos)?.id).toBe('p-02');
+  });
+
+  it('sin retos vivos se cae al primero que exista, y sin ninguno a null', () => {
+    expect(proyectoActualDe([{ id: 'p-01', retoEstado: 'cerrado' }])?.id).toBe('p-01');
+    expect(proyectoActualDe([])).toBeNull();
   });
 });

@@ -23,6 +23,7 @@ import {
   JOURNEYS,
   loopDeProyecto,
   marcaDeReto,
+  proyectoActualDe,
   type EstadoDelLoop,
   type EstadoJourney,
 } from '@/lib/loop/loop-estado';
@@ -111,11 +112,14 @@ export function LoopScreen({
 }) {
   const navigate = useNavigate();
   const membresia = membresiaActiva ?? usuario.membresias[0];
-  const servicio = arbol?.servicios[0] ?? null;
-  // El proyecto «actual» del servicio, con el mismo criterio que el servicio actual: el
-  // primero. Es lo que abren la pestaña de proyecto y las tarjetas de los journeys que
-  // viven en la pantalla del método (etapas y gates), y el que da su estado al loop.
-  const proyecto = servicio?.retos.flatMap((r) => r.proyectos)[0] ?? null;
+  // El servicio del que habla la pantalla lo dice la proyección: el pedido en la ruta si es
+  // de este workspace, y si no el primero. Con el árbol delante y sin resumen, el primero.
+  const servicio =
+    arbol?.servicios.find((s) => s.id === resumen?.servicioId) ?? arbol?.servicios[0] ?? null;
+  // El proyecto «actual» del servicio: el del reto activo o en medición (proyectoActualDe),
+  // que es lo que abren la pestaña de proyecto y las tarjetas de los journeys del método, y
+  // el que da su estado al loop. La proyección elige con la misma regla.
+  const proyecto = servicio ? proyectoActual(servicio) : null;
   const proyectos = new Map<string, GatesDeProyecto>(
     (resumen?.proyectos ?? []).map((p) => [p.proyectoId, p]),
   );
@@ -151,6 +155,7 @@ export function LoopScreen({
           membresia={membresia}
           arbol={arbol}
           resumen={resumen}
+          servicioActual={servicio}
           proyectos={proyectos}
           hayEvidencia={hayEvidencia}
         />
@@ -229,6 +234,15 @@ export function LoopScreen({
 
 function idDeTarjeta(j: JourneyN): string {
   return `journey-j${j}`;
+}
+
+/** El proyecto actual de un servicio del árbol, con la regla compartida con la proyección. */
+function proyectoActual(servicio: ServicioArbol): ProyectoArbol | null {
+  return (
+    proyectoActualDe(
+      servicio.retos.flatMap((r) => r.proyectos.map((p) => ({ retoEstado: r.estado, p }))),
+    )?.p ?? null
+  );
 }
 
 // ── Topbar ─────────────────────────────────────────────────────────────────────────────
@@ -324,6 +338,7 @@ function Lateral({
   membresia,
   arbol,
   resumen,
+  servicioActual,
   proyectos,
   hayEvidencia,
 }: {
@@ -331,13 +346,18 @@ function Lateral({
   membresia: MembresiaLoop | undefined;
   arbol: ArbolWorkspace | null;
   resumen: ResumenDelLoop | null;
+  /** El servicio seleccionado (estado de la ruta), ya resuelto por la pantalla. */
+  servicioActual: ServicioArbol | null;
   proyectos: ReadonlyMap<string, GatesDeProyecto>;
   hayEvidencia: boolean;
 }) {
   const navigate = useNavigate();
   const rol = membresia?.rol ?? '';
   const servicios = arbol?.servicios ?? [];
-  const servicioActual = servicios[0] ?? null;
+  // Seleccionar un servicio es navegar: queda en `?servicio=` y los loaders reaccionan.
+  function seleccionar(id: string) {
+    void navigate({ to: '/app', search: (prev) => ({ ...prev, servicio: id }) });
+  }
 
   // Qué servicios están desplegados. El actual nace abierto; el resto se recuerda por
   // usuario y workspace en el navegador, que es donde vive una preferencia de lectura (la
@@ -526,17 +546,32 @@ function Lateral({
             Sin servicios aún
           </span>
         )}
-        {servicios.map((s, indice) => (
-          <ServicioDelArbol
-            key={s.id}
-            servicio={s}
-            actual={indice === 0}
-            abierto={estaAbierto(s.id)}
-            onAlternar={() => alternar(s.id)}
-            proyectos={proyectos}
-            hayEvidencia={hayEvidencia}
-          />
-        ))}
+        {servicios.map((s) => {
+          const actual = s.id === servicioActual?.id;
+          const abiertoAhora = estaAbierto(s.id);
+          return (
+            <ServicioDelArbol
+              key={s.id}
+              servicio={s}
+              actual={actual}
+              abierto={abiertoAhora}
+              // Colapsado: se despliega Y se selecciona (handoff). Desplegado y actual: se
+              // colapsa. Desplegado y no actual: se selecciona sin tocar la expansión.
+              onPulsar={() => {
+                if (!abiertoAhora) {
+                  alternar(s.id);
+                  if (!actual) seleccionar(s.id);
+                } else if (actual) {
+                  alternar(s.id);
+                } else {
+                  seleccionar(s.id);
+                }
+              }}
+              proyectos={proyectos}
+              hayEvidencia={hayEvidencia}
+            />
+          );
+        })}
       </div>
 
       {/* 4. Workspace — destinos reales, con los pendientes que existen. */}
@@ -766,20 +801,23 @@ function ServicioDelArbol({
   servicio,
   actual,
   abierto,
-  onAlternar,
+  onPulsar,
   proyectos,
   hayEvidencia,
 }: {
   servicio: ServicioArbol;
   actual: boolean;
   abierto: boolean;
-  onAlternar: () => void;
+  onPulsar: () => void;
   proyectos: ReadonlyMap<string, GatesDeProyecto>;
   hayEvidencia: boolean;
 }) {
-  const proyectoActual = servicio.retos.flatMap((r) => r.proyectos)[0];
-  const loop = proyectoActual
-    ? loopDeProyecto(proyectos.get(proyectoActual.id) ?? null, { hayEvidencia, hayServicio: true })
+  const proyectoActualDelServicio = proyectoActual(servicio);
+  const loop = proyectoActualDelServicio
+    ? loopDeProyecto(proyectos.get(proyectoActualDelServicio.id) ?? null, {
+        hayEvidencia,
+        hayServicio: true,
+      })
     : null;
   const nRetos = servicio.retos.length;
   return (
@@ -788,8 +826,9 @@ function ServicioDelArbol({
         type="button"
         className="loop-fila"
         aria-expanded={abierto}
-        onClick={onAlternar}
-        title={servicio.nombre}
+        aria-current={actual ? 'true' : undefined}
+        onClick={onPulsar}
+        title={actual ? servicio.nombre : `${servicio.nombre} · seleccionar`}
         style={{
           ...filaLateral,
           padding: '9px 10px',
@@ -882,7 +921,7 @@ function ServicioDelArbol({
               reto={reto}
               // El reto activo es el del proyecto actual —el que gobiernan cabecera, spotlight
               // y pestañas—, no el primero de la lista: pueden no ser el mismo.
-              activo={actual && reto.proyectos.some((p) => p.id === proyectoActual?.id)}
+              activo={actual && reto.proyectos.some((p) => p.id === proyectoActualDelServicio?.id)}
               marca={marcaDeReto(reto, proyectos, hayEvidencia)}
             />
           ))}

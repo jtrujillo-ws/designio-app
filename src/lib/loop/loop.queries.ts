@@ -2,6 +2,7 @@ import '@/lib/server-only';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { proyectoActualDe } from './loop-estado';
 import type {
   AprobacionPendiente,
   GatesDeProyecto,
@@ -30,13 +31,13 @@ export async function resumenParaUsuario(
     async (tx) => {
       await exigirCuentaActiva(tx, actorId);
 
-      // El servicio del que habla la pantalla: el pedido, o el primero con el MISMO orden que
-      // usa el árbol (creado_en, id). Si los dos eligieran por criterios distintos, el lateral
-      // y la cabecera hablarían de servicios diferentes.
-      const [svc] = servicioId
-        ? await tx`select id from servicio where id = ${servicioId} and workspace_id = ${workspaceId}`
-        : await tx`select id from servicio where workspace_id = ${workspaceId}
-            order by creado_en, id limit 1`;
+      // El servicio del que habla la pantalla: el pedido si es de este workspace (la RLS no
+      // enseña los ajenos), y si no el primero con el MISMO orden que usa el árbol (creado_en,
+      // id). La pantalla se cae al primero exactamente igual, así que hablan del mismo.
+      const [svc] = await tx`select id from servicio
+        where workspace_id = ${workspaceId}
+        order by (id = ${servicioId ?? null}::uuid) desc nulls last, creado_en, id
+        limit 1`;
       const sid = (svc?.id as string | undefined) ?? null;
 
       const [base] = await tx`select
@@ -49,10 +50,17 @@ export async function resumenParaUsuario(
       // El orden es el del árbol (reto por código, proyecto por código) para que «el primer
       // proyecto del servicio» sea el mismo aquí y allí.
       const filasProyectos = await tx`
-        select p.id, p.codigo, r.id as reto_id, r.codigo as reto_codigo,
+        select p.id, p.codigo, r.id as reto_id, r.codigo as reto_codigo, r.estado as reto_estado,
           r.servicio_ancla_id as servicio_id,
           coalesce(array_agg(g.numero order by g.numero) filter (where g.numero is not null),
             '{}'::int[]) as aprobados,
+          -- Mide y alguna ventana sigue abierta: el mismo predicado con el que la política
+          -- del outcome review (review_insert) rechaza abrirlo todavía.
+          (r.estado = 'en-medicion' and exists (select 1 from entrada_kpi e
+            join metric_registry mr on mr.id = e.registry_id and mr.workspace_id = e.workspace_id
+            join criterio_exito c on c.id = e.criterio_id and c.workspace_id = e.workspace_id
+            where mr.reto_id = r.id and mr.workspace_id = r.workspace_id
+              and ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias))) as medicion_abierta,
           exists (select 1 from outcome_review o
             where o.reto_id = r.id and o.workspace_id = r.workspace_id
               and o.estado = 'completado') as review_completado
@@ -61,15 +69,17 @@ export async function resumenParaUsuario(
         left join gate_instancia g
           on g.proyecto_id = p.id and g.workspace_id = p.workspace_id and g.estado = 'aprobado'
         where p.workspace_id = ${workspaceId}
-        group by p.id, p.codigo, r.id, r.codigo, r.servicio_ancla_id, r.workspace_id
+        group by p.id, p.codigo, r.id, r.codigo, r.estado, r.servicio_ancla_id, r.workspace_id
         order by r.codigo, r.id, p.codigo, p.id`;
       const proyectos: GatesDeProyecto[] = filasProyectos.map((f) => ({
         proyectoId: f.id as string,
         proyectoCodigo: f.codigo as string,
         retoId: f.reto_id as string,
         retoCodigo: f.reto_codigo as string,
+        retoEstado: f.reto_estado as string,
         servicioId: f.servicio_id as string,
         aprobados: f.aprobados as number[],
+        medicionAbierta: f.medicion_abierta as boolean,
         reviewCompletado: f.review_completado as boolean,
       }));
 
@@ -137,9 +147,11 @@ export async function resumenParaUsuario(
           }
         : null;
 
-      // El Metric Registry del reto del proyecto ACTUAL del servicio (el primero, con el
-      // criterio de arriba). Sin registry no hay métricas que decir, y la pantalla lo dice.
-      const proyectoActual = sid ? proyectos.find((p) => p.servicioId === sid) : undefined;
+      // El Metric Registry del reto del proyecto ACTUAL del servicio, elegido con la misma
+      // regla que la pantalla (proyectoActualDe). Sin registry no hay métricas que decir.
+      const proyectoActual = sid
+        ? proyectoActualDe(proyectos.filter((p) => p.servicioId === sid))
+        : null;
       const [met] = proyectoActual
         ? await tx`
           select mr.estado,

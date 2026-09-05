@@ -12,8 +12,8 @@ import { z } from 'zod';
 
 export const ResumenLoopInputSchema = z.object({
   workspaceId: z.string().uuid(),
-  /** El servicio que la pantalla enseña. Ausente: el primero del workspace, con el mismo
-   * orden que el árbol (creado_en, id), para que ambos hablen del mismo servicio. */
+  /** El servicio que la pantalla enseña. Ausente —o no visible en este workspace—: el
+   * primero, con el mismo orden que el árbol (creado_en, id), para que ambos hablen del mismo. */
   servicioId: z.string().uuid().optional(),
 });
 export type ResumenLoopInput = z.infer<typeof ResumenLoopInputSchema>;
@@ -24,9 +24,14 @@ export type GatesDeProyecto = {
   proyectoCodigo: string;
   retoId: string;
   retoCodigo: string;
+  /** Estado del reto: decide cuál es el proyecto ACTUAL de un servicio (ver proyectoActualDe). */
+  retoEstado: string;
   servicioId: string;
   /** Números de gate (0–7) ya aprobados. La base exige que sean un prefijo 0..n. */
   aprobados: number[];
+  /** El reto mide y alguna ventana sigue abierta: el post mortem no puede abrirse todavía
+   * (mismo predicado que la política del outcome review), así que J6 sigue en curso. */
+  medicionAbierta: boolean;
   /** El outcome review del reto está completado con veredicto (J7 hecho). */
   reviewCompletado: boolean;
 };
@@ -82,7 +87,8 @@ export type MetricasDelReto = {
 
 export type ResumenDelLoop = {
   workspaceId: string;
-  /** El servicio del que habla la proyección; null en un workspace sin servicios. */
+  /** El servicio del que habla la proyección: el pedido si es de este workspace, si no el
+   * primero; null solo en un workspace sin servicios. */
   servicioId: string | null;
   /** Hay evidencia curada en el workspace: el arranque en frío (J1) ya ocurrió. */
   hayEvidencia: boolean;

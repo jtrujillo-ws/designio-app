@@ -17,7 +17,9 @@ import type { GatesDeProyecto } from './loop.schemas';
  *   J3 investigación          → G1 G2
  *   J4 conceptualización      → G3 G4
  *   J5 detalle y plan         → G5 G6
- *   J6 implementación         → G7
+ *   J6 implementación         → G7, y la medición ya no abierta (mientras alguna ventana
+ *                                siga abierta el outcome review no puede abrirse: la
+ *                                política de la base lo rechaza, y J7 no puede estar en curso).
  *   J7 post mortem            → outcome review completado.
  * El primer journey no hecho es el que está en curso; los de después, próximos.
  */
@@ -53,6 +55,8 @@ export type Arranque = {
 
 export type EntradaDelLoop = Arranque & {
   gatesAprobados: readonly number[];
+  /** El reto mide y alguna ventana sigue abierta (ver GatesDeProyecto.medicionAbierta). */
+  medicionAbierta: boolean;
   reviewCompletado: boolean;
 };
 
@@ -65,6 +69,9 @@ export function estadoDelLoop(entrada: EntradaDelLoop): EstadoDelLoop {
     // Sin servicio no hay arranque que dar por hecho: la evidencia se cura sin él.
     if (j === 1) return entrada.hayServicio && (entrada.hayEvidencia || aprobados.size > 0);
     if (j === 7) return entrada.reviewCompletado;
+    // J6 no termina con G7: la implementación se mide, y hasta que la última ventana cierre
+    // el post mortem no se puede abrir. Un J7 «en curso» que no se puede empezar mentiría.
+    if (j === 6) return aprobados.has(7) && !entrada.medicionAbierta;
     return GATES_POR_JOURNEY[j].every((g) => aprobados.has(g));
   };
   const journeys = {} as Record<JourneyN, EstadoJourney>;
@@ -93,12 +100,13 @@ export function estadoDelLoop(entrada: EntradaDelLoop): EstadoDelLoop {
 
 /** El loop de un proyecto concreto, o el de un servicio SIN proyecto (solo J1 puede estar hecho). */
 export function loopDeProyecto(
-  proyecto: Pick<GatesDeProyecto, 'aprobados' | 'reviewCompletado'> | null,
+  proyecto: Pick<GatesDeProyecto, 'aprobados' | 'medicionAbierta' | 'reviewCompletado'> | null,
   arranque: Arranque,
 ): EstadoDelLoop {
   return estadoDelLoop({
     ...arranque,
     gatesAprobados: proyecto?.aprobados ?? [],
+    medicionAbierta: proyecto?.medicionAbierta ?? false,
     reviewCompletado: proyecto?.reviewCompletado ?? false,
   });
 }
@@ -128,4 +136,20 @@ export function marcaDeReto(
     return { j: 7, punteado: true, sufijo: '—' };
   }
   return { j: 2, punteado: false, sufijo: 'J2' };
+}
+
+/**
+ * Cuál es el proyecto ACTUAL de un servicio: el del primer reto activo o en medición, y si
+ * no hay ninguno, el primero que exista. «El primero» a secas se quedaba con R-01 después
+ * de cerrado su ciclo mientras R-02 trabajaba: el árbol ordena por código, no por vida. La
+ * pantalla y la proyección eligen con ESTA función, sobre los datos que cada una tiene.
+ */
+export function proyectoActualDe<T extends { retoEstado: string }>(
+  candidatos: readonly T[],
+): T | null {
+  return (
+    candidatos.find((c) => c.retoEstado === 'activo' || c.retoEstado === 'en-medicion') ??
+    candidatos[0] ??
+    null
+  );
 }

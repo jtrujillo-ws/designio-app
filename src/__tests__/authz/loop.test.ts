@@ -119,6 +119,8 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
     expect(p.proyectoId).toBe(proyectoA);
     expect(p.servicioId).toBe(svcA1);
     expect(p.aprobados).toEqual([0]);
+    expect(p.retoEstado).toBe('activo');
+    expect(p.medicionAbierta).toBe(false);
     expect(p.reviewCompletado).toBe(false);
 
     // Solo G1: es el gate ABIERTO y su checklist está decidido. G2 tiene trabajo pendiente y
@@ -134,7 +136,7 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
     expect(resumen.metricas).toBeNull();
   });
 
-  it('con un servicio pedido habla de ese servicio, y de uno ajeno no habla', async () => {
+  it('con un servicio pedido habla de ese servicio, y con uno ajeno se cae al primero', async () => {
     const otro = await resumenParaUsuario(userA, wsA, svcA2);
     expect(otro.servicioId).toBe(svcA2);
     // Los proyectos son de TODO el workspace (el árbol los pinta todos), pero el release y
@@ -143,9 +145,10 @@ describeAuthz('resumen del loop (proyección + aislamiento)', () => {
     expect(otro.release).toBeNull();
     expect(otro.metricas).toBeNull();
 
-    // El servicio de B no existe para un miembro de A: la proyección no lo confirma.
+    // El servicio de B no existe para un miembro de A: la proyección no lo confirma y habla
+    // del primero de A, que es exactamente a lo que se cae la pantalla.
     const ajeno = await resumenParaUsuario(userA, wsA, svcB);
-    expect(ajeno.servicioId).toBeNull();
+    expect(ajeno.servicioId).toBe(svcA1);
   });
 
   it('un miembro de A no ve nada de B, ni preguntando directo por su workspace', async () => {

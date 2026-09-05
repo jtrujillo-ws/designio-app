@@ -182,6 +182,9 @@ export async function resumenParaUsuario(
                 and case
                   -- Sin ventana no hay cadencia que juzgar: espera mientras no llegue nada.
                   when e.ventana_inicio is null or c.ventana_dias is null then ult.fecha is null
+                  -- Ventana que aún no empezó: la política del snapshot exige fecha >= inicio
+                  -- y <= hoy, así que no hay fecha válida que cargar. Todavía no es tarea.
+                  when e.ventana_inicio > fecha_de_la_base() then false
                   -- Ventana cerrada: estado terminal, ya nadie puede aportar.
                   when not ventana_de_medicion_abierta(e.ventana_inicio, c.ventana_dias) then false
                   -- Abierta: vencida si falta alguna entrega prometida hasta ayer…

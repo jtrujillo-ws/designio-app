@@ -1439,7 +1439,31 @@ async function sembrarAdminPropio(
     await tx`insert into usuario (email, nombre, password_hash, estado)
       values (${email}, ${nombre}, ${hash}, 'activo')
       on conflict (lower(email)) do nothing`;
-    const [u] = await tx`select id, estado from usuario where lower(email) = ${email}`;
+    /*
+     * `for update`, y el candado es el arreglo — no un adorno de la lectura.
+     *
+     * Sin él, entre este `select` y todo lo que se decide con lo leído cabe una
+     * DESACTIVACIÓN ajena. Reproducido contra la base real, con la cuenta invitada de una
+     * persona: A leyó «invitado», B ejecutó `update usuario set estado = 'inactivo'` y
+     * CONFIRMÓ, y el `update` de abajo —cuyo `where` solo mira `password_hash is null`, que
+     * seguía siendo cierto— la devolvió a «activo». Estado final: `activo`. Un despliegue
+     * deshacía en silencio una decisión de producto, y acto seguido le concedía membresías
+     * `lead-boutique`.
+     *
+     * Meter `and estado <> 'inactivo'` en aquel `update` tapaba la mitad visible y dejaba la
+     * peor: cero filas ya significa «ya tenía contraseña», que es el caso NORMAL, así que la
+     * carrera se volvía indistinguible del camino bueno y las concesiones seguían adelante
+     * igual. Lo que hay que serializar no es una sentencia, es la DECISIÓN entera.
+     *
+     * El candado dura hasta el commit, así que cubre la guarda, la contraseña y las dos
+     * membresías. Los dos órdenes quedan bien y ambos están comprobados: si B llega primero,
+     * este `select` espera y —bajo READ COMMITTED `for update` RELEE la última versión
+     * confirmada— ve «inactivo» y la guarda de abajo corta; si llegamos primero, B espera a
+     * que terminemos y la desactivación se aplica después, sobre una cuenta ya sembrada, que
+     * es exactamente lo que quería quien la desactivó.
+     */
+    const [u] = await tx`select id, estado from usuario
+      where lower(email) = ${email} for update`;
     const id = u!.id as string;
     /*
      * Una cuenta DESACTIVADA no recibe accesos, igual que en el flujo de invitación —que la

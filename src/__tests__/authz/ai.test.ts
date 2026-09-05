@@ -9,7 +9,7 @@ import {
   MODELO_PRIMARIO,
   VENTANA_SALUD_PROVEEDOR_MS,
 } from '@/lib/ai/ai.degradacion';
-import { MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
+import { materialDeJourney, MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   type ContenidoAsistenteGate,
@@ -5790,6 +5790,72 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * está acotado; el de no filtrarlo lo paga quien pulsa.
    */
   /**
+   * Dos fases con el MISMO NOMBRE no son la misma fase.
+   *
+   * El grafo que ve el modelo sustituía `faseId` por la ETIQUETA de la fase, y nada impide dos
+   * fases llamadas igual. Con solo el rótulo, sus hijos son indistinguibles: «muévelo a la fase
+   * Alta» no dice a cuál. Y la huella tampoco los distinguía, así que mover un nodo señalado de
+   * una «Alta» a la otra dejaba el material idéntico —un informe que ya no describe la
+   * agrupación seguía saliendo al día en el panel—.
+   *
+   * Se mide por la HUELLA, que es lo que gobierna la obsolescencia: el traslado tiene que
+   * cambiarla. Y las señales se comprueban idénticas antes y después, para que el caso no pase
+   * por la puerta de «cambiaron las señales», que es otra regla.
+   */
+  it('mover un nodo entre dos fases del mismo nombre cambia el material que ve el modelo', async () => {
+    await enWorkspaceLimpio('c5-dos-fases-igual', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const admin = sqlAdmin();
+      // Una segunda fase con EXACTAMENTE el mismo rótulo que la del fixture.
+      const [otra] = await admin`insert into journey_nodo
+        (workspace_id, journey_id, tipo, etiqueta, detalle, orden, responsable, creado_por)
+        values (${wsC}, ${j.journeyId}, 'fase', 'Alta', '', 5, '', ${curadorId})
+        returning id`;
+
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const material = async () =>
+        conUsuario(curadorId, async (tx) => {
+          const g = await leerJourneyCompleto(tx, wsC, j.journeyId);
+          return materialDeJourney({
+            nombre: g!.nombre,
+            servicio: g!.servicioNombre,
+            tipo: g!.tipo,
+            grafo: {
+              nodos: g!.nodos.map((n) => ({
+                id: n.id,
+                tipo: n.tipo,
+                etiqueta: n.etiqueta,
+                fase: 'Alta',
+                faseId: n.faseId ?? '',
+                responsable: n.responsable ?? '',
+                evidencias: n.evidencias.length,
+              })),
+              aristas: g!.aristas.map((a) => ({
+                origen: a.origenId,
+                destino: a.destinoId,
+                tipo: a.tipo,
+                condicion: a.condicion ?? '',
+              })),
+              senales: [],
+            },
+          }).texto;
+        });
+
+      const antes = await material();
+      await admin`update journey_nodo set fase_id = ${otra!.id as string}
+        where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      const despues = await material();
+
+      // Las señales son las MISMAS: sin esto, el caso podría estar pasando por otra regla.
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+      expect(despues, 'el traslado entre dos fases homónimas no se ve en el material').not.toBe(
+        antes,
+      );
+    });
+  });
+
+  /**
    * Un nodoId en MAYÚSCULA es el mismo nodo, y el informe tiene que valer igual.
    *
    * `z.string().uuid()` admite el hexadecimal en mayúscula y Postgres almacena la forma
@@ -6083,6 +6149,23 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [despues] = await admin`select count(*)::int as n from llamada_ai
         where workspace_id = ${wsC}`;
       expect(despues!.n).toBeGreaterThan(antes!.n);
+
+      /*
+       * Y el libro NO culpa al modelo. `resultado` describe lo que devolvió el proveedor, y
+       * aquí devolvió lo que se le pidió: lo que cambió fue el grafo, por debajo. Reetiquetar
+       * esto como `fuera-de-contrato` —que es lo que hacía el primer arreglo de la ronda
+       * anterior, sin distinguir los dos motivos— corrompe la medida de calidad del proveedor
+       * y emite `LlamadaAISinPropuesta` por algo que el modelo hizo bien.
+       *
+       * Se cierra igual, eso sí: dejar la línea en `despachada` la deja contando para el tope,
+       * sin desenlace y sin coste, que es peor que cualquiera de las dos etiquetas.
+       */
+      const lineas = await admin`select resultado from llamada_ai
+        where workspace_id = ${wsC} and journey_id = ${j.journeyId}`;
+      expect(
+        lineas.map((l) => l.resultado as string),
+        'el libro culpa al modelo de un cambio del grafo',
+      ).toEqual(lineas.map(() => 'salida-valida'));
     });
   });
 

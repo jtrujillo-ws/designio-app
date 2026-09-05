@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.8';
+export const PROMPT_VERSION = 'ai-2026-09-05.9';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -210,6 +210,15 @@ export type GrafoDelJourney = {
     tipo: string;
     etiqueta: string;
     fase: string;
+    /**
+     * Y la IDENTIDAD de esa fase, no solo su rótulo.
+     *
+     * Nada impide dos fases con el mismo nombre, y con solo el rótulo sus hijos son
+     * indistinguibles para el modelo —«muévelo a la fase Alta» no dice a cuál— y para la
+     * huella: mover un nodo señalado de una «Alta» a la otra dejaba el material idéntico, así
+     * que un informe que ya no describe la agrupación seguía saliendo al día.
+     */
+    faseId: string;
     responsable: string;
     evidencias: number;
   }[];
@@ -295,7 +304,8 @@ export function nucleoDeRemediacion(grafo: GrafoDelJourney): {
 }
 
 function lineaDeNodo(n: GrafoDelJourney['nodos'][number]): string {
-  return `[${n.id}] ${n.tipo} · fase: ${n.fase || '(sin fase)'} · responsable: ${n.responsable || '(sin responsable)'} · evidencias: ${n.evidencias}\n${n.etiqueta}`;
+  const fase = n.faseId ? `${n.fase || '(sin rótulo)'} [${n.faseId}]` : '(sin fase)';
+  return `[${n.id}] ${n.tipo} · fase: ${fase} · responsable: ${n.responsable || '(sin responsable)'} · evidencias: ${n.evidencias}\n${n.etiqueta}`;
 }
 
 function lineaDeArista(a: GrafoDelJourney['aristas'][number]): string {

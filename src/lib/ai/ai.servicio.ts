@@ -81,6 +81,21 @@ import {
 
 export class ErrorAI extends Error {}
 
+/**
+ * Lo que el modelo DIJO no cumple el contrato de su capacidad.
+ *
+ * Se distingue del resto de `ErrorAI` por lo que hay que anotar en el libro. `resultado`
+ * describe LO QUE DEVOLVIÓ EL PROVEEDOR, así que solo esto se reetiqueta como
+ * `fuera-de-contrato`: un informe que se salta una señal o repite otra es culpa suya.
+ *
+ * Lo que NO es esto: que el mundo se moviera entre preparar y escribir —el journey borrado, el
+ * grafo editado por otro curador—. Ahí el proveedor devolvió lo que se le pidió y la respuesta
+ * se descarta por algo que pasó fuera; anotarlo como fuera de contrato corrompería la medida
+ * de calidad del proveedor y emitiría `LlamadaAISinPropuesta` culpando al modelo de algo que
+ * hizo bien.
+ */
+export class ErrorContratoAI extends ErrorAI {}
+
 const PAGINA_PENDIENTES = 100;
 const DECIDIDAS_RECIENTES = 50;
 /** Cuántas anclas se ofrecen a la vez en el formulario de generación. El corte es
@@ -364,6 +379,9 @@ function grafoParaElModelo(journey: JourneyCompleto): GrafoDelJourney {
       tipo: n.tipo,
       etiqueta: n.etiqueta,
       fase: n.faseId ? (fase.get(n.faseId) ?? '') : '',
+      // El id de la fase, además del rótulo: dos fases pueden llamarse igual, y entonces ni el
+      // modelo puede decir a cuál mover un nodo ni la huella distingue un traslado entre ellas.
+      faseId: n.faseId ?? '',
       responsable: n.responsable ?? '',
       evidencias: n.evidencias.length,
     })),
@@ -2351,6 +2369,8 @@ const COMPROBAR: Record<
      * Y se descarta ENTERO, no la parte afectada: media respuesta no es revisable.
      */
     if (huellaDelGrafo(grafoAhora) !== huellaMostrada) {
+      // `ErrorAI` a secas, no de contrato: el proveedor devolvió lo que se le pidió y lo que
+      // cambió fue el grafo. Ver `ErrorContratoAI`.
       throw new ErrorAI(
         'El grafo de ese journey cambió mientras se generaba el informe: lo que dice ya no describe el grafo que hay, así que se descarta. Vuelve a pedirlo.',
       );
@@ -2374,13 +2394,13 @@ const COMPROBAR: Record<
     const reales = new Set(ahora);
     const inventadas = propuestas.filter((c) => !reales.has(c));
     if (inventadas.length > 0) {
-      throw new ErrorAI(
+      throw new ErrorContratoAI(
         `El informe señala ${inventadas.length} señal(es) que la validación de este journey no emitió: se descarta. Si el grafo cambió mientras se generaba, vuelve a pedirlo.`,
       );
     }
     if (propuestas.join('\n') !== ahora.join('\n')) {
       const faltan = reales.size - new Set(propuestas).size;
-      throw new ErrorAI(
+      throw new ErrorContratoAI(
         faltan > 0
           ? `El informe deja ${faltan} señal(es) sin remediar y el contrato pide una por señal: se descarta, porque leerlo haría creer que el grafo tiene menos averías de las que tiene. Vuelve a pedirlo.`
           : 'El informe propone dos remediaciones para la misma señal: se descarta, porque no hay criterio para elegir entre ellas. Vuelve a pedirlo.',
@@ -2498,11 +2518,25 @@ export async function generarPropuestas(
       );
     } catch (e) {
       if (!(e instanceof ErrorAI)) throw e;
-      const intentos = respuesta.intentos.map((i, indice) =>
-        indice === respuesta.intentos.length - 1
-          ? { ...i, resultado: 'fuera-de-contrato' as const, motivo: e.message }
-          : i,
-      );
+      /*
+       * Se reetiqueta SOLO lo que es culpa del modelo. `resultado` describe lo que devolvió el
+       * proveedor, así que un informe que se salta una señal o repite otra es
+       * `fuera-de-contrato`; un journey borrado o editado por otro curador NO lo es —el
+       * proveedor devolvió lo que se le pidió— y anotarlo así corrompería la medida de calidad
+       * y emitiría `LlamadaAISinPropuesta` culpando al modelo de algo que hizo bien.
+       *
+       * En los dos casos la línea SE CIERRA antes de relanzar: dejarla en `despachada` la deja
+       * contando para el tope, sin desenlace y sin coste anotado, que es peor que cualquiera
+       * de las dos etiquetas.
+       */
+      const intentos =
+        e instanceof ErrorContratoAI
+          ? respuesta.intentos.map((i, indice) =>
+              indice === respuesta.intentos.length - 1
+                ? { ...i, resultado: 'fuera-de-contrato' as const, motivo: e.message }
+                : i,
+            )
+          : respuesta.intentos;
       await cerrarSinTaparElMotivo(actorId, entrada, intentos);
       throw e;
     }

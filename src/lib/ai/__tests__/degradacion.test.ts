@@ -448,6 +448,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       tipo: 'paso',
       etiqueta: `Paso ${i} — ${'descripción larga del paso '.repeat(8)}`,
       fase: 'Alta',
+      faseId: 'b1000000-0000-4000-8000-0000000000fa',
       responsable: 'Front',
       evidencias: 0,
     }));
@@ -477,6 +478,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
         tipo: 'paso',
         etiqueta: 'Recibir documento',
         fase: 'Alta',
+        faseId: 'b1000000-0000-4000-8000-0000000000fa',
         responsable: 'Front',
         evidencias: 1,
       },
@@ -485,6 +487,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
         tipo: 'paso',
         etiqueta: 'Verificar identidad',
         fase: 'Alta',
+        faseId: 'b1000000-0000-4000-8000-0000000000fa',
         responsable: '',
         evidencias: 0,
       },
@@ -516,8 +519,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * «todavía no la usa nadie» es exactamente el que hay que no aceptar, porque es cierto
    * hasta el commit en que deja de serlo.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-05.8';
-  const HUELLA_ANOTADA = 'da740859d79208220f9a29d88ec9385213dae7c9e74eb5826e8b716c6d1c6b61';
+  const VERSION_ANOTADA = 'ai-2026-09-05.9';
+  const HUELLA_ANOTADA = '86de82b2d38b12cb228831de0b2f3cbc49cc5eeadf176dfb414209679eea4a84';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y

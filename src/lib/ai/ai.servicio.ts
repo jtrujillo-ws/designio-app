@@ -3170,9 +3170,35 @@ const PREPARAR: Record<
         `Ninguno de los ${registry.criterios.length} criterios de ese reto cabe entero en el material (el techo son ${MAX_MATERIAL} caracteres, y la formulación del reto va delante): no se llamó al proveedor, porque cualquier entrada saldría de un criterio que el modelo no habría visto completo. Acorta la descripción del reto o la definición de sus criterios y vuelve a pedirlo.`,
       );
     }
+    /*
+     * Y lo que el registry YA mide. Se lee AQUÍ y no dentro de `huellaDelMaterialDelRegistry`,
+     * y esa separación es toda la decisión de esta ronda: ese lector compone el MATERIAL —lo
+     * que las citas copian, lo que la huella vigila y lo que el recorte mide—, y las entradas
+     * existentes no son eso. Son el estado del contrato, contexto para no repetirse.
+     *
+     * Metidas en el material moverían la huella cada vez que se acepta una entrada, y como C6
+     * es un LOTE que se revisa fila a fila, aceptar la primera dejaría a las demás sin poder
+     * aceptarse: la comprobación de la ronda 3 —que el material no se movió— volviéndose
+     * contra su propio caso de uso. Van, por eso, en un bloque aparte del prompt y fuera de la
+     * huella.
+     *
+     * Bajo los candados que `huellaDelMaterialDelRegistry` acaba de tomar (workspace → reto →
+     * registry, y las filas en `for share`): esta lectura va DESPUÉS, que es el orden del
+     * protocolo, y ve el registry que el resto de la preparación vio.
+     */
+    const entradas = await tx`select nombre, definicion from entrada_kpi
+      where registry_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+      order by nombre asc`;
     return {
       sistema: SISTEMA_REGISTRY,
-      prompt: promptRegistry({ ...registry, cuantas: MAX_ENTRADAS_KPI_POR_LOTE }),
+      prompt: promptRegistry({
+        ...registry,
+        entradas: entradas.map((e) => ({
+          nombre: e.nombre as string,
+          definicion: e.definicion as string,
+        })),
+        cuantas: MAX_ENTRADAS_KPI_POR_LOTE,
+      }),
       /*
        * La huella de ESTE material, para volver a mirarla justo antes de despachar. Entre esta
        * transacción y aquella hay un commit, y lo que puede pasar en medio no es solo que el

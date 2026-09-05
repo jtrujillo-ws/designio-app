@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.12';
+export const PROMPT_VERSION = 'ai-2026-09-05.13';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -640,6 +640,7 @@ export const SISTEMA_REGISTRY = [
   'La FRECUENCIA tiene que dar varias lecturas dentro de la ventana del criterio: una serie de un solo punto no dice si algo mejoró.',
   'NO propongas quién aporta el dato, ni la línea base, ni desde cuándo se mide, ni la fecha del post mortem: eso lo acuerdan las personas y se firma aparte. Tampoco lo escondas dentro de la definición o de la fuente.',
   'No propongas indicadores que estos criterios no pidan, aunque sean interesantes: un KPI que no responde a una promesa es telemetría.',
+  'Si el registry ya tiene entradas, se te dan aparte: no propongas otra vez lo que ya mide, ni con otro nombre. Dos formas de medir lo mismo dentro del mismo contrato es lo que hace que nadie sepa cuál se lee.',
   REGLAS_COMUNES,
 ].join('\n');
 
@@ -734,6 +735,39 @@ export function promptInsights(reto: {
   };
 }
 
+export type EntradasDelRegistry = { nombre: string; definicion: string }[];
+
+/**
+ * Lo que el registry YA mide, como SEGUNDO bloque no confiable.
+ *
+ * Sin esto, el modelo no sabe qué hay dentro del contrato: un registry a medio llenar —o el
+ * segundo lote del mismo, que el panel vuelve a ofrecer en cuanto el primero se decide— recibe
+ * exactamente el mismo material y propone otra vez lo mismo. La colisión EXACTA de nombre la
+ * ve el panel («nombre-ocupado»); un sinónimo, no la ve nadie, y entra al contrato como una
+ * segunda forma de medir lo mismo.
+ *
+ * Bloque APARTE y no dentro del material, y esa separación es la decisión que hay que
+ * entender: el material es aquello CONTRA lo que se propone —lo que las citas copian, lo que
+ * la huella vigila y lo que el recorte decide si llegó entero—. Las entradas existentes no son
+ * eso: son el estado del contrato, contexto para no repetirse. Metidas en el material moverían
+ * la huella cada vez que se acepta una entrada, y como C6 es un LOTE que se revisa fila a fila,
+ * aceptar la primera dejaría la segunda sin poder aceptarse — el arreglo de la ronda 3
+ * volviéndose contra su propio caso de uso.
+ *
+ * Delimitado igual que el resto: el nombre y la definición de una entrada los escribe un
+ * miembro, así que son dato, no instrucciones.
+ */
+function bloqueDeEntradas(entradas: EntradasDelRegistry): string {
+  if (entradas.length === 0) {
+    return 'Este Metric Registry todavía no tiene ninguna entrada: propón el contrato desde cero.';
+  }
+  const lista = entradas.map((e) => `- ${e.nombre}: ${e.definicion}`).join('\n');
+  return [
+    `Este Metric Registry ya tiene ${entradas.length} ${entradas.length === 1 ? 'entrada' : 'entradas'}. NO vuelvas a proponer lo que ya mide, ni con otro nombre:`,
+    delimitarMaterialNoConfiable(lista).bloque,
+  ].join('\n\n');
+}
+
 /**
  * Prompt de C6: los criterios del reto, delimitados como dato igual que el resto.
  *
@@ -747,6 +781,7 @@ export function promptRegistry(reto: {
   titulo: string;
   descripcion: string;
   criterios: CriteriosDelReto;
+  entradas: EntradasDelRegistry;
   cuantas: number;
 }): { usuario: string; alcanceResumen: string } {
   const material = materialDeRegistry(reto);
@@ -754,6 +789,7 @@ export function promptRegistry(reto: {
     usuario: [
       `Propón hasta ${reto.cuantas} entradas del Metric Registry para el reto descrito en el material: qué se va a medir para saber si se logró.`,
       material.bloque,
+      bloqueDeEntradas(reto.entradas),
       'Cada entrada responde a UN criterio de éxito del material, por su id. Un KPI que no responde a ninguno es telemetría, no medición de impacto: no lo propongas.',
       'No propongas dos entradas para el mismo criterio salvo que midan cosas distintas de verdad, y nunca dos con el mismo nombre.',
       // Lo que no se pide, dicho: el esquema no lo admite, pero un modelo al que no se le
@@ -766,7 +802,7 @@ export function promptRegistry(reto: {
     ]
       .filter(Boolean)
       .join('\n\n'),
-    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.criterios.length} criterios (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.criterios.length} criterios, ${reto.entradas.length} entradas ya en el registry (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 

@@ -780,10 +780,13 @@ declare
   -- solo el destino deja abierta la puerta de atrás: quien sea miembro de los dos puede MOVER
   -- una fila fuera de un workspace archivado a uno vivo, el guard comprueba el activo y lo da
   -- por bueno. La promesa «se conserva para consulta y no admite escrituras» se rompería por
-  -- EXTRACCIÓN en vez de por escritura, que es la misma pérdida por otra puerta. `segmento` es
-  -- la superficie exacta: su grant de UPDATE incluye `workspace_id` y su política es solo de
-  -- membresía. Y el otro caso que cierra: una actualización concurrente que saca filas de un
-  -- workspace mientras se está borrando, sin competir nunca por su candado.
+  -- EXTRACCIÓN en vez de por escritura, que es la misma pérdida por otra puerta. `segmento` era
+  -- la superficie exacta al escribirse esto: su grant de UPDATE incluía `workspace_id` y su
+  -- política era solo de membresía (20260905110000 cerró ese grant a nombre y definición; hoy
+  -- ninguna tabla deja al rol de aplicación escribir `workspace_id`, y este guard queda como
+  -- la garantía de detrás por si un grant lo reabre). Y el otro caso que cierra: una
+  -- actualización concurrente que saca filas de un workspace mientras se está borrando, sin
+  -- competir nunca por su candado.
   --
   -- Ordenados, que no es cosmética: al tomar DOS candados hace falta un orden total o dos
   -- movimientos en sentidos opuestos se abrazan. Se ordena por el uuid, que es el mismo orden

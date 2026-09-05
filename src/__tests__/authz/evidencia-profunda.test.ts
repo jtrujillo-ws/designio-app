@@ -2499,24 +2499,37 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     // del insight, que es el mismo error una capa más arriba.
     const [pr] = await admin`select pg_get_functiondef('razonamiento_sin_respaldo'::regproc) as def`;
     const predicado = pr!.def as string;
+    // Desde 20260905120000 el guard ya no decide nada por su cuenta: toma los candados y le
+    // hace UNA pregunta a `gate_faltas_para_aprobar`, que es la misma que hace la bandeja de
+    // aprobaciones. Los candados del protocolo salieron a `razonamiento_candados`.
+    const [cd] = await admin`select pg_get_functiondef('razonamiento_candados'::regproc) as def`;
+    const candados = cd!.def as string;
+    const [fa] = await admin`select pg_get_functiondef('gate_faltas_para_aprobar'::regproc) as def`;
+    const faltas = fa!.def as string;
 
-    // Las TRES rutas que consumen razonamiento llaman a la misma función: el checklist, G5
-    // y —desde 20260905120000— el portafolio de oportunidades de G3. Ni una más ni una
-    // menos: una llamada nueva es una ruta nueva que hay que mirar (se miró: G3 certifica
-    // «dónde jugamos» sobre HMW trazadas a insights, así que consume razonamiento igual que
-    // las otras dos y entra por el mismo protocolo), y ninguna sería un guard que volvió a
-    // decidir por su cuenta.
-    expect((guard.match(/razonamiento_usable_guard\(/g) ?? []).length).toBe(3);
+    // Las TRES rutas que consumen razonamiento toman los candados con la misma función —el
+    // checklist, el diseño de G5 y, desde 20260905130000, el portafolio de G3—, y las faltas
+    // se preguntan UNA vez. Ni una más ni una menos: una llamada nueva es una ruta nueva que
+    // hay que mirar (se miró: G3 certifica «dónde jugamos» sobre HMW trazadas a insights, así
+    // que consume razonamiento igual que las otras dos y entra por el mismo protocolo), y
+    // ninguna sería un guard que volvió a decidir por su cuenta.
+    expect((guard.match(/razonamiento_candados\(/g) ?? []).length).toBe(3);
+    expect((guard.match(/gate_faltas_para_aprobar\(/g) ?? []).length).toBe(1);
+    // Y en las faltas, las tres rutas preguntan al MISMO predicado.
+    expect((faltas.match(/razonamiento_sin_respaldo\(/g) ?? []).length).toBe(3);
 
     // Y el guard ya no recorre ni decide sobre razonamiento: ni sigue `decision_insight`
     // —el eslabón por el que se llega a los insights de una decisión— ni bloquea decisiones
-    // por su cuenta. Todo eso vive en la compartida.
+    // por su cuenta. Todo eso vive en las compartidas.
     expect(guard).not.toContain('decision_insight');
     expect(guard).not.toContain('for share of d');
+    expect(guard).not.toContain('razonamiento_sin_respaldo');
 
-    // La compartida sí trae el protocolo entero: los dos candados y las tres
-    // comprobaciones. Se afirma sobre su texto porque es lo que las dos rutas heredan.
-    expect(compartida).toContain('for share');
+    // Las compartidas sí traen el protocolo entero: los dos candados en una, y la
+    // comprobación en la otra. Se afirma sobre su texto porque es lo que las dos rutas
+    // heredan. `razonamiento_usable_guard` sigue siendo candados + predicado + raise.
+    expect(candados).toContain('for share');
+    expect(compartida).toContain('razonamiento_candados');
     expect(compartida).toContain('razonamiento_sin_respaldo');
     expect(predicado).toContain("i.estado <> 'validado'");
     /*

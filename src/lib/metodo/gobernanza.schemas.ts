@@ -101,6 +101,20 @@ export type DecisionDeProyecto = {
  * vocabulario, no de una copia que pueda quedarse atrás. */
 export type EstadoArquetipo = 'hipotesis' | 'confirmado' | 'refutado';
 
+/** Cómo se NOMBRA cada estado en pantalla: el slug es de la base, no del lector. */
+export const ETIQUETA_ESTADO_ARQUETIPO: Record<EstadoArquetipo, string> = {
+  hipotesis: 'Hipótesis',
+  confirmado: 'Confirmado',
+  refutado: 'Refutado',
+};
+
+/** Y su color, uno para el proyecto y para la biblioteca: el vocabulario visual es el mismo. */
+export const COLOR_ARQUETIPO: Record<EstadoArquetipo, string> = {
+  hipotesis: 'var(--warn)',
+  confirmado: 'var(--accent)',
+  refutado: 'var(--text-faint)',
+};
+
 export type ArquetipoDeReto = {
   id: string;
   nombre: string;

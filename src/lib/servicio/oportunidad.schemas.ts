@@ -26,6 +26,11 @@ export type EstadoOportunidad = z.infer<typeof EstadoOportunidadSchema>;
  */
 export const MAX_PREGUNTA = 500;
 
+/** Y el de las razones —la de la prioridad y la del veredicto—, por lo mismo y para los tres
+ * controles que las escriben: los dos techos se exportan porque el número que gobierna tiene
+ * que ser uno solo, no una copia en cada sitio que se pueda separar del original. */
+export const MAX_RAZON = 2000;
+
 /** El texto de la pregunta. No se valida que empiece por «HMW» ni por «cómo podríamos»:
  * imponer el prefijo sería imponer un idioma, y una regla que se rodea escribiendo el
  * prefijo delante no es una regla. */
@@ -36,7 +41,7 @@ export const CrearOportunidadSchema = z.object({
   retoId: z.string().uuid(),
   pregunta: PreguntaSchema,
   prioridad: z.number().int().min(0).max(1000).default(0),
-  prioridadRazon: z.string().trim().max(2000).default(''),
+  prioridadRazon: z.string().trim().max(MAX_RAZON).default(''),
 });
 export type CrearOportunidad = z.infer<typeof CrearOportunidadSchema>;
 
@@ -51,7 +56,7 @@ export const PriorizarOportunidadSchema = z.object({
   workspaceId: z.string().uuid(),
   oportunidadId: z.string().uuid(),
   prioridad: z.number().int().min(0).max(1000),
-  prioridadRazon: z.string().trim().max(2000).default(''),
+  prioridadRazon: z.string().trim().max(MAX_RAZON).default(''),
 });
 export type PriorizarOportunidad = z.infer<typeof PriorizarOportunidadSchema>;
 
@@ -68,7 +73,7 @@ export const DecidirOportunidadSchema = z
     workspaceId: z.string().uuid(),
     oportunidadId: z.string().uuid(),
     estado: z.enum(['aprobada', 'descartada']),
-    veredictoRazon: z.string().trim().max(2000).default(''),
+    veredictoRazon: z.string().trim().max(MAX_RAZON).default(''),
   })
   .refine((v) => v.estado !== 'descartada' || v.veredictoRazon.length > 0, {
     path: ['veredictoRazon'],

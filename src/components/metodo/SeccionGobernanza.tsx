@@ -18,7 +18,9 @@ import {
   veredictoDeArquetipo,
 } from '@/lib/metodo/gobernanza.functions';
 import {
+  COLOR_ARQUETIPO,
   ETIQUETA_ALCANCE,
+  ETIQUETA_ESTADO_ARQUETIPO,
   ETIQUETA_TIPO_DECISION,
   TIPOS_DECISION,
   type GobernanzaDeProyecto,
@@ -42,12 +44,6 @@ const micro: CSSProperties = {
   letterSpacing: '.08em',
   textTransform: 'uppercase',
   color: 'var(--text-muted)',
-};
-
-const COLOR_ARQUETIPO: Record<string, string> = {
-  hipotesis: 'var(--warn)',
-  confirmado: 'var(--accent)',
-  refutado: 'var(--text-faint)',
 };
 
 export function SeccionGobernanza({
@@ -454,7 +450,7 @@ function BloqueArquetipos({
               {a.nombre}
             </span>
             <span style={{ font: '600 11.5px var(--font-sans)', color: COLOR_ARQUETIPO[a.estado] }}>
-              {a.estado}
+              {ETIQUETA_ESTADO_ARQUETIPO[a.estado]}
             </span>
           </div>
           {a.definicion && (

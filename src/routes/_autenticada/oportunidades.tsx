@@ -17,7 +17,7 @@ import {
   repriorizarOportunidad,
   trazarInsight,
 } from '@/lib/servicio/oportunidad.functions';
-import { MAX_PREGUNTA } from '@/lib/servicio/oportunidad.schemas';
+import { MAX_PREGUNTA, MAX_RAZON } from '@/lib/servicio/oportunidad.schemas';
 import type { OportunidadDelPortafolio } from '@/lib/servicio/oportunidad.schemas';
 
 /**
@@ -185,6 +185,7 @@ function PantallaOportunidades() {
                   />
                   <Textarea
                     placeholder="Por qué esa prioridad (contra qué criterio del reto)"
+                    maxLength={MAX_RAZON}
                     value={prioridadRazon}
                     onChange={(e) => setPrioridadRazon(e.currentTarget.value)}
                     style={{ flex: 1, minHeight: 40 }}
@@ -366,6 +367,7 @@ function PantallaOportunidades() {
                         <Input
                           placeholder="Por qué esa prioridad"
                           style={{ width: 220 }}
+                          maxLength={MAX_RAZON}
                           value={repriorizando[o.id]!.razon}
                           aria-label={`Razón de la prioridad de ${o.pregunta}`}
                           onChange={(e) =>
@@ -436,6 +438,7 @@ function PantallaOportunidades() {
                     <Input
                       placeholder="Razón para descartar"
                       style={{ width: 220 }}
+                      maxLength={MAX_RAZON}
                       value={razonDeDescarte[o.id] ?? ''}
                       onChange={(e) =>
                         setRazonDeDescarte({ ...razonDeDescarte, [o.id]: e.currentTarget.value })

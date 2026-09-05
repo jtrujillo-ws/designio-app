@@ -317,6 +317,36 @@ declare
 begin
   if session_user <> 'designio_app' then return null; end if;
 
+  -- ── LA ETAPA, que es el efecto que da nombre a la fila ──
+  -- Sin esto, un registro con su propagación hecha y SIN el update de la etapa pasaba: la
+  -- etapa se quedaba 'completada' y el archivo recibía un `EtapaReabierta` de una reapertura
+  -- que no ocurrió. El guard comprobaba los efectos de al lado y no el suyo.
+  if not exists (
+    select 1 from etapa_instancia e
+    where e.proyecto_id = new.proyecto_id and e.workspace_id = new.workspace_id
+      and e.numero = new.etapa_numero and e.estado = 'en-curso'
+  ) then
+    raise exception 'esa reapertura no abre nada: la etapa % del proyecto sigue sin estar en curso, así que el registro y su evento dirían que ocurrió algo que no ocurrió', new.etapa_numero;
+  end if;
+
+  -- ── Y UN ALCANCE 'declarado' DECLARA ALGO ──
+  -- El agujero más fino de los tres, y estaba en el predicado de abajo: con `alcance =
+  -- 'declarado'` y CERO `reapertura_insight`, la primera rama es falsa y el `exists` no
+  -- encuentra nada, así que TODA decisión queda fuera del alcance y la comprobación pasa en
+  -- vacío. Una reapertura que no declara nada abre todas las ventanas del ciclo sin
+  -- cuestionar una sola decisión — y con menos requisitos que la de etapa completa, que sí
+  -- tiene que marcarlas todas.
+  --
+  -- `reabrirEtapa` no llega aquí con esa forma —su `alcance` sale de `cardinality(insightIds)`
+  -- y sus filas de los insights que EXISTEN, y cuando la declaración era falsa el servicio
+  -- revierte antes con su propio mensaje—, así que esto es suelo para el SQL directo.
+  select count(*)::int into v_declarados
+    from reapertura_insight ri
+   where ri.reapertura_id = new.id and ri.workspace_id = new.workspace_id;
+  if new.alcance = 'declarado' and v_declarados = 0 then
+    raise exception 'esa reapertura dice tener alcance declarado y no declara ningún insight: un alcance vacío no acota nada, deja fuera todas las decisiones y abre la etapa sin cuestionar ninguna (RF-04.9)';
+  end if;
+
   if exists (
     select 1 from decision d
       join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id
@@ -340,9 +370,20 @@ begin
      and g.numero >= new.etapa_numero
      and d.estado = 'en-revision'
      and d.xmin = pg_current_xact_id()::xid;
-  select count(*)::int into v_declarados
-    from reapertura_insight ri
-   where ri.reapertura_id = new.id and ri.workspace_id = new.workspace_id;
+
+  -- ── Y EL NÚMERO QUE LA FILA DECLARA ES EL QUE SE PUEDE CONTAR ──
+  -- Aquí lo dejé a medias a propósito y estaba mal: el evento llevaba el número contado y la
+  -- columna se quedaba con el del llamante, «que es su declaración». Pero `SeccionGobernanza`
+  -- pinta la COLUMNA, así que la pantalla y el archivo podían decir dos números distintos de
+  -- la misma reapertura — y de los dos, el que la gente ve es el falsificable. Un archivo que
+  -- contradice a la pantalla no arregla la pantalla: estropea el archivo.
+  --
+  -- Se exige que cuadren, en vez de escribir el contado por encima: reescribir el valor de una
+  -- fila append-only desde su propio trigger deja al llamante creyendo que guardó otra cosa.
+  -- Así el que se equivoca se entera.
+  if new.decisiones_marcadas <> v_marcadas then
+    raise exception 'esa reapertura dice haber marcado % decisiones y en esta transacción se marcaron %: el número que se guarda es el que la pantalla enseña, así que tiene que ser el que ocurrió', new.decisiones_marcadas, v_marcadas;
+  end if;
 
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
     values (new.workspace_id, 'EtapaReabierta',

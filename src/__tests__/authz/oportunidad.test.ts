@@ -681,6 +681,40 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
       where proyecto_id = ${proyectoE} and workspace_id = ${ws} and numero = 3`;
     expect(quieta!.estado as string).toBe('completada');
 
+    // Y las otras tres formas de escribir un registro que no es una reapertura. Las tres
+    // pasaban la primera versión de este guard, que comprobaba los efectos de al lado y no
+    // los suyos.
+    const registroCon = (
+      campos: { alcance?: string; marcadas?: number; abrirEtapa?: boolean } = {},
+    ) =>
+      conUsuario(leadId, async (tx) => {
+        await tx`insert into reapertura_etapa
+          (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+           reabierto_por)
+          values (${ws}, ${proyectoE}, 3, 'Motivo cualquiera',
+                  ${campos.alcance ?? 'etapa-completa'}, ${campos.marcadas ?? 1}, ${leadId})`;
+        // La propagación, que es la que el guard exigía desde el principio.
+        await tx`update decision set estado = 'en-revision' where id = ${decisionE}`;
+        if (campos.abrirEtapa !== false) {
+          await tx`update etapa_instancia set estado = 'en-curso'
+            where proyecto_id = ${proyectoE} and workspace_id = ${ws} and numero = 3`;
+        }
+      });
+
+    // 1. El ALCANCE DECLARADO que no declara nada: la primera rama del predicado es falsa y el
+    //    `exists` está vacío, así que toda decisión quedaba fuera y la comprobación pasaba en
+    //    vacío. Una reapertura que no acota nada abriendo con menos requisitos que la completa.
+    await expect(registroCon({ alcance: 'declarado' })).rejects.toThrow(
+      /no declara ningún insight/,
+    );
+    // 2. El registro SIN abrir la etapa: propagación hecha, etapa 'completada', y un
+    //    `EtapaReabierta` en el archivo de algo que no ocurrió.
+    await expect(registroCon({ abrirEtapa: false })).rejects.toThrow(/no abre nada/);
+    // 3. Y el NÚMERO inventado. Lo dejé a medias a propósito —el evento contaba y la columna
+    //    era del llamante— y estaba mal: `SeccionGobernanza` pinta la columna, así que la
+    //    pantalla y el archivo podían decir dos números distintos de la misma reapertura.
+    await expect(registroCon({ marcadas: 7 })).rejects.toThrow(/dice haber marcado 7/);
+
     // Y la reapertura DE VERDAD, por su servicio: propaga, abre y deja su evento.
     const { decisionesMarcadas } = await reabrirEtapa(leadId, {
       workspaceId: ws,

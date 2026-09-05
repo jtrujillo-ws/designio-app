@@ -7557,6 +7557,144 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y tampoco deja nacer una propuesta que va a morir: el guard del INSERT también espera.
+   *
+   * El barrido de citas lee el derecho vigente al persistir, y eso cierra la ventana ancha. La
+   * fina no: una revocación en vuelo no la ve ese snapshot, así que nace una propuesta que
+   * llega al panel ya `evidencia-no-citable` y que aceptar rechazará SIEMPRE con DR001 — con
+   * la llamada pagada y alguien delante intentando revisarla.
+   *
+   * Mismo protocolo que los otros dos sitios: `for share` sobre las filas de `derecho_uso` de
+   * la evidencia del reto, antes de leerlas.
+   */
+  it('una revocación en vuelo impide que nazca una propuesta ya muerta', async () => {
+    await enWorkspaceLimpio('c2-revocacion-al-persistir', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsC}, 'C2', ${retoC}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+
+      let soltar: () => void = () => {};
+      const enVuelo = new Promise<void>((r) => {
+        soltar = r;
+      });
+      const revocacion = admin.begin(async (tx) => {
+        await tx`update derecho_uso
+          set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+              decidido_por = ${curadorId}, decidido_en = now()
+          where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+        await enVuelo;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      const persistencia = conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           llamada_id, creado_por)
+        values (${wsC}, 'C2', 'insight', ${retoC}, ${tx.json(CONTENIDO_C2(ev) as never)},
+                ${tx.json(CONTENIDO_C2(ev) as never)}, 0.6, ${MODELO_PRIMARIO},
+                ${PROMPT_VERSION}, 'alcance', 'huella', 'entorno', ${l!.id as string},
+                ${curadorId})`);
+      const veredicto = persistencia.then(
+        () => 'nació',
+        (e: Error) => `rechazó: ${e.message}`,
+      );
+
+      await new Promise((r) => setTimeout(r, 1500));
+      soltar();
+      await revocacion;
+
+      expect(
+        await veredicto,
+        'nació una propuesta que la aceptación va a rechazar siempre con DR001',
+      ).toMatch(/ya no se puede citar al cliente/);
+
+      const filas = await admin`select 1 from propuesta_ai
+        where workspace_id = ${wsC} and capacidad = 'C2'`;
+      expect(filas.length).toBe(0);
+    });
+  }, 20000);
+
+  /**
+   * Una revocación EN VUELO no deja que el material salga hacia el proveedor.
+   *
+   * `REVALIDAR.C2` recompone la huella del material justo antes de despachar, y eso cierra la
+   * ventana ancha: la revocación ya commiteada. La fina no: una que está en vuelo no la ve este
+   * snapshot, la huella cuadra, y esa revocación puede commitear antes de que `abrirLlamada`
+   * cierre su transacción y despache.
+   *
+   * Es el peor desenlace del pipeline y el único IRREVERSIBLE — material del cliente saliendo
+   * hacia un tercero después de que le retiraran el permiso, y lo que ya salió no se puede
+   * retirar. Todo lo demás de este PR se arregla rechazando o rehaciendo; esto no.
+   *
+   * Se mide por el LIBRO y por el despacho: la revocación toma su candado y se queda abierta;
+   * la generación entra y espera en el `for share`; se suelta la revocación, la generación
+   * despierta, recompone la huella, la ve distinta y NO llama. Sin el candado no espera:
+   * despacha con la evidencia revocada dentro.
+   */
+  it('una revocación en vuelo impide que el material salga hacia el proveedor', async () => {
+    await enWorkspaceLimpio('c2-revocacion-antes-de-despachar', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      // `duranteLlamada` es el hueco en el que el material ESTÁ EN EL AIRE: corre después de
+      // que el apunte haya salido bien, así que contar aquí es contar despachos de verdad.
+      // (`antesDelApunte` corre antes de la comprobación del permiso y no mide eso.)
+      let despachos = 0;
+      proveedor.duranteLlamada = async () => {
+        despachos += 1;
+      };
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+
+      let soltar: () => void = () => {};
+      const enVuelo = new Promise<void>((r) => {
+        soltar = r;
+      });
+      const revocacion = admin.begin(async (tx) => {
+        await tx`update derecho_uso
+          set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+              decidido_por = ${curadorId}, decidido_en = now()
+          where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+        await enVuelo;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      try {
+        const generacion = conProveedor(
+          { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+          () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+        );
+        const veredicto = generacion.then(
+          () => 'generó',
+          (e: Error) => `rechazó: ${e.message}`,
+        );
+        await new Promise((r) => setTimeout(r, 1500));
+        soltar();
+        await revocacion;
+        expect(await veredicto).toMatch(/cambió mientras se preparaba|no se llamó al proveedor/);
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      // Ni un byte en el aire, y sin línea en el libro: no se abre para una llamada que no
+      // ocurre. Sin el candado, esto despacha con la evidencia revocada dentro.
+      expect(despachos, 'se despachó el material con la evidencia revocada dentro').toBe(0);
+      const [tras] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(tras!.n).toBe(antes!.n);
+    });
+  }, 20000);
+
+  /**
    * Un uuid en mayúscula es el MISMO uuid, también en el suelo.
    *
    * El guard del INSERT normaliza con `lower(...)` —lo hace explícitamente— y el guard diferido

@@ -997,6 +997,25 @@ begin
   -- trabajo bueno por el reloj, y el mensaje además llamaba «cita» a una contradicción.
   --
   -- Así que la rama viaja con el id y cada regla se aplica a lo suyo.
+  -- Y el CANDADO antes de leer los derechos, por lo mismo que en la revalidación previa al
+  -- despacho y en el guard diferido de la aceptación: sin él esta lectura es una foto, y una
+  -- revocación en vuelo la esquiva. Lo que se persiste entonces es una propuesta que nace ya
+  -- «evidencia-no-citable» y que aceptar rechazará SIEMPRE con DR001 — con la llamada pagada y
+  -- alguien delante intentando revisarla.
+  --
+  -- Sobre las filas de «derecho_uso» de toda la evidencia del reto, ordenadas por id, que es
+  -- el protocolo de «candados-compartidos».
+  perform du.evidencia_id
+    from derecho_uso du
+   where du.workspace_id = new.workspace_id
+     and du.evidencia_id in (
+       select ae.evidencia_id
+         from arquetipo a
+         join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+        where a.reto_id = new.reto_id and a.workspace_id = new.workspace_id)
+   order by du.evidencia_id
+     for share;
+
   select coalesce(citas.x, '(sin evidenciaId)'), citas.rama,
     case
       when not exists (

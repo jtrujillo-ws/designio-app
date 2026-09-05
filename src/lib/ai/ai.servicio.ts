@@ -2419,7 +2419,31 @@ const REVALIDAR: Record<
      * el proveedor. Preguntar por el conjunto entero es lo que corresponde a lo que se va a
      * mandar, y de paso cubre lo demás que puede haber cambiado: una evidencia desenlazada,
      * otra nueva, un resumen editado, la formulación del reto.
+     *
+     * Y el CANDADO antes de leerlos, que es lo que convierte esto en una garantía y no en una
+     * foto. Sin él, una revocación EN VUELO no la ve este snapshot —no ha commiteado—, la
+     * huella cuadra, y esa revocación puede commitear antes de que `abrirLlamada` cierre su
+     * transacción y despache: material del cliente saliendo hacia un tercero después de que le
+     * retiraran el permiso. Es el peor desenlace del pipeline y el único irreversible — lo que
+     * ya salió no se puede retirar.
+     *
+     * `for share` sobre las filas de `derecho_uso` de la evidencia del reto, ordenadas por id:
+     * el protocolo que este repositorio ya tiene escrito en `candados-compartidos` y el mismo
+     * que toman el guard del insert y el guard diferido de la aceptación. Con él hay un orden:
+     * o la revocación commitea antes y esta lectura la ve —y no se despacha—, o espera a que
+     * el despacho quede anotado. Va en ESTA transacción y no en `PREPARAR.C2` porque el
+     * candado se suelta al commitear, y la que tiene que ganar es la que despacha.
      */
+    await tx`select du.evidencia_id
+      from derecho_uso du
+      where du.workspace_id = ${entrada.workspaceId}
+        and du.evidencia_id in (
+          select ae.evidencia_id
+          from arquetipo a
+          join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+          where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId})
+      order by du.evidencia_id
+      for share`;
     const evidencia = await tx`select distinct e.id, e.titulo, e.resumen
       from arquetipo a
       join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id

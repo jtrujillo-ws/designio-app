@@ -122,6 +122,17 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
 
   const resultados = estado.fase === 'listo' ? estado.resultados : [];
   const desplegado = abierto && texto.trim() !== '' && workspaceId !== null;
+  const idDeOpcion = (r: ResultadoBusqueda) => `${idLista}-${r.clase}-${r.id}`;
+
+  // El foco no se mueve de la caja (aria-activedescendant), así que el navegador no
+  // desplaza solo la opción activa: con más filas de las que caben, las flechas la dejaban
+  // fuera de la vista y Enter abría algo que no se veía.
+  useEffect(() => {
+    const activa = desplegado ? resultados[activo] : undefined;
+    if (activa) document.getElementById(idDeOpcion(activa))?.scrollIntoView({ block: 'nearest' });
+    // idDeOpcion solo depende de idLista, que es estable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activo, desplegado, resultados]);
   // La lista es de la consulta ACTUAL solo cuando no hay nada en vuelo y su texto es el del
   // campo. Mientras tanto se sigue viendo (evita el parpadeo), pero no se puede abrir: ni con
   // Enter, ni con clic, ni tabulando hasta ella. Abrir algo de la consulta anterior con el
@@ -183,8 +194,6 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
       if (elegido) void abrir(elegido);
     }
   }
-
-  const idDeOpcion = (r: ResultadoBusqueda) => `${idLista}-${r.clase}-${r.id}`;
 
   return (
     <div style={{ position: 'relative', width: 280 }} onBlur={alPerderFoco}>

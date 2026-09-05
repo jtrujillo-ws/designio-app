@@ -1,4 +1,5 @@
 import '@/lib/server-only';
+import { createHash } from 'node:crypto';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
@@ -499,31 +500,70 @@ type CapacidadEnElPanel = {
    */
   estado: (tx: TransactionSql) => PendingQuery<Row[]>;
   /**
+   * Y el estado que el SQL NO puede calcular, sobre la fila ya proyectada.
+   *
+   * Existe por C5: lo que deja obsoleto un informe de remediación es que sus señales dejen de
+   * estar abiertas, y las señales son una función pura de los nodos y las aristas, no una
+   * tabla. Con solo el CASE, la única respuesta honesta para C5 era «disponible» siempre — o
+   * sea, la pantalla no avisaba nunca de que un informe había dejado de describir el grafo,
+   * mientras CT sí avisa de su equivalente. Que la comprobación exista al ESCRIBIR no cubre
+   * esto: entre escribir y revisar cabe la edición, y es justo cuando conviene avisar.
+   *
+   * Devuelve `null` para dejar el veredicto del CASE, que es lo que hacen las tres que sí se
+   * pueden juzgar en SQL. Se evalúa sobre `f`, la misma fila que ya trae el grafo entero: no
+   * abre ninguna consulta nueva.
+   */
+  estadoDeLaFila?: (f: Record<string, unknown>) => EstadoAncla | null;
+  /**
+   * Cómo se llaman, en cristiano, los ids que el contenido nombra.
+   *
+   * El modelo copia ids del material —es lo único verificable, por eso se le piden así— y la
+   * pantalla los recibe tal cual. Un uuid no le dice nada a quien revisa: en C5 varias
+   * remediaciones pueden traer el MISMO código de señal sobre nodos distintos (media docena de
+   * `paso-sin-evidencia` es lo normal), y sin el nombre del nodo las tarjetas son
+   * indistinguibles — `comoCerrarlo` no está obligado a repetirlo.
+   *
+   * Sale de la MISMA fila que ya trae el grafo proyectado: no abre ninguna consulta nueva.
+   */
+  etiquetasDelContenido?: (f: Record<string, unknown>) => Record<string, string>;
+  /**
    * El material que el modelo leyó, recompuesto desde las columnas que proyectó su ancla. Se
    * compone IGUAL que al construir el prompt —ficha incluida y con el delimitador
    * neutralizado—: la presencia literal se mide contra lo que el modelo leyó, no contra el
    * texto crudo de la base. Una sola definición, dos usos.
    */
   material: (f: Record<string, unknown>) => string;
-  /** Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad. */
+  /**
+   * Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad, y SI
+   * DEJÓ ALGO FUERA.
+   *
+   * Lo segundo lo devuelve la cola y no lo deduce quien llama, que es lo que hacía: pedía una
+   * fila de más y miraba si venía. Eso vale mientras el corte lo haga el `limit` del SQL, y
+   * deja de valer en cuanto la cola filtra por algo que el SQL no sabe —C5 filtra por «tiene
+   * señales abiertas», que es una función pura del grafo—: ahí una lista corta puede
+   * significar «no hay más» o «no he llegado a mirar», y la primera es una respuesta que no se
+   * puede dar sin haber mirado. La cola es la única que sabe cuál de las dos es.
+   */
   candidatas: (
     tx: TransactionSql,
     workspaceId: string,
     patron: string | null,
     limite: number,
-  ) => Promise<CandidatoAncla[]>;
+  ) => Promise<{ lista: CandidatoAncla[]; hayMas: boolean }>;
 };
 
 /**
- * Cuántos journeys se leen del prefiltro por cada plaza del selector de C5.
+ * Cómo se barre la cola de C5, que no se puede resolver entera en SQL: «tiene señales
+ * abiertas» es una función pura del grafo, así que el SQL trae candidatos baratos y el bucle
+ * descarta los que vienen limpios.
  *
- * La cola de C5 no se puede resolver entera en SQL —«tiene señales abiertas» es una función
- * pura del grafo—, así que el SQL trae candidatos baratos y el bucle descarta los limpios. El
- * factor es la holgura para no quedarse corto cuando varios vienen limpios, y a la vez el
- * techo del barrido: sin él, un workspace con muchos journeys sanos convertiría cada pintado
- * del selector en una lectura de todos sus grafos.
+ * `LOTE` es cuántos se piden por vuelta y `TOPE` cuántos se llegan a mirar como mucho. El tope
+ * existe para que un workspace enorme no convierta cada pintado del selector en una lectura de
+ * todos sus grafos; y cuando se alcanza, la cola lo DICE en vez de devolver «no hay», que es
+ * la única respuesta que no se puede dar sin haber mirado.
  */
-const FACTOR_DE_HOLGURA_C5 = 4;
+const LOTE_DE_BARRIDO_C5 = 60;
+const TOPE_DE_BARRIDO_C5 = 300;
 
 const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
   CI: {
@@ -559,12 +599,15 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           and (${patron}::text is null or i.titulo ilike ${patron})
         order by i.creado_en asc, i.id asc
         limit ${limite}`;
-      return filas.map((i) => ({
-        id: i.id as string,
-        titulo: i.titulo as string,
-        consentimientoPendiente: i.consentimiento_pendiente as boolean,
-        sinMaterial: i.sin_material as boolean,
-      }));
+      return {
+        lista: filas.map((i) => ({
+          id: i.id as string,
+          titulo: i.titulo as string,
+          consentimientoPendiente: i.consentimiento_pendiente as boolean,
+          sinMaterial: i.sin_material as boolean,
+        })),
+        hayMas: false,
+      };
     },
   },
   C0: {
@@ -620,7 +663,7 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
         order by r.codigo asc, r.id asc
         limit ${limite}`;
-      return filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string }));
+      return { lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })), hayMas: false };
     },
   },
   CT: {
@@ -678,7 +721,7 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
                or pr.titulo ilike ${patron})
         order by g.creado_en asc, g.id asc
         limit ${limite}`;
-      return filas.map((g) => ({ id: g.id as string, titulo: g.titulo as string }));
+      return { lista: filas.map((g) => ({ id: g.id as string, titulo: g.titulo as string })), hayMas: false };
     },
   },
   C5: {
@@ -696,6 +739,33 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      * calcular, en `COMPROBAR.C5`, contra las que el modelo tuvo delante.
      */
     estado: (tx) => tx`'disponible'`,
+    /*
+     * Lo que sí deja obsoleto un informe, calculado donde se puede: que las señales que
+     * remedia ya no sean las del grafo. Si alguien las cerró —que es el desenlace bueno— o
+     * editó el grafo por su cuenta, lo que el informe dice ya no describe lo que hay, y quien
+     * lo lee tiene que saberlo antes de aplicarlo.
+     *
+     * Se compara contra el ORIGINAL, no contra el contenido vigente: es el testimonio del
+     * modelo, y para un informe los dos son el mismo mientras no se corrija (C5 no se acepta,
+     * así que nunca se corrige).
+     */
+    /** El nombre de cada nodo, para que una remediación diga a CUÁL aplica. */
+    etiquetasDelContenido: (f) =>
+      Object.fromEntries(
+        journeyDesdeElPanel(f).nodos.map((n) => [n.id, n.etiqueta || '(sin etiqueta)']),
+      ),
+    estadoDeLaFila: (f) => {
+      const contenido = f.contenido_original as ContenidoRemediacionJourney | null;
+      if (!contenido) return null;
+      const ahora = new Set(
+        clavesDeSenales(validarJourney(journeyDesdeElPanel(f))),
+      );
+      const remedia = contenido.remediaciones ?? [];
+      const cambio =
+        remedia.length !== ahora.size ||
+        remedia.some((r) => !ahora.has(`${r.nodoId}\u0000${r.codigo}`));
+      return cambio ? 'journey-cambiado' : null;
+    },
     material: (f) => materialDeJourney({
       nombre: (f.journey_nombre as string | null) ?? '',
       servicio: (f.journey_servicio as string | null) ?? '',
@@ -711,37 +781,52 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      * señalaron las dos revisiones, y las dos tienen razón: la promesa del rótulo y lo que la
      * cola devuelve tienen que ser lo mismo, o el rótulo es una decoración.
      *
-     * El coste es real y por eso está acotado: el SQL hace el prefiltro barato —journeys sin
-     * informe pendiente, por nombre— y solo de ESOS se lee el grafo para validarlo, parando
-     * en cuanto se llenan las `limite` plazas. Se piden con holgura porque una parte se caerá
-     * por venir limpia; el tope duro evita que un workspace con muchos journeys limpios
-     * convierta el selector en un barrido.
+     * El coste es real y por eso está acotado, pero el corte NO puede ser un `limit` fijo: con
+     * uno, un workspace cuyos journeys recientes estén todos limpios devolvía la lista vacía y
+     * el panel decía «no hay journeys con señales abiertas» —con `hayMas` en falso— aunque
+     * hubiera uno más viejo que sí. Se PAGINA el prefiltro hasta llenar las plazas o agotar la
+     * fuente, con un tope de barrido para que un workspace enorme no convierta el selector en
+     * una lectura de todos sus grafos.
+     *
+     * Y cuando el tope se alcanza sin agotar la fuente, la lista se devuelve con una plaza de
+     * más aunque no la haya: es lo que hace que `hayMas` salga cierto, que es la verdad —hay
+     * más journeys sin mirar— y le dice a quien busca que use el buscador. Decir «no hay» sin
+     * haber mirado es la única respuesta que no se puede dar.
      */
     candidatas: async (tx, workspaceId, patron, limite) => {
-      const filas = await tx`
-        select jr.id, jr.nombre || ' · ' || s.nombre as titulo
-        from journey jr
-        join servicio s on s.id = jr.servicio_id and s.workspace_id = jr.workspace_id
-        where jr.workspace_id = ${workspaceId}
-          and not exists (select 1 from propuesta_ai p
-            where p.journey_id = jr.id and p.workspace_id = jr.workspace_id
-              and p.estado = 'propuesta')
-          and (${patron}::text is null or jr.nombre ilike ${patron} or s.nombre ilike ${patron})
-        order by jr.creado_en desc, jr.id asc
-        limit ${limite * FACTOR_DE_HOLGURA_C5}`;
       const conSenales: { id: string; titulo: string }[] = [];
-      for (const j of filas) {
-        if (conSenales.length >= limite) break;
-        const journey = await leerJourneyCompleto(tx, workspaceId, j.id as string);
-        if (!journey) continue;
-        const senales = validarJourney(journey);
-        // Y las que NO caben tampoco se ofrecen: pedir un informe que el contrato no puede
-        // llevar es pagar una llamada cuya respuesta se descarta. `PREPARAR.C5` lo dice con
-        // su motivo; aquí simplemente no se ofrece.
-        if (senales.length === 0 || senales.length > MAX_REMEDIACIONES) continue;
-        conSenales.push({ id: j.id as string, titulo: j.titulo as string });
+      let vistos = 0;
+      let agotado = false;
+      while (conSenales.length < limite && vistos < TOPE_DE_BARRIDO_C5 && !agotado) {
+        const lote = await tx`
+          select jr.id, jr.nombre || ' · ' || s.nombre as titulo
+          from journey jr
+          join servicio s on s.id = jr.servicio_id and s.workspace_id = jr.workspace_id
+          where jr.workspace_id = ${workspaceId}
+            and not exists (select 1 from propuesta_ai p
+              where p.journey_id = jr.id and p.workspace_id = jr.workspace_id
+                and p.estado = 'propuesta')
+            and (${patron}::text is null or jr.nombre ilike ${patron} or s.nombre ilike ${patron})
+          order by jr.creado_en desc, jr.id asc
+          limit ${LOTE_DE_BARRIDO_C5} offset ${vistos}`;
+        agotado = lote.length < LOTE_DE_BARRIDO_C5;
+        vistos += lote.length;
+        for (const j of lote) {
+          if (conSenales.length >= limite) break;
+          const journey = await leerJourneyCompleto(tx, workspaceId, j.id as string);
+          if (!journey) continue;
+          const senales = validarJourney(journey);
+          // Y las que NO caben tampoco se ofrecen: pedir un informe que el contrato no puede
+          // llevar es pagar una llamada cuya respuesta se descarta. `PREPARAR.C5` lo dice con
+          // su motivo; aquí simplemente no se ofrece.
+          if (senales.length === 0 || senales.length > MAX_REMEDIACIONES) continue;
+          conSenales.push({ id: j.id as string, titulo: j.titulo as string });
+        }
       }
-      return conSenales;
+      // Hay más por ofrecer si se llenaron las plazas, o si el barrido se cortó por el tope
+      // sin agotar la fuente. Lo segundo es lo que el `limit` fijo no podía decir: la lista
+      // sale corta y NO es porque no haya, es porque no se ha mirado.
+      return { lista: conSenales, hayMas: conSenales.length >= limite || !agotado };
     },
   },
 };
@@ -850,6 +935,9 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
       presenteLiteral: presencias[i]!,
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
+    // Cómo se llaman los ids que el contenido nombra, cuando su capacidad lo sabe. Vacío es la
+    // respuesta correcta de las que no nombran ninguno, no un hueco.
+    etiquetas: definicionDeFila(f)?.etiquetasDelContenido?.(f) ?? {},
     /*
      * El ancla sale de TODAS las columnas declaradas, no de una pareja escrita aquí. Con
      * `f.item_id ?? f.reto_id`, una capacidad anclada en otra cosa aparecía en el panel con
@@ -863,7 +951,17 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     // cuando ninguna columna declarada trae el ancla, en vez de dejar que la fila caiga en
     // la rama de otra: un motivo prestado es peor que ninguno, porque propone una salida
     // que no existe.
-    anclaEstado: (f.ancla_estado as EstadoAncla | null) ?? 'ancla-ausente',
+    /*
+     * El veredicto de la capacidad va POR DELANTE del CASE cuando lo hay, y no al revés: el
+     * CASE dice lo que el SQL puede juzgar, y `estadoDeLaFila` lo que solo se puede calcular
+     * fuera. Hoy solo C5 lo declara, y su CASE es la constante «disponible», así que el orden
+     * no cambia ninguna respuesta viva — pero lo correcto es que la respuesta más informada
+     * gane, no la que llegó antes.
+     */
+    anclaEstado:
+      CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva]?.estadoDeLaFila?.(f) ??
+      (f.ancla_estado as EstadoAncla | null) ??
+      'ancla-ausente',
     modelo: f.modelo as string,
     promptVersion: f.prompt_version as string,
     origenKey: f.origen_key as OrigenKey,
@@ -1032,11 +1130,13 @@ export async function panelPropuestas(
     // suya perfectamente válida después del G0 se quedaba sin ancla que ofrecer, y sin que
     // faltara ninguna entrada que el compilador echara de menos.
     //
-    // Se pide una fila de más para saber si el corte dejó algo fuera, y el corte se DICE.
+    // Se pide una plaza de más para saber si el corte dejó algo fuera, y el corte se DICE. La
+    // cola puede además decirlo ELLA —C5 lo hace, porque filtra por algo que su `limit` no
+    // sabe—, así que los dos se suman: la de más que sobra, o el aviso de la cola.
     const candidatas = Object.fromEntries(
       await Promise.all(
         CAPACIDADES_ACTIVAS.map(async (k) => {
-          const filas = await CAPACIDAD_EN_EL_PANEL[k].candidatas(
+          const { lista, hayMas } = await CAPACIDAD_EN_EL_PANEL[k].candidatas(
             tx,
             workspaceId,
             patron,
@@ -1044,7 +1144,10 @@ export async function panelPropuestas(
           );
           return [
             k,
-            { lista: filas.slice(0, PAGINA_ANCLAS), hayMas: filas.length > PAGINA_ANCLAS },
+            {
+              lista: lista.slice(0, PAGINA_ANCLAS),
+              hayMas: hayMas || lista.length > PAGINA_ANCLAS,
+            },
           ] as const;
         }),
       ),
@@ -2038,8 +2141,14 @@ const PREPARAR: Record<
        * dos cabe la llamada entera: otro curador edita el journey, la señal que el informe
        * remedia sigue existiendo por casualidad, y el consejo —que nombra nodos que ya no
        * están— se acepta como si fuera de este grafo.
+       *
+       * Y es el GRAFO ENTERO, no solo sus señales. Guardar las claves `(nodoId, codigo)` era
+       * la mitad: renombrar un nodo, cambiar la condición de una transición o rehacer la
+       * topología de alrededor deja las mismas señales y cambia todo lo que el consejo
+       * describe. Lo que hay que fijar es el material, y el material son los nodos, las
+       * aristas y las señales juntos.
        */
-      visto: { senales: clavesDeSenales(grafo.senales) },
+      visto: { grafo: huellaDelGrafo(grafo) },
     };
   },
 };
@@ -2076,8 +2185,9 @@ const COMPROBAR: Record<
   C5: async (tx, entrada, contenidos, visto) => {
     const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
     if (!journey) throw new ErrorAI('El journey dejó de existir mientras se generaba el informe');
-    const ahora = clavesDeSenales(validarJourney(journey));
-    const mostradas = (visto as { senales: string[] } | undefined)?.senales ?? [];
+    const grafoAhora = grafoParaElModelo(journey);
+    const ahora = clavesDeSenales(grafoAhora.senales);
+    const huellaMostrada = (visto as { grafo: string } | undefined)?.grafo ?? '';
 
     /*
      * ── Primero: que el grafo siga siendo EL QUE VIO EL MODELO ──
@@ -2086,12 +2196,14 @@ const COMPROBAR: Record<
      * no retiene una conexión—, así que entre armar el prompt y escribir la fila cabe la
      * edición de otro curador. Comparar solo contra una lectura nueva no bastaba: si la señal
      * que el informe remedia sobrevive al cambio, el consejo se acepta aunque nombre nodos que
-     * ya no existen. Se compara contra las señales que el modelo TUVO DELANTE, que es lo único
-     * que hace de ese informe un informe sobre ESTE grafo.
+     * ya no existen. Se compara contra la HUELLA del grafo que el modelo tuvo delante, que es
+     * lo único que hace de ese informe un informe sobre ESTE grafo — y es el grafo ENTERO y no
+     * sus señales, porque renombrar un nodo o cambiar una transición las deja iguales y cambia
+     * todo lo que el consejo describe.
      *
      * Y se descarta ENTERO, no la parte afectada: media respuesta no es revisable.
      */
-    if (ahora.join('\n') !== mostradas.join('\n')) {
+    if (huellaDelGrafo(grafoAhora) !== huellaMostrada) {
       throw new ErrorAI(
         'El grafo de ese journey cambió mientras se generaba el informe: lo que dice ya no describe el grafo que hay, así que se descarta. Vuelve a pedirlo.',
       );
@@ -2129,6 +2241,20 @@ const COMPROBAR: Record<
     }
   },
 };
+
+/**
+ * La huella del grafo que se le enseña al modelo: nodos, aristas y señales.
+ *
+ * Se calcula sobre `GrafoDelJourney` —la forma que ve el prompt— y no sobre las filas de la
+ * base, porque lo que hay que fijar es el MATERIAL: si dos lecturas producen el mismo
+ * material, el informe sigue describiendo lo que se ve; si producen otro, no.
+ *
+ * No hace falta que sea criptográfica —aquí nadie ataca la huella, solo se compara consigo
+ * misma dentro de una generación—, pero sale gratis y ahorra razonar sobre colisiones.
+ */
+function huellaDelGrafo(grafo: GrafoDelJourney): string {
+  return createHash('sha256').update(JSON.stringify(grafo)).digest('hex');
+}
 
 /** La clave de una señal —su nodo y su código— en orden estable, para poder comparar dos
  * listas por igualdad. El `\u0000` separa porque no puede aparecer en un uuid ni en un

@@ -100,6 +100,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'gate-decidido':
     'Ese gate ya se decidió: este informe describe un estado que ya pasó. Puedes leerlo, pero lo que dice que falta ya no aplica.',
+  'journey-cambiado':
+    'El grafo de ese journey cambió desde que se generó el informe: alguna de las señales que remedia ya no está abierta, o el grafo que describe ya no es el que hay. Puedes leerlo, pero comprueba contra el journey antes de aplicar nada.',
   'checklist-avanzado':
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
@@ -931,7 +933,7 @@ const PRESENTACION_POR_CAPACIDAD: Record<
   CapacidadActiva,
   {
     rotulo: string;
-    ficha: (contenido: ContenidoPropuesta) => ReactNode;
+    ficha: (contenido: ContenidoPropuesta, etiquetas: Record<string, string>) => ReactNode;
     /**
      * Qué se le dice a quien lee un informe que NO materializa nada, y por qué está aquí y no
      * escrito una vez junto al botón que falta.
@@ -966,7 +968,9 @@ const PRESENTACION_POR_CAPACIDAD: Record<
   },
   C5: {
     rotulo: 'Remediación del grafo (no se aplica desde aquí)',
-    ficha: (c) => <FichaRemediacionJourney contenido={c as ContenidoRemediacionJourney} />,
+    ficha: (c, etiquetas) => (
+      <FichaRemediacionJourney contenido={c as ContenidoRemediacionJourney} etiquetas={etiquetas} />
+    ),
     sinAccion:
       'Este informe no cambia el grafo y no se aprueba: se lee y se descarta. Las ' +
       'remediaciones las aplica una persona editando el journey.',
@@ -1156,7 +1160,7 @@ function TarjetaPropuesta({
         Alcance: {propuesta.anclaTitulo}
       </span>
 
-      {presentacion.ficha(propuesta.contenido)}
+      {presentacion.ficha(propuesta.contenido, propuesta.etiquetas)}
 
       {propuesta.citas.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -1435,7 +1439,13 @@ function FichaAsistenteGate({ contenido }: { contenido: ContenidoAsistenteGate }
  * La lista vacía se dice con palabras: un informe sin remediaciones y un informe que no se
  * pintó se ven igual, y son cosas muy distintas.
  */
-function FichaRemediacionJourney({ contenido }: { contenido: ContenidoRemediacionJourney }) {
+function FichaRemediacionJourney({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoRemediacionJourney;
+  etiquetas: Record<string, string>;
+}) {
   return (
     <div
       style={{
@@ -1462,7 +1472,18 @@ function FichaRemediacionJourney({ contenido }: { contenido: ContenidoRemediacio
               borderTop: '1px solid var(--border-faint)',
             }}
           >
-            <Dato rotulo={`Señal ${i + 1}`} valor={r.codigo} />
+            {/*
+              El NODO por delante del código, porque es lo que distingue una tarjeta de otra:
+              un journey trae media docena de `paso-sin-evidencia` sin despeinarse, y con solo
+              el código las remediaciones son indistinguibles — `comoCerrarlo` no está obligado
+              a repetir a cuál aplica. Si el nodo ya no está en el grafo se enseña su id: eso
+              también es información, y de la que hay que ver (el informe habla de algo que se
+              borró).
+            */}
+            <Dato
+              rotulo={`Señal ${i + 1} · ${r.codigo}`}
+              valor={etiquetas[r.nodoId] ?? `nodo ${r.nodoId} (ya no está en el grafo)`}
+            />
             <Dato rotulo="Cómo cerrarla" valor={r.comoCerrarlo} />
           </div>
         ))

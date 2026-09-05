@@ -478,6 +478,7 @@ export const ESTADOS_ANCLA = [
   'reto-no-admite',
   'gate-decidido',
   'checklist-avanzado',
+  'journey-cambiado',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];
@@ -515,6 +516,16 @@ export type PropuestaEnPanel = {
    * original nunca se pierde de vista. */
   contenidoOriginal: ContenidoPropuesta | null;
   citas: CitaConPresencia[];
+  /**
+   * Cómo se llaman los ids que el contenido nombra: `{ id → etiqueta }`.
+   *
+   * El modelo copia ids del material porque es lo único verificable, y la pantalla los recibe
+   * tal cual. Un uuid no le dice nada a quien revisa, y en C5 varias remediaciones pueden
+   * traer el mismo código de señal sobre nodos distintos: sin esto, sus tarjetas son
+   * indistinguibles. Vacío en las capacidades que no nombran ids, que es su respuesta y no un
+   * hueco.
+   */
+  etiquetas: Record<string, string>;
   /** Título del objeto del que se derivó (item de bandeja o reto), para dar contexto. */
   anclaTitulo: string;
   anclaId: string;

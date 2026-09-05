@@ -5972,4 +5972,131 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(despues!.n, 'se abrió una línea en el libro: hubo despacho').toBe(antes!.n);
     });
   });
+
+  /**
+   * El grafo puede cambiar SIN que cambien sus señales, y el informe deja de describirlo.
+   *
+   * La huella cubría solo las claves `(nodoId, codigo)`, y eso es la mitad: renombrar un nodo,
+   * cambiar la condición de una transición o rehacer la topología de alrededor deja las mismas
+   * señales y cambia todo lo que el consejo describe. Quien lee entonces una remediación que
+   * habla de «Verificar identidad» sobre un nodo que ahora se llama otra cosa no tiene manera
+   * de saber que está leyendo sobre un grafo que ya no existe.
+   *
+   * Se renombra un nodo a mitad de la llamada: las señales quedan idénticas —se comprueba— y
+   * el informe se descarta igual.
+   */
+  it('un informe se descarta si el grafo cambió aunque sus señales sean las mismas', async () => {
+    await enWorkspaceLimpio('c5-grafo-renombrado', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      const admin = sqlAdmin();
+
+      proveedor.duranteLlamada = async () => {
+        await admin`update journey_nodo set etiqueta = 'Comprobar quién eres'
+          where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C5',
+                anclaId: j.journeyId,
+              }),
+            ).rejects.toThrow(/cambió mientras se generaba/);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      // Y las señales eran EXACTAMENTE las mismas: sin esto, el caso podría estar pasando por
+      // el mismo camino que el de «las señales se cerraron» y no probaría nada nuevo.
+      expect(await senalesDe(curadorId, wsC, j.journeyId)).toEqual(senales);
+    });
+  });
+
+  /**
+   * Un informe ya escrito se marca OBSOLETO cuando alguien cierra sus señales después.
+   *
+   * `COMPROBAR.C5` solo corre al escribir, y entre escribir y revisar cabe la vida entera del
+   * grafo —incluido el desenlace bueno, que alguien arregle lo que el informe señalaba—. El
+   * estado del ancla de C5 era la constante «disponible», así que la pantalla no avisaba
+   * nunca, mientras CT sí avisa de su equivalente: quien revisa podía aplicar un consejo que
+   * ya no describe el journey.
+   *
+   * No se puede preguntar en SQL —las señales son una función pura del grafo—, así que se
+   * calcula sobre la misma fila que el panel ya trae, sin abrir ninguna consulta más.
+   */
+  it('un informe cuyas señales se cerraron después se marca obsoleto en el panel', async () => {
+    await enWorkspaceLimpio('c5-informe-obsoleto', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+
+      // Recién nacido, el informe describe el grafo que hay.
+      const antes = await panelPropuestas(curadorId, wsC);
+      const informe = antes.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(informe.anclaEstado).toBe('disponible');
+      // Y ya dice a QUÉ nodo aplica cada remediación: sin esto, media docena de tarjetas con
+      // el mismo código de señal son indistinguibles.
+      expect(informe.etiquetas[j.nodos.dos]).toBe('Verificar identidad');
+
+      // Alguien arregla el grafo a mano — que es lo que el informe pedía.
+      const admin = sqlAdmin();
+      await admin`delete from journey_arista where journey_id = ${j.journeyId}`;
+      await admin`delete from journey_nodo where journey_id = ${j.journeyId}`;
+
+      const despues = await panelPropuestas(curadorId, wsC);
+      const obsoleto = despues.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(
+        obsoleto.anclaEstado,
+        'el informe sigue diciéndose al día sobre un grafo que ya no es el suyo',
+      ).toBe('journey-cambiado');
+    });
+  });
+
+  /**
+   * La cola sigue buscando por debajo de los journeys limpios.
+   *
+   * Filtrar por señales fuera del SQL obliga a paginar el prefiltro: con un `limit` fijo, un
+   * workspace cuyos journeys RECIENTES estén todos limpios devolvía la lista vacía y el panel
+   * decía «no hay journeys con señales abiertas» —con el aviso de «hay más» en falso— aunque
+   * hubiera uno más viejo que sí. Decir «no hay» sin haber mirado es la única respuesta que no
+   * se puede dar.
+   *
+   * El orden de la cola es por fecha descendente, así que el journey con señales se crea
+   * PRIMERO y los limpios después: así queda debajo de todos ellos, que es el caso.
+   */
+  it('la cola encuentra un journey con señales por debajo de varios limpios', async () => {
+    await enWorkspaceLimpio('c5-cola-profunda', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const conSenales = await nuevoJourney({ ...ctx, actorId: curadorId });
+      for (let i = 0; i < 3; i++) {
+        await nuevoJourney({ ...ctx, actorId: curadorId }, { limpio: true });
+      }
+      expect((await senalesDe(curadorId, wsC, conSenales.journeyId)).length).toBeGreaterThan(0);
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(
+        panel.candidatas.C5.lista.map((c) => c.id),
+        'la cola se paró en los limpios y no llegó al que sí tiene señales',
+      ).toContain(conSenales.journeyId);
+    });
+  });
 });

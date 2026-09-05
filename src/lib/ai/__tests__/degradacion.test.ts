@@ -484,8 +484,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * «todavía no la usa nadie» es exactamente el que hay que no aceptar, porque es cierto
    * hasta el commit en que deja de serlo.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-05.5';
-  const HUELLA_ANOTADA = '9983af3f727d3c9b4c694fbb317ea8d11b88264c26c5c023d85297e8ec7cf305';
+  const VERSION_ANOTADA = 'ai-2026-09-05.6';
+  const HUELLA_ANOTADA = '3f90d310ad74149d57f0270c13f80e928d9fba2c8cc3d1764f28b073672cf032';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y

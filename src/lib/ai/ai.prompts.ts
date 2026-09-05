@@ -1,5 +1,5 @@
 import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
-import { CAPACIDADES, CAPACIDADES_ACTIVAS } from './ai.schemas';
+import { CAPACIDADES, CAPACIDADES_ACTIVAS, MAX_REMEDIACIONES } from './ai.schemas';
 import type { CapacidadActiva } from './ai.schemas';
 
 /**
@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.5';
+export const PROMPT_VERSION = 'ai-2026-09-05.6';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -634,9 +634,18 @@ const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>>
       },
       remediaciones: {
         type: 'array',
-        // Sin `minItems`: un grafo sin señales no tiene nada que remediar, y pedir una como
-        // mínimo obligaría a inventarse una avería en un grafo limpio.
-        maxItems: 20,
+        /*
+         * Al menos UNA, y el mismo techo que el contrato de Zod.
+         *
+         * Aquí decía «sin minItems: un grafo sin señales no tiene nada que remediar», y era
+         * cierto cuando C5 aceptaba pedir informes sobre grafos limpios. Desde que se niega a
+         * llamar con cero señales, no queda ninguna petición real cuya respuesta correcta sea
+         * la lista vacía — así que dejarla abierta solo significaba aceptar del proveedor algo
+         * que `contenidosValidos` iba a descartar después, con la llamada ya pagada. Los dos
+         * contratos dicen lo mismo, y el de fuera es el que ahorra la llamada.
+         */
+        minItems: 1,
+        maxItems: MAX_REMEDIACIONES,
         items: {
           type: 'object',
           additionalProperties: false,

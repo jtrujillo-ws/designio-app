@@ -11,3 +11,7 @@ coverage/
 
 # Worktrees locales de agentes en paralelo: nunca son parte del repo.
 .claude/worktrees/
+
+# Binarios sueltos de una compilación de una sola vez: `git add -A` los barre.
+a.out
+*.o

@@ -1,0 +1,6873 @@
+import { afterAll, beforeAll, expect, it } from 'vitest';
+import { cerrarPools, sqlAdmin } from '@/lib/db';
+import * as ts from 'typescript';
+import { describeAuthz } from './helpers';
+
+/**
+ * El calendario contra el que se miden las garantías lo fija la BASE, no quien llama.
+ *
+ * `current_date` —y sus hermanos `current_time`, `localtime` y `localtimestamp`— no devuelven
+ * un instante: devuelven el reloj de pared EN EL HUSO DE LA SESIÓN, y ese huso lo pone quien
+ * llama con `SET LOCAL TIME ZONE`. `SECURITY DEFINER` no protege de esto: presta los
+ * privilegios del dueño, no devuelve los parámetros de sesión al valor del servidor. Solo lo
+ * que la función fija en su propio `SET` queda fuera del alcance del llamante.
+ *
+ * `now()` y `current_timestamp` NO están en la lista y es a propósito: devuelven un
+ * `timestamptz`, o sea un instante absoluto. El huso solo cambia cómo se IMPRIMEN, no lo que
+ * valen, así que compararlos es seguro. Lo que no es seguro es colapsarlos a un día.
+ *
+ * ───────────────────────────────────────────────────────────────────────────────────────
+ *
+ * Este fichero tiene DOS mitades, y conviene saber cuál sostiene qué antes de leerlo.
+ *
+ * La primera ACUSA. Es un reconocedor: un catálogo de formas peligrosas —el cast, la
+ * asignación a una variable, el `select … into`, el SQL dinámico, el serializador, el
+ * `format`— que recorre cada expresión guardada del esquema y señala las que lee como
+ * culpables. Sirve, y su virtud es que cuando marca algo DICE POR QUÉ. Pero su modo de fallo
+ * es el peor posible: lo que no sabe leer, pasa en verde. Doce rondas de revisión seguidas
+ * encontraron doce formas más, cada una un parche, y ninguna respondía la única pregunta que
+ * importaba — cuántas quedaban.
+ *
+ * La segunda CERTIFICA, y es la que sostiene la garantía. Le da la vuelta a la obligación:
+ * un instante solo puede volverse dependiente del huso de quien llama encontrándose con un
+ * tipo temporal que no es un instante, así que toda expresión que junte las dos cosas tiene
+ * que estar CERTIFICADA como segura o enrojece. Lo que cuenta como «tipo que no es un
+ * instante» sale del CATÁLOGO —columnas, retornos, parámetros, dominios, built-ins—, no de
+ * una expresión regular de este fichero, así que su alcance crece con el esquema sin que
+ * nadie lo escriba aquí. Su incompletitud cuesta falsos positivos, que se ven y se declaran
+ * a mano con el motivo escrito, en vez de huecos, que no se ven y se quedan.
+ *
+ * Medido sobre cuatro formas que el reconocedor no leía —un dominio en el tipo de vuelta,
+ * una vista actualizable como destino de escritura, un `RETURNING` como entrega final de un
+ * cuerpo SQL, y un `WITH` delante de un `INSERT … VALUES`—: el reconocedor marcó UNA de las
+ * cuatro; la certificación, las cuatro.
+ */
+describeAuthz('el calendario de las garantías lo fija la base', () => {
+  /*
+   * El presupuesto de tiempo, explícito y no por omisión. Estas comprobaciones no son
+   * unitarias: la del catálogo crea ~150 sondas en la base y las lee de vuelta, y la de las
+   * plantillas analiza con el compilador de TypeScript TODO el `src` del repositorio. En local
+   * la más cara tarda 3,3 s; en el runner de CI, que además compila el árbol FUSIONADO —más
+   * ficheros que analizar—, cruzó los 5 s por omisión de vitest y el `Tests` salió rojo con un
+   * `Test timed out in 5000ms`, dos veces de cuatro, justo por encima del borde.
+   *
+   * No es aflojar nada: las aserciones son las mismas y ninguna se salta. Es dejar de medir un
+   * censo del esquema entero con el cronómetro de una función pura, y que crezca sin volver a
+   * enrojecer por el reloj en vez de por lo que vigila.
+   */
+  const PACIENCIA = 120_000;
+
+  afterAll(async () => {
+    await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
+    await sqlAdmin().unsafe('drop table if exists censo_probe_particionada cascade');
+    await sqlAdmin().unsafe('drop table if exists "CensoProbeCitada"');
+    await sqlAdmin().unsafe('drop table if exists censo_probe_dominio cascade');
+    await sqlAdmin().unsafe('drop domain if exists censo_probe_fecha cascade');
+    await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
+    await cerrarPools();
+  }, PACIENCIA);
+
+  /**
+   * Las palabras clave del reloj de pared. Son de la GRAMÁTICA, no funciones, así que no
+   * salen del catálogo y esta lista es a mano — pero es cerrada: la define el estándar SQL y
+   * no crece. `(\s*\(\s*\d+\s*\))?` es por la precisión opcional, que Postgres conserva
+   * al deparsear: `current_timestamp(0)` se guarda tal cual y sin eso quedaba fuera.
+   *
+   * Con `\b` y no `\y`: `\y` es la frontera de palabra de POSIX y en JavaScript no es un
+   * escape, así que la expresión buscaba el literal «ycurrent_datey» y el censo daba verde
+   * sin mirar nada. `_` cuenta como carácter de palabra, así que `current_date_pactada` no
+   * se marca.
+   */
+  const PRECISION = String.raw`(?:\s*\(\s*\d+\s*\))?`;
+  /*
+   * Las cuatro cadenas que Postgres NO trata como dato. `'now'`, `'today'`, `'tomorrow'` y
+   * `'yesterday'` se EVALÚAN contra el reloj de la sesión en cuanto se castean a un tipo
+   * temporal, así que son expresiones escritas entre comillas. Medido en husos opuestos:
+   * `'today'::date` da 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12,
+   * `'now'::timestamp` da la hora de pared de cada uno, y `'yesterday'`/`'tomorrow'` se mueven
+   * con ellas. Las otras especiales —`'epoch'`, `'infinity'`, `'allballs'`— son fijas, medidas
+   * las tres, y no entran.
+   *
+   * Postgres las reconoce sin distinguir mayúsculas y recortando los espacios de los bordes
+   * (medido: `' NOW '::date` y `'NOW'::date` son la misma lectura), así que aquí igual.
+   */
+  const ESPECIAL_TEMPORAL = /^\s*(?:now|today|tomorrow|yesterday)\s*$/i;
+  /**
+   * Lo que un literal con prefijo `E` VALE, no cómo se teclea. `E'\\x6eow'` es la cadena
+   * `now` —medido, igual que `E'\\156ow'` y `E'\\u006eow'`—, así que `E'\\x6eow'::date` es
+   * exactamente `'now'::date`, o sea `current_date` escrito de la tercera manera. Sin
+   * deshacer los escapes, el contenido no casaba con la lista de cadenas que Postgres evalúa,
+   * el vaciado se lo llevaba y la función quedaba limpia.
+   *
+   * Es la misma lección que la plantilla de TypeScript, en el otro dialecto: preguntar por la
+   * ortografía en vez de por el valor.
+   */
+  const SIN_ESCAPES_E = (t: string): string =>
+    t.replace(
+      /\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|([0-7]{1,3})|(.))/g,
+      (_todo, hex?: string, u4?: string, u8?: string, octal?: string, otro?: string) => {
+        const codigo =
+          hex !== undefined
+            ? parseInt(hex, 16)
+            : u4 !== undefined
+              ? parseInt(u4, 16)
+              : u8 !== undefined
+                ? parseInt(u8, 16)
+                : octal !== undefined
+                  ? parseInt(octal, 8)
+                  : null;
+        if (codigo !== null) return String.fromCodePoint(codigo);
+        return { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' }[otro ?? ''] ?? (otro ?? '');
+      },
+    );
+  /*
+   * Y el nombre de un tipo tal como lo ESCRIBE el catálogo, que es la otra mitad de esa misma
+   * lección: `format_type` devuelve `timestamp without time zone`, no `timestamp`, y la
+   * precisión va dentro del nombre. La regla es la misma que ya se mide arriba —un valor de
+   * reloj es independiente del huso si su tipo LLEVA huso— escrita aquí sobre el nombre en vez
+   * de sobre la palabra.
+   */
+  /*
+   * Y el sufijo de ARRAY, que no cambia la pregunta: Postgres coerciona elemento a elemento,
+   * así que lo que decide es el tipo del ELEMENTO. Medido: `returns date[]` con
+   * `return array[now()]` da `{2026-09-05}` en Pacific/Kiritimati y `{2026-09-04}` en
+   * Etc/GMT+12, exactamente igual que su versión escalar. Sin admitirlo, escribir un par de
+   * corchetes en el tipo de vuelta sacaba a la función de esta familia entera.
+   *
+   * Las dimensiones se aceptan todas y los tamaños se ignoran, porque a Postgres tampoco le
+   * importan: `date[3]` y `date[][]` son el mismo tipo que `date[]` (comprobado en el
+   * catálogo, que los imprime los tres como `date[]`).
+   */
+  const SIN_HUSO_DECLARADO =
+    /^\s*(?:date|(?:timestamp|time)(?:\s*\(\s*\d+\s*\))?(?:\s+without\s+time\s+zone)?)(?:\s*\[\s*\d*\s*\])*\s*$/i;
+  const PALABRAS_DEL_RELOJ = [
+    // De más larga a más corta: con `current_time` delante, la alternación la casaba dentro
+    // de `current_timestamp` y el resto quedaba suelto. (Con la frontera derecha puesta ya no
+    // haría falta —`current_time\b` no casa dentro de `current_timestamp`— pero el orden no
+    // estorba y una alternación ordenada se lee sin tener que razonar el caso.)
+    //
+    // Las DOS fronteras van DENTRO de cada palabra. Antes vivían al final de la alternación
+    // entera —`\b(…)\b`— y ahí no se podían reutilizar: `current_timestamp(0)` termina en
+    // `)`, y un `\b` detrás de un paréntesis exige un carácter de palabra que no existe. Así
+    // que la derecha va justo después del NOMBRE y antes de la precisión opcional.
+    //
+    // Y la izquierda tuvo que venirse aquí también. Al reutilizar esta alternación como
+    // operando, `DEL_HUSO_DE_LA_SESION` se quedó con su `\b` de la izquierda y el operando
+    // no: `mi_current_timestamp::date` casaba desde la mitad del identificador. Es el mismo
+    // patrón de siempre —lo que se queda atrás al mover algo— y por eso las fronteras viajan
+    // ahora CON la palabra, no alrededor de quien la usa.
+    'current_timestamp',
+    'current_time',
+    'localtimestamp',
+    'localtime',
+    'current_date',
+  ];
+  /** El patrón de una palabra: sus dos fronteras y su precisión opcional. */
+  const patronDe = (palabra: string) => String.raw`\b${palabra}\b${PRECISION}`;
+  /**
+   * El NOMBRE de una función, entrecomillado o no. `pg_catalog."to_json"(now())`,
+   * `"date_trunc"('day', now())`, `"to_char"(…)`, `"age"(…)`, `"date"(…)`, `"date_part"(…)` y
+   * `"timezone"(…)` son llamadas válidas —medidas las siete contra la base— y un patrón que
+   * exija el paréntesis pegado al nombre DESNUDO no ve ninguna: encuentra antes la comilla.
+   *
+   * La variante ya existía en un sitio, el de las funciones de reloj, y faltaba en los otros
+   * siete. Es el mismo modo de fallo de siempre —un criterio repetido aprende en un sitio y se
+   * queda viejo en los demás—, así que aquí vive UNA vez y la usan todos.
+   *
+   * `extract` y `cast` NO la llevan, y no es un olvido: son palabras clave con sintaxis propia
+   * —`extract(campo from x)`, `cast(x as t)`— y entrecomilladas son errores de sintaxis, las
+   * dos medidas. Añadirles la variante sería cobertura de algo que no existe.
+   *
+   * Las PALABRAS del reloj tampoco: `current_date` es palabra clave, y `"current_date"` ya no
+   * lo es — sería el nombre de una columna, que no lee ningún reloj.
+   */
+  const nombreDeFuncion = (nombres: string) =>
+    String.raw`(?:\b(?:${nombres})|"(?:${nombres})")`;
+
+  /**
+   * Los campos y precisiones seguros NO se escriben: se MIDEN contra la base, comparando el
+   * mismo instante en husos distintos. Tres veces me equivoqué al elegir la muestra:
+   *
+   *  · con UN instante, `month`, `year` y `week` salían independientes porque ese instante no
+   *    cruzaba esas fronteras;
+   *  · con dos husos de desfase ENTERO, `minute` salía independiente — y no lo es: en
+   *    `Asia/Kathmandu` (UTC+05:45) `extract(minute from …)` da 20 donde UTC da 35;
+   *  · con CINCO husos escogidos a mano quedaba la pregunta de siempre, «¿y el que no se me
+   *    ocurrió?». Escoger la muestra era el punto débil, así que ya no se escoge: el barrido
+   *    va sobre TODO `pg_timezone_names` —499 husos en la tzdata de esta máquina, los que
+   *    haya en la del servidor— en un bucle del lado suyo (230 ms). Las listas salen iguales
+   *    que con los cinco escogidos a mano — pero
+   *    ahora eso es un RESULTADO y no una suposición, y si mañana tzdata añade un huso raro
+   *    las listas se recalculan solas sin que nadie tenga que acordarse.
+   *
+   * Los INSTANTES sí siguen escritos, y son todos de hoy o del futuro a propósito: son los
+   * que un RELOJ puede devolver, que es lo único que estos patrones miran. La distinción no
+   * es cosmética. Con un instante de 1900 en la muestra, `second`, `milliseconds` y
+   * `microseconds` se caen de la lista de campos y `minute` de la de precisiones, porque 297
+   * de esos husos tenían entonces desfases de HORA LOCAL MEDIA con segundos sueltos
+   * (`Europe/Amsterdam` iba a UTC+00:19:32). Medirlo con 1900 dentro dejaría la lista de
+   * campos en `epoch` a secas y convertiría `extract(milliseconds from now())` —que es
+   * seguro— en un hallazgo. El caso se comprueba abajo por los dos lados en vez de confiarse.
+   *
+   * Las dos listas NO coinciden, y la diferencia es instructiva: `minute` es seguro para
+   * `date_trunc` —truncar al minuto deja el mismo instante, porque todos los desfases
+   * ALCANZABLES POR UN RELOJ son minutos enteros— y peligroso para `extract`, que lee la
+   * esfera del reloj de pared.
+   */
+  const INSTANTES = [
+    '2026-09-04 06:35:00+00',
+    '2026-09-04 00:10:00+00',
+    '2026-09-30 23:30:00+00',
+    '2026-12-31 23:30:00+00',
+    '2029-12-31 23:30:00+00',
+    '2099-12-31 23:30:00+00',
+    '2000-12-31 23:30:00+00',
+    '2026-01-01 00:30:00+00',
+  ];
+  const CAMPOS = ['epoch', 'microseconds', 'milliseconds', 'second', 'minute', 'hour', 'day',
+    'dow', 'doy', 'week', 'month', 'quarter', 'year', 'isodow', 'isoyear', 'decade', 'century',
+    'millennium', 'timezone', 'timezone_hour', 'timezone_minute', 'julian'];
+  const UNIDADES = ['microseconds', 'milliseconds', 'second', 'minute', 'hour', 'day', 'week',
+    'month', 'quarter', 'year', 'decade', 'century', 'millennium'];
+
+  let CAMPOS_SEGUROS = '';
+  let UNIDADES_SEGURAS = '';
+
+  /** Se rellena en el primer caso: los relojes que el CATÁLOGO declara, para no listarlos. */
+  let RELOJES = '';
+  let RELOJ_COLAPSADO_A_DIA: RegExp[] = [];
+  /** Los dos patrones que LEEN el literal: van contra el texto SIN vaciar. */
+  let RELOJ_LEYENDO_LITERAL: RegExp[] = [];
+  let DEL_HUSO_DE_LA_SESION: RegExp;
+  /*
+   * Y los dos que NO se pueden decidir mirando la expresión, porque lo decisivo está FUERA de
+   * ella: el TIPO del destino. Van aparte por eso, y no porque sean otra clase de reloj.
+   */
+  let RELOJ_ENTREGADO: (texto: string) => boolean = () => false;
+  let RELOJ_ASIGNADO_A_VARIABLE: (texto: string, conLiterales: string) => boolean =
+    () => false;
+  /*
+   * Y el TERCER destino tipado, que es el que faltaba: la COLUMNA en la que se escribe.
+   * `insert into t(d) values (now())` con `t.d date` guarda 2026-09-05 en Pacific/Kiritimati
+   * y 2026-09-04 en Etc/GMT+12 —medido—, la función puede devolver `void`, no hay ninguna
+   * variable declarada y en el texto solo hay un `now()` desnudo. Los otros dos destinos
+   * —el tipo de vuelta y el de una variable— ya se miraban; éste no, y en este esquema hay
+   * DIEZ columnas temporales sin huso donde cabía.
+   *
+   * El tipo se saca del catálogo, como todo lo demás aquí: nada de listas a mano.
+   */
+  let RELOJ_ESCRITO_EN_COLUMNA: (texto: string) => boolean = () => false;
+  /** El reloj entregado por `USING` a un marcador que el SQL dinámico colapsa a un día. */
+  let RELOJ_EN_PARAMETRO_DINAMICO: (texto: string) => boolean = () => false;
+  /*
+   * Y el reloj PROYECTADO a las columnas de un `RETURNS TABLE` desde un cuerpo SQL. Aquí el
+   * tipo sí está escrito —en la propia firma— pero no llega por ninguna de las vías que ya se
+   * miran: `prorettype` dice `record`, y un cuerpo SQL no tiene asignaciones que buscar, así
+   * que el reconocedor de las columnas como variables no encuentra nada. Medido:
+   * `returns table(d date, n int) language sql as $$ select now(), 1 $$` devuelve 2026-09-05
+   * en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+   */
+  let RELOJ_PROYECTADO_A_TABLA: (texto: string) => boolean = () => false;
+  /*
+   * Y la COMPARACIÓN implícita: `vence_en > current_timestamp` con `vence_en date` promociona
+   * la fecha a `timestamptz` por la medianoche del huso de la SESIÓN, así que quien llama
+   * decide el resultado. Medido, y no de canto: la misma fila da `f` en Pacific/Kiritimati y
+   * `t` en Etc/GMT+12 — la comparación se da la vuelta entera.
+   *
+   * Va aparte de la comparación con un literal tipado o un cast, que ya se miraban, porque
+   * aquí el tipo no está escrito en ningún sitio de la expresión: está en el catálogo.
+   */
+  let RELOJ_COMPARADO_CON_COLUMNA: (texto: string) => boolean = () => false;
+  /** Nombres de columna que son sin huso en una tabla y CON huso en otra. Debe estar vacío. */
+  let COLUMNAS_AMBIGUAS: string[] = [];
+
+  beforeAll(async () => {
+    /*
+     * Una tabla SONDA para el destino tipado de una escritura, con las dos columnas que
+     * separan el caso: una sin huso y otra con él. Se crea a propósito y no se usa una tabla
+     * real, por lo mismo que las sondas de matview y de regla: el esquema está limpio, así
+     * que sin una tabla fabricada el reconocedor de escrituras no tendría ni un solo culpable
+     * y podría romperse sin que nada enrojeciera.
+     *
+     * Va aquí y no en el bloque de sondas de más abajo porque el tipo de sus columnas se lee
+     * del catálogo tres líneas después: si naciera más tarde, no estaría en el mapa.
+     */
+    await sqlAdmin().unsafe('drop table if exists censo_probe_escritura');
+    await sqlAdmin().unsafe(
+      /*
+       * `censo_fecha` existe para la comparación implícita, que necesita un nombre de columna
+       * SIN HUSO y sin ambigüedad: `d` es ambigua a propósito —significa `date` aquí y
+       * `timestamptz` en la otra tabla— y por eso queda fuera del conjunto que resuelve por
+       * nombre, que es justo lo que la haría inservible como sonda. Va la ÚLTIMA para no mover
+       * las posiciones que empareja el `insert` sin lista de columnas.
+       */
+      'create table censo_probe_escritura (k int primary key, d date, ts timestamptz,' +
+        ' censo_fecha date)',
+    );
+    /*
+     * Y una SEGUNDA tabla con una columna que se llama igual y tiene otro tipo. Existe para
+     * una sola sonda, la que comprueba que la culpa no se atribuye a la tabla equivocada: sin
+     * dos tablas donde el mismo nombre de columna signifique cosas distintas, ese caso no se
+     * puede escribir.
+     */
+    /*
+     * Y una PARTICIONADA, que no es `relkind = 'r'` y por eso no entraba en el inventario. El
+     * cuerpo guardado escribe contra el nombre del PADRE, no contra la partición, así que sin
+     * ella el tipo de `censo_probe_particionada.d` no existe y la coerción no se ve.
+     */
+    await sqlAdmin().unsafe('drop table if exists censo_probe_particionada cascade');
+    await sqlAdmin().unsafe(
+      'create table censo_probe_particionada (k int, d date) partition by range (k)',
+    );
+    await sqlAdmin().unsafe(
+      'create table censo_probe_particionada_p0 partition of censo_probe_particionada' +
+        ' for values from (0) to (1000)',
+    );
+    /*
+     * Y una con el nombre y la columna CITADOS en mayúsculas, que es donde se ve si la
+     * canonicalización se aplica a los dos lados: el catálogo la entrega como `T`/`D`, y un
+     * cuerpo que escriba `insert into "T"("D") …` busca exactamente eso.
+     */
+    await sqlAdmin().unsafe('drop table if exists "CensoProbeCitada"');
+    await sqlAdmin().unsafe(
+      'create table "CensoProbeCitada" ("K" int primary key, "FechaCitada" date)',
+    );
+    /*
+     * Y una columna cuyo tipo es un DOMINIO sobre `date`: coerciona igual que el `date`, pero
+     * `format_type` sobre el atributo imprime el nombre del dominio.
+     */
+    await sqlAdmin().unsafe('drop table if exists censo_probe_dominio cascade');
+    await sqlAdmin().unsafe('drop domain if exists censo_probe_fecha cascade');
+    await sqlAdmin().unsafe('create domain censo_probe_fecha as date');
+    await sqlAdmin().unsafe(
+      'create table censo_probe_dominio (k int primary key, fecha_dom censo_probe_fecha)',
+    );
+    await sqlAdmin().unsafe('drop table if exists censo_probe_otra');
+    await sqlAdmin().unsafe(
+      'create table censo_probe_otra (k int primary key, d timestamptz)',
+    );
+    /*
+     * Los relojes que son FUNCIONES se derivan del catálogo en vez de escribirlos: cualquier
+     * función de `pg_catalog` sin argumentos que devuelva un tipo de tiempo y no sea inmutable
+     * lee el reloj. Así salen `now`, `clock_timestamp`, `statement_timestamp` y
+     * `transaction_timestamp` —el que faltaba— sin que nadie tenga que acordarse, y también
+     * las de información del servidor, cuyo día colapsado depende del huso igual.
+     */
+    const filas = await sqlAdmin()`
+      select p.proname as nombre
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'pg_catalog' and p.pronargs = 0 and p.provolatile in ('s', 'v')
+        and (format_type(p.prorettype, null) in ('timestamp with time zone',
+              'timestamp without time zone', 'date', 'time with time zone',
+              'time without time zone')
+          -- timeofday() es un reloj que devuelve TEXTO, así que el filtro por tipo no lo
+          -- alcanza: timeofday()::timestamptz::date elige día igual. Va por nombre porque
+          -- filtrar por text arrastraría media biblioteca. (Sin comillas invertidas: esto
+          -- vive dentro de una template literal y las terminaría.)
+          or p.proname = 'timeofday')
+      order by 1`;
+    /*
+     * Y el nombre puede ir ENTRECOMILLADO: `pg_catalog."now"()` es la misma función y elige
+     * día igual —medido: 2026-09-05 en Kiritimati y 2026-09-03 en Etc/GMT+12—, pero con la
+     * frontera de palabra sola no casaba, porque entre el nombre y el `(` va una comilla.
+     *
+     * Las PALABRAS del reloj no llevan esta variante y es a propósito: `current_date` es una
+     * palabra clave, y `"current_date"` entrecomillado ya no lo es — sería el nombre de una
+     * columna, que no lee ningún reloj.
+     */
+    const funciones = filas.map(
+      (f) => String.raw`${nombreDeFuncion(f.nombre as string)}\s*\(\s*\)`,
+    );
+    expect(funciones.length).toBeGreaterThanOrEqual(5);
+
+    /*
+     * Y las dos listas seguras, MEDIDAS sobre TODOS los husos que el servidor conoce.
+     *
+     * El bucle va del lado del servidor, en un bloque `DO`, y no en TypeScript. No es por
+     * velocidad: es porque `set_config(…, true)` DENTRO de una consulta no se aplica por
+     * fila —el orden de evaluación no está definido— y mi primer intento midió mal por eso
+     * («epoch» salía inestable). En plpgsql cada sentencia ve el huso que fijó la anterior,
+     * que es la única forma honesta de barrer 499 husos en una ida y vuelta.
+     *
+     * El valor se compara como NÚMERO ABSOLUTO, no como texto. `date_trunc` devuelve
+     * `timestamptz` y su representación textual lleva el desfase: mi primer intento comparaba
+     * `…::text` y daba `second` y `milliseconds` como inestables porque «06:35:00+00» y
+     * «12:20:00+05:45» son cadenas distintas… del mismo instante. Comparar la impresión en
+     * vez del valor es el mismo error que este censo existe para cazar, cometido al medirlo.
+     *
+     * La reducción también va en el servidor: 140.000 mediciones no tienen por qué cruzar el
+     * cable para acabar en dos listas de una línea.
+     */
+    const [campos, unidades] = await sqlAdmin().begin(async (tx) => {
+      await tx`create temp table censo_entrada(clase text, nombre text) on commit drop`;
+      await tx`create temp table censo_instante(t timestamptz) on commit drop`;
+      await tx`create temp table censo_medicion(clase text, nombre text, t timestamptz, v text)
+               on commit drop`;
+      await tx`insert into censo_entrada select 'campo', unnest(${CAMPOS}::text[])`;
+      await tx`insert into censo_entrada select 'unidad', unnest(${UNIDADES}::text[])`;
+      await tx`insert into censo_instante select unnest(${INSTANTES}::timestamptz[])`;
+      await tx`do $medir$
+        declare z text;
+        begin
+          for z in select name from pg_timezone_names loop
+            perform set_config('TimeZone', z, true);
+            insert into censo_medicion
+              select e.clase, e.nombre, i.t,
+                     case e.clase
+                       when 'campo' then date_part(e.nombre, i.t)::text
+                       else extract(epoch from date_trunc(e.nombre, i.t))::text
+                     end
+              from censo_entrada e, censo_instante i;
+          end loop;
+          perform set_config('TimeZone', 'UTC', true);
+        end $medir$`;
+      // Estable = para cada instante, un único valor en los 499 husos.
+      const estables = await tx`
+        select clase, nombre from censo_medicion
+        group by clase, nombre
+        having count(distinct t::text || '|' || v) = count(distinct t)
+        order by clase, nombre`;
+      const de = (clase: string) =>
+        estables.filter((f) => f.clase === clase).map((f) => f.nombre as string);
+      return [de('campo'), de('unidad')];
+    });
+    /*
+     * Que la medición esté midiendo: `epoch` es un instante absoluto y tiene que salir seguro,
+     * y `day` depende del huso por definición y no puede salir.
+     */
+    expect(campos).toContain('epoch');
+    expect(campos).not.toContain('day');
+    expect(unidades).not.toContain('day');
+    /*
+     * Y la premisa que sostiene a `second`, `milliseconds`, `microseconds` y al `minute` de
+     * `date_trunc`: en los instantes que un RELOJ puede devolver, ningún huso del servidor
+     * tiene un desfase con segundos sueltos. Se comprueba por los dos lados, porque un
+     * guardián que nunca ve un culpable no está probado: en 1900 sí los hay, en la era de la
+     * hora local media, y la misma consulta los encuentra.
+     *
+     * (Postgres 16 no ofrece otra vía: `set time zone interval '00:00:30' hour to second` la
+     * rechaza con «time zone interval must be HOUR or HOUR TO MINUTE», y un huso POSIX con
+     * segundos lo rechaza como segundos intercalares. Comprobado, no supuesto.)
+     */
+    const [desfases] = await sqlAdmin()`
+      select
+        count(*) filter (where
+          extract(second from (i.t at time zone z.name) - (i.t at time zone 'UTC')) <> 0
+        ) as con_segundos,
+        count(*) filter (where
+          extract(second from (h.t at time zone z.name) - (h.t at time zone 'UTC')) <> 0
+        ) as con_segundos_en_1900
+      from pg_timezone_names z,
+        unnest(${INSTANTES}::timestamptz[]) i(t),
+        (select timestamptz '1900-01-01 12:00:00+00') h(t)`;
+    expect(Number(desfases!.con_segundos)).toBe(0);
+    expect(Number(desfases!.con_segundos_en_1900)).toBeGreaterThan(0);
+    CAMPOS_SEGUROS = campos.join('|');
+    UNIDADES_SEGURAS = unidades.join('|');
+
+    /*
+     * Cuáles de esas palabras son peligrosas POR SÍ SOLAS, sin colapsar nada. No se decide a
+     * mano: se deriva del TIPO que devuelven, preguntándoselo a la base.
+     *
+     * La regla —medida, no supuesta— es que un valor de reloj es independiente del huso si su
+     * tipo LLEVA huso. Con un instante fijo y dos husos opuestos:
+     *
+     *   current_timestamp  timestamp with time zone     igualdad → true    estable
+     *   current_time       time with time zone          igualdad → true    estable
+     *   localtimestamp     timestamp without time zone  20:35 vs 18:35     DEPENDE
+     *   localtime          time without time zone       20:35 vs 18:35     DEPENDE
+     *   current_date       date                         09-04 vs 09-03     DEPENDE
+     *
+     * La cabecera de este fichero ya decía que `current_timestamp` es un instante absoluto y
+     * no debía marcarse, y sin embargo `DEL_HUSO_DE_LA_SESION` se construía con la lista
+     * ENTERA y lo marcaba: el contrato escrito y el código decían cosas distintas. Ahora lo
+     * dice una sola vez, y lo dice la base.
+     */
+    expect(PALABRAS_DEL_RELOJ.every((w) => /^[a-z_]+$/.test(w))).toBe(true);
+    const tipos = await sqlAdmin().unsafe(
+      PALABRAS_DEL_RELOJ.map(
+        (w) => `select '${w}' as palabra, pg_typeof(${w})::text as tipo`,
+      ).join(' union all '),
+    );
+    const yaLeenLaPared = tipos
+      .filter((f) => !(f.tipo as string).endsWith('with time zone'))
+      .map((f) => f.palabra as string);
+    // Que la derivación esté derivando: `current_date` es una fecha y tiene que salir; el
+    // `timestamptz` de `current_timestamp` es un instante absoluto y no puede.
+    expect(yaLeenLaPared).toContain('current_date');
+    expect(yaLeenLaPared).not.toContain('current_timestamp');
+    // Sin `\b` alrededor: cada palabra trae ya las suyas, y ponerlas dos veces esconde de
+    // quién son. Comprobado que sigue distinguiendo `current_date` de `current_date_pactada`
+    // y de `mi_current_timestamp`, y que sigue viendo `localtimestamp(3)`.
+    DEL_HUSO_DE_LA_SESION = new RegExp(
+      String.raw`(?:${yaLeenLaPared.map(patronDe).join('|')})`,
+      'i',
+    );
+
+    /*
+     * Un reloj rara vez llega DESNUDO a la operación que elige el calendario: se le pone un
+     * cast por el camino, o Postgres se lo envuelve en paréntesis al deparsear. Los patrones
+     * exigían el reloj a secas, y eso NO eran tres agujeros sueltos sino UNA causa con ocho:
+     * `now()::timestamp::date`, `date_trunc('day', timeofday()::timestamptz)` y su forma
+     * deparseada, `date_trunc('day', now()::timestamp)`, `cast(now()::timestamp as date)`,
+     * `date(now()::timestamp)`, `to_char(now()::timestamp, …)` y
+     * `extract(day from (now())::timestamp)` se escapaban todas. Medido — y medido también
+     * que las ocho eligen día distinto en husos opuestos, que es lo que las hace hallazgos:
+     * `now()::timestamp` da día 4 en `Pacific/Kiritimati` y día 3 en `Etc/GMT+12`.
+     *
+     * Así que el reloj como OPERANDO se define UNA vez y se usa en todos: el reloj, con o sin
+     * paréntesis propios, seguido de cualquier cadena de castos a un tipo de tiempo, y todo
+     * ello envolvible otra vez —que es exactamente como sale del deparseador:
+     * `((timeofday())::timestamp with time zone)`.
+     *
+     * El arreglo tiene DOS mitades y las dos cargan peso, comprobado neutralizando cada una
+     * por separado: sin el operando se escapan ocho formas —entre ellas las dos del reloj de
+     * texto, que es la prueba de que fundir tres patrones en uno no perdió nada—; sin el
+     * destino ampliado de aquí abajo se escapan `now()::timestamp` y su deparseo. Ninguna de
+     * las dos enrojece nada que no sea suyo.
+     */
+    const TIPO_DE_TIEMPO = [
+      String.raw`timestamptz\b${PRECISION}`,
+      String.raw`timestamp\b${PRECISION}(?:\s+with(?:out)?\s+time\s+zone\b)?`,
+      // `timetz` conserva el instante —medido: dos husos opuestos dan valores IGUALES— así
+      // que no es un destino que elija calendario. Pero es un paso por el que el reloj puede
+      // ATRAVESAR hacia uno que sí: `(now()::time with time zone)::time` tira el desfase y se
+      // queda la esfera local, 20:35 en Kiritimati y 18:35 en Etc/GMT+12. Excluirlo del
+      // destino y no admitirlo como paso dejaba la expresión entera fuera del censo.
+      String.raw`timetz\b${PRECISION}`,
+      String.raw`time\b${PRECISION}\s+with\s+time\s+zone\b`,
+    ].join('|');
+    /*
+     * Un nombre de tipo puede ir CALIFICADO con su esquema: `now()::pg_catalog.date` elige día
+     * igual —medido: distinto en Kiritimati y en Etc/GMT+12— y se escapaba porque los tipos se
+     * escribían sin admitir el punto. Va en un solo sitio y lo usan TODOS los sitios donde se
+     * consume un nombre de tipo, que es la lección de esta ronda.
+     */
+    // Y el esquema, entrecomillado o no: `now()::"pg_catalog".date` es el mismo cast
+    // (medido). Un identificador entre comillas dobles es un NOMBRE, no un dato.
+    const ESQUEMA = String.raw`(?:(?:\w+|"\w+")\s*\.\s*)?`;
+    /*
+     * El destino de los CASTS incluye además el TEXTO. Serializar un reloj es elegir día igual
+     * que `to_char`: medido, `now()::text` da «2026-09-05 00:08…+14» y «2026-09-03 22:08…-12»,
+     * y una regla escrita sobre `substring(now()::text, 1, 10)` decide con el huso de quien
+     * llama. Va aparte de `TIPO_SIN_HUSO` a propósito: en una COMPARACIÓN mixta el texto no
+     * es el caso —ahí lo que importa es la promoción de un temporal sin huso— así que el
+     * operando de aquellas sigue siendo el otro.
+     */
+    /*
+     * Los nombres COMPLETOS: `character varying` y `character` son como se escribe en SQL
+     * estándar y como Postgres deparsea `varchar`. De más largo a más corto, que si no
+     * `character` casa dentro de `character varying` y deja el resto suelto.
+     *
+     * Y el texto tiene una salida: si el cast a texto es solo un PASO y se vuelve a un tipo
+     * CON huso, la ida y vuelta recupera el mismo instante —medido: `now()::text::timestamptz`
+     * es estable, porque la representación lleva el desfase—. Marcar eso sería un falso
+     * positivo sobre una serialización correcta. Volver a un tipo SIN huso sigue eligiendo
+     * calendario (`now()::text::date` depende, medido), y ese lo caza el destino de siempre.
+     */
+    // `character` lleva su propia guardia contra `varying`: el ORDEN de las alternativas no
+    // basta, porque el motor RETROCEDE. Con `character varying::timestamptz`, la alternativa
+    // larga la rechaza el lookahead de la vuelta, y entonces el motor prueba la corta —hay
+    // frontera de palabra antes del espacio— que ya no ve el cast de vuelta y la marca.
+    const TIPO_TEXTUAL = String.raw`(?:"(?:text|varchar|bpchar)"${PRECISION}|character\s+varying\b${PRECISION}|character\b(?!\s+varying)${PRECISION}|varchar\b${PRECISION}|bpchar\b${PRECISION}|text\b)`;
+    // Con un `)` opcional en medio: Postgres deparsea `now()::text::timestamptz` como
+    // `((now())::text)::timestamp with time zone`, o sea que el cast de vuelta NO va pegado al
+    // nombre del tipo sino detrás del paréntesis que cierra. Sin admitirlo, la forma del
+    // CATÁLOGO —la única que las sondas pueden ejercitar— salía marcada igual.
+    // Entrecomillados también, por lo mismo — y aquí el efecto es el CONTRARIO: sin ellos,
+    // `now()::text::"timestamptz"` salía marcada siendo una ida y vuelta que recupera el
+    // instante (medido por epoch: idéntico en Kiritimati y en Etc/GMT+12). Un falso positivo
+    // sobre código correcto.
+    const TIPO_CON_HUSO = String.raw`(?:"(?:timestamptz|timetz)"|timestamptz\b|timetz\b|(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)`;
+    /*
+     * Y la IDA Y VUELTA por texto es un PASO de la cadena, no un final. `now()::text::timestamptz`
+     * recupera el mismo instante —medido por epoch: 1788537725 en Kiritimati y en Etc/GMT+12— y por
+     * eso el destino de más abajo no la marca. Pero seguir siendo el mismo instante es exactamente
+     * lo que la hace un RELOJ, y el reloj se paraba ante el paso por texto: la cadena de castos solo
+     * admitía tipos de tiempo, así que `date_trunc('day', now()::text::timestamptz)` se escapaba
+     * entera —medido: `2026-09-05 00:00:00+14` en Kiritimati y `2026-09-04 00:00:00-12` en
+     * Etc/GMT+12—, y con ella `to_char(now()::text::timestamptz, 'YYYY-MM-DD')` (2026-09-05 contra
+     * 2026-09-04) y `concat(now()::text::timestamptz)`, que renderiza el instante con el huso de
+     * quien llama. No era un agujero de `date_trunc`: era el reloj que no atravesaba, y por eso el
+     * arreglo va donde se define el reloj y no en el patrón que lo consume.
+     *
+     * La vuelta va como ASERCIÓN, sin consumirse: el paso por texto cuenta como reloj SOLO si detrás
+     * vuelve un tipo con huso, porque es la vuelta —y no el paso— lo que conserva el instante. El
+     * `)` opcional en medio es el del deparseador: `((now())::text)::timestamp with time zone`.
+     *
+     * Dicho con la misma honestidad que la precisión de más abajo: la ASERCIÓN no mueve ninguna
+     * sonda. Vaciándola no enrojece nada, y buscando el falso positivo que la justificara no lo hay,
+     * porque `now()::text` a secas NO es seguro en ningún caso de este censo —ya lo caza el destino,
+     * con vuelta o sin ella—. Se queda porque dice la verdad de por qué esto es un reloj: si el
+     * criterio se relaja a «cualquier paso por texto», la próxima regla que se escriba sobre `RELOJ`
+     * heredará una definición falsa y nadie sabrá por qué. Medido, no supuesto.
+     */
+    const VUELVE_CON_HUSO = String.raw`(?=(?:\s*\))*\s*::\s*${ESQUEMA}(?:${TIPO_CON_HUSO}))`;
+    const CASTOS = String.raw`(?:\s*::\s*${ESQUEMA}(?:${TIPO_DE_TIEMPO}|(?:${TIPO_TEXTUAL})${VUELVE_CON_HUSO}))*`;
+    const entreParentesis = (x: string) => String.raw`(?:${x}|\(\s*(?:${x})\s*\))`;
+    /*
+     * Y la ARITMÉTICA, porque una garantía ajusta el instante antes de colapsarlo:
+     * `(now() + interval '1 day')::date` sigue eligiendo día con el huso de la sesión —medido:
+     * 09-06 en Kiritimati y 09-04 en Etc/GMT+12— y el operando se paraba ante el `+`.
+     * Postgres la deparsea como `((now() + '1 day'::interval))::date`, con el intervalo
+     * casteado y un paréntesis de más, así que hacen falta las dos formas del intervalo y un
+     * nivel más de envoltura.
+     */
+    /*
+     * El operando del ajuste no es solo un literal de intervalo: `make_interval(days => 1)` y
+     * `interval '1 day' * 2` eligen día igual (medido) y el reconocedor se paraba ante ellos.
+     * Se admite una llamada a función, un literal, un número o un identificador, con
+     * multiplicaciones detrás.
+     *
+     * LÍMITE DECLARADO: una llamada con paréntesis ANIDADOS —`make_interval(days => f(1))`—
+     * no la cubre, porque contar paréntesis no es cosa de una expresión regular. Queda dicho
+     * aquí en vez de descubrirse.
+     */
+    /*
+     * La gramática de un LITERAL de SQL, en un solo sitio. Había cuatro reconocedores de «lo
+     * seguro» —la unidad, el campo de `extract`, el formato de `to_char` y el huso fijo— y
+     * cada uno aprendía por su cuenta: solo el del campo sabía de prefijos, así que
+     * `date_trunc(E'second', …)`, `to_char(now(), 'US'::text)` y `date_trunc(…, E'UTC')`
+     * —los tres estables, medidos por epoch— salían marcados.
+     *
+     * Es la misma lección que el predicado de las transacciones en el otro censo: si el
+     * criterio vive en cuatro sitios, aprende en uno y se queda viejo en tres.
+     *
+     * El prefijo se admite y NO relaja nada: el contenido tiene que seguir siendo el nombre
+     * seguro tal cual, así que un `E'seco\x6ed'` —que vale «second»— no se declara seguro y
+     * se marca. De más, no de menos.
+     */
+    const PREFIJO = String.raw`[A-Za-z_]*&?`;
+    const CASTO = String.raw`(?:\s*::\s*[\w. ]+)?`;
+    const literalDe = (contenido: string) => String.raw`${PREFIJO}'(?:${contenido})'${CASTO}`;
+    const envuelto = (x: string) => String.raw`(?:\(\s*)?(?:${x})(?:\s*\))?`;
+    /*
+     * Y AQUÍ se cierra la lista de relojes, y no arriba con las palabras, porque falta uno que
+     * necesita saber qué tipos llevan huso: el reloj escrito como LITERAL.
+     *
+     * `'now'::timestamptz` es el mismo instante que `now()` —medido por epoch: 1788538089 en
+     * Pacific/Kiritimati y en Etc/GMT+12—, o sea que no es un hallazgo por sí solo pero es un
+     * RELOJ, y todo lo que este censo prohíbe hacerle a `now()` estaba permitido escribiéndolo
+     * así. Metido en la lista, lo heredan de golpe el destino, `date_trunc`, `to_char`, la
+     * comparación mixta, los serializadores y el `||`, que es lo que se gana definiendo el
+     * reloj en un sitio.
+     *
+     * Va con el tipo EXIGIDO, en las dos sintaxis, y esa es la diferencia entre esto y marcar
+     * la palabra: `'now'` a secas es un dato como cualquier otro —`concat('now')` devuelve la
+     * cadena, y `jsonb_build_object('now', x)` es una clave— y marcarla sería el falso positivo
+     * que acaba con el censo desactivado. Solo cuenta cuando lleva encima un tipo temporal, que
+     * es exactamente cuando Postgres la evalúa.
+     */
+    const AHORA_LITERAL = String.raw`${PREFIJO}'\s*now\s*'`;
+    /*
+     * Y sus tres hermanas, que no son relojes sino el calendario YA leído: `'today'`,
+     * `'tomorrow'` y `'yesterday'` no conservan el instante ni siquiera con huso —medido:
+     * `'today'::timestamptz` da epoch 1788516000 en Pacific/Kiritimati y 1788523200 en
+     * Etc/GMT+12, dos instantes distintos—, así que con CUALQUIER tipo temporal encima son un
+     * hallazgo, y por eso van aparte y no en la lista de relojes.
+     */
+    const DIA_LITERAL = String.raw`${PREFIJO}'\s*(?:today|tomorrow|yesterday)\s*'`;
+    RELOJES = [
+      // Las funciones llevan su frontera IZQUIERDA —sin ella, `mi_now()` salía marcado— o la
+      // comilla de apertura, que separa igual. A la derecha no hace falta, porque el `(` cierra.
+      ...funciones,
+      // Y TODAS las palabras: colapsar cualquiera de ellas a un día es peligroso, aunque la
+      // palabra desnuda no lo sea.
+      ...PALABRAS_DEL_RELOJ.map(patronDe),
+      // El literal con su tipo detrás y con su tipo delante: `'now'::timestamptz` y
+      // `timestamptz 'now'` (medidas las dos, mismo epoch en husos opuestos).
+      String.raw`${AHORA_LITERAL}\s*::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})`,
+      String.raw`(?<![\w.])${ESQUEMA}(?:${TIPO_CON_HUSO})\s*${AHORA_LITERAL}`,
+    ].join('|');
+
+    // Un grupo entre paréntesis con UN nivel de anidamiento dentro, porque así llega del
+    // deparseador: `interval '1 day' * 2` se guarda como
+    // `('1 day'::interval * (2)::double precision)`, con el número casteado dentro de su
+    // propio paréntesis. Escribiendo solo la forma fuente, la del catálogo se escapaba.
+    const GRUPO = String.raw`\([^()]*(?:\([^()]*\)[^()]*)*\)`;
+    /*
+     * El operando NO puede ser otro reloj: `(now() - now())::text` es la diferencia de dos
+     * instantes —el intervalo cero, estable entre husos, medido— y entraba como «reloj
+     * ajustado y serializado». Restar un reloj de otro da un intervalo, no una lectura del
+     * calendario, así que se excluye explícitamente.
+     *
+     * Y el multiplicador admite un grupo entre paréntesis: `interval '1 day' * (2)` es
+     * TypeScript y SQL válidos y dependía del huso igual (medido).
+     */
+    /*
+     * Y el reloj excluido no es solo `now()`: entre PARENTESIS es el mismo reloj. Con
+     * `(now() - (now()))::text` el lookahead solo veía el `(` de apertura, no reconocía un
+     * reloj, y la alternativa del GRUPO se tragaba el operando entero: la resta —que sigue
+     * siendo el intervalo cero, medido `00:00:00` en Kiritimati y en Etc/GMT+12— salía
+     * MARCADA. Un falso positivo sobre una plantilla correcta, que es lo que acaba con el
+     * censo desactivado.
+     *
+     * Se excluye el reloj con su envoltura y sus casts: `now()`, `(now())`, `((now()))`,
+     * `now()::timestamptz` y `(now()::timestamptz)`.
+     *
+     * LÍMITE DECLARADO: un reloj YA AJUSTADO dentro del paréntesis —`(now() - (now() +
+     * interval '1 day'))::text`— sigue saliendo marcado. También es un intervalo y también es
+     * un falso positivo; cubrirlo pide que el operando se defina en términos de sí mismo, que
+     * no es cosa de una expresión regular. Queda dicho aquí en vez de descubrirse.
+     */
+    const RELOJ_COMO_OPERANDO = entreParentesis(entreParentesis(RELOJES) + CASTOS);
+    const OPERANDO_ARITMETICO = String.raw`(?!\s*(?:${RELOJ_COMO_OPERANDO}))(?:interval\s*'[^']*'|${PREFIJO}'[^']*'\s*::\s*${ESQUEMA}interval\b|\w+\s*${GRUPO}|${GRUPO}|[\w.]+)(?:\s*[*/]\s*(?:${GRUPO}|[\w.]+)${CASTO})*`;
+    const ARITMETICA = String.raw`(?:\s*[-+]\s*${OPERANDO_ARITMETICO})*`;
+    const NUCLEO = entreParentesis(RELOJES) + CASTOS + ARITMETICA;
+    const RELOJ = entreParentesis(entreParentesis(NUCLEO)) + CASTOS;
+
+    /*
+     * Y el DESTINO que elige calendario: un tipo SIN huso. `timestamptz` no entra porque
+     * conserva el instante; `timestamp` a secas sí, porque es ya el reloj de pared de quien
+     * llama —medido: `now()::timestamp` da día 4 en Kiritimati y día 3 en Etc/GMT+12—.
+     *
+     * El nombre del tipo va ACOTADO. Antes el cast intermedio se escribía `timestamp[^)]*`, y
+     * ese `[^)]*` se tragaba la cláusula que precisamente FIJA el huso: en
+     * `((now())::timestamp with time zone AT TIME ZONE 'UTC')::date` —que medido NO depende
+     * del huso— el `AT TIME ZONE 'UTC'` entraba en el tipo y la forma correcta salía marcada.
+     * Un censo que marca el propio arreglo se acaba desactivando.
+     *
+     * Y el nombre de un tipo temporal incluye su PRECISIÓN. Sin ella se escapaban siete
+     * formas peligrosas —`now()::timestamptz(0)::date` entre ellas, que Postgres guarda como
+     * `((now())::timestamp(0) with time zone)::date`— porque la cadena de castos se paraba
+     * ante el `(0)` y no llegaba nunca al `::date`.
+     *
+     * La guardia del huso va DELANTE, como aserción, y esto sí es sutil: detrás de una
+     * precisión opcional NO sirve. Con `timestamp\b(precisión)?(?!\s+with time zone)`, el
+     * motor prueba `timestamp(0)`, ve que sigue ` with time zone`, RETROCEDE a la precisión
+     * vacía, y entonces el lookahead mira `(0)`, que no es ` with time zone`, y pasa. Así
+     * `now()::timestamp(0) with time zone` —que medido conserva el instante— salía marcada.
+     * Puesta delante se evalúa en una posición fija y el retroceso no la puede rodear.
+     *
+     * (La precisión que se CONSUME al final es la única parte de todo esto que no carga
+     * peso: quitarla no cambia ni un caso, porque detrás del tipo no hay nada más que casar.
+     * Se queda porque el nombre de un tipo la incluye, y una gramática a medias es la que
+     * hace que la próxima vez nadie sepa por qué falta. Medido, no supuesto.)
+     */
+    /*
+     * Y el nombre del tipo puede ir ENTRECOMILLADO. `now()::"date"` es el mismo cast que
+     * `now()::date` —medido, y elige el mismo día distinto en husos opuestos—, y también
+     * `pg_catalog."date"`. Sin admitirlo, escribir el tipo entre comillas sacaba la
+     * expresión del censo entero, que es la peor forma de fallar: en silencio.
+     *
+     * La rama entrecomillada NO lleva la guardia de `with time zone`, y no es un descuido:
+     * medido, `now()::"timestamp" with time zone` y `cast(now() as "timestamp" with time
+     * zone)` son errores de SINTAXIS. Un nombre entrecomillado es un identificador completo;
+     * detrás no cabe el resto de la sintaxis del estándar. Por eso tampoco se entrecomillan
+     * los nombres de varias palabras: `"character varying"` y `"timestamp with time zone"`
+     * no existen como tipos (medido, los dos).
+     *
+     * Va envuelto en su propio grupo porque hay sitios donde se concatena algo detrás
+     * —el operando lo sigue de un literal—, y una alternativa suelta se llevaría el
+     * resto de la expresión con ella.
+     */
+    const SIN_HUSO = String.raw`date|time|timestamp`;
+    const TIPO_SIN_HUSO = String.raw`(?:"(?:${SIN_HUSO})"${PRECISION}|(?!(?:timestamp|time)\b${PRECISION}\s+with\s+time\s+zone\b)(?:${SIN_HUSO})\b${PRECISION})`;
+    /*
+     * Y la vuelta se escribe de DOS maneras. `now()::text::timestamptz` la introduce un `::`;
+     * `cast(now()::text as timestamptz)` la introduce el `as` del cast exterior, y esa mitad
+     * ninguna sonda del catálogo puede cubrirla porque Postgres deparsea las dos con `::`.
+     * Sin contemplarla, el patrón casaba `now()::text`, no veía vuelta y declaraba culpable
+     * una ida y vuelta que recupera el mismo instante —medido por epoch: idéntico en
+     * Kiritimati y en Etc/GMT+12, en las dos formas—.
+     *
+     * El `as` exige su `)` de cierre, que es lo que lo separa de un ALIAS de columna: en
+     * `select now()::text as timestamptz` no hay cast, hay un nombre, y eso sigue marcado.
+     * LÍMITE DECLARADO: ese mismo alias dentro de un paréntesis —`(select now()::text as
+     * timestamptz)`— se leería como cast y se escaparía.
+     */
+    /*
+     * Y la vuelta solo salva si es TERMINAL. `now()::text::timestamptz::date` recupera el
+     * instante y a continuación vuelve a elegir día con el huso de la sesión —medido:
+     * 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12—, y la excepción lo tapaba: el
+     * patrón descartaba la coincidencia en `::text` y el RELOJ no puede atravesar el paso por
+     * texto para llegar al destino final, así que la expresión entera se escapaba.
+     *
+     * Ahora la excepción lleva su propia condición: la vuelta con huso NO salva si detrás hay
+     * otro casto a un tipo sin huso — y ese casto se escribe con las MISMAS dos sintaxis que
+     * la vuelta, así que la condición las mira las dos. Escrita solo con `::`,
+     * `cast(now()::text::timestamptz as date)` se escapaba entera: el `as date` no se veía, la
+     * vuelta pasaba por terminal y la expresión quedaba exenta — y elige día con el huso de la
+     * sesión igual que las demás (medido: 2026-09-05 en Kiritimati y 2026-09-04 en
+     * Etc/GMT+12). El mismo hueco que ya se había tapado en la mitad de arriba, abierto en la
+     * de abajo: un criterio repetido aprende en un sitio y se queda viejo en el otro.
+     *
+     * El `as` exige aquí también su `)` de cierre, y por lo mismo: `now()::text::timestamptz
+     * as date` sin paréntesis es un ALIAS de columna, no un cast, y ahí la vuelta sí es
+     * terminal y la expresión sí es correcta.
+     *
+     * Y lo que descalifica a la vuelta es CUALQUIER casto detrás, no solo uno a un tipo sin
+     * huso. Escrita con esa lista, `now()::text::timestamptz::text::date` se escapaba —el
+     * paso intermedio por texto no era «un tipo sin huso», así que la vuelta seguía pareciendo
+     * terminal— y elige día igual que las demás (medido: 2026-09-05 en Kiritimati y
+     * 2026-09-04 en Etc/GMT+12). Era el LÍMITE que esta misma nota declaraba, y mirar qué lo
+     * sostenía costó una condición más corta, no una más larga: la vuelta salva si el valor se
+     * queda ahí, y no si se le sigue haciendo cosas.
+     *
+     * Se marca de más un `now()::text::timestamptz::timestamptz`, que no cambia nada y que
+     * nadie escribe. Un falso positivo se ve; el hueco que cerraba no.
+     */
+    const OTRO_CASTO = String.raw`::|as\s+${ESQUEMA}(?:"[^"]*"|\w+)${PRECISION}\s*\)`;
+    const VUELTA_CON_HUSO = String.raw`(?!(?:\s*\))*\s*(?:::\s*${ESQUEMA}(?:${TIPO_CON_HUSO})|as\s+${ESQUEMA}(?:${TIPO_CON_HUSO})\s*\))(?!(?:\s*\))*\s*(?:${OTRO_CASTO})))`;
+    const DESTINO_QUE_ELIGE = String.raw`${TIPO_SIN_HUSO}|(?:${TIPO_TEXTUAL})${VUELTA_CON_HUSO}`;
+
+    /*
+     * Y un operando cuyo tipo NO lleva huso, en las dos formas que se pueden leer del texto:
+     * el literal tipado (`date '…'`) y el cast (`'…'::date`, `columna::date`). La segunda es
+     * la que devuelve el catálogo: Postgres deparsea `current_timestamp < date '2026-09-04'`
+     * como `(CURRENT_TIMESTAMP < '2026-09-04'::date)`.
+     *
+     * Esto cubre lo que se puede leer del TEXTO. Lo que el texto no dice —que una columna
+     * llamada `vence_en` es un `date`— lo pone el catálogo, y de eso se ocupa
+     * `RELOJ_COMPARADO_CON_COLUMNA`, ahí abajo. Aquí había un límite declarado que decía que
+     * ese caso se escapaba; ya no, y conviene que se vea por qué importaba: medido,
+     * `vence_en > current_timestamp` da `f` en Pacific/Kiritimati y `t` en Etc/GMT+12 sobre la
+     * MISMA fila. No es que la fecha se desplace un día: la comparación se da la vuelta
+     * entera, y `derecho_uso.vence_en` es justo la columna que decide si una evidencia se
+     * puede citar.
+     */
+    const OPERANDO_SIN_HUSO = String.raw`(?:${TIPO_SIN_HUSO}\s*${PREFIJO}'[^']*'|(?:${PREFIJO}'[^']*'|[\w."]+)\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO}))`;
+    const COMPARADOR = String.raw`(?:<=|>=|<>|!=|<|>|=)`;
+
+    /*
+     * La UNIDAD de `date_trunc`/`date_part` no siempre es un literal pegado al paréntesis:
+     * `date_trunc(CAST('day' AS text), now())` elige día igual —medido: 2026-09-05 00:00+14 y
+     * 2026-09-04 00:00-12— y `date_trunc(v_unidad, now())` ni siquiera se puede leer.
+     *
+     * Así que la pregunta se INVIERTE, que es lo que cierra la clase en vez del caso: en lugar
+     * de reconocer las unidades peligrosas —lista infinita— se exige que la unidad sea una de
+     * las SEGURAS, medidas contra todos los husos, escrita de alguna de sus tres formas. Todo
+     * lo demás se marca, incluida una unidad que no sea literal.
+     *
+     * LÍMITE DECLARADO: una unidad con una coma dentro del literal partiría el argumento. No
+     * existe ninguna unidad válida así.
+     */
+    /*
+     * Y la unidad SEGURA se puede escribir con envolturas que no la cambian: entre paréntesis
+     * —`date_trunc(('second'), now())`— y con el tipo calificado —`'second'::pg_catalog.text`—.
+     * Las dos son estables (medido por EPOCH, no por texto: el resultado es `timestamptz` y su
+     * representación lleva el desfase, así que compararlo como texto dice que cambia cuando no
+     * cambia — la misma trampa que este censo existe para cazar, en la que caí al medirlo).
+     * Sin admitirlas, el censo marcaba código correcto.
+     */
+    const unidadSegura = (lista: string) =>
+      envuelto(
+        String.raw`${literalDe(lista)}|cast\s*\(\s*${PREFIJO}'(?:${lista})'\s+as\s+[\w. ]+\s*\)`,
+      );
+    /*
+     * El PRIMER argumento de una llamada, hasta su coma de primer nivel. Dos niveles de
+     * paréntesis y no uno: con uno solo, `timezone((current_setting('TimeZone')), now())` no
+     * se podía consumir —el grupo exterior contiene los paréntesis de `current_setting`—, el
+     * patrón no casaba y la expresión pasaba entera, eligiendo día con el huso de la sesión
+     * (medido: 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12). Las dos alternativas
+     * empiezan por caracteres distintos en cada nivel, así que no hay ambigüedad que hacer
+     * retroceder al motor.
+     *
+     * LÍMITE DECLARADO: un tercer nivel de envoltura vuelve a escaparse. Una expresión regular
+     * no cuenta paréntesis; lo que se puede hacer es subir el techo cuando aparezca una forma
+     * real que lo pida.
+     */
+    const PRIMER_ARGUMENTO = String.raw`(?:[^,()]|\((?:[^()]|\([^()]*\))*\))*`;
+    /*
+     * `date_trunc` tiene una sobrecarga de TRES argumentos, y el tercero es el huso. Con un
+     * literal fijo —`date_trunc('day', now(), 'UTC')`— el resultado es el mismo instante en
+     * cualquier sesión (medido por epoch); con algo que LEA la sesión —`current_setting(
+     * 'TimeZone')`— vuelve a depender de quien llama, y el patrón no lo veía porque exigía el
+     * paréntesis pegado al reloj.
+     *
+     * La guardia va DELANTE del `\s*` y no detrás, que es donde la puse primero: con el
+     * espacio por medio, el motor lo devuelve a cero, la aserción se evalúa sobre el espacio
+     * —donde no hay literal— y pasa. Una aserción negativa detrás de algo opcional no asegura
+     * nada; ya lo tenía escrito de otra vuelta y volví a hacerlo.
+     */
+    const HUSO_LITERAL = literalDe(String.raw`[^']*`);
+    const HUSO_FIJO = String.raw`${HUSO_LITERAL}\s*\)`;
+    /*
+     * Y el prefijo de una conversión con huso FIJO, para poder decir «este reloj ya está
+     * convertido» desde detrás. Se usa como mirada atrás, que es la única forma de excluir el
+     * ARREGLO sin dejar de mirar dentro de lo demás.
+     *
+     * Exige que el huso sea LITERAL, y conviene ser exacto sobre lo que eso vale hoy: NO carga
+     * peso por sí solo. Un huso dinámico dentro de un JSON ya lo marca el patrón de
+     * `timezone(...)`, que no necesita al de JSON para nada; comprobado aflojando esta
+     * condición a un argumento cualquiera, y no se mueve ninguna sonda. Se escribe así porque
+     * es el criterio correcto —«convertido» significa convertido a un huso fijo— y porque dos
+     * guardas que dicen cosas distintas del mismo hecho es como este fichero ha fallado ya
+     * cuatro veces. Medido, no supuesto.
+     */
+    /** Lo que RENDERIZA un valor a texto: la clase del JSON, más los de la biblioteca. */
+    /*
+     * `array_to_string` va en la lista aunque no lo parezca: no renderiza UN valor, renderiza
+     * cada ELEMENTO con la función de salida de su tipo, que es exactamente lo mismo un piso
+     * más abajo. Medido: `array_to_string(array[now()], ',')` da
+     * `2026-09-05 08:26:19.88+14` en Pacific/Kiritimati y `2026-09-04 06:26:19.92-12` en
+     * Etc/GMT+12 — fecha distinta dentro del texto, no solo desfase distinto.
+     *
+     * Los demás serializadores de array ya entraban por `\w*json\w*`: `array_to_json`,
+     * `to_jsonb`, `jsonb_build_array`. Éste era el único que renderiza a texto plano sin
+     * llevar `json` en el nombre.
+     */
+    const SERIALIZAN = String.raw`\w*json\w*|array_to_string|concat|concat_ws|quote_literal|quote_nullable|quote_ident|format`;
+    const HUSO_YA_FIJADO = String.raw`${nombreDeFuncion('timezone')}\s*\(\s*${envuelto(HUSO_LITERAL)}\s*,\s*`;
+    /*
+     * Y el FORMATO de `to_char`, que hasta ahora no se miraba: se marcaba cualquier `to_char`
+     * con un reloj delante, y hay formatos que no leen el calendario —`'"fijo"'` devuelve
+     * texto literal y `'US'` extrae microsegundos—.
+     *
+     * Qué declaro seguro, y por qué NO es la lista que medí. Barrí los 57 códigos contra los
+     * 499 husos y seis instantes de frontera y salieron 17 estables; pero seis instantes son
+     * una MUESTRA, no una prueba, y equivocarse aquí es un hueco SILENCIOSO. Así que solo
+     * declaro seguros aquellos cuya estabilidad se sigue de un invariante ya medido: los
+     * campos por debajo del minuto, porque ningún huso tiene hoy desfase con segundos —eso
+     * está medido en este mismo fichero, sobre los 499—. `CC`, `IYYY`, `IW` y compañía
+     * salieron estables en la muestra y aun así van fuera: marcarlos de más es un falso
+     * positivo, que se ve; darlos por seguros sin invariante sería un agujero que no.
+     *
+     * El texto entre comillas dobles es literal por definición del formato.
+     *
+     * `SSSS` —segundos desde medianoche— NO entra, y por eso los códigos exigen no llevar
+     * detrás otra letra o dígito: sin esa guardia se leería como `SS` + `SS` y pasaría por
+     * seguro.
+     */
+    const FORMATO_SEGURO = literalDe(
+      String.raw`(?:"[^"]*"|[^A-Za-z0-9"']|(?:SS|MS|US|FF[1-6])(?![A-Za-z0-9]))*`,
+    );
+    RELOJ_COLAPSADO_A_DIA = [
+      // El cast al tipo sin huso, en sus cuatro formas de una sola vez: `now()::date` tal como
+      // se escribe, `(now())::date` tal como Postgres la devuelve —y a la que reduce también
+      // `cast(now() as date)`—, `now()::timestamp::date` con salto intermedio, y
+      // `((timeofday())::timestamp with time zone)::date`, que es la anterior deparseada.
+      //
+      // Eran tres patrones y ahora es uno; las cuatro formas siguen teniendo sonda propia,
+      // porque juntar patrones sin dejar prueba de cada forma es cambiar un hueco por otro.
+      //
+      // NO marca `(timezone('UTC'::text, now()))::date`: ahí el paréntesis que precede al
+      // `::` es el de `timezone`, y `timezone` no es un reloj — el reloj va envuelto.
+      /*
+       * La conversión de huso con un huso DINÁMICO. `timezone('UTC', now())` es el ARREGLO
+       * canónico de este PR y por eso el censo lo deja pasar; con
+       * `timezone(current_setting('TimeZone'), now())` vuelve a decidir quien llama —medido:
+       * 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12— y la excepción lo tapaba.
+       *
+       * Se marca cuando el huso NO es un literal fijo. En las dos sintaxis, que son la misma
+       * operación escrita distinto.
+       *
+       * La guardia va pegada a la palabra y no detrás del espacio, por lo de siempre: con el
+       * `\s+` por medio el motor lo devuelve a cero y la aserción deja de guardar.
+       */
+      new RegExp(
+        String.raw`${nombreDeFuncion('timezone')}\s*\((?!\s*${envuelto(HUSO_LITERAL)}\s*,)\s*${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*\)`,
+        'i',
+      ),
+      new RegExp(
+        String.raw`(${RELOJ})\s*at\s+time\s+zone(?!\s+${envuelto(HUSO_LITERAL)})\s+`,
+        'i',
+      ),
+      new RegExp(String.raw`(${RELOJ})\s*::\s*${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
+      /*
+       * Y el reloj escrito ENTERO entre comillas, que era la puerta de al lado: `'now'::date`
+       * es exactamente `current_date` —2026-09-05 en Pacific/Kiritimati y 2026-09-04 en
+       * Etc/GMT+12, medido— y `current_date` está prohibido desde la primera línea de este
+       * fichero mientras su sinónimo pasaba limpio, porque el vaciado de literales se llevaba
+       * el contenido antes de que nadie lo mirara. No es un caso raro: es la forma de saltarse
+       * el censo entero sin escribir ninguna de las palabras que vigila.
+       *
+       * `'now'` con un tipo CON huso es el instante y ya está en la lista de relojes; aquí van
+       * los tipos SIN huso, que es donde se elige calendario. Las tres sintaxis, porque el
+       * literal tipado (`date 'now'`) y el `cast` no se deparsean igual que el `::`.
+       *
+       * La frontera IZQUIERDA es la misma disciplina que llevan las funciones —sin ella,
+       * `mi_now()` salía marcado—: un `creado_date` con un literal pegado detrás casaría el
+       * nombre del tipo DENTRO del identificador. Dicho con honestidad: no mueve ninguna sonda,
+       * y no por falta de buscarla, sino porque en SQL válido no hay sitio donde un
+       * identificador pueda ir pegado a un literal —ahí solo cabe un literal TIPADO—. Se queda
+       * porque el reconocedor de un nombre de tipo tiene que reconocer el nombre entero, no un
+       * trozo; la alternativa es descubrir el falso positivo en el primer nombre de columna que
+       * acabe en `_date`.
+       */
+      new RegExp(String.raw`${AHORA_LITERAL}\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO})`, 'i'),
+      new RegExp(String.raw`(?<![\w.])${ESQUEMA}(?:${TIPO_SIN_HUSO})\s*${AHORA_LITERAL}`, 'i'),
+      new RegExp(
+        String.raw`cast\s*\(\s*${AHORA_LITERAL}\s+as\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})`,
+        'i',
+      ),
+      // Y las tres hermanas, con cualquier tipo temporal: ni con huso conservan el instante.
+      new RegExp(
+        String.raw`${DIA_LITERAL}\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO}|${TIPO_CON_HUSO})`,
+        'i',
+      ),
+      new RegExp(
+        String.raw`(?<![\w.])${ESQUEMA}(?:${TIPO_SIN_HUSO}|${TIPO_CON_HUSO})\s*${DIA_LITERAL}`,
+        'i',
+      ),
+      new RegExp(
+        String.raw`cast\s*\(\s*${DIA_LITERAL}\s+as\s+${ESQUEMA}(?:${TIPO_SIN_HUSO}|${TIPO_CON_HUSO})`,
+        'i',
+      ),
+      // `cast(now() as date)` en el código fuente, antes de que nadie la deparsee.
+      new RegExp(String.raw`cast\s*\(\s*(${RELOJ})\s+as\s+${ESQUEMA}(?:${DESTINO_QUE_ELIGE})`, 'i'),
+      // `date(now())`, la tercera forma de escribir la misma conversión.
+      new RegExp(String.raw`${nombreDeFuncion('date|time')}\s*\(\s*(${RELOJ})\s*\)`, 'i'),
+      /*
+       * Y la COMPARACIÓN MIXTA, que es la puerta que abrió declarar seguro el reloj desnudo.
+       * `current_timestamp` es un instante absoluto, sí — pero comparado contra un valor SIN
+       * huso, el que se mueve es el otro: Postgres promociona el `date` a `timestamptz`
+       * usando la MEDIANOCHE LOCAL de la sesión. Medido:
+       *
+       *   current_timestamp < date '2026-09-04'   →  false en UTC+14, true en UTC-12
+       *
+       * O sea que la garantía la sigue eligiendo quien llama, aunque el reloj no tenga la
+       * culpa. Marcar el reloj a secas lo cazaba por accidente y a costa de marcar todo uso
+       * legítimo; esto lo caza por lo que es, y solo eso.
+       *
+       * En los dos órdenes, porque el reloj puede ir a cualquier lado del comparador.
+       */
+      new RegExp(String.raw`(${RELOJ})\s*${COMPARADOR}\s*(${OPERANDO_SIN_HUSO})`, 'i'),
+      new RegExp(String.raw`(${OPERANDO_SIN_HUSO})\s*${COMPARADOR}\s*(${RELOJ})`, 'i'),
+      /*
+       * `BETWEEN` es TERNARIO y lo trataba como binario: solo miraba el primer límite, así
+       * que `now() between timestamptz '…' and date '2026-09-04'` —peligrosa por el límite
+       * de arriba, medida— pasaba limpia, y `NOT BETWEEN` no casaba siquiera por el `not`
+       * de en medio. Un patrón por límite, y el `not` opcional.
+       *
+       * (En el CATÁLOGO no hacía falta: Postgres deparsea el `between` como
+       * `(x >= a) AND (x <= b)`, y esos dos ya los cazaban los comparadores de arriba. Esto
+       * es para el censo de plantillas, donde el SQL está tal como se escribió.)
+       */
+      new RegExp(
+        String.raw`(${RELOJ})\s+(?:not\s+)?between\s+(${OPERANDO_SIN_HUSO})`,
+        'i',
+      ),
+      new RegExp(
+        // El hueco entre los dos límites no puede CRUZAR un `and`: con `[^;]*?` el patrón
+        // alcanzaba cualquier `and` posterior, y `now() between <tz> and <tz> and date … = …`
+        // —segura, medida— salía marcada por la condición de al lado. Con la clase templada,
+        // el `and` que encuentra es el del propio ternario.
+        String.raw`(${RELOJ})\s+(?:not\s+)?between\b(?:(?!\band\b)[^;])*?\band\s+(${OPERANDO_SIN_HUSO})`,
+        'i',
+      ),
+    ];
+    /*
+     * Y aparte los DOS que LEEN el literal, porque tienen que mirar el texto con los literales
+     * dentro y los demás no. Separarlos no es estética: es lo que permite vaciar los literales
+     * para todo lo demás sin romper `date_trunc('milliseconds', now())`.
+     */
+    RELOJ_LEYENDO_LITERAL = [
+      // `to_char(now(), 'YYYY-MM-DD')`: no colapsa a un `date` pero produce el mismo día del
+      // huso, y una regla escrita sobre esa cadena decide igual. El reloj tiene que ser el
+      // PRIMER argumento — envuelto en `timezone('UTC', …)` ya no lo es. Y desde que mira el
+      // FORMATO tiene que ver el literal sin vaciar, como los otros dos.
+      //
+      // La guardia va pegada a la coma y NO detrás del `\s*`: con el espacio por medio el
+      // motor lo devuelve a cero y la aserción se evalúa donde no hay literal.
+      new RegExp(String.raw`${nombreDeFuncion('to_char')}\s*\(\s*(${RELOJ})\s*,(?!\s*${FORMATO_SEGURO}\s*\))`, 'i'),
+      /*
+       * `extract` entra aquí desde que el campo puede ser un LITERAL —`extract('dow' from
+       * now())` es SQL válido, comprobado contra la base—: si el literal viene vaciado, el
+       * nombre del campo desaparece y hasta `extract('epoch' …)` —seguro— saldría marcado.
+       * Lo cazó su propia sonda segura, que para eso está.
+       */
+      new RegExp(
+        String.raw`extract\s*\(\s*(?!(?:(?:${CAMPOS_SEGUROS})\b|${literalDe(CAMPOS_SEGUROS)})\s*from)(?:${literalDe(String.raw`[^']*`)}|\w+)\s+from\s+(${RELOJ})`,
+        'i',
+      ),
+      // `date_trunc('day', now())`, su forma deparseada `date_trunc('day'::text, now())` y la
+      // que lleva cast: `date_trunc('day', timeofday()::timestamptz)`, obligada porque ese
+      // reloj devuelve texto. Marca CUALQUIER unidad que no esté en la lista medida.
+      new RegExp(
+        String.raw`${nombreDeFuncion('date_trunc')}\s*\(\s*(?!${unidadSegura(UNIDADES_SEGURAS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})\s*(?:,(?!\s*${HUSO_FIJO})\s*${PRIMER_ARGUMENTO})?\s*\)`,
+        'i',
+      ),
+      // `date_part('dow', now())`, que es la misma operación con la otra sintaxis, y su forma
+      // deparseada `date_part('dow'::text, now())`.
+      new RegExp(
+        String.raw`${nombreDeFuncion('date_part')}\s*\(\s*(?!${unidadSegura(CAMPOS_SEGUROS)}\s*,)${PRIMER_ARGUMENTO},\s*(${RELOJ})`,
+        'i',
+      ),
+      /*
+       * La SERIALIZACIÓN, en cualquiera de sus formas. `to_json(now())` imprime el
+       * `timestamptz` con la fecha, la hora y el desfase LOCALES —medido: «2026-09-05T05:11:45+14:00» en Kiritimati y
+       * «2026-09-04T03:11:45-12:00» en Etc/GMT+12—, así que es la MISMA elección de calendario
+       * que `now()::text`, que ya se marcaba, escrita con otra función.
+       *
+       * Y no solo el JSON: `concat(now())`, `quote_literal(now())` y `format('%s', now())`
+       * hacen la MISMA coerción implícita a texto, medidas las tres igual de dependientes. Lo
+       * que las junta no es el formato de salida sino que todas RENDERIZAN el reloj.
+       *
+       * Los que llevan `json` en el nombre entran por la clase —`to_json`, `to_jsonb`,
+       * `json_build_object`, `jsonb_agg`, `row_to_json` y los que nazcan mañana, sin que nadie
+       * tenga que acordarse—; los demás son un conjunto CERRADO de la biblioteca estándar y
+       * por eso van nombrados.
+       *
+       * Y el reloj puede ir ANIDADO, que es como se usa `row_to_json` de verdad —exige
+       * construir un registro—: `row_to_json(row(now()))` y `jsonb_build_object('d',
+       * coalesce(now(), now()))` serializan igual de local (medido). Así que el consumidor
+       * DESCIENDE: puede saltarse una llamada anidada entera para seguir en el mismo nivel, o
+       * meterse dentro de ella. Lo que no puede es cruzar un `)`, así que nunca sale de la
+       * llamada JSON — que es lo que lo separa de un `.*` y de marcar un reloj de más allá.
+       *
+       * Lo que deja fuera el ARREGLO canónico ya no es la profundidad sino una mirada ATRÁS:
+       * un reloj precedido de una conversión con huso LITERAL ya está convertido, y
+       * `to_json(timezone('UTC', now()))` da el mismo texto en los dos husos (medido). Con el
+       * huso dinámico la mirada no casa y la expresión se marca, que es justo lo correcto.
+       * (`to_json(now() at time zone 'UTC')` no llega ni a probarse: detrás del reloj no hay
+       * una coma ni un cierre.)
+       */
+      new RegExp(
+        String.raw`${nombreDeFuncion(SERIALIZAN)}\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\)|\()*?(?<!${HUSO_YA_FIJADO})(${RELOJ})\s*(?=[,)\]])`,
+        'i',
+      ),
+      /*
+       * Y el OPERADOR de concatenación, que hace la misma coerción sin nombrar ninguna
+       * función: `now() || ''` da «2026-09-05 05:43…+14» y «2026-09-04 03:43…-12» (medido).
+       * En los dos órdenes, porque el reloj puede ir a cualquier lado.
+       *
+       * El arreglo no casa por dónde queda el reloj: en `timezone('UTC', now()) || ''` lo que
+       * precede al operador es el paréntesis de la conversión, no un reloj. Y la resta de dos
+       * relojes tampoco, por la misma gramática que ya usan las comparaciones: sigue siendo el
+       * intervalo cero, medido `00:00:00` en los dos husos.
+       */
+      new RegExp(String.raw`(${RELOJ})\s*\|\|`, 'i'),
+      new RegExp(String.raw`\|\|\s*(${RELOJ})`, 'i'),
+      /*
+       * `age(x)` con UN argumento, que es el único de esta lista donde el reloj no se escribe:
+       * lo pone Postgres. La documentación dice «resta el argumento de current_date (a
+       * medianoche)», y medido sobre el mismo instante sale `8 mons 3 days 10:00:00` en
+       * Kiritimati y `8 mons 3 days 12:00:00` en Etc/GMT+12. Una regla escrita como
+       * `age(vence_en) > interval '30 days'` cambia de respuesta con la sesión igual que
+       * `current_date`, y por eso no hacía falta que hubiera un reloj a la vista para marcarla:
+       * la peligrosa es la FORMA de un solo argumento.
+       *
+       * Con DOS argumentos no hay calendario que leer —los dos instantes vienen dados, medido
+       * idéntico en los dos husos— y no se marca. Los separa `PRIMER_ARGUMENTO`, que no cruza
+       * comas de primer nivel: si detrás del primer argumento hay `)`, era uno solo.
+       *
+       * Hoy `age` no aparece en el repositorio. Entra igual, que es para lo que existe un censo
+       * y no una lista de hallazgos: la garantía que lo use mañana ya nace vigilada.
+       */
+      new RegExp(String.raw`${nombreDeFuncion('age')}\s*\(\s*${PRIMER_ARGUMENTO}\)`, 'i'),
+    ];
+
+    /*
+     * Y los dos reconocedores del destino TIPADO, que es lo que la expresión no dice.
+     *
+     * El primero: dónde se ENTREGA un valor al tipo declarado de fuera. Son tres posiciones y
+     * las tres se miden: `return now();` en un cuerpo plpgsql, `select now()` como cuerpo SQL
+     * —las dos formas, la antigua entre dólares y la nueva `RETURN now()`, que el catálogo
+     * guarda SIN cast (comprobado)— y la expresión entera, que es como llega un `default`.
+     * Las tres dan 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12 con
+     * `returns date`, y las tres son un `now()` desnudo en el texto.
+     *
+     * El reloj tiene que ser TERMINAL en su posición: si detrás hay algo más —un cast, una
+     * coma, un `into`— la coerción implícita ya no es lo que decide, y lo que decida ya lo
+     * miran los demás patrones. Por eso el fin de expresión es una aserción y no un consumo.
+     *
+     * Con una salida: el `from`. `select now() from t` entrega el mismo valor al mismo tipo
+     * declarado —medido, 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12 con
+     * `returns date`— y sin admitirlo bastaba escribir un `from` para salirse. Un `into` NO es
+     * salida, y la asimetría es a propósito: ahí el destino es la variable, y de eso se ocupa
+     * el reconocedor de al lado.
+     */
+    /*
+     * Y el reloj ENTREGADO no tiene por qué ser toda la expresión. Una función `returns date`
+     * con `return coalesce(now(), now());` colapsa un `timestamptz` a día con el huso de quien
+     * llama —medido: 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12— y lo mismo
+     * `greatest(now(), now())` y `case when … then now() else now() end`, las tres medidas.
+     * Exigir el reloj pegado al `return` las dejaba pasar las tres: el reconocedor se paraba
+     * ante el `coalesce(`.
+     *
+     * Y no vale con buscar un reloj DENTRO, que es la tentación: `return timezone('UTC',
+     * now())::date;` también lo contiene y es el arreglo canónico de este PR —medido 2026-09-04
+     * en los dos husos—, y `return (select f from t where creado_en < now());` devuelve una
+     * columna `date` con el reloj solo en el `where`. Marcar cualquiera de las dos es el falso
+     * positivo que desactiva un censo.
+     *
+     * Lo que hay que seguir es el VALOR. Así que la expresión entregada se descompone en las
+     * ramas que pueden ser su valor —las envolturas transparentes, que devuelven el tipo de sus
+     * argumentos, y los brazos de un `case`— y se pregunta si alguna hoja es un reloj a secas.
+     * `timezone(…)` no está en la lista porque NO es transparente: fija el huso, que es
+     * exactamente lo contrario. Y el `select` de una subconsulta no se abre: su valor es la
+     * columna, no lo que haya en el `where`.
+     *
+     * LÍMITE DECLARADO: la lista de envolturas transparentes se escribe a mano —`coalesce`,
+     * `nullif`, `greatest`, `least`— y no se deriva del catálogo. Derivarla pediría resolver
+     * tipos polimórficos, que no es cosa de este censo; lo que sí es cosa suya es que la lista
+     * esté aquí, a la vista, y no repartida por los patrones.
+     */
+    const ENVOLTURA_TRANSPARENTE = /^(?:coalesce|nullif|greatest|least)$/i;
+    const RELOJ_A_SECAS = new RegExp(String.raw`^\s*(?:${RELOJ})\s*$`, 'i');
+
+    /** Lo que hay dentro de la llamada o del paréntesis, si el cierre es el ÚLTIMO carácter. */
+    const dentroDelParentesis = (e: string): string | null => {
+      const abre = e.indexOf('(');
+      if (abre < 0) return null;
+      let nivel = 0;
+      for (let i = abre; i < e.length; i++) {
+        if (e[i] === '(') nivel++;
+        else if (e[i] === ')' && --nivel === 0) return i === e.length - 1 ? e.slice(abre + 1, i) : null;
+      }
+      return null;
+    };
+
+    /*
+     * Lo de dentro de un `array[…]`, cuando los corchetes cierran la expresión entera. Se
+     * exige el nombre delante: un `x[1]` es un SUBÍNDICE —que saca un elemento, no lo
+     * entrega— y no tiene nada que ver.
+     */
+    const dentroDelCorchete = (e: string): string | null => {
+      /*
+       * Sin la palabra `array` también: los niveles INTERIORES de un array de más de una
+       * dimensión no la llevan. `array[[now()]]` entrega `[now()]`, y ahí se paraba — la hoja
+       * era `[now()]`, que no es ningún reloj. Un `[` que abre la expresión entera solo puede
+       * ser eso, un nivel de array; un subíndice va detrás de un nombre, nunca delante.
+       */
+      const m = /^(?:array\s*)?\[/i.exec(e.trim());
+      if (!m) return null;
+      e = e.trim();
+      const abre = m[0].length - 1;
+      let nivel = 0;
+      for (let i = abre; i < e.length; i++) {
+        if (e[i] === '[') nivel++;
+        else if (e[i] === ']' && --nivel === 0)
+          return i === e.length - 1 ? e.slice(abre + 1, i) : null;
+      }
+      return null;
+    };
+
+    /**
+     * Los argumentos de PRIMER nivel: una coma dentro de un paréntesis no separa. Ni dentro de
+     * un CORCHETE, desde que se desciende por los constructores de array: en
+     * `coalesce(array[a, b], c)` los argumentos son dos, y contando solo paréntesis salían
+     * tres, partidos por la mitad. Contar también los corchetes solo puede unir trozos que
+     * estaban mal partidos; no puede partir un argumento que estaba bien.
+     */
+    const argumentosDe = (dentro: string): string[] => {
+      const partes: string[] = [];
+      let nivel = 0;
+      let desde = 0;
+      for (let i = 0; i < dentro.length; i++) {
+        if (dentro[i] === '(' || dentro[i] === '[') nivel++;
+        else if (dentro[i] === ')' || dentro[i] === ']') nivel--;
+        else if (dentro[i] === ',' && nivel === 0) {
+          partes.push(dentro.slice(desde, i));
+          desde = i + 1;
+        }
+      }
+      partes.push(dentro.slice(desde));
+      return partes;
+    };
+
+    /*
+     * Los brazos de un `case`: lo que sigue a cada `then` y al `else`. Se recogen TODOS los que
+     * estén fuera de paréntesis, sin llevar la cuenta de `case` anidados, y eso es a propósito:
+     * el brazo de un `case` de dentro también es un valor que sube, así que recoger de más aquí
+     * es recoger bien. Lo que no se cruza es un paréntesis, que sí cambia de expresión.
+     */
+    const brazosDelCase = (e: string): string[] | null => {
+      if (!/^case\b/i.test(e)) return null;
+      const brazos: string[] = [];
+      let nivel = 0;
+      let desde = -1;
+      const token = /[()]|\b(?:case|when|then|else|end)\b/gi;
+      let m: RegExpExecArray | null;
+      while ((m = token.exec(e)) !== null) {
+        const t = m[0].toLowerCase();
+        if (t === '(') nivel++;
+        else if (t === ')') nivel--;
+        else if (nivel === 0) {
+          if (desde >= 0) {
+            brazos.push(e.slice(desde, m.index));
+            desde = -1;
+          }
+          if (t === 'then' || t === 'else') desde = m.index + m[0].length;
+        }
+      }
+      if (desde >= 0) brazos.push(e.slice(desde));
+      return brazos.length > 0 ? brazos : null;
+    };
+
+    /**
+     * Lo que una subconsulta PROYECTA, o `null` si no lo es. Se para donde empiezan las
+     * cláusulas: el `where` filtra, no entrega.
+     */
+    const listaDeSeleccion = (dentro: string): string | null => {
+      const m = /^\s*select\s+([\s\S]*)$/i.exec(dentro);
+      return m === null ? null : hastaLaClausula(m[1]!);
+    };
+
+    /** Las hojas cuyo valor PUEDE ser el de la expresión entera. */
+    const hojasDelValor = (expr: string, hondura = 0): string[] => {
+      const e = expr.trim();
+      if (hondura >= 8 || e === '') return [e];
+      const brazos = brazosDelCase(e);
+      if (brazos) return brazos.flatMap((b) => hojasDelValor(b, hondura + 1));
+      const dentro = dentroDelParentesis(e);
+      if (dentro !== null) {
+        const nombre = e.slice(0, e.indexOf('(')).trim();
+        /*
+         * Sin nombre delante son los paréntesis propios de la expresión, que no cambian nada
+         * — salvo que dentro haya una SUBCONSULTA, y entonces su valor es lo que PROYECTA.
+         * `return (select now());` con `returns date` da 2026-09-05 en Pacific/Kiritimati y
+         * 2026-09-04 en Etc/GMT+12, y `update t set d = (select now())` guarda lo mismo.
+         *
+         * Es exactamente el medio-razonamiento que ya tuve que corregir en `array(select …)`:
+         * escribí que una subconsulta no se abre «porque su valor es la columna, no lo que
+         * haya en el where», y la primera mitad es la que importa — la columna que proyecta
+         * SÍ es el valor. Lo dejé escrito bien allí y no lo trasladé aquí.
+         */
+        if (nombre === '') {
+          const proyecta = listaDeSeleccion(dentro);
+          if (proyecta !== null)
+            return argumentosDe(proyecta)
+              .map(sinAlias)
+              .flatMap((a) => hojasDelValor(a, hondura + 1));
+          return hojasDelValor(dentro, hondura + 1);
+        }
+        if (ENVOLTURA_TRANSPARENTE.test(nombre))
+          return argumentosDe(dentro).flatMap((a) => hojasDelValor(a, hondura + 1));
+        /*
+         * Y el constructor de array en su OTRA sintaxis, la de subconsulta. Aquí me equivoqué
+         * al razonarlo la primera vez —escribí que no entraba porque «su valor es la columna,
+         * no lo que haya en el where», y eso es media verdad—: el `where` efectivamente no se
+         * sigue, pero la LISTA DE SELECCIÓN es exactamente el valor que se entrega. Medido:
+         * `returns date[]` con `return array(select now())` da `{2026-09-05}` en
+         * Pacific/Kiritimati y `{2026-09-04}` en Etc/GMT+12, sin un solo cast escrito.
+         *
+         * Así que se abre la lista y se para donde empiezan las cláusulas. La sonda segura es
+         * la que fija la mitad correcta de aquel razonamiento: un `array(select d from t where
+         * … < now())` proyecta `d` y usa el reloj solo para filtrar.
+         */
+        if (/^array$/i.test(nombre)) {
+          const proyecta = listaDeSeleccion(dentro);
+          if (proyecta !== null)
+            return argumentosDe(proyecta)
+              .map(sinAlias)
+              .flatMap((a) => hojasDelValor(a, hondura + 1));
+        }
+      }
+      /*
+       * Y el CONSTRUCTOR de array, que no es una llamada y por eso no entraba por arriba.
+       * `array[a, b]` no devuelve el valor de sus elementos —devuelve el array— pero para lo
+       * único que se pregunta aquí da igual: el tipo declarado se reparte elemento a elemento,
+       * así que cada elemento se entrega a `date` con la misma fuerza que si fuera toda la
+       * expresión. Medido: `returns date[]` con `return array[now()]`, 2026-09-05 contra
+       * 2026-09-04 en husos opuestos.
+       *
+       * `array(select …)` NO entra, y es la misma asimetría que ya rige para las subconsultas:
+       * su valor es la columna que devuelve el select, no lo que se escriba en el `where`. Va
+       * por la rama de los paréntesis de arriba, donde el nombre `array` no está en la lista de
+       * envolturas transparentes, así que se queda como hoja. (`array(select now()::date)` sí
+       * depende de quien llama —medido—, pero por el `::date` que lleva escrito, y de eso ya se
+       * ocupan los patrones del cast.)
+       */
+      const enCorchetes = dentroDelCorchete(e);
+      if (enCorchetes !== null)
+        return argumentosDe(enCorchetes).flatMap((a) => hojasDelValor(a, hondura + 1));
+      return [e];
+    };
+
+    /*
+     * De dónde se saca la expresión entregada. Tres sitios, los mismos tres de antes: el
+     * `return` de plpgsql, el `select` de un cuerpo SQL —que termina también en su `from`— y
+     * el texto ENTERO, que es como llega un `default`.
+     */
+    const ENTREGAS = [
+      // `return next` es otra entrega al mismo tipo declarado, no una palabra suelta: medido,
+      // `returns setof date` con `return next now();` da 2026-09-05 en Pacific/Kiritimati y
+      // 2026-09-04 en Etc/GMT+12. Sin la alternativa, lo que se leía era `next now()`, que no
+      // es ningún reloj. (`return next;` a secas —el de un RETURNS TABLE que ya asignó sus
+      // columnas— no casa esta rama y sigue yendo por la de al lado, que es lo correcto: ahí
+      // el valor lo pusieron las variables.)
+      /\breturn\s+(?:query\s+select\s+|next\s+)?([^;]*?)(?=;|\s*\$|\s*$)/gi,
+      /\bselect\s+([^;]*?)(?=;|\s+from\b|\s*\$|\s*$)/gi,
+    ];
+    /*
+     * Un ALIAS de nivel superior no cambia el valor entregado: `returns date … as $$ select
+     * now() as d $$` colapsa igual —medido, 2026-09-05 en Pacific/Kiritimati contra 2026-09-04
+     * en Etc/GMT+12— y lo que llegaba a mirarse era la hoja `now() as d`, que no es ningún
+     * reloj a secas. Se quita, en las dos ortografías que admite Postgres —con `as` y sin él—.
+     *
+     * A PROFUNDIDAD CERO, que es lo que lo hace seguro: el `as` de un `cast(now() as date)` va
+     * dentro de paréntesis y ahí no se toca. Y solo si queda algo delante, para que
+     * `select current_date` no se convierta en la cadena vacía.
+     */
+    /*
+     * Un ALIAS admite las mismas tres ortografías que cualquier nombre SQL, la Unicode
+     * incluida: `select now() as U&"\\0064"` es válido y nombra la columna `d` —medido,
+     * 2026-09-05 contra 2026-09-04—. Con la forma desnuda y la entrecomillada solamente, el
+     * alias no se quitaba y la hoja no era ningún reloj.
+     */
+    const NOMBRE_LLANO =
+      String.raw`(?:[Uu]&"(?:[^"]|"")*"(?:\s+uescape\s+'.')?|"(?:[^"]|"")+"|[A-Za-z_]\w*)`;
+    const CON_ALIAS = new RegExp(String.raw`^([\s\S]*?\S)\s+(?:as\s+)?(${NOMBRE_LLANO})$`, 'i');
+    const profundidad = (t: string): number => {
+      let nivel = 0;
+      for (const c of t) {
+        if (c === '(' || c === '[') nivel++;
+        else if (c === ')' || c === ']') nivel--;
+      }
+      return nivel;
+    };
+    const aNivelCero = (t: string): boolean => profundidad(t) === 0;
+    const sinAlias = (e: string): string => {
+      const m = CON_ALIAS.exec(e.trim());
+      return m !== null && aNivelCero(m[1]!) ? m[1]! : e;
+    };
+    /** El nombre con el que sale una expresión proyectada: su alias, o ella misma si es uno. */
+    const nombreProyectado = (e: string): string | null => {
+      const t = e.trim();
+      const m = CON_ALIAS.exec(t);
+      if (m !== null && aNivelCero(m[1]!)) return nombreCanonico(m[2]!);
+      /*
+       * Y la proyección de fuera puede venir CALIFICADA por el alias de la subconsulta —
+       * `select s.d from (select now() d) s`, medido con el mismo par—. El calificador se
+       * descarta en quien llama, porque la subconsulta es una sola; aquí solo hace falta que
+       * el nombre llegue en vez de perderse por no ser un identificador llano.
+       */
+      return new RegExp(String.raw`^${NOMBRE_LLANO}(?:\s*\.\s*${NOMBRE_LLANO})?$`).test(t)
+        ? t
+            .split('.')
+            .map((parte) => nombreCanonico(parte))
+            .join('.')
+        : null;
+    };
+    /*
+     * Las ramas de una OPERACIÓN DE CONJUNTOS, a profundidad cero. `returns date … as $$ select
+     * now() union all select now() where false $$` entrega el reloj —medido, con el mismo par
+     * de fechas— y la captura se llevaba la consulta compuesta entera como una sola hoja: la
+     * expresión regular no para en el `union`, y su `?` perezoso llega hasta el final porque no
+     * hay `from` ni `;` que lo corten. Ninguno de los dos `now()` quedaba terminal.
+     */
+    const RAMA_SIGUIENTE = /\b(?:union|intersect|except)\b(?:\s+(?:all|distinct))?/gi;
+    const ramasDeConjunto = (t: string): string[] => {
+      const ramas: string[] = [];
+      let desde = 0;
+      RAMA_SIGUIENTE.lastIndex = 0;
+      for (let m = RAMA_SIGUIENTE.exec(t); m !== null; m = RAMA_SIGUIENTE.exec(t)) {
+        if (!aNivelCero(t.slice(0, m.index))) continue;
+        ramas.push(t.slice(desde, m.index));
+        desde = m.index + m[0].length;
+      }
+      ramas.push(t.slice(desde));
+      return ramas;
+    };
+    /**
+     * Lo que proyecta una rama: sin su `select`, cortada donde empiezan sus cláusulas y sin
+     * su alias.
+     *
+     * NO se parte por comas, y la omisión es deliberada: quien llama aquí solo lo hace cuando
+     * el destino es un tipo escalar sin huso, y ahí Postgres no acepta una lista de más de una
+     * columna, así que no hay ninguna forma válida que lo necesite. Lo intenté al revés
+     * —partiendo— y no había sonda que lo moviera, mientras que sí había dos seguras que se
+     * volvían culpables: `select now(), timezone('UTC', now())::date into t, d`, donde el reloj
+     * va a la variable CON huso, y la subconsulta del `from` de aquí abajo.
+     */
+    /** Lo mismo, pero partido por columnas: para lo que se empareja por posición. */
+    const porColumnas = (t: string): string[] => {
+      const m = /^\s*select\s+(?:all\s+|distinct\s+(?:on\s*\([^)]*\)\s*)?)?([\s\S]*)$/i.exec(t);
+      return argumentosDe(hastaLaClausula(m === null ? t : m[1]!)).map(sinAlias);
+    };
+    const proyectadas = (t: string): string[] => {
+      const m = /^\s*select\s+(?:all\s+|distinct\s+(?:on\s*\([^)]*\)\s*)?)?([\s\S]*)$/i.exec(t);
+      return [sinAlias(hastaLaClausula(m === null ? t : m[1]!))];
+    };
+    /*
+     * Y la columna que llega por una SUBCONSULTA DEL `FROM`: `returns date … as $$ select d
+     * from (select now() d) s $$` devuelve el reloj a través de la columna derivada —medido—.
+     * Ninguna de las dos capturas lo veía: la de fuera aporta la hoja `d`, y la de dentro
+     * empieza en el segundo `select` y se lleva `now() d) s`, que tampoco es un reloj a secas.
+     *
+     * Se resuelve el NOMBRE contra la lista de la subconsulta, que es lo único que hace falta y
+     * lo que además no inventa culpa: solo se sustituye la columna que de verdad se proyecta,
+     * así que un `select k from (select now() d, 1 k) s` sigue saliendo limpio —su sonda está
+     * abajo—. El calificador se descarta porque el alias de la subconsulta es uno solo.
+     */
+    const DESDE_SUBCONSULTA = /\bselect\s+([\s\S]*?)\s+from\s*\(/gi;
+    const columnasDerivadas = (texto: string): string[] => {
+      const salida: string[] = [];
+      for (const m of texto.matchAll(DESDE_SUBCONSULTA)) {
+        const dentro = parejaDeParentesis(texto, m.index + m[0].length - 1);
+        if (dentro === null) continue;
+        const interior = listaDeSeleccion(dentro);
+        if (interior === null) continue;
+        const porNombre = new Map<string, string>();
+        for (const e of argumentosDe(interior)) {
+          const n = nombreProyectado(e);
+          if (n !== null) porNombre.set(n, sinAlias(e));
+        }
+        for (const e of proyectadas(`select ${m[1]!}`)) {
+          const n = nombreProyectado(e);
+          const sin = n === null ? null : (porNombre.get(n.split('.').pop()!) ?? null);
+          if (sin !== undefined && sin !== null) salida.push(sin);
+        }
+      }
+      return salida;
+    };
+    /*
+     * Una función SQL también entrega su resultado con `VALUES`: `returns date … as $$ values
+     * (now()) $$` coerciona ese `timestamptz` al `date` declarado con el huso de la sesión
+     * —medido, 2026-09-05 contra 2026-09-04—, y `ENTREGAS` solo sabía sacar proyecciones que
+     * empiezan por `select`, así que el cuerpo entero quedaba como una hoja opaca.
+     *
+     * El `values` tiene que EMPEZAR la sentencia, y esa condición es la que evita el falso
+     * positivo que la versión ingenua trae de la mano: el `values` de un `insert into t(k, ts)
+     * values (1, now())` dentro de una función `returns date` no entrega nada al tipo de
+     * retorno —va a una columna CON huso— y marcarlo sería culpar por vecindad. Su sonda
+     * segura está abajo. Se mira el último carácter que no sea espacio: solo valen el `$` que
+     * cierra la etiqueta del cuerpo, el `;` de la sentencia anterior, o el principio del texto.
+     *
+     * Y TODAS las tuplas, no la primera: `returns setof date … values (date '2026-01-01'),
+     * (now())` devuelve las dos filas y solo la segunda se mueve con el huso.
+     */
+    const EMPIEZA_VALUES = /\bvalues\s*\(/gi;
+    const tuplasEntregadas = (texto: string): string[] => {
+      const salida: string[] = [];
+      for (const m of texto.matchAll(EMPIEZA_VALUES)) {
+        const antes = texto.slice(0, m.index).replace(/\s+$/, '');
+        const ultimo = antes.slice(-1);
+        if (antes !== '' && ultimo !== '$' && ultimo !== ';') continue;
+        let cursor = m.index + m[0].length - 1;
+        for (;;) {
+          const dentro = parejaDeParentesis(texto, cursor);
+          if (dentro === null) break;
+          salida.push(...argumentosDe(dentro).map(sinAlias));
+          cursor += dentro.length + 2;
+          const siguiente = /^\s*,\s*\(/.exec(texto.slice(cursor));
+          if (siguiente === null) break;
+          cursor += siguiente[0].length - 1;
+        }
+      }
+      return salida;
+    };
+    RELOJ_ENTREGADO = (texto: string): boolean => {
+      const entregadas = [
+        texto,
+        ...[...texto.matchAll(ENTREGAS[0]!)].map((m) => m[1]!),
+        /*
+         * Solo los `select` que empiezan a PROFUNDIDAD CERO. Uno que empieza dentro de un
+         * paréntesis es una subconsulta, y que su proyección se entregue o no lo deciden otros
+         * dos sitios que sí saben mirarlo: la subconsulta del `from` —aquí abajo— y la escalar,
+         * que abre `hojasDelValor`.
+         *
+         * Y aquí va dicho lo que no se ve: HOY ninguna sonda mueve este filtro, ni el nivel
+         * cero que exigen `sinAlias` y `ramasDeConjunto`. Los tres se tapan entre sí —quitando
+         * cualquiera de ellos, los otros dos siguen dejando limpias las tres sondas seguras de
+         * subconsulta— y el sitio donde sí se veía la diferencia era el corte por comas, que ya
+         * no está. Se quedan porque son la condición correcta y no un remiendo del caso que la
+         * descubrió; se dice en vez de dejar creer que hay una medida detrás de cada uno.
+         */
+        ...[...texto.matchAll(ENTREGAS[1]!)]
+          .filter((m) => profundidad(texto.slice(0, m.index)) === 0)
+          .flatMap((m) => ramasDeConjunto(m[1]!).flatMap(proyectadas)),
+        ...columnasDerivadas(texto),
+        ...tuplasEntregadas(texto),
+      ];
+      return entregadas.some((e) => hojasDelValor(e).some((hoja) => RELOJ_A_SECAS.test(hoja)));
+    };
+
+    /*
+     * El segundo no necesita que nadie le pase el tipo, porque lo declara el propio texto: una
+     * VARIABLE plpgsql. `declare d date; begin d := now(); …` guarda el día del huso de quien
+     * llama —medido, 09-05 contra 09-04— y en el texto solo hay, otra vez, un `now()` desnudo.
+     *
+     * Se leen los nombres declarados con un tipo sin huso y se busca la asignación a UNO DE
+     * ELLOS, en las dos formas que tiene plpgsql: `:=` y `select … into`. Buscar la asignación
+     * sin la declaración marcaría `v := now()` sobre una variable `timestamptz`, que es
+     * correcto; buscar la declaración sin la asignación marcaría una variable que solo se lee.
+     *
+     * LÍMITE DECLARADO: el reconocedor de declaraciones no distingue el bloque `declare` del
+     * resto del cuerpo, así que puede recoger un nombre de más —`cast(x as date);` daría «as»—.
+     * No importa mientras ese nombre no aparezca además asignándose un reloj, que es lo que se
+     * marca; queda dicho aquí en vez de descubrirse. Y las variables de un bloque ANIDADO se
+     * mezclan con las de fuera, que es de más y no de menos.
+     */
+    /*
+     * Y una variable no se declara solo en el `declare`: las columnas de salida de un
+     * `RETURNS TABLE(d date)` son variables plpgsql con todas las letras, y ahí el tipo lo
+     * sigue un `)` o una coma en vez de un `;`. Medido: `returns table(d date)` con
+     * `d := now();` da 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+     *
+     * Y es esta mitad la que tiene que cazarlo, no la del tipo declarado, por una razón que
+     * conviene medir antes que suponer: con UNA columna de salida `prorettype` sí es `date`
+     * —Postgres solo pone `record` a partir de DOS, medidos los dos casos— pero el valor no
+     * llega por un `return`, llega por la ASIGNACIÓN, así que el reconocedor del destino no lo
+     * ve pase lo que pase con el tipo de vuelta. Los parámetros `IN` de tipo fecha entran por
+     * el mismo camino, y también es correcto: asignarles un reloj colapsa igual.
+     *
+     * LÍMITE DECLARADO, y va escrito aquí en vez de descubrirse: cuando el valor llega por una
+     * LISTA de selección y no por una asignación —`returns table(d date, n int) as $$ select
+     * now(), 1 $$`— nadie lo caza. Emparejar cada elemento de la lista con su columna declarada
+     * es un analizador de listas de selección, no un censo de texto, y sin ese emparejamiento
+     * el tipo de la columna no decide nada por sí solo. Lo que llega por asignación, que es
+     * como se escribe un `RETURNS TABLE` en plpgsql, sí está cubierto.
+     */
+    /*
+     * El nombre de una variable plpgsql puede venir ENTRECOMILLADO, y entonces no es `\w+`:
+     * `declare "d" date; begin "d" := now(); return "d"; end` con `returns date` devuelve
+     * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12 —medido—, y el catálogo lo
+     * guarda con las comillas puestas. El barrido las conserva bien (los nombres sí los leen
+     * los patrones), pero la gramática del nombre no las admitía, así que no casaba ni la
+     * declaración ni la asignación, y por el lado del tipo de vuelta solo se veía un
+     * `return "d"` que no es ningún reloj. La variable quedaba invisible por los dos lados a
+     * la vez.
+     *
+     * LÍMITE DECLARADO: un identificador entrecomillado distingue mayúsculas y uno desnudo
+     * no, así que `declare "D" date; begin d := now();` son en Postgres dos variables
+     * distintas y aquí se conflan. Ya se conflaban antes —estos patrones van con `i`— y el
+     * error es hacia marcar de más, no de menos.
+     */
+    const NOMBRE_DE_VARIABLE = String.raw`"(?:[^"]|"")+"|\w+`;
+    /*
+     * Y la declaración se escribe con la gramática ENTERA de plpgsql, no con el trozo mínimo:
+     *
+     *     nombre [CONSTANT] tipo [COLLATE x] [NOT NULL] [ { DEFAULT | := | = } expresión ] ;
+     *
+     * Cada pieza opcional que faltaba aquí era una forma de declarar lo mismo y quedar fuera.
+     * Las cinco medidas, todas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+     * Etc/GMT+12 y todas guardadas verbatim en el catálogo:
+     *
+     *   d date := now()              el inicializador va DENTRO de la declaración
+     *   d constant date := now()     `constant` se mete entre el nombre y el tipo
+     *   d date not null := now()     `not null` se mete entre el tipo y el inicializador
+     *   d date default now()         la palabra `default` en vez del `:=`
+     *   d date = now()               y el `=` a secas, que plpgsql también acepta
+     *
+     * El primero es el que más dice: el reconocedor separaba «declarar el nombre» de «buscarle
+     * una asignación», y eso solo funciona cuando la asignación es una SENTENCIA aparte
+     * —`declare d date; begin d := now();`—. Con el valor puesto en la propia declaración no
+     * había ninguna sentencia que buscar, y era la forma más corta de escribirlo.
+     *
+     * Así que el inicializador se captura AQUÍ y se mira con las mismas hojas que todo lo
+     * demás. Grupos con nombre y no por número, para que meter una pieza más en el medio no
+     * vuelva a mover lo que lee quien llama.
+     *
+     * PIEZA QUE NO MUEVE NINGUNA SONDA, y se queda dicho en vez de venderse: el
+     * `(?:constant\s+)?`. Sin él, `d constant date := now()` casa igual, solo que tomando
+     * `constant` por el nombre de la variable — y como el inicializador se captura de todas
+     * formas, el veredicto no cambia. Y no puede cambiar nunca: plpgsql **exige** inicializar
+     * una `CONSTANT`, así que esa rama siempre está. Se queda porque el nombre que se lleva la
+     * lista tiene que ser el de verdad y no una palabra clave, no porque atrape nada.
+     */
+    /*
+     * El tipo declarado admite SUFIJO DE ARRAY, que `SIN_HUSO_DECLARADO` ya sabía leer para las
+     * columnas del catálogo y aquí faltaba: una variable `date[]` ni siquiera llegaba a
+     * declararse, así que ninguna asignación suya se miraba. Medido: `declare d date[]; begin
+     * d := array[now()]; return d; end` devuelve `{2026-09-05}` en Pacific/Kiritimati y
+     * `{2026-09-04}` en Etc/GMT+12.
+     */
+    const DECLARADAS_SIN_HUSO = new RegExp(
+      String.raw`(?<![\w"])(?<nombre>${NOMBRE_DE_VARIABLE})\s+(?:constant\s+)?${ESQUEMA}` +
+        String.raw`(?:${TIPO_SIN_HUSO})(?:\s*\[\s*\d*\s*\])*` +
+        String.raw`\s*(?:collate\s+(?:\w+|"\w+")\s*)?(?:not\s+null\s*)?` +
+        String.raw`(?:(?::=|=|\bdefault\b)\s*(?<inicial>[^;]*)|[;:,)])`,
+      'gi',
+    );
+    /*
+     * Dónde acaba de verdad una cláusula. El corte NO puede ser la primera palabra que
+     * aparezca: en `set ts = (select now() where true), d = now()` ese `where` es de la
+     * SUBCONSULTA, y cortar ahí deja fuera la asignación peligrosa —medido, esa función guarda
+     * 2026-09-05 y 2026-09-04—. Se corta en la primera que esté a profundidad CERO de
+     * paréntesis.
+     *
+     * Vive en el ámbito compartido porque hacen falta tres cortes iguales: la cláusula `set`,
+     * la lista de selección de un `insert … select`, y los destinos de un `into`.
+     */
+    const CLAUSULA_SIGUIENTE = /\s(?:from|where|using|group|order|limit|offset|returning)\b/gi;
+    const hastaLaClausula = (t: string): string => {
+      CLAUSULA_SIGUIENTE.lastIndex = 0;
+      for (let m = CLAUSULA_SIGUIENTE.exec(t); m !== null; m = CLAUSULA_SIGUIENTE.exec(t)) {
+        let nivel = 0;
+        for (let i = 0; i < m.index; i++) {
+          if (t[i] === '(' || t[i] === '[') nivel++;
+          else if (t[i] === ')' || t[i] === ']') nivel--;
+        }
+        if (nivel === 0) return t.slice(0, m.index);
+      }
+      return t;
+    };
+    /** Lo que hay antes del primer `,`, `)` o `;` que esté a profundidad cero. */
+    const hastaElDelimitador = (t: string): string => {
+      let nivel = 0;
+      for (let i = 0; i < t.length; i++) {
+        const c = t[i];
+        if (c === '(' || c === '[') nivel++;
+        else if (c === ')' || c === ']') {
+          if (nivel === 0) return t.slice(0, i);
+          nivel--;
+        } else if ((c === ',' || c === ';') && nivel === 0) return t.slice(0, i);
+      }
+      return t;
+    };
+    /*
+     * Las DOS cláusulas que entregan valores a variables por posición. El `select … into` ya
+     * estaba; el `returning … into` no, y hace exactamente la misma coerción: medido,
+     * `declare d date; begin update t set k = k returning now() into d; return d; end`
+     * devuelve 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+     *
+     * Va por la CLÁUSULA y no por la sentencia, así que vale para las tres que admiten
+     * `RETURNING` —`insert`, `update`, `delete`— sin escribir ninguna: medido también sobre
+     * `insert … values (…) returning now() into d`, con el mismo par de fechas.
+     *
+     * Son DOS patrones y no una alternación, porque una alternación se queda con el primero
+     * que aparezca y el `into` es uno solo: en `insert into t(k, d) select 1, timestamptz
+     * '2020-01-01' returning now() into d`, empezar por el `select` empareja `d` con `1` y no
+     * vuelve a intentarlo desde el `returning`. La columna escrita ahí lleva huso, así que
+     * ningún otro reconocedor lo veía. Medido: 2026-09-05 contra 2026-09-04.
+     */
+    const PARES_INTO = ['select', 'returning'].map(
+      (clausula) =>
+        String.raw`\b${clausula}\s+([\s\S]*?)\s+into\s+(?:strict\s+)?([^;]*)`,
+    );
+
+    /** Un nombre listo para meterse en una expresión regular sin significar otra cosa. */
+    const escapado = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    /** Los subíndices o rebanadas que pueden ir entre un nombre y el operador que lo asigna. */
+    const SUBINDICES = String.raw`(?:\s*\[[^\]]*\])*`;
+    /** El nombre como lo escribe quien lo declara, sin las comillas ni su duplicación. */
+    const sinComillas = (n: string): string =>
+      n.startsWith('"') ? n.slice(1, -1).replace(/""/g, '"') : n;
+    /*
+     * Y lo que se asigna se mira con las MISMAS hojas que lo que se devuelve, que es la lección
+     * de aquí al lado escrita una vez más: `declare d date; begin d := coalesce(now(), now());`
+     * colapsa igual (medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12)
+     * y exigir el reloj pegado al `:=` lo dejaba pasar. El destino tipado y la asignación son
+     * dos puertas del mismo sitio: si una sigue el valor y la otra no, la que no lo sigue es
+     * por donde se entra.
+     */
+    RELOJ_ASIGNADO_A_VARIABLE = (texto: string, conLiterales: string): boolean => {
+      const declaradas = [...texto.matchAll(DECLARADAS_SIN_HUSO)];
+      /*
+       * Los nombres se canonicalizan con la MISMA regla a los dos lados —desnudo se pliega a
+       * minúsculas, citado no—, que es la de Postgres. Plegar los citados y no los desnudos, o
+       * al revés, hace que la comparación falle en un lado: medido, `declare "D" date; begin
+       * for "D" in select now() loop …` escribe 2026-09-05 en Pacific/Kiritimati y 2026-09-04
+       * en Etc/GMT+12, y comparando `d` contra `D` salía limpia.
+       */
+      const nombres = declaradas.map((m) => nombreCanonico(m.groups!.nombre!));
+      if (nombres.length === 0) return false;
+      // Lo que la propia declaración le pone dentro, que no es ninguna sentencia y por eso no
+      // lo encontraba la búsqueda de asignaciones.
+      /*
+       * El inicializador se acota a PROFUNDIDAD CERO: termina en el primer `,`, `)` o `;` que
+       * no esté dentro de un paréntesis. Antes se capturaba hasta el `;` y eso, en el
+       * ENCABEZADO de una función, se llevaba por delante el resto de la definición —el
+       * `RETURNS`, el `LANGUAGE`, el cuerpo entero— y lo que llegaba a mirarse no se parecía a
+       * ningún reloj.
+       *
+       * Acotarlo arregla dos cosas de una: la captura deja de desbordarse, y el DEFAULT de un
+       * PARÁMETRO pasa a leerse como lo que es. Porque un parámetro también es un destino
+       * tipado, evaluado al invocar: medido, `f(p date default now())` devuelve 2026-09-05 en
+       * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12 cuando se omite el argumento, y
+       * `pg_get_functiondef` guarda el encabezado verbatim.
+       */
+      const inicializadas = declaradas
+        .map((m) => m.groups!.inicial)
+        .filter((x): x is string => x !== undefined)
+        .map(hastaElDelimitador);
+      /*
+       * Cada nombre se busca en las formas en que se puede volver a escribir, porque
+       * declararlo entrecomillado no obliga a usarlo así después (ni al revés).
+       *
+       * Y se ESCAPA para la expresión regular en vez de mutilarse, que es lo que hacía antes
+       * —`replace(/[^\w]/g, '')`—. Sobre un nombre desnudo daba igual; sobre uno que necesita
+       * las comillas, no: `"fecha final"` se convertía en `fechafinal`, que no aparece en el
+       * texto por ningún lado, así que la asignación no se encontraba y la función salía
+       * limpia. Medido antes de arreglarlo: `declare "fecha final" date; "fecha final" :=
+       * now(); return "fecha final";` con `returns date` da 2026-09-05 en Pacific/Kiritimati
+       * y 2026-09-04 en Etc/GMT+12.
+       *
+       * La forma DESNUDA solo se genera cuando el nombre puede escribirse sin comillas. Con un
+       * espacio dentro no se puede, y buscarla sería buscar algo que Postgres no acepta.
+       */
+      const formasDelNombre = (n: string): string[] => {
+        const citada = `"${escapado(n.replace(/"/g, '""'))}"`;
+        return /^[A-Za-z_]\w*$/.test(n) ? [escapado(n), citada] : [citada];
+      };
+      const cualquiera = nombres.flatMap(formasDelNombre).join('|');
+      /*
+       * Y entre el nombre y el operador caben SUBÍNDICES: si la variable es un array sin huso,
+       * plpgsql asigna elemento a elemento y coerciona igual. Medido: `declare d date[] :=
+       * array[date '2000-01-01']; begin d[1] := now(); return d; end` devuelve `{2026-09-05}`
+       * en Pacific/Kiritimati y `{2026-09-04}` en Etc/GMT+12.
+       */
+      if (cualquiera === '') return false;
+      // Las tres formas de que a una de esas variables le caiga un valor: en su propia
+      // declaración, por una asignación posterior, y por un `into` —el del `select` y el del
+      // `returning`, que son la misma entrega por posición—.
+      const asignaciones = [
+        ...texto.matchAll(
+          new RegExp(String.raw`(?<![\w"])(?:${cualquiera})${SUBINDICES}\s*:=\s*([^;]*)`, 'gi'),
+        ),
+        /*
+         * Y plpgsql también asigna con `=` a secas: `declare d date; begin d = now();` hace la
+         * misma coerción (medido, 2026-09-05 contra 2026-09-04). Va en su propia búsqueda y
+         * no como alternativa del `:=`, porque el `=` es AMBIGUO: en `if d = now() then` es una
+         * comparación, no una asignación. Lo que las separa es la posición, así que se exige
+         * que el nombre empiece SENTENCIA — detrás de un `;`, o de las palabras que abren un
+         * bloque—. El `:=` no necesita esa guarda porque no significa otra cosa.
+         */
+        ...texto.matchAll(
+          new RegExp(
+            String.raw`(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*(?:${cualquiera})` +
+              String.raw`${SUBINDICES}\s*=(?!=)\s*([^;]*)`,
+            'gi',
+          ),
+        ),
+      ].map((m) => m[1]!);
+      /*
+       * El `select … into` con VARIAS columnas asigna por posición: `select 1, now() into n, d`
+       * entrega el reloj a `d`, no a la lista entera. Medido: 2026-09-05 en Pacific/Kiritimati
+       * contra 2026-09-04 en Etc/GMT+12.
+       *
+       * Antes se exigía que una variable vigilada fuera justo la SIGUIENTE al `into`, y se
+       * entregaba toda la lista de selección como una sola hoja: con una variable sola acertaba
+       * por casualidad —la lista era la expresión— y con varias no acertaba nunca. Ahora se
+       * parten las dos listas y se emparejan, que es lo que hace plpgsql.
+       */
+      const entradas = [
+        ...PARES_INTO.flatMap((r) => [...texto.matchAll(new RegExp(r, 'gi'))]),
+      ].flatMap((m) => {
+        /*
+         * Los destinos se cortan donde empiezan las cláusulas del `select`. Sin eso,
+         * `select now() into d from generate_series(1, 1)` daba el destino
+         * `d from generate_series(1, 1)`, que no casa con ninguna variable.
+         *
+         * Es una REGRESIÓN mía: esa forma la cogía el reconocedor anterior —exigía la variable
+         * pegada al `into`— y se perdió al reescribirlo para emparejar varias columnas. Ninguna
+         * sonda la cubría, porque las dos que había del `into` no llevan `from`. La nueva sí.
+         */
+        const destinos = argumentosDe(hastaLaClausula(m[2]!)).map((d) => nombreCanonico(d));
+        const valores = argumentosDe(hastaLaClausula(m[1]!)).map(sinAlias);
+        return destinos
+          .map((d, i) => (nombres.includes(d) ? valores[i] : undefined))
+          .filter((v): v is string => v !== undefined);
+      });
+      /*
+       * ── Las otras tres ataduras de plpgsql ──
+       *
+       * Un valor llega a una variable declarada por más caminos que el `:=` y el `into` de un
+       * `select`. Las tres siguientes coercionan igual y ninguna se veía. Medidas las cuatro
+       * formas: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
+       *
+       *   for d in select now() loop …            el bucle de consulta asigna cada vuelta
+       *   for d in execute 'select now()' loop …  y su variante dinámica
+       *   fetch c into d   con `c cursor for …`   el cursor trae su consulta de otro sitio
+       *   execute 'select now()' into d           el tipo que coerciona está FUERA del literal
+       *
+       * Las dos dinámicas se miran sobre el texto CON literales, porque ahí es donde está la
+       * consulta: vaciado el literal no queda nada que leer. Y por eso la recursión de SQL
+       * dinámico no bastaba — analiza `select now()` por su cuenta, que es seguro; lo que lo
+       * vuelve peligroso es el tipo del destino, y ése está en el `into` de fuera.
+       */
+      /*
+       * Devuelve FILAS, no una lista plana: el emparejamiento por posición es por fila, y un
+       * `values (a), (b)` entrega `a` en una vuelta y `b` en la otra —las dos a la MISMA
+       * posición—. Aplanarlas emparejaba `b` contra el segundo destino, que no existe, y la
+       * segunda fila no se miraba nunca. Lo dijo su sonda: sin esto se quedaba limpia.
+       */
+      const proyeccionDe = (consulta: string): string[][] => {
+        const t = consulta.trim();
+        const dolar = /^execute\s+\$([A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$([\s\S]*?)\$\1\$/i.exec(t);
+        const dinamico = /^execute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'))/i.exec(t);
+        const sql =
+          dolar !== null
+            ? dolar[2]!
+            : dinamico === null
+              ? t
+              : dinamico[1]!.replace(/^[A-Za-z_]*&?'/, '').replace(/'$/, '').replace(/''/g, "'");
+        /*
+         * Y no solo `select`: un `for … in values (now()) loop` asigna igual —medido, el mismo
+         * par de fechas—, y una consulta puede venir encabezada por su propio `WITH`.
+         */
+        const tras = /^\s*with\b/i.test(sql) ? finDeLosCTEs(sql, sql.search(/\bwith\b/i) + 4) : 0;
+        const cuerpo = tras === null ? sql : sql.slice(tras);
+        /*
+         * Aquí SÍ se parte por columnas, al revés que en la entrega al tipo de retorno: esto
+         * se empareja por POSICIÓN contra una lista de destinos, y un `for n, d in select 1,
+         * now() loop` entrega la segunda columna a `d`. Medido: 2026-09-05 en
+         * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12. Allí no se parte porque el
+         * destino es escalar y Postgres no acepta más de una columna; aquí sí lo acepta.
+         */
+        if (/^\s*select\b/i.test(cuerpo)) return [porColumnas(cuerpo)];
+        /*
+         * Y TODAS las tuplas de un `values`, no la primera: `for d in values (date
+         * '2026-01-01'), (now()) loop` recorre las dos y solo la segunda se mueve con el huso.
+         */
+        const filas = /^\s*values\s*\(/i.exec(cuerpo);
+        if (filas === null) return [];
+        const salida: string[][] = [];
+        let cursor = filas[0].length - 1;
+        for (;;) {
+          const dentro = parejaDeParentesis(cuerpo, cursor);
+          if (dentro === null) break;
+          salida.push(argumentosDe(dentro).map(sinAlias));
+          cursor += dentro.length + 2;
+          const siguiente = /^\s*,\s*\(/.exec(cuerpo.slice(cursor));
+          if (siguiente === null) break;
+          cursor += siguiente[0].length - 1;
+        }
+        return salida;
+      };
+      /** `<destinos>` de un `into` o de un `for`, en minúsculas y sin comillas. */
+      const listaDeDestinos = (t: string): string[] =>
+        argumentosDe(hastaLaClausula(t)).map((x) => nombreCanonico(x.trim()));
+      const porPosicionDeNombre = (destinos: string[], valores: string[]): string[] =>
+        destinos
+          .map((n, i) => (nombres.includes(n) ? valores[i] : undefined))
+          .filter((v): v is string => v !== undefined);
+      const bucles = [
+        ...conLiterales.matchAll(/\bfor\s+([^;]*?)\s+in\s+([\s\S]*?)\s+loop\b/gi),
+      ].flatMap((m) => {
+        const destinos = listaDeDestinos(m[1]!);
+        return proyeccionDe(m[2]!).flatMap((fila) => porPosicionDeNombre(destinos, fila));
+      });
+      const dinamicas = [
+        /*
+         * En las DOS ortografías del literal. La de dólar la lee el recorrido de SQL dinámico
+         * desde hace tiempo, pero ahí se analiza sin el tipo del destino y `select now()` por
+         * su cuenta es seguro; el tipo está en el `into` de fuera, y hasta aquí solo llegaba la
+         * de comillas simples. Medido: `execute $q$select now()$q$ into d` con `d date` da
+         * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+         */
+        ...conLiterales.matchAll(
+          /\bexecute\s+((?:[A-Za-z_]*&?'(?:[^']|'')*'|\$(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$[\s\S]*?\$(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$))\s+into\s+(?:strict\s+)?([^;]*)/gi,
+        ),
+      ].flatMap((m) => {
+        const destinos = listaDeDestinos(m[2]!);
+        return proyeccionDe(`execute ${m[1]!}`).flatMap((fila) =>
+          porPosicionDeNombre(destinos, fila),
+        );
+      });
+      /*
+       * Y el `FOREACH … IN ARRAY`, que asigna ELEMENTO a elemento y por eso no es un `for` de
+       * consulta: lo que llega al destino es cada elemento del array, con la misma coerción.
+       * Medido: `declare d date; begin foreach d in array array[now()] loop … end loop; end`
+       * escribe 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12. El array se
+       * entrega entero porque `hojasDelValor` ya baja por los corchetes.
+       *
+       * Con su modificador `SLICE <n>`, que va ENTRE el destino y el `in array` y sin apartarlo
+       * dejaba el destino como `d slice 1`, que no casa con ninguna variable. Medido sobre
+       * `foreach d slice 1 in array array[[now()]]` con `d date[]`: el mismo par de fechas.
+       */
+      const recorridos = [
+        ...conLiterales.matchAll(
+          /\bforeach\s+([^;]*?)(?:\s+slice\s+\d+)?\s+in\s+array\s+([\s\S]*?)\s+loop\b/gi,
+        ),
+      ].flatMap((m) =>
+        listaDeDestinos(m[1]!).some((n) => nombres.includes(n)) ? [m[2]!] : [],
+      );
+      /*
+       * El cursor trae su consulta de donde se declaró —o de su `open … for`—, así que el
+       * `fetch` por sí solo no dice nada: hay que resolver el nombre primero.
+       */
+      const consultaDelCursor = new Map<string, string>();
+      for (const m of conLiterales.matchAll(
+        /(?:(\w+)\s+(?:(?:no\s+)?scroll\s+)?cursor\s*(?:\([^)]*\)\s*)?for\s+([^;]*)|\bopen\s+(\w+)(?:\s*\([^)]*\))?\s+for\s+([^;]*))/gi,
+      )) {
+        consultaDelCursor.set((m[1] ?? m[3]!).toLowerCase(), m[2] ?? m[4]!);
+      }
+      const cursores = [
+        ...conLiterales.matchAll(
+          /\bfetch\s+(?:(?:next|prior|first|last|absolute\s+\S+|relative\s+\S+|forward|backward)\s+)?(?:(?:from|in)\s+)?(\w+)\s+into\s+(?:strict\s+)?([^;]*)/gi,
+        ),
+      ].flatMap((m) => {
+        const consulta = consultaDelCursor.get(m[1]!.toLowerCase());
+        if (consulta === undefined) return [];
+        const destinos = listaDeDestinos(m[2]!);
+        return proyeccionDe(consulta).flatMap((fila) => porPosicionDeNombre(destinos, fila));
+      });
+      const derechas = [
+        ...inicializadas,
+        ...asignaciones,
+        ...entradas,
+        ...bucles,
+        ...dinamicas,
+        ...recorridos,
+        ...cursores,
+      ];
+      return derechas.some((d) => hojasDelValor(d).some((hoja) => RELOJ_A_SECAS.test(hoja)));
+    };
+
+    /*
+     * ── El destino tipado de una ESCRITURA ──
+     *
+     * Los tipos salen del catálogo, no de una lista, y con `format_type` y no con
+     * `information_schema`: aquél imprime `date`, `timestamp without time zone` y `date[]`
+     * exactamente como los escribe una declaración, que es lo que `SIN_HUSO_DECLARADO` ya
+     * sabe leer; `information_schema` dice `ARRAY` para lo tercero y habría hecho falta un
+     * segundo vocabulario para lo mismo.
+     */
+    /*
+     * `relkind in ('r', 'p')`: una tabla PARTICIONADA no es `'r'`, y el cuerpo guardado escribe
+     * contra el nombre del PADRE, no contra la partición. Sin ella en el inventario, `padre.d`
+     * no tiene tipo y la coerción no se ve. Medido: `insert into padre(k, d) values (1, now())`
+     * sobre un padre con `d date` guarda 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en
+     * Etc/GMT+12.
+     */
+    /*
+     * Y el tipo se DESENVUELVE si es un dominio: `create domain fecha as date` y una columna
+     * `fecha` coercionan igual que un `date` —medido, 2026-09-05 en Pacific/Kiritimati contra
+     * 2026-09-04 en Etc/GMT+12—, pero `format_type` sobre el atributo imprime el nombre del
+     * dominio y `SIN_HUSO_DECLARADO` no lo reconoce. Se baja recursivamente hasta el tipo base,
+     * porque un dominio puede estar definido sobre otro; el `typmod` propio solo vale si no se
+     * bajó ningún nivel.
+     */
+    const columnas = await sqlAdmin()`
+      select c.relname as tabla, a.attname as columna, a.attnum as posicion,
+             format_type(base.tipo, case when base.nivel = 0 then a.atttypmod else null end)
+               as tipo
+      from pg_attribute a
+      join pg_class c on c.oid = a.attrelid
+      join pg_namespace n on n.oid = c.relnamespace
+      join lateral (
+        with recursive desenvuelve(tipo, nivel) as (
+          select a.atttypid, 0
+          union all
+          select t.typbasetype, d.nivel + 1
+          from desenvuelve d join pg_type t on t.oid = d.tipo
+          where t.typtype = 'd' and t.typbasetype <> 0 and d.nivel < 16
+        )
+        select tipo, nivel from desenvuelve order by nivel desc limit 1
+      ) base on true
+      where n.nspname = 'public' and c.relkind in ('r', 'p')
+        and a.attnum > 0 and not a.attisdropped
+      order by c.relname, a.attnum`;
+    const TIPO_DE_COLUMNA = new Map<string, string>();
+    const COLUMNAS_EN_ORDEN = new Map<string, string[]>();
+    for (const f of columnas as unknown as {
+      tabla: string;
+      columna: string;
+      tipo: string;
+    }[]) {
+      /*
+       * Las claves van con el nombre TAL CUAL lo da el catálogo, que ya es el canónico:
+       * plegarlo otra vez rompe justo los citados. Medido: `create table "T" ("D" date)` se
+       * inventariaba como `t.d`, y `insert into "T"("D") values (now())` busca `T.D` —que es
+       * lo correcto—, no lo encuentra, y la escritura salía limpia (2026-09-05 en
+       * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12).
+       *
+       * Es la misma lección que el nombre de las variables, un sitio más: canonicalizar es una
+       * regla, y aplicarla en un lado y no en el otro es no aplicarla.
+       */
+      TIPO_DE_COLUMNA.set(`${f.tabla}.${f.columna}`, f.tipo);
+      const ya = COLUMNAS_EN_ORDEN.get(f.tabla) ?? [];
+      ya.push(f.columna);
+      COLUMNAS_EN_ORDEN.set(f.tabla, ya);
+    }
+
+    /**
+     * El nombre tal cual lo escribe Postgres: desnudo se pliega a minúsculas, citado no.
+     *
+     * Y con la forma `U&"…"`, que es un identificador escrito por PUNTOS DE CÓDIGO:
+     * `U&"\\0064"` es la columna `d` —medido, y con `UESCAPE '!'` la barra la sustituye el
+     * carácter que se declare—. Sin deshacerlo, la clave que se busca en el catálogo era la
+     * ortografía y no el nombre, así que no casaba con ninguna columna y la escritura salía
+     * limpia. Tercera vez que el mismo error aparece en otro dialecto: preguntar cómo está
+     * escrito algo en vez de qué es.
+     */
+    /*
+     * El conjunto de NOMBRES sin huso, para la comparación implícita. Se casa por nombre y no
+     * por (tabla, columna) porque en una expresión el calificador es un alias —`e.ventana_inicio`,
+     * `new.vence_en`— y resolverlo pediría analizar el `from`, que no es cosa de este censo.
+     *
+     * La premisa que lo hace correcto se COMPRUEBA, no se supone: ningún nombre puede ser sin
+     * huso en una tabla y con huso en otra. Hoy son ocho nombres y ninguno lo es; si algún día
+     * lo fuera, el censo lo dice en vez de empezar a marcar de más en silencio.
+     */
+    const NOMBRES_SIN_HUSO = new Set<string>();
+    const NOMBRES_CON_HUSO = new Set<string>();
+    const AMBIGUAS_REALES = new Set<string>();
+    for (const f of columnas as unknown as { tabla: string; columna: string; tipo: string }[]) {
+      (SIN_HUSO_DECLARADO.test(f.tipo) ? NOMBRES_SIN_HUSO : NOMBRES_CON_HUSO).add(
+        f.columna.toLowerCase(),
+      );
+    }
+    /*
+     * Un nombre que significa un tipo sin huso en una tabla y uno CON huso en otra no lo
+     * resuelve el nombre, así que el censo NO lo adivina: lo saca del conjunto. Es una omisión
+     * declarada y no un descuido — marcar de más ahí sería un falso positivo sobre la tabla
+     * inocente, y en un guardián eso cuesta lo mismo que un hueco.
+     *
+     * Lo aprendí de una sonda propia: las dos tablas fabricadas para el caso de la atribución
+     * equivocada tienen a propósito una columna `d` que significa cosas distintas, y fue justo
+     * ella la que hizo saltar esta comprobación.
+     *
+     * Y para que la omisión no crezca en silencio, se anota aparte cuáles vienen del ESQUEMA
+     * de verdad; eso tiene que estar vacío.
+     */
+    for (const f of columnas as unknown as { tabla: string; columna: string; tipo: string }[]) {
+      const c = f.columna.toLowerCase();
+      if (NOMBRES_SIN_HUSO.has(c) && NOMBRES_CON_HUSO.has(c) && !/^censo_probe_/.test(f.tabla))
+        AMBIGUAS_REALES.add(c);
+    }
+    for (const c of [...NOMBRES_SIN_HUSO]) if (NOMBRES_CON_HUSO.has(c)) NOMBRES_SIN_HUSO.delete(c);
+    COLUMNAS_AMBIGUAS = [...AMBIGUAS_REALES].sort();
+
+    /*
+     * El reconocedor va como UN patrón y en las dos direcciones, en vez de buscar la columna y
+     * luego rebanar el operando de al lado. Lo intenté así primero y no servía: recortar por
+     * comas y paréntesis parte `now()` por la mitad y se lleva por delante el `from` de la
+     * cola, así que el operando que salía nunca parecía un reloj. La forma correcta es exigir
+     * el reloj PEGADO al comparador, que es justo lo que hace peligrosa a la comparación.
+     */
+    if (NOMBRES_SIN_HUSO.size > 0) {
+      const alternativa = [...NOMBRES_SIN_HUSO].map(escapado).join('|');
+      /*
+       * El nombre puede ir ENTRECOMILLADO, y su calificador también: medido,
+       * `select "vence_en" > current_timestamp` hace la misma promoción —`false` en
+       * Pacific/Kiritimati y `true` en Etc/GMT+12— y el patrón solo admitía la forma desnuda.
+       * Peor: excluía explícitamente las comillas de al lado, así que la forma citada no es
+       * que se le escapara, es que la descartaba.
+       */
+      const CITADO = (t: string): string => String.raw`(?:"${t}"|${t})`;
+      const CALIFICADOR = String.raw`(?:(?:"[^"]+"|\w+)\s*\.\s*)?`;
+      const COLUMNA =
+        String.raw`(?<![\w.])${CALIFICADOR}${CITADO(`(?:${alternativa})`)}(?![\w])`;
+      /*
+       * Y el `BETWEEN`, que es TERNARIO y no lo cubría ningún comparador: `vence_en between
+       * current_timestamp and current_timestamp + interval '1 day'`, con `vence_en date`,
+       * promueve la columna con el huso de la sesión igual que un `<`. Medido sobre tres
+       * fechas seguidas: la promovida sale `2026-09-05 00:00:00+14` en Pacific/Kiritimati y
+       * `2026-09-05 00:00:00-12` en Etc/GMT+12, y el resultado cambia de fila —`2026-09-06`
+       * cae dentro en el primer huso y `2026-09-05` en el segundo—.
+       *
+       * Cuatro patrones porque hay dos límites y dos órdenes: el reloj puede ser cualquiera de
+       * los dos extremos, y también puede ser el término de la IZQUIERDA con la columna de
+       * límite —`now() between vence_en and timestamptz '2030-01-01'`, medido con el mismo
+       * vuelco de fila—. El `not` y el `symmetric` van opcionales, y el `not` se escribe UNA
+       * vez, en `ENTRE`, para que las dos formas del ternario no puedan discrepar.
+       *
+       * Los cuatro se comprueban de uno en uno y cada sonda está escrita para que solo la coja
+       * SU patrón. No es celo: escribiéndolas de la forma natural —el reloj a los dos lados
+       * del `and`— las cazaba a todas el patrón del límite superior, y quitar el del inferior
+       * no movía ninguna. Cuatro sondas que en realidad probaban una.
+       *
+       * El hueco entre límites no cruza un `and`, por lo mismo que en el censo de plantillas:
+       * con `[^;]*?` el patrón alcanzaría el `and` de la condición de al lado y marcaría por
+       * lo que no es.
+       */
+      const ENTRE = String.raw`\s+(?:not\s+)?between`;
+      const LIMITES = String.raw`${ENTRE}\s+(?:a?symmetric\s+)?`;
+      const HASTA_EL_AND = String.raw`${ENTRE}\b(?:(?!\band\b)[^;])*?\band\s+`;
+      const COMPARA_CON_RELOJ = new RegExp(
+        String.raw`${COLUMNA}\s*${COMPARADOR}\s*(?:${RELOJ})` +
+          String.raw`|(?:${RELOJ})\s*${COMPARADOR}\s*${COLUMNA}` +
+          String.raw`|${COLUMNA}${LIMITES}(?:${RELOJ})` +
+          String.raw`|${COLUMNA}${HASTA_EL_AND}(?:${RELOJ})` +
+          String.raw`|(?:${RELOJ})${LIMITES}${COLUMNA}` +
+          String.raw`|(?:${RELOJ})${HASTA_EL_AND}${COLUMNA}`,
+        'i',
+      );
+      RELOJ_COMPARADO_CON_COLUMNA = (texto: string): boolean => COMPARA_CON_RELOJ.test(texto);
+    }
+
+    const nombreCanonico = (t: string): string => {
+      const n = t.trim();
+      const uni = /^[Uu]&"((?:[^"]|"")*)"(?:\s+uescape\s+'(.)')?$/is.exec(n);
+      if (uni) {
+        const marca = uni[2] ?? '\\';
+        const escapa = marca.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return uni[1]!
+          .replace(/""/g, '"')
+          .replace(
+            new RegExp(`${escapa}(?:\\+([0-9A-Fa-f]{6})|([0-9A-Fa-f]{4})|(${escapa}))`, 'g'),
+            (_todo, seis?: string, cuatro?: string, propia?: string) =>
+              propia !== undefined
+                ? marca
+                : String.fromCodePoint(parseInt((seis ?? cuatro)!, 16)),
+          );
+      }
+      return n.startsWith('"') ? n.slice(1, -1).replace(/""/g, '"') : n.toLowerCase();
+    };
+    /** Lo que hay entre el paréntesis que empieza en `desde` y el que lo cierra. */
+    const parejaDeParentesis = (texto: string, desde: number): string | null => {
+      let nivel = 0;
+      for (let i = desde; i < texto.length; i++) {
+        if (texto[i] === '(') nivel++;
+        else if (texto[i] === ')' && --nivel === 0) return texto.slice(desde + 1, i);
+      }
+      return null;
+    };
+
+    /*
+     * LÍMITES DECLARADOS, y son de forma, no de fondo: un `insert … select …` no trae la
+     * expresión pegada a su columna en el texto, y la forma de fila del `update`
+     * —`set (a, b) = (…)`— tampoco. Las dos se quedan fuera y se dicen aquí en vez de
+     * descubrirse. Lo que sí entra es el `insert` con lista de columnas, el `insert` SIN
+     * lista —que va por posición, y por eso el catálogo se lee ordenado por `attnum`— y el
+     * `update … set col = expr`.
+     */
+    /*
+     * Un nombre SQL, en las tres ortografías: desnudo, entrecomillado y por puntos de código.
+     * La tercera vale también para la TABLA, no solo para la columna —
+     * `insert into U&"\\0073onda"."\\006b2"(…)` escribe en `sonda.k2`—, y sin admitirla aquí
+     * el reconocedor ni siquiera llegaba a `nombreCanonico`, que ya sabía decodificarla.
+     */
+    const NOMBRE_SQL = String.raw`(?:[Uu]&"(?:[^"]|"")*"(?:\s+uescape\s+'.')?|"(?:[^"]|"")+"|\w+)`;
+    /*
+     * Entre la lista de columnas y la fuente de las filas cabe además el `OVERRIDING`, que
+     * decide qué gana cuando la columna es de identidad. Medido: `insert into t(k, d)
+     * overriding user value values (1, now())` guarda 2026-09-05 en Pacific/Kiritimati y
+     * 2026-09-04 en Etc/GMT+12. Y sin lista de columnas era peor que un hueco: `overriding` se
+     * tomaba por ALIAS de la tabla y el patrón moría al llegar a `user`.
+     */
+    const SOBRESCRIBE = String.raw`(?:overriding\s+(?:system|user)\s+value\s+)?`;
+    const INSERTA = new RegExp(
+      // El destino de un `insert` también admite ALIAS, entre la tabla y la lista de
+      // columnas: `insert into t as x(k, d) values (…)`. Medido: 2026-09-05 contra
+      // 2026-09-04. El `(?!values\b)` evita que un `insert into t values (…)` tome `values`
+      // por alias.
+      String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
+        String.raw`(?:\s+(?:as\s+)?(?!values\b|with\b|overriding\b)${NOMBRE_SQL})?\s*` +
+        String.raw`(?:\(([^)]*)\)\s*)?${SOBRESCRIBE}(?:values\s*\(|(with)\s+)`,
+      'gi',
+    );
+    /*
+     * El `insert … select`, que era límite declarado y ya no hace falta que lo sea: la lista
+     * de selección se reparte por posición contra las columnas igual que una tupla de
+     * `values`. Medido: `insert into t(k, d) select 2, now()` guarda 2026-09-05 en
+     * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+     *
+     * Lo que NO se sigue es el `where`, por lo de siempre: ahí el reloj filtra, no se guarda.
+     * Y el corte tiene que hacerse: la sonda lleva un `from` a propósito, porque sin él el
+     * último valor de la lista sería ya un reloj a secas y el caso pasaría con corte y sin
+     * él — probando el emparejamiento, sí, pero no el límite.
+     */
+    const INSERTA_SELECT = new RegExp(
+      String.raw`\binsert\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
+        String.raw`(?:\s+(?:as\s+)?(?!select\b|values\b|with\b|overriding\b)${NOMBRE_SQL})?\s*` +
+        String.raw`(?:\(([^)]*)\)\s*)?${SOBRESCRIBE}(?:select\s+([^;]*)|(with)\s+)`,
+      'gi',
+    );
+    /*
+     * Entre la lista de columnas de un `insert` y el `select`/`values` que le entrega las filas
+     * cabe una lista de CTEs: `insert into t(k, d) with x as (select 1) select 1, now()`.
+     * Medido, y también con `values` en vez de `select` y con el CTE llevando su propia lista
+     * de columnas —`with x (a) as (…)`—: las tres guardan 2026-09-05 en Pacific/Kiritimati y
+     * 2026-09-04 en Etc/GMT+12.
+     *
+     * El salto NO se hace con una expresión regular, y no por gusto: el cuerpo de un CTE anida
+     * paréntesis y lleva dentro su propio `select`, así que saltar «hasta el primer `select`»
+     * se queda con el del CTE y empareja la lista equivocada. Se recorre la gramática —
+     * `nombre [(columnas)] as [not] [materialized] (cuerpo)`, separados por comas— y se
+     * devuelve dónde acaba la lista, o `null` si eso no es una lista de CTEs.
+     */
+    const CABEZA_CTE = new RegExp(
+      String.raw`^\s*${NOMBRE_SQL}\s*(?:\([^)]*\)\s*)?as\s+(?:not\s+)?(?:materialized\s+)?\(`,
+      'i',
+    );
+    const finDeLosCTEs = (texto: string, desde: number): number | null => {
+      const recursivo = /^\s*recursive\b/i.exec(texto.slice(desde));
+      let i = desde + (recursivo?.[0].length ?? 0);
+      for (;;) {
+        const cabeza = CABEZA_CTE.exec(texto.slice(i));
+        if (cabeza === null) return null;
+        const abre = i + cabeza[0].length - 1;
+        const dentro = parejaDeParentesis(texto, abre);
+        if (dentro === null) return null;
+        i = abre + dentro.length + 2;
+        const coma = /^\s*,/.exec(texto.slice(i));
+        if (coma === null) return i;
+        i += coma[0].length;
+      }
+    };
+    /*
+     * Y el `MERGE`, que es un `update` y un `insert` con otra sintaxis y sin repetir la tabla
+     * en cada rama. Medido: `merge … when matched then update set d = now()` guarda
+     * 2026-09-05 contra 2026-09-04. Está en Postgres desde la 15, que es la de este CI.
+     */
+    const FUSIONA = new RegExp(
+      String.raw`\bmerge\s+into\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
+        String.raw`(?:\s+(?:as\s+)?(?!using\b)${NOMBRE_SQL})?\s+using\b([^;]*)`,
+      'gi',
+    );
+    const RAMA_ACTUALIZA = /\bthen\s+update\s+set\s+([\s\S]*?)(?=\bwhen\b|$)/gi;
+    /** `declare r <tabla>%rowtype;` y `declare v <tabla>.<columna>%type;`. */
+    const FILA_DEL_CATALOGO = new RegExp(
+      String.raw`(?<![\w"])(${NOMBRE_SQL})\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s*%\s*rowtype\b`,
+      'gi',
+    );
+    /*
+     * Y con su inicializador, que es la misma lección que ya se aprendió con las variables de
+     * tipo escrito: `declare v t.d%type := now();` no tiene ninguna sentencia de asignación
+     * que buscar. Medido: 2026-09-05 contra 2026-09-04.
+     */
+    const COLUMNA_DEL_CATALOGO = new RegExp(
+      String.raw`(?<![\w"])(${NOMBRE_SQL})\s+(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})\s*\.\s*(${NOMBRE_SQL})\s*%\s*type\b` +
+        String.raw`(?:\s*(?::=|=|\bdefault\b)\s*(?<inicial>[^;]*))?`,
+      'gi',
+    );
+    /*
+     * Las dos formas de asignar después: `:=` sin más, y `=` exigiendo empezar SENTENCIA,
+     * porque ese signo también es una comparación. Es la misma distinción que ya rige para las
+     * variables con el tipo escrito, y aquí faltaba.
+     */
+    /*
+     * Y en las DOS ortografías, como las variables de tipo escrito: `declare "D" t.d%type;
+     * begin "D" := now();` es válida y depende del huso —medido, 2026-09-05 contra
+     * 2026-09-04—, y quitarle las comillas antes de construir el patrón la hacía invisible,
+     * porque la guarda de la izquierda impide casar la `D` de dentro de `"D"`.
+     */
+    const formasDeLaVariable = (crudo: string): string => {
+      const n = nombreCanonico(crudo.trim());
+      const citada = `"${escapado(n.replace(/"/g, '""'))}"`;
+      return (/^[A-Za-z_]\w*$/.test(n) ? [escapado(n), citada] : [citada]).join('|');
+    };
+    const ASIGNA_DESPUES = (variable: string): RegExp =>
+      new RegExp(
+        String.raw`(?<![\w".])(?:${variable})\s*:=\s*([^;]*)` +
+          String.raw`|(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*(?:${variable})\s*=(?!=)\s*([^;]*)`,
+        'gi',
+      );
+    const RAMA_INSERTA = /\bthen\s+insert\s*(?:\(([^)]*)\)\s*)?values\s*\(([\s\S]*?)\)(?=\s*(?:\bwhen\b|$))/gi;
+    const ACTUALIZA = new RegExp(
+      // El destino puede llevar ALIAS —`update t as x set …`, con `as` o sin él—, y el tipo
+      // de la columna se sigue consultando por la tabla de verdad, no por el alias. Medido:
+      // 2026-09-05 contra 2026-09-04. El `(?!set\b)` es para que un `update t set …` no tome
+      // `set` por alias y se quede sin cláusula que mirar.
+      String.raw`\bupdate\s+(?:only\s+)?(?:${NOMBRE_SQL}\s*\.\s*)?(${NOMBRE_SQL})` +
+        String.raw`(?:\s+(?:as\s+)?(?!set\b)${NOMBRE_SQL})?\s+set\s+([^;]*)`,
+      'gi',
+    );
+    /*
+     * `execute <consulta> [into …] using <expr>, <expr>`. La consulta puede venir en un
+     * literal simple o entrecomillada por dólar; en las dos, lo que se busca es un marcador
+     * `$n` colapsado a un tipo sin huso —`$1::date` o `cast($1 as date)`—, y entonces la
+     * n-ésima expresión del `using` es la que se entrega a ese tipo.
+     *
+     * LÍMITE DECLARADO, el de siempre: si la consulta está en una variable no se puede leer.
+     */
+    const EJECUTA_CON_USING =
+      /\bexecute\s+(?:[A-Za-z_]*&?'((?:[^']|'')*)'|\$([A-Za-z_]\w*)?\$([\s\S]*?)\$\2\$)[\s\S]*?\busing\s+([^;]*)/gi;
+    /*
+     * `returns table(col tipo, …)` y, si el cuerpo es un `select`, su lista de selección
+     * emparejada por POSICIÓN con las columnas cuyo tipo declarado no lleva huso. El tipo se
+     * lee de la firma, no del catálogo, porque ahí está escrito.
+     */
+    const TABLA_DEVUELTA =
+      /\breturns\s+(?:setof\s+)?table\s*\(([\s\S]*?)\)\s*(?:language|as|return|stable|immutable|volatile|window|strict|security|parallel|cost|rows|support|set\b)/i;
+    const CUERPO_SELECT = /\bselect\s+([\s\S]*)$/i;
+    RELOJ_PROYECTADO_A_TABLA = (texto: string): boolean => {
+      const firma = TABLA_DEVUELTA.exec(texto);
+      if (firma === null) return false;
+      const tipos = argumentosDe(firma[1]!).map((c) => {
+        const t = c.trim();
+        const corte = t.search(/\s/);
+        return corte < 0 ? '' : t.slice(corte + 1).trim();
+      });
+      const cuerpo = CUERPO_SELECT.exec(texto.slice(firma.index + firma[0].length));
+      if (cuerpo === null) return false;
+      const valores = argumentosDe(hastaLaClausula(cuerpo[1]!)).map(sinAlias);
+      return tipos.some(
+        (t, i) =>
+          SIN_HUSO_DECLARADO.test(t) &&
+          valores[i] !== undefined &&
+          hojasDelValor(valores[i]!).some((h) => RELOJ_A_SECAS.test(h)),
+      );
+    };
+
+    RELOJ_EN_PARAMETRO_DINAMICO = (texto: string): boolean => {
+      for (const m of texto.matchAll(EJECUTA_CON_USING)) {
+        const consulta = (m[1] ?? m[3] ?? '').replace(/''/g, "'");
+        const argumentos = argumentosDe(m[4]!);
+        const marcadores = new RegExp(
+          String.raw`\$(\d+)\s*::\s*${ESQUEMA}(?:${TIPO_SIN_HUSO})|cast\s*\(\s*\$(\d+)\s+as\s+${ESQUEMA}(?:${TIPO_SIN_HUSO})`,
+          'gi',
+        );
+        for (const p of consulta.matchAll(marcadores)) {
+          const numero = Number(p[1] ?? p[2]);
+          const arg = argumentos[numero - 1];
+          if (arg !== undefined && hojasDelValor(arg).some((h) => RELOJ_A_SECAS.test(h)))
+            return true;
+        }
+      }
+      return false;
+    };
+
+    RELOJ_ESCRITO_EN_COLUMNA = (texto: string): boolean => {
+      const entrega = (tabla: string, columna: string, expr: string): boolean => {
+        const tipo = TIPO_DE_COLUMNA.get(`${tabla}.${columna}`);
+        return (
+          tipo !== undefined &&
+          SIN_HUSO_DECLARADO.test(tipo) &&
+          hojasDelValor(expr).some((hoja) => RELOJ_A_SECAS.test(hoja))
+        );
+      };
+      /**
+       * Una cláusula `set`. Cada pieza es `col = expr`, y también la forma de FILA
+       * —`set (a, b) = (e1, e2)`—, que reparte por posición y ya no es un límite declarado:
+       * medido, `update t set (d, ts) = (now(), now())` guarda 2026-09-05 en
+       * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+       */
+      const asignacionCulpable = (tabla: string, clausulaCruda: string): boolean =>
+        argumentosDe(hastaLaClausula(clausulaCruda)).some((pieza) => {
+          const corte = pieza.indexOf('=');
+          if (corte < 0) return false;
+          const izquierda = pieza.slice(0, corte).trim();
+          const derecha = pieza.slice(corte + 1).trim();
+          if (izquierda.startsWith('(') && derecha.startsWith('(')) {
+            const columnas = argumentosDe(izquierda.slice(1, -1)).map(nombreCanonico);
+            const valores = argumentosDe(derecha.slice(1, -1));
+            return columnas.some(
+              (c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!),
+            );
+          }
+          return entrega(tabla, nombreCanonico(izquierda), derecha);
+        });
+      /** Una lista de valores emparejada por POSICIÓN con una lista de columnas. */
+      const porPosicion = (tabla: string, destinos: string[], valores: string[]): boolean =>
+        destinos.some((c, i) => valores[i] !== undefined && entrega(tabla, c, valores[i]!));
+      /*
+       * Y las variables que toman su tipo del CATÁLOGO en vez de escribirlo. Son dos formas y
+       * las dos se miden 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   declare r t%rowtype;   begin r.d := now();   el campo `d` de la fila
+       *   declare v t.d%type;    begin v := now();     el tipo de esa columna
+       *
+       * Van aquí y no con las demás variables porque lo que decide está en el catálogo, que es
+       * lo que este reconocedor tiene a mano. En el texto no hay ningún tipo que leer: hay un
+       * nombre de tabla y un `%`.
+       */
+      for (const m of texto.matchAll(FILA_DEL_CATALOGO)) {
+        const tabla = nombreCanonico(m[2]!);
+        const variable = escapado(sinComillas(m[1]!.trim()));
+        for (const a of texto.matchAll(
+          new RegExp(
+            String.raw`(?<![\w"])${variable}\s*\.\s*(${NOMBRE_SQL})\s*:=\s*([^;]*)` +
+              String.raw`|(?:^|;|\bbegin\b|\bthen\b|\belse\b|\bloop\b)\s*${variable}\s*\.\s*(${NOMBRE_SQL})\s*=(?!=)\s*([^;]*)`,
+            'gi',
+          ),
+        )) {
+          if (entrega(tabla, nombreCanonico(a[1] ?? a[3]!), a[2] ?? a[4]!)) return true;
+        }
+      }
+      for (const m of texto.matchAll(COLUMNA_DEL_CATALOGO)) {
+        const tabla = nombreCanonico(m[2]!);
+        const columna = nombreCanonico(m[3]!);
+        const inicial = m.groups?.inicial;
+        if (inicial !== undefined && entrega(tabla, columna, inicial)) return true;
+        for (const a of texto.matchAll(ASIGNA_DESPUES(formasDeLaVariable(m[1]!)))) {
+          if (entrega(tabla, columna, a[1] ?? a[2]!)) return true;
+        }
+        /*
+         * Y el `select … into`, que es la tercera forma de que a una variable le caiga un
+         * valor y la que faltaba aquí: las de tipo escrito ya la miraban. Medido:
+         * `declare v t.d%type; begin select now() into v; …` da 2026-09-05 en
+         * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+         */
+        for (const a of PARES_INTO.flatMap((r) => [...texto.matchAll(new RegExp(r, 'gi'))])) {
+          const destinos = argumentosDe(hastaLaClausula(a[2]!)).map((d) =>
+            sinComillas(d.trim()).toLowerCase(),
+          );
+          const valores = argumentosDe(hastaLaClausula(a[1]!)).map(sinAlias);
+          const i = destinos.indexOf(sinComillas(m[1]!.trim()).toLowerCase());
+          if (i >= 0 && valores[i] !== undefined && entrega(tabla, columna, valores[i]!))
+            return true;
+        }
+      }
+      for (const m of texto.matchAll(INSERTA)) {
+        const tabla = nombreCanonico(m[1]!);
+        /*
+         * TODAS las tuplas, no la primera: un `values (…), (…)` mete varias filas y cada una
+         * se coerciona por su cuenta. Medido: `values (date '2026-01-01'), (now())` sobre una
+         * columna `date` guarda 2026-01-01 y 2026-09-05 en Pacific/Kiritimati, y 2026-01-01 y
+         * 2026-09-04 en Etc/GMT+12 — o sea que quedarse con la primera es mirar justo la fila
+         * que suele ser inocente.
+         */
+        let cursor = m.index + m[0].length - 1;
+        // Con CTEs por medio, el `(` de la primera tupla está detrás de ellos y no aquí.
+        if (m[3] !== undefined) {
+          const fin = finDeLosCTEs(texto, m.index + m[0].length);
+          if (fin === null) continue;
+          const abre = /^\s*values\s*\(/i.exec(texto.slice(fin));
+          if (abre === null) continue;
+          cursor = fin + abre[0].length - 1;
+        }
+        const tuplas: string[] = [];
+        for (;;) {
+          const dentro = parejaDeParentesis(texto, cursor);
+          if (dentro === null) break;
+          tuplas.push(dentro);
+          cursor += dentro.length + 2;
+          const siguiente = /^\s*,\s*\(/.exec(texto.slice(cursor));
+          if (!siguiente) break;
+          cursor += siguiente[0].length - 1;
+        }
+        if (tuplas.length === 0) continue;
+        const destinos =
+          m[2] === undefined
+            ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
+            : argumentosDe(m[2]).map(nombreCanonico);
+        if (tuplas.some((t) => porPosicion(tabla, destinos, argumentosDe(t)))) return true;
+        /*
+         * Y el `ON CONFLICT … DO UPDATE SET`, que es un `update` con la tabla escrita arriba:
+         * el propio `update` no lleva nombre detrás, así que el reconocedor de `UPDATE` no lo
+         * ve y la tabla hay que traerla del `insert` que lo contiene. Medido:
+         * `on conflict (k) do update set d = now()` sobre una columna `date` guarda
+         * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12.
+         */
+        // `cursor` quedó justo detrás del paréntesis que cierra la última tupla.
+        const cola = texto.slice(cursor);
+        const enConflicto =
+          // El salto hasta el `do update` no cruza un `;`: si lo cruzara, un
+          // `on conflict … do nothing;` seguido de un `update` de OTRA tabla se leería como
+          // si el `set` de aquél fuera de ésta, y la culpa saldría atribuida a quien no es.
+          /^\s*on\s+conflict\b[^;]*?\bdo\s+update\s+set\s+([^;]*)/i.exec(
+            cola,
+          );
+        if (enConflicto && asignacionCulpable(tabla, enConflicto[1]!)) return true;
+      }
+      for (const m of texto.matchAll(ACTUALIZA)) {
+        if (asignacionCulpable(nombreCanonico(m[1]!), m[2]!)) return true;
+      }
+      for (const m of texto.matchAll(INSERTA_SELECT)) {
+        const tabla = nombreCanonico(m[1]!);
+        let lista = m[3];
+        if (lista === undefined) {
+          const fin = finDeLosCTEs(texto, m.index + m[0].length);
+          if (fin === null) continue;
+          const sel = /^\s*select\s+([^;]*)/i.exec(texto.slice(fin));
+          if (sel === null) continue;
+          lista = sel[1]!;
+        }
+        const destinos =
+          m[2] === undefined
+            ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
+            : argumentosDe(m[2]).map(nombreCanonico);
+        /*
+         * El `ON CONFLICT` también viene detrás de un `SELECT`, y ahí no lo miraba nadie: la
+         * rama que analiza el `DO UPDATE SET` vive en el reconocedor del `VALUES`, y `ACTUALIZA`
+         * no ve este `update` porque no lleva tabla detrás. Medido: `insert into t(k, d) select
+         * 1, date '2026-01-01' on conflict (k) do update set d = now()` guarda 2026-09-05 en
+         * Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12 cuando hay conflicto.
+         *
+         * Y la proyección se corta ahí antes de emparejarla: la cláusula no es una columna.
+         */
+        const conflicto = /\bon\s+conflict\b/i.exec(lista);
+        const proyeccion = conflicto === null ? lista : lista.slice(0, conflicto.index);
+        if (porPosicion(tabla, destinos, argumentosDe(hastaLaClausula(proyeccion)).map(sinAlias)))
+          return true;
+        const enConflicto = /\bon\s+conflict\b[^;]*?\bdo\s+update\s+set\s+([^;]*)/i.exec(
+          lista,
+        );
+        if (enConflicto !== null && asignacionCulpable(tabla, enConflicto[1]!)) return true;
+      }
+      for (const m of texto.matchAll(FUSIONA)) {
+        const tabla = nombreCanonico(m[1]!);
+        const cuerpo = m[2]!;
+        for (const r of cuerpo.matchAll(RAMA_ACTUALIZA)) {
+          if (asignacionCulpable(tabla, r[1]!)) return true;
+        }
+        for (const r of cuerpo.matchAll(RAMA_INSERTA)) {
+          const destinos =
+            r[1] === undefined
+              ? (COLUMNAS_EN_ORDEN.get(tabla) ?? [])
+              : argumentosDe(r[1]).map(nombreCanonico);
+          if (porPosicion(tabla, destinos, argumentosDe(r[2]!))) return true;
+        }
+      }
+      return false;
+    };
+  }, PACIENCIA);
+
+  /** Lo que hace culpable a un cuerpo: la palabra clave o cualquiera de las operaciones. */
+  /**
+   * Recibe el texto CRUDO y hace él mismo el barrido, en sus dos formas. Antes lo hacía cada
+   * llamante y dos no lo hacían: el guardián no llegaba a limpiar lo que iba a mirar. Que la
+   * limpieza no se pueda olvidar vale más que la flexibilidad de elegirla.
+   *
+   * Los patrones que LEEN el literal van contra el texto con los literales dentro; todo lo
+   * demás, contra el texto con los literales vacíos, porque una palabra del reloj dentro de un
+   * literal es un dato y no una lectura del calendario.
+   */
+  /*
+   * El `tipoDeclarado` es lo que la EXPRESIÓN NO DICE. Postgres coerciona sin que nadie
+   * escriba un cast: una función `returns date` cuyo cuerpo es `return now()` devuelve el día
+   * del huso de quien llama —medido: 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en
+   * Etc/GMT+12— y en el texto solo hay un `now()` desnudo, que este censo declara seguro y con
+   * razón. Lo mismo un `default now()` sobre una columna `date`, que el catálogo guarda como
+   * `now()` a secas (comprobado) y coerciona en cada `INSERT`.
+   *
+   * O sea que había una familia entera invisible, y no porque el reconocedor fuera corto: el
+   * dato que decide no está en lo que el reconocedor lee. Quien llama a `culpable` sobre algo
+   * cuyo destino tiene tipo —una función por su `prorettype`, un default por el tipo de su
+   * columna— lo pasa, y quien no lo tiene lo omite.
+   */
+  const culpable = (
+    crudo: string,
+    dialecto: 'sql' | 'ts' = 'sql',
+    tipoDeclarado?: string,
+  ): boolean => {
+    const conLiterales = sinComentarios(crudo, dialecto);
+    const sinLiterales = sinComentarios(crudo, dialecto, true);
+    return (
+      DEL_HUSO_DE_LA_SESION.test(sinLiterales) ||
+      RELOJ_COLAPSADO_A_DIA.some((r) => r.test(sinLiterales)) ||
+      RELOJ_LEYENDO_LITERAL.some((r) => r.test(conLiterales)) ||
+      (tipoDeclarado !== undefined &&
+        SIN_HUSO_DECLARADO.test(tipoDeclarado) &&
+        RELOJ_ENTREGADO(sinLiterales)) ||
+      RELOJ_ASIGNADO_A_VARIABLE(sinLiterales, conLiterales) ||
+      RELOJ_ESCRITO_EN_COLUMNA(sinLiterales) ||
+      /*
+       * Y el parámetro de un `EXECUTE … USING`, que es otro destino tipado con el tipo escrito
+       * en OTRO sitio: `execute 'select $1::date' into d using now()` entrega el instante al
+       * marcador y el SQL dinámico lo colapsa con el huso de quien llama —medido, 2026-09-05
+       * en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12—. La consulta se analiza sola y
+       * ahí `$1::date` no es ningún reloj; el reloj está fuera, en el `using`, donde no hay
+       * cast que mirar. Se emparejan por número, que es como los empareja Postgres.
+       */
+      RELOJ_EN_PARAMETRO_DINAMICO(conLiterales) ||
+      RELOJ_PROYECTADO_A_TABLA(sinLiterales) ||
+      RELOJ_COMPARADO_CON_COLUMNA(sinLiterales) ||
+      /*
+       * Y el SQL DINÁMICO: `execute 'select now()::date'` guarda la operación DENTRO de un
+       * literal, que el vaciado se lleva por delante. La función depende del huso de quien la
+       * llama igual que si estuviera escrita fuera. Se extrae y se analiza por su cuenta,
+       * deshaciendo la duplicación de comillas; cada nivel quita una capa, así que la
+       * recursión termina.
+       *
+       * Y el literal puede ir ENVUELTO: `execute format('select now()::date')` es la forma
+       * normal de componer SQL dinámico en plpgsql, y el catálogo la conserva —comprobado—.
+       * Se admiten las llamadas envolventes que haya delante.
+       *
+       * LÍMITE DECLARADO: `execute v_sql`, con la consulta en una variable, no se puede leer
+       * desde el texto; y un `format` con marcadores mete trozos que aquí no están.
+       */
+      /*
+       * Y el literal por DÓLAR, que es la otra forma de escribir el SQL de un `EXECUTE`.
+       * Dentro del cuerpo de una función el delimitador exterior ya es un dólar, así que
+       * `execute $q$select now()::date$q$` viajaba como literal ANIDADO: el vaciado se llevaba
+       * su contenido y la extracción, que solo miraba comillas simples, no lo recuperaba. La
+       * función dependía del huso igual y el censo la daba por limpia.
+       *
+       * `\\1` con la etiqueta opcional cubre las dos formas: con `$$…$$` el grupo no casa nada
+       * y la referencia vale la cadena vacía. Aquí no hay escapes que deshacer — un
+       * entrecomillado por dólar no los tiene, que es justo para lo que existe.
+       */
+      [
+        ...conLiterales.matchAll(
+          /\bexecute\s+(?:\w+\s*\(\s*)*\$([A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?\$([\s\S]*?)\$\1\$/gi,
+        ),
+      ].some((m) => culpable(m[2]!, 'sql')) ||
+      [
+        ...conLiterales.matchAll(
+          /\bexecute\s+(?:\w+\s*\(\s*)*((?:[A-Za-z_]*&?'(?:[^']|'')*'|\d+)(?:\s*(?:\|\||,)\s*(?:[A-Za-z_]*&?'(?:[^']|'')*'|\d+|\w+))*)/gi,
+        ),
+      ].some((m) =>
+        /*
+         * La cadena ENTERA, no el primer literal. `execute 'select now()' || '::date'` ejecuta
+         * una consulta que depende del huso, y leyendo solo el primer trozo se leía
+         * `select now()` —seguro— y la función pasaba limpia. El SQL que se ejecuta es la
+         * concatenación, así que es la concatenación lo que se analiza.
+         *
+         * LÍMITE DECLARADO, el mismo de siempre y ahora con una forma más: si en medio de la
+         * concatenación hay una VARIABLE, sus trozos no están en el texto. La cadena se corta
+         * ahí, igual que `execute v_sql` no se puede leer.
+         */
+        (() => {
+          /*
+           * Los argumentos, y no solo los LITERALES. Un número desnudo es un argumento con
+           * todas las letras —`format('select %2$*1$s::date', 0, 'now()')` da exactamente
+           * `select now()::date`, medido— y dejarlo fuera no lo omitía: DESPLAZABA todo lo de
+           * detrás, porque las posiciones de `format` cuentan argumentos, no comillas. La
+           * lista se cortaba además en el primer número, así que el reloj ni siquiera
+           * llegaba. Un número se sustituye por su propio texto, que es lo que hace Postgres.
+           *
+           * Y lo que no se puede leer —una VARIABLE— tampoco se puede tirar, que era el otro
+           * fallo: cortaba la lista ahí y se perdían los argumentos de DETRÁS, que sí eran
+           * constantes. `format('select %3$s::date', 0, v, 'now()')` produce
+           * `select now()::date` pase lo que pase con `v` —medido— y el reloj estaba en el
+           * tercero. Así que un argumento ilegible ocupa su HUECO y aporta la cadena vacía:
+           * su contenido sigue sin estar en el texto, pero su posición sí.
+           */
+          const trozos = [
+            ...m[1]!.matchAll(/[A-Za-z_]*&?'((?:[^']|'')*)'|(\d+)|(\w+)/g),
+          ].map((l) => (l[1] !== undefined ? l[1].replace(/''/g, "'") : (l[2] ?? '')));
+          /*
+           * Los DOS pegados, y no uno: ninguno es la verdad para las dos formas. `||` une
+           * exactamente —`'select now()' || '::date'` tiene que quedar sin hueco o el casto no
+           * se pega—, mientras que `format('select %s', 'now()::date')` mete el trozo donde
+           * está el marcador, y pegado a secas queda `%snow()` sin frontera de palabra: el
+           * reloj deja de reconocerse. Con hueco pasa lo contrario, se parte `'da' ||
+           * 'te_trunc'`. Se miran los dos y basta con que uno sea culpable, que es el lado
+           * seguro.
+           */
+          /*
+           * Y una TERCERA lectura, porque `format` no PEGA los trozos: los mete DONDE está el
+           * marcador. `execute format('select %s::date', 'now()')` ejecuta `select now()::date`
+           * —medido— y las dos concatenaciones daban `select %s::datenow()` y
+           * `select %s::date now()`: en ninguna de las dos se reconoce el reloj pegado a su casto,
+           * así que la consulta se escapaba entera. Un marcador que PARTE la expresión no se
+           * arregla pegando los trozos, ni con hueco ni sin él; hay que sustituirlo.
+           *
+           * Se reconstruye lo que `format` produce, medido cada caso: `%s` mete el argumento tal
+           * cual, `%L` entre comillas simples duplicando las de dentro, `%I` entre dobles, `%%` es
+           * un porciento. Es una lectura MÁS, no en vez de: si el envoltorio no era `format`, no
+           * hay marcadores que sustituir y la reconstrucción se queda en el primer trozo, que las
+           * otras dos ya miraban.
+           *
+           * Los POSICIONALES se resuelven por su número, que es como los resuelve Postgres
+           * —medido: `format('%1$s y %1$s', 'now()')` da `now() y now()`—. La anchura (`%10s`) se
+           * reconoce en la sintaxis y se ignora al rellenar: los espacios de más no cambian que el
+           * reloj esté ahí.
+           *
+           * LÍMITE DECLARADO: un argumento que NO esté en el texto —una variable— deja su marcador
+           * sin nada que poner, igual que en las otras dos lecturas la cadena se corta ahí.
+           *
+           * Y una honestidad sobre el `%%`: la rama existe porque sin ella `'%%s'` se leería como
+           * marcador y metería el argumento donde Postgres no mete nada (medido: `format('%%s',
+           * 'now()::date')` da `select %s`). Pero NINGUNA sonda la sostiene, y no por falta de
+           * ganas: el pegado con hueco ya marca ese caso —`select %%s now()::date`— y marcar de
+           * más ahí es la postura declarada de las dos lecturas de arriba. La rama se queda para
+           * que la reconstrucción diga la verdad, no para que aporte una marca.
+           */
+          const comoFormat = (partes: string[]): string => {
+            let siguiente = 1;
+            return partes[0]!.replace(
+              /%(?:(\d+)\$)?[-+ 0]*(\d+|\*(?:\d+\$)?)?([sIL%])/g,
+              (
+                _todo,
+                posicion: string | undefined,
+                ancho: string | undefined,
+                tipo: string,
+              ) => {
+                if (tipo === '%') return '%';
+                /*
+                 * El ancho puede venir de OTRO ARGUMENTO —`%*s` lo toma del siguiente,
+                 * `%*n$s` del n-ésimo—, y eso no es cosmética: el `*` a secas SE COME un
+                 * argumento del contador secuencial, así que sin contarlo todo lo que viene
+                 * detrás se lee corrido. Medido: `format('[%*s][%s]', 4, 'a', 'b')` da
+                 * `[   a][b]`, o sea que el 4 fue el ancho y la `a` el valor.
+                 *
+                 * El relleno NO se aplica, y es deliberado: son espacios, y un espacio no
+                 * separa un valor de su cast —medido, `select now()     ::date` devuelve la
+                 * fecha—. Lo que hay que reconstruir bien es QUÉ argumento va en cada hueco.
+                 */
+                if (ancho === '*') siguiente++;
+                const arg = partes[posicion === undefined ? siguiente++ : Number(posicion)];
+                if (arg === undefined) return '';
+                if (tipo === 'L') return `'${arg.replace(/'/g, "''")}'`;
+                if (tipo === 'I') return `"${arg.replace(/"/g, '""')}"`;
+                return arg;
+              },
+            );
+          };
+          return (
+            culpable(trozos.join(''), 'sql') ||
+            culpable(trozos.join(' '), 'sql') ||
+            culpable(comoFormat(trozos), 'sql')
+          );
+        })(),
+      )
+    );
+  };
+
+  /**
+   * Las excepciones se declaran AQUÍ, con su motivo, o no existen. Vacío es el estado
+   * correcto: si algo entra, tiene que entrar con una razón escrita al lado.
+   */
+  const DECLARADAS: Record<string, string> = {};
+
+  /**
+   * Quita los comentarios antes de buscar: un `current_date` dentro de un comentario que
+   * EXPLICA por qué ya no se usa es exactamente lo contrario de un hallazgo, y sin esto el
+   * censo se volvería contra quien documenta el arreglo.
+   *
+   * Va como RECORRIDO y no como expresión regular, y esta vez la diferencia no es de estilo:
+   * con `replace(/--[^\n]*!/g, '')` un cuerpo legítimo como `select '--', now()::date` se
+   * queda en `select '` —el resto se va como si fuera comentario— y el censo pasa en verde
+   * sin haber mirado la expresión. Lo mismo en TypeScript con una URL: `'https://host'` hace
+   * que el barrido de `//` se lleve el resto de la línea. Es la peor forma de fallar de un
+   * guardián: no encontrar nada porque no está mirando.
+   *
+   * Dos decisiones que no son obvias y conviene dejar dichas:
+   *
+   *  · las comillas invertidas de TypeScript se ATRAVIESAN y su contenido se lee como SQL,
+   *    porque ahí es justo donde vive el SQL que este censo busca. Las comillas simples y
+   *    dobles sí son datos y se saltan;
+   *  · el entrecomillado por dólar de SQL —`$function$ … $function$`— también se atraviesa,
+   *    porque `pg_get_functiondef` devuelve así los cuerpos plpgsql. Saltárselo dejaría de
+   *    mirar el cuerpo de cada función plpgsql, que es exactamente el error que este arreglo
+   *    viene a evitar. El precio es que un literal por dólar que contuviera `--` se leería
+   *    como comentario; queda dicho, y no existe ninguno en el esquema.
+   */
+  /** Lo que puede ir DELANTE de una barra que abre una expresión regular. */
+  /*
+   * ── La mitad de TypeScript la hace el PARSER de TypeScript ──
+   *
+   * Aquí había un reconocedor escrito a mano que decidía si una barra abría una expresión
+   * regular o dividía, mirando el carácter anterior y una lista de palabras. La revisión le
+   * encontró CINCO agujeros seguidos —`throw` y `export default`, el paréntesis de un `if`, el
+   * `}` de un bloque, el `for await`, y el `}` de un objeto con `valueOf`— y el quinto refutó
+   * una afirmación que yo mismo había escrito aquí: dije que dividir un objeto no significa
+   * nada en JavaScript, y `{ valueOf() { return 1; } } / 2` es una división perfectamente
+   * válida. Cinco parches al mismo sitio no son cinco descuidos: son la señal de que el
+   * criterio no cabe en una heurística.
+   *
+   * Y no cabe por un motivo conocido: «regex o división» no se decide con el token anterior,
+   * se decide con la GRAMÁTICA. Así que la decide quien la tiene. Se parsea el fichero con
+   * `typescript` —que ya es dependencia de desarrollo y que el otro censo de este repositorio
+   * usa igual—, y del árbol salen los tramos exactos de cada literal: expresión regular,
+   * cadena, y cada trozo de plantilla.
+   *
+   * Con esos tramos, lo demás es aritmética: fuera de un literal, `//` y `/*` SIEMPRE abren
+   * comentario —eso sí es cierto sin contexto— y dentro de un literal nunca. El barrido pasa
+   * de adivinar a saber.
+   *
+   * Lo que NO cambia es el contrato: la salida sigue siendo el mismo texto con los comentarios
+   * fuera, las expresiones regulares fuera, las cadenas vaciadas si se pide, y el contenido de
+   * cada plantilla pasado por el barrido de SQL —que es donde vive el SQL que este censo
+   * busca—. Las sondas de este fichero son las que lo comprueban: siguen siendo las mismas y
+   * siguen en verde.
+   *
+   * Se parsea como TSX porque el barrido cubre `.ts` y `.tsx` y no sabe cuál está mirando.
+   * LÍMITE DECLARADO: en TSX, `<T>expr` es JSX y no un cast, y una función flecha genérica
+   * pide `<T,>`. Comprobado que este repositorio no usa ninguna de las dos formas; si algún
+   * día las usa, ese fichero se parsea con errores y sus literales dejan de reconocerse — y el
+   * fallo cae del lado seguro, que es MIRAR de más y no de menos.
+   */
+  const barridoTs = (texto: string, vaciarLiterales: boolean): string => {
+    const arbol = ts.createSourceFile(
+      'censo.tsx',
+      texto,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TSX,
+    );
+    const piezas: { inicio: number; fin: number; texto: string }[] = [];
+    const recorrer = (n: ts.Node): void => {
+      const inicio = n.getStart(arbol);
+      const fin = n.getEnd();
+      const crudo = texto.slice(inicio, fin);
+      if (n.kind === ts.SyntaxKind.RegularExpressionLiteral) {
+        piezas.push({ inicio, fin, texto: ' ' });
+        return;
+      }
+      if (n.kind === ts.SyntaxKind.StringLiteral) {
+        /*
+         * Una cadena que se le pasa a `unsafe` NO es un dato: es SQL, dicho por el nombre de
+         * la función. Vaciarla es dejar de mirar justo donde la aplicación escribe la consulta
+         * sin la protección de la plantilla — y este repositorio ya usa `tx.unsafe`, hoy con
+         * comillas invertidas (que sí se leen); cambiar una a comillas normales, o añadir otra
+         * así, bastaba para sacar la operación del censo.
+         *
+         * Se conserva SIEMPRE, también al vaciar literales, que es lo mismo que se hace con
+         * las cuatro cadenas que Postgres evalúa: la excepción existe porque ahí el contenido
+         * es código.
+         */
+        const esSqlCrudo =
+          n.parent !== undefined &&
+          ts.isCallExpression(n.parent) &&
+          n.parent.arguments.some((a) => a === n) &&
+          /(^|\.)unsafe$/.test(n.parent.expression.getText(arbol).trim());
+        if (esSqlCrudo) {
+          // Cocinado, por lo mismo que la plantilla: `tx.unsafe('select \\x6eow()::date')`
+          // ejecuta `select now()::date`. Conservar la cadena sin deshacer los escapes era
+          // dejar de mirar por la ortografía justo después de haber dejado de vaciarla.
+          const q = crudo[0] ?? "'";
+          piezas.push({
+            inicio,
+            fin,
+            texto: `${q}${(n as ts.LiteralLikeNode).text.split(q).join(`\\${q}`)}${q}`,
+          });
+          return;
+        }
+        const comilla = crudo[0] ?? "'";
+        // Cocinado también aquí, por lo mismo, y con la comilla vuelta a escapar para que el
+        // literal siga teniendo los bordes donde los tenía.
+        const dentro = (n as ts.LiteralLikeNode).text.split(comilla).join(`\\${comilla}`);
+        piezas.push({
+          inicio,
+          fin,
+          texto:
+            vaciarLiterales && !ESPECIAL_TEMPORAL.test(dentro) ? `${comilla}${comilla}` : crudo,
+        });
+        return;
+      }
+      if (
+        n.kind === ts.SyntaxKind.NoSubstitutionTemplateLiteral ||
+        n.kind === ts.SyntaxKind.TemplateHead ||
+        n.kind === ts.SyntaxKind.TemplateMiddle ||
+        n.kind === ts.SyntaxKind.TemplateTail
+      ) {
+        // El trozo abre con un backtick o con el `}` que cierra una interpolación, y cierra
+        // con un backtick o con el `${` que abre la siguiente. Los delimitadores se conservan
+        // para no mover nada de sitio; lo de dentro es SQL y va por el barrido de SQL.
+        const cierra = crudo.endsWith('${') ? 2 : 1;
+        /*
+         * Y lo de dentro se lee COCINADO, que es lo que la etiqueta recibe de verdad. Una
+         * plantilla `select \x6eow()::date` entrega `select now()::date` —comprobado con
+         * node—, y leer la ortografía en vez del valor es dejar de mirar por cómo está
+         * escrito algo. `n.text` es justo eso: el parser ya deshizo los escapes.
+         *
+         * La salida se construye concatenando, no por posiciones, así que la longitud puede
+         * cambiar sin descolocar nada.
+         */
+        const dentro = (n as ts.LiteralLikeNode).text;
+        piezas.push({
+          inicio,
+          fin,
+          texto:
+            crudo.slice(0, 1) +
+            sinComentarios(dentro, 'sql', vaciarLiterales, false) +
+            crudo.slice(crudo.length - cierra),
+        });
+        return;
+      }
+      n.forEachChild(recorrer);
+    };
+    recorrer(arbol);
+    piezas.sort((a, b) => a.inicio - b.inicio);
+
+    let salida = '';
+    let i = 0;
+    let p = 0;
+    while (i < texto.length) {
+      while (p < piezas.length && piezas[p]!.inicio < i) p++;
+      if (p < piezas.length && piezas[p]!.inicio === i) {
+        salida += piezas[p]!.texto;
+        i = piezas[p]!.fin;
+        p++;
+        continue;
+      }
+      if (texto[i] === '/' && texto[i + 1] === '/') {
+        const salto = texto.indexOf('\n', i);
+        salida += ' ';
+        i = salto === -1 ? texto.length : salto;
+        continue;
+      }
+      if (texto[i] === '/' && texto[i + 1] === '*') {
+        const cierre = texto.indexOf('*/', i + 2);
+        salida += ' ';
+        i = cierre === -1 ? texto.length : cierre + 2;
+        continue;
+      }
+      salida += texto[i];
+      i++;
+    }
+    return salida;
+  };
+
+  const sinComentarios = (
+    texto: string,
+    dialecto: 'sql' | 'ts' = 'sql',
+    vaciarLiterales = false,
+    /*
+     * Si el texto es un CUERPO del catálogo —lo que devuelve `pg_get_functiondef`— o un trozo
+     * de plantilla de TypeScript. Lo único que cambia es qué significa el primer `$tag$`, y
+     * cambia del todo: en un cuerpo es el delimitador que lo envuelve y lo de dentro es CÓDIGO;
+     * en una plantilla no hay nada que envolver, así que el primer par es un LITERAL y lo de
+     * dentro es dato.
+     *
+     * Lo rompí yo al borrar el reconocedor a mano: la distinción vivía en la pila —el `$` solo
+     * se leía como cuerpo en el marco raíz— y se fue con ella sin que ninguna sonda lo notara.
+     * Ahora va en un parámetro, que es donde se ve y donde se puede leer sin reconstruir una
+     * máquina de estados en la cabeza.
+     */
+    cuerpoDelCatalogo = true,
+  ): string => {
+    if (dialecto === 'ts') return barridoTs(texto, vaciarLiterales);
+    let salida = '';
+    let i = 0;
+    /** La etiqueta del cuerpo por dólar que está abierto, o `null` si no hay ninguno. */
+    let cuerpoPorDolar: string | null = null;
+    const DOLAR = /^\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/;
+    while (i < texto.length) {
+      const c = texto[i]!;
+      const d = texto[i + 1];
+      // Comentario de bloque.
+      if (c === '/' && d === '*') {
+        /*
+         * PostgreSQL ANIDA los comentarios de bloque: un bloque abierto dentro de otro exige
+         * DOS cierres, y comprobado que un `select` con uno dentro de otro devuelve su valor
+         * sin quejarse. Con `indexOf` del primer cierre, el recorrido salía en el INTERIOR. Lo
+         * que
+         * viene después sigue comentado, así que un `--` de ahí se tomaba por comentario de
+         * línea y se llevaba por delante el código real que hubiera detrás: el censo volvía a
+         * dejar de mirar. Se cuenta la profundidad.
+         *
+         * (El ejemplo no se escribe aquí dentro a propósito: un cierre de bloque dentro de un
+         * comentario de bloque lo termina, y me costó un fichero sin compilar. La sonda lo
+         * lleva, que es donde tiene que estar.)
+         *
+         */
+        let hondura = 1;
+        i += 2;
+        while (i < texto.length && hondura > 0) {
+          // SQL anida y TypeScript no, y esa diferencia estuvo escrita al revés aquí durante
+          // un rato —yo mismo puse que contar profundidad «tampoco estorba» en TypeScript, y
+          // estorba—. Hoy no hay que elegir: este recorrido solo ve SQL, y el de TypeScript lo
+          // hace su parser.
+          if (texto[i] === '/' && texto[i + 1] === '*') {
+            hondura++;
+            i += 2;
+          } else if (texto[i] === '*' && texto[i + 1] === '/') {
+            hondura--;
+            i += 2;
+          } else i++;
+        }
+        salida += ' ';
+        continue;
+      }
+      // Comentario de línea: `--` en SQL, `//` en TypeScript.
+      if (c === '-' && d === '-') {
+        /*
+         * Un comentario no sale de su PLANTILLA, y eso ya no hay que vigilarlo aquí: cada
+         * trozo de plantilla llega a este recorrido por separado, recortado por el parser, así
+         * que un `--` nunca puede comerse nada de fuera. Antes sí podía, y bastaba una
+         * plantilla ajena —`const ayuda = \`--x\`;`— para cegar el censo entero.
+         *
+         * LÍMITE DECLARADO, ése sigue en pie: toda plantilla de TypeScript se lee como SQL
+         * —ahí es donde vive el SQL que este censo busca, y reconocerlas por su etiqueta sería
+         * una lista escrita a mano que dejaría fuera el SQL sin etiquetar—, así que una
+         * plantilla ajena que mencione una palabra del reloj en PROSA sale marcada. Es un
+         * falso positivo, o sea visible, y hoy no hay ninguno.
+         */
+        const salto = texto.indexOf('\n', i);
+        /*
+         * El cierre del marco es el primer backtick NO escapado: `indexOf` devolvía también
+         * los escapados, que no cierran nada. Con uno dentro del comentario, el recorrido
+         * salía de la plantilla a mitad, y lo que todavía era comentario —una comilla, otro
+         * `--`— pasaba a leerse como código y se llevaba por delante lo de después.
+         */
+        i = salto === -1 ? texto.length : salto;
+        salida += ' ';
+        continue;
+      }
+      /*
+       * Un identificador entre comillas dobles es SQL válido y puede contener CUALQUIER cosa:
+       * `declare "--" int;` en una función de una línea hacía que el barrido tomara esos
+       * guiones por un comentario y se comiera la operación de después. Se consume entero,
+       * con su escape por duplicación.
+       *
+       * Y se copia TAL CUAL incluso al vaciar literales, a diferencia de un dato: los nombres
+       * SÍ los leen los patrones —`pg_catalog."now"()` es un reloj—, así que vaciarlos abriría
+       * el hueco que el reconocimiento del nombre entrecomillado vino a cerrar.
+       *
+       * LÍMITE DECLARADO: un identificador que se llame exactamente como una palabra del reloj
+       * —`select 1 as "current_date"`— saldrá marcado. Es un falso positivo, o sea visible.
+       */
+      if (c === '"') {
+        const desde = i;
+        i++;
+        while (i < texto.length) {
+          if (texto[i] === '"' && texto[i + 1] === '"') i += 2;
+          else if (texto[i] === '"') {
+            i++;
+            break;
+          } else i++;
+        }
+        salida += texto.slice(desde, i);
+        continue;
+      }
+      // Literal de comillas simples: dato en los dos dialectos. En SQL se escapa
+      // duplicándolo; en TypeScript, con barra invertida.
+      if (c === "'") {
+        const desde = i;
+        /*
+         * La cadena con prefijo `E` de SQL escapa con BARRA y no duplicando la comilla, y
+         * `pg_get_functiondef` la conserva tal cual. Sin esto, `E'a\\'--b'` terminaba el
+         * literal en la barra y el `--` —que todavía es DATO— abría un comentario que se
+         * llevaba por delante la operación de después: el censo en verde sin haber mirado.
+         *
+         * Es el mismo arreglo que acaba de entrar en el censo de proyecciones, allí en la
+         * dirección contraria. Las demás formas con prefijo —`U&'…'`, `B'…'`, `X'…'`— escapan
+         * duplicando como la normal.
+         */
+        const prefijoE =
+          c === "'" &&
+          (texto[i - 1] === 'E' || texto[i - 1] === 'e') &&
+          !/[A-Za-z0-9_]/.test(texto[i - 2] ?? ' ');
+        i++;
+        while (i < texto.length) {
+          if (prefijoE && texto[i] === '\\') i += 2;
+          else if (texto[i] === c && texto[i + 1] === c) i += 2;
+          else if (texto[i] === c) {
+            i++;
+            break;
+          } else i++;
+        }
+        /*
+         * El literal se copia TAL CUAL, no se borra. Borrarlo parecía inofensivo —es un dato,
+         * no código— y rompió tres patrones a la vez: los que LEEN el literal,
+         * `date_trunc('day', …)`, `date_part('dow', …)` y `to_char(…, 'YYYY-MM-DD')`. Con el
+         * contenido fuera, `date_trunc('milliseconds', now())` —seguro— pasaba a marcarse.
+         * Lo cazó su propia sonda segura, que para eso está. Aquí el recorrido solo sirve para
+         * NO confundir un `--` de dentro de un literal con un comentario.
+         */
+        /*
+         * Con `vaciarLiterales`, el CONTENIDO se va y quedan solo las comillas. Las dos formas
+         * hacen falta y por eso conviven: los patrones que LEEN el literal —`date_trunc` y
+         * `date_part`— necesitan el texto tal cual; los demás no, y con él dentro una función
+         * que devuelva la cadena 'current_date' salía marcada sin leer ningún reloj.
+         */
+        /*
+         * Con UNA excepción, y es la que impedía que el censo entero se rodeara con dos
+         * comillas: `'now'`, `'today'`, `'tomorrow'` y `'yesterday'` no son datos —Postgres las
+         * EVALÚA— y vaciarlas dejaba `'today'::date` indistinguible de `''::date`. O sea que
+         * `current_date` estaba prohibido y su sinónimo exacto pasaba limpio: el mismo día
+         * distinto en husos opuestos (2026-09-05 contra 2026-09-04, medido), escrito de otra
+         * manera. Se conserva SOLO ese contenido, así que la función que devuelve la cadena
+         * `'current_date'` —el falso positivo que motivó el vaciado— se sigue vaciando.
+         */
+        /*
+         * Y con prefijo `E` se pregunta por el VALOR: los escapes se deshacen antes de decidir
+         * si es una de las cadenas que Postgres evalúa, y lo que se copia es el literal ya
+         * cocinado, para que los patrones que lo leen vean `'now'` y no `E'\\x6eow'`.
+         */
+        const contenido = texto.slice(desde + 1, i - 1);
+        const cocido = prefijoE ? SIN_ESCAPES_E(contenido) : contenido;
+        salida +=
+          vaciarLiterales && !ESPECIAL_TEMPORAL.test(cocido)
+            ? `${c}${c}`
+            : prefijoE
+              ? `${c}${cocido}${c}`
+              : texto.slice(desde, i);
+        continue;
+      }
+      /*
+       * El entrecomillado por DÓLAR: el delimitador del CUERPO se atraviesa, y cualquier otro
+       * es un literal.
+       *
+       * `pg_get_functiondef` envuelve el cuerpo plpgsql en `$function$ … $function$` y hay que
+       * ATRAVESARLO, o el censo dejaría de mirar el cuerpo de cada función. Pero dentro del
+       * cuerpo puede haber literales por dólar de verdad —`perform $q$--$q$; perform
+       * now()::date;`— y leerlos como código hacía que su `--` se comiera la consulta de
+       * después. El catálogo los conserva verbatim: comprobado sobre una función real.
+       *
+       * La regla es la anidación: la primera etiqueta abre el cuerpo; una etiqueta DISTINTA
+       * estando dentro es un literal; la MISMA lo cierra.
+       *
+       * LÍMITE DECLARADO: un cuerpo anidado escrito con otra etiqueta —una función que crea
+       * otra— se leería como literal, así que sus comentarios no se quitarían. Eso da falsos
+       * positivos, que se ven, no huecos.
+       *
+       * Y solo aquí, en el recorrido de SQL, que es donde `pg_get_functiondef` pone
+       * el cuerpo. Dentro de una plantilla de TypeScript, `$` no es esto: `` `< $${n}` `` —que
+       * está en `ai.degradacion.ts`— es un dólar literal seguido de una interpolación, y
+       * leerlo como apertura de cuerpo se comía el `${` y dejaba la etiqueta puesta para el
+       * resto del fichero. Con una etiqueta sin cerrar más adelante, el vaciado se llevaba
+       * por delante la consulta y el censo daba verde. Lo escribí sin este alcance y lo
+       * encontré al buscar en `src/` si el idioma existía: existe.
+       */
+      if (c === '$') {
+        const m = DOLAR.exec(texto.slice(i));
+        if (m) {
+          const etiqueta = m[0];
+          if (cuerpoDelCatalogo && cuerpoPorDolar === null) {
+            cuerpoPorDolar = etiqueta;
+            salida += etiqueta;
+            i += etiqueta.length;
+            continue;
+          }
+          if (etiqueta === cuerpoPorDolar) {
+            cuerpoPorDolar = null;
+            salida += etiqueta;
+            i += etiqueta.length;
+            continue;
+          }
+          const cierra = texto.indexOf(etiqueta, i + etiqueta.length);
+          /*
+           * Y en una plantilla solo cuenta el par BALANCEADO. Un `$x$` sin cierre no es un
+           * literal: es SQL a medio escribir —o una plantilla que se corta en una
+           * interpolación—, y tragarse el resto sería dejar de mirar por un fallo de sintaxis
+           * ajeno, que es la forma en que este barrido ha fallado siempre. Se copia la etiqueta
+           * y se sigue leyendo lo de detrás como código.
+           *
+           * En un cuerpo del catálogo no hace falta la salvedad: ahí el primer par SÍ envuelve,
+           * y lo que no cierra ya lo cubre la rama de arriba.
+           */
+          if (!cuerpoDelCatalogo && cierra === -1) {
+            salida += etiqueta;
+            i += etiqueta.length;
+            continue;
+          }
+          const hasta = cierra === -1 ? texto.length : cierra + etiqueta.length;
+          salida += vaciarLiterales ? `${etiqueta}${etiqueta}` : texto.slice(i, hasta);
+          i = hasta;
+          continue;
+        }
+      }
+      salida += c;
+      i++;
+    }
+    return salida;
+  };
+
+  /*
+   * ─── LA REGLA, DEL REVÉS ──────────────────────────────────────────────────────────────
+   *
+   * Todo lo de arriba ACUSA: busca formas peligrosas y deja pasar lo que no sabe leer. Ese
+   * modo de fallo costó doce rondas de revisión seguidas, y cada hallazgo era el mismo
+   * hallazgo: una forma más de entregar un reloj que el reconocedor no tenía. Arreglarlas una
+   * a una no responde nunca la única pregunta que importa —cuántas quedan—, porque un censo
+   * cuya incompletitud sale en VERDE no es un censo: es la lista de lo que a alguien se le
+   * ocurrió mirar.
+   *
+   * Así que la obligación se invierte. Un instante —`now()`, `clock_timestamp()`, cualquier
+   * `timestamptz`— solo puede volverse dependiente del huso de quien llama de UNA manera:
+   * encontrándose con un tipo temporal que NO es un instante. La pregunta deja de ser
+   * «¿reconozco esta forma peligrosa?» y pasa a ser «¿puedo CERTIFICAR que este reloj no
+   * tiene con qué encontrarse?». Lo que no se certifica enrojece, y para ponerlo en verde
+   * hay que declararlo A MANO con el motivo escrito y medido.
+   *
+   * Lo que hace que esto no sea otro reconocedor con otro nombre es de dónde sale la lista de
+   * lo que cuenta: del CATÁLOGO, no de una expresión regular. Los nombres —columnas,
+   * retornos, parámetros, dominios— los enumera Postgres; los built-ins que aceptan un
+   * instante los enumera Postgres. Añadir mañana una columna `date` mete su nombre en el
+   * conjunto sin que nadie lo escriba aquí, y desde ese momento cualquier objeto que la
+   * mezcle con un reloj deja de certificarse — aunque su forma sea una que este fichero no
+   * haya visto nunca. La incompletitud pasa a costar falsos positivos, que se ven y se
+   * declaran, en vez de huecos, que no se ven y se quedan.
+   *
+   * El alcance del certificado es el OBJETO ENTERO y no la sentencia, y es a propósito. Con
+   * alcance de sentencia, `for r in select now() as t loop v_d := r.t; end loop` se certifica
+   * y no debería: el registro `r` se lleva el instante a la sentencia siguiente, donde le
+   * espera un `date`. Seguir el valor de una sentencia a otra es exactamente el análisis que
+   * este cambio viene a dejar de necesitar, así que el corte se pone donde no hace falta
+   * seguirlo. El precio son doce declaraciones a mano hoy —medido— y una por cada objeto
+   * futuro que mezcle las dos cosas; a cambio, mezclarlas nunca es gratis ni silencioso.
+   */
+
+  /**
+   * Los built-ins que ACEPTAN un instante, clasificados uno a uno. `colapsa` es el que puede
+   * devolver algo que dependa del huso de la sesión; `conserva`, el que no.
+   *
+   * Cada `colapsa` está MEDIDO, no supuesto, comparando el resultado en dos husos:
+   *
+   *   to_char(t,'YYYY-MM-DD')      2026-03-08 en Pacific/Kiritimati · 2026-03-07 en Etc/GMT+12
+   *   extract(day from t)          8 · 7
+   *   date_part('day', t)          igual que extract, es su misma implementación
+   *   date_trunc('day', t)         dos INSTANTES distintos (10:00Z · 12:00Z), aunque el tipo
+   *                                de vuelta sí lleve huso: trunca en el huso de la sesión
+   *   age(t)                       …27 days 04:00:00 · …27 days 06:00:00
+   *   date/time/timetz/timestamp   el cast, que es de lo que va todo este fichero
+   *   timezone                     seguro SOLO con 'UTC' escrito; con otro huso, no
+   *   t + interval / t - interval  medido con DST y no con husos fijos, que es donde se ve:
+   *                                `t + interval '1 day'` da 11:00Z en America/New_York y
+   *                                12:00Z en UTC. Con campos de hora es exacto, pero eso no
+   *                                se sabe desde el nombre de la función, así que colapsa
+   *   generate_series(t,t,step)    por lo mismo: los pasos de un día saltan el cambio de hora
+   *   date_add / date_subtract     el mismo cálculo con nombre de función (Postgres 16+)
+   *
+   * Y los `conserva` que podrían sorprender, también medidos:
+   *
+   *   date_bin(iv, t, origen)      mismo INSTANTE en los dos husos: bina desde el origen en
+   *                                tiempo absoluto, no en el calendario de la sesión
+   *   t - t                        66 days 06:00:00 en los dos: una resta de instantes
+   *   isfinite / overlaps          booleanos sobre instantes
+   *
+   * La lista NO se escribe a ojo: el censo la compara contra el catálogo y exige que TODO
+   * built-in que acepte un instante esté aquí clasificado. Un Postgres que traiga uno nuevo
+   * enrojece hasta que alguien lo mire — la misma inversión, aplicada a la propia lista.
+   */
+  const ACEPTAN_INSTANTE: Record<string, 'colapsa' | 'conserva'> = {
+    age: 'colapsa',
+    date: 'colapsa',
+    date_add: 'colapsa',
+    date_part: 'colapsa',
+    date_subtract: 'colapsa',
+    date_trunc: 'colapsa',
+    extract: 'colapsa',
+    generate_series: 'colapsa',
+    interval_pl_timestamptz: 'colapsa',
+    time: 'colapsa',
+    timestamp: 'colapsa',
+    timestamptz_mi_interval: 'colapsa',
+    timestamptz_pl_interval: 'colapsa',
+    timetz: 'colapsa',
+    timezone: 'colapsa',
+    to_char: 'colapsa',
+    date_bin: 'conserva',
+    in_range: 'conserva',
+    isfinite: 'conserva',
+    max: 'conserva',
+    min: 'conserva',
+    overlaps: 'conserva',
+    pg_replication_origin_xact_setup: 'conserva',
+    pg_sleep_until: 'conserva',
+    timestamptz: 'conserva',
+    timestamptz_larger: 'conserva',
+    timestamptz_mi: 'conserva',
+    timestamptz_out: 'conserva',
+    timestamptz_send: 'conserva',
+    timestamptz_smaller: 'conserva',
+    tstzrange: 'conserva',
+    tstzrange_subdiff: 'conserva',
+    /*
+     * Y las implementaciones de los OPERADORES de comparación, que nadie escribe por su
+     * nombre pero que el catálogo devuelve igual. Todas comparan instantes contra instantes,
+     * fechas o marcas sin huso y devuelven un booleano o un entero de orden: la comparación
+     * la hace Postgres promoviendo el operando sin huso CON EL HUSO DE LA SESIÓN, así que la
+     * peligrosa es la fecha que entra, no la función — y esa fecha ya está en el conjunto de
+     * nombres por su tipo. Aquí van clasificadas para que la comparación contra el catálogo
+     * sea exhaustiva y no para que alguien las busque en un cuerpo.
+     */
+    date_cmp_timestamptz: 'conserva',
+    date_eq_timestamptz: 'conserva',
+    date_ge_timestamptz: 'conserva',
+    date_gt_timestamptz: 'conserva',
+    date_le_timestamptz: 'conserva',
+    date_lt_timestamptz: 'conserva',
+    date_ne_timestamptz: 'conserva',
+    timestamp_cmp_timestamptz: 'conserva',
+    timestamp_eq_timestamptz: 'conserva',
+    timestamp_ge_timestamptz: 'conserva',
+    timestamp_gt_timestamptz: 'conserva',
+    timestamp_le_timestamptz: 'conserva',
+    timestamp_lt_timestamptz: 'conserva',
+    timestamp_ne_timestamptz: 'conserva',
+    timestamptz_cmp: 'conserva',
+    timestamptz_cmp_date: 'conserva',
+    timestamptz_cmp_timestamp: 'conserva',
+    timestamptz_eq: 'conserva',
+    timestamptz_eq_date: 'conserva',
+    timestamptz_eq_timestamp: 'conserva',
+    timestamptz_ge: 'conserva',
+    timestamptz_ge_date: 'conserva',
+    timestamptz_ge_timestamp: 'conserva',
+    timestamptz_gt: 'conserva',
+    timestamptz_gt_date: 'conserva',
+    timestamptz_gt_timestamp: 'conserva',
+    timestamptz_le: 'conserva',
+    timestamptz_le_date: 'conserva',
+    timestamptz_le_timestamp: 'conserva',
+    timestamptz_lt: 'conserva',
+    timestamptz_lt_date: 'conserva',
+    timestamptz_lt_timestamp: 'conserva',
+    timestamptz_ne: 'conserva',
+    timestamptz_ne_date: 'conserva',
+    timestamptz_ne_timestamp: 'conserva',
+  };
+
+  /**
+   * Un tipo temporal que NO es un instante, escrito como palabra. `date`, `time`, `timestamp`
+   * a secas e `interval`; `timestamptz` y `timetz` no casan porque la frontera de palabra
+   * cae dentro, y `timestamp with time zone` lo saca la mirada hacia adelante — que también
+   * tiene que descartar el `time` de «time zone», o `timestamp with time zone` se marcaría a
+   * sí mismo por su propia mitad.
+   *
+   * `interval` está aquí por lo medido arriba: sumarle un intervalo a un instante da
+   * instantes DISTINTOS según el huso en cuanto el intervalo lleva días.
+   */
+  const TEMPORAL_QUE_MUEVE = /\b(?:date|time|timestamp|interval)\b(?!\s*(?:with\s+time\s+)?zone)/i;
+
+  /**
+   * Los que pueden mover un instante, POR SU NOMBRE, para buscarlos en un cuerpo — menos los
+   * que ya son una palabra de tipo. `date`, `time` y `timestamp` son a la vez el nombre de un
+   * cast y el de un tipo, y buscarlos como palabra suelta los saca de contexto: una firma tan
+   * correcta como `p_expira timestamp with time zone` obligaba a declarar la función entera.
+   * De esas se ocupa `TEMPORAL_QUE_MUEVE`, que sí mira lo que viene detrás — y el filtro es
+   * ella misma, no una lista aparte que se pudiera desincronizar. `timetz` y `timestamptz` no
+   * casan con ella (la frontera de palabra cae dentro), así que se quedan aquí.
+   */
+  const COLAPSAN = new Set(
+    Object.entries(ACEPTAN_INSTANTE)
+      .filter(([nombre, papel]) => papel === 'colapsa' && !TEMPORAL_QUE_MUEVE.test(nombre))
+      .map(([nombre]) => nombre),
+  );
+
+  /**
+   * Las palabras del reloj que son de la GRAMÁTICA y no funciones, así que no salen del
+   * catálogo: `current_date` y sus hermanos, más las cuatro cadenas que Postgres EVALÚA. Es
+   * la única parte de «qué es un instante» escrita a mano, y puede estarlo porque la define
+   * el estándar SQL y no crece.
+   *
+   * Todo lo DEMÁS —qué función devuelve un instante, qué columna vale uno— sale del catálogo,
+   * y por una razón que costó un hallazgo: la primera versión de esta comprobación llevaba
+   * los relojes en una lista a mano, y esa lista se dejaba fuera `pg_postmaster_start_time()`
+   * y ocho más que el propio Postgres publica. Una función que guardara uno de ésos en un
+   * registro y lo asignara después a una variable `date` recibía el certificado «sin reloj» y
+   * pasaba en verde — el mismo modo de fallo que esta comprobación vino a quitar, reaparecido
+   * dentro de ella. Una lista a mano en un guardián es una promesa que caduca sin avisar.
+   */
+  const RELOJ_DE_LA_GRAMATICA = [
+    'current_date',
+    'current_time',
+    'current_timestamp',
+    'localtime',
+    'localtimestamp',
+  ];
+
+  /**
+   * El reloj ENVUELTO en UTC, en las dos escrituras: la que `pg_get_functiondef` conserva
+   * verbatim de un cuerpo plpgsql (`now() at time zone 'UTC'`) y la que Postgres deparsea de
+   * un cuerpo SQL o un default (`timezone('UTC'::text, now())`). Envuelto así, el resultado
+   * es un `timestamp` sin huso que ya no tiene de dónde moverse: lo que venga después da
+   * igual, y por eso este certificado corta el análisis.
+   *
+   * Y el CALIFICADOR cuenta como parte del envuelto: lo que se envuelve en
+   * `timezone('UTC', v_disp.ejecutado_en)` es la columna entera, pero el instante se
+   * encuentra por su último identificador, así que sin admitir el `v_disp.` de en medio el
+   * arreglo canónico sobre una columna calificada salía sin certificar. Lo encontraron tres
+   * guards del borrado acordado, que lo escriben todos así.
+   */
+  const ENVUELTO_ANTES =
+    /\btimezone\s*\(\s*'utc'(?:\s*::\s*[a-z_"]+)?\s*,\s*(?:[A-Za-z_"][\w$"]*\s*\.\s*)*$/i;
+  const ENVUELTO_DESPUES = /^\s*(?:\(\s*\)\s*)?at\s+time\s+zone\s+'utc'/i;
+  /*
+   * Y el propio ENVOLVEDOR. `timezone` esta en el conjunto de instantes por su sobrecarga
+   * `(text, timestamp) -> timestamptz`, pero escrito como `timezone('UTC', …)` es la otra
+   * —`(text, timestamptz) -> timestamp`—, que es justo el arreglo canonico de este PR. El
+   * nombre no distingue las dos sobrecargas; la LLAMADA si, y es lo unico que hace falta
+   * mirar: con `'UTC'` escrito de primer argumento, lo que sale ya no depende de la sesion.
+   */
+  const ENVUELTO_ES_LA_ENVOLTURA = /^\s*\(\s*'utc'(?:\s*::\s*[a-z_"]+)?\s*,/i;
+  /*
+   * Y el instante tiene que ser el argumento DIRECTO, no el principio de una cuenta. Con solo
+   * mirar lo de delante, `timezone('UTC', now() + interval '2 days')` se certificaba como
+   * envuelto — y no lo está: sumarle días a un instante YA depende del huso alrededor de un
+   * cambio de hora (medido en este mismo fichero: 11:00Z en America/New_York contra 12:00Z en
+   * UTC), y convertir DESPUÉS a UTC no deshace esa diferencia, porque convierte un resultado
+   * que ya salió distinto.
+   *
+   * Así que detrás de la ocurrencia solo puede venir su propio `()` y el cierre de la
+   * envoltura. Lo que haya más allá —un `::date`, lo que sea— da igual: eso ya opera sobre un
+   * `timestamp` sin huso.
+   */
+  const CIERRA_LA_ENVOLTURA = /^\s*(?:\(\s*\))?\s*\)/;
+  /*
+   * Y la envoltura NO certifica un reloj de PARED. `timezone('UTC', …)` fija al huso del
+   * servidor un INSTANTE; aplicado a algo que ya leyó la hora local no deshace nada — la
+   * reinterpreta como si fuera UTC y la desplaza otra vez en el mismo sentido. Medido:
+   *
+   *   timezone('UTC', localtimestamp)::date
+   *     Pacific/Kiritimati -> 2026-09-06     Etc/GMT+12 -> 2026-09-04
+   *
+   * DOS días de diferencia, no uno: es peor que el `current_date` desnudo del que va todo
+   * este PR, y con aspecto de arreglo canónico.
+   *
+   * `current_timestamp` no está en la lista y es a propósito: devuelve un `timestamptz`, o
+   * sea un instante, y envolverlo sí lo fija. Los cuatro que están son los que leen la hora
+   * de pared.
+   *
+   * Estos cuatro ya los prohíbe la comprobación léxica, así que en un árbol verde no llegan
+   * aquí. La razón de que este certificado los rechace igual es que un guardián no puede
+   * apoyarse en otro: el día que aquél se rompa, éste no puede estar dándolos por buenos.
+   */
+  const RELOJ_DE_PARED = /^(?:current_date|current_time|localtime|localtimestamp)$/i;
+
+  /**
+   * El veredicto, del revés: devuelve el certificado si lo hay, o `null` si no se puede
+   * certificar. Tres certificados y ninguno más — que sean pocos y cortos es la propiedad,
+   * no una limitación: cada uno que se añadiera sería una forma más de pasar en silencio.
+   */
+  const certificar = (
+    crudo: string,
+    tipoDestino: string | undefined,
+    nombresQueMueven: Set<string>,
+    instantes: RegExp,
+  ): { certificado: string } | { motivo: string } => {
+    const texto = sinComentarios(crudo, 'sql');
+    /*
+     * Los instantes se buscan en el CUERPO, no en el encabezado que `pg_get_functiondef`
+     * antepone. Ahí el nombre de la propia función y sus tipos son una FIRMA, no un uso: una
+     * función nularia que devuelve `timestamptz` —`inicio_del_dia_de_la_base`— está en el
+     * conjunto de instantes por su tipo de vuelta, y al leer su encabezado casaba consigo
+     * misma y salía con un instante sin envolver que no existe en ninguna parte.
+     *
+     * Lo que el encabezado sí aporta —el tipo del DESTINO— llega por su parámetro, que es
+     * donde se puede mirar sin confundirlo con un uso.
+     */
+    const cuerpo = /\bas\s+(\$[A-Za-z_]*\$)/i.exec(texto);
+    const dondeBuscar = cuerpo ? texto.slice(cuerpo.index + cuerpo[0].length) : texto;
+    instantes.lastIndex = 0;
+    const relojes = [...dondeBuscar.matchAll(instantes)];
+    // «SIN INSTANTE»: no hay nada que colocar.
+    if (relojes.length === 0) return { certificado: 'sin instante' };
+    // «ENVUELTO EN UTC»: todos los instantes del objeto están fijados al huso del servidor.
+    const envuelto = (r: RegExpMatchArray): boolean => {
+      if (RELOJ_DE_PARED.test(r[0])) return false;
+      const detras = dondeBuscar.slice(r.index! + r[0].length, r.index! + r[0].length + 40);
+      return (
+        (ENVUELTO_ANTES.test(dondeBuscar.slice(Math.max(0, r.index! - 60), r.index!)) &&
+          CIERRA_LA_ENVOLTURA.test(detras)) ||
+        ENVUELTO_DESPUES.test(detras) ||
+        ENVUELTO_ES_LA_ENVOLTURA.test(detras)
+      );
+    };
+    if (relojes.every(envuelto)) return { certificado: 'envuelto en UTC' };
+    /*
+     * «SIN DÓNDE CAER»: en todo el objeto no hay un solo tipo temporal que no sea un instante,
+     * ni un nombre del catálogo que valga uno, ni un built-in que pueda producirlo. Es el
+     * certificado que cubre los 56 defaults `now()` sobre `timestamptz` y los guards que
+     * sellan una marca de tiempo — y el que deja de valer en cuanto alguien añade una columna
+     * `date` y la toca desde el mismo sitio.
+     *
+     * El destino se mira aparte porque NO está escrito en la expresión: el catálogo guarda
+     * `now()` a secas tanto en una columna `date` como en una `timestamptz`, y lo único que
+     * las separa es el tipo de la columna.
+     */
+    /*
+     * Y cuando no se certifica, el veredicto DICE POR QUÉ: qué instante quedó sin envolver y
+     * con qué se podría encontrar. Un guardián que enrojece sin nombrar lo que vio obliga a
+     * reconstruir su razonamiento a mano, y eso es lo que hace que una lista de excepciones
+     * crezca sin que nadie la lea.
+     */
+    const suelto = relojes.find((r) => !envuelto(r))!;
+    const donde = dondeBuscar
+      .slice(Math.max(0, suelto.index! - 40), suelto.index! + suelto[0].length + 20)
+      .replace(/\s+/g, ' ')
+      .trim();
+    const mueve = (razon: string) => ({ motivo: `${razon} · «…${donde}…»` });
+    if (tipoDestino !== undefined && TEMPORAL_QUE_MUEVE.test(tipoDestino))
+      return mueve(`el destino es ${tipoDestino}`);
+    const tipo = TEMPORAL_QUE_MUEVE.exec(texto);
+    if (tipo !== null) return mueve(`menciona el tipo «${tipo[0]}»`);
+    for (const palabra of texto.toLowerCase().match(/[a-z_][a-z0-9_$]*/g) ?? [])
+      if (nombresQueMueven.has(palabra)) return mueve(`menciona «${palabra}», que no es un instante`);
+      else if (COLAPSAN.has(palabra)) return mueve(`llama a «${palabra}», que colapsa`);
+    return { certificado: 'sin dónde caer' };
+  };
+
+  /**
+   * Los NOMBRES que pueden mover un instante, del CATÁLOGO: toda columna, todo retorno, todo
+   * parámetro y todo dominio cuyo tipo sea temporal y no sea un instante. Aquí es donde la
+   * certificación deja de depender de lo que este fichero sepa leer — la lista la escribe el
+   * esquema, y crece con él sin que nadie la toque.
+   *
+   * Vive fuera de las comprobaciones porque la usan DOS: la del catálogo y la del SQL de la
+   * aplicación. Duplicar la consulta sería dejar que las dos se desviaran.
+   */
+  const nombresQueMuevenDelCatalogo = async (): Promise<Set<string>> => {
+    const filas = await sqlAdmin()`
+      select distinct nombre from (
+        select a.attname::text as nombre, format_type(a.atttypid, a.atttypmod) as tipo
+          from pg_attribute a
+          join pg_class c on c.oid = a.attrelid
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and a.attnum > 0 and not a.attisdropped
+           and c.relkind in ('r', 'p', 'v', 'm', 'c')
+           -- Fuera las sondas de las OTRAS familias de este fichero, que viven en el mismo
+           -- esquema mientras corre la suite: censo_probe_escritura tiene una columna
+           -- «d date», y con «d» aquí dentro cualquier función con una variable llamada d
+           -- dejaba de certificarse. Es contaminación entre pruebas, no esquema — y el
+           -- filtro va por el nombre de la TABLA, que es lo que las identifica.
+           and c.relname not like 'censo_probe%' and c.relname not like 'censo_tmp%'
+           and c.relname not like 'CensoProbe%'
+        union all
+        select p.proname::text, format_type(p.prorettype, null)
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+         where n.nspname in ('public', 'pg_catalog') and p.prokind = 'f'
+        union all
+        -- El nombre del PARÁMETRO, no el de su función. Aquí ponía p.proname, y con eso una
+        -- función que reciba un instante y lo devuelva colapsado —«f(p timestamptz) returns
+        -- date as select p»— se certificaba sin mirar nada: su cuerpo nombra «p», que no
+        -- estaba en ningún conjunto. «with ordinality» para indexar proargnames.
+        -- LÍMITE DECLARADO: la referencia POSICIONAL de un cuerpo SQL ($1) no se cubre —
+        -- meterla marcaría todo cuerpo que use $1 para cualquier cosa. Medido: este esquema
+        -- no tiene ninguna función con parámetros sin nombre.
+        select p.proargnames[i]::text, format_type(t.oid, null)
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace,
+               unnest(coalesce(p.proallargtypes, p.proargtypes::oid[]))
+                 with ordinality as t(oid, i)
+         where n.nspname = 'public' and p.prokind in ('f', 'p')
+           and p.proargnames is not null and p.proargnames[i] is not null
+        union all
+        select t.typname::text, format_type(t.typbasetype, t.typtypmod)
+          from pg_type t join pg_namespace n on n.oid = t.typnamespace
+         where n.nspname = 'public' and t.typtype = 'd'
+      ) x
+      where (tipo like 'date%' or tipo like 'time%' or tipo like 'interval%')
+        and tipo not like 'timestamp with time zone%'
+        -- Fuera los nombres que son el de un TIPO built-in: date, time, timestamp e
+        -- interval existen también como funciones de cast, y meterlos aquí los volvía
+        -- palabras sueltas sin contexto — con lo que una firma perfectamente correcta como
+        -- «p_expira timestamp with time zone» obligaba a declarar la función entera. El
+        -- contexto de esas cuatro lo mira TEMPORAL_QUE_MUEVE, que sí sabe leer el «with
+        -- time zone» de al lado. Los dominios del esquema NO se van: los excluye el
+        -- pg_catalog del where, y un x::mi_dominio_fecha tiene que seguir contando.
+        -- (Sin comillas invertidas: esto vive en una template literal y las terminaría.)
+        and not exists (
+          select 1 from pg_type ty join pg_namespace tn on tn.oid = ty.typnamespace
+          where tn.nspname = 'pg_catalog' and ty.typname = x.nombre)
+        -- Y fuera las sondas de las OTRAS familias de este fichero, que viven en el mismo
+        -- esquema mientras corre la suite: censo_probe_escritura tiene una columna «d date»,
+        -- y con «d» en este conjunto cualquier función que use una variable llamada d
+        -- dejaba de certificarse. Es contaminación entre pruebas, no esquema.
+        and x.nombre not like 'censo_probe%' and x.nombre not like 'censo_tmp%'`;
+    return new Set(filas.map((r) => (r.nombre as string).toLowerCase()));
+  };
+
+  /**
+   * QUÉ ES UN INSTANTE, del catálogo: toda función que devuelva `timestamp with time zone`
+   * —incluidas las NULARIAS, que son los relojes de verdad: `now`, `clock_timestamp`,
+   * `pg_postmaster_start_time`, `pg_conf_load_time`…— y todo nombre (columna, retorno,
+   * parámetro, dominio) que valga uno. Más las palabras de la gramática, que no son funciones.
+   *
+   * Se busca por NOMBRE y con posición, porque el certificado de la envoltura necesita saber
+   * dónde está cada uno. La alternativa —una lista a mano— es justo lo que falló.
+   *
+   * Sin AGREGADOS, por lo mismo que en el conjunto de los que mueven: `max` y `min` tienen una
+   * entrada que devuelve `timestamptz`, sus nombres son demasiado comunes, y el tipo de un
+   * agregado lo pone su ENTRADA — que es una columna, y esa columna ya está aquí si vale un
+   * instante.
+   */
+  const instantesDelCatalogo = async (): Promise<RegExp> => {
+    const filas = await sqlAdmin()`
+      select distinct nombre from (
+        select a.attname::text as nombre, format_type(a.atttypid, a.atttypmod) as tipo
+          from pg_attribute a
+          join pg_class c on c.oid = a.attrelid
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and a.attnum > 0 and not a.attisdropped
+           and c.relkind in ('r', 'p', 'v', 'm', 'c')
+           and c.relname not like 'censo_probe%' and c.relname not like 'censo_tmp%'
+           and c.relname not like 'CensoProbe%'
+        union all
+        -- TODA funcion que devuelva un instante, tenga argumentos o no. Lo intente con solo
+        -- las nularias —«una funcion con argumentos hereda el instante de lo que le pasan»— y
+        -- es falso: momento(boolean) con cuerpo «select now()» devuelve un instante que no
+        -- viene de su argumento, y una segunda funcion «returns date» que la llame se
+        -- certificaba como «sin instante» mientras Postgres la colapsaba con el huso de la
+        -- sesion. Reproducido antes de aceptarlo.
+        --
+        -- El falso positivo que aquel filtro evitaba —timezone tiene una sobrecarga
+        -- (text, timestamp) que devuelve timestamptz, asi que su NOMBRE casa aqui aunque en
+        -- timezone('UTC', now()) devuelva un timestamp sin huso— se resuelve distinguiendo la
+        -- LLAMADA, no borrando media familia: lo hace ENVUELTO_ES_LA_ENVOLTURA.
+        select p.proname::text, format_type(p.prorettype, null)
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+         where n.nspname in ('public', 'pg_catalog') and p.prokind = 'f'
+        union all
+        -- El nombre del PARÁMETRO, no el de su función. Aquí ponía p.proname, y con eso una
+        -- función que reciba un instante y lo devuelva colapsado —«f(p timestamptz) returns
+        -- date as select p»— se certificaba sin mirar nada: su cuerpo nombra «p», que no
+        -- estaba en ningún conjunto. «with ordinality» para indexar proargnames.
+        -- LÍMITE DECLARADO: la referencia POSICIONAL de un cuerpo SQL ($1) no se cubre —
+        -- meterla marcaría todo cuerpo que use $1 para cualquier cosa. Medido: este esquema
+        -- no tiene ninguna función con parámetros sin nombre.
+        select p.proargnames[i]::text, format_type(t.oid, null)
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace,
+               unnest(coalesce(p.proallargtypes, p.proargtypes::oid[]))
+                 with ordinality as t(oid, i)
+         where n.nspname = 'public' and p.prokind in ('f', 'p')
+           and p.proargnames is not null and p.proargnames[i] is not null
+        union all
+        select t.typname::text, format_type(t.typbasetype, t.typtypmod)
+          from pg_type t join pg_namespace n on n.oid = t.typnamespace
+         where n.nspname = 'public' and t.typtype = 'd'
+      ) x
+      where tipo like 'timestamp with time zone%'`;
+    const nombres = [
+      ...RELOJ_DE_LA_GRAMATICA,
+      ...filas.map((r) => (r.nombre as string).toLowerCase()),
+    ];
+    // De mayor a menor, para que una alternativa corta no se coma el prefijo de una larga.
+    nombres.sort((a, b) => b.length - a.length);
+    return new RegExp(String.raw`\b(?:${nombres.join('|')})\b`, 'gi');
+  };
+
+  /**
+   * Lo que NO se certifica y aun así está bien, uno por uno y con el motivo escrito. Esta
+   * lista es el precio del cambio y también su prueba: mientras sea corta y cada línea diga
+   * algo medido, la inversión está haciendo su trabajo; el día que crezca sin que nadie lea
+   * lo que añade, habrá vuelto a ser una lista de excepciones.
+   *
+   * Los cuatro primeros son la MISMA forma: un guard que sella su marca de tiempo con
+   * `now()` o `clock_timestamp()` sobre una columna `timestamp with time zone` —comprobados
+   * los cuatro tipos en el catálogo— y que, en OTRA sentencia del mismo cuerpo, nombra una
+   * columna sin huso que no tiene nada que ver. El certificado «sin dónde caer» mira el
+   * objeto entero y por eso no los deja pasar; seguir el valor de una sentencia a otra es
+   * justo el análisis que este fichero deja de hacer, así que la respuesta va aquí escrita.
+   */
+  const CERTIFICADAS_A_MANO: Record<string, string> = {
+    'funcion acuerdo_disposicion_registro_guard':
+      'el reloj es «new.acordado_en := clock_timestamp()» y acuerdo_disposicion.acordado_en es ' +
+      'timestamp with time zone. El nombre sin huso que obliga es efectivo_desde, y aparece ' +
+      'veinte líneas más abajo dentro del jsonb del evento («efectivoDesde», new.efectivo_desde), ' +
+      'sin tocar el instante.',
+    'funcion derecho_uso_transicion_guard':
+      'el reloj es «new.decidido_en := now()» y derecho_uso.decidido_en es timestamp with time ' +
+      'zone. Obliga vence_en, que es date y se usa en dos sitios ajenos: una comparación con ' +
+      'old.vence_en y un to_char(new.vence_en, YYYY-MM-DD) para el evento. Ese to_char está ' +
+      'medido y no depende del huso: 2026-03-08 en Pacific/Kiritimati y en Etc/GMT+12 — es la ' +
+      'sobrecarga sobre date, que Postgres promueve a timestamp SIN huso.',
+    'funcion gate_aprobar_suficiencia_guard':
+      'el reloj es «new.aprobado_en := now()» y gate_instancia.aprobado_en es timestamp with ' +
+      'time zone. Obligan fecha, fecha_objetivo y linea_base_fecha, que se leen setenta líneas ' +
+      'más abajo para comprobar la suficiencia del gate y nunca se cruzan con el instante.',
+    'funcion outcome_review_completar_guard':
+      'el reloj es «new.completado_en := now()» y outcome_review.completado_en es timestamp ' +
+      'with time zone. Obligan ventana_inicio (date) y ventana_de_medicion_abierta (que la ' +
+      'recibe), en la comprobación de la ventana de medición, otra sentencia.',
+    'funcion filas_de_conciliacion':
+      'el instante es «order by t.orden, t.creado_en», que ordena y no colapsa. Lo que mueve ' +
+      'es un to_char, pero sobre r.fecha_objetivo, que es date: medido, to_char(date, ' +
+      'YYYY-MM-DD) da 2026-03-08 en Pacific/Kiritimati y en Etc/GMT+12 — un date no tiene huso ' +
+      'que perder. Los dos nunca se cruzan.',
+    'funcion disposicion_motivo_no_ejecutable':
+      'el instante suelto es «select max(xp.completado_en) into v_export», y v_export está ' +
+      'declarada timestamptz: instante a instante. El tipo date que obliga es el del arreglo ' +
+      'canónico de este mismo PR, timezone(UTC, now())::date, sesenta líneas más abajo y ya ' +
+      'envuelto.',
+    'funcion ejecutar_disposicion':
+      'el mismo «max(xp.completado_en) into v_export» con v_export timestamptz. Lo que obliga ' +
+      'es un to_char, y su argumento es timezone(UTC, v_disp.ejecutado_en) — o sea el instante ' +
+      'ya fijado al huso del servidor antes de imprimirlo.',
+    'funcion vencimientos_de_cadencia':
+      'no hay ningún instante: la función trabaja solo con date —sus tres parámetros, su ' +
+      'RETURNS TABLE y toda su aritmética—. Lo que la obliga es «generate_series», que está ' +
+      'en el conjunto de instantes porque UNA de sus sobrecargas devuelve timestamptz; aquí ' +
+      'se llama con enteros, «generate_series(1, greatest(…))», y devuelve integer. Es la ' +
+      'misma ambigüedad de sobrecarga que timezone, y la resuelve la LLAMADA, que un ' +
+      'conjunto de nombres no puede ver. Son las dos únicas del esquema.',
+    'politica derecho_insert en derecho_uso':
+      'el instante es «decidido_en IS NULL» y lo que obliga es «vence_en IS NULL». Las dos son ' +
+      'pruebas de nulidad: no hay comparación ni cast que pueda colapsar nada.',
+    'politica gate_update_aprobar en gate_instancia':
+      'lo mismo del revés: «aprobado_en IS NOT NULL» contra «c.linea_base_fecha IS NULL». Dos ' +
+      'pruebas de nulidad, en ramas distintas del predicado.',
+    'politica reserva_delete en reserva_ai':
+      'la comparación es «creado_en <= now() - reserva_ai_ventana()», los dos lados instantes. ' +
+      'Obliga que reserva_ai_ventana() devuelva interval, y un intervalo movería el instante ' +
+      'según el huso si llevara días — medido: t + interval 1 day da 11:00Z en America/New_York ' +
+      'y 12:00Z en UTC. Éste no los lleva: la función es «select interval 100 seconds», y la ' +
+      'resta da el mismo instante (05:58:20Z) en Pacific/Kiritimati, Etc/GMT+12, ' +
+      'America/New_York y UTC. Si algún día la ventana pasa a contarse en días, esta línea ' +
+      'deja de valer y hay que volver a medirla.',
+  };
+
+  /**
+   * Y las sondas de esta misma comprobación que TIENEN que salir sin certificar. Van aparte
+   * de las de arriba porque no son una excusa sino lo contrario: si alguna desapareciera de
+   * la lista, sería que el certificado se ha vuelto demasiado generoso y todo lo demás dejó
+   * de significar nada.
+   */
+  const SONDAS_SIN_CERTIFICAR = [
+    'funcion censo_cert_opaca',
+    'funcion censo_cert_por_nombre',
+    'funcion censo_cert_indirecta',
+    'funcion censo_cert_aritmetica',
+    'funcion censo_cert_recibido',
+    'funcion censo_cert_pared_envuelta',
+  ];
+
+  /**
+   * Una forma peligrosa por CADA patrón, y una segura por cada trampa que los patrones tienen
+   * que esquivar. Se fabrican como funciones y se exige que el censo señale exactamente las
+   * primeras: sin esto, los patrones solo se ejercitaban con `current_date` —los objetos
+   * reales ya están limpios—, así que cualquiera de los otros podía romperse y el censo seguir
+   * en verde. Es la tercera vuelta de la misma lección: un guardián sin culpable no se prueba.
+   */
+  const SONDAS: Record<string, { expr: string; tipo: string; culpable: boolean }> = {
+    censo_probe_current_date: { expr: 'current_date', tipo: 'date', culpable: true },
+    censo_probe_cast: { expr: 'cast(now() as date)', tipo: 'date', culpable: true },
+    censo_probe_castop: { expr: 'now()::date', tipo: 'date', culpable: true },
+    censo_probe_datefn: { expr: 'date(now())', tipo: 'date', culpable: true },
+    censo_probe_trunc: {
+      expr: "(date_trunc('day', now()))::date",
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_tochar: {
+      expr: "to_char(now(), 'YYYY-MM-DD')",
+      tipo: 'text',
+      culpable: true,
+    },
+    censo_probe_stmt: { expr: 'statement_timestamp()::date', tipo: 'date', culpable: true },
+    censo_probe_prec: { expr: 'current_timestamp(0)::date', tipo: 'date', culpable: true },
+    censo_probe_extract: {
+      expr: 'extract(day from now())::int',
+      tipo: 'integer',
+      culpable: true,
+    },
+    censo_probe_datepart: {
+      expr: "date_part('dow', now())::int",
+      tipo: 'integer',
+      culpable: true,
+    },
+    // El reloj que devuelve TEXTO, con su salto de cast intermedio.
+    censo_probe_tod: {
+      expr: 'timeofday()::timestamptz::date',
+      tipo: 'date',
+      culpable: true,
+    },
+    // Las OCHO formas que el reloj desnudo dejaba pasar. Todas medidas: eligen día distinto
+    // en husos opuestos. Van con sonda propia porque un patrón sin culpable no está probado,
+    // y porque tres de los patrones se fundieron en uno — sin una sonda por FORMA, la fusión
+    // habría podido perder una sin que nada enrojeciera.
+    censo_probe_cast_interm: {
+      expr: 'now()::timestamp::date',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_trunc_tod: {
+      expr: "date_trunc('day', timeofday()::timestamptz)",
+      tipo: 'timestamptz',
+      culpable: true,
+    },
+    censo_probe_trunc_ts: {
+      expr: "date_trunc('day', now()::timestamp)",
+      tipo: 'timestamp',
+      culpable: true,
+    },
+    censo_probe_cast_kw_ts: {
+      expr: 'cast(now()::timestamp as date)',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_datefn_ts: {
+      expr: 'date(now()::timestamp)',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_tochar_ts: {
+      expr: "to_char(now()::timestamp, 'YYYY-MM-DD')",
+      tipo: 'text',
+      culpable: true,
+    },
+    censo_probe_extract_ts: {
+      expr: 'extract(day from (now())::timestamp)::int',
+      tipo: 'integer',
+      culpable: true,
+    },
+    // El destino ampliado: un cast a un tipo SIN huso ya es el reloj de pared de quien llama,
+    // aunque no llegue a `date`.
+    censo_probe_pared: {
+      expr: 'now()::timestamp',
+      tipo: 'timestamp',
+      culpable: true,
+    },
+    // Y las mismas con PRECISIÓN, que es parte del nombre del tipo. La primera se guarda
+    // deparseada como `((now())::timestamp(0) with time zone)::date`, así que la sonda del
+    // catálogo ejercita justo la forma que se escapaba.
+    censo_probe_prec_interm: {
+      expr: 'now()::timestamptz(0)::date',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_prec_pared: {
+      expr: 'now()::timestamp(0)',
+      tipo: 'timestamp',
+      culpable: true,
+    },
+    // El reloj que ATRAVIESA un `timetz` para quedarse la esfera local. El `timetz` conserva
+    // el instante, pero tirar su desfase no: 20:35 en Kiritimati, 18:35 en Etc/GMT+12.
+    censo_probe_timetz: {
+      expr: '(now()::time with time zone)::time',
+      tipo: 'time',
+      culpable: true,
+    },
+    // Y las seguras, que son la otra mitad del contrato: un censo que marcara el propio
+    // arreglo acabaría desactivado, así que se exige explícitamente que NO las señale.
+    censo_probe_ok_utc: {
+      expr: "timezone('UTC', now())::date",
+      tipo: 'date',
+      culpable: false,
+    },
+    censo_probe_ok_trunc: {
+      expr: "(date_trunc('day', timezone('UTC', now())))::date",
+      tipo: 'date',
+      culpable: false,
+    },
+    // `date_trunc` a una precisión que NO elige día: solo quita fracciones del instante, y
+    // medido no depende del huso. Marcarla sería un falso positivo.
+    censo_probe_ok_ms: {
+      expr: "date_trunc('milliseconds', now())",
+      tipo: 'timestamptz',
+      culpable: false,
+    },
+    // `to_char` sobre un `date`: un `date` no tiene huso del que moverse (medido).
+    censo_probe_ok_fecha: {
+      expr: "to_char(fecha_de_la_base(), 'YYYY-MM-DD')",
+      tipo: 'text',
+      culpable: false,
+    },
+    // El cast que CONSERVA el instante no elige calendario: `timestamptz` se queda fuera del
+    // destino a propósito. Sin esta sonda, ampliar el destino a `timestamp` podía haberse
+    // pasado de largo y llevarse también el que no molesta.
+    censo_probe_ok_tz: {
+      expr: 'now()::timestamptz',
+      tipo: 'timestamptz',
+      culpable: false,
+    },
+    // La ida y vuelta por TEXTO recupera el mismo instante —la representación lleva el
+    // desfase— así que marcarla sería un falso positivo sobre una serialización correcta.
+    censo_probe_ok_texto_vuelta: {
+      expr: 'now()::text::timestamptz',
+      tipo: 'timestamptz',
+      culpable: false,
+    },
+    // Con precisión sigue conservando el instante (medido comparando el VALOR): se guarda
+    // como `(now())::timestamp(0) with time zone`, y esa forma es la que el guardia del huso
+    // marcaba en falso cuando iba detrás de la precisión.
+    censo_probe_ok_tz_prec: {
+      expr: 'now()::timestamp(0) with time zone',
+      tipo: 'timestamptz',
+      culpable: false,
+    },
+    // El reloj AJUSTADO antes de colapsarlo. Medido: 09-06 en Kiritimati, 09-04 en Etc/GMT+12.
+    censo_probe_aritmetica: {
+      expr: "(now() + interval '1 day')::date",
+      tipo: 'date',
+      culpable: true,
+    },
+    // Serializar el reloj elige día igual que `to_char`. Se guarda deparseada como
+    // `"substring"((now())::text, 1, 10)`.
+    censo_probe_texto: {
+      expr: 'substring(now()::text, 1, 10)',
+      tipo: 'text',
+      culpable: true,
+    },
+    censo_probe_texto_cast: {
+      expr: 'cast(current_timestamp as text)',
+      tipo: 'text',
+      culpable: true,
+    },
+    // Un literal con `--` DENTRO: sin recorrer las comillas, todo lo que sigue se iba como
+    // comentario y el censo no llegaba a mirar el `::date`. Esta sonda solo sale marcada si
+    // el barrido de comentarios respeta el literal.
+    censo_probe_guion_en_literal: {
+      expr: "('--' || (now())::date::text)",
+      tipo: 'text',
+      culpable: true,
+    },
+    // El ajuste con una LLAMADA y con una multiplicación: el operando de la aritmética no es
+    // solo un literal de intervalo. Medidas las dos.
+    censo_probe_make_interval: {
+      expr: '(now() + make_interval(days => 1))::date',
+      tipo: 'date',
+      culpable: true,
+    },
+    censo_probe_interval_mult: {
+      expr: "(now() + interval '1 day' * 2)::date",
+      tipo: 'date',
+      culpable: true,
+    },
+    // El nombre SQL completo del tipo textual, que es como Postgres deparsea `varchar`.
+    censo_probe_character_varying: {
+      expr: 'cast(now() as character varying)',
+      tipo: 'text',
+      culpable: true,
+    },
+    // La comparación MIXTA: el reloj es absoluto, pero el `date` del otro lado se promociona
+    // con la medianoche LOCAL. Medido: false en UTC+14 y true en UTC-12. Se guarda deparseada
+    // como `(CURRENT_TIMESTAMP < '2026-09-04'::date)`, que es la forma que hay que cazar.
+    censo_probe_mixta: {
+      expr: "current_timestamp < date '2026-09-04'",
+      tipo: 'boolean',
+      culpable: true,
+    },
+    // Y en el otro orden, porque el reloj puede ir a cualquier lado del comparador.
+    censo_probe_mixta_der: {
+      expr: "date '2026-09-04' > now()",
+      tipo: 'boolean',
+      culpable: true,
+    },
+    // Comparar dos instantes absolutos no elige nada: el otro operando LLEVA huso.
+    censo_probe_ok_mixta: {
+      expr: "now() < timestamptz '2026-09-04 00:00:00+00'",
+      tipo: 'boolean',
+      culpable: false,
+    },
+    // `current_timestamp` desnudo es un instante absoluto —la cabecera de este fichero lo dice
+    // desde el principio— y el censo lo marcaba igual. Con la lista derivada del tipo, ya no.
+    censo_probe_ok_ct: {
+      expr: 'current_timestamp',
+      tipo: 'timestamptz',
+      culpable: false,
+    },
+    // Y `timetz` desnudo, que conserva el instante (medido por igualdad, no por impresión).
+    censo_probe_ok_timetz: {
+      expr: 'now()::time with time zone',
+      tipo: 'timetz',
+      culpable: false,
+    },
+    // Un identificador que TERMINA en la palabra clave no es una lectura del reloj, y solo la
+    // frontera IZQUIERDA lo distingue: `current_date_pactada` lo para la derecha, así que no
+    // sirve para probar la otra mitad. `mi_current_date` sí, y sobrevive al deparseo como
+    // alias de la subconsulta (comprobado). Sin la frontera izquierda, sale marcado.
+    censo_probe_ok_prefijo: {
+      expr: "(select q.mi_current_date from (select date '2026-01-01' as mi_current_date) q)",
+      tipo: 'date',
+      culpable: false,
+    },
+    // La edad contra HOY, que es el reloj que no se escribe: lo pone `age` con un solo
+    // argumento. Medido: 10:00:00 en Kiritimati y 12:00:00 en Etc/GMT+12 sobre el mismo
+    // instante.
+    censo_probe_edad: { expr: "age(timestamptz '2020-01-01 00:00:00+00')", tipo: 'interval', culpable: true },
+    // Y con los DOS instantes dados no hay calendario que leer: medido idéntico en los dos.
+    censo_probe_ok_edad_dos: {
+      expr: "age(now(), timestamptz '2020-01-01 00:00:00+00')",
+      tipo: 'interval',
+      culpable: false,
+    },
+    // `epoch` es el instante absoluto: medido, no cambia con el huso.
+    censo_probe_ok_epoch: {
+      expr: 'extract(epoch from now())::bigint',
+      tipo: 'bigint',
+      culpable: false,
+    },
+  };
+
+  it('el reconocedor dice que sí a cada forma peligrosa y que no a cada segura', async () => {
+    /*
+     * Las sondas de más abajo son objetos REALES y por eso solo pueden ejercitar lo que el
+     * catálogo devuelve, que es la forma DEPARSEADA. Dos de los patrones existen para el otro
+     * censo —el del código TypeScript, donde el SQL está tal como se escribió— y ningún objeto
+     * puede producirlos: Postgres reduce `now()::date` y `cast(now() as date)` a
+     * `(now())::date` antes de guardarlos. Comprobado: rompiendo esos dos patrones, las sondas
+     * del catálogo siguen en verde.
+     *
+     * Así que el reconocedor se prueba también solo, con las dos formas de cada cosa. Es la
+     * mitad que las sondas no pueden cubrir, y sin ella dos de los siete patrones no los
+     * ejercitaba nada.
+     */
+    const PELIGROSAS = [
+      // El huso dinámico ENVUELTO: el paréntesis de más impedía consumir el argumento y el
+      // patrón no casaba. Medido: 2026-09-05 en Kiritimati y 2026-09-04 en Etc/GMT+12.
+      "timezone((current_setting('TimeZone')), now())::date",
+      // Y el SQL de un EXECUTE compuesto por concatenación, en sus dos cortes, y por `format`,
+      // que es la forma idiomática de componerlo en plpgsql.
+      "execute 'select now()' || '::date'",
+      "execute 'select ' || 'now()::date'",
+      "execute format('select %s', 'now()::date')",
+      // Y el marcador PARTIENDO la expresión, que es donde pegar los trozos ya no alcanza:
+      // Postgres ejecuta `select now()::date` (medido) y las dos concatenaciones daban
+      // `select %s::datenow()` y `select %s::date now()`, ninguna culpable.
+      "execute format('select %s::date', 'now()')",
+      // Con marcador POSICIONAL y con anchura, que es la misma sustitución escrita distinto. El
+      // posicional se elige SALTEADO a propósito: con `%1$s` el orden natural acierta por
+      // casualidad y la sonda no probaría nada. Medido: `format('select %2$s::date', 'columna',
+      // 'now()')` da `select now()::date`.
+      "execute format('select %2$s::date', 'columna', 'now()')",
+      "execute format('select %10s::date', 'now()')",
+      // Y el ancho tomado de OTRO argumento, que es la parte de la gramática de `format` que
+      // faltaba. Medido: `format('select %2$*1$s::date', 0, 'now()')` da exactamente
+      // `select now()::date`. Va con posición SALTEADA y con ancho posicional a la vez,
+      // porque es la forma en que reconstruir mal el marcador desalinea todo lo de detrás.
+      "execute format('select %2$*1$s::date', 0, 'now()')",
+      // Y el ancho por `*` a secas, que se COME un argumento del contador secuencial: sin
+      // contarlo, el valor que se sustituye es el ancho y el reloj se queda fuera.
+      "execute format('select %*s::date', 4, 'now()')",
+      // Y con un argumento ILEGIBLE en medio, que ocupa hueco pero no se lee: el reloj está
+      // en el tercero y el posicional tiene que llegar hasta él. Medido: `select now()::date`.
+      "execute format('select %3$s::date', 0, v_cualquiera, 'now()')",
+      // Serializar un ARRAY a texto plano: `array_to_string` aplica la función de salida a
+      // cada elemento. Medido: `2026-09-05 …+14` contra `2026-09-04 …-12`, con fecha distinta
+      // dentro del texto. Era el único serializador de array sin `json` en el nombre.
+      "array_to_string(array[now()], ',')",
+      // Y la comparación IMPLÍCITA con una columna cuyo tipo no está escrito en ninguna parte:
+      // Postgres promociona la fecha a `timestamptz` por la medianoche del huso de la sesión.
+      // Medido, y no de canto: la misma fila da `f` en Pacific/Kiritimati y `t` en Etc/GMT+12.
+      // Estaba como límite declarado, con esta misma línea del lado seguro.
+      'vence_en > current_timestamp',
+      // Y con el nombre ENTRECOMILLADO, que es la misma promoción escrita de otra manera
+      // —medido: `false` en Pacific/Kiritimati y `true` en Etc/GMT+12—. El patrón no es que se
+      // la dejara: EXCLUÍA las comillas de al lado, así que la descartaba a propósito.
+      // (Va como sonda de texto y no de catálogo porque en las tablas sonda el nombre `d` es
+      // ambiguo a propósito, y los ambiguos se omiten: allí el caso no se puede escribir.)
+      '"vence_en" > current_timestamp',
+      // La coerción IMPLÍCITA a texto, que renderiza igual sin nombrar ningún formato. Las
+      // cuatro medidas: cadena distinta en husos opuestos.
+      'concat(now())',
+      'quote_literal(now())',
+      "now() || ''",
+      "'fecha: ' || now()",
+      // El NOMBRE de la función, entrecomillado. Las siete son llamadas válidas (medidas) y
+      // ninguna casaba: el patrón exigía el paréntesis pegado al nombre desnudo.
+      'pg_catalog."to_json"(now())',
+      '"date_trunc"(\'day\', now())',
+      '"to_char"(now(), \'YYYY-MM-DD\')',
+      '"date_part"(\'dow\', now())',
+      '"date"(now())',
+      '"age"(vence_en)',
+      '"timezone"(current_setting(\'TimeZone\'), now())::date',
+      // La serialización a JSON, que es la misma elección de calendario que `::text` escrita
+      // con otra función. Las cuatro medidas: cadena distinta en husos opuestos.
+      'to_json(now())',
+      'to_jsonb(now())',
+      "jsonb_build_object('cuando', now())",
+      'json_agg(now())',
+      // Y el reloj ANIDADO dentro del valor que se serializa, que es como se usa `row_to_json`
+      // de verdad. Las dos medidas: cadena distinta en husos opuestos.
+      'row_to_json(row(now()))',
+      "jsonb_build_object('d', coalesce(now(), now()))",
+      // Ésta es peligrosa y está bien que esté, pero NO prueba el patrón de JSON: la marca el
+      // de `timezone(...)`, que ve el huso dinámico sin mirar el envoltorio. Se deja dicho para
+      // que nadie la lea como cobertura de lo que no cubre.
+      "jsonb_build_object('d', timezone(current_setting('TimeZone'), now()))",
+      // La edad contra HOY, sin ningún reloj escrito: la forma de un solo argumento basta.
+      'age(vence_en)',
+      "select age(t.creado_en) > interval '30 days' from t",
+      'pg_catalog.age(vence_en)',
+      // El nombre del tipo ENTRECOMILLADO, y el del esquema. Las tres medidas: 2026-09-05 en
+      // Kiritimati y 2026-09-04 en Etc/GMT+12, igual que sin comillas. El catálogo tampoco
+      // produce esta forma —deparsea el nombre desnudo—, así que solo el reconocedor la cubre.
+      'now()::"date"',
+      'now()::pg_catalog."date"',
+      'now()::"pg_catalog".date',
+      'now()::"timestamp"',
+      'now()::"text"',
+      // Y la ida y vuelta cuya SALIDA vuelve a elegir día, escrita con `cast … as`: la vuelta
+      // con huso solo salva si es TERMINAL, y aquí no lo es. Medido: 2026-09-05 y 2026-09-04.
+      'cast(now()::text::timestamptz as date)',
+      'cast(now()::text::"timestamptz" as "date")',
+      // Y la cadena LARGA, que era el límite declarado de esa misma guardia: volver a texto y
+      // de ahí a fecha. El paso intermedio no es «un tipo sin huso» y la vuelta pasaba por
+      // terminal. Medido: 2026-09-05 y 2026-09-04, las dos.
+      'now()::text::timestamptz::text::date',
+      'left(now()::text::timestamptz::text, 10)',
+      'cast(cast(now()::text as timestamptz) as text)',
+      'current_date',
+      'CURRENT_DATE',
+      'select localtimestamp',
+      "date_trunc('day', now())",
+      "date_trunc('day'::text, now())",
+      "date_trunc('month', current_timestamp)",
+      'now()::date',
+      '(now())::date',
+      'cast(now() as date)',
+      'CAST(clock_timestamp() AS date)',
+      'date(now())',
+      "to_char(now(), 'YYYY-MM-DD')",
+      "to_char(now(), 'YYYY-MM-DD'::text)",
+      // El `as` del cast solo salva si el destino LLEVA huso: a un tipo sin huso sigue
+      // eligiendo calendario.
+      "cast(now()::text as date)",
+      // Y un ALIAS no es un cast, aunque se llame como el tipo: sin `)` de cierre no hay
+      // vuelta que valga. Con sufijo, la frontera de palabra lo separa igual.
+      'select now()::text as timestamptz',
+      'select now()::text as timestamptz_pactado',
+      // El nombre del reloj ENTRE COMILLAS: `pg_catalog."now"()` es la misma función y el día
+      // cambia igual (medido: 2026-09-05 en Kiritimati y 2026-09-03 en Etc/GMT+12).
+      'pg_catalog."now"()::date',
+      // La unidad puede llegar CASTEADA con la sintaxis larga, o no ser un literal siquiera.
+      "date_trunc(CAST('day' AS text), now())",
+      'date_trunc(v_unidad, now())',
+      "date_part(CAST('dow' AS text), now())",
+      'date_part(v_campo, now())',
+      // Y el campo de `extract` también admite literal: `extract('dow' from now())` es SQL
+      // válido —comprobado contra la base— y la palabra desnuda no lo casaba.
+      "extract('dow' from now())",
+      // El TERCER argumento que lee la sesión: la sobrecarga de tres se escapaba entera.
+      "date_trunc('day', now(), current_setting('TimeZone'))",
+      // Y el campo con PREFIJO, que es otra forma válida de escribir el mismo literal.
+      "extract(E'dow' from now())",
+      // El prefijo no vuelve segura una unidad peligrosa, ni un contenido escapado la iguala.
+      "date_trunc(E'day', now())",
+      "(now() + interval '1 day' * (2)::pg_catalog.float8)::date",
+      "(now() + '1 day'::pg_catalog.interval)::date",
+      "current_timestamp < '2026-09-05'::pg_catalog.date",
+      'now()::pg_catalog.date',
+      // El RELOJ escrito entre comillas, que es `current_date` con otra ortografía. Medidas
+      // todas en husos opuestos: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+      // Etc/GMT+12 las que colapsan a día, y la hora de pared de cada uno las de `timestamp`.
+      "'now'::date",
+      "'now'::timestamp",
+      "date 'now'",
+      "cast('now' as date)",
+      "'now'::pg_catalog.date",
+      // Sin distinguir mayúsculas, con espacios de sobra y con prefijo: las tres son la misma
+      // lectura para Postgres (medido).
+      "'NOW'::date",
+      "' now '::date",
+      "E'now'::date",
+      // Y `'now'` CON huso es el instante, o sea un reloj: no es hallazgo solo, pero todo lo
+      // que este censo prohíbe hacerle a `now()` vale igual escrito así.
+      "'now'::timestamptz::date",
+      "date_trunc('day', 'now'::timestamptz)",
+      "to_char(timestamptz 'now', 'YYYY-MM-DD')",
+      "concat('now'::timestamptz)",
+      // Y las tres hermanas, que ni con huso conservan el instante (medido por epoch:
+      // 1788516000 contra 1788523200).
+      "'today'::date",
+      "'today'::timestamptz",
+      "timestamptz 'today'",
+      "'tomorrow'::date",
+      "cast('yesterday' as date)",
+      // La ida y vuelta que NO termina ahí: recupera el instante y vuelve a elegir día.
+      // En su forma fuente y en la que devuelve el catálogo.
+      'now()::text::timestamptz::date',
+      // Y la ida y vuelta USADA COMO OPERANDO de otra cosa: el instante es el mismo, pero
+      // quien elige calendario es la operación de fuera. Medidas las tres en husos opuestos:
+      // `2026-09-05 00:00:00+14` contra `2026-09-04 00:00:00-12`, `2026-09-05` contra
+      // `2026-09-04`, y el renderizado con su desfase.
+      "date_trunc('day', now()::text::timestamptz)",
+      "to_char(now()::text::timestamptz, 'YYYY-MM-DD')",
+      'concat(now()::text::timestamptz)',
+      // Y el reloj dentro de un CONSTRUCTOR de array: `to_json` serializa recursivamente, así
+      // que el instante sale con el desfase de quien llama (medido:
+      // `["2026-09-05T…+14:00"]` contra `["2026-09-04T…-12:00"]`).
+      'to_json(array[now()])',
+      'to_jsonb(array[now()])',
+      // El huso DINÁMICO en las dos sintaxis: vuelve a decidir quien llama.
+      "timezone(current_setting('TimeZone'), now())::date",
+      "(now() at time zone current_setting('TimeZone'))::date",
+      // Y el SQL dentro de un EXECUTE, que el vaciado de literales se llevaba.
+      "execute 'select now()::date'",
+      "execute format('select now()::date')",
+      '(((now())::text)::timestamp with time zone)::date',
+      "to_char(now(), E'YYYY'::text)",
+      // El formato de `to_char` que SÍ lee el calendario, y `SSSS` —segundos desde
+      // medianoche— que sin la guardia de frontera se leería como dos `SS` seguros.
+      "to_char(now(), 'SSSS')",
+      "to_char(now(), 'US HH24')",
+      'statement_timestamp()::date',
+      '(statement_timestamp())::date',
+      'transaction_timestamp()::date',
+      'current_timestamp(0)::date',
+      '(CURRENT_TIMESTAMP(0))::date',
+      'localtimestamp(3)',
+      'extract(day from now())',
+      'EXTRACT(day FROM now())',
+      // `minute` NO es seguro para `extract`: con un desfase de 45 minutos (`Asia/Kathmandu`)
+      // da 20 donde UTC da 35. Sí lo es para `date_trunc`, que conserva el instante — y esa
+      // asimetría es la razón de que las dos listas se midan por separado.
+      'extract(minute from now())',
+      "date_part('minute', now())",
+      'extract(month from clock_timestamp())',
+      "date_part('dow', now())",
+      "date_part('dow'::text, now())",
+      'timeofday()::timestamptz::date',
+      '((timeofday())::timestamp with time zone)::date',
+      // El reloj con cast por el camino, en las ocho formas que el reloj desnudo dejaba
+      // pasar. Medidas: las ocho eligen día distinto en husos opuestos.
+      'now()::timestamp::date',
+      'now()::timestamp without time zone::date',
+      "date_trunc('day', timeofday()::timestamptz)",
+      "date_trunc('day'::text, (timeofday())::timestamp with time zone)",
+      "date_trunc('day', now()::timestamp)",
+      'cast(now()::timestamp as date)',
+      'date(now()::timestamp)',
+      "to_char(now()::timestamp, 'YYYY-MM-DD')",
+      'extract(day from (now())::timestamp)',
+      "date_part('day', now()::timestamp)",
+      // Y el destino ampliado: un tipo SIN huso ya es el reloj de pared, no haga falta llegar
+      // a `date`. `now()::timestamp` da día 4 en Kiritimati y día 3 en Etc/GMT+12 (medido).
+      'now()::timestamp',
+      '(now())::timestamp without time zone',
+      'localtimestamp::date',
+      // Con precisión: el nombre del tipo la incluye, y sin ella la cadena de castos se
+      // paraba ante el `(0)` sin llegar nunca al `::date`. La segunda es la forma en que
+      // Postgres guarda la primera.
+      'now()::timestamptz(0)::date',
+      '((now())::timestamp(0) with time zone)::date',
+      'now()::timestamp(0)::date',
+      'now()::timestamp(0)',
+      'cast(now()::timestamptz(3) as date)',
+      'current_timestamp(0)::timestamp(0)',
+      // El reloj que atraviesa un `timetz` y se queda la esfera local.
+      '(now()::time with time zone)::time',
+      'now()::timetz::time',
+      '(now()::timetz)::time',
+      'extract(hour from now()::time with time zone)',
+      'current_time::time',
+      // La comparación mixta: el reloj es absoluto y el otro operando se promociona con la
+      // medianoche LOCAL. Medido: false en UTC+14 y true en UTC-12.
+      "current_timestamp < date '2026-09-04'",
+      "CURRENT_TIMESTAMP < '2026-09-04'::date",
+      "now() < '2026-09-04'::date",
+      "now() >= timestamp '2026-09-04 00:00:00'",
+      "date '2026-09-04' > now()",
+      "'2026-09-04'::date > current_timestamp",
+      "now() between date '2026-09-01' and date '2026-09-30'",
+      'vence_en::date = current_timestamp',
+      // `BETWEEN` es ternario: el límite peligroso puede ser el de ARRIBA, y el `not` va en
+      // medio. Medido: el primero da false en UTC+14 y true en UTC-12.
+      "now() between timestamptz '2020-01-01 00:00+00' and date '2026-09-04'",
+      "now() not between timestamptz '2020-01-01 00:00+00' and '2026-09-04'::date",
+      // La aritmética con llamada y con multiplicación, y con el multiplicador entre
+      // paréntesis, que es la forma FUENTE que el deparseo no enseña.
+      '(now() + make_interval(days => 1))::date',
+      "(now() + interval '1 day' * 2)::date",
+      "(now() + interval '1 day' * (2))::date",
+      // Y los nombres completos del tipo textual.
+      'cast(now() as character varying)',
+      'now()::character varying',
+      'now()::character(10)',
+      // El texto que NO vuelve a un tipo con huso sigue eligiendo día.
+      'now()::text::date',
+      // La aritmética antes del colapso.
+      "(now() + interval '1 day')::date",
+      "((now() + '1 day'::interval))::date",
+      "(current_timestamp - interval '2 hours')::date",
+      "date(now() + interval '1 day')",
+      // Y el destino de TEXTO, que serializa el reloj con el huso de la sesión.
+      'now()::text',
+      'substring(now()::text, 1, 10)',
+      'cast(current_timestamp as text)',
+      '((now())::text)',
+    ];
+    const SEGURAS = [
+      "timezone('UTC', now())::date",
+      "(timezone('UTC'::text, now()))::date",
+      "date_trunc('day', timezone('UTC', now()))",
+      "date_trunc('milliseconds', now())",
+      "date_trunc('second', now())",
+      'fecha_de_la_base()',
+      'inicio_del_dia_de_la_base()',
+      "to_char(vence_en, 'YYYY-MM-DD')",
+      "to_char(fecha_de_la_base(), 'YYYY-MM-DD')",
+      'creado_en >= inicio_del_dia_de_la_base()',
+      // Un identificador que CONTIENE una palabra clave no es una lectura del reloj.
+      'select current_date_pactada from acuerdo',
+      // `epoch` y los campos por debajo del minuto NO dependen del huso (medido con siete
+      // instantes que cruzan día, mes, año, década, siglo y milenio, y dos husos extremos).
+      'extract(epoch from now())',
+      "date_part('epoch', now())",
+      "extract(day from timezone('UTC', now()))",
+      // Y las precisiones de `date_trunc` que solo quitan fracciones del instante.
+      "date_trunc('milliseconds', now())",
+      // `AT TIME ZONE 'UTC'` es justo lo que FIJA el reloj, y la expresión entera es
+      // independiente del huso (medido). El cast intermedio se escribía `timestamp[^)]*` y
+      // ese `[^)]*` se tragaba la cláusula, así que la forma CORRECTA salía marcada: un censo
+      // que marca su propio arreglo se acaba desactivando.
+      "((now())::timestamp with time zone AT TIME ZONE 'UTC')::date",
+      "(now() at time zone 'UTC')::date",
+      // El cast que CONSERVA el instante: `timestamptz` no elige calendario.
+      'now()::timestamptz',
+      '(now())::timestamp with time zone',
+      'clock_timestamp()::timestamptz',
+      // Un campo por debajo del minuto sí es seguro sobre un reloj — y lo sería mal si los
+      // instantes de la medición incluyeran la era de la hora local media.
+      'extract(milliseconds from now())',
+      // La precisión es parte del NOMBRE del tipo, y con ella el tipo sigue llevando huso:
+      // medido comparando el valor, `now()::timestamp(0) with time zone` es el mismo instante
+      // en husos opuestos. La guardia del huso tiene que ir DELANTE de la precisión para que
+      // el retroceso del motor no la rodee.
+      'now()::timestamp(0) with time zone',
+      '(now())::timestamp(0) with time zone',
+      'now()::timestamptz(0)',
+      // Las palabras cuyo tipo LLEVA huso son instantes absolutos y no se marcan solas.
+      // Medido: con instante fijo, la igualdad da `true` en husos opuestos.
+      'current_timestamp',
+      'current_time',
+      'select current_timestamp - creado_en from disposicion',
+      // Comparar dos instantes absolutos no elige calendario: el otro operando lleva huso.
+      "now() < timestamptz '2026-09-04 00:00:00+00'",
+      "now() >= '2026-09-04 00:00:00+00'::timestamptz",
+      'now() < creado_en',
+      // Y la columna sin huso comparada con algo que YA es fecha: ninguna de las dos tiene
+      // huso del que moverse, así que resolver el tipo por el catálogo no puede inventar
+      // culpa. Es la mitad que acota a la comparación implícita.
+      "vence_en >= timezone('UTC', now())::date",
+      // Y comparar dos FECHAS tampoco: ninguna tiene huso del que moverse.
+      "fecha_de_la_base() = date '2026-09-04'",
+      // El `and` de al lado no es el límite superior del `between`. Medida: estable.
+      "now() between timestamptz '2020-01-01+00' and timestamptz '2030-01-01+00' and date '2026-09-04' = fecha_de_la_base()",
+      // La ida y vuelta por texto conserva el instante (medido por valor: mismo epoch en husos
+      // opuestos). Con cualquier envoltura de paréntesis y con el nombre largo del tipo, que
+      // son las dos formas por las que el guardia se dejaba rodear.
+      'now()::text::timestamptz',
+      'now()::text::timestamp with time zone',
+      '((now()::text))::timestamptz',
+      '(((now())::text))::timestamptz',
+      'now()::character varying::timestamptz',
+      // La RESTA de dos relojes es un intervalo, no una lectura del calendario: el cero es el
+      // cero en todos los husos (medido).
+      '(now() - now())::text',
+      '(now() - now())::interval',
+      "(now() at time zone 'UTC')::date = date '2026-09-04'",
+      // Un intervalo sobre un valor que NO es reloj no colapsa ningún calendario.
+      "(vence_en + interval '1 day')::date",
+      // Y serializar algo que ya es fecha tampoco: un `date` no tiene huso del que moverse.
+      'fecha_de_la_base()::text',
+      // …y la unidad segura sigue siéndolo escrita con la sintaxis larga.
+      "date_trunc(CAST('milliseconds' AS text), now())",
+      "date_part(CAST('epoch' AS text), now())",
+      "extract('epoch' from now())",
+      // Un huso FIJO como tercer argumento da el mismo instante en cualquier sesión (medido
+      // por epoch: idéntico en Kiritimati y en Etc/GMT+12), aunque su TEXTO se imprima
+      // distinto — que es justo la trampa que este censo persigue, y en la que caí midiendo.
+      "date_trunc('day', now(), 'UTC')",
+      "date_trunc('day', now(), 'UTC'::text)",
+      // Y las envolturas que no cambian la unidad segura.
+      "date_trunc(('second'), now())",
+      "date_trunc('second'::pg_catalog.text, now())",
+      // Y las mismas formas SEGURAS escritas con prefijo o con cast, que es la gramática común
+      // del literal. Las cuatro medidas por epoch: iguales en los dos husos.
+      "date_trunc(E'second', now())",
+      "date_part(E'epoch', now())",
+      "date_trunc('day', now(), E'UTC')",
+      "to_char(now(), 'US'::text)",
+      'now()::text::pg_catalog.timestamptz',
+      // El huso FIJO sigue siendo el arreglo canónico y no se marca, en las dos sintaxis.
+      "timezone('UTC', now())::date",
+      "(now() at time zone 'UTC')::date",
+      // Y sigue siendo fijo con un paréntesis de más, que es la otra mitad de admitir la
+      // envoltura: sin ella, subir el techo de anidamiento habría marcado código correcto.
+      // Medido: 2026-09-04 en los dos husos.
+      "timezone(('UTC'), now())::date",
+      "(now() at time zone ('UTC'))::date",
+      // Ni un EXECUTE cuyo SQL no lee el calendario.
+      "execute 'select 1'",
+      "execute format('select 1')",
+      // Y la sustitución no INVENTA culpa: el mismo `format` con un argumento que no lee el
+      // calendario sigue limpio.
+      "execute format('select %s', '1')",
+      // Y la mitad que acota a `array_to_string`: serializar un array de algo que YA es fecha
+      // no elige calendario (medido: `2026-09-04` en los dos husos). El huso ya fijado dentro
+      // del corchete se respeta igual que fuera — comprobado retirando esa mirada de atrás,
+      // que la mueve junto a las tres seguras que ya la sostenían.
+      "array_to_string(array[timezone('UTC', now())::date], ',')",
+      // Y serializar un array de algo que YA es fecha no elige calendario: un `date` no tiene
+      // huso del que moverse (medido: `["2026-09-04"]` en los dos husos). Es la mitad que
+      // acota el descenso por los corchetes.
+      'to_json(array[fecha_de_la_base()])',
+      // `'now'` con huso es el instante y no elige nada: mismo epoch en husos opuestos
+      // (1788538089, medido), igual que `now()` a secas.
+      "'now'::timestamptz",
+      "timestamptz 'now'",
+      // Y las especiales que NO se mueven: las tres medidas iguales en husos opuestos.
+      "'epoch'::date",
+      "'infinity'::date",
+      "'allballs'::timetz",
+      // La palabra entre comillas SIN tipo encima es un dato como cualquier otro, y marcarla
+      // sería el falso positivo que desactiva un censo: una clave de JSON, un texto que se
+      // devuelve, una comparación contra una columna de texto.
+      "concat('now')",
+      "jsonb_build_object('now', creado_en)",
+      "select 'today' as etiqueta",
+      "where clase = 'yesterday'",
+      // Y los formatos que NO leen el calendario: texto entrecomillado y campos por debajo
+      // del minuto (ningún huso tiene desfase con segundos — medido sobre los 499).
+      "to_char(now(), '\"fijo\"')",
+      "to_char(now(), 'US')",
+      "to_char(now(), 'SS.MS')",
+      // …y `timetz` como destino conserva el instante igual.
+      'now()::time with time zone',
+      'now()::timetz',
+      // Un identificador que TERMINA en la palabra clave. Solo la frontera IZQUIERDA lo
+      // separa: `current_date_pactada` lo para la derecha, y por eso no prueba esta mitad.
+      'mi_current_timestamp::date',
+      'select mi_localtimestamp::date from t',
+      'tabla.current_date_previo::date',
+      // …y el reloj restado entre PARÉNTESIS es el mismo reloj: sigue siendo el intervalo
+      // cero (medido `00:00:00` en los dos husos). Las dos formas que la exclusión ancha
+      // recupera; con DOBLE paréntesis no hay sonda porque no la había marcado nadie —el
+      // GRUPO solo anida un nivel—, y una sonda que pasa por otro motivo no prueba nada.
+      '(now() - (now()))::text',
+      '(now() - (now()::timestamptz))::text',
+      // La ida y vuelta escrita con CAST … AS, en sus dos mitades. El catálogo NUNCA produce
+      // esta forma —la deparsea con `::`—, así que ninguna sonda de objeto real la cubre.
+      'cast(now()::text as timestamptz)',
+      // Y el nombre entrecomillado no puede volverse una excusa para marcar: el arreglo
+      // canónico y una unidad segura siguen siéndolo escritos así (medidos los dos).
+      '"timezone"(\'UTC\', now())::date',
+      '"date_trunc"(\'second\', now())',
+      // Y el arreglo canónico DENTRO del JSON: lo que se serializa ya es un `timestamp` sin
+      // huso, y sale igual en los dos (medido). Sin esta mitad, el patrón de arriba habría
+      // marcado justo la forma que este PR propone como solución.
+      "to_json(timezone('UTC', now()))",
+      "jsonb_build_object('d', timezone('UTC', now()))",
+      // Y la otra sintaxis de la conversión fija, que ni llega a probarse: detrás del reloj no
+      // hay coma ni cierre. Medido estable en los dos husos.
+      "to_json(now() at time zone 'UTC')",
+      // Y las dos formas en que el operador NO renderiza un reloj: con la conversión delante
+      // —lo que precede al operador es su paréntesis— y con la resta, que sigue siendo el
+      // intervalo cero. Medidas las dos: iguales en los dos husos.
+      "timezone('UTC', now()) || ''",
+      "(now() - now()) || ''",
+      "concat(timezone('UTC', now()))",
+      // Con los dos instantes dados, `age` no lee ningún calendario (medido). Y el nombre
+      // dentro de otro identificador tampoco: `promedio_age` y `average` no son la función.
+      'age(now(), t.creado_en)',
+      'select average(x) from t',
+      'select promedio_age(x) from t',
+      // Y con el tipo de la vuelta ENTRECOMILLADO, que sigue recuperando el instante (medido
+      // por epoch: 1788530625 en los dos husos). Sin reconocerlo, el censo marcaba correcto.
+      'now()::text::"timestamptz"',
+      'cast(now()::text as "timestamptz")',
+      // Un ALIAS de columna llamado como un tipo NO es un casto: la vuelta sigue siendo
+      // terminal y la expresión sigue siendo correcta. Es lo que separa a la guardia nueva de
+      // marcar cualquier `as` que venga detrás.
+      'select now()::text::timestamptz as date from t',
+      'cast(cast(now() as text) as timestamptz)',
+      'cast(now()::text as timestamp with time zone)',
+    ];
+    expect(PELIGROSAS.filter((f) => !culpable(f))).toEqual([]);
+    expect(SEGURAS.filter((f) => culpable(f))).toEqual([]);
+
+    /*
+     * Y el BARRIDO DE COMENTARIOS por los dos dialectos, que es por donde pasa TODO lo que
+     * este censo inspecciona: si se come código, el censo da verde sin haber mirado.
+     *
+     * La diferencia entre los dialectos no es un detalle: **SQL anida los comentarios de
+     * bloque y TypeScript no** (comprobados los dos). Contar profundidad en TypeScript deja la
+     * cuenta abierta en el primer cierre y se lleva por delante la consulta real hasta el
+     * siguiente cierre o el final del fichero.
+     */
+    /*
+     * Y la BARRA de una expresión regular, que es la misma con la que empieza un comentario.
+     * Dentro de una clase de caracteres no se escapa, así que `/[/*]/` lleva un `/*` que el
+     * recorrido tomaba por comentario de bloque y, sin cierre por delante, se comía el resto
+     * del fichero con la consulta peligrosa dentro.
+     */
+    expect(culpable('const sep = /[/*]/; const q = sql`select now()::date`;', 'ts')).toBe(true);
+    // Y con la otra forma dentro de la clase, que se llevaba solo hasta el fin de renglón.
+    expect(culpable('const sep = /[//]/;\nconst q = sql`select now()::date`;', 'ts')).toBe(true);
+    /*
+     * La otra mitad, y la que decide que la heurística vaya por el lado seguro: una DIVISIÓN
+     * no puede tomarse por regex. Si se tomara, el recorrido se comería desde ahí hasta la
+     * siguiente barra —la consulta de después incluida— y el censo daría verde sin mirar. Aquí
+     * hay dos divisiones y una consulta peligrosa en medio.
+     */
+    expect(
+      culpable('const a = b / c; const q = sql`select now()::date`; const d = e / f;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y la CLASE de caracteres tiene que consumirse entera, no hasta la primera barra de
+     * dentro: cortar ahí devuelve al recorrido el resto de la regex como si fuera código, y
+     * ese resto puede llevar una barra que abra otra «regex» que sí se coma la consulta. Aquí
+     * la clase esconde una barra y el cuerpo lleva `\/\*` escapado, que es lo que al cortar
+     * pronto deja un `*` delante de la barra siguiente.
+     */
+    expect(
+      culpable('const r = /[/]|\\/\\*/; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y una regex que MENCIONA una palabra del reloj es un dato, no una lectura: no se ejecuta
+    // como SQL nunca. Copiarla tal cual la marcaba.
+    expect(culpable('const r = /current_date/; const q = sql`select 1`;', 'ts')).toBe(false);
+    /*
+     * El SQL de un `EXECUTE` escrito con literal por DÓLAR, dentro del cuerpo de una función
+     * —que es donde aparece de verdad, y donde el delimitador exterior ya es otro dólar—.
+     */
+    expect(
+      culpable(
+        'create function f() returns void language plpgsql as $$ begin execute $q$select now()::date$q$; end $$',
+        'sql',
+      ),
+    ).toBe(true);
+    // Y la segura por la misma vía: fallar cerrado sobre un EXECUTE que no lee el calendario
+    // sería marcar cualquier SQL dinámico.
+    expect(
+      culpable(
+        'create function f() returns void language plpgsql as $$ begin execute $q$select 1$q$; end $$',
+        'sql',
+      ),
+    ).toBe(false);
+    /*
+     * Una expresión regular en posición de SENTENCIA, tras la condición de un `if`. El `)` no
+     * se puede decidir mirando un carácter: cierra un valor —y la barra divide— o cierra una
+     * condición, y entonces lo que sigue es una sentencia que puede empezar por una regex.
+     */
+    expect(
+      culpable('if (activo) /[/*]/.test(x); const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y tras CERRAR un bloque empieza otra sentencia, así que también puede empezar una regex:
+     * `if (activo) {} /re/.test(x)`. Con el `}` fuera de los abridores, la barra se leía como
+     * división y el `/*` de la clase abría un comentario sin cierre que se llevaba la consulta
+     * de después — el censo en verde por no estar mirando, que es su peor forma de fallar.
+     *
+     * Y no hay caso legítimo del otro lado que perder: dividir un objeto, una función o un
+     * bloque no significa nada en JavaScript, así que una barra pegada a un `}` no es una
+     * división en ningún código que compile.
+     */
+    expect(
+      culpable('if (activo) {} /[/*]/.test(x); const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y el `for await` de un bucle asíncrono: la palabra pegada al paréntesis es `await`, no
+     * `for`, así que la condición de control no se reconocía y la barra de después volvía a
+     * leerse como división.
+     *
+     * La segunda sonda es la que impide el arreglo perezoso: meter `await` en la lista de
+     * control taparía el caso y rompería `await (f()) / 2`, que es una división legítima y
+     * bien formada —y entonces la «regex» se comería hasta el salto de línea la consulta que
+     * viene detrás—. Lo que hay que hacer es ATRAVESAR el modificador, no darle rango propio.
+     */
+    expect(
+      culpable(
+        'async function f() { for await (const x of xs) /[/*]/.test(x); }\nconst q = sql`select now()::date`;',
+        'ts',
+      ),
+    ).toBe(true);
+    expect(
+      culpable('const n = await (f()) / 2; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y la división cuyo operando izquierdo es un OBJETO, que es la que refutó la afirmación
+     * con la que yo había justificado meter el `}` entre los abridores: escribí que dividir un
+     * objeto no significa nada en JavaScript, y con un `valueOf` significa exactamente lo que
+     * parece. Es la quinta de esta familia y la que la cerró: esto ya no lo decide una lista de
+     * caracteres, lo decide el parser.
+     */
+    expect(
+      culpable(
+        'const ratio = { valueOf() { return 1; } } / 2; const sep = /[/*]/;'
+          + ' const q = sql`select now()::date`;',
+        'ts',
+      ),
+    ).toBe(true);
+    expect(culpable('function f() {} /[/*]/.test(x); const q = sql`select now()::date`;', 'ts')).toBe(
+      true,
+    );
+    // Y las dos posiciones que faltaban tras una PALABRA: lo que sigue a `throw` y a un
+    // `export default` es una expresión, y puede ser una regex.
+    expect(
+      culpable('if (error) throw /[/*]/; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    expect(
+      culpable('export default /[/*]/; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y el lado seguro del mismo carácter: un valor entre paréntesis dividido, que NO puede
+    // tomarse por regex o se comería la consulta de después.
+    expect(
+      culpable('const a = (b + c) / d; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Un backtick dentro de un comentario de bloque que está en una INTERPOLACIÓN: ahí es
+     * texto inerte y no cierra la plantilla. Cortando el comentario en él, ese backtick abría
+     * una plantilla nueva y el `--` de después se comía hasta el cierre de verdad.
+     */
+    expect(
+      culpable('const q = sql`select ${/* ` -- nota */ valor}, now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y el backtick ESCAPADO dentro de un comentario de línea de la plantilla: no cierra el
+     * marco. Saliendo de la plantilla ahí, la comilla que todavía era comentario abría un
+     * literal que se llevaba por delante la operación de la línea siguiente.
+     */
+    expect(culpable("const q = sql`select 1 -- \\` '\nnow()::date`;", 'ts')).toBe(true);
+    /*
+     * Y la otra cara de ese mismo escape: en un cuerpo del CATÁLOGO la barra no escapa nada
+     * —SQL no la trata como escape—, así que `\*` no protege al `/` que le sigue y el
+     * comentario SÍ cierra ahí. Saltando el par, el recorrido se comía el cierre y seguía
+     * tragando SQL de verdad. Es el hueco que abrió el arreglo de arriba antes de acotarlo.
+     */
+    expect(culpable('/* nota \\*/ select now()::date', 'sql')).toBe(true);
+    /*
+     * Y dentro de una plantilla sí escapa, también en un comentario de BLOQUE: parando en ese
+     * backtick, el recorrido salía de la plantilla a mitad y lo que aún era comentario pasaba
+     * a leerse como TypeScript, donde el cierre del comentario ya no significa nada y lo de
+     * detrás desaparece.
+     */
+    expect(culpable("const q = sql`select 1 /* \\` */ , now()::date`;", 'ts')).toBe(true);
+    // Un `--` DENTRO de un literal no abre comentario.
+    expect(culpable("select '--', now()::date", 'sql')).toBe(true);
+    // Ni un `//` dentro de una cadena de TypeScript.
+    expect(
+      culpable("const u = 'https://host'; const q = sql`select now()::date`;", 'ts'),
+    ).toBe(true);
+    /*
+     * Y el literal que SÍ es código sobrevive al vaciado en los dos dialectos, sin que la
+     * cadena que solo lo NOMBRA se contagie. Las dos mitades hacen falta: conservar el
+     * contenido de un literal es exactamente lo que el vaciado existe para no hacer, y sin la
+     * segunda mitad esto sería la puerta de vuelta al falso positivo que lo motivó.
+     */
+    expect(culpable("const q = sql`select 'today'::date from t`;", 'ts')).toBe(true);
+    expect(culpable("const modo = 'now'; const q = sql`select 1`;", 'ts')).toBe(false);
+    expect(culpable("select clase from t where clase = 'now'", 'sql')).toBe(false);
+    // SQL ANIDA: el cierre interior no termina el comentario, así que el `--` de después sigue
+    // comentado y no puede comerse el código que viene tras el cierre exterior.
+    expect(
+      culpable('/* fuera /* dentro */ -- sigue fuera */ select now()::date', 'sql'),
+    ).toBe(true);
+    // TypeScript NO anida: el primer cierre termina el comentario y lo de después es código.
+    expect(
+      culpable('/* explica /* de SQL */ const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y la otra mitad: un comentario de verdad no se convierte en hallazgo.
+    expect(culpable('-- antes usaba current_date; ahora fecha_de_la_base()', 'sql')).toBe(
+      false,
+    );
+    expect(culpable('// antes usaba current_date; ahora fecha_de_la_base()', 'ts')).toBe(
+      false,
+    );
+    /*
+     * Y DENTRO DE UNA INTERPOLACIÓN se vuelve a TypeScript. Una plantilla SQL es SQL, pero lo
+     * que va entre las llaves es código, y ahí no anidan los comentarios ni las comillas
+     * dobles son un carácter cualquiera. Sin esa transición, un comentario escrito dentro de
+     * la interpolación dejaba la cuenta abierta y el recorrido se comía la consulta que venía
+     * detrás: el censo de la aplicación en verde sin haber mirado.
+     */
+    expect(
+      culpable('const q = sql`select ${/* uno /* dos */ v}, now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * La misma transición por el otro carácter, y el daño es el CONTRARIO: una comilla simple
+     * dentro de una cadena de comillas dobles es un apóstrofo, y leída como SQL abría un
+     * literal que se tragaba el resto del fichero. Tragárselo NO deja ciego al censo —los
+     * literales se copian tal cual, a propósito—, pero sí deja sin borrar los comentarios de
+     * después: un `current_date` mencionado en uno pasa a ser hallazgo. Falso positivo, no
+     * hueco.
+     *
+     * (Lo escribí primero al revés, esperando que cegara, y la sonda pasaba en verde con el
+     * arreglo retirado. Una sonda que pasa por otro motivo no prueba nada.)
+     */
+    expect(
+      culpable('const q = sql`select ${x ? "it\'s" : \'\'} from t`; // usaba current_date', 'ts',
+      ),
+    ).toBe(false);
+    // Y la otra mitad: un comentario de verdad dentro de la interpolación sigue borrándose.
+    expect(culpable('const q = sql`select ${/* current_date */ v} from t`;', 'ts')).toBe(
+      false,
+    );
+    /*
+     * Y las cuatro formas de desalinear la cuenta de llaves que abre este mismo arreglo: una
+     * plantilla ANIDADA dentro de la interpolación, una llave dentro de una cadena, una
+     * dentro de un comentario y un literal de objeto. En las cuatro tiene que seguir viéndose
+     * el reloj que va DESPUÉS.
+     *
+     * DICHO CLARO, PORQUE VERDE NO ES PRUEBA: estas cuatro NO se mueven al retirar el
+     * arreglo, ni al romper el conteo de llaves. Medido, no supuesto. Y la razón es
+     * estructural: salirse de la interpolación ANTES de tiempo devuelve el recorrido a `sql`,
+     * que es el modo que INSPECCIONA, así que un desajuste en esa dirección no puede cegar
+     * nada; y al revés no hay forma de llegar, porque las cadenas y los comentarios se
+     * consumen antes de que sus llaves se cuenten. El conteo es higiene, no guardián.
+     *
+     * Se quedan como PINS de regresión —si alguien hace que `${` se trague hasta el final de
+     * la plantilla, estas cuatro lo cazan—, no como prueba de nada de hoy. Que es lo que ya
+     * me obligó a retirar una sonda del doble paréntesis y a reescribir la del apóstrofo:
+     * una sonda que pasa por otro motivo no prueba nada, y disfrazada de cobertura es peor
+     * que no estar.
+     */
+    expect(
+      culpable('const q = sql`a ${c ? sql`b ${x} c` : d}, now()::date`;', 'ts'),
+    ).toBe(true);
+    expect(culpable('const q = sql`a ${o["}"]}, now()::date`;', 'ts')).toBe(true);
+    expect(culpable('const q = sql`a ${/* } */ v}, now()::date`;', 'ts')).toBe(true);
+    // Y un literal de objeto, que abre y cierra llaves de verdad dentro de la interpolación.
+    expect(culpable('const q = sql`a ${{ k: 1 }.k}, now()::date`;', 'ts')).toBe(true);
+    /*
+     * Un literal POR DÓLAR dentro de un cuerpo plpgsql. El delimitador del cuerpo hay que
+     * atravesarlo —si no, el censo deja de mirar el cuerpo de cada función—, pero el literal
+     * de dentro es un dato: leerlo como código hacía que su `--` se comiera la consulta de
+     * después. `pg_get_functiondef` los conserva verbatim, comprobado sobre una función real.
+     */
+    expect(
+      culpable(
+        'create function f() returns void language plpgsql as $function$ begin perform $q$--$q$; perform now()::date; end $function$',
+        'sql',
+      ),
+    ).toBe(true);
+    // Y el cuerpo entero sigue mirándose: el delimitador se atraviesa, no se salta.
+    expect(
+      culpable(
+        'create function f() returns void language plpgsql as $function$ begin perform now()::date; end $function$',
+        'sql',
+      ),
+    ).toBe(true);
+    // Una plantilla AJENA no puede tapar la consulta que viene después: su comentario acaba
+    // donde acaba la plantilla.
+    expect(
+      culpable('const ayuda = `--opcion`; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    // Y con un bloque sin cerrar, que es la misma puerta por el otro comentario.
+    expect(
+      culpable('const ayuda = `/*x`; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y la otra dirección: una palabra del reloj DENTRO de un literal es un dato, no una
+     * lectura del calendario. Vale para el literal de SQL y para un mensaje de TypeScript.
+     */
+    expect(
+      culpable(
+        "create function f() returns text language sql as $$ select 'current_date' $$",
+        'sql',
+      ),
+    ).toBe(false);
+    expect(culpable("const aviso = 'current_date ya no se usa';", 'ts')).toBe(false);
+    // Pero vaciar el literal NO puede romper a los dos patrones que lo LEEN.
+    expect(culpable("date_trunc('milliseconds', now())")).toBe(false);
+    expect(culpable("date_trunc('day', now())")).toBe(true);
+    // Un identificador entrecomillado con guiones no abre comentario: el catálogo devuelve la
+    // función en una línea y el barrido se comía la operación de después.
+    expect(
+      culpable(
+        'create function f() returns date language plpgsql as $function$ declare "--" int; begin return now()::date; end $function$',
+        'sql',
+      ),
+    ).toBe(true);
+    // Y un backtick ESCAPADO no cierra la plantilla: si la cierra, el `//` que es contenido
+    // pasa a ser comentario y se lleva la consulta de después.
+    expect(
+      culpable('const ayuda = `texto \\` // ejemplo`; const q = sql`select now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y la cadena con prefijo E dentro de un cuerpo plpgsql: la comilla escapada con BARRA no
+     * termina el literal, así que el `--` de dentro sigue siendo dato y no se come la
+     * operación de después.
+     */
+    expect(
+      culpable(
+        "create function f() returns void language plpgsql as $function$ begin perform E'a\\'--b'; perform now()::date; end $function$",
+        'sql',
+      ),
+    ).toBe(true);
+    /*
+     * El dólar dentro de una PLANTILLA no es un entrecomillado por dólar. `` `< $${n}` `` es
+     * TypeScript real —está en `ai.degradacion.ts`—, y tomarlo por apertura de cuerpo dejaba
+     * la etiqueta puesta: una etiqueta sin cerrar más adelante se leía como literal, el
+     * vaciado se llevaba el resto y el censo daba verde. Lo introduje yo con el arreglo del
+     * dólar y lo cacé buscando el idioma en `src/`.
+     */
+    expect(
+      culpable('const p = `< $${n}`; const q = sql`select $x$ now()::date`;', 'ts'),
+    ).toBe(true);
+    /*
+     * Y el literal por DÓLAR dentro de una plantilla no es el cuerpo de nada: en
+     * `` sql`select $q$--$q$, now()::date` `` el `$q$…$q$` es un literal cuyo contenido es
+     * `--` —medido: la consulta devuelve el texto `--` y la fecha—, así que tomarlo por la
+     * apertura de un cuerpo dejaba ese `--` de código y se comía la operación de después.
+     *
+     * Esto lo rompí yo al quitar el reconocedor a mano: la guarda que lo distinguía vivía en
+     * la pila que se fue con él, y ninguna sonda cubría el caso. La distinción va ahora en un
+     * parámetro, que es donde se ve.
+     */
+    expect(culpable('const q = sql`select $q$--$q$, now()::date`;', 'ts')).toBe(true);
+    /*
+     * Y la plantilla se lee por lo que VALE, no por cómo está escrita. `\x6e` es una `n`
+     * —comprobado con node: `` `select \x6eow()::date` `` es exactamente la cadena
+     * `select now()::date` —, así que la etiqueta `sql` recibe el reloj aunque en el fichero
+     * no aparezca escrito. Leer la ortografía es dejar de mirar por la forma de teclear algo,
+     * que es la misma familia que el `$q$` de aquí arriba.
+     *
+     * Va con su mitad segura: un escape que NO compone ningún reloj se sigue leyendo como lo
+     * que es, y no enrojece por llevar barras.
+     */
+    expect(culpable('const q = sql`select \\x6eow()::date`;', 'ts')).toBe(true);
+    /*
+     * Y la cadena que se le pasa a `unsafe` es SQL, no un dato: lo dice el nombre de la
+     * función. Este repositorio ya la usa —hoy con comillas invertidas, que sí se leen—, así
+     * que pasar una de esas consultas a comillas normales bastaba para sacarla del censo.
+     *
+     * Con su mitad segura, que es la que impide leer como SQL cualquier cadena suelta: la
+     * misma consulta escrita en una variable que nadie ejecuta se sigue vaciando.
+     */
+    expect(culpable("await tx.unsafe('select now()::date');", 'ts')).toBe(true);
+    // Y cocinada, que es el cruce de las dos cosas anteriores: la cadena de `unsafe` deja de
+    // vaciarse Y se lee por su valor. Sin lo segundo, conservarla entera no servía de nada.
+    expect(culpable("await tx.unsafe('select \\x6eow()::date');", 'ts')).toBe(true);
+    expect(culpable("const t = 'select now()::date';", 'ts')).toBe(false);
+    expect(culpable('const q = sql`select \\x64ato from t`;', 'ts')).toBe(false);
+    // Y la interpolación se sigue reconociendo detrás de un dólar literal: si no, el
+    // comentario de dentro volvería a anidar como SQL.
+    expect(
+      culpable('const p = sql`a $${n} ${/* uno /* dos */ v}, now()::date`;', 'ts'),
+    ).toBe(true);
+  }, PACIENCIA);
+
+  it('ninguna función lee el reloj de pared de quien la llama', async () => {
+    /*
+     * Las sondas se crean ANTES de capturar el censo y se exige que salgan entre SUS
+     * culpables, usando la misma consulta y el mismo filtro. Antes hacían una consulta aparte,
+     * y eso no protegía nada: volver la consulta principal a `prosrc` las habría dejado en
+     * verde. Lo comprobé mal —cambié las dos a la vez— y por eso el rojo me pareció una prueba
+     * cuando no lo era. Una sonda que no atraviesa el camino que dice proteger es peor que
+     * ninguna: da la impresión de cubrirlo.
+     *
+     * Van como `LANGUAGE SQL … RETURN …`, así que de paso ejercitan la otra mitad: ese cuerpo
+     * vive en `prosqlbody` y deja `prosrc` VACÍO (comprobado abajo), que es lo que hacía
+     * invisible a una función entera cuando el censo leía `prosrc`.
+     */
+    const admin = sqlAdmin();
+    for (const [nombre, { expr, tipo }] of Object.entries(SONDAS)) {
+      await admin.unsafe(
+        `create function ${nombre}() returns ${tipo} language sql stable return ${expr}`,
+      );
+    }
+    /* Y un PROCEDIMIENTO, que no se puede crear con la forma de arriba y que `prokind = 'f'`
+     * dejaba invisible: un procedimiento puede validar o escribir con el calendario de la
+     * sesión igual que una función. Va aparte porque su sintaxis lo es. */
+    await admin`create procedure censo_probe_procedimiento()
+      language plpgsql as $$ begin perform current_date; end $$`;
+    /*
+     * Y el comentario de bloque ANIDADO, que tiene que ir en plpgsql y no en un cuerpo SQL.
+     * Mi primera sonda tenía cuerpo SQL con un comentario dentro, y no probaba NADA: un
+     * cuerpo SQL se guarda como ÁRBOL ANALIZADO, así que `pg_get_functiondef` lo devuelve sin
+     * comentarios —comprobado: sale `RETURN (SELECT (now())::date AS now)`— y el recorrido
+     * nunca veía uno. Un cuerpo plpgsql sí se guarda VERBATIM, comentarios incluidos.
+     *
+     * TODO EN UNA LÍNEA, y esto costó una segunda pasada: con el cierre exterior en su propio
+     * renglón, el recorrido roto salía en el interior, se comía una línea con el `--` y el
+     * `perform` de la siguiente SEGUÍA visible — la sonda no perdía nada y por tanto no probaba
+     * nada. En una línea, el `--` que sigue al cierre interior se lleva por delante el resto,
+     * cierre exterior y `perform` incluidos, que es justo la pérdida que hay que enseñar.
+     */
+    await admin.unsafe(
+      'create function censo_probe_bloque_anidado() returns void language plpgsql as $c$ ' +
+        'begin /* fuera /* dentro */ -- sigue fuera */ perform (now())::date; end $c$',
+    );
+    /*
+     * Y el RELOJ ESCRITO ENTRE COMILLAS, que también tiene que ir en plpgsql, y por una razón
+     * que conviene medir antes que suponer: Postgres PLIEGA `'today'::date` en cuanto puede.
+     * Medido sobre cuatro sitios distintos —
+     *
+     *   cuerpo SQL nuevo (`return 'now'::date`)   se guarda ya como `'2026-09-04'::date`
+     *   vista (`select 'today'::date`)            se guarda ya como `'2026-09-04'::date`
+     *   cuerpo SQL antiguo (`as $$ select … $$`)  se guarda VERBATIM y depende: 09-05 / 09-04
+     *   cuerpo plpgsql                            se guarda VERBATIM y depende: 09-05 / 09-04
+     *
+     * — o sea que donde el literal queda congelado ya no hay nada que censar (el problema ahí
+     * es otro: una fecha fija que nadie escribió), y donde SÍ lee el reloj de quien llama el
+     * texto sigue en el catálogo. La sonda va en el lado que el censo tiene que ver.
+     *
+     * Sin ella, todo lo que sostiene a esta familia serían sondas de TEXTO: el patrón podría
+     * estar bien y el recorrido del catálogo no llegar nunca a enseñárselo.
+     */
+    await admin.unsafe(
+      "create function censo_probe_literal_reloj() returns void language plpgsql as $c$ " +
+        "begin perform 'today'::date; end $c$",
+    );
+    /*
+     * Y las sondas del DESTINO TIPADO, que son las únicas de este fichero donde el cuerpo, por
+     * sí solo, es CORRECTO: `begin return now(); end` no tiene nada que marcar hasta que se
+     * sabe qué tipo declara la firma. Por eso van en pares —la misma expresión con `date` y
+     * con `timestamptz`— y por eso ninguna sonda de texto podía sostenerlas: lo que decide no
+     * está en el texto que se le pasa al reconocedor.
+     *
+     * Las cinco culpables son las cinco formas medidas de entregar un reloj a un tipo sin
+     * huso, todas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12: el
+     * `return` de plpgsql, la asignación a una variable declarada, el `select … into`, el
+     * cuerpo SQL antiguo y el nuevo —que el catálogo guarda como `RETURN now()`, sin cast—.
+     * Las dos seguras son las mismas expresiones devolviendo el instante, que es lo que hacen
+     * bien las funciones de este esquema y no puede enrojecer.
+     */
+    for (const [nombre, sql] of [
+      ['censo_probe_devuelve_date', 'returns date language plpgsql as $c$ begin return now(); end $c$'],
+      [
+        'censo_probe_variable_date',
+        'returns date language plpgsql as $c$ declare d date; begin d := now(); return d; end $c$',
+      ],
+      [
+        'censo_probe_into_date',
+        'returns date language plpgsql as $c$ declare d date; begin select now() into d; return d; end $c$',
+      ],
+      ['censo_probe_cuerpo_viejo_date', 'returns date language sql stable as $c$ select now() $c$'],
+      [
+        'censo_probe_cuerpo_from_date',
+        'returns date language sql stable as $c$ select now() from generate_series(1, 1) $c$',
+      ],
+      ['censo_probe_cuerpo_nuevo_date', 'returns date language sql stable return now()'],
+      [
+        'censo_probe_devuelve_instante',
+        'returns timestamptz language plpgsql as $c$ begin return now(); end $c$',
+      ],
+      [
+        'censo_probe_variable_instante',
+        'returns timestamptz language plpgsql as $c$ declare d timestamptz; begin d := now(); return d; end $c$',
+      ],
+      /*
+       * Y la misma variable con el nombre ENTRECOMILLADO, que es un identificador SQL con
+       * todas las letras y que el catálogo guarda con las comillas puestas (comprobado).
+       * Medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12, igual que
+       * su hermana desnuda. Se escapaba por los DOS lados a la vez —ni la declaración ni la
+       * asignación casaban con `\w+`— y por el del tipo de vuelta solo se veía un
+       * `return "d"`, que no es ningún reloj.
+       *
+       * Con su pareja segura, que acota la forma: el mismo nombre entrecomillado sobre un
+       * tipo CON huso conserva el instante. Dicho lo que vale, que es poco: no carga peso
+       * propio —lo que la mantiene limpia es que `timestamptz` no case como tipo sin huso,
+       * exactamente lo mismo que mantiene limpia a `censo_probe_variable_instante`—. Está
+       * para que la forma nueva no entre sin su mitad, no como cobertura.
+       */
+      [
+        'censo_probe_var_comillas_date',
+        'returns date language plpgsql as $c$ declare "d" date;' +
+          ' begin "d" := now(); return "d"; end $c$',
+      ],
+      [
+        'censo_probe_var_comillas_instante',
+        'returns timestamptz language plpgsql as $c$ declare "d" timestamptz;' +
+          ' begin "d" := now(); return "d"; end $c$',
+      ],
+      /*
+       * La gramática ENTERA de una declaración plpgsql, que es donde estaba la familia. Las
+       * cinco culpables, todas medidas 2026-09-05 contra 2026-09-04 y todas verbatim en el
+       * catálogo. La primera es la que más dice: el valor puesto en la PROPIA declaración no
+       * es ninguna sentencia, así que la búsqueda de asignaciones no tenía qué buscar — y es
+       * la forma más corta de escribirlo.
+       *
+       * Y sus dos seguras, que acotan las dos mitades por separado: el `constant` sobre un
+       * tipo CON huso conserva el instante (mismo epoch en husos opuestos, medido) y el
+       * `default` con el huso ya fijado da 2026-09-04 en los dos, o sea que capturar el
+       * inicializador no se convierte en «hay un reloj dentro».
+       */
+      [
+        'censo_probe_decl_inicializada',
+        'returns date language plpgsql as $c$ declare d date := now(); begin return d; end $c$',
+      ],
+      [
+        'censo_probe_decl_constant',
+        'returns date language plpgsql as $c$ declare d constant date := now();' +
+          ' begin return d; end $c$',
+      ],
+      [
+        'censo_probe_decl_notnull',
+        'returns date language plpgsql as $c$ declare d date not null := now();' +
+          ' begin return d; end $c$',
+      ],
+      [
+        'censo_probe_decl_default',
+        'returns date language plpgsql as $c$ declare d date default now();' +
+          ' begin return d; end $c$',
+      ],
+      [
+        'censo_probe_decl_igual',
+        'returns date language plpgsql as $c$ declare d date = now(); begin return d; end $c$',
+      ],
+      [
+        'censo_probe_ok_decl_constant_instante',
+        'returns timestamptz language plpgsql as $c$ declare d constant timestamptz := now();' +
+          ' begin return d; end $c$',
+      ],
+      [
+        'censo_probe_ok_decl_default_huso_fijo',
+        "returns date language plpgsql as $c$ declare d date default timezone('UTC', now())::date;" +
+          ' begin return d; end $c$',
+      ],
+      /*
+       * Y el nombre citado que NECESITA las comillas, que es donde la normalización de antes
+       * mentía: mutilaba `"fecha final"` hasta `fechafinal`, que no está en el texto por
+       * ningún lado. Medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12. Ahora el nombre se escapa en vez de recortarse, y la forma desnuda solo
+       * se genera cuando Postgres la aceptaría.
+       */
+      [
+        'censo_probe_var_espacio_date',
+        'returns date language plpgsql as $c$ declare "fecha final" date;' +
+          ' begin "fecha final" := now(); return "fecha final"; end $c$',
+      ],
+      /*
+       * Y el constructor de array por SUBCONSULTA, con su segura al lado. La culpable
+       * proyecta el reloj —`{2026-09-05}` contra `{2026-09-04}`, medido— y la segura proyecta
+       * una columna y usa el reloj solo en el `where`, que es la mitad que impide que abrir la
+       * lista se convierta en «hay un reloj dentro» (medido: la misma fecha en los dos husos).
+       */
+      [
+        'censo_probe_arreglo_subconsulta_date',
+        'returns date[] language plpgsql as $c$ begin return array(select now()); end $c$',
+      ],
+      /*
+       * El destino tipado de una ESCRITURA, con y sin lista de columnas, y en `update`. Las
+       * tres medidas: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12, con
+       * la función devolviendo `void` y sin una sola variable declarada.
+       *
+       * La sonda SIN lista de columnas es la que carga el reparto por posición, que es la
+       * mitad que no se ve: ahí la columna la elige el orden del catálogo y no el texto.
+       *
+       * Y sus dos seguras: la misma escritura sobre la columna CON huso conserva el instante
+       * (mismo epoch en los dos husos, medido) y la de siempre con el huso ya fijado da
+       * 2026-09-04 en los dos.
+       */
+      [
+        'censo_probe_insert_date',
+        'returns void language plpgsql as $c$' +
+          ' begin insert into censo_probe_escritura(k, d) values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_insert_posicional_date',
+        'returns void language plpgsql as $c$' +
+          ' begin insert into censo_probe_escritura values (1, now(), now()); end $c$',
+      ],
+      [
+        'censo_probe_update_date',
+        'returns void language plpgsql as $c$' +
+          ' begin update censo_probe_escritura set d = now(); end $c$',
+      ],
+      [
+        'censo_probe_ok_insert_instante',
+        'returns void language plpgsql as $c$' +
+          ' begin insert into censo_probe_escritura(k, ts) values (1, now()); end $c$',
+      ],
+      /*
+       * Y el `ON CONFLICT … DO UPDATE SET`, que es un `update` cuya tabla está escrita arriba,
+       * en el `insert`. Medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12. Con su segura sobre la columna con huso.
+       *
+       * Salió de preguntarme dónde MÁS se entrega una expresión a un tipo que no está escrito,
+       * y de esa pregunta salieron tres candidatos. Los otros dos NO son huecos, y queda
+       * medido para que nadie los persiga: pasar un `timestamptz` a una función de parámetro
+       * `date` es un error —«function … (timestamp with time zone) does not exist»— y un
+       * `return query select now()` contra un `returns table(d date)` también —«structure of
+       * query does not match function result type»—. Postgres coerciona en ASIGNACIÓN, no en
+       * llamada ni en proyección, y por eso el destino tipado tiene las puertas que tiene y
+       * no más.
+       */
+      [
+        'censo_probe_conflicto_date',
+        'returns void language plpgsql as $c$ begin' +
+          " insert into censo_probe_escritura(k, d) values (1, date '2020-01-01')" +
+          ' on conflict (k) do update set d = now(); end $c$',
+      ],
+      /*
+       * Y la que comprueba que la culpa va a la tabla que TOCA. Las dos sentencias son
+       * seguras por separado: la primera resuelve su conflicto sin escribir nada y la segunda
+       * escribe el reloj en una columna que SÍ lleva huso. Pero el salto desde `on conflict`
+       * hasta un `do update set` no puede cruzar el `;`: si lo cruza, el `set d = …` de la
+       * segunda se lee como si fuera de la tabla de la primera, donde `d` es un `date`, y sale
+       * un culpable que no existe. Es un falso positivo, que en un guardián cuesta lo mismo
+       * que un hueco: se acaba desactivando.
+       *
+       * Por eso la segunda tabla tiene una columna que se llama IGUAL y significa otra cosa.
+       * Sin eso el caso no se puede escribir: la atribución equivocada daría el mismo
+       * veredicto que la correcta y la sonda pasaría por los dos motivos.
+       */
+      /*
+       * Cuatro formas más de escribir lo mismo, las cuatro medidas 2026-09-05 en
+       * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   values (…), (…)          la SEGUNDA tupla, que es donde no se mira
+       *   d = now()                plpgsql también asigna con `=` a secas
+       *   update t as x set …      el destino puede llevar alias
+       *   return next now()        con `returns setof date`
+       *
+       * La del `values` es la que más dice de cómo falla un reconocedor a mano: leía la
+       * primera tupla, y la primera suele ser la inocente.
+       *
+       * Y la del `=` va con su segura al lado, que es la que separa las dos cosas que ese
+       * signo significa. La comparación tiene que terminar EN el `;` para que el caso valga:
+       * en `if d = now() then …` la captura se lleva el `then …` detrás y ya no parece un
+       * reloj a secas, así que ese escrito no distingue nada. En `perform 1 where d = now();`
+       * sí —la captura es exactamente `now()`—, y ahí se ve que lo único que separa una
+       * asignación de una comparación es la POSICIÓN. Medido: 2026-09-04 en los dos husos, o
+       * sea que no elige calendario y marcarla sería un falso positivo.
+       */
+      [
+        'censo_probe_values_dos_tuplas_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          " values (1, date '2026-01-01'), (2, now()); end $c$",
+      ],
+      [
+        'censo_probe_asigna_igual_date',
+        'returns date language plpgsql as $c$ declare d date; begin d = now(); return d; end $c$',
+      ],
+      [
+        'censo_probe_update_alias_date',
+        'returns void language plpgsql as $c$' +
+          ' begin update censo_probe_escritura as x set d = now(); end $c$',
+      ],
+      [
+        'censo_probe_return_next_date',
+        'returns setof date language plpgsql as $c$ begin return next now(); end $c$',
+      ],
+      /*
+       * El `where` de una SUBCONSULTA no cierra la cláusula `set`. Medido: la función guarda
+       * 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12, y la asignación que lo
+       * hace es la SEGUNDA — la primera es segura (`ts` lleva huso) y estaba puesta ahí para
+       * que cortar por la primera palabra suelta pareciera correcto.
+       */
+      [
+        'censo_probe_set_subconsulta_date',
+        'returns void language plpgsql as $c$ begin update censo_probe_escritura' +
+          ' set ts = (select now() where true), d = now(); end $c$',
+      ],
+      // Y el alias en el destino de un `insert`, que va entre la tabla y la lista de columnas.
+      [
+        'censo_probe_insert_alias_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into censo_probe_escritura as x(k, d) values (1, now()); end $c$',
+      ],
+      /*
+       * Y las tres formas que hasta ahora eran límite declarado o directamente no existían en
+       * el reconocedor. Las tres medidas: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04
+       * en Etc/GMT+12.
+       *
+       * `MERGE` merece la mención: es un `update` y un `insert` con otra sintaxis y sin
+       * repetir la tabla en cada rama, así que ninguno de los dos reconocedores podía verlo.
+       * Está en Postgres desde la 15, que es la de este CI.
+       *
+       * Y sus dos seguras, que fijan lo mismo que fija el resto: en el `insert … select` el
+       * `where` filtra y no guarda, y la forma de fila sobre columnas CON huso conserva el
+       * instante.
+       */
+      [
+        'censo_probe_merge_date',
+        'returns void language plpgsql as $c$ begin merge into censo_probe_escritura t' +
+          ' using (select 1 as k) s on t.k = s.k' +
+          ' when matched then update set d = now(); end $c$',
+      ],
+      [
+        'censo_probe_set_fila_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' update censo_probe_escritura set (d, ts) = (now(), now()); end $c$',
+      ],
+      [
+        'censo_probe_insert_select_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' select 2, now() from generate_series(1, 1); end $c$',
+      ],
+      /*
+       * Cuatro formas más, las cuatro medidas 2026-09-05 en Pacific/Kiritimati contra
+       * 2026-09-04 en Etc/GMT+12 y las cuatro guardadas verbatim en el catálogo.
+       *
+       * Tres son la MISMA lección en tres dialectos: preguntar cómo está escrito algo en vez
+       * de qué vale. `E'\\x6eow'` es la cadena `now`; `U&"\\0064"` es la columna `d`; y el
+       * `$1` de un `EXECUTE` lleva su tipo escrito en la consulta mientras el reloj viaja
+       * aparte, en el `using`.
+       *
+       * La cuarta es el `select … into` con varias columnas, que asigna por posición: antes se
+       * entregaba la lista entera como una sola hoja, y con una variable sola eso acertaba por
+       * casualidad.
+       */
+      [
+        'censo_probe_escape_e_date',
+        "returns date language plpgsql as $c$ begin return E'\\x6eow'::date; end $c$",
+      ],
+      [
+        'censo_probe_identificador_unicode_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into censo_probe_escritura(k, U&"\\0064") values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_using_date',
+        "returns date language plpgsql as $c$ declare d date;" +
+          " begin execute 'select $1::date' into d using now(); return d; end $c$",
+      ],
+      [
+        'censo_probe_into_dos_columnas_date',
+        'returns date language plpgsql as $c$ declare n int; d date;' +
+          ' begin select 1, now() into n, d; return d; end $c$',
+      ],
+      /*
+       * Y sus seguras: el mismo `using` entregado a un marcador CON huso conserva el instante,
+       * y el mismo `into` de dos columnas con el reloj cayendo en la que lleva huso tampoco
+       * elige calendario. Las dos fijan que lo que se empareja es la POSICIÓN y no la lista.
+       */
+      /*
+       * Y las variables que toman su tipo del catálogo: no hay ningún tipo escrito en el
+       * texto, solo un nombre de tabla y un `%`. Las dos medidas 2026-09-05 contra 2026-09-04.
+       *
+       * La segunda —`%type`— no la señaló nadie: salió de preguntarme cuál era la hermana de
+       * la primera, y son la misma idea con distinto alcance (una fila entera contra una
+       * columna). Van juntas por eso.
+       *
+       * Y su segura, que fija que lo que decide es el CAMPO y no la fila: el mismo `%rowtype`
+       * escribiendo en el campo CON huso conserva el instante (mismo epoch en los dos husos).
+       */
+      [
+        'censo_probe_rowtype_date',
+        'returns date language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
+          ' begin r.d := now(); return r.d; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
+          ' begin v := now(); return v; end $c$',
+      ],
+      /*
+       * Y la sonda que sostiene la OMISIÓN de los nombres ambiguos. `censo_probe_otra.d` lleva
+       * huso, así que comparar esa columna con el reloj es comparar dos instantes y no elige
+       * calendario. Pero el nombre `d` también existe, sin huso, en la otra tabla sonda: si el
+       * censo resolviera por nombre sin omitir los ambiguos, marcaría esta función inocente.
+       * Es el falso positivo que la omisión evita, y sin dos tablas donde `d` signifique cosas
+       * distintas no se puede escribir.
+       */
+      /*
+       * Y los CRUCES de lo anterior consigo mismo, que es donde la revisión encontró lo que yo
+       * no: cada pieza nueva vuelve a abrir las puertas que las viejas ya tenían cerradas.
+       * Las cuatro medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
+       *
+       * La del `into … from` es una REGRESIÓN mía y va la primera por eso: esa forma la cogía
+       * el reconocedor anterior y se perdió al reescribirlo. Las dos sondas que había del
+       * `into` no llevan `from`, así que no lo notaron.
+       */
+      [
+        'censo_probe_into_con_from_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin select now() into d from generate_series(1, 1); return d; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_inicializada_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type := now();' +
+          ' begin return v; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_igual_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
+          ' begin v = now(); return v; end $c$',
+      ],
+      // Y el mismo `=` sobre un campo de `%rowtype`, que tenía el hueco por el mismo motivo
+      // aunque no lo señalara nadie. Medido: 2026-09-05 contra 2026-09-04.
+      [
+        'censo_probe_rowtype_igual_date',
+        'returns date language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
+          ' begin r.d = now(); return r.d; end $c$',
+      ],
+      [
+        'censo_probe_tabla_unicode_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into U&"\\0063enso_probe_escritura"(k, d) values (1, now()); end $c$',
+      ],
+      /*
+       * Y más cruces, buscados a propósito siguiendo la veta que abrió la revisión. Los cuatro
+       * medidos 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12, y los cuatro
+       * SALEN YA MARCADOS: esta vez las piezas compusieron solas y no hubo nada que arreglar.
+       *
+       * Lo que cada sonda vale, medido y no supuesto, porque dos de las cuatro valen menos de
+       * lo que parece:
+       *
+       *  · `merge_insert` y `using_dolar` cargan peso PROPIO. Cubren la rama `then insert` del
+       *    `MERGE` y la consulta entrecomillada por dólar de un `EXECUTE … USING`, y ninguna
+       *    de las dos tenía sonda: el `MERGE` solo se probaba por su rama `update`, y el
+       *    `USING` solo con la consulta en literal simple.
+       *  · `conflicto_fila` y `rowtype_campo_unicode` NO añaden cobertura: se mueven con la
+       *    misma neutralización que `set_fila` y que `tabla_unicode`, y con ninguna otra.
+       *    Documentan que la composición funciona, que no es poco, pero no son un guardián
+       *    más. Queda dicho en vez de contarlas dos veces.
+       *
+       * Y uno que NO es hueco, medido para que nadie lo persiga: un `%TYPE` cuyo nombre de
+       * tabla va en la forma `U&"…"` es un ERROR DE SINTAXIS en plpgsql —«syntax error at or
+       * near "%"»—, así que ahí no hay nada que cerrar. Igual que pasar un `timestamptz` a una
+       * función de parámetro `date`: la forma no existe.
+       */
+      [
+        'censo_probe_rowtype_campo_unicode_date',
+        'returns date language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
+          ' begin r.U&"\\0064" := now(); return r.d; end $c$',
+      ],
+      [
+        'censo_probe_using_dolar_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin execute $q$select $1::date$q$ into d using now(); return d; end $c$',
+      ],
+      [
+        'censo_probe_merge_insert_date',
+        'returns void language plpgsql as $c$ begin merge into censo_probe_escritura t' +
+          ' using (select 9 as k) s on t.k = s.k' +
+          ' when not matched then insert (k, d) values (9, now()); end $c$',
+      ],
+      [
+        'censo_probe_conflicto_fila_date',
+        'returns void language plpgsql as $c$ begin' +
+          " insert into censo_probe_escritura(k, d) values (1, date '2020-01-01')" +
+          ' on conflict (k) do update set (d, ts) = (now(), now()); end $c$',
+      ],
+      /*
+       * Otra tanda de cruces, los cinco de aquí medidos 2026-09-05 en Pacific/Kiritimati contra
+       * 2026-09-04 en Etc/GMT+12 —salvo el de la columna citada, que da `false` y `true`, o
+       * sea que la comparación se da la vuelta entera—:
+       *
+       *   execute E'select $1::date' … using now()        el prefijo E en el USING
+       *   returns table(d date, n int) … select now(), 1  la proyección a las columnas
+       *   return (select now())                           la subconsulta escalar
+       *   update t set d = (select now())                 la misma, del lado de la escritura
+       *   (la columna citada va de sonda de TEXTO, ver más arriba)
+       *   declare v t.d%type; select now() into v         el `into` para variable de catálogo
+       *
+       * Y otro que NO es hueco: `declare U&"\\0076" t.d%type` es un ERROR DE SINTAXIS —plpgsql
+       * no admite esa ortografía para el nombre de una variable—. Cuarto caso de la serie que
+       * resulta ser una no-forma, y va escrito para no volver a buscarlo.
+       */
+      [
+        'censo_probe_using_prefijo_e_date',
+        "returns date language plpgsql as $c$ declare d date;" +
+          " begin execute E'select $1::date' into d using now(); return d; end $c$",
+      ],
+      [
+        'censo_probe_tabla_proyectada_date',
+        'returns table(d date, n int) language sql stable as $c$ select now(), 1 $c$',
+      ],
+      [
+        'censo_probe_subconsulta_escalar_date',
+        'returns date language plpgsql as $c$ begin return (select now()); end $c$',
+      ],
+      [
+        'censo_probe_subconsulta_escritura_date',
+        'returns void language plpgsql as $c$' +
+          ' begin update censo_probe_escritura set d = (select now()); end $c$',
+      ],
+      [
+        'censo_probe_pct_type_into_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
+          ' begin select now() into v; return v; end $c$',
+      ],
+      /*
+       * El DEFAULT de un parámetro, que también es un destino tipado —se evalúa al invocar, con
+       * el huso de quien llama, cuando se omite el argumento—. Medido: `f(p date default
+       * now())` devuelve 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12, y el
+       * catálogo guarda el encabezado verbatim.
+       *
+       * Con su segura al lado, que fija que lo que decide es el TIPO del parámetro y no la
+       * palabra `default`: el mismo encabezado con huso conserva el instante.
+       */
+      [
+        'censo_probe_parametro_default_date',
+        '(p date default now()) returns date language sql immutable as $c$ select p $c$',
+      ],
+      [
+        'censo_probe_ok_parametro_default_instante',
+        '(p timestamptz default now()) returns timestamptz language sql immutable' +
+          ' as $c$ select p $c$',
+      ],
+      /*
+       * Tres formas más, medidas las tres 2026-09-05 en Pacific/Kiritimati contra 2026-09-04
+       * en Etc/GMT+12, y las tres eran hueco:
+       *
+       *   returning … into    la otra cláusula que entrega por posición, además del `select`
+       *   between             el ternario, que no cubre ningún comparador binario
+       *   with … select       una lista de CTEs entre la lista de columnas y el `select`
+       *
+       * El `between` se mide distinto que los demás porque no guarda nada: lo que cambia con
+       * el huso es la promoción de la columna. Sobre `2026-09-04`, `2026-09-05` y `2026-09-06`
+       * a la vez, la promovida sale `+14` en Pacific/Kiritimati y `-12` en Etc/GMT+12, y la
+       * respuesta se mueve de fila: cae dentro `2026-09-06` en el primer huso y `2026-09-05`
+       * en el segundo.
+       */
+      /*
+       * Tres formas de ENTREGAR el valor que la captura de la lista de selección no veía. Las
+       * tres medidas: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
+       *
+       *   select now() as d                         el alias tapaba el reloj
+       *   select now() union all select …           la consulta compuesta entera, una hoja
+       *   select d from (select now() d) s          la columna llega derivada de la subconsulta
+       */
+      [
+        'censo_probe_alias_date',
+        'returns date language sql stable as $c$ select now() as d $c$',
+      ],
+      [
+        'censo_probe_alias_desnudo_date',
+        'returns date language sql stable as $c$ select now() d $c$',
+      ],
+      /*
+       * Y el alias en las OTRAS listas de selección, que son cinco sitios más y no uno: quitarlo
+       * solo donde lo dijo el hallazgo habría dejado el mismo hueco en todos ellos. Las seis
+       * medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   insert into t(k, d) select 2, now() as f …    empareja por posición
+       *   select now() as x into d                      variable de tipo escrito
+       *   select now() as q into v  (v t.d%type)        variable de tipo del catálogo
+       *   returns table(d date) as $$ select now() as q $$
+       *   select array(select now() as q)               y la subconsulta escalar de al lado
+       */
+      [
+        'censo_probe_insert_select_alias_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' select 2, now() as f from generate_series(1, 1); end $c$',
+      ],
+      [
+        'censo_probe_into_alias_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin select now() as x into d; return d; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_into_alias_date',
+        'returns date language plpgsql as $c$ declare v censo_probe_escritura.d%type;' +
+          ' begin select now() as q into v; return v; end $c$',
+      ],
+      /*
+       * La del `RETURNS TABLE` lleva DOS columnas a propósito: con una sola, `prorettype` es
+       * `date` —Postgres solo pone `record` a partir de dos, medido— y quien la caza es el
+       * reconocedor del tipo de retorno, no éste. Con dos, el único que puede verla es el que
+       * empareja la lista con las columnas declaradas, que es donde está el alias.
+       */
+      [
+        'censo_probe_tabla_alias_date',
+        'returns table(d date, n int) language sql stable as $c$ select now() as q, 1 $c$',
+      ],
+      [
+        'censo_probe_arreglo_alias_date',
+        'returns date[] language sql stable as $c$ select array(select now() as q) $c$',
+      ],
+      [
+        'censo_probe_subconsulta_alias_date',
+        'returns date language sql stable as $c$ select (select now() as q) $c$',
+      ],
+      [
+        'censo_probe_union_date',
+        'returns date language sql stable as $c$ select now()' +
+          ' union all select now() where false $c$',
+      ],
+      [
+        'censo_probe_union_segunda_rama_date',
+        "returns date language sql stable as $c$ select date '2026-01-01'" +
+          ' union all select now() where false $c$',
+      ],
+      [
+        'censo_probe_derivada_date',
+        'returns date language sql stable as $c$ select d from (select now() d) s $c$',
+      ],
+      /*
+       * Y sus seguras. La de la subconsulta es la que fija que esto no marca por vecindad: el
+       * reloj está DENTRO de la subconsulta, pero en una columna que no es la que se proyecta,
+       * así que la función sigue devolviendo la fecha fija. Y la del alias fija que quitarlo no
+       * se lleva por delante una expresión de un solo término.
+       */
+      [
+        'censo_probe_ok_subconsulta_no_proyectada',
+        "returns date language sql stable as $c$ select date '2026-01-01'" +
+          ' from (select now() d) s $c$',
+      ],
+      [
+        'censo_probe_ok_derivada_otra_columna',
+        "returns date language sql stable as $c$ select f from (select now() d," +
+          " date '2026-01-01' f) s $c$",
+      ],
+      [
+        'censo_probe_ok_alias_fecha_fija',
+        "returns date language sql stable as $c$ select date '2026-01-01' as now $c$",
+      ],
+      /*
+       * Cuatro formas más, las cuatro medidas 2026-09-05 en Pacific/Kiritimati contra
+       * 2026-09-04 en Etc/GMT+12:
+       *
+       *   insert … overriding user value values (…)   el OVERRIDING entre la lista y la fuente
+       *   insert … select … on conflict do update     el ON CONFLICT detrás de un SELECT
+       *   d[1] := now()   con `d date[]`              la asignación a un elemento
+       *   as $$ values (now()) $$                     el cuerpo que entrega con VALUES
+       */
+      /*
+       * Y cuatro formas que salieron de revisar lo de arriba, las cuatro medidas 2026-09-05 en
+       * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   insert … select … returning now() into d   el `select` se comía la coincidencia
+       *   select s.d from (select now() d) s         la proyección calificada
+       *   select now() as U&"\\0064"                  el alias por puntos de código
+       *   select d from (select now() as U&"\\0064") s   y el mismo alias, resuelto por nombre
+       *
+       * La primera escribe en una columna CON huso a propósito: así ningún otro reconocedor la
+       * caza y lo que se prueba es el emparejamiento del `into`, no otra cosa.
+       */
+      /*
+       * Las otras cuatro ataduras de plpgsql, medidas las cuatro 2026-09-05 en
+       * Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12:
+       *
+       *   for d in select now() loop …            el bucle asigna cada vuelta
+       *   for d in execute 'select now()' loop …  y su variante dinámica
+       *   fetch c into d   con `c cursor for …`   el cursor trae su consulta de otro sitio
+       *   execute 'select now()' into d           el tipo que coerciona está FUERA del literal
+       */
+      /*
+       * Tres formas más, medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12:
+       *
+       *   execute $q$select now()$q$ into d    la otra ortografía del literal
+       *   foreach d in array array[now()]      el bucle de arrays asigna elemento a elemento
+       *   insert into <particionada>(…)        el padre no estaba en el inventario
+       */
+      [
+        'censo_probe_execute_dolar_into_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          ' execute $q$select now()$q$ into d; return d; end $c$',
+      ],
+      /*
+       * Y las dos que salieron de revisar lo de arriba, medidas con el mismo par de fechas:
+       * el destino ENTRECOMILLADO con mayúsculas —que hay que canonicalizar igual a los dos
+       * lados— y el modificador `SLICE <n>` del `FOREACH`, que va entre el destino y el array.
+       */
+      /*
+       * Dos formas más, medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12: la tabla y la columna CITADAS en mayúsculas —donde se ve si la
+       * canonicalización se aplica a los dos lados— y el `for … in values`.
+       */
+      /*
+       * Cinco formas más, medidas 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en
+       * Etc/GMT+12. Las tres primeras son sobre código de esta misma sesión:
+       *
+       *   for n, d in select 1, now() loop         el destino MÚLTIPLE, emparejado por posición
+       *   for d in values (fija), (now()) loop     todas las tuplas, no la primera
+       *   declare "D" t.d%type; "D" := now()       la variable %TYPE entrecomillada
+       *   insert into t(d) values (now())  con `d` de un DOMINIO sobre date
+       *   update only t set d = now()
+       */
+      [
+        'censo_probe_bucle_multiple_date',
+        'returns void language plpgsql as $c$ declare n int; d date; begin' +
+          ' for n, d in select 1, now() loop' +
+          ' insert into censo_probe_escritura(k, d) values (n, d); end loop; end $c$',
+      ],
+      [
+        'censo_probe_bucle_values_dos_date',
+        "returns void language plpgsql as $c$ declare d date; i int := 10; begin" +
+          " for d in values (date '2026-01-01'), (now()) loop" +
+          ' insert into censo_probe_escritura(k, d) values (i, d); i := i + 1;' +
+          ' end loop; end $c$',
+      ],
+      [
+        'censo_probe_pct_type_citada_date',
+        'returns date language plpgsql as $c$ declare "D" censo_probe_escritura.d%type;' +
+          ' begin "D" := now(); return "D"; end $c$',
+      ],
+      [
+        'censo_probe_columna_dominio_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into censo_probe_dominio(k, fecha_dom) values (1, now()); end $c$',
+      ],
+      /*
+       * La del `update only` estaba ya cubierta —el reconocedor del `UPDATE` admite el
+       * modificador desde antes—, y va escrita porque nadie lo había comprobado: una cobertura
+       * que no tiene sonda es una cobertura que nadie ha medido.
+       */
+      [
+        'censo_probe_update_only_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' update only censo_probe_escritura set d = now(); end $c$',
+      ],
+      [
+        'censo_probe_tabla_citada_mayus_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into "CensoProbeCitada"("K", "FechaCitada") values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_bucle_values_date',
+        'returns void language plpgsql as $c$ declare d date; begin' +
+          ' for d in values (now()) loop' +
+          ' insert into censo_probe_escritura(k, d) values (1, d); end loop; end $c$',
+      ],
+      [
+        'censo_probe_destino_citado_mayus_date',
+        'returns void language plpgsql as $c$ declare "D" date; begin' +
+          ' for "D" in select now() loop' +
+          ' insert into censo_probe_escritura(k, d) values (1, "D"); end loop; end $c$',
+      ],
+      [
+        'censo_probe_foreach_slice_date',
+        'returns void language plpgsql as $c$ declare d date[]; begin' +
+          ' foreach d slice 1 in array array[[now()]] loop' +
+          ' insert into censo_probe_escritura(k, d) values (2, d[1]); end loop; end $c$',
+      ],
+      [
+        'censo_probe_foreach_date',
+        'returns void language plpgsql as $c$ declare d date; begin' +
+          ' foreach d in array array[now()] loop' +
+          ' insert into censo_probe_escritura(k, d) values (1, d); end loop; end $c$',
+      ],
+      [
+        'censo_probe_particionada_date',
+        'returns void language plpgsql as $c$ begin' +
+          ' insert into censo_probe_particionada(k, d) values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_bucle_for_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          ' for d in select now() loop return d; end loop; return null; end $c$',
+      ],
+      [
+        'censo_probe_bucle_for_execute_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          " for d in execute 'select now()' loop return d; end loop; return null; end $c$",
+      ],
+      /*
+       * Las del cursor van `returns void` y escriben en una columna a propósito. Escritas como
+       * `returns date`, el `select now()` de la declaración del cursor lo caza el reconocedor
+       * del tipo de RETORNO y la sonda pasaba sin probar lo suyo: neutralizar el cursor entero
+       * no la movía. Así, el único camino que puede verlas es el que resuelve el cursor.
+       *
+       * Y son dos, porque un cursor trae su consulta de dos sitios: de su declaración y de un
+       * `open … for`. Las dos medidas con el mismo par de fechas.
+       */
+      [
+        'censo_probe_fetch_date',
+        'returns void language plpgsql as $c$ declare d date; c cursor for select now();' +
+          ' begin open c; fetch c into d; close c;' +
+          ' insert into censo_probe_escritura(k, d) values (1, d); end $c$',
+      ],
+      [
+        'censo_probe_fetch_open_for_date',
+        'returns void language plpgsql as $c$ declare d date; c refcursor;' +
+          ' begin open c for select now(); fetch c into d; close c;' +
+          ' insert into censo_probe_escritura(k, d) values (2, d); end $c$',
+      ],
+      [
+        'censo_probe_execute_into_date',
+        "returns date language plpgsql as $c$ declare d date; begin execute 'select now()'" +
+          ' into d; return d; end $c$',
+      ],
+      /*
+       * Y sus seguras, que fijan que lo que decide sigue siendo el TIPO del destino y no la
+       * palabra: las mismas cuatro formas sobre una variable CON huso conservan el instante.
+       */
+      [
+        'censo_probe_ok_bucle_for_instante',
+        'returns timestamptz language plpgsql as $c$ declare t timestamptz; begin' +
+          ' for t in select now() loop return t; end loop; return null; end $c$',
+      ],
+      [
+        'censo_probe_ok_fetch_instante',
+        'returns void language plpgsql as $c$ declare t timestamptz;' +
+          ' c cursor for select now(); begin open c; fetch c into t; close c;' +
+          ' insert into censo_probe_escritura(k, ts) values (3, t); end $c$',
+      ],
+      [
+        'censo_probe_ok_execute_into_instante',
+        'returns timestamptz language plpgsql as $c$ declare t timestamptz; begin' +
+          " execute 'select now()' into t; return t; end $c$",
+      ],
+      [
+        'censo_probe_returning_tras_select_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          " insert into censo_probe_otra(k, d) select 1, timestamptz '2020-01-01'" +
+          ' returning now() into d; return d; end $c$',
+      ],
+      [
+        'censo_probe_derivada_calificada_date',
+        'returns date language sql stable as $c$ select s.d from (select now() d) s $c$',
+      ],
+      [
+        'censo_probe_alias_unicode_date',
+        'returns date language sql stable as $c$ select now() as U&"\\0064" $c$',
+      ],
+      [
+        'censo_probe_derivada_unicode_date',
+        'returns date language sql stable as $c$ select d from' +
+          ' (select now() as U&"\\0064") s $c$',
+      ],
+      [
+        'censo_probe_overriding_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' overriding user value values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_conflicto_select_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          " select 1, date '2026-01-01' on conflict (k) do update set d = now(); end $c$",
+      ],
+      [
+        'censo_probe_arreglo_variable_date',
+        'returns date[] language plpgsql as $c$ declare d date[];' +
+          ' begin d := array[now()]; return d; end $c$',
+      ],
+      [
+        'censo_probe_subindice_date',
+        "returns date[] language plpgsql as $c$ declare d date[] := array[date '2000-01-01'];" +
+          ' begin d[1] := now(); return d; end $c$',
+      ],
+      [
+        'censo_probe_values_cuerpo_date',
+        'returns date language sql stable as $c$ values (now()) $c$',
+      ],
+      [
+        'censo_probe_values_dos_filas_date',
+        "returns setof date language sql stable as $c$ values (date '2026-01-01'), (now()) $c$",
+      ],
+      /*
+       * Y las seguras. La del `values` es la que sostiene la guarda de «tiene que EMPEZAR la
+       * sentencia»: sin ella, el `values` de un `insert` hacia una columna CON huso, dentro de
+       * una función `returns date`, saldría culpable por vecindad.
+       */
+      [
+        'censo_probe_ok_values_de_insert',
+        'returns date language plpgsql as $c$ begin' +
+          ' insert into censo_probe_escritura(k, ts) values (1, now());' +
+          " return date '2026-01-01'; end $c$",
+      ],
+      [
+        'censo_probe_ok_overriding_instante',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, ts)' +
+          ' overriding user value values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_returning_into_date',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          ' update censo_probe_otra set k = k returning now() into d; return d; end $c$',
+      ],
+      /*
+       * El ternario son CUATRO patrones —dos límites por dos órdenes— y cada sonda está
+       * escrita para que solo la coja el suyo: la que lleva el reloj ABAJO pone una fecha fija
+       * arriba, y al revés. Escribirlas de otro modo las cazaba todas el mismo brazo y las
+       * demás pasaban por sondas sin serlo — medido: quitando el brazo del límite inferior no
+       * se movía ninguna.
+       *
+       * Las cinco medidas sobre las mismas tres fechas seguidas, y las cinco cambian de fila
+       * entre Pacific/Kiritimati y Etc/GMT+12.
+       */
+      [
+        'censo_probe_between_date',
+        "returns boolean language sql stable as $c$ select censo_fecha between now() and" +
+          " date '2026-12-31' from censo_probe_escritura limit 1 $c$",
+      ],
+      [
+        'censo_probe_between_superior_date',
+        "returns boolean language sql stable as $c$ select censo_fecha between date" +
+          " '2026-01-01' and current_timestamp from censo_probe_escritura limit 1 $c$",
+      ],
+      [
+        'censo_probe_between_reloj_izquierdo_date',
+        "returns boolean language sql stable as $c$ select now() between censo_fecha and" +
+          " timestamptz '2030-01-01' from censo_probe_escritura limit 1 $c$",
+      ],
+      /* Ésta lleva además el `not`, que es la única pieza que comparten los cuatro. */
+      [
+        'censo_probe_between_superior_columna_date',
+        "returns boolean language sql stable as $c$ select now() not between timestamptz" +
+          " '2000-01-01Z' and censo_fecha from censo_probe_escritura limit 1 $c$",
+      ],
+      /* Y el `symmetric`, con la fecha fija arriba para que el otro brazo no la alcance. */
+      [
+        'censo_probe_between_symmetric_date',
+        'returns boolean language sql stable as $c$ select censo_fecha between symmetric' +
+          " now() and date '2026-01-01' from censo_probe_escritura limit 1 $c$",
+      ],
+      [
+        'censo_probe_insert_cte_select_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with x as (select 1) select 1, now(); end $c$',
+      ],
+      [
+        'censo_probe_insert_cte_values_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with x as (select 1) values (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_insert_cte_columnas_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with x (a) as (select 1) select 1, now(); end $c$',
+      ],
+      /*
+       * Y las dos piezas restantes de la gramática, para que ninguna quede sin sonda: la lista
+       * con VARIOS CTEs separados por comas y el `RECURSIVE`. Medidas las dos con el mismo par
+       * de fechas.
+       */
+      [
+        'censo_probe_insert_cte_dos_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with x as (select 1), y as (select 2) select 1, now(); end $c$',
+      ],
+      [
+        'censo_probe_insert_cte_recursive_date',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          ' with recursive x (a) as (select 1) select 1, now(); end $c$',
+      ],
+      /*
+       * Y sus seguras, que son las que fijan que el salto de los CTEs no se convirtió en «lo
+       * que venga detrás de un `with` es culpable»: la misma forma sobre una columna CON huso
+       * conserva el instante, y un reloj que se queda DENTRO del cuerpo del CTE no llega a
+       * ninguna columna sin huso —lo que se escribe ahí es una fecha fija—.
+       *
+       * La segunda es además la que distingue este salto de saltar «hasta el primer `select`»:
+       * el cuerpo del CTE lleva uno, y quedarse con él emparejaría la lista equivocada.
+       */
+      [
+        'censo_probe_ok_insert_cte_instante',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, ts)' +
+          ' with x as (select 1) select 1, now(); end $c$',
+      ],
+      [
+        'censo_probe_ok_insert_cte_reloj_dentro',
+        'returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)' +
+          " with x as (select now() as n) select 1, date '2026-01-01' from x; end $c$",
+      ],
+      [
+        'censo_probe_ok_between_instante',
+        'returns boolean language sql stable as $c$ select ts between current_timestamp' +
+          " and current_timestamp + interval '1 day' from censo_probe_escritura limit 1 $c$",
+      ],
+      [
+        'censo_probe_ok_compara_columna_ambigua',
+        'returns boolean language sql stable as $c$ select now() < d from censo_probe_otra $c$',
+      ],
+      [
+        'censo_probe_ok_rowtype_instante',
+        'returns timestamptz language plpgsql as $c$ declare r censo_probe_escritura%rowtype;' +
+          ' begin r.ts := now(); return r.ts; end $c$',
+      ],
+      [
+        'censo_probe_ok_using_instante',
+        "returns timestamptz language plpgsql as $c$ declare d timestamptz;" +
+          " begin execute 'select $1::timestamptz' into d using now(); return d; end $c$",
+      ],
+      [
+        'censo_probe_ok_into_dos_columnas',
+        'returns date language plpgsql as $c$ declare t timestamptz; d date;' +
+          " begin select now(), timezone('UTC', now())::date into t, d; return d; end $c$",
+      ],
+      [
+        'censo_probe_ok_insert_select_where',
+        "returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)" +
+          " select 3, d from censo_probe_escritura where ts < now(); end $c$",
+      ],
+      [
+        'censo_probe_ok_set_fila_instante',
+        'returns void language plpgsql as $c$ begin' +
+          ' update censo_probe_escritura set (k, ts) = (1, now()); end $c$',
+      ],
+      [
+        'censo_probe_ok_compara_igual',
+        'returns date language plpgsql as $c$ declare d date; begin' +
+          " d := timezone('UTC', now())::date; perform 1 where d = now(); return d; end $c$",
+      ],
+      [
+        'censo_probe_ok_conflicto_otra_tabla',
+        'returns void language plpgsql as $c$ begin' +
+          " insert into censo_probe_escritura(k, ts) values (1, timestamptz '2020-01-01Z')" +
+          ' on conflict (k) do nothing;' +
+          " insert into censo_probe_otra(k, d) values (1, timestamptz '2020-01-01Z')" +
+          ' on conflict (k) do update set d = now(); end $c$',
+      ],
+      [
+        'censo_probe_ok_conflicto_instante',
+        'returns void language plpgsql as $c$ begin' +
+          " insert into censo_probe_escritura(k, ts) values (1, timestamptz '2020-01-01Z')" +
+          ' on conflict (k) do update set ts = now(); end $c$',
+      ],
+      [
+        'censo_probe_ok_insert_huso_fijo',
+        "returns void language plpgsql as $c$ begin insert into censo_probe_escritura(k, d)" +
+          " values (1, timezone('UTC', now())::date); end $c$",
+      ],
+      [
+        'censo_probe_ok_arreglo_subconsulta_where',
+        "returns date[] language sql stable as $c$ select array(select d from" +
+          " (values (date '2026-01-01')) v(d) where now() > timestamptz '2000-01-01') $c$",
+      ],
+      // Y el reloj ENVUELTO en algo que no cambia su tipo, que es como llega de verdad una
+      // expresión escrita por una persona. Las cuatro medidas: 2026-09-05 en
+      // Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12.
+      [
+        'censo_probe_coalesce_date',
+        'returns date language plpgsql as $c$ begin return coalesce(now(), now()); end $c$',
+      ],
+      [
+        'censo_probe_greatest_date',
+        'returns date language plpgsql as $c$ begin return greatest(now(), now()); end $c$',
+      ],
+      [
+        'censo_probe_case_date',
+        'returns date language plpgsql as $c$ begin return case when true then now() else now() end; end $c$',
+      ],
+      [
+        'censo_probe_coalesce_sql_date',
+        'returns date language sql stable as $c$ select coalesce(now(), now()) $c$',
+      ],
+      // Y las dos que impiden el atajo de «hay un reloj dentro»: las dos LO TIENEN y las dos
+      // dan lo mismo en husos opuestos (2026-09-04 y 2026-01-01, medidas). La primera es el
+      // arreglo canónico de este PR; la segunda devuelve una columna y usa el reloj solo para
+      // filtrar. Sin ellas, seguir el valor y buscar dentro se verían igual de verdes.
+      // Y la envoltura también en lo que se ASIGNA, que es la misma puerta por el otro lado.
+      // Medidas las dos: 2026-09-05 contra 2026-09-04.
+      [
+        'censo_probe_variable_coalesce_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin d := coalesce(now(), now()); return d; end $c$',
+      ],
+      [
+        'censo_probe_into_coalesce_date',
+        'returns date language plpgsql as $c$ declare d date;' +
+          ' begin select coalesce(now(), now()) into d; return d; end $c$',
+      ],
+      // Y las columnas de salida de un RETURNS TABLE, que son variables con otro sitio donde
+      // declararse. Con una columna y con dos —`prorettype` dice `date` en el primer caso y
+      // `record` en el segundo, medido—, porque lo que las caza es la declaración y no el
+      // tipo de vuelta.
+      [
+        'censo_probe_tabla_date',
+        'returns table(d date) language plpgsql as $c$ begin d := now(); return next; end $c$',
+      ],
+      [
+        'censo_probe_tabla_dos_date',
+        'returns table(d date, n int) language plpgsql as $c$' +
+          ' begin d := now(); n := 1; return next; end $c$',
+      ],
+      // Y su pareja segura, que es la que acota: la misma columna de salida CON huso conserva
+      // el instante y no puede enrojecer.
+      [
+        'censo_probe_tabla_instante',
+        'returns table(d timestamptz) language plpgsql as $c$' +
+          ' begin d := now(); return next; end $c$',
+      ],
+      /*
+       * Y el destino tipado a través de un CONSTRUCTOR de array. Postgres coerciona
+       * ELEMENTO A ELEMENTO: `returns date[]` con `return array[now()]` da
+       * `{2026-09-05}` en Pacific/Kiritimati y `{2026-09-04}` en Etc/GMT+12 —medido—, y en
+       * el catálogo no hay más que un `now()` desnudo, igual que en toda esta familia. Lo
+       * que cambia es la SINTAXIS del envoltorio: `array[…]` no es una llamada, así que no
+       * lo veía ni el seguimiento del valor ni la lista de tipos sin huso, que estaba
+       * anclada al tipo escalar.
+       *
+       * El arreglo son DOS piezas y ninguna basta sola —admitir el sufijo en la lista de
+       * tipos sin huso, y descender por el corchete—: retirando cualquiera de las dos se
+       * mueve esta misma sonda y ninguna otra.
+       *
+       * Y sus dos parejas seguras, dicho lo que cada una vale de verdad, que no es lo que
+       * parece:
+       *
+       * - `censo_probe_arreglo_instante` (elemento CON huso, que conserva el instante) SÍ
+       *   carga peso: relajando el tipo del elemento para que acepte `with time zone`,
+       *   enrojece. Pero enrojece junto a `censo_probe_devuelve_instante`, o sea que lo que
+       *   añade no es el guardián —ése ya estaba— sino que el sufijo nuevo no se lo llevó
+       *   por delante al pasar por encima.
+       * - `censo_probe_ok_arreglo_huso_fijo` (el huso ya fijado DENTRO del corchete) NO
+       *   añade cobertura, y se queda escrito como tal en vez de venderse: se mueve con
+       *   exactamente la misma neutralización que `censo_probe_ok_huso_fijo_date` —quitarle
+       *   el anclaje a `RELOJ_A_SECAS`— y con ninguna otra. Es la misma guarda de siempre
+       *   redicha en forma de array. Lo que NO la sostiene, comprobado: meter `timezone` en
+       *   las envolturas transparentes deja la suite entera en verde, porque ahí el
+       *   descenso ni siquiera llega —el `)` no cierra la expresión, que sigue con `::date`—.
+       */
+      [
+        'censo_probe_arreglo_date',
+        'returns date[] language plpgsql as $c$ begin return array[now()]; end $c$',
+      ],
+      [
+        'censo_probe_arreglo_instante',
+        'returns timestamptz[] language plpgsql as $c$ begin return array[now()]; end $c$',
+      ],
+      [
+        'censo_probe_ok_arreglo_huso_fijo',
+        "returns date[] language plpgsql as $c$" +
+          " begin return array[timezone('UTC', now())::date]; end $c$",
+      ],
+      // Y su pareja segura: la misma envoltura sobre una variable CON huso conserva el
+      // instante, así que seguir el valor no puede enrojecerla.
+      [
+        'censo_probe_variable_coalesce_instante',
+        'returns timestamptz language plpgsql as $c$ declare d timestamptz;' +
+          ' begin d := coalesce(now(), now()); return d; end $c$',
+      ],
+      [
+        'censo_probe_ok_huso_fijo_date',
+        "returns date language plpgsql as $c$ begin return timezone('UTC', now())::date; end $c$",
+      ],
+      [
+        'censo_probe_ok_subconsulta_date',
+        "returns date language sql stable as $c$ select d from (values (date '2026-01-01')) v(d)" +
+          " where now() > timestamptz '2000-01-01' $c$",
+      ],
+    ] as const) {
+      // La mayoría no lleva argumentos y por eso el `()` va aquí; las que sí —el `DEFAULT` de
+      // un parámetro— traen su propia lista y empiezan por paréntesis.
+      await admin.unsafe(
+        sql.startsWith('(')
+          ? `create function ${nombre}${sql}`
+          : `create function ${nombre}() ${sql}`,
+      );
+    }
+    try {
+      // `pg_get_functiondef` y no `prosrc`, y `prokind = 'f'` porque aquél no acepta
+      // agregados ni funciones de ventana.
+      const funciones = await admin`
+        select p.proname as nombre, pg_get_functiondef(p.oid) as cuerpo, p.prosrc,
+               -- El TIPO DE VUELTA, que es lo que la expresión no dice: una funcion
+               -- que devuelve date con un now() desnudo dentro coerciona con el huso de
+               -- quien llama, y en el texto no hay ningun cast que mirar.
+               format_type(p.prorettype, null) as tipo
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+        join pg_language l on l.oid = p.prolang
+        where n.nspname = 'public' and l.lanname not in ('internal', 'c')
+          -- Funciones Y PROCEDIMIENTOS: pg_get_functiondef reconstruye los dos, y lo que no
+          -- acepta son agregados (a) y funciones de ventana (w). Con prokind = f a secas, un
+          -- procedimiento que validara con el calendario de la sesión quedaba invisible.
+          -- (Sin comillas invertidas: esto vive en una template literal y las terminaría.)
+          and p.prokind in ('f', 'p')
+        order by 1`;
+      // El censo tiene que estar mirando algo: sin esto, un cambio en la consulta que
+      // devolviera cero filas dejaría el test en verde para siempre sin comprobar nada.
+      expect(funciones.length).toBeGreaterThan(50);
+      /*
+       * Y la premisa que hace correcta la comparación implícita, COMPROBADA y no supuesta: la
+       * columna se casa por nombre —en una expresión el calificador es un alias, no la tabla—,
+       * y un nombre que significara un tipo sin huso en una tabla y uno con huso en otra no lo
+       * resolvería. Esos el censo los OMITE en vez de adivinar; lo que no puede pasar es que
+       * omita uno del esquema de verdad sin decirlo, porque entonces habría dejado de mirar
+       * una columna sin que nadie se entere. Las de las tablas sonda no cuentan: una de ellas
+       * es ambigua a propósito.
+       */
+      expect(COLUMNAS_AMBIGUAS).toEqual([]);
+      // Y la premisa del hallazgo del `prosqlbody`, comprobada y no supuesta.
+      expect(funciones.find((f) => f.nombre === 'censo_probe_castop')!.prosrc).toBe('');
+
+      const culpables = funciones
+        .filter((f) => culpable(f.cuerpo as string, 'sql', f.tipo as string))
+        .map((f) => f.nombre as string)
+        .filter((n) => !(n in DECLARADAS));
+      // Exactamente las peligrosas y ninguna más: si un patrón se rompe, su sonda desaparece
+      // de aquí; si un patrón se pasa de ancho, aparece una segura.
+      expect(culpables.sort()).toEqual(
+        [
+          ...Object.entries(SONDAS)
+            .filter(([, v]) => v.culpable)
+            .map(([n]) => n),
+          'censo_probe_procedimiento',
+          'censo_probe_bloque_anidado',
+          'censo_probe_literal_reloj',
+          'censo_probe_devuelve_date',
+          'censo_probe_variable_date',
+          'censo_probe_into_date',
+          'censo_probe_cuerpo_viejo_date',
+          'censo_probe_cuerpo_from_date',
+          'censo_probe_cuerpo_nuevo_date',
+          'censo_probe_coalesce_date',
+          'censo_probe_greatest_date',
+          'censo_probe_case_date',
+          'censo_probe_coalesce_sql_date',
+          'censo_probe_variable_coalesce_date',
+          'censo_probe_into_coalesce_date',
+          'censo_probe_tabla_date',
+          'censo_probe_tabla_dos_date',
+          'censo_probe_arreglo_date',
+          'censo_probe_var_comillas_date',
+          'censo_probe_decl_inicializada',
+          'censo_probe_decl_constant',
+          'censo_probe_decl_notnull',
+          'censo_probe_decl_default',
+          'censo_probe_decl_igual',
+          'censo_probe_var_espacio_date',
+          'censo_probe_arreglo_subconsulta_date',
+          'censo_probe_insert_date',
+          'censo_probe_insert_posicional_date',
+          'censo_probe_update_date',
+          'censo_probe_conflicto_date',
+          'censo_probe_values_dos_tuplas_date',
+          'censo_probe_asigna_igual_date',
+          'censo_probe_update_alias_date',
+          'censo_probe_return_next_date',
+          'censo_probe_set_subconsulta_date',
+          'censo_probe_insert_alias_date',
+          'censo_probe_merge_date',
+          'censo_probe_set_fila_date',
+          'censo_probe_insert_select_date',
+          'censo_probe_escape_e_date',
+          'censo_probe_identificador_unicode_date',
+          'censo_probe_using_date',
+          'censo_probe_into_dos_columnas_date',
+          'censo_probe_rowtype_date',
+          'censo_probe_pct_type_date',
+          'censo_probe_into_con_from_date',
+          'censo_probe_pct_type_inicializada_date',
+          'censo_probe_pct_type_igual_date',
+          'censo_probe_rowtype_igual_date',
+          'censo_probe_rowtype_campo_unicode_date',
+          'censo_probe_using_dolar_date',
+          'censo_probe_merge_insert_date',
+          'censo_probe_conflicto_fila_date',
+          'censo_probe_using_prefijo_e_date',
+          'censo_probe_tabla_proyectada_date',
+          'censo_probe_subconsulta_escalar_date',
+          'censo_probe_subconsulta_escritura_date',
+          'censo_probe_pct_type_into_date',
+          'censo_probe_parametro_default_date',
+          'censo_probe_tabla_unicode_date',
+          'censo_probe_returning_into_date',
+          'censo_probe_execute_dolar_into_date',
+          'censo_probe_bucle_multiple_date',
+          'censo_probe_bucle_values_dos_date',
+          'censo_probe_pct_type_citada_date',
+          'censo_probe_columna_dominio_date',
+          'censo_probe_update_only_date',
+          'censo_probe_tabla_citada_mayus_date',
+          'censo_probe_bucle_values_date',
+          'censo_probe_destino_citado_mayus_date',
+          'censo_probe_foreach_slice_date',
+          'censo_probe_foreach_date',
+          'censo_probe_particionada_date',
+          'censo_probe_bucle_for_date',
+          'censo_probe_bucle_for_execute_date',
+          'censo_probe_fetch_date',
+          'censo_probe_fetch_open_for_date',
+          'censo_probe_execute_into_date',
+          'censo_probe_returning_tras_select_date',
+          'censo_probe_derivada_calificada_date',
+          'censo_probe_alias_unicode_date',
+          'censo_probe_derivada_unicode_date',
+          'censo_probe_overriding_date',
+          'censo_probe_conflicto_select_date',
+          'censo_probe_arreglo_variable_date',
+          'censo_probe_subindice_date',
+          'censo_probe_values_cuerpo_date',
+          'censo_probe_values_dos_filas_date',
+          'censo_probe_alias_date',
+          'censo_probe_alias_desnudo_date',
+          'censo_probe_insert_select_alias_date',
+          'censo_probe_into_alias_date',
+          'censo_probe_pct_type_into_alias_date',
+          'censo_probe_tabla_alias_date',
+          'censo_probe_arreglo_alias_date',
+          'censo_probe_subconsulta_alias_date',
+          'censo_probe_union_date',
+          'censo_probe_union_segunda_rama_date',
+          'censo_probe_derivada_date',
+          'censo_probe_between_date',
+          'censo_probe_between_reloj_izquierdo_date',
+          'censo_probe_between_superior_date',
+          'censo_probe_between_superior_columna_date',
+          'censo_probe_between_symmetric_date',
+          'censo_probe_insert_cte_select_date',
+          'censo_probe_insert_cte_values_date',
+          'censo_probe_insert_cte_columnas_date',
+          'censo_probe_insert_cte_dos_date',
+          'censo_probe_insert_cte_recursive_date',
+        ].sort(),
+      );
+    } finally {
+      for (const nombre of Object.keys(SONDAS)) {
+        await admin.unsafe(`drop function ${nombre}()`);
+      }
+      await admin`drop procedure censo_probe_procedimiento()`;
+      await admin`drop function censo_probe_bloque_anidado()`;
+      await admin`drop function censo_probe_literal_reloj()`;
+      for (const nombre of [
+        'censo_probe_devuelve_date',
+        'censo_probe_variable_date',
+        'censo_probe_into_date',
+        'censo_probe_cuerpo_viejo_date',
+        'censo_probe_cuerpo_from_date',
+        'censo_probe_cuerpo_nuevo_date',
+        'censo_probe_devuelve_instante',
+        'censo_probe_variable_instante',
+        'censo_probe_coalesce_date',
+        'censo_probe_greatest_date',
+        'censo_probe_case_date',
+        'censo_probe_coalesce_sql_date',
+        'censo_probe_variable_coalesce_date',
+        'censo_probe_into_coalesce_date',
+        'censo_probe_variable_coalesce_instante',
+        'censo_probe_tabla_date',
+        'censo_probe_tabla_dos_date',
+        'censo_probe_tabla_instante',
+        'censo_probe_arreglo_date',
+        'censo_probe_arreglo_instante',
+        'censo_probe_var_comillas_date',
+        'censo_probe_var_comillas_instante',
+        'censo_probe_decl_inicializada',
+        'censo_probe_decl_constant',
+        'censo_probe_decl_notnull',
+        'censo_probe_decl_default',
+        'censo_probe_decl_igual',
+        'censo_probe_var_espacio_date',
+        'censo_probe_arreglo_subconsulta_date',
+        'censo_probe_ok_arreglo_subconsulta_where',
+        'censo_probe_insert_date',
+        'censo_probe_insert_posicional_date',
+        'censo_probe_update_date',
+        'censo_probe_conflicto_date',
+        'censo_probe_values_dos_tuplas_date',
+        'censo_probe_asigna_igual_date',
+        'censo_probe_update_alias_date',
+        'censo_probe_return_next_date',
+        'censo_probe_set_subconsulta_date',
+        'censo_probe_insert_alias_date',
+        'censo_probe_merge_date',
+        'censo_probe_set_fila_date',
+        'censo_probe_insert_select_date',
+        'censo_probe_escape_e_date',
+        'censo_probe_identificador_unicode_date',
+        'censo_probe_using_date',
+        'censo_probe_into_dos_columnas_date',
+        'censo_probe_rowtype_date',
+        'censo_probe_pct_type_date',
+        'censo_probe_into_con_from_date',
+        'censo_probe_pct_type_inicializada_date',
+        'censo_probe_pct_type_igual_date',
+        'censo_probe_rowtype_igual_date',
+        'censo_probe_rowtype_campo_unicode_date',
+        'censo_probe_using_dolar_date',
+        'censo_probe_merge_insert_date',
+        'censo_probe_conflicto_fila_date',
+        'censo_probe_using_prefijo_e_date',
+        'censo_probe_tabla_proyectada_date',
+        'censo_probe_subconsulta_escalar_date',
+        'censo_probe_subconsulta_escritura_date',
+        'censo_probe_pct_type_into_date',
+        'censo_probe_parametro_default_date',
+        'censo_probe_ok_parametro_default_instante',
+        'censo_probe_alias_date',
+        'censo_probe_alias_desnudo_date',
+        'censo_probe_insert_select_alias_date',
+        'censo_probe_into_alias_date',
+        'censo_probe_pct_type_into_alias_date',
+        'censo_probe_tabla_alias_date',
+        'censo_probe_arreglo_alias_date',
+        'censo_probe_subconsulta_alias_date',
+        'censo_probe_union_date',
+        'censo_probe_union_segunda_rama_date',
+        'censo_probe_derivada_date',
+        'censo_probe_ok_subconsulta_no_proyectada',
+        'censo_probe_ok_derivada_otra_columna',
+        'censo_probe_ok_alias_fecha_fija',
+        'censo_probe_returning_into_date',
+        'censo_probe_execute_dolar_into_date',
+        'censo_probe_bucle_multiple_date',
+        'censo_probe_bucle_values_dos_date',
+        'censo_probe_pct_type_citada_date',
+        'censo_probe_columna_dominio_date',
+        'censo_probe_update_only_date',
+        'censo_probe_tabla_citada_mayus_date',
+        'censo_probe_bucle_values_date',
+        'censo_probe_destino_citado_mayus_date',
+        'censo_probe_foreach_slice_date',
+        'censo_probe_foreach_date',
+        'censo_probe_particionada_date',
+        'censo_probe_bucle_for_date',
+        'censo_probe_bucle_for_execute_date',
+        'censo_probe_fetch_date',
+        'censo_probe_fetch_open_for_date',
+        'censo_probe_execute_into_date',
+        'censo_probe_ok_bucle_for_instante',
+        'censo_probe_ok_fetch_instante',
+        'censo_probe_ok_execute_into_instante',
+        'censo_probe_returning_tras_select_date',
+        'censo_probe_derivada_calificada_date',
+        'censo_probe_alias_unicode_date',
+        'censo_probe_derivada_unicode_date',
+        'censo_probe_overriding_date',
+        'censo_probe_conflicto_select_date',
+        'censo_probe_arreglo_variable_date',
+        'censo_probe_subindice_date',
+        'censo_probe_values_cuerpo_date',
+        'censo_probe_values_dos_filas_date',
+        'censo_probe_ok_values_de_insert',
+        'censo_probe_ok_overriding_instante',
+        'censo_probe_between_date',
+        'censo_probe_between_reloj_izquierdo_date',
+        'censo_probe_between_superior_date',
+        'censo_probe_between_superior_columna_date',
+        'censo_probe_between_symmetric_date',
+        'censo_probe_insert_cte_select_date',
+        'censo_probe_insert_cte_values_date',
+        'censo_probe_insert_cte_columnas_date',
+        'censo_probe_insert_cte_dos_date',
+        'censo_probe_insert_cte_recursive_date',
+        'censo_probe_ok_insert_cte_instante',
+        'censo_probe_ok_insert_cte_reloj_dentro',
+        'censo_probe_ok_between_instante',
+        'censo_probe_tabla_unicode_date',
+        'censo_probe_ok_compara_columna_ambigua',
+        'censo_probe_ok_rowtype_instante',
+        'censo_probe_ok_using_instante',
+        'censo_probe_ok_into_dos_columnas',
+        'censo_probe_ok_insert_select_where',
+        'censo_probe_ok_set_fila_instante',
+        'censo_probe_ok_compara_igual',
+        'censo_probe_ok_conflicto_instante',
+        'censo_probe_ok_conflicto_otra_tabla',
+        'censo_probe_ok_insert_instante',
+        'censo_probe_ok_insert_huso_fijo',
+        'censo_probe_ok_decl_constant_instante',
+        'censo_probe_ok_decl_default_huso_fijo',
+        'censo_probe_ok_arreglo_huso_fijo',
+        'censo_probe_ok_huso_fijo_date',
+        'censo_probe_ok_subconsulta_date',
+      ]) {
+        // Sin la lista de argumentos: alguna sonda lleva parámetro y `()` no la nombraría.
+        await admin.unsafe(`drop function ${nombre}`);
+      }
+    }
+  }, PACIENCIA);
+
+  it('ninguna política RLS lo lee tampoco', async () => {
+    // Una política es el caso peor de todos: se evalúa ENTERA en la sesión de quien escribe,
+    // así que no hay ni siquiera un `SECURITY DEFINER` de por medio que confunda. Postgres la
+    // devuelve deparseada y en mayúsculas (`CURRENT_DATE`), de ahí la `i` de la expresión.
+    const politicas = await sqlAdmin()`
+      select tablename || ' / ' || policyname as nombre,
+             coalesce(qual, '') || ' ' || coalesce(with_check, '') as cuerpo
+      from pg_policies where schemaname = 'public' order by 1`;
+    expect(politicas.length).toBeGreaterThan(50);
+
+    const culpables = politicas
+      .filter((p) => culpable(p.cuerpo as string))
+      .map((p) => p.nombre as string)
+      .filter((n) => !(n in DECLARADAS));
+    expect(culpables).toEqual([]);
+  }, PACIENCIA);
+
+  it('ni una vista, ni un CHECK, ni un default, ni una vista MATERIALIZADA, ni una REGLA', async () => {
+    /*
+     * Los cuatro sitios que quedan donde una expresión se guarda y se vuelve a evaluar.
+     *
+     * Un CHECK es el más traicionero: se comprueba al escribir, así que fijaría la fila
+     * contra el calendario de quien la escribió y la dejaría incumpliendo su propia
+     * restricción. Y una vista MATERIALIZADA es peor todavía, porque no está en `pg_views`
+     * sino en `pg_matviews`: su valor se CALCULA con el huso de la sesión que ejecuta el
+     * `CREATE` o el `REFRESH`, y se queda ahí congelado — el calendario elegido por quien
+     * refrescó, servido después a todo el mundo como si fuera un hecho.
+     *
+     * Cada categoría se cuenta POR SEPARADO y no en un montón. La versión anterior las unía y
+     * exigía «más de 50 filas en total», y eso no comprobaba lo que parecía: medido contra
+     * esta base hay 485 constraints —de los cuales solo 141 son CHECK— frente a UNA vista y
+     * cero materializadas. Los constraints solos pasaban el listón, así que si la rama de
+     * vistas o la de defaults dejaba de devolver filas, el censo seguía en verde sin mirarlas.
+     * Es el mismo modo de fallo que ya me comió una vez en este fichero, con la frontera de
+     * palabra: verde porque no estaba buscando nada.
+     */
+    const admin = sqlAdmin();
+    // La sonda de vistas materializadas se crea ANTES de capturar las categorías y sale por el
+    // MISMO recorrido que protege, por lo mismo que la de cuerpos SQL estándar: una consulta
+    // aparte no protegería la del censo. Con cero matviews reales, es lo único que distingue
+    // «no hay ninguna» de «no estoy mirando».
+    await admin`create materialized view censo_tmp_matview as select current_date as d`;
+    // Y una culpable para la rama de triggers, por lo mismo: sin ella, la consulta podría
+    // dejar de devolver filas o mirar la columna equivocada y el mínimo seguiría cumpliéndose
+    // con los siete triggers reales, que están limpios.
+    await admin`create table censo_tmp_tabla (id int, f date)`;
+    await admin`create function censo_tmp_guard() returns trigger
+      language plpgsql as $$ begin return new; end $$`;
+    await admin`create trigger censo_tmp_trg before insert on censo_tmp_tabla
+      for each row when (new.f > current_date) execute function censo_tmp_guard()`;
+    /*
+     * Y el DEFAULT tipado, que es la otra mitad de la coerción implícita y la que ninguna sonda
+     * de texto puede enseñar: el catálogo guarda `now()` a secas en las dos columnas
+     * (comprobado con `pg_get_expr`), y lo que las separa es el TIPO. Medido insertando en las
+     * dos: la de `date` da 2026-09-05 en Pacific/Kiritimati y 2026-09-04 en Etc/GMT+12; la de
+     * `timestamptz` guarda el mismo instante. La segunda columna no es adorno: sin ella, una
+     * regla que marcara cualquier `default now()` pasaría esta sonda igual y estaría rompiendo
+     * el patrón correcto que usa medio esquema.
+     */
+    await admin`create table censo_tmp_defecto (d date default now(), t timestamptz default now())`;
+    // Y una REGLA de reescritura, por lo mismo que la matview: hoy no hay ninguna real
+    // (medido: cero), así que sin sonda su rama estaría en verde por no mirar nada.
+    /*
+     * El dominio va con su sonda por lo mismo que la matview y la regla: el esquema real no
+     * tiene ninguno hoy, así que cero es el conteo correcto y no prueba nada.
+     *
+     * Y la culpable lleva `now()` y no `current_date` a propósito: con `current_date` la caza
+     * cualquier reconocedor y la sonda no probaría que a esta rama se le pasa el TIPO BASE del
+     * dominio. Con `now()` sobre una base `date`, lo único que la hace culpable es ese tipo
+     * —medido: 2026-09-05 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12—, y su pareja
+     * segura es el mismo `now()` sobre una base con huso.
+     */
+    await admin`create domain censo_tmp_dominio as date default now()`;
+    await admin`create domain censo_tmp_dominio_ok as timestamptz default now()`;
+    await admin`create table censo_tmp_regla_log (d date)`;
+    await admin`create rule censo_tmp_regla as on insert to censo_tmp_tabla
+      do also insert into censo_tmp_regla_log values (current_date)`;
+    try {
+    const categorias = {
+      vista: await admin`select viewname as nombre, definition as cuerpo
+        from pg_views where schemaname = 'public'`,
+      // Solo `contype = 'c'`: una PK, una unique o una FK no pueden contener una expresión
+      // de reloj, así que contarlas era inflar el censo con filas que no prueban nada.
+      check: await admin`select conrelid::regclass || '/' || conname as nombre,
+             pg_get_constraintdef(c.oid) as cuerpo
+        from pg_constraint c join pg_namespace n on n.oid = c.connamespace
+        where n.nspname = 'public' and c.contype = 'c'`,
+      default: await admin`select a.attrelid::regclass || '.' || a.attname as nombre,
+             pg_get_expr(d.adbin, d.adrelid) as cuerpo,
+             -- Y aquí el tipo de la COLUMNA, por lo mismo: el catálogo guarda
+             -- default now() tal cual sobre una columna date (comprobado) y la
+             -- coerción la hace cada INSERT con el huso de quien inserta.
+             format_type(a.atttypid, a.atttypmod) as tipo
+        from pg_attribute a
+        join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+        join pg_class rel on rel.oid = a.attrelid
+        join pg_namespace n2 on n2.oid = rel.relnamespace
+        where n2.nspname = 'public'`,
+      /*
+       * Y el DEFAULT de un DOMINIO, que es el octavo sitio y no estaba: no vive en
+       * `pg_attrdef` sino en `pg_type.typdefaultbin`, y se vuelve a evaluar en cada `INSERT`
+       * que omita una columna de ese dominio sin default propio. Medido: un dominio sobre
+       * `date` con `default current_date` guarda 2026-09-05 en Pacific/Kiritimati y 2026-09-04
+       * en Etc/GMT+12.
+       *
+       * El tipo que decide es el BASE del dominio, no el dominio: es sobre él sobre el que
+       * Postgres coerciona.
+       */
+      dominio: await admin`select t.typname as nombre,
+             pg_get_expr(t.typdefaultbin, 0) as cuerpo,
+             format_type(t.typbasetype, t.typtypmod) as tipo
+        from pg_type t join pg_namespace n on n.oid = t.typnamespace
+        where n.nspname = 'public' and t.typtype = 'd' and t.typdefaultbin is not null`,
+      matview: await admin`select matviewname as nombre, definition as cuerpo
+        from pg_matviews where schemaname = 'public'`,
+      // La condición `WHEN` de un trigger no vive en el cuerpo de su función: vive en
+      // `pg_trigger.tgqual`, y decide SI el guard llega a ejecutarse. Se evalúa en la sesión
+      // de quien escribe, así que una condición calendárica ahí elige el día igual que una
+      // política — y ninguna de las otras cuatro categorías la miraba. Este repositorio ya
+      // usa siete condiciones `WHEN`, así que no es una categoría hipotética.
+      trigger: await admin`select t.tgname || ' on ' || t.tgrelid::regclass as nombre,
+             pg_get_triggerdef(t.oid) as cuerpo
+        from pg_trigger t
+        join pg_class c on c.oid = t.tgrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and not t.tgisinternal`,
+      // La SÉPTIMA, y la última que queda: una REGLA de reescritura. No es una vista —esas
+      // son la regla `_RETURN` de su propia relación, y ya se cuentan por `pg_views`— sino la
+      // forma legada de `CREATE RULE … DO ALSO`: una expresión guardada que se inserta DENTRO
+      // de la sentencia de quien escribe y se evalúa en su sesión, igual que una condición
+      // `WHEN`. Ninguna de las otras seis mira `pg_rewrite`, así que una regla calendárica
+      // pasaba entera. Medido: hoy este repositorio no tiene ninguna, y precisamente por eso
+      // entra — un censo cubre la clase, no los hallazgos.
+      regla: await admin`select c.relname || ' / ' || r.rulename as nombre,
+             pg_get_ruledef(r.oid) as cuerpo
+        from pg_rewrite r
+        join pg_class c on c.oid = r.ev_class
+        join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and r.rulename <> '_RETURN'`,
+    };
+
+    /* Lo que cada categoría tiene que estar mirando para que su verde signifique algo. */
+    const MINIMO: Record<keyof typeof categorias, number> = {
+      vista: 1,
+      check: 100,
+      default: 100,
+      trigger: 50,
+      // Uno: el que fabrica la sonda. Hoy no hay ninguna real, y por eso su rama se comprueba
+      // con ella en vez de con un conteo — cero es el conteo correcto y no prueba nada.
+      matview: 1,
+      regla: 1,
+      // Dos: el dominio de la sonda y su pareja segura. Tampoco hay ninguno real todavía.
+      dominio: 2,
+    };
+      for (const [nombre, filas] of Object.entries(categorias)) {
+        expect(filas.length, `la rama «${nombre}» no está mirando nada`).toBeGreaterThanOrEqual(
+          MINIMO[nombre as keyof typeof categorias],
+        );
+        const culpables = filas
+          .filter((o) => culpable(o!.cuerpo as string, 'sql', o!.tipo as string | undefined))
+          .map((o) => `${nombre} ${o!.nombre as string}`)
+          .filter((n) => !(n in DECLARADAS));
+        // La única culpable admitida es la sonda, y tiene que ESTAR: si la rama de matviews
+        // deja de devolver filas, desaparece de aquí y este caso se pone rojo.
+        // La única culpable admitida por categoría es su sonda, y tiene que ESTAR: si la
+        // rama deja de devolver filas o mira la columna equivocada, desaparece de aquí.
+        const esperadas: Record<string, string[]> = {
+          default: ['default censo_tmp_defecto.d'],
+          matview: ['matview censo_tmp_matview'],
+          trigger: ['trigger censo_tmp_trg on censo_tmp_tabla'],
+          regla: ['regla censo_tmp_tabla / censo_tmp_regla'],
+          dominio: ['dominio censo_tmp_dominio'],
+        };
+        expect(culpables).toEqual(esperadas[nombre] ?? []);
+      }
+    } finally {
+      await admin`drop materialized view censo_tmp_matview`;
+      await admin`drop table censo_tmp_tabla cascade`;
+      await admin`drop table censo_tmp_regla_log cascade`;
+      await admin`drop domain censo_tmp_dominio cascade`;
+      await admin`drop domain censo_tmp_dominio_ok cascade`;
+      await admin`drop table censo_tmp_defecto cascade`;
+      await admin`drop function censo_tmp_guard()`;
+    }
+  }, PACIENCIA);
+
+  it('toda expresión guardada que mezcle un reloj con algo sin huso está CERTIFICADA', async () => {
+    const admin = sqlAdmin();
+    /*
+     * Las sondas van ANTES de leer el catálogo y salen por el MISMO recorrido, como todas las
+     * de este fichero: una consulta aparte no protegería la del censo.
+     *
+     * La primera es la que da sentido a todo el cambio: entrega el instante por un camino que
+     * NINGÚN patrón de este fichero lee —un bucle `for` que deja el reloj en un registro, y la
+     * asignación a la variable `date` en la sentencia siguiente, con el registro de por
+     * medio—. El reconocedor de arriba la da por limpia, comprobado; la certificación no,
+     * porque no tiene con qué certificarla.
+     */
+    await admin.unsafe(`create function censo_cert_opaca() returns void language plpgsql as $c$
+      declare v_d date; r record;
+      begin for r in select now() as t loop v_d := r.t; end loop; end $c$`);
+    /*
+     * Y sus dos parejas seguras, que son las que impiden que la certificación se vuelva un
+     * «todo lo que mencione un reloj enrojece»: una envuelta en UTC y otra que sella una marca
+     * de tiempo sin tocar nada sin huso. Si el certificado se rompiera, saldrían aquí.
+     */
+    await admin.unsafe(`create function censo_cert_envuelta() returns date language plpgsql as $c$
+      declare v_d date;
+      begin v_d := timezone('UTC', now())::date; return v_d; end $c$`);
+    await admin`create table censo_cert_sello (id int, sellado_en timestamptz)`;
+    await admin.unsafe(`create function censo_cert_instante() returns void language plpgsql as $c$
+      begin update censo_cert_sello set sellado_en = now() where id = 1; end $c$`);
+    /*
+     * Y la sonda que prueba de dónde sale la obligación: DOS funciones con la MISMA forma,
+     * distinguidas solo por el tipo de la columna que tocan. Ninguna palabra del texto las
+     * separa —las dos dicen `now()` y las dos nombran una columna—, así que si la que toca la
+     * columna `date` sale sin certificar y la que toca la `timestamptz` no, es porque el
+     * conjunto de nombres viene del CATÁLOGO y no de este fichero. Es la misma prueba que la
+     * pareja de defaults tipados de la otra familia, y por la misma razón: una sonda de texto
+     * no puede sostener una regla que no lee el texto.
+     */
+    /*
+     * Y la sonda del INSTANTE INDIRECTO, que salió de una ronda de revisión sobre este mismo
+     * rework: una función con argumentos que devuelve un instante NO lo hereda de ellos
+     * —`censo_cert_momento(boolean)` devuelve `now()` y su argumento no pinta nada—, así que
+     * una segunda que la llame y devuelva `date` colapsa con el huso de quien llama. Con el
+     * conjunto de instantes limitado a las funciones NULARIAS, la segunda se certificaba como
+     * «sin instante»: el reconocedor no conoce ese nombre y el catálogo no lo incluía.
+     *
+     * Es la sonda que sostiene que el conjunto salga del catálogo ENTERO y no de la parte
+     * cómoda de él, y la única forma de que la comodidad de ayer no vuelva mañana.
+     */
+    await admin.unsafe(
+      'create function censo_cert_momento(boolean) returns timestamptz language sql as ' +
+        '$c$ select now() $c$',
+    );
+    await admin.unsafe(
+      'create function censo_cert_indirecta() returns date language sql as ' +
+        '$c$ select censo_cert_momento(true) $c$',
+    );
+    /*
+     * Y las dos sondas de la ronda catorce, que atacan la ENVOLTURA y el PARÁMETRO — las dos
+     * mitades por donde un instante entra sin que ningún nombre lo delate:
+     *
+     *   · `timezone('UTC', now() + interval '2 days')` parecía envuelto y no lo está: sumar
+     *     días a un instante YA depende del huso en un cambio de hora, y convertir después a
+     *     UTC no deshace esa diferencia — convierte un resultado que ya salió distinto.
+     *   · una función que RECIBE un instante y lo devuelve colapsado no nombra ningún reloj:
+     *     el instante entra por la firma, y su parámetro solo está en el catálogo.
+     */
+    await admin.unsafe(
+      'create function censo_cert_aritmetica() returns date language sql as ' +
+        "$c$ select timezone('UTC', now() + interval '2 days')::date $c$",
+    );
+    await admin.unsafe(
+      'create function censo_cert_recibido(p_instante timestamptz) returns date ' +
+        'language sql as $c$ select p_instante $c$',
+    );
+    /*
+     * Y el RELOJ DE PARED ENVUELTO, que tiene el aspecto exacto del arreglo canónico de este
+     * PR y es peor que el defecto que arregla: `timezone('UTC', localtimestamp)` no deshace
+     * nada, reinterpreta una hora local como si fuera UTC y la desplaza otra vez en el mismo
+     * sentido. Medido: 2026-09-06 en Pacific/Kiritimati contra 2026-09-04 en Etc/GMT+12 — DOS
+     * días, cuando el `current_date` desnudo del que va todo esto solo daba uno.
+     *
+     * La comprobación léxica ya lo prohíbe, así que en un árbol verde no llega a la
+     * certificación. Está aquí porque un guardián no puede apoyarse en otro: el día que aquél
+     * se rompa, éste no puede estar dándolo por bueno.
+     */
+    await admin.unsafe(
+      'create function censo_cert_pared_envuelta() returns date language sql as ' +
+        "$c$ select timezone('UTC', localtimestamp)::date $c$",
+    );
+    await admin`create table censo_cert_agenda (censo_cert_dia date, censo_cert_hito timestamptz)`;
+    await admin.unsafe(`create function censo_cert_por_nombre() returns void language plpgsql as $c$
+      begin insert into censo_cert_agenda (censo_cert_dia) select censo_cert_dia
+            from censo_cert_agenda where censo_cert_hito < now(); end $c$`);
+    await admin.unsafe(`create function censo_cert_por_nombre_ok() returns void language plpgsql as $c$
+      begin insert into censo_cert_agenda (censo_cert_hito) select censo_cert_hito
+            from censo_cert_agenda where censo_cert_hito < now(); end $c$`);
+    try {
+      /*
+       * 1. La clasificación de los built-ins, contra el catálogo. Es la inversión aplicada a
+       *    la propia lista: no se comprueba que la lista sea correcta —eso lo dicen las
+       *    medidas de su docblock— sino que sea COMPLETA, o sea que ningún built-in que acepte
+       *    un instante se haya quedado sin mirar.
+       *
+       *    Se exige la inclusión y no la igualdad, y por una razón medida: CI corre Postgres
+       *    15 y este contenedor el 16, y `date_add`/`date_subtract` solo existen desde el 16.
+       *    Con igualdad, el censo enrojecería en CI por la versión del motor en vez de por lo
+       *    que vigila. Al revés —un built-in nuevo sin clasificar— sí enrojece, que es la
+       *    dirección que importa. LÍMITE DECLARADO: una entrada que sobre no se nota.
+       */
+      const aceptan = await admin`
+        select distinct p.proname as nombre
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace,
+             unnest(p.proargtypes::oid[]) a(oid)
+        where n.nspname = 'pg_catalog'
+          and format_type(a.oid, null) = 'timestamp with time zone'`;
+      expect(aceptan.length).toBeGreaterThan(40);
+      expect(
+        aceptan.map((r) => r.nombre as string).filter((n) => !(n in ACEPTAN_INSTANTE)),
+      ).toEqual([]);
+
+      /*
+       * 2. Los NOMBRES que pueden mover un instante, del catálogo: toda columna, todo retorno,
+       *    todo parámetro y todo dominio cuyo tipo sea temporal y no sea un instante. Aquí es
+       *    donde esta comprobación deja de depender de lo que este fichero sepa leer: la lista
+       *    la escribe el esquema.
+       *
+       *    Sin agregados (`prokind = 'a'`): `max` y `sum` tienen una entrada que devuelve
+       *    `interval` y sus nombres son demasiado comunes, así que obligaban a declarar tres
+       *    guards que no tocan ningún intervalo. El tipo de un agregado lo pone su ENTRADA, y
+       *    esa entrada es una columna — que ya está en este conjunto si es de las que mueven.
+       */
+      const NOMBRES_QUE_MUEVEN = await nombresQueMuevenDelCatalogo();
+      const INSTANTES = await instantesDelCatalogo();
+      // El reconocedor de instantes tiene que estar mirando lo que el catálogo publica, y en
+      // concreto el reloj que la lista a mano se dejaba fuera. Sin esto, volver a una lista
+      // corta dejaría esta comprobación en verde sin mirar la mitad de las fuentes.
+      expect(INSTANTES.test('select pg_postmaster_start_time()')).toBe(true);
+      expect(INSTANTES.test('select 1')).toBe(false);
+      // Tiene que estar mirando algo, y en concreto la columna que fabrica la sonda: si esta
+      // consulta dejara de devolverla, la pareja de arriba se certificaría y el censo daría
+      // verde por no saber que existe una columna `date`.
+      expect(NOMBRES_QUE_MUEVEN.size).toBeGreaterThan(20);
+      expect(NOMBRES_QUE_MUEVEN.has('censo_cert_dia')).toBe(true);
+      expect(NOMBRES_QUE_MUEVEN.has('censo_cert_hito')).toBe(false);
+
+      /*
+       * 3. Las expresiones guardadas, los ocho sitios en una sola consulta y con su tipo de
+       *    DESTINO donde lo hay. Los ocho son los mismos que censa la familia de arriba, y
+       *    van juntos a propósito: la certificación no es una comprobación más al lado de las
+       *    otras sino la que decide, así que tiene que cubrir exactamente lo mismo.
+       */
+      const guardadas = await admin`
+        select 'funcion' as sitio, p.proname::text as objeto,
+               pg_get_functiondef(p.oid) as cuerpo, format_type(p.prorettype, null) as tipo
+          from pg_proc p
+          join pg_namespace n on n.oid = p.pronamespace
+          join pg_language l on l.oid = p.prolang
+         where n.nspname = 'public' and l.lanname not in ('internal', 'c')
+           and p.prokind in ('f', 'p')
+        union all
+        select 'default', c.relname || '.' || a.attname,
+               pg_get_expr(d.adbin, d.adrelid), format_type(a.atttypid, a.atttypmod)
+          from pg_attrdef d
+          join pg_class c on c.oid = d.adrelid
+          join pg_namespace n on n.oid = c.relnamespace
+          join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+         where n.nspname = 'public'
+        union all
+        select 'dominio', t.typname, pg_get_expr(t.typdefaultbin, 0),
+               format_type(t.typbasetype, t.typtypmod)
+          from pg_type t join pg_namespace n on n.oid = t.typnamespace
+         where n.nspname = 'public' and t.typtype = 'd' and t.typdefaultbin is not null
+        union all
+        select 'check', conrelid::regclass || '/' || conname, pg_get_constraintdef(c.oid), null
+          from pg_constraint c join pg_namespace n on n.oid = c.connamespace
+         where n.nspname = 'public' and c.contype = 'c'
+        union all
+        select 'politica', pol.polname || ' en ' || c.relname,
+               coalesce(pg_get_expr(pol.polqual, pol.polrelid), '') || ' ' ||
+               coalesce(pg_get_expr(pol.polwithcheck, pol.polrelid), ''), null
+          from pg_policy pol
+          join pg_class c on c.oid = pol.polrelid
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public'
+        union all
+        select case when c.relkind = 'm' then 'matview' else 'vista' end, c.relname,
+               pg_get_viewdef(c.oid), null
+          from pg_class c join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and c.relkind in ('v', 'm')
+        union all
+        select 'trigger', t.tgname || ' on ' || t.tgrelid::regclass, pg_get_triggerdef(t.oid), null
+          from pg_trigger t
+          join pg_class c on c.oid = t.tgrelid
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and not t.tgisinternal
+        union all
+        select 'regla', c.relname || ' / ' || r.rulename, pg_get_ruledef(r.oid), null
+          from pg_rewrite r
+          join pg_class c on c.oid = r.ev_class
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and r.rulename <> '_RETURN'`;
+      // Que esté mirando el esquema entero y no un trozo: la familia de arriba cuenta cada
+      // categoría por separado y aquí van juntas, así que el listón es el del conjunto.
+      expect(guardadas.length).toBeGreaterThan(500);
+      /*
+       * Y la premisa que hace que la sonda opaca signifique algo, COMPROBADA y no supuesta: el
+       * reconocedor de arriba la da por LIMPIA. Es toda la diferencia entre las dos mitades en
+       * una línea — si algún día llegara a reconocerla, esta sonda dejaría de probar que la
+       * certificación ve lo que él no ve, y habría que buscar otra que sí.
+       */
+      const opaca = guardadas.find((g) => g.objeto === 'censo_cert_opaca')!;
+      expect(culpable(opaca.cuerpo as string, 'sql', opaca.tipo as string)).toBe(false);
+
+      /*
+       * 4. El veredicto. Lo que no se certifica tiene que estar DECLARADO A MANO, y la
+       *    igualdad va en los dos sentidos: un objeto nuevo sin declarar enrojece, y una
+       *    declaración que sobra —porque el objeto se arregló o desapareció— también. Una
+       *    lista de excepciones que no caduca deja de ser una lista de excepciones.
+       */
+      const diagnostico: string[] = [];
+      const sinCertificar: string[] = [];
+      for (const g of guardadas) {
+        const v = certificar(
+          g.cuerpo as string,
+          (g.tipo as string | null) ?? undefined,
+          NOMBRES_QUE_MUEVEN,
+          INSTANTES,
+        );
+        if ('motivo' in v) {
+          sinCertificar.push(`${g.sitio as string} ${g.objeto as string}`);
+          diagnostico.push(`${g.sitio as string} ${g.objeto as string}: ${v.motivo}`);
+        }
+      }
+      expect(sinCertificar.sort(), diagnostico.join('\n')).toEqual(
+        [...Object.keys(CERTIFICADAS_A_MANO), ...SONDAS_SIN_CERTIFICAR].sort(),
+      );
+    } finally {
+      await admin`drop function censo_cert_opaca()`;
+      await admin`drop function censo_cert_envuelta()`;
+      await admin`drop function censo_cert_instante()`;
+      await admin`drop function censo_cert_por_nombre()`;
+      await admin`drop function censo_cert_indirecta()`;
+      await admin`drop function censo_cert_aritmetica()`;
+      await admin`drop function censo_cert_pared_envuelta()`;
+      await admin.unsafe('drop function censo_cert_recibido(timestamptz)');
+      await admin.unsafe('drop function censo_cert_momento(boolean)');
+      await admin`drop function censo_cert_por_nombre_ok()`;
+      await admin`drop table censo_cert_sello`;
+      await admin`drop table censo_cert_agenda`;
+    }
+  }, PACIENCIA);
+
+  it('ni el SQL de la aplicación, que es por donde volvió', async () => {
+    /*
+     * El censo del catálogo no alcanzaba al SQL que la aplicación escribe en sus plantillas,
+     * y por ahí volvió el defecto en cuanto se arregló la base: `snapshot_insert` pasó a
+     * juzgar con el calendario fijo mientras `contextoDeEntrada` y `seguimientoDeImpacto`
+     * seguían diagnosticando con `current_date`. En el borde del día la pantalla ofrecía una
+     * fecha que la política rechaza —con el error genérico de RLS— o escondía una que sí
+     * acepta, que es justo lo que el comentario de ese módulo dice que no puede pasar: «el
+     * espejo LEE la regla; no la reproduce».
+     *
+     * Se leen los ficheros del repositorio y no el catálogo, porque lo que se vigila es la
+     * plantilla, no un objeto de la base. Los tests quedan fuera: ahí `current_date` es
+     * legítimo para construir un caso.
+     */
+    const { readdir, readFile } = await import('node:fs/promises');
+    // Desde la RAÍZ del repositorio y no desde `src/`: hay TypeScript de producción fuera de
+    // `src/` —`serve.ts` es el entrypoint del servidor y ya lleva plantillas SQL—, y con el
+    // recorrido empezando en `src/` quedaba fuera del censo mientras el mínimo de ficheros se
+    // seguía cumpliendo de sobra. Un guardián que no mira el entrypoint no guarda la puerta.
+    const raiz = new URL('../../../', import.meta.url).pathname.replace(/\/$/, '');
+    /* Lo que se salta, con su motivo: dependencias y artefactos no son código de este
+     * repositorio, y en los tests `current_date` es legítimo para construir un caso. */
+    const FUERA = new Set(['node_modules', '.git', 'dist', 'build', '.output', '.vinxi',
+      '.nitro', 'coverage', '__tests__']);
+    const ficheros: string[] = [];
+    const recorrer = async (dir: string) => {
+      for (const e of await readdir(dir, { withFileTypes: true })) {
+        const ruta = `${dir}/${e.name}`;
+        if (e.isDirectory()) {
+          if (!FUERA.has(e.name)) await recorrer(ruta);
+        } else if (e.name.endsWith('.ts') || e.name.endsWith('.tsx')) ficheros.push(ruta);
+      }
+    };
+    await recorrer(raiz);
+    // Que el censo esté mirando algo, y no un directorio que alguien movió.
+    expect(ficheros.length).toBeGreaterThan(50);
+    // Y que alcance de verdad la raíz: `serve.ts` es el fichero que se le escapaba.
+    expect(ficheros.map((f) => f.slice(raiz.length + 1))).toContain('serve.ts');
+
+    /*
+     * LÍMITE DECLARADO, y medido antes de declararlo: aquí NO corre la certificación, solo el
+     * reconocedor. Lo intenté y el resultado fue una lista de once ficheros que no tenían
+     * nada — `Date.now()` de JavaScript casa con la palabra `now`, y devuelve milisegundos
+     * desde la época, que es lo más independiente del huso que hay. El vocabulario de la
+     * certificación es el de SQL: «tipo temporal sin huso», «columna del catálogo»,
+     * «built-in que colapsa». Trasplantarlo a TypeScript pediría un segundo modelo, el de
+     * JavaScript —`Date.now()` seguro, `toLocaleDateString()` no, `toISOString().slice(0,10)`
+     * tampoco—, y eso es otro trabajo, no una línea más de éste. Poner una lista de once
+     * excepciones para que el rojo se callara habría sido exactamente el vicio que este
+     * cambio viene a quitar.
+     *
+     * Lo que sostiene esta mitad mientras tanto: el recorrido lo hace el PARSER de TypeScript
+     * y no una expresión regular, así que visita todas las plantillas del repositorio sin
+     * adivinar dónde empieza ninguna. Y medido hoy, en todo el repositorio hay CUATRO
+     * menciones del reloj fuera de los tests, las cuatro dentro de comentarios que explican
+     * el arreglo: el SQL de la aplicación no lee ningún calendario.
+     */
+    const culpables: string[] = [];
+    for (const f of ficheros) {
+      // Sin comentarios: un `current_date` que EXPLICA por qué ya no se usa no es un
+      // hallazgo, y sin esto el censo se volvería contra quien documenta el arreglo.
+      const codigo = await readFile(f, 'utf8');
+      if (culpable(codigo, 'ts')) culpables.push(f.slice(raiz.length + 1));
+    }
+    expect(culpables.filter((c) => !(c in DECLARADAS))).toEqual([]);
+  }, PACIENCIA);
+
+  it('la ventana de medición no se alarga cambiando de huso', async () => {
+    /*
+     * El caso concreto, sobre la única de las cuatro que es una función PURA —sin filas de por
+     * medio, así que lo que falla o pasa es exactamente la comparación de fechas.
+     *
+     * Se construye sin depender de la hora a la que corra: el mundo abarca a la vez 26 horas
+     * de calendario (de UTC-12 a UTC+14), así que la fecha del huso más adelantado es SIEMPRE
+     * un día mayor que la del más atrasado. Con la ventana cerrando en la fecha del más
+     * atrasado, sin fijar el calendario la misma llamada respondía «abierta» o «cerrada»
+     * según lo que el llamante hubiera declarado un renglón antes.
+     */
+    const admin = sqlAdmin();
+    const [dias] = await admin`
+      select (timezone('Etc/GMT+12', now()))::date as temprana,
+             (timezone('Pacific/Kiritimati', now()))::date as tardia`;
+    const temprana = (dias!.temprana as Date).toISOString().slice(0, 10);
+    const tardia = (dias!.tardia as Date).toISOString().slice(0, 10);
+    // El supuesto sobre el que se apoya el caso, comprobado y no asumido.
+    expect(tardia > temprana).toBe(true);
+
+    const respuestas: Record<string, boolean> = {};
+    for (const huso of ['Etc/GMT+12', 'UTC', 'Pacific/Kiritimati']) {
+      respuestas[huso] = await admin.begin(async (tx) => {
+        await tx.unsafe(`set local time zone '${huso}'`);
+        const [r] = await tx`select ventana_de_medicion_abierta(${temprana}::date, 0) as v`;
+        return r!.v as boolean;
+      });
+    }
+    expect(respuestas['Etc/GMT+12']).toBe(respuestas['Pacific/Kiritimati']);
+    expect(respuestas['UTC']).toBe(respuestas['Pacific/Kiritimati']);
+    // Y con el calendario fijado en UTC la respuesta no es «cualquiera igual para todos»:
+    // es la que corresponde a la fecha de la base, que a esta altura ya pasó o es hoy.
+    const [hoy] = await admin`select (timezone('UTC', now()))::date as d`;
+    expect(respuestas['UTC']).toBe(temprana >= (hoy!.d as Date).toISOString().slice(0, 10));
+  }, PACIENCIA);
+});

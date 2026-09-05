@@ -7,7 +7,8 @@
  * persona va a revisar y puede cambiar, el día que quiere ver es el SUYO.
  *
  * Lo que NO se hace con esto es acotar lo que la base va a aceptar. Ahí el calendario que
- * manda es el de PostgreSQL —`snapshot_insert` juzga con `current_date` y no hay huso por
+ * manda es el de PostgreSQL —`snapshot_insert` juzga con `fecha_de_la_base()`, que fija UTC
+ * y no lee el huso de la sesión, y no hay huso por
  * petición—, así que un «hoy» calculado aquí sería un segundo calendario que discrepa del que
  * decide: la pantalla ofrecería un día que el servicio rechaza por futuro, o escondería uno
  * que sí acepta. Esos límites se PROYECTAN desde el servidor (`seguimiento.hoy`) y el espejo

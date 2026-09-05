@@ -128,7 +128,7 @@ async function presupuestoDeHoy(
   // null, que cae al respaldo. Una lectura ciega no se convierte en una autorización.
   const [fila] = await tx`select
       (select count(*) from llamada_ai
-        where workspace_id = ${workspaceId} and creado_en >= date_trunc('day', now())
+        where workspace_id = ${workspaceId} and creado_en >= inicio_del_dia_de_la_base()
           and resultado <> 'sin-respuesta'
           -- Una línea EN VUELO no se cuenta dos veces. Con el libro anticipado la fila nace
           -- antes de llamar, así que durante la llamada coexiste con la reserva que ya apartó

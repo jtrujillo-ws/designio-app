@@ -742,8 +742,8 @@ grant update (insight_id) on propuesta_ai to designio_app;
 create or replace function propuesta_ai_c2_citas_guard() returns trigger
 language plpgsql as $$
 declare
-  ajena text;
-  hallada boolean;
+  senalada text;
+  motivo text;
 begin
   if new.capacidad <> 'C2' then
     return new;
@@ -779,10 +779,43 @@ begin
     return new;
   end if;
 
-  -- `hallada` aparte del valor, por lo mismo que en el guard de CT: con `select … into ajena`
-  -- a secas, una cita sin `evidenciaId` la selecciona el `not exists` pero deja el valor en
-  -- null, y el `if` no dispararía — admitiendo justo lo que se rechaza.
-  select true, x into hallada, ajena
+  -- Dos motivos por los que una cita no puede nacer, y un solo barrido para los dos.
+  --
+  --  · AJENA: señala evidencia que no cuelga de los arquetipos de este reto. Es una regla de
+  --    PROVENIENCIA y no cambia nunca: lo que no es del reto no lo será mañana.
+  --
+  --  · NO CITABLE: el derecho de uso de esa evidencia ya no autoriza citarla al cliente
+  --    —se retiró, caducó o nunca se concedió—. Es una regla TEMPORAL, y por eso hay que
+  --    leerla aquí y no darla por leída antes: `PREPARAR.C2` solo enseña al modelo evidencia
+  --    usable y `REVALIDAR.C2` vuelve a comprobar el material entero antes de despachar, pero
+  --    entre el despacho y esta escritura pasa la llamada al proveedor, que es exactamente el
+  --    hueco que ningún candado puede cubrir. Sin esta lectura nacía una propuesta que
+  --    `materializarInsight` iba a rechazar SIEMPRE con DR001 al insertar la cita: quien
+  --    revisa se encontraba una tarjeta aceptable que no se deja aceptar, con un código de
+  --    error por toda explicación.
+  --
+  --    Es la misma regla que el suelo de CI —«el guard lee el registro VIGENTE, así que la
+  --    propuesta no llega a existir aunque el proveedor ya hubiera respondido»— escrita para
+  --    lo que C2 lee: allí es el consentimiento del item, aquí el derecho de uso de cada
+  --    evidencia citada.
+  --
+  -- El MOTIVO viaja con el hallazgo en vez de un booleano suelto, y hace además el trabajo
+  -- que hacía `hallada`: una cita sin `evidenciaId` la selecciona el `not exists` y deja el
+  -- valor en null, así que preguntar por el valor no dispararía — admitiendo justo lo que se
+  -- rechaza. `motivo` solo es null cuando no hubo fila.
+  select
+    coalesce(citas.x, '(sin evidenciaId)'),
+    case
+      when not exists (
+        select 1
+        from arquetipo a
+        join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+        where a.reto_id = new.reto_id and a.workspace_id = new.workspace_id
+          and ae.evidencia_id::text = lower(citas.x))
+      then 'ajena'
+      else 'no-citable'
+    end
+  into senalada, motivo
   from (
     select h->>'evidenciaId' as x
     from jsonb_path_query(
@@ -799,11 +832,18 @@ begin
     join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
     where a.reto_id = new.reto_id and a.workspace_id = new.workspace_id
       and ae.evidencia_id::text = lower(citas.x))
+     or not exists (
+    select 1 from evidencia e
+    where e.id::text = lower(citas.x) and e.workspace_id = new.workspace_id
+      and evidencia_usable(e.id, e.workspace_id, 'cliente'))
   limit 1;
-  if hallada then
+  if motivo = 'ajena' then
     raise exception
-      'una cita del insight señala evidencia que no es de este reto: %',
-      coalesce(ajena, '(sin evidenciaId)');
+      'una cita del insight señala evidencia que no es de este reto: %', senalada;
+  elsif motivo = 'no-citable' then
+    raise exception
+      'una cita del insight señala evidencia que ya no se puede citar al cliente (su derecho de uso se retiró, caducó o el documento ya no está): %. La propuesta se descarta; si el derecho vuelve, vuelve a pedirla.',
+      senalada;
   end if;
   return new;
 end $$;

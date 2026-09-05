@@ -6740,6 +6740,122 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Revocar los derechos MIENTRAS la llamada viaja: la respuesta llega, y ninguna propuesta nace.
+   *
+   * Es el hueco que ningún candado puede cubrir, y el suelo de CI ya lo dice con sus palabras:
+   * «el guard lee el registro VIGENTE, así que la propuesta no llega a existir aunque el
+   * proveedor ya hubiera respondido». C2 lee otra cosa —el derecho de uso de cada evidencia
+   * citada, no el consentimiento de un item—, y sin esa lectura nacía una propuesta que
+   * `materializarInsight` iba a rechazar SIEMPRE con DR001 al insertar la cita: una tarjeta
+   * aceptable que no se deja aceptar, con un código de error por toda explicación.
+   *
+   * Y la llamada QUEDA ANOTADA con su coste: el gasto ocurrido se registra aunque su salida se
+   * tire. Es la misma regla que en todo el slice, y lo que separa este caso del de arriba —el
+   * de la revocación ANTES de despachar, donde no hay línea porque no hubo despacho—.
+   */
+  it('revocar los derechos con la llamada en vuelo: la propuesta de C2 no llega a nacer', async () => {
+    await enWorkspaceLimpio('c2-derechos-tras-despachar', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia que se revoca en vuelo',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+
+      // El hueco con el material YA despachado: la línea del libro está abierta y los bytes
+      // en el aire. Lo que se promete no es deshacer el envío, es que de él no nazca nada.
+      proveedor.duranteLlamada = async () => {
+        await admin`update derecho_uso
+          set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+              decidido_por = ${curadorId}, decidido_en = now()
+          where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+      };
+      try {
+        await conProveedor(
+          {
+            ok: true,
+            datos: { insights: [CONTENIDO_C2(ev)] },
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+            ).rejects.toThrow(/ya no se puede citar al cliente/);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      const propuestas = await conUsuario(curadorId, (tx) => tx`
+        select 1 as x from propuesta_ai
+        where workspace_id = ${wsC} and reto_id = ${retoC}`);
+      expect(propuestas.length, 'nació una propuesta que aceptar fallaría siempre').toBe(0);
+      // Y la llamada, que se pagó, queda: registrar el gasto no depende de que el resultado
+      // llegue a usarse. Sin esta mitad, un rechazo ANTES de despachar pasaría igual.
+      const [tras] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(tras!.n).toBeGreaterThan(antes!.n);
+    });
+  });
+
+  /**
+   * Y si los derechos se caen DESPUÉS, el panel lo dice en vez de ofrecer lo imposible.
+   *
+   * El guard del insert cubre lo de antes de nacer; entre nacer y revisarse cabe la vida
+   * entera de un derecho de uso —se retira, caduca, el documento se va—. El estado del ancla
+   * de C2 era «archivado o disponible», así que la pantalla habilitaba aceptar y corregir, y
+   * aceptar falla SIEMPRE: `evidencia_citable_guard` rechaza la cita con DR001. Es el
+   * equivalente exacto del `consentimiento-revocado` de CI.
+   *
+   * Se comprueba de los dos lados: que el panel lo diga, y que aceptar de verdad falle. Sin lo
+   * segundo el estado sería una decoración; sin lo primero, quien revisa se lo encuentra a
+   * golpes.
+   */
+  it('una propuesta de C2 cuya evidencia dejó de ser citable se marca en el panel', async () => {
+    await enWorkspaceLimpio('c2-derechos-tras-nacer', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia que se revoca después',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+
+      // Recién nacida, la propuesta es aceptable: sin esto, el caso podría estar midiendo un
+      // fixture que nunca estuvo disponible.
+      const recien = await panelPropuestas(curadorId, wsC);
+      expect(recien.pendientes.find((x) => x.capacidad === 'C2')!.anclaEstado).toBe('disponible');
+
+      await admin`update derecho_uso
+        set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+            decidido_por = ${curadorId}, decidido_en = now()
+        where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      expect(p.anclaEstado, 'el panel ofrece aceptar algo que no se puede aceptar').toBe(
+        'evidencia-no-citable',
+      );
+      // Y no es una decoración: aceptar falla de verdad, que es lo que el estado anuncia.
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p.id }),
+      ).rejects.toThrow(/DR001|derecho/i);
+
+      // Y cuando el derecho vuelve, la propuesta vuelve a poder aceptarse sin tocar nada: el
+      // estado se calcula vivo, no se marca en la fila.
+      await admin`update derecho_uso
+        set estado = 'concedido', ambito = 'cliente', base = 'El participante lo autoriza de nuevo'
+        where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+      const vuelta = await panelPropuestas(curadorId, wsC);
+      expect(vuelta.pendientes.find((x) => x.capacidad === 'C2')!.anclaEstado).toBe('disponible');
+    });
+  });
+
+  /**
    * Y el evento de la aceptación dice QUÉ insight se creó.
    *
    * `jsonb_strip_nulls` se lleva `evidenciaId` y `criterioId` por nulos, así que sin

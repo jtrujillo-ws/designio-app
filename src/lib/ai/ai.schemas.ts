@@ -491,6 +491,7 @@ export const ESTADOS_ANCLA = [
   'gate-decidido',
   'checklist-avanzado',
   'reto-archivado',
+  'evidencia-no-citable',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

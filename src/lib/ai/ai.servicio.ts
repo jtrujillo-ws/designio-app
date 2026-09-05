@@ -637,6 +637,34 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      */
     estado: (tx) => tx`case
         when r.estado = 'archivado' then 'reto-archivado'
+        /*
+         * Y que la evidencia que el insight CITA siga pudiendo citarse al cliente.
+         *
+         * El derecho de uso es temporal: se retira, caduca, o el documento se va. Cuando eso
+         * pasa DESPUÉS de nacer la propuesta —el guard del insert cubre lo de antes—, el panel
+         * decía disponible y ofrecía aceptar, y aceptar falla siempre: materializarInsight
+         * inserta la cita y evidencia_citable_guard la rechaza con DR001. Quien revisa se
+         * encontraba una tarjeta aceptable que no se deja aceptar, con un código por toda
+         * explicación. Es el equivalente exacto del consentimiento-revocado de CI, con lo que
+         * C2 lee en vez de lo que lee CI.
+         *
+         * Se pregunta por la AUSENCIA de una evidencia usable y no por la presencia de una
+         * bloqueada: así el documento borrado —que también hace fallar la aceptación, por la
+         * FK— cae en la misma rama en vez de pasar por disponible.
+         *
+         * Y se compara por texto en vez de castear a uuid: el contenido es jsonb, y un
+         * evidenciaId que no parsee reventaría la consulta del panel entero en vez de marcar
+         * una fila. Mismo criterio que el estado de CT con su checklistItemId.
+         */
+        when exists (
+          select 1
+          from jsonb_path_query(
+                 p.contenido, '$.afirmaciones[*].citas[*].evidenciaId') c
+          where not exists (
+            select 1 from evidencia e
+            where e.id::text = lower(c #>> '{}') and e.workspace_id = p.workspace_id
+              and evidencia_usable(e.id, e.workspace_id, 'cliente')))
+          then 'evidencia-no-citable'
         else 'disponible'
       end`,
     material: (f) =>

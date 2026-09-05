@@ -9,10 +9,16 @@ import {
   MODELO_PRIMARIO,
   VENTANA_SALUD_PROVEEDOR_MS,
 } from '@/lib/ai/ai.degradacion';
-import { materialDeJourney, MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
+import {
+  criteriosQueLlegaronAlModelo,
+  materialDeJourney,
+  MAX_CRITERIOS_POR_LOTE,
+  PROMPT_VERSION,
+} from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   type ContenidoAsistenteGate,
+  type ContenidoEntradaKpi,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoInsight,
@@ -24,6 +30,7 @@ import { evidenciaQueLlegoAlModelo, MAX_MATERIAL } from '@/lib/ai/ai.prompts';
 import {
   aceptarPropuesta,
   ErrorAI,
+  huellaDelMaterialDelRegistry,
   generarPropuestas,
   panelPropuestas,
   proyeccionDelPanel,
@@ -44,6 +51,7 @@ import {
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
 import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
+import { borrarEntrada } from '@/lib/medicion/medicion.servicio';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -118,6 +126,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   let gateId = '';
   let requisitoIds: string[] = [];
   let evidenciaDelRetoId = '';
+  let registryId = '';
+  let criterioDelRegistryId = '';
 
   const MATERIAL = 'El 71% de los abandonos ocurre en la carga del documento de identidad.';
 
@@ -170,6 +180,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     citas: [{ fragmento: 'El journey está validado', localizacion: 'requisito 1' }],
   });
 
+  const CONTENIDO_C6 = (criterioId: string): ContenidoEntradaKpi => ({
+    criterioId,
+    nombre: 'Tasa de verificación completada en móvil',
+    definicion: 'Verificaciones completadas / verificaciones iniciadas, solo en app móvil',
+    fuente: 'Eventos de la app, tablero de onboarding',
+    dimensiones: 'canal, segmento',
+    frecuencia: 'mensual',
+    confianzaPropuesta: 'media',
+    citas: [{ fragmento: 'Tiempo de verificación', localizacion: 'KPI del criterio' }],
+  });
+
   /**
    * El contenido de prueba de cada capacidad, por su nombre.
    *
@@ -204,6 +225,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       citas: [{ fragmento: 'NODOS', localizacion: 'cabecera del grafo' }],
       confianzaPropuesta: 'baja',
     } satisfies ContenidoRemediacionJourney,
+    /* Igual que CT y C2: se resuelve tarde porque el criterio se crea en el `beforeAll`, y su
+     * id tiene que ser REAL — el guard exige que el criterio sea del reto del registry. */
+    get C6() {
+      return CONTENIDO_C6(criterioDelRegistryId);
+    },
   };
 
   /**
@@ -782,6 +808,23 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
       values (${ws}, ${evidenciaDelRetoId}, 'concedido', 'cliente',
               'Consentimiento del participante', ${leadId}, now(), ${leadId})`;
+
+    /*
+     * Y el ancla de C6: el contrato de medición del reto, en borrador, con un criterio real al
+     * que una entrada KPI pueda responder. El criterio tiene que existir de verdad porque el
+     * guard de la materialización exige que sea del reto DEL REGISTRY, y la cita se mide contra
+     * su texto.
+     */
+    const [crit] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Tiempo de verificación',
+              'Minutos medianos desde iniciar hasta completar la verificación',
+              'Bajar de 8 a 4 minutos', 90, 'Medir dos semanas antes del release', ${leadId})
+      returning id`;
+    criterioDelRegistryId = crit!.id as string;
+    const [mr] = await admin`insert into metric_registry (workspace_id, reto_id, creado_por)
+      values (${ws}, ${retoId}, ${leadId}) returning id`;
+    registryId = mr!.id as string;
     await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
       values (${ws}, ${arq!.id as string}, ${evidenciaDelRetoId})`;
   });
@@ -796,10 +839,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // Ver la nota de `enWorkspaceLimpio`: el sello va de la propuesta al insight y del
       // insight a la propuesta, así que se suelta antes de borrar ninguno de los dos.
       await admin`update insight set propuesta_ai_id = null where workspace_id = ${ws}`;
+      // Y lo mismo con la entrada KPI, que es el cuarto objeto sellado. El sello va en los dos
+      // sentidos —`propuesta_ai.entrada_kpi_id` y `entrada_kpi.propuesta_ai_id`—, así que hay
+      // que soltarlo antes de borrar cualquiera de los dos extremos.
+      await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where workspace_id = ${ws}`;
       await admin`delete from llamada_ai where workspace_id = ${ws}`;
       await admin`delete from consentimiento_item where workspace_id = ${ws}`;
       await admin`delete from item_importacion where workspace_id = ${ws}`;
+      // El contrato de medición, por delante de los criterios: `entrada_kpi` referencia a los
+      // dos, y el registry al reto.
+      await admin`delete from entrada_kpi where workspace_id = ${ws}`;
+      await admin`delete from metric_registry where workspace_id = ${ws}`;
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
       await admin`delete from cita where workspace_id = ${ws}`;
       await admin`delete from contradiccion where workspace_id = ${ws}`;
@@ -5296,6 +5347,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                        -- ninguna; nulo la deja inerte, que es la respuesta correcta para una
                        -- fila sintética que no representa a ninguna propuesta.
                        null::uuid[] as alcance_evidencia,
+            null::uuid as entrada_kpi_id,
                        ${ws}::uuid as workspace_id) p
           ${proyeccion.joins}`;
         return (f!.estado as string | null) ?? null;
@@ -7940,6 +7992,68 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   }, 20000);
 
   /**
+   * Y el archivado en vuelo también ordena una propuesta de C6, cuyo reto vive DETRÁS del
+   * registry.
+   *
+   * `propuesta_ai_un_ancla` deja `reto_id` nulo cuando el ancla es el registry, así que el
+   * guard del INSERT preguntaba por una columna vacía y se saltaba el candado entero: ni la
+   * clave de aviso del reto, ni el `for share` sobre su fila. Y el estado del reto sí decide
+   * aquí, porque `registry_admite_entradas` lo mira por dentro. Medido contra la base: con un
+   * archivado en vuelo la propuesta de C6 NACE —no espera a nadie— y queda en el panel
+   * imposible de aceptar, con la llamada ya pagada. Es exactamente lo que las dos sondas de
+   * arriba impiden para el ancla que sí es un reto.
+   *
+   * El reto se resuelve por `metric_registry.reto_id`, que es la relación de verdad; copiarlo
+   * en la propuesta sería un segundo sitio donde puede decir otra cosa.
+   */
+  it('el archivado en vuelo también ordena una propuesta de C6, anclada en el registry', async () => {
+    await enWorkspaceLimpio('c6-archivado-al-persistir', async ({ ws: wsE, curadorId, retoId: retoE }) => {
+      const admin = sqlAdmin();
+      const [crit] = await admin`insert into criterio_exito
+        (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan,
+         creado_por)
+        values (${wsE}, ${retoE}, 'KPI', 'Definición', 'Objetivo', 30, 'Plan', ${curadorId})
+        returning id`;
+      const [mr] = await admin`insert into metric_registry (workspace_id, reto_id, creado_por)
+        values (${wsE}, ${retoE}, ${curadorId}) returning id`;
+      const registryE = mr!.id as string;
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, registry_id, modelo, origen_key, resultado, creado_por)
+        values (${wsE}, 'C6', ${registryE}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const contenido = CONTENIDO_C6(crit!.id as string);
+
+      const archivado = await candadoEnVuelo((tx) => tx`update reto set estado = 'archivado'
+          where id = ${retoE} and workspace_id = ${wsE}`);
+
+      const persistencia = conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, registry_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           llamada_id, creado_por)
+        values (${wsE}, 'C6', 'entrada-kpi', ${registryE}, ${tx.json(contenido as never)},
+                ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})`);
+      const veredicto = persistencia.then(
+        () => 'nació',
+        (e: Error) => `rechazó: ${e.message}`,
+      );
+
+      await archivado.esperaAQueAlguienEspere();
+      archivado.soltar();
+      await archivado.terminado;
+
+      expect(
+        await veredicto,
+        'nació una propuesta de C6 sobre un reto que se estaba archivando',
+      ).toMatch(/archivado/);
+      const filas = await admin`select 1 from propuesta_ai
+        where workspace_id = ${wsE} and capacidad = 'C6'`;
+      expect(filas.length).toBe(0);
+    });
+  }, 20000);
+
+  /**
    * Y el ORDEN de los dos candados, leído del catálogo.
    *
    * Que el reto se bloquee en algún sitio no basta: donde el conjunto de `derecho_uso` que se
@@ -10546,4 +10660,492 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await expect(escribir('una huella cualquiera')).resolves.toBeDefined();
     });
   });
+
+  /**
+   * C6 — el borrador del Metric Registry, propuesto contra los criterios que promete medir.
+   *
+   * Cinco puertas, y cada una es una regla que la capacidad no comparte con sus hermanas:
+   * dónde cuelga, contra qué se mide una cita, qué exige materializar, qué la deja obsoleta y
+   * qué NO propone.
+   */
+  /**
+   * La huella REAL del material de un registry, escrita sobre una propuesta del fixture.
+   *
+   * `nuevaPropuesta` escribe `'huella-del-material'` a propósito —componer el material a mano
+   * sería fijar en el fixture el prompt que se está probando—, y eso valía mientras la huella
+   * solo apagara el verde de la presencia literal. Desde que además BLOQUEA la aceptación de
+   * C6, una propuesta con huella falsa no se puede aceptar y las sondas del pipeline medirían
+   * el bloqueo en vez de lo suyo.
+   *
+   * Se compone llamando a la MISMA función que usa el servicio, no copiándola: lo que el
+   * fixture no puede hacer es inventarse el texto, y esto no se lo inventa.
+   */
+  const conHuellaReal = async (propuestaId: string) => {
+    const { huella } = await conUsuario(leadId, (tx) =>
+      huellaDelMaterialDelRegistry(tx, ws, registryId),
+    );
+    await sqlAdmin()`update propuesta_ai set huella_material = ${huella}
+      where id = ${propuestaId}`;
+    return propuestaId;
+  };
+
+  it('C6: la entrada del registry nace del criterio que cita, y se sella con su procedencia', async () => {
+    const admin = sqlAdmin();
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+    );
+
+    // 1. El ANCLA es el registry, no el reto: la fila cuelga de la columna que su capacidad
+    //    declara, y de ninguna otra. Es lo que `propuesta_ai_un_ancla` impone y lo que el
+    //    insert generado desde `COLUMNAS_DE_ANCLA` escribe sin que nadie lo enumere.
+    const [fila] = await admin`select registry_id, reto_id, item_id, gate_id, journey_id, destino
+      from propuesta_ai where id = ${propuestaId}`;
+    expect(fila!.registry_id).toBe(registryId);
+    expect([fila!.reto_id, fila!.item_id, fila!.gate_id, fila!.journey_id]).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+    expect(fila!.destino).toBe('entrada-kpi');
+
+    // 2. Aceptarla crea la entrada, con los seis campos copiados TAL CUAL y los demás
+    //    vacíos: el dueño del dato, la línea base y la ventana no los propone la AI.
+    const r = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [entrada] = await admin`select * from entrada_kpi where id = ${r.objetoId}`;
+    expect(entrada!.registry_id).toBe(registryId);
+    expect(entrada!.criterio_id).toBe(criterioDelRegistryId);
+    expect(entrada!.nombre).toBe('Tasa de verificación completada en móvil');
+    expect(entrada!.frecuencia).toBe('mensual');
+    expect(
+      [
+        entrada!.propietario_miembro_id,
+        entrada!.linea_base_valor,
+        entrada!.linea_base_fecha,
+        entrada!.ventana_inicio,
+        entrada!.fecha_post_mortem,
+      ],
+      'la AI rellenó un compromiso que nadie adquirió',
+    ).toEqual([null, null, null, null, null]);
+    // 3. Y el SELLO de procedencia, que es la mitad permanente de SYS-19: de qué propuesta
+    //    salió esta fila. Lo escribe el guard, no la aplicación — la columna no está en el
+    //    grant.
+    expect(entrada!.propuesta_ai_id).toBe(propuestaId);
+    const [sellada] = await admin`select estado, entrada_kpi_id from propuesta_ai
+      where id = ${propuestaId}`;
+    expect(sellada!.estado).toBe('aceptada');
+    expect(sellada!.entrada_kpi_id).toBe(r.objetoId);
+  });
+
+  /**
+   * Y el criterio al que responde una entrada NO se corrige.
+   *
+   * Aquí hubo una contradicción mía: `TESTIMONIO_ADICIONAL.C6` decía `null` —«elegir el
+   * criterio equivocado es el error que más se corrige»— y a la vez `CITAS_DEL_CONTENIDO.C6`
+   * deriva de ese campo el `alcanceId` de cada cita, que la comparación de la corrección SÍ
+   * compara. Las dos reglas decían cosas opuestas y la que ganaba lo hacía por accidente, con
+   * el mensaje equivocado: «las citas no se corrigen» sobre una corrección que no las tocaba.
+   *
+   * Gana el blindaje, y no por resolver el empate hacia el lado estricto: los fragmentos se
+   * copiaron de UN criterio, y reapuntarlos a otro conservándolos es quedarse con el sostén de
+   * A para afirmar sobre B. Es lo mismo que C2 hace con el `evidenciaId` de sus citas.
+   */
+  it('C6: el criterio de una entrada no se reapunta al corregir, y el resto sí', async () => {
+    const admin = sqlAdmin();
+    // Un segundo criterio REAL del mismo reto: el destino al que un revisor querría reapuntar.
+    const [otro] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Otro criterio', 'Definición', 'Objetivo', 30, 'Plan', ${leadId})
+      returning id`;
+    // Con nombre propio: `unique (registry_id, nombre)` es real, y el caso de arriba ya dejó
+    // materializada una entrada con el del fixture. Compartir registry entre casos es lo que
+    // hace que esa colisión sea una conducta de verdad y no una molestia del arnés.
+    const inicial = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en escritorio',
+    };
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido: inicial,
+      }),
+    );
+
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...inicial, criterioId: otro!.id as string },
+      }),
+    ).rejects.toThrow(/no se corrige/i);
+
+    // Y lo que SÍ es redacción se corrige, que es la otra mitad: sin ella, este caso pasaría
+    // igual con la corrección entera tapiada.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: { ...inicial, definicion: 'Verificaciones completas / iniciadas, en móvil' },
+    });
+    expect(r.estado).toBe('corregida');
+    const [entrada] = await admin`select definicion, criterio_id from entrada_kpi
+      where id = ${r.objetoId}`;
+    expect(entrada!.definicion).toBe('Verificaciones completas / iniciadas, en móvil');
+    expect(entrada!.criterio_id).toBe(criterioDelRegistryId);
+
+    // Y el evento de la revisión NOMBRA el objeto creado. La lista de columnas del payload se
+    // quedó corta cuando llegó C2 y se volvió a quedar corta con esta: `jsonb_strip_nulls` se
+    // lleva las nulas, así que un objeto sin su clave es un registro que no documenta nada.
+    const [evento] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'PropuestaAICorregida'
+        and payload->>'propuestaId' = ${propuestaId}`;
+    expect((evento!.payload as Record<string, unknown>).entradaKpiId).toBe(r.objetoId);
+
+    // Y el SELLO no es una edición. La aceptación inserta la entrada —`EntradaKpiAgregada`,
+    // correcto— y el guard diferido le escribe después su `propuesta_ai_id`, que dispara la
+    // rama de UPDATE del mismo trigger de auditoría. Medido antes de arreglarlo: cada
+    // aceptación de C6 dejaba un `EntradaKpiEditada` con el «antes» idéntico al «después», o
+    // sea una edición que nadie hizo, en la única tabla cuyo rastro sirve para decir quién
+    // movió el contrato de medición.
+    const rastro = await admin`select tipo from evento_dominio
+      where workspace_id = ${ws} and payload->>'entradaId' = ${r.objetoId}
+      order by creado_en`;
+    expect(
+      rastro.map((f) => f.tipo),
+      'el sello de procedencia se apuntó como una edición del contrato',
+    ).toEqual(['EntradaKpiAgregada']);
+  });
+
+  /**
+   * Y una entrada no puede responder a un criterio que el modelo no llegó a ver ENTERO.
+   *
+   * El cuerpo es la formulación del reto más todos los criterios, y se recorta ENTERO a
+   * `MAX_MATERIAL`: con una descripción larga por delante, la cola se queda fuera —el criterio
+   * donde cae el corte, a medias; los siguientes, del todo—. Un `criterioId` de uno de ésos
+   * pasa el suelo de la base —el criterio ES del reto del registry, y eso sigue siendo cierto—
+   * y sin embargo el KPI no pudo leer la promesa que dice medir.
+   *
+   * Se mide sobre la función que lo decide y sobre las dos puertas que la consumen.
+   */
+  it('C6: el recorte del material decide qué criterios se pueden responder', async () => {
+    const largo = 'x'.repeat(MAX_MATERIAL);
+    const conRecorte = {
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: largo,
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-00000000000a',
+          kpi: 'K',
+          definicion: 'D',
+          objetivo: 'O',
+          ventanaDias: 30,
+          lineaBasePlan: 'P',
+        },
+      ],
+    };
+    // Con la descripción ocupando el presupuesto entero, NINGÚN criterio llega: la lista de
+    // los que se pueden responder está vacía y el conteo de los que se quedaron fuera es 1.
+    const recortado = criteriosQueLlegaronAlModelo(conRecorte);
+    expect(recortado.ids).toEqual([]);
+    expect(recortado.fuera).toBe(1);
+    // Y sin recorte llegan enteros, que es la otra mitad: sin ella, una función que devolviera
+    // siempre la lista vacía pasaría igual.
+    const llano = criteriosQueLlegaronAlModelo({ ...conRecorte, descripcion: 'D' });
+    expect(llano.ids).toEqual(['c3d4e5f6-0000-4000-8000-00000000000a']);
+    expect(llano.fuera).toBe(0);
+  });
+
+  /**
+   * Y el registry FIRMADO cierra la puerta en los dos momentos que importan: al proponer y al
+   * aceptar. Son dos escrituras distintas y entre ellas cabe la firma entera, que es el acto
+   * de G6 — una entrada colada en un contrato ya firmado es un KPI que nadie acordó dentro de
+   * lo que sí se acordó.
+   */
+  it('C6: un registry firmado no admite propuestas nuevas ni deja aceptar las pendientes', async () => {
+    const admin = sqlAdmin();
+    // Una propuesta que nace ANTES de la firma, para medir la segunda mitad.
+    const pendiente = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+    });
+
+    await admin`update metric_registry set estado = 'firmado', firmado_por = ${leadId},
+      firmado_en = now() where id = ${registryId}`;
+    try {
+      // Al PROPONER: el guard del insert lo rechaza aunque la fila venga por SQL directo.
+      await expect(
+        nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+      ).rejects.toThrow(/ya no admite entradas/);
+
+      // Y al ACEPTAR: la propuesta que ya existía queda obsoleta y solo se puede rechazar.
+      await expect(
+        aceptarPropuesta(leadId, { workspaceId: ws, propuestaId: pendiente }),
+      ).rejects.toThrow(/ya no admite entradas/);
+
+      // Rechazar SÍ sigue abierto: bloquear también esa salida dejaría la fila muerta y su
+      // ancla retenida para siempre.
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: pendiente });
+      const [tras] = await admin`select estado from propuesta_ai where id = ${pendiente}`;
+      expect(tras!.estado).toBe('rechazada');
+    } finally {
+      await admin`update metric_registry set estado = 'borrador', firmado_por = null,
+        firmado_en = null where id = ${registryId}`;
+    }
+  });
+
+  /**
+   * Y la entrada que salió de una propuesta SIGUE pudiendo quitarse del borrador.
+   *
+   * `entrada_kpi` es el primero de los cuatro destinos cuyo objeto tiene un camino de BORRADO
+   * en el producto: `borrarEntrada` existe porque una entrada que sobra —o que se pactó y
+   * después no— bloquearía la firma del contrato, y firmar es lo que hace G6. Los otros tres
+   * no se borran nunca, así que el enlace del sello nunca había chocado con nada.
+   *
+   * Con el sello puesto sí choca, y hacia el lado peor: la salida que existe para no bloquear
+   * la firma se cierra JUSTO para las entradas que propuso la AI, y el mensaje que llega es una
+   * violación de clave ajena. La forma de la regla queda dicha por sus dos mitades: la entrada
+   * se va, y la propuesta se queda —aceptada, con su rastro—.
+   */
+  it('C6: una entrada del registry se puede quitar del borrador aunque la haya propuesto la AI', async () => {
+    const admin = sqlAdmin();
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+    );
+    // Con nombre propio: el registry del fixture es uno solo —`metric_registry` es único por
+    // reto— y `unique (registry_id, nombre)` no admite dos entradas iguales.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: {
+        ...CONTENIDO_C6(criterioDelRegistryId),
+        nombre: 'Tasa de verificación completada en tableta',
+      },
+    });
+
+    await borrarEntrada(leadId, { workspaceId: ws, entradaId: r.objetoId });
+    const quedan = await admin`select id from entrada_kpi where id = ${r.objetoId}`;
+    expect(quedan.length, 'la salida que existe para no bloquear la firma').toBe(0);
+
+    // Y la propuesta se queda: quitar la entrada no borra que se aceptó, ni quién la aceptó.
+    // El puntero se va con el objeto —no queda a qué apuntar—, y el hecho vive donde tiene que
+    // vivir: en el evento, que es append-only y sí conserva el id.
+    const [tras] = await admin`select estado, revisada_por, entrada_kpi_id from propuesta_ai
+      where id = ${propuestaId}`;
+    expect(tras!.estado).toBe('corregida');
+    expect(tras!.revisada_por).toBe(leadId);
+    expect(tras!.entrada_kpi_id).toBeNull();
+    const [evento] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'PropuestaAICorregida'
+        and payload->>'propuestaId' = ${propuestaId}`;
+    expect(
+      (evento!.payload as Record<string, unknown>).entradaKpiId,
+      'el rastro de qué objeto creó esta propuesta no se borra con el objeto',
+    ).toBe(r.objetoId);
+  });
+
+  /**
+   * Y el criterio tampoco se reapunta por SQL DIRECTO, que es donde la regla tenía que estar.
+   *
+   * La ronda anterior blindó `criterioId` en `TESTIMONIO_ADICIONAL.C6` y eso cierra el
+   * formulario. Pero el guard de la base comparaba contra `contenido_original` solo las citas
+   * de primer nivel y la confianza, y `criterioId` no es ninguna de las dos: por la superficie
+   * SQL concedida, una «corrección» podía reapuntar la entrada a otro criterio CONSERVANDO las
+   * citas, y el resto del suelo no lo veía —el criterio nuevo es del reto del registry, y la
+   * proyección compara contra `contenido`, que es el ya corregido—. La entrada quedaba sellada
+   * respondiendo a una promesa cuyos fragmentos nunca se leyeron.
+   *
+   * La comparación se añade SIN condicionar al destino, como la de las citas y por lo mismo:
+   * para las capacidades cuyo contenido no lleva `criterioId` los dos lados son nulos y la
+   * regla no dice nada, así que atarla a C6 solo la dejaría corta ante la siguiente.
+   */
+  it('C6: reapuntar el criterio por SQL directo tampoco sella la entrada', async () => {
+    const admin = sqlAdmin();
+    const [otro] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Criterio de al lado', 'Definición', 'Objetivo', 30, 'Plan',
+              ${leadId}) returning id`;
+    const otroId = otro!.id as string;
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+    });
+    // El contenido con el criterio cambiado y las citas INTACTAS: es la forma que el guard de
+    // las citas no ve, porque no toca ninguna cita.
+    const corregido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      criterioId: otroId,
+      nombre: 'Tasa de verificación completada en quiosco',
+    };
+
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [entrada] = await tx`insert into entrada_kpi
+          (workspace_id, registry_id, criterio_id, nombre, definicion, fuente, dimensiones,
+           frecuencia, dashboard_url, creado_por)
+          values (${ws}, ${registryId}, ${otroId}, ${corregido.nombre}, ${corregido.definicion},
+                  ${corregido.fuente}, ${corregido.dimensiones}, ${corregido.frecuencia}, '',
+                  ${leadId}) returning id`;
+        await tx`update propuesta_ai
+          set estado = 'corregida', revisada_por = ${leadId},
+              contenido = ${tx.json(corregido)}::jsonb,
+              entrada_kpi_id = ${entrada!.id as string}
+          where id = ${propuestaId} and workspace_id = ${ws}`;
+      }),
+    ).rejects.toThrow(/no se corrige|no se reapunta/i);
+
+    // Y la propuesta sigue pendiente: la transacción entera se fue, entrada incluida.
+    const [tras] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(tras!.estado).toBe('propuesta');
+    const restos = await admin`select id from entrada_kpi
+      where registry_id = ${registryId} and criterio_id = ${otroId}`;
+    expect(restos.length).toBe(0);
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+  });
+
+  /**
+   * Y un criterio que se MUEVE después de la llamada cierra la aceptación.
+   *
+   * La huella del material se guardaba y solo la leía el panel, para apagar el verde de la
+   * presencia literal. Pero un registry en borrador se abre ANTES de G0, y hasta G0 los
+   * criterios se editan: entre generar el lote y revisarlo, `editarCriterio` puede cambiar la
+   * definición, el objetivo o la ventana del criterio al que la entrada responde. Medido: la
+   * propuesta seguía `disponible` y la aceptación materializaba el KPI — un contrato de
+   * medición, permanente y atado a ese criterio, escrito contra una promesa que ya no existe.
+   *
+   * Se cierra en los DOS sitios donde se puede: el panel lo dice con su motivo, y el
+   * materializador lo rechaza. En la base no tiene suelo, y eso va escrito en la tabla de
+   * precondiciones: el material es el texto ya compuesto y recortado, así que no hay SQL que
+   * lo recalcule. Por eso no basta con el panel — un aviso de pantalla lo salta cualquier
+   * cliente que hable con la server function.
+   */
+  it('C6: si los criterios se mueven después de la llamada, la entrada ya no se acepta', async () => {
+    const admin = sqlAdmin();
+    // Nombre propio, como las demás: el registry del fixture es uno solo y los casos de
+    // arriba ya dejaron entradas materializadas dentro.
+    const contenido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en tótem',
+    };
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido,
+      }),
+    );
+    // Con el material intacto, la propuesta está disponible: sin esta mitad, un panel que
+    // dijera siempre «cambiado» pasaría igual.
+    const antes = (await panelPropuestas(leadId, ws)).pendientes.find((x) => x.id === propuestaId);
+    expect(antes!.anclaEstado).toBe('disponible');
+
+    // El criterio se mueve. Es el acto legítimo que abre el hueco: hasta G0 se editan, y el
+    // registry en borrador existe antes de G0.
+    await admin`update criterio_exito set objetivo = 'Bajar de 8 a 3 minutos'
+      where id = ${criterioDelRegistryId}`;
+
+    const tras = (await panelPropuestas(leadId, ws)).pendientes.find((x) => x.id === propuestaId);
+    expect(tras!.anclaEstado, 'el panel seguía diciendo disponible').toBe('criterios-cambiados');
+    // Y el verde de la presencia literal se apaga: contra un material que el modelo no leyó,
+    // «aparece» o «no aparece» son las dos respuestas equivocadas.
+    expect(tras!.citas.map((c) => c.presenteLiteral)).toEqual(tras!.citas.map(() => null));
+    await expect(
+      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
+    ).rejects.toThrow(/cambiaron después de que el modelo los leyera/);
+    // Y corregir el texto tampoco la salva: lo que se movió está fuera de la propuesta.
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...contenido, definicion: 'Otra definición del mismo KPI' },
+      }),
+    ).rejects.toThrow(/cambiaron después de que el modelo los leyera/);
+
+    // RECHAZAR sigue abierto, que es la asimetría que sostiene la tabla entera: si el bloqueo
+    // alcanzara al rechazo, la fila quedaría muerta reteniendo su ancla.
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [fin] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(fin!.estado).toBe('rechazada');
+  });
+
+  /**
+   * Y un despliegue del PROMPT no apaga la comprobación: la deja en «no se sabe», y eso no
+   * es permiso.
+   *
+   * La huella es del texto YA COMPUESTO, así que un cambio del renderizador la mueve sin que
+   * nadie haya tocado un criterio; por eso la comparación se hace solo contra el mismo
+   * `prompt_version`. Pero «no se puede comparar» no puede resolverse aceptando: una propuesta
+   * de C6 que sobreviva a un despliegue quedaba sin ninguna comprobación del material, y a
+   * partir de ahí editar el criterio y aceptar volvía a materializar un KPI contra una promesa
+   * distinta — el mismo daño de la ronda anterior, por la puerta que abrió su mitigación.
+   *
+   * El MISMO desconocimiento se resuelve de tres formas distintas, y las tres están dichas
+   * donde toca: en la presencia literal no puede volverse un veredicto (verde ni rojo), en el
+   * estado de la fila de C5 no puede volverse una alarma —C5 no materializa nada—, y aquí no
+   * puede volverse un permiso, porque lo que se firma es un contrato de medición permanente.
+   *
+   * Y el panel lo dice con su propio motivo: `criterios-cambiados` afirma que se movieron, y
+   * eso aquí sería inventarse una alarma. La salida es la misma —rechazar y pedir otro lote—,
+   * pero el motivo que se enseña tiene que ser el que ocurrió.
+   */
+  it('C6: una propuesta de otro render del prompt no se acepta, y el panel dice por qué', async () => {
+    const admin = sqlAdmin();
+    const contenido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en caja',
+    };
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido,
+      }),
+    );
+    // El despliegue: la fila se queda con la versión con la que nació y el código avanza. Se
+    // simula moviendo la de la FILA, que es lo mismo visto desde la comparación.
+    await admin`update propuesta_ai set prompt_version = 'ai-2000-01-01.1'
+      where id = ${propuestaId}`;
+
+    const enPanel = (await panelPropuestas(leadId, ws)).pendientes.find(
+      (x) => x.id === propuestaId,
+    );
+    expect(enPanel!.anclaEstado).toBe('material-no-comparable');
+    await expect(
+      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
+    ).rejects.toThrow(/no se puede comprobar/i);
+
+    // Y rechazar sigue abierto, como en todas las filas de la tabla de precondiciones.
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [fin] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(fin!.estado).toBe('rechazada');
+  });
+
+  /**
+   * Y la entrada materializada tiene que haber NACIDO en esa aceptación.
+   *
+   * `xmin` dice «esta transacción escribió esta versión de la fila» y no distingue insertar de
+   * actualizar, así que una entrada vieja EDITADA aquí pasaría como recién nacida — y con ella
+   * quedaría atribuido a la AI un KPI escrito a mano. El insight cerró ese hueco con «y sigue
+   * propuesto»; `entrada_kpi` no tiene estado con el que decirlo, así que lo dice su fecha:
+   * `creado_en` la pone la base y está fuera del grant, de modo que ningún UPDATE concedido la
+   * mueve.
+   *
+   * Se mide por lo que de verdad lo sostiene: que la columna NO se pueda escribir.
+   */
+  it('C6: `creado_en` de una entrada KPI no está al alcance del rol de aplicación', async () => {
+    const admin = sqlAdmin();
+    const [grant] = await admin`select bool_or(privilege_type = 'INSERT') as puede
+      from information_schema.column_privileges
+      where table_name = 'entrada_kpi' and column_name = 'creado_en'
+        and grantee = 'designio_app'`;
+    expect(
+      grant?.puede ?? false,
+      'con creado_en en el grant, «nació en esta aceptación» deja de ser comprobable',
+    ).toBe(false);
+    const [gid] = await admin`select bool_or(privilege_type = 'INSERT') as puede
+      from information_schema.column_privileges
+      where table_name = 'entrada_kpi' and column_name = 'id' and grantee = 'designio_app'`;
+    expect(gid?.puede ?? false).toBe(false);
+  });
+
 });

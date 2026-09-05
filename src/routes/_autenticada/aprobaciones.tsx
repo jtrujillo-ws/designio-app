@@ -103,13 +103,12 @@ function PantallaAprobaciones() {
             </span>
           </Card>
         )}
+        {/* El loader devuelve null solo cuando la sesión ya no vale (cuenta desactivada con
+            el JWT aún vigente): no es un fallo de lectura, es que no hay con qué leer. */}
         {membresiaActiva && !datos && (
           <Card style={{ padding: 24 }}>
-            <span
-              role="alert"
-              style={{ font: '500 13px var(--font-sans)', color: 'var(--danger)' }}
-            >
-              No se pudieron leer las aprobaciones pendientes de este workspace.
+            <span style={{ font: '400 13.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+              Tu sesión ya no tiene acceso a este workspace; vuelve a entrar.
             </span>
           </Card>
         )}
@@ -126,9 +125,12 @@ function PantallaAprobaciones() {
               </Card>
             )}
             {clases.map((clase) => (
-              <Clase key={clase} clase={clase} cuantos={conteo.porClase[clase]}>
-                {filasDeClase(clase, datos)}
-              </Clase>
+              <Clase
+                key={clase}
+                clase={clase}
+                cuantos={conteo.porClase[clase]}
+                filas={filasDeClase(clase, datos)}
+              />
             ))}
           </>
         )}
@@ -196,15 +198,19 @@ function Cabecera({
   );
 }
 
-/** Un grupo: su rótulo, qué acto espera en él, y sus filas —o el aviso de que no hay—. */
+/**
+ * Un grupo: su rótulo con lo DECIDIBLE, qué acto espera en él, y sus filas —o el aviso de
+ * que no hay—. Puede haber filas y contar cero: un gate al que aún le falta algo se enseña
+ * con su motivo, pero no es una decisión que se pueda tomar ahora.
+ */
 function Clase({
   clase,
   cuantos,
-  children,
+  filas,
 }: {
   clase: ClasePendiente;
   cuantos: number;
-  children: ReactNode;
+  filas: ReactNode[];
 }) {
   return (
     <section
@@ -214,23 +220,24 @@ function Clase({
       <div style={{ display: 'flex', flexDirection: 'column', gap: 4, paddingTop: 6 }}>
         <span style={etiqueta}>
           {ETIQUETA_CLASE_PENDIENTE[clase]} · {cuantos}
+          {filas.length > cuantos ? ` · ${filas.length - cuantos} en espera` : ''}
         </span>
         <span style={apunte}>{ACTO_DE_CLASE[clase]}</span>
       </div>
-      {cuantos === 0 ? (
+      {filas.length === 0 ? (
         <Card pending style={{ padding: '14px 20px' }}>
           <span style={{ font: '400 13px var(--font-sans)', color: 'var(--text-muted)' }}>
             Nada pendiente de tu rol
           </span>
         </Card>
       ) : (
-        children
+        filas
       )}
     </section>
   );
 }
 
-function filasDeClase(clase: ClasePendiente, datos: PendientesDelRol): ReactNode {
+function filasDeClase(clase: ClasePendiente, datos: PendientesDelRol): ReactNode[] {
   switch (clase) {
     case 'gate':
       return datos.gates.map((g) => (
@@ -240,7 +247,14 @@ function filasDeClase(clase: ClasePendiente, datos: PendientesDelRol): ReactNode
           codigoDestino={g.proyectoCodigo}
           codigo={`G${g.numero}`}
           titulo={`Gate G${g.numero} de ${g.proyectoCodigo}`}
-          detalle={`Reto ${g.retoCodigo} · checklist decidido, espera tu aprobación`}
+          detalle={
+            g.falta.length === 0
+              ? `Reto ${g.retoCodigo} · se puede aprobar ahora`
+              : `Reto ${g.retoCodigo} · gate abierto, todavía no se puede aprobar`
+          }
+          // El mismo predicado que apaga el botón en el proyecto (`faltaParaAprobarGate`):
+          // lo que diga aquí es lo que dirá allí, y por eso no cuenta como decisión.
+          aviso={g.falta.length > 0 ? `Falta para poder aprobarlo: ${g.falta.join(' · ')}` : null}
         />
       ));
     case 'derecho':
@@ -260,14 +274,15 @@ function filasDeClase(clase: ClasePendiente, datos: PendientesDelRol): ReactNode
           destino={destinoDeInsight(i)}
           codigo="INS"
           titulo={i.titulo}
-          detalle={detalleDeInsight(i.afirmaciones, i.afirmacionesSinCita)}
-          // Validar va a fallar mientras falte una cita o no haya afirmaciones: se avisa
+          detalle={detalleDeInsight(i.afirmaciones, i.afirmacionesSinRespaldo)}
+          // Validar va a fallar mientras una afirmación no-hipótesis no tenga una cita con
+          // derechos vigentes, o no haya afirmaciones (el guard de validación): se avisa
           // aquí para que quien decide sepa que antes hay trabajo, no solo una firma.
           aviso={
             i.afirmaciones === 0
               ? 'Sin afirmaciones: no se puede validar todavía'
-              : i.afirmacionesSinCita > 0
-                ? 'Falta citar antes de validar'
+              : i.afirmacionesSinRespaldo > 0
+                ? 'Falta respaldo: cita evidencia con derechos vigentes antes de validar'
                 : null
           }
         />
@@ -293,9 +308,9 @@ function filasDeClase(clase: ClasePendiente, datos: PendientesDelRol): ReactNode
   }
 }
 
-function detalleDeInsight(afirmaciones: number, sinCita: number): string {
+function detalleDeInsight(afirmaciones: number, sinRespaldo: number): string {
   const base = `${afirmaciones} ${afirmaciones === 1 ? 'afirmación' : 'afirmaciones'}`;
-  return sinCita > 0 ? `${base} · ${sinCita} sin cita` : base;
+  return sinRespaldo > 0 ? `${base} · ${sinRespaldo} sin respaldo usable` : base;
 }
 
 /**

@@ -18,6 +18,7 @@ import {
   afirmarEnInsight,
   anotarContradiccion,
   citarEvidencia,
+  insightDelEspacio,
   insightsDelEspacio,
   proponerInsight,
   validarInsightPropuesto,
@@ -33,24 +34,32 @@ import type { InsightCompleto } from '@/lib/insight/insight.schemas';
  * exactamente el sesgo que el grounding existe para combatir.
  */
 export const Route = createFileRoute('/_autenticada/insights')({
-  // `destacar`: el id del insight al que se vino (desde el buscador). Solo orienta la
-  // pantalla; el loader no lo mira, la lista sigue siendo la misma.
+  // `destacar`: el id del insight al que se vino (desde el buscador o la bandeja de
+  // aprobaciones). La lista sigue siendo la misma; si el pedido no cae en la primera página
+  // —keyset de los más recientes, y lo que más espera validación es lo más antiguo— el
+  // loader lo trae aparte y la pantalla lo fija arriba: un enlace que aterriza en «no está
+  // entre lo cargado» no es un enlace.
   validateSearch: (search: Record<string, unknown>): { destacar?: string } =>
     typeof search.destacar === 'string' && search.destacar !== '' ? { destacar: search.destacar } : {},
-  loaderDeps: ({ search }) => ({ ws: search.ws }),
-  loader: async ({ context }) => {
+  loaderDeps: ({ search }) => ({ ws: search.ws, destacar: search.destacar }),
+  loader: async ({ context, deps }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
     if (!workspaceId) return null;
     const [insights, evidencias] = await Promise.all([
       insightsDelEspacio({ data: { workspaceId } }),
       evidenciasDelWorkspace({ data: { workspaceId } }),
     ]);
+    const fijado =
+      deps.destacar && !insights.insights.some((i) => i.id === deps.destacar)
+        ? await insightDelEspacio({ data: { workspaceId, insightId: deps.destacar } })
+        : null;
     return {
       workspaceId,
       insights: insights.insights,
       // Cursor keyset de la primera página: «cargar más» sigue desde aquí sin saltar
       // ni repetir. Sin esto, un insight viejo quedaba fuera de alcance para siempre.
       siguiente: insights.siguiente,
+      fijado,
       evidencias: evidencias?.evidencias ?? [],
       hayMasEvidencias: evidencias?.hayMas ?? false,
     };
@@ -238,9 +247,12 @@ function ListaDeInsights({
     datos.siguiente ?? null,
   );
   const [cargando, setCargando] = useState(false);
-  const listados = [...datos.insights, ...masPaginas];
+  // El fijado va aparte y no se repite si «cargar más» llega hasta él.
+  const fijado = datos.fijado ?? null;
+  const listados = [...datos.insights, ...masPaginas].filter((i) => i.id !== fijado?.id);
   const { destacar } = Route.useSearch();
-  const destacadoCargado = destacar !== undefined && listados.some((i) => i.id === destacar);
+  const destacadoCargado =
+    destacar !== undefined && (fijado !== null || listados.some((i) => i.id === destacar));
 
   async function cargarMas() {
     if (!cursor) return;
@@ -267,6 +279,22 @@ function ListaDeInsights({
         </Card>
       )}
       {destacar !== undefined && !destacadoCargado && <AvisoDeDestacadoAusente que="El insight" />}
+      {fijado && (
+        <Destacado id={fijado.id} destacado={fijado.id === destacar}>
+          <span role="status" style={{ ...micro, display: 'block', marginBottom: 8 }}>
+            Traído aquí por el enlace; en la lista va más abajo
+          </span>
+          <FichaInsight
+            workspaceId={datos.workspaceId}
+            insight={fijado}
+            evidencias={datos.evidencias}
+            hayMasEvidencias={datos.hayMasEvidencias}
+            puedeCurar={puedeCurar}
+            onCambio={onCambio}
+            onError={onError}
+          />
+        </Destacado>
+      )}
       {listados.map((insight) => (
         <Destacado key={insight.id} id={insight.id} destacado={insight.id === destacar}>
           <FichaInsight

@@ -1,5 +1,5 @@
 import '@/lib/server-only';
-import type { TransactionSql } from 'postgres';
+import type { Row, TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import type {
@@ -307,7 +307,59 @@ export async function insightsDelWorkspace(
 ): Promise<{ insights: InsightCompleto[]; siguiente: { creadoEn: string; id: string } | null }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    const filas = await tx`
+    const filas = await filasDeInsights(tx, workspaceId, { cursor, limite: PAGINA_INSIGHTS + 1 });
+    const pagina = filas.slice(0, PAGINA_INSIGHTS);
+    const ultima = pagina[pagina.length - 1];
+    return {
+      insights: pagina.map(comoInsightCompleto),
+      // El cursor es el par completo (creado_en, id): dos insights del mismo instante
+      // no harían saltar ni repetir la página siguiente.
+      siguiente:
+        filas.length > PAGINA_INSIGHTS && ultima
+          ? { creadoEn: (ultima.creado_en as Date).toISOString(), id: ultima.id as string }
+          : null,
+    };
+  });
+}
+
+/**
+ * UN insight completo, por id: la misma ficha que la lista, para el que se vino a ver con
+ * `destacar` y no está en la primera página (keyset de los más recientes; lo que más
+ * espera validación es lo más antiguo). null si no existe o RLS no lo enseña —la pantalla
+ * no distingue los dos casos, y no debe—.
+ */
+export async function insightDelWorkspace(
+  actorId: string,
+  workspaceId: string,
+  insightId: string,
+): Promise<InsightCompleto | null> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [fila] = await filasDeInsights(tx, workspaceId, { soloId: insightId, limite: 1 });
+    return fila ? comoInsightCompleto(fila) : null;
+  });
+}
+
+function comoInsightCompleto(f: Row): InsightCompleto {
+  return {
+    id: f.id as string,
+    titulo: f.titulo as string,
+    resumen: f.resumen as string,
+    estado: f.estado as InsightCompleto['estado'],
+    validadoEn: (f.validado_en as string | null) ?? null,
+    afirmaciones: f.afirmaciones as InsightCompleto['afirmaciones'],
+    contradicciones: f.contradicciones as InsightCompleto['contradicciones'],
+  };
+}
+
+/** La ficha completa, compartida por la lista paginada y por la lectura por id. */
+async function filasDeInsights(
+  tx: TransactionSql,
+  workspaceId: string,
+  filtro: { cursor?: { creadoEn: string; id: string } | null; soloId?: string; limite: number },
+) {
+  const { cursor } = filtro;
+  return tx`
       select i.id, i.titulo, i.resumen, i.estado,
         to_char(i.validado_en, 'YYYY-MM-DD') as validado_en,
         coalesce((
@@ -347,29 +399,10 @@ export async function insightsDelWorkspace(
         , i.creado_en
       from insight i
       where i.workspace_id = ${workspaceId}
+        ${filtro.soloId ? tx`and i.id = ${filtro.soloId}` : tx``}
         and (${cursor?.creadoEn ?? null}::timestamptz is null
              or (i.creado_en, i.id) < (${cursor?.creadoEn ?? null}::timestamptz,
                                        ${cursor?.id ?? null}::uuid))
       order by i.creado_en desc, i.id desc
-      limit ${PAGINA_INSIGHTS + 1}`;
-    const pagina = filas.slice(0, PAGINA_INSIGHTS);
-    const ultima = pagina[pagina.length - 1];
-    return {
-      insights: pagina.map((f) => ({
-        id: f.id as string,
-        titulo: f.titulo as string,
-        resumen: f.resumen as string,
-        estado: f.estado as InsightCompleto['estado'],
-        validadoEn: (f.validado_en as string | null) ?? null,
-        afirmaciones: f.afirmaciones as InsightCompleto['afirmaciones'],
-        contradicciones: f.contradicciones as InsightCompleto['contradicciones'],
-      })),
-      // El cursor es el par completo (creado_en, id): dos insights del mismo instante
-      // no harían saltar ni repetir la página siguiente.
-      siguiente:
-        filas.length > PAGINA_INSIGHTS && ultima
-          ? { creadoEn: (ultima.creado_en as Date).toISOString(), id: ultima.id as string }
-          : null,
-    };
-  });
+      limit ${filtro.limite}`;
 }

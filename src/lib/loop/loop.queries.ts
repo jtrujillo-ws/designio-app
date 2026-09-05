@@ -3,10 +3,16 @@ import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
-  gatesQueEsperanAprobador,
-  otrosPendientesDelRol,
+  conteoDeOtrosPendientes,
+  gatesAbiertos,
+  gatesDelRol,
+  rolEnWorkspace,
 } from '@/lib/aprobaciones/aprobaciones.queries';
-import { contarPendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
+import {
+  checklistDecidido,
+  clasesDelRol,
+  comoAprobacionPendiente,
+} from '@/lib/aprobaciones/aprobaciones.schemas';
 import { proyectoActualDe } from './loop-estado';
 import type {
   EntregaPendiente,
@@ -99,17 +105,33 @@ export async function resumenParaUsuario(
         reviewCompletado: f.review_completado as boolean,
       }));
 
-      // Gates abiertos con el checklist decidido: TODOS, con la marca de si esperan a quien
-      // mira («Te toca a ti» nombra también los que esperan a otro rol). La consulta vive en
-      // el módulo de aprobaciones, que es su otro lector: una sola redacción del predicado.
-      const aprobaciones = await gatesQueEsperanAprobador(tx, actorId, workspaceId);
-      // Y el conteo de TODO lo que el rol de quien mira puede decidir ahora (gates propios,
-      // derechos, insights, design versions): el contador del lateral bebe de aquí, la
-      // pantalla de aprobaciones lee las filas con la misma fuente.
-      const pendientesDelRol = contarPendientes({
-        gates: aprobaciones.filter((a) => a.esMia),
-        ...(await otrosPendientesDelRol(tx, actorId, workspaceId)),
-      });
+      // El rol de quien mira, UNA vez y por la base: decide de qué gates es aprobador y qué
+      // clases de pendientes se cuentan siquiera.
+      const rol = await rolEnWorkspace(tx, actorId, workspaceId);
+      const clases = clasesDelRol(rol);
+      // El gate abierto de cada proyecto (la consulta vive en el módulo de aprobaciones, su
+      // otro lector). De ahí salen dos cosas: las «aprobaciones» que «Te toca a ti» nombra
+      // —TODAS las que tienen el checklist decidido, esperen a quien esperen— y, para el
+      // contador del lateral, las que quien mira puede aprobar YA según el mismo predicado
+      // que la pantalla del proyecto (`faltaParaAprobarGate`).
+      const abiertos = await gatesAbiertos(tx, rol, workspaceId);
+      const aprobaciones = abiertos
+        .filter((g) => checklistDecidido(g.gate))
+        .map(comoAprobacionPendiente);
+      // Y el conteo de TODO lo que el rol puede decidir ahora (gates propios, derechos,
+      // insights, design versions): solo escalares, sin materializar las filas que la
+      // pantalla de aprobaciones lee con la misma fuente.
+      const otros = await conteoDeOtrosPendientes(tx, workspaceId, clases);
+      const porClase = {
+        gate: clases.includes('gate')
+          ? gatesDelRol(abiertos).filter((g) => g.falta.length === 0).length
+          : 0,
+        ...otros,
+      };
+      const pendientesDelRol = {
+        total: porClase.gate + porClase.derecho + porClase.insight + porClase['design-version'],
+        porClase,
+      };
 
       // El release más avanzado del servicio: uno que ya salió antes que uno planificado, y
       // entre los que salieron, el último. Los días vivos los cuenta el calendario de la

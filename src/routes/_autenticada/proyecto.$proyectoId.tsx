@@ -19,11 +19,11 @@ import { ETIQUETA_PERFIL } from '@/lib/metodo/metodo.plantillas';
 import {
   CLASES_OBJETO_CITABLE,
   ETIQUETA_CLASE_OBJETO,
+  criteriosCompletos,
   faltaParaAprobarGate,
 } from '@/lib/metodo/metodo.schemas';
 import type {
   ClaseObjetoCitable,
-  CriterioDeReto,
   GateDeProyecto,
   ItemDeGate,
   ProyectoMetodo,
@@ -188,23 +188,6 @@ const COLOR_ITEM: Record<ItemDeGate['estado'], string> = {
  * suyos (RF-01.5: el hilo pertenece al objeto, no a la pantalla). */
 function hilosDe(hilos: HiloDeObjeto[], tipo: AnclaDeHilo, id: string): HiloDeObjeto[] {
   return hilos.filter((h) => h.objetoTipo === tipo && h.objetoId === id);
-}
-
-/** Espejo cliente del predicado SYS-22 de aprobarGate — solo informa la etiqueta de
- * G0; la exigencia real vive en el servidor y en la política. */
-function criteriosCompletos(criterios: CriterioDeReto[]): boolean {
-  return (
-    criterios.length > 0 &&
-    criterios.every(
-      (c) =>
-        c.kpi.trim() !== '' &&
-        c.definicion.trim() !== '' &&
-        c.objetivo.trim() !== '' &&
-        c.ventanaDias !== null &&
-        (((c.lineaBaseValor ?? '').trim() !== '' && c.lineaBaseFecha !== null) ||
-          c.lineaBasePlan.trim() !== ''),
-    )
-  );
 }
 
 function PantallaProyecto() {

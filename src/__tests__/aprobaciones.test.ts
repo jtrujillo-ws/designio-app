@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   CLASES_PENDIENTES,
   ROLES_POR_CLASE,
+  checklistDecidido,
   clasesDelRol,
+  comoAprobacionPendiente,
   contarPendientes,
   destinoDeDerecho,
   destinoDeDesignVersion,
@@ -11,16 +13,18 @@ import {
   etiquetaDePendientes,
   type DerechoPendiente,
   type DesignVersionPendiente,
+  type GateAbierto,
   type GatePendiente,
   type InsightPendiente,
 } from '@/lib/aprobaciones/aprobaciones.schemas';
 import { ROLES_DERECHOS } from '@/lib/evidencia/evidencia.schemas';
 import { etiquetaDeDestino } from '@/lib/destinos';
+import type { ItemDeGate } from '@/lib/metodo/metodo.schemas';
 
 /**
  * La pantalla de aprobaciones decide qué clases enseñar SIN consultar nada: por rol. Y el
  * conteo que da la cabecera es el mismo que el contador del lateral, así que se comprueba
- * que sume lo que hay y que cada fila lleve a la pantalla donde se decide.
+ * que sume solo lo decidible y que cada fila lleve a la pantalla donde se decide.
  */
 describe('qué clases decide cada rol', () => {
   it('el lead boutique decide en las cuatro clases, en el orden de la pantalla', () => {
@@ -50,6 +54,67 @@ describe('qué clases decide cada rol', () => {
   });
 });
 
+function item(estado: ItemDeGate['estado'], decisionEnRevision = false): ItemDeGate {
+  return {
+    id: `i-${estado}`,
+    orden: 0,
+    texto: 'Ítem',
+    estado,
+    objetoClase: null,
+    objetoId: null,
+    objetoTitulo: null,
+    decisionEnRevision,
+    naJustificacion: '',
+  };
+}
+
+describe('el checklist decidido (lo que «Te toca a ti» llama aprobación pendiente)', () => {
+  const base = {
+    id: 'g1',
+    numero: 1,
+    rolAprobador: 'lead-boutique',
+    estado: 'pendiente',
+    aprobadoEn: null,
+  } as const;
+
+  it('cuenta con todo decidido: cumplidos o N/A, nada pendiente', () => {
+    expect(checklistDecidido({ ...base, items: [item('cumplido'), item('na')] })).toBe(true);
+  });
+
+  it('no cuenta con un ítem pendiente, ni con el checklist vacío (no es suficiencia)', () => {
+    expect(checklistDecidido({ ...base, items: [item('cumplido'), item('pendiente')] })).toBe(
+      false,
+    );
+    expect(checklistDecidido({ ...base, items: [] })).toBe(false);
+  });
+
+  it('se proyecta a la fila del resumen del loop con la marca de si es de quien mira', () => {
+    const abierto: GateAbierto = {
+      gate: { ...base, items: [item('cumplido')] },
+      esMia: false,
+      proyectoId: 'p1',
+      proyectoCodigo: 'P-01',
+      retoCodigo: 'R-01',
+      contexto: {
+        anterioresAprobados: true,
+        criteriosListosG0: true,
+        registryFirmadoG6: true,
+        arquetiposSinVeredicto: 0,
+        proyectoEstado: 'activo',
+      },
+    };
+    expect(comoAprobacionPendiente(abierto)).toEqual({
+      gateId: 'g1',
+      numero: 1,
+      rolAprobador: 'lead-boutique',
+      esMia: false,
+      proyectoId: 'p1',
+      proyectoCodigo: 'P-01',
+      retoCodigo: 'R-01',
+    });
+  });
+});
+
 describe('el conteo de la cabecera', () => {
   const gate: GatePendiente = {
     gateId: 'g1',
@@ -58,6 +123,7 @@ describe('el conteo de la cabecera', () => {
     proyectoId: 'p1',
     proyectoCodigo: 'P-01',
     retoCodigo: 'R-01',
+    falta: [],
   };
   const derecho: DerechoPendiente = {
     evidenciaId: 'e1',
@@ -69,7 +135,7 @@ describe('el conteo de la cabecera', () => {
     insightId: 'i1',
     titulo: 'Hallazgo',
     afirmaciones: 2,
-    afirmacionesSinCita: 1,
+    afirmacionesSinRespaldo: 1,
     creadoEn: '2026-09-01T00:00:00.000Z',
   };
   const dv: DesignVersionPendiente = {
@@ -91,6 +157,17 @@ describe('el conteo de la cabecera', () => {
     });
     expect(conteo.total).toBe(5);
     expect(conteo.porClase).toEqual({ gate: 2, derecho: 1, insight: 1, 'design-version': 1 });
+  });
+
+  it('un gate al que le falta algo se lista pero NO cuenta: no es decidible ahora', () => {
+    const conteo = contarPendientes({
+      gates: [gate, { ...gate, gateId: 'g2', falta: ['2 pendientes'] }],
+      derechos: [],
+      insights: [],
+      designVersions: [],
+    });
+    expect(conteo.total).toBe(1);
+    expect(conteo.porClase.gate).toBe(1);
   });
 
   it('sin nada, el total es cero y cada clase también', () => {

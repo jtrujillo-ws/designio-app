@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Destino } from '@/lib/destinos';
 import { ROLES_DERECHOS } from '@/lib/evidencia/evidencia.schemas';
 import type { AprobacionPendiente } from '@/lib/loop/loop.schemas';
+import type { GateDeProyecto } from '@/lib/metodo/metodo.schemas';
 
 /**
  * Aprobaciones pendientes: lo que el rol de quien mira puede aprobar o decidir AHORA en el
@@ -31,7 +32,7 @@ export const ETIQUETA_CLASE_PENDIENTE: Record<ClasePendiente, string> = {
 
 /** Qué acto espera en cada clase, dicho como lo entiende quien decide. */
 export const ACTO_DE_CLASE: Record<ClasePendiente, string> = {
-  gate: 'Gates abiertos con el checklist decidido: esperan tu aprobación',
+  gate: 'El gate abierto de cada proyecto que espera tu aprobación, y qué le falta si aún no se puede',
   derecho: 'Evidencia curada cuyos derechos nadie ha concedido ni denegado todavía',
   insight: 'Insights que alguien propuso y esperan que los valides',
   'design-version': 'Design versions en borrador: aprobarlas congela su snapshot',
@@ -63,6 +64,62 @@ export function clasesDelRol(rol: string): ClasePendiente[] {
   return CLASES_PENDIENTES.filter((clase) => ROLES_POR_CLASE[clase].includes(rol));
 }
 
+/**
+ * El gate ABIERTO de un proyecto (el primero pendiente), tal como sale de la base, con todo
+ * lo que hace falta para preguntarle a `faltaParaAprobarGate` —el predicado de la pantalla
+ * del proyecto— si se puede aprobar ya. Es UNA fila por proyecto con gates pendientes, sea
+ * de quien sea el gate: el resumen del loop necesita también los que esperan a otro rol.
+ */
+export type GateAbierto = {
+  gate: GateDeProyecto;
+  /** El rol aprobador es el de quien mira: es SU aprobación, no una que espera a otro. */
+  esMia: boolean;
+  proyectoId: string;
+  proyectoCodigo: string;
+  retoCodigo: string;
+  /** Las entradas de `faltaParaAprobarGate` que no están en el gate mismo. */
+  contexto: {
+    anterioresAprobados: boolean;
+    criteriosListosG0: boolean;
+    registryFirmadoG6: boolean;
+    arquetiposSinVeredicto: number;
+    proyectoEstado: string;
+  };
+};
+
+/**
+ * El checklist del gate está entero decidido y no vacío: dejó de ser trabajo y espera a su
+ * aprobador. Es lo que «Te toca a ti» llama «aprobación pendiente» —el mismo criterio que
+ * tenía la consulta del resumen del loop antes de que existiera esta pantalla—. Un
+ * checklist vacío no es suficiencia (mismo criterio que el guard de la base). La
+ * suficiencia COMPLETA la dice `faltaParaAprobarGate`; esto es solo la parte del gate que
+ * es trabajo de otros.
+ */
+export function checklistDecidido(gate: GateDeProyecto): boolean {
+  return gate.items.length > 0 && gate.items.every((i) => i.estado !== 'pendiente');
+}
+
+/** La fila del resumen del loop que un gate abierto produce cuando su checklist está decidido. */
+export function comoAprobacionPendiente(g: GateAbierto): AprobacionPendiente {
+  return {
+    gateId: g.gate.id,
+    numero: g.gate.numero,
+    rolAprobador: g.gate.rolAprobador,
+    esMia: g.esMia,
+    proyectoId: g.proyectoId,
+    proyectoCodigo: g.proyectoCodigo,
+    retoCodigo: g.retoCodigo,
+  };
+}
+
+/**
+ * Un gate que espera a QUIEN MIRA. `falta` es la respuesta de `faltaParaAprobarGate` —la
+ * MISMA que apaga el botón en la pantalla del proyecto—: vacía, el gate se puede aprobar
+ * ahora y cuenta; con motivos, se lista para que el aprobador sepa qué espera, pero no es
+ * una decisión que pueda tomar todavía y no cuenta.
+ */
+export type GatePendiente = Omit<AprobacionPendiente, 'esMia'> & { falta: string[] };
+
 /** Un derecho de uso sin decidir: la evidencia existe pero no se cita ni sale en entregables. */
 export type DerechoPendiente = {
   evidenciaId: string;
@@ -71,14 +128,16 @@ export type DerechoPendiente = {
   creadoEn: string;
 };
 
-/** Un insight propuesto. `afirmacionesSinCita` avisa de lo que el guard de validación va a
- * rechazar (toda afirmación no-hipótesis exige cita): la decisión espera, pero puede que
- * antes falte trabajo, y decirlo evita un viaje en vano. */
+/** Un insight propuesto. `afirmacionesSinRespaldo` cuenta las afirmaciones no-hipótesis
+ * que no tienen ninguna cita USABLE (con derechos vigentes para el ámbito cliente): es el
+ * predicado de `insight_validar_guard` desde 20260902310000, que ya no se conforma con que
+ * la cita exista. La decisión espera, pero puede que antes falte trabajo, y decirlo evita
+ * un viaje en vano. */
 export type InsightPendiente = {
   insightId: string;
   titulo: string;
   afirmaciones: number;
-  afirmacionesSinCita: number;
+  afirmacionesSinRespaldo: number;
   creadoEn: string;
 };
 
@@ -93,9 +152,6 @@ export type DesignVersionPendiente = {
   conElementos: boolean;
   creadoEn: string;
 };
-
-/** Un gate que espera a QUIEN MIRA: es la misma fila del resumen del loop, ya filtrada. */
-export type GatePendiente = Omit<AprobacionPendiente, 'esMia'>;
 
 /** Todo lo que el rol puede decidir ahora. Una clase que no aplica al rol viene vacía, igual
  * que una que aplica y no tiene nada: distinguirlas es cosa de `clasesDelRol`. */
@@ -113,9 +169,10 @@ export type ConteoDePendientes = {
   porClase: Record<ClasePendiente, number>;
 };
 
+/** Solo lo DECIDIBLE cuenta: un gate al que aún le falta algo se lista, pero no suma. */
 export function contarPendientes(p: Omit<PendientesDelRol, 'workspaceId'>): ConteoDePendientes {
   const porClase: Record<ClasePendiente, number> = {
-    gate: p.gates.length,
+    gate: p.gates.filter((g) => g.falta.length === 0).length,
     derecho: p.derechos.length,
     insight: p.insights.length,
     'design-version': p.designVersions.length,
@@ -131,7 +188,7 @@ export function contarPendientes(p: Omit<PendientesDelRol, 'workspaceId'>): Cont
  * insights, en sus listas con el elemento destacado (es donde están los controles); una
  * design version, en su pantalla propia.
  */
-export function destinoDeGate(g: GatePendiente): Destino {
+export function destinoDeGate(g: Pick<GatePendiente, 'proyectoId'>): Destino {
   return { to: '/proyecto/$proyectoId', params: { proyectoId: g.proyectoId } };
 }
 export function destinoDeDerecho(d: DerechoPendiente): Destino {

@@ -34,6 +34,11 @@
   --grad-arco: linear-gradient(120deg, oklch(0.58 0.11 190), oklch(0.58 0.14 340));
   --grad-arco-deep: linear-gradient(120deg, oklch(0.4 0.08 190), oklch(0.4 0.1 340));
 
+  /* Marca — negro violeta: casi negro, croma mínima en el hue del arco (J5–J6).
+     Es la tinta de la marca, del lateral del workspace y de los botones primarios. */
+  --brand-ink: oklch(0.22 0.045 305);
+  --brand-ink-lift: oklch(0.28 0.055 305);
+
   /* Acento por defecto (centro del arco): links, focus, selección */
   --accent: oklch(0.5 0.12 265);
   --accent-soft: oklch(0.95 0.03 265);

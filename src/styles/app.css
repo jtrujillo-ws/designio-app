@@ -28,3 +28,96 @@ a:hover {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* ── Pantalla Loop (dirección 3a: lateral negro violeta) ──
+   Lo que los estilos en línea no pueden decir: hover, foco y el comportamiento por debajo
+   de ~1200px, donde el lateral se recoge a un riel y el arco de siete tarjetas se desplaza. */
+.loop-fila {
+  background: transparent;
+  transition:
+    background 150ms ease-out,
+    color 150ms ease-out;
+}
+.loop-fila:hover {
+  background: rgba(247, 247, 249, 0.07);
+}
+.loop-fila:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* El <select> del conmutador de cliente cubre la tarjeta con opacidad 0: el foco se pinta
+   en la tarjeta, que es lo que se ve. */
+.loop-conmutador:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.loop-tramo {
+  transition: opacity 150ms ease-out;
+}
+/* La etiqueta del tramo: peso y color por estado, y el hover la sube a blanco. */
+.loop-tramo > span:last-child {
+  font-weight: 600;
+  color: rgba(247, 247, 249, 0.9);
+  transition: color 150ms ease-out;
+}
+.loop-tramo[data-estado='en curso'] > span:last-child {
+  font-weight: 700;
+  color: #fff;
+}
+.loop-tramo[data-estado='próximo'] > span:last-child {
+  font-weight: 500;
+  color: rgba(247, 247, 249, 0.5);
+}
+.loop-tramo:hover > span:last-child {
+  color: #fff;
+}
+.loop-tarjeta {
+  transition:
+    box-shadow 150ms ease-out,
+    transform 150ms ease-out;
+}
+.loop-tarjeta[data-enlace='true']:hover {
+  box-shadow: var(--shadow-md);
+}
+.loop-estrecho {
+  display: none;
+}
+@media (max-width: 1200px) {
+  .loop-aside {
+    width: 68px !important;
+    padding: 20px 10px !important;
+  }
+  .loop-aside .loop-ancho {
+    display: none !important;
+  }
+  .loop-aside .loop-estrecho {
+    display: flex;
+  }
+  /* En el riel una fila no cabe en horizontal (abreviatura + contador, o iniciales + chip
+     de journey): lo que quede visible se apila en columna, centrado, sin el caret. */
+  .loop-aside .loop-fila {
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    padding: 6px 4px !important;
+    min-height: 32px;
+  }
+  .loop-aside .loop-fila > .loop-caret {
+    display: none;
+  }
+  .loop-cabecera-fila {
+    flex-wrap: wrap;
+  }
+  .loop-cifras {
+    flex-basis: 100%;
+    padding-top: 18px !important;
+  }
+  .loop-recorridos {
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .loop-recorridos > div {
+    grid-template-columns: repeat(7, minmax(158px, 1fr)) !important;
+    min-width: 1166px;
+  }
+}

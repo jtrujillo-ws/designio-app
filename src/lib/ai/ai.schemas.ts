@@ -11,6 +11,7 @@ import { z } from 'zod';
  */
 import type { ContenidoPropuesta } from './ai.contenido';
 export type {
+  ContenidoAsistenteGate,
   ContenidoCriterio,
   ContenidoExtraccion,
   ContenidoPropuesta,
@@ -61,12 +62,19 @@ export const PropuestaAISchema = z.object({
 });
 export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
 
-// ── Contratos ejecutables del slice 1 de SPEC-08 ──────────────────────────────────────
-// Dos capacidades: las únicas con objeto REAL en el esquema de hoy. El resto (C1-C7, CT)
-// llegan con sus specs; el catálogo de arriba ya las nombra.
+// ── Contratos ejecutables de SPEC-08 ──────────────────────────────────────────────────
+// Las que están vivas hoy. El resto (C1-C7) llegan con sus specs; el catálogo de arriba ya
+// las nombra, y el vocabulario de la base admite las diez desde
+// `…030000-el-vocabulario-de-capacidades-es-uno.sql`.
 
-/** Capacidades con destino materializable en este slice. */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0'] as const;
+/**
+ * Las capacidades VIVAS: las únicas que llaman al proveedor.
+ *
+ * Ya no son «las que tienen destino materializable». CT no lo tiene y está aquí: es
+ * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
+ * carece de acción «aprobar».
+ */
+export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
 export const DestinoSchema = z.enum(['evidencia', 'criterio-exito']);
@@ -124,7 +132,7 @@ export const MAX_CRITERIOS_POR_LOTE = 4;
  */
 export type AnclaCapacidad = {
   /** La columna donde cuelga en `reserva_ai`, `llamada_ai` y `propuesta_ai`. */
-  columna: 'item_id' | 'reto_id';
+  columna: 'item_id' | 'reto_id' | 'gate_id';
   /** El título del selector en la pantalla. */
   etiqueta: string;
   /** Cómo se nombra en prosa, en minúscula, dentro de una frase. */
@@ -163,29 +171,30 @@ export type DefinicionCapacidad = {
   /** Cómo se lee en el selector de capacidad. */
   etiqueta: string;
   /**
-   * Qué objeto del dominio materializa una propuesta aceptada.
+   * Qué objeto del dominio materializa una propuesta aceptada, o `null` si NO materializa.
    *
-   * OBLIGATORIO, y hoy eso deja fuera a las capacidades INFORMATIVAS. RF-08.4 dice que CT
-   * «carece de acción aprobar»: reporta huecos citando objetos y no escribe nada. Con este
-   * campo obligatorio, CT tendría que elegir un destino materializable, y la revisión llamaría
-   * a `MATERIALIZAR` y guardaría un id que no significa nada.
+   * `null` es «capacidad informativa», y la primera es CT: RF-08.4 dice que «reporta huecos
+   * citando objetos; carece de acción aprobar». No es un hueco en el contrato — es el
+   * contrato, y por eso se escribe como una ausencia REPRESENTABLE y no como un destino
+   * inventado. La misma distinción que sostiene el `null` de `llamada_ai.consentimiento_version`.
    *
-   * No se hace nullable AQUÍ, y conviene decir por qué en vez de dejarlo raro: el suelo de
-   * esta costura es la base, y `propuesta_ai` no admite hoy una propuesta informativa —
-   * `destino` es `not null`, seis CHECK atan destino con ancla y con objeto, y
-   * `check ((estado in ('aceptada','corregida')) = (coalesce(evidencia_id, criterio_id) is not null))`
-   * exige objeto para toda decisión que no sea rechazo. Un `Destino | null` en TypeScript sin
-   * esa migración detrás sería exactamente la clase de declaración decorativa que este
-   * registro existe para quitar: un valor que se puede escribir y que no llega a ninguna parte.
+   * Esto llegó DESPUÉS de su migración y no antes, a propósito: mientras `propuesta_ai.destino`
+   * fue `not null`, un `Destino | null` en TypeScript habría sido justo la declaración
+   * decorativa que este registro existe para quitar —un valor que se puede escribir y que no
+   * llega a ninguna parte—. Ahora el suelo lo admite: `destino` es anulable,
+   * `propuesta_ai_destino_informativo` ata «sin destino» a su ancla, y
+   * `propuesta_ai_destino_ct` lo exige por capacidad.
    *
-   * Y no es un caso aparte: `reserva_ai`, `llamada_ai` y `propuesta_ai` restringen
-   * `capacidad in ('C0','CI')`, así que TODA capacidad nueva trae su migración. La de CT es la
-   * que además hace `destino` anulable, rehace esos CHECK para admitir «sin objeto» y decide
-   * qué significa decidir una propuesta que no se materializa (rechazar y poco más). Ese
-   * trabajo va con CT, donde hay algo que lo ejercite; aquí solo queda dicho para que quien
-   * la escriba no lo descubra a mitad.
+   * Y lo que hace que «sin acción aprobar» sea una IMPOSIBILIDAD y no una regla de pantalla
+   * es un CHECK que ya estaba y no hubo que tocar:
+   *
+   *   check ((estado in ('aceptada','corregida')) = (coalesce(evidencia_id, criterio_id) is not null))
+   *
+   * Sin destino no hay objeto que enlazar, así que una propuesta informativa NO PUEDE quedar
+   * 'aceptada' ni 'corregida'. Su ciclo es 'propuesta' → 'rechazada', que es «leída y
+   * descartada», y eso sigue exigiendo revisor y fecha.
    */
-  destino: Destino;
+  destino: Destino | null;
   ancla: AnclaCapacidad;
   /*
    * El contrato de la salida del modelo NO vive aquí, y esa ausencia es deliberada. Este
@@ -229,6 +238,7 @@ export type DefinicionCapacidad = {
 const ANCLA_DECLARADA: Record<AnclaCapacidad['columna'], true> = {
   item_id: true,
   reto_id: true,
+  gate_id: true,
 };
 export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad['columna'][];
 
@@ -282,6 +292,47 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
         'Ese reto ya tiene criterios propuestos esperando revisión: decídelos antes de pedir otros',
     },
     lote: { campo: 'criterios', maximo: MAX_CRITERIOS_POR_LOTE },
+    exigeConsentimiento: false,
+    esSimulacion: false,
+  },
+  CT: {
+    etiqueta: 'Asistente de gates → qué falta para este gate',
+    /*
+     * INFORMATIVA. Lee y cita; no escribe. Todo lo que hay que decir de esta ausencia está
+     * en el docblock de `destino`, arriba.
+     */
+    destino: null,
+    ancla: {
+      columna: 'gate_id',
+      etiqueta: 'Gate pendiente',
+      enProsa: 'gate pendiente',
+      buscar: 'Buscar por proyecto o número de gate…',
+      vacia: 'No hay gates pendientes sin informe.',
+      hayMas: (n) =>
+        `Hay más gates pendientes de los que caben aquí: se listan los ${n} más antiguos. ` +
+        'Un gate sale de la lista mientras su informe espera lectura; para uno concreto, ' +
+        'búscalo por su proyecto o su número.',
+      enCurso:
+        'Ese gate ya tiene un informe AI en curso: espera a que termine antes de pedir otro',
+      pendiente: 'Ese gate ya tiene un informe sin leer: léelo antes de pedir otro',
+    },
+    /*
+     * Sin lote, y no por parecerse a CI: un informe es UNO por gate. Los huecos viajan
+     * DENTRO del contenido porque se leen juntos —«qué falta para G3» es una sola respuesta,
+     * no cinco propuestas independientes— y porque no hay nada que decidir por elemento:
+     * ninguno se acepta. El techo de un lote existe para que la revisión por elemento no
+     * degenere en aceptar todo de golpe (SPEC-08 §3), y aquí no hay aceptación que proteger.
+     */
+    lote: null,
+    /*
+     * El material de CT son los textos del checklist y los objetos del proyecto que esos
+     * items citan —evidencias, insights, decisiones—, y ninguno es material de PERSONAS: el
+     * consentimiento se pide sobre `item_importacion`, que es por donde entra lo que alguien
+     * dijo o escribió (RF-09.5). Un item de checklist es una frase del método.
+     *
+     * Y la comprobación que acompaña al registro lo sujeta por el otro lado: quien exige
+     * consentimiento tiene que anclar en `item_id`, que es donde el consentimiento vive.
+     */
     exigeConsentimiento: false,
     esSimulacion: false,
   },
@@ -373,6 +424,8 @@ export const ESTADOS_ANCLA = [
   'criterios-congelados',
   'registry-firmado',
   'reto-no-admite',
+  'gate-decidido',
+  'checklist-avanzado',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];
@@ -396,7 +449,12 @@ export type CitaConPresencia = {
 export type PropuestaEnPanel = {
   id: string;
   capacidad: CapacidadAI;
-  destino: Destino;
+  /**
+   * `null` en una capacidad INFORMATIVA: no materializa nada, así que no hay objeto que
+   * anunciar ni formulario de corrección que ofrecer. La pantalla tiene que decidir qué
+   * pinta en ese caso, y con el tipo así no compila hasta que lo decida.
+   */
+  destino: Destino | null;
   estado: EstadoPropuesta;
   esSimulacion: boolean;
   confianza: number | null;

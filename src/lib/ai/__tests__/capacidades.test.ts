@@ -6,6 +6,7 @@ import {
   CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
   COLUMNA_DE_DESTINO,
+  DestinoSchema,
   RevisarPropuestaSchema,
   type ContenidoExtraccion,
 } from '../ai.schemas';
@@ -50,7 +51,19 @@ describe('el registro de capacidades', () => {
     for (const c of CAPACIDADES_ACTIVAS) {
       const d = CAPACIDADES[c];
       expect(d.etiqueta.length, `${c} sin etiqueta`).toBeGreaterThan(0);
-      expect(d.destino, `${c} sin destino`).toBeTruthy();
+      /*
+       * `destino` puede ser `null` —capacidad INFORMATIVA, RF-08.4— pero lo que NO puede ser
+       * es un valor fuera del catálogo. `toBeTruthy()` decía las dos cosas a la vez y ahora
+       * solo puede decir una: se separa en la que sigue valiendo.
+       *
+       * Y `null` no se acepta a ciegas: la comprobación de más abajo exige que una capacidad
+       * sin destino tampoco tenga forma de aceptarse, que es lo que distingue «informativa»
+       * de «se me olvidó declarar el destino».
+       */
+      expect(
+        d.destino === null || (DestinoSchema.options as readonly string[]).includes(d.destino),
+        `${c}: destino fuera del catálogo (${String(d.destino)})`,
+      ).toBe(true);
       expect(ESQUEMA_DE_CONTENIDO[c], `${c} sin esquema de contenido`).toBeTruthy();
       // El ancla es lo que más varía y lo que más veces se pregunta: si a una capacidad le
       // falta una de estas piezas, la pantalla enseñaría `undefined` a un curador.

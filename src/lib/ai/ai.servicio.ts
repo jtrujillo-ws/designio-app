@@ -12,14 +12,18 @@ import {
 } from './ai.degradacion';
 import {
   presenciaLiteralPorCita,
+  materialDeGate,
   materialDeItem,
   materialDeReto,
   MAX_MATERIAL,
   PROMPT_VERSION,
+  promptAsistenteGate,
   promptCriterios,
   promptExtraccion,
+  SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
   SISTEMA_EXTRACCION,
+  type ChecklistDelGate,
 } from './ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
@@ -339,6 +343,34 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
     columnas: (tx) => tx`r.codigo as reto_codigo, r.titulo as reto_titulo,
       r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica`,
   },
+  gate_id: {
+    // DOS joins: el gate y su proyecto. El proyecto no es adorno — es lo que distingue
+    // «G3» de «el G3 de cuál», y un workspace tiene varios proyectos a la vez.
+    join: (tx) => tx`left join gate_instancia g
+        on g.id = p.gate_id and g.workspace_id = p.workspace_id
+      left join proyecto pr on pr.id = g.proyecto_id and pr.workspace_id = g.workspace_id`,
+    titulo: (tx) => tx`pr.codigo || ' · G' || g.numero`,
+    /*
+     * El checklist ENTERO, agregado a json en la misma proyección. No es una comodidad: el
+     * material contra el que se mide la presencia literal de las citas tiene que ser el
+     * MISMO texto que leyó el modelo, y ese texto son los requisitos. Traerlos con otra
+     * consulta abriría la puerta a que las dos listas difirieran —en orden, en filtro, en el
+     * momento— y la medición del grounding empezaría a marcar como ausentes citas que están.
+     *
+     * `order by c.orden` dentro del agregado, y no fuera: es el mismo orden con el que se
+     * armó el prompt, y si el checklist no cupo entero, lo que se truncó fue la cola.
+     */
+    columnas: (tx) => tx`g.numero as gate_numero, g.rol_aprobador as gate_rol,
+      g.estado as gate_estado, pr.titulo as gate_proyecto,
+      case when p.gate_id is null then '[]'::json else
+        (select coalesce(json_agg(json_build_object(
+                  'id', c.id, 'texto', c.texto, 'estado', c.estado,
+                  'conObjeto', num_nonnulls(c.evidencia_id, c.insight_id, c.decision_id) = 1)
+                order by c.orden), '[]'::json)
+         from checklist_item c
+         where c.gate_id = g.id and c.workspace_id = g.workspace_id)
+      end as gate_checklist`,
+  },
 };
 
 /**
@@ -468,6 +500,64 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         order by r.codigo asc, r.id asc
         limit ${limite}`;
       return filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string }));
+    },
+  },
+  CT: {
+    /*
+     * Lo que deja obsoleto un informe de gate es que el gate DEJE DE ESTAR PENDIENTE. No hay
+     * más motivos y no hace falta ordenarlos: un gate aprobado ya no tiene «qué le falta»,
+     * y `gate_instancia` no admite volver atrás desde aprobado sin pasar por el método.
+     *
+     * Aquí «obsoleto» pesa menos que en las otras dos, y conviene decirlo para que nadie
+     * lea de más: un informe de CT no se acepta nunca —no hay objeto que crear—, así que
+     * este estado no cierra ninguna puerta de escritura. Lo que hace es DECIRLE al revisor
+     * que lo que está leyendo ya no describe la realidad, que es lo único que un informe
+     * puede quedarse sin.
+     */
+    estado: (tx) => tx`case
+        when g.estado is distinct from 'pendiente' then 'gate-decidido'
+        when exists (
+          select 1
+          from jsonb_array_elements(
+                 case when jsonb_typeof(p.contenido->'huecos') = 'array'
+                      then p.contenido->'huecos' else '[]'::jsonb end) h
+          join checklist_item c
+            on c.id::text = lower(h->>'checklistItemId') and c.workspace_id = p.workspace_id
+          where c.estado <> 'pendiente')
+          then 'checklist-avanzado'
+        else 'disponible'
+      end`,
+    /*
+     * Recompuesto con la MISMA función que armó el prompt, desde las columnas que proyectó
+     * el ancla. El checklist llega ya parseado —es `json`—, así que se pasa tal cual.
+     */
+    material: (f) =>
+      materialDeGate({
+        proyecto: (f.gate_proyecto as string | null) ?? '',
+        numero: (f.gate_numero as number | null) ?? 0,
+        rolAprobador: (f.gate_rol as string | null) ?? '',
+        checklist: (f.gate_checklist as ChecklistDelGate | null) ?? [],
+      }).texto,
+    /*
+     * Gates PENDIENTES sin informe sin leer. Las dos condiciones son la misma que en las
+     * otras dos capacidades con otra ropa: que el ancla siga admitiendo la acción, y que no
+     * tenga ya trabajo esperando — lo segundo lo impone además el índice parcial
+     * `propuesta_ai_gate_pendiente_idx`, así que ofrecer un gate con informe sin leer sería
+     * ofrecer algo que la base va a rechazar.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select g.id, pr.codigo || ' · G' || g.numero as titulo
+        from gate_instancia g
+        join proyecto pr on pr.id = g.proyecto_id and pr.workspace_id = g.workspace_id
+        where g.workspace_id = ${workspaceId} and g.estado = 'pendiente'
+          and not exists (select 1 from propuesta_ai p
+            where p.gate_id = g.id and p.workspace_id = g.workspace_id and p.estado = 'propuesta')
+          and (${patron}::text is null or pr.codigo || ' · G' || g.numero ilike ${patron}
+               or pr.titulo ilike ${patron})
+        order by g.creado_en asc, g.id asc
+        limit ${limite}`;
+      return filas.map((g) => ({ id: g.id as string, titulo: g.titulo as string }));
     },
   },
 };
@@ -1534,6 +1624,19 @@ const REVALIDAR: Record<
       );
     }
   },
+  CT: async (tx, entrada) => {
+    // El gate pudo aprobarse a mano mientras se preparaba la llamada, y entonces el informe
+    // nacería describiendo un estado que ya pasó. Es el mismo caso que el item curado: algo
+    // que `prepararAlcance` vio cierto y dejó de serlo antes de commitear.
+    const [gate] = await tx`select estado <> 'pendiente' as ya_decidido
+      from gate_instancia
+      where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+    if (!gate || gate.ya_decidido) {
+      throw new ErrorAI(
+        'Ese gate ya se decidió mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+  },
 };
 
 /**
@@ -1617,6 +1720,51 @@ const PREPARAR: Record<
       descripcion: reto.descripcion as string,
       metricaObjetivo: reto.metrica_objetivo as string,
         cuantos: CRITERIOS_POR_GENERACION,
+      }),
+    };
+  },
+  CT: async (tx, entrada) => {
+    const [gate] = await tx`select g.numero, g.rol_aprobador, pr.titulo as proyecto
+      from gate_instancia g
+      join proyecto pr on pr.id = g.proyecto_id and pr.workspace_id = g.workspace_id
+      where g.id = ${entrada.anclaId} and g.workspace_id = ${entrada.workspaceId}
+        and g.estado = 'pendiente'`;
+    if (!gate) throw new ErrorAI('El gate no existe en este workspace o ya se decidió');
+    /*
+     * El checklist, con el MISMO orden y las MISMAS columnas que proyecta el panel. Que las
+     * dos consultas coincidan no es casualidad ni disciplina: es lo que hace que el material
+     * contra el que se mide la presencia literal de las citas sea el que el modelo leyó. Si
+     * divergieran, el grounding empezaría a marcar como ausentes citas que están.
+     */
+    const requisitos = await tx`select id, texto, estado,
+        num_nonnulls(evidencia_id, insight_id, decision_id) = 1 as con_objeto
+      from checklist_item
+      where gate_id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+      order by orden asc`;
+    /*
+     * Un gate SIN checklist no tiene nada sobre lo que informar, y el contrato de CT obliga
+     * al modelo a devolver al menos una cita literal del material. Sin requisitos, la única
+     * salida que cumple el contrato sale de la ficha —el nombre del proyecto y el número del
+     * gate—, o sea inventada. Es el mismo caso que un item importado sin cuerpo, y la
+     * respuesta correcta es la misma: no ofrecer la generación, no intentarla peor.
+     */
+    if (requisitos.length === 0) {
+      throw new ErrorAI(
+        'Ese gate no tiene checklist todavía: no hay requisitos que revisar, así que no hay nada que informar',
+      );
+    }
+    return {
+      sistema: SISTEMA_ASISTENTE_GATES,
+      prompt: promptAsistenteGate({
+        proyecto: gate.proyecto as string,
+        numero: gate.numero as number,
+        rolAprobador: gate.rol_aprobador as string,
+        checklist: requisitos.map((c) => ({
+          id: c.id as string,
+          texto: c.texto as string,
+          estado: c.estado as string,
+          conObjeto: c.con_objeto as boolean,
+        })),
       }),
     };
   },
@@ -2021,7 +2169,20 @@ export async function registrarConsentimiento(
 /** Datos mínimos de la propuesta que se está revisando. */
 type PropuestaEnRevision = {
   capacidad: CapacidadActiva;
-  destino: 'evidencia' | 'criterio-exito';
+  /**
+   * `Destino | null`, y ese `null` es lo que hace que el compilador pida una decisión.
+   *
+   * Estaba escrito como la unión de los dos literales A MANO, y por eso volver `destino`
+   * anulable en el registro no rompió aquí NADA: una propuesta informativa se leía con su
+   * `null` disfrazado de destino y llegaba entera hasta `MATERIALIZAR[p.destino]`, que
+   * devolvía `undefined` y reventaba al llamarlo — sin decir por qué, y después de haber
+   * pasado por la corrección y las citas. El mismo defecto que este pipeline ya conoce: un
+   * tipo que copia a mano lo que otro declara deja de comprobar el día que aquél cambia.
+   *
+   * Escrito como el registro lo declara, `aceptarPropuesta` no compila hasta que alguien
+   * diga qué pasa cuando no hay destino. Y lo que pasa está abajo: no se acepta.
+   */
+  destino: Destino | null;
   /**
    * El id del ancla, el de la columna que SU capacidad declara.
    *
@@ -2173,6 +2334,25 @@ async function aceptarPropuestaEnTransaccion(
           'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',
         );
       }
+    }
+    /*
+     * Una propuesta INFORMATIVA no se acepta, y aquí es donde se dice.
+     *
+     * RF-08.4: CT «reporta huecos citando objetos; carece de acción aprobar». No hay objeto
+     * que crear, así que «aceptar» no significaría nada — y el CHECK
+     * `(estado in ('aceptada','corregida')) = (coalesce(evidencia_id, criterio_id) is not null)`
+     * de la base lo rechazaría de todas formas, pero con un error de restricción en vez de
+     * con un motivo. Quien lo lea merece saber que no es un fallo suyo: ese informe se lee y
+     * se descarta, y el gate lo aprueba una persona con su rol (SYS-18).
+     *
+     * Es también el narrowing que `MATERIALIZAR[p.destino]` necesita: sin este corte, el
+     * compilador se niega a indexar un `Record<Destino, …>` con `Destino | null`. Esa
+     * negativa es la costura funcionando — pide una decisión antes de dejar pasar.
+     */
+    if (p.destino === null) {
+      throw new ErrorAI(
+        `${CAPACIDADES[p.capacidad].etiqueta} es una capacidad INFORMATIVA: su propuesta no crea ningún objeto, así que no se acepta. Léela y descártala; lo que decida sobre el objeto de origen lo decide una persona con su rol.`,
+      );
     }
     // El destino y la forma del contenido van atados por el CHECK de la tabla y por el
     // esquema de la capacidad; el narrowing lo hace explícito para el compilador.

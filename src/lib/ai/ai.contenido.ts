@@ -114,9 +114,47 @@ export const ContenidoCriterioSchema = z.object({
 }).describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
 export type ContenidoCriterio = z.infer<typeof ContenidoCriterioSchema>;
 
+/**
+ * CT — qué falta para un gate, con los huecos citados (RF-08.4, SPEC-08 §30).
+ *
+ * INFORMATIVO: aquí no hay ningún campo que describa un objeto a crear, y esa ausencia es
+ * el contrato. CT «reporta huecos citando objetos; carece de acción aprobar». Lo que
+ * produce se lee y se descarta; el gate lo aprueba una persona con su rol (SYS-18).
+ *
+ * `huecos` PUEDE venir vacío, y ése es un resultado legítimo y además el bueno: no falta
+ * nada. Lo que no puede venir vacío son las citas — un informe que no dice qué miró no se
+ * distingue de uno que no miró nada, y es exactamente el que hay que poder desmentir.
+ */
+export const ContenidoAsistenteGateSchema = z
+  .object({
+    resumen: z.string().trim().min(1).max(2000),
+    huecos: z
+      .array(
+        z.object({
+          /*
+           * El item del checklist al que se refiere el hueco, POR SU ID.
+           *
+           * Se le pide un id y no una descripción porque el id es lo único verificable: el
+           * prompt le manda los items con el suyo, y el servicio comprueba después que cada
+           * uno de estos esté entre los que le mandó. Una descripción libre no se puede
+           * contrastar contra nada, y un hueco que señala un requisito que no existe manda a
+           * quien lo lee a buscar algo que no está.
+           */
+          checklistItemId: z.string().uuid(),
+          queFalta: z.string().trim().min(1).max(1000),
+          comoCerrarlo: z.string().trim().min(1).max(1000),
+        }),
+      )
+      .max(20),
+    citas: CitasSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoAsistenteGate = z.infer<typeof ContenidoAsistenteGateSchema>;
+
 /** Contenido de una propuesta: una de las formas tipadas, nunca un jsonb libre — así el
  * panel, el servicio y la corrección hablan del mismo objeto sin castings. */
-export type ContenidoPropuesta = ContenidoExtraccion | ContenidoCriterio;
+export type ContenidoPropuesta = ContenidoExtraccion | ContenidoCriterio | ContenidoAsistenteGate;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -144,6 +182,7 @@ export const ESQUEMA_DE_CONTENIDO: Record<
 > = {
   CI: ContenidoExtraccionSchema,
   C0: ContenidoCriterioSchema,
+  CT: ContenidoAsistenteGateSchema,
 };
 
 /**

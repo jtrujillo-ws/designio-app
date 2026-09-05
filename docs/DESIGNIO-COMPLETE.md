@@ -857,7 +857,9 @@ Miembros leen (es el lenguaje común con el cliente). Escriben los curadores (le
 
 SPEC-05 (RF-05.1 a RF-05.9), ADR-0006. PRs [#12](https://github.com/jtrujillo-ws/designio-app/pull/12),
 [#17](https://github.com/jtrujillo-ws/designio-app/pull/17), [#34](https://github.com/jtrujillo-ws/designio-app/pull/34).
-Pendiente (diseñado): vista timeline y por actor; exportación PNG/SVG del render.
+El render Mermaid se **descarga como SVG o PNG** desde la propia pantalla (`DiagramaMermaid`: el SVG
+tal cual, el PNG pintado en un canvas al doble de tamaño) y el **código Mermaid se copia** al
+portapapeles. Pendiente (diseñado): vista timeline y por actor.
 
 ---
 
@@ -1640,7 +1642,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-02 Árbol y grafo | Servicios **afectados** adicionales de un reto en la UI (la tabla `reto_servicio_afectado` existe y la lectura de journeys ya la usa); consultas de trazabilidad predefinidas como pantalla propia (a–f); `AlcanceDeContexto` explícito para la AI (hoy el alcance es por ancla y se resume en `alcance_resumen`) | RF-02.3, RF-02.6, RF-02.7 |
 | SPEC-03 Evidencia e importación | Transcripción y diarización (C1, requiere proveedor STT); escaneo de malware; object storage S3-compatible con proxy de bytes (hoy `bytea` en Postgres); preview y OCR de artefactos; codificación asistida por segmento y tema | RF-03.2, RF-03.7, RF-03.8 |
 | SPEC-04 Método | **Pantalla de J2** para crear el reto, definir y editar criterios a mano y activarlo con perfil (las server functions existen; ninguna ruta las llama); **conceptos y resultados de test** de la etapa 4 (G4 hoy se sostiene en el checklist, sin objeto propio ni umbral por concepto); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
-| SPEC-05 Journeys | Vistas timeline y por actor; exportación PNG/SVG y código Mermaid como artefacto | RF-05.3 |
+| SPEC-05 Journeys | Vistas timeline y por actor (la descarga SVG/PNG del render y la copia del código Mermaid ya están construidas en la pantalla del journey) | RF-05.3 |
 | SPEC-06 Trazabilidad | Detección AI de desviaciones (C7) | RF-06.8 |
 | SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; borrador AI del outcome review (C7); retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
 | SPEC-08 AI | Capacidades C1, C4 (revisores AI por arquetipo, con el esquema de simulación ya preparado), C7 y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; evaluaciones de grounding con línea base y regresión; observabilidad AI como panel (los datos ya están en `llamada_ai`) | RF-08.2, RF-08.7, RF-08.9 |

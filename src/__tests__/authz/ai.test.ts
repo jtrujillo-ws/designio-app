@@ -565,6 +565,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
        * En el uso normal se omite y sale de `CAPACIDADES`, que es lo que hace el servicio. */
       destino?: Destino | null;
       contenido?: ContenidoPropuesta;
+      /** Solo para probar el suelo del INSERT con un alcance que NO es el del reto: en el uso
+       * normal se omite y sale de la misma función que miran el guard y el panel. */
+      alcanceInsights?: string[];
     },
   ): Promise<string> {
     const contenido = campos.contenido ?? CONTENIDO_POR_CAPACIDAD[campos.capacidad];
@@ -599,10 +602,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               -- evidencia: una copia en el fixture fijaría justo lo que el suelo compara.
               -- Solo para C3: el CHECK deja nulo a las demás.
               ${
-                campos.capacidad === 'C3' && campos.anclas.reto_id
-                  ? tx`array(select v.id from insights_validados_del_reto(
+                campos.alcanceInsights !== undefined
+                  ? campos.alcanceInsights
+                  : campos.capacidad === 'C3' && campos.anclas.reto_id
+                    ? tx`array(select v.id from insights_validados_del_reto(
                         ${campos.anclas.reto_id}, ${ws}) as v(id))`
-                  : null
+                    : null
               },
               'entorno', ${llamadaId}, ${actorId})
       returning id`);
@@ -11918,6 +11923,120 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
 
   /**
+   * Y la MISMA regla al INSERTAR, que es lo que cierra la carrera con la validación.
+   *
+   * El servicio comprueba el material después de la llamada, pero esa lectura y el INSERT son
+   * dos momentos: `validarInsight` toma «designio:insight:<id>» y no la clave del reto, así
+   * que una validación puede cometearse justo en medio. Lo que se guardaba entonces era una
+   * propuesta con la llamada YA PAGADA y un alcance al que le falta un insight: nace
+   * `alcance-incompleto` y no se puede aceptar nunca — otra vez la tarjeta que solo se puede
+   * rechazar.
+   *
+   * El guard del INSERT sí lo ve, porque tiene el `for share` del reto tomado. La carrera se
+   * mide aquí por su EFECTO y no con dos transacciones: lo que la carrera produce es un INSERT
+   * cuyo alcance no es el del reto, y eso se escribe directamente. Montar la ventana exacta
+   * pediría un hueco dentro de `generarPropuestas` que no existe, y mediría el arnés en vez de
+   * la regla.
+   */
+  it('C3: no se guarda una propuesta cuyo alcance no es el del reto al insertarla', async () => {
+    const admin = sqlAdmin();
+    const [otro] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'Validado mientras el proveedor respondía', 'Llegó tarde al material.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const nuevoId = otro!.id as string;
+    const [af] = await admin`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${ws}, ${nuevoId}, 0, 'Llegó tarde', false) returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${ws}, ${af!.id as string}, ${evidenciaDelRetoId}, 'El 71% de los abandonos',
+              'resumen', ${leadId})`;
+    try {
+      // El alcance de ANTES: solo el que ya estaba, sin el que acaba de validarse. Es
+      // exactamente lo que la carrera deja escrito.
+      await expect(
+        nuevaPropuesta(leadId, {
+          capacidad: 'C3',
+          anclas: { reto_id: retoId },
+          alcanceInsights: [insightValidadoDelRetoId],
+        }),
+      ).rejects.toThrow(/el alcance que trae no es el que el reto tiene ahora/);
+      // Y con el alcance al día SÍ entra: sin esta mitad, un guard que rechazara siempre
+      // pasaría la de arriba sin medir nada.
+      const alDia = await nuevaPropuesta(leadId, {
+        capacidad: 'C3',
+        anclas: { reto_id: retoId },
+        alcanceInsights: [insightValidadoDelRetoId, nuevoId],
+      });
+      await admin`delete from propuesta_ai where id = ${alDia}`;
+    } finally {
+      await admin`delete from cita where afirmacion_id = ${af!.id as string}`;
+      await admin`delete from afirmacion where id = ${af!.id as string}`;
+      await admin`delete from insight where id = ${nuevoId}`;
+    }
+  });
+
+  /**
+   * El alcance declarado tiene que ser EL DEL RETO, no un superconjunto suyo.
+   *
+   * Con la cota escrita solo como «no falta ninguno», el array se podía PREDECLARAR: meter hoy
+   * un id ajeno y esperar a que ese insight pase a ser del reto —basta con enlazar su
+   * evidencia a un arquetipo suyo—. Entonces el conjunto real crece hasta caber dentro de lo
+   * declarado, la comprobación pasa POR HABERLO ANTICIPADO, y la HMW se sella sin haber visto
+   * un insight que el reto ya tiene. Es el agujero que esa comprobación existía para tapar,
+   * abierto desde el otro lado, y ni siquiera hace falta citar el ajeno: basta con declararlo.
+   *
+   * Por eso la cota es una IGUALDAD. Declarar de más no es un caso legítimo: el servicio
+   * escribe exactamente los que llegaron enteros, y desde que no se despacha con ninguno
+   * recortado eso es todo el conjunto.
+   */
+  it('C3: el alcance de una propuesta no puede declarar insights que no son del reto', async () => {
+    const admin = sqlAdmin();
+    const [aj] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'Un insight que aún no es del reto', 'Se enlazará después.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const ajenoId = aj!.id as string;
+    // La propuesta CITA solo el legítimo: lo que sobra está en el alcance, no en las citas.
+    const contenido = CONTENIDO_C3(insightValidadoDelRetoId);
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C3',
+      anclas: { reto_id: retoId },
+      contenido,
+    });
+    try {
+      // Predeclarado: el array lo escribe quien inserta, así que puede anticipar un id.
+      await admin`update propuesta_ai
+        set alcance_insights = alcance_insights || ${ajenoId}::uuid
+        where id = ${propuestaId}`;
+      await expect(
+        conUsuario(leadId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${contenido.pregunta}, ${contenido.prioridad},
+                    ${contenido.prioridadRazon}, ${leadId})
+            returning id`;
+          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+            values (${ws}, ${o!.id as string}, ${insightValidadoDelRetoId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        }),
+      ).rejects.toThrow(/el alcance declarado por esa propuesta no es el del reto/);
+    } finally {
+      await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
+      await admin`delete from propuesta_ai where id = ${propuestaId}`;
+      await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+      await admin`delete from oportunidad where workspace_id = ${ws}`;
+      await admin`delete from insight where id = ${ajenoId}`;
+    }
+  });
+
+  /**
    * Y lo CITADO tiene que caber dentro del alcance sellado.
    *
    * El alcance se comprobaba en un solo sentido —que estuvieran TODOS los validados del reto—
@@ -11970,33 +12089,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         }),
       ).rejects.toThrow(/cita insights que no entraron en el material/);
 
+
       /*
-       * Y con el alcance INFLADO, que es el caso que de verdad cierra la puerta: el array lo
-       * escribe quien inserta —hay `grant insert (alcance_insights)`— así que puede meter el
-       * ajeno dentro. Entonces las dos comprobaciones que miran el array se cumplen a la vez:
-       * la primera porque un superconjunto sigue conteniendo todos los del reto, y la segunda
-       * porque lo citado ya está dentro. Dos verdades sobre una lista que el propio llamante
-       * escribió no son ninguna verdad sobre el reto: la comprobación tiene que ir contra
-       * `insights_validados_del_reto`, que es el hecho, y no contra lo declarado.
+       * La otra mitad —inflar el alcance y citar lo inflado— ya no llega hasta aquí: desde que
+       * el alcance tiene que ser IGUAL al del reto, esa fila cae antes por la igualdad, y su
+       * caso vive ahora en la sonda de al lado. Mantenerla aquí mediría esa otra regla creyendo
+       * medir ésta. Lo que esta sonda sujeta es lo que la igualdad NO cubre: citar un ajeno sin
+       * declararlo, que deja el alcance cuadrando y la cita fuera del reto igual.
        */
-      await admin`update propuesta_ai
-        set alcance_insights = alcance_insights || ${ajenoId}::uuid
-        where id = ${propuestaId}`;
-      await expect(
-        conUsuario(leadId, async (tx) => {
-          const [o] = await tx`insert into oportunidad
-            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
-            values (${ws}, ${retoId}, ${contenido.pregunta}, ${contenido.prioridad},
-                    ${contenido.prioridadRazon}, ${leadId})
-            returning id`;
-          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
-            values (${ws}, ${o!.id as string}, ${ajenoId})`;
-          await tx`update propuesta_ai
-            set estado = 'aceptada', revisada_por = ${leadId},
-                oportunidad_id = ${o!.id as string}
-            where id = ${propuestaId} and workspace_id = ${ws}`;
-        }),
-      ).rejects.toThrow(/cita insights que no entraron en el material/);
     } finally {
       await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where id = ${propuestaId}`;

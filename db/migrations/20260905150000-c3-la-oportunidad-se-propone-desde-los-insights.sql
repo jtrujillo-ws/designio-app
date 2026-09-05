@@ -379,6 +379,31 @@ begin
       raise exception 'el portafolio de ese reto está cerrado: su G3 quedó firmado sobre lo que había y la etapa 3 no está reabierta, o el reto ya no admite trabajo de método';
     end if;
 
+    -- Y que el ALCANCE que trae sea el del reto AHORA, bajo el `for share` de arriba.
+    --
+    -- El servicio ya lo comprueba tras la llamada, pero esa lectura y este INSERT son dos
+    -- momentos: `validarInsight` toma «designio:insight:<id>» y no la clave del reto, así que
+    -- una validación puede cometearse justo en medio. Lo que se guardaba entonces era una
+    -- propuesta con la llamada PAGADA y un alcance al que ya le falta un insight: nace
+    -- `alcance-incompleto` y no se puede aceptar nunca. Aquí sí se ve, porque este guard tiene
+    -- el candado del reto tomado, y la salida correcta es no guardarla y decir que se repita.
+    --
+    -- Es la misma regla que el guard diferido vuelve a hacer en el commit, en su instante: lo
+    -- que caduca solo hay que preguntarlo cada vez que se escribe algo que dependa de ello.
+    -- Aquí va en una sola comprobación —falta o sobra— porque el destinatario es quien pidió
+    -- el lote y el remedio es el mismo: repetirlo. En el commit van separadas, porque ahí lo
+    -- lee quien revisa y el motivo que se enseña tiene que ser el que ocurrió.
+    if new.destino = 'oportunidad' and new.alcance_insights is not null
+       and (exists (
+             select 1 from insights_validados_del_reto(new.reto_id, new.workspace_id) as v(id)
+             where not (v.id = any (new.alcance_insights)))
+            or exists (
+             select 1 from unnest(new.alcance_insights) as a(id)
+             where a.id not in (
+               select v.id from insights_validados_del_reto(new.reto_id, new.workspace_id) as v(id)))) then
+      raise exception 'los insights validados de ese reto cambiaron mientras se preparaba esta propuesta: el alcance que trae no es el que el reto tiene ahora, así que estas preguntas se escribieron sobre otro material y no se guardan. Vuelve a pedirlas';
+    end if;
+
     -- La llamada referenciada tiene que ser LA QUE PRODUJO esta propuesta, no una
     -- cualquiera del workspace. La FK sola comprobaba existencia y tenant, así que por SQL
     -- crudo se podía colgar una extracción de una llamada C0, de otra ancla, de otro modelo
@@ -1106,6 +1131,24 @@ begin
       select 1 from insights_validados_del_reto(new.reto_id, new.workspace_id) as v(id)
        where not (v.id = any (new.alcance_insights))) then
       raise exception 'ese reto tiene insights validados que estas oportunidades no llegaron a ver: se validaron después de generarlas, así que la propuesta quedó obsoleta y solo puede rechazarse. Vuelve a pedirla para que los tenga en cuenta';
+    end if;
+    -- Y NINGUNO DE MÁS, que es lo que convierte la cota en una IGUALDAD.
+    --
+    -- Con «no falta ninguno» a secas, el array se podía PREDECLARAR: meter un id ajeno hoy y
+    -- esperar a que ese insight pase a ser del reto mañana —basta con enlazar su evidencia a
+    -- un arquetipo suyo—. Entonces el conjunto real crece hasta caber dentro de lo declarado,
+    -- la comprobación de arriba pasa por haberlo anticipado, y la HMW se sella sin haber visto
+    -- un insight que el reto ya tiene. Es justo el agujero que esa comprobación existía para
+    -- tapar, abierto desde el otro lado.
+    --
+    -- Declarar de más no es un caso legítimo: el servicio escribe EXACTAMENTE los que llegaron
+    -- enteros, y desde que no se despacha con ninguno recortado eso es todo el conjunto. Un
+    -- alcance que no cuadra con el reto solo sale de la superficie SQL.
+    if exists (
+      select 1 from unnest(new.alcance_insights) as a(id)
+      where a.id not in (
+        select v.id from insights_validados_del_reto(new.reto_id, new.workspace_id) as v(id))) then
+      raise exception 'el alcance declarado por esa propuesta no es el del reto: dice haber leído insights que el reto no tiene validados, así que no dice la verdad sobre lo que se le enseñó al modelo y no puede sellarse (SYS-19)';
     end if;
     -- Y EL OTRO SENTIDO: lo citado tiene que caber DENTRO del alcance.
     --

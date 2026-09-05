@@ -36,6 +36,10 @@ export async function buscarEnWorkspace(
   texto: string,
 ): Promise<{ resultados: ResultadoBusqueda[]; hayMas: boolean }> {
   const patron = patronDeBusqueda(texto);
+  // Un código tecleado entero va primero en su clase: «P-1» casa también con P-10…P-15 y,
+  // ordenando solo por título, el tope por clase podía dejar fuera justo el P-1 que se buscaba
+  // —y «afina la búsqueda» no ayuda cuando el texto ya es el código completo—.
+  const exacto = texto.trim().toLowerCase();
   // Además de la fila, cuántas hay en su clase: el recorte por clase también es «hay más»,
   // y solo contando se sabe si se recortó.
   const filas = await tx<(FilaBusqueda & { enClase: number })[]>`
@@ -43,7 +47,10 @@ export async function buscarEnWorkspace(
            en_clase as "enClase"
     from (
       select u.*,
-             row_number() over (partition by u.clase order by u.titulo, u.id) as n,
+             row_number() over (
+               partition by u.clase
+               order by (lower(u.codigo) = ${exacto}) desc, u.titulo, u.id
+             ) as n,
              count(*) over (partition by u.clase) as en_clase
       from (
         select 'servicio'::text as clase, s.id, null::text as codigo, s.nombre as titulo,
@@ -87,7 +94,7 @@ export async function buscarEnWorkspace(
                when 'servicio' then 1 when 'reto' then 2 when 'proyecto' then 3
                when 'journey' then 4 when 'design-version' then 5
                when 'evidencia' then 6 else 7 end,
-             titulo, id
+             n
     limit ${MAX_RESULTADOS + 1}`;
   const hayMas = filas.length > MAX_RESULTADOS || filas.some((f) => f.enClase > MAX_POR_CLASE);
   const visibles: FilaBusqueda[] = filas

@@ -100,6 +100,24 @@ describeAuthz('búsqueda del workspace (RLS + destinos)', () => {
     expect(hayMas).toBe(true);
   });
 
+  it('un código tecleado entero va primero, aunque sea prefijo de otros y la clase se recorte', async () => {
+    const admin = sqlAdmin();
+    // P-1 y P-10…P-15: siete proyectos que casan con «P-1». Por título, «Uno» va el último.
+    await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+      values (${wsA}, ${retoA}, 'P-1', ${`${marca} Uno exacto`}, ${userA})`;
+    for (let i = 10; i <= 15; i++) {
+      await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsA}, ${retoA}, ${`P-${i}`}, ${`${marca} Alfa ${i}`}, ${userA})`;
+    }
+    const { resultados, hayMas } = await conUsuario(userA, (tx) =>
+      buscarEnWorkspace(tx, wsA, 'p-1'),
+    );
+    const proyectos = resultados.filter((r) => r.clase === 'proyecto');
+    expect(proyectos).toHaveLength(5);
+    expect(proyectos[0]!.codigo).toBe('P-1');
+    expect(hayMas).toBe(true);
+  });
+
   it('los comodines del texto se buscan literales', async () => {
     const con = await conUsuario(userA, (tx) => buscarEnWorkspace(tx, wsA, '100%'));
     expect(con.resultados.map((r) => r.id)).toEqual([retoA]);

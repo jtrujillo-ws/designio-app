@@ -9,6 +9,7 @@ import {
   portafolioDelWorkspace,
   priorizarOportunidad,
 } from '@/lib/servicio/oportunidad.servicio';
+import { reabrirEtapa } from '@/lib/metodo/gobernanza.servicio';
 import { describeAuthz } from './helpers';
 
 /**
@@ -99,6 +100,9 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
     await admin`delete from oportunidad where workspace_id = ${ws}`;
     await admin`delete from checklist_item where workspace_id = ${ws}`;
+    // La decisión cuelga del gate: sin esta línea la limpieza muere en la FK.
+    await admin`delete from decision_insight where workspace_id = ${ws}`;
+    await admin`delete from decision where workspace_id = ${ws}`;
     await admin`delete from gate_instancia where workspace_id = ${ws}`;
     await admin`delete from etapa_instancia where workspace_id = ${ws}`;
     await admin`delete from reapertura_insight where workspace_id = ${ws}`;
@@ -620,6 +624,87 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     const [sigueAbierta] = await admin`select estado from etapa_instancia
       where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`;
     expect(sigueAbierta!.estado as string).toBe('en-curso');
+  });
+
+  /**
+   * Y un REGISTRO de reapertura no es una reapertura hasta que arrastra sus efectos.
+   *
+   * La puerta de arriba convirtió `reapertura_etapa` en una fila que MANDA: mientras exista con
+   * la hora de esta transacción, la etapa sale de 'completada' y con ella se abren todas las
+   * ventanas del ciclo. Y lo que exigía era que la fila EXISTIERA, que no es lo mismo que que la
+   * reapertura haya ocurrido. Medido, con un lead escribiendo registro y etapa en la misma
+   * transacción por la superficie concedida: `decision=vigente`, `eventos=0`, `etapa=en-curso` y
+   * la ventana del portafolio abierta. El registro era la coartada, no el acto.
+   *
+   * Se mide por las dos mitades y por el camino de verdad: el atajo se rechaza, y `reabrirEtapa`
+   * —que sí propaga— sigue funcionando y deja su evento, que ahora lo emite la BASE.
+   */
+  it('una reapertura sin sus efectos no pasa, y la de verdad deja su rastro', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio de los efectos', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo,
+       creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-EFE', 'Reto de los efectos', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoE = r!.id as string;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${retoE}, 'P-EFE', 'Proyecto', 'activo', 'rapido', ${leadId}) returning id`;
+    const proyectoE = p!.id as string;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoE}, 3, 'Conceptualización', 'completada')`;
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoE}, 3, 'sponsor') returning id`;
+    // Una decisión VIGENTE de ese gate: es la que `reabrirEtapa` pone «en-revisión», y la que
+    // el atajo dejaba en pie mientras abría la ventana.
+    const [d] = await admin`insert into decision
+      (workspace_id, proyecto_id, gate_id, tipo, titulo, fundamento, estado, decidido_por)
+      values (${ws}, ${proyectoE}, ${g!.id as string}, 'diseno', 'Se elige el flujo corto',
+              'Porque la evidencia lo apoya', 'vigente', ${leadId}) returning id`;
+    const decisionE = d!.id as string;
+
+    // El atajo: registro y etapa, sin propagar nada.
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        await tx`insert into reapertura_etapa
+          (workspace_id, proyecto_id, etapa_numero, motivo, alcance, decisiones_marcadas,
+           reabierto_por)
+          values (${ws}, ${proyectoE}, 3, 'Motivo cualquiera', 'etapa-completa', 0, ${leadId})`;
+        await tx`update etapa_instancia set estado = 'en-curso'
+          where proyecto_id = ${proyectoE} and workspace_id = ${ws} and numero = 3`;
+      }),
+    ).rejects.toThrow(/deja decisiones aguas abajo en pie/);
+    const [quieta] = await admin`select estado from etapa_instancia
+      where proyecto_id = ${proyectoE} and workspace_id = ${ws} and numero = 3`;
+    expect(quieta!.estado as string).toBe('completada');
+
+    // Y la reapertura DE VERDAD, por su servicio: propaga, abre y deja su evento.
+    const { decisionesMarcadas } = await reabrirEtapa(leadId, {
+      workspaceId: ws,
+      proyectoId: proyectoE,
+      etapaNumero: 3,
+      motivo: 'Llegó evidencia que cambia el portafolio',
+      insightIds: [],
+    });
+    expect(decisionesMarcadas).toBe(1);
+    const [tras] = await admin`select estado from decision where id = ${decisionE}`;
+    expect(tras!.estado as string).toBe('en-revision');
+    const [abierta] = await admin`select estado from etapa_instancia
+      where proyecto_id = ${proyectoE} and workspace_id = ${ws} and numero = 3`;
+    expect(abierta!.estado as string).toBe('en-curso');
+    // El evento lo emite ahora la BASE, no el servicio: UNO, con el número CONTADO —no el
+    // que declara la columna— y con el actor del mismo snapshot que escribió la fila.
+    const eventos = await admin`select payload, actor_id, actor_rol from evento_dominio
+      where workspace_id = ${ws} and tipo = 'EtapaReabierta'
+        and payload->>'proyectoId' = ${proyectoE}`;
+    expect(eventos.length, 'dos escritores del mismo evento, o ninguno').toBe(1);
+    expect((eventos[0]!.payload as Record<string, unknown>).decisionesMarcadas).toBe(1);
+    expect((eventos[0]!.payload as Record<string, unknown>).alcance).toBe('etapa-completa');
+    expect(eventos[0]!.actor_id).toBe(leadId);
+    expect(eventos[0]!.actor_rol).toBe('lead-boutique');
   });
 
   /**

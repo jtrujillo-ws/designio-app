@@ -268,6 +268,101 @@ create constraint trigger z_etapa_cruza_completada_por_la_puerta
   deferrable initially deferred
   for each row execute function etapa_cruza_completada_por_la_puerta_guard();
 
+-- ── Y un REGISTRO de reapertura no es una reapertura hasta que arrastra sus efectos ──
+--
+-- La rama de arriba convirtió `reapertura_etapa` en una fila que MANDA: mientras exista con la
+-- hora de esta transacción, la etapa sale de 'completada' y con ella se abren todas las
+-- ventanas del ciclo —insight, decisión, medición, la capa AI y el portafolio de G3—. Y lo que
+-- exige es que la fila EXISTA, que no es lo mismo que que la reapertura haya ocurrido.
+--
+-- Medido, con un lead escribiendo por la superficie SQL concedida el registro y la etapa en la
+-- MISMA transacción, que es exactamente lo que el guard pide:
+--
+--   tras el atajo: decision=vigente  eventos=0  etapa=en-curso
+--   reto_admite_portafolio = true
+--
+-- O sea: la ventana abierta, la decisión aguas abajo que `reabrirEtapa` habría puesto
+-- `en-revision` intacta —de modo que el proyecto sigue enseñando como vigente una decisión
+-- tomada sobre lo que se acaba de reabrir— y ni un solo `EtapaReabierta` en el archivo. Un
+-- registro sin sus efectos es la coartada, no el acto.
+--
+-- Se cierra por los dos lados, y ninguno de los dos es una comprobación nueva: son los efectos
+-- que `reabrirEtapa` YA escribe, mudados al sitio donde no se pueden saltar.
+--
+--   1. LA PROPAGACIÓN se vuelve obligatoria. Ninguna decisión del alcance de esta reapertura
+--      puede quedar `vigente` al commit. El predicado del alcance es el MISMO que el CTE del
+--      servicio: de la etapa reabierta en adelante, y —cuando la reapertura declara insights—
+--      solo las que se apoyan en alguno de ellos.
+--   2. EL EVENTO se vuelve una propiedad. Lo emitía el servicio, y una migración anterior dejó
+--      escrito por qué se quedaba allí: «su EtapaReabierta vive en el servicio de gobernanza,
+--      que es de quien es la tabla; mudarlo desde aquí sería reescribir el rastro de otro
+--      slice de paso». Ese argumento valía mientras la fila no gobernara nada. Ahora gobierna,
+--      así que el rastro de quién la escribió tiene que producirlo la misma escritura — que es
+--      la regla que este esquema aplica en todas partes: un evento en el servicio es una
+--      promesa; uno en el trigger es una propiedad.
+--
+-- DIFERIDO por lo mismo que su hermano de la etapa: `reabrirEtapa` escribe el registro, sus
+-- `reapertura_insight` y el marcado de decisiones en UNA sentencia (un CTE), y un guard
+-- inmediato dependería del orden en que se materializan sus ramas. Al commit están las tres.
+--
+-- Y el número del evento se CUENTA, no se copia de `decisiones_marcadas`: esa columna la
+-- escribe quien inserta y es una declaración suya. Lo que se cuenta son las decisiones del
+-- alcance que esta misma transacción dejó `en-revision` —`xmin` es la transacción que escribió
+-- la versión de la fila—, que es el número que de verdad ocurrió.
+create function reapertura_etapa_efectos_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+declare
+  v_marcadas integer;
+  v_declarados integer;
+begin
+  if session_user <> 'designio_app' then return null; end if;
+
+  if exists (
+    select 1 from decision d
+      join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id
+    where d.proyecto_id = new.proyecto_id and d.workspace_id = new.workspace_id
+      and g.numero >= new.etapa_numero
+      and d.estado = 'vigente'
+      and (new.alcance = 'etapa-completa'
+        or exists (select 1 from decision_insight di
+             join reapertura_insight ri on ri.insight_id = di.insight_id
+               and ri.workspace_id = di.workspace_id
+             where di.decision_id = d.id and di.workspace_id = d.workspace_id
+               and ri.reapertura_id = new.id))
+  ) then
+    raise exception 'esa reapertura deja decisiones aguas abajo en pie: reabrir una etapa pone «en-revisión» las decisiones que se apoyaban en lo reabierto, y un registro sin esa propagación abre la ventana sin cuestionar nada (RF-04.9)';
+  end if;
+
+  select count(*)::int into v_marcadas
+    from decision d
+    join gate_instancia g on g.id = d.gate_id and g.workspace_id = d.workspace_id
+   where d.proyecto_id = new.proyecto_id and d.workspace_id = new.workspace_id
+     and g.numero >= new.etapa_numero
+     and d.estado = 'en-revision'
+     and d.xmin = pg_current_xact_id()::xid;
+  select count(*)::int into v_declarados
+    from reapertura_insight ri
+   where ri.reapertura_id = new.id and ri.workspace_id = new.workspace_id;
+
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id, 'EtapaReabierta',
+      jsonb_build_object('proyectoId', new.proyecto_id, 'etapa', new.etapa_numero,
+                         'motivo', new.motivo, 'alcance', new.alcance,
+                         'insightsDeclarados', v_declarados,
+                         'decisionesMarcadas', v_marcadas),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  return null;
+end;
+$fn$;
+
+revoke execute on function reapertura_etapa_efectos_guard() from public;
+
+-- `z_` como el de la etapa, por detrás de `a_congelacion_por_disposicion`.
+create constraint trigger z_reapertura_etapa_efectos
+  after insert on reapertura_etapa
+  deferrable initially deferred
+  for each row execute function reapertura_etapa_efectos_guard();
+
 -- Verla es de todo miembro: el portal existe para que el cliente vea el razonamiento, y una
 -- oportunidad es exactamente el razonamiento que se le enseña en la etapa 3.
 create policy oportunidad_select on oportunidad

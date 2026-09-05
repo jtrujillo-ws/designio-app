@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
+import { EnlaceA } from '@/components/ui/EnlaceA';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
 import { Wordmark } from '@/components/ui/Wordmark';
@@ -270,7 +271,26 @@ function PantallaOportunidades() {
                   )}
                   {o.insights.map((i) => (
                     <span key={i.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                      <Tag>{i.titulo}</Tag>
+                      {/*
+                        La traza se puede SEGUIR, que es la mitad de para qué existe. Quien
+                        decide una oportunidad —o firma el G3 que la certifica— tiene que
+                        poder abrir el insight y leer sus afirmaciones y sus citas; con el
+                        título pintado como etiqueta muerta, la cadena
+                        oportunidad → insight → evidencia se enseña y no se recorre, y lo que
+                        queda es un nombre en el que hay que creer.
+
+                        `EnlaceA` con el destino que `/insights` ya entiende (`?destacar=<id>`),
+                        que es el mismo que usan la bandeja de aprobaciones y el buscador: un
+                        `<Link>` escrito aquí a mano sería una tercera redacción de la misma
+                        navegación.
+                      */}
+                      <EnlaceA
+                        destino={{ to: '/insights', search: { destacar: i.id } }}
+                        title={`Abrir el insight «${i.titulo}»`}
+                        style={{ textDecoration: 'none' }}
+                      >
+                        <Tag>{i.titulo}</Tag>
+                      </EnlaceA>
                       {puedeCurar && o.estado === 'propuesta' && (
                         <Button
                           variant="ghost"

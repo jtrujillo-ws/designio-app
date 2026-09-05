@@ -1222,8 +1222,24 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
     await tx`insert into usuario (email, nombre, password_hash, estado)
       values (${email}, ${nombre}, ${hash}, 'activo')
       on conflict (lower(email)) do nothing`;
-    const [u] = await tx`select id from usuario where lower(email) = ${email}`;
+    const [u] = await tx`select id, estado from usuario where lower(email) = ${email}`;
     const id = u!.id as string;
+    /*
+     * Una cuenta DESACTIVADA no recibe accesos, igual que en el flujo de invitación —que la
+     * rechaza explícitamente («la cuenta de ese correo está desactivada; no puede recibir
+     * invitaciones»)—. Sin esta guarda, el seed le concedía membresías privilegiadas y, si
+     * además no tenía contraseña, el `update` de abajo la devolvía a `activo`: un despliegue
+     * posterior deshacía una desactivación deliberada, que es una decisión de producto y no
+     * un detalle de arranque.
+     *
+     * Se falla en vez de saltárselo. Quien pone `SEED_ADMIN_EMAIL` apuntando a una cuenta
+     * desactivada tiene un problema que quiere ver.
+     */
+    if ((u!.estado as string) === 'inactivo') {
+      throw new Error(
+        `SEED_ADMIN_EMAIL apunta a ${email}, que es una cuenta DESACTIVADA: el seed no la reactiva ni le concede accesos`,
+      );
+    }
     /*
      * La contraseña solo se escribe si NO había ninguna —este seed corre en cada despliegue, y
      * reescribirla convertiría una variable de entorno vieja en una puerta abierta— y la
@@ -1235,10 +1251,27 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
      * secreto del seed. Leer y decidir por separado deja un hueco; el `where` lo cierra
      * porque la comprobación y la escritura pasan a ser la misma sentencia.
      */
-    await tx`update usuario
+    const [activada] = await tx`update usuario
       set password_hash = ${hash}, estado = 'activo',
           invitacion_token_hash = null, invitacion_expira = null, actualizado_en = now()
-      where id = ${id} and password_hash is null`;
+      where id = ${id} and password_hash is null
+      returning invitacion_origen_ws`;
+    /*
+     * Y si lo que se acaba de activar era una INVITACIÓN pendiente, su evento, como lo emite
+     * `activar_usuario_con_token`. Este `update` consume la invitación —limpia el token y su
+     * caducidad— así que sin el evento el historial del workspace que invitó se queda con una
+     * invitación pendiente para siempre y una identidad activa que nada explica. La condición
+     * es `invitacion_origen_ws`: sin él no había invitación que consumir y no hay a qué
+     * workspace contárselo.
+     */
+    if (activada?.invitacion_origen_ws) {
+      await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        values (${activada.invitacion_origen_ws as string}, 'UsuarioActivado',
+                ${tx.json({ email, origen: 'seed:SEED_ADMIN_EMAIL' })}, ${id},
+                (select rol from miembro
+                  where workspace_id = ${activada.invitacion_origen_ws as string}
+                    and usuario_id = ${id}))`;
+    }
 
     /*
      * Los DOS workspaces se resuelven aquí y por la FIRMA DEL SEED —tener a Lucía de miembro—,
@@ -1284,9 +1317,25 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
         );
         continue;
       }
-      await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+      /*
+       * `returning` para saber si esta transacción fue la que insertó. Dos procesos del mismo
+       * despliegue pueden ver los dos que no hay membresía: uno inserta y al otro su
+       * `on conflict do nothing` le afecta CERO filas — pero los dos emitían el evento y los
+       * dos decían «lead-boutique». Eso duplica la auditoría, y si el que ganó el conflicto
+       * fue otro flujo con otro rol, además la miente.
+       */
+      const [creada] = await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
         values (${wsId}, ${id}, ${nombre}, ${email}, 'lead-boutique')
-        on conflict do nothing`;
+        on conflict do nothing
+        returning rol`;
+      if (!creada) {
+        // Otro la creó entre nuestro `select` y este `insert`: se relee al ganador en vez de
+        // afirmar lo que quisimos escribir.
+        const [gano] = await tx`select rol from miembro
+          where workspace_id = ${wsId} and usuario_id = ${id}`;
+        dichos.push(`${w.nombre as string}: la creó otro arranque como ${gano?.rol ?? '¿?'}`);
+        continue;
+      }
       /*
        * Y su EVENTO, en la misma transacción que la concesión, como hace el flujo de
        * invitación. RF-01.6 exige que toda escritura quede auditada, y una membresía

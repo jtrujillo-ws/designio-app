@@ -9649,6 +9649,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * Y la llamada QUEDA ANOTADA con su coste: el gasto ocurrido se registra aunque su salida se
    * tire. Es la misma regla que en todo el slice, y lo que separa este caso del de arriba —el
    * de la revocación ANTES de despachar, donde no hay línea porque no hubo despacho—.
+   *
+   * QUIÉN rechaza cambió, y conviene dejarlo dicho porque el mensaje que se espera aquí es
+   * otro. Antes llegaba hasta el INSERT de la cita y lo paraba el suelo con su DR001
+   * traducido; ahora lo corta antes `COMPROBAR.C2`, que compara la huella del material dentro
+   * de la transacción que va a escribir. Es mejor por dos motivos: llega antes —sin intentar
+   * escribir nada— y su mensaje dice qué hacer con la propuesta, que es lo que una restricción
+   * de la base no puede decir. El suelo NO se queda sin sonda: lo pinta «una revocación en
+   * vuelo impide que nazca una propuesta ya muerta», que escribe la fila por SQL directo y no
+   * pasa por el servicio.
    */
   it('revocar los derechos con la llamada en vuelo: la propuesta de C2 no llega a nacer', async () => {
     await enWorkspaceLimpio('c2-derechos-tras-despachar', async ({ ws: wsC, curadorId, retoId: retoC }) => {
@@ -9678,7 +9687,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           async () => {
             await expect(
               generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
-            ).rejects.toThrow(/ya no se puede citar al cliente/);
+            ).rejects.toThrow(/cambió mientras el proveedor respondía/);
           },
         );
       } finally {
@@ -9696,6 +9705,80 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(tras!.n).toBeGreaterThan(antes!.n);
     });
   });
+
+  /**
+   * Y una evidencia que se enlaza MIENTRAS el proveedor responde.
+   *
+   * El candado previo al despacho se suelta al commitear el apunte, y la llamada viaja fuera
+   * de toda transacción —a propósito: un tercero lento no retiene una conexión—. En ese hueco
+   * cabe enlazar evidencia nueva al reto. La propuesta vuelve, se persiste y se acepta sin
+   * haber visto ese documento.
+   *
+   * Y no lo tapaba nada de lo que ya había, aunque el comentario de `COMPROBAR.C2` afirmara lo
+   * contrario: los guards de la base comprueban la evidencia que la respuesta SÍ citó —que sea
+   * del reto, que tenga derechos— y la materialización compara la descendencia contra lo
+   * propuesto. Las tres cosas son ciertas y ninguna mira lo que la respuesta NO PUDO citar.
+   * En C2 eso importa el doble: el documento que llega tarde puede ser justo el que
+   * CONTRADICE el insight, que es lo que I4 existe para no dejar esconder.
+   *
+   * Es lo mismo que C5 hace con su grafo, por el mismo canal (`huellaMaterial`) y a la misma
+   * altura del pipeline. Que una de las dos lo usara y la otra no era divergencia entre
+   * hermanos, no una diferencia de fondo.
+   */
+  it('una evidencia enlazada mientras responde el proveedor impide guardar la propuesta', async () => {
+    await enWorkspaceLimpio('c2-enlace-mientras-responde', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const [arqNuevo] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, 'Arquetipo tardío', 'Definición', ${curadorId}) returning id`;
+      const [fte] = await admin`insert into fuente
+        (workspace_id, tipo, titulo, referencia, creado_por)
+        values (${wsC}, 'documento', 'La contradicción', 'ref', ${curadorId}) returning id`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, 'La contradicción',
+                'En cambio el 12% dice que el documento nunca fue el problema.', '{}'::jsonb,
+                ${curadorId}) returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev2!.id as string}, 'concedido', 'cliente', 'Consentimiento',
+                ${curadorId}, now(), ${curadorId})`;
+
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      // El hueco con el material YA despachado: el apunte commiteó y soltó sus candados.
+      proveedor.duranteLlamada = async () => {
+        await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+          values (${wsC}, ${arqNuevo!.id as string}, ${ev2!.id as string})`;
+      };
+      try {
+        await conProveedor(
+          { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+            ).rejects.toThrow(/cambió mientras el proveedor respondía/);
+          },
+        );
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      // Ni una propuesta armada sin ver el documento que ya sostenía al reto…
+      const propuestas = await admin`select 1 from propuesta_ai
+        where workspace_id = ${wsC} and reto_id = ${retoC}`;
+      expect(propuestas.length).toBe(0);
+      // …y la llamada SÍ queda anotada: el gasto ocurrió aunque su salida se tire. Es la misma
+      // regla que en todo el slice, y lo que separa este caso del de antes de despachar.
+      const [tras] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(tras!.n).toBe(antes!.n + 1);
+    });
+  }, 20000);
 
   /**
    * El grafo puede cambiar SIN que cambien sus señales, y el informe deja de describirlo.

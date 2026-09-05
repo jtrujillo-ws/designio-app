@@ -2350,6 +2350,73 @@ function anclasDelInsert(
  * `Record<CapacidadActiva, …>` hace que el compilador exija la entrada de toda capacidad
  * nueva, que es la diferencia entre declarar y ramificar.
  */
+/**
+ * El material de C2, leído y resumido en su huella, con los CANDADOS que hacen de eso una
+ * garantía y no una foto. Una sola redacción porque la miran TRES sitios —preparar, revalidar
+ * antes de despachar y comprobar antes de persistir— y este PR ya lleva varias rondas cuyo
+ * hallazgo era «dos redacciones hermanas del mismo protocolo divergieron».
+ *
+ * Los candados, en el orden del sistema:
+ *   · `designio:workspace:` en compartido, que es el que toma el guard de congelación en toda
+ *     escritura y por tanto el primero del par. Aquí no hace falta para nada más: va delante
+ *     para no crear un segundo orden.
+ *   · `designio:reto:` por CLAVE, que es lo único que cubre una evidencia enlazada EN VUELO —
+ *     `for share` bloquea filas que existen, y un enlace sin commitear no está en ninguna—.
+ *   · `for share` sobre la fila del reto y sobre los `derecho_uso` de su evidencia, que es lo
+ *     que ordena las revocaciones y los archivados ya commiteados.
+ */
+async function huellaDelMaterialDeInsights(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+): Promise<{ huella: string; reto: { codigo: string; titulo: string; descripcion: string } | null }> {
+  await tx`select pg_advisory_xact_lock_shared(
+    hashtextextended('designio:workspace:' || ${entrada.workspaceId}, 42))`;
+  await tx`select pg_advisory_xact_lock(
+    hashtextextended('designio:reto:' || ${entrada.anclaId}, 42))`;
+  await tx`select 1 from reto
+    where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+    for share`;
+  const [reto] = await tx`select estado = 'archivado' as archivado, codigo, titulo, descripcion
+    from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+  if (!reto || (reto.archivado as boolean)) return { huella: '', reto: null };
+  await tx`select du.evidencia_id
+    from derecho_uso du
+    where du.workspace_id = ${entrada.workspaceId}
+      and du.evidencia_id in (
+        select ae.evidencia_id
+        from arquetipo a
+        join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+        where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId})
+    order by du.evidencia_id
+    for share`;
+  const evidencia = await tx`select distinct e.id, e.titulo, e.resumen
+    from arquetipo a
+    join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+    join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+    where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
+      and evidencia_usable(e.id, e.workspace_id, 'cliente')
+    order by e.titulo asc, e.id asc`;
+  return {
+    huella: huellaDelMaterial(
+      materialDeInsights({
+        codigo: reto.codigo as string,
+        titulo: reto.titulo as string,
+        descripcion: reto.descripcion as string,
+        evidencia: evidencia.map((e) => ({
+          id: e.id as string,
+          titulo: e.titulo as string,
+          resumen: e.resumen as string,
+        })),
+      }).texto,
+    ),
+    reto: {
+      codigo: reto.codigo as string,
+      titulo: reto.titulo as string,
+      descripcion: reto.descripcion as string,
+    },
+  };
+}
+
 const REVALIDAR: Record<
   CapacidadActiva,
   (
@@ -2401,104 +2468,26 @@ const REVALIDAR: Record<
   },
   C2: async (tx, entrada, huellaMaterial) => {
     /*
-     * El reto pudo archivarse mientras se preparaba la llamada, y entonces el insight nacería
-     * sobre un trabajo cerrado. Con CANDADO, por lo mismo que los derechos de abajo: un
-     * archivado EN VUELO no lo ve este snapshot, así que un `select` a secas lee la versión
-     * activa anterior sin esperar y el despacho se cuela por delante — se paga el análisis de
-     * un trabajo que este mismo camino declara cerrado.
+     * Dos preguntas, y las dos con la lectura que hace `huellaDelMaterialDeInsights`: bajo los
+     * candados del sistema (workspace, reto por clave, y `for share` sobre el reto y sus
+     * derechos), porque cada una de ellas la puso aquí un caso medido y no una precaución.
      *
-     * Va PRIMERO, antes del candado de `derecho_uso`: el mismo orden que toma el guard
-     * diferido de la aceptación y el que encabeza `bloquearReto` en el servicio, para que dos
-     * transacciones los pidan siempre en la misma secuencia.
+     * 1. Que el reto NO se haya archivado: el insight nacería sobre un trabajo cerrado, y se
+     *    pagaría el análisis de algo que este mismo camino declara terminado.
+     * 2. Que el MATERIAL siga siendo el que se armó — no «que quede alguna evidencia
+     *    utilizable». Aquí hubo un `exists (… evidencia_usable …)`, y esa pregunta pasa aunque
+     *    la evidencia a la que acaban de revocarle los derechos sea justo una de las que el
+     *    prompt YA LLEVA DENTRO. Preguntar por el conjunto entero es lo que corresponde a lo
+     *    que se va a mandar, y de paso cubre lo demás que puede haber cambiado: una evidencia
+     *    desenlazada, otra nueva, un resumen editado, la formulación del reto.
      */
-    /*
-     * Y ANTES de eso, los dos candados por CLAVE, en el orden en que los pide todo lo demás.
-     *
-     * El del RETO cubre lo que ningún candado de fila puede cubrir: una evidencia que se
-     * enlaza al reto MIENTRAS se prepara la llamada. `for share` bloquea filas que existen, y
-     * un `insert into arquetipo_evidencia` sin commitear no está en ninguna — la lectura no lo
-     * ve, no espera, y el material sale viejo. Peor con un arquetipo nuevo: ahí ni siquiera
-     * existía la fila padre. Por eso el candado es por clave (`designio:reto:`), el mismo que
-     * toma `gate_aprobar_suficiencia_guard` cuando decide sobre filas de otras tablas, y el
-     * que este PR pone en un trigger de `arquetipo` y `arquetipo_evidencia` para que lo tome
-     * también quien escribe por SQL directo.
-     *
-     * El del WORKSPACE no hace falta para nada aquí, y aun así va delante: el guard de
-     * congelación lo toma —en modo compartido— antes que ningún otro en toda escritura, así
-     * que el orden del sistema es workspace → reto. Sin esta línea, el despacho pediría reto y
-     * después workspace (se lo pide su propio insert en `llamada_ai`), mientras una
-     * disposición en curso —la única que lo toma en EXCLUSIVA, y que borra `arquetipo`— los
-     * pediría al revés. Dos órdenes sobre el mismo par es un abrazo mortal esperando.
-     */
-    await tx`select pg_advisory_xact_lock_shared(
-      hashtextextended('designio:workspace:' || ${entrada.workspaceId}, 42))`;
-    await tx`select pg_advisory_xact_lock(
-      hashtextextended('designio:reto:' || ${entrada.anclaId}, 42))`;
-    await tx`select 1 from reto
-      where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-      for share`;
-    const [reto] = await tx`select estado = 'archivado' as archivado, codigo, titulo, descripcion
-      from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
-    if (!reto || (reto.archivado as boolean)) {
+    const { huella, reto } = await huellaDelMaterialDeInsights(tx, entrada);
+    if (!reto) {
       throw new ErrorAI(
         'Ese reto se archivó mientras se preparaba la llamada: no se llamó al proveedor',
       );
     }
-    /*
-     * Y el MATERIAL tiene que seguir siendo el que se armó — no «que quede alguna evidencia
-     * utilizable».
-     *
-     * Aquí había un `exists (… evidencia_usable …)`, y esa pregunta pasa aunque la evidencia
-     * a la que acaban de revocarle los derechos sea justo una de las que el prompt YA LLEVA
-     * DENTRO: el bloque está construido desde la transacción anterior y saldría igual hacia
-     * el proveedor. Preguntar por el conjunto entero es lo que corresponde a lo que se va a
-     * mandar, y de paso cubre lo demás que puede haber cambiado: una evidencia desenlazada,
-     * otra nueva, un resumen editado, la formulación del reto.
-     *
-     * Y el CANDADO antes de leerlos, que es lo que convierte esto en una garantía y no en una
-     * foto. Sin él, una revocación EN VUELO no la ve este snapshot —no ha commiteado—, la
-     * huella cuadra, y esa revocación puede commitear antes de que `abrirLlamada` cierre su
-     * transacción y despache: material del cliente saliendo hacia un tercero después de que le
-     * retiraran el permiso. Es el peor desenlace del pipeline y el único irreversible — lo que
-     * ya salió no se puede retirar.
-     *
-     * `for share` sobre las filas de `derecho_uso` de la evidencia del reto, ordenadas por id:
-     * el protocolo que este repositorio ya tiene escrito en `candados-compartidos` y el mismo
-     * que toman el guard del insert y el guard diferido de la aceptación. Con él hay un orden:
-     * o la revocación commitea antes y esta lectura la ve —y no se despacha—, o espera a que
-     * el despacho quede anotado. Va en ESTA transacción y no en `PREPARAR.C2` porque el
-     * candado se suelta al commitear, y la que tiene que ganar es la que despacha.
-     */
-    await tx`select du.evidencia_id
-      from derecho_uso du
-      where du.workspace_id = ${entrada.workspaceId}
-        and du.evidencia_id in (
-          select ae.evidencia_id
-          from arquetipo a
-          join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
-          where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId})
-      order by du.evidencia_id
-      for share`;
-    const evidencia = await tx`select distinct e.id, e.titulo, e.resumen
-      from arquetipo a
-      join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
-      join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
-      where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
-        and evidencia_usable(e.id, e.workspace_id, 'cliente')
-      order by e.titulo asc, e.id asc`;
-    const ahora = huellaDelMaterial(
-      materialDeInsights({
-        codigo: reto.codigo as string,
-        titulo: reto.titulo as string,
-        descripcion: reto.descripcion as string,
-        evidencia: evidencia.map((e) => ({
-          id: e.id as string,
-          titulo: e.titulo as string,
-          resumen: e.resumen as string,
-        })),
-      }).texto,
-    );
-    if (ahora !== (huellaMaterial ?? '')) {
+    if (huella !== (huellaMaterial ?? '')) {
       throw new ErrorAI(
         'La evidencia de ese reto cambió mientras se preparaba la llamada —se revocaron derechos, se desenlazó o se editó—, así que el material ya no es el que se iba a mandar: no se llamó al proveedor. Vuelve a pedirlo.',
       );
@@ -2869,12 +2858,38 @@ const COMPROBAR: Record<
   // Los huecos de CT los comprueba un trigger, que es un suelo más bajo que éste.
   CT: async () => {},
   /*
-   * C2 tampoco: su contenido lo sujetan el esquema y los guards de la base —la evidencia
-   * citada es del reto, sus derechos siguen vigentes, y la materialización compara la
-   * descendencia entera contra lo propuesto—. No hay nada que contrastar aquí que no esté ya
-   * contrastado donde puede hacerse de verdad, que es dentro de la transacción que escribe.
+   * C2 SÍ, y lo que estaba escrito aquí antes era falso donde más importa. Decía que no había
+   * nada que contrastar porque «la evidencia citada es del reto, sus derechos siguen vigentes,
+   * y la materialización compara la descendencia entera contra lo propuesto». Las tres cosas
+   * son ciertas y ninguna cubre esto: todas miran lo que la respuesta SÍ citó. Lo que no se
+   * miraba es lo que la respuesta NO PUDO citar.
+   *
+   * La llamada al proveedor ocurre fuera de toda transacción —a propósito: un tercero lento no
+   * retiene una conexión—, y el candado previo al despacho se suelta al commitear el apunte.
+   * En ese hueco se puede enlazar evidencia nueva al reto. La propuesta vuelve, se persiste y
+   * se acepta sin haber visto ese documento — y en C2 el documento que llega tarde puede ser
+   * justo el que CONTRADICE el insight, que es lo que I4 existe para no dejar esconder.
+   *
+   * Es exactamente lo que C5 hace dos entradas más abajo con su grafo, y con el mismo canal:
+   * `huellaMaterial` se construyó compartido en este PR para esto. Que una de las dos lo usara
+   * y la otra no era la divergencia entre hermanos que este PR ya ha corregido varias veces.
+   *
+   * La comparación va bajo los mismos candados que la de antes del despacho —`huellaDelMaterialDeInsights`—
+   * y dentro de la transacción que escribe, que es lo que la hace atómica con la fila.
    */
-  C2: async () => {},
+  C2: async (tx, entrada, _contenidos, huellaMaterial) => {
+    const { huella, reto } = await huellaDelMaterialDeInsights(tx, entrada);
+    if (!reto) {
+      throw new ErrorAI(
+        'Ese reto se archivó mientras el proveedor respondía: la propuesta no se guarda',
+      );
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'La evidencia de ese reto cambió mientras el proveedor respondía —se enlazó, se desenlazó, se revocaron derechos o se editó—, así que estos insights se armaron sin verla: la propuesta no se guarda. Vuelve a pedirla.',
+      );
+    }
+  },
   C5: async (tx, entrada, contenidos, huellaMaterial) => {
     const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
     if (!journey) throw new ErrorAI('El journey dejó de existir mientras se generaba el informe');

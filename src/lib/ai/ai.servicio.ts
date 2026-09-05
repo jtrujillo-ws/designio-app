@@ -2184,12 +2184,15 @@ const PREPARAR: Record<
      * única salida que le quedaba era inventarla — y `COMPROBAR.C5` no la puede distinguir de
      * una buena, porque cubre exactamente la señal que se le pidió.
      *
-     * `nucleoDeRemediacion` pone ese núcleo delante, así que sobrevive al recorte salvo que él
-     * SOLO ya no quepa. Ese caso se dice aquí, antes de gastar, y se dice qué hacer.
+     * `nucleoDeRemediacion` pone delante las señales, sus nodos y el grafo ENTERO de
+     * transiciones, así que todo eso sobrevive al recorte salvo que ello solo ya no quepa. Ese
+     * caso se dice aquí, antes de gastar, y se dice qué hacer: sin la conectividad completa,
+     * media docena de los códigos que emite la validación —los que preguntan por el grafo y no
+     * por un nodo— no tienen respuesta fiable.
      */
     if (!prompt.nucleo.cabe) {
       throw new ErrorAI(
-        `El grafo alrededor de las señales de ese journey ocupa ${prompt.nucleo.caracteres} caracteres y al modelo le caben ${MAX_MATERIAL}: no se llamó al proveedor, porque tendría que responder sin ver los nodos que se le pide remediar. Cierra a mano las señales de los tramos más cargados y vuelve a pedirlo.`,
+        `Las señales de ese journey y su grafo de transiciones ocupan ${prompt.nucleo.caracteres} caracteres y al modelo le caben ${MAX_MATERIAL}: no se llamó al proveedor, porque tendría que responder sin ver la conectividad que se le pide remediar. Cierra a mano las señales de los tramos más cargados, o parte el journey, y vuelve a pedirlo.`,
       );
     }
     return {

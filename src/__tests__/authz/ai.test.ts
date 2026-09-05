@@ -6083,7 +6083,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         async () => {
           await expect(
             generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
-          ).rejects.toThrow(/sin ver los nodos que se le pide remediar/);
+          ).rejects.toThrow(/sin ver la conectividad que se le pide remediar/);
         },
       );
       const [despues] = await admin`select count(*)::int as n from llamada_ai

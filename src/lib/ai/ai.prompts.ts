@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.7';
+export const PROMPT_VERSION = 'ai-2026-09-05.8';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -224,25 +224,33 @@ export type MaterialDeJourney = MaterialDelimitado & {
 };
 
 /**
- * El NÚCLEO de un encargo de remediación —las señales, los nodos que nombran, los vecinos a
- * los que llegan sus transiciones y esas transiciones— y, aparte, EL RESTO del grafo.
+ * El NÚCLEO de un encargo de remediación —las señales, los nodos que nombran, los vecinos que
+ * sus transiciones alcanzan y EL GRAFO DE TRANSICIONES ENTERO— y, aparte, el resto: las
+ * etiquetas de los demás nodos.
  *
  * La partición existe porque el cuerpo se recorta a `MAX_MATERIAL` y no todo el grafo vale lo
  * mismo. El encargo de C5 es «di cómo cerrar CADA una de estas N señales», y eso no se puede
- * responder sin ver el nodo de cada señal y por dónde se entra y se sale de él; el resto del
- * grafo ayuda, pero su ausencia no impide responder.
+ * responder sin ver el nodo de cada señal y cómo está conectado; la etiqueta de un nodo que
+ * ninguna señal toca ayuda a redactar, pero su ausencia no impide responder.
  *
- * Poner las señales delante —que fue el arreglo anterior— dejó de perderlas a ELLAS, y seguía
- * perdiendo su topología: en un grafo de cuatrocientos nodos, el material que llegaba al
- * modelo decía «el paso X no tiene salida» sin contener el paso X ni una sola transición. Y el
- * contrato le exige una remediación por señal igual, así que la única salida que le queda es
- * inventarla; `COMPROBAR.C5` no puede distinguir un consejo inventado de uno bueno —cubre
- * exactamente la señal que se le pidió—, de modo que se acepta, se paga y se lee como si
- * alguien hubiera mirado el grafo.
+ * Poner las señales delante —el arreglo anterior— dejó de perderlas a ELLAS, y seguía
+ * perdiendo su topología: en un grafo grande, el material decía «el paso X no tiene salida»
+ * sin contener el paso X ni una sola transición. Y el contrato le exige una remediación por
+ * señal igual, así que la única salida que le queda es inventarla; `COMPROBAR.C5` no puede
+ * distinguir un consejo inventado de uno bueno —cubre exactamente la señal que se le pidió—,
+ * de modo que se acepta, se paga y se lee como si alguien hubiera mirado el grafo.
  *
- * El tamaño del núcleo lo acota el número de señales (`MAX_REMEDIACIONES`) y no el del grafo,
- * que es lo que hace que quepa casi siempre. Casi: cuando no cabe, quien va a pagar lo mira
- * antes y no llama.
+ * Y va el grafo ENTERO de transiciones, no la vecindad de las señales, que fue el intento a
+ * medias: media docena de los códigos que emite la validación son preguntas DE GRAFO y no de
+ * nodo —«no se llega hasta aquí», «desde aquí no se llega a ningún final», «el recorrido es un
+ * ciclo cerrado»—, y a esas un salto no las contesta: para decir dónde enganchar un paso
+ * inalcanzable hay que ver desde dónde se llega a alguna parte. La conectividad es además la
+ * mitad BARATA del grafo: una transición son dos identificadores, y una etiqueta es prosa. Lo
+ * caro es lo que se recorta.
+ *
+ * Lo acota entonces el número de transiciones, no el de señales. Cuando ni eso cabe —un grafo
+ * de varios cientos de enlaces— la conectividad no se puede enseñar entera y ninguna respuesta
+ * de grafo sería fiable: quien va a pagar lo mira antes y no llama.
  */
 export function nucleoDeRemediacion(grafo: GrafoDelJourney): {
   texto: string;
@@ -272,18 +280,16 @@ export function nucleoDeRemediacion(grafo: GrafoDelJourney): {
       (s) => `[${s.codigo}] severidad ${s.severidad} · nodo [${s.nodoId}]\n${s.mensaje}`,
     ),
     '',
-    'NODOS Y TRANSICIONES DE LAS SEÑALES (lo que hay que remediar)',
+    'NODOS DE LAS SEÑALES Y SUS VECINOS (lo que hay que remediar)',
     ...nodos.filter((n) => delNucleo.has(n.id)).map(lineaDeNodo),
-    ...aristas.filter(incidente).map(lineaDeArista),
+    '',
+    'TRANSICIONES Y ENLACES (el grafo entero)',
+    ...aristas.map(lineaDeArista),
   ].join('\n');
   const resto = [
     '',
-    'RESTO DEL GRAFO (contexto)',
-    'NODOS',
+    'ETIQUETAS DE LOS DEMÁS NODOS (contexto)',
     ...nodos.filter((n) => !delNucleo.has(n.id)).map(lineaDeNodo),
-    '',
-    'TRANSICIONES Y ENLACES',
-    ...aristas.filter((a) => !incidente(a)).map(lineaDeArista),
   ].join('\n');
   return { texto, resto, cabe: texto.length <= MAX_MATERIAL };
 }
@@ -453,7 +459,7 @@ export function promptRemediacionJourney(journey: {
       // el núcleo a remediar, detrás el contexto. Que además quepa entero es lo que mira quien
       // paga la llamada, y si no cabe no se llega hasta aquí.
       material.truncado
-        ? `(El grafo se truncó a ${MAX_MATERIAL} caracteres: primero van las señales y la topología que hay que remediar, y lo que falta es el contexto de alrededor. No afirmes nada sobre los nodos que no ves.)`
+        ? `(El grafo se truncó a ${MAX_MATERIAL} caracteres: las señales, sus nodos y TODAS las transiciones van delante, así que la conectividad que ves está completa; lo que falta son las etiquetas de los demás nodos. No los nombres por su etiqueta si no la ves.)`
         : '',
     ]
       .filter(Boolean)

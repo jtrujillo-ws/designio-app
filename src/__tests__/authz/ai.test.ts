@@ -6665,4 +6665,125 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(p.citas.map((c) => c.presenteLiteral)).toEqual([true, false, false]);
     });
   });
+
+  /**
+   * Revocar los derechos de UNA evidencia entre preparar y despachar para la llamada.
+   *
+   * La revalidación preguntaba `exists (… evidencia_usable …)`, y esa pregunta pasa aunque la
+   * evidencia a la que acaban de revocarle los derechos sea justo una de las que el prompt YA
+   * LLEVA DENTRO: el bloque se armó en la transacción anterior y saldría igual hacia el
+   * proveedor. Con dos evidencias y una revocada, la vieja comprobación decía «queda una» y
+   * despachaba el documento revocado.
+   *
+   * Se usa el hueco REAL —`antesDelApunte`, que es el instante con la autorización ya leída y
+   * ni un byte todavía en el aire— y se mide por el LIBRO: lo que hay que probar es que NO se
+   * despachó, no que la llamada fallara después.
+   */
+  it('revocar los derechos de una evidencia entre preparar y despachar para la llamada', async () => {
+    await enWorkspaceLimpio('c2-derechos-en-vuelo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const a = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'AAA la que se queda',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const b = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'BBB la que se revoca',
+        resumen: 'Quien abandona dice que no sabía qué documento subir.',
+      });
+
+      let despachos = 0;
+      proveedor.antesDelApunte = async () => {
+        // Denegar exige decisión completa (`derecho_decision_completa`): quién, cuándo y con
+        // qué base. Un `denegado` a medias lo rechaza la base, y con razón.
+        await admin`update derecho_uso
+          set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+              decidido_por = ${curadorId}, decidido_en = now()
+          where evidencia_id = ${b} and workspace_id = ${wsC}`;
+      };
+      proveedor.duranteLlamada = async () => {
+        despachos += 1;
+      };
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      try {
+        await conProveedor(
+          { ok: true, datos: { insights: [] }, intentos: [intento({ uso: null })] },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+            ).rejects.toThrow(/cambió mientras se preparaba/);
+          },
+        );
+      } finally {
+        proveedor.antesDelApunte = null;
+        proveedor.duranteLlamada = null;
+      }
+
+      // Ni un byte en el aire, y sin línea en el libro: no se abre para una llamada que no
+      // ocurre. Con la comprobación vieja, la evidencia `a` seguía siendo utilizable y esto
+      // habría despachado el prompt con `b` dentro.
+      expect(despachos, 'se despachó el material con la evidencia revocada dentro').toBe(0);
+      const [tras] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(tras!.n).toBe(antes!.n);
+      // Y la evidencia que se quedó sigue siendo utilizable: sin esto, el caso podría estar
+      // pasando por «el reto se quedó sin evidencia», que es otra regla.
+      //
+      // Se pregunta CON CONTEXTO DE USUARIO y no con la conexión de administración: la primera
+      // línea de `evidencia_usable` es `is_workspace_member(app_user_id(), …)`, y para el
+      // administrador `app_user_id()` es nulo — la respuesta sería `false` siempre, y esta
+      // sonda diría lo contrario de lo que quiere decir.
+      const [usable] = await conUsuario(curadorId, (tx) => tx`
+        select evidencia_usable(${a}::uuid, ${wsC}::uuid, 'cliente') as x`);
+      expect(usable!.x).toBe(true);
+    });
+  });
+
+  /**
+   * Y el evento de la aceptación dice QUÉ insight se creó.
+   *
+   * `jsonb_strip_nulls` se lleva `evidenciaId` y `criterioId` por nulos, así que sin
+   * `insightId` el evento de una aceptación de C2 no nombraba el objeto que documenta — un
+   * registro append-only que no puede decir qué se creó no documenta nada. Es la misma
+   * enumeración corta de siempre, esta vez en la bitácora.
+   */
+  it('el evento de una aceptación de C2 nombra el insight materializado', async () => {
+    await enWorkspaceLimpio('c2-evento-insight', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido: ContenidoInsight = {
+        titulo: 'T',
+        resumen: 'R',
+        afirmaciones: [
+          {
+            texto: 'A',
+            esHipotesis: false,
+            citas: [{ evidenciaId: ev, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
+          },
+        ],
+        contradicciones: [],
+        confianzaPropuesta: 'media',
+      };
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p.id,
+      });
+
+      const [evento] = await sqlAdmin()`select payload from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'PropuestaAIAceptada'
+          and payload->>'propuestaId' = ${p.id}`;
+      expect(
+        (evento!.payload as { insightId?: string }).insightId,
+        'el evento no dice qué insight se creó',
+      ).toBe(objetoId);
+    });
+  });
 });

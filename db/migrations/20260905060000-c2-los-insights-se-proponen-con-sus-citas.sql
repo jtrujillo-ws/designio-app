@@ -336,9 +336,15 @@ begin
       when 'corregida' then 'PropuestaAICorregida'
       else 'PropuestaAIRechazada'
     end,
+    -- El objeto materializado, POR SU COLUMNA, y ahora las tres. `insight_id` faltaba y
+    -- `jsonb_strip_nulls` se lleva las otras dos por nulas, así que el evento de una
+    -- aceptación de C2 no decía QUÉ insight se creó: un registro append-only que no puede
+    -- nombrar el objeto que documenta no documenta nada. Es la misma enumeración corta de
+    -- siempre, esta vez en la bitácora.
     jsonb_strip_nulls(jsonb_build_object(
       'propuestaId', new.id, 'capacidad', new.capacidad, 'destino', new.destino,
-      'modelo', new.modelo, 'evidenciaId', new.evidencia_id, 'criterioId', new.criterio_id)),
+      'modelo', new.modelo, 'evidenciaId', new.evidencia_id, 'criterioId', new.criterio_id,
+      'insightId', new.insight_id)),
     app_user_id(), workspace_role(app_user_id(), new.workspace_id));
   return new;
 end $function$;

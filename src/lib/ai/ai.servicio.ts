@@ -1,4 +1,5 @@
 import '@/lib/server-only';
+import { createHash } from 'node:crypto';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
@@ -1110,6 +1111,8 @@ type Alcance = {
    * libera si la generación no llega a nacer. */
   reservaId: string;
   unidades: number;
+  /** La huella del material que `PREPARAR` le enseñó al modelo. Ver `Preparacion`. */
+  huellaMaterial?: string;
 };
 
 /**
@@ -1153,7 +1156,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const consentimiento = exigeConsentimiento
       ? await leerConsentimientoBajoCandado(tx, entrada)
       : null;
-    const { sistema, prompt } = await PREPARAR[entrada.capacidad](tx, entrada);
+    const { sistema, prompt, huellaMaterial } = await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
       throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
     }
@@ -1247,6 +1250,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       key,
       reservaId: reserva!.id as string,
       unidades,
+      huellaMaterial,
     };
   });
 }
@@ -1503,7 +1507,7 @@ async function comprobarDespacho(
     if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
       versionConsentimiento = await exigirConsentimientoVigente(tx, entrada, 'antes-de-despachar');
     }
-    await REVALIDAR[entrada.capacidad](tx, entrada);
+    await REVALIDAR[entrada.capacidad](tx, entrada, alcance.huellaMaterial);
 
     // El token de despacho: la reserva sigue existiendo y NO ha caducado. Una revocación la
     // retira, y una caducada dejó de contar para admitir a los demás — despachar con ella
@@ -1781,7 +1785,11 @@ function anclasDelInsert(
  */
 const REVALIDAR: Record<
   CapacidadActiva,
-  (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<void>
+  (
+    tx: TransactionSql,
+    entrada: GenerarPropuestas,
+    huellaMaterial: string | undefined,
+  ) => Promise<void>
 > = {
   CI: async (tx, entrada) => {
     // El consentimiento NO se comprueba aquí: lo hace `exigirConsentimientoVigente`, que corre
@@ -1824,20 +1832,49 @@ const REVALIDAR: Record<
       );
     }
   },
-  C2: async (tx, entrada) => {
+  C2: async (tx, entrada, huellaMaterial) => {
     // El reto pudo archivarse mientras se preparaba la llamada, y entonces el insight nacería
-    // sobre un trabajo cerrado. Y la evidencia pudo desenlazarse de sus arquetipos: sin ella
-    // no hay nada que citar, que es lo mismo que le pasa a CI con un item sin material.
-    const [reto] = await tx`select r.estado = 'archivado' as archivado,
-        exists (select 1 from arquetipo a
-          join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
-          join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
-          where a.reto_id = r.id and a.workspace_id = r.workspace_id
-            and evidencia_usable(e.id, e.workspace_id, 'cliente')) as con_evidencia
-      from reto r where r.id = ${entrada.anclaId} and r.workspace_id = ${entrada.workspaceId}`;
-    if (!reto || (reto.archivado as boolean) || !(reto.con_evidencia as boolean)) {
+    // sobre un trabajo cerrado.
+    const [reto] = await tx`select estado = 'archivado' as archivado, codigo, titulo, descripcion
+      from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+    if (!reto || (reto.archivado as boolean)) {
       throw new ErrorAI(
-        'Ese reto se archivó o se quedó sin evidencia enlazada mientras se preparaba la llamada: no se llamó al proveedor',
+        'Ese reto se archivó mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+    /*
+     * Y el MATERIAL tiene que seguir siendo el que se armó — no «que quede alguna evidencia
+     * utilizable».
+     *
+     * Aquí había un `exists (… evidencia_usable …)`, y esa pregunta pasa aunque la evidencia
+     * a la que acaban de revocarle los derechos sea justo una de las que el prompt YA LLEVA
+     * DENTRO: el bloque está construido desde la transacción anterior y saldría igual hacia
+     * el proveedor. Preguntar por el conjunto entero es lo que corresponde a lo que se va a
+     * mandar, y de paso cubre lo demás que puede haber cambiado: una evidencia desenlazada,
+     * otra nueva, un resumen editado, la formulación del reto.
+     */
+    const evidencia = await tx`select distinct e.id, e.titulo, e.resumen
+      from arquetipo a
+      join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+      join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+      where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
+        and evidencia_usable(e.id, e.workspace_id, 'cliente')
+      order by e.titulo asc, e.id asc`;
+    const ahora = huellaDelMaterial(
+      materialDeInsights({
+        codigo: reto.codigo as string,
+        titulo: reto.titulo as string,
+        descripcion: reto.descripcion as string,
+        evidencia: evidencia.map((e) => ({
+          id: e.id as string,
+          titulo: e.titulo as string,
+          resumen: e.resumen as string,
+        })),
+      }).texto,
+    );
+    if (ahora !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'La evidencia de ese reto cambió mientras se preparaba la llamada —se revocaron derechos, se desenlazó o se editó—, así que el material ya no es el que se iba a mandar: no se llamó al proveedor. Vuelve a pedirlo.',
       );
     }
   },
@@ -1856,7 +1893,22 @@ const REVALIDAR: Record<
  * transacción y los prompts, y el registro lo importa la PANTALLA — meterlo allí arrastraría
  * los prompts al bundle del cliente, que es justo lo que `check:bundle` vigila.
  */
-type Preparacion = { sistema: string; prompt: { usuario: string; alcanceResumen: string } };
+type Preparacion = {
+  sistema: string;
+  prompt: { usuario: string; alcanceResumen: string };
+  /**
+   * La HUELLA del material que se le enseñó al modelo, para las capacidades que la declaran.
+   *
+   * Existe porque entre PREPARAR y el despacho hay un commit: `prepararAlcance` arma el prompt
+   * y cierra su transacción, y `comprobarDespacho` corre en otra. Lo que se comprueba allí
+   * tiene que ser que el material SIGA SIENDO EL QUE SE ARMÓ, y eso no lo dice ningún
+   * `exists`: preguntar «¿queda alguna evidencia utilizable?» pasa aunque la que se revocó sea
+   * justo una de las que el prompt ya lleva dentro.
+   *
+   * `undefined` en las capacidades que no la declaran, que es su respuesta y no un hueco.
+   */
+  huellaMaterial?: string;
+};
 const PREPARAR: Record<
   CapacidadActiva,
   (tx: TransactionSql, entrada: GenerarPropuestas) => Promise<Preparacion>
@@ -2017,22 +2069,36 @@ const PREPARAR: Record<
         'Ese reto no tiene evidencia CITABLE: no hay nada que citar. La evidencia llega a un reto por sus ARQUETIPOS, y además tiene que tener derechos de uso vigentes para ámbito cliente (SPEC-03) — comprueba las dos cosas y vuelve a pedirlo.',
       );
     }
+    const material = {
+      codigo: reto.codigo as string,
+      titulo: reto.titulo as string,
+      descripcion: reto.descripcion as string,
+      evidencia: evidencia.map((e) => ({
+        id: e.id as string,
+        titulo: e.titulo as string,
+        resumen: e.resumen as string,
+      })),
+    };
     return {
       sistema: SISTEMA_INSIGHTS,
-      prompt: promptInsights({
-        codigo: reto.codigo as string,
-        titulo: reto.titulo as string,
-        descripcion: reto.descripcion as string,
-        evidencia: evidencia.map((e) => ({
-          id: e.id as string,
-          titulo: e.titulo as string,
-          resumen: e.resumen as string,
-        })),
-        cuantos: MAX_INSIGHTS_POR_LOTE,
-      }),
+      prompt: promptInsights({ ...material, cuantos: MAX_INSIGHTS_POR_LOTE }),
+      /*
+       * La huella de ESTE material, para volver a mirarla justo antes de despachar. Entre esta
+       * transacción y aquella hay un commit, y lo que puede pasar en medio no es solo que el
+       * reto se archive: que a UNA de las evidencias que el prompt ya lleva dentro le revoquen
+       * los derechos, y el bloque está armado y saldría igual hacia el proveedor.
+       */
+      huellaMaterial: huellaDelMaterial(materialDeInsights(material).texto),
     };
   },
 };
+
+/** La huella de un material, para comparar si sigue siendo el mismo entre dos transacciones.
+ * No hace falta que sea criptográfica —solo se compara consigo misma dentro de una
+ * generación— pero sale gratis y ahorra razonar sobre colisiones. */
+function huellaDelMaterial(texto: string): string {
+  return createHash('sha256').update(texto).digest('hex');
+}
 
 /**
  * Genera propuestas para un ancla (RF-08.1). Nada del dominio cambia aquí: solo nacen

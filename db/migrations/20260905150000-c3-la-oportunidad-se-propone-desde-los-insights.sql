@@ -1120,11 +1120,25 @@ begin
     -- —eso lo comprueba el bloque de «la traza es la cita»— así que acotar aquí acota las dos,
     -- y hacerlo al revés dejaría el orden de las comprobaciones decidiendo qué se protege.
     --
+    -- Y se mide contra `insights_validados_del_reto`, que es el HECHO, no contra
+    -- `alcance_insights`, que es lo DECLARADO por quien insertó la fila. Escrito contra el
+    -- array no cerraba nada: hay `grant insert (alcance_insights)`, así que el llamante puede
+    -- meter el ajeno dentro, y entonces las dos comprobaciones que miran el array se cumplen a
+    -- la vez —la de arriba porque un superconjunto sigue conteniendo todos los del reto, y
+    -- ésta porque lo citado ya está dentro—. Dos verdades sobre una lista que escribió el
+    -- propio llamante no son ninguna verdad sobre el reto. Medido: con el alcance inflado,
+    -- sellaba.
+    --
+    -- La comprobación de arriba no sobra: dice que no FALTE ninguno, y ésta que no SOBRE
+    -- ninguno. Juntas, y con ésta apoyada en el hecho, el array ya no puede mentir a favor de
+    -- nadie — si declara de más, esta rama lo caza; si declara de menos, la de arriba.
+    --
     -- `lower`, igual que en el resto de este guard: un uuid en mayúscula es el MISMO uuid y la
     -- superficie SQL no pasa por el parser, que es quien lo normaliza.
     if exists (
       select 1 from jsonb_array_elements(new.contenido -> 'citas') as c(cita)
-      where not (lower(c.cita ->> 'insightId')::uuid = any (new.alcance_insights))) then
+      where lower(c.cita ->> 'insightId')::uuid not in (
+        select v.id from insights_validados_del_reto(new.reto_id, new.workspace_id) as v(id))) then
       raise exception 'esa oportunidad cita insights que no entraron en el material que se le mandó al modelo: una HMW solo puede apoyarse en lo que leyó, y el alcance sellado dice qué fue (SYS-19)';
     end if;
   end if;

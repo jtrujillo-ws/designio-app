@@ -6619,6 +6619,45 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * el de sellar.
    */
   /**
+   * Y el SELECTOR no ofrece un reto sin criterios, que es lo que pasó a no poder generarse.
+   *
+   * La lista de candidatas ya exigía portafolio abierto e insights validados, con el argumento
+   * escrito de que ofrecer lo que el guard va a rechazar es ofrecer una llamada pagada para
+   * nada. Desde que la prioridad se argumenta contra los criterios, «sin criterios» entra en
+   * esa misma categoría: `PREPARAR` rechaza siempre, así que el reto no puede ofrecerse.
+   *
+   * Lo que este filtro NO cubre —y por eso `PREPARAR` conserva su comprobación— es que los
+   * criterios existan pero no QUEPAN: eso depende del presupuesto de caracteres, y no hay SQL
+   * que lo sepa sin rehacer el recorte dentro de la consulta.
+   */
+  it('C3 no ofrece como candidato un reto sin criterios de éxito', async () => {
+    await enWorkspaceLimpio('c3-candidatas-sin-criterios', async (ctx) => {
+      const evId = await evidenciaDelReto(ctx.ws, ctx.retoId, ctx.curadorId, {
+        titulo: 'Abandono en verificación',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+      });
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'La verificación excluye a quien no tiene el documento a mano',
+        resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
+        fragmento: 'El 71% de los abandonos',
+      });
+      // Con insight validado y portafolio abierto, pero SIN criterio: todo lo demás que la
+      // consulta exige está puesto, así que lo único que puede dejarlo fuera es el filtro nuevo.
+      const sinCriterio = await panelPropuestas(ctx.curadorId, ctx.ws);
+      expect(
+        sinCriterio.candidatas.C3.lista.map((a) => a.id),
+        'el selector ofrece un reto sobre el que generar falla siempre',
+      ).not.toContain(ctx.retoId);
+
+      // Y con el criterio puesto SÍ aparece: sin esta mitad, una consulta que no devolviera
+      // nunca nada pasaría la de arriba sin medir nada.
+      await criterioDelReto(ctx.ws, ctx.retoId, ctx.curadorId);
+      const conCriterio = await panelPropuestas(ctx.curadorId, ctx.ws);
+      expect(conCriterio.candidatas.C3.lista.map((a) => a.id)).toContain(ctx.retoId);
+    });
+  });
+
+  /**
    * CENSO: todo estado de ancla que el SQL del panel emite tiene que estar en el registro.
    *
    * Éste es el agujero por el que C3 se coló: su CASE devolvía `portafolio-cerrado` e
@@ -11915,6 +11954,34 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(p!.alcance_insights as string[]).toContain(insightValidadoDelRetoId);
       expect(p!.alcance_insights as string[]).not.toContain(ajenoId);
 
+      await expect(
+        conUsuario(leadId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${contenido.pregunta}, ${contenido.prioridad},
+                    ${contenido.prioridadRazon}, ${leadId})
+            returning id`;
+          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+            values (${ws}, ${o!.id as string}, ${ajenoId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        }),
+      ).rejects.toThrow(/cita insights que no entraron en el material/);
+
+      /*
+       * Y con el alcance INFLADO, que es el caso que de verdad cierra la puerta: el array lo
+       * escribe quien inserta —hay `grant insert (alcance_insights)`— así que puede meter el
+       * ajeno dentro. Entonces las dos comprobaciones que miran el array se cumplen a la vez:
+       * la primera porque un superconjunto sigue conteniendo todos los del reto, y la segunda
+       * porque lo citado ya está dentro. Dos verdades sobre una lista que el propio llamante
+       * escribió no son ninguna verdad sobre el reto: la comprobación tiene que ir contra
+       * `insights_validados_del_reto`, que es el hecho, y no contra lo declarado.
+       */
+      await admin`update propuesta_ai
+        set alcance_insights = alcance_insights || ${ajenoId}::uuid
+        where id = ${propuestaId}`;
       await expect(
         conUsuario(leadId, async (tx) => {
           const [o] = await tx`insert into oportunidad

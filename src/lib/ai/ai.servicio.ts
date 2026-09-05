@@ -1460,6 +1460,14 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      *
      * Y lo segundo tampoco: ofrecer un reto cuyo portafolio está cerrado es ofrecer una
      * llamada que el guard del insert va a rechazar DESPUÉS de pagarla.
+     *
+     * Y CRITERIOS, por lo mismo: la razón de cada prioridad tiene que nombrar el criterio que
+     * la pregunta movería, así que sin ninguno `PREPARAR` rechaza siempre y ofrecer el reto es
+     * ofrecer un botón que no puede funcionar. Es el mismo filtro que la consulta de C6.
+     *
+     * Lo que este `exists` NO cubre —y por eso `PREPARAR` conserva su comprobación— es que los
+     * criterios EXISTAN pero no quepan: eso depende del presupuesto de caracteres y del texto
+     * ya compuesto, y no hay SQL que lo sepa sin rehacer el recorte aquí.
      */
     candidatas: async (tx, workspaceId, patron, limite) => {
       const filas = await tx`
@@ -1467,6 +1475,8 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         where r.workspace_id = ${workspaceId}
           and reto_admite_portafolio(r.id, r.workspace_id)
           and exists (select 1 from insights_validados_del_reto(r.id, r.workspace_id))
+          and exists (select 1 from criterio_exito c
+            where c.reto_id = r.id and c.workspace_id = r.workspace_id)
           and not exists (select 1 from propuesta_ai p
             where p.reto_id = r.id and p.workspace_id = r.workspace_id
               and p.capacidad = 'C3' and p.estado = 'propuesta')

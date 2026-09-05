@@ -27,7 +27,11 @@ import {
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { parsearContenido } from '@/lib/ai/ai.contenido';
-import { evidenciaQueLlegoAlModelo, MAX_MATERIAL } from '@/lib/ai/ai.prompts';
+import {
+  criteriosQueLlegaronConLasOportunidades,
+  evidenciaQueLlegoAlModelo,
+  MAX_MATERIAL,
+} from '@/lib/ai/ai.prompts';
 import {
   aceptarPropuesta,
   ErrorAI,
@@ -6349,6 +6353,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                where id = ${gateId} and workspace_id = ${wsC}`,
     );
 
+  /** Un criterio de éxito real para el reto: C3 no se ofrece sin al menos uno entero en el
+   * material, porque la razón de cada prioridad tiene que nombrar el que movería. */
+  async function criterioDelReto(wsC: string, retoC: string, actorId: string): Promise<string> {
+    const [c] = await sqlAdmin()`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${wsC}, ${retoC}, 'Tiempo de verificación',
+              'Minutos medianos desde iniciar hasta completar la verificación',
+              'Bajar de 8 a 4 minutos', 90, 'Medir dos semanas antes del release', ${actorId})
+      returning id`;
+    return c!.id as string;
+  }
+
   /**
    * Una propuesta de C3 pendiente, nacida por el camino REAL sobre un reto con un insight
    * validado. Devuelve lo que los casos de caducidad necesitan mover después.
@@ -6363,6 +6379,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
       fragmento: 'El 71% de los abandonos',
     });
+    await criterioDelReto(ctx.ws, ctx.retoId, ctx.curadorId);
     await conProveedor(
       {
         ok: true,
@@ -6412,6 +6429,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         resumen: 'El recordatorio sale cuando la persona ya cerró la aplicación.',
         fragmento: 'El 71% de los abandonos',
       });
+      await criterioDelReto(wsC, retoC, curadorId);
 
       // Dos citas a DOS insights distintos: la traza que debe nacer tiene dos filas, y así el
       // «exactamente los citados» se mide contra un conjunto y no contra un elemento.
@@ -6597,6 +6615,140 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * C6 la firma de su registry, en su tercer instante: no el de generar ni el de guardar, sino
    * el de sellar.
    */
+  /**
+   * C3 no se pide sobre un material que no cabe entero, ni sobre uno que no trae contra qué
+   * priorizar. Las dos son la misma regla: no se pregunta lo que no se ha enseñado.
+   *
+   *   · UN SOLO insight fuera basta. `alcance_insights` guarda solo los que llegaron enteros
+   *     —tiene que ser honesto, ésa fue la corrección de C2— y el suelo exige que ese conjunto
+   *     CONTENGA todos los validados del reto. Con uno fuera es un subconjunto estricto desde
+   *     el primer instante: el panel la marca `alcance-incompleto` nada más nacer y aceptarla
+   *     no puede prosperar NUNCA. Lo que quedaba era una tarjeta que solo se puede rechazar,
+   *     con la llamada ya pagada. El caso de «ninguno cabe» era esto mismo visto en su extremo.
+   *
+   *   · Y SIN CRITERIOS no hay prioridad que argumentar. El sistema exige que cada razón
+   *     nombre el criterio que la pregunta movería, y `prioridadRazon` es prosa libre: sin
+   *     criterios delante el modelo cumple inventándose uno, y lo inventado se materializa con
+   *     aspecto de argumento. Es la misma puerta que C6 cierra sobre un reto sin criterios.
+   *
+   * En los dos casos se comprueba además que NO se apuntó llamada: el corte va antes de pagar,
+   * que es la mitad que convierte «se rechaza igual» en «no se gastó».
+   */
+  it('C3 no se despacha con un insight recortado ni sin criterios contra los que priorizar', async () => {
+    const admin = sqlAdmin();
+    await enWorkspaceLimpio('c3-insight-recortado', async (ctx) => {
+      const evId = await evidenciaDelReto(ctx.ws, ctx.retoId, ctx.curadorId, {
+        titulo: 'Abandono en verificación',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+      });
+      await criterioDelReto(ctx.ws, ctx.retoId, ctx.curadorId);
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'La verificación excluye a quien no tiene el documento a mano',
+        resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
+        fragmento: 'El 71% de los abandonos',
+      });
+      // Sin éste, el lote saldría: es el que no cabe, y basta con él.
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'El relato largo del participante',
+        resumen: 'Relato sin parar. '.repeat(MAX_MATERIAL / 10),
+        fragmento: 'El 71% de los abandonos',
+      });
+
+      await conProveedor(
+        { ok: true, datos: { oportunidades: [] }, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(ctx.curadorId, {
+              workspaceId: ctx.ws,
+              capacidad: 'C3',
+              anclaId: ctx.retoId,
+            }),
+          ).rejects.toThrow(/no caben enteros en el material/);
+        },
+      );
+      const [n] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${ctx.ws}`;
+      expect(n!.n, 'se apuntó una llamada que no se hizo').toBe(0);
+    });
+
+    await enWorkspaceLimpio('c3-sin-criterios', async (ctx) => {
+      const evId = await evidenciaDelReto(ctx.ws, ctx.retoId, ctx.curadorId, {
+        titulo: 'Abandono en verificación',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+      });
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'La verificación excluye a quien no tiene el documento a mano',
+        resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
+        fragmento: 'El 71% de los abandonos',
+      });
+      // Con insight y SIN criterio: lo único que falta es contra qué priorizar.
+      await conProveedor(
+        { ok: true, datos: { oportunidades: [] }, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(ctx.curadorId, {
+              workspaceId: ctx.ws,
+              capacidad: 'C3',
+              anclaId: ctx.retoId,
+            }),
+          ).rejects.toThrow(/no tiene criterios de éxito/);
+        },
+      );
+      const [n] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${ctx.ws}`;
+      expect(n!.n, 'se apuntó una llamada que no se hizo').toBe(0);
+      // Y con el criterio puesto SÍ sale: sin esta mitad, un corte que rechazara siempre
+      // pasaría la de arriba sin medir nada.
+      await criterioDelReto(ctx.ws, ctx.retoId, ctx.curadorId);
+      await conProveedor(
+        { ok: true, datos: { oportunidades: [] }, intentos: [intento({ uso: null })] },
+        async () => {
+          const r = await generarPropuestas(ctx.curadorId, {
+            workspaceId: ctx.ws,
+            capacidad: 'C3',
+            anclaId: ctx.retoId,
+          });
+          expect(r.generadas).toBe(0);
+        },
+      );
+    });
+  });
+
+  /**
+   * Y la función que lo decide, medida aparte: los criterios de C3 van DETRÁS de los insights,
+   * así que son los primeros que el recorte se come.
+   *
+   * Hermana y no la misma que la de C6 —allí los criterios SON el material y van delante—: son
+   * dos cuerpos distintos y se recortan en sitios distintos, así que una sola función mediría
+   * un texto que en la otra capacidad nadie manda.
+   */
+  it('C3: el recorte del material decide si queda algún criterio contra el que priorizar', () => {
+    const criterio = {
+      id: 'c3d4e5f6-0000-4000-8000-00000000000b',
+      kpi: 'K',
+      definicion: 'D',
+      objetivo: 'O',
+      ventanaDias: 30,
+      lineaBasePlan: 'P',
+    };
+    const reto = {
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'x'.repeat(MAX_MATERIAL),
+      insights: [{ id: 'c3d4e5f6-0000-4000-8000-00000000000c', titulo: 'I', resumen: 'R' }],
+      criterios: [criterio],
+    };
+    // Con la descripción ocupando el presupuesto entero no llega NINGUNO.
+    const recortado = criteriosQueLlegaronConLasOportunidades(reto);
+    expect(recortado.ids).toEqual([]);
+    expect(recortado.fuera).toBe(1);
+    // Y sin recorte llegan enteros, que es la otra mitad: sin ella, una función que devolviera
+    // siempre la lista vacía pasaría igual.
+    const llano = criteriosQueLlegaronConLasOportunidades({ ...reto, descripcion: 'D' });
+    expect(llano.ids).toEqual([criterio.id]);
+    expect(llano.fuera).toBe(0);
+  });
+
   it('C3: una firma de G3 cometida entre el insert y el sello impide materializar la HMW', async () => {
     await enWorkspaceLimpio('c3-firma-entre-medias', async (ctx) => {
       const admin = sqlAdmin();
@@ -11475,10 +11627,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       });
       try {
         await conUsuario(leadId, async (tx) => {
+          // Copiada TAL CUAL de la propuesta: desde que el guard comprueba también la
+          // proyección —pregunta, prioridad y razón—, una HMW con texto de relleno cae ahí
+          // antes de llegar a la traza, y este caso mediría esa otra regla.
           const [o] = await tx`insert into oportunidad
             (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
-            values (${ws}, ${retoId}, ${`HMW ${crypto.randomUUID().slice(0, 8)}`}, 0, '',
-                    ${leadId})
+            values (${ws}, ${retoId}, ${CONTENIDO_C3(insightValidadoDelRetoId).pregunta},
+                    ${CONTENIDO_C3(insightValidadoDelRetoId).prioridad},
+                    ${CONTENIDO_C3(insightValidadoDelRetoId).prioridadRazon}, ${leadId})
             returning id`;
           for (const insightId of enlaces) {
             await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
@@ -11569,6 +11725,75 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from oportunidad where id = ${viejaId}`;
     }
   });
+
+  /**
+   * Y el PARECIDO: la HMW sellada tiene que decir lo que dice la propuesta.
+   *
+   * Los otros cuatro destinos ya lo comprueban —evidencia, criterio, insight y entrada KPI—, y
+   * la oportunidad se había quedado solo con su PREDICADO: cuelga del reto, la firma quien
+   * aceptó, nace por decidir y su traza es la citada. Todo eso lo cumple una HMW que pregunte
+   * OTRA COSA. Por la superficie SQL concedida —o por un camino futuro del servicio que
+   * construya mal la transacción— quedaba una propuesta constando como aceptada mientras el
+   * objeto que se le atribuye dice algo distinto: procedencia corrupta, y la tasa de
+   * corrección midiendo texto que el modelo no escribió.
+   *
+   * Los tres campos que la propuesta DICTA, y solo esos: la pregunta, la prioridad y su razón.
+   * El veredicto y su razón no se comparan porque la propuesta no los dice — nacen vacíos y
+   * los pone la decisión humana, que es otra puerta.
+   */
+  it('C3: la HMW materializada tiene que decir lo que dice la propuesta', async () => {
+    const admin = sqlAdmin();
+    const contenido = CONTENIDO_C3(insightValidadoDelRetoId);
+    // `campos` decide qué se escribe en la fila; lo que no venga, se copia de la propuesta.
+    const sellarConCampos = async (campos: {
+      pregunta?: string;
+      prioridad?: number;
+      prioridadRazon?: string;
+    }) => {
+      const propuestaId = await nuevaPropuesta(leadId, {
+        capacidad: 'C3',
+        anclas: { reto_id: retoId },
+      });
+      try {
+        await conUsuario(leadId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${campos.pregunta ?? contenido.pregunta},
+                    ${campos.prioridad ?? contenido.prioridad},
+                    ${campos.prioridadRazon ?? contenido.prioridadRazon}, ${leadId})
+            returning id`;
+          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+            values (${ws}, ${o!.id as string}, ${insightValidadoDelRetoId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        });
+        return 'selló';
+      } catch (e) {
+        return `rechazó: ${(e as Error).message.slice(0, 80)}`;
+      } finally {
+        await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
+        await admin`delete from propuesta_ai where id = ${propuestaId}`;
+        await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+        await admin`delete from oportunidad where workspace_id = ${ws}`;
+      }
+    };
+
+    // Los tres, uno a uno: cada campo por separado, o un guard que solo mirara la pregunta
+    // pasaría los otros dos sin que nadie lo notara.
+    expect(await sellarConCampos({ pregunta: '¿Cómo podríamos preguntar otra cosa?' })).toMatch(
+      /no dice lo que dice la propuesta/,
+    );
+    expect(await sellarConCampos({ prioridad: 1 })).toMatch(/no dice lo que dice la propuesta/);
+    expect(await sellarConCampos({ prioridadRazon: 'Otra razón cualquiera' })).toMatch(
+      /no dice lo que dice la propuesta/,
+    );
+    // Y la buena: copiada tal cual, sella. Sin esta mitad, un guard que rechazara SIEMPRE
+    // pasaría las tres de arriba.
+    expect(await sellarConCampos({})).toBe('selló');
+  });
+
 
   /**
    * Y la entrada que salió de una propuesta SIGUE pudiendo quitarse del borrador.

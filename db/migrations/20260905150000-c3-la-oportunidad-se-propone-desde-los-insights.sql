@@ -1167,6 +1167,30 @@ begin
     raise exception 'la entrada KPI materializada no dice lo que dice la propuesta: el criterio al que responde, el nombre, la definición, la fuente, las dimensiones y la frecuencia se copian tal cual de la propuesta aceptada (SYS-19)';
   end if;
 
+  -- Y la de la OPORTUNIDAD. Los tres campos que la propuesta DICTA, y solo esos: la pregunta,
+  -- la prioridad y su razón. El veredicto y su razón NO se comparan porque la propuesta no los
+  -- dice: nacen vacíos y los escribe la decisión humana, que llega por otra puerta y con su
+  -- propia re-comprobación del razonamiento.
+  --
+  -- Sin esto la oportunidad se quedaba con su PREDICADO a secas —cuelga del reto, la firma
+  -- quien aceptó, nace por decidir, su traza es la citada—, y todo eso lo cumple una HMW que
+  -- pregunte otra cosa. Medido por la superficie concedida: sellaba. Lo que quedaba entonces
+  -- era una propuesta constando como aceptada con un objeto atribuido que dice algo distinto,
+  -- que es procedencia corrupta y una tasa de corrección midiendo texto que nadie propuso.
+  --
+  -- Verbatim y sin `titulo_normalizado`: la comparación es «se copió tal cual», no «se parece
+  -- lo bastante». El esquema normaliza para decidir si la pregunta está VACÍA y para el único
+  -- por reto —dos preguntas iguales— y ésas son otras preguntas; aquí normalizar dejaría pasar
+  -- una HMW que cambia acentos o espacios respecto de lo que el modelo escribió.
+  if new.destino = 'oportunidad' and not exists (
+    select 1 from oportunidad o
+    where o.id = new.oportunidad_id and o.workspace_id = new.workspace_id
+      and o.pregunta        = new.contenido ->> 'pregunta'
+      and o.prioridad       = (new.contenido ->> 'prioridad')::integer
+      and o.prioridad_razon = new.contenido ->> 'prioridadRazon') then
+    raise exception 'la HMW materializada no dice lo que dice la propuesta: la pregunta, la prioridad y su razón se copian tal cual de la propuesta aceptada (SYS-19)';
+  end if;
+
   -- Y LA RELACIÓN, estampada aquí porque este es el único sitio que sabe que la
   -- materialización es legítima: la columna está fuera de todo grant, así que la fila queda
   -- diciendo de qué propuesta viene y ningún camino de la aplicación puede escribirlo ni

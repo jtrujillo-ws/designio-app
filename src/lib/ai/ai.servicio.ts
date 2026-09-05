@@ -21,6 +21,7 @@ import {
   materialDeInsights,
   materialDeOportunidades,
   materialDeUnInsight,
+  criteriosQueLlegaronConLasOportunidades,
   insightsQueLlegaronAlModelo,
   promptOportunidades,
   SISTEMA_OPORTUNIDADES,
@@ -3613,9 +3614,45 @@ const PREPARAR: Record<
      * Es la misma regla que la de C6 con sus criterios, con la misma causa: el recorte.
      */
     const llegados = insightsQueLlegaronAlModelo(reto);
-    if (llegados.ids.length === 0) {
+    if (llegados.fuera > 0) {
+      /*
+       * Y basta con que UNO se quede fuera. No es una precaución: es que la propuesta nacería
+       * IMPOSIBLE DE ACEPTAR, y con la llamada ya pagada.
+       *
+       * `alcance_insights` guarda solo los que llegaron enteros —tiene que ser honesto, ésa
+       * fue la corrección de C2—, y el guard diferido exige que ese conjunto CONTENGA todos
+       * los insights validados que el reto tiene. Con `fuera > 0` el conjunto guardado es un
+       * subconjunto estricto desde el primer instante, así que la comparación falla siempre:
+       * el panel la marca `alcance-incompleto` nada más nacer y aceptarla no puede prosperar
+       * nunca. Lo único que quedaba era una tarjeta que solo se puede rechazar.
+       *
+       * Por eso el corte sube AQUÍ, antes de llamar: si el material no cabe entero, la
+       * respuesta correcta no es proponer y que el suelo lo pare, es no preguntar y decir qué
+       * acortar. El caso de «ninguno cabe» era el mismo problema visto solo en su extremo.
+       */
       throw new ErrorAI(
-        `Ninguno de los ${reto.insights.length} insights validados de ese reto cabe entero en el material (el techo son ${MAX_MATERIAL} caracteres, y la formulación del reto va delante): no se llamó al proveedor, porque cualquier pregunta saldría de un insight que el modelo no habría visto completo. Acorta la descripción del reto o los resúmenes de sus insights y vuelve a pedirlo.`,
+        `${llegados.fuera} de los ${reto.insights.length} insights validados de ese reto no caben enteros en el material (el techo son ${MAX_MATERIAL} caracteres, y la formulación del reto va delante): no se llamó al proveedor, porque una pregunta escrita sin verlos no se podría aceptar —el suelo exige que el lote haya visto TODOS los insights validados del reto—. Acorta la descripción del reto o los resúmenes de sus insights y vuelve a pedirlo.`,
+      );
+    }
+    /*
+     * Y que llegue al menos UN criterio entero, que es contra lo que se prioriza.
+     *
+     * El sistema exige que cada razón de prioridad nombre el criterio que la pregunta movería,
+     * y `prioridadRazon` es prosa libre: sin criterios delante el modelo cumple la instrucción
+     * inventándose uno, y lo inventado se materializa con aspecto de argumento. Cubre los dos
+     * modos de quedarse sin ellos —que el reto no tenga, y que el recorte se los coma, que van
+     * al final del cuerpo y son los primeros en caer— porque para quien pide el lote son el
+     * mismo hecho: el modelo no vio contra qué priorizar.
+     *
+     * Es la misma regla que la de C6 sobre un reto sin criterios, y por eso el mensaje manda
+     * al mismo sitio: G0 es donde se acuerdan.
+     */
+    const criterios = criteriosQueLlegaronConLasOportunidades(reto);
+    if (criterios.ids.length === 0) {
+      throw new ErrorAI(
+        reto.criterios.length === 0
+          ? 'Ese reto no tiene criterios de éxito: la prioridad de una HMW se argumenta contra lo que el reto promete mover, y aquí no hay nada contra lo que priorizar. Los criterios se acuerdan en G0 — acuérdalos y vuelve a pedirlo.'
+          : `Ninguno de los ${reto.criterios.length} criterios de éxito de ese reto cabe entero en el material (van al final, detrás de los insights, así que son los primeros que el recorte deja fuera): no se llamó al proveedor, porque la razón de cada prioridad tiene que nombrar el criterio que movería y sin verlos saldría inventada. Acorta la descripción del reto o los resúmenes de sus insights y vuelve a pedirlo.`,
       );
     }
     return {

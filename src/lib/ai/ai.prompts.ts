@@ -352,6 +352,7 @@ export function materialDeOportunidades(reto: RetoConInsights): MaterialDelimita
 function cuerpoDeOportunidades(reto: RetoConInsights): {
   texto: string;
   tramos: Map<string, [number, number]>;
+  tramosCriterios: Map<string, [number, number]>;
 } {
   const partes = [reto.descripcion, '', 'INSIGHTS VALIDADOS DEL RETO'];
   const tramos = new Map<string, [number, number]>();
@@ -363,14 +364,55 @@ function cuerpoDeOportunidades(reto: RetoConInsights): {
     partes.push(linea);
     largo = inicio + linea.length;
   }
-  // Los criterios, detrás y sin tramos: no se citan, así que no hay pajar que acotar. Se
-  // enseñan enteros —KPI, definición y objetivo— porque la razón de la prioridad tiene que
-  // poder nombrarlos, y una lista de KPIs a secas no da para argumentar contra nada.
+  // Los criterios, detrás. Se enseñan enteros —KPI, definición y objetivo— porque la razón de
+  // la prioridad tiene que poder nombrarlos, y una lista de KPIs a secas no da para argumentar
+  // contra nada.
+  //
+  // Y CON tramos, aunque no se citen: van al final, así que son los primeros que el recorte se
+  // come, y el sistema exige que cada razón nombre el criterio que movería. Sin poder decir
+  // cuáles llegaron enteros no había forma de distinguir «no nombró ninguno» de «no le
+  // enseñamos ninguno», que es la diferencia entre una respuesta mala y una pregunta mal hecha.
   partes.push('', 'CRITERIOS DE ÉXITO DEL RETO (contra los que se prioriza; no se citan)');
+  largo = partes.join('\n').length;
+  const tramosCriterios = new Map<string, [number, number]>();
   for (const c of reto.criterios) {
-    partes.push(`${c.kpi}: ${c.definicion} · objetivo: ${c.objetivo}`);
+    const linea = `${c.kpi}: ${c.definicion} · objetivo: ${c.objetivo}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramosCriterios.set(c.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
   }
-  return { texto: partes.join('\n'), tramos };
+  return { texto: partes.join('\n'), tramos, tramosCriterios };
+}
+
+/**
+ * Cuántos criterios de éxito llegaron ENTEROS al modelo EN EL MATERIAL DE C3.
+ *
+ * Hermana y no la misma que `criteriosQueLlegaronAlModelo`, que mide los de C6: son dos
+ * cuerpos distintos —allí los criterios SON el material y van delante; aquí van detrás de los
+ * insights— así que se recortan en sitios distintos. Una sola función mediría un texto que en
+ * la otra capacidad nadie manda.
+ *
+ * El sistema de C3 dice que la razón de la prioridad argumenta contra los criterios del reto:
+ * «qué criterio movería esta pregunta si se resolviera». Pero `prioridadRazon` es prosa libre
+ * —el contrato solo exige que no esté vacía—, así que si no llega ningún criterio el modelo
+ * cumple la instrucción inventándose uno, y lo inventado se materializa con aspecto de
+ * argumento. Es el mismo motivo por el que C6 no se ofrece sobre un reto sin criterios: no se
+ * pide un razonamiento contra un material que no se ha enseñado.
+ */
+export function criteriosQueLlegaronConLasOportunidades(reto: RetoConInsights): {
+  ids: string[];
+  fuera: number;
+} {
+  const { texto, tramosCriterios } = cuerpoDeOportunidades(reto);
+  const visto = materialQueVeElModelo(texto);
+  const ids = reto.criterios
+    .filter((c) => {
+      const tramo = tramosCriterios.get(c.id);
+      return tramo !== undefined && visto.slice(tramo[0], tramo[1]).length === tramo[1] - tramo[0];
+    })
+    .map((c) => c.id);
+  return { ids, fuera: reto.criterios.length - ids.length };
 }
 
 /**

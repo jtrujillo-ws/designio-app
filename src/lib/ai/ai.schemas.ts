@@ -711,6 +711,9 @@ export const ESTADOS_ANCLA = [
   'criterio-ausente',
   'nombre-ocupado',
   'criterios-cambiados',
+  'insights-cambiados',
+  'portafolio-cerrado',
+  'insight-no-validado',
   'material-no-comparable',
   'ancla-ausente',
 ] as const;

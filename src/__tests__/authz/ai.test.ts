@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
@@ -17,6 +18,8 @@ import {
 } from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
+  ESTADOS_ANCLA,
+  type EstadoAncla,
   type ContenidoAsistenteGate,
   type ContenidoEntradaKpi,
   type ContenidoCriterio,
@@ -6615,6 +6618,86 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * C6 la firma de su registry, en su tercer instante: no el de generar ni el de guardar, sino
    * el de sellar.
    */
+  /**
+   * CENSO: todo estado de ancla que el SQL del panel emite tiene que estar en el registro.
+   *
+   * Éste es el agujero por el que C3 se coló: su CASE devolvía `portafolio-cerrado` e
+   * `insight-no-validado`, que no estaban en `ESTADOS_ANCLA`. Nadie se enteró porque el valor
+   * llega desde SQL como texto y `filaDePanel` lo mete al tipo con un cast: el compilador no
+   * ve nada, la aceptación queda deshabilitada —eso sí funcionaba— y `MOTIVO_ANCLA[estado]`
+   * devuelve `undefined`, así que quien revisa se queda sin explicación ni salida.
+   *
+   * Se mide sobre el TEXTO del registro y no llamando a los callbacks: `estado` devuelve un
+   * fragmento de plantilla, no una cadena, y ejecutarlo pediría una conexión por capacidad
+   * para no leer, al final, más que estos literales. Lo que devuelve `estadoDeLaFila` no hace
+   * falta censarlo: eso sí está tipado como `EstadoAncla` y lo sujeta el compilador.
+   *
+   * El modo de fallo está invertido a propósito, que es la lección del censo de husos: si la
+   * extracción deja de encontrar literales, la prueba CAE en vez de pasar en vacío.
+   */
+  it('todo estado de ancla que emite el SQL del panel está declarado en ESTADOS_ANCLA', async () => {
+    const fuente = await readFile(
+      new URL('../../lib/ai/ai.servicio.ts', import.meta.url),
+      'utf8',
+    );
+    const desde = fuente.indexOf('const CAPACIDAD_EN_EL_PANEL');
+    expect(desde, 'no se encontró el registro del panel: el censo no mide nada').toBeGreaterThan(
+      -1,
+    );
+    const region = fuente.slice(desde, fuente.indexOf('\n};', desde));
+    const emitidos = [
+      ...new Set([...region.matchAll(/(?:then|else)\s+'([a-z][a-z0-9-]*)'/g)].map((m) => m[1]!)),
+    ].sort();
+    // Sin esto, una extracción rota devolvería la lista vacía y el censo pasaría en vacío.
+    expect(
+      emitidos.length,
+      'la extracción no encontró literales: el censo dejó de medir',
+    ).toBeGreaterThan(8);
+    expect(emitidos.filter((e) => !ESTADOS_ANCLA.includes(e as EstadoAncla))).toEqual([]);
+  });
+
+  /**
+   * Y el material que CAMBIA sin que cambie el conjunto de ids.
+   *
+   * La formulación del reto, el título o el resumen de un insight ya validado, o el texto de
+   * un criterio: nada de eso mueve `insights_validados_del_reto`, así que el CASE del panel
+   * —que mira ese conjunto— seguía diciendo `disponible`. Pero la huella del material sí se
+   * mueve, y la comprobación de la aceptación la compara: el botón se ofrecía y aceptar
+   * fallaba SIEMPRE. Es la tarjeta que se puede pulsar y nunca funciona, el mismo defecto que
+   * C6 corrigió con su `estadoDeLaFila`.
+   *
+   * Y «no se sabe» tiene motivo propio: si la propuesta viene de otro render del prompt, decir
+   * «los insights cambiaron» sería inventarse una alarma y mandar a quien revisa a buscar una
+   * edición que nadie hizo. La salida es la misma —rechazar y pedir otro lote—, el motivo no.
+   */
+  it('C3: si el material cambia bajo una propuesta pendiente, el panel deja de ofrecerla', async () => {
+    const admin = sqlAdmin();
+    await enWorkspaceLimpio('c3-material-cambiado', async (ctx) => {
+      const { insightId, propuestaId } = await propuestaC3Pendiente(ctx);
+      // Antes de tocar nada: sin esta mitad, un panel que dijera siempre «cambiados» pasaría
+      // la de abajo sin medir nada.
+      const antes = (await panelPropuestas(ctx.curadorId, ctx.ws)).pendientes.find(
+        (x) => x.capacidad === 'C3',
+      )!;
+      expect(antes.anclaEstado).toBe('disponible');
+
+      // El resumen del insight, que NO mueve el conjunto de ids validados y SÍ la huella.
+      await admin`update insight set resumen = 'Otro resumen, entero y distinto.'
+        where id = ${insightId}`;
+
+      const p = (await panelPropuestas(ctx.curadorId, ctx.ws)).pendientes.find(
+        (x) => x.capacidad === 'C3',
+      )!;
+      expect(p.anclaEstado, 'el panel ofrece aceptar algo que no se puede aceptar').toBe(
+        'insights-cambiados',
+      );
+      // Y no es decoración: aceptar falla de verdad, que es lo que el estado anuncia.
+      await expect(
+        aceptarPropuesta(ctx.curadorId, { workspaceId: ctx.ws, propuestaId }),
+      ).rejects.toThrow(/Los insights validados de ese reto cambiaron/);
+    });
+  });
+
   /**
    * C3 no se pide sobre un material que no cabe entero, ni sobre uno que no trae contra qué
    * priorizar. Las dos son la misma regla: no se pregunta lo que no se ha enseñado.

@@ -1391,6 +1391,37 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
     // insight nuevo que ordena antes mueve el trozo del citado y el verde de la presencia
     // literal pasa a mentir en los dos sentidos. No saber NO se resuelve como vigente.
     materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
+    /*
+     * Lo que el CASE de arriba NO puede juzgar: que el material siga DICIENDO lo mismo.
+     *
+     * El SQL mira el conjunto de insights validados del reto, y ese conjunto no se mueve
+     * cuando se reescribe la formulación del reto, el título o el resumen de un insight que ya
+     * estaba validado, o el texto de un criterio. La huella sí se mueve, y la comprobación de
+     * la aceptación la compara: sin esto el panel decía `disponible` y aceptar fallaba
+     * SIEMPRE. Misma corrección que la de C6, por la misma razón y en el mismo sitio.
+     */
+    estadoDeLaFila: (f) => {
+      /*
+       * Primero, CEDER. Este veredicto va por delante del CASE, así que puede taparlo, y el
+       * CASE de C3 sí juzga cosas —portafolio cerrado, insight desvalidado, alcance
+       * incompleto— que son más precisas que «el material cambió» y a veces más duras: con el
+       * portafolio cerrado, pedir otro lote no arregla nada. Y son eventos que se solapan: al
+       * VALIDAR un insight nuevo cambian la huella Y el alcance a la vez, y el motivo que
+       * ocurrió es el segundo. Este callback está para decir lo que el SQL NO PUEDE juzgar,
+       * no para pisar lo que ya juzgó.
+       */
+      if ((f.ancla_estado as EstadoAncla | null) !== 'disponible') return null;
+      const comparable = materialDelPanelEsElDelModelo(f);
+      if (comparable === false) return 'insights-cambiados';
+      /*
+       * Y «no se sabe» con motivo propio, que no es el de arriba: si la propuesta viene de otro
+       * render del prompt, decir «los insights cambiaron» sería inventarse una alarma y mandar
+       * a quien revisa a buscar una edición que nadie hizo. La salida es la misma —rechazar y
+       * pedir otro lote—, el motivo que se enseña no.
+       */
+      if (comparable === null) return 'material-no-comparable';
+      return null;
+    },
     /** El título de cada insight, para que una cita diga de QUÉ conclusión habla. */
     etiquetasDelContenido: (f) =>
       Object.fromEntries(
@@ -1755,9 +1786,12 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     /*
      * El veredicto de la capacidad va POR DELANTE del CASE cuando lo hay, y no al revés: el
      * CASE dice lo que el SQL puede juzgar, y `estadoDeLaFila` lo que solo se puede calcular
-     * fuera. Hoy solo C5 lo declara, y su CASE es la constante «disponible», así que el orden
-     * no cambia ninguna respuesta viva — pero lo correcto es que la respuesta más informada
-     * gane, no la que llegó antes.
+     * fuera. Lo declaran C5, C6 y C3, y con C3 el orden SÍ cambia respuestas: su CASE juzga
+     * cosas que se solapan con «el material cambió» —validar un insight mueve la huella y el
+     * alcance a la vez— así que ceder cuando el CASE ya dijo algo distinto de «disponible» es
+     * cosa de cada capacidad, y C3 lo hace en su callback. Aquí el orden se queda como está:
+     * el veredicto más informado gana, y quien no tenga nada más informado que decir devuelve
+     * `null`.
      */
     anclaEstado:
       CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva]?.estadoDeLaFila?.(f) ??

@@ -110,15 +110,35 @@ alter table oportunidad_insight enable row level security;
 -- con G3 aprobado, se podía BORRAR el último enlace de una oportunidad viva y dejar el gate
 -- firmado incumpliendo SYS-15, sin que nadie reabriera nada. El guard del gate no lo ve
 -- porque solo corre al aprobar.
+--
+-- ── ANTI-ORÁCULO ──
+-- Es SECURITY DEFINER, así que no pasa por RLS, y está concedida al rol de aplicación: sin
+-- esta primera línea, cualquiera con un par de uuids ajenos puede preguntarle si aquel reto
+-- tiene su G3 aprobado y su etapa cerrada. Lo que se filtra no es una fila, es la RESPUESTA —
+-- el mismo argumento con el que `congelacion_por_disposicion_guard` se calla ante quien no es
+-- miembro—, y por eso se distingue al llamante por `session_user`: bajo SECURITY DEFINER,
+-- `current_user` es siempre el dueño, y el propietario (seed, migraciones, el guard que la
+-- llama sin contexto) sí tiene que recibir la respuesta de verdad.
+--
+-- Devolver `false` para el no-miembro es además lo correcto y no solo lo callado: significa
+-- «esa ventana no está abierta para ti», y las políticas que la miran ya exigen además un rol
+-- del workspace, así que ninguna escritura ajena dependía de otra respuesta.
 create function reto_admite_portafolio(p_reto uuid, p_ws uuid) returns boolean
 language sql stable security definer set search_path = public, pg_temp as $fn$
-  select not exists (
-    select 1 from gate_instancia g
-      join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
-      join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
-        and e.numero = 3
-    where p.reto_id = p_reto and p.workspace_id = p_ws
-      and g.numero = 3 and g.estado = 'aprobado' and e.estado <> 'en-curso');
+  -- `case` y no `or … and …`: la precedencia de `and` sobre `or` haría que el propietario
+  -- recibiera `true` siempre en vez de la respuesta de verdad. Escrito así no hay que
+  -- acordarse de la precedencia para leerlo.
+  select case
+    when session_user = 'designio_app' and not is_workspace_member(app_user_id(), p_ws)
+      then false
+    else not exists (
+      select 1 from gate_instancia g
+        join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
+        join etapa_instancia e on e.proyecto_id = p.id and e.workspace_id = p.workspace_id
+          and e.numero = 3
+      where p.reto_id = p_reto and p.workspace_id = p_ws
+        and g.numero = 3 and g.estado = 'aprobado' and e.estado <> 'en-curso')
+  end;
 $fn$;
 
 revoke execute on function reto_admite_portafolio(uuid, uuid) from public;
@@ -289,6 +309,22 @@ begin
   end if;
   if v_reto is not null then
     perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
+    -- Y VOLVER A PREGUNTAR, que es la mitad que faltaba. Esperar no basta: cuando este
+    -- trigger corre, la fila YA está calificada —la política de RLS se evaluó con la
+    -- instantánea del inicio de la sentencia, antes de que existiera este candado—, y
+    -- Postgres no vuelve a evaluarla porque un trigger BEFORE se haya quedado esperando.
+    -- Así, un DELETE que califica su fila mientras G3 se está aprobando, espera aquí y
+    -- borra después de que la aprobación commitee: el gate se queda certificando un
+    -- portafolio que ya perdió su traza. La ventana se relee AQUÍ, con el candado en la
+    -- mano y por tanto sobre un estado que nadie puede estar cambiando.
+    --
+    -- El propietario no pasa por políticas y tampoco por esta comprobación —seed, migraciones
+    -- y backfills administran la base y responden por lo que escriben—, que es la misma
+    -- exención que tienen `oportunidad_veredicto_guard` y el resto de guards del esquema.
+    if session_user = 'designio_app'
+       and not reto_admite_portafolio(v_reto, v_fila.workspace_id) then
+      raise exception 'el G3 de ese reto está aprobado: su portafolio no se toca sin reabrir la etapa 3';
+    end if;
   end if;
   return v_fila;
 end;

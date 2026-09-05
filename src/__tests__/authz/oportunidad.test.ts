@@ -449,7 +449,9 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
       crearOportunidad(leadId, {
         workspaceId: ws, retoId: retoV, pregunta: 'HMW tardía', prioridad: 0, prioridadRazon: '',
       }),
-    ).rejects.toThrow(/G3 ya está aprobado/);
+      // El mensaje lo pone ahora el guard y no la política: un trigger BEFORE corre antes
+      // del WITH CHECK, así que llega primero — y dice mejor qué pasa y cuál es la salida.
+    ).rejects.toThrow(/su portafolio no se toca sin reabrir la etapa 3/);
     await expect(
       priorizarOportunidad(leadId, {
         workspaceId: ws, oportunidadId: viva.oportunidadId, prioridad: 9, prioridadRazon: '',
@@ -531,4 +533,152 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     await comoElGate;
     expect(await veredicto).toBe('enlazó');
   }, 20000);
+
+  /**
+   * Esperar el candado no basta: hay que VOLVER A PREGUNTAR con él en la mano.
+   *
+   * Cuando el trigger corre, la fila ya está calificada — la política de RLS se evaluó con la
+   * instantánea del inicio de la sentencia, antes de que existiera este candado, y Postgres no
+   * la vuelve a evaluar porque un trigger BEFORE se haya quedado esperando. Así, un DELETE que
+   * califica su fila mientras G3 se está aprobando, espera, y borra DESPUÉS de que la
+   * aprobación commitee: el gate se queda certificando un portafolio que ya perdió su traza,
+   * sin que ninguna de las dos reglas fallara.
+   *
+   * Es la misma forma que el candado del reto de la ronda anterior —serializar sin releer solo
+   * mueve la foto un poco más tarde— y por eso la sonda va por SQL DIRECTO: no comprueba que
+   * el servicio se porte bien, comprueba que el suelo aguanta a quien no pasa por él.
+   */
+  it('un borrado que esperó al candado se encuentra el G3 ya aprobado y no pasa', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio relectura', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-REL', 'Reto de la relectura', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoR = r!.id as string;
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${ws}, ${retoR}, 'P-REL', 'Proyecto de la relectura', 'activo', 'rapido', ${leadId})
+      returning id`;
+    const proyectoR = p!.id as string;
+    const [g] = await admin`insert into gate_instancia
+      (workspace_id, proyecto_id, numero, rol_aprobador)
+      values (${ws}, ${proyectoR}, 3, 'sponsor') returning id`;
+    const gateR = g!.id as string;
+    await admin`insert into checklist_item
+      (workspace_id, gate_id, orden, texto, estado, insight_id)
+      values (${ws}, ${gateR}, 0, 'El portafolio está razonado', 'cumplido', ${insightValidado})`;
+    await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+      values (${ws}, ${proyectoR}, 3, 'Conceptualización', 'completada')`;
+
+    const o = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId: retoR, pregunta: 'HMW de la relectura', prioridad: 0, prioridadRazon: '',
+    });
+    await enlazarInsight(leadId, {
+      workspaceId: ws, oportunidadId: o.oportunidadId, insightId: insightValidado,
+    });
+
+    // La aprobación de G3 toma el candado del reto y se queda abierta.
+    let soltar: () => void = () => {};
+    const enVuelo = new Promise<void>((r2) => {
+      soltar = r2;
+    });
+    const aprobacion = admin.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(
+        hashtextextended('designio:reto:' || ${retoR}::text, 42))`;
+      await tx`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId},
+        aprobado_en = now() where id = ${gateR}`;
+      await enVuelo;
+    });
+    await new Promise((r2) => setTimeout(r2, 150));
+
+    // El borrado entra AHORA, cuando la ventana todavía está abierta para su instantánea: su
+    // política pasa. Y se queda esperando en el candado del trigger.
+    const borrado = conUsuario(leadId, (tx) => tx`
+      delete from oportunidad_insight
+      where oportunidad_id = ${o.oportunidadId} and insight_id = ${insightValidado}
+        and workspace_id = ${ws}`);
+    const veredicto = borrado.then(
+      () => 'borró',
+      (e: Error) => `rechazó: ${e.message}`,
+    );
+
+    await new Promise((r2) => setTimeout(r2, 1500));
+    soltar();
+    await aprobacion;
+
+    expect(
+      await veredicto,
+      'el borrado se coló detrás de una aprobación de G3 que ya había commiteado',
+    ).toMatch(/no se toca sin reabrir la etapa 3/);
+    // Y la traza que el gate certificó sigue ahí.
+    const enlaces = await admin`select 1 from oportunidad_insight
+      where oportunidad_id = ${o.oportunidadId}`;
+    expect(enlaces.length).toBe(1);
+  }, 20000);
+
+  /**
+   * El predicado no es un oráculo del ciclo de vida ajeno.
+   *
+   * `reto_admite_portafolio` es SECURITY DEFINER —no pasa por RLS— y está concedida al rol de
+   * aplicación, así que sin anti-oráculo cualquiera con un par de uuids ajenos podía
+   * preguntarle si aquel reto tiene su G3 aprobado y su etapa cerrada. Lo que se filtra no es
+   * una fila: es la RESPUESTA, que distingue dos estados del método de otro cliente.
+   *
+   * La sonda monta DOS retos ajenos cuya respuesta verdadera es distinta —uno con G3 aprobado
+   * y etapa completada, otro sin gate ninguno— y comprueba que para quien no es miembro los
+   * dos contestan lo mismo. Si contestaran distinto, la función seguiría siendo un oráculo
+   * aunque devolviera «false» en algún caso.
+   */
+  it('el predicado del portafolio no distingue estados de un workspace ajeno', async () => {
+    const admin = sqlAdmin();
+    const [wb] = await admin`insert into workspace (nombre) values (${marca + '-ajeno'}) returning id`;
+    const wsAjeno = wb!.id as string;
+    try {
+      const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+        values (${wsAjeno}, 'Servicio ajeno', 'activo', ${leadId}) returning id`;
+      const retoAjeno = async (codigo: string, conG3: boolean) => {
+        const [r] = await admin`insert into reto
+          (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+          values (${wsAjeno}, ${srv!.id as string}, ${codigo}, 'Reto ajeno', 'Descripción',
+                  'activo', 'Ninguna', ${leadId}) returning id`;
+        const id = r!.id as string;
+        if (conG3) {
+          const [p] = await admin`insert into proyecto
+            (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+            values (${wsAjeno}, ${id}, ${'P-' + codigo}, 'Proyecto ajeno', 'activo', 'rapido',
+                    ${leadId}) returning id`;
+          await admin`insert into gate_instancia
+            (workspace_id, proyecto_id, numero, rol_aprobador, estado, aprobado_por, aprobado_en)
+            values (${wsAjeno}, ${p!.id as string}, 3, 'sponsor', 'aprobado', ${leadId}, now())`;
+          await admin`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+            values (${wsAjeno}, ${p!.id as string}, 3, 'Conceptualización', 'completada')`;
+        }
+        return id;
+      };
+      // La respuesta VERDADERA de estos dos es distinta: cerrado el primero, abierto el segundo.
+      const cerrado = await retoAjeno('R-AJ1', true);
+      const abierto = await retoAjeno('R-AJ2', false);
+      const [comoOwner1] = await admin`select reto_admite_portafolio(${cerrado}, ${wsAjeno}) as v`;
+      const [comoOwner2] = await admin`select reto_admite_portafolio(${abierto}, ${wsAjeno}) as v`;
+      expect([comoOwner1!.v, comoOwner2!.v], 'el montaje no crea dos estados distintos')
+        .toEqual([false, true]);
+
+      // Y para quien no es miembro de ese workspace, las dos contestan lo mismo.
+      const preguntar = (reto: string) =>
+        conUsuario(leadId, async (tx) => {
+          const [f] = await tx`select reto_admite_portafolio(${reto}, ${wsAjeno}) as v`;
+          return f!.v as boolean;
+        });
+      expect([await preguntar(cerrado), await preguntar(abierto)]).toEqual([false, false]);
+    } finally {
+      await admin`delete from etapa_instancia where workspace_id = ${wsAjeno}`;
+      await admin`delete from gate_instancia where workspace_id = ${wsAjeno}`;
+      await admin`delete from proyecto where workspace_id = ${wsAjeno}`;
+      await admin`delete from reto where workspace_id = ${wsAjeno}`;
+      await admin`delete from servicio where workspace_id = ${wsAjeno}`;
+      await admin`delete from workspace where id = ${wsAjeno}`;
+    }
+  });
 });

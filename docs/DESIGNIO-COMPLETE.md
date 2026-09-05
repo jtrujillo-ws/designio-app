@@ -1,14 +1,12 @@
-# DESIGNIO-COMPLETE — Documento consolidado
-
-<!-- Documento canónico derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 70a7fc3, 2026-09-05). -->
-
 ---
 status: current
 last_verified: 2026-09-05
 audience: mixed (producto, boutique, ingeniería, comercial, revisores de seguridad)
 language: es
 ---
+
+<!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 70a7fc3, 2026-09-05). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -571,8 +569,9 @@ existe pero **no se cita en un gate ni sale en un entregable** (SYS-14).
 
 ## Derechos de uso
 
-- Estados: `pendiente` → `concedido` o `denegado` (la transición es irreversible y nunca vuelve a
-  pendiente).
+- Estados: `pendiente` → `concedido` o `denegado`. Un derecho concedido se puede **revocar** (pasa
+  a `denegado`, con su base documental); lo que no existe es la vuelta a `pendiente`, que significa
+  «nadie ha decidido todavía» y solo se nace en él.
 - Ámbitos: `interno`, `cliente`, `publico`. Cada uso aguas abajo pregunta por el ámbito que necesita.
 - **Vigencia temporal**: los derechos pueden vencer, y todo predicado de uso mira la fecha **de la
   base**, no la del proceso.
@@ -1045,8 +1044,9 @@ comentan.
 **Ruta**: `/auditoria`. El flujo **append-only** de `evento_dominio` con actor, rol, tipo y payload,
 filtrable por tipo y paginado por keyset. Cada guard de la base emite su evento **dentro de la
 transacción que decide**, así que el SQL crudo produce la misma acta que la aplicación. La consultan
-admin del cliente, lead y diseñador; para los demás roles la política RLS devuelve cero filas, no se
-esconde un enlace.
+admin del cliente, lead y diseñador. Para los demás roles el lateral **no muestra** el destino
+(`ROLES_AUDITORIA`) y, si llegan a la ruta por URL, la política RLS de `evento_dominio` les devuelve
+cero filas: el enlace oculto es comodidad; el aislamiento lo da la base.
 
 Fuente: SPEC-01 (RF-01.5, RF-01.6). PR [#11](https://github.com/jtrujillo-ws/designio-app/pull/11).
 
@@ -1226,8 +1226,12 @@ y ejecuta `serve.ts`. No hay worker, cola ni cron construidos.
 4. **Servicios** (`*.servicio.ts`, `*.queries.ts`): abren la transacción con `conUsuario(userId, tx
    => …)`, que fija `set_config('app.user_id', …, true)` como primera sentencia; comprueban que la
    cuenta esté activa; re-validan tenant y rol para sus reglas (capa 2); ejecutan SQL. La base
-   aplica RLS y guards (capa 1). Solo la exportación usa `repeatable read`, y la base **rechaza**
-   escribir fuera de `read committed` en las tablas cuyos guards serializan (`IS001`).
+   aplica RLS y guards (capa 1). Las **proyecciones de solo lectura** que consultan varias tablas y
+   deben devolver una foto coherente (exportación, panel de disposición, auditoría, árbol, resumen
+   del loop, aprobaciones, memoria, segmentos, evidencia con derechos, panel de propuestas AI,
+   lectura de medición, membresías) abren la transacción en `repeatable read`; las **escrituras**
+   van en `read committed`, y la base **rechaza** escribir fuera de ese nivel en las tablas cuyos
+   guards serializan con candado y releen (`IS001`).
 5. Los errores de Postgres se traducen al contrato del módulo (`42501` sin permiso, `23503`
    referencia inexistente, `23514` regla del pipeline, códigos propios `DR001`, `DS003`, `IS001`).
 
@@ -1316,7 +1320,7 @@ alcanzado del catálogo de Postgres.
 | Release | `planificado` → `desplegado` → `verificado` |
 | Insight | `propuesto` → `validado` · `descartado` |
 | Arquetipo | `hipotesis` → `confirmado` · `refutado` |
-| Derecho de uso | `pendiente` → `concedido` · `denegado` |
+| Derecho de uso | `pendiente` → `concedido` → `denegado` (revocación) · `pendiente` → `denegado`; nunca vuelve a `pendiente` |
 | Ítem de importación | `pendiente` → `aprobado` · `rechazado` |
 | Propuesta AI | `propuesta` → `corregida` → `aceptada` · `rechazada` |
 | Llamada AI | `despachada` → `salida-valida` · `rechazo-proveedor` · `fuera-de-contrato` · `sin-respuesta` |

@@ -583,6 +583,18 @@ begin
   -- como `destino = 'insight'` se queda corta ante la próxima capacidad que ancle ahí. Para
   -- C0 es redundante hoy y esa redundancia es el punto: deja de depender de que el predicado
   -- de los criterios siga excluyendo el archivo.
+  -- Candado ANTES de decidir, sobre la fila del reto. Sin él esto es una FOTO: un archivado
+  -- ajeno que commitea entre esta lectura y el commit de la aceptación pasa por delante, y el
+  -- insight nace en un reto ya cerrado. El servicio toma «bloquearReto», pero este guard existe
+  -- precisamente para quien escribe por SQL directo, que no pasa por el servicio.
+  --
+  -- «for share» y no «for update»: dos aceptaciones sobre el mismo reto no tienen por qué
+  -- esperarse, y quien archiva hace un UPDATE que toma FOR NO KEY UPDATE, con el que FOR SHARE
+  -- ya choca. Es el mismo protocolo que la congelación por disposición usa sobre «derecho_uso»,
+  -- y el mismo orden que encabeza el del servicio (reto primero).
+  perform 1 from reto r
+   where r.id = new.reto_id and r.workspace_id = new.workspace_id
+   for share;
   if new.reto_id is not null and exists (
     select 1 from reto r
     where r.id = new.reto_id and r.workspace_id = new.workspace_id
@@ -710,6 +722,27 @@ begin
   -- Va por el OBJETO —las citas del insight que esta propuesta materializó— y no por destino
   -- ni por capacidad: la regla es «citar exige derechos vigentes» y habla de las citas, así
   -- que cualquier capacidad que mañana materialice un insight la hereda sin tocar esto.
+  -- Y aquí también el candado va ANTES de la lectura, por lo mismo y con más motivo: sin él,
+  -- volver a preguntar en el commit solo adelanta la foto un poco. Una revocación que ya está
+  -- EN VUELO no la ve este snapshot —no ha commiteado—, así que la comprobación pasa y la
+  -- aceptación commitea con la revocación pisándole los talones. Con el candado, o la
+  -- revocación commitea primero y esta lectura la ve, o espera a que la aceptación termine: hay
+  -- un orden, que es lo que no había.
+  --
+  -- Es literalmente el protocolo de «candados-compartidos»: «for share» sobre las filas de
+  -- «derecho_uso» de toda la evidencia que este snapshot va a fijar, ordenadas por su id para
+  -- que dos transacciones las pidan en el mismo orden. Va DESPUÉS del candado del reto, que es
+  -- el orden que ya encabeza el del servicio.
+  perform du.evidencia_id
+    from derecho_uso du
+   where du.workspace_id = new.workspace_id
+     and du.evidencia_id in (
+       select c.evidencia_id
+         from afirmacion a
+         join cita c on c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
+        where a.insight_id = new.insight_id and a.workspace_id = new.workspace_id)
+   order by du.evidencia_id
+     for share;
   if new.insight_id is not null and exists (
     select 1
     from afirmacion a

@@ -7791,6 +7791,166 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Lo mismo con el ARCHIVO del reto: la comprobación diferida también era una foto.
+   *
+   * El servicio toma `bloquearReto`, pero este guard existe precisamente para quien escribe por
+   * SQL directo, que no pasa por el servicio. Sin candado sobre la fila del reto, un archivado
+   * en vuelo no lo ve este snapshot y el insight nace en un reto que se está cerrando.
+   *
+   * `for share` y no `for update`: dos aceptaciones sobre el mismo reto no tienen por qué
+   * esperarse, y quien archiva hace un UPDATE que toma FOR NO KEY UPDATE, con el que FOR SHARE
+   * ya choca — que es exactamente el orden que hace falta.
+   */
+  it('un archivado en vuelo ordena la aceptación en vez de colarse detrás', async () => {
+    await enWorkspaceLimpio('c2-archivado-en-vuelo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido = CONTENIDO_C2(ev);
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+
+      let soltar: () => void = () => {};
+      const enVuelo = new Promise<void>((r) => {
+        soltar = r;
+      });
+      const archivado = admin.begin(async (tx) => {
+        await tx`update reto set estado = 'archivado'
+          where id = ${retoC} and workspace_id = ${wsC}`;
+        await enVuelo;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      const aceptacion = conUsuario(curadorId, async (tx) => {
+        const [ins] = await tx`insert into insight
+          (workspace_id, titulo, resumen, estado, creado_por)
+          values (${wsC}, ${contenido.titulo}, ${contenido.resumen}, 'propuesto', ${curadorId})
+          returning id`;
+        const [af] = await tx`insert into afirmacion
+          (workspace_id, insight_id, orden, texto, es_hipotesis)
+          values (${wsC}, ${ins!.id as string}, 0, ${contenido.afirmaciones[0]!.texto}, false)
+          returning id`;
+        await tx`insert into cita
+          (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+          values (${wsC}, ${af!.id as string}, ${ev},
+                  ${contenido.afirmaciones[0]!.citas[0]!.fragmento},
+                  ${contenido.afirmaciones[0]!.citas[0]!.localizacion}, ${curadorId})`;
+        await tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${curadorId}, insight_id = ${ins!.id as string}
+          where id = ${p.id} and workspace_id = ${wsC}`;
+      });
+      const veredicto = aceptacion.then(
+        () => 'commiteó',
+        (e: Error) => `rechazó: ${e.message}`,
+      );
+
+      await new Promise((r) => setTimeout(r, 1500));
+      soltar();
+      await archivado;
+
+      expect(
+        await veredicto,
+        'la aceptación se coló por delante de un archivado que ya estaba en vuelo',
+      ).toMatch(/archivado/);
+    });
+  }, 20000);
+
+  /**
+   * Y volver a preguntar no basta si no se toma el CANDADO: la revocación EN VUELO.
+   *
+   * El rechequeo del commit cierra la ventana ancha —la revocación que ya commiteó—, y deja
+   * una fina: una revocación que está en vuelo y todavía no ha commiteado no la ve este
+   * snapshot, así que la comprobación pasa y la aceptación commitea con la revocación
+   * pisándole los talones. Volver a preguntar sin candado solo adelanta la foto un poco.
+   *
+   * Con «for share» sobre las filas de `derecho_uso` que este insight cita, hay un ORDEN: o la
+   * revocación commitea primero y la lectura la ve, o espera a que la aceptación termine. Es el
+   * protocolo que este repositorio ya tiene escrito para `derecho_uso` en
+   * `20260902240000-candados-compartidos.sql`, y que este guard no seguía.
+   *
+   * El caso lo fabrica de verdad, con dos conexiones: la revocación toma su candado y se queda
+   * abierta; la aceptación entra, inserta la cita —su trigger la ve concedida, porque la
+   * revocación no ha commiteado— y llega al commit, donde espera. Se suelta la revocación y la
+   * aceptación despierta, vuelve a leer y rechaza. Sin el candado no espera: commitea antes,
+   * y esta sonda se pone roja.
+   */
+  it('una revocación en vuelo ordena la aceptación en vez de colarse detrás', async () => {
+    await enWorkspaceLimpio('c2-revocacion-en-vuelo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido = CONTENIDO_C2(ev);
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+
+      // La revocación toma su candado de fila y se queda ABIERTA.
+      let soltar: () => void = () => {};
+      const enVuelo = new Promise<void>((r) => {
+        soltar = r;
+      });
+      const revocacion = admin.begin(async (tx) => {
+        await tx`update derecho_uso
+          set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+              decidido_por = ${curadorId}, decidido_en = now()
+          where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+        await enVuelo;
+      });
+      // Que el UPDATE haya llegado a tomar el candado antes de empezar la aceptación.
+      await new Promise((r) => setTimeout(r, 150));
+
+      const aceptacion = conUsuario(curadorId, async (tx) => {
+        const [ins] = await tx`insert into insight
+          (workspace_id, titulo, resumen, estado, creado_por)
+          values (${wsC}, ${contenido.titulo}, ${contenido.resumen}, 'propuesto', ${curadorId})
+          returning id`;
+        const [af] = await tx`insert into afirmacion
+          (workspace_id, insight_id, orden, texto, es_hipotesis)
+          values (${wsC}, ${ins!.id as string}, 0, ${contenido.afirmaciones[0]!.texto}, false)
+          returning id`;
+        await tx`insert into cita
+          (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+          values (${wsC}, ${af!.id as string}, ${ev},
+                  ${contenido.afirmaciones[0]!.citas[0]!.fragmento},
+                  ${contenido.afirmaciones[0]!.citas[0]!.localizacion}, ${curadorId})`;
+        await tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${curadorId}, insight_id = ${ins!.id as string}
+          where id = ${p.id} and workspace_id = ${wsC}`;
+      });
+      const veredicto = aceptacion.then(
+        () => 'commiteó',
+        (e: Error) => `rechazó: ${e.message}`,
+      );
+
+      // Margen amplio y unilateral: sin candado la aceptación commitea en decenas de
+      // milisegundos, mucho antes de esto, y la sonda lo caza. Con candado espera aquí.
+      await new Promise((r) => setTimeout(r, 1500));
+      soltar();
+      await revocacion;
+
+      expect(
+        await veredicto,
+        'la aceptación se coló por delante de una revocación que ya estaba en vuelo',
+      ).toMatch(/DR001/);
+
+      const [tras] = await admin`select estado from propuesta_ai
+        where id = ${p.id} and workspace_id = ${wsC}`;
+      expect(tras!.estado as string).toBe('propuesta');
+    });
+  }, 20000);
+
+  /**
    * Y el derecho de uso se vuelve a preguntar en el COMMIT, no solo al insertar la cita.
    *
    * `evidencia_citable_guard` lo exige al insertar cada cita, y ahí lo lee en el snapshot de SU

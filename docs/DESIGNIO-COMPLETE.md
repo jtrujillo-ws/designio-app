@@ -153,7 +153,7 @@ proyecto en curso; nunca se declara a mano.
 | **J4** Conceptualización y exploración | 3–4 | **G3 G4** | Sponsor + equipo | Oportunidades HMW trazables, conceptos, tests, decisiones pasa/muere | Oportunidades |
 | **J5** Detalle y plan | 5–6 | **G5 G6** | Sponsor + dueño del dato | Design version con diff, plan de releases, Metric Registry firmado | Design versions |
 | **J6** Implementación y medición | 7 | **G7** | Equipo cliente + dueño del dato | Releases, effective state con desviaciones, snapshots | Design versions / Proyecto |
-| **J7** Post mortem y continuidad | PM | Veredicto | Sponsor | Outcome review con veredicto; retos candidatos; suscripción o exportación | Proyecto |
+| **J7** Post mortem y continuidad | PM | Veredicto | Lead redacta y completa el review; el sponsor lo recibe y decide la continuidad | Outcome review con veredicto; retos candidatos; suscripción o exportación | Proyecto |
 
 Las etapas y sus gates, tal como el código los fija (`src/lib/metodo/metodo.plantillas.ts`):
 
@@ -427,7 +427,7 @@ identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de o
 | Árbol, servicios, segmentos, búsqueda, biblioteca del cliente | ✔ | | Servicios afectados adicionales de un reto en la UI |
 | Bandeja, evidencia, adjuntos, derechos de uso | ✔ | | Escaneo de malware, object storage, transcripción y diarización (C1) |
 | Insights, citas, contradicciones | ✔ | | Clustering (fuera del MVP) |
-| Método: retos, criterios, proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas | ✔ | | Conceptos y resultados de test (etapa 4, G4 con umbral) |
+| Método: proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas | ✔ | | **Pantalla de J2**: crear un reto, definir criterios a mano y activarlo con perfil existen como server functions pero ninguna pantalla las llama todavía (los criterios entran hoy por C0 o por seed); conceptos y resultados de test (etapa 4, G4 con umbral) |
 | Oportunidades HMW y G3 sobre el portafolio | ✔ | | Generación asistida C3 |
 | Journeys, catálogo, Mermaid, carriles, validación, snapshot | ✔ | | Vista timeline y por actor |
 | Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | Detección AI de desviaciones (C7) |
@@ -538,8 +538,11 @@ evidencia hasta que una persona lo aprueba** con sus cinco dimensiones (SYS-16).
 
 ## Permisos
 
-Registran y curan los **roles curadores**: lead de la boutique y diseñador. Todo miembro ve la
-bandeja; el contenido del material solo lo ven quienes pueden verlo por derechos
+Registran y curan los **roles curadores**: lead de la boutique y diseñador. La ruta la abre
+cualquier miembro, pero las **filas** de la bandeja las filtra RLS (`item_select`): un miembro ve
+los ítems que él mismo registró y los que ya tienen evidencia cuyo material puede ver
+(`material_evidencia_visible`); un sponsor o stakeholder no ve, por tanto, la cola pendiente del
+workspace, solo sus propios envíos. El contenido del material sigue además la regla de derechos
 (`material_item_visible`).
 
 ## Fuente
@@ -650,9 +653,14 @@ módulo aparte (ADR-0007).
   (`post-mortem`, `hallazgo-medicion`, `peticion-cliente`), métrica objetivo declarada y estado
   (`candidato` → `activo` → `en-medicion` → `cerrado`, o `archivado`).
 - Se crea como **candidato** (lead o diseñador) y se **activa con un perfil**, lo que abre un proyecto `P-nn`
-  con sus ocho etapas, ocho gates y el checklist del perfil.
+  con sus ocho etapas, ocho gates y el checklist del perfil. **Estado: construido en servidor, sin
+  pantalla**: las server functions `crearRetoCandidato`, `definirCriterio`, `editarCriterioDeReto` y
+  `activarRetoConPerfil` existen y están probadas, pero ninguna ruta ni componente las llama
+  todavía; hoy un reto y su proyecto nacen del seed o de una llamada directa, y la pantalla del
+  proyecto solo muestra los criterios existentes. Es el hueco visible del flujo J2 (ver `30`).
 - Cada **criterio de éxito** registra KPI, definición, línea base (valor y fecha), objetivo y
-  **ventana de medición en días**. Los criterios se pueden proponer con la AI (C0) o a mano.
+  **ventana de medición en días**. Desde la app los criterios entran hoy aceptando propuestas de la
+  AI (C0); la definición y edición manual existen como server functions sin pantalla.
 - **G0 congela los criterios**: después de aprobado no se editan ni se añaden (`reto_admite_criterios`);
   el cambio es una reapertura trazada de la etapa 0.
 
@@ -707,8 +715,10 @@ que comparten el checklist, G3 y G5.
 
 ## Permisos
 
-Lead y diseñador crean retos candidatos; el lead define criterios, activa, marca checklist, define
-arquetipos y reabre. Aprueba cada gate su rol aprobador. Miembros leen todo el proyecto.
+Los **roles curadores** (lead y diseñador) crean retos candidatos, definen y editan criterios,
+marcan ítems del checklist, y definen y deciden arquetipos. Solo el **lead** activa el reto,
+enlaza evidencia a un arquetipo, registra y revalida decisiones y reabre etapas. Aprueba cada gate
+su rol aprobador. Miembros leen todo el proyecto.
 
 ## Fuente
 
@@ -855,7 +865,10 @@ La design version tiene hilos de comentarios: es el objeto que el cliente discut
 
 ## Permisos
 
-Miembros leen la cadena completa (es lo que el cliente audita). El lead la opera.
+Miembros leen la cadena completa (es lo que el cliente audita). Los **roles curadores** (lead y
+diseñador) redactan el borrador: crean la design version, enlazan su journey y añaden, editan y
+quitan elementos de cambio. Solo el **lead** aprueba y congela, declara la sucesión, planifica y
+despliega releases y constata el effective state.
 
 ## Fuente
 
@@ -897,7 +910,9 @@ veredicto honesto (ADR-0007).
   firmado, el reto en medición y la ventana abierta según la **fecha de la base**.
 - La lectura por criterio muestra línea base, serie de snapshots, objetivo y ventana; un tope de
   serie anunciado protege la pantalla sin ocultar snapshots ya referenciados por el review.
-- Un proyecto se puede **pausar** y **retomar** durante la medición.
+- Un proyecto se puede **pausar** mientras está `activo` o `en-implementacion`, y **retomar** al
+  estado que le toque, incluido `en-medicion` si su reto ya mide. Una vez en medición no se pausa:
+  la transición `en-medicion → pausado` no existe.
 
 ## Outcome review (post mortem)
 
@@ -907,6 +922,10 @@ veredicto honesto (ADR-0007).
 - **Completar** dicta el **veredicto** del catálogo cerrado: `logrado`, `parcialmente-logrado`,
   `no-logrado`, `no-concluyente`; cierra el reto con veredicto y pasa el proyecto a `cerrado`
   (inmutable). Un candado por reto serializa snapshots, resultados y cierre.
+- **Quién decide**: abrir, redactar y completar el outcome review es del **lead de la boutique**
+  (políticas `review_insert` y `review_completar`); el sponsor lo **recibe** en el portal y decide
+  la continuidad comercial. El prediseño (§13.2) le asigna al sponsor recibir el post mortem, no
+  dictar el veredicto; una aprobación formal del sponsor sobre el review no está construida.
 - El veredicto "no concluyente" existe y es honesto: se usa cuando faltan datos.
 
 ## Qué falta (diseñado)
@@ -1537,7 +1556,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-01 Workspace, roles, portal | Correo saliente (invitaciones, avisos del portal), notificaciones básicas por email; recovery de contraseña por correo | RF-01.5, diseño técnico · Correo |
 | SPEC-02 Árbol y grafo | Servicios **afectados** adicionales de un reto en la UI (la tabla `reto_servicio_afectado` existe y la lectura de journeys ya la usa); consultas de trazabilidad predefinidas como pantalla propia (a–f); `AlcanceDeContexto` explícito para la AI (hoy el alcance es por ancla y se resume en `alcance_resumen`) | RF-02.3, RF-02.6, RF-02.7 |
 | SPEC-03 Evidencia e importación | Transcripción y diarización (C1, requiere proveedor STT); escaneo de malware; object storage S3-compatible con proxy de bytes (hoy `bytea` en Postgres); preview y OCR de artefactos; codificación asistida por segmento y tema | RF-03.2, RF-03.7, RF-03.8 |
-| SPEC-04 Método | **Conceptos y resultados de test** de la etapa 4 (G4 hoy se sostiene en el checklist, sin objeto propio ni umbral por concepto); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.10, SYS-13 |
+| SPEC-04 Método | **Pantalla de J2** para crear el reto, definir y editar criterios a mano y activarlo con perfil (las server functions existen; ninguna ruta las llama); **conceptos y resultados de test** de la etapa 4 (G4 hoy se sostiene en el checklist, sin objeto propio ni umbral por concepto); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
 | SPEC-05 Journeys | Vistas timeline y por actor; exportación PNG/SVG y código Mermaid como artefacto | RF-05.3 |
 | SPEC-06 Trazabilidad | Detección AI de desviaciones (C7) | RF-06.8 |
 | SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; borrador AI del outcome review (C7); retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
@@ -1813,6 +1832,8 @@ fuente o a un ADR de sucesión.
 | 14 | Diseño técnico · AI | Grounding evaluado con fidelidad de citas | Lo medido es presencia literal; la fidelidad se delega al acto humano | Reescribir la sección de grounding con el nombre honesto |
 | 15 | Runbook Railway §2 | `ANTHROPIC_API_KEY` «solo cuando llegue la capa AI» | La capa AI existe desde el 09-03 | Actualizar nota |
 | 16 | `docs/README.md` | Estados del paquete «borrador» | El código ya materializa la mayoría de las specs | Añadir columna de estado de implementación (o enlazar este documento) |
+| 17 | Journeys J2 (`docs/04-journeys/`) / SPEC-04 RF-04.1–04.3 | El lead formula el reto y define criterios en la plataforma | Las server functions existen pero ninguna pantalla las expone: el reto y sus criterios manuales nacen del seed o de C0 | Construir la pantalla de J2 (alta de reto, criterios, activación) |
+| 18 | Journeys J7 / prediseño §13.2 | El sponsor «recibe el post mortem» y decide continuidad; la tabla de journeys lo pone como rol decisivo | El veredicto lo dicta el lead (`review_completar`); no hay aprobación del sponsor sobre el review | Decidir si el sponsor debe firmar el outcome review (ADR) o dejar el rol como está y ajustar el journey |
 
 ---
 

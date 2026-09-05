@@ -517,6 +517,18 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
         and payload->>'oportunidadId' = ${oportunidadId}`;
     expect(repriorizaciones.length, 'se apuntó una repriorización que no ocurrió').toBe(0);
 
+    // Ni tampoco un UPDATE que no mueve nada. La pantalla lo produce sola —se edita la
+    // prioridad, se deshace la edición y se guarda—, y por SQL basta con reasignar lo que ya
+    // está. Anotarlo daba una fila idéntica a la anterior: ruido indistinguible de una
+    // repriorización de verdad.
+    await conUsuario(leadId, (tx) => tx`update oportunidad
+      set prioridad = 1, prioridad_razon = 'Nace priorizada'
+      where id = ${oportunidadId} and workspace_id = ${ws}`);
+    const inmoviles = await admin`select 1 from evento_dominio
+      where workspace_id = ${ws} and tipo = 'OportunidadRepriorizada'
+        and payload->>'oportunidadId' = ${oportunidadId}`;
+    expect(inmoviles.length, 'un update que repite los mismos valores se apuntó').toBe(0);
+
     // Y repriorizar de verdad sí deja su rastro, que es la otra mitad.
     await priorizarOportunidad(leadId, {
       workspaceId: ws,
@@ -591,6 +603,23 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
     const [abierta] = await admin`select estado from etapa_instancia
       where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`;
     expect(abierta!.estado as string).toBe('en-curso');
+
+    // Y el rodeo POR EL OTRO LADO, que es el que quedaba: vigilar solo la salida deja
+    // entrar en 'completada' a mano. Reabierta la etapa por la puerta, el lead añade una
+    // oportunidad sin traza y vuelve a cerrar por SQL — y así el gate quedaba firmado
+    // sobre un portafolio que la base misma declara en falta.
+    const [huerfana] = await conUsuario(leadId, (tx) => tx`insert into oportunidad
+      (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+      values (${ws}, ${retoR}, '¿Cómo podríamos saltarnos la traza?', 1, 'Sin apoyo',
+              ${leadId}) returning id`);
+    expect(huerfana!.id).toBeTruthy();
+    await expect(
+      conUsuario(leadId, (tx) => tx`update etapa_instancia set estado = 'completada'
+        where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`),
+    ).rejects.toThrow(/una etapa se cierra al firmar su gate/);
+    const [sigueAbierta] = await admin`select estado from etapa_instancia
+      where proyecto_id = ${proyectoR} and workspace_id = ${ws} and numero = 3`;
+    expect(sigueAbierta!.estado as string).toBe('en-curso');
   });
 
   /**

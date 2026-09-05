@@ -144,7 +144,7 @@ $fn$;
 revoke execute on function reto_admite_portafolio(uuid, uuid) from public;
 grant execute on function reto_admite_portafolio(uuid, uuid) to designio_app;
 
--- ── Y una etapa cerrada solo se reabre POR LA PUERTA ──
+-- ── Y 'completada' se cruza POR LA PUERTA, en los dos sentidos ──
 -- La función de arriba toma `etapa_instancia.estado = 'en-curso'` por «hay una reapertura
 -- viva». No se lo inventa: es la lectura que hacen también las ventanas de insight/decisión, de
 -- medición y de la capa AI — seis sitios en cinco migraciones anteriores escriben
@@ -174,21 +174,18 @@ grant execute on function reto_admite_portafolio(uuid, uuid) to designio_app;
 -- Se calla ante el propietario por `session_user`, como el resto de la casa: migraciones, seed
 -- y fixtures montan estados a mano a propósito, y quien tiene el rol dueño no necesita esta
 -- puerta para nada.
-create function etapa_reabre_con_su_registro_guard() returns trigger
+create function etapa_cruza_completada_por_la_puerta_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $fn$
 begin
   if session_user <> 'designio_app' then return null; end if;
+
+  -- ── SALIR de 'completada': su registro de reapertura ──
+  -- La puerta se mide sobre SALIR de 'completada', no sobre entrar en 'en-curso'. Escrita
+  -- como «completada → en-curso» dejaba el mismo rodeo en DOS pasos —completada →
+  -- pendiente, commit, pendiente → en-curso—, porque ninguna de esas dos transiciones es la
+  -- que se vigilaba. Y exigir registro al entrar en 'en-curso' no vale: así es como EMPIEZA
+  -- una etapa normal.
   if old.estado = 'completada' and new.estado <> 'completada' then
-    -- La puerta se mide sobre SALIR de 'completada', no sobre entrar en 'en-curso'. Escrita
-    -- como «completada → en-curso» dejaba el mismo rodeo en DOS pasos —completada →
-    -- pendiente, commit, pendiente → en-curso—, porque ninguna de esas dos transiciones es la
-    -- que se vigilaba. Y exigir registro al entrar en 'en-curso' no vale: así es como EMPIEZA
-    -- una etapa normal.
-    --
-    -- Así que 'completada' tiene una sola salida, y lleva su registro. No tapia nada: en todo
-    -- el código no hay un camino que devuelva una etapa a 'pendiente' —`reabrirEtapa` la pone
-    -- 'en-curso' y `aprobarGate` la pone 'completada'—, así que lo único que esta rama impide
-    -- es el rodeo.
     if new.estado <> 'en-curso' then
       raise exception 'una etapa completada no vuelve a %: su única salida es reabrirla, y eso queda registrado', new.estado;
     end if;
@@ -201,18 +198,53 @@ begin
       raise exception 'esa etapa está cerrada y solo se reabre por la puerta: la reapertura tiene que quedar registrada —motivo, alcance y quién— en la misma transacción que la abre';
     end if;
   end if;
+
+  -- ── ENTRAR en 'completada': la firma de su gate ──
+  -- Vigilar solo la salida deja el rodeo entero por el otro lado, y se midió: reabierta la
+  -- etapa 3 POR LA PUERTA —registro y todo—, el lead añade una oportunidad sin traza y cierra
+  -- con `update etapa_instancia set estado = 'completada'`. Pasaba. Y quedaba la etapa cerrada,
+  -- G3 en 'aprobado' y `gate_faltas_para_aprobar` diciendo P0001 (SYS-15) sobre ese mismo gate:
+  -- una firma congelada sobre un portafolio que la contradice, con la ventana ya cerrada para
+  -- que nadie vuelva a mirarla.
+  --
+  -- El cierre también tiene UNA puerta, y es la del método: `gate_aprobar_suficiencia_guard`
+  -- —y solo él— escribe 'completada', después de preguntarle a `gate_faltas_para_aprobar`. Se
+  -- exige su firma EN ESTA transacción, con el mismo `= now()` que la rama de arriba y por el
+  -- mismo motivo: una firma vieja, de un ciclo anterior, no es coartada de este cierre.
+  --
+  -- Rechazar y no «revalidar aquí» es una decisión: revalidar dejaría pasar el cierre siempre
+  -- que el portafolio esté limpio, pero `aprobado_por` y `aprobado_en` seguirían diciendo que
+  -- el sponsor firmó en aquel momento —sobre el portafolio de aquel momento—. Eso no arregla la
+  -- firma congelada: la falsifica.
+  --
+  -- Tampoco tapia: hoy no hay ningún camino de producto que cierre una etapa reabierta.
+  -- `gate_update_aprobar` solo admite 'pendiente' → 'aprobado', y `reabrirEtapa` no devuelve el
+  -- gate a 'pendiente', así que un gate ya firmado no se vuelve a firmar. La etapa reabierta se
+  -- queda abierta —y su ventana con ella, que es el lado seguro— hasta que el método tenga su
+  -- ceremonia de recierre. Lo único que esta rama quita es el atajo.
+  if new.estado = 'completada' and old.estado <> 'completada' then
+    if not exists (
+      select 1 from gate_instancia g
+       where g.workspace_id = new.workspace_id
+         and g.proyecto_id = new.proyecto_id
+         and g.numero = new.numero
+         and g.estado = 'aprobado'
+         and g.aprobado_en = now()) then
+      raise exception 'una etapa se cierra al firmar su gate, no por SQL: sin la firma del gate % en esta misma transacción, cerrarla congelaría lo que el gate certificó sin volver a comprobarlo', new.numero;
+    end if;
+  end if;
   return null;
 end;
 $fn$;
 
-revoke execute on function etapa_reabre_con_su_registro_guard() from public;
+revoke execute on function etapa_cruza_completada_por_la_puerta_guard() from public;
 
 -- `z_` para que quede por detrás de `a_congelacion_por_disposicion`, que es la que abre en toda
 -- tabla de workspace y tiene su propio censo.
-create constraint trigger z_etapa_reabre_con_su_registro
+create constraint trigger z_etapa_cruza_completada_por_la_puerta
   after update on etapa_instancia
   deferrable initially deferred
-  for each row execute function etapa_reabre_con_su_registro_guard();
+  for each row execute function etapa_cruza_completada_por_la_puerta_guard();
 
 -- Verla es de todo miembro: el portal existe para que el cliente vea el razonamiento, y una
 -- oportunidad es exactamente el razonamiento que se le enseña en la etapa 3.
@@ -931,13 +963,24 @@ begin
       v_tipo := 'OportunidadBorrada';
     elsif old.estado is distinct from new.estado then
       v_tipo := 'OportunidadDecidida';
-    else
+    elsif old.prioridad is distinct from new.prioridad
+       or old.prioridad_razon is distinct from new.prioridad_razon then
       -- Lo único que queda es la repriorización, y eso es verdad por construcción y no por
       -- confianza: el grant no deja tocar `pregunta` ni el ancla, el CHECK de la tabla no deja
       -- firmar sin decidir, y `oportunidad_razon_del_veredicto_guard` cierra la última rendija
       -- —tocar `veredicto_razon` sin veredicto—, que era la que hacía que este `else` apuntara
       -- como repriorización algo que no lo era.
       v_tipo := 'OportunidadRepriorizada';
+    else
+      -- Y la última que quedaba: un UPDATE que no mueve nada. La pantalla lo produce sola —se
+      -- edita la prioridad, se deshace la edición y se guarda—, y por SQL basta con reasignar
+      -- los valores que ya están. El archivo anotaba una repriorización idéntica a la fila
+      -- anterior: ruido que no distingue de una de verdad, y que hace incontable justo lo que
+      -- este trigger existe para poder contar.
+      --
+      -- `is distinct from` y no `<>`: `prioridad_razon` es NOT NULL hoy, pero `<>` con un NULL
+      -- da NULL —ni cierto ni falso— y esta rama se colaría callada el día que deje de serlo.
+      return null;
     end if;
     v_payload := jsonb_strip_nulls(jsonb_build_object(
       'oportunidadId', v_fila.id, 'retoId', v_fila.reto_id,

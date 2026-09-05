@@ -2,6 +2,12 @@ import { z } from 'zod';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
 import {
+  MAX_DEFINICION_KPI,
+  MAX_DIMENSIONES_KPI,
+  MAX_FUENTE_KPI,
+  MAX_NOMBRE_KPI,
+} from '@/lib/medicion/medicion.schemas';
+import {
   CONFIANZA_PROPUESTA,
   MAX_REMEDIACIONES,
   type CapacidadActiva,
@@ -378,6 +384,18 @@ export type ContenidoPropuesta =
  * propósito: `entrada_kpi` admite entradas incompletas porque el registry se redacta
  * iterando, y la completitud la exige la FIRMA.
  */
+/*
+ * Los TOPES de los cuatro campos de texto salen del editor del registry, no de aquí.
+ *
+ * Escritos a mano coincidían en dos y eran más anchos en los otros dos, y esa diferencia no
+ * era inofensiva: una entrada materializada con 400 caracteres de `fuente` pasaba este
+ * esquema y después el editor —que hidrata su formulario con esos valores— rechazaba TODA
+ * guarda hasta acortarla. Como el editor es por donde se rellenan el dueño del dato, la línea
+ * base y la ventana, la entrada quedaba bloqueando la firma de su propio contrato.
+ *
+ * Un límite propio solo tendría sentido si dijera algo que el editor no dice; aquí decía lo
+ * mismo con otro número.
+ */
 export const ContenidoEntradaKpiSchema = z
   .object({
     /* El criterio de éxito al que responde, POR SU ID: copiado del material, no inventado. */
@@ -388,14 +406,14 @@ export const ContenidoEntradaKpiSchema = z
      * dos. Rechazarlo aquí no está en manos de este esquema —valida una entrada, no el lote—;
      * lo hace el servicio al comprobar el lote, que es quien las ve juntas.
      */
-    nombre: z.string().trim().min(1).max(200),
+    nombre: z.string().trim().min(1).max(MAX_NOMBRE_KPI),
     /* Qué mide exactamente y cómo se calcula: sin esto un KPI es un rótulo. */
-    definicion: z.string().trim().min(1).max(2000),
+    definicion: z.string().trim().min(1).max(MAX_DEFINICION_KPI),
     /* De dónde sale el dato. Texto, no una URL: el dashboard es otra columna y la pone quien
      * lo tiene. */
-    fuente: z.string().trim().min(1).max(500),
+    fuente: z.string().trim().min(1).max(MAX_FUENTE_KPI),
     /* Cortes del KPI. Puede venir vacío: no todo indicador se desagrega. */
-    dimensiones: z.string().trim().max(500).default(''),
+    dimensiones: z.string().trim().max(MAX_DIMENSIONES_KPI).default(''),
     /* El vocabulario es el de la columna, no uno propio: `entrada_kpi.frecuencia` tiene su
      * CHECK y una lista distinta aquí produciría propuestas que el suelo rechaza. */
     frecuencia: z.enum(['semanal', 'mensual', 'trimestral', 'unica']),

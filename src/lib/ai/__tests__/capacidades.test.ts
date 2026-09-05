@@ -12,6 +12,13 @@ import {
   MAX_REMEDIACIONES,
 } from '../ai.schemas';
 import { ESQUEMA_DE_CONTENIDO, parsearContenido } from '../ai.contenido';
+import {
+  CamposEntradaSchema,
+  MAX_DEFINICION_KPI,
+  MAX_DIMENSIONES_KPI,
+  MAX_FUENTE_KPI,
+  MAX_NOMBRE_KPI,
+} from '@/lib/medicion/medicion.schemas';
 import { ESQUEMA_SALIDA } from '../ai.prompts';
 
 const RAIZ = new URL('../../../../', import.meta.url).pathname.replace(/\/$/, '');
@@ -453,5 +460,61 @@ describe('el registro de capacidades', () => {
       'el proveedor puede devolver un informe vacío que el contrato rechaza después de pagarlo',
     ).toBe(1);
     expect(c5.properties.remediaciones!.maxItems).toBe(MAX_REMEDIACIONES);
+  });
+
+  /**
+   * Y lo que C6 propone cabe en el EDITOR que después lo va a guardar.
+   *
+   * Los cuatro campos de texto de una entrada KPI los escribe C6 y los reescribe el editor del
+   * registry, y sus topes estaban escritos dos veces: coincidían en dos y eran más anchos en
+   * los otros dos. Una entrada materializada con 400 caracteres de `fuente` pasaba el pipeline
+   * de la AI, y a partir de ahí el editor —que hidrata su formulario con esos valores— se
+   * negaba a guardar hasta acortarla. Como es por ahí por donde se rellenan el dueño del dato,
+   * la línea base y la ventana, la entrada quedaba bloqueando la FIRMA de su propio contrato,
+   * y el mensaje no decía qué campo sobraba.
+   *
+   * Ahora los dos esquemas leen la misma constante, y esto lo sujeta por la CONDUCTA: un texto
+   * de un carácter por encima del tope tiene que caer en los dos. Comparar los números entre
+   * sí no serviría —serían la misma constante mirada dos veces—; lo que hay que sostener es
+   * que ninguno de los dos acepte lo que el otro rechaza.
+   */
+  it('los textos que C6 propone caben en el editor del registry', () => {
+    const CAMPOS = [
+      ['nombre', MAX_NOMBRE_KPI],
+      ['definicion', MAX_DEFINICION_KPI],
+      ['fuente', MAX_FUENTE_KPI],
+      ['dimensiones', MAX_DIMENSIONES_KPI],
+    ] as const;
+    const base = {
+      criterioId: 'c3d4e5f6-0000-4000-8000-00000000000a',
+      nombre: 'Tasa de verificación',
+      definicion: 'Completadas / iniciadas',
+      fuente: 'Eventos de la app',
+      dimensiones: 'canal',
+      frecuencia: 'mensual' as const,
+      citas: [{ fragmento: 'Tiempo de verificación', localizacion: 'KPI' }],
+      confianzaPropuesta: 'media' as const,
+    };
+    for (const [campo, tope] of CAMPOS) {
+      const pasado = 'x'.repeat(tope + 1);
+      expect(
+        ESQUEMA_DE_CONTENIDO.C6.safeParse({ ...base, [campo]: pasado }).success,
+        `C6 acepta un ${campo} que el editor del registry va a rechazar`,
+      ).toBe(false);
+      // Y el tope ES el del editor, no un número que se le parece: sin esta mitad, subir el
+      // del editor dejaría la comparación midiendo contra una constante huérfana.
+      expect(
+        CamposEntradaSchema.safeParse({
+          workspaceId: '00000000-0000-4000-8000-000000000001',
+          frecuencia: 'mensual',
+          [campo]: pasado,
+        }).success,
+        `el editor acepta un ${campo} de ${tope + 1}: la constante no es su tope`,
+      ).toBe(false);
+    }
+    // Y justo en el tope entran los dos, que es la mitad sin la cual un esquema que rechazara
+    // todo pasaría igual.
+    expect(ESQUEMA_DE_CONTENIDO.C6.safeParse({ ...base, fuente: 'x'.repeat(MAX_FUENTE_KPI) }).success)
+      .toBe(true);
   });
 });

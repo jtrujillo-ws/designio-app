@@ -1194,78 +1194,110 @@ async function sembrarAdminPropio(cliente: typeof sql): Promise<string | null> {
   }
   const nombre = process.env.SEED_ADMIN_NOMBRE?.trim() || email.split('@')[0]!;
   const hash = await bcrypt.hash(clave, 10);
-  const [existente] = await cliente`select id, password_hash from usuario
-    where lower(email) = ${email}`;
-  let id: string;
-  if (existente) {
-    id = existente.id as string;
-    if (existente.password_hash === null) {
-      await cliente`update usuario
+
+  /*
+   * TODO en UNA transacción, y esto no es prolijidad: sin ella, la cuenta y la primera
+   * membresía ya estaban COMMITEADAS cuando una sentencia posterior fallara —por ejemplo un
+   * `DS001` al tocar una demo archivada—. El entrypoint corta con `set -e` y el despliegue no
+   * arranca, así que nadie ve el fallo; pero apagar el seed en el siguiente despliegue deja
+   * viva una cuenta privilegiada a medio crear. Un seed que concede accesos tiene que
+   * conceder todo o nada.
+   */
+  return cliente.begin(async (tx) => {
+    /*
+     * El alta va con `ON CONFLICT` y relectura. Dos instancias del mismo despliegue arrancan a
+     * la vez: las dos pueden ver que el usuario no existe y las dos intentar crearlo. El
+     * índice único sobre `lower(email)` rechaza a una, y con `set -e` esa instancia no arranca
+     * — por una cuenta que la otra ya había creado bien.
+     *
+     * Y tiene que ser `ON CONFLICT` y no un `where not exists`: escribí primero lo segundo y
+     * NO arregla nada. Un `where not exists` es el mismo «mirar y luego insertar» metido en
+     * una sentencia — bajo READ COMMITTED las dos transacciones pueden pasar la comprobación
+     * antes de que ninguna haya escrito, y la violación de unicidad ocurre igual. Solo el
+     * índice, que es quien arbitra de verdad, puede resolver la carrera.
+     *
+     * `on conflict (lower(email))` sobre el índice de EXPRESIÓN, comprobado contra el real:
+     * la segunda inserción con otra caja de letras devuelve `INSERT 0 0` en vez de un error.
+     */
+    await tx`insert into usuario (email, nombre, password_hash, estado)
+      values (${email}, ${nombre}, ${hash}, 'activo')
+      on conflict (lower(email)) do nothing`;
+    const [u] = await tx`select id, password_hash from usuario where lower(email) = ${email}`;
+    const id = u!.id as string;
+    // La contraseña solo se escribe si NO había ninguna: este seed corre en cada despliegue,
+    // y reescribirla convertiría una variable de entorno vieja en una puerta abierta.
+    if (u!.password_hash === null) {
+      await tx`update usuario
         set password_hash = ${hash}, estado = 'activo',
             invitacion_token_hash = null, invitacion_expira = null, actualizado_en = now()
         where id = ${id}`;
     }
-  } else {
-    const [u] = await cliente`insert into usuario (email, nombre, password_hash, estado)
-      values (${email}, ${nombre}, ${hash}, 'activo') returning id`;
-    id = u!.id as string;
-  }
 
-  /*
-   * Los DOS workspaces se resuelven aquí y por la FIRMA DEL SEED —tener a Lucía de miembro—,
-   * sin fiarse del id que llegue de fuera.
-   *
-   * `workspace` no tiene unicidad por nombre (comprobado: su única restricción es la clave
-   * primaria por `id`), y el `select … where nombre = 'Banco Andino'` de `main()` no está
-   * calificado. Recibir ese id y conceder sobre él habría dado acceso `lead-boutique` de una
-   * persona REAL al workspace de otro cliente que se llamara igual. Arreglar solo el segundo
-   * workspace no bastaba: el primero entraba por el parámetro, que es la puerta de al lado.
-   *
-   * Una función que concede accesos no puede confiar en que su llamante haya acotado bien.
-   */
-  const workspaces = await cliente`select w.id, w.nombre from workspace w
-    join miembro m on m.workspace_id = w.id
-    join usuario u on u.id = m.usuario_id
-    where w.nombre in ('Banco Andino', 'Clínica del Valle')
-      and lower(u.email) = 'lucia@whitespace.demo'`;
-
-  const dichos: string[] = [];
-  for (const w of workspaces) {
-    const wsId = w.id as string;
     /*
-     * Se MIRA antes de escribir, y el `on conflict` se queda de todas formas.
+     * Los DOS workspaces se resuelven aquí y por la FIRMA DEL SEED —tener a Lucía de miembro—,
+     * sin fiarse de ningún id de fuera. `workspace` no tiene unicidad por nombre (comprobado:
+     * su única restricción es la clave primaria), y el `select … where nombre = 'Banco Andino'`
+     * de `main()` no está calificado. Recibir ese id habría dado acceso `lead-boutique` de una
+     * persona REAL al workspace de otro cliente que se llamara igual.
      *
-     * Escribí que mirar antes sobraba porque `on conflict do nothing` cubre la carrera. Cubre
-     * la carrera y no cubre esto: `miembro` tiene un trigger BEFORE INSERT
-     * (`a_congelacion_por_disposicion`) que corre ANTES de que Postgres compruebe el
-     * conflicto, y sobre un workspace ya dispuesto levanta `DS001`. O sea que un redespliegue
-     * sobre una demo archivada abortaba el seed —y con `set -e` en el entrypoint, el servidor
-     * no arrancaba— por una membresía que YA existía y que no hacía falta escribir.
-     *
-     * Mirar evita el trigger en el caso normal; el `on conflict` sigue cubriendo la carrera
-     * entre dos arranques del mismo despliegue. Los dos hacen falta y ninguno sustituye al otro.
+     * Una función que concede accesos no puede confiar en que su llamante haya acotado bien.
      */
-    const [ya] = await cliente`select rol from miembro
-      where workspace_id = ${wsId} and usuario_id = ${id}`;
-    if (ya) {
-      // Y si ya estaba con OTRO rol, se dice. Antes el `on conflict do nothing` se lo tragaba
-      // y el registro afirmaba «asegurada como lead-boutique» sobre una cuenta que seguía
-      // siendo stakeholder: un mensaje que miente es peor que no tener mensaje. No se
-      // reescribe el rol — cambiar la membresía de alguien que ya estaba es una decisión de
-      // producto, no una comodidad del seed.
-      dichos.push(
-        ya.rol === 'lead-boutique'
-          ? `${w.nombre as string}: ya`
-          : `${w.nombre as string}: SIN TOCAR, ya era ${ya.rol as string}`,
-      );
-      continue;
+    const workspaces = await tx`select w.id, w.nombre, m.usuario_id as lucia_id
+      from workspace w
+      join miembro m on m.workspace_id = w.id
+      join usuario u2 on u2.id = m.usuario_id
+      where w.nombre in ('Banco Andino', 'Clínica del Valle')
+        and lower(u2.email) = 'lucia@whitespace.demo'`;
+
+    const dichos: string[] = [];
+    for (const w of workspaces) {
+      const wsId = w.id as string;
+      /*
+       * Se MIRA antes de escribir, y el `on conflict` se queda de todas formas.
+       *
+       * El `on conflict` cubre la carrera y no cubre esto: `miembro` tiene un trigger BEFORE
+       * INSERT (`a_congelacion_por_disposicion`) que corre ANTES de que Postgres compruebe el
+       * conflicto, y sobre un workspace ya dispuesto levanta `DS001`. Medido: con un trigger
+       * BEFORE que lanza, `insert … on conflict do nothing` sale por el trigger. O sea que un
+       * redespliegue sobre una demo archivada abortaba el seed por una membresía que YA
+       * existía y que no hacía falta escribir.
+       */
+      const [ya] = await tx`select rol from miembro
+        where workspace_id = ${wsId} and usuario_id = ${id}`;
+      if (ya) {
+        // Y si ya estaba con OTRO rol, se dice. Antes el `on conflict do nothing` se lo tragaba
+        // y el registro afirmaba «asegurada como lead-boutique» sobre una cuenta que seguía
+        // siendo stakeholder: un mensaje que miente es peor que no tener mensaje. No se
+        // reescribe el rol — cambiar la membresía de alguien que ya estaba es una decisión de
+        // producto, no una comodidad del seed.
+        dichos.push(
+          ya.rol === 'lead-boutique'
+            ? `${w.nombre as string}: ya`
+            : `${w.nombre as string}: SIN TOCAR, ya era ${ya.rol as string}`,
+        );
+        continue;
+      }
+      await tx`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsId}, ${id}, ${nombre}, ${email}, 'lead-boutique')
+        on conflict do nothing`;
+      /*
+       * Y su EVENTO, en la misma transacción que la concesión, como hace el flujo de
+       * invitación. RF-01.6 exige que toda escritura quede auditada, y una membresía
+       * privilegiada que aparece sin rastro es exactamente lo que una auditoría no puede
+       * explicar — ni la exportación del workspace, que lee de aquí.
+       *
+       * El actor es Lucía, que es la identidad con la que este seed escribe todo lo demás, y
+       * el payload dice que vino del seed y por qué variable: quien lo lea sabrá que no fue
+       * una invitación, sino un despliegue con `SEED_ADMIN_EMAIL` puesta.
+       */
+      await tx`insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+        values (${wsId}, 'MiembroInvitado',
+                ${tx.json({ email, rol: 'lead-boutique', requiereActivacion: false, origen: 'seed:SEED_ADMIN_EMAIL' })},
+                ${w.lucia_id as string}, 'lead-boutique')`;
+      dichos.push(`${w.nombre as string}: lead-boutique`);
     }
-    await cliente`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
-      values (${wsId}, ${id}, ${nombre}, ${email}, 'lead-boutique')
-      on conflict do nothing`;
-    dichos.push(`${w.nombre as string}: lead-boutique`);
-  }
-  return dichos.length > 0 ? `${email} (${dichos.join('; ')})` : `${email} (sin workspaces demo)`;
+    return dichos.length > 0 ? `${email} (${dichos.join('; ')})` : `${email} (sin workspaces demo)`;
+  });
 }
 
 async function main() {

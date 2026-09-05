@@ -75,6 +75,7 @@ describeAuthz('búsqueda del workspace (RLS + destinos)', () => {
 
     const reto = resultados.find((r) => r.clase === 'reto')!;
     expect(reto.destino).toEqual({ to: '/proyecto/$proyectoId', params: { proyectoId: proyA } });
+    expect(reto.refCodigo).toBe('P-B1');
     const proyecto = resultados.find((r) => r.clase === 'proyecto')!;
     expect(proyecto.codigo).toBe('P-B1');
     expect(proyecto.destino).toEqual({
@@ -84,6 +85,19 @@ describeAuthz('búsqueda del workspace (RLS + destinos)', () => {
 
     const porCodigo = await conUsuario(userA, (tx) => buscarEnWorkspace(tx, wsA, 'p-b1'));
     expect(porCodigo.resultados.map((r) => r.id)).toEqual([proyA]);
+  });
+
+  it('el recorte dentro de una clase también es «hay más»', async () => {
+    const admin = sqlAdmin();
+    for (let i = 1; i <= 6; i++) {
+      await admin`insert into proyecto (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsA}, ${retoA}, ${`P-Z${i}`}, ${`${marca} zeta ${i}`}, ${userA})`;
+    }
+    const { resultados, hayMas } = await conUsuario(userA, (tx) =>
+      buscarEnWorkspace(tx, wsA, 'zeta'),
+    );
+    expect(resultados).toHaveLength(5);
+    expect(hayMas).toBe(true);
   });
 
   it('los comodines del texto se buscan literales', async () => {

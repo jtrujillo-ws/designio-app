@@ -2,6 +2,7 @@ import '@/lib/server-only';
 import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { patronDeBusqueda } from '@/lib/busqueda/busqueda.schemas';
 import { DimensionesEvidenciaSchema, ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { bloquearReto } from '@/lib/metodo/metodo.servicio';
 import {
@@ -530,7 +531,7 @@ export async function panelPropuestas(
     // forma de alcanzarlos. Y como ningún orden alcanza cuando hay más anclas que ventana,
     // la búsqueda por texto es lo que vuelve la promesa incondicional: cualquier ancla se
     // alcanza por su nombre sin depender de dónde caiga el corte.
-    const patron = busqueda ? `%${busqueda.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
+    const patron = busqueda ? patronDeBusqueda(busqueda) : null;
     const items = await tx`
       select i.id, i.titulo,
              tipo_fuente_exige_consentimiento(i.tipo_fuente)

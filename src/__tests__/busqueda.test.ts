@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   BusquedaInputSchema,
+  codigoDelDestino,
   conDestino,
   destinoDeResultado,
   patronDeBusqueda,
@@ -13,6 +14,7 @@ const fila = (parcial: Partial<FilaBusqueda> & Pick<FilaBusqueda, 'clase'>): Fil
   titulo: 'Algo',
   detalle: '',
   refId: null,
+  refCodigo: null,
   ...parcial,
 });
 
@@ -71,10 +73,27 @@ describe('a dónde abre cada resultado', () => {
     expect(destinoDeResultado(fila({ clase: 'reto', id: 'r' }))).toEqual({ to: '/app' });
   });
 
-  it('servicio, evidencia e insight abren donde se leen', () => {
+  it('el servicio abre el árbol; evidencia e insight abren su lista con el elemento destacado', () => {
     expect(destinoDeResultado(fila({ clase: 'servicio' }))).toEqual({ to: '/app' });
-    expect(destinoDeResultado(fila({ clase: 'evidencia' }))).toEqual({ to: '/evidencia' });
-    expect(destinoDeResultado(fila({ clase: 'insight' }))).toEqual({ to: '/insights' });
+    expect(destinoDeResultado(fila({ clase: 'evidencia', id: 'e' }))).toEqual({
+      to: '/evidencia',
+      search: { destacar: 'e' },
+    });
+    expect(destinoDeResultado(fila({ clase: 'insight', id: 'i' }))).toEqual({
+      to: '/insights',
+      search: { destacar: 'i' },
+    });
+  });
+
+  it('el pie nombra el proyecto que abre un reto, no el código del reto', () => {
+    const [reto] = conDestino([
+      fila({ clase: 'reto', codigo: 'R-01', refId: 'p', refCodigo: 'P-01' }),
+    ]);
+    expect(codigoDelDestino(reto!)).toBe('P-01');
+    const [proyecto] = conDestino([fila({ clase: 'proyecto', id: 'p', codigo: 'P-01' })]);
+    expect(codigoDelDestino(proyecto!)).toBe('P-01');
+    const [servicio] = conDestino([fila({ clase: 'servicio' })]);
+    expect(codigoDelDestino(servicio!)).toBeUndefined();
   });
 
   it('conDestino conserva la fila y le añade el destino', () => {

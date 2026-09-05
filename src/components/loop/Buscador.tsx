@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import type { CSSProperties, KeyboardEvent, ReactNode } from 'react';
+import type { CSSProperties, FocusEvent, KeyboardEvent, ReactNode } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { EnlaceA, navegarA } from '@/components/ui/EnlaceA';
 import { Input } from '@/components/ui/Input';
@@ -8,6 +8,7 @@ import {
   ETIQUETA_CLASE,
   MAX_CARACTERES,
   MIN_CARACTERES,
+  codigoDelDestino,
   type ResultadoBusqueda,
 } from '@/lib/busqueda/busqueda.schemas';
 import { etiquetaDeDestino } from '@/lib/destinos';
@@ -35,7 +36,12 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
   const [abierto, setAbierto] = useState(false);
   const [activo, setActivo] = useState(0);
   const [estado, setEstado] = useState<Estado>({ fase: 'inactivo' });
-  // Cada consulta lleva su número: una respuesta que llega tarde no pisa a la del texto actual.
+  // Mientras se consulta se sigue enseñando la lista anterior: sustituirla por «Buscando…»
+  // a cada tecla hacía parpadear el panel y perdía la fila elegida con las flechas.
+  const [cargando, setCargando] = useState(false);
+  // Cada consulta lleva su número: una respuesta que llega tarde no pisa a la del texto
+  // actual. Se avanza en TODOS los caminos, también cuando el texto se queda corto o vacío:
+  // si no, la respuesta de «ab» aterrizaba sobre un campo que ya decía «a».
   const consulta = useRef(0);
 
   // «/» enfoca el buscador desde cualquier sitio de la pantalla, salvo cuando ya se escribe
@@ -59,17 +65,20 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
   }, []);
 
   useEffect(() => {
+    const numero = ++consulta.current;
     const limpio = texto.trim();
     if (!workspaceId || limpio === '') {
       setEstado({ fase: 'inactivo' });
+      setCargando(false);
       return;
     }
     if (limpio.length < MIN_CARACTERES) {
       setEstado({ fase: 'corto' });
+      setCargando(false);
       return;
     }
-    const numero = ++consulta.current;
-    setEstado({ fase: 'buscando' });
+    setCargando(true);
+    setEstado((previo) => (previo.fase === 'listo' ? previo : { fase: 'buscando' }));
     const temporizador = setTimeout(async () => {
       try {
         const r = await buscarEnElWorkspace({ data: { workspaceId, texto: limpio } });
@@ -82,6 +91,8 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
           fase: 'error',
           mensaje: e instanceof Error ? e.message : 'No se pudo buscar en este momento.',
         });
+      } finally {
+        if (numero === consulta.current) setCargando(false);
       }
     }, ESPERA_MS);
     return () => clearTimeout(temporizador);
@@ -102,7 +113,16 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
     await navegarA(navigate, resultado.destino);
   }
 
+  // El panel se cierra cuando el foco SALE del buscador entero, no cuando sale del campo:
+  // así un clic lento sobre un resultado no lo desmonta antes de completarse, y tabular
+  // hacia los resultados no los hace desaparecer bajo el foco.
+  function alPerderFoco(e: FocusEvent<HTMLDivElement>) {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setAbierto(false);
+  }
+
   function alTeclearEnElCampo(e: KeyboardEvent<HTMLInputElement>) {
+    // El Enter que confirma una composición (IME, acentos muertos) no elige nada.
+    if (e.nativeEvent.isComposing) return;
     if (e.key === 'Escape') {
       e.preventDefault();
       if (texto === '') input.current?.blur();
@@ -127,8 +147,10 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
     }
   }
 
+  const idDeOpcion = (r: ResultadoBusqueda) => `${idLista}-${r.clase}-${r.id}`;
+
   return (
-    <div style={{ position: 'relative', width: 280 }}>
+    <div style={{ position: 'relative', width: 280 }} onBlur={alPerderFoco}>
       <Input
         ref={input}
         type="search"
@@ -138,7 +160,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
         aria-controls={idLista}
         aria-autocomplete="list"
         aria-activedescendant={
-          desplegado && resultados[activo] ? `${idLista}-${resultados[activo].id}` : undefined
+          desplegado && resultados[activo] ? idDeOpcion(resultados[activo]) : undefined
         }
         autoComplete="off"
         maxLength={MAX_CARACTERES}
@@ -151,13 +173,17 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
           setAbierto(true);
         }}
         onFocus={() => setAbierto(true)}
-        // El cierre por blur espera al clic sobre un resultado (que es un enlace y navega solo).
-        onBlur={() => setTimeout(() => setAbierto(false), 150)}
         onKeyDown={alTeclearEnElCampo}
         style={{ background: 'var(--bg-app)', border: '1px solid var(--border)', width: '100%' }}
       />
       {desplegado && (
-        <div id={idLista} role="listbox" aria-label="Resultados de la búsqueda" style={panel}>
+        <div
+          id={idLista}
+          role="listbox"
+          aria-label="Resultados de la búsqueda"
+          aria-busy={cargando}
+          style={{ ...panel, opacity: cargando ? 0.7 : 1 }}
+        >
           {estado.fase === 'corto' && <Aviso>Escribe al menos {MIN_CARACTERES} caracteres.</Aviso>}
           {estado.fase === 'buscando' && <Aviso>Buscando…</Aviso>}
           {estado.fase === 'error' && (
@@ -171,44 +197,47 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
           {estado.fase === 'listo' &&
             resultados.map((r, i) => {
               const nuevaClase = i === 0 || resultados[i - 1]!.clase !== r.clase;
+              const pantalla = etiquetaDeDestino(r.destino, codigoDelDestino(r));
+              // Las cabeceras de clase son presentación: el listbox posee directamente a
+              // sus opciones, que son los propios enlaces.
               return (
-                <div key={`${r.clase}-${r.id}`}>
-                  {nuevaClase && <div style={cabeceraClase}>{ETIQUETA_CLASE[r.clase]}</div>}
+                <div key={idDeOpcion(r)} role="presentation">
+                  {nuevaClase && (
+                    <div role="presentation" style={cabeceraClase}>
+                      {ETIQUETA_CLASE[r.clase]}
+                    </div>
+                  )}
                   <EnlaceA
                     destino={r.destino}
+                    id={idDeOpcion(r)}
+                    role="option"
+                    aria-selected={i === activo}
+                    onMouseEnter={() => setActivo(i)}
+                    title={`Abrir ${pantalla}`}
                     style={{
                       ...opcion,
                       background: i === activo ? 'var(--accent-soft)' : undefined,
                     }}
-                    title={`Abrir ${etiquetaDeDestino(r.destino, r.codigo ?? undefined)}`}
                   >
                     <span
-                      id={`${idLista}-${r.id}`}
-                      role="option"
-                      aria-selected={i === activo}
-                      onMouseEnter={() => setActivo(i)}
-                      style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}
+                      style={{
+                        font: '600 13px var(--font-sans)',
+                        color: 'var(--ink)',
+                        ...truncado,
+                      }}
                     >
-                      <span
-                        style={{
-                          font: '600 13px var(--font-sans)',
-                          color: 'var(--ink)',
-                          ...truncado,
-                        }}
-                      >
-                        {r.codigo ? `${r.codigo} ` : ''}
-                        {r.titulo}
-                      </span>
-                      <span
-                        style={{
-                          font: '400 11px var(--font-sans)',
-                          color: 'var(--text-muted)',
-                          ...truncado,
-                        }}
-                      >
-                        {r.detalle ? `${r.detalle} · ` : ''}
-                        {etiquetaDeDestino(r.destino, r.codigo ?? undefined)}
-                      </span>
+                      {r.codigo ? `${r.codigo} ` : ''}
+                      {r.titulo}
+                    </span>
+                    <span
+                      style={{
+                        font: '400 11px var(--font-sans)',
+                        color: 'var(--text-muted)',
+                        ...truncado,
+                      }}
+                    >
+                      {r.detalle ? `${r.detalle} · ` : ''}
+                      {pantalla}
                     </span>
                   </EnlaceA>
                 </div>
@@ -251,7 +280,10 @@ const cabeceraClase: CSSProperties = {
 };
 
 const opcion: CSSProperties = {
-  display: 'block',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 2,
+  minWidth: 0,
   padding: '7px 10px',
   borderRadius: 'var(--r-sm)',
   textDecoration: 'none',

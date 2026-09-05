@@ -3,12 +3,16 @@
  * nombre de ruta con sus parámetros y nada más: quien lo produce (una tarjeta del loop, un
  * resultado de búsqueda) no necesita saber cómo se navega, y quien navega no necesita saber
  * de dónde salió. Módulo compartido client/server: solo tipos y funciones puras.
+ *
+ * Las listas (evidencia, insights) admiten `destacar`: el id del elemento que se fue a
+ * buscar. Sin él, «abrir la lista» desde un resultado dejaba al usuario en la primera página
+ * sin ninguna pista de dónde estaba lo que encontró.
  */
 export type Destino =
   | { to: '/app' }
   | { to: '/importacion' }
-  | { to: '/evidencia' }
-  | { to: '/insights' }
+  | { to: '/evidencia'; search?: { destacar: string } }
+  | { to: '/insights'; search?: { destacar: string } }
   | { to: '/journeys' }
   | { to: '/design-versions' }
   | { to: '/proyecto/$proyectoId'; params: { proyectoId: string } }

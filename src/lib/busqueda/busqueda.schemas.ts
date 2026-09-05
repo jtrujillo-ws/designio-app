@@ -50,13 +50,16 @@ export type FilaBusqueda = {
   detalle: string;
   /** Para un reto, su primer proyecto (si tiene): es la pantalla que lo abre. */
   refId: string | null;
+  /** Y el código de ese proyecto, que es lo que hay que decir en el pie: «Proyecto P-01». */
+  refCodigo: string | null;
 };
 
 export type ResultadoBusqueda = FilaBusqueda & { destino: Destino };
 
 /**
  * `texto` como patrón ILIKE: los comodines del propio texto van escapados, porque quien
- * escribe «100%» busca eso y no «cualquier cosa que empiece por 100».
+ * escribe «100%» busca eso y no «cualquier cosa que empiece por 100». Es LA regla de escape
+ * de la app: la búsqueda de anclas del módulo AI la usa también, para que no diverjan.
  */
 export function patronDeBusqueda(texto: string): string {
   return `%${texto.trim().replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
@@ -65,8 +68,8 @@ export function patronDeBusqueda(texto: string): string {
 /**
  * A qué pantalla abre cada resultado. No todo tiene pantalla propia: un reto se abre por su
  * proyecto y, si no tiene, por el árbol del loop donde figura; evidencias e insights abren
- * su lista, que es donde se leen. Es una función y no una columna para que la base no tenga
- * que saber de rutas.
+ * su lista con el elemento destacado, que es donde se leen. Es una función y no una columna
+ * para que la base no tenga que saber de rutas.
  */
 export function destinoDeResultado(fila: FilaBusqueda): Destino {
   switch (fila.clase) {
@@ -83,12 +86,17 @@ export function destinoDeResultado(fila: FilaBusqueda): Destino {
     case 'design-version':
       return { to: '/design-version/$designVersionId', params: { designVersionId: fila.id } };
     case 'evidencia':
-      return { to: '/evidencia' };
+      return { to: '/evidencia', search: { destacar: fila.id } };
     case 'insight':
-      return { to: '/insights' };
+      return { to: '/insights', search: { destacar: fila.id } };
   }
 }
 
 export function conDestino(filas: FilaBusqueda[]): ResultadoBusqueda[] {
   return filas.map((fila) => ({ ...fila, destino: destinoDeResultado(fila) }));
+}
+
+/** El código con el que se nombra la pantalla destino: el del propio resultado, o el del proyecto que abre un reto. */
+export function codigoDelDestino(r: ResultadoBusqueda): string | undefined {
+  return (r.clase === 'reto' ? r.refCodigo : r.codigo) ?? undefined;
 }

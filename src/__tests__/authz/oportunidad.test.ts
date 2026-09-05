@@ -749,4 +749,90 @@ describeAuthz('oportunidades HMW: el portafolio de la etapa 3', () => {
       where oportunidad_id = ${o.oportunidadId}`;
     expect(enlaces.length, 'la oportunidad aprobada se quedó sin traza').toBe(1);
   }, 20000);
+
+  /**
+   * RF-01.6: toda escritura del portafolio deja rastro, venga de donde venga.
+   *
+   * Nació cumpliéndolo a medias: el SERVICIO escribía el evento al crear y al decidir, y no
+   * al enlazar, al desenlazar ni al repriorizar — y ninguno de los cuatro dejaba rastro si la
+   * escritura entraba por la superficie SQL concedida, que es justo la que hay que auditar.
+   *
+   * El rastro lo escribe ahora un trigger y el servicio ya no, para que haya UN solo escritor:
+   * dos dejarían dos filas por una acción hecha desde la app y una por la misma acción hecha
+   * por SQL, y entonces el archivo no permite contar nada.
+   *
+   * La sonda hace las cinco escrituras POR SQL DIRECTO —sin pasar por el servicio— y cuenta
+   * los eventos. Es la mitad que el servicio no podía cubrir ni cubriendo el resto.
+   */
+  it('toda escritura del portafolio deja su evento, también por SQL directo', async () => {
+    const admin = sqlAdmin();
+    const [srv] = await admin`insert into servicio (workspace_id, nombre, estado, creado_por)
+      values (${ws}, 'Servicio auditoría', 'activo', ${leadId}) returning id`;
+    const [r] = await admin`insert into reto
+      (workspace_id, servicio_ancla_id, codigo, titulo, descripcion, estado, metrica_objetivo, creado_por)
+      values (${ws}, ${srv!.id as string}, 'R-AUD', 'Reto de auditoría', 'Descripción',
+              'activo', 'Ninguna', ${leadId}) returning id`;
+    const retoA = r!.id as string;
+
+    const tiposDe = async (): Promise<string[]> => {
+      const filas = await admin`select tipo, payload from evento_dominio
+        where workspace_id = ${ws} and payload->>'retoId' = ${retoA}
+        order by creado_en, id`;
+      return filas.map((f) => f.tipo as string);
+    };
+
+    // Las CINCO escrituras, todas por la superficie concedida.
+    const [o] = await conUsuario(leadId, (tx) => tx`
+      insert into oportunidad (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+      values (${ws}, ${retoA}, 'HMW auditada', 3, 'Porque sí', ${leadId})
+      returning id`);
+    const oportunidadId = o!.id as string;
+    await conUsuario(leadId, (tx) => tx`
+      insert into oportunidad_insight (oportunidad_id, insight_id, workspace_id)
+      values (${oportunidadId}, ${insightValidado}, ${ws})`);
+    await conUsuario(leadId, (tx) => tx`
+      update oportunidad set prioridad = 7, prioridad_razon = 'Cambió el criterio'
+      where id = ${oportunidadId} and workspace_id = ${ws}`);
+    await conUsuario(leadId, (tx) => tx`
+      delete from oportunidad_insight
+      where oportunidad_id = ${oportunidadId} and insight_id = ${insightValidado}
+        and workspace_id = ${ws}`);
+    // Se vuelve a enlazar para poder aprobar: SYS-15 lo exige, y de paso el rastro lleva
+    // las dos trazas.
+    await conUsuario(leadId, (tx) => tx`
+      insert into oportunidad_insight (oportunidad_id, insight_id, workspace_id)
+      values (${oportunidadId}, ${insightValidado}, ${ws})`);
+    await conUsuario(leadId, (tx) => tx`
+      update oportunidad set estado = 'aprobada', veredicto_razon = ''
+      where id = ${oportunidadId} and workspace_id = ${ws}`);
+
+    expect(await tiposDe()).toEqual([
+      'OportunidadPropuesta',
+      'OportunidadTrazada',
+      'OportunidadRepriorizada',
+      'OportunidadDestrazada',
+      'OportunidadTrazada',
+      'OportunidadDecidida',
+    ]);
+
+    // Y el rastro se entiende SOLO: el evento del enlace nombra el reto y la pregunta, no
+    // solo ids que obliguen a ir a buscar la fila.
+    const [trazado] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'OportunidadTrazada'
+        and payload->>'oportunidadId' = ${oportunidadId}
+      order by creado_en limit 1`;
+    expect((trazado!.payload as { pregunta: string; insightId: string })).toMatchObject({
+      pregunta: 'HMW auditada',
+      insightId: insightValidado,
+    });
+
+    // Un solo escritor: el servicio no duplica lo que el trigger ya anotó.
+    const porServicio = await crearOportunidad(leadId, {
+      workspaceId: ws, retoId: retoA, pregunta: 'HMW por el servicio', prioridad: 0, prioridadRazon: '',
+    });
+    const [n] = await admin`select count(*)::int as n from evento_dominio
+      where workspace_id = ${ws} and tipo = 'OportunidadPropuesta'
+        and payload->>'oportunidadId' = ${porServicio.oportunidadId}`;
+    expect(n!.n, 'la misma acción dejó dos filas de auditoría').toBe(1);
+  });
 });

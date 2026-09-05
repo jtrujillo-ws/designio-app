@@ -55,28 +55,17 @@ export async function crearOportunidad(
     await exigirCuentaActiva(tx, actorId);
     let fila;
     try {
-      // UNA sentencia: la oportunidad y su evento comparten snapshot, y el rol auditado es
-      // el que autorizó el insert (misma disciplina que el resto de los módulos).
+      // El evento de auditoría NO se escribe aquí: lo escribe `oportunidad_auditoria`, un
+      // trigger, para que también deje rastro quien entra por la superficie SQL concedida
+      // (RF-01.6). Escribirlo en los dos sitios dejaría DOS filas por una acción hecha desde
+      // la app y una por la misma acción hecha por SQL, y entonces el archivo no permite
+      // contar nada. Mismo motivo en las otras cuatro escrituras de este módulo.
       [fila] = await tx`
-        with quien as (
-          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-        ),
-        nueva as (
-          insert into oportunidad
-            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
-          values (${entrada.workspaceId}, ${entrada.retoId}, ${entrada.pregunta},
-                  ${entrada.prioridad}, ${entrada.prioridadRazon}, ${actorId})
-          returning id
-        ),
-        evento as (
-          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-          select ${entrada.workspaceId}, 'OportunidadPropuesta',
-            jsonb_build_object('oportunidadId', nueva.id, 'retoId', ${entrada.retoId}::uuid,
-                               'pregunta', ${entrada.pregunta}::text),
-            ${actorId}, quien.rol
-          from nueva, quien
-        )
-        select id from nueva`;
+        insert into oportunidad
+          (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+        values (${entrada.workspaceId}, ${entrada.retoId}, ${entrada.pregunta},
+                ${entrada.prioridad}, ${entrada.prioridadRazon}, ${actorId})
+        returning id`;
     } catch (e) {
       const code = (e as { code?: string }).code;
       // WITH CHECK (42501): no eres quien propone, o el G3 de este reto ya se aprobó y la
@@ -181,24 +170,10 @@ export async function decidirOportunidad(
       // su momento. Están en el grant porque el guard escribe a través de la misma
       // superficie, no para que los use quien llama.
       [fila] = await tx`
-        with quien as (
-          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-        ),
-        decidida as (
-          update oportunidad
-          set estado = ${entrada.estado}, veredicto_razon = ${entrada.veredictoRazon}
-          where id = ${entrada.oportunidadId} and workspace_id = ${entrada.workspaceId}
-          returning id, reto_id
-        ),
-        evento as (
-          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-          select ${entrada.workspaceId}, 'OportunidadDecidida',
-            jsonb_build_object('oportunidadId', decidida.id, 'retoId', decidida.reto_id,
-                               'estado', ${entrada.estado}::text),
-            ${actorId}, quien.rol
-          from decidida, quien
-        )
-        select id from decidida`;
+        update oportunidad
+        set estado = ${entrada.estado}, veredicto_razon = ${entrada.veredictoRazon}
+        where id = ${entrada.oportunidadId} and workspace_id = ${entrada.workspaceId}
+        returning id`;
     } catch (e) {
       comoErrorDeDominio(e);
     }

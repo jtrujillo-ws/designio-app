@@ -60,6 +60,11 @@ function PantallaOportunidades() {
   const [prioridadRazon, setPrioridadRazon] = useState('');
   const [insightElegido, setInsightElegido] = useState<Record<string, string>>({});
   const [razonDeDescarte, setRazonDeDescarte] = useState<Record<string, string>>({});
+  /** El borrador de una repriorización: número y razón viajan juntos, y se suelta solo
+   * cuando el servidor lo aceptó. */
+  const [repriorizando, setRepriorizando] = useState<
+    Record<string, { prioridad: string; razon: string } | undefined>
+  >({});
   const rol = membresiaActiva?.rol ?? '';
   const puedeCurar = (ROLES_CURADORES as readonly string[]).includes(rol);
 
@@ -325,42 +330,84 @@ function PantallaOportunidades() {
                     >
                       Enlazar
                     </Button>
+                    {/*
+                      La prioridad y SU RAZÓN se cambian juntas, y por eso van en un
+                      formulario y no en un campo suelto que guarda al perder el foco.
+                      Reordenar el portafolio conservando la explicación vieja deja una
+                      prioridad razonada que ya no dice por qué: el número nuevo con el
+                      argumento del anterior. La razón se precarga con la que hay —lo normal
+                      es matizarla, no escribirla de cero— y se manda con el número.
+                    */}
                     <Input
                       type="number"
                       min={0}
                       max={1000}
                       step={1}
-                      style={{ width: 100 }}
-                      defaultValue={String(o.prioridad)}
+                      style={{ width: 90 }}
+                      value={repriorizando[o.id]?.prioridad ?? String(o.prioridad)}
                       aria-label={`Prioridad de ${o.pregunta}`}
-                      onBlur={(e) => {
-                        // Un `type="number"` vacío, o con «e» o «-» dentro, da `NaN` o un
-                        // decimal: mandarlo sería estrellarse contra el validador con un
-                        // mensaje que no dice nada. Se recorta al rango del contrato y, si no
-                        // hay número, se repone el valor que había — que es lo que el usuario
-                        // ve y lo que evita dejar el campo mintiendo.
-                        const crudo = Number(e.currentTarget.value);
-                        if (!Number.isFinite(crudo)) {
-                          e.currentTarget.value = String(o.prioridad);
-                          return;
-                        }
-                        const valor = Math.min(1000, Math.max(0, Math.round(crudo)));
-                        e.currentTarget.value = String(valor);
-                        if (valor === o.prioridad) return;
-                        void ejecutar(
-                          () =>
-                            repriorizarOportunidad({
-                              data: {
-                                workspaceId: datos.workspaceId,
-                                oportunidadId: o.id,
-                                prioridad: valor,
-                                prioridadRazon: o.prioridadRazon,
-                              },
-                            }),
-                          'No se pudo repriorizar; intenta de nuevo',
-                        );
-                      }}
+                      onChange={(e) =>
+                        setRepriorizando({
+                          ...repriorizando,
+                          [o.id]: {
+                            prioridad: e.currentTarget.value,
+                            razon: repriorizando[o.id]?.razon ?? o.prioridadRazon,
+                          },
+                        })
+                      }
                     />
+                    {repriorizando[o.id] && (
+                      <>
+                        <Input
+                          placeholder="Por qué esa prioridad"
+                          style={{ width: 220 }}
+                          value={repriorizando[o.id]!.razon}
+                          aria-label={`Razón de la prioridad de ${o.pregunta}`}
+                          onChange={(e) =>
+                            setRepriorizando({
+                              ...repriorizando,
+                              [o.id]: {
+                                prioridad: repriorizando[o.id]!.prioridad,
+                                razon: e.currentTarget.value,
+                              },
+                            })
+                          }
+                        />
+                        <Button
+                          size="sm"
+                          disabled={ocupado}
+                          onClick={async () => {
+                            // Un `type="number"` vacío, o con «e» dentro, da `NaN`: mandarlo
+                            // sería estrellarse contra el validador con un mensaje que no
+                            // dice nada. Se acota al rango del contrato antes de salir.
+                            const crudo = Number(repriorizando[o.id]!.prioridad);
+                            const valor = Number.isFinite(crudo)
+                              ? Math.min(1000, Math.max(0, Math.round(crudo)))
+                              : o.prioridad;
+                            const ok = await ejecutar(
+                              () =>
+                                repriorizarOportunidad({
+                                  data: {
+                                    workspaceId: datos.workspaceId,
+                                    oportunidadId: o.id,
+                                    prioridad: valor,
+                                    prioridadRazon: repriorizando[o.id]!.razon.trim(),
+                                  },
+                                }),
+                              'No se pudo repriorizar; intenta de nuevo',
+                            );
+                            // Solo se suelta el borrador si SE GUARDÓ. Si el servidor lo
+                            // rechazó —la oportunidad se decidió, G3 se cerró— el campo tiene
+                            // que seguir mostrando lo que el usuario escribió y no un número
+                            // que la base no tiene: eso es lo que convierte un error visible
+                            // en un dato inventado.
+                            if (ok) setRepriorizando({ ...repriorizando, [o.id]: undefined });
+                          }}
+                        >
+                          Guardar prioridad
+                        </Button>
+                      </>
+                    )}
                     <Button
                       size="sm"
                       disabled={ocupado || o.insights.length === 0}

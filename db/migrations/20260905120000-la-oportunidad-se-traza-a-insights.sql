@@ -798,3 +798,85 @@ begin
     end if;
   end loop;
 end $$;
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- AUDITORÍA: TODA ESCRITURA DEL PORTAFOLIO DEJA RASTRO (RF-01.6)
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- «Toda acción de escritura, aprobación y acción AI genera un registro de auditoría
+-- append-only» (RF-01.6), escrito «en la misma transacción que el cambio de estado»
+-- (diseño técnico §evento_dominio). El portafolio nació cumpliéndolo A MEDIAS: el servicio
+-- escribía el evento al crear y al decidir, y no al enlazar, al desenlazar ni al
+-- repriorizar — y NINGUNO de los cuatro dejaba rastro si la escritura entraba por la
+-- superficie SQL concedida, que es justo la que hay que auditar.
+--
+-- Va en TRIGGERS y el servicio deja de escribirlos. Dos escritores para el mismo evento es
+-- peor que ninguno: dejaría dos filas por una acción hecha desde la app y una por la misma
+-- acción hecha por SQL, y entonces el archivo no permite contar nada.
+--
+-- El pre-chequeo anti-oráculo es el mismo del resto del esquema: sin contexto de aplicación
+-- (seed, migraciones, backfills) no hay actor a quien atribuir la acción, y `evento_dominio`
+-- nace para auditar a las personas, no al administrador de la base.
+create function oportunidad_auditoria() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+declare
+  v_fila record;
+  v_tipo text;
+  v_payload jsonb;
+  v_oportunidad record;
+begin
+  v_fila := coalesce(new, old);
+  if not is_workspace_member(app_user_id(), v_fila.workspace_id) then
+    return null;
+  end if;
+
+  if tg_table_name = 'oportunidad' then
+    if tg_op = 'INSERT' then
+      v_tipo := 'OportunidadPropuesta';
+    elsif tg_op = 'DELETE' then
+      v_tipo := 'OportunidadBorrada';
+    elsif old.estado is distinct from new.estado then
+      v_tipo := 'OportunidadDecidida';
+    else
+      -- Lo único que queda es la repriorización: el grant no deja tocar `pregunta` ni el
+      -- ancla, así que un UPDATE que no cambia el estado cambió la prioridad o su razón.
+      v_tipo := 'OportunidadRepriorizada';
+    end if;
+    v_payload := jsonb_strip_nulls(jsonb_build_object(
+      'oportunidadId', v_fila.id, 'retoId', v_fila.reto_id,
+      'pregunta', v_fila.pregunta, 'estado', v_fila.estado,
+      'prioridad', v_fila.prioridad,
+      -- La razón viaja SOLO cuando la hay: un archivo lleno de cadenas vacías esconde las
+      -- que sí dicen algo.
+      'prioridadRazon', nullif(btrim(v_fila.prioridad_razon), ''),
+      'veredictoRazon', nullif(btrim(v_fila.veredicto_razon), '')));
+  else
+    v_tipo := case tg_op when 'INSERT' then 'OportunidadTrazada' else 'OportunidadDestrazada' end;
+    -- El reto y la pregunta se leen de la oportunidad para que el evento se entienda SOLO:
+    -- un rastro que obliga a ir a buscar la fila para saber de qué habla no es auditoría.
+    -- En el DELETE puede no estar (un borrado en cascada la habría quitado antes), y
+    -- entonces el evento sale con lo que sí consta.
+    select o.reto_id, o.pregunta into v_oportunidad
+      from oportunidad o
+      where o.id = v_fila.oportunidad_id and o.workspace_id = v_fila.workspace_id;
+    v_payload := jsonb_strip_nulls(jsonb_build_object(
+      'oportunidadId', v_fila.oportunidad_id, 'insightId', v_fila.insight_id,
+      'retoId', v_oportunidad.reto_id, 'pregunta', v_oportunidad.pregunta));
+  end if;
+
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (v_fila.workspace_id, v_tipo, v_payload,
+            app_user_id(), workspace_role(app_user_id(), v_fila.workspace_id));
+  return null;
+end;
+$fn$;
+
+revoke execute on function oportunidad_auditoria() from public;
+
+create trigger oportunidad_auditoria
+  after insert or update or delete on oportunidad
+  for each row execute function oportunidad_auditoria();
+create trigger oportunidad_auditoria
+  after insert or delete on oportunidad_insight
+  for each row execute function oportunidad_auditoria();

@@ -26,11 +26,13 @@ import {
   promptAsistenteGate,
   promptCriterios,
   promptRemediacionJourney,
+  promptOportunidades,
   promptRegistry,
   promptExtraccion,
   promptInsights,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
+  SISTEMA_OPORTUNIDADES,
   SISTEMA_REGISTRY,
   SISTEMA_REMEDIACION_JOURNEY,
   type GrafoDelJourney,
@@ -692,8 +694,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
    * del material guardado con el de hoy solo vale entre propuestas del mismo render.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-05.14';
-  const HUELLA_ANOTADA = '0c96649c53322f05cf712f71cd03c7c6a623b48243667d190bc069699d1549c8';
+  const VERSION_ANOTADA = 'ai-2026-09-05.15';
+  const HUELLA_ANOTADA = '2e89a1c135c854553fb6926975a00a5ca867d00c1958ce827ba6b040c2c9474c';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -1005,6 +1007,100 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       })),
       cuantas: 3,
     }),
+    // ── C3 ──
+    // Los insights son el cuerpo y llevan sus tramos; los criterios van detrás y NO se citan.
+    // Las dos cosas están en el mismo material, así que la huella tiene que cubrir un caso con
+    // las dos pobladas — con los criterios vacíos, el bloque que los rotula desaparecería sin
+    // que ninguna rama lo notara.
+    oportunidadesLlano: promptOportunidades({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D',
+      insights: [
+        { id: 'd4e5f6a7-0000-4000-8000-000000000001', titulo: 'La verificación excluye', resumen: 'Quien no lleva el documento abandona.' },
+        { id: 'd4e5f6a7-0000-4000-8000-000000000002', titulo: 'El aviso llega tarde', resumen: 'El recordatorio sale cuando ya se fue.' },
+      ],
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: 'Tiempo de verificación',
+          definicion: 'Minutos medianos de la verificación',
+          objetivo: 'Bajar de 8 a 4',
+          ventanaDias: 90,
+          lineaBasePlan: 'Medir dos semanas antes',
+        },
+      ],
+      cuantas: 5,
+    }),
+    // Sin criterios: el bloque de la prioridad se queda con su rótulo y sin nada debajo, que
+    // es una forma distinta del material y por tanto otra rama.
+    oportunidadesSinCriterios: promptOportunidades({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D',
+      insights: [
+        { id: 'd4e5f6a7-0000-4000-8000-000000000001', titulo: 'La verificación excluye', resumen: 'Quien no lleva el documento abandona.' },
+      ],
+      criterios: [],
+      cuantas: 5,
+    }),
+    // El recorte: aparece el aviso de truncado y el «truncado» del resumen de alcance, que es
+    // lo que le dice al modelo que no cite lo que no ve entero.
+    oportunidadesTruncado: promptOportunidades({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: CUERPO_LARGO,
+      insights: [
+        { id: 'd4e5f6a7-0000-4000-8000-000000000001', titulo: 'La verificación excluye', resumen: 'Quien no lleva el documento abandona.' },
+      ],
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: 'Tiempo de verificación',
+          definicion: 'Minutos medianos de la verificación',
+          objetivo: 'Bajar de 8 a 4',
+          ventanaDias: 90,
+          lineaBasePlan: 'Medir dos semanas antes',
+        },
+      ],
+      cuantas: 5,
+    }),
+    oportunidadesFichaVacia: promptOportunidades({
+      codigo: '',
+      titulo: '',
+      descripcion: 'D',
+      insights: [
+        { id: 'd4e5f6a7-0000-4000-8000-000000000001', titulo: 'La verificación excluye', resumen: 'Quien no lleva el documento abandona.' },
+      ],
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: 'Tiempo de verificación',
+          definicion: 'Minutos medianos de la verificación',
+          objetivo: 'Bajar de 8 a 4',
+          ventanaDias: 90,
+          lineaBasePlan: 'Medir dos semanas antes',
+        },
+      ],
+      cuantas: 1,
+    }),
+    oportunidadesConDelimitador: promptOportunidades({
+      codigo: 'R-01',
+      titulo: CON_DELIMITADOR,
+      descripcion: CON_DELIMITADOR,
+      insights: [{ id: 'd4e5f6a7-0000-4000-8000-000000000001', titulo: CON_DELIMITADOR, resumen: CON_DELIMITADOR }],
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-000000000001',
+          kpi: 'Tiempo de verificación',
+          definicion: 'Minutos medianos de la verificación',
+          objetivo: 'Bajar de 8 a 4',
+          ventanaDias: 90,
+          lineaBasePlan: 'Medir dos semanas antes',
+        },
+      ],
+      cuantas: 3,
+    }),
     // ── C5 ──
     // El grafo es el cuerpo, y sus SEÑALES van dentro: lo que distingue a C5 de una
     // capacidad que adivina es que la lista de defectos viene dada. Que ese bloque cambie de
@@ -1069,6 +1165,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       sistemaInsights: SISTEMA_INSIGHTS,
       sistemaRemediacionJourney: SISTEMA_REMEDIACION_JOURNEY,
       sistemaRegistry: SISTEMA_REGISTRY,
+      sistemaOportunidades: SISTEMA_OPORTUNIDADES,
       esquemaSalida: ESQUEMA_SALIDA,
       maxMaterial: MAX_MATERIAL,
       maxCampoFicha: MAX_CAMPO_FICHA,
@@ -1146,6 +1243,23 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.registryConEntradas.usuario).toContain('ya tiene 2 entradas');
     expect(RAMAS.registryConEntradas.usuario).toContain('Minutos de verificación');
     expect(RAMAS.registryConEntradas.alcanceResumen).toContain('2 entradas ya en el registry');
+
+    // C3: los insights son el cuerpo con sus ids delante —de ahí salen las citas y la traza—,
+    // los criterios van detrás y bajo su propio rótulo, el recorte avisa, y la ficha vacía
+    // emite su «(sin dato)». Sin criterios el rótulo se queda solo, que es otra forma.
+    expect(RAMAS.oportunidadesLlano.usuario).toContain('INSIGHTS VALIDADOS DEL RETO');
+    expect(RAMAS.oportunidadesLlano.usuario).toContain('[d4e5f6a7-0000-4000-8000-000000000002]');
+    expect(RAMAS.oportunidadesLlano.usuario).toContain('no se citan');
+    expect(RAMAS.oportunidadesLlano.usuario).toContain('Tiempo de verificación');
+    expect(RAMAS.oportunidadesLlano.alcanceResumen).toContain('2 insights validados, 1 criterios');
+    expect(RAMAS.oportunidadesSinCriterios.usuario).not.toContain('Tiempo de verificación');
+    expect(RAMAS.oportunidadesSinCriterios.alcanceResumen).toContain('0 criterios');
+    expect(RAMAS.oportunidadesTruncado.usuario).toContain('se truncó');
+    expect(RAMAS.oportunidadesTruncado.alcanceResumen).toContain('truncado');
+    expect(RAMAS.oportunidadesFichaVacia.usuario).toContain('(sin dato)');
+    expect(
+      RAMAS.oportunidadesConDelimitador.usuario.match(/<material-no-confiable>/g),
+    ).toHaveLength(1);
 
     // C5: el id del nodo y el código de la señal llegan al material —son lo que la respuesta
     // tiene que copiar—, el encargo cambia cuando no hay señales, el truncado avisa y la

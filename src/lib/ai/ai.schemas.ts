@@ -16,6 +16,7 @@ export type {
   ContenidoEntradaKpi,
   ContenidoExtraccion,
   ContenidoInsight,
+  ContenidoOportunidad,
   ContenidoPropuesta,
   ContenidoRemediacionJourney,
 } from './ai.contenido';
@@ -77,10 +78,16 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
  * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
  * carece de acción «aprobar».
  */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5', 'C6'] as const;
+export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5', 'C6', 'C3'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
-export const DestinoSchema = z.enum(['evidencia', 'criterio-exito', 'insight', 'entrada-kpi']);
+export const DestinoSchema = z.enum([
+  'evidencia',
+  'criterio-exito',
+  'insight',
+  'entrada-kpi',
+  'oportunidad',
+]);
 export type Destino = z.infer<typeof DestinoSchema>;
 
 
@@ -141,6 +148,22 @@ export const MAX_INSIGHTS_POR_LOTE = 4;
  * de haber pagado la llamada. Seis deja margen para un reto ancho sin invitar a inventar.
  */
 export const MAX_ENTRADAS_KPI_POR_LOTE = 6;
+
+/**
+ * Cuántas oportunidades HMW se le piden a C3 de una vez.
+ *
+ * Aquí el techo no lo pone la revisión ni el dominio, sino LO QUE UNA ETAPA PUEDE TRABAJAR.
+ * La etapa 3 no produce un catálogo de preguntas: produce el puñado que el equipo va a
+ * explorar en la 4, y cada una arrastra su prioridad, su razón y la traza a los insights que
+ * la sostienen. Un lote de doce se acepta entero sin leerlo, que es la forma que tiene esta
+ * capacidad de fallar sin que nadie lo note — y lo que quedaría es un portafolio inflado que
+ * G3 certifica igual, porque el gate mira la traza y no el tamaño.
+ *
+ * Cinco: uno más que los criterios y los insights, porque una HMW es más corta de leer que un
+ * insight con sus citas, y bastantes menos que las entradas KPI, que responden una a una a
+ * criterios que ya existen.
+ */
+export const MAX_OPORTUNIDADES_POR_LOTE = 5;
 
 /**
  * Cuántas remediaciones puede llevar UN informe de C5 — que es lo mismo que decir cuántas
@@ -304,12 +327,13 @@ export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad[
  */
 export const COLUMNA_DE_DESTINO: Record<
   Destino,
-  'evidencia_id' | 'criterio_id' | 'insight_id' | 'entrada_kpi_id'
+  'evidencia_id' | 'criterio_id' | 'insight_id' | 'entrada_kpi_id' | 'oportunidad_id'
 > = {
   evidencia: 'evidencia_id',
   'criterio-exito': 'criterio_id',
   insight: 'insight_id',
   'entrada-kpi': 'entrada_kpi_id',
+  oportunidad: 'oportunidad_id',
 };
 
 export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
@@ -532,6 +556,63 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     exigeConsentimiento: false,
     esSimulacion: false,
   },
+  C3: {
+    etiqueta: 'Oportunidades del reto → pregunta HMW trazada a insights',
+    destino: 'oportunidad',
+    /*
+     * El RETO, la TERCERA capacidad que comparte esta columna —con C0 y C2—. Que sean tres y
+     * no dos importa poco por sí mismo; lo que importa es que ninguna de las tres comparte
+     * puertas con las otras, y por eso cada regla se escribe por DESTINO: C0 se congela con
+     * el G0 (SYS-22), C2 no se congela con nada de eso y cita evidencia, y C3 vive dentro de
+     * la ventana del portafolio —que abre y cierra la etapa 3 con su G3— y cita insights.
+     *
+     * `oportunidad.reto_id` es NOT NULL y el portafolio es del reto, así que el objeto del que
+     * sale el material y aquel sobre el que se escribe son el mismo. No hay aquí la vuelta que
+     * obligó a C6 a anclar en el registry.
+     */
+    ancla: {
+      columna: 'reto_id',
+      etiqueta: 'Reto con insights validados',
+      enProsa: 'reto con insights validados',
+      buscar: 'Buscar por código o título…',
+      vacia:
+        'No hay retos con insights validados y portafolio abierto. Una HMW se apoya en lo que ya se sabe: valida insights en la etapa 2 y el reto aparecerá aquí.',
+      hayMas: (n) =>
+        `Hay más retos con insights validados de los que caben aquí: se listan los ${n} ` +
+        'primeros por código. Un reto sale de la lista mientras sus oportunidades propuestas ' +
+        'esperan revisión; para uno concreto, búscalo por su código o su título.',
+      enCurso:
+        'Ese reto ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese reto ya tiene oportunidades propuestas esperando revisión: decídelas antes de pedir otras',
+    },
+    /*
+     * LOTE, y la revisión es POR ELEMENTO: cada HMW se acepta o se descarta por separado, que
+     * es lo que pide SPEC-08 §3 y lo que la etapa 3 hace de todas formas — un portafolio se
+     * arma pregunta a pregunta.
+     *
+     * CERO es una respuesta legítima, como en C2: los insights validados de un reto pueden no
+     * dar para ninguna pregunta que valga la pena explorar, y el prompt pide expresamente que
+     * no se proponga lo que no se sostiene. Una lista vacía es mejor respuesta que cinco
+     * preguntas de relleno que después alguien tiene que descartar una a una — y que, hasta
+     * que las descarte, bloquean el G3 de su proyecto.
+     */
+    lote: { campo: 'oportunidades', minimo: 0, maximo: MAX_OPORTUNIDADES_POR_LOTE },
+    /*
+     * El material son INSIGHTS, que son conclusiones del equipo y no material de personas.
+     * El consentimiento se registra sobre `item_importacion` —por donde ese material entra— y
+     * se comprueba allí; lo que C3 lee ya pasó por esa puerta dos veces, porque un insight
+     * cita evidencia y esa evidencia salió de un item consentido.
+     *
+     * Es la misma respuesta que dio C2 y por el mismo motivo, con la salvedad que allí quedó
+     * apuntada: una revocación posterior sobre el item de origen no retira la evidencia ya
+     * materializada ni el insight que la cita. Eso es una regla de retención sobre
+     * `evidencia`, no una puerta de esta capacidad, y arreglarla aquí sería taparla en un
+     * tercer sitio en vez de en el suyo.
+     */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+  },
 };
 
 
@@ -630,6 +711,9 @@ export const ESTADOS_ANCLA = [
   'criterio-ausente',
   'nombre-ocupado',
   'criterios-cambiados',
+  'insights-cambiados',
+  'portafolio-cerrado',
+  'insight-no-validado',
   'material-no-comparable',
   'ancla-ausente',
 ] as const;

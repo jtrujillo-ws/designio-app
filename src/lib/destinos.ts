@@ -13,6 +13,7 @@ export type Destino =
   | { to: '/importacion' }
   | { to: '/evidencia'; search?: { destacar: string } }
   | { to: '/insights'; search?: { destacar: string } }
+  | { to: '/oportunidades' }
   | { to: '/journeys' }
   | { to: '/design-versions' }
   | { to: '/proyecto/$proyectoId'; params: { proyectoId: string } }
@@ -30,6 +31,8 @@ export function etiquetaDeDestino(destino: Destino, codigo?: string): string {
       return 'Evidencia y derechos de uso';
     case '/insights':
       return 'Insights y citas';
+    case '/oportunidades':
+      return 'Oportunidades HMW';
     case '/journeys':
       return 'Journeys y blueprints';
     case '/design-versions':

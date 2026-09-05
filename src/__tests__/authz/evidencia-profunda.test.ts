@@ -2507,13 +2507,16 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const [fa] = await admin`select pg_get_functiondef('gate_faltas_para_aprobar'::regproc) as def`;
     const faltas = fa!.def as string;
 
-    // Las dos rutas —checklist y G5— toman los candados con la misma función, y las
-    // faltas se preguntan UNA vez. Ni una más ni una menos: una tercera llamada sería una
-    // ruta nueva que hay que mirar; ninguna, un guard que volvió a decidir por su cuenta.
-    expect((guard.match(/razonamiento_candados\(/g) ?? []).length).toBe(2);
+    // Las TRES rutas que consumen razonamiento toman los candados con la misma función —el
+    // checklist, el diseño de G5 y, desde 20260905130000, el portafolio de G3—, y las faltas
+    // se preguntan UNA vez. Ni una más ni una menos: una llamada nueva es una ruta nueva que
+    // hay que mirar (se miró: G3 certifica «dónde jugamos» sobre HMW trazadas a insights, así
+    // que consume razonamiento igual que las otras dos y entra por el mismo protocolo), y
+    // ninguna sería un guard que volvió a decidir por su cuenta.
+    expect((guard.match(/razonamiento_candados\(/g) ?? []).length).toBe(3);
     expect((guard.match(/gate_faltas_para_aprobar\(/g) ?? []).length).toBe(1);
-    // Y en las faltas, las dos rutas preguntan al MISMO predicado.
-    expect((faltas.match(/razonamiento_sin_respaldo\(/g) ?? []).length).toBe(2);
+    // Y en las faltas, las tres rutas preguntan al MISMO predicado.
+    expect((faltas.match(/razonamiento_sin_respaldo\(/g) ?? []).length).toBe(3);
 
     // Y el guard ya no recorre ni decide sobre razonamiento: ni sigue `decision_insight`
     // —el eslabón por el que se llega a los insights de una decisión— ni bloquea decisiones

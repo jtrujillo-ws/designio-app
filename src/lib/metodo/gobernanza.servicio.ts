@@ -287,12 +287,18 @@ export async function reabrirEtapa(
       hashtextextended('designio:reto:' || ${dueno.reto_id as string}, 42))`;
     const insightIds = [...new Set(entrada.insightIds)];
     let fila;
+    /*
+     * El evento `EtapaReabierta` NO se emite aquí: lo emite el guard diferido de
+     * `reapertura_etapa`, para que también lo produzca el SQL directo. Es la misma regla que
+     * el resto del esquema —un evento en el servicio es una promesa; uno en el trigger es una
+     * propiedad—, y aquí se volvió urgente cuando esa fila pasó a gobernar la salida de
+     * 'completada': un registro sin rastro abría todas las ventanas del ciclo sin que
+     * constara quién. Con el evento se fue el CTE `quien`, que solo existía para ponerle el
+     * rol al actor.
+     */
     try {
       [fila] = await tx`
-        with quien as (
-          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-        ),
-        declarados as (
+        with declarados as (
           -- Los insights que existen DE VERDAD en el workspace: si el conteo no cuadra
           -- con lo pedido, la declaración era falsa y abajo se revierte todo.
           select i.id from insight i
@@ -337,19 +343,6 @@ export async function reabrirEtapa(
           select registro.id, declarados.id, ${entrada.workspaceId}
           from registro, declarados
           returning insight_id
-        ),
-        evento as (
-          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-          select ${entrada.workspaceId}, 'EtapaReabierta',
-            jsonb_build_object('proyectoId', ${entrada.proyectoId}::uuid,
-                               'etapa', ${entrada.etapaNumero}::int,
-                               'motivo', ${entrada.motivo}::text,
-                               'alcance', case when cardinality(${insightIds}::uuid[]) = 0
-                                               then 'etapa-completa' else 'declarado' end,
-                               'insightsDeclarados', (select count(*)::int from cambios),
-                               'decisionesMarcadas', (select count(*)::int from marcadas)),
-            ${actorId}, quien.rol
-          from registro, quien
         )
         select registro.id, (select count(*)::int from marcadas) as marcadas,
           (select count(*)::int from cambios) as declarados

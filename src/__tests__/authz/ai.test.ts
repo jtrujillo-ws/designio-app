@@ -7992,6 +7992,68 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   }, 20000);
 
   /**
+   * Y el archivado en vuelo también ordena una propuesta de C6, cuyo reto vive DETRÁS del
+   * registry.
+   *
+   * `propuesta_ai_un_ancla` deja `reto_id` nulo cuando el ancla es el registry, así que el
+   * guard del INSERT preguntaba por una columna vacía y se saltaba el candado entero: ni la
+   * clave de aviso del reto, ni el `for share` sobre su fila. Y el estado del reto sí decide
+   * aquí, porque `registry_admite_entradas` lo mira por dentro. Medido contra la base: con un
+   * archivado en vuelo la propuesta de C6 NACE —no espera a nadie— y queda en el panel
+   * imposible de aceptar, con la llamada ya pagada. Es exactamente lo que las dos sondas de
+   * arriba impiden para el ancla que sí es un reto.
+   *
+   * El reto se resuelve por `metric_registry.reto_id`, que es la relación de verdad; copiarlo
+   * en la propuesta sería un segundo sitio donde puede decir otra cosa.
+   */
+  it('el archivado en vuelo también ordena una propuesta de C6, anclada en el registry', async () => {
+    await enWorkspaceLimpio('c6-archivado-al-persistir', async ({ ws: wsE, curadorId, retoId: retoE }) => {
+      const admin = sqlAdmin();
+      const [crit] = await admin`insert into criterio_exito
+        (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan,
+         creado_por)
+        values (${wsE}, ${retoE}, 'KPI', 'Definición', 'Objetivo', 30, 'Plan', ${curadorId})
+        returning id`;
+      const [mr] = await admin`insert into metric_registry (workspace_id, reto_id, creado_por)
+        values (${wsE}, ${retoE}, ${curadorId}) returning id`;
+      const registryE = mr!.id as string;
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, registry_id, modelo, origen_key, resultado, creado_por)
+        values (${wsE}, 'C6', ${registryE}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const contenido = CONTENIDO_C6(crit!.id as string);
+
+      const archivado = await candadoEnVuelo((tx) => tx`update reto set estado = 'archivado'
+          where id = ${retoE} and workspace_id = ${wsE}`);
+
+      const persistencia = conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, registry_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           llamada_id, creado_por)
+        values (${wsE}, 'C6', 'entrada-kpi', ${registryE}, ${tx.json(contenido as never)},
+                ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})`);
+      const veredicto = persistencia.then(
+        () => 'nació',
+        (e: Error) => `rechazó: ${e.message}`,
+      );
+
+      await archivado.esperaAQueAlguienEspere();
+      archivado.soltar();
+      await archivado.terminado;
+
+      expect(
+        await veredicto,
+        'nació una propuesta de C6 sobre un reto que se estaba archivando',
+      ).toMatch(/archivado/);
+      const filas = await admin`select 1 from propuesta_ai
+        where workspace_id = ${wsE} and capacidad = 'C6'`;
+      expect(filas.length).toBe(0);
+    });
+  }, 20000);
+
+  /**
    * Y el ORDEN de los dos candados, leído del catálogo.
    *
    * Que el reto se bloquee en algún sitio no basta: donde el conjunto de `derecho_uso` que se

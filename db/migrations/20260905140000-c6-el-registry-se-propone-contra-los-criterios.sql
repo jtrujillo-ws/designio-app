@@ -295,6 +295,8 @@ CREATE OR REPLACE FUNCTION public.propuesta_ai_revision_guard()
  SECURITY DEFINER
  SET search_path TO 'public', 'pg_temp'
 AS $function$
+declare
+  v_reto uuid;
 begin
   -- Pre-chequeo anti-oráculo: para quien no es miembro del workspace declarado no hay
   -- nada que auditar ni que serializar — la política rechaza la escritura como siempre.
@@ -358,14 +360,30 @@ begin
     -- pagada. `for share` sobre la fila del reto es lo que la ordena detrás o delante, y va
     -- ANTES de cualquier candado sobre `derecho_uso` — el orden del protocolo, el mismo que
     -- toman el guard diferido, la revalidación previa al despacho y `bloquearReto`.
-    if new.reto_id is not null then
+    -- ── EL RETO DE ESTA PROPUESTA, QUE EN C6 VIVE DETRÁS DEL REGISTRY ──
+    -- `propuesta_ai_un_ancla` deja `reto_id` NULO cuando el ancla es el registry, así que
+    -- preguntando por la columna se saltaba el candado entero: ni la clave de aviso del reto, ni
+    -- el `for share` sobre su fila. Y el estado del reto SÍ decide aquí —
+    -- `registry_admite_entradas` lo mira por dentro (`rt.estado <> 'archivado'`)—, de modo que sin
+    -- candado esa lectura es una FOTO. Medido: con un archivado en vuelo, la propuesta de C6 NACE
+    -- —no espera a nadie— y queda en el panel imposible de aceptar, con la llamada ya pagada. Es
+    -- exactamente lo que las sondas de C0 y C2 impiden para el ancla que sí es un reto.
+    --
+    -- Se resuelve por la tabla y no copiando `reto_id` en la propuesta: `metric_registry.reto_id`
+    -- es la relación de verdad, y duplicarla sería un segundo sitio donde puede decir otra cosa.
+    v_reto := new.reto_id;
+    if v_reto is null and new.registry_id is not null then
+      select mr.reto_id into v_reto from metric_registry mr
+       where mr.id = new.registry_id and mr.workspace_id = new.workspace_id;
+    end if;
+    if v_reto is not null then
       perform 1 from reto r
-       where r.id = new.reto_id and r.workspace_id = new.workspace_id
+       where r.id = v_reto and r.workspace_id = new.workspace_id
        for share;
     end if;
-    if new.reto_id is not null and exists (
+    if v_reto is not null and exists (
       select 1 from reto r
-      where r.id = new.reto_id and r.workspace_id = new.workspace_id
+      where r.id = v_reto and r.workspace_id = new.workspace_id
         and r.estado = 'archivado'
     ) then
       raise exception 'ese reto está archivado: no admite propuestas AI nuevas';

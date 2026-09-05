@@ -5289,6 +5289,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           select case ${proyeccion.motivo} else null end as estado
           from (select ${capacidad}::text as capacidad, ${columnas},
                        ${tx.json(contenido)}::jsonb as contenido,
+                       -- Y el alcance sellado, por la misma razón que «contenido»: el motivo de
+                       -- C2 pasó a mirar si el reto tiene evidencia fuera de él. Va NULO porque
+                       -- esa rama pregunta por el alcance de una propuesta concreta y lo que
+                       -- este censo mide es el ENRUTADO del motivo, no la completitud de
+                       -- ninguna; nulo la deja inerte, que es la respuesta correcta para una
+                       -- fila sintética que no representa a ninguna propuesta.
+                       null::uuid[] as alcance_evidencia,
                        ${ws}::uuid as workspace_id) p
           ${proyeccion.joins}`;
         return (f!.estado as string | null) ?? null;
@@ -7042,9 +7049,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
       const panel = await panelPropuestas(curadorId, wsC);
       const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
-      // Sigue siendo aceptable —la cita apunta a evidencia real y citable—: lo que se pierde
-      // es la SEÑAL, no la propuesta.
-      expect(p.anclaEstado).toBe('disponible');
+      /*
+       * Y deja de ser aceptable, que es un cambio de esta ronda y no un detalle: aquí ponía
+       * `disponible` con el comentario «la cita apunta a evidencia real y citable, lo que se
+       * pierde es la SEÑAL, no la propuesta». Dejó de ser verdad cuando el sello pasó a exigir
+       * que los insights hubieran VISTO toda la evidencia del reto — el documento recién
+       * enlazado no lo vieron—, y el estado del panel se quedó atrás porque se calculaba sin
+       * mirar esa condición. La aserción vieja documentaba el hueco en vez de cerrarlo.
+       */
+      expect(p.anclaEstado).toBe('alcance-incompleto');
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p.id }),
+      ).rejects.toThrow(/no llegaron a ver/);
       expect(
         p.citas.map((c) => c.presenteLiteral),
         'el panel afirma sobre un material que ya no es el que vio el modelo',
@@ -9804,6 +9820,78 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
   /**
+   * Un derecho CADUCADO para el reloj de pared no sale hacia el proveedor, y lo dice por su
+   * nombre.
+   *
+   * Todo lo demás que puede invalidar el material lo escribe alguien, y por eso los candados de
+   * la revalidación lo ordenan. La caducidad llega sola, sin tomar ningún candado — y
+   * `evidencia_usable` la mide con `current_date`, que es la fecha de INICIO de la transacción
+   * y no avanza aunque la transacción espere.
+   *
+   * Lo que esta sonda mide es la mitad reproducible: que la caducidad se caza en la
+   * revalidación con su PROPIO mensaje, y no disuelta en el genérico de «la evidencia cambió»
+   * —que manda a buscar a un culpable que aquí no existe y propone la salida equivocada—. La
+   * otra mitad, que la comparación use el reloj de pared y no el de la transacción, no se puede
+   * montar en la suite sin cruzar la medianoche de verdad: va argumentada en el código, no
+   * probada aquí, y conviene decirlo en vez de dejarlo pasar.
+   */
+  it('un derecho caducado se caza antes de despachar, con su propio motivo', async () => {
+    await enWorkspaceLimpio(
+      'c2-derecho-caducado',
+      async ({ ws: wsC, curadorId, retoId: retoC }) => {
+        const admin = sqlAdmin();
+        // DOS documentos: uno vigente, que es lo que mantiene al reto con material citable —si
+        // caducara el único, el rechazo lo daría la puerta de «este reto no tiene evidencia
+        // citable» y esta sonda no llegaría a medir lo suyo—, y otro caducado.
+        const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+          titulo: 'La evidencia vigente',
+          resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+        });
+        const caduca = await evidenciaDelReto(wsC, retoC, curadorId, {
+          titulo: 'La evidencia con fecha',
+          resumen: 'Un permiso que vence hoy.',
+        });
+        // Vence HOY, que es el caso donde las dos preguntas discrepan: `evidencia_usable` dice
+        // que sí —hoy todavía se puede citar— y este camino dice que no, porque mañana, cuando
+        // alguien revise, ya no. Con «ayer» la sonda no mediría esto: el documento saldría del
+        // material y el rechazo lo daría la puerta de «este reto no tiene evidencia citable».
+        await admin`update derecho_uso set vence_en = current_date
+          where evidencia_id = ${caduca} and workspace_id = ${wsC}`;
+        // Por el rol de aplicación y no por administración: `evidencia_usable` lleva su propio
+        // anti-oráculo —`is_workspace_member(app_user_id(), …)`— y sin contexto de usuario
+        // contesta `false` a todo, así que preguntarla con `sqlAdmin()` mediría eso y no esto.
+        const [sigueCitable] = await conUsuario(
+          curadorId,
+          (tx) => tx`select evidencia_usable(${caduca}, ${wsC}, 'cliente') as usable`,
+        );
+        expect(sigueCitable!.usable, 'el supuesto de la sonda: hoy todavía es citable').toBe(true);
+
+        const [antes] = await admin`select count(*)::int as n from llamada_ai
+          where workspace_id = ${wsC}`;
+        await conProveedor(
+          {
+            ok: true,
+            datos: { insights: [CONTENIDO_C2(ev)] },
+            intentos: [intento({ uso: null })],
+          },
+          async () => {
+            await expect(
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C2',
+                anclaId: retoC,
+              }),
+            ).rejects.toThrow(/vence hoy/);
+          },
+        );
+        const [tras] = await admin`select count(*)::int as n from llamada_ai
+          where workspace_id = ${wsC}`;
+        expect(tras!.n, 'se apuntó una llamada que no se hizo').toBe(antes!.n);
+      },
+    );
+  });
+
+  /**
    * El alcance que se sella dice lo que el modelo LEYÓ, no lo que se consultó para él.
    *
    * El cuerpo de C2 es la concatenación de todos los documentos del reto y se recorta ENTERO a
@@ -9875,7 +9963,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         ).toEqual([cabe]);
         expect(guardada!.alcance_evidencia).not.toContain(noCabe);
 
-        // Y el suelo no la sella mientras el reto siga teniendo esa evidencia sin ver.
+        // Y el panel lo DICE, en vez de ofrecer un botón que siempre vuelve: el guard rechaza
+        // esa aceptación de forma determinista, así que una tarjeta «disponible» sería una
+        // tarjeta aceptable que no se deja aceptar.
+        const p = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+          (x) => x.capacidad === 'C2',
+        )!;
+        expect(p.anclaEstado, 'el panel ofrece aceptar algo que no se puede aceptar').toBe(
+          'alcance-incompleto',
+        );
+
+        // Y no es decoración: aceptar falla de verdad, que es lo que el estado anuncia.
         await expect(
           aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: guardada!.id as string }),
         ).rejects.toThrow(/no llegaron a ver/);

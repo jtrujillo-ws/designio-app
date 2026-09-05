@@ -1372,3 +1372,49 @@ alter table propuesta_ai add constraint propuesta_ai_alcance_evidencia_c2
   check (capacidad <> 'C2' or alcance_evidencia is not null);
 
 grant insert (alcance_evidencia) on propuesta_ai to designio_app;
+
+-- ── Un permiso que no aguanta hasta el sello no vale una llamada ──
+--
+-- `evidencia_usable` contesta «¿se puede usar HOY?», y para leer o citar hoy es la pregunta
+-- correcta. Antes de PAGAR una llamada hace falta la otra: ¿aguanta hasta que alguien la
+-- acepte? Entre el despacho y el sello hay un commit, la respuesta del proveedor y una revisión
+-- humana, que no ocurre en el mismo minuto. Un derecho que vence HOY llega muerto: mañana la
+-- aceptación falla con DR001 y queda una propuesta pagada, revisada y solo tirable — que es lo
+-- que este mismo camino ya evita con la evidencia que no es citable.
+--
+-- De paso desaparece un borde: `evidencia_usable` mide con la fecha de INICIO de la
+-- transacción, así que una que empieza a las 23:59 y despacha pasada la medianoche mandaría un
+-- documento cuyo permiso expiró mientras ella esperaba en los candados. Con el último día ya
+-- fuera, no hay medianoche que cruzar.
+--
+-- Vive AQUÍ y no en la plantilla del servicio porque el calendario de las garantías lo fija la
+-- base (20260904220000): `timezone('UTC', now())::date` es la forma canónica de esta casa, y
+-- preguntarlo desde la aplicación lo dejaría dependiendo del huso de quien llama.
+--
+-- Anti-oráculo como sus hermanas: es SECURITY DEFINER y está concedida al rol de aplicación,
+-- así que sin esta primera rama contestaría por retos ajenos —y lo que contesta es el TÍTULO de
+-- un documento del otro cliente—. `session_user` y no `current_user`, que bajo SECURITY DEFINER
+-- es siempre el dueño.
+create function derecho_del_reto_que_vence_ya(p_reto uuid, p_ws uuid) returns text
+language sql stable security definer set search_path = public, pg_temp as $fn$
+  select case
+    when session_user = 'designio_app' and not is_workspace_member(app_user_id(), p_ws)
+      then null
+    else (
+      select e.titulo
+        from derecho_uso du
+        join evidencia e on e.id = du.evidencia_id and e.workspace_id = du.workspace_id
+        join arquetipo_evidencia ae on ae.evidencia_id = e.id
+          and ae.workspace_id = e.workspace_id
+        join arquetipo a on a.id = ae.arquetipo_id and a.workspace_id = ae.workspace_id
+       where a.reto_id = p_reto and a.workspace_id = p_ws
+         and du.estado = 'concedido' and du.ambito in ('cliente', 'publico')
+         and du.vence_en is not null
+         and du.vence_en <= timezone('UTC', now())::date
+       order by e.titulo asc
+       limit 1)
+  end
+$fn$;
+
+revoke execute on function derecho_del_reto_que_vence_ya(uuid, uuid) from public;
+grant execute on function derecho_del_reto_que_vence_ya(uuid, uuid) to designio_app;

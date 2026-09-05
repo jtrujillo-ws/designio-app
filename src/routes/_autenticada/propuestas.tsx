@@ -105,6 +105,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese reto está archivado: su trabajo se cerró y esta propuesta quedó obsoleta, así que solo puede rechazarse.',
   'evidencia-no-citable':
     'Alguna de las evidencias que este insight cita ya no se puede citar al cliente: su derecho de uso se retiró, caducó o el documento ya no está. Aceptarlo fallaría al escribir la cita (DR001), así que por ahora solo puede rechazarse. Si el derecho vuelve, la propuesta vuelve a poder aceptarse sin hacer nada.',
+  'alcance-incompleto':
+    'Ese reto tiene evidencia que estos insights no llegaron a ver: se enlazó después de generarlos, o no cabía en el material que se le mandó al modelo. Aceptarlos sellaría un análisis que no la miró, así que por ahora solo pueden rechazarse. Vuelve a pedirlos para que la tenga en cuenta.',
   'journey-cambiado':
     'El grafo de ese journey cambió desde que se generó el informe: alguna de las señales que remedia ya no está abierta, o el grafo que describe ya no es el que hay. Puedes leerlo, pero comprueba contra el journey antes de aplicar nada.',
   'checklist-avanzado':

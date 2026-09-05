@@ -1132,6 +1132,28 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
             where e.id::text = lower(c #>> '{}') and e.workspace_id = p.workspace_id
               and evidencia_usable(e.id, e.workspace_id, 'cliente')))
           then 'evidencia-no-citable'
+        /*
+         * Y que el reto no haya ganado evidencia que estos insights no llegaron a ver.
+         *
+         * Es la misma clase de defecto que la rama de arriba, con la otra mitad del sello: el
+         * guard diferido rechaza la aceptación cuando el reto tiene evidencia usable que no
+         * está en «alcance_evidencia» —porque se enlazó después, o porque el recorte del
+         * material no la dejó llegar—, y sin esta rama el panel seguía diciendo «disponible» y
+         * ofreciendo un botón que siempre vuelve. Una tarjeta aceptable que no se deja aceptar
+         * es peor que una marcada: la marcada dice qué hacer.
+         *
+         * La condición es LA MISMA que la del guard, escrita igual, porque una discrepancia
+         * entre las dos devuelve exactamente el problema que esta rama quita.
+         */
+        when p.reto_id is not null and p.alcance_evidencia is not null and exists (
+          select 1
+          from arquetipo a
+          join arquetipo_evidencia ae on ae.arquetipo_id = a.id
+            and ae.workspace_id = a.workspace_id
+          where a.reto_id = p.reto_id and a.workspace_id = p.workspace_id
+            and evidencia_usable(ae.evidencia_id, ae.workspace_id, 'cliente')
+            and not (ae.evidencia_id = any (p.alcance_evidencia)))
+          then 'alcance-incompleto'
         else 'disponible'
       end`,
     material: (f) =>
@@ -2373,7 +2395,13 @@ function anclasDelInsert(
 async function huellaDelMaterialDeInsights(
   tx: TransactionSql,
   entrada: GenerarPropuestas,
-): Promise<{ huella: string; reto: { codigo: string; titulo: string; descripcion: string } | null }> {
+): Promise<{
+  huella: string;
+  reto: { codigo: string; titulo: string; descripcion: string } | null;
+  /** El título del primer documento del reto cuyo derecho de cita NO aguanta hasta el sello —vence
+   * hoy o antes—, o `null` si ninguno. Ver la nota del calendario. */
+  caducada: string | null;
+}> {
   await tx`select pg_advisory_xact_lock_shared(
     hashtextextended('designio:workspace:' || ${entrada.workspaceId}, 42))`;
   await tx`select pg_advisory_xact_lock(
@@ -2383,7 +2411,7 @@ async function huellaDelMaterialDeInsights(
     for share`;
   const [reto] = await tx`select estado = 'archivado' as archivado, codigo, titulo, descripcion
     from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
-  if (!reto || (reto.archivado as boolean)) return { huella: '', reto: null };
+  if (!reto || (reto.archivado as boolean)) return { huella: '', reto: null, caducada: null };
   await tx`select du.evidencia_id
     from derecho_uso du
     where du.workspace_id = ${entrada.workspaceId}
@@ -2401,7 +2429,34 @@ async function huellaDelMaterialDeInsights(
     where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
       and evidencia_usable(e.id, e.workspace_id, 'cliente')
     order by e.titulo asc, e.id asc`;
+  /*
+   * Y el CALENDARIO, que es lo único de aquí que avanza SIN TOMAR NINGÚN CANDADO.
+   *
+   * Todo lo demás que puede invalidar el material —una revocación, un desenlace, un archivado—
+   * lo escribe alguien, y por eso los candados de arriba lo ordenan. La caducidad llega sola.
+   * `evidencia_usable` la mide con `current_date`, que es la fecha de INICIO de la transacción
+   * y no avanza aunque la transacción espere (medido: tras dos segundos, `now()` y
+   * `current_date` intactos, `clock_timestamp()` movido). Una transacción que empieza a las
+   * 23:59 y despacha pasada la medianoche manda un documento cuyo permiso ya expiró.
+   *
+   * El margen NO es de medianoche: se pregunta por el día ENTERO. Un permiso que vence HOY no
+   * llega vivo al final del camino —entre esta llamada y el sello hay un commit, la respuesta
+   * del proveedor y una revisión humana, que no ocurre en el mismo minuto—, así que mañana la
+   * aceptación fallaría con DR001 y quedaría una propuesta pagada, revisada y solo tirable. Con
+   * el último día ya fuera, además, no queda medianoche que cruzar.
+   *
+   * La pregunta la contesta la BASE y no esta plantilla: el calendario de las garantías lo fija
+   * ella (20260904220000), y preguntarlo desde aquí lo dejaría dependiendo del huso de quien
+   * llama. Hay un censo que lo vigila, y cazó la primera versión de esto.
+   *
+   * `evidencia_usable` no se toca: es LA definición de «se puede usar», es STABLE a propósito
+   * —las políticas de RLS la usan así— y para leer o citar hoy sigue siendo la correcta. Esto
+   * es una pregunta distinta y más estricta, y solo puede errar en la dirección de no gastar.
+   */
+  const [caducada] = await tx`select derecho_del_reto_que_vence_ya(
+    ${entrada.anclaId}, ${entrada.workspaceId}) as titulo`;
   return {
+    caducada: (caducada?.titulo as string | undefined) ?? null,
     huella: huellaDelMaterial(
       materialDeInsights({
         codigo: reto.codigo as string,
@@ -2486,10 +2541,18 @@ const REVALIDAR: Record<
      *    que se va a mandar, y de paso cubre lo demás que puede haber cambiado: una evidencia
      *    desenlazada, otra nueva, un resumen editado, la formulación del reto.
      */
-    const { huella, reto } = await huellaDelMaterialDeInsights(tx, entrada);
+    const { huella, reto, caducada } = await huellaDelMaterialDeInsights(tx, entrada);
     if (!reto) {
       throw new ErrorAI(
         'Ese reto se archivó mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+    // Con su propio mensaje y no dentro del de la huella: la caducidad no la provocó nadie, así
+    // que «se revocaron derechos, se desenlazó o se editó» mandaría a buscar a un culpable que
+    // no existe. Y la salida es otra: renovar el permiso, no volver a pedirlo tal cual.
+    if (caducada !== null) {
+      throw new ErrorAI(
+        `El derecho de cita de «${caducada}» vence hoy: no se llamó al proveedor, porque unos insights que se revisan mañana ya no se podrían aceptar. Renueva el permiso —o desenlaza ese documento del reto— y vuelve a pedirlo.`,
       );
     }
     if (huella !== (huellaMaterial ?? '')) {
@@ -2914,10 +2977,15 @@ const COMPROBAR: Record<
    * y dentro de la transacción que escribe, que es lo que la hace atómica con la fila.
    */
   C2: async (tx, entrada, _contenidos, huellaMaterial) => {
-    const { huella, reto } = await huellaDelMaterialDeInsights(tx, entrada);
+    const { huella, reto, caducada } = await huellaDelMaterialDeInsights(tx, entrada);
     if (!reto) {
       throw new ErrorAI(
         'Ese reto se archivó mientras el proveedor respondía: la propuesta no se guarda',
+      );
+    }
+    if (caducada !== null) {
+      throw new ErrorAI(
+        `El derecho de cita de «${caducada}» vence hoy: la propuesta no se guarda, porque sus citas ya no se podrían aceptar al revisarla. Renueva el permiso —o desenlaza ese documento del reto— y vuelve a pedirla.`,
       );
     }
     if (huella !== (huellaMaterial ?? '')) {

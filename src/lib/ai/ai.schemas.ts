@@ -568,6 +568,7 @@ export const ESTADOS_ANCLA = [
   'checklist-avanzado',
   'reto-archivado',
   'evidencia-no-citable',
+  'alcance-incompleto',
   'journey-cambiado',
   'ancla-ausente',
 ] as const;

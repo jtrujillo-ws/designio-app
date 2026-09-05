@@ -695,6 +695,29 @@ begin
                 and c.localizacion = q.ci->>'localizacion'))))) then
     raise exception 'las afirmaciones y las citas del insight materializado no dicen lo que dice la propuesta: se copian tal cual de la propuesta aceptada (SYS-19)';
   end if;
+  -- Y que TODA evidencia que el insight acaba de citar siga pudiendo citarse al cliente, en
+  -- el COMMIT.
+  --
+  -- `evidencia_citable_guard` lo exige al insertar cada cita, y ahí lee el derecho en el
+  -- snapshot de SU sentencia. Entre esa lectura y el commit cabe una revocación ajena ya
+  -- commiteada, y entonces la transacción sella una cita —con su fragmento copiado— cuyo
+  -- derecho de uso ya no existe. Medido: la aceptación commiteaba y `evidencia_usable` daba
+  -- `false` justo después. Es exactamente el mismo argumento por el que este guard ya rehace
+  -- la comprobación del CONSENTIMIENTO para la evidencia extraída, y por el que rehace el
+  -- ciclo de vida del reto: lo que caduca solo hay que volver a preguntarlo en el último
+  -- instante, y el último instante es este.
+  --
+  -- Va por el OBJETO —las citas del insight que esta propuesta materializó— y no por destino
+  -- ni por capacidad: la regla es «citar exige derechos vigentes» y habla de las citas, así
+  -- que cualquier capacidad que mañana materialice un insight la hereda sin tocar esto.
+  if new.insight_id is not null and exists (
+    select 1
+    from afirmacion a
+    join cita c on c.afirmacion_id = a.id and c.workspace_id = a.workspace_id
+    where a.insight_id = new.insight_id and a.workspace_id = new.workspace_id
+      and not evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente')) then
+    raise exception 'DR001: alguna de las evidencias que este insight cita dejó de poder citarse al cliente mientras se aceptaba (se retiró el derecho de uso, caducó, o el documento ya no está)';
+  end if;
   -- Y las CONTRADICCIONES, que son parte del insight y no un adorno.
   --
   -- La comprobación de arriba cubría la cabecera, las afirmaciones y sus citas, y dejaba fuera

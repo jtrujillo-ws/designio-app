@@ -6998,71 +6998,23 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
-  /**
-   * Y una cita cuyo documento ya no está en el material NO se mide contra los demás.
+  /*
+   * (Aquí vivía «una cita a evidencia que ya no está en el material no se mide contra el
+   * resto». Se retira porque su ruta dejó de ser alcanzable, no porque estorbara.)
    *
-   * `pajarDeLaCita` devuelve `null` para eso, y quien lo lee tenía escrito
-   * `pajarDeLaCita?.(f, c) ?? material`: un `??` que confunde las dos respuestas que la
-   * función distingue. `undefined` es «esta capacidad no declara pajar» —CI, C0 y CT citan
-   * contra un material único— y su respuesta correcta es el material entero. `null` es «la
-   * cita nombra un trozo que no está», y colapsarlo en el material entero devuelve
-   * exactamente el verde prestado que `pajarDeLaCita` existe para quitar.
+   * Aquel caso llegaba al `pajarDeLaCita` nulo por el único hueco que quedaba: la huella no
+   * comparable tras un cambio de versión del prompt, que resolvía la presencia como medible y
+   * dejaba a una cita sin documento midiéndose contra los demás. Desde que `materialVigente`
+   * solo mide cuando la huella dice que SÍ, ese hueco no existe: con la huella igual, el
+   * material es el mismo byte a byte, así que el conjunto de documentos también, y una cita no
+   * puede nombrar uno que falte. Y con la huella distinta no se mide nada.
    *
-   * Se llega por el camino normal —a la evidencia citada le retiran los derechos y sale del
-   * material— con la huella no comparable, que es cuando la comprobación de arriba no
-   * short-circuita: una propuesta viva el día que se despliega una versión nueva del prompt.
-   * Ese es justo el día en que un verde prestado se envía a revisión.
+   * Lo que protegía sigue protegido, y en un sitio donde no hace falta alcanzarlo para que
+   * valga: el TIPO exige `materialVigente` a toda capacidad que declare `pajarDeLaCita`, así
+   * que la que venga no puede recortar el pajar por documento sin poder decir si ese recorte
+   * sigue siendo el del modelo. Comprobado quitando `materialVigente` de C2: el compilador se
+   * niega.
    */
-  it('una cita a evidencia que ya no está en el material no se mide contra el resto', async () => {
-    await enWorkspaceLimpio('c2-pajar-ausente', async ({ ws: wsC, curadorId, retoId: retoC }) => {
-      const admin = sqlAdmin();
-      const a = await evidenciaDelReto(wsC, retoC, curadorId, {
-        titulo: 'Analítica del funnel',
-        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
-      });
-      const b = await evidenciaDelReto(wsC, retoC, curadorId, {
-        titulo: 'Encuesta de salida',
-        resumen: 'El 71% de los abandonos lo dice también quien contesta la encuesta.',
-      });
-      const contenido: ContenidoInsight = {
-        titulo: 'Dónde se pierde la gente',
-        resumen: 'El abandono se concentra en la carga del documento.',
-        afirmaciones: [
-          {
-            texto: 'La mayoría abandona al cargar el documento',
-            esHipotesis: false,
-            // Cita a B, con un fragmento que está en B — y también en A, que es lo que hace
-            // visible el defecto cuando B sale del material.
-            citas: [{ evidenciaId: b, fragmento: 'El 71% de los abandonos', localizacion: 'resumen' }],
-          },
-        ],
-        contradicciones: [],
-        confianzaPropuesta: 'media',
-      };
-      await conProveedor(
-        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
-        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
-      );
-      expect(a).not.toBe(b);
-
-      // El día del despliegue: la propuesta sigue viva y su huella ya no es comparable, así
-      // que la comprobación del material no puede contestar y la presencia se mide igual.
-      await admin`update propuesta_ai set prompt_version = 'ai-de-otro-render'
-        where workspace_id = ${wsC} and capacidad = 'C2'`;
-      // Y a la evidencia citada le retiran los derechos: sale del material del panel.
-      await admin`update derecho_uso
-        set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
-            decidido_por = ${curadorId}, decidido_en = now()
-        where evidencia_id = ${b} and workspace_id = ${wsC}`;
-
-      const panel = await panelPropuestas(curadorId, wsC);
-      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
-      expect(
-        p.citas.map((c) => c.presenteLiteral),
-        'la cita a un documento que ya no está en el material se midió contra los demás',
-      ).toEqual([false]);
-    });
-  });
 
   /**
    * La misma evidencia enlazada por DOS arquetipos del mismo reto se cuenta una vez.
@@ -7601,6 +7553,124 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             where id = ${prop!.id as string} and workspace_id = ${wsC}`;
         }),
       ).rejects.toThrow(/contradicciones del insight materializado/);
+    });
+  });
+
+  /**
+   * Y el derecho de uso se vuelve a preguntar en el COMMIT, no solo al insertar la cita.
+   *
+   * `evidencia_citable_guard` lo exige al insertar cada cita, y ahí lo lee en el snapshot de SU
+   * sentencia. Entre esa lectura y el commit cabe una revocación ajena ya commiteada, y
+   * entonces la transacción sella una cita —con su fragmento copiado— cuyo derecho ya no
+   * existe. No es una carrera rebuscada: aceptar es una transacción con varias escrituras y
+   * una revisión humana justo delante.
+   *
+   * Medido antes del arreglo: la aceptación COMMITEABA, y `evidencia_usable` daba `false`
+   * inmediatamente después sobre esa misma evidencia.
+   *
+   * Es el mismo argumento por el que este guard ya rehace la comprobación del CONSENTIMIENTO
+   * para la evidencia extraída y el ciclo de vida del reto: lo que caduca solo hay que volver a
+   * preguntarlo en el último instante, y el guard diferido ES el último instante — corre en el
+   * commit y ve lo ajeno ya commiteado.
+   */
+  it('los derechos de las citas se vuelven a exigir al cerrar la aceptación', async () => {
+    await enWorkspaceLimpio('c2-derechos-en-el-commit', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const contenido = CONTENIDO_C2(ev);
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [ins] = await tx`insert into insight
+            (workspace_id, titulo, resumen, estado, creado_por)
+            values (${wsC}, ${contenido.titulo}, ${contenido.resumen}, 'propuesto', ${curadorId})
+            returning id`;
+          const [af] = await tx`insert into afirmacion
+            (workspace_id, insight_id, orden, texto, es_hipotesis)
+            values (${wsC}, ${ins!.id as string}, 0, ${contenido.afirmaciones[0]!.texto}, false)
+            returning id`;
+          // La cita ENTRA: su trigger lee el derecho en el snapshot de esta sentencia y sigue
+          // concedido. Es la mitad que hace que este caso mida la ventana y no otra cosa.
+          await tx`insert into cita
+            (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+            values (${wsC}, ${af!.id as string}, ${ev},
+                    ${contenido.afirmaciones[0]!.citas[0]!.fragmento},
+                    ${contenido.afirmaciones[0]!.citas[0]!.localizacion}, ${curadorId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${curadorId}, insight_id = ${ins!.id as string}
+            where id = ${p.id} and workspace_id = ${wsC}`;
+          // Y AHORA, desde OTRA conexión y ya commiteado, se retira el derecho — que es la
+          // ventana entera: después del trigger de la cita y antes de este commit.
+          await admin`update derecho_uso
+            set estado = 'denegado', ambito = 'interno', base = 'El participante retiró el permiso',
+                decidido_por = ${curadorId}, decidido_en = now()
+            where evidencia_id = ${ev} and workspace_id = ${wsC}`;
+        }),
+        'se selló una cita cuyo derecho de uso ya no existía al commitear',
+      ).rejects.toThrow(/DR001/);
+
+      // Y la propuesta sigue viva y pendiente: el rollback la deja donde estaba, así que quien
+      // revisa puede rechazarla o esperar a que el derecho vuelva.
+      const [tras] = await admin`select estado, insight_id from propuesta_ai
+        where id = ${p.id} and workspace_id = ${wsC}`;
+      expect(tras!.estado as string).toBe('propuesta');
+      expect(tras!.insight_id).toBeNull();
+    });
+  });
+
+  /**
+   * Y tras un despliegue que mueve el contrato, la presencia literal NO se afirma.
+   *
+   * La huella guardada solo se puede comparar contra una recomposición del mismo render, así
+   * que `materialDelPanelEsElDelModelo` devuelve `null` en cuanto `prompt_version` difiere. Ese
+   * `null` se resolvía como «vigente», apelando a que era lo que hacían todas las capacidades
+   * antes de que ninguna guardara huella — y el precedente no es un argumento: si el render del
+   * material cambió, los verdes y los rojos salen de un texto que el modelo no vio, que es
+   * exactamente lo que esta maquinaria existe para no hacer.
+   *
+   * Ahora solo se mide cuando la huella dice que sí. El estado de la fila sigue resolviendo ese
+   * mismo `null` en la dirección contraria, y a propósito: nombra una causa, y afirmarla sin
+   * saberlo sería una alarma inventada.
+   */
+  it('tras un cambio de versión del prompt, las citas de C2 no se dan por comprobadas', async () => {
+    await enWorkspaceLimpio('c2-render-de-otra-version', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      // Con su propia versión se mide y sale presente: sin esta mitad, el caso pasaría también
+      // con un fixture cuyo fragmento no aparece nunca.
+      const antes = await panelPropuestas(curadorId, wsC);
+      expect(antes.pendientes.find((x) => x.capacidad === 'C2')!.citas[0]!.presenteLiteral).toBe(
+        true,
+      );
+
+      // El despliegue: la propuesta sigue viva y su huella ya no es comparable.
+      await admin`update propuesta_ai set prompt_version = 'ai-de-otro-render'
+        where workspace_id = ${wsC} and capacidad = 'C2'`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      expect(
+        p.citas.map((c) => c.presenteLiteral),
+        'el panel afirma sobre un material que no puede comparar con el que vio el modelo',
+      ).toEqual([null]);
+      // Y sin inventarse una alarma: el ancla sigue disponible, porque nadie sabe si cambió.
+      expect(p.anclaEstado).toBe('disponible');
     });
   });
 

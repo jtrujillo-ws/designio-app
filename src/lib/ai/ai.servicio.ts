@@ -381,10 +381,24 @@ function motivoConectividadQueNoCabe(caracteres: number): string {
  * huella que la propuesta guardó al nacer.
  *
  * `null` cuando NO SE PUEDE SABER, y no se resuelve a ninguno de los dos lados aquí: quien lo
- * lee decide qué hacer con no saber, y las dos respuestas son distintas. Para el ESTADO de la
- * fila, no saber no puede volverse «cambiado»: sería inventarse una alarma. Para la presencia
- * literal, no saber se resuelve como vigente, que es lo que hacían todas las capacidades
- * cuando ninguna guardaba huella.
+ * lee decide qué hacer con no saber, y las dos respuestas son OPUESTAS, cada una por lo que
+ * está en juego.
+ *
+ * Para el ESTADO de la fila, no saber no puede volverse «cambiado»: ese estado NOMBRA UNA
+ * CAUSA —«el grafo de ese journey cambió»— y afirmarla sin saberlo es inventarse una alarma
+ * que además culpa a quien no fue.
+ *
+ * Para la PRESENCIA LITERAL es al revés, y entenderlo costó una ronda. Aquí no se nombra
+ * ninguna causa: se contesta «¿puedo medir esto?», y la respuesta honesta a no saber es que
+ * no. Estaba resuelto como vigente apelando a que era lo que hacían todas las capacidades
+ * antes de que ninguna guardara huella, y el precedente no es un argumento: el día de un
+ * despliegue que cambie el renderizador del material, resolverlo como vigente pinta verdes y
+ * rojos calculados contra un texto que el modelo no vio, que es justo lo que toda esta
+ * maquinaria existe para no hacer. La pantalla ya sabe decir «no se puede comprobar».
+ *
+ * Y no cuesta nada donde antes valía: el CHECK exige la huella a las capacidades que la leen,
+ * así que «sin huella» ya no es alcanzable para ellas y el único `null` que queda es el de la
+ * versión — que es exactamente el caso en que no se puede medir.
  *
  * Y son DOS los casos en que no se sabe. El primero es no tener huella: una propuesta anterior
  * a la columna. El segundo es tenerla de OTRO RENDER: desde que la huella se calcula sobre el
@@ -618,7 +632,20 @@ function journeyDesdeElPanel(f: Record<string, unknown>): JourneyCompleto {
  * no desbloquea nada, el material equivocado marca como ausentes citas que están, y la lista
  * de candidatas esconde el ancla de una generación perfectamente válida.
  */
-type CapacidadEnElPanel = {
+/**
+ * Y las dos van JUNTAS, impuesto por el tipo: quien recorta el pajar por documento tiene que
+ * poder decir si ese recorte sigue siendo el del modelo.
+ *
+ * `pajarDeLaCita` estrecha el pajar a UN documento, y ese documento sale de las filas de HOY.
+ * Sin huella no hay forma de saber que las de hoy son las que el modelo leyó, así que el
+ * recorte se calcularía sobre un conjunto que puede haberse movido —y el verde de una cita es
+ * lo único contrastable que tiene quien revisa—. Declararlo en el tipo y no en una prueba es
+ * lo que hace que la capacidad que venga no pueda declarar solo la mitad.
+ */
+type CapacidadEnElPanel = BaseDelPanel &
+  ({ pajarDeLaCita?: undefined } | Required<Pick<BaseDelPanel, 'pajarDeLaCita' | 'materialVigente'>>);
+
+type BaseDelPanel = {
   /**
    * Qué deja la propuesta obsoleta, DADO que su capacidad es esta. Sin `case … end`: el CASE
    * exterior lo cierra con `else null`, que es lo que dice «este panel no sabe juzgar esto».
@@ -937,11 +964,10 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
        */
       return materialDelPanelEsElDelModelo(f) === false ? 'journey-cambiado' : null;
     },
-    // La misma comparación, leída para lo otro que depende de ella: sin huella no se sabe, y
-    // no saber se resuelve como vigente —es lo que hacían todas las capacidades antes de que
-    // ninguna guardara nada—, mientras que no saber NO se resuelve como «cambiado», que sería
-    // inventarse una alarma.
-    materialVigente: (f) => materialDelPanelEsElDelModelo(f) !== false,
+    // La misma comparación, leída para lo otro que depende de ella, y resuelta AL REVÉS. Ver
+    // `materialDelPanelEsElDelModelo`: para el estado de la fila, no saber no puede volverse
+    // una alarma; para la presencia literal, no saber no puede volverse un veredicto.
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
     material: (f) => materialDeJourney({
       nombre: (f.journey_nombre as string | null) ?? '',
       servicio: (f.journey_servicio as string | null) ?? '',
@@ -1103,10 +1129,11 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
      * de hoy acaba de dejar visible sale PRESENTE aunque el modelo no lo tuviera delante, y
      * una cita legítima cuyo trozo el recorte de hoy esconde sale AUSENTE.
      *
-     * No saber se resuelve como vigente, igual que en C5 y por lo mismo: es la respuesta que
-     * daban todas las capacidades antes de que ninguna guardara huella.
+     * Y no saber NO se resuelve como vigente: solo se mide cuando la huella dice que sí. Ver
+     * `materialDelPanelEsElDelModelo` para por qué las dos lecturas de ese mismo `null` van en
+     * direcciones opuestas.
      */
-    materialVigente: (f) => materialDelPanelEsElDelModelo(f) !== false,
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
     /*
      * Una cita de C2 se mide contra LA EVIDENCIA QUE NOMBRA, no contra todas juntas.
      *

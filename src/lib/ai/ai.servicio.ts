@@ -13,7 +13,7 @@ import {
 } from './ai.degradacion';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
 import type { JourneyCompleto } from '@/lib/journey/journey.schemas';
-import { leerJourneyCompleto } from '@/lib/journey/journey.servicio';
+import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
 import {
   presenciaLiteralPorCita,
   materialDeGate,
@@ -322,6 +322,22 @@ async function bloquearPresupuesto(tx: TransactionSql, workspaceId: string): Pro
  * Las señales las pone `validarJourney`, que es DETERMINISTA (RF-05.6). No se le pide al
  * modelo que las encuentre: se le dan hechas y se le pide qué hacer con ellas.
  */
+/**
+ * Si el grafo que el panel puede leer HOY es el que el modelo tuvo delante, según la huella
+ * que la propuesta guardó al nacer.
+ *
+ * `null` cuando no se puede saber —una propuesta anterior a la columna—, y no se resuelve a
+ * ninguno de los dos lados aquí: quien lo lee decide qué hacer con no saber, y las dos
+ * respuestas son distintas. Para el ESTADO de la fila, no saber no puede volverse «cambiado»:
+ * sería inventarse una alarma. Para la presencia literal, no saber se resuelve como vigente,
+ * que es exactamente lo que hacían todas las capacidades cuando ninguna guardaba huella.
+ */
+function grafoDelPanelEsElDelModelo(f: Record<string, unknown>): boolean | null {
+  const guardada = f.huella_material as string | null;
+  if (!guardada) return null;
+  return huellaDelGrafo(grafoParaElModelo(journeyDesdeElPanel(f))) === guardada;
+}
+
 function grafoParaElModelo(journey: JourneyCompleto): GrafoDelJourney {
   const fase = new Map(
     journey.nodos.filter((n) => n.tipo === 'fase').map((n) => [n.id, n.etiqueta]),
@@ -538,6 +554,20 @@ type CapacidadEnElPanel = {
    * texto crudo de la base. Una sola definición, dos usos.
    */
   material: (f: Record<string, unknown>) => string;
+  /**
+   * Si el material que `material` recompone es TODAVÍA el que vio el modelo.
+   *
+   * El panel lo rearma a partir del estado de HOY, y contra ese texto se mide la presencia
+   * literal de las citas. Mientras nada cambie es el mismo texto; después de una edición
+   * ajena no lo es, y entonces el veredicto no es ni «aparece» ni «no aparece» — un fragmento
+   * que la edición acaba de añadir saldría en verde y una cita legítima que la edición borró
+   * saldría en rojo.
+   *
+   * Solo lo puede contestar quien GUARDÓ algo con qué comparar, y por eso es opcional: sin
+   * entrada se asume vigente, que es lo que hoy hacen todas —es la respuesta que ya daban en
+   * silencio— y lo que la capacidad que guarde una huella puede mejorar. C5 la guarda.
+   */
+  materialVigente?: (f: Record<string, unknown>) => boolean;
   /**
    * Las anclas que se le pueden ofrecer a esta capacidad, con su propia elegibilidad, y SI
    * DEJÓ ALGO FUERA.
@@ -773,12 +803,13 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
        * veredicto del CASE. Decir «cambiado» sin poder saberlo sería inventarse una alarma,
        * y decir «al día» sería inventarse una tranquilidad.
        */
-      const guardada = f.huella_material as string | null;
-      if (!guardada) return null;
-      return huellaDelGrafo(grafoParaElModelo(journeyDesdeElPanel(f))) === guardada
-        ? null
-        : 'journey-cambiado';
+      return grafoDelPanelEsElDelModelo(f) === false ? 'journey-cambiado' : null;
     },
+    // La misma comparación, leída para lo otro que depende de ella: sin huella no se sabe, y
+    // no saber se resuelve como vigente —es lo que hacían todas las capacidades antes de que
+    // ninguna guardara nada—, mientras que no saber NO se resuelve como «cambiado», que sería
+    // inventarse una alarma.
+    materialVigente: (f) => grafoDelPanelEsElDelModelo(f) !== false,
     material: (f) => materialDeJourney({
       nombre: (f.journey_nombre as string | null) ?? '',
       servicio: (f.journey_servicio as string | null) ?? '',
@@ -824,9 +855,26 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           limit ${LOTE_DE_BARRIDO_C5} offset ${vistos}`;
         agotado = lote.length < LOTE_DE_BARRIDO_C5;
         vistos += lote.length;
+        /*
+         * Los grafos del lote se leen DE UNA VEZ, no uno por journey mirado.
+         *
+         * `validarJourney` es una función pura del grafo, así que el barrido tiene que leerlos
+         * todos; lo que no tiene que hacer es una ida y vuelta por cada uno. Con el tope de
+         * barrido puesto en trescientos, un workspace con muchos journeys limpios convertía
+         * cada carga de la pantalla de propuestas en trescientas consultas —cada una con sus
+         * agregados anidados de nodos y aristas— antes de pintar nada.
+         *
+         * El orden del lote manda, no el que devuelva la base: el `order by` de la lista es lo
+         * que hace que dos cargas ofrezcan lo mismo, y un `any(...)` no promete ninguno.
+         */
+        const grafos = new Map(
+          (await leerJourneysCompletos(tx, workspaceId, lote.map((j) => j.id as string))).map(
+            (g) => [g.id, g],
+          ),
+        );
         for (const j of lote) {
           if (conSenales.length >= limite) break;
-          const journey = await leerJourneyCompleto(tx, workspaceId, j.id as string);
+          const journey = grafos.get(j.id as string);
           if (!journey) continue;
           const senales = validarJourney(journey);
           // Y las que NO caben tampoco se ofrecen: pedir un informe que el contrato no puede
@@ -935,7 +983,19 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   // humano que corrige. Hoy son siempre las mismas —corregirlas está prohibido en el
   // servicio y en el guard— y leerlas de aquí lo deja dicho en la proyección también.
   const citas = 'citas' in original ? original.citas : [];
-  const presencias = presenciaLiteralPorCita(material, citas);
+  /*
+   * Y si el material que se acaba de recomponer YA NO es el que vio el modelo, no hay
+   * veredicto que dar. Medir contra el estado de hoy pinta en verde un fragmento que una
+   * edición ajena acaba de añadir y en rojo una cita legítima que esa edición borró: las dos
+   * mentiras caben en un booleano, y la única respuesta honesta es que no se puede comprobar.
+   *
+   * Lo contesta la CAPACIDAD, porque solo ella sabe si guardó algo con qué comparar. Las que
+   * no lo declaran siguen midiendo como siempre.
+   */
+  const vigente = definicionDeFila(f)?.materialVigente?.(f) ?? true;
+  const presencias = vigente
+    ? presenciaLiteralPorCita(material, citas)
+    : citas.map(() => null);
   return {
     id: f.id as string,
     capacidad: f.capacidad as PropuestaEnPanel['capacidad'],

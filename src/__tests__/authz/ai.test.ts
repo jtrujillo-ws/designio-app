@@ -40,7 +40,7 @@ import {
 } from '@/lib/ai/ai.schemas';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
-import { leerJourneyCompleto } from '@/lib/journey/journey.servicio';
+import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -5789,6 +5789,92 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * rótulo que decía lo contrario. El coste de filtrarlo es leer los grafos del prefiltro, y
    * está acotado; el de no filtrarlo lo paga quien pulsa.
    */
+  /**
+   * Y cuando el grafo cambia, la presencia literal de las citas deja de tener veredicto.
+   *
+   * El panel recompone el pajar a partir del grafo de HOY, y contra ese texto mide si cada
+   * cita aparece literal. Después de una edición ajena ese texto ya no es el que vio el
+   * modelo: un fragmento que la edición acaba de añadir sale en VERDE —el reviewer lee que la
+   * cita está respaldada por un texto que el modelo nunca tuvo delante— y una cita legítima
+   * cuyo nodo la edición borró sale en ROJO. Las dos mentiras caben en un booleano.
+   *
+   * `null` es la tercera respuesta, y es la única honesta. La huella que C5 guarda al nacer es
+   * lo que permite darla: sin ella, la capacidad no puede saber si su material sigue siendo el
+   * suyo — y las que no lo declaran siguen midiendo como siempre.
+   */
+  it('la presencia literal de una cita de C5 no se afirma si el grafo cambió', async () => {
+    await enWorkspaceLimpio('c5-presencia-sin-veredicto', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const j = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const senales = await senalesDe(curadorId, wsC, j.journeyId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: informeCompleto(senales) as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C5', anclaId: j.journeyId }),
+      );
+
+      // Recién nacido, el pajar ES el del modelo y la cita tiene veredicto: sin esto, el caso
+      // podría estar midiendo una propuesta que nunca lo tuvo.
+      const antes = await panelPropuestas(curadorId, wsC);
+      const recien = antes.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(recien.citas.length).toBeGreaterThan(0);
+      expect(recien.citas.every((c) => c.presenteLiteral !== null)).toBe(true);
+
+      // Alguien edita el grafo. La cita no cambió —no se pueden corregir— pero su pajar sí.
+      await sqlAdmin()`update journey_nodo set etiqueta = 'Comprobar quién eres'
+        where id = ${j.nodos.dos} and workspace_id = ${wsC}`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C5')!;
+      expect(
+        p.citas.map((c) => c.presenteLiteral),
+        'el panel afirma sobre un material que el modelo no vio',
+      ).toEqual(p.citas.map(() => null));
+      // Y la fila sigue diciendo POR QUÉ, que es la otra mitad de lo mismo.
+      expect(p.anclaEstado).toBe('journey-cambiado');
+    });
+  });
+
+  /**
+   * Leer los grafos EN LOTE tiene que dar exactamente la misma proyección.
+   *
+   * El barrido de candidatos leía un grafo por journey mirado, y con el tope en trescientos
+   * eso son hasta trescientas idas y vueltas —cada una con sus agregados anidados— antes de
+   * que la pantalla de propuestas pinte nada. Pasa a leer el lote de una vez.
+   *
+   * Y por eso hay UNA sola definición de la proyección, con la forma en singular delegando en
+   * la de plural: de aquí sale la HUELLA del material de C5, así que dos consultas que se
+   * desincronizaran en una coma de `order by` declararían obsoleto un informe que está al día
+   * y rechazarían una respuesta ya pagada. Esta prueba es lo que sujeta esa igualdad.
+   */
+  it('leer los grafos en lote da la misma proyección que leerlos de uno en uno', async () => {
+    await enWorkspaceLimpio('c5-lectura-en-lote', async (ctx) => {
+      const { ws: wsC, curadorId } = ctx;
+      const a = await nuevoJourney({ ...ctx, actorId: curadorId });
+      const b = await nuevoJourney({ ...ctx, actorId: curadorId }, { limpio: true });
+
+      const sueltos = await conUsuario(curadorId, async (tx) => ({
+        a: await leerJourneyCompleto(tx, wsC, a.journeyId),
+        b: await leerJourneyCompleto(tx, wsC, b.journeyId),
+      }));
+      const lote = await conUsuario(curadorId, (tx) =>
+        leerJourneysCompletos(tx, wsC, [a.journeyId, b.journeyId]),
+      );
+
+      expect(lote.length).toBe(2);
+      const porId = new Map(lote.map((g) => [g.id, g]));
+      // Igualdad ESTRUCTURAL, no por id: un orden distinto en los nodos o en las aristas es
+      // una huella distinta, y `toEqual` sobre el objeto entero es lo que lo dice.
+      expect(porId.get(a.journeyId)).toEqual(sueltos.a);
+      expect(porId.get(b.journeyId)).toEqual(sueltos.b);
+      // Y la huella que de verdad se compara sale igual: es el uso, no la forma.
+      expect(sueltos.a!.nodos.length).toBeGreaterThan(0);
+    });
+  });
+
   it('la cola de C5 solo ofrece journeys con señales abiertas, como dice su rótulo', async () => {
     await enWorkspaceLimpio('c5-cola-honesta', async (ctx) => {
       const { ws: wsC, curadorId } = ctx;

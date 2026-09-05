@@ -474,13 +474,23 @@ export async function journeyCompleto(
  *
  * Una definición, dos usos: la RLS la sigue poniendo la conexión de quien llama.
  */
-export async function leerJourneyCompleto(
+/**
+ * El MISMO lector para uno y para muchos.
+ *
+ * Existe en plural porque el barrido de candidatos de C5 lee un grafo por journey mirado, y
+ * eso es hasta trescientas idas y vueltas antes de que la pantalla de propuestas pinte nada.
+ * Y existe UNA sola vez, en vez de una consulta por cada forma, porque de esta proyección sale
+ * la HUELLA del material de C5: dos copias que se desincronicen en una coma de `order by`
+ * declararían obsoleto un informe que está al día.
+ */
+export async function leerJourneysCompletos(
   tx: TransactionSql,
   workspaceId: string,
-  journeyId: string,
-): Promise<JourneyCompleto | null> {
+  journeyIds: string[],
+): Promise<JourneyCompleto[]> {
+  if (journeyIds.length === 0) return [];
   {
-    const [fila] = await tx`
+    const filas = await tx`
       select j.id, j.servicio_id, s.nombre as servicio_nombre, j.reto_id, j.proyecto_id,
         j.tipo, j.nombre, j.descripcion,
         coalesce((
@@ -541,9 +551,8 @@ export async function leerJourneyCompleto(
         ), '[]'::jsonb) as arquetipos
       from journey j
       join servicio s on s.id = j.servicio_id and s.workspace_id = j.workspace_id
-      where j.id = ${journeyId} and j.workspace_id = ${workspaceId}`;
-    if (!fila) return null;
-    return {
+      where j.id = any(${journeyIds}::uuid[]) and j.workspace_id = ${workspaceId}`;
+    return filas.map((fila) => ({
       id: fila.id as string,
       servicioId: fila.servicio_id as string,
       servicioNombre: fila.servicio_nombre as string,
@@ -556,8 +565,18 @@ export async function leerJourneyCompleto(
       aristas: fila.aristas as JourneyCompleto['aristas'],
       snapshots: fila.snapshots as JourneyCompleto['snapshots'],
       arquetipos: fila.arquetipos as JourneyCompleto['arquetipos'],
-    };
+    }));
   }
+}
+
+/** Un journey, por el lector de arriba: una definición de la proyección, dos formas de
+ * pedirla. */
+export async function leerJourneyCompleto(
+  tx: TransactionSql,
+  workspaceId: string,
+  journeyId: string,
+): Promise<JourneyCompleto | null> {
+  return (await leerJourneysCompletos(tx, workspaceId, [journeyId]))[0] ?? null;
 }
 
 /** Página de la lista de journeys. El corte duro dejaba fuera para siempre a los más

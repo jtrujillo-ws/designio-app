@@ -1094,16 +1094,32 @@ function TarjetaPropuesta({
 }) {
   const [corrigiendo, setCorrigiendo] = useState(false);
   const [ocupado, setOcupado] = useState(false);
-  const presentacion =
-    PRESENTACION_POR_CAPACIDAD[propuesta.capacidad as CapacidadActiva] ??
-    PRESENTACION_DESCONOCIDA(propuesta.capacidad);
-  const materializacion = propuesta.destino === null ? null : MATERIALIZACION[propuesta.destino];
+  const conocida = PRESENTACION_POR_CAPACIDAD[propuesta.capacidad as CapacidadActiva];
+  const presentacion = conocida ?? PRESENTACION_DESCONOCIDA(propuesta.capacidad);
+  /*
+   * Y sin presentación NO hay materialización, aunque el destino sí se conozca.
+   *
+   * Las dos cosas envejecen por separado: una capacidad nueva puede materializar un destino
+   * que este cliente ya conocía —evidencia, criterio— mientras su contenido tiene una forma
+   * que no sabe pintar. Consultando solo el destino, la tarjeta decía «no sé presentar esto,
+   * puedes descartarla» y ofrecía al lado «Aceptar» y «Corregir»: aceptar a ciegas lo que
+   * acaba de declararse ilegible, y un formulario que castea el contenido a la forma de SU
+   * destino, que no tiene por qué ser la de esta capacidad.
+   *
+   * Se derivan del MISMO hallazgo para que no puedan discrepar. Rechazar sigue disponible,
+   * que es la salida que el propio texto de la ficha ofrece.
+   */
+  const materializacion =
+    conocida !== undefined && propuesta.destino !== null ? MATERIALIZACION[propuesta.destino] : null;
   const anclaDisponible = propuesta.anclaEstado === 'disponible';
   // La otra precondición que la base impone SIEMPRE y que no es del ancla, sino del contenido.
   // Va aparte de `anclaDisponible` porque no caduca con el tiempo —nació así— y su salida es
   // distinta: no es rechazar, es corregir. Y la declara el DESTINO, no un ternario.
   const bloqueoPropio = materializacion?.bloqueoPropio(propuesta.contenido) ?? null;
-  const citasPresentes = propuesta.citas.filter((c) => c.presenteLiteral).length;
+  const citasPresentes = propuesta.citas.filter((c) => c.presenteLiteral === true).length;
+  // `null` es NO COMPROBABLE, y no cabe en el recuento de arriba: el material que el panel
+  // recompone ya no es el que vio el modelo, así que ni «aparece» ni «no aparece» son verdad.
+  const citasSinComprobar = propuesta.citas.filter((c) => c.presenteLiteral === null).length;
 
   async function decidir(correccion?: ContenidoPropuesta) {
     setOcupado(true);
@@ -1171,8 +1187,9 @@ function TarjetaPropuesta({
               la propuesta es la persona que la acepta (SYS-19), y eso se cuenta abajo, en
               las decididas. */}
           <span style={etiqueta}>
-            Citas · {citasPresentes}/{propuesta.citas.length} presentes literalmente en el
-            material
+            {citasSinComprobar === propuesta.citas.length && propuesta.citas.length > 0
+              ? `Citas · ${propuesta.citas.length}, sin comprobar: el material cambió desde que se generó`
+              : `Citas · ${citasPresentes}/${propuesta.citas.length} presentes literalmente en el material`}
           </span>
           {/* El índice vale como identidad AQUÍ, y conviene decir por qué en vez de dejar
               que cada lector lo deduzca: las citas de una propuesta no cambian nunca. Se
@@ -1185,12 +1202,18 @@ function TarjetaPropuesta({
               key={i}
               style={{
                 font: '400 12px/1.5 var(--font-mono)',
-                color: c.presenteLiteral ? 'var(--text-body)' : 'var(--danger)',
+                color:
+                  c.presenteLiteral === null
+                    ? 'var(--text-muted)'
+                    : c.presenteLiteral
+                      ? 'var(--text-body)'
+                      : 'var(--danger)',
                 overflowWrap: 'anywhere',
               }}
             >
-              {c.presenteLiteral ? '· ' : '⚠ '}«{c.fragmento}» — {c.localizacion}
-              {!c.presenteLiteral && ' (no aparece literal en el material)'}
+              {c.presenteLiteral === false ? '⚠ ' : '· '}«{c.fragmento}» — {c.localizacion}
+              {c.presenteLiteral === false && ' (no aparece literal en el material)'}
+              {c.presenteLiteral === null && ' (no se puede comprobar: el material cambió)'}
             </div>
           ))}
         </div>

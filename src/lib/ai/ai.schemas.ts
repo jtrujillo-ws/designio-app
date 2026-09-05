@@ -494,9 +494,16 @@ export type CitaConPresencia = {
    * un sostén que aquí nadie ata; quien lo ata es la persona que acepta (SYS-19).
    *
    * `false` es la señal de alarma y la UI la pinta; `true` no es un visto bueno, es la
-   * ausencia de una alarma concreta.
+   * ausencia de esa alarma.
+   *
+   * Y `null` es NO COMPROBABLE, que no es ninguna de las dos. El panel recompone el material
+   * a partir del estado de HOY, y para las capacidades que saben si su material sigue siendo
+   * el que vio el modelo —C5 lo sabe: guarda su huella— la respuesta después de una edición
+   * ajena no es ni sí ni no. Con un booleano, un fragmento que la edición acaba de añadir
+   * salía en verde y una cita legítima que la edición borró salía en rojo: las dos mentiras
+   * caben en un booleano y ninguna en un `null`.
    */
-  presenteLiteral: boolean;
+  presenteLiteral: boolean | null;
 };
 
 export type PropuestaEnPanel = {

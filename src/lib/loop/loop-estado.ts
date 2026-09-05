@@ -9,8 +9,10 @@ import type { GatesDeProyecto } from './loop.schemas';
  * en una función pura que un test puede recorrer entera.
  *
  * Cada journey cubre gates concretos:
- *   J1 arranque en frío       → no tiene gate: está hecho cuando hay evidencia curada
- *                                (o cuando algún gate ya se aprobó: sin arranque no hay G0).
+ *   J1 arranque en frío       → no tiene gate: está hecho cuando existe el servicio Y hay
+ *                                evidencia curada (o algún gate ya aprobado: sin arranque no
+ *                                hay G0). La evidencia se cura sin servicio; el arranque no
+ *                                termina hasta que el servicio existe.
  *   J2 formulación del reto   → G0
  *   J3 investigación          → G1 G2
  *   J4 conceptualización      → G3 G4
@@ -43,8 +45,13 @@ export const GATES_POR_JOURNEY: Record<JourneyN, readonly number[]> = {
 
 export const JOURNEYS: readonly JourneyN[] = [1, 2, 3, 4, 5, 6, 7];
 
-export type EntradaDelLoop = {
+/** Lo que el arranque en frío (J1) deja hecho: el servicio y su material curado. */
+export type Arranque = {
   hayEvidencia: boolean;
+  hayServicio: boolean;
+};
+
+export type EntradaDelLoop = Arranque & {
   gatesAprobados: readonly number[];
   reviewCompletado: boolean;
 };
@@ -52,10 +59,11 @@ export type EntradaDelLoop = {
 export function estadoDelLoop(entrada: EntradaDelLoop): EstadoDelLoop {
   const aprobados = new Set(entrada.gatesAprobados);
   const hecho = (j: JourneyN): boolean => {
-    // El arranque en frío está hecho cuando hay evidencia curada… o cuando algún gate ya se
-    // aprobó: nadie pasa G0 sin haber arrancado, y un workspace cuyo checklist se decidió
-    // entero por N/A no puede quedarse en «J1 en curso» con G5 abierto al lado.
-    if (j === 1) return entrada.hayEvidencia || aprobados.size > 0;
+    // El arranque en frío está hecho cuando existe el servicio y hay evidencia curada… o
+    // algún gate ya aprobado: nadie pasa G0 sin haber arrancado, y un workspace cuyo checklist
+    // se decidió entero por N/A no puede quedarse en «J1 en curso» con G5 abierto al lado.
+    // Sin servicio no hay arranque que dar por hecho: la evidencia se cura sin él.
+    if (j === 1) return entrada.hayServicio && (entrada.hayEvidencia || aprobados.size > 0);
     if (j === 7) return entrada.reviewCompletado;
     return GATES_POR_JOURNEY[j].every((g) => aprobados.has(g));
   };
@@ -86,10 +94,10 @@ export function estadoDelLoop(entrada: EntradaDelLoop): EstadoDelLoop {
 /** El loop de un proyecto concreto, o el de un servicio SIN proyecto (solo J1 puede estar hecho). */
 export function loopDeProyecto(
   proyecto: Pick<GatesDeProyecto, 'aprobados' | 'reviewCompletado'> | null,
-  hayEvidencia: boolean,
+  arranque: Arranque,
 ): EstadoDelLoop {
   return estadoDelLoop({
-    hayEvidencia,
+    ...arranque,
     gatesAprobados: proyecto?.aprobados ?? [],
     reviewCompletado: proyecto?.reviewCompletado ?? false,
   });
@@ -110,7 +118,8 @@ export function marcaDeReto(
 ): MarcaDeReto {
   const proyecto = reto.proyectos[0] ? proyectos.get(reto.proyectos[0].id) : undefined;
   if (proyecto) {
-    const loop = loopDeProyecto(proyecto, hayEvidencia);
+    // Un reto siempre cuelga de un servicio: el arranque, por ese lado, está.
+    const loop = loopDeProyecto(proyecto, { hayEvidencia, hayServicio: true });
     return loop.enCurso
       ? { j: loop.enCurso, punteado: false, sufijo: `J${loop.enCurso}` }
       : { j: 7, punteado: false, sufijo: 'cerrado' };

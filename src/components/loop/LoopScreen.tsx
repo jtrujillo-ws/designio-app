@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/Button';
 import { Tabs } from '@/components/ui/Tabs';
 import { Wordmark } from '@/components/ui/Wordmark';
 import type { JourneyN } from '@/components/ui/JourneyBadge';
-import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
+import { ETIQUETA_ROL, ROLES_QUE_INVITAN } from '@/lib/auth/auth.schemas';
 import { cerrarSesion } from '@/lib/auth/auth.functions';
 import type {
   ArbolWorkspace,
@@ -120,7 +120,8 @@ export function LoopScreen({
     (resumen?.proyectos ?? []).map((p) => [p.proyectoId, p]),
   );
   const hayEvidencia = resumen?.hayEvidencia ?? false;
-  const loop = loopDeProyecto(proyecto ? (proyectos.get(proyecto.id) ?? null) : null, hayEvidencia);
+  const arranque = { hayEvidencia, hayServicio: servicio !== null };
+  const loop = loopDeProyecto(proyecto ? (proyectos.get(proyecto.id) ?? null) : null, arranque);
   const vistas = vistasDelServicio(proyecto);
 
   // Un tramo de la barra del arco ancla a la tarjeta de su journey y la resalta 1,2 s.
@@ -143,7 +144,7 @@ export function LoopScreen({
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
-      <Topbar workspaceId={membresia?.workspaceId ?? null} />
+      <Topbar workspaceId={membresia?.workspaceId ?? null} rol={membresia?.rol ?? ''} />
       <div className="loop-cuerpo" style={{ display: 'flex', minHeight: 820 }}>
         <Lateral
           usuario={usuario}
@@ -190,7 +191,13 @@ export function LoopScreen({
               resumen={resumen}
               hayServicio={servicio !== null}
             />
-            <TeTocaATi loop={loop} servicio={servicio} resumen={resumen} proyecto={proyecto} />
+            <TeTocaATi
+              loop={loop}
+              servicio={servicio}
+              resumen={resumen}
+              proyecto={proyecto}
+              rol={membresia?.rol ?? ''}
+            />
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             <span style={etiquetaSeccion}>Los siete recorridos</span>
@@ -231,8 +238,11 @@ function idDeTarjeta(j: JourneyN): string {
  * Queda el buscador y la acción principal del workspace, invitar al cliente, que abre la
  * pantalla de personas donde de verdad se invita.
  */
-function Topbar({ workspaceId }: { workspaceId: string | null }) {
+function Topbar({ workspaceId, rol }: { workspaceId: string | null; rol: string }) {
   const navigate = useNavigate();
+  // Invitar es del lead y del admin del cliente (RF-01.2): a los demás no se les ofrece un
+  // botón principal cuyo formulario la base rechazaría al enviar.
+  const puedeInvitar = (ROLES_QUE_INVITAN as readonly string[]).includes(rol);
   return (
     <div
       style={{
@@ -246,18 +256,20 @@ function Topbar({ workspaceId }: { workspaceId: string | null }) {
       }}
     >
       <Buscador workspaceId={workspaceId} />
-      <Button
-        onClick={() => navigate({ to: '/personas' })}
-        style={{
-          background: 'var(--brand-ink)',
-          color: '#fff',
-          fontSize: 12.5,
-          padding: '9px 16px',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        Invitar al cliente
-      </Button>
+      {puedeInvitar && (
+        <Button
+          onClick={() => navigate({ to: '/personas' })}
+          style={{
+            background: 'var(--brand-ink)',
+            color: '#fff',
+            fontSize: 12.5,
+            padding: '9px 16px',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          Invitar al cliente
+        </Button>
+      )}
     </div>
   );
 }
@@ -418,7 +430,7 @@ function Lateral({
         </Link>
         <span
           className="loop-ancho"
-          title="Enfoca el buscador"
+          title="⌘K (Ctrl+K) enfoca el buscador"
           style={{ font: '400 13px var(--font-sans)', color: claro(0.5) }}
         >
           ⌘K
@@ -427,6 +439,7 @@ function Lateral({
 
       {/* 2. Organización cliente — el único conmutador de cliente de la pantalla. */}
       <div
+        className="loop-conmutador"
         style={{
           position: 'relative',
           display: 'flex',
@@ -763,7 +776,7 @@ function ServicioDelArbol({
 }) {
   const proyectoActual = servicio.retos.flatMap((r) => r.proyectos)[0];
   const loop = proyectoActual
-    ? loopDeProyecto(proyectos.get(proyectoActual.id) ?? null, hayEvidencia)
+    ? loopDeProyecto(proyectos.get(proyectoActual.id) ?? null, { hayEvidencia, hayServicio: true })
     : null;
   const nRetos = servicio.retos.length;
   return (
@@ -1395,13 +1408,17 @@ function TeTocaATi({
   servicio,
   resumen,
   proyecto,
+  rol,
 }: {
   loop: EstadoDelLoop;
   servicio: ServicioArbol | null;
   resumen: ResumenDelLoop | null;
   proyecto: ProyectoArbol | null;
+  rol: string;
 }) {
   const filas: Pendiente[] = [];
+  // La bandeja la curan la boutique (RF-03.4): para los demás roles no es una tarea.
+  const esCurador = (ROLES_CURADORES as readonly string[]).includes(rol);
   if (resumen === null) {
     filas.push({
       color: 'var(--danger)',
@@ -1417,12 +1434,16 @@ function TeTocaATi({
       filas.push({
         color: a.esMia ? 'var(--warn)' : 'var(--text-faint)',
         texto: a.esMia
-          ? `Aprobación G${a.numero} de ${a.proyectoCodigo}: te toca aprobarla`
-          : `Aprobación G${a.numero} de ${a.proyectoCodigo} esperando al ${rol}`,
+          ? `G${a.numero} de ${a.proyectoCodigo} tiene el checklist decidido: te toca revisarlo`
+          : `G${a.numero} de ${a.proyectoCodigo} tiene el checklist decidido y espera al ${rol}`,
         destino: { to: '/proyecto/$proyectoId', params: { proyectoId: a.proyectoId } },
+        // El checklist es la parte del gate que dejó de ser trabajo; lo demás que la
+        // suficiencia exige (criterios de G0, registry de G6, decisiones en revisión…) lo
+        // dice la pantalla del proyecto con la misma regla que la base aplica al aprobar.
+        titulo: 'El proyecto dice qué más falta, si falta, antes de poder aprobar',
       });
     }
-    if (resumen.importacionPendientes > 0) {
+    if (esCurador && resumen.importacionPendientes > 0) {
       const n = resumen.importacionPendientes;
       filas.push({
         color: 'var(--accent)',
@@ -1431,11 +1452,12 @@ function TeTocaATi({
       });
     }
     const m = resumen.metricas;
-    if (m && m.registryFirmado && m.listas < m.total && proyecto) {
-      const faltan = m.total - m.listas;
+    // Solo las entradas que quien mira puede cargar (curador o propietario del dato).
+    if (m && m.registryFirmado && m.sinSnapshotMias > 0 && proyecto) {
+      const faltan = m.sinSnapshotMias;
       filas.push({
         color: 'var(--j7)',
-        texto: `${faltan} de ${m.total} ${faltan === 1 ? 'métrica sigue' : 'métricas siguen'} sin snapshot`,
+        texto: `${faltan} ${faltan === 1 ? 'métrica tuya sigue' : 'métricas tuyas siguen'} sin snapshot`,
         destino: { to: '/proyecto/$proyectoId', params: { proyectoId: proyecto.id } },
       });
     } else if (loop.journeys[7] === 'próximo' && proyecto) {
@@ -1472,8 +1494,8 @@ function TeTocaATi({
             Nada espera por ti ahora mismo.
           </span>
         )}
-        {filas.map((f, i) => (
-          <FilaPendiente key={i} fila={f} />
+        {filas.map((f) => (
+          <FilaPendiente key={f.texto} fila={f} />
         ))}
       </div>
       <span

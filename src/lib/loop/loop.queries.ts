@@ -1,6 +1,7 @@
 import '@/lib/server-only';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import type {
   AprobacionPendiente,
   GatesDeProyecto,
@@ -147,6 +148,17 @@ export async function resumenParaUsuario(
               where e.registry_id = mr.id and e.workspace_id = mr.workspace_id
                 and exists (select 1 from snapshot s
                   where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id)) as listas,
+            -- Las que faltan Y puede cargar quien mira: la política del snapshot exige ser
+            -- curador o el propietario del dato de ESA entrada (medicion.servicio), así que
+            -- una entrada de otro propietario no es tarea suya.
+            (select count(*)::int from entrada_kpi e
+              left join miembro m
+                on m.id = e.propietario_miembro_id and m.workspace_id = e.workspace_id
+              where e.registry_id = mr.id and e.workspace_id = mr.workspace_id
+                and not exists (select 1 from snapshot s
+                  where s.entrada_kpi_id = e.id and s.workspace_id = e.workspace_id)
+                and (workspace_role(${actorId}, ${workspaceId}) = any(${[...ROLES_CURADORES]})
+                  or m.usuario_id = ${actorId})) as sin_snapshot_mias,
             (select jsonb_build_object(
                 'nombre', e.nombre,
                 'lineaBase', e.linea_base_valor::text,
@@ -166,6 +178,7 @@ export async function resumenParaUsuario(
             registryFirmado: met.estado === 'firmado',
             listas: met.listas as number,
             total: met.total as number,
+            sinSnapshotMias: met.sin_snapshot_mias as number,
             primaria: (met.primaria as MetricasDelReto['primaria']) ?? null,
           }
         : null;

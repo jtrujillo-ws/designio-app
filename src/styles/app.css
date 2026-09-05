@@ -44,6 +44,12 @@ a:hover {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
+/* El <select> del conmutador de cliente cubre la tarjeta con opacidad 0: el foco se pinta
+   en la tarjeta, que es lo que se ve. */
+.loop-conmutador:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .loop-tramo {
   transition: opacity 150ms ease-out;
 }

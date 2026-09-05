@@ -10,6 +10,7 @@ describe('el estado del loop se deriva de los gates', () => {
   it('sin evidencia ni gates, el arranque en frío es lo que está en curso', () => {
     const loop = estadoDelLoop({
       hayEvidencia: false,
+      hayServicio: true,
       gatesAprobados: [],
       reviewCompletado: false,
     });
@@ -21,7 +22,12 @@ describe('el estado del loop se deriva de los gates', () => {
   });
 
   it('con evidencia curada y ningún gate, se está formulando el reto (J2, G0 abierto)', () => {
-    const loop = estadoDelLoop({ hayEvidencia: true, gatesAprobados: [], reviewCompletado: false });
+    const loop = estadoDelLoop({
+      hayEvidencia: true,
+      hayServicio: true,
+      gatesAprobados: [],
+      reviewCompletado: false,
+    });
     expect(loop.journeys[1]).toBe('hecho');
     expect(loop.journeys[2]).toBe('en curso');
     expect(loop.enCurso).toBe(2);
@@ -32,6 +38,7 @@ describe('el estado del loop se deriva de los gates', () => {
   it('cada journey cubre sus gates: J3 necesita G1 y G2, no solo G1', () => {
     const conG1 = estadoDelLoop({
       hayEvidencia: true,
+      hayServicio: true,
       gatesAprobados: [0, 1],
       reviewCompletado: false,
     });
@@ -39,6 +46,7 @@ describe('el estado del loop se deriva de los gates', () => {
     expect(conG1.gateAbierto).toBe(2);
     const conG2 = estadoDelLoop({
       hayEvidencia: true,
+      hayServicio: true,
       gatesAprobados: [0, 1, 2],
       reviewCompletado: false,
     });
@@ -50,6 +58,7 @@ describe('el estado del loop se deriva de los gates', () => {
   it('con G7 aprobado se está en el post mortem (J7) hasta que el review se complete', () => {
     const midiendo = estadoDelLoop({
       hayEvidencia: true,
+      hayServicio: true,
       gatesAprobados: [0, 1, 2, 3, 4, 5, 6, 7],
       reviewCompletado: false,
     });
@@ -61,6 +70,7 @@ describe('el estado del loop se deriva de los gates', () => {
 
     const cerrado = estadoDelLoop({
       hayEvidencia: true,
+      hayServicio: true,
       gatesAprobados: [0, 1, 2, 3, 4, 5, 6, 7],
       reviewCompletado: true,
     });
@@ -75,6 +85,7 @@ describe('el estado del loop se deriva de los gates', () => {
     // está en curso y todo lo posterior es próximo, esté como esté.
     const loop = estadoDelLoop({
       hayEvidencia: true,
+      hayServicio: true,
       gatesAprobados: [7],
       reviewCompletado: false,
     });
@@ -88,6 +99,7 @@ describe('el estado del loop se deriva de los gates', () => {
     // esta regla la pantalla decía «J1 en curso» con «gate abierto G5» al lado.
     const loop = estadoDelLoop({
       hayEvidencia: false,
+      hayServicio: true,
       gatesAprobados: [0, 1, 2, 3, 4],
       reviewCompletado: false,
     });
@@ -98,8 +110,14 @@ describe('el estado del loop se deriva de los gates', () => {
   });
 
   it('un servicio sin proyecto solo puede tener J1 hecho', () => {
-    expect(loopDeProyecto(null, true).enCurso).toBe(2);
-    expect(loopDeProyecto(null, false).enCurso).toBe(1);
+    expect(loopDeProyecto(null, { hayEvidencia: true, hayServicio: true }).enCurso).toBe(2);
+    expect(loopDeProyecto(null, { hayEvidencia: false, hayServicio: true }).enCurso).toBe(1);
+  });
+
+  it('sin servicio el arranque no está hecho aunque haya evidencia: la pantalla lo dice así', () => {
+    const loop = loopDeProyecto(null, { hayEvidencia: true, hayServicio: false });
+    expect(loop.journeys[1]).toBe('en curso');
+    expect(loop.cerrados).toBe(0);
   });
 });
 

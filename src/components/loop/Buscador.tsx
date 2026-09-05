@@ -217,7 +217,7 @@ export function Buscador({ workspaceId }: { workspaceId: string | null }) {
         maxLength={MAX_CARACTERES}
         placeholder={workspaceId ? 'Buscar en el workspace…  /' : 'Sin workspace donde buscar'}
         disabled={!workspaceId}
-        title={workspaceId ? 'Atajos: / y ⌘K' : 'Únete a un workspace para buscar en él'}
+        title={workspaceId ? 'Atajos: / y ⌘K (Ctrl+K)' : 'Únete a un workspace para buscar en él'}
         value={texto}
         onChange={(e) => {
           setTexto(e.target.value);

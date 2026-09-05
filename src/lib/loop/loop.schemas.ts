@@ -66,6 +66,9 @@ export type MetricasDelReto = {
   /** Entradas KPI con al menos un snapshot recibido. */
   listas: number;
   total: number;
+  /** Entradas sin snapshot que QUIEN MIRA puede cargar: curador, o propietario del dato de
+   * esa entrada. Las de otros propietarios no son su tarea. */
+  sinSnapshotMias: number;
   /** La primera entrada del registry: es la cifra que la cabecera enseña. */
   primaria: {
     nombre: string;

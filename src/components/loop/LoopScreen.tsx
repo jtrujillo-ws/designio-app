@@ -344,7 +344,9 @@ function Lateral({
   // clave lleva al usuario: dos cuentas en el mismo navegador no se pisan la suya). Se lee
   // en un efecto, no en el inicializador: el servidor no tiene localStorage y el primer
   // fotograma tiene que coincidir con el que él pintó.
-  const claveExpansion = `designio.loop.expandidos.${usuario.id}.${arbol?.workspaceId ?? ''}`;
+  // La clave lleva el workspace de la MEMBRESÍA, que existe aunque el árbol no haya llegado:
+  // con `arbol?.workspaceId` una carga fallida guardaba la preferencia bajo un workspace vacío.
+  const claveExpansion = `designio.loop.expandidos.${usuario.id}.${membresia?.workspaceId ?? ''}`;
   const [expandidos, setExpandidos] = useState<Set<string>>(
     () => new Set(servicioActual ? [servicioActual.id] : []),
   );

@@ -51,16 +51,17 @@ export async function resumenParaUsuario(
       const filasProyectos = await tx`
         select p.id, p.codigo, r.id as reto_id, r.codigo as reto_codigo,
           r.servicio_ancla_id as servicio_id,
-          coalesce((select array_agg(g.numero order by g.numero)
-            from gate_instancia g
-            where g.proyecto_id = p.id and g.workspace_id = p.workspace_id
-              and g.estado = 'aprobado'), '{}'::int[]) as aprobados,
+          coalesce(array_agg(g.numero order by g.numero) filter (where g.numero is not null),
+            '{}'::int[]) as aprobados,
           exists (select 1 from outcome_review o
             where o.reto_id = r.id and o.workspace_id = r.workspace_id
               and o.estado = 'completado') as review_completado
         from proyecto p
         join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id
+        left join gate_instancia g
+          on g.proyecto_id = p.id and g.workspace_id = p.workspace_id and g.estado = 'aprobado'
         where p.workspace_id = ${workspaceId}
+        group by p.id, p.codigo, r.id, r.codigo, r.servicio_ancla_id, r.workspace_id
         order by r.codigo, r.id, p.codigo, p.id`;
       const proyectos: GatesDeProyecto[] = filasProyectos.map((f) => ({
         proyectoId: f.id as string,

@@ -116,7 +116,7 @@ Cinco ideas sostienen el producto:
 | **Árbol simple sobre grafo rico** | El cliente navega Cliente → Servicios → Retos → Proyectos; debajo, el dominio es un grafo n:m que sostiene trazabilidad, consulta y scoping de la AI |
 | **Trazabilidad decisión → resultado** | Cadena evidencia → insight → decisión → design version → release → effective state → snapshots → outcome review, navegable en ambos sentidos |
 | **Medición temporal y honesta** | Metric Registry firmado en G6, snapshots manuales o CSV, ventana por criterio, post mortem con veredicto de cuatro valores y sin causalidad automática |
-| **La AI propone, el humano aprueba** | Pipeline único `PropuestaAI` con citas verificables y lineage; sin AI todo flujo sigue disponible a mano |
+| **La AI propone, el humano aprueba** | Pipeline único `PropuestaAI` con citas verificables y lineage; sin AI todo flujo sigue disponible a mano, con una excepción hoy declarada: los criterios de éxito de un reto nuevo solo entran desde la interfaz por C0 mientras J2 no tenga pantalla (ver `05` y `10`) |
 
 Lo que Designio **no es**, por diseño (prediseño §21): no es un canvas ni "un Miro peor"; no es una
 plataforma de telemetría u operación continua; no aprende de otros clientes; no presenta revisores
@@ -420,7 +420,7 @@ identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de o
    snapshots son append-only y la ventana la fija el calendario de la base, no quien llama.
 6. **La AI deja libro de costos y lineage**: cada llamada al proveedor es una fila con su desenlace,
    tokens, costo y modelo; cada propuesta conserva su contenido original aunque se corrija; sin
-   proveedor la plataforma funciona igual y lo dice.
+   proveedor la plataforma funciona igual y lo dice (con la excepción de J2 anotada arriba).
 
 ## Estado del producto de un vistazo (2026-09-05)
 
@@ -1752,7 +1752,7 @@ base.
 | **Presencia literal** | Medida de si el fragmento citado aparece en el material que el modelo vio; no es fidelidad |
 | **Capacidad** | Una de C0–C7, CT o CI |
 | **Revisor AI** | Lente de revisión por arquetipo etiquetada como simulación; nunca evidencia (diseñado, C4) |
-| **Degradación segura** | Sin AI disponible, todo flujo sigue operable a mano y la pantalla dice por qué |
+| **Degradación segura** | Sin AI disponible, todo flujo sigue operable a mano y la pantalla dice por qué; excepción vigente: los criterios de éxito de un reto nuevo, que solo entran desde la interfaz por C0 hasta que exista la pantalla de J2 |
 | **Portal** | Los hilos de comentarios y aprobaciones dentro del workspace, auditados |
 | **Evento de dominio** | Fila append-only de auditoría con tipo, payload, actor y rol |
 | **Exportación** | Paquete JSON del workspace en ámbito archivo (todo) o entregable (con derechos vigentes) |

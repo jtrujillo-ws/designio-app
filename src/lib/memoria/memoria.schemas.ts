@@ -52,8 +52,15 @@ export type ArquetipoEnMemoria = {
   reto: { id: string; codigo: string; titulo: string; estado: string };
   /** Su primer proyecto, si lo hay: es la pantalla donde se lee la gobernanza del arquetipo. */
   proyecto: { id: string; codigo: string } | null;
-  /** El mapeo n:m a segmentos (RF-04.11). Vacío = arquetipo sin segmento declarado. */
+  /**
+   * El mapeo n:m a segmentos (RF-04.11), pero solo a los segmentos MOSTRADOS: la sección
+   * de segmentos viene acotada y devolver el mapeo entero por arquetipo volvía a dar una
+   * respuesta sin cota sobre una taxonomía grande. Vacío no significa «sin segmento»: para
+   * eso está `tieneOtrosMapeos`.
+   */
   segmentoIds: string[];
+  /** Mapeado a algún segmento que el tope de segmentos dejó fuera (un `exists`, no la lista). */
+  tieneOtrosMapeos: boolean;
 };
 
 /**
@@ -196,10 +203,11 @@ export type GrupoDeSegmento = {
  * tiene. `sinSegmento` es el total de los que no declararon segmento, por lo mismo.
  *
  * Y `segmentos` también viene recortada al tope, así que «no está en ningún segmento
- * mostrado» no significa «no tiene segmento»: `segmentoIds` trae el mapeo ENTERO desde la
- * base, y con él se separan tres casos —mapeado a algún segmento mostrado (va en ese
- * grupo), mapeado solo a segmentos fuera de los mostrados (grupo aparte, que remite a la
- * pantalla de segmentos), y sin mapeo alguno (el único que es «sin segmento declarado»)—.
+ * mostrado» no significa «no tiene segmento»: `segmentoIds` trae solo el mapeo a los
+ * mostrados (traerlo entero era otra respuesta sin cota) y `tieneOtrosMapeos` dice si hay
+ * mapeo a los demás. Con eso se separan tres casos —mapeado a algún segmento mostrado (va
+ * en ese grupo), sin mapeo mostrado pero con otros (grupo aparte, que remite a la pantalla
+ * de segmentos), y ni lo uno ni lo otro (el único que es «sin segmento declarado»)—.
  */
 export function agruparArquetiposPorSegmento(
   segmentos: SegmentoEnMemoria[],
@@ -223,12 +231,11 @@ export function agruparArquetiposPorSegmento(
     };
   });
   const mostrados = new Set(segmentos.map((s) => s.id));
-  // Con mapeo, pero a ninguno de los segmentos mostrados: tienen segmento, solo que el
-  // suyo no cupo. Se listan tal cual llegan; su total es lo que se enseña, porque contar
-  // «los que solo están en segmentos no mostrados» costaría lo que el tope ahorra.
-  const fuera = ordenados.filter(
-    (a) => a.segmentoIds.length > 0 && !a.segmentoIds.some((id) => mostrados.has(id)),
-  );
+  const enMostrado = (a: ArquetipoEnMemoria) => a.segmentoIds.some((id) => mostrados.has(id));
+  // Sin mapeo a ningún segmento mostrado pero con mapeo a otros: tienen segmento, solo que
+  // el suyo no cupo. Se listan tal cual llegan; su total no se conoce, porque contar «los
+  // que solo están en segmentos no mostrados» costaría lo que el tope ahorra.
+  const fuera = ordenados.filter((a) => !enMostrado(a) && a.tieneOtrosMapeos);
   if (fuera.length > 0) {
     grupos.push({
       clase: 'fuera-de-los-mostrados',
@@ -239,7 +246,7 @@ export function agruparArquetiposPorSegmento(
   }
   // Sin mapeo alguno: los únicos «sin segmento declarado». El grupo existe si HAY alguno,
   // se enseñe o no: los que el tope dejó fuera también son memoria y hay que decir que están.
-  const sueltos = ordenados.filter((a) => a.segmentoIds.length === 0);
+  const sueltos = ordenados.filter((a) => !enMostrado(a) && !a.tieneOtrosMapeos);
   const totalSueltos = Math.max(sinSegmento, sueltos.length);
   if (totalSueltos > 0) {
     grupos.push({

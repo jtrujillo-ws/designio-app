@@ -91,7 +91,19 @@ export async function construirMemoria(
       // El arquetipo con el reto donde nació y el primer proyecto de ese reto (el mismo
       // criterio que el buscador: por código, con desempate por id). Un reto sin proyecto —
       // un candidato, o uno activado a mano— deja el enlace en null y la pantalla lo dice.
+      //
+      // Su mapeo a segmentos va acotado a los segmentos MOSTRADOS: el CTE repite la selección
+      // de la sentencia de segmentos (mismo orden, mismo tope, misma foto de REPEATABLE READ,
+      // así que es la misma lista) y el json_agg solo agrega los que están en él. Devolver el
+      // mapeo entero por arquetipo era otra respuesta sin cota sobre una taxonomía grande.
+      // Que haya mapeo a los demás se dice con un `exists`, que no crece con nada.
       tx<ArquetipoEnMemoria[]>`
+        with segmentos_mostrados as (
+          select s.id from segmento s
+          where s.workspace_id = ${workspaceId}
+          order by s.creado_en desc, s.id
+          limit ${TOPE_POR_SECCION}
+        )
         select a.id, a.nombre, a.definicion, a.estado, a.veredicto_razon as "veredictoRazon",
                json_build_object('id', r.id, 'codigo', r.codigo, 'titulo', r.titulo,
                                  'estado', r.estado) as reto,
@@ -102,7 +114,13 @@ export async function construirMemoria(
                  from arquetipo_segmento asg
                  join segmento s on s.id = asg.segmento_id and s.workspace_id = asg.workspace_id
                  where asg.arquetipo_id = a.id and asg.workspace_id = a.workspace_id
-               ), '[]'::json) as "segmentoIds"
+                   and asg.segmento_id in (select id from segmentos_mostrados)
+               ), '[]'::json) as "segmentoIds",
+               exists (
+                 select 1 from arquetipo_segmento asg
+                 where asg.arquetipo_id = a.id and asg.workspace_id = a.workspace_id
+                   and asg.segmento_id not in (select id from segmentos_mostrados)
+               ) as "tieneOtrosMapeos"
         from arquetipo a
         join reto r on r.id = a.reto_id and r.workspace_id = a.workspace_id
         left join lateral (

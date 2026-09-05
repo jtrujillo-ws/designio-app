@@ -238,9 +238,11 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
     });
     expect(confirmado.proyecto).toEqual({ id: proyectoA, codigo: 'P-M1' });
     expect(confirmado.segmentoIds).toEqual([segIndep, segPymes]);
+    expect(confirmado.tieneOtrosMapeos).toBe(false);
     const hipotesis = m!.arquetipos.find((a) => a.id === arqHipotesis)!;
     expect(hipotesis.estado).toBe('hipotesis');
     expect(hipotesis.segmentoIds).toEqual([]);
+    expect(hipotesis.tieneOtrosMapeos).toBe(false);
 
     // Solo validados (el propuesto no es memoria), recortados al tope con el más reciente
     // primero y el total REAL al lado: la pantalla dice «50 de 53», no finge la lista entera.
@@ -369,11 +371,16 @@ describeAuthz('biblioteca del cliente (proyección de la memoria + aislamiento)'
       expect(m!.segmentos.some((s) => s.id === segIndep || s.id === segPymes)).toBe(false);
       expect(m!.segmentos.every((s) => s.totalArquetipos === 0)).toBe(true);
       expect(m!.totales.arquetipos).toBe(2);
-      // El arquetipo mapeado a los segmentos antiguos trae su mapeo ENTERO —la base no lo
-      // recorta— y por eso NO cae en «sin segmento»: va al grupo de los segmentos que no se
-      // muestran. «Sin segmento» sigue siendo solo el que de verdad no declaró ninguno.
+      // El arquetipo mapeado a los segmentos antiguos llega SIN mapeos mostrados —la base
+      // solo devuelve los que caben en la sección— pero con `tieneOtrosMapeos`, y por eso
+      // NO cae en «sin segmento»: va al grupo de los segmentos que no se muestran. «Sin
+      // segmento» sigue siendo solo el que de verdad no declaró ninguno.
       const confirmado = m!.arquetipos.find((a) => a.id === arqConfirmado)!;
-      expect(confirmado.segmentoIds).toEqual([segIndep, segPymes]);
+      expect(confirmado.segmentoIds).toEqual([]);
+      expect(confirmado.tieneOtrosMapeos).toBe(true);
+      const hipotesis = m!.arquetipos.find((a) => a.id === arqHipotesis)!;
+      expect(hipotesis.segmentoIds).toEqual([]);
+      expect(hipotesis.tieneOtrosMapeos).toBe(false);
       expect(m!.totales.arquetiposSinSegmento).toBe(1);
       const grupos = agruparArquetiposPorSegmento(
         m!.segmentos,

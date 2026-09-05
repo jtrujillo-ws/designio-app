@@ -33,6 +33,7 @@ const arquetipo = (
   reto: { id: 'r1', codigo: 'R-01', titulo: 'Reto', estado: 'activo' },
   proyecto: { id: 'p1', codigo: 'P-01' },
   segmentoIds: [],
+  tieneOtrosMapeos: false,
   ...parcial,
 });
 
@@ -81,16 +82,17 @@ describe('los arquetipos agrupados por segmento', () => {
   });
 
   it('tres casos: en un segmento mostrado, solo en segmentos no mostrados, y sin segmento alguno', () => {
-    // `segmentos` viene recortada al tope: «s-antiguo» existe en el workspace pero no cupo.
-    // El arquetipo mapeado solo a él TIENE segmento, y no puede acabar en «sin segmento».
+    // `segmentos` viene recortada al tope y `segmentoIds` solo trae los mapeos a los
+    // mostrados: el arquetipo cuyo segmento no cupo llega con la lista vacía y
+    // `tieneOtrosMapeos`. TIENE segmento, y no puede acabar en «sin segmento».
     const grupos = agruparArquetiposPorSegmento(
       [independientes],
       [
         arquetipo({ id: 'a1', nombre: 'Con segmento', segmentoIds: ['s1'] }),
         arquetipo({ id: 'a2', nombre: 'Suelto' }),
-        arquetipo({ id: 'a3', nombre: 'De un segmento no mostrado', segmentoIds: ['s-antiguo'] }),
-        // Mapeado a uno mostrado y a uno no mostrado: va con el mostrado, no aparte.
-        arquetipo({ id: 'a4', nombre: 'Mixto', segmentoIds: ['s-antiguo', 's1'] }),
+        arquetipo({ id: 'a3', nombre: 'De un segmento no mostrado', tieneOtrosMapeos: true }),
+        // Mapeado a uno mostrado y a otro no mostrado: va con el mostrado, no aparte.
+        arquetipo({ id: 'a4', nombre: 'Mixto', segmentoIds: ['s1'], tieneOtrosMapeos: true }),
       ],
       1,
     );

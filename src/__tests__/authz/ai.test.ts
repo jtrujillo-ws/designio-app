@@ -12,20 +12,22 @@ import {
 import { MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
-  parsearContenido,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
+import { parsearContenido } from '@/lib/ai/ai.contenido';
 import {
   aceptarPropuesta,
   ErrorAI,
   generarPropuestas,
   panelPropuestas,
+  proyeccionDelPanel,
   rechazarPropuesta,
   registrarConsentimiento,
 } from '@/lib/ai/ai.servicio';
 import type { IntentoProveedor, ResultadoProveedor } from '@/lib/ai/proveedor.server';
+import { CAPACIDADES, CAPACIDADES_ACTIVAS } from '@/lib/ai/ai.schemas';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -1026,6 +1028,39 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
   // ── RF-09.5: consentimiento ANTES de que el material salga hacia el proveedor ──
 
+  /**
+   * Y el mensaje va donde la persona pueda ACTUAR.
+   *
+   * El candado del consentimiento se toma primero —leerlo y apartar la reserva tienen que ser
+   * atómicos—, pero eso no decide qué se dice. Con la comprobación delante de la preparación,
+   * una petición rancia contra un item YA CURADO recibía «registra el consentimiento»: una
+   * instrucción que no lleva a ninguna parte, porque después de registrarlo el item sigue
+   * curado y la generación falla igual. Lo cazó una revisión sobre el arreglo anterior.
+   *
+   * Lo que se sujeta es la PRECEDENCIA: primero lo que hay que arreglar primero.
+   */
+  it('a un item ya curado le dice que está curado, no que registre el consentimiento', async () => {
+    const itemId = await nuevoItem('Entrevista ya curada', 'entrevista');
+    // Se cura a mano, y sin consentimiento: las dos cosas mal a la vez.
+    // Un item decidido lleva quién y cuándo: el CHECK de la tabla lo exige, y esta prueba
+    // tiene que montar un estado que la base admita para medir algo real.
+    await sqlAdmin()`update item_importacion
+      set estado = 'rechazado', decidido_por = ${leadId}, decidido_en = now()
+      where id = ${itemId} and workspace_id = ${ws}`;
+    await conProveedor(RESPUESTA_CI, async () => {
+      await expect(
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: itemId }),
+      ).rejects.toThrow(/ya fue curado/i);
+    });
+    // Y cuando el item SÍ está disponible, el consentimiento vuelve a ser lo que falta.
+    const pendiente = await nuevoItem('Entrevista pendiente sin consentimiento', 'entrevista');
+    await conProveedor(RESPUESTA_CI, async () => {
+      await expect(
+        generarPropuestas(leadId, { workspaceId: ws, capacidad: 'CI', anclaId: pendiente }),
+      ).rejects.toThrow(/consentimiento/i);
+    });
+  });
+
   it('material de personas sin consentimiento: no se genera, y la base tampoco lo admite', async () => {
     const itemId = await nuevoItem('Entrevista sin consentimiento', 'entrevista');
     await conProveedor(RESPUESTA_CI, async () => {
@@ -1177,7 +1212,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       where workspace_id = ${ws} and item_id = ${itemId} and estado = 'propuesta'`);
     await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: viva!.id as string });
     const panel = await panelPropuestas(leadId, ws);
-    expect(panel.itemsPendientes.find((i) => i.id === itemId)?.consentimientoPendiente).toBe(true);
+    expect(panel.candidatas.CI.lista.find((i) => i.id === itemId)?.consentimientoPendiente).toBe(true);
     // También en la base: el guard lee lo mismo que el servicio, no «si existe algún
     // registro» — que con la revocación seguiría diciendo que sí.
     await expect(
@@ -1614,7 +1649,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
     // Con permiso vigente y una propuesta pendiente, el item ya no es un ancla ofrecible…
     const conPropuesta = await panelPropuestas(leadId, ws);
-    expect(conPropuesta.itemsPendientes.some((i) => i.id === itemId)).toBe(false);
+    expect(conPropuesta.candidatas.CI.lista.some((i) => i.id === itemId)).toBe(false);
     // …y ahí estaba el agujero: el formulario colgaba del selector de generación, así que
     // en este estado —el único en el que una revocación urge— no había forma de registrarla.
     const vigente = conPropuesta.materialDePersonas.find((m) => m.id === itemId)!;
@@ -2993,9 +3028,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     const itemId = await nuevoItem('Entrevista por marcar', 'entrevista');
     const notaId = await nuevoItem('Nota que no espera nada');
     const panel = await panelPropuestas(leadId, ws);
-    expect(panel.itemsPendientes.find((i) => i.id === itemId)?.consentimientoPendiente).toBe(true);
+    expect(panel.candidatas.CI.lista.find((i) => i.id === itemId)?.consentimientoPendiente).toBe(true);
     // Y no se derrama: un item que no es de personas se ofrece sin marca.
-    expect(panel.itemsPendientes.find((i) => i.id === notaId)?.consentimientoPendiente).toBe(false);
+    expect(panel.candidatas.CI.lista.find((i) => i.id === notaId)?.consentimientoPendiente).toBe(false);
   });
 
   // ── RF-09.12: el presupuesto se aparta ANTES de llamar, y una sola propuesta por item ──
@@ -3540,16 +3575,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         from generate_series(1, 51) as g`;
 
       const panel = await panelPropuestas(curadorId, wsA);
-      expect(panel.itemsPendientes.length).toBe(50);
-      expect(panel.hayMasItems).toBe(true);
-      expect(panel.retosAbiertos.length).toBe(50);
-      expect(panel.hayMasRetos).toBe(true);
+      expect(panel.candidatas.CI.lista.length).toBe(50);
+      expect(panel.candidatas.CI.hayMas).toBe(true);
+      expect(panel.candidatas.C0.lista.length).toBe(50);
+      expect(panel.candidatas.C0.hayMas).toBe(true);
       // El MÁS ANTIGUO encabeza la lista. Con el orden inverso, los items viejos caían
       // fuera del corte y ninguna acción del producto volvía a acercarlos: seguían
       // pendientes y elegibles, pero imposibles de elegir.
-      expect(panel.itemsPendientes[0]!.titulo).toBe('Item 01');
-      expect(panel.itemsPendientes.at(-1)!.titulo).toBe('Item 50');
-      expect(panel.itemsPendientes.some((i) => i.titulo === 'Item 60')).toBe(false);
+      expect(panel.candidatas.CI.lista[0]!.titulo).toBe('Item 01');
+      expect(panel.candidatas.CI.lista.at(-1)!.titulo).toBe('Item 50');
+      expect(panel.candidatas.CI.lista.some((i) => i.titulo === 'Item 60')).toBe(false);
 
       // Y la ventana avanza al drenar la cabeza: curar los diez primeros a mano hace
       // entrar solos a los que faltaban. Eso es lo que convierte el corte en una ventana
@@ -3558,30 +3593,30 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         set estado = 'rechazado', decidido_por = ${curadorId}, decidido_en = now()
         where workspace_id = ${wsA} and titulo <= 'Item 10'`;
       const despues = await panelPropuestas(curadorId, wsA);
-      expect(despues.itemsPendientes[0]!.titulo).toBe('Item 11');
-      expect(despues.itemsPendientes.some((i) => i.titulo === 'Item 60')).toBe(true);
-      expect(despues.hayMasItems).toBe(false);
+      expect(despues.candidatas.CI.lista[0]!.titulo).toBe('Item 11');
+      expect(despues.candidatas.CI.lista.some((i) => i.titulo === 'Item 60')).toBe(true);
+      expect(despues.candidatas.CI.hayMas).toBe(false);
 
       // Y la promesa incondicional: con más anclas elegibles que sitio en la lista, NINGÚN
       // orden alcanza —el drenaje ayuda, pero exige trabajar lo que va delante—. Buscar por
       // nombre llega a cualquiera sin drenar nada y sin gastar presupuesto en el camino.
       const buscado = await panelPropuestas(curadorId, wsA, 'Item 58');
-      expect(buscado.itemsPendientes.map((i) => i.titulo)).toEqual(['Item 58']);
-      expect(buscado.hayMasItems).toBe(false);
+      expect(buscado.candidatas.CI.lista.map((i) => i.titulo)).toEqual(['Item 58']);
+      expect(buscado.candidatas.CI.hayMas).toBe(false);
       const porCodigo = await panelPropuestas(curadorId, wsA, 'R-052');
-      expect(porCodigo.retosAbiertos).toHaveLength(1);
+      expect(porCodigo.candidatas.C0.lista).toHaveLength(1);
       expect(porCodigo.busqueda).toBe('R-052');
       // El texto se busca LITERAL: un comodín de LIKE escrito por la persona es un carácter
       // más, no un «dámelo todo» que haría creer que la búsqueda no filtra.
       const comodin = await panelPropuestas(curadorId, wsA, '%');
-      expect(comodin.itemsPendientes).toHaveLength(0);
+      expect(comodin.candidatas.CI.lista).toHaveLength(0);
     });
   });
 
   it('los retos también drenan: un reto con criterios propuestos sale de la lista', async () => {
     await enWorkspaceLimpio('drenaje', async ({ ws: wsD, curadorId, retoId: retoD }) => {
       const antes = await panelPropuestas(curadorId, wsD);
-      expect(antes.retosAbiertos.some((r) => r.id === retoD)).toBe(true);
+      expect(antes.candidatas.C0.lista.some((r) => r.id === retoD)).toBe(true);
 
       await conProveedor(
         { ok: true, datos: { criterios: [CONTENIDO_C0] }, intentos: [intento({ uso: null })] },
@@ -3592,7 +3627,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // quedaba en la lista para siempre y con más de 50 retos abiertos los de atrás eran
       // inalcanzables: el orden FIFO ordenaba, pero no drenaba.
       const conPendiente = await panelPropuestas(curadorId, wsD);
-      expect(conPendiente.retosAbiertos.some((r) => r.id === retoD)).toBe(false);
+      expect(conPendiente.candidatas.C0.lista.some((r) => r.id === retoD)).toBe(false);
       // Y el servicio dice lo mismo que el panel: pedir otro lote sobre un ancla que ya
       // espera revisión quemaría presupuesto en algo que nadie ha mirado.
       await conProveedor(
@@ -3608,7 +3643,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         where workspace_id = ${wsD} and reto_id = ${retoD} and estado = 'propuesta'`);
       await rechazarPropuesta(curadorId, { workspaceId: wsD, propuestaId: p!.id as string });
       const drenado = await panelPropuestas(curadorId, wsD);
-      expect(drenado.retosAbiertos.some((r) => r.id === retoD)).toBe(true);
+      expect(drenado.candidatas.C0.lista.some((r) => r.id === retoD)).toBe(true);
     });
   });
 
@@ -3624,12 +3659,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         values (${wsM}, 'Con material', ${MATERIAL}, 'nota', 'ref', ${curadorId}) returning id`;
 
       const panel = await panelPropuestas(curadorId, wsM);
-      const marcado = panel.itemsPendientes.find((i) => i.id === (soloRef!.id as string));
+      const marcado = panel.candidatas.CI.lista.find((i) => i.id === (soloRef!.id as string));
       // Se ofrece MARCADO: la pantalla explica que no hay texto que citar y por dónde
       // sigue el trabajo (la bandeja), en vez de esconder el item sin decir por qué.
       expect(marcado?.sinMaterial).toBe(true);
       expect(
-        panel.itemsPendientes.find((i) => i.id === (conTexto!.id as string))?.sinMaterial,
+        panel.candidatas.CI.lista.find((i) => i.id === (conTexto!.id as string))?.sinMaterial,
       ).toBe(false);
     });
   });
@@ -3651,7 +3686,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(antes.pendientes.every((p) => p.anclaEstado === 'disponible')).toBe(true);
       // Con criterios propuestos esperando revisión, el reto deja de ofrecerse como ancla:
       // es la condición que DRENA la lista (un reto no cambia de estado por generar).
-      expect(antes.retosAbiertos.some((r) => r.id === retoC)).toBe(false);
+      expect(antes.candidatas.C0.lista.some((r) => r.id === retoC)).toBe(false);
 
       // Entre generar y revisar, alguien aprueba el G0: ese gate certificó unos criterios
       // y los congeló (SYS-22). El insert directo del gate ya aprobado es el atajo del
@@ -3674,7 +3709,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // C0 salía disponible y el panel habilitaba «aceptar» y «corregir y aceptar» sobre
       // algo que la base rechaza siempre.
       expect(despues.pendientes.every((x) => x.anclaEstado === 'criterios-congelados')).toBe(true);
-      expect(despues.retosAbiertos.some((r) => r.id === retoC)).toBe(false);
+      expect(despues.candidatas.C0.lista.some((r) => r.id === retoC)).toBe(false);
 
       // Lo que decía la pantalla se confirma contra la base…
       await expect(
@@ -3694,7 +3729,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(viva.anclaEstado).toBe('disponible');
       // Sigue sin ofrecerse como ancla mientras esa propuesta espera: las dos condiciones
       // son independientes y ninguna tapa a la otra.
-      expect(reabierto.retosAbiertos.some((r) => r.id === retoC)).toBe(false);
+      expect(reabierto.candidatas.C0.lista.some((r) => r.id === retoC)).toBe(false);
       const aceptada = await aceptarPropuesta(curadorId, {
         workspaceId: wsC,
         propuestaId: viva.id,
@@ -3703,7 +3738,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // Y decidida la última pendiente, el reto vuelve a la lista: la ventana avanza al
       // trabajar, que es justo lo que le faltaba a los retos.
       const drenado = await panelPropuestas(curadorId, wsC);
-      expect(drenado.retosAbiertos.some((r) => r.id === retoC)).toBe(true);
+      expect(drenado.candidatas.C0.lista.some((r) => r.id === retoC)).toBe(true);
     });
   });
 
@@ -3736,7 +3771,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // El motivo es el SUYO: con un solo valor para las dos causas, la pantalla le habría
       // ofrecido al lead reabrir la etapa 0, que aquí no desbloquea nada.
       expect(panel.pendientes.every((p) => p.anclaEstado === 'registry-firmado')).toBe(true);
-      expect(panel.retosAbiertos.some((r) => r.id === retoR)).toBe(false);
+      expect(panel.candidatas.C0.lista.some((r) => r.id === retoR)).toBe(false);
 
       // Y lo que dice la pantalla se confirma contra la base, por los tres caminos:
       // aceptar la propuesta… y con un error de DOMINIO, no con el del driver. Esto es lo
@@ -4625,5 +4660,109 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     } finally {
       await admin`update usuario set estado = 'activo' where id = ${leadId}`;
     }
+  });
+  /*
+   * El ancla que cada capacidad DECLARA tiene que existir en las tres tablas del pipeline.
+   *
+   * Es la misma inversión que el registro: la lista de columnas válidas no se escribe aquí,
+   * se le pregunta al catálogo. Una capacidad futura que cuelgue de un objeto nuevo —un
+   * journey, una design version— necesita su columna en las tres, y este caso lo dice ANTES
+   * de que el primer `insert` lo descubra en caliente, con la llamada al proveedor ya pagada.
+   */
+  it('cada capacidad declara un ancla que existe en reserva_ai, llamada_ai y propuesta_ai', async () => {
+    const admin = sqlAdmin();
+    const filas = await admin`
+      select table_name as tabla, column_name as columna
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name in ('reserva_ai', 'llamada_ai', 'propuesta_ai')`;
+    // Que esté mirando algo: con cero filas, todo lo de abajo pasaría sin comprobar nada.
+    expect(filas.length).toBeGreaterThan(20);
+    const columnas = new Set(filas.map((f) => `${f.tabla as string}.${f.columna as string}`));
+
+    const faltan: string[] = [];
+    for (const capacidad of CAPACIDADES_ACTIVAS) {
+      const { columna } = CAPACIDADES[capacidad].ancla;
+      for (const tabla of ['reserva_ai', 'llamada_ai', 'propuesta_ai']) {
+        if (!columnas.has(`${tabla}.${columna}`)) faltan.push(`${capacidad}: ${tabla}.${columna}`);
+      }
+    }
+    expect(faltan).toEqual([]);
+  });
+
+  /**
+   * Ninguna CAPACIDAD hereda el juicio de otra, y la que el panel no sabe juzgar no se acepta.
+   *
+   * Dos rondas de revisión sobre el mismo sitio. La primera: el CASE de `ancla_estado` decía
+   * `when p.item_id is not null then <lo del item>` y a continuación, SIN preguntar por
+   * `p.reto_id`, las tres ramas del reto — todo lo que no fuera un item caía en ellas. Medido
+   * con las dos columnas en null, respondía «reto-no-admite»: un motivo falso, y de los que
+   * mandan al revisor a reabrir la etapa 0, que ahí no desbloquea nada.
+   *
+   * La segunda, sobre el arreglo de la primera: indexarlo por COLUMNA seguía siendo la clave
+   * equivocada. Dos capacidades pueden colgar del mismo reto —C2 y C3 lo harán— y no comparten
+   * sus puertas: C0 se congela con el G0 (SYS-22) y una capacidad posterior no tendría por qué.
+   * Con el CASE preguntando por la columna, la segunda heredaba las puertas de la primera y no
+   * faltaba ninguna entrada que el compilador echara de menos.
+   *
+   * Ahora cada rama pregunta por `p.capacidad`. No se puede montar la fila en `propuesta_ai`
+   * —sus CHECK atan capacidad, destino y ancla, que es justo lo que se quiere de ellos—, así
+   * que se evalúa el CASE REAL, el que compone `proyeccionDelPanel`, sobre un `p` sintético.
+   */
+  it('no le presta a una capacidad el motivo de otra, y la desconocida no es aceptable', async () => {
+    const item = await nuevoItem('Item para medir el motivo de la capacidad');
+    await conUsuario(leadId, async (tx) => {
+      const proyeccion = proyeccionDelPanel(tx);
+      // Un `p` sintético con las columnas que el CASE mira, y los joins que el panel hace.
+      const motivoDe = async (
+        capacidad: string,
+        i: string | null,
+        r: string | null,
+      ): Promise<string | null> => {
+        const [f] = await tx`
+          select case ${proyeccion.motivo} else null end as estado
+          from (select ${capacidad}::text as capacidad, ${i}::uuid as item_id,
+                       ${r}::uuid as reto_id, ${ws}::uuid as workspace_id) p
+          ${proyeccion.joins}`;
+        return (f!.estado as string | null) ?? null;
+      };
+
+      // Una capacidad que este panel no sabe pintar: lo dice CALLANDO. `filaDePanel` lee ese
+      // null como 'ancla-ausente', que solo admite rechazar. Antes respondía con el motivo del
+      // vecino — primero el del reto por caer en su rama, después el de quien compartiera
+      // columna.
+      expect(await motivoDe('C3', null, retoId)).toBeNull();
+      expect(await motivoDe('C3', item, null)).toBeNull();
+      expect(await motivoDe('C4', null, null)).toBeNull();
+
+      // Y cada capacidad responde SOLO con motivos suyos: se comprueban los conjuntos, no un
+      // valor concreto, porque lo que se sujeta es que las ramas no se crucen y no en qué
+      // estado dejó el fixture a cada fila.
+      const DE_CI = ['disponible', 'item-curado', 'consentimiento-revocado'];
+      const DE_C0 = ['disponible', 'reto-no-admite', 'registry-firmado', 'criterios-congelados'];
+      expect(DE_CI).toContain(await motivoDe('CI', item, null));
+      expect(DE_C0).toContain(await motivoDe('C0', null, retoId));
+      // El de CI no puede ser NUNCA uno exclusivo de C0 (que es lo que pasaba).
+      expect(DE_C0.slice(1)).not.toContain(await motivoDe('CI', item, null));
+    });
+  });
+
+  /**
+   * Y las anclas OFRECIDAS también son de la capacidad, no de su columna.
+   *
+   * Comprobado sobre las dos activas: la cola de CI trae items de bandeja y la de C0 trae
+   * retos, y ninguna de las dos está vacía por accidente. Lo que esto sujeta es que el panel
+   * las resuelva POR CAPACIDAD: con la lista elegida por la columna del ancla, una segunda
+   * capacidad sobre `reto_id` recibía la cola de C0 —que excluye los retos con criterios
+   * congelados— y sus anclas válidas no aparecían en el selector.
+   */
+  it('resuelve las anclas ofrecidas por capacidad, cada una con su elegibilidad', async () => {
+    const item = await nuevoItem('Item ofrecible a CI');
+    const panel = await panelPropuestas(leadId, ws);
+    expect(Object.keys(panel.candidatas).sort()).toEqual([...CAPACIDADES_ACTIVAS].sort());
+    expect(panel.candidatas.CI.lista.some((c) => c.id === item)).toBe(true);
+    // La cola de CI son items: ninguno de sus ids puede ser un reto, y al revés.
+    expect(panel.candidatas.C0.lista.some((c) => c.id === item)).toBe(false);
+    expect(panel.candidatas.CI.lista.some((c) => c.id === retoId)).toBe(false);
   });
 });

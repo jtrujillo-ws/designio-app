@@ -9,10 +9,22 @@ if [ ! -d "$DIR" ]; then
   exit 1
 fi
 
+# Los marcadores. Los tres primeros son módulos server-only cargándose donde no deben. El
+# cuarto es otra cosa y por eso lleva su nota: los VALIDADORES de contenido AI son código
+# muerto en el navegador —desde que la frontera de la corrección es `unknown`, la única
+# validación de contenido ocurre en el servidor— y llegaban allí solo por estar colgados de
+# `CAPACIDADES`, que sí importa la pantalla. No rompen nada; pesan. Una revisión señaló que
+# este guardián no lo veía, y tenía razón: solo miraba marcadores de server-only.
+#
+# El marcador es un CENTINELA puesto a propósito en `ai.contenido.ts`, no un texto prestado.
+# Con el nombre de un campo no valía por dos lados: `fechaSinDatoMotivo` también está en el
+# formulario de corrección —que sí vive en el navegador y tiene que seguir estando—, así que
+# daba falso positivo; y un mensaje de validación cualquiera deja de guardar el día que alguien
+# lo reescribe. Éste existe solo para esto.
 BAD=0
-for needle in "Módulo server-only cargado" "DATABASE_URL_APP" "app.user_id"; do
+for needle in "Módulo server-only cargado" "DATABASE_URL_APP" "app.user_id" "designio:contenido-ai-solo-servidor"; do
   if grep -rq -- "$needle" "$DIR"; then
-    echo "✗ Marcador server-only en el bundle del cliente: \"$needle\"" >&2
+    echo "✗ Marcador que no debe estar en el bundle del cliente: \"$needle\"" >&2
     grep -rl -- "$needle" "$DIR" >&2 || true
     BAD=1
   fi

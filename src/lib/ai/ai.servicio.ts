@@ -2400,8 +2400,20 @@ const REVALIDAR: Record<
     }
   },
   C2: async (tx, entrada, huellaMaterial) => {
-    // El reto pudo archivarse mientras se preparaba la llamada, y entonces el insight nacería
-    // sobre un trabajo cerrado.
+    /*
+     * El reto pudo archivarse mientras se preparaba la llamada, y entonces el insight nacería
+     * sobre un trabajo cerrado. Con CANDADO, por lo mismo que los derechos de abajo: un
+     * archivado EN VUELO no lo ve este snapshot, así que un `select` a secas lee la versión
+     * activa anterior sin esperar y el despacho se cuela por delante — se paga el análisis de
+     * un trabajo que este mismo camino declara cerrado.
+     *
+     * Va PRIMERO, antes del candado de `derecho_uso`: el mismo orden que toma el guard
+     * diferido de la aceptación y el que encabeza `bloquearReto` en el servicio, para que dos
+     * transacciones los pidan siempre en la misma secuencia.
+     */
+    await tx`select 1 from reto
+      where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+      for share`;
     const [reto] = await tx`select estado = 'archivado' as archivado, codigo, titulo, descripcion
       from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
     if (!reto || (reto.archivado as boolean)) {

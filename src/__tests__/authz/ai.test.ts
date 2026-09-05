@@ -7695,6 +7695,77 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   }, 20000);
 
   /**
+   * Y el ARCHIVO del reto EN VUELO, que es el cuarto sitio donde se hace la misma pregunta.
+   *
+   * `REVALIDAR.C2` ya volvía a preguntar por el archivo justo antes de despachar —eso cierra la
+   * ventana ancha—, pero lo preguntaba con un `select` a secas, una línea por encima del
+   * candado de `derecho_uso` que cerró la ventana fina de la revocación. Un archivado en vuelo
+   * no lo ve ese snapshot: la lectura devuelve la versión activa anterior sin esperar, la
+   * huella del material no cambia —archivar solo toca `estado`— y el despacho se cuela por
+   * delante del archivo. Se paga el análisis de un trabajo que este mismo camino declara
+   * cerrado, y la propuesta que vuelva del proveedor la va a rechazar el suelo.
+   *
+   * Volver a preguntar en el momento correcto no basta: hace falta preguntarlo BAJO CANDADO, y
+   * hace falta hacerlo en TODOS los sitios donde se hace la misma pregunta. Este es el cuarto:
+   * el guard del insert, el guard diferido de la aceptación, los derechos de aquí — y el reto
+   * de aquí, que se había quedado fuera.
+   *
+   * Se mide por el despacho y por el LIBRO: el archivado toma su candado y se queda abierto; la
+   * generación entra y espera en el `for share`; se suelta el archivado, la generación
+   * despierta, relee el reto y ve `archivado`, y no llama. Sin el candado no espera: despacha.
+   */
+  it('un archivado en vuelo impide que se despache el análisis de un reto cerrado', async () => {
+    await enWorkspaceLimpio('c2-archivado-antes-de-despachar', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'La evidencia',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      // `duranteLlamada` —y no `antesDelApunte`— por lo mismo que en la revocación: es el hueco
+      // en el que el material ESTÁ EN EL AIRE, después de que el apunte haya salido bien.
+      let despachos = 0;
+      proveedor.duranteLlamada = async () => {
+        despachos += 1;
+      };
+      const [antes] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+
+      let soltar: () => void = () => {};
+      const enVuelo = new Promise<void>((r) => {
+        soltar = r;
+      });
+      const archivado = admin.begin(async (tx) => {
+        await tx`update reto set estado = 'archivado'
+          where id = ${retoC} and workspace_id = ${wsC}`;
+        await enVuelo;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+
+      try {
+        const generacion = conProveedor(
+          { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+          () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+        );
+        const veredicto = generacion.then(
+          () => 'generó',
+          (e: Error) => `rechazó: ${e.message}`,
+        );
+        await new Promise((r) => setTimeout(r, 1500));
+        soltar();
+        await archivado;
+        expect(await veredicto).toMatch(/se archivó mientras se preparaba/);
+      } finally {
+        proveedor.duranteLlamada = null;
+      }
+
+      expect(despachos, 'se despachó el análisis de un reto que se estaba archivando').toBe(0);
+      const [tras] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC}`;
+      expect(tras!.n).toBe(antes!.n);
+    });
+  }, 20000);
+
+  /**
    * Un uuid en mayúscula es el MISMO uuid, también en el suelo.
    *
    * El guard del INSERT normaliza con `lower(...)` —lo hace explícitamente— y el guard diferido

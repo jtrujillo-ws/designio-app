@@ -9,9 +9,11 @@ import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { DescargaArchivo } from '@/components/evidencia/DescargaArchivo';
+import { wsDeBusqueda } from '@/lib/auth/workspace-activo';
 import {
   decidirDerechosDeEvidencia,
   evidenciaConDerechos,
+  evidenciaConDerechosDeUna,
 } from '@/lib/evidencia/evidencia.functions';
 import {
   AMBITOS_USO,
@@ -28,14 +30,28 @@ import {
  * acto ocurre — y donde el bloqueo se explica en lugar de esconderse.
  */
 export const Route = createFileRoute('/_autenticada/evidencia')({
-  // `destacar`: el id de la evidencia a la que se vino (desde el buscador). Solo orienta la
-  // pantalla; el loader no lo mira, la lista sigue siendo la misma.
-  validateSearch: (search: Record<string, unknown>): { destacar?: string } =>
-    typeof search.destacar === 'string' && search.destacar !== '' ? { destacar: search.destacar } : {},
-  loaderDeps: ({ search }) => ({ ws: search.ws }),
-  loader: ({ context }) => {
+  // `destacar`: el id de la evidencia a la que se vino (desde el buscador o la bandeja de
+  // aprobaciones). La lista sigue siendo la misma; si la pedida no cae en la primera página
+  // —keyset de las más recientes, y lo que más espera es lo más antiguo— el loader la trae
+  // aparte y la pantalla la fija arriba: un enlace que aterriza en «no está entre lo
+  // cargado» no es un enlace.
+  // Solo cuenta un uuid bien formado (misma regla que `ws` y `servicio`): el loader lo pide
+  // por id con un schema uuid, y un `?destacar=foo` tecleado a mano no debe tumbar la ruta.
+  validateSearch: (search: Record<string, unknown>): { destacar?: string } => {
+    const destacar = wsDeBusqueda(search.destacar);
+    return destacar ? { destacar } : {};
+  },
+  loaderDeps: ({ search }) => ({ ws: search.ws, destacar: search.destacar }),
+  loader: async ({ context, deps }) => {
     const workspaceId = context.membresiaActiva?.workspaceId;
-    return workspaceId ? evidenciaConDerechos({ data: { workspaceId } }) : null;
+    if (!workspaceId) return null;
+    const lista = await evidenciaConDerechos({ data: { workspaceId } });
+    if (!lista) return null;
+    const fijada =
+      deps.destacar && !lista.evidencias.some((e) => e.id === deps.destacar)
+        ? await evidenciaConDerechosDeUna({ data: { workspaceId, evidenciaId: deps.destacar } })
+        : null;
+    return { ...lista, fijada };
   },
   component: PantallaEvidencia,
 });
@@ -85,7 +101,11 @@ function PantallaEvidencia() {
     setHayMasLocal(null);
   }
 
-  const evidencias = datos ? [...datos.evidencias, ...masEvidencias] : [];
+  // La fijada va aparte y no se repite si «cargar más» llega hasta ella.
+  const fijada = datos?.fijada ?? null;
+  const evidencias = datos
+    ? [...datos.evidencias, ...masEvidencias].filter((e) => e.id !== fijada?.id)
+    : [];
   const hayMas = hayMasLocal ?? datos?.hayMas ?? false;
   const [cargandoMas, setCargandoMas] = useState(false);
 
@@ -187,8 +207,24 @@ function PantallaEvidencia() {
                 : `${evidencias.length}${hayMas ? '+' : ''} evidencias · ${evidencias.filter((e) => e.citable).length} citables`}
             </div>
 
-            {destacar !== undefined && !evidencias.some((e) => e.id === destacar) && (
-              <AvisoDeDestacadoAusente que="La evidencia" />
+            {destacar !== undefined &&
+              fijada === null &&
+              !evidencias.some((e) => e.id === destacar) && (
+                <AvisoDeDestacadoAusente que="La evidencia" />
+              )}
+            {fijada && (
+              <Destacado id={fijada.id} destacado={fijada.id === destacar}>
+                <span role="status" style={{ ...etiqueta, display: 'block', marginBottom: 8 }}>
+                  Traída aquí por el enlace; en la lista va más abajo
+                </span>
+                <TarjetaEvidencia
+                  evidencia={fijada}
+                  workspaceId={datos.workspaceId}
+                  puedeDecidir={puedeDecidir}
+                  onCambio={refrescar}
+                  onError={setError}
+                />
+              </Destacado>
             )}
             {evidencias.map((ev) => (
               <Destacado key={ev.id} id={ev.id} destacado={ev.id === destacar}>

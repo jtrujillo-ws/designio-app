@@ -37,6 +37,7 @@ import { ROLES_ALTA_SERVICIO } from '@/lib/arbol/arbol.schemas';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { etiquetaDePendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
 
 /**
  * Pantalla Loop J1–J7 — dirección 3a del handoff «Loop · impacto visual»: lateral en negro
@@ -447,10 +448,11 @@ function Lateral({
   }
 
   const nombreCliente = arbol?.workspaceNombre ?? membresia?.workspaceNombre ?? 'Sin workspace';
-  // El lateral cuenta las aprobaciones que le tocan a QUIEN MIRA: una que espera al sponsor
-  // no es una tarea del lead, aunque «Te toca a ti» la nombre para que sepa a quién espera.
-  const aprobaciones = (resumen?.aprobaciones ?? []).filter((a) => a.esMia);
-  const primeraAprobacion = aprobaciones[0];
+  // El lateral cuenta lo que le toca decidir a QUIEN MIRA en todo el workspace: sus gates
+  // (una aprobación que espera al sponsor no es tarea del lead, aunque «Te toca a ti» la
+  // nombre), y además los derechos, insights y design versions que su rol resuelve. El
+  // conteo lo trae el resumen; las filas, la pantalla de aprobaciones con la misma fuente.
+  const pendientesDelRol = resumen?.pendientesDelRol.total ?? 0;
   const esBoutique = (ROLES_CURADORES as readonly string[]).includes(rol);
 
   return (
@@ -631,28 +633,18 @@ function Lateral({
           </Contador>
         )}
       </DestinoDelWorkspace>
-      {primeraAprobacion && (
-        // No hay pantalla de aprobaciones: la fila abre el proyecto del gate que espera.
-        <Link
-          className="loop-fila"
-          to="/proyecto/$proyectoId"
-          params={{ proyectoId: primeraAprobacion.proyectoId }}
-          title={`Abrir ${primeraAprobacion.proyectoCodigo} · gate G${primeraAprobacion.numero} espera tu aprobación`}
-          aria-label="Aprobaciones"
-          style={filaLateral}
-        >
-          <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
-            Aprobaciones
-          </span>
-          <Abreviatura>APR</Abreviatura>
+      {/* La pantalla de aprobaciones lista todo lo que el rol puede decidir ahora, por
+          clase y con enlace a donde se decide; el contador es ese total, no solo los gates. */}
+      <DestinoDelWorkspace to="/aprobaciones" etiqueta="Aprobaciones" abrev="APR">
+        {pendientesDelRol > 0 && (
           <Contador
             color="var(--warn)"
-            titulo={`${aprobaciones.length} gate(s) esperando tu aprobación`}
+            titulo={`${etiquetaDePendientes(pendientesDelRol)} de tu rol`}
           >
-            {aprobaciones.length}
+            {pendientesDelRol}
           </Contador>
-        </Link>
-      )}
+        )}
+      </DestinoDelWorkspace>
       <DestinoDelWorkspace to="/evidencia" etiqueta="Evidencia y derechos de uso" abrev="EVI" />
       <DestinoDelWorkspace to="/insights" etiqueta="Insights y citas" abrev="INS" />
       <DestinoDelWorkspace to="/journeys" etiqueta="Journeys y blueprints" abrev="JOU" />
@@ -789,6 +781,7 @@ function Contador({
 
 type RutaSinParametros =
   | '/importacion'
+  | '/aprobaciones'
   | '/evidencia'
   | '/insights'
   | '/journeys'

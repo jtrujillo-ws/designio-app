@@ -5,6 +5,7 @@ import {
   AgregarAfirmacionSchema,
   AgregarCitaSchema,
   CrearInsightSchema,
+  InsightInputSchema,
   InsightsInputSchema,
   RegistrarContradiccionSchema,
   ValidarInsightSchema,
@@ -14,6 +15,7 @@ import {
   agregarCita,
   crearInsight,
   ErrorInsight,
+  insightDelWorkspace,
   insightsCitables,
   insightsDelWorkspace,
   registrarContradiccion,
@@ -41,6 +43,20 @@ export const insightsDelEspacio = createServerFn({ method: 'GET' })
       return await insightsDelWorkspace(usuarioId, data.workspaceId, data.cursor);
     } catch (e) {
       if (e instanceof ErrorAutorizacion) return { insights: [], siguiente: null };
+      throw e;
+    }
+  });
+
+/** UN insight completo, por id: para el que se vino a ver con `destacar` y no está en la
+ * primera página. null si no existe, no es visible o la cuenta dejó de estar activa. */
+export const insightDelEspacio = createServerFn({ method: 'GET' })
+  .inputValidator(InsightInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await insightDelWorkspace(usuarioId, data.workspaceId, data.insightId);
+    } catch (e) {
+      if (e instanceof ErrorAutorizacion) return null;
       throw e;
     }
   });

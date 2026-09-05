@@ -316,58 +316,91 @@ export async function listarEvidenciaConDerechos(
 ): Promise<{ evidencias: EvidenciaConDerechos[]; hayMas: boolean }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    // El item se trae con subconsulta escalar y no con un join: `item_importacion.evidencia_id`
-    // no es único, y un join que multiplicara filas haría que `limit` contase duplicados y
-    // dejara evidencia real fuera de la página — el mismo daño que el tope duro.
-    const filas = await tx`select e.id, e.titulo, e.resumen, e.es_estado_actual, e.creado_en,
-        d.estado, d.ambito, d.base, d.vence_en::text as vence_en, d.decidido_en,
-        (select i.id from item_importacion i
-          where i.evidencia_id = e.id and i.workspace_id = e.workspace_id
-          order by i.creado_en, i.id limit 1) as item_id,
-        evidencia_usable(e.id, e.workspace_id, 'cliente') as citable,
-        evidencia_motivo_bloqueo(e.id, e.workspace_id, 'cliente') as motivo
-      from evidencia e
-      left join derecho_uso d on d.evidencia_id = e.id and d.workspace_id = e.workspace_id
-      where e.workspace_id = ${workspaceId}
-        ${antesDe
-          ? tx`and (e.creado_en, e.id) < (select e2.creado_en, e2.id from evidencia e2
-                where e2.id = ${antesDe} and e2.workspace_id = ${workspaceId})`
-          : tx``}
-      order by e.creado_en desc, e.id desc
-      limit ${PAGINA_DERECHOS + 1}`;
-
-    const pagina = filas.slice(0, PAGINA_DERECHOS);
-    const adjuntos = await archivosPorItem(
-      tx,
-      workspaceId,
-      pagina.map((f) => f.item_id as string | null).filter((id): id is string => id !== null),
-    );
-
+    const filas = await evidenciasConDerechos(tx, workspaceId, {
+      antesDe,
+      limite: PAGINA_DERECHOS + 1,
+    });
     return {
-      evidencias: pagina.map((f) => ({
-        id: f.id as string,
-        titulo: f.titulo as string,
-        resumen: f.resumen as string,
-        esEstadoActual: f.es_estado_actual as boolean,
-        creadoEn: (f.creado_en as Date).toISOString(),
-        derechos: {
-          // El backfill de la migración garantiza la fila; el fallback deja la pantalla
-          // en fail-closed si alguna vez faltara, en vez de romperse.
-          estado: (f.estado ?? 'pendiente') as EstadoDerechos,
-          ambito: (f.ambito ?? 'interno') as AmbitoUso,
-          base: (f.base ?? '') as string,
-          // Calendárica pura: viaja como texto desde la base (`::text`), nunca como
-          // instante — formatearla con huso la correría de día.
-          venceEn: (f.vence_en ?? null) as string | null,
-          decididoEn: f.decidido_en ? (f.decidido_en as Date).toISOString() : null,
-        },
-        citable: f.citable as boolean,
-        motivoBloqueo: (f.motivo ?? null) as string | null,
-        archivos: f.item_id ? (adjuntos.get(f.item_id as string) ?? []) : [],
-      })),
+      evidencias: filas.slice(0, PAGINA_DERECHOS),
       hayMas: filas.length > PAGINA_DERECHOS,
     };
   }, { aislamiento: 'repeatable read' });
+}
+
+/**
+ * UNA evidencia con sus derechos, por id: la misma proyección que la lista, para el caso en
+ * que se llega con `destacar` a una que no está en la primera página. La lista es keyset
+ * de las 50 más recientes y lo que más espera —la bandeja de aprobaciones ordena por
+ * antigüedad, el buscador no mira la fecha— cae justo fuera. Traerla aparte es lo que
+ * convierte el enlace en un enlace. null si no existe o RLS no la enseña: la pantalla no
+ * distingue los dos casos, y no debe (sería un oráculo de existencia).
+ */
+export async function evidenciaConDerechosPorId(
+  actorId: string,
+  workspaceId: string,
+  evidenciaId: string,
+): Promise<EvidenciaConDerechos | null> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const [fila] = await evidenciasConDerechos(tx, workspaceId, { soloId: evidenciaId, limite: 1 });
+    return fila ?? null;
+  }, { aislamiento: 'repeatable read' });
+}
+
+/** La proyección compartida por la lista y por la lectura por id, con sus adjuntos. */
+async function evidenciasConDerechos(
+  tx: TransactionSql,
+  workspaceId: string,
+  filtro: { antesDe?: string; soloId?: string; limite: number },
+): Promise<EvidenciaConDerechos[]> {
+  // El item se trae con subconsulta escalar y no con un join: `item_importacion.evidencia_id`
+  // no es único, y un join que multiplicara filas haría que `limit` contase duplicados y
+  // dejara evidencia real fuera de la página — el mismo daño que el tope duro.
+  const filas = await tx`select e.id, e.titulo, e.resumen, e.es_estado_actual, e.creado_en,
+      d.estado, d.ambito, d.base, d.vence_en::text as vence_en, d.decidido_en,
+      (select i.id from item_importacion i
+        where i.evidencia_id = e.id and i.workspace_id = e.workspace_id
+        order by i.creado_en, i.id limit 1) as item_id,
+      evidencia_usable(e.id, e.workspace_id, 'cliente') as citable,
+      evidencia_motivo_bloqueo(e.id, e.workspace_id, 'cliente') as motivo
+    from evidencia e
+    left join derecho_uso d on d.evidencia_id = e.id and d.workspace_id = e.workspace_id
+    where e.workspace_id = ${workspaceId}
+      ${filtro.soloId ? tx`and e.id = ${filtro.soloId}` : tx``}
+      ${filtro.antesDe
+        ? tx`and (e.creado_en, e.id) < (select e2.creado_en, e2.id from evidencia e2
+              where e2.id = ${filtro.antesDe} and e2.workspace_id = ${workspaceId})`
+        : tx``}
+    order by e.creado_en desc, e.id desc
+    limit ${filtro.limite}`;
+
+  const adjuntos = await archivosPorItem(
+    tx,
+    workspaceId,
+    filas.map((f) => f.item_id as string | null).filter((id): id is string => id !== null),
+  );
+
+  return filas.map((f) => ({
+    id: f.id as string,
+    titulo: f.titulo as string,
+    resumen: f.resumen as string,
+    esEstadoActual: f.es_estado_actual as boolean,
+    creadoEn: (f.creado_en as Date).toISOString(),
+    derechos: {
+      // El backfill de la migración garantiza la fila; el fallback deja la pantalla
+      // en fail-closed si alguna vez faltara, en vez de romperse.
+      estado: (f.estado ?? 'pendiente') as EstadoDerechos,
+      ambito: (f.ambito ?? 'interno') as AmbitoUso,
+      base: (f.base ?? '') as string,
+      // Calendárica pura: viaja como texto desde la base (`::text`), nunca como
+      // instante — formatearla con huso la correría de día.
+      venceEn: (f.vence_en ?? null) as string | null,
+      decididoEn: f.decidido_en ? (f.decidido_en as Date).toISOString() : null,
+    },
+    citable: f.citable as boolean,
+    motivoBloqueo: (f.motivo ?? null) as string | null,
+    archivos: f.item_id ? (adjuntos.get(f.item_id as string) ?? []) : [],
+  }));
 }
 
 /**

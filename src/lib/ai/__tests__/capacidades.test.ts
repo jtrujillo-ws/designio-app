@@ -75,6 +75,12 @@ describe('el registro de capacidades', () => {
       if (d.lote !== null) {
         expect(d.lote.campo.length, `${c}: lote sin campo`).toBeGreaterThan(0);
         expect(d.lote.maximo, `${c}: lote sin techo`).toBeGreaterThan(0);
+        // El suelo se declara, y puede ser CERO: lo que no puede es faltar, ni pasarse del
+        // techo, que dejaría un rango vacío y ninguna respuesta válida.
+        expect(d.lote.minimo, `${c}: lote sin suelo`).toBeGreaterThanOrEqual(0);
+        expect(d.lote.minimo, `${c}: el suelo del lote pasa de su techo`).toBeLessThanOrEqual(
+          d.lote.maximo,
+        );
       }
     }
   });
@@ -412,7 +418,13 @@ describe('el registro de capacidades', () => {
       expect(sobre, `${c}: el esquema no declara ${lote.campo}`).toBeDefined();
       expect(sobre!.type).toBe('array');
       expect(sobre!.maxItems, `${c}: el techo pedido no es el que se valida`).toBe(lote.maximo);
-      expect(sobre!.minItems).toBe(1);
+      // Y el SUELO, que es la mitad que faltaba. Estaba escrito `1` a los dos lados: correcto
+      // para C5 —se niega a llamar con cero señales, así que ninguna petición real tiene la
+      // lista vacía por respuesta— y falso para C2, cuyo prompt dice «hasta N» y prohíbe
+      // proponer lo que la evidencia no sostenga. Con el suelo en uno, una evidencia que no
+      // sostiene nada obliga al modelo a inventarse un insight, o su respuesta ya pagada se
+      // descarta como fuera de contrato por haber obedecido.
+      expect(sobre!.minItems, `${c}: el suelo pedido no es el que se valida`).toBe(lote.minimo);
     }
   });
 

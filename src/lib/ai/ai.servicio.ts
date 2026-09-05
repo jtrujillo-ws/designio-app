@@ -17,6 +17,11 @@ import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journe
 import {
   presenciaLiteralPorCita,
   materialDeGate,
+  evidenciaQueLlegoAlModelo,
+  materialDeInsights,
+  promptInsights,
+  SISTEMA_INSIGHTS,
+  type EvidenciaDelReto,
   materialDeItem,
   materialDeReto,
   MAX_MATERIAL,
@@ -32,10 +37,12 @@ import {
   SISTEMA_EXTRACCION,
   SISTEMA_REMEDIACION_JOURNEY,
   type ChecklistDelGate,
+  materialDeUnaEvidencia,
   type GrafoDelJourney,
 } from './ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
+  MAX_INSIGHTS_POR_LOTE,
   CAPACIDADES,
   CAPACIDADES_ACTIVAS,
   COLUMNAS_DE_ANCLA,
@@ -47,6 +54,7 @@ import {
   type CapacidadActiva,
   type ContenidoCriterio,
   type ContenidoExtraccion,
+  type ContenidoInsight,
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
   type EstadoAncla,
@@ -57,7 +65,13 @@ import {
   type RegistrarConsentimiento,
   type RevisarPropuesta,
 } from './ai.schemas';
-import { ESQUEMA_DE_CONTENIDO, parsearContenido } from './ai.contenido';
+import {
+  CITAS_DEL_CONTENIDO,
+  ESQUEMA_DE_CONTENIDO,
+  parsearContenido,
+  TESTIMONIO_ADICIONAL,
+  type CitaDelContenido,
+} from './ai.contenido';
 import {
   credencialesAI,
   generarConProveedor,
@@ -230,7 +244,7 @@ async function presupuestoDeHoy(
       -- que es un problema del material y no de la disponibilidad.
       (select case when u.resultado = 'sin-respuesta'
                 then (extract(epoch from (now() - coalesce(u.cerrado_en, u.creado_en)))
-                        * 1000)::bigint end
+                       * 1000)::bigint end
          from llamada_ai u
         where u.workspace_id = ${workspaceId} and u.resultado <> 'despachada'
         order by coalesce(u.cerrado_en, u.creado_en) desc, u.intento desc, u.id desc
@@ -368,10 +382,24 @@ function motivoConectividadQueNoCabe(caracteres: number): string {
  * huella que la propuesta guardó al nacer.
  *
  * `null` cuando NO SE PUEDE SABER, y no se resuelve a ninguno de los dos lados aquí: quien lo
- * lee decide qué hacer con no saber, y las dos respuestas son distintas. Para el ESTADO de la
- * fila, no saber no puede volverse «cambiado»: sería inventarse una alarma. Para la presencia
- * literal, no saber se resuelve como vigente, que es lo que hacían todas las capacidades
- * cuando ninguna guardaba huella.
+ * lee decide qué hacer con no saber, y las dos respuestas son OPUESTAS, cada una por lo que
+ * está en juego.
+ *
+ * Para el ESTADO de la fila, no saber no puede volverse «cambiado»: ese estado NOMBRA UNA
+ * CAUSA —«el grafo de ese journey cambió»— y afirmarla sin saberlo es inventarse una alarma
+ * que además culpa a quien no fue.
+ *
+ * Para la PRESENCIA LITERAL es al revés, y entenderlo costó una ronda. Aquí no se nombra
+ * ninguna causa: se contesta «¿puedo medir esto?», y la respuesta honesta a no saber es que
+ * no. Estaba resuelto como vigente apelando a que era lo que hacían todas las capacidades
+ * antes de que ninguna guardara huella, y el precedente no es un argumento: el día de un
+ * despliegue que cambie el renderizador del material, resolverlo como vigente pinta verdes y
+ * rojos calculados contra un texto que el modelo no vio, que es justo lo que toda esta
+ * maquinaria existe para no hacer. La pantalla ya sabe decir «no se puede comprobar».
+ *
+ * Y no cuesta nada donde antes valía: el CHECK exige la huella a las capacidades que la leen,
+ * así que «sin huella» ya no es alcanzable para ellas y el único `null` que queda es el de la
+ * versión — que es exactamente el caso en que no se puede medir.
  *
  * Y son DOS los casos en que no se sabe. El primero es no tener huella: una propuesta anterior
  * a la columna. El segundo es tenerla de OTRO RENDER: desde que la huella se calcula sobre el
@@ -384,7 +412,22 @@ function materialDelPanelEsElDelModelo(f: Record<string, unknown>): boolean | nu
   const guardada = f.huella_material as string | null;
   if (!guardada) return null;
   if ((f.prompt_version as string | null) !== PROMPT_VERSION) return null;
-  return huellaDelMaterialDeC5(journeyDesdeElPanel(f)) === guardada;
+  /*
+   * Contra el material de SU capacidad, no contra el de una escrita aquí. Esto nació mirando
+   * el journey de C5 porque C5 era la única que guardaba huella; C2 guarda la suya desde que
+   * la revalidación previa al despacho la necesitó, y con la comparación escrita para C5 su
+   * huella se habría contrastado contra un grafo inexistente —`journeyDesdeElPanel` sobre una
+   * fila de C2 devuelve un journey vacío— y toda propuesta de C2 se habría leído como material
+   * cambiado. Es la misma trampa que las anclas y los destinos: la parte que varía indexada
+   * por lo que varía.
+   *
+   * `material(f)` es exactamente el texto que se hasheó al preparar la llamada, porque las dos
+   * mitades salen de la misma función por capacidad. Una capacidad que guarde huella y no
+   * declare `material` no existe: `material` es obligatorio en el registro.
+   */
+  const definicion = CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva];
+  if (!definicion) return null;
+  return huellaDelMaterial(definicion.material(f)) === guardada;
 }
 
 function grafoParaElModelo(journey: JourneyCompleto): GrafoDelJourney {
@@ -460,8 +503,58 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
   reto_id: {
     join: (tx) => tx`left join reto r on r.id = p.reto_id and r.workspace_id = p.workspace_id`,
     titulo: (tx) => tx`r.codigo || ' ' || r.titulo`,
+    /*
+     * El repertorio COMPLETO del ancla, no el de una capacidad: C0 compone su material con la
+     * formulación y C2 con la formulación MÁS la evidencia. La evidencia llega al reto por sus
+     * ARQUETIPOS, que es el único camino que este esquema tiene —`evidencia` no cuelga de un
+     * reto— y por eso la consulta va por ahí y no por el workspace.
+     */
     columnas: (tx) => tx`r.codigo as reto_codigo, r.titulo as reto_titulo,
-      r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica`,
+      r.descripcion as reto_descripcion, r.metrica_objetivo as reto_metrica,
+      case when p.capacidad = 'C2' then
+        (select coalesce(json_agg(json_build_object(
+                  'id', x.id, 'titulo', x.titulo, 'resumen', x.resumen)
+                  order by x.titulo, x.id), '[]'::json)
+         from (
+           -- DISTINCT, y el mismo orden que arma el prompt. La misma evidencia puede colgar de
+           -- DOS arquetipos del mismo reto —la clave de arquetipo_evidencia es
+           -- (arquetipo_id, evidencia_id), así que nada lo impide y es lo normal cuando dos
+           -- arquetipos comparten una entrevista—, y el join la devolvía repetida: el documento
+           -- salía dos veces en el material, el recuento del alcance mentía, y el presupuesto de
+           -- caracteres se gastaba en copias hasta truncar evidencia que sí era única.
+           select distinct e.id, e.titulo, e.resumen
+           from arquetipo a
+           join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+           join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+           where a.reto_id = r.id and a.workspace_id = r.workspace_id
+             and evidencia_usable(e.id, e.workspace_id, 'cliente')) x)
+      else '[]'::json end as reto_evidencia,
+      -- Y los NOMBRES, que son otra pregunta y no admiten el mismo filtro.
+      --
+      -- Las etiquetas salían de la lista de arriba, que es la del MATERIAL y por eso está
+      -- filtrada por «evidencia_usable(…, 'cliente')». Para las citas cuadra de casualidad;
+      -- para las CONTRADICCIONES no, y ahí decía algo falso: «evidencia_citable_guard» cuelga
+      -- de «cita» y no de «contradiccion» —a propósito, porque una cita REPRODUCE un fragmento
+      -- para el cliente y una contradicción solo señala que ese documento va en contra—, así
+      -- que a una evidencia contradicha se le pueden retirar los derechos de cita y la
+      -- contradicción se sigue pudiendo materializar. Medido: la propuesta seguía
+      -- «disponible», aceptar FUNCIONABA, y la pantalla decía «ya no está» del documento que
+      -- quien revisa tenía delante y estaba a punto de sellar.
+      --
+      -- Identidad y permiso de cita son cosas distintas, así que se preguntan por separado. El
+      -- alcance sigue siendo el mismo —la evidencia de ESTE reto por sus arquetipos, dentro del
+      -- workspace y bajo las mismas políticas—: lo único que se cae es el filtro de derechos,
+      -- que aquí no pinta nada.
+      case when p.capacidad = 'C2' then
+        (select coalesce(json_agg(json_build_object('id', y.id, 'titulo', y.titulo)
+                  order by y.titulo, y.id), '[]'::json)
+         from (
+           select distinct e.id, e.titulo
+           from arquetipo a
+           join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+           join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+           where a.reto_id = r.id and a.workspace_id = r.workspace_id) y)
+      else '[]'::json end as reto_evidencia_nombres`,
   },
   gate_id: {
     // DOS joins: el gate y su proyecto. El proyecto no es adorno — es lo que distingue
@@ -566,7 +659,20 @@ function journeyDesdeElPanel(f: Record<string, unknown>): JourneyCompleto {
  * no desbloquea nada, el material equivocado marca como ausentes citas que están, y la lista
  * de candidatas esconde el ancla de una generación perfectamente válida.
  */
-type CapacidadEnElPanel = {
+/**
+ * Y las dos van JUNTAS, impuesto por el tipo: quien recorta el pajar por documento tiene que
+ * poder decir si ese recorte sigue siendo el del modelo.
+ *
+ * `pajarDeLaCita` estrecha el pajar a UN documento, y ese documento sale de las filas de HOY.
+ * Sin huella no hay forma de saber que las de hoy son las que el modelo leyó, así que el
+ * recorte se calcularía sobre un conjunto que puede haberse movido —y el verde de una cita es
+ * lo único contrastable que tiene quien revisa—. Declararlo en el tipo y no en una prueba es
+ * lo que hace que la capacidad que venga no pueda declarar solo la mitad.
+ */
+type CapacidadEnElPanel = BaseDelPanel &
+  ({ pajarDeLaCita?: undefined } | Required<Pick<BaseDelPanel, 'pajarDeLaCita' | 'materialVigente'>>);
+
+type BaseDelPanel = {
   /**
    * Qué deja la propuesta obsoleta, DADO que su capacidad es esta. Sin `case … end`: el CASE
    * exterior lo cierra con `else null`, que es lo que dice «este panel no sabe juzgar esto».
@@ -595,8 +701,13 @@ type CapacidadEnElPanel = {
    * remediaciones pueden traer el MISMO código de señal sobre nodos distintos (media docena de
    * `paso-sin-evidencia` es lo normal), y sin el nombre del nodo las tarjetas son
    * indistinguibles — `comoCerrarlo` no está obligado a repetirlo.
+   * pantalla los recibe tal cual. Un uuid no le dice nada a quien revisa, y las dos
+   * capacidades que nombran ids lo necesitan por motivos distintos: en C2 una cita declara de
+   * qué evidencia sale, y sin el nombre del documento la señal de grounding queda a medias —se
+   * ve el verde, no contra qué—; en C5 varias remediaciones pueden traer el MISMO código sobre
+   * nodos distintos, y sin el nombre del nodo las tarjetas son indistinguibles.
    *
-   * Sale de la MISMA fila que ya trae el grafo proyectado: no abre ninguna consulta nueva.
+   * Sale de la MISMA fila que ya trae el material proyectado: no abre ninguna consulta nueva.
    */
   etiquetasDelContenido?: (f: Record<string, unknown>) => Record<string, string>;
   /**
@@ -606,6 +717,23 @@ type CapacidadEnElPanel = {
    * texto crudo de la base. Una sola definición, dos usos.
    */
   material: (f: Record<string, unknown>) => string;
+  /**
+   * Y contra QUÉ TROZO de ese material se mide una cita concreta, para las capacidades cuyo
+   * material son varios documentos.
+   *
+   * CI, C0 y CT citan contra uno solo —el item, el reto, el checklist—, así que «aparece en
+   * el material» es la pregunta entera y no declaran esto. C2 cita contra la evidencia de un
+   * reto, que son varios, y cada cita nombra el suyo: midiendo contra todos juntos, una cita
+   * que dice «esto está en la evidencia B» sale PRESENTE porque su texto está en la A. Y no
+   * es un verde cualquiera: la presencia literal es la única señal contrastable que tiene
+   * quien revisa, así que un verde prestado le dice que confíe en una cita que le manda a
+   * otro documento.
+   *
+   * Devuelve `null` cuando la cita nombra algo que no está en el material — que es distinto
+   * de «no aparece» y se resuelve igual (ausente), porque una cita a un documento que el
+   * modelo no vio no está sostenida por nada.
+   */
+  pajarDeLaCita?: (f: Record<string, unknown>, cita: CitaDelContenido) => string | null;
   /**
    * Si el material que `material` recompone es TODAVÍA el que vio el modelo.
    *
@@ -745,8 +873,14 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         where r.workspace_id = ${workspaceId}
           and reto_admite_criterios(r.id, r.workspace_id)
           and not reto_criterios_congelados(r.id, r.workspace_id)
+          -- Y el trabajo pendiente que excluye a un reto es EL DE C0, no cualquiera. C2
+          -- cuelga del mismo reto y es otro pipeline: la admisión ya lo scopea por capacidad
+          -- —eso se corrigió del otro lado—, así que sin este filtro la independencia valía
+          -- en una sola dirección: con un insight esperando revisión, pedir criterios habría
+          -- funcionado si se enviaba a mano, pero el reto desaparecía del selector de C0.
           and not exists (select 1 from propuesta_ai p
-            where p.reto_id = r.id and p.workspace_id = r.workspace_id and p.estado = 'propuesta')
+            where p.reto_id = r.id and p.workspace_id = r.workspace_id
+              and p.capacidad = 'C0' and p.estado = 'propuesta')
           and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
         order by r.codigo asc, r.id asc
         limit ${limite}`;
@@ -857,11 +991,10 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
        */
       return materialDelPanelEsElDelModelo(f) === false ? 'journey-cambiado' : null;
     },
-    // La misma comparación, leída para lo otro que depende de ella: sin huella no se sabe, y
-    // no saber se resuelve como vigente —es lo que hacían todas las capacidades antes de que
-    // ninguna guardara nada—, mientras que no saber NO se resuelve como «cambiado», que sería
-    // inventarse una alarma.
-    materialVigente: (f) => materialDelPanelEsElDelModelo(f) !== false,
+    // La misma comparación, leída para lo otro que depende de ella, y resuelta AL REVÉS. Ver
+    // `materialDelPanelEsElDelModelo`: para el estado de la fila, no saber no puede volverse
+    // una alarma; para la presencia literal, no saber no puede volverse un veredicto.
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
     material: (f) => materialDeJourney({
       nombre: (f.journey_nombre as string | null) ?? '',
       servicio: (f.journey_servicio as string | null) ?? '',
@@ -959,6 +1092,177 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
       return { lista: conSenales, hayMas: conSenales.length >= limite || !agotado };
     },
   },
+  C2: {
+    /*
+     * Lo que deja obsoleto un insight propuesto es que su reto se ARCHIVE: ahí el trabajo se
+     * cerró y proponerle insights nuevos no lleva a ninguna parte.
+     *
+     * Y NADA de lo que congela a C0 aplica aquí, que es justamente lo que este registro
+     * existe para permitir: C0 y C2 cuelgan del MISMO reto y no comparten sus puertas. Un G0
+     * aprobado congela los criterios (SYS-22) y no tiene nada que decir sobre los insights;
+     * indexado por columna de ancla, C2 habría heredado sus tres motivos y su cola.
+     */
+    estado: (tx) => tx`case
+        when r.estado = 'archivado' then 'reto-archivado'
+        /*
+         * Y que la evidencia que el insight CITA siga pudiendo citarse al cliente.
+         *
+         * El derecho de uso es temporal: se retira, caduca, o el documento se va. Cuando eso
+         * pasa DESPUÉS de nacer la propuesta —el guard del insert cubre lo de antes—, el panel
+         * decía disponible y ofrecía aceptar, y aceptar falla siempre: materializarInsight
+         * inserta la cita y evidencia_citable_guard la rechaza con DR001. Quien revisa se
+         * encontraba una tarjeta aceptable que no se deja aceptar, con un código por toda
+         * explicación. Es el equivalente exacto del consentimiento-revocado de CI, con lo que
+         * C2 lee en vez de lo que lee CI.
+         *
+         * Se pregunta por la AUSENCIA de una evidencia usable y no por la presencia de una
+         * bloqueada: así el documento borrado —que también hace fallar la aceptación, por la
+         * FK— cae en la misma rama en vez de pasar por disponible.
+         *
+         * Y se compara por texto en vez de castear a uuid: el contenido es jsonb, y un
+         * evidenciaId que no parsee reventaría la consulta del panel entero en vez de marcar
+         * una fila. Mismo criterio que el estado de CT con su checklistItemId.
+         */
+        when exists (
+          select 1
+          from jsonb_path_query(
+                 p.contenido, '$.afirmaciones[*].citas[*].evidenciaId') c
+          where not exists (
+            select 1 from evidencia e
+            where e.id::text = lower(c #>> '{}') and e.workspace_id = p.workspace_id
+              and evidencia_usable(e.id, e.workspace_id, 'cliente')))
+          then 'evidencia-no-citable'
+        /*
+         * Y que el reto no haya ganado evidencia que estos insights no llegaron a ver.
+         *
+         * Es la misma clase de defecto que la rama de arriba, con la otra mitad del sello: el
+         * guard diferido rechaza la aceptación cuando el reto tiene evidencia usable que no
+         * está en «alcance_evidencia» —porque se enlazó después, o porque el recorte del
+         * material no la dejó llegar—, y sin esta rama el panel seguía diciendo «disponible» y
+         * ofreciendo un botón que siempre vuelve. Una tarjeta aceptable que no se deja aceptar
+         * es peor que una marcada: la marcada dice qué hacer.
+         *
+         * La condición es LA MISMA que la del guard, escrita igual, porque una discrepancia
+         * entre las dos devuelve exactamente el problema que esta rama quita.
+         */
+        when p.reto_id is not null and p.alcance_evidencia is not null and exists (
+          select 1
+          from arquetipo a
+          join arquetipo_evidencia ae on ae.arquetipo_id = a.id
+            and ae.workspace_id = a.workspace_id
+          where a.reto_id = p.reto_id and a.workspace_id = p.workspace_id
+            and evidencia_usable(ae.evidencia_id, ae.workspace_id, 'cliente')
+            and not (ae.evidencia_id = any (p.alcance_evidencia)))
+          then 'alcance-incompleto'
+        else 'disponible'
+      end`,
+    material: (f) =>
+      materialDeInsights({
+        codigo: (f.reto_codigo as string | null) ?? '',
+        titulo: (f.reto_titulo as string | null) ?? '',
+        descripcion: (f.reto_descripcion as string | null) ?? '',
+        evidencia: (f.reto_evidencia as EvidenciaDelReto | null) ?? [],
+      }).texto,
+    /*
+     * Y si ese material sigue siendo el que vio el modelo, contra la huella que la propuesta
+     * guardó al nacer. C2 la guarda desde que la revalidación previa al despacho la necesitó,
+     * y aquí sirve para lo otro que depende de ella.
+     *
+     * Lo que se rompe sin esto no es la aceptación —las citas siguen apuntando a evidencia
+     * real y el guard las valida—, es la SEÑAL DE GROUNDING, que es lo único contrastable que
+     * tiene quien revisa. El material de C2 son varios documentos concatenados y el recorte de
+     * `MAX_MATERIAL` es global y depende del orden: basta con que a un documento NO CITADO que
+     * ordenaba antes le caduquen los derechos, o con que se enlace uno nuevo que ordena antes,
+     * para que el trozo del documento citado que el panel recompone hoy no sea el que el
+     * modelo leyó. Y entonces el verde miente en los dos sentidos: un fragmento que el recorte
+     * de hoy acaba de dejar visible sale PRESENTE aunque el modelo no lo tuviera delante, y
+     * una cita legítima cuyo trozo el recorte de hoy esconde sale AUSENTE.
+     *
+     * Y no saber NO se resuelve como vigente: solo se mide cuando la huella dice que sí. Ver
+     * `materialDelPanelEsElDelModelo` para por qué las dos lecturas de ese mismo `null` van en
+     * direcciones opuestas.
+     */
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
+    /*
+     * Una cita de C2 se mide contra LA EVIDENCIA QUE NOMBRA, no contra todas juntas.
+     *
+     * El material de C2 son varios documentos y cada cita dice de cuál sale. Con el pajar
+     * completo, «el 71% de los abandonos, en la evidencia B» salía presente porque ese texto
+     * está en la A: un verde que le dice a quien revisa que confíe en una cita que le manda a
+     * otro documento, y la presencia literal es justo lo único que puede contrastar.
+     *
+     * Se compone con la MISMA función que arma el prompt, sobre esa sola evidencia: lo que se
+     * compara tiene que ser el texto que el modelo leyó de ella, con su ficha y su delimitador
+     * neutralizado, no el crudo de la base.
+     *
+     * Y si la cita nombra una evidencia que no está en el material, `null`: no es lo mismo que
+     * «no aparece», pero se resuelve igual —ausente—, porque una cita a un documento que el
+     * modelo no vio no la sostiene nada.
+     */
+    /**
+     * El título de cada evidencia, para que una cita —o una contradicción— diga de QUÉ
+     * documento habla. Sale de la lista de NOMBRES, no de la del material: los derechos de
+     * cita no gobiernan la identidad de un documento, y una contradicción no los necesita.
+     */
+    etiquetasDelContenido: (f) =>
+      Object.fromEntries(
+        ((f.reto_evidencia_nombres as { id: string; titulo: string }[] | null) ?? []).map((e) => [
+          e.id,
+          e.titulo,
+        ]),
+      ),
+    pajarDeLaCita: (f, cita) => {
+      const evidencia = (f.reto_evidencia as EvidenciaDelReto | null) ?? [];
+      if (cita.alcanceId === undefined) return null;
+      // SOLO ese documento, y el trozo de él que SOBREVIVIÓ al recorte del cuerpo entero. Las
+      // dos mitades importan y las dos costaron una ronda: componerlo con `materialDeInsights`
+      // metía delante la formulación del reto, y recomponer la línea aparte reiniciaba el
+      // presupuesto de caracteres y devolvía texto que el modelo nunca vio.
+      const tramo = materialDeUnaEvidencia(
+        {
+          codigo: (f.reto_codigo as string | null) ?? '',
+          titulo: (f.reto_titulo as string | null) ?? '',
+          descripcion: (f.reto_descripcion as string | null) ?? '',
+          evidencia,
+        },
+        cita.alcanceId,
+      );
+      // Tramo vacío es «esa evidencia no está en el material» —le retiraron los derechos, se
+      // desenlazó, o el recorte no llegó a ella—, y eso es `null` y no `''`: son las dos
+      // respuestas que este contrato distingue, y quien lo lee las trata distinto. Devolver
+      // `''` funcionaba por accidente —buscar en la cadena vacía da ausente— y dejaba viva la
+      // única forma de perderlo: que alguien resuelva el `null` con el material entero.
+      return tramo === '' ? null : tramo;
+    },
+    /*
+     * Retos CON EVIDENCIA y sin insights esperando revisión. Lo primero no es un filtro de
+     * comodidad: sin evidencia, la única salida que cumple el contrato —afirmaciones con
+     * citas literales— sale de la formulación del reto, o sea inventada. Es el mismo caso que
+     * el item importado solo con su referencia, y la respuesta es la misma: no ofrecerlo.
+     */
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select r.id, r.codigo || ' ' || r.titulo as titulo from reto r
+        where r.workspace_id = ${workspaceId}
+          and r.estado <> 'archivado'
+          and exists (
+            select 1 from arquetipo a
+            join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+            join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+            where a.reto_id = r.id and a.workspace_id = r.workspace_id
+              and evidencia_usable(e.id, e.workspace_id, 'cliente'))
+          and not exists (select 1 from propuesta_ai p
+            where p.reto_id = r.id and p.workspace_id = r.workspace_id
+              and p.capacidad = 'C2' and p.estado = 'propuesta')
+          and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
+        order by r.codigo asc, r.id asc
+        limit ${limite}`;
+      return {
+        lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
+        hayMas: false,
+      };
+    },
+  },
 };
 
 /**
@@ -1039,14 +1343,32 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   // ausentes estando presentes.
   const material = definicionDeFila(f)?.material(f) ?? '';
   const columna = columnaDelAncla(f);
-  // Las presencias se resuelven de una vez para toda la fila: el pajar es el mismo para
-  // todas sus citas, y normalizarlo por cita multiplicaba el trabajo por seis sin cambiar
-  // ninguna respuesta.
-  //
   // Las citas se leen del ORIGINAL: son el testimonio del modelo sobre lo que leyó, no del
   // humano que corrige. Hoy son siempre las mismas —corregirlas está prohibido en el
   // servicio y en el guard— y leerlas de aquí lo deja dicho en la proyección también.
-  const citas = 'citas' in original ? original.citas : [];
+  // Por CAPACIDAD, no por la forma del objeto: las de C2 viven dentro de cada afirmación, y
+  // con `'citas' in original` su grounding se habría medido sobre una lista vacía — o sea, no
+  // se habría medido, que es el peor resultado posible para una medida de grounding.
+  /*
+   * Y degradando si la capacidad no está en el registro. `f.capacidad` son las diez de
+   * SPEC-08 y el registro cubre las ACTIVAS, así que la indexación puede devolver `undefined`
+   * de verdad: una fila escrita por una versión más nueva del servidor, o una capacidad que
+   * vuelve a apagarse dejando propuestas pendientes. Llamar a `undefined` aquí no degradaba la
+   * fila, tiraba el panel entero — y con él las filas de todas las demás capacidades.
+   *
+   * Sin citas es lo correcto y no un apaño: si nadie sabe dónde las guarda esa capacidad, no
+   * hay nada que medir, y decir «cero citas» es más honesto que inventarse dónde buscarlas.
+   */
+  const definicion = CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva] as
+    | CapacidadEnElPanel
+    | undefined;
+  const citas = CITAS_DEL_CONTENIDO[f.capacidad as CapacidadActiva]?.(original) ?? [];
+  /*
+   * La presencia, CITA A CITA, contra el trozo de material que cada una nombra cuando su
+   * capacidad lo declara. Antes se resolvía de una vez para toda la fila porque «el pajar es
+   * el mismo para todas sus citas», y eso dejó de ser cierto con C2: su material son varios
+   * documentos y cada cita dice de cuál sale.
+   */
   /*
    * Y si el material que se acaba de recomponer YA NO es el que vio el modelo, no hay
    * veredicto que dar. Medir contra el estado de hoy pinta en verde un fragmento que una
@@ -1056,10 +1378,27 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
    * Lo contesta la CAPACIDAD, porque solo ella sabe si guardó algo con qué comparar. Las que
    * no lo declaran siguen midiendo como siempre.
    */
-  const vigente = definicionDeFila(f)?.materialVigente?.(f) ?? true;
-  const presencias = vigente
-    ? presenciaLiteralPorCita(material, citas)
-    : citas.map(() => null);
+  const vigente = definicion?.materialVigente?.(f) ?? true;
+  /*
+   * La presencia, CITA A CITA, contra el trozo de material que cada una nombra cuando su
+   * capacidad lo declara. Antes se resolvía de una vez para toda la fila porque «el pajar es
+   * el mismo para todas sus citas», y eso dejó de ser cierto con C2: su material son varios
+   * documentos y cada cita dice de cuál sale.
+   */
+  const presencias = citas.map((c) => {
+    if (!vigente) return null;
+    /*
+     * `undefined` y `null` NO son lo mismo aquí, y colapsarlos con un `??` devolvía el verde
+     * prestado que `pajarDeLaCita` existe para quitar. `undefined` es «esta capacidad no
+     * declara pajar», y su respuesta es el material entero —CI, C0 y CT citan contra uno
+     * solo—. `null` es «la cita nombra un trozo que no está en el material», y su respuesta
+     * es la cadena vacía: ausente. Con `?? material`, esa cita a un documento que el modelo
+     * no vio se medía contra TODOS los demás y salía presente si el texto estaba en
+     * cualquiera de ellos.
+     */
+    if (!definicion?.pajarDeLaCita) return presenciaLiteralPorCita(material ?? '', [c])[0]!;
+    return presenciaLiteralPorCita(definicion.pajarDeLaCita(f, c) ?? '', [c])[0]!;
+  });
   return {
     id: f.id as string,
     capacidad: f.capacidad as PropuestaEnPanel['capacidad'],
@@ -1074,12 +1413,15 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     citas: citas.map((c, i) => ({
       fragmento: c.fragmento,
       localizacion: c.localizacion,
+      // A qué documento dice señalar, cuando su capacidad lo dice. Sin esto, quien revisa ve
+      // el fragmento y su verde pero no CONTRA QUÉ se midió, que es la mitad de la señal.
+      alcanceId: c.alcanceId ?? null,
       presenteLiteral: presencias[i]!,
     })),
     anclaTitulo: (f.ancla_titulo as string | null) ?? '',
     // Cómo se llaman los ids que el contenido nombra, cuando su capacidad lo sabe. Vacío es la
     // respuesta correcta de las que no nombran ninguno, no un hueco.
-    etiquetas: definicionDeFila(f)?.etiquetasDelContenido?.(f) ?? {},
+    etiquetas: definicion?.etiquetasDelContenido?.(f) ?? {},
     /*
      * El ancla sale de TODAS las columnas declaradas, no de una pareja escrita aquí. Con
      * `f.item_id ?? f.reto_id`, una capacidad anclada en otra cosa aparecía en el panel con
@@ -1361,6 +1703,8 @@ type Alcance = {
   unidades: number;
   /** La huella del material que `PREPARAR` le enseñó al modelo. Ver `Preparacion`. */
   huellaMaterial?: string;
+  /** Los ids de la evidencia de ese material. Ver `Preparacion`. */
+  evidenciaDelMaterial?: string[];
 };
 
 /**
@@ -1404,7 +1748,8 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     const consentimiento = exigeConsentimiento
       ? await leerConsentimientoBajoCandado(tx, entrada)
       : null;
-    const { sistema, prompt, huellaMaterial } = await PREPARAR[entrada.capacidad](tx, entrada);
+    const { sistema, prompt, huellaMaterial, evidenciaDelMaterial } =
+      await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
       throw new ErrorAI(MOTIVO_SIN_CONSENTIMIENTO['antes-de-preparar']);
     }
@@ -1417,15 +1762,22 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       where workspace_id = ${entrada.workspaceId}
         and creado_en <= now() - reserva_ai_ventana()`;
 
-    // Exclusión por ANCLA, no solo por item: dos curadores no pueden tener a la vez una
-    // generación en vuelo sobre el mismo objeto. Para C0 esto faltaba —la reserva no
-    // guardaba el reto, así que no excluía nada— y dos lotes podían despacharse a la vez
-    // sobre el mismo reto: se pagaba dos veces y quedaban dos lotes pendientes sobre un
-    // ancla que la pantalla ofrece una sola vez. Los dos caminos toman el MISMO candado
-    // (el del presupuesto del workspace) antes de mirar, que es lo que hace que mirar sirva.
+    // Exclusión por (CAPACIDAD, ANCLA): dos curadores no pueden tener a la vez una generación
+    // en vuelo sobre el mismo trabajo. Para C0 esto faltaba —la reserva no guardaba el reto,
+    // así que no excluía nada— y dos lotes podían despacharse a la vez sobre el mismo reto: se
+    // pagaba dos veces y quedaban dos lotes pendientes sobre un ancla que la pantalla ofrece
+    // una sola vez. Los dos caminos toman el MISMO candado (el del presupuesto del workspace)
+    // antes de mirar, que es lo que hace que mirar sirva.
+    //
+    // Y la capacidad entra en la clave desde que dos de ellas comparten el reto: sin ella, una
+    // generación de C0 en vuelo impedía pedir insights del mismo reto —y al revés—, que es
+    // decir que pedir criterios y pedir insights son el mismo trabajo. No lo son: son
+    // pipelines independientes con sus propias puertas, y la cola del panel ya los ofrece por
+    // separado. La misma corrección va en los índices que lo imponen.
     const ancla = CAPACIDADES[entrada.capacidad].ancla;
     const [enCurso] = await tx`select 1 as hay from reserva_ai
-      where workspace_id = ${entrada.workspaceId} and ${tx(ancla.columna)} = ${entrada.anclaId}`;
+      where workspace_id = ${entrada.workspaceId} and capacidad = ${entrada.capacidad}
+        and ${tx(ancla.columna)} = ${entrada.anclaId}`;
     if (enCurso) throw new ErrorAI(ancla.enCurso);
 
     // «Este ancla ya tiene trabajo esperando revisión» se pregunta AQUÍ, bajo el mismo
@@ -1439,7 +1791,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
     // donde se decide.
     const [pendiente] = await tx`select 1 as hay from propuesta_ai
       where ${tx(ancla.columna)} = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
-        and estado = 'propuesta' limit 1`;
+        and capacidad = ${entrada.capacidad} and estado = 'propuesta' limit 1`;
     if (pendiente) throw new ErrorAI(ancla.pendiente);
 
     const { atendidas, reservadas, limiteDiario, ultimaCaidaHaceMs } = await presupuestoDeHoy(
@@ -1492,6 +1844,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       reservaId: reserva!.id as string,
       unidades,
       huellaMaterial,
+      evidenciaDelMaterial,
     };
   });
 }
@@ -1796,7 +2149,7 @@ function contenidosValidos(capacidad: CapacidadActiva, datos: unknown): Contenid
   // es lo mismo que un lote de uno, y por eso se declara en vez de deducirse de la forma.
   if (lote === null) return [contenido.parse(datos)];
   const sobre = (datos ?? {}) as Record<string, unknown>;
-  return contenido.array().min(1).max(lote.maximo).parse(sobre[lote.campo]);
+  return contenido.array().min(lote.minimo).max(lote.maximo).parse(sobre[lote.campo]);
 }
 
 /**
@@ -2024,6 +2377,106 @@ function anclasDelInsert(
  * `Record<CapacidadActiva, …>` hace que el compilador exija la entrada de toda capacidad
  * nueva, que es la diferencia entre declarar y ramificar.
  */
+/**
+ * El material de C2, leído y resumido en su huella, con los CANDADOS que hacen de eso una
+ * garantía y no una foto. Una sola redacción porque la miran TRES sitios —preparar, revalidar
+ * antes de despachar y comprobar antes de persistir— y este PR ya lleva varias rondas cuyo
+ * hallazgo era «dos redacciones hermanas del mismo protocolo divergieron».
+ *
+ * Los candados, en el orden del sistema:
+ *   · `designio:workspace:` en compartido, que es el que toma el guard de congelación en toda
+ *     escritura y por tanto el primero del par. Aquí no hace falta para nada más: va delante
+ *     para no crear un segundo orden.
+ *   · `designio:reto:` por CLAVE, que es lo único que cubre una evidencia enlazada EN VUELO —
+ *     `for share` bloquea filas que existen, y un enlace sin commitear no está en ninguna—.
+ *   · `for share` sobre la fila del reto y sobre los `derecho_uso` de su evidencia, que es lo
+ *     que ordena las revocaciones y los archivados ya commiteados.
+ */
+async function huellaDelMaterialDeInsights(
+  tx: TransactionSql,
+  entrada: GenerarPropuestas,
+): Promise<{
+  huella: string;
+  reto: { codigo: string; titulo: string; descripcion: string } | null;
+  /** El título del primer documento del reto cuyo derecho de cita NO aguanta hasta el sello —vence
+   * hoy o antes—, o `null` si ninguno. Ver la nota del calendario. */
+  caducada: string | null;
+}> {
+  await tx`select pg_advisory_xact_lock_shared(
+    hashtextextended('designio:workspace:' || ${entrada.workspaceId}, 42))`;
+  await tx`select pg_advisory_xact_lock(
+    hashtextextended('designio:reto:' || ${entrada.anclaId}, 42))`;
+  await tx`select 1 from reto
+    where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}
+    for share`;
+  const [reto] = await tx`select estado = 'archivado' as archivado, codigo, titulo, descripcion
+    from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+  if (!reto || (reto.archivado as boolean)) return { huella: '', reto: null, caducada: null };
+  await tx`select du.evidencia_id
+    from derecho_uso du
+    where du.workspace_id = ${entrada.workspaceId}
+      and du.evidencia_id in (
+        select ae.evidencia_id
+        from arquetipo a
+        join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+        where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId})
+    order by du.evidencia_id
+    for share`;
+  const evidencia = await tx`select distinct e.id, e.titulo, e.resumen
+    from arquetipo a
+    join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+    join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+    where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
+      and evidencia_usable(e.id, e.workspace_id, 'cliente')
+    order by e.titulo asc, e.id asc`;
+  /*
+   * Y el CALENDARIO, que es lo único de aquí que avanza SIN TOMAR NINGÚN CANDADO.
+   *
+   * Todo lo demás que puede invalidar el material —una revocación, un desenlace, un archivado—
+   * lo escribe alguien, y por eso los candados de arriba lo ordenan. La caducidad llega sola.
+   * `evidencia_usable` la mide con `current_date`, que es la fecha de INICIO de la transacción
+   * y no avanza aunque la transacción espere (medido: tras dos segundos, `now()` y
+   * `current_date` intactos, `clock_timestamp()` movido). Una transacción que empieza a las
+   * 23:59 y despacha pasada la medianoche manda un documento cuyo permiso ya expiró.
+   *
+   * El margen NO es de medianoche: se pregunta por el día ENTERO. Un permiso que vence HOY no
+   * llega vivo al final del camino —entre esta llamada y el sello hay un commit, la respuesta
+   * del proveedor y una revisión humana, que no ocurre en el mismo minuto—, así que mañana la
+   * aceptación fallaría con DR001 y quedaría una propuesta pagada, revisada y solo tirable. Con
+   * el último día ya fuera, además, no queda medianoche que cruzar.
+   *
+   * La pregunta la contesta la BASE y no esta plantilla: el calendario de las garantías lo fija
+   * ella (20260904220000), y preguntarlo desde aquí lo dejaría dependiendo del huso de quien
+   * llama. Hay un censo que lo vigila, y cazó la primera versión de esto.
+   *
+   * `evidencia_usable` no se toca: es LA definición de «se puede usar», es STABLE a propósito
+   * —las políticas de RLS la usan así— y para leer o citar hoy sigue siendo la correcta. Esto
+   * es una pregunta distinta y más estricta, y solo puede errar en la dirección de no gastar.
+   */
+  const [caducada] = await tx`select derecho_del_reto_que_vence_ya(
+    ${entrada.anclaId}, ${entrada.workspaceId}) as titulo`;
+  return {
+    caducada: (caducada?.titulo as string | undefined) ?? null,
+    huella: huellaDelMaterial(
+      materialDeInsights({
+        codigo: reto.codigo as string,
+        titulo: reto.titulo as string,
+        descripcion: reto.descripcion as string,
+        evidencia: evidencia.map((e) => ({
+          id: e.id as string,
+          titulo: e.titulo as string,
+          resumen: e.resumen as string,
+        })),
+      }).texto,
+    ),
+    reto: {
+      codigo: reto.codigo as string,
+      titulo: reto.titulo as string,
+      descripcion: reto.descripcion as string,
+    },
+  };
+}
+
 const REVALIDAR: Record<
   CapacidadActiva,
   (
@@ -2070,6 +2523,41 @@ const REVALIDAR: Record<
     if (!gate || gate.ya_decidido) {
       throw new ErrorAI(
         'Ese gate ya se decidió mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+  },
+  C2: async (tx, entrada, huellaMaterial) => {
+    /*
+     * Dos preguntas, y las dos con la lectura que hace `huellaDelMaterialDeInsights`: bajo los
+     * candados del sistema (workspace, reto por clave, y `for share` sobre el reto y sus
+     * derechos), porque cada una de ellas la puso aquí un caso medido y no una precaución.
+     *
+     * 1. Que el reto NO se haya archivado: el insight nacería sobre un trabajo cerrado, y se
+     *    pagaría el análisis de algo que este mismo camino declara terminado.
+     * 2. Que el MATERIAL siga siendo el que se armó — no «que quede alguna evidencia
+     *    utilizable». Aquí hubo un `exists (… evidencia_usable …)`, y esa pregunta pasa aunque
+     *    la evidencia a la que acaban de revocarle los derechos sea justo una de las que el
+     *    prompt YA LLEVA DENTRO. Preguntar por el conjunto entero es lo que corresponde a lo
+     *    que se va a mandar, y de paso cubre lo demás que puede haber cambiado: una evidencia
+     *    desenlazada, otra nueva, un resumen editado, la formulación del reto.
+     */
+    const { huella, reto, caducada } = await huellaDelMaterialDeInsights(tx, entrada);
+    if (!reto) {
+      throw new ErrorAI(
+        'Ese reto se archivó mientras se preparaba la llamada: no se llamó al proveedor',
+      );
+    }
+    // Con su propio mensaje y no dentro del de la huella: la caducidad no la provocó nadie, así
+    // que «se revocaron derechos, se desenlazó o se editó» mandaría a buscar a un culpable que
+    // no existe. Y la salida es otra: renovar el permiso, no volver a pedirlo tal cual.
+    if (caducada !== null) {
+      throw new ErrorAI(
+        `El derecho de cita de «${caducada}» vence hoy: no se llamó al proveedor, porque unos insights que se revisan mañana ya no se podrían aceptar. Renueva el permiso —o desenlaza ese documento del reto— y vuelve a pedirlo.`,
+      );
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'La evidencia de ese reto cambió mientras se preparaba la llamada —se revocaron derechos, se desenlazó o se editó—, así que el material ya no es el que se iba a mandar: no se llamó al proveedor. Vuelve a pedirlo.',
       );
     }
   },
@@ -2138,14 +2626,23 @@ type Preparacion = {
    * contenido habla del estado que el modelo tuvo delante, que es otra pregunta y la que
    * importa.
    *
-   * Es una cadena y no un objeto porque eso es lo que resultó ser, y porque así se puede
-   * GUARDAR: una vez escrita en `propuesta_ai.huella_material`, la misma comparación sirve
-   * meses después para decirle a quien revisa que el material cambió desde que se pidió.
-   *
-   * `undefined` en las capacidades que no la declaran: hoy, todas menos C5. Y no es un hueco
-   * —es que su material no se puede recomponer barato en cada pintada del panel—.
+   * Y ya antes del despacho: entre `PREPARAR` y `comprobarDespacho` hay un commit, y lo que
+   * hay que comprobar allí es que el material SIGA SIENDO EL QUE SE ARMÓ. Eso no lo dice
+   * ningún `exists`: preguntar «¿queda alguna evidencia utilizable?» pasa aunque la que se
+   * revocó sea justo una de las que ya están dentro del prompt construido.
    */
   huellaMaterial?: string;
+  /**
+   * Los ids de la evidencia que compuso ese material, para las capacidades que la tienen.
+   *
+   * Es la MISMA pregunta que la huella, escrita de una forma que la BASE puede volver a
+   * hacerse. La huella es de un texto —con su formato y su recorte— y no hay SQL que lo
+   * reconstruya; el conjunto de ids sí, y es justo lo que hace falta en el último instante:
+   * si al aceptar hay evidencia del reto que NO estaba aquí, el insight se selló sin haberla
+   * visto, y en C2 esa evidencia puede ser la que lo contradice. Por eso viaja hasta la fila
+   * y se guarda: el guard diferido no puede llamar a TypeScript.
+   */
+  evidenciaDelMaterial?: string[];
 };
 const PREPARAR: Record<
   CapacidadActiva,
@@ -2262,6 +2759,93 @@ const PREPARAR: Record<
       }),
     };
   },
+  C2: async (tx, entrada) => {
+    const [reto] = await tx`select codigo, titulo, descripcion, estado
+      from reto where id = ${entrada.anclaId} and workspace_id = ${entrada.workspaceId}`;
+    if (!reto) throw new ErrorAI('El reto no existe en este workspace');
+    if ((reto.estado as string) === 'archivado') {
+      throw new ErrorAI('Ese reto está archivado: su trabajo se cerró y no admite insights nuevos');
+    }
+    /*
+     * La evidencia del reto, por el ÚNICO camino que este esquema tiene: `evidencia` no cuelga
+     * de un reto, cuelga del workspace, y lo que la ata a uno son sus ARQUETIPOS. Y solo la
+     * CITABLE: `evidencia_citable_guard` exige derechos vigentes de ámbito cliente para
+     * escribir una `cita`, así que enseñarle al modelo un documento sin ellos es pedirle que
+     * cite lo que la aceptación va a rechazar — después de pagar la llamada Y de que alguien
+     * la revise, dejando una propuesta que solo se puede tirar. El mismo predicado que impone
+     * la escritura, aplicado antes de gastar. Va en los CUATRO sitios que miran esa evidencia
+     * (la cola, la revalidación, este prompt y la proyección del panel), porque una lista que
+     * discrepe de otra es exactamente lo que reabre el hueco.
+     *
+     * La misma consulta que proyecta el panel, para que el material contra el que se mide la presencia
+     * literal sea el que el modelo leyó. «La misma» incluye el DISTINCT y el desempate del
+     * orden: una evidencia puede colgar de dos arquetipos del mismo reto, y si una de las dos
+     * consultas la trae repetida y la otra no, el pajar contra el que se mide una cita deja de
+     * ser el texto que el modelo tuvo delante.
+     */
+    const evidencia = await tx`select distinct e.id, e.titulo, e.resumen
+      from arquetipo a
+      join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+      join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+      where a.reto_id = ${entrada.anclaId} and a.workspace_id = ${entrada.workspaceId}
+        and evidencia_usable(e.id, e.workspace_id, 'cliente')
+      order by e.titulo asc, e.id asc`;
+    /*
+     * Sin evidencia no se llama. El contrato de C2 obliga a que cada afirmación cite un
+     * fragmento literal, y sin evidencia la única salida que lo cumple sale de la formulación
+     * del reto —o sea inventada, con aspecto de fundamentada y pagada—. Es el mismo caso que
+     * el item importado solo con su referencia, y la respuesta es la misma.
+     *
+     * Y el mensaje dice DÓNDE se enlaza, porque el camino no es obvio: la evidencia llega a un
+     * reto por sus arquetipos, no directamente.
+     */
+    if (evidencia.length === 0) {
+      throw new ErrorAI(
+        'Ese reto no tiene evidencia CITABLE: no hay nada que citar. La evidencia llega a un reto por sus ARQUETIPOS, y además tiene que tener derechos de uso vigentes para ámbito cliente (SPEC-03) — comprueba las dos cosas y vuelve a pedirlo.',
+      );
+    }
+    const material = {
+      codigo: reto.codigo as string,
+      titulo: reto.titulo as string,
+      descripcion: reto.descripcion as string,
+      evidencia: evidencia.map((e) => ({
+        id: e.id as string,
+        titulo: e.titulo as string,
+        resumen: e.resumen as string,
+      })),
+    };
+    /*
+     * Y qué evidencia LLEGÓ, que no es la misma pregunta que cuál se consultó para armarla. El
+     * cuerpo es la concatenación de todos los documentos y se recorta ENTERO a `MAX_MATERIAL`,
+     * así que con bastante evidencia enlazada la cola se queda fuera —el documento donde cae el
+     * corte, a medias; los siguientes, del todo—.
+     *
+     * El recorte NO es un error: el prompt se lo dice al modelo («no afirmes nada sobre lo que
+     * no ves») y el panel mide cada cita contra el trozo que sobrevivió. Lo que no puede pasar
+     * es que el ALCANCE mienta: `alcance_evidencia` es lo que el guard diferido compara al
+     * aceptar con la evidencia que el reto tiene, y apuntar ahí todo lo consultado da por
+     * vistos documentos que nadie enseñó — sellando unos insights que no pudieron encontrar la
+     * contradicción que estaba justo en el trozo cortado. Con el alcance honesto, la propuesta
+     * se genera y se revisa igual, y lo que el suelo impide es SELLARLA mientras el reto siga
+     * teniendo evidencia que ella no vio.
+     */
+    const llegado = evidenciaQueLlegoAlModelo(material);
+    return {
+      sistema: SISTEMA_INSIGHTS,
+      prompt: promptInsights({ ...material, cuantos: MAX_INSIGHTS_POR_LOTE }),
+      /*
+       * La huella de ESTE material, para volver a mirarla justo antes de despachar. Entre esta
+       * transacción y aquella hay un commit, y lo que puede pasar en medio no es solo que el
+       * reto se archive: que a UNA de las evidencias que el prompt ya lleva dentro le revoquen
+       * los derechos, y el bloque está armado y saldría igual hacia el proveedor.
+       */
+      huellaMaterial: huellaDelMaterial(materialDeInsights(material).texto),
+      // Lo que el modelo tuvo delante, para que el suelo pueda volver a preguntarlo. Sale de
+      // `material` y no de otra lectura: dos consultas para el mismo conjunto es cómo
+      // empiezan las discrepancias que este PR ya ha corregido varias veces.
+      evidenciaDelMaterial: llegado.ids,
+    };
+  },
   C5: async (tx, entrada) => {
     // El MISMO lector que usa la pantalla del journey, no una consulta paralela: lo que se
     // le enseña al modelo y lo que la validación evalúa tienen que salir de la misma
@@ -2336,6 +2920,13 @@ const PREPARAR: Record<
   },
 };
 
+/** La huella de un material, para comparar si sigue siendo el mismo entre dos transacciones.
+ * No hace falta que sea criptográfica —solo se compara consigo misma dentro de una
+ * generación— pero sale gratis y ahorra razonar sobre colisiones. */
+function huellaDelMaterial(texto: string): string {
+  return createHash('sha256').update(texto).digest('hex');
+}
+
 /**
  * Lo que cada capacidad comprueba de la salida DEL MODELO contra el estado del workspace,
  * ya dentro de la transacción que la va a persistir.
@@ -2365,6 +2956,44 @@ const COMPROBAR: Record<
   C0: async () => {},
   // Los huecos de CT los comprueba un trigger, que es un suelo más bajo que éste.
   CT: async () => {},
+  /*
+   * C2 SÍ, y lo que estaba escrito aquí antes era falso donde más importa. Decía que no había
+   * nada que contrastar porque «la evidencia citada es del reto, sus derechos siguen vigentes,
+   * y la materialización compara la descendencia entera contra lo propuesto». Las tres cosas
+   * son ciertas y ninguna cubre esto: todas miran lo que la respuesta SÍ citó. Lo que no se
+   * miraba es lo que la respuesta NO PUDO citar.
+   *
+   * La llamada al proveedor ocurre fuera de toda transacción —a propósito: un tercero lento no
+   * retiene una conexión—, y el candado previo al despacho se suelta al commitear el apunte.
+   * En ese hueco se puede enlazar evidencia nueva al reto. La propuesta vuelve, se persiste y
+   * se acepta sin haber visto ese documento — y en C2 el documento que llega tarde puede ser
+   * justo el que CONTRADICE el insight, que es lo que I4 existe para no dejar esconder.
+   *
+   * Es exactamente lo que C5 hace dos entradas más abajo con su grafo, y con el mismo canal:
+   * `huellaMaterial` se construyó compartido en este PR para esto. Que una de las dos lo usara
+   * y la otra no era la divergencia entre hermanos que este PR ya ha corregido varias veces.
+   *
+   * La comparación va bajo los mismos candados que la de antes del despacho —`huellaDelMaterialDeInsights`—
+   * y dentro de la transacción que escribe, que es lo que la hace atómica con la fila.
+   */
+  C2: async (tx, entrada, _contenidos, huellaMaterial) => {
+    const { huella, reto, caducada } = await huellaDelMaterialDeInsights(tx, entrada);
+    if (!reto) {
+      throw new ErrorAI(
+        'Ese reto se archivó mientras el proveedor respondía: la propuesta no se guarda',
+      );
+    }
+    if (caducada !== null) {
+      throw new ErrorAI(
+        `El derecho de cita de «${caducada}» vence hoy: la propuesta no se guarda, porque sus citas ya no se podrían aceptar al revisarla. Renueva el permiso —o desenlaza ese documento del reto— y vuelve a pedirla.`,
+      );
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        'La evidencia de ese reto cambió mientras el proveedor respondía —se enlazó, se desenlazó, se revocaron derechos o se editó—, así que estos insights se armaron sin verla: la propuesta no se guarda. Vuelve a pedirla.',
+      );
+    }
+  },
   C5: async (tx, entrada, contenidos, huellaMaterial) => {
     const journey = await leerJourneyCompleto(tx, entrada.workspaceId, entrada.anclaId);
     if (!journey) throw new ErrorAI('El journey dejó de existir mientras se generaba el informe');
@@ -2445,13 +3074,14 @@ const COMPROBAR: Record<
  * sale gratis y ahorra razonar sobre colisiones.
  */
 function huellaDelMaterialDeC5(journey: JourneyCompleto): string {
-  const material = materialDeJourney({
-    nombre: journey.nombre,
-    servicio: journey.servicioNombre,
-    tipo: journey.tipo,
-    grafo: grafoParaElModelo(journey),
-  });
-  return createHash('sha256').update(material.texto).digest('hex');
+  return huellaDelMaterial(
+    materialDeJourney({
+      nombre: journey.nombre,
+      servicio: journey.servicioNombre,
+      tipo: journey.tipo,
+      grafo: grafoParaElModelo(journey),
+    }).texto,
+  );
 }
 
 /** La clave de una señal —su nodo y su código— en orden estable, para poder comparar dos
@@ -2678,7 +3308,8 @@ async function persistirPropuestas(
       const filas = await tx`
       insert into propuesta_ai
         (workspace_id, capacidad, destino, ${anclas.columnas}, contenido, contenido_original,
-         confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+         confianza, modelo, prompt_version, alcance_resumen, huella_material,
+         alcance_evidencia, origen_key,
          llamada_id, orden, es_simulacion, creado_por)
       select ${entrada.workspaceId}, ${entrada.capacidad}, ${destino}, ${anclas.valores},
              c.contenido, c.contenido,
@@ -2695,6 +3326,10 @@ async function persistirPropuestas(
              -- declaran. Se escribe al nacer y no se toca: un valor reescribible después no
              -- diría nada sobre lo que se leyó.
              ${alcance.huellaMaterial ?? null},
+             -- Y el CONJUNTO de evidencia de ese material, que es la misma pregunta escrita
+             -- de una forma que el suelo puede volver a hacerse: la huella es de un texto
+             -- con formato y recorte, y no hay SQL que lo reconstruya. Ver «Preparacion».
+             ${alcance.evidenciaDelMaterial ?? null},
              ${alcance.origenKey}, ${llamada.id},
              -- El puesto en el lote sale de la MISMA sentencia que inserta (with
              -- ordinality, que numera desde 1, de ahi el -1) y no de un contador aparte
@@ -3080,13 +3715,35 @@ async function aceptarPropuestaEnTransaccion(
       // tercera que ordene distinto —`pagina`, por ejemplo— toda corrección se rechazaría con
       // «las citas no se corrigen» aunque fueran idénticas. El guard de la base compara
       // `jsonb`, que es insensible al orden, así que el suelo y el servicio discreparían.
+      // DÓNDE están las citas lo dice la capacidad, no la forma del objeto. Leerlas como
+      // `contenido.citas` funcionaba con tres capacidades que las tenían al final; con las de
+      // C2 dentro de cada afirmación, esa lectura habría dado `undefined` en los dos lados y
+      // la regla habría pasado EN VACÍO, dejando editables justo las citas que no se tocan.
       if (
-        canonico((contenido as ContenidoPropuesta).citas) !==
-        canonico((p.contenidoOriginal as ContenidoPropuesta).citas)
+        canonico(CITAS_DEL_CONTENIDO[p.capacidad](contenido)) !==
+        canonico(CITAS_DEL_CONTENIDO[p.capacidad](p.contenidoOriginal))
       ) {
         throw new ErrorAI(
           'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',
         );
+      }
+      /*
+       * Y lo que cada capacidad declare intocable ADEMÁS de sus citas, por registro y no por
+       * un `if` sobre la capacidad: el guardián de ramas binarias de este pipeline existe
+       * justo para eso, y lo cazó cuando esto era un `if`.
+       *
+       * Hoy solo C2, con sus contradicciones; el motivo lo escribe la capacidad, porque quien
+       * lo lee necesita saber QUÉ no se toca y no «algo». Cerraba además un agujero de
+       * alcance: `parsearContenido` admite cambiarlas y nada comprobaba que la evidencia nueva
+       * fuera del reto —`contradiccion` solo lleva la FK del tenant—, así que una corrección
+       * podía apuntar a cualquiera del workspace y la aceptación la materializaba.
+       */
+      const adicional = TESTIMONIO_ADICIONAL[p.capacidad];
+      if (
+        adicional &&
+        canonico(adicional.parte(contenido)) !== canonico(adicional.parte(p.contenidoOriginal))
+      ) {
+        throw new ErrorAI(adicional.motivo);
       }
     }
     /*
@@ -3131,6 +3788,8 @@ async function aceptarPropuestaEnTransaccion(
         ),
       'criterio-exito': () =>
         materializarCriterio(tx, actorId, entrada.workspaceId, p, contenido as ContenidoCriterio),
+      insight: () =>
+        materializarInsight(tx, actorId, entrada.workspaceId, p, contenido as ContenidoInsight),
     };
     const objetoId = await MATERIALIZAR[p.destino]();
 
@@ -3293,6 +3952,91 @@ async function materializarEvidencia(
 
 /** C0: el criterio nace bajo el reto de la propuesta, firmado por quien acepta y SIN
  * línea base inventada (solo el plan para obtenerla — SYS-22 exige valor+fecha o plan). */
+/**
+ * C2: la aceptación crea el insight ENTERO — sus afirmaciones y las citas de cada una, y las
+ * contradicciones si las señaló.
+ *
+ * Es el primer objeto COMPUESTO que materializa el pipeline, y por eso el orden importa: las
+ * políticas de `afirmacion` y `cita` exigen que su insight esté en `propuesto`, así que se
+ * crea primero y todo cuelga dentro de la MISMA transacción. Si algo falla —una evidencia
+ * citada que ya no está, por ejemplo— no queda un insight a medias: no queda nada.
+ *
+ * El `orden` de cada afirmación sale de su posición en el contenido, que es el que el modelo
+ * propuso y el revisor leyó. No se reordena por nada: `afirmacion` tiene único
+ * `(insight_id, orden)` y lo que se acepta es LO QUE SE VIO.
+ *
+ * Las citas apuntan a la EVIDENCIA por su id. Que ese id sea de una evidencia real y del
+ * tenant lo sujeta su FK compuesta; que sea de las que se le enseñaron al modelo lo sujeta el
+ * trigger de la migración de C2. Aquí no se vuelve a comprobar: repetir una regla en un
+ * tercer sitio es cómo las tres empiezan a divergir.
+ */
+async function materializarInsight(
+  tx: TransactionSql,
+  actorId: string,
+  workspaceId: string,
+  p: PropuestaEnRevision,
+  c: ContenidoInsight,
+): Promise<string> {
+  // El reto tiene que SEGUIR sin archivar. Entre generar y aceptar hay una segunda vida
+  // entera y el ciclo de vida del reto avanza solo; aceptar después colgaría un insight de un
+  // trabajo ya cerrado. Mismo razonamiento que `materializarCriterio`, con su propio
+  // predicado: lo que congela criterios (G0, registry) no dice nada sobre insights.
+  await bloquearReto(tx, p.anclaId);
+  const [reto] = await tx`select estado from reto
+    where id = ${p.anclaId} and workspace_id = ${workspaceId}`;
+  if ((reto?.estado as string | undefined) === 'archivado') {
+    throw new ErrorAI(
+      'Ese reto se archivó: su trabajo se cerró y esta propuesta quedó obsoleta, así que solo puede rechazarse',
+    );
+  }
+  const [insight] = await tx`insert into insight
+    (workspace_id, titulo, resumen, estado, creado_por)
+    values (${workspaceId}, ${c.titulo}, ${c.resumen}, 'propuesto', ${actorId})
+    returning id`;
+  const insightId = insight!.id as string;
+  for (const [orden, a] of c.afirmaciones.entries()) {
+    const [afirmacion] = await tx`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${workspaceId}, ${insightId}, ${orden}, ${a.texto}, ${a.esHipotesis})
+      returning id`;
+    for (const cita of a.citas) {
+      try {
+        await tx`insert into cita
+          (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+          values (${workspaceId}, ${afirmacion!.id as string}, ${cita.evidenciaId},
+                  ${cita.fragmento}, ${cita.localizacion}, ${actorId})`;
+      } catch (e) {
+        /*
+         * DR001 es el código de los DERECHOS: citar una evidencia exige que siga siendo
+         * usable (SPEC-03/SYS-14), y entre generar y aceptar cabe una revocación entera —es
+         * el mismo hueco que el consentimiento retirado, con otro registro—. Sin traducirlo,
+         * el rechazo sale como error crudo del driver a una pantalla de revisión, y quien
+         * revisa no puede saber que lo que falta son derechos ni de qué evidencia.
+         *
+         * El motivo del guard ya nombra la evidencia y la causa; se antepone lo que hay que
+         * hacer con la propuesta, que es lo que el guard no puede saber. Ninguna otra causa
+         * se disfraza: cualquier otro error se relanza tal cual.
+         */
+        const err = e as { code?: string; message?: string };
+        if (err.code === 'DR001') {
+          throw new ErrorAI(
+            `Este insight cita evidencia que ya no se puede citar. ${err.message ?? ''} ` +
+              'Los derechos no los propone la AI: repón los de esa evidencia, o rechaza la propuesta.',
+          );
+        }
+        throw e;
+      }
+    }
+  }
+  for (const contra of c.contradicciones) {
+    await tx`insert into contradiccion
+      (workspace_id, insight_id, evidencia_id, descripcion, creado_por)
+      values (${workspaceId}, ${insightId}, ${contra.evidenciaId}, ${contra.descripcion},
+              ${actorId})`;
+  }
+  return insightId;
+}
+
 async function materializarCriterio(
   tx: TransactionSql,
   actorId: string,

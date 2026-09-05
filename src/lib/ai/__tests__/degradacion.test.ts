@@ -26,11 +26,13 @@ import {
   promptCriterios,
   promptRemediacionJourney,
   promptExtraccion,
+  promptInsights,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
   SISTEMA_REMEDIACION_JOURNEY,
   type GrafoDelJourney,
   SISTEMA_EXTRACCION,
+  SISTEMA_INSIGHTS,
 } from '../ai.prompts';
 
 /**
@@ -434,7 +436,15 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * Al ampliar la huella a todas las ramas del render, el DIGESTO cambia sin que el contrato
    * haya cambiado: lo que se amplió es la medida, no lo que se le dice al modelo. Por eso
    * `PROMPT_VERSION` NO se toca aquí — subirla habría partido en dos poblaciones que salieron
-   * del mismo contrato, que es exactamente el daño que esta prueba existe para evitar. */
+   * del mismo contrato, que es exactamente el daño que esta prueba existe para evitar.
+   *
+   * C2 y C5 SÍ la suben, porque cada una añade un sistema y un esquema de salida: es contrato
+   * nuevo. Cada rama tomó su número y el MERGE toma otro, y saltar números no cuesta nada —la
+   * versión es una ETIQUETA opaca que se guarda en el lineage, no un contador— mientras que
+   * reutilizar el de otra sí: dos contratos distintos con la misma etiqueta son dos
+   * poblaciones que ya no se pueden separar, y no hay forma de deshacerlo después. La línea de
+   * `PROMPT_VERSION` colisiona en el merge a propósito, así que nadie la cruza en silencio; y
+   * la huella cambia de todos modos, porque `ESQUEMA_SALIDA` lleva ahora las dos. */
   /** Un grafo mínimo con UNA señal: lo justo para que las ramas de C5 rindan un render
    * estable y distinto entre sí. No sale de `validarJourney` —esto mide el PROMPT, no la
    * validación— así que la señal se escribe a mano con la forma que la función produce. */
@@ -511,16 +521,21 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
   };
 
   /*
-   * La `.4` la lleva C2 en su rama, así que C5 pasa de la `.3` a la `.5` en vez de reusarla.
+   * C5 y C2 salieron en paralelo y cada una movió el contrato por su lado, así que las dos
+   * ramas subieron la versión a la vez sobre la misma base. C5 entró antes y se quedó con la
+   * `.9`; C2 subió a la `.10` al integrarse, y a la `.11` al admitir el lote vacío —que cambia
+   * el `minItems` del sobre y la instrucción del prompt, o sea el contrato por sus dos lados.
+   *
    * La versión es una ETIQUETA opaca que se guarda en el lineage, no un contador: saltar un
-   * número no cuesta nada y compartirlo sí — dos contratos distintos con la misma etiqueta
-   * son dos poblaciones que ya no se pueden separar, y eso no se deshace después. Y sube
-   * ahora y no se queda en la `.3` aunque esa nunca haya salido de esta rama: el argumento
-   * «todavía no la usa nadie» es exactamente el que hay que no aceptar, porque es cierto
-   * hasta el commit en que deja de serlo.
+   * número no cuesta nada y compartirlo sí — dos contratos distintos con la misma etiqueta son
+   * dos poblaciones que ya no se pueden separar, y eso no se deshace después. Y sube al
+   * integrar aunque ninguna de las dos etiquetas haya salido todavía de su rama: el argumento
+   * «todavía no la usa nadie» es exactamente el que hay que no aceptar, porque es cierto hasta
+   * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
+   * del material guardado con el de hoy solo vale entre propuestas del mismo render.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-05.9';
-  const HUELLA_ANOTADA = '86de82b2d38b12cb228831de0b2f3cbc49cc5eeadf176dfb414209679eea4a84';
+  const VERSION_ANOTADA = 'ai-2026-09-05.11';
+  const HUELLA_ANOTADA = '1d866f9513752e0be85ebbf1bb5ba3dcf4a58ba96fb4a21ffcea5fd6de8ece25';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -655,6 +670,51 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
         { id: 'a1b2c3d4-0000-4000-8000-000000000001', texto: CON_DELIMITADOR, estado: 'pendiente', conObjeto: false },
       ],
     }),
+    // ── C2 ──
+    // La evidencia del reto es el CUERPO del material, y el id de cada una viaja en él: es lo
+    // que el modelo tiene que copiar dentro de cada cita para que la presencia literal se
+    // pueda comprobar contra la evidencia correcta. El esqueleto de esa línea es contrato.
+    // NO hay rama «sin evidencia»: C2 se niega a llamar al proveedor con cero evidencias, así
+    // que una entrada así no sería una rama del render sino una que nadie alcanza.
+    insightsLlano: promptInsights({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D',
+      evidencia: [
+        { id: 'b2c3d4e5-0000-4000-8000-000000000001', titulo: 'E1', resumen: 'Resumen uno' },
+        { id: 'b2c3d4e5-0000-4000-8000-000000000002', titulo: 'E2', resumen: 'Resumen dos' },
+      ],
+      cuantos: 3,
+    }),
+    // La evidencia no cabe: aparece el aviso de truncado y el «truncado» del resumen de
+    // alcance, que es lo que le dice al modelo que no afirme sobre lo que no ve.
+    insightsTruncado: promptInsights({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: CUERPO_LARGO,
+      evidencia: [
+        { id: 'b2c3d4e5-0000-4000-8000-000000000001', titulo: 'E1', resumen: 'Resumen uno' },
+      ],
+      cuantos: 3,
+    }),
+    insightsFichaVacia: promptInsights({
+      codigo: '',
+      titulo: '',
+      descripcion: 'D',
+      evidencia: [
+        { id: 'b2c3d4e5-0000-4000-8000-000000000001', titulo: 'E1', resumen: 'Resumen uno' },
+      ],
+      cuantos: 1,
+    }),
+    insightsConDelimitador: promptInsights({
+      codigo: 'R-01',
+      titulo: CON_DELIMITADOR,
+      descripcion: CON_DELIMITADOR,
+      evidencia: [
+        { id: 'b2c3d4e5-0000-4000-8000-000000000001', titulo: CON_DELIMITADOR, resumen: CON_DELIMITADOR },
+      ],
+      cuantos: 3,
+    }),
     // ── C5 ──
     // El grafo es el cuerpo, y sus SEÑALES van dentro: lo que distingue a C5 de una
     // capacidad que adivina es que la lista de defectos viene dada. Que ese bloque cambie de
@@ -716,6 +776,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       sistemaExtraccion: SISTEMA_EXTRACCION,
       sistemaCriterios: SISTEMA_CRITERIOS,
       sistemaAsistenteGates: SISTEMA_ASISTENTE_GATES,
+      sistemaInsights: SISTEMA_INSIGHTS,
       sistemaRemediacionJourney: SISTEMA_REMEDIACION_JOURNEY,
       esquemaSalida: ESQUEMA_SALIDA,
       maxMaterial: MAX_MATERIAL,
@@ -761,6 +822,17 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.gateFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.gateConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
 
+    // C2: el id de cada evidencia llega al material —es lo que cada cita tiene que copiar—,
+    // el truncado avisa por partida doble (cuerpo y resumen de alcance), y la ficha vacía
+    // emite su «(sin dato)».
+    expect(RAMAS.insightsLlano.usuario).toContain('[b2c3d4e5-0000-4000-8000-000000000002]');
+    expect(RAMAS.insightsLlano.usuario).toContain('EVIDENCIA DEL RETO');
+    expect(RAMAS.insightsLlano.usuario).not.toContain('se truncó');
+    expect(RAMAS.insightsLlano.alcanceResumen).toContain('2 evidencias');
+    expect(RAMAS.insightsTruncado.usuario).toContain('se truncó');
+    expect(RAMAS.insightsTruncado.alcanceResumen).toContain('truncado');
+    expect(RAMAS.insightsFichaVacia.usuario).toContain('(sin dato)');
+    expect(RAMAS.insightsConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
     // C5: el id del nodo y el código de la señal llegan al material —son lo que la respuesta
     // tiene que copiar—, el encargo cambia cuando no hay señales, el truncado avisa y la
     // ficha vacía emite su «(sin dato)».

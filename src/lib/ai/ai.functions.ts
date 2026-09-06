@@ -125,5 +125,20 @@ export const observabilidadDelWorkspace = createServerFn({ method: 'GET' })
   .inputValidator(ObservabilidadInputSchema)
   .handler(async ({ data }) => {
     const usuarioId = await requerirUsuarioId();
-    return observabilidadAI(usuarioId, data.workspaceId);
+    try {
+      return await observabilidadAI(usuarioId, data.workspaceId);
+    } catch (e) {
+      /*
+       * Igual que `propuestasDelWorkspace`, y por lo que dice la nota de arriba de este
+       * fichero: un fallo de AUTORIZACIÓN devuelve «sin datos», no tira la ruta entera contra
+       * el error boundary. Cabe entre el guardián del padre y este loader —una cuenta que un
+       * administrador desactiva, una membresía revocada—, y la pantalla ya sabe decir qué pasa
+       * en los tres casos; una pantalla rota no dice ninguno.
+       *
+       * Nótese el `await` dentro del `try`: sin él la promesa se devolvía sin esperar y este
+       * `catch` no veía nunca el rechazo.
+       */
+      if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
   });

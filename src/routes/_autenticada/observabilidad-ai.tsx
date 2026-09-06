@@ -19,9 +19,13 @@ import { ROLES_OBSERVABILIDAD_AI, type ObservabilidadDeCapacidad } from '@/lib/a
  * La puerta es de PANTALLA, y eso se dice aquí porque en la auditoría NO lo es: allí la
  * autoridad es la política RLS de `evento_dominio`, que a los demás roles les devuelve cero
  * filas. `llamada_ai` pide sólo membresía —el tope diario y el estado de la capacidad la leen
- * para todo el que abre el panel de propuestas—, así que aquí el suelo es más ancho que la
- * pantalla. Es el sentido seguro de la discrepancia, y cerrarlo por rol rompería lecturas ya
- * declaradas; queda como pregunta de producto en el cuerpo del PR.
+ * para todo el que abre el panel de propuestas—, así que el SUELO es más ancho y así se queda:
+ * cerrarlo por rol rompería lecturas ya declaradas.
+ *
+ * Lo que sí está cerrado por rol es la PROYECCIÓN, en el servicio, y eso llegó tarde: durante
+ * dos rondas la puerta vivió sólo aquí, en el loader, mientras la server function respondía a
+ * cualquier miembro. Este filtro se queda igualmente —lo que no se puede mostrar tampoco tiene
+ * por qué viajar— pero ya no es lo único que cierra.
  */
 export const Route = createFileRoute('/_autenticada/observabilidad-ai')({
   loader: ({ context }) => {
@@ -189,7 +193,12 @@ function PantallaObservabilidad() {
                 {formatearCosteUsd(datos.total.costoUsd)}
               </span>
               <span style={{ font: '400 12.5px/1.6 var(--font-sans)', color: 'var(--text-muted)' }}>
-                {datos.total.llamadasCerradas} llamadas atendidas
+                {/* «Con desenlace», no «atendidas»: el presupuesto reserva esa palabra para lo
+                    que se cobra, y excluye de ella las que no obtuvieron respuesta — que aquí
+                    sí cuentan, porque para quien pidió la generación son un fallo igual. */}
+                {datos.total.llamadasCerradas} llamadas con desenlace
+                {datos.total.llamadasSinRespuesta > 0 &&
+                  ` (${datos.total.llamadasSinRespuesta} sin respuesta del proveedor)`}
                 {datos.total.llamadasEnVuelo > 0 &&
                   ` · ${datos.total.llamadasEnVuelo} en vuelo, que todavía no son ni acierto ni fallo`}
                 {/* Y las huérfanas aparte, porque no son ninguna de las otras dos: su cierre

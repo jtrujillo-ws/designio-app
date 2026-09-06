@@ -1,6 +1,7 @@
 import '@/lib/server-only';
 import { conUsuario } from '@/lib/db';
-import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { ErrorAutorizacion, exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { ROLES_OBSERVABILIDAD_AI } from './ai.roles';
 import { reservaSigueViva } from './ai.servicio';
 import { CAPACIDADES, CAPACIDADES_ACTIVAS, type CapacidadActiva } from './ai.schemas';
 import type { ObservabilidadAI, ObservabilidadDeCapacidad } from './ai.schemas';
@@ -48,6 +49,7 @@ import type { ObservabilidadAI, ObservabilidadDeCapacidad } from './ai.schemas';
  */
 const NINGUNA: Omit<ObservabilidadDeCapacidad, 'capacidad' | 'etiqueta'> = {
   llamadasCerradas: 0,
+  llamadasSinRespuesta: 0,
   llamadasEnVuelo: 0,
   llamadasHuerfanas: 0,
   llamadasValidas: 0,
@@ -75,6 +77,35 @@ export async function observabilidadAI(
     async (tx) => {
       await exigirCuentaActiva(tx, actorId);
       /*
+       * LA CAPA 2, QUE FALTABA — y que no es la misma pregunta que la RLS.
+       *
+       * `exigirCuentaActiva` valida el estado GLOBAL de la cuenta, no la membresía de ESTE
+       * workspace. Sin esto pasaban dos cosas, y la segunda es peor que la reportada:
+       *
+       *  · Sin membresía viva —revocada entre que el contexto resolvió y esta llamada, o un
+       *    uuid ajeno pasado a mano a la server function— la RLS filtra las dos consultas a
+       *    cero filas, y el recorrido por `CAPACIDADES_ACTIVAS` las rellena con `NINGUNA`. El
+       *    resultado es un informe de aspecto normal, todo a cero: la pérdida de acceso se
+       *    disfrazaba de «aquí no se ha gastado nada».
+       *  · Y con membresía pero SIN el rol, la puerta era sólo de pantalla: el `loader` no
+       *    pide el cuadro, pero la server function es la superficie de verdad y respondía a
+       *    cualquier miembro con la factura de la boutique y los nombres de los modelos.
+       *
+       * Esto NO es cerrar el suelo por rol, que es lo que la nota de `ROLES_OBSERVABILIDAD_AI`
+       * descarta: la política de `llamada_ai` sigue pidiendo membresía a secas, porque el tope
+       * diario y el estado de la capacidad los lee todo el que abre el panel de propuestas.
+       * Lo que se cierra es ESTA proyección, que es otra cosa — la misma forma que la auditoría
+       * (`portal.servicio.ts`), y con motivo, porque una tabla vacía y «no te corresponde» no
+       * se parecen en nada para quien mira.
+       */
+      const [quien] = await tx`select workspace_role(${actorId}, ${workspaceId}) as rol`;
+      const rol = (quien?.rol ?? null) as string | null;
+      if (!rol || !(ROLES_OBSERVABILIDAD_AI as readonly string[]).includes(rol)) {
+        throw new ErrorAutorizacion(
+          'El cuadro de operación de la capa AI lo consultan el admin del cliente y quienes llevan el workspace en la boutique',
+        );
+      }
+      /*
        * Las dos mitades se leen por SEPARADO y se cruzan por capacidad, en vez de con un join.
        * No es estilo: una llamada puede no haber producido ninguna propuesta —es justo el caso
        * que interesa contar, la llamada pagada de la que no nació nada— y una propuesta cuelga
@@ -84,6 +115,22 @@ export async function observabilidadAI(
       const llamadas = await tx`
         select l.capacidad,
                count(*) filter (where l.resultado <> 'despachada')::int as cerradas,
+               /*
+                * Y CUÁNTAS DE ESAS FUERON EL PROVEEDOR SIN RESPONDER.
+                *
+                * Va DENTRO de las cerradas, no restada: una llamada que no obtuvo respuesta es
+                * un fallo de la capa para quien la pidió, así que sacarla del denominador de la
+                * tasa de error escondería una caída del proveedor justo cuando hay que verla.
+                * Lo que sí hace falta es poder separarla al leer, porque «el modelo contestó
+                * mal» y «el modelo no contestó» piden cosas distintas.
+                *
+                * Y es lo que arregla el rótulo: presupuestoDeHoy llama ATENDIDAS a las de hoy
+                * excluyendo explícitamente las sin-respuesta —no se cobra lo que no respondió—,
+                * así que este recuento nunca fue el mismo conjunto. Tomarle la palabra prestada
+                * al presupuesto hacía que el cuadro dijera «atendidas» sobre un número que
+                * incluye justo las que no lo fueron.
+                */
+               count(*) filter (where l.resultado = 'sin-respuesta')::int as sin_respuesta,
                count(*) filter (
                  where l.resultado = 'despachada' and ${reservaSigueViva(tx, 'l')}
                )::int as en_vuelo,
@@ -165,6 +212,7 @@ export async function observabilidadAI(
            * que sabe, y lo que hace falta de esa fila es que su gasto se vea. */
           etiqueta: CAPACIDADES[capacidad as CapacidadActiva]?.etiqueta ?? capacidad,
           llamadasCerradas: cerradas,
+          llamadasSinRespuesta: l ? (l.sin_respuesta as number) : 0,
           llamadasEnVuelo: l ? (l.en_vuelo as number) : 0,
           llamadasHuerfanas: l ? (l.huerfanas as number) : 0,
           llamadasValidas: validas,
@@ -198,6 +246,7 @@ export async function observabilidadAI(
         capacidades: filas,
         total: {
           llamadasCerradas: filas.reduce((n, f) => n + f.llamadasCerradas, 0),
+          llamadasSinRespuesta: filas.reduce((n, f) => n + f.llamadasSinRespuesta, 0),
           llamadasEnVuelo: filas.reduce((n, f) => n + f.llamadasEnVuelo, 0),
           llamadasHuerfanas: filas.reduce((n, f) => n + f.llamadasHuerfanas, 0),
           costoUsd: filas.reduce((n, f) => n + f.costoUsd, 0),

@@ -21,13 +21,21 @@ import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
  * otra vez: si algún día tienen que divergir, la divergencia será una edición deliberada en un
  * sitio y no dos listas que se separan solas.
  *
- * Y una asimetría que hay que decir en vez de dar por hecha: la nota de `ROLES_AUDITORIA`
- * presume que «la autoridad es la política RLS», y ahí es cierto —`evento_dominio` devuelve
- * cero filas a los demás roles—. Aquí NO: la política de `llamada_ai` pide membresía a secas,
- * porque el tope diario y el estado de la capacidad la leen para todo el que abre el panel.
- * Así que esta puerta es de PANTALLA y el suelo es más ancho. Cerrar el suelo por rol
- * repetiría la avería de la ronda 42 de #48 —cerrar una fila por rol y romper una lectura ya
- * declarada—, y queda como pregunta de producto: en BYOAI (RF-09.9) `origen_key = 'workspace'`
- * dice que paga el cliente, y quien paga probablemente deba ver la factura.
+ * Y una asimetría que hay que decir en vez de dar por hecha, ya CORREGIDA una vez: la nota de
+ * `ROLES_AUDITORIA` presume que «la autoridad es la política RLS», y ahí es cierto
+ * —`evento_dominio` devuelve cero filas a los demás roles—. Aquí NO: la política de
+ * `llamada_ai` pide membresía a secas, porque el tope diario y el estado de la capacidad la
+ * leen para todo el que abre el panel de propuestas.
+ *
+ * De eso yo concluí que «esta puerta es de PANTALLA y el suelo es más ancho», y me salté una
+ * capa entera. Que la RLS no deba cerrarse —cerrar una fila por rol y romper una lectura ya
+ * declarada es la avería de la ronda 42 de #48— no dice nada sobre la CAPA 2: la proyección de
+ * `observabilidadAI` sí se cierra por rol, como la auditoría, y hasta que se hizo cualquier
+ * miembro podía pedirle a mano el cuadro con la factura de la boutique. La asimetría real es
+ * entre el SUELO (ancho, y así se queda) y la PROYECCIÓN (cerrada), no entre la base y la
+ * pantalla.
+ *
+ * Lo que sigue siendo pregunta de producto: en BYOAI (RF-09.9) `origen_key = 'workspace'` dice
+ * que paga el cliente, y quien paga probablemente deba ver la factura.
  */
 export const ROLES_OBSERVABILIDAD_AI = ROLES_AUDITORIA;

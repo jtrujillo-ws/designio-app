@@ -12730,6 +12730,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
        */
       await llamada('fuera-de-contrato', null, 500, 800);
       /*
+       * Y una que el proveedor NO respondió. Es la que separa las dos palabras: para el
+       * presupuesto no cuenta como atendida —no se cobra lo que no respondió— y para este
+       * cuadro sí cuenta como cerrada, porque quien pidió la generación se quedó sin ella.
+       * Sin esta línea en el fixture, la sonda no distinguía los dos conjuntos.
+       */
+      await llamada('sin-respuesta', null, null);
+      /*
        * Y las dos clases de `despachada`, que NO son la misma y confundirlas fue el hallazgo
        * de la primera revisión de este PR:
        *
@@ -12756,6 +12763,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(
         {
           cerradas: c0.llamadasCerradas,
+          sinRespuesta: c0.llamadasSinRespuesta,
           enVuelo: c0.llamadasEnVuelo,
           huerfanas: c0.llamadasHuerfanas,
           validas: c0.llamadasValidas,
@@ -12766,7 +12774,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         },
         'el lector cuenta la línea en vuelo, confunde la huérfana con ella, suma el coste desconocido como cero, o achaca a una tarifa que falta lo que es un uso que el proveedor no devolvió',
       ).toEqual({
-        cerradas: 3,
+        // CUATRO cerradas: dos válidas, la fuera-de-contrato y la sin-respuesta.
+        cerradas: 4,
+        // La sin-respuesta va DENTRO de las cerradas: para quien pidió la generación es un
+        // fallo igual, así que sacarla del denominador escondería una caída del proveedor.
+        sinRespuesta: 1,
         enVuelo: 1,
         huerfanas: 1,
         validas: 2,
@@ -12778,9 +12790,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
          * una tarifa que no habría cambiado nada.
          */
         sinTarifa: 1,
-        sinUso: 1,
+        // DOS sin uso devuelto: la huérfana y la sin-respuesta. Las dos son el proveedor
+        // callado, que es exactamente la clase que este reparto separa de «falta la tarifa».
+        sinUso: 2,
         costo: 0.03,
-        tasaError: 1 / 3,
+        // Dos de cuatro cerradas no dieron salida válida: la fuera-de-contrato y la que
+        // el proveedor no contestó. Una caída del proveedor SUBE la tasa de error, que es lo
+        // que un cuadro de operación tiene que enseñar.
+        tasaError: 0.5,
       });
       /*
        * Las latencias, que ignoran los nulos por construcción de `percentile_cont` — medido
@@ -12884,41 +12901,70 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
-   * Y LA FRONTERA de la puerta de rol, medida en vez de afirmada.
+   * Y LA FRONTERA de la puerta de rol, medida en vez de afirmada — CORREGIDA.
    *
-   * La pantalla de operación dice «tu rol no incluye esta lectura» a quien no lleva el
-   * workspace, y esa frase es cierta DE LA PANTALLA. No lo es de la base: la política de
-   * `llamada_ai` pide membresía a secas porque el tope diario y el estado de la capacidad la
-   * leen para todo el que abre el panel de propuestas, así que el suelo es más ancho.
+   * Esta sonda decía antes lo contrario de lo que dice ahora, y el cambio es un arreglo, no un
+   * ajuste. Yo había escrito que la puerta era «de PANTALLA» y que el suelo, más ancho, se
+   * quedaba como estaba: cerrarlo repetiría la avería de la ronda 42 de #48, cerrar una fila
+   * por rol y romper una lectura ya declarada. Ese razonamiento es correcto sobre la RLS y NO
+   * se aplica a la capa 2, y yo las confundí: dejé la server function sin puerta ninguna, así
+   * que cualquier miembro podía pedirle a mano el cuadro con la factura de la boutique y los
+   * nombres de los modelos. Lo cazó una revisión, y la sonda que yo había escrito lo fijaba
+   * como si fuera la conducta deseada.
    *
-   * Esta sonda existe para que esa asimetría no se lea nunca como una promesa de la base.
-   * Cerrarla por rol es tentador y sería la avería de la ronda 42 de #48 otra vez —cerrar una
-   * fila por rol y romper una lectura ya declarada—, así que el suelo se queda como está y la
-   * discrepancia va en el sentido seguro: la pantalla enseña menos, no más.
+   * Ahora se miden las TRES capas por separado, que es lo que hace la frontera legible:
+   *
+   *  1. La RLS sigue igual de ancha —el tope diario y el estado de la capacidad los lee todo
+   *     miembro desde el panel de propuestas—, y eso se comprueba leyendo la tabla directamente.
+   *  2. La PROYECCIÓN se cierra por rol, con motivo.
+   *  3. Y sin MEMBRESÍA no hay informe en cero: la pérdida de acceso no puede disfrazarse de
+   *     «aquí no se ha gastado nada», que es la única de las tres que además engaña.
    */
-  it('RF-08.9: la puerta de rol del cuadro de operación es de PANTALLA, no del suelo', async () => {
+  it('RF-08.9: la RLS sigue ancha, la proyección se cierra por rol, y sin membresía no hay ceros', async () => {
     await enWorkspaceLimpio('obs-frontera', async ({ ws: wsO, curadorId, retoId: retoO }) => {
       const admin = sqlAdmin();
       await admin`insert into llamada_ai
         (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, costo_usd, creado_por)
         values (${wsO}, 'C0', ${retoO}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', 0.07,
                 ${curadorId})`;
-      const [u] = await admin`insert into usuario (email, nombre, estado)
-        values (${`${marca}-obs-stake@test.demo`}, 'Stake', 'activo') returning id`;
-      const stakeId = u!.id as string;
-      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
-        values (${wsO}, ${stakeId}, 'Stake', ${`${marca}-obs-stake@test.demo`}, 'stakeholder')`;
+      const alta = async (rol: string, sufijo: string) => {
+        const email = `${marca}-obs-${sufijo}@test.demo`;
+        const [u] = await admin`insert into usuario (email, nombre, estado)
+          values (${email}, ${rol}, 'activo') returning id`;
+        const id = u!.id as string;
+        if (rol !== '') {
+          await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+            values (${wsO}, ${id}, ${rol}, ${email}, ${rol})`;
+        }
+        return id;
+      };
+      const stakeId = await alta('stakeholder', 'stake');
+      const ajenoId = await alta('', 'ajeno');
 
-      // La puerta de la pantalla: el stakeholder no está en la lista, así que el loader no pide
-      // el cuadro y la tarjeta dice por qué.
-      expect((ROLES_OBSERVABILIDAD_AI as readonly string[]).includes('stakeholder')).toBe(false);
-      // Y el suelo, que es más ancho y hay que saberlo: por el servicio, con su membresía viva,
-      // el stakeholder SÍ lee el libro. La pantalla enseña menos que la base, no al revés.
-      const obs = await observabilidadAI(stakeId, wsO);
+      // 1. El SUELO no se ha movido: con membresía viva, el stakeholder sigue leyendo la tabla.
+      //    Es la lectura que el panel de propuestas necesita, y cerrarla por rol sería la
+      //    avería de la ronda 42 de #48.
+      const [suelo] = await conUsuario(
+        stakeId,
+        (tx) => tx`select count(*)::int as n from llamada_ai where workspace_id = ${wsO}`,
+      );
       expect(
-        Number(obs.total.costoUsd.toFixed(2)),
+        suelo!.n,
         'la política de llamada_ai dejó de admitir a un miembro: mira qué lectura declarada se rompió',
-      ).toBe(0.07);
+      ).toBe(1);
+
+      // 2. Y la PROYECCIÓN sí se cierra, con motivo. La puerta ya no es sólo de pantalla: la
+      //    server function es la superficie de verdad.
+      expect((ROLES_OBSERVABILIDAD_AI as readonly string[]).includes('stakeholder')).toBe(false);
+      await expect(observabilidadAI(stakeId, wsO)).rejects.toThrow(ErrorAutorizacion);
+
+      // 3. Y sin membresía tampoco sale un informe en cero, que es el caso que engaña: la RLS
+      //    filtra a cero filas y el recorrido por el registro las rellena, así que la pérdida de
+      //    acceso tenía exactamente la misma cara que un workspace sin gasto.
+      await expect(
+        observabilidadAI(ajenoId, wsO),
+        'sin membresía el informe salía todo en cero, indistinguible de «aquí no se gastó nada»',
+      ).rejects.toThrow(ErrorAutorizacion);
     });
   });
 

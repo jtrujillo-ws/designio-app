@@ -1160,6 +1160,19 @@ export type ObservabilidadDeCapacidad = {
   etiqueta: string;
   /** Llamadas con desenlace. Las EN VUELO van aparte: mientras esperan no son un fallo. */
   llamadasCerradas: number;
+  /**
+   * De las cerradas, cuántas fueron el proveedor SIN RESPONDER.
+   *
+   * Dentro de las cerradas y no restada: una llamada sin respuesta es un fallo de la capa para
+   * quien la pidió, así que sacarla del denominador de `tasaError` escondería una caída justo
+   * cuando hay que verla. Viaja aparte porque «el modelo contestó mal» y «el modelo no
+   * contestó» piden cosas distintas de quien opera.
+   *
+   * Y porque `presupuestoDeHoy` llama ATENDIDAS a otra cosa —excluye `sin-respuesta`, que no se
+   * cobra—: sin esta cifra, el cuadro tomaba prestada esa palabra para un conjunto que la
+   * contradice.
+   */
+  llamadasSinRespuesta: number;
   llamadasEnVuelo: number;
   /**
    * Despachadas cuya RESERVA ya no vive: el cierre falló después de que el proveedor
@@ -1216,6 +1229,7 @@ export type ObservabilidadAI = {
   capacidades: ObservabilidadDeCapacidad[];
   total: {
     llamadasCerradas: number;
+    llamadasSinRespuesta: number;
     llamadasEnVuelo: number;
     llamadasHuerfanas: number;
     costoUsd: number;

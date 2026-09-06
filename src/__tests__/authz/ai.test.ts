@@ -10431,6 +10431,103 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+
+  /**
+   * EL GUARD DE SOSTÉN SE VUELVE A PREGUNTAR TAMBIÉN AL AÑADIR UNA CITA.
+   *
+   * Las dos clases de RF-08.2 se excluyen desde la ronda 28, y cada dirección entra por su
+   * puerta: quitar la última cita deja sin sostén a un hallazgo observado, y AÑADIR una se lo
+   * pone a uno marcado como hipótesis. El constraint trigger colgaba del INSERT del hallazgo y
+   * del DELETE de la cita, así que la segunda dirección no corría nunca sobre una fila ya
+   * commiteada — y la ruta manual llega ahí sin esfuerzo: su sello es null para siempre, así que
+   * las políticas de las hojas admiten escribir después, y el diferido del hallazgo terminó con
+   * su propia transacción.
+   *
+   * Medido antes de arreglarlo, con una transacción nueva sobre una hipótesis ya escrita:
+   *
+   *   HIPOTESIS: true · CITAS: 1
+   *
+   * Un guard diferido protege el ESTADO FINAL, y el estado final cambia por los dos lados. Y la
+   * rama nueva se separa por `tg_op`, no sólo por tabla: al borrar el hallazgo está en `old` y
+   * al añadir en `new`, que es la lección que este mismo fichero dejó escrita sobre plpgsql.
+   */
+  it('C4 no deja añadir una cita a un hallazgo ya marcado como hipótesis', async () => {
+    await enWorkspaceLimpio('c4-cita-tardia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const escribir = (esHipotesis: boolean) =>
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            arquetipoId: lenteA,
+            sintesis: 'Una lectura para la que la cita llega después.',
+            hallazgos: [
+              {
+                titulo: 'Probablemente dude',
+                descripcion: 'Extrapolando del perfil, dudaría antes de entregar nada.',
+                esHipotesis,
+                citas: esHipotesis
+                  ? []
+                  : [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula',
+                        localizacion: 'resumen',
+                      },
+                    ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Dudarías?', escenario: '' }],
+          },
+        });
+      const citar = (hallazgoId: string, fragmento: string) =>
+        conUsuario(curadorId, async (tx) => {
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${hallazgoId}, ${evA}, ${wsC}, ${fragmento}, 'resumen')`;
+        });
+
+      const { revisionId } = await escribir(true);
+      const [h] = await admin`select id from hallazgo_simulado where revision_id = ${revisionId}`;
+      // TRANSACCIÓN NUEVA: el diferido del INSERT del hallazgo ya terminó con la anterior.
+      await expect(
+        citar(h!.id as string, 'No entrego la cédula'),
+        'la cita entró sobre una hipótesis: la fila queda como extrapolación y como observada',
+      ).rejects.toThrow(/las dos clases se excluyen/i);
+
+      /*
+       * Y la otra mitad, para que esto no se lea como «no se pueden añadir citas después»: sobre
+       * un hallazgo OBSERVADO, una segunda cita —de otro documento, que es lo que el enlace
+       * admite— entra sin problema. La puerta es la clase del hallazgo, no el momento.
+       */
+      await borrarRevisionAMano(curadorId, { workspaceId: wsC, revisionId });
+      const segunda = await escribir(false);
+      const [h2] = await admin`select id from hallazgo_simulado
+        where revision_id = ${segunda.revisionId}`;
+      const [fte] = await admin`select fuente_id from evidencia where id = ${evA}`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.fuente_id as string}, 'Entrevista D-06',
+                'Me da igual el trámite si sé a dónde va.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const otroDoc = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${otroDoc}, 'concedido', 'cliente', 'Consentimiento del participante',
+                ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteA}, ${otroDoc})`;
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h2!.id as string}, ${otroDoc}, ${wsC}, 'sé a dónde va', 'resumen')`;
+        }),
+      ).resolves.toBeUndefined();
+    });
+  });
+
   /**
    * Y TAMPOCO PUEDE SABER PARA QUÉ CONCEPTO SE ESCRIBIÓ.
    *

@@ -296,10 +296,16 @@ begin
   -- lección que dejó escrita `concepto_candado_del_reto_guard`: plpgsql resuelve los campos de
   -- un `record` al planificar, así que nombrar un campo que la otra rama no tiene revienta
   -- también en la rama que sí lo tiene.
+  --
+  -- Y sobre el ENLACE hay que separar además por `tg_op`: al borrar una cita el hallazgo está
+  -- en `old`, al añadirla en `new`, y nombrar el campo que la otra operación no tiene es
+  -- exactamente lo que la nota de arriba describe. Cada rama nombra sólo lo suyo.
   if tg_table_name = 'hallazgo_simulado' then
     v_hallazgo := new.id;
-  else
+  elsif tg_op = 'DELETE' then
     v_hallazgo := old.hallazgo_id;
+  else
+    v_hallazgo := new.hallazgo_id;
   end if;
   -- Si el hallazgo ya no está —se borró él, o cayó con su revisión por el `on delete cascade`—
   -- no hay nada que exigir: la pregunta era sobre una fila que ya no existe. Sin esta salida,
@@ -331,12 +337,26 @@ $fn$;
 revoke execute on function hallazgo_simulado_sostenido_guard() from public;
 
 -- `z_` para que quede por detrás de `a_congelacion_por_disposicion`, como sus hermanos.
+--
+-- Y sobre el enlace va por INSERT **y** por DELETE, que es la mitad que faltaba. La regla tiene
+-- dos direcciones desde que las dos clases de RF-08.2 se excluyen, y cada una entra por su
+-- puerta: quitar la última cita deja sin sostén a un hallazgo observado, y AÑADIR una se lo pone
+-- a uno marcado como hipótesis. Colgado sólo del DELETE, la segunda no corría nunca sobre una
+-- fila ya commiteada: el diferido del INSERT del hallazgo terminó con su transacción, y una
+-- revisión escrita a mano admite hojas después porque su sello es null para siempre.
+--
+-- Medido antes de arreglarlo, en una transacción nueva sobre una hipótesis ya escrita:
+--
+--   HIPOTESIS: true · CITAS: 1
+--
+-- No es simetría por gusto: es que un guard diferido protege el ESTADO FINAL, y el estado final
+-- cambia por los dos lados.
 create constraint trigger z_hallazgo_sostenido
   after insert on hallazgo_simulado
   deferrable initially deferred
   for each row execute function hallazgo_simulado_sostenido_guard();
 create constraint trigger z_hallazgo_sostenido
-  after delete on hallazgo_simulado_evidencia
+  after insert or delete on hallazgo_simulado_evidencia
   deferrable initially deferred
   for each row execute function hallazgo_simulado_sostenido_guard();
 

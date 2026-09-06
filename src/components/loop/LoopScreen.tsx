@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Button } from '@/components/ui/Button';
@@ -34,16 +34,25 @@ import { EnlaceA, navegarA } from '@/components/ui/EnlaceA';
 import { Buscador } from '@/components/loop/Buscador';
 import { NuevoServicio } from '@/components/loop/NuevoServicio';
 import { ROLES_ALTA_SERVICIO } from '@/lib/arbol/arbol.schemas';
-import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
-import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
-import { etiquetaDePendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
+import {
+  ETIQUETA_GOBIERNO,
+  ETIQUETA_TE_ESPERA,
+  agruparLateral,
+  claveDeGobierno,
+  notaDeGobierno,
+  type DestinoDelLateral,
+} from '@/lib/loop/lateral';
 
 /**
  * Pantalla Loop J1–J7 — dirección 3a del handoff «Loop · impacto visual»: lateral en negro
- * violeta que navega el árbol cliente → servicios → retos, y el loop narrado solo en el
- * contenido (cabecera de arco, spotlight del journey en curso, «Te toca a ti», los siete
- * recorridos).
+ * violeta que navega el árbol cliente → servicios → retos → proyectos, y el loop narrado
+ * solo en el contenido (cabecera de arco, spotlight del journey en curso, «Te toca a ti»,
+ * los siete recorridos).
+ *
+ * Turno 4a del mismo handoff: los destinos del workspace dejan de ser una lista plana de
+ * trece filas y se ordenan por clase (ver `agruparLateral`): lo pendiente arriba en
+ * «Te espera», el árbol, dos estantes de consulta y el gobierno plegado en una fila.
  *
  * Regla de propiedad del chrome: el lateral posee marca, cliente y usuario; la topbar no
  * repite ninguno de los tres, y la ruta se imprime solo en el main.
@@ -453,7 +462,33 @@ function Lateral({
   // nombre), y además los derechos, insights y design versions que su rol resuelve. El
   // conteo lo trae el resumen; las filas, la pantalla de aprobaciones con la misma fuente.
   const pendientesDelRol = resumen?.pendientesDelRol.total ?? 0;
-  const esBoutique = (ROLES_CURADORES as readonly string[]).includes(rol);
+  const lateral = agruparLateral({
+    rol,
+    pendientesDelRol,
+    importacionPendientes: resumen?.importacionPendientes ?? 0,
+  });
+
+  // «Gobierno del workspace» nace plegado y recuerda si quien mira lo abrió, con la misma
+  // convención que la expansión de servicios: por usuario y workspace, leído en un efecto
+  // para que el primer fotograma coincida con el del servidor.
+  const claveGobierno = claveDeGobierno(usuario.id, membresia?.workspaceId ?? '');
+  const [gobiernoAbierto, setGobiernoAbierto] = useState(false);
+  useEffect(() => {
+    try {
+      setGobiernoAbierto(window.localStorage.getItem(claveGobierno) === '1');
+    } catch {
+      // Sin almacenamiento: plegado, que es el estado de partida.
+    }
+  }, [claveGobierno]);
+  function fijarGobierno(abierto: boolean) {
+    setGobiernoAbierto(abierto);
+    try {
+      window.localStorage.setItem(claveGobierno, abierto ? '1' : '0');
+    } catch {
+      // Recordar es una comodidad, no un contrato.
+    }
+  }
+  const idGobierno = useId();
 
   return (
     <aside
@@ -507,7 +542,6 @@ function Lateral({
           padding: 10,
           borderRadius: 11,
           background: claro(0.09),
-          marginBottom: 16,
         }}
       >
         <span
@@ -569,9 +603,51 @@ function Lateral({
         ) : null}
       </div>
 
-      {/* 3. Servicios y retos — la función principal del lateral. */}
-      <span className="loop-ancho" style={etiquetaLateral}>
-        Servicios y retos
+      {/* 3. Te espera — exactamente los destinos con pendientes, promovidos sobre el árbol.
+          A cero no existe: ni etiqueta ni contenedor, y sus filas vuelven a su estante. */}
+      {lateral.teEspera.length > 0 && (
+        <div
+          className="loop-te-espera"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+            margin: '12px 0 4px',
+            padding: 6,
+            borderRadius: 11,
+            background: claro(0.05),
+            border: `1px solid ${claro(0.1)}`,
+          }}
+        >
+          <span
+            className="loop-ancho"
+            style={{ ...etiquetaLateral, color: claro(0.5), padding: '2px 6px 6px' }}
+          >
+            {ETIQUETA_TE_ESPERA}
+          </span>
+          {lateral.teEspera.map((destino, i) => (
+            <DestinoDelWorkspace
+              key={destino.to}
+              destino={destino}
+              // La primera fila es la que decide quien mira (aprobaciones va siempre delante
+              // de la bandeja): lleva fondo y blanco pleno; la segunda, texto al 82%. El fondo
+              // lo pone la clase, no la línea, para que el hover siga respondiendo.
+              clase={i === 0 ? 'loop-fila-destacada' : undefined}
+              estilo={{
+                padding: 8,
+                borderRadius: 8,
+                font: '600 13px var(--font-sans)',
+                color: i === 0 ? '#fff' : claro(0.82),
+              }}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* 4. Cliente · árbol — la función principal del lateral, en sus cuatro niveles
+          (ADR-0003): servicios, sus retos, y los proyectos de cada reto. */}
+      <span className="loop-ancho" style={{ ...etiquetaLateral, padding: '8px 8px 8px' }}>
+        Cliente · árbol
       </span>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingBottom: 4 }}>
         {servicios.length === 0 && (
@@ -622,64 +698,95 @@ function Lateral({
         )}
       </div>
 
-      {/* 4. Workspace — destinos reales, con los pendientes que existen. */}
-      <span className="loop-ancho" style={{ ...etiquetaLateral, padding: '12px 8px 8px' }}>
-        Workspace
-      </span>
-      <DestinoDelWorkspace to="/importacion" etiqueta="Bandeja de importación" abrev="IMP">
-        {esCurador && resumen && resumen.importacionPendientes > 0 && (
-          <Contador color="var(--accent)" titulo={`${resumen.importacionPendientes} sin curar`}>
-            {resumen.importacionPendientes}
-          </Contador>
-        )}
-      </DestinoDelWorkspace>
-      {/* La pantalla de aprobaciones lista todo lo que el rol puede decidir ahora, por
-          clase y con enlace a donde se decide; el contador es ese total, no solo los gates. */}
-      <DestinoDelWorkspace to="/aprobaciones" etiqueta="Aprobaciones" abrev="APR">
-        {pendientesDelRol > 0 && (
-          <Contador
-            color="var(--warn)"
-            titulo={`${etiquetaDePendientes(pendientesDelRol)} de tu rol`}
-          >
-            {pendientesDelRol}
-          </Contador>
-        )}
-      </DestinoDelWorkspace>
-      <DestinoDelWorkspace to="/evidencia" etiqueta="Evidencia y derechos de uso" abrev="EVI" />
-      <DestinoDelWorkspace to="/insights" etiqueta="Insights y citas" abrev="INS" />
-      <DestinoDelWorkspace to="/biblioteca" etiqueta="Biblioteca del cliente" abrev="BIB" />
-      <DestinoDelWorkspace to="/journeys" etiqueta="Journeys y blueprints" abrev="JOU" />
-      <DestinoDelWorkspace to="/design-versions" etiqueta="Versions y releases" abrev="DVR" />
-      <DestinoDelWorkspace to="/propuestas" etiqueta="Propuestas AI" abrev="AI" />
-      <DestinoDelWorkspace to="/personas" etiqueta="Personas y permisos" abrev="PER" />
-      <DestinoDelWorkspace to="/segmentos" etiqueta="Segmentos" abrev="SEG" />
-      <DestinoDelWorkspace to="/exportacion" etiqueta="Exportación del workspace" abrev="EXP" />
-      {/* Esta puerta NO se condiciona al rol: detrás están las constancias que cada quien
-          conserva, y ésas no dependen de ninguna membresía. El rótulo nombra lo que cada
-          quien encuentra (ver la historia completa en el commit que la abrió). */}
-      <DestinoDelWorkspace
-        to="/disposicion"
-        etiqueta={
-          (ROLES_DISPOSICION as readonly string[]).includes(rol)
-            ? 'Disposición del workspace'
-            : 'Constancias que conservas'
-        }
-        abrev="DIS"
-      />
-      {/* La auditoría es de quienes rinden cuentas (RF-01.6): el enlace no aparece para
-          los demás roles y, si lo teclean, la RLS de evento_dominio no les da filas. */}
-      {(ROLES_AUDITORIA as readonly string[]).includes(rol) && (
-        <DestinoDelWorkspace to="/auditoria" etiqueta="Auditoría" abrev="AUD" />
-      )}
+      {/* 5. Estantes de consulta — por qué clase de cosa es cada destino. Las etiquetas no
+          son interactivas; en el riel se ocultan y los estantes los separa un hairline. */}
+      {lateral.estantes.map((estante) => (
+        <div
+          key={estante.etiqueta}
+          className="loop-estante"
+          style={{ display: 'flex', flexDirection: 'column', gap: 2 }}
+        >
+          <span className="loop-ancho" style={{ ...etiquetaLateral, padding: '14px 8px 8px' }}>
+            {estante.etiqueta}
+          </span>
+          {estante.destinos.map((destino) => (
+            <DestinoDelWorkspace key={destino.to} destino={destino} />
+          ))}
+        </div>
+      ))}
 
-      {/* 5. Pie de usuario. */}
+      {/* 6. Gobierno del workspace — lo archivístico, plegado en una fila que cuenta lo que
+          el rol ve; el grupo que abre va en el DOM inmediatamente después del botón. */}
+      <div className="loop-estante" style={{ marginTop: 16 }}>
+        <button
+          type="button"
+          className="loop-fila loop-fila-gobierno"
+          aria-expanded={gobiernoAbierto}
+          aria-controls={idGobierno}
+          aria-label={`${ETIQUETA_GOBIERNO} · ${lateral.gobierno.length} destinos`}
+          title={
+            gobiernoAbierto ? `${ETIQUETA_GOBIERNO} · plegar` : `${ETIQUETA_GOBIERNO} · desplegar`
+          }
+          onClick={() => fijarGobierno(!gobiernoAbierto)}
+          style={{
+            ...filaLateral,
+            padding: 10,
+            color: claro(0.7),
+            font: '600 12.5px var(--font-sans)',
+          }}
+        >
+          <span
+            className="loop-caret loop-caret-gira"
+            aria-hidden
+            data-abierto={gobiernoAbierto ? 'true' : 'false'}
+            style={{ font: '400 10px var(--font-mono)', color: claro(0.4), flex: 'none' }}
+          >
+            ▸
+          </span>
+          <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
+            {ETIQUETA_GOBIERNO}
+          </span>
+          <Abreviatura>GOB</Abreviatura>
+          <span style={{ font: '600 10.5px var(--font-mono)', color: claro(0.4), flex: 'none' }}>
+            {lateral.gobierno.length}
+          </span>
+        </button>
+        <div
+          id={idGobierno}
+          hidden={!gobiernoAbierto}
+          style={{
+            display: gobiernoAbierto ? 'flex' : undefined,
+            flexDirection: 'column',
+            gap: 2,
+            marginTop: 2,
+          }}
+        >
+          {lateral.gobierno.map((destino) => (
+            <DestinoDelWorkspace key={destino.to} destino={destino} estilo={{ paddingLeft: 26 }} />
+          ))}
+        </div>
+        {!gobiernoAbierto && (
+          <span
+            className="loop-ancho"
+            style={{
+              font: '400 11px/1.45 var(--font-sans)',
+              color: claro(0.38),
+              padding: '6px 10px 0',
+            }}
+          >
+            {notaDeGobierno(lateral.gobierno)}
+          </span>
+        )}
+      </div>
+
+      {/* 7. Pie de usuario. */}
       <div
         style={{
           marginTop: 'auto',
           display: 'flex',
           alignItems: 'center',
           gap: 9,
-          padding: '12px 8px 0',
+          padding: '14px 8px 0',
           borderTop: `1px solid ${claro(0.14)}`,
         }}
       >
@@ -707,7 +814,7 @@ function Lateral({
           </span>
           <span style={{ font: '400 11px var(--font-sans)', color: claro(0.55), ...truncado }}>
             {membresia
-              ? `${ETIQUETA_ROL[membresia.rol] ?? membresia.rol} · ${esBoutique ? 'autorizada' : 'propietaria'}`
+              ? `${ETIQUETA_ROL[membresia.rol] ?? membresia.rol} · ${esCurador ? 'autorizada' : 'propietaria'}`
               : 'Sin workspace'}
           </span>
         </div>
@@ -780,45 +887,54 @@ function Contador({
   );
 }
 
-type RutaSinParametros =
-  | '/importacion'
-  | '/aprobaciones'
-  | '/evidencia'
-  | '/insights'
-  | '/oportunidades'
-  | '/biblioteca'
-  | '/journeys'
-  | '/design-versions'
-  | '/propuestas'
-  | '/personas'
-  | '/segmentos'
-  | '/exportacion'
-  | '/disposicion'
-  | '/auditoria';
-
 /**
- * Un destino del workspace. En el riel estrecho (<1200px) el texto no cabe y la fila no puede
- * quedarse en blanco: lleva una etiqueta mono de tres letras, que es lo que el design system
- * usa en su riel (dirección 2a) mientras no haya set de iconos en el codebase.
+ * Un destino del workspace, tal como lo agrupa `agruparLateral`: etiqueta, su contador si
+ * hay algo pendiente (nunca un «0»), y el sufijo mono que recuerda qué hace. En el riel
+ * estrecho (<1200px) el texto no cabe y la fila no puede quedarse en blanco: lleva una
+ * etiqueta mono de tres letras, que es lo que el design system usa en su riel (dirección 2a)
+ * mientras no haya set de iconos en el codebase.
  */
 function DestinoDelWorkspace({
-  to,
-  etiqueta,
-  abrev,
-  children,
+  destino,
+  estilo,
+  clase,
 }: {
-  to: RutaSinParametros;
-  etiqueta: string;
-  abrev: string;
-  children?: ReactNode;
+  destino: DestinoDelLateral;
+  /** Lo que la fila cambia respecto a `filaLateral` (las de «Te espera», la sangría de gobierno). */
+  estilo?: CSSProperties;
+  /** Clase extra para el fondo (que va en la hoja, no en línea, para no anular el hover). */
+  clase?: string;
 }) {
+  const { to, etiqueta, abrev, contador, sufijo } = destino;
+  // El nombre accesible lleva lo que la fila DICE, no solo su rótulo: el sufijo y, sobre
+  // todo, el contador en palabras («3 pendientes de tu rol»), que en el riel ni se lee.
+  const nombre = [etiqueta, sufijo, contador?.titulo].filter(Boolean).join(' · ');
   return (
-    <Link className="loop-fila" to={to} title={etiqueta} aria-label={etiqueta} style={filaLateral}>
+    <Link
+      className={clase ? `loop-fila ${clase}` : 'loop-fila'}
+      to={to}
+      title={nombre}
+      aria-label={nombre}
+      style={{ ...filaLateral, ...estilo }}
+    >
       <span className="loop-ancho" style={{ flex: 1, ...truncado }}>
         {etiqueta}
       </span>
       <Abreviatura>{abrev}</Abreviatura>
-      {children}
+      {sufijo && (
+        <span
+          className="loop-ancho"
+          aria-hidden
+          style={{ font: '600 9.5px var(--font-mono)', color: claro(0.4), flex: 'none' }}
+        >
+          {sufijo}
+        </span>
+      )}
+      {contador && (
+        <Contador color={`var(--${contador.color})`} titulo={contador.titulo}>
+          {contador.n}
+        </Contador>
+      )}
     </Link>
   );
 }
@@ -1074,10 +1190,9 @@ function RetoDelArbol({
       </div>
     );
   }
-  // El esquema no limita un reto a un proyecto. La fila del reto abre el primero (el que el
-  // resto de la pantalla toma como actual); los demás no pueden quedarse sin entrada, así
-  // que cuelgan debajo como subfilas, cada una con su propio enlace.
-  const otros = reto.proyectos.filter((p) => p.id !== proyecto?.id);
+  // El cuarto nivel del árbol (ADR-0003): cada proyecto del reto cuelga debajo como subfila
+  // con su propio enlace. El actual —el que abre la fila del reto y gobierna cabecera y
+  // spotlight— va con fondo y texto al 72%; los demás, planos al 55%.
   return (
     <>
       <Link
@@ -1089,26 +1204,36 @@ function RetoDelArbol({
       >
         {contenido}
       </Link>
-      {otros.map((p) => (
-        <Link
-          key={p.id}
-          className="loop-fila"
-          to="/proyecto/$proyectoId"
-          params={{ proyectoId: p.id }}
-          title={`${p.codigo} ${p.titulo} · otro proyecto de ${reto.codigo}`}
-          style={{
-            ...filaLateral,
-            paddingLeft: 41,
-            color: claro(0.55),
-            font: '500 12px var(--font-sans)',
-          }}
-        >
-          <span style={{ font: '500 10.5px var(--font-mono)', color: claro(0.5), flex: 'none' }}>
-            {p.codigo}
-          </span>
-          <span style={{ flex: 1, ...truncado }}>{p.titulo}</span>
-        </Link>
-      ))}
+      {reto.proyectos.map((p) => {
+        const esActual = p.id === proyecto.id;
+        return (
+          <Link
+            key={p.id}
+            className="loop-fila"
+            to="/proyecto/$proyectoId"
+            params={{ proyectoId: p.id }}
+            title={`${p.codigo} ${p.titulo} · ${esActual ? 'proyecto actual' : 'otro proyecto'} de ${reto.codigo}`}
+            style={{
+              ...filaLateral,
+              padding: '7px 10px 7px 41px',
+              background: esActual ? claro(0.04) : undefined,
+              color: claro(esActual ? 0.72 : 0.55),
+              font: '500 12px var(--font-sans)',
+            }}
+          >
+            <span
+              style={{
+                font: '500 10.5px var(--font-mono)',
+                color: claro(esActual ? 0.6 : 0.5),
+                flex: 'none',
+              }}
+            >
+              {p.codigo}
+            </span>
+            <span style={{ flex: 1, ...truncado }}>{p.titulo}</span>
+          </Link>
+        );
+      })}
     </>
   );
 }

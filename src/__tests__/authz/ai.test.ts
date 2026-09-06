@@ -20048,6 +20048,57 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * LA FIDELIDAD VIAJA DECLARADA Y SIN MEDIR, en todas las capacidades y a propósito.
+   *
+   * RF-08.7 la exige —«la cita dice lo que el objeto afirma»— y es un juicio semántico: una cita
+   * puede aparecer palabra por palabra en el material y no sostener lo que se afirma con ella,
+   * así que el suelo puede marcar el máximo sobre una cita infiel. No se calcula desde la base y
+   * no se inventa.
+   *
+   * Lo que esta sonda fija es que el hueco SE VEA: su fila se escribe igualmente, con las tres
+   * cifras nulas, para que la exigencia aparezca en el informe junto a las que sí se miden. Sin
+   * ella, un informe de cuatro parecía completo y la ausencia vivía en un comentario — que es
+   * exactamente la clase de nota que caduca con el commit que la contradice.
+   */
+  it('RF-08.7: la fidelidad de citas aparece en el informe, vacía, en todas las capacidades', async () => {
+    await enWorkspaceLimpio('eval-fidelidad', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuesta = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuesta.id });
+
+      const informe = await correrEvalDeGrounding(curadorId, wsC);
+      const filas = informe.ultima!.mediciones.filter((m) => m.metrica === 'fidelidad-de-citas');
+      // Aparece, y en TODAS: es una exigencia del producto, no una propiedad de una capacidad.
+      expect(filas.length, 'la fidelidad no llegó al informe').toBeGreaterThan(1);
+      for (const f of filas) {
+        expect([f.numerador, f.denominador, f.sinVeredicto, f.tasa]).toEqual([
+          null,
+          null,
+          null,
+          null,
+        ]);
+      }
+      /*
+       * Y en el MISMO workspace el suelo sí trae cifras. Es lo que separa «declarada y no
+       * medida» de «aquí no hay datos»: si las dos salieran vacías, esta sonda pasaría con la
+       * corrida entera rota y no diría nada.
+       */
+      const suelo = informe.ultima!.mediciones.find(
+        (m) => m.metrica === 'suelo-presencia-literal' && m.capacidad === 'C2',
+      )!;
+      expect([suelo.numerador, suelo.denominador]).toEqual([1, 1]);
+    });
+  });
+
+  /**
    * Y LAS DOS PUERTAS, que no son la misma.
    *
    * Leer el informe es de quien audita; correrlo escribe un hecho fechado y es de quien lleva el

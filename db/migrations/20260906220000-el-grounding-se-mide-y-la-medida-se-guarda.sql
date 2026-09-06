@@ -73,6 +73,14 @@ create table medicion_eval (
    * material, que es un suelo: una cita que ni siquiera aparece no puede ser fiel. Publicarlo
    * como «fidelidad» dejaría que el nombre hiciera el trabajo que la medición no hace.
    *
+   * Y por eso `fidelidad-de-citas` está en la lista SIN QUE NADIE LA MIDA. RF-08.7 la nombra, y
+   * lo que este repositorio sabe calcular es el suelo; escribir sólo el suelo dejaba la
+   * exigencia ausente del informe, visible únicamente en un comentario y en el cuerpo de un PR.
+   * Su fila se escribe con las cifras en null —la misma forma que una métrica sin universo— para
+   * que el hueco aparezca EN EL INFORME, al lado de las que sí se miden, en vez de que un
+   * informe de cuatro parezca completo. Medirla pide un juicio semántico, y las dos salidas
+   * honestas —modelo como juez, o nombrar un proxy como proxy— son decisión de producto.
+   *
    * Y `contradicciones` SÍ se mide, contra lo que decía la primera versión de este comentario.
    * Escribí aquí que no tenía definición operativa en el repositorio y era falso: `contradiccion`
    * existe desde `20260902080000-insight-decision.sql` —«evidencia que CONTRADICE al insight; se
@@ -82,6 +90,7 @@ create table medicion_eval (
    * se mide.
    */
   metrica text not null check (metrica in (
+    'fidelidad-de-citas',
     'suelo-presencia-literal',
     'afirmaciones-no-soportadas',
     'correccion-humana',

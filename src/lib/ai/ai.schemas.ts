@@ -1258,10 +1258,18 @@ export type ConsentimientoDeItem = {
  * puede sostener cualquier cosa. Publicarlo como «fidelidad» dejaría que el nombre hiciera el
  * trabajo que la medición no hace.
  *
+ * Por eso `fidelidad-de-citas` está en la lista y NO se mide: RF-08.7 la exige con ese nombre, y
+ * su fila se escribe con las cifras en null. Es la diferencia entre una exigencia que falta y
+ * una que falta A LA VISTA — con sólo el suelo publicado, el informe parecía completo y el hueco
+ * vivía en un comentario. Medirla pide un juicio semántico; las dos salidas honestas (modelo
+ * como juez, con el problema de que la evaluación pasaría a depender del componente evaluado, o
+ * nombrar un proxy COMO proxy) son decisión de producto y van en el cuerpo del PR.
+ *
  * La lista es la misma que el CHECK de `medicion_eval.metrica`, y un censo lo comprueba contra
  * la base: es la quinta vez en esta épica que una enumeración escrita en dos sitios se separa.
  */
 export const METRICAS_DE_GROUNDING = [
+  'fidelidad-de-citas',
   'suelo-presencia-literal',
   'afirmaciones-no-soportadas',
   'correccion-humana',

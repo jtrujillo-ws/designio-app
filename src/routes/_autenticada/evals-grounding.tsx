@@ -80,6 +80,13 @@ const PRESENTACION: Record<
   MetricaDeGrounding,
   { titulo: string; explica: string; numerador: string; subirEsBueno: boolean }
 > = {
+  'fidelidad-de-citas': {
+    titulo: 'Fidelidad de citas — exigida y NO medida',
+    explica:
+      'RF-08.7 la pide con estas palabras: «la cita dice lo que el objeto afirma». Es un juicio semántico y no se calcula desde la base, así que esta fila viaja vacía a propósito: una cita puede aparecer palabra por palabra en el material y no sostener lo que se afirma con ella, de modo que el suelo de abajo puede marcar el máximo sobre una cita infiel. Medirla tiene dos salidas honestas, y las dos son decisión de producto: un modelo como juez —que haría depender la evaluación del mismo componente que evalúa, y costaría por corrida— o nombrar un proxy COMO proxy. Hasta que se decida, la exigencia aparece aquí con su hueco a la vista en vez de faltar en silencio.',
+    numerador: 'sin medir',
+    subirEsBueno: true,
+  },
   'suelo-presencia-literal': {
     titulo: 'Suelo de presencia literal',
     explica:

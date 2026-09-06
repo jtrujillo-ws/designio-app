@@ -374,6 +374,28 @@ function ceroSiDeclarado(
  * se compara entre versiones de prompt, unos milisegundos no mueven nada; mezclar dos
  * instantes DENTRO de una misma medida sí.
  */
+/**
+ * QUIÉN LA DISPARA HOY, Y QUÉ FALTA PARA QUE SE DISPARE SOLA.
+ *
+ * Hoy: una persona, desde la pantalla. El diseño técnico pide además una corrida PROGRAMADA
+ * («evals de grounding programadas», §Cadencias; «evals de grounding en CI + corrida
+ * programada», §Cuotas), y esa mitad no está — no por olvido de esta función, sino porque el
+ * planificador que describe ese documento NO EXISTE en el repositorio: la tabla
+ * `scheduled_jobs`, el tick enganchado al middleware, el latch de claim y el hook con
+ * `x-cron-secret` están todos por construir.
+ *
+ * No es una ausencia de esta fase: `medicion.servicio.ts` la tiene escrita igual para los
+ * recordatorios de RF-07.4 —«no hay canal de correo ni planificador… así que el recordatorio
+ * EFECTIVO depende de una cadencia que todavía no existe»—. Construirlo es una pieza de
+ * infraestructura entera, no un añadido a un lector de métricas, y hacerlo aquí lo dejaría
+ * escrito para un solo consumidor cuando lo van a usar tres.
+ *
+ * Lo que esta función SÍ hace para no estorbar ese día: es una función normal de `(actor,
+ * workspace)` sin nada de HTTP ni de sesión, así que el job que llegue la llama tal cual. Y
+ * mientras tanto la pantalla no finge estar al día: enseña la fecha de la última corrida y avisa
+ * cuando midió una versión de la capa AI distinta de la que corre hoy, que es la forma en que
+ * una corrida vieja se delata.
+ */
 export async function correrEvalDeGrounding(
   actorId: string,
   workspaceId: string,
@@ -406,6 +428,22 @@ export async function correrEvalDeGrounding(
        * comparen fila contra fila sin volver a derivar nada.
        */
       const porMetrica: Record<MetricaDeGrounding, (c: string) => Recuento | null> = {
+        /*
+         * DECLARADA Y NO MEDIDA, en todas las capacidades y a propósito.
+         *
+         * RF-08.7 exige «fidelidad de citas» —«la cita dice lo que el objeto afirma»— y eso es un
+         * JUICIO SEMÁNTICO: una cita puede aparecer palabra por palabra en el material y no
+         * sostener lo que se afirma con ella, así que el suelo de presencia puede marcar 100 %
+         * sobre una cita infiel. No se calcula desde la base, y no se inventa.
+         *
+         * Su fila se escribe igualmente, con las tres cifras en null, para que la exigencia
+         * aparezca EN EL INFORME junto a las que sí se miden. Con sólo el suelo publicado, un
+         * informe de cuatro métricas parecía completo y el hueco vivía en un comentario; así,
+         * quien lo lee ve que falta. Las dos salidas honestas para medirla —modelo como juez, con
+         * el problema de que la evaluación pasaría a depender del componente que evalúa y a
+         * costar por corrida, o nombrar un proxy COMO proxy— son decisión de producto.
+         */
+        'fidelidad-de-citas': () => SIN_UNIVERSO,
         // El suelo tiene universo en toda capacidad: la que no declara citas mide cero de cero,
         // que es verdad —no citó nada—, y no «aquí no se puede medir».
         'suelo-presencia-literal': (c) =>
@@ -507,10 +545,12 @@ export async function informeDeGrounding(
        * Todo en una consulta: pedirlas por separado bajo instantáneas distintas podía devolver
        * la misma corrida dos veces si una tercera entraba en medio.
        *
-       * `distinct on` sobre la versión da la más reciente de CADA versión, y con el límite en
-       * tres caben la última, la anterior inmediata y la de otra versión aunque las dos
-       * primeras compartan versión. Se pide sobre la unión de las dos consultas para no
-       * suponer cuántas versiones hay en medio.
+       * Y ACOTADA: como mucho tres filas, sea cual sea el historial. La primera versión de esto
+       * usaba `distinct on (prompt_version)`, que trae una fila por versión histórica, y el
+       * `Promise.all` de abajo pedía después las mediciones de todas para quedarse con tres:
+       * el informe se encarecía cada vez que el producto publicaba una versión. La unión es de
+       * dos consultas acotadas —las dos últimas, y la última de otra versión— porque lo que hay
+       * que traer son exactamente las tres que se devuelven.
        */
       const corridas = await tx`
         with ultimas as (
@@ -519,18 +559,23 @@ export async function informeDeGrounding(
           where workspace_id = ${workspaceId}
           order by corrida_en desc, id desc
           limit 2
-        ), por_version as (
-          select distinct on (prompt_version) id, prompt_version, corrida_en
+        ), otra_version as (
+          /*
+           * La más reciente de una versión DISTINTA de la que mide la última. Se busca con su
+           * propio limit 1 y no recorriendo todas las versiones: con distinct on (prompt_version) la unión traía UNA FILA POR VERSIÓN HISTÓRICA y el Promise.all
+           * de abajo pedía las mediciones de todas ellas para quedarse con tres — el informe se
+           * volvía más caro cada vez que el producto publicaba una versión. Y mi propio
+           * comentario decía «con el límite en tres», que era justo lo que la consulta no hacía.
+           */
+          select id, prompt_version, corrida_en
           from corrida_eval
           where workspace_id = ${workspaceId}
-          order by prompt_version, corrida_en desc, id desc
+            and prompt_version is distinct from (select prompt_version from ultimas limit 1)
+          order by corrida_en desc, id desc
+          limit 1
         )
         select id, prompt_version, corrida_en::text as corrida_en
-        from (
-          select * from ultimas
-          union
-          select * from por_version
-        ) as todas
+        from (select * from ultimas union select * from otra_version) as todas
         order by corrida_en desc, id desc`;
 
       const conMediciones = await Promise.all(

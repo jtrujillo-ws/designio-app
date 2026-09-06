@@ -919,6 +919,32 @@ begin
   ) then
     raise exception 'la propuesta debe colgar de la llamada que la produjo: mismo concepto';
   end if;
+  -- Y LA LENTE, que es la otra mitad de la identidad de una sesión de C4. El arquetipo viaja
+  -- DENTRO del contenido y no como columna, así que ninguna clave ajena lo mira: por la
+  -- superficie concedida entraba una propuesta cuya lente es de otro reto, o está refutada.
+  --
+  -- Y no se queda en inútil. `candidatas` no ofrece un concepto que ya tenga una propuesta de
+  -- C4 en curso, así que la fila BLOQUEA pedir otro lote; y aceptarla muere después contra
+  -- `revision_simulada_insert`, que sí exige las dos cosas. Queda una propuesta que sólo se
+  -- puede rechazar, con la llamada al proveedor ya pagada — el mismo modo de fallo que las dos
+  -- puertas del INSERT existen para evitar, entrando por donde no se miraba.
+  --
+  -- Va aquí y no en la rama de `session_user` del otro guard: que la lente sea del reto del
+  -- concepto es lo que hace que la sesión sea DE ESE concepto, y eso vale para todo el que
+  -- escriba. Las mismas dos condiciones que pide la política de la revisión, ni una más.
+  --
+  -- La comparación es por TEXTO y no casteando a uuid: el contenido lo escribe quien inserta y
+  -- un valor que no sea uuid reventaría el cast con un error de tipo en vez del motivo. Sin
+  -- `arquetipoId` no hay lente que comprobar, y eso también se rechaza.
+  if not exists (
+    select 1
+      from concepto c
+      join arquetipo a on a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
+     where c.id = new.concepto_id and c.workspace_id = new.workspace_id
+       and a.id::text = new.contenido ->> 'arquetipoId'
+       and a.estado <> 'refutado') then
+    raise exception 'esa propuesta declara una lente que no es un arquetipo vigente del reto de su concepto: una sesión de C4 es la lectura de UNA lente de ESE concepto (SYS-20), y nacería imposible de aceptar';
+  end if;
   return new;
 end $$;
 

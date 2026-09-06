@@ -9931,6 +9931,101 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y LA LENTE SE COMPRUEBA AL ESCRIBIR LA PROPUESTA, no sólo al aceptarla.
+   *
+   * `propuesta_ai_c4_linaje_guard` comprobaba que la propuesta cuelgue de la llamada que la
+   * produjo —mismo concepto— y nada más; el guard del INSERT mira el estado del concepto y la
+   * ventana de la etapa. Ninguno miraba el `arquetipoId` del contenido, que es la otra mitad de
+   * la identidad de una sesión de C4.
+   *
+   * Por la superficie concedida entraba entonces una propuesta cuya lente es de OTRO reto, o
+   * está REFUTADA. Y no se queda en inútil: `candidatas` no ofrece un concepto con propuesta de
+   * C4 en curso, así que la fila BLOQUEA pedir otro lote, y aceptarla muere después contra
+   * `revision_simulada_insert`. Una propuesta que sólo se puede rechazar, con la llamada pagada
+   * — el mismo modo de fallo que la ronda del candado, entrando por otra puerta.
+   *
+   * Va en el guard de LINAJE y no en la rama de `session_user`: que la lente sea del reto del
+   * concepto es lo que hace que la sesión sea de ese concepto, y eso vale para todo el que
+   * escriba, no sólo para la aplicación.
+   */
+  it('C4 no deja nacer una propuesta cuya lente no es del concepto', async () => {
+    await enWorkspaceLimpio('c4-lente-ajena', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Una lente de OTRO reto del mismo workspace: las claves ajenas de `propuesta_ai` no la
+      // ven, porque el arquetipo viaja dentro del contenido y no como columna.
+      const [servicio] = await admin`select servicio_ancla_id from reto where id = ${retoC}`;
+      const [otro] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
+        values (${wsC}, ${servicio!.servicio_ancla_id as string}, 'R-OTRO', 'Otro reto',
+                ${curadorId})
+        returning id`;
+      const [ajena] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${otro!.id as string}, 'El de otro reto', 'Perfil de otro sitio',
+                ${curadorId})
+        returning id`;
+      await admin`update arquetipo set estado = 'refutado',
+        veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
+        where id = ${lenteB} and workspace_id = ${wsC}`;
+
+      const proponer = (arquetipoId: string) =>
+        conUsuario(curadorId, async (tx) => {
+          const contenido = {
+            arquetipoId,
+            sintesis: 'Una lectura.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas: [
+                  { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+            confianzaPropuesta: 'media',
+          };
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return p!.id as string;
+        });
+
+      await expect(
+        proponer(ajena!.id as string),
+        'nace una propuesta de C4 cuya lente es de otro reto',
+      ).rejects.toThrow(/lente|arquetipo/i);
+      await expect(
+        proponer(lenteB),
+        'nace una propuesta de C4 sobre una lente refutada',
+      ).rejects.toThrow(/lente|arquetipo/i);
+
+      // Y con la lente buena entra, y el concepto deja de ofrecerse — que es justo lo que hace
+      // que las de arriba fueran un bloqueo y no una fila inerte.
+      const buena = await proponer(lenteA);
+      expect(buena).toBeTruthy();
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(
+        panel.candidatas.C4.lista.some((i) => i.id === conceptoId),
+        'una propuesta de C4 en curso tiene que retirar el concepto de la cola',
+      ).toBe(false);
+    });
+  });
+
+  /**
    * UN ARQUETIPO REFUTADO NO REVISA A NADIE.
    *
    * El veredicto de SPEC-04.11 dice que ese perfil NO DESCRIBE A NADIE. El repositorio ya sacó

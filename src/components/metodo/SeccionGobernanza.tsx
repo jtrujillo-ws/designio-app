@@ -315,11 +315,13 @@ function BloqueDecisiones({
               ))}
             </Select>
           )}
-          {tipo === 'pasa-muere' && conceptoId !== '' && (
-            <RevisionesDelConcepto
-              revisiones={conceptos.find((c) => c.id === conceptoId)?.revisiones ?? []}
-            />
-          )}
+          {/*
+            Aquí NO van las revisiones simuladas, y su ausencia es la mitad que faltaba del
+            arreglo que las sacó fuera. `BloqueRevisionesSimuladas` ya las pinta —todas, sin
+            puerta de rol, arriba en la sección—, así que repetirlas aquí no añade nada: alarga
+            el formulario con las sesiones, sus hallazgos, sus citas y sus preguntas, y empuja
+            hacia abajo los campos con los que de verdad se registra la decisión.
+          */}
           {tipo === 'pasa-muere' && conceptos.length === 0 && (
             <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
               Este reto no tiene conceptos todavía: un pasa/muere decide SOBRE uno (RF-04.10).

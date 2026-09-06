@@ -6958,6 +6958,53 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   }
 
   /**
+   * Un concepto con N lentes, cada una con su documento citable.
+   *
+   * Hermano de `conceptoConDosLentes` para lo que necesita MÁS de las que caben en un lote:
+   * la ventana sólo se puede medir con más arquetipos que `MAX_REVISIONES_POR_LOTE`.
+   */
+  async function conceptoConLentes(
+    wsC: string,
+    retoC: string,
+    actorId: string,
+    cuantas: number,
+  ): Promise<{ conceptoId: string; lentes: { arq: string; ev: string; nombre: string }[] }> {
+    const admin = sqlAdmin();
+    const [fte] = await admin`insert into fuente
+      (workspace_id, tipo, titulo, referencia, creado_por)
+      values (${wsC}, 'entrevista', 'Entrevistas del reto', 'ref-n', ${actorId})
+      returning id`;
+    const lentes: { arq: string; ev: string; nombre: string }[] = [];
+    for (let i = 0; i < cuantas; i++) {
+      // El nombre lleva el índice con cero delante: el material ordena por nombre, así que así
+      // el orden alfabético y el de creación son el mismo y la sonda puede razonar sobre él.
+      const nombre = `Perfil ${String(i).padStart(2, '0')}`;
+      const [ev] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, ${`Entrevista ${String(i).padStart(2, '0')}`},
+                ${`Lo que dijo el perfil ${i}.`}, '{}'::jsonb, ${actorId})
+        returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev!.id as string}, 'concedido', 'cliente',
+                'Consentimiento del participante', ${actorId}, now(), ${actorId})`;
+      const [arq] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, ${nombre}, 'Perfil emergente de la evidencia', ${actorId})
+        returning id`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${arq!.id as string}, ${ev!.id as string})`;
+      lentes.push({ arq: arq!.id as string, ev: ev!.id as string, nombre });
+    }
+    const [cpt] = await admin`insert into concepto
+      (workspace_id, reto_id, titulo, descripcion, umbral_test, creado_por)
+      values (${wsC}, ${retoC}, 'Concepto de muchas lentes', 'Descripción breve',
+              '6 de cada 8 completan sin ayuda', ${actorId})
+      returning id`;
+    return { conceptoId: cpt!.id as string, lentes };
+  }
+
+  /**
    * Una revisión escrita A MANO y COMPLETA, en UNA transacción.
    *
    * El suelo exige en el commit al menos un hallazgo y al menos una pregunta de test, así que
@@ -8610,6 +8657,85 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [sinSello] = await admin`select propuesta_ai_id from revision_simulada
         where id = ${aMano} and workspace_id = ${wsC}`;
       expect(sinSello!.propuesta_ai_id, 'la escrita a mano no debería llevar sello').toBeNull();
+    });
+  });
+
+  /**
+   * LA VENTANA TAMBIÉN AVANZA CUANDO SE RECHAZA, y antes no.
+   *
+   * La ronda 2 hizo que aceptar moviera la ventana: `lentesDelLote` descuenta las lentes que ya
+   * tienen `revision_simulada` de este concepto. Pero RECHAZAR no escribe esa fila, así que
+   * descontaba cero — y con siete arquetipos el lote pedía los seis primeros por orden
+   * alfabético, se rechazaban los seis, y el siguiente lote pedía exactamente los mismos. Del
+   * séptimo en adelante no se revisaba ninguno nunca, que es literalmente la avería que la
+   * ronda 2 arregló, entrando por la otra puerta.
+   *
+   * El arreglo NO es excluir la lente rechazada: se rechaza porque la salida no valía, y volver
+   * a pedirla tiene que seguir siendo posible. Es ROTAR — las que nunca se propusieron van
+   * primero, y las ya intentadas después—, así que la séptima entra y la primera vuelve luego.
+   *
+   * Y sin contar las HERMANAS del propio lote, por lo mismo que la exclusión: si rechazar una
+   * moviera el orden, la huella de sus hermanas dejaría de cuadrar y aceptarlas fallaría con
+   * «material movido».
+   */
+  it('la ventana de lentes de C4 avanza también cuando se rechaza el lote', async () => {
+    await enWorkspaceLimpio('c4-ventana-rechazo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lentes } = await conceptoConLentes(wsC, retoC, curadorId, 7);
+      expect(lentes.length).toBe(MAX_REVISIONES_POR_LOTE + 1);
+      const sesion = (l: { arq: string; ev: string }) => ({
+        arquetipoId: l.arq,
+        sintesis: 'Una lectura de esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Lo que pide',
+            descripcion: 'Sale de su testimonio.',
+            esHipotesis: false,
+            citas: [{ evidenciaId: l.ev, fragmento: 'Lo que dijo el perfil', localizacion: 'resumen' }],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Y si no?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      // Qué lentes pide el material de AHORA, leído del propio material y no de una cuenta.
+      const pedidas = async () =>
+        conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return lentesDelLote(material!.arquetipos).lentes.map((a) => a.id);
+        });
+
+      const primeras = await pedidas();
+      expect(primeras.length).toBe(MAX_REVISIONES_POR_LOTE);
+      await conProveedor(
+        {
+          ok: true,
+          datos: { revisiones: primeras.map((id) => sesion(lentes.find((l) => l.arq === id)!)) },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      // Se RECHAZAN las seis. Ninguna escribe `revision_simulada`.
+      const panel = await panelPropuestas(curadorId, wsC);
+      for (const p of panel.pendientes.filter((x) => x.capacidad === 'C4')) {
+        await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p.id });
+      }
+
+      const segundas = await pedidas();
+      expect(segundas.length).toBe(MAX_REVISIONES_POR_LOTE);
+      const septima = lentes.find((l) => !primeras.includes(l.arq))!;
+      expect(
+        segundas.includes(septima.arq),
+        'tras rechazar el lote entero, la lente que nunca se propuso sigue sin pedirse',
+      ).toBe(true);
+      // Y la rotación no la excluye para siempre: alguna de las rechazadas vuelve.
+      expect(
+        segundas.some((id) => primeras.includes(id)),
+        'las lentes rechazadas quedaron excluidas: no se podrían reintentar nunca',
+      ).toBe(true);
     });
   });
 
@@ -11631,6 +11757,61 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       ciegos,
       'un índice único sobre una columna de ancla que no distingue la capacidad: dos ' +
         'capacidades ancladas ahí se excluyen entre sí, y son pipelines independientes',
+    ).toEqual([]);
+  });
+
+  /**
+   * EL TECHO DEL LOTE DE LA BASE CABE PARA TODAS, no sólo para la que lo escribió.
+   *
+   * `propuesta_ai_orden_check` nació con `orden <= 3` —cuatro criterios de C0, puestos 0..3—
+   * y se quedó ahí mientras el registro declaraba lotes más grandes: 5 oportunidades en C3,
+   * 6 entradas de KPI en C6, 6 revisiones en C4. La quinta propuesta de cualquiera de las tres
+   * reventaba el INSERT del lote ENTERO con un 23514, y con la llamada ya pagada.
+   *
+   * No lo cazó ninguna sonda porque ninguna generaba un lote de más de cuatro. Salió al montar
+   * la de la ventana de lentes, que necesita siete arquetipos — y para entonces dos de las tres
+   * capacidades afectadas ya estaban mergeadas.
+   *
+   * Así que la pregunta se hace por el REGISTRO y no por un número escrito aquí: el techo de la
+   * base tiene que dar cabida al lote más grande que cualquier capacidad declare. La que venga
+   * con un lote de siete lo romperá aquí, que es donde se puede leer.
+   */
+  it('el techo de orden en la base cabe para el lote más grande que declara el registro', async () => {
+    const admin = sqlAdmin();
+    const [fila] = await admin`select pg_get_constraintdef(oid) as d from pg_constraint
+      where conname = 'propuesta_ai_orden_check'`;
+    const definicion = fila!.d as string;
+    /*
+     * El techo se lee POR CAPACIDAD del `case`, no como un número único: subirlo a uno solo
+     * —el máximo de todas— le quitaría el suyo a las que declaran menos, y ese techo es lo que
+     * defiende la sonda «C0 reparte una llamada entre su lote». Lo aprendí subiéndolo y viéndola
+     * caer, así que el censo compara los DOS lados capacidad a capacidad.
+     */
+    const enLaBase = new Map(
+      [...definicion.matchAll(/WHEN '([^']+)'::text THEN (\d+)/g)].map((m) => [
+        m[1] as string,
+        Number(m[2]),
+      ]),
+    );
+    const porDefecto = Number(/ELSE (\d+)/.exec(definicion)?.[1]);
+    expect(
+      enLaBase.size > 0 && Number.isFinite(porDefecto),
+      `no se pudo leer el techo por capacidad de: ${definicion}`,
+    ).toBe(true);
+
+    const discrepan = CAPACIDADES_ACTIVAS.map((c) => {
+      const declarado = (CAPACIDADES[c].lote?.maximo ?? 1) - 1;
+      const enBase = enLaBase.get(c) ?? porDefecto;
+      return { c, declarado, enBase };
+    })
+      .filter((x) => x.declarado !== x.enBase)
+      .map((x) => `${x.c}: el registro dice ${x.declarado + 1} y la base admite ${x.enBase + 1}`)
+      .sort();
+    expect(
+      discrepan,
+      'el techo del lote en la base y el que declara el registro no dicen lo mismo: si la base ' +
+        'admite MENOS, el INSERT del lote entero falla con un 23514 y la llamada ya está ' +
+        'pagada; si admite MÁS, esa capacidad se queda sin su techo',
     ).toEqual([]);
   });
 

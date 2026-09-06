@@ -692,6 +692,42 @@ alter table llamada_ai add constraint llamada_ai_concepto_fk
 alter table propuesta_ai add constraint propuesta_ai_concepto_fk
   foreign key (concepto_id, workspace_id) references concepto (id, workspace_id);
 
+-- EL TECHO DEL LOTE ERA EL DE C0, Y TRES CAPACIDADES LO PASARON DE LARGO.
+--
+-- `propuesta_ai_orden_check` nació en «el lote de C0 tiene techo» con `orden <= 3`, que es
+-- exacto para C0: cuatro criterios, puestos 0..3. Desde entonces el registro declara lotes más
+-- grandes —C3 con 5 oportunidades, C6 con 6 entradas de KPI, C4 con 6 revisiones— y el CHECK
+-- se quedó donde estaba. O sea que la quinta propuesta de cualquiera de las tres revienta el
+-- INSERT del lote ENTERO con un 23514, con la llamada al proveedor ya pagada.
+--
+-- No lo cazó nada porque ninguna sonda generaba un lote de más de cuatro: salió al montar la
+-- de la ventana de lentes, que necesita siete arquetipos. Dos de las tres capacidades afectadas
+-- ya están en `agents`.
+--
+-- Es la MISMA avería que las cuatro listas escritas a mano de este fichero, en su cuarta forma:
+-- un límite escrito para una capacidad que la siguiente no ve.
+--
+-- Y NO se arregla subiendo el número al máximo de todas: eso le quitaría a C0 su techo —con
+-- «orden <= 5» un lote de C0 admitiría seis criterios cuando declara cuatro— y ese techo es
+-- justo lo que la sonda «C0 reparte una llamada entre su lote» defiende. Lo aprendí subiéndolo
+-- y viéndola caer.
+--
+-- Así que el techo es POR CAPACIDAD, que es lo que siempre debió ser: una cota que Postgres
+-- impone por fila, sin preguntar «cuántas hay ya» —la pregunta sobre el conjunto que dos
+-- transacciones contestan a la vez sobre snapshots distintos—. Los números salen de
+-- `CAPACIDADES[c].lote.maximo` y el censo de la suite los enfrenta uno a uno: si alguien mueve
+-- uno de los dos lados, cae ahí y no en producción con la llamada pagada.
+alter table propuesta_ai drop constraint propuesta_ai_orden_check;
+alter table propuesta_ai add constraint propuesta_ai_orden_check check (
+  orden >= 0 and orden <= case capacidad
+    when 'C0' then 3   -- 4 criterios
+    when 'C2' then 3   -- 4 insights
+    when 'C3' then 4   -- 5 oportunidades
+    when 'C6' then 5   -- 6 entradas de KPI
+    when 'C4' then 5   -- 6 revisiones simuladas
+    else 0             -- CI, CT, C5, C7: una propuesta por llamada
+  end);
+
 -- Y EL ÍNDICE QUE IMPIDE DOS TRABAJOS A LA VEZ SOBRE EL MISMO CONCEPTO.
 --
 -- El suelo de «no se paga dos veces por el mismo objeto» son los índices únicos parciales de

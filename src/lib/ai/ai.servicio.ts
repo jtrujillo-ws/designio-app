@@ -3477,7 +3477,31 @@ export async function huellaDelMaterialDeRevision(
                   join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
                   where ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
                     and evidencia_usable(e.id, e.workspace_id, 'cliente')))
-                order by a.nombre, a.id), '[]'::json)
+                /*
+                 * Y ROTANDO: las lentes que ya tuvieron una propuesta DECIDIDA sobre este
+                 * concepto van al final, las que nunca se propusieron van delante.
+                 *
+                 * Descontar por «revision_simulada» hace avanzar la ventana al ACEPTAR, y sólo
+                 * al aceptar: rechazar no escribe esa fila, así que con siete arquetipos se
+                 * pedían los seis primeros por nombre, se rechazaban los seis, y el lote
+                 * siguiente pedía otra vez exactamente los mismos. Del séptimo en adelante no
+                 * se revisaba ninguno nunca — que es la avería que descontar las revisadas
+                 * arregló, entrando por la otra puerta.
+                 *
+                 * Se ROTA y no se excluye porque una lente se rechaza cuando su salida no
+                 * valía, y volver a pedirla tiene que seguir siendo posible: primero las que
+                 * nadie ha intentado, después las intentadas.
+                 *
+                 * Sin contar las HERMANAS de este mismo lote, por el mismo motivo que la
+                 * exclusión de abajo: si rechazar una moviera el orden, el material de sus
+                 * hermanas cambiaría y aceptarlas fallaría con «material movido».
+                 */
+                order by (exists (select 1 from propuesta_ai pd
+                  where pd.concepto_id = c.id and pd.workspace_id = c.workspace_id
+                    and pd.capacidad = 'C4' and pd.estado <> 'propuesta'
+                    and pd.contenido ->> 'arquetipoId' = a.id::text
+                    and pd.llamada_id is distinct from ${loteId ?? null}::uuid)),
+                  a.nombre, a.id), '[]'::json)
        from arquetipo a
        where a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
          /*

@@ -746,6 +746,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // un `miembro_usuario_id_fkey` al final, que no dice nada de dónde está.
       await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      /* Y el post mortem, que es el quinto objeto sellado — y el único cuyo sello apunta a una
+       * propuesta que NO lo creó, porque la fila ya existía. La FK es la misma. */
+      await admin`update outcome_review set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -756,12 +759,45 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from entrada_kpi where workspace_id = ${wsL}`;
       await admin`delete from metric_registry where workspace_id = ${wsL}`;
       await admin`delete from derecho_uso where workspace_id = ${wsL}`;
+      /* El post mortem y sus lecturas cuelgan de los criterios, así que van delante. */
+      await admin`delete from resultado_criterio where workspace_id = ${wsL}`;
+      await admin`delete from outcome_review where workspace_id = ${wsL}`;
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
       // Y la oportunidad con su traza, que es el QUINTO destino y llega con C3. Va aquí y no
       // más abajo porque apunta a los dos lados: su traza cuelga de `insight` —que se borra
       // justo debajo— y ella misma del `reto`, que se borra al final.
       await admin`delete from oportunidad_insight where workspace_id = ${wsL}`;
       await admin`delete from oportunidad where workspace_id = ${wsL}`;
+      /*
+       * El expediente del post mortem, de dentro afuera: las constataciones cuelgan del
+       * effective state y del elemento, el effective state del release, y el review del reto,
+       * que se borra al final. Sin esto, el reto no se puede borrar y el workspace se queda
+       * colgado — que es exactamente lo que dijo la primera vuelta de las sondas de C7.
+       */
+      await admin`delete from constatacion where workspace_id = ${wsL}`;
+      await admin`delete from effective_state where workspace_id = ${wsL}`;
+
+      /*
+       * Los elementos y su design version, en LA MISMA transacción. Aprobar los congela
+       * («la design version se aprobó mientras se editaban sus elementos», SYS-05) y ese guard
+       * corre también para el propietario; desaprobar no es salida, porque la transición
+       * aprobada → borrador es ilegal.
+       *
+       * La salida es que ese guard es un constraint trigger DIFERIDO: lee el estado de la
+       * design version AL COMMIT. Borrando las dos cosas juntas, cuando mira ya no hay
+       * versión que consultar y se aparta —que es la respuesta correcta, porque lo que
+       * protege es un congelado que a esas alturas no existe—.
+       *
+       * Y el plan de releases va dentro por lo mismo, con su propia versión del argumento: «ese
+       * release ya salió: su alcance es fijo» protege el alcance de un release desplegado, y en
+       * la misma transacción el release tampoco queda.
+       */
+      await admin.begin(async (tx) => {
+        await tx`delete from release_elemento where workspace_id = ${wsL}`;
+        await tx`delete from release where workspace_id = ${wsL}`;
+        await tx`delete from elemento_cambio where workspace_id = ${wsL}`;
+        await tx`delete from design_version where workspace_id = ${wsL}`;
+      });
       await admin`delete from cita where workspace_id = ${wsL}`;
       await admin`delete from contradiccion where workspace_id = ${wsL}`;
       await admin`delete from afirmacion where workspace_id = ${wsL}`;
@@ -6446,6 +6482,310 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * escriba lo que el guard exige. Las sondas miden el SUELO —que por SQL crudo no se pueda
    * mentir—; ésta mide que el camino de producción no se caiga contra su propio suelo.
    */
+  /**
+   * Un post mortem con EXPEDIENTE: el tablero de conciliación de una design version y la
+   * lectura de un criterio. Es lo mínimo que C7 necesita para tener algo que leer.
+   *
+   * Se monta con el propietario y no por el camino del producto a propósito: llegar hasta aquí
+   * por la app son siete gates, un registry firmado y una ventana de medición cerrada, y eso ya
+   * lo prueban los casos de CTX-05 y CTX-06. Lo que estos casos miden es C7 sobre un expediente
+   * REAL —filas de verdad, leídas por las mismas funciones que lee el tablero de G7—, no cómo
+   * se llega a tenerlo.
+   */
+  async function postMortemConExpediente(
+    wsC: string,
+    retoC: string,
+    servicioC: string,
+    actorId: string,
+    opciones: { desviado?: boolean } = {},
+  ): Promise<{ reviewId: string; elementoId: string; criterioId: string }> {
+    const admin = sqlAdmin();
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${wsC}, ${retoC}, 'P-C7', 'Proyecto del post mortem', 'activo', 'rapido', ${actorId})
+      returning id`;
+    const proyectoId = p!.id as string;
+    /*
+     * Aprobar es INSEPARABLE de congelar: el CHECK de la tabla no admite `aprobada` sin
+     * snapshot, aprobador y fecha (RF-06.3). Así que la versión nace borrador y se aprueba
+     * después con su snapshot, que es también el orden real.
+     */
+    const [jr] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, descripcion, creado_por)
+      values (${wsC}, ${servicioC}, 'to-be', 'Journey del post mortem',
+              'El recorrido que la design version cambia', ${actorId}) returning id`;
+    const [dv] = await admin`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, journey_id, titulo, resumen, creado_por)
+      values (${wsC}, ${proyectoId}, ${servicioC}, ${jr!.id as string}, 'Verificación asistida',
+              'Resuelve la verificación dentro de la app', ${actorId}) returning id`;
+    const dvId = dv!.id as string;
+    const [el] = await admin`insert into elemento_cambio
+      (workspace_id, design_version_id, tipo, operacion, titulo, detalle, orden, creado_por)
+      values (${wsC}, ${dvId}, 'touchpoint', 'agrega', 'Verificación en video',
+              'Sustituye la carga del documento', 0, ${actorId}) returning id`;
+    const elementoId = el!.id as string;
+    /*
+     * Y ahora sí la aprobación, con dos condiciones que el guard impone y que valen la pena
+     * decir porque las dos costaron una vuelta: una design version no se aprueba SIN
+     * ELEMENTOS —de ahí que esto vaya detrás del elemento— y «aprobar congela el to-be de
+     * AHORA», así que el snapshot tiene que tomarse en la MISMA transición. De ahí el CTE: en
+     * dos sentencias son dos transacciones y el guard lo ve.
+     */
+    await admin`
+      with s as (
+        insert into journey_snapshot
+          (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${wsC}, ${jr!.id as string}, 'Aprobación de la DV del post mortem',
+                jsonb_build_object('nodos', '[]'::jsonb, 'aristas', '[]'::jsonb), ${actorId})
+        returning id
+      )
+      update design_version
+      set estado = 'aprobada', snapshot_id = (select id from s), aprobada_por = ${actorId},
+          aprobada_en = now()
+      where id = ${dvId}`;
+    /*
+     * El release nace PLANIFICADO y se despliega después, que es el orden real y el único que
+     * la base admite: «ese release ya salió: su alcance es fijo» (SYS-06) impide asignarle
+     * elementos una vez desplegado. Crearlo ya verificado era mi atajo, y el guard lo dijo.
+     */
+    const [rl] = await admin`insert into release
+      (workspace_id, design_version_id, titulo, responsable, fecha_objetivo, creado_por)
+      values (${wsC}, ${dvId}, 'Verificación en la app', 'Equipo de canales', '2026-08-10',
+              ${actorId}) returning id`;
+    const releaseId = rl!.id as string;
+    await admin`insert into release_elemento (elemento_id, release_id, workspace_id, creado_por)
+      values (${elementoId}, ${releaseId}, ${wsC}, ${actorId})`;
+    await admin`update release set estado = 'desplegado', desplegado_en = '2026-08-10'
+      where id = ${releaseId}`;
+    /*
+     * Y la constatación ANTES de verificar: «verificar exige constatar TODOS los elementos del
+     * release» (RF-06.6). El orden del método es desplegar → constatar → verificar, y la base
+     * no admite otro — que es justo lo que hace fiable al tablero que C7 lee.
+     */
+    const [es] = await admin`insert into effective_state
+      (workspace_id, servicio_id, release_id, resumen, constatado_por, constatado_en)
+      values (${wsC}, ${servicioC}, ${releaseId}, 'Opera desde el 10 de agosto',
+              ${actorId}, '2026-08-20') returning id`;
+    const desviado = opciones.desviado ?? true;
+    await admin`insert into constatacion
+      (workspace_id, effective_state_id, elemento_id, resultado, que_quedo_distinto, razon,
+       creado_por)
+      values (${wsC}, ${es!.id as string}, ${elementoId},
+              ${desviado ? 'desviado' : 'como-aprobado'},
+              ${desviado ? 'Salió sin el aviso previo' : ''},
+              ${desviado ? 'El proveedor de video no lo soportaba a tiempo' : ''},
+              ${actorId})`;
+    await admin`update release set estado = 'verificado' where id = ${releaseId}`;
+    const criterioId = await criterioDelReto(wsC, retoC, actorId);
+    const [rev] = await admin`insert into outcome_review
+      (workspace_id, reto_id, estado, creado_por)
+      values (${wsC}, ${retoC}, 'borrador', ${actorId}) returning id`;
+    const reviewId = rev!.id as string;
+    await admin`insert into resultado_criterio
+      (workspace_id, review_id, criterio_id, sin_datos_motivo)
+      values (${wsC}, ${reviewId}, ${criterioId},
+              'La serie del proveedor se cortó en agosto y no hay lectura final')`;
+    return { reviewId, elementoId, criterioId };
+  }
+
+  /**
+   * C7 por el camino real: el material sale de las MISMAS funciones que dibujan el tablero de
+   * G7, y aceptar escribe los cuatro campos narrativos del post mortem que ya existía.
+   *
+   * Lo que este caso sujeta y no sujetaba ninguna otra capacidad: que el ancla y el objeto sean
+   * la misma fila. No nace nada al aceptar — se EDITA—, así que se comprueba por el otro lado:
+   * los cuatro campos dicen lo que decía la propuesta, el sello de procedencia queda puesto, y
+   * lo que C7 no propone —el veredicto y la casilla del diseño experimental— sigue intacto.
+   */
+  it('C7 redacta el post mortem sobre el tablero, y aceptar escribe SOLO su narrativa', async () => {
+    await enWorkspaceLimpio('c7-camino-real', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId, elementoId } = await postMortemConExpediente(
+        wsC,
+        retoC,
+        servicioId,
+        curadorId,
+      );
+      // El post mortem trae ya un veredicto puesto a mano: C7 no lo toca, y esa es la mitad
+      // que hay que medir — el dictamen lo firma quien cierra (RF-07.8).
+      await sqlAdmin()`update outcome_review
+        set veredicto = 'parcialmente-logrado', diseno_experimental_suficiente = true,
+            diseno_experimental_justificacion = 'Hubo grupo de control en dos sucursales'
+        where id = ${reviewId}`;
+
+      const propuesta = {
+        contribucion:
+          'La verificación en video salió en agosto; la serie del criterio se cortó ese mismo mes.',
+        factoresExternos: 'El proveedor de video no soportaba el aviso previo a tiempo.',
+        hipotesisAbiertas: 'Queda sin saber si el aviso previo habría movido la lectura.',
+        aprendizajes: 'Lo que depende de un tercero se planifica con su calendario, no con el nuestro.',
+        desviaciones: [
+          {
+            elementoId,
+            lectura: 'Salió sin el aviso previo, que era la mitad de lo que el elemento prometía.',
+          },
+        ],
+        citas: [
+          { fragmento: 'Salió sin el aviso previo', localizacion: 'conciliación del elemento' },
+        ],
+        confianzaPropuesta: 'media' as const,
+      };
+      await conProveedor(
+        {
+          ok: true,
+          datos: propuesta as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C7',
+            anclaId: reviewId,
+          }),
+      );
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C7');
+      expect(p, 'la propuesta de C7 no llegó al panel').toBeDefined();
+      expect(p!.destino).toBe('outcome-review');
+      expect(p!.anclaEstado).toBe('disponible');
+      // La cita se copió del tablero, así que se mide presente contra el material real.
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p!.id,
+      });
+      // El objeto ES el ancla: no nació ninguna fila.
+      expect(objetoId).toBe(reviewId);
+
+      const [rev] = await conUsuario(curadorId, (tx) => tx`
+        select contribucion, factores_externos, hipotesis_abiertas, aprendizajes, veredicto,
+               diseno_experimental_suficiente, diseno_experimental_justificacion, propuesta_ai_id
+        from outcome_review where id = ${reviewId}`);
+      expect(rev!.contribucion).toBe(propuesta.contribucion);
+      expect(rev!.factores_externos).toBe(propuesta.factoresExternos);
+      expect(rev!.hipotesis_abiertas).toBe(propuesta.hipotesisAbiertas);
+      expect(rev!.aprendizajes).toBe(propuesta.aprendizajes);
+      // Y lo que C7 NO propone sigue como estaba: el veredicto y la casilla causal son de quien
+      // firma, y aceptar un borrador no los toca ni para ponerlos ni para borrarlos.
+      expect(rev!.veredicto).toBe('parcialmente-logrado');
+      expect(rev!.diseno_experimental_suficiente).toBe(true);
+      expect(rev!.diseno_experimental_justificacion).toBe('Hubo grupo de control en dos sucursales');
+      // El sello lo escribe el guard: la columna está fuera del grant de la aplicación.
+      expect(rev!.propuesta_ai_id).toBe(p!.id);
+    });
+  });
+
+  /**
+   * Una desviación sobre un elemento que no estaba en el tablero tumba la respuesta ENTERA.
+   *
+   * No lo cubre ninguna clave ajena —las desviaciones no se materializan, viven en el
+   * contenido— así que si no lo comprueba el servicio no lo comprueba nadie. Y lo que se evita
+   * es de las averías caras: mandar a alguien a revisar un release que estaba bien, con la
+   * firma de un post mortem detrás.
+   */
+  it('C7 no guarda un borrador que señale un elemento fuera de la conciliación', async () => {
+    await enWorkspaceLimpio('c7-elemento-ajeno', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              contribucion: 'Algo se movió.',
+              factoresExternos: '',
+              hipotesisAbiertas: '',
+              aprendizajes: 'Algo se aprendió.',
+              desviaciones: [
+                {
+                  /* Un uuid con forma buena que el tablero no nombra. */
+                  elementoId: '00000000-0000-4000-8000-00000000c7c7',
+                  lectura: 'Este elemento no existe en la conciliación de este reto.',
+                },
+              ],
+              citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+              confianzaPropuesta: 'baja',
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: reviewId,
+            }),
+        ),
+      ).rejects.toThrow(/no están en la conciliación de este reto/);
+    });
+  });
+
+  /**
+   * Un post mortem sin nada que leer no se ofrece, y uno completado deja de ofrecerse.
+   *
+   * La primera mitad es la regla de «datos deterministas» aplicada al revés: sin lecturas ni
+   * elementos conciliados, la única salida posible es prosa inventada con aspecto de post
+   * mortem —cara, y peor que no tener ninguna porque parece trabajo hecho—.
+   */
+  it('C7 no se ofrece sobre un post mortem vacío, y uno completado cierra la puerta', async () => {
+    await enWorkspaceLimpio('c7-sin-expediente', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const [vacio] = await admin`insert into outcome_review
+        (workspace_id, reto_id, estado, creado_por)
+        values (${wsC}, ${retoC}, 'borrador', ${curadorId}) returning id`;
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: CONTENIDO_POR_CAPACIDAD.C7 as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: vacio!.id as string,
+            }),
+        ),
+      ).rejects.toThrow(/no tiene todavía nada que leer/);
+
+      // Y con expediente: nace, y se cierra la puerta al completarse el post mortem. El vacío
+      // se retira primero porque `outcome_review` es único por reto — un reto tiene UN post
+      // mortem, que es lo correcto y lo que obliga a montar los dos casos en secuencia.
+      await admin`delete from outcome_review where id = ${vacio!.id as string}`;
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: CONTENIDO_POR_CAPACIDAD.C7 as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C7',
+            anclaId: reviewId,
+          }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      expect(antes.pendientes.find((x) => x.capacidad === 'C7')!.anclaEstado).toBe('disponible');
+
+      /* Completar exige el dictamen firmado Y la narrativa escrita: un post mortem cerrado en
+       * blanco no es un post mortem. Se rellena a mano porque lo que este caso mide es la
+       * PUERTA, no cómo se llegó a la narrativa. */
+      await admin`update outcome_review
+        set estado = 'completado', veredicto = 'no-concluyente', completado_por = ${curadorId},
+            completado_en = now(), contribucion = 'Escrita a mano para cerrar',
+            aprendizajes = 'Escritos a mano para cerrar'
+        where id = ${reviewId}`;
+      const despues = await panelPropuestas(curadorId, wsC);
+      const p = despues.pendientes.find((x) => x.capacidad === 'C7');
+      expect(p!.anclaEstado).toBe('post-mortem-cerrado');
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p!.id }),
+      ).rejects.toThrow(/ya se completó/);
+    });
+  });
+
   it('C3 propone HMW por el camino real y aceptar materializa la oportunidad con su traza', async () => {
     await enWorkspaceLimpio('c3-camino-real', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const evId = await evidenciaDelReto(wsC, retoC, curadorId, {

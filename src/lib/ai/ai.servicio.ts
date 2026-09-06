@@ -5105,7 +5105,7 @@ async function aceptarPropuestaEnTransaccion(
       set estado = case when contenido is distinct from ${tx.json(contenido)}::jsonb
                         then 'corregida' else 'aceptada' end,
           contenido = ${tx.json(contenido)}::jsonb,
-          revisada_por = ${actorId},
+          revisada_por = ${actorId}
           -- El enlace se escribe EN la columna que el destino nombra: el nombre viaja como
           -- identificador, no como una etiqueta contra la que comparar.
           --
@@ -5124,7 +5124,17 @@ async function aceptarPropuestaEnTransaccion(
           -- escribe, así que están todas en null. El CHECK de «propuesta_ai» que ata
           -- «estado in (aceptada, corregida)» a tener enlace es el respaldo en la base: un
           -- destino cuya columna nueva no entre en ese CHECK no se sella a medias, revienta.
-          ${tx(COLUMNA_DE_DESTINO[p.destino])} = ${objetoId}
+          --
+          -- Y una excepción, que es la consecuencia de que C7 tenga el ancla POR objeto: ahí
+          -- la columna de destino ES la del ancla, y ya trae el id desde que la propuesta
+          -- nació. Reescribirlo sería un no-op que además exigiría conceder UPDATE sobre una
+          -- columna de ancla —o sea, dejar re-anclar una propuesta después de nacida, que es
+          -- exactamente lo que el guard de linaje impide al insertar—. Así que no se asigna.
+          ${
+            COLUMNA_DE_DESTINO[p.destino] === CAPACIDADES[p.capacidad].ancla.columna
+              ? tx``
+              : tx`, ${tx(COLUMNA_DE_DESTINO[p.destino])} = ${objetoId}`
+          }
       where id = ${entrada.propuestaId} and workspace_id = ${entrada.workspaceId}
         and estado = 'propuesta'
       returning estado`;

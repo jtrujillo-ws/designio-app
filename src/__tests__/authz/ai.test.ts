@@ -6826,6 +6826,69 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Un elemento que el recorte dejó fuera no admite desviación, y el rechazo es DE CONTRATO.
+   *
+   * Dos cosas en una sonda porque son dos mitades del mismo acto. El elemento existe, su estado
+   * admite lectura, y aun así la desviación que lo nombra se escribió sin verlo: el cuerpo se
+   * corta entero a `MAX_MATERIAL` y con una conciliación grande la cola se queda fuera. Es la
+   * misma puerta que C3 le pone a sus insights.
+   *
+   * Y el rechazo se apunta como salida FUERA DE CONTRATO, que es lo que la instrumentación lee:
+   * con el error genérico, el último intento quedaba apuntado como `salida-valida` aunque no
+   * naciera ninguna propuesta, y la métrica de calidad del proveedor decía que había respondido
+   * bien. La sonda lo mide en `llamada_ai`, no en el mensaje.
+   */
+  it('C7 no admite una desviación sobre un elemento que el recorte no dejó llegar', async () => {
+    await enWorkspaceLimpio(
+      'c7-elemento-recortado',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const admin = sqlAdmin();
+        const { reviewId, elementoId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+        );
+        // El corte se empuja a propósito: una descripción de reto más larga que el techo se
+        // lleva por delante TODO lo que el render pone detrás, la conciliación incluida.
+        await admin`update reto set descripcion = ${'x'.repeat(MAX_MATERIAL + 1000)}
+          where id = ${retoC} and workspace_id = ${wsC}`;
+        await expect(
+          conProveedor(
+            {
+              ok: true,
+              datos: {
+                contribucion: 'Algo se movió.',
+                factoresExternos: '',
+                hipotesisAbiertas: '',
+                aprendizajes: 'Algo se aprendió.',
+                desviaciones: [
+                  { elementoId, lectura: 'Sobre un elemento que el modelo no llegó a ver.' },
+                ],
+                citas: [{ fragmento: 'x', localizacion: 'cabecera' }],
+                confianzaPropuesta: 'baja',
+              },
+              intentos: [intento({ uso: null })],
+            },
+            () =>
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C7',
+                anclaId: reviewId,
+              }),
+          ),
+        ).rejects.toThrow(/no admite como tales|no están en el tablero/i);
+        // Y la llamada consta como lo que fue: una salida fuera de contrato.
+        const [linea] = await conUsuario(curadorId, (tx) => tx`
+          select resultado from llamada_ai
+          where workspace_id = ${wsC} and capacidad = 'C7'
+          order by creado_en desc limit 1`);
+        expect(linea!.resultado).toBe('fuera-de-contrato');
+      },
+    );
+  });
+
+  /**
    * Y dos desviaciones sobre el MISMO elemento tumban la respuesta igual, aunque el elemento
    * exista.
    *

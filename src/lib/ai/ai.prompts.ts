@@ -550,7 +550,18 @@ export function materialDePostMortem(expediente: ExpedienteDePostMortem): Materi
   );
 }
 
-function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): { texto: string } {
+function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): {
+  texto: string;
+  /**
+   * Dónde acaba la LÍNEA de cada elemento dentro del cuerpo.
+   *
+   * Existe por la misma razón que los tramos de C2 y C3, y con una diferencia: allí el tramo
+   * es el pajar contra el que se mide una cita; aquí no se cita ningún elemento —las citas de
+   * C7 van contra el expediente entero— y lo que hace falta saber es más simple, si la línea
+   * del elemento SOBREVIVIÓ al recorte. Por eso basta con el final, no con el par.
+   */
+  finales: Map<string, number>;
+} {
   const partes = [expediente.descripcion, '', 'LECTURA DE CADA CRITERIO DE ÉXITO'];
   if (expediente.lecturas.length === 0) {
     partes.push('(ninguna registrada todavía)');
@@ -574,6 +585,7 @@ function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): { texto: string
   if (expediente.conciliacion.length === 0) {
     partes.push('(este reto no tiene design versions a cargo de sus proyectos)');
   }
+  const finales = new Map<string, number>();
   for (const bloque of expediente.conciliacion) {
     partes.push(`${bloque.proyectoCodigo} · ${bloque.designVersionCodigo}`);
     for (const e of bloque.elementos) {
@@ -587,9 +599,34 @@ function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): { texto: string
        * también dice algo —el elemento quedó como se aprobó— y por eso no se rellena. */
       if (e.queQuedoDistinto) partes.push(`  Quedó distinto: ${e.queQuedoDistinto}`);
       if (e.razonDesviacion) partes.push(`  Razón registrada: ${e.razonDesviacion}`);
+      /*
+       * Y dónde acaba lo que este elemento aporta, contado sobre el texto YA UNIDO. Se anota
+       * después de sus líneas opcionales y no en la primera: un elemento cuyo «quedó distinto»
+       * cayó al otro lado del corte llegó a medias, y lo que la desviación necesita es
+       * precisamente ese hecho.
+       */
+      finales.set(e.elementoId, partes.join('\n').length);
     }
   }
-  return { texto: partes.join('\n') };
+  return { texto: partes.join('\n'), finales };
+}
+
+/**
+ * Qué elementos de la conciliación llegaron ENTEROS al modelo.
+ *
+ * Hermana de `evidenciaQueLlegoAlModelo` y de `insightsQueLlegaronAlModelo`, y hace falta por
+ * lo mismo: el cuerpo se recorta ENTERO a `MAX_MATERIAL`, así que con una conciliación grande
+ * la cola se queda fuera. Un `elementoId` del sufijo truncado pasa el suelo —es un elemento de
+ * este reto y su estado admite lectura— y sin embargo la desviación que lo nombra se escribió
+ * sin verlo: manda a alguien a revisar un release que el modelo nunca leyó, con la firma de un
+ * post mortem detrás.
+ */
+export function elementosQueLlegaronAlModelo(expediente: ExpedienteDePostMortem): {
+  ids: string[];
+} {
+  const { texto, finales } = cuerpoDePostMortem(expediente);
+  const cabe = materialQueVeElModelo(texto).length;
+  return { ids: [...finales].filter(([, fin]) => fin <= cabe).map(([id]) => id) };
 }
 
 export function materialDeRegistry(reto: RetoConCriterios): MaterialDelimitado {

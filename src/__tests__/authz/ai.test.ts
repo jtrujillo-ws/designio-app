@@ -37,6 +37,7 @@ import {
   elementosQueLlegaronAlModelo,
   materialDePostMortem,
   promptPostMortem,
+  seccionesQueLlegaronAlPostMortem,
   type ExpedienteDePostMortem,
   MAX_MATERIAL,
 } from '@/lib/ai/ai.prompts';
@@ -6965,10 +6966,34 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     expect(materialDePostMortem(expediente(400)).truncado).toBe(true);
     expect(largo.usuario).toContain('se truncó');
     expect(largo.usuario).toContain('COLA DEL TABLERO');
-    expect(largo.usuario).toContain('no señales desviaciones sobre elementos que no ves');
-    expect(largo.usuario).toContain('ni des por completo ningún recuento');
+    expect(largo.usuario).toContain('no señales desviaciones ni cites lecturas que no ves');
+    expect(largo.usuario).toContain('no des por completo ningún recuento');
     // El resumen de alcance también lo dice: es lo que queda en el lineage.
     expect(largo.alcanceResumen).toContain('truncado');
+
+    /*
+     * Y el aviso nombra LA SECCIÓN QUE DE VERDAD SE CORTÓ. «La cola del tablero» es cierto casi
+     * siempre —la conciliación va la última— y deja de serlo cuando el corte cae ANTES, dentro
+     * de las lecturas: entonces el tablero no llega ni a empezar y decir que falta su cola le
+     * asegura al modelo que las lecturas que ve son todas, que es la afirmación falsa que este
+     * aviso existe para impedir.
+     */
+    const conLecturasLargas = {
+      ...expediente(2),
+      lecturas: Array.from({ length: 40 }, (_, i) => ({
+        criterioId: `c3d4e5f6-0000-4000-8000-${String(i).padStart(12, '0')}`,
+        kpi: 'Tiempo de verificación',
+        objetivo: 'o'.repeat(600),
+        ventanaDias: 90,
+        lectura: '5 minutos',
+        sinDatosMotivo: '',
+      })),
+    };
+    expect(seccionesQueLlegaronAlPostMortem(conLecturasLargas).lecturas).toBe(false);
+    const cortadoAntes = promptPostMortem(conLecturasLargas);
+    expect(cortadoAntes.usuario).toContain('parte de las LECTURAS DE CRITERIO');
+    expect(cortadoAntes.usuario).toContain('TABLERO de conciliación ENTERO');
+    expect(cortadoAntes.usuario).not.toContain('COLA DEL TABLERO');
   });
 
   it('C7 no admite una desviación sobre un elemento que el recorte no dejó llegar', async () => {

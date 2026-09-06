@@ -6,7 +6,7 @@ language: es
 ---
 
 <!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta f80c76a, 2026-09-06). -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 8f4882a, 2026-09-06). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -17,11 +17,12 @@ language: es
 > cumplimiento. Debe dar a cualquier lector una idea clara de **qué es Designio, qué incluye hoy,
 > qué está en vuelo y qué está diseñado pero todavía no construido**.
 >
-> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `f80c76a`
+> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `8f4882a`
 > (tras fusionar [#39](https://github.com/jtrujillo-ws/designio-app/pull/39),
 > [#43](https://github.com/jtrujillo-ws/designio-app/pull/43),
-> [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) y
-> [#46](https://github.com/jtrujillo-ws/designio-app/pull/46)). Donde el paquete de diseño y el código
+> [#45](https://github.com/jtrujillo-ws/designio-app/pull/45),
+> [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) y
+> [#47](https://github.com/jtrujillo-ws/designio-app/pull/47)). Donde el paquete de diseño y el código
 > difieren, **gana el código** y la diferencia se anota en el apéndice 94.
 >
 > Generado: 2026-09-05 — rama `claude/designio-doc-sequentia-base-j0y13b`.
@@ -55,7 +56,7 @@ capítulo:
 | Marca | Significado |
 |---|---|
 | **Construido** | Existe en la rama `agents`, con migración, server function, pantalla y pruebas |
-| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45 y #46 se fusionaron el 2026-09-05) |
+| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46 y #47 se fusionaron el 2026-09-05) |
 | **Diseñado** | Está especificado en el paquete de diseño (`docs/05-specs/`, `docs/06-diseno-tecnico/`) pero no hay código que lo materialice |
 | **Fuera del MVP** | Excluido explícitamente por ADR-0014 o por la spec correspondiente |
 
@@ -214,7 +215,7 @@ flowchart TD
     AI["Pipeline PropuestaAI<br/>src/lib/ai"]
   end
   subgraph Datos["PostgreSQL 15 (Railway)"]
-    PG[("54 migraciones forward-only<br/>RLS activo en toda tabla<br/>guards SECURITY DEFINER<br/>evento_dominio append-only")]
+    PG[("55 migraciones forward-only<br/>RLS activo en toda tabla<br/>guards SECURITY DEFINER<br/>evento_dominio append-only")]
   end
   subgraph Ext["Externos"]
     LLM["SDK Anthropic<br/>claude-sonnet-5 → claude-sonnet-4-6"]
@@ -241,7 +242,7 @@ server function. El scheduler in-app y el object storage están diseñados pero 
 | CTX-05 Entrega y Estado Efectivo | Releases, effective state, constataciones, conciliación | `entrega` | Construido |
 | CTX-06 Medición e Impacto | Metric Registry, snapshots, outcome review | `medicion` | Construido |
 | CTX-07 Biblioteca General | Conocimiento metodológico de la boutique | `biblioteca` (solo schemas; los checklists viven en `metodo.plantillas.ts`) | Diseñado |
-| CTX-08 Capacidades AI | PropuestaAI, llamadas, reservas, capacidades | `ai` | Construido para CI, C0, CT, C2, C3, C5, C6 |
+| CTX-08 Capacidades AI | PropuestaAI, llamadas, reservas, capacidades | `ai` | Construido para CI, C0, CT, C2, C3, C5, C6, C7 |
 
 ## Mapa de módulos y componentes funcionales
 
@@ -398,7 +399,7 @@ identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de o
 | Journeys, blueprints, validación, snapshot | `/journeys`, `/journey/$id` | `journey` | `journey`, `journey_nodo`, `journey_arista`, `journey_nodo_evidencia`, `journey_snapshot`, `catalogo_journey` | 07 |
 | Design versions, diff, releases, effective state, conciliación | `/design-versions`, `/design-version/$id` | `entrega` | `design_version`, `elemento_cambio`, `release`, `release_elemento`, `effective_state`, `constatacion` | 08 |
 | Metric Registry, snapshots, outcome review | `/proyecto/$id` (sección medición) | `medicion` | `metric_registry`, `entrada_kpi`, `snapshot`, `outcome_review`, `resultado_criterio` | 09 |
-| Propuestas AI (CI, C0, CT, C2, C3, C5, C6) | `/propuestas` | `ai` | `propuesta_ai`, `llamada_ai`, `reserva_ai` | 10 |
+| Propuestas AI (CI, C0, CT, C2, C3, C5, C6, C7) | `/propuestas` | `ai` | `propuesta_ai`, `llamada_ai`, `reserva_ai` | 10 |
 | Aprobaciones pendientes por rol | `/aprobaciones` | `aprobaciones` (proyección) | lee `gate_instancia`, `derecho_uso`, `insight`, `design_version` | 11 |
 | Hilos del portal y auditoría | `/proyecto/$id`, `/design-version/$id`, `/auditoria` | `portal` | `hilo_comentario`, `comentario`, `evento_dominio` | 12 |
 | Biblioteca del cliente | `/biblioteca` | `memoria` (proyección) | lee `arquetipo`, `insight`, `decision`, `reto`, `segmento` | 13 |
@@ -435,9 +436,9 @@ identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de o
 | Método: proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas | ✔ | | **Pantalla de J2**: crear un reto, definir criterios a mano y activarlo con perfil existen como server functions pero ninguna pantalla las llama todavía (los criterios entran hoy por C0 o por seed). **Pantalla de la etapa 4**: el concepto, su evidencia de test, su umbral, su N/A y su veredicto existen en la base con políticas y puerta de G4 (#46), pero ninguna server function ni pantalla los crea o decide; mientras no exista, G4 aprueba como antes cuando el reto no tiene conceptos, y una decisión `pasa-muere` no puede registrarse desde la interfaz porque exige elegir un concepto |
 | Oportunidades HMW (con borrador AI de preguntas trazadas a insights, C3) y G3 sobre el portafolio | ✔ | | Serializar la carrera entre validar un insight y persistir un lote de C3 (deuda anotada en #45; C2 la comparte) |
 | Journeys, catálogo, Mermaid, carriles, validación, snapshot | ✔ | | Vista timeline y por actor |
-| Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | Detección AI de desviaciones (C7) |
-| Metric Registry (con borrador AI de entradas KPI, C6), snapshots, outcome review, veredicto | ✔ | | Recordatorios por cadencia, borrador AI del post mortem (C7), series ancladas a fechas de release |
-| Pipeline PropuestaAI, presupuesto, degradación, consentimiento | ✔ (CI, C0, CT, C2, C3, C5, C6) | | C1, C4 (revisores AI), C7, plan de releases asistido; BYOAI con secret manager; evals de grounding programadas |
+| Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | — (las desviaciones constatadas las lee C7 dentro del borrador del post mortem; no hay un detector AI que proponga constataciones, y por diseño no lo habrá: constatar es testimonio humano) |
+| Metric Registry (con borrador AI de entradas KPI, C6), snapshots, outcome review (con borrador AI de la narrativa, C7), veredicto | ✔ | | Recordatorios por cadencia, series ancladas a fechas de release |
+| Pipeline PropuestaAI, presupuesto, degradación, consentimiento | ✔ (CI, C0, CT, C2, C3, C5, C6, C7) | | C1, C4 (revisores AI), plan de releases asistido; BYOAI con secret manager; evals de grounding programadas |
 | Exportación (archivo y entregable), disposición acordada | ✔ | | Exportación de adjuntos por object storage |
 | Despliegue Railway, CI de seis checks, suite authz contra Postgres real | ✔ | | E2E Playwright, scheduler y cron, backups verificados |
 
@@ -960,7 +961,9 @@ despliega releases y constata el effective state.
 ## Fuente
 
 SPEC-06 (RF-06.1 a RF-06.10), SYS-05 a SYS-08. PRs [#13](https://github.com/jtrujillo-ws/designio-app/pull/13),
-[#16](https://github.com/jtrujillo-ws/designio-app/pull/16). Pendiente (diseñado): detección AI de desviaciones (C7).
+[#16](https://github.com/jtrujillo-ws/designio-app/pull/16). Las desviaciones constatadas las **lee** C7 al redactar el
+borrador del post mortem (ver `09`); no existe, ni por diseño existirá, un detector AI que proponga
+constataciones: constatar es el testimonio de quien miró qué quedó funcionando.
 
 ---
 
@@ -1017,14 +1020,30 @@ veredicto honesto (ADR-0007).
   la continuidad comercial. El prediseño (§13.2) le asigna al sponsor recibir el post mortem, no
   dictar el veredicto; una aprobación formal del sponsor sobre el review no está construida.
 - El veredicto "no concluyente" existe y es honesto: se usa cuando faltan datos.
+- **Borrador AI de la narrativa (C7)** — **Construido**, PR [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) «El post mortem se
+  redacta sobre lo constatado, no sobre lo que se recuerda». Con el review **en borrador**, el
+  **lead** (solo él: la política de escritura de `outcome_review` pide `lead-boutique`, así que C7 es
+  la única capacidad que no puede pedir el diseñador) pide desde `/propuestas` un borrador de los
+  cuatro campos narrativos (contribución, factores externos, hipótesis abiertas, aprendizajes) más
+  una **lectura de cada desviación** constatada, citando el elemento y la constatación de la que
+  sale. El material es **determinista**: el tablero de conciliación de todos los proyectos del reto
+  (`conciliacion_del_reto`, la misma lectura que dibuja G7) y la lectura por criterio de
+  `resultado_criterio`; los snapshots crudos no entran, porque ya están resumidos en lo que el lead
+  constató. **No propone** el veredicto (RF-07.8) ni la casilla de diseño experimental (SYS-24, la
+  única que habilita lenguaje causal). Es la primera capacidad cuyo **ancla es su objeto**: aceptar
+  no crea fila, escribe los cuatro campos del review que ya existía (y una segunda aceptación los
+  sobrescribe mientras siga en borrador); la huella se toma sobre el expediente entero, así que si
+  se constata un elemento o se registra una lectura después de generar, el panel lo dice
+  (`conciliacion-cambiada`) y, si el review se completó, la propuesta solo puede rechazarse
+  (`post-mortem-cerrado`). Se corrigen los textos; los elementos que las desviaciones señalan son
+  testimonio y no se reapuntan.
 
 ## Qué falta (diseñado)
 
 Recordatorios al propietario del dato por cadencia (RF-07.4; hoy la cadencia incumplida se ve pero
-no se notifica), el borrador narrativo del post mortem por AI (C7), la descomposición asistida en
-releases (segunda salida de C6 en SPEC-08, que exige otra capacidad con ancla en la design version),
-las marcas de fecha de release sobre la serie (RF-07.5) y la creación asistida de retos candidatos
-pre-poblados desde la memoria.
+no se notifica), la descomposición asistida en releases (segunda salida de C6 en SPEC-08, que exige
+otra capacidad con ancla en la design version), las marcas de fecha de release sobre la serie
+(RF-07.5) y la creación asistida de retos candidatos pre-poblados desde la memoria.
 Los retos candidatos nacidos del post mortem se crean a mano con origen `post-mortem`.
 
 ## Fuente
@@ -1037,8 +1056,8 @@ C6 en [#43](https://github.com/jtrujillo-ws/designio-app/pull/43).
 
 # 10 — Propuestas AI (pipeline PropuestaAI)
 
-**Ruta**: `/propuestas`. **Estado: Construido** para siete de las diez capacidades (CI, C0, CT, C2,
-C3, C5, C6); las otras tres están diseñadas.
+**Ruta**: `/propuestas`. **Estado: Construido** para ocho de las diez capacidades (CI, C0, CT, C2,
+C3, C5, C6, C7); las otras dos (C1, C4) están diseñadas.
 
 Es el panel donde vive **todo lo que la AI propuso**: con qué citas, con qué lineage, esperando que
 una persona lo acepte, corrija o rechace. Ningún objeto del dominio existe hasta esa decisión
@@ -1057,7 +1076,7 @@ generar se desactivan y revisar lo ya propuesto sigue disponible (SYS-21).
 | **C4** | 4 | Revisores AI por arquetipo (etiqueta **simulación**) y borrador de diseño de tests | — | Informativo; jamás evidencia | Diseñado (la columna `es_simulacion` y su CHECK «simulación no es evidencia» ya existen) |
 | **C5** | 5 | Cómo cerrar cada señal de validación del journey; no rediagnostica | Journey | Informativo | Construido |
 | **C6** | 6 | Hasta 6 entradas KPI del Metric Registry contra los criterios de éxito del reto: criterio al que responde (por id), nombre, definición, fuente, dimensiones, frecuencia y citas a los criterios; **no** propone propietario del dato, línea base, ventana ni dashboard (compromisos y datos, no redacción) | Metric Registry en borrador | Entrada KPI (incompleta hasta la firma) | Construido |
-| **C7** | 7 | Detección de desviaciones DV vs. constatado; borrador narrativo del post mortem sobre snapshots | — | — | Diseñado |
+| **C7** | 7 | Borrador de los cuatro campos narrativos del post mortem (contribución, factores externos, hipótesis abiertas, aprendizajes) y una lectura por cada desviación constatada, con citas al tablero de conciliación del reto y a las lecturas por criterio; **no** propone el veredicto ni la casilla de diseño experimental | Outcome review en borrador (solo el lead) | El propio outcome review: aceptar escribe sus campos narrativos, no crea fila | Construido |
 | **CT** | Transversal | Qué falta para un gate, citando ítems del checklist por id, con cómo cerrarlo | Gate | Informativo; **no puede aprobar** | Construido |
 | — | 6 | Descomposición asistida en releases (segunda salida de C6 en SPEC-08) | Design version | Informativo | Diseñado: exige ampliar el vocabulario de capacidades (decisión de producto anotada en la migración de C6) |
 
@@ -1079,7 +1098,7 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
 4. **Generación**: prompt versionado (`PROMPT_VERSION`, atado por huella del contrato), material
    delimitado como datos no confiables y acotado (`MAX_MATERIAL`), salida estructurada validada por
    Zod contra el esquema de la capacidad, ids copiados del material normalizados.
-5. **Revisión** en el panel. Para las capacidades que **materializan** (CI, C0, C2, C3, C6): **aceptar**,
+5. **Revisión** en el panel. Para las capacidades que **materializan** (CI, C0, C2, C3, C6, y C7 escribiendo sobre su ancla): **aceptar**,
    **corregir y aceptar** (las citas y las contradicciones no se corrigen: son testimonio del modelo;
    el resto sí) o **rechazar**. Para las **informativas** (CT, C5) no hay nada que aceptar ni
    corregir: el informe se lee y se **marca como leído**; `aceptarPropuesta` las rechaza a
@@ -1112,7 +1131,9 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
 
 ## Permisos
 
-Piden y revisan propuestas los roles curadores (lead, diseñador). `agente-ai` no aparece en ningún
+Piden y revisan propuestas los roles curadores (lead, diseñador), salvo **C7**, que solo pide y acepta
+el lead porque su destino, `outcome_review`, solo lo escribe `lead-boutique` (cada capacidad declara
+sus `roles` en el registro). `agente-ai` no aparece en ningún
 predicado de escritura.
 
 ## Fuente
@@ -1121,7 +1142,8 @@ SPEC-08 (RF-08.1 a RF-08.9), ADR-0012, SYS-17 a SYS-21. PRs [#14/b7e04b7](https:
 [#22](https://github.com/jtrujillo-ws/designio-app/pull/22), [#28](https://github.com/jtrujillo-ws/designio-app/pull/28),
 [#31](https://github.com/jtrujillo-ws/designio-app/pull/31), [#33](https://github.com/jtrujillo-ws/designio-app/pull/33),
 [#34](https://github.com/jtrujillo-ws/designio-app/pull/34), [#35](https://github.com/jtrujillo-ws/designio-app/pull/35),
-[#43](https://github.com/jtrujillo-ws/designio-app/pull/43), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45).
+[#43](https://github.com/jtrujillo-ws/designio-app/pull/43), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45),
+[#47](https://github.com/jtrujillo-ws/designio-app/pull/47).
 
 ---
 
@@ -1410,7 +1432,7 @@ JourneyBadge, Select, Switch, Tabs, Tag, Textarea, Wordmark); piezas de pantalla
 
 ## Migraciones
 
-**54 migraciones SQL forward-only** en `db/migrations/`, aplicadas en orden de nombre exactamente una
+**55 migraciones SQL forward-only** en `db/migrations/`, aplicadas en orden de nombre exactamente una
 vez con ledger `schema_migrations`. Las trece primeras crean el dominio (workspace, auth, árbol,
 evidencia, método, insight y decisión, portal, journey, medición, design version, evidencia
 profunda); las siguientes son **endurecimientos con nombre propio**, cada una con su motivación
@@ -1511,9 +1533,9 @@ Descrito funcionalmente en `10`. Técnicamente (`src/lib/ai/`):
   latencia, `intento`, `reserva_id`, `consentimiento_version`, `cerrado_en`). El costo es de la
   llamada, no de la propuesta.
 - `reserva_ai`: el hueco de las generaciones en vuelo y el token de exclusión por ancla
-  (`item_id`, `reto_id`, `gate_id`, `journey_id`, `registry_id`), con ventana de caducidad.
+  (`item_id`, `reto_id`, `gate_id`, `journey_id`, `registry_id`, `outcome_review_id`), con ventana de caducidad.
 - `propuesta_ai`: capacidad, destino (`evidencia`, `criterio-exito`, `insight`, `entrada-kpi`,
-  `oportunidad` o informativo), ancla, `contenido` y `contenido_original`, confianza, `es_simulacion`,
+  `oportunidad`, `outcome-review` o informativo), ancla, `contenido` y `contenido_original`, confianza, `es_simulacion`,
   estado, `modelo`, `prompt_version`, `alcance_resumen`, `alcance_evidencia` (C2) y `alcance_insights`
   (C3), `huella_material`, `origen_key`, `llamada_id`, revisor, objeto materializado (`evidencia_id`,
   `criterio_id`, `insight_id`, `entrada_kpi_id`, `oportunidad_id`, cada uno con índice único: un objeto
@@ -1521,8 +1543,11 @@ Descrito funcionalmente en `10`. Técnicamente (`src/lib/ai/`):
   lista: el reto es ancla de C0, C2 y C3), destino ↔ capacidad y «simulación no es evidencia».
 - Guards: `propuesta_ai_revision_guard` (transición y atribución), `propuesta_ai_materializacion_guard`
   (diferido: lo materializado coincide con lo propuesto), `propuesta_ai_ct_huecos_guard`,
-  `propuesta_ai_c5_linaje_guard`, `propuesta_ai_c2_citas_guard`, y el guard de linaje de C6 (el
-  criterio al que responde una entrada es testimonio y no se reapunta conservando las citas). C3 no
+  `propuesta_ai_c5_linaje_guard`, `propuesta_ai_c2_citas_guard`, `propuesta_ai_c7_linaje_guard` (la
+  propuesta cuelga de la llamada del mismo post mortem) y el guard de linaje de C6 (el criterio al
+  que responde una entrada es testimonio y no se reapunta conservando las citas). En C7 el ancla es
+  el objeto: `outcome_review.propuesta_ai_id` sella la última aceptación y la procedencia se
+  comprueba por `xmin`, porque la fila no se inserta, se edita. C3 no
   añade un guard propio: sus comprobaciones (portafolio abierto, traza igual al conjunto de insights
   citados, citados ⊆ validados del reto vía `insights_validados_del_reto`) viven dentro de los guards
   de revisión y materialización.
@@ -1660,7 +1685,7 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 | **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (un archivo por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai, concepto) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
-Recuento al último PR fusionado (#46): **887 pruebas** en verde. La suite de
+Recuento al último PR fusionado (#47): **895 pruebas** en verde. La suite de
 autorización se **omite y lo dice** si faltan las URLs de base; en CI siempre corre. Regla de
 revisión: cada candado se verifica retirándolo, y debe caer exactamente la prueba que lo cubre.
 
@@ -1672,7 +1697,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | PR | Qué trae | Estado |
 |---|---|---|
-| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados) y [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base) | — |
+| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base) y [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -1683,9 +1708,9 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-03 Evidencia e importación | Transcripción y diarización (C1, requiere proveedor STT); escaneo de malware; object storage S3-compatible con proxy de bytes (hoy `bytea` en Postgres); preview y OCR de artefactos; codificación asistida por segmento y tema | RF-03.2, RF-03.7, RF-03.8 |
 | SPEC-04 Método | **Pantalla de J2** para crear el reto, definir y editar criterios a mano y activarlo con perfil (las server functions existen; ninguna ruta las llama); **pantalla de la etapa 4** para crear conceptos, enlazar su evidencia de test, declarar umbral, registrar lectura, aprobar la N/A y dictar el veredicto (el modelo, las políticas y la puerta de G4 ya están en la base desde #46; sin esa pantalla un `pasa-muere` no se puede registrar desde la interfaz); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
 | SPEC-05 Journeys | Vistas timeline y por actor (la descarga SVG/PNG del render y la copia del código Mermaid ya están construidas en la pantalla del journey) | RF-05.3 |
-| SPEC-06 Trazabilidad | Detección AI de desviaciones (C7) | RF-06.8 |
-| SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; borrador AI del outcome review (C7); retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
-| SPEC-08 AI | Capacidades C1, C4 (revisores AI por arquetipo, con el esquema de simulación ya preparado), C7 y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; evaluaciones de grounding con línea base y regresión; observabilidad AI como panel (los datos ya están en `llamada_ai`) | RF-08.2, RF-08.7, RF-08.9 |
+| SPEC-06 Trazabilidad | — (RF-06.8 se cubre con la lectura de desviaciones que C7 hace dentro del borrador del post mortem; un detector que proponga constataciones queda descartado por diseño) | RF-06.8 |
+| SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
+| SPEC-08 AI | Capacidades C1, C4 (revisores AI por arquetipo, con el esquema de simulación ya preparado) y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; evaluaciones de grounding con línea base y regresión; observabilidad AI como panel (los datos ya están en `llamada_ai`) | RF-08.2, RF-08.7, RF-08.9 |
 | SPEC-09 Seguridad | Prueba «AI off» del loop completo como E2E; condiciones de proveedores registradas; backups con prueba de restauración documentada | RF-09.10, RF-09.11 |
 | Diseño técnico | Scheduler in-app (`scheduled_jobs` + tick + claim latch) y servicio cron de Railway; Playwright E2E; búsqueda semántica intra-workspace con pgvector; ADR formal «Stack del MVP» | `docs/06-diseno-tecnico/` |
 
@@ -1892,7 +1917,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 
 # 93 — Apéndice: cronología de PRs fusionados en `agents`
 
-Cinco días de construcción (2026-09-01 a 2026-09-05), 43 commits en `agents`, cada uno un
+Cinco días de construcción (2026-09-01 a 2026-09-05), 44 commits en `agents`, cada uno un
 squash-merge con título que dice qué garantía añade.
 
 | Fecha | PR | Título |
@@ -1940,6 +1965,7 @@ squash-merge con título que dice qué garantía añade.
 | 09-05 | #43 | C6: el borrador del Metric Registry se propone contra los criterios que promete medir |
 | 09-05 | #45 | C3: la oportunidad (HMW) se propone desde los insights validados, y su traza es la cita |
 | 09-05 | #46 | El concepto existe, y no avanza sin haberse probado |
+| 09-05 | #47 | El post mortem se redacta sobre lo constatado, no sobre lo que se recuerda |
 
 ---
 
@@ -1959,7 +1985,7 @@ fuente o a un ADR de sucesión.
 | 6 | Diseño técnico · Scheduler | Tabla `scheduled_jobs`, tick, claim latch, cron de Railway | No construido; `CRON_SECRET` solo en la plantilla de variables | Sin cambio; es roadmap |
 | 7 | Diseño técnico · pgvector | Búsqueda semántica intra-workspace | Extensión creada de forma tolerante, sin uso | Sin cambio; es roadmap |
 | 8 | SPEC-05 · Taxonomía | Aristas `pertenece-a`, `evidencia-de`, `mide`, `afecta`, `siente` (también en `servicio.schemas.ts`) | El grafo real usa 6 tipos de arista (`transicion`, `dependencia`, `ocurre-en`, `participa`, `soporta`, `duele`); la pertenencia a fase es columna, la evidencia es tabla `journey_nodo_evidencia`, y las relaciones mide/afecta viven en medición y entrega | Alinear `servicio.schemas.ts` (sin uso) con `journey.schemas.ts` o retirarlo |
-| 9 | SPEC-08 | Diez capacidades en el MVP; C6 con dos salidas (entradas KPI y plan de releases) | Siete construidas (CI, C0, CT, C2, C3, C5, C6); la segunda salida de C6 no cabe en el vocabulario `CapacidadAISchema` y queda como decisión de producto | Roadmap; decidir si se amplía el vocabulario |
+| 9 | SPEC-08 | Diez capacidades en el MVP; C6 con dos salidas (entradas KPI y plan de releases) | Ocho construidas (CI, C0, CT, C2, C3, C5, C6, C7); la segunda salida de C6 no cabe en el vocabulario `CapacidadAISchema` y queda como decisión de producto | Roadmap; decidir si se amplía el vocabulario |
 | 10 | SPEC-04 RF-04.10 / SYS-13 | Conceptos con resultados de test y umbral, trabajados desde la aplicación | Objeto, umbral, N/A, veredicto y puerta de G4 en la base (#46); sin server function ni pantalla, así que solo se ejercen por SQL y un `pasa-muere` no se registra desde la interfaz | Roadmap: pantalla de la etapa 4 |
 | 11 | SPEC-07 RF-07.4 | Recordatorios por frecuencia | La cadencia incumplida se calcula y se ve, pero no se notifica | Roadmap (scheduler) |
 | 12 | SPEC-01 RF-01.5 / diseño técnico · Correo | Email básico | Sin correo saliente; el enlace de invitación se muestra en pantalla | Roadmap |

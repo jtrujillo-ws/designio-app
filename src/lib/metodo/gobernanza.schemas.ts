@@ -24,6 +24,18 @@ export const RegistrarDecisionSchema = z.object({
   fundamento: z.string().trim().max(4000).default(''),
   /** Sin insights que la sostengan no hay decisión trazable: el servicio lo exige. */
   insightIds: z.array(z.string().uuid()).min(1, 'Enlaza al menos un insight').max(20),
+  /**
+   * Qué concepto se decide, cuando la decisión es un pasa/muere (RF-04.10).
+   *
+   * Opcional porque el resto de tipos no decide ningún concepto, y porque hay decisiones
+   * 'pasa-muere' anteriores a que la tabla existiera. La ATADURA —un concepto solo cuelga de
+   * una decisión de ese tipo— es un CHECK de la base; aquí se anticipa para que la pantalla
+   * diga qué pasa en vez de enseñar un 23514.
+   */
+  conceptoId: z.string().uuid().optional(),
+}).refine((d) => d.conceptoId === undefined || d.tipo === 'pasa-muere', {
+  path: ['conceptoId'],
+  message: 'Solo una decisión de tipo pasa/muere decide un concepto',
 });
 export type RegistrarDecision = z.infer<typeof RegistrarDecisionSchema>;
 

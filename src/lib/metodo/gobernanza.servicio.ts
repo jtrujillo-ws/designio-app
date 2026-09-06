@@ -47,9 +47,10 @@ export async function registrarDecision(
       ),
       nueva as (
         insert into decision (workspace_id, proyecto_id, gate_id, tipo, titulo,
-                              fundamento, decidido_por)
+                              fundamento, decidido_por, concepto_id)
         select ${entrada.workspaceId}, destino.proyecto_id, destino.gate_id,
-               ${entrada.tipo}, ${entrada.titulo}, ${entrada.fundamento}, ${actorId}
+               ${entrada.tipo}, ${entrada.titulo}, ${entrada.fundamento}, ${actorId},
+               ${entrada.conceptoId ?? null}
         from destino
         returning id
       ),
@@ -69,7 +70,10 @@ export async function registrarDecision(
         insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
         select ${entrada.workspaceId}, 'DecisionAprobada',
           jsonb_build_object('decisionId', nueva.id, 'gateId', ${entrada.gateId}::uuid,
-                             'tipo', ${entrada.tipo}::text, 'titulo', ${entrada.titulo}::text),
+                             'tipo', ${entrada.tipo}::text, 'titulo', ${entrada.titulo}::text,
+                             -- El evento dice SOBRE QUÉ se decidió, no solo de qué clase era.
+                             -- Sin esto, la auditoría de un pasa/muere no llega al concepto.
+                             'conceptoId', ${entrada.conceptoId ?? null}::uuid),
           ${actorId}, quien.rol
         from nueva, quien
       )

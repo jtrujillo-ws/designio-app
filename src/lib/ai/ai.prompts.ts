@@ -479,6 +479,8 @@ function cuerpoDeRevision(c: ConceptoARevisar): {
   texto: string;
   tramos: Map<string, [number, number]>;
   finalDeLaLente: Map<string, number>;
+  /** Fin de CADA aparición, con clave «arquetipoId\u0000evidenciaId». Ver abajo. */
+  finDeCadaAparicion: Map<string, number>;
 } {
   const { lentes, sinEvidencia, sobreElTope } = lentesDelLote(c.arquetipos);
   // Lo que queda fuera, DICHO. Un material que enseña cuatro lentes de siete sin mencionar las
@@ -503,6 +505,8 @@ function cuerpoDeRevision(c: ConceptoARevisar): {
   // Dónde ACABA la aportación de cada lente: su cabecera y toda su evidencia. Es lo que permite
   // saber cuáles llegaron enteras, que no es lo mismo que qué documentos llegaron.
   const finalDeLaLente = new Map<string, number>();
+  // Dónde acaba CADA aparición de un documento, con la lente que lo dibuja en la clave.
+  const finDeCadaAparicion = new Map<string, number>();
   let largo = partes.join('\n').length;
   for (const a of lentes) {
     // La cabecera del arquetipo y su evidencia DEBAJO, en el mismo bloque: es lo que hace
@@ -524,12 +528,19 @@ function cuerpoDeRevision(c: ConceptoARevisar): {
        * recorte queda: quedarse con ella contesta bien las dos preguntas.
        */
       if (!tramos.has(e.id)) tramos.set(e.id, [inicio, inicio + linea.length]);
+      /*
+       * Y el fin de ESTA aparición, bajo ESTA lente. `tramos` guarda la primera —es lo que hay
+       * que medir para una cita, que nombra el documento y no el arquetipo— y por eso no sirve
+       * para saber qué vio cada lente: un documento enlazado a dos arquetipos se dibuja dos
+       * veces, y la aparición de la segunda puede caer tras el corte cuando la primera no.
+       */
+      finDeCadaAparicion.set(`${a.id}\u0000${e.id}`, inicio + linea.length);
       partes.push(linea);
       largo = inicio + linea.length;
     }
     finalDeLaLente.set(a.id, largo);
   }
-  return { texto: partes.join('\n'), tramos, finalDeLaLente };
+  return { texto: partes.join('\n'), tramos, finalDeLaLente, finDeCadaAparicion };
 }
 
 /** El tramo de UNA evidencia dentro del material de C4, para medir su presencia literal
@@ -556,6 +567,32 @@ export function evidenciaQueLlegoAlRevisor(c: ConceptoARevisar): { ids: string[]
   const { texto, tramos } = cuerpoDeRevision(c);
   const cabe = materialQueVeElModelo(texto).length;
   return { ids: [...tramos].filter(([, [, fin]]) => fin <= cabe).map(([id]) => id) };
+}
+
+/**
+ * Lo mismo, PARTIDO POR LENTE — y es la partición la que importa, no el total.
+ *
+ * Un lote de C4 es una sesión por lente, y hasta aquí las N propuestas se llevaban el MISMO
+ * conjunto: el de todo el material. Con eso, la comprobación que el sello hace —«¿tiene este
+ * arquetipo evidencia que su revisión no llegó a ver?»— se contesta contra documentos de otras
+ * lentes, y un testimonio que se enlaza a la lente B después de generar pasa por visto porque
+ * la lente A ya lo enseñaba. La sesión de B nunca lo leyó bajo B, que es justo la frontera que
+ * SYS-20 defiende: una frase con voz del «apurado de RR. HH.» no se sostiene en el testimonio
+ * del «desconfiado digital».
+ *
+ * Se mide sobre el TEXTO recortado y por aparición, no sobre el objeto de la base, por lo
+ * mismo que su hermana: lo que una lente enseñó es lo que de esa lente se llegó a escribir.
+ */
+export function evidenciaPorLenteQueLlegoAlRevisor(c: ConceptoARevisar): Record<string, string[]> {
+  const { texto, finDeCadaAparicion } = cuerpoDeRevision(c);
+  const cabe = materialQueVeElModelo(texto).length;
+  const porLente: Record<string, string[]> = {};
+  for (const [clave, fin] of finDeCadaAparicion) {
+    if (fin > cabe) continue;
+    const [arquetipoId, evidenciaId] = clave.split('\u0000');
+    (porLente[arquetipoId!] ??= []).push(evidenciaId!);
+  }
+  return porLente;
 }
 
 /**

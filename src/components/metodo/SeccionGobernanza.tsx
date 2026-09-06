@@ -865,12 +865,20 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
                 )}
                 <br />
                 {h.descripcion}
-                {h.citas.length > 0 && (
-                  <span style={{ color: 'var(--texto-3)' }}>
-                    {' '}
-                    · se apoya en {h.citas.join(', ')}
+                {h.citas.map((c, j) => (
+                  // El PASAJE, no solo el documento: quien firma el pasa/muere tiene que poder
+                  // ver qué dijo alguien, no solo dónde. Cuando la revisión se escribió a mano
+                  // no hay fragmento que enseñar y queda el título, que es todo lo que existe.
+                  <span key={j} style={{ display: 'block', color: 'var(--texto-3)' }}>
+                    {c.fragmento === null
+                      ? `· se apoya en ${c.evidenciaTitulo}`
+                      : `· «${c.fragmento}» — ${c.evidenciaTitulo}${
+                          c.localizacion === null || c.localizacion === ''
+                            ? ''
+                            : `, ${c.localizacion}`
+                        }`}
                   </span>
-                )}
+                ))}
               </li>
             ))}
           </ul>

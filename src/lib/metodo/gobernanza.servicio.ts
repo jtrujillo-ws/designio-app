@@ -483,14 +483,49 @@ export async function gobernanzaDeProyecto(
                                          'id', h.id, 'titulo', h.titulo,
                                          'descripcion', h.descripcion,
                                          'esHipotesis', h.es_hipotesis,
-                                         'citas', coalesce((
-                                           select jsonb_agg(e.titulo order by e.titulo)
-                                           from hallazgo_simulado_evidencia he
-                                           join evidencia e on e.id = he.evidencia_id
-                                            and e.workspace_id = he.workspace_id
-                                           where he.hallazgo_id = h.id
-                                             and he.workspace_id = h.workspace_id
-                                         ), '[]'::jsonb))
+                                         -- EL FRAGMENTO Y DÓNDE, no solo el título.
+                                         --
+                                         -- La tarjeta de la propuesta pendiente enseña «cita»
+                                         -- entera; al aceptar solo quedaba «se apoya en <doc>»,
+                                         -- y con eso quien firma el pasa/muere no puede ver qué
+                                         -- pasaje sostiene el hallazgo. El enlace materializado
+                                         -- no lo guarda —«hallazgo_simulado_evidencia» son tres
+                                         -- uuid— y encima colapsa dos citas del mismo documento
+                                         -- por su clave primaria: el testimonio vive en el
+                                         -- «contenido» de la propuesta, inmutable por SYS-17,
+                                         -- así que es de ahí de donde se lee.
+                                         --
+                                         -- «orden» ES el índice del hallazgo en ese contenido
+                                         -- (lo escribe la materialización), que es lo que
+                                         -- permite bajar al array de citas del hallazgo justo.
+                                         'citas', coalesce(
+                                           (select jsonb_agg(jsonb_build_object(
+                                                     'evidenciaTitulo', e2.titulo,
+                                                     'fragmento', x ->> 'fragmento',
+                                                     'localizacion', x ->> 'localizacion')
+                                                   order by ord)
+                                              from propuesta_ai p2
+                                              cross join lateral jsonb_array_elements(
+                                                coalesce(p2.contenido -> 'hallazgos' -> h.orden
+                                                           -> 'citas', '[]'::jsonb))
+                                                with ordinality as t(x, ord)
+                                              left join evidencia e2
+                                                on e2.id = (x ->> 'evidenciaId')::uuid
+                                               and e2.workspace_id = p2.workspace_id
+                                             where p2.id = r.propuesta_ai_id
+                                               and p2.workspace_id = r.workspace_id),
+                                           -- Y la escrita a mano (SYS-21), que no tiene
+                                           -- propuesta detrás: el enlace es todo lo que hay.
+                                           (select jsonb_agg(jsonb_build_object(
+                                                     'evidenciaTitulo', e.titulo,
+                                                     'fragmento', null, 'localizacion', null)
+                                                   order by e.titulo)
+                                              from hallazgo_simulado_evidencia he
+                                              join evidencia e on e.id = he.evidencia_id
+                                               and e.workspace_id = he.workspace_id
+                                             where he.hallazgo_id = h.id
+                                               and he.workspace_id = h.workspace_id),
+                                           '[]'::jsonb))
                                        order by h.orden)
                                 from hallazgo_simulado h
                                 where h.revision_id = r.id and h.workspace_id = r.workspace_id

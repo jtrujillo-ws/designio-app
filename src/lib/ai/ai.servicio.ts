@@ -54,6 +54,7 @@ import {
   promptRevision,
   tramoDeEvidenciaEnRevision,
   arquetiposQueLlegaronEnteros,
+  evidenciaPorLenteQueLlegoAlRevisor,
   evidenciaQueLlegoAlRevisor,
   lentesDelLote,
   SISTEMA_REVISION,
@@ -2486,6 +2487,8 @@ type Alcance = {
   huellaEntradas?: string;
   /** Los ids de la evidencia de ese material. Ver `Preparacion`. */
   evidenciaDelMaterial?: string[];
+  /** Y ese conjunto partido por sesión, cuando el lote se parte. Ver `Preparacion`. */
+  evidenciaDelMaterialPorSesion?: { clave: string; porClave: Record<string, string[]> };
   /** Y los ids de los INSIGHTS que llegaron enteros al modelo (C3). Es la misma pregunta que
    * la de arriba con otro sustantivo —lo que se sella tiene que haberse leído— y se resuelve
    * igual: la huella es de un TEXTO y no hay SQL que lo reconstruya; el conjunto de ids sí, y
@@ -2540,6 +2543,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       huellaMaterial,
       huellaEntradas,
       evidenciaDelMaterial,
+      evidenciaDelMaterialPorSesion,
       insightsDelMaterial,
     } = await PREPARAR[entrada.capacidad](tx, entrada);
     if (consentimiento?.falta) {
@@ -2638,6 +2642,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
       huellaMaterial,
       huellaEntradas,
       evidenciaDelMaterial,
+      evidenciaDelMaterialPorSesion,
       insightsDelMaterial,
     };
   });
@@ -3983,6 +3988,19 @@ type Preparacion = {
    * y se guarda: el guard diferido no puede llamar a TypeScript.
    */
   evidenciaDelMaterial?: string[];
+  /**
+   * Y ese mismo conjunto PARTIDO, cuando el lote se parte.
+   *
+   * Un lote de C4 es una sesión por lente: las N propuestas nacen de un material común pero
+   * cada una responde por UNA de sus partes, así que el conjunto que el sello va a comparar
+   * no es el del material, es el de su parte. Con el del material, un documento que se enlaza
+   * a la lente B después de generar pasa por visto porque la lente A ya lo enseñaba.
+   *
+   * `clave` es el campo del contenido que dice de qué parte es cada propuesta, y `porClave`
+   * lo que esa parte enseñó. Va declarado y no escrito para C4 —el insert lo usa si está y no
+   * pregunta por capacidad— porque la siguiente que parta su lote tendrá el mismo problema.
+   */
+  evidenciaDelMaterialPorSesion?: { clave: string; porClave: Record<string, string[]> };
   /** Y los ids de los INSIGHTS que llegaron enteros al modelo (C3). Es la misma pregunta que
    * la de arriba con otro sustantivo —lo que se sella tiene que haberse leído— y se resuelve
    * igual: la huella es de un TEXTO y no hay SQL que lo reconstruya; el conjunto de ids sí, y
@@ -4247,6 +4265,15 @@ const PREPARAR: Record<
        * misma lección que costó una ronda en C2.
        */
       evidenciaDelMaterial: llegado.ids,
+      /*
+       * Y PARTIDO POR LENTE, que es lo que el sello necesita: cada propuesta del lote responde
+       * por un arquetipo, así que su alcance es el de ese arquetipo y no el del material. Ver
+       * «evidenciaPorLenteQueLlegoAlRevisor».
+       */
+      evidenciaDelMaterialPorSesion: {
+        clave: 'arquetipoId',
+        porClave: evidenciaPorLenteQueLlegoAlRevisor(material),
+      },
     };
   },
   C7: async (tx, entrada) => {
@@ -5246,7 +5273,21 @@ async function persistirPropuestas(
              -- Y el CONJUNTO de evidencia de ese material, que es la misma pregunta escrita
              -- de una forma que el suelo puede volver a hacerse: la huella es de un texto
              -- con formato y recorte, y no hay SQL que lo reconstruya. Ver «Preparacion».
-             ${alcance.evidenciaDelMaterial ?? null},
+             --
+             -- Partido POR SESIÓN cuando la preparación lo declara: un lote que se parte en
+             -- una sesión por parte necesita que cada fila lleve el conjunto de SU parte, o el
+             -- sello compara contra lo que enseñaron las demás. Se decide por lo que la
+             -- preparación trae y no por la capacidad: un «if capacidad === 'C4'» aquí sería
+             -- la misma regla escrita en un sitio donde la siguiente capacidad no la ve.
+             ${
+               alcance.evidenciaDelMaterialPorSesion === undefined
+                 ? tx`${alcance.evidenciaDelMaterial ?? null}::uuid[]`
+                 : tx`(select array_agg(x::uuid)
+                         from jsonb_array_elements_text(
+                           ${tx.json(alcance.evidenciaDelMaterialPorSesion.porClave)}::jsonb
+                             -> (c.contenido ->> ${alcance.evidenciaDelMaterialPorSesion.clave}))
+                           as t(x))`
+             },
              ${alcance.insightsDelMaterial ?? null},
              ${alcance.origenKey}, ${llamada.id},
              -- El puesto en el lote sale de la MISMA sentencia que inserta (with

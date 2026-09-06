@@ -211,8 +211,15 @@ export type RevisionSimuladaDeConcepto = {
     titulo: string;
     descripcion: string;
     esHipotesis: boolean;
-    /** Los documentos que sostienen la lectura, por título. Vacío en una hipótesis. */
-    citas: string[];
+    /**
+     * Lo que sostiene la lectura. Vacío en una hipótesis.
+     *
+     * Con el FRAGMENTO y su localización cuando la revisión salió de una propuesta: el
+     * testimonio vive en su `contenido` —inmutable por SYS-17— y es lo que la tarjeta pendiente
+     * enseñaba. La escrita a mano (SYS-21) no tiene de dónde sacarlo: llega solo el título, y
+     * los dos campos en `null`, que es un hecho y no una ausencia.
+     */
+    citas: { evidenciaTitulo: string; fragmento: string | null; localizacion: string | null }[];
   }[];
   /** Lo único que esta sesión le entrega a la etapa 4: qué ir a probar con personas. */
   preguntas: {

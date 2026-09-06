@@ -1933,10 +1933,15 @@ begin
     -- inventado hablando en primera persona» (SYS-20). La misma regla estaba escrita en un solo
     -- extremo del camino, y el que faltaba es el que sella.
     --
-    -- Se pide UNA que la revisión haya visto, no todas: el alcance es el del LOTE —la evidencia
-    -- de todas las lentes que llegaron al modelo— así que «todas las suyas» no se puede
-    -- preguntar desde aquí sin guardar el alcance por arquetipo. Una basta para lo que esto
-    -- protege: que lo que se sella siga siendo la lectura de una lente y no de un perfil vacío.
+    -- Se pide UNA que la revisión haya visto, no todas, y aquí sí es a propósito: «todas» es
+    -- justo lo que pregunta la comprobación de arriba, y esta responde a otra cosa. Lo que se
+    -- protege es que lo sellado siga siendo la lectura de una lente y no de un perfil vacío,
+    -- y para eso una basta.
+    --
+    -- (El alcance ES el de la lente desde que se escribe partido por sesión: con el del LOTE
+    -- —la evidencia de todas las lentes que llegaron al modelo— ni siquiera la de arriba
+    -- servía, porque un documento enlazado a esta lente DESPUÉS pasaba por visto si otra lente
+    -- ya lo enseñaba. Ver «evidenciaPorLenteQueLlegoAlRevisor».)
     --
     -- Y una sesión de hipótesis pura es justo la que llega hasta aquí: donde hay citas, la
     -- comprobación de DR001 de más arriba ya para la revocación.

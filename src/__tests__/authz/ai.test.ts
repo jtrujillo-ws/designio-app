@@ -8409,6 +8409,104 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * EL ALCANCE ES DE LA LENTE, no del lote — y con el del lote una lente que CRECE pasa.
+   *
+   * `alcance_evidencia` se escribía con lo que llegó al modelo en TODO el material, y de una
+   * fila de C4 el material trae varias lentes: el mismo array iba a las N propuestas del lote.
+   * Entonces la primera comprobación del sello —«¿tiene este arquetipo evidencia que la
+   * revisión no llegó a ver?»— se contesta contra un conjunto que incluye documentos de OTRAS
+   * lentes, y basta con que el documento nuevo ya estuviera ahí por otra para que la pregunta
+   * diga que no falta nada.
+   *
+   * El caso es exactamente el que SYS-20 quiere impedir por el otro lado: una frase con voz del
+   * «apurado de RR. HH.» sostenida en el testimonio del «desconfiado digital». Aquí no se cita
+   * mal —eso ya lo para el guard de las citas—, se SELLA una sesión de una lente que hoy tiene
+   * un testimonio que aquella sesión no leyó, con el argumento de que alguien lo leyó.
+   *
+   * Y no lo tapa el servicio: la huella del material sí se movería, pero este guard existe
+   * porque la superficie concedida deja escribir el sello sin pasar por ahí.
+   */
+  it('el alcance de una propuesta de C4 es el de SU lente, no el del lote', async () => {
+    await enWorkspaceLimpio('c4-alcance-lente', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const sesion = (arquetipoId: string, evidenciaId: string, quien: string) => ({
+        arquetipoId,
+        sintesis: `Una lectura de ${quien}.`,
+        hallazgos: [
+          {
+            titulo: `Lo que ${quien} pide`,
+            descripcion: 'Sale de su testimonio.',
+            esHipotesis: false,
+            citas: [{ evidenciaId, fragmento: 'No entrego la cédula', localizacion: 'resumen' }],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Y si no?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [sesion(lenteA, evA, 'el primero'), sesion(lenteB, evB, 'el segundo')],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const filas = await admin`select contenido ->> 'arquetipoId' as lente, alcance_evidencia
+          from propuesta_ai where workspace_id = ${wsC} and capacidad = 'C4'`;
+      expect(filas.length, 'el lote no trajo las dos sesiones').toBe(2);
+      expect(
+        Object.fromEntries(filas.map((f) => [f.lente as string, [...(f.alcance_evidencia as string[])].sort()])),
+        'el alcance de cada propuesta no es el de su propia lente',
+      ).toEqual({ [lenteA]: [evA], [lenteB]: [evB] });
+
+      // Y lo que eso compra, medido en el sello: la lente del segundo CRECE con el documento
+      // del primero, y su revisión —que no lo leyó bajo esa lente— deja de poder sellarse.
+      await conUsuario(curadorId, (tx) =>
+        tx`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+             values (${wsC}, ${lenteB}, ${evA})`,
+      );
+      const [pB] = await admin`select id from propuesta_ai
+          where workspace_id = ${wsC} and capacidad = 'C4'
+            and contenido ->> 'arquetipoId' = ${lenteB}`;
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura de el segundo.', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Lo que el segundo pide',
+                    'Sale de su testimonio.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id)
+            values (${h!.id as string}, ${evB}, ${wsC})`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Y si no?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${pB!.id as string} and workspace_id = ${wsC}`;
+        }),
+      ).rejects.toThrow(/no llegó a ver/i);
+    });
+  });
+
+  /**
    * Y una lente que se quedó sin evidencia utilizable tampoco se sella.
    *
    * La avería que la señaló venía escrita como «evidencia desenlazada del arquetipo», y ESO no
@@ -9269,8 +9367,20 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(rev!.sintesis).toBe('No entrega el documento sin saber para qué.');
       expect(rev!.propuestaAiId, 'la revisión no dice de qué propuesta salió').toBe(propuestaId);
       expect(rev!.hallazgos.map((h) => h.esHipotesis)).toEqual([false, true]);
-      expect(rev!.hallazgos[0]!.citas, 'la cita no llega con el título del documento').toEqual([
-        'Entrevista D-01',
+      /*
+       * La cita ENTERA, no solo el documento.
+       *
+       * El enlace materializado son tres uuid: no guarda el fragmento, y por su clave primaria
+       * dos citas del mismo documento colapsan en una. El testimonio vive en el «contenido» de
+       * la propuesta —inmutable por SYS-17—, así que leerlo de ahí no es un adorno: es la única
+       * forma de que quien firma el pasa/muere vea QUÉ dijo alguien y no solo dónde.
+       */
+      expect(rev!.hallazgos[0]!.citas, 'la cita llega sin el pasaje que la sostiene').toEqual([
+        {
+          evidenciaTitulo: 'Entrevista D-01',
+          fragmento: 'No entrego la cédula',
+          localizacion: 'resumen',
+        },
       ]);
       expect(rev!.hallazgos[1]!.citas, 'una hipótesis no cita nada').toEqual([]);
       expect(rev!.preguntas.map((q) => q.pregunta)).toEqual([

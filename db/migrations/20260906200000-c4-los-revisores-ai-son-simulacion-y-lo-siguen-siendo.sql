@@ -194,6 +194,26 @@ create table hallazgo_simulado_evidencia (
   hallazgo_id uuid not null,
   evidencia_id uuid not null,
   workspace_id uuid not null references workspace(id),
+  /*
+   * EL PASAJE, en la cita y no sólo en el contenido de la propuesta.
+   *
+   * Para una revisión propuesta por la AI el fragmento vive en `propuesta_ai.contenido`, que es
+   * inmutable (SYS-17) y es de donde el lector lo saca. Una revisión escrita a mano NO TIENE
+   * propuesta, así que ahí no hay nada que leer: sin estas dos columnas, el pasaje que escribió
+   * quien la redactó se perdía en el refresco y la cita quedaba reducida al título del
+   * documento — justo lo contrastable, que es para lo que existe una cita.
+   *
+   * Va en el ENLACE porque el pasaje es una propiedad de la cita, no de la respuesta que la
+   * trajo, y así lo escriben y lo leen los dos caminos por el mismo sitio.
+   *
+   * La clave primaria sigue siendo `(hallazgo_id, evidencia_id)`: dos citas del MISMO documento
+   * en el mismo hallazgo son un solo enlace, y se guarda el pasaje de la primera. Para lo que
+   * viene de la AI las demás siguen enteras en el contenido; para lo escrito a mano, el contrato
+   * ya prohíbe repetir la misma cita y lo que queda es el primero de dos fragmentos del mismo
+   * documento, que es un empobrecimiento acotado y dicho, no una pérdida silenciosa.
+   */
+  fragmento text,
+  localizacion text,
   primary key (hallazgo_id, evidencia_id),
   foreign key (hallazgo_id, workspace_id)
     references hallazgo_simulado (id, workspace_id) on delete cascade,
@@ -276,6 +296,16 @@ begin
     select 1 from hallazgo_simulado_evidencia e where e.hallazgo_id = v_hallazgo
   ) then
     raise exception 'un hallazgo de revisión simulada que no se marca como hipótesis tiene que citar al menos una evidencia real: sin cita y sin marca es una afirmación inventada con voz de usuario (RF-08.2, SYS-20)';
+  end if;
+  -- Y LA OTRA DIRECCIÓN, que este guard también miraba en un solo sentido. Las dos clases de
+  -- RF-08.2 se EXCLUYEN: una hipótesis con citas es una fila que se presenta a la vez como
+  -- extrapolación sin sostén y como lectura de un testimonio observado, y quien firma el
+  -- pasa/muere lee las dos cosas — el lector pinta las citas como sostén y la etiqueta dice que
+  -- no lo hay. El contrato lo corta al parsear; esto es el suelo para lo que no pasa por ahí.
+  if v_es_hipotesis and exists (
+    select 1 from hallazgo_simulado_evidencia e where e.hallazgo_id = v_hallazgo
+  ) then
+    raise exception 'un hallazgo de revisión simulada marcado como hipótesis no cita evidencia: o se extrapola y se dice, o se observa y se cita — las dos clases se excluyen (RF-08.2, SYS-20)';
   end if;
   return null;
 end;
@@ -687,7 +717,7 @@ grant insert (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
   on revision_simulada to designio_app;
 grant insert (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
   on hallazgo_simulado to designio_app;
-grant insert (hallazgo_id, evidencia_id, workspace_id)
+grant insert (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
   on hallazgo_simulado_evidencia to designio_app;
 grant insert (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
   on pregunta_de_test to designio_app;

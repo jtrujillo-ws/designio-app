@@ -471,8 +471,19 @@ export async function gobernanzaDeProyecto(
               join segmento s on s.id = asg.segmento_id and s.workspace_id = asg.workspace_id
               where asg.arquetipo_id = a.id and asg.workspace_id = a.workspace_id
             ), '[]'::jsonb),
+            /*
+             * Con «citable», que es lo que hace que el formulario manual no dependa del selector
+             * general de evidencias. Aquél se corta en las 200 más recientes del workspace, así
+             * que una lente sostenida por documentos más antiguos daba una intersección VACÍA y
+             * quien escribía a mano no podía citar nada — con la única salida aparente de
+             * marcar el hallazgo como hipótesis, o sea mentir sobre su clase.
+             *
+             * Aquí no hay corte: esta lista es la del arquetipo, entera. Y el permiso se
+             * pregunta donde vive, para que la pantalla ofrezca lo que de verdad se puede citar.
+             */
             'evidencias', coalesce((
-              select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo)
+              select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo,
+                       'citable', evidencia_usable(e.id, e.workspace_id, 'cliente'))
                 order by e.titulo)
               from arquetipo_evidencia ae
               join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
@@ -595,10 +606,25 @@ export async function gobernanzaDeProyecto(
                                                     and hv.evidencia_id
                                                           = (x ->> 'evidenciaId')::uuid)),
                                            -- Y la escrita a mano (SYS-21), que no tiene
-                                           -- propuesta detrás: el enlace es todo lo que hay.
+                                           -- propuesta detrás: el enlace es todo lo que hay, y
+                                           -- por eso el enlace GUARDA el pasaje. Antes esta
+                                           -- rama lo daba por perdido —«fragmento null»— y la
+                                           -- cita quedaba reducida al título del documento en
+                                           -- cuanto se refrescaba: lo contrastable, que es para
+                                           -- lo que existe una cita, se borraba solo.
+                                           --
+                                           -- Con la misma puerta que la otra rama: el pasaje
+                                           -- sólo si el documento sigue pudiendo citarse.
                                            (select jsonb_agg(jsonb_build_object(
                                                      'evidenciaTitulo', e.titulo,
-                                                     'fragmento', null, 'localizacion', null,
+                                                     'fragmento', case when evidencia_usable(
+                                                         he.evidencia_id, he.workspace_id,
+                                                         'cliente')
+                                                       then he.fragmento end,
+                                                     'localizacion', case when evidencia_usable(
+                                                         he.evidencia_id, he.workspace_id,
+                                                         'cliente')
+                                                       then he.localizacion end,
                                                      'citable', evidencia_usable(
                                                        he.evidencia_id, he.workspace_id, 'cliente'))
                                                    order by e.titulo)
@@ -696,6 +722,38 @@ export async function escribirRevisionAMano(
         );
       }
       throw e;
+    }
+  });
+}
+
+/**
+ * Y BORRARLA, que es la otra mitad de la ruta manual — y la que el propio mensaje de error
+ * prometía sin que existiera.
+ *
+ * «Corregir una revisión es borrarla y escribir la buena» es la decisión que este módulo tomó
+ * cuando le puso a `revision_simulada` una política de DELETE y ningún UPDATE: las hojas son
+ * inmutables a propósito, y una errata o una pregunta que sobra no se editan, se rehacen. Sin
+ * una función que ejerza ese DELETE, la primera revisión escrita a mano era irreversible desde
+ * la aplicación — y `unique (concepto_id, arquetipo_id)` impedía además escribir la sustituta.
+ *
+ * Lo que se puede borrar lo sigue diciendo la base, no esta función: mientras el concepto sea
+ * candidato y su etapa siga abierta. Una revisión SELLADA por una propuesta también se borra —
+ * es como se corrige lo aceptado, y su trigger suelta el puntero de la propuesta—, y el hecho
+ * no se pierde: vive en `evento_dominio`.
+ */
+export async function borrarRevisionAMano(
+  actorId: string,
+  entrada: { workspaceId: string; revisionId: string },
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`delete from revision_simulada
+      where id = ${entrada.revisionId} and workspace_id = ${entrada.workspaceId}
+      returning id`;
+    if (filas.length === 0) {
+      throw new ErrorGobernanza(
+        'No puedes borrar esa revisión: o no eres curador, o el concepto ya no es candidato, o su etapa 4 está cerrada — una vez firmado el pasa/muere, lo que se leyó para decidir se queda',
+      );
     }
   });
 }

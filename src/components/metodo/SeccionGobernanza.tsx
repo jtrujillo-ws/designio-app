@@ -13,6 +13,7 @@ import {
   aprobarDecision,
   definirArquetipo,
   enlazarEvidenciaArquetipo,
+  borrarRevisionSimuladaAMano,
   escribirRevisionSimuladaAMano,
   reabrirEtapaDelProyecto,
   revalidarDecisionRevisada,
@@ -109,7 +110,6 @@ export function SeccionGobernanza({
         workspaceId={workspaceId}
         conceptos={gobernanza.conceptos}
         arquetipos={gobernanza.arquetipos}
-        evidencias={evidencias}
         onCambio={onCambio}
         onError={onError}
       />
@@ -836,18 +836,31 @@ function BloqueRevisionesSimuladas({
   workspaceId,
   conceptos,
   arquetipos,
-  evidencias,
   onCambio,
   onError,
 }: {
   workspaceId: string;
   conceptos: GobernanzaDeProyecto['conceptos'];
   arquetipos: ArquetipoDeReto[];
-  evidencias: EvidenciaCitable[];
   onCambio: () => Promise<void>;
   onError: (m: string | null) => void;
 }) {
+  const [borrando, setBorrando] = useState('');
   const conRevisiones = conceptos.filter((c) => c.revisiones.length > 0);
+
+  async function borrar(revisionId: string) {
+    setBorrando(revisionId);
+    onError(null);
+    try {
+      const r = await borrarRevisionSimuladaAMano({ data: { workspaceId, revisionId } });
+      if (r.ok) await onCambio();
+      else onError(r.error);
+    } catch {
+      onError('No se pudo borrar la revisión; intenta de nuevo');
+    } finally {
+      setBorrando('');
+    }
+  }
   /*
    * Y ya NO se esconde cuando no hay ninguna: sin revisiones es justo cuando hace falta poder
    * escribir una. Lo que decide si hay algo que enseñar es si hay conceptos, no si la AI ya
@@ -870,13 +883,36 @@ function BloqueRevisionesSimuladas({
             {c.estado === 'candidato' ? '' : ` · ${ETIQUETA_ESTADO_CONCEPTO[c.estado]}`}
           </span>
           <RevisionesDelConcepto revisiones={c.revisiones} />
+          {/*
+            BORRAR Y REESCRIBIR, que es la única corrección que este diseño admite: las hojas de
+            una revisión no se editan —no hay UPDATE concedido— así que una errata o una pregunta
+            que sobra se arreglan rehaciéndola. Sin este control, la primera revisión escrita a
+            mano era irreversible desde la aplicación, y la clave única por lente impedía además
+            escribir la sustituta.
+
+            Sólo mientras el concepto es CANDIDATO: firmado el pasa/muere, lo que se leyó para
+            decidir se queda. La base lo exige igual; esto es no ofrecer lo que va a fallar.
+          */}
+          {c.estado === 'candidato' && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {c.revisiones.map((r) => (
+                <Button
+                  key={r.id}
+                  variant="secondary"
+                  disabled={borrando !== ''}
+                  onClick={() => void borrar(r.id)}
+                >
+                  Borrar la de «{r.arquetipoNombre}» y reescribirla
+                </Button>
+              ))}
+            </div>
+          )}
         </div>
       ))}
       <FormularioRevisionAMano
         workspaceId={workspaceId}
         conceptos={conceptos}
         arquetipos={arquetipos}
-        evidencias={evidencias}
         onCambio={onCambio}
         onError={onError}
       />
@@ -901,14 +937,12 @@ function FormularioRevisionAMano({
   workspaceId,
   conceptos,
   arquetipos,
-  evidencias,
   onCambio,
   onError,
 }: {
   workspaceId: string;
   conceptos: GobernanzaDeProyecto['conceptos'];
   arquetipos: ArquetipoDeReto[];
-  evidencias: EvidenciaCitable[];
   onCambio: () => Promise<void>;
   onError: (m: string | null) => void;
 }) {
@@ -919,7 +953,20 @@ function FormularioRevisionAMano({
   const [sintesis, setSintesis] = useState('');
   const [titulo, setTitulo] = useState('');
   const [descripcion, setDescripcion] = useState('');
-  const [esHipotesis, setEsHipotesis] = useState(false);
+  const [esHipotesis, setEsHipotesisCrudo] = useState(false);
+  /*
+   * Marcar hipótesis BORRA la cita elegida. Los campos se ocultaban, pero lo que ya estaba
+   * seleccionado seguía en el estado y se mandaba igual: un hallazgo que se presenta a la vez
+   * como extrapolación sin sostén y como lectura de un testimonio observado.
+   */
+  const setEsHipotesis = (v: boolean) => {
+    setEsHipotesisCrudo(v);
+    if (v) {
+      setEvidenciaId('');
+      setFragmento('');
+      setLocalizacion('');
+    }
+  };
   const [evidenciaId, setEvidenciaId] = useState('');
   const [fragmento, setFragmento] = useState('');
   const [localizacion, setLocalizacion] = useState('');
@@ -932,8 +979,16 @@ function FormularioRevisionAMano({
   const lentes = arquetipos.filter((a) => a.estado !== 'refutado');
   // Y la evidencia OFRECIDA es la de la lente elegida: una sesión sólo cita lo que constituyó
   // a su arquetipo, y ofrecer el resto sería ofrecer un error que la base devuelve después.
-  const deLaLente = new Set(lentes.find((a) => a.id === arquetipoId)?.evidencias.map((e) => e.id));
-  const citables = evidencias.filter((e) => deLaLente.has(e.id) && e.citable);
+  /*
+   * Lo citable sale de LA LENTE y no del selector general del workspace. Aquél se corta en las
+   * 200 más recientes, así que una lente sostenida por documentos más antiguos dejaba la lista
+   * vacía y el único camino aparente era marcar el hallazgo como hipótesis — mentir sobre su
+   * clase para poder guardar. La proyección de la lente trae su evidencia entera y con su
+   * permiso ya resuelto.
+   */
+  const citables = (lentes.find((a) => a.id === arquetipoId)?.evidencias ?? []).filter(
+    (e) => e.citable,
+  );
 
   async function escribir() {
     setOcupado(true);
@@ -951,8 +1006,16 @@ function FormularioRevisionAMano({
                 titulo,
                 descripcion,
                 esHipotesis,
+                /*
+                 * Sin cita si es hipótesis, y no por cortesía: las dos clases de RF-08.2 se
+                 * excluyen, así que mandar una cita con la marca puesta lo rechaza el contrato.
+                 * Ocultar los campos no bastaba — lo elegido seguía en el estado—, así que la
+                 * casilla los LIMPIA al marcarse y esto es el cinturón.
+                 */
                 citas:
-                  evidenciaId === '' ? [] : [{ evidenciaId, fragmento, localizacion }],
+                  esHipotesis || evidenciaId === ''
+                    ? []
+                    : [{ evidenciaId, fragmento, localizacion }],
               },
             ],
             preguntas: [{ pregunta, escenario, hallazgoIndice: 0 }],

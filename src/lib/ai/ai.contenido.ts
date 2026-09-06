@@ -734,6 +734,24 @@ export const ContenidoRevisionSimuladaSchema = z
                 'un hallazgo que no se marca como hipótesis cita al menos una evidencia real: sin cita y sin marca es una afirmación inventada con voz de usuario (RF-08.2, SYS-20)',
             });
           }
+          /*
+           * Y LA OTRA DIRECCIÓN, que faltaba. «Dos clases de hallazgo y ninguna tercera» se
+           * comprobaba en un solo sentido, así que una HIPÓTESIS CON CITAS pasaba: una fila que
+           * se presenta a la vez como extrapolación sin sostén y como lectura de un testimonio
+           * observado. El lector pinta las citas como sostén y la etiqueta dice que no lo hay;
+           * quien firma un pasa/muere lee las dos cosas.
+           *
+           * No es teórico: en el formulario manual basta con elegir la evidencia y marcar
+           * después la casilla — los campos se ocultan, pero lo elegido sigue ahí.
+           */
+          if (h.esHipotesis && h.citas.length > 0) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: [i, 'citas'],
+              message:
+                'un hallazgo marcado como hipótesis no cita evidencia: o se extrapola y se dice, o se observa y se cita — las dos clases se excluyen (RF-08.2, SYS-20)',
+            });
+          }
         });
       }),
     preguntas: z

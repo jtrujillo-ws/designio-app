@@ -73,7 +73,11 @@ import {
 } from '@/lib/ai/ai.schemas';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
-import { escribirRevisionAMano, gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
+import {
+  borrarRevisionAMano,
+  escribirRevisionAMano,
+  gobernanzaDeProyecto,
+} from '@/lib/metodo/gobernanza.servicio';
 import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
 import { borrarEntrada } from '@/lib/medicion/medicion.servicio';
 import { describeAuthz } from './helpers';
@@ -9604,6 +9608,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         fragmento: 'sin saber para qué',
         localizacion: 'resumen',
       };
+      // Una TERCERA: un reparto sólo es reparto si los dos hallazgos siguen citando algo, desde
+      // que las dos clases de RF-08.2 se excluyen.
+      const citaTres = { evidenciaId: evA, fragmento: 'la cédula', localizacion: 'resumen' };
       const original = {
         arquetipoId: lenteA,
         sintesis: 'Dos lecturas del primero.',
@@ -9612,12 +9619,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             titulo: 'Pide saber para qué',
             descripcion: 'No entrega el documento sin motivo.',
             esHipotesis: false,
-            citas: [citaAfirmada],
+            citas: [citaAfirmada, citaTres],
           },
           {
-            titulo: 'Quizá abandone el alta',
-            descripcion: 'Extrapolando, se iría antes de terminar.',
-            esHipotesis: true,
+            // OBSERVADO y no hipótesis: este hallazgo lleva su propia cita, y desde que las dos
+            // clases de RF-08.2 se excluyen, marcarlo como extrapolación con un testimonio
+            // detrás es justo lo que la base rechaza. Lo que la sonda mide —que las citas no se
+            // reparten entre hallazgos— necesita dos hallazgos CITADOS, no uno de cada clase.
+            titulo: 'Se va por el tiempo',
+            descripcion: 'Dice que abandona si tarda.',
+            esHipotesis: false,
             citas: [citaHipotesis],
           },
         ],
@@ -9639,8 +9650,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       };
 
       const propuestaId = await pedir();
-      // La lista aplanada es la MISMA —dos citas, en el mismo orden— y las marcas también.
-      // Lo único que cambia es de quién cuelga cada una.
+      /*
+       * La lista aplanada es la MISMA —dos citas, en el mismo orden— y las marcas también. Lo
+       * único que cambia es de quién cuelga cada una: la primera se muda al segundo hallazgo.
+       *
+       * Los DOS siguen citando algo, y eso importa desde que las dos clases de RF-08.2 se
+       * excluyen: dejar uno a cero lo pararía el CONTRATO —«la corrección no cumple el formato
+       * de la capacidad»— y la sonda estaría midiendo esa puerta en vez del reparto. Medido: es
+       * exactamente lo que respondía al escribirlo así.
+       */
       await expect(
         aceptarPropuesta(curadorId, {
           workspaceId: wsC,
@@ -9648,8 +9666,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           correccion: {
             ...original,
             hallazgos: [
-              { ...original.hallazgos[0]!, citas: [citaAfirmada, citaHipotesis] },
-              { ...original.hallazgos[1]!, citas: [] },
+              { ...original.hallazgos[0]!, citas: [citaAfirmada] },
+              { ...original.hallazgos[1]!, citas: [citaTres, citaHipotesis] },
             ],
           },
         }),
@@ -10025,6 +10043,108 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           },
         }),
       ).rejects.toThrow();
+    });
+  });
+
+  /**
+   * LO QUE LA RUTA MANUAL PROMETÍA Y NO TENÍA: el pasaje, el borrado y las clases excluyentes.
+   *
+   * Tres consecuencias de haber añadido la escritura a mano, y las tres se ven sólo desde ella:
+   *
+   *  · EL PASAJE. Una revisión propuesta guarda el fragmento en `propuesta_ai.contenido`, que es
+   *    de donde el lector lo saca. Una escrita a mano no tiene propuesta, así que el pasaje se
+   *    perdía en el refresco y la cita quedaba reducida al título del documento — justo lo
+   *    contrastable. Ahora vive en el ENLACE, que es donde vive la cita, y lo escriben y lo leen
+   *    los dos caminos por el mismo sitio.
+   *  · EL BORRADO. «Corregir una revisión es borrarla y escribir la buena» es la decisión que
+   *    tomó la política de DELETE al no conceder ningún UPDATE — y el mensaje de error de la
+   *    ruta manual la prometía sin que existiera función alguna que la ejerciera. La primera
+   *    revisión escrita a mano era irreversible, y la clave única por lente impedía la
+   *    sustituta.
+   *  · LAS DOS CLASES. «Hipótesis o citada, y ninguna tercera» se comprobaba en un solo
+   *    sentido, así que una hipótesis CON citas pasaba: una fila que se presenta a la vez como
+   *    extrapolación sin sostén y como lectura de un testimonio observado.
+   */
+  it('la revisión a mano guarda su pasaje, se puede rehacer, y no mezcla las dos clases', async () => {
+    await enWorkspaceLimpio('c4-a-mano-completa', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4C', 'Proyecto de la revisión rehecha', ${curadorId})
+        returning id`;
+      const base = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      const leer = async () => {
+        const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+        return gob!.conceptos.find((c) => c.id === conceptoId)!.revisiones;
+      };
+
+      // 1. EL PASAJE llega al lector, que es lo que hace contrastable a una cita.
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido: base,
+      });
+      const cita = (await leer())[0]!.hallazgos[0]!.citas[0]!;
+      expect(cita.fragmento, 'el pasaje escrito a mano se perdió en el refresco').toBe(
+        'No entrego la cédula',
+      );
+      expect(cita.localizacion).toBe('resumen');
+      expect(cita.citable).toBe(true);
+
+      // 2. SE REHACE: borrar y escribir la buena, que es la única corrección que hay.
+      await borrarRevisionAMano(curadorId, { workspaceId: wsC, revisionId });
+      expect((await leer()).length, 'la revisión no se borró').toBe(0);
+      const rehecha = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido: { ...base, sintesis: 'Lo que leo yo, ya sin la errata.' },
+      });
+      expect(rehecha.revisionId).toBeTruthy();
+      expect((await leer())[0]!.sintesis).toBe('Lo que leo yo, ya sin la errata.');
+
+      // 3. LAS DOS CLASES se excluyen, y en los dos sentidos.
+      await borrarRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        revisionId: rehecha.revisionId,
+      });
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            ...base,
+            hallazgos: [{ ...base.hallazgos[0]!, esHipotesis: true }],
+          },
+        }),
+        'una hipótesis con citas entró: se presenta como extrapolación y como testimonio a la vez',
+      ).rejects.toThrow();
+      // Y la hipótesis SIN citas sí entra, que es lo que separa «no se mezclan» de «no hay
+      // hipótesis».
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            ...base,
+            hallazgos: [{ ...base.hallazgos[0]!, esHipotesis: true, citas: [] }],
+          },
+        }),
+      ).resolves.toBeTruthy();
     });
   });
 
@@ -10437,6 +10557,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         fragmento: 'Prefiero que me digan para qué',
         localizacion: 'resumen',
       };
+      // Una TERCERA cita: desde que las dos clases de RF-08.2 se excluyen, un reparto sólo es
+      // reparto si los dos hallazgos siguen citando algo — dejar uno a cero lo para el contrato
+      // antes, y la sonda mediría esa puerta.
+      const citaTres = { evidenciaId: evA, fragmento: 'la cédula', localizacion: 'resumen' };
       const original = {
         arquetipoId: lenteA,
         sintesis: 'Dos lecturas del primero.',
@@ -10448,9 +10572,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             citas: [citaUna],
           },
           {
-            titulo: 'Quizá abandone el alta',
-            descripcion: 'Extrapolando, se iría antes de terminar.',
-            esHipotesis: true,
+            // OBSERVADO y no hipótesis: este hallazgo lleva su propia cita, y desde que las dos
+            // clases de RF-08.2 se excluyen, marcarlo como extrapolación con un testimonio
+            // detrás es justo lo que la base rechaza. Lo que la sonda mide —que las citas no se
+            // reparten entre hallazgos— necesita dos hallazgos CITADOS, no uno de cada clase.
+            titulo: 'Se va por el tiempo',
+            descripcion: 'Dice que abandona si tarda.',
+            esHipotesis: false,
             citas: [citaOtra],
           },
         ],
@@ -10510,13 +10638,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         });
 
       // 1. EL REPARTO: la misma lista aplanada, colgada de otro hallazgo. Lo que se mueve es el
-      //    documento que sostenía a una hipótesis, ahora debajo de una afirmación.
+      //    documento que sostenía a un hallazgo, ahora debajo del otro.
       await expect(
         corregirEntero({
           ...original,
           hallazgos: [
-            { ...original.hallazgos[0]!, citas: [citaUna, citaOtra] },
-            { ...original.hallazgos[1]!, citas: [] },
+            { ...original.hallazgos[0]!, citas: [citaUna] },
+            { ...original.hallazgos[1]!, citas: [citaTres, citaOtra] },
           ],
         }),
       ).rejects.toThrow(/citas de una revisión simulada no se corrigen/i);
@@ -10536,13 +10664,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         }),
       ).rejects.toThrow(/citas de una revisión simulada no se corrigen/i);
 
-      // 3. La marca de hipótesis, que convierte una extrapolación en investigación.
+      /*
+       * 3. LA MARCA DE HIPÓTESIS ya no llega hasta su guard, y su caso se retira diciendo por
+       *    qué. Desde que las dos clases de RF-08.2 se excluyen, un cambio SUELTO de la marca es
+       *    ilegal por una de las dos en cualquier dirección: una observada citada que pasa a
+       *    hipótesis lleva citas y una hipótesis sin citas que pasa a observada no cita nada.
+       *    Y cambiarla AJUSTANDO las citas mueve las citas, que es lo que para el caso 1.
+       *
+       *    Lo que protegía sigue protegido, y desde un sitio al que no hay que llegar: las dos
+       *    clases se comprueban en el commit de TODA revisión, no sólo al corregir una. Se mide
+       *    aquí el cambio combinado, que es el único que queda alcanzable.
+       */
       await expect(
         corregirEntero({
           ...original,
-          hallazgos: [original.hallazgos[0]!, { ...original.hallazgos[1]!, esHipotesis: false }],
+          hallazgos: [
+            original.hallazgos[0]!,
+            { ...original.hallazgos[1]!, esHipotesis: true, citas: [] },
+          ],
         }),
-      ).rejects.toThrow(/marca de hipótesis/i);
+      ).rejects.toThrow(/citas de una revisión simulada no se corrigen/i);
 
       /*
        * LA LENTE no lleva caso propio, y es una respuesta: cambiarla en el contenido obliga a

@@ -1,4 +1,5 @@
 import { createServerFn } from '@tanstack/react-start';
+import { z } from 'zod';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { requerirUsuarioId, usuarioIdDeRequest } from '@/lib/auth/guardia.server';
 import { ProyectoInputSchema } from './metodo.schemas';
@@ -12,6 +13,7 @@ import {
 } from './gobernanza.schemas';
 import {
   apoyarArquetipo,
+  borrarRevisionAMano,
   crearArquetipo,
   darVeredictoArquetipo,
   ErrorGobernanza,
@@ -152,6 +154,27 @@ export const escribirRevisionSimuladaAMano = createServerFn({ method: 'POST' })
     try {
       const r = await escribirRevisionAMano(actorId, data);
       return { ok: true as const, revisionId: r.revisionId };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+/**
+ * Y BORRARLA, que es la otra mitad de la ruta manual: corregir una revisión es borrarla y
+ * escribir la buena — es lo que decidió la política de DELETE cuando dejó fuera todo UPDATE.
+ * Sin esto, la primera escrita a mano era irreversible desde la aplicación, y la clave única
+ * por lente impedía además escribir la sustituta.
+ */
+export const borrarRevisionSimuladaAMano = createServerFn({ method: 'POST' })
+  .inputValidator(z.object({ workspaceId: z.string().uuid(), revisionId: z.string().uuid() }))
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      await borrarRevisionAMano(actorId, data);
+      return { ok: true as const };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

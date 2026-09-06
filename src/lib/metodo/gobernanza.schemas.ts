@@ -139,7 +139,7 @@ export type ArquetipoDeReto = {
   estado: EstadoArquetipo;
   veredictoRazon: string;
   segmentos: { id: string; nombre: string }[];
-  evidencias: { id: string; titulo: string }[];
+  evidencias: { id: string; titulo: string; citable: boolean }[];
 };
 
 export type AlcanceReapertura = 'declarado' | 'etapa-completa';

@@ -6337,9 +6337,20 @@ export async function escribirRevisionSimulada(
      * se pierde: vive en el `contenido`, que es inmutable por SYS-17 y es donde se lee de
      * dónde salió la frase.
      */
-    for (const evidenciaId of new Set(h.citas.map((x) => x.evidenciaId))) {
-      await tx`insert into hallazgo_simulado_evidencia (hallazgo_id, evidencia_id, workspace_id)
-        values (${fila!.id as string}, ${evidenciaId}, ${workspaceId})`;
+    /*
+     * La PRIMERA cita de cada documento, no la última: `new Map` se queda con la última entrada
+     * de una clave repetida, así que la lista se invierte antes. Cuál se guarda importa poco
+     * para la AI —las demás siguen en el contenido— y mucho para lo escrito a mano, donde ésta
+     * es la única copia; y «la primera» es la que quien escribió puso delante.
+     */
+    const primeraPorDocumento = new Map(
+      [...h.citas].reverse().map((x) => [x.evidenciaId, x] as const),
+    );
+    for (const cita of primeraPorDocumento.values()) {
+      await tx`insert into hallazgo_simulado_evidencia
+          (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+        values (${fila!.id as string}, ${cita.evidenciaId}, ${workspaceId},
+                ${cita.fragmento}, ${cita.localizacion})`;
     }
   }
   // Y las preguntas, con el índice ya traducido al id que acaba de nacer.

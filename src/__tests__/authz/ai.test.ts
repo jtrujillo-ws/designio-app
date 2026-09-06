@@ -73,7 +73,7 @@ import {
 } from '@/lib/ai/ai.schemas';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
-import { gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
+import { escribirRevisionAMano, gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
 import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
 import { borrarEntrada } from '@/lib/medicion/medicion.servicio';
 import { describeAuthz } from './helpers';
@@ -9927,6 +9927,104 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         await elOtro;
       }
       await expect(escritura).rejects.toThrow(/ya no es candidato/i);
+    });
+  });
+
+  /**
+   * SIN AI TAMBIÉN SE ESCRIBE UNA REVISIÓN (SYS-21), que es la paridad que faltaba.
+   *
+   * «Caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre presentes», y el
+   * criterio 3 de SPEC-08 lo lleva a CI. Las cinco capacidades hermanas ya tenían su ruta manual
+   * en su propio servicio de dominio —`insight.servicio.ts`, `medicion.servicio.ts`,
+   * `oportunidad.servicio.ts`—; C4 era la ÚNICA cuyas tablas sólo escribía la materialización.
+   * Las concesiones y las políticas que la base tiene puestas para admitir una revisión a mano
+   * existían desde el principio, y no las podía ejercer nadie.
+   *
+   * Se mide lo que de verdad importa de una ruta manual: que entre ENTERA —la revisión, sus
+   * hallazgos, sus citas y sus preguntas con el hallazgo del que nacen—, que NO lleve sello de
+   * procedencia, que siga marcada como simulación, y que la lea quien decide.
+   *
+   * Y que el contrato sea el MISMO: lo que no puede escribir el modelo tampoco lo escribe una
+   * persona, porque la regla no es sobre quién escribe sino sobre qué se sostiene.
+   */
+  it('sin AI, una revisión simulada se escribe a mano y llega entera (SYS-21)', async () => {
+    await enWorkspaceLimpio('c4-a-mano-sys21', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4M', 'Proyecto de la revisión a mano', ${curadorId})
+        returning id`;
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo de este concepto con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+          {
+            titulo: 'Puede que abandone antes',
+            descripcion: 'Extrapolado del perfil, sin testimonio que lo diga.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [
+          { pregunta: '¿Qué te haría entregarla?', escenario: '', hallazgoIndice: 0 },
+          { pregunta: '¿Y si te lo pide la sucursal?', escenario: 'En sucursal' },
+        ],
+      };
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido,
+      });
+      expect(revisionId).toBeTruthy();
+
+      // Sin sello de procedencia, y con la marca de simulación puesta por el default de la
+      // columna: las dos mitades de SYS-20 sobre una fila que no salió de ninguna propuesta.
+      const [fila] = await admin`select propuesta_ai_id, es_simulacion, arquetipo_id
+        from revision_simulada where id = ${revisionId}`;
+      expect(fila!.propuesta_ai_id, 'una revisión a mano no lleva sello de procedencia').toBeNull();
+      expect(fila!.es_simulacion).toBe(true);
+      expect(fila!.arquetipo_id).toBe(lenteA);
+
+      // Entera: los dos hallazgos con su orden, la cita del afirmativo, y las dos preguntas —
+      // una colgando de su hallazgo y la otra suelta.
+      const hallazgos = await admin`select id, orden, titulo, es_hipotesis from hallazgo_simulado
+        where revision_id = ${revisionId} order by orden`;
+      expect(hallazgos.map((h) => h.es_hipotesis)).toEqual([false, true]);
+      const [citas] = await admin`select count(*)::int as n from hallazgo_simulado_evidencia
+        where hallazgo_id = ${hallazgos[0]!.id as string}`;
+      expect(citas!.n).toBe(1);
+      const preguntas = await admin`select hallazgo_id, orden from pregunta_de_test
+        where revision_id = ${revisionId} order by orden`;
+      expect(preguntas.map((q) => q.hallazgo_id)).toEqual([hallazgos[0]!.id, null]);
+
+      // Y la lee quien decide, por el mismo lector que las aceptadas.
+      const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const revisiones = gob!.conceptos.find((c) => c.id === conceptoId)?.revisiones ?? [];
+      expect(revisiones.length, 'la revisión escrita a mano no llega a quien decide').toBe(1);
+      expect(revisiones[0]!.preguntas.length).toBe(2);
+
+      // El CONTRATO es el mismo: un hallazgo afirmativo sin cita no entra, lo escriba quien lo
+      // escriba. Es lo que separa «hay ruta manual» de «hay una puerta trasera».
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            ...contenido,
+            hallazgos: [{ ...contenido.hallazgos[0]!, citas: [] }],
+            preguntas: [{ pregunta: '¿Y esto?', escenario: '' }],
+          },
+        }),
+      ).rejects.toThrow();
     });
   });
 

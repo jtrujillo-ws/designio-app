@@ -13,6 +13,7 @@ import {
   aprobarDecision,
   definirArquetipo,
   enlazarEvidenciaArquetipo,
+  escribirRevisionSimuladaAMano,
   reabrirEtapaDelProyecto,
   revalidarDecisionRevisada,
   veredictoDeArquetipo,
@@ -25,6 +26,7 @@ import {
   ETIQUETA_ESTADO_CONCEPTO,
   ETIQUETA_TIPO_DECISION,
   TIPOS_DECISION,
+  type ArquetipoDeReto,
   type GobernanzaDeProyecto,
   type TipoDecision,
 } from '@/lib/metodo/gobernanza.schemas';
@@ -103,7 +105,14 @@ export function SeccionGobernanza({
         *
         * Sin puerta de rol: leer no es decidir. Escribir el pasa/muere sigue siendo del lead.
         */}
-      <BloqueRevisionesSimuladas conceptos={gobernanza.conceptos} />
+      <BloqueRevisionesSimuladas
+        workspaceId={workspaceId}
+        conceptos={gobernanza.conceptos}
+        arquetipos={gobernanza.arquetipos}
+        evidencias={evidencias}
+        onCambio={onCambio}
+        onError={onError}
+      />
       <BloqueArquetipos
         workspaceId={workspaceId}
         retoId={proyecto.reto.id}
@@ -824,12 +833,27 @@ function BloqueReaperturas({
  * confusión ocurriría.
  */
 function BloqueRevisionesSimuladas({
+  workspaceId,
   conceptos,
+  arquetipos,
+  evidencias,
+  onCambio,
+  onError,
 }: {
+  workspaceId: string;
   conceptos: GobernanzaDeProyecto['conceptos'];
+  arquetipos: ArquetipoDeReto[];
+  evidencias: EvidenciaCitable[];
+  onCambio: () => Promise<void>;
+  onError: (m: string | null) => void;
 }) {
   const conRevisiones = conceptos.filter((c) => c.revisiones.length > 0);
-  if (conRevisiones.length === 0) return null;
+  /*
+   * Y ya NO se esconde cuando no hay ninguna: sin revisiones es justo cuando hace falta poder
+   * escribir una. Lo que decide si hay algo que enseñar es si hay conceptos, no si la AI ya
+   * produjo algo — que es la diferencia entre un lector y una capacidad.
+   */
+  if (conceptos.length === 0) return null;
   return (
     <Card>
       <h3 style={{ font: '600 13px var(--font-sans)', margin: 0 }}>
@@ -848,7 +872,220 @@ function BloqueRevisionesSimuladas({
           <RevisionesDelConcepto revisiones={c.revisiones} />
         </div>
       ))}
+      <FormularioRevisionAMano
+        workspaceId={workspaceId}
+        conceptos={conceptos}
+        arquetipos={arquetipos}
+        evidencias={evidencias}
+        onCambio={onCambio}
+        onError={onError}
+      />
     </Card>
+  );
+}
+
+/**
+ * ESCRIBIR UNA REVISIÓN A MANO — la paridad que SYS-21 exige (RF-08.6).
+ *
+ * «Caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre presentes.» Las
+ * concesiones y las políticas de la base estaban puestas para esto desde el principio —una
+ * revisión escrita a mano lleva el sello de procedencia en null para siempre— pero no había
+ * por dónde ejercerlas: las tablas de C4 sólo las escribía la aceptación de una propuesta.
+ *
+ * El formulario pide lo mismo que el contrato exige al modelo, ni más ni menos, porque es EL
+ * MISMO esquema el que valida las dos: al menos un hallazgo y una pregunta; un hallazgo que no
+ * se marca como hipótesis cita al menos un documento; y las citas sólo de la evidencia de su
+ * lente. Lo que la base rechace vuelve como mensaje, no como pantalla rota.
+ */
+function FormularioRevisionAMano({
+  workspaceId,
+  conceptos,
+  arquetipos,
+  evidencias,
+  onCambio,
+  onError,
+}: {
+  workspaceId: string;
+  conceptos: GobernanzaDeProyecto['conceptos'];
+  arquetipos: ArquetipoDeReto[];
+  evidencias: EvidenciaCitable[];
+  onCambio: () => Promise<void>;
+  onError: (m: string | null) => void;
+}) {
+  const [abierto, setAbierto] = useState(false);
+  const [ocupado, setOcupado] = useState(false);
+  const [conceptoId, setConceptoId] = useState('');
+  const [arquetipoId, setArquetipoId] = useState('');
+  const [sintesis, setSintesis] = useState('');
+  const [titulo, setTitulo] = useState('');
+  const [descripcion, setDescripcion] = useState('');
+  const [esHipotesis, setEsHipotesis] = useState(false);
+  const [evidenciaId, setEvidenciaId] = useState('');
+  const [fragmento, setFragmento] = useState('');
+  const [localizacion, setLocalizacion] = useState('');
+  const [pregunta, setPregunta] = useState('');
+  const [escenario, setEscenario] = useState('');
+
+  // Sólo los conceptos que todavía admiten revisión, y sólo las lentes que pueden mirar: un
+  // arquetipo REFUTADO no describe a nadie (SPEC-04.11) y la base lo rechaza igualmente.
+  const candidatos = conceptos.filter((c) => c.estado === 'candidato');
+  const lentes = arquetipos.filter((a) => a.estado !== 'refutado');
+  // Y la evidencia OFRECIDA es la de la lente elegida: una sesión sólo cita lo que constituyó
+  // a su arquetipo, y ofrecer el resto sería ofrecer un error que la base devuelve después.
+  const deLaLente = new Set(lentes.find((a) => a.id === arquetipoId)?.evidencias.map((e) => e.id));
+  const citables = evidencias.filter((e) => deLaLente.has(e.id) && e.citable);
+
+  async function escribir() {
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await escribirRevisionSimuladaAMano({
+        data: {
+          workspaceId,
+          conceptoId,
+          contenido: {
+            arquetipoId,
+            sintesis,
+            hallazgos: [
+              {
+                titulo,
+                descripcion,
+                esHipotesis,
+                citas:
+                  evidenciaId === '' ? [] : [{ evidenciaId, fragmento, localizacion }],
+              },
+            ],
+            preguntas: [{ pregunta, escenario, hallazgoIndice: 0 }],
+          },
+        },
+      });
+      if (r.ok) {
+        setAbierto(false);
+        setSintesis('');
+        setTitulo('');
+        setDescripcion('');
+        setEsHipotesis(false);
+        setEvidenciaId('');
+        setFragmento('');
+        setLocalizacion('');
+        setPregunta('');
+        setEscenario('');
+        await onCambio();
+      } else onError(r.error);
+    } catch {
+      onError('No se pudo escribir la revisión; intenta de nuevo');
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  if (candidatos.length === 0 || lentes.length === 0) return null;
+  if (!abierto) {
+    return (
+      <Button variant="secondary" onClick={() => setAbierto(true)}>
+        Escribir una revisión a mano
+      </Button>
+    );
+  }
+  return (
+    <div style={{ display: 'grid', gap: 6 }}>
+      <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+        Revisión escrita a mano · queda marcada como simulación y sin procedencia AI
+      </span>
+      <Select value={conceptoId} onChange={(e) => setConceptoId(e.target.value)}>
+        <option value="">Concepto que se revisa…</option>
+        {candidatos.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.titulo}
+          </option>
+        ))}
+      </Select>
+      <Select
+        value={arquetipoId}
+        onChange={(e) => {
+          setArquetipoId(e.target.value);
+          setEvidenciaId('');
+        }}
+      >
+        <option value="">Lente desde la que se lee…</option>
+        {lentes.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.nombre}
+          </option>
+        ))}
+      </Select>
+      <Input
+        placeholder="Lectura de conjunto"
+        value={sintesis}
+        onChange={(e) => setSintesis(e.target.value)}
+      />
+      <Input placeholder="Hallazgo" value={titulo} onChange={(e) => setTitulo(e.target.value)} />
+      <Input
+        placeholder="Qué se observa"
+        value={descripcion}
+        onChange={(e) => setDescripcion(e.target.value)}
+      />
+      <label style={{ font: '400 11.5px var(--font-sans)', display: 'flex', gap: 6 }}>
+        <input
+          type="checkbox"
+          checked={esHipotesis}
+          onChange={(ev) => setEsHipotesis(ev.currentTarget.checked)}
+        />
+        Es una hipótesis: lo extrapolo del perfil, no lo dice ningún testimonio
+      </label>
+      {!esHipotesis && (
+        <>
+          <Select value={evidenciaId} onChange={(e) => setEvidenciaId(e.target.value)}>
+            <option value="">Documento que lo sostiene…</option>
+            {citables.map((e) => (
+              <option key={e.id} value={e.id}>
+                {e.titulo}
+              </option>
+            ))}
+          </Select>
+          <Input
+            placeholder="Fragmento literal"
+            value={fragmento}
+            onChange={(e) => setFragmento(e.target.value)}
+          />
+          <Input
+            placeholder="Dónde está (p. ej. resumen)"
+            value={localizacion}
+            onChange={(e) => setLocalizacion(e.target.value)}
+          />
+        </>
+      )}
+      <Input
+        placeholder="Pregunta que hay que llevarle a una persona real"
+        value={pregunta}
+        onChange={(e) => setPregunta(e.target.value)}
+      />
+      <Input
+        placeholder="En qué montaje preguntarla (opcional)"
+        value={escenario}
+        onChange={(e) => setEscenario(e.target.value)}
+      />
+      <div style={{ display: 'flex', gap: 6 }}>
+        <Button
+          onClick={escribir}
+          disabled={
+            ocupado ||
+            conceptoId === '' ||
+            arquetipoId === '' ||
+            sintesis.trim() === '' ||
+            titulo.trim() === '' ||
+            descripcion.trim() === '' ||
+            pregunta.trim() === '' ||
+            (!esHipotesis && (evidenciaId === '' || fragmento.trim() === ''))
+          }
+        >
+          Escribir revisión
+        </Button>
+        <Button variant="secondary" onClick={() => setAbierto(false)} disabled={ocupado}>
+          Cancelar
+        </Button>
+      </div>
+    </div>
   );
 }
 

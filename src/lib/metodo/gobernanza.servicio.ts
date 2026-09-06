@@ -1,6 +1,9 @@
 import '@/lib/server-only';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { ContenidoRevisionSimuladaSchema } from '@/lib/ai/ai.contenido';
+import { escribirRevisionSimulada } from '@/lib/ai/ai.servicio';
+import { z } from 'zod';
 import type {
   CrearArquetipo,
   GobernanzaDeProyecto,
@@ -22,6 +25,57 @@ type ApoyarArquetipoEntrada = { workspaceId: string; arquetipoId: string; eviden
  * la que hace trazable una decisión: al menos un insight que la sostenga, enlazado en
  * la MISMA sentencia que la registra (nunca una decisión huérfana a medio camino).
  */
+
+/**
+ * ESCRIBIR UNA REVISIÓN SIMULADA A MANO (SYS-21).
+ *
+ * La paridad manual no es un extra de C4: es la condición que SYS-21 le pone a toda capacidad
+ * —«caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre presentes»— y el
+ * criterio 3 de SPEC-08 la lleva a CI. Sus cinco hermanas ya la tienen en su propio servicio de
+ * dominio (`insight.servicio.ts`, `medicion.servicio.ts`, `oportunidad.servicio.ts`); las
+ * concesiones de la base y las políticas de C4 estaban escritas para admitirla —el sello de
+ * procedencia se queda en null para siempre— pero nadie podía ejercerlas desde la pantalla.
+ *
+ * El CONTENIDO se valida con el MISMO esquema que gobierna lo que devuelve el proveedor, no con
+ * una copia: lo que hace legítima a una revisión —hallazgos que citan o se marcan como
+ * hipótesis, preguntas que nacen de un hallazgo, nada de agregados sintéticos— no depende de
+ * quién la escribió. Una segunda escritura de esas reglas sería una segunda cosa que mantener,
+ * y este PR ya ha pagado esa cuenta cuatro veces.
+ *
+ * VIVE EN EL SERVICIO y no en el fichero de esquemas de gobernanza, y eso lo dijo el guardián
+ * del bundle: `ai.contenido` lleva el marcador de solo-servidor, y los esquemas de gobernanza
+ * los importa la pantalla. El cliente no necesita el validador —arma el objeto y llama a la
+ * server function—; el validador corre donde tiene que correr.
+ *
+ * Lo único que sobra es `confianzaPropuesta`: eso es lo que el modelo dice de SU salida, y
+ * quien escribe a mano no propone nada — materializa directamente. No se puede quitar con
+ * `.omit()` porque el esquema compartido lleva un `superRefine` de objeto —el que comprueba que
+ * el índice de cada pregunta apunta dentro de la lista de hallazgos— y eso lo convierte en un
+ * `ZodEffects`, que ya no expone la forma. Y ese refinamiento es justo el que hay que conservar.
+ *
+ * Así que el campo se RELLENA antes de validar, con un valor que nadie lee: la materialización
+ * escribe síntesis, hallazgos, citas y preguntas, y la confianza vive en la propuesta, que aquí
+ * no existe. El contrato sigue siendo uno.
+ */
+export const EscribirRevisionAManoSchema = z.object({
+  workspaceId: z.string().uuid(),
+  conceptoId: z.string().uuid(),
+  contenido: z.preprocess(
+    (v) => (typeof v === 'object' && v !== null ? { confianzaPropuesta: 'media', ...v } : v),
+    ContenidoRevisionSimuladaSchema,
+  ),
+});
+/*
+ * El TIPO deja fuera `confianzaPropuesta` aunque el validador la rellene: `z.infer` describe lo
+ * que sale del esquema, y lo que hace falta aquí es lo que hay que META. Sin esto, el compilador
+ * pediría a quien escribe a mano un campo que el propio esquema se inventa.
+ */
+export type EscribirRevisionAMano = Omit<
+  z.infer<typeof EscribirRevisionAManoSchema>,
+  'contenido'
+> & {
+  contenido: Omit<z.infer<typeof EscribirRevisionAManoSchema>['contenido'], 'confianzaPropuesta'>;
+};
 
 export class ErrorGobernanza extends Error {}
 
@@ -588,5 +642,60 @@ export async function gobernanzaDeProyecto(
       segmentosDisponibles: fila.segmentos_disponibles as GobernanzaDeProyecto['segmentosDisponibles'],
       conceptos: fila.conceptos as GobernanzaDeProyecto['conceptos'],
     };
+  });
+}
+
+/**
+ * ESCRIBIR UNA REVISIÓN SIMULADA A MANO — la paridad que SYS-21 exige para C4.
+ *
+ * «Caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre presentes», y el
+ * criterio 3 de SPEC-08 lo lleva a CI. Las cinco capacidades hermanas ya tenían su ruta manual
+ * en su propio servicio de dominio; C4 era la única cuyas tablas sólo escribía la
+ * materialización, así que las concesiones y las políticas que la base tiene puestas para
+ * admitir una revisión a mano —el sello de procedencia en null para siempre— no las podía
+ * ejercer nadie desde la pantalla.
+ *
+ * Escribe por la MISMA función que la aceptación de una propuesta, no por una copia: lo que
+ * hace legítima a una revisión no depende de quién la escribió. Lo que no comparten es lo que
+ * de verdad las distingue — aquélla compara el veredicto y la huella del material y estampa el
+ * sello; ésta no tiene material que comparar y su sello se queda en null.
+ *
+ * Todo lo demás lo sigue diciendo la base, y por eso no se repite aquí: que el concepto siga
+ * siendo candidato y su etapa abierta, que la lente sea un arquetipo NO REFUTADO del reto del
+ * concepto, que una lente lea un concepto una sola vez, que cada hallazgo afirmativo cite
+ * evidencia utilizable de esa lente, y que la revisión no nazca vacía.
+ */
+export async function escribirRevisionAMano(
+  actorId: string,
+  entrada: EscribirRevisionAMano,
+): Promise<{ revisionId: string }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    try {
+      const revisionId = await escribirRevisionSimulada(
+        tx,
+        actorId,
+        entrada.workspaceId,
+        entrada.conceptoId,
+        entrada.contenido,
+      );
+      return { revisionId };
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      // 23505: `unique (concepto_id, arquetipo_id)` — esa lente ya leyó este concepto (SYS-20).
+      if (code === '23505') {
+        throw new ErrorGobernanza(
+          'Esa lente ya tiene una revisión de este concepto: de un arquetipo hay una sola lectura por concepto (SYS-20). Bórrala y escribe la buena, o elige otra lente',
+        );
+      }
+      // 42501: la política de inserción — o no curas, o el concepto ya no es candidato, o su
+      // etapa cerró, o el arquetipo no es una lente vigente de su reto.
+      if (code === '42501') {
+        throw new ErrorGobernanza(
+          'No puedes escribir esa revisión: o no eres curador, o el concepto ya no es candidato, o su etapa 4 está cerrada, o esa lente no es un arquetipo vigente del reto del concepto',
+        );
+      }
+      throw e;
+    }
   });
 }

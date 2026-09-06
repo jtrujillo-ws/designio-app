@@ -6279,9 +6279,39 @@ async function materializarRevision(
       `${MOTIVO_MATERIAL_REVISION_MOVIDO}: solo puede rechazarse. Pide otra revisión.`,
     );
   }
+  return escribirRevisionSimulada(tx, actorId, workspaceId, p.anclaId, c);
+}
+
+/**
+ * LA ESCRITURA de una revisión simulada: la fila, sus hallazgos, sus citas y sus preguntas.
+ *
+ * Sale de la materialización para que la tenga TAMBIÉN la ruta manual que SYS-21 exige, y no
+ * una copia suya. Lo que hace legítima a una revisión —el orden de los hallazgos, las citas
+ * como enlaces distintos, la traducción del índice de cada pregunta al id que acaba de nacer—
+ * no depende de quién la escribió, y escribirlo dos veces sería la clase que este PR lleva
+ * pagando desde la primera ronda.
+ *
+ * Lo que las separa se queda FUERA: la materialización comprueba antes el veredicto y la huella
+ * del material, y estampa el sello de procedencia después. Una revisión a mano no tiene material
+ * que comparar y su sello se queda en null para siempre.
+ */
+export async function escribirRevisionSimulada(
+  tx: TransactionSql,
+  actorId: string,
+  workspaceId: string,
+  conceptoId: string,
+  /*
+   * El tipo NOMBRA sólo lo que esta función lee, y por eso deja fuera `confianzaPropuesta`: eso
+   * es lo que el modelo dice de SU salida y vive en la propuesta, no en la revisión. Escribirlo
+   * en la firma obligaría a la ruta manual —donde no hay propuesta— a inventarse un valor para
+   * satisfacer al compilador, que es la clase de mentira que luego alguien lee como si
+   * significara algo.
+   */
+  c: Omit<ContenidoRevisionSimulada, 'confianzaPropuesta'>,
+): Promise<string> {
   const [rev] = await tx`
     insert into revision_simulada (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
-    values (${workspaceId}, ${p.anclaId}, ${c.arquetipoId}, ${c.sintesis}, ${actorId})
+    values (${workspaceId}, ${conceptoId}, ${c.arquetipoId}, ${c.sintesis}, ${actorId})
     returning id`;
   if (!rev) {
     throw new ErrorAI(
@@ -6314,10 +6344,23 @@ async function materializarRevision(
   }
   // Y las preguntas, con el índice ya traducido al id que acaba de nacer.
   for (const [i, q] of c.preguntas.entries()) {
+    /*
+     * Un índice FUERA DE RANGO no se degrada a «sin hallazgo». El `?? null` que había lo hacía
+     * en silencio, y el guard diferido compara con `is not distinct from`, así que null contra
+     * null daba la razón: una pregunta que dice nacer del hallazgo 5 se materializaba colgando
+     * de nada y la traza simulación → test real se rompía sin que nadie lo viera. El contrato
+     * lo rechaza al parsear, pero una propuesta aceptada sin corrección no se vuelve a parsear,
+     * así que por la superficie concedida entraba igual. Aquí falla, y dice cuál.
+     */
+    const hallazgoId = q.hallazgoIndice === undefined ? null : idsHallazgo[q.hallazgoIndice];
+    if (hallazgoId === undefined) {
+      throw new ErrorAI(
+        `esa revisión dice que su pregunta ${i + 1} nace del hallazgo ${q.hallazgoIndice! + 1}, y sólo trae ${c.hallazgos.length}: la pregunta quedaría colgando de nada y se perdería de qué nace (RF-08.2)`,
+      );
+    }
     await tx`insert into pregunta_de_test
       (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
-      values (${workspaceId}, ${revisionId},
-              ${q.hallazgoIndice === undefined ? null : (idsHallazgo[q.hallazgoIndice] ?? null)},
+      values (${workspaceId}, ${revisionId}, ${hallazgoId},
               ${i}, ${q.pregunta}, ${q.escenario})`;
   }
   return revisionId;

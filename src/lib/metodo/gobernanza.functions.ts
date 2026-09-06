@@ -15,6 +15,8 @@ import {
   crearArquetipo,
   darVeredictoArquetipo,
   ErrorGobernanza,
+  escribirRevisionAMano,
+  EscribirRevisionAManoSchema,
   gobernanzaDeProyecto,
   reabrirEtapa,
   registrarDecision,
@@ -128,6 +130,28 @@ export const reabrirEtapaDelProyecto = createServerFn({ method: 'POST' })
     try {
       const r = await reabrirEtapa(actorId, data);
       return { ok: true as const, decisionesMarcadas: r.decisionesMarcadas };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+/**
+ * La ruta manual de C4 (SYS-21): escribir la revisión simulada sin pasar por el proveedor.
+ *
+ * El validador es el mismo esquema que gobierna lo que devuelve el modelo, así que un mensaje
+ * de error aquí es el mismo que allí. Lo que la base rechace —lente refutada, concepto ya
+ * decidido, lente que ya leyó este concepto— vuelve traducido por `ErrorGobernanza`.
+ */
+export const escribirRevisionSimuladaAMano = createServerFn({ method: 'POST' })
+  .inputValidator(EscribirRevisionAManoSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      const r = await escribirRevisionAMano(actorId, data);
+      return { ok: true as const, revisionId: r.revisionId };
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };

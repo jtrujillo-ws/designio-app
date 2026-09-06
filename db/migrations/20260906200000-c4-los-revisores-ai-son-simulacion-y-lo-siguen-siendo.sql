@@ -774,6 +774,22 @@ create unique index reserva_ai_concepto_idx
 create unique index reserva_ai_outcome_review_idx
   on reserva_ai (workspace_id, capacidad, outcome_review_id) where outcome_review_id is not null;
 
+-- Y UNA LENTE, UNA PROPUESTA EN CURSO. `unique (concepto_id, arquetipo_id)` en
+-- `revision_simulada` dice que una lente lee un concepto UNA vez (SYS-20), pero eso sólo muerde
+-- al ACEPTAR. Dos propuestas de C4 pendientes sobre la misma lente —con `orden` distinto, así
+-- que ninguna clave las junta— pasan las dos: aceptar cualquiera crea la única revisión
+-- permitida y deja la otra imposible de aceptar para siempre. Y esa segunda fila pendiente
+-- retira el concepto de la cola de C4 hasta que alguien la rechace a mano.
+--
+-- El servicio ya impide DOS EN EL MISMO LOTE («el lote trae dos sesiones del mismo arquetipo»),
+-- que es otra cosa: aquello mira dentro de una respuesta, esto mira lo que ya está en la mesa.
+--
+-- Sólo sobre las PENDIENTES, para que reintentar después de rechazar siga siendo posible — que
+-- es justo lo que la rotación de lentes existe para permitir.
+create unique index propuesta_ai_c4_lente_pendiente_idx
+  on propuesta_ai (workspace_id, concepto_id, (contenido ->> 'arquetipoId'))
+  where capacidad = 'C4' and estado = 'propuesta';
+
 -- El nombre lo elige el CENSO, no el gusto: la suite recorre las restricciones cuyo nombre
 -- termina en el nombre de la columna de ancla para comprobar que toda ancla declarada en
 -- `ai.schemas.ts` tiene su check en la base. `..._ancla_c4` habría pasado desapercibida.

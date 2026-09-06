@@ -620,6 +620,27 @@ export function arquetiposQueLlegaronEnteros(c: ConceptoARevisar): { ids: string
 }
 
 /**
+ * Y la que de verdad acota el permiso: la evidencia de las lentes QUE SE PIDEN.
+ *
+ * No es ninguna de las dos de arriba, y por eso se escribe como la INTERSECCIÓN de las dos en
+ * vez de recorrer el texto una tercera vez. «Qué documentos llegaron» incluye los de una lente
+ * que el corte partió por la mitad —su cabecera y su primer testimonio dentro, el resto
+ * fuera—; de esa lente `promptRevision` no pide ninguna sesión, porque pide las que llegaron
+ * ENTERAS. Entonces un permiso que vence hoy sobre ese primer testimonio abortaba la llamada
+ * por material del que no puede nacer ninguna propuesta: el falso bloqueo que la acotación de
+ * la ventana existe para evitar, un escalón más abajo todavía.
+ *
+ * Para el ALCANCE sellado sigue valiendo la de arriba —lo que se enseñó es lo que se enseñó—;
+ * ésta contesta la otra pregunta: de qué material puede salir algo que alguien acepte.
+ */
+export function evidenciaDeLasLentesQueSePiden(c: ConceptoARevisar): { ids: string[] } {
+  const porLente = evidenciaPorLenteQueLlegoAlRevisor(c);
+  return {
+    ids: [...new Set(arquetiposQueLlegaronEnteros(c).ids.flatMap((a) => porLente[a] ?? []))],
+  };
+}
+
+/**
  * Cuántos criterios de éxito llegaron ENTEROS al modelo EN EL MATERIAL DE C3.
  *
  * Hermana y no la misma que `criteriosQueLlegaronAlModelo`, que mide los de C6: son dos

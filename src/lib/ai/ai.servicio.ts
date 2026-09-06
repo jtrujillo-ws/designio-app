@@ -55,6 +55,7 @@ import {
   tramoDeEvidenciaEnRevision,
   arquetiposQueLlegaronEnteros,
   evidenciaPorLenteQueLlegoAlRevisor,
+  evidenciaDeLasLentesQueSePiden,
   evidenciaQueLlegoAlRevisor,
   lentesDelLote,
   SISTEMA_REVISION,
@@ -3545,14 +3546,20 @@ export async function huellaDelMaterialDeRevision(
    * abortaba la llamada: exactamente el falso bloqueo que la primera acotación existe para
    * evitar, un escalón más abajo.
    *
-   * `evidenciaQueLlegoAlRevisor` mide sobre el texto ya compuesto y recortado, que es lo único
-   * que de verdad sale hacia el proveedor.
+   * Y una TERCERA acotación, que es la segunda mirada de cerca: no toda la evidencia que el
+   * texto enseña puede producir una propuesta. El corte puede partir una lente por la mitad
+   * —su cabecera y su primer testimonio dentro, el resto fuera— y de esa lente no se pide
+   * ninguna sesión, porque el prompt pide las que llegaron ENTERAS. Un permiso que vence hoy
+   * sobre ese primer testimonio abortaba la llamada por material del que no puede nacer nada.
+   * `evidenciaDeLasLentesQueSePiden` es la intersección de las dos preguntas que ya existían,
+   * escrita una sola vez; el ALCANCE sellado sigue saliendo de la otra, porque lo que se
+   * enseñó es lo que se enseñó.
    *
    * La pregunta la contesta la BASE y no esta plantilla, como en C2: el calendario de las
    * garantías lo fija ella, y preguntarlo desde aquí lo dejaría dependiendo del huso de quien
    * llama. Hay un censo que lo vigila.
    */
-  const evidencias = evidenciaQueLlegoAlRevisor(material).ids;
+  const evidencias = evidenciaDeLasLentesQueSePiden(material).ids;
   const [caducada] = await tx`select derecho_que_vence_ya(
     ${evidencias}::uuid[], ${workspaceId}) as titulo`;
   return {

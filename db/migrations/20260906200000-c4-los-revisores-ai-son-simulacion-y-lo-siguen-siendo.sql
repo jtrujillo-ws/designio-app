@@ -2066,10 +2066,16 @@ begin
     -- inventado hablando en primera persona» (SYS-20). La misma regla estaba escrita en un solo
     -- extremo del camino, y el que faltaba es el que sella.
     --
-    -- Se pide UNA que la revisión haya visto, no todas, y aquí sí es a propósito: «todas» es
-    -- justo lo que pregunta la comprobación de arriba, y esta responde a otra cosa. Lo que se
-    -- protege es que lo sellado siga siendo la lectura de una lente y no de un perfil vacío,
-    -- y para eso una basta.
+    -- Se pide UNA que la revisión haya visto, y ESO SOLO no basta — corrección de lo que esta
+    -- misma nota decía antes. Decía que pedir «todas» era redundante «porque todas es justo lo
+    -- que pregunta la comprobación de arriba», y es falso: la de arriba pregunta si el alcance
+    -- CUBRE lo utilizable, no si todo lo declarado SIGUE siendo utilizable. Son dos direcciones
+    -- distintas, y por el hueco entre ellas se colaba la lente que se ENCOGE: dos documentos en
+    -- el alcance, uno revocado, y las tres pasando. Esa mitad la cierra la comprobación de
+    -- abajo; ésta se queda con la suya, que es cuando NADA de lo declarado es ya utilizable —
+    -- sellar ahí es sellar la lectura de un perfil sin nada detrás. (Con el alcance VACÍO no se
+    -- llega hasta aquí, y está medido: responde la PRIMERA, porque la lente conserva evidencia
+    -- utilizable fuera del alcance.)
     --
     -- (El alcance ES el de la lente desde que se escribe partido por sesión: con el del LOTE
     -- —la evidencia de todas las lentes que llegaron al modelo— ni siquiera la de arriba
@@ -2087,6 +2093,28 @@ begin
          and evidencia_usable(ae.evidencia_id, ae.workspace_id, 'cliente')
          and ae.evidencia_id = any (coalesce(new.alcance_evidencia, '{}'::uuid[]))) then
       raise exception 'esa revisión se quedó sin evidencia utilizable de su arquetipo: el permiso de cita se retiró, caducó o el documento ya no está, así que lo que se sellaría es la lectura de un perfil sin nada detrás (SYS-20). Renueva el permiso y vuelve a pedirla, o recházala';
+    end if;
+    -- Y NI UNA SOLA que haya dejado de serlo, que es la mitad que faltaba.
+    --
+    -- Con lo anterior, una lente de dos documentos a la que se le retira el permiso de UNO
+    -- pasaba las tres: la primera no lo exige porque ya no es utilizable, la segunda sólo mira
+    -- que siga ENLAZADO —y retirar el derecho no desenlaza—, y la tercera se conforma con la
+    -- que queda. Se sellaba entonces una revisión producida desde una lente que ya no es la que
+    -- el alcance dice, con la etiqueta de procedencia intacta.
+    --
+    -- El alcance no se toca: sigue diciendo la verdad de lo que se enseñó, que es para lo que
+    -- existe. Lo que deja de ser verdad es que eso siga siendo la lente, y entonces la propuesta
+    -- sólo puede rechazarse — la misma salida que para la lente que CRECE.
+    --
+    -- Va aquí abajo y no arriba a propósito: si el permiso se retiró de TODOS, el caso lo
+    -- explica mejor la comprobación anterior, y llega antes.
+    if exists (
+      select 1
+        from revision_simulada r
+        cross join unnest(coalesce(new.alcance_evidencia, '{}'::uuid[])) as declarado(evidencia_id)
+       where r.id = new.revision_simulada_id and r.workspace_id = new.workspace_id
+         and not evidencia_usable(declarado.evidencia_id, r.workspace_id, 'cliente')) then
+      raise exception 'parte de la evidencia que esa lente enseñó dejó de ser utilizable: el permiso de cita se retiró, caducó o el documento ya no está, así que la revisión se produjo desde una lente que ya no es la que su alcance declara (SYS-20). Renueva el permiso y vuelve a pedirla, o recházala';
     end if;
   end if;
   -- Y que el insight haya VISTO toda la evidencia que el reto tiene ahora.

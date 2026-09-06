@@ -8575,6 +8575,135 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y LA LENTE QUE SE ENCOGE, que es la que las tres comprobaciones dejaban pasar.
+   *
+   * Las tres miran el alcance contra la lente, y ninguna cierra este caso:
+   *
+   *   1. «no falta ninguna» pregunta si hay evidencia UTILIZABLE de la lente fuera del
+   *      alcance. Un documento cuyo derecho se revocó deja de ser utilizable, así que deja de
+   *      exigirse: la comprobación pasa.
+   *   2. «no declara de más» pregunta si lo declarado está ENLAZADO al arquetipo — y revocar
+   *      no desenlaza («arquetipo_evidencia» no tiene DELETE concedido), así que también pasa.
+   *   3. «que la lente siga siendo una lente» pide UNA utilizable, y con dos documentos y uno
+   *      revocado queda la otra: pasa.
+   *
+   * Y aquí hay una corrección mía. Al escribir la tercera dejé dicho que pedir «una y no todas»
+   * era a propósito porque «todas es justo lo que pregunta la comprobación de arriba». Eso es
+   * falso, y esta sonda lo mide: la de arriba pregunta si el alcance CUBRE lo utilizable, no si
+   * todo lo declarado SIGUE siendo utilizable. Son dos direcciones distintas, y por el hueco
+   * entre ellas se sella una revisión producida desde una lente que ya no es la que dice.
+   *
+   * El servicio lo para por la huella del material —`evidencia_usable` decide qué entra en el
+   * cuerpo, así que revocar mueve el texto—, pero el servicio no es el único camino a la tabla:
+   * la superficie concedida a `designio_app` llega hasta aquí, y es la que este guard defiende.
+   *
+   * La sesión es de HIPÓTESIS PURA a propósito: donde hay citas, la comprobación de DR001 ya
+   * para la revocación, y la sonda estaría midiendo esa puerta y no ésta.
+   */
+  it('C4 no sella una revisión cuya lente perdió parte de su evidencia utilizable', async () => {
+    await enWorkspaceLimpio('c4-lente-encogida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteB, evB } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un SEGUNDO documento en la lente que firma: con uno solo, revocarlo la deja vacía y la
+      // pararía la tercera comprobación — otra puerta, no la que se mide.
+      const [fte] = await admin`select id from fuente where workspace_id = ${wsC} limit 1`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, 'Entrevista A-02',
+                'El segundo testimonio del apurado.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const evB2 = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${evB2}, 'concedido', 'cliente',
+                'Consentimiento del participante', ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteB}, ${evB2})`;
+
+      const contenido = {
+        arquetipoId: lenteB,
+        sintesis: 'Una lectura del segundo, sin citar.',
+        hallazgos: [
+          {
+            titulo: 'Puede que abandone antes',
+            descripcion: 'Extrapolado del perfil, sin testimonio que lo diga.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
+        confianzaPropuesta: 'baja',
+      };
+      const sellar = (alcance: string[]) =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${alcance},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura del segundo, sin citar.',
+                    ${curadorId})
+            returning id`;
+          await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Puede que abandone antes',
+                    'Extrapolado del perfil, sin testimonio que lo diga.', true)`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Cuánto esperarías?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${p!.id as string} and workspace_id = ${wsC}`;
+          return r!.id as string;
+        });
+
+      // Se revoca UNO de los dos. El alcance sigue diciendo la verdad de lo que se enseñó, y
+      // por eso no se toca: lo que ya no es verdad es que esa siga siendo la lente.
+      // Retirar el derecho arrastra el ÁMBITO, y el estado se llama «denegado»: los dos los
+      // dijo la base al fallar el UPDATE — «derecho_alcance_solo_concedido» exige que lo que no
+      // está concedido sea interno y sin vencimiento, y el CHECK del estado sólo admite
+      // pendiente, concedido o denegado.
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+        where evidencia_id = ${evB2} and workspace_id = ${wsC}`;
+      await expect(sellar([evB, evB2])).rejects.toThrow(/dejó de ser utilizable|ya no está/i);
+
+      /*
+       * Y la comprobación ANTERIOR —«que la lente siga siendo una lente»— sigue teniendo su
+       * caso: cuando NADA de lo declarado es ya utilizable. Se mide porque el comentario de la
+       * migración lo afirma, y una rama que se afirma y no se alcanza es peor que no tenerla.
+       *
+       * Con el alcance VACÍO no se llega aquí, y eso también está medido: quien responde
+       * entonces es la PRIMERA —«ese arquetipo tiene evidencia que esta revisión no llegó a
+       * ver»—, porque la lente conserva un documento utilizable fuera del alcance. Sólo se cae
+       * en ésta cuando no queda ninguno.
+       */
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+        where evidencia_id = ${evB} and workspace_id = ${wsC}`;
+      await expect(sellar([evB, evB2])).rejects.toThrow(/se quedó sin evidencia utilizable/i);
+      await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente'
+        where evidencia_id = ${evB} and workspace_id = ${wsC}`;
+
+      // Y devuelto el permiso, la MISMA escritura entra entera: la puerta es la revocación, no
+      // el número de documentos.
+      await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente'
+        where evidencia_id = ${evB2} and workspace_id = ${wsC}`;
+      await expect(sellar([evB, evB2])).resolves.toBeTruthy();
+    });
+  });
+
+  /**
    * A UNA REVISIÓN YA SELLADA NO SE LE AÑADE NADA.
    *
    * Las políticas de inserción de las tres hojas miraban el rol y la ventana de la etapa, y no
@@ -9142,6 +9271,119 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(
         bloqueada.caducada,
         'un permiso que vence hoy sobre un documento que SÍ se manda no bloquea',
+      ).not.toBeNull();
+    });
+  });
+
+  /**
+   * Y LA LENTE A MEDIAS, que es el caso que la acotación anterior dejó abierto.
+   *
+   * Aquélla midió con dos lentes de UN documento cada una: cuando el corte deja fuera una
+   * lente entera, su único documento se va con ella y `evidenciaQueLlegoAlRevisor` ya no lo
+   * cuenta. Con una lente de DOS documentos el corte puede caer EN MEDIO — su cabecera y su
+   * primer testimonio dentro, el segundo fuera—, y entonces el primero SÍ está en «lo que
+   * llegó» aunque su lente no esté en `arquetiposQueLlegaronEnteros` y `promptRevision` no
+   * pida ninguna sesión para ella.
+   *
+   * Con un permiso que vence hoy sobre ese primer documento, la llamada entera se abortaba por
+   * material del que no puede nacer ninguna propuesta: el mismo falso bloqueo, un escalón más
+   * abajo todavía. La pregunta correcta no es «qué documentos se enseñaron» sino «qué
+   * documentos de las lentes que SE PIDEN se enseñaron», y las dos ya existían por separado.
+   *
+   * Se mide en los dos sentidos, como su hermana: sobre el documento de la lente a medias no
+   * bloquea, y movido al de una lente que sí se pide, la puerta se cierra.
+   */
+  it('el permiso que vence hoy no bloquea C4 por la lente que el recorte dejó a medias', async () => {
+    await enWorkspaceLimpio('c4-vence-lente-media', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un SEGUNDO documento en la lente que se renderiza la última, para que el corte pueda
+      // caer entre los dos. Cuál es la última lo dice el material, no el nombre.
+      const ultima = await conUsuario(curadorId, async (tx) => {
+        const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+        return material!.arquetipos[material!.arquetipos.length - 1]!.id;
+      });
+      const [fte] = await admin`select id from fuente where workspace_id = ${wsC} limit 1`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, 'Entrevista D-02',
+                'El segundo testimonio de esta misma lente.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev2!.id as string}, 'concedido', 'cliente',
+                'Consentimiento del participante', ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${ultima}, ${ev2!.id as string})`;
+
+      /*
+       * El corte se calibra por BISECCIÓN contra el material real, como sus dos hermanas, y lo
+       * que se busca es el estado exacto que el hallazgo describe: existe un documento que SÍ
+       * llegó cuya lente NO llegó entera. Leerlo así —y no contar caracteres— es lo que hace
+       * que la sonda mida lo que dice.
+       */
+      const aMediasCon = async (relleno: number) =>
+        conUsuario(curadorId, async (tx) => {
+          if (relleno >= 0) {
+            await admin`update evidencia
+              set resumen = ${'El segundo testimonio de esta misma lente.' + '·'.repeat(relleno)}
+              where id = ${ev2!.id as string}`;
+          }
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          const llego = new Set(evidenciaQueLlegoAlRevisor(material!).ids);
+          const enteras = new Set(arquetiposQueLlegaronEnteros(material!).ids);
+          const aMedias = material!.arquetipos
+            .filter((a) => !enteras.has(a.id))
+            .flatMap((a) => a.evidencia.map((e) => e.id))
+            .filter((id) => llego.has(id));
+          const deLasQueSePiden = material!.arquetipos
+            .filter((a) => enteras.has(a.id))
+            .flatMap((a) => a.evidencia.map((e) => e.id))
+            .filter((id) => llego.has(id));
+          return { aMedias, deLasQueSePiden };
+        });
+
+      let cabe = 0;
+      let noCabe = MAX_MATERIAL + 2_000;
+      expect((await aMediasCon(cabe)).aMedias.length, 'sin relleno ya había una lente a medias').toBe(0);
+      while (noCabe - cabe > 1) {
+        const medio = (cabe + noCabe) >> 1;
+        if ((await aMediasCon(medio)).aMedias.length === 0) cabe = medio;
+        else noCabe = medio;
+      }
+      const { aMedias, deLasQueSePiden } = await aMediasCon(noCabe);
+      expect(
+        aMedias.length,
+        'no se logró cortar una lente POR LA MITAD: la sonda no mide el caso del hallazgo',
+      ).toBeGreaterThan(0);
+      expect(
+        deLasQueSePiden.length,
+        'no queda ninguna lente entera: entonces la llamada ni se pide y la sonda mediría otra puerta',
+      ).toBeGreaterThan(0);
+
+      const hoy = await admin`select fecha_de_la_base() as d`;
+      // El permiso del documento de la lente A MEDIAS vence hoy: nadie va a pedir esa sesión.
+      await admin`update derecho_uso set vence_en = ${hoy[0]!.d as string}
+        where evidencia_id = ${aMedias[0]!} and workspace_id = ${wsC}`;
+      const sinBloquear = await conUsuario(curadorId, (tx) =>
+        huellaDelMaterialDeRevision(tx, wsC, conceptoId),
+      );
+      expect(
+        sinBloquear.caducada,
+        'un permiso sobre la lente que el recorte dejó a medias bloquea la llamada entera',
+      ).toBeNull();
+
+      // Y sobre el de una lente que SÍ se pide, la puerta se cierra: es la misma puerta.
+      await admin`update derecho_uso set vence_en = null
+        where evidencia_id = ${aMedias[0]!} and workspace_id = ${wsC}`;
+      await admin`update derecho_uso set vence_en = ${hoy[0]!.d as string}
+        where evidencia_id = ${deLasQueSePiden[0]!} and workspace_id = ${wsC}`;
+      const bloqueada = await conUsuario(curadorId, (tx) =>
+        huellaDelMaterialDeRevision(tx, wsC, conceptoId),
+      );
+      expect(
+        bloqueada.caducada,
+        'un permiso que vence hoy sobre una lente que sí se pide no bloquea',
       ).not.toBeNull();
     });
   });

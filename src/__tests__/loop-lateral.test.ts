@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from 'node:fs';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import {
   ETIQUETA_DISENO,
@@ -108,6 +110,10 @@ describe('agrupación del lateral (4a)', () => {
     expect(lead.gobierno.map((d) => d.to)).toEqual([
       '/personas',
       '/auditoria',
+      // §14 pone la observabilidad de la capa AI en la misma fila que la auditoría
+      // —«Auditoría y operación»—, así que va con su misma puerta de rol; y el informe de
+      // grounding detrás, que contesta la otra mitad de la misma pregunta.
+      '/observabilidad-ai',
       '/evals-grounding',
       '/exportacion',
       '/disposicion',
@@ -141,13 +147,22 @@ describe('agrupación del lateral (4a)', () => {
         ).map((d) => d.to);
         expect(new Set(rutas).size).toBe(rutas.length);
         /*
-         * El total se deriva de QUÉ puertas condicionadas trae este rol, no de un número
-         * escrito a mano por cada una. Con `14 - (…auditoría…)`, la segunda puerta por rol
-         * —el informe de grounding— dejó el censo rojo sin haber roto nada, y arreglarlo
-         * restando otro literal habría hecho lo mismo con la tercera.
+         * Dieciséis destinos, menos los que el rol puede no ver. El total se deriva de QUÉ
+         * puertas condicionadas trae este rol, no de un número escrito a mano por cada uno: con
+         * `14 - (…auditoría…)`, la SEGUNDA puerta por rol dejó el censo rojo sin haber roto
+         * nada, y arreglarlo restando otro literal habría hecho lo mismo con la tercera.
+         *
+         * Las tres comparten hoy la misma lista de roles a propósito (§14 pone auditoría y
+         * operación en la misma fila, y el grounding se deriva de ahí), así que o entran las
+         * tres o no entra ninguna — y si algún día se separan, este recuento lo dice en vez de
+         * dejarlo pasar.
          */
-        const conPuerta: RutaDelWorkspace[] = ['/auditoria', '/evals-grounding'];
-        const esperadas = 15 - conPuerta.filter((r) => !rutas.includes(r)).length;
+        const conPuerta: RutaDelWorkspace[] = [
+          '/auditoria',
+          '/observabilidad-ai',
+          '/evals-grounding',
+        ];
+        const esperadas = 16 - conPuerta.filter((r) => !rutas.includes(r)).length;
         expect(rutas).toHaveLength(esperadas);
       }
     }
@@ -160,7 +175,7 @@ describe('agrupación del lateral (4a)', () => {
       importacionPendientes: 0,
     });
     expect(notaDeGobierno(lead.gobierno)).toBe(
-      'Personas, auditoría, grounding medido, exportación y disposición: se abren cuando se buscan, no cada día.',
+      'Personas, auditoría, operación AI, grounding medido, exportación y disposición: se abren cuando se buscan, no cada día.',
     );
     const sponsor = agruparLateral({
       rol: 'sponsor',
@@ -170,6 +185,85 @@ describe('agrupación del lateral (4a)', () => {
     expect(notaDeGobierno(sponsor.gobierno)).toBe(
       'Personas, exportación y disposición: se abren cuando se buscan, no cada día.',
     );
+  });
+
+  /**
+   * LA PANTALLA DEL LOOP NO ALCANZA EL CONTRATO DE LA CAPA AI.
+   *
+   * `ai.schemas.ts` lo dice en su propia cabecera: Rollup no puede podar una construcción de Zod
+   * de nivel superior, así que importar UNA cosa de allí arrastra el contrato entero. `/app` se
+   * pinta en cada visita, y el lateral llegó a importar de ahí una lista de tres roles — con eso
+   * bastaba para tender la arista.
+   *
+   * Se mide sobre el GRAFO DE MÓDULOS y no sobre el tamaño de un chunk, porque el troceado no es
+   * la propiedad: medido, quitar aquel import dejaba el bundle byte a byte idéntico, porque
+   * Rollup ya izaba `ai.schemas` al chunk común al usarlo tres rutas perezosas. Eso puede cambiar
+   * mañana; la arista es lo que se puede afirmar y lo que hay que impedir.
+   *
+   * Los `import type` NO cuentan: se borran al compilar y no crean arista. Y los específicos que
+   * este censo vigila son los DOS módulos pesados de la capa AI —el contrato y sus validadores—,
+   * no la carpeta entera: `ai.roles.ts` existe justo para poder importarse desde aquí.
+   */
+  it('la pantalla del Loop no alcanza el contrato de la capa AI por ningún camino', () => {
+    const raiz = new URL('../../', import.meta.url).pathname.replace(/\/$/, '');
+    const entradas = [`${raiz}/src/components/loop/LoopScreen.tsx`, `${raiz}/src/lib/loop/lateral.ts`];
+    for (const e of entradas) expect(existsSync(e), `${e} no existe: el censo no mira nada`).toBe(true);
+
+    const resolver = (desde: string, spec: string): string | null => {
+      let base: string;
+      if (spec.startsWith('@/')) base = `${raiz}/src/${spec.slice(2)}`;
+      else if (spec.startsWith('.')) {
+        const dir = desde.slice(0, desde.lastIndexOf('/'));
+        base = new URL(spec, `file://${dir}/`).pathname;
+      } else return null; // Paquetes de node_modules: no son código de este repositorio.
+      for (const ext of ['.ts', '.tsx', '/index.ts', '/index.tsx']) {
+        if (existsSync(base + ext)) return base + ext;
+      }
+      return existsSync(base) ? base : null;
+    };
+
+    const visto = new Set(entradas);
+    const desde = new Map<string, string>();
+    const cola = [...entradas];
+    while (cola.length > 0) {
+      const f = cola.shift()!;
+      const arbol = ts.createSourceFile(
+        f,
+        readFileSync(f, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true,
+        f.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+      );
+      // Lo que no parsea limpio no se da por barrido: si no, el censo pasaría en verde sin
+      // haber leído el fichero donde estuviera la arista.
+      const diagnosticos = (arbol as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics;
+      expect(diagnosticos ?? [], `${f} no parsea limpio`).toHaveLength(0);
+      for (const st of arbol.statements) {
+        if (!ts.isImportDeclaration(st)) continue;
+        if (st.importClause?.isTypeOnly) continue;
+        const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+        if (!destino || visto.has(destino)) continue;
+        visto.add(destino);
+        desde.set(destino, f);
+        cola.push(destino);
+      }
+    }
+    // Que haya recorrido algo: con un resolutor roto, el conjunto sería de dos y el censo
+    // pasaría sin haber mirado nada — el modo de fallo de todo barrido.
+    expect(visto.size, 'el grafo salió demasiado pequeño: el resolutor no está resolviendo').toBeGreaterThan(10);
+
+    const PESADOS = ['/src/lib/ai/ai.schemas.ts', '/src/lib/ai/ai.contenido.ts'];
+    const cadena = (m: string): string => {
+      const pasos: string[] = [];
+      let p: string | undefined = m;
+      while (p) {
+        pasos.push(p.slice(raiz.length + 1));
+        p = desde.get(p);
+      }
+      return pasos.reverse().join(' → ');
+    };
+    const alcanzados = [...visto].filter((m) => PESADOS.some((x) => m.endsWith(x)));
+    expect(alcanzados.map(cadena)).toEqual([]);
   });
 
   it('la preferencia de gobierno se guarda por usuario y workspace, como la expansión', () => {

@@ -1,7 +1,7 @@
 import { etiquetaDePendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
-import { ROLES_INFORME_GROUNDING } from '@/lib/ai/ai.schemas';
+import { ROLES_INFORME_GROUNDING, ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.roles';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
 /**
@@ -36,6 +36,7 @@ export type RutaDelWorkspace =
   | '/exportacion'
   | '/disposicion'
   | '/auditoria'
+  | '/observabilidad-ai'
   | '/evals-grounding';
 
 export type ContadorDelLateral = {
@@ -77,6 +78,7 @@ export const ETIQUETA_GOBIERNO = 'Gobierno del workspace';
 const NOMBRE_CORTO_DE_GOBIERNO: Partial<Record<RutaDelWorkspace, string>> = {
   '/personas': 'personas',
   '/auditoria': 'auditoría',
+  '/observabilidad-ai': 'operación AI',
   '/evals-grounding': 'grounding medido',
   '/exportacion': 'exportación',
   '/disposicion': 'disposición',
@@ -179,13 +181,34 @@ export function agruparLateral({
       ? [{ to: '/auditoria', etiqueta: 'Auditoría', abrev: 'AUD' } as DestinoDelLateral]
       : []),
     /*
-     * Y el informe de grounding, con la MISMA puerta que la auditoría porque contesta la misma
-     * pregunta con otras cifras: qué tan de fiar es lo que la capa AI produjo. Va aquí, en lo
-     * archivístico, y no junto a «Propuestas AI»: no es trabajo del día —nadie revisa
-     * propuestas desde aquí— sino la medida que se mira cuando se pregunta si mejora.
+     * Y el cuadro de operación de la capa AI (RF-08.9), con la MISMA puerta: §14 pone la
+     * observabilidad de costos, latencia, errores y calidad en la fila «Auditoría y
+     * operación», junto a la auditoría, y `ROLES_OBSERVABILIDAD_AI` se deriva de la de
+     * arriba justamente para que no puedan separarse por descuido.
+     *
+     * Sin esta entrada la pantalla existía y no se podía abrir salvo tecleando la URL. Lo
+     * dijo una revisión, y tenía razón dos veces: yo había buscado enlaces en el JSX y
+     * concluido que en este producto no hay navegación. La hay, y es este fichero — la
+     * lista vive como DATOS, no como `<Link>`, así que mi grep miraba donde no estaba.
+     */
+    ...((ROLES_OBSERVABILIDAD_AI as readonly string[]).includes(rol)
+      ? [
+          {
+            to: '/observabilidad-ai',
+            etiqueta: 'Operación de la capa AI',
+            abrev: 'OPS',
+          } as DestinoDelLateral,
+        ]
+      : []),
+    /*
+     * Y el informe de grounding (RF-08.7), tercera puerta con la misma raíz: la operación dice
+     * qué costó la capa AI y esta dice qué tan de fiar salió. Va aquí, en lo archivístico, y no
+     * junto a «Propuestas AI»: no es trabajo del día —nadie revisa propuestas desde aquí— sino
+     * la medida que se mira cuando se pregunta si mejora.
      *
      * La puerta se deriva de `ROLES_INFORME_GROUNDING`, que a su vez se deriva de la de la
-     * auditoría: escrita a mano, el día que una de las dos cambiara la otra se quedaría atrás.
+     * auditoría, y por eso vive en `ai.roles` y no en el contrato: la razón está escrita allí, y
+     * es la misma que trajo la de al lado —desde aquí no se puede alcanzar `ai.schemas`—.
      */
     ...((ROLES_INFORME_GROUNDING as readonly string[]).includes(rol)
       ? [

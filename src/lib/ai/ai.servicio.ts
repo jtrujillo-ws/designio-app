@@ -229,6 +229,28 @@ async function rolParaCapacidad(
  * reserva se cuenta dos veces; el error es conservador —nunca deja pasar de más— y dura lo
  * que tarda en terminar.
  */
+/**
+ * Si la reserva que pagó una línea SIGUE VIVA — el predicado, escrito una sola vez.
+ *
+ * Nació dentro de `presupuestoDeHoy` con su razonamiento entero al lado (por qué por
+ * IDENTIDAD y no por tiempo ni por ancla), y sale aquí porque hay un segundo lector que
+ * necesita la misma distinción: el cuadro de operación de RF-08.9. Sin compartirlo, una línea
+ * `despachada` cuya reserva se retiró contaba como PAGADA para el presupuesto y como EN VUELO
+ * para el cuadro — dos respuestas distintas a la misma pregunta, que es exactamente la avería
+ * que este repositorio lleva toda la épica pagando.
+ *
+ * `alias` porque las dos consultas nombran la tabla distinto: una la referencia por su nombre
+ * dentro de una subconsulta correlacionada y la otra la aliasa.
+ */
+export function reservaSigueViva(tx: TransactionSql, alias: string) {
+  return tx`exists (
+    select 1 from reserva_ai r
+    where r.id = ${tx(alias)}.reserva_id
+      and r.workspace_id = ${tx(alias)}.workspace_id
+      and r.creado_en > now() - reserva_ai_ventana()
+  )`;
+}
+
 async function presupuestoDeHoy(
   tx: TransactionSql,
   workspaceId: string,
@@ -274,12 +296,8 @@ async function presupuestoDeHoy(
           -- línea cuenta, y ninguna otra reserva la cubre. Es la dirección segura para una
           -- llamada cuyo cierre se perdió, porque ante la duda de si el proveedor cobró se
           -- asume que sí; una fila sin reserva anotada cuenta por lo mismo.
-          and (resultado <> 'despachada' or not exists (
-            select 1 from reserva_ai r
-            where r.id = llamada_ai.reserva_id
-              and r.workspace_id = llamada_ai.workspace_id
-              and r.creado_en > now() - reserva_ai_ventana()
-          )))::int as atendidas,
+          and (resultado <> 'despachada' or not ${reservaSigueViva(tx, 'llamada_ai')}))::int
+        as atendidas,
       (select coalesce(sum(unidades), 0) from reserva_ai
         where workspace_id = ${workspaceId} and creado_en > now() - reserva_ai_ventana())::int
         as reservadas,

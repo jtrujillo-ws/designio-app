@@ -4,11 +4,13 @@ import { requerirUsuarioId, usuarioIdDeRequest } from '@/lib/auth/guardia.server
 import {
   CorridaEvalInputSchema,
   GenerarPropuestasSchema,
+  ObservabilidadInputSchema,
   PropuestasInputSchema,
   RegistrarConsentimientoSchema,
   RevisarPropuestaSchema,
 } from './ai.schemas';
 import { correrEvalDeGrounding, informeDeGrounding } from './ai.evals';
+import { observabilidadAI } from './ai.observabilidad';
 import {
   aceptarPropuesta,
   ErrorAI,
@@ -110,6 +112,36 @@ export const rechazarPropuestaAI = createServerFn({ method: 'POST' })
     } catch (e) {
       const mensaje = mensajeDe(e);
       if (mensaje) return { ok: false as const, error: mensaje };
+      throw e;
+    }
+  });
+
+/**
+ * RF-08.9 — el libro de costos del workspace, por capacidad.
+ *
+ * GET y sin contrato `{ok, …}` porque es una LECTURA: si falla, falla hacia el error boundary
+ * del router como el resto de loaders. La puerta de rol la pone el SERVICIO —`observabilidadAI`
+ * relee `workspace_role` y cierra la proyección—, y la pantalla no la repite: sin eso, cualquier
+ * miembro podía pedir a mano el cuadro con la factura de la boutique.
+ */
+export const observabilidadDelWorkspace = createServerFn({ method: 'GET' })
+  .inputValidator(ObservabilidadInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await observabilidadAI(usuarioId, data.workspaceId);
+    } catch (e) {
+      /*
+       * Igual que `propuestasDelWorkspace`, y por lo que dice la nota de arriba de este
+       * fichero: un fallo de AUTORIZACIÓN devuelve «sin datos», no tira la ruta entera contra
+       * el error boundary. Cabe entre el guardián del padre y este loader —una cuenta que un
+       * administrador desactiva, una membresía revocada—, y la pantalla ya sabe decir qué pasa
+       * en los tres casos; una pantalla rota no dice ninguno.
+       *
+       * Nótese el `await` dentro del `try`: sin él la promesa se devolvía sin esperar y este
+       * `catch` no veía nunca el rechazo.
+       */
+      if (e instanceof ErrorAutorizacion) return null;
       throw e;
     }
   });

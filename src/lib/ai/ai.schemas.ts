@@ -10,7 +10,6 @@ import { z } from 'zod';
  * que nadie los llamara allí. Un reexport de tipos no crea esa arista.
  */
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
-import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 
 import type { ContenidoPropuesta } from './ai.contenido';
 export type {
@@ -900,6 +899,10 @@ export const RevisarPropuestaSchema = z.object({
 });
 export type RevisarPropuesta = z.infer<typeof RevisarPropuestaSchema>;
 
+/** El libro de costos se lee de UN workspace: no hay vista cruzada, y la RLS tampoco la
+ * daría — cada lectura va dentro de la membresía de quien llama. */
+export const ObservabilidadInputSchema = z.object({ workspaceId: z.string().uuid() });
+
 export const PropuestasInputSchema = z.object({
   workspaceId: z.string().uuid(),
   /** Filtro de las anclas ofrecidas a la generación. Con más anclas elegibles que sitio en
@@ -1130,6 +1133,112 @@ export type PropuestaEnPanel = PropuestaEnPanelComun &
     | { contenidoLegible: false; contenido: null; contenidoOriginal: null }
   );
 
+/*
+ * La puerta de rol de la observabilidad AI vive en `ai.roles.ts` —un módulo sin Zod— y aquí se
+ * REEXPORTA para quien ya la importaba de este contrato.
+ *
+ * El motivo es la nota de arriba llevada a sus consecuencias: importar UNA cosa de este fichero
+ * arrastra todos sus esquemas, y el lateral del Loop —que se pinta en cada visita a `/app`— solo
+ * necesitaba una lista de tres roles. Medido con el grafo de módulos: `LoopScreen → lateral →
+ * ai.schemas` era el ÚNICO camino por el que la pantalla del método alcanzaba el contrato de la
+ * capa AI. (En el bundle de hoy no se nota, porque Rollup ya iza este módulo al chunk común al
+ * usarlo tres rutas perezosas; eso es una coincidencia del troceado, no una garantía.)
+ */
+export { ROLES_OBSERVABILIDAD_AI } from './ai.roles';
+
+/**
+ * RF-08.9 — lo que el libro de costos dice de UNA capacidad en este workspace.
+ *
+ * Los tres `null` NO son huecos, son respuestas distintas de un cero: `tasaError` es `null`
+ * cuando no hay ninguna llamada cerrada (un 0 % de error sobre cero llamadas es un verde que
+ * nadie se ha ganado), `tasaAceptacion` cuando nadie ha decidido todavía, y las latencias
+ * cuando ninguna línea la trae medida.
+ */
+export type ObservabilidadDeCapacidad = {
+  capacidad: string;
+  /** Del registro cuando esta versión conoce la capacidad; el código a secas cuando no. */
+  etiqueta: string;
+  /** Llamadas con desenlace. Las EN VUELO van aparte: mientras esperan no son un fallo. */
+  llamadasCerradas: number;
+  /**
+   * De las cerradas, cuántas fueron el proveedor SIN RESPONDER.
+   *
+   * Dentro de las cerradas y no restada: una llamada sin respuesta es un fallo de la capa para
+   * quien la pidió, así que sacarla del denominador de `tasaError` escondería una caída justo
+   * cuando hay que verla. Viaja aparte porque «el modelo contestó mal» y «el modelo no
+   * contestó» piden cosas distintas de quien opera.
+   *
+   * Y porque `presupuestoDeHoy` llama ATENDIDAS a otra cosa —excluye `sin-respuesta`, que no se
+   * cobra—: sin esta cifra, el cuadro tomaba prestada esa palabra para un conjunto que la
+   * contradice.
+   */
+  llamadasSinRespuesta: number;
+  llamadasEnVuelo: number;
+  /**
+   * Despachadas cuya RESERVA ya no vive: el cierre falló después de que el proveedor
+   * respondiera y la limpieza retiró la reserva dejando la fila `despachada` a propósito. No
+   * son «en vuelo» —nadie las espera ya— ni «cerradas» —no tienen desenlace—, y el presupuesto
+   * las cuenta como pagadas: ante la duda de si el proveedor cobró, se asume que sí. Van con su
+   * propio número porque meterlas en cualquiera de los otros dos diría algo falso.
+   */
+  llamadasHuerfanas: number;
+  llamadasValidas: number;
+  /** Suma de lo que SÍ tiene tarifa registrada. Lo que no la tiene se cuenta al lado. */
+  costoUsd: number;
+  /**
+   * Llamadas sin coste conocido PORQUE FALTA LA TARIFA: hubo uso del proveedor, pero el modelo
+   * no estaba en el arancel cuando se llamó. Es la que se arregla registrando una tarifa.
+   *
+   * Viaja porque sin este número nadie puede saber si `costoUsd` es el total o una parte, y «no
+   * se sabe» no es «salió gratis». Las huérfanas cuentan aquí porque pueden haberse pagado;
+   * dejarlas fuera apagaba el aviso justo en el caso que lo necesita.
+   */
+  llamadasSinTarifa: number;
+  /**
+   * Y las que no lo tienen PORQUE EL PROVEEDOR NO DIJO CUÁNTO USÓ: ante un timeout, un 5xx o un
+   * fallo de red no vuelve uso, así que los tokens y el coste quedan nulos aunque el modelo
+   * tenga su tarifa.
+   *
+   * Separada de la anterior porque piden cosas distintas: aquélla se arregla registrando una
+   * tarifa y ésta no se arregla —es un fallo del proveedor—. Juntas bajo un solo rótulo, la
+   * pantalla mandaba a registrar una tarifa que no habría cambiado nada. Las dos hacen que
+   * `costoUsd` sea un mínimo.
+   */
+  llamadasSinUso: number;
+  latenciaP50Ms: number | null;
+  /** El percentil 95, porque una alarma de latencia es sobre la cola: una media se la come
+   * el resto de la distribución y deja de avisar justo cuando hay que avisar. */
+  latenciaP95Ms: number | null;
+  tasaError: number | null;
+  propuestas: number;
+  pendientes: number;
+  aceptadas: number;
+  corregidas: number;
+  rechazadas: number;
+  /** Sobre las DECIDIDAS: una propuesta que nadie ha mirado no es un rechazo, y meterla en el
+   * denominador hace que el número empeore solo por generar más. */
+  tasaAceptacion: number | null;
+  /** Una de las cuatro de RF-08.7, y sale del mismo recuento: la base garantiza que una
+   * propuesta `aceptada` tiene el contenido idéntico al original, así que «se corrigió» es
+   * el estado y no un diff de jsonb. Denominador: las que se materializaron. */
+  tasaCorreccion: number | null;
+};
+
+export type ObservabilidadAI = {
+  workspaceId: string;
+  capacidades: ObservabilidadDeCapacidad[];
+  total: {
+    llamadasCerradas: number;
+    llamadasSinRespuesta: number;
+    llamadasEnVuelo: number;
+    llamadasHuerfanas: number;
+    costoUsd: number;
+    llamadasSinTarifa: number;
+    llamadasSinUso: number;
+    propuestas: number;
+  };
+};
+
 export type CandidatoAncla = {
   id: string;
   titulo: string;
@@ -1298,16 +1407,11 @@ export const CAPACIDAD_AGREGADA = 'TODAS';
 export const ROLES_CORREN_EVAL = ['lead-boutique', 'disenador'] as const;
 
 /**
- * Y quién puede LEER el informe: los mismos que auditan lo que la AI hizo.
- *
- * Derivado, no copiado. El informe de grounding responde a la misma pregunta que la auditoría
- * —«¿qué tan de fiar es lo que esta capa produjo?»— y su respuesta interesa al cliente que
- * administra tanto como a la boutique: son recuentos sobre la calidad del trabajo que se le
- * entrega, no la factura ni los nombres de los modelos. La RLS deja leer las dos tablas a todo
- * miembro y así se queda —cerrarla tocaría una lectura ya declarada—; lo que la pantalla no
- * ofrece es el enlace a quien no audita.
+ * Y quién puede LEER el informe de grounding: se re-exporta desde `ai.roles`, donde vive junto a
+ * la puerta del libro de costos, por lo mismo que aquella —el lateral del Loop la necesita y no
+ * puede pagar el contrato entero de Zod por tres roles—. La derivación y su porqué están allí.
  */
-export const ROLES_INFORME_GROUNDING = ROLES_AUDITORIA;
+export { ROLES_INFORME_GROUNDING } from './ai.roles';
 
 /** Una medición: el par guardado, lo que no se pudo juzgar, y la tasa ya dividida. */
 export type MedicionDeGrounding = {

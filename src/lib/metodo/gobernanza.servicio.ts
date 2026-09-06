@@ -513,7 +513,22 @@ export async function gobernanzaDeProyecto(
                                                 on e2.id = (x ->> 'evidenciaId')::uuid
                                                and e2.workspace_id = p2.workspace_id
                                              where p2.id = r.propuesta_ai_id
-                                               and p2.workspace_id = r.workspace_id),
+                                               and p2.workspace_id = r.workspace_id
+                                               -- Y SOLO LAS QUE SIGUEN ENLAZADAS. El contenido
+                                               -- es inmutable (SYS-17) y por eso guarda el
+                                               -- pasaje, pero no es la lista viva: quitar una
+                                               -- cita de una revisión aceptada —el borrado del
+                                               -- enlace SÍ está concedido, y es lo que se hace
+                                               -- cuando su derecho se retira— no lo toca. Sin
+                                               -- este cruce, el pasaje retirado se seguía
+                                               -- enseñando como sostén actual delante de quien
+                                               -- firma el pasa/muere.
+                                               and exists (
+                                                 select 1 from hallazgo_simulado_evidencia hv
+                                                  where hv.hallazgo_id = h.id
+                                                    and hv.workspace_id = h.workspace_id
+                                                    and hv.evidencia_id
+                                                          = (x ->> 'evidenciaId')::uuid)),
                                            -- Y la escrita a mano (SYS-21), que no tiene
                                            -- propuesta detrás: el enlace es todo lo que hay.
                                            (select jsonb_agg(jsonb_build_object(

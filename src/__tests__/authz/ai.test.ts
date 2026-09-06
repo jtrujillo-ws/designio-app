@@ -8494,6 +8494,196 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * A UNA REVISIÓN YA SELLADA NO SE LE AÑADE NADA.
+   *
+   * Las políticas de inserción de las tres hojas miraban el rol y la ventana de la etapa, y no
+   * si su revisión ya lleva el sello de una propuesta. El guard de materialización no vuelve a
+   * correr —no hay UPDATE de propuesta que lo dispare—, así que un hallazgo escrito a mano
+   * después de aceptar entraba y el archivo lo presentaba bajo «propuesta por AI». La
+   * procedencia es de la fila entera: o todo salió de esa propuesta, o la etiqueta miente
+   * sobre la parte que no, y eso se lee justo cuando se firma un pasa/muere.
+   *
+   * Se mide en los DOS sentidos, que es lo que separa «no se amplía lo firmado» de «no se
+   * escribe a mano»: a la revisión SELLADA no entra, y a una escrita a mano —sello en null
+   * para siempre, SYS-21— la misma escritura entra entera.
+   */
+  it('C4 no deja añadir hallazgos ni preguntas a una revisión ya sellada', async () => {
+    await enWorkspaceLimpio('c4-sellada-cerrada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'No entrega el documento sin saber para qué.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      const [sellada] = await admin`select id from revision_simulada
+        where workspace_id = ${wsC} and propuesta_ai_id is not null`;
+      expect(sellada, 'no hay revisión sellada: la sonda no mide nada').toBeDefined();
+      const selladaId = sellada!.id as string;
+
+      // Un hallazgo NUEVO en la revisión que la AI firmó: no entra.
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`insert into hallazgo_simulado
+              (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${selladaId}, 9, 'Añadido a mano', 'Lo escribió una persona.', true)`,
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+      // Y una pregunta tampoco.
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`insert into pregunta_de_test
+              (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${selladaId}, null, 9, '¿Y esto quién lo puso?', '')`,
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+
+      // Y el otro sentido: una revisión escrita a mano se monta entera, sin sello.
+      const aMano = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Escrita a mano'),
+      );
+      expect(aMano, 'la revisión escrita a mano dejó de poder montarse').toBeTruthy();
+      const [sinSello] = await admin`select propuesta_ai_id from revision_simulada
+        where id = ${aMano} and workspace_id = ${wsC}`;
+      expect(sinSello!.propuesta_ai_id, 'la escrita a mano no debería llevar sello').toBeNull();
+    });
+  });
+
+  /**
+   * UNA CITA RETIRADA DEJA DE ENSEÑARSE, aunque el contenido la siga guardando.
+   *
+   * El `contenido` de la propuesta es inmutable (SYS-17) y por eso es donde vive el pasaje —
+   * pero no es la lista viva. Quitar una cita de una revisión YA ACEPTADA sí se puede:
+   * `hallazgo_simulado_evidencia` tiene DELETE concedido y su política, y es justo lo que se
+   * hace cuando el derecho de ese documento se retira. Leyendo sólo el contenido, el pasaje
+   * retirado seguía apareciendo como sostén ACTUAL delante de quien firma el pasa/muere.
+   *
+   * El caso alcanzable es un hallazgo con DOS citas: con una sola, quitarla deja un hallazgo
+   * observado sin nada detrás y el guard diferido ya lo impide —medido: responde «un hallazgo
+   * de revisión simulada que no se marca como hipótesis tiene que citar al menos una evidencia
+   * real»—. Y las dos tienen que ser de DOCUMENTOS distintos: la clave primaria del enlace
+   * colapsa dos citas del mismo. Los dos documentos van a la MISMA lente, porque una sesión
+   * sólo puede citar evidencia de su arquetipo.
+   */
+  it('C4 deja de enseñar una cita que se retiró de la revisión aceptada', async () => {
+    await enWorkspaceLimpio('c4-cita-retirada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4B', 'Proyecto de la cita retirada', ${curadorId})
+        returning id`;
+      // Un SEGUNDO documento en la misma lente, antes de generar: enlazarlo después dejaría la
+      // propuesta obsoleta —eso lo mide otra sonda— y aquí lo que se quiere es que la sesión
+      // pueda citar dos.
+      const [fte] = await admin`select fuente_id from evidencia where id = ${evA}`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.fuente_id as string}, 'Entrevista D-02',
+                'Prefiero que me digan para qué antes de dar nada.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const evA2 = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${evA2}, 'concedido', 'cliente', 'Consentimiento del participante',
+                ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteA}, ${evA2})`;
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'No entrega el documento sin saber para qué.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'Lo dicen los dos testimonios.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                      { evidenciaId: evA2, fragmento: 'Prefiero que me digan para qué', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+
+      const leer = async () => {
+        const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+        return gob!.conceptos.find((c) => c.id === conceptoId)!.revisiones[0]!;
+      };
+      const antes = await leer();
+      expect(
+        antes.hallazgos[0]!.citas.map((c) => c.evidenciaTitulo),
+        'la sonda no parte de dos citas: no mediría la retirada',
+      ).toEqual(['Entrevista D-01', 'Entrevista D-02']);
+
+      // Se retira una, por la superficie concedida y como se haría de verdad.
+      await conUsuario(curadorId, (tx) =>
+        tx`delete from hallazgo_simulado_evidencia
+            where hallazgo_id = ${antes.hallazgos[0]!.id} and evidencia_id = ${evA2}
+              and workspace_id = ${wsC}`,
+      );
+      const despues = await leer();
+      expect(
+        despues.hallazgos[0]!.citas.map((c) => c.evidenciaTitulo),
+        'la cita retirada se sigue enseñando como sostén actual',
+      ).toEqual(['Entrevista D-01']);
+      // Y la que queda conserva su pasaje: lo que se cruza es la lista, no el testimonio.
+      expect(despues.hallazgos[0]!.citas[0]!.fragmento).toBe('No entrego la cédula');
+    });
+  });
+
+  /**
    * EL PERMISO QUE VENCE HOY se pregunta por lo que el prompt ENSEÑA, no por lo que se pensó
    * enseñar.
    *
@@ -9644,6 +9834,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         revsDelDisenador.flatMap((x) => x.preguntas.map((q) => q.pregunta)),
         'las preguntas de test no llegan a quien va a correr el test',
       ).toContain('¿Qué te haría entregar la cédula?');
+
     });
   });
 

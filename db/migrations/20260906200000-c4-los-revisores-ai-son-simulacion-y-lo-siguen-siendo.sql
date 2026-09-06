@@ -502,6 +502,21 @@ create policy revision_simulada_insert on revision_simulada
 -- mientras el concepto era candidato sigue admitiendo hallazgos, citas y preguntas DESPUÉS del
 -- pasa/muere: contenido nuevo dentro de un objeto viejo, que en el expediente se lee como si
 -- hubiera informado el veredicto. Que el padre esté cerrado no cierra a los hijos.
+-- Y LAS TRES PIDEN QUE LA REVISIÓN NO ESTÉ SELLADA TODAVÍA.
+--
+-- «revision_simulada.propuesta_ai_id» lo estampa el guard de materialización, y lo estampa al
+-- FINAL: la aceptación inserta la revisión, sus hallazgos, sus citas y sus preguntas, y sólo
+-- entonces el UPDATE de la propuesta dispara el guard que sella. Así que dentro de la
+-- aceptación el sello sigue en null y estas tres políticas dejan escribir; después, ya no.
+--
+-- Sin eso, un curador podía añadir un hallazgo o una pregunta A UNA REVISIÓN YA ACEPTADA —el
+-- guard de materialización no vuelve a correr, porque no hay UPDATE de propuesta que lo
+-- dispare— y el archivo presentaba contenido escrito a mano bajo la etiqueta «propuesta por
+-- AI». La procedencia es de la fila entera: o todo salió de esa propuesta, o la etiqueta miente
+-- sobre la parte que no. Y no es cosmético: lo que se lee ahí decide un pasa/muere.
+--
+-- Una revisión escrita a mano (SYS-21) tiene el sello en null para siempre, así que se sigue
+-- montando y ampliando igual. Lo que se cierra es el añadido a lo que YA se firmó.
 create policy hallazgo_simulado_insert on hallazgo_simulado
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
@@ -509,6 +524,7 @@ create policy hallazgo_simulado_insert on hallazgo_simulado
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where r.id = hallazgo_simulado.revision_id
         and r.workspace_id = hallazgo_simulado.workspace_id
+        and r.propuesta_ai_id is null
         and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
@@ -521,6 +537,7 @@ create policy hallazgo_simulado_evidencia_insert on hallazgo_simulado_evidencia
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where h.id = hallazgo_simulado_evidencia.hallazgo_id
         and h.workspace_id = hallazgo_simulado_evidencia.workspace_id
+        and r.propuesta_ai_id is null
         and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
@@ -532,6 +549,7 @@ create policy pregunta_de_test_insert on pregunta_de_test
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where r.id = pregunta_de_test.revision_id
         and r.workspace_id = pregunta_de_test.workspace_id
+        and r.propuesta_ai_id is null
         and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );

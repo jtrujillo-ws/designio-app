@@ -436,7 +436,7 @@ identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de o
 | Método: proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas | ✔ | | **Pantalla de J2**: crear un reto, definir criterios a mano y activarlo con perfil existen como server functions pero ninguna pantalla las llama todavía (los criterios entran hoy por C0 o por seed). **Pantalla de la etapa 4**: el concepto, su evidencia de test, su umbral, su N/A y su veredicto existen en la base con políticas y puerta de G4 (#46), pero ninguna server function ni pantalla los crea o decide; mientras no exista, G4 aprueba como antes cuando el reto no tiene conceptos, y una decisión `pasa-muere` no puede registrarse desde la interfaz porque exige elegir un concepto |
 | Oportunidades HMW (con borrador AI de preguntas trazadas a insights, C3) y G3 sobre el portafolio | ✔ | | Serializar la carrera entre validar un insight y persistir un lote de C3 (deuda anotada en #45; C2 la comparte) |
 | Journeys, catálogo, Mermaid, carriles, validación, snapshot | ✔ | | Vista timeline y por actor |
-| Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | — (las desviaciones constatadas las lee C7 dentro del borrador del post mortem; no hay un detector AI que proponga constataciones, y por diseño no lo habrá: constatar es testimonio humano) |
+| Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | Detección AI de desviaciones como discrepancias propuestas (RF-06.8); C7 solo lee las ya registradas dentro del borrador del post mortem (discrepancia 20) |
 | Metric Registry (con borrador AI de entradas KPI, C6), snapshots, outcome review (con borrador AI de la narrativa, C7), veredicto | ✔ | | Recordatorios por cadencia, series ancladas a fechas de release |
 | Pipeline PropuestaAI, presupuesto, degradación, consentimiento | ✔ (CI, C0, CT, C2, C3, C5, C6, C7) | | C1, C4 (revisores AI), plan de releases asistido; BYOAI con secret manager; evals de grounding programadas |
 | Exportación (archivo y entregable), disposición acordada | ✔ | | Exportación de adjuntos por object storage |
@@ -961,9 +961,13 @@ despliega releases y constata el effective state.
 ## Fuente
 
 SPEC-06 (RF-06.1 a RF-06.10), SYS-05 a SYS-08. PRs [#13](https://github.com/jtrujillo-ws/designio-app/pull/13),
-[#16](https://github.com/jtrujillo-ws/designio-app/pull/16). Las desviaciones constatadas las **lee** C7 al redactar el
-borrador del post mortem (ver `09`); no existe, ni por diseño existirá, un detector AI que proponga
-constataciones: constatar es el testimonio de quien miró qué quedó funcionando.
+[#16](https://github.com/jtrujillo-ws/designio-app/pull/16). **Pendiente (diseñado)**: la detección AI de desviaciones tal
+como la define RF-06.8 (discrepancias propuestas entre la design version y lo constatado, a
+confirmar por el lead). Lo construido en #47 es distinto: C7 **lee** desviaciones ya registradas al
+redactar el borrador del post mortem (ver `09`) y nunca propone ni materializa una constatación; la
+migración de C7 argumenta que un detector así contradiría el carácter testimonial de la
+constatación. La spec no se ha cambiado, así que la diferencia queda como discrepancia 20 en el
+apéndice 94.
 
 ---
 
@@ -1024,9 +1028,13 @@ veredicto honesto (ADR-0007).
   redacta sobre lo constatado, no sobre lo que se recuerda». Con el review **en borrador**, el
   **lead** (solo él: la política de escritura de `outcome_review` pide `lead-boutique`, así que C7 es
   la única capacidad que no puede pedir el diseñador) pide desde `/propuestas` un borrador de los
-  cuatro campos narrativos (contribución, factores externos, hipótesis abiertas, aprendizajes) más
-  una **lectura de cada desviación** constatada, citando el elemento y la constatación de la que
-  sale. El material es **determinista**: el tablero de conciliación de todos los proyectos del reto
+  cuatro campos narrativos (contribución, factores externos, hipótesis abiertas, aprendizajes) y,
+  **opcionalmente, lecturas de desviaciones** tomadas del tablero (hasta 50, una por elemento): el
+  prompt pide comentar las que importan para el resultado, no todas, así que un borrador aceptado
+  puede omitir desviaciones registradas; puede leer cualquier elemento del tablero que **no** esté
+  constatado «como aprobado» (desviado, no implementado, o desplegado, en release o aprobado sin
+  constatar), y el servicio rechaza ids fuera del tablero o de elementos constatados como aprobados.
+  El material es **determinista**: el tablero de conciliación de todos los proyectos del reto
   (`conciliacion_del_reto`, la misma lectura que dibuja G7) y la lectura por criterio de
   `resultado_criterio`; los snapshots crudos no entran, porque ya están resumidos en lo que el lead
   constató. **No propone** el veredicto (RF-07.8) ni la casilla de diseño experimental (SYS-24, la
@@ -1036,7 +1044,9 @@ veredicto honesto (ADR-0007).
   se constata un elemento o se registra una lectura después de generar, el panel lo dice
   (`conciliacion-cambiada`) y, si el review se completó, la propuesta solo puede rechazarse
   (`post-mortem-cerrado`). Se corrigen los textos; los elementos que las desviaciones señalan son
-  testimonio y no se reapuntan.
+  testimonio y no se reapuntan. Lo que C7 **no** hace es proponer discrepancias como objeto: las
+  desviaciones que lee ya están registradas por el lead (ver RF-06.8 en `08`, `30` y la discrepancia
+  20 del apéndice 94).
 
 ## Qué falta (diseñado)
 
@@ -1076,7 +1086,7 @@ generar se desactivan y revisar lo ya propuesto sigue disponible (SYS-21).
 | **C4** | 4 | Revisores AI por arquetipo (etiqueta **simulación**) y borrador de diseño de tests | — | Informativo; jamás evidencia | Diseñado (la columna `es_simulacion` y su CHECK «simulación no es evidencia» ya existen) |
 | **C5** | 5 | Cómo cerrar cada señal de validación del journey; no rediagnostica | Journey | Informativo | Construido |
 | **C6** | 6 | Hasta 6 entradas KPI del Metric Registry contra los criterios de éxito del reto: criterio al que responde (por id), nombre, definición, fuente, dimensiones, frecuencia y citas a los criterios; **no** propone propietario del dato, línea base, ventana ni dashboard (compromisos y datos, no redacción) | Metric Registry en borrador | Entrada KPI (incompleta hasta la firma) | Construido |
-| **C7** | 7 | Borrador de los cuatro campos narrativos del post mortem (contribución, factores externos, hipótesis abiertas, aprendizajes) y una lectura por cada desviación constatada, con citas al tablero de conciliación del reto y a las lecturas por criterio; **no** propone el veredicto ni la casilla de diseño experimental | Outcome review en borrador (solo el lead) | El propio outcome review: aceptar escribe sus campos narrativos, no crea fila | Construido |
+| **C7** | 7 | Borrador de los cuatro campos narrativos del post mortem (contribución, factores externos, hipótesis abiertas, aprendizajes) y, opcionalmente, lecturas de elementos del tablero de conciliación no constatados como aprobados, con citas al tablero del reto y a las lecturas por criterio; **no** propone el veredicto ni la casilla de diseño experimental | Outcome review en borrador (solo el lead) | El propio outcome review: aceptar escribe sus campos narrativos, no crea fila | Construido |
 | **CT** | Transversal | Qué falta para un gate, citando ítems del checklist por id, con cómo cerrarlo | Gate | Informativo; **no puede aprobar** | Construido |
 | — | 6 | Descomposición asistida en releases (segunda salida de C6 en SPEC-08) | Design version | Informativo | Diseñado: exige ampliar el vocabulario de capacidades (decisión de producto anotada en la migración de C6) |
 
@@ -1708,7 +1718,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-03 Evidencia e importación | Transcripción y diarización (C1, requiere proveedor STT); escaneo de malware; object storage S3-compatible con proxy de bytes (hoy `bytea` en Postgres); preview y OCR de artefactos; codificación asistida por segmento y tema | RF-03.2, RF-03.7, RF-03.8 |
 | SPEC-04 Método | **Pantalla de J2** para crear el reto, definir y editar criterios a mano y activarlo con perfil (las server functions existen; ninguna ruta las llama); **pantalla de la etapa 4** para crear conceptos, enlazar su evidencia de test, declarar umbral, registrar lectura, aprobar la N/A y dictar el veredicto (el modelo, las políticas y la puerta de G4 ya están en la base desde #46; sin esa pantalla un `pasa-muere` no se puede registrar desde la interfaz); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
 | SPEC-05 Journeys | Vistas timeline y por actor (la descarga SVG/PNG del render y la copia del código Mermaid ya están construidas en la pantalla del journey) | RF-05.3 |
-| SPEC-06 Trazabilidad | — (RF-06.8 se cubre con la lectura de desviaciones que C7 hace dentro del borrador del post mortem; un detector que proponga constataciones queda descartado por diseño) | RF-06.8 |
+| SPEC-06 Trazabilidad | Detección AI de desviaciones como **discrepancias propuestas** entre la design version y lo constatado, a confirmar por el lead (la spec sigue vigente; C7 solo lee las desviaciones ya registradas dentro del borrador del post mortem, y la migración de #47 argumenta contra un detector que proponga constataciones: decisión de producto pendiente, discrepancia 20) | RF-06.8 |
 | SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
 | SPEC-08 AI | Capacidades C1, C4 (revisores AI por arquetipo, con el esquema de simulación ya preparado) y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; evaluaciones de grounding con línea base y regresión; observabilidad AI como panel (los datos ya están en `llamada_ai`) | RF-08.2, RF-08.7, RF-08.9 |
 | SPEC-09 Seguridad | Prueba «AI off» del loop completo como E2E; condiciones de proveedores registradas; backups con prueba de restauración documentada | RF-09.10, RF-09.11 |
@@ -1995,7 +2005,8 @@ fuente o a un ADR de sucesión.
 | 16 | `docs/README.md` | Estados del paquete «borrador» | El código ya materializa la mayoría de las specs | Añadir columna de estado de implementación (o enlazar este documento) |
 | 17 | Journeys J2 (`docs/04-journeys/`) / SPEC-04 RF-04.1–04.3 | El lead formula el reto y define criterios en la plataforma | Las server functions existen pero ninguna pantalla las expone: el reto y sus criterios manuales nacen del seed o de C0 | Construir la pantalla de J2 (alta de reto, criterios, activación) |
 | 18 | Journeys J7 / prediseño §13.2 | El sponsor «recibe el post mortem» y decide continuidad; la tabla de journeys lo pone como rol decisivo | El veredicto lo dicta el lead (`review_completar`); no hay aprobación del sponsor sobre el review | Decidir si el sponsor debe firmar el outcome review (ADR) o dejar el rol como está y ajustar el journey |
-| 19 | SPEC-01 RF-01.4 | El admin del cliente gestiona los accesos de su organización | Alta por invitación sí; la baja de una membresía no tiene camino en la app (solo conexión administrativa) | Añadir política, grant y pantalla de baja |
+| 19 | SPEC-01 RF-01.4 | El admin del cliente gestiona los accesos de su organización | Alta por invitación sí; la baja de una membresía no tiene camino en la app (solo conexión administrativa) |
+| 20 | SPEC-06 RF-06.8 | Detección AI de desviaciones: discrepancias propuestas entre DV y lo constatado, a confirmar por el lead | C7 (#47) no propone discrepancias ni constataciones: lee las desviaciones ya registradas por el lead y las comenta, opcionalmente, dentro del borrador del post mortem; la migración de C7 sostiene que una constatación propuesta por el modelo contradiría su carácter testimonial | Decidir si se reescribe RF-06.8 o se construye el detector; mientras, RF-06.8 sigue pendiente en `30` | Añadir política, grant y pantalla de baja |
 
 ---
 

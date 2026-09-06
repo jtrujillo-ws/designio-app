@@ -613,6 +613,19 @@ create policy revision_simulada_delete on revision_simulada
 --
 -- Sin el estado, un borrado de hoja sería la vía para MUTAR una revisión después del veredicto
 -- sin tocar la puerta que lo impide: quitar hallazgos de uno en uno hasta dejar otra cosa.
+--
+-- Y SIN EL SELLO pasa lo mismo ANTES del veredicto, que es la otra mitad de «a lo firmado no se
+-- le añade nada». Recortar deforma igual que ampliar: con dos hallazgos firmados, quitar uno
+-- deja al trigger de completitud contento —queda otro— y la revisión sigue rotulada «propuesta
+-- por AI» diciendo menos de lo que la propuesta dijo. El guard de materialización no vuelve a
+-- correr: no hay UPDATE de propuesta que lo dispare. Y se lleva por delante lo que colgaba,
+-- porque `pregunta_de_test.hallazgo_id` cae con `on delete cascade`: la única señal
+-- contrastable que una simulación le entrega a la etapa 4 se podía vaciar de una en una.
+--
+-- La salida para corregir es la que el diseño ya eligió y sigue abierta: borrar la revisión
+-- ENTERA y escribir la buena, que suelta el puntero de la propuesta por su `BEFORE DELETE` y no
+-- deja media procedencia en pie. Y una revisión escrita a mano —sello en null para siempre— se
+-- sigue corrigiendo hoja a hoja, que es de quien la escribió.
 create policy hallazgo_simulado_delete on hallazgo_simulado
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
@@ -620,10 +633,14 @@ create policy hallazgo_simulado_delete on hallazgo_simulado
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where r.id = hallazgo_simulado.revision_id
         and r.workspace_id = hallazgo_simulado.workspace_id
+        and r.propuesta_ai_id is null
         and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
+-- La CITA es la excepción, y a propósito: quitarla de una revisión YA SELLADA es justo como se
+-- remedia un derecho de uso retirado, así que aquí NO va la puerta del sello. Lo que queda no se
+-- queda sin comprobar — el guard diferido para el hallazgo afirmativo que se quedó sin ninguna.
 create policy hallazgo_simulado_evidencia_delete on hallazgo_simulado_evidencia
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
@@ -643,6 +660,7 @@ create policy pregunta_de_test_delete on pregunta_de_test
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where r.id = pregunta_de_test.revision_id
         and r.workspace_id = pregunta_de_test.workspace_id
+        and r.propuesta_ai_id is null
         and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );

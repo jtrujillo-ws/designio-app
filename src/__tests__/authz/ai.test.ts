@@ -8661,6 +8661,167 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * NI SE LE QUITA NADA. La otra mitad, y la que faltaba.
+   *
+   * La ronda anterior cerró el AÑADIR con `r.propuesta_ai_id is null` en las tres políticas de
+   * inserción. El BORRADO de hoja quedó abierto, y recorta lo mismo que ampliar deformaba: con
+   * dos hallazgos firmados, quitar uno deja al trigger de completitud contento —queda otro— y
+   * la revisión sigue rotulada «propuesta por AI» diciendo menos de lo que la propuesta dijo.
+   * El guard de materialización no vuelve a correr: no hay UPDATE de propuesta que lo dispare.
+   *
+   * Y se lleva por delante lo que colgaba: `pregunta_de_test.hallazgo_id` referencia el hallazgo
+   * con `on delete cascade`, así que las preguntas de ese hallazgo desaparecen sin que nadie las
+   * borre. La única señal contrastable que una simulación le entrega a la etapa 4 se puede
+   * vaciar de una en una, con la etiqueta de procedencia intacta.
+   *
+   * La salida para corregir sigue abierta y es la que el diseño ya eligió: **borrar la revisión
+   * ENTERA y escribir la buena**, que suelta el puntero de la propuesta por su trigger
+   * `BEFORE DELETE` y no deja media procedencia en pie. Y quitar una CITA sigue permitido sobre
+   * una sellada, que es como se remedia un derecho retirado; el guard diferido decide si lo que
+   * queda se sostiene.
+   *
+   * Se mide en los dos sentidos, como la de arriba: de la sellada no sale, de la escrita a mano
+   * sí — porque una persona que escribió mal su propia revisión tiene que poder corregirla.
+   */
+  it('C4 no deja quitar hallazgos ni preguntas de una revisión ya sellada', async () => {
+    await enWorkspaceLimpio('c4-sellada-sin-recortes', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // DOS hallazgos: con uno solo, quitarlo lo pararía el trigger de completitud y la sonda
+      // estaría midiendo esa puerta y no ésta.
+      const cita = { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' };
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'No entrega el documento sin saber para qué.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [cita],
+                  },
+                  {
+                    titulo: 'Desconfía del canal',
+                    descripcion: 'Prefiere la sucursal para lo sensible.',
+                    esHipotesis: false,
+                    citas: [cita],
+                  },
+                ],
+                // DOS preguntas, por lo mismo que dos hallazgos: con una sola, quitarla la para
+                // el trigger de completitud y la sonda estaría midiendo ESA puerta. Medido: al
+                // neutralizar el sello con una sola pregunta, el borrado pasaba la política y
+                // moría en «esa revisión simulada se queda sin preguntas» — la sonda se movía,
+                // pero no por lo que dice medir.
+                preguntas: [
+                  { pregunta: '¿Qué te haría entregarla?', escenario: '' },
+                  { pregunta: '¿Y si te lo pide la sucursal?', escenario: '' },
+                ],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      const firmados = await admin`select h.id, h.orden from hallazgo_simulado h
+        join revision_simulada r on r.id = h.revision_id and r.workspace_id = h.workspace_id
+        where r.workspace_id = ${wsC} and r.propuesta_ai_id is not null
+        order by h.orden`;
+      expect(firmados.length, 'la sonda necesita DOS hallazgos firmados').toBe(2);
+      const [primero, segundo] = firmados as unknown as { id: string }[];
+
+      // El concepto sigue candidato —la puerta del veredicto no es la que se está midiendo—.
+      const [estado] = await admin`select estado from concepto
+        where id = ${conceptoId} and workspace_id = ${wsC}`;
+      expect(estado!.estado, 'el concepto ya no es candidato: la sonda mediría otra puerta').toBe(
+        'candidato',
+      );
+
+      // Quitar UNO de los dos hallazgos firmados: no se puede.
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`delete from hallazgo_simulado
+            where id = ${segundo!.id} and workspace_id = ${wsC}`.then(async (r) => {
+            if (r.count === 0) throw new Error('row-level security: 0 filas borradas');
+            return r;
+          }),
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+
+      // Y una pregunta suelta de la revisión firmada, tampoco.
+      const preguntasFirmadas = await admin`select p.id from pregunta_de_test p
+        join revision_simulada r on r.id = p.revision_id and r.workspace_id = p.workspace_id
+        where r.workspace_id = ${wsC} and r.propuesta_ai_id is not null
+        order by p.orden`;
+      expect(preguntasFirmadas.length, 'la sonda necesita DOS preguntas firmadas').toBe(2);
+      const preguntaFirmada = preguntasFirmadas[1];
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`delete from pregunta_de_test
+            where id = ${preguntaFirmada!.id} and workspace_id = ${wsC}`.then(async (r) => {
+            if (r.count === 0) throw new Error('row-level security: 0 filas borradas');
+            return r;
+          }),
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+      expect(primero, 'el fixture perdió el primer hallazgo').toBeTruthy();
+
+      // Lo que SÍ sigue abierto sobre la sellada: quitar una CITA, que es como se remedia un
+      // derecho retirado. Aquí el hallazgo se queda sin ninguna y el guard diferido lo para
+      // con su motivo — que es exactamente la comprobación que tiene que seguir decidiendo.
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`delete from hallazgo_simulado_evidencia
+            where hallazgo_id = ${segundo!.id} and workspace_id = ${wsC}`,
+        ),
+      ).rejects.toThrow(/hipótesis|al menos una evidencia/i);
+
+      // Y la salida que el diseño eligió para corregir sigue abierta: la revisión ENTERA.
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const r = await tx`delete from revision_simulada
+            where workspace_id = ${wsC} and propuesta_ai_id is not null`;
+          if (r.count === 0) throw new Error('row-level security: 0 filas borradas');
+          return r;
+        }),
+      ).resolves.toBeTruthy();
+
+      // Y el otro sentido: de una revisión escrita a mano sí se quita un hallazgo.
+      const aMano = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Escrita a mano'),
+      );
+      const [suyo] = await admin`select id from hallazgo_simulado
+        where revision_id = ${aMano} and workspace_id = ${wsC}`;
+      await conUsuario(curadorId, (tx) =>
+        tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+          values (${wsC}, ${aMano}, 9, 'El segundo, a mano', 'Para poder quitar el otro.', true)`,
+      );
+      const suPropiaMano = await conUsuario(curadorId, (tx) =>
+        tx`delete from hallazgo_simulado where id = ${suyo!.id} and workspace_id = ${wsC}`,
+      );
+      expect(
+        suPropiaMano.count,
+        'quien escribió su revisión a mano dejó de poder corregirla',
+      ).toBe(1);
+    });
+  });
+
+  /**
    * LA VENTANA TAMBIÉN AVANZA CUANDO SE RECHAZA, y antes no.
    *
    * La ronda 2 hizo que aceptar moviera la ventana: `lentesDelLote` descuenta las lentes que ya

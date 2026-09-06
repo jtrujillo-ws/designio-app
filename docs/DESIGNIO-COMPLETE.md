@@ -787,7 +787,11 @@ irreversible, umbral congelado con prueba enlazada, N/A firmada por el rol de G4
 ## Permisos
 
 Los **roles curadores** (lead y diseñador) crean retos candidatos, definen y editan criterios,
-marcan ítems del checklist, y definen, **enlazan evidencia** y deciden arquetipos
+marcan ítems del checklist como **cumplido** o los devuelven a pendiente, y también actúan sobre los arquetipos (abajo). La **N/A** de un ítem es aparte: solo la marca o la revierte el
+**rol aprobador del gate** (sponsor en G0, G3, G5 y G6; lead en el resto), y un ítem ya en N/A no lo
+toca un curador, igual que el aprobador no deshace un cumplido de los curadores (`checklist_update`;
+la pantalla lo separa en `puedeCurar` y `puedeNa`). Los curadores también definen, **enlazan
+evidencia** y deciden arquetipos
 (`arquetipo_evidencia_insert` admite a ambos y la pantalla ofrece «Enlazar evidencia» a todo
 curador mientras el arquetipo es hipótesis); por política también crean, editan, prueban y deciden
 conceptos, aunque hoy sin pantalla. Solo el **lead** activa el reto, registra y revalida decisiones

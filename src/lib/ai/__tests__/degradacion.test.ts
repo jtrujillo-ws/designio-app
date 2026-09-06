@@ -12,6 +12,7 @@ import {
   motivoDeFalloProveedor,
   TARIFA_USD_POR_MTOK,
 } from '../ai.degradacion';
+import { MAX_REVISIONES_POR_LOTE } from '../ai.schemas';
 import {
   delimitarMaterialNoConfiable,
   citaApareceLiteral,
@@ -31,6 +32,8 @@ import {
   promptExtraccion,
   promptInsights,
   promptPostMortem,
+  promptRevision,
+  type ConceptoARevisar,
   type ExpedienteDePostMortem,
   SISTEMA_ASISTENTE_GATES,
   SISTEMA_CRITERIOS,
@@ -38,6 +41,7 @@ import {
   SISTEMA_REGISTRY,
   SISTEMA_POST_MORTEM,
   SISTEMA_REMEDIACION_JOURNEY,
+  SISTEMA_REVISION,
   type GrafoDelJourney,
   SISTEMA_EXTRACCION,
   SISTEMA_INSIGHTS,
@@ -697,8 +701,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
    * del material guardado con el de hoy solo vale entre propuestas del mismo render.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-06.20';
-  const HUELLA_ANOTADA = 'd64454a1105d373c15b709854fd1686021f5845194faf5624bb35ffb906426a6';
+  const VERSION_ANOTADA = 'ai-2026-09-06.21';
+  const HUELLA_ANOTADA = 'd8d2648349da74de1c5551aa37f57d7b16e0c2ed944559417b4048b303db8437';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -721,7 +725,42 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * un refactor que dejara de truncar seguiría produciendo una huella —otra, pero una—, y la
    * prueba diría «el contrato cambió» en vez de «esta rama ya no existe».
    */
-  /** El expediente que redacta C7: una lectura y un elemento desviado. */
+  /** El concepto que revisa C4: dos lentes, cada una con su documento. */
+  const CONCEPTO_DE_PRUEBA: ConceptoARevisar = {
+    titulo: 'Verificación diferida',
+    descripcion: 'Se abre la cuenta y el documento se pide después',
+    umbralTest: '6 de 8 completan sin ayuda',
+    arquetipos: [
+      {
+        id: 'e5f6a7b8-0000-4000-8000-000000000001',
+        nombre: 'El desconfiado digital',
+        definicion: 'Perfil emergente de la evidencia',
+        estado: 'hipotesis',
+        evidencia: [
+          {
+            id: 'f6a7b8c9-0000-4000-8000-000000000001',
+            titulo: 'Entrevista D-01',
+            resumen: 'No entrego la cédula sin saber para qué.',
+          },
+        ],
+      },
+      {
+        id: 'e5f6a7b8-0000-4000-8000-000000000002',
+        nombre: 'El apurado de RR. HH.',
+        definicion: 'Perfil confirmado en la etapa 2',
+        estado: 'confirmado',
+        evidencia: [
+          {
+            id: 'f6a7b8c9-0000-4000-8000-000000000002',
+            titulo: 'Entrevista A-01',
+            resumen: 'Si tarda más de un café, lo dejo.',
+          },
+        ],
+      },
+    ],
+  };
+
+  /** Y el expediente que redacta C7: una lectura y un elemento desviado. */
   const EXPEDIENTE_DE_PRUEBA: ExpedienteDePostMortem = {
     codigo: 'R-01',
     titulo: 'Verificación de identidad',
@@ -1196,6 +1235,40 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     }),
 
     /*
+     * ── C4 ──
+     *
+     * Faltaba entera, como le pasó a C7 —que entró por su lado—: sin ella la huella no cubría ni
+     * su sistema ni ninguna rama de su render, así que cambiar el prompt de C4 sin subir
+     * `PROMPT_VERSION` no rompía nada, que es lo único que esta huella existe para impedir. Lo
+     * dijo un cambio de esta rama: se tocó el prompt de C4 entero y la huella no se movió.
+     */
+    revisionLlana: promptRevision(CONCEPTO_DE_PRUEBA),
+    // Por encima del tope del lote: el material dice qué lentes deja fuera y el prompt pide
+    // tantas sesiones como caben, no tantas como arquetipos hay.
+    revisionSobreElTope: promptRevision({
+      ...CONCEPTO_DE_PRUEBA,
+      arquetipos: [
+        ...Array.from({ length: MAX_REVISIONES_POR_LOTE + 2 }, (_, i) => ({
+          ...CONCEPTO_DE_PRUEBA.arquetipos[0]!,
+          id: `e5f6a7b8-0000-4000-8000-${String(i + 10).padStart(12, '0')}`,
+          nombre: `Arquetipo ${i}`,
+          evidencia: [
+            {
+              ...CONCEPTO_DE_PRUEBA.arquetipos[0]!.evidencia[0]!,
+              id: `f6a7b8c9-0000-4000-8000-${String(i + 10).padStart(12, '0')}`,
+            },
+          ],
+        })),
+        // Y una lente SIN evidencia, que tampoco se puede revisar y se cuenta aparte.
+        { ...CONCEPTO_DE_PRUEBA.arquetipos[0]!, id: 'e5f6a7b8-0000-4000-8000-000000000099', nombre: 'Sin nada detrás', evidencia: [] },
+      ],
+    }),
+    // El recorte: el aviso de truncado, y con él la lista de lentes que sí llegaron enteras.
+    revisionTruncada: promptRevision({ ...CONCEPTO_DE_PRUEBA, descripcion: CUERPO_LARGO }),
+    revisionFichaVacia: promptRevision({ ...CONCEPTO_DE_PRUEBA, titulo: '' }),
+    revisionConDelimitador: promptRevision({ ...CONCEPTO_DE_PRUEBA, titulo: CON_DELIMITADOR }),
+
+    /*
      * ── C7 ──
      *
      * Faltaba entera: ni su sistema ni ninguna rama de su render entraban en la huella, así que
@@ -1250,6 +1323,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
       sistemaRemediacionJourney: SISTEMA_REMEDIACION_JOURNEY,
       sistemaRegistry: SISTEMA_REGISTRY,
       sistemaOportunidades: SISTEMA_OPORTUNIDADES,
+      sistemaRevision: SISTEMA_REVISION,
       sistemaPostMortem: SISTEMA_POST_MORTEM,
       esquemaSalida: ESQUEMA_SALIDA,
       maxMaterial: MAX_MATERIAL,
@@ -1410,6 +1484,24 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.journeyLlano.nucleo.cabe).toBe(true);
     expect(RAMAS.journeyFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.journeyConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
+
+    /*
+     * C4. Las cuatro cosas que distinguen sus ramas: que el prompt NOMBRA las lentes por su id
+     * —no las cuenta—, que por encima del tope pide solo las que caben y dice cuáles deja
+     * fuera, que el recorte avisa, y que la ficha vacía y el delimitador se comportan como en
+     * las demás capacidades.
+     */
+    expect(RAMAS.revisionLlana.usuario).toContain('[e5f6a7b8-0000-4000-8000-000000000001]');
+    expect(RAMAS.revisionLlana.usuario).toContain('ESTOS 2 arquetipos');
+    expect(RAMAS.revisionLlana.usuario).not.toContain('se truncó');
+    expect(RAMAS.revisionSobreElTope.usuario).toContain(`ESTOS ${MAX_REVISIONES_POR_LOTE} arquetipos`);
+    expect(RAMAS.revisionSobreElTope.usuario).toContain('2 por encima del tope');
+    expect(RAMAS.revisionSobreElTope.usuario).toContain('1 sin evidencia citable enlazada');
+    expect(RAMAS.revisionTruncada.usuario).toContain('se truncó');
+    expect(RAMAS.revisionTruncada.alcanceResumen).toContain('truncado');
+    expect(RAMAS.revisionFichaVacia.usuario).toContain('(sin dato)');
+    expect(RAMAS.revisionConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
+
 
     /*
      * C7. La conciliación llega con sus elementos por id, el bloque de lecturas cambia cuando no

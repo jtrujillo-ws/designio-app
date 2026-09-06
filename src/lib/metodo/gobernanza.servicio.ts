@@ -1,6 +1,9 @@
 import '@/lib/server-only';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { ContenidoRevisionSimuladaSchema } from '@/lib/ai/ai.contenido';
+import { escribirRevisionSimulada } from '@/lib/ai/ai.servicio';
+import { z } from 'zod';
 import type {
   CrearArquetipo,
   GobernanzaDeProyecto,
@@ -22,6 +25,95 @@ type ApoyarArquetipoEntrada = { workspaceId: string; arquetipoId: string; eviden
  * la que hace trazable una decisión: al menos un insight que la sostenga, enlazado en
  * la MISMA sentencia que la registra (nunca una decisión huérfana a medio camino).
  */
+
+/**
+ * ESCRIBIR UNA REVISIÓN SIMULADA A MANO (SYS-21).
+ *
+ * La paridad manual no es un extra de C4: es la condición que SYS-21 le pone a toda capacidad
+ * —«caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre presentes»— y el
+ * criterio 3 de SPEC-08 la lleva a CI. Sus cinco hermanas ya la tienen en su propio servicio de
+ * dominio (`insight.servicio.ts`, `medicion.servicio.ts`, `oportunidad.servicio.ts`); las
+ * concesiones de la base y las políticas de C4 estaban escritas para admitirla —el sello de
+ * procedencia se queda en null para siempre— pero nadie podía ejercerlas desde la pantalla.
+ *
+ * El CONTENIDO se valida con el MISMO esquema que gobierna lo que devuelve el proveedor, no con
+ * una copia: lo que hace legítima a una revisión —hallazgos que citan o se marcan como
+ * hipótesis, preguntas que nacen de un hallazgo, nada de agregados sintéticos— no depende de
+ * quién la escribió. Una segunda escritura de esas reglas sería una segunda cosa que mantener,
+ * y este PR ya ha pagado esa cuenta cuatro veces.
+ *
+ * VIVE EN EL SERVICIO y no en el fichero de esquemas de gobernanza, y eso lo dijo el guardián
+ * del bundle: `ai.contenido` lleva el marcador de solo-servidor, y los esquemas de gobernanza
+ * los importa la pantalla. El cliente no necesita el validador —arma el objeto y llama a la
+ * server function—; el validador corre donde tiene que correr.
+ *
+ * Lo único que sobra es `confianzaPropuesta`: eso es lo que el modelo dice de SU salida, y
+ * quien escribe a mano no propone nada — materializa directamente. No se puede quitar con
+ * `.omit()` porque el esquema compartido lleva un `superRefine` de objeto —el que comprueba que
+ * el índice de cada pregunta apunta dentro de la lista de hallazgos— y eso lo convierte en un
+ * `ZodEffects`, que ya no expone la forma. Y ese refinamiento es justo el que hay que conservar.
+ *
+ * Así que el campo se RELLENA antes de validar, con un valor que nadie lee: la materialización
+ * escribe síntesis, hallazgos, citas y preguntas, y la confianza vive en la propuesta, que aquí
+ * no existe. El contrato sigue siendo uno.
+ */
+export const EscribirRevisionAManoSchema = z.object({
+  workspaceId: z.string().uuid(),
+  conceptoId: z.string().uuid(),
+  contenido: z
+    .preprocess(
+      (v) => (typeof v === 'object' && v !== null ? { confianzaPropuesta: 'media', ...v } : v),
+      ContenidoRevisionSimuladaSchema,
+    )
+    /*
+     * UN PASAJE POR DOCUMENTO Y HALLAZGO, y esto SÍ es propio de la ruta manual.
+     *
+     * El enlace materializado tiene clave primaria `(hallazgo_id, evidencia_id)`: dos citas del
+     * mismo documento en el mismo hallazgo son una sola fila, y se guarda el pasaje de la
+     * primera. Para una revisión PROPUESTA eso no pierde nada —el contenido de la propuesta es
+     * inmutable por SYS-17 y las lleva todas, y el guard de materialización cuenta enlaces
+     * contra documentos DISTINTOS justo por esto—. Una revisión escrita a mano no tiene ese
+     * respaldo: el segundo pasaje se escribía, se mandaba, y desaparecía en el refresco.
+     *
+     * Medido antes de cerrarlo, con dos fragmentos de la misma entrevista:
+     *
+     *   CITAS QUE SOBREVIVEN: [{ fragmento: 'No entrego la cédula', … }]   ← sólo la primera
+     *
+     * Hasta la ronda anterior era un límite que nadie podía tocar, porque el formulario sólo
+     * ofrecía UNA cita por hallazgo; volverlas repetibles convirtió un empobrecimiento acotado
+     * en una pérdida silenciosa y alcanzable. Así que el contrato de esta ruta pide lo que esta
+     * ruta puede guardar: un documento por hallazgo. La alternativa —que el enlace admita varias
+     * filas por documento— rehace la clave primaria y con ella la comprobación del sello, que
+     * hoy es correcta; queda dicha aquí por si el límite llega a apretar.
+     *
+     * Va aquí y no en el contrato compartido a propósito: aquél gobierna también lo que el
+     * proveedor puede devolver, y para él las dos citas siguen siendo legítimas.
+     */
+    .superRefine((c, ctx) => {
+      c.hallazgos.forEach((h, i) => {
+        const documentos = h.citas.map((x) => x.evidenciaId);
+        if (new Set(documentos).size !== documentos.length) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['hallazgos', i, 'citas'],
+            message:
+              'un hallazgo escrito a mano cita cada documento UNA vez: el enlace guarda un pasaje por documento, y una revisión sin propuesta detrás no tiene de dónde recuperar los demás — elige el pasaje que mejor lo sostiene, o abre otro hallazgo',
+          });
+        }
+      });
+    }),
+});
+/*
+ * El TIPO deja fuera `confianzaPropuesta` aunque el validador la rellene: `z.infer` describe lo
+ * que sale del esquema, y lo que hace falta aquí es lo que hay que META. Sin esto, el compilador
+ * pediría a quien escribe a mano un campo que el propio esquema se inventa.
+ */
+export type EscribirRevisionAMano = Omit<
+  z.infer<typeof EscribirRevisionAManoSchema>,
+  'contenido'
+> & {
+  contenido: Omit<z.infer<typeof EscribirRevisionAManoSchema>['contenido'], 'confianzaPropuesta'>;
+};
 
 export class ErrorGobernanza extends Error {}
 
@@ -417,8 +509,19 @@ export async function gobernanzaDeProyecto(
               join segmento s on s.id = asg.segmento_id and s.workspace_id = asg.workspace_id
               where asg.arquetipo_id = a.id and asg.workspace_id = a.workspace_id
             ), '[]'::jsonb),
+            /*
+             * Con «citable», que es lo que hace que el formulario manual no dependa del selector
+             * general de evidencias. Aquél se corta en las 200 más recientes del workspace, así
+             * que una lente sostenida por documentos más antiguos daba una intersección VACÍA y
+             * quien escribía a mano no podía citar nada — con la única salida aparente de
+             * marcar el hallazgo como hipótesis, o sea mentir sobre su clase.
+             *
+             * Aquí no hay corte: esta lista es la del arquetipo, entera. Y el permiso se
+             * pregunta donde vive, para que la pantalla ofrezca lo que de verdad se puede citar.
+             */
             'evidencias', coalesce((
-              select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo)
+              select jsonb_agg(jsonb_build_object('id', e.id, 'titulo', e.titulo,
+                       'citable', evidencia_usable(e.id, e.workspace_id, 'cliente'))
                 order by e.titulo)
               from arquetipo_evidencia ae
               join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
@@ -459,13 +562,142 @@ export async function gobernanzaDeProyecto(
         -- —son dos escrituras del mismo acto—, así que filtrar por «candidato» dejaría fuera
         -- exactamente el caso normal. Cuál de ellos tiene ya su decisión lo dice la pantalla
         -- con lo que ya tiene: «decisiones» trae su «conceptoId».
+        --
+        -- Y CON SUS REVISIONES SIMULADAS ACEPTADAS DENTRO. Iban a ninguna parte: C4 las
+        -- escribía y el panel de propuestas solo pinta lo que sigue en «estado = propuesta»,
+        -- así que en cuanto se aceptaban desaparecían de la única pantalla que las mostraba.
+        -- Las preguntas de test son lo único que una simulación le entrega a la etapa 4
+        -- (RF-08.2), y quien decide el pasa/muere es exactamente quien tiene que leerlas.
+        --
+        -- Va en la MISMA sentencia que los conceptos por lo de siempre: quien elige el concepto
+        -- y quien lee sus revisiones tienen que mirar la misma foto.
         coalesce((
-          select jsonb_agg(jsonb_build_object('id', c.id, 'titulo', c.titulo,
-                                              'estado', c.estado)
+          select jsonb_agg(jsonb_build_object(
+                   'id', c.id, 'titulo', c.titulo, 'estado', c.estado,
+                   'revisiones', coalesce((
+                     select jsonb_agg(jsonb_build_object(
+                              'id', r.id,
+                              -- El ID de la lente y no sólo su nombre: el formulario de a mano
+                              -- necesita saber cuáles ya revisaron ESTE concepto para no
+                              -- ofrecerlas, porque «unique (concepto_id, arquetipo_id)» las
+                              -- rechaza después de haberlo escrito todo.
+                              'arquetipoId', a.id,
+                              'arquetipoNombre', a.nombre,
+                              'arquetipoEstado', a.estado,
+                              'sintesis', r.sintesis,
+                              'propuestaAiId', r.propuesta_ai_id,
+                              'hallazgos', coalesce((
+                                select jsonb_agg(jsonb_build_object(
+                                         'id', h.id, 'titulo', h.titulo,
+                                         'descripcion', h.descripcion,
+                                         'esHipotesis', h.es_hipotesis,
+                                         -- EL FRAGMENTO Y DÓNDE, no solo el título.
+                                         --
+                                         -- La tarjeta de la propuesta pendiente enseña «cita»
+                                         -- entera; al aceptar solo quedaba «se apoya en <doc>»,
+                                         -- y con eso quien firma el pasa/muere no puede ver qué
+                                         -- pasaje sostiene el hallazgo.
+                                         --
+                                         -- El testimonio vive en el «contenido» de la propuesta,
+                                         -- inmutable por SYS-17, y de ahí se lee: el enlace
+                                         -- materializado guarda el pasaje pero su clave es
+                                         -- «(hallazgo_id, evidencia_id)», así que dos citas del
+                                         -- MISMO documento dentro de un hallazgo colapsan en una
+                                         -- fila y el contenido conserva las dos.
+                                         --
+                                         -- «orden» ES el índice del hallazgo en ese contenido
+                                         -- (lo escribe la materialización), que es lo que
+                                         -- permite bajar al array de citas del hallazgo justo.
+                                         --
+                                         -- Y SE LEE POR FUNCIÓN, no de la tabla. Las dos que
+                                         -- guardan pasajes están cerradas —el enlace por
+                                         -- «material_evidencia_visible», la propuesta por rol,
+                                         -- porque su contenido guarda el texto literal y una
+                                         -- columna no se puede recortar con RLS— y esta
+                                         -- pantalla la lee quien firma el pasa/muere, que puede
+                                         -- no tener ninguno de los dos permisos. La función
+                                         -- recorta el TEXTO y deja la cita: sin ella la cita
+                                         -- desaparecía entera, que dice algo distinto y falso
+                                         -- —que el hallazgo nunca tuvo sostén—.
+                                         'citas', coalesce(
+                                           (select jsonb_agg(jsonb_build_object(
+                                                     'evidenciaTitulo', cp.evidencia_titulo,
+                                                     'fragmento', cp.fragmento,
+                                                     'localizacion', cp.localizacion,
+                                                     'citable', cp.citable)
+                                                   order by cp.ord)
+                                              from citas_de_hallazgo_en_propuesta(
+                                                     r.propuesta_ai_id, r.workspace_id, h.orden) cp
+                                               -- Y SOLO LAS QUE SIGUEN ENLAZADAS. El contenido
+                                               -- es inmutable (SYS-17) y por eso guarda el
+                                               -- pasaje, pero no es la lista viva: quitar una
+                                               -- cita de una revisión aceptada —el borrado del
+                                               -- enlace SÍ está concedido, y es lo que se hace
+                                               -- cuando su derecho se retira— no lo toca. Sin
+                                               -- este cruce, el pasaje retirado se seguía
+                                               -- enseñando como sostén actual delante de quien
+                                               -- firma el pasa/muere.
+                                             where exists (
+                                               select 1 from citas_materializadas_del_hallazgo(
+                                                             h.id, h.workspace_id) hv
+                                                where hv.evidencia_id = cp.evidencia_id)),
+                                           -- Y la escrita a mano (SYS-21), que no tiene
+                                           -- propuesta detrás: el enlace es todo lo que hay, y
+                                           -- por eso el enlace GUARDA el pasaje. Antes esta
+                                           -- rama lo daba por perdido —«fragmento null»— y la
+                                           -- cita quedaba reducida al título del documento en
+                                           -- cuanto se refrescaba: lo contrastable, que es para
+                                           -- lo que existe una cita, se borraba solo.
+                                           --
+                                           -- Por la MISMA función que el cruce de arriba, que
+                                           -- es la que recorta: dos ramas y una sola redacción
+                                           -- de «el pasaje sólo si el documento sigue pudiendo
+                                           -- citarse».
+                                           (select jsonb_agg(jsonb_build_object(
+                                                     'evidenciaTitulo', hm.evidencia_titulo,
+                                                     'fragmento', hm.fragmento,
+                                                     'localizacion', hm.localizacion,
+                                                     'citable', hm.citable)
+                                                   order by hm.evidencia_titulo)
+                                              from citas_materializadas_del_hallazgo(
+                                                     h.id, h.workspace_id) hm),
+                                           '[]'::jsonb))
+                                       order by h.orden)
+                                from hallazgo_simulado h
+                                where h.revision_id = r.id and h.workspace_id = r.workspace_id
+                              ), '[]'::jsonb),
+                              'preguntas', coalesce((
+                                select jsonb_agg(jsonb_build_object(
+                                         'id', q.id, 'pregunta', q.pregunta,
+                                         'escenario', q.escenario,
+                                         -- Puede ser null, y por eso no va en jsonb_strip_nulls
+                                         -- ni en un coalesce: «de ningún hallazgo» es un valor.
+                                         'hallazgoId', q.hallazgo_id)
+                                       order by q.orden)
+                                from pregunta_de_test q
+                                where q.revision_id = r.id and q.workspace_id = r.workspace_id
+                              ), '[]'::jsonb))
+                            order by a.nombre)
+                     from revision_simulada r
+                     join arquetipo a on a.id = r.arquetipo_id and a.workspace_id = r.workspace_id
+                     where r.concepto_id = c.id and r.workspace_id = c.workspace_id
+                   ), '[]'::jsonb))
                    order by c.titulo)
           from concepto c
           where c.reto_id = p.reto_id and c.workspace_id = p.workspace_id
-        ), '[]'::jsonb) as conceptos
+        ), '[]'::jsonb) as conceptos,
+        -- Y SI LA ETAPA 4 SIGUE ADMITIENDO TRABAJO, que es la otra mitad de la misma foto.
+        --
+        -- Las políticas de la revisión simulada piden concepto «candidato» Y
+        -- «reto_admite_conceptos(...)»: son dos puertas, y la pantalla sólo llevaba una. Con G4
+        -- aprobado —o el reto archivado— un concepto se queda candidato sin que nada lo mueva,
+        -- así que el formulario lo ofrecía y el borrado también, y las dos operaciones morían
+        -- después de que alguien lo hubiera escrito todo.
+        --
+        -- Va aquí y en la MISMA sentencia por lo que ya dice la nota de los conceptos: el
+        -- formulario que los ofrece y la validación que los exige tienen que mirar la misma
+        -- foto. Es del reto y no del concepto, así que es un campo del proyecto y no de cada uno.
+        reto_admite_conceptos(p.reto_id, p.workspace_id) as etapa_admite_conceptos
       from proyecto p
       where p.id = ${proyectoId} and p.workspace_id = ${workspaceId}`;
     if (!fila) return null;
@@ -475,6 +707,94 @@ export async function gobernanzaDeProyecto(
       reaperturas: fila.reaperturas as GobernanzaDeProyecto['reaperturas'],
       segmentosDisponibles: fila.segmentos_disponibles as GobernanzaDeProyecto['segmentosDisponibles'],
       conceptos: fila.conceptos as GobernanzaDeProyecto['conceptos'],
+      etapaAdmiteConceptos: fila.etapa_admite_conceptos as boolean,
     };
+  });
+}
+
+/**
+ * ESCRIBIR UNA REVISIÓN SIMULADA A MANO — la paridad que SYS-21 exige para C4.
+ *
+ * «Caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre presentes», y el
+ * criterio 3 de SPEC-08 lo lleva a CI. Las cinco capacidades hermanas ya tenían su ruta manual
+ * en su propio servicio de dominio; C4 era la única cuyas tablas sólo escribía la
+ * materialización, así que las concesiones y las políticas que la base tiene puestas para
+ * admitir una revisión a mano —el sello de procedencia en null para siempre— no las podía
+ * ejercer nadie desde la pantalla.
+ *
+ * Escribe por la MISMA función que la aceptación de una propuesta, no por una copia: lo que
+ * hace legítima a una revisión no depende de quién la escribió. Lo que no comparten es lo que
+ * de verdad las distingue — aquélla compara el veredicto y la huella del material y estampa el
+ * sello; ésta no tiene material que comparar y su sello se queda en null.
+ *
+ * Todo lo demás lo sigue diciendo la base, y por eso no se repite aquí: que el concepto siga
+ * siendo candidato y su etapa abierta, que la lente sea un arquetipo NO REFUTADO del reto del
+ * concepto, que una lente lea un concepto una sola vez, que cada hallazgo afirmativo cite
+ * evidencia utilizable de esa lente, y que la revisión no nazca vacía.
+ */
+export async function escribirRevisionAMano(
+  actorId: string,
+  entrada: EscribirRevisionAMano,
+): Promise<{ revisionId: string }> {
+  return conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    try {
+      const revisionId = await escribirRevisionSimulada(
+        tx,
+        actorId,
+        entrada.workspaceId,
+        entrada.conceptoId,
+        entrada.contenido,
+      );
+      return { revisionId };
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      // 23505: `unique (concepto_id, arquetipo_id)` — esa lente ya leyó este concepto (SYS-20).
+      if (code === '23505') {
+        throw new ErrorGobernanza(
+          'Esa lente ya tiene una revisión de este concepto: de un arquetipo hay una sola lectura por concepto (SYS-20). Bórrala y escribe la buena, o elige otra lente',
+        );
+      }
+      // 42501: la política de inserción — o no curas, o el concepto ya no es candidato, o su
+      // etapa cerró, o el arquetipo no es una lente vigente de su reto.
+      if (code === '42501') {
+        throw new ErrorGobernanza(
+          'No puedes escribir esa revisión: o no eres curador, o el concepto ya no es candidato, o su etapa 4 está cerrada, o esa lente no es un arquetipo vigente del reto del concepto',
+        );
+      }
+      throw e;
+    }
+  });
+}
+
+/**
+ * Y BORRARLA, que es la otra mitad de la ruta manual — y la que el propio mensaje de error
+ * prometía sin que existiera.
+ *
+ * «Corregir una revisión es borrarla y escribir la buena» es la decisión que este módulo tomó
+ * cuando le puso a `revision_simulada` una política de DELETE y ningún UPDATE: las hojas son
+ * inmutables a propósito, y una errata o una pregunta que sobra no se editan, se rehacen. Sin
+ * una función que ejerza ese DELETE, la primera revisión escrita a mano era irreversible desde
+ * la aplicación — y `unique (concepto_id, arquetipo_id)` impedía además escribir la sustituta.
+ *
+ * Lo que se puede borrar lo sigue diciendo la base, no esta función: mientras el concepto sea
+ * candidato y su etapa siga abierta. Una revisión SELLADA por una propuesta también se borra —
+ * es como se corrige lo aceptado, y su trigger suelta el puntero de la propuesta—, y el hecho
+ * no se pierde: vive en `evento_dominio`.
+ */
+export async function borrarRevisionAMano(
+  actorId: string,
+  entrada: { workspaceId: string; revisionId: string },
+): Promise<void> {
+  await conUsuario(actorId, async (tx) => {
+    await exigirCuentaActiva(tx, actorId);
+    const filas = await tx`delete from revision_simulada
+      where id = ${entrada.revisionId} and workspace_id = ${entrada.workspaceId}
+      returning id`;
+    if (filas.length === 0) {
+      throw new ErrorGobernanza(
+        'No puedes borrar esa revisión: o no eres curador, o el concepto ya no es candidato, o su etapa 4 está cerrada — una vez firmado el pasa/muere, lo que se leyó para decidir se queda',
+      );
+    }
   });
 }

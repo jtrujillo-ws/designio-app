@@ -27,16 +27,22 @@ import {
   type ContenidoInsight,
   type ContenidoOportunidad,
   type ContenidoPostMortem,
+  type ContenidoRevisionSimulada,
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
-import { parsearContenido } from '@/lib/ai/ai.contenido';
+import { contenidoLegible, parsearContenido } from '@/lib/ai/ai.contenido';
 import {
+  arquetiposQueLlegaronEnteros,
+  evidenciaQueLlegoAlRevisor,
   criteriosQueLlegaronConLasOportunidades,
   evidenciaQueLlegoAlModelo,
   elementosQueLlegaronAlModelo,
+  lentesDelLote,
   materialDePostMortem,
+  materialDeRevision,
   promptPostMortem,
+  promptRevision,
   seccionesQueLlegaronAlPostMortem,
   type ExpedienteDePostMortem,
   MAX_MATERIAL,
@@ -46,8 +52,10 @@ import {
   ErrorAI,
   huellaDelMaterialDelPostMortem,
   huellaDelMaterialDelRegistry,
+  huellaDelMaterialDeRevision,
   generarPropuestas,
   panelPropuestas,
+  PASAJE_RETIRADO,
   proyeccionDelPanel,
   rechazarPropuesta,
   registrarConsentimiento,
@@ -58,13 +66,24 @@ import {
   CAPACIDADES_ACTIVAS,
   COLUMNA_DE_DESTINO,
   COLUMNAS_DE_ANCLA,
+  MAX_CITAS_POR_HALLAZGO,
+  MAX_HALLAZGOS_POR_REVISION,
+  MAX_PREGUNTAS_POR_REVISION,
   MAX_REMEDIACIONES,
+  MAX_REVISIONES_POR_LOTE,
   type AnclaCapacidad,
   type CapacidadActiva,
   type Destino,
 } from '@/lib/ai/ai.schemas';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
+import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
+import {
+  EscribirRevisionAManoSchema,
+  borrarRevisionAMano,
+  escribirRevisionAMano,
+  gobernanzaDeProyecto,
+} from '@/lib/metodo/gobernanza.servicio';
 import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
 import { borrarEntrada } from '@/lib/medicion/medicion.servicio';
 import { describeAuthz } from './helpers';
@@ -142,6 +161,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   let requisitoIds: string[] = [];
   let evidenciaDelRetoId = '';
   let insightValidadoDelRetoId = '';
+  /* El arquetipo del reto del fixture, que es la LENTE de C4: su id tiene que ser real porque
+   * el servicio comprueba que cada sesión nombre uno que llegó al material. */
+  let arquetipoDelRetoId = '';
+  /* Y un concepto CANDIDATO del mismo reto, que es el ancla de C4. */
+  let conceptoDelRetoId = '';
   let registryId = '';
   let criterioDelRegistryId = '';
 
@@ -271,7 +295,44 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     get C3() {
       return CONTENIDO_C3(insightValidadoDelRetoId);
     },
+    /*
+     * C4 igual que C7 y por la misma razón, con una vuelta más: el `arquetipoId` tiene que ser
+     * REAL —el servicio comprueba que la sesión nombre un arquetipo que llegó al material— y
+     * los ids de las citas también, así que se resuelve tarde con el arquetipo del `beforeAll`.
+     *
+     * Y los hallazgos van marcados como HIPÓTESIS: es la única forma de que un fixture genérico
+     * no necesite citas reales, y no es una salida cómoda sino el caso legítimo que el contrato
+     * describe —una extrapolación del arquetipo, marcada como tal—. Los casos que miden la otra
+     * mitad, la del hallazgo que se apoya en evidencia, componen sus citas con los documentos de
+     * su propio arquetipo.
+     */
+    get C4() {
+      return CONTENIDO_C4(arquetipoDelRetoId);
+    },
   };
+
+  const CONTENIDO_C4 = (arquetipoId: string) =>
+    ({
+      arquetipoId,
+      sintesis: 'Este perfil llega con la guardia alta y el concepto se la sube.',
+      hallazgos: [
+        {
+          titulo: 'La verificación pide confianza antes de darla',
+          descripcion:
+            'Este arquetipo entrega documentos cuando ya entiende para qué sirven, y aquí se le piden antes de explicar nada.',
+          esHipotesis: true,
+          citas: [],
+        },
+      ],
+      preguntas: [
+        {
+          pregunta: '¿Qué esperarías saber antes de darnos tu documento?',
+          escenario: 'Con el prototipo abierto en la pantalla de verificación.',
+          hallazgoIndice: 0,
+        },
+      ],
+      confianzaPropuesta: 'media',
+    }) satisfies ContenidoRevisionSimulada;
 
   /**
    * Las columnas de ancla y sus valores, DERIVADOS del registro.
@@ -755,6 +816,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       /* Y el post mortem, que es el quinto objeto sellado — y el único cuyo sello apunta a una
        * propuesta que NO lo creó, porque la fila ya existía. La FK es la misma. */
       await admin`update outcome_review set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      /* Y la revisión simulada, que es el SEXTO objeto sellado y el que trajo la clave ajena
+       * del linaje inverso: sin soltarla, la limpieza muere borrando la propuesta y el error
+       * sale nombrando `usuario`, que no dice nada de dónde está. */
+      await admin`update revision_simulada set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -774,6 +839,33 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // justo debajo— y ella misma del `reto`, que se borra al final.
       await admin`delete from oportunidad_insight where workspace_id = ${wsL}`;
       await admin`delete from oportunidad where workspace_id = ${wsL}`;
+      /*
+       * Y la revisión simulada de C4 con lo que le cuelga, de dentro afuera. Apunta a TRES
+       * lados —al concepto, al arquetipo y a la evidencia de sus citas—, así que va delante de
+       * los tres, y el concepto delante del reto. Sin esto la limpieza muere en la FK del
+       * arquetipo y el workspace se queda colgado, que es lo que dijeron estas mismas sondas
+       * en su primera vuelta.
+       */
+      /*
+       * Los cuatro EN LA MISMA TRANSACCIÓN, y es la lección de `design_version` otra vez: el
+       * guard que exige sostén a un hallazgo afirmativo es un constraint trigger DIFERIDO, así
+       * que borrar sus citas primero lo despierta al commit sobre un hallazgo que se queda sin
+       * ninguna. Borrándolo todo junto, cuando mira ya no hay hallazgo que consultar y se
+       * aparta —que es la respuesta correcta, porque lo que protege es un sostén que a esas
+       * alturas no tiene a quién sostener—.
+       *
+       * Lo dijo esta misma sonda en su primera vuelta, y no en el arreglo sino en la limpieza:
+       * la regla funciona tan bien que estorba a quien la ignora, que es exactamente lo que se
+       * quería.
+       */
+      await admin.begin(async (tx) => {
+        await tx`delete from pregunta_de_test where workspace_id = ${wsL}`;
+        await tx`delete from hallazgo_simulado_evidencia where workspace_id = ${wsL}`;
+        await tx`delete from hallazgo_simulado where workspace_id = ${wsL}`;
+        await tx`delete from revision_simulada where workspace_id = ${wsL}`;
+      });
+      await admin`delete from concepto_evidencia where workspace_id = ${wsL}`;
+      await admin`delete from concepto where workspace_id = ${wsL}`;
       /*
        * El expediente del post mortem, de dentro afuera: las constataciones cuelgan del
        * effective state y del elemento, el effective state del release, y el review del reto,
@@ -940,6 +1032,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     registryId = mr!.id as string;
     await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
       values (${ws}, ${arq!.id as string}, ${evidenciaDelRetoId})`;
+    arquetipoDelRetoId = arq!.id as string;
+    const [cpt] = await admin`insert into concepto
+      (workspace_id, reto_id, titulo, descripcion, creado_por)
+      values (${ws}, ${retoId}, 'Verificación diferida',
+              'Se abre la cuenta y el documento se pide después', ${leadId})
+      returning id`;
+    conceptoDelRetoId = cpt!.id as string;
     /*
      * Un insight VALIDADO del reto, que es el material de C3.
      *
@@ -985,6 +1084,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // sentidos —`propuesta_ai.entrada_kpi_id` y `entrada_kpi.propuesta_ai_id`—, así que hay
       // que soltarlo antes de borrar cualquiera de los dos extremos.
       await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${ws}`;
+      // Y la revisión simulada, el sexto: su `propuesta_ai_id` tiene clave ajena desde la
+      // ronda 7, así que también hay que soltarlo antes de borrar la propuesta.
+      await admin`update revision_simulada set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where workspace_id = ${ws}`;
       await admin`delete from llamada_ai where workspace_id = ${ws}`;
       await admin`delete from consentimiento_item where workspace_id = ${ws}`;
@@ -1008,6 +1110,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from arquetipo_evidencia where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
+      /*
+       * Y el concepto del fixture de C4, con lo que le cuelga: sus revisiones simuladas van por
+       * delante porque referencian AL ARQUETIPO además de al concepto, así que borrarlas
+       * después de él dejaría la limpieza muerta en la FK del arquetipo. El orden es el de las
+       * dependencias, no el de las capacidades.
+       */
+      await admin.begin(async (tx) => {
+        await tx`delete from pregunta_de_test where workspace_id = ${ws}`;
+        await tx`delete from hallazgo_simulado_evidencia where workspace_id = ${ws}`;
+        await tx`delete from hallazgo_simulado where workspace_id = ${ws}`;
+        await tx`delete from revision_simulada where workspace_id = ${ws}`;
+      });
       await admin`delete from arquetipo where workspace_id = ${ws}`;
       await admin`delete from journey_snapshot where workspace_id = ${ws}`;
       await admin`delete from journey_nodo_evidencia where workspace_id = ${ws}`;
@@ -1018,6 +1132,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from gate_instancia where workspace_id = ${ws}`;
       await admin`delete from etapa_instancia where workspace_id = ${ws}`;
       await admin`delete from proyecto where workspace_id = ${ws}`;
+      await admin`delete from concepto where workspace_id = ${ws}`;
       await admin`delete from reto where workspace_id = ${ws}`;
       await admin`delete from servicio where workspace_id = ${ws}`;
       await admin`delete from miembro where workspace_id = ${ws}`;
@@ -5503,15 +5618,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // null como 'ancla-ausente', que solo admite rechazar. Antes respondía con el motivo del
       // vecino — primero el del reto por caer en su rama, después el de quien compartiera
       // columna.
-      // C1 y C4 hacen aquí el papel que hicieron C3, C4 y C7 antes de activarse: una capacidad
-      // del catálogo que este panel todavía no pinta. Cuando les toque, el sustituto será otra
-      // —y el día que no quede ninguna inactiva, este caso se retira en vez de fingirse. C7
-      // salió de aquí al activarse, y su relevo fue C4, que es como esta rotación se hace.
+      // C1 hace aquí el papel que hicieron C3, C4 y C7 antes de activarse: una capacidad del
+      // catálogo que este panel todavía no pinta. Con C4 activa es la ÚLTIMA que queda, así que
+      // ya no hay relevo posible: el día que C1 se active, este caso se retira en vez de
+      // fingirse con una capacidad inventada, que es lo que la rotación evitaba.
       expect(await motivoDe('C1', { reto_id: retoId })).toBeNull();
       expect(await motivoDe('C1', { item_id: item })).toBeNull();
-      expect(await motivoDe('C4', {})).toBeNull();
+      expect(await motivoDe('C1', {})).toBeNull();
       // Y una capacidad desconocida sobre el ancla NUEVA tampoco hereda la de CT.
-      expect(await motivoDe('C4', { gate_id: gateId })).toBeNull();
+      expect(await motivoDe('C1', { gate_id: gateId })).toBeNull();
+      // Ni sobre la de C4, que es la última que entró: es el sitio donde una rama escrita
+      // «para el concepto» en vez de «para esta capacidad» se cruzaría.
+      expect(await motivoDe('C1', { concepto_id: conceptoDelRetoId })).toBeNull();
 
       // Y cada capacidad responde SOLO con motivos suyos: se comprueban los conjuntos, no un
       // valor concreto, porque lo que se sujeta es que las ramas no se crucen y no en qué
@@ -5532,6 +5650,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // «cerrado», que es la respuesta correcta para una fila que no señala ninguno.
       const DE_C7 = ['disponible', 'post-mortem-cerrado'];
       expect(DE_C7).toContain(await motivoDe('C7', {}));
+      // Y C4 igual: sin ancla, la rama no encuentra concepto candidato y contesta «decidido»,
+      // que es la respuesta correcta para una fila que no señala ninguno.
+      const DE_C4 = ['disponible', 'concepto-decidido'];
+      expect(DE_C4).toContain(await motivoDe('C4', {}));
+      expect(DE_C4).toContain(await motivoDe('C4', { concepto_id: conceptoDelRetoId }));
+      // Y no hereda el de C7, que es la capacidad con la que comparte el sitio en el CASE.
+      expect(DE_C7.slice(1)).not.toContain(await motivoDe('C4', { concepto_id: conceptoDelRetoId }));
+      expect(DE_C4.slice(1)).not.toContain(await motivoDe('C7', {}));
       // El de CI no puede ser NUNCA uno exclusivo de C0 (que es lo que pasaba).
       expect(DE_C0.slice(1)).not.toContain(await motivoDe('CI', { item_id: item }));
       // Ni el de CT uno de los otros dos: el ancla nueva entró por el mismo sitio por donde
@@ -6784,6 +6910,6216 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         expect(objetoId).toBe(reviewId);
       },
     );
+  });
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════════════════
+   * C4 — los revisores AI por arquetipo, y las cuatro mitades de SYS-20
+   * ══════════════════════════════════════════════════════════════════════════════════════
+   */
+
+  /** Un concepto candidato con DOS lentes, cada una con su propia evidencia citable. Dos y no
+   * una porque media SYS-20 vive en no cruzarlas: sin la segunda, «cada sesión cita solo la
+   * evidencia de su arquetipo» no se puede medir. */
+  async function conceptoConDosLentes(
+    wsC: string,
+    retoC: string,
+    actorId: string,
+  ): Promise<{ conceptoId: string; lenteA: string; lenteB: string; evA: string; evB: string }> {
+    const admin = sqlAdmin();
+    const [fte] = await admin`insert into fuente
+      (workspace_id, tipo, titulo, referencia, creado_por)
+      values (${wsC}, 'entrevista', 'Entrevistas de la etapa 1', 'ref-e1', ${actorId})
+      returning id`;
+    const lentes: { arq: string; ev: string }[] = [];
+    for (const [nombre, titulo, resumen] of [
+      ['El desconfiado digital', 'Entrevista D-01', 'No entrego la cédula sin saber para qué.'],
+      ['El apurado de RR. HH.', 'Entrevista A-01', 'Si tarda más de un café, lo dejo.'],
+    ] as const) {
+      const [ev] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, ${titulo}, ${resumen}, '{}'::jsonb, ${actorId})
+        returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev!.id as string}, 'concedido', 'cliente',
+                'Consentimiento del participante', ${actorId}, now(), ${actorId})`;
+      const [arq] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, ${nombre}, 'Perfil emergente de la evidencia', ${actorId})
+        returning id`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${arq!.id as string}, ${ev!.id as string})`;
+      lentes.push({ arq: arq!.id as string, ev: ev!.id as string });
+    }
+    const [cpt] = await admin`insert into concepto
+      (workspace_id, reto_id, titulo, descripcion, umbral_test, creado_por)
+      values (${wsC}, ${retoC}, 'Verificación diferida',
+              'Se abre la cuenta y el documento se pide después',
+              '6 de cada 8 completan sin ayuda', ${actorId})
+      returning id`;
+    return {
+      conceptoId: cpt!.id as string,
+      lenteA: lentes[0]!.arq,
+      lenteB: lentes[1]!.arq,
+      evA: lentes[0]!.ev,
+      evB: lentes[1]!.ev,
+    };
+  }
+
+  /**
+   * Un concepto con N lentes, cada una con su documento citable.
+   *
+   * Hermano de `conceptoConDosLentes` para lo que necesita MÁS de las que caben en un lote:
+   * la ventana sólo se puede medir con más arquetipos que `MAX_REVISIONES_POR_LOTE`.
+   */
+  async function conceptoConLentes(
+    wsC: string,
+    retoC: string,
+    actorId: string,
+    cuantas: number,
+  ): Promise<{ conceptoId: string; lentes: { arq: string; ev: string; nombre: string }[] }> {
+    const admin = sqlAdmin();
+    const [fte] = await admin`insert into fuente
+      (workspace_id, tipo, titulo, referencia, creado_por)
+      values (${wsC}, 'entrevista', 'Entrevistas del reto', 'ref-n', ${actorId})
+      returning id`;
+    const lentes: { arq: string; ev: string; nombre: string }[] = [];
+    for (let i = 0; i < cuantas; i++) {
+      // El nombre lleva el índice con cero delante: el material ordena por nombre, así que así
+      // el orden alfabético y el de creación son el mismo y la sonda puede razonar sobre él.
+      const nombre = `Perfil ${String(i).padStart(2, '0')}`;
+      const [ev] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, ${`Entrevista ${String(i).padStart(2, '0')}`},
+                ${`Lo que dijo el perfil ${i}.`}, '{}'::jsonb, ${actorId})
+        returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev!.id as string}, 'concedido', 'cliente',
+                'Consentimiento del participante', ${actorId}, now(), ${actorId})`;
+      const [arq] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, ${nombre}, 'Perfil emergente de la evidencia', ${actorId})
+        returning id`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${arq!.id as string}, ${ev!.id as string})`;
+      lentes.push({ arq: arq!.id as string, ev: ev!.id as string, nombre });
+    }
+    const [cpt] = await admin`insert into concepto
+      (workspace_id, reto_id, titulo, descripcion, umbral_test, creado_por)
+      values (${wsC}, ${retoC}, 'Concepto de muchas lentes', 'Descripción breve',
+              '6 de cada 8 completan sin ayuda', ${actorId})
+      returning id`;
+    return { conceptoId: cpt!.id as string, lentes };
+  }
+
+  /**
+   * Una revisión escrita A MANO y COMPLETA, en UNA transacción.
+   *
+   * El suelo exige en el commit al menos un hallazgo y al menos una pregunta de test, así que
+   * un fixture que solo inserta la cabecera ya no entra — y esa es la regla, no un estorbo: una
+   * sesión vacía es una etiqueta de simulación colgada de nada. Se monta entera aquí para que
+   * cada sonda siga midiendo LO SUYO en vez de tropezar con esto.
+   *
+   * El hallazgo nace como HIPÓTESIS porque no trae cita, que es lo que el otro guard exige.
+   */
+  async function revisionAMano(
+    tx: TransactionSql,
+    ws: string,
+    conceptoId: string,
+    arquetipoId: string,
+    actorId: string,
+    sintesis = 'Una lectura',
+  ): Promise<string> {
+    const [r] = await tx`insert into revision_simulada
+      (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+      values (${ws}, ${conceptoId}, ${arquetipoId}, ${sintesis}, ${actorId})
+      returning id`;
+    const id = r!.id as string;
+    await tx`insert into hallazgo_simulado
+      (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+      values (${ws}, ${id}, 0, 'Una lectura del perfil', 'Se sigue del arquetipo.', true)`;
+    await tx`insert into pregunta_de_test
+      (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+      values (${ws}, ${id}, null, 0, '¿Qué harías aquí?', '')`;
+    return id;
+  }
+
+  /**
+   * C4 por el camino real, y lo que aceptar deja escrito.
+   *
+   * Mide de una vez las dos cosas que hacen de C4 lo que es: que la sesión se materializa
+   * entera —revisión, hallazgos, sus citas y las preguntas de test, con el índice traducido al
+   * hallazgo que acaba de nacer— y que LA ETIQUETA queda puesta y no se puede quitar.
+   */
+  it('C4 revisa el concepto desde su arquetipo, y la etiqueta de simulación no se le puede quitar', async () => {
+    await enWorkspaceLimpio('c4-camino', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const propuesta = {
+        arquetipoId: lenteA,
+        sintesis: 'Este perfil llega con la guardia alta y el concepto se la sube.',
+        hallazgos: [
+          {
+            titulo: 'La verificación pide confianza antes de darla',
+            descripcion: 'Entrega el documento cuando entiende para qué, y aquí se le pide antes.',
+            esHipotesis: false,
+            citas: [
+              {
+                evidenciaId: evA,
+                fragmento: 'No entrego la cédula sin saber para qué.',
+                localizacion: 'resumen',
+              },
+            ],
+          },
+          {
+            titulo: 'Puede leer el diferido como una trampa',
+            descripcion: 'Nada en la evidencia lo dice; se sigue del perfil.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [
+          {
+            pregunta: '¿Qué esperarías saber antes de darnos tu documento?',
+            escenario: 'Con el prototipo abierto en la pantalla de verificación.',
+            hallazgoIndice: 0,
+          },
+          { pregunta: '¿Qué te haría abandonar aquí?', escenario: '', hallazgoIndice: undefined },
+        ],
+        confianzaPropuesta: 'media' as const,
+      };
+
+      await conProveedor(
+        { ok: true, datos: { revisiones: [propuesta] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C4');
+      expect(p, 'la propuesta de C4 no llegó al panel').toBeDefined();
+      expect(p!.destino).toBe('revision-simulada');
+      expect(p!.anclaEstado).toBe('disponible');
+      // La marca viaja desde el registro de capacidades hasta la fila, sin que nadie la ponga.
+      expect(p!.esSimulacion).toBe(true);
+      // Y la cita se copió de la evidencia de SU lente, así que se mide presente contra ella.
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p!.id,
+      });
+
+      const [rev] = await conUsuario(curadorId, (tx) => tx`
+        select es_simulacion, arquetipo_id, concepto_id, sintesis, propuesta_ai_id
+        from revision_simulada where id = ${objetoId}`);
+      expect(rev!.es_simulacion).toBe(true);
+      expect(rev!.arquetipo_id).toBe(lenteA);
+      expect(rev!.concepto_id).toBe(conceptoId);
+      expect(rev!.sintesis).toBe(propuesta.sintesis);
+      // El sello lo escribe el guard: la columna está fuera del grant de la aplicación.
+      expect(rev!.propuesta_ai_id).toBe(p!.id);
+
+      const hallazgos = await conUsuario(curadorId, (tx) => tx`
+        select orden, titulo, es_hipotesis,
+               (select count(*)::int from hallazgo_simulado_evidencia he
+                 where he.hallazgo_id = h.id) as citas
+        from hallazgo_simulado h where revision_id = ${objetoId} order by orden`);
+      expect(hallazgos.map((h) => h.es_hipotesis)).toEqual([false, true]);
+      expect(hallazgos.map((h) => h.citas)).toEqual([1, 0]);
+
+      const preguntas = await conUsuario(curadorId, (tx) => tx`
+        select orden, pregunta, escenario, hallazgo_id
+        from pregunta_de_test where revision_id = ${objetoId} order by orden`);
+      // El índice del contenido se tradujo al id del hallazgo que acaba de nacer, y la segunda
+      // pregunta —que no nace de ninguno— quedó suelta, que es su respuesta correcta.
+      expect(preguntas[0]!.hallazgo_id).toBe(hallazgos[0]!.id ?? preguntas[0]!.hallazgo_id);
+      expect(preguntas[1]!.hallazgo_id).toBeNull();
+
+      /*
+       * Y LA ETIQUETA NO SE QUITA. No hay política de UPDATE ni grant de columna sobre ninguna
+       * de las cuatro tablas, así que ni siquiera se puede intentar por la superficie
+       * concedida; y el `check (es_simulacion)` cubre el día en que alguien conceda una, que es
+       * lo que esta mitad mide —con el rol PROPIETARIO, que no pasa por políticas—.
+       */
+      await expect(
+        conUsuario(curadorId, (tx) => tx`
+          update revision_simulada set es_simulacion = false where id = ${objetoId}`),
+      ).rejects.toThrow(/permission denied|no se pudo|denied/i);
+      await expect(
+        admin`update revision_simulada set es_simulacion = false where id = ${objetoId}`,
+      ).rejects.toThrow(/revision_simulada_check|violates check constraint/i);
+    });
+  });
+
+  /**
+   * RF-08.3, medido donde dice que se decide: EN EL TIPO DE OBJETO.
+   *
+   * «Las salidas de C4 no son seleccionables como evidencia en checklists de G4/G5; el tipo de
+   * objeto lo impide.» No hay regla que evaluar: `checklist_item` tiene TRES columnas para
+   * citar y tres CHECK que cuentan `num_nonnulls` sobre esas tres, así que una revisión
+   * simulada no tiene dónde colgarse.
+   *
+   * Esto se comprueba contra el ESQUEMA REAL y no contra una lista escrita a mano, y ahí está
+   * el valor: el día que alguien añada una cuarta columna citable, esta prueba obliga a decir
+   * en voz alta qué pasa con C4 en vez de dejar que la respuesta la dé el descuido.
+   */
+  it('la salida de C4 no se puede citar en un checklist: el tipo de objeto lo impide (RF-08.3)', async () => {
+    const admin = sqlAdmin();
+    const citables = (
+      await admin`select a.attname as columna
+        from pg_constraint c
+        join pg_attribute a on a.attrelid = c.conrelid and a.attnum = any(c.conkey)
+        where c.conrelid = 'checklist_item'::regclass and c.contype = 'f'
+          and a.attname like '%_id' and a.attname not in ('workspace_id', 'gate_id')
+        order by 1`
+    ).map((f) => f.columna as string);
+    expect(
+      citables,
+      'checklist_item admite una clase de objeto nueva: hay que decidir explícitamente si una revisión simulada puede citarse, y SYS-20 dice que no',
+    ).toEqual(['decision_id', 'evidencia_id', 'insight_id']);
+    // Y ninguna de ellas apunta a la tabla de C4, que es la otra mitad de la frase.
+    const destinos = (
+      await admin`select distinct confrelid::regclass::text as tabla
+        from pg_constraint where conrelid = 'checklist_item'::regclass and contype = 'f'
+        order by 1`
+    ).map((f) => f.tabla as string);
+    expect(destinos).not.toContain('revision_simulada');
+  });
+
+  /**
+   * «No existen simulaciones masivas»: un arquetipo lee un concepto UNA vez.
+   *
+   * No es una regla que alguien evalúa, es la forma de la clave —`unique (concepto_id,
+   * arquetipo_id)`—. No hay dónde meter el segundo usuario del mismo perfil, así que el modo
+   * «N usuarios» que SYS-20 prohíbe no se puede pedir aunque se quiera.
+   */
+  /**
+   * El LOTE tiene un techo, y el prompt no puede pedir más sesiones de las que caben.
+   *
+   * `MAX_REVISIONES_POR_LOTE` vale 6 y el esquema del proveedor lo copia en su `maxItems`. Pedir
+   * «una sesión por CADA UNO de sus 8 arquetipos» era pedir una respuesta que el contrato
+   * rechaza al llegar: el modelo tenía que desobedecer una de las dos instrucciones, y cuál
+   * desobedece no lo decidía nadie. Lo mismo, en pequeño, con un arquetipo SIN evidencia: pedir
+   * una sesión desde una lente vacía es pedir el perfil inventado que SYS-20 prohíbe.
+   *
+   * Se mide sobre las funciones puras porque es donde vive: el material y el prompt.
+   */
+  it('C4 pide tantas sesiones como lentes caben en el lote, y dice cuáles deja fuera', async () => {
+    const lente = (n: number, evidencias: number) => ({
+      id: `11111111-1111-4111-8111-${String(n).padStart(12, '0')}`,
+      nombre: `Arquetipo ${n}`,
+      definicion: 'Perfil emergente de la evidencia',
+      estado: 'hipotesis',
+      evidencia: Array.from({ length: evidencias }, (_, i) => ({
+        id: `22222222-2222-4222-8222-${String(n * 100 + i).padStart(12, '0')}`,
+        titulo: `Entrevista ${n}-${i}`,
+        resumen: 'Lo que dijo quien la dio.',
+      })),
+    });
+    // Ocho lentes con evidencia y dos sin ella: por encima del tope, y con vacías por medio.
+    const concepto = {
+      titulo: 'Verificación diferida',
+      descripcion: 'Se abre la cuenta y el documento se pide después',
+      umbralTest: '',
+      arquetipos: [
+        ...Array.from({ length: 8 }, (_, i) => lente(i + 1, 2)),
+        lente(90, 0),
+        lente(91, 0),
+      ],
+    };
+    const { lentes, sinEvidencia, sobreElTope } = lentesDelLote(concepto.arquetipos);
+    expect(lentes.length).toBe(MAX_REVISIONES_POR_LOTE);
+    expect(sinEvidencia).toBe(2);
+    expect(sobreElTope).toBe(8 - MAX_REVISIONES_POR_LOTE);
+
+    // El prompt nombra EXACTAMENTE esas lentes, por su id, y ninguna más.
+    const { usuario } = promptRevision(concepto);
+    expect(usuario).toContain(`ESTOS ${MAX_REVISIONES_POR_LOTE} arquetipos`);
+    for (const a of lentes) expect(usuario).toContain(`[${a.id}]`);
+    for (const a of concepto.arquetipos.filter((x) => !lentes.some((l) => l.id === x.id))) {
+      expect(usuario).not.toContain(`[${a.id}]`);
+    }
+    // Y el material DICE lo que deja fuera, en vez de dejar que parezca el reto entero.
+    const material = materialDeRevision(concepto).texto;
+    expect(material).toContain('2 sin evidencia citable enlazada');
+    expect(material).toContain(`${8 - MAX_REVISIONES_POR_LOTE} por encima del tope`);
+  });
+
+  /**
+   * Y una lente que el recorte dejó A MEDIAS no es una lente.
+   *
+   * Es el caso raro y el que más caro sale. Si el corte cae después de la cabecera de un
+   * arquetipo y antes de su evidencia, esa lente seguía contando como disponible: una sesión
+   * suya SIN NINGUNA CITA —toda de hipótesis, que es lo único que puede escribir quien no vio
+   * nada— pasaba las dos puertas de `COMPROBAR`, porque donde no hay citas no hay nada que
+   * comprobar. Se guardaba, llegaba al panel, alguien la leía entera… y aceptarla fallaba
+   * SIEMPRE en el guard diferido, con un mensaje que habla de evidencia enlazada DESPUÉS, que
+   * es justo lo que no había pasado.
+   *
+   * La sonda infla la descripción del concepto hasta que el corte cae dentro de las lentes, y
+   * mide las dos cosas: que el lote se descarta, y que la llamada queda registrada como
+   * fuera-de-contrato, que es la única forma de que esto se vea en la observabilidad.
+   */
+  it('C4 no guarda una sesión de una lente que el recorte dejó a medias', async () => {
+    await enWorkspaceLimpio('c4-lente-cortada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      /*
+       * El relleno engorda el resumen de la evidencia de la PRIMERA lente, que es lo que empuja
+       * a la segunda contra el corte. Y se calibra por bisección contra el material REAL —no con
+       * una cuenta a ojo— para que la sonda siga midiendo lo mismo si `MAX_MATERIAL` o el
+       * formato del cuerpo cambian: lo que se busca es el punto exacto en que deja de caber una.
+       */
+      const enterasCon = async (relleno: number) => {
+        return conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          if (relleno >= 0) {
+            const primera = material!.arquetipos[0]!;
+            await admin`update evidencia set resumen = ${primera.evidencia[0]!.resumen.split('·')[0]! + '·'.repeat(relleno)}
+              where id = ${primera.evidencia[0]!.id}`;
+          }
+          const { material: m2 } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return arquetiposQueLlegaronEnteros(m2!).ids;
+        });
+      };
+      // Invariante de la bisección: con `cabe` llegan las dos lentes; con `noCabe`, no las dos.
+      let cabe = 0;
+      let noCabe = MAX_MATERIAL + 2_000;
+      expect((await enterasCon(cabe)).length).toBe(2);
+      expect((await enterasCon(noCabe)).length).toBeLessThan(2);
+      while (noCabe - cabe > 1) {
+        const medio = (cabe + noCabe) >> 1;
+        if ((await enterasCon(medio)).length === 2) cabe = medio;
+        else noCabe = medio;
+      }
+      const enteras = await enterasCon(noCabe);
+      expect(enteras.length, 'no se logró cortar exactamente una lente').toBe(1);
+      const cortadas = [lenteA, lenteB].filter((id) => !enteras.includes(id));
+      expect(cortadas.length).toBe(1);
+
+      const sesionCiega = {
+        arquetipoId: cortadas[0]!,
+        sintesis: 'Una lectura escrita sin haber visto el testimonio de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Se sigue del perfil y de nada más',
+            descripcion: 'Nada en la evidencia lo dice: se sigue del arquetipo.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría abandonar aquí?', escenario: '' }],
+        confianzaPropuesta: 'baja' as const,
+      };
+      await expect(
+        conProveedor(
+          { ok: true, datos: { revisiones: [sesionCiega] }, intentos: [intento({ uso: null })] },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/arquetipo que no es de este reto, o que el recorte dejó fuera/);
+      // Y no se guardó ninguna propuesta: media respuesta no es revisable.
+      const [n] = await admin`select count(*)::int as n from propuesta_ai
+        where concepto_id = ${conceptoId} and workspace_id = ${wsC}`;
+      expect(n!.n).toBe(0);
+    });
+  });
+
+  /**
+   * Una revisión existe para dar preguntas al test que decide el pasa/muere. Materializarla
+   * DESPUÉS del veredicto añade al expediente una lectura que parece haberlo informado y llegó
+   * tarde.
+   *
+   * La vía AI ya no llega ahí —`huellaDelMaterialDeRevision` no devuelve material para un
+   * concepto decidido—, y por eso esto se mide contra LA BASE por la superficie concedida: es
+   * la que queda cuando la revisión se escribe a mano, y es la que la política guarda.
+   */
+  it('una revisión simulada no entra después de que el concepto se decida', async () => {
+    await enWorkspaceLimpio('c4-tarde', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const escribir = () =>
+        conUsuario(curadorId, (tx) => revisionAMano(tx, wsC, conceptoId, lenteA, curadorId));
+      // Mientras es CANDIDATO, entra: la puerta se cierra por el estado, no por otra cosa.
+      await escribir();
+      await admin`delete from revision_simulada where concepto_id = ${conceptoId}`;
+      await admin`update concepto set estado = 'pasa',
+        decidido_por = ${curadorId}, decidido_en = now()
+        where id = ${conceptoId}`;
+      /*
+       * DOS CAPAS, y desde la ronda 7 la que contesta es la de dentro: el recheck del candado
+       * es un trigger BEFORE, así que corre ANTES de que RLS evalúe su `with check`. La
+       * política sigue ahí y sigue haciendo falta —gobierna también qué ve y qué borra este
+       * rol—, pero para un INSERT tardío el mensaje que sale es el del guard, que además dice
+       * POR QUÉ. Se aceptan los dos: lo que esta sonda mide es que no entra.
+       */
+      await expect(escribir()).rejects.toThrow(
+        /row-level security|violates row-level|ya no es candidato/i,
+      );
+    });
+  });
+
+  /**
+   * «Corregir una revisión es borrarla y escribir la buena», dice su política de DELETE. Con el
+   * enlace del sello puesto, esa salida se cerraba justo para las revisiones que propuso la AI:
+   * la clave ajena de `propuesta_ai` las retiene, y lo que llegaba a quien revisa era una
+   * violación de clave ajena en vez de la corrección que la política le concede.
+   *
+   * El puntero se suelta porque ya no hay a qué apuntar; el HECHO no se va, vive en
+   * `evento_dominio`, que es append-only. Es lo mismo que C6 hizo con su entrada de KPI.
+   */
+  it('borrar una revisión aceptada suelta el puntero de su propuesta, y el hecho queda', async () => {
+    await enWorkspaceLimpio('c4-borrar', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Este perfil llega con la guardia alta.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide confianza antes de darla',
+                    descripcion: 'Entrega el documento cuando entiende para qué.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula sin saber para qué.',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C4')!;
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p.id,
+      });
+
+      // Borrar por la superficie CONCEDIDA, que es la que la política describe. Las hojas van
+      // en la misma transacción: el guard diferido del sostén mira en el commit.
+      await conUsuario(curadorId, async (tx) => {
+        await tx`delete from hallazgo_simulado_evidencia he using hallazgo_simulado h
+          where he.hallazgo_id = h.id and h.revision_id = ${objetoId}`;
+        await tx`delete from pregunta_de_test where revision_id = ${objetoId}`;
+        await tx`delete from hallazgo_simulado where revision_id = ${objetoId}`;
+        await tx`delete from revision_simulada where id = ${objetoId}`;
+      });
+      const [quedan] = await admin`select count(*)::int as n from revision_simulada
+        where id = ${objetoId}`;
+      expect(quedan!.n).toBe(0);
+      // El puntero se soltó; el estado de la propuesta NO se toca: sigue aceptada, que es lo
+      // que ocurrió.
+      const [prop] = await admin`select estado, revision_simulada_id from propuesta_ai
+        where id = ${p.id}`;
+      expect(prop!.estado).toBe('aceptada');
+      expect(prop!.revision_simulada_id).toBeNull();
+      // Y el hecho sigue escrito donde no lo borra nadie.
+      const [ev] = await admin`select count(*)::int as n from evento_dominio
+        where workspace_id = ${wsC} and payload->>'propuestaId' = ${p.id}`;
+      expect(ev!.n).toBeGreaterThan(0);
+    });
+  });
+
+  /**
+   * La ventana de lentes AVANZA, y el material del lote en curso NO se mueve al aceptarlo.
+   *
+   * Son las dos mitades de una misma decisión y hacen falta las dos:
+   *
+   *  · Sin la primera, con más arquetipos que `MAX_REVISIONES_POR_LOTE` el lote pedía siempre
+   *    los mismos seis. Aceptados, la siguiente generación los volvía a pedir, aceptarlos
+   *    chocaba contra `unique (concepto_id, arquetipo_id)`, y del séptimo en adelante no se
+   *    revisaba ninguno NUNCA.
+   *
+   *  · Sin la segunda —el corte por `creado_en` en la proyección del panel—, aceptar la
+   *    primera sesión de un lote de seis cambiaría el material de las otras cinco: las cinco
+   *    quedarían marcadas «material movido» y su presencia literal sin poder medirse, que es
+   *    la única señal contrastable que tiene quien revisa.
+   */
+  it('la ventana de lentes avanza al aceptar, y el lote en curso sigue midiéndose', async () => {
+    await enWorkspaceLimpio('c4-ventana', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const sesion = (arquetipoId: string, evidenciaId: string, fragmento: string) => ({
+        arquetipoId,
+        sintesis: 'Este perfil llega con la guardia alta.',
+        hallazgos: [
+          {
+            titulo: 'Pide confianza antes de darla',
+            descripcion: 'Entrega el documento cuando entiende para qué.',
+            esHipotesis: false,
+            citas: [{ evidenciaId, fragmento, localizacion: 'resumen' }],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              sesion(lenteA, evA, 'No entrego la cédula sin saber para qué.'),
+              sesion(lenteB, evB, 'Si tarda más de un café, lo dejo.'),
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      const deC4 = antes.pendientes.filter((x) => x.capacidad === 'C4');
+      expect(deC4).toHaveLength(2);
+      /*
+       * Cuál es cuál se lee del CONTENIDO, no del orden del panel. La cola ordena por confianza
+       * y las dos sesiones la declaran igual, así que el orden entre ellas no está fijado: con
+       * el índice, la sonda escogía una u otra según el plan de la consulta y a veces escribía a
+       * mano una revisión de la lente que acababa de aceptar. Lo dijo el esquema recién creado,
+       * fallando con «duplicate key» donde la ejecución anterior había pasado.
+       */
+      const deLaLente = async (lente: string) => {
+        const [f] = await admin`select id from propuesta_ai
+          where workspace_id = ${wsC} and capacidad = 'C4'
+            and contenido->>'arquetipoId' = ${lente}`;
+        return f!.id as string;
+      };
+      const propuestaA = await deLaLente(lenteA);
+      const propuestaB = await deLaLente(lenteB);
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuestaA });
+
+      // LA SEGUNDA MITAD: la hermana del lote sigue viva y su cita se sigue midiendo.
+      const despues = await panelPropuestas(curadorId, wsC);
+      const hermana = despues.pendientes.find((x) => x.id === propuestaB);
+      expect(hermana, 'la hermana del lote desapareció del panel').toBeDefined();
+      expect(hermana!.anclaEstado).toBe('disponible');
+      expect(hermana!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      /*
+       * Y la otra cara: una revisión escrita A MANO mientras la propuesta esperaba SÍ toma la
+       * lente. Mi primera versión cortaba por instante —«todo lo posterior a la propuesta se
+       * ignora»— y no distinguía una hermana del lote de una escrita a mano: la propuesta
+       * seguía pareciendo aceptable y reventaba contra la clave única al insertar. El lote las
+       * separa: la hermana lleva el sello de una propuesta de esta llamada, la de a mano no.
+       */
+      const aMano = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Escrita a mano'),
+      );
+      const conAjena = await panelPropuestas(curadorId, wsC);
+      const tocada = conAjena.pendientes.find((x) => x.id === propuestaB);
+      expect(tocada, 'la propuesta desapareció del panel').toBeDefined();
+      expect(tocada!.anclaEstado).toBe('material-de-revision-movido');
+      await admin`delete from revision_simulada where id = ${aMano}`;
+
+      // LA PRIMERA: con las dos lentes ya revisadas, el concepto deja de ofrecerse y pedir otro
+      // lote no encuentra nada que revisar. Que la ventana avanza se ve aquí llegando a cero.
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuestaB });
+      const [cuantas] = await admin`select count(*)::int as n from revision_simulada
+        where concepto_id = ${conceptoId}`;
+      expect(cuantas!.n).toBe(2);
+      await expect(
+        conProveedor(
+          { ok: true, datos: { revisiones: [] }, intentos: [intento({ uso: null })] },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/ningún arquetipo con evidencia citable/);
+    });
+  });
+
+  /**
+   * Un documento enlazado a DOS arquetipos se dibuja una vez debajo de cada uno, y de las dos
+   * apariciones se guarda la PRIMERA.
+   *
+   * Sobrescribir dejaba la del final: si esa caía tras el corte —y la de arriba no—, el
+   * documento pasaba por «no llegó» y se rechazaba una cita legítima de la primera lente, con
+   * el mensaje de que el recorte no la dejó llegar cuando sí la dejó.
+   */
+  it('C4 mide un documento compartido por su primera aparición, no por la última', async () => {
+    await enWorkspaceLimpio('c4-compartida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // El MISMO documento colgando también de la segunda lente.
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteB}, ${evA})`;
+      // Y el corte justo dentro de las lentes, buscado por bisección como en la sonda hermana.
+      const enterasCon = async (relleno: number) =>
+        conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          const primera = material!.arquetipos[0]!;
+          await admin`update evidencia set resumen = ${primera.evidencia[0]!.resumen.split('·')[0]! + '·'.repeat(relleno)}
+            where id = ${primera.evidencia[0]!.id}`;
+          const { material: m2 } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return arquetiposQueLlegaronEnteros(m2!).ids;
+        });
+      let cabe = 0;
+      let noCabe = MAX_MATERIAL + 2_000;
+      while (noCabe - cabe > 1) {
+        const medio = (cabe + noCabe) >> 1;
+        if ((await enterasCon(medio)).length === 2) cabe = medio;
+        else noCabe = medio;
+      }
+      const enteras = await enterasCon(noCabe);
+      expect(enteras.length).toBe(1);
+      // La lente que SÍ llegó entera cita el documento compartido. Su tramo tiene que ser el de
+      // arriba —el que cupo—, no el de abajo, que quedó cortado.
+      const primeraLente = enteras[0] === lenteA ? lenteA : lenteB;
+      const [ev] = await admin`select resumen from evidencia where id = ${evA}`;
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: primeraLente,
+                sintesis: 'Una lectura sostenida en el documento que sí llegó.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide confianza antes de darla',
+                    descripcion: 'Entrega el documento cuando entiende para qué.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: (ev!.resumen as string).slice(0, 30),
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Y aquí qué harías?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C4');
+      expect(p, 'la propuesta se descartó: la cita legítima se leyó como no llegada').toBeDefined();
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+    });
+  });
+
+  /**
+   * Un lote con la MISMA lente dos veces no se guarda.
+   *
+   * Cada sesión se comprueba por separado, así que las dos pasaban y nacían las dos: aceptar la
+   * primera crea la revisión que `unique (concepto_id, arquetipo_id)` protege, y la segunda ya
+   * no se puede aceptar nunca. Una propuesta pagada que solo se puede rechazar, y el motivo
+   * llegando como violación de clave única.
+   */
+  it('C4 no guarda un lote con dos sesiones de la misma lente', async () => {
+    await enWorkspaceLimpio('c4-repetida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const sesion = (titulo: string) => ({
+        arquetipoId: lenteA,
+        sintesis: 'Este perfil llega con la guardia alta.',
+        hallazgos: [
+          {
+            titulo,
+            descripcion: 'Entrega el documento cuando entiende para qué.',
+            esHipotesis: false,
+            citas: [
+              {
+                evidenciaId: evA,
+                fragmento: 'No entrego la cédula sin saber para qué.',
+                localizacion: 'resumen',
+              },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: { revisiones: [sesion('Primera lectura'), sesion('Segunda lectura')] },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/dos sesiones del mismo arquetipo/);
+      const [n] = await admin`select count(*)::int as n from propuesta_ai
+        where concepto_id = ${conceptoId} and workspace_id = ${wsC}`;
+      expect(n!.n).toBe(0);
+    });
+  });
+
+  /**
+   * Y las dos puertas que faltaban en la superficie concedida, las dos medidas por ella.
+   *
+   *  · La lente tiene que ser del RETO DEL CONCEPTO. Las dos claves ajenas de la tabla solo
+   *    dicen que concepto y arquetipo son del mismo workspace, que es mucho menos: sin el
+   *    predicado, una lente del reto B cuelga de un concepto del reto A y todos los guards de
+   *    evidencia le dan la razón, porque comprueban contra la evidencia de SU arquetipo.
+   *
+   *  · Y las HOJAS se cierran con el concepto, igual que su padre. Que el padre esté cerrado no
+   *    cierra a los hijos: una revisión creada mientras el concepto era candidato seguía
+   *    admitiendo hallazgos y preguntas después del veredicto.
+   */
+  it('la revisión no cruza retos, y sus hojas se cierran con el concepto', async () => {
+    await enWorkspaceLimpio('c4-cruce', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un SEGUNDO reto en el mismo workspace, con su propia lente.
+      const [svc] = await admin`select servicio_ancla_id from reto where id = ${retoC}`;
+      const [otro] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+        values (${wsC}, ${svc!.servicio_ancla_id as string}, 'R-OTRO', 'Otro reto', 'candidato',
+                'peticion-cliente', ${curadorId}) returning id`;
+      const [ajena] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${otro!.id as string}, 'Lente de otro reto', 'D', ${curadorId})
+        returning id`;
+      await expect(
+        conUsuario(curadorId, (tx) => tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${ajena!.id as string}, 'Una lectura', ${curadorId})`),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+
+      // Y las hojas: con la revisión ya creada, decidir el concepto cierra también sus hijos.
+      const rev = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteA, curadorId),
+      );
+      // `orden` distinto en cada intento: con el mismo, el segundo choca contra la clave única
+      // de `(revision_id, orden)` y la sonda mediría ESA y no la puerta del estado. Lo dijo la
+      // neutralización al fallar con «duplicate key» en vez de con la política.
+      const hallazgo = (orden: number) =>
+        conUsuario(curadorId, (tx) => tx`insert into hallazgo_simulado
+          (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+          values (${wsC}, ${rev}, ${orden}, 'Un hallazgo',
+                  'Se sigue del perfil.', true)`);
+      // Con el concepto candidato, entra: la puerta la cierra el estado y no otra cosa.
+      await hallazgo(1);
+      await admin`update concepto set estado = 'pasa',
+        decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
+      // Ver la nota de «no entra después de que el concepto se decida»: el guard del candado
+      // es BEFORE y contesta antes que la política. Las dos siguen puestas.
+      await expect(hallazgo(2)).rejects.toThrow(
+        /row-level security|violates row-level|ya no es candidato/i,
+      );
+
+      /*
+       * Y BORRAR pide lo mismo que escribir, en las cuatro tablas.
+       *
+       * «Corregir una revisión es borrarla y escribir la buena» — así que si borrar siguiera
+       * abierto después del veredicto, la corrección se quedaría a medias: el borrado pasa, el
+       * insert de vuelta lo rechaza la política, y lo que había se perdió. Las dos mitades de
+       * una operación no pueden tener puertas distintas.
+       *
+       * Y sin el estado en las HOJAS, borrarlas de una en una sería la vía para mutar una
+       * revisión después del veredicto sin tocar la puerta que lo impide.
+       *
+       * Un DELETE que la política no deja pasar no lanza: no encuentra filas. Así que lo que se
+       * mide es que NO BORRÓ NADA y que lo de antes sigue ahí.
+       */
+      await conUsuario(curadorId, (tx) => tx`delete from hallazgo_simulado
+        where revision_id = ${rev} and workspace_id = ${wsC}`);
+      await conUsuario(curadorId, (tx) => tx`delete from revision_simulada
+        where id = ${rev} and workspace_id = ${wsC}`);
+      const [quedan] = await admin`select
+          (select count(*)::int from revision_simulada where id = ${rev}) as revision,
+          (select count(*)::int from hallazgo_simulado
+             where revision_id = ${rev}) as hallazgos`;
+      expect(quedan!.revision, 'la revisión se borró con el concepto ya decidido').toBe(1);
+      expect(quedan!.hallazgos, 'un hallazgo se borró con el concepto ya decidido').toBe(2);
+    });
+  });
+
+  /**
+   * Y la ventana del RETO, que se cierra por su cuenta.
+   *
+   * Un concepto puede seguir siendo `candidato` cuando G4 ya se firmó o la etapa 4 se completó:
+   * `reto_admite_conceptos` es del reto y el estado es del concepto, y las dos puertas se
+   * cierran por separado. Sin esta rama la tarjeta decía «disponible» y ofrecía Aceptar, y el
+   * Aceptar reventaba después con un motivo que quien revisa no había podido ver venir.
+   *
+   * Y la huella tampoco lo tapaba: el material de C4 no lleva dentro ni el gate ni la etapa, así
+   * que no se mueve cuando ellos se cierran. Hacían falta las dos comprobaciones.
+   */
+  it('C4 deja de ofrecer Aceptar cuando la ventana del reto se cierra, no al fallar', async () => {
+    await enWorkspaceLimpio('c4-ventana-reto', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Este perfil llega con la guardia alta.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide confianza antes de darla',
+                    descripcion: 'Entrega el documento cuando entiende para qué.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula sin saber para qué.',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      const p = antes.pendientes.find((x) => x.capacidad === 'C4')!;
+      expect(p.anclaEstado).toBe('disponible');
+
+      // El reto deja de admitir conceptos —`candidato → archivado` es una transición legal— y
+      // el concepto sigue siendo CANDIDATO: es justo el caso en que las dos puertas discrepan.
+      await admin`update reto set estado = 'archivado' where id = ${retoC}`;
+      const [cpt] = await admin`select estado from concepto where id = ${conceptoId}`;
+      expect(cpt!.estado).toBe('candidato');
+
+      const despues = await panelPropuestas(curadorId, wsC);
+      const p2 = despues.pendientes.find((x) => x.id === p.id);
+      expect(p2, 'la propuesta desapareció del panel').toBeDefined();
+      // Y con NOMBRE PROPIO. Esta rama emitía `reto-no-admite`, que es el estado de C0 y cuyo
+      // texto habla de criterios y del ciclo candidato/activo del reto: nombraba otra etapa y
+      // otro objeto que los que de verdad se cerraron. Un motivo que apunta donde no es hace
+      // perder más tiempo que uno genérico, así que la ventana de C4 tiene el suyo.
+      expect(p2!.anclaEstado).toBe('revisiones-cerradas');
+    });
+  });
+
+  /**
+   * Y un lote que devuelve MENOS sesiones de las pedidas no se tira: se recupera solo.
+   *
+   * El sobre admite de 1 a `MAX_REVISIONES_POR_LOTE`, así que un subconjunto estricto se
+   * guarda. La alternativa —descartar el lote— tira sesiones válidas y obliga a repetir la
+   * llamada ENTERA; esto conserva las que llegaron y solo hace falta una llamada más para las
+   * que faltan, que es estrictamente más barato.
+   *
+   * Lo que hace que sea recuperación y no pérdida son dos piezas que ya están: el selector no
+   * ofrece un concepto con una propuesta de C4 pendiente —así que no se puede pedir otro lote
+   * hasta resolver éste—, y la ventana de lentes descuenta las ya revisadas —así que el lote
+   * siguiente pide exactamente las que faltan—. La sonda recorre el ciclo entero.
+   *
+   * Y ESE ORDEN TIENE UN PRECIO, que conviene decir aquí porque es lo que se está eligiendo:
+   * recuperar no es «volver a pedir». Con el lote parcial pendiente, pedir otra vez responde
+   * «ese concepto ya tiene revisiones propuestas esperando decisión: decídelas antes de pedir
+   * otras», así que primero hay que DECIDIR las que llegaron. No son propuestas ajenas —son
+   * lentes que quien revisa pidió—, pero sí una decisión adelantada sobre una foto parcial, y
+   * la llamada por las que faltan se paga igual.
+   *
+   * La alternativa es tratar el lote corto como respuesta fuera de contrato y descartarlo, como
+   * se hace con dos sesiones del mismo arquetipo o con una cita fuera de su lente. Se queda sin
+   * hacer a propósito: con 5 de 6 conservar es claramente mejor y con 1 de 6 claramente peor,
+   * o sea que lo que hay debajo es un umbral, y un umbral es decisión de producto. Queda
+   * anotado para quien la tome, con el precio medido y no supuesto.
+   */
+  it('un lote de C4 incompleto se guarda, y el siguiente pide exactamente las lentes que faltan', async () => {
+    await enWorkspaceLimpio('c4-parcial', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const sesion = (arquetipoId: string, evidenciaId: string, fragmento: string) => ({
+        arquetipoId,
+        sintesis: 'Este perfil llega con la guardia alta.',
+        hallazgos: [
+          {
+            titulo: 'Pide confianza antes de darla',
+            descripcion: 'Entrega el documento cuando entiende para qué.',
+            esHipotesis: false,
+            citas: [{ evidenciaId, fragmento, localizacion: 'resumen' }],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      const pedir = () =>
+        generarPropuestas(curadorId, {
+          workspaceId: wsC,
+          capacidad: 'C4',
+          anclaId: conceptoId,
+        });
+
+      // Se piden DOS lentes y el proveedor devuelve UNA. Se guarda.
+      const alcanceUltimo = async () => {
+        const [l] = await admin`select alcance_resumen from propuesta_ai
+          where workspace_id = ${wsC} and capacidad = 'C4' order by creado_en desc limit 1`;
+        return l!.alcance_resumen as string;
+      };
+      const primero = await conProveedor(
+        {
+          ok: true,
+          datos: { revisiones: [sesion(lenteA, evA, 'No entrego la cédula sin saber para qué.')] },
+          intentos: [intento({ uso: null })],
+        },
+        pedir,
+      );
+      expect(primero.generadas).toBe(1);
+      expect(await alcanceUltimo()).toContain('2 arquetipos revisables');
+      const conUna = await panelPropuestas(curadorId, wsC);
+      expect(conUna.pendientes.filter((x) => x.capacidad === 'C4')).toHaveLength(1);
+
+      // Con la propuesta pendiente, el concepto NO se vuelve a ofrecer: no se puede pedir otro
+      // lote encima del que está sin resolver.
+      expect(conUna.candidatas.C4.lista.map((x) => x.id)).not.toContain(conceptoId);
+
+      // Resuelta la primera, la ventana avanza y el lote siguiente pide SOLO la que falta.
+      await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: conUna.pendientes.find((x) => x.capacidad === 'C4')!.id,
+      });
+      await conProveedor(
+        {
+          ok: true,
+          datos: { revisiones: [sesion(lenteB, evB, 'Si tarda más de un café, lo dejo.')] },
+          intentos: [intento({ uso: null })],
+        },
+        pedir,
+      );
+      // El alcance de la SEGUNDA llamada dice UNA lente: la ventana avanzó sola.
+      expect(await alcanceUltimo()).toContain('1 arquetipos revisables');
+      const [n] = await admin`select count(*)::int as n from propuesta_ai
+        where concepto_id = ${conceptoId} and workspace_id = ${wsC}`;
+      expect(n!.n).toBe(2);
+    });
+  });
+
+  /**
+   * Un permiso que vence HOY no llega vivo al final del camino.
+   *
+   * `evidencia_usable` dice que se puede citar hoy, y es cierto: es LA definición y no se toca.
+   * Pero entre pedir la revisión y aceptarla hay un commit, la respuesta del proveedor y una
+   * lectura humana, que no ocurre en el mismo minuto. Mañana la aceptación fallaría con DR001 y
+   * quedaría una revisión pagada, leída entera y solo tirable.
+   *
+   * Es la puerta que C2 ya tiene, con una diferencia que importa: la de C2 recorre TODOS los
+   * arquetipos del reto, y el lote de C4 manda solo las lentes de su ventana. Preguntar por el
+   * reto entero bloquearía una llamada legítima por un permiso de un arquetipo que este
+   * material ni siquiera enseña, así que `derecho_que_vence_ya` recibe la lista de lo que se
+   * manda. La sonda mide las dos direcciones.
+   */
+  it('C4 no gasta una llamada con un derecho de cita que vence hoy', async () => {
+    await enWorkspaceLimpio('c4-vence', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const pedir = () =>
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              revisiones: [
+                {
+                  arquetipoId: lenteA,
+                  sintesis: 'Este perfil llega con la guardia alta.',
+                  hallazgos: [
+                    {
+                      titulo: 'Pide confianza antes de darla',
+                      descripcion: 'Entrega el documento cuando entiende para qué.',
+                      esHipotesis: false,
+                      citas: [
+                        {
+                          evidenciaId: evA,
+                          fragmento: 'No entrego la cédula sin saber para qué.',
+                          localizacion: 'resumen',
+                        },
+                      ],
+                    },
+                  ],
+                  preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+                  confianzaPropuesta: 'media' as const,
+                },
+              ],
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        );
+
+      // El permiso del documento de UNA lente vence hoy: no se llama al proveedor.
+      await admin`update derecho_uso set vence_en = timezone('UTC', now())::date
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+      await expect(pedir()).rejects.toThrow(/vence hoy/);
+      const [nada] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC} and capacidad = 'C4'`;
+      expect(nada!.n, 'se llamó al proveedor con un permiso que vence hoy').toBe(0);
+
+      // Y con el permiso renovado, la llamada sale.
+      await admin`update derecho_uso set vence_en = timezone('UTC', now())::date + 30
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+      await pedir();
+      const [una] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC} and capacidad = 'C4'`;
+      expect(una!.n).toBe(1);
+
+      /*
+       * Y la otra dirección, que es la que separa esto de la puerta de C2: un permiso que vence
+       * hoy en una lente que este lote NO manda no bloquea nada.
+       *
+       * La lente fuera del lote se construye por el ÚNICO camino donde este acotado cambia algo:
+       * POR ENCIMA DEL TOPE. Las ya revisadas las quita antes el propio lector —su ventana no
+       * las trae—, así que una revisión escrita a mano no mediría esto: lo dijo la
+       * neutralización, que no movía la sonda. Lo que sí queda dentro de `material.arquetipos` y
+       * fuera del lote es el arquetipo que no cabe en las seis sesiones.
+       */
+      // La propuesta del lote anterior se acepta: con una pendiente no se puede pedir otra.
+      await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: (await panelPropuestas(curadorId, wsC)).pendientes.find(
+          (x) => x.capacidad === 'C4',
+        )!.id,
+      });
+      const [fte] = await admin`select fuente_id from evidencia where id = ${evB}`;
+      let ultimaEvidencia = '';
+      for (let i = 0; i < MAX_REVISIONES_POR_LOTE; i++) {
+        const [ev] = await admin`insert into evidencia
+          (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+          values (${wsC}, ${fte!.fuente_id as string}, ${`Entrevista Z-${i}`},
+                  'Lo dijo quien la dio.', '{}'::jsonb, ${curadorId}) returning id`;
+        await admin`insert into derecho_uso
+          (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+          values (${wsC}, ${ev!.id as string}, 'concedido', 'cliente',
+                  'Consentimiento del participante', ${curadorId}, now(), ${curadorId})`;
+        // `Zz…` ordena detrás de las dos del fixture, así que la última es la que no cabe.
+        const [arq] = await admin`insert into arquetipo
+          (workspace_id, reto_id, nombre, definicion, creado_por)
+          values (${wsC}, ${retoC}, ${`Zz lente ${i}`}, 'Perfil emergente', ${curadorId})
+          returning id`;
+        await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+          values (${wsC}, ${arq!.id as string}, ${ev!.id as string})`;
+        ultimaEvidencia = ev!.id as string;
+      }
+      // 2 + 6 = 8 lentes con evidencia y un tope de 6: las dos últimas quedan fuera del lote.
+      const enElLote = await conUsuario(curadorId, async (tx) => {
+        const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+        return lentesDelLote(material!.arquetipos).lentes.flatMap((a) =>
+          a.evidencia.map((e) => e.id),
+        );
+      });
+      expect(enElLote).not.toContain(ultimaEvidencia);
+
+      // Su permiso vence hoy, y la llamada sale igual: solo se mira lo que se manda. El lote
+      // nuevo propone `lenteB`, que es la que sigue sin revisar de las dos del fixture.
+      await admin`update derecho_uso set vence_en = timezone('UTC', now())::date
+        where evidencia_id = ${ultimaEvidencia} and workspace_id = ${wsC}`;
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteB,
+                sintesis: 'La segunda lente, con su documento vivo.',
+                hallazgos: [
+                  {
+                    titulo: 'El tiempo manda',
+                    descripcion: 'Abandona si tarda.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evB,
+                        fragmento: 'Si tarda más de un café, lo dejo.',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const [dos] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC} and capacidad = 'C4'`;
+      expect(dos!.n, 'un permiso de una lente fuera del lote bloqueó la llamada').toBe(2);
+    });
+  });
+
+  it('C4 no admite dos sesiones del mismo arquetipo sobre el mismo concepto (SYS-20)', async () => {
+    await enWorkspaceLimpio('c4-masiva', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const nueva = () =>
+        admin.begin((tx) => revisionAMano(tx, wsC, conceptoId, lenteA, curadorId));
+      await nueva();
+      await expect(nueva()).rejects.toThrow(/revision_simulada_concepto_id_arquetipo_id_key/);
+    });
+  });
+
+  /**
+   * «Ni porcentajes sintéticos»: lo que se lee como MEDICIÓN no entra.
+   *
+   * Se corta en dos sitios y los dos hacen falta. El contrato lo rechaza al parsear, que es
+   * donde se puede decir el motivo; `sin_agregado_sintetico()` lo rechaza en la base, que es
+   * lo que sigue siendo verdad cuando la revisión se escribe a mano y nadie parsea.
+   */
+  it('C4 no admite un número con forma de dato de campo, ni al parsear ni en la base', async () => {
+    await enWorkspaceLimpio('c4-porcentaje', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              revisiones: [
+                {
+                  arquetipoId: lenteA,
+                  sintesis: 'El 70 % de este perfil abandonaría en la primera pantalla.',
+                  hallazgos: [
+                    {
+                      titulo: 'Abandono temprano',
+                      descripcion: 'Se va antes de llegar al formulario.',
+                      esHipotesis: true,
+                      citas: [],
+                    },
+                  ],
+                  preguntas: [{ pregunta: '¿Hasta dónde llegarías?', escenario: '' }],
+                  confianzaPropuesta: 'baja',
+                },
+              ],
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/no cumplió el esquema/);
+      // Y la base lo dice también, para la revisión escrita a mano. Con el rol PROPIETARIO,
+      // que no pasa por políticas: lo que se mide es el CHECK, no el permiso.
+      await expect(
+        admin`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteA},
+                  'Aquí 6 de cada 10 abandonan', ${curadorId})`,
+      ).rejects.toThrow(/violates check constraint/);
+    });
+  });
+
+  /**
+   * Y el corte del contrato y el de la base tienen que decir LO MISMO.
+   *
+   * Son dos escrituras de una regla —una regex de JS y un `!~` de Postgres— y divergían: al
+   * contrato le faltaba la frontera de palabra que la función de la base pone a propósito, para
+   * que un «100%» dentro de un identificador o una URL no se lea como una medición. El contrato
+   * rechazaba entonces textos que el CHECK acepta, con el motivo de SYS-20 puesto encima, que
+   * ahí no aplica: una llamada pagada perdida y un mensaje que no se entiende.
+   *
+   * Se mide enfrentando las dos, sobre los mismos textos, en vez de leer las dos regex y
+   * convencerse de que dicen lo mismo.
+   */
+  it('el corte de agregados sintéticos dice lo mismo en el contrato que en la base', async () => {
+    const admin = sqlAdmin();
+    const casos = [
+      // Mediciones: las dos tienen que rechazarlas, en cualquier caja.
+      'El 70 % de los desconfiados digitales abandonaría',
+      '100% de acuerdo con lo que dijo',
+      'el margen del 12,5% que midieron',
+      '6 de cada 10 abandonan aquí',
+      // La misma proporción GRITADA: pasaba las dos capas, que es como no tener ninguna.
+      '6 DE CADA 10 abandonan aquí',
+      '6 De Cada 10 abandonan aquí',
+      // El mismo porcentaje DELETREADO, y la misma proporción con BARRA: dos puertas más a
+      // lo mismo, y las dos capas las dejaban abiertas igual.
+      '70 por ciento de los desconfiados abandonaría',
+      '70 porciento de acuerdo',
+      /*
+       * Y el mismo porcentaje deletreado con el espacio ESTIRADO. `\s?` admitía un solo
+       * carácter, así que «70 por  ciento» pasaba las dos capas —la del contrato y la del
+       * suelo, que comparten la expresión— y eso es lo que hace que dos validaciones no sean
+       * dos: fallan en el mismo sitio. Un tabulador es el mismo caso con otro carácter, y ya
+       * ha entrado por aquí antes: `btrim` no lo recorta, y esa lección costó una ronda.
+       */
+      '70 por  ciento de los desconfiados abandonaría',
+      '70 por\tciento de acuerdo',
+      '70 por \t ciento, con los dos',
+      '6/10 abandonan aquí',
+      'una proporción de 1/3 en la muestra',
+      // Y NO mediciones: identificadores y códigos con un número pegado. Las dos las aceptan.
+      'La versión v2r100% del prototipo',
+      'La norma ISO9001% del proveedor',
+      'Sin un solo número en toda la frase',
+      'id3de cada4 no es una proporción',
+      /*
+       * Los cuatro que la barra NO puede confundir con una medición: una fecha, una ruta, una
+       * versión y el «siempre» de 24/7. Rechazar cualquiera tira el lote entero con un motivo
+       * de SYS-20 que no aplica, que es el falso bloqueo que ya costó una ronda con `v2r100%`.
+       */
+      'La sesión del 6/10/2026 con el participante',
+      'Lo vio en https://ejemplo.test/a/1/2 y no volvió',
+      'La versión 1/2/3 del flujo antiguo',
+      'Quiere soporte 24/7 y no lo dice de otra forma',
+    ];
+    const enLaBase = await Promise.all(
+      casos.map(async (t) => {
+        const [r] = await admin`select sin_agregado_sintetico(${t}) as ok`;
+        return r!.ok as boolean;
+      }),
+    );
+    /*
+     * El lado del contrato se mide POR EL CONTRATO, no por la regex: es el rechazo que ve quien
+     * llama. Un texto que la base acepta tiene que poder ser la síntesis de una sesión.
+     */
+    const parsea = (valor: unknown) => {
+      try {
+        parsearContenido('C4', valor);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const enElContrato = casos.map((t) =>
+      parsea({
+        arquetipoId: '11111111-1111-4111-8111-111111111111',
+        sintesis: t,
+        hallazgos: [
+          {
+            titulo: 'Un hallazgo cualquiera',
+            descripcion: 'Lo que se sigue del perfil.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Y aquí qué harías?', escenario: '' }],
+        confianzaPropuesta: 'baja',
+      }),
+    );
+    expect(enElContrato).toEqual(enLaBase);
+    /*
+     * Y que la sonda mida algo, en los DOS sentidos y en el orden en que están escritos: TRECE
+     * mediciones que las dos capas rechazan y ocho textos legítimos que las dos aceptan. El
+     * vector escrito a mano es a propósito: si una de las dos capas se relaja, la igualdad de
+     * arriba sigue pasando —las dos dirían lo mismo— y sólo esto lo nota. Es exactamente lo que
+     * pasó con el espacio estirado: las dos lo aceptaban, así que la igualdad estaba en verde.
+     */
+    expect(enLaBase).toEqual([
+      false, false, false, false, false, false, false, false, false, false, false, false, false,
+      true, true, true, true, true, true, true, true,
+    ]);
+  });
+
+  /**
+   * «Sus afirmaciones deben derivarse del arquetipo y de evidencia real citada; cuando
+   * extrapolen, se marcan como hipótesis» — o sea DOS clases de hallazgo y ninguna tercera.
+   *
+   * La tercera es la avería: una frase con voz de usuario, sin nada detrás y sin avisar de que
+   * no lo hay. El contrato la corta al parsear; el trigger diferido la corta en el commit, que
+   * es lo que queda cuando la revisión se escribe a mano.
+   */
+  it('C4 no admite un hallazgo sin cita y sin marca de hipótesis (RF-08.2)', async () => {
+    await enWorkspaceLimpio('c4-sin-sosten', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              revisiones: [
+                {
+                  arquetipoId: lenteA,
+                  sintesis: 'Una lectura cualquiera.',
+                  hallazgos: [
+                    {
+                      titulo: 'Afirmación sin sostén',
+                      descripcion: 'Esto lo digo yo y no lo dice ningún documento.',
+                      esHipotesis: false,
+                      citas: [],
+                    },
+                  ],
+                  preguntas: [{ pregunta: '¿Y bien?', escenario: '' }],
+                  confianzaPropuesta: 'baja',
+                },
+              ],
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/no cumplió el esquema/);
+      // Y el suelo, en el commit: la revisión y su hallazgo caben, y lo que falla es la
+      // transacción entera al cerrarse sin ninguna cita detrás de una afirmación.
+      await expect(
+        admin.begin(async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})
+            returning id`;
+          await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Sin sostén', 'Nada detrás', false)`;
+          // Y su pregunta, porque sin ninguna caería el guard de completitud y la sonda
+          // mediría ESE en vez del sostén del hallazgo.
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Y bien?', '')`;
+        }),
+      ).rejects.toThrow(/no se marca como hipótesis/);
+    });
+  });
+
+  /**
+   * Y la evidencia citada es la del arquetipo QUE REVISA, no la del perfil de al lado.
+   *
+   * Es la forma más limpia de fabricar una voz: una frase que suena al «desconfiado digital»
+   * sostenida en el testimonio de un «apurado de RR. HH.». Por eso el fixture monta dos lentes
+   * con evidencia propia — con una sola, esto no se puede medir.
+   */
+  it('C4 no deja que una sesión cite la evidencia de otro arquetipo (RF-08.2)', async () => {
+    await enWorkspaceLimpio('c4-voz-prestada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evB } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              revisiones: [
+                {
+                  arquetipoId: lenteA,
+                  sintesis: 'Una lectura del primero.',
+                  hallazgos: [
+                    {
+                      titulo: 'Se va por el tiempo',
+                      descripcion: 'Dice que abandona si tarda.',
+                      esHipotesis: false,
+                      /* La evidencia del OTRO arquetipo: existe, está en el material, y no es
+                       * de esta lente. */
+                      citas: [
+                        {
+                          evidenciaId: evB,
+                          fragmento: 'Si tarda más de un café, lo dejo.',
+                          localizacion: 'resumen',
+                        },
+                      ],
+                    },
+                  ],
+                  preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
+                  confianzaPropuesta: 'media',
+                },
+              ],
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/no son de su arquetipo/);
+      // Y el suelo, para la revisión escrita a mano: el guard de la base dice lo mismo.
+      await expect(
+        admin.begin(async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Prestada', 'Voz ajena', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evB}, ${wsC}, 'Si tarda más de un café', 'resumen')`;
+        }),
+      ).rejects.toThrow(/no es de las que sostienen al arquetipo/);
+    });
+  });
+
+  /**
+   * Una revisión que no declara alcance no apaga el guard: lo enciende en contra.
+   *
+   * `alcance_evidencia` es lo que el guard diferido compara con la evidencia que el arquetipo
+   * tiene AHORA, y su rama estaba escrita «y el alcance no es nulo». Un nulo no comprueba
+   * menos: no comprueba NADA, y la columna es de las que `designio_app` puede escribir en el
+   * insert —el CHECK que la exige lo tenían C2 y C3, cada una la suya, y C4 ninguna—. O sea
+   * que por la superficie concedida se sellaba una revisión que no dice haber visto ni un
+   * documento de la lente que firma.
+   *
+   * Se mide con el suelo y no por el servicio a propósito: el servicio escribe el alcance
+   * SIEMPRE, así que esta avería no tiene camino por ahí. Vive donde el guard es lo único
+   * que queda.
+   */
+  it('C4 no sella una revisión cuyo alcance no dice nada', async () => {
+    await enWorkspaceLimpio('c4-alcance-nulo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      /**
+       * La propuesta y su sello, escritos POR LA SUPERFICIE CONCEDIDA y en una sola
+       * transacción — que es donde este guard vive: es un trigger diferido que se aparta si
+       * quien escribe no es miembro del workspace, así que medirlo con la conexión de
+       * administración no mide nada. Esa fue la primera versión de esta sonda, y «reproducía»
+       * la avería por el motivo equivocado.
+       */
+      const sellar = (alcance: string[] | null) =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${alcance},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura del primero.', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Pide saber para qué',
+                    'No entrega el documento sin motivo.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evA}, ${wsC}, 'No entrego la cédula', 'resumen')`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Qué te haría entregarla?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${p!.id as string} and workspace_id = ${wsC}`;
+          return r!.id as string;
+        });
+
+      // Sin alcance no hay propuesta: el CHECK lo corta al escribirla, que es lo más pronto
+      // que se puede decir.
+      await expect(sellar(null)).rejects.toThrow(/alcance_evidencia/i);
+      // Y el otro sentido, que es lo que separa «el nulo no pasa» de «C4 no sella»: con el
+      // alcance honesto —la evidencia de la lente— la misma escritura entra entera.
+      await expect(sellar([evA])).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * EL ALCANCE NO DECLARA DE MÁS: contener no acota, hace falta la IGUALDAD.
+   *
+   * La comprobación del sello preguntaba solo «¿falta alguna?». Un alcance inflado —la
+   * evidencia de la lente MÁS un documento cualquiera del workspace— la satisface para
+   * siempre, y el día que ese documento se enlace al arquetipo la comprobación lo encuentra ya
+   * dentro: se sella una revisión que nunca lo vio, con el argumento de que estaba declarado.
+   *
+   * Es la misma lección que C3 pagó en su ronda 5, y aquí llega por la superficie concedida:
+   * el servicio escribe el alcance partido por lente, pero `propuesta_ai` tiene INSERT para el
+   * rol de la aplicación y nada obligaba a que ese array fuera el de la lente.
+   *
+   * Se mide en los dos sentidos: con el documento ajeno dentro no sella; sin él, la misma
+   * escritura entra entera.
+   */
+  it('C4 no sella una revisión cuyo alcance declara evidencia de otra lente', async () => {
+    await enWorkspaceLimpio('c4-alcance-inflado', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const contenido = {
+        arquetipoId: lenteB,
+        sintesis: 'Una lectura del segundo.',
+        hallazgos: [
+          {
+            titulo: 'Se va por el tiempo',
+            descripcion: 'Dice que abandona si tarda.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evB, fragmento: 'Si tarda más de un café', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      const sellar = (alcance: string[]) =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${alcance},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura del segundo.', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Se va por el tiempo',
+                    'Dice que abandona si tarda.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evB}, ${wsC}, 'Si tarda más de un café', 'resumen')`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Cuánto esperarías?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${p!.id as string} and workspace_id = ${wsC}`;
+          return r!.id as string;
+        });
+
+      // `evA` es de la PRIMERA lente y esta revisión firma con la segunda.
+      await expect(sellar([evB, evA])).rejects.toThrow(/no es de la lente que firma/i);
+      // Y con el alcance honesto —solo lo de su lente— la misma escritura entra entera.
+      await expect(sellar([evB])).resolves.toBeTruthy();
+      expect(lenteA, 'el fixture perdió la primera lente').toBeTruthy();
+    });
+  });
+
+  /**
+   * Y LA LENTE QUE SE ENCOGE, que es la que las tres comprobaciones dejaban pasar.
+   *
+   * Las tres miran el alcance contra la lente, y ninguna cierra este caso:
+   *
+   *   1. «no falta ninguna» pregunta si hay evidencia UTILIZABLE de la lente fuera del
+   *      alcance. Un documento cuyo derecho se revocó deja de ser utilizable, así que deja de
+   *      exigirse: la comprobación pasa.
+   *   2. «no declara de más» pregunta si lo declarado está ENLAZADO al arquetipo — y revocar
+   *      no desenlaza («arquetipo_evidencia» no tiene DELETE concedido), así que también pasa.
+   *   3. «que la lente siga siendo una lente» pide UNA utilizable, y con dos documentos y uno
+   *      revocado queda la otra: pasa.
+   *
+   * Y aquí hay una corrección mía. Al escribir la tercera dejé dicho que pedir «una y no todas»
+   * era a propósito porque «todas es justo lo que pregunta la comprobación de arriba». Eso es
+   * falso, y esta sonda lo mide: la de arriba pregunta si el alcance CUBRE lo utilizable, no si
+   * todo lo declarado SIGUE siendo utilizable. Son dos direcciones distintas, y por el hueco
+   * entre ellas se sella una revisión producida desde una lente que ya no es la que dice.
+   *
+   * El servicio lo para por la huella del material —`evidencia_usable` decide qué entra en el
+   * cuerpo, así que revocar mueve el texto—, pero el servicio no es el único camino a la tabla:
+   * la superficie concedida a `designio_app` llega hasta aquí, y es la que este guard defiende.
+   *
+   * La sesión es de HIPÓTESIS PURA a propósito: donde hay citas, la comprobación de DR001 ya
+   * para la revocación, y la sonda estaría midiendo esa puerta y no ésta.
+   */
+  it('C4 no sella una revisión cuya lente perdió parte de su evidencia utilizable', async () => {
+    await enWorkspaceLimpio('c4-lente-encogida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteB, evB } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un SEGUNDO documento en la lente que firma: con uno solo, revocarlo la deja vacía y la
+      // pararía la tercera comprobación — otra puerta, no la que se mide.
+      const [fte] = await admin`select id from fuente where workspace_id = ${wsC} limit 1`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, 'Entrevista A-02',
+                'El segundo testimonio del apurado.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const evB2 = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${evB2}, 'concedido', 'cliente',
+                'Consentimiento del participante', ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteB}, ${evB2})`;
+
+      const contenido = {
+        arquetipoId: lenteB,
+        sintesis: 'Una lectura del segundo, sin citar.',
+        hallazgos: [
+          {
+            titulo: 'Puede que abandone antes',
+            descripcion: 'Extrapolado del perfil, sin testimonio que lo diga.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
+        confianzaPropuesta: 'baja',
+      };
+      /*
+       * `entreMedias` corre DESPUÉS de nacer la propuesta y ANTES de aceptarla, en otra conexión
+       * y ya commiteado. Hace falta desde que el INSERT de la propuesta exige que su lente
+       * conserve algún documento citable: montar el estado «no le queda ninguno» antes de
+       * proponer hace que falle ahí, y esta sonda pasaría en verde midiendo esa puerta en vez de
+       * la del sello, que es la que nombra. Y de paso es la secuencia REAL: el permiso se retira
+       * mientras la aceptación está en vuelo, que es justo para lo que existe esa comprobación.
+       */
+      const sellar = (alcance: string[], entreMedias?: () => Promise<void>) =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${alcance},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          if (entreMedias) await entreMedias();
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura del segundo, sin citar.',
+                    ${curadorId})
+            returning id`;
+          await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Puede que abandone antes',
+                    'Extrapolado del perfil, sin testimonio que lo diga.', true)`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Cuánto esperarías?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${p!.id as string} and workspace_id = ${wsC}`;
+          return r!.id as string;
+        });
+
+      // Se revoca UNO de los dos. El alcance sigue diciendo la verdad de lo que se enseñó, y
+      // por eso no se toca: lo que ya no es verdad es que esa siga siendo la lente.
+      // Retirar el derecho arrastra el ÁMBITO, y el estado se llama «denegado»: los dos los
+      // dijo la base al fallar el UPDATE — «derecho_alcance_solo_concedido» exige que lo que no
+      // está concedido sea interno y sin vencimiento, y el CHECK del estado sólo admite
+      // pendiente, concedido o denegado.
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+        where evidencia_id = ${evB2} and workspace_id = ${wsC}`;
+      await expect(sellar([evB, evB2])).rejects.toThrow(/dejó de ser utilizable|ya no está/i);
+
+      /*
+       * Y la comprobación ANTERIOR —«que la lente siga siendo una lente»— sigue teniendo su
+       * caso: cuando NADA de lo declarado es ya utilizable. Se mide porque el comentario de la
+       * migración lo afirma, y una rama que se afirma y no se alcanza es peor que no tenerla.
+       *
+       * Con el alcance VACÍO no se llega aquí, y eso también está medido: quien responde
+       * entonces es la PRIMERA —«ese arquetipo tiene evidencia que esta revisión no llegó a
+       * ver»—, porque la lente conserva un documento utilizable fuera del alcance. Sólo se cae
+       * en ésta cuando no queda ninguno.
+       */
+      await expect(
+        sellar([evB, evB2], async () => {
+          await admin`update derecho_uso set estado = 'denegado', ambito = 'interno',
+            vence_en = null where evidencia_id = ${evB} and workspace_id = ${wsC}`;
+        }),
+      ).rejects.toThrow(/se quedó sin evidencia utilizable/i);
+      await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente'
+        where evidencia_id = ${evB} and workspace_id = ${wsC}`;
+
+      // Y devuelto el permiso, la MISMA escritura entra entera: la puerta es la revocación, no
+      // el número de documentos.
+      await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente'
+        where evidencia_id = ${evB2} and workspace_id = ${wsC}`;
+      await expect(sellar([evB, evB2])).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * A UNA REVISIÓN YA SELLADA NO SE LE AÑADE NADA.
+   *
+   * Las políticas de inserción de las tres hojas miraban el rol y la ventana de la etapa, y no
+   * si su revisión ya lleva el sello de una propuesta. El guard de materialización no vuelve a
+   * correr —no hay UPDATE de propuesta que lo dispare—, así que un hallazgo escrito a mano
+   * después de aceptar entraba y el archivo lo presentaba bajo «propuesta por AI». La
+   * procedencia es de la fila entera: o todo salió de esa propuesta, o la etiqueta miente
+   * sobre la parte que no, y eso se lee justo cuando se firma un pasa/muere.
+   *
+   * Se mide en los DOS sentidos, que es lo que separa «no se amplía lo firmado» de «no se
+   * escribe a mano»: a la revisión SELLADA no entra, y a una escrita a mano —sello en null
+   * para siempre, SYS-21— la misma escritura entra entera.
+   */
+  it('C4 no deja añadir hallazgos ni preguntas a una revisión ya sellada', async () => {
+    await enWorkspaceLimpio('c4-sellada-cerrada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'No entrega el documento sin saber para qué.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      const [sellada] = await admin`select id from revision_simulada
+        where workspace_id = ${wsC} and propuesta_ai_id is not null`;
+      expect(sellada, 'no hay revisión sellada: la sonda no mide nada').toBeDefined();
+      const selladaId = sellada!.id as string;
+
+      // Un hallazgo NUEVO en la revisión que la AI firmó: no entra.
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`insert into hallazgo_simulado
+              (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${selladaId}, 9, 'Añadido a mano', 'Lo escribió una persona.', true)`,
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+      // Y una pregunta tampoco.
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`insert into pregunta_de_test
+              (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${selladaId}, null, 9, '¿Y esto quién lo puso?', '')`,
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+
+      // Y el otro sentido: una revisión escrita a mano se monta entera, sin sello.
+      const aMano = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Escrita a mano'),
+      );
+      expect(aMano, 'la revisión escrita a mano dejó de poder montarse').toBeTruthy();
+      const [sinSello] = await admin`select propuesta_ai_id from revision_simulada
+        where id = ${aMano} and workspace_id = ${wsC}`;
+      expect(sinSello!.propuesta_ai_id, 'la escrita a mano no debería llevar sello').toBeNull();
+    });
+  });
+
+  /**
+   * NI SE LE QUITA NADA. La otra mitad, y la que faltaba.
+   *
+   * La ronda anterior cerró el AÑADIR con `r.propuesta_ai_id is null` en las tres políticas de
+   * inserción. El BORRADO de hoja quedó abierto, y recorta lo mismo que ampliar deformaba: con
+   * dos hallazgos firmados, quitar uno deja al trigger de completitud contento —queda otro— y
+   * la revisión sigue rotulada «propuesta por AI» diciendo menos de lo que la propuesta dijo.
+   * El guard de materialización no vuelve a correr: no hay UPDATE de propuesta que lo dispare.
+   *
+   * Y se lleva por delante lo que colgaba: `pregunta_de_test.hallazgo_id` referencia el hallazgo
+   * con `on delete cascade`, así que las preguntas de ese hallazgo desaparecen sin que nadie las
+   * borre. La única señal contrastable que una simulación le entrega a la etapa 4 se puede
+   * vaciar de una en una, con la etiqueta de procedencia intacta.
+   *
+   * La salida para corregir sigue abierta y es la que el diseño ya eligió: **borrar la revisión
+   * ENTERA y escribir la buena**, que suelta el puntero de la propuesta por su trigger
+   * `BEFORE DELETE` y no deja media procedencia en pie. Y quitar una CITA sigue permitido sobre
+   * una sellada, que es como se remedia un derecho retirado; el guard diferido decide si lo que
+   * queda se sostiene.
+   *
+   * Se mide en los dos sentidos, como la de arriba: de la sellada no sale, de la escrita a mano
+   * sí — porque una persona que escribió mal su propia revisión tiene que poder corregirla.
+   */
+  it('C4 no deja quitar hallazgos ni preguntas de una revisión ya sellada', async () => {
+    await enWorkspaceLimpio('c4-sellada-sin-recortes', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // DOS hallazgos: con uno solo, quitarlo lo pararía el trigger de completitud y la sonda
+      // estaría midiendo esa puerta y no ésta.
+      const cita = { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' };
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'No entrega el documento sin saber para qué.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [cita],
+                  },
+                  {
+                    titulo: 'Desconfía del canal',
+                    descripcion: 'Prefiere la sucursal para lo sensible.',
+                    esHipotesis: false,
+                    citas: [cita],
+                  },
+                ],
+                // DOS preguntas, por lo mismo que dos hallazgos: con una sola, quitarla la para
+                // el trigger de completitud y la sonda estaría midiendo ESA puerta. Medido: al
+                // neutralizar el sello con una sola pregunta, el borrado pasaba la política y
+                // moría en «esa revisión simulada se queda sin preguntas» — la sonda se movía,
+                // pero no por lo que dice medir.
+                preguntas: [
+                  { pregunta: '¿Qué te haría entregarla?', escenario: '' },
+                  { pregunta: '¿Y si te lo pide la sucursal?', escenario: '' },
+                ],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      const firmados = await admin`select h.id, h.orden from hallazgo_simulado h
+        join revision_simulada r on r.id = h.revision_id and r.workspace_id = h.workspace_id
+        where r.workspace_id = ${wsC} and r.propuesta_ai_id is not null
+        order by h.orden`;
+      expect(firmados.length, 'la sonda necesita DOS hallazgos firmados').toBe(2);
+      const [primero, segundo] = firmados as unknown as { id: string }[];
+
+      // El concepto sigue candidato —la puerta del veredicto no es la que se está midiendo—.
+      const [estado] = await admin`select estado from concepto
+        where id = ${conceptoId} and workspace_id = ${wsC}`;
+      expect(estado!.estado, 'el concepto ya no es candidato: la sonda mediría otra puerta').toBe(
+        'candidato',
+      );
+
+      // Quitar UNO de los dos hallazgos firmados: no se puede.
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`delete from hallazgo_simulado
+            where id = ${segundo!.id} and workspace_id = ${wsC}`.then(async (r) => {
+            if (r.count === 0) throw new Error('row-level security: 0 filas borradas');
+            return r;
+          }),
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+
+      // Y una pregunta suelta de la revisión firmada, tampoco.
+      const preguntasFirmadas = await admin`select p.id from pregunta_de_test p
+        join revision_simulada r on r.id = p.revision_id and r.workspace_id = p.workspace_id
+        where r.workspace_id = ${wsC} and r.propuesta_ai_id is not null
+        order by p.orden`;
+      expect(preguntasFirmadas.length, 'la sonda necesita DOS preguntas firmadas').toBe(2);
+      const preguntaFirmada = preguntasFirmadas[1];
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`delete from pregunta_de_test
+            where id = ${preguntaFirmada!.id} and workspace_id = ${wsC}`.then(async (r) => {
+            if (r.count === 0) throw new Error('row-level security: 0 filas borradas');
+            return r;
+          }),
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+      expect(primero, 'el fixture perdió el primer hallazgo').toBeTruthy();
+
+      // Lo que SÍ sigue abierto sobre la sellada: quitar una CITA, que es como se remedia un
+      // derecho retirado. Aquí el hallazgo se queda sin ninguna y el guard diferido lo para
+      // con su motivo — que es exactamente la comprobación que tiene que seguir decidiendo.
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`delete from hallazgo_simulado_evidencia
+            where hallazgo_id = ${segundo!.id} and workspace_id = ${wsC}`,
+        ),
+      ).rejects.toThrow(/hipótesis|al menos una evidencia/i);
+
+      // Y la salida que el diseño eligió para corregir sigue abierta: la revisión ENTERA.
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const r = await tx`delete from revision_simulada
+            where workspace_id = ${wsC} and propuesta_ai_id is not null`;
+          if (r.count === 0) throw new Error('row-level security: 0 filas borradas');
+          return r;
+        }),
+      ).resolves.toBeTruthy();
+
+      // Y el otro sentido: de una revisión escrita a mano sí se quita un hallazgo.
+      const aMano = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Escrita a mano'),
+      );
+      const [suyo] = await admin`select id from hallazgo_simulado
+        where revision_id = ${aMano} and workspace_id = ${wsC}`;
+      await conUsuario(curadorId, (tx) =>
+        tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+          values (${wsC}, ${aMano}, 9, 'El segundo, a mano', 'Para poder quitar el otro.', true)`,
+      );
+      const suPropiaMano = await conUsuario(curadorId, (tx) =>
+        tx`delete from hallazgo_simulado where id = ${suyo!.id} and workspace_id = ${wsC}`,
+      );
+      expect(
+        suPropiaMano.count,
+        'quien escribió su revisión a mano dejó de poder corregirla',
+      ).toBe(1);
+    });
+  });
+
+  /**
+   * LA VENTANA TAMBIÉN AVANZA CUANDO SE RECHAZA, y antes no.
+   *
+   * La ronda 2 hizo que aceptar moviera la ventana: `lentesDelLote` descuenta las lentes que ya
+   * tienen `revision_simulada` de este concepto. Pero RECHAZAR no escribe esa fila, así que
+   * descontaba cero — y con siete arquetipos el lote pedía los seis primeros por orden
+   * alfabético, se rechazaban los seis, y el siguiente lote pedía exactamente los mismos. Del
+   * séptimo en adelante no se revisaba ninguno nunca, que es literalmente la avería que la
+   * ronda 2 arregló, entrando por la otra puerta.
+   *
+   * El arreglo NO es excluir la lente rechazada: se rechaza porque la salida no valía, y volver
+   * a pedirla tiene que seguir siendo posible. Es ROTAR — las que nunca se propusieron van
+   * primero, y las ya intentadas después—, así que la séptima entra y la primera vuelve luego.
+   *
+   * Y sin contar las HERMANAS del propio lote, por lo mismo que la exclusión: si rechazar una
+   * moviera el orden, la huella de sus hermanas dejaría de cuadrar y aceptarlas fallaría con
+   * «material movido».
+   */
+  it('la ventana de lentes de C4 avanza también cuando se rechaza el lote', async () => {
+    await enWorkspaceLimpio('c4-ventana-rechazo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lentes } = await conceptoConLentes(wsC, retoC, curadorId, 7);
+      expect(lentes.length).toBe(MAX_REVISIONES_POR_LOTE + 1);
+      const sesion = (l: { arq: string; ev: string }) => ({
+        arquetipoId: l.arq,
+        sintesis: 'Una lectura de esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Lo que pide',
+            descripcion: 'Sale de su testimonio.',
+            esHipotesis: false,
+            citas: [{ evidenciaId: l.ev, fragmento: 'Lo que dijo el perfil', localizacion: 'resumen' }],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Y si no?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      // Qué lentes pide el material de AHORA, leído del propio material y no de una cuenta.
+      const pedidas = async () =>
+        conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return lentesDelLote(material!.arquetipos).lentes.map((a) => a.id);
+        });
+
+      const primeras = await pedidas();
+      expect(primeras.length).toBe(MAX_REVISIONES_POR_LOTE);
+      await conProveedor(
+        {
+          ok: true,
+          datos: { revisiones: primeras.map((id) => sesion(lentes.find((l) => l.arq === id)!)) },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      // Se RECHAZAN las seis. Ninguna escribe `revision_simulada`.
+      const panel = await panelPropuestas(curadorId, wsC);
+      for (const p of panel.pendientes.filter((x) => x.capacidad === 'C4')) {
+        await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p.id });
+      }
+
+      const segundas = await pedidas();
+      expect(segundas.length).toBe(MAX_REVISIONES_POR_LOTE);
+      const septima = lentes.find((l) => !primeras.includes(l.arq))!;
+      expect(
+        segundas.includes(septima.arq),
+        'tras rechazar el lote entero, la lente que nunca se propuso sigue sin pedirse',
+      ).toBe(true);
+      // Y la rotación no la excluye para siempre: alguna de las rechazadas vuelve.
+      expect(
+        segundas.some((id) => primeras.includes(id)),
+        'las lentes rechazadas quedaron excluidas: no se podrían reintentar nunca',
+      ).toBe(true);
+
+      /*
+       * Y LA OTRA MITAD, que la rotación se llevó por delante: el PANEL tiene que reconstruir
+       * el mismo material que leyó la generación, porque es contra él contra lo que mide la
+       * presencia literal de cada cita y de ahí sale su «disponible».
+       *
+       * La ventana estaba escrita DOS veces —una en la consulta de generación, otra en la
+       * proyección del panel— y al rotar sólo la primera, el segundo lote se reconstruía con
+       * las lentes en otro orden: huella distinta, «material-de-revision-movido», y el panel
+       * bloqueaba un Aceptar que el servidor sí habría admitido, porque la relectura de la
+       * aceptación usa la consulta rotada. La avería sólo aparece en el SEGUNDO lote: en el
+       * primero no hay ninguna propuesta decidida y la rotación no mueve nada.
+       *
+       * Se arregló dejando UNA escritura de la regla, no copiando el arreglo al segundo sitio.
+       */
+      await conProveedor(
+        {
+          ok: true,
+          datos: { revisiones: segundas.map((id) => sesion(lentes.find((l) => l.arq === id)!)) },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const segundoPanel = (await panelPropuestas(curadorId, wsC)).pendientes.filter(
+        (x) => x.capacidad === 'C4',
+      );
+      expect(segundoPanel.length).toBe(MAX_REVISIONES_POR_LOTE);
+      expect(
+        segundoPanel.map((x) => x.anclaEstado),
+        'el panel reconstruyó el material del segundo lote con otra ventana que la generación',
+      ).toEqual(Array(MAX_REVISIONES_POR_LOTE).fill('disponible'));
+      // Y con el material bien reconstruido, la presencia literal de la cita se puede medir.
+      expect(segundoPanel.every((x) => x.citas.every((c) => c.presenteLiteral))).toBe(true);
+
+      /*
+       * Y LA ROTACIÓN TIENE QUE SEGUIR ROTANDO, Y REPARTIR PAREJO, LOTE TRAS LOTE.
+       *
+       * Este orden se ha agotado DOS veces, y cada vez unos lotes más tarde que el anterior, así
+       * que lo que se mide aquí ya no es «¿vuelve alguna vez?» sino el reparto entero:
+       *
+       *   - Con un BOOLEANO —«¿se intentó alguna vez?»— tras los dos primeros lotes las siete
+       *     lentes tienen alguna propuesta decidida, el predicado es cierto para todas, el
+       *     desempate vuelve a ser alfabético y del tercer lote en adelante se piden otra vez
+       *     las seis primeras. La séptima no vuelve nunca: (4,4,4,4,4,3,1).
+       *   - Con el ÚLTIMO INTENTO —«max(creado_en)»— gira, pero cojeando: «creado_en» es
+       *     «now()», estable dentro de la transacción, así que las seis de una generación
+       *     empatan al instante y entre las empatadas manda otra vez el nombre. Las cinco
+       *     primeras entran en TODOS los lotes y las dos últimas se turnan la plaza que sobra:
+       *     (4,4,4,4,4,2,2). Nadie se queda fuera, y por eso un suelo —«ninguna menos de dos»—
+       *     lo daba por bueno; el reparto era el doble para unas que para otras.
+       *
+       * Lo que se afirma ahora es la propiedad del reparto por «la menos servida primero»: la
+       * diferencia entre la más pedida y la menos pedida NO PASA DE UNA. Y se comprueba tras
+       * CADA lote y no sólo al final, porque las dos averías se ven un lote antes así — las dos
+       * rompen en el TERCERO.
+       *
+       * Siete lotes, que es el turno completo de siete lentes de seis en seis. Medir dos lotes
+       * antes de donde aparece la avería es la lección que este orden ya cobró dos veces.
+       */
+      const vueltas: string[][] = [primeras, segundas];
+      for (let i = 0; i < 5; i++) {
+        for (const p of (await panelPropuestas(curadorId, wsC)).pendientes.filter(
+          (x) => x.capacidad === 'C4',
+        )) {
+          await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p.id });
+        }
+        const lote = await pedidas();
+        vueltas.push(lote);
+        await conProveedor(
+          {
+            ok: true,
+            datos: { revisiones: lote.map((id) => sesion(lentes.find((l) => l.arq === id)!)) },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        );
+      }
+      const veces = new Map(lentes.map((l) => [l.arq, 0]));
+      const desparejos = vueltas.flatMap((lote, i) => {
+        for (const id of lote) veces.set(id, veces.get(id)! + 1);
+        const n = [...veces.values()];
+        return Math.max(...n) - Math.min(...n) > 1 ? [`lote ${i + 1}: (${n.join(',')})`] : [];
+      });
+      expect(
+        desparejos,
+        'la rueda reparte desparejo: hay lentes pedidas más del doble que otras, y eso no se corrige con más lotes',
+      ).toEqual([]);
+      // Y la mitad sin la cual esto lo cumpliría una rueda parada: las siete se piden de verdad.
+      expect([...veces.values()].every((n) => n > 0)).toBe(true);
+    });
+  });
+
+  /**
+   * UNA CITA RETIRADA DEJA DE ENSEÑARSE, aunque el contenido la siga guardando.
+   *
+   * El `contenido` de la propuesta es inmutable (SYS-17) y por eso es donde vive el pasaje —
+   * pero no es la lista viva. Quitar una cita de una revisión YA ACEPTADA sí se puede:
+   * `hallazgo_simulado_evidencia` tiene DELETE concedido y su política, y es justo lo que se
+   * hace cuando el derecho de ese documento se retira. Leyendo sólo el contenido, el pasaje
+   * retirado seguía apareciendo como sostén ACTUAL delante de quien firma el pasa/muere.
+   *
+   * El caso alcanzable es un hallazgo con DOS citas: con una sola, quitarla deja un hallazgo
+   * observado sin nada detrás y el guard diferido ya lo impide —medido: responde «un hallazgo
+   * de revisión simulada que no se marca como hipótesis tiene que citar al menos una evidencia
+   * real»—. Y las dos tienen que ser de DOCUMENTOS distintos: la clave primaria del enlace
+   * colapsa dos citas del mismo. Los dos documentos van a la MISMA lente, porque una sesión
+   * sólo puede citar evidencia de su arquetipo.
+   */
+  it('C4 deja de enseñar una cita que se retiró de la revisión aceptada', async () => {
+    await enWorkspaceLimpio('c4-cita-retirada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4B', 'Proyecto de la cita retirada', ${curadorId})
+        returning id`;
+      // Un SEGUNDO documento en la misma lente, antes de generar: enlazarlo después dejaría la
+      // propuesta obsoleta —eso lo mide otra sonda— y aquí lo que se quiere es que la sesión
+      // pueda citar dos.
+      const [fte] = await admin`select fuente_id from evidencia where id = ${evA}`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.fuente_id as string}, 'Entrevista D-02',
+                'Prefiero que me digan para qué antes de dar nada.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const evA2 = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${evA2}, 'concedido', 'cliente', 'Consentimiento del participante',
+                ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteA}, ${evA2})`;
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'No entrega el documento sin saber para qué.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'Lo dicen los dos testimonios.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                      { evidenciaId: evA2, fragmento: 'Prefiero que me digan para qué', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+
+      const leer = async () => {
+        const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+        return gob!.conceptos.find((c) => c.id === conceptoId)!.revisiones[0]!;
+      };
+      const antes = await leer();
+      expect(
+        antes.hallazgos[0]!.citas.map((c) => c.evidenciaTitulo),
+        'la sonda no parte de dos citas: no mediría la retirada',
+      ).toEqual(['Entrevista D-01', 'Entrevista D-02']);
+
+      // Se retira una, por la superficie concedida y como se haría de verdad.
+      await conUsuario(curadorId, (tx) =>
+        tx`delete from hallazgo_simulado_evidencia
+            where hallazgo_id = ${antes.hallazgos[0]!.id} and evidencia_id = ${evA2}
+              and workspace_id = ${wsC}`,
+      );
+      const despues = await leer();
+      expect(
+        despues.hallazgos[0]!.citas.map((c) => c.evidenciaTitulo),
+        'la cita retirada se sigue enseñando como sostén actual',
+      ).toEqual(['Entrevista D-01']);
+      // Y la que queda conserva su pasaje: lo que se cruza es la lista, no el testimonio.
+      expect(despues.hallazgos[0]!.citas[0]!.fragmento).toBe('No entrego la cédula');
+      expect(despues.hallazgos[0]!.citas[0]!.citable).toBe(true);
+
+      /*
+       * Y EL DERECHO QUE SE RETIRA SIN QUITAR EL ENLACE, que es la otra mitad y la que no se
+       * puede limpiar después: la política de DELETE de la cita pide concepto `candidato`, así
+       * que en cuanto se firma el pasa/muere el enlace ya no se quita. Sin releer el permiso,
+       * ese pasaje se quedaría para siempre presentado como sostén ACTUAL de la decisión.
+       *
+       * Se dice en vez de esconderse: el título se queda —ya se publica en el tablero de
+       * gobernanza— y el pasaje se retira con su motivo. Borrar la cita entera borraría que el
+       * hallazgo TUVO apoyo, que es otra cosa y también falsa.
+       */
+      await admin`update derecho_uso
+           set estado = 'denegado', ambito = 'interno', vence_en = null
+         where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+      const sinDerecho = await leer();
+      const cita = sinDerecho.hallazgos[0]!.citas[0]!;
+      expect(cita.citable, 'la cita sin permiso sigue diciéndose citable').toBe(false);
+      expect(cita.fragmento, 'el pasaje sigue mostrándose sin permiso de cita').toBeNull();
+      expect(cita.localizacion).toBeNull();
+      expect(cita.evidenciaTitulo, 'el título tenía que quedarse').toBe('Entrevista D-01');
+    });
+  });
+
+  /**
+   * EL PERMISO QUE VENCE HOY se pregunta por lo que el prompt ENSEÑA, no por lo que se pensó
+   * enseñar.
+   *
+   * La puerta ya acotaba una vez —las lentes del lote y no las del reto entero— y ahí se quedó:
+   * la lista salía de `lentesDelLote`, que es la ventana ANTES del recorte. Pero el cuerpo se
+   * recorta después a `MAX_MATERIAL`, y de las candidatas puede quedarse fuera una lente
+   * entera. Un permiso que vence hoy sobre un documento que nadie manda abortaba la llamada:
+   * el mismo falso bloqueo que la primera acotación existe para evitar, un escalón más abajo.
+   *
+   * Se mide en los DOS sentidos, que es lo que separa «no bloquea de más» de «ya no bloquea»:
+   * con el permiso sobre el documento que el recorte dejó fuera, la llamada sale; movido al
+   * que sí llega, la puerta se cierra.
+   *
+   * El corte se calibra por bisección contra el material REAL, como su hermana de la lente a
+   * medias: lo que se busca es el punto exacto en que deja de caber una.
+   */
+  it('el permiso que vence hoy no bloquea C4 por un documento que el recorte dejó fuera', async () => {
+    await enWorkspaceLimpio('c4-vence-recortado', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const enterasCon = async (relleno: number) =>
+        conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          if (relleno >= 0) {
+            const primera = material!.arquetipos[0]!;
+            await admin`update evidencia set resumen = ${primera.evidencia[0]!.resumen.split('·')[0]! + '·'.repeat(relleno)}
+              where id = ${primera.evidencia[0]!.id}`;
+          }
+          const { material: m2 } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return arquetiposQueLlegaronEnteros(m2!).ids;
+        });
+      let cabe = 0;
+      let noCabe = MAX_MATERIAL + 2_000;
+      expect((await enterasCon(cabe)).length).toBe(2);
+      expect((await enterasCon(noCabe)).length).toBeLessThan(2);
+      while (noCabe - cabe > 1) {
+        const medio = (cabe + noCabe) >> 1;
+        if ((await enterasCon(medio)).length === 2) cabe = medio;
+        else noCabe = medio;
+      }
+      expect((await enterasCon(noCabe)).length, 'no se logró cortar exactamente una lente').toBe(1);
+
+      // Quién llega y quién no, leído del material recortado y no de una cuenta a ojo.
+      const { llegan, fuera } = await conUsuario(curadorId, async (tx) => {
+        const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+        const dentro = new Set(evidenciaQueLlegoAlRevisor(material!).ids);
+        const todas = material!.arquetipos.flatMap((a) => a.evidencia.map((e) => e.id));
+        return {
+          llegan: todas.filter((id) => dentro.has(id)),
+          fuera: todas.filter((id) => !dentro.has(id)),
+        };
+      });
+      expect(fuera.length, 'el recorte no dejó fuera ningún documento: la sonda no mide nada').toBeGreaterThan(0);
+      expect(llegan.length, 'no llegó ningún documento: la sonda tampoco mediría').toBeGreaterThan(0);
+
+      // El permiso del que NO llega vence hoy: la llamada no tiene por qué enterarse.
+      const hoy = await admin`select fecha_de_la_base() as d`;
+      await admin`update derecho_uso set vence_en = ${hoy[0]!.d as string}
+        where evidencia_id = ${fuera[0]!} and workspace_id = ${wsC}`;
+      const sinBloquear = await conUsuario(curadorId, (tx) =>
+        huellaDelMaterialDeRevision(tx, wsC, conceptoId),
+      );
+      expect(
+        sinBloquear.caducada,
+        'un permiso sobre un documento que el prompt no manda bloquea la llamada',
+      ).toBeNull();
+
+      // Y movido al que sí llega, la puerta se cierra: es la misma puerta, bien apuntada.
+      await admin`update derecho_uso set vence_en = null
+        where evidencia_id = ${fuera[0]!} and workspace_id = ${wsC}`;
+      await admin`update derecho_uso set vence_en = ${hoy[0]!.d as string}
+        where evidencia_id = ${llegan[0]!} and workspace_id = ${wsC}`;
+      const bloqueada = await conUsuario(curadorId, (tx) =>
+        huellaDelMaterialDeRevision(tx, wsC, conceptoId),
+      );
+      expect(
+        bloqueada.caducada,
+        'un permiso que vence hoy sobre un documento que SÍ se manda no bloquea',
+      ).not.toBeNull();
+    });
+  });
+
+  /**
+   * Y LA LENTE A MEDIAS, que es el caso que la acotación anterior dejó abierto.
+   *
+   * Aquélla midió con dos lentes de UN documento cada una: cuando el corte deja fuera una
+   * lente entera, su único documento se va con ella y `evidenciaQueLlegoAlRevisor` ya no lo
+   * cuenta. Con una lente de DOS documentos el corte puede caer EN MEDIO — su cabecera y su
+   * primer testimonio dentro, el segundo fuera—, y entonces el primero SÍ está en «lo que
+   * llegó» aunque su lente no esté en `arquetiposQueLlegaronEnteros` y `promptRevision` no
+   * pida ninguna sesión para ella.
+   *
+   * Con un permiso que vence hoy sobre ese primer documento, la llamada entera se abortaba por
+   * material del que no puede nacer ninguna propuesta: el mismo falso bloqueo, un escalón más
+   * abajo todavía. La pregunta correcta no es «qué documentos se enseñaron» sino «qué
+   * documentos de las lentes que SE PIDEN se enseñaron», y las dos ya existían por separado.
+   *
+   * Se mide en los dos sentidos, como su hermana: sobre el documento de la lente a medias no
+   * bloquea, y movido al de una lente que sí se pide, la puerta se cierra.
+   */
+  it('el permiso que vence hoy no bloquea C4 por la lente que el recorte dejó a medias', async () => {
+    await enWorkspaceLimpio('c4-vence-lente-media', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un SEGUNDO documento en la lente que se renderiza la última, para que el corte pueda
+      // caer entre los dos. Cuál es la última lo dice el material, no el nombre.
+      const ultima = await conUsuario(curadorId, async (tx) => {
+        const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+        return material!.arquetipos[material!.arquetipos.length - 1]!.id;
+      });
+      const [fte] = await admin`select id from fuente where workspace_id = ${wsC} limit 1`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, 'Entrevista D-02',
+                'El segundo testimonio de esta misma lente.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev2!.id as string}, 'concedido', 'cliente',
+                'Consentimiento del participante', ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${ultima}, ${ev2!.id as string})`;
+
+      /*
+       * El corte se calibra por BISECCIÓN contra el material real, como sus dos hermanas, y lo
+       * que se busca es el estado exacto que el hallazgo describe: existe un documento que SÍ
+       * llegó cuya lente NO llegó entera. Leerlo así —y no contar caracteres— es lo que hace
+       * que la sonda mida lo que dice.
+       */
+      const aMediasCon = async (relleno: number) =>
+        conUsuario(curadorId, async (tx) => {
+          if (relleno >= 0) {
+            await admin`update evidencia
+              set resumen = ${'El segundo testimonio de esta misma lente.' + '·'.repeat(relleno)}
+              where id = ${ev2!.id as string}`;
+          }
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          const llego = new Set(evidenciaQueLlegoAlRevisor(material!).ids);
+          const enteras = new Set(arquetiposQueLlegaronEnteros(material!).ids);
+          const aMedias = material!.arquetipos
+            .filter((a) => !enteras.has(a.id))
+            .flatMap((a) => a.evidencia.map((e) => e.id))
+            .filter((id) => llego.has(id));
+          const deLasQueSePiden = material!.arquetipos
+            .filter((a) => enteras.has(a.id))
+            .flatMap((a) => a.evidencia.map((e) => e.id))
+            .filter((id) => llego.has(id));
+          return { aMedias, deLasQueSePiden };
+        });
+
+      let cabe = 0;
+      let noCabe = MAX_MATERIAL + 2_000;
+      expect((await aMediasCon(cabe)).aMedias.length, 'sin relleno ya había una lente a medias').toBe(0);
+      while (noCabe - cabe > 1) {
+        const medio = (cabe + noCabe) >> 1;
+        if ((await aMediasCon(medio)).aMedias.length === 0) cabe = medio;
+        else noCabe = medio;
+      }
+      const { aMedias, deLasQueSePiden } = await aMediasCon(noCabe);
+      expect(
+        aMedias.length,
+        'no se logró cortar una lente POR LA MITAD: la sonda no mide el caso del hallazgo',
+      ).toBeGreaterThan(0);
+      expect(
+        deLasQueSePiden.length,
+        'no queda ninguna lente entera: entonces la llamada ni se pide y la sonda mediría otra puerta',
+      ).toBeGreaterThan(0);
+
+      const hoy = await admin`select fecha_de_la_base() as d`;
+      // El permiso del documento de la lente A MEDIAS vence hoy: nadie va a pedir esa sesión.
+      await admin`update derecho_uso set vence_en = ${hoy[0]!.d as string}
+        where evidencia_id = ${aMedias[0]!} and workspace_id = ${wsC}`;
+      const sinBloquear = await conUsuario(curadorId, (tx) =>
+        huellaDelMaterialDeRevision(tx, wsC, conceptoId),
+      );
+      expect(
+        sinBloquear.caducada,
+        'un permiso sobre la lente que el recorte dejó a medias bloquea la llamada entera',
+      ).toBeNull();
+
+      // Y sobre el de una lente que SÍ se pide, la puerta se cierra: es la misma puerta.
+      await admin`update derecho_uso set vence_en = null
+        where evidencia_id = ${aMedias[0]!} and workspace_id = ${wsC}`;
+      await admin`update derecho_uso set vence_en = ${hoy[0]!.d as string}
+        where evidencia_id = ${deLasQueSePiden[0]!} and workspace_id = ${wsC}`;
+      const bloqueada = await conUsuario(curadorId, (tx) =>
+        huellaDelMaterialDeRevision(tx, wsC, conceptoId),
+      );
+      expect(
+        bloqueada.caducada,
+        'un permiso que vence hoy sobre una lente que sí se pide no bloquea',
+      ).not.toBeNull();
+    });
+  });
+
+  /**
+   * EL ALCANCE ES DE LA LENTE, no del lote — y con el del lote una lente que CRECE pasa.
+   *
+   * `alcance_evidencia` se escribía con lo que llegó al modelo en TODO el material, y de una
+   * fila de C4 el material trae varias lentes: el mismo array iba a las N propuestas del lote.
+   * Entonces la primera comprobación del sello —«¿tiene este arquetipo evidencia que la
+   * revisión no llegó a ver?»— se contesta contra un conjunto que incluye documentos de OTRAS
+   * lentes, y basta con que el documento nuevo ya estuviera ahí por otra para que la pregunta
+   * diga que no falta nada.
+   *
+   * El caso es exactamente el que SYS-20 quiere impedir por el otro lado: una frase con voz del
+   * «apurado de RR. HH.» sostenida en el testimonio del «desconfiado digital». Aquí no se cita
+   * mal —eso ya lo para el guard de las citas—, se SELLA una sesión de una lente que hoy tiene
+   * un testimonio que aquella sesión no leyó, con el argumento de que alguien lo leyó.
+   *
+   * Y no lo tapa el servicio: la huella del material sí se movería, pero este guard existe
+   * porque la superficie concedida deja escribir el sello sin pasar por ahí.
+   */
+  it('el alcance de una propuesta de C4 es el de SU lente, no el del lote', async () => {
+    await enWorkspaceLimpio('c4-alcance-lente', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const sesion = (arquetipoId: string, evidenciaId: string, quien: string) => ({
+        arquetipoId,
+        sintesis: `Una lectura de ${quien}.`,
+        hallazgos: [
+          {
+            titulo: `Lo que ${quien} pide`,
+            descripcion: 'Sale de su testimonio.',
+            esHipotesis: false,
+            citas: [{ evidenciaId, fragmento: 'No entrego la cédula', localizacion: 'resumen' }],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Y si no?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [sesion(lenteA, evA, 'el primero'), sesion(lenteB, evB, 'el segundo')],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const filas = await admin`select contenido ->> 'arquetipoId' as lente, alcance_evidencia
+          from propuesta_ai where workspace_id = ${wsC} and capacidad = 'C4'`;
+      expect(filas.length, 'el lote no trajo las dos sesiones').toBe(2);
+      expect(
+        Object.fromEntries(filas.map((f) => [f.lente as string, [...(f.alcance_evidencia as string[])].sort()])),
+        'el alcance de cada propuesta no es el de su propia lente',
+      ).toEqual({ [lenteA]: [evA], [lenteB]: [evB] });
+
+      // Y lo que eso compra, medido en el sello: la lente del segundo CRECE con el documento
+      // del primero, y su revisión —que no lo leyó bajo esa lente— deja de poder sellarse.
+      await conUsuario(curadorId, (tx) =>
+        tx`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+             values (${wsC}, ${lenteB}, ${evA})`,
+      );
+      const [pB] = await admin`select id from propuesta_ai
+          where workspace_id = ${wsC} and capacidad = 'C4'
+            and contenido ->> 'arquetipoId' = ${lenteB}`;
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura de el segundo.', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Lo que el segundo pide',
+                    'Sale de su testimonio.', false)
+            returning id`;
+          /*
+           * El pasaje, EL DE LA PROPUESTA. Aquí decía «Si tarda más de un café» mientras el
+           * contenido de esa sesión dice «No entrego la cédula», y pasaba porque nada comparaba
+           * el texto del enlace: el hueco que la ronda 48 cerró estaba también en esta sonda,
+           * escrito a mano. Con la comparación puesta, dejarlo así mediría el guard del pasaje
+           * en vez del alcance de la lente, que es lo que este caso existe para medir.
+           */
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evB}, ${wsC}, 'No entrego la cédula', 'resumen')`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Y si no?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${pB!.id as string} and workspace_id = ${wsC}`;
+        }),
+      ).rejects.toThrow(/no llegó a ver/i);
+    });
+  });
+
+  /**
+   * Y una lente que se quedó sin evidencia utilizable tampoco se sella.
+   *
+   * La avería que la señaló venía escrita como «evidencia desenlazada del arquetipo», y ESO no
+   * se reproduce: `designio_app` tiene INSERT y SELECT sobre `arquetipo_evidencia` y ninguna
+   * política de DELETE, así que por la superficie concedida un enlace no se quita. Lo que sí
+   * ocurre —y es la misma consecuencia por otra puerta— es que el enlace siga y la evidencia
+   * deje de ser utilizable: el derecho se revoca, caduca, o el documento se va.
+   *
+   * Entonces la lente se queda vacía, y sellar ahí contradice la puerta que la GENERACIÓN ya
+   * tiene: sin lentes no se pide la revisión, porque lo que volvería es «un perfil inventado
+   * hablando en primera persona». La misma regla, y hasta ahora solo en un extremo del camino.
+   *
+   * La sesión es de HIPÓTESIS PURA a propósito: con una cita, esto ya lo para DR001 unas
+   * líneas más arriba, y la sonda no mediría lo que dice medir.
+   */
+  it('C4 no sella una revisión cuya lente se quedó sin evidencia utilizable', async () => {
+    await enWorkspaceLimpio('c4-lente-vacia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Primero, la medición que refuta el mecanismo tal como venía escrito.
+      const desenlazar = await conUsuario(curadorId, (tx) =>
+        tx`delete from arquetipo_evidencia
+            where arquetipo_id = ${lenteA} and workspace_id = ${wsC}`,
+      ).then(
+        () => 'pasó',
+        (e: unknown) => (e as Error).message,
+      );
+      expect(desenlazar, 'la superficie concedida deja desenlazar evidencia del arquetipo').toMatch(
+        /permission denied|denegado/i,
+      );
+
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura sin nada que citar.',
+        hallazgos: [
+          {
+            titulo: 'Probablemente dude',
+            descripcion: 'Extrapolando del perfil, dudaría antes de entregar nada.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Dudarías?', escenario: '' }],
+        confianzaPropuesta: 'baja',
+      };
+      const propuestaId = await conUsuario(curadorId, async (tx) => {
+        const [ll] = await tx`insert into llamada_ai
+          (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+          values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                  'salida-valida', ${curadorId})
+          returning id`;
+        const [p] = await tx`insert into propuesta_ai
+          (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, es_simulacion, creado_por)
+          values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                  ${tx.json(contenido)}, ${tx.json(contenido)},
+                  'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                  'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+          returning id`;
+        return p!.id as string;
+      });
+      // Y ahora la lente se vacía sin que nadie desenlace nada: se retira el derecho de cita.
+      // Va por administración porque `designio_app` no tiene UPDATE sobre `derecho_uso`.
+      await admin`update derecho_uso
+           set estado = 'denegado', ambito = 'interno', vence_en = null
+         where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura sin nada que citar.',
+                    ${curadorId})
+            returning id`;
+          await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Probablemente dude',
+                    'Extrapolando del perfil, dudaría antes de entregar nada.', true)`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Dudarías?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${propuestaId} and workspace_id = ${wsC}`;
+        }),
+      ).rejects.toThrow(/sin evidencia utilizable/i);
+    });
+  });
+
+  /**
+   * Y una corrección no reparte las citas entre los hallazgos.
+   *
+   * Las citas de C4 viven DENTRO de cada hallazgo, y `CITAS_DEL_CONTENIDO` las aplana para
+   * medirlas. Aplanadas, `[A], [B]` y `[A, B], []` son la misma lista: la comprobación de «las
+   * citas no se corrigen» las ve idénticas y deja pasar la corrección, y la materialización
+   * persiste el reparto NUEVO. O sea que se puede mover el documento que sostenía a una
+   * hipótesis debajo de una afirmación, que es la única relación contrastable que hay aquí:
+   * qué documento sostiene cuál lectura.
+   *
+   * La marca de hipótesis no lo estorba: la lista de marcas no se mueve, y un hallazgo que se
+   * queda sin citas ya venía marcado.
+   */
+  it('C4 no deja repartir las citas entre hallazgos al corregir, y sí reescribir sus textos', async () => {
+    await enWorkspaceLimpio('c4-reparto-citas', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const citaAfirmada = {
+        evidenciaId: evA,
+        fragmento: 'No entrego la cédula',
+        localizacion: 'resumen',
+      };
+      const citaHipotesis = {
+        evidenciaId: evA,
+        fragmento: 'sin saber para qué',
+        localizacion: 'resumen',
+      };
+      // Una TERCERA: un reparto sólo es reparto si los dos hallazgos siguen citando algo, desde
+      // que las dos clases de RF-08.2 se excluyen.
+      const citaTres = { evidenciaId: evA, fragmento: 'la cédula', localizacion: 'resumen' };
+      const original = {
+        arquetipoId: lenteA,
+        sintesis: 'Dos lecturas del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [citaAfirmada, citaTres],
+          },
+          {
+            // OBSERVADO y no hipótesis: este hallazgo lleva su propia cita, y desde que las dos
+            // clases de RF-08.2 se excluyen, marcarlo como extrapolación con un testimonio
+            // detrás es justo lo que la base rechaza. Lo que la sonda mide —que las citas no se
+            // reparten entre hallazgos— necesita dos hallazgos CITADOS, no uno de cada clase.
+            titulo: 'Se va por el tiempo',
+            descripcion: 'Dice que abandona si tarda.',
+            esHipotesis: false,
+            citas: [citaHipotesis],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      };
+      const pedir = async () => {
+        await conProveedor(
+          { ok: true, datos: { revisiones: [original] }, intentos: [intento({ uso: null })] },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        );
+        const panel = await panelPropuestas(curadorId, wsC);
+        return panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      };
+
+      const propuestaId = await pedir();
+      /*
+       * La lista aplanada es la MISMA —dos citas, en el mismo orden— y las marcas también. Lo
+       * único que cambia es de quién cuelga cada una: la primera se muda al segundo hallazgo.
+       *
+       * Los DOS siguen citando algo, y eso importa desde que las dos clases de RF-08.2 se
+       * excluyen: dejar uno a cero lo pararía el CONTRATO —«la corrección no cumple el formato
+       * de la capacidad»— y la sonda estaría midiendo esa puerta en vez del reparto. Medido: es
+       * exactamente lo que respondía al escribirlo así.
+       */
+      await expect(
+        aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId,
+          correccion: {
+            ...original,
+            hallazgos: [
+              { ...original.hallazgos[0]!, citas: [citaAfirmada] },
+              { ...original.hallazgos[1]!, citas: [citaTres, citaHipotesis] },
+            ],
+          },
+        }),
+      ).rejects.toThrow(/no se corrigen/i);
+
+      // Y el otro sentido: los TEXTOS sí se corrigen, que es para lo que está la revisión.
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId,
+        correccion: {
+          ...original,
+          hallazgos: [
+            { ...original.hallazgos[0]!, descripcion: 'No entrega el documento sin un motivo.' },
+            { ...original.hallazgos[1]!, titulo: 'Quizá abandone antes de terminar' },
+          ],
+        },
+      });
+      expect(objetoId).toBeTruthy();
+    });
+  });
+
+  /**
+   * El sello de procedencia está ATADO en todas las que lo llevan, no en casi todas.
+   *
+   * `propuesta_ai_id` es la traza permanente de qué propuesta creó una fila, y siete tablas la
+   * tienen. `revision_simulada` nació sin clave ajena: por el código privilegiado —seed,
+   * importaciones, backfills— podía quedar apuntando a una propuesta inexistente o de otro
+   * tenant, y entonces la procedencia deja de estar garantizada por la base y pasa a ser una
+   * costumbre.
+   *
+   * Se barre el ESQUEMA y no una lista escrita aquí: la octava tabla que lleve la columna entra
+   * sola en este censo, que es justo lo que falló esta vez.
+   *
+   * Lo que NO se exige es unicidad: ninguna de las siete la tiene, y el uno-a-uno lo impone el
+   * otro extremo —el guard de materialización pide que el objeto haya NACIDO en la aceptación
+   * que lo sella, así que una segunda propuesta no puede adoptar uno que ya existía—.
+   */
+  it('toda tabla con sello de propuesta lo tiene atado al tenant', async () => {
+    const admin = sqlAdmin();
+    const conSello = await admin`select c.table_name from information_schema.columns c
+      join information_schema.tables t on t.table_name = c.table_name
+       and t.table_schema = c.table_schema and t.table_type = 'BASE TABLE'
+      where c.table_schema = 'public' and c.column_name = 'propuesta_ai_id'
+      order by c.table_name`;
+    expect(conSello.length, 'ninguna tabla lleva el sello: el censo no mide nada').toBeGreaterThan(
+      1,
+    );
+    const sinAtar: string[] = [];
+    for (const fila of conSello) {
+      const tabla = fila.table_name as string;
+      const [atada] = await admin`select count(*)::int as n from pg_constraint
+        where conrelid = ${tabla}::regclass and contype = 'f'
+          and confrelid = 'propuesta_ai'::regclass
+          and pg_get_constraintdef(oid) like '%(propuesta_ai_id, workspace_id)%'`;
+      if ((atada!.n as number) === 0) sinAtar.push(tabla);
+    }
+    expect(
+      sinAtar,
+      'estas tablas guardan de qué propuesta salió su fila y nada lo garantiza: el puntero puede señalar a una propuesta que no existe, o a una de otro workspace',
+    ).toEqual([]);
+  });
+
+  /**
+   * El veredicto que llega MIENTRAS la escritura espera el candado.
+   *
+   * Las políticas piden concepto `candidato`, y eso cierra la escritura tardía SECUENCIAL. No
+   * la concurrente: RLS se evalúa con la instantánea de la sentencia, tomada antes de que el
+   * trigger se quedara esperando el candado del reto, y Postgres no vuelve a evaluar la
+   * política porque un BEFORE se haya bloqueado. El guard ya sabe esto —por eso vuelve a
+   * preguntar por la ventana del reto con el candado en la mano— y preguntaba solo la mitad:
+   * `reto_admite_conceptos`, nunca el estado del concepto. Ese estado lo añadí yo dos rondas
+   * después de escribir el recheck, y no lo llevé hasta aquí.
+   *
+   * La carrera se monta a propósito, no se espera a que ocurra: la otra transacción toma el
+   * candado ANTES y suelta el veredicto dentro, así que el orden está fijado y la sonda no es
+   * intermitente.
+   *
+   * DOS COSAS QUE LA CI ENSEÑÓ, y ninguna es el orden de la carrera:
+   *
+   * 1. El presupuesto de la espera era el mismo que el de la prueba —200 × 25 ms = 5 s, y
+   *    `testTimeout` son 5 s—, así que en una máquina cargada la prueba se moría DENTRO del
+   *    bucle en vez de llegar a su afirmación. Un fallo así no dice nada: no distingue «la
+   *    escritura no llegó a esperar el candado» de «esto tardó». El bucle se acorta y la
+   *    prueba recibe su propio plazo, holgado: lo que se mide sigue siendo idéntico, y lo que
+   *    cambia es que un fallo de verdad ahora sale por el `expect` que lo nombra.
+   * 2. Y `soltar()` sólo corría si todo iba bien. Al morir antes, la otra transacción se
+   *    quedaba abierta con el candado del reto en la mano, y lo siguiente que se bloqueaba era
+   *    la LIMPIEZA del workspace: un fallo aquí se llevaba por delante el resto del fichero
+   *    («Hook timed out»). Va en `finally`, que es donde va lo que hay que soltar pase lo que
+   *    pase.
+   */
+  it('C4 no deja entrar una revisión cuyo veredicto llegó mientras esperaba el candado', { timeout: 30_000 }, async () => {
+    await enWorkspaceLimpio('c4-veredicto-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+
+      // El otro: toma el candado del reto y decide el concepto DENTRO, sin cerrar todavía.
+      let soltar!: () => void;
+      const puedeCerrar = new Promise<void>((r) => {
+        soltar = r;
+      });
+      let tomado!: () => void;
+      const yaTomado = new Promise<void>((r) => {
+        tomado = r;
+      });
+      const elOtro = admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        await tx`update concepto set estado = 'pasa',
+          decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
+        tomado();
+        await puedeCerrar;
+      });
+      await yaTomado;
+
+      // Y la escritura, que toma su instantánea AHORA —con el concepto todavía candidato para
+      // ella— y se queda esperando el candado dentro del trigger.
+      const escritura = conUsuario(curadorId, (tx) =>
+        tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteA}, 'Llegó tarde', ${curadorId})`,
+      );
+      try {
+        // Hasta que de verdad esté bloqueada en el candado: se lee de `pg_locks`, no de un
+        // tiempo de espera, que es lo que haría intermitente a esta prueba.
+        /*
+         * Contando SÓLO los que esperan ESTA clave, y no todos los avisos del clúster.
+         *
+         * La primera versión contaba `locktype = 'advisory' and not granted` a secas, y eso es
+         * un número GLOBAL: en cuanto otra prueba en paralelo espera cualquier otra clave, la
+         * cuenta sube y la afirmación «es 1» se vuelve intermitente. Se vio al correr la suite
+         * entera después de que el INSERT de propuestas empezara a tomar la clave del reto:
+         * «expected 3 to be 1». La sonda medía la contención de la máquina, no la carrera.
+         *
+         * `pg_advisory_xact_lock(bigint)` parte la clave en dos mitades de 32 bits —`classid`
+         * la alta, `objid` la baja—, así que se reconstruye la pregunta a partir de la MISMA
+         * expresión que toma el candado.
+         */
+        const esperandoLaClave = async () => {
+          const [f] = await admin`select count(*)::int as n
+            from pg_locks l, (select hashtextextended(
+              'designio:reto:' || ${retoC}::text, 42) as k) c
+            where l.locktype = 'advisory' and not l.granted
+              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+          return f!.n as number;
+        };
+        for (let i = 0; i < 100; i++) {
+          if ((await esperandoLaClave()) > 0) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        const bloqueada = { n: await esperandoLaClave() };
+        expect(
+          bloqueada!.n,
+          'la escritura no llegó a esperar el candado: la sonda no mide la carrera',
+        ).toBe(1);
+      } finally {
+        // Pase lo que pase: si esto no corre, la otra transacción se queda abierta con el
+        // candado del reto y la limpieza del workspace se bloquea detrás de ella.
+        soltar();
+        await elOtro;
+      }
+      await expect(escritura).rejects.toThrow(/ya no es candidato|veredicto/i);
+    });
+  });
+
+  /**
+   * Y LA PROPUESTA TAMPOCO, que es la otra puerta y no tenía candado.
+   *
+   * La de arriba mide la escritura de la REVISIÓN, que entra por `concepto_candado_del_reto_guard`
+   * y ahí sí se toma `designio:reto:` en exclusiva. La PROPUESTA de C4 entra por otro guard, y
+   * ese sólo tomaba `for share` sobre la fila del reto — y con eso no se serializa contra nada:
+   * quien firma el pasa/muere toma la clave y luego pide la MISMA fila en compartido, así que
+   * los dos modos son compatibles y ninguno espera al otro. Está escrito en el propio guard del
+   * concepto: «entre dos escrituras de conceptos no hay espera: las dos piden compartido».
+   *
+   * Corrección de una nota mía, otra vez: junto a esta comprobación dejé escrito «el candado del
+   * reto ya está en la mano, así que lo que se lee aquí no es una foto». El `for share` no es
+   * ese candado. La lectura SÍ era una foto, y el precio es una propuesta que nace imposible de
+   * aceptar —el guard diferido y la política la paran— y que además bloquea pedir otro lote,
+   * porque el selector no ofrece un concepto con propuesta de C4 en curso. Con la llamada al
+   * proveedor ya pagada.
+   *
+   * Se mide como su hermana y por el mismo motivo: leyendo `pg_locks` en vez de esperar un
+   * tiempo, que es lo que haría intermitente la prueba.
+   */
+  it('la PROPUESTA de C4 espera al candado del reto, no solo a su fila', { timeout: 30_000 }, async () => {
+    await enWorkspaceLimpio('c4-propuesta-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura que llegó tarde.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+
+      let soltar!: () => void;
+      const puedeCerrar = new Promise<void>((r) => {
+        soltar = r;
+      });
+      let tomado!: () => void;
+      const yaTomado = new Promise<void>((r) => {
+        tomado = r;
+      });
+      const elOtro = admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        await tx`update concepto set estado = 'pasa',
+          decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
+        tomado();
+        await puedeCerrar;
+      });
+      await yaTomado;
+
+      const escritura = conUsuario(curadorId, async (tx) => {
+        const [ll] = await tx`insert into llamada_ai
+          (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+          values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                  'salida-valida', ${curadorId})
+          returning id`;
+        return tx`insert into propuesta_ai
+          (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, es_simulacion, creado_por)
+          values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                  ${tx.json(contenido)}, ${tx.json(contenido)},
+                  'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                  'entorno', ${ll!.id as string}, 0, true, ${curadorId})`;
+      });
+      try {
+        /*
+         * Contando SÓLO los que esperan ESTA clave, y no todos los avisos del clúster.
+         *
+         * La primera versión contaba `locktype = 'advisory' and not granted` a secas, y eso es
+         * un número GLOBAL: en cuanto otra prueba en paralelo espera cualquier otra clave, la
+         * cuenta sube y la afirmación «es 1» se vuelve intermitente. Se vio al correr la suite
+         * entera después de que el INSERT de propuestas empezara a tomar la clave del reto:
+         * «expected 3 to be 1». La sonda medía la contención de la máquina, no la carrera.
+         *
+         * `pg_advisory_xact_lock(bigint)` parte la clave en dos mitades de 32 bits —`classid`
+         * la alta, `objid` la baja—, así que se reconstruye la pregunta a partir de la MISMA
+         * expresión que toma el candado.
+         */
+        const esperandoLaClave = async () => {
+          const [f] = await admin`select count(*)::int as n
+            from pg_locks l, (select hashtextextended(
+              'designio:reto:' || ${retoC}::text, 42) as k) c
+            where l.locktype = 'advisory' and not l.granted
+              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+          return f!.n as number;
+        };
+        for (let i = 0; i < 100; i++) {
+          if ((await esperandoLaClave()) > 0) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        const bloqueada = { n: await esperandoLaClave() };
+        expect(
+          bloqueada!.n,
+          'la propuesta no llegó a esperar el candado del reto: nace sobre una foto',
+        ).toBe(1);
+      } finally {
+        soltar();
+        await elOtro;
+      }
+      await expect(escritura).rejects.toThrow(/ya no es candidato/i);
+    });
+  });
+
+  /**
+   * SIN AI TAMBIÉN SE ESCRIBE UNA REVISIÓN (SYS-21), que es la paridad que faltaba.
+   *
+   * «Caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre presentes», y el
+   * criterio 3 de SPEC-08 lo lleva a CI. Las cinco capacidades hermanas ya tenían su ruta manual
+   * en su propio servicio de dominio —`insight.servicio.ts`, `medicion.servicio.ts`,
+   * `oportunidad.servicio.ts`—; C4 era la ÚNICA cuyas tablas sólo escribía la materialización.
+   * Las concesiones y las políticas que la base tiene puestas para admitir una revisión a mano
+   * existían desde el principio, y no las podía ejercer nadie.
+   *
+   * Se mide lo que de verdad importa de una ruta manual: que entre ENTERA —la revisión, sus
+   * hallazgos, sus citas y sus preguntas con el hallazgo del que nacen—, que NO lleve sello de
+   * procedencia, que siga marcada como simulación, y que la lea quien decide.
+   *
+   * Y que el contrato sea el MISMO: lo que no puede escribir el modelo tampoco lo escribe una
+   * persona, porque la regla no es sobre quién escribe sino sobre qué se sostiene.
+   */
+  /**
+   * EL PASAJE COPIADO ES MATERIAL, y deja de leerse cuando el derecho de uso se va.
+   *
+   * `hallazgo_simulado_evidencia` guarda `fragmento` y `localizacion`: texto copiado del
+   * documento, no una referencia a él. Su gemela de C2 —`cita`— lo tiene dicho desde
+   * RF-03.10: la política de SELECT la gobierna `material_evidencia_visible`, no la membresía.
+   * Ésta nació pidiendo sólo membresía, así que quien no tiene el uso concedido seguía leyendo
+   * el pasaje por la superficie SQL que el rol de la aplicación tiene concedida.
+   *
+   * Y el recorte de la proyección de gobernanza no lo tapa: la lectura directa de la tabla no
+   * pasa por ahí. Menos aún en las revisiones escritas a MANO, que no tienen copia en ninguna
+   * propuesta de la que recortar.
+   *
+   * Se mide con las tres mitades que la regla tiene: quien no tiene el uso deja de ver el
+   * pasaje, la boutique lo sigue viendo porque es su material de trabajo, y la IDENTIDAD de la
+   * evidencia sigue visible para todos, que es lo que SYS-14 exige para poder explicar el
+   * bloqueo.
+   */
+  it('C4: el pasaje de una cita deja de leerse cuando se revoca el derecho de uso', async () => {
+    await enWorkspaceLimpio('c4-pasaje-sin-derechos', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un miembro sin acceso al material: `material_evidencia_visible` deja pasar siempre a
+      // lead-boutique, diseñador y admin-cliente, así que con uno de ésos no se mediría nada.
+      const correo = `${marca}-c4-pasaje-stake@test.demo`;
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${correo}, 'Sponsor del cliente', 'activo') returning id`;
+      const stakeId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${stakeId}, 'Sponsor del cliente', ${correo}, 'stakeholder')`;
+
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido: {
+          arquetipoId: lenteA,
+          sintesis: 'Lo que leo yo de este concepto con esta lente.',
+          hallazgos: [
+            {
+              titulo: 'Pide saber para qué',
+              descripcion: 'No entrega el documento sin motivo.',
+              esHipotesis: false,
+              citas: [
+                { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+              ],
+            },
+          ],
+          preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        },
+      });
+      const pasajes = (quien: string) =>
+        conUsuario(quien, (tx) => tx`select he.fragmento, he.localizacion
+          from hallazgo_simulado_evidencia he
+          join hallazgo_simulado h on h.id = he.hallazgo_id and h.workspace_id = he.workspace_id
+          where h.revision_id = ${revisionId}`);
+
+      // Con el derecho vigente lo ve: no se le esconde el trabajo, se le esconde el material
+      // que todavía no está autorizado para él.
+      expect(await pasajes(stakeId)).toHaveLength(1);
+
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno'
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+
+      expect(
+        await pasajes(stakeId),
+        'el pasaje copiado sigue legible para quien ya no tiene el uso concedido',
+      ).toHaveLength(0);
+      // Y la boutique lo sigue viendo, o el arreglo sería esconderle a todos su propio trabajo.
+      expect(await pasajes(curadorId)).toHaveLength(1);
+      // La IDENTIDAD de la evidencia sigue visible: sin ella no se puede explicar el bloqueo.
+      expect(
+        await conUsuario(stakeId, (tx) => tx`select titulo from evidencia where id = ${evA}`),
+      ).toHaveLength(1);
+      // Y el HALLAZGO al que colgaba se sigue leyendo: lo que se retira es el pasaje del
+      // documento, no la lectura que la revisión hizo de él.
+      expect(
+        await conUsuario(stakeId, (tx) => tx`select titulo from hallazgo_simulado
+          where revision_id = ${revisionId}`),
+      ).toHaveLength(1);
+
+      /*
+       * Y LA PROCEDENCIA SOBREVIVE AL RECORTE, que es la otra mitad de la misma regla y por
+       * poco se pierde con el arreglo de arriba.
+       *
+       * La proyección de gobernanza ya recortaba el pasaje —«fragmento» nulo y «citable»
+       * false— y entregaba la cita IGUAL, porque quien firma un pasa/muere tiene que poder ver
+       * que ese hallazgo se apoyaba en un documento que hoy está bloqueado. Esconder la cita
+       * ENTERA dice otra cosa: que el hallazgo nunca tuvo sostén.
+       *
+       * Con la política nueva, el `exists` contra la tabla de pasajes se evalúa bajo la RLS de
+       * quien lee, así que para el mismo lector devolvía falso y la cita desaparecía. El
+       * recorte tiene que quitar el TEXTO, no la existencia del enlace.
+       */
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4RLS', 'Proyecto de la revisión', ${curadorId})
+        returning id`;
+      for (const [quien, etiqueta] of [
+        [curadorId, 'la boutique'],
+        [stakeId, 'quien perdió el derecho'],
+      ] as const) {
+        const g = await gobernanzaDeProyecto(quien, wsC, proy!.id as string);
+        const cita = g!.conceptos
+          .flatMap((c) => c.revisiones)
+          .find((r) => r.id === revisionId)?.hallazgos[0]?.citas[0];
+        expect(
+          cita,
+          `${etiqueta} ya no ve que el hallazgo se apoyaba en un documento: la cita desapareció en vez de recortarse`,
+        ).toBeTruthy();
+        expect(cita!.citable, `${etiqueta} recibe la cita sin marcarla bloqueada`).toBe(false);
+        expect(cita!.fragmento, `${etiqueta} sigue recibiendo el pasaje recortado`).toBeNull();
+        // Y el TÍTULO del documento sigue llegando: es su identidad, no su material.
+        expect(cita!.evidenciaTitulo).toBeTruthy();
+      }
+    });
+  });
+
+  /**
+   * Y EL PASAJE VIVE TAMBIÉN EN LA PROPUESTA, que es la otra copia del mismo texto.
+   *
+   * Cerrar el enlace dejaba la mitad abierta: `propuesta_ai.contenido` guarda el `fragmento`
+   * LITERAL de cada cita, y su política autorizaba por membresía a secas. Quien perdía el
+   * derecho de uso seguía leyendo el pasaje directamente de la propuesta —que además es
+   * inmutable por SYS-17, así que no se puede limpiar después—.
+   *
+   * Una COLUMNA no se recorta con RLS. Mi primer arreglo cerró la FILA por rol y estaba mal:
+   * la pantalla de propuestas dice, con esas palabras, que quien no cura «puede ver qué se
+   * propuso, con qué citas y quién lo decidió», así que cerrarla vaciaba una lectura DECLARADA
+   * —el recuento de pendientes y el historial de lo decidido—. Yo afirmé que no escondía nada
+   * que alguien tuviera que ver: medí los lectores SQL y no la ruta.
+   *
+   * El recorte va donde la propuesta se PROYECTA, y por eso esta sonda mide las DOS mitades: la
+   * propuesta sigue llegando, y el pasaje no. La identidad del documento tampoco se toca —el
+   * `evidenciaId` sigue ahí—, porque SYS-14 exige poder explicar el bloqueo y borrar la cita
+   * entera diría que la propuesta no citó nada.
+   *
+   * La regla no es de C4: el `fragmento` de C2 vive igual en su contenido, y por eso el recorte
+   * busca por la FORMA —un objeto con `evidenciaId` ES una cita— y no por rutas por capacidad.
+   */
+  it('C4: el pasaje de una propuesta se recorta para quien no puede recibir el material', async () => {
+    await enWorkspaceLimpio('c4-propuesta-por-rol', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const correo = `${marca}-c4-propuesta-stake@test.demo`;
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${correo}, 'Sponsor del cliente', 'activo') returning id`;
+      const stakeId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${stakeId}, 'Sponsor del cliente', ${correo}, 'stakeholder')`;
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Una lectura de este perfil.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const enElPanel = async (quien: string) => {
+        const p = (await panelPropuestas(quien, wsC)).pendientes.find((x) => x.capacidad === 'C4');
+        const c = p?.contenido as ContenidoRevisionSimulada | undefined;
+        return { hay: p !== undefined, cita: c?.hallazgos[0]?.citas[0] };
+      };
+
+      // Con el derecho vigente, quien no cura ve la propuesta ENTERA: es la lectura que la
+      // pantalla declara, y sin esta mitad el arreglo sería esconderle el trabajo.
+      const antes = await enElPanel(stakeId);
+      expect(antes.hay).toBe(true);
+      expect(antes.cita!.fragmento).toBe('No entrego la cédula');
+
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno'
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+
+      // Quien cura lo sigue viendo: es su mesa de trabajo.
+      const paraCurador = await enElPanel(curadorId);
+      expect(paraCurador.cita!.fragmento).toBe('No entrego la cédula');
+
+      const despues = await enElPanel(stakeId);
+      expect(
+        despues.hay,
+        'la propuesta desapareció entera: la pantalla declara que quien no cura puede ver qué se propuso',
+      ).toBe(true);
+      // Y se sustituye por un TEXTO, no por null: el contrato declara los dos campos `string` y
+      // las fichas los interpolan, así que un nulo salía impreso como «null» en la tarjeta.
+      expect(
+        despues.cita!.fragmento,
+        'el pasaje literal de la propuesta se sigue entregando sin permiso sobre el material que copia',
+      ).toBe(PASAJE_RETIRADO);
+      expect(despues.cita!.localizacion).toBe(PASAJE_RETIRADO);
+      // Y la IDENTIDAD del documento no se toca: sin ella no se puede explicar el bloqueo, y
+      // borrar la cita entera diría que la propuesta no citó nada.
+      expect(despues.cita!.evidenciaId).toBe(evA);
+    });
+  });
+
+  /**
+   * Y UNA FILA CON UN ID QUE NO ES UN UUID NO TUMBA EL PANEL DE TODO EL WORKSPACE.
+   *
+   * El recorte de arriba busca los documentos citados por la FORMA del contenido, y su primera
+   * versión casteaba el escalar a `uuid` sin más. La única forma que la base le exige a
+   * `contenido` es ser un objeto JSON —los guards de C4 no miran los ids de dentro de cada
+   * cita—, así que una fila escrita por la superficie SQL concedida con un `evidenciaId` torcido
+   * hacía saltar «invalid input syntax for type uuid» en la consulta del panel. Y eso no
+   * degradaba una fila: tiraba `panelPropuestas` ENTERO, para todos los miembros, sin dejar
+   * siquiera rechazar la fila culpable desde la pantalla.
+   *
+   * Ahora se resuelve contra `evidencia` comparando el id de la COLUMNA en texto —un cast que
+   * no puede fallar— y lo que no resuelve se VETA. Falla cerrado, que es la respuesta correcta:
+   * un id que no nombra ningún documento de este workspace no puede autorizar el pasaje que
+   * lleva al lado.
+   */
+  /**
+   * NINGUNA COMPARACIÓN DEL GUARD DE SELLO SE APOYA EN UN ARRAY QUE PUEDE NO ESTAR.
+   *
+   * `jsonb_array_length(NULL)` es NULL, y en plpgsql un `IF NULL` no salta. Un contenido de C4
+   * sin la clave `hallazgos` dejaba la comparación de la cuenta en NULL y la del `exists` en
+   * falso —`jsonb_array_elements(NULL)` no devuelve filas—, así que `NULL or false` es NULL y el
+   * guard entero se saltaba: se podían materializar hojas arbitrarias y sellar la propuesta
+   * aunque su contenido inmutable no registrara ninguna. Eso es la procedencia rota, que es lo
+   * único que el sello promete. Medido antes de tocarlo:
+   *
+   *   rama de la cuenta es NULL: true | rama del exists: false | el IF entero NO salta: true
+   *
+   * `coalesce(..., -1)` y no `..., 0`: cero significaría «el contenido declara ninguna», que
+   * para un array obligatorio no es un estado legal, y con cero hojas selladas la comparación
+   * volvería a pasar. Menos uno no es igual a ningún recuento real, así que el guard SIEMPRE
+   * salta. Y no se apoya en que otro trigger exija al menos un hallazgo: un guard que necesita
+   * otro guard para ser total no es total.
+   *
+   * Se mide sobre el guard VIVO —`pg_get_functiondef`— y por la FORMA, no sobre los tres sitios
+   * que hay hoy: eran tres y el hallazgo nombraba dos, así que la lista escrita a mano habría
+   * dejado el tercero, que además es de C2. El cuarto lo caza esto solo.
+   */
+  it('el guard de sello no compara contra un array que puede faltar', async () => {
+    const admin = sqlAdmin();
+    const [g] = await admin`select pg_get_functiondef(oid) as cuerpo from pg_proc
+      where proname = 'propuesta_ai_materializacion_guard'`;
+    const cuerpo = g!.cuerpo as string;
+    const todas = [...cuerpo.matchAll(/jsonb_array_length\(\s*new\.contenido[^)]*\)/g)].map(
+      (m) => m[0],
+    );
+    // Y el censo se cae si no encuentra ninguna, en vez de pasar sobre una lista vacía.
+    expect(
+      todas.length,
+      'el censo no encontró ninguna lectura de array en el guard: está mirando la función equivocada',
+    ).toBeGreaterThan(0);
+    const desnudas = todas.filter(
+      (lectura) => !cuerpo.includes(`coalesce(${lectura}`) && !cuerpo.includes(`coalesce( ${lectura}`),
+    );
+    expect(
+      desnudas,
+      'una comparación del sello lee un array del contenido sin coalesce: si la clave falta, la rama vale NULL y el IF no salta, así que se puede sellar contra hojas que el contenido no declara',
+    ).toEqual([]);
+    // Y la mitad que lo hace verdad y no sólo forma: con la clave ausente, la comparación ya no
+    // es NULL sino verdadera, que es lo que hace saltar el guard.
+    const [r] = await admin`select
+      (coalesce(jsonb_array_length('{}'::jsonb->'hallazgos'), -1) <> 0) as salta,
+      (jsonb_array_length('{}'::jsonb->'hallazgos') <> 0) is null as antes_era_null`;
+    expect(r!.antes_era_null).toBe(true);
+    expect(r!.salta).toBe(true);
+  });
+
+  /**
+   * UNA CITA GUARDADA EN MAYÚSCULA NO CONVIERTE LA PROPUESTA EN INCORREGIBLE.
+   *
+   * Es la sexta vez que un identificador comparado en crudo cuesta una ronda en este PR, y la
+   * segunda con esta forma exacta: la ronda 35 la arregló para el `arquetipoId` y las citas se
+   * quedaron byte a byte, una capa más adentro. Peor: el comentario que lo justificaba decía que
+   * las citas «son texto, y ahí la igualdad exacta es la pregunta» — y una cita lleva un uuid.
+   *
+   * Con el id guardado en mayúscula, el contrato lo baja al parsear la corrección y las dos
+   * capas —el guard de la base y la comprobación del servicio— leían esa normalización como una
+   * edición del testimonio. La propuesta sólo se podía aceptar tal cual o rechazar.
+   *
+   * Y la otra mitad, sin la cual esto sería debilitar el guard: mover una cita de hallazgo
+   * SIGUE rechazándose. Es lo único contrastable que hay en una revisión simulada.
+   */
+  it('C4 corrige los textos de una propuesta cuya cita se guardó en mayúscula, y no las citas', async () => {
+    await enWorkspaceLimpio('c4-cita-mayuscula-correccion', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+          {
+            titulo: 'Puede que abandone antes',
+            descripcion: 'Extrapolado del perfil.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      };
+      // Por el camino real, para que la huella del material sea la de verdad.
+      await conProveedor(
+        { ok: true, datos: { revisiones: [contenido] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+      // Y se sube la caja del id de la CITA por fuera del servicio, en las dos columnas: lo que
+      // se simula es una fila que NACIÓ así, no una corrección.
+      for (const col of ['contenido', 'contenido_original']) {
+        await admin`update propuesta_ai
+            set ${admin(col)} = jsonb_set(${admin(col)}, '{hallazgos,0,citas,0,evidenciaId}',
+                                          to_jsonb(upper(${evA}::text)))
+          where id = ${propuestaId} and workspace_id = ${wsC}`;
+      }
+
+      /*
+       * Cambiar la cita DE VERDAD sigue rechazándose, esté el id en la caja que esté. Se cambia
+       * el `fragmento` y no el reparto porque mover una cita a un hallazgo marcado como
+       * hipótesis lo rechaza ANTES el contrato —una hipótesis no lleva citas, que es la mitad
+       * de SYS-20 que hace que la marca signifique algo—, y esa puerta no es la que se mide
+       * aquí. Medido: sin esto salía «La corrección no cumple el formato de la capacidad».
+       */
+      await expect(
+        aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId,
+          correccion: {
+            ...contenido,
+            hallazgos: [
+              {
+                ...contenido.hallazgos[0]!,
+                citas: [{ ...contenido.hallazgos[0]!.citas[0]!, fragmento: 'Otra cosa dijo' }],
+              },
+              contenido.hallazgos[1]!,
+            ],
+          },
+        }),
+      ).rejects.toThrow(/citas/i);
+
+      // Y corregir los TEXTOS entra, que es para lo que existe la corrección.
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId,
+        correccion: { ...contenido, sintesis: 'La misma lectura, con la síntesis pulida.' },
+      });
+      const [fila] = await admin`select sintesis from revision_simulada where id = ${objetoId}`;
+      expect(fila!.sintesis).toBe('La misma lectura, con la síntesis pulida.');
+      // Y el enlace materializado cuelga del documento de verdad, no de un id en otra caja.
+      const [enlace] = await admin`select he.evidencia_id from hallazgo_simulado_evidencia he
+        join hallazgo_simulado h on h.id = he.hallazgo_id and h.workspace_id = he.workspace_id
+        where h.revision_id = ${objetoId}`;
+      expect(enlace!.evidencia_id).toBe(evA);
+    });
+  });
+
+  /**
+   * Y UN CONTENIDO SIN LA CLAVE DE SUS CITAS TAMPOCO, que es la misma avería una capa arriba.
+   *
+   * La ronda anterior la cerró en la CONSULTA —un `::uuid` sobre un escalar del contenido— y
+   * quedaba la de TypeScript: los lectores de citas dan por buena la forma de su capacidad
+   * (`(c as X).citas`, o un `flatMap` sobre `hallazgos`), y la base sólo exige que `contenido`
+   * sea un objeto JSON. Un `.flatMap` sobre `undefined` no degradaba una fila: tiraba
+   * `panelPropuestas` entero, para todos los miembros, y con él el control de rechazar la fila
+   * culpable. La avería se cerraba sobre sí misma, igual que la anterior.
+   *
+   * Y no es de C4: las NUEVE capacidades leen así. Por eso el arreglo está en la costura de la
+   * que salen todas y no en el lector que se reportó.
+   *
+   * Lo que se comprueba aquí es lo que la avería impedía: que la propuesta se pueda VER y
+   * RECHAZAR. Aceptarla sigue siendo imposible, y eso también se mide.
+   */
+  /**
+   * UNA PREGUNTA QUE DICE NACER DEL HALLAZGO 7 NO SE SELLA COMO SI NO NACIERA DE NINGUNO.
+   *
+   * El enlace pregunta→hallazgo se comprueba por ÍNDICE, con una subconsulta escalar. Y una
+   * subconsulta escalar que no encuentra fila devuelve NULL — exactamente lo mismo que devuelve
+   * cuando la clave no está—, así que con `is not distinct from` un `hallazgo_id` nulo
+   * satisfacía las DOS lecturas: la propuesta declaraba «esta pregunta nace del hallazgo 7», se
+   * materializaba sin enlace, y el sello lo daba por bueno. El rastro se borraba en silencio, y
+   * ese enlace es lo que distingue «ve a comprobar ESTE riesgo que la simulación se inventó» de
+   * una pregunta suelta.
+   *
+   * Es la tercera vez en este fichero que NULL significa dos cosas y la comparación no las
+   * distingue. Lo que lo arregla no es tratar el NULL: es preguntar por la PRESENCIA de la
+   * clave, que es la única forma de separar «no lo declara» de «lo declara mal».
+   *
+   * DOS CAPAS, y por eso el patrón acepta los dos mensajes. El servicio ya comprobaba el rango
+   * —«esa revisión dice que su pregunta N nace del hallazgo M, y sólo trae K»— y es el que
+   * responde por este camino, que es el que usa quien revisa. El agujero estaba en el SUELO,
+   * que es lo que queda cuando alguien escribe por la superficie SQL concedida sin pasar por el
+   * servicio. Medido neutralizando la comprobación del servicio: el guard de la base rechaza
+   * igual, con su propio motivo. Las dos cubren la misma regla y sólo el mensaje las separa.
+   */
+  it('C4: una pregunta con un hallazgoIndice que no existe no se puede sellar', async () => {
+    await enWorkspaceLimpio('c4-indice-fuera-de-rango', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '', hallazgoIndice: 0 }],
+        confianzaPropuesta: 'media' as const,
+      };
+      await conProveedor(
+        { ok: true, datos: { revisiones: [contenido] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+      // Fuera de rango, por fuera del servicio: el contrato acota el índice al parsear, así que
+      // sólo puede llegar así por la superficie SQL concedida.
+      for (const col of ['contenido', 'contenido_original']) {
+        await admin`update propuesta_ai
+            set ${admin(col)} = jsonb_set(${admin(col)}, '{preguntas,0,hallazgoIndice}',
+                                          to_jsonb(7))
+          where id = ${propuestaId} and workspace_id = ${wsC}`;
+      }
+
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId }),
+        'una pregunta que dice nacer de un hallazgo inexistente se selló como si no naciera de ninguno',
+      ).rejects.toThrow(/de qué hallazgo nacen|nace del hallazgo/i);
+
+      // Y la mitad sin la cual esto pasaría con el enlace tapiado: un índice que SÍ existe se
+      // sella con normalidad, y la pregunta cuelga de su hallazgo.
+      for (const col of ['contenido', 'contenido_original']) {
+        await admin`update propuesta_ai
+            set ${admin(col)} = jsonb_set(${admin(col)}, '{preguntas,0,hallazgoIndice}',
+                                          to_jsonb(0))
+          where id = ${propuestaId} and workspace_id = ${wsC}`;
+      }
+      const { objetoId } = await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      const [q] = await admin`select q.hallazgo_id, h.orden from pregunta_de_test q
+        join hallazgo_simulado h on h.id = q.hallazgo_id and h.workspace_id = q.workspace_id
+        where q.revision_id = ${objetoId}`;
+      expect(q!.orden).toBe(0);
+    });
+  });
+
+  it('C4: un contenido sin la clave de sus citas no tumba el panel, y se puede rechazar', async () => {
+    await enWorkspaceLimpio('c4-sin-hallazgos', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Una lectura de este perfil.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+      // Por fuera del servicio: el contrato exige la clave al parsear, así que una fila sin ella
+      // sólo puede llegar por la superficie SQL concedida, que es de la que habla el hallazgo.
+      await admin`update propuesta_ai
+          set contenido = contenido - 'hallazgos',
+              contenido_original = contenido_original - 'hallazgos'
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const rota = panel.pendientes.find((x) => x.id === propuestaId);
+      expect(rota, 'el panel entero se cayó por una fila a la que le falta una clave').toBeTruthy();
+      // Cero citas es la respuesta honesta: no hay dónde buscarlas.
+      expect(rota!.citas).toEqual([]);
+      // Y el panel dice que no la certifica, que es lo que la pantalla necesita para no
+      // atravesarla: sin esto, la ficha de C4 hacía `.map` sobre `undefined` y se llevaba la
+      // ruta entera, con el botón de rechazar dentro.
+      expect(rota!.contenidoLegible).toBe(false);
+      expect(rota!.contenido).toBeNull();
+      // Aceptarla sigue siendo imposible, que es la otra mitad: esto no abre una puerta.
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId }),
+      ).rejects.toThrow();
+      // Y lo que la avería impedía: rechazarla.
+      await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      expect(
+        (await panelPropuestas(curadorId, wsC)).pendientes.some((x) => x.id === propuestaId),
+      ).toBe(false);
+    });
+  });
+
+  /*
+   * EL CENSO DE LA PUERTA, sobre las NUEVE y no sobre la que lo cobró.
+   *
+   * Lo que se midió antes de ponerla: con un contenido al que le falta una clave, SIETE de las
+   * nueve fichas de la pantalla revientan («Cannot read properties of undefined (reading
+   * 'map')»), y lo que se cae con ellas no es una tarjeta sino la ruta entera —con el botón de
+   * rechazar dentro, que es lo único que esa fila admite—. Las otras dos no revientan por
+   * casualidad: sólo leen escalares. O sea que la regla no es de C4, es de las nueve, y por eso
+   * la puerta está en la proyección y no en la ficha que lo cobró.
+   *
+   * Y mide las dos direcciones. Sólo el `false` habría pasado con una puerta que dijera que no
+   * a todo —y entonces NINGUNA propuesta sería presentable, que es la avería opuesta y peor—.
+   */
+  it('el panel certifica el contenido de las nueve capacidades, y sólo cuando lo cumple', () => {
+    /*
+     * C5 entra al censo con una remediación puesta AQUÍ, y el motivo está en su fixture: el de
+     * por omisión va vacío a propósito —una remediación tiene que señalar una señal real del
+     * grafo, y un id inventado haría nacer torcida toda propuesta de C5 que no lo pisara—, así
+     * que no cumple su propio contrato, que pide al menos una. Lo cazó este censo, que era su
+     * trabajo. Lo que se mide aquí es la FORMA; que la señal exista lo comprueba el servicio y
+     * eso se mide en las sondas de C5. Dejar a C5 fuera habría sido peor que arreglarle el
+     * fixture: un censo con una excepción no es un censo.
+     */
+    const queCumple: Record<CapacidadActiva, ContenidoPropuesta> = {
+      ...CONTENIDO_POR_CAPACIDAD,
+      C5: {
+        ...(CONTENIDO_POR_CAPACIDAD.C5 as ContenidoRemediacionJourney),
+        remediaciones: [
+          {
+            nodoId: crypto.randomUUID(),
+            codigo: CODIGOS_SENAL[0]!,
+            comoCerrarlo: 'Cierra la señal editando el nodo.',
+          },
+        ],
+      },
+    };
+    for (const capacidad of CAPACIDADES_ACTIVAS) {
+      expect(contenidoLegible(capacidad, queCumple[capacidad]), capacidad).toBe(true);
+      // Lo que la ficha atravesaría: un objeto sin las claves que su capacidad declara.
+      expect(contenidoLegible(capacidad, {}), capacidad).toBe(false);
+      expect(contenidoLegible(capacidad, null), capacidad).toBe(false);
+    }
+    /*
+     * Y una capacidad sin esquema declarado tampoco se certifica. No es un caso de laboratorio:
+     * las filas traen las DIEZ de SPEC-08 y el registro cubre las ACTIVAS, así que una escrita
+     * por un servidor más nuevo llega aquí. Sin forma declarada no hay nada que certificar, y
+     * la respuesta es fallar cerrado —la pantalla tiene su propio aviso para ese caso, que dice
+     * lo que sí arregla: actualizar la aplicación—.
+     */
+    expect(contenidoLegible('C1-D', CONTENIDO_POR_CAPACIDAD.C4)).toBe(false);
+  });
+
+  /*
+   * Y la otra mitad del censo, del lado de la pantalla: que la puerta siga siendo UNA.
+   *
+   * El compilador ya lo sujeta —en la rama ilegible el contenido es `null`, así que los tres
+   * sitios que lo atraviesan no compilan sin preguntar—, pero un error de tipos se calla con
+   * un `as` y este censo no. Cuenta la lectura, que es lo que no puede multiplicarse: nueve
+   * fichas leyendo cada una por su cuenta es exactamente la forma en que esto se rompió.
+   */
+  it('la pantalla de propuestas lee el contenido de la fila por una sola puerta', async () => {
+    const fuente = await readFile('src/routes/_autenticada/propuestas.tsx', 'utf8');
+    const lecturas = fuente.match(/propuesta\.contenido\b/g) ?? [];
+    expect(
+      lecturas.length,
+      'el contenido de la fila se lee en más de un sitio: la puerta que lo certifica es una, y cada lectura de más es una ficha que puede atravesar lo que no cumple su capacidad',
+    ).toBe(1);
+  });
+
+  it('C4: una cita con un id que no es uuid no tumba el panel entero', async () => {
+    await enWorkspaceLimpio('c4-id-torcido', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Una lectura de este perfil.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+      // Por fuera del servicio, que es la superficie de la que habla el hallazgo: el contrato
+      // canoniza al parsear, así que un id torcido sólo puede llegar a la fila por aquí.
+      await admin`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{hallazgos,0,citas,0,evidenciaId}',
+                                    to_jsonb('no-es-un-uuid'::text)),
+              contenido_original = jsonb_set(contenido_original,
+                                             '{hallazgos,0,citas,0,evidenciaId}',
+                                             to_jsonb('no-es-un-uuid'::text))
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const rota = panel.pendientes.find((x) => x.id === propuestaId);
+      expect(rota, 'el panel entero se cayó por una sola fila con un id torcido').toBeTruthy();
+      /*
+       * Y la fila torcida viaja SIN contenido. Antes viajaba con él y con el pasaje recortado
+       * —un id que no nombra ningún documento no autoriza nada—, y eso seguía siendo un
+       * contenido que no cumple el contrato de su capacidad tipado como si lo cumpliera: la
+       * pantalla lo atravesaba entero. Ahora el panel lo marca ilegible y no lo manda, así que
+       * el pasaje tampoco puede escaparse por aquí. El recorte de pasajes sigue medido donde
+       * SÍ se ve —con un id válido de un documento que quien lee no puede recibir—, que es su
+       * caso de verdad.
+       */
+      expect(rota!.contenidoLegible).toBe(false);
+      expect(rota!.contenido).toBeNull();
+      expect(rota!.contenidoOriginal).toBeNull();
+      // Lo que importa de verdad: se puede DECIDIR, que es lo que la avería impedía.
+      await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      expect(
+        (await panelPropuestas(curadorId, wsC)).pendientes.some((x) => x.id === propuestaId),
+      ).toBe(false);
+    });
+  });
+
+  it('sin AI, una revisión simulada se escribe a mano y llega entera (SYS-21)', async () => {
+    await enWorkspaceLimpio('c4-a-mano-sys21', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4M', 'Proyecto de la revisión a mano', ${curadorId})
+        returning id`;
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo de este concepto con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+          {
+            titulo: 'Puede que abandone antes',
+            descripcion: 'Extrapolado del perfil, sin testimonio que lo diga.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [
+          { pregunta: '¿Qué te haría entregarla?', escenario: '', hallazgoIndice: 0 },
+          { pregunta: '¿Y si te lo pide la sucursal?', escenario: 'En sucursal' },
+        ],
+      };
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido,
+      });
+      expect(revisionId).toBeTruthy();
+
+      // Sin sello de procedencia, y con la marca de simulación puesta por el default de la
+      // columna: las dos mitades de SYS-20 sobre una fila que no salió de ninguna propuesta.
+      const [fila] = await admin`select propuesta_ai_id, es_simulacion, arquetipo_id
+        from revision_simulada where id = ${revisionId}`;
+      expect(fila!.propuesta_ai_id, 'una revisión a mano no lleva sello de procedencia').toBeNull();
+      expect(fila!.es_simulacion).toBe(true);
+      expect(fila!.arquetipo_id).toBe(lenteA);
+
+      // Entera: los dos hallazgos con su orden, la cita del afirmativo, y las dos preguntas —
+      // una colgando de su hallazgo y la otra suelta.
+      const hallazgos = await admin`select id, orden, titulo, es_hipotesis from hallazgo_simulado
+        where revision_id = ${revisionId} order by orden`;
+      expect(hallazgos.map((h) => h.es_hipotesis)).toEqual([false, true]);
+      const [citas] = await admin`select count(*)::int as n from hallazgo_simulado_evidencia
+        where hallazgo_id = ${hallazgos[0]!.id as string}`;
+      expect(citas!.n).toBe(1);
+      const preguntas = await admin`select hallazgo_id, orden from pregunta_de_test
+        where revision_id = ${revisionId} order by orden`;
+      expect(preguntas.map((q) => q.hallazgo_id)).toEqual([hallazgos[0]!.id, null]);
+
+      // Y la lee quien decide, por el mismo lector que las aceptadas.
+      const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const revisiones = gob!.conceptos.find((c) => c.id === conceptoId)?.revisiones ?? [];
+      expect(revisiones.length, 'la revisión escrita a mano no llega a quien decide').toBe(1);
+      expect(revisiones[0]!.preguntas.length).toBe(2);
+
+      /*
+       * Un hallazgo afirmativo sin cita no entra, lo escriba quien lo escriba. Y las DOS capas
+       * dicen que no, que es lo que separa «hay ruta manual» de «hay una puerta trasera»: el
+       * contrato en la frontera —el mismo que gobierna al proveedor— y el guard diferido en el
+       * commit. Se comprueban por separado porque el servicio recibe un valor YA tipado: llamarlo
+       * a pelo mide el suelo, no el contrato, y esta nota decía «el contrato es el mismo» sobre
+       * una sola de las dos.
+       */
+      expect(
+        EscribirRevisionAManoSchema.safeParse({
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            ...contenido,
+            hallazgos: [{ ...contenido.hallazgos[0]!, citas: [] }],
+            preguntas: [{ pregunta: '¿Y esto?', escenario: '' }],
+          },
+        }).success,
+      ).toBe(false);
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            ...contenido,
+            hallazgos: [{ ...contenido.hallazgos[0]!, citas: [] }],
+            preguntas: [{ pregunta: '¿Y esto?', escenario: '' }],
+          },
+        }),
+      ).rejects.toThrow();
+    });
+  });
+
+  /**
+   * LO QUE LA RUTA MANUAL PROMETÍA Y NO TENÍA: el pasaje, el borrado y las clases excluyentes.
+   *
+   * Tres consecuencias de haber añadido la escritura a mano, y las tres se ven sólo desde ella:
+   *
+   *  · EL PASAJE. Una revisión propuesta guarda el fragmento en `propuesta_ai.contenido`, que es
+   *    de donde el lector lo saca. Una escrita a mano no tiene propuesta, así que el pasaje se
+   *    perdía en el refresco y la cita quedaba reducida al título del documento — justo lo
+   *    contrastable. Ahora vive en el ENLACE, que es donde vive la cita, y lo escriben y lo leen
+   *    los dos caminos por el mismo sitio.
+   *  · EL BORRADO. «Corregir una revisión es borrarla y escribir la buena» es la decisión que
+   *    tomó la política de DELETE al no conceder ningún UPDATE — y el mensaje de error de la
+   *    ruta manual la prometía sin que existiera función alguna que la ejerciera. La primera
+   *    revisión escrita a mano era irreversible, y la clave única por lente impedía la
+   *    sustituta.
+   *  · LAS DOS CLASES. «Hipótesis o citada, y ninguna tercera» se comprobaba en un solo
+   *    sentido, así que una hipótesis CON citas pasaba: una fila que se presenta a la vez como
+   *    extrapolación sin sostén y como lectura de un testimonio observado.
+   */
+  it('la revisión a mano guarda su pasaje, se puede rehacer, y no mezcla las dos clases', async () => {
+    await enWorkspaceLimpio('c4-a-mano-completa', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4C', 'Proyecto de la revisión rehecha', ${curadorId})
+        returning id`;
+      const base = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      const leer = async () => {
+        const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+        return gob!.conceptos.find((c) => c.id === conceptoId)!.revisiones;
+      };
+
+      // 1. EL PASAJE llega al lector, que es lo que hace contrastable a una cita.
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido: base,
+      });
+      const cita = (await leer())[0]!.hallazgos[0]!.citas[0]!;
+      expect(cita.fragmento, 'el pasaje escrito a mano se perdió en el refresco').toBe(
+        'No entrego la cédula',
+      );
+      expect(cita.localizacion).toBe('resumen');
+      expect(cita.citable).toBe(true);
+
+      // 2. SE REHACE: borrar y escribir la buena, que es la única corrección que hay.
+      await borrarRevisionAMano(curadorId, { workspaceId: wsC, revisionId });
+      expect((await leer()).length, 'la revisión no se borró').toBe(0);
+      const rehecha = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido: { ...base, sintesis: 'Lo que leo yo, ya sin la errata.' },
+      });
+      expect(rehecha.revisionId).toBeTruthy();
+      expect((await leer())[0]!.sintesis).toBe('Lo que leo yo, ya sin la errata.');
+
+      // 3. LAS DOS CLASES se excluyen, y en los dos sentidos.
+      await borrarRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        revisionId: rehecha.revisionId,
+      });
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            ...base,
+            hallazgos: [{ ...base.hallazgos[0]!, esHipotesis: true }],
+          },
+        }),
+        'una hipótesis con citas entró: se presenta como extrapolación y como testimonio a la vez',
+      ).rejects.toThrow();
+      // Y la hipótesis SIN citas sí entra, que es lo que separa «no se mezclan» de «no hay
+      // hipótesis».
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            ...base,
+            hallazgos: [{ ...base.hallazgos[0]!, esHipotesis: true, citas: [] }],
+          },
+        }),
+      ).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * EL PASAJE ES OBLIGATORIO EN LA TABLA, no sólo en el contrato.
+   *
+   * `fragmento` y `localizacion` nacieron anulables, y la superficie CONCEDIDA los incluye
+   * (`grant insert (… fragmento, localizacion)`). Por ahí volvía a entrar exactamente el enlace
+   * pelado que esas columnas existen para impedir: los guards de sostén sólo preguntan si el
+   * hallazgo observado tiene ALGÚN enlace, así que la fila pasaba, cumplía la regla de las dos
+   * clases de RF-08.2, y el lector volvía a enseñar el título del documento y nada más — que es
+   * justo lo NO contrastable, y una cita existe para ser contrastable.
+   *
+   * Que el servicio siempre los escriba no cierra nada: el servicio no es el único camino a la
+   * tabla, y es la misma lección que ya dejaron el arquetipo refutado y la lente ajena.
+   *
+   * Las dos mitades se midieron POR SEPARADO, porque son dos comprobaciones distintas: quitando
+   * sólo el CHECK de no-en-blanco se mueve la línea del pasaje en blanco y NO la del nulo, que
+   * la sostiene el `not null`. Y el no-en-blanco va por `titulo_normalizado` y no por `btrim`:
+   * `btrim` no recorta tabuladores, así que un pasaje de un solo tabulador pasaba por escrito.
+   */
+  it('C4 no materializa una cita sin su pasaje, ni por la superficie concedida', async () => {
+    await enWorkspaceLimpio('c4-cita-sin-pasaje', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const escribir = (fragmento: string | null, localizacion: string | null) =>
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Pide saber para qué',
+                    'No entrega el documento sin motivo.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evA}, ${wsC}, ${fragmento}, ${localizacion})`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Qué harías aquí?', '')`;
+          return r!.id as string;
+        });
+      await expect(
+        escribir(null, 'resumen'),
+        'una cita sin pasaje entró: el enlace queda reducido al título del documento',
+      ).rejects.toThrow();
+      // Un TABULADOR solo, que es lo que `btrim` deja pasar por escrito.
+      await expect(escribir('\t', 'resumen')).rejects.toThrow();
+      await expect(escribir('No entrego la cédula', '   ')).rejects.toThrow();
+      await expect(escribir('No entrego la cédula', null)).rejects.toThrow();
+      await expect(escribir('No entrego la cédula', 'resumen')).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * LA RUTA MANUAL ESCRIBE UNA REVISIÓN ENTERA, no una de cada.
+   *
+   * El formulario mandaba siempre un hallazgo, una cita y una pregunta, y eso no era un recorte
+   * de la pantalla: la clave única `(concepto_id, arquetipo_id)` deja UNA revisión por lente y
+   * no hay ninguna ruta para añadirle hojas después —las políticas de las tres hojas piden el
+   * sello en null, así que la base lo admitiría, pero no existe acción de servidor que lo haga—.
+   * Lo que no cabía en el envío no cabía nunca: una lente que ve tres fricciones sólo podía
+   * registrar una, y la única salida era borrar y reescribir con el mismo formulario de una.
+   *
+   * Peor: con una sola casilla de cita, un hallazgo con dos testimonios detrás empujaba a
+   * MARCARLO COMO HIPÓTESIS para que la segunda no estorbara — mentir sobre su clase por un
+   * límite de la pantalla, que es el mismo modo de fallo que el selector recortado.
+   *
+   * Los topes viven ahora en un solo sitio, `ai.schemas`, y los leen el contrato y el
+   * formulario: el módulo del contrato es solo-servidor, así que la pantalla no puede leerlos de
+   * allí sin arrastrar los validadores al navegador. Esta sonda es la que los enfrenta.
+   */
+  it('C4 a mano llena una revisión hasta el tope del contrato, y ni una más', async () => {
+    await enWorkspaceLimpio('c4-a-mano-llena', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4L', 'Proyecto de la revisión llena', ${curadorId})
+        returning id`;
+      /*
+       * CUATRO documentos más en la misma lente. El tope de citas por hallazgo sólo se llena con
+       * documentos DISTINTOS: la ruta manual pide un pasaje por documento —lo mide la sonda de
+       * al lado— porque el enlace guarda uno solo y aquí no hay propuesta inmutable de la que
+       * recuperar los demás. El quinto está para que pasarse del tope sea pasarse del TOPE y no
+       * repetir documento, que es otra regla y otro mensaje.
+       */
+      const [fte] = await admin`select fuente_id from evidencia where id = ${evA}`;
+      const otros: string[] = [];
+      for (const [n, resumen] of [
+        ['D-02', 'Prefiero que me digan para qué antes de dar nada.'],
+        ['D-03', 'Si me explican el motivo, lo entrego sin problema.'],
+        ['D-04', 'Lo dejé a medias porque no sabía qué pedían.'],
+        ['D-05', 'Me da igual el trámite si sé a dónde va.'],
+      ] as const) {
+        const [ev] = await admin`insert into evidencia
+          (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+          values (${wsC}, ${fte!.fuente_id as string}, ${`Entrevista ${n}`}, ${resumen},
+                  '{}'::jsonb, ${curadorId})
+          returning id`;
+        const id = ev!.id as string;
+        await admin`insert into derecho_uso
+          (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+          values (${wsC}, ${id}, 'concedido', 'cliente', 'Consentimiento del participante',
+                  ${curadorId}, now(), ${curadorId})`;
+        await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+          values (${wsC}, ${lenteA}, ${id})`;
+        otros.push(id);
+      }
+
+      // Cuatro citas, una por documento, cada fragmento literal del resumen del suyo.
+      const citas = [
+        { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+        { evidenciaId: otros[0]!, fragmento: 'Prefiero que me digan', localizacion: 'resumen' },
+        { evidenciaId: otros[1]!, fragmento: 'Si me explican el motivo', localizacion: 'resumen' },
+        { evidenciaId: otros[2]!, fragmento: 'no sabía qué pedían', localizacion: 'resumen' },
+      ];
+      expect(citas.length).toBe(MAX_CITAS_POR_HALLAZGO);
+      const LETRA = 'ABCDEF';
+      const hallazgos = Array.from({ length: MAX_HALLAZGOS_POR_REVISION }, (_, i) => ({
+        titulo: `Fricción ${LETRA[i]}`,
+        descripcion: `Lo que esta lente ve en el punto ${LETRA[i]}, distinto de lo anterior.`,
+        esHipotesis: false,
+        // El primero con el tope de citas; los demás con una, que ya los hace observados.
+        citas: i === 0 ? citas : [citas[i % citas.length]!],
+      }));
+      const preguntas = Array.from({ length: MAX_PREGUNTAS_POR_REVISION }, (_, i) => ({
+        pregunta: `¿Qué harías en el caso ${LETRA[i]}?`,
+        escenario: '',
+        // Cada una de la suya, incluida la ÚLTIMA: el índice se traduce al hallazgo que acaba
+        // de nacer, y el tope del campo sale del mismo sitio que el del array de hallazgos.
+        hallazgoIndice: i,
+      }));
+
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido: {
+          arquetipoId: lenteA,
+          sintesis: 'Seis lecturas de una sola lente.',
+          hallazgos,
+          preguntas,
+        },
+      });
+
+      const filas = await admin`select id, orden, titulo from hallazgo_simulado
+        where revision_id = ${revisionId} order by orden`;
+      expect(filas.length).toBe(MAX_HALLAZGOS_POR_REVISION);
+      const [nCitas] = await admin`select count(*)::int as n from hallazgo_simulado_evidencia
+        where hallazgo_id = ${filas[0]!.id as string}`;
+      // Las cuatro, cada una con su pasaje: un enlace por documento es exactamente lo que la
+      // clave primaria `(hallazgo_id, evidencia_id)` guarda, y por eso son cuatro documentos.
+      expect(nCitas!.n).toBe(MAX_CITAS_POR_HALLAZGO);
+
+      // La traza de cada pregunta a SU hallazgo, que es lo que la simulación entrega a la etapa
+      // 4. Con una sola pregunta el índice 0 acertaba por casualidad.
+      const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const rev = gob!.conceptos.find((c) => c.id === conceptoId)!.revisiones[0]!;
+      expect(rev.hallazgos.length).toBe(MAX_HALLAZGOS_POR_REVISION);
+      expect(rev.preguntas.length).toBe(MAX_PREGUNTAS_POR_REVISION);
+      expect(rev.preguntas.map((q) => q.hallazgoId)).toEqual(filas.map((f) => f.id as string));
+
+      /*
+       * Y NI UNA MÁS. El tope lo pone el CONTRATO, y el contrato lo aplica el validador de
+       * entrada de la acción de servidor — no el servicio, que recibe un valor ya tipado: la
+       * primera versión de esta sonda pedía siete hallazgos a `escribirRevisionAMano` y entraban
+       * los siete, porque ahí no hay quien los cuente. Se mide entonces donde de verdad se
+       * decide, que es exactamente la frontera que cruza el formulario.
+       */
+      const parsear = (contenido: unknown) =>
+        EscribirRevisionAManoSchema.safeParse({ workspaceId: wsC, conceptoId, contenido });
+      const cabe = (contenido: unknown) => parsear(contenido).success;
+      const base = { arquetipoId: lenteA, sintesis: 'Uno más de la cuenta.', hallazgos, preguntas };
+      expect(cabe(base), 'el contrato no admite lo que el formulario ofrece escribir').toBe(true);
+      expect(
+        cabe({ ...base, hallazgos: [...hallazgos, { ...hallazgos[0]!, titulo: 'La séptima' }] }),
+        'entró un hallazgo por encima del tope que el formulario ofrece',
+      ).toBe(false);
+      expect(
+        cabe({
+          ...base,
+          preguntas: [...preguntas, { ...preguntas[0]!, pregunta: '¿Y la séptima?' }],
+        }),
+      ).toBe(false);
+      const cinco = parsear({
+        ...base,
+        hallazgos: [
+          {
+            ...hallazgos[0]!,
+            citas: [
+              ...citas,
+              { evidenciaId: otros[3]!, fragmento: 'sé a dónde va', localizacion: 'resumen' },
+            ],
+          },
+          ...hallazgos.slice(1),
+        ],
+      });
+      expect(cinco.success).toBe(false);
+      /*
+       * Y por el TOPE, no por repetir documento: la quinta cita trae un quinto documento a
+       * propósito. Sin esto la línea pasaría en verde midiendo la otra regla — que es la avería
+       * que este PR ya se ha corregido a sí mismo tres veces.
+       */
+      expect(
+        cinco.error!.issues.some((x) => /cita cada documento UNA vez/i.test(x.message)),
+      ).toBe(false);
+    });
+  });
+
+
+  /**
+   * UN PASAJE POR DOCUMENTO EN LA RUTA MANUAL, y por qué sólo en ella.
+   *
+   * El enlace materializado tiene clave primaria `(hallazgo_id, evidencia_id)`, así que dos
+   * citas del mismo documento en un hallazgo son una sola fila con el pasaje de la primera. Para
+   * una revisión PROPUESTA no se pierde nada —el contenido es inmutable por SYS-17 y las lleva
+   * todas, y el guard del sello cuenta enlaces contra documentos DISTINTOS justo por eso—. Una
+   * escrita a mano no tiene ese respaldo, y hasta la ronda 29 tampoco tenía cómo llegar aquí:
+   * el formulario ofrecía UNA cita por hallazgo. Volverlas repetibles convirtió un
+   * empobrecimiento acotado en una pérdida silenciosa, medida antes de cerrarla:
+   *
+   *   CITAS QUE SOBREVIVEN: [{ fragmento: 'No entrego la cédula', … }]   ← sólo la primera
+   *
+   * Así que el contrato de ESTA ruta pide lo que esta ruta puede guardar. El compartido no se
+   * toca: gobierna también lo que el proveedor devuelve, y para él las dos citas son legítimas —
+   * lo comprueba la sonda del reparto, cuyo primer hallazgo cita dos pasajes de la misma
+   * entrevista y se materializa sin queja.
+   */
+  it('C4 a mano cita cada documento una vez, y la ruta AI las sigue admitiendo', async () => {
+    await enWorkspaceLimpio('c4-dos-pasajes', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const conCitas = (citas: { evidenciaId: string; fragmento: string; localizacion: string }[]) => ({
+        arquetipoId: lenteA,
+        sintesis: 'Dos pasajes de la misma entrevista.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas,
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      });
+      const primera = { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' };
+      const segunda = { evidenciaId: evA, fragmento: 'sin saber para qué', localizacion: 'resumen' };
+      const porElValidador = (contenido: unknown) =>
+        EscribirRevisionAManoSchema.safeParse({ workspaceId: wsC, conceptoId, contenido });
+
+      const dos = porElValidador(conCitas([primera, segunda]));
+      expect(dos.success, 'el segundo pasaje del mismo documento entró para perderse').toBe(false);
+      expect(dos.error!.issues[0]!.message).toMatch(/cita cada documento UNA vez/i);
+      expect(porElValidador(conCitas([primera])).success).toBe(true);
+
+      /*
+       * Y el CONTRATO COMPARTIDO sigue admitiéndolas, que es lo que hace de esto una regla de la
+       * ruta manual y no un recorte de la capacidad.
+       */
+      expect(() =>
+        parsearContenido('C4', { ...conCitas([primera, segunda]), confianzaPropuesta: 'media' }),
+      ).not.toThrow();
+    });
+  });
+
+
+  /**
+   * UNA LENTE SIN DOCUMENTOS CITABLES NO REVISA A NADIE.
+   *
+   * `lentesDelLote` filtra por `evidencia.length > 0` sobre una proyección que ya aplica
+   * `evidencia_usable(..., 'cliente')`, así que un arquetipo sin documentos utilizables NO se le
+   * enseña al modelo nunca. La base no lo exigía: el guard de linaje pide que la lente sea del
+   * reto y no esté refutada, y ahí se acaba.
+   *
+   * Y no queda en una fila inerte, que es lo que lo hace un P2 y no un detalle: el selector no
+   * ofrece un concepto con propuesta de C4 en curso, así que BLOQUEA pedir otro lote, y aceptarla
+   * muere después contra la primera comprobación del sello —que exige al menos un documento
+   * utilizable en el alcance—. Otra que nace sólo para rechazarse, con la llamada pagada.
+   *
+   * Las dos formas de quedarse sin lente se miden aquí, porque son la misma pregunta por dos
+   * caminos: la que NUNCA tuvo documentos, y la que los tenía y perdió el permiso — refutar no
+   * desenlaza, y retirar un derecho tampoco.
+   */
+  it('C4 no deja nacer una propuesta sobre una lente sin evidencia utilizable', async () => {
+    await enWorkspaceLimpio('c4-lente-vacia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Una lente del MISMO reto y sin refutar, pero sin ningún documento enlazado.
+      const [vacia] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, 'El que no dejó testimonio', 'Perfil sin documentos',
+                ${curadorId})
+        returning id`;
+      const proponer = (arquetipoId: string) =>
+        conUsuario(curadorId, async (tx) => {
+          const contenido = {
+            arquetipoId,
+            sintesis: 'Una lectura.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas: [
+                  { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+            confianzaPropuesta: 'media',
+          };
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [pr] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return pr!.id as string;
+        });
+
+      await expect(
+        proponer(vacia!.id as string),
+        'nace una propuesta sobre una lente que el material no enseña nunca',
+      ).rejects.toThrow(/ningún documento citable|no puede revisar/i);
+
+      // Y LA QUE SE QUEDA VACÍA: retirar el derecho de su único documento no desenlaza nada, así
+      // que la lente sigue ahí con su evidencia — y sin poder citarla.
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+      await expect(
+        proponer(lenteA),
+        'nace una propuesta sobre una lente cuyo permiso de cita se retiró',
+      ).rejects.toThrow(/ningún documento citable|no puede revisar/i);
+    });
+  });
+
+  /**
+   * Y LA REFUTACIÓN QUE LLEGA MIENTRAS LA PROPUESTA ESPERA EL CANDADO.
+   *
+   * Misma forma que las dos carreras de arriba, y la misma lección una vez más: el guard de
+   * LINAJE comprueba la lente y corre ANTES que éste —va primero por nombre—, o sea antes del
+   * candado del reto. Lee una foto. El veredicto del arquetipo commitea después, y queda una
+   * propuesta que no se podrá aceptar nunca y que además bloquea pedir otro lote.
+   *
+   * Es literalmente la avería de la ronda 23 un campo más allá: allí llevé el estado del
+   * CONCEPTO al recheck bajo candado y dejé la lente donde estaba.
+   *
+   * La carrera se monta a propósito, no se espera a que ocurra, y la espera se lee de `pg_locks`
+   * acotando por la clave —no por un tiempo—, que es lo que hizo intermitente a esta familia en
+   * la ronda 25.
+   */
+  it('C4 no deja nacer una propuesta cuya lente se refutó mientras esperaba el candado', { timeout: 30_000 }, async () => {
+    await enWorkspaceLimpio('c4-lente-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de una lente que dejó de serlo.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+
+      let soltar!: () => void;
+      const puedeCerrar = new Promise<void>((r) => {
+        soltar = r;
+      });
+      let tomado!: () => void;
+      const yaTomado = new Promise<void>((r) => {
+        tomado = r;
+      });
+      // El otro: toma el candado del reto y REFUTA la lente dentro, sin cerrar todavía.
+      const elOtro = admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        await tx`update arquetipo set estado = 'refutado',
+          veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
+          where id = ${lenteA} and workspace_id = ${wsC}`;
+        tomado();
+        await puedeCerrar;
+      });
+      await yaTomado;
+
+      // Y la propuesta, que toma su instantánea AHORA —con la lente todavía vigente para el
+      // guard de linaje— y se queda esperando el candado dentro del guard de revisión.
+      const escritura = conUsuario(curadorId, async (tx) => {
+        const [ll] = await tx`insert into llamada_ai
+          (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+          values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                  'salida-valida', ${curadorId})
+          returning id`;
+        return tx`insert into propuesta_ai
+          (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, es_simulacion, creado_por)
+          values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                  ${tx.json(contenido)}, ${tx.json(contenido)},
+                  'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                  'entorno', ${ll!.id as string}, 0, true, ${curadorId})`;
+      });
+      try {
+        const esperandoLaClave = async () => {
+          const [f] = await admin`select count(*)::int as n
+            from pg_locks l, (select hashtextextended(
+              'designio:reto:' || ${retoC}::text, 42) as k) c
+            where l.locktype = 'advisory' and not l.granted
+              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+          return f!.n as number;
+        };
+        for (let i = 0; i < 100; i++) {
+          if ((await esperandoLaClave()) > 0) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        expect(
+          await esperandoLaClave(),
+          'la propuesta no llegó a esperar el candado: la sonda no mide la carrera',
+        ).toBe(1);
+      } finally {
+        soltar();
+        await elOtro;
+      }
+      await expect(escritura).rejects.toThrow(/no puede revisar|refutó/i);
+    });
+  });
+
+  /**
+   * EL ID DE LA LENTE SE NORMALIZA, Y EN TODOS LOS SITIOS QUE LO COMPARAN.
+   *
+   * `z.string().uuid()` admite los hexadecimales en MAYÚSCULA y Postgres almacena el uuid en
+   * minúscula, así que el contrato normaliza al parsear —`IdCopiadoDelMaterial`— y los guards
+   * ponen `lower(...)` como suelo, «porque el suelo no depende de que la aplicación haya hecho
+   * bien su parte». Eso ya estaba escrito en este repositorio, y en C4 se cumplía en UN sitio de
+   * cinco: el guard de materialización. El de linaje, el recheck bajo candado, el índice único
+   * de la lente pendiente y la rotación del selector comparaban el texto crudo.
+   *
+   * Lo que se veía era una NEGATIVA falsa: por la superficie concedida, un `arquetipoId` válido
+   * escrito en mayúscula no acertaba ningún arquetipo y salía por «esa lente no es del reto del
+   * concepto» — un mensaje que además apunta al sitio equivocado. Y detrás quedaba lo peor: dos
+   * propuestas pendientes de la MISMA lente escrita en dos cajas distintas son dos claves
+   * distintas para el índice, así que la exclusión de la ronda 27 no las veía.
+   */
+  it('C4 normaliza el id de la lente: mayúscula entra, y sigue siendo la misma lente', async () => {
+    await enWorkspaceLimpio('c4-lente-mayuscula', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const proponer = (arquetipoId: string) =>
+        conUsuario(curadorId, async (tx) => {
+          const contenido = {
+            arquetipoId,
+            sintesis: 'Una lectura.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas: [
+                  { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+            confianzaPropuesta: 'media',
+          };
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [pr] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return pr!.id as string;
+        });
+
+      // En MAYÚSCULA entra: es el mismo uuid, y el contrato lo admitiría igual.
+      expect(await proponer(lenteA.toUpperCase())).toBeTruthy();
+      // Y sigue siendo LA MISMA LENTE para el índice de pendientes: en minúscula ya no cabe otra.
+      await expect(
+        proponer(lenteA),
+        'dos pendientes de la misma lente, escrita en dos cajas: el índice no las vio',
+      ).rejects.toThrow();
+    });
+  });
+
+
+  /**
+   * Y ESA LENTE SE PUEDE CORREGIR, que es la otra cara de admitir la mayúscula.
+   *
+   * Desde que el id no canónico se puede GUARDAR —los guards comparan con `lower()`— una
+   * corrección de sólo textos se volvía imposible: la corrección se parsea, el contrato la baja
+   * a minúscula, y las dos comprobaciones de testimonio leían la normalización como un intento
+   * de cambiar la lente. La propuesta sólo se podía aceptar tal cual o rechazar. Medido antes de
+   * tocar nada, y responde primero la capa del CONTRATO:
+   *
+   *   CORRECCION RECHAZADA: De una revisión simulada no se corrigen ni el arquetipo que la
+   *   firma ni la marca de hipótesis de sus hallazgos…
+   *
+   * El arreglo no es una excepción: es la pregunta correcta. Ese guard compara tres cosas, y las
+   * otras dos —las citas y las marcas— son texto y booleanos, donde la igualdad byte a byte SÍ
+   * es lo que se pregunta. Un IDENTIFICADOR no: «¿es la misma lente?» se contesta canónicamente.
+   *
+   * Y la sonda mide la otra mitad, porque si no esto sería debilitar el guard: cambiar la lente
+   * DE VERDAD sigue rechazándose.
+   */
+  it('C4 corrige los textos de una propuesta cuya lente se guardó en mayúscula, y no la lente', async () => {
+    await enWorkspaceLimpio('c4-mayuscula-correccion', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      };
+      /*
+       * Por el camino REAL, para que la huella del material sea la de verdad —una propuesta
+       * insertada a mano no la tiene y la aceptación muere antes de llegar a lo que se mide—, y
+       * después se sube la CAJA del id con `sqlAdmin`: el contrato canoniza al parsear, así que
+       * un `arquetipoId` en mayúscula sólo puede llegar a la fila por fuera del servicio, que es
+       * exactamente la superficie de la que hablaba el hallazgo anterior.
+       */
+      await conProveedor(
+        { ok: true, datos: { revisiones: [contenido] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await admin`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{arquetipoId}', to_jsonb(upper(${lenteA}::text))),
+              contenido_original = jsonb_set(contenido_original, '{arquetipoId}',
+                                             to_jsonb(upper(${lenteA}::text)))
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+      const [guardado] = await admin`select contenido ->> 'arquetipoId' as id
+        from propuesta_ai where id = ${propuestaId}`;
+      expect(guardado!.id).toBe(lenteA.toUpperCase());
+
+      // Cambiar la LENTE de verdad sigue siendo fabricar una voz, esté en la caja que esté.
+      await expect(
+        aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId,
+          correccion: { ...contenido, arquetipoId: lenteB },
+        }),
+      ).rejects.toThrow(/arquetipo que la firma|no se corrige/i);
+
+      // Y corregir los TEXTOS entra, que es para lo que existe la corrección.
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId,
+        correccion: { ...contenido, sintesis: 'La misma lectura, con la síntesis pulida.' },
+      });
+      const [fila] = await admin`select arquetipo_id, sintesis from revision_simulada
+        where id = ${objetoId}`;
+      // Y la revisión materializada cuelga de la lente de verdad, no de un id en otra caja.
+      expect(fila!.arquetipo_id).toBe(lenteA);
+      expect(fila!.sintesis).toBe('La misma lectura, con la síntesis pulida.');
+    });
+  });
+
+  /**
+   * Y EL PANEL BUSCA EL TRAMO DEL DOCUMENTO CON EL ID TAL CUAL VINO, que es la misma superficie
+   * una puerta más allá.
+   *
+   * La ronda anterior admitió el `arquetipoId` en mayúscula comparándolo canónicamente. Esta es
+   * la factura: el `evidenciaId` de cada cita entra por la misma rendija —el contrato canoniza al
+   * PARSEAR, así que a la fila sólo llega en otra caja por fuera del servicio— y el panel lo usa
+   * como CLAVE contra un mapa cuyas claves salen de la base, en minúscula. La búsqueda falla en
+   * silencio: no hay error, la cita se reporta AUSENTE y la etiqueta de al lado dice que el
+   * documento ya no está.
+   *
+   * Y ausente es justo la señal que quien revisa mira para decidir. Una cita literal y correcta
+   * pasa por inventada porque alguien guardó el uuid gritado.
+   *
+   * Se mide donde duele —`presenteLiteral` pasa de `true` a `false` sin tocar NADA más que la
+   * caja del id— y el arreglo va donde las citas se LEEN del contenido, que es una costura y no
+   * cuatro: es una propiedad de cómo se leen, no de quién las lee.
+   */
+  it('C4: una cita con el id de evidencia en mayúscula sigue estando presente en el panel', async () => {
+    await enWorkspaceLimpio('c4-cita-id-mayuscula', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      };
+      // Por el camino real, igual que arriba: la huella del material tiene que ser la de verdad.
+      await conProveedor(
+        { ok: true, datos: { revisiones: [contenido] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+
+      // La mitad sin la cual esto no mediría nada: con el id en minúscula, PRESENTE.
+      const antes = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.id === propuestaId,
+      )!;
+      expect(antes.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      /*
+       * Y ahora se sube la caja del id, y sólo eso. En las DOS columnas: el guard de la base
+       * compara `contenido` contra `contenido_original` y con una sola responde «las citas de
+       * una revisión simulada no se corrigen» —el suelo funcionando—, que no es el caso que se
+       * quiere medir. Lo que se simula aquí es una fila que NACIÓ con el id gritado.
+       */
+      await admin`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{hallazgos,0,citas,0,evidenciaId}',
+                                    to_jsonb(upper(${evA}::text))),
+              contenido_original = jsonb_set(contenido_original,
+                                             '{hallazgos,0,citas,0,evidenciaId}',
+                                             to_jsonb(upper(${evA}::text)))
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+      const [guardada] = await admin`select contenido #>> '{hallazgos,0,citas,0,evidenciaId}' as id
+        from propuesta_ai where id = ${propuestaId}`;
+      expect(guardada!.id).toBe(evA.toUpperCase());
+
+      const despues = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.id === propuestaId,
+      )!;
+      expect(
+        despues.citas.map((c) => c.presenteLiteral),
+        'la cita se reporta ausente sólo porque el id venía en otra caja',
+      ).toEqual([true]);
+      // Y el tramo que la sostiene sigue siendo el suyo, no «el documento ya no está».
+      expect(despues.citas[0]!.fragmento).toBe('No entrego la cédula');
+    });
+  });
+
+  /**
+   * Y LA REVISIÓN A MANO RELEE SU ARQUETIPO BAJO EL CANDADO, que es la OTRA puerta.
+   *
+   * La ronda anterior cerró esto para la PROPUESTA y me dejé la ruta que no pasa por
+   * `propuesta_ai`: escribir la revisión directamente. Su política pide que la lente sea del reto
+   * y no esté refutada, y eso cierra la escritura tardía secuencial y no la concurrente — RLS
+   * decidió con la instantánea de antes de esperar el candado, y el veredicto que se firma
+   * mientras espera no lo ve nadie. Queda una revisión en la que HABLA un perfil ya declarado
+   * inexistente, que es peor que dibujarlo.
+   *
+   * Es la tercera vez que la misma regla aparece con una capa menos en un camino: primero el
+   * concepto, luego la lente en la propuesta, ahora la lente aquí.
+   */
+  it('C4 a mano no deja entrar una revisión cuya lente se refutó mientras esperaba el candado', { timeout: 30_000 }, async () => {
+    await enWorkspaceLimpio('c4-lente-refutada-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+
+      let soltar!: () => void;
+      const puedeCerrar = new Promise<void>((r) => {
+        soltar = r;
+      });
+      let tomado!: () => void;
+      const yaTomado = new Promise<void>((r) => {
+        tomado = r;
+      });
+      const elOtro = admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        await tx`update arquetipo set estado = 'refutado',
+          veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
+          where id = ${lenteA} and workspace_id = ${wsC}`;
+        tomado();
+        await puedeCerrar;
+      });
+      await yaTomado;
+
+      const escritura = conUsuario(curadorId, (tx) =>
+        tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteA}, 'Llegó después del veredicto', ${curadorId})`,
+      );
+      try {
+        const esperandoLaClave = async () => {
+          const [f] = await admin`select count(*)::int as n
+            from pg_locks l, (select hashtextextended(
+              'designio:reto:' || ${retoC}::text, 42) as k) c
+            where l.locktype = 'advisory' and not l.granted
+              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+          return f!.n as number;
+        };
+        for (let i = 0; i < 100; i++) {
+          if ((await esperandoLaClave()) > 0) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        expect(
+          await esperandoLaClave(),
+          'la escritura no llegó a esperar el candado: la sonda no mide la carrera',
+        ).toBe(1);
+      } finally {
+        soltar();
+        await elOtro;
+      }
+      await expect(escritura).rejects.toThrow(/se refutó mientras|refutado no describe/i);
+    });
+  });
+
+  /**
+   * EL GUARD DE SOSTÉN SE VUELVE A PREGUNTAR TAMBIÉN AL AÑADIR UNA CITA.
+   *
+   * Las dos clases de RF-08.2 se excluyen desde la ronda 28, y cada dirección entra por su
+   * puerta: quitar la última cita deja sin sostén a un hallazgo observado, y AÑADIR una se lo
+   * pone a uno marcado como hipótesis. El constraint trigger colgaba del INSERT del hallazgo y
+   * del DELETE de la cita, así que la segunda dirección no corría nunca sobre una fila ya
+   * commiteada — y la ruta manual llega ahí sin esfuerzo: su sello es null para siempre, así que
+   * las políticas de las hojas admiten escribir después, y el diferido del hallazgo terminó con
+   * su propia transacción.
+   *
+   * Medido antes de arreglarlo, con una transacción nueva sobre una hipótesis ya escrita:
+   *
+   *   HIPOTESIS: true · CITAS: 1
+   *
+   * Un guard diferido protege el ESTADO FINAL, y el estado final cambia por los dos lados. Y la
+   * rama nueva se separa por `tg_op`, no sólo por tabla: al borrar el hallazgo está en `old` y
+   * al añadir en `new`, que es la lección que este mismo fichero dejó escrita sobre plpgsql.
+   */
+  it('C4 no deja añadir una cita a un hallazgo ya marcado como hipótesis', async () => {
+    await enWorkspaceLimpio('c4-cita-tardia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const escribir = (esHipotesis: boolean) =>
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            arquetipoId: lenteA,
+            sintesis: 'Una lectura para la que la cita llega después.',
+            hallazgos: [
+              {
+                titulo: 'Probablemente dude',
+                descripcion: 'Extrapolando del perfil, dudaría antes de entregar nada.',
+                esHipotesis,
+                citas: esHipotesis
+                  ? []
+                  : [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula',
+                        localizacion: 'resumen',
+                      },
+                    ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Dudarías?', escenario: '' }],
+          },
+        });
+      const citar = (hallazgoId: string, fragmento: string) =>
+        conUsuario(curadorId, async (tx) => {
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${hallazgoId}, ${evA}, ${wsC}, ${fragmento}, 'resumen')`;
+        });
+
+      const { revisionId } = await escribir(true);
+      const [h] = await admin`select id from hallazgo_simulado where revision_id = ${revisionId}`;
+      // TRANSACCIÓN NUEVA: el diferido del INSERT del hallazgo ya terminó con la anterior.
+      await expect(
+        citar(h!.id as string, 'No entrego la cédula'),
+        'la cita entró sobre una hipótesis: la fila queda como extrapolación y como observada',
+      ).rejects.toThrow(/las dos clases se excluyen/i);
+
+      /*
+       * Y la otra mitad, para que esto no se lea como «no se pueden añadir citas después»: sobre
+       * un hallazgo OBSERVADO, una segunda cita —de otro documento, que es lo que el enlace
+       * admite— entra sin problema. La puerta es la clase del hallazgo, no el momento.
+       */
+      await borrarRevisionAMano(curadorId, { workspaceId: wsC, revisionId });
+      const segunda = await escribir(false);
+      const [h2] = await admin`select id from hallazgo_simulado
+        where revision_id = ${segunda.revisionId}`;
+      const [fte] = await admin`select fuente_id from evidencia where id = ${evA}`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.fuente_id as string}, 'Entrevista D-06',
+                'Me da igual el trámite si sé a dónde va.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const otroDoc = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${otroDoc}, 'concedido', 'cliente', 'Consentimiento del participante',
+                ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteA}, ${otroDoc})`;
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h2!.id as string}, ${otroDoc}, ${wsC}, 'sé a dónde va', 'resumen')`;
+        }),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  /**
+   * Y TAMPOCO PUEDE SABER PARA QUÉ CONCEPTO SE ESCRIBIÓ.
+   *
+   * El contenido de C4 nombra su arquetipo —`arquetipoId`, y hay un guard que lo comprueba
+   * contra el reto del concepto desde la ronda 26— pero NO nombra su concepto: ése viaja como
+   * columna. No hay nada dentro del texto que contrastar, así que una revisión redactada para el
+   * concepto A y escrita bajo el B del mismo reto pasa TODAS las comprobaciones: la lente sigue
+   * siendo del reto, su evidencia sigue siendo la suya, y el veredicto y la ventana son los del
+   * mismo reto.
+   *
+   * Esta sonda mide justo eso —que la base no puede decir que no— y por eso está: es lo que
+   * obliga a que el reinicio viva en el FORMULARIO, que es el único sitio que sabe para qué
+   * concepto se escribió lo que hay en pantalla. Lo mismo que el pasaje que no está en su
+   * documento: donde no hay contra qué comparar, la pantalla es el suelo.
+   */
+  it('C4 a mano no puede saber para qué concepto se escribió: el contenido nombra la lente, no el concepto', async () => {
+    await enWorkspaceLimpio('c4-concepto-ajeno', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un SEGUNDO concepto del MISMO reto, que es donde el selector puede saltar.
+      const [otro] = await admin`insert into concepto
+        (workspace_id, reto_id, titulo, descripcion, umbral_test, creado_por)
+        values (${wsC}, ${retoC}, 'Verificación en sucursal',
+                'El documento se entrega en persona', '6 de cada 8 completan sin ayuda',
+                ${curadorId})
+        returning id`;
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que esta lente ve en el concepto para el que lo escribí.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      // El MISMO texto entra bajo los dos conceptos, uno detrás de otro: nada dentro de él dice
+      // de cuál habla, y la clave única es por `(concepto, lente)`, así que ni siquiera choca.
+      await expect(
+        escribirRevisionAMano(curadorId, { workspaceId: wsC, conceptoId, contenido }),
+      ).resolves.toBeTruthy();
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId: otro!.id as string,
+          contenido,
+        }),
+      ).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * Y LO QUE LA RUTA MANUAL NO COMPRUEBA: que el pasaje esté en el documento.
+   *
+   * La presencia literal la mide el panel sobre el material de la llamada (`presenteLiteral`), y
+   * una revisión escrita a mano no tiene llamada ni material: no hay contra qué medirla. Así que
+   * un fragmento que no aparece en el documento elegido se escribe y se enseña como sostén.
+   *
+   * Está aquí escrito y medido porque es lo que obliga al formulario a VACIAR el pasaje cuando
+   * se cambia de documento: si nadie lo para después, dejar el fragmento de A pegado a B lo
+   * atribuye a quien no lo dijo, y ya no hay quien lo desmienta. El día que esta ruta compruebe
+   * presencia literal, esta sonda es la que hay que borrar — y entonces el vaciado del
+   * formulario pasa a ser comodidad en vez de suelo.
+   */
+  it('C4 a mano no comprueba presencia literal: lo que lo acota es vaciar al cambiar de documento', async () => {
+    await enWorkspaceLimpio('c4-pasaje-ajeno', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            arquetipoId: lenteA,
+            sintesis: 'Un pasaje que no es de ahí.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas: [
+                  {
+                    evidenciaId: evA,
+                    fragmento: 'esto no aparece en ese documento por ninguna parte',
+                    localizacion: 'resumen',
+                  },
+                ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Y esto?', escenario: '' }],
+          },
+        }),
+      ).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * Y LA VENTANA DE LA ETAPA ES LA TERCERA PUERTA, que la pantalla no llevaba.
+   *
+   * Las políticas de `revision_simulada` piden concepto «candidato» Y `reto_admite_conceptos`.
+   * El formulario filtraba por el estado y los botones de borrar igual, así que faltaba la
+   * mitad — y no es una mitad teórica: nada mueve el estado de un concepto cuando G4 se aprueba
+   * o el reto se archiva, así que se queda `candidato` con la etapa cerrada. La pantalla lo
+   * ofrecía, y las dos operaciones morían DESPUÉS de que alguien lo hubiera escrito todo.
+   *
+   * Es la misma frase que ya está escrita al lado de la proyección de conceptos —«el formulario
+   * que los ofrece y la validación que los exige tienen que mirar la misma foto»— aplicada a un
+   * campo que no estaba en la foto.
+   *
+   * La sonda mide las tres cosas: que el estado sigue siendo candidato (o sea que el caso es
+   * alcanzable y no una hipótesis), que la base rechaza escribir y borrar, y que la proyección
+   * lo dice — porque lo que la pantalla esconde tiene que poder leerlo de algún sitio.
+   */
+  it('C4 a mano no escribe ni borra con la etapa 4 cerrada, y la proyección lo dice', async () => {
+    await enWorkspaceLimpio('c4-etapa-cerrada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4E', 'Proyecto de la etapa cerrada', ${curadorId})
+        returning id`;
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      // Una escrita ANTES de cerrar, para poder medir también el borrado.
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido,
+      });
+      const abierta = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      expect(abierta!.etapaAdmiteConceptos).toBe(true);
+
+      // Y se cierra la etapa por el ciclo de vida del reto, que es una de sus dos ramas.
+      await admin`update reto set estado = 'archivado' where id = ${retoC} and workspace_id = ${wsC}`;
+
+      const cerrada = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      // El concepto SIGUE siendo candidato: nada lo mueve, y por eso el estado solo no basta.
+      expect(cerrada!.conceptos.find((c) => c.id === conceptoId)!.estado).toBe('candidato');
+      expect(
+        cerrada!.etapaAdmiteConceptos,
+        'la proyección no dice que la etapa cerró: la pantalla no tiene con qué esconder',
+      ).toBe(false);
+
+      // Y la base rechaza las DOS, que es lo que la pantalla estaba ofreciendo.
+      await expect(
+        escribirRevisionAMano(curadorId, { workspaceId: wsC, conceptoId, contenido }),
+      ).rejects.toThrow();
+      await expect(
+        borrarRevisionAMano(curadorId, { workspaceId: wsC, revisionId }),
+      ).rejects.toThrow();
+      const [quedan] = await admin`select count(*)::int as n from revision_simulada
+        where id = ${revisionId}`;
+      expect(quedan!.n).toBe(1);
+    });
+  });
+
+  /**
+   * UNA LENTE LEE UN CONCEPTO UNA VEZ, y la pantalla tiene con qué saberlo.
+   *
+   * `unique (concepto_id, arquetipo_id)` es de la ronda 2, y el formulario a mano ofrecía las
+   * lentes filtrando sólo por su estado: elegir una que ya revisó ese concepto se rechazaba
+   * DESPUÉS de haberlo escrito todo. La misma clase que la ventana de la etapa, y con el mismo
+   * remedio — no esconder una regla, sino llevar a la pantalla el dato con el que la base
+   * decide.
+   *
+   * El dato es el ID de la lente en cada revisión ya escrita: la proyección llevaba su NOMBRE,
+   * que sirve para pintar y no para comparar. Se filtra por el concepto SELECCIONADO y no en
+   * global, porque la misma lente sigue libre para los demás conceptos del reto.
+   */
+  it('C4 a mano no repite lente sobre el mismo concepto, y la proyección trae con qué filtrar', async () => {
+    await enWorkspaceLimpio('c4-lente-repetida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4R', 'Proyecto de la lente repetida', ${curadorId})
+        returning id`;
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      await escribirRevisionAMano(curadorId, { workspaceId: wsC, conceptoId, contenido });
+
+      // La base lo rechaza, y con su motivo — que es lo que la pantalla no debería llegar a ver.
+      await expect(
+        escribirRevisionAMano(curadorId, { workspaceId: wsC, conceptoId, contenido }),
+      ).rejects.toThrow(/una sola lectura por concepto|ya tiene una revisión/i);
+
+      // Y la proyección trae el ID de la lente, que es con lo que el formulario la descuenta.
+      const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const rev = gob!.conceptos.find((c) => c.id === conceptoId)!.revisiones;
+      expect(rev.map((r) => r.arquetipoId), 'sin el id, la pantalla sólo tiene el nombre').toEqual([
+        lenteA,
+      ]);
+    });
+  });
+
+  /**
+   * Y NI LA ESCRIBE NI LA BORRA QUIEN NO ES CURADOR.
+   *
+   * `revision_simulada_insert` y `_delete` piden `workspace_role(...) in ('lead-boutique',
+   * 'disenador')` — que es exactamente el `esCurador` de la pantalla. El bloque de lectura se
+   * sacó del formulario del pasa/muere a propósito, para que las preguntas de test lleguen a
+   * TODO el equipo antes del test y no sólo a quien firma; pero al meterle después los controles
+   * de escribir y borrar se los ofrecía también a un stakeholder, que sólo podía descubrir por
+   * un error de permisos que no eran suyos. Leer no es decidir, y escribir tampoco es leer.
+   *
+   * Lo que la pantalla esconde lo exige la base, y esto es esa exigencia medida: la puerta de la
+   * UI es no ofrecer lo que va a fallar, no la puerta.
+   */
+  it('C4 a mano no la escribe ni la borra quien no es curador', async () => {
+    await enWorkspaceLimpio('c4-a-mano-rol', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      const email = `${marca}-c4-rol-stakeholder@test.demo`;
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${email}, 'Quien mira', 'activo') returning id`;
+      const ajenoId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${ajenoId}, 'Quien mira', ${email}, 'stakeholder')`;
+
+      await expect(
+        escribirRevisionAMano(ajenoId, { workspaceId: wsC, conceptoId, contenido }),
+        'un stakeholder escribió una revisión simulada',
+      ).rejects.toThrow();
+
+      // Y tampoco borra la que escribió un curador.
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido,
+      });
+      await expect(
+        borrarRevisionAMano(ajenoId, { workspaceId: wsC, revisionId }),
+        'un stakeholder borró una revisión simulada ajena',
+      ).rejects.toThrow();
+      const [quedan] = await admin`select count(*)::int as n from revision_simulada
+        where id = ${revisionId}`;
+      expect(quedan!.n).toBe(1);
+    });
+  });
+
+  /**
+   * Y LA LENTE SE COMPRUEBA AL ESCRIBIR LA PROPUESTA, no sólo al aceptarla.
+   *
+   * `propuesta_ai_c4_linaje_guard` comprobaba que la propuesta cuelgue de la llamada que la
+   * produjo —mismo concepto— y nada más; el guard del INSERT mira el estado del concepto y la
+   * ventana de la etapa. Ninguno miraba el `arquetipoId` del contenido, que es la otra mitad de
+   * la identidad de una sesión de C4.
+   *
+   * Por la superficie concedida entraba entonces una propuesta cuya lente es de OTRO reto, o
+   * está REFUTADA. Y no se queda en inútil: `candidatas` no ofrece un concepto con propuesta de
+   * C4 en curso, así que la fila BLOQUEA pedir otro lote, y aceptarla muere después contra
+   * `revision_simulada_insert`. Una propuesta que sólo se puede rechazar, con la llamada pagada
+   * — el mismo modo de fallo que la ronda del candado, entrando por otra puerta.
+   *
+   * Va en el guard de LINAJE y no en la rama de `session_user`: que la lente sea del reto del
+   * concepto es lo que hace que la sesión sea de ese concepto, y eso vale para todo el que
+   * escriba, no sólo para la aplicación.
+   */
+  it('C4 no deja nacer una propuesta cuya lente no es del concepto', async () => {
+    await enWorkspaceLimpio('c4-lente-ajena', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Una lente de OTRO reto del mismo workspace: las claves ajenas de `propuesta_ai` no la
+      // ven, porque el arquetipo viaja dentro del contenido y no como columna.
+      const [servicio] = await admin`select servicio_ancla_id from reto where id = ${retoC}`;
+      const [otro] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, creado_por)
+        values (${wsC}, ${servicio!.servicio_ancla_id as string}, 'R-OTRO', 'Otro reto',
+                ${curadorId})
+        returning id`;
+      const [ajena] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${otro!.id as string}, 'El de otro reto', 'Perfil de otro sitio',
+                ${curadorId})
+        returning id`;
+      await admin`update arquetipo set estado = 'refutado',
+        veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
+        where id = ${lenteB} and workspace_id = ${wsC}`;
+
+      const proponer = (arquetipoId: string) =>
+        conUsuario(curadorId, async (tx) => {
+          const contenido = {
+            arquetipoId,
+            sintesis: 'Una lectura.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas: [
+                  { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+            confianzaPropuesta: 'media',
+          };
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return p!.id as string;
+        });
+
+      await expect(
+        proponer(ajena!.id as string),
+        'nace una propuesta de C4 cuya lente es de otro reto',
+      ).rejects.toThrow(/lente|arquetipo/i);
+      await expect(
+        proponer(lenteB),
+        'nace una propuesta de C4 sobre una lente refutada',
+      ).rejects.toThrow(/lente|arquetipo/i);
+
+      // Y con la lente buena entra, y el concepto deja de ofrecerse — que es justo lo que hace
+      // que las de arriba fueran un bloqueo y no una fila inerte.
+      const buena = await proponer(lenteA);
+      expect(buena).toBeTruthy();
+      const panel = await panelPropuestas(curadorId, wsC);
+      expect(
+        panel.candidatas.C4.lista.some((i) => i.id === conceptoId),
+        'una propuesta de C4 en curso tiene que retirar el concepto de la cola',
+      ).toBe(false);
+    });
+  });
+
+  /**
+   * UN ARQUETIPO REFUTADO NO REVISA A NADIE.
+   *
+   * El veredicto de SPEC-04.11 dice que ese perfil NO DESCRIBE A NADIE. El repositorio ya sacó
+   * la consecuencia una vez, para el grafo: «un arquetipo REFUTADO no entra al journey —
+   * dibujarlo lo resucitaría como si el veredicto no se hubiera dado». Aquí es peor que
+   * dibujarlo: es hacerlo HABLAR. Una sesión suya escribe fricciones y preguntas de test en
+   * primera persona, y esas preguntas son lo único que la simulación entrega a la etapa 4 — la
+   * voz inventada que SYS-20 nombra, pero con procedencia y con un arquetipo real detrás.
+   *
+   * Y el estado es alcanzable sin nada raro: refutar no desenlaza su evidencia —los enlaces son
+   * aditivos y `arquetipo_evidencia` no tiene DELETE concedido—, así que la lente sigue teniendo
+   * documentos utilizables y pasaba todas las puertas.
+   *
+   * Se mide en los TRES sitios donde la regla tiene que estar, que es lo que impide que un
+   * cuarto se olvide: el material que se manda, el selector que ofrece el concepto, y la
+   * política de inserción de la base. Y en los dos sentidos: con una lente sana el concepto
+   * sigue ofreciéndose y su revisión entra.
+   */
+  it('C4 no usa como lente un arquetipo refutado', async () => {
+    await enWorkspaceLimpio('c4-lente-refutada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const refutar = (id: string) =>
+        admin`update arquetipo set estado = 'refutado',
+          veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
+          where id = ${id} and workspace_id = ${wsC}`;
+      const lentesDelMaterial = () =>
+        conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return (material?.arquetipos ?? []).map((a) => a.id);
+        });
+      const seOfrece = async () => {
+        const panel = await panelPropuestas(curadorId, wsC);
+        return panel.candidatas.C4.lista.some((i) => i.id === conceptoId);
+      };
+
+      expect((await lentesDelMaterial()).sort()).toEqual([lenteA, lenteB].sort());
+      expect(await seOfrece()).toBe(true);
+
+      // 1. EL MATERIAL: la refutada deja de ser lente, y la sana se queda.
+      await refutar(lenteB);
+      expect(
+        await lentesDelMaterial(),
+        'el material sigue mandando como lente un arquetipo refutado',
+      ).toEqual([lenteA]);
+      // El concepto se sigue ofreciendo: le queda una lente que sí mira.
+      expect(await seOfrece()).toBe(true);
+
+      /*
+       * 2. EL SUELO: ni siquiera escrita a mano entra una revisión de la refutada.
+       *
+       * Va COMPLETA —hallazgo, cita y pregunta— y no como una fila suelta, porque una suelta
+       * la para el trigger de completitud y la sonda mediría esa puerta. Medido: con el
+       * predicado neutralizado, la fila suelta respondía «esa revisión simulada se queda sin
+       * hallazgos», o sea que se movía sin medir lo que dice medir.
+       *
+       * Y ahora lo cubren DOS capas, así que la afirmación admite las dos salidas. La política
+       * era la única cuando esto se escribió; desde que el guard del candado relee el arquetipo
+       * —para el veredicto que se firma MIENTRAS se espera—, responde él primero: un trigger
+       * BEFORE corre antes de que se evalúe el `with check` de la política. Es literalmente el
+       * caso que este repositorio ya tenía escrito, «las dos capas de una misma regla se tapan:
+       * neutralizando cualquiera, la otra rechaza; lo que las separa es la SALIDA del mensaje».
+       * Fijar aquí una de las dos convertiría esta sonda en una prueba del orden de las capas.
+       */
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Lo que diría quien no existe'),
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level|refutado no describe/i);
+      // Y la sana entra, que es lo que separa «no revisa la refutada» de «no revisa nadie».
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          revisionAMano(tx, wsC, conceptoId, lenteA, curadorId, 'Escrita a mano'),
+        ),
+      ).resolves.toBeTruthy();
+      await admin`delete from revision_simulada where concepto_id = ${conceptoId}`;
+
+      // 3. EL SELECTOR: refutadas las dos, el concepto deja de ofrecerse — ofrecerlo sería
+      //    ofrecer un callejón, porque PREPARAR moriría con «sin lentes».
+      await refutar(lenteA);
+      expect(await lentesDelMaterial()).toEqual([]);
+      expect(
+        await seOfrece(),
+        'se ofrece un concepto cuyas lentes están todas refutadas: un callejón',
+      ).toBe(false);
+      await expect(
+        conProveedor(
+          { ok: true, datos: { revisiones: [] }, intentos: [intento({ uso: null })] },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/ningún arquetipo con evidencia citable/);
+    });
+  });
+
+  /**
+   * Y una sesión escrita a mano no entra vacía.
+   *
+   * El contrato pide al menos un hallazgo y al menos una pregunta de test —y las preguntas son
+   * lo único que una simulación puede legítimamente producir para la etapa 4 (RF-08.2)—, pero
+   * el contrato solo gobierna lo que viene del proveedor. Por la superficie concedida, una
+   * `revision_simulada` sola commitea: queda en el archivo una lectura sin nada leído y sin
+   * nada que probar, con la etiqueta de simulación puesta.
+   *
+   * Se mide en los dos sentidos, que es lo que separa «no entra vacía» de «no entra a mano».
+   */
+  it('C4 no archiva una revisión sin hallazgos ni preguntas', async () => {
+    await enWorkspaceLimpio('c4-revision-vacia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura sin nada detrás', ${curadorId})`,
+        ),
+      ).rejects.toThrow(/sin hallazgos|sin preguntas|vacía/i);
+
+      // Y entera sí entra: hallazgo con su cita y su pregunta, en la misma transacción.
+      const escrita = await conUsuario(curadorId, async (tx) => {
+        const [r] = await tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura entera', ${curadorId})
+          returning id`;
+        const [h] = await tx`insert into hallazgo_simulado
+          (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+          values (${wsC}, ${r!.id as string}, 0, 'Se va por el tiempo',
+                  'Dice que abandona si tarda.', false)
+          returning id`;
+        await tx`insert into hallazgo_simulado_evidencia
+          (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+          values (${h!.id as string}, ${evB}, ${wsC}, 'Si tarda más de un café', 'resumen')`;
+        await tx`insert into pregunta_de_test
+          (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+          values (${wsC}, ${r!.id as string}, ${h!.id as string}, 0, '¿Cuánto esperarías?', '')`;
+        return r!.id as string;
+      });
+      expect(escrita, 'la revisión completa no entró').toBeTruthy();
+      expect(evA, 'el fixture perdió la evidencia de la primera lente').toBeTruthy();
+    });
+  });
+
+  /**
+   * La etiqueta de simulación tampoco depende de que el servicio se acuerde de ponerla.
+   *
+   * `es_simulacion` sale del registro y viaja al insert, pero la columna tiene `default false`
+   * y ningún CHECK la exige: por la superficie concedida, una propuesta de C4 escrita sin ella
+   * nace diciendo que NO es simulación. Y no se queda en la fila: el evento
+   * `PropuestaAIGenerada` —que es append-only— la copia, así que el libro afirma en falso
+   * mientras el panel rotula «simulación AI» encima. SYS-20 pide que la etiqueta sea
+   * imborrable, y una que se puede omitir al nacer no lo es.
+   *
+   * Se mide en los dos sentidos: sin la marca no entra, con ella sí.
+   */
+  it('C4 no admite una propuesta que no se declare simulación', async () => {
+    await enWorkspaceLimpio('c4-sin-etiqueta', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      const proponer = (marca: boolean | null) =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, ${marca === null ? tx`creado_por` : tx`es_simulacion, creado_por`})
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0,
+                    ${marca === null ? tx`${curadorId}` : tx`${marca}, ${curadorId}`})
+            returning id`;
+          return p!.id as string;
+        });
+
+      // Omitida: el `default false` la deja entrar diciendo que no es simulación.
+      await expect(proponer(null)).rejects.toThrow(/simulaci/i);
+      // Y puesta a mano en falso, que es la misma mentira escrita entera.
+      await expect(proponer(false)).rejects.toThrow(/simulaci/i);
+      // Con la marca puesta, entra: lo que se cierra es la mentira, no la capacidad.
+      await expect(proponer(true)).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * Y una revisión escrita a mano deja rastro en el libro.
+   *
+   * RF-01.6 pide registro append-only de lo que pasa en el workspace, y las cinco tablas de
+   * objeto materializado que ya existían lo escriben DESDE LA BASE —`insight`, `entrada_kpi`,
+   * `oportunidad`, `outcome_review` y `criterio_exito` tienen su trigger— justamente porque la
+   * escritura a mano no pasa por el servicio. `revision_simulada` nació sin él: por el camino
+   * manual, que existe porque SYS-21 lo obliga, la sesión entraba sin que nada lo anotara.
+   *
+   * Las HOJAS no lo llevan, y eso es una respuesta y no un olvido: tampoco lo llevan las de
+   * C2 —`afirmacion` y `cita`—, porque el evento es del OBJETO y sus hijos son su contenido.
+   */
+  it('una revisión escrita a mano queda anotada en el libro', async () => {
+    await enWorkspaceLimpio('c4-libro-a-mano', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const revisionId = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteA, curadorId),
+      );
+      const eventos = await admin`select tipo, payload, actor_id, actor_rol
+        from evento_dominio
+        where workspace_id = ${wsC} and payload->>'revisionSimuladaId' = ${revisionId}`;
+      expect(eventos.length, 'la revisión escrita a mano no dejó rastro en el libro').toBe(1);
+      expect(eventos[0]!.tipo).toBe('RevisionSimuladaCreada');
+      expect((eventos[0]!.payload as Record<string, unknown>).conceptoId).toBe(conceptoId);
+      expect((eventos[0]!.payload as Record<string, unknown>).arquetipoId).toBe(lenteA);
+      expect(eventos[0]!.actor_id).toBe(curadorId);
+      expect(eventos[0]!.actor_rol).toBe('lead-boutique');
+    });
+  });
+
+  /**
+   * Y el evento de la aceptación dice QUÉ objeto se creó, en todos los destinos.
+   *
+   * El payload enumeraba las columnas de destino a mano y se quedó en `oportunidadId`: ni el
+   * post mortem de C7 ni la revisión de C4 aparecían. Importa porque el puntero vivo se puede
+   * soltar —borrar una revisión aceptada suelta `propuesta_ai.revision_simulada_id`, que es la
+   * salida documentada para corregirla— y entonces lo único que queda diciendo qué se creó es
+   * el evento, que es append-only.
+   *
+   * El censo se hace contra el REGISTRO y no contra una lista escrita aquí: es exactamente la
+   * enumeración a mano lo que falló, y ya van dos capacidades.
+   */
+  it('el evento de la aceptación nombra la columna de destino de toda capacidad', async () => {
+    const admin = sqlAdmin();
+    const [f] = await admin`select prosrc from pg_proc
+      where proname = 'propuesta_ai_revision_guard'`;
+    const fuente = f!.prosrc as string;
+    const enCamello = (col: string) =>
+      col.replace(/_id$/, '').replace(/_(.)/g, (_m, c: string) => c.toUpperCase()) + 'Id';
+    const faltan = [...new Set(Object.values(COLUMNA_DE_DESTINO))].filter(
+      (col) => !fuente.includes(`'${enCamello(col)}', new.${col}`),
+    );
+    expect(
+      faltan,
+      'el evento de aceptación no nombra estas columnas de destino: si el puntero vivo se suelta, nada dice ya qué objeto creó esa propuesta',
+    ).toEqual([]);
+  });
+
+  /**
+   * El testimonio de C4 también está blindado EN LA BASE, no solo en el servicio.
+   *
+   * La comparación que la base ya hacía mira `contenido -> 'citas'`, y las de C4 viven dentro de
+   * cada hallazgo: null contra null, o sea que pasaba EN VACÍO. Es la lección que este
+   * repositorio ya tiene escrita —una regla contra una ruta fija del contenido no ve a quien lo
+   * guarda en otro sitio— y C2 la aprendió en su día: su guard compara
+   * `$.afirmaciones[*].citas`, que por ser un array DE ARRAYS conserva además el reparto.
+   *
+   * Y el reparto que arreglé en la ronda 8 vive en el servicio, así que por la superficie SQL
+   * —donde `contenido` sí se puede actualizar— no lo tapaba nadie: se podían repartir las citas
+   * entre hallazgos, cambiar de lente conservando las frases, o quitar una marca de hipótesis, y
+   * luego escribir las hojas que cuadran con lo corregido.
+   *
+   * Los cuatro casos, y el último es el que separa «el testimonio está blindado» de «C4 no
+   * admite correcciones».
+   */
+  it('C4 no deja tocar su testimonio por SQL, y sí corregir sus textos', async () => {
+    await enWorkspaceLimpio('c4-testimonio-sql', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      /*
+       * Un SEGUNDO documento en la misma lente, y hace falta: el enlace materializado tiene
+       * clave primaria (hallazgo, evidencia), así que dos citas del MISMO documento bajo un
+       * mismo hallazgo colapsan en una fila y el reparto ni siquiera se puede escribir. Esa es
+       * ya media protección, y la sonda mediría esa clave en vez de la regla si no lo separara.
+       */
+      const [fte2] = await admin`insert into fuente
+        (workspace_id, tipo, titulo, referencia, creado_por)
+        values (${wsC}, 'entrevista', 'Entrevistas de la etapa 1 (bis)', 'ref-e1b', ${curadorId})
+        returning id`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte2!.id as string}, 'Entrevista D-02',
+                'Prefiero que me digan para qué antes de dar nada.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const evA2 = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${evA2}, 'concedido', 'cliente', 'Consentimiento del participante',
+                ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteA}, ${evA2})`;
+      const citaUna = {
+        evidenciaId: evA,
+        fragmento: 'No entrego la cédula',
+        localizacion: 'resumen',
+      };
+      const citaOtra = {
+        evidenciaId: evA2,
+        fragmento: 'Prefiero que me digan para qué',
+        localizacion: 'resumen',
+      };
+      // Una TERCERA cita: desde que las dos clases de RF-08.2 se excluyen, un reparto sólo es
+      // reparto si los dos hallazgos siguen citando algo — dejar uno a cero lo para el contrato
+      // antes, y la sonda mediría esa puerta.
+      const citaTres = { evidenciaId: evA, fragmento: 'la cédula', localizacion: 'resumen' };
+      const original = {
+        arquetipoId: lenteA,
+        sintesis: 'Dos lecturas del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [citaUna],
+          },
+          {
+            // OBSERVADO y no hipótesis: este hallazgo lleva su propia cita, y desde que las dos
+            // clases de RF-08.2 se excluyen, marcarlo como extrapolación con un testimonio
+            // detrás es justo lo que la base rechaza. Lo que la sonda mide —que las citas no se
+            // reparten entre hallazgos— necesita dos hallazgos CITADOS, no uno de cada clase.
+            titulo: 'Se va por el tiempo',
+            descripcion: 'Dice que abandona si tarda.',
+            esHipotesis: false,
+            citas: [citaOtra],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      const propuestaId = await conUsuario(curadorId, async (tx) => {
+        const [ll] = await tx`insert into llamada_ai
+          (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+          values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                  'salida-valida', ${curadorId})
+          returning id`;
+        const [p] = await tx`insert into propuesta_ai
+          (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, es_simulacion, creado_por)
+          values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                  ${tx.json(original)}, ${tx.json(original)},
+                  'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA, evA2]},
+                  'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+          returning id`;
+        return p!.id as string;
+      });
+
+      /**
+       * La corrección ENTERA por la superficie concedida: mover el estado, escribir las hojas
+       * que cuadran con lo corregido, y sellar. Es el camino que la avería describe — el guard
+       * diferido comprueba contra el `contenido` YA corregido, así que las hojas cuadran y pasa.
+       */
+      const corregirEntero = (contenido: typeof original) =>
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${contenido.arquetipoId}, ${contenido.sintesis},
+                    ${curadorId})
+            returning id`;
+          for (const [i, h] of contenido.hallazgos.entries()) {
+            const [fila] = await tx`insert into hallazgo_simulado
+              (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+              values (${wsC}, ${r!.id as string}, ${i}, ${h!.titulo}, ${h!.descripcion},
+                      ${h!.esHipotesis})
+              returning id`;
+            for (const cita of h!.citas) {
+              await tx`insert into hallazgo_simulado_evidencia
+                (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+                values (${fila!.id as string}, ${cita.evidenciaId}, ${wsC}, ${cita.fragmento},
+                        ${cita.localizacion})`;
+            }
+          }
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Qué te haría entregarla?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'corregida', contenido = ${tx.json(contenido)},
+                  revisada_por = ${curadorId}, revision_simulada_id = ${r!.id as string}
+            where id = ${propuestaId} and workspace_id = ${wsC}`;
+          return r!.id as string;
+        });
+
+      // 1. EL REPARTO: la misma lista aplanada, colgada de otro hallazgo. Lo que se mueve es el
+      //    documento que sostenía a un hallazgo, ahora debajo del otro.
+      await expect(
+        corregirEntero({
+          ...original,
+          hallazgos: [
+            { ...original.hallazgos[0]!, citas: [citaUna] },
+            { ...original.hallazgos[1]!, citas: [citaTres, citaOtra] },
+          ],
+        }),
+      ).rejects.toThrow(/citas de una revisión simulada no se corrigen/i);
+
+      // 2. Una cita CAMBIADA. El enlace materializado solo guarda el id del documento, así que
+      //    las hojas cuadran igual y el fragmento —que es lo contrastable— se reescribe entero.
+      await expect(
+        corregirEntero({
+          ...original,
+          hallazgos: [
+            {
+              ...original.hallazgos[0]!,
+              citas: [{ ...citaUna, fragmento: 'No entrego la cédula sin saber' }],
+            },
+            original.hallazgos[1]!,
+          ],
+        }),
+      ).rejects.toThrow(/citas de una revisión simulada no se corrigen/i);
+
+      /*
+       * 3. LA MARCA DE HIPÓTESIS ya no llega hasta su guard, y su caso se retira diciendo por
+       *    qué. Desde que las dos clases de RF-08.2 se excluyen, un cambio SUELTO de la marca es
+       *    ilegal por una de las dos en cualquier dirección: una observada citada que pasa a
+       *    hipótesis lleva citas y una hipótesis sin citas que pasa a observada no cita nada.
+       *    Y cambiarla AJUSTANDO las citas mueve las citas, que es lo que para el caso 1.
+       *
+       *    Lo que protegía sigue protegido, y desde un sitio al que no hay que llegar: las dos
+       *    clases se comprueban en el commit de TODA revisión, no sólo al corregir una. Se mide
+       *    aquí el cambio combinado, que es el único que queda alcanzable.
+       */
+      await expect(
+        corregirEntero({
+          ...original,
+          hallazgos: [
+            original.hallazgos[0]!,
+            { ...original.hallazgos[1]!, esHipotesis: true, citas: [] },
+          ],
+        }),
+      ).rejects.toThrow(/citas de una revisión simulada no se corrigen/i);
+
+      /*
+       * LA LENTE no lleva caso propio, y es una respuesta: cambiarla en el contenido obliga a
+       * cambiarla también en la fila —el guard diferido exige que el arquetipo materializado sea
+       * el que la propuesta nombra— y entonces las citas dejan de ser de su arquetipo y las para
+       * el guard de la voz prestada, que ya tiene su sonda. Añadir aquí un caso que cae por otra
+       * puerta mediría esa puerta, no ésta.
+       */
+
+      // 4. Y LOS TEXTOS SÍ, que es lo que separa «el testimonio está blindado» de «C4 no admite
+      //    correcciones». Va el último porque es el único que llega a escribir la revisión.
+      const revisionId = await corregirEntero({
+        ...original,
+        sintesis: 'Dos lecturas del primero, mejor dichas.',
+        hallazgos: [
+          { ...original.hallazgos[0]!, descripcion: 'No entrega el documento sin un motivo.' },
+          { ...original.hallazgos[1]!, titulo: 'Quizá abandone antes de terminar' },
+        ],
+      });
+      expect(revisionId, 'la corrección de textos no entró').toBeTruthy();
+    });
+  });
+
+  /**
+   * Y EL PASAJE QUE SE ESCRIBE EN EL ENLACE tiene que ser el que la propuesta dice.
+   *
+   * La sonda de arriba mide el camino contrario —cambiar el `contenido` y escribir las hojas
+   * que cuadran—, y eso lo para el guard del testimonio. Éste es el otro: dejar el contenido
+   * INTACTO y escribir en `hallazgo_simulado_evidencia` un fragmento distinto. El guard del
+   * sello contaba las citas y comparaba `evidencia_id`, nada más, así que el enlace se sellaba
+   * con un texto que la propuesta inmutable no dice — y ese texto es el que se lee y el que
+   * viaja en la exportación.
+   *
+   * La comparación es «el pasaje guardado es UNO de los que la propuesta trae para ESE
+   * documento», y no «es el de la cita i», porque el enlace tiene clave primaria
+   * `(hallazgo, evidencia)`: dos citas del mismo documento colapsan en una fila y cuál de las
+   * dos queda es cosa de quien escribe. Exigir la primera habría pedido un orden que la tabla
+   * no guarda, y habría roto la materialización que ya funciona.
+   *
+   * Las DOS columnas, que es la mitad que se olvida: cerrar sólo el fragmento deja la avería
+   * idéntica una columna a la derecha, y eso ya está escrito en la tabla desde la ronda 29.
+   */
+  it('C4: el pasaje del enlace materializado es uno de los que la propuesta dice', async () => {
+    await enWorkspaceLimpio('c4-pasaje-sello', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const citaUna = {
+        evidenciaId: evA,
+        fragmento: 'No entrego la cédula',
+        localizacion: 'resumen',
+      };
+      /*
+       * El caso del colapso va por la SEGUNDA lente y su documento, no por la primera. No es
+       * cosmético: hay un único parcial que impide dos propuestas pendientes de la misma lente
+       * sobre el mismo concepto, y `revision_simulada` es única por `(concepto, arquetipo)`, así
+       * que reutilizar la primera medía esas dos claves en vez de esta regla. Lo cazó la propia
+       * sonda al fallar por «duplicate key», que es el fallo de la MEDICIÓN y no del arreglo.
+       */
+      const citaDos = { evidenciaId: evB, fragmento: 'Si tarda más de un café', localizacion: 'resumen' };
+      // Segunda cita del MISMO documento: es la que hace medible el colapso de la clave.
+      const citaDosBis = { evidenciaId: evB, fragmento: 'lo dejo', localizacion: 'cierre' };
+      const hacerPropuesta = (lente: string, citas: (typeof citaUna)[]) =>
+        conUsuario(curadorId, async (tx) => {
+          const contenido = {
+            arquetipoId: lente,
+            sintesis: 'Una lectura del primero.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas,
+              },
+            ],
+            preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+            confianzaPropuesta: 'media',
+          };
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente',
+                    ${citas.map((c) => c.evidenciaId)},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return p!.id as string;
+        });
+
+      /* Materializar A MANO por la superficie concedida, con el contenido INTACTO y el pasaje
+       * que se le pase — que es exactamente lo que la avería describe. */
+      const sellarCon = (
+        propuestaId: string,
+        lente: string,
+        evidenciaId: string,
+        fragmento: string,
+        localizacion: string,
+      ) =>
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lente}, 'Una lectura del primero.', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Pide saber para qué',
+                    'No entrega el documento sin motivo.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evidenciaId}, ${wsC}, ${fragmento}, ${localizacion})`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Qué te haría entregarla?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${propuestaId} and workspace_id = ${wsC}`;
+        });
+
+      // UNA sola propuesta para los tres primeros casos: los dos que se rechazan tumban la
+      // transacción del sello y la dejan pendiente otra vez, así que el tercero la reutiliza.
+      const propuesta = await hacerPropuesta(lenteA, [citaUna]);
+
+      // 1. El FRAGMENTO cambiado: el documento es el que la propuesta nombra, el texto no.
+      await expect(
+        sellarCon(propuesta, lenteA, evA, 'Entrego la cédula sin problema', 'resumen'),
+        'el enlace se selló con un pasaje que la propuesta no dice',
+      ).rejects.toThrow(/no dicen lo que dice la propuesta/i);
+
+      // 2. Y la LOCALIZACIÓN, que es la columna de al lado y la mitad que se olvida.
+      await expect(
+        sellarCon(propuesta, lenteA, evA, 'No entrego la cédula', 'anexo inventado'),
+        'la localización del enlace no se compara contra la de la propuesta',
+      ).rejects.toThrow(/no dicen lo que dice la propuesta/i);
+
+      // 3. El pasaje EXACTO entra, que es lo que separa esto de «no se puede materializar».
+      await expect(
+        sellarCon(propuesta, lenteA, evA, 'No entrego la cédula', 'resumen'),
+      ).resolves.toBeUndefined();
+
+      /*
+       * 4. Y con dos citas del mismo documento, vale CUALQUIERA de las dos: el enlace es uno
+       *    solo por la clave primaria, así que la comparación pregunta por pertenencia y no por
+       *    posición. Sin esto, el arreglo habría cerrado una puerta abriendo otra: la
+       *    materialización real —que guarda la primera— seguiría entrando, y esta de aquí no,
+       *    sin que nada distinga una de otra en la tabla.
+       */
+      await expect(
+        sellarCon(
+          await hacerPropuesta(lenteB, [citaDos, citaDosBis]),
+          lenteB,
+          evB,
+          'lo dejo',
+          'cierre',
+        ),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  /**
+   * Una propuesta de C4 tampoco nace cuando el concepto ya está decidido.
+   *
+   * El guard de inserción resuelve el reto para tomar su candado, y lo hacía por una lista de
+   * anclas escrita a mano: `reto_id`, y `registry_id` para C6. Ni `concepto_id` ni
+   * —medido de paso— `outcome_review_id`, que llegó con C7 y ya está en `agents`. Es la TERCERA
+   * vez que esa forma falla en este fichero: las tres listas de `num_nonnulls` y el payload del
+   * evento de aceptación fueron las dos primeras.
+   *
+   * Sin resolverlo no hay candado del reto, y por tanto no hay ninguna de las dos puertas de C4:
+   * ni el estado del concepto ni la ventana de la etapa. Lo que queda es una propuesta pendiente
+   * que NUNCA se podrá aceptar —la política y el guard diferido la paran al materializar— y que
+   * mientras tanto bloquea pedir otra, porque el selector no ofrece un concepto con propuesta de
+   * C4 en curso. La llamada ya está pagada.
+   */
+  it('C4 no acepta propuestas nuevas sobre un concepto ya decidido', async () => {
+    await enWorkspaceLimpio('c4-propuesta-tardia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      const proponer = () =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return p!.id as string;
+        });
+
+      // Con el concepto candidato entra: la puerta la cierra el veredicto y no otra cosa.
+      await expect(proponer()).resolves.toBeTruthy();
+      await admin`update concepto set estado = 'pasa',
+        decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
+      await expect(proponer()).rejects.toThrow(/ya no es candidato|no admite/i);
+    });
+  });
+
+  /**
+   * Y el libro dice de qué propuesta salió la revisión, cuando salió de una.
+   *
+   * El evento se escribía en un `after insert` inmediato, y ahí `propuesta_ai_id` todavía es
+   * nulo: la materialización lo inserta sin sello a propósito —esa columna no está en el grant,
+   * la estampa el guard diferido— así que `jsonb_strip_nulls` se llevaba `propuestaAiId` y TODA
+   * revisión hecha por la AI quedaba anotada como si la hubiera escrito una persona. La avería
+   * la abrió mi propio arreglo de la ronda 8, y su sonda no la vio porque medía el camino manual,
+   * donde el sello es nulo de verdad.
+   *
+   * Se mide por el camino REAL, que es el único donde hay sello que perder.
+   */
+  it('el libro distingue la revisión que nació de una propuesta de la escrita a mano', async () => {
+    await enWorkspaceLimpio('c4-libro-sello', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Una lectura del primero.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media',
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId,
+      });
+      const [evento] = await admin`select payload from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'RevisionSimuladaCreada'
+          and payload->>'revisionSimuladaId' = ${objetoId}`;
+      expect(evento, 'la revisión aceptada no dejó rastro en el libro').toBeDefined();
+      expect(
+        (evento!.payload as Record<string, unknown>).propuestaAiId,
+        'el libro anota como escrita a mano una revisión que salió de una propuesta',
+      ).toBe(propuestaId);
+    });
+  });
+
+  /**
+   * Y lo aceptado SE LEE: la revisión llega a quien decide el pasa/muere.
+   *
+   * C4 escribía y nadie leía. Un barrido del código de producción lo dejaba claro: las únicas
+   * menciones a `revision_simulada` fuera de migraciones y pruebas eran tres `not exists` —la
+   * ventana de lentes, que las descuenta sin mirar su contenido—, dos `insert into`, y el
+   * catálogo de exportación, que las poda del entregable. En cuanto la propuesta se aceptaba
+   * desaparecía del panel, que solo pinta `estado = 'propuesta'`.
+   *
+   * Y lo que se perdía no es un detalle: las preguntas de test son lo ÚNICO que una simulación
+   * le entrega a la etapa 4 (RF-08.2), porque sus hallazgos no se citan ni cuentan en G4. Sin
+   * lector, la capacidad producía datos que nadie podía usar.
+   *
+   * Se mide por el camino real y hasta la proyección que alimenta la pantalla: generar, aceptar,
+   * y leer la gobernanza del proyecto como la lee quien registra el pasa/muere.
+   */
+  it('una revisión aceptada llega a quien decide el pasa/muere, con sus preguntas', async () => {
+    await enWorkspaceLimpio('c4-lectura', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4', 'Proyecto de la lectura', ${curadorId})
+        returning id`;
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'No entrega el documento sin saber para qué.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                    ],
+                  },
+                  {
+                    titulo: 'Quizá abandone el alta',
+                    descripcion: 'Extrapolando, se iría antes de terminar.',
+                    esHipotesis: true,
+                    citas: [],
+                  },
+                ],
+                preguntas: [
+                  {
+                    pregunta: '¿Qué te haría entregar la cédula?',
+                    escenario: 'Alta con verificación diferida',
+                    hallazgoIndice: 0,
+                  },
+                  { pregunta: '¿Hasta dónde llegarías antes de irte?', escenario: '' },
+                ],
+                confianzaPropuesta: 'media',
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+
+      // Y ya no está en el panel: por eso hace falta el otro lector.
+      const despues = await panelPropuestas(curadorId, wsC);
+      expect(
+        despues.pendientes.some((x) => x.id === propuestaId),
+        'la propuesta aceptada sigue en el panel: la sonda no mide la pérdida',
+      ).toBe(false);
+
+      const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const concepto = gob!.conceptos.find((c) => c.id === conceptoId);
+      expect(concepto, 'el concepto no llega a la gobernanza').toBeDefined();
+      expect(concepto!.revisiones.length, 'la revisión aceptada no se lee desde ninguna parte').toBe(1);
+      const [rev] = concepto!.revisiones;
+      expect(rev!.arquetipoNombre).toBe('El desconfiado digital');
+      expect(rev!.sintesis).toBe('No entrega el documento sin saber para qué.');
+      expect(rev!.propuestaAiId, 'la revisión no dice de qué propuesta salió').toBe(propuestaId);
+      expect(rev!.hallazgos.map((h) => h.esHipotesis)).toEqual([false, true]);
+      /*
+       * La cita ENTERA, no solo el documento.
+       *
+       * El enlace materializado son tres uuid: no guarda el fragmento, y por su clave primaria
+       * dos citas del mismo documento colapsan en una. El testimonio vive en el «contenido» de
+       * la propuesta —inmutable por SYS-17—, así que leerlo de ahí no es un adorno: es la única
+       * forma de que quien firma el pasa/muere vea QUÉ dijo alguien y no solo dónde.
+       */
+      expect(rev!.hallazgos[0]!.citas, 'la cita llega sin el pasaje que la sostiene').toEqual([
+        {
+          evidenciaTitulo: 'Entrevista D-01',
+          fragmento: 'No entrego la cédula',
+          localizacion: 'resumen',
+          // Y si sigue pudiendo citarse, que es lo que decide si el pasaje se enseña.
+          citable: true,
+        },
+      ]);
+      expect(rev!.hallazgos[1]!.citas, 'una hipótesis no cita nada').toEqual([]);
+      expect(rev!.preguntas.map((q) => q.pregunta)).toEqual([
+        '¿Qué te haría entregar la cédula?',
+        '¿Hasta dónde llegarías antes de irte?',
+      ]);
+      expect(rev!.preguntas[0]!.escenario).toBe('Alta con verificación diferida');
+
+      /*
+       * Y DE QUÉ HALLAZGO NACE CADA PREGUNTA.
+       *
+       * La base lo guarda —`pregunta_de_test.hallazgo_id`, con clave ajena compuesta a
+       * `hallazgo_simulado (id, revision_id)`— y la tarjeta de la propuesta pendiente lo dice
+       * («Nace del hallazgo N»). La proyección lo dejaba caer, así que el rastro de un riesgo
+       * simulado a la pregunta que hay que ir a probar se cortaba EXACTAMENTE al aceptar, que
+       * es cuando se está decidiendo el pasa/muere.
+       *
+       * Las dos ramas, porque el enlace es opcional: la primera pregunta nace del hallazgo
+       * observado, la segunda no nace de ninguno.
+       */
+      const [enLaBase] = await admin`select count(*)::int as n from pregunta_de_test
+        where revision_id = ${rev!.id} and hallazgo_id is not null`;
+      expect(enLaBase!.n, 'la base no guardó el enlace: la sonda no mide la pérdida').toBe(1);
+      expect(rev!.preguntas.map((q) => q.hallazgoId)).toEqual([rev!.hallazgos[0]!.id, null]);
+
+      /*
+       * Y LA PROCEDENCIA SE DISTINGUE, que es el campo del que la pantalla cuelga su etiqueta.
+       *
+       * `revision_simulada` no es una tabla de la AI: SYS-21 deja escribir la sesión a mano, y
+       * esas filas llegan a esta misma proyección con `propuesta_ai_id` en null. La pantalla
+       * decía «simulación AI» sin mirar el campo y dos palabras después «escrita a mano»: las
+       * dos cosas a la vez, con una de ellas falsa, delante de quien firma un pasa/muere. La
+       * marca de simulación es de todas —eso es SYS-20— y la autoría no, así que la sonda pide
+       * las dos filas por el mismo lector y que el campo las separe.
+       */
+      const aMano = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Leída a mano por una persona'),
+      );
+      const gob2 = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const revs = gob2!.conceptos.find((c) => c.id === conceptoId)!.revisiones;
+      expect(revs.length, 'la revisión escrita a mano no llega al mismo lector').toBe(2);
+      expect(
+        Object.fromEntries(revs.map((x) => [x.id, x.propuestaAiId])),
+        'la procedencia no distingue lo que propuso la AI de lo que escribió una persona',
+      ).toEqual({ [rev!.id]: propuestaId, [aMano]: null });
+
+      /*
+       * Y LO LEE QUIEN NO DECIDE, que es la mitad que faltaba.
+       *
+       * Las preguntas de test son para el equipo que va a correr el test, no para el lead en el
+       * momento de firmar: pintarlas sólo dentro del formulario del pasa/muere las dejaba fuera
+       * del alcance de quien no es lead —el control que abre ese formulario se pinta para él— y
+       * al alcance del lead sólo DESPUÉS de los tests que esas preguntas guían.
+       *
+       * Lo que se puede medir de eso es el lector, y aquí está: un diseñador del mismo
+       * workspace lo abre y recibe las revisiones enteras. Si algún día alguien le pone una
+       * puerta de rol, esto se cae.
+       */
+      const [otro] = await admin`insert into usuario (email, nombre, estado)
+        values (${`disenador-${wsC}@designio.test`}, 'Diseñador', 'activo') returning id`;
+      const disenadorId = otro!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${disenadorId}, 'Diseñador', ${`disenador-${wsC}@designio.test`},
+                'disenador')`;
+      const gob3 = await gobernanzaDeProyecto(disenadorId, wsC, proy!.id as string);
+      const revsDelDisenador = gob3!.conceptos.find((c) => c.id === conceptoId)!.revisiones;
+      expect(
+        revsDelDisenador.length,
+        'quien no es lead no llega a leer las revisiones aceptadas',
+      ).toBe(2);
+      expect(
+        revsDelDisenador.flatMap((x) => x.preguntas.map((q) => q.pregunta)),
+        'las preguntas de test no llegan a quien va a correr el test',
+      ).toContain('¿Qué te haría entregar la cédula?');
+
+    });
   });
 
   /**
@@ -8522,6 +14858,120 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       ciegos,
       'un índice único sobre una columna de ancla que no distingue la capacidad: dos ' +
         'capacidades ancladas ahí se excluyen entre sí, y son pipelines independientes',
+    ).toEqual([]);
+  });
+
+  /**
+   * EL TECHO DEL LOTE DE LA BASE CABE PARA TODAS, no sólo para la que lo escribió.
+   *
+   * `propuesta_ai_orden_check` nació con `orden <= 3` —cuatro criterios de C0, puestos 0..3—
+   * y se quedó ahí mientras el registro declaraba lotes más grandes: 5 oportunidades en C3,
+   * 6 entradas de KPI en C6, 6 revisiones en C4. La quinta propuesta de cualquiera de las tres
+   * reventaba el INSERT del lote ENTERO con un 23514, y con la llamada ya pagada.
+   *
+   * No lo cazó ninguna sonda porque ninguna generaba un lote de más de cuatro. Salió al montar
+   * la de la ventana de lentes, que necesita siete arquetipos — y para entonces dos de las tres
+   * capacidades afectadas ya estaban mergeadas.
+   *
+   * Así que la pregunta se hace por el REGISTRO y no por un número escrito aquí: el techo de la
+   * base tiene que dar cabida al lote más grande que cualquier capacidad declare. La que venga
+   * con un lote de siete lo romperá aquí, que es donde se puede leer.
+   */
+  it('el techo de orden en la base cabe para el lote más grande que declara el registro', async () => {
+    const admin = sqlAdmin();
+    const [fila] = await admin`select pg_get_constraintdef(oid) as d from pg_constraint
+      where conname = 'propuesta_ai_orden_check'`;
+    const definicion = fila!.d as string;
+    /*
+     * El techo se lee POR CAPACIDAD del `case`, no como un número único: subirlo a uno solo
+     * —el máximo de todas— le quitaría el suyo a las que declaran menos, y ese techo es lo que
+     * defiende la sonda «C0 reparte una llamada entre su lote». Lo aprendí subiéndolo y viéndola
+     * caer, así que el censo compara los DOS lados capacidad a capacidad.
+     */
+    const enLaBase = new Map(
+      [...definicion.matchAll(/WHEN '([^']+)'::text THEN (\d+)/g)].map((m) => [
+        m[1] as string,
+        Number(m[2]),
+      ]),
+    );
+    const porDefecto = Number(/ELSE (\d+)/.exec(definicion)?.[1]);
+    expect(
+      enLaBase.size > 0 && Number.isFinite(porDefecto),
+      `no se pudo leer el techo por capacidad de: ${definicion}`,
+    ).toBe(true);
+
+    const discrepan = CAPACIDADES_ACTIVAS.map((c) => {
+      const declarado = (CAPACIDADES[c].lote?.maximo ?? 1) - 1;
+      const enBase = enLaBase.get(c) ?? porDefecto;
+      return { c, declarado, enBase };
+    })
+      .filter((x) => x.declarado !== x.enBase)
+      .map((x) => `${x.c}: el registro dice ${x.declarado + 1} y la base admite ${x.enBase + 1}`)
+      .sort();
+    expect(
+      discrepan,
+      'el techo del lote en la base y el que declara el registro no dicen lo mismo: si la base ' +
+        'admite MENOS, el INSERT del lote entero falla con un 23514 y la llamada ya está ' +
+        'pagada; si admite MÁS, esa capacidad se queda sin su techo',
+    ).toEqual([]);
+  });
+
+  /**
+   * Y AL REVÉS: toda columna de ancla TIENE su índice único parcial en `reserva_ai`.
+   *
+   * El censo de arriba mira los índices que EXISTEN y exige que ninguno excluya por ancla sin
+   * distinguir la capacidad. Eso no ve el modo de fallo contrario, que es el que ha pasado:
+   * un ancla nueva llega con su clave ajena y su CHECK y SIN índice, y un índice que falta no
+   * aparece en ningún barrido de índices. Medido en esta rama: faltaba el de `concepto_id`
+   * (C4) y también el de `outcome_review_id` (C7, ya en `agents`), o sea que la ausencia
+   * sobrevivió a una capacidad entera sin que nada la nombrara.
+   *
+   * Lo que ese índice sostiene no es cosmético: es el suelo de «no se paga dos veces por el
+   * mismo objeto» cuando la escritura no pasa por el candado de presupuesto de
+   * `prepararAlcance`.
+   *
+   * Se deriva de `COLUMNAS_DE_ANCLA`, no de una lista escrita aquí, porque la lista escrita a
+   * mano es exactamente lo que ha fallado cuatro veces en este pipeline.
+   */
+  it('toda columna de ancla tiene su índice único parcial en reserva_ai', async () => {
+    const admin = sqlAdmin();
+    const filas = await admin`
+      select ic.relname as indice,
+             array_agg(a.attname order by k.ord) as columnas,
+             coalesce(pg_get_expr(i.indpred, i.indrelid), '') as predicado
+      from pg_index i
+      join pg_class ic on ic.oid = i.indexrelid
+      join pg_class c on c.oid = i.indrelid
+      join lateral unnest(i.indkey) with ordinality as k(attnum, ord) on true
+      join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+      where i.indisunique and c.relname = 'reserva_ai'
+      group by 1, 3`;
+    const columnasDeReserva = await admin`select column_name from information_schema.columns
+      where table_name = 'reserva_ai'`;
+    const presentes = new Set(columnasDeReserva.map((f) => f.column_name as string));
+    // Solo las anclas que esta tabla lleva: el registro declara alguna que aún no está aquí.
+    const anclas = COLUMNAS_DE_ANCLA.filter((c) => presentes.has(c));
+    expect(anclas.length, 'ninguna columna de ancla en reserva_ai: el censo no mide nada').toBeGreaterThan(1);
+
+    const sinIndice = anclas
+      .filter(
+        (ancla) =>
+          !filas.some((f) => {
+            const columnas = f.columnas as string[];
+            return (
+              columnas.includes(ancla) &&
+              columnas.includes('workspace_id') &&
+              columnas.includes('capacidad') &&
+              (f.predicado as string).includes(ancla)
+            );
+          }),
+      )
+      .sort();
+    expect(
+      sinIndice,
+      'estas anclas no tienen índice único parcial en reserva_ai: dos reservas vivas sobre ' +
+        'el mismo objeto commitean las dos, doblan el presupuesto apartado y dejan pagar dos ' +
+        'veces el mismo trabajo',
     ).toEqual([]);
   });
 
@@ -12440,6 +18890,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * Gana el blindaje, y no por resolver el empate hacia el lado estricto: los fragmentos se
    * copiaron de UN criterio, y reapuntarlos a otro conservándolos es quedarse con el sostén de
    * A para afirmar sobre B. Es lo mismo que C2 hace con el `evidenciaId` de sus citas.
+   *
+   * Y se exige el mensaje EXACTO, no un `/no se corrige/i` que los dos cumplen: con el patrón
+   * laxo esta sonda pasó en verde durante rondas mientras el mensaje que salía seguía siendo
+   * el de las citas —el blindaje estaba escrito y su puerta tapada por la comparación general,
+   * que corría antes—. Un patrón que ninguna de las dos ramas distingue no mide cuál corrió.
    */
   it('C6: el criterio de una entrada no se reapunta al corregir, y el resto sí', async () => {
     const admin = sqlAdmin();
@@ -12469,7 +18924,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         propuestaId,
         correccion: { ...inicial, criterioId: otro!.id as string },
       }),
-    ).rejects.toThrow(/no se corrige/i);
+    ).rejects.toThrow(/El criterio al que responde una entrada KPI no se corrige/);
 
     // Y lo que SÍ es redacción se corrige, que es la otra mitad: sin ella, este caso pasaría
     // igual con la corrección entera tapiada.

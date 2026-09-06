@@ -139,7 +139,7 @@ export type ArquetipoDeReto = {
   estado: EstadoArquetipo;
   veredictoRazon: string;
   segmentos: { id: string; nombre: string }[];
-  evidencias: { id: string; titulo: string }[];
+  evidencias: { id: string; titulo: string; citable: boolean }[];
 };
 
 export type AlcanceReapertura = 'declarado' | 'etapa-completa';
@@ -172,7 +172,94 @@ export type GobernanzaDeProyecto = {
    * pasa/muere es raro pero no imposible —la decisión y el veredicto son dos escrituras del
    * mismo acto y pueden llegar en cualquier orden—, y quien decide tiene que ver cuál es cuál.
    */
-  conceptos: { id: string; titulo: string; estado: EstadoConcepto }[];
+  conceptos: {
+    id: string;
+    titulo: string;
+    estado: EstadoConcepto;
+    /**
+     * Y LAS REVISIONES SIMULADAS QUE YA SE ACEPTARON SOBRE ÉL.
+     *
+     * Sin esto, C4 escribía y nadie leía: la revisión, sus hallazgos, sus citas y las preguntas
+     * de test entraban en la base y salían del panel —que solo pinta `estado = 'propuesta'`— sin
+     * ninguna pantalla detrás. Las preguntas son lo único que una simulación le entrega a la
+     * etapa 4 (RF-08.2), así que dejarlas sin lector es dejar la capacidad sin entregar.
+     *
+     * Las cinco capacidades que materializan tienen su sitio donde leer lo aceptado: los
+     * insights en `/insights`, las entradas de KPI en el registry, las HMW en el portafolio, el
+     * post mortem en medición. Ésta es el de C4.
+     */
+    revisiones: RevisionSimuladaDeConcepto[];
+  }[];
+  /**
+   * Si la etapa 4 del reto sigue admitiendo trabajo de método.
+   *
+   * Un concepto se queda `candidato` cuando G4 se aprueba o el reto se archiva: nada lo mueve.
+   * Las políticas de la revisión simulada piden las DOS cosas —candidato y etapa abierta—, así
+   * que con sólo el estado la pantalla ofrecía escribir y borrar donde la base ya decía que no.
+   */
+  etapaAdmiteConceptos: boolean;
+};
+
+/**
+ * Una sesión de revisión simulada, tal como la lee quien decide el pasa/muere.
+ *
+ * Con la lente y su estado por delante, porque es lo que dice DESDE QUÉ perfil se leyó, y con
+ * la marca de simulación en cada hallazgo: SYS-20 pide que no se pueda confundir con
+ * investigación, y eso vale también donde se lee, no solo donde se guarda.
+ */
+export type RevisionSimuladaDeConcepto = {
+  id: string;
+  /** La lente, por id: el formulario a mano no ofrece las que ya revisaron este concepto. */
+  arquetipoId: string;
+  arquetipoNombre: string;
+  arquetipoEstado: string;
+  sintesis: string;
+  /** De qué propuesta salió, o `null` si la escribió una persona (SYS-21). */
+  propuestaAiId: string | null;
+  hallazgos: {
+    id: string;
+    titulo: string;
+    descripcion: string;
+    esHipotesis: boolean;
+    /**
+     * Lo que sostiene la lectura. Vacío en una hipótesis.
+     *
+     * Con el FRAGMENTO y su localización cuando la revisión salió de una propuesta: el
+     * testimonio vive en su `contenido` —inmutable por SYS-17— y es lo que la tarjeta pendiente
+     * enseñaba. La escrita a mano (SYS-21) no tiene de dónde sacarlo: llega solo el título, y
+     * los dos campos en `null`, que es un hecho y no una ausencia.
+     */
+    citas: {
+      evidenciaTitulo: string;
+      fragmento: string | null;
+      localizacion: string | null;
+      /**
+       * Si ese documento SIGUE pudiendo citarse al cliente (DR001).
+       *
+       * El enlace no se puede quitar después del pasa/muere —su política de DELETE pide
+       * concepto `candidato`—, así que una cita cuyo derecho se retira se queda ahí para
+       * siempre. Enseñarla igual la presenta como sostén actual de una decisión; borrarla de
+       * la vista borraría que el hallazgo TUVO apoyo. Se dice: el título se queda —ya se
+       * publica en el tablero de gobernanza— y el pasaje se retira con su motivo.
+       */
+      citable: boolean;
+    }[];
+  }[];
+  /** Lo único que esta sesión le entrega a la etapa 4: qué ir a probar con personas. */
+  preguntas: {
+    id: string;
+    pregunta: string;
+    escenario: string;
+    /**
+     * De qué hallazgo nace, o `null` si no nace de ninguno.
+     *
+     * El enlace es opcional en la base y no es adorno: distingue «ve a comprobar ESTE riesgo
+     * que la simulación se inventó» de una pregunta suelta. La tarjeta de la propuesta
+     * pendiente ya lo dice —«Nace del hallazgo N»— y perderlo al aceptar cortaría el rastro
+     * justo cuando se está decidiendo el pasa/muere.
+     */
+    hallazgoId: string | null;
+  }[];
 };
 
 /** El ciclo de vida de un concepto, tal como lo escribe su tabla. */

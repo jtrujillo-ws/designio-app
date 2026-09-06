@@ -518,3 +518,73 @@ describe('el registro de capacidades', () => {
       .toBe(true);
   });
 });
+
+/**
+ * Toda capacidad que ANIDA sus citas tiene que decir de quién cuelga cada una.
+ *
+ * `CITAS_DEL_CONTENIDO` aplana para dos trabajos: medir la presencia literal —a la que el
+ * reparto le da igual— y comprobar que una corrección no toca las citas. Para el segundo,
+ * aplanar PIERDE lo que hay que proteger: con las citas dentro de cada hallazgo (C4) o de cada
+ * afirmación (C2), `[A], [B]` y `[A, B], []` son la misma lista, así que una corrección podía
+ * repartirlas de otra manera —mover el documento que sostenía a una hipótesis debajo de una
+ * afirmación— y la comprobación las veía idénticas. La materialización persiste el reparto
+ * nuevo, y eso es lo único contrastable que hay: qué documento sostiene cuál lectura.
+ *
+ * Se mide por la FORMA del registro y no contra una lista escrita a mano de «las que anidan»:
+ * esa lista sería una segunda redacción de la regla, y la capacidad que llegue anidando y sin
+ * `grupo` pasaría por no estar en ella. Un `flatMap` en la entrada ES el anidamiento.
+ *
+ * El registro que se lee es `CITAS_POR_CAPACIDAD`, que es donde vive el lector de cada una;
+ * `CITAS_DEL_CONTENIDO` se DERIVA de él para canonizar el `alcanceId`, y por eso ya no es un
+ * literal que se pueda recorrer. El censo se ancla a un nombre, así que se comprueba además
+ * que la exportación siga saliendo de ESTE registro: si mañana se derivara de otro, el censo
+ * se quedaría midiendo un literal muerto y pasaría en verde sobre la capacidad nueva.
+ */
+it('las capacidades que anidan sus citas llevan el reparto en cada una', async () => {
+  const ruta = `${RAIZ}/src/lib/ai/ai.contenido.ts`;
+  const codigo = await readFile(ruta, 'utf8');
+  const arbol = ts.createSourceFile(ruta, codigo, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const diagnosticos = (arbol as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics;
+  expect(diagnosticos ?? [], 'ai.contenido.ts no parsea limpio: el censo no lo ha leído').toEqual(
+    [],
+  );
+
+  const entradas = new Map<string, string>();
+  let derivado = '';
+  const recorrer = (n: ts.Node): void => {
+    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer) {
+      if (n.name.text === 'CITAS_POR_CAPACIDAD' && ts.isObjectLiteralExpression(n.initializer)) {
+        for (const prop of n.initializer.properties) {
+          if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
+            entradas.set(prop.name.text, prop.initializer.getText(arbol));
+          }
+        }
+      }
+      if (n.name.text === 'CITAS_DEL_CONTENIDO') derivado = n.initializer.getText(arbol);
+    }
+    ts.forEachChild(n, recorrer);
+  };
+  recorrer(arbol);
+
+  // Y el censo se cae si no encuentra el registro, en vez de pasar sobre un mapa vacío.
+  expect([...entradas.keys()].sort(), 'el censo no leyó el registro de citas').toEqual(
+    [...CAPACIDADES_ACTIVAS].sort(),
+  );
+  // Y que lo que consume el resto del sistema sea ESTE registro y no otro: sin esto, el censo
+  // se ancla a un nombre que puede quedarse atrás sin que nada lo diga.
+  expect(
+    derivado,
+    '`CITAS_DEL_CONTENIDO` ya no se deriva de `CITAS_POR_CAPACIDAD`: el censo está midiendo un registro que nadie lee',
+  ).toMatch(/\bCITAS_POR_CAPACIDAD\b/);
+
+  const anidan = [...entradas].filter(([, cuerpo]) => cuerpo.includes('.flatMap('));
+  expect(anidan.length, 'ninguna capacidad anida sus citas: el censo no mide nada').toBeGreaterThan(
+    0,
+  );
+  for (const [capacidad, cuerpo] of anidan) {
+    expect(
+      cuerpo,
+      `${capacidad} anida sus citas y no declara \`grupo\`: aplanadas, dos repartos distintos de las mismas citas son la misma lista, y una corrección que las mueve de hallazgo pasa por «las citas no cambiaron»`,
+    ).toMatch(/\bgrupo:/);
+  }
+});

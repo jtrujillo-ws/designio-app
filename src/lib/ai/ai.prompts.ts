@@ -1,5 +1,10 @@
 import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
-import { CAPACIDADES, CAPACIDADES_ACTIVAS, MAX_REMEDIACIONES } from './ai.schemas';
+import {
+  CAPACIDADES,
+  CAPACIDADES_ACTIVAS,
+  MAX_REMEDIACIONES,
+  MAX_REVISIONES_POR_LOTE,
+} from './ai.schemas';
 import type { CapacidadActiva } from './ai.schemas';
 
 /**
@@ -26,7 +31,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-06.20';
+export const PROMPT_VERSION = 'ai-2026-09-06.21';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -383,6 +388,256 @@ function cuerpoDeOportunidades(reto: RetoConInsights): {
     largo = inicio + linea.length;
   }
   return { texto: partes.join('\n'), tramos, tramosCriterios };
+}
+
+/**
+ * Material de C4: EL CONCEPTO que se revisa, y detrás EL ARQUETIPO que hace de lente con la
+ * evidencia que lo sostiene.
+ *
+ * El orden no es de estilo. El recorte muerde por la cola, así que delante va lo que sin ello
+ * la respuesta no existe —el concepto— y detrás lo que puede llegar a medias sin invalidarla.
+ * Y la evidencia va la última de todas por la misma razón que en C3 los criterios: es lo que
+ * más ocupa, y un documento a medias sigue sirviendo para citar el trozo que llegó, que es
+ * exactamente lo que la presencia literal mide.
+ *
+ * La evidencia lleva TRAMOS, como la de C2: el pajar de una cita es el documento que la cita
+ * nombra, no el material entero. Sin ellos, un fragmento del testimonio de al lado saldría
+ * PRESENTE y quien revisa vería un verde prestado sobre la única señal contrastable que tiene.
+ *
+ * Y la evidencia va DENTRO del bloque de su arquetipo, sangrada: cada sesión cita solo la
+ * suya, y lo que hace del hallazgo la lectura de esa lente es que se apoye en lo que
+ * constituyó a esa lente. Con una lista de evidencia aparte, la pertenencia habría que
+ * deducirla —y deducirla es como se acaba citando el testimonio del perfil de al lado—. La
+ * base lo exige también, con un guard sobre `hallazgo_simulado_evidencia`; esto es para que el
+ * modelo no tenga que adivinarlo.
+ */
+export type ArquetipoQueRevisa = {
+  id: string;
+  nombre: string;
+  definicion: string;
+  estado: string;
+  evidencia: { id: string; titulo: string; resumen: string }[];
+};
+
+export type ConceptoARevisar = {
+  titulo: string;
+  descripcion: string;
+  umbralTest: string;
+  arquetipos: ArquetipoQueRevisa[];
+};
+
+/**
+ * Las LENTES de un lote: los arquetipos que pueden mirar de verdad, y como mucho los que caben.
+ *
+ * Dos cortes, y los dos contestan la misma pregunta —qué se le puede PEDIR al modelo—:
+ *
+ *  · Sin evidencia citable enlazada no hay lente. Pedir una sesión desde un arquetipo vacío es
+ *    pedir un perfil inventado hablando en primera persona, que es la avería exacta que SYS-20
+ *    nombra. `PREPARAR` ya lo miraba para no llamar en vano; lo que faltaba era que el material
+ *    no lo enseñara y que el prompt no lo contara entre los que hay que revisar.
+ *
+ *  · Y como mucho `MAX_REVISIONES_POR_LOTE`, porque el lote tiene ese techo y el esquema del
+ *    proveedor lo copia en su `maxItems`. Con siete arquetipos, pedir «una sesión por CADA uno»
+ *    era pedir una respuesta que el contrato rechaza al llegar: el modelo tenía que desobedecer
+ *    una de las dos instrucciones, y cuál desobedece no lo decidía nadie. Lo que queda fuera se
+ *    dice en el material en vez de desaparecer.
+ *
+ * El corte va DENTRO del cuerpo, que es el único sitio donde vale: el panel recompone el
+ * material desde las columnas de su ancla para comparar la huella, así que un recorte hecho
+ * solo en el servicio daría dos textos distintos y toda propuesta de C4 nacería marcada como
+ * «material movido». Ya costó una vuelta al escribir esta capacidad; el sitio es éste.
+ */
+export function lentesDelLote(arquetipos: ArquetipoQueRevisa[]): {
+  lentes: ArquetipoQueRevisa[];
+  sinEvidencia: number;
+  sobreElTope: number;
+} {
+  const conLente = arquetipos.filter((a) => a.evidencia.length > 0);
+  return {
+    lentes: conLente.slice(0, MAX_REVISIONES_POR_LOTE),
+    sinEvidencia: arquetipos.length - conLente.length,
+    sobreElTope: Math.max(0, conLente.length - MAX_REVISIONES_POR_LOTE),
+  };
+}
+
+export function materialDeRevision(c: ConceptoARevisar): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Concepto que se revisa', c.titulo],
+      [
+        'Arquetipos que lo revisan',
+        lentesDelLote(c.arquetipos)
+          .lentes.map((a) => a.nombre)
+          .join(' · '),
+      ],
+    ],
+    cuerpoDeRevision(c).texto,
+  );
+}
+
+function cuerpoDeRevision(c: ConceptoARevisar): {
+  texto: string;
+  tramos: Map<string, [number, number]>;
+  finalDeLaLente: Map<string, number>;
+  /** Fin de CADA aparición, con clave «arquetipoId\u0000evidenciaId». Ver abajo. */
+  finDeCadaAparicion: Map<string, number>;
+} {
+  const { lentes, sinEvidencia, sobreElTope } = lentesDelLote(c.arquetipos);
+  // Lo que queda fuera, DICHO. Un material que enseña cuatro lentes de siete sin mencionar las
+  // otras tres se lee como el reto entero, y quien revisa daría por cubierto lo que no se miró.
+  const aparte = [
+    sinEvidencia > 0 ? `${sinEvidencia} sin evidencia citable enlazada` : '',
+    sobreElTope > 0 ? `${sobreElTope} por encima del tope de ${MAX_REVISIONES_POR_LOTE} por lote` : '',
+  ].filter(Boolean);
+  const partes = [
+    'CONCEPTO QUE SE REVISA',
+    c.descripcion,
+    '',
+    // El umbral del test, cuando lo hay: es contra lo que las preguntas propuestas tienen que
+    // servir. Sin él, «propón preguntas para el test» no dice para qué test.
+    ...(c.umbralTest.trim() ? ['UMBRAL DE TEST YA DEFINIDO', c.umbralTest, ''] : []),
+    'ARQUETIPOS DESDE LOS QUE SE REVISA (uno por sesión; cada uno cita SOLO su evidencia)',
+    ...(aparte.length > 0
+      ? [`(El reto tiene otros arquetipos que no se revisan aquí: ${aparte.join('; ')}.)`]
+      : []),
+  ];
+  const tramos = new Map<string, [number, number]>();
+  // Dónde ACABA la aportación de cada lente: su cabecera y toda su evidencia. Es lo que permite
+  // saber cuáles llegaron enteras, que no es lo mismo que qué documentos llegaron.
+  const finalDeLaLente = new Map<string, number>();
+  // Dónde acaba CADA aparición de un documento, con la lente que lo dibuja en la clave.
+  const finDeCadaAparicion = new Map<string, number>();
+  let largo = partes.join('\n').length;
+  for (const a of lentes) {
+    // La cabecera del arquetipo y su evidencia DEBAJO, en el mismo bloque: es lo que hace
+    // legible de quién es cada documento. Con una lista de evidencia aparte, la pertenencia
+    // habría que deducirla, y deducirla es como se cita el testimonio del perfil de al lado.
+    const cabecera = `\n[${a.id}] ${a.nombre} (${a.estado}): ${a.definicion}`;
+    partes.push(cabecera.slice(1));
+    largo = largo + cabecera.length;
+    for (const e of a.evidencia) {
+      const linea = `  [${e.id}] ${e.titulo}\n  ${e.resumen}`;
+      const inicio = largo + 1; // el '\n' que la une a lo anterior
+      /*
+       * La PRIMERA aparición y no la última: un documento puede estar enlazado a varios
+       * arquetipos, y entonces se dibuja una vez debajo de cada uno. Sobrescribir dejaba
+       * guardada la del final, así que si esa caía tras el corte —y la de arriba no—, el
+       * documento pasaba por «no llegó»: se rechazaba una cita legítima de la primera lente, y
+       * el panel medía su presencia contra un tramo vacío. El texto de las dos apariciones es
+       * el mismo, y el orden es lineal, así que la primera es siempre la que más adentro del
+       * recorte queda: quedarse con ella contesta bien las dos preguntas.
+       */
+      if (!tramos.has(e.id)) tramos.set(e.id, [inicio, inicio + linea.length]);
+      /*
+       * Y el fin de ESTA aparición, bajo ESTA lente. `tramos` guarda la primera —es lo que hay
+       * que medir para una cita, que nombra el documento y no el arquetipo— y por eso no sirve
+       * para saber qué vio cada lente: un documento enlazado a dos arquetipos se dibuja dos
+       * veces, y la aparición de la segunda puede caer tras el corte cuando la primera no.
+       */
+      finDeCadaAparicion.set(`${a.id}\u0000${e.id}`, inicio + linea.length);
+      partes.push(linea);
+      largo = inicio + linea.length;
+    }
+    finalDeLaLente.set(a.id, largo);
+  }
+  return { texto: partes.join('\n'), tramos, finalDeLaLente, finDeCadaAparicion };
+}
+
+/** El tramo de UNA evidencia dentro del material de C4, para medir su presencia literal
+ * contra el documento que la cita nombra y no contra el material entero. Hermano exacto del
+ * de C2 y del de C3, con el mismo motivo escrito allí: se saca de AQUÍ, después del recorte,
+ * porque recomponerlo aparte reinicia el presupuesto y devuelve un texto que nadie mandó. */
+export function tramoDeEvidenciaEnRevision(c: ConceptoARevisar, evidenciaId: string): string {
+  const { texto, tramos } = cuerpoDeRevision(c);
+  const tramo = tramos.get(evidenciaId);
+  if (!tramo) return '';
+  return materialQueVeElModelo(texto).slice(tramo[0], tramo[1]);
+}
+
+/**
+ * Y qué evidencia llegó ENTERA al modelo, de todos los arquetipos.
+ *
+ * Misma pregunta que en C2 y por el mismo motivo, con una consecuencia propia: aquí la
+ * evidencia va la última del cuerpo, así que es lo primero que el recorte se come. Un
+ * arquetipo con muchos documentos enlazados puede llegar con la mitad, y entonces el alcance
+ * sellado tiene que decir la verdad —qué se enseñó— o el guard diferido daría por vistos
+ * documentos que nadie mandó.
+ */
+export function evidenciaQueLlegoAlRevisor(c: ConceptoARevisar): { ids: string[] } {
+  const { texto, tramos } = cuerpoDeRevision(c);
+  const cabe = materialQueVeElModelo(texto).length;
+  return { ids: [...tramos].filter(([, [, fin]]) => fin <= cabe).map(([id]) => id) };
+}
+
+/**
+ * Lo mismo, PARTIDO POR LENTE — y es la partición la que importa, no el total.
+ *
+ * Un lote de C4 es una sesión por lente, y hasta aquí las N propuestas se llevaban el MISMO
+ * conjunto: el de todo el material. Con eso, la comprobación que el sello hace —«¿tiene este
+ * arquetipo evidencia que su revisión no llegó a ver?»— se contesta contra documentos de otras
+ * lentes, y un testimonio que se enlaza a la lente B después de generar pasa por visto porque
+ * la lente A ya lo enseñaba. La sesión de B nunca lo leyó bajo B, que es justo la frontera que
+ * SYS-20 defiende: una frase con voz del «apurado de RR. HH.» no se sostiene en el testimonio
+ * del «desconfiado digital».
+ *
+ * Se mide sobre el TEXTO recortado y por aparición, no sobre el objeto de la base, por lo
+ * mismo que su hermana: lo que una lente enseñó es lo que de esa lente se llegó a escribir.
+ */
+export function evidenciaPorLenteQueLlegoAlRevisor(c: ConceptoARevisar): Record<string, string[]> {
+  const { texto, finDeCadaAparicion } = cuerpoDeRevision(c);
+  const cabe = materialQueVeElModelo(texto).length;
+  const porLente: Record<string, string[]> = {};
+  for (const [clave, fin] of finDeCadaAparicion) {
+    if (fin > cabe) continue;
+    const [arquetipoId, evidenciaId] = clave.split('\u0000');
+    (porLente[arquetipoId!] ??= []).push(evidenciaId!);
+  }
+  return porLente;
+}
+
+/**
+ * Y qué LENTES llegaron ENTERAS: la cabecera del arquetipo y TODA su evidencia dentro del corte.
+ *
+ * Hermana de la de arriba y NO la misma pregunta, aunque se parezcan. Aquélla dice qué
+ * documentos se enseñaron; ésta dice de qué arquetipos se puede pedir una sesión. La diferencia
+ * está en el único caso que importa: un arquetipo cuya cabecera cupo y cuya evidencia no.
+ *
+ * Ese arquetipo puede devolver una sesión ENTERA DE HIPÓTESIS —sin una sola cita— y pasar todas
+ * las puertas del contrato, porque donde no hay citas no hay nada que comprobar. Se guarda,
+ * llega al panel, alguien la lee entera… y aceptarla falla SIEMPRE, en el guard diferido que
+ * exige que la revisión haya visto toda la evidencia que su arquetipo tiene ahora. Una
+ * propuesta que nace imposible de aceptar es una llamada pagada y un rato de revisión humana
+ * tirados, y el motivo no lo dice nadie: el mensaje habla de evidencia enlazada DESPUÉS, que es
+ * justo lo que no pasó.
+ *
+ * Por eso se mide aquí, sobre el texto recortado, y no sobre el objeto que salió de la base: lo
+ * que el modelo puede revisar es lo que el modelo vio.
+ */
+export function arquetiposQueLlegaronEnteros(c: ConceptoARevisar): { ids: string[] } {
+  const { texto, finalDeLaLente } = cuerpoDeRevision(c);
+  const cabe = materialQueVeElModelo(texto).length;
+  return { ids: [...finalDeLaLente].filter(([, fin]) => fin <= cabe).map(([id]) => id) };
+}
+
+/**
+ * Y la que de verdad acota el permiso: la evidencia de las lentes QUE SE PIDEN.
+ *
+ * No es ninguna de las dos de arriba, y por eso se escribe como la INTERSECCIÓN de las dos en
+ * vez de recorrer el texto una tercera vez. «Qué documentos llegaron» incluye los de una lente
+ * que el corte partió por la mitad —su cabecera y su primer testimonio dentro, el resto
+ * fuera—; de esa lente `promptRevision` no pide ninguna sesión, porque pide las que llegaron
+ * ENTERAS. Entonces un permiso que vence hoy sobre ese primer testimonio abortaba la llamada
+ * por material del que no puede nacer ninguna propuesta: el falso bloqueo que la acotación de
+ * la ventana existe para evitar, un escalón más abajo todavía.
+ *
+ * Para el ALCANCE sellado sigue valiendo la de arriba —lo que se enseñó es lo que se enseñó—;
+ * ésta contesta la otra pregunta: de qué material puede salir algo que alguien acepte.
+ */
+export function evidenciaDeLasLentesQueSePiden(c: ConceptoARevisar): { ids: string[] } {
+  const porLente = evidenciaPorLenteQueLlegoAlRevisor(c);
+  return {
+    ids: [...new Set(arquetiposQueLlegaronEnteros(c).ids.flatMap((a) => porLente[a] ?? []))],
+  };
 }
 
 /**
@@ -995,6 +1250,43 @@ export const SISTEMA_OPORTUNIDADES = [
 ].join('\n');
 
 /**
+ * C4 es la única capacidad cuya salida NO ES EVIDENCIA DE NADA, y su sistema empieza por ahí.
+ *
+ * Un revisor AI por arquetipo simula una mirada; no la sustituye. SYS-20 lo dice en cuatro
+ * prohibiciones y las cuatro se le dicen al modelo, aunque las cuatro estén además cerradas
+ * por debajo —el contrato, la clave única, el CHECK del agregado sintético y la etiqueta
+ * imborrable—. Decírselas no es redundante: un modelo que entiende POR QUÉ no puede reportar
+ * porcentajes escribe una prosa distinta, no solo una que pasa el validador.
+ *
+ * Las tres cosas que este sistema tiene que conseguir, y por qué cada una:
+ *
+ * 1. Que hable DESDE el arquetipo y no sobre él. «El desconfiado digital probablemente
+ *    abandonaría» es una frase de analista; «no me fío de una app que me pide la cédula antes
+ *    de decirme para qué» es la lente puesta. La segunda se puede contrastar contra el
+ *    testimonio que sostiene al arquetipo; la primera no dice nada que alguien pueda ir a
+ *    comprobar.
+ * 2. Que separe lo que la evidencia sostiene de lo que está extrapolando. Es la regla más
+ *    fácil de romper sin querer, porque un buen revisor extrapola todo el rato — y ahí está
+ *    la diferencia entre una simulación honesta y una que se lee como investigación.
+ * 3. Que termine en PREGUNTAS PARA PERSONAS REALES. Es la única salida legítima de una
+ *    simulación: no valida nada, dice qué hay que ir a preguntar. Un lote sin preguntas ha
+ *    gastado dinero en una opinión.
+ */
+export const SISTEMA_REVISION = [
+  'Eres una capacidad de revisión adversarial de una plataforma de service design. Propones; una persona decide.',
+  'Revisas UN CONCEPTO desde UN ARQUETIPO del reto, usándolo como lente: qué fricciones, exclusiones, contradicciones y riesgos le ve ESE perfil a ESA solución candidata.',
+  'Lo que produces es SIMULACIÓN, y así queda etiquetado para siempre. No es evidencia, no sustituye a una entrevista ni a un test, y no cuenta para aprobar ningún gate. Escribe sabiendo eso: tu trabajo es decir qué habría que ir a comprobar, no comprobarlo.',
+  'Habla DESDE el arquetipo, no sobre él. Un hallazgo que empieza «este perfil probablemente…» es de analista; uno que nombra la fricción concreta que ese perfil encuentra en este concepto se puede contrastar.',
+  'Cada hallazgo que NO marques como hipótesis trae al menos una cita: un fragmento LITERAL de la evidencia que sostiene AL ARQUETIPO DE ESA SESIÓN (copiado carácter a carácter, sin parafrasear), con el id EXACTO entre corchetes y su localización. No inventes ids, no cites nada que no esté en el material, y no cruces la evidencia de un arquetipo a la sesión de otro: eso fabrica una voz.',
+  'Y lo que extrapoles, MÁRCALO como hipótesis. Extrapolar está bien y es la mitad del oficio; disimularlo convierte una simulación en una investigación falsa. Sin cita y sin marca, un hallazgo es una frase con voz de usuario y nada detrás.',
+  'NADA DE NÚMEROS INVENTADOS. Ni porcentajes, ni «N de cada M», ni cuántos usuarios harían algo. No has medido nada y no hay ninguna muestra detrás de ti: un número con forma de dato de campo se lee como investigación y esa confusión es exactamente lo que aquí está prohibido.',
+  'Termina en PREGUNTAS PARA EL TEST REAL: qué habría que preguntarle a una persona, y en qué escenario, para saber si lo que señalas ocurre de verdad. Ésa es la única salida legítima de una simulación, y de ahí sale su valor.',
+  'Di de qué hallazgo nace cada pregunta cuando nazca de uno: es la traza que conecta lo que simulaste con lo que se va a comprobar.',
+  'NO decidas el concepto. Tu revisión no lo aprueba ni lo mata: eso lo hace un test con personas y una decisión humana con su razón escrita.',
+  REGLAS_COMUNES,
+].join('\n');
+
+/**
  * C6 redacta un CONTRATO, y por eso su sistema empieza diciendo lo que NO redacta.
  *
  * El Metric Registry es lo que el cliente se compromete a aportar y contra lo que se lee el
@@ -1367,6 +1659,59 @@ export function promptOportunidades(reto: {
       .filter(Boolean)
       .join('\n\n'),
     alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.insights.length} insights validados, ${reto.criterios.length} criterios (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+  };
+}
+
+/**
+ * Prompt de C4: un concepto, una lente, y lo que hay que ir a preguntar.
+ *
+ * Un LOTE de sesiones en UNA llamada, una por arquetipo, que es lo que RF-08.2 llama «sesión
+ * por arquetipo» y lo que el pipeline sabe hacer: `PREPARAR` compone un prompt y el sobre del
+ * lote devuelve N propuestas, cada una revisable por separado.
+ *
+ * Estuve a punto de escribirlo como N llamadas —una por lente, para que ninguna supiera lo que
+ * dijo la otra— y no cabe en esta arquitectura: `PREPARAR` devuelve un prompt, no una lista.
+ * Y no se pierde gran cosa: lo que el prediseño pide es «comparar cómo una decisión afectaría
+ * a distintos arquetipos», y esa comparación la hace quien revisa leyendo las sesiones, que es
+ * donde vale algo. Lo que sí hay que decirle al modelo, y se le dice en el prompt y en el
+ * sistema, es que cada sesión cite SOLO la evidencia de su arquetipo: es la regla que impide
+ * que ver todas las lentes a la vez las mezcle.
+ */
+export function promptRevision(c: ConceptoARevisar): {
+  usuario: string;
+  alcanceResumen: string;
+} {
+  const material = materialDeRevision(c);
+  /*
+   * Las lentes se NOMBRAN, y son las que llegaron enteras. «Cada uno de sus N arquetipos» era
+   * una cuenta del objeto de la base, no del material: contaba los que no tienen evidencia
+   * —desde los que no se puede revisar—, los que no caben en el lote, y los que el recorte
+   * dejó a medias. Con siete arquetipos pedía siete sesiones contra un `maxItems` de seis: una
+   * instrucción imposible, y cuál de las dos desobedecer no lo decidía nadie.
+   */
+  const lentes = arquetiposQueLlegaronEnteros(c).ids;
+  const enLote = new Set(lentes);
+  const evidencias = lentesDelLote(c.arquetipos)
+    .lentes.filter((a) => enLote.has(a.id))
+    .reduce((n, a) => n + a.evidencia.length, 0);
+  return {
+    usuario: [
+      `Revisa el concepto del material desde ESTOS ${lentes.length} arquetipos y solo desde ellos, una sesión por cada uno, mirando la solución con sus ojos: ${lentes.map((id) => `[${id}]`).join(' ')}.`,
+      material.bloque,
+      'Cada sesión nombra su arquetipo por el id EXACTO entre corchetes, y sus hallazgos citan SOLO la evidencia de ESE arquetipo: lo que hace de un hallazgo la lectura de esa lente es que se apoye en lo que constituyó a esa lente. Citar el testimonio del perfil de al lado fabrica una voz.',
+      'Cada hallazgo que no marques como hipótesis cita al menos un fragmento LITERAL, copiado carácter a carácter. Lo que extrapoles, márcalo como hipótesis: las dos cosas son legítimas, confundirlas no.',
+      'Nada de porcentajes ni de «N de cada M»: no has medido nada, y un número con esa forma se lee como investigación.',
+      'Y cada sesión termina en preguntas para el test con personas reales: qué preguntar, en qué escenario, y de qué hallazgo tuyo nace cada una.',
+      // Lo que no se pide, dicho: el veredicto del concepto es de las personas y tiene su
+      // propia puerta —un test real y una decisión con su razón escrita—.
+      'NO decidas el concepto ni digas si debería pasar o morir: tu revisión no es evidencia y no cuenta para el gate.',
+      material.truncado
+        ? `(El material se truncó a ${MAX_MATERIAL} caracteres: no cites nada de una evidencia que no ves entera. Los arquetipos que hay que revisar son los ${lentes.length} nombrados arriba, ni uno más.)`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `concepto «${c.titulo}» × ${lentes.length} arquetipos revisables de ${c.arquetipos.length} · ${evidencias} evidencias enlazadas (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 
@@ -1924,6 +2269,106 @@ const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>>
         enum: ['alta', 'media', 'baja'],
         description:
           'Cuánta confianza tienes en este borrador. Baja si el material trae pocas lecturas o muchos elementos sin constatar: quien revisa ordena su cola por esto',
+      },
+    },
+  },
+  C4: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['arquetipoId', 'sintesis', 'hallazgos', 'preguntas', 'confianzaPropuesta'],
+    properties: {
+      arquetipoId: {
+        type: 'string',
+        description:
+          'El id del arquetipo desde el que revisas, COPIADO del material entre corchetes. Es la lente: dice desde qué perfil se hizo esta lectura',
+      },
+      sintesis: {
+        type: 'string',
+        description:
+          'De qué va esta revisión en conjunto: qué le ve este arquetipo al concepto, antes de bajar a los hallazgos. Sin porcentajes ni proporciones inventadas',
+      },
+      hallazgos: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        description:
+          'Las fricciones, exclusiones, contradicciones y riesgos que este arquetipo le encuentra al concepto',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['titulo', 'descripcion', 'esHipotesis', 'citas'],
+          properties: {
+            titulo: { type: 'string', description: 'El hallazgo en una línea' },
+            descripcion: {
+              type: 'string',
+              description:
+                'Qué encuentra este perfil y por qué le importa. Escrito DESDE el arquetipo, no sobre él. Sin números con forma de dato de campo: no has medido nada',
+            },
+            esHipotesis: {
+              type: 'boolean',
+              description:
+                'true si esto es una EXTRAPOLACIÓN del arquetipo y la evidencia no lo dice; false si lo sostiene una cita. Extrapolar está bien; disimularlo convierte una simulación en una investigación falsa',
+            },
+            citas: {
+              type: 'array',
+              maxItems: 4,
+              description:
+                'De dónde sale, copiado LITERAL de la evidencia del arquetipo. Puede ir vacía SOLO si esHipotesis es true: sin cita y sin marca, el hallazgo es una frase con voz de usuario y nada detrás',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['evidenciaId', 'fragmento', 'localizacion'],
+                properties: {
+                  evidenciaId: {
+                    type: 'string',
+                    description:
+                      'El id de la evidencia, COPIADO del material entre corchetes. Solo la que sostiene a ESTE arquetipo: no hay otra en el material',
+                  },
+                  fragmento: {
+                    type: 'string',
+                    description: 'El texto EXACTO, copiado carácter a carácter, sin parafrasear',
+                  },
+                  localizacion: {
+                    type: 'string',
+                    description: 'Dónde está dentro de ese documento',
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      preguntas: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        description:
+          'Lo que hay que ir a preguntarle a una persona real. Es la única salida legítima de una simulación: no valida nada, dice qué comprobar',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['pregunta'],
+          properties: {
+            pregunta: { type: 'string', description: 'Qué preguntar, en las palabras del test' },
+            escenario: {
+              type: 'string',
+              description:
+                'En qué montaje preguntarla, si necesita uno. Cadena vacía si la pregunta se sostiene sola',
+            },
+            hallazgoIndice: {
+              type: 'integer',
+              minimum: 0,
+              maximum: 5,
+              description:
+                'De qué hallazgo tuyo nace, por su POSICIÓN en la lista de arriba empezando en 0. Omítelo si la pregunta no nace de ninguno en concreto',
+            },
+          },
+        },
+      },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description: 'Cuánta confianza tienes en ESTA revisión, no en el concepto',
       },
     },
   },

@@ -814,6 +814,33 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from oportunidad_insight where workspace_id = ${wsL}`;
       await admin`delete from oportunidad where workspace_id = ${wsL}`;
       /*
+       * Y la revisión simulada de C4 con lo que le cuelga, de dentro afuera. Apunta a TRES
+       * lados —al concepto, al arquetipo y a la evidencia de sus citas—, así que va delante de
+       * los tres, y el concepto delante del reto. Sin esto la limpieza muere en la FK del
+       * arquetipo y el workspace se queda colgado, que es lo que dijeron estas mismas sondas
+       * en su primera vuelta.
+       */
+      /*
+       * Los cuatro EN LA MISMA TRANSACCIÓN, y es la lección de `design_version` otra vez: el
+       * guard que exige sostén a un hallazgo afirmativo es un constraint trigger DIFERIDO, así
+       * que borrar sus citas primero lo despierta al commit sobre un hallazgo que se queda sin
+       * ninguna. Borrándolo todo junto, cuando mira ya no hay hallazgo que consultar y se
+       * aparta —que es la respuesta correcta, porque lo que protege es un sostén que a esas
+       * alturas no tiene a quién sostener—.
+       *
+       * Lo dijo esta misma sonda en su primera vuelta, y no en el arreglo sino en la limpieza:
+       * la regla funciona tan bien que estorba a quien la ignora, que es exactamente lo que se
+       * quería.
+       */
+      await admin.begin(async (tx) => {
+        await tx`delete from pregunta_de_test where workspace_id = ${wsL}`;
+        await tx`delete from hallazgo_simulado_evidencia where workspace_id = ${wsL}`;
+        await tx`delete from hallazgo_simulado where workspace_id = ${wsL}`;
+        await tx`delete from revision_simulada where workspace_id = ${wsL}`;
+      });
+      await admin`delete from concepto_evidencia where workspace_id = ${wsL}`;
+      await admin`delete from concepto where workspace_id = ${wsL}`;
+      /*
        * El expediente del post mortem, de dentro afuera: las constataciones cuelgan del
        * effective state y del elemento, el effective state del release, y el review del reto,
        * que se borra al final. Sin esto, el reto no se puede borrar y el workspace se queda
@@ -1060,10 +1087,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
        * después de él dejaría la limpieza muerta en la FK del arquetipo. El orden es el de las
        * dependencias, no el de las capacidades.
        */
-      await admin`delete from pregunta_de_test where workspace_id = ${ws}`;
-      await admin`delete from hallazgo_simulado_evidencia where workspace_id = ${ws}`;
-      await admin`delete from hallazgo_simulado where workspace_id = ${ws}`;
-      await admin`delete from revision_simulada where workspace_id = ${ws}`;
+      await admin.begin(async (tx) => {
+        await tx`delete from pregunta_de_test where workspace_id = ${ws}`;
+        await tx`delete from hallazgo_simulado_evidencia where workspace_id = ${ws}`;
+        await tx`delete from hallazgo_simulado where workspace_id = ${ws}`;
+        await tx`delete from revision_simulada where workspace_id = ${ws}`;
+      });
       await admin`delete from arquetipo where workspace_id = ${ws}`;
       await admin`delete from journey_snapshot where workspace_id = ${ws}`;
       await admin`delete from journey_nodo_evidencia where workspace_id = ${ws}`;
@@ -6852,6 +6881,410 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         expect(objetoId).toBe(reviewId);
       },
     );
+  });
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════════════════
+   * C4 — los revisores AI por arquetipo, y las cuatro mitades de SYS-20
+   * ══════════════════════════════════════════════════════════════════════════════════════
+   */
+
+  /** Un concepto candidato con DOS lentes, cada una con su propia evidencia citable. Dos y no
+   * una porque media SYS-20 vive en no cruzarlas: sin la segunda, «cada sesión cita solo la
+   * evidencia de su arquetipo» no se puede medir. */
+  async function conceptoConDosLentes(
+    wsC: string,
+    retoC: string,
+    actorId: string,
+  ): Promise<{ conceptoId: string; lenteA: string; lenteB: string; evA: string; evB: string }> {
+    const admin = sqlAdmin();
+    const [fte] = await admin`insert into fuente
+      (workspace_id, tipo, titulo, referencia, creado_por)
+      values (${wsC}, 'entrevista', 'Entrevistas de la etapa 1', 'ref-e1', ${actorId})
+      returning id`;
+    const lentes: { arq: string; ev: string }[] = [];
+    for (const [nombre, titulo, resumen] of [
+      ['El desconfiado digital', 'Entrevista D-01', 'No entrego la cédula sin saber para qué.'],
+      ['El apurado de RR. HH.', 'Entrevista A-01', 'Si tarda más de un café, lo dejo.'],
+    ] as const) {
+      const [ev] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.id as string}, ${titulo}, ${resumen}, '{}'::jsonb, ${actorId})
+        returning id`;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${ev!.id as string}, 'concedido', 'cliente',
+                'Consentimiento del participante', ${actorId}, now(), ${actorId})`;
+      const [arq] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, ${nombre}, 'Perfil emergente de la evidencia', ${actorId})
+        returning id`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${arq!.id as string}, ${ev!.id as string})`;
+      lentes.push({ arq: arq!.id as string, ev: ev!.id as string });
+    }
+    const [cpt] = await admin`insert into concepto
+      (workspace_id, reto_id, titulo, descripcion, umbral_test, creado_por)
+      values (${wsC}, ${retoC}, 'Verificación diferida',
+              'Se abre la cuenta y el documento se pide después',
+              '6 de cada 8 completan sin ayuda', ${actorId})
+      returning id`;
+    return {
+      conceptoId: cpt!.id as string,
+      lenteA: lentes[0]!.arq,
+      lenteB: lentes[1]!.arq,
+      evA: lentes[0]!.ev,
+      evB: lentes[1]!.ev,
+    };
+  }
+
+  /**
+   * C4 por el camino real, y lo que aceptar deja escrito.
+   *
+   * Mide de una vez las dos cosas que hacen de C4 lo que es: que la sesión se materializa
+   * entera —revisión, hallazgos, sus citas y las preguntas de test, con el índice traducido al
+   * hallazgo que acaba de nacer— y que LA ETIQUETA queda puesta y no se puede quitar.
+   */
+  it('C4 revisa el concepto desde su arquetipo, y la etiqueta de simulación no se le puede quitar', async () => {
+    await enWorkspaceLimpio('c4-camino', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const propuesta = {
+        arquetipoId: lenteA,
+        sintesis: 'Este perfil llega con la guardia alta y el concepto se la sube.',
+        hallazgos: [
+          {
+            titulo: 'La verificación pide confianza antes de darla',
+            descripcion: 'Entrega el documento cuando entiende para qué, y aquí se le pide antes.',
+            esHipotesis: false,
+            citas: [
+              {
+                evidenciaId: evA,
+                fragmento: 'No entrego la cédula sin saber para qué.',
+                localizacion: 'resumen',
+              },
+            ],
+          },
+          {
+            titulo: 'Puede leer el diferido como una trampa',
+            descripcion: 'Nada en la evidencia lo dice; se sigue del perfil.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [
+          {
+            pregunta: '¿Qué esperarías saber antes de darnos tu documento?',
+            escenario: 'Con el prototipo abierto en la pantalla de verificación.',
+            hallazgoIndice: 0,
+          },
+          { pregunta: '¿Qué te haría abandonar aquí?', escenario: '', hallazgoIndice: undefined },
+        ],
+        confianzaPropuesta: 'media' as const,
+      };
+
+      await conProveedor(
+        { ok: true, datos: { revisiones: [propuesta] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C4');
+      expect(p, 'la propuesta de C4 no llegó al panel').toBeDefined();
+      expect(p!.destino).toBe('revision-simulada');
+      expect(p!.anclaEstado).toBe('disponible');
+      // La marca viaja desde el registro de capacidades hasta la fila, sin que nadie la ponga.
+      expect(p!.esSimulacion).toBe(true);
+      // Y la cita se copió de la evidencia de SU lente, así que se mide presente contra ella.
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p!.id,
+      });
+
+      const [rev] = await conUsuario(curadorId, (tx) => tx`
+        select es_simulacion, arquetipo_id, concepto_id, sintesis, propuesta_ai_id
+        from revision_simulada where id = ${objetoId}`);
+      expect(rev!.es_simulacion).toBe(true);
+      expect(rev!.arquetipo_id).toBe(lenteA);
+      expect(rev!.concepto_id).toBe(conceptoId);
+      expect(rev!.sintesis).toBe(propuesta.sintesis);
+      // El sello lo escribe el guard: la columna está fuera del grant de la aplicación.
+      expect(rev!.propuesta_ai_id).toBe(p!.id);
+
+      const hallazgos = await conUsuario(curadorId, (tx) => tx`
+        select orden, titulo, es_hipotesis,
+               (select count(*)::int from hallazgo_simulado_evidencia he
+                 where he.hallazgo_id = h.id) as citas
+        from hallazgo_simulado h where revision_id = ${objetoId} order by orden`);
+      expect(hallazgos.map((h) => h.es_hipotesis)).toEqual([false, true]);
+      expect(hallazgos.map((h) => h.citas)).toEqual([1, 0]);
+
+      const preguntas = await conUsuario(curadorId, (tx) => tx`
+        select orden, pregunta, escenario, hallazgo_id
+        from pregunta_de_test where revision_id = ${objetoId} order by orden`);
+      // El índice del contenido se tradujo al id del hallazgo que acaba de nacer, y la segunda
+      // pregunta —que no nace de ninguno— quedó suelta, que es su respuesta correcta.
+      expect(preguntas[0]!.hallazgo_id).toBe(hallazgos[0]!.id ?? preguntas[0]!.hallazgo_id);
+      expect(preguntas[1]!.hallazgo_id).toBeNull();
+
+      /*
+       * Y LA ETIQUETA NO SE QUITA. No hay política de UPDATE ni grant de columna sobre ninguna
+       * de las cuatro tablas, así que ni siquiera se puede intentar por la superficie
+       * concedida; y el `check (es_simulacion)` cubre el día en que alguien conceda una, que es
+       * lo que esta mitad mide —con el rol PROPIETARIO, que no pasa por políticas—.
+       */
+      await expect(
+        conUsuario(curadorId, (tx) => tx`
+          update revision_simulada set es_simulacion = false where id = ${objetoId}`),
+      ).rejects.toThrow(/permission denied|no se pudo|denied/i);
+      await expect(
+        admin`update revision_simulada set es_simulacion = false where id = ${objetoId}`,
+      ).rejects.toThrow(/revision_simulada_check|violates check constraint/i);
+    });
+  });
+
+  /**
+   * RF-08.3, medido donde dice que se decide: EN EL TIPO DE OBJETO.
+   *
+   * «Las salidas de C4 no son seleccionables como evidencia en checklists de G4/G5; el tipo de
+   * objeto lo impide.» No hay regla que evaluar: `checklist_item` tiene TRES columnas para
+   * citar y tres CHECK que cuentan `num_nonnulls` sobre esas tres, así que una revisión
+   * simulada no tiene dónde colgarse.
+   *
+   * Esto se comprueba contra el ESQUEMA REAL y no contra una lista escrita a mano, y ahí está
+   * el valor: el día que alguien añada una cuarta columna citable, esta prueba obliga a decir
+   * en voz alta qué pasa con C4 en vez de dejar que la respuesta la dé el descuido.
+   */
+  it('la salida de C4 no se puede citar en un checklist: el tipo de objeto lo impide (RF-08.3)', async () => {
+    const admin = sqlAdmin();
+    const citables = (
+      await admin`select a.attname as columna
+        from pg_constraint c
+        join pg_attribute a on a.attrelid = c.conrelid and a.attnum = any(c.conkey)
+        where c.conrelid = 'checklist_item'::regclass and c.contype = 'f'
+          and a.attname like '%_id' and a.attname not in ('workspace_id', 'gate_id')
+        order by 1`
+    ).map((f) => f.columna as string);
+    expect(
+      citables,
+      'checklist_item admite una clase de objeto nueva: hay que decidir explícitamente si una revisión simulada puede citarse, y SYS-20 dice que no',
+    ).toEqual(['decision_id', 'evidencia_id', 'insight_id']);
+    // Y ninguna de ellas apunta a la tabla de C4, que es la otra mitad de la frase.
+    const destinos = (
+      await admin`select distinct confrelid::regclass::text as tabla
+        from pg_constraint where conrelid = 'checklist_item'::regclass and contype = 'f'
+        order by 1`
+    ).map((f) => f.tabla as string);
+    expect(destinos).not.toContain('revision_simulada');
+  });
+
+  /**
+   * «No existen simulaciones masivas»: un arquetipo lee un concepto UNA vez.
+   *
+   * No es una regla que alguien evalúa, es la forma de la clave —`unique (concepto_id,
+   * arquetipo_id)`—. No hay dónde meter el segundo usuario del mismo perfil, así que el modo
+   * «N usuarios» que SYS-20 prohíbe no se puede pedir aunque se quiera.
+   */
+  it('C4 no admite dos sesiones del mismo arquetipo sobre el mismo concepto (SYS-20)', async () => {
+    await enWorkspaceLimpio('c4-masiva', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const nueva = () => admin`insert into revision_simulada
+        (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+        values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})`;
+      await nueva();
+      await expect(nueva()).rejects.toThrow(/revision_simulada_concepto_id_arquetipo_id_key/);
+    });
+  });
+
+  /**
+   * «Ni porcentajes sintéticos»: lo que se lee como MEDICIÓN no entra.
+   *
+   * Se corta en dos sitios y los dos hacen falta. El contrato lo rechaza al parsear, que es
+   * donde se puede decir el motivo; `sin_agregado_sintetico()` lo rechaza en la base, que es
+   * lo que sigue siendo verdad cuando la revisión se escribe a mano y nadie parsea.
+   */
+  it('C4 no admite un número con forma de dato de campo, ni al parsear ni en la base', async () => {
+    await enWorkspaceLimpio('c4-porcentaje', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              revisiones: [
+                {
+                  arquetipoId: lenteA,
+                  sintesis: 'El 70 % de este perfil abandonaría en la primera pantalla.',
+                  hallazgos: [
+                    {
+                      titulo: 'Abandono temprano',
+                      descripcion: 'Se va antes de llegar al formulario.',
+                      esHipotesis: true,
+                      citas: [],
+                    },
+                  ],
+                  preguntas: [{ pregunta: '¿Hasta dónde llegarías?', escenario: '' }],
+                  confianzaPropuesta: 'baja',
+                },
+              ],
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/no cumplió el esquema/);
+      // Y la base lo dice también, para la revisión escrita a mano. Con el rol PROPIETARIO,
+      // que no pasa por políticas: lo que se mide es el CHECK, no el permiso.
+      await expect(
+        admin`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteA},
+                  'Aquí 6 de cada 10 abandonan', ${curadorId})`,
+      ).rejects.toThrow(/violates check constraint/);
+    });
+  });
+
+  /**
+   * «Sus afirmaciones deben derivarse del arquetipo y de evidencia real citada; cuando
+   * extrapolen, se marcan como hipótesis» — o sea DOS clases de hallazgo y ninguna tercera.
+   *
+   * La tercera es la avería: una frase con voz de usuario, sin nada detrás y sin avisar de que
+   * no lo hay. El contrato la corta al parsear; el trigger diferido la corta en el commit, que
+   * es lo que queda cuando la revisión se escribe a mano.
+   */
+  it('C4 no admite un hallazgo sin cita y sin marca de hipótesis (RF-08.2)', async () => {
+    await enWorkspaceLimpio('c4-sin-sosten', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              revisiones: [
+                {
+                  arquetipoId: lenteA,
+                  sintesis: 'Una lectura cualquiera.',
+                  hallazgos: [
+                    {
+                      titulo: 'Afirmación sin sostén',
+                      descripcion: 'Esto lo digo yo y no lo dice ningún documento.',
+                      esHipotesis: false,
+                      citas: [],
+                    },
+                  ],
+                  preguntas: [{ pregunta: '¿Y bien?', escenario: '' }],
+                  confianzaPropuesta: 'baja',
+                },
+              ],
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/no cumplió el esquema/);
+      // Y el suelo, en el commit: la revisión y su hallazgo caben, y lo que falla es la
+      // transacción entera al cerrarse sin ninguna cita detrás de una afirmación.
+      await expect(
+        admin.begin(async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})
+            returning id`;
+          await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Sin sostén', 'Nada detrás', false)`;
+        }),
+      ).rejects.toThrow(/no se marca como hipótesis/);
+    });
+  });
+
+  /**
+   * Y la evidencia citada es la del arquetipo QUE REVISA, no la del perfil de al lado.
+   *
+   * Es la forma más limpia de fabricar una voz: una frase que suena al «desconfiado digital»
+   * sostenida en el testimonio de un «apurado de RR. HH.». Por eso el fixture monta dos lentes
+   * con evidencia propia — con una sola, esto no se puede medir.
+   */
+  it('C4 no deja que una sesión cite la evidencia de otro arquetipo (RF-08.2)', async () => {
+    await enWorkspaceLimpio('c4-voz-prestada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evB } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              revisiones: [
+                {
+                  arquetipoId: lenteA,
+                  sintesis: 'Una lectura del primero.',
+                  hallazgos: [
+                    {
+                      titulo: 'Se va por el tiempo',
+                      descripcion: 'Dice que abandona si tarda.',
+                      esHipotesis: false,
+                      /* La evidencia del OTRO arquetipo: existe, está en el material, y no es
+                       * de esta lente. */
+                      citas: [
+                        {
+                          evidenciaId: evB,
+                          fragmento: 'Si tarda más de un café, lo dejo.',
+                          localizacion: 'resumen',
+                        },
+                      ],
+                    },
+                  ],
+                  preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
+                  confianzaPropuesta: 'media',
+                },
+              ],
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/no son de su arquetipo/);
+      // Y el suelo, para la revisión escrita a mano: el guard de la base dice lo mismo.
+      await expect(
+        admin.begin(async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Prestada', 'Voz ajena', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id)
+            values (${h!.id as string}, ${evB}, ${wsC})`;
+        }),
+      ).rejects.toThrow(/no es de las que sostienen al arquetipo/);
+    });
   });
 
   /**

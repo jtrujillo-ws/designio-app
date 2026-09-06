@@ -158,6 +158,20 @@ export const CATALOGO_EXPORT = [
   { tabla: 'oportunidad_insight', orden: 'oportunidad_id, insight_id', poda: { modo: 'fuera' } },
   { tabla: 'concepto', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'concepto_evidencia', orden: 'concepto_id, evidencia_id', poda: { modo: 'fuera' } },
+  // Las revisiones simuladas del concepto (C4) y lo que salió de ellas. Entran en el ARCHIVO
+  // porque SYS-04 exige que lo lleve TODO —también lo que no es evidencia—, y quedan `fuera`
+  // del entregable por una razón que no es la del resto de la cadena: un hallazgo de revisión
+  // AI no es un resultado del trabajo, es una simulación etiquetada que sirvió para decidir qué
+  // preguntar en el test real. Entregarlo al cliente junto a lo demás invita exactamente a la
+  // lectura que SYS-20 prohíbe: tomarlo por hallazgo de investigación.
+  { tabla: 'revision_simulada', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'hallazgo_simulado', orden: 'revision_id, orden', poda: { modo: 'fuera' } },
+  {
+    tabla: 'hallazgo_simulado_evidencia',
+    orden: 'hallazgo_id, evidencia_id',
+    poda: { modo: 'fuera' },
+  },
+  { tabla: 'pregunta_de_test', orden: 'revision_id, orden', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_etapa', orden: 'reabierto_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id', poda: { modo: 'fuera' } },
   // Medición temporal de impacto y post mortem (SPEC-07 / SYS-22): el contrato de

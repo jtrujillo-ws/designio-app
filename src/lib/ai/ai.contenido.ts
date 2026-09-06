@@ -14,6 +14,9 @@ import { TOPE_NARRATIVA } from '@/lib/medicion/medicion.schemas';
 import { MAX_PREGUNTA, MAX_RAZON } from '@/lib/servicio/oportunidad.schemas';
 import {
   CONFIANZA_PROPUESTA,
+  MAX_CITAS_POR_HALLAZGO,
+  MAX_HALLAZGOS_POR_REVISION,
+  MAX_PREGUNTAS_POR_REVISION,
   MAX_REMEDIACIONES,
   type CapacidadActiva,
 } from './ai.schemas';
@@ -337,8 +340,9 @@ export type ContenidoInsight = z.infer<typeof ContenidoInsightSchema>;
  * del grafo con la que se armó el prompt. Una remediación de una señal inexistente es una
  * avería inventada, y de las caras: manda a alguien a arreglar un grafo que estaba bien.
  *
- * `remediaciones` PUEDE venir vacío: un grafo sin señales es un resultado legítimo, y además
- * el bueno.
+ * Y un grafo SIN señales no llega hasta aquí: el servicio se niega a pedir un informe sobre un
+ * grafo limpio, que es el resultado legítimo y además el bueno. Por eso `remediaciones` pide al
+ * menos una —el porqué, entero, está en el propio campo—.
  */
 export const ContenidoRemediacionJourneySchema = z
   .object({
@@ -383,7 +387,8 @@ export type ContenidoPropuesta =
   | ContenidoRemediacionJourney
   | ContenidoEntradaKpi
   | ContenidoOportunidad
-  | ContenidoPostMortem;
+  | ContenidoPostMortem
+  | ContenidoRevisionSimulada;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -620,6 +625,193 @@ export const ContenidoPostMortemSchema = z
   .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
 export type ContenidoPostMortem = z.infer<typeof ContenidoPostMortemSchema>;
 
+/**
+ * C4 — la sesión de UN arquetipo revisando UN concepto (RF-08.2).
+ *
+ * La forma es casi la de C2 y no es casualidad: un hallazgo es una afirmación con citas y su
+ * marca de hipótesis, igual que las de un insight. Lo que cambia es de dónde sale la
+ * autoridad —allí, la evidencia; aquí, un arquetipo mirando la evidencia que lo sostiene— y
+ * qué se puede hacer con el resultado, que es lo que SYS-20 acota.
+ *
+ * Las tres reglas del invariante que viven en este contrato:
+ *
+ *  · `esHipotesis` sin citas, o citas: nunca ninguna de las dos. «Sus afirmaciones deben
+ *    derivarse del arquetipo y de evidencia real citada; cuando extrapolen, se marcan como
+ *    hipótesis» son las DOS clases legítimas de hallazgo, y la tercera —una frase con voz de
+ *    usuario, sin nada detrás y sin avisar de que no lo hay— es la avería que el invariante
+ *    teme. La base lo exige también, con un trigger diferido, porque una revisión se puede
+ *    escribir a mano sin pasar por aquí.
+ *
+ *  · Ni un agregado sintético en ningún texto. «El 70 % de los desconfiados abandonaría» es
+ *    la frase exacta que SYS-20 prohíbe, y la prohíbe porque ese 70 % no lo midió nadie. Aquí
+ *    se corta al parsear, con el motivo; en la base lo corta `sin_agregado_sintetico()`, que
+ *    es lo que sigue siendo verdad cuando nadie parsea.
+ *
+ *  · Y las preguntas de test, que son la ÚNICA salida legítima de una simulación: el journey
+ *    lo dice con el ejemplo —«señala riesgo de exclusión (simulación → origina una pregunta
+ *    del test)»—. Al menos una: una revisión que no deja ninguna pregunta que hacerle a una
+ *    persona real no ha servido para lo que existe.
+ */
+/*
+ * La MISMA regla que `sin_agregado_sintetico()` en la base, frontera de palabra incluida. Sin el
+ * `\b` de delante, el contrato rechazaba lo que el CHECK acepta —«v2r100%», «ISO9001%»: un
+ * identificador, no una medición— y el motivo que se leía era el de SYS-20, que ahí no aplica.
+ * Medido contra la función viva: divergían en tres de diez casos, todos en esa dirección.
+ *
+ * Y la `i`, con su `!~*` al otro lado: «6 DE CADA 10» es la misma proporción sintética que
+ * «6 de cada 10», y las dos capas la dejaban pasar igual. Dos validaciones que fallan en el
+ * mismo sitio no son dos validaciones.
+ */
+const AGREGADO_SINTETICO =
+  /\b\d+([.,]\d+)?\s*%|\b\d+\s+de\s+cada\s+\d+\b|\b\d+([.,]\d+)?\s*por\s*ciento\b/i;
+/*
+ * Y la proporción escrita con BARRA, que es «N de cada M» por otra puerta.
+ *
+ * No va en la regex de arriba porque hace falta comparar los dos números: `6/10` es una
+ * proporción y `24/7` es una forma de decir «siempre». Sin esa condición, una síntesis que
+ * dijera «quiere soporte 24/7» tiraba el lote entero con un motivo de SYS-20 que no aplica —
+ * el mismo falso bloqueo que costó una ronda con `v2r100%`.
+ *
+ * Y los bordes piden que no haya otra cifra ni otra barra pegada, para no confundir una fecha
+ * (`6/10/2026`), una ruta (`/a/1/2`) ni una versión (`1/2/3`) con una medición.
+ *
+ * Lo que esto NO cubre, y conviene decirlo: los numerales ESCRITOS —«siete de cada diez»—.
+ * Cazarlos pide un léxico de números en las dos capas, y un léxico a medias es peor que la
+ * ausencia declarada. El prompt lo prohíbe; aquí el corte llega hasta las cifras.
+ */
+const PROPORCION_CON_BARRA = /(?:^|[^0-9/])(\d+)\s*\/\s*(\d+)(?=[^0-9/]|$)/g;
+const tieneProporcionConBarra = (t: string): boolean =>
+  [...t.matchAll(PROPORCION_CON_BARRA)].some(([, a, b]) => Number(a) <= Number(b));
+const SIN_AGREGADO =
+  'sin porcentajes ni proporciones inventadas: una revisión simulada no mide nada, y un número con forma de dato de campo se lee como investigación (SYS-20)';
+
+const TextoDeRevision = (max: number) =>
+  z.string().trim().min(1).max(max).refine((t) => !AGREGADO_SINTETICO.test(t) && !tieneProporcionConBarra(t), SIN_AGREGADO);
+
+export const ContenidoRevisionSimuladaSchema = z
+  .object({
+    /* El arquetipo que hace de lente, por su id copiado del material. */
+    arquetipoId: IdCopiadoDelMaterial,
+    /* La lectura de conjunto: de qué va esta sesión, antes de bajar a los hallazgos. */
+    sintesis: TextoDeRevision(2000),
+    hallazgos: z
+      .array(
+        z.object({
+          titulo: TextoDeRevision(200),
+          descripcion: TextoDeRevision(2000),
+          /* SYS-20 / RF-08.2: lo que se extrapola se marca, no se disimula. */
+          esHipotesis: z.boolean(),
+          /*
+           * Y sus citas, con la MISMA forma que las de una afirmación de C2 —el documento por
+           * su id, el fragmento literal y dónde está—: la presencia literal se mide igual, y
+           * una segunda forma de cita habría sido una segunda cosa que mantener.
+           *
+           * El techo es cuatro y no seis: un hallazgo de revisión es más estrecho que una
+           * afirmación de insight, y cuatro fragmentos ya son más de lo que alguien contrasta
+           * de una sentada.
+           */
+          citas: z
+            .array(CitaDeAfirmacionSchema)
+            .max(MAX_CITAS_POR_HALLAZGO)
+            .refine(
+              (xs) =>
+                new Set(xs.map((c) => `${c.evidenciaId}\u0000${c.fragmento}\u0000${c.localizacion}`))
+                  .size === xs.length,
+              'un hallazgo no repite la misma cita: no añade sostén y deja sin comprobar lo que se materializa',
+            ),
+        }),
+      )
+      .min(1)
+      .max(MAX_HALLAZGOS_POR_REVISION)
+      /*
+       * LA REGLA DEL INVARIANTE, y va como `superRefine` para que el error señale al hallazgo
+       * que falla: con seis en el lote, «alguno no se sostiene» obliga a quien revisa a
+       * buscarlo a mano.
+       */
+      .superRefine((xs, ctx) => {
+        xs.forEach((h, i) => {
+          if (!h.esHipotesis && h.citas.length === 0) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: [i, 'citas'],
+              message:
+                'un hallazgo que no se marca como hipótesis cita al menos una evidencia real: sin cita y sin marca es una afirmación inventada con voz de usuario (RF-08.2, SYS-20)',
+            });
+          }
+          /*
+           * Y LA OTRA DIRECCIÓN, que faltaba. «Dos clases de hallazgo y ninguna tercera» se
+           * comprobaba en un solo sentido, así que una HIPÓTESIS CON CITAS pasaba: una fila que
+           * se presenta a la vez como extrapolación sin sostén y como lectura de un testimonio
+           * observado. El lector pinta las citas como sostén y la etiqueta dice que no lo hay;
+           * quien firma un pasa/muere lee las dos cosas.
+           *
+           * No es teórico: en el formulario manual basta con elegir la evidencia y marcar
+           * después la casilla — los campos se ocultan, pero lo elegido sigue ahí.
+           */
+          if (h.esHipotesis && h.citas.length > 0) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: [i, 'citas'],
+              message:
+                'un hallazgo marcado como hipótesis no cita evidencia: o se extrapola y se dice, o se observa y se cita — las dos clases se excluyen (RF-08.2, SYS-20)',
+            });
+          }
+        });
+      }),
+    preguntas: z
+      .array(
+        z.object({
+          pregunta: TextoDeRevision(500),
+          /* El montaje en el que preguntarla. Puede ir vacío: no toda pregunta lo necesita. */
+          escenario: z
+            .string()
+            .trim()
+            .max(1000)
+            .default('')
+            .refine((t) => !AGREGADO_SINTETICO.test(t) && !tieneProporcionConBarra(t), SIN_AGREGADO),
+          /*
+           * De qué hallazgo nace, POR SU ÍNDICE en la lista de arriba. Un índice y no un id
+           * porque cuando esta respuesta se escribe los hallazgos todavía no existen como
+           * filas; la aceptación lo traduce al id que acaba de nacer, y el guard diferido
+           * comprueba la traducción.
+           */
+          hallazgoIndice: z
+            .number()
+            .int()
+            .min(0)
+            .max(MAX_HALLAZGOS_POR_REVISION - 1)
+            .optional(),
+        }),
+      )
+      .min(1)
+      .max(MAX_PREGUNTAS_POR_REVISION),
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  /*
+   * Y el índice de cada pregunta apunta DENTRO del lote. Va en el `superRefine` del objeto y no
+   * en el del array porque la respuesta está en la OTRA lista: un array no puede mirarse contra
+   * su hermano, y el techo estático del campo —el tope de hallazgos menos uno— solo acota la
+   * forma, no la relación.
+   *
+   * Fuera de rango no es un matiz: la aceptación dejaría la pregunta colgando de nada y la traza
+   * simulación → test real se rompería en silencio, que es justo la que hace legítima a esta
+   * capacidad.
+   */
+  .superRefine((c, ctx) => {
+    c.preguntas.forEach((q, i) => {
+      if (q.hallazgoIndice !== undefined && q.hallazgoIndice >= c.hallazgos.length) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['preguntas', i, 'hallazgoIndice'],
+          message:
+            'esa pregunta dice nacer de un hallazgo que el lote no trae: la traza de la simulación al test real es lo que hace legítima a esta capacidad, así que no puede apuntar a nada',
+        });
+      }
+    });
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoRevisionSimulada = z.infer<typeof ContenidoRevisionSimuladaSchema>;
+
 export const ESQUEMA_DE_CONTENIDO: Record<
   CapacidadActiva,
   z.ZodType<ContenidoPropuesta, z.ZodTypeDef, unknown>
@@ -632,6 +824,7 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   C6: ContenidoEntradaKpiSchema,
   C3: ContenidoOportunidadSchema,
   C7: ContenidoPostMortemSchema,
+  C4: ContenidoRevisionSimuladaSchema,
 };
 
 /**
@@ -671,8 +864,30 @@ export type CitaDelContenido = {
    * correcta y no una omisión.
    */
   alcanceId?: string;
+  /**
+   * Y DE QUIÉN CUELGA, en las capacidades que las anidan.
+   *
+   * Esta lista se aplana para dos cosas: medir la presencia literal —a la que el grupo le da
+   * igual— y comprobar que una corrección no toca las citas. Para lo segundo, aplanar PIERDE
+   * justo lo que hay que proteger: `[A], [B]` y `[A, B], []` son la misma lista, así que una
+   * corrección podía repartir las mismas citas entre otros hallazgos —mover el documento que
+   * sostenía a una hipótesis debajo de una afirmación— y la comprobación las veía idénticas.
+   * La materialización persiste después el reparto nuevo.
+   *
+   * Y eso es lo único contrastable que hay en una revisión simulada: qué documento sostiene
+   * cuál lectura. En C2 es la misma frase con otras palabras: qué cita sostiene qué afirmación.
+   *
+   * Va aquí y no en `TESTIMONIO_ADICIONAL` porque el reparto es una propiedad de las CITAS, y
+   * ahí se habría escrito una vez por capacidad —dos entradas para una regla— mientras que
+   * este campo lo pone quien declara el anidamiento, que es quien lo sabe. Hay un censo que
+   * exige `grupo` a toda entrada del registro que anide.
+   *
+   * `undefined` en las que no anidan, que es su respuesta correcta: una lista plana no tiene
+   * reparto que proteger.
+   */
+  grupo?: number;
 };
-export const CITAS_DEL_CONTENIDO: Record<
+const CITAS_POR_CAPACIDAD: Record<
   CapacidadActiva,
   (contenido: ContenidoPropuesta) => CitaDelContenido[]
 > = {
@@ -680,8 +895,23 @@ export const CITAS_DEL_CONTENIDO: Record<
   C0: (c) => (c as ContenidoCriterio).citas,
   CT: (c) => (c as ContenidoAsistenteGate).citas,
   C2: (c) =>
-    (c as ContenidoInsight).afirmaciones.flatMap((a) =>
-      a.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId })),
+    (c as ContenidoInsight).afirmaciones.flatMap((a, i) =>
+      a.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId, grupo: i })),
+    ),
+  /*
+   * C4 igual que C2, y por la misma razón exacta: sus citas viven DENTRO de cada hallazgo
+   * —una cita sostiene UN hallazgo concreto, y por eso el aplanado se lleva el `grupo`: sin
+   * él, repartirlas de otra manera pasaba por «las citas no cambiaron»— y cada una nombra su
+   * documento, porque el material lleva varios (la evidencia que sostiene al arquetipo que
+   * revisa).
+   *
+   * Un hallazgo marcado como HIPÓTESIS puede no traer ninguna, y eso no rompe nada aquí: la
+   * lista sale más corta, la presencia literal se mide sobre lo que hay, y el contrato ya
+   * garantizó que la ausencia de citas viene con la marca puesta.
+   */
+  C4: (c) =>
+    (c as ContenidoRevisionSimulada).hallazgos.flatMap((h, i) =>
+      h.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId, grupo: i })),
     ),
   // C5 las guarda arriba, como las tres primeras: sus remediaciones no son el sujeto de las
   // citas —lo es el grafo entero—, así que no hay nada que anidar.
@@ -716,6 +946,75 @@ export const CITAS_DEL_CONTENIDO: Record<
 };
 
 /**
+ * Y EL «alcanceId» SALE CANÓNICO DE AQUÍ, una vez y para las cuatro capacidades que lo tienen.
+ *
+ * Es la clave con la que el panel busca el TRAMO del documento que la cita nombra, y las claves
+ * de ese mapa salen de la base —minúsculas—. El contenido almacenado no tiene por qué estarlo:
+ * el contrato canoniza al PARSEAR, pero por la superficie concedida entra un uuid en mayúscula,
+ * y los guards lo admiten desde que comparan con «lower()». Con el id crudo la búsqueda falla
+ * en silencio y la cita se reporta AUSENTE —la única señal contrastable que quien revisa mira—
+ * y la etiqueta de al lado dice que el documento ya no está. Medido: «presenteLiteral» pasa de
+ * true a false sin tocar nada más que la caja del id.
+ *
+ * Va aquí, donde las citas se LEEN del contenido, y no en los cuatro consumidores: es una
+ * propiedad de cómo se lee, no de quién lee. Y se deriva del registro en vez de escribirse por
+ * capacidad, que es la lección que este fichero lleva cobrada cuatro veces.
+ *
+ * Y AGUANTA UN CONTENIDO MALFORMADO, que es la otra mitad y la que casi cuesta la pantalla.
+ *
+ * Los lectores de arriba dan por buena la forma de su capacidad: `(c as X).citas`, o un
+ * `flatMap` sobre `hallazgos`. La base sólo exige que `contenido` sea un objeto JSON —los
+ * guards de inserción no miran dentro— así que por la superficie SQL concedida entra una fila
+ * sin la clave, y entonces `.flatMap` sobre `undefined` no degradaba una fila: tiraba
+ * `panelPropuestas` ENTERO, para todos los miembros del workspace, y con él el control de
+ * rechazar la fila culpable. Es la misma avería que la del cast a `uuid` en la consulta del
+ * panel, una capa más arriba, y son las NUEVE capacidades: ninguna comprueba su forma.
+ *
+ * Cero citas es la respuesta correcta y no un apaño, y esta pantalla ya lo dice para la
+ * capacidad que no está en el registro: si el contenido no tiene dónde guardarlas, no hay nada
+ * que medir, y decirlo es más honesto que morirse. Aceptar esa propuesta sigue siendo imposible
+ * —el contrato la rechaza al parsear y el guard del sello falla cerrado desde que compara con
+ * `coalesce(..., -1)`—, así que lo único que esto habilita es lo que hay que poder hacer con
+ * ella: verla y rechazarla.
+ */
+export const CITAS_DEL_CONTENIDO = Object.fromEntries(
+  Object.entries(CITAS_POR_CAPACIDAD).map(([capacidad, leer]) => [
+    capacidad,
+    (contenido: ContenidoPropuesta) => {
+      try {
+        const crudas = leer(contenido);
+        return Array.isArray(crudas) ? crudas.map(conIdsCanonicos) : [];
+      } catch {
+        return [];
+      }
+    },
+  ]),
+) as Record<CapacidadActiva, (contenido: ContenidoPropuesta) => CitaDelContenido[]>;
+
+/**
+ * Y el `evidenciaId` con él, que es la misma pregunta un campo más allá.
+ *
+ * Esta lista se usa para DOS cosas, y las dos la necesitan canónica: buscar el tramo del
+ * documento —de ahí salió el `alcanceId`— y preguntar «¿son las mismas citas?» al corregir. Lo
+ * segundo se comparaba byte a byte, y yo lo justifiqué diciendo que una cita «es texto, y ahí la
+ * igualdad exacta es la pregunta». Se contradecía solo: una cita lleva un uuid dentro. Con el id
+ * guardado en mayúscula, el contrato lo baja al parsear la corrección y esa normalización se
+ * leía como una edición del testimonio, así que la propuesta sólo se podía aceptar tal cual o
+ * rechazar.
+ *
+ * Lo que NO se toca: `fragmento` y `localizacion`. Son el texto copiado del documento, y ahí la
+ * igualdad byte a byte sí es exactamente lo que se pregunta.
+ */
+function conIdsCanonicos(cita: CitaDelContenido): CitaDelContenido {
+  const canon = (v: unknown) => (typeof v === 'string' ? v.toLowerCase() : v);
+  return {
+    ...cita,
+    ...(cita.alcanceId === undefined ? {} : { alcanceId: cita.alcanceId.toLowerCase() }),
+    ...('evidenciaId' in cita ? { evidenciaId: canon((cita as { evidenciaId: unknown }).evidenciaId) } : {}),
+  } as CitaDelContenido;
+}
+
+/**
  * Qué MÁS, aparte de las citas, es testimonio del modelo y por tanto no se corrige.
  *
  * Las citas las cubre `CITAS_DEL_CONTENIDO` para todas; esto es lo que cada capacidad añade
@@ -736,6 +1035,44 @@ export const TESTIMONIO_ADICIONAL: Record<
   CI: null,
   C0: null,
   CT: null,
+  C4: {
+    parte: (c) => ({
+      /*
+       * CANÓNICO, porque lo que aquí se pregunta es «¿es la MISMA lente?» y la igualdad de un
+       * uuid no distingue caja. Los otros dos campos que este guard compara —las citas y las
+       * marcas de hipótesis— son texto y booleanos, donde la igualdad byte a byte SÍ es la
+       * pregunta; un identificador no.
+       *
+       * Sin esto, una propuesta cuyo `arquetipoId` se guardó en mayúscula por la superficie
+       * concedida sólo se podía aceptar tal cual o rechazar: la corrección se parsea, y el
+       * contrato la baja a minúscula, así que corregir una errata de la síntesis se leía como
+       * un intento de cambiar la lente. Medido antes de arreglarlo.
+       */
+      arquetipoId: (c as ContenidoRevisionSimulada).arquetipoId.toLowerCase(),
+      hipotesis: (c as ContenidoRevisionSimulada).hallazgos.map((h) => h.esHipotesis),
+    }),
+    /*
+     * DOS cosas, y las dos por la misma frase que ya está escrita en la entrada de C6: la
+     * parte que se puede contrastar no la reescribe quien revisa.
+     *
+     * El `arquetipoId` porque es la LENTE: dice desde qué perfil se hizo la lectura, y
+     * cambiarlo al corregir convierte la sesión del «apurado de RR. HH.» en la del
+     * «desconfiado digital» conservando sus frases. Es fabricar una voz, que es justo lo que
+     * SYS-20 existe para impedir.
+     *
+     * Y `esHipotesis`, que es la mitad del invariante que se puede borrar sin que se note. Un
+     * hallazgo propuesto como extrapolación y «corregido» a afirmación es una simulación que
+     * pasa a leerse como investigación, y la propuesta seguiría diciendo `true` en su
+     * contenido original mientras el objeto de al lado dice que no. La base lo comprueba
+     * también, al materializar; esto lo corta antes, donde se puede decir el motivo.
+     *
+     * Lo que SÍ se corrige, que es la otra mitad: el título y la descripción de cada hallazgo,
+     * la síntesis y las preguntas de test. Un hallazgo bien fundado y mal redactado se
+     * arregla, no se tira — y las preguntas son consejo, como las remediaciones de C5.
+     */
+    motivo:
+      'De una revisión simulada no se corrigen ni el arquetipo que la firma ni la marca de hipótesis de sus hallazgos: la lente dice desde qué perfil se leyó, y la marca separa lo que se apoya en evidencia de lo que se extrapola (SYS-20). Corrige los textos, o rechaza la revisión.',
+  },
   /*
    * C3 no añade nada, y eso es una respuesta y no un hueco: lo único que en esta capacidad es
    * testimonio del modelo —a qué insights se apoya— vive DENTRO de las citas, que ya son
@@ -801,6 +1138,11 @@ export const TESTIMONIO_ADICIONAL: Record<
      * opuestas, y la que ganaba —el rechazo— lo hacía por accidente y con el mensaje
      * equivocado («las citas no se corrigen» sobre una corrección que no las tocaba).
      *
+     * Escribir el blindaje no bastó para que ese mensaje dejara de salir: la comparación de
+     * las citas corría ANTES, y como reapuntar el criterio mueve también su `alcanceId`,
+     * seguía saltando ella. Medido. Por eso `aceptarPropuesta` comprueba ahora el testimonio
+     * adicional primero: la regla que nombra el campo va antes que la que habla del conjunto.
+     *
      * Gana el blindaje, y no por resolver el empate hacia el lado estricto: `criterioId` es la
      * mitad CONTRASTABLE de lo que el modelo dijo. Los fragmentos se copiaron de UN criterio,
      * y reapuntarlos a otro conservándolos es quedarse con el sostén de A para afirmar sobre
@@ -827,4 +1169,26 @@ export function parsearContenido(
   valor: unknown,
 ): ContenidoPropuesta {
   return ESQUEMA_DE_CONTENIDO[capacidad].parse(valor);
+}
+
+/**
+ * Y la misma pregunta sin excepción: ¿este valor tiene la forma que esa capacidad declara?
+ *
+ * El MISMO esquema que `parsearContenido`, a propósito. Quien proyecta el panel necesita
+ * contestarla para toda una página de filas —una excepción por fila tumbaría el panel entero,
+ * que es justo la avería que esto viene a cerrar— y quien acepta necesita contestarla para
+ * una; con dos comprobaciones distintas, la pantalla y el suelo podrían discrepar sobre la
+ * misma fila y quien revisa vería un botón que la base rechaza (o al revés).
+ *
+ * `capacidad` entra como `string` porque las filas traen las DIEZ de SPEC-08 y aquí solo hay
+ * esquema para las ACTIVAS. Una capacidad sin esquema es ilegible, que es lo que hay que
+ * contestar sin saber su forma: fallar cerrado. La pantalla, que además sabe si conoce la
+ * capacidad, distingue los dos motivos al escribir el aviso.
+ */
+export function contenidoLegible(capacidad: string, ...valores: unknown[]): boolean {
+  const esquema = ESQUEMA_DE_CONTENIDO[capacidad as CapacidadActiva] as
+    | (typeof ESQUEMA_DE_CONTENIDO)[CapacidadActiva]
+    | undefined;
+  if (esquema === undefined) return false;
+  return valores.every((v) => esquema.safeParse(v).success);
 }

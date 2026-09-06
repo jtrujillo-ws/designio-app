@@ -13,10 +13,18 @@ import {
   aprobarDecision,
   definirArquetipo,
   enlazarEvidenciaArquetipo,
+  borrarRevisionSimuladaAMano,
+  escribirRevisionSimuladaAMano,
   reabrirEtapaDelProyecto,
   revalidarDecisionRevisada,
   veredictoDeArquetipo,
 } from '@/lib/metodo/gobernanza.functions';
+import {
+  MAX_CITAS_POR_HALLAZGO,
+  MAX_HALLAZGOS_POR_REVISION,
+  MAX_PREGUNTAS_POR_REVISION,
+} from '@/lib/ai/ai.schemas';
+import type { RevisionSimuladaDeConcepto } from '@/lib/metodo/gobernanza.schemas';
 import {
   COLOR_ARQUETIPO,
   ETIQUETA_ALCANCE,
@@ -24,6 +32,7 @@ import {
   ETIQUETA_ESTADO_CONCEPTO,
   ETIQUETA_TIPO_DECISION,
   TIPOS_DECISION,
+  type ArquetipoDeReto,
   type GobernanzaDeProyecto,
   type TipoDecision,
 } from '@/lib/metodo/gobernanza.schemas';
@@ -87,6 +96,29 @@ export function SeccionGobernanza({
         hayMasInsights={hayMasInsights}
         conceptos={gobernanza.conceptos}
         esLead={esLead}
+        onCambio={onCambio}
+        onError={onError}
+      />
+      {/*
+        * Las revisiones simuladas ACEPTADAS, fuera del formulario del pasa/muere.
+        *
+        * Estaban dentro, y dentro no las lee nadie a tiempo: el formulario solo se abre desde
+        * un control que se pinta para el lead, así que quien no es lead no las veía nunca, y el
+        * lead las veía sólo mientras registraba la decisión — después de los tests que esas
+        * preguntas existen para guiar. Lo que una simulación le entrega a la etapa 4 son
+        * justamente sus preguntas (RF-08.2): tienen que estar donde el equipo prepara el test,
+        * no detrás del acto de decidir.
+        *
+        * Sin puerta de rol PARA LEER: leer no es decidir. Escribir el pasa/muere sigue siendo
+        * del lead, y ESCRIBIR O BORRAR una revisión a mano es de los curadores — que es lo que
+        * la base exige y lo que este bloque tiene que dejar de ofrecer a quien no lo es.
+        */}
+      <BloqueRevisionesSimuladas
+        workspaceId={workspaceId}
+        conceptos={gobernanza.conceptos}
+        arquetipos={gobernanza.arquetipos}
+        esCurador={esCurador}
+        etapaAbierta={gobernanza.etapaAdmiteConceptos}
         onCambio={onCambio}
         onError={onError}
       />
@@ -301,6 +333,13 @@ function BloqueDecisiones({
               ))}
             </Select>
           )}
+          {/*
+            Aquí NO van las revisiones simuladas, y su ausencia es la mitad que faltaba del
+            arreglo que las sacó fuera. `BloqueRevisionesSimuladas` ya las pinta —todas, sin
+            puerta de rol, arriba en la sección—, así que repetirlas aquí no añade nada: alarga
+            el formulario con las sesiones, sus hallazgos, sus citas y sus preguntas, y empuja
+            hacia abajo los campos con los que de verdad se registra la decisión.
+          */}
           {tipo === 'pasa-muere' && conceptos.length === 0 && (
             <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
               Este reto no tiene conceptos todavía: un pasa/muere decide SOBRE uno (RF-04.10).
@@ -786,5 +825,733 @@ function BloqueReaperturas({
         </div>
       )}
     </Card>
+  );
+}
+
+/**
+ * Lo que las revisiones simuladas ya aceptadas dijeron sobre este concepto.
+ *
+ * Se pinta junto al selector del pasa/muere porque es ahí donde sirve: quien decide si el
+ * concepto pasa o muere es quien tiene que haber leído lo que las lentes vieron y, sobre todo,
+ * QUÉ IR A PROBAR — las preguntas de test son lo único que una simulación le entrega a la
+ * etapa 4 (RF-08.2). Antes de esto la sesión se guardaba y desaparecía: el panel de propuestas
+ * solo pinta lo pendiente.
+ *
+ * La etiqueta de SIMULACIÓN va arriba y en cada hallazgo que sea hipótesis, no como adorno:
+ * SYS-20 pide que esto no se pueda confundir con investigación, y donde se LEE es donde esa
+ * confusión ocurriría.
+ */
+function BloqueRevisionesSimuladas({
+  workspaceId,
+  conceptos,
+  arquetipos,
+  esCurador,
+  etapaAbierta,
+  onCambio,
+  onError,
+}: {
+  workspaceId: string;
+  conceptos: GobernanzaDeProyecto['conceptos'];
+  arquetipos: ArquetipoDeReto[];
+  esCurador: boolean;
+  etapaAbierta: boolean;
+  onCambio: () => Promise<void>;
+  onError: (m: string | null) => void;
+}) {
+  const [borrando, setBorrando] = useState('');
+  const conRevisiones = conceptos.filter((c) => c.revisiones.length > 0);
+
+  async function borrar(revisionId: string) {
+    setBorrando(revisionId);
+    onError(null);
+    try {
+      const r = await borrarRevisionSimuladaAMano({ data: { workspaceId, revisionId } });
+      if (r.ok) await onCambio();
+      else onError(r.error);
+    } catch {
+      onError('No se pudo borrar la revisión; intenta de nuevo');
+    } finally {
+      setBorrando('');
+    }
+  }
+  /*
+   * Y ya NO se esconde cuando no hay ninguna: sin revisiones es justo cuando hace falta poder
+   * escribir la primera. Lo que decide si hay algo que enseñar es si hay conceptos, no si la AI
+   * ya produjo algo — que es la diferencia entre un lector y una capacidad.
+   *
+   * Pero eso vale para quien PUEDE escribirla. A quien no es curador, un bloque sin revisiones
+   * es una tarjeta con un título y nada debajo, así que para él la puerta vuelve a ser si hay
+   * algo escrito.
+   */
+  if (conceptos.length === 0) return null;
+  if (conRevisiones.length === 0 && !(esCurador && etapaAbierta)) return null;
+  return (
+    <Card>
+      <h3 style={{ font: '600 13px var(--font-sans)', margin: 0 }}>
+        Revisiones simuladas de los conceptos
+      </h3>
+      <p style={{ font: '400 11.5px var(--font-sans)', color: 'var(--text-faint)', margin: 0 }}>
+        No son evidencia y no cuentan en G4/G5 (SYS-20). Lo que sí entregan es qué ir a probar
+        con personas reales.
+      </p>
+      {conRevisiones.map((c) => (
+        <div key={c.id} style={{ display: 'grid', gap: 6 }}>
+          <span style={{ font: '600 12.5px var(--font-sans)' }}>
+            {c.titulo}
+            {c.estado === 'candidato' ? '' : ` · ${ETIQUETA_ESTADO_CONCEPTO[c.estado]}`}
+          </span>
+          <RevisionesDelConcepto revisiones={c.revisiones} />
+          {/*
+            BORRAR Y REESCRIBIR, que es la única corrección que este diseño admite: las hojas de
+            una revisión no se editan —no hay UPDATE concedido— así que una errata o una pregunta
+            que sobra se arreglan rehaciéndola. Sin este control, la primera revisión escrita a
+            mano era irreversible desde la aplicación, y la clave única por lente impedía además
+            escribir la sustituta.
+
+            Sólo mientras el concepto es CANDIDATO y la ETAPA 4 sigue abierta: firmado el
+            pasa/muere, lo que se leyó para decidir se queda; y aprobado G4 —o archivado el
+            reto— el concepto se queda candidato sin que nada lo mueva, así que el estado solo
+            no basta. Y sólo para un CURADOR, que es a quien la política concede el borrado — y
+            la de escritura, igual. La base exige las TRES cosas; esto es no ofrecer lo que va a
+            fallar. Leer sigue siendo de todo el equipo: el bloque entero está fuera del
+            formulario del pasa/muere justo por eso.
+          */}
+          {esCurador && etapaAbierta && c.estado === 'candidato' && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {c.revisiones.map((r) => (
+                <Button
+                  key={r.id}
+                  variant="secondary"
+                  disabled={borrando !== ''}
+                  onClick={() => void borrar(r.id)}
+                >
+                  Borrar la de «{r.arquetipoNombre}» y reescribirla
+                </Button>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+      {esCurador && etapaAbierta && (
+        <FormularioRevisionAMano
+          workspaceId={workspaceId}
+          conceptos={conceptos}
+          arquetipos={arquetipos}
+          onCambio={onCambio}
+          onError={onError}
+        />
+      )}
+    </Card>
+  );
+}
+
+/*
+ * Las tres listas que una revisión tiene, con la forma que el contrato les da. El formulario
+ * escribía UNA de cada —un hallazgo, una cita, una pregunta— y eso no era un recorte de la
+ * pantalla sino un techo del producto: la clave única `(concepto_id, arquetipo_id)` deja una
+ * sola revisión por lente y no hay ninguna ruta para añadirle hojas después, así que lo que no
+ * cabía en el envío no cabía nunca. La única salida era borrarla y reescribirla, con el mismo
+ * formulario de una, o —peor— marcar como hipótesis un hallazgo observado para que la cita
+ * sobrante no estorbara. Los topes salen de donde los lee también el contrato.
+ */
+type CitaAMano = { evidenciaId: string; fragmento: string; localizacion: string };
+type HallazgoAMano = {
+  titulo: string;
+  descripcion: string;
+  esHipotesis: boolean;
+  citas: CitaAMano[];
+};
+type PreguntaAMano = { pregunta: string; escenario: string; hallazgoIndice: number | null };
+
+const CITA_VACIA: CitaAMano = { evidenciaId: '', fragmento: '', localizacion: '' };
+const HALLAZGO_VACIO: HallazgoAMano = {
+  titulo: '',
+  descripcion: '',
+  esHipotesis: false,
+  citas: [CITA_VACIA],
+};
+const PREGUNTA_VACIA: PreguntaAMano = { pregunta: '', escenario: '', hallazgoIndice: null };
+
+/*
+ * Una fila de cita está VACÍA (no se manda) o COMPLETA (se manda entera). A medias no: el
+ * contrato pide fragmento Y localización con al menos un carácter, y la tabla los pide `not
+ * null` y no en blanco. Sin esto, la localización se quedaba fuera de la puerta del botón y el
+ * envío moría en la frontera con todo lo escrito por delante.
+ */
+const citaVacia = (c: CitaAMano) =>
+  c.evidenciaId === '' && c.fragmento.trim() === '' && c.localizacion.trim() === '';
+const citaCompleta = (c: CitaAMano) =>
+  c.evidenciaId !== '' && c.fragmento.trim() !== '' && c.localizacion.trim() !== '';
+
+/**
+ * ESCRIBIR UNA REVISIÓN A MANO — la paridad que SYS-21 exige (RF-08.6).
+ *
+ * «Caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre presentes.» Las
+ * concesiones y las políticas de la base estaban puestas para esto desde el principio —una
+ * revisión escrita a mano lleva el sello de procedencia en null para siempre— pero no había
+ * por dónde ejercerlas: las tablas de C4 sólo las escribía la aceptación de una propuesta.
+ *
+ * El formulario pide lo mismo que el contrato exige al modelo, ni más ni menos, porque es EL
+ * MISMO esquema el que valida las dos: al menos un hallazgo y una pregunta; un hallazgo que no
+ * se marca como hipótesis cita al menos un documento; y las citas sólo de la evidencia de su
+ * lente. «Ni menos» incluye la CANTIDAD: hasta seis hallazgos, cuatro citas por hallazgo y seis
+ * preguntas, que es lo que el contrato admite. Lo que la base rechace vuelve como mensaje, no
+ * como pantalla rota.
+ */
+function FormularioRevisionAMano({
+  workspaceId,
+  conceptos,
+  arquetipos,
+  onCambio,
+  onError,
+}: {
+  workspaceId: string;
+  conceptos: GobernanzaDeProyecto['conceptos'];
+  arquetipos: ArquetipoDeReto[];
+  onCambio: () => Promise<void>;
+  onError: (m: string | null) => void;
+}) {
+  const [abierto, setAbierto] = useState(false);
+  const [ocupado, setOcupado] = useState(false);
+  const [conceptoId, setConceptoId] = useState('');
+  const [arquetipoId, setArquetipoId] = useState('');
+  const [sintesis, setSintesis] = useState('');
+  const [hallazgos, setHallazgos] = useState<HallazgoAMano[]>([HALLAZGO_VACIO]);
+  const [preguntas, setPreguntas] = useState<PreguntaAMano[]>([PREGUNTA_VACIA]);
+
+  const parchearHallazgo = (i: number, patch: Partial<HallazgoAMano>) =>
+    setHallazgos((xs) => xs.map((h, j) => (j === i ? { ...h, ...patch } : h)));
+  const parchearCita = (i: number, k: number, patch: Partial<CitaAMano>) =>
+    setHallazgos((xs) =>
+      xs.map((h, j) =>
+        j === i ? { ...h, citas: h.citas.map((c, l) => (l === k ? { ...c, ...patch } : c)) } : h,
+      ),
+    );
+  const parchearPregunta = (i: number, patch: Partial<PreguntaAMano>) =>
+    setPreguntas((xs) => xs.map((q, j) => (j === i ? { ...q, ...patch } : q)));
+
+  /*
+   * Marcar hipótesis BORRA las citas del hallazgo. Los campos se ocultaban, pero lo que ya
+   * estaba seleccionado seguía en el estado y se mandaba igual: un hallazgo que se presenta a
+   * la vez como extrapolación sin sostén y como lectura de un testimonio observado, que es lo
+   * que las dos clases de RF-08.2 excluyen.
+   */
+  const marcarHipotesis = (i: number, v: boolean) =>
+    parchearHallazgo(i, { esHipotesis: v, citas: v ? [] : [CITA_VACIA] });
+
+  /*
+   * Y quitar un hallazgo REENUMERA las preguntas que lo nombran. El índice apunta por posición
+   * —los hallazgos todavía no son filas cuando esto se escribe—, así que borrar el primero
+   * dejaría a su pregunta colgando del segundo, y a la última apuntando fuera de rango: lo
+   * primero es una traza falsa que nadie ve, y lo segundo lo para el contrato con todo escrito.
+   */
+  const quitarHallazgo = (i: number) => {
+    setHallazgos((xs) => xs.filter((_, j) => j !== i));
+    setPreguntas((qs) =>
+      qs.map((q) =>
+        q.hallazgoIndice === null || q.hallazgoIndice < i
+          ? q
+          : { ...q, hallazgoIndice: q.hallazgoIndice === i ? null : q.hallazgoIndice - 1 },
+      ),
+    );
+  };
+
+  /*
+   * Un borrador vacío es TAMBIÉN sin lente, y por eso `limpiar` la borra.
+   *
+   * Al guardar, la lente elegida deja de estar disponible —una lente lee un concepto una vez—,
+   * así que el selector se queda pintando su hueco mientras el estado sigue teniendo el id: se
+   * escribe el borrador siguiente, el botón se habilita porque el id no está vacío, y se manda
+   * una lente ya usada. Con esto el borrador siguiente tiene que elegirla otra vez, que es lo
+   * que la pantalla ya está diciendo.
+   *
+   * Quien cambia de lente la fija DESPUÉS de limpiar, por eso, y no antes.
+   */
+  const limpiar = () => {
+    setArquetipoId('');
+    setSintesis('');
+    setHallazgos([HALLAZGO_VACIO]);
+    setPreguntas([PREGUNTA_VACIA]);
+  };
+
+  // Sólo los conceptos que todavía admiten revisión, y sólo las lentes que pueden mirar: un
+  // arquetipo REFUTADO no describe a nadie (SPEC-04.11) y la base lo rechaza igualmente.
+  const candidatos = conceptos.filter((c) => c.estado === 'candidato');
+  /*
+   * Y sin las que YA revisaron el concepto elegido. «unique (concepto_id, arquetipo_id)» dice
+   * que una lente lee un concepto una sola vez, así que ofrecerla otra vez es ofrecer un rechazo
+   * que llega cuando ya está todo escrito — la misma clase que la ventana de la etapa.
+   *
+   * Se filtra por el CONCEPTO seleccionado y no globalmente: la misma lente sigue estando
+   * disponible para los demás conceptos del reto, que es de lo que va la rotación.
+   */
+  const yaRevisaron = new Set(
+    (conceptos.find((c) => c.id === conceptoId)?.revisiones ?? []).map((r) => r.arquetipoId),
+  );
+  const lentesVigentes = arquetipos.filter((a) => a.estado !== 'refutado');
+  const lentes = lentesVigentes.filter((a) => !yaRevisaron.has(a.id));
+  /*
+   * Lo citable sale de LA LENTE y no del selector general del workspace. Aquél se corta en las
+   * 200 más recientes, así que una lente sostenida por documentos más antiguos dejaba la lista
+   * vacía y el único camino aparente era marcar el hallazgo como hipótesis — mentir sobre su
+   * clase para poder guardar. La proyección de la lente trae su evidencia entera y con su
+   * permiso ya resuelto.
+   */
+  const citables = (lentes.find((a) => a.id === arquetipoId)?.evidencias ?? []).filter(
+    (e) => e.citable,
+  );
+
+  /*
+   * Cambiar de LENTE o de CONCEPTO reinicia la revisión entera, no sólo sus citas.
+   *
+   * Una revisión es lo que UNA lente ve en UN concepto: la lectura de conjunto, los hallazgos y
+   * qué hay que ir a preguntar son de ese par y de ningún otro. Vaciar sólo las citas dejaba lo
+   * escrito para uno guardado como lectura del otro —y una revisión de puras hipótesis, que no
+   * lleva citas, se podía mandar tal cual—: la falsa atribución que el guard de corrección
+   * impide en la ruta AI cuando el `arquetipoId` se mueve.
+   *
+   * Con el concepto es PEOR, y por eso también se reinicia aquí aunque no sea «de la lente»: el
+   * contenido nombra su arquetipo —y hay un guard que lo comprueba contra el reto del concepto—
+   * pero NO nombra su concepto, que viaja como columna. No hay nada dentro del texto que
+   * contrastar, así que ninguna capa puede detectar una revisión escrita para otro concepto del
+   * mismo reto: la lente sigue siendo del reto, su evidencia también, y todo pasa. Medido.
+   *
+   * Y se dice antes de que pase, junto a los selectores, porque perder lo escrito en silencio es
+   * su propia avería.
+   */
+  // La LENTE se vacía con el resto: qué lentes quedan libres depende del concepto —una lente lee
+  // un concepto UNA vez—, así que al cambiarlo la elegida puede haber dejado de estar disponible.
+  const cambiarConcepto = (v: string) => {
+    limpiar();
+    setConceptoId(v);
+  };
+  const cambiarLente = (v: string) => {
+    limpiar();
+    setArquetipoId(v);
+  };
+
+  const hallazgoListo = (h: HallazgoAMano) =>
+    h.titulo.trim() !== '' &&
+    h.descripcion.trim() !== '' &&
+    h.citas.every((c) => citaVacia(c) || citaCompleta(c)) &&
+    (h.esHipotesis || h.citas.some(citaCompleta));
+  const listo =
+    conceptoId !== '' &&
+    arquetipoId !== '' &&
+    sintesis.trim() !== '' &&
+    hallazgos.every(hallazgoListo) &&
+    preguntas.every((q) => q.pregunta.trim() !== '');
+
+  async function escribir() {
+    setOcupado(true);
+    onError(null);
+    try {
+      const r = await escribirRevisionSimuladaAMano({
+        data: {
+          workspaceId,
+          conceptoId,
+          contenido: {
+            arquetipoId,
+            sintesis,
+            hallazgos: hallazgos.map((h) => ({
+              titulo: h.titulo,
+              descripcion: h.descripcion,
+              esHipotesis: h.esHipotesis,
+              // Sin citas si es hipótesis, y no por cortesía: mandar una con la marca puesta lo
+              // rechaza el contrato. La casilla ya las limpia; esto es el cinturón.
+              citas: h.esHipotesis ? [] : h.citas.filter((c) => !citaVacia(c)),
+            })),
+            preguntas: preguntas.map((q) =>
+              q.hallazgoIndice === null
+                ? { pregunta: q.pregunta, escenario: q.escenario }
+                : {
+                    pregunta: q.pregunta,
+                    escenario: q.escenario,
+                    hallazgoIndice: q.hallazgoIndice,
+                  },
+            ),
+          },
+        },
+      });
+      if (r.ok) {
+        setAbierto(false);
+        limpiar();
+        await onCambio();
+      } else onError(r.error);
+    } catch {
+      onError('No se pudo escribir la revisión; intenta de nuevo');
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  /*
+   * El retorno mira las lentes VIGENTES y no las libres del concepto elegido: si no, elegir un
+   * concepto ya revisado por todas haría desaparecer el formulario ENTERO —con su selector
+   * dentro—, y quien lo elegió se quedaría sin manera de volver atrás. Cuando no queda ninguna
+   * libre se dice, que es distinto de esconderse.
+   */
+  if (candidatos.length === 0 || lentesVigentes.length === 0) return null;
+  if (!abierto) {
+    return (
+      <Button variant="secondary" onClick={() => setAbierto(true)}>
+        Escribir una revisión a mano
+      </Button>
+    );
+  }
+  return (
+    <div style={{ display: 'grid', gap: 6 }}>
+      <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+        Revisión escrita a mano · queda marcada como simulación y sin procedencia AI
+      </span>
+      <Select value={conceptoId} onChange={(e) => cambiarConcepto(e.target.value)}>
+        <option value="">Concepto que se revisa…</option>
+        {candidatos.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.titulo}
+          </option>
+        ))}
+      </Select>
+      <Select value={arquetipoId} onChange={(e) => cambiarLente(e.target.value)}>
+        <option value="">Lente desde la que se lee…</option>
+        {lentes.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.nombre}
+          </option>
+        ))}
+      </Select>
+      <span style={{ font: '400 11px var(--font-sans)', color: 'var(--text-faint)' }}>
+        Cambiar de concepto o de lente vacía lo escrito: una revisión es lo que ESA lente ve en
+        ESE concepto.
+      </span>
+      {conceptoId !== '' && lentes.length === 0 && (
+        <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+          Todas las lentes vigentes del reto ya revisaron este concepto: una lente lo lee una
+          sola vez. Borra la que quieras rehacer, o elige otro concepto.
+        </span>
+      )}
+      <Input
+        placeholder="Lectura de conjunto"
+        value={sintesis}
+        onChange={(e) => setSintesis(e.target.value)}
+      />
+
+      {hallazgos.map((h, i) => (
+        <div
+          key={i}
+          style={{
+            display: 'grid',
+            gap: 6,
+            padding: 8,
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+          }}
+        >
+          <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+            <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+              Hallazgo {i + 1}
+            </span>
+            {hallazgos.length > 1 && (
+              <Button variant="secondary" onClick={() => quitarHallazgo(i)} disabled={ocupado}>
+                Quitar
+              </Button>
+            )}
+          </div>
+          <Input
+            placeholder="Hallazgo"
+            value={h.titulo}
+            onChange={(e) => parchearHallazgo(i, { titulo: e.target.value })}
+          />
+          <Input
+            placeholder="Qué se observa"
+            value={h.descripcion}
+            onChange={(e) => parchearHallazgo(i, { descripcion: e.target.value })}
+          />
+          <label style={{ font: '400 11.5px var(--font-sans)', display: 'flex', gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={h.esHipotesis}
+              onChange={(ev) => marcarHipotesis(i, ev.currentTarget.checked)}
+            />
+            Es una hipótesis: lo extrapolo del perfil, no lo dice ningún testimonio
+          </label>
+          {!h.esHipotesis &&
+            h.citas.map((c, k) => (
+              <div key={k} style={{ display: 'grid', gap: 6 }}>
+                <Select
+                  value={c.evidenciaId}
+                  /*
+                   * Cambiar de documento VACÍA el pasaje, por lo mismo que cambiar de lente: un
+                   * fragmento es texto literal de un documento concreto, y dejar el de A pegado
+                   * a B lo atribuye a quien no lo dijo. Nadie lo para después — la ruta manual
+                   * no comprueba presencia literal, y está medido: un pasaje que no aparece en
+                   * el documento elegido se escribe y se muestra como sostén del hallazgo.
+                   */
+                  onChange={(e) =>
+                    parchearCita(i, k, {
+                      evidenciaId: e.target.value,
+                      fragmento: '',
+                      localizacion: '',
+                    })
+                  }
+                >
+                  <option value="">Documento que lo sostiene…</option>
+                  {/*
+                    Y sólo los que este hallazgo NO cita ya: el enlace guarda un pasaje por
+                    documento, así que un segundo pasaje del mismo se perdía en el refresco. El
+                    contrato de la ruta manual lo rechaza; esto es no ofrecerlo.
+                  */}
+                  {citables
+                    .filter(
+                      (e) =>
+                        e.id === c.evidenciaId ||
+                        !h.citas.some((otra, l) => l !== k && otra.evidenciaId === e.id),
+                    )
+                    .map((e) => (
+                      <option key={e.id} value={e.id}>
+                        {e.titulo}
+                      </option>
+                    ))}
+                </Select>
+                <Input
+                  placeholder="Fragmento literal"
+                  value={c.fragmento}
+                  onChange={(e) => parchearCita(i, k, { fragmento: e.target.value })}
+                />
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <Input
+                    placeholder="Dónde está (p. ej. resumen)"
+                    value={c.localizacion}
+                    onChange={(e) => parchearCita(i, k, { localizacion: e.target.value })}
+                  />
+                  {h.citas.length > 1 && (
+                    <Button
+                      variant="secondary"
+                      disabled={ocupado}
+                      onClick={() =>
+                        parchearHallazgo(i, { citas: h.citas.filter((_, l) => l !== k) })
+                      }
+                    >
+                      Quitar cita
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ))}
+          {!h.esHipotesis &&
+            h.citas.length < MAX_CITAS_POR_HALLAZGO &&
+            h.citas.filter((c) => c.evidenciaId !== '').length < citables.length && (
+            <Button
+              variant="secondary"
+              disabled={ocupado}
+              onClick={() => parchearHallazgo(i, { citas: [...h.citas, CITA_VACIA] })}
+            >
+              Añadir otra cita
+            </Button>
+          )}
+        </div>
+      ))}
+      {hallazgos.length < MAX_HALLAZGOS_POR_REVISION && (
+        <Button
+          variant="secondary"
+          disabled={ocupado}
+          onClick={() => setHallazgos((xs) => [...xs, HALLAZGO_VACIO])}
+        >
+          Añadir otro hallazgo
+        </Button>
+      )}
+
+      {preguntas.map((q, i) => (
+        <div
+          key={i}
+          style={{
+            display: 'grid',
+            gap: 6,
+            padding: 8,
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+          }}
+        >
+          <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+            <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+              Pregunta {i + 1}
+            </span>
+            {preguntas.length > 1 && (
+              <Button
+                variant="secondary"
+                disabled={ocupado}
+                onClick={() => setPreguntas((xs) => xs.filter((_, j) => j !== i))}
+              >
+                Quitar
+              </Button>
+            )}
+          </div>
+          <Input
+            placeholder="Pregunta que hay que llevarle a una persona real"
+            value={q.pregunta}
+            onChange={(e) => parchearPregunta(i, { pregunta: e.target.value })}
+          />
+          <Input
+            placeholder="En qué montaje preguntarla (opcional)"
+            value={q.escenario}
+            onChange={(e) => parchearPregunta(i, { escenario: e.target.value })}
+          />
+          {/*
+            De qué hallazgo NACE, que es la traza simulación → test real y lo que el lector
+            pinta al lado de cada pregunta. Puede no nacer de ninguno: la lista lo dice en vez
+            de colgarla del primero por omisión, que es lo que hacía cuando sólo había uno.
+          */}
+          <Select
+            value={q.hallazgoIndice === null ? '' : String(q.hallazgoIndice)}
+            onChange={(e) =>
+              parchearPregunta(i, {
+                hallazgoIndice: e.target.value === '' ? null : Number(e.target.value),
+              })
+            }
+          >
+            <option value="">No nace de un hallazgo concreto</option>
+            {hallazgos.map((h, j) => (
+              <option key={j} value={String(j)}>
+                {h.titulo.trim() === '' ? `Hallazgo ${j + 1}` : h.titulo}
+              </option>
+            ))}
+          </Select>
+        </div>
+      ))}
+      {preguntas.length < MAX_PREGUNTAS_POR_REVISION && (
+        <Button
+          variant="secondary"
+          disabled={ocupado}
+          onClick={() => setPreguntas((xs) => [...xs, PREGUNTA_VACIA])}
+        >
+          Añadir otra pregunta
+        </Button>
+      )}
+
+      <div style={{ display: 'flex', gap: 6 }}>
+        <Button onClick={escribir} disabled={ocupado || !listo}>
+          Escribir revisión
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={() => {
+            setAbierto(false);
+            limpiar();
+          }}
+          disabled={ocupado}
+        >
+          Cancelar
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeConcepto[] }) {
+  if (revisiones.length === 0) return null;
+  return (
+    <div style={{ display: 'grid', gap: 10, gridColumn: '1 / -1' }}>
+      <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+        Revisiones simuladas aceptadas · {revisiones.length}
+      </span>
+      {revisiones.map((r) => (
+        <article
+          key={r.id}
+          style={{
+            display: 'grid',
+            gap: 6,
+            padding: 10,
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+          }}
+        >
+          <header style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            <strong style={{ font: '600 12.5px var(--font-sans)' }}>{r.arquetipoNombre}</strong>
+            <span style={{ font: '400 11px var(--font-sans)', color: 'var(--text-faint)' }}>
+              {r.arquetipoEstado}
+            </span>
+            {/*
+              * La etiqueta de SYS-20 va SIEMPRE —toda revisión de esta tabla es simulación, la
+              * escriba quien la escriba— pero la AUTORÍA no: decía «simulación AI» encima de
+              * una fila que dos palabras después se declaraba «escrita a mano», o sea las dos
+              * cosas a la vez y una de ellas falsa. Quien lee esto está firmando un pasa/muere;
+              * una procedencia contradictoria es de las que se resuelven creyendo la mitad
+              * equivocada. La marca de simulación y de dónde salió son dos hechos distintos y
+              * ahora se dicen por separado.
+              */}
+            <span
+              style={{
+                font: '600 10.5px var(--font-sans)',
+                color: 'var(--warn)',
+                border: '1px solid var(--warn)',
+                borderRadius: 3,
+                padding: '1px 5px',
+              }}
+            >
+              simulación
+            </span>
+            <span style={{ font: '400 11px var(--font-sans)', color: 'var(--text-faint)' }}>
+              {r.propuestaAiId === null ? 'escrita a mano' : 'propuesta por AI'}
+            </span>
+          </header>
+          <p style={{ font: '400 12px var(--font-sans)', margin: 0 }}>{r.sintesis}</p>
+          <ul style={{ display: 'grid', gap: 5, margin: 0, paddingLeft: 16 }}>
+            {r.hallazgos.map((h) => (
+              <li key={h.id} style={{ font: '400 12px var(--font-sans)' }}>
+                <strong style={{ fontWeight: 600 }}>{h.titulo}</strong>
+                {h.esHipotesis && (
+                  <span style={{ color: 'var(--text-faint)' }}> · hipótesis, no observado</span>
+                )}
+                <br />
+                {h.descripcion}
+                {h.citas.map((c, j) => (
+                  // El PASAJE, no solo el documento: quien firma el pasa/muere tiene que poder
+                  // ver qué dijo alguien, no solo dónde. Cuando la revisión se escribió a mano
+                  // no hay fragmento que enseñar y queda el título, que es todo lo que existe.
+                  <span key={j} style={{ display: 'block', color: 'var(--text-faint)' }}>
+                    {!c.citable
+                      ? `· se apoyaba en ${c.evidenciaTitulo} · su permiso de cita ya no está, así que el pasaje no se muestra`
+                      : c.fragmento === null
+                        ? `· se apoya en ${c.evidenciaTitulo}`
+                        : `· «${c.fragmento}» — ${c.evidenciaTitulo}${
+                            c.localizacion === null || c.localizacion === ''
+                              ? ''
+                              : `, ${c.localizacion}`
+                          }`}
+                  </span>
+                ))}
+              </li>
+            ))}
+          </ul>
+          {r.preguntas.length > 0 && (
+            <div style={{ display: 'grid', gap: 3 }}>
+              <span style={{ font: '600 11px var(--font-sans)', color: 'var(--text-muted)' }}>
+                Qué ir a probar con personas
+              </span>
+              <ul style={{ display: 'grid', gap: 3, margin: 0, paddingLeft: 16 }}>
+                {r.preguntas.map((q) => {
+                  // Por TÍTULO, no por número. La tarjeta de la propuesta pendiente dice «Nace
+                  // del hallazgo N» porque ahí lo único que hay es el índice del contenido;
+                  // aquí el hallazgo ya es una fila con nombre, y un nombre no obliga a contar
+                  // viñetas hacia arriba para saber de qué se está hablando.
+                  const nace = r.hallazgos.find((h) => h.id === q.hallazgoId);
+                  return (
+                    <li key={q.id} style={{ font: '400 12px var(--font-sans)' }}>
+                      {q.pregunta}
+                      {q.escenario !== '' && (
+                        <span style={{ color: 'var(--text-faint)' }}> · {q.escenario}</span>
+                      )}
+                      {nace !== undefined && (
+                        <span style={{ color: 'var(--text-faint)' }}> · nace de «{nace.titulo}»</span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
+        </article>
+      ))}
+    </div>
   );
 }

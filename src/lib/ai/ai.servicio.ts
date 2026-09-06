@@ -2094,9 +2094,43 @@ function columnaDelAncla(f: Record<string, unknown>): AnclaCapacidad['columna'] 
   return COLUMNAS_DE_ANCLA.find((c) => f[c] != null);
 }
 
+/**
+ * El PASAJE de una cita se retira si quien lee no puede recibir ese documento.
+ *
+ * `fragmento` y `localizacion` son texto COPIADO del original, y RF-03.10 tiene una sola
+ * definición de quién puede recibirlo. El contenido de una propuesta los guarda —es el
+ * testimonio del modelo, inmutable por SYS-17, así que no se puede limpiar la fila— y esta
+ * pantalla la lee también quien no cura.
+ *
+ * Se recorta por la FORMA y no por una lista de rutas por capacidad: un objeto que lleva un
+ * `evidenciaId` ES una cita, y no hay otra cosa que pueda ser. Así vale para C2 —dentro de cada
+ * afirmación—, para C4 —dentro de cada hallazgo—, para las que las llevan arriba, y para la
+ * capacidad que llegue mañana sin que nadie se acuerde de venir aquí.
+ *
+ * Lo que NO se retira: el `evidenciaId` ni nada más de la cita. La IDENTIDAD del documento es
+ * visible para todo miembro —SYS-14 exige poder explicar el bloqueo— y borrar la cita entera
+ * diría que la propuesta no citó nada, que es falso y es peor.
+ */
+function sinPasajesVetados<T>(valor: T, vetados: Set<string>): T {
+  if (Array.isArray(valor)) return valor.map((x) => sinPasajesVetados(x, vetados)) as T;
+  if (valor === null || typeof valor !== 'object') return valor;
+  const o = valor as Record<string, unknown>;
+  const id = o.evidenciaId;
+  const vetada = typeof id === 'string' && vetados.has(id.toLowerCase());
+  return Object.fromEntries(
+    Object.entries(o).map(([k, v]) => [
+      k,
+      vetada && (k === 'fragmento' || k === 'localizacion') ? null : sinPasajesVetados(v, vetados),
+    ]),
+  ) as T;
+}
+
 function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
-  const contenido = f.contenido as ContenidoPropuesta;
-  const original = f.contenido_original as ContenidoPropuesta;
+  const vetados = new Set(
+    ((f.material_vetado as string[] | null) ?? []).map((x) => x.toLowerCase()),
+  );
+  const contenido = sinPasajesVetados(f.contenido as ContenidoPropuesta, vetados);
+  const original = sinPasajesVetados(f.contenido_original as ContenidoPropuesta, vetados);
   // El material lo recompone la CAPACIDAD, que es lo que decide qué leyó el modelo. Con la
   // columna del ancla no bastaba: dos capacidades pueden colgar del mismo reto y citar cosas
   // distintas —C0 la formulación, una posterior la evidencia codificada—, así que indexarlo
@@ -2280,8 +2314,25 @@ export async function panelPropuestas(
     // honesta cuando el panel no sabe juzgar el ancla.
     const proyeccion = proyeccionDelPanel(tx);
 
+    /*
+     * Y QUÉ DOCUMENTOS CITADOS NO PUEDE RECIBIR QUIEN LEE.
+     *
+     * El contenido guarda el `fragmento` LITERAL de cada cita —texto copiado del documento—, y
+     * esta pantalla la lee también quien no cura: dice con esas palabras que puede «ver qué se
+     * propuso, con qué citas y quién lo decidió». Una columna no se recorta con RLS, así que se
+     * recorta al proyectar, con el mismo predicado que gobierna todo el material (RF-03.10).
+     *
+     * Se buscan por la FORMA del contenido —«$.**.evidenciaId», todo objeto que nombre un
+     * documento a cualquier profundidad— y no por una lista de rutas por capacidad: las de C2
+     * viven dentro de cada afirmación y las de C4 dentro de cada hallazgo, y una lista escrita a
+     * mano dejaría fuera a la capacidad que llegue mañana sin decirlo.
+     */
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, ${proyeccion.columnas},
+             (select coalesce(array_agg(distinct (x #>> '{}')), '{}')
+                from jsonb_path_query(p.contenido, '$.**.evidenciaId') x
+               where not material_evidencia_visible((x #>> '{}')::uuid, p.workspace_id))
+               as material_vetado,
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen, p.huella_material,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,
              coalesce(${proyeccion.titulos}) as ancla_titulo,

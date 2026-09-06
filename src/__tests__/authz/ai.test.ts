@@ -10167,16 +10167,21 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * derecho de uso seguía leyendo el pasaje directamente de la propuesta —que además es
    * inmutable por SYS-17, así que no se puede limpiar después—.
    *
-   * No se puede recortar una COLUMNA con RLS, así que la propuesta se cierra por FILA a quien
-   * trabaja con ella. Y se puede porque su único lector fuera del panel es la proyección de
-   * gobernanza, que pasa por las dos funciones recortadoras: no se esconde nada que alguien
-   * tuviera que ver, y eso es lo que mide la sonda de arriba.
+   * Una COLUMNA no se recorta con RLS. Mi primer arreglo cerró la FILA por rol y estaba mal:
+   * la pantalla de propuestas dice, con esas palabras, que quien no cura «puede ver qué se
+   * propuso, con qué citas y quién lo decidió», así que cerrarla vaciaba una lectura DECLARADA
+   * —el recuento de pendientes y el historial de lo decidido—. Yo afirmé que no escondía nada
+   * que alguien tuviera que ver: medí los lectores SQL y no la ruta.
    *
-   * La regla no es de C4: el `fragmento` de C2 vive igual en su contenido. Por eso se afirma
-   * además que la política no nombra ninguna capacidad — una puerta escrita para una capacidad
-   * es exactamente lo que este fichero lleva pagando cuatro veces.
+   * El recorte va donde la propuesta se PROYECTA, y por eso esta sonda mide las DOS mitades: la
+   * propuesta sigue llegando, y el pasaje no. La identidad del documento tampoco se toca —el
+   * `evidenciaId` sigue ahí—, porque SYS-14 exige poder explicar el bloqueo y borrar la cita
+   * entera diría que la propuesta no citó nada.
+   *
+   * La regla no es de C4: el `fragmento` de C2 vive igual en su contenido, y por eso el recorte
+   * busca por la FORMA —un objeto con `evidenciaId` ES una cita— y no por rutas por capacidad.
    */
-  it('C4: el contenido de una propuesta no se lee sin permiso sobre el material', async () => {
+  it('C4: el pasaje de una propuesta se recorta para quien no puede recibir el material', async () => {
     await enWorkspaceLimpio('c4-propuesta-por-rol', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();
       const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
@@ -10223,27 +10228,38 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             anclaId: conceptoId,
           }),
       );
-      const pasajeEnPropuesta = (quien: string) =>
-        conUsuario(quien, (tx) => tx`select contenido #>> '{hallazgos,0,citas,0,fragmento}' as f
-          from propuesta_ai where workspace_id = ${wsC} and capacidad = 'C4'`);
+      const enElPanel = async (quien: string) => {
+        const p = (await panelPropuestas(quien, wsC)).pendientes.find((x) => x.capacidad === 'C4');
+        const c = p?.contenido as ContenidoRevisionSimulada | undefined;
+        return { hay: p !== undefined, cita: c?.hallazgos[0]?.citas[0] };
+      };
 
-      // Quien cura lo ve: es su mesa de trabajo, y sin esto el panel entero se quedaría vacío.
-      expect((await pasajeEnPropuesta(curadorId)).map((r) => r.f)).toEqual(['No entrego la cédula']);
-      // Y quien no trabaja con propuestas no las lee, tenga o no el derecho sobre el documento:
-      // el pasaje literal está dentro, y una columna no se recorta con RLS.
-      expect(
-        await pasajeEnPropuesta(stakeId),
-        'el pasaje literal de la propuesta se lee sin permiso sobre el material que copia',
-      ).toHaveLength(0);
+      // Con el derecho vigente, quien no cura ve la propuesta ENTERA: es la lectura que la
+      // pantalla declara, y sin esta mitad el arreglo sería esconderle el trabajo.
+      const antes = await enElPanel(stakeId);
+      expect(antes.hay).toBe(true);
+      expect(antes.cita!.fragmento).toBe('No entrego la cédula');
 
-      // Y la puerta no está escrita para una capacidad: el `fragmento` de C2 vive igual en su
-      // contenido, y una regla escrita para C4 dejaría a las demás fuera sin decirlo.
-      const [pol] = await admin`select pg_get_expr(polqual, polrelid) as expr from pg_policy
-        where polrelid = 'propuesta_ai'::regclass and polname = 'propuesta_select'`;
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno'
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+
+      // Quien cura lo sigue viendo: es su mesa de trabajo.
+      const paraCurador = await enElPanel(curadorId);
+      expect(paraCurador.cita!.fragmento).toBe('No entrego la cédula');
+
+      const despues = await enElPanel(stakeId);
       expect(
-        pol!.expr as string,
-        'la política de lectura de propuestas nombra una capacidad: las demás quedan fuera de la regla',
-      ).not.toMatch(/capacidad/i);
+        despues.hay,
+        'la propuesta desapareció entera: la pantalla declara que quien no cura puede ver qué se propuso',
+      ).toBe(true);
+      expect(
+        despues.cita!.fragmento,
+        'el pasaje literal de la propuesta se sigue entregando sin permiso sobre el material que copia',
+      ).toBeNull();
+      expect(despues.cita!.localizacion).toBeNull();
+      // Y la IDENTIDAD del documento no se toca: sin ella no se puede explicar el bloqueo, y
+      // borrar la cita entera diría que la propuesta no citó nada.
+      expect(despues.cita!.evidenciaId).toBe(evA);
     });
   });
 

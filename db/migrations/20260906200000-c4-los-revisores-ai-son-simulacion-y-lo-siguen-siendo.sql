@@ -2994,22 +2994,26 @@ end $function$
 -- directamente de la propuesta, que además es inmutable por SYS-17 y por tanto no se puede
 -- limpiar después.
 --
--- No se puede recortar una COLUMNA con RLS, así que la propuesta se cierra por fila a quien
--- trabaja con ella. Y se puede: el único lector de `propuesta_ai` fuera del panel de propuestas
--- —que es la mesa de trabajo de quien cura— es la proyección de gobernanza, y esa pasa ahora
--- por las dos funciones de abajo. No se esconde nada que alguien tuviera que ver.
+-- Y NO se cierra la fila por rol, que fue mi primer intento y estaba mal. La pantalla de
+-- propuestas dice, con esas palabras, que quien no cura «puede ver qué se propuso, con qué
+-- citas y quién lo decidió»: es una lectura DECLARADA, con los controles de decisión apagados,
+-- no un descuido. Cerrar la fila la vaciaba entera —el recuento de pendientes y el historial de
+-- lo decidido— y yo afirmé que no escondía nada que alguien tuviera que ver sin haberlo medido.
+-- Medí los lectores SQL y no la ruta.
 --
--- Los tres roles son los mismos de `material_evidencia_visible`, y por la misma razón que allí:
--- la boutique cura, y `admin-cliente` administra los datos y exporta el archivo completo
--- (SYS-04). Se escribe con la función y no repitiendo la lista, para que el día que ese
--- conjunto cambie, cambie en un sitio.
-drop policy propuesta_select on propuesta_ai;
-create policy propuesta_select on propuesta_ai
-  for select using (
-    is_workspace_member(app_user_id(), workspace_id)
-    and workspace_role(app_user_id(), workspace_id)
-          in ('lead-boutique', 'disenador', 'admin-cliente')
-  );
+-- Una COLUMNA no se recorta con RLS, así que el recorte vive donde la propuesta se PROYECTA: el
+-- panel devuelve el contenido con el pasaje en null para quien no puede recibir ese material,
+-- igual que ya hacía la proyección de gobernanza. Se busca por la FORMA —todo objeto del JSON
+-- que lleve un `evidenciaId`, a cualquier profundidad— y no por una lista de rutas por
+-- capacidad, que es la enumeración escrita a mano que este fichero lleva pagando cuatro veces.
+--
+-- LO QUE ESO NO CIERRA, dicho aquí porque no cerrarlo en silencio sería peor: la superficie SQL
+-- concedida al rol de la aplicación sigue devolviendo `propuesta_ai.contenido` entero. Cerrarla
+-- de verdad pide revocar el privilegio de la COLUMNA y hacer pasar por un lector recortador los
+-- NUEVE sitios que hoy leen ese campo —la rotación de C4, el estado del ancla del panel, la
+-- huella del material, los caminos de C2, C3 y C6, el insert y la aceptación—, y eso no es de
+-- C4: el `fragmento` de C2 vive en su contenido desde que C2 citó, y el cambio toca a las
+-- nueve capacidades por igual. Queda como hilo abierto, no como algo hecho.
 
 -- ── Las dos lecturas de una cita para quien no trabaja con propuestas ──
 --

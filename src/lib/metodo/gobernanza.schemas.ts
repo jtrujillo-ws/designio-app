@@ -219,7 +219,21 @@ export type RevisionSimuladaDeConcepto = {
      * enseñaba. La escrita a mano (SYS-21) no tiene de dónde sacarlo: llega solo el título, y
      * los dos campos en `null`, que es un hecho y no una ausencia.
      */
-    citas: { evidenciaTitulo: string; fragmento: string | null; localizacion: string | null }[];
+    citas: {
+      evidenciaTitulo: string;
+      fragmento: string | null;
+      localizacion: string | null;
+      /**
+       * Si ese documento SIGUE pudiendo citarse al cliente (DR001).
+       *
+       * El enlace no se puede quitar después del pasa/muere —su política de DELETE pide
+       * concepto `candidato`—, así que una cita cuyo derecho se retira se queda ahí para
+       * siempre. Enseñarla igual la presenta como sostén actual de una decisión; borrarla de
+       * la vista borraría que el hallazgo TUVO apoyo. Se dice: el título se queda —ya se
+       * publica en el tablero de gobernanza— y el pasaje se retira con su motivo.
+       */
+      citable: boolean;
+    }[];
   }[];
   /** Lo único que esta sesión le entrega a la etapa 4: qué ir a probar con personas. */
   preguntas: {

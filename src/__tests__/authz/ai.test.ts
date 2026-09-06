@@ -8153,11 +8153,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // La misma proporción GRITADA: pasaba las dos capas, que es como no tener ninguna.
       '6 DE CADA 10 abandonan aquí',
       '6 De Cada 10 abandonan aquí',
+      // El mismo porcentaje DELETREADO, y la misma proporción con BARRA: dos puertas más a
+      // lo mismo, y las dos capas las dejaban abiertas igual.
+      '70 por ciento de los desconfiados abandonaría',
+      '70 porciento de acuerdo',
+      '6/10 abandonan aquí',
+      'una proporción de 1/3 en la muestra',
       // Y NO mediciones: identificadores y códigos con un número pegado. Las dos las aceptan.
       'La versión v2r100% del prototipo',
       'La norma ISO9001% del proveedor',
       'Sin un solo número en toda la frase',
       'id3de cada4 no es una proporción',
+      /*
+       * Los cuatro que la barra NO puede confundir con una medición: una fecha, una ruta, una
+       * versión y el «siempre» de 24/7. Rechazar cualquiera tira el lote entero con un motivo
+       * de SYS-20 que no aplica, que es el falso bloqueo que ya costó una ronda con `v2r100%`.
+       */
+      'La sesión del 6/10/2026 con el participante',
+      'Lo vio en https://ejemplo.test/a/1/2 y no volvió',
+      'La versión 1/2/3 del flujo antiguo',
+      'Quiere soporte 24/7 y no lo dice de otra forma',
     ];
     const enLaBase = await Promise.all(
       casos.map(async (t) => {
@@ -8194,9 +8209,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       }),
     );
     expect(enElContrato).toEqual(enLaBase);
-    // Y que la sonda mida algo: los cuatro primeros se rechazan, los cuatro últimos no.
+    /*
+     * Y que la sonda mida algo, en los DOS sentidos y en el orden en que están escritos: diez
+     * mediciones que las dos capas rechazan y ocho textos legítimos que las dos aceptan. El
+     * vector escrito a mano es a propósito: si una de las dos capas se relaja, la igualdad de
+     * arriba sigue pasando —las dos dirían lo mismo— y sólo esto lo nota.
+     */
     expect(enLaBase).toEqual([
-      false, false, false, false, false, false, true, true, true, true,
+      false, false, false, false, false, false, false, false, false, false,
+      true, true, true, true, true, true, true, true,
     ]);
   });
 
@@ -8693,6 +8714,27 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       ).toEqual(['Entrevista D-01']);
       // Y la que queda conserva su pasaje: lo que se cruza es la lista, no el testimonio.
       expect(despues.hallazgos[0]!.citas[0]!.fragmento).toBe('No entrego la cédula');
+      expect(despues.hallazgos[0]!.citas[0]!.citable).toBe(true);
+
+      /*
+       * Y EL DERECHO QUE SE RETIRA SIN QUITAR EL ENLACE, que es la otra mitad y la que no se
+       * puede limpiar después: la política de DELETE de la cita pide concepto `candidato`, así
+       * que en cuanto se firma el pasa/muere el enlace ya no se quita. Sin releer el permiso,
+       * ese pasaje se quedaría para siempre presentado como sostén ACTUAL de la decisión.
+       *
+       * Se dice en vez de esconderse: el título se queda —ya se publica en el tablero de
+       * gobernanza— y el pasaje se retira con su motivo. Borrar la cita entera borraría que el
+       * hallazgo TUVO apoyo, que es otra cosa y también falsa.
+       */
+      await admin`update derecho_uso
+           set estado = 'denegado', ambito = 'interno', vence_en = null
+         where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+      const sinDerecho = await leer();
+      const cita = sinDerecho.hallazgos[0]!.citas[0]!;
+      expect(cita.citable, 'la cita sin permiso sigue diciéndose citable').toBe(false);
+      expect(cita.fragmento, 'el pasaje sigue mostrándose sin permiso de cita').toBeNull();
+      expect(cita.localizacion).toBeNull();
+      expect(cita.evidenciaTitulo, 'el título tenía que quedarse').toBe('Entrevista D-01');
     });
   });
 
@@ -9772,6 +9814,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           evidenciaTitulo: 'Entrevista D-01',
           fragmento: 'No entrego la cédula',
           localizacion: 'resumen',
+          // Y si sigue pudiendo citarse, que es lo que decide si el pasaje se enseña.
+          citable: true,
         },
       ]);
       expect(rev!.hallazgos[1]!.citas, 'una hipótesis no cita nada').toEqual([]);

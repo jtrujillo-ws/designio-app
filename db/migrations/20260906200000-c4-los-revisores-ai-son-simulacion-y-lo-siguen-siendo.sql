@@ -64,8 +64,25 @@ language sql immutable as $fn$
   -- Y `!~*`, insensible a mayúsculas: «6 DE CADA 10» es la misma proporción sintética que
   -- «6 de cada 10», y con `!~` pasaba. Lo mismo en el contrato, que tenía la misma grieta: dos
   -- capas de validación dejando entrar lo mismo no son dos capas.
+  -- «70 por ciento» es el mismo porcentaje deletreado, y pasaba las dos capas. Igual que
+  -- «6 DE CADA 10»: dos capas que dejan entrar lo mismo no son dos capas.
+  --
+  -- Y la proporción con BARRA, que es «N de cada M» por otra puerta. Va con la comparación de
+  -- los dos números —«6/10» es proporción y «24/7» es «siempre»—, y con los bordes exigiendo
+  -- que no haya otra cifra ni otra barra pegada, para no confundir una fecha («6/10/2026»),
+  -- una ruta («/a/1/2») ni una versión («1/2/3») con una medición. El falso bloqueo cuesta el
+  -- lote entero, y ya costó una ronda con «v2r100%».
+  --
+  -- Lo que NO cubre, dicho a propósito: los numerales escritos («siete de cada diez»). Pide un
+  -- léxico de números en las dos capas, y a medias sería peor que la ausencia declarada.
   select p_texto !~ '\m\d+([.,]\d+)?\s*%'
-     and p_texto !~* '\m\d+\s+de\s+cada\s+\d+\M';
+     and p_texto !~* '\m\d+\s+de\s+cada\s+\d+\M'
+     and p_texto !~* '\m\d+([.,]\d+)?\s*por\s?ciento\M'
+     and not exists (
+       select 1
+       from regexp_matches(p_texto,
+              '(^|[^0-9/])([0-9]+)[[:space:]]*/[[:space:]]*([0-9]+)([^0-9/]|$)', 'g') as m
+       where (m[2])::numeric <= (m[3])::numeric);
 $fn$;
 
 revoke execute on function sin_agregado_sintetico(text) from public;

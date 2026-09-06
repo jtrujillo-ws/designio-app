@@ -501,8 +501,19 @@ export async function gobernanzaDeProyecto(
                                          'citas', coalesce(
                                            (select jsonb_agg(jsonb_build_object(
                                                      'evidenciaTitulo', e2.titulo,
-                                                     'fragmento', x ->> 'fragmento',
-                                                     'localizacion', x ->> 'localizacion')
+                                                     -- El pasaje SÓLO si el documento sigue
+                                                     -- pudiendo citarse. Ver «citable».
+                                                     'fragmento', case when evidencia_usable(
+                                                         (x ->> 'evidenciaId')::uuid,
+                                                         p2.workspace_id, 'cliente')
+                                                       then x ->> 'fragmento' end,
+                                                     'localizacion', case when evidencia_usable(
+                                                         (x ->> 'evidenciaId')::uuid,
+                                                         p2.workspace_id, 'cliente')
+                                                       then x ->> 'localizacion' end,
+                                                     'citable', evidencia_usable(
+                                                       (x ->> 'evidenciaId')::uuid,
+                                                       p2.workspace_id, 'cliente'))
                                                    order by ord)
                                               from propuesta_ai p2
                                               cross join lateral jsonb_array_elements(
@@ -533,7 +544,9 @@ export async function gobernanzaDeProyecto(
                                            -- propuesta detrás: el enlace es todo lo que hay.
                                            (select jsonb_agg(jsonb_build_object(
                                                      'evidenciaTitulo', e.titulo,
-                                                     'fragmento', null, 'localizacion', null)
+                                                     'fragmento', null, 'localizacion', null,
+                                                     'citable', evidencia_usable(
+                                                       he.evidencia_id, he.workspace_id, 'cliente'))
                                                    order by e.titulo)
                                               from hallazgo_simulado_evidencia he
                                               join evidencia e on e.id = he.evidencia_id

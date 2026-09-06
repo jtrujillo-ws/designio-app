@@ -658,12 +658,31 @@ export type ContenidoPostMortem = z.infer<typeof ContenidoPostMortemSchema>;
  * «6 de cada 10», y las dos capas la dejaban pasar igual. Dos validaciones que fallan en el
  * mismo sitio no son dos validaciones.
  */
-const AGREGADO_SINTETICO = /\b\d+([.,]\d+)?\s*%|\b\d+\s+de\s+cada\s+\d+\b/i;
+const AGREGADO_SINTETICO =
+  /\b\d+([.,]\d+)?\s*%|\b\d+\s+de\s+cada\s+\d+\b|\b\d+([.,]\d+)?\s*por\s?ciento\b/i;
+/*
+ * Y la proporción escrita con BARRA, que es «N de cada M» por otra puerta.
+ *
+ * No va en la regex de arriba porque hace falta comparar los dos números: `6/10` es una
+ * proporción y `24/7` es una forma de decir «siempre». Sin esa condición, una síntesis que
+ * dijera «quiere soporte 24/7» tiraba el lote entero con un motivo de SYS-20 que no aplica —
+ * el mismo falso bloqueo que costó una ronda con `v2r100%`.
+ *
+ * Y los bordes piden que no haya otra cifra ni otra barra pegada, para no confundir una fecha
+ * (`6/10/2026`), una ruta (`/a/1/2`) ni una versión (`1/2/3`) con una medición.
+ *
+ * Lo que esto NO cubre, y conviene decirlo: los numerales ESCRITOS —«siete de cada diez»—.
+ * Cazarlos pide un léxico de números en las dos capas, y un léxico a medias es peor que la
+ * ausencia declarada. El prompt lo prohíbe; aquí el corte llega hasta las cifras.
+ */
+const PROPORCION_CON_BARRA = /(?:^|[^0-9/])(\d+)\s*\/\s*(\d+)(?=[^0-9/]|$)/g;
+const tieneProporcionConBarra = (t: string): boolean =>
+  [...t.matchAll(PROPORCION_CON_BARRA)].some(([, a, b]) => Number(a) <= Number(b));
 const SIN_AGREGADO =
   'sin porcentajes ni proporciones inventadas: una revisión simulada no mide nada, y un número con forma de dato de campo se lee como investigación (SYS-20)';
 
 const TextoDeRevision = (max: number) =>
-  z.string().trim().min(1).max(max).refine((t) => !AGREGADO_SINTETICO.test(t), SIN_AGREGADO);
+  z.string().trim().min(1).max(max).refine((t) => !AGREGADO_SINTETICO.test(t) && !tieneProporcionConBarra(t), SIN_AGREGADO);
 
 export const ContenidoRevisionSimuladaSchema = z
   .object({
@@ -727,7 +746,7 @@ export const ContenidoRevisionSimuladaSchema = z
             .trim()
             .max(1000)
             .default('')
-            .refine((t) => !AGREGADO_SINTETICO.test(t), SIN_AGREGADO),
+            .refine((t) => !AGREGADO_SINTETICO.test(t) && !tieneProporcionConBarra(t), SIN_AGREGADO),
           /*
            * De qué hallazgo nace, POR SU ÍNDICE en la lista de arriba. Un índice y no un id
            * porque cuando esta respuesta se escribe los hallazgos todavía no existen como

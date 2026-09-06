@@ -32,6 +32,7 @@ import {
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { contenidoLegible, parsearContenido } from '@/lib/ai/ai.contenido';
+import { observabilidadAI } from '@/lib/ai/ai.observabilidad';
 import {
   arquetiposQueLlegaronEnteros,
   evidenciaQueLlegoAlRevisor,
@@ -12681,6 +12682,165 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * Las DOS columnas, que es la mitad que se olvida: cerrar sólo el fragmento deja la avería
    * idéntica una columna a la derecha, y eso ya está escrito en la tabla desde la ronda 29.
    */
+  /**
+   * RF-08.9 — EL LIBRO DE COSTOS TIENE LECTOR.
+   *
+   * `llamada_ai` guarda una línea por intento desde RF-09.14 y el único sitio que la
+   * consultaba era el tope diario del panel: coste, latencia, desenlace y modelo estaban
+   * escritos y no los leía nadie. Esta sonda mide las tres decisiones del lector, que son tres
+   * formas de no mentir con una cuenta:
+   *
+   * 1. Una línea EN VUELO no es un error. Nace `despachada` y se cierra después; contarla como
+   *    fallo hace que la tasa de error suba mientras el proveedor responde bien.
+   * 2. `costo_usd` nulo es «ese modelo no tenía tarifa registrada», no «salió gratis». Se suma
+   *    lo que se sabe y se cuenta aparte lo que no, porque sin ese segundo número nadie puede
+   *    saber si el total es el total.
+   * 3. Una propuesta PENDIENTE no es un rechazo. En el denominador de la aceptación haría que
+   *    el número empeorase solo por generar más, que es justo al revés.
+   */
+  it('RF-08.9: el lector del libro no cuenta en vuelo como error ni sin tarifa como gratis', async () => {
+    await enWorkspaceLimpio('obs-libro', async ({ ws: wsO, curadorId, retoId: retoO }) => {
+      const admin = sqlAdmin();
+      // El `motivo` no es relleno: la base exige que todo desenlace que NO sea
+      // `salida-valida` ni `despachada` traiga uno no vacío, porque una llamada pagada que
+      // falló sin decir por qué no se puede remediar.
+      const llamada = (resultado: string, costo: number | null, latencia: number | null) =>
+        admin`insert into llamada_ai
+          (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo,
+           costo_usd, latencia_ms, creado_por)
+          values (${wsO}, 'C0', ${retoO}, ${MODELO_PRIMARIO}, 'entorno', ${resultado},
+                  ${resultado === 'salida-valida' || resultado === 'despachada' ? '' : 'la respuesta no cumplió el esquema'},
+                  ${costo}, ${latencia}, ${curadorId})
+          returning id`.then((r) => r[0]!.id as string);
+
+      await llamada('salida-valida', 0.01, 100);
+      await llamada('salida-valida', 0.02, 300);
+      // Cerrada y FALLIDA, y además sin tarifa: las dos mitades a la vez.
+      await llamada('fuera-de-contrato', null, 500);
+      // Y una EN VUELO, que no es ninguna de las dos cosas.
+      await llamada('despachada', null, null);
+
+      const obs = await observabilidadAI(curadorId, wsO);
+      const c0 = obs.capacidades.find((c) => c.capacidad === 'C0')!;
+      expect(
+        {
+          cerradas: c0.llamadasCerradas,
+          enVuelo: c0.llamadasEnVuelo,
+          validas: c0.llamadasValidas,
+          sinTarifa: c0.llamadasSinTarifa,
+          costo: Number(c0.costoUsd.toFixed(2)),
+          tasaError: c0.tasaError,
+        },
+        'el lector cuenta la línea en vuelo, o suma el coste desconocido como cero',
+      ).toEqual({
+        cerradas: 3,
+        enVuelo: 1,
+        validas: 2,
+        sinTarifa: 1,
+        costo: 0.03,
+        tasaError: 1 / 3,
+      });
+      /*
+       * Las latencias, que ignoran los nulos por construcción de `percentile_cont` — medido
+       * antes de apoyarse en ello, porque tratarlos como cero hundiría el p50 justo cuando hay
+       * llamadas sin medir. Con 100, 300 y 500 el p50 es 300.
+       */
+      expect({ p50: c0.latenciaP50Ms, p95: c0.latenciaP95Ms }).toEqual({ p50: 300, p95: 480 });
+
+      /*
+       * Y una capacidad ACTIVA sin una sola llamada sale en cero, no ausente: «nadie la ha
+       * usado» es una respuesta, y su ausencia se leería como que la capacidad no existe.
+       */
+      expect(obs.capacidades.map((c) => c.capacidad)).toEqual(
+        expect.arrayContaining([...CAPACIDADES_ACTIVAS]),
+      );
+      const c7 = obs.capacidades.find((c) => c.capacidad === 'C7')!;
+      expect({ llamadas: c7.llamadasCerradas, error: c7.tasaError }).toEqual({
+        llamadas: 0,
+        // `null` y no cero: un 0 % de error sobre cero llamadas es un verde que nadie se ganó.
+        error: null,
+      });
+    });
+  });
+
+  /**
+   * Y la otra mitad del lector: los DENOMINADORES, que es donde una tasa miente sin que se note.
+   *
+   * Una propuesta pendiente no es un rechazo. Metida en el denominador de la aceptación, el
+   * número baja solo por generar más — o sea, empeora cuando el producto se usa, que es la
+   * peor forma de fallar para una métrica de salud. Y una capacidad que el registro NO cubre
+   * no se descarta: el CHECK de la base admite las diez de SPEC-08 y esta versión conoce
+   * nueve, así que una fila escrita por un servidor más nuevo se llevaría su GASTO fuera de
+   * la vista, que es exactamente lo que este lector existe para impedir.
+   */
+  it('RF-08.9: una propuesta pendiente no cuenta como rechazo, y una capacidad desconocida no se pierde', async () => {
+    await enWorkspaceLimpio('obs-denom', async ({ ws: wsO, curadorId, retoId: retoO }) => {
+      const admin = sqlAdmin();
+      const [ll] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsO}, 'C0', ${retoO}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId})
+        returning id`;
+      const propuesta = (estado: string, orden: number) =>
+        admin`insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, estado, revisada_por, revisada_en, creado_por)
+          values (${wsO}, 'C0', 'criterio-exito', ${retoO},
+                  ${admin.json(CONTENIDO_C0)}, ${admin.json(CONTENIDO_C0)},
+                  ${MODELO_PRIMARIO}, 'v-prueba', 'la formulación', '{}', 'entorno',
+                  ${ll!.id as string}, ${orden}, ${estado},
+                  ${estado === 'propuesta' ? null : curadorId},
+                  ${estado === 'propuesta' ? null : new Date()},
+                  ${curadorId})`;
+      // Una decidida y DOS sin mirar: con el denominador equivocado la tasa saldría 0/3.
+      await propuesta('rechazada', 0);
+      await propuesta('propuesta', 1);
+      await propuesta('propuesta', 2);
+
+      const obs = await observabilidadAI(curadorId, wsO);
+      const c0 = obs.capacidades.find((c) => c.capacidad === 'C0')!;
+      expect(
+        {
+          propuestas: c0.propuestas,
+          pendientes: c0.pendientes,
+          rechazadas: c0.rechazadas,
+          tasaAceptacion: c0.tasaAceptacion,
+          // `null` mientras no se haya materializado ninguna: no hay sobre qué dividir, y un
+          // 0 % de corrección sin nada aceptado diría que nadie corrige nada.
+          tasaCorreccion: c0.tasaCorreccion,
+        },
+        'las pendientes entraron en el denominador de la aceptación',
+      ).toEqual({
+        propuestas: 3,
+        pendientes: 2,
+        rechazadas: 1,
+        tasaAceptacion: 0,
+        tasaCorreccion: null,
+      });
+
+      /*
+       * Y la capacidad que el registro no conoce. `C1` está en el CHECK de la base —es C1-D,
+       * que no tiene implementación— así que es exactamente la fila que un servidor más nuevo
+       * escribiría: aparece, con su código por etiqueta y su gasto contado.
+       */
+      await admin`insert into llamada_ai
+        (workspace_id, capacidad, modelo, origen_key, resultado, costo_usd, creado_por)
+        values (${wsO}, 'C1', ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', 0.05,
+                ${curadorId})`;
+      const conDesconocida = await observabilidadAI(curadorId, wsO);
+      const c1 = conDesconocida.capacidades.find((c) => c.capacidad === 'C1');
+      expect(c1, 'una fila de una capacidad que esta versión no conoce se perdió del libro')
+        .toBeTruthy();
+      expect({ etiqueta: c1!.etiqueta, costo: Number(c1!.costoUsd) }).toEqual({
+        etiqueta: 'C1',
+        costo: 0.05,
+      });
+      // Y el total del workspace la incluye: si no, el gasto declarado sería menor que el real.
+      expect(Number(conDesconocida.total.costoUsd.toFixed(2))).toBe(0.05);
+    });
+  });
+
   it('C4: el pasaje del enlace materializado es uno de los que la propuesta dice', async () => {
     await enWorkspaceLimpio('c4-pasaje-sello', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(

@@ -1129,6 +1129,61 @@ export type PropuestaEnPanel = PropuestaEnPanelComun &
     | { contenidoLegible: false; contenido: null; contenidoOriginal: null }
   );
 
+/**
+ * RF-08.9 — lo que el libro de costos dice de UNA capacidad en este workspace.
+ *
+ * Los tres `null` NO son huecos, son respuestas distintas de un cero: `tasaError` es `null`
+ * cuando no hay ninguna llamada cerrada (un 0 % de error sobre cero llamadas es un verde que
+ * nadie se ha ganado), `tasaAceptacion` cuando nadie ha decidido todavía, y las latencias
+ * cuando ninguna línea la trae medida.
+ */
+export type ObservabilidadDeCapacidad = {
+  capacidad: string;
+  /** Del registro cuando esta versión conoce la capacidad; el código a secas cuando no. */
+  etiqueta: string;
+  /** Llamadas con desenlace. Las EN VUELO van aparte: mientras esperan no son un fallo. */
+  llamadasCerradas: number;
+  llamadasEnVuelo: number;
+  llamadasValidas: number;
+  /** Suma de lo que SÍ tiene tarifa registrada. Lo que no la tiene se cuenta al lado. */
+  costoUsd: number;
+  /**
+   * Llamadas cerradas sin coste conocido: el modelo no tenía tarifa registrada cuando se
+   * llamó. Viaja porque sin este número nadie puede saber si `costoUsd` es el total o una
+   * parte, y «no se sabe» no es «salió gratis».
+   */
+  llamadasSinTarifa: number;
+  latenciaP50Ms: number | null;
+  /** El percentil 95, porque una alarma de latencia es sobre la cola: una media se la come
+   * el resto de la distribución y deja de avisar justo cuando hay que avisar. */
+  latenciaP95Ms: number | null;
+  tasaError: number | null;
+  propuestas: number;
+  pendientes: number;
+  aceptadas: number;
+  corregidas: number;
+  rechazadas: number;
+  /** Sobre las DECIDIDAS: una propuesta que nadie ha mirado no es un rechazo, y meterla en el
+   * denominador hace que el número empeore solo por generar más. */
+  tasaAceptacion: number | null;
+  /** Una de las cuatro de RF-08.7, y sale del mismo recuento: la base garantiza que una
+   * propuesta `aceptada` tiene el contenido idéntico al original, así que «se corrigió» es
+   * el estado y no un diff de jsonb. Denominador: las que se materializaron. */
+  tasaCorreccion: number | null;
+};
+
+export type ObservabilidadAI = {
+  workspaceId: string;
+  capacidades: ObservabilidadDeCapacidad[];
+  total: {
+    llamadasCerradas: number;
+    llamadasEnVuelo: number;
+    costoUsd: number;
+    llamadasSinTarifa: number;
+    propuestas: number;
+  };
+};
+
 export type CandidatoAncla = {
   id: string;
   titulo: string;

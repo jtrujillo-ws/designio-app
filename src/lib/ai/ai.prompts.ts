@@ -31,7 +31,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-06.19';
+export const PROMPT_VERSION = 'ai-2026-09-06.21';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -758,6 +758,17 @@ function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): {
    * del elemento SOBREVIVIÓ al recorte. Por eso basta con el final, no con el par.
    */
   finales: Map<string, number>;
+  /**
+   * Dónde ACABA cada sección del cuerpo, para que el aviso del recorte diga la verdad.
+   *
+   * La primera versión del aviso afirmaba que lo que faltaba era «la cola del tablero», y eso
+   * es cierto casi siempre —la conciliación va la última— pero no siempre: con una descripción
+   * de reto larga y cuatro lecturas cerca de su tope, el corte cae DENTRO del bloque de
+   * lecturas y el tablero no llega a empezar. Un aviso que nombra la sección equivocada es peor
+   * que uno genérico: le dice al modelo que las lecturas que ve son todas, y esa es
+   * exactamente la afirmación falsa que el aviso existía para impedir.
+   */
+  secciones: { lecturas: number; conciliacion: number };
 } {
   const partes = [expediente.descripcion, '', 'LECTURA DE CADA CRITERIO DE ÉXITO'];
   if (expediente.lecturas.length === 0) {
@@ -778,6 +789,7 @@ function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): {
         : `  Sin dato: ${l.sinDatosMotivo}`,
     );
   }
+  const finLecturas = partes.join('\n').length;
   partes.push('', 'CONCILIACIÓN: QUÉ SE APROBÓ Y QUÉ QUEDÓ');
   if (expediente.conciliacion.length === 0) {
     partes.push('(este reto no tiene design versions a cargo de sus proyectos)');
@@ -819,7 +831,11 @@ function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): {
       finales.set(e.elementoId, largo);
     }
   }
-  return { texto: partes.join('\n'), finales };
+  return {
+    texto: partes.join('\n'),
+    finales,
+    secciones: { lecturas: finLecturas, conciliacion: largo },
+  };
 }
 
 /**
@@ -832,6 +848,24 @@ function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): {
  * sin verlo: manda a alguien a revisar un release que el modelo nunca leyó, con la firma de un
  * post mortem detrás.
  */
+/**
+ * Qué SECCIONES del expediente sobrevivieron enteras al recorte.
+ *
+ * El aviso del prompt se compone con esto y no con una suposición. «Lo que falta es la cola del
+ * tablero» es cierto casi siempre —la conciliación va la última—, y deja de serlo con una
+ * descripción de reto larga y lecturas cerca de su tope: entonces el corte cae dentro del
+ * bloque de lecturas y el tablero no llega a empezar. Nombrar la sección equivocada es peor que
+ * no nombrar ninguna: le dice al modelo que las lecturas que ve son todas.
+ */
+export function seccionesQueLlegaronAlPostMortem(expediente: ExpedienteDePostMortem): {
+  lecturas: boolean;
+  conciliacion: boolean;
+} {
+  const { texto, secciones } = cuerpoDePostMortem(expediente);
+  const cabe = materialQueVeElModelo(texto).length;
+  return { lecturas: secciones.lecturas <= cabe, conciliacion: secciones.conciliacion <= cabe };
+}
+
 export function elementosQueLlegaronAlModelo(expediente: ExpedienteDePostMortem): {
   ids: string[];
 } {
@@ -1439,6 +1473,29 @@ function bloqueDeEntradas(entradas: EntradasDelRegistry): {
  * Y el veredicto no se pide en ninguna de las dos: no está en el esquema, no está en el texto,
  * y esta nota existe para que la próxima vuelta no lo añada «para que quede completo».
  */
+/**
+ * El aviso del recorte, redactado sobre lo que SE CORTÓ de verdad.
+ *
+ * Dos mitades en las dos ramas, y las dos hacen falta:
+ *
+ *  · «No señales lo que no ves» la respalda una puerta: una desviación sobre un elemento que no
+ *    llegó descarta el lote. Pero la puerta solo rechaza lo que YA llegó, con la llamada
+ *    pagada; el aviso es lo único que puede cambiar lo que el modelo devuelve.
+ *
+ *  · «No des por completo ningún recuento» no la corta nada. «Tres de doce elementos se
+ *    desviaron» sobre una cola truncada es una frase entera, comprobable y falsa: no nombra
+ *    ningún elemento, así que ninguna puerta la ve. Si el aviso no la nombra, no la nombra
+ *    nadie — y por eso está también en la rama de las lecturas, donde «ningún criterio se
+ *    quedó sin dato» sería la misma avería con otra cara.
+ */
+function avisoDelRecorteDelPostMortem(expediente: ExpedienteDePostMortem): string {
+  const llegaron = seccionesQueLlegaronAlPostMortem(expediente);
+  const falta = llegaron.lecturas
+    ? 'la COLA DEL TABLERO de conciliación'
+    : 'parte de las LECTURAS DE CRITERIO y el TABLERO de conciliación ENTERO';
+  return `(El material se truncó a ${MAX_MATERIAL} caracteres y lo que falta es ${falta}: no señales desviaciones ni cites lecturas que no ves, y no des por completo ningún recuento —ni de lo desviado ni de los criterios—.)`;
+}
+
 export function promptPostMortem(expediente: ExpedienteDePostMortem): {
   usuario: string;
   alcanceResumen: string;
@@ -1454,8 +1511,26 @@ export function promptPostMortem(expediente: ExpedienteDePostMortem): {
       'Las desviaciones salen del tablero de conciliación y nombran el elemento por el id que va entre corchetes, copiado. No inventes elementos ni constataciones: lo que quedó distinto ya lo escribió quien lo miró, y tu lectura es por qué importa.',
       'Si un criterio no tiene dato, dilo así —con el motivo registrado— en vez de estimarlo.',
       'Cita literal del material lo que afirmes. Sin citas, la narrativa es prosa sobre datos que nadie puede comprobar.',
-    ].join('\n\n'),
-    alcanceResumen: `Post mortem de ${expediente.codigo}: ${expediente.lecturas.length} lecturas de criterio y ${elementos} elementos conciliados`,
+      /*
+       * Y el aviso del recorte, que C7 era la ÚNICA capacidad en no dar.
+       *
+       * Todas las demás le dicen al modelo que su material se truncó. Aquí no, y con la puerta
+       * que #49 le puso —una desviación sobre un elemento que no llegó descarta el LOTE— el
+       * silencio salía caro: el modelo seguiría nombrando la cola que no vio y el lote entero,
+       * pagado, se tiraría. Decírselo es lo único que puede cambiar lo que devuelve; la puerta
+       * solo puede rechazar lo que ya llegó.
+       *
+       * Nombra el TABLERO y no «el material» a secas porque es la conciliación la que se come
+       * el corte: va la última del cuerpo, así que es lo primero que se pierde. Y avisa de las
+       * dos cosas que la ausencia estropea —señalar lo que no ve, y dar por completo un
+       * recuento de lo desviado—, porque la segunda no la corta ninguna puerta: un «tres de
+       * doce elementos se desviaron» sobre una cola truncada es una frase entera y falsa.
+       */
+      material.truncado ? avisoDelRecorteDelPostMortem(expediente) : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `Post mortem de ${expediente.codigo}: ${expediente.lecturas.length} lecturas de criterio y ${elementos} elementos conciliados${material.truncado ? ', truncado' : ''}`,
   };
 }
 

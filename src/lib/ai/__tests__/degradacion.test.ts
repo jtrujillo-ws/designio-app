@@ -701,8 +701,8 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
    * del material guardado con el de hoy solo vale entre propuestas del mismo render.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-06.19';
-  const HUELLA_ANOTADA = '7f4ca963477e577b6eb9775eb6584923670b78d15c36d686f1e64d144079c4c1';
+  const VERSION_ANOTADA = 'ai-2026-09-06.21';
+  const HUELLA_ANOTADA = 'd8d2648349da74de1c5551aa37f57d7b16e0c2ed944559417b4048b303db8437';
 
   /**
    * Todo lo que define el contrato: lo que se le dice al modelo, la forma que se le exige y
@@ -1235,13 +1235,12 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     }),
 
     /*
-     * ── C4 y C7 ──
+     * ── C4 ──
      *
-     * Faltaban las dos, y no es un descuido menor: sin ellas la huella no cubría ni sus dos
-     * sistemas ni ninguna rama de sus renders, así que cambiar el prompt de C4 o el de C7 sin
-     * subir `PROMPT_VERSION` no rompía nada — que es exactamente lo único que esta huella
-     * existe para impedir. Lo dijo un cambio de esta rama: se tocó el prompt de C4 entero y la
-     * huella no se movió.
+     * Faltaba entera, como le pasó a C7 —que entró por su lado—: sin ella la huella no cubría ni
+     * su sistema ni ninguna rama de su render, así que cambiar el prompt de C4 sin subir
+     * `PROMPT_VERSION` no rompía nada, que es lo único que esta huella existe para impedir. Lo
+     * dijo un cambio de esta rama: se tocó el prompt de C4 entero y la huella no se movió.
      */
     revisionLlana: promptRevision(CONCEPTO_DE_PRUEBA),
     // Por encima del tope del lote: el material dice qué lentes deja fuera y el prompt pide
@@ -1269,10 +1268,43 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     revisionFichaVacia: promptRevision({ ...CONCEPTO_DE_PRUEBA, titulo: '' }),
     revisionConDelimitador: promptRevision({ ...CONCEPTO_DE_PRUEBA, titulo: CON_DELIMITADOR }),
 
+    /*
+     * ── C7 ──
+     *
+     * Faltaba entera: ni su sistema ni ninguna rama de su render entraban en la huella, así que
+     * desde que C7 se integró se podía cambiar su prompt sin subir `PROMPT_VERSION` y sin que
+     * nada lo dijera — que es lo único que esta huella existe para impedir. Lo dijo este mismo
+     * cambio: se tocó el prompt de C7 entero y la huella no se movió.
+     */
     postMortemLlano: promptPostMortem(EXPEDIENTE_DE_PRUEBA),
-    // Sin lecturas de criterio: el bloque se queda con su rótulo y sin nada debajo.
+    // Sin lecturas de criterio: el bloque se queda con su rótulo y su «(ninguna registrada)».
     postMortemSinLecturas: promptPostMortem({ ...EXPEDIENTE_DE_PRUEBA, lecturas: [] }),
-    postMortemTruncado: promptPostMortem({ ...EXPEDIENTE_DE_PRUEBA, descripcion: CUERPO_LARGO }),
+    /*
+     * Y las DOS formas del recorte, que dicen cosas distintas: con la descripción larga se corta
+     * la cola del tablero, y con las lecturas infladas el corte cae dentro de ELLAS y el tablero
+     * no llega a empezar. El aviso tiene que nombrar la sección correcta en cada caso.
+     */
+    postMortemTruncado: promptPostMortem({
+      ...EXPEDIENTE_DE_PRUEBA,
+      conciliacion: [
+        {
+          ...EXPEDIENTE_DE_PRUEBA.conciliacion[0]!,
+          elementos: Array.from({ length: 200 }, (_, i) => ({
+            ...EXPEDIENTE_DE_PRUEBA.conciliacion[0]!.elementos[0]!,
+            elementoId: `a7b8c9d0-0000-4000-8000-${String(i).padStart(12, '0')}`,
+            elementoTitulo: `Elemento ${i}`,
+          })),
+        },
+      ],
+    }),
+    postMortemLecturasCortadas: promptPostMortem({
+      ...EXPEDIENTE_DE_PRUEBA,
+      lecturas: Array.from({ length: 40 }, (_, i) => ({
+        ...EXPEDIENTE_DE_PRUEBA.lecturas[0]!,
+        criterioId: `c3d4e5f6-0000-4000-8000-${String(i).padStart(12, '0')}`,
+        objetivo: 'o'.repeat(600),
+      })),
+    }),
     postMortemFichaVacia: promptPostMortem({ ...EXPEDIENTE_DE_PRUEBA, codigo: '', titulo: '' }),
     postMortemConDelimitador: promptPostMortem({
       ...EXPEDIENTE_DE_PRUEBA,
@@ -1470,18 +1502,20 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
     expect(RAMAS.revisionFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.revisionConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
 
-    // C7. La conciliación llega con sus elementos por id, el bloque de lecturas desaparece
-    // cuando no hay ninguna, y el recorte avisa igual que en las demás.
+
+    /*
+     * C7. La conciliación llega con sus elementos por id, el bloque de lecturas cambia cuando no
+     * hay ninguna, y —lo que este cambio añade— el aviso del recorte NOMBRA LA SECCIÓN QUE DE
+     * VERDAD SE CORTÓ, que es distinta en las dos ramas truncadas.
+     */
     expect(RAMAS.postMortemLlano.usuario).toContain('[a7b8c9d0-0000-4000-8000-000000000001]');
     expect(RAMAS.postMortemLlano.usuario).toContain('Tiempo de verificación');
-    expect(RAMAS.postMortemSinLecturas.usuario).not.toContain('Tiempo de verificación');
-    /*
-     * El recorte de C7 se afirma por lo que SÍ es cierto hoy: el render cambia. Y aquí queda
-     * dicho lo que no lo es — C7 es la única capacidad cuyo prompt NO avisa al modelo de que su
-     * material se truncó—; se arregla donde vive el resto del recorte de C7, no aquí, porque
-     * tocar su prompt desde esta rama es escribir la misma corrección en dos sitios.
-     */
-    expect(RAMAS.postMortemTruncado.usuario).not.toBe(RAMAS.postMortemLlano.usuario);
+    expect(RAMAS.postMortemLlano.usuario).not.toContain('se truncó');
+    expect(RAMAS.postMortemSinLecturas.usuario).toContain('(ninguna registrada todavía)');
+    expect(RAMAS.postMortemTruncado.usuario).toContain('COLA DEL TABLERO');
+    expect(RAMAS.postMortemTruncado.usuario).not.toContain('LECTURAS DE CRITERIO');
+    expect(RAMAS.postMortemLecturasCortadas.usuario).toContain('parte de las LECTURAS DE CRITERIO');
+    expect(RAMAS.postMortemLecturasCortadas.usuario).toContain('TABLERO de conciliación ENTERO');
     expect(RAMAS.postMortemFichaVacia.usuario).toContain('(sin dato)');
     expect(RAMAS.postMortemConDelimitador.usuario.match(/<material-no-confiable>/g)).toHaveLength(1);
 

@@ -1,12 +1,12 @@
 ---
 status: current
-last_verified: 2026-09-05
+last_verified: 2026-09-06
 audience: mixed (producto, boutique, ingeniería, comercial, revisores de seguridad)
 language: es
 ---
 
 <!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta b28d9b7, 2026-09-05). -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta f80c76a, 2026-09-06). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -17,10 +17,11 @@ language: es
 > cumplimiento. Debe dar a cualquier lector una idea clara de **qué es Designio, qué incluye hoy,
 > qué está en vuelo y qué está diseñado pero todavía no construido**.
 >
-> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-05, punta `b28d9b7`
+> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `f80c76a`
 > (tras fusionar [#39](https://github.com/jtrujillo-ws/designio-app/pull/39),
-> [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) y
-> [#45](https://github.com/jtrujillo-ws/designio-app/pull/45)). Donde el paquete de diseño y el código
+> [#43](https://github.com/jtrujillo-ws/designio-app/pull/43),
+> [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) y
+> [#46](https://github.com/jtrujillo-ws/designio-app/pull/46)). Donde el paquete de diseño y el código
 > difieren, **gana el código** y la diferencia se anota en el apéndice 94.
 >
 > Generado: 2026-09-05 — rama `claude/designio-doc-sequentia-base-j0y13b`.
@@ -54,7 +55,7 @@ capítulo:
 | Marca | Significado |
 |---|---|
 | **Construido** | Existe en la rama `agents`, con migración, server function, pantalla y pruebas |
-| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43 y #45 se fusionaron el 2026-09-05) |
+| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45 y #46 se fusionaron el 2026-09-05) |
 | **Diseñado** | Está especificado en el paquete de diseño (`docs/05-specs/`, `docs/06-diseno-tecnico/`) pero no hay código que lo materialice |
 | **Fuera del MVP** | Excluido explícitamente por ADR-0014 o por la spec correspondiente |
 
@@ -213,7 +214,7 @@ flowchart TD
     AI["Pipeline PropuestaAI<br/>src/lib/ai"]
   end
   subgraph Datos["PostgreSQL 15 (Railway)"]
-    PG[("53 migraciones forward-only<br/>RLS activo en toda tabla<br/>guards SECURITY DEFINER<br/>evento_dominio append-only")]
+    PG[("54 migraciones forward-only<br/>RLS activo en toda tabla<br/>guards SECURITY DEFINER<br/>evento_dominio append-only")]
   end
   subgraph Ext["Externos"]
     LLM["SDK Anthropic<br/>claude-sonnet-5 → claude-sonnet-4-6"]
@@ -236,7 +237,7 @@ server function. El scheduler in-app y el object storage están diseñados pero 
 | CTX-01 Workspace e Identidad | Tenancy, usuarios, roles, segmentos, portal, auditoría, exportación, disposición, biblioteca del cliente | `auth`, `arbol`, `segmento`, `portal`, `exportacion`, `disposicion`, `memoria`, `aprobaciones`, `busqueda`, `workspace` (schemas) | Construido |
 | CTX-02 Evidencia y Conocimiento | Fuentes, evidencia, derechos, bandeja, insights, citas, contradicciones | `evidencia`, `insight` | Construido |
 | CTX-03 Método y Gobernanza | Retos, proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas | `metodo` (+ `gobernanza`), `loop` | Construido |
-| CTX-04 Diseño del Servicio | Servicio, catálogo, journeys tipados, oportunidades, conceptos, design versions | `journey`, `servicio` (oportunidades), design versions en `entrega` | Construido salvo conceptos (diseñado) |
+| CTX-04 Diseño del Servicio | Servicio, catálogo, journeys tipados, oportunidades, conceptos, design versions | `journey`, `servicio` (oportunidades), design versions en `entrega`; conceptos en `metodo/gobernanza` | Construido; el concepto tiene modelo, políticas y puerta de G4 en la base, pero todavía sin server function ni pantalla que lo cree o decida |
 | CTX-05 Entrega y Estado Efectivo | Releases, effective state, constataciones, conciliación | `entrega` | Construido |
 | CTX-06 Medición e Impacto | Metric Registry, snapshots, outcome review | `medicion` | Construido |
 | CTX-07 Biblioteca General | Conocimiento metodológico de la boutique | `biblioteca` (solo schemas; los checklists viven en `metodo.plantillas.ts`) | Diseñado |
@@ -311,7 +312,7 @@ flowchart TB
     T_ARB["servicio · reto · proyecto<br/>reto_servicio_afectado · catalogo_journey"]
     T_EVI["fuente · evidencia · item_importacion<br/>archivo_importado · derecho_uso<br/>consentimiento_item"]
     T_INS["insight · afirmacion · cita<br/>contradiccion"]
-    T_MET["criterio_exito · etapa · gate<br/>checklist_item · decision · arquetipo<br/>reapertura · oportunidad"]
+    T_MET["criterio_exito · etapa · gate<br/>checklist_item · decision · arquetipo<br/>reapertura · oportunidad · concepto"]
     T_JOU["journey · journey_nodo<br/>journey_arista · journey_snapshot"]
     T_ENT["design_version · elemento_cambio<br/>release · effective_state · constatacion"]
     T_MED["metric_registry · entrada_kpi<br/>snapshot · outcome_review"]
@@ -392,7 +393,7 @@ identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de o
 | Evidencia y derechos de uso | `/evidencia` | `evidencia` | `evidencia`, `derecho_uso`, `fuente` | 03 |
 | Insights, citas y contradicciones | `/insights` | `insight` | `insight`, `afirmacion`, `cita`, `contradiccion` | 04 |
 | Retos, criterios, etapas, gates, checklist | `/proyecto/$id` | `metodo` | `reto`, `criterio_exito`, `etapa_instancia`, `gate_instancia`, `checklist_item` | 05 |
-| Decisiones, arquetipos, reaperturas | `/proyecto/$id` | `metodo/gobernanza` | `decision`, `decision_insight`, `arquetipo`, `reapertura_etapa` | 05 |
+| Decisiones, arquetipos, reaperturas, conceptos | `/proyecto/$id` | `metodo/gobernanza` | `decision`, `decision_insight`, `arquetipo`, `reapertura_etapa`, `concepto`, `concepto_evidencia` (solo lectura desde la pantalla) | 05 |
 | Portafolio de oportunidades HMW | `/oportunidades` | `servicio/oportunidad` | `oportunidad`, `oportunidad_insight` | 06 |
 | Journeys, blueprints, validación, snapshot | `/journeys`, `/journey/$id` | `journey` | `journey`, `journey_nodo`, `journey_arista`, `journey_nodo_evidencia`, `journey_snapshot`, `catalogo_journey` | 07 |
 | Design versions, diff, releases, effective state, conciliación | `/design-versions`, `/design-version/$id` | `entrega` | `design_version`, `elemento_cambio`, `release`, `release_elemento`, `effective_state`, `constatacion` | 08 |
@@ -423,7 +424,7 @@ identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de o
    tokens, costo y modelo; cada propuesta conserva su contenido original aunque se corrija; sin
    proveedor la plataforma funciona igual y lo dice (con la excepción de J2 anotada arriba).
 
-## Estado del producto de un vistazo (2026-09-05)
+## Estado del producto de un vistazo (2026-09-06)
 
 | Bloque | Construido | En vuelo | Diseñado, pendiente |
 |---|---|---|---|
@@ -431,7 +432,7 @@ identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de o
 | Árbol, servicios, segmentos, búsqueda, biblioteca del cliente | ✔ | | Servicios afectados adicionales de un reto en la UI |
 | Bandeja, evidencia, adjuntos, derechos de uso | ✔ | | Escaneo de malware, object storage, transcripción y diarización (C1) |
 | Insights, citas, contradicciones | ✔ | | Clustering (fuera del MVP) |
-| Método: proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas | ✔ | | **Pantalla de J2**: crear un reto, definir criterios a mano y activarlo con perfil existen como server functions pero ninguna pantalla las llama todavía (los criterios entran hoy por C0 o por seed); conceptos y resultados de test (etapa 4, G4 con umbral) |
+| Método: proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas | ✔ | | **Pantalla de J2**: crear un reto, definir criterios a mano y activarlo con perfil existen como server functions pero ninguna pantalla las llama todavía (los criterios entran hoy por C0 o por seed). **Pantalla de la etapa 4**: el concepto, su evidencia de test, su umbral, su N/A y su veredicto existen en la base con políticas y puerta de G4 (#46), pero ninguna server function ni pantalla los crea o decide; mientras no exista, G4 aprueba como antes cuando el reto no tiene conceptos, y una decisión `pasa-muere` no puede registrarse desde la interfaz porque exige elegir un concepto |
 | Oportunidades HMW (con borrador AI de preguntas trazadas a insights, C3) y G3 sobre el portafolio | ✔ | | Serializar la carrera entre validar un insight y persistir un lote de C3 (deuda anotada en #45; C2 la comparte) |
 | Journeys, catálogo, Mermaid, carriles, validación, snapshot | ✔ | | Vista timeline y por actor |
 | Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | Detección AI de desviaciones (C7) |
@@ -690,8 +691,9 @@ módulo aparte (ADR-0007).
   **pendiente** o **N/A** con justificación y aprobación. No hay cuarto estado (SYS-11).
 - **Aprobar un gate** exige checklist sin pendientes, el rol correcto, y que la base no encuentre
   faltas: `gate_faltas_para_aprobar` devuelve la lista de motivos con código (criterios sin ventana
-  en G0, razonamiento sin respaldo, design version sin congelar en G5, registry sin firmar en G6,
-  conciliación incompleta en G7…). La pantalla **invoca** ese predicado en lugar de reproducirlo, así
+  en G0, razonamiento sin respaldo, concepto que avanza sin evidencia de test o sin umbral alcanzado
+  en G4, design version sin congelar en G5, registry sin firmar en G6, conciliación incompleta en
+  G7…). La pantalla **invoca** ese predicado en lugar de reproducirlo, así
   que el botón no se ofrece cuando la base lo va a rechazar, y no se esconde cuando sí procedía.
 - **G5 certifica vigencia, no existencia**: si un derecho venció entre enlazar y aprobar, G5 no pasa.
 - **G6** exige el Metric Registry firmado y pasa el proyecto a `en-implementacion`. La columna
@@ -708,12 +710,45 @@ módulo aparte (ADR-0007).
 
 - **Decisiones** (`pasa-muere`, `diseno`, `alcance`, `otra`) se aprueban en un gate y enlazan los
   insights validados que las sostienen. Una decisión es inmutable; si una reapertura la afecta pasa a
-  **revisión** y hay que **revalidarla**.
+  **revisión** y hay que **revalidarla**. Desde #46 una decisión `pasa-muere` **decide sobre un
+  concepto** del reto (`decision.concepto_id`, obligatorio para ese tipo y prohibido para los demás;
+  un guard comprueba que el concepto sea del reto del proyecto); el formulario ofrece los conceptos
+  del reto y, si no hay ninguno, lo dice y no deja registrarla.
 - **Arquetipos** del reto: definición, mapeo n:m a segmentos, evidencia enlazada obligatoria y
   veredicto `hipotesis` → `confirmado` o `refutado` con razón. Un arquetipo sin evidencia con
   derechos vigentes no pasa G2; un arquetipo refutado dispara una señal en el journey que lo use.
 - **Reabrir una etapa** registra motivo y cambios, marca los insights afectados y las decisiones
   aguas abajo, y nunca borra historia (SYS-10). No se reabre un proyecto cerrado.
+
+## Conceptos y resultados de test (etapa 4, G4)
+
+**Estado: construido en la base, sin pantalla** — PR [#46](https://github.com/jtrujillo-ws/designio-app/pull/46)
+«El concepto existe, y no avanza sin haberse probado». La etapa 4 era la única sin su objeto; el PR
+añade las tablas `concepto` y `concepto_evidencia`, sus políticas, sus guards y la puerta de G4, y las
+mete en el catálogo de exportación. **Ninguna server function ni pantalla** crea un concepto, enlaza
+su evidencia de test, declara su umbral, registra su lectura, aprueba su N/A ni dicta su veredicto:
+hoy todo eso solo se ejerce por SQL bajo las mismas políticas. La pantalla del proyecto solo **lee**
+los conceptos para el selector de la decisión `pasa-muere`.
+
+- **Modelo**: título único por reto, descripción, estado `candidato` → `pasa` · `muere` (sin vuelta
+  atrás; el que muere exige razón), umbral de test declarado, lectura del test, afirmación de si la
+  lectura alcanza el umbral, y N/A con justificación y aprobador. La evidencia de test se enlaza por
+  `concepto_evidencia` (los «resultados de test» son evidencia: observaciones y entrevistas de la
+  sesión).
+- **SYS-13 entero**: el umbral se declara **antes** de la prueba y se congela en cuanto hay evidencia
+  enlazada; la lectura se registra después y quien la lee **afirma** si alcanzó el listón (la base no
+  compara los dos textos: un umbral puede ser cualitativo); un concepto solo **pasa** con N/A aprobada
+  o con umbral declarado y lectura que lo alcanza; la N/A **excluye** prueba registrada en los tres
+  sentidos y la firma el rol aprobador de G4 (hoy el lead), leído del propio gate.
+- **G4 mira los conceptos que avanzan**: `gate_faltas_para_aprobar` nombra el primer concepto en
+  `pasa` sin evidencia de test ni N/A, el que tiene evidencia sin derechos vigentes para el cliente
+  (DR001, comprobado vivo al firmar, como G2 con los arquetipos) y el que avanza sin umbral alcanzado.
+  Sin conceptos, G4 se comporta como antes.
+- **Ventana** (`reto_admite_conceptos`): se escribe mientras el reto está `candidato` o `activo` y su
+  G4 no está aprobado con la etapa 4 cerrada; reabrir la etapa vuelve a abrirla. Los guards toman el
+  candado del reto y releen la ventana bajo él.
+- Lo que el veredicto congela es lo que afirmó: razón, umbral, lectura y afirmación son inmutables
+  tras decidir; el expediente de evidencia sigue editable hasta que G4 lo mira.
 
 ## Portal en el proyecto
 
@@ -731,12 +766,16 @@ Transiciones de estado de reto y proyecto por trigger (`reto_estado_transicion_g
 `proyecto_estado_transicion_guard`), par indivisible reto ↔ proyectos al entrar en medición,
 `gate_aprobar_suficiencia_guard` como único punto de aprobación, un **protocolo único de
 razonamiento** (`razonamiento_usable_guard`) que toma candados sobre los derechos antes de leerlos y
-que comparten el checklist, G3 y G5.
+que comparten el checklist, G3 y G5; para los conceptos, `concepto_veredicto_guard` (veredicto
+irreversible, umbral congelado con prueba enlazada, N/A firmada por el rol de G4),
+`concepto_candado_del_reto_guard` (ventana de la etapa 4 releída bajo candado) y
+`decision_concepto_del_mismo_reto_guard`.
 
 ## Permisos
 
 Los **roles curadores** (lead y diseñador) crean retos candidatos, definen y editan criterios,
-marcan ítems del checklist, y definen y deciden arquetipos. Solo el **lead** activa el reto,
+marcan ítems del checklist, y definen y deciden arquetipos; por política también crean, editan,
+prueban y deciden conceptos, aunque hoy sin pantalla. Solo el **lead** activa el reto,
 enlaza evidencia a un arquetipo, registra y revalida decisiones y reabre etapas. Aprueba cada gate
 su rol aprobador. Miembros leen todo el proyecto.
 
@@ -744,7 +783,8 @@ su rol aprobador. Miembros leen todo el proyecto.
 
 SPEC-04 completa (RF-04.1 a RF-04.12), SYS-08 a SYS-13, SYS-22. PRs [#8](https://github.com/jtrujillo-ws/designio-app/pull/8),
 [#10](https://github.com/jtrujillo-ws/designio-app/pull/10), [#33](https://github.com/jtrujillo-ws/designio-app/pull/33),
-migración «lo que le falta a un gate lo dice la base» (2026-09-05).
+migración «lo que le falta a un gate lo dice la base» (2026-09-05), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46)
+(conceptos; 17 pruebas nuevas, 887 en verde al fusionar).
 
 ---
 
@@ -1370,14 +1410,14 @@ JourneyBadge, Select, Switch, Tabs, Tag, Textarea, Wordmark); piezas de pantalla
 
 ## Migraciones
 
-**53 migraciones SQL forward-only** en `db/migrations/`, aplicadas en orden de nombre exactamente una
+**54 migraciones SQL forward-only** en `db/migrations/`, aplicadas en orden de nombre exactamente una
 vez con ledger `schema_migrations`. Las trece primeras crean el dominio (workspace, auth, árbol,
 evidencia, método, insight y decisión, portal, journey, medición, design version, evidencia
 profunda); las siguientes son **endurecimientos con nombre propio**, cada una con su motivación
 escrita en cabecera («derechos en toda cita», «candados compartidos», «la premisa del aislamiento se
 comprueba», «el libro se abre antes de despachar», «borrado acordado», «lo que le falta a un gate lo
 dice la base», «la oportunidad se traza a insights», «C6: el registry se propone contra los
-criterios», «C3: la oportunidad se propone desde los insights»…).
+criterios», «C3: la oportunidad se propone desde los insights», «el concepto se prueba antes de avanzar»…).
 
 ## Tablas por contexto
 
@@ -1387,7 +1427,7 @@ criterios», «C3: la oportunidad se propone desde los insights»…).
 | Árbol y servicio | `servicio`, `reto`, `reto_servicio_afectado`, `proyecto`, `catalogo_journey` |
 | Evidencia | `fuente`, `evidencia` (dimensiones en `jsonb` validado), `evidencia_segmento`, `item_importacion`, `archivo_importado` (`bytea`), `derecho_uso`, `consentimiento_item`, vista `evidencia_entregable` |
 | Conocimiento | `insight`, `afirmacion`, `cita`, `contradiccion` |
-| Método | `criterio_exito`, `etapa_instancia`, `gate_instancia`, `checklist_item`, `decision`, `decision_insight`, `arquetipo`, `arquetipo_segmento`, `arquetipo_evidencia`, `reapertura_etapa`, `reapertura_insight`, `oportunidad`, `oportunidad_insight` |
+| Método | `criterio_exito`, `etapa_instancia`, `gate_instancia`, `checklist_item`, `decision`, `decision_insight`, `arquetipo`, `arquetipo_segmento`, `arquetipo_evidencia`, `reapertura_etapa`, `reapertura_insight`, `oportunidad`, `oportunidad_insight`, `concepto`, `concepto_evidencia` |
 | Journey | `journey`, `journey_nodo`, `journey_arista`, `journey_nodo_evidencia`, `journey_snapshot` |
 | Entrega | `design_version`, `elemento_cambio`, `elemento_decision`, `elemento_insight`, `release`, `release_elemento`, `effective_state`, `constatacion` |
 | Medición | `metric_registry`, `entrada_kpi`, `snapshot`, `outcome_review`, `resultado_criterio` |
@@ -1617,10 +1657,10 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 | Estrato | Dónde | Qué cubre |
 |---|---|---|
 | Unit puro (sin base) | `src/__tests__/*.test.ts`, `src/lib/**/__tests__/` | Estado del loop y destinos, diff de entrega, Mermaid, sanitización, esquemas, números de formulario, degradación AI, proveedor (no lanza), sesión, password, limitador, memoria, segmentos, búsqueda, configuración de entrada |
-| **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (un archivo por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
+| **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (un archivo por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai, concepto) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
-Recuento al último PR fusionado (#45): **870 pruebas** en verde. La suite de
+Recuento al último PR fusionado (#46): **887 pruebas** en verde. La suite de
 autorización se **omite y lo dice** si faltan las URLs de base; en CI siempre corre. Regla de
 revisión: cada candado se verifica retirándolo, y debe caer exactamente la prueba que lo cubre.
 
@@ -1632,7 +1672,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | PR | Qué trae | Estado |
 |---|---|---|
-| — | Ningún PR de producto abierto a fecha 2026-09-05. Los tres últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry) y [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados) | — |
+| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados) y [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -1641,7 +1681,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-01 Workspace, roles, portal | Baja de miembros desde la app (política y grant de DELETE, server function y pantalla); hilos del portal sobre retos y evidencias en la interfaz (el modelo ya los admite); correo saliente (invitaciones, avisos del portal), notificaciones básicas por email; recovery de contraseña por correo | RF-01.4, RF-01.5, diseño técnico · Correo |
 | SPEC-02 Árbol y grafo | Servicios **afectados** adicionales de un reto en la UI (la tabla `reto_servicio_afectado` existe y la lectura de journeys ya la usa); consultas de trazabilidad predefinidas como pantalla propia (a–f); `AlcanceDeContexto` explícito para la AI (hoy el alcance es por ancla y se resume en `alcance_resumen`) | RF-02.3, RF-02.6, RF-02.7 |
 | SPEC-03 Evidencia e importación | Transcripción y diarización (C1, requiere proveedor STT); escaneo de malware; object storage S3-compatible con proxy de bytes (hoy `bytea` en Postgres); preview y OCR de artefactos; codificación asistida por segmento y tema | RF-03.2, RF-03.7, RF-03.8 |
-| SPEC-04 Método | **Pantalla de J2** para crear el reto, definir y editar criterios a mano y activarlo con perfil (las server functions existen; ninguna ruta las llama); **conceptos y resultados de test** de la etapa 4 (G4 hoy se sostiene en el checklist, sin objeto propio ni umbral por concepto); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
+| SPEC-04 Método | **Pantalla de J2** para crear el reto, definir y editar criterios a mano y activarlo con perfil (las server functions existen; ninguna ruta las llama); **pantalla de la etapa 4** para crear conceptos, enlazar su evidencia de test, declarar umbral, registrar lectura, aprobar la N/A y dictar el veredicto (el modelo, las políticas y la puerta de G4 ya están en la base desde #46; sin esa pantalla un `pasa-muere` no se puede registrar desde la interfaz); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
 | SPEC-05 Journeys | Vistas timeline y por actor (la descarga SVG/PNG del render y la copia del código Mermaid ya están construidas en la pantalla del journey) | RF-05.3 |
 | SPEC-06 Trazabilidad | Detección AI de desviaciones (C7) | RF-06.8 |
 | SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; borrador AI del outcome review (C7); retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
@@ -1777,7 +1817,7 @@ base.
 | **Contradicción** | Evidencia que va en contra de un insight, señalada y nunca ocultada |
 | **Arquetipo** | Perfil conductual emergente de la evidencia de un reto; mapea n:m a segmentos; hipótesis → confirmado o refutado |
 | **Oportunidad (HMW)** | Pregunta «how might we» trazable a uno o más insights validados; se prioriza y se decide |
-| **Concepto** | Solución candidata con resultados de test y decisión pasa/muere (diseñado) |
+| **Concepto** | Solución candidata de la etapa 4 con umbral de test declarado, evidencia de test enlazada, lectura afirmada y veredicto `pasa`/`muere` con razón; en la base desde #46, todavía sin pantalla |
 | **Journey** | Grafo tipado as-is o to-be de un servicio: fases, pasos, touchpoints, canales, actores, sistemas, acciones, emociones, fricciones |
 | **Blueprint** | Vista por carriles del mismo grafo (evidencia, frontstage, backstage, sistemas) |
 | **Catálogo del servicio** | Identidades estables de touchpoints, canales, sistemas y actores compartidas entre journeys |
@@ -1827,7 +1867,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 | I1 / SYS-10 | Reabrir registra y marca; nunca borra historia | `reapertura_etapa`, `reapertura_insight`, decisiones en revisión | Construido |
 | I1 / SYS-11 | N/A con justificación y aprobación | Tres estados de `checklist_item`, sin cuarto | Construido |
 | I2 / SYS-12 | Gate pasa solo con checklist completo y rol correcto | `gate_aprobar_suficiencia_guard`, `rol_aprobador` por CHECK, `gate_faltas_para_aprobar` | Construido |
-| I2 / SYS-13 | G4 exige evidencia de test por concepto | Checklist de G4; sin objeto concepto ni umbral | **Parcial (diseñado)** |
+| I2 / SYS-13 | G4 exige evidencia de test por concepto | `concepto` + `concepto_evidencia`; `gate_faltas_para_aprobar` en G4 (evidencia o N/A, derechos vivos, umbral alcanzado); `concepto_veredicto_guard` (umbral antes de la prueba, N/A firmada por el rol de G4) | **Construido en la base**; sin pantalla que lo ejerza |
 | I3 / SYS-14 | Cinco dimensiones; derechos restringen aguas abajo | `dimensiones` jsonb validado; `evidencia_citable` en toda superficie; `derecho_uso` | Construido |
 | I3 / SYS-15 | Insight validado con ≥1 cita; arquetipo con evidencia en G2; oportunidad con ≥1 insight en G3 | `insight_validar_guard` exige cita por cada afirmación **no hipótesis**, así que un insight solo de hipótesis se valida sin citas; `arquetipo_evidencia` + G2; G3 sobre `oportunidad_insight`; en C3 la traza se deriva de las citas (≥1 cita ⇒ ≥1 insight) | **Parcial** (insight): la regla es por afirmación, no por insight |
 | I3 / SYS-16 | Nada entra al grafo sin curaduría | `item_update_curaduria`; la extracción CI produce propuestas, no evidencia | Construido |
@@ -1852,7 +1892,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 
 # 93 — Apéndice: cronología de PRs fusionados en `agents`
 
-Cinco días de construcción (2026-09-01 a 2026-09-05), 42 commits en `agents`, cada uno un
+Cinco días de construcción (2026-09-01 a 2026-09-05), 43 commits en `agents`, cada uno un
 squash-merge con título que dice qué garantía añade.
 
 | Fecha | PR | Título |
@@ -1899,6 +1939,7 @@ squash-merge con título que dice qué garantía añade.
 | 09-05 | #39 | La oportunidad (HMW) existe, y no se sostiene sola |
 | 09-05 | #43 | C6: el borrador del Metric Registry se propone contra los criterios que promete medir |
 | 09-05 | #45 | C3: la oportunidad (HMW) se propone desde los insights validados, y su traza es la cita |
+| 09-05 | #46 | El concepto existe, y no avanza sin haberse probado |
 
 ---
 
@@ -1919,7 +1960,7 @@ fuente o a un ADR de sucesión.
 | 7 | Diseño técnico · pgvector | Búsqueda semántica intra-workspace | Extensión creada de forma tolerante, sin uso | Sin cambio; es roadmap |
 | 8 | SPEC-05 · Taxonomía | Aristas `pertenece-a`, `evidencia-de`, `mide`, `afecta`, `siente` (también en `servicio.schemas.ts`) | El grafo real usa 6 tipos de arista (`transicion`, `dependencia`, `ocurre-en`, `participa`, `soporta`, `duele`); la pertenencia a fase es columna, la evidencia es tabla `journey_nodo_evidencia`, y las relaciones mide/afecta viven en medición y entrega | Alinear `servicio.schemas.ts` (sin uso) con `journey.schemas.ts` o retirarlo |
 | 9 | SPEC-08 | Diez capacidades en el MVP; C6 con dos salidas (entradas KPI y plan de releases) | Siete construidas (CI, C0, CT, C2, C3, C5, C6); la segunda salida de C6 no cabe en el vocabulario `CapacidadAISchema` y queda como decisión de producto | Roadmap; decidir si se amplía el vocabulario |
-| 10 | SPEC-04 RF-04.10 / SYS-13 | Conceptos con resultados de test y umbral | Sin objeto concepto; G4 se sostiene en el checklist | Roadmap; spec vigente |
+| 10 | SPEC-04 RF-04.10 / SYS-13 | Conceptos con resultados de test y umbral, trabajados desde la aplicación | Objeto, umbral, N/A, veredicto y puerta de G4 en la base (#46); sin server function ni pantalla, así que solo se ejercen por SQL y un `pasa-muere` no se registra desde la interfaz | Roadmap: pantalla de la etapa 4 |
 | 11 | SPEC-07 RF-07.4 | Recordatorios por frecuencia | La cadencia incumplida se calcula y se ve, pero no se notifica | Roadmap (scheduler) |
 | 12 | SPEC-01 RF-01.5 / diseño técnico · Correo | Email básico | Sin correo saliente; el enlace de invitación se muestra en pantalla | Roadmap |
 | 13 | Prediseño §3.3 / `metodo.schemas.ts` | Estados con espacios («en medición», «en implementación») | La base usa guiones (`en-medicion`, `en-implementacion`, `parcialmente-logrado`) y `medicion.schemas.ts` ya lo refleja | Unificar el esquema compartido `metodo.schemas.ts` con los valores de la base |

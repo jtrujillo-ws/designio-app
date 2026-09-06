@@ -1135,14 +1135,6 @@ export type PropuestaEnPanel = PropuestaEnPanelComun &
   );
 
 /**
- * RF-08.9 — lo que el libro de costos dice de UNA capacidad en este workspace.
- *
- * Los tres `null` NO son huecos, son respuestas distintas de un cero: `tasaError` es `null`
- * cuando no hay ninguna llamada cerrada (un 0 % de error sobre cero llamadas es un verde que
- * nadie se ha ganado), `tasaAceptacion` cuando nadie ha decidido todavía, y las latencias
- * cuando ninguna línea la trae medida.
- */
-/**
  * Quién puede leer el libro de costos AI del workspace, DERIVADO y no copiado.
  *
  * §14 pone «observabilidad de costos, latencia, errores y calidad» en la misma fila que la
@@ -1162,6 +1154,14 @@ export type PropuestaEnPanel = PropuestaEnPanelComun &
  */
 export const ROLES_OBSERVABILIDAD_AI = ROLES_AUDITORIA;
 
+/**
+ * RF-08.9 — lo que el libro de costos dice de UNA capacidad en este workspace.
+ *
+ * Los tres `null` NO son huecos, son respuestas distintas de un cero: `tasaError` es `null`
+ * cuando no hay ninguna llamada cerrada (un 0 % de error sobre cero llamadas es un verde que
+ * nadie se ha ganado), `tasaAceptacion` cuando nadie ha decidido todavía, y las latencias
+ * cuando ninguna línea la trae medida.
+ */
 export type ObservabilidadDeCapacidad = {
   capacidad: string;
   /** Del registro cuando esta versión conoce la capacidad; el código a secas cuando no. */
@@ -1169,13 +1169,22 @@ export type ObservabilidadDeCapacidad = {
   /** Llamadas con desenlace. Las EN VUELO van aparte: mientras esperan no son un fallo. */
   llamadasCerradas: number;
   llamadasEnVuelo: number;
+  /**
+   * Despachadas cuya RESERVA ya no vive: el cierre falló después de que el proveedor
+   * respondiera y la limpieza retiró la reserva dejando la fila `despachada` a propósito. No
+   * son «en vuelo» —nadie las espera ya— ni «cerradas» —no tienen desenlace—, y el presupuesto
+   * las cuenta como pagadas: ante la duda de si el proveedor cobró, se asume que sí. Van con su
+   * propio número porque meterlas en cualquiera de los otros dos diría algo falso.
+   */
+  llamadasHuerfanas: number;
   llamadasValidas: number;
   /** Suma de lo que SÍ tiene tarifa registrada. Lo que no la tiene se cuenta al lado. */
   costoUsd: number;
   /**
-   * Llamadas cerradas sin coste conocido: el modelo no tenía tarifa registrada cuando se
-   * llamó. Viaja porque sin este número nadie puede saber si `costoUsd` es el total o una
-   * parte, y «no se sabe» no es «salió gratis».
+   * Llamadas sin coste conocido —cerradas y HUÉRFANAS—: el modelo no tenía tarifa registrada
+   * cuando se llamó. Viaja porque sin este número nadie puede saber si `costoUsd` es el total o
+   * una parte, y «no se sabe» no es «salió gratis». Las huérfanas cuentan aquí porque pueden
+   * haberse pagado; dejarlas fuera apagaba el aviso justo en el caso que lo necesita.
    */
   llamadasSinTarifa: number;
   latenciaP50Ms: number | null;
@@ -1203,6 +1212,7 @@ export type ObservabilidadAI = {
   total: {
     llamadasCerradas: number;
     llamadasEnVuelo: number;
+    llamadasHuerfanas: number;
     costoUsd: number;
     llamadasSinTarifa: number;
     propuestas: number;

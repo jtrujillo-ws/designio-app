@@ -5,6 +5,7 @@ import {
   agruparLateral,
   claveDeGobierno,
   notaDeGobierno,
+  type RutaDelWorkspace,
 } from '@/lib/loop/lateral';
 
 /**
@@ -107,6 +108,9 @@ describe('agrupación del lateral (4a)', () => {
     expect(lead.gobierno.map((d) => d.to)).toEqual([
       '/personas',
       '/auditoria',
+      // §14 pone la observabilidad de la capa AI en la misma fila que la auditoría
+      // —«Auditoría y operación»—, así que va con su misma puerta de rol.
+      '/observabilidad-ai',
       '/exportacion',
       '/disposicion',
     ]);
@@ -138,7 +142,16 @@ describe('agrupación del lateral (4a)', () => {
           agruparLateral({ rol, pendientesDelRol: p, importacionPendientes: b }),
         ).map((d) => d.to);
         expect(new Set(rutas).size).toBe(rutas.length);
-        const esperadas = 14 - (rutas.includes('/auditoria') ? 0 : 1);
+        /*
+         * Quince destinos, menos los dos que el rol puede no ver. Se cuentan por su PRESENCIA
+         * y no con un número por rol, que es lo que hace que este censo siga valiendo cuando
+         * se añade un destino con puerta: la auditoría y el cuadro de operación de la capa AI
+         * comparten la misma lista de roles a propósito (§14 los pone en la misma fila), así
+         * que o entran los dos o no entra ninguno — y si algún día se separan, este recuento
+         * lo dice en vez de dejarlo pasar.
+         */
+        const conPuerta: RutaDelWorkspace[] = ['/auditoria', '/observabilidad-ai'];
+        const esperadas = 15 - conPuerta.filter((r) => !rutas.includes(r)).length;
         expect(rutas).toHaveLength(esperadas);
       }
     }
@@ -151,7 +164,7 @@ describe('agrupación del lateral (4a)', () => {
       importacionPendientes: 0,
     });
     expect(notaDeGobierno(lead.gobierno)).toBe(
-      'Personas, auditoría, exportación y disposición: se abren cuando se buscan, no cada día.',
+      'Personas, auditoría, operación AI, exportación y disposición: se abren cuando se buscan, no cada día.',
     );
     const sponsor = agruparLateral({
       rol: 'sponsor',

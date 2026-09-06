@@ -12718,7 +12718,24 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await llamada('salida-valida', 0.02, 300);
       // Cerrada y FALLIDA, y además sin tarifa: las dos mitades a la vez.
       await llamada('fuera-de-contrato', null, 500);
-      // Y una EN VUELO, que no es ninguna de las dos cosas.
+      /*
+       * Y las dos clases de `despachada`, que NO son la misma y confundirlas fue el hallazgo
+       * de la primera revisión de este PR:
+       *
+       *  · EN VUELO: su reserva sigue viva, así que alguien la está esperando.
+       *  · HUÉRFANA: sin reserva viva. Es lo que queda cuando el cierre falla DESPUÉS de que
+       *    el proveedor respondiera —la limpieza retira la reserva y deja la fila
+       *    `despachada` a propósito—, y el presupuesto ya la cuenta como pagada. Si el cuadro
+       *    la da por en vuelo, su coste desconocido se queda fuera del aviso de «el total es
+       *    un mínimo», que es justo el caso que ese aviso existe para cubrir.
+       */
+      const [res] = await admin`insert into reserva_ai
+        (workspace_id, capacidad, reto_id, unidades, creado_por)
+        values (${wsO}, 'C0', ${retoO}, 1, ${curadorId})
+        returning id`;
+      await admin`update llamada_ai set reserva_id = ${res!.id as string}
+        where id = ${await llamada('despachada', null, null)}`;
+      // Y la huérfana: despachada, sin reserva que la cubra.
       await llamada('despachada', null, null);
 
       const obs = await observabilidadAI(curadorId, wsO);
@@ -12727,17 +12744,20 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         {
           cerradas: c0.llamadasCerradas,
           enVuelo: c0.llamadasEnVuelo,
+          huerfanas: c0.llamadasHuerfanas,
           validas: c0.llamadasValidas,
           sinTarifa: c0.llamadasSinTarifa,
           costo: Number(c0.costoUsd.toFixed(2)),
           tasaError: c0.tasaError,
         },
-        'el lector cuenta la línea en vuelo, o suma el coste desconocido como cero',
+        'el lector cuenta la línea en vuelo, confunde la huérfana con ella, o suma el coste desconocido como cero',
       ).toEqual({
         cerradas: 3,
         enVuelo: 1,
+        huerfanas: 1,
         validas: 2,
-        sinTarifa: 1,
+        // La fallida sin tarifa Y la huérfana sin tarifa: las dos pueden haberse pagado.
+        sinTarifa: 2,
         costo: 0.03,
         tasaError: 1 / 3,
       });

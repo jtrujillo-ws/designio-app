@@ -1,6 +1,7 @@
 import '@/lib/server-only';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
+import { reservaSigueViva } from './ai.servicio';
 import { CAPACIDADES, CAPACIDADES_ACTIVAS, type CapacidadActiva } from './ai.schemas';
 import type { ObservabilidadAI, ObservabilidadDeCapacidad } from './ai.schemas';
 
@@ -30,6 +31,16 @@ import type { ObservabilidadAI, ObservabilidadDeCapacidad } from './ai.schemas';
  *    después; mientras espera no es un fallo, es una llamada en curso. `ESTADOS_LLAMADA` existe
  *    para esto y su propia nota lo dice: «olvidar las líneas en vuelo al leer» es una de las
  *    dos mitades del error. La tasa se calcula sobre las CERRADAS.
+ *
+ *    Y «despachada» son DOS cosas, que es lo que se me escapó en la primera versión: la que
+ *    espera con su reserva viva, y la HUÉRFANA — aquella cuyo cierre falló después de que el
+ *    proveedor respondiera, y que la limpieza deja `despachada` a propósito mientras retira su
+ *    reserva. El presupuesto ya las distinguía y las cuenta como pagadas —«ante la duda de si
+ *    el proveedor cobró se asume que sí»—; este cuadro las daba a las dos por en vuelo, así
+ *    que una llamada probablemente pagada y de coste desconocido se quedaba fuera del aviso de
+ *    abajo. El predicado es el MISMO —`reservaSigueViva`, que salió de allí para no escribirse
+ *    dos veces—, y la huérfana viaja con su propio número: no es un desenlace, así que meterla
+ *    en las cerradas inventaría un `resultado` que la fila no tiene.
  * 3. **Contar las propuestas pendientes como rechazos.** Una propuesta que nadie ha mirado no
  *    es una que alguien rechazó, y meterla en el denominador hace que la tasa de aceptación
  *    baje sola cuando se genera más — o sea, que el número empeore cuando el producto se usa.
@@ -38,6 +49,7 @@ import type { ObservabilidadAI, ObservabilidadDeCapacidad } from './ai.schemas';
 const NINGUNA: Omit<ObservabilidadDeCapacidad, 'capacidad' | 'etiqueta'> = {
   llamadasCerradas: 0,
   llamadasEnVuelo: 0,
+  llamadasHuerfanas: 0,
   llamadasValidas: 0,
   costoUsd: 0,
   llamadasSinTarifa: 0,
@@ -71,11 +83,19 @@ export async function observabilidadAI(
       const llamadas = await tx`
         select l.capacidad,
                count(*) filter (where l.resultado <> 'despachada')::int as cerradas,
-               count(*) filter (where l.resultado = 'despachada')::int as en_vuelo,
+               count(*) filter (
+                 where l.resultado = 'despachada' and ${reservaSigueViva(tx, 'l')}
+               )::int as en_vuelo,
+               count(*) filter (
+                 where l.resultado = 'despachada' and not ${reservaSigueViva(tx, 'l')}
+               )::int as huerfanas,
                count(*) filter (where l.resultado = 'salida-valida')::int as validas,
                coalesce(sum(l.costo_usd), 0) as costo_usd,
+               -- Las cerradas Y las huérfanas: las dos pueden haberse pagado, así que si no
+               -- tienen coste conocido el total de arriba es un mínimo y hay que decirlo.
                count(*) filter (
-                 where l.resultado <> 'despachada' and l.costo_usd is null
+                 where l.costo_usd is null
+                   and (l.resultado <> 'despachada' or not ${reservaSigueViva(tx, 'l')})
                )::int as sin_tarifa,
                percentile_cont(0.5) within group (order by l.latencia_ms) as p50,
                percentile_cont(0.95) within group (order by l.latencia_ms) as p95
@@ -127,6 +147,7 @@ export async function observabilidadAI(
           etiqueta: CAPACIDADES[capacidad as CapacidadActiva]?.etiqueta ?? capacidad,
           llamadasCerradas: cerradas,
           llamadasEnVuelo: l ? (l.en_vuelo as number) : 0,
+          llamadasHuerfanas: l ? (l.huerfanas as number) : 0,
           llamadasValidas: validas,
           costoUsd: l ? Number(l.costo_usd) : 0,
           llamadasSinTarifa: l ? (l.sin_tarifa as number) : 0,
@@ -158,6 +179,7 @@ export async function observabilidadAI(
         total: {
           llamadasCerradas: filas.reduce((n, f) => n + f.llamadasCerradas, 0),
           llamadasEnVuelo: filas.reduce((n, f) => n + f.llamadasEnVuelo, 0),
+          llamadasHuerfanas: filas.reduce((n, f) => n + f.llamadasHuerfanas, 0),
           costoUsd: filas.reduce((n, f) => n + f.costoUsd, 0),
           llamadasSinTarifa: filas.reduce((n, f) => n + f.llamadasSinTarifa, 0),
           propuestas: filas.reduce((n, f) => n + f.propuestas, 0),

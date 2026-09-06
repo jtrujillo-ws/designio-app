@@ -121,8 +121,15 @@ function PantallaObservabilidad() {
   const datos = Route.useLoaderData();
   const { membresiaActiva } = Route.useRouteContext();
   const navigate = useNavigate();
-  const rol = membresiaActiva?.rol ?? '';
-  const puedeVer = (ROLES_OBSERVABILIDAD_AI as readonly string[]).includes(rol);
+  /*
+   * Sin membresía activa NO hay rol, y eso no es «tu rol no alcanza»: es que no hay workspace
+   * elegido. Con `rol = ''` las dos situaciones caían en el mismo mensaje y la pantalla
+   * mandaba a pedir un permiso a quien lo que le falta es elegir dónde mirar. Lo dijo una
+   * revisión; se separan, que es lo que ya hace el resto de la aplicación.
+   */
+  const sinWorkspace = membresiaActiva === undefined;
+  const puedeVer =
+    !sinWorkspace && (ROLES_OBSERVABILIDAD_AI as readonly string[]).includes(membresiaActiva.rol);
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg-app)' }}>
@@ -160,9 +167,11 @@ function PantallaObservabilidad() {
         {!puedeVer || !datos ? (
           <Card style={{ padding: 20 }}>
             <span style={{ font: '400 13px/1.6 var(--font-sans)', color: 'var(--text-muted)' }}>
-              {puedeVer
+              {sinWorkspace
                 ? 'Elige un workspace para ver la operación de su capa AI.'
-                : 'La operación de la capa AI la consultan quienes llevan el workspace. Tu rol no incluye esta lectura.'}
+                : puedeVer
+                  ? 'Todavía no hay nada que leer de la capa AI en este workspace.'
+                  : 'La operación de la capa AI la consultan quienes llevan el workspace. Tu rol no incluye esta lectura.'}
             </span>
           </Card>
         ) : (
@@ -176,6 +185,10 @@ function PantallaObservabilidad() {
                 {datos.total.llamadasCerradas} llamadas atendidas
                 {datos.total.llamadasEnVuelo > 0 &&
                   ` · ${datos.total.llamadasEnVuelo} en vuelo, que todavía no son ni acierto ni fallo`}
+                {/* Y las huérfanas aparte, porque no son ninguna de las otras dos: su cierre
+                    se perdió, así que pueden haberse pagado y no tienen desenlace. */}
+                {datos.total.llamadasHuerfanas > 0 &&
+                  ` · ${datos.total.llamadasHuerfanas} sin cierre, que pueden haberse pagado y no tienen desenlace`}
                 {datos.total.llamadasSinTarifa > 0 &&
                   ` · ${datos.total.llamadasSinTarifa} sin tarifa registrada, así que el total es un mínimo`}
                 {' · '}
@@ -199,6 +212,9 @@ function PantallaObservabilidad() {
                     ].map(([texto, alineado]) => (
                       <th
                         key={texto}
+                        // `scope` no es adorno: con scroll horizontal, un lector de pantalla
+                        // no puede asociar una celda con su columna sin él.
+                        scope="col"
                         style={{
                           ...micro,
                           padding: '10px',

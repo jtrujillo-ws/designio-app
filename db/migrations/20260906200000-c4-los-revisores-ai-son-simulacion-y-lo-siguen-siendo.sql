@@ -2643,6 +2643,43 @@ begin
       if v_reto is not null and not reto_admite_conceptos(v_reto, new.workspace_id) then
         raise exception 'la etapa 4 de ese reto está cerrada: no admite revisiones simuladas nuevas';
       end if;
+      /*
+       * Y LA LENTE, aquí también, por sus dos mitades.
+       *
+       * `a_propuesta_ai_c4_linaje` ya comprueba que el arquetipo sea del reto del concepto y no
+       * esté refutado, y eso se queda ahí porque vale para TODO el que escriba: es lo que hace
+       * que la sesión sea de ese concepto. Pero ese trigger corre ANTES que éste —va primero por
+       * nombre— y por tanto antes del candado, así que lee una FOTO: una refutación en vuelo
+       * commitea después y queda una propuesta imposible de aceptar. Es la avería de la ronda
+       * 23, un campo más allá: allí el concepto se releyó con el candado en la mano y la lente
+       * no se llevó hasta aquí.
+       *
+       * Y la otra mitad, que no es de carreras: la lente tiene que tener EVIDENCIA UTILIZABLE.
+       * `lentesDelLote` filtra por `evidencia.length > 0` sobre una proyección que ya aplica
+       * `evidencia_usable(..., 'cliente')`, o sea que una lente sin documentos citables no se le
+       * enseña nunca al modelo — pero por la superficie concedida entraba igual, y no inerte: el
+       * selector no ofrece un concepto con propuesta de C4 en curso, así que BLOQUEA pedir otro
+       * lote, y aceptarla muere contra la primera comprobación del sello, que exige al menos un
+       * documento utilizable en el alcance. Otra que nace sólo para rechazarse, con la llamada
+       * pagada — el mismo modo de fallo que la lente ajena y el arquetipo refutado.
+       *
+       * Va en la rama de `designio_app` y no en el guard de linaje porque es la misma clase de
+       * pregunta que el concepto candidato y la ventana de la etapa: no es la IDENTIDAD de la
+       * sesión, es si puede llegar a aceptarse.
+       */
+      if not exists (
+        select 1
+          from concepto c
+          join arquetipo a on a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
+         where c.id = new.concepto_id and c.workspace_id = new.workspace_id
+           and a.id::text = new.contenido ->> 'arquetipoId'
+           and a.estado <> 'refutado'
+           and exists (
+             select 1 from arquetipo_evidencia ae
+              where ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+                and evidencia_usable(ae.evidencia_id, ae.workspace_id, 'cliente'))) then
+        raise exception 'esa lente ya no puede revisar: o su veredicto la refutó, o no le queda ningún documento citable — el material sólo ofrece arquetipos con evidencia utilizable, y una propuesta así nacería imposible de aceptar bloqueando el lote siguiente';
+      end if;
     end if;
     -- Y la puerta de los criterios, por DESTINO y no por ancla. Escrita como «toda
     -- propuesta que cuelgue de un reto» era exacta mientras solo C0 colgara de ahí; con C2

@@ -8642,7 +8642,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
         confianzaPropuesta: 'baja',
       };
-      const sellar = (alcance: string[]) =>
+      /*
+       * `entreMedias` corre DESPUÉS de nacer la propuesta y ANTES de aceptarla, en otra conexión
+       * y ya commiteado. Hace falta desde que el INSERT de la propuesta exige que su lente
+       * conserve algún documento citable: montar el estado «no le queda ninguno» antes de
+       * proponer hace que falle ahí, y esta sonda pasaría en verde midiendo esa puerta en vez de
+       * la del sello, que es la que nombra. Y de paso es la secuencia REAL: el permiso se retira
+       * mientras la aceptación está en vuelo, que es justo para lo que existe esa comprobación.
+       */
+      const sellar = (alcance: string[], entreMedias?: () => Promise<void>) =>
         conUsuario(curadorId, async (tx) => {
           const [ll] = await tx`insert into llamada_ai
             (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
@@ -8658,6 +8666,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                     'modelo-de-prueba', 'v-prueba', 'una lente', ${alcance},
                     'entorno', ${ll!.id as string}, 0, true, ${curadorId})
             returning id`;
+          if (entreMedias) await entreMedias();
           const [r] = await tx`insert into revision_simulada
             (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
             values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura del segundo, sin citar.',
@@ -8697,9 +8706,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
        * ver»—, porque la lente conserva un documento utilizable fuera del alcance. Sólo se cae
        * en ésta cuando no queda ninguno.
        */
-      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
-        where evidencia_id = ${evB} and workspace_id = ${wsC}`;
-      await expect(sellar([evB, evB2])).rejects.toThrow(/se quedó sin evidencia utilizable/i);
+      await expect(
+        sellar([evB, evB2], async () => {
+          await admin`update derecho_uso set estado = 'denegado', ambito = 'interno',
+            vence_en = null where evidencia_id = ${evB} and workspace_id = ${wsC}`;
+        }),
+      ).rejects.toThrow(/se quedó sin evidencia utilizable/i);
       await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente'
         where evidencia_id = ${evB} and workspace_id = ${wsC}`;
 
@@ -10431,6 +10443,183 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+
+  /**
+   * UNA LENTE SIN DOCUMENTOS CITABLES NO REVISA A NADIE.
+   *
+   * `lentesDelLote` filtra por `evidencia.length > 0` sobre una proyección que ya aplica
+   * `evidencia_usable(..., 'cliente')`, así que un arquetipo sin documentos utilizables NO se le
+   * enseña al modelo nunca. La base no lo exigía: el guard de linaje pide que la lente sea del
+   * reto y no esté refutada, y ahí se acaba.
+   *
+   * Y no queda en una fila inerte, que es lo que lo hace un P2 y no un detalle: el selector no
+   * ofrece un concepto con propuesta de C4 en curso, así que BLOQUEA pedir otro lote, y aceptarla
+   * muere después contra la primera comprobación del sello —que exige al menos un documento
+   * utilizable en el alcance—. Otra que nace sólo para rechazarse, con la llamada pagada.
+   *
+   * Las dos formas de quedarse sin lente se miden aquí, porque son la misma pregunta por dos
+   * caminos: la que NUNCA tuvo documentos, y la que los tenía y perdió el permiso — refutar no
+   * desenlaza, y retirar un derecho tampoco.
+   */
+  it('C4 no deja nacer una propuesta sobre una lente sin evidencia utilizable', async () => {
+    await enWorkspaceLimpio('c4-lente-vacia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Una lente del MISMO reto y sin refutar, pero sin ningún documento enlazado.
+      const [vacia] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${retoC}, 'El que no dejó testimonio', 'Perfil sin documentos',
+                ${curadorId})
+        returning id`;
+      const proponer = (arquetipoId: string) =>
+        conUsuario(curadorId, async (tx) => {
+          const contenido = {
+            arquetipoId,
+            sintesis: 'Una lectura.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas: [
+                  { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+            confianzaPropuesta: 'media',
+          };
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [pr] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return pr!.id as string;
+        });
+
+      await expect(
+        proponer(vacia!.id as string),
+        'nace una propuesta sobre una lente que el material no enseña nunca',
+      ).rejects.toThrow(/ningún documento citable|no puede revisar/i);
+
+      // Y LA QUE SE QUEDA VACÍA: retirar el derecho de su único documento no desenlaza nada, así
+      // que la lente sigue ahí con su evidencia — y sin poder citarla.
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+      await expect(
+        proponer(lenteA),
+        'nace una propuesta sobre una lente cuyo permiso de cita se retiró',
+      ).rejects.toThrow(/ningún documento citable|no puede revisar/i);
+    });
+  });
+
+  /**
+   * Y LA REFUTACIÓN QUE LLEGA MIENTRAS LA PROPUESTA ESPERA EL CANDADO.
+   *
+   * Misma forma que las dos carreras de arriba, y la misma lección una vez más: el guard de
+   * LINAJE comprueba la lente y corre ANTES que éste —va primero por nombre—, o sea antes del
+   * candado del reto. Lee una foto. El veredicto del arquetipo commitea después, y queda una
+   * propuesta que no se podrá aceptar nunca y que además bloquea pedir otro lote.
+   *
+   * Es literalmente la avería de la ronda 23 un campo más allá: allí llevé el estado del
+   * CONCEPTO al recheck bajo candado y dejé la lente donde estaba.
+   *
+   * La carrera se monta a propósito, no se espera a que ocurra, y la espera se lee de `pg_locks`
+   * acotando por la clave —no por un tiempo—, que es lo que hizo intermitente a esta familia en
+   * la ronda 25.
+   */
+  it('C4 no deja nacer una propuesta cuya lente se refutó mientras esperaba el candado', { timeout: 30_000 }, async () => {
+    await enWorkspaceLimpio('c4-lente-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de una lente que dejó de serlo.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+
+      let soltar!: () => void;
+      const puedeCerrar = new Promise<void>((r) => {
+        soltar = r;
+      });
+      let tomado!: () => void;
+      const yaTomado = new Promise<void>((r) => {
+        tomado = r;
+      });
+      // El otro: toma el candado del reto y REFUTA la lente dentro, sin cerrar todavía.
+      const elOtro = admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        await tx`update arquetipo set estado = 'refutado',
+          veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
+          where id = ${lenteA} and workspace_id = ${wsC}`;
+        tomado();
+        await puedeCerrar;
+      });
+      await yaTomado;
+
+      // Y la propuesta, que toma su instantánea AHORA —con la lente todavía vigente para el
+      // guard de linaje— y se queda esperando el candado dentro del guard de revisión.
+      const escritura = conUsuario(curadorId, async (tx) => {
+        const [ll] = await tx`insert into llamada_ai
+          (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+          values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                  'salida-valida', ${curadorId})
+          returning id`;
+        return tx`insert into propuesta_ai
+          (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, es_simulacion, creado_por)
+          values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                  ${tx.json(contenido)}, ${tx.json(contenido)},
+                  'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                  'entorno', ${ll!.id as string}, 0, true, ${curadorId})`;
+      });
+      try {
+        const esperandoLaClave = async () => {
+          const [f] = await admin`select count(*)::int as n
+            from pg_locks l, (select hashtextextended(
+              'designio:reto:' || ${retoC}::text, 42) as k) c
+            where l.locktype = 'advisory' and not l.granted
+              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+          return f!.n as number;
+        };
+        for (let i = 0; i < 100; i++) {
+          if ((await esperandoLaClave()) > 0) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        expect(
+          await esperandoLaClave(),
+          'la propuesta no llegó a esperar el candado: la sonda no mide la carrera',
+        ).toBe(1);
+      } finally {
+        soltar();
+        await elOtro;
+      }
+      await expect(escritura).rejects.toThrow(/no puede revisar|refutó/i);
+    });
+  });
 
   /**
    * EL GUARD DE SOSTÉN SE VUELVE A PREGUNTAR TAMBIÉN AL AÑADIR UNA CITA.

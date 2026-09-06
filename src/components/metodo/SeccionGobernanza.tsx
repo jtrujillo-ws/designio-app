@@ -1072,11 +1072,21 @@ function FormularioRevisionAMano({
     (e) => e.citable,
   );
 
-  // Cambiar de lente vacía las citas ENTERAS, no sólo el documento: un fragmento es texto
-  // literal de un documento concreto, y dejarlo bajo otro sería atribuirlo a quien no lo dijo.
+  /*
+   * Cambiar de lente REINICIA la revisión entera, no sólo sus citas.
+   *
+   * Una revisión es la voz de SU arquetipo: la lectura de conjunto, lo que ve y qué hay que ir a
+   * preguntar son de esa lente y de ninguna otra. Vaciar sólo las citas dejaba lo escrito para A
+   * guardado como lectura de B —y una revisión de puras hipótesis, que no lleva citas, se podía
+   * mandar tal cual—: exactamente la falsa atribución que el guard de corrección impide en la
+   * ruta AI cuando el `arquetipoId` se mueve. El concepto no se toca, que no es de la lente.
+   *
+   * Y se dice antes de que pase, junto al selector, porque perder lo escrito en silencio es su
+   * propia avería.
+   */
   const cambiarLente = (v: string) => {
     setArquetipoId(v);
-    setHallazgos((xs) => xs.map((h) => ({ ...h, citas: h.citas.map(() => CITA_VACIA) })));
+    limpiar();
   };
 
   const hallazgoListo = (h: HallazgoAMano) =>
@@ -1163,6 +1173,9 @@ function FormularioRevisionAMano({
           </option>
         ))}
       </Select>
+      <span style={{ font: '400 11px var(--font-sans)', color: 'var(--text-faint)' }}>
+        Cambiar de lente vacía lo escrito: una revisión es la lectura de SU arquetipo.
+      </span>
       <Input
         placeholder="Lectura de conjunto"
         value={sintesis}
@@ -1213,14 +1226,38 @@ function FormularioRevisionAMano({
               <div key={k} style={{ display: 'grid', gap: 6 }}>
                 <Select
                   value={c.evidenciaId}
-                  onChange={(e) => parchearCita(i, k, { evidenciaId: e.target.value })}
+                  /*
+                   * Cambiar de documento VACÍA el pasaje, por lo mismo que cambiar de lente: un
+                   * fragmento es texto literal de un documento concreto, y dejar el de A pegado
+                   * a B lo atribuye a quien no lo dijo. Nadie lo para después — la ruta manual
+                   * no comprueba presencia literal, y está medido: un pasaje que no aparece en
+                   * el documento elegido se escribe y se muestra como sostén del hallazgo.
+                   */
+                  onChange={(e) =>
+                    parchearCita(i, k, {
+                      evidenciaId: e.target.value,
+                      fragmento: '',
+                      localizacion: '',
+                    })
+                  }
                 >
                   <option value="">Documento que lo sostiene…</option>
-                  {citables.map((e) => (
-                    <option key={e.id} value={e.id}>
-                      {e.titulo}
-                    </option>
-                  ))}
+                  {/*
+                    Y sólo los que este hallazgo NO cita ya: el enlace guarda un pasaje por
+                    documento, así que un segundo pasaje del mismo se perdía en el refresco. El
+                    contrato de la ruta manual lo rechaza; esto es no ofrecerlo.
+                  */}
+                  {citables
+                    .filter(
+                      (e) =>
+                        e.id === c.evidenciaId ||
+                        !h.citas.some((otra, l) => l !== k && otra.evidenciaId === e.id),
+                    )
+                    .map((e) => (
+                      <option key={e.id} value={e.id}>
+                        {e.titulo}
+                      </option>
+                    ))}
                 </Select>
                 <Input
                   placeholder="Fragmento literal"
@@ -1247,7 +1284,9 @@ function FormularioRevisionAMano({
                 </div>
               </div>
             ))}
-          {!h.esHipotesis && h.citas.length < MAX_CITAS_POR_HALLAZGO && (
+          {!h.esHipotesis &&
+            h.citas.length < MAX_CITAS_POR_HALLAZGO &&
+            h.citas.filter((c) => c.evidenciaId !== '').length < citables.length && (
             <Button
               variant="secondary"
               disabled={ocupado}

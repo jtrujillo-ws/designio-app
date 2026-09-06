@@ -60,10 +60,48 @@ type ApoyarArquetipoEntrada = { workspaceId: string; arquetipoId: string; eviden
 export const EscribirRevisionAManoSchema = z.object({
   workspaceId: z.string().uuid(),
   conceptoId: z.string().uuid(),
-  contenido: z.preprocess(
-    (v) => (typeof v === 'object' && v !== null ? { confianzaPropuesta: 'media', ...v } : v),
-    ContenidoRevisionSimuladaSchema,
-  ),
+  contenido: z
+    .preprocess(
+      (v) => (typeof v === 'object' && v !== null ? { confianzaPropuesta: 'media', ...v } : v),
+      ContenidoRevisionSimuladaSchema,
+    )
+    /*
+     * UN PASAJE POR DOCUMENTO Y HALLAZGO, y esto SÍ es propio de la ruta manual.
+     *
+     * El enlace materializado tiene clave primaria `(hallazgo_id, evidencia_id)`: dos citas del
+     * mismo documento en el mismo hallazgo son una sola fila, y se guarda el pasaje de la
+     * primera. Para una revisión PROPUESTA eso no pierde nada —el contenido de la propuesta es
+     * inmutable por SYS-17 y las lleva todas, y el guard de materialización cuenta enlaces
+     * contra documentos DISTINTOS justo por esto—. Una revisión escrita a mano no tiene ese
+     * respaldo: el segundo pasaje se escribía, se mandaba, y desaparecía en el refresco.
+     *
+     * Medido antes de cerrarlo, con dos fragmentos de la misma entrevista:
+     *
+     *   CITAS QUE SOBREVIVEN: [{ fragmento: 'No entrego la cédula', … }]   ← sólo la primera
+     *
+     * Hasta la ronda anterior era un límite que nadie podía tocar, porque el formulario sólo
+     * ofrecía UNA cita por hallazgo; volverlas repetibles convirtió un empobrecimiento acotado
+     * en una pérdida silenciosa y alcanzable. Así que el contrato de esta ruta pide lo que esta
+     * ruta puede guardar: un documento por hallazgo. La alternativa —que el enlace admita varias
+     * filas por documento— rehace la clave primaria y con ella la comprobación del sello, que
+     * hoy es correcta; queda dicha aquí por si el límite llega a apretar.
+     *
+     * Va aquí y no en el contrato compartido a propósito: aquél gobierna también lo que el
+     * proveedor puede devolver, y para él las dos citas siguen siendo legítimas.
+     */
+    .superRefine((c, ctx) => {
+      c.hallazgos.forEach((h, i) => {
+        const documentos = h.citas.map((x) => x.evidenciaId);
+        if (new Set(documentos).size !== documentos.length) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['hallazgos', i, 'citas'],
+            message:
+              'un hallazgo escrito a mano cita cada documento UNA vez: el enlace guarda un pasaje por documento, y una revisión sin propuesta detrás no tiene de dónde recuperar los demás — elige el pasaje que mejor lo sostiene, o abre otro hallazgo',
+          });
+        }
+      });
+    }),
 });
 /*
  * El TIPO deja fuera `confianzaPropuesta` aunque el validador la rellene: `z.infer` describe lo

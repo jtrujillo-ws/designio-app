@@ -10247,29 +10247,42 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (workspace_id, reto_id, codigo, titulo, creado_por)
         values (${wsC}, ${retoC}, 'P-C4L', 'Proyecto de la revisión llena', ${curadorId})
         returning id`;
-      // Un SEGUNDO documento en la misma lente: cuatro citas distintas no caben en uno solo, y
-      // el contrato no admite repetir la misma cita dentro de un hallazgo.
+      /*
+       * CUATRO documentos más en la misma lente. El tope de citas por hallazgo sólo se llena con
+       * documentos DISTINTOS: la ruta manual pide un pasaje por documento —lo mide la sonda de
+       * al lado— porque el enlace guarda uno solo y aquí no hay propuesta inmutable de la que
+       * recuperar los demás. El quinto está para que pasarse del tope sea pasarse del TOPE y no
+       * repetir documento, que es otra regla y otro mensaje.
+       */
       const [fte] = await admin`select fuente_id from evidencia where id = ${evA}`;
-      const [ev2] = await admin`insert into evidencia
-        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
-        values (${wsC}, ${fte!.fuente_id as string}, 'Entrevista D-02',
-                'Prefiero que me digan para qué antes de dar nada.', '{}'::jsonb, ${curadorId})
-        returning id`;
-      const evA2 = ev2!.id as string;
-      await admin`insert into derecho_uso
-        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
-        values (${wsC}, ${evA2}, 'concedido', 'cliente', 'Consentimiento del participante',
-                ${curadorId}, now(), ${curadorId})`;
-      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
-        values (${wsC}, ${lenteA}, ${evA2})`;
+      const otros: string[] = [];
+      for (const [n, resumen] of [
+        ['D-02', 'Prefiero que me digan para qué antes de dar nada.'],
+        ['D-03', 'Si me explican el motivo, lo entrego sin problema.'],
+        ['D-04', 'Lo dejé a medias porque no sabía qué pedían.'],
+        ['D-05', 'Me da igual el trámite si sé a dónde va.'],
+      ] as const) {
+        const [ev] = await admin`insert into evidencia
+          (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+          values (${wsC}, ${fte!.fuente_id as string}, ${`Entrevista ${n}`}, ${resumen},
+                  '{}'::jsonb, ${curadorId})
+          returning id`;
+        const id = ev!.id as string;
+        await admin`insert into derecho_uso
+          (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+          values (${wsC}, ${id}, 'concedido', 'cliente', 'Consentimiento del participante',
+                  ${curadorId}, now(), ${curadorId})`;
+        await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+          values (${wsC}, ${lenteA}, ${id})`;
+        otros.push(id);
+      }
 
-      // Cuatro citas DISTINTAS sobre los DOS documentos de la lente, todas literales de su
-      // resumen: el enlace colapsa por documento, así que van a dar a dos filas.
+      // Cuatro citas, una por documento, cada fragmento literal del resumen del suyo.
       const citas = [
         { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
-        { evidenciaId: evA, fragmento: 'sin saber para qué', localizacion: 'resumen' },
-        { evidenciaId: evA2, fragmento: 'Prefiero que me digan', localizacion: 'resumen' },
-        { evidenciaId: evA2, fragmento: 'antes de dar nada', localizacion: 'resumen' },
+        { evidenciaId: otros[0]!, fragmento: 'Prefiero que me digan', localizacion: 'resumen' },
+        { evidenciaId: otros[1]!, fragmento: 'Si me explican el motivo', localizacion: 'resumen' },
+        { evidenciaId: otros[2]!, fragmento: 'no sabía qué pedían', localizacion: 'resumen' },
       ];
       expect(citas.length).toBe(MAX_CITAS_POR_HALLAZGO);
       const LETRA = 'ABCDEF';
@@ -10304,10 +10317,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(filas.length).toBe(MAX_HALLAZGOS_POR_REVISION);
       const [nCitas] = await admin`select count(*)::int as n from hallazgo_simulado_evidencia
         where hallazgo_id = ${filas[0]!.id as string}`;
-      // DOS y no cuatro: la clave primaria del enlace es `(hallazgo_id, evidencia_id)`, así que
-      // las cuatro citas del contenido colapsan a un enlace por documento. Está dicho en la
-      // tabla y medido aquí para que deje de ser una suposición.
-      expect(nCitas!.n).toBe(2);
+      // Las cuatro, cada una con su pasaje: un enlace por documento es exactamente lo que la
+      // clave primaria `(hallazgo_id, evidencia_id)` guarda, y por eso son cuatro documentos.
+      expect(nCitas!.n).toBe(MAX_CITAS_POR_HALLAZGO);
 
       // La traza de cada pregunta a SU hallazgo, que es lo que la simulación entrega a la etapa
       // 4. Con una sola pregunta el índice 0 acertaba por casualidad.
@@ -10324,8 +10336,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
        * los siete, porque ahí no hay quien los cuente. Se mide entonces donde de verdad se
        * decide, que es exactamente la frontera que cruza el formulario.
        */
-      const cabe = (contenido: unknown) =>
-        EscribirRevisionAManoSchema.safeParse({ workspaceId: wsC, conceptoId, contenido }).success;
+      const parsear = (contenido: unknown) =>
+        EscribirRevisionAManoSchema.safeParse({ workspaceId: wsC, conceptoId, contenido });
+      const cabe = (contenido: unknown) => parsear(contenido).success;
       const base = { arquetipoId: lenteA, sintesis: 'Uno más de la cuenta.', hallazgos, preguntas };
       expect(cabe(base), 'el contrato no admite lo que el formulario ofrece escribir').toBe(true);
       expect(
@@ -10338,21 +10351,127 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           preguntas: [...preguntas, { ...preguntas[0]!, pregunta: '¿Y la séptima?' }],
         }),
       ).toBe(false);
+      const cinco = parsear({
+        ...base,
+        hallazgos: [
+          {
+            ...hallazgos[0]!,
+            citas: [
+              ...citas,
+              { evidenciaId: otros[3]!, fragmento: 'sé a dónde va', localizacion: 'resumen' },
+            ],
+          },
+          ...hallazgos.slice(1),
+        ],
+      });
+      expect(cinco.success).toBe(false);
+      /*
+       * Y por el TOPE, no por repetir documento: la quinta cita trae un quinto documento a
+       * propósito. Sin esto la línea pasaría en verde midiendo la otra regla — que es la avería
+       * que este PR ya se ha corregido a sí mismo tres veces.
+       */
       expect(
-        cabe({
-          ...base,
-          hallazgos: [
-            {
-              ...hallazgos[0]!,
-              citas: [
-                ...citas,
-                { evidenciaId: evA, fragmento: 'la cédula', localizacion: 'resumen' },
-              ],
-            },
-            ...hallazgos.slice(1),
-          ],
-        }),
+        cinco.error!.issues.some((x) => /cita cada documento UNA vez/i.test(x.message)),
       ).toBe(false);
+    });
+  });
+
+
+  /**
+   * UN PASAJE POR DOCUMENTO EN LA RUTA MANUAL, y por qué sólo en ella.
+   *
+   * El enlace materializado tiene clave primaria `(hallazgo_id, evidencia_id)`, así que dos
+   * citas del mismo documento en un hallazgo son una sola fila con el pasaje de la primera. Para
+   * una revisión PROPUESTA no se pierde nada —el contenido es inmutable por SYS-17 y las lleva
+   * todas, y el guard del sello cuenta enlaces contra documentos DISTINTOS justo por eso—. Una
+   * escrita a mano no tiene ese respaldo, y hasta la ronda 29 tampoco tenía cómo llegar aquí:
+   * el formulario ofrecía UNA cita por hallazgo. Volverlas repetibles convirtió un
+   * empobrecimiento acotado en una pérdida silenciosa, medida antes de cerrarla:
+   *
+   *   CITAS QUE SOBREVIVEN: [{ fragmento: 'No entrego la cédula', … }]   ← sólo la primera
+   *
+   * Así que el contrato de ESTA ruta pide lo que esta ruta puede guardar. El compartido no se
+   * toca: gobierna también lo que el proveedor devuelve, y para él las dos citas son legítimas —
+   * lo comprueba la sonda del reparto, cuyo primer hallazgo cita dos pasajes de la misma
+   * entrevista y se materializa sin queja.
+   */
+  it('C4 a mano cita cada documento una vez, y la ruta AI las sigue admitiendo', async () => {
+    await enWorkspaceLimpio('c4-dos-pasajes', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const conCitas = (citas: { evidenciaId: string; fragmento: string; localizacion: string }[]) => ({
+        arquetipoId: lenteA,
+        sintesis: 'Dos pasajes de la misma entrevista.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas,
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      });
+      const primera = { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' };
+      const segunda = { evidenciaId: evA, fragmento: 'sin saber para qué', localizacion: 'resumen' };
+      const porElValidador = (contenido: unknown) =>
+        EscribirRevisionAManoSchema.safeParse({ workspaceId: wsC, conceptoId, contenido });
+
+      const dos = porElValidador(conCitas([primera, segunda]));
+      expect(dos.success, 'el segundo pasaje del mismo documento entró para perderse').toBe(false);
+      expect(dos.error!.issues[0]!.message).toMatch(/cita cada documento UNA vez/i);
+      expect(porElValidador(conCitas([primera])).success).toBe(true);
+
+      /*
+       * Y el CONTRATO COMPARTIDO sigue admitiéndolas, que es lo que hace de esto una regla de la
+       * ruta manual y no un recorte de la capacidad.
+       */
+      expect(() =>
+        parsearContenido('C4', { ...conCitas([primera, segunda]), confianzaPropuesta: 'media' }),
+      ).not.toThrow();
+    });
+  });
+
+  /**
+   * Y LO QUE LA RUTA MANUAL NO COMPRUEBA: que el pasaje esté en el documento.
+   *
+   * La presencia literal la mide el panel sobre el material de la llamada (`presenteLiteral`), y
+   * una revisión escrita a mano no tiene llamada ni material: no hay contra qué medirla. Así que
+   * un fragmento que no aparece en el documento elegido se escribe y se enseña como sostén.
+   *
+   * Está aquí escrito y medido porque es lo que obliga al formulario a VACIAR el pasaje cuando
+   * se cambia de documento: si nadie lo para después, dejar el fragmento de A pegado a B lo
+   * atribuye a quien no lo dijo, y ya no hay quien lo desmienta. El día que esta ruta compruebe
+   * presencia literal, esta sonda es la que hay que borrar — y entonces el vaciado del
+   * formulario pasa a ser comodidad en vez de suelo.
+   */
+  it('C4 a mano no comprueba presencia literal: lo que lo acota es vaciar al cambiar de documento', async () => {
+    await enWorkspaceLimpio('c4-pasaje-ajeno', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            arquetipoId: lenteA,
+            sintesis: 'Un pasaje que no es de ahí.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas: [
+                  {
+                    evidenciaId: evA,
+                    fragmento: 'esto no aparece en ese documento por ninguna parte',
+                    localizacion: 'resumen',
+                  },
+                ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Y esto?', escenario: '' }],
+          },
+        }),
+      ).resolves.toBeTruthy();
     });
   });
 

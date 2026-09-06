@@ -906,12 +906,15 @@ function DestinoDelWorkspace({
   clase?: string;
 }) {
   const { to, etiqueta, abrev, contador, sufijo } = destino;
+  // El nombre accesible lleva lo que la fila DICE, no solo su rótulo: el sufijo y, sobre
+  // todo, el contador en palabras («3 pendientes de tu rol»), que en el riel ni se lee.
+  const nombre = [etiqueta, sufijo, contador?.titulo].filter(Boolean).join(' · ');
   return (
     <Link
       className={clase ? `loop-fila ${clase}` : 'loop-fila'}
       to={to}
-      title={etiqueta}
-      aria-label={etiqueta}
+      title={nombre}
+      aria-label={nombre}
       style={{ ...filaLateral, ...estilo }}
     >
       <span className="loop-ancho" style={{ flex: 1, ...truncado }}>

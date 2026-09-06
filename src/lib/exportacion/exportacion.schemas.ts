@@ -156,6 +156,8 @@ export const CATALOGO_EXPORT = [
   // reto, que también está fuera, y una HMW sin su reto es un id colgando.
   { tabla: 'oportunidad', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'oportunidad_insight', orden: 'oportunidad_id, insight_id', poda: { modo: 'fuera' } },
+  { tabla: 'concepto', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'concepto_evidencia', orden: 'concepto_id, evidencia_id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_etapa', orden: 'reabierto_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id', poda: { modo: 'fuera' } },
   // Medición temporal de impacto y post mortem (SPEC-07 / SYS-22): el contrato de

@@ -10463,6 +10463,90 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * Lo que se comprueba aquí es lo que la avería impedía: que la propuesta se pueda VER y
    * RECHAZAR. Aceptarla sigue siendo imposible, y eso también se mide.
    */
+  /**
+   * UNA PREGUNTA QUE DICE NACER DEL HALLAZGO 7 NO SE SELLA COMO SI NO NACIERA DE NINGUNO.
+   *
+   * El enlace pregunta→hallazgo se comprueba por ÍNDICE, con una subconsulta escalar. Y una
+   * subconsulta escalar que no encuentra fila devuelve NULL — exactamente lo mismo que devuelve
+   * cuando la clave no está—, así que con `is not distinct from` un `hallazgo_id` nulo
+   * satisfacía las DOS lecturas: la propuesta declaraba «esta pregunta nace del hallazgo 7», se
+   * materializaba sin enlace, y el sello lo daba por bueno. El rastro se borraba en silencio, y
+   * ese enlace es lo que distingue «ve a comprobar ESTE riesgo que la simulación se inventó» de
+   * una pregunta suelta.
+   *
+   * Es la tercera vez en este fichero que NULL significa dos cosas y la comparación no las
+   * distingue. Lo que lo arregla no es tratar el NULL: es preguntar por la PRESENCIA de la
+   * clave, que es la única forma de separar «no lo declara» de «lo declara mal».
+   *
+   * DOS CAPAS, y por eso el patrón acepta los dos mensajes. El servicio ya comprobaba el rango
+   * —«esa revisión dice que su pregunta N nace del hallazgo M, y sólo trae K»— y es el que
+   * responde por este camino, que es el que usa quien revisa. El agujero estaba en el SUELO,
+   * que es lo que queda cuando alguien escribe por la superficie SQL concedida sin pasar por el
+   * servicio. Medido neutralizando la comprobación del servicio: el guard de la base rechaza
+   * igual, con su propio motivo. Las dos cubren la misma regla y sólo el mensaje las separa.
+   */
+  it('C4: una pregunta con un hallazgoIndice que no existe no se puede sellar', async () => {
+    await enWorkspaceLimpio('c4-indice-fuera-de-rango', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '', hallazgoIndice: 0 }],
+        confianzaPropuesta: 'media' as const,
+      };
+      await conProveedor(
+        { ok: true, datos: { revisiones: [contenido] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+      // Fuera de rango, por fuera del servicio: el contrato acota el índice al parsear, así que
+      // sólo puede llegar así por la superficie SQL concedida.
+      for (const col of ['contenido', 'contenido_original']) {
+        await admin`update propuesta_ai
+            set ${admin(col)} = jsonb_set(${admin(col)}, '{preguntas,0,hallazgoIndice}',
+                                          to_jsonb(7))
+          where id = ${propuestaId} and workspace_id = ${wsC}`;
+      }
+
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId }),
+        'una pregunta que dice nacer de un hallazgo inexistente se selló como si no naciera de ninguno',
+      ).rejects.toThrow(/de qué hallazgo nacen|nace del hallazgo/i);
+
+      // Y la mitad sin la cual esto pasaría con el enlace tapiado: un índice que SÍ existe se
+      // sella con normalidad, y la pregunta cuelga de su hallazgo.
+      for (const col of ['contenido', 'contenido_original']) {
+        await admin`update propuesta_ai
+            set ${admin(col)} = jsonb_set(${admin(col)}, '{preguntas,0,hallazgoIndice}',
+                                          to_jsonb(0))
+          where id = ${propuestaId} and workspace_id = ${wsC}`;
+      }
+      const { objetoId } = await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      const [q] = await admin`select q.hallazgo_id, h.orden from pregunta_de_test q
+        join hallazgo_simulado h on h.id = q.hallazgo_id and h.workspace_id = q.workspace_id
+        where q.revision_id = ${objetoId}`;
+      expect(q!.orden).toBe(0);
+    });
+  });
+
   it('C4: un contenido sin la clave de sus citas no tumba el panel, y se puede rechazar', async () => {
     await enWorkspaceLimpio('c4-sin-hallazgos', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();

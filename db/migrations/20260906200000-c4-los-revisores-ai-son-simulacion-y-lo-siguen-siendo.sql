@@ -1922,7 +1922,31 @@ begin
             select h2.id from hallazgo_simulado h2
             where h2.revision_id = new.revision_simulada_id
               and h2.workspace_id = new.workspace_id
-              and h2.orden = (p.pr->>'hallazgoIndice')::integer)))) then
+              and h2.orden::text = p.pr->>'hallazgoIndice')
+          -- Y SI EL ÍNDICE SE DECLARA, TIENE QUE EXISTIR.
+          --
+          -- Una subconsulta escalar que no encuentra fila devuelve NULL — exactamente lo mismo
+          -- que devuelve cuando la clave no está—, así que un índice fuera de rango pasaba por
+          -- «esta pregunta no nace de ningún hallazgo» y la propuesta se sellaba borrando en
+          -- silencio el enlace que ella misma declara. El contrato acota el índice al parsear,
+          -- pero la superficie SQL concedida no corre el contrato, que es de donde viene la
+          -- fila torcida.
+          --
+          -- Es la tercera vez en este fichero que NULL significa dos cosas y la comparación no
+          -- las distingue: primero el array ausente en el recuento del sello, luego éste. Lo
+          -- que lo arregla no es tratar el NULL, es preguntar por la PRESENCIA de la clave.
+          --
+          -- Y se compara `orden::text` contra el texto del JSON en vez de castear el JSON a
+          -- integer: castear lo que sale del contenido es lo que ya tumbó el panel una vez, y
+          -- aquí un `hallazgoIndice` que no sea un número reventaría la aceptación con un error
+          -- del tipo en vez de con este motivo. Sin cast no hay nada que reventar: lo que no
+          -- coincide con ningún `orden` es un índice que no existe, y se rechaza.
+          and (p.pr -> 'hallazgoIndice' is null
+               or exists (
+                 select 1 from hallazgo_simulado h3
+                 where h3.revision_id = new.revision_simulada_id
+                   and h3.workspace_id = new.workspace_id
+                   and h3.orden::text = p.pr->>'hallazgoIndice'))))) then
     raise exception 'las preguntas de test de la revisión materializada no dicen lo que dice la propuesta: el texto, el escenario y de qué hallazgo nacen se copian tal cual de la propuesta aceptada (SYS-19)';
   end if;
 

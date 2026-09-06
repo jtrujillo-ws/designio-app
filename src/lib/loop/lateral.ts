@@ -1,6 +1,7 @@
 import { etiquetaDePendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
+import { ROLES_INFORME_GROUNDING } from '@/lib/ai/ai.schemas';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
 /**
@@ -34,7 +35,8 @@ export type RutaDelWorkspace =
   | '/segmentos'
   | '/exportacion'
   | '/disposicion'
-  | '/auditoria';
+  | '/auditoria'
+  | '/evals-grounding';
 
 export type ContadorDelLateral = {
   n: number;
@@ -75,6 +77,7 @@ export const ETIQUETA_GOBIERNO = 'Gobierno del workspace';
 const NOMBRE_CORTO_DE_GOBIERNO: Partial<Record<RutaDelWorkspace, string>> = {
   '/personas': 'personas',
   '/auditoria': 'auditoría',
+  '/evals-grounding': 'grounding medido',
   '/exportacion': 'exportación',
   '/disposicion': 'disposición',
 };
@@ -174,6 +177,24 @@ export function agruparLateral({
     { to: '/personas', etiqueta: 'Personas y permisos', abrev: 'PER' },
     ...((ROLES_AUDITORIA as readonly string[]).includes(rol)
       ? [{ to: '/auditoria', etiqueta: 'Auditoría', abrev: 'AUD' } as DestinoDelLateral]
+      : []),
+    /*
+     * Y el informe de grounding, con la MISMA puerta que la auditoría porque contesta la misma
+     * pregunta con otras cifras: qué tan de fiar es lo que la capa AI produjo. Va aquí, en lo
+     * archivístico, y no junto a «Propuestas AI»: no es trabajo del día —nadie revisa
+     * propuestas desde aquí— sino la medida que se mira cuando se pregunta si mejora.
+     *
+     * La puerta se deriva de `ROLES_INFORME_GROUNDING`, que a su vez se deriva de la de la
+     * auditoría: escrita a mano, el día que una de las dos cambiara la otra se quedaría atrás.
+     */
+    ...((ROLES_INFORME_GROUNDING as readonly string[]).includes(rol)
+      ? [
+          {
+            to: '/evals-grounding',
+            etiqueta: 'Grounding medido',
+            abrev: 'GRD',
+          } as DestinoDelLateral,
+        ]
       : []),
     { to: '/exportacion', etiqueta: 'Exportación del workspace', abrev: 'EXP' },
     {

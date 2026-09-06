@@ -10,6 +10,7 @@ import { z } from 'zod';
  * que nadie los llamara allí. Un reexport de tipos no crea esa arista.
  */
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 
 import type { ContenidoPropuesta } from './ai.contenido';
 export type {
@@ -1241,3 +1242,115 @@ export type ConsentimientoDeItem = {
   /** Versión del registro vigente; null si nunca se registró ninguno. */
   version: number | null;
 };
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// RF-08.7 — LA CORRIDA DE EVALS DE GROUNDING
+// ═════════════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Las cuatro métricas de grounding de §17, con el nombre que cada una MERECE.
+ *
+ * La primera no se llama «fidelidad de citas» aunque §17 la nombre así, y esa diferencia es
+ * la mitad del trabajo: §9 dice «la presencia de una cita no equivale a grounding correcto», y
+ * la fidelidad que pide —«la cita dice lo que el objeto afirma»— es un JUICIO. Lo que este
+ * repositorio sabe medir sin llamar a ningún modelo es si el fragmento aparece en el material,
+ * que es un SUELO: una cita que ni siquiera aparece no puede ser fiel, pero una que aparece
+ * puede sostener cualquier cosa. Publicarlo como «fidelidad» dejaría que el nombre hiciera el
+ * trabajo que la medición no hace.
+ *
+ * La lista es la misma que el CHECK de `medicion_eval.metrica`, y un censo lo comprueba contra
+ * la base: es la quinta vez en esta épica que una enumeración escrita en dos sitios se separa.
+ */
+export const METRICAS_DE_GROUNDING = [
+  'suelo-presencia-literal',
+  'afirmaciones-no-soportadas',
+  'correccion-humana',
+  'contradicciones',
+] as const;
+export type MetricaDeGrounding = (typeof METRICAS_DE_GROUNDING)[number];
+
+/**
+ * La fila del agregado del workspace, que va en la misma columna que las capacidades.
+ *
+ * En mayúscula y sin parecerse a ninguna del catálogo a propósito: la columna es texto —tiene
+ * que serlo, porque una capacidad que se apague deja filas escritas— y una etiqueta que
+ * pudiera confundirse con una capacidad haría que el total se sumara consigo mismo.
+ */
+export const CAPACIDAD_AGREGADA = 'TODAS';
+
+/**
+ * Quién PUEDE CORRER una eval, que no es lo mismo que quién puede leerla.
+ *
+ * Correrla ESCRIBE un hecho fechado en el workspace, así que es de quien lo lleva —los dos
+ * roles de boutique—, y es exactamente lo que dicen las políticas de INSERT de `corrida_eval` y
+ * `medicion_eval`. Un censo compara esta lista contra esas políticas en la base: escrita en dos
+ * sitios sin nada que las ate, la de aquí se habría quedado atrás el día que la otra cambiara,
+ * y el producto ofrecería un botón que la base rechaza.
+ */
+export const ROLES_CORREN_EVAL = ['lead-boutique', 'disenador'] as const;
+
+/**
+ * Y quién puede LEER el informe: los mismos que auditan lo que la AI hizo.
+ *
+ * Derivado, no copiado. El informe de grounding responde a la misma pregunta que la auditoría
+ * —«¿qué tan de fiar es lo que esta capa produjo?»— y su respuesta interesa al cliente que
+ * administra tanto como a la boutique: son recuentos sobre la calidad del trabajo que se le
+ * entrega, no la factura ni los nombres de los modelos. La RLS deja leer las dos tablas a todo
+ * miembro y así se queda —cerrarla tocaría una lectura ya declarada—; lo que la pantalla no
+ * ofrece es el enlace a quien no audita.
+ */
+export const ROLES_INFORME_GROUNDING = ROLES_AUDITORIA;
+
+/** Una medición: el par guardado, lo que no se pudo juzgar, y la tasa ya dividida. */
+export type MedicionDeGrounding = {
+  metrica: MetricaDeGrounding;
+  /** Una capacidad del catálogo, `TODAS` para el agregado, o una que el registro ya no cubre. */
+  capacidad: string;
+  /** Null los tres a la vez: esta métrica no tiene universo en esta capacidad. */
+  numerador: number | null;
+  denominador: number | null;
+  /**
+   * Casos que la corrida no pudo juzgar y por eso NO están en el denominador. Hoy solo el suelo
+   * de presencia los tiene: una cita cuyo material ya no es el que vio el modelo no tiene
+   * veredicto. Sin este número, una corrida que no pudo juzgar nada sale `0/0` y se lee igual
+   * que «aquí no se aceptó nada».
+   */
+  sinVeredicto: number | null;
+  /** `numerador / denominador`, o null si no hay universo o el denominador es cero. La división
+   * vive en un solo sitio porque lo que se guarda es el par. */
+  tasa: number | null;
+};
+
+/** Una corrida guardada, con sus mediciones. */
+export type CorridaDeGrounding = {
+  id: string;
+  /** La versión de la capa AI que se midió, que es también el FILTRO: solo entran las
+   * propuestas aceptadas generadas con ella. */
+  promptVersion: string;
+  corridaEn: string;
+  mediciones: MedicionDeGrounding[];
+};
+
+/**
+ * El informe: la última corrida CONTRA LA ANTERIOR, que es lo que pide el criterio 4 de
+ * SPEC-08 y lo que §17 convierte en la métrica («fidelidad que no mejora entre releases»).
+ */
+export type InformeDeGrounding = {
+  workspaceId: string;
+  /** Null si nunca se corrió ninguna: la pantalla lo dice en vez de pintar ceros. */
+  ultima: CorridaDeGrounding | null;
+  /** Null en la primera corrida. Sin ella no hay regresión que medir, y eso también se dice. */
+  anterior: CorridaDeGrounding | null;
+  /**
+   * La versión que corre HOY. Si no coincide con la de `ultima`, lo guardado mide OTRA capa: la
+   * pantalla lo avisa, porque leer un informe de la versión anterior como si fuera el de ésta
+   * es exactamente el error que §17 no perdona.
+   */
+  promptVersionActual: string;
+  /** Si quien mira puede correr una nueva. La base lo impone igual; esto evita ofrecer un
+   * botón que va a fallar. */
+  puedeCorrer: boolean;
+};
+
+export const CorridaEvalInputSchema = z.object({ workspaceId: z.string().uuid() });
+export type CorridaEvalInput = z.infer<typeof CorridaEvalInputSchema>;

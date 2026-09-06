@@ -28,9 +28,23 @@ create table corrida_eval (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references workspace(id),
   /*
-   * La versión de la capa AI con la que se midió. No se deriva de las propuestas medidas —que
-   * pueden ser de varias versiones— sino de la que corría al medir: es la que responde «¿mejoró
-   * respecto de la anterior?», que es la pregunta de §17.
+   * La versión de la capa AI que se midió, y a la vez EL FILTRO de la corrida: se miden las
+   * propuestas aceptadas cuyo `prompt_version` es ésta, no todas las del workspace.
+   *
+   * Es lo que hace comparables dos corridas, que es la pregunta de §17 —«fidelidad que no
+   * mejora entre releases»—. Midiendo todo lo aceptado, una corrida de hoy respondería con el
+   * grounding de tres versiones mezcladas y la mejora de la última quedaría diluida en la
+   * inercia de las anteriores; peor aún, la cifra se movería sola cuando lo viejo envejece,
+   * sin que nadie hubiera cambiado nada.
+   *
+   * Y cierra de paso un hueco de medición: `materialDelPanelEsElDelModelo` devuelve «no se
+   * sabe» cuando la propuesta es de OTRA versión de prompt, así que una corrida que mirara
+   * todo se encontraría el día del cambio de versión con casi todas sus citas sin veredicto —
+   * exactamente el día en que §17 quiere comparar.
+   *
+   * Lo que esto cuesta, y se dice en el informe en vez de esconderlo: la primera corrida
+   * después de un cambio de versión mide poco, porque hay pocas propuestas aceptadas de la
+   * versión nueva. El denominador guardado es lo que deja verlo.
    */
   prompt_version text not null check (btrim(prompt_version) <> '' and length(prompt_version) <= 100),
   corrida_en timestamptz not null default now(),
@@ -58,6 +72,14 @@ create table medicion_eval (
    * que este repositorio sabe medir sin llamar a nadie es si el fragmento APARECE en el
    * material, que es un suelo: una cita que ni siquiera aparece no puede ser fiel. Publicarlo
    * como «fidelidad» dejaría que el nombre hiciera el trabajo que la medición no hace.
+   *
+   * Y `contradicciones` SÍ se mide, contra lo que decía la primera versión de este comentario.
+   * Escribí aquí que no tenía definición operativa en el repositorio y era falso: `contradiccion`
+   * existe desde `20260902080000-insight-decision.sql` —«evidencia que CONTRADICE al insight; se
+   * registra y se muestra siempre, jamás bloquea» (RF-03.9)—, el contenido de C2 la lleva como
+   * campo obligatorio y `materializarInsight` la escribe al aceptar. Afirmar que faltaba, sin
+   * haber mirado la tabla, es exactamente la avería que esta épica lleva pagando: si se afirma,
+   * se mide.
    */
   metrica text not null check (metrica in (
     'suelo-presencia-literal',
@@ -69,27 +91,46 @@ create table medicion_eval (
    * media entre capacidades esconde justo lo que hay que ver: una que empeora sola. */
   capacidad text not null check (btrim(capacidad) <> '' and length(capacidad) <= 20),
   /*
-   * Y los dos NULOS a la vez, que es lo que hace visible una métrica DECLARADA Y NO MEDIDA.
+   * Y los dos NULOS a la vez, que es lo que hace visible una métrica SIN UNIVERSO.
    *
-   * `contradicciones` está en §17 y no tiene definición operativa en este repositorio: no hay
-   * ningún sitio donde el producto declare qué es una contradicción entre dos afirmaciones
-   * aceptadas. Inventarla aquí sería peor que no medirla, porque el número existiría y nadie
-   * sabría de qué. Así que la fila SE ESCRIBE con las dos cifras en null: la métrica aparece en
-   * el informe, con su hueco a la vista, en vez de que un informe con tres de cuatro parezca
-   * completo.
+   * No toda métrica tiene algo que contar en toda capacidad: `afirmaciones-no-soportadas` y
+   * `contradicciones` se miden sobre objetos —`afirmacion` con sus citas, `contradiccion`— que
+   * hoy solo nacen de C2, y las demás capacidades no materializan nada con esa forma. La fila
+   * SE ESCRIBE igualmente con las dos cifras en null: la métrica aparece en el informe, con su
+   * hueco a la vista y por capacidad, en vez de desaparecer de la tabla y dejar que un informe
+   * de tres parezca completo. Un cero diría «medido y salió cero», que es otra cosa.
    *
    * Los dos juntos o ninguno, como `tokens_entrada`/`tokens_salida` en `llamada_ai` y por la
    * misma razón: media medición no es una medición, es un número que engaña al compararlo.
    */
   numerador integer,
   denominador integer,
+  /*
+   * Y CUÁNTOS CASOS LA CORRIDA NO PUDO JUZGAR.
+   *
+   * Es la misma razón por la que se guarda el denominador, un paso más allá. Una tasa sin su
+   * denominador no se puede comparar; un denominador que EXCLUYÓ casos en silencio tampoco, y
+   * ese es el caso real del suelo de presencia: cuando el material que se recompone hoy ya no
+   * es el que vio el modelo, la cita no tiene veredicto —medirla contra el estado de hoy pinta
+   * en verde lo que una edición ajena añadió y en rojo lo que borró—. Sin esta columna, una
+   * corrida en la que todo el material se editó sale `0/0`, que se lee igual que «este
+   * workspace no aceptó ninguna propuesta»: dos situaciones opuestas con la misma cara.
+   *
+   * Nulo exactamente cuando la métrica no tiene universo, para que las tres cifras cuenten la
+   * misma historia; cero es la respuesta normal de las métricas que sí saben juzgar todos sus
+   * casos, y es un dato, no un hueco.
+   */
+  sin_veredicto integer,
   primary key (corrida_id, metrica, capacidad),
   foreign key (corrida_id, workspace_id) references corrida_eval (id, workspace_id) on delete cascade,
-  constraint medicion_eval_par_completo check ((numerador is null) = (denominador is null)),
+  constraint medicion_eval_par_completo check (
+    (numerador is null) = (denominador is null) and (numerador is null) = (sin_veredicto is null)
+  ),
   constraint medicion_eval_rango check (
-    numerador is null or (numerador >= 0 and denominador >= numerador)
+    numerador is null or (numerador >= 0 and denominador >= numerador and sin_veredicto >= 0)
   )
 );
+
 create index medicion_eval_corrida_idx on medicion_eval (workspace_id, corrida_id);
 
 -- ── Y la congelación por disposición, que abre en toda tabla de workspace ──

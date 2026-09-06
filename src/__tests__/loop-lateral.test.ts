@@ -5,6 +5,7 @@ import {
   agruparLateral,
   claveDeGobierno,
   notaDeGobierno,
+  type RutaDelWorkspace,
 } from '@/lib/loop/lateral';
 
 /**
@@ -107,6 +108,7 @@ describe('agrupación del lateral (4a)', () => {
     expect(lead.gobierno.map((d) => d.to)).toEqual([
       '/personas',
       '/auditoria',
+      '/evals-grounding',
       '/exportacion',
       '/disposicion',
     ]);
@@ -138,7 +140,14 @@ describe('agrupación del lateral (4a)', () => {
           agruparLateral({ rol, pendientesDelRol: p, importacionPendientes: b }),
         ).map((d) => d.to);
         expect(new Set(rutas).size).toBe(rutas.length);
-        const esperadas = 14 - (rutas.includes('/auditoria') ? 0 : 1);
+        /*
+         * El total se deriva de QUÉ puertas condicionadas trae este rol, no de un número
+         * escrito a mano por cada una. Con `14 - (…auditoría…)`, la segunda puerta por rol
+         * —el informe de grounding— dejó el censo rojo sin haber roto nada, y arreglarlo
+         * restando otro literal habría hecho lo mismo con la tercera.
+         */
+        const conPuerta: RutaDelWorkspace[] = ['/auditoria', '/evals-grounding'];
+        const esperadas = 15 - conPuerta.filter((r) => !rutas.includes(r)).length;
         expect(rutas).toHaveLength(esperadas);
       }
     }
@@ -151,7 +160,7 @@ describe('agrupación del lateral (4a)', () => {
       importacionPendientes: 0,
     });
     expect(notaDeGobierno(lead.gobierno)).toBe(
-      'Personas, auditoría, exportación y disposición: se abren cuando se buscan, no cada día.',
+      'Personas, auditoría, grounding medido, exportación y disposición: se abren cuando se buscan, no cada día.',
     );
     const sponsor = agruparLateral({
       rol: 'sponsor',

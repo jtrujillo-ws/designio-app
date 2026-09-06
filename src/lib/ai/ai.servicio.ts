@@ -2070,19 +2070,6 @@ export function proyeccionDelPanel(tx: TransactionSql): {
 }
 
 /**
- * La definición de la capacidad de ESTA fila, o `undefined` si el panel no la conoce.
- *
- * `propuesta_ai.capacidad` admite las diez del catálogo y solo dos están activas, así que una
- * fila puede nombrar una capacidad que este código no sabe pintar. No se esconde —una
- * propuesta invisible es una que nadie puede rechazar— pero tampoco se le presta el juicio de
- * otra: sale sin material y sin motivo, y `filaDePanel` lee eso como «ancla-ausente», que es
- * solo rechazable.
- */
-function definicionDeFila(f: Record<string, unknown>): CapacidadEnElPanel | undefined {
-  return CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva];
-}
-
-/**
  * La columna por la que cuelga ESTA fila.
  *
  * Sale de lo que la CAPACIDAD declara —no de buscar cuál de las columnas trae valor—, porque
@@ -2136,6 +2123,62 @@ function sinPasajesVetados<T>(valor: T, vetados: Set<string>): T {
   ) as T;
 }
 
+/**
+ * LAS CITAS DE UNA PROPUESTA Y SU PRESENCIA LITERAL, cita a cita.
+ *
+ * Vive aquí y no dentro de la ficha porque tiene DOS lectores —el panel de revisión, que la
+ * pinta, y la corrida de evals, que la cuenta— y una regla con dos lectores escrita dos veces
+ * es la avería que esta épica lleva pagando: el día que la presencia cambie de definición,
+ * cambiaría en una de las dos y la medida diría otra cosa que la pantalla.
+ *
+ * Lo que SÍ decide cada lector es el `original` que pasa: la ficha lo pasa recortado —lo que
+ * enseña—, la corrida lo pasa crudo —lo que el modelo emitió—. Es el mismo cálculo sobre dos
+ * entradas distintas a propósito, y por eso el argumento es explícito en vez de leerse de `f`.
+ *
+ * Las tres respuestas de cada cita:
+ *  - `true` / `false`: el fragmento aparece —o no— en el material que su capacidad declara.
+ *  - `null`: NO SE PUEDE COMPROBAR, porque el material que se recompone hoy ya no es el que
+ *    vio el modelo. Medir contra el estado de hoy pinta en verde lo que una edición ajena
+ *    añadió y en rojo la cita legítima que esa edición borró; las dos mentiras caben en un
+ *    booleano y la única respuesta honesta es que no hay veredicto.
+ *
+ * `undefined` y `null` de `pajarDeLaCita` NO son lo mismo, y colapsarlos con un `??` devolvía
+ * un verde prestado: `undefined` es «esta capacidad no declara pajar» —y su pajar es el
+ * material entero: CI, C0 y CT citan contra uno solo—; `null` es «la cita nombra un trozo que
+ * no está en el material», cuya respuesta es la cadena vacía, o sea ausente. Con `?? material`
+ * esa cita a un documento que el modelo no vio se medía contra TODOS los demás y salía
+ * presente si el texto estaba en cualquiera de ellos.
+ *
+ * Y sin citas es lo correcto para una capacidad que el registro no cubre, no un apaño: si
+ * nadie sabe dónde las guarda, decir «cero citas» es más honesto que inventarse dónde
+ * buscarlas.
+ */
+export function citasConPresencia(
+  f: Record<string, unknown>,
+  original: ContenidoPropuesta,
+): { citas: CitaDelContenido[]; presencias: (boolean | null)[] } {
+  const definicion = CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva] as
+    | CapacidadEnElPanel
+    | undefined;
+  // El material lo recompone la CAPACIDAD, que es lo que decide qué leyó el modelo. Con la
+  // columna del ancla no bastaba: dos capacidades pueden colgar del mismo reto y citar cosas
+  // distintas —C0 la formulación, una posterior la evidencia codificada—, así que indexarlo
+  // por columna le habría dado a la segunda el pajar de la primera y sus citas habrían salido
+  // ausentes estando presentes.
+  const material = definicion?.material(f) ?? '';
+  // Por CAPACIDAD, no por la forma del objeto: las de C2 viven dentro de cada afirmación, y
+  // con `'citas' in original` su grounding se habría medido sobre una lista vacía — o sea, no
+  // se habría medido, que es el peor resultado posible para una medida de grounding.
+  const citas = CITAS_DEL_CONTENIDO[f.capacidad as CapacidadActiva]?.(original) ?? [];
+  const vigente = definicion?.materialVigente?.(f) ?? true;
+  const presencias = citas.map((c) => {
+    if (!vigente) return null;
+    if (!definicion?.pajarDeLaCita) return presenciaLiteralPorCita(material ?? '', [c])[0]!;
+    return presenciaLiteralPorCita(definicion.pajarDeLaCita(f, c) ?? '', [c])[0]!;
+  });
+  return { citas, presencias };
+}
+
 function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   const vetados = new Set(
     ((f.material_vetado as string[] | null) ?? []).map((x) => x.toLowerCase()),
@@ -2147,64 +2190,20 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
   // distintas —C0 la formulación, una posterior la evidencia codificada—, así que indexarlo
   // por columna le habría dado a la segunda el pajar de la primera y sus citas habrían salido
   // ausentes estando presentes.
-  const material = definicionDeFila(f)?.material(f) ?? '';
-  const columna = columnaDelAncla(f);
-  // Las citas se leen del ORIGINAL: son el testimonio del modelo sobre lo que leyó, no del
-  // humano que corrige. Hoy son siempre las mismas —corregirlas está prohibido en el
-  // servicio y en el guard— y leerlas de aquí lo deja dicho en la proyección también.
-  // Por CAPACIDAD, no por la forma del objeto: las de C2 viven dentro de cada afirmación, y
-  // con `'citas' in original` su grounding se habría medido sobre una lista vacía — o sea, no
-  // se habría medido, que es el peor resultado posible para una medida de grounding.
-  /*
-   * Y degradando si la capacidad no está en el registro. `f.capacidad` son las diez de
-   * SPEC-08 y el registro cubre las ACTIVAS, así que la indexación puede devolver `undefined`
-   * de verdad: una fila escrita por una versión más nueva del servidor, o una capacidad que
-   * vuelve a apagarse dejando propuestas pendientes. Llamar a `undefined` aquí no degradaba la
-   * fila, tiraba el panel entero — y con él las filas de todas las demás capacidades.
-   *
-   * Sin citas es lo correcto y no un apaño: si nadie sabe dónde las guarda esa capacidad, no
-   * hay nada que medir, y decir «cero citas» es más honesto que inventarse dónde buscarlas.
-   */
   const definicion = CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva] as
     | CapacidadEnElPanel
     | undefined;
-  const citas = CITAS_DEL_CONTENIDO[f.capacidad as CapacidadActiva]?.(original) ?? [];
   /*
-   * La presencia, CITA A CITA, contra el trozo de material que cada una nombra cuando su
-   * capacidad lo declara. Antes se resolvía de una vez para toda la fila porque «el pajar es
-   * el mismo para todas sus citas», y eso dejó de ser cierto con C2: su material son varios
-   * documentos y cada cita dice de cuál sale.
-   */
-  /*
-   * Y si el material que se acaba de recomponer YA NO es el que vio el modelo, no hay
-   * veredicto que dar. Medir contra el estado de hoy pinta en verde un fragmento que una
-   * edición ajena acaba de añadir y en rojo una cita legítima que esa edición borró: las dos
-   * mentiras caben en un booleano, y la única respuesta honesta es que no se puede comprobar.
+   * Las citas se miden sobre el ORIGINAL YA RECORTADO, que es lo que esta pantalla enseña.
    *
-   * Lo contesta la CAPACIDAD, porque solo ella sabe si guardó algo con qué comparar. Las que
-   * no lo declaran siguen midiendo como siempre.
+   * Quien mide (`ai.evals.ts`) pasa el crudo, y la diferencia está en el ARGUMENTO y no en dos
+   * copias de la cuenta: es lo que hace que la medida no pueda separarse de lo que se pinta.
+   * Aquí el recortado es lo correcto —al lado se lee «pasaje retirado», así que el rojo no
+   * acusa a nadie de algo que quien mira no puede contrastar—; allí lo correcto es el crudo,
+   * porque una medida no puede depender del rol de quien la toma.
    */
-  const vigente = definicion?.materialVigente?.(f) ?? true;
-  /*
-   * La presencia, CITA A CITA, contra el trozo de material que cada una nombra cuando su
-   * capacidad lo declara. Antes se resolvía de una vez para toda la fila porque «el pajar es
-   * el mismo para todas sus citas», y eso dejó de ser cierto con C2: su material son varios
-   * documentos y cada cita dice de cuál sale.
-   */
-  const presencias = citas.map((c) => {
-    if (!vigente) return null;
-    /*
-     * `undefined` y `null` NO son lo mismo aquí, y colapsarlos con un `??` devolvía el verde
-     * prestado que `pajarDeLaCita` existe para quitar. `undefined` es «esta capacidad no
-     * declara pajar», y su respuesta es el material entero —CI, C0 y CT citan contra uno
-     * solo—. `null` es «la cita nombra un trozo que no está en el material», y su respuesta
-     * es la cadena vacía: ausente. Con `?? material`, esa cita a un documento que el modelo
-     * no vio se medía contra TODOS los demás y salía presente si el texto estaba en
-     * cualquiera de ellos.
-     */
-    if (!definicion?.pajarDeLaCita) return presenciaLiteralPorCita(material ?? '', [c])[0]!;
-    return presenciaLiteralPorCita(definicion.pajarDeLaCita(f, c) ?? '', [c])[0]!;
-  });
+  const { citas, presencias } = citasConPresencia(f, original);
+  const columna = columnaDelAncla(f);
   // El original solo viaja cuando difiere: una corrección nunca oculta lo que la AI había
   // dicho de verdad (SYS-17).
   const originalEnviado =

@@ -18,6 +18,7 @@ import { Route as AutenticadaAuditoriaRouteImport } from './routes/_autenticada/
 import { Route as AutenticadaBibliotecaRouteImport } from './routes/_autenticada/biblioteca'
 import { Route as AutenticadaDesignVersionsRouteImport } from './routes/_autenticada/design-versions'
 import { Route as AutenticadaDisposicionRouteImport } from './routes/_autenticada/disposicion'
+import { Route as AutenticadaEvalsGroundingRouteImport } from './routes/_autenticada/evals-grounding'
 import { Route as AutenticadaEvidenciaRouteImport } from './routes/_autenticada/evidencia'
 import { Route as AutenticadaExportacionRouteImport } from './routes/_autenticada/exportacion'
 import { Route as AutenticadaImportacionRouteImport } from './routes/_autenticada/importacion'
@@ -77,6 +78,12 @@ const AutenticadaDisposicionRoute = AutenticadaDisposicionRouteImport.update({
   path: '/disposicion',
   getParentRoute: () => AutenticadaRoute,
 } as any)
+const AutenticadaEvalsGroundingRoute =
+  AutenticadaEvalsGroundingRouteImport.update({
+    id: '/evals-grounding',
+    path: '/evals-grounding',
+    getParentRoute: () => AutenticadaRoute,
+  } as any)
 const AutenticadaEvidenciaRoute = AutenticadaEvidenciaRouteImport.update({
   id: '/evidencia',
   path: '/evidencia',
@@ -156,6 +163,7 @@ export interface FileRoutesByFullPath {
   '/biblioteca': typeof AutenticadaBibliotecaRoute
   '/design-versions': typeof AutenticadaDesignVersionsRoute
   '/disposicion': typeof AutenticadaDisposicionRoute
+  '/evals-grounding': typeof AutenticadaEvalsGroundingRoute
   '/evidencia': typeof AutenticadaEvidenciaRoute
   '/exportacion': typeof AutenticadaExportacionRoute
   '/importacion': typeof AutenticadaImportacionRoute
@@ -179,6 +187,7 @@ export interface FileRoutesByTo {
   '/biblioteca': typeof AutenticadaBibliotecaRoute
   '/design-versions': typeof AutenticadaDesignVersionsRoute
   '/disposicion': typeof AutenticadaDisposicionRoute
+  '/evals-grounding': typeof AutenticadaEvalsGroundingRoute
   '/evidencia': typeof AutenticadaEvidenciaRoute
   '/exportacion': typeof AutenticadaExportacionRoute
   '/importacion': typeof AutenticadaImportacionRoute
@@ -204,6 +213,7 @@ export interface FileRoutesById {
   '/_autenticada/biblioteca': typeof AutenticadaBibliotecaRoute
   '/_autenticada/design-versions': typeof AutenticadaDesignVersionsRoute
   '/_autenticada/disposicion': typeof AutenticadaDisposicionRoute
+  '/_autenticada/evals-grounding': typeof AutenticadaEvalsGroundingRoute
   '/_autenticada/evidencia': typeof AutenticadaEvidenciaRoute
   '/_autenticada/exportacion': typeof AutenticadaExportacionRoute
   '/_autenticada/importacion': typeof AutenticadaImportacionRoute
@@ -229,6 +239,7 @@ export interface FileRouteTypes {
     | '/biblioteca'
     | '/design-versions'
     | '/disposicion'
+    | '/evals-grounding'
     | '/evidencia'
     | '/exportacion'
     | '/importacion'
@@ -252,6 +263,7 @@ export interface FileRouteTypes {
     | '/biblioteca'
     | '/design-versions'
     | '/disposicion'
+    | '/evals-grounding'
     | '/evidencia'
     | '/exportacion'
     | '/importacion'
@@ -276,6 +288,7 @@ export interface FileRouteTypes {
     | '/_autenticada/biblioteca'
     | '/_autenticada/design-versions'
     | '/_autenticada/disposicion'
+    | '/_autenticada/evals-grounding'
     | '/_autenticada/evidencia'
     | '/_autenticada/exportacion'
     | '/_autenticada/importacion'
@@ -361,6 +374,13 @@ declare module '@tanstack/react-router' {
       path: '/disposicion'
       fullPath: '/disposicion'
       preLoaderRoute: typeof AutenticadaDisposicionRouteImport
+      parentRoute: typeof AutenticadaRoute
+    }
+    '/_autenticada/evals-grounding': {
+      id: '/_autenticada/evals-grounding'
+      path: '/evals-grounding'
+      fullPath: '/evals-grounding'
+      preLoaderRoute: typeof AutenticadaEvalsGroundingRouteImport
       parentRoute: typeof AutenticadaRoute
     }
     '/_autenticada/evidencia': {
@@ -464,6 +484,7 @@ interface AutenticadaRouteChildren {
   AutenticadaBibliotecaRoute: typeof AutenticadaBibliotecaRoute
   AutenticadaDesignVersionsRoute: typeof AutenticadaDesignVersionsRoute
   AutenticadaDisposicionRoute: typeof AutenticadaDisposicionRoute
+  AutenticadaEvalsGroundingRoute: typeof AutenticadaEvalsGroundingRoute
   AutenticadaEvidenciaRoute: typeof AutenticadaEvidenciaRoute
   AutenticadaExportacionRoute: typeof AutenticadaExportacionRoute
   AutenticadaImportacionRoute: typeof AutenticadaImportacionRoute
@@ -485,6 +506,7 @@ const AutenticadaRouteChildren: AutenticadaRouteChildren = {
   AutenticadaBibliotecaRoute: AutenticadaBibliotecaRoute,
   AutenticadaDesignVersionsRoute: AutenticadaDesignVersionsRoute,
   AutenticadaDisposicionRoute: AutenticadaDisposicionRoute,
+  AutenticadaEvalsGroundingRoute: AutenticadaEvalsGroundingRoute,
   AutenticadaEvidenciaRoute: AutenticadaEvidenciaRoute,
   AutenticadaExportacionRoute: AutenticadaExportacionRoute,
   AutenticadaImportacionRoute: AutenticadaImportacionRoute,

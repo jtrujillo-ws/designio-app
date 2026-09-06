@@ -20010,6 +20010,44 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y LA CORRIDA DE LA VERSIÓN ANTERIOR NO LA DESPLAZA LA SEGUNDA DE ESTA.
+   *
+   * Es la comparación que §17 pide —«fidelidad que no mejora entre releases»— y con «las dos
+   * últimas» a secas se perdía en cuanto una versión se medía dos veces: la corrida de la
+   * versión previa salía de la ventana y el informe dejaba de poder responder la pregunta para
+   * la que existe, TENIENDO el dato guardado. Lo demostraba la propia pantalla, que ya avisaba
+   * de que un delta entre corridas de la misma versión sólo dice cuánto creció la muestra.
+   *
+   * Se mide con tres corridas y el reparto de versiones que lo rompe: V1, V2, V2. La de V1 no
+   * es «la anterior» —lo es la primera de V2— pero sí es contra la que se lee la regresión.
+   */
+  it('RF-08.7: la segunda corrida de una versión no expulsa a la de la versión anterior', async () => {
+    await enWorkspaceLimpio('eval-dos-versiones', async ({ ws: wsC, curadorId }) => {
+      const admin = sqlAdmin();
+      const vieja = await correrEvalDeGrounding(curadorId, wsC);
+      // La primera se reetiqueta como de OTRA versión. Sólo la base puede: `prompt_version` es
+      // lineage y está fuera del grant de UPDATE de la aplicación.
+      await admin`update corrida_eval set prompt_version = 'ai-anterior'
+        where workspace_id = ${wsC} and id = ${vieja.ultima!.id}`;
+
+      const primeraDeEsta = await correrEvalDeGrounding(curadorId, wsC);
+      expect(primeraDeEsta.anterior?.promptVersion).toBe('ai-anterior');
+      expect(primeraDeEsta.anteriorDeOtraVersion?.id).toBe(vieja.ultima!.id);
+
+      // Y la SEGUNDA de esta versión, que es donde se rompía: «la anterior» pasa a ser la de la
+      // misma versión —correcto, es la inmediatamente previa— y la de la versión vieja tiene
+      // que seguir viajando aparte.
+      const segundaDeEsta = await correrEvalDeGrounding(curadorId, wsC);
+      expect(segundaDeEsta.anterior?.id).toBe(primeraDeEsta.ultima!.id);
+      expect(segundaDeEsta.anterior?.promptVersion).toBe(PROMPT_VERSION);
+      expect(
+        segundaDeEsta.anteriorDeOtraVersion?.id,
+        'la corrida de la versión anterior se perdió: la regresión entre releases deja de leerse desde la segunda corrida de cada versión',
+      ).toBe(vieja.ultima!.id);
+    });
+  });
+
+  /**
    * Y LAS DOS PUERTAS, que no son la misma.
    *
    * Leer el informe es de quien audita; correrlo escribe un hecho fechado y es de quien lleva el

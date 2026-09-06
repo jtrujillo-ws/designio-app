@@ -65,9 +65,15 @@ const cifra: CSSProperties = { ...celda, fontFamily: 'var(--font-mono)', textAli
 /**
  * Cómo se presenta cada métrica, y QUÉ DIRECCIÓN es la buena.
  *
- * La dirección importa tanto como el número: en tres de las cuatro, subir es empeorar
- * —corregir más, sostener menos—, y en `contradicciones` es al revés. Sin decirlo, una flecha
- * roja al lado de la única métrica que mejora habría leído lo contrario de lo que pasa.
+ * La dirección importa tanto como el número, y va **dos y dos**, no tres y una: subir es BUENO
+ * en el suelo de presencia —más citas que aparecen— y en las contradicciones —más insights con
+ * su contraevidencia—, y es MALO en las afirmaciones sin sostén y en la corrección humana. Sin
+ * declararlo por métrica, un delta rojo al lado de una que mejora leería justo lo contrario de
+ * lo que pasa.
+ *
+ * (Este comentario decía «en tres de las cuatro, subir es empeorar», y era falso: lo
+ * contradecían dos entradas de la tabla que hay debajo. Una revisión lo cazó. Si se afirma, se
+ * mira.)
  */
 const PRESENTACION: Record<
   MetricaDeGrounding,
@@ -270,16 +276,34 @@ function PantallaEvalsGrounding() {
                       está en producción: hace falta una corrida nueva.
                     </span>
                   )}
-                  {informe.anterior &&
-                    informe.anterior.promptVersion === informe.ultima.promptVersion && (
-                      <span
-                        style={{ font: '400 12.5px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}
-                      >
-                        Las dos corridas midieron la misma versión de la capa AI, así que la
-                        diferencia dice cuánto creció la muestra, no si la capa mejoró. La alarma
-                        de §17 se lee comparando corridas de VERSIONES distintas.
-                      </span>
-                    )}
+                  <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline' }}>
+                    <span style={micro}>Última de otra versión</span>
+                    <span style={{ font: '400 13px var(--font-mono)', color: 'var(--text-body)' }}>
+                      {informe.anteriorDeOtraVersion
+                        ? `${informe.anteriorDeOtraVersion.corridaEn.slice(0, 16)} · ${informe.anteriorDeOtraVersion.promptVersion}`
+                        : 'no hay'}
+                    </span>
+                  </div>
+                  {/* Las dos comparaciones responden preguntas distintas, y decirlo es lo que
+                      impide leer la primera como si fuera la segunda. */}
+                  <span
+                    style={{ font: '400 12.5px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}
+                  >
+                    «Vs. anterior» compara con la corrida inmediatamente previa: si las dos
+                    midieron la misma versión, esa diferencia dice cuánto creció la muestra, no si
+                    la capa mejoró. La alarma de §17 —«fidelidad que no mejora entre releases»— se
+                    lee en «vs. otra versión», y por eso esa corrida se conserva aunque haya
+                    varias más recientes de la versión de hoy.
+                  </span>
+                  {informe.anteriorDeOtraVersion === null && informe.anterior && (
+                    <span
+                      style={{ font: '400 12.5px/1.55 var(--font-sans)', color: 'var(--text-muted)' }}
+                    >
+                      Todavía no se ha medido más de una versión de la capa AI, así que la
+                      regresión entre releases no se puede leer aún. Aparece con la primera
+                      corrida posterior a un cambio de versión.
+                    </span>
+                  )}
                 </Card>
 
                 {METRICAS_DE_GROUNDING.map((metrica) => (
@@ -288,6 +312,7 @@ function PantallaEvalsGrounding() {
                     metrica={metrica}
                     ultima={informe.ultima!}
                     anterior={informe.anterior}
+                    otraVersion={informe.anteriorDeOtraVersion}
                   />
                 ))}
               </>
@@ -303,10 +328,14 @@ function TablaDeMetrica({
   metrica,
   ultima,
   anterior,
+  otraVersion,
 }: {
   metrica: MetricaDeGrounding;
   ultima: CorridaDeGrounding;
   anterior: CorridaDeGrounding | null;
+  /** La última de una versión distinta: la comparación que §17 pide, y la que se pierde si sólo
+   * se guarda «la anterior» cuando una versión se mide dos veces. */
+  otraVersion: CorridaDeGrounding | null;
 }) {
   const p = PRESENTACION[metrica];
   const filas = ultima.mediciones.filter((m) => m.metrica === metrica);
@@ -315,9 +344,10 @@ function TablaDeMetrica({
   // ver, que es una empeorando sola.
   const agregada = filas.find((m) => m.capacidad === CAPACIDAD_AGREGADA);
   const porCapacidad = filas.filter((m) => m.capacidad !== CAPACIDAD_AGREGADA);
-  const antes = new Map(
-    anterior?.mediciones.filter((m) => m.metrica === metrica).map((m) => [m.capacidad, m]) ?? [],
-  );
+  const porCapacidadDe = (c: CorridaDeGrounding | null) =>
+    new Map(c?.mediciones.filter((m) => m.metrica === metrica).map((m) => [m.capacidad, m]) ?? []);
+  const antes = porCapacidadDe(anterior);
+  const antesDeOtra = porCapacidadDe(otraVersion);
 
   return (
     <Card style={{ padding: 0, overflow: 'hidden' }}>
@@ -332,7 +362,7 @@ function TablaDeMetrica({
       {/* Ancho variable dentro de su propia caja: la tabla se desplaza sola en una pantalla
           estrecha en vez de arrastrar la página entera. */}
       <div style={{ overflowX: 'auto' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 620 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 760 }}>
           <thead>
             <tr>
               <th scope="col" style={{ ...celda, ...micro }}>
@@ -351,6 +381,9 @@ function TablaDeMetrica({
                 vs. anterior
               </th>
               <th scope="col" style={{ ...cifra, ...micro }}>
+                vs. otra versión
+              </th>
+              <th scope="col" style={{ ...cifra, ...micro }}>
                 Sin veredicto
               </th>
             </tr>
@@ -360,6 +393,7 @@ function TablaDeMetrica({
               <FilaDeMedicion
                 m={agregada}
                 previa={antes.get(agregada.capacidad) ?? null}
+                previaDeOtraVersion={antesDeOtra.get(agregada.capacidad) ?? null}
                 subirEsBueno={p.subirEsBueno}
                 destacada
               />
@@ -369,6 +403,7 @@ function TablaDeMetrica({
                 key={m.capacidad}
                 m={m}
                 previa={antes.get(m.capacidad) ?? null}
+                previaDeOtraVersion={antesDeOtra.get(m.capacidad) ?? null}
                 subirEsBueno={p.subirEsBueno}
               />
             ))}
@@ -379,14 +414,54 @@ function TablaDeMetrica({
   );
 }
 
+/** El delta de una tasa contra una referencia, o null si alguna de las dos no existe. */
+function delta(m: MedicionDeGrounding, referencia: MedicionDeGrounding | null): number | null {
+  if (m.tasa === null || referencia?.tasa == null) return null;
+  return m.tasa - referencia.tasa;
+}
+
+/**
+ * Una celda de diferencia, con su color decidido por la DIRECCIÓN que la métrica declara.
+ *
+ * Un delta por debajo de la resolución que se imprime sale neutro: teñir de rojo un cambio que
+ * la propia celda muestra como «0.0 puntos» sería una alarma que nadie puede rastrear.
+ */
+function CeldaDelta({
+  d,
+  subirEsBueno,
+  sinUniverso,
+  sinReferencia,
+}: {
+  d: number | null;
+  subirEsBueno: boolean;
+  sinUniverso: boolean;
+  /** Qué decir cuando no hay contra qué comparar, que no es lo mismo que «no cambió». */
+  sinReferencia: string;
+}) {
+  const relevante = d !== null && Math.abs(d) >= 0.0005;
+  const mejora = relevante && d !== null && d > 0 === subirEsBueno;
+  const color = !relevante ? 'var(--text-muted)' : mejora ? 'var(--ok)' : 'var(--danger)';
+  return (
+    <td style={{ ...cifra, color }}>
+      {d === null
+        ? sinUniverso
+          ? ''
+          : sinReferencia
+        : `${d > 0 ? '+' : ''}${(d * 100).toFixed(1)} puntos`}
+    </td>
+  );
+}
+
 function FilaDeMedicion({
   m,
   previa,
+  previaDeOtraVersion,
   subirEsBueno,
   destacada = false,
 }: {
   m: MedicionDeGrounding;
   previa: MedicionDeGrounding | null;
+  previaDeOtraVersion: MedicionDeGrounding | null;
   subirEsBueno: boolean;
   destacada?: boolean;
 }) {
@@ -396,17 +471,6 @@ function FilaDeMedicion({
    * un cero en «afirmaciones no soportadas» diría «medido y salió limpio».
    */
   const sinUniverso = m.numerador === null;
-  const delta =
-    m.tasa !== null && previa?.tasa != null && previa.tasa !== undefined
-      ? m.tasa - previa.tasa
-      : null;
-  // El color lo decide la DIRECCIÓN que la métrica declara, no el signo. Un delta menor que la
-  // resolución que se imprime se pinta neutro: teñir de rojo un cambio que la propia columna
-  // muestra como «0.0 por ciento» sería una alarma que nadie puede ver de dónde sale.
-  const relevante = delta !== null && Math.abs(delta) >= 0.0005;
-  const mejora = relevante && delta !== null && delta > 0 === subirEsBueno;
-  const color = !relevante ? 'var(--text-muted)' : mejora ? 'var(--ok)' : 'var(--danger)';
-
   const fondo = destacada ? 'var(--surface-sunken)' : undefined;
   return (
     <tr style={{ background: fondo }}>
@@ -423,13 +487,20 @@ function FilaDeMedicion({
       <td style={cifra}>{sinUniverso ? 'no aplica' : m.numerador}</td>
       <td style={cifra}>{sinUniverso ? '' : m.denominador}</td>
       <td style={cifra}>{sinUniverso ? '' : porcentaje(m.tasa)}</td>
-      <td style={{ ...cifra, color }}>
-        {delta === null
-          ? sinUniverso
-            ? ''
-            : 'sin comparación'
-          : `${delta > 0 ? '+' : ''}${(delta * 100).toFixed(1)} puntos`}
-      </td>
+      <CeldaDelta
+        d={delta(m, previa)}
+        subirEsBueno={subirEsBueno}
+        sinUniverso={sinUniverso}
+        sinReferencia="sin comparación"
+      />
+      {/* Y la de §17. «Sin otra versión» no es «no cambió»: la primera se dice cuando todavía
+          no hay una corrida de otra versión contra la que leer la regresión. */}
+      <CeldaDelta
+        d={delta(m, previaDeOtraVersion)}
+        subirEsBueno={subirEsBueno}
+        sinUniverso={sinUniverso}
+        sinReferencia="sin otra versión"
+      />
       <td style={cifra}>{sinUniverso ? '' : m.sinVeredicto}</td>
     </tr>
   );

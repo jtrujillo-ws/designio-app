@@ -1339,8 +1339,21 @@ export type InformeDeGrounding = {
   workspaceId: string;
   /** Null si nunca se corrió ninguna: la pantalla lo dice en vez de pintar ceros. */
   ultima: CorridaDeGrounding | null;
-  /** Null en la primera corrida. Sin ella no hay regresión que medir, y eso también se dice. */
+  /**
+   * La corrida inmediatamente previa, sea de la versión que sea: la literalidad del criterio 4
+   * de SPEC-08. Null en la primera, y eso se dice en vez de pintar un delta de la nada.
+   */
   anterior: CorridaDeGrounding | null;
+  /**
+   * Y la última de una versión DISTINTA, que es contra la que §17 quiere comparar.
+   *
+   * Son dos preguntas y hacen falta las dos. Con sólo `anterior`, la segunda corrida de una
+   * misma versión desplazaba a la última de la versión previa, y desde ahí el informe ya no
+   * podía responder «¿mejoró entre releases?» teniendo el dato guardado — mientras la propia
+   * pantalla avisaba de que un delta entre corridas de la misma versión sólo dice cuánto creció
+   * la muestra. Null hasta que se haya medido más de una versión.
+   */
+  anteriorDeOtraVersion: CorridaDeGrounding | null;
   /**
    * La versión que corre HOY. Si no coincide con la de `ultima`, lo guardado mide OTRA capa: la
    * pantalla lo avisa, porque leer un informe de la versión anterior como si fuera el de ésta

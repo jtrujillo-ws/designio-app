@@ -488,14 +488,50 @@ export async function informeDeGrounding(
         TEXTO_ROL_INFORME,
       );
 
-      // Las DOS últimas en una sola consulta: pedirlas por separado bajo dos instantáneas
-      // distintas podía devolver la misma corrida dos veces si una tercera entraba en medio.
+      /*
+       * TRES corridas, y la tercera es la que salva la métrica de §17.
+       *
+       * Con «las dos últimas» a secas, la segunda corrida de una misma versión desplazaba a la
+       * última de la versión ANTERIOR — y ésa es justo contra la que §17 quiere comparar
+       * («fidelidad que no mejora entre releases»). Desde la segunda corrida de cada versión,
+       * el informe dejaba de poder responder la pregunta para la que existe, teniendo el dato
+       * guardado. La pantalla lo demostraba sola: ya avisaba de que un delta entre corridas de
+       * la misma versión dice cuánto creció la muestra, no si la capa mejoró.
+       *
+       * Así que viajan las dos comparaciones, porque son dos preguntas:
+       *  · `anterior` — la corrida inmediatamente previa, sea de la versión que sea. Es la
+       *    literalidad del criterio 4 de SPEC-08 y responde «¿se movió algo desde la última
+       *    medición?».
+       *  · `anteriorDeOtraVersion` — la última de una versión DISTINTA. Es la alarma de §17.
+       *
+       * Todo en una consulta: pedirlas por separado bajo instantáneas distintas podía devolver
+       * la misma corrida dos veces si una tercera entraba en medio.
+       *
+       * `distinct on` sobre la versión da la más reciente de CADA versión, y con el límite en
+       * tres caben la última, la anterior inmediata y la de otra versión aunque las dos
+       * primeras compartan versión. Se pide sobre la unión de las dos consultas para no
+       * suponer cuántas versiones hay en medio.
+       */
       const corridas = await tx`
+        with ultimas as (
+          select id, prompt_version, corrida_en
+          from corrida_eval
+          where workspace_id = ${workspaceId}
+          order by corrida_en desc, id desc
+          limit 2
+        ), por_version as (
+          select distinct on (prompt_version) id, prompt_version, corrida_en
+          from corrida_eval
+          where workspace_id = ${workspaceId}
+          order by prompt_version, corrida_en desc, id desc
+        )
         select id, prompt_version, corrida_en::text as corrida_en
-        from corrida_eval
-        where workspace_id = ${workspaceId}
-        order by corrida_en desc, id desc
-        limit 2`;
+        from (
+          select * from ultimas
+          union
+          select * from por_version
+        ) as todas
+        order by corrida_en desc, id desc`;
 
       const conMediciones = await Promise.all(
         corridas.map(async (c) => {
@@ -529,10 +565,19 @@ export async function informeDeGrounding(
         }),
       );
 
+      const ultima = conMediciones[0] ?? null;
       return {
         workspaceId,
-        ultima: conMediciones[0] ?? null,
+        ultima,
         anterior: conMediciones[1] ?? null,
+        /*
+         * La más reciente de una versión DISTINTA de la que mide `ultima`. Se busca sobre la
+         * lista ya ordenada por fecha, así que la primera que no coincide es la que toca; y es
+         * `null` cuando todavía no hay más de una versión medida, que es el caso normal el
+         * primer día y se dice en la pantalla en vez de pintar un delta de la nada.
+         */
+        anteriorDeOtraVersion:
+          conMediciones.find((c) => c.promptVersion !== ultima?.promptVersion) ?? null,
         promptVersionActual: PROMPT_VERSION,
         puedeCorrer: (ROLES_CORREN_EVAL as readonly string[]).includes(rol),
       };
